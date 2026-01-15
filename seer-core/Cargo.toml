@@ -1,0 +1,27 @@
+[package]
+name = "seer-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Core library for Seer domain name utilities"
+
+[dependencies]
+tokio = { workspace = true }
+reqwest = { workspace = true }
+hickory-resolver = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+once_cell = { workspace = true }
+regex = { workspace = true }
+url = { workspace = true }
+colored = { workspace = true }
+
+[dev-dependencies]
+tokio-test = "0.4"

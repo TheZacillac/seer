@@ -1,0 +1,465 @@
+mod commands;
+mod completer;
+
+pub use commands::{CommandContext, CommandResult};
+pub use completer::SeerCompleter;
+
+use std::io::Write;
+
+use colored::Colorize;
+use rustyline::error::ReadlineError;
+use rustyline::history::DefaultHistory;
+use rustyline::{CompletionType, Editor};
+
+use crate::display::Spinner;
+
+const HISTORY_FILE: &str = ".seer_history";
+
+pub struct Repl {
+    editor: Editor<SeerCompleter, DefaultHistory>,
+    context: CommandContext,
+}
+
+impl Repl {
+    pub fn new() -> anyhow::Result<Self> {
+        let config = rustyline::Config::builder()
+            .history_ignore_space(true)
+            .completion_type(CompletionType::List)
+            .edit_mode(rustyline::EditMode::Emacs)
+            .build();
+
+        let completer = SeerCompleter::new();
+        let mut editor = Editor::with_config(config)?;
+        editor.set_helper(Some(completer));
+
+        // Load history
+        let history_path = dirs::home_dir()
+            .map(|p| p.join(HISTORY_FILE))
+            .unwrap_or_else(|| HISTORY_FILE.into());
+
+        let _ = editor.load_history(&history_path);
+
+        Ok(Self {
+            editor,
+            context: CommandContext::new(),
+        })
+    }
+
+    pub async fn run(&mut self) -> anyhow::Result<()> {
+        self.print_banner();
+
+        loop {
+            let prompt = self.get_prompt();
+
+            match self.editor.readline(&prompt) {
+                Ok(line) => {
+                    let line = line.trim();
+                    if line.is_empty() {
+                        continue;
+                    }
+
+                    self.editor.add_history_entry(line)?;
+
+                    match self.execute_line(line).await {
+                        CommandResult::Continue => {}
+                        CommandResult::Exit => break,
+                        CommandResult::Error(e) => {
+                            eprintln!("{} {}", "Error:".red().bold(), e);
+                        }
+                    }
+                }
+                Err(ReadlineError::Interrupted) => {
+                    println!("^C");
+                    continue;
+                }
+                Err(ReadlineError::Eof) => {
+                    println!("exit");
+                    break;
+                }
+                Err(err) => {
+                    eprintln!("{} {:?}", "Error:".red().bold(), err);
+                    break;
+                }
+            }
+        }
+
+        // Save history
+        let history_path = dirs::home_dir()
+            .map(|p| p.join(HISTORY_FILE))
+            .unwrap_or_else(|| HISTORY_FILE.into());
+
+        let _ = self.editor.save_history(&history_path);
+
+        Ok(())
+    }
+
+    fn print_banner(&self) {
+        let banner = r#"
+      ✦ ·:*¨¨¨¨¨¨¨¨¨¨¨¨¨¨¨¨¨¨*:· ✦
+          ╔═╗    ╔═╗    ╔═╗    ╦═╗
+          ╚═╗    ╠═     ╠═     ╠╦╝
+          ╚═╝    ╚═╝    ╚═╝    ╩╚═
+        ✦ '·:*¨¨¨¨¨¨¨¨¨¨¨¨¨¨*:·' ✦
+"#;
+        println!("{}", banner.cyan());
+        println!(
+            "  {} - Domain Name Helper",
+            "Seer v0.1.0".bold()
+        );
+        println!("  Type {} for available commands\n", "help".green());
+    }
+
+    fn get_prompt(&self) -> String {
+        let format_indicator = match self.context.output_format {
+            seer_core::output::OutputFormat::Human => "",
+            seer_core::output::OutputFormat::Json => " [json]",
+        };
+        format!(
+            "{}{} ",
+            "seer".cyan().bold(),
+            format!("{}›", format_indicator).dimmed()
+        )
+    }
+
+    async fn execute_line(&mut self, line: &str) -> CommandResult {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.is_empty() {
+            return CommandResult::Continue;
+        }
+
+        let command = parts[0].to_lowercase();
+        let args = &parts[1..];
+
+        match command.as_str() {
+            "help" | "?" => {
+                self.print_help();
+                CommandResult::Continue
+            }
+            "exit" | "quit" | "q" => CommandResult::Exit,
+            "lookup" => self.execute_lookup(args).await,
+            "whois" => self.execute_whois(args).await,
+            "rdap" => self.execute_rdap(args).await,
+            "dig" | "dns" => self.execute_dig(args).await,
+            "propagation" | "prop" => self.execute_propagation(args).await,
+            "bulk" => self.execute_bulk(args).await,
+            "set" => self.execute_set(args),
+            "clear" => {
+                print!("\x1B[2J\x1B[1;1H");
+                let _ = std::io::stdout().flush();
+                CommandResult::Continue
+            }
+            _ => CommandResult::Error(format!("Unknown command: {}. Type 'help' for available commands.", command)),
+        }
+    }
+
+    fn print_help(&self) {
+        println!("\n{}", "Available Commands:".bold().underline());
+        println!();
+        println!("  {}       Smart lookup (tries RDAP first, falls back to WHOIS)", "lookup <domain>".green());
+        println!("  {}         Look up WHOIS information for a domain", "whois <domain>".green());
+        println!("  {}          Look up RDAP information for a domain/IP/ASN", "rdap <query>".green());
+        println!("  {} Query DNS records", "dig <domain> [type] [@server]".green());
+        println!("  {}   Check DNS propagation", "propagation <domain> [type]".green());
+        println!("    [type] include: A, AAAA, CNAME, MX, NS, TXT, SOA, PTR, SRV, CAA");
+        println!();
+        println!("  {}  Execute bulk operations from file", "bulk <operation> <file>".green());
+        println!("    Operations: lookup, whois, rdap, dig, propagation");
+        println!("    File format: one domain per line, # for comments, or CSV (first column)");
+        println!();
+        println!("  {} Change output format (human/json)", "set output <format>".green());
+        println!("  {}                         Clear screen", "clear".green());
+        println!("  {}                          Exit the program", "exit".green());
+        println!();
+        println!("{}", "Examples:".bold().underline());
+        println!("  seer› lookup example.com");
+        println!("  seer› whois example.com");
+        println!("  seer› rdap 8.8.8.8");
+        println!("  seer› dig google.com MX");
+        println!("  seer› dig cloudflare.com A @1.1.1.1");
+        println!("  seer› propagation github.com A");
+        println!("  seer› bulk whois domains.txt");
+        println!("  seer› set output json");
+        println!();
+    }
+
+    async fn execute_lookup(&self, args: &[&str]) -> CommandResult {
+        if args.is_empty() {
+            return CommandResult::Error("Usage: lookup <domain>".to_string());
+        }
+
+        let domain = args[0];
+        let spinner = Spinner::new(&format!("Smart lookup for {} (trying RDAP first)", domain));
+
+        let lookup = seer_core::SmartLookup::new();
+        match lookup.lookup(domain).await {
+            Ok(result) => {
+                spinner.finish();
+                let formatter = seer_core::output::get_formatter(self.context.output_format);
+                println!("{}", formatter.format_lookup(&result));
+                CommandResult::Continue
+            }
+            Err(e) => {
+                spinner.finish();
+                CommandResult::Error(e.to_string())
+            }
+        }
+    }
+
+    async fn execute_whois(&self, args: &[&str]) -> CommandResult {
+        if args.is_empty() {
+            return CommandResult::Error("Usage: whois <domain>".to_string());
+        }
+
+        let domain = args[0];
+        let spinner = Spinner::new(&format!("Looking up WHOIS for {}", domain));
+
+        let client = seer_core::WhoisClient::new();
+        match client.lookup(domain).await {
+            Ok(response) => {
+                spinner.finish();
+                let formatter = seer_core::output::get_formatter(self.context.output_format);
+                println!("{}", formatter.format_whois(&response));
+                CommandResult::Continue
+            }
+            Err(e) => {
+                spinner.finish();
+                CommandResult::Error(e.to_string())
+            }
+        }
+    }
+
+    async fn execute_rdap(&self, args: &[&str]) -> CommandResult {
+        if args.is_empty() {
+            return CommandResult::Error("Usage: rdap <domain|ip|asn>".to_string());
+        }
+
+        let query = args[0];
+        let spinner = Spinner::new(&format!("Looking up RDAP for {}", query));
+
+        let client = seer_core::RdapClient::new();
+
+        // Determine query type
+        let result = if query.starts_with("AS") || query.starts_with("as") {
+            match query[2..].parse::<u32>() {
+                Ok(asn) => client.lookup_asn(asn).await,
+                Err(_) => {
+                    spinner.finish();
+                    return CommandResult::Error("Invalid ASN format".to_string());
+                }
+            }
+        } else if query.parse::<std::net::IpAddr>().is_ok() {
+            client.lookup_ip(query).await
+        } else {
+            client.lookup_domain(query).await
+        };
+
+        match result {
+            Ok(response) => {
+                spinner.finish();
+                let formatter = seer_core::output::get_formatter(self.context.output_format);
+                println!("{}", formatter.format_rdap(&response));
+                CommandResult::Continue
+            }
+            Err(e) => {
+                spinner.finish();
+                CommandResult::Error(e.to_string())
+            }
+        }
+    }
+
+    async fn execute_dig(&self, args: &[&str]) -> CommandResult {
+        if args.is_empty() {
+            return CommandResult::Error("Usage: dig <domain> [type] [@server]".to_string());
+        }
+
+        let domain = args[0];
+        let mut record_type = seer_core::RecordType::A;
+        let mut nameserver: Option<&str> = None;
+
+        for arg in &args[1..] {
+            if arg.starts_with('@') {
+                nameserver = Some(&arg[1..]);
+            } else if let Ok(rt) = arg.parse() {
+                record_type = rt;
+            }
+        }
+
+        let spinner = Spinner::new(&format!("Querying {} {} records", domain, record_type));
+
+        let resolver = seer_core::DnsResolver::new();
+        match resolver.resolve(domain, record_type, nameserver).await {
+            Ok(records) => {
+                spinner.finish();
+                let formatter = seer_core::output::get_formatter(self.context.output_format);
+                println!("{}", formatter.format_dns(&records));
+                CommandResult::Continue
+            }
+            Err(e) => {
+                spinner.finish();
+                CommandResult::Error(e.to_string())
+            }
+        }
+    }
+
+    async fn execute_propagation(&self, args: &[&str]) -> CommandResult {
+        if args.is_empty() {
+            return CommandResult::Error("Usage: propagation <domain> [type]".to_string());
+        }
+
+        let domain = args[0];
+        let record_type: seer_core::RecordType = args
+            .get(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(seer_core::RecordType::A);
+
+        let spinner = Spinner::new(&format!(
+            "Checking {} {} propagation across DNS servers",
+            domain, record_type
+        ));
+
+        let checker = seer_core::dns::PropagationChecker::new();
+        match checker.check(domain, record_type).await {
+            Ok(result) => {
+                spinner.finish();
+                let formatter = seer_core::output::get_formatter(self.context.output_format);
+                println!("{}", formatter.format_propagation(&result));
+                CommandResult::Continue
+            }
+            Err(e) => {
+                spinner.finish();
+                CommandResult::Error(e.to_string())
+            }
+        }
+    }
+
+    async fn execute_bulk(&mut self, args: &[&str]) -> CommandResult {
+        if args.len() < 2 {
+            return CommandResult::Error(
+                "Usage: bulk <operation> <file> [type]\nOperations: whois, rdap, dig, propagation"
+                    .to_string(),
+            );
+        }
+
+        let operation = args[0];
+        let file_path = args[1];
+        let record_type: seer_core::RecordType = args
+            .get(2)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(seer_core::RecordType::A);
+
+        // Read domains from file
+        let content = match std::fs::read_to_string(file_path) {
+            Ok(c) => c,
+            Err(e) => return CommandResult::Error(format!("Failed to read file: {}", e)),
+        };
+
+        let domains = seer_core::bulk::parse_domains_from_file(&content);
+        if domains.is_empty() {
+            return CommandResult::Error(
+                "No valid domains found in file. Expected format: one domain per line, # for comments, or CSV (first column)".to_string()
+            );
+        }
+
+        println!("Found {} domains in {}", domains.len(), file_path);
+
+        let progress = indicatif::ProgressBar::new(domains.len() as u64);
+        progress.set_style(
+            indicatif::ProgressStyle::default_bar()
+                .template("{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} {msg}")
+                .unwrap()
+                .progress_chars("█▓░"),
+        );
+
+        let executor = seer_core::BulkExecutor::new().with_concurrency(5);
+
+        let callback: seer_core::bulk::ProgressCallback =
+            Box::new(move |current, _total, domain| {
+                progress.set_position(current as u64);
+                progress.set_message(domain.to_string());
+            });
+
+        let operations: Vec<seer_core::bulk::BulkOperation> = match operation {
+            "whois" => domains
+                .iter()
+                .map(|d: &String| seer_core::bulk::BulkOperation::Whois { domain: d.clone() })
+                .collect(),
+            "rdap" => domains
+                .iter()
+                .map(|d: &String| seer_core::bulk::BulkOperation::Rdap { domain: d.clone() })
+                .collect(),
+            "dig" | "dns" => domains
+                .iter()
+                .map(|d: &String| seer_core::bulk::BulkOperation::Dns {
+                    domain: d.clone(),
+                    record_type,
+                })
+                .collect(),
+            "propagation" | "prop" => domains
+                .iter()
+                .map(|d: &String| seer_core::bulk::BulkOperation::Propagation {
+                    domain: d.clone(),
+                    record_type,
+                })
+                .collect(),
+            "lookup" => domains
+                .iter()
+                .map(|d: &String| seer_core::bulk::BulkOperation::Lookup { domain: d.clone() })
+                .collect(),
+            _ => {
+                return CommandResult::Error(format!(
+                    "Unknown bulk operation: {}. Use: lookup, whois, rdap, dig, propagation",
+                    operation
+                ))
+            }
+        };
+
+        let results = executor.execute(operations, Some(callback)).await;
+
+        // Print results summary
+        let successful = results.iter().filter(|r| r.success).count();
+        let failed = results.len() - successful;
+
+        println!("\n\n{}", "Bulk Operation Complete".bold());
+        println!("  Successful: {}", successful.to_string().green());
+        println!("  Failed: {}", failed.to_string().red());
+
+        // Print failures
+        if failed > 0 {
+            println!("\n{}", "Failures:".red().bold());
+            for result in results.iter().filter(|r| !r.success) {
+                let domain = match &result.operation {
+                    seer_core::bulk::BulkOperation::Whois { domain } => domain,
+                    seer_core::bulk::BulkOperation::Rdap { domain } => domain,
+                    seer_core::bulk::BulkOperation::Dns { domain, .. } => domain,
+                    seer_core::bulk::BulkOperation::Propagation { domain, .. } => domain,
+                    seer_core::bulk::BulkOperation::Lookup { domain } => domain,
+                };
+                println!(
+                    "  {} - {}",
+                    domain,
+                    result.error.as_deref().unwrap_or("Unknown error")
+                );
+            }
+        }
+
+        CommandResult::Continue
+    }
+
+    fn execute_set(&mut self, args: &[&str]) -> CommandResult {
+        if args.len() < 2 {
+            return CommandResult::Error("Usage: set <setting> <value>".to_string());
+        }
+
+        match args[0] {
+            "output" => match args[1].parse() {
+                Ok(format) => {
+                    self.context.output_format = format;
+                    println!("Output format set to: {}", args[1]);
+                    CommandResult::Continue
+                }
+                Err(_) => CommandResult::Error("Invalid format. Use: human, json".to_string()),
+            },
+            _ => CommandResult::Error(format!("Unknown setting: {}", args[0])),
+        }
+    }
+}
