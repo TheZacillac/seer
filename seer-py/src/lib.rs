@@ -6,6 +6,7 @@ use seer_core::{
     dns::{DnsResolver, PropagationChecker, RecordType},
     lookup::SmartLookup,
     rdap::RdapClient,
+    status::StatusClient,
     whois::WhoisClient,
 };
 
@@ -254,6 +255,41 @@ fn bulk_propagation(
     json_to_python(py, &json)
 }
 
+#[pyfunction]
+fn status(py: Python<'_>, domain: String) -> PyResult<PyObject> {
+    let rt = get_runtime();
+    let client = StatusClient::new();
+
+    let result = rt.block_on(async { client.check(&domain).await });
+
+    match result {
+        Ok(response) => {
+            let json = serde_json::to_value(&response)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            json_to_python(py, &json)
+        }
+        Err(e) => Err(PyRuntimeError::new_err(e.to_string())),
+    }
+}
+
+#[pyfunction]
+#[pyo3(signature = (domains, concurrency = 10))]
+fn bulk_status(py: Python<'_>, domains: Vec<String>, concurrency: usize) -> PyResult<PyObject> {
+    let rt = get_runtime();
+    let executor = BulkExecutor::new().with_concurrency(concurrency);
+
+    let operations: Vec<BulkOperation> = domains
+        .into_iter()
+        .map(|domain| BulkOperation::Status { domain })
+        .collect();
+
+    let result = rt.block_on(async { executor.execute(operations, None).await });
+
+    let json =
+        serde_json::to_value(&result).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    json_to_python(py, &json)
+}
+
 fn json_to_python(py: Python<'_>, value: &serde_json::Value) -> PyResult<PyObject> {
     match value {
         serde_json::Value::Null => Ok(py.None()),
@@ -294,9 +330,11 @@ fn _seer(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(rdap_asn, m)?)?;
     m.add_function(wrap_pyfunction!(dig, m)?)?;
     m.add_function(wrap_pyfunction!(propagation, m)?)?;
+    m.add_function(wrap_pyfunction!(status, m)?)?;
     m.add_function(wrap_pyfunction!(bulk_lookup, m)?)?;
     m.add_function(wrap_pyfunction!(bulk_whois, m)?)?;
     m.add_function(wrap_pyfunction!(bulk_dig, m)?)?;
     m.add_function(wrap_pyfunction!(bulk_propagation, m)?)?;
+    m.add_function(wrap_pyfunction!(bulk_status, m)?)?;
     Ok(())
 }

@@ -12,6 +12,7 @@ use crate::dns::{DnsRecord, DnsResolver, PropagationChecker, PropagationResult, 
 use crate::error::Result;
 use crate::lookup::{LookupResult, SmartLookup};
 use crate::rdap::{RdapClient, RdapResponse};
+use crate::status::{StatusClient, StatusResponse};
 use crate::whois::{WhoisClient, WhoisResponse};
 
 pub type ProgressCallback = Box<dyn Fn(usize, usize, &str) + Send + Sync>;
@@ -24,6 +25,7 @@ pub enum BulkOperation {
     Dns { domain: String, record_type: RecordType },
     Propagation { domain: String, record_type: RecordType },
     Lookup { domain: String },
+    Status { domain: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,6 +36,7 @@ pub enum BulkResultData {
     Dns(Vec<DnsRecord>),
     Propagation(PropagationResult),
     Lookup(LookupResult),
+    Status(StatusResponse),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,6 +57,7 @@ pub struct BulkExecutor {
     dns_resolver: DnsResolver,
     propagation_checker: PropagationChecker,
     smart_lookup: SmartLookup,
+    status_client: StatusClient,
 }
 
 impl Default for BulkExecutor {
@@ -72,6 +76,7 @@ impl BulkExecutor {
             dns_resolver: DnsResolver::new(),
             propagation_checker: PropagationChecker::new(),
             smart_lookup: SmartLookup::new(),
+            status_client: StatusClient::new(),
         }
     }
 
@@ -111,6 +116,7 @@ impl BulkExecutor {
                 let dns_resolver = &self.dns_resolver;
                 let propagation_checker = &self.propagation_checker;
                 let smart_lookup = &self.smart_lookup;
+                let status_client = &self.status_client;
 
                 async move {
                     let _permit = match semaphore.acquire().await {
@@ -139,6 +145,7 @@ impl BulkExecutor {
                         dns_resolver,
                         propagation_checker,
                         smart_lookup,
+                        status_client,
                     )
                     .await;
                     let duration_ms = start.elapsed().as_millis() as u64;
@@ -152,6 +159,7 @@ impl BulkExecutor {
                             BulkOperation::Dns { domain, .. } => domain.clone(),
                             BulkOperation::Propagation { domain, .. } => domain.clone(),
                             BulkOperation::Lookup { domain } => domain.clone(),
+                            BulkOperation::Status { domain } => domain.clone(),
                         };
                         progress(count, total, &desc);
                     }
@@ -237,6 +245,14 @@ impl BulkExecutor {
             .collect();
         self.execute(operations, None).await
     }
+
+    pub async fn execute_status(&self, domains: Vec<String>) -> Vec<BulkResult> {
+        let operations = domains
+            .into_iter()
+            .map(|domain| BulkOperation::Status { domain })
+            .collect();
+        self.execute(operations, None).await
+    }
 }
 
 async fn execute_operation(
@@ -246,6 +262,7 @@ async fn execute_operation(
     dns_resolver: &DnsResolver,
     propagation_checker: &PropagationChecker,
     smart_lookup: &SmartLookup,
+    status_client: &StatusClient,
 ) -> Result<BulkResultData> {
     match op {
         BulkOperation::Whois { domain } => {
@@ -273,6 +290,10 @@ async fn execute_operation(
         BulkOperation::Lookup { domain } => {
             let result = smart_lookup.lookup(domain).await?;
             Ok(BulkResultData::Lookup(result))
+        }
+        BulkOperation::Status { domain } => {
+            let result = status_client.check(domain).await?;
+            Ok(BulkResultData::Status(result))
         }
     }
 }

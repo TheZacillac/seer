@@ -2,7 +2,7 @@ mod display;
 mod repl;
 
 use clap::{Parser, Subcommand};
-use colored::Colorize;
+use seer_core::colors::CatppuccinExt;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -56,13 +56,18 @@ enum Commands {
     },
     /// Execute bulk operations from a file
     Bulk {
-        /// Operation type (lookup, whois, rdap, dig, propagation)
+        /// Operation type (lookup, whois, rdap, dig, propagation, status)
         operation: String,
         /// File containing domains: one per line, # for comments, or CSV (uses first column)
         file: String,
         /// Record type for dig/propagation operations
         #[arg(default_value = "A")]
         record_type: String,
+    },
+    /// Check domain status (HTTP, SSL cert, registration expiration)
+    Status {
+        /// Domain name to check
+        domain: String,
     },
 }
 
@@ -103,7 +108,7 @@ async fn execute_command(
                     println!("{}", formatter.format_lookup(&result));
                 }
                 Err(e) => {
-                    eprintln!("{} {}", "Error:".red(), e);
+                    eprintln!("{} {}", "Error:".ctp_red(), e);
                     std::process::exit(1);
                 }
             }
@@ -115,7 +120,7 @@ async fn execute_command(
                     println!("{}", formatter.format_whois(&response));
                 }
                 Err(e) => {
-                    eprintln!("{} {}", "Error:".red(), e);
+                    eprintln!("{} {}", "Error:".ctp_red(), e);
                     std::process::exit(1);
                 }
             }
@@ -136,7 +141,7 @@ async fn execute_command(
                     println!("{}", formatter.format_rdap(&response));
                 }
                 Err(e) => {
-                    eprintln!("{} {}", "Error:".red(), e);
+                    eprintln!("{} {}", "Error:".ctp_red(), e);
                     std::process::exit(1);
                 }
             }
@@ -155,7 +160,7 @@ async fn execute_command(
                     println!("{}", formatter.format_dns(&records));
                 }
                 Err(e) => {
-                    eprintln!("{} {}", "Error:".red(), e);
+                    eprintln!("{} {}", "Error:".ctp_red(), e);
                     std::process::exit(1);
                 }
             }
@@ -172,7 +177,7 @@ async fn execute_command(
                     println!("{}", formatter.format_propagation(&result));
                 }
                 Err(e) => {
-                    eprintln!("{} {}", "Error:".red(), e);
+                    eprintln!("{} {}", "Error:".ctp_red(), e);
                     std::process::exit(1);
                 }
             }
@@ -188,7 +193,7 @@ async fn execute_command(
             if domains.is_empty() {
                 eprintln!(
                     "{} No valid domains found in file. Expected format: one domain per line, # for comments, or CSV (first column)",
-                    "Error:".red()
+                    "Error:".ctp_red()
                 );
                 std::process::exit(1);
             }
@@ -223,10 +228,14 @@ async fn execute_command(
                         record_type: rt,
                     })
                     .collect(),
+                "status" => domains
+                    .iter()
+                    .map(|d: &String| seer_core::bulk::BulkOperation::Status { domain: d.clone() })
+                    .collect(),
                 _ => {
                     eprintln!(
-                        "{} Unknown operation: {}. Use: lookup, whois, rdap, dig, propagation",
-                        "Error:".red(),
+                        "{} Unknown operation: {}. Use: lookup, whois, rdap, dig, propagation, status",
+                        "Error:".ctp_red(),
                         operation
                     );
                     std::process::exit(1);
@@ -237,6 +246,18 @@ async fn execute_command(
 
             // Output results as JSON array for bulk operations
             println!("{}", serde_json::to_string_pretty(&results)?);
+        }
+        Commands::Status { domain } => {
+            let client = seer_core::StatusClient::new();
+            match client.check(&domain).await {
+                Ok(response) => {
+                    println!("{}", formatter.format_status(&response));
+                }
+                Err(e) => {
+                    eprintln!("{} {}", "Error:".ctp_red(), e);
+                    std::process::exit(1);
+                }
+            }
         }
     }
 

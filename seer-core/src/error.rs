@@ -33,7 +33,10 @@ pub enum SeerError {
     InvalidRecordType(String),
 
     #[error("HTTP request failed: {0}")]
-    HttpError(#[from] reqwest::Error),
+    HttpError(String),
+
+    #[error("Reqwest error: {0}")]
+    ReqwestError(#[from] reqwest::Error),
 
     #[error("JSON parsing failed: {0}")]
     JsonError(#[from] serde_json::Error),
@@ -43,6 +46,9 @@ pub enum SeerError {
 
     #[error("Rate limited: {0}")]
     RateLimited(String),
+
+    #[error("Certificate error: {0}")]
+    CertificateError(String),
 
     #[error("Bulk operation failed: {context}")]
     BulkOperationError {

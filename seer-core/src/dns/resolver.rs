@@ -88,6 +88,8 @@ impl DnsResolver {
                 "SRV records require service name format: _service._proto.name".to_string(),
             )),
             RecordType::CAA => self.resolve_caa(&resolver, &domain).await,
+            RecordType::DNSKEY => self.resolve_dnskey(&resolver, &domain).await,
+            RecordType::DS => self.resolve_ds(&resolver, &domain).await,
             RecordType::ANY => self.resolve_any(&resolver, &domain).await,
             _ => Err(SeerError::DnsError(format!(
                 "Record type {} not implemented",
@@ -416,6 +418,91 @@ impl DnsResolver {
         Ok(records)
     }
 
+    async fn resolve_dnskey(
+        &self,
+        resolver: &TokioAsyncResolver,
+        domain: &str,
+    ) -> Result<Vec<DnsRecord>> {
+        use hickory_resolver::proto::rr::RData as HickoryRData;
+
+        let response = resolver
+            .lookup(domain, HickoryRecordType::DNSKEY)
+            .await
+            .map_err(|e| SeerError::DnsError(format!("DNSKEY lookup failed: {}", e)))?;
+
+        let records = response
+            .record_iter()
+            .filter_map(|record| {
+                if let Some(rdata) = record.data() {
+                    if let HickoryRData::DNSSEC(dnssec_rdata) = rdata {
+                        if let Some(dnskey) = dnssec_rdata.as_dnskey() {
+                            use base64::{engine::general_purpose::STANDARD, Engine};
+                            let public_key = STANDARD.encode(dnskey.public_key());
+                            return Some(DnsRecord {
+                                name: domain.to_string(),
+                                record_type: RecordType::DNSKEY,
+                                ttl: record.ttl(),
+                                data: RecordData::DNSKEY {
+                                    flags: dnskey.flags(),
+                                    protocol: 3, // Protocol is always 3 for DNSSEC (RFC 4034)
+                                    algorithm: u8::from(dnskey.algorithm()),
+                                    public_key,
+                                },
+                            });
+                        }
+                    }
+                }
+                None
+            })
+            .collect();
+
+        Ok(records)
+    }
+
+    async fn resolve_ds(
+        &self,
+        resolver: &TokioAsyncResolver,
+        domain: &str,
+    ) -> Result<Vec<DnsRecord>> {
+        use hickory_resolver::proto::rr::RData as HickoryRData;
+
+        let response = resolver
+            .lookup(domain, HickoryRecordType::DS)
+            .await
+            .map_err(|e| SeerError::DnsError(format!("DS lookup failed: {}", e)))?;
+
+        let records = response
+            .record_iter()
+            .filter_map(|record| {
+                if let Some(rdata) = record.data() {
+                    if let HickoryRData::DNSSEC(dnssec_rdata) = rdata {
+                        if let Some(ds) = dnssec_rdata.as_ds() {
+                            let digest = ds
+                                .digest()
+                                .iter()
+                                .map(|b| format!("{:02X}", b))
+                                .collect::<String>();
+                            return Some(DnsRecord {
+                                name: domain.to_string(),
+                                record_type: RecordType::DS,
+                                ttl: record.ttl(),
+                                data: RecordData::DS {
+                                    key_tag: ds.key_tag(),
+                                    algorithm: u8::from(ds.algorithm()),
+                                    digest_type: u8::from(ds.digest_type()),
+                                    digest,
+                                },
+                            });
+                        }
+                    }
+                }
+                None
+            })
+            .collect();
+
+        Ok(records)
+    }
+
     async fn resolve_any(
         &self,
         resolver: &TokioAsyncResolver,
@@ -459,6 +546,8 @@ impl DnsResolver {
             RecordType::TXT => self.resolve_txt(resolver, domain).await,
             RecordType::SOA => self.resolve_soa(resolver, domain).await,
             RecordType::CAA => self.resolve_caa(resolver, domain).await,
+            RecordType::DNSKEY => self.resolve_dnskey(resolver, domain).await,
+            RecordType::DS => self.resolve_ds(resolver, domain).await,
             _ => Err(SeerError::DnsError("Unsupported record type".to_string())),
         }
     }

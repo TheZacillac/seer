@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
@@ -44,6 +45,33 @@ impl LookupResult {
 
     pub fn is_whois(&self) -> bool {
         matches!(self, LookupResult::Whois { .. })
+    }
+
+    /// Get expiration date and registrar info from the lookup result
+    pub fn expiration_info(&self) -> (Option<DateTime<Utc>>, Option<String>) {
+        match self {
+            LookupResult::Rdap { data, whois_fallback } => {
+                // Try to get expiration from RDAP events
+                let expiration_date = data
+                    .events
+                    .iter()
+                    .find(|e| e.event_action == "expiration")
+                    .and_then(|e| e.parsed_date())
+                    .or_else(|| {
+                        // Fallback to WHOIS if available
+                        whois_fallback.as_ref().and_then(|w| w.expiration_date)
+                    });
+
+                let registrar = data.get_registrar().or_else(|| {
+                    whois_fallback.as_ref().and_then(|w| w.registrar.clone())
+                });
+
+                (expiration_date, registrar)
+            }
+            LookupResult::Whois { data, .. } => {
+                (data.expiration_date, data.registrar.clone())
+            }
+        }
     }
 }
 

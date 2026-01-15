@@ -6,8 +6,9 @@ A multi-interface domain name utility tool for querying domain registration info
 
 - **WHOIS Lookups** - Query domain registrant and registrar information
 - **RDAP Lookups** - Modern Registration Data Access Protocol queries for domains, IPs, and ASNs
-- **DNS Resolution** - Query DNS records (A, AAAA, MX, TXT, NS, SOA, CNAME, CAA, PTR, SRV)
+- **DNS Resolution** - Query DNS records (A, AAAA, MX, TXT, NS, SOA, CNAME, CAA, PTR, SRV, DNSKEY, DS)
 - **DNS Propagation Checking** - Monitor global DNS propagation across multiple nameservers
+- **Domain Status** - Quick health check: HTTP status, site title, SSL certificate info, expiration dates
 - **Smart Lookups** - Intelligent fallback that tries RDAP first, then falls back to WHOIS
 - **Bulk Operations** - Process multiple domains/queries concurrently with rate limiting
 - **Multiple Interfaces** - CLI, Python library, REST API, and MCP server
@@ -80,10 +81,14 @@ seer dig example.com A @8.8.8.8  # Custom nameserver
 # DNS propagation check
 seer propagation example.com A
 
+# Domain status check (HTTP, SSL, expiration)
+seer status example.com
+
 # Bulk operations
 seer bulk lookup domains.txt
 seer bulk whois domains.txt
 seer bulk dig domains.txt A
+seer bulk status domains.txt
 ```
 
 #### Output Formats
@@ -105,6 +110,7 @@ $ seer
 seer> lookup example.com
 seer> whois google.com
 seer> dig github.com MX
+seer> status cloudflare.com
 seer> set output json
 seer> help
 seer> exit
@@ -138,10 +144,14 @@ dns_custom = seer.dig("example.com", record_type="MX", nameserver="8.8.8.8")
 # DNS propagation
 propagation = seer.propagation("example.com", record_type="A")
 
+# Domain status (HTTP, SSL, expiration)
+status = seer.status("example.com")
+
 # Bulk operations
 results = seer.bulk_lookup(["example.com", "google.com"], concurrency=10)
 results = seer.bulk_whois(["example.com", "google.com"])
 results = seer.bulk_dig(["example.com", "google.com"], record_type="A")
+results = seer.bulk_status(["example.com", "google.com"])
 ```
 
 ### REST API
@@ -168,6 +178,8 @@ The API runs on `http://localhost:8000` with auto-reload enabled.
 | `/rdap/asn/{asn}` | GET | RDAP ASN lookup |
 | `/dns/{domain}/{record_type}` | GET | DNS query |
 | `/propagation/{domain}/{record_type}` | GET | Propagation check |
+| `/status/{domain}` | GET | Domain status check |
+| `/status/bulk` | POST | Bulk status checks |
 
 #### Examples
 
@@ -180,6 +192,9 @@ curl http://localhost:8000/whois/example.com
 
 # DNS query
 curl http://localhost:8000/dns/example.com/MX
+
+# Domain status
+curl http://localhost:8000/status/example.com
 
 # Bulk lookup
 curl -X POST http://localhost:8000/lookup/bulk \
@@ -214,7 +229,8 @@ The MCP server exposes these tools:
 - `seer_rdap_domain` / `seer_rdap_ip` / `seer_rdap_asn` - RDAP lookups
 - `seer_dig` - DNS queries
 - `seer_propagation` - Propagation checking
-- `seer_bulk_lookup` / `seer_bulk_whois` / `seer_bulk_dig` - Bulk operations
+- `seer_status` - Domain status (HTTP, SSL, expiration)
+- `seer_bulk_lookup` / `seer_bulk_whois` / `seer_bulk_dig` / `seer_bulk_status` - Bulk operations
 
 ## Project Structure
 
@@ -229,6 +245,7 @@ seer/
 │       ├── dns/        # DNS resolver and propagation
 │       ├── whois/      # WHOIS client and parser
 │       ├── rdap/       # RDAP client
+│       ├── status/     # Domain status checker
 │       └── output/     # Output formatters
 │
 ├── seer-cli/           # CLI application
@@ -278,6 +295,8 @@ Default concurrency: 10 (max: 50)
 - `CAA` - Certification authority authorization
 - `PTR` - Pointer record
 - `SRV` - Service locator
+- `DNSKEY` - DNSSEC public key
+- `DS` - Delegation signer (DNSSEC)
 - `ANY` - All available records
 
 ## Global DNS Servers for Propagation Checks

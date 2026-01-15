@@ -2,6 +2,7 @@ use super::OutputFormatter;
 use crate::dns::{DnsRecord, PropagationResult};
 use crate::lookup::LookupResult;
 use crate::rdap::RdapResponse;
+use crate::status::StatusResponse;
 use crate::whois::WhoisResponse;
 
 pub struct JsonFormatter {
@@ -52,5 +53,9 @@ impl OutputFormatter for JsonFormatter {
 
     fn format_lookup(&self, result: &LookupResult) -> String {
         self.to_json(result)
+    }
+
+    fn format_status(&self, response: &StatusResponse) -> String {
+        self.to_json(response)
     }
 }

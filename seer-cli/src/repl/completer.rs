@@ -16,15 +16,16 @@ const COMMANDS: &[&str] = &[
     "propagation",
     "prop",
     "bulk",
+    "status",
     "set",
     "clear",
 ];
 
 const RECORD_TYPES: &[&str] = &[
-    "A", "AAAA", "CNAME", "MX", "NS", "TXT", "SOA", "PTR", "SRV", "CAA", "ANY",
+    "A", "AAAA", "CNAME", "MX", "NS", "TXT", "SOA", "PTR", "SRV", "CAA", "DNSKEY", "DS", "ANY",
 ];
 
-const BULK_OPERATIONS: &[&str] = &["lookup", "whois", "rdap", "dig", "propagation"];
+const BULK_OPERATIONS: &[&str] = &["lookup", "whois", "rdap", "dig", "propagation", "status"];
 
 const SET_OPTIONS: &[&str] = &["output"];
 
@@ -172,6 +173,9 @@ impl Hinter for SeerCompleter {
             }
             "set" if words.len() == 1 && line.ends_with(' ') => {
                 Some(" output <human|json>".to_string())
+            }
+            "status" if words.len() == 1 && line.ends_with(' ') => {
+                Some(" <domain>".to_string())
             }
             _ => None,
         }

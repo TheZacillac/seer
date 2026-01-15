@@ -127,6 +127,18 @@ pub enum RecordData {
         tag: String,
         value: String,
     },
+    DNSKEY {
+        flags: u16,
+        protocol: u8,
+        algorithm: u8,
+        public_key: String,
+    },
+    DS {
+        key_tag: u16,
+        algorithm: u8,
+        digest_type: u8,
+        digest: String,
+    },
     Unknown {
         raw: String,
     },
@@ -165,6 +177,18 @@ impl fmt::Display for RecordData {
                 target,
             } => write!(f, "{} {} {} {}", priority, weight, port, target),
             RecordData::CAA { flags, tag, value } => write!(f, "{} {} \"{}\"", flags, tag, value),
+            RecordData::DNSKEY {
+                flags,
+                protocol,
+                algorithm,
+                public_key,
+            } => write!(f, "{} {} {} {}", flags, protocol, algorithm, public_key),
+            RecordData::DS {
+                key_tag,
+                algorithm,
+                digest_type,
+                digest,
+            } => write!(f, "{} {} {} {}", key_tag, algorithm, digest_type, digest),
             RecordData::Unknown { raw } => write!(f, "{}", raw),
         }
     }

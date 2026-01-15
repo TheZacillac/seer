@@ -5,7 +5,7 @@ import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from .routers import lookup, whois, rdap, dns, propagation
+from .routers import lookup, whois, rdap, dns, propagation, status
 
 app = FastAPI(
     title="Seer API",
@@ -41,6 +41,7 @@ app.include_router(whois.router, prefix="/whois", tags=["WHOIS"])
 app.include_router(rdap.router, prefix="/rdap", tags=["RDAP"])
 app.include_router(dns.router, prefix="/dns", tags=["DNS"])
 app.include_router(propagation.router, prefix="/propagation", tags=["Propagation"])
+app.include_router(status.router, prefix="/status", tags=["Status"])
 
 
 @app.get("/")
@@ -58,6 +59,7 @@ async def root():
             "rdap_asn": "/rdap/asn/{asn}",
             "dns": "/dns/{domain}/{record_type}",
             "propagation": "/propagation/{domain}/{record_type}",
+            "status": "/status/{domain}",
         },
         "docs": "/docs",
     }

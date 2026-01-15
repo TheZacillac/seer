@@ -10,6 +10,7 @@ use colored::Colorize;
 use rustyline::error::ReadlineError;
 use rustyline::history::DefaultHistory;
 use rustyline::{CompletionType, Editor};
+use seer_core::colors::CatppuccinExt;
 
 use crate::display::Spinner;
 
@@ -64,7 +65,7 @@ impl Repl {
                         CommandResult::Continue => {}
                         CommandResult::Exit => break,
                         CommandResult::Error(e) => {
-                            eprintln!("{} {}", "Error:".red().bold(), e);
+                            eprintln!("{} {}", "Error:".ctp_red().bold(), e);
                         }
                     }
                 }
@@ -77,7 +78,7 @@ impl Repl {
                     break;
                 }
                 Err(err) => {
-                    eprintln!("{} {:?}", "Error:".red().bold(), err);
+                    eprintln!("{} {:?}", "Error:".ctp_red().bold(), err);
                     break;
                 }
             }
@@ -94,19 +95,18 @@ impl Repl {
     }
 
     fn print_banner(&self) {
-        let banner = r#"
-      ✦ ·:*¨¨¨¨¨¨¨¨¨¨¨¨¨¨¨¨¨¨*:· ✦
-          ╔═╗    ╔═╗    ╔═╗    ╦═╗
-          ╚═╗    ╠═     ╠═     ╠╦╝
-          ╚═╝    ╚═╝    ╚═╝    ╩╚═
-        ✦ '·:*¨¨¨¨¨¨¨¨¨¨¨¨¨¨*:·' ✦
-"#;
-        println!("{}", banner.cyan());
+        println!();
+        println!("{}", "      ✦ ·:*¨¨¨¨¨¨¨¨¨¨¨¨¨¨¨¨¨¨*:· ✦".bright_cyan());
+        println!("{}", "          ╔═╗    ╔═╗    ╔═╗    ╦═╗".bright_purple());
+        println!("{}", "          ╚═╗    ╠═     ╠═     ╠╦╝".bright_purple());
+        println!("{}", "          ╚═╝    ╚═╝    ╚═╝    ╩╚═".bright_purple());
+        println!("{}", "        ✦ '·:*¨¨¨¨¨¨¨¨¨¨¨¨¨¨*:·' ✦".bright_cyan());
+        println!();
         println!(
             "  {} - Domain Name Helper",
-            "Seer v0.1.0".bold()
+            "Seer v0.1.0".bright_purple().bold()
         );
-        println!("  Type {} for available commands\n", "help".green());
+        println!("  Type {} for available commands\n", "help".bright_green());
     }
 
     fn get_prompt(&self) -> String {
@@ -116,8 +116,8 @@ impl Repl {
         };
         format!(
             "{}{} ",
-            "seer".cyan().bold(),
-            format!("{}›", format_indicator).dimmed()
+            "seer".bright_cyan().bold(),
+            format!("{}›", format_indicator).white()
         )
     }
 
@@ -142,6 +142,7 @@ impl Repl {
             "dig" | "dns" => self.execute_dig(args).await,
             "propagation" | "prop" => self.execute_propagation(args).await,
             "bulk" => self.execute_bulk(args).await,
+            "status" => self.execute_status(args).await,
             "set" => self.execute_set(args),
             "clear" => {
                 print!("\x1B[2J\x1B[1;1H");
@@ -153,32 +154,29 @@ impl Repl {
     }
 
     fn print_help(&self) {
-        println!("\n{}", "Available Commands:".bold().underline());
+        println!("\n{}", "Available Commands:".bright_purple().bold().underline());
         println!();
-        println!("  {}       Smart lookup (tries RDAP first, falls back to WHOIS)", "lookup <domain>".green());
-        println!("  {}         Look up WHOIS information for a domain", "whois <domain>".green());
-        println!("  {}          Look up RDAP information for a domain/IP/ASN", "rdap <query>".green());
-        println!("  {} Query DNS records", "dig <domain> [type] [@server]".green());
-        println!("  {}   Check DNS propagation", "propagation <domain> [type]".green());
-        println!("    [type] include: A, AAAA, CNAME, MX, NS, TXT, SOA, PTR, SRV, CAA");
+        println!("  {}       Smart lookup (RDAP first, WHOIS fallback)", "lookup <domain>".bright_cyan());
+        println!("  {}         Look up WHOIS information", "whois <domain>".bright_cyan());
+        println!("  {}          Look up RDAP for domain/IP/ASN", "rdap <query>".bright_cyan());
+        println!("  {} Query DNS records", "dig <domain> [type] [@server]".bright_cyan());
+        println!("  {}   Check DNS propagation", "propagation <domain> [type]".bright_cyan());
+        println!("    Types: A, AAAA, CNAME, MX, NS, TXT, SOA, PTR, SRV, CAA, DNSKEY, DS");
         println!();
-        println!("  {}  Execute bulk operations from file", "bulk <operation> <file>".green());
-        println!("    Operations: lookup, whois, rdap, dig, propagation");
-        println!("    File format: one domain per line, # for comments, or CSV (first column)");
+        println!("  {}       Check HTTP, SSL, and expiration", "status <domain>".bright_cyan());
         println!();
-        println!("  {} Change output format (human/json)", "set output <format>".green());
-        println!("  {}                         Clear screen", "clear".green());
-        println!("  {}                          Exit the program", "exit".green());
+        println!("  {}  Bulk operations from file", "bulk <operation> <file>".bright_cyan());
+        println!("    Operations: lookup, whois, rdap, dig, propagation, status");
         println!();
-        println!("{}", "Examples:".bold().underline());
+        println!("  {} Change output format (human/json)", "set output <format>".bright_cyan());
+        println!("  {}                         Clear screen", "clear".bright_cyan());
+        println!("  {}                          Exit the program", "exit".bright_cyan());
+        println!();
+        println!("{}", "Examples:".bright_purple().bold().underline());
         println!("  seer› lookup example.com");
-        println!("  seer› whois example.com");
-        println!("  seer› rdap 8.8.8.8");
-        println!("  seer› dig google.com MX");
-        println!("  seer› dig cloudflare.com A @1.1.1.1");
-        println!("  seer› propagation github.com A");
+        println!("  seer› dig google.com MX @8.8.8.8");
+        println!("  seer› status cloudflare.com");
         println!("  seer› bulk whois domains.txt");
-        println!("  seer› set output json");
         println!();
     }
 
@@ -405,9 +403,13 @@ impl Repl {
                 .iter()
                 .map(|d: &String| seer_core::bulk::BulkOperation::Lookup { domain: d.clone() })
                 .collect(),
+            "status" => domains
+                .iter()
+                .map(|d: &String| seer_core::bulk::BulkOperation::Status { domain: d.clone() })
+                .collect(),
             _ => {
                 return CommandResult::Error(format!(
-                    "Unknown bulk operation: {}. Use: lookup, whois, rdap, dig, propagation",
+                    "Unknown bulk operation: {}. Use: lookup, whois, rdap, dig, propagation, status",
                     operation
                 ))
             }
@@ -419,13 +421,13 @@ impl Repl {
         let successful = results.iter().filter(|r| r.success).count();
         let failed = results.len() - successful;
 
-        println!("\n\n{}", "Bulk Operation Complete".bold());
-        println!("  Successful: {}", successful.to_string().green());
-        println!("  Failed: {}", failed.to_string().red());
+        println!("\n\n{}", "Bulk Operation Complete".bright_purple().bold());
+        println!("  Successful: {}", successful.to_string().bright_green());
+        println!("  Failed: {}", failed.to_string().bright_red());
 
         // Print failures
         if failed > 0 {
-            println!("\n{}", "Failures:".red().bold());
+            println!("\n{}", "Failures:".bright_red().bold());
             for result in results.iter().filter(|r| !r.success) {
                 let domain = match &result.operation {
                     seer_core::bulk::BulkOperation::Whois { domain } => domain,
@@ -433,6 +435,7 @@ impl Repl {
                     seer_core::bulk::BulkOperation::Dns { domain, .. } => domain,
                     seer_core::bulk::BulkOperation::Propagation { domain, .. } => domain,
                     seer_core::bulk::BulkOperation::Lookup { domain } => domain,
+                    seer_core::bulk::BulkOperation::Status { domain } => domain,
                 };
                 println!(
                     "  {} - {}",
@@ -443,6 +446,29 @@ impl Repl {
         }
 
         CommandResult::Continue
+    }
+
+    async fn execute_status(&self, args: &[&str]) -> CommandResult {
+        if args.is_empty() {
+            return CommandResult::Error("Usage: status <domain>".to_string());
+        }
+
+        let domain = args[0];
+        let spinner = Spinner::new(&format!("Checking status for {}", domain));
+
+        let client = seer_core::StatusClient::new();
+        match client.check(domain).await {
+            Ok(response) => {
+                spinner.finish();
+                let formatter = seer_core::output::get_formatter(self.context.output_format);
+                println!("{}", formatter.format_status(&response));
+                CommandResult::Continue
+            }
+            Err(e) => {
+                spinner.finish();
+                CommandResult::Error(e.to_string())
+            }
+        }
     }
 
     fn execute_set(&mut self, args: &[&str]) -> CommandResult {

@@ -1,9 +1,11 @@
 use colored::Colorize;
 
 use super::OutputFormatter;
+use crate::colors::CatppuccinExt;
 use crate::dns::{DnsRecord, PropagationResult};
 use crate::lookup::LookupResult;
 use crate::rdap::RdapResponse;
+use crate::status::StatusResponse;
 use crate::whois::WhoisResponse;
 
 pub struct HumanFormatter {
@@ -28,7 +30,7 @@ impl HumanFormatter {
 
     fn label(&self, text: &str) -> String {
         if self.use_colors {
-            text.cyan().bold().to_string()
+            text.sky().bold().to_string()
         } else {
             text.to_string()
         }
@@ -36,7 +38,7 @@ impl HumanFormatter {
 
     fn value(&self, text: &str) -> String {
         if self.use_colors {
-            text.white().to_string()
+            text.ctp_white().to_string()
         } else {
             text.to_string()
         }
@@ -44,7 +46,7 @@ impl HumanFormatter {
 
     fn success(&self, text: &str) -> String {
         if self.use_colors {
-            text.green().to_string()
+            text.ctp_green().bold().to_string()
         } else {
             text.to_string()
         }
@@ -52,7 +54,7 @@ impl HumanFormatter {
 
     fn warning(&self, text: &str) -> String {
         if self.use_colors {
-            text.yellow().to_string()
+            text.ctp_yellow().bold().to_string()
         } else {
             text.to_string()
         }
@@ -60,7 +62,7 @@ impl HumanFormatter {
 
     fn error(&self, text: &str) -> String {
         if self.use_colors {
-            text.red().to_string()
+            text.ctp_red().bold().to_string()
         } else {
             text.to_string()
         }
@@ -68,7 +70,7 @@ impl HumanFormatter {
 
     fn header(&self, text: &str) -> String {
         if self.use_colors {
-            format!("\n{}\n{}", text.bold(), "─".repeat(text.len()))
+            format!("\n{}\n{}", text.lavender().bold(), "─".repeat(text.len()).subtext0())
         } else {
             format!("\n{}\n{}", text, "-".repeat(text.len()))
         }
@@ -572,6 +574,122 @@ impl OutputFormatter for HumanFormatter {
                     ));
                 }
             }
+        }
+
+        output.join("\n")
+    }
+
+    fn format_status(&self, response: &StatusResponse) -> String {
+        let mut output = Vec::new();
+
+        output.push(self.header(&format!("Status: {}", response.domain)));
+
+        // HTTP Status
+        if let Some(status) = response.http_status {
+            let status_text = response
+                .http_status_text
+                .as_deref()
+                .unwrap_or("Unknown");
+            let status_display = if status >= 200 && status < 300 {
+                self.success(&format!("{} ({})", status, status_text))
+            } else if status >= 300 && status < 400 {
+                self.warning(&format!("{} ({})", status, status_text))
+            } else {
+                self.error(&format!("{} ({})", status, status_text))
+            };
+            output.push(format!(
+                "  {}: {}",
+                self.label("HTTP Status"),
+                status_display
+            ));
+        }
+
+        // Site Title
+        if let Some(ref title) = response.title {
+            output.push(format!(
+                "  {}: {}",
+                self.label("Site Title"),
+                self.value(title)
+            ));
+        }
+
+        // SSL Certificate
+        if let Some(ref cert) = response.certificate {
+            output.push(format!("\n  {}:", self.label("SSL Certificate")));
+            output.push(format!(
+                "    {}: {}",
+                self.label("Subject"),
+                self.value(&cert.subject)
+            ));
+            output.push(format!(
+                "    {}: {}",
+                self.label("Issuer"),
+                self.value(&cert.issuer)
+            ));
+
+            let valid_status = if cert.is_valid {
+                self.success("Valid")
+            } else {
+                self.error("Invalid")
+            };
+            output.push(format!(
+                "    {}: {}",
+                self.label("Status"),
+                valid_status
+            ));
+
+            output.push(format!(
+                "    {}: {}",
+                self.label("Valid From"),
+                self.value(&cert.valid_from.format("%Y-%m-%d").to_string())
+            ));
+
+            let expiry_str = cert.valid_until.format("%Y-%m-%d").to_string();
+            let expiry_display = if cert.days_until_expiry < 30 {
+                self.error(&format!("{} ({} days!)", expiry_str, cert.days_until_expiry))
+            } else if cert.days_until_expiry < 90 {
+                self.warning(&format!("{} ({} days)", expiry_str, cert.days_until_expiry))
+            } else {
+                self.value(&format!("{} ({} days)", expiry_str, cert.days_until_expiry))
+            };
+            output.push(format!(
+                "    {}: {}",
+                self.label("Expires"),
+                expiry_display
+            ));
+        } else {
+            output.push(format!(
+                "\n  {}: {}",
+                self.label("SSL Certificate"),
+                self.warning("Not available (HTTPS may not be configured)")
+            ));
+        }
+
+        // Domain Expiration
+        if let Some(ref expiry) = response.domain_expiration {
+            output.push(format!("\n  {}:", self.label("Domain Registration")));
+
+            if let Some(ref registrar) = expiry.registrar {
+                output.push(format!(
+                    "    {}: {}",
+                    self.label("Registrar"),
+                    self.value(registrar)
+                ));
+            }
+
+            let expiry_str = expiry.expiration_date.format("%Y-%m-%d").to_string();
+            let expiry_display = if expiry.days_until_expiry < 30 {
+                self.error(&format!("{} ({} days!)", expiry_str, expiry.days_until_expiry))
+            } else if expiry.days_until_expiry < 90 {
+                self.warning(&format!("{} ({} days)", expiry_str, expiry.days_until_expiry))
+            } else {
+                self.value(&format!("{} ({} days)", expiry_str, expiry.days_until_expiry))
+            };
+            output.push(format!(
+                "    {}: {}",
+                self.label("Expires"),
+                expiry_display
+            ));
         }
 
         output.join("\n")
