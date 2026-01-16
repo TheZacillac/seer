@@ -15,7 +15,13 @@ A multi-interface domain name utility tool for querying domain registration info
 
 ## Installation
 
-### CLI (Rust)
+### Prerequisites
+
+- [Rust](https://rustup.rs/) 1.70+ (required for CLI and building Python bindings)
+- Python 3.9+ (required for Python library, REST API, and MCP server)
+- [uv](https://docs.astral.sh/uv/) (recommended Python package manager)
+
+### CLI Only
 
 Install from [crates.io](https://crates.io/crates/seer-cli):
 
@@ -25,38 +31,60 @@ cargo install seer-cli
 
 This installs the `seer` binary to `~/.cargo/bin/`, which is typically already in your PATH if you have Rust installed.
 
-**From source:**
+### Full Installation (CLI + Python Library + REST API + MCP Server)
+
+```bash
+# Clone the repository
+git clone https://github.com/TheZacillac/seer.git
+cd seer
+
+# Install CLI to PATH
+cargo install --path seer-cli
+
+# Install maturin (needed to build Python bindings)
+uv pip install maturin
+
+# Build and install Python bindings (required before installing the API)
+cd seer-py
+maturin develop --release
+cd ..
+
+# Install REST API and MCP server
+cd seer-api
+uv pip install -e .
+cd ..
+```
+
+After installation, you'll have access to:
+- `seer` - CLI tool
+- `seer-api` - REST API server
+- `seer-mcp` - MCP server for AI assistants
+
+### Individual Components
+
+#### Python Library Only
 
 ```bash
 git clone https://github.com/TheZacillac/seer.git
-cd seer
-cargo install --path seer-cli
-```
-
-### Python Library
-
-Install the Python bindings using [maturin](https://github.com/PyO3/maturin):
-
-```bash
-cd seer-py
+cd seer/seer-py
+uv pip install maturin
 maturin develop --release
 ```
 
-Or build a wheel:
+Or build a wheel for distribution:
 
 ```bash
-cd seer-py
 maturin build --release
-pip install target/wheels/seer-*.whl
+uv pip install target/wheels/seer-*.whl
 ```
 
-### REST API & MCP Server
+#### REST API & MCP Server
 
-Install the API package:
+> **Note:** The Python library must be installed first (see above).
 
 ```bash
 cd seer-api
-pip install -e .
+uv pip install -e .
 ```
 
 This provides two commands:
