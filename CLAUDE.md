@@ -203,7 +203,7 @@ seer-api/
 
 ```bash
 # 1. Clone repository
-git clone https://github.com/your-org/seer.git
+git clone https://github.com/TheZacillac/seer.git
 cd seer
 
 # 2. Install CLI to PATH (installs to ~/.cargo/bin/)
@@ -1265,8 +1265,8 @@ cargo check
 ## Contact and Support
 
 For issues and questions:
-- GitHub Issues: [Repository Issues](https://github.com/your-org/seer/issues)
-- Discussions: [Repository Discussions](https://github.com/your-org/seer/discussions)
+- GitHub Issues: [Repository Issues](https://github.com/TheZacillac/seer/issues)
+- Discussions: [Repository Discussions](https://github.com/TheZacillac/seer/discussions)
 
 ---
 

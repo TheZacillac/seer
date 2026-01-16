@@ -1,0 +1,28 @@
+name: Publish to crates.io
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:  # Allow manual trigger
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-action@stable
+
+      - name: Publish seer-core
+        run: cargo publish -p seer-core --token ${{ secrets.CRATES_IO_API_KEY }}
+        continue-on-error: true  # Skip if already published
+
+      - name: Wait for crates.io to index
+        run: sleep 60
+
+      - name: Publish seer-cli
+        run: cargo publish -p seer-cli --token ${{ secrets.CRATES_IO_API_KEY }}

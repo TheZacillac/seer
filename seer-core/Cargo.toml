@@ -4,7 +4,11 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "Core library for Seer domain name utilities"
+readme = "../README.md"
+keywords = ["whois", "rdap", "dns", "domain", "networking"]
+categories = ["network-programming", "command-line-utilities"]
 
 [dependencies]
 tokio = { workspace = true }
