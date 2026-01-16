@@ -136,10 +136,9 @@ impl RdapEntity {
                     if let Some(props) = arr[1].as_array() {
                         for prop in props {
                             if let Some(prop_arr) = prop.as_array() {
-                                if prop_arr.len() >= 4 {
-                                    if prop_arr[0].as_str() == Some("fn") {
-                                        return prop_arr[3].as_str().map(String::from);
-                                    }
+                                if prop_arr.len() >= 4
+                                    && prop_arr[0].as_str() == Some("fn") {
+                                    return prop_arr[3].as_str().map(String::from);
                                 }
                             }
                         }
@@ -157,10 +156,9 @@ impl RdapEntity {
                     if let Some(props) = arr[1].as_array() {
                         for prop in props {
                             if let Some(prop_arr) = prop.as_array() {
-                                if prop_arr.len() >= 4 {
-                                    if prop_arr[0].as_str() == Some("email") {
-                                        return prop_arr[3].as_str().map(String::from);
-                                    }
+                                if prop_arr.len() >= 4
+                                    && prop_arr[0].as_str() == Some("email") {
+                                    return prop_arr[3].as_str().map(String::from);
                                 }
                             }
                         }

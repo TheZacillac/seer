@@ -6,9 +6,11 @@ pub mod lookup;
 pub mod output;
 pub mod rdap;
 pub mod status;
+pub mod validation;
 pub mod whois;
 
 pub use error::{Result, SeerError};
+pub use validation::{normalize_domain, validate_domain_safe};
 
 pub use dns::{DnsRecord, DnsResolver, PropagationResult, RecordType};
 pub use lookup::{LookupResult, SmartLookup};

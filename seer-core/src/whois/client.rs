@@ -8,6 +8,7 @@ use tracing::{debug, instrument, warn};
 use super::parser::WhoisResponse;
 use super::servers::{get_tld, get_whois_server};
 use crate::error::{Result, SeerError};
+use crate::validation::normalize_domain;
 
 const WHOIS_PORT: u16 = 43;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -153,34 +154,7 @@ impl WhoisClient {
     }
 }
 
-fn normalize_domain(domain: &str) -> Result<String> {
-    let domain = domain.trim().to_lowercase();
-
-    // Remove protocol if present
-    let domain = domain
-        .strip_prefix("http://")
-        .or_else(|| domain.strip_prefix("https://"))
-        .unwrap_or(&domain);
-
-    // Remove trailing slash and path
-    let domain = domain.split('/').next().unwrap_or(&domain);
-
-    // Remove www. prefix
-    let domain = domain.strip_prefix("www.").unwrap_or(domain);
-
-    // Validate domain format
-    if domain.is_empty() || !domain.contains('.') {
-        return Err(SeerError::InvalidDomain(domain.to_string()));
-    }
-
-    // Basic validation - alphanumeric, hyphens, and dots
-    let valid = domain.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-');
-    if !valid {
-        return Err(SeerError::InvalidDomain(domain.to_string()));
-    }
-
-    Ok(domain.to_string())
-}
+// Domain normalization is now handled by the shared validation module
 
 fn extract_referral(response: &str) -> Option<String> {
     let patterns = [

@@ -371,7 +371,8 @@ impl OutputFormatter for HumanFormatter {
         output.push(format!("\n  {}:", self.label("Results by Region")));
         for region in &regions {
             output.push(format!("\n    {}:", self.label(region)));
-            for server_result in by_region.get(region).unwrap() {
+            if let Some(server_results) = by_region.get(region) {
+                for server_result in server_results {
                 let status_icon = if server_result.success { "✓" } else { "✗" };
                 let status_colored = if server_result.success {
                     self.success(status_icon)
@@ -406,6 +407,7 @@ impl OutputFormatter for HumanFormatter {
                     values,
                     server_result.response_time_ms
                 ));
+                }
             }
         }
 
@@ -590,9 +592,9 @@ impl OutputFormatter for HumanFormatter {
                 .http_status_text
                 .as_deref()
                 .unwrap_or("Unknown");
-            let status_display = if status >= 200 && status < 300 {
+            let status_display = if (200..300).contains(&status) {
                 self.success(&format!("{} ({})", status, status_text))
-            } else if status >= 300 && status < 400 {
+            } else if (300..400).contains(&status) {
                 self.warning(&format!("{} ({})", status, status_text))
             } else {
                 self.error(&format!("{} ({})", status, status_text))

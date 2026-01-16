@@ -275,8 +275,8 @@ impl Repl {
         let mut nameserver: Option<&str> = None;
 
         for arg in &args[1..] {
-            if arg.starts_with('@') {
-                nameserver = Some(&arg[1..]);
+            if let Some(ns) = arg.strip_prefix('@') {
+                nameserver = Some(ns);
             } else if let Ok(rt) = arg.parse() {
                 record_type = rt;
             }
@@ -364,7 +364,7 @@ impl Repl {
         progress.set_style(
             indicatif::ProgressStyle::default_bar()
                 .template("{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} {msg}")
-                .unwrap()
+                .expect("Progress bar template is hardcoded and should be valid")
                 .progress_chars("█▓░"),
         );
 

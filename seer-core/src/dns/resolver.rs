@@ -10,6 +10,7 @@ use tracing::{debug, instrument};
 
 use super::records::{DnsRecord, RecordData, RecordType};
 use crate::error::{Result, SeerError};
+use crate::validation::normalize_domain;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -68,7 +69,7 @@ impl DnsResolver {
         nameserver: Option<&str>,
     ) -> Result<Vec<DnsRecord>> {
         let resolver = self.create_resolver(nameserver)?;
-        let domain = normalize_domain(domain);
+        let domain = normalize_domain(domain)?;
 
         debug!(
             nameserver = nameserver.unwrap_or("system"),
@@ -433,9 +434,8 @@ impl DnsResolver {
         let records = response
             .record_iter()
             .filter_map(|record| {
-                if let Some(rdata) = record.data() {
-                    if let HickoryRData::DNSSEC(dnssec_rdata) = rdata {
-                        if let Some(dnskey) = dnssec_rdata.as_dnskey() {
+                if let Some(HickoryRData::DNSSEC(dnssec_rdata)) = record.data() {
+                    if let Some(dnskey) = dnssec_rdata.as_dnskey() {
                             use base64::{engine::general_purpose::STANDARD, Engine};
                             let public_key = STANDARD.encode(dnskey.public_key());
                             return Some(DnsRecord {
@@ -450,7 +450,6 @@ impl DnsResolver {
                                 },
                             });
                         }
-                    }
                 }
                 None
             })
@@ -474,9 +473,8 @@ impl DnsResolver {
         let records = response
             .record_iter()
             .filter_map(|record| {
-                if let Some(rdata) = record.data() {
-                    if let HickoryRData::DNSSEC(dnssec_rdata) = rdata {
-                        if let Some(ds) = dnssec_rdata.as_ds() {
+                if let Some(HickoryRData::DNSSEC(dnssec_rdata)) = record.data() {
+                    if let Some(ds) = dnssec_rdata.as_ds() {
                             let digest = ds
                                 .digest()
                                 .iter()
@@ -494,7 +492,6 @@ impl DnsResolver {
                                 },
                             });
                         }
-                    }
                 }
                 None
             })
@@ -553,15 +550,7 @@ impl DnsResolver {
     }
 }
 
-fn normalize_domain(domain: &str) -> String {
-    let domain = domain.trim().to_lowercase();
-    let domain = domain
-        .strip_prefix("http://")
-        .or_else(|| domain.strip_prefix("https://"))
-        .unwrap_or(&domain);
-    let domain = domain.split('/').next().unwrap_or(&domain);
-    domain.strip_prefix("www.").unwrap_or(domain).to_string()
-}
+// Domain normalization is now handled by the shared validation module
 
 fn reverse_dns_name(ip: &IpAddr) -> String {
     match ip {

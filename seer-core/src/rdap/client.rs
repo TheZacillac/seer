@@ -10,6 +10,7 @@ use tracing::{debug, instrument};
 
 use super::types::RdapResponse;
 use crate::error::{Result, SeerError};
+use crate::validation::normalize_domain;
 
 const IANA_BOOTSTRAP_DNS: &str = "https://data.iana.org/rdap/dns.json";
 const IANA_BOOTSTRAP_IPV4: &str = "https://data.iana.org/rdap/ipv4.json";
@@ -332,21 +333,7 @@ impl RdapClient {
     }
 }
 
-fn normalize_domain(domain: &str) -> Result<String> {
-    let domain = domain.trim().to_lowercase();
-    let domain = domain
-        .strip_prefix("http://")
-        .or_else(|| domain.strip_prefix("https://"))
-        .unwrap_or(&domain);
-    let domain = domain.split('/').next().unwrap_or(&domain);
-    let domain = domain.strip_prefix("www.").unwrap_or(domain);
-
-    if domain.is_empty() || !domain.contains('.') {
-        return Err(SeerError::InvalidDomain(domain.to_string()));
-    }
-
-    Ok(domain.to_string())
-}
+// Domain normalization is now handled by the shared validation module
 
 fn ensure_trailing_slash(url: &str) -> String {
     if url.ends_with('/') {
@@ -385,8 +372,8 @@ fn ip_matches_prefix(prefix: &str, octets: &[u8; 4]) -> bool {
     let mask_bits = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(8);
     let full_octets = mask_bits / 8;
 
-    for i in 0..full_octets.min(prefix_octets.len()) {
-        if i >= 4 || prefix_octets.get(i) != Some(&octets[i]) {
+    for (i, &octet) in octets.iter().enumerate().take(full_octets.min(prefix_octets.len())) {
+        if i >= 4 || prefix_octets.get(i) != Some(&octet) {
             return false;
         }
     }
@@ -407,8 +394,8 @@ fn ipv6_matches_prefix(prefix: &str, segments: &[u16; 8]) -> bool {
         let mask_bits: usize = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(48);
         let full_segments = mask_bits / 16;
 
-        for i in 0..full_segments.min(8) {
-            if prefix_segments[i] != segments[i] {
+        for (i, &segment) in segments.iter().enumerate().take(full_segments.min(8)) {
+            if prefix_segments[i] != segment {
                 return false;
             }
         }

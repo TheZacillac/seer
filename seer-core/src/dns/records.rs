@@ -84,6 +84,7 @@ pub struct DnsRecord {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
+#[allow(clippy::upper_case_acronyms)]
 pub enum RecordData {
     A {
         address: String,
