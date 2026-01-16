@@ -87,7 +87,7 @@ impl StatusClient {
 
         let response = client
             .get(&url)
-            .header("User-Agent", "Seer/0.1.0")
+            .header("User-Agent", concat!("Seer/", env!("CARGO_PKG_VERSION")))
             .send()
             .await
             .map_err(|e| SeerError::HttpError(e.to_string()))?;

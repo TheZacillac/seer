@@ -36,7 +36,11 @@ from seer._seer import (
     bulk_propagation,
 )
 
-__version__ = "0.1.0"
+try:
+    from importlib.metadata import version
+    __version__ = version("seer")
+except Exception:
+    __version__ = "unknown"
 __all__ = [
     "whois",
     "rdap_domain",

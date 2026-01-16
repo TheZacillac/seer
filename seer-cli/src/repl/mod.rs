@@ -104,7 +104,7 @@ impl Repl {
         println!();
         println!(
             "  {} - Domain Name Helper",
-            "Seer v0.1.2".bright_purple().bold()
+            format!("Seer v{}", env!("CARGO_PKG_VERSION")).bright_purple().bold()
         );
         println!("  Type {} for available commands\n", "help".bright_green());
     }

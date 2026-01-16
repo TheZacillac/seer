@@ -5,12 +5,13 @@ import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from . import __version__
 from .routers import lookup, whois, rdap, dns, propagation, status
 
 app = FastAPI(
     title="Seer API",
     description="Domain name helper API - WHOIS, RDAP, DNS lookups, and propagation checking",
-    version="0.1.0",
+    version=__version__,
     docs_url="/docs",
     redoc_url="/redoc",
 )
@@ -49,7 +50,7 @@ async def root():
     """Root endpoint with API information."""
     return {
         "name": "Seer API",
-        "version": "0.1.0",
+        "version": __version__,
         "description": "Domain name helper API",
         "endpoints": {
             "lookup": "/lookup/{domain}",

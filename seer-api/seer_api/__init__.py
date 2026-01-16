@@ -1,3 +1,7 @@
 """Seer API - FastAPI server and MCP integration for domain utilities."""
 
-__version__ = "0.1.0"
+try:
+    from importlib.metadata import version
+    __version__ = version("seer-api")
+except Exception:
+    __version__ = "unknown"
