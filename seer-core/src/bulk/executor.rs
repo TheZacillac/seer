@@ -32,7 +32,7 @@ pub enum BulkOperation {
 #[serde(untagged)]
 pub enum BulkResultData {
     Whois(WhoisResponse),
-    Rdap(RdapResponse),
+    Rdap(Box<RdapResponse>),
     Dns(Vec<DnsRecord>),
     Propagation(PropagationResult),
     Lookup(LookupResult),
@@ -271,7 +271,7 @@ async fn execute_operation(
         }
         BulkOperation::Rdap { domain } => {
             let result = rdap_client.lookup_domain(domain).await?;
-            Ok(BulkResultData::Rdap(result))
+            Ok(BulkResultData::Rdap(Box::new(result)))
         }
         BulkOperation::Dns {
             domain,
@@ -327,10 +327,10 @@ csv,format,example.org
 "#;
 
         let domains = parse_domains_from_file(content);
-        assert_eq!(domains.len(), 4);
+        assert_eq!(domains.len(), 3);
         assert!(domains.contains(&"example.com".to_string()));
         assert!(domains.contains(&"google.com".to_string()));
         assert!(domains.contains(&"whitespace.com".to_string()));
-        assert!(domains.contains(&"csv".to_string())); // First column of CSV
+        // "invalid" and "csv" are filtered out because they don't contain a dot
     }
 }

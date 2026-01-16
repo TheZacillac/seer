@@ -12,7 +12,7 @@ impl Spinner {
             ProgressStyle::default_spinner()
                 .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
                 .template("{spinner:.cyan} {msg}")
-                .unwrap(),
+                .expect("Spinner template is hardcoded and should be valid"),
         );
         progress.set_message(message.to_string());
         progress.enable_steady_tick(Duration::from_millis(80));

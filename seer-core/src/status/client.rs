@@ -9,6 +9,7 @@ use tracing::{debug, instrument};
 use super::types::{CertificateInfo, DomainExpiration, StatusResponse};
 use crate::error::{Result, SeerError};
 use crate::lookup::SmartLookup;
+use crate::validation::validate_domain_safe;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -41,7 +42,8 @@ impl StatusClient {
     /// Check the status of a domain
     #[instrument(skip(self), fields(domain = %domain))]
     pub async fn check(&self, domain: &str) -> Result<StatusResponse> {
-        let domain = normalize_domain(domain);
+        // Validate domain and check for SSRF (prevents querying internal IPs)
+        let domain = validate_domain_safe(domain).await?;
         debug!("Checking status for domain: {}", domain);
 
         let mut response = StatusResponse::new(domain.clone());
@@ -177,16 +179,7 @@ impl StatusClient {
     }
 }
 
-/// Normalize a domain name (remove protocol, www, trailing slashes)
-fn normalize_domain(domain: &str) -> String {
-    let domain = domain.trim().to_lowercase();
-    let domain = domain
-        .strip_prefix("http://")
-        .or_else(|| domain.strip_prefix("https://"))
-        .unwrap_or(&domain);
-    let domain = domain.split('/').next().unwrap_or(&domain);
-    domain.strip_prefix("www.").unwrap_or(domain).to_string()
-}
+// Domain normalization and validation is now handled by the validation module
 
 /// Extract the title from HTML content
 fn extract_title(html: &str) -> Option<String> {

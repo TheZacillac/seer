@@ -10,7 +10,7 @@ use crate::whois::{WhoisClient, WhoisResponse};
 #[serde(tag = "source", rename_all = "lowercase")]
 pub enum LookupResult {
     Rdap {
-        data: RdapResponse,
+        data: Box<RdapResponse>,
         #[serde(skip_serializing_if = "Option::is_none")]
         whois_fallback: Option<WhoisResponse>,
     },
@@ -142,7 +142,7 @@ impl SmartLookup {
                     };
 
                     Ok(LookupResult::Rdap {
-                        data: rdap_data,
+                        data: Box::new(rdap_data),
                         whois_fallback,
                     })
                 } else {
@@ -172,7 +172,7 @@ impl SmartLookup {
                 // Try RDAP as fallback
                 let rdap_data = self.rdap_client.lookup_domain(domain).await?;
                 Ok(LookupResult::Rdap {
-                    data: rdap_data,
+                    data: Box::new(rdap_data),
                     whois_fallback: None,
                 })
             }
