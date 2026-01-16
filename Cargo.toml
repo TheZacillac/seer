@@ -5,7 +5,7 @@ members = ["seer-core", "seer-cli", "seer-py"]
 [workspace.package]
 version = "0.1.2"
 edition = "2021"
-authors = ["Seer Contributors"]
+authors = ["Zac Roach"]
 license = "MIT"
 repository = "https://github.com/your-org/seer"
 
