@@ -206,8 +206,8 @@ seer-api/
 git clone https://github.com/your-org/seer.git
 cd seer
 
-# 2. Build Rust packages
-cargo build --release
+# 2. Install CLI to PATH (installs to ~/.cargo/bin/)
+cargo install --path seer-cli
 
 # 3. Build Python bindings
 cd seer-py
@@ -1199,14 +1199,17 @@ When making changes to this codebase:
 ### Common Commands
 
 ```bash
-# Build everything
+# Install CLI to PATH
+cargo install --path seer-cli
+
+# Run CLI (after installation)
+seer lookup example.com
+
+# Run REPL (after installation)
+seer
+
+# Build everything (without installing)
 cargo build --release
-
-# Run CLI
-./target/release/seer lookup example.com
-
-# Run REPL
-./target/release/seer
 
 # Run tests
 cargo test

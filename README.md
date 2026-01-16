@@ -17,13 +17,21 @@ A multi-interface domain name utility tool for querying domain registration info
 
 ### CLI (Rust)
 
-Build from source:
+Install the CLI to your PATH using `cargo install`:
+
+```bash
+cargo install --path seer-cli
+```
+
+This installs the `seer` binary to `~/.cargo/bin/`, which is typically already in your PATH if you have Rust installed.
+
+**Alternative:** Build without installing:
 
 ```bash
 cargo build --release
 ```
 
-The binary will be available at `target/release/seer`.
+The binary will be available at `target/release/seer` (not in PATH).
 
 ### Python Library
 
