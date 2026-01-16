@@ -96,15 +96,15 @@ impl Repl {
 
     fn print_banner(&self) {
         println!();
-        println!("{}", "      ✦ ·:*¨¨¨¨¨¨¨¨¨¨¨¨¨¨¨¨¨¨*:· ✦".bright_cyan());
-        println!("{}", "          ╔═╗    ╔═╗    ╔═╗    ╦═╗".bright_purple());
-        println!("{}", "          ╚═╗    ╠═     ╠═     ╠╦╝".bright_purple());
-        println!("{}", "          ╚═╝    ╚═╝    ╚═╝    ╩╚═".bright_purple());
-        println!("{}", "        ✦ '·:*¨¨¨¨¨¨¨¨¨¨¨¨¨¨*:·' ✦".bright_cyan());
+        println!("{}", "  ✦ ·:*¨¨¨¨¨¨¨¨¨¨¨¨¨¨¨¨*:· ✦".bright_cyan());
+        println!("{}", "   ╔═╗    ╔═╗    ╔═╗    ╦═╗".bright_purple());
+        println!("{}", "   ╚═╗    ╠═     ╠═     ╠╦╝".bright_purple());
+        println!("{}", "   ╚═╝    ╚═╝    ╚═╝    ╩╚═".bright_purple());
+        println!("{}", "  ✦ '·:*¨¨¨¨¨¨¨¨¨¨¨¨¨¨*:·' ✦".bright_cyan());
         println!();
         println!(
             "  {} - Domain Name Helper",
-            "Seer v0.1.1".bright_purple().bold()
+            "Seer v0.1.2".bright_purple().bold()
         );
         println!("  Type {} for available commands\n", "help".bright_green());
     }

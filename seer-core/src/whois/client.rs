@@ -1,5 +1,7 @@
 use std::collections::HashSet;
+use std::sync::RwLock;
 use std::time::Duration;
+use once_cell::sync::Lazy;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
@@ -14,6 +16,11 @@ const WHOIS_PORT: u16 = 43;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_RESPONSE_SIZE: usize = 1024 * 1024; // 1MB
 const MAX_REFERRAL_DEPTH: u8 = 3;
+const IANA_WHOIS_SERVER: &str = "whois.iana.org";
+
+/// Cache for dynamically discovered WHOIS servers
+static DISCOVERED_SERVERS: Lazy<RwLock<std::collections::HashMap<String, String>>> =
+    Lazy::new(|| RwLock::new(std::collections::HashMap::new()));
 
 #[derive(Debug, Clone)]
 pub struct WhoisClient {
@@ -43,11 +50,25 @@ impl WhoisClient {
         let domain = normalize_domain(domain)?;
         let tld = get_tld(&domain).ok_or_else(|| SeerError::InvalidDomain(domain.clone()))?;
 
-        let whois_server = get_whois_server(tld)
-            .ok_or_else(|| SeerError::WhoisServerNotFound(tld.to_string()))?;
+        // Try static mapping first
+        let whois_server = if let Some(server) = get_whois_server(tld) {
+            server.to_string()
+        } else {
+            // Try cached discovered server
+            if let Some(server) = get_cached_server(tld) {
+                debug!(tld = %tld, server = %server, "Using cached WHOIS server");
+                server
+            } else {
+                // Query IANA to discover the WHOIS server
+                debug!(tld = %tld, "Querying IANA for WHOIS server");
+                let server = self.discover_whois_server(tld).await?;
+                cache_server(tld, &server);
+                server
+            }
+        };
 
         let mut visited = HashSet::new();
-        self.lookup_with_referrals(&domain, whois_server, 0, &mut visited)
+        self.lookup_with_referrals(&domain, &whois_server, 0, &mut visited)
             .await
     }
 
@@ -152,9 +173,78 @@ impl WhoisClient {
                 SeerError::WhoisError(format!("Failed to decode response: {}", e))
             })
     }
+
+    /// Discovers the WHOIS server for a TLD by querying IANA
+    async fn discover_whois_server(&self, tld: &str) -> Result<String> {
+        let response = self.query_server(IANA_WHOIS_SERVER, tld).await?;
+
+        // Parse IANA response to find the whois server
+        // IANA response format includes a line like: "whois:        whois.nic.xyz"
+        if let Some(server) = extract_iana_whois_server(&response) {
+            return Ok(server);
+        }
+
+        // No WHOIS server found - check for registration URL in remarks
+        if let Some(url) = extract_iana_registration_url(&response) {
+            return Err(SeerError::WhoisServerNotFound(format!(
+                "No WHOIS server for '.{}' - check whois directly via: {}",
+                tld, url
+            )));
+        }
+
+        Err(SeerError::WhoisServerNotFound(format!(
+            "No WHOIS server found for TLD '{}'",
+            tld
+        )))
+    }
 }
 
-// Domain normalization is now handled by the shared validation module
+/// Extracts the WHOIS server from an IANA response
+fn extract_iana_whois_server(response: &str) -> Option<String> {
+    for line in response.lines() {
+        let line = line.trim();
+        if line.to_lowercase().starts_with("whois:") {
+            let server = line[6..].trim();
+            if !server.is_empty() {
+                return Some(server.to_lowercase());
+            }
+        }
+    }
+    None
+}
+
+/// Extracts the registration URL from an IANA response remarks field
+fn extract_iana_registration_url(response: &str) -> Option<String> {
+    for line in response.lines() {
+        let line = line.trim();
+        if line.to_lowercase().starts_with("remarks:") {
+            let remarks = line[8..].trim();
+            // Look for URL patterns in remarks
+            if let Some(url_start) = remarks.find("http") {
+                let url = &remarks[url_start..];
+                // Extract URL (ends at whitespace or end of line)
+                let url_end = url.find(char::is_whitespace).unwrap_or(url.len());
+                return Some(url[..url_end].to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Gets a cached WHOIS server for a TLD
+fn get_cached_server(tld: &str) -> Option<String> {
+    DISCOVERED_SERVERS
+        .read()
+        .ok()
+        .and_then(|cache| cache.get(&tld.to_lowercase()).cloned())
+}
+
+/// Caches a discovered WHOIS server for a TLD
+fn cache_server(tld: &str, server: &str) {
+    if let Ok(mut cache) = DISCOVERED_SERVERS.write() {
+        cache.insert(tld.to_lowercase(), server.to_string());
+    }
+}
 
 fn extract_referral(response: &str) -> Option<String> {
     let patterns = [
