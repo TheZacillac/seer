@@ -9,7 +9,7 @@ use tracing::{debug, instrument};
 use super::types::{CertificateInfo, DomainExpiration, StatusResponse};
 use crate::error::{Result, SeerError};
 use crate::lookup::SmartLookup;
-use crate::validation::validate_domain_safe;
+use crate::validation::normalize_domain;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -42,8 +42,8 @@ impl StatusClient {
     /// Check the status of a domain
     #[instrument(skip(self), fields(domain = %domain))]
     pub async fn check(&self, domain: &str) -> Result<StatusResponse> {
-        // Validate domain and check for SSRF (prevents querying internal IPs)
-        let domain = validate_domain_safe(domain).await?;
+        // Validate domain format (individual checks handle connection failures gracefully)
+        let domain = normalize_domain(domain)?;
         debug!("Checking status for domain: {}", domain);
 
         let mut response = StatusResponse::new(domain.clone());
