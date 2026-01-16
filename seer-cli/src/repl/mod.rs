@@ -104,7 +104,7 @@ impl Repl {
         println!();
         println!(
             "  {} - Domain Name Helper",
-            "Seer v0.1.0".bright_purple().bold()
+            "Seer v0.1.1".bright_purple().bold()
         );
         println!("  Type {} for available commands\n", "help".bright_green());
     }
@@ -154,29 +154,28 @@ impl Repl {
     }
 
     fn print_help(&self) {
-        println!("\n{}", "Available Commands:".bright_purple().bold().underline());
         println!();
-        println!("  {}       Smart lookup (RDAP first, WHOIS fallback)", "lookup <domain>".bright_cyan());
-        println!("  {}         Look up WHOIS information", "whois <domain>".bright_cyan());
-        println!("  {}          Look up RDAP for domain/IP/ASN", "rdap <query>".bright_cyan());
-        println!("  {} Query DNS records", "dig <domain> [type] [@server]".bright_cyan());
-        println!("  {}   Check DNS propagation", "propagation <domain> [type]".bright_cyan());
-        println!("    Types: A, AAAA, CNAME, MX, NS, TXT, SOA, PTR, SRV, CAA, DNSKEY, DS");
+        println!("{}", "LOOKUP COMMANDS".bright_purple().bold());
+        println!("  {:<34} {}", "lookup <domain>".bright_cyan(), "Smart lookup (RDAP first, WHOIS fallback)");
+        println!("  {:<34} {}", "whois <domain>".bright_cyan(), "Query WHOIS information");
+        println!("  {:<34} {}", "rdap <domain|ip|asn>".bright_cyan(), "Query RDAP registry data");
         println!();
-        println!("  {}       Check HTTP, SSL, and expiration", "status <domain>".bright_cyan());
+        println!("{}", "DNS COMMANDS".bright_purple().bold());
+        println!("  {:<34} {}", "dig <domain> [type] [@server]".bright_cyan(), "Query DNS records");
+        println!("  {:<34} {}", "propagation <domain> [type]".bright_cyan(), "Check DNS propagation globally");
+        println!("  {}", "Record types: A, AAAA, CNAME, MX, NS, TXT, SOA, PTR, SRV, CAA".dimmed());
         println!();
-        println!("  {}  Bulk operations from file", "bulk <operation> <file>".bright_cyan());
-        println!("    Operations: lookup, whois, rdap, dig, propagation, status");
+        println!("{}", "STATUS COMMANDS".bright_purple().bold());
+        println!("  {:<34} {}", "status <domain>".bright_cyan(), "Check HTTP, SSL, and domain expiration");
         println!();
-        println!("  {} Change output format (human/json)", "set output <format>".bright_cyan());
-        println!("  {}                         Clear screen", "clear".bright_cyan());
-        println!("  {}                          Exit the program", "exit".bright_cyan());
+        println!("{}", "BULK OPERATIONS".bright_purple().bold());
+        println!("  {:<34} {}", "bulk <op> <file>".bright_cyan(), "Run bulk operations from file");
+        println!("  {}", "Operations: lookup, whois, rdap, dig, propagation, status".dimmed());
         println!();
-        println!("{}", "Examples:".bright_purple().bold().underline());
-        println!("  seer› lookup example.com");
-        println!("  seer› dig google.com MX @8.8.8.8");
-        println!("  seer› status cloudflare.com");
-        println!("  seer› bulk whois domains.txt");
+        println!("{}", "SETTINGS".bright_purple().bold());
+        println!("  {:<34} {}", "set output <human|json>".bright_cyan(), "Change output format");
+        println!("  {:<34} {}", "clear".bright_cyan(), "Clear screen");
+        println!("  {:<34} {}", "exit".bright_cyan(), "Exit the program");
         println!();
     }
 
