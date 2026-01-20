@@ -206,11 +206,16 @@ impl OutputFormatter for HumanFormatter {
         }
 
         if let Some(expires) = response.expiration_date() {
-            output.push(format!(
-                "  {}: {}",
-                self.label("Expires"),
-                self.value(&expires.format("%Y-%m-%d").to_string())
-            ));
+            let days_until = (expires - chrono::Utc::now()).num_days();
+            let expiry_str = expires.format("%Y-%m-%d").to_string();
+            let status = if days_until < 30 {
+                self.error(&format!("{} (expires in {} days!)", expiry_str, days_until))
+            } else if days_until < 90 {
+                self.warning(&format!("{} ({} days)", expiry_str, days_until))
+            } else {
+                self.value(&format!("{} ({} days)", expiry_str, days_until))
+            };
+            output.push(format!("  {}: {}", self.label("Expires"), status));
         }
 
         if let Some(updated) = response.last_updated() {
