@@ -56,6 +56,13 @@ pub enum SeerError {
         failures: Vec<(String, String)>,
     },
 
+    #[error("Lookup failed for {domain}: {details}\n\nTip: Try checking the registry directly at: {registry_url}")]
+    LookupFailed {
+        domain: String,
+        details: String,
+        registry_url: String,
+    },
+
     #[error("{0}")]
     Other(String),
 }

@@ -2,7 +2,10 @@ mod display;
 mod repl;
 
 use clap::{Parser, Subcommand};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::terminal;
 use seer_core::colors::CatppuccinExt;
+use seer_core::output::OutputFormatter;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -68,6 +71,26 @@ enum Commands {
     Status {
         /// Domain name to check
         domain: String,
+    },
+    /// Monitor DNS records over time
+    Follow {
+        /// Domain name to monitor
+        domain: String,
+        /// Number of checks to perform
+        #[arg(default_value = "10")]
+        iterations: usize,
+        /// Minutes between checks (can be decimal, e.g., 0.5 for 30 seconds)
+        #[arg(default_value = "1")]
+        interval_minutes: f64,
+        /// Record type (A, AAAA, MX, NS, TXT, etc.)
+        #[arg(default_value = "A")]
+        record_type: String,
+        /// Nameserver to query (e.g., @8.8.8.8)
+        #[arg(short, long)]
+        server: Option<String>,
+        /// Only show output when records change
+        #[arg(long)]
+        changes_only: bool,
     },
 }
 
@@ -259,7 +282,116 @@ async fn execute_command(
                 }
             }
         }
+        Commands::Follow {
+            domain,
+            iterations,
+            interval_minutes,
+            record_type,
+            server,
+            changes_only,
+        } => {
+            let rt: seer_core::RecordType = record_type.parse()?;
+            let ns = server.as_ref().map(|s| s.trim_start_matches('@'));
+
+            let config = seer_core::FollowConfig::new(iterations, interval_minutes)
+                .with_changes_only(changes_only);
+
+            let follower = seer_core::DnsFollower::new();
+
+            // Set up cancellation channel
+            let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+
+            // Set up Ctrl+C handler
+            let cancel_tx_ctrlc = cancel_tx.clone();
+            tokio::spawn(async move {
+                tokio::signal::ctrl_c().await.ok();
+                let _ = cancel_tx_ctrlc.send(true);
+            });
+
+            // Enable raw mode for Escape key detection
+            let raw_mode_enabled = terminal::enable_raw_mode().is_ok();
+
+            // Spawn a task to listen for Escape key
+            let cancel_tx_esc = cancel_tx.clone();
+            let key_listener = tokio::spawn(async move {
+                loop {
+                    if event::poll(std::time::Duration::from_millis(100)).unwrap_or(false) {
+                        if let Ok(Event::Key(KeyEvent { code, modifiers, .. })) = event::read() {
+                            match code {
+                                KeyCode::Esc => {
+                                    let _ = cancel_tx_esc.send(true);
+                                    break;
+                                }
+                                KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
+                                    let _ = cancel_tx_esc.send(true);
+                                    break;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    if cancel_tx_esc.is_closed() {
+                        break;
+                    }
+                }
+            });
+
+            // Create progress callback for real-time output
+            let use_json = matches!(output_format, seer_core::output::OutputFormat::Json);
+            let callback: seer_core::dns::FollowProgressCallback =
+                std::sync::Arc::new(move |iteration| {
+                    if use_json {
+                        let json_formatter = seer_core::output::JsonFormatter::new();
+                        println!("{}", json_formatter.format_follow_iteration(iteration));
+                    } else {
+                        let human_formatter = seer_core::output::HumanFormatter::new();
+                        println!("{}", human_formatter.format_follow_iteration(iteration));
+                    }
+                });
+
+            println!(
+                "Following {} {} records ({} iterations, {} interval)",
+                domain.ctp_green(),
+                record_type.ctp_yellow(),
+                iterations.to_string().ctp_yellow(),
+                format_interval(interval_minutes)
+            );
+            println!("Press {} or {} to stop early\n", "Esc".ctp_yellow(), "Ctrl+C".ctp_yellow());
+
+            let result = follower
+                .follow(&domain, rt, ns, config, Some(callback), Some(cancel_rx))
+                .await;
+
+            // Clean up
+            key_listener.abort();
+            if raw_mode_enabled {
+                let _ = terminal::disable_raw_mode();
+            }
+
+            match result {
+                Ok(result) => {
+                    if result.interrupted {
+                        println!("\n{}", "Follow interrupted by user".ctp_yellow());
+                    }
+                    println!("\n{}", formatter.format_follow(&result));
+                }
+                Err(e) => {
+                    eprintln!("{} {}", "Error:".ctp_red(), e);
+                    std::process::exit(1);
+                }
+            }
+        }
     }
 
     Ok(())
+}
+
+fn format_interval(minutes: f64) -> String {
+    if minutes < 1.0 {
+        format!("{}s", (minutes * 60.0) as u64)
+    } else if minutes == 1.0 {
+        "1m".to_string()
+    } else {
+        format!("{}m", minutes)
+    }
 }

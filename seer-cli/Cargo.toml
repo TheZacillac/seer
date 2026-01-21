@@ -15,7 +15,7 @@ name = "seer"
 path = "src/main.rs"
 
 [dependencies]
-seer-core = { version = "0.1.5", path = "../seer-core" }
+seer-core = { version = "0.1.51", path = "../seer-core" }
 tokio = { workspace = true }
 rustyline = { workspace = true }
 colored = { workspace = true }
@@ -26,4 +26,5 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 serde_json = { workspace = true }
+crossterm = { workspace = true }
 dirs = "5"

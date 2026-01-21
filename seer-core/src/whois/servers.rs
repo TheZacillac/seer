@@ -467,3 +467,37 @@ pub fn get_whois_server(tld: &str) -> Option<&'static str> {
 pub fn get_tld(domain: &str) -> Option<&str> {
     domain.rsplit('.').next()
 }
+
+/// Get a suggested registry website URL for a TLD.
+/// This derives the URL from the WHOIS server hostname when possible.
+pub fn get_registry_url(tld: &str) -> Option<String> {
+    let tld_lower = tld.to_lowercase();
+
+    // Special cases for well-known registries
+    match tld_lower.as_str() {
+        "com" | "net" | "cc" | "tv" => return Some("https://www.verisign.com/en_US/domain-names/index.xhtml".to_string()),
+        "org" => return Some("https://thenew.org/org-people/domain-management/whois/".to_string()),
+        "edu" => return Some("https://www.educause.edu/whois".to_string()),
+        "gov" => return Some("https://domains.dotgov.gov/".to_string()),
+        "app" | "dev" | "page" => return Some("https://www.registry.google/policies/whois/".to_string()),
+        _ => {}
+    }
+
+    // Try to derive URL from WHOIS server
+    if let Some(whois_server) = get_whois_server(&tld_lower) {
+        // Pattern: whois.nic.XX -> https://nic.XX
+        if let Some(suffix) = whois_server.strip_prefix("whois.nic.") {
+            return Some(format!("https://nic.{}", suffix));
+        }
+        // Pattern: whois.XX -> https://www.nic.XX or https://XX registry
+        if whois_server.starts_with("whois.") {
+            // For ccTLDs, try the nic.TLD pattern
+            if tld_lower.len() == 2 {
+                return Some(format!("https://nic.{}", tld_lower));
+            }
+        }
+    }
+
+    // Fallback: suggest IANA's TLD info page
+    Some(format!("https://www.iana.org/domains/root/db/{}.html", tld_lower))
+}

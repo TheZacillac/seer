@@ -5,16 +5,31 @@ pub use commands::{CommandContext, CommandResult};
 pub use completer::SeerCompleter;
 
 use std::io::Write;
+use std::sync::Arc;
 
 use colored::Colorize;
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::terminal;
 use rustyline::error::ReadlineError;
 use rustyline::history::DefaultHistory;
 use rustyline::{CompletionType, Editor};
 use seer_core::colors::CatppuccinExt;
+use seer_core::output::OutputFormatter;
+use tokio::sync::watch;
 
 use crate::display::Spinner;
 
 const HISTORY_FILE: &str = ".seer_history";
+
+fn format_interval(minutes: f64) -> String {
+    if minutes < 1.0 {
+        format!("{}s", (minutes * 60.0) as u64)
+    } else if minutes == 1.0 {
+        "1m".to_string()
+    } else {
+        format!("{}m", minutes)
+    }
+}
 
 pub struct Repl {
     editor: Editor<SeerCompleter, DefaultHistory>,
@@ -143,6 +158,7 @@ impl Repl {
             "propagation" | "prop" => self.execute_propagation(args).await,
             "bulk" => self.execute_bulk(args).await,
             "status" => self.execute_status(args).await,
+            "follow" => self.execute_follow(args).await,
             "set" => self.execute_set(args),
             "clear" => {
                 print!("\x1B[2J\x1B[1;1H");
@@ -163,6 +179,7 @@ impl Repl {
         println!("{}", "DNS COMMANDS".bright_purple().bold());
         println!("  {:<34} {}", "dig <domain> [type] [@server]".bright_cyan(), "Query DNS records");
         println!("  {:<34} {}", "propagation <domain> [type]".bright_cyan(), "Check DNS propagation globally");
+        println!("  {:<34} {}", "follow <domain> [n] [mins] [type] [@server]".bright_cyan(), "Monitor DNS records over time");
         println!("  {}", "Record types: A, AAAA, CNAME, MX, NS, TXT, SOA, PTR, SRV, CAA".dimmed());
         println!();
         println!("{}", "STATUS COMMANDS".bright_purple().bold());
@@ -467,6 +484,120 @@ impl Repl {
                 spinner.finish();
                 CommandResult::Error(e.to_string())
             }
+        }
+    }
+
+    async fn execute_follow(&self, args: &[&str]) -> CommandResult {
+        if args.is_empty() {
+            return CommandResult::Error(
+                "Usage: follow <domain> [iterations] [interval_minutes] [type] [@server]".to_string(),
+            );
+        }
+
+        let domain = args[0];
+        let mut iterations: usize = 10;
+        let mut interval_minutes: f64 = 1.0;
+        let mut record_type = seer_core::RecordType::A;
+        let mut nameserver: Option<&str> = None;
+
+        // Parse remaining args
+        for arg in &args[1..] {
+            if let Some(ns) = arg.strip_prefix('@') {
+                nameserver = Some(ns);
+            } else if let Ok(n) = arg.parse::<usize>() {
+                // First number is iterations, second is interval
+                if iterations == 10 {
+                    iterations = n;
+                } else {
+                    interval_minutes = n as f64;
+                }
+            } else if let Ok(mins) = arg.parse::<f64>() {
+                interval_minutes = mins;
+            } else if let Ok(rt) = arg.parse() {
+                record_type = rt;
+            }
+        }
+
+        let config = seer_core::FollowConfig::new(iterations, interval_minutes);
+
+        println!(
+            "Following {} {} records ({} iterations, {} interval)",
+            domain.ctp_green(),
+            record_type.to_string().ctp_yellow(),
+            iterations.to_string().ctp_yellow(),
+            format_interval(interval_minutes)
+        );
+        println!("Press {} or {} to stop early\n", "Esc".ctp_yellow(), "Ctrl+C".ctp_yellow());
+
+        let follower = seer_core::DnsFollower::new();
+
+        // Set up cancellation channel
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+
+        // Create progress callback for real-time output
+        let use_json = matches!(self.context.output_format, seer_core::output::OutputFormat::Json);
+        let callback: seer_core::dns::FollowProgressCallback =
+            Arc::new(move |iteration| {
+                if use_json {
+                    let json_formatter = seer_core::output::JsonFormatter::new();
+                    println!("{}", json_formatter.format_follow_iteration(iteration));
+                } else {
+                    let human_formatter = seer_core::output::HumanFormatter::new();
+                    println!("{}", human_formatter.format_follow_iteration(iteration));
+                }
+            });
+
+        // Enable raw mode to capture key presses
+        let raw_mode_enabled = terminal::enable_raw_mode().is_ok();
+
+        // Spawn a task to listen for Escape key or Ctrl+C
+        let cancel_tx_clone = cancel_tx.clone();
+        let key_listener = tokio::spawn(async move {
+            loop {
+                // Poll for events with a short timeout
+                if event::poll(std::time::Duration::from_millis(100)).unwrap_or(false) {
+                    if let Ok(Event::Key(KeyEvent { code, modifiers, .. })) = event::read() {
+                        match code {
+                            KeyCode::Esc => {
+                                let _ = cancel_tx_clone.send(true);
+                                break;
+                            }
+                            KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
+                                let _ = cancel_tx_clone.send(true);
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+
+                // Check if we should stop listening (main task completed)
+                if cancel_tx_clone.is_closed() {
+                    break;
+                }
+            }
+        });
+
+        let result = follower
+            .follow(domain, record_type, nameserver, config, Some(callback), Some(cancel_rx))
+            .await;
+
+        // Clean up: abort the key listener and disable raw mode
+        key_listener.abort();
+        if raw_mode_enabled {
+            let _ = terminal::disable_raw_mode();
+        }
+
+        match result {
+            Ok(result) => {
+                let formatter = seer_core::output::get_formatter(self.context.output_format);
+                if result.interrupted {
+                    println!("\n{}", "Follow interrupted by user".ctp_yellow());
+                }
+                println!("\n{}", formatter.format_follow(&result));
+                CommandResult::Continue
+            }
+            Err(e) => CommandResult::Error(e.to_string()),
         }
     }
 

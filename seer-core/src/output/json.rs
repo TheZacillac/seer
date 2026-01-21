@@ -1,5 +1,5 @@
 use super::OutputFormatter;
-use crate::dns::{DnsRecord, PropagationResult};
+use crate::dns::{DnsRecord, FollowIteration, FollowResult, PropagationResult};
 use crate::lookup::LookupResult;
 use crate::rdap::RdapResponse;
 use crate::status::StatusResponse;
@@ -57,5 +57,13 @@ impl OutputFormatter for JsonFormatter {
 
     fn format_status(&self, response: &StatusResponse) -> String {
         self.to_json(response)
+    }
+
+    fn format_follow_iteration(&self, iteration: &FollowIteration) -> String {
+        self.to_json(iteration)
+    }
+
+    fn format_follow(&self, result: &FollowResult) -> String {
+        self.to_json(result)
     }
 }

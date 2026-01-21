@@ -15,6 +15,7 @@ const COMMANDS: &[&str] = &[
     "dns",
     "propagation",
     "prop",
+    "follow",
     "bulk",
     "status",
     "set",
@@ -74,7 +75,7 @@ impl Completer for SeerCompleter {
         };
 
         match command.as_str() {
-            "dig" | "dns" | "propagation" | "prop" => {
+            "dig" | "dns" | "propagation" | "prop" | "follow" => {
                 // Complete record types
                 if words.len() >= 2 {
                     let matches: Vec<Pair> = RECORD_TYPES
@@ -176,6 +177,9 @@ impl Hinter for SeerCompleter {
             }
             "status" if words.len() == 1 && line.ends_with(' ') => {
                 Some(" <domain>".to_string())
+            }
+            "follow" if words.len() == 1 && line.ends_with(' ') => {
+                Some(" <domain> [iterations] [interval_minutes] [type] [@server]".to_string())
             }
             _ => None,
         }

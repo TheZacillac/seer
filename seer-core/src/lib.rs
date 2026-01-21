@@ -12,7 +12,7 @@ pub mod whois;
 pub use error::{Result, SeerError};
 pub use validation::{normalize_domain, validate_domain_safe};
 
-pub use dns::{DnsRecord, DnsResolver, PropagationResult, RecordType};
+pub use dns::{DnsFollower, DnsRecord, DnsResolver, FollowConfig, FollowIteration, FollowResult, PropagationResult, RecordType};
 pub use lookup::{LookupResult, SmartLookup};
 pub use rdap::{RdapClient, RdapResponse};
 pub use status::{CertificateInfo, DomainExpiration, StatusClient, StatusResponse};

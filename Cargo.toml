@@ -3,7 +3,7 @@ resolver = "2"
 members = ["seer-core", "seer-cli", "seer-py"]
 
 [workspace.package]
-version = "0.1.5"
+version = "0.1.51"
 edition = "2021"
 authors = ["Zac Roach"]
 license = "MIT"
@@ -36,6 +36,7 @@ colored = "2"
 indicatif = "0.17"
 comfy-table = "7"
 clap = { version = "4", features = ["derive"] }
+crossterm = "0.28"
 
 # Python bindings
 pyo3 = { version = "0.23", features = ["extension-module", "abi3-py39"] }

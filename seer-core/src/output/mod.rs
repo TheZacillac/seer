@@ -33,6 +33,8 @@ pub trait OutputFormatter {
     fn format_propagation(&self, result: &crate::dns::PropagationResult) -> String;
     fn format_lookup(&self, result: &crate::lookup::LookupResult) -> String;
     fn format_status(&self, response: &crate::status::StatusResponse) -> String;
+    fn format_follow_iteration(&self, iteration: &crate::dns::FollowIteration) -> String;
+    fn format_follow(&self, result: &crate::dns::FollowResult) -> String;
 }
 
 pub fn get_formatter(format: OutputFormat) -> Box<dyn OutputFormatter> {

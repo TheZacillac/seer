@@ -1,12 +1,28 @@
+use chrono::TimeDelta;
 use colored::Colorize;
 
 use super::OutputFormatter;
 use crate::colors::CatppuccinExt;
-use crate::dns::{DnsRecord, PropagationResult};
+use crate::dns::{DnsRecord, FollowIteration, FollowResult, PropagationResult};
 use crate::lookup::LookupResult;
 use crate::rdap::RdapResponse;
 use crate::status::StatusResponse;
 use crate::whois::WhoisResponse;
+
+fn format_duration(duration: TimeDelta) -> String {
+    let total_secs = duration.num_seconds();
+    if total_secs < 60 {
+        format!("{}s", total_secs)
+    } else if total_secs < 3600 {
+        let mins = total_secs / 60;
+        let secs = total_secs % 60;
+        format!("{}m {}s", mins, secs)
+    } else {
+        let hours = total_secs / 3600;
+        let mins = (total_secs % 3600) / 60;
+        format!("{}h {}m", hours, mins)
+    }
+}
 
 pub struct HumanFormatter {
     use_colors: bool,
@@ -697,6 +713,136 @@ impl OutputFormatter for HumanFormatter {
                 self.label("Expires"),
                 expiry_display
             ));
+        }
+
+        output.join("\n")
+    }
+
+    fn format_follow_iteration(&self, iteration: &FollowIteration) -> String {
+        let mut output = Vec::new();
+
+        let time_str = iteration.timestamp.format("%H:%M:%S").to_string();
+        let iter_str = format!(
+            "Iteration {}/{}",
+            iteration.iteration, iteration.total_iterations
+        );
+
+        if let Some(ref error) = iteration.error {
+            output.push(format!(
+                "[{}] {}: {}",
+                self.label(&time_str),
+                iter_str,
+                self.error(error)
+            ));
+            return output.join("\n");
+        }
+
+        let record_count = iteration.record_count();
+        let status = if iteration.iteration == 1 {
+            "".to_string()
+        } else if iteration.changed {
+            format!(" ({})", self.warning("CHANGED"))
+        } else {
+            format!(" ({})", self.success("unchanged"))
+        };
+
+        output.push(format!(
+            "[{}] {}: {} record(s){}",
+            self.label(&time_str),
+            iter_str,
+            record_count,
+            status
+        ));
+
+        // Show records
+        if !iteration.records.is_empty() {
+            let values: Vec<String> = iteration
+                .records
+                .iter()
+                .map(|r| r.data.to_string())
+                .collect();
+            output.push(format!("  {}", self.value(&values.join("  "))));
+        }
+
+        // Show changes if any
+        if !iteration.added.is_empty() {
+            for added in &iteration.added {
+                output.push(format!("  {} {}", self.success("+"), self.success(added)));
+            }
+        }
+        if !iteration.removed.is_empty() {
+            for removed in &iteration.removed {
+                output.push(format!("  {} {}", self.error("-"), self.error(removed)));
+            }
+        }
+
+        output.join("\n")
+    }
+
+    fn format_follow(&self, result: &FollowResult) -> String {
+        let mut output = Vec::new();
+
+        output.push(self.header(&format!(
+            "DNS Follow Complete: {} {}",
+            result.domain, result.record_type
+        )));
+
+        // Summary
+        output.push(format!(
+            "  {}: {}/{}",
+            self.label("Iterations completed"),
+            result.completed_iterations(),
+            result.iterations_requested
+        ));
+
+        if result.interrupted {
+            output.push(format!(
+                "  {}: {}",
+                self.label("Status"),
+                self.warning("Interrupted")
+            ));
+        }
+
+        output.push(format!(
+            "  {}: {}",
+            self.label("Total changes detected"),
+            if result.total_changes > 0 {
+                self.warning(&result.total_changes.to_string())
+            } else {
+                self.success(&result.total_changes.to_string())
+            }
+        ));
+
+        let duration = result.ended_at - result.started_at;
+        output.push(format!(
+            "  {}: {}",
+            self.label("Duration"),
+            self.value(&format_duration(duration))
+        ));
+
+        // Show iteration details
+        if !result.iterations.is_empty() {
+            output.push(format!("\n  {}:", self.label("Iteration Details")));
+            for iteration in &result.iterations {
+                let time_str = iteration.timestamp.format("%H:%M:%S").to_string();
+                let status = if iteration.error.is_some() {
+                    self.error("ERROR")
+                } else if iteration.changed {
+                    self.warning("CHANGED")
+                } else if iteration.iteration == 1 {
+                    self.value("initial")
+                } else {
+                    self.success("stable")
+                };
+
+                output.push(format!(
+                    "    [{}] #{}: {} record(s) - {}",
+                    time_str,
+                    iteration.iteration,
+                    iteration.record_count(),
+                    status
+                ));
+            }
         }
 
         output.join("\n")

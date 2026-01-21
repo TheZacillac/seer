@@ -2,9 +2,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
-use crate::error::Result;
+use crate::error::{Result, SeerError};
 use crate::rdap::{RdapClient, RdapResponse};
-use crate::whois::{WhoisClient, WhoisResponse};
+use crate::whois::{WhoisClient, WhoisResponse, get_registry_url, get_tld};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "source", rename_all = "lowercase")]
@@ -180,11 +180,32 @@ impl SmartLookup {
     }
 
     async fn fallback_to_whois(&self, domain: &str, rdap_error: Option<&str>) -> Result<LookupResult> {
-        let whois_data = self.whois_client.lookup(domain).await?;
-        Ok(LookupResult::Whois {
-            data: whois_data,
-            rdap_error: rdap_error.map(String::from),
-        })
+        match self.whois_client.lookup(domain).await {
+            Ok(whois_data) => Ok(LookupResult::Whois {
+                data: whois_data,
+                rdap_error: rdap_error.map(String::from),
+            }),
+            Err(whois_err) => {
+                // Both RDAP and WHOIS failed - provide helpful error with registry suggestion
+                let tld = get_tld(domain).unwrap_or("unknown");
+                let registry_url = get_registry_url(tld)
+                    .unwrap_or_else(|| format!("https://www.iana.org/domains/root/db/{}.html", tld));
+
+                let details = match rdap_error {
+                    Some(rdap_err) => format!(
+                        "RDAP failed ({}), WHOIS also failed ({})",
+                        rdap_err, whois_err
+                    ),
+                    None => format!("WHOIS lookup failed ({})", whois_err),
+                };
+
+                Err(SeerError::LookupFailed {
+                    domain: domain.to_string(),
+                    details,
+                    registry_url,
+                })
+            }
+        }
     }
 
     fn is_rdap_response_useful(&self, response: &RdapResponse) -> bool {
