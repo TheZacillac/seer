@@ -754,25 +754,23 @@ impl OutputFormatter for HumanFormatter {
             status
         ));
 
-        // Show records
-        if !iteration.records.is_empty() {
-            let values: Vec<String> = iteration
-                .records
-                .iter()
-                .map(|r| r.data.to_string())
-                .collect();
-            output.push(format!("  {}", self.value(&values.join("  "))));
+        // Show records (each on its own line, trailing dots removed)
+        for record in &iteration.records {
+            let value = record.data.to_string().trim_end_matches('.').to_string();
+            output.push(format!("    {}", self.value(&value)));
         }
 
         // Show changes if any
         if !iteration.added.is_empty() {
             for added in &iteration.added {
-                output.push(format!("  {} {}", self.success("+"), self.success(added)));
+                let value = added.trim_end_matches('.');
+                output.push(format!("    {} {}", self.success("+"), self.success(value)));
             }
         }
         if !iteration.removed.is_empty() {
             for removed in &iteration.removed {
-                output.push(format!("  {} {}", self.error("-"), self.error(removed)));
+                let value = removed.trim_end_matches('.');
+                output.push(format!("    {} {}", self.error("-"), self.error(value)));
             }
         }
 
