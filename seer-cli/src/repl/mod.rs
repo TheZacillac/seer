@@ -165,14 +165,22 @@ impl Repl {
                 let _ = std::io::stdout().flush();
                 CommandResult::Continue
             }
-            _ => CommandResult::Error(format!("Unknown command: {}. Type 'help' for available commands.", command)),
+            // Default: treat as domain lookup if it looks like a domain
+            _ => {
+                // If the input contains a dot, assume it's a domain and run lookup
+                if command.contains('.') {
+                    self.execute_lookup(&parts).await
+                } else {
+                    CommandResult::Error(format!("Unknown command: {}. Type 'help' for available commands.", command))
+                }
+            }
         }
     }
 
     fn print_help(&self) {
         println!();
         println!("{}", "LOOKUP COMMANDS".bright_purple().bold());
-        println!("  {:<34} {}", "lookup <domain>".bright_cyan(), "Smart lookup (RDAP first, WHOIS fallback)");
+        println!("  {:<34} {}", "<domain>".bright_cyan(), "Smart lookup (just type a domain directly)");
         println!("  {:<34} {}", "whois <domain>".bright_cyan(), "Query WHOIS information");
         println!("  {:<34} {}", "rdap <domain|ip|asn>".bright_cyan(), "Query RDAP registry data");
         println!();
