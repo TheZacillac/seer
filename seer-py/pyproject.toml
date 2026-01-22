@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "seer"
-version = "0.1.6"
+version = "0.1.8"
 description = "Domain name helper - WHOIS, RDAP, DIG, and propagation checking"
 readme = "README.md"
 license = { text = "MIT" }
