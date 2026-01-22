@@ -393,6 +393,9 @@ RUST_LOG=debug seer lookup example.com
 - Hickory-resolver - DNS resolution
 - Serde - Serialization
 
+**Data Sources**
+- WHOIS server list sourced from [WooMai/whois-servers](https://github.com/WooMai/whois-servers) (auto-synced with IANA Root Zone Database)
+
 **CLI**
 - Clap - Command-line parsing
 - Rustyline - REPL line editing
