@@ -1,7 +1,9 @@
 use std::collections::HashSet;
 use std::sync::RwLock;
 use std::time::Duration;
+
 use once_cell::sync::Lazy;
+use regex::Regex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
@@ -11,6 +13,15 @@ use super::parser::WhoisResponse;
 use super::servers::{get_tld, get_whois_server};
 use crate::error::{Result, SeerError};
 use crate::validation::normalize_domain;
+
+/// Pre-compiled regexes for extracting WHOIS referral servers
+static REFERRAL_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
+    vec![
+        Regex::new(r"(?i)Registrar WHOIS Server:\s*(.+)").unwrap(),
+        Regex::new(r"(?i)Whois Server:\s*(.+)").unwrap(),
+        Regex::new(r"(?i)ReferralServer:\s*whois://(.+)").unwrap(),
+    ]
+});
 
 const WHOIS_PORT: u16 = 43;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -267,20 +278,12 @@ fn cache_server(tld: &str, server: &str) {
 }
 
 fn extract_referral(response: &str) -> Option<String> {
-    let patterns = [
-        r"(?i)Registrar WHOIS Server:\s*(.+)",
-        r"(?i)Whois Server:\s*(.+)",
-        r"(?i)ReferralServer:\s*whois://(.+)",
-    ];
-
-    for pattern in &patterns {
-        if let Ok(re) = regex::Regex::new(pattern) {
-            if let Some(caps) = re.captures(response) {
-                if let Some(m) = caps.get(1) {
-                    let server = m.as_str().trim().to_lowercase();
-                    if !server.is_empty() && server.contains('.') {
-                        return Some(server);
-                    }
+    for re in REFERRAL_PATTERNS.iter() {
+        if let Some(caps) = re.captures(response) {
+            if let Some(m) = caps.get(1) {
+                let server = m.as_str().trim().to_lowercase();
+                if !server.is_empty() && server.contains('.') {
+                    return Some(server);
                 }
             }
         }

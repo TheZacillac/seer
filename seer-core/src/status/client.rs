@@ -2,14 +2,19 @@ use std::time::Duration;
 
 use chrono::Utc;
 use native_tls::TlsConnector;
+use once_cell::sync::Lazy;
 use regex::Regex;
 use tokio::net::TcpStream;
 use tracing::{debug, instrument};
 
+/// Pre-compiled regex for extracting HTML title
+static TITLE_REGEX: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)<title[^>]*>([^<]+)</title>").unwrap());
+
 use super::types::{CertificateInfo, DomainExpiration, StatusResponse};
 use crate::error::{Result, SeerError};
 use crate::lookup::SmartLookup;
-use crate::validation::normalize_domain;
+use crate::validation::validate_domain_safe;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -42,8 +47,8 @@ impl StatusClient {
     /// Check the status of a domain
     #[instrument(skip(self), fields(domain = %domain))]
     pub async fn check(&self, domain: &str) -> Result<StatusResponse> {
-        // Validate domain format (individual checks handle connection failures gracefully)
-        let domain = normalize_domain(domain)?;
+        // Validate domain format and check for SSRF (resolves domain and blocks private IPs)
+        let domain = validate_domain_safe(domain).await?;
         debug!("Checking status for domain: {}", domain);
 
         let mut response = StatusResponse::new(domain.clone());
@@ -183,22 +188,31 @@ impl StatusClient {
 
 /// Extract the title from HTML content
 fn extract_title(html: &str) -> Option<String> {
-    let re = Regex::new(r"(?i)<title[^>]*>([^<]+)</title>").ok()?;
-    re.captures(html)
+    TITLE_REGEX
+        .captures(html)
         .and_then(|caps| caps.get(1))
         .map(|m| m.as_str().trim().to_string())
         .filter(|s| !s.is_empty())
 }
 
-/// Parse certificate information from DER-encoded certificate
+/// Parse certificate information from DER-encoded certificate using x509-parser
 fn parse_certificate_der(der: &[u8], _domain: &str) -> Result<CertificateInfo> {
-    // Validate the DER is a proper certificate
-    let _ = native_tls::Certificate::from_der(der)
-        .map_err(|e| SeerError::CertificateError(e.to_string()))?;
+    use x509_parser::prelude::*;
 
-    // Parse the DER manually to extract dates and names
-    // This is a simplified parser for X.509 certificates
-    let (issuer, subject, valid_from, valid_until) = parse_x509_basic(der)?;
+    let (_, cert) = X509Certificate::from_der(der)
+        .map_err(|e| SeerError::CertificateError(format!("Failed to parse certificate: {}", e)))?;
+
+    // Extract issuer - prefer CN, fall back to O (Organization)
+    let issuer = extract_name_from_x509(cert.issuer())
+        .unwrap_or_else(|| "Unknown Issuer".to_string());
+
+    // Extract subject - prefer CN, fall back to O (Organization)
+    let subject = extract_name_from_x509(cert.subject())
+        .unwrap_or_else(|| "Unknown Subject".to_string());
+
+    // Extract validity dates
+    let valid_from = asn1_time_to_chrono(cert.validity().not_before)?;
+    let valid_until = asn1_time_to_chrono(cert.validity().not_after)?;
 
     let now = Utc::now();
     let days_until_expiry = (valid_until - now).num_days();
@@ -214,162 +228,38 @@ fn parse_certificate_der(der: &[u8], _domain: &str) -> Result<CertificateInfo> {
     })
 }
 
-/// Basic X.509 certificate parser to extract issuer, subject, and validity dates
-fn parse_x509_basic(
-    der: &[u8],
-) -> Result<(String, String, chrono::DateTime<Utc>, chrono::DateTime<Utc>)> {
-    // This is a simplified parser that extracts common certificate fields
-    // by looking for known ASN.1 patterns
+/// Extract Common Name or Organization from X.509 name
+fn extract_name_from_x509(name: &x509_parser::prelude::X509Name) -> Option<String> {
+    use x509_parser::prelude::*;
 
-    let issuer = extract_cn_from_der(der, true).unwrap_or_else(|| "Unknown Issuer".to_string());
-    let subject = extract_cn_from_der(der, false).unwrap_or_else(|| "Unknown Subject".to_string());
-
-    // Extract validity dates
-    let (valid_from, valid_until) = extract_validity_from_der(der)?;
-
-    Ok((issuer, subject, valid_from, valid_until))
-}
-
-/// Extract Common Name from DER certificate (simplified)
-fn extract_cn_from_der(der: &[u8], is_issuer: bool) -> Option<String> {
-    // Look for the OID 2.5.4.3 (Common Name) followed by the value
-    // OID encoding: 55 04 03 (2.5.4.3)
-    let cn_oid = [0x55, 0x04, 0x03];
-
-    let mut found_first = false;
-    for i in 0..der.len().saturating_sub(10) {
-        if der[i..].starts_with(&cn_oid) {
-            if is_issuer && found_first {
-                // Skip to subject's CN
-                continue;
-            }
-            if !is_issuer && !found_first {
-                found_first = true;
-                continue;
-            }
-
-            // The CN value follows the OID
-            // Skip OID (3 bytes) + type tag (1 byte) + length (1 byte)
-            let start = i + 5;
-            if start < der.len() {
-                let len = der[i + 4] as usize;
-                let end = (start + len).min(der.len());
-                if let Ok(s) = std::str::from_utf8(&der[start..end]) {
+    // Try Common Name first (OID 2.5.4.3)
+    for rdn in name.iter() {
+        for attr in rdn.iter() {
+            if attr.attr_type() == &oid_registry::OID_X509_COMMON_NAME {
+                if let Ok(s) = attr.attr_value().as_str() {
                     return Some(s.to_string());
                 }
             }
         }
     }
 
-    // Fallback: look for Organization name if CN not found
-    let org_oid = [0x55, 0x04, 0x0a]; // 2.5.4.10 (Organization)
-    for i in 0..der.len().saturating_sub(10) {
-        if der[i..].starts_with(&org_oid) {
-            let start = i + 5;
-            if start < der.len() {
-                let len = der[i + 4] as usize;
-                let end = (start + len).min(der.len());
-                if let Ok(s) = std::str::from_utf8(&der[start..end]) {
+    // Fall back to Organization (OID 2.5.4.10)
+    for rdn in name.iter() {
+        for attr in rdn.iter() {
+            if attr.attr_type() == &oid_registry::OID_X509_ORGANIZATION_NAME {
+                if let Ok(s) = attr.attr_value().as_str() {
                     return Some(s.to_string());
                 }
             }
-            break;
         }
     }
 
     None
 }
 
-/// Extract validity dates from DER certificate
-fn extract_validity_from_der(
-    der: &[u8],
-) -> Result<(chrono::DateTime<Utc>, chrono::DateTime<Utc>)> {
-    // Look for UTCTime (tag 0x17) or GeneralizedTime (tag 0x18) patterns
-    // Validity is typically a SEQUENCE containing two time values
-
-    let mut times: Vec<chrono::DateTime<Utc>> = Vec::new();
-
-    let mut i = 0;
-    while i < der.len().saturating_sub(15) && times.len() < 2 {
-        // UTCTime: tag 0x17, typically 13 bytes (YYMMDDHHMMSSZ)
-        if der[i] == 0x17 && i + 1 < der.len() {
-            let len = der[i + 1] as usize;
-            if len >= 13 && i + 2 + len <= der.len() {
-                if let Ok(s) = std::str::from_utf8(&der[i + 2..i + 2 + len]) {
-                    if let Some(dt) = parse_utc_time(s) {
-                        times.push(dt);
-                    }
-                }
-            }
-        }
-        // GeneralizedTime: tag 0x18, typically 15 bytes (YYYYMMDDHHMMSSZ)
-        else if der[i] == 0x18 && i + 1 < der.len() {
-            let len = der[i + 1] as usize;
-            if len >= 15 && i + 2 + len <= der.len() {
-                if let Ok(s) = std::str::from_utf8(&der[i + 2..i + 2 + len]) {
-                    if let Some(dt) = parse_generalized_time(s) {
-                        times.push(dt);
-                    }
-                }
-            }
-        }
-        i += 1;
-    }
-
-    if times.len() >= 2 {
-        Ok((times[0], times[1]))
-    } else {
-        Err(SeerError::CertificateError(
-            "Could not parse certificate validity dates".to_string(),
-        ))
-    }
-}
-
-/// Parse UTCTime format (YYMMDDHHMMSSZ)
-fn parse_utc_time(s: &str) -> Option<chrono::DateTime<Utc>> {
-    use chrono::NaiveDateTime;
-
-    let s = s.trim_end_matches('Z');
-    if s.len() < 12 {
-        return None;
-    }
-
-    let year: i32 = s[0..2].parse().ok()?;
-    let year = if year >= 50 { 1900 + year } else { 2000 + year };
-    let month: u32 = s[2..4].parse().ok()?;
-    let day: u32 = s[4..6].parse().ok()?;
-    let hour: u32 = s[6..8].parse().ok()?;
-    let min: u32 = s[8..10].parse().ok()?;
-    let sec: u32 = s[10..12].parse().ok()?;
-
-    NaiveDateTime::parse_from_str(
-        &format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", year, month, day, hour, min, sec),
-        "%Y-%m-%d %H:%M:%S",
-    )
-    .ok()
-    .map(|dt| dt.and_utc())
-}
-
-/// Parse GeneralizedTime format (YYYYMMDDHHMMSSZ)
-fn parse_generalized_time(s: &str) -> Option<chrono::DateTime<Utc>> {
-    use chrono::NaiveDateTime;
-
-    let s = s.trim_end_matches('Z');
-    if s.len() < 14 {
-        return None;
-    }
-
-    let year: i32 = s[0..4].parse().ok()?;
-    let month: u32 = s[4..6].parse().ok()?;
-    let day: u32 = s[6..8].parse().ok()?;
-    let hour: u32 = s[8..10].parse().ok()?;
-    let min: u32 = s[10..12].parse().ok()?;
-    let sec: u32 = s[12..14].parse().ok()?;
-
-    NaiveDateTime::parse_from_str(
-        &format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", year, month, day, hour, min, sec),
-        "%Y-%m-%d %H:%M:%S",
-    )
-    .ok()
-    .map(|dt| dt.and_utc())
+/// Convert x509-parser ASN1Time to chrono DateTime
+fn asn1_time_to_chrono(time: x509_parser::time::ASN1Time) -> Result<chrono::DateTime<Utc>> {
+    let timestamp = time.timestamp();
+    chrono::DateTime::from_timestamp(timestamp, 0)
+        .ok_or_else(|| SeerError::CertificateError("Invalid certificate timestamp".to_string()))
 }

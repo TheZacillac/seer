@@ -1,6 +1,81 @@
 use chrono::{DateTime, Utc};
+use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+
+/// Pre-compiled regexes for WHOIS field extraction
+static REGISTRAR_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
+    vec![
+        Regex::new(r"(?i)Registrar:\s*(.+)").unwrap(),
+        Regex::new(r"(?i)Registrar Name:\s*(.+)").unwrap(),
+        Regex::new(r"(?i)Sponsoring Registrar:\s*(.+)").unwrap(),
+    ]
+});
+
+static REGISTRANT_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
+    vec![
+        Regex::new(r"(?i)Registrant Organization:\s*(.+)").unwrap(),
+        Regex::new(r"(?i)Registrant Name:\s*(.+)").unwrap(),
+        Regex::new(r"(?i)Registrant:\s*(.+)").unwrap(),
+        Regex::new(r"(?i)org-name:\s*(.+)").unwrap(),
+    ]
+});
+
+static CREATION_DATE_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
+    vec![
+        Regex::new(r"(?i)Creation Date:\s*(.+)").unwrap(),
+        Regex::new(r"(?i)Created Date:\s*(.+)").unwrap(),
+        Regex::new(r"(?i)Created On:\s*(.+)").unwrap(),
+        Regex::new(r"(?i)Created:\s*(.+)").unwrap(),
+        Regex::new(r"(?i)Registration Date:\s*(.+)").unwrap(),
+        Regex::new(r"(?i)Domain Registration Date:\s*(.+)").unwrap(),
+    ]
+});
+
+static EXPIRATION_DATE_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
+    vec![
+        Regex::new(r"(?i)(?:Registry )?Expir(?:y|ation) Date:\s*(.+)").unwrap(),
+        Regex::new(r"(?i)Expiration Date:\s*(.+)").unwrap(),
+        Regex::new(r"(?i)Expires On:\s*(.+)").unwrap(),
+        Regex::new(r"(?i)Expires:\s*(.+)").unwrap(),
+        Regex::new(r"(?i)Expiry Date:\s*(.+)").unwrap(),
+        Regex::new(r"(?i)paid-till:\s*(.+)").unwrap(),
+    ]
+});
+
+static UPDATED_DATE_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
+    vec![
+        Regex::new(r"(?i)Updated Date:\s*(.+)").unwrap(),
+        Regex::new(r"(?i)Last Updated On:\s*(.+)").unwrap(),
+        Regex::new(r"(?i)Last Modified:\s*(.+)").unwrap(),
+        Regex::new(r"(?i)Last Update:\s*(.+)").unwrap(),
+        Regex::new(r"(?i)Modified:\s*(.+)").unwrap(),
+    ]
+});
+
+static DNSSEC_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
+    vec![
+        Regex::new(r"(?i)DNSSEC:\s*(.+)").unwrap(),
+        Regex::new(r"(?i)DNSSEC Status:\s*(.+)").unwrap(),
+    ]
+});
+
+static NAMESERVER_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
+    vec![
+        Regex::new(r"(?i)Name Server:\s*(.+)").unwrap(),
+        Regex::new(r"(?i)Nameserver:\s*(.+)").unwrap(),
+        Regex::new(r"(?i)nserver:\s*(.+)").unwrap(),
+        Regex::new(r"(?i)NS:\s*(.+)").unwrap(),
+    ]
+});
+
+static STATUS_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
+    vec![
+        Regex::new(r"(?i)Domain Status:\s*(.+)").unwrap(),
+        Regex::new(r"(?i)Status:\s*(.+)").unwrap(),
+        Regex::new(r"(?i)state:\s*(.+)").unwrap(),
+    ]
+});
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WhoisResponse {
@@ -19,52 +94,14 @@ pub struct WhoisResponse {
 
 impl WhoisResponse {
     pub fn parse(domain: &str, whois_server: &str, raw: &str) -> Self {
-        let registrar = extract_field(raw, &[
-            r"(?i)Registrar:\s*(.+)",
-            r"(?i)Registrar Name:\s*(.+)",
-            r"(?i)Sponsoring Registrar:\s*(.+)",
-        ]);
-
-        let registrant = extract_field(raw, &[
-            r"(?i)Registrant Organization:\s*(.+)",
-            r"(?i)Registrant Name:\s*(.+)",
-            r"(?i)Registrant:\s*(.+)",
-            r"(?i)org-name:\s*(.+)",
-        ]);
-
-        let creation_date = extract_date(raw, &[
-            r"(?i)Creation Date:\s*(.+)",
-            r"(?i)Created Date:\s*(.+)",
-            r"(?i)Created On:\s*(.+)",
-            r"(?i)Created:\s*(.+)",
-            r"(?i)Registration Date:\s*(.+)",
-            r"(?i)Domain Registration Date:\s*(.+)",
-        ]);
-
-        let expiration_date = extract_date(raw, &[
-            r"(?i)(?:Registry )?Expir(?:y|ation) Date:\s*(.+)",
-            r"(?i)Expiration Date:\s*(.+)",
-            r"(?i)Expires On:\s*(.+)",
-            r"(?i)Expires:\s*(.+)",
-            r"(?i)Expiry Date:\s*(.+)",
-            r"(?i)paid-till:\s*(.+)",
-        ]);
-
-        let updated_date = extract_date(raw, &[
-            r"(?i)Updated Date:\s*(.+)",
-            r"(?i)Last Updated On:\s*(.+)",
-            r"(?i)Last Modified:\s*(.+)",
-            r"(?i)Last Update:\s*(.+)",
-            r"(?i)Modified:\s*(.+)",
-        ]);
-
+        let registrar = extract_field_with_patterns(raw, &REGISTRAR_PATTERNS);
+        let registrant = extract_field_with_patterns(raw, &REGISTRANT_PATTERNS);
+        let creation_date = extract_date_with_patterns(raw, &CREATION_DATE_PATTERNS);
+        let expiration_date = extract_date_with_patterns(raw, &EXPIRATION_DATE_PATTERNS);
+        let updated_date = extract_date_with_patterns(raw, &UPDATED_DATE_PATTERNS);
         let nameservers = extract_nameservers(raw);
         let status = extract_status(raw);
-
-        let dnssec = extract_field(raw, &[
-            r"(?i)DNSSEC:\s*(.+)",
-            r"(?i)DNSSEC Status:\s*(.+)",
-        ]);
+        let dnssec = extract_field_with_patterns(raw, &DNSSEC_PATTERNS);
 
         WhoisResponse {
             domain: domain.to_string(),
@@ -114,15 +151,13 @@ impl WhoisResponse {
     }
 }
 
-fn extract_field(text: &str, patterns: &[&str]) -> Option<String> {
-    for pattern in patterns {
-        if let Ok(re) = Regex::new(pattern) {
-            if let Some(caps) = re.captures(text) {
-                if let Some(m) = caps.get(1) {
-                    let value = m.as_str().trim().to_string();
-                    if !value.is_empty() && value.to_lowercase() != "redacted" {
-                        return Some(value);
-                    }
+fn extract_field_with_patterns(text: &str, patterns: &[Regex]) -> Option<String> {
+    for re in patterns {
+        if let Some(caps) = re.captures(text) {
+            if let Some(m) = caps.get(1) {
+                let value = m.as_str().trim().to_string();
+                if !value.is_empty() && value.to_lowercase() != "redacted" {
+                    return Some(value);
                 }
             }
         }
@@ -130,8 +165,8 @@ fn extract_field(text: &str, patterns: &[&str]) -> Option<String> {
     None
 }
 
-fn extract_date(text: &str, patterns: &[&str]) -> Option<DateTime<Utc>> {
-    let date_str = extract_field(text, patterns)?;
+fn extract_date_with_patterns(text: &str, patterns: &[Regex]) -> Option<DateTime<Utc>> {
+    let date_str = extract_field_with_patterns(text, patterns)?;
     parse_date(&date_str)
 }
 
@@ -174,23 +209,14 @@ fn parse_date(date_str: &str) -> Option<DateTime<Utc>> {
 }
 
 fn extract_nameservers(text: &str) -> Vec<String> {
-    let patterns = [
-        r"(?i)Name Server:\s*(.+)",
-        r"(?i)Nameserver:\s*(.+)",
-        r"(?i)nserver:\s*(.+)",
-        r"(?i)NS:\s*(.+)",
-    ];
-
     let mut nameservers = Vec::new();
 
-    for pattern in &patterns {
-        if let Ok(re) = Regex::new(pattern) {
-            for caps in re.captures_iter(text) {
-                if let Some(m) = caps.get(1) {
-                    let ns = m.as_str().trim().to_lowercase();
-                    if !ns.is_empty() && !nameservers.contains(&ns) {
-                        nameservers.push(ns);
-                    }
+    for re in NAMESERVER_PATTERNS.iter() {
+        for caps in re.captures_iter(text) {
+            if let Some(m) = caps.get(1) {
+                let ns = m.as_str().trim().to_lowercase();
+                if !ns.is_empty() && !nameservers.contains(&ns) {
+                    nameservers.push(ns);
                 }
             }
         }
@@ -200,24 +226,16 @@ fn extract_nameservers(text: &str) -> Vec<String> {
 }
 
 fn extract_status(text: &str) -> Vec<String> {
-    let patterns = [
-        r"(?i)Domain Status:\s*(.+)",
-        r"(?i)Status:\s*(.+)",
-        r"(?i)state:\s*(.+)",
-    ];
-
     let mut statuses = Vec::new();
 
-    for pattern in &patterns {
-        if let Ok(re) = Regex::new(pattern) {
-            for caps in re.captures_iter(text) {
-                if let Some(m) = caps.get(1) {
-                    let status = m.as_str().trim().to_string();
-                    // Extract just the status code without the URL
-                    let status = status.split_whitespace().next().unwrap_or(&status).to_string();
-                    if !status.is_empty() && !statuses.contains(&status) {
-                        statuses.push(status);
-                    }
+    for re in STATUS_PATTERNS.iter() {
+        for caps in re.captures_iter(text) {
+            if let Some(m) = caps.get(1) {
+                let status = m.as_str().trim().to_string();
+                // Extract just the status code without the URL
+                let status = status.split_whitespace().next().unwrap_or(&status).to_string();
+                if !status.is_empty() && !statuses.contains(&status) {
+                    statuses.push(status);
                 }
             }
         }

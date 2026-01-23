@@ -369,11 +369,16 @@ fn ip_matches_prefix(prefix: &str, octets: &[u8; 4]) -> bool {
         return false;
     }
 
-    let mask_bits = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(8);
+    // Validate and clamp mask_bits to valid IPv4 range (0-32)
+    let mask_bits: usize = parts
+        .get(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8)
+        .min(32);
     let full_octets = mask_bits / 8;
 
     for (i, &octet) in octets.iter().enumerate().take(full_octets.min(prefix_octets.len())) {
-        if i >= 4 || prefix_octets.get(i) != Some(&octet) {
+        if prefix_octets.get(i) != Some(&octet) {
             return false;
         }
     }
@@ -391,7 +396,12 @@ fn ipv6_matches_prefix(prefix: &str, segments: &[u16; 8]) -> bool {
     let prefix_str = parts[0];
     if let Ok(addr) = prefix_str.parse::<std::net::Ipv6Addr>() {
         let prefix_segments = addr.segments();
-        let mask_bits: usize = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(48);
+        // Validate and clamp mask_bits to valid IPv6 range (0-128)
+        let mask_bits: usize = parts
+            .get(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(48)
+            .min(128);
         let full_segments = mask_bits / 16;
 
         for (i, &segment) in segments.iter().enumerate().take(full_segments.min(8)) {

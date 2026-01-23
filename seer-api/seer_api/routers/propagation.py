@@ -2,12 +2,15 @@
 
 from typing import List
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
+from slowapi import Limiter
+from slowapi.util import get_remote_address
 
 import seer
 
 router = APIRouter()
+limiter = Limiter(key_func=get_remote_address)
 
 # Bulk operation limits
 MAX_BULK_DOMAINS = 100
@@ -23,7 +26,8 @@ class BulkPropagationRequest(BaseModel):
 
 
 @router.get("/{domain}/{record_type}")
-async def propagation_check(domain: str, record_type: str = "A"):
+@limiter.limit("20/minute")
+async def propagation_check(request: Request, domain: str, record_type: str = "A"):
     """
     Check DNS propagation for a domain across global DNS servers.
 
@@ -42,19 +46,20 @@ async def propagation_check(domain: str, record_type: str = "A"):
 
 
 @router.post("/bulk")
-async def bulk_propagation_check(request: BulkPropagationRequest):
+@limiter.limit("5/minute")
+async def bulk_propagation_check(request: Request, body: BulkPropagationRequest):
     """
     Check DNS propagation for multiple domains.
 
     Args:
-        request: BulkPropagationRequest with list of domains, record type, and concurrency
+        body: BulkPropagationRequest with list of domains, record type, and concurrency
 
     Returns:
         List of propagation results for each domain
     """
     try:
         results = seer.bulk_propagation(
-            request.domains, request.record_type, request.concurrency
+            body.domains, body.record_type, body.concurrency
         )
         return results
     except Exception as e:

@@ -2,12 +2,15 @@
 
 from typing import List
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
+from slowapi import Limiter
+from slowapi.util import get_remote_address
 
 import seer
 
 router = APIRouter()
+limiter = Limiter(key_func=get_remote_address)
 
 # Bulk operation limits
 MAX_BULK_DOMAINS = 100
@@ -22,7 +25,8 @@ class BulkWhoisRequest(BaseModel):
 
 
 @router.get("/{domain}")
-async def whois_lookup(domain: str):
+@limiter.limit("30/minute")
+async def whois_lookup(request: Request, domain: str):
     """
     Look up WHOIS information for a domain.
 
@@ -40,18 +44,19 @@ async def whois_lookup(domain: str):
 
 
 @router.post("/bulk")
-async def bulk_whois_lookup(request: BulkWhoisRequest):
+@limiter.limit("10/minute")
+async def bulk_whois_lookup(request: Request, body: BulkWhoisRequest):
     """
     Look up WHOIS information for multiple domains.
 
     Args:
-        request: BulkWhoisRequest with list of domains and optional concurrency
+        body: BulkWhoisRequest with list of domains and optional concurrency
 
     Returns:
         List of WHOIS results for each domain
     """
     try:
-        results = seer.bulk_whois(request.domains, request.concurrency)
+        results = seer.bulk_whois(body.domains, body.concurrency)
         return results
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))

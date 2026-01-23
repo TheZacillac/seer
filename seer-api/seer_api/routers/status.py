@@ -2,12 +2,15 @@
 
 from typing import List
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
+from slowapi import Limiter
+from slowapi.util import get_remote_address
 
 import seer
 
 router = APIRouter()
+limiter = Limiter(key_func=get_remote_address)
 
 # Bulk operation limits
 MAX_BULK_DOMAINS = 100
@@ -22,7 +25,8 @@ class BulkStatusRequest(BaseModel):
 
 
 @router.get("/{domain}")
-async def check_status(domain: str):
+@limiter.limit("20/minute")
+async def check_status(request: Request, domain: str):
     """
     Check the status of a domain.
 
@@ -46,18 +50,19 @@ async def check_status(domain: str):
 
 
 @router.post("/bulk")
-async def bulk_status(request: BulkStatusRequest):
+@limiter.limit("5/minute")
+async def bulk_status(request: Request, body: BulkStatusRequest):
     """
     Check status for multiple domains.
 
     Args:
-        request: BulkStatusRequest with list of domains and optional concurrency
+        body: BulkStatusRequest with list of domains and optional concurrency
 
     Returns:
         List of status results for each domain
     """
     try:
-        results = seer.bulk_status(request.domains, request.concurrency)
+        results = seer.bulk_status(body.domains, body.concurrency)
         return results
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))

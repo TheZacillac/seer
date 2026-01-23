@@ -628,10 +628,24 @@ fn bulk_results_to_csv(results: &[seer_core::bulk::BulkResult], operation: &str)
 }
 
 fn escape_csv_field(s: &str) -> String {
+    // Protect against CSV injection by prefixing formula-starting characters with a single quote
+    // This prevents Excel/Sheets from interpreting the content as a formula
+    let s = if s.starts_with('=')
+        || s.starts_with('+')
+        || s.starts_with('-')
+        || s.starts_with('@')
+        || s.starts_with('\t')
+        || s.starts_with('\r')
+    {
+        format!("'{}", s)
+    } else {
+        s.to_string()
+    };
+
     if s.contains(',') || s.contains('"') || s.contains('\n') {
         format!("\"{}\"", s.replace('"', "\"\""))
     } else {
-        s.to_string()
+        s
     }
 }
 

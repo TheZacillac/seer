@@ -1,14 +1,18 @@
 """RDAP API endpoints."""
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
+from slowapi import Limiter
+from slowapi.util import get_remote_address
 
 import seer
 
 router = APIRouter()
+limiter = Limiter(key_func=get_remote_address)
 
 
 @router.get("/domain/{domain}")
-async def rdap_domain_lookup(domain: str):
+@limiter.limit("30/minute")
+async def rdap_domain_lookup(request: Request, domain: str):
     """
     Look up RDAP information for a domain.
 
@@ -26,7 +30,8 @@ async def rdap_domain_lookup(domain: str):
 
 
 @router.get("/ip/{ip}")
-async def rdap_ip_lookup(ip: str):
+@limiter.limit("30/minute")
+async def rdap_ip_lookup(request: Request, ip: str):
     """
     Look up RDAP information for an IP address.
 
@@ -44,7 +49,8 @@ async def rdap_ip_lookup(ip: str):
 
 
 @router.get("/asn/{asn}")
-async def rdap_asn_lookup(asn: int):
+@limiter.limit("30/minute")
+async def rdap_asn_lookup(request: Request, asn: int):
     """
     Look up RDAP information for an Autonomous System Number.
 

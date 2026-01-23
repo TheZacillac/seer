@@ -2,11 +2,20 @@
 
 import os
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 
 from . import __version__
 from .routers import lookup, whois, rdap, dns, propagation, status
+
+# Rate limiter configuration
+# Configure via SEER_RATE_LIMIT env var (default: "30/minute")
+rate_limit = os.environ.get("SEER_RATE_LIMIT", "30/minute")
+limiter = Limiter(key_func=get_remote_address, default_limits=[rate_limit])
 
 app = FastAPI(
     title="Seer API",
@@ -15,6 +24,10 @@ app = FastAPI(
     docs_url="/docs",
     redoc_url="/redoc",
 )
+
+# Add rate limiter to app state and exception handler
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # CORS middleware - configure allowed origins via SEER_CORS_ORIGINS env var
 # For production, set SEER_CORS_ORIGINS to comma-separated list of allowed origins

@@ -2,12 +2,15 @@
 
 from typing import List
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
+from slowapi import Limiter
+from slowapi.util import get_remote_address
 
 import seer
 
 router = APIRouter()
+limiter = Limiter(key_func=get_remote_address)
 
 # Bulk operation limits
 MAX_BULK_DOMAINS = 100
@@ -22,7 +25,8 @@ class BulkLookupRequest(BaseModel):
 
 
 @router.get("/{domain}")
-async def smart_lookup(domain: str):
+@limiter.limit("30/minute")
+async def smart_lookup(request: Request, domain: str):
     """
     Smart lookup for a domain (tries RDAP first, falls back to WHOIS).
 
@@ -40,18 +44,19 @@ async def smart_lookup(domain: str):
 
 
 @router.post("/bulk")
-async def bulk_smart_lookup(request: BulkLookupRequest):
+@limiter.limit("10/minute")
+async def bulk_smart_lookup(request: Request, body: BulkLookupRequest):
     """
     Smart lookup for multiple domains.
 
     Args:
-        request: BulkLookupRequest with list of domains and optional concurrency
+        body: BulkLookupRequest with list of domains and optional concurrency
 
     Returns:
         List of lookup results for each domain
     """
     try:
-        results = seer.bulk_lookup(request.domains, request.concurrency)
+        results = seer.bulk_lookup(body.domains, body.concurrency)
         return results
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
