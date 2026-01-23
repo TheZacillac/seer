@@ -102,18 +102,38 @@ impl WhoisClient {
             debug!(whois_server = %whois_server, depth = depth, "Querying WHOIS server");
 
             let raw_response = self.query_server(whois_server, domain).await?;
+            let current_response = WhoisResponse::parse(domain, whois_server, &raw_response);
 
             // Check for referral to another WHOIS server
             if let Some(referral) = extract_referral(&raw_response) {
                 if referral != whois_server && !visited.contains(&referral.to_lowercase()) {
                     debug!(referral = %referral, "Following referral");
-                    return self
+                    match self
                         .lookup_with_referrals(domain, &referral, depth + 1, visited)
-                        .await;
+                        .await
+                    {
+                        Ok(referral_response) => {
+                            // If referral indicates domain not found or has less data,
+                            // prefer the current response which has registry data
+                            if referral_response.is_available() || referral_response.indicates_not_found() {
+                                debug!(
+                                    referral = %referral,
+                                    "Referral server indicates domain not found, using registry response"
+                                );
+                                return Ok(current_response);
+                            }
+                            return Ok(referral_response);
+                        }
+                        Err(e) => {
+                            // If referral fails, use the current response if it has data
+                            warn!(referral = %referral, error = %e, "Referral lookup failed, using registry response");
+                            return Ok(current_response);
+                        }
+                    }
                 }
             }
 
-            Ok(WhoisResponse::parse(domain, whois_server, &raw_response))
+            Ok(current_response)
         })
     }
 

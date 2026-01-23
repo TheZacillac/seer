@@ -91,10 +91,26 @@ impl WhoisResponse {
             "status: available",
             "domain not found",
             "no object found",
+            "does not exist",
         ];
 
         let lower = self.raw_response.to_lowercase();
         available_patterns.iter().any(|p| lower.contains(p))
+    }
+
+    /// Checks if the response indicates the registrar doesn't have data for this domain.
+    /// This is different from is_available() - the domain may exist at the registry level
+    /// but the referral registrar may not have data for it.
+    pub fn indicates_not_found(&self) -> bool {
+        let not_found_patterns = [
+            "queried object does not exist",
+            "object does not exist",
+            "no match for domain",
+            "domain is not registered",
+        ];
+
+        let lower = self.raw_response.to_lowercase();
+        not_found_patterns.iter().any(|p| lower.contains(p))
     }
 }
 
