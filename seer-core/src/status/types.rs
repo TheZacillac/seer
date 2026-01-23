@@ -16,6 +16,8 @@ pub struct StatusResponse {
     pub certificate: Option<CertificateInfo>,
     /// Domain registration expiration information
     pub domain_expiration: Option<DomainExpiration>,
+    /// DNS root record resolution information
+    pub dns_resolution: Option<DnsResolution>,
 }
 
 /// SSL certificate information
@@ -46,6 +48,21 @@ pub struct DomainExpiration {
     pub registrar: Option<String>,
 }
 
+/// DNS root record resolution information
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DnsResolution {
+    /// IPv4 addresses (A records)
+    pub a_records: Vec<String>,
+    /// IPv6 addresses (AAAA records)
+    pub aaaa_records: Vec<String>,
+    /// CNAME target if domain is an alias
+    pub cname_target: Option<String>,
+    /// Authoritative nameservers
+    pub nameservers: Vec<String>,
+    /// Whether domain resolves (has A/AAAA or CNAME)
+    pub resolves: bool,
+}
+
 impl StatusResponse {
     /// Create a new StatusResponse with just the domain name
     pub fn new(domain: String) -> Self {
@@ -56,6 +73,7 @@ impl StatusResponse {
             title: None,
             certificate: None,
             domain_expiration: None,
+            dns_resolution: None,
         }
     }
 }

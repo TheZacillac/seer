@@ -29,9 +29,9 @@ Example Usage:
   seer bulk status domains.txt -o out.csv   # Output: out.csv
 
 Example Output (status operation):
-  domain,success,http_status,http_status_text,title,ssl_issuer,ssl_valid_until,ssl_days_remaining,domain_expires,domain_days_remaining,registrar,duration_ms,error
-  example.com,true,200,OK,Example Domain,DigiCert Inc,2025-03-01,89,2025-08-13,204,RESERVED-Internet Assigned Numbers Authority,1245,
-  google.com,true,200,OK,Google,Google Trust Services,2025-02-15,75,2028-09-14,1332,MarkMonitor Inc.,892,
+  domain,success,http_status,http_status_text,title,ssl_issuer,ssl_valid_until,ssl_days_remaining,domain_expires,domain_days_remaining,registrar,dns_resolves,dns_a_records,dns_aaaa_records,dns_cname,dns_nameservers,duration_ms,error
+  example.com,true,200,OK,Example Domain,DigiCert Inc,2025-03-01,89,2025-08-13,204,RESERVED-Internet Assigned Numbers Authority,true,93.184.216.34,2606:2800:220:1:248:1893:25c8:1946,,a.iana-servers.net;b.iana-servers.net,1245,
+  google.com,true,200,OK,Google,Google Trust Services,2025-02-15,75,2028-09-14,1332,MarkMonitor Inc.,true,142.250.185.46,2607:f8b0:4004:800::200e,,ns1.google.com;ns2.google.com,892,
 
 Example Output (lookup/whois/rdap operation):
   domain,success,registrar,created,expires,updated,duration_ms,error
@@ -170,12 +170,26 @@ async fn execute_command(
 
     match command {
         Commands::Lookup { domain } => {
+            let spinner = std::sync::Arc::new(display::Spinner::new(&format!(
+                "Smart lookup for {} (trying RDAP first)",
+                domain
+            )));
+
+            // Create progress callback that updates the spinner
+            let spinner_clone = spinner.clone();
+            let progress: seer_core::LookupProgressCallback =
+                std::sync::Arc::new(move |message| {
+                    spinner_clone.set_message(message);
+                });
+
             let lookup = seer_core::SmartLookup::new();
-            match lookup.lookup(&domain).await {
+            match lookup.lookup_with_progress(&domain, Some(progress)).await {
                 Ok(result) => {
+                    spinner.finish();
                     println!("{}", formatter.format_lookup(&result));
                 }
                 Err(e) => {
+                    spinner.finish();
                     eprintln!("{} {}", "Error:".ctp_red(), e);
                     std::process::exit(1);
                 }
@@ -485,7 +499,7 @@ fn bulk_results_to_csv(results: &[seer_core::bulk::BulkResult], operation: &str)
     // Write header based on operation type
     match operation {
         "status" => {
-            csv.push_str("domain,success,http_status,http_status_text,title,ssl_issuer,ssl_valid_until,ssl_days_remaining,domain_expires,domain_days_remaining,registrar,duration_ms,error\n");
+            csv.push_str("domain,success,http_status,http_status_text,title,ssl_issuer,ssl_valid_until,ssl_days_remaining,domain_expires,domain_days_remaining,registrar,dns_resolves,dns_a_records,dns_aaaa_records,dns_cname,dns_nameservers,duration_ms,error\n");
         }
         "lookup" | "whois" | "rdap" => {
             csv.push_str("domain,success,registrar,created,expires,updated,duration_ms,error\n");
@@ -526,14 +540,31 @@ fn bulk_results_to_csv(results: &[seer_core::bulk::BulkResult], operation: &str)
                     } else {
                         Default::default()
                     };
+                let (dns_resolves, dns_a, dns_aaaa, dns_cname, dns_ns) =
+                    if let Some(BulkResultData::Status(ref s)) = result.data {
+                        (
+                            s.dns_resolution.as_ref().map(|d| d.resolves.to_string()).unwrap_or_default(),
+                            s.dns_resolution.as_ref().map(|d| d.a_records.join(";")).unwrap_or_default(),
+                            s.dns_resolution.as_ref().map(|d| d.aaaa_records.join(";")).unwrap_or_default(),
+                            s.dns_resolution.as_ref().and_then(|d| d.cname_target.clone()).unwrap_or_default(),
+                            s.dns_resolution.as_ref().map(|d| d.nameservers.join(";")).unwrap_or_default(),
+                        )
+                    } else {
+                        Default::default()
+                    };
                 csv.push_str(&format!(
-                    "{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+                    "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
                     domain, success, http_status,
                     escape_csv_field(&http_text),
                     escape_csv_field(&title),
                     escape_csv_field(&ssl_issuer),
                     ssl_valid_until, ssl_days, domain_expires, domain_days,
                     escape_csv_field(&registrar),
+                    dns_resolves,
+                    escape_csv_field(&dns_a),
+                    escape_csv_field(&dns_aaaa),
+                    escape_csv_field(&dns_cname),
+                    escape_csv_field(&dns_ns),
                     duration_ms, error
                 ));
             }

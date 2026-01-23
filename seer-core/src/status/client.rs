@@ -11,10 +11,11 @@ use tracing::{debug, instrument};
 static TITLE_REGEX: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?i)<title[^>]*>([^<]+)</title>").unwrap());
 
-use super::types::{CertificateInfo, DomainExpiration, StatusResponse};
+use super::types::{CertificateInfo, DnsResolution, DomainExpiration, StatusResponse};
+use crate::dns::{DnsResolver, RecordData, RecordType};
 use crate::error::{Result, SeerError};
 use crate::lookup::SmartLookup;
-use crate::validation::validate_domain_safe;
+use crate::validation::{is_private_or_reserved_ip, normalize_domain};
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -47,17 +48,19 @@ impl StatusClient {
     /// Check the status of a domain
     #[instrument(skip(self), fields(domain = %domain))]
     pub async fn check(&self, domain: &str) -> Result<StatusResponse> {
-        // Validate domain format and check for SSRF (resolves domain and blocks private IPs)
-        let domain = validate_domain_safe(domain).await?;
+        // Normalize domain format (doesn't require DNS resolution)
+        let domain = normalize_domain(domain)?;
         debug!("Checking status for domain: {}", domain);
 
         let mut response = StatusResponse::new(domain.clone());
 
-        // Fetch HTTP status and title concurrently with SSL cert info
-        let (http_result, cert_result, expiry_result) = tokio::join!(
+        // Fetch HTTP status, SSL cert info, domain expiration, and DNS resolution concurrently
+        // HTTP and SSL checks include SSRF protection internally
+        let (http_result, cert_result, expiry_result, dns_result) = tokio::join!(
             self.fetch_http_info(&domain),
             self.fetch_certificate_info(&domain),
-            self.fetch_domain_expiration(&domain)
+            self.fetch_domain_expiration(&domain),
+            self.fetch_dns_resolution(&domain)
         );
 
         // Apply HTTP info
@@ -77,11 +80,32 @@ impl StatusClient {
             response.domain_expiration = expiry_info;
         }
 
+        // Apply DNS resolution info
+        if let Ok(dns_info) = dns_result {
+            response.dns_resolution = Some(dns_info);
+        }
+
         Ok(response)
     }
 
     /// Fetch HTTP status code and page title
     async fn fetch_http_info(&self, domain: &str) -> Result<(u16, String, Option<String>)> {
+        // SSRF protection: resolve domain and check IPs before connecting
+        let addr = format!("{}:443", domain);
+        let socket_addrs: Vec<_> = tokio::net::lookup_host(&addr)
+            .await
+            .map_err(|e| SeerError::HttpError(format!("DNS lookup failed: {}", e)))?
+            .collect();
+
+        for socket_addr in &socket_addrs {
+            if is_private_or_reserved_ip(&socket_addr.ip()) {
+                return Err(SeerError::HttpError(format!(
+                    "Domain resolves to private/reserved IP: {}",
+                    socket_addr.ip()
+                )));
+            }
+        }
+
         let url = format!("https://{}", domain);
 
         let client = reqwest::Client::builder()
@@ -127,6 +151,22 @@ impl StatusClient {
 
     /// Fetch SSL certificate information using native-tls
     async fn fetch_certificate_info(&self, domain: &str) -> Result<CertificateInfo> {
+        // SSRF protection: resolve domain and check IPs before connecting
+        let addr = format!("{}:443", domain);
+        let socket_addrs: Vec<_> = tokio::net::lookup_host(&addr)
+            .await
+            .map_err(|e| SeerError::CertificateError(format!("DNS lookup failed: {}", e)))?
+            .collect();
+
+        for socket_addr in &socket_addrs {
+            if is_private_or_reserved_ip(&socket_addr.ip()) {
+                return Err(SeerError::CertificateError(format!(
+                    "Domain resolves to private/reserved IP: {}",
+                    socket_addr.ip()
+                )));
+            }
+        }
+
         let connector = TlsConnector::builder()
             .danger_accept_invalid_certs(true) // We want to see the cert even if invalid
             .build()
@@ -134,7 +174,6 @@ impl StatusClient {
 
         let connector = tokio_native_tls::TlsConnector::from(connector);
 
-        let addr = format!("{}:443", domain);
         let stream = tokio::time::timeout(self.timeout, TcpStream::connect(&addr))
             .await
             .map_err(|_| SeerError::Timeout(format!("Connection to {} timed out", domain)))?
@@ -181,6 +220,81 @@ impl StatusClient {
             }
             Err(_) => Ok(None), // Don't fail the whole status check if WHOIS fails
         }
+    }
+
+    /// Fetch DNS root record resolution (A, AAAA, CNAME, NS)
+    async fn fetch_dns_resolution(&self, domain: &str) -> Result<DnsResolution> {
+        let resolver = DnsResolver::new();
+
+        // Query all record types concurrently
+        let (a_result, aaaa_result, cname_result, ns_result) = tokio::join!(
+            resolver.resolve(domain, RecordType::A, None),
+            resolver.resolve(domain, RecordType::AAAA, None),
+            resolver.resolve(domain, RecordType::CNAME, None),
+            resolver.resolve(domain, RecordType::NS, None)
+        );
+
+        // Extract A records
+        let a_records: Vec<String> = a_result
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|r| {
+                if let RecordData::A { address } = r.data {
+                    Some(address)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Extract AAAA records
+        let aaaa_records: Vec<String> = aaaa_result
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|r| {
+                if let RecordData::AAAA { address } = r.data {
+                    Some(address)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Extract CNAME target (trim trailing dot)
+        let cname_target: Option<String> = cname_result
+            .unwrap_or_default()
+            .into_iter()
+            .find_map(|r| {
+                if let RecordData::CNAME { target } = r.data {
+                    Some(target.trim_end_matches('.').to_string())
+                } else {
+                    None
+                }
+            });
+
+        // Extract NS records (trim trailing dots)
+        let nameservers: Vec<String> = ns_result
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|r| {
+                if let RecordData::NS { nameserver } = r.data {
+                    Some(nameserver.trim_end_matches('.').to_string())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Domain resolves if it has A/AAAA records or a CNAME
+        let resolves = !a_records.is_empty() || !aaaa_records.is_empty() || cname_target.is_some();
+
+        Ok(DnsResolution {
+            a_records,
+            aaaa_records,
+            cname_target,
+            nameservers,
+            resolves,
+        })
     }
 }
 
@@ -236,8 +350,8 @@ fn extract_name_from_x509(name: &x509_parser::prelude::X509Name) -> Option<Strin
     for rdn in name.iter() {
         for attr in rdn.iter() {
             if attr.attr_type() == &oid_registry::OID_X509_COMMON_NAME {
-                if let Ok(s) = attr.attr_value().as_str() {
-                    return Some(s.to_string());
+                if let Some(s) = extract_attr_string(attr.attr_value()) {
+                    return Some(s);
                 }
             }
         }
@@ -247,11 +361,31 @@ fn extract_name_from_x509(name: &x509_parser::prelude::X509Name) -> Option<Strin
     for rdn in name.iter() {
         for attr in rdn.iter() {
             if attr.attr_type() == &oid_registry::OID_X509_ORGANIZATION_NAME {
-                if let Ok(s) = attr.attr_value().as_str() {
-                    return Some(s.to_string());
+                if let Some(s) = extract_attr_string(attr.attr_value()) {
+                    return Some(s);
                 }
             }
         }
+    }
+
+    None
+}
+
+/// Extract string from ASN.1 attribute value, handling different encodings
+fn extract_attr_string(value: &x509_parser::der_parser::asn1_rs::Any) -> Option<String> {
+    // Try as_str() first (handles PrintableString, IA5String, etc.)
+    if let Ok(s) = value.as_str() {
+        return Some(s.to_string());
+    }
+
+    // Try UTF8String explicitly
+    if let Ok(utf8) = value.as_utf8string() {
+        return Some(utf8.string().to_string());
+    }
+
+    // Try raw bytes as UTF-8
+    if let Ok(s) = std::str::from_utf8(value.data) {
+        return Some(s.to_string());
     }
 
     None

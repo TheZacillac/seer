@@ -14,10 +14,17 @@ static REGISTRAR_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
 
 static REGISTRANT_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
     vec![
-        Regex::new(r"(?i)Registrant Organization:\s*(.+)").unwrap(),
         Regex::new(r"(?i)Registrant Name:\s*(.+)").unwrap(),
         Regex::new(r"(?i)Registrant:\s*(.+)").unwrap(),
+    ]
+});
+
+static ORGANIZATION_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
+    vec![
+        Regex::new(r"(?i)Registrant Organization:\s*(.+)").unwrap(),
+        Regex::new(r"(?i)Organization:\s*(.+)").unwrap(),
         Regex::new(r"(?i)org-name:\s*(.+)").unwrap(),
+        Regex::new(r"(?i)Org Name:\s*(.+)").unwrap(),
     ]
 });
 
@@ -82,6 +89,7 @@ pub struct WhoisResponse {
     pub domain: String,
     pub registrar: Option<String>,
     pub registrant: Option<String>,
+    pub organization: Option<String>,
     pub creation_date: Option<DateTime<Utc>>,
     pub expiration_date: Option<DateTime<Utc>>,
     pub updated_date: Option<DateTime<Utc>>,
@@ -96,6 +104,7 @@ impl WhoisResponse {
     pub fn parse(domain: &str, whois_server: &str, raw: &str) -> Self {
         let registrar = extract_field_with_patterns(raw, &REGISTRAR_PATTERNS);
         let registrant = extract_field_with_patterns(raw, &REGISTRANT_PATTERNS);
+        let organization = extract_field_with_patterns(raw, &ORGANIZATION_PATTERNS);
         let creation_date = extract_date_with_patterns(raw, &CREATION_DATE_PATTERNS);
         let expiration_date = extract_date_with_patterns(raw, &EXPIRATION_DATE_PATTERNS);
         let updated_date = extract_date_with_patterns(raw, &UPDATED_DATE_PATTERNS);
@@ -107,6 +116,7 @@ impl WhoisResponse {
             domain: domain.to_string(),
             registrar,
             registrant,
+            organization,
             creation_date,
             expiration_date,
             updated_date,

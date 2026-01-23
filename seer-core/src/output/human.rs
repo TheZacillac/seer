@@ -120,6 +120,14 @@ impl OutputFormatter for HumanFormatter {
             ));
         }
 
+        if let Some(ref organization) = response.organization {
+            output.push(format!(
+                "  {}: {}",
+                self.label("Organization"),
+                self.value(organization)
+            ));
+        }
+
         if let Some(created) = response.creation_date {
             output.push(format!(
                 "  {}: {}",
@@ -210,6 +218,14 @@ impl OutputFormatter for HumanFormatter {
                 "  {}: {}",
                 self.label("Registrant"),
                 self.value(&registrant)
+            ));
+        }
+
+        if let Some(organization) = response.get_registrant_organization() {
+            output.push(format!(
+                "  {}: {}",
+                self.label("Organization"),
+                self.value(&organization)
             ));
         }
 
@@ -467,6 +483,14 @@ impl OutputFormatter for HumanFormatter {
                     ));
                 }
 
+                if let Some(organization) = data.get_registrant_organization() {
+                    output.push(format!(
+                        "  {}: {}",
+                        self.label("Organization"),
+                        self.value(&organization)
+                    ));
+                }
+
                 if let Some(created) = data.creation_date() {
                     output.push(format!(
                         "  {}: {}",
@@ -551,6 +575,14 @@ impl OutputFormatter for HumanFormatter {
                         "  {}: {}",
                         self.label("Registrant"),
                         self.value(registrant)
+                    ));
+                }
+
+                if let Some(ref organization) = data.organization {
+                    output.push(format!(
+                        "  {}: {}",
+                        self.label("Organization"),
+                        self.value(organization)
                     ));
                 }
 
@@ -712,6 +744,57 @@ impl OutputFormatter for HumanFormatter {
                 "    {}: {}",
                 self.label("Expires"),
                 expiry_display
+            ));
+        }
+
+        // DNS Resolution
+        if let Some(ref dns) = response.dns_resolution {
+            output.push(format!("\n  {}:", self.label("DNS Resolution")));
+
+            // Status line
+            if dns.resolves {
+                output.push(format!("    {}", self.success("✓ Resolving")));
+            } else {
+                output.push(format!("    {}", self.error("✗ Domain does not resolve")));
+            }
+
+            // CNAME if present
+            if let Some(ref cname) = dns.cname_target {
+                output.push(format!(
+                    "    {}: Aliases to {}",
+                    self.label("CNAME"),
+                    self.success(cname)
+                ));
+            }
+
+            // IPv4 addresses (A records)
+            if !dns.a_records.is_empty() {
+                output.push(format!("    {}:", self.label("IPv4 (A)")));
+                for ip in &dns.a_records {
+                    output.push(format!("      • {}", self.value(ip)));
+                }
+            }
+
+            // IPv6 addresses (AAAA records)
+            if !dns.aaaa_records.is_empty() {
+                output.push(format!("    {}:", self.label("IPv6 (AAAA)")));
+                for ip in &dns.aaaa_records {
+                    output.push(format!("      • {}", self.value(ip)));
+                }
+            }
+
+            // Nameservers
+            if !dns.nameservers.is_empty() {
+                output.push(format!("    {}:", self.label("Nameservers")));
+                for ns in &dns.nameservers {
+                    output.push(format!("      • {}", self.value(ns)));
+                }
+            }
+        } else {
+            output.push(format!(
+                "\n  {}: {}",
+                self.label("DNS Resolution"),
+                self.warning("Check failed")
             ));
         }
 

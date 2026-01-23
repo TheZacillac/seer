@@ -13,9 +13,9 @@ pub use error::{Result, SeerError};
 pub use validation::{normalize_domain, validate_domain_safe};
 
 pub use dns::{DnsFollower, DnsRecord, DnsResolver, FollowConfig, FollowIteration, FollowResult, PropagationResult, RecordType};
-pub use lookup::{LookupResult, SmartLookup};
+pub use lookup::{LookupProgressCallback, LookupResult, SmartLookup};
 pub use rdap::{RdapClient, RdapResponse};
-pub use status::{CertificateInfo, DomainExpiration, StatusClient, StatusResponse};
+pub use status::{CertificateInfo, DnsResolution, DomainExpiration, StatusClient, StatusResponse};
 pub use whois::{WhoisClient, WhoisResponse};
 
 pub use bulk::{BulkExecutor, BulkOperation, BulkResult};

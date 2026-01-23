@@ -251,10 +251,19 @@ impl Repl {
         }
 
         let domain = args[0];
-        let spinner = Spinner::new(&format!("Smart lookup for {} (trying RDAP first)", domain));
+        let spinner = Arc::new(Spinner::new(&format!(
+            "Smart lookup for {} (trying RDAP first)",
+            domain
+        )));
+
+        // Create progress callback that updates the spinner
+        let spinner_clone = spinner.clone();
+        let progress: seer_core::LookupProgressCallback = Arc::new(move |message| {
+            spinner_clone.set_message(message);
+        });
 
         let lookup = seer_core::SmartLookup::new();
-        match lookup.lookup(domain).await {
+        match lookup.lookup_with_progress(domain, Some(progress)).await {
             Ok(result) => {
                 spinner.finish();
                 let formatter = seer_core::output::get_formatter(self.context.output_format);

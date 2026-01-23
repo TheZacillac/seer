@@ -20,6 +20,10 @@ impl Spinner {
         Self { progress }
     }
 
+    pub fn set_message(&self, message: &str) {
+        self.progress.set_message(message.to_string());
+    }
+
     pub fn finish(&self) {
         self.progress.finish_and_clear();
     }

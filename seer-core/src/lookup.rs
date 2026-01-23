@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
@@ -5,6 +7,10 @@ use tracing::{debug, warn};
 use crate::error::{Result, SeerError};
 use crate::rdap::{RdapClient, RdapResponse};
 use crate::whois::{WhoisClient, WhoisResponse, get_registry_url, get_tld};
+
+/// Progress callback for smart lookup operations
+/// Called with a message describing the current phase of the lookup
+pub type LookupProgressCallback = Arc<dyn Fn(&str) + Send + Sync>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "source", rename_all = "lowercase")]
@@ -36,6 +42,17 @@ impl LookupResult {
                 })
             }
             LookupResult::Whois { data, .. } => data.registrar.clone(),
+        }
+    }
+
+    pub fn organization(&self) -> Option<String> {
+        match self {
+            LookupResult::Rdap { data, whois_fallback } => {
+                data.get_registrant_organization().or_else(|| {
+                    whois_fallback.as_ref().and_then(|w| w.organization.clone())
+                })
+            }
+            LookupResult::Whois { data, .. } => data.organization.clone(),
         }
     }
 
@@ -112,14 +129,28 @@ impl SmartLookup {
     }
 
     pub async fn lookup(&self, domain: &str) -> Result<LookupResult> {
+        self.lookup_with_progress(domain, None).await
+    }
+
+    /// Perform lookup with an optional progress callback
+    /// The callback is called with messages describing the current phase
+    pub async fn lookup_with_progress(
+        &self,
+        domain: &str,
+        progress: Option<LookupProgressCallback>,
+    ) -> Result<LookupResult> {
         if self.prefer_rdap {
-            self.lookup_rdap_first(domain).await
+            self.lookup_rdap_first(domain, progress).await
         } else {
-            self.lookup_whois_first(domain).await
+            self.lookup_whois_first(domain, progress).await
         }
     }
 
-    async fn lookup_rdap_first(&self, domain: &str) -> Result<LookupResult> {
+    async fn lookup_rdap_first(
+        &self,
+        domain: &str,
+        progress: Option<LookupProgressCallback>,
+    ) -> Result<LookupResult> {
         debug!(domain = %domain, "Attempting RDAP lookup first");
 
         match self.rdap_client.lookup_domain(domain).await {
@@ -147,17 +178,27 @@ impl SmartLookup {
                     })
                 } else {
                     debug!("RDAP response lacks useful data, falling back to WHOIS");
+                    if let Some(ref cb) = progress {
+                        cb("RDAP not available (trying WHOIS)");
+                    }
                     self.fallback_to_whois(domain, Some("RDAP response incomplete")).await
                 }
             }
             Err(e) => {
                 warn!(error = %e, "RDAP lookup failed, falling back to WHOIS");
+                if let Some(ref cb) = progress {
+                    cb("RDAP not available (trying WHOIS)");
+                }
                 self.fallback_to_whois(domain, Some(&e.to_string())).await
             }
         }
     }
 
-    async fn lookup_whois_first(&self, domain: &str) -> Result<LookupResult> {
+    async fn lookup_whois_first(
+        &self,
+        domain: &str,
+        progress: Option<LookupProgressCallback>,
+    ) -> Result<LookupResult> {
         debug!(domain = %domain, "Attempting WHOIS lookup first");
 
         match self.whois_client.lookup(domain).await {
@@ -169,6 +210,9 @@ impl SmartLookup {
             }
             Err(e) => {
                 warn!(error = %e, "WHOIS lookup failed, trying RDAP");
+                if let Some(ref cb) = progress {
+                    cb("WHOIS not available (trying RDAP)");
+                }
                 // Try RDAP as fallback
                 let rdap_data = self.rdap_client.lookup_domain(domain).await?;
                 Ok(LookupResult::Rdap {

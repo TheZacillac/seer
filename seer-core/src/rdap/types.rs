@@ -149,6 +149,36 @@ impl RdapEntity {
         None
     }
 
+    pub fn get_organization(&self) -> Option<String> {
+        if let Some(vcard) = &self.vcard_array {
+            if let Some(arr) = vcard.as_array() {
+                if arr.len() > 1 {
+                    if let Some(props) = arr[1].as_array() {
+                        for prop in props {
+                            if let Some(prop_arr) = prop.as_array() {
+                                if prop_arr.len() >= 4
+                                    && prop_arr[0].as_str() == Some("org") {
+                                    // org value can be a string or array
+                                    if let Some(org_str) = prop_arr[3].as_str() {
+                                        return Some(org_str.to_string());
+                                    } else if let Some(org_arr) = prop_arr[3].as_array() {
+                                        // org is often ["Company Name", "Department"]
+                                        if let Some(first) = org_arr.first() {
+                                            if let Some(org_str) = first.as_str() {
+                                                return Some(org_str.to_string());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
     pub fn get_email(&self) -> Option<String> {
         if let Some(vcard) = &self.vcard_array {
             if let Some(arr) = vcard.as_array() {
@@ -288,6 +318,21 @@ impl RdapResponse {
         for entity in &self.entities {
             if entity.roles.iter().any(|r| r == "registrant") {
                 return entity.get_name().or_else(|| entity.handle.clone());
+            }
+        }
+        None
+    }
+
+    pub fn get_registrant_organization(&self) -> Option<String> {
+        for entity in &self.entities {
+            if entity.roles.iter().any(|r| r == "registrant") {
+                if let Some(org) = entity.get_organization() {
+                    // Filter out redacted values
+                    let org_lower = org.to_lowercase();
+                    if !org_lower.contains("redacted") && !org.is_empty() {
+                        return Some(org);
+                    }
+                }
             }
         }
         None

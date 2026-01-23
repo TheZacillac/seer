@@ -9,4 +9,4 @@ mod client;
 mod types;
 
 pub use client::StatusClient;
-pub use types::{CertificateInfo, DomainExpiration, StatusResponse};
+pub use types::{CertificateInfo, DnsResolution, DomainExpiration, StatusResponse};
