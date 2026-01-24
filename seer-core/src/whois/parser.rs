@@ -84,12 +84,117 @@ static STATUS_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
     ]
 });
 
+static REGISTRANT_EMAIL_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
+    vec![
+        Regex::new(r"(?i)Registrant Email:\s*(.+)").unwrap(),
+        Regex::new(r"(?i)Registrant E-mail:\s*(.+)").unwrap(),
+    ]
+});
+
+static REGISTRANT_PHONE_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
+    vec![
+        Regex::new(r"(?i)Registrant Phone:\s*(.+)").unwrap(),
+        Regex::new(r"(?i)Registrant Tel:\s*(.+)").unwrap(),
+    ]
+});
+
+static REGISTRANT_ADDRESS_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
+    vec![
+        Regex::new(r"(?i)Registrant Street:\s*(.+)").unwrap(),
+        Regex::new(r"(?i)Registrant Address:\s*(.+)").unwrap(),
+    ]
+});
+
+static REGISTRANT_COUNTRY_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
+    vec![
+        Regex::new(r"(?i)Registrant Country:\s*(.+)").unwrap(),
+    ]
+});
+
+static ADMIN_NAME_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
+    vec![
+        Regex::new(r"(?i)Admin Name:\s*(.+)").unwrap(),
+        Regex::new(r"(?i)Administrative Contact Name:\s*(.+)").unwrap(),
+    ]
+});
+
+static ADMIN_ORG_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
+    vec![
+        Regex::new(r"(?i)Admin Organization:\s*(.+)").unwrap(),
+    ]
+});
+
+static ADMIN_EMAIL_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
+    vec![
+        Regex::new(r"(?i)Admin Email:\s*(.+)").unwrap(),
+        Regex::new(r"(?i)Admin E-mail:\s*(.+)").unwrap(),
+    ]
+});
+
+static ADMIN_PHONE_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
+    vec![
+        Regex::new(r"(?i)Admin Phone:\s*(.+)").unwrap(),
+        Regex::new(r"(?i)Admin Tel:\s*(.+)").unwrap(),
+    ]
+});
+
+static TECH_NAME_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
+    vec![
+        Regex::new(r"(?i)Tech Name:\s*(.+)").unwrap(),
+        Regex::new(r"(?i)Technical Contact Name:\s*(.+)").unwrap(),
+    ]
+});
+
+static TECH_ORG_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
+    vec![
+        Regex::new(r"(?i)Tech Organization:\s*(.+)").unwrap(),
+    ]
+});
+
+static TECH_EMAIL_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
+    vec![
+        Regex::new(r"(?i)Tech Email:\s*(.+)").unwrap(),
+        Regex::new(r"(?i)Tech E-mail:\s*(.+)").unwrap(),
+    ]
+});
+
+static TECH_PHONE_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
+    vec![
+        Regex::new(r"(?i)Tech Phone:\s*(.+)").unwrap(),
+        Regex::new(r"(?i)Tech Tel:\s*(.+)").unwrap(),
+    ]
+});
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WhoisResponse {
     pub domain: String,
     pub registrar: Option<String>,
     pub registrant: Option<String>,
     pub organization: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub registrant_email: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub registrant_phone: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub registrant_address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub registrant_country: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub admin_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub admin_organization: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub admin_email: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub admin_phone: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tech_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tech_organization: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tech_email: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tech_phone: Option<String>,
     pub creation_date: Option<DateTime<Utc>>,
     pub expiration_date: Option<DateTime<Utc>>,
     pub updated_date: Option<DateTime<Utc>>,
@@ -105,6 +210,18 @@ impl WhoisResponse {
         let registrar = extract_field_with_patterns(raw, &REGISTRAR_PATTERNS);
         let registrant = extract_field_with_patterns(raw, &REGISTRANT_PATTERNS);
         let organization = extract_field_with_patterns(raw, &ORGANIZATION_PATTERNS);
+        let registrant_email = extract_field_with_patterns(raw, &REGISTRANT_EMAIL_PATTERNS);
+        let registrant_phone = extract_field_with_patterns(raw, &REGISTRANT_PHONE_PATTERNS);
+        let registrant_address = extract_field_with_patterns(raw, &REGISTRANT_ADDRESS_PATTERNS);
+        let registrant_country = extract_field_with_patterns(raw, &REGISTRANT_COUNTRY_PATTERNS);
+        let admin_name = extract_field_with_patterns(raw, &ADMIN_NAME_PATTERNS);
+        let admin_organization = extract_field_with_patterns(raw, &ADMIN_ORG_PATTERNS);
+        let admin_email = extract_field_with_patterns(raw, &ADMIN_EMAIL_PATTERNS);
+        let admin_phone = extract_field_with_patterns(raw, &ADMIN_PHONE_PATTERNS);
+        let tech_name = extract_field_with_patterns(raw, &TECH_NAME_PATTERNS);
+        let tech_organization = extract_field_with_patterns(raw, &TECH_ORG_PATTERNS);
+        let tech_email = extract_field_with_patterns(raw, &TECH_EMAIL_PATTERNS);
+        let tech_phone = extract_field_with_patterns(raw, &TECH_PHONE_PATTERNS);
         let creation_date = extract_date_with_patterns(raw, &CREATION_DATE_PATTERNS);
         let expiration_date = extract_date_with_patterns(raw, &EXPIRATION_DATE_PATTERNS);
         let updated_date = extract_date_with_patterns(raw, &UPDATED_DATE_PATTERNS);
@@ -117,6 +234,18 @@ impl WhoisResponse {
             registrar,
             registrant,
             organization,
+            registrant_email,
+            registrant_phone,
+            registrant_address,
+            registrant_country,
+            admin_name,
+            admin_organization,
+            admin_email,
+            admin_phone,
+            tech_name,
+            tech_organization,
+            tech_email,
+            tech_phone,
             creation_date,
             expiration_date,
             updated_date,
@@ -166,7 +295,19 @@ fn extract_field_with_patterns(text: &str, patterns: &[Regex]) -> Option<String>
         if let Some(caps) = re.captures(text) {
             if let Some(m) = caps.get(1) {
                 let value = m.as_str().trim().to_string();
-                if !value.is_empty() && value.to_lowercase() != "redacted" {
+                let lower = value.to_lowercase();
+
+                // Filter out redacted/privacy-protected values
+                let is_redacted = lower.contains("redacted")
+                    || lower.contains("data protected")
+                    || lower.contains("privacy")
+                    || lower.contains("not disclosed")
+                    || lower.contains("withheld")
+                    || lower == "n/a"
+                    || lower == "none"
+                    || value.is_empty();
+
+                if !is_redacted {
                     return Some(value);
                 }
             }

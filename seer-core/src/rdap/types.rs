@@ -198,6 +198,95 @@ impl RdapEntity {
         }
         None
     }
+
+    pub fn get_phone(&self) -> Option<String> {
+        if let Some(vcard) = &self.vcard_array {
+            if let Some(arr) = vcard.as_array() {
+                if arr.len() > 1 {
+                    if let Some(props) = arr[1].as_array() {
+                        for prop in props {
+                            if let Some(prop_arr) = prop.as_array() {
+                                if prop_arr.len() >= 4
+                                    && prop_arr[0].as_str() == Some("tel") {
+                                    if let Some(phone) = prop_arr[3].as_str() {
+                                        return Some(phone.to_string());
+                                    } else if let Some(phone_obj) = prop_arr[3].as_object() {
+                                        // Sometimes phone is {"uri": "tel:+1234567890"}
+                                        if let Some(uri) = phone_obj.get("uri") {
+                                            if let Some(uri_str) = uri.as_str() {
+                                                return Some(uri_str.trim_start_matches("tel:").to_string());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    pub fn get_address(&self) -> Option<String> {
+        if let Some(vcard) = &self.vcard_array {
+            if let Some(arr) = vcard.as_array() {
+                if arr.len() > 1 {
+                    if let Some(props) = arr[1].as_array() {
+                        for prop in props {
+                            if let Some(prop_arr) = prop.as_array() {
+                                if prop_arr.len() >= 4
+                                    && prop_arr[0].as_str() == Some("adr") {
+                                    // adr is usually an array: [pobox, ext, street, city, state, postal, country]
+                                    if let Some(adr_arr) = prop_arr[3].as_array() {
+                                        let parts: Vec<String> = adr_arr
+                                            .iter()
+                                            .filter_map(|v| v.as_str())
+                                            .filter(|s| !s.is_empty())
+                                            .map(String::from)
+                                            .collect();
+                                        if !parts.is_empty() {
+                                            return Some(parts.join(", "));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    pub fn get_country(&self) -> Option<String> {
+        if let Some(vcard) = &self.vcard_array {
+            if let Some(arr) = vcard.as_array() {
+                if arr.len() > 1 {
+                    if let Some(props) = arr[1].as_array() {
+                        for prop in props {
+                            if let Some(prop_arr) = prop.as_array() {
+                                // Check for country in adr field (index 6)
+                                if prop_arr.len() >= 4
+                                    && prop_arr[0].as_str() == Some("adr") {
+                                    if let Some(adr_arr) = prop_arr[3].as_array() {
+                                        if let Some(country) = adr_arr.get(6) {
+                                            if let Some(country_str) = country.as_str() {
+                                                if !country_str.is_empty() {
+                                                    return Some(country_str.to_string());
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -371,5 +460,89 @@ impl RdapResponse {
             .as_ref()
             .map(|s| s.delegation_signed.unwrap_or(false))
             .unwrap_or(false)
+    }
+
+    /// Get entity by role
+    pub fn get_entity_by_role(&self, role: &str) -> Option<&RdapEntity> {
+        self.entities
+            .iter()
+            .find(|e| e.roles.iter().any(|r| r == role))
+    }
+
+    /// Get all contact information for a specific role
+    pub fn get_contact_info(&self, role: &str) -> Option<ContactInfo> {
+        let entity = self.get_entity_by_role(role)?;
+        Some(ContactInfo {
+            name: entity.get_name(),
+            organization: entity.get_organization(),
+            email: entity.get_email(),
+            phone: entity.get_phone(),
+            address: entity.get_address(),
+            country: entity.get_country(),
+        })
+    }
+
+    pub fn get_admin_contact(&self) -> Option<ContactInfo> {
+        self.get_contact_info("administrative")
+    }
+
+    pub fn get_tech_contact(&self) -> Option<ContactInfo> {
+        self.get_contact_info("technical")
+    }
+
+    pub fn get_billing_contact(&self) -> Option<ContactInfo> {
+        self.get_contact_info("billing")
+    }
+
+    pub fn get_registrant_contact(&self) -> Option<ContactInfo> {
+        self.get_contact_info("registrant")
+    }
+}
+
+/// Contact information extracted from RDAP entity
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContactInfo {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub organization: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phone: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub country: Option<String>,
+}
+
+impl ContactInfo {
+    /// Check if contact has any non-redacted information
+    pub fn has_info(&self) -> bool {
+        let has_data = self.name.is_some()
+            || self.organization.is_some()
+            || self.email.is_some()
+            || self.phone.is_some()
+            || self.address.is_some()
+            || self.country.is_some();
+
+        if !has_data {
+            return false;
+        }
+
+        // Filter out redacted values
+        let is_redacted = |s: &Option<String>| {
+            s.as_ref().map_or(false, |v| {
+                let lower = v.to_lowercase();
+                lower.contains("redacted") || lower.contains("data protected") || v.is_empty()
+            })
+        };
+
+        !is_redacted(&self.name)
+            || !is_redacted(&self.organization)
+            || !is_redacted(&self.email)
+            || !is_redacted(&self.phone)
+            || !is_redacted(&self.address)
+            || !is_redacted(&self.country)
     }
 }
