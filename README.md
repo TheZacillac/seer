@@ -7,10 +7,12 @@ A multi-interface domain name utility tool for querying domain registration info
 - **WHOIS Lookups** - Query domain registrant and registrar information
 - **RDAP Lookups** - Modern Registration Data Access Protocol queries for domains, IPs, and ASNs
 - **DNS Resolution** - Query DNS records (A, AAAA, MX, TXT, NS, SOA, CNAME, CAA, PTR, SRV, DNSKEY, DS)
-- **DNS Propagation Checking** - Monitor global DNS propagation across multiple nameservers
+- **DNS Propagation Checking** - Monitor global DNS propagation across 29 nameservers in 6 regions
+- **DNS Monitoring** - Track DNS record changes over time with configurable intervals
 - **Domain Status** - Quick health check: HTTP status, site title, SSL certificate info, expiration dates
 - **Smart Lookups** - Intelligent fallback that tries RDAP first, then falls back to WHOIS
 - **Bulk Operations** - Process multiple domains/queries concurrently with rate limiting
+- **SSRF Protection** - Blocks requests to private/reserved IP ranges
 - **Multiple Interfaces** - CLI, Python library, REST API, and MCP server
 
 ## Installation
@@ -125,6 +127,11 @@ seer bulk lookup domains.txt
 seer bulk whois domains.txt
 seer bulk dig domains.txt A
 seer bulk status domains.txt
+
+# DNS monitoring over time
+seer follow example.com              # 10 iterations, 1 min interval
+seer follow example.com 20 0.5       # 20 iterations, 30 sec interval
+seer follow example.com 10 1 MX --changes-only  # Only show changes
 ```
 
 #### Output Formats
@@ -272,34 +279,59 @@ The MCP server exposes these tools:
 
 ```
 seer/
-├── seer-core/          # Core Rust library
+├── seer-core/          # Core Rust library (all business logic)
+│   ├── README.md       # Core library documentation
 │   └── src/
 │       ├── lib.rs      # Module exports
 │       ├── error.rs    # Error types
 │       ├── lookup.rs   # Smart lookup implementation
+│       ├── validation.rs # Domain validation & SSRF protection
+│       ├── colors.rs   # Catppuccin color palette
 │       ├── bulk/       # Bulk operation executor
-│       ├── dns/        # DNS resolver and propagation
+│       ├── dns/        # DNS resolver, propagation, and follow
 │       ├── whois/      # WHOIS client and parser
-│       ├── rdap/       # RDAP client
+│       ├── rdap/       # RDAP client with IANA bootstrap
 │       ├── status/     # Domain status checker
-│       └── output/     # Output formatters
+│       └── output/     # Output formatters (human/JSON)
 │
 ├── seer-cli/           # CLI application
+│   ├── README.md       # CLI documentation
 │   └── src/
 │       ├── main.rs     # Entry point with clap commands
 │       ├── display/    # Spinner and display utilities
 │       └── repl/       # Interactive REPL
 │
 ├── seer-py/            # Python bindings (PyO3)
+│   ├── README.md       # Python library documentation
 │   ├── pyproject.toml  # Maturin build config
 │   └── src/lib.rs      # Python module definitions
 │
 └── seer-api/           # FastAPI REST server + MCP
+    ├── README.md       # API documentation
     └── seer_api/
         ├── main.py     # FastAPI app
         ├── routers/    # API endpoints
         └── mcp/        # MCP server
 ```
+
+## Documentation
+
+Each package has its own README with detailed documentation:
+
+| Package | Description |
+|---------|-------------|
+| [seer-core](seer-core/README.md) | Core Rust library with all business logic |
+| [seer-cli](seer-cli/README.md) | Command-line interface |
+| [seer-py](seer-py/README.md) | Python bindings |
+| [seer-api](seer-api/README.md) | REST API and MCP server |
+
+Module-level documentation is also available within each package:
+- [whois](seer-core/src/whois/README.md) - WHOIS protocol client
+- [rdap](seer-core/src/rdap/README.md) - RDAP client with IANA bootstrap
+- [dns](seer-core/src/dns/README.md) - DNS resolver and propagation
+- [status](seer-core/src/status/README.md) - Domain health checking
+- [bulk](seer-core/src/bulk/README.md) - Bulk operations
+- [output](seer-core/src/output/README.md) - Output formatters
 
 ## Configuration
 
@@ -337,14 +369,25 @@ Default concurrency: 10 (max: 50)
 
 ## Global DNS Servers for Propagation Checks
 
-Propagation checks query these nameservers:
-- Google DNS (8.8.8.8, 8.8.4.4)
-- Cloudflare DNS (1.1.1.1, 1.0.0.1)
-- OpenDNS (208.67.222.222, 208.67.220.220)
-- Quad9 (9.9.9.9)
-- Level3 (4.2.2.1, 4.2.2.2)
-- Comodo (8.26.56.26)
-- DNS.Watch (84.200.69.80)
+Propagation checks query 29 nameservers across 6 regions:
+
+**North America**
+- Google (8.8.8.8), Cloudflare (1.1.1.1), OpenDNS (208.67.222.222), Quad9 (9.9.9.9), Level3 (4.2.2.1)
+
+**Europe**
+- DNS.Watch (84.200.69.80), Mullvad (194.242.2.2), dns0.eu (193.110.81.0), Yandex (77.88.8.8), UncensoredDNS (91.239.100.100)
+
+**Asia Pacific**
+- AliDNS (223.5.5.5), 114DNS (114.114.114.114), Tencent DNSPod (119.29.29.29), TWNIC (101.101.101.101), HiNet (168.95.1.1)
+
+**Latin America**
+- Claro Brasil, Telefonica Brasil, Antel Uruguay, Telmex Mexico, CenturyLink LATAM
+
+**Africa**
+- Liquid Telecom, SEACOM, Safaricom Kenya, MTN South Africa, Telecom Egypt
+
+**Middle East**
+- Etisalat UAE, STC Saudi, Bezeq Israel, Turk Telekom, Ooredoo Qatar
 
 ## Development
 
