@@ -128,6 +128,72 @@ impl OutputFormatter for HumanFormatter {
             ));
         }
 
+        // Registrant contact details
+        let has_registrant_details = response.registrant_email.is_some()
+            || response.registrant_phone.is_some()
+            || response.registrant_address.is_some()
+            || response.registrant_country.is_some();
+
+        if has_registrant_details {
+            output.push(format!("\n  {}:", self.label("Registrant Contact")));
+            if let Some(ref email) = response.registrant_email {
+                output.push(format!("    {}: {}", self.label("Email"), self.value(email)));
+            }
+            if let Some(ref phone) = response.registrant_phone {
+                output.push(format!("    {}: {}", self.label("Phone"), self.value(phone)));
+            }
+            if let Some(ref address) = response.registrant_address {
+                output.push(format!("    {}: {}", self.label("Address"), self.value(address)));
+            }
+            if let Some(ref country) = response.registrant_country {
+                output.push(format!("    {}: {}", self.label("Country"), self.value(country)));
+            }
+        }
+
+        // Admin contact
+        let has_admin_contact = response.admin_name.is_some()
+            || response.admin_organization.is_some()
+            || response.admin_email.is_some()
+            || response.admin_phone.is_some();
+
+        if has_admin_contact {
+            output.push(format!("\n  {}:", self.label("Admin Contact")));
+            if let Some(ref name) = response.admin_name {
+                output.push(format!("    {}: {}", self.label("Name"), self.value(name)));
+            }
+            if let Some(ref org) = response.admin_organization {
+                output.push(format!("    {}: {}", self.label("Organization"), self.value(org)));
+            }
+            if let Some(ref email) = response.admin_email {
+                output.push(format!("    {}: {}", self.label("Email"), self.value(email)));
+            }
+            if let Some(ref phone) = response.admin_phone {
+                output.push(format!("    {}: {}", self.label("Phone"), self.value(phone)));
+            }
+        }
+
+        // Tech contact
+        let has_tech_contact = response.tech_name.is_some()
+            || response.tech_organization.is_some()
+            || response.tech_email.is_some()
+            || response.tech_phone.is_some();
+
+        if has_tech_contact {
+            output.push(format!("\n  {}:", self.label("Tech Contact")));
+            if let Some(ref name) = response.tech_name {
+                output.push(format!("    {}: {}", self.label("Name"), self.value(name)));
+            }
+            if let Some(ref org) = response.tech_organization {
+                output.push(format!("    {}: {}", self.label("Organization"), self.value(org)));
+            }
+            if let Some(ref email) = response.tech_email {
+                output.push(format!("    {}: {}", self.label("Email"), self.value(email)));
+            }
+            if let Some(ref phone) = response.tech_phone {
+                output.push(format!("    {}: {}", self.label("Phone"), self.value(phone)));
+            }
+        }
+
         if let Some(created) = response.creation_date {
             output.push(format!(
                 "  {}: {}",
@@ -227,6 +293,100 @@ impl OutputFormatter for HumanFormatter {
                 self.label("Organization"),
                 self.value(&organization)
             ));
+        }
+
+        // Registrant contact details
+        if let Some(contact) = response.get_registrant_contact() {
+            if contact.has_info() {
+                output.push(format!("\n  {}:", self.label("Registrant Contact")));
+                if let Some(ref email) = contact.email {
+                    output.push(format!("    {}: {}", self.label("Email"), self.value(email)));
+                }
+                if let Some(ref phone) = contact.phone {
+                    output.push(format!("    {}: {}", self.label("Phone"), self.value(phone)));
+                }
+                if let Some(ref address) = contact.address {
+                    output.push(format!("    {}: {}", self.label("Address"), self.value(address)));
+                }
+                if let Some(ref country) = contact.country {
+                    output.push(format!("    {}: {}", self.label("Country"), self.value(country)));
+                }
+            }
+        }
+
+        // Admin contact
+        if let Some(contact) = response.get_admin_contact() {
+            if contact.has_info() {
+                output.push(format!("\n  {}:", self.label("Admin Contact")));
+                if let Some(ref name) = contact.name {
+                    output.push(format!("    {}: {}", self.label("Name"), self.value(name)));
+                }
+                if let Some(ref org) = contact.organization {
+                    output.push(format!("    {}: {}", self.label("Organization"), self.value(org)));
+                }
+                if let Some(ref email) = contact.email {
+                    output.push(format!("    {}: {}", self.label("Email"), self.value(email)));
+                }
+                if let Some(ref phone) = contact.phone {
+                    output.push(format!("    {}: {}", self.label("Phone"), self.value(phone)));
+                }
+                if let Some(ref address) = contact.address {
+                    output.push(format!("    {}: {}", self.label("Address"), self.value(address)));
+                }
+                if let Some(ref country) = contact.country {
+                    output.push(format!("    {}: {}", self.label("Country"), self.value(country)));
+                }
+            }
+        }
+
+        // Tech contact
+        if let Some(contact) = response.get_tech_contact() {
+            if contact.has_info() {
+                output.push(format!("\n  {}:", self.label("Tech Contact")));
+                if let Some(ref name) = contact.name {
+                    output.push(format!("    {}: {}", self.label("Name"), self.value(name)));
+                }
+                if let Some(ref org) = contact.organization {
+                    output.push(format!("    {}: {}", self.label("Organization"), self.value(org)));
+                }
+                if let Some(ref email) = contact.email {
+                    output.push(format!("    {}: {}", self.label("Email"), self.value(email)));
+                }
+                if let Some(ref phone) = contact.phone {
+                    output.push(format!("    {}: {}", self.label("Phone"), self.value(phone)));
+                }
+                if let Some(ref address) = contact.address {
+                    output.push(format!("    {}: {}", self.label("Address"), self.value(address)));
+                }
+                if let Some(ref country) = contact.country {
+                    output.push(format!("    {}: {}", self.label("Country"), self.value(country)));
+                }
+            }
+        }
+
+        // Billing contact
+        if let Some(contact) = response.get_billing_contact() {
+            if contact.has_info() {
+                output.push(format!("\n  {}:", self.label("Billing Contact")));
+                if let Some(ref name) = contact.name {
+                    output.push(format!("    {}: {}", self.label("Name"), self.value(name)));
+                }
+                if let Some(ref org) = contact.organization {
+                    output.push(format!("    {}: {}", self.label("Organization"), self.value(org)));
+                }
+                if let Some(ref email) = contact.email {
+                    output.push(format!("    {}: {}", self.label("Email"), self.value(email)));
+                }
+                if let Some(ref phone) = contact.phone {
+                    output.push(format!("    {}: {}", self.label("Phone"), self.value(phone)));
+                }
+                if let Some(ref address) = contact.address {
+                    output.push(format!("    {}: {}", self.label("Address"), self.value(address)));
+                }
+                if let Some(ref country) = contact.country {
+                    output.push(format!("    {}: {}", self.label("Country"), self.value(country)));
+                }
+            }
         }
 
         if let Some(created) = response.creation_date() {
@@ -491,6 +651,63 @@ impl OutputFormatter for HumanFormatter {
                     ));
                 }
 
+                // Registrant contact details
+                if let Some(contact) = data.get_registrant_contact() {
+                    if contact.has_info() {
+                        output.push(format!("\n  {}:", self.label("Registrant Contact")));
+                        if let Some(ref email) = contact.email {
+                            output.push(format!("    {}: {}", self.label("Email"), self.value(email)));
+                        }
+                        if let Some(ref phone) = contact.phone {
+                            output.push(format!("    {}: {}", self.label("Phone"), self.value(phone)));
+                        }
+                        if let Some(ref address) = contact.address {
+                            output.push(format!("    {}: {}", self.label("Address"), self.value(address)));
+                        }
+                        if let Some(ref country) = contact.country {
+                            output.push(format!("    {}: {}", self.label("Country"), self.value(country)));
+                        }
+                    }
+                }
+
+                // Admin contact
+                if let Some(contact) = data.get_admin_contact() {
+                    if contact.has_info() {
+                        output.push(format!("\n  {}:", self.label("Admin Contact")));
+                        if let Some(ref name) = contact.name {
+                            output.push(format!("    {}: {}", self.label("Name"), self.value(name)));
+                        }
+                        if let Some(ref org) = contact.organization {
+                            output.push(format!("    {}: {}", self.label("Organization"), self.value(org)));
+                        }
+                        if let Some(ref email) = contact.email {
+                            output.push(format!("    {}: {}", self.label("Email"), self.value(email)));
+                        }
+                        if let Some(ref phone) = contact.phone {
+                            output.push(format!("    {}: {}", self.label("Phone"), self.value(phone)));
+                        }
+                    }
+                }
+
+                // Tech contact
+                if let Some(contact) = data.get_tech_contact() {
+                    if contact.has_info() {
+                        output.push(format!("\n  {}:", self.label("Tech Contact")));
+                        if let Some(ref name) = contact.name {
+                            output.push(format!("    {}: {}", self.label("Name"), self.value(name)));
+                        }
+                        if let Some(ref org) = contact.organization {
+                            output.push(format!("    {}: {}", self.label("Organization"), self.value(org)));
+                        }
+                        if let Some(ref email) = contact.email {
+                            output.push(format!("    {}: {}", self.label("Email"), self.value(email)));
+                        }
+                        if let Some(ref phone) = contact.phone {
+                            output.push(format!("    {}: {}", self.label("Phone"), self.value(phone)));
+                        }
+                    }
+                }
+
                 if let Some(created) = data.creation_date() {
                     output.push(format!(
                         "  {}: {}",
@@ -584,6 +801,72 @@ impl OutputFormatter for HumanFormatter {
                         self.label("Organization"),
                         self.value(organization)
                     ));
+                }
+
+                // Registrant contact details
+                let has_registrant_details = data.registrant_email.is_some()
+                    || data.registrant_phone.is_some()
+                    || data.registrant_address.is_some()
+                    || data.registrant_country.is_some();
+
+                if has_registrant_details {
+                    output.push(format!("\n  {}:", self.label("Registrant Contact")));
+                    if let Some(ref email) = data.registrant_email {
+                        output.push(format!("    {}: {}", self.label("Email"), self.value(email)));
+                    }
+                    if let Some(ref phone) = data.registrant_phone {
+                        output.push(format!("    {}: {}", self.label("Phone"), self.value(phone)));
+                    }
+                    if let Some(ref address) = data.registrant_address {
+                        output.push(format!("    {}: {}", self.label("Address"), self.value(address)));
+                    }
+                    if let Some(ref country) = data.registrant_country {
+                        output.push(format!("    {}: {}", self.label("Country"), self.value(country)));
+                    }
+                }
+
+                // Admin contact
+                let has_admin_contact = data.admin_name.is_some()
+                    || data.admin_organization.is_some()
+                    || data.admin_email.is_some()
+                    || data.admin_phone.is_some();
+
+                if has_admin_contact {
+                    output.push(format!("\n  {}:", self.label("Admin Contact")));
+                    if let Some(ref name) = data.admin_name {
+                        output.push(format!("    {}: {}", self.label("Name"), self.value(name)));
+                    }
+                    if let Some(ref org) = data.admin_organization {
+                        output.push(format!("    {}: {}", self.label("Organization"), self.value(org)));
+                    }
+                    if let Some(ref email) = data.admin_email {
+                        output.push(format!("    {}: {}", self.label("Email"), self.value(email)));
+                    }
+                    if let Some(ref phone) = data.admin_phone {
+                        output.push(format!("    {}: {}", self.label("Phone"), self.value(phone)));
+                    }
+                }
+
+                // Tech contact
+                let has_tech_contact = data.tech_name.is_some()
+                    || data.tech_organization.is_some()
+                    || data.tech_email.is_some()
+                    || data.tech_phone.is_some();
+
+                if has_tech_contact {
+                    output.push(format!("\n  {}:", self.label("Tech Contact")));
+                    if let Some(ref name) = data.tech_name {
+                        output.push(format!("    {}: {}", self.label("Name"), self.value(name)));
+                    }
+                    if let Some(ref org) = data.tech_organization {
+                        output.push(format!("    {}: {}", self.label("Organization"), self.value(org)));
+                    }
+                    if let Some(ref email) = data.tech_email {
+                        output.push(format!("    {}: {}", self.label("Email"), self.value(email)));
+                    }
+                    if let Some(ref phone) = data.tech_phone {
+                        output.push(format!("    {}: {}", self.label("Phone"), self.value(phone)));
+                    }
                 }
 
                 if let Some(created) = data.creation_date {
