@@ -83,6 +83,9 @@ impl Repl {
                             eprintln!("{} {}", "Error:".ctp_red().bold(), e);
                         }
                     }
+
+                    // Add blank line before next prompt for readability
+                    println!();
                 }
                 Err(ReadlineError::Interrupted) => {
                     println!("^C");
