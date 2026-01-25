@@ -180,27 +180,27 @@ impl Repl {
     fn print_help(&self) {
         println!();
         println!("{}", "LOOKUP COMMANDS".bright_purple().bold());
-        println!("  {:<34} {}", "<domain>".bright_cyan(), "Smart lookup (just type a domain directly)");
-        println!("  {:<34} {}", "whois <domain>".bright_cyan(), "Query WHOIS information");
-        println!("  {:<34} {}", "rdap <domain|ip|asn>".bright_cyan(), "Query RDAP registry data");
+        println!("  {:<34} Smart lookup (just type a domain directly)", "<domain>".bright_cyan());
+        println!("  {:<34} Query WHOIS information", "whois <domain>".bright_cyan());
+        println!("  {:<34} Query RDAP registry data", "rdap <domain|ip|asn>".bright_cyan());
         println!();
         println!("{}", "DNS COMMANDS".bright_purple().bold());
-        println!("  {:<34} {}", "dig <domain> [type] [@server]".bright_cyan(), "Query DNS records");
-        println!("  {:<34} {}", "propagation <domain> [type]".bright_cyan(), "Check DNS propagation globally");
-        println!("  {:<34} {}", "follow <domain> [n] [mins] [type] [@server]".bright_cyan(), "Monitor DNS records over time");
+        println!("  {:<34} Query DNS records", "dig <domain> [type] [@server]".bright_cyan());
+        println!("  {:<34} Check DNS propagation globally", "propagation <domain> [type]".bright_cyan());
+        println!("  {:<34} Monitor DNS records over time", "follow <domain> [n] [mins] [type] [@server]".bright_cyan());
         println!("  {}", "Record types: A, AAAA, CNAME, MX, NS, TXT, SOA, PTR, SRV, CAA".dimmed());
         println!();
         println!("{}", "STATUS COMMANDS".bright_purple().bold());
-        println!("  {:<34} {}", "status <domain>".bright_cyan(), "Check HTTP, SSL, and domain expiration");
+        println!("  {:<34} Check HTTP, SSL, and domain expiration", "status <domain>".bright_cyan());
         println!();
         println!("{}", "BULK OPERATIONS".bright_purple().bold());
-        println!("  {:<34} {}", "bulk <op> <file>".bright_cyan(), "Run bulk operations from file");
+        println!("  {:<34} Run bulk operations from file", "bulk <op> <file>".bright_cyan());
         println!("  {}", "Operations: lookup, whois, rdap, dig, propagation, status".dimmed());
         println!();
         println!("{}", "SETTINGS".bright_purple().bold());
-        println!("  {:<34} {}", "set output <human|json>".bright_cyan(), "Change output format");
-        println!("  {:<34} {}", "clear".bright_cyan(), "Clear screen");
-        println!("  {:<34} {}", "exit".bright_cyan(), "Exit the program");
+        println!("  {:<34} Change output format", "set output <human|json>".bright_cyan());
+        println!("  {:<34} Clear screen", "clear".bright_cyan());
+        println!("  {:<34} Exit the program", "exit".bright_cyan());
         println!();
     }
 

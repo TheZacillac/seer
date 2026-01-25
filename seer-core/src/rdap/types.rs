@@ -1,6 +1,8 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+/// RDAP response for domain, IP, or ASN lookups.
+/// Follows RFC 7483 (JSON Responses for RDAP).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RdapResponse {
@@ -78,6 +80,7 @@ pub struct RdapResponse {
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
+/// An event in the lifecycle of an RDAP object (registration, expiration, etc.).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RdapEvent {
@@ -94,6 +97,7 @@ impl RdapEvent {
     }
 }
 
+/// An entity associated with an RDAP object (registrar, registrant, admin, tech contact).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RdapEntity {
@@ -289,6 +293,7 @@ impl RdapEntity {
     }
 }
 
+/// A public identifier for an RDAP entity (e.g., IANA Registrar ID).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PublicId {
@@ -297,6 +302,7 @@ pub struct PublicId {
     pub identifier: String,
 }
 
+/// A nameserver associated with a domain in RDAP.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RdapNameserver {
@@ -319,6 +325,7 @@ pub struct RdapNameserver {
     pub links: Vec<RdapLink>,
 }
 
+/// IPv4 and IPv6 addresses associated with a nameserver.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IpAddresses {
     #[serde(default)]
@@ -327,6 +334,7 @@ pub struct IpAddresses {
     pub v6: Vec<String>,
 }
 
+/// DNSSEC information for a domain.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SecureDns {
@@ -338,6 +346,7 @@ pub struct SecureDns {
     pub key_data: Vec<KeyData>,
 }
 
+/// DNSSEC DS (Delegation Signer) record data.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DsData {
@@ -347,6 +356,7 @@ pub struct DsData {
     pub digest: String,
 }
 
+/// DNSSEC key data.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KeyData {
@@ -356,6 +366,7 @@ pub struct KeyData {
     pub public_key: String,
 }
 
+/// A link to related RDAP resources.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RdapLink {
     #[serde(default)]
@@ -369,6 +380,7 @@ pub struct RdapLink {
     pub media_type: Option<String>,
 }
 
+/// A remark or note attached to an RDAP object.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RdapRemark {
     #[serde(default)]
@@ -379,6 +391,7 @@ pub struct RdapRemark {
     pub links: Vec<RdapLink>,
 }
 
+/// A notice from the RDAP server (terms of service, rate limiting, etc.).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RdapNotice {
     #[serde(default)]
@@ -532,7 +545,7 @@ impl ContactInfo {
 
         // Filter out redacted values
         let is_redacted = |s: &Option<String>| {
-            s.as_ref().map_or(false, |v| {
+            s.as_ref().is_some_and(|v| {
                 let lower = v.to_lowercase();
                 lower.contains("redacted") || lower.contains("data protected") || v.is_empty()
             })

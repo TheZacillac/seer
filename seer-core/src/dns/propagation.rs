@@ -9,6 +9,7 @@ use super::records::{DnsRecord, RecordType};
 use super::resolver::DnsResolver;
 use crate::error::Result;
 
+/// A DNS server used for propagation checking.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DnsServer {
     pub name: String,
@@ -28,6 +29,7 @@ impl DnsServer {
     }
 }
 
+/// Returns the default list of global DNS servers for propagation checking.
 pub fn default_dns_servers() -> Vec<DnsServer> {
     vec![
         // North America
@@ -69,6 +71,7 @@ pub fn default_dns_servers() -> Vec<DnsServer> {
     ]
 }
 
+/// Result from querying a single DNS server during propagation check.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerResult {
     pub server: DnsServer,
@@ -78,6 +81,7 @@ pub struct ServerResult {
     pub error: Option<String>,
 }
 
+/// Aggregated result of DNS propagation check across multiple global servers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PropagationResult {
     pub domain: String,
@@ -100,6 +104,7 @@ impl PropagationResult {
     }
 }
 
+/// Checks DNS propagation across multiple global DNS servers.
 #[derive(Debug, Clone)]
 pub struct PropagationChecker {
     resolver: DnsResolver,

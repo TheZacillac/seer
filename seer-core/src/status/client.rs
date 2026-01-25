@@ -8,8 +8,10 @@ use tokio::net::TcpStream;
 use tracing::{debug, instrument};
 
 /// Pre-compiled regex for extracting HTML title
-static TITLE_REGEX: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?i)<title[^>]*>([^<]+)</title>").unwrap());
+static TITLE_REGEX: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)<title[^>]*>([^<]+)</title>")
+        .expect("Invalid regex for HTML title extraction")
+});
 
 use super::types::{CertificateInfo, DnsResolution, DomainExpiration, StatusResponse};
 use crate::dns::{DnsResolver, RecordData, RecordType};

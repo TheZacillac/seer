@@ -6,162 +6,218 @@ use serde::{Deserialize, Serialize};
 /// Pre-compiled regexes for WHOIS field extraction
 static REGISTRAR_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
     vec![
-        Regex::new(r"(?i)Registrar:\s*(.+)").unwrap(),
-        Regex::new(r"(?i)Registrar Name:\s*(.+)").unwrap(),
-        Regex::new(r"(?i)Sponsoring Registrar:\s*(.+)").unwrap(),
+        Regex::new(r"(?i)Registrar:\s*(.+)")
+            .expect("Invalid regex for Registrar"),
+        Regex::new(r"(?i)Registrar Name:\s*(.+)")
+            .expect("Invalid regex for Registrar Name"),
+        Regex::new(r"(?i)Sponsoring Registrar:\s*(.+)")
+            .expect("Invalid regex for Sponsoring Registrar"),
     ]
 });
 
 static REGISTRANT_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
     vec![
-        Regex::new(r"(?i)Registrant Name:\s*(.+)").unwrap(),
-        Regex::new(r"(?i)Registrant:\s*(.+)").unwrap(),
+        Regex::new(r"(?i)Registrant Name:\s*(.+)")
+            .expect("Invalid regex for Registrant Name"),
+        Regex::new(r"(?i)Registrant:\s*(.+)")
+            .expect("Invalid regex for Registrant"),
     ]
 });
 
 static ORGANIZATION_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
     vec![
-        Regex::new(r"(?i)Registrant Organization:\s*(.+)").unwrap(),
-        Regex::new(r"(?i)Organization:\s*(.+)").unwrap(),
-        Regex::new(r"(?i)org-name:\s*(.+)").unwrap(),
-        Regex::new(r"(?i)Org Name:\s*(.+)").unwrap(),
+        Regex::new(r"(?i)Registrant Organization:\s*(.+)")
+            .expect("Invalid regex for Registrant Organization"),
+        Regex::new(r"(?i)Organization:\s*(.+)")
+            .expect("Invalid regex for Organization"),
+        Regex::new(r"(?i)org-name:\s*(.+)")
+            .expect("Invalid regex for org-name"),
+        Regex::new(r"(?i)Org Name:\s*(.+)")
+            .expect("Invalid regex for Org Name"),
     ]
 });
 
 static CREATION_DATE_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
     vec![
-        Regex::new(r"(?i)Creation Date:\s*(.+)").unwrap(),
-        Regex::new(r"(?i)Created Date:\s*(.+)").unwrap(),
-        Regex::new(r"(?i)Created On:\s*(.+)").unwrap(),
-        Regex::new(r"(?i)Created:\s*(.+)").unwrap(),
-        Regex::new(r"(?i)Registration Date:\s*(.+)").unwrap(),
-        Regex::new(r"(?i)Domain Registration Date:\s*(.+)").unwrap(),
+        Regex::new(r"(?i)Creation Date:\s*(.+)")
+            .expect("Invalid regex for Creation Date"),
+        Regex::new(r"(?i)Created Date:\s*(.+)")
+            .expect("Invalid regex for Created Date"),
+        Regex::new(r"(?i)Created On:\s*(.+)")
+            .expect("Invalid regex for Created On"),
+        Regex::new(r"(?i)Created:\s*(.+)")
+            .expect("Invalid regex for Created"),
+        Regex::new(r"(?i)Registration Date:\s*(.+)")
+            .expect("Invalid regex for Registration Date"),
+        Regex::new(r"(?i)Domain Registration Date:\s*(.+)")
+            .expect("Invalid regex for Domain Registration Date"),
     ]
 });
 
 static EXPIRATION_DATE_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
     vec![
-        Regex::new(r"(?i)(?:Registry )?Expir(?:y|ation) Date:\s*(.+)").unwrap(),
-        Regex::new(r"(?i)Expiration Date:\s*(.+)").unwrap(),
-        Regex::new(r"(?i)Expires On:\s*(.+)").unwrap(),
-        Regex::new(r"(?i)Expires:\s*(.+)").unwrap(),
-        Regex::new(r"(?i)Expiry Date:\s*(.+)").unwrap(),
-        Regex::new(r"(?i)paid-till:\s*(.+)").unwrap(),
+        Regex::new(r"(?i)(?:Registry )?Expir(?:y|ation) Date:\s*(.+)")
+            .expect("Invalid regex for Expiry/Expiration Date"),
+        Regex::new(r"(?i)Expiration Date:\s*(.+)")
+            .expect("Invalid regex for Expiration Date"),
+        Regex::new(r"(?i)Expires On:\s*(.+)")
+            .expect("Invalid regex for Expires On"),
+        Regex::new(r"(?i)Expires:\s*(.+)")
+            .expect("Invalid regex for Expires"),
+        Regex::new(r"(?i)Expiry Date:\s*(.+)")
+            .expect("Invalid regex for Expiry Date"),
+        Regex::new(r"(?i)paid-till:\s*(.+)")
+            .expect("Invalid regex for paid-till"),
     ]
 });
 
 static UPDATED_DATE_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
     vec![
-        Regex::new(r"(?i)Updated Date:\s*(.+)").unwrap(),
-        Regex::new(r"(?i)Last Updated On:\s*(.+)").unwrap(),
-        Regex::new(r"(?i)Last Modified:\s*(.+)").unwrap(),
-        Regex::new(r"(?i)Last Update:\s*(.+)").unwrap(),
-        Regex::new(r"(?i)Modified:\s*(.+)").unwrap(),
+        Regex::new(r"(?i)Updated Date:\s*(.+)")
+            .expect("Invalid regex for Updated Date"),
+        Regex::new(r"(?i)Last Updated On:\s*(.+)")
+            .expect("Invalid regex for Last Updated On"),
+        Regex::new(r"(?i)Last Modified:\s*(.+)")
+            .expect("Invalid regex for Last Modified"),
+        Regex::new(r"(?i)Last Update:\s*(.+)")
+            .expect("Invalid regex for Last Update"),
+        Regex::new(r"(?i)Modified:\s*(.+)")
+            .expect("Invalid regex for Modified"),
     ]
 });
 
 static DNSSEC_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
     vec![
-        Regex::new(r"(?i)DNSSEC:\s*(.+)").unwrap(),
-        Regex::new(r"(?i)DNSSEC Status:\s*(.+)").unwrap(),
+        Regex::new(r"(?i)DNSSEC:\s*(.+)")
+            .expect("Invalid regex for DNSSEC"),
+        Regex::new(r"(?i)DNSSEC Status:\s*(.+)")
+            .expect("Invalid regex for DNSSEC Status"),
     ]
 });
 
 static NAMESERVER_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
     vec![
-        Regex::new(r"(?i)Name Server:\s*(.+)").unwrap(),
-        Regex::new(r"(?i)Nameserver:\s*(.+)").unwrap(),
-        Regex::new(r"(?i)nserver:\s*(.+)").unwrap(),
-        Regex::new(r"(?i)NS:\s*(.+)").unwrap(),
+        Regex::new(r"(?i)Name Server:\s*(.+)")
+            .expect("Invalid regex for Name Server"),
+        Regex::new(r"(?i)Nameserver:\s*(.+)")
+            .expect("Invalid regex for Nameserver"),
+        Regex::new(r"(?i)nserver:\s*(.+)")
+            .expect("Invalid regex for nserver"),
+        Regex::new(r"(?i)NS:\s*(.+)")
+            .expect("Invalid regex for NS"),
     ]
 });
 
 static STATUS_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
     vec![
-        Regex::new(r"(?i)Domain Status:\s*(.+)").unwrap(),
-        Regex::new(r"(?i)Status:\s*(.+)").unwrap(),
-        Regex::new(r"(?i)state:\s*(.+)").unwrap(),
+        Regex::new(r"(?i)Domain Status:\s*(.+)")
+            .expect("Invalid regex for Domain Status"),
+        Regex::new(r"(?i)Status:\s*(.+)")
+            .expect("Invalid regex for Status"),
+        Regex::new(r"(?i)state:\s*(.+)")
+            .expect("Invalid regex for state"),
     ]
 });
 
 static REGISTRANT_EMAIL_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
     vec![
-        Regex::new(r"(?i)Registrant Email:\s*(.+)").unwrap(),
-        Regex::new(r"(?i)Registrant E-mail:\s*(.+)").unwrap(),
+        Regex::new(r"(?i)Registrant Email:\s*(.+)")
+            .expect("Invalid regex for Registrant Email"),
+        Regex::new(r"(?i)Registrant E-mail:\s*(.+)")
+            .expect("Invalid regex for Registrant E-mail"),
     ]
 });
 
 static REGISTRANT_PHONE_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
     vec![
-        Regex::new(r"(?i)Registrant Phone:\s*(.+)").unwrap(),
-        Regex::new(r"(?i)Registrant Tel:\s*(.+)").unwrap(),
+        Regex::new(r"(?i)Registrant Phone:\s*(.+)")
+            .expect("Invalid regex for Registrant Phone"),
+        Regex::new(r"(?i)Registrant Tel:\s*(.+)")
+            .expect("Invalid regex for Registrant Tel"),
     ]
 });
 
 static REGISTRANT_ADDRESS_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
     vec![
-        Regex::new(r"(?i)Registrant Street:\s*(.+)").unwrap(),
-        Regex::new(r"(?i)Registrant Address:\s*(.+)").unwrap(),
+        Regex::new(r"(?i)Registrant Street:\s*(.+)")
+            .expect("Invalid regex for Registrant Street"),
+        Regex::new(r"(?i)Registrant Address:\s*(.+)")
+            .expect("Invalid regex for Registrant Address"),
     ]
 });
 
 static REGISTRANT_COUNTRY_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
     vec![
-        Regex::new(r"(?i)Registrant Country:\s*(.+)").unwrap(),
+        Regex::new(r"(?i)Registrant Country:\s*(.+)")
+            .expect("Invalid regex for Registrant Country"),
     ]
 });
 
 static ADMIN_NAME_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
     vec![
-        Regex::new(r"(?i)Admin Name:\s*(.+)").unwrap(),
-        Regex::new(r"(?i)Administrative Contact Name:\s*(.+)").unwrap(),
+        Regex::new(r"(?i)Admin Name:\s*(.+)")
+            .expect("Invalid regex for Admin Name"),
+        Regex::new(r"(?i)Administrative Contact Name:\s*(.+)")
+            .expect("Invalid regex for Administrative Contact Name"),
     ]
 });
 
 static ADMIN_ORG_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
     vec![
-        Regex::new(r"(?i)Admin Organization:\s*(.+)").unwrap(),
+        Regex::new(r"(?i)Admin Organization:\s*(.+)")
+            .expect("Invalid regex for Admin Organization"),
     ]
 });
 
 static ADMIN_EMAIL_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
     vec![
-        Regex::new(r"(?i)Admin Email:\s*(.+)").unwrap(),
-        Regex::new(r"(?i)Admin E-mail:\s*(.+)").unwrap(),
+        Regex::new(r"(?i)Admin Email:\s*(.+)")
+            .expect("Invalid regex for Admin Email"),
+        Regex::new(r"(?i)Admin E-mail:\s*(.+)")
+            .expect("Invalid regex for Admin E-mail"),
     ]
 });
 
 static ADMIN_PHONE_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
     vec![
-        Regex::new(r"(?i)Admin Phone:\s*(.+)").unwrap(),
-        Regex::new(r"(?i)Admin Tel:\s*(.+)").unwrap(),
+        Regex::new(r"(?i)Admin Phone:\s*(.+)")
+            .expect("Invalid regex for Admin Phone"),
+        Regex::new(r"(?i)Admin Tel:\s*(.+)")
+            .expect("Invalid regex for Admin Tel"),
     ]
 });
 
 static TECH_NAME_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
     vec![
-        Regex::new(r"(?i)Tech Name:\s*(.+)").unwrap(),
-        Regex::new(r"(?i)Technical Contact Name:\s*(.+)").unwrap(),
+        Regex::new(r"(?i)Tech Name:\s*(.+)")
+            .expect("Invalid regex for Tech Name"),
+        Regex::new(r"(?i)Technical Contact Name:\s*(.+)")
+            .expect("Invalid regex for Technical Contact Name"),
     ]
 });
 
 static TECH_ORG_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
     vec![
-        Regex::new(r"(?i)Tech Organization:\s*(.+)").unwrap(),
+        Regex::new(r"(?i)Tech Organization:\s*(.+)")
+            .expect("Invalid regex for Tech Organization"),
     ]
 });
 
 static TECH_EMAIL_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
     vec![
-        Regex::new(r"(?i)Tech Email:\s*(.+)").unwrap(),
-        Regex::new(r"(?i)Tech E-mail:\s*(.+)").unwrap(),
+        Regex::new(r"(?i)Tech Email:\s*(.+)")
+            .expect("Invalid regex for Tech Email"),
+        Regex::new(r"(?i)Tech E-mail:\s*(.+)")
+            .expect("Invalid regex for Tech E-mail"),
     ]
 });
 
 static TECH_PHONE_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
     vec![
-        Regex::new(r"(?i)Tech Phone:\s*(.+)").unwrap(),
-        Regex::new(r"(?i)Tech Tel:\s*(.+)").unwrap(),
+        Regex::new(r"(?i)Tech Phone:\s*(.+)")
+            .expect("Invalid regex for Tech Phone"),
+        Regex::new(r"(?i)Tech Tel:\s*(.+)")
+            .expect("Invalid regex for Tech Tel"),
     ]
 });
 

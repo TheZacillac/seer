@@ -1,11 +1,11 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::RwLock;
 use std::time::Duration;
 
 use once_cell::sync::Lazy;
 use reqwest::Client;
 use serde::Deserialize;
+use tokio::sync::OnceCell;
 use tracing::{debug, instrument};
 
 use super::types::RdapResponse;
@@ -19,16 +19,24 @@ const IANA_BOOTSTRAP_ASN: &str = "https://data.iana.org/rdap/asn.json";
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
-static BOOTSTRAP_CACHE: Lazy<RwLock<BootstrapCache>> =
-    Lazy::new(|| RwLock::new(BootstrapCache::default()));
+/// Thread-safe HTTP client for bootstrap loading
+static BOOTSTRAP_HTTP_CLIENT: Lazy<Client> = Lazy::new(|| {
+    Client::builder()
+        .timeout(DEFAULT_TIMEOUT)
+        .user_agent("Seer/1.0 (RDAP Bootstrap)")
+        .build()
+        .expect("Failed to build bootstrap HTTP client - invalid configuration")
+});
 
-#[derive(Default)]
-struct BootstrapCache {
+/// Bootstrap cache using OnceCell for race-free one-time initialization
+static BOOTSTRAP_CACHE: OnceCell<BootstrapData> = OnceCell::const_new();
+
+/// Parsed IANA bootstrap data
+struct BootstrapData {
     dns: HashMap<String, String>,
     ipv4: Vec<(IpRange, String)>,
     ipv6: Vec<(IpRange, String)>,
     asn: Vec<(AsnRange, String)>,
-    initialized: bool,
 }
 
 #[derive(Clone)]
@@ -78,134 +86,22 @@ impl RdapClient {
         self
     }
 
-    async fn ensure_bootstrap(&self) -> Result<()> {
-        {
-            let cache = BOOTSTRAP_CACHE
-                .read()
-                .map_err(|_| SeerError::RdapError("Bootstrap cache lock poisoned".to_string()))?;
-            if cache.initialized {
-                return Ok(());
-            }
-        }
-
-        self.load_bootstrap().await
+    /// Ensures bootstrap data is loaded, using OnceCell for race-free initialization.
+    /// Multiple concurrent callers will wait for the first caller to complete loading.
+    async fn ensure_bootstrap(&self) -> Result<&'static BootstrapData> {
+        BOOTSTRAP_CACHE
+            .get_or_try_init(load_bootstrap_data)
+            .await
     }
 
-    async fn load_bootstrap(&self) -> Result<()> {
-        debug!("Loading RDAP bootstrap data from IANA");
-
-        let dns_future = self.http.get(IANA_BOOTSTRAP_DNS).send();
-        let ipv4_future = self.http.get(IANA_BOOTSTRAP_IPV4).send();
-        let ipv6_future = self.http.get(IANA_BOOTSTRAP_IPV6).send();
-        let asn_future = self.http.get(IANA_BOOTSTRAP_ASN).send();
-
-        let (dns_resp, ipv4_resp, ipv6_resp, asn_resp) =
-            tokio::try_join!(dns_future, ipv4_future, ipv6_future, asn_future)?;
-
-        let dns_data: BootstrapResponse = dns_resp.json().await?;
-        let ipv4_data: BootstrapResponse = ipv4_resp.json().await?;
-        let ipv6_data: BootstrapResponse = ipv6_resp.json().await?;
-        let asn_data: BootstrapResponse = asn_resp.json().await?;
-
-        let mut cache = BOOTSTRAP_CACHE
-            .write()
-            .map_err(|_| SeerError::RdapError("Bootstrap cache lock poisoned".to_string()))?;
-
-        // Parse DNS bootstrap
-        for service in dns_data.services {
-            if service.len() >= 2 {
-                if let (Some(tlds), Some(urls)) = (service[0].as_array(), service[1].as_array()) {
-                    if let Some(url) = urls.first().and_then(|u| u.as_str()) {
-                        for tld in tlds {
-                            if let Some(tld_str) = tld.as_str() {
-                                cache.dns.insert(tld_str.to_lowercase(), url.to_string());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Parse IPv4 bootstrap
-        for service in ipv4_data.services {
-            if service.len() >= 2 {
-                if let (Some(prefixes), Some(urls)) = (service[0].as_array(), service[1].as_array())
-                {
-                    if let Some(url) = urls.first().and_then(|u| u.as_str()) {
-                        for prefix in prefixes {
-                            if let Some(prefix_str) = prefix.as_str() {
-                                cache.ipv4.push((
-                                    IpRange {
-                                        prefix: prefix_str.to_string(),
-                                    },
-                                    url.to_string(),
-                                ));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Parse IPv6 bootstrap
-        for service in ipv6_data.services {
-            if service.len() >= 2 {
-                if let (Some(prefixes), Some(urls)) = (service[0].as_array(), service[1].as_array())
-                {
-                    if let Some(url) = urls.first().and_then(|u| u.as_str()) {
-                        for prefix in prefixes {
-                            if let Some(prefix_str) = prefix.as_str() {
-                                cache.ipv6.push((
-                                    IpRange {
-                                        prefix: prefix_str.to_string(),
-                                    },
-                                    url.to_string(),
-                                ));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Parse ASN bootstrap
-        for service in asn_data.services {
-            if service.len() >= 2 {
-                if let (Some(ranges), Some(urls)) = (service[0].as_array(), service[1].as_array()) {
-                    if let Some(url) = urls.first().and_then(|u| u.as_str()) {
-                        for range in ranges {
-                            if let Some(range_str) = range.as_str() {
-                                if let Some((start, end)) = parse_asn_range(range_str) {
-                                    cache.asn.push((AsnRange { start, end }, url.to_string()));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        cache.initialized = true;
-        debug!(
-            dns_entries = cache.dns.len(),
-            ipv4_entries = cache.ipv4.len(),
-            ipv6_entries = cache.ipv6.len(),
-            asn_entries = cache.asn.len(),
-            "RDAP bootstrap loaded"
-        );
-
-        Ok(())
-    }
-
-    fn get_rdap_url_for_domain(&self, domain: &str) -> Option<String> {
-        let cache = BOOTSTRAP_CACHE.read().ok()?;
+    /// Looks up the RDAP server URL for a domain's TLD from bootstrap data.
+    fn get_rdap_url_for_domain(cache: &BootstrapData, domain: &str) -> Option<String> {
         let tld = domain.rsplit('.').next()?;
         cache.dns.get(&tld.to_lowercase()).cloned()
     }
 
-    fn get_rdap_url_for_ip(&self, ip: &IpAddr) -> Option<String> {
-        let cache = BOOTSTRAP_CACHE.read().ok()?;
-
+    /// Looks up the RDAP server URL for an IP address from bootstrap data.
+    fn get_rdap_url_for_ip(cache: &BootstrapData, ip: &IpAddr) -> Option<String> {
         match ip {
             IpAddr::V4(addr) => {
                 let octets = addr.octets();
@@ -228,9 +124,8 @@ impl RdapClient {
         None
     }
 
-    fn get_rdap_url_for_asn(&self, asn: u32) -> Option<String> {
-        let cache = BOOTSTRAP_CACHE.read().ok()?;
-
+    /// Looks up the RDAP server URL for an ASN from bootstrap data.
+    fn get_rdap_url_for_asn(cache: &BootstrapData, asn: u32) -> Option<String> {
         for (range, url) in &cache.asn {
             if asn >= range.start && asn <= range.end {
                 return Some(url.clone());
@@ -242,11 +137,10 @@ impl RdapClient {
 
     #[instrument(skip(self), fields(domain = %domain))]
     pub async fn lookup_domain(&self, domain: &str) -> Result<RdapResponse> {
-        self.ensure_bootstrap().await?;
+        let cache = self.ensure_bootstrap().await?;
 
         let domain = normalize_domain(domain)?;
-        let base_url = self
-            .get_rdap_url_for_domain(&domain)
+        let base_url = Self::get_rdap_url_for_domain(cache, &domain)
             .ok_or_else(|| SeerError::RdapBootstrapError(format!("No RDAP server for {}", domain)))?;
 
         let url = format!("{}domain/{}", ensure_trailing_slash(&base_url), domain);
@@ -272,14 +166,13 @@ impl RdapClient {
 
     #[instrument(skip(self), fields(ip = %ip))]
     pub async fn lookup_ip(&self, ip: &str) -> Result<RdapResponse> {
-        self.ensure_bootstrap().await?;
+        let cache = self.ensure_bootstrap().await?;
 
         let ip_addr: IpAddr = ip
             .parse()
             .map_err(|_| SeerError::InvalidIpAddress(ip.to_string()))?;
 
-        let base_url = self
-            .get_rdap_url_for_ip(&ip_addr)
+        let base_url = Self::get_rdap_url_for_ip(cache, &ip_addr)
             .ok_or_else(|| SeerError::RdapBootstrapError(format!("No RDAP server for {}", ip)))?;
 
         let url = format!("{}ip/{}", ensure_trailing_slash(&base_url), ip);
@@ -305,10 +198,9 @@ impl RdapClient {
 
     #[instrument(skip(self), fields(asn = %asn))]
     pub async fn lookup_asn(&self, asn: u32) -> Result<RdapResponse> {
-        self.ensure_bootstrap().await?;
+        let cache = self.ensure_bootstrap().await?;
 
-        let base_url = self
-            .get_rdap_url_for_asn(asn)
+        let base_url = Self::get_rdap_url_for_asn(cache, asn)
             .ok_or_else(|| SeerError::RdapBootstrapError(format!("No RDAP server for AS{}", asn)))?;
 
         let url = format!("{}autnum/{}", ensure_trailing_slash(&base_url), asn);
@@ -331,6 +223,119 @@ impl RdapClient {
         let rdap: RdapResponse = response.json().await?;
         Ok(rdap)
     }
+}
+
+/// Loads IANA RDAP bootstrap data from all registries.
+/// This function is called only once via OnceCell, eliminating race conditions.
+async fn load_bootstrap_data() -> Result<BootstrapData> {
+    debug!("Loading RDAP bootstrap data from IANA");
+
+    let http = &*BOOTSTRAP_HTTP_CLIENT;
+
+    let dns_future = http.get(IANA_BOOTSTRAP_DNS).send();
+    let ipv4_future = http.get(IANA_BOOTSTRAP_IPV4).send();
+    let ipv6_future = http.get(IANA_BOOTSTRAP_IPV6).send();
+    let asn_future = http.get(IANA_BOOTSTRAP_ASN).send();
+
+    let (dns_resp, ipv4_resp, ipv6_resp, asn_resp) =
+        tokio::try_join!(dns_future, ipv4_future, ipv6_future, asn_future)?;
+
+    let dns_data: BootstrapResponse = dns_resp.json().await?;
+    let ipv4_data: BootstrapResponse = ipv4_resp.json().await?;
+    let ipv6_data: BootstrapResponse = ipv6_resp.json().await?;
+    let asn_data: BootstrapResponse = asn_resp.json().await?;
+
+    let mut dns = HashMap::new();
+    let mut ipv4 = Vec::new();
+    let mut ipv6 = Vec::new();
+    let mut asn = Vec::new();
+
+    // Parse DNS bootstrap
+    for service in dns_data.services {
+        if service.len() >= 2 {
+            if let (Some(tlds), Some(urls)) = (service[0].as_array(), service[1].as_array()) {
+                if let Some(url) = urls.first().and_then(|u| u.as_str()) {
+                    for tld in tlds {
+                        if let Some(tld_str) = tld.as_str() {
+                            dns.insert(tld_str.to_lowercase(), url.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Parse IPv4 bootstrap
+    for service in ipv4_data.services {
+        if service.len() >= 2 {
+            if let (Some(prefixes), Some(urls)) = (service[0].as_array(), service[1].as_array()) {
+                if let Some(url) = urls.first().and_then(|u| u.as_str()) {
+                    for prefix in prefixes {
+                        if let Some(prefix_str) = prefix.as_str() {
+                            ipv4.push((
+                                IpRange {
+                                    prefix: prefix_str.to_string(),
+                                },
+                                url.to_string(),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Parse IPv6 bootstrap
+    for service in ipv6_data.services {
+        if service.len() >= 2 {
+            if let (Some(prefixes), Some(urls)) = (service[0].as_array(), service[1].as_array()) {
+                if let Some(url) = urls.first().and_then(|u| u.as_str()) {
+                    for prefix in prefixes {
+                        if let Some(prefix_str) = prefix.as_str() {
+                            ipv6.push((
+                                IpRange {
+                                    prefix: prefix_str.to_string(),
+                                },
+                                url.to_string(),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Parse ASN bootstrap
+    for service in asn_data.services {
+        if service.len() >= 2 {
+            if let (Some(ranges), Some(urls)) = (service[0].as_array(), service[1].as_array()) {
+                if let Some(url) = urls.first().and_then(|u| u.as_str()) {
+                    for range in ranges {
+                        if let Some(range_str) = range.as_str() {
+                            if let Some((start, end)) = parse_asn_range(range_str) {
+                                asn.push((AsnRange { start, end }, url.to_string()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    debug!(
+        dns_entries = dns.len(),
+        ipv4_entries = ipv4.len(),
+        ipv6_entries = ipv6.len(),
+        asn_entries = asn.len(),
+        "RDAP bootstrap loaded"
+    );
+
+    Ok(BootstrapData {
+        dns,
+        ipv4,
+        ipv6,
+        asn,
+    })
 }
 
 // Domain normalization is now handled by the shared validation module

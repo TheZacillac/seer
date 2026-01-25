@@ -67,4 +67,32 @@ pub enum SeerError {
     Other(String),
 }
 
+impl SeerError {
+    /// Returns a sanitized error message safe for external exposure.
+    /// This hides internal details like server hostnames and raw system errors.
+    pub fn sanitized_message(&self) -> String {
+        match self {
+            SeerError::WhoisError(_) => "WHOIS lookup failed".to_string(),
+            SeerError::WhoisServerNotFound(_) => "WHOIS server not found for this TLD".to_string(),
+            SeerError::WhoisConnectionFailed(_) => "WHOIS connection failed".to_string(),
+            SeerError::RdapError(_) => "RDAP lookup failed".to_string(),
+            SeerError::RdapBootstrapError(_) => "RDAP service unavailable for this resource".to_string(),
+            SeerError::DnsError(_) => "DNS resolution failed".to_string(),
+            SeerError::DnsResolverError(_) => "DNS resolution failed".to_string(),
+            SeerError::InvalidDomain(domain) => format!("Invalid domain name: {}", domain),
+            SeerError::InvalidIpAddress(ip) => format!("Invalid IP address: {}", ip),
+            SeerError::InvalidRecordType(rt) => format!("Invalid record type: {}", rt),
+            SeerError::HttpError(_) => "HTTP request failed".to_string(),
+            SeerError::ReqwestError(_) => "HTTP request failed".to_string(),
+            SeerError::JsonError(_) => "Response parsing failed".to_string(),
+            SeerError::Timeout(_) => "Operation timed out".to_string(),
+            SeerError::RateLimited(_) => "Rate limited - please try again later".to_string(),
+            SeerError::CertificateError(_) => "Certificate validation failed".to_string(),
+            SeerError::BulkOperationError { .. } => "Bulk operation partially failed".to_string(),
+            SeerError::LookupFailed { domain, .. } => format!("Lookup failed for {}", domain),
+            SeerError::Other(_) => "Operation failed".to_string(),
+        }
+    }
+}
+
 pub type Result<T> = std::result::Result<T, SeerError>;

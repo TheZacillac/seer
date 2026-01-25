@@ -17,6 +17,7 @@ use crate::whois::{WhoisClient, WhoisResponse};
 
 pub type ProgressCallback = Box<dyn Fn(usize, usize, &str) + Send + Sync>;
 
+/// A single operation to perform in a bulk execution batch.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum BulkOperation {
@@ -28,6 +29,7 @@ pub enum BulkOperation {
     Status { domain: String },
 }
 
+/// The data returned from a bulk operation (varies by operation type).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum BulkResultData {
@@ -39,6 +41,7 @@ pub enum BulkResultData {
     Status(StatusResponse),
 }
 
+/// Result of a single operation within a bulk execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BulkResult {
     pub operation: BulkOperation,
@@ -48,6 +51,7 @@ pub struct BulkResult {
     pub duration_ms: u64,
 }
 
+/// Executes bulk operations concurrently with rate limiting.
 #[derive(Debug, Clone)]
 pub struct BulkExecutor {
     concurrency: usize,

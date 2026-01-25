@@ -193,6 +193,65 @@ async def list_tools() -> list[Tool]:
                 "required": ["domains"],
             },
         ),
+        Tool(
+            name="seer_status",
+            description="Check the health status of a domain including HTTP accessibility, SSL certificate validity, and domain expiration.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "domain": {
+                        "type": "string",
+                        "description": "Domain name to check (e.g., 'example.com')",
+                    },
+                },
+                "required": ["domain"],
+            },
+        ),
+        Tool(
+            name="seer_bulk_status",
+            description="Check health status for multiple domains at once. Returns HTTP, SSL, and expiration status for each domain.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "domains": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of domain names to check",
+                    },
+                    "concurrency": {
+                        "type": "integer",
+                        "description": "Number of concurrent requests (default: 10)",
+                        "default": 10,
+                    },
+                },
+                "required": ["domains"],
+            },
+        ),
+        Tool(
+            name="seer_bulk_propagation",
+            description="Check DNS propagation for multiple domains at once across global DNS servers.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "domains": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of domain names to check",
+                    },
+                    "record_type": {
+                        "type": "string",
+                        "description": "DNS record type to check (default: A)",
+                        "default": "A",
+                    },
+                    "concurrency": {
+                        "type": "integer",
+                        "description": "Number of concurrent requests (default: 5)",
+                        "default": 5,
+                    },
+                },
+                "required": ["domains"],
+            },
+        ),
     ]
 
 
@@ -254,6 +313,22 @@ async def execute_tool(name: str, arguments: dict[str, Any]) -> Any:
                 arguments["domains"],
                 arguments.get("record_type", "A"),
                 arguments.get("concurrency", 10),
+            )
+
+        case "seer_status":
+            return seer.status(arguments["domain"])
+
+        case "seer_bulk_status":
+            return seer.bulk_status(
+                arguments["domains"],
+                arguments.get("concurrency", 10),
+            )
+
+        case "seer_bulk_propagation":
+            return seer.bulk_propagation(
+                arguments["domains"],
+                arguments.get("record_type", "A"),
+                arguments.get("concurrency", 5),
             )
 
         case _:

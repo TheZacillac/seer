@@ -17,9 +17,12 @@ use crate::validation::normalize_domain;
 /// Pre-compiled regexes for extracting WHOIS referral servers
 static REFERRAL_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
     vec![
-        Regex::new(r"(?i)Registrar WHOIS Server:\s*(.+)").unwrap(),
-        Regex::new(r"(?i)Whois Server:\s*(.+)").unwrap(),
-        Regex::new(r"(?i)ReferralServer:\s*whois://(.+)").unwrap(),
+        Regex::new(r"(?i)Registrar WHOIS Server:\s*(.+)")
+            .expect("Invalid regex pattern for Registrar WHOIS Server"),
+        Regex::new(r"(?i)Whois Server:\s*(.+)")
+            .expect("Invalid regex pattern for Whois Server"),
+        Regex::new(r"(?i)ReferralServer:\s*whois://(.+)")
+            .expect("Invalid regex pattern for ReferralServer"),
     ]
 });
 
@@ -196,6 +199,9 @@ impl WhoisClient {
                 }
             }
         }
+
+        // Explicitly shutdown the TCP stream to ensure proper FIN handshake
+        let _ = stream.shutdown().await;
 
         // Try UTF-8, fall back to Latin-1
         String::from_utf8(response.clone())
