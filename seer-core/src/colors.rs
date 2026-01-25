@@ -2,6 +2,9 @@
 //!
 //! Uses standard ANSI bright colors for maximum terminal compatibility,
 //! mapped to approximate Catppuccin Frappe aesthetics.
+//!
+//! Color palette inspired by [Catppuccin](https://github.com/catppuccin/catppuccin),
+//! a community-driven pastel theme. See their repository for the full palette specification.
 
 use colored::{ColoredString, Colorize};
 
