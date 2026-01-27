@@ -17,7 +17,7 @@ use seer_core::colors::CatppuccinExt;
 use seer_core::output::OutputFormatter;
 use tokio::sync::watch;
 
-use crate::display::Spinner;
+use crate::display::{clear_bulk_progress_bar, set_bulk_progress_bar, Spinner};
 
 const HISTORY_FILE: &str = ".seer_history";
 
@@ -480,12 +480,16 @@ impl Repl {
                 .progress_chars("█▓░"),
         );
 
+        // Register progress bar for tracing integration
+        set_bulk_progress_bar(progress.clone());
+
         let executor = seer_core::BulkExecutor::new().with_concurrency(5);
 
+        let progress_callback = progress.clone();
         let callback: seer_core::bulk::ProgressCallback =
             Box::new(move |current, _total, domain| {
-                progress.set_position(current as u64);
-                progress.set_message(domain.to_string());
+                progress_callback.set_position(current as u64);
+                progress_callback.set_message(domain.to_string());
             });
 
         let operations: Vec<seer_core::bulk::BulkOperation> = match operation {
@@ -528,6 +532,10 @@ impl Repl {
         };
 
         let results = executor.execute(operations, Some(callback)).await;
+
+        // Clear progress bar registration before printing results
+        clear_bulk_progress_bar();
+        progress.finish_and_clear();
 
         // Write results to CSV
         let csv_content = bulk_results_to_csv(&results, operation);

@@ -141,11 +141,14 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Initialize tracing
+    // Initialize tracing with progress-aware writer
+    // This routes log output through the progress bar when one is active,
+    // preventing logs from interfering with progress bar display
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
         )
+        .with_writer(display::ProgressWriterFactory::new())
         .init();
 
     let cli = Cli::parse();
