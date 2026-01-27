@@ -11,7 +11,7 @@ name = "seer"
 crate-type = ["cdylib"]
 
 [dependencies]
-seer-core = { version = "0.1.92", path = "../seer-core" }
+seer-core = { version = "0.1.93", path = "../seer-core" }
 pyo3 = { workspace = true }
 tokio = { workspace = true }
 serde_json = { workspace = true }

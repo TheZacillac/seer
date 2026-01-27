@@ -3,7 +3,7 @@ resolver = "2"
 members = ["seer-core", "seer-cli", "seer-py"]
 
 [workspace.package]
-version = "0.1.92"
+version = "0.1.93"
 edition = "2021"
 authors = ["Zac Roach"]
 license = "MIT"

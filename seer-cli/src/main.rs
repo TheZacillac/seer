@@ -502,19 +502,19 @@ fn bulk_results_to_csv(results: &[seer_core::bulk::BulkResult], operation: &str)
     // Write header based on operation type
     match operation {
         "status" => {
-            csv.push_str("domain,success,http_status,http_status_text,title,ssl_issuer,ssl_valid_until,ssl_days_remaining,domain_expires,domain_days_remaining,registrar,dns_resolves,dns_a_records,dns_aaaa_records,dns_cname,dns_nameservers,duration_ms,error\n");
+            csv.push_str("domain,success,http_status,http_status_text,title,ssl_issuer,ssl_valid_until,ssl_days_remaining,domain_expires,domain_days_remaining,registrar,dns_resolves,dns_a_records,dns_aaaa_records,dns_cname,dns_nameservers,duration_ms\n");
         }
         "lookup" | "whois" | "rdap" => {
-            csv.push_str("domain,success,registrar,created,expires,updated,duration_ms,error\n");
+            csv.push_str("domain,success,registrar,created,expires,updated,duration_ms\n");
         }
         "dig" | "dns" => {
-            csv.push_str("domain,success,record_type,records,duration_ms,error\n");
+            csv.push_str("domain,success,record_type,records,duration_ms\n");
         }
         "propagation" | "prop" => {
-            csv.push_str("domain,success,propagation_pct,servers_total,servers_responded,duration_ms,error\n");
+            csv.push_str("domain,success,propagation_pct,servers_total,servers_responded,duration_ms\n");
         }
         _ => {
-            csv.push_str("domain,success,duration_ms,error\n");
+            csv.push_str("domain,success,duration_ms\n");
         }
     }
 
@@ -523,7 +523,6 @@ fn bulk_results_to_csv(results: &[seer_core::bulk::BulkResult], operation: &str)
         let domain = get_domain_from_operation(&result.operation);
         let success = result.success;
         let duration_ms = result.duration_ms;
-        let error = escape_csv_field(result.error.as_deref().unwrap_or(""));
 
         match operation {
             "status" => {
@@ -600,7 +599,7 @@ fn bulk_results_to_csv(results: &[seer_core::bulk::BulkResult], operation: &str)
                         Default::default()
                     };
                 csv.push_str(&format!(
-                    "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+                    "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
                     domain,
                     success,
                     http_status,
@@ -617,8 +616,7 @@ fn bulk_results_to_csv(results: &[seer_core::bulk::BulkResult], operation: &str)
                     escape_csv_field(&dns_aaaa),
                     escape_csv_field(&dns_cname),
                     escape_csv_field(&dns_ns),
-                    duration_ms,
-                    error
+                    duration_ms
                 ));
             }
             "lookup" => {
@@ -649,15 +647,14 @@ fn bulk_results_to_csv(results: &[seer_core::bulk::BulkResult], operation: &str)
                     Default::default()
                 };
                 csv.push_str(&format!(
-                    "{},{},{},{},{},{},{},{}\n",
+                    "{},{},{},{},{},{},{}\n",
                     domain,
                     success,
                     escape_csv_field(&registrar),
                     created,
                     expires,
                     updated,
-                    duration_ms,
-                    error
+                    duration_ms
                 ));
             }
             "whois" => {
@@ -679,15 +676,14 @@ fn bulk_results_to_csv(results: &[seer_core::bulk::BulkResult], operation: &str)
                         Default::default()
                     };
                 csv.push_str(&format!(
-                    "{},{},{},{},{},{},{},{}\n",
+                    "{},{},{},{},{},{},{}\n",
                     domain,
                     success,
                     escape_csv_field(&registrar),
                     created,
                     expires,
                     updated,
-                    duration_ms,
-                    error
+                    duration_ms
                 ));
             }
             "rdap" => {
@@ -698,15 +694,14 @@ fn bulk_results_to_csv(results: &[seer_core::bulk::BulkResult], operation: &str)
                         Default::default()
                     };
                 csv.push_str(&format!(
-                    "{},{},{},{},{},{},{},{}\n",
+                    "{},{},{},{},{},{},{}\n",
                     domain,
                     success,
                     escape_csv_field(&registrar),
                     created,
                     expires,
                     updated,
-                    duration_ms,
-                    error
+                    duration_ms
                 ));
             }
             "dig" | "dns" => {
@@ -722,13 +717,12 @@ fn bulk_results_to_csv(results: &[seer_core::bulk::BulkResult], operation: &str)
                         Default::default()
                     };
                 csv.push_str(&format!(
-                    "{},{},{},{},{},{}\n",
+                    "{},{},{},{},{}\n",
                     domain,
                     success,
                     record_type,
                     escape_csv_field(&records),
-                    duration_ms,
-                    error
+                    duration_ms
                 ));
             }
             "propagation" | "prop" => {
@@ -750,14 +744,14 @@ fn bulk_results_to_csv(results: &[seer_core::bulk::BulkResult], operation: &str)
                         Default::default()
                     };
                 csv.push_str(&format!(
-                    "{},{},{},{},{},{},{}\n",
-                    domain, success, pct, total, responded, duration_ms, error
+                    "{},{},{},{},{},{}\n",
+                    domain, success, pct, total, responded, duration_ms
                 ));
             }
             _ => {
                 csv.push_str(&format!(
-                    "{},{},{},{}\n",
-                    domain, success, duration_ms, error
+                    "{},{},{}\n",
+                    domain, success, duration_ms
                 ));
             }
         }
@@ -781,11 +775,8 @@ fn escape_csv_field(s: &str) -> String {
         s.to_string()
     };
 
-    if s.contains(',') || s.contains('"') || s.contains('\n') {
-        format!("\"{}\"", s.replace('"', "\"\""))
-    } else {
-        s
-    }
+    // Replace commas and newlines with spaces for cleaner CSV
+    s.replace(',', " ").replace('\n', " ").replace('"', "'")
 }
 
 fn get_domain_from_operation(op: &seer_core::bulk::BulkOperation) -> String {
