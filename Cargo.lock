@@ -1818,7 +1818,7 @@ dependencies = [
 
 [[package]]
 name = "seer-cli"
-version = "0.1.93"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1837,7 +1837,7 @@ dependencies = [
 
 [[package]]
 name = "seer-core"
-version = "0.1.93"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1848,6 +1848,7 @@ dependencies = [
  "hickory-resolver",
  "native-tls",
  "once_cell",
+ "rand 0.8.5",
  "regex",
  "reqwest",
  "serde",
@@ -1863,7 +1864,7 @@ dependencies = [
 
 [[package]]
 name = "seer-py"
-version = "0.1.93"
+version = "0.10.0"
 dependencies = [
  "pyo3",
  "seer-core",

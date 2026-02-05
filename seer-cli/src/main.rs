@@ -1,6 +1,8 @@
 mod display;
 mod repl;
 
+use std::io::Write;
+
 use clap::{Parser, Subcommand};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::terminal;
@@ -434,30 +436,36 @@ async fn execute_command(
             });
 
             // Create progress callback for real-time output
+            // Note: raw mode is enabled for key detection, so we need \r\n for proper line breaks
             let use_json = matches!(output_format, seer_core::output::OutputFormat::Json);
             let callback: seer_core::dns::FollowProgressCallback =
                 std::sync::Arc::new(move |iteration| {
-                    if use_json {
+                    let output = if use_json {
                         let json_formatter = seer_core::output::JsonFormatter::new();
-                        println!("{}", json_formatter.format_follow_iteration(iteration));
+                        json_formatter.format_follow_iteration(iteration)
                     } else {
                         let human_formatter = seer_core::output::HumanFormatter::new();
-                        println!("{}", human_formatter.format_follow_iteration(iteration));
-                    }
+                        human_formatter.format_follow_iteration(iteration)
+                    };
+                    // In raw mode, \n alone doesn't return to column 0, so use \r\n
+                    let output = output.replace('\n', "\r\n");
+                    println!("{}\r", output);
                 });
 
-            println!(
-                "Following {} {} records ({} iterations, {} interval)",
+            // In raw mode, use \r\n for proper line breaks
+            print!(
+                "Following {} {} records ({} iterations, {} interval)\r\n",
                 domain.ctp_green(),
                 record_type.ctp_yellow(),
                 iterations.to_string().ctp_yellow(),
                 format_interval(interval_minutes)
             );
-            println!(
-                "Press {} or {} to stop early\n",
+            print!(
+                "Press {} or {} to stop early\r\n\r\n",
                 "Esc".ctp_yellow(),
                 "Ctrl+C".ctp_yellow()
             );
+            let _ = std::io::stdout().flush();
 
             let result = follower
                 .follow(&domain, rt, ns, config, Some(callback), Some(cancel_rx))

@@ -12,8 +12,13 @@ use super::records::{DnsRecord, RecordData, RecordType};
 use crate::error::{Result, SeerError};
 use crate::validation::normalize_domain;
 
+/// Default timeout for DNS queries (5 seconds).
+/// DNS is typically fast; longer timeouts indicate network issues or unreachable servers.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// DNS resolver for querying various record types.
+///
+/// Uses Google DNS (8.8.8.8) by default, but supports custom nameservers.
 #[derive(Debug, Clone)]
 pub struct DnsResolver {
     timeout: Duration,
@@ -26,12 +31,16 @@ impl Default for DnsResolver {
 }
 
 impl DnsResolver {
+    /// Creates a new DNS resolver with default settings.
     pub fn new() -> Self {
         Self {
             timeout: DEFAULT_TIMEOUT,
         }
     }
 
+    /// Sets the timeout for DNS queries.
+    ///
+    /// The default is 5 seconds, which is sufficient for most DNS queries.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
@@ -46,7 +55,7 @@ impl DnsResolver {
         let config = if let Some(ns) = nameserver {
             let ip: IpAddr = ns
                 .parse()
-                .map_err(|_| SeerError::DnsError(format!("Invalid nameserver IP: {}", ns)))?;
+                .map_err(|_| SeerError::DnsError(format!("invalid nameserver IP: {}", ns)))?;
 
             let socket_addr = SocketAddr::new(ip, 53);
             let ns_config = NameServerConfig::new(socket_addr, Protocol::Udp);
@@ -61,6 +70,12 @@ impl DnsResolver {
         Ok(TokioAsyncResolver::tokio(config, opts))
     }
 
+    /// Resolves DNS records for a domain.
+    ///
+    /// # Arguments
+    /// * `domain` - The domain name to query
+    /// * `record_type` - The type of DNS record to look up (A, AAAA, MX, etc.)
+    /// * `nameserver` - Optional custom nameserver IP; uses Google DNS if None
     #[instrument(skip(self), fields(domain = %domain, record_type = %record_type))]
     pub async fn resolve(
         &self,
@@ -99,6 +114,13 @@ impl DnsResolver {
         }
     }
 
+    /// Resolves SRV records for a service.
+    ///
+    /// # Arguments
+    /// * `service` - The service name (e.g., "http", "ldap")
+    /// * `protocol` - The protocol (e.g., "tcp", "udp")
+    /// * `domain` - The domain name
+    /// * `nameserver` - Optional custom nameserver IP
     pub async fn resolve_srv(
         &self,
         service: &str,
@@ -109,13 +131,13 @@ impl DnsResolver {
         // Validate service and protocol to prevent DNS query injection
         if !is_valid_srv_label(service) {
             return Err(SeerError::DnsError(format!(
-                "Invalid SRV service name: {}",
+                "invalid SRV service name: {}",
                 service
             )));
         }
         if !is_valid_srv_label(protocol) {
             return Err(SeerError::DnsError(format!(
-                "Invalid SRV protocol name: {}",
+                "invalid SRV protocol name: {}",
                 protocol
             )));
         }
@@ -545,7 +567,7 @@ impl DnsResolver {
             RecordType::CAA => self.resolve_caa(resolver, domain).await,
             RecordType::DNSKEY => self.resolve_dnskey(resolver, domain).await,
             RecordType::DS => self.resolve_ds(resolver, domain).await,
-            _ => Err(SeerError::DnsError("Unsupported record type".to_string())),
+            _ => Err(SeerError::DnsError("unsupported record type".to_string())),
         }
     }
 }
@@ -563,15 +585,21 @@ fn reverse_dns_name(ip: &IpAddr) -> String {
         }
         IpAddr::V6(addr) => {
             let segments = addr.segments();
-            let nibbles: Vec<String> = segments
-                .iter()
-                .flat_map(|s| {
-                    let hex = format!("{:04x}", s);
-                    hex.chars().map(|c| c.to_string()).collect::<Vec<_>>()
-                })
-                .rev()
-                .collect();
-            format!("{}.ip6.arpa", nibbles.join("."))
+            // 32 hex nibbles + 31 dots + ".ip6.arpa" (9) = 72 chars
+            let mut result = String::with_capacity(72);
+            let mut first = true;
+            for segment in segments.iter().rev() {
+                for shift in [0, 4, 8, 12] {
+                    if !first {
+                        result.push('.');
+                    }
+                    first = false;
+                    let nibble = (segment >> shift) & 0xF;
+                    result.push(char::from_digit(nibble as u32, 16).unwrap());
+                }
+            }
+            result.push_str(".ip6.arpa");
+            result
         }
     }
 }

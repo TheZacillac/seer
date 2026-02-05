@@ -7,7 +7,7 @@ use regex::Regex;
 use tokio::net::TcpStream;
 use tracing::{debug, instrument};
 
-/// Pre-compiled regex for extracting HTML title
+/// Pre-compiled regex for extracting HTML title.
 static TITLE_REGEX: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?i)<title[^>]*>([^<]+)</title>")
         .expect("Invalid regex for HTML title extraction")
@@ -19,6 +19,8 @@ use crate::error::{Result, SeerError};
 use crate::lookup::SmartLookup;
 use crate::validation::{is_private_or_reserved_ip, normalize_domain};
 
+/// Default timeout for HTTP and TLS operations (10 seconds).
+/// Balances responsiveness with allowing slow servers to respond.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Client for checking domain status (HTTP, SSL, expiration)
@@ -34,20 +36,20 @@ impl Default for StatusClient {
 }
 
 impl StatusClient {
-    /// Create a new StatusClient with default settings
+    /// Creates a new StatusClient with default settings.
     pub fn new() -> Self {
         Self {
             timeout: DEFAULT_TIMEOUT,
         }
     }
 
-    /// Set the timeout for HTTP and TLS operations
+    /// Sets the timeout for HTTP and TLS operations.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
     }
 
-    /// Check the status of a domain
+    /// Checks the status of a domain (HTTP, SSL, expiration, DNS).
     #[instrument(skip(self), fields(domain = %domain))]
     pub async fn check(&self, domain: &str) -> Result<StatusResponse> {
         // Normalize domain format (doesn't require DNS resolution)
@@ -90,7 +92,7 @@ impl StatusClient {
         Ok(response)
     }
 
-    /// Fetch HTTP status code and page title
+    /// Fetches the HTTP status code and page title.
     async fn fetch_http_info(&self, domain: &str) -> Result<(u16, String, Option<String>)> {
         // SSRF protection: resolve domain and check IPs before connecting
         let addr = format!("{}:443", domain);
@@ -102,7 +104,7 @@ impl StatusClient {
         for socket_addr in &socket_addrs {
             if is_private_or_reserved_ip(&socket_addr.ip()) {
                 return Err(SeerError::HttpError(format!(
-                    "Domain resolves to private/reserved IP: {}",
+                    "domain resolves to private/reserved IP: {}",
                     socket_addr.ip()
                 )));
             }
@@ -151,7 +153,7 @@ impl StatusClient {
         Ok((status_code, status_text, title))
     }
 
-    /// Fetch SSL certificate information using native-tls
+    /// Fetches SSL certificate information using native-tls.
     async fn fetch_certificate_info(&self, domain: &str) -> Result<CertificateInfo> {
         // SSRF protection: resolve domain and check IPs before connecting
         let addr = format!("{}:443", domain);
@@ -163,7 +165,7 @@ impl StatusClient {
         for socket_addr in &socket_addrs {
             if is_private_or_reserved_ip(&socket_addr.ip()) {
                 return Err(SeerError::CertificateError(format!(
-                    "Domain resolves to private/reserved IP: {}",
+                    "domain resolves to private/reserved IP: {}",
                     socket_addr.ip()
                 )));
             }
@@ -178,7 +180,7 @@ impl StatusClient {
 
         let stream = tokio::time::timeout(self.timeout, TcpStream::connect(&addr))
             .await
-            .map_err(|_| SeerError::Timeout(format!("Connection to {} timed out", domain)))?
+            .map_err(|_| SeerError::Timeout(format!("connection to {} timed out", domain)))?
             .map_err(|e| SeerError::CertificateError(e.to_string()))?;
 
         let tls_stream = tokio::time::timeout(self.timeout, connector.connect(domain, stream))
@@ -191,7 +193,7 @@ impl StatusClient {
             .get_ref()
             .peer_certificate()
             .map_err(|e| SeerError::CertificateError(e.to_string()))?
-            .ok_or_else(|| SeerError::CertificateError("No certificate found".to_string()))?;
+            .ok_or_else(|| SeerError::CertificateError("no certificate found".to_string()))?;
 
         // Parse certificate info
         let der = cert
@@ -201,7 +203,7 @@ impl StatusClient {
         parse_certificate_der(&der, domain)
     }
 
-    /// Fetch domain expiration info using WHOIS/RDAP
+    /// Fetches domain expiration info using WHOIS/RDAP.
     async fn fetch_domain_expiration(&self, domain: &str) -> Result<Option<DomainExpiration>> {
         let lookup = SmartLookup::new();
 
@@ -224,7 +226,7 @@ impl StatusClient {
         }
     }
 
-    /// Fetch DNS root record resolution (A, AAAA, CNAME, NS)
+    /// Fetches DNS root record resolution (A, AAAA, CNAME, NS).
     async fn fetch_dns_resolution(&self, domain: &str) -> Result<DnsResolution> {
         let resolver = DnsResolver::new();
 
@@ -302,7 +304,7 @@ impl StatusClient {
 
 // Domain normalization and validation is now handled by the validation module
 
-/// Extract the title from HTML content
+/// Extracts the title from HTML content.
 fn extract_title(html: &str) -> Option<String> {
     TITLE_REGEX
         .captures(html)
@@ -311,12 +313,12 @@ fn extract_title(html: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// Parse certificate information from DER-encoded certificate using x509-parser
+/// Parses certificate information from DER-encoded certificate using x509-parser.
 fn parse_certificate_der(der: &[u8], _domain: &str) -> Result<CertificateInfo> {
     use x509_parser::prelude::*;
 
     let (_, cert) = X509Certificate::from_der(der)
-        .map_err(|e| SeerError::CertificateError(format!("Failed to parse certificate: {}", e)))?;
+        .map_err(|e| SeerError::CertificateError(format!("failed to parse certificate: {}", e)))?;
 
     // Extract issuer - prefer CN, fall back to O (Organization)
     let issuer = extract_name_from_x509(cert.issuer())
@@ -344,7 +346,7 @@ fn parse_certificate_der(der: &[u8], _domain: &str) -> Result<CertificateInfo> {
     })
 }
 
-/// Extract Common Name or Organization from X.509 name
+/// Extracts the Common Name or Organization from an X.509 name.
 fn extract_name_from_x509(name: &x509_parser::prelude::X509Name) -> Option<String> {
     use x509_parser::prelude::*;
 
@@ -373,7 +375,7 @@ fn extract_name_from_x509(name: &x509_parser::prelude::X509Name) -> Option<Strin
     None
 }
 
-/// Extract string from ASN.1 attribute value, handling different encodings
+/// Extracts a string from an ASN.1 attribute value, handling different encodings.
 fn extract_attr_string(value: &x509_parser::der_parser::asn1_rs::Any) -> Option<String> {
     // Try as_str() first (handles PrintableString, IA5String, etc.)
     if let Ok(s) = value.as_str() {
@@ -393,9 +395,9 @@ fn extract_attr_string(value: &x509_parser::der_parser::asn1_rs::Any) -> Option<
     None
 }
 
-/// Convert x509-parser ASN1Time to chrono DateTime
+/// Converts an x509-parser ASN1Time to a chrono DateTime.
 fn asn1_time_to_chrono(time: x509_parser::time::ASN1Time) -> Result<chrono::DateTime<Utc>> {
     let timestamp = time.timestamp();
     chrono::DateTime::from_timestamp(timestamp, 0)
-        .ok_or_else(|| SeerError::CertificateError("Invalid certificate timestamp".to_string()))
+        .ok_or_else(|| SeerError::CertificateError("invalid certificate timestamp".to_string()))
 }

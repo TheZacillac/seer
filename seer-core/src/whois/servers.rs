@@ -2,7 +2,7 @@ use once_cell::sync::Lazy;
 use std::collections::HashMap;
 
 /// Comprehensive WHOIS server list.
-/// Data sourced from https://github.com/WooMai/whois-servers (auto-synced with IANA Root Zone Database)
+/// Data sourced from https://github.com/WooMai/whois-servers (auto-synced with IANA Root Zone Database).
 pub static WHOIS_SERVERS: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(|| {
     let mut m = HashMap::new();
 
@@ -1246,8 +1246,8 @@ pub fn get_tld(domain: &str) -> Option<&str> {
     domain.rsplit('.').next()
 }
 
-/// Get a suggested registry website URL for a TLD.
-/// This derives the URL from the WHOIS server hostname when possible.
+/// Returns a suggested registry website URL for a TLD.
+/// Derives the URL from the WHOIS server hostname when possible.
 pub fn get_registry_url(tld: &str) -> Option<String> {
     let tld_lower = tld.to_lowercase();
 

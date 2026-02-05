@@ -475,14 +475,14 @@ impl RdapResponse {
             .unwrap_or(false)
     }
 
-    /// Get entity by role
+    /// Returns an entity by its role.
     pub fn get_entity_by_role(&self, role: &str) -> Option<&RdapEntity> {
         self.entities
             .iter()
             .find(|e| e.roles.iter().any(|r| r == role))
     }
 
-    /// Get all contact information for a specific role
+    /// Returns all contact information for a specific role.
     pub fn get_contact_info(&self, role: &str) -> Option<ContactInfo> {
         let entity = self.get_entity_by_role(role)?;
         Some(ContactInfo {
@@ -512,7 +512,7 @@ impl RdapResponse {
     }
 }
 
-/// Contact information extracted from RDAP entity
+/// Contact information extracted from RDAP entity.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContactInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -530,7 +530,7 @@ pub struct ContactInfo {
 }
 
 impl ContactInfo {
-    /// Check if contact has any non-redacted information
+    /// Checks if the contact has any non-redacted information.
     pub fn has_info(&self) -> bool {
         let has_data = self.name.is_some()
             || self.organization.is_some()

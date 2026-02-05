@@ -1,9 +1,11 @@
+use std::collections::HashSet;
+
 use chrono::{DateTime, Utc};
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
-/// Pre-compiled regexes for WHOIS field extraction
+/// Pre-compiled regexes for WHOIS field extraction.
 static REGISTRAR_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
     vec![
         Regex::new(r"(?i)Registrar:\s*(.+)")
@@ -262,7 +264,19 @@ pub struct WhoisResponse {
 }
 
 impl WhoisResponse {
+    /// Parses a WHOIS response using the parser registry.
+    ///
+    /// This method delegates to specialized parsers for known TLDs
+    /// and falls back to the generic parser otherwise.
     pub fn parse(domain: &str, whois_server: &str, raw: &str) -> Self {
+        super::parsers::PARSER_REGISTRY.parse(domain, whois_server, raw)
+    }
+
+    /// Internal parsing using the generic regex-based approach.
+    ///
+    /// This is called by the GenericParser and can be overridden
+    /// by specialized parsers for specific TLDs.
+    pub fn parse_internal(domain: &str, whois_server: &str, raw: &str) -> Self {
         let registrar = extract_field_with_patterns(raw, &REGISTRAR_PATTERNS);
         let registrant = extract_field_with_patterns(raw, &REGISTRANT_PATTERNS);
         let organization = extract_field_with_patterns(raw, &ORGANIZATION_PATTERNS);
@@ -350,7 +364,10 @@ fn extract_field_with_patterns(text: &str, patterns: &[Regex]) -> Option<String>
     for re in patterns {
         if let Some(caps) = re.captures(text) {
             if let Some(m) = caps.get(1) {
-                let value = m.as_str().trim().to_string();
+                let value = m.as_str().trim();
+                if value.is_empty() {
+                    continue;
+                }
                 let lower = value.to_lowercase();
 
                 // Filter out redacted/privacy-protected values
@@ -360,11 +377,10 @@ fn extract_field_with_patterns(text: &str, patterns: &[Regex]) -> Option<String>
                     || lower.contains("not disclosed")
                     || lower.contains("withheld")
                     || lower == "n/a"
-                    || lower == "none"
-                    || value.is_empty();
+                    || lower == "none";
 
                 if !is_redacted {
-                    return Some(value);
+                    return Some(value.to_string());
                 }
             }
         }
@@ -416,13 +432,14 @@ fn parse_date(date_str: &str) -> Option<DateTime<Utc>> {
 }
 
 fn extract_nameservers(text: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
     let mut nameservers = Vec::new();
 
     for re in NAMESERVER_PATTERNS.iter() {
         for caps in re.captures_iter(text) {
             if let Some(m) = caps.get(1) {
                 let ns = m.as_str().trim().to_lowercase();
-                if !ns.is_empty() && !nameservers.contains(&ns) {
+                if !ns.is_empty() && seen.insert(ns.clone()) {
                     nameservers.push(ns);
                 }
             }
@@ -433,16 +450,17 @@ fn extract_nameservers(text: &str) -> Vec<String> {
 }
 
 fn extract_status(text: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
     let mut statuses = Vec::new();
 
     for re in STATUS_PATTERNS.iter() {
         for caps in re.captures_iter(text) {
             if let Some(m) = caps.get(1) {
-                let status = m.as_str().trim().to_string();
+                let raw = m.as_str().trim();
                 // Extract just the status code without the URL
-                let status = status.split_whitespace().next().unwrap_or(&status).to_string();
-                if !status.is_empty() && !statuses.contains(&status) {
-                    statuses.push(status);
+                let status = raw.split_whitespace().next().unwrap_or(raw);
+                if !status.is_empty() && seen.insert(status.to_string()) {
+                    statuses.push(status.to_string());
                 }
             }
         }

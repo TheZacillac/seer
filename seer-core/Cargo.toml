@@ -30,6 +30,7 @@ base64 = { workspace = true }
 native-tls = { workspace = true }
 tokio-native-tls = { workspace = true }
 x509-parser = { workspace = true }
+rand = { workspace = true }
 
 [dev-dependencies]
 tokio-test = "0.4"

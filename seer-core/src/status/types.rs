@@ -64,7 +64,7 @@ pub struct DnsResolution {
 }
 
 impl StatusResponse {
-    /// Create a new StatusResponse with just the domain name
+    /// Creates a new StatusResponse with just the domain name.
     pub fn new(domain: String) -> Self {
         Self {
             domain,

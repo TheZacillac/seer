@@ -4,7 +4,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use crate::error::{Result, SeerError};
 
-/// Normalize and validate a domain name
+/// Normalizes and validates a domain name.
 ///
 /// This function:
 /// - Removes http:// and https:// prefixes
@@ -56,7 +56,7 @@ pub fn normalize_domain(domain: &str) -> Result<String> {
     Ok(domain.to_string())
 }
 
-/// Check if an IP address is in a private or reserved range
+/// Checks if an IP address is in a private or reserved range.
 ///
 /// This includes:
 /// - Private networks (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16)
@@ -73,7 +73,7 @@ pub fn is_private_or_reserved_ip(ip: &IpAddr) -> bool {
     }
 }
 
-/// Check if an IPv4 address is private or reserved
+/// Checks if an IPv4 address is private or reserved.
 fn is_private_or_reserved_ipv4(ip: &Ipv4Addr) -> bool {
     // Standard private/loopback/link-local checks
     if ip.is_private() || ip.is_loopback() || ip.is_link_local() {
@@ -130,7 +130,7 @@ fn is_private_or_reserved_ipv4(ip: &Ipv4Addr) -> bool {
     false
 }
 
-/// Check if an IPv6 address is private or reserved
+/// Checks if an IPv6 address is private or reserved.
 fn is_private_or_reserved_ipv6(ip: &Ipv6Addr) -> bool {
     // Loopback (::1)
     if ip.is_loopback() {
@@ -168,7 +168,7 @@ fn is_private_or_reserved_ipv6(ip: &Ipv6Addr) -> bool {
     false
 }
 
-/// Validate that a domain is safe to query (SSRF protection)
+/// Validates that a domain is safe to query (SSRF protection).
 ///
 /// This function:
 /// 1. Normalizes the domain
@@ -184,14 +184,14 @@ pub async fn validate_domain_safe(domain: &str) -> Result<String> {
     let addr = format!("{}:443", normalized);
     let socket_addrs = tokio::net::lookup_host(&addr)
         .await
-        .map_err(|e| SeerError::InvalidDomain(format!("Failed to resolve domain: {}", e)))?;
+        .map_err(|e| SeerError::InvalidDomain(format!("failed to resolve domain: {}", e)))?;
 
     // Check all resolved IPs
     for socket_addr in socket_addrs {
         let ip = socket_addr.ip();
         if is_private_or_reserved_ip(&ip) {
             return Err(SeerError::InvalidDomain(format!(
-                "Domain '{}' resolves to private or reserved IP: {}. This is blocked for security reasons.",
+                "domain '{}' resolves to private or reserved IP: {} (blocked for security)",
                 normalized, ip
             )));
         }

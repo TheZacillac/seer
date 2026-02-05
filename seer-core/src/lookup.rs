@@ -8,8 +8,8 @@ use crate::error::{Result, SeerError};
 use crate::rdap::{RdapClient, RdapResponse};
 use crate::whois::{WhoisClient, WhoisResponse, get_registry_url, get_tld};
 
-/// Progress callback for smart lookup operations
-/// Called with a message describing the current phase of the lookup
+/// Progress callback for smart lookup operations.
+/// Called with a message describing the current phase of the lookup.
 pub type LookupProgressCallback = Arc<dyn Fn(&str) + Send + Sync>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -27,6 +27,7 @@ pub enum LookupResult {
 }
 
 impl LookupResult {
+    /// Returns the domain name from the lookup result.
     pub fn domain_name(&self) -> Option<String> {
         match self {
             LookupResult::Rdap { data, .. } => data.domain_name().map(String::from),
@@ -34,6 +35,7 @@ impl LookupResult {
         }
     }
 
+    /// Returns the registrar name, preferring RDAP data with WHOIS fallback.
     pub fn registrar(&self) -> Option<String> {
         match self {
             LookupResult::Rdap { data, whois_fallback } => {
@@ -45,6 +47,7 @@ impl LookupResult {
         }
     }
 
+    /// Returns the registrant organization, preferring RDAP data with WHOIS fallback.
     pub fn organization(&self) -> Option<String> {
         match self {
             LookupResult::Rdap { data, whois_fallback } => {
@@ -56,15 +59,17 @@ impl LookupResult {
         }
     }
 
+    /// Returns true if the result came from RDAP.
     pub fn is_rdap(&self) -> bool {
         matches!(self, LookupResult::Rdap { .. })
     }
 
+    /// Returns true if the result came from WHOIS.
     pub fn is_whois(&self) -> bool {
         matches!(self, LookupResult::Whois { .. })
     }
 
-    /// Get expiration date and registrar info from the lookup result
+    /// Returns the expiration date and registrar info from the lookup result.
     pub fn expiration_info(&self) -> (Option<DateTime<Utc>>, Option<String>) {
         match self {
             LookupResult::Rdap { data, whois_fallback } => {
@@ -107,6 +112,7 @@ impl Default for SmartLookup {
 }
 
 impl SmartLookup {
+    /// Creates a new SmartLookup with default settings (RDAP-first with WHOIS fallback).
     pub fn new() -> Self {
         Self {
             rdap_client: RdapClient::new(),
@@ -116,24 +122,25 @@ impl SmartLookup {
         }
     }
 
-    /// Always try RDAP first, fall back to WHOIS on failure
+    /// Sets whether to try RDAP first, falling back to WHOIS on failure.
     pub fn prefer_rdap(mut self, prefer: bool) -> Self {
         self.prefer_rdap = prefer;
         self
     }
 
-    /// Include WHOIS data as fallback even when RDAP succeeds (for additional fields)
+    /// Includes WHOIS data as fallback even when RDAP succeeds (for additional fields).
     pub fn include_fallback(mut self, include: bool) -> Self {
         self.include_fallback = include;
         self
     }
 
+    /// Performs a smart lookup for a domain, trying RDAP first with WHOIS fallback.
     pub async fn lookup(&self, domain: &str) -> Result<LookupResult> {
         self.lookup_with_progress(domain, None).await
     }
 
-    /// Perform lookup with an optional progress callback
-    /// The callback is called with messages describing the current phase
+    /// Performs a lookup with an optional progress callback.
+    /// The callback is called with messages describing the current phase.
     pub async fn lookup_with_progress(
         &self,
         domain: &str,

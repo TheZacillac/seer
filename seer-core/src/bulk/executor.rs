@@ -158,14 +158,14 @@ impl BulkExecutor {
 
                     if let Some(progress) = progress {
                         let desc = match &op {
-                            BulkOperation::Whois { domain } => domain.clone(),
-                            BulkOperation::Rdap { domain } => domain.clone(),
-                            BulkOperation::Dns { domain, .. } => domain.clone(),
-                            BulkOperation::Propagation { domain, .. } => domain.clone(),
-                            BulkOperation::Lookup { domain } => domain.clone(),
-                            BulkOperation::Status { domain } => domain.clone(),
+                            BulkOperation::Whois { domain }
+                            | BulkOperation::Rdap { domain }
+                            | BulkOperation::Dns { domain, .. }
+                            | BulkOperation::Propagation { domain, .. }
+                            | BulkOperation::Lookup { domain }
+                            | BulkOperation::Status { domain } => domain.as_str(),
                         };
-                        progress(count, total, &desc);
+                        progress(count, total, desc);
                     }
 
                     match result {

@@ -1,15 +1,16 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use once_cell::sync::Lazy;
 use reqwest::Client;
 use serde::Deserialize;
-use tokio::sync::OnceCell;
-use tracing::{debug, instrument};
+use tokio::sync::RwLock;
+use tracing::{debug, instrument, warn};
 
 use super::types::RdapResponse;
 use crate::error::{Result, SeerError};
+use crate::retry::{RetryExecutor, RetryPolicy};
 use crate::validation::normalize_domain;
 
 const IANA_BOOTSTRAP_DNS: &str = "https://data.iana.org/rdap/dns.json";
@@ -17,7 +18,13 @@ const IANA_BOOTSTRAP_IPV4: &str = "https://data.iana.org/rdap/ipv4.json";
 const IANA_BOOTSTRAP_IPV6: &str = "https://data.iana.org/rdap/ipv6.json";
 const IANA_BOOTSTRAP_ASN: &str = "https://data.iana.org/rdap/asn.json";
 
+/// Default timeout for RDAP queries (30 seconds).
+/// RDAP servers can be slow, especially during bootstrap loading which fetches
+/// from 4 IANA registries. Some regional registries also have high latency.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// TTL for bootstrap data (24 hours)
+const BOOTSTRAP_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Thread-safe HTTP client for bootstrap loading
 static BOOTSTRAP_HTTP_CLIENT: Lazy<Client> = Lazy::new(|| {
@@ -28,8 +35,32 @@ static BOOTSTRAP_HTTP_CLIENT: Lazy<Client> = Lazy::new(|| {
         .expect("Failed to build bootstrap HTTP client - invalid configuration")
 });
 
-/// Bootstrap cache using OnceCell for race-free one-time initialization
-static BOOTSTRAP_CACHE: OnceCell<BootstrapData> = OnceCell::const_new();
+/// Bootstrap cache with TTL support
+static BOOTSTRAP_CACHE: Lazy<RwLock<Option<CachedBootstrap>>> =
+    Lazy::new(|| RwLock::new(None));
+
+/// Cached bootstrap data with timestamp for TTL tracking
+struct CachedBootstrap {
+    data: BootstrapData,
+    loaded_at: Instant,
+}
+
+impl CachedBootstrap {
+    fn new(data: BootstrapData) -> Self {
+        Self {
+            data,
+            loaded_at: Instant::now(),
+        }
+    }
+
+    fn is_expired(&self) -> bool {
+        self.loaded_at.elapsed() > BOOTSTRAP_TTL
+    }
+
+    fn age(&self) -> Duration {
+        self.loaded_at.elapsed()
+    }
+}
 
 /// Parsed IANA bootstrap data
 struct BootstrapData {
@@ -59,6 +90,7 @@ struct BootstrapResponse {
 pub struct RdapClient {
     http: Client,
     timeout: Duration,
+    retry_policy: RetryPolicy,
 }
 
 impl Default for RdapClient {
@@ -68,6 +100,7 @@ impl Default for RdapClient {
 }
 
 impl RdapClient {
+    /// Creates a new RDAP client with default settings.
     pub fn new() -> Self {
         let http = Client::builder()
             .timeout(DEFAULT_TIMEOUT)
@@ -78,20 +111,85 @@ impl RdapClient {
         Self {
             http,
             timeout: DEFAULT_TIMEOUT,
+            retry_policy: RetryPolicy::default(),
         }
     }
 
+    /// Sets the timeout for RDAP queries.
+    ///
+    /// The default is 30 seconds to accommodate slow RDAP servers and
+    /// bootstrap loading from IANA registries.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
     }
 
-    /// Ensures bootstrap data is loaded, using OnceCell for race-free initialization.
-    /// Multiple concurrent callers will wait for the first caller to complete loading.
-    async fn ensure_bootstrap(&self) -> Result<&'static BootstrapData> {
-        BOOTSTRAP_CACHE
-            .get_or_try_init(load_bootstrap_data)
-            .await
+    /// Sets the retry policy for transient network failures.
+    ///
+    /// The default policy retries up to 3 times with exponential backoff.
+    pub fn with_retry_policy(mut self, policy: RetryPolicy) -> Self {
+        self.retry_policy = policy;
+        self
+    }
+
+    /// Disables retries (single attempt only).
+    pub fn without_retries(mut self) -> Self {
+        self.retry_policy = RetryPolicy::no_retry();
+        self
+    }
+
+    /// Ensures bootstrap data is loaded and not expired.
+    /// Uses stale-while-revalidate: if refresh fails, stale data is used.
+    async fn ensure_bootstrap(&self) -> Result<()> {
+        // Check if we have valid (non-expired) data
+        {
+            let cache = BOOTSTRAP_CACHE.read().await;
+            if let Some(cached) = cache.as_ref() {
+                if !cached.is_expired() {
+                    return Ok(());
+                }
+            }
+        }
+
+        // Need to load or refresh - acquire write lock
+        let mut cache = BOOTSTRAP_CACHE.write().await;
+
+        // Double-check after acquiring write lock (another task may have loaded)
+        if let Some(cached) = cache.as_ref() {
+            if !cached.is_expired() {
+                return Ok(());
+            }
+        }
+
+        // Try to load fresh data
+        debug!("Loading/refreshing RDAP bootstrap data");
+        match load_bootstrap_data_with_retry(&self.retry_policy).await {
+            Ok(data) => {
+                debug!(
+                    dns_entries = data.dns.len(),
+                    ipv4_entries = data.ipv4.len(),
+                    ipv6_entries = data.ipv6.len(),
+                    asn_entries = data.asn.len(),
+                    "RDAP bootstrap loaded/refreshed"
+                );
+                *cache = Some(CachedBootstrap::new(data));
+                Ok(())
+            }
+            Err(e) => {
+                // Stale-while-revalidate: use stale data if refresh fails
+                if let Some(cached) = cache.as_ref() {
+                    warn!(
+                        error = %e,
+                        age_hours = cached.age().as_secs() / 3600,
+                        "Bootstrap refresh failed, using stale data"
+                    );
+                    Ok(())
+                } else {
+                    // No stale data available
+                    Err(e)
+                }
+            }
+        }
     }
 
     /// Looks up the RDAP server URL for a domain's TLD from bootstrap data.
@@ -135,98 +233,126 @@ impl RdapClient {
         None
     }
 
+    /// Looks up RDAP registration data for a domain.
+    ///
+    /// Uses IANA bootstrap data to find the appropriate RDAP server for the TLD.
     #[instrument(skip(self), fields(domain = %domain))]
     pub async fn lookup_domain(&self, domain: &str) -> Result<RdapResponse> {
-        let cache = self.ensure_bootstrap().await?;
+        self.ensure_bootstrap().await?;
 
         let domain = normalize_domain(domain)?;
-        let base_url = Self::get_rdap_url_for_domain(cache, &domain)
-            .ok_or_else(|| SeerError::RdapBootstrapError(format!("No RDAP server for {}", domain)))?;
 
-        let url = format!("{}domain/{}", ensure_trailing_slash(&base_url), domain);
+        // Extract URL while holding the lock, then release before HTTP request
+        let url = {
+            let cache_guard = BOOTSTRAP_CACHE.read().await;
+            let cache = cache_guard
+                .as_ref()
+                .ok_or_else(|| SeerError::RdapBootstrapError("bootstrap data not loaded".to_string()))?;
+
+            let base_url = Self::get_rdap_url_for_domain(&cache.data, &domain)
+                .ok_or_else(|| SeerError::RdapBootstrapError(format!("no RDAP server for {}", domain)))?;
+
+            format!("{}domain/{}", ensure_trailing_slash(&base_url), domain)
+        }; // Lock released here
+
         debug!(url = %url, "Querying RDAP");
-
-        let response = self
-            .http
-            .get(&url)
-            .header("Accept", "application/rdap+json")
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            return Err(SeerError::RdapError(format!(
-                "RDAP query failed with status {}",
-                response.status()
-            )));
-        }
-
-        let rdap: RdapResponse = response.json().await?;
-        Ok(rdap)
+        self.query_rdap_with_retry(&url).await
     }
 
+    /// Looks up RDAP registration data for an IP address.
+    ///
+    /// Uses IANA bootstrap data to find the appropriate RIR (Regional Internet Registry).
     #[instrument(skip(self), fields(ip = %ip))]
     pub async fn lookup_ip(&self, ip: &str) -> Result<RdapResponse> {
-        let cache = self.ensure_bootstrap().await?;
+        self.ensure_bootstrap().await?;
 
         let ip_addr: IpAddr = ip
             .parse()
             .map_err(|_| SeerError::InvalidIpAddress(ip.to_string()))?;
 
-        let base_url = Self::get_rdap_url_for_ip(cache, &ip_addr)
-            .ok_or_else(|| SeerError::RdapBootstrapError(format!("No RDAP server for {}", ip)))?;
+        // Extract URL while holding the lock, then release before HTTP request
+        let url = {
+            let cache_guard = BOOTSTRAP_CACHE.read().await;
+            let cache = cache_guard
+                .as_ref()
+                .ok_or_else(|| SeerError::RdapBootstrapError("bootstrap data not loaded".to_string()))?;
 
-        let url = format!("{}ip/{}", ensure_trailing_slash(&base_url), ip);
+            let base_url = Self::get_rdap_url_for_ip(&cache.data, &ip_addr)
+                .ok_or_else(|| SeerError::RdapBootstrapError(format!("no RDAP server for {}", ip)))?;
+
+            format!("{}ip/{}", ensure_trailing_slash(&base_url), ip)
+        }; // Lock released here
+
         debug!(url = %url, "Querying RDAP");
-
-        let response = self
-            .http
-            .get(&url)
-            .header("Accept", "application/rdap+json")
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            return Err(SeerError::RdapError(format!(
-                "RDAP query failed with status {}",
-                response.status()
-            )));
-        }
-
-        let rdap: RdapResponse = response.json().await?;
-        Ok(rdap)
+        self.query_rdap_with_retry(&url).await
     }
 
+    /// Looks up RDAP registration data for an Autonomous System Number (ASN).
+    ///
+    /// Uses IANA bootstrap data to find the appropriate RIR for the ASN range.
     #[instrument(skip(self), fields(asn = %asn))]
     pub async fn lookup_asn(&self, asn: u32) -> Result<RdapResponse> {
-        let cache = self.ensure_bootstrap().await?;
+        self.ensure_bootstrap().await?;
 
-        let base_url = Self::get_rdap_url_for_asn(cache, asn)
-            .ok_or_else(|| SeerError::RdapBootstrapError(format!("No RDAP server for AS{}", asn)))?;
+        // Extract URL while holding the lock, then release before HTTP request
+        let url = {
+            let cache_guard = BOOTSTRAP_CACHE.read().await;
+            let cache = cache_guard
+                .as_ref()
+                .ok_or_else(|| SeerError::RdapBootstrapError("bootstrap data not loaded".to_string()))?;
 
-        let url = format!("{}autnum/{}", ensure_trailing_slash(&base_url), asn);
+            let base_url = Self::get_rdap_url_for_asn(&cache.data, asn)
+                .ok_or_else(|| SeerError::RdapBootstrapError(format!("no RDAP server for AS{}", asn)))?;
+
+            format!("{}autnum/{}", ensure_trailing_slash(&base_url), asn)
+        }; // Lock released here
+
         debug!(url = %url, "Querying RDAP");
+        self.query_rdap_with_retry(&url).await
+    }
 
-        let response = self
-            .http
-            .get(&url)
-            .header("Accept", "application/rdap+json")
-            .send()
-            .await?;
+    /// Queries an RDAP endpoint with retry logic.
+    async fn query_rdap_with_retry(&self, url: &str) -> Result<RdapResponse> {
+        let executor = RetryExecutor::new(self.retry_policy.clone());
+        let http = self.http.clone();
+        let url = url.to_string();
 
-        if !response.status().is_success() {
-            return Err(SeerError::RdapError(format!(
-                "RDAP query failed with status {}",
-                response.status()
-            )));
-        }
-
-        let rdap: RdapResponse = response.json().await?;
-        Ok(rdap)
+        executor
+            .execute(|| {
+                let http = http.clone();
+                let url = url.clone();
+                async move { query_rdap_internal(&http, &url).await }
+            })
+            .await
     }
 }
 
+/// Internal function to query an RDAP endpoint (used by retry executor).
+async fn query_rdap_internal(http: &Client, url: &str) -> Result<RdapResponse> {
+    let response = http
+        .get(url)
+        .header("Accept", "application/rdap+json")
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        return Err(SeerError::RdapError(format!(
+            "query failed with status {}",
+            response.status()
+        )));
+    }
+
+    let rdap: RdapResponse = response.json().await?;
+    Ok(rdap)
+}
+
+/// Loads IANA RDAP bootstrap data from all registries with retry.
+async fn load_bootstrap_data_with_retry(policy: &RetryPolicy) -> Result<BootstrapData> {
+    let executor = RetryExecutor::new(policy.clone());
+    executor.execute(load_bootstrap_data).await
+}
+
 /// Loads IANA RDAP bootstrap data from all registries.
-/// This function is called only once via OnceCell, eliminating race conditions.
 async fn load_bootstrap_data() -> Result<BootstrapData> {
     debug!("Loading RDAP bootstrap data from IANA");
 
@@ -255,9 +381,10 @@ async fn load_bootstrap_data() -> Result<BootstrapData> {
         if service.len() >= 2 {
             if let (Some(tlds), Some(urls)) = (service[0].as_array(), service[1].as_array()) {
                 if let Some(url) = urls.first().and_then(|u| u.as_str()) {
+                    let url_string = url.to_string();
                     for tld in tlds {
                         if let Some(tld_str) = tld.as_str() {
-                            dns.insert(tld_str.to_lowercase(), url.to_string());
+                            dns.insert(tld_str.to_lowercase(), url_string.clone());
                         }
                     }
                 }
@@ -270,13 +397,14 @@ async fn load_bootstrap_data() -> Result<BootstrapData> {
         if service.len() >= 2 {
             if let (Some(prefixes), Some(urls)) = (service[0].as_array(), service[1].as_array()) {
                 if let Some(url) = urls.first().and_then(|u| u.as_str()) {
+                    let url_string = url.to_string();
                     for prefix in prefixes {
                         if let Some(prefix_str) = prefix.as_str() {
                             ipv4.push((
                                 IpRange {
                                     prefix: prefix_str.to_string(),
                                 },
-                                url.to_string(),
+                                url_string.clone(),
                             ));
                         }
                     }
@@ -290,13 +418,14 @@ async fn load_bootstrap_data() -> Result<BootstrapData> {
         if service.len() >= 2 {
             if let (Some(prefixes), Some(urls)) = (service[0].as_array(), service[1].as_array()) {
                 if let Some(url) = urls.first().and_then(|u| u.as_str()) {
+                    let url_string = url.to_string();
                     for prefix in prefixes {
                         if let Some(prefix_str) = prefix.as_str() {
                             ipv6.push((
                                 IpRange {
                                     prefix: prefix_str.to_string(),
                                 },
-                                url.to_string(),
+                                url_string.clone(),
                             ));
                         }
                     }
@@ -310,10 +439,11 @@ async fn load_bootstrap_data() -> Result<BootstrapData> {
         if service.len() >= 2 {
             if let (Some(ranges), Some(urls)) = (service[0].as_array(), service[1].as_array()) {
                 if let Some(url) = urls.first().and_then(|u| u.as_str()) {
+                    let url_string = url.to_string();
                     for range in ranges {
                         if let Some(range_str) = range.as_str() {
                             if let Some((start, end)) = parse_asn_range(range_str) {
-                                asn.push((AsnRange { start, end }, url.to_string()));
+                                asn.push((AsnRange { start, end }, url_string.clone()));
                             }
                         }
                     }
@@ -322,14 +452,6 @@ async fn load_bootstrap_data() -> Result<BootstrapData> {
         }
     }
 
-    debug!(
-        dns_entries = dns.len(),
-        ipv4_entries = ipv4.len(),
-        ipv6_entries = ipv6.len(),
-        asn_entries = asn.len(),
-        "RDAP bootstrap loaded"
-    );
-
     Ok(BootstrapData {
         dns,
         ipv4,
@@ -337,8 +459,6 @@ async fn load_bootstrap_data() -> Result<BootstrapData> {
         asn,
     })
 }
-
-// Domain normalization is now handled by the shared validation module
 
 fn ensure_trailing_slash(url: &str) -> String {
     if url.ends_with('/') {
@@ -360,12 +480,12 @@ fn parse_asn_range(range: &str) -> Option<(u32, u32)> {
 }
 
 fn ip_matches_prefix(prefix: &str, octets: &[u8; 4]) -> bool {
-    let parts: Vec<&str> = prefix.split('/').collect();
-    if parts.is_empty() {
-        return false;
-    }
+    let (addr_part, mask_part) = match prefix.split_once('/') {
+        Some((a, m)) => (a, Some(m)),
+        None => (prefix, None),
+    };
 
-    let prefix_octets: Vec<u8> = parts[0]
+    let prefix_octets: Vec<u8> = addr_part
         .split('.')
         .filter_map(|s| s.parse().ok())
         .collect();
@@ -375,8 +495,7 @@ fn ip_matches_prefix(prefix: &str, octets: &[u8; 4]) -> bool {
     }
 
     // Validate and clamp mask_bits to valid IPv4 range (0-32)
-    let mask_bits: usize = parts
-        .get(1)
+    let mask_bits: usize = mask_part
         .and_then(|s| s.parse().ok())
         .unwrap_or(8)
         .min(32);
@@ -392,18 +511,16 @@ fn ip_matches_prefix(prefix: &str, octets: &[u8; 4]) -> bool {
 }
 
 fn ipv6_matches_prefix(prefix: &str, segments: &[u16; 8]) -> bool {
-    let parts: Vec<&str> = prefix.split('/').collect();
-    if parts.is_empty() {
-        return false;
-    }
+    let (addr_part, mask_part) = match prefix.split_once('/') {
+        Some((a, m)) => (a, Some(m)),
+        None => (prefix, None),
+    };
 
     // Parse IPv6 prefix (simplified)
-    let prefix_str = parts[0];
-    if let Ok(addr) = prefix_str.parse::<std::net::Ipv6Addr>() {
+    if let Ok(addr) = addr_part.parse::<std::net::Ipv6Addr>() {
         let prefix_segments = addr.segments();
         // Validate and clamp mask_bits to valid IPv6 range (0-128)
-        let mask_bits: usize = parts
-            .get(1)
+        let mask_bits: usize = mask_part
             .and_then(|s| s.parse().ok())
             .unwrap_or(48)
             .min(128);
@@ -419,4 +536,41 @@ fn ipv6_matches_prefix(prefix: &str, segments: &[u16; 8]) -> bool {
     }
 
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_client_has_retry_policy() {
+        let client = RdapClient::new();
+        assert_eq!(client.retry_policy.max_attempts, 3);
+    }
+
+    #[test]
+    fn test_client_without_retries() {
+        let client = RdapClient::new().without_retries();
+        assert_eq!(client.retry_policy.max_attempts, 1);
+    }
+
+    #[test]
+    fn test_client_custom_retry_policy() {
+        let policy = RetryPolicy::new().with_max_attempts(5);
+        let client = RdapClient::new().with_retry_policy(policy);
+        assert_eq!(client.retry_policy.max_attempts, 5);
+    }
+
+    #[test]
+    fn test_cached_bootstrap_expiration() {
+        let data = BootstrapData {
+            dns: HashMap::new(),
+            ipv4: Vec::new(),
+            ipv6: Vec::new(),
+            asn: Vec::new(),
+        };
+        let cached = CachedBootstrap::new(data);
+        // Fresh cache should not be expired
+        assert!(!cached.is_expired());
+    }
 }

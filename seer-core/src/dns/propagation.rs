@@ -233,60 +233,55 @@ fn analyze_results(
         return (0.0, vec![], vec!["No servers responded".to_string()]);
     }
 
-    // Count occurrences of each value set
-    let mut value_counts: HashMap<Vec<String>, usize> = HashMap::new();
+    // Build sorted value sets once per server result
+    let sorted_value_sets: Vec<Vec<String>> = successful
+        .iter()
+        .map(|result| {
+            let mut values: Vec<String> = result
+                .records
+                .iter()
+                .map(|r| r.format_short())
+                .collect();
+            values.sort();
+            values
+        })
+        .collect();
 
-    for result in &successful {
-        let mut values: Vec<String> = result
-            .records
-            .iter()
-            .map(|r| r.format_short())
-            .collect();
-        values.sort();
+    // Count occurrences of each value set
+    let mut value_counts: HashMap<&Vec<String>, usize> = HashMap::new();
+    for values in &sorted_value_sets {
         *value_counts.entry(values).or_insert(0) += 1;
     }
 
     // Find the most common value set (consensus)
     let (consensus_values, consensus_count) = value_counts
-        .iter()
+        .into_iter()
         .max_by_key(|(_, count)| *count)
-        .map(|(values, count)| (values.clone(), *count))
-        .unwrap_or((vec![], 0));
+        .unwrap();
 
     // Calculate propagation percentage based on consensus
-    let propagation_percentage = if successful.is_empty() {
-        0.0
+    let propagation_percentage =
+        (consensus_count as f64 / successful.len() as f64) * 100.0;
+
+    // Find inconsistencies (reuse pre-computed sorted value sets)
+    let consensus_str = if consensus_values.is_empty() {
+        "NXDOMAIN".to_string()
     } else {
-        (consensus_count as f64 / successful.len() as f64) * 100.0
+        consensus_values.join(", ")
     };
 
-    // Find inconsistencies
     let mut inconsistencies = Vec::new();
-    for result in &successful {
-        let mut values: Vec<String> = result
-            .records
-            .iter()
-            .map(|r| r.format_short())
-            .collect();
-        values.sort();
-
+    for (result, values) in successful.iter().zip(sorted_value_sets.iter()) {
         if values != consensus_values {
-            let inconsistency = format!(
+            let server_values = if values.is_empty() {
+                "NXDOMAIN".to_string()
+            } else {
+                values.join(", ")
+            };
+            inconsistencies.push(format!(
                 "{} ({}): {} vs consensus: {}",
-                result.server.name,
-                result.server.ip,
-                if values.is_empty() {
-                    "NXDOMAIN".to_string()
-                } else {
-                    values.join(", ")
-                },
-                if consensus_values.is_empty() {
-                    "NXDOMAIN".to_string()
-                } else {
-                    consensus_values.join(", ")
-                }
-            );
-            inconsistencies.push(inconsistency);
+                result.server.name, result.server.ip, server_values, consensus_str
+            ));
         }
     }
 
@@ -304,5 +299,5 @@ fn analyze_results(
         // No records is a valid state for optional record types
     }
 
-    (propagation_percentage, consensus_values, inconsistencies)
+    (propagation_percentage, consensus_values.clone(), inconsistencies)
 }

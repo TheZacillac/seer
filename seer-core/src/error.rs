@@ -65,6 +65,9 @@ pub enum SeerError {
 
     #[error("{0}")]
     Other(String),
+
+    #[error("Operation failed after {attempts} attempts: {last_error}")]
+    RetryExhausted { attempts: usize, last_error: String },
 }
 
 impl SeerError {
@@ -91,6 +94,9 @@ impl SeerError {
             SeerError::BulkOperationError { .. } => "Bulk operation partially failed".to_string(),
             SeerError::LookupFailed { domain, .. } => format!("Lookup failed for {}", domain),
             SeerError::Other(_) => "Operation failed".to_string(),
+            SeerError::RetryExhausted { attempts, .. } => {
+                format!("Operation failed after {} attempts", attempts)
+            }
         }
     }
 }
