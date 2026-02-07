@@ -1,5 +1,7 @@
-use pyo3::prelude::*;
+use std::sync::OnceLock;
+
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
+use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use seer_core::{
     bulk::{BulkExecutor, BulkOperation},
@@ -11,7 +13,6 @@ use seer_core::{
 };
 
 fn get_runtime() -> &'static tokio::runtime::Runtime {
-    use std::sync::OnceLock;
     static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
     RUNTIME.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
@@ -21,10 +22,40 @@ fn get_runtime() -> &'static tokio::runtime::Runtime {
     })
 }
 
+fn get_smart_lookup() -> &'static SmartLookup {
+    static INSTANCE: OnceLock<SmartLookup> = OnceLock::new();
+    INSTANCE.get_or_init(SmartLookup::new)
+}
+
+fn get_whois_client() -> &'static WhoisClient {
+    static INSTANCE: OnceLock<WhoisClient> = OnceLock::new();
+    INSTANCE.get_or_init(WhoisClient::new)
+}
+
+fn get_rdap_client() -> &'static RdapClient {
+    static INSTANCE: OnceLock<RdapClient> = OnceLock::new();
+    INSTANCE.get_or_init(RdapClient::new)
+}
+
+fn get_dns_resolver() -> &'static DnsResolver {
+    static INSTANCE: OnceLock<DnsResolver> = OnceLock::new();
+    INSTANCE.get_or_init(DnsResolver::new)
+}
+
+fn get_propagation_checker() -> &'static PropagationChecker {
+    static INSTANCE: OnceLock<PropagationChecker> = OnceLock::new();
+    INSTANCE.get_or_init(PropagationChecker::new)
+}
+
+fn get_status_client() -> &'static StatusClient {
+    static INSTANCE: OnceLock<StatusClient> = OnceLock::new();
+    INSTANCE.get_or_init(StatusClient::new)
+}
+
 #[pyfunction]
 fn lookup(py: Python<'_>, domain: String) -> PyResult<PyObject> {
     let rt = get_runtime();
-    let smart_lookup = SmartLookup::new();
+    let smart_lookup = get_smart_lookup();
 
     let result = rt.block_on(async { smart_lookup.lookup(&domain).await });
 
@@ -41,7 +72,7 @@ fn lookup(py: Python<'_>, domain: String) -> PyResult<PyObject> {
 #[pyfunction]
 fn whois(py: Python<'_>, domain: String) -> PyResult<PyObject> {
     let rt = get_runtime();
-    let client = WhoisClient::new();
+    let client = get_whois_client();
 
     let result = rt.block_on(async { client.lookup(&domain).await });
 
@@ -58,7 +89,7 @@ fn whois(py: Python<'_>, domain: String) -> PyResult<PyObject> {
 #[pyfunction]
 fn rdap_domain(py: Python<'_>, domain: String) -> PyResult<PyObject> {
     let rt = get_runtime();
-    let client = RdapClient::new();
+    let client = get_rdap_client();
 
     let result = rt.block_on(async { client.lookup_domain(&domain).await });
 
@@ -75,7 +106,7 @@ fn rdap_domain(py: Python<'_>, domain: String) -> PyResult<PyObject> {
 #[pyfunction]
 fn rdap_ip(py: Python<'_>, ip: String) -> PyResult<PyObject> {
     let rt = get_runtime();
-    let client = RdapClient::new();
+    let client = get_rdap_client();
 
     let result = rt.block_on(async { client.lookup_ip(&ip).await });
 
@@ -92,7 +123,7 @@ fn rdap_ip(py: Python<'_>, ip: String) -> PyResult<PyObject> {
 #[pyfunction]
 fn rdap_asn(py: Python<'_>, asn: u32) -> PyResult<PyObject> {
     let rt = get_runtime();
-    let client = RdapClient::new();
+    let client = get_rdap_client();
 
     let result = rt.block_on(async { client.lookup_asn(asn).await });
 
@@ -115,7 +146,7 @@ fn dig(
     nameserver: Option<String>,
 ) -> PyResult<PyObject> {
     let rt = get_runtime();
-    let resolver = DnsResolver::new();
+    let resolver = get_dns_resolver();
 
     let rt_parsed: RecordType = record_type
         .parse()
@@ -141,7 +172,7 @@ fn dig(
 #[pyo3(signature = (domain, record_type = "A"))]
 fn propagation(py: Python<'_>, domain: String, record_type: &str) -> PyResult<PyObject> {
     let rt = get_runtime();
-    let checker = PropagationChecker::new();
+    let checker = get_propagation_checker();
 
     let rt_parsed: RecordType = record_type
         .parse()
@@ -172,8 +203,7 @@ fn bulk_lookup(py: Python<'_>, domains: Vec<String>, concurrency: usize) -> PyRe
 
     let result = rt.block_on(async { executor.execute(operations, None).await });
 
-    let json =
-        serde_json::to_value(&result).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let json = serde_json::to_value(&result).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     json_to_python(py, &json)
 }
 
@@ -190,8 +220,7 @@ fn bulk_whois(py: Python<'_>, domains: Vec<String>, concurrency: usize) -> PyRes
 
     let result = rt.block_on(async { executor.execute(operations, None).await });
 
-    let json =
-        serde_json::to_value(&result).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let json = serde_json::to_value(&result).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     json_to_python(py, &json)
 }
 
@@ -220,8 +249,7 @@ fn bulk_dig(
 
     let result = rt.block_on(async { executor.execute(operations, None).await });
 
-    let json =
-        serde_json::to_value(&result).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let json = serde_json::to_value(&result).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     json_to_python(py, &json)
 }
 
@@ -250,15 +278,14 @@ fn bulk_propagation(
 
     let result = rt.block_on(async { executor.execute(operations, None).await });
 
-    let json =
-        serde_json::to_value(&result).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let json = serde_json::to_value(&result).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     json_to_python(py, &json)
 }
 
 #[pyfunction]
 fn status(py: Python<'_>, domain: String) -> PyResult<PyObject> {
     let rt = get_runtime();
-    let client = StatusClient::new();
+    let client = get_status_client();
 
     let result = rt.block_on(async { client.check(&domain).await });
 
@@ -285,8 +312,7 @@ fn bulk_status(py: Python<'_>, domains: Vec<String>, concurrency: usize) -> PyRe
 
     let result = rt.block_on(async { executor.execute(operations, None).await });
 
-    let json =
-        serde_json::to_value(&result).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let json = serde_json::to_value(&result).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     json_to_python(py, &json)
 }
 

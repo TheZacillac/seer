@@ -173,7 +173,7 @@ impl RegistryParser for DenicParser {
             tech_organization: None,
             tech_email: None,
             tech_phone: None,
-            creation_date: None, // DENIC doesn't expose creation date
+            creation_date: None,   // DENIC doesn't expose creation date
             expiration_date: None, // DENIC doesn't expose expiration date
             updated_date,
             nameservers,

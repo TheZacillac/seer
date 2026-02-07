@@ -49,7 +49,10 @@ Name Server: ns2.example.com
         let result = parser.parse("example.com", "whois.example.com", raw);
 
         assert_eq!(result.domain, "example.com");
-        assert_eq!(result.registrar, Some("Example Registrar, Inc.".to_string()));
+        assert_eq!(
+            result.registrar,
+            Some("Example Registrar, Inc.".to_string())
+        );
         assert_eq!(result.nameservers.len(), 2);
     }
 }

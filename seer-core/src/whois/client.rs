@@ -20,8 +20,7 @@ static REFERRAL_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
     vec![
         Regex::new(r"(?i)Registrar WHOIS Server:\s*(.+)")
             .expect("Invalid regex pattern for Registrar WHOIS Server"),
-        Regex::new(r"(?i)Whois Server:\s*(.+)")
-            .expect("Invalid regex pattern for Whois Server"),
+        Regex::new(r"(?i)Whois Server:\s*(.+)").expect("Invalid regex pattern for Whois Server"),
         Regex::new(r"(?i)ReferralServer:\s*whois://(.+)")
             .expect("Invalid regex pattern for ReferralServer"),
     ]
@@ -159,7 +158,9 @@ impl WhoisClient {
                         Ok(referral_response) => {
                             // If referral indicates domain not found or has less data,
                             // prefer the current response which has registry data
-                            if referral_response.is_available() || referral_response.indicates_not_found() {
+                            if referral_response.is_available()
+                                || referral_response.indicates_not_found()
+                            {
                                 debug!(
                                     referral = %referral,
                                     "Referral server indicates domain not found, using registry response"
@@ -233,7 +234,11 @@ impl WhoisClient {
 }
 
 /// Internal function to query a WHOIS server (used by retry executor).
-async fn query_server_internal(server: &str, query: &str, timeout_duration: Duration) -> Result<String> {
+async fn query_server_internal(
+    server: &str,
+    query: &str,
+    timeout_duration: Duration,
+) -> Result<String> {
     let addr = format!("{}:{}", server, WHOIS_PORT);
 
     let mut stream = timeout(timeout_duration, TcpStream::connect(&addr))

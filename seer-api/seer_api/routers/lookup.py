@@ -2,15 +2,14 @@
 
 from typing import List
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field
-from slowapi import Limiter
-from slowapi.util import get_remote_address
+from seer_api.errors import http_error
+from seer_api.limiting import limiter
 
 import seer
 
 router = APIRouter()
-limiter = Limiter(key_func=get_remote_address)
 
 # Bulk operation limits
 MAX_BULK_DOMAINS = 100
@@ -40,7 +39,7 @@ async def smart_lookup(request: Request, domain: str):
         result = seer.lookup(domain)
         return result
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise http_error(e, "Lookup failed")
 
 
 @router.post("/bulk")
@@ -59,4 +58,4 @@ async def bulk_smart_lookup(request: Request, body: BulkLookupRequest):
         results = seer.bulk_lookup(body.domains, body.concurrency)
         return results
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise http_error(e, "Bulk lookup failed")

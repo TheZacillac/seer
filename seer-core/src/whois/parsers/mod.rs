@@ -98,7 +98,11 @@ fn extract_tld(domain: &str) -> Option<String> {
 fn extract_second_level_tld(domain: &str) -> Option<String> {
     let parts: Vec<&str> = domain.rsplit('.').collect();
     if parts.len() >= 2 {
-        Some(format!("{}.{}", parts[1].to_lowercase(), parts[0].to_lowercase()))
+        Some(format!(
+            "{}.{}",
+            parts[1].to_lowercase(),
+            parts[0].to_lowercase()
+        ))
     } else {
         None
     }
@@ -131,21 +135,33 @@ mod tests {
     fn test_parser_registry_selects_denic_for_de() {
         let registry = ParserRegistry::new();
         // Just test that it doesn't panic
-        let result = registry.parse("example.de", "whois.denic.de", "Domain: example.de\nStatus: connect");
+        let result = registry.parse(
+            "example.de",
+            "whois.denic.de",
+            "Domain: example.de\nStatus: connect",
+        );
         assert_eq!(result.domain, "example.de");
     }
 
     #[test]
     fn test_parser_registry_selects_nominet_for_uk() {
         let registry = ParserRegistry::new();
-        let result = registry.parse("example.co.uk", "whois.nic.uk", "Domain name:\n    example.co.uk");
+        let result = registry.parse(
+            "example.co.uk",
+            "whois.nic.uk",
+            "Domain name:\n    example.co.uk",
+        );
         assert_eq!(result.domain, "example.co.uk");
     }
 
     #[test]
     fn test_parser_registry_uses_generic_for_unknown() {
         let registry = ParserRegistry::new();
-        let result = registry.parse("example.com", "whois.verisign-grs.com", "Domain Name: example.com");
+        let result = registry.parse(
+            "example.com",
+            "whois.verisign-grs.com",
+            "Domain Name: example.com",
+        );
         assert_eq!(result.domain, "example.com");
     }
 }

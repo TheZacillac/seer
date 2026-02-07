@@ -1,17 +1,13 @@
+use std::collections::HashSet;
 use std::time::Duration;
 
 use chrono::Utc;
 use native_tls::TlsConnector;
 use once_cell::sync::Lazy;
 use regex::Regex;
+use reqwest::{Client, Url};
 use tokio::net::TcpStream;
 use tracing::{debug, instrument};
-
-/// Pre-compiled regex for extracting HTML title.
-static TITLE_REGEX: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)<title[^>]*>([^<]+)</title>")
-        .expect("Invalid regex for HTML title extraction")
-});
 
 use super::types::{CertificateInfo, DnsResolution, DomainExpiration, StatusResponse};
 use crate::dns::{DnsResolver, RecordData, RecordType};
@@ -22,6 +18,23 @@ use crate::validation::{is_private_or_reserved_ip, normalize_domain};
 /// Default timeout for HTTP and TLS operations (10 seconds).
 /// Balances responsiveness with allowing slow servers to respond.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_REDIRECTS: usize = 5;
+
+/// Pre-compiled regex for extracting HTML title.
+static TITLE_REGEX: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)<title[^>]*>([^<]+)</title>").expect("Invalid regex for HTML title extraction")
+});
+
+/// Shared HTTP client for status checks. Reusing a single Client enables
+/// connection pooling and avoids per-request TLS handshake overhead.
+static STATUS_HTTP_CLIENT: Lazy<Client> = Lazy::new(|| {
+    Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent(concat!("Seer/", env!("CARGO_PKG_VERSION")))
+        .pool_max_idle_per_host(10)
+        .build()
+        .expect("Failed to build status HTTP client - invalid configuration")
+});
 
 /// Client for checking domain status (HTTP, SSL, expiration)
 #[derive(Debug, Clone)]
@@ -94,63 +107,68 @@ impl StatusClient {
 
     /// Fetches the HTTP status code and page title.
     async fn fetch_http_info(&self, domain: &str) -> Result<(u16, String, Option<String>)> {
-        // SSRF protection: resolve domain and check IPs before connecting
-        let addr = format!("{}:443", domain);
-        let socket_addrs: Vec<_> = tokio::net::lookup_host(&addr)
-            .await
-            .map_err(|e| SeerError::HttpError(format!("DNS lookup failed: {}", e)))?
-            .collect();
+        let mut url = Url::parse(&format!("https://{}", domain))
+            .map_err(|e| SeerError::HttpError(format!("invalid URL: {}", e)))?;
+        let mut visited = HashSet::new();
 
-        for socket_addr in &socket_addrs {
-            if is_private_or_reserved_ip(&socket_addr.ip()) {
-                return Err(SeerError::HttpError(format!(
-                    "domain resolves to private/reserved IP: {}",
-                    socket_addr.ip()
-                )));
+        for _ in 0..=MAX_REDIRECTS {
+            validate_url_target(&url).await?;
+
+            if !visited.insert(url.clone()) {
+                return Err(SeerError::HttpError("redirect loop detected".to_string()));
             }
-        }
 
-        let url = format!("https://{}", domain);
+            let response = STATUS_HTTP_CLIENT
+                .get(url.clone())
+                .timeout(self.timeout)
+                .send()
+                .await
+                .map_err(|e| SeerError::HttpError(e.to_string()))?;
 
-        let client = reqwest::Client::builder()
-            .timeout(self.timeout)
-            .redirect(reqwest::redirect::Policy::limited(5))
-            .build()
-            .map_err(|e| SeerError::HttpError(e.to_string()))?;
+            if response.status().is_redirection() {
+                let location = response.headers().get(reqwest::header::LOCATION);
+                let location = location
+                    .and_then(|v| v.to_str().ok())
+                    .ok_or_else(|| {
+                        SeerError::HttpError("redirect missing location header".to_string())
+                    })?;
+                let next_url = url
+                    .join(location)
+                    .or_else(|_| Url::parse(location))
+                    .map_err(|e| SeerError::HttpError(format!("invalid redirect URL: {}", e)))?;
+                url = next_url;
+                continue;
+            }
 
-        let response = client
-            .get(&url)
-            .header("User-Agent", concat!("Seer/", env!("CARGO_PKG_VERSION")))
-            .send()
-            .await
-            .map_err(|e| SeerError::HttpError(e.to_string()))?;
+            let status = response.status();
+            let status_code = status.as_u16();
+            let status_text = status.canonical_reason().unwrap_or("Unknown").to_string();
 
-        let status = response.status();
-        let status_code = status.as_u16();
-        let status_text = status.canonical_reason().unwrap_or("Unknown").to_string();
+            // Only try to get title for successful HTML responses
+            let title = if status.is_success() {
+                let content_type = response
+                    .headers()
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
 
-        // Only try to get title for successful HTML responses
-        let title = if status.is_success() {
-            let content_type = response
-                .headers()
-                .get("content-type")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("");
-
-            if content_type.contains("text/html") {
-                let body = response
-                    .text()
-                    .await
-                    .map_err(|e| SeerError::HttpError(e.to_string()))?;
-                extract_title(&body)
+                if content_type.contains("text/html") {
+                    let body = response
+                        .text()
+                        .await
+                        .map_err(|e| SeerError::HttpError(e.to_string()))?;
+                    extract_title(&body)
+                } else {
+                    None
+                }
             } else {
                 None
-            }
-        } else {
-            None
-        };
+            };
 
-        Ok((status_code, status_text, title))
+            return Ok((status_code, status_text, title));
+        }
+
+        Err(SeerError::HttpError("too many redirects".to_string()))
     }
 
     /// Fetches SSL certificate information using native-tls.
@@ -265,10 +283,8 @@ impl StatusClient {
             .collect();
 
         // Extract CNAME target (trim trailing dot)
-        let cname_target: Option<String> = cname_result
-            .unwrap_or_default()
-            .into_iter()
-            .find_map(|r| {
+        let cname_target: Option<String> =
+            cname_result.unwrap_or_default().into_iter().find_map(|r| {
                 if let RecordData::CNAME { target } = r.data {
                     Some(target.trim_end_matches('.').to_string())
                 } else {
@@ -313,6 +329,54 @@ fn extract_title(html: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+async fn validate_url_target(url: &Url) -> Result<()> {
+    let scheme = url.scheme();
+    if scheme != "https" && scheme != "http" {
+        return Err(SeerError::HttpError(format!(
+            "unsupported URL scheme: {}",
+            scheme
+        )));
+    }
+
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(SeerError::HttpError(
+            "URL credentials are not allowed".to_string(),
+        ));
+    }
+
+    let host = url
+        .host_str()
+        .ok_or_else(|| SeerError::HttpError("missing URL host".to_string()))?;
+    let port = url.port_or_known_default().unwrap_or(443);
+
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        if is_private_or_reserved_ip(&ip) {
+            return Err(SeerError::HttpError(format!(
+                "URL resolves to private/reserved IP: {}",
+                ip
+            )));
+        }
+        return Ok(());
+    }
+
+    let addr = format!("{}:{}", host, port);
+    let socket_addrs: Vec<_> = tokio::net::lookup_host(&addr)
+        .await
+        .map_err(|e| SeerError::HttpError(format!("DNS lookup failed: {}", e)))?
+        .collect();
+
+    for socket_addr in &socket_addrs {
+        if is_private_or_reserved_ip(&socket_addr.ip()) {
+            return Err(SeerError::HttpError(format!(
+                "URL resolves to private/reserved IP: {}",
+                socket_addr.ip()
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 /// Parses certificate information from DER-encoded certificate using x509-parser.
 fn parse_certificate_der(der: &[u8], _domain: &str) -> Result<CertificateInfo> {
     use x509_parser::prelude::*;
@@ -321,12 +385,12 @@ fn parse_certificate_der(der: &[u8], _domain: &str) -> Result<CertificateInfo> {
         .map_err(|e| SeerError::CertificateError(format!("failed to parse certificate: {}", e)))?;
 
     // Extract issuer - prefer CN, fall back to O (Organization)
-    let issuer = extract_name_from_x509(cert.issuer())
-        .unwrap_or_else(|| "Unknown Issuer".to_string());
+    let issuer =
+        extract_name_from_x509(cert.issuer()).unwrap_or_else(|| "Unknown Issuer".to_string());
 
     // Extract subject - prefer CN, fall back to O (Organization)
-    let subject = extract_name_from_x509(cert.subject())
-        .unwrap_or_else(|| "Unknown Subject".to_string());
+    let subject =
+        extract_name_from_x509(cert.subject()).unwrap_or_else(|| "Unknown Subject".to_string());
 
     // Extract validity dates
     let valid_from = asn1_time_to_chrono(cert.validity().not_before)?;

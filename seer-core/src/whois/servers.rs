@@ -1253,11 +1253,15 @@ pub fn get_registry_url(tld: &str) -> Option<String> {
 
     // Special cases for well-known registries
     match tld_lower.as_str() {
-        "com" | "net" | "cc" | "tv" => return Some("https://www.verisign.com/en_US/domain-names/index.xhtml".to_string()),
+        "com" | "net" | "cc" | "tv" => {
+            return Some("https://www.verisign.com/en_US/domain-names/index.xhtml".to_string())
+        }
         "org" => return Some("https://thenew.org/org-people/domain-management/whois/".to_string()),
         "edu" => return Some("https://www.educause.edu/whois".to_string()),
         "gov" => return Some("https://domains.dotgov.gov/".to_string()),
-        "app" | "dev" | "page" => return Some("https://www.registry.google/policies/whois/".to_string()),
+        "app" | "dev" | "page" => {
+            return Some("https://www.registry.google/policies/whois/".to_string())
+        }
         _ => {}
     }
 
@@ -1277,5 +1281,8 @@ pub fn get_registry_url(tld: &str) -> Option<String> {
     }
 
     // Fallback: suggest IANA's TLD info page
-    Some(format!("https://www.iana.org/domains/root/db/{}.html", tld_lower))
+    Some(format!(
+        "https://www.iana.org/domains/root/db/{}.html",
+        tld_lower
+    ))
 }

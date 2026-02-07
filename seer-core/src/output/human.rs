@@ -86,7 +86,11 @@ impl HumanFormatter {
 
     fn header(&self, text: &str) -> String {
         if self.use_colors {
-            format!("\n{}\n{}", text.lavender().bold(), "─".repeat(text.len()).subtext0())
+            format!(
+                "\n{}\n{}",
+                text.lavender().bold(),
+                "─".repeat(text.len()).subtext0()
+            )
         } else {
             format!("\n{}\n{}", text, "-".repeat(text.len()))
         }
@@ -137,16 +141,32 @@ impl OutputFormatter for HumanFormatter {
         if has_registrant_details {
             output.push(format!("\n  {}:", self.label("Registrant Contact")));
             if let Some(ref email) = response.registrant_email {
-                output.push(format!("    {}: {}", self.label("Email"), self.value(email)));
+                output.push(format!(
+                    "    {}: {}",
+                    self.label("Email"),
+                    self.value(email)
+                ));
             }
             if let Some(ref phone) = response.registrant_phone {
-                output.push(format!("    {}: {}", self.label("Phone"), self.value(phone)));
+                output.push(format!(
+                    "    {}: {}",
+                    self.label("Phone"),
+                    self.value(phone)
+                ));
             }
             if let Some(ref address) = response.registrant_address {
-                output.push(format!("    {}: {}", self.label("Address"), self.value(address)));
+                output.push(format!(
+                    "    {}: {}",
+                    self.label("Address"),
+                    self.value(address)
+                ));
             }
             if let Some(ref country) = response.registrant_country {
-                output.push(format!("    {}: {}", self.label("Country"), self.value(country)));
+                output.push(format!(
+                    "    {}: {}",
+                    self.label("Country"),
+                    self.value(country)
+                ));
             }
         }
 
@@ -162,13 +182,25 @@ impl OutputFormatter for HumanFormatter {
                 output.push(format!("    {}: {}", self.label("Name"), self.value(name)));
             }
             if let Some(ref org) = response.admin_organization {
-                output.push(format!("    {}: {}", self.label("Organization"), self.value(org)));
+                output.push(format!(
+                    "    {}: {}",
+                    self.label("Organization"),
+                    self.value(org)
+                ));
             }
             if let Some(ref email) = response.admin_email {
-                output.push(format!("    {}: {}", self.label("Email"), self.value(email)));
+                output.push(format!(
+                    "    {}: {}",
+                    self.label("Email"),
+                    self.value(email)
+                ));
             }
             if let Some(ref phone) = response.admin_phone {
-                output.push(format!("    {}: {}", self.label("Phone"), self.value(phone)));
+                output.push(format!(
+                    "    {}: {}",
+                    self.label("Phone"),
+                    self.value(phone)
+                ));
             }
         }
 
@@ -184,13 +216,25 @@ impl OutputFormatter for HumanFormatter {
                 output.push(format!("    {}: {}", self.label("Name"), self.value(name)));
             }
             if let Some(ref org) = response.tech_organization {
-                output.push(format!("    {}: {}", self.label("Organization"), self.value(org)));
+                output.push(format!(
+                    "    {}: {}",
+                    self.label("Organization"),
+                    self.value(org)
+                ));
             }
             if let Some(ref email) = response.tech_email {
-                output.push(format!("    {}: {}", self.label("Email"), self.value(email)));
+                output.push(format!(
+                    "    {}: {}",
+                    self.label("Email"),
+                    self.value(email)
+                ));
             }
             if let Some(ref phone) = response.tech_phone {
-                output.push(format!("    {}: {}", self.label("Phone"), self.value(phone)));
+                output.push(format!(
+                    "    {}: {}",
+                    self.label("Phone"),
+                    self.value(phone)
+                ));
             }
         }
 
@@ -300,16 +344,32 @@ impl OutputFormatter for HumanFormatter {
             if contact.has_info() {
                 output.push(format!("\n  {}:", self.label("Registrant Contact")));
                 if let Some(ref email) = contact.email {
-                    output.push(format!("    {}: {}", self.label("Email"), self.value(email)));
+                    output.push(format!(
+                        "    {}: {}",
+                        self.label("Email"),
+                        self.value(email)
+                    ));
                 }
                 if let Some(ref phone) = contact.phone {
-                    output.push(format!("    {}: {}", self.label("Phone"), self.value(phone)));
+                    output.push(format!(
+                        "    {}: {}",
+                        self.label("Phone"),
+                        self.value(phone)
+                    ));
                 }
                 if let Some(ref address) = contact.address {
-                    output.push(format!("    {}: {}", self.label("Address"), self.value(address)));
+                    output.push(format!(
+                        "    {}: {}",
+                        self.label("Address"),
+                        self.value(address)
+                    ));
                 }
                 if let Some(ref country) = contact.country {
-                    output.push(format!("    {}: {}", self.label("Country"), self.value(country)));
+                    output.push(format!(
+                        "    {}: {}",
+                        self.label("Country"),
+                        self.value(country)
+                    ));
                 }
             }
         }
@@ -322,19 +382,39 @@ impl OutputFormatter for HumanFormatter {
                     output.push(format!("    {}: {}", self.label("Name"), self.value(name)));
                 }
                 if let Some(ref org) = contact.organization {
-                    output.push(format!("    {}: {}", self.label("Organization"), self.value(org)));
+                    output.push(format!(
+                        "    {}: {}",
+                        self.label("Organization"),
+                        self.value(org)
+                    ));
                 }
                 if let Some(ref email) = contact.email {
-                    output.push(format!("    {}: {}", self.label("Email"), self.value(email)));
+                    output.push(format!(
+                        "    {}: {}",
+                        self.label("Email"),
+                        self.value(email)
+                    ));
                 }
                 if let Some(ref phone) = contact.phone {
-                    output.push(format!("    {}: {}", self.label("Phone"), self.value(phone)));
+                    output.push(format!(
+                        "    {}: {}",
+                        self.label("Phone"),
+                        self.value(phone)
+                    ));
                 }
                 if let Some(ref address) = contact.address {
-                    output.push(format!("    {}: {}", self.label("Address"), self.value(address)));
+                    output.push(format!(
+                        "    {}: {}",
+                        self.label("Address"),
+                        self.value(address)
+                    ));
                 }
                 if let Some(ref country) = contact.country {
-                    output.push(format!("    {}: {}", self.label("Country"), self.value(country)));
+                    output.push(format!(
+                        "    {}: {}",
+                        self.label("Country"),
+                        self.value(country)
+                    ));
                 }
             }
         }
@@ -347,19 +427,39 @@ impl OutputFormatter for HumanFormatter {
                     output.push(format!("    {}: {}", self.label("Name"), self.value(name)));
                 }
                 if let Some(ref org) = contact.organization {
-                    output.push(format!("    {}: {}", self.label("Organization"), self.value(org)));
+                    output.push(format!(
+                        "    {}: {}",
+                        self.label("Organization"),
+                        self.value(org)
+                    ));
                 }
                 if let Some(ref email) = contact.email {
-                    output.push(format!("    {}: {}", self.label("Email"), self.value(email)));
+                    output.push(format!(
+                        "    {}: {}",
+                        self.label("Email"),
+                        self.value(email)
+                    ));
                 }
                 if let Some(ref phone) = contact.phone {
-                    output.push(format!("    {}: {}", self.label("Phone"), self.value(phone)));
+                    output.push(format!(
+                        "    {}: {}",
+                        self.label("Phone"),
+                        self.value(phone)
+                    ));
                 }
                 if let Some(ref address) = contact.address {
-                    output.push(format!("    {}: {}", self.label("Address"), self.value(address)));
+                    output.push(format!(
+                        "    {}: {}",
+                        self.label("Address"),
+                        self.value(address)
+                    ));
                 }
                 if let Some(ref country) = contact.country {
-                    output.push(format!("    {}: {}", self.label("Country"), self.value(country)));
+                    output.push(format!(
+                        "    {}: {}",
+                        self.label("Country"),
+                        self.value(country)
+                    ));
                 }
             }
         }
@@ -372,19 +472,39 @@ impl OutputFormatter for HumanFormatter {
                     output.push(format!("    {}: {}", self.label("Name"), self.value(name)));
                 }
                 if let Some(ref org) = contact.organization {
-                    output.push(format!("    {}: {}", self.label("Organization"), self.value(org)));
+                    output.push(format!(
+                        "    {}: {}",
+                        self.label("Organization"),
+                        self.value(org)
+                    ));
                 }
                 if let Some(ref email) = contact.email {
-                    output.push(format!("    {}: {}", self.label("Email"), self.value(email)));
+                    output.push(format!(
+                        "    {}: {}",
+                        self.label("Email"),
+                        self.value(email)
+                    ));
                 }
                 if let Some(ref phone) = contact.phone {
-                    output.push(format!("    {}: {}", self.label("Phone"), self.value(phone)));
+                    output.push(format!(
+                        "    {}: {}",
+                        self.label("Phone"),
+                        self.value(phone)
+                    ));
                 }
                 if let Some(ref address) = contact.address {
-                    output.push(format!("    {}: {}", self.label("Address"), self.value(address)));
+                    output.push(format!(
+                        "    {}: {}",
+                        self.label("Address"),
+                        self.value(address)
+                    ));
                 }
                 if let Some(ref country) = contact.country {
-                    output.push(format!("    {}: {}", self.label("Country"), self.value(country)));
+                    output.push(format!(
+                        "    {}: {}",
+                        self.label("Country"),
+                        self.value(country)
+                    ));
                 }
             }
         }
@@ -553,7 +673,8 @@ impl OutputFormatter for HumanFormatter {
         }
 
         // Group results by region
-        let mut by_region: std::collections::HashMap<&str, Vec<_>> = std::collections::HashMap::new();
+        let mut by_region: std::collections::HashMap<&str, Vec<_>> =
+            std::collections::HashMap::new();
         for server_result in &result.results {
             by_region
                 .entry(server_result.server.location.as_str())
@@ -570,40 +691,40 @@ impl OutputFormatter for HumanFormatter {
             output.push(format!("\n    {}:", self.label(region)));
             if let Some(server_results) = by_region.get(region) {
                 for server_result in server_results {
-                let status_icon = if server_result.success { "✓" } else { "✗" };
-                let status_colored = if server_result.success {
-                    self.success(status_icon)
-                } else {
-                    self.error(status_icon)
-                };
+                    let status_icon = if server_result.success { "✓" } else { "✗" };
+                    let status_colored = if server_result.success {
+                        self.success(status_icon)
+                    } else {
+                        self.error(status_icon)
+                    };
 
-                let values = if server_result.success {
-                    if server_result.records.is_empty() {
-                        "NXDOMAIN".to_string()
+                    let values = if server_result.success {
+                        if server_result.records.is_empty() {
+                            "NXDOMAIN".to_string()
+                        } else {
+                            server_result
+                                .records
+                                .iter()
+                                .map(|r| r.format_short())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        }
                     } else {
                         server_result
-                            .records
-                            .iter()
-                            .map(|r| r.format_short())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    }
-                } else {
-                    server_result
-                        .error
-                        .as_deref()
-                        .unwrap_or("Error")
-                        .to_string()
-                };
+                            .error
+                            .as_deref()
+                            .unwrap_or("Error")
+                            .to_string()
+                    };
 
-                output.push(format!(
-                    "      {} {} ({}) - {} [{}ms]",
-                    status_colored,
-                    self.value(&server_result.server.name),
-                    server_result.server.ip,
-                    values,
-                    server_result.response_time_ms
-                ));
+                    output.push(format!(
+                        "      {} {} ({}) - {} [{}ms]",
+                        status_colored,
+                        self.value(&server_result.server.name),
+                        server_result.server.ip,
+                        values,
+                        server_result.response_time_ms
+                    ));
                 }
             }
         }
@@ -614,13 +735,18 @@ impl OutputFormatter for HumanFormatter {
     fn format_lookup(&self, result: &LookupResult) -> String {
         let mut output = Vec::new();
 
-        let domain = result.domain_name().unwrap_or_else(|| "Unknown".to_string());
+        let domain = result
+            .domain_name()
+            .unwrap_or_else(|| "Unknown".to_string());
         let source = if result.is_rdap() { "RDAP" } else { "WHOIS" };
 
         output.push(self.header(&format!("Lookup: {} (via {})", domain, source)));
 
         match result {
-            LookupResult::Rdap { data, whois_fallback } => {
+            LookupResult::Rdap {
+                data,
+                whois_fallback,
+            } => {
                 output.push(format!(
                     "  {}: {}",
                     self.label("Source"),
@@ -656,16 +782,32 @@ impl OutputFormatter for HumanFormatter {
                     if contact.has_info() {
                         output.push(format!("\n  {}:", self.label("Registrant Contact")));
                         if let Some(ref email) = contact.email {
-                            output.push(format!("    {}: {}", self.label("Email"), self.value(email)));
+                            output.push(format!(
+                                "    {}: {}",
+                                self.label("Email"),
+                                self.value(email)
+                            ));
                         }
                         if let Some(ref phone) = contact.phone {
-                            output.push(format!("    {}: {}", self.label("Phone"), self.value(phone)));
+                            output.push(format!(
+                                "    {}: {}",
+                                self.label("Phone"),
+                                self.value(phone)
+                            ));
                         }
                         if let Some(ref address) = contact.address {
-                            output.push(format!("    {}: {}", self.label("Address"), self.value(address)));
+                            output.push(format!(
+                                "    {}: {}",
+                                self.label("Address"),
+                                self.value(address)
+                            ));
                         }
                         if let Some(ref country) = contact.country {
-                            output.push(format!("    {}: {}", self.label("Country"), self.value(country)));
+                            output.push(format!(
+                                "    {}: {}",
+                                self.label("Country"),
+                                self.value(country)
+                            ));
                         }
                     }
                 }
@@ -675,16 +817,32 @@ impl OutputFormatter for HumanFormatter {
                     if contact.has_info() {
                         output.push(format!("\n  {}:", self.label("Admin Contact")));
                         if let Some(ref name) = contact.name {
-                            output.push(format!("    {}: {}", self.label("Name"), self.value(name)));
+                            output.push(format!(
+                                "    {}: {}",
+                                self.label("Name"),
+                                self.value(name)
+                            ));
                         }
                         if let Some(ref org) = contact.organization {
-                            output.push(format!("    {}: {}", self.label("Organization"), self.value(org)));
+                            output.push(format!(
+                                "    {}: {}",
+                                self.label("Organization"),
+                                self.value(org)
+                            ));
                         }
                         if let Some(ref email) = contact.email {
-                            output.push(format!("    {}: {}", self.label("Email"), self.value(email)));
+                            output.push(format!(
+                                "    {}: {}",
+                                self.label("Email"),
+                                self.value(email)
+                            ));
                         }
                         if let Some(ref phone) = contact.phone {
-                            output.push(format!("    {}: {}", self.label("Phone"), self.value(phone)));
+                            output.push(format!(
+                                "    {}: {}",
+                                self.label("Phone"),
+                                self.value(phone)
+                            ));
                         }
                     }
                 }
@@ -694,16 +852,32 @@ impl OutputFormatter for HumanFormatter {
                     if contact.has_info() {
                         output.push(format!("\n  {}:", self.label("Tech Contact")));
                         if let Some(ref name) = contact.name {
-                            output.push(format!("    {}: {}", self.label("Name"), self.value(name)));
+                            output.push(format!(
+                                "    {}: {}",
+                                self.label("Name"),
+                                self.value(name)
+                            ));
                         }
                         if let Some(ref org) = contact.organization {
-                            output.push(format!("    {}: {}", self.label("Organization"), self.value(org)));
+                            output.push(format!(
+                                "    {}: {}",
+                                self.label("Organization"),
+                                self.value(org)
+                            ));
                         }
                         if let Some(ref email) = contact.email {
-                            output.push(format!("    {}: {}", self.label("Email"), self.value(email)));
+                            output.push(format!(
+                                "    {}: {}",
+                                self.label("Email"),
+                                self.value(email)
+                            ));
                         }
                         if let Some(ref phone) = contact.phone {
-                            output.push(format!("    {}: {}", self.label("Phone"), self.value(phone)));
+                            output.push(format!(
+                                "    {}: {}",
+                                self.label("Phone"),
+                                self.value(phone)
+                            ));
                         }
                     }
                 }
@@ -812,16 +986,32 @@ impl OutputFormatter for HumanFormatter {
                 if has_registrant_details {
                     output.push(format!("\n  {}:", self.label("Registrant Contact")));
                     if let Some(ref email) = data.registrant_email {
-                        output.push(format!("    {}: {}", self.label("Email"), self.value(email)));
+                        output.push(format!(
+                            "    {}: {}",
+                            self.label("Email"),
+                            self.value(email)
+                        ));
                     }
                     if let Some(ref phone) = data.registrant_phone {
-                        output.push(format!("    {}: {}", self.label("Phone"), self.value(phone)));
+                        output.push(format!(
+                            "    {}: {}",
+                            self.label("Phone"),
+                            self.value(phone)
+                        ));
                     }
                     if let Some(ref address) = data.registrant_address {
-                        output.push(format!("    {}: {}", self.label("Address"), self.value(address)));
+                        output.push(format!(
+                            "    {}: {}",
+                            self.label("Address"),
+                            self.value(address)
+                        ));
                     }
                     if let Some(ref country) = data.registrant_country {
-                        output.push(format!("    {}: {}", self.label("Country"), self.value(country)));
+                        output.push(format!(
+                            "    {}: {}",
+                            self.label("Country"),
+                            self.value(country)
+                        ));
                     }
                 }
 
@@ -837,13 +1027,25 @@ impl OutputFormatter for HumanFormatter {
                         output.push(format!("    {}: {}", self.label("Name"), self.value(name)));
                     }
                     if let Some(ref org) = data.admin_organization {
-                        output.push(format!("    {}: {}", self.label("Organization"), self.value(org)));
+                        output.push(format!(
+                            "    {}: {}",
+                            self.label("Organization"),
+                            self.value(org)
+                        ));
                     }
                     if let Some(ref email) = data.admin_email {
-                        output.push(format!("    {}: {}", self.label("Email"), self.value(email)));
+                        output.push(format!(
+                            "    {}: {}",
+                            self.label("Email"),
+                            self.value(email)
+                        ));
                     }
                     if let Some(ref phone) = data.admin_phone {
-                        output.push(format!("    {}: {}", self.label("Phone"), self.value(phone)));
+                        output.push(format!(
+                            "    {}: {}",
+                            self.label("Phone"),
+                            self.value(phone)
+                        ));
                     }
                 }
 
@@ -859,13 +1061,25 @@ impl OutputFormatter for HumanFormatter {
                         output.push(format!("    {}: {}", self.label("Name"), self.value(name)));
                     }
                     if let Some(ref org) = data.tech_organization {
-                        output.push(format!("    {}: {}", self.label("Organization"), self.value(org)));
+                        output.push(format!(
+                            "    {}: {}",
+                            self.label("Organization"),
+                            self.value(org)
+                        ));
                     }
                     if let Some(ref email) = data.tech_email {
-                        output.push(format!("    {}: {}", self.label("Email"), self.value(email)));
+                        output.push(format!(
+                            "    {}: {}",
+                            self.label("Email"),
+                            self.value(email)
+                        ));
                     }
                     if let Some(ref phone) = data.tech_phone {
-                        output.push(format!("    {}: {}", self.label("Phone"), self.value(phone)));
+                        output.push(format!(
+                            "    {}: {}",
+                            self.label("Phone"),
+                            self.value(phone)
+                        ));
                     }
                 }
 
@@ -924,10 +1138,7 @@ impl OutputFormatter for HumanFormatter {
 
         // HTTP Status
         if let Some(status) = response.http_status {
-            let status_text = response
-                .http_status_text
-                .as_deref()
-                .unwrap_or("Unknown");
+            let status_text = response.http_status_text.as_deref().unwrap_or("Unknown");
             let status_display = if (200..300).contains(&status) {
                 self.success(&format!("{} ({})", status, status_text))
             } else if (300..400).contains(&status) {
@@ -970,11 +1181,7 @@ impl OutputFormatter for HumanFormatter {
             } else {
                 self.error("Invalid")
             };
-            output.push(format!(
-                "    {}: {}",
-                self.label("Status"),
-                valid_status
-            ));
+            output.push(format!("    {}: {}", self.label("Status"), valid_status));
 
             output.push(format!(
                 "    {}: {}",
@@ -984,17 +1191,16 @@ impl OutputFormatter for HumanFormatter {
 
             let expiry_str = cert.valid_until.format("%Y-%m-%d").to_string();
             let expiry_display = if cert.days_until_expiry < 30 {
-                self.error(&format!("{} ({} days!)", expiry_str, cert.days_until_expiry))
+                self.error(&format!(
+                    "{} ({} days!)",
+                    expiry_str, cert.days_until_expiry
+                ))
             } else if cert.days_until_expiry < 90 {
                 self.warning(&format!("{} ({} days)", expiry_str, cert.days_until_expiry))
             } else {
                 self.value(&format!("{} ({} days)", expiry_str, cert.days_until_expiry))
             };
-            output.push(format!(
-                "    {}: {}",
-                self.label("Expires"),
-                expiry_display
-            ));
+            output.push(format!("    {}: {}", self.label("Expires"), expiry_display));
         } else {
             output.push(format!(
                 "\n  {}: {}",
@@ -1017,17 +1223,22 @@ impl OutputFormatter for HumanFormatter {
 
             let expiry_str = expiry.expiration_date.format("%Y-%m-%d").to_string();
             let expiry_display = if expiry.days_until_expiry < 30 {
-                self.error(&format!("{} ({} days!)", expiry_str, expiry.days_until_expiry))
+                self.error(&format!(
+                    "{} ({} days!)",
+                    expiry_str, expiry.days_until_expiry
+                ))
             } else if expiry.days_until_expiry < 90 {
-                self.warning(&format!("{} ({} days)", expiry_str, expiry.days_until_expiry))
+                self.warning(&format!(
+                    "{} ({} days)",
+                    expiry_str, expiry.days_until_expiry
+                ))
             } else {
-                self.value(&format!("{} ({} days)", expiry_str, expiry.days_until_expiry))
+                self.value(&format!(
+                    "{} ({} days)",
+                    expiry_str, expiry.days_until_expiry
+                ))
             };
-            output.push(format!(
-                "    {}: {}",
-                self.label("Expires"),
-                expiry_display
-            ));
+            output.push(format!("    {}: {}", self.label("Expires"), expiry_display));
         }
 
         // DNS Resolution

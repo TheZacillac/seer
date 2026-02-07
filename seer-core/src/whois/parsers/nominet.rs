@@ -36,9 +36,8 @@ static DOMAIN_SECTION: Lazy<Regex> =
 static REGISTRANT_SECTION: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?i)^Registrant:\s*$").expect("Invalid Nominet registrant regex"));
 
-static REGISTRAR_SECTION: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)^Registrar:\s*$").expect("Invalid Nominet registrar regex")
-});
+static REGISTRAR_SECTION: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)^Registrar:\s*$").expect("Invalid Nominet registrar regex"));
 
 static REGISTRATION_DATE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?i)^Registration date:\s*$").expect("Invalid Nominet registration date regex")
@@ -47,11 +46,13 @@ static REGISTRATION_DATE: Lazy<Regex> = Lazy::new(|| {
 static EXPIRY_DATE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?i)^Expiry date:\s*$").expect("Invalid Nominet expiry date regex"));
 
-static LAST_UPDATED: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?i)^Last updated:\s*$").expect("Invalid Nominet last updated regex"));
+static LAST_UPDATED: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)^Last updated:\s*$").expect("Invalid Nominet last updated regex")
+});
 
-static NAME_SERVERS_SECTION: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?i)^Name servers:\s*$").expect("Invalid Nominet name servers regex"));
+static NAME_SERVERS_SECTION: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)^Name servers:\s*$").expect("Invalid Nominet name servers regex")
+});
 
 static STATUS_SECTION: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?i)^Registration status:\s*$").expect("Invalid Nominet status regex")
@@ -75,11 +76,11 @@ impl NominetParser {
 
         // Nominet uses formats like "01-January-2020" or "01 January 2020"
         let formats = [
-            "%d-%B-%Y",  // 01-January-2020
-            "%d %B %Y",  // 01 January 2020
-            "%d-%b-%Y",  // 01-Jan-2020
-            "%d %b %Y",  // 01 Jan 2020
-            "%Y-%m-%d",  // 2020-01-01 (fallback)
+            "%d-%B-%Y", // 01-January-2020
+            "%d %B %Y", // 01 January 2020
+            "%d-%b-%Y", // 01-Jan-2020
+            "%d %b %Y", // 01 Jan 2020
+            "%Y-%m-%d", // 2020-01-01 (fallback)
         ];
 
         for fmt in &formats {
@@ -94,7 +95,9 @@ impl NominetParser {
 
 impl RegistryParser for NominetParser {
     fn supported_tlds(&self) -> &[&str] {
-        &["uk", "co.uk", "org.uk", "me.uk", "ltd.uk", "plc.uk", "net.uk", "sch.uk"]
+        &[
+            "uk", "co.uk", "org.uk", "me.uk", "ltd.uk", "plc.uk", "net.uk", "sch.uk",
+        ]
     }
 
     fn parse(&self, domain: &str, server: &str, raw: &str) -> WhoisResponse {
@@ -273,6 +276,7 @@ mod tests {
     use super::*;
     use chrono::Datelike;
 
+    #[allow(dead_code)]
     const SAMPLE_NOMINET_RESPONSE: &str = r#"
     Domain name:
         example.co.uk

@@ -2,15 +2,14 @@
 
 from typing import List, Optional
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, Query, Request
 from pydantic import BaseModel, Field
-from slowapi import Limiter
-from slowapi.util import get_remote_address
+from seer_api.errors import http_error
+from seer_api.limiting import limiter
 
 import seer
 
 router = APIRouter()
-limiter = Limiter(key_func=get_remote_address)
 
 # Bulk operation limits
 MAX_BULK_DOMAINS = 100
@@ -48,7 +47,7 @@ async def dns_lookup(
         result = seer.dig(domain, record_type, nameserver)
         return result
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise http_error(e, "DNS lookup failed")
 
 
 @router.post("/bulk")
@@ -67,4 +66,4 @@ async def bulk_dns_lookup(request: Request, body: BulkDnsRequest):
         results = seer.bulk_dig(body.domains, body.record_type, body.concurrency)
         return results
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise http_error(e, "Bulk DNS lookup failed")

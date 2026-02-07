@@ -16,7 +16,10 @@ pub use error::{Result, SeerError};
 pub use retry::{NetworkRetryClassifier, RetryClassifier, RetryExecutor, RetryPolicy};
 pub use validation::{normalize_domain, validate_domain_safe};
 
-pub use dns::{DnsFollower, DnsRecord, DnsResolver, FollowConfig, FollowIteration, FollowResult, PropagationResult, RecordType};
+pub use dns::{
+    DnsFollower, DnsRecord, DnsResolver, FollowConfig, FollowIteration, FollowResult,
+    PropagationResult, RecordType,
+};
 pub use lookup::{LookupProgressCallback, LookupResult, SmartLookup};
 pub use rdap::{RdapClient, RdapResponse};
 pub use status::{CertificateInfo, DnsResolution, DomainExpiration, StatusClient, StatusResponse};

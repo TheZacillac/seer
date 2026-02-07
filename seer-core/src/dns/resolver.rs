@@ -86,10 +86,7 @@ impl DnsResolver {
         let resolver = self.create_resolver(nameserver)?;
         let domain = normalize_domain(domain)?;
 
-        debug!(
-            nameserver = nameserver.unwrap_or("system"),
-            "Resolving DNS"
-        );
+        debug!(nameserver = nameserver.unwrap_or("system"), "Resolving DNS");
 
         match record_type {
             RecordType::A => self.resolve_a(&resolver, &domain).await,
@@ -155,7 +152,12 @@ impl DnsResolver {
             .map(|srv| DnsRecord {
                 name: query_name.clone(),
                 record_type: RecordType::SRV,
-                ttl: response.as_lookup().record_iter().next().map(|r| r.ttl()).unwrap_or(0),
+                ttl: response
+                    .as_lookup()
+                    .record_iter()
+                    .next()
+                    .map(|r| r.ttl())
+                    .unwrap_or(0),
                 data: RecordData::SRV {
                     priority: srv.priority(),
                     weight: srv.weight(),
@@ -168,13 +170,22 @@ impl DnsResolver {
         Ok(records)
     }
 
-    async fn resolve_a(&self, resolver: &TokioAsyncResolver, domain: &str) -> Result<Vec<DnsRecord>> {
+    async fn resolve_a(
+        &self,
+        resolver: &TokioAsyncResolver,
+        domain: &str,
+    ) -> Result<Vec<DnsRecord>> {
         let response = resolver
             .ipv4_lookup(domain)
             .await
             .map_err(|e| SeerError::DnsError(format!("A lookup failed: {}", e)))?;
 
-        let ttl = response.as_lookup().record_iter().next().map(|r| r.ttl()).unwrap_or(0);
+        let ttl = response
+            .as_lookup()
+            .record_iter()
+            .next()
+            .map(|r| r.ttl())
+            .unwrap_or(0);
 
         let records = response
             .iter()
@@ -201,7 +212,12 @@ impl DnsResolver {
             .await
             .map_err(|e| SeerError::DnsError(format!("AAAA lookup failed: {}", e)))?;
 
-        let ttl = response.as_lookup().record_iter().next().map(|r| r.ttl()).unwrap_or(0);
+        let ttl = response
+            .as_lookup()
+            .record_iter()
+            .next()
+            .map(|r| r.ttl())
+            .unwrap_or(0);
 
         let records = response
             .iter()
@@ -250,13 +266,22 @@ impl DnsResolver {
         Ok(records)
     }
 
-    async fn resolve_mx(&self, resolver: &TokioAsyncResolver, domain: &str) -> Result<Vec<DnsRecord>> {
+    async fn resolve_mx(
+        &self,
+        resolver: &TokioAsyncResolver,
+        domain: &str,
+    ) -> Result<Vec<DnsRecord>> {
         let response = resolver
             .mx_lookup(domain)
             .await
             .map_err(|e| SeerError::DnsError(format!("MX lookup failed: {}", e)))?;
 
-        let ttl = response.as_lookup().record_iter().next().map(|r| r.ttl()).unwrap_or(0);
+        let ttl = response
+            .as_lookup()
+            .record_iter()
+            .next()
+            .map(|r| r.ttl())
+            .unwrap_or(0);
 
         let mut records: Vec<DnsRecord> = response
             .iter()
@@ -282,13 +307,22 @@ impl DnsResolver {
         Ok(records)
     }
 
-    async fn resolve_ns(&self, resolver: &TokioAsyncResolver, domain: &str) -> Result<Vec<DnsRecord>> {
+    async fn resolve_ns(
+        &self,
+        resolver: &TokioAsyncResolver,
+        domain: &str,
+    ) -> Result<Vec<DnsRecord>> {
         let response = resolver
             .ns_lookup(domain)
             .await
             .map_err(|e| SeerError::DnsError(format!("NS lookup failed: {}", e)))?;
 
-        let ttl = response.as_lookup().record_iter().next().map(|r| r.ttl()).unwrap_or(0);
+        let ttl = response
+            .as_lookup()
+            .record_iter()
+            .next()
+            .map(|r| r.ttl())
+            .unwrap_or(0);
 
         let records = response
             .iter()
@@ -315,7 +349,12 @@ impl DnsResolver {
             .await
             .map_err(|e| SeerError::DnsError(format!("TXT lookup failed: {}", e)))?;
 
-        let ttl = response.as_lookup().record_iter().next().map(|r| r.ttl()).unwrap_or(0);
+        let ttl = response
+            .as_lookup()
+            .record_iter()
+            .next()
+            .map(|r| r.ttl())
+            .unwrap_or(0);
 
         let records = response
             .iter()
@@ -348,7 +387,12 @@ impl DnsResolver {
             .await
             .map_err(|e| SeerError::DnsError(format!("SOA lookup failed: {}", e)))?;
 
-        let ttl = response.as_lookup().record_iter().next().map(|r| r.ttl()).unwrap_or(0);
+        let ttl = response
+            .as_lookup()
+            .record_iter()
+            .next()
+            .map(|r| r.ttl())
+            .unwrap_or(0);
 
         let records = response
             .iter()
@@ -458,20 +502,20 @@ impl DnsResolver {
             .filter_map(|record| {
                 if let Some(HickoryRData::DNSSEC(dnssec_rdata)) = record.data() {
                     if let Some(dnskey) = dnssec_rdata.as_dnskey() {
-                            use base64::{engine::general_purpose::STANDARD, Engine};
-                            let public_key = STANDARD.encode(dnskey.public_key());
-                            return Some(DnsRecord {
-                                name: domain.to_string(),
-                                record_type: RecordType::DNSKEY,
-                                ttl: record.ttl(),
-                                data: RecordData::DNSKEY {
-                                    flags: dnskey.flags(),
-                                    protocol: 3, // Protocol is always 3 for DNSSEC (RFC 4034)
-                                    algorithm: u8::from(dnskey.algorithm()),
-                                    public_key,
-                                },
-                            });
-                        }
+                        use base64::{engine::general_purpose::STANDARD, Engine};
+                        let public_key = STANDARD.encode(dnskey.public_key());
+                        return Some(DnsRecord {
+                            name: domain.to_string(),
+                            record_type: RecordType::DNSKEY,
+                            ttl: record.ttl(),
+                            data: RecordData::DNSKEY {
+                                flags: dnskey.flags(),
+                                protocol: 3, // Protocol is always 3 for DNSSEC (RFC 4034)
+                                algorithm: u8::from(dnskey.algorithm()),
+                                public_key,
+                            },
+                        });
+                    }
                 }
                 None
             })
@@ -497,23 +541,23 @@ impl DnsResolver {
             .filter_map(|record| {
                 if let Some(HickoryRData::DNSSEC(dnssec_rdata)) = record.data() {
                     if let Some(ds) = dnssec_rdata.as_ds() {
-                            let digest = ds
-                                .digest()
-                                .iter()
-                                .map(|b| format!("{:02X}", b))
-                                .collect::<String>();
-                            return Some(DnsRecord {
-                                name: domain.to_string(),
-                                record_type: RecordType::DS,
-                                ttl: record.ttl(),
-                                data: RecordData::DS {
-                                    key_tag: ds.key_tag(),
-                                    algorithm: u8::from(ds.algorithm()),
-                                    digest_type: u8::from(ds.digest_type()),
-                                    digest,
-                                },
-                            });
-                        }
+                        let digest = ds
+                            .digest()
+                            .iter()
+                            .map(|b| format!("{:02X}", b))
+                            .collect::<String>();
+                        return Some(DnsRecord {
+                            name: domain.to_string(),
+                            record_type: RecordType::DS,
+                            ttl: record.ttl(),
+                            data: RecordData::DS {
+                                key_tag: ds.key_tag(),
+                                algorithm: u8::from(ds.algorithm()),
+                                digest_type: u8::from(ds.digest_type()),
+                                digest,
+                            },
+                        });
+                    }
                 }
                 None
             })
@@ -615,9 +659,7 @@ fn parse_caa(caa: &CAA) -> (u8, String, String) {
 fn is_valid_srv_label(label: &str) -> bool {
     !label.is_empty()
         && label.len() <= 63
-        && label
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-')
+        && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
         && !label.starts_with('-')
         && !label.ends_with('-')
 }

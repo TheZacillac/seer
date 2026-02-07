@@ -26,6 +26,9 @@ pub enum SeerError {
     #[error("Invalid domain name: {0}")]
     InvalidDomain(String),
 
+    #[error("Domain not allowed: TLD '{tld}' is not in the allowlist")]
+    DomainNotAllowed { domain: String, tld: String },
+
     #[error("Invalid IP address: {0}")]
     InvalidIpAddress(String),
 
@@ -79,10 +82,15 @@ impl SeerError {
             SeerError::WhoisServerNotFound(_) => "WHOIS server not found for this TLD".to_string(),
             SeerError::WhoisConnectionFailed(_) => "WHOIS connection failed".to_string(),
             SeerError::RdapError(_) => "RDAP lookup failed".to_string(),
-            SeerError::RdapBootstrapError(_) => "RDAP service unavailable for this resource".to_string(),
+            SeerError::RdapBootstrapError(_) => {
+                "RDAP service unavailable for this resource".to_string()
+            }
             SeerError::DnsError(_) => "DNS resolution failed".to_string(),
             SeerError::DnsResolverError(_) => "DNS resolution failed".to_string(),
             SeerError::InvalidDomain(domain) => format!("Invalid domain name: {}", domain),
+            SeerError::DomainNotAllowed { tld, .. } => {
+                format!("Domain not allowed: TLD '{}' is not in the allowlist", tld)
+            }
             SeerError::InvalidIpAddress(ip) => format!("Invalid IP address: {}", ip),
             SeerError::InvalidRecordType(rt) => format!("Invalid record type: {}", rt),
             SeerError::HttpError(_) => "HTTP request failed".to_string(),

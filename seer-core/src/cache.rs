@@ -101,7 +101,11 @@ where
         let entry = entries.get(key)?;
 
         if entry.is_expired() {
-            debug!(?key, age_secs = entry.age().as_secs(), "Cache entry expired");
+            debug!(
+                ?key,
+                age_secs = entry.age().as_secs(),
+                "Cache entry expired"
+            );
             None
         } else {
             Some(entry.value.clone())
@@ -399,7 +403,11 @@ mod tests {
         std::thread::sleep(Duration::from_millis(20));
 
         // Add a fresh entry
-        cache.insert_with_ttl("key3".to_string(), "value3".to_string(), Duration::from_secs(3600));
+        cache.insert_with_ttl(
+            "key3".to_string(),
+            "value3".to_string(),
+            Duration::from_secs(3600),
+        );
 
         assert_eq!(cache.len(), 3);
 

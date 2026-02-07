@@ -21,12 +21,26 @@ pub type ProgressCallback = Box<dyn Fn(usize, usize, &str) + Send + Sync>;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum BulkOperation {
-    Whois { domain: String },
-    Rdap { domain: String },
-    Dns { domain: String, record_type: RecordType },
-    Propagation { domain: String, record_type: RecordType },
-    Lookup { domain: String },
-    Status { domain: String },
+    Whois {
+        domain: String,
+    },
+    Rdap {
+        domain: String,
+    },
+    Dns {
+        domain: String,
+        record_type: RecordType,
+    },
+    Propagation {
+        domain: String,
+        record_type: RecordType,
+    },
+    Lookup {
+        domain: String,
+    },
+    Status {
+        domain: String,
+    },
 }
 
 /// The data returned from a bulk operation (varies by operation type).

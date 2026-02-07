@@ -35,7 +35,12 @@ pub fn default_dns_servers() -> Vec<DnsServer> {
         // North America
         DnsServer::new("Google", "8.8.8.8", "North America", "Google"),
         DnsServer::new("Cloudflare", "1.1.1.1", "North America", "Cloudflare"),
-        DnsServer::new("OpenDNS", "208.67.222.222", "North America", "Cisco OpenDNS"),
+        DnsServer::new(
+            "OpenDNS",
+            "208.67.222.222",
+            "North America",
+            "Cisco OpenDNS",
+        ),
         DnsServer::new("Quad9", "9.9.9.9", "North America", "Quad9"),
         DnsServer::new("Level3", "4.2.2.1", "North America", "Lumen"),
         // Europe
@@ -52,10 +57,20 @@ pub fn default_dns_servers() -> Vec<DnsServer> {
         DnsServer::new("HiNet", "168.95.1.1", "Asia Pacific", "Chunghwa Telecom"),
         // Latin America
         DnsServer::new("Claro Brasil", "200.248.178.54", "Latin America", "Claro"),
-        DnsServer::new("Telefonica Brasil", "200.176.2.10", "Latin America", "Telefonica"),
+        DnsServer::new(
+            "Telefonica Brasil",
+            "200.176.2.10",
+            "Latin America",
+            "Telefonica",
+        ),
         DnsServer::new("Antel Uruguay", "200.40.30.245", "Latin America", "Antel"),
         DnsServer::new("Telmex Mexico", "200.33.146.217", "Latin America", "Telmex"),
-        DnsServer::new("CenturyLink LATAM", "200.75.51.132", "Latin America", "CenturyLink"),
+        DnsServer::new(
+            "CenturyLink LATAM",
+            "200.75.51.132",
+            "Latin America",
+            "CenturyLink",
+        ),
         // Africa
         DnsServer::new("Liquid Telecom", "41.63.64.74", "Africa", "Liquid Telecom"),
         DnsServer::new("SEACOM", "196.216.2.1", "Africa", "SEACOM"),
@@ -66,7 +81,12 @@ pub fn default_dns_servers() -> Vec<DnsServer> {
         DnsServer::new("Etisalat UAE", "213.42.20.20", "Middle East", "Etisalat"),
         DnsServer::new("STC Saudi", "212.118.129.106", "Middle East", "STC"),
         DnsServer::new("Bezeq Israel", "192.115.106.81", "Middle East", "Bezeq"),
-        DnsServer::new("Turk Telekom", "195.175.39.39", "Middle East", "Turk Telekom"),
+        DnsServer::new(
+            "Turk Telekom",
+            "195.175.39.39",
+            "Middle East",
+            "Turk Telekom",
+        ),
         DnsServer::new("Ooredoo Qatar", "212.77.192.10", "Middle East", "Ooredoo"),
     ]
 }
@@ -141,11 +161,7 @@ impl PropagationChecker {
     }
 
     #[instrument(skip(self), fields(domain = %domain, record_type = %record_type))]
-    pub async fn check(
-        &self,
-        domain: &str,
-        record_type: RecordType,
-    ) -> Result<PropagationResult> {
+    pub async fn check(&self, domain: &str, record_type: RecordType) -> Result<PropagationResult> {
         debug!(servers = self.servers.len(), "Starting propagation check");
 
         let futures: Vec<_> = self
@@ -237,11 +253,7 @@ fn analyze_results(
     let sorted_value_sets: Vec<Vec<String>> = successful
         .iter()
         .map(|result| {
-            let mut values: Vec<String> = result
-                .records
-                .iter()
-                .map(|r| r.format_short())
-                .collect();
+            let mut values: Vec<String> = result.records.iter().map(|r| r.format_short()).collect();
             values.sort();
             values
         })
@@ -260,8 +272,7 @@ fn analyze_results(
         .unwrap();
 
     // Calculate propagation percentage based on consensus
-    let propagation_percentage =
-        (consensus_count as f64 / successful.len() as f64) * 100.0;
+    let propagation_percentage = (consensus_count as f64 / successful.len() as f64) * 100.0;
 
     // Find inconsistencies (reuse pre-computed sorted value sets)
     let consensus_str = if consensus_values.is_empty() {
@@ -295,9 +306,16 @@ fn analyze_results(
     }
 
     // For record types where empty result is valid, adjust messaging
-    if consensus_values.is_empty() && record_type != RecordType::A && record_type != RecordType::AAAA {
+    if consensus_values.is_empty()
+        && record_type != RecordType::A
+        && record_type != RecordType::AAAA
+    {
         // No records is a valid state for optional record types
     }
 
-    (propagation_percentage, consensus_values.clone(), inconsistencies)
+    (
+        propagation_percentage,
+        consensus_values.clone(),
+        inconsistencies,
+    )
 }

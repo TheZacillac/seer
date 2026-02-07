@@ -1,8 +1,29 @@
 //! Domain validation and SSRF protection utilities
 
+use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
+use once_cell::sync::Lazy;
+
 use crate::error::{Result, SeerError};
+
+/// TLD allowlist loaded from the `SEER_DOMAIN_ALLOWLIST` environment variable.
+/// When set (e.g., `SEER_DOMAIN_ALLOWLIST="com,org,net"`), only domains with
+/// matching TLDs are permitted. When unset, all TLDs are allowed.
+static DOMAIN_ALLOWLIST: Lazy<Option<HashSet<String>>> = Lazy::new(|| {
+    let set: HashSet<String> = std::env::var("SEER_DOMAIN_ALLOWLIST")
+        .ok()?
+        .split(',')
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if set.is_empty() {
+        None
+    } else {
+        Some(set)
+    }
+});
 
 /// Normalizes and validates a domain name.
 ///
@@ -50,6 +71,18 @@ pub fn normalize_domain(domain: &str) -> Result<String> {
     for label in domain.split('.') {
         if label.is_empty() || label.starts_with('-') || label.ends_with('-') {
             return Err(SeerError::InvalidDomain(domain.to_string()));
+        }
+    }
+
+    // Check TLD against allowlist (if configured)
+    if let Some(ref allowlist) = *DOMAIN_ALLOWLIST {
+        if let Some(tld) = domain.rsplit('.').next() {
+            if !allowlist.contains(tld) {
+                return Err(SeerError::DomainNotAllowed {
+                    domain: domain.to_string(),
+                    tld: tld.to_string(),
+                });
+            }
         }
     }
 
@@ -161,7 +194,10 @@ fn is_private_or_reserved_ipv6(ip: &Ipv6Addr) -> bool {
 
     // IPv4-mapped IPv6 addresses (::ffff:0:0/96)
     // Check if it maps to a private IPv4
-    if ip.to_ipv4_mapped().is_some_and(|ipv4| is_private_or_reserved_ipv4(&ipv4)) {
+    if ip
+        .to_ipv4_mapped()
+        .is_some_and(|ipv4| is_private_or_reserved_ipv4(&ipv4))
+    {
         return true;
     }
 
@@ -232,38 +268,71 @@ mod tests {
     }
 
     #[test]
+    fn test_allowlist_not_set_allows_all() {
+        // When SEER_DOMAIN_ALLOWLIST is not set, all domains pass
+        // This test verifies the default behavior (no env var)
+        assert!(normalize_domain("example.com").is_ok());
+        assert!(normalize_domain("example.xyz").is_ok());
+        assert!(normalize_domain("example.co.uk").is_ok());
+    }
+
+    #[test]
     fn test_is_private_or_reserved_ipv4() {
         // Private networks
-        assert!(is_private_or_reserved_ip(&IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
-        assert!(is_private_or_reserved_ip(&IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1))));
-        assert!(is_private_or_reserved_ip(&IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))));
+        assert!(is_private_or_reserved_ip(&IpAddr::V4(Ipv4Addr::new(
+            10, 0, 0, 1
+        ))));
+        assert!(is_private_or_reserved_ip(&IpAddr::V4(Ipv4Addr::new(
+            172, 16, 0, 1
+        ))));
+        assert!(is_private_or_reserved_ip(&IpAddr::V4(Ipv4Addr::new(
+            192, 168, 1, 1
+        ))));
 
         // Loopback
-        assert!(is_private_or_reserved_ip(&IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))));
+        assert!(is_private_or_reserved_ip(&IpAddr::V4(Ipv4Addr::new(
+            127, 0, 0, 1
+        ))));
 
         // Link-local
-        assert!(is_private_or_reserved_ip(&IpAddr::V4(Ipv4Addr::new(169, 254, 1, 1))));
+        assert!(is_private_or_reserved_ip(&IpAddr::V4(Ipv4Addr::new(
+            169, 254, 1, 1
+        ))));
 
         // Cloud metadata
-        assert!(is_private_or_reserved_ip(&IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254))));
+        assert!(is_private_or_reserved_ip(&IpAddr::V4(Ipv4Addr::new(
+            169, 254, 169, 254
+        ))));
 
         // Public IP (should not be blocked)
-        assert!(!is_private_or_reserved_ip(&IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
-        assert!(!is_private_or_reserved_ip(&IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))));
+        assert!(!is_private_or_reserved_ip(&IpAddr::V4(Ipv4Addr::new(
+            8, 8, 8, 8
+        ))));
+        assert!(!is_private_or_reserved_ip(&IpAddr::V4(Ipv4Addr::new(
+            1, 1, 1, 1
+        ))));
     }
 
     #[test]
     fn test_is_private_or_reserved_ipv6() {
         // Loopback
-        assert!(is_private_or_reserved_ip(&IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1))));
+        assert!(is_private_or_reserved_ip(&IpAddr::V6(Ipv6Addr::new(
+            0, 0, 0, 0, 0, 0, 0, 1
+        ))));
 
         // Unique local
-        assert!(is_private_or_reserved_ip(&IpAddr::V6(Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 1))));
+        assert!(is_private_or_reserved_ip(&IpAddr::V6(Ipv6Addr::new(
+            0xfc00, 0, 0, 0, 0, 0, 0, 1
+        ))));
 
         // Link-local
-        assert!(is_private_or_reserved_ip(&IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1))));
+        assert!(is_private_or_reserved_ip(&IpAddr::V6(Ipv6Addr::new(
+            0xfe80, 0, 0, 0, 0, 0, 0, 1
+        ))));
 
         // Public IPv6 (should not be blocked)
-        assert!(!is_private_or_reserved_ip(&IpAddr::V6(Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888))));
+        assert!(!is_private_or_reserved_ip(&IpAddr::V6(Ipv6Addr::new(
+            0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888
+        ))));
     }
 }

@@ -522,7 +522,9 @@ fn bulk_results_to_csv(results: &[seer_core::bulk::BulkResult], operation: &str)
             csv.push_str("domain,success,record_type,records,duration_ms\n");
         }
         "propagation" | "prop" => {
-            csv.push_str("domain,success,propagation_pct,servers_total,servers_responded,duration_ms\n");
+            csv.push_str(
+                "domain,success,propagation_pct,servers_total,servers_responded,duration_ms\n",
+            );
         }
         _ => {
             csv.push_str("domain,success,duration_ms\n");
@@ -760,10 +762,7 @@ fn bulk_results_to_csv(results: &[seer_core::bulk::BulkResult], operation: &str)
                 ));
             }
             _ => {
-                csv.push_str(&format!(
-                    "{},{},{}\n",
-                    domain, success, duration_ms
-                ));
+                csv.push_str(&format!("{},{},{}\n", domain, success, duration_ms));
             }
         }
     }
@@ -787,7 +786,7 @@ fn escape_csv_field(s: &str) -> String {
     };
 
     // Replace commas and newlines with spaces for cleaner CSV
-    s.replace(',', " ").replace('\n', " ").replace('"', "'")
+    s.replace([',', '\n'], " ").replace('"', "'")
 }
 
 fn get_domain_from_operation(op: &seer_core::bulk::BulkOperation) -> String {

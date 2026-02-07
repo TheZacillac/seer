@@ -95,8 +95,7 @@ impl RetryPolicy {
         // gives 2^20 = ~1 million, which is safe for f64 and reasonable for delays
         let safe_attempt = attempt.min(20) as i32;
 
-        let base_delay = self.initial_delay.as_millis() as f64
-            * self.multiplier.powi(safe_attempt);
+        let base_delay = self.initial_delay.as_millis() as f64 * self.multiplier.powi(safe_attempt);
         let capped_delay = base_delay.min(self.max_delay.as_millis() as f64);
 
         let final_delay = if self.jitter {
@@ -182,13 +181,12 @@ impl RetryClassifier for NetworkRetryClassifier {
             // HTTP errors might be transient
             SeerError::HttpError(msg) => {
                 let lower = msg.to_lowercase();
-                lower.contains("timeout")
-                    || lower.contains("connection")
-                    || lower.contains("5")
+                lower.contains("timeout") || lower.contains("connection") || lower.contains("5")
             }
 
             // Not retryable - permanent failures
             SeerError::InvalidDomain(_) => false,
+            SeerError::DomainNotAllowed { .. } => false,
             SeerError::InvalidIpAddress(_) => false,
             SeerError::InvalidRecordType(_) => false,
             SeerError::WhoisServerNotFound(_) => false,

@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::{Duration, Instant};
 
 use once_cell::sync::Lazy;
@@ -26,18 +26,19 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 /// TTL for bootstrap data (24 hours)
 const BOOTSTRAP_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// Thread-safe HTTP client for bootstrap loading
-static BOOTSTRAP_HTTP_CLIENT: Lazy<Client> = Lazy::new(|| {
+/// Shared HTTP client for all RDAP operations (bootstrap + queries).
+/// Reusing a single Client enables connection pooling across requests.
+static RDAP_HTTP_CLIENT: Lazy<Client> = Lazy::new(|| {
     Client::builder()
         .timeout(DEFAULT_TIMEOUT)
-        .user_agent("Seer/1.0 (RDAP Bootstrap)")
+        .user_agent("Seer/1.0 (RDAP Client)")
+        .pool_max_idle_per_host(10)
         .build()
-        .expect("Failed to build bootstrap HTTP client - invalid configuration")
+        .expect("Failed to build RDAP HTTP client - invalid configuration")
 });
 
 /// Bootstrap cache with TTL support
-static BOOTSTRAP_CACHE: Lazy<RwLock<Option<CachedBootstrap>>> =
-    Lazy::new(|| RwLock::new(None));
+static BOOTSTRAP_CACHE: Lazy<RwLock<Option<CachedBootstrap>>> = Lazy::new(|| RwLock::new(None));
 
 /// Cached bootstrap data with timestamp for TTL tracking
 struct CachedBootstrap {
@@ -88,8 +89,6 @@ struct BootstrapResponse {
 
 #[derive(Debug, Clone)]
 pub struct RdapClient {
-    http: Client,
-    timeout: Duration,
     retry_policy: RetryPolicy,
 }
 
@@ -102,26 +101,9 @@ impl Default for RdapClient {
 impl RdapClient {
     /// Creates a new RDAP client with default settings.
     pub fn new() -> Self {
-        let http = Client::builder()
-            .timeout(DEFAULT_TIMEOUT)
-            .user_agent("Seer/1.0 (RDAP Client)")
-            .build()
-            .expect("Failed to build HTTP client");
-
         Self {
-            http,
-            timeout: DEFAULT_TIMEOUT,
             retry_policy: RetryPolicy::default(),
         }
-    }
-
-    /// Sets the timeout for RDAP queries.
-    ///
-    /// The default is 30 seconds to accommodate slow RDAP servers and
-    /// bootstrap loading from IANA registries.
-    pub fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.timeout = timeout;
-        self
     }
 
     /// Sets the retry policy for transient network failures.
@@ -202,17 +184,15 @@ impl RdapClient {
     fn get_rdap_url_for_ip(cache: &BootstrapData, ip: &IpAddr) -> Option<String> {
         match ip {
             IpAddr::V4(addr) => {
-                let octets = addr.octets();
                 for (range, url) in &cache.ipv4 {
-                    if ip_matches_prefix(&range.prefix, &octets) {
+                    if ipv4_matches_prefix(&range.prefix, addr) {
                         return Some(url.clone());
                     }
                 }
             }
             IpAddr::V6(addr) => {
-                let segments = addr.segments();
                 for (range, url) in &cache.ipv6 {
-                    if ipv6_matches_prefix(&range.prefix, &segments) {
+                    if ipv6_matches_prefix(&range.prefix, addr) {
                         return Some(url.clone());
                     }
                 }
@@ -245,12 +225,14 @@ impl RdapClient {
         // Extract URL while holding the lock, then release before HTTP request
         let url = {
             let cache_guard = BOOTSTRAP_CACHE.read().await;
-            let cache = cache_guard
-                .as_ref()
-                .ok_or_else(|| SeerError::RdapBootstrapError("bootstrap data not loaded".to_string()))?;
+            let cache = cache_guard.as_ref().ok_or_else(|| {
+                SeerError::RdapBootstrapError("bootstrap data not loaded".to_string())
+            })?;
 
-            let base_url = Self::get_rdap_url_for_domain(&cache.data, &domain)
-                .ok_or_else(|| SeerError::RdapBootstrapError(format!("no RDAP server for {}", domain)))?;
+            let base_url =
+                Self::get_rdap_url_for_domain(&cache.data, &domain).ok_or_else(|| {
+                    SeerError::RdapBootstrapError(format!("no RDAP server for {}", domain))
+                })?;
 
             format!("{}domain/{}", ensure_trailing_slash(&base_url), domain)
         }; // Lock released here
@@ -273,12 +255,13 @@ impl RdapClient {
         // Extract URL while holding the lock, then release before HTTP request
         let url = {
             let cache_guard = BOOTSTRAP_CACHE.read().await;
-            let cache = cache_guard
-                .as_ref()
-                .ok_or_else(|| SeerError::RdapBootstrapError("bootstrap data not loaded".to_string()))?;
+            let cache = cache_guard.as_ref().ok_or_else(|| {
+                SeerError::RdapBootstrapError("bootstrap data not loaded".to_string())
+            })?;
 
-            let base_url = Self::get_rdap_url_for_ip(&cache.data, &ip_addr)
-                .ok_or_else(|| SeerError::RdapBootstrapError(format!("no RDAP server for {}", ip)))?;
+            let base_url = Self::get_rdap_url_for_ip(&cache.data, &ip_addr).ok_or_else(|| {
+                SeerError::RdapBootstrapError(format!("no RDAP server for {}", ip))
+            })?;
 
             format!("{}ip/{}", ensure_trailing_slash(&base_url), ip)
         }; // Lock released here
@@ -297,12 +280,13 @@ impl RdapClient {
         // Extract URL while holding the lock, then release before HTTP request
         let url = {
             let cache_guard = BOOTSTRAP_CACHE.read().await;
-            let cache = cache_guard
-                .as_ref()
-                .ok_or_else(|| SeerError::RdapBootstrapError("bootstrap data not loaded".to_string()))?;
+            let cache = cache_guard.as_ref().ok_or_else(|| {
+                SeerError::RdapBootstrapError("bootstrap data not loaded".to_string())
+            })?;
 
-            let base_url = Self::get_rdap_url_for_asn(&cache.data, asn)
-                .ok_or_else(|| SeerError::RdapBootstrapError(format!("no RDAP server for AS{}", asn)))?;
+            let base_url = Self::get_rdap_url_for_asn(&cache.data, asn).ok_or_else(|| {
+                SeerError::RdapBootstrapError(format!("no RDAP server for AS{}", asn))
+            })?;
 
             format!("{}autnum/{}", ensure_trailing_slash(&base_url), asn)
         }; // Lock released here
@@ -314,12 +298,11 @@ impl RdapClient {
     /// Queries an RDAP endpoint with retry logic.
     async fn query_rdap_with_retry(&self, url: &str) -> Result<RdapResponse> {
         let executor = RetryExecutor::new(self.retry_policy.clone());
-        let http = self.http.clone();
         let url = url.to_string();
 
         executor
             .execute(|| {
-                let http = http.clone();
+                let http = RDAP_HTTP_CLIENT.clone();
                 let url = url.clone();
                 async move { query_rdap_internal(&http, &url).await }
             })
@@ -356,7 +339,7 @@ async fn load_bootstrap_data_with_retry(policy: &RetryPolicy) -> Result<Bootstra
 async fn load_bootstrap_data() -> Result<BootstrapData> {
     debug!("Loading RDAP bootstrap data from IANA");
 
-    let http = &*BOOTSTRAP_HTTP_CLIENT;
+    let http = &*RDAP_HTTP_CLIENT;
 
     let dns_future = http.get(IANA_BOOTSTRAP_DNS).send();
     let ipv4_future = http.get(IANA_BOOTSTRAP_IPV4).send();
@@ -479,63 +462,71 @@ fn parse_asn_range(range: &str) -> Option<(u32, u32)> {
     }
 }
 
-fn ip_matches_prefix(prefix: &str, octets: &[u8; 4]) -> bool {
+fn ipv4_matches_prefix(prefix: &str, ip: &Ipv4Addr) -> bool {
     let (addr_part, mask_part) = match prefix.split_once('/') {
         Some((a, m)) => (a, Some(m)),
         None => (prefix, None),
     };
 
-    let prefix_octets: Vec<u8> = addr_part
-        .split('.')
-        .filter_map(|s| s.parse().ok())
-        .collect();
+    let prefix_ip: Ipv4Addr = match addr_part.parse() {
+        Ok(ip) => ip,
+        Err(_) => return false,
+    };
 
-    if prefix_octets.is_empty() {
-        return false;
-    }
+    let mask_bits: u32 = match mask_part.and_then(|s| s.parse().ok()) {
+        Some(bits) if bits <= 32 => bits,
+        Some(_) => return false,
+        None => 32,
+    };
 
-    // Validate and clamp mask_bits to valid IPv4 range (0-32)
-    let mask_bits: usize = mask_part
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(8)
-        .min(32);
-    let full_octets = mask_bits / 8;
+    let mask = if mask_bits == 0 {
+        0
+    } else {
+        u32::MAX << (32 - mask_bits)
+    };
 
-    for (i, &octet) in octets.iter().enumerate().take(full_octets.min(prefix_octets.len())) {
-        if prefix_octets.get(i) != Some(&octet) {
-            return false;
-        }
-    }
+    let ip_value = u32::from(*ip);
+    let prefix_value = u32::from(prefix_ip);
 
-    true
+    (ip_value & mask) == (prefix_value & mask)
 }
 
-fn ipv6_matches_prefix(prefix: &str, segments: &[u16; 8]) -> bool {
+fn ipv6_matches_prefix(prefix: &str, ip: &Ipv6Addr) -> bool {
     let (addr_part, mask_part) = match prefix.split_once('/') {
         Some((a, m)) => (a, Some(m)),
         None => (prefix, None),
     };
 
-    // Parse IPv6 prefix (simplified)
-    if let Ok(addr) = addr_part.parse::<std::net::Ipv6Addr>() {
-        let prefix_segments = addr.segments();
-        // Validate and clamp mask_bits to valid IPv6 range (0-128)
-        let mask_bits: usize = mask_part
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(48)
-            .min(128);
-        let full_segments = mask_bits / 16;
+    let prefix_ip: Ipv6Addr = match addr_part.parse() {
+        Ok(ip) => ip,
+        Err(_) => return false,
+    };
 
-        for (i, &segment) in segments.iter().enumerate().take(full_segments.min(8)) {
-            if prefix_segments[i] != segment {
-                return false;
-            }
-        }
+    let mask_bits: u32 = match mask_part.and_then(|s| s.parse().ok()) {
+        Some(bits) if bits <= 128 => bits,
+        Some(_) => return false,
+        None => 128,
+    };
 
-        return true;
+    let mask = if mask_bits == 0 {
+        0u128
+    } else {
+        u128::MAX << (128 - mask_bits)
+    };
+
+    let ip_value = ipv6_to_u128(ip);
+    let prefix_value = ipv6_to_u128(&prefix_ip);
+
+    (ip_value & mask) == (prefix_value & mask)
+}
+
+fn ipv6_to_u128(ip: &Ipv6Addr) -> u128 {
+    let segments = ip.segments();
+    let mut value = 0u128;
+    for segment in segments {
+        value = (value << 16) | segment as u128;
     }
-
-    false
+    value
 }
 
 #[cfg(test)]
@@ -572,5 +563,21 @@ mod tests {
         let cached = CachedBootstrap::new(data);
         // Fresh cache should not be expired
         assert!(!cached.is_expired());
+    }
+
+    #[test]
+    fn test_ipv4_prefix_matching_partial_mask() {
+        let ip_in = Ipv4Addr::new(203, 0, 114, 1);
+        let ip_out = Ipv4Addr::new(203, 0, 120, 1);
+        assert!(ipv4_matches_prefix("203.0.112.0/21", &ip_in));
+        assert!(!ipv4_matches_prefix("203.0.112.0/21", &ip_out));
+    }
+
+    #[test]
+    fn test_ipv6_prefix_matching_partial_mask() {
+        let ip_in: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let ip_out: Ipv6Addr = "2001:db9::1".parse().unwrap();
+        assert!(ipv6_matches_prefix("2001:db8::/33", &ip_in));
+        assert!(!ipv6_matches_prefix("2001:db8::/33", &ip_out));
     }
 }

@@ -154,12 +154,8 @@ impl Hinter for SeerCompleter {
 
         // Provide usage hints for commands
         match words[0].to_lowercase().as_str() {
-            "lookup" if words.len() == 1 && line.ends_with(' ') => {
-                Some(" <domain>".to_string())
-            }
-            "whois" if words.len() == 1 && line.ends_with(' ') => {
-                Some(" <domain>".to_string())
-            }
+            "lookup" if words.len() == 1 && line.ends_with(' ') => Some(" <domain>".to_string()),
+            "whois" if words.len() == 1 && line.ends_with(' ') => Some(" <domain>".to_string()),
             "rdap" if words.len() == 1 && line.ends_with(' ') => {
                 Some(" <domain|ip|asn>".to_string())
             }
@@ -175,9 +171,7 @@ impl Hinter for SeerCompleter {
             "set" if words.len() == 1 && line.ends_with(' ') => {
                 Some(" output <human|json>".to_string())
             }
-            "status" if words.len() == 1 && line.ends_with(' ') => {
-                Some(" <domain>".to_string())
-            }
+            "status" if words.len() == 1 && line.ends_with(' ') => Some(" <domain>".to_string()),
             "follow" if words.len() == 1 && line.ends_with(' ') => {
                 Some(" <domain> [iterations] [interval_minutes] [type] [@server]".to_string())
             }

@@ -140,8 +140,7 @@ impl RdapEntity {
                     if let Some(props) = arr[1].as_array() {
                         for prop in props {
                             if let Some(prop_arr) = prop.as_array() {
-                                if prop_arr.len() >= 4
-                                    && prop_arr[0].as_str() == Some("fn") {
+                                if prop_arr.len() >= 4 && prop_arr[0].as_str() == Some("fn") {
                                     return prop_arr[3].as_str().map(String::from);
                                 }
                             }
@@ -160,8 +159,7 @@ impl RdapEntity {
                     if let Some(props) = arr[1].as_array() {
                         for prop in props {
                             if let Some(prop_arr) = prop.as_array() {
-                                if prop_arr.len() >= 4
-                                    && prop_arr[0].as_str() == Some("org") {
+                                if prop_arr.len() >= 4 && prop_arr[0].as_str() == Some("org") {
                                     // org value can be a string or array
                                     if let Some(org_str) = prop_arr[3].as_str() {
                                         return Some(org_str.to_string());
@@ -190,8 +188,7 @@ impl RdapEntity {
                     if let Some(props) = arr[1].as_array() {
                         for prop in props {
                             if let Some(prop_arr) = prop.as_array() {
-                                if prop_arr.len() >= 4
-                                    && prop_arr[0].as_str() == Some("email") {
+                                if prop_arr.len() >= 4 && prop_arr[0].as_str() == Some("email") {
                                     return prop_arr[3].as_str().map(String::from);
                                 }
                             }
@@ -210,15 +207,16 @@ impl RdapEntity {
                     if let Some(props) = arr[1].as_array() {
                         for prop in props {
                             if let Some(prop_arr) = prop.as_array() {
-                                if prop_arr.len() >= 4
-                                    && prop_arr[0].as_str() == Some("tel") {
+                                if prop_arr.len() >= 4 && prop_arr[0].as_str() == Some("tel") {
                                     if let Some(phone) = prop_arr[3].as_str() {
                                         return Some(phone.to_string());
                                     } else if let Some(phone_obj) = prop_arr[3].as_object() {
                                         // Sometimes phone is {"uri": "tel:+1234567890"}
                                         if let Some(uri) = phone_obj.get("uri") {
                                             if let Some(uri_str) = uri.as_str() {
-                                                return Some(uri_str.trim_start_matches("tel:").to_string());
+                                                return Some(
+                                                    uri_str.trim_start_matches("tel:").to_string(),
+                                                );
                                             }
                                         }
                                     }
@@ -239,8 +237,7 @@ impl RdapEntity {
                     if let Some(props) = arr[1].as_array() {
                         for prop in props {
                             if let Some(prop_arr) = prop.as_array() {
-                                if prop_arr.len() >= 4
-                                    && prop_arr[0].as_str() == Some("adr") {
+                                if prop_arr.len() >= 4 && prop_arr[0].as_str() == Some("adr") {
                                     // adr is usually an array: [pobox, ext, street, city, state, postal, country]
                                     if let Some(adr_arr) = prop_arr[3].as_array() {
                                         let parts: Vec<String> = adr_arr
@@ -271,8 +268,7 @@ impl RdapEntity {
                         for prop in props {
                             if let Some(prop_arr) = prop.as_array() {
                                 // Check for country in adr field (index 6)
-                                if prop_arr.len() >= 4
-                                    && prop_arr[0].as_str() == Some("adr") {
+                                if prop_arr.len() >= 4 && prop_arr[0].as_str() == Some("adr") {
                                     if let Some(adr_arr) = prop_arr[3].as_array() {
                                         if let Some(country) = adr_arr.get(6) {
                                             if let Some(country_str) = country.as_str() {
@@ -457,7 +453,9 @@ impl RdapResponse {
     pub fn last_updated(&self) -> Option<DateTime<Utc>> {
         self.events
             .iter()
-            .find(|e| e.event_action == "last changed" || e.event_action == "last update of RDAP database")
+            .find(|e| {
+                e.event_action == "last changed" || e.event_action == "last update of RDAP database"
+            })
             .and_then(|e| e.parsed_date())
     }
 

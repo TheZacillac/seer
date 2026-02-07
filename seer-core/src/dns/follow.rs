@@ -181,20 +181,15 @@ impl DnsFollower {
             let iteration_num = i + 1;
 
             // Perform DNS lookup
-            let (records, error) = match self
-                .resolver
-                .resolve(domain, record_type, nameserver)
-                .await
-            {
-                Ok(records) => (records, None),
-                Err(e) => (Vec::new(), Some(e.to_string())),
-            };
+            let (records, error) =
+                match self.resolver.resolve(domain, record_type, nameserver).await {
+                    Ok(records) => (records, None),
+                    Err(e) => (Vec::new(), Some(e.to_string())),
+                };
 
             // Extract record values for comparison
-            let current_values: HashSet<String> = records
-                .iter()
-                .map(|r| r.data.to_string())
-                .collect();
+            let current_values: HashSet<String> =
+                records.iter().map(|r| r.data.to_string()).collect();
 
             // Compare with previous iteration
             let (changed, added, removed) = if i == 0 {

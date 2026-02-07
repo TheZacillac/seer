@@ -6,7 +6,7 @@ use tracing::{debug, warn};
 
 use crate::error::{Result, SeerError};
 use crate::rdap::{RdapClient, RdapResponse};
-use crate::whois::{WhoisClient, WhoisResponse, get_registry_url, get_tld};
+use crate::whois::{get_registry_url, get_tld, WhoisClient, WhoisResponse};
 
 /// Progress callback for smart lookup operations.
 /// Called with a message describing the current phase of the lookup.
@@ -38,11 +38,12 @@ impl LookupResult {
     /// Returns the registrar name, preferring RDAP data with WHOIS fallback.
     pub fn registrar(&self) -> Option<String> {
         match self {
-            LookupResult::Rdap { data, whois_fallback } => {
-                data.get_registrar().or_else(|| {
-                    whois_fallback.as_ref().and_then(|w| w.registrar.clone())
-                })
-            }
+            LookupResult::Rdap {
+                data,
+                whois_fallback,
+            } => data
+                .get_registrar()
+                .or_else(|| whois_fallback.as_ref().and_then(|w| w.registrar.clone())),
             LookupResult::Whois { data, .. } => data.registrar.clone(),
         }
     }
@@ -50,11 +51,12 @@ impl LookupResult {
     /// Returns the registrant organization, preferring RDAP data with WHOIS fallback.
     pub fn organization(&self) -> Option<String> {
         match self {
-            LookupResult::Rdap { data, whois_fallback } => {
-                data.get_registrant_organization().or_else(|| {
-                    whois_fallback.as_ref().and_then(|w| w.organization.clone())
-                })
-            }
+            LookupResult::Rdap {
+                data,
+                whois_fallback,
+            } => data
+                .get_registrant_organization()
+                .or_else(|| whois_fallback.as_ref().and_then(|w| w.organization.clone())),
             LookupResult::Whois { data, .. } => data.organization.clone(),
         }
     }
@@ -72,7 +74,10 @@ impl LookupResult {
     /// Returns the expiration date and registrar info from the lookup result.
     pub fn expiration_info(&self) -> (Option<DateTime<Utc>>, Option<String>) {
         match self {
-            LookupResult::Rdap { data, whois_fallback } => {
+            LookupResult::Rdap {
+                data,
+                whois_fallback,
+            } => {
                 // Try to get expiration from RDAP events
                 let expiration_date = data
                     .events
@@ -84,15 +89,13 @@ impl LookupResult {
                         whois_fallback.as_ref().and_then(|w| w.expiration_date)
                     });
 
-                let registrar = data.get_registrar().or_else(|| {
-                    whois_fallback.as_ref().and_then(|w| w.registrar.clone())
-                });
+                let registrar = data
+                    .get_registrar()
+                    .or_else(|| whois_fallback.as_ref().and_then(|w| w.registrar.clone()));
 
                 (expiration_date, registrar)
             }
-            LookupResult::Whois { data, .. } => {
-                (data.expiration_date, data.registrar.clone())
-            }
+            LookupResult::Whois { data, .. } => (data.expiration_date, data.registrar.clone()),
         }
     }
 }
@@ -188,7 +191,8 @@ impl SmartLookup {
                     if let Some(ref cb) = progress {
                         cb("RDAP not available (trying WHOIS)");
                     }
-                    self.fallback_to_whois(domain, Some("RDAP response incomplete")).await
+                    self.fallback_to_whois(domain, Some("RDAP response incomplete"))
+                        .await
                 }
             }
             Err(e) => {
@@ -209,12 +213,10 @@ impl SmartLookup {
         debug!(domain = %domain, "Attempting WHOIS lookup first");
 
         match self.whois_client.lookup(domain).await {
-            Ok(whois_data) => {
-                Ok(LookupResult::Whois {
-                    data: whois_data,
-                    rdap_error: None,
-                })
-            }
+            Ok(whois_data) => Ok(LookupResult::Whois {
+                data: whois_data,
+                rdap_error: None,
+            }),
             Err(e) => {
                 warn!(error = %e, "WHOIS lookup failed, trying RDAP");
                 if let Some(ref cb) = progress {
@@ -230,7 +232,11 @@ impl SmartLookup {
         }
     }
 
-    async fn fallback_to_whois(&self, domain: &str, rdap_error: Option<&str>) -> Result<LookupResult> {
+    async fn fallback_to_whois(
+        &self,
+        domain: &str,
+        rdap_error: Option<&str>,
+    ) -> Result<LookupResult> {
         match self.whois_client.lookup(domain).await {
             Ok(whois_data) => Ok(LookupResult::Whois {
                 data: whois_data,
@@ -239,8 +245,9 @@ impl SmartLookup {
             Err(whois_err) => {
                 // Both RDAP and WHOIS failed - provide helpful error with registry suggestion
                 let tld = get_tld(domain).unwrap_or("unknown");
-                let registry_url = get_registry_url(tld)
-                    .unwrap_or_else(|| format!("https://www.iana.org/domains/root/db/{}.html", tld));
+                let registry_url = get_registry_url(tld).unwrap_or_else(|| {
+                    format!("https://www.iana.org/domains/root/db/{}.html", tld)
+                });
 
                 let details = match rdap_error {
                     Some(rdap_err) => format!(
@@ -262,9 +269,10 @@ impl SmartLookup {
     fn is_rdap_response_useful(&self, response: &RdapResponse) -> bool {
         // Check if we have at least some meaningful data
         let has_name = response.ldh_name.is_some() || response.unicode_name.is_some();
-        let has_dates = response.events.iter().any(|e| {
-            e.event_action == "registration" || e.event_action == "expiration"
-        });
+        let has_dates = response
+            .events
+            .iter()
+            .any(|e| e.event_action == "registration" || e.event_action == "expiration");
         let has_entities = !response.entities.is_empty();
         let has_nameservers = !response.nameservers.is_empty();
         let has_status = !response.status.is_empty();

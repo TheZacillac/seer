@@ -27,7 +27,8 @@ impl JsonFormatter {
 
     fn to_json<T: serde::Serialize + ?Sized>(&self, value: &T) -> String {
         if self.pretty {
-            serde_json::to_string_pretty(value).unwrap_or_else(|e| format!("{{\"error\": \"{}\"}}", e))
+            serde_json::to_string_pretty(value)
+                .unwrap_or_else(|e| format!("{{\"error\": \"{}\"}}", e))
         } else {
             serde_json::to_string(value).unwrap_or_else(|e| format!("{{\"error\": \"{}\"}}", e))
         }
