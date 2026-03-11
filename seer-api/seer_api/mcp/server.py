@@ -1,6 +1,8 @@
 """MCP server implementation for Seer domain utilities."""
 
+import asyncio
 import json
+import logging
 from typing import Any
 
 from mcp.server import Server
@@ -9,7 +11,41 @@ from mcp.types import Tool, TextContent
 
 import seer
 
+logger = logging.getLogger(__name__)
+
 mcp = Server("seer")
+
+MAX_BULK_DOMAINS = 100
+MAX_CONCURRENCY = 50
+
+
+def _require_str(arguments: dict[str, Any], key: str) -> str:
+    """Extract and validate a required string argument."""
+    value = arguments.get(key)
+    if not value or not isinstance(value, str):
+        raise ValueError(f"Required argument '{key}' is missing or empty")
+    return value
+
+
+def _require_domains(arguments: dict[str, Any]) -> list[str]:
+    """Extract and validate a required domains list."""
+    domains = arguments.get("domains")
+    if not isinstance(domains, list) or len(domains) == 0:
+        raise ValueError("'domains' must be a non-empty list")
+    if len(domains) > MAX_BULK_DOMAINS:
+        raise ValueError(f"'domains' list exceeds maximum of {MAX_BULK_DOMAINS}")
+    for d in domains:
+        if not isinstance(d, str) or not d.strip():
+            raise ValueError("Each domain must be a non-empty string")
+    return domains
+
+
+def _get_concurrency(arguments: dict[str, Any], default: int = 10) -> int:
+    """Extract and validate an optional concurrency argument."""
+    concurrency = arguments.get("concurrency", default)
+    if not isinstance(concurrency, int) or concurrency < 1:
+        raise ValueError("'concurrency' must be a positive integer")
+    return min(concurrency, MAX_CONCURRENCY)
 
 
 @mcp.list_tools()
@@ -81,6 +117,8 @@ async def list_tools() -> list[Tool]:
                     "asn": {
                         "type": "integer",
                         "description": "AS number (e.g., 15169 for Google)",
+                        "minimum": 0,
+                        "maximum": 4294967295,
                     },
                 },
                 "required": ["asn"],
@@ -129,6 +167,20 @@ async def list_tools() -> list[Tool]:
             },
         ),
         Tool(
+            name="seer_status",
+            description="Check the health status of a domain including HTTP accessibility, SSL certificate validity, and domain expiration.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "domain": {
+                        "type": "string",
+                        "description": "Domain name to check (e.g., 'example.com')",
+                    },
+                },
+                "required": ["domain"],
+            },
+        ),
+        Tool(
             name="seer_bulk_lookup",
             description="Smart lookup for multiple domains at once (tries RDAP first, falls back to WHOIS). Efficient for checking many domains.",
             inputSchema={
@@ -138,11 +190,14 @@ async def list_tools() -> list[Tool]:
                         "type": "array",
                         "items": {"type": "string"},
                         "description": "List of domain names to look up",
+                        "maxItems": MAX_BULK_DOMAINS,
                     },
                     "concurrency": {
                         "type": "integer",
-                        "description": "Number of concurrent requests (default: 10)",
+                        "description": f"Number of concurrent requests (default: 10, max: {MAX_CONCURRENCY})",
                         "default": 10,
+                        "minimum": 1,
+                        "maximum": MAX_CONCURRENCY,
                     },
                 },
                 "required": ["domains"],
@@ -158,11 +213,14 @@ async def list_tools() -> list[Tool]:
                         "type": "array",
                         "items": {"type": "string"},
                         "description": "List of domain names to look up",
+                        "maxItems": MAX_BULK_DOMAINS,
                     },
                     "concurrency": {
                         "type": "integer",
-                        "description": "Number of concurrent requests (default: 10)",
+                        "description": f"Number of concurrent requests (default: 10, max: {MAX_CONCURRENCY})",
                         "default": 10,
+                        "minimum": 1,
+                        "maximum": MAX_CONCURRENCY,
                     },
                 },
                 "required": ["domains"],
@@ -178,6 +236,7 @@ async def list_tools() -> list[Tool]:
                         "type": "array",
                         "items": {"type": "string"},
                         "description": "List of domain names to query",
+                        "maxItems": MAX_BULK_DOMAINS,
                     },
                     "record_type": {
                         "type": "string",
@@ -186,25 +245,13 @@ async def list_tools() -> list[Tool]:
                     },
                     "concurrency": {
                         "type": "integer",
-                        "description": "Number of concurrent requests (default: 10)",
+                        "description": f"Number of concurrent requests (default: 10, max: {MAX_CONCURRENCY})",
                         "default": 10,
+                        "minimum": 1,
+                        "maximum": MAX_CONCURRENCY,
                     },
                 },
                 "required": ["domains"],
-            },
-        ),
-        Tool(
-            name="seer_status",
-            description="Check the health status of a domain including HTTP accessibility, SSL certificate validity, and domain expiration.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "domain": {
-                        "type": "string",
-                        "description": "Domain name to check (e.g., 'example.com')",
-                    },
-                },
-                "required": ["domain"],
             },
         ),
         Tool(
@@ -217,11 +264,14 @@ async def list_tools() -> list[Tool]:
                         "type": "array",
                         "items": {"type": "string"},
                         "description": "List of domain names to check",
+                        "maxItems": MAX_BULK_DOMAINS,
                     },
                     "concurrency": {
                         "type": "integer",
-                        "description": "Number of concurrent requests (default: 10)",
+                        "description": f"Number of concurrent requests (default: 10, max: {MAX_CONCURRENCY})",
                         "default": 10,
+                        "minimum": 1,
+                        "maximum": MAX_CONCURRENCY,
                     },
                 },
                 "required": ["domains"],
@@ -237,6 +287,7 @@ async def list_tools() -> list[Tool]:
                         "type": "array",
                         "items": {"type": "string"},
                         "description": "List of domain names to check",
+                        "maxItems": MAX_BULK_DOMAINS,
                     },
                     "record_type": {
                         "type": "string",
@@ -245,8 +296,10 @@ async def list_tools() -> list[Tool]:
                     },
                     "concurrency": {
                         "type": "integer",
-                        "description": "Number of concurrent requests (default: 5)",
+                        "description": f"Number of concurrent requests (default: 5, max: {MAX_CONCURRENCY})",
                         "default": 5,
+                        "minimum": 1,
+                        "maximum": MAX_CONCURRENCY,
                     },
                 },
                 "required": ["domains"],
@@ -261,74 +314,94 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
     try:
         result = await execute_tool(name, arguments)
         return [TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
+    except ValueError as e:
+        return [TextContent(type="text", text=f"Invalid input: {e}")]
     except Exception as e:
-        return [TextContent(type="text", text=f"Error: {str(e)}")]
+        logger.exception("Tool %s failed", name)
+        return [TextContent(type="text", text="An internal error occurred while processing your request.")]
 
 
 async def execute_tool(name: str, arguments: dict[str, Any]) -> Any:
     """Execute the appropriate Seer function based on tool name."""
+    loop = asyncio.get_event_loop()
+
     match name:
         case "seer_lookup":
-            return seer.lookup(arguments["domain"])
+            domain = _require_str(arguments, "domain")
+            return await loop.run_in_executor(None, seer.lookup, domain)
 
         case "seer_whois":
-            return seer.whois(arguments["domain"])
+            domain = _require_str(arguments, "domain")
+            return await loop.run_in_executor(None, seer.whois, domain)
 
         case "seer_rdap_domain":
-            return seer.rdap_domain(arguments["domain"])
+            domain = _require_str(arguments, "domain")
+            return await loop.run_in_executor(None, seer.rdap_domain, domain)
 
         case "seer_rdap_ip":
-            return seer.rdap_ip(arguments["ip"])
+            ip = _require_str(arguments, "ip")
+            return await loop.run_in_executor(None, seer.rdap_ip, ip)
 
         case "seer_rdap_asn":
-            return seer.rdap_asn(arguments["asn"])
+            asn = arguments.get("asn")
+            if not isinstance(asn, int) or asn < 0 or asn > 4294967295:
+                raise ValueError(f"'asn' must be an integer between 0 and 4294967295 (got {asn!r})")
+            return await loop.run_in_executor(None, seer.rdap_asn, asn)
 
         case "seer_dig":
-            return seer.dig(
-                arguments["domain"],
-                arguments.get("record_type", "A"),
-                arguments.get("nameserver"),
+            domain = _require_str(arguments, "domain")
+            record_type = arguments.get("record_type", "A")
+            nameserver = arguments.get("nameserver")
+            return await loop.run_in_executor(
+                None, seer.dig, domain, record_type, nameserver
             )
 
         case "seer_propagation":
-            return seer.propagation(
-                arguments["domain"],
-                arguments.get("record_type", "A"),
-            )
-
-        case "seer_bulk_lookup":
-            return seer.bulk_lookup(
-                arguments["domains"],
-                arguments.get("concurrency", 10),
-            )
-
-        case "seer_bulk_whois":
-            return seer.bulk_whois(
-                arguments["domains"],
-                arguments.get("concurrency", 10),
-            )
-
-        case "seer_bulk_dig":
-            return seer.bulk_dig(
-                arguments["domains"],
-                arguments.get("record_type", "A"),
-                arguments.get("concurrency", 10),
+            domain = _require_str(arguments, "domain")
+            record_type = arguments.get("record_type", "A")
+            return await loop.run_in_executor(
+                None, seer.propagation, domain, record_type
             )
 
         case "seer_status":
-            return seer.status(arguments["domain"])
+            domain = _require_str(arguments, "domain")
+            return await loop.run_in_executor(None, seer.status, domain)
+
+        case "seer_bulk_lookup":
+            domains = _require_domains(arguments)
+            concurrency = _get_concurrency(arguments, default=10)
+            return await loop.run_in_executor(
+                None, seer.bulk_lookup, domains, concurrency
+            )
+
+        case "seer_bulk_whois":
+            domains = _require_domains(arguments)
+            concurrency = _get_concurrency(arguments, default=10)
+            return await loop.run_in_executor(
+                None, seer.bulk_whois, domains, concurrency
+            )
+
+        case "seer_bulk_dig":
+            domains = _require_domains(arguments)
+            record_type = arguments.get("record_type", "A")
+            concurrency = _get_concurrency(arguments, default=10)
+            return await loop.run_in_executor(
+                None, seer.bulk_dig, domains, record_type, concurrency
+            )
 
         case "seer_bulk_status":
-            return seer.bulk_status(
-                arguments["domains"],
-                arguments.get("concurrency", 10),
+            domains = _require_domains(arguments)
+            concurrency = _get_concurrency(arguments, default=10)
+            return await loop.run_in_executor(
+                None, seer.bulk_status, domains, concurrency
             )
 
         case "seer_bulk_propagation":
-            return seer.bulk_propagation(
-                arguments["domains"],
-                arguments.get("record_type", "A"),
-                arguments.get("concurrency", 5),
+            domains = _require_domains(arguments)
+            record_type = arguments.get("record_type", "A")
+            concurrency = _get_concurrency(arguments, default=5)
+            return await loop.run_in_executor(
+                None, seer.bulk_propagation, domains, record_type, concurrency
             )
 
         case _:
@@ -343,8 +416,6 @@ async def main():
 
 def run():
     """Entry point for the MCP server."""
-    import asyncio
-
     asyncio.run(main())
 
 

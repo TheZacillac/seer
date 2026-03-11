@@ -25,15 +25,19 @@ Example usage:
 """
 
 from seer._seer import (
+    lookup,
     whois,
     rdap_domain,
     rdap_ip,
     rdap_asn,
     dig,
     propagation,
+    status,
+    bulk_lookup,
     bulk_whois,
     bulk_dig,
     bulk_propagation,
+    bulk_status,
 )
 
 try:
@@ -42,15 +46,19 @@ try:
 except Exception:
     __version__ = "unknown"
 __all__ = [
+    "lookup",
     "whois",
     "rdap_domain",
     "rdap_ip",
     "rdap_asn",
     "dig",
     "propagation",
+    "status",
+    "bulk_lookup",
     "bulk_whois",
     "bulk_dig",
     "bulk_propagation",
+    "bulk_status",
 ]
 
 

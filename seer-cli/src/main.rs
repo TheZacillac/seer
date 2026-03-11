@@ -449,7 +449,10 @@ async fn execute_command(
                     };
                     // In raw mode, \n alone doesn't return to column 0, so use \r\n
                     let output = output.replace('\n', "\r\n");
-                    println!("{}\r", output);
+                    let mut stdout = std::io::stdout().lock();
+                    let _ = stdout.write_all(output.as_bytes());
+                    let _ = stdout.write_all(b"\r\n");
+                    let _ = stdout.flush();
                 });
 
             // In raw mode, use \r\n for proper line breaks

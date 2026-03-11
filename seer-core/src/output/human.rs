@@ -1323,6 +1323,13 @@ impl OutputFormatter for HumanFormatter {
             format!(" ({})", self.success("unchanged"))
         };
 
+        // Collect record values, trimming trailing dots
+        let values: Vec<String> = iteration
+            .records
+            .iter()
+            .map(|r| r.data.to_string().trim_end_matches('.').to_string())
+            .collect();
+
         output.push(format!(
             "[{}] {}: {} record(s){}",
             self.label(&time_str),
@@ -1331,23 +1338,22 @@ impl OutputFormatter for HumanFormatter {
             status
         ));
 
-        // Show records (each on its own line, trailing dots removed)
-        for record in &iteration.records {
-            let value = record.data.to_string().trim_end_matches('.').to_string();
-            output.push(format!("    {}", self.value(&value)));
+        // Show records comma-separated on a single indented line
+        if !values.is_empty() {
+            output.push(format!("  {}", self.value(&values.join(", "))));
         }
 
         // Show changes if any
         if !iteration.added.is_empty() {
             for added in &iteration.added {
                 let value = added.trim_end_matches('.');
-                output.push(format!("    {} {}", self.success("+"), self.success(value)));
+                output.push(format!("  {} {}", self.success("+"), self.success(value)));
             }
         }
         if !iteration.removed.is_empty() {
             for removed in &iteration.removed {
                 let value = removed.trim_end_matches('.');
-                output.push(format!("    {} {}", self.error("-"), self.error(value)));
+                output.push(format!("  {} {}", self.error("-"), self.error(value)));
             }
         }
 

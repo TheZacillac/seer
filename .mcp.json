@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "seer": {
+      "command": "uvx",
+      "args": [
+        "--from", "/home/zac/Projects/seer/seer-api",
+        "--with", "/home/zac/Projects/seer/seer-py",
+        "seer-mcp"
+      ]
+    }
+  }
+}
