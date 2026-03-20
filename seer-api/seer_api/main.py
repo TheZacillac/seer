@@ -115,12 +115,14 @@ async def root():
 
 
 @app.get("/health")
+@limiter.exempt
 async def health():
     """Health check endpoint."""
     return {"status": "healthy"}
 
 
 @app.get("/metrics")
+@limiter.exempt
 async def get_metrics():
     """Request metrics endpoint for observability."""
     return metrics.snapshot()

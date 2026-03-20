@@ -183,7 +183,14 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
-    let output_format: seer_core::output::OutputFormat = cli.format.parse().unwrap_or_default();
+    // Use config file default when --format is not explicitly provided
+    let output_format: seer_core::output::OutputFormat = if cli.format == "human" {
+        // Could be explicit or default; check config for a different preference
+        let config = seer_core::SeerConfig::load();
+        config.output_format.parse().unwrap_or_default()
+    } else {
+        cli.format.parse().unwrap_or_default()
+    };
 
     match cli.command {
         Some(cmd) => execute_command(cmd, output_format).await,
@@ -424,8 +431,8 @@ async fn execute_command(
         Commands::Avail { domain } => {
             let checker = seer_core::AvailabilityChecker::new();
             match checker.check(&domain).await {
-                Ok(result) => {
-                    if matches!(output_format, seer_core::output::OutputFormat::Human) {
+                Ok(result) => match output_format {
+                    seer_core::output::OutputFormat::Human => {
                         let status = if result.available {
                             "AVAILABLE".ctp_green()
                         } else {
@@ -437,11 +444,18 @@ async fn execute_command(
                         if let Some(details) = &result.details {
                             println!("  Details: {}", details);
                         }
-                    } else {
-                        let json = serde_json::to_string_pretty(&result).unwrap_or_default();
-                        println!("{}", json);
                     }
-                }
+                    seer_core::output::OutputFormat::Json => {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&result).unwrap_or_default()
+                        );
+                    }
+                    seer_core::output::OutputFormat::Yaml => {
+                        let yaml = seer_core::output::YamlFormatter::new();
+                        println!("{}", yaml.to_yaml_value(&result));
+                    }
+                },
                 Err(e) => {
                     eprintln!("{} {}", "Error:".ctp_red(), e);
                     std::process::exit(1);
@@ -451,8 +465,8 @@ async fn execute_command(
         Commands::Dnssec { domain } => {
             let checker = seer_core::DnssecChecker::new();
             match checker.check(&domain).await {
-                Ok(report) => {
-                    if matches!(output_format, seer_core::output::OutputFormat::Human) {
+                Ok(report) => match output_format {
+                    seer_core::output::OutputFormat::Human => {
                         println!("DNSSEC Report for {}", report.domain.ctp_green());
                         println!();
                         let status_colored = match report.status.as_str() {
@@ -497,16 +511,23 @@ async fn execute_command(
                         }
                         if !report.issues.is_empty() {
                             println!();
-                            println!("  {} Issues:", "⚠".ctp_yellow());
+                            println!("  Issues:");
                             for issue in &report.issues {
                                 println!("    - {}", issue);
                             }
                         }
-                    } else {
-                        let json = serde_json::to_string_pretty(&report).unwrap_or_default();
-                        println!("{}", json);
                     }
-                }
+                    seer_core::output::OutputFormat::Json => {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&report).unwrap_or_default()
+                        );
+                    }
+                    seer_core::output::OutputFormat::Yaml => {
+                        let yaml = seer_core::output::YamlFormatter::new();
+                        println!("{}", yaml.to_yaml_value(&report));
+                    }
+                },
                 Err(e) => {
                     eprintln!("{} {}", "Error:".ctp_red(), e);
                     std::process::exit(1);

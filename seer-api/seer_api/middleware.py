@@ -6,7 +6,6 @@ import logging
 import time
 import uuid
 from collections import defaultdict
-from threading import Lock
 
 from fastapi import Request, Response
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
@@ -15,10 +14,14 @@ logger = logging.getLogger("seer_api")
 
 
 class RequestMetrics:
-    """Thread-safe request metrics collector."""
+    """Request metrics collector.
+
+    Safe for single-threaded async use (uvicorn default). For multi-worker
+    deployments each worker maintains its own counters; use an external
+    metrics backend (Prometheus, StatsD) for aggregated metrics.
+    """
 
     def __init__(self):
-        self._lock = Lock()
         self._total_requests = 0
         self._total_errors = 0
         self._status_counts: dict[int, int] = defaultdict(int)
@@ -26,28 +29,26 @@ class RequestMetrics:
         self._total_latency_ms = 0.0
 
     def record(self, path: str, status_code: int, latency_ms: float):
-        with self._lock:
-            self._total_requests += 1
-            self._status_counts[status_code] += 1
-            self._endpoint_counts[path] += 1
-            self._total_latency_ms += latency_ms
-            if status_code >= 400:
-                self._total_errors += 1
+        self._total_requests += 1
+        self._status_counts[status_code] += 1
+        self._endpoint_counts[path] += 1
+        self._total_latency_ms += latency_ms
+        if status_code >= 400:
+            self._total_errors += 1
 
     def snapshot(self) -> dict:
-        with self._lock:
-            avg_latency = (
-                self._total_latency_ms / self._total_requests
-                if self._total_requests > 0
-                else 0
-            )
-            return {
-                "total_requests": self._total_requests,
-                "total_errors": self._total_errors,
-                "avg_latency_ms": round(avg_latency, 2),
-                "status_codes": dict(self._status_counts),
-                "endpoints": dict(self._endpoint_counts),
-            }
+        avg_latency = (
+            self._total_latency_ms / self._total_requests
+            if self._total_requests > 0
+            else 0
+        )
+        return {
+            "total_requests": self._total_requests,
+            "total_errors": self._total_errors,
+            "avg_latency_ms": round(avg_latency, 2),
+            "status_codes": dict(self._status_counts),
+            "endpoints": dict(self._endpoint_counts),
+        }
 
 
 # Global metrics instance

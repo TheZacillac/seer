@@ -50,7 +50,8 @@ impl YamlFormatter {
         Self
     }
 
-    fn to_yaml<T: serde::Serialize + ?Sized>(&self, value: &T) -> String {
+    /// Formats any serializable value as YAML output.
+    pub fn to_yaml_value<T: serde::Serialize + ?Sized>(&self, value: &T) -> String {
         // Convert to JSON value first, then format as YAML-like output
         match serde_json::to_value(value) {
             Ok(v) => format_as_yaml(&v, 0),
@@ -67,28 +68,28 @@ impl Default for YamlFormatter {
 
 impl OutputFormatter for YamlFormatter {
     fn format_whois(&self, response: &crate::whois::WhoisResponse) -> String {
-        self.to_yaml(response)
+        self.to_yaml_value(response)
     }
     fn format_rdap(&self, response: &crate::rdap::RdapResponse) -> String {
-        self.to_yaml(response)
+        self.to_yaml_value(response)
     }
     fn format_dns(&self, records: &[crate::dns::DnsRecord]) -> String {
-        self.to_yaml(records)
+        self.to_yaml_value(records)
     }
     fn format_propagation(&self, result: &crate::dns::PropagationResult) -> String {
-        self.to_yaml(result)
+        self.to_yaml_value(result)
     }
     fn format_lookup(&self, result: &crate::lookup::LookupResult) -> String {
-        self.to_yaml(result)
+        self.to_yaml_value(result)
     }
     fn format_status(&self, response: &crate::status::StatusResponse) -> String {
-        self.to_yaml(response)
+        self.to_yaml_value(response)
     }
     fn format_follow_iteration(&self, iteration: &crate::dns::FollowIteration) -> String {
-        self.to_yaml(iteration)
+        self.to_yaml_value(iteration)
     }
     fn format_follow(&self, result: &crate::dns::FollowResult) -> String {
-        self.to_yaml(result)
+        self.to_yaml_value(result)
     }
 }
 

@@ -1,10 +1,10 @@
-pub mod dnssec;
+mod dnssec;
 mod follow;
 mod propagation;
 mod records;
 mod resolver;
 
-pub use dnssec::{DnssecChecker, DnssecReport};
+pub use dnssec::{DnskeyInfo, DnssecChecker, DnssecReport, DsInfo};
 pub use follow::{
     DnsFollower, FollowConfig, FollowIteration, FollowProgressCallback, FollowResult,
 };

@@ -132,17 +132,24 @@ impl DnssecChecker {
                     ref public_key,
                 } = r.data
                 {
-                    let is_ksk = flags & 0x0001 != 0; // SEP flag (bit 15)
-                    let is_zsk = flags & 0x0100 != 0; // Zone flag (bit 7)
+                    let is_sep = flags & 0x0001 != 0; // SEP flag (bit 15)
+                    let is_zone = flags & 0x0100 != 0; // Zone flag (bit 7)
+                    let is_ksk = is_sep && is_zone;
+                    let is_zsk = is_zone && !is_sep;
+                    let key_tag_hint = if public_key.len() > 12 {
+                        format!(
+                            "{}...{}",
+                            &public_key[..8],
+                            &public_key[public_key.len() - 4..]
+                        )
+                    } else {
+                        public_key.clone()
+                    };
                     Some(DnskeyInfo {
                         flags,
                         protocol,
                         algorithm,
-                        key_tag_hint: format!(
-                            "{}...{}",
-                            &public_key[..8.min(public_key.len())],
-                            &public_key[public_key.len().saturating_sub(4)..]
-                        ),
+                        key_tag_hint,
                         is_ksk,
                         is_zsk,
                         algorithm_name: algorithm_name(algorithm),

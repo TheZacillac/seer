@@ -80,8 +80,8 @@ impl AvailabilityChecker {
                     )),
                 })
             }
-            Err(_rdap_err) => {
-                // RDAP failed - try WHOIS
+            Err(rdap_err) => {
+                debug!(error = %rdap_err, "RDAP lookup failed, falling back to WHOIS");
                 match self.whois_client.lookup(&domain).await {
                     Ok(whois_response) => {
                         if whois_response.is_available() {
