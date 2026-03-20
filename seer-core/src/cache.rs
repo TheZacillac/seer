@@ -506,21 +506,22 @@ mod tests {
 
     #[test]
     fn test_needs_refresh() {
-        // TTL of 100ms, staleness at 75ms
-        let cache: TtlCache<String, String> = TtlCache::new(Duration::from_millis(100));
+        // TTL of 1000ms, staleness at 750ms
+        // Use large TTL to avoid flaky timing on slow CI runners
+        let cache: TtlCache<String, String> = TtlCache::new(Duration::from_millis(1000));
 
         cache.insert("key".to_string(), "value".to_string());
 
         // Initially not stale
         assert!(!cache.needs_refresh(&"key".to_string()));
 
-        // Wait until stale (75% of TTL)
-        std::thread::sleep(Duration::from_millis(80));
+        // Wait until stale (past 75% of TTL = 750ms)
+        std::thread::sleep(Duration::from_millis(800));
 
         // Now should be stale
         assert!(cache.needs_refresh(&"key".to_string()));
 
-        // But still valid (not expired)
+        // But still valid (not expired) — 200ms of headroom
         assert!(cache.get(&"key".to_string()).is_some());
     }
 }
