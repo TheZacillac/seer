@@ -151,7 +151,7 @@ seer-cli/src/
 **Key Points:**
 - Uses Clap v4 with derive macros
 - Defaults to REPL when no command provided
-- Supports `--format` flag (human/json)
+- Supports global `--format` flag (human/json) — must be placed before the subcommand
 - REPL history saved to `~/.seer_history`
 
 ### seer-py/ (Python Bindings)

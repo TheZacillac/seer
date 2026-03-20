@@ -272,8 +272,8 @@ seer bulk status domains.txt -o results.csv  # Export to CSV
 #### Output Formats
 
 ```bash
-seer lookup example.com --format human  # Human-readable (default)
-seer lookup example.com --format json   # JSON output
+seer --format human lookup example.com  # Human-readable (default)
+seer --format json lookup example.com   # JSON output
 ```
 
 #### Interactive REPL
