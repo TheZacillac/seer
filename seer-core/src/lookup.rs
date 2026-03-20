@@ -6,6 +6,7 @@ use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
+use crate::availability::{AvailabilityChecker, AvailabilityResult};
 use crate::cache::TtlCache;
 use crate::error::{Result, SeerError};
 use crate::rdap::{RdapClient, RdapResponse};
@@ -34,6 +35,11 @@ pub enum LookupResult {
         data: WhoisResponse,
         rdap_error: Option<String>,
     },
+    Available {
+        data: Box<AvailabilityResult>,
+        rdap_error: String,
+        whois_error: String,
+    },
 }
 
 impl LookupResult {
@@ -42,6 +48,7 @@ impl LookupResult {
         match self {
             LookupResult::Rdap { data, .. } => data.domain_name().map(String::from),
             LookupResult::Whois { data, .. } => Some(data.domain.clone()),
+            LookupResult::Available { data, .. } => Some(data.domain.clone()),
         }
     }
 
@@ -55,6 +62,7 @@ impl LookupResult {
                 .get_registrar()
                 .or_else(|| whois_fallback.as_ref().and_then(|w| w.registrar.clone())),
             LookupResult::Whois { data, .. } => data.registrar.clone(),
+            LookupResult::Available { .. } => None,
         }
     }
 
@@ -68,6 +76,7 @@ impl LookupResult {
                 .get_registrant_organization()
                 .or_else(|| whois_fallback.as_ref().and_then(|w| w.organization.clone())),
             LookupResult::Whois { data, .. } => data.organization.clone(),
+            LookupResult::Available { .. } => None,
         }
     }
 
@@ -79,6 +88,11 @@ impl LookupResult {
     /// Returns true if the result came from WHOIS.
     pub fn is_whois(&self) -> bool {
         matches!(self, LookupResult::Whois { .. })
+    }
+
+    /// Returns true if the result is an availability check fallback.
+    pub fn is_available(&self) -> bool {
+        matches!(self, LookupResult::Available { .. })
     }
 
     /// Returns the expiration date and registrar info from the lookup result.
@@ -106,6 +120,7 @@ impl LookupResult {
                 (expiration_date, registrar)
             }
             LookupResult::Whois { data, .. } => (data.expiration_date, data.registrar.clone()),
+            LookupResult::Available { .. } => (None, None),
         }
     }
 }
@@ -114,7 +129,10 @@ impl LookupResult {
 pub struct SmartLookup {
     rdap_client: RdapClient,
     whois_client: WhoisClient,
+    availability_checker: AvailabilityChecker,
+    /// Deprecated: both protocols are now always attempted concurrently.
     prefer_rdap: bool,
+    /// Deprecated: WHOIS data is now always attached when available.
     include_fallback: bool,
 }
 
@@ -125,29 +143,34 @@ impl Default for SmartLookup {
 }
 
 impl SmartLookup {
-    /// Creates a new SmartLookup with default settings (RDAP-first with WHOIS fallback).
+    /// Creates a new SmartLookup that runs RDAP and WHOIS concurrently,
+    /// falling back to an availability check if both fail.
     pub fn new() -> Self {
         Self {
             rdap_client: RdapClient::new(),
             whois_client: WhoisClient::new(),
+            availability_checker: AvailabilityChecker::new(),
             prefer_rdap: true,
             include_fallback: false,
         }
     }
 
-    /// Sets whether to try RDAP first, falling back to WHOIS on failure.
+    /// Deprecated: both protocols are now always attempted concurrently.
+    /// This method is kept for API compatibility but has no effect.
     pub fn prefer_rdap(mut self, prefer: bool) -> Self {
         self.prefer_rdap = prefer;
         self
     }
 
-    /// Includes WHOIS data as fallback even when RDAP succeeds (for additional fields).
+    /// Deprecated: WHOIS data is now always attached when available.
+    /// This method is kept for API compatibility but has no effect.
     pub fn include_fallback(mut self, include: bool) -> Self {
         self.include_fallback = include;
         self
     }
 
-    /// Performs a smart lookup for a domain, trying RDAP first with WHOIS fallback.
+    /// Performs a smart lookup for a domain, trying both RDAP and WHOIS concurrently.
+    /// Falls back to an availability check if both fail.
     /// Results are cached for 5 minutes to avoid redundant network calls.
     pub async fn lookup(&self, domain: &str) -> Result<LookupResult> {
         self.lookup_with_progress(domain, None).await
@@ -169,11 +192,7 @@ impl SmartLookup {
             return Ok(cached);
         }
 
-        let result = if self.prefer_rdap {
-            self.lookup_rdap_first(domain, progress).await?
-        } else {
-            self.lookup_whois_first(domain, progress).await?
-        };
+        let result = self.lookup_concurrent(domain, progress).await?;
 
         // Cache the result
         LOOKUP_CACHE.insert(normalized, result.clone());
@@ -186,110 +205,111 @@ impl SmartLookup {
         LOOKUP_CACHE.clear();
     }
 
-    async fn lookup_rdap_first(
+    async fn lookup_concurrent(
         &self,
         domain: &str,
         progress: Option<LookupProgressCallback>,
     ) -> Result<LookupResult> {
-        debug!(domain = %domain, "Attempting RDAP lookup first");
+        debug!(domain = %domain, "Attempting RDAP and WHOIS concurrently");
 
-        match self.rdap_client.lookup_domain(domain).await {
-            Ok(rdap_data) => {
-                // Check if RDAP response has meaningful data
-                if self.is_rdap_response_useful(&rdap_data) {
-                    debug!("RDAP lookup successful");
-
-                    // Optionally fetch WHOIS for additional data
-                    let whois_fallback = if self.include_fallback {
-                        match self.whois_client.lookup(domain).await {
-                            Ok(whois) => Some(whois),
-                            Err(e) => {
-                                debug!(error = %e, "WHOIS fallback failed");
-                                None
-                            }
-                        }
-                    } else {
-                        None
-                    };
-
-                    Ok(LookupResult::Rdap {
-                        data: Box::new(rdap_data),
-                        whois_fallback,
-                    })
-                } else {
-                    debug!("RDAP response lacks useful data, falling back to WHOIS");
-                    if let Some(ref cb) = progress {
-                        cb("RDAP not available (trying WHOIS)");
-                    }
-                    self.fallback_to_whois(domain, Some("RDAP response incomplete"))
-                        .await
-                }
-            }
-            Err(e) => {
-                warn!(error = %e, "RDAP lookup failed, falling back to WHOIS");
-                if let Some(ref cb) = progress {
-                    cb("RDAP not available (trying WHOIS)");
-                }
-                self.fallback_to_whois(domain, Some(&e.to_string())).await
-            }
+        if let Some(ref cb) = progress {
+            cb("Querying RDAP and WHOIS concurrently");
         }
-    }
 
-    async fn lookup_whois_first(
-        &self,
-        domain: &str,
-        progress: Option<LookupProgressCallback>,
-    ) -> Result<LookupResult> {
-        debug!(domain = %domain, "Attempting WHOIS lookup first");
+        let (rdap_result, whois_result) = tokio::join!(
+            self.rdap_client.lookup_domain(domain),
+            self.whois_client.lookup(domain)
+        );
 
-        match self.whois_client.lookup(domain).await {
-            Ok(whois_data) => Ok(LookupResult::Whois {
-                data: whois_data,
-                rdap_error: None,
-            }),
-            Err(e) => {
-                warn!(error = %e, "WHOIS lookup failed, trying RDAP");
-                if let Some(ref cb) = progress {
-                    cb("WHOIS not available (trying RDAP)");
-                }
-                // Try RDAP as fallback
-                let rdap_data = self.rdap_client.lookup_domain(domain).await?;
-                Ok(LookupResult::Rdap {
+        // Phase 1: If RDAP returned useful data, use it as primary
+        if let Ok(rdap_data) = rdap_result {
+            if self.is_rdap_response_useful(&rdap_data) {
+                debug!("RDAP lookup successful");
+                let whois_fallback = whois_result.ok();
+                return Ok(LookupResult::Rdap {
                     data: Box::new(rdap_data),
-                    whois_fallback: None,
-                })
+                    whois_fallback,
+                });
             }
+
+            // RDAP succeeded but response wasn't useful — try WHOIS
+            if let Ok(whois_data) = whois_result {
+                debug!("RDAP response incomplete, using WHOIS result");
+                if let Some(ref cb) = progress {
+                    cb("RDAP response incomplete (using WHOIS)");
+                }
+                return Ok(LookupResult::Whois {
+                    data: whois_data,
+                    rdap_error: Some("RDAP response incomplete".to_string()),
+                });
+            }
+
+            // RDAP not useful, WHOIS also failed — availability fallback
+            let whois_error_str = whois_result.unwrap_err().to_string();
+            return self
+                .availability_fallback(
+                    domain,
+                    "RDAP response incomplete".to_string(),
+                    whois_error_str,
+                    progress,
+                )
+                .await;
         }
+
+        // Phase 2: RDAP failed — use WHOIS if it succeeded
+        let rdap_error_str = rdap_result.unwrap_err().to_string();
+
+        if let Ok(whois_data) = whois_result {
+            debug!("RDAP failed, using WHOIS result");
+            if let Some(ref cb) = progress {
+                cb("RDAP not available (using WHOIS)");
+            }
+            return Ok(LookupResult::Whois {
+                data: whois_data,
+                rdap_error: Some(rdap_error_str),
+            });
+        }
+
+        // Phase 3: Both failed — try availability check as last resort
+        let whois_error_str = whois_result.unwrap_err().to_string();
+        self.availability_fallback(domain, rdap_error_str, whois_error_str, progress)
+            .await
     }
 
-    async fn fallback_to_whois(
+    async fn availability_fallback(
         &self,
         domain: &str,
-        rdap_error: Option<&str>,
+        rdap_error: String,
+        whois_error: String,
+        progress: Option<LookupProgressCallback>,
     ) -> Result<LookupResult> {
-        match self.whois_client.lookup(domain).await {
-            Ok(whois_data) => Ok(LookupResult::Whois {
-                data: whois_data,
-                rdap_error: rdap_error.map(String::from),
+        if let Some(ref cb) = progress {
+            cb("RDAP and WHOIS unavailable (checking availability)");
+        }
+        warn!(
+            domain = %domain,
+            rdap_error = %rdap_error,
+            whois_error = %whois_error,
+            "Both RDAP and WHOIS failed, falling back to availability check"
+        );
+
+        match self.availability_checker.check(domain).await {
+            Ok(avail) => Ok(LookupResult::Available {
+                data: Box::new(avail),
+                rdap_error,
+                whois_error,
             }),
-            Err(whois_err) => {
-                // Both RDAP and WHOIS failed - provide helpful error with registry suggestion
+            Err(avail_err) => {
                 let tld = get_tld(domain).unwrap_or("unknown");
                 let registry_url = get_registry_url(tld).unwrap_or_else(|| {
                     format!("https://www.iana.org/domains/root/db/{}.html", tld)
                 });
-
-                let details = match rdap_error {
-                    Some(rdap_err) => format!(
-                        "RDAP failed ({}), WHOIS also failed ({})",
-                        rdap_err, whois_err
-                    ),
-                    None => format!("WHOIS lookup failed ({})", whois_err),
-                };
-
                 Err(SeerError::LookupFailed {
                     domain: domain.to_string(),
-                    details,
+                    details: format!(
+                        "RDAP failed ({}), WHOIS failed ({}), availability check failed ({})",
+                        rdap_error, whois_error, avail_err
+                    ),
                     registry_url,
                 })
             }
@@ -352,6 +372,7 @@ mod tests {
         assert_eq!(result.registrar(), Some("Test Registrar".to_string()));
         assert!(result.is_whois());
         assert!(!result.is_rdap());
+        assert!(!result.is_available());
     }
 
     #[test]
@@ -389,6 +410,33 @@ mod tests {
         let json = serde_json::to_string(&result).unwrap();
         assert!(json.contains("\"source\":\"whois\""));
         assert!(json.contains("RDAP failed"));
+    }
+
+    #[test]
+    fn test_lookup_result_available_serialization() {
+        let result = LookupResult::Available {
+            data: Box::new(AvailabilityResult {
+                domain: "test123.xyz".to_string(),
+                available: true,
+                confidence: "medium".to_string(),
+                method: "whois_error".to_string(),
+                details: Some("WHOIS server indicates no matching records".to_string()),
+            }),
+            rdap_error: "RDAP failed".to_string(),
+            whois_error: "WHOIS failed".to_string(),
+        };
+
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("\"source\":\"available\""));
+        assert!(json.contains("\"available\":true"));
+        assert!(json.contains("test123.xyz"));
+
+        assert_eq!(result.domain_name(), Some("test123.xyz".to_string()));
+        assert!(result.is_available());
+        assert!(!result.is_rdap());
+        assert!(!result.is_whois());
+        assert!(result.registrar().is_none());
+        assert_eq!(result.expiration_info(), (None, None));
     }
 
     #[test]

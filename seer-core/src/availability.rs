@@ -26,6 +26,7 @@ pub struct AvailabilityResult {
 }
 
 /// Checks domain availability by attempting lookups and interpreting failures.
+#[derive(Debug, Clone)]
 pub struct AvailabilityChecker {
     rdap_client: RdapClient,
     whois_client: WhoisClient,

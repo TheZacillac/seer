@@ -738,7 +738,11 @@ impl OutputFormatter for HumanFormatter {
         let domain = result
             .domain_name()
             .unwrap_or_else(|| "Unknown".to_string());
-        let source = if result.is_rdap() { "RDAP" } else { "WHOIS" };
+        let source = match result {
+            LookupResult::Rdap { .. } => "RDAP",
+            LookupResult::Whois { .. } => "WHOIS",
+            LookupResult::Available { .. } => "availability",
+        };
 
         output.push(self.header(&format!("Lookup: {} (via {})", domain, source)));
 
@@ -1125,6 +1129,57 @@ impl OutputFormatter for HumanFormatter {
                         self.value(dnssec)
                     ));
                 }
+            }
+            LookupResult::Available {
+                data,
+                rdap_error,
+                whois_error,
+            } => {
+                output.push(format!(
+                    "  {}: {}",
+                    self.label("Source"),
+                    self.warning("availability check (RDAP and WHOIS failed)")
+                ));
+
+                let avail_str = if data.available {
+                    self.success("AVAILABLE")
+                } else {
+                    self.error("TAKEN")
+                };
+                output.push(format!("  {}: {}", self.label("Availability"), avail_str));
+
+                let confidence_colored = match data.confidence.as_str() {
+                    "high" => self.success(&data.confidence),
+                    "medium" => self.warning(&data.confidence),
+                    _ => self.error(&data.confidence),
+                };
+                output.push(format!(
+                    "  {}: {}",
+                    self.label("Confidence"),
+                    confidence_colored
+                ));
+                output.push(format!(
+                    "  {}: {}",
+                    self.label("Method"),
+                    self.value(&data.method)
+                ));
+                if let Some(ref details) = data.details {
+                    output.push(format!(
+                        "  {}: {}",
+                        self.label("Details"),
+                        self.value(details)
+                    ));
+                }
+                output.push(format!(
+                    "  {}: {}",
+                    self.label("RDAP Error"),
+                    self.error(rdap_error)
+                ));
+                output.push(format!(
+                    "  {}: {}",
+                    self.label("WHOIS Error"),
+                    self.error(whois_error)
+                ));
             }
         }
 
