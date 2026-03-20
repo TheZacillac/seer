@@ -3,7 +3,8 @@ mod repl;
 
 use std::io::Write;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::{generate, Shell};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::terminal;
 use seer_core::colors::CatppuccinExt;
@@ -54,7 +55,7 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 
-    /// Output format (human or json)
+    /// Output format (human, json, or yaml)
     #[arg(short, long, default_value = "human")]
     format: String,
 }
@@ -138,6 +139,33 @@ enum Commands {
         /// Only show output when records change
         #[arg(long)]
         changes_only: bool,
+    },
+    /// Reverse DNS lookup for an IP address
+    Reverse {
+        /// IP address to look up (IPv4 or IPv6)
+        ip: String,
+    },
+    /// Check if a domain is available for registration
+    Avail {
+        /// Domain name to check
+        domain: String,
+    },
+    /// Check DNSSEC configuration for a domain
+    Dnssec {
+        /// Domain name to check
+        domain: String,
+    },
+    /// Generate shell completions
+    Completions {
+        /// Shell to generate completions for
+        #[arg(value_enum)]
+        shell: Shell,
+    },
+    /// Show or initialize configuration
+    Config {
+        /// Initialize default config file at ~/.seer/config.toml
+        #[arg(long)]
+        init: bool,
     },
 }
 
@@ -376,6 +404,149 @@ async fn execute_command(
                     eprintln!("{} {}", "Error:".ctp_red(), e);
                     std::process::exit(1);
                 }
+            }
+        }
+        Commands::Reverse { ip } => {
+            let resolver = seer_core::DnsResolver::new();
+            match resolver
+                .resolve(&ip, seer_core::RecordType::PTR, None)
+                .await
+            {
+                Ok(records) => {
+                    println!("{}", formatter.format_dns(&records));
+                }
+                Err(e) => {
+                    eprintln!("{} {}", "Error:".ctp_red(), e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Commands::Avail { domain } => {
+            let checker = seer_core::AvailabilityChecker::new();
+            match checker.check(&domain).await {
+                Ok(result) => {
+                    if matches!(output_format, seer_core::output::OutputFormat::Human) {
+                        let status = if result.available {
+                            "AVAILABLE".ctp_green()
+                        } else {
+                            "TAKEN".ctp_red()
+                        };
+                        println!("{}: {}", result.domain, status);
+                        println!("  Confidence: {}", result.confidence.ctp_yellow());
+                        println!("  Method: {}", result.method);
+                        if let Some(details) = &result.details {
+                            println!("  Details: {}", details);
+                        }
+                    } else {
+                        let json = serde_json::to_string_pretty(&result).unwrap_or_default();
+                        println!("{}", json);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("{} {}", "Error:".ctp_red(), e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Commands::Dnssec { domain } => {
+            let checker = seer_core::DnssecChecker::new();
+            match checker.check(&domain).await {
+                Ok(report) => {
+                    if matches!(output_format, seer_core::output::OutputFormat::Human) {
+                        println!("DNSSEC Report for {}", report.domain.ctp_green());
+                        println!();
+                        let status_colored = match report.status.as_str() {
+                            "secure" => report.status.ctp_green(),
+                            "insecure" => report.status.ctp_yellow(),
+                            _ => report.status.ctp_red(),
+                        };
+                        println!("  Status: {}", status_colored);
+                        println!("  Enabled: {}", report.enabled);
+                        println!("  DS Records: {}", report.ds_records.len());
+                        println!("  DNSKEY Records: {}", report.dnskey_records.len());
+                        if !report.ds_records.is_empty() {
+                            println!();
+                            println!("  DS Records:");
+                            for ds in &report.ds_records {
+                                println!(
+                                    "    Key Tag: {}, Algorithm: {} ({}), Digest: {} ({})",
+                                    ds.key_tag,
+                                    ds.algorithm,
+                                    ds.algorithm_name,
+                                    ds.digest_type,
+                                    ds.digest_type_name
+                                );
+                            }
+                        }
+                        if !report.dnskey_records.is_empty() {
+                            println!();
+                            println!("  DNSKEY Records:");
+                            for key in &report.dnskey_records {
+                                let role = if key.is_ksk {
+                                    "KSK"
+                                } else if key.is_zsk {
+                                    "ZSK"
+                                } else {
+                                    "Other"
+                                };
+                                println!(
+                                    "    Flags: {}, Role: {}, Algorithm: {} ({})",
+                                    key.flags, role, key.algorithm, key.algorithm_name
+                                );
+                            }
+                        }
+                        if !report.issues.is_empty() {
+                            println!();
+                            println!("  {} Issues:", "⚠".ctp_yellow());
+                            for issue in &report.issues {
+                                println!("    - {}", issue);
+                            }
+                        }
+                    } else {
+                        let json = serde_json::to_string_pretty(&report).unwrap_or_default();
+                        println!("{}", json);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("{} {}", "Error:".ctp_red(), e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Commands::Completions { shell } => {
+            let mut cmd = Cli::command();
+            generate(shell, &mut cmd, "seer", &mut std::io::stdout());
+        }
+        Commands::Config { init } => {
+            if init {
+                let config_path = seer_core::SeerConfig::config_path();
+                match config_path {
+                    Some(path) => {
+                        if let Some(parent) = path.parent() {
+                            std::fs::create_dir_all(parent)?;
+                        }
+                        if path.exists() {
+                            eprintln!("Config file already exists at: {}", path.display());
+                            std::process::exit(1);
+                        }
+                        let content = seer_core::SeerConfig::default_toml();
+                        std::fs::write(&path, content)?;
+                        println!(
+                            "Created config file at: {}",
+                            path.display().to_string().ctp_green()
+                        );
+                    }
+                    None => {
+                        eprintln!("{} Could not determine home directory", "Error:".ctp_red());
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                let config = seer_core::SeerConfig::load();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&config).unwrap_or_default()
+                );
             }
         }
         Commands::Follow {

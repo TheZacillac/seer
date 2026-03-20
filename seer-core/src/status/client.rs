@@ -127,11 +127,9 @@ impl StatusClient {
 
             if response.status().is_redirection() {
                 let location = response.headers().get(reqwest::header::LOCATION);
-                let location = location
-                    .and_then(|v| v.to_str().ok())
-                    .ok_or_else(|| {
-                        SeerError::HttpError("redirect missing location header".to_string())
-                    })?;
+                let location = location.and_then(|v| v.to_str().ok()).ok_or_else(|| {
+                    SeerError::HttpError("redirect missing location header".to_string())
+                })?;
                 let next_url = url
                     .join(location)
                     .or_else(|_| Url::parse(location))

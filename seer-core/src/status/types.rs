@@ -77,3 +77,78 @@ impl StatusResponse {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_status_response_new() {
+        let response = StatusResponse::new("example.com".to_string());
+        assert_eq!(response.domain, "example.com");
+        assert!(response.http_status.is_none());
+        assert!(response.certificate.is_none());
+        assert!(response.domain_expiration.is_none());
+        assert!(response.dns_resolution.is_none());
+    }
+
+    #[test]
+    fn test_status_response_serialization() {
+        let response = StatusResponse {
+            domain: "example.com".to_string(),
+            http_status: Some(200),
+            http_status_text: Some("OK".to_string()),
+            title: Some("Example".to_string()),
+            certificate: None,
+            domain_expiration: None,
+            dns_resolution: Some(DnsResolution {
+                a_records: vec!["93.184.216.34".to_string()],
+                aaaa_records: vec![],
+                cname_target: None,
+                nameservers: vec!["ns1.example.com".to_string()],
+                resolves: true,
+            }),
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"http_status\":200"));
+        assert!(json.contains("93.184.216.34"));
+        assert!(json.contains("\"resolves\":true"));
+    }
+
+    #[test]
+    fn test_dns_resolution_resolves() {
+        let dns = DnsResolution {
+            a_records: vec!["1.2.3.4".to_string()],
+            aaaa_records: vec![],
+            cname_target: None,
+            nameservers: vec![],
+            resolves: true,
+        };
+        assert!(dns.resolves);
+
+        let dns_empty = DnsResolution {
+            a_records: vec![],
+            aaaa_records: vec![],
+            cname_target: None,
+            nameservers: vec![],
+            resolves: false,
+        };
+        assert!(!dns_empty.resolves);
+    }
+
+    #[test]
+    fn test_certificate_info_serialization() {
+        use chrono::Utc;
+        let cert = CertificateInfo {
+            issuer: "Let's Encrypt".to_string(),
+            subject: "example.com".to_string(),
+            valid_from: Utc::now(),
+            valid_until: Utc::now(),
+            days_until_expiry: 90,
+            is_valid: true,
+        };
+        let json = serde_json::to_string(&cert).unwrap();
+        assert!(json.contains("Let's Encrypt"));
+        assert!(json.contains("\"is_valid\":true"));
+    }
+}

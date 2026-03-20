@@ -1,12 +1,22 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
+use crate::cache::TtlCache;
 use crate::error::{Result, SeerError};
 use crate::rdap::{RdapClient, RdapResponse};
 use crate::whois::{get_registry_url, get_tld, WhoisClient, WhoisResponse};
+
+/// Cache TTL for lookup results (5 minutes).
+const LOOKUP_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+
+/// Global cache for lookup results to avoid redundant network calls.
+static LOOKUP_CACHE: Lazy<TtlCache<String, LookupResult>> =
+    Lazy::new(|| TtlCache::new(LOOKUP_CACHE_TTL));
 
 /// Progress callback for smart lookup operations.
 /// Called with a message describing the current phase of the lookup.
@@ -138,22 +148,42 @@ impl SmartLookup {
     }
 
     /// Performs a smart lookup for a domain, trying RDAP first with WHOIS fallback.
+    /// Results are cached for 5 minutes to avoid redundant network calls.
     pub async fn lookup(&self, domain: &str) -> Result<LookupResult> {
         self.lookup_with_progress(domain, None).await
     }
 
     /// Performs a lookup with an optional progress callback.
     /// The callback is called with messages describing the current phase.
+    /// Results are cached for 5 minutes.
     pub async fn lookup_with_progress(
         &self,
         domain: &str,
         progress: Option<LookupProgressCallback>,
     ) -> Result<LookupResult> {
-        if self.prefer_rdap {
-            self.lookup_rdap_first(domain, progress).await
-        } else {
-            self.lookup_whois_first(domain, progress).await
+        let normalized = crate::validation::normalize_domain(domain)?;
+
+        // Check cache first
+        if let Some(cached) = LOOKUP_CACHE.get(&normalized) {
+            debug!(domain = %normalized, "Returning cached lookup result");
+            return Ok(cached);
         }
+
+        let result = if self.prefer_rdap {
+            self.lookup_rdap_first(domain, progress).await?
+        } else {
+            self.lookup_whois_first(domain, progress).await?
+        };
+
+        // Cache the result
+        LOOKUP_CACHE.insert(normalized, result.clone());
+
+        Ok(result)
+    }
+
+    /// Clears the lookup result cache.
+    pub fn clear_cache() {
+        LOOKUP_CACHE.clear();
     }
 
     async fn lookup_rdap_first(
@@ -279,5 +309,98 @@ impl SmartLookup {
 
         // Consider useful if we have the name plus at least one other piece of info
         has_name && (has_dates || has_entities || has_nameservers || has_status)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_lookup_result_domain_name_whois() {
+        let result = LookupResult::Whois {
+            data: WhoisResponse {
+                domain: "example.com".to_string(),
+                registrar: Some("Test Registrar".to_string()),
+                registrant: None,
+                organization: None,
+                registrant_email: None,
+                registrant_phone: None,
+                registrant_address: None,
+                registrant_country: None,
+                admin_name: None,
+                admin_organization: None,
+                admin_email: None,
+                admin_phone: None,
+                tech_name: None,
+                tech_organization: None,
+                tech_email: None,
+                tech_phone: None,
+                creation_date: None,
+                expiration_date: None,
+                updated_date: None,
+                status: vec![],
+                nameservers: vec![],
+                dnssec: None,
+                whois_server: "whois.example.com".to_string(),
+                raw_response: String::new(),
+            },
+            rdap_error: None,
+        };
+
+        assert_eq!(result.domain_name(), Some("example.com".to_string()));
+        assert_eq!(result.registrar(), Some("Test Registrar".to_string()));
+        assert!(result.is_whois());
+        assert!(!result.is_rdap());
+    }
+
+    #[test]
+    fn test_lookup_result_serialization() {
+        let result = LookupResult::Whois {
+            data: WhoisResponse {
+                domain: "test.com".to_string(),
+                registrar: None,
+                registrant: None,
+                organization: None,
+                registrant_email: None,
+                registrant_phone: None,
+                registrant_address: None,
+                registrant_country: None,
+                admin_name: None,
+                admin_organization: None,
+                admin_email: None,
+                admin_phone: None,
+                tech_name: None,
+                tech_organization: None,
+                tech_email: None,
+                tech_phone: None,
+                creation_date: None,
+                expiration_date: None,
+                updated_date: None,
+                status: vec![],
+                nameservers: vec![],
+                dnssec: None,
+                whois_server: String::new(),
+                raw_response: String::new(),
+            },
+            rdap_error: Some("RDAP failed".to_string()),
+        };
+
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("\"source\":\"whois\""));
+        assert!(json.contains("RDAP failed"));
+    }
+
+    #[test]
+    fn test_smart_lookup_builder() {
+        let lookup = SmartLookup::new().prefer_rdap(false).include_fallback(true);
+        assert!(!lookup.prefer_rdap);
+        assert!(lookup.include_fallback);
+    }
+
+    #[test]
+    fn test_lookup_cache_clear() {
+        SmartLookup::clear_cache();
+        assert!(LOOKUP_CACHE.is_empty());
     }
 }
