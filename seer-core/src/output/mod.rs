@@ -12,6 +12,7 @@ pub enum OutputFormat {
     #[default]
     Human,
     Json,
+    Yaml,
 }
 
 impl std::str::FromStr for OutputFormat {
@@ -21,7 +22,11 @@ impl std::str::FromStr for OutputFormat {
         match s.to_lowercase().as_str() {
             "human" | "text" | "pretty" => Ok(OutputFormat::Human),
             "json" => Ok(OutputFormat::Json),
-            _ => Err(format!("Unknown output format: {}", s)),
+            "yaml" | "yml" => Ok(OutputFormat::Yaml),
+            _ => Err(format!(
+                "Unknown output format: {}. Use: human, json, yaml",
+                s
+            )),
         }
     }
 }
@@ -37,9 +42,183 @@ pub trait OutputFormatter {
     fn format_follow(&self, result: &crate::dns::FollowResult) -> String;
 }
 
+/// YAML output formatter that converts data structures to YAML format.
+pub struct YamlFormatter;
+
+impl YamlFormatter {
+    pub fn new() -> Self {
+        Self
+    }
+
+    /// Formats any serializable value as YAML output.
+    pub fn to_yaml_value<T: serde::Serialize + ?Sized>(&self, value: &T) -> String {
+        // Convert to JSON value first, then format as YAML-like output
+        match serde_json::to_value(value) {
+            Ok(v) => format_as_yaml(&v, 0),
+            Err(e) => format!("error: {}", e),
+        }
+    }
+}
+
+impl Default for YamlFormatter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl OutputFormatter for YamlFormatter {
+    fn format_whois(&self, response: &crate::whois::WhoisResponse) -> String {
+        self.to_yaml_value(response)
+    }
+    fn format_rdap(&self, response: &crate::rdap::RdapResponse) -> String {
+        self.to_yaml_value(response)
+    }
+    fn format_dns(&self, records: &[crate::dns::DnsRecord]) -> String {
+        self.to_yaml_value(records)
+    }
+    fn format_propagation(&self, result: &crate::dns::PropagationResult) -> String {
+        self.to_yaml_value(result)
+    }
+    fn format_lookup(&self, result: &crate::lookup::LookupResult) -> String {
+        self.to_yaml_value(result)
+    }
+    fn format_status(&self, response: &crate::status::StatusResponse) -> String {
+        self.to_yaml_value(response)
+    }
+    fn format_follow_iteration(&self, iteration: &crate::dns::FollowIteration) -> String {
+        self.to_yaml_value(iteration)
+    }
+    fn format_follow(&self, result: &crate::dns::FollowResult) -> String {
+        self.to_yaml_value(result)
+    }
+}
+
+/// Simple YAML-like formatter from serde_json::Value.
+fn format_as_yaml(value: &serde_json::Value, indent: usize) -> String {
+    let prefix = "  ".repeat(indent);
+    match value {
+        serde_json::Value::Null => "null".to_string(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::String(s) => {
+            if s.contains('\n') || s.contains(':') || s.contains('#') {
+                format!("\"{}\"", s.replace('"', "\\\""))
+            } else {
+                s.clone()
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            if arr.is_empty() {
+                return "[]".to_string();
+            }
+            let mut out = String::new();
+            for item in arr {
+                out.push('\n');
+                out.push_str(&prefix);
+                out.push_str("- ");
+                let formatted = format_as_yaml(item, indent + 1);
+                out.push_str(&formatted);
+            }
+            out
+        }
+        serde_json::Value::Object(map) => {
+            if map.is_empty() {
+                return "{}".to_string();
+            }
+            let mut out = String::new();
+            let mut first = indent == 0;
+            for (key, val) in map {
+                if !first {
+                    out.push('\n');
+                }
+                first = false;
+                out.push_str(&prefix);
+                out.push_str(key);
+                out.push_str(": ");
+                match val {
+                    serde_json::Value::Object(_) | serde_json::Value::Array(_) => {
+                        out.push_str(&format_as_yaml(val, indent + 1));
+                    }
+                    _ => {
+                        out.push_str(&format_as_yaml(val, indent));
+                    }
+                }
+            }
+            out
+        }
+    }
+}
+
 pub fn get_formatter(format: OutputFormat) -> Box<dyn OutputFormatter> {
     match format {
         OutputFormat::Human => Box::new(HumanFormatter::new()),
         OutputFormat::Json => Box::new(JsonFormatter::new()),
+        OutputFormat::Yaml => Box::new(YamlFormatter::new()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_output_format_from_str() {
+        assert_eq!(
+            "human".parse::<OutputFormat>().unwrap(),
+            OutputFormat::Human
+        );
+        assert_eq!("json".parse::<OutputFormat>().unwrap(), OutputFormat::Json);
+        assert_eq!("yaml".parse::<OutputFormat>().unwrap(), OutputFormat::Yaml);
+        assert_eq!("yml".parse::<OutputFormat>().unwrap(), OutputFormat::Yaml);
+        assert_eq!("text".parse::<OutputFormat>().unwrap(), OutputFormat::Human);
+        assert_eq!(
+            "pretty".parse::<OutputFormat>().unwrap(),
+            OutputFormat::Human
+        );
+        assert!("invalid".parse::<OutputFormat>().is_err());
+    }
+
+    #[test]
+    fn test_output_format_default() {
+        assert_eq!(OutputFormat::default(), OutputFormat::Human);
+    }
+
+    #[test]
+    fn test_get_formatter_returns_correct_type() {
+        // Just verify we can get formatters without panicking
+        let _ = get_formatter(OutputFormat::Human);
+        let _ = get_formatter(OutputFormat::Json);
+        let _ = get_formatter(OutputFormat::Yaml);
+    }
+
+    #[test]
+    fn test_yaml_formatter_basic() {
+        let formatter = YamlFormatter::new();
+        let status = crate::status::StatusResponse::new("example.com".to_string());
+        let output = formatter.format_status(&status);
+        assert!(output.contains("example.com"));
+        assert!(output.contains("domain"));
+    }
+
+    #[test]
+    fn test_format_as_yaml_primitives() {
+        assert_eq!(format_as_yaml(&serde_json::json!(null), 0), "null");
+        assert_eq!(format_as_yaml(&serde_json::json!(true), 0), "true");
+        assert_eq!(format_as_yaml(&serde_json::json!(42), 0), "42");
+        assert_eq!(format_as_yaml(&serde_json::json!("hello"), 0), "hello");
+    }
+
+    #[test]
+    fn test_format_as_yaml_array() {
+        let output = format_as_yaml(&serde_json::json!([1, 2, 3]), 0);
+        assert!(output.contains("- 1"));
+        assert!(output.contains("- 2"));
+        assert!(output.contains("- 3"));
+    }
+
+    #[test]
+    fn test_format_as_yaml_empty_collections() {
+        assert_eq!(format_as_yaml(&serde_json::json!([]), 0), "[]");
+        assert_eq!(format_as_yaml(&serde_json::json!({}), 0), "{}");
     }
 }

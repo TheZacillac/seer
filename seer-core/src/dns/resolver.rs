@@ -19,9 +19,22 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 /// DNS resolver for querying various record types.
 ///
 /// Uses Google DNS (8.8.8.8) by default, but supports custom nameservers.
-#[derive(Debug, Clone)]
+/// The default resolver is cached and reused across queries to avoid
+/// repeated initialization overhead.
+#[derive(Clone)]
 pub struct DnsResolver {
     timeout: Duration,
+    /// Cached default resolver (Google DNS). Reused across all queries
+    /// that don't specify a custom nameserver.
+    default_resolver: TokioAsyncResolver,
+}
+
+impl std::fmt::Debug for DnsResolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DnsResolver")
+            .field("timeout", &self.timeout)
+            .finish()
+    }
 }
 
 impl Default for DnsResolver {
@@ -33,8 +46,14 @@ impl Default for DnsResolver {
 impl DnsResolver {
     /// Creates a new DNS resolver with default settings.
     pub fn new() -> Self {
+        let mut opts = ResolverOpts::default();
+        opts.timeout = DEFAULT_TIMEOUT;
+        opts.attempts = 2;
+        opts.use_hosts_file = false;
+
         Self {
             timeout: DEFAULT_TIMEOUT,
+            default_resolver: TokioAsyncResolver::tokio(ResolverConfig::google(), opts),
         }
     }
 
@@ -43,29 +62,30 @@ impl DnsResolver {
     /// The default is 5 seconds, which is sufficient for most DNS queries.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        // Recreate default resolver with new timeout
+        let mut opts = ResolverOpts::default();
+        opts.timeout = timeout;
+        opts.attempts = 2;
+        opts.use_hosts_file = false;
+        self.default_resolver = TokioAsyncResolver::tokio(ResolverConfig::google(), opts);
         self
     }
 
-    fn create_resolver(&self, nameserver: Option<&str>) -> Result<TokioAsyncResolver> {
+    fn create_custom_resolver(&self, nameserver: &str) -> Result<TokioAsyncResolver> {
         let mut opts = ResolverOpts::default();
         opts.timeout = self.timeout;
         opts.attempts = 2;
         opts.use_hosts_file = false;
 
-        let config = if let Some(ns) = nameserver {
-            let ip: IpAddr = ns
-                .parse()
-                .map_err(|_| SeerError::DnsError(format!("invalid nameserver IP: {}", ns)))?;
+        let ip: IpAddr = nameserver
+            .parse()
+            .map_err(|_| SeerError::DnsError(format!("invalid nameserver IP: {}", nameserver)))?;
 
-            let socket_addr = SocketAddr::new(ip, 53);
-            let ns_config = NameServerConfig::new(socket_addr, Protocol::Udp);
+        let socket_addr = SocketAddr::new(ip, 53);
+        let ns_config = NameServerConfig::new(socket_addr, Protocol::Udp);
 
-            let mut config = ResolverConfig::new();
-            config.add_name_server(ns_config);
-            config
-        } else {
-            ResolverConfig::google()
-        };
+        let mut config = ResolverConfig::new();
+        config.add_name_server(ns_config);
 
         Ok(TokioAsyncResolver::tokio(config, opts))
     }
@@ -83,27 +103,34 @@ impl DnsResolver {
         record_type: RecordType,
         nameserver: Option<&str>,
     ) -> Result<Vec<DnsRecord>> {
-        let resolver = self.create_resolver(nameserver)?;
+        // Reuse the cached default resolver when no custom nameserver is specified
+        let custom_resolver;
+        let resolver = if let Some(ns) = nameserver {
+            custom_resolver = self.create_custom_resolver(ns)?;
+            &custom_resolver
+        } else {
+            &self.default_resolver
+        };
         let domain = normalize_domain(domain)?;
 
         debug!(nameserver = nameserver.unwrap_or("system"), "Resolving DNS");
 
         match record_type {
-            RecordType::A => self.resolve_a(&resolver, &domain).await,
-            RecordType::AAAA => self.resolve_aaaa(&resolver, &domain).await,
-            RecordType::CNAME => self.resolve_cname(&resolver, &domain).await,
-            RecordType::MX => self.resolve_mx(&resolver, &domain).await,
-            RecordType::NS => self.resolve_ns(&resolver, &domain).await,
-            RecordType::TXT => self.resolve_txt(&resolver, &domain).await,
-            RecordType::SOA => self.resolve_soa(&resolver, &domain).await,
-            RecordType::PTR => self.resolve_ptr(&resolver, &domain).await,
+            RecordType::A => self.resolve_a(resolver, &domain).await,
+            RecordType::AAAA => self.resolve_aaaa(resolver, &domain).await,
+            RecordType::CNAME => self.resolve_cname(resolver, &domain).await,
+            RecordType::MX => self.resolve_mx(resolver, &domain).await,
+            RecordType::NS => self.resolve_ns(resolver, &domain).await,
+            RecordType::TXT => self.resolve_txt(resolver, &domain).await,
+            RecordType::SOA => self.resolve_soa(resolver, &domain).await,
+            RecordType::PTR => self.resolve_ptr(resolver, &domain).await,
             RecordType::SRV => Err(SeerError::DnsError(
                 "SRV records require service name format: _service._proto.name".to_string(),
             )),
-            RecordType::CAA => self.resolve_caa(&resolver, &domain).await,
-            RecordType::DNSKEY => self.resolve_dnskey(&resolver, &domain).await,
-            RecordType::DS => self.resolve_ds(&resolver, &domain).await,
-            RecordType::ANY => self.resolve_any(&resolver, &domain).await,
+            RecordType::CAA => self.resolve_caa(resolver, &domain).await,
+            RecordType::DNSKEY => self.resolve_dnskey(resolver, &domain).await,
+            RecordType::DS => self.resolve_ds(resolver, &domain).await,
+            RecordType::ANY => self.resolve_any(resolver, &domain).await,
             _ => Err(SeerError::DnsError(format!(
                 "Record type {} not implemented",
                 record_type
@@ -139,7 +166,13 @@ impl DnsResolver {
             )));
         }
 
-        let resolver = self.create_resolver(nameserver)?;
+        let custom_resolver;
+        let resolver = if let Some(ns) = nameserver {
+            custom_resolver = self.create_custom_resolver(ns)?;
+            &custom_resolver
+        } else {
+            &self.default_resolver
+        };
         let query_name = format!("_{}._{}.{}", service, protocol, domain);
 
         let response = resolver

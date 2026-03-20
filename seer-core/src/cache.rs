@@ -71,18 +71,34 @@ impl<V> CacheEntry<V> {
 pub struct TtlCache<K, V> {
     entries: RwLock<HashMap<K, CacheEntry<V>>>,
     default_ttl: Duration,
+    /// Maximum number of entries. When exceeded, expired entries are purged
+    /// and if still over capacity, the oldest entry is evicted.
+    max_capacity: usize,
 }
+
+/// Default maximum capacity for TtlCache instances.
+const DEFAULT_MAX_CAPACITY: usize = 1024;
 
 impl<K, V> TtlCache<K, V>
 where
     K: Eq + Hash + Clone + std::fmt::Debug,
     V: Clone,
 {
-    /// Creates a new cache with the specified default TTL.
+    /// Creates a new cache with the specified default TTL and default max capacity (1024).
     pub fn new(default_ttl: Duration) -> Self {
         Self {
             entries: RwLock::new(HashMap::new()),
             default_ttl,
+            max_capacity: DEFAULT_MAX_CAPACITY,
+        }
+    }
+
+    /// Creates a new cache with a specified TTL and max capacity.
+    pub fn with_max_capacity(default_ttl: Duration, max_capacity: usize) -> Self {
+        Self {
+            entries: RwLock::new(HashMap::new()),
+            default_ttl,
+            max_capacity,
         }
     }
 
@@ -157,6 +173,9 @@ where
     }
 
     /// Inserts a value into the cache with a custom TTL.
+    ///
+    /// If the cache exceeds max capacity, expired entries are purged first.
+    /// If still over capacity, the oldest entry is evicted.
     pub fn insert_with_ttl(&self, key: K, value: V, ttl: Duration) {
         let mut entries = match self.entries.write() {
             Ok(guard) => guard,
@@ -165,6 +184,30 @@ where
                 poisoned.into_inner()
             }
         };
+
+        // Evict if at capacity (before inserting)
+        if entries.len() >= self.max_capacity && !entries.contains_key(&key) {
+            // First, remove expired entries
+            let before = entries.len();
+            entries.retain(|_, entry| !entry.is_expired());
+            let removed = before - entries.len();
+            if removed > 0 {
+                debug!(removed, "Evicted expired entries to make room");
+            }
+
+            // If still at capacity, evict the oldest entry
+            if entries.len() >= self.max_capacity {
+                if let Some(oldest_key) = entries
+                    .iter()
+                    .max_by_key(|(_, entry)| entry.age())
+                    .map(|(k, _)| k.clone())
+                {
+                    entries.remove(&oldest_key);
+                    debug!(?oldest_key, "Evicted oldest entry to make room");
+                }
+            }
+        }
+
         debug!(?key, ttl_secs = ttl.as_secs(), "Inserting cache entry");
         entries.insert(key, CacheEntry::new(value, ttl));
     }

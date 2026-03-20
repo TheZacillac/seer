@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use once_cell::sync::Lazy;
@@ -63,12 +64,14 @@ impl CachedBootstrap {
     }
 }
 
-/// Parsed IANA bootstrap data
+/// Parsed IANA bootstrap data.
+/// Uses Arc<str> for URL strings to reduce cloning overhead when multiple
+/// TLDs/prefixes share the same RDAP server URL.
 struct BootstrapData {
-    dns: HashMap<String, String>,
-    ipv4: Vec<(IpRange, String)>,
-    ipv6: Vec<(IpRange, String)>,
-    asn: Vec<(AsnRange, String)>,
+    dns: HashMap<String, Arc<str>>,
+    ipv4: Vec<(IpRange, Arc<str>)>,
+    ipv6: Vec<(IpRange, Arc<str>)>,
+    asn: Vec<(AsnRange, Arc<str>)>,
 }
 
 #[derive(Clone)]
@@ -175,25 +178,25 @@ impl RdapClient {
     }
 
     /// Looks up the RDAP server URL for a domain's TLD from bootstrap data.
-    fn get_rdap_url_for_domain(cache: &BootstrapData, domain: &str) -> Option<String> {
+    fn get_rdap_url_for_domain(cache: &BootstrapData, domain: &str) -> Option<Arc<str>> {
         let tld = domain.rsplit('.').next()?;
         cache.dns.get(&tld.to_lowercase()).cloned()
     }
 
     /// Looks up the RDAP server URL for an IP address from bootstrap data.
-    fn get_rdap_url_for_ip(cache: &BootstrapData, ip: &IpAddr) -> Option<String> {
+    fn get_rdap_url_for_ip(cache: &BootstrapData, ip: &IpAddr) -> Option<Arc<str>> {
         match ip {
             IpAddr::V4(addr) => {
                 for (range, url) in &cache.ipv4 {
                     if ipv4_matches_prefix(&range.prefix, addr) {
-                        return Some(url.clone());
+                        return Some(Arc::clone(url));
                     }
                 }
             }
             IpAddr::V6(addr) => {
                 for (range, url) in &cache.ipv6 {
                     if ipv6_matches_prefix(&range.prefix, addr) {
-                        return Some(url.clone());
+                        return Some(Arc::clone(url));
                     }
                 }
             }
@@ -203,10 +206,10 @@ impl RdapClient {
     }
 
     /// Looks up the RDAP server URL for an ASN from bootstrap data.
-    fn get_rdap_url_for_asn(cache: &BootstrapData, asn: u32) -> Option<String> {
+    fn get_rdap_url_for_asn(cache: &BootstrapData, asn: u32) -> Option<Arc<str>> {
         for (range, url) in &cache.asn {
             if asn >= range.start && asn <= range.end {
-                return Some(url.clone());
+                return Some(Arc::clone(url));
             }
         }
 
@@ -234,7 +237,7 @@ impl RdapClient {
                     SeerError::RdapBootstrapError(format!("no RDAP server for {}", domain))
                 })?;
 
-            format!("{}domain/{}", ensure_trailing_slash(&base_url), domain)
+            build_rdap_url(&base_url, &format!("domain/{}", domain))
         }; // Lock released here
 
         debug!(url = %url, "Querying RDAP");
@@ -263,7 +266,7 @@ impl RdapClient {
                 SeerError::RdapBootstrapError(format!("no RDAP server for {}", ip))
             })?;
 
-            format!("{}ip/{}", ensure_trailing_slash(&base_url), ip)
+            build_rdap_url(&base_url, &format!("ip/{}", ip))
         }; // Lock released here
 
         debug!(url = %url, "Querying RDAP");
@@ -288,7 +291,7 @@ impl RdapClient {
                 SeerError::RdapBootstrapError(format!("no RDAP server for AS{}", asn))
             })?;
 
-            format!("{}autnum/{}", ensure_trailing_slash(&base_url), asn)
+            build_rdap_url(&base_url, &format!("autnum/{}", asn))
         }; // Lock released here
 
         debug!(url = %url, "Querying RDAP");
@@ -364,10 +367,10 @@ async fn load_bootstrap_data() -> Result<BootstrapData> {
         if service.len() >= 2 {
             if let (Some(tlds), Some(urls)) = (service[0].as_array(), service[1].as_array()) {
                 if let Some(url) = urls.first().and_then(|u| u.as_str()) {
-                    let url_string = url.to_string();
+                    let url_arc: Arc<str> = Arc::from(url);
                     for tld in tlds {
                         if let Some(tld_str) = tld.as_str() {
-                            dns.insert(tld_str.to_lowercase(), url_string.clone());
+                            dns.insert(tld_str.to_lowercase(), Arc::clone(&url_arc));
                         }
                     }
                 }
@@ -380,14 +383,14 @@ async fn load_bootstrap_data() -> Result<BootstrapData> {
         if service.len() >= 2 {
             if let (Some(prefixes), Some(urls)) = (service[0].as_array(), service[1].as_array()) {
                 if let Some(url) = urls.first().and_then(|u| u.as_str()) {
-                    let url_string = url.to_string();
+                    let url_arc: Arc<str> = Arc::from(url);
                     for prefix in prefixes {
                         if let Some(prefix_str) = prefix.as_str() {
                             ipv4.push((
                                 IpRange {
                                     prefix: prefix_str.to_string(),
                                 },
-                                url_string.clone(),
+                                Arc::clone(&url_arc),
                             ));
                         }
                     }
@@ -401,14 +404,14 @@ async fn load_bootstrap_data() -> Result<BootstrapData> {
         if service.len() >= 2 {
             if let (Some(prefixes), Some(urls)) = (service[0].as_array(), service[1].as_array()) {
                 if let Some(url) = urls.first().and_then(|u| u.as_str()) {
-                    let url_string = url.to_string();
+                    let url_arc: Arc<str> = Arc::from(url);
                     for prefix in prefixes {
                         if let Some(prefix_str) = prefix.as_str() {
                             ipv6.push((
                                 IpRange {
                                     prefix: prefix_str.to_string(),
                                 },
-                                url_string.clone(),
+                                Arc::clone(&url_arc),
                             ));
                         }
                     }
@@ -422,11 +425,11 @@ async fn load_bootstrap_data() -> Result<BootstrapData> {
         if service.len() >= 2 {
             if let (Some(ranges), Some(urls)) = (service[0].as_array(), service[1].as_array()) {
                 if let Some(url) = urls.first().and_then(|u| u.as_str()) {
-                    let url_string = url.to_string();
+                    let url_arc: Arc<str> = Arc::from(url);
                     for range in ranges {
                         if let Some(range_str) = range.as_str() {
                             if let Some((start, end)) = parse_asn_range(range_str) {
-                                asn.push((AsnRange { start, end }, url_string.clone()));
+                                asn.push((AsnRange { start, end }, Arc::clone(&url_arc)));
                             }
                         }
                     }
@@ -443,11 +446,12 @@ async fn load_bootstrap_data() -> Result<BootstrapData> {
     })
 }
 
-fn ensure_trailing_slash(url: &str) -> String {
-    if url.ends_with('/') {
-        url.to_string()
+/// Builds a full RDAP query URL from a base URL and path.
+fn build_rdap_url(base_url: &str, path: &str) -> String {
+    if base_url.ends_with('/') {
+        format!("{}{}", base_url, path)
     } else {
-        format!("{}/", url)
+        format!("{}/{}", base_url, path)
     }
 }
 

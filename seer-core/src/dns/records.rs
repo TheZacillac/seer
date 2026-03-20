@@ -207,3 +207,104 @@ impl DnsRecord {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_record_type_from_str() {
+        assert_eq!("A".parse::<RecordType>().unwrap(), RecordType::A);
+        assert_eq!("aaaa".parse::<RecordType>().unwrap(), RecordType::AAAA);
+        assert_eq!("MX".parse::<RecordType>().unwrap(), RecordType::MX);
+        assert_eq!("*".parse::<RecordType>().unwrap(), RecordType::ANY);
+        assert!("INVALID".parse::<RecordType>().is_err());
+    }
+
+    #[test]
+    fn test_record_type_display() {
+        assert_eq!(RecordType::A.to_string(), "A");
+        assert_eq!(RecordType::AAAA.to_string(), "AAAA");
+        assert_eq!(RecordType::MX.to_string(), "MX");
+        assert_eq!(RecordType::SOA.to_string(), "SOA");
+    }
+
+    #[test]
+    fn test_dns_record_format_short() {
+        let record = DnsRecord {
+            name: "example.com".to_string(),
+            record_type: RecordType::A,
+            ttl: 300,
+            data: RecordData::A {
+                address: "1.2.3.4".to_string(),
+            },
+        };
+        assert_eq!(record.format_short(), "1.2.3.4");
+    }
+
+    #[test]
+    fn test_dns_record_format_full() {
+        let record = DnsRecord {
+            name: "example.com".to_string(),
+            record_type: RecordType::A,
+            ttl: 300,
+            data: RecordData::A {
+                address: "1.2.3.4".to_string(),
+            },
+        };
+        assert_eq!(record.format_full(), "example.com\t300\tIN\tA\t1.2.3.4");
+    }
+
+    #[test]
+    fn test_record_data_display() {
+        let mx = RecordData::MX {
+            preference: 10,
+            exchange: "mail.example.com".to_string(),
+        };
+        assert_eq!(format!("{}", mx), "10 mail.example.com");
+
+        let txt = RecordData::TXT {
+            text: "v=spf1 include:example.com".to_string(),
+        };
+        assert_eq!(format!("{}", txt), "\"v=spf1 include:example.com\"");
+
+        let srv = RecordData::SRV {
+            priority: 10,
+            weight: 5,
+            port: 443,
+            target: "server.example.com".to_string(),
+        };
+        assert_eq!(format!("{}", srv), "10 5 443 server.example.com");
+    }
+
+    #[test]
+    fn test_record_serialization_roundtrip() {
+        let record = DnsRecord {
+            name: "example.com".to_string(),
+            record_type: RecordType::A,
+            ttl: 300,
+            data: RecordData::A {
+                address: "1.2.3.4".to_string(),
+            },
+        };
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(json.contains("\"A\""));
+        assert!(json.contains("1.2.3.4"));
+    }
+
+    #[test]
+    fn test_soa_display() {
+        let soa = RecordData::SOA {
+            mname: "ns1.example.com".to_string(),
+            rname: "admin.example.com".to_string(),
+            serial: 2024010101,
+            refresh: 3600,
+            retry: 900,
+            expire: 604800,
+            minimum: 86400,
+        };
+        let display = format!("{}", soa);
+        assert!(display.contains("ns1.example.com"));
+        assert!(display.contains("2024010101"));
+    }
+}

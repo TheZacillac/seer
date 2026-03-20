@@ -32,6 +32,7 @@ static DOMAIN_ALLOWLIST: Lazy<Option<HashSet<String>>> = Lazy::new(|| {
 /// - Removes www. prefix
 /// - Removes trailing slashes and paths
 /// - Converts to lowercase
+/// - Converts internationalized domain names (IDN) to Punycode (ASCII)
 /// - Validates format (must contain dots, only alphanumeric/hyphens/dots)
 /// - Does NOT perform SSRF checks (use `validate_domain_safe` for network operations)
 pub fn normalize_domain(domain: &str) -> Result<String> {
@@ -53,6 +54,13 @@ pub fn normalize_domain(domain: &str) -> Result<String> {
     if domain.is_empty() || !domain.contains('.') {
         return Err(SeerError::InvalidDomain(domain.to_string()));
     }
+
+    // Convert internationalized domain names (IDN) to ASCII/Punycode
+    let domain = if !domain.is_ascii() {
+        domain_to_ascii(domain)?
+    } else {
+        domain.to_string()
+    };
 
     // Basic validation - alphanumeric, hyphens, and dots
     let valid = domain
@@ -87,6 +95,13 @@ pub fn normalize_domain(domain: &str) -> Result<String> {
     }
 
     Ok(domain.to_string())
+}
+
+/// Converts an internationalized domain name to ASCII (Punycode).
+fn domain_to_ascii(domain: &str) -> Result<String> {
+    idna::domain_to_ascii(domain).map_err(|_| {
+        SeerError::InvalidDomain(format!("invalid internationalized domain: {}", domain))
+    })
 }
 
 /// Checks if an IP address is in a private or reserved range.
@@ -265,6 +280,25 @@ mod tests {
         assert!(normalize_domain("example.com.").is_err());
         assert!(normalize_domain("-example.com").is_err());
         assert!(normalize_domain("example-.com").is_err());
+    }
+
+    #[test]
+    fn test_normalize_idn_domain() {
+        // German: münchen.de -> xn--mnchen-3ya.de
+        let result = normalize_domain("münchen.de").unwrap();
+        assert_eq!(result, "xn--mnchen-3ya.de");
+
+        // Japanese: 例え.jp -> xn--r8jz45g.jp
+        let result = normalize_domain("例え.jp").unwrap();
+        assert_eq!(result, "xn--r8jz45g.jp");
+
+        // Chinese: 中文.com -> xn--fiq228c.com
+        let result = normalize_domain("中文.com").unwrap();
+        assert_eq!(result, "xn--fiq228c.com");
+
+        // With protocol prefix
+        let result = normalize_domain("https://münchen.de/path").unwrap();
+        assert_eq!(result, "xn--mnchen-3ya.de");
     }
 
     #[test]

@@ -239,6 +239,135 @@ impl PropagationChecker {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_dns_servers() {
+        let servers = default_dns_servers();
+        assert!(
+            servers.len() >= 20,
+            "Should have at least 20 global DNS servers"
+        );
+
+        // Verify regions are covered
+        let locations: Vec<&str> = servers.iter().map(|s| s.location.as_str()).collect();
+        assert!(locations.contains(&"North America"));
+        assert!(locations.contains(&"Europe"));
+        assert!(locations.contains(&"Asia Pacific"));
+        assert!(locations.contains(&"Latin America"));
+        assert!(locations.contains(&"Africa"));
+        assert!(locations.contains(&"Middle East"));
+    }
+
+    #[test]
+    fn test_propagation_result_methods() {
+        let result = PropagationResult {
+            domain: "example.com".to_string(),
+            record_type: RecordType::A,
+            servers_checked: 10,
+            servers_responding: 10,
+            propagation_percentage: 100.0,
+            results: vec![],
+            consensus_values: vec!["1.2.3.4".to_string()],
+            inconsistencies: vec![],
+        };
+        assert!(result.is_fully_propagated());
+        assert!(!result.has_inconsistencies());
+    }
+
+    #[test]
+    fn test_propagation_result_with_inconsistencies() {
+        let result = PropagationResult {
+            domain: "example.com".to_string(),
+            record_type: RecordType::A,
+            servers_checked: 10,
+            servers_responding: 8,
+            propagation_percentage: 75.0,
+            results: vec![],
+            consensus_values: vec!["1.2.3.4".to_string()],
+            inconsistencies: vec!["Server X has different value".to_string()],
+        };
+        assert!(!result.is_fully_propagated());
+        assert!(result.has_inconsistencies());
+    }
+
+    #[test]
+    fn test_dns_server_new() {
+        let server = DnsServer::new("Test", "1.2.3.4", "Test Region", "Test Provider");
+        assert_eq!(server.name, "Test");
+        assert_eq!(server.ip, "1.2.3.4");
+        assert_eq!(server.location, "Test Region");
+        assert_eq!(server.provider, "Test Provider");
+    }
+
+    #[test]
+    fn test_analyze_empty_results() {
+        let results: Vec<ServerResult> = vec![];
+        let (pct, consensus, issues) = analyze_results(&results, RecordType::A);
+        assert_eq!(pct, 0.0);
+        assert!(consensus.is_empty());
+        assert!(!issues.is_empty());
+    }
+
+    #[test]
+    fn test_analyze_consistent_results() {
+        let server = DnsServer::new("Test", "1.1.1.1", "Test", "Test");
+        let results = vec![
+            ServerResult {
+                server: server.clone(),
+                records: vec![DnsRecord {
+                    name: "example.com".to_string(),
+                    record_type: RecordType::A,
+                    ttl: 300,
+                    data: crate::dns::RecordData::A {
+                        address: "1.2.3.4".to_string(),
+                    },
+                }],
+                response_time_ms: 10,
+                success: true,
+                error: None,
+            },
+            ServerResult {
+                server: server.clone(),
+                records: vec![DnsRecord {
+                    name: "example.com".to_string(),
+                    record_type: RecordType::A,
+                    ttl: 300,
+                    data: crate::dns::RecordData::A {
+                        address: "1.2.3.4".to_string(),
+                    },
+                }],
+                response_time_ms: 15,
+                success: true,
+                error: None,
+            },
+        ];
+        let (pct, consensus, issues) = analyze_results(&results, RecordType::A);
+        assert_eq!(pct, 100.0);
+        assert_eq!(consensus, vec!["1.2.3.4"]);
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn test_propagation_result_serialization() {
+        let result = PropagationResult {
+            domain: "test.com".to_string(),
+            record_type: RecordType::A,
+            servers_checked: 5,
+            servers_responding: 5,
+            propagation_percentage: 100.0,
+            results: vec![],
+            consensus_values: vec!["1.2.3.4".to_string()],
+            inconsistencies: vec![],
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("test.com"));
+        assert!(json.contains("100"));
+    }
+}
+
 fn analyze_results(
     results: &[ServerResult],
     record_type: RecordType,

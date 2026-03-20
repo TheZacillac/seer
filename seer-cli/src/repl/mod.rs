@@ -133,6 +133,7 @@ impl Repl {
         let format_indicator = match self.context.output_format {
             seer_core::output::OutputFormat::Human => "",
             seer_core::output::OutputFormat::Json => " [json]",
+            seer_core::output::OutputFormat::Yaml => " [yaml]",
         };
         format!(
             "{}{} ",

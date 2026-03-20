@@ -3,11 +3,11 @@ mod repl;
 
 use std::io::Write;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::{generate, Shell};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::terminal;
 use seer_core::colors::CatppuccinExt;
-use seer_core::output::OutputFormatter;
 use tracing_subscriber::EnvFilter;
 
 const BULK_EXAMPLES: &str = r#"
@@ -54,7 +54,7 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 
-    /// Output format (human or json)
+    /// Output format (human, json, or yaml)
     #[arg(short, long, default_value = "human")]
     format: String,
 }
@@ -139,6 +139,33 @@ enum Commands {
         #[arg(long)]
         changes_only: bool,
     },
+    /// Reverse DNS lookup for an IP address
+    Reverse {
+        /// IP address to look up (IPv4 or IPv6)
+        ip: String,
+    },
+    /// Check if a domain is available for registration
+    Avail {
+        /// Domain name to check
+        domain: String,
+    },
+    /// Check DNSSEC configuration for a domain
+    Dnssec {
+        /// Domain name to check
+        domain: String,
+    },
+    /// Generate shell completions
+    Completions {
+        /// Shell to generate completions for
+        #[arg(value_enum)]
+        shell: Shell,
+    },
+    /// Show or initialize configuration
+    Config {
+        /// Initialize default config file at ~/.seer/config.toml
+        #[arg(long)]
+        init: bool,
+    },
 }
 
 #[tokio::main]
@@ -155,7 +182,14 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
-    let output_format: seer_core::output::OutputFormat = cli.format.parse().unwrap_or_default();
+    // Use config file default when --format is not explicitly provided
+    let output_format: seer_core::output::OutputFormat = if cli.format == "human" {
+        // Could be explicit or default; check config for a different preference
+        let config = seer_core::SeerConfig::load();
+        config.output_format.parse().unwrap_or_default()
+    } else {
+        cli.format.parse().unwrap_or_default()
+    };
 
     match cli.command {
         Some(cmd) => execute_command(cmd, output_format).await,
@@ -378,6 +412,163 @@ async fn execute_command(
                 }
             }
         }
+        Commands::Reverse { ip } => {
+            let resolver = seer_core::DnsResolver::new();
+            match resolver
+                .resolve(&ip, seer_core::RecordType::PTR, None)
+                .await
+            {
+                Ok(records) => {
+                    println!("{}", formatter.format_dns(&records));
+                }
+                Err(e) => {
+                    eprintln!("{} {}", "Error:".ctp_red(), e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Commands::Avail { domain } => {
+            let checker = seer_core::AvailabilityChecker::new();
+            match checker.check(&domain).await {
+                Ok(result) => match output_format {
+                    seer_core::output::OutputFormat::Human => {
+                        let status = if result.available {
+                            "AVAILABLE".ctp_green()
+                        } else {
+                            "TAKEN".ctp_red()
+                        };
+                        println!("{}: {}", result.domain, status);
+                        println!("  Confidence: {}", result.confidence.ctp_yellow());
+                        println!("  Method: {}", result.method);
+                        if let Some(details) = &result.details {
+                            println!("  Details: {}", details);
+                        }
+                    }
+                    seer_core::output::OutputFormat::Json => {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&result).unwrap_or_default()
+                        );
+                    }
+                    seer_core::output::OutputFormat::Yaml => {
+                        let yaml = seer_core::output::YamlFormatter::new();
+                        println!("{}", yaml.to_yaml_value(&result));
+                    }
+                },
+                Err(e) => {
+                    eprintln!("{} {}", "Error:".ctp_red(), e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Commands::Dnssec { domain } => {
+            let checker = seer_core::DnssecChecker::new();
+            match checker.check(&domain).await {
+                Ok(report) => match output_format {
+                    seer_core::output::OutputFormat::Human => {
+                        println!("DNSSEC Report for {}", report.domain.ctp_green());
+                        println!();
+                        let status_colored = match report.status.as_str() {
+                            "secure" => report.status.ctp_green(),
+                            "insecure" => report.status.ctp_yellow(),
+                            _ => report.status.ctp_red(),
+                        };
+                        println!("  Status: {}", status_colored);
+                        println!("  Enabled: {}", report.enabled);
+                        println!("  DS Records: {}", report.ds_records.len());
+                        println!("  DNSKEY Records: {}", report.dnskey_records.len());
+                        if !report.ds_records.is_empty() {
+                            println!();
+                            println!("  DS Records:");
+                            for ds in &report.ds_records {
+                                println!(
+                                    "    Key Tag: {}, Algorithm: {} ({}), Digest: {} ({})",
+                                    ds.key_tag,
+                                    ds.algorithm,
+                                    ds.algorithm_name,
+                                    ds.digest_type,
+                                    ds.digest_type_name
+                                );
+                            }
+                        }
+                        if !report.dnskey_records.is_empty() {
+                            println!();
+                            println!("  DNSKEY Records:");
+                            for key in &report.dnskey_records {
+                                let role = if key.is_ksk {
+                                    "KSK"
+                                } else if key.is_zsk {
+                                    "ZSK"
+                                } else {
+                                    "Other"
+                                };
+                                println!(
+                                    "    Flags: {}, Role: {}, Algorithm: {} ({})",
+                                    key.flags, role, key.algorithm, key.algorithm_name
+                                );
+                            }
+                        }
+                        if !report.issues.is_empty() {
+                            println!();
+                            println!("  Issues:");
+                            for issue in &report.issues {
+                                println!("    - {}", issue);
+                            }
+                        }
+                    }
+                    seer_core::output::OutputFormat::Json => {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&report).unwrap_or_default()
+                        );
+                    }
+                    seer_core::output::OutputFormat::Yaml => {
+                        let yaml = seer_core::output::YamlFormatter::new();
+                        println!("{}", yaml.to_yaml_value(&report));
+                    }
+                },
+                Err(e) => {
+                    eprintln!("{} {}", "Error:".ctp_red(), e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Commands::Completions { shell } => {
+            let mut cmd = Cli::command();
+            generate(shell, &mut cmd, "seer", &mut std::io::stdout());
+        }
+        Commands::Config { init } => {
+            if init {
+                let config_path = seer_core::SeerConfig::config_path();
+                match config_path {
+                    Some(path) => {
+                        if let Some(parent) = path.parent() {
+                            std::fs::create_dir_all(parent)?;
+                        }
+                        if path.exists() {
+                            eprintln!("Config file already exists at: {}", path.display());
+                            std::process::exit(1);
+                        }
+                        let content = seer_core::SeerConfig::default_toml();
+                        std::fs::write(&path, content)?;
+                        println!(
+                            "Created config file at: {}",
+                            path.display().to_string().ctp_green()
+                        );
+                    }
+                    None => {
+                        eprintln!("{} Could not determine home directory", "Error:".ctp_red());
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                let config = seer_core::SeerConfig::load();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&config).unwrap_or_default()
+                );
+            }
+        }
         Commands::Follow {
             domain,
             iterations,
@@ -437,16 +628,11 @@ async fn execute_command(
 
             // Create progress callback for real-time output
             // Note: raw mode is enabled for key detection, so we need \r\n for proper line breaks
-            let use_json = matches!(output_format, seer_core::output::OutputFormat::Json);
+            let follow_format = output_format;
             let callback: seer_core::dns::FollowProgressCallback =
                 std::sync::Arc::new(move |iteration| {
-                    let output = if use_json {
-                        let json_formatter = seer_core::output::JsonFormatter::new();
-                        json_formatter.format_follow_iteration(iteration)
-                    } else {
-                        let human_formatter = seer_core::output::HumanFormatter::new();
-                        human_formatter.format_follow_iteration(iteration)
-                    };
+                    let formatter = seer_core::output::get_formatter(follow_format);
+                    let output = formatter.format_follow_iteration(iteration);
                     // In raw mode, \n alone doesn't return to column 0, so use \r\n
                     let output = output.replace('\n', "\r\n");
                     let mut stdout = std::io::stdout().lock();
