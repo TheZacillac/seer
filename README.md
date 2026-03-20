@@ -43,7 +43,7 @@ Seer provides a unified, high-performance toolkit for domain intelligence with m
 | **DNS Propagation** | Monitor global DNS propagation across 29 nameservers in 6 regions |
 | **DNS Monitoring** | Track DNS record changes over time with configurable intervals |
 | **Domain Status** | HTTP status, site title, SSL certificate info, and expiration dates |
-| **Smart Lookups** | Intelligent fallback: tries RDAP first, then falls back to WHOIS |
+| **Smart Lookups** | Concurrent RDAP + WHOIS with availability fallback |
 | **Bulk Operations** | Process multiple domains concurrently with configurable rate limiting |
 | **SSRF Protection** | Blocks requests to private/reserved IP ranges |
 | **Multiple Interfaces** | CLI, Rust library, Python library, REST API, and MCP server |
@@ -134,7 +134,7 @@ To use Seer in your Rust project, add `seer-core` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-seer-core = "0.1"
+seer-core = "0.12"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -234,7 +234,7 @@ The CLI offers two modes: **command mode** for scripts/one-off queries, and **in
 #### Command Mode
 
 ```bash
-# Smart lookup (RDAP with WHOIS fallback)
+# Smart lookup (concurrent RDAP + WHOIS)
 seer lookup example.com
 
 # WHOIS lookup
@@ -251,7 +251,7 @@ seer dig example.com MX        # MX records
 seer dig example.com A @8.8.8.8  # Custom nameserver
 
 # DNS propagation check
-seer propagation example.com A
+seer prop example.com A
 
 # Domain status check (HTTP, SSL, expiration)
 seer status example.com
@@ -274,6 +274,7 @@ seer bulk status domains.txt -o results.csv  # Export to CSV
 ```bash
 seer --format human lookup example.com  # Human-readable (default)
 seer --format json lookup example.com   # JSON output
+seer --format yaml lookup example.com   # YAML output
 ```
 
 #### Interactive REPL
@@ -302,7 +303,7 @@ seer> exit
 ```python
 import seer
 
-# Smart lookup (RDAP with WHOIS fallback)
+# Smart lookup (concurrent RDAP + WHOIS)
 result = seer.lookup("example.com")
 
 # WHOIS lookup
@@ -346,7 +347,7 @@ Add to `Cargo.toml`:
 
 ```toml
 [dependencies]
-seer-core = "0.1"
+seer-core = "0.12"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -606,7 +607,7 @@ seer/
 │   └── src/
 │       ├── lib.rs          # Module exports
 │       ├── error.rs        # Error types
-│       ├── lookup.rs       # Smart lookup (RDAP → WHOIS fallback)
+│       ├── lookup.rs       # Smart lookup (concurrent RDAP + WHOIS)
 │       ├── validation.rs   # Domain validation & SSRF protection
 │       ├── colors.rs       # Catppuccin color palette
 │       ├── whois/          # WHOIS client and parser
@@ -614,7 +615,7 @@ seer/
 │       ├── dns/            # DNS resolver, propagation, and follow
 │       ├── status/         # Domain status checker
 │       ├── bulk/           # Bulk operation executor
-│       └── output/         # Output formatters (human/JSON)
+│       └── output/         # Output formatters (human/JSON/YAML)
 │
 ├── seer-cli/               # CLI application
 │   ├── README.md

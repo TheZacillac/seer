@@ -19,7 +19,7 @@ cargo run --release -p seer-cli -- <command>
 ### Lookup Commands
 
 ```bash
-# Smart lookup (RDAP first, WHOIS fallback)
+# Smart lookup (concurrent RDAP + WHOIS, availability fallback)
 seer lookup example.com
 
 # WHOIS only
