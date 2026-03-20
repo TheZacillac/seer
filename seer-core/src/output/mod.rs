@@ -40,6 +40,8 @@ pub trait OutputFormatter {
     fn format_status(&self, response: &crate::status::StatusResponse) -> String;
     fn format_follow_iteration(&self, iteration: &crate::dns::FollowIteration) -> String;
     fn format_follow(&self, result: &crate::dns::FollowResult) -> String;
+    fn format_availability(&self, result: &crate::availability::AvailabilityResult) -> String;
+    fn format_dnssec(&self, report: &crate::dns::DnssecReport) -> String;
 }
 
 /// YAML output formatter that converts data structures to YAML format.
@@ -90,6 +92,12 @@ impl OutputFormatter for YamlFormatter {
     }
     fn format_follow(&self, result: &crate::dns::FollowResult) -> String {
         self.to_yaml_value(result)
+    }
+    fn format_availability(&self, result: &crate::availability::AvailabilityResult) -> String {
+        self.to_yaml_value(result)
+    }
+    fn format_dnssec(&self, report: &crate::dns::DnssecReport) -> String {
+        self.to_yaml_value(report)
     }
 }
 

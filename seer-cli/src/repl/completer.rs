@@ -5,20 +5,8 @@ use rustyline::validate::Validator;
 use rustyline::Helper;
 
 const COMMANDS: &[&str] = &[
-    "help",
-    "exit",
-    "quit",
-    "lookup",
-    "whois",
-    "rdap",
-    "dig",
-    "dns",
-    "prop",
-    "follow",
-    "bulk",
-    "status",
-    "set",
-    "clear",
+    "help", "exit", "quit", "lookup", "whois", "rdap", "dig", "dns", "prop", "follow", "reverse",
+    "avail", "dnssec", "bulk", "status", "set", "clear",
 ];
 
 const RECORD_TYPES: &[&str] = &[
@@ -29,7 +17,7 @@ const BULK_OPERATIONS: &[&str] = &["lookup", "whois", "rdap", "dig", "prop", "st
 
 const SET_OPTIONS: &[&str] = &["output"];
 
-const OUTPUT_FORMATS: &[&str] = &["human", "json"];
+const OUTPUT_FORMATS: &[&str] = &["human", "json", "yaml"];
 
 pub struct SeerCompleter;
 
@@ -168,8 +156,11 @@ impl Hinter for SeerCompleter {
                 Some(" <operation> <file.txt>".to_string())
             }
             "set" if words.len() == 1 && line.ends_with(' ') => {
-                Some(" output <human|json>".to_string())
+                Some(" output <human|json|yaml>".to_string())
             }
+            "reverse" if words.len() == 1 && line.ends_with(' ') => Some(" <ip>".to_string()),
+            "avail" if words.len() == 1 && line.ends_with(' ') => Some(" <domain>".to_string()),
+            "dnssec" if words.len() == 1 && line.ends_with(' ') => Some(" <domain>".to_string()),
             "status" if words.len() == 1 && line.ends_with(' ') => Some(" <domain>".to_string()),
             "follow" if words.len() == 1 && line.ends_with(' ') => {
                 Some(" <domain> [iterations] [interval_minutes] [type] [@server]".to_string())

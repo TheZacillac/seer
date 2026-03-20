@@ -67,6 +67,14 @@ impl OutputFormatter for JsonFormatter {
     fn format_follow(&self, result: &FollowResult) -> String {
         self.to_json(result)
     }
+
+    fn format_availability(&self, result: &crate::availability::AvailabilityResult) -> String {
+        self.to_json(result)
+    }
+
+    fn format_dnssec(&self, report: &crate::dns::DnssecReport) -> String {
+        self.to_json(report)
+    }
 }
 
 #[cfg(test)]

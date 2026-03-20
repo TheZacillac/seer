@@ -7,9 +7,9 @@ pub struct CommandContext {
 
 impl CommandContext {
     pub fn new() -> Self {
-        Self {
-            output_format: OutputFormat::Human,
-        }
+        let config = seer_core::SeerConfig::load();
+        let output_format = config.output_format.parse().unwrap_or_default();
+        Self { output_format }
     }
 }
 

@@ -14,26 +14,23 @@ use rustyline::error::ReadlineError;
 use rustyline::history::DefaultHistory;
 use rustyline::{CompletionType, Editor};
 use seer_core::colors::CatppuccinExt;
-use seer_core::output::OutputFormatter;
 use tokio::sync::watch;
 
 use crate::display::{clear_bulk_progress_bar, set_bulk_progress_bar, Spinner};
 
 const HISTORY_FILE: &str = ".seer_history";
 
-fn format_interval(minutes: f64) -> String {
-    if minutes < 1.0 {
-        format!("{}s", (minutes * 60.0) as u64)
-    } else if minutes == 1.0 {
-        "1m".to_string()
-    } else {
-        format!("{}m", minutes)
-    }
-}
-
 pub struct Repl {
     editor: Editor<SeerCompleter, DefaultHistory>,
     context: CommandContext,
+    whois_client: seer_core::WhoisClient,
+    rdap_client: seer_core::RdapClient,
+    dns_resolver: seer_core::DnsResolver,
+    propagation_checker: seer_core::dns::PropagationChecker,
+    status_client: seer_core::StatusClient,
+    dnssec_checker: seer_core::DnssecChecker,
+    availability_checker: seer_core::AvailabilityChecker,
+    dns_follower: seer_core::DnsFollower,
 }
 
 impl Repl {
@@ -58,6 +55,14 @@ impl Repl {
         Ok(Self {
             editor,
             context: CommandContext::new(),
+            whois_client: seer_core::WhoisClient::new(),
+            rdap_client: seer_core::RdapClient::new(),
+            dns_resolver: seer_core::DnsResolver::new(),
+            propagation_checker: seer_core::dns::PropagationChecker::new(),
+            status_client: seer_core::StatusClient::new(),
+            dnssec_checker: seer_core::DnssecChecker::new(),
+            availability_checker: seer_core::AvailabilityChecker::new(),
+            dns_follower: seer_core::DnsFollower::new(),
         })
     }
 
@@ -162,6 +167,9 @@ impl Repl {
             "rdap" => self.execute_rdap(args).await,
             "dig" | "dns" => self.execute_dig(args).await,
             "propagation" | "prop" => self.execute_propagation(args).await,
+            "reverse" => self.execute_reverse(args).await,
+            "avail" => self.execute_avail(args).await,
+            "dnssec" => self.execute_dnssec(args).await,
             "bulk" => self.execute_bulk(args).await,
             "status" => self.execute_status(args).await,
             "follow" => self.execute_follow(args).await,
@@ -220,6 +228,20 @@ impl Repl {
             "Record types: A, AAAA, CNAME, MX, NS, TXT, SOA, PTR, SRV, CAA".dimmed()
         );
         println!();
+        println!("{}", "UTILITY COMMANDS".bright_purple().bold());
+        println!(
+            "  {:<34} Reverse DNS lookup for an IP",
+            "reverse <ip>".bright_cyan()
+        );
+        println!(
+            "  {:<34} Check domain registration availability",
+            "avail <domain>".bright_cyan()
+        );
+        println!(
+            "  {:<34} Check DNSSEC configuration",
+            "dnssec <domain>".bright_cyan()
+        );
+        println!();
         println!("{}", "STATUS COMMANDS".bright_purple().bold());
         println!(
             "  {:<34} Check HTTP, SSL, and domain expiration",
@@ -239,7 +261,7 @@ impl Repl {
         println!("{}", "SETTINGS".bright_purple().bold());
         println!(
             "  {:<34} Change output format",
-            "set output <human|json>".bright_cyan()
+            "set output <human|json|yaml>".bright_cyan()
         );
         println!("  {:<34} Clear screen", "clear".bright_cyan());
         println!("  {:<34} Exit the program", "exit".bright_cyan());
@@ -348,8 +370,7 @@ impl Repl {
         let domain = args[0];
         let spinner = Spinner::new(&format!("Looking up WHOIS for {}", domain));
 
-        let client = seer_core::WhoisClient::new();
-        match client.lookup(domain).await {
+        match self.whois_client.lookup(domain).await {
             Ok(response) => {
                 spinner.finish();
                 let formatter = seer_core::output::get_formatter(self.context.output_format);
@@ -371,21 +392,19 @@ impl Repl {
         let query = args[0];
         let spinner = Spinner::new(&format!("Looking up RDAP for {}", query));
 
-        let client = seer_core::RdapClient::new();
-
         // Determine query type
         let result = if query.starts_with("AS") || query.starts_with("as") {
             match query[2..].parse::<u32>() {
-                Ok(asn) => client.lookup_asn(asn).await,
+                Ok(asn) => self.rdap_client.lookup_asn(asn).await,
                 Err(_) => {
                     spinner.finish();
                     return CommandResult::Error("Invalid ASN format".to_string());
                 }
             }
         } else if query.parse::<std::net::IpAddr>().is_ok() {
-            client.lookup_ip(query).await
+            self.rdap_client.lookup_ip(query).await
         } else {
-            client.lookup_domain(query).await
+            self.rdap_client.lookup_domain(query).await
         };
 
         match result {
@@ -421,8 +440,11 @@ impl Repl {
 
         let spinner = Spinner::new(&format!("Querying {} {} records", domain, record_type));
 
-        let resolver = seer_core::DnsResolver::new();
-        match resolver.resolve(domain, record_type, nameserver).await {
+        match self
+            .dns_resolver
+            .resolve(domain, record_type, nameserver)
+            .await
+        {
             Ok(records) => {
                 spinner.finish();
                 let formatter = seer_core::output::get_formatter(self.context.output_format);
@@ -452,12 +474,81 @@ impl Repl {
             domain, record_type
         ));
 
-        let checker = seer_core::dns::PropagationChecker::new();
-        match checker.check(domain, record_type).await {
+        match self.propagation_checker.check(domain, record_type).await {
             Ok(result) => {
                 spinner.finish();
                 let formatter = seer_core::output::get_formatter(self.context.output_format);
                 println!("{}", formatter.format_propagation(&result));
+                CommandResult::Continue
+            }
+            Err(e) => {
+                spinner.finish();
+                CommandResult::Error(e.to_string())
+            }
+        }
+    }
+
+    async fn execute_reverse(&self, args: &[&str]) -> CommandResult {
+        if args.is_empty() {
+            return CommandResult::Error("Usage: reverse <ip>".to_string());
+        }
+
+        let ip = args[0];
+        let spinner = Spinner::new(&format!("Looking up PTR for {}", ip));
+
+        match self
+            .dns_resolver
+            .resolve(ip, seer_core::RecordType::PTR, None)
+            .await
+        {
+            Ok(records) => {
+                spinner.finish();
+                let formatter = seer_core::output::get_formatter(self.context.output_format);
+                println!("{}", formatter.format_dns(&records));
+                CommandResult::Continue
+            }
+            Err(e) => {
+                spinner.finish();
+                CommandResult::Error(e.to_string())
+            }
+        }
+    }
+
+    async fn execute_avail(&self, args: &[&str]) -> CommandResult {
+        if args.is_empty() {
+            return CommandResult::Error("Usage: avail <domain>".to_string());
+        }
+
+        let domain = args[0];
+        let spinner = Spinner::new(&format!("Checking availability of {}", domain));
+
+        match self.availability_checker.check(domain).await {
+            Ok(result) => {
+                spinner.finish();
+                let formatter = seer_core::output::get_formatter(self.context.output_format);
+                println!("{}", formatter.format_availability(&result));
+                CommandResult::Continue
+            }
+            Err(e) => {
+                spinner.finish();
+                CommandResult::Error(e.to_string())
+            }
+        }
+    }
+
+    async fn execute_dnssec(&self, args: &[&str]) -> CommandResult {
+        if args.is_empty() {
+            return CommandResult::Error("Usage: dnssec <domain>".to_string());
+        }
+
+        let domain = args[0];
+        let spinner = Spinner::new(&format!("Checking DNSSEC for {}", domain));
+
+        match self.dnssec_checker.check(domain).await {
+            Ok(report) => {
+                spinner.finish();
+                let formatter = seer_core::output::get_formatter(self.context.output_format);
+                println!("{}", formatter.format_dnssec(&report));
                 CommandResult::Continue
             }
             Err(e) => {
@@ -589,9 +680,9 @@ impl Repl {
                 .collect(),
             _ => {
                 return CommandResult::Error(format!(
-                "Unknown bulk operation: {}. Use: lookup, whois, rdap, dig, prop, status",
-                operation
-            ))
+                    "Unknown bulk operation: {}. Use: lookup, whois, rdap, dig/dns, prop, status",
+                    operation
+                ))
             }
         };
 
@@ -602,7 +693,7 @@ impl Repl {
         progress.finish_and_clear();
 
         // Write results to CSV
-        let csv_content = bulk_results_to_csv(&results, operation);
+        let csv_content = crate::utils::bulk_results_to_csv(&results, operation);
         if let Err(e) = std::fs::write(&output_path, csv_content) {
             return CommandResult::Error(format!("Failed to write output file: {}", e));
         }
@@ -654,8 +745,7 @@ impl Repl {
         let domain = args[0];
         let spinner = Spinner::new(&format!("Checking status for {}", domain));
 
-        let client = seer_core::StatusClient::new();
-        match client.check(domain).await {
+        match self.status_client.check(domain).await {
             Ok(response) => {
                 spinner.finish();
                 let formatter = seer_core::output::get_formatter(self.context.output_format);
@@ -708,7 +798,7 @@ impl Repl {
             domain.ctp_green(),
             record_type.to_string().ctp_yellow(),
             iterations.to_string().ctp_yellow(),
-            format_interval(interval_minutes)
+            crate::utils::format_interval(interval_minutes)
         );
         println!(
             "Press {} or {} to stop early\n",
@@ -716,24 +806,20 @@ impl Repl {
             "Ctrl+C".ctp_yellow()
         );
 
-        let follower = seer_core::DnsFollower::new();
-
         // Set up cancellation channel
         let (cancel_tx, cancel_rx) = watch::channel(false);
 
         // Create progress callback for real-time output
-        let use_json = matches!(
-            self.context.output_format,
-            seer_core::output::OutputFormat::Json
-        );
+        // Note: raw mode is enabled for key detection, so we need \r\n for proper line breaks
+        let follow_format = self.context.output_format;
         let callback: seer_core::dns::FollowProgressCallback = Arc::new(move |iteration| {
-            if use_json {
-                let json_formatter = seer_core::output::JsonFormatter::new();
-                println!("{}", json_formatter.format_follow_iteration(iteration));
-            } else {
-                let human_formatter = seer_core::output::HumanFormatter::new();
-                println!("{}", human_formatter.format_follow_iteration(iteration));
-            }
+            let formatter = seer_core::output::get_formatter(follow_format);
+            let output = formatter.format_follow_iteration(iteration);
+            let output = output.replace('\n', "\r\n");
+            let mut stdout = std::io::stdout().lock();
+            let _ = stdout.write_all(output.as_bytes());
+            let _ = stdout.write_all(b"\r\n");
+            let _ = stdout.flush();
         });
 
         // Enable raw mode to capture key presses
@@ -770,7 +856,8 @@ impl Repl {
             }
         });
 
-        let result = follower
+        let result = self
+            .dns_follower
             .follow(
                 domain,
                 record_type,
@@ -812,293 +899,11 @@ impl Repl {
                     println!("Output format set to: {}", args[1]);
                     CommandResult::Continue
                 }
-                Err(_) => CommandResult::Error("Invalid format. Use: human, json".to_string()),
+                Err(_) => {
+                    CommandResult::Error("Invalid format. Use: human, json, yaml".to_string())
+                }
             },
             _ => CommandResult::Error(format!("Unknown setting: {}", args[0])),
         }
     }
-}
-
-fn bulk_results_to_csv(results: &[seer_core::bulk::BulkResult], operation: &str) -> String {
-    use seer_core::bulk::BulkResultData;
-
-    let mut csv = String::new();
-
-    // Write header based on operation type
-    match operation {
-        "status" => {
-            csv.push_str("domain,success,http_status,http_status_text,title,ssl_issuer,ssl_valid_until,ssl_days_remaining,domain_expires,domain_days_remaining,registrar,duration_ms\n");
-        }
-        "lookup" | "whois" | "rdap" => {
-            csv.push_str("domain,success,registrar,created,expires,updated,duration_ms\n");
-        }
-        "dig" | "dns" => {
-            csv.push_str("domain,success,record_type,records,duration_ms\n");
-        }
-        "propagation" | "prop" => {
-            csv.push_str(
-                "domain,success,propagation_pct,servers_total,servers_responded,duration_ms\n",
-            );
-        }
-        _ => {
-            csv.push_str("domain,success,duration_ms\n");
-        }
-    }
-
-    // Write data rows
-    for result in results {
-        let domain = get_domain_from_operation(&result.operation);
-        let success = result.success;
-        let duration_ms = result.duration_ms;
-
-        match operation {
-            "status" => {
-                let (
-                    http_status,
-                    http_text,
-                    title,
-                    ssl_issuer,
-                    ssl_valid_until,
-                    ssl_days,
-                    domain_expires,
-                    domain_days,
-                    registrar,
-                ) = if let Some(BulkResultData::Status(ref s)) = result.data {
-                    (
-                        s.http_status
-                            .map(|v: u16| v.to_string())
-                            .unwrap_or_default(),
-                        s.http_status_text.clone().unwrap_or_default(),
-                        s.title.clone().unwrap_or_default(),
-                        s.certificate
-                            .as_ref()
-                            .map(|c| c.issuer.clone())
-                            .unwrap_or_default(),
-                        s.certificate
-                            .as_ref()
-                            .map(|c| c.valid_until.format("%Y-%m-%d").to_string())
-                            .unwrap_or_default(),
-                        s.certificate
-                            .as_ref()
-                            .map(|c| c.days_until_expiry.to_string())
-                            .unwrap_or_default(),
-                        s.domain_expiration
-                            .as_ref()
-                            .map(|d| d.expiration_date.format("%Y-%m-%d").to_string())
-                            .unwrap_or_default(),
-                        s.domain_expiration
-                            .as_ref()
-                            .map(|d| d.days_until_expiry.to_string())
-                            .unwrap_or_default(),
-                        s.domain_expiration
-                            .as_ref()
-                            .and_then(|d| d.registrar.clone())
-                            .unwrap_or_default(),
-                    )
-                } else {
-                    Default::default()
-                };
-                csv.push_str(&format!(
-                    "{},{},{},{},{},{},{},{},{},{},{},{}\n",
-                    domain,
-                    success,
-                    http_status,
-                    escape_csv_field(&http_text),
-                    escape_csv_field(&title),
-                    escape_csv_field(&ssl_issuer),
-                    ssl_valid_until,
-                    ssl_days,
-                    domain_expires,
-                    domain_days,
-                    escape_csv_field(&registrar),
-                    duration_ms
-                ));
-            }
-            "lookup" => {
-                let (registrar, created, expires, updated) = if let Some(ref data) = result.data {
-                    match data {
-                        BulkResultData::Lookup(seer_core::lookup::LookupResult::Rdap {
-                            data: r,
-                            ..
-                        }) => extract_rdap_dates(r),
-                        BulkResultData::Lookup(seer_core::lookup::LookupResult::Whois {
-                            data: w,
-                            ..
-                        }) => (
-                            w.registrar.clone().unwrap_or_default(),
-                            w.creation_date
-                                .map(|d| d.format("%Y-%m-%d").to_string())
-                                .unwrap_or_default(),
-                            w.expiration_date
-                                .map(|d| d.format("%Y-%m-%d").to_string())
-                                .unwrap_or_default(),
-                            w.updated_date
-                                .map(|d| d.format("%Y-%m-%d").to_string())
-                                .unwrap_or_default(),
-                        ),
-                        _ => Default::default(),
-                    }
-                } else {
-                    Default::default()
-                };
-                csv.push_str(&format!(
-                    "{},{},{},{},{},{},{}\n",
-                    domain,
-                    success,
-                    escape_csv_field(&registrar),
-                    created,
-                    expires,
-                    updated,
-                    duration_ms
-                ));
-            }
-            "whois" => {
-                let (registrar, created, expires, updated) =
-                    if let Some(BulkResultData::Whois(ref w)) = result.data {
-                        (
-                            w.registrar.clone().unwrap_or_default(),
-                            w.creation_date
-                                .map(|d| d.format("%Y-%m-%d").to_string())
-                                .unwrap_or_default(),
-                            w.expiration_date
-                                .map(|d| d.format("%Y-%m-%d").to_string())
-                                .unwrap_or_default(),
-                            w.updated_date
-                                .map(|d| d.format("%Y-%m-%d").to_string())
-                                .unwrap_or_default(),
-                        )
-                    } else {
-                        Default::default()
-                    };
-                csv.push_str(&format!(
-                    "{},{},{},{},{},{},{}\n",
-                    domain,
-                    success,
-                    escape_csv_field(&registrar),
-                    created,
-                    expires,
-                    updated,
-                    duration_ms
-                ));
-            }
-            "rdap" => {
-                let (registrar, created, expires, updated) =
-                    if let Some(BulkResultData::Rdap(ref r)) = result.data {
-                        extract_rdap_dates(r)
-                    } else {
-                        Default::default()
-                    };
-                csv.push_str(&format!(
-                    "{},{},{},{},{},{},{}\n",
-                    domain,
-                    success,
-                    escape_csv_field(&registrar),
-                    created,
-                    expires,
-                    updated,
-                    duration_ms
-                ));
-            }
-            "dig" | "dns" => {
-                let (record_type, records) =
-                    if let Some(BulkResultData::Dns(ref recs)) = result.data {
-                        let rt = recs
-                            .first()
-                            .map(|r| r.record_type.to_string())
-                            .unwrap_or_default();
-                        let vals: Vec<String> = recs.iter().map(|r| r.format_short()).collect();
-                        (rt, vals.join("; "))
-                    } else {
-                        Default::default()
-                    };
-                csv.push_str(&format!(
-                    "{},{},{},{},{}\n",
-                    domain,
-                    success,
-                    record_type,
-                    escape_csv_field(&records),
-                    duration_ms
-                ));
-            }
-            "propagation" | "prop" => {
-                let (pct, total, responded) =
-                    if let Some(BulkResultData::Propagation(ref p)) = result.data {
-                        let total = p.results.len();
-                        let responded = p.results.iter().filter(|r| r.success).count();
-                        let pct = if total > 0 {
-                            (responded as f64 / total as f64) * 100.0
-                        } else {
-                            0.0
-                        };
-                        (
-                            format!("{:.1}", pct),
-                            total.to_string(),
-                            responded.to_string(),
-                        )
-                    } else {
-                        Default::default()
-                    };
-                csv.push_str(&format!(
-                    "{},{},{},{},{},{}\n",
-                    domain, success, pct, total, responded, duration_ms
-                ));
-            }
-            _ => {
-                csv.push_str(&format!("{},{},{}\n", domain, success, duration_ms));
-            }
-        }
-    }
-
-    csv
-}
-
-fn escape_csv_field(s: &str) -> String {
-    // Protect against CSV injection by prefixing formula-starting characters with a single quote
-    let s = if s.starts_with('=')
-        || s.starts_with('+')
-        || s.starts_with('-')
-        || s.starts_with('@')
-        || s.starts_with('\t')
-        || s.starts_with('\r')
-    {
-        format!("'{}", s)
-    } else {
-        s.to_string()
-    };
-
-    // Replace commas and newlines with spaces for cleaner CSV
-    s.replace([',', '\n'], " ").replace('"', "'")
-}
-
-fn get_domain_from_operation(op: &seer_core::bulk::BulkOperation) -> String {
-    use seer_core::bulk::BulkOperation;
-    match op {
-        BulkOperation::Whois { domain } => domain.clone(),
-        BulkOperation::Rdap { domain } => domain.clone(),
-        BulkOperation::Dns { domain, .. } => domain.clone(),
-        BulkOperation::Propagation { domain, .. } => domain.clone(),
-        BulkOperation::Lookup { domain } => domain.clone(),
-        BulkOperation::Status { domain } => domain.clone(),
-    }
-}
-
-fn extract_rdap_dates(r: &seer_core::rdap::RdapResponse) -> (String, String, String, String) {
-    let registrar = r.get_registrar().unwrap_or_default();
-
-    let created = r
-        .creation_date()
-        .map(|d| d.format("%Y-%m-%d").to_string())
-        .unwrap_or_default();
-
-    let expires = r
-        .expiration_date()
-        .map(|d| d.format("%Y-%m-%d").to_string())
-        .unwrap_or_default();
-
-    let updated = r
-        .last_updated()
-        .map(|d| d.format("%Y-%m-%d").to_string())
-        .unwrap_or_default();
-
-    (registrar, created, expires, updated)
 }

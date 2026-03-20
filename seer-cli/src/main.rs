@@ -1,5 +1,6 @@
 mod display;
 mod repl;
+mod utils;
 
 use std::io::Write;
 
@@ -372,7 +373,7 @@ async fn execute_command(
                     .collect(),
                 _ => {
                     eprintln!(
-                        "{} Unknown operation: {}. Use: lookup, whois, rdap, dig, prop, status",
+                        "{} Unknown operation: {}. Use: lookup, whois, rdap, dig/dns, prop, status",
                         "Error:".ctp_red(),
                         operation
                     );
@@ -383,7 +384,7 @@ async fn execute_command(
             let results = executor.execute(operations, None).await;
 
             // Convert results to CSV
-            let csv_content = bulk_results_to_csv(&results, &operation);
+            let csv_content = utils::bulk_results_to_csv(&results, &operation);
             std::fs::write(&output_path, csv_content)?;
 
             let success_count = results.iter().filter(|r| r.success).count();
@@ -430,31 +431,9 @@ async fn execute_command(
         Commands::Avail { domain } => {
             let checker = seer_core::AvailabilityChecker::new();
             match checker.check(&domain).await {
-                Ok(result) => match output_format {
-                    seer_core::output::OutputFormat::Human => {
-                        let status = if result.available {
-                            "AVAILABLE".ctp_green()
-                        } else {
-                            "TAKEN".ctp_red()
-                        };
-                        println!("{}: {}", result.domain, status);
-                        println!("  Confidence: {}", result.confidence.ctp_yellow());
-                        println!("  Method: {}", result.method);
-                        if let Some(details) = &result.details {
-                            println!("  Details: {}", details);
-                        }
-                    }
-                    seer_core::output::OutputFormat::Json => {
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&result).unwrap_or_default()
-                        );
-                    }
-                    seer_core::output::OutputFormat::Yaml => {
-                        let yaml = seer_core::output::YamlFormatter::new();
-                        println!("{}", yaml.to_yaml_value(&result));
-                    }
-                },
+                Ok(result) => {
+                    println!("{}", formatter.format_availability(&result));
+                }
                 Err(e) => {
                     eprintln!("{} {}", "Error:".ctp_red(), e);
                     std::process::exit(1);
@@ -464,69 +443,9 @@ async fn execute_command(
         Commands::Dnssec { domain } => {
             let checker = seer_core::DnssecChecker::new();
             match checker.check(&domain).await {
-                Ok(report) => match output_format {
-                    seer_core::output::OutputFormat::Human => {
-                        println!("DNSSEC Report for {}", report.domain.ctp_green());
-                        println!();
-                        let status_colored = match report.status.as_str() {
-                            "secure" => report.status.ctp_green(),
-                            "insecure" => report.status.ctp_yellow(),
-                            _ => report.status.ctp_red(),
-                        };
-                        println!("  Status: {}", status_colored);
-                        println!("  Enabled: {}", report.enabled);
-                        println!("  DS Records: {}", report.ds_records.len());
-                        println!("  DNSKEY Records: {}", report.dnskey_records.len());
-                        if !report.ds_records.is_empty() {
-                            println!();
-                            println!("  DS Records:");
-                            for ds in &report.ds_records {
-                                println!(
-                                    "    Key Tag: {}, Algorithm: {} ({}), Digest: {} ({})",
-                                    ds.key_tag,
-                                    ds.algorithm,
-                                    ds.algorithm_name,
-                                    ds.digest_type,
-                                    ds.digest_type_name
-                                );
-                            }
-                        }
-                        if !report.dnskey_records.is_empty() {
-                            println!();
-                            println!("  DNSKEY Records:");
-                            for key in &report.dnskey_records {
-                                let role = if key.is_ksk {
-                                    "KSK"
-                                } else if key.is_zsk {
-                                    "ZSK"
-                                } else {
-                                    "Other"
-                                };
-                                println!(
-                                    "    Flags: {}, Role: {}, Algorithm: {} ({})",
-                                    key.flags, role, key.algorithm, key.algorithm_name
-                                );
-                            }
-                        }
-                        if !report.issues.is_empty() {
-                            println!();
-                            println!("  Issues:");
-                            for issue in &report.issues {
-                                println!("    - {}", issue);
-                            }
-                        }
-                    }
-                    seer_core::output::OutputFormat::Json => {
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&report).unwrap_or_default()
-                        );
-                    }
-                    seer_core::output::OutputFormat::Yaml => {
-                        let yaml = seer_core::output::YamlFormatter::new();
-                        println!("{}", yaml.to_yaml_value(&report));
-                    }
-                },
+                Ok(report) => {
+                    println!("{}", formatter.format_dnssec(&report));
+                }
                 Err(e) => {
                     eprintln!("{} {}", "Error:".ctp_red(), e);
                     std::process::exit(1);
@@ -647,7 +566,7 @@ async fn execute_command(
                 domain.ctp_green(),
                 record_type.ctp_yellow(),
                 iterations.to_string().ctp_yellow(),
-                format_interval(interval_minutes)
+                utils::format_interval(interval_minutes)
             );
             print!(
                 "Press {} or {} to stop early\r\n\r\n",
@@ -682,331 +601,4 @@ async fn execute_command(
     }
 
     Ok(())
-}
-
-fn format_interval(minutes: f64) -> String {
-    if minutes < 1.0 {
-        format!("{}s", (minutes * 60.0) as u64)
-    } else if minutes == 1.0 {
-        "1m".to_string()
-    } else {
-        format!("{}m", minutes)
-    }
-}
-
-fn bulk_results_to_csv(results: &[seer_core::bulk::BulkResult], operation: &str) -> String {
-    use seer_core::bulk::BulkResultData;
-
-    let mut csv = String::new();
-
-    // Write header based on operation type
-    match operation {
-        "status" => {
-            csv.push_str("domain,success,http_status,http_status_text,title,ssl_issuer,ssl_valid_until,ssl_days_remaining,domain_expires,domain_days_remaining,registrar,dns_resolves,dns_a_records,dns_aaaa_records,dns_cname,dns_nameservers,duration_ms\n");
-        }
-        "lookup" | "whois" | "rdap" => {
-            csv.push_str("domain,success,registrar,created,expires,updated,duration_ms\n");
-        }
-        "dig" | "dns" => {
-            csv.push_str("domain,success,record_type,records,duration_ms\n");
-        }
-        "propagation" | "prop" => {
-            csv.push_str(
-                "domain,success,propagation_pct,servers_total,servers_responded,duration_ms\n",
-            );
-        }
-        _ => {
-            csv.push_str("domain,success,duration_ms\n");
-        }
-    }
-
-    // Write data rows
-    for result in results {
-        let domain = get_domain_from_operation(&result.operation);
-        let success = result.success;
-        let duration_ms = result.duration_ms;
-
-        match operation {
-            "status" => {
-                let (
-                    http_status,
-                    http_text,
-                    title,
-                    ssl_issuer,
-                    ssl_valid_until,
-                    ssl_days,
-                    domain_expires,
-                    domain_days,
-                    registrar,
-                ) = if let Some(BulkResultData::Status(ref s)) = result.data {
-                    (
-                        s.http_status
-                            .map(|v: u16| v.to_string())
-                            .unwrap_or_default(),
-                        s.http_status_text.clone().unwrap_or_default(),
-                        s.title.clone().unwrap_or_default(),
-                        s.certificate
-                            .as_ref()
-                            .map(|c| c.issuer.clone())
-                            .unwrap_or_default(),
-                        s.certificate
-                            .as_ref()
-                            .map(|c| c.valid_until.format("%Y-%m-%d").to_string())
-                            .unwrap_or_default(),
-                        s.certificate
-                            .as_ref()
-                            .map(|c| c.days_until_expiry.to_string())
-                            .unwrap_or_default(),
-                        s.domain_expiration
-                            .as_ref()
-                            .map(|d| d.expiration_date.format("%Y-%m-%d").to_string())
-                            .unwrap_or_default(),
-                        s.domain_expiration
-                            .as_ref()
-                            .map(|d| d.days_until_expiry.to_string())
-                            .unwrap_or_default(),
-                        s.domain_expiration
-                            .as_ref()
-                            .and_then(|d| d.registrar.clone())
-                            .unwrap_or_default(),
-                    )
-                } else {
-                    Default::default()
-                };
-                let (dns_resolves, dns_a, dns_aaaa, dns_cname, dns_ns) =
-                    if let Some(BulkResultData::Status(ref s)) = result.data {
-                        (
-                            s.dns_resolution
-                                .as_ref()
-                                .map(|d| d.resolves.to_string())
-                                .unwrap_or_default(),
-                            s.dns_resolution
-                                .as_ref()
-                                .map(|d| d.a_records.join(";"))
-                                .unwrap_or_default(),
-                            s.dns_resolution
-                                .as_ref()
-                                .map(|d| d.aaaa_records.join(";"))
-                                .unwrap_or_default(),
-                            s.dns_resolution
-                                .as_ref()
-                                .and_then(|d| d.cname_target.clone())
-                                .unwrap_or_default(),
-                            s.dns_resolution
-                                .as_ref()
-                                .map(|d| d.nameservers.join(";"))
-                                .unwrap_or_default(),
-                        )
-                    } else {
-                        Default::default()
-                    };
-                csv.push_str(&format!(
-                    "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
-                    domain,
-                    success,
-                    http_status,
-                    escape_csv_field(&http_text),
-                    escape_csv_field(&title),
-                    escape_csv_field(&ssl_issuer),
-                    ssl_valid_until,
-                    ssl_days,
-                    domain_expires,
-                    domain_days,
-                    escape_csv_field(&registrar),
-                    dns_resolves,
-                    escape_csv_field(&dns_a),
-                    escape_csv_field(&dns_aaaa),
-                    escape_csv_field(&dns_cname),
-                    escape_csv_field(&dns_ns),
-                    duration_ms
-                ));
-            }
-            "lookup" => {
-                let (registrar, created, expires, updated) = if let Some(ref data) = result.data {
-                    match data {
-                        BulkResultData::Lookup(seer_core::lookup::LookupResult::Rdap {
-                            data: r,
-                            ..
-                        }) => extract_rdap_dates(r),
-                        BulkResultData::Lookup(seer_core::lookup::LookupResult::Whois {
-                            data: w,
-                            ..
-                        }) => (
-                            w.registrar.clone().unwrap_or_default(),
-                            w.creation_date
-                                .map(|d| d.format("%Y-%m-%d").to_string())
-                                .unwrap_or_default(),
-                            w.expiration_date
-                                .map(|d| d.format("%Y-%m-%d").to_string())
-                                .unwrap_or_default(),
-                            w.updated_date
-                                .map(|d| d.format("%Y-%m-%d").to_string())
-                                .unwrap_or_default(),
-                        ),
-                        _ => Default::default(),
-                    }
-                } else {
-                    Default::default()
-                };
-                csv.push_str(&format!(
-                    "{},{},{},{},{},{},{}\n",
-                    domain,
-                    success,
-                    escape_csv_field(&registrar),
-                    created,
-                    expires,
-                    updated,
-                    duration_ms
-                ));
-            }
-            "whois" => {
-                let (registrar, created, expires, updated) =
-                    if let Some(BulkResultData::Whois(ref w)) = result.data {
-                        (
-                            w.registrar.clone().unwrap_or_default(),
-                            w.creation_date
-                                .map(|d| d.format("%Y-%m-%d").to_string())
-                                .unwrap_or_default(),
-                            w.expiration_date
-                                .map(|d| d.format("%Y-%m-%d").to_string())
-                                .unwrap_or_default(),
-                            w.updated_date
-                                .map(|d| d.format("%Y-%m-%d").to_string())
-                                .unwrap_or_default(),
-                        )
-                    } else {
-                        Default::default()
-                    };
-                csv.push_str(&format!(
-                    "{},{},{},{},{},{},{}\n",
-                    domain,
-                    success,
-                    escape_csv_field(&registrar),
-                    created,
-                    expires,
-                    updated,
-                    duration_ms
-                ));
-            }
-            "rdap" => {
-                let (registrar, created, expires, updated) =
-                    if let Some(BulkResultData::Rdap(ref r)) = result.data {
-                        extract_rdap_dates(r)
-                    } else {
-                        Default::default()
-                    };
-                csv.push_str(&format!(
-                    "{},{},{},{},{},{},{}\n",
-                    domain,
-                    success,
-                    escape_csv_field(&registrar),
-                    created,
-                    expires,
-                    updated,
-                    duration_ms
-                ));
-            }
-            "dig" | "dns" => {
-                let (record_type, records) =
-                    if let Some(BulkResultData::Dns(ref recs)) = result.data {
-                        let rt = recs
-                            .first()
-                            .map(|r| r.record_type.to_string())
-                            .unwrap_or_default();
-                        let vals: Vec<String> = recs.iter().map(|r| r.format_short()).collect();
-                        (rt, vals.join("; "))
-                    } else {
-                        Default::default()
-                    };
-                csv.push_str(&format!(
-                    "{},{},{},{},{}\n",
-                    domain,
-                    success,
-                    record_type,
-                    escape_csv_field(&records),
-                    duration_ms
-                ));
-            }
-            "propagation" | "prop" => {
-                let (pct, total, responded) =
-                    if let Some(BulkResultData::Propagation(ref p)) = result.data {
-                        let total = p.results.len();
-                        let responded = p.results.iter().filter(|r| r.success).count();
-                        let pct = if total > 0 {
-                            (responded as f64 / total as f64) * 100.0
-                        } else {
-                            0.0
-                        };
-                        (
-                            format!("{:.1}", pct),
-                            total.to_string(),
-                            responded.to_string(),
-                        )
-                    } else {
-                        Default::default()
-                    };
-                csv.push_str(&format!(
-                    "{},{},{},{},{},{}\n",
-                    domain, success, pct, total, responded, duration_ms
-                ));
-            }
-            _ => {
-                csv.push_str(&format!("{},{},{}\n", domain, success, duration_ms));
-            }
-        }
-    }
-
-    csv
-}
-
-fn escape_csv_field(s: &str) -> String {
-    // Protect against CSV injection by prefixing formula-starting characters with a single quote
-    // This prevents Excel/Sheets from interpreting the content as a formula
-    let s = if s.starts_with('=')
-        || s.starts_with('+')
-        || s.starts_with('-')
-        || s.starts_with('@')
-        || s.starts_with('\t')
-        || s.starts_with('\r')
-    {
-        format!("'{}", s)
-    } else {
-        s.to_string()
-    };
-
-    // Replace commas and newlines with spaces for cleaner CSV
-    s.replace([',', '\n'], " ").replace('"', "'")
-}
-
-fn get_domain_from_operation(op: &seer_core::bulk::BulkOperation) -> String {
-    use seer_core::bulk::BulkOperation;
-    match op {
-        BulkOperation::Whois { domain } => domain.clone(),
-        BulkOperation::Rdap { domain } => domain.clone(),
-        BulkOperation::Dns { domain, .. } => domain.clone(),
-        BulkOperation::Propagation { domain, .. } => domain.clone(),
-        BulkOperation::Lookup { domain } => domain.clone(),
-        BulkOperation::Status { domain } => domain.clone(),
-    }
-}
-
-fn extract_rdap_dates(r: &seer_core::rdap::RdapResponse) -> (String, String, String, String) {
-    let registrar = r.get_registrar().unwrap_or_default();
-
-    let created = r
-        .creation_date()
-        .map(|d| d.format("%Y-%m-%d").to_string())
-        .unwrap_or_default();
-
-    let expires = r
-        .expiration_date()
-        .map(|d| d.format("%Y-%m-%d").to_string())
-        .unwrap_or_default();
-
-    let updated = r
-        .last_updated()
-        .map(|d| d.format("%Y-%m-%d").to_string())
-        .unwrap_or_default();
-
-    (registrar, created, expires, updated)
 }

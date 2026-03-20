@@ -1428,4 +1428,114 @@ impl OutputFormatter for HumanFormatter {
 
         output.join("\n")
     }
+
+    fn format_availability(&self, result: &crate::availability::AvailabilityResult) -> String {
+        let mut output = Vec::new();
+
+        let status = if result.available {
+            self.success("AVAILABLE")
+        } else {
+            self.error("TAKEN")
+        };
+        output.push(format!("{}: {}", result.domain, status));
+        let confidence_colored = match result.confidence.as_str() {
+            "high" => self.success(&result.confidence),
+            "medium" => self.warning(&result.confidence),
+            _ => self.error(&result.confidence),
+        };
+        output.push(format!(
+            "  {}: {}",
+            self.label("Confidence"),
+            confidence_colored
+        ));
+        output.push(format!(
+            "  {}: {}",
+            self.label("Method"),
+            self.value(&result.method)
+        ));
+        if let Some(ref details) = result.details {
+            output.push(format!(
+                "  {}: {}",
+                self.label("Details"),
+                self.value(details)
+            ));
+        }
+
+        output.join("\n")
+    }
+
+    fn format_dnssec(&self, report: &crate::dns::DnssecReport) -> String {
+        let mut output = Vec::new();
+
+        output.push(format!(
+            "DNSSEC Report for {}",
+            self.success(&report.domain)
+        ));
+        output.push(String::new());
+
+        let status_colored = match report.status.as_str() {
+            "secure" => self.success(&report.status),
+            "insecure" | "partial" => self.warning(&report.status),
+            _ => self.error(&report.status),
+        };
+        output.push(format!("  {}: {}", self.label("Status"), status_colored));
+        output.push(format!(
+            "  {}: {}",
+            self.label("Enabled"),
+            self.value(&report.enabled.to_string())
+        ));
+        output.push(format!(
+            "  {}: {}",
+            self.label("DS Records"),
+            self.value(&report.ds_records.len().to_string())
+        ));
+        output.push(format!(
+            "  {}: {}",
+            self.label("DNSKEY Records"),
+            self.value(&report.dnskey_records.len().to_string())
+        ));
+
+        if !report.ds_records.is_empty() {
+            output.push(String::new());
+            output.push(format!("  {}:", self.label("DS Records")));
+            for ds in &report.ds_records {
+                output.push(format!(
+                    "    Key Tag: {}, Algorithm: {} ({}), Digest: {} ({})",
+                    ds.key_tag,
+                    ds.algorithm,
+                    ds.algorithm_name,
+                    ds.digest_type,
+                    ds.digest_type_name
+                ));
+            }
+        }
+
+        if !report.dnskey_records.is_empty() {
+            output.push(String::new());
+            output.push(format!("  {}:", self.label("DNSKEY Records")));
+            for key in &report.dnskey_records {
+                let role = if key.is_ksk {
+                    "KSK"
+                } else if key.is_zsk {
+                    "ZSK"
+                } else {
+                    "Other"
+                };
+                output.push(format!(
+                    "    Flags: {}, Role: {}, Algorithm: {} ({})",
+                    key.flags, role, key.algorithm, key.algorithm_name
+                ));
+            }
+        }
+
+        if !report.issues.is_empty() {
+            output.push(String::new());
+            output.push(format!("  {}:", self.label("Issues")));
+            for issue in &report.issues {
+                output.push(format!("    - {}", issue));
+            }
+        }
+
+        output.join("\n")
+    }
 }
