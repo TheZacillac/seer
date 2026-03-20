@@ -40,6 +40,8 @@ static STATUS_HTTP_CLIENT: Lazy<Client> = Lazy::new(|| {
 #[derive(Debug, Clone)]
 pub struct StatusClient {
     timeout: Duration,
+    /// Cached DNS resolver reused across status checks.
+    dns_resolver: DnsResolver,
 }
 
 impl Default for StatusClient {
@@ -53,6 +55,7 @@ impl StatusClient {
     pub fn new() -> Self {
         Self {
             timeout: DEFAULT_TIMEOUT,
+            dns_resolver: DnsResolver::new(),
         }
     }
 
@@ -244,7 +247,7 @@ impl StatusClient {
 
     /// Fetches DNS root record resolution (A, AAAA, CNAME, NS).
     async fn fetch_dns_resolution(&self, domain: &str) -> Result<DnsResolution> {
-        let resolver = DnsResolver::new();
+        let resolver = &self.dns_resolver;
 
         // Query all record types concurrently
         let (a_result, aaaa_result, cname_result, ns_result) = tokio::join!(
