@@ -44,7 +44,7 @@ Tries RDAP first, falls back to WHOIS.
 
 ```bash
 seer lookup example.com
-seer lookup example.com --format json
+seer --format json lookup example.com
 ```
 
 ### WHOIS Lookup
@@ -131,13 +131,13 @@ Input file formats:
 
 ```bash
 # Human-readable (default)
-seer lookup example.com --format human
+seer --format human lookup example.com
 
 # JSON
-seer lookup example.com --format json
+seer --format json lookup example.com
 ```
 
-The `--format` flag works with all commands.
+The `--format` flag is a global option that must be placed before the subcommand.
 
 ## Interactive REPL
 
@@ -165,7 +165,7 @@ REPL features:
 ### Check If Domain Is Available
 
 ```bash
-seer lookup newdomain.com --format json | jq '.source'
+seer --format json lookup newdomain.com | jq '.source'
 ```
 
 ### Export Domain Status to CSV
@@ -184,13 +184,13 @@ seer follow example.com 60 0.5 A --changes-only
 ### Quick DNS Check with JSON
 
 ```bash
-seer dig example.com A --format json | jq '.[].data.address'
+seer --format json dig example.com A | jq '.[].data.address'
 ```
 
 ### Verify SSL Certificate
 
 ```bash
-seer status example.com --format json | jq '.certificate'
+seer --format json status example.com | jq '.certificate'
 ```
 
 ## Environment Variables
