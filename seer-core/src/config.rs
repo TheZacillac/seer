@@ -12,7 +12,7 @@ use tracing::debug;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SeerConfig {
-    /// Default output format ("human", "json", "yaml", "csv")
+    /// Default output format ("human", "json", "yaml")
     pub output_format: String,
     /// Default DNS nameserver (e.g., "8.8.8.8")
     pub nameserver: Option<String>,

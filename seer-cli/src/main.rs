@@ -8,7 +8,6 @@ use clap_complete::{generate, Shell};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::terminal;
 use seer_core::colors::CatppuccinExt;
-use seer_core::output::OutputFormatter;
 use tracing_subscriber::EnvFilter;
 
 const BULK_EXAMPLES: &str = r#"
@@ -629,16 +628,11 @@ async fn execute_command(
 
             // Create progress callback for real-time output
             // Note: raw mode is enabled for key detection, so we need \r\n for proper line breaks
-            let use_json = matches!(output_format, seer_core::output::OutputFormat::Json);
+            let follow_format = output_format;
             let callback: seer_core::dns::FollowProgressCallback =
                 std::sync::Arc::new(move |iteration| {
-                    let output = if use_json {
-                        let json_formatter = seer_core::output::JsonFormatter::new();
-                        json_formatter.format_follow_iteration(iteration)
-                    } else {
-                        let human_formatter = seer_core::output::HumanFormatter::new();
-                        human_formatter.format_follow_iteration(iteration)
-                    };
+                    let formatter = seer_core::output::get_formatter(follow_format);
+                    let output = formatter.format_follow_iteration(iteration);
                     // In raw mode, \n alone doesn't return to column 0, so use \r\n
                     let output = output.replace('\n', "\r\n");
                     let mut stdout = std::io::stdout().lock();

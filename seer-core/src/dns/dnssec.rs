@@ -173,7 +173,7 @@ impl DnssecChecker {
             );
         }
 
-        // Check for deprecated algorithms
+        // Check for deprecated algorithms in DS records
         for ds in &ds_info {
             if ds.algorithm == 1 || ds.algorithm == 3 || ds.algorithm == 5 || ds.algorithm == 6 {
                 issues.push(format!(
@@ -186,6 +186,17 @@ impl DnssecChecker {
                     "DS record uses SHA-1 digest (type 1) - consider upgrading to SHA-256 (type 2)"
                         .to_string(),
                 );
+            }
+        }
+
+        // Check for deprecated algorithms in DNSKEY records
+        for key in &dnskey_info {
+            if key.algorithm == 1 || key.algorithm == 3 || key.algorithm == 5 || key.algorithm == 6
+            {
+                issues.push(format!(
+                    "DNSKEY record uses deprecated algorithm {} ({})",
+                    key.algorithm, key.algorithm_name
+                ));
             }
         }
 
