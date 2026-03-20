@@ -931,9 +931,182 @@ impl OutputFormatter for HumanFormatter {
                 }
 
                 if let Some(whois) = whois_fallback {
-                    output.push(format!("\n  {}", self.label("Additional WHOIS data:")));
-                    if let Some(ref raw) = whois.dnssec {
-                        output.push(format!("    DNSSEC: {}", self.value(raw)));
+                    let mut extra = Vec::new();
+
+                    // Registrant (if RDAP didn't have it)
+                    if data.get_registrant().is_none() {
+                        if let Some(ref registrant) = whois.registrant {
+                            extra.push(format!(
+                                "    {}: {}",
+                                self.label("Registrant"),
+                                self.value(registrant)
+                            ));
+                        }
+                    }
+
+                    // Organization (if RDAP didn't have it)
+                    if data.get_registrant_organization().is_none() {
+                        if let Some(ref org) = whois.organization {
+                            extra.push(format!(
+                                "    {}: {}",
+                                self.label("Organization"),
+                                self.value(org)
+                            ));
+                        }
+                    }
+
+                    // Registrant contact details (if RDAP didn't have them)
+                    let rdap_registrant = data.get_registrant_contact();
+                    let rdap_has_registrant =
+                        rdap_registrant.as_ref().is_some_and(|c| c.has_info());
+                    if !rdap_has_registrant {
+                        let has_whois_contact = whois.registrant_email.is_some()
+                            || whois.registrant_phone.is_some()
+                            || whois.registrant_address.is_some()
+                            || whois.registrant_country.is_some();
+                        if has_whois_contact {
+                            extra.push(format!("\n    {}:", self.label("Registrant Contact")));
+                            if let Some(ref email) = whois.registrant_email {
+                                extra.push(format!(
+                                    "      {}: {}",
+                                    self.label("Email"),
+                                    self.value(email)
+                                ));
+                            }
+                            if let Some(ref phone) = whois.registrant_phone {
+                                extra.push(format!(
+                                    "      {}: {}",
+                                    self.label("Phone"),
+                                    self.value(phone)
+                                ));
+                            }
+                            if let Some(ref address) = whois.registrant_address {
+                                extra.push(format!(
+                                    "      {}: {}",
+                                    self.label("Address"),
+                                    self.value(address)
+                                ));
+                            }
+                            if let Some(ref country) = whois.registrant_country {
+                                extra.push(format!(
+                                    "      {}: {}",
+                                    self.label("Country"),
+                                    self.value(country)
+                                ));
+                            }
+                        }
+                    }
+
+                    // Admin contact (if RDAP didn't have it)
+                    let rdap_has_admin = data.get_admin_contact().is_some_and(|c| c.has_info());
+                    if !rdap_has_admin {
+                        let has_whois_admin = whois.admin_name.is_some()
+                            || whois.admin_email.is_some()
+                            || whois.admin_phone.is_some();
+                        if has_whois_admin {
+                            extra.push(format!("\n    {}:", self.label("Admin Contact")));
+                            if let Some(ref name) = whois.admin_name {
+                                extra.push(format!(
+                                    "      {}: {}",
+                                    self.label("Name"),
+                                    self.value(name)
+                                ));
+                            }
+                            if let Some(ref org) = whois.admin_organization {
+                                extra.push(format!(
+                                    "      {}: {}",
+                                    self.label("Organization"),
+                                    self.value(org)
+                                ));
+                            }
+                            if let Some(ref email) = whois.admin_email {
+                                extra.push(format!(
+                                    "      {}: {}",
+                                    self.label("Email"),
+                                    self.value(email)
+                                ));
+                            }
+                            if let Some(ref phone) = whois.admin_phone {
+                                extra.push(format!(
+                                    "      {}: {}",
+                                    self.label("Phone"),
+                                    self.value(phone)
+                                ));
+                            }
+                        }
+                    }
+
+                    // Tech contact (if RDAP didn't have it)
+                    let rdap_has_tech = data.get_tech_contact().is_some_and(|c| c.has_info());
+                    if !rdap_has_tech {
+                        let has_whois_tech = whois.tech_name.is_some()
+                            || whois.tech_email.is_some()
+                            || whois.tech_phone.is_some();
+                        if has_whois_tech {
+                            extra.push(format!("\n    {}:", self.label("Tech Contact")));
+                            if let Some(ref name) = whois.tech_name {
+                                extra.push(format!(
+                                    "      {}: {}",
+                                    self.label("Name"),
+                                    self.value(name)
+                                ));
+                            }
+                            if let Some(ref org) = whois.tech_organization {
+                                extra.push(format!(
+                                    "      {}: {}",
+                                    self.label("Organization"),
+                                    self.value(org)
+                                ));
+                            }
+                            if let Some(ref email) = whois.tech_email {
+                                extra.push(format!(
+                                    "      {}: {}",
+                                    self.label("Email"),
+                                    self.value(email)
+                                ));
+                            }
+                            if let Some(ref phone) = whois.tech_phone {
+                                extra.push(format!(
+                                    "      {}: {}",
+                                    self.label("Phone"),
+                                    self.value(phone)
+                                ));
+                            }
+                        }
+                    }
+
+                    // Updated date (RDAP doesn't typically expose this)
+                    if let Some(updated) = whois.updated_date {
+                        extra.push(format!(
+                            "    {}: {}",
+                            self.label("Updated"),
+                            self.value(&updated.format("%Y-%m-%d").to_string())
+                        ));
+                    }
+
+                    // DNSSEC (if RDAP didn't show it)
+                    if !data.is_dnssec_signed() {
+                        if let Some(ref dnssec) = whois.dnssec {
+                            extra.push(format!(
+                                "    {}: {}",
+                                self.label("DNSSEC"),
+                                self.value(dnssec)
+                            ));
+                        }
+                    }
+
+                    // WHOIS server
+                    if !whois.whois_server.is_empty() {
+                        extra.push(format!(
+                            "    {}: {}",
+                            self.label("WHOIS Server"),
+                            self.value(&whois.whois_server)
+                        ));
+                    }
+
+                    if !extra.is_empty() {
+                        output.push(format!("\n  {}", self.label("Additional WHOIS data:")));
+                        output.extend(extra);
                     }
                 }
             }
