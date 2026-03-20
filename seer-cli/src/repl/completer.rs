@@ -13,7 +13,6 @@ const COMMANDS: &[&str] = &[
     "rdap",
     "dig",
     "dns",
-    "propagation",
     "prop",
     "follow",
     "bulk",
@@ -26,7 +25,7 @@ const RECORD_TYPES: &[&str] = &[
     "A", "AAAA", "CNAME", "MX", "NS", "TXT", "SOA", "PTR", "SRV", "CAA", "DNSKEY", "DS", "ANY",
 ];
 
-const BULK_OPERATIONS: &[&str] = &["lookup", "whois", "rdap", "dig", "propagation", "status"];
+const BULK_OPERATIONS: &[&str] = &["lookup", "whois", "rdap", "dig", "prop", "status"];
 
 const SET_OPTIONS: &[&str] = &["output"];
 

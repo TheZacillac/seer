@@ -47,7 +47,7 @@ impl Repl {
 | `whois <domain>` | WHOIS lookup |
 | `rdap <query>` | RDAP lookup (domain/IP/ASN) |
 | `dig <domain> [type]` | DNS query |
-| `propagation <domain> [type]` | DNS propagation check |
+| `prop <domain> [type]` | DNS propagation check |
 | `status <domain>` | Domain status check |
 | `set output <format>` | Change output format (human/json) |
 | `help` | Show help message |
@@ -114,7 +114,7 @@ Available commands:
   whois <domain>            - WHOIS lookup
   rdap <domain|ip|asn>      - RDAP lookup
   dig <domain> [type]       - DNS query (default: A)
-  propagation <domain> [type] - DNS propagation check
+  prop <domain> [type]        - DNS propagation check
   status <domain>           - Domain status check
   set output <human|json>   - Change output format
   help                      - Show this help

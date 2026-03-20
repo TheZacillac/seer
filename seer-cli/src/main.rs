@@ -98,7 +98,7 @@ enum Commands {
     /// Execute bulk operations from a file, output results to CSV
     #[command(after_long_help = BULK_EXAMPLES)]
     Bulk {
-        /// Operation type: lookup, whois, rdap, dig, propagation, status
+        /// Operation type: lookup, whois, rdap, dig, prop, status
         #[arg(value_name = "OPERATION")]
         operation: String,
 
@@ -106,7 +106,7 @@ enum Commands {
         #[arg(value_name = "FILE")]
         file: String,
 
-        /// Record type for dig/propagation operations
+        /// Record type for dig/prop operations
         #[arg(value_name = "TYPE", default_value = "A")]
         record_type: String,
 
@@ -372,7 +372,7 @@ async fn execute_command(
                     .collect(),
                 _ => {
                     eprintln!(
-                        "{} Unknown operation: {}. Use: lookup, whois, rdap, dig, propagation, status",
+                        "{} Unknown operation: {}. Use: lookup, whois, rdap, dig, prop, status",
                         "Error:".ctp_red(),
                         operation
                     );

@@ -209,7 +209,7 @@ impl Repl {
         );
         println!(
             "  {:<34} Check DNS propagation globally",
-            "propagation <domain> [type]".bright_cyan()
+            "prop <domain> [type]".bright_cyan()
         );
         println!(
             "  {:<34} Monitor DNS records over time",
@@ -233,7 +233,7 @@ impl Repl {
         );
         println!(
             "  {}",
-            "Operations: lookup, whois, rdap, dig, propagation, status".dimmed()
+            "Operations: lookup, whois, rdap, dig, prop, status".dimmed()
         );
         println!();
         println!("{}", "SETTINGS".bright_purple().bold());
@@ -265,8 +265,8 @@ impl Repl {
         );
         println!("  {}         Query DNS records", "dig".bright_green());
         println!(
-            "  {}  Check DNS propagation globally",
-            "propagation".bright_green()
+            "  {}        Check DNS propagation globally",
+            "prop".bright_green()
         );
         println!(
             "  {}      Check HTTP, SSL, and domain expiration",
@@ -438,7 +438,7 @@ impl Repl {
 
     async fn execute_propagation(&self, args: &[&str]) -> CommandResult {
         if args.is_empty() {
-            return CommandResult::Error("Usage: propagation <domain> [type]".to_string());
+            return CommandResult::Error("Usage: prop <domain> [type]".to_string());
         }
 
         let domain = args[0];
@@ -589,7 +589,7 @@ impl Repl {
                 .collect(),
             _ => {
                 return CommandResult::Error(format!(
-                "Unknown bulk operation: {}. Use: lookup, whois, rdap, dig, propagation, status",
+                "Unknown bulk operation: {}. Use: lookup, whois, rdap, dig, prop, status",
                 operation
             ))
             }
