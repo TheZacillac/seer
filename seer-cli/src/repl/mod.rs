@@ -93,8 +93,8 @@ impl Repl {
                     println!();
                 }
                 Err(ReadlineError::Interrupted) => {
-                    println!("^C");
-                    continue;
+                    println!("exit");
+                    break;
                 }
                 Err(ReadlineError::Eof) => {
                     println!("exit");
