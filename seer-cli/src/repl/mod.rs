@@ -69,11 +69,14 @@ impl Repl {
     pub async fn run(&mut self) -> anyhow::Result<()> {
         self.print_banner();
 
+        let mut last_ctrl_c: Option<std::time::Instant> = None;
+
         loop {
             let prompt = self.get_prompt();
 
             match self.editor.readline(&prompt) {
                 Ok(line) => {
+                    last_ctrl_c = None;
                     let line = line.trim();
                     if line.is_empty() {
                         continue;
@@ -93,8 +96,14 @@ impl Repl {
                     println!();
                 }
                 Err(ReadlineError::Interrupted) => {
-                    println!("exit");
-                    break;
+                    if last_ctrl_c.is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(2))
+                    {
+                        println!("exit");
+                        break;
+                    }
+                    last_ctrl_c = Some(std::time::Instant::now());
+                    println!("{}", "Press Ctrl+C again to exit (or type 'exit')".dimmed());
+                    continue;
                 }
                 Err(ReadlineError::Eof) => {
                     println!("exit");
