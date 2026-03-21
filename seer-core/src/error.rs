@@ -53,6 +53,9 @@ pub enum SeerError {
     #[error("Certificate error: {0}")]
     CertificateError(String),
 
+    #[error("SSL error: {0}")]
+    SslError(String),
+
     #[error("Bulk operation failed: {context}")]
     BulkOperationError {
         context: String,
@@ -65,6 +68,9 @@ pub enum SeerError {
         details: String,
         registry_url: String,
     },
+
+    #[error("Configuration error: {0}")]
+    ConfigError(String),
 
     #[error("{0}")]
     Other(String),
@@ -99,8 +105,10 @@ impl SeerError {
             SeerError::Timeout(_) => "Operation timed out".to_string(),
             SeerError::RateLimited(_) => "Rate limited - please try again later".to_string(),
             SeerError::CertificateError(_) => "Certificate validation failed".to_string(),
+            SeerError::SslError(_) => "SSL inspection failed".to_string(),
             SeerError::BulkOperationError { .. } => "Bulk operation partially failed".to_string(),
             SeerError::LookupFailed { domain, .. } => format!("Lookup failed for {}", domain),
+            SeerError::ConfigError(msg) => format!("Configuration error: {}", msg),
             SeerError::Other(_) => "Operation failed".to_string(),
             SeerError::RetryExhausted { attempts, .. } => {
                 format!("Operation failed after {} attempts", attempts)

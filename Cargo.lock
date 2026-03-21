@@ -1863,7 +1863,7 @@ dependencies = [
 
 [[package]]
 name = "seer-cli"
-version = "0.12.2"
+version = "0.13.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1875,6 +1875,7 @@ dependencies = [
  "indicatif",
  "rustyline",
  "seer-core",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",
@@ -1883,7 +1884,7 @@ dependencies = [
 
 [[package]]
 name = "seer-core"
-version = "0.12.2"
+version = "0.13.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1913,7 +1914,7 @@ dependencies = [
 
 [[package]]
 name = "seer-py"
-version = "0.12.2"
+version = "0.13.0"
 dependencies = [
  "pyo3",
  "seer-core",

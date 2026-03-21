@@ -55,9 +55,17 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 
-    /// Output format (human, json, or yaml)
+    /// Output format (human, json, yaml, or markdown)
     #[arg(short, long, default_value = "human")]
     format: String,
+
+    /// Quiet mode - suppress headers and formatting, output raw values only
+    #[arg(short, long)]
+    quiet: bool,
+
+    /// Comma-separated list of fields to extract (use with --quiet)
+    #[arg(long, value_delimiter = ',')]
+    fields: Option<Vec<String>>,
 }
 
 #[derive(Subcommand)]
@@ -167,6 +175,55 @@ enum Commands {
         #[arg(long)]
         init: bool,
     },
+    /// Inspect SSL certificate chain for a domain
+    Ssl {
+        /// Domain name to check
+        domain: String,
+    },
+    /// Look up TLD information (WHOIS server, RDAP endpoint, registry)
+    Tld {
+        /// TLD to look up (e.g., .com, com, .uk)
+        tld: String,
+    },
+    /// Compare DNS records from two nameservers
+    Compare {
+        /// Domain name to query
+        domain: String,
+        /// Record type (A, AAAA, MX, etc.)
+        #[arg(default_value = "A")]
+        record_type: String,
+        /// First nameserver (e.g., 8.8.8.8)
+        server_a: String,
+        /// Second nameserver (e.g., 1.1.1.1)
+        server_b: String,
+    },
+    /// Enumerate subdomains via Certificate Transparency logs
+    Subdomains {
+        /// Domain to enumerate subdomains for
+        domain: String,
+    },
+    /// Compare two domains side-by-side (registration, DNS, SSL)
+    Diff {
+        /// First domain
+        domain_a: String,
+        /// Second domain
+        domain_b: String,
+    },
+    /// Monitor domain watchlist for expiration and health issues
+    Watch {
+        /// Subcommand: add, remove, list (or omit to check all)
+        action: Option<String>,
+        /// Domain for add/remove actions
+        domain: Option<String>,
+    },
+    /// Show lookup history for a domain
+    History {
+        /// Domain to show history for (omit to show all)
+        domain: Option<String>,
+        /// Clear all history
+        #[arg(long)]
+        clear: bool,
+    },
 }
 
 #[tokio::main]
@@ -193,7 +250,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     match cli.command {
-        Some(cmd) => execute_command(cmd, output_format).await,
+        Some(cmd) => execute_command(cmd, output_format, cli.quiet, cli.fields).await,
         None => {
             // Start interactive REPL
             let mut repl = repl::Repl::new()?;
@@ -202,9 +259,48 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
+/// Extract specific fields from a JSON value and print them.
+/// Supports nested field access via dot notation (e.g., "certificate.issuer").
+fn extract_fields(value: &serde_json::Value, fields: &[String]) {
+    for field in fields {
+        let parts: Vec<&str> = field.split('.').collect();
+        let mut current = value;
+        for part in &parts {
+            current = match current {
+                serde_json::Value::Object(map) => {
+                    map.get(*part).unwrap_or(&serde_json::Value::Null)
+                }
+                _ => &serde_json::Value::Null,
+            };
+        }
+        match current {
+            serde_json::Value::String(s) => println!("{}", s),
+            serde_json::Value::Null => println!(),
+            other => println!("{}", other),
+        }
+    }
+}
+
+/// Handle quiet output for a serializable result.
+/// If `fields` is Some, extracts and prints the requested fields and returns true.
+/// If `fields` is None, prints compact JSON and returns true.
+fn handle_quiet_output<T: serde::Serialize>(value: &T, fields: &Option<Vec<String>>) -> bool {
+    if let Some(ref fields) = fields {
+        let json_value = serde_json::to_value(value).unwrap_or_default();
+        extract_fields(&json_value, fields);
+        true
+    } else {
+        let json = serde_json::to_string(value).unwrap_or_default();
+        println!("{}", json);
+        true
+    }
+}
+
 async fn execute_command(
     command: Commands,
     output_format: seer_core::output::OutputFormat,
+    quiet: bool,
+    fields: Option<Vec<String>>,
 ) -> anyhow::Result<()> {
     let formatter = seer_core::output::get_formatter(output_format);
 
@@ -225,7 +321,16 @@ async fn execute_command(
             match lookup.lookup_with_progress(&domain, Some(progress)).await {
                 Ok(result) => {
                     spinner.finish();
-                    println!("{}", formatter.format_lookup(&result));
+                    // Record to history
+                    let mut history = seer_core::LookupHistory::load();
+                    history.record(&domain, result.clone());
+                    let _ = history.save();
+
+                    if quiet {
+                        handle_quiet_output(&result, &fields);
+                    } else {
+                        println!("{}", formatter.format_lookup(&result));
+                    }
                 }
                 Err(e) => {
                     spinner.finish();
@@ -238,7 +343,11 @@ async fn execute_command(
             let client = seer_core::WhoisClient::new();
             match client.lookup(&domain).await {
                 Ok(response) => {
-                    println!("{}", formatter.format_whois(&response));
+                    if quiet {
+                        handle_quiet_output(&response, &fields);
+                    } else {
+                        println!("{}", formatter.format_whois(&response));
+                    }
                 }
                 Err(e) => {
                     eprintln!("{} {}", "Error:".ctp_red(), e);
@@ -259,7 +368,11 @@ async fn execute_command(
 
             match result {
                 Ok(response) => {
-                    println!("{}", formatter.format_rdap(&response));
+                    if quiet {
+                        handle_quiet_output(&response, &fields);
+                    } else {
+                        println!("{}", formatter.format_rdap(&response));
+                    }
                 }
                 Err(e) => {
                     eprintln!("{} {}", "Error:".ctp_red(), e);
@@ -278,7 +391,11 @@ async fn execute_command(
 
             match resolver.resolve(&domain, rt, ns).await {
                 Ok(records) => {
-                    println!("{}", formatter.format_dns(&records));
+                    if quiet {
+                        handle_quiet_output(&records, &fields);
+                    } else {
+                        println!("{}", formatter.format_dns(&records));
+                    }
                 }
                 Err(e) => {
                     eprintln!("{} {}", "Error:".ctp_red(), e);
@@ -295,7 +412,11 @@ async fn execute_command(
 
             match checker.check(&domain, rt).await {
                 Ok(result) => {
-                    println!("{}", formatter.format_propagation(&result));
+                    if quiet {
+                        handle_quiet_output(&result, &fields);
+                    } else {
+                        println!("{}", formatter.format_propagation(&result));
+                    }
                 }
                 Err(e) => {
                     eprintln!("{} {}", "Error:".ctp_red(), e);
@@ -405,7 +526,26 @@ async fn execute_command(
             let client = seer_core::StatusClient::new();
             match client.check(&domain).await {
                 Ok(response) => {
-                    println!("{}", formatter.format_status(&response));
+                    if quiet {
+                        handle_quiet_output(&response, &fields);
+                    } else {
+                        println!("{}", formatter.format_status(&response));
+                    }
+                    // Exit with 1 if any health issues detected
+                    let has_issues = response
+                        .http_status
+                        .is_none_or(|s| !(200..300).contains(&s))
+                        || response
+                            .certificate
+                            .as_ref()
+                            .is_some_and(|c| !c.is_valid || c.days_until_expiry < 30)
+                        || response
+                            .domain_expiration
+                            .as_ref()
+                            .is_some_and(|d| d.days_until_expiry < 30);
+                    if has_issues {
+                        std::process::exit(1);
+                    }
                 }
                 Err(e) => {
                     eprintln!("{} {}", "Error:".ctp_red(), e);
@@ -420,7 +560,11 @@ async fn execute_command(
                 .await
             {
                 Ok(records) => {
-                    println!("{}", formatter.format_dns(&records));
+                    if quiet {
+                        handle_quiet_output(&records, &fields);
+                    } else {
+                        println!("{}", formatter.format_dns(&records));
+                    }
                 }
                 Err(e) => {
                     eprintln!("{} {}", "Error:".ctp_red(), e);
@@ -432,7 +576,14 @@ async fn execute_command(
             let checker = seer_core::AvailabilityChecker::new();
             match checker.check(&domain).await {
                 Ok(result) => {
-                    println!("{}", formatter.format_availability(&result));
+                    if quiet {
+                        handle_quiet_output(&result, &fields);
+                    } else {
+                        println!("{}", formatter.format_availability(&result));
+                    }
+                    if !result.available {
+                        std::process::exit(1);
+                    }
                 }
                 Err(e) => {
                     eprintln!("{} {}", "Error:".ctp_red(), e);
@@ -444,7 +595,14 @@ async fn execute_command(
             let checker = seer_core::DnssecChecker::new();
             match checker.check(&domain).await {
                 Ok(report) => {
-                    println!("{}", formatter.format_dnssec(&report));
+                    if quiet {
+                        handle_quiet_output(&report, &fields);
+                    } else {
+                        println!("{}", formatter.format_dnssec(&report));
+                    }
+                    if report.status != "secure" {
+                        std::process::exit(1);
+                    }
                 }
                 Err(e) => {
                     eprintln!("{} {}", "Error:".ctp_red(), e);
@@ -595,6 +753,216 @@ async fn execute_command(
                 Err(e) => {
                     eprintln!("{} {}", "Error:".ctp_red(), e);
                     std::process::exit(1);
+                }
+            }
+        }
+        Commands::Ssl { domain } => {
+            let checker = seer_core::SslChecker::new();
+            match checker.check(&domain).await {
+                Ok(report) => {
+                    if quiet && handle_quiet_output(&report, &fields) {
+                    } else {
+                        println!("{}", formatter.format_ssl(&report));
+                    }
+                }
+                Err(e) => {
+                    eprintln!("{} {}", "Error:".ctp_red(), e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Commands::Tld { tld } => {
+            let info = seer_core::lookup_tld(&tld).await;
+            if quiet && handle_quiet_output(&info, &fields) {
+            } else {
+                println!("{}", formatter.format_tld(&info));
+            }
+        }
+        Commands::Compare {
+            domain,
+            record_type,
+            server_a,
+            server_b,
+        } => {
+            let comparator = seer_core::dns::DnsComparator::new();
+            let rt: seer_core::RecordType = record_type.parse()?;
+            let ns_a = server_a.trim_start_matches('@');
+            let ns_b = server_b.trim_start_matches('@');
+            match comparator.compare(&domain, rt, ns_a, ns_b).await {
+                Ok(comparison) => {
+                    if quiet && handle_quiet_output(&comparison, &fields) {
+                    } else {
+                        println!("{}", formatter.format_dns_comparison(&comparison));
+                    }
+                    if !comparison.matches {
+                        std::process::exit(1);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("{} {}", "Error:".ctp_red(), e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Commands::Subdomains { domain } => {
+            let spinner = std::sync::Arc::new(display::Spinner::new(&format!(
+                "Enumerating subdomains for {}",
+                domain
+            )));
+            let enumerator = seer_core::SubdomainEnumerator::new();
+            match enumerator.enumerate(&domain).await {
+                Ok(result) => {
+                    spinner.finish();
+                    if quiet && handle_quiet_output(&result, &fields) {
+                    } else {
+                        println!("{}", formatter.format_subdomains(&result));
+                    }
+                }
+                Err(e) => {
+                    spinner.finish();
+                    eprintln!("{} {}", "Error:".ctp_red(), e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Commands::Diff { domain_a, domain_b } => {
+            let spinner = std::sync::Arc::new(display::Spinner::new(&format!(
+                "Comparing {} vs {}",
+                domain_a, domain_b
+            )));
+            let differ = seer_core::DomainDiffer::new();
+            match differ.diff(&domain_a, &domain_b).await {
+                Ok(diff) => {
+                    spinner.finish();
+                    if quiet && handle_quiet_output(&diff, &fields) {
+                    } else {
+                        println!("{}", formatter.format_diff(&diff));
+                    }
+                }
+                Err(e) => {
+                    spinner.finish();
+                    eprintln!("{} {}", "Error:".ctp_red(), e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Commands::Watch { action, domain } => {
+            let mut watchlist = seer_core::Watchlist::load();
+            match action.as_deref() {
+                Some("add") => {
+                    let domain = domain
+                        .as_deref()
+                        .ok_or_else(|| anyhow::anyhow!("Usage: seer watch add <domain>"))?;
+                    match watchlist.add(domain) {
+                        Ok(true) => {
+                            watchlist.save()?;
+                            println!("Added {} to watchlist", domain.ctp_green());
+                        }
+                        Ok(false) => {
+                            println!("{} is already in the watchlist", domain);
+                        }
+                        Err(e) => {
+                            eprintln!("{} Invalid domain: {}", "Error:".ctp_red(), e);
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                Some("remove") => {
+                    let domain = domain
+                        .as_deref()
+                        .ok_or_else(|| anyhow::anyhow!("Usage: seer watch remove <domain>"))?;
+                    if watchlist.remove(domain) {
+                        watchlist.save()?;
+                        println!("Removed {} from watchlist", domain.ctp_green());
+                    } else {
+                        println!("{} was not in the watchlist", domain);
+                    }
+                }
+                Some("list") => {
+                    if watchlist.domains.is_empty() {
+                        println!(
+                            "Watchlist is empty. Use 'seer watch add <domain>' to add domains."
+                        );
+                    } else {
+                        println!("Watchlist ({} domains):", watchlist.domains.len());
+                        for d in &watchlist.domains {
+                            println!("  - {}", d);
+                        }
+                    }
+                }
+                None => {
+                    if watchlist.domains.is_empty() {
+                        println!(
+                            "Watchlist is empty. Use 'seer watch add <domain>' to add domains."
+                        );
+                    } else {
+                        let spinner = std::sync::Arc::new(display::Spinner::new(&format!(
+                            "Checking {} domains",
+                            watchlist.domains.len()
+                        )));
+                        let report = seer_core::check_watchlist(&watchlist.domains).await;
+                        spinner.finish();
+                        if quiet && handle_quiet_output(&report, &fields) {
+                        } else {
+                            println!("{}", formatter.format_watch(&report));
+                        }
+                    }
+                }
+                Some(other) => {
+                    eprintln!(
+                        "{} Unknown watch action: {}. Use: add, remove, list",
+                        "Error:".ctp_red(),
+                        other
+                    );
+                    std::process::exit(1);
+                }
+            }
+        }
+        Commands::History { domain, clear } => {
+            let mut history = seer_core::LookupHistory::load();
+            if clear {
+                history.clear();
+                history.save()?;
+                println!("Lookup history cleared");
+            } else if let Some(domain) = domain {
+                let entries = history.get(&domain);
+                if entries.is_empty() {
+                    println!("No history for {}", domain);
+                } else {
+                    println!(
+                        "History for {} ({} entries):",
+                        domain.ctp_green(),
+                        entries.len()
+                    );
+                    for entry in entries {
+                        let source = if entry.result.is_rdap() {
+                            "RDAP"
+                        } else if entry.result.is_whois() {
+                            "WHOIS"
+                        } else {
+                            "availability"
+                        };
+                        println!(
+                            "  [{}] via {} - registrar: {}",
+                            entry.timestamp.format("%Y-%m-%d %H:%M"),
+                            source,
+                            entry.result.registrar().unwrap_or_else(|| "—".to_string())
+                        );
+                    }
+                }
+            } else {
+                let total: usize = history.entries.values().map(|v| v.len()).sum();
+                if total == 0 {
+                    println!("No lookup history. Run 'seer lookup <domain>' to build history.");
+                } else {
+                    println!(
+                        "Lookup history ({} entries across {} domains):",
+                        total,
+                        history.entries.len()
+                    );
+                    for (domain, entries) in &history.entries {
+                        println!("  {} ({} entries)", domain, entries.len());
+                    }
                 }
             }
         }

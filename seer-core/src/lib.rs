@@ -3,14 +3,20 @@ pub mod bulk;
 pub mod cache;
 pub mod colors;
 pub mod config;
+pub mod diff;
 pub mod dns;
 pub mod error;
+pub mod history;
 pub mod lookup;
 pub mod output;
 pub mod rdap;
 pub mod retry;
+pub mod ssl;
 pub mod status;
+pub mod subdomains;
+pub mod tld;
 pub mod validation;
+pub mod watchlist;
 pub mod whois;
 
 pub use availability::{AvailabilityChecker, AvailabilityResult};
@@ -21,13 +27,19 @@ pub use retry::{NetworkRetryClassifier, RetryClassifier, RetryExecutor, RetryPol
 pub use validation::{normalize_domain, validate_domain_safe};
 
 pub use dns::{
-    DnsFollower, DnsRecord, DnsResolver, DnssecChecker, DnssecReport, FollowConfig,
-    FollowIteration, FollowResult, PropagationResult, RecordType,
+    DnsComparator, DnsComparison, DnsFollower, DnsRecord, DnsResolver, DnssecChecker, DnssecReport,
+    FollowConfig, FollowIteration, FollowResult, PropagationResult, RecordType,
 };
 pub use lookup::{LookupProgressCallback, LookupResult, SmartLookup};
 pub use rdap::{RdapClient, RdapResponse};
 pub use status::{CertificateInfo, DnsResolution, DomainExpiration, StatusClient, StatusResponse};
+pub use tld::{lookup_tld, TldInfo};
 pub use whois::{WhoisClient, WhoisResponse};
 
 pub use bulk::{BulkExecutor, BulkOperation, BulkResult};
+pub use diff::{DomainDiff, DomainDiffer};
+pub use history::{HistoryEntry, LookupHistory};
 pub use output::{OutputFormat, OutputFormatter};
+pub use ssl::{CertDetail, SslChecker, SslReport};
+pub use subdomains::{SubdomainEnumerator, SubdomainResult};
+pub use watchlist::{check_watchlist, WatchReport, WatchResult, Watchlist};

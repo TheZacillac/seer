@@ -43,6 +43,9 @@ seer dig example.com A -s @8.8.8.8    # Custom nameserver
 seer prop example.com
 seer prop example.com AAAA
 
+# Compare DNS records across two nameservers
+seer compare example.com A 8.8.8.8 1.1.1.1
+
 # Monitor DNS records over time
 seer follow example.com                           # 10 checks, 1 min apart
 seer follow example.com 20 0.5                    # 20 checks, 30s apart
@@ -55,18 +58,51 @@ seer reverse 8.8.8.8
 ### Utility Commands
 
 ```bash
-# Check domain availability
+# Check domain availability (exit code: 0=available, 1=taken)
 seer avail example.com
 
-# Check DNSSEC configuration
+# Check DNSSEC configuration (exit code: 0=secure, 1=not secure)
 seer dnssec example.com
+
+# Look up TLD info (WHOIS server, RDAP endpoint, registry)
+seer tld .com
+seer tld uk
+
+# Enumerate subdomains via Certificate Transparency logs
+seer subdomains example.com
 ```
 
-### Status Commands
+### Status & SSL
 
 ```bash
-# Full domain health: HTTP status, SSL cert, registration expiry, DNS
+# Full domain health (exit code: 0=healthy, 1=issues)
 seer status example.com
+
+# Inspect SSL certificate chain, SANs, and key details
+seer ssl example.com
+```
+
+### Domain Comparison
+
+```bash
+# Compare two domains side-by-side (registration, DNS, SSL)
+seer diff example.com google.com
+```
+
+### Monitoring
+
+```bash
+# Domain watchlist
+seer watch add example.com        # Add domain
+seer watch add google.com
+seer watch list                   # Show watchlist
+seer watch                        # Check all domains for expiring certs/registrations
+seer watch remove example.com     # Remove domain
+
+# Lookup history (persisted to ~/.seer/history.json)
+seer history example.com          # Show past lookups for a domain
+seer history                      # Show all domains with history
+seer history --clear              # Clear history
 ```
 
 ### Bulk Operations
@@ -90,10 +126,32 @@ Input file format: one domain per line (# for comments), or CSV (first column).
 The `--format` flag goes **before** the subcommand:
 
 ```bash
-seer --format json lookup example.com
-seer --format yaml dig example.com MX
-seer --format human status example.com    # Default
+seer --format json lookup example.com       # JSON
+seer --format yaml dig example.com MX       # YAML
+seer --format markdown status example.com   # Markdown
+seer --format human lookup example.com      # Human-readable (default)
 ```
+
+### Field Extraction (Scripting)
+
+Use `--quiet` with `--fields` for scriptable output:
+
+```bash
+seer --quiet --fields registrar lookup example.com
+seer --quiet --fields certificate.issuer status example.com
+seer --quiet --fields available avail example.com
+seer --quiet --fields registrar,expires lookup example.com   # Multiple fields
+```
+
+### Exit Codes
+
+| Command | Exit 0 | Exit 1 |
+|---------|--------|--------|
+| `avail` | Domain available | Domain taken |
+| `status` | Healthy (HTTP 2xx, valid SSL, not expiring) | Any issue |
+| `dnssec` | DNSSEC secure | Not secure |
+| `compare` | Records match | Records differ |
+| All others | Success | Error |
 
 ### Configuration
 
@@ -105,7 +163,7 @@ seer config           # Show current config as JSON
 Config file (`~/.seer/config.toml`):
 
 ```toml
-output_format = "human"    # human, json, yaml
+output_format = "human"    # human, json, yaml, markdown
 # nameserver = "8.8.8.8"   # Optional default nameserver
 
 [timeouts]
@@ -136,18 +194,25 @@ $ seer
 seer> lookup example.com
 seer> dig github.com MX @1.1.1.1
 seer> status cloudflare.com
+seer> ssl cloudflare.com
+seer> compare example.com A @8.8.8.8 @1.1.1.1
+seer> subdomains example.com
+seer> diff example.com google.com
+seer> tld .com
+seer> watch add example.com
+seer> watch
+seer> history example.com
 seer> set output json
-seer> bulk status domains.txt -o results.csv
-seer> clear
 seer> help
 seer> exit
 ```
 
 REPL features:
-- Tab completion for commands, record types, bulk operations, and output formats
+- Tab completion for commands, record types, bulk operations, output formats, and watch actions
 - Usage hints (type a command and press space)
 - Command history saved to `~/.seer_history`
 - Just type a domain name directly to run a smart lookup
+- Ctrl+C or Ctrl+D to exit
 
 ## DNS Record Types
 

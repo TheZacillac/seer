@@ -298,6 +298,24 @@ impl RdapClient {
         self.query_rdap_with_retry(&url).await
     }
 
+    /// Returns the RDAP base URL for a given TLD, if known from bootstrap data.
+    ///
+    /// Loads bootstrap data if not already cached. Returns `None` if the TLD
+    /// has no registered RDAP server in the IANA bootstrap registry.
+    pub async fn get_rdap_base_url_for_tld(&self, tld: &str) -> Option<String> {
+        if self.ensure_bootstrap().await.is_err() {
+            return None;
+        }
+
+        let cache_guard = BOOTSTRAP_CACHE.read().await;
+        let cache = cache_guard.as_ref()?;
+        cache
+            .data
+            .dns
+            .get(&tld.to_lowercase())
+            .map(|url| url.to_string())
+    }
+
     /// Queries an RDAP endpoint with retry logic.
     async fn query_rdap_with_retry(&self, url: &str) -> Result<RdapResponse> {
         let executor = RetryExecutor::new(self.retry_policy.clone());

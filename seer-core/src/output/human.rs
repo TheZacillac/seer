@@ -1766,4 +1766,427 @@ impl OutputFormatter for HumanFormatter {
 
         output.join("\n")
     }
+
+    fn format_tld(&self, info: &crate::tld::TldInfo) -> String {
+        let mut output = Vec::new();
+
+        output.push(self.header(&format!("TLD Info: .{}", info.tld)));
+
+        output.push(format!(
+            "  {}: {}",
+            self.label("Type"),
+            self.value(&info.tld_type)
+        ));
+
+        if let Some(ref server) = info.whois_server {
+            output.push(format!(
+                "  {}: {}",
+                self.label("WHOIS Server"),
+                self.value(server)
+            ));
+        } else {
+            output.push(format!(
+                "  {}: {}",
+                self.label("WHOIS Server"),
+                self.warning("not available")
+            ));
+        }
+
+        if let Some(ref url) = info.rdap_url {
+            output.push(format!("  {}: {}", self.label("RDAP URL"), self.value(url)));
+        } else {
+            output.push(format!(
+                "  {}: {}",
+                self.label("RDAP URL"),
+                self.warning("not available")
+            ));
+        }
+
+        if let Some(ref url) = info.registry_url {
+            output.push(format!("  {}: {}", self.label("Registry"), self.value(url)));
+        } else {
+            output.push(format!(
+                "  {}: {}",
+                self.label("Registry"),
+                self.warning("not available")
+            ));
+        }
+
+        output.join("\n")
+    }
+
+    fn format_dns_comparison(&self, comparison: &crate::dns::DnsComparison) -> String {
+        let mut output = Vec::new();
+
+        output.push(self.header(&format!(
+            "DNS Comparison: {} {}",
+            comparison.domain, comparison.record_type
+        )));
+
+        // Match status
+        if comparison.matches {
+            output.push(format!("  {} Records match", self.success("✓")));
+        } else {
+            output.push(format!("  {} Records differ", self.error("✗")));
+        }
+        output.push(String::new());
+
+        // Server A
+        if let Some(ref err) = comparison.server_a.error {
+            output.push(format!(
+                "  {} ({}): {}",
+                self.label("Server A"),
+                self.value(&comparison.server_a.nameserver),
+                self.error(err)
+            ));
+        } else {
+            output.push(format!(
+                "  {} ({}): {} records",
+                self.label("Server A"),
+                self.value(&comparison.server_a.nameserver),
+                self.value(&comparison.server_a.records.len().to_string())
+            ));
+            for record in &comparison.server_a.records {
+                output.push(format!("    - {}", self.value(&record.format_short())));
+            }
+        }
+        output.push(String::new());
+
+        // Server B
+        if let Some(ref err) = comparison.server_b.error {
+            output.push(format!(
+                "  {} ({}): {}",
+                self.label("Server B"),
+                self.value(&comparison.server_b.nameserver),
+                self.error(err)
+            ));
+        } else {
+            output.push(format!(
+                "  {} ({}): {} records",
+                self.label("Server B"),
+                self.value(&comparison.server_b.nameserver),
+                self.value(&comparison.server_b.records.len().to_string())
+            ));
+            for record in &comparison.server_b.records {
+                output.push(format!("    - {}", self.value(&record.format_short())));
+            }
+        }
+        output.push(String::new());
+
+        // Common records
+        output.push(format!(
+            "  {}: {}",
+            self.label("Common"),
+            if comparison.common.is_empty() {
+                self.warning("(none)")
+            } else {
+                self.value(&comparison.common.join(", "))
+            }
+        ));
+
+        // Only in A
+        output.push(format!(
+            "  {}: {}",
+            self.label(&format!("Only in {}", comparison.server_a.nameserver)),
+            if comparison.only_in_a.is_empty() {
+                self.warning("(none)")
+            } else {
+                self.error(&comparison.only_in_a.join(", "))
+            }
+        ));
+
+        // Only in B
+        output.push(format!(
+            "  {}: {}",
+            self.label(&format!("Only in {}", comparison.server_b.nameserver)),
+            if comparison.only_in_b.is_empty() {
+                self.warning("(none)")
+            } else {
+                self.error(&comparison.only_in_b.join(", "))
+            }
+        ));
+
+        output.join("\n")
+    }
+
+    fn format_subdomains(&self, result: &crate::subdomains::SubdomainResult) -> String {
+        let mut output = Vec::new();
+
+        output.push(self.header(&format!("Subdomains: {}", result.domain)));
+
+        output.push(format!(
+            "  {}: {}",
+            self.label("Source"),
+            self.value(&result.source)
+        ));
+        output.push(format!(
+            "  {}: {}",
+            self.label("Count"),
+            self.value(&result.count.to_string())
+        ));
+
+        if result.subdomains.is_empty() {
+            output.push(format!("  {}", self.warning("No subdomains found")));
+        } else {
+            output.push(String::new());
+            for subdomain in &result.subdomains {
+                output.push(format!("    - {}", self.value(subdomain)));
+            }
+        }
+
+        output.join("\n")
+    }
+
+    fn format_diff(&self, diff: &crate::diff::DomainDiff) -> String {
+        let mut output = Vec::new();
+
+        output.push(self.header(&format!("Diff: {} vs {}", diff.domain_a, diff.domain_b)));
+
+        // Registration
+        output.push(format!("\n  {}:", self.label("Registration")));
+        let reg = &diff.registration;
+        output.push(format!(
+            "    {}: {} | {}",
+            self.label("Registrar"),
+            self.value(reg.registrar.0.as_deref().unwrap_or("N/A")),
+            self.value(reg.registrar.1.as_deref().unwrap_or("N/A"))
+        ));
+        output.push(format!(
+            "    {}: {} | {}",
+            self.label("Organization"),
+            self.value(reg.organization.0.as_deref().unwrap_or("N/A")),
+            self.value(reg.organization.1.as_deref().unwrap_or("N/A"))
+        ));
+        output.push(format!(
+            "    {}: {} | {}",
+            self.label("Created"),
+            self.value(reg.created.0.as_deref().unwrap_or("N/A")),
+            self.value(reg.created.1.as_deref().unwrap_or("N/A"))
+        ));
+        output.push(format!(
+            "    {}: {} | {}",
+            self.label("Expires"),
+            self.value(reg.expires.0.as_deref().unwrap_or("N/A")),
+            self.value(reg.expires.1.as_deref().unwrap_or("N/A"))
+        ));
+
+        // DNS
+        output.push(format!("\n  {}:", self.label("DNS")));
+        let dns = &diff.dns;
+        {
+            let (res_a, res_b) = dns.resolves;
+            output.push(format!(
+                "    {}: {} | {}",
+                self.label("Resolves"),
+                if res_a {
+                    self.success("yes")
+                } else {
+                    self.error("no")
+                },
+                if res_b {
+                    self.success("yes")
+                } else {
+                    self.error("no")
+                }
+            ));
+        }
+        output.push(format!(
+            "    {}: {} | {}",
+            self.label("A Records"),
+            self.value(&dns.a_records.0.join(", ")),
+            self.value(&dns.a_records.1.join(", "))
+        ));
+        output.push(format!(
+            "    {}: {} | {}",
+            self.label("Nameservers"),
+            self.value(&dns.nameservers.0.join(", ")),
+            self.value(&dns.nameservers.1.join(", "))
+        ));
+
+        // SSL
+        output.push(format!("\n  {}:", self.label("SSL")));
+        let ssl = &diff.ssl;
+        output.push(format!(
+            "    {}: {} | {}",
+            self.label("Issuer"),
+            self.value(ssl.issuer.0.as_deref().unwrap_or("N/A")),
+            self.value(ssl.issuer.1.as_deref().unwrap_or("N/A"))
+        ));
+        output.push(format!(
+            "    {}: {} | {}",
+            self.label("Valid Until"),
+            self.value(ssl.valid_until.0.as_deref().unwrap_or("N/A")),
+            self.value(ssl.valid_until.1.as_deref().unwrap_or("N/A"))
+        ));
+        {
+            let a_str = ssl.days_remaining.0.map(|d| d.to_string());
+            let b_str = ssl.days_remaining.1.map(|d| d.to_string());
+            output.push(format!(
+                "    {}: {} | {}",
+                self.label("Days Remaining"),
+                self.value(a_str.as_deref().unwrap_or("N/A")),
+                self.value(b_str.as_deref().unwrap_or("N/A"))
+            ));
+        }
+        {
+            let a_str = ssl.is_valid.0.map(|v| if v { "yes" } else { "no" });
+            let b_str = ssl.is_valid.1.map(|v| if v { "yes" } else { "no" });
+            output.push(format!(
+                "    {}: {} | {}",
+                self.label("Valid"),
+                self.value(a_str.unwrap_or("N/A")),
+                self.value(b_str.unwrap_or("N/A"))
+            ));
+        }
+
+        output.join("\n")
+    }
+
+    fn format_ssl(&self, report: &crate::ssl::SslReport) -> String {
+        let mut output = Vec::new();
+
+        output.push(self.header(&format!("SSL Report: {}", report.domain)));
+
+        output.push(format!(
+            "  {}: {}",
+            self.label("Valid"),
+            if report.is_valid {
+                self.success("yes")
+            } else {
+                self.error("no")
+            }
+        ));
+        output.push(format!(
+            "  {}: {}",
+            self.label("Days Until Expiry"),
+            self.value(&report.days_until_expiry.to_string())
+        ));
+
+        if let Some(ref proto) = report.protocol_version {
+            output.push(format!(
+                "  {}: {}",
+                self.label("Protocol"),
+                self.value(proto)
+            ));
+        }
+
+        if !report.san_names.is_empty() {
+            output.push(format!(
+                "  {}: {}",
+                self.label("SANs"),
+                self.value(&report.san_names.join(", "))
+            ));
+        }
+
+        if !report.chain.is_empty() {
+            output.push(String::new());
+            output.push(format!("  {}:", self.label("Certificate Chain")));
+            for (i, cert) in report.chain.iter().enumerate() {
+                output.push(format!("    [{}] {}", i, self.value(&cert.subject)));
+                output.push(format!(
+                    "        {}: {}",
+                    self.label("Issuer"),
+                    self.value(&cert.issuer)
+                ));
+                if let Some(ref alg) = cert.signature_algorithm {
+                    output.push(format!(
+                        "        {}: {}",
+                        self.label("Algorithm"),
+                        self.value(alg)
+                    ));
+                }
+                if let Some(ref key_type) = cert.key_type {
+                    let key_info = if let Some(bits) = cert.key_bits {
+                        format!("{} ({} bits)", key_type, bits)
+                    } else {
+                        key_type.clone()
+                    };
+                    output.push(format!(
+                        "        {}: {}",
+                        self.label("Key"),
+                        self.value(&key_info)
+                    ));
+                }
+                output.push(format!(
+                    "        {}: {} to {}",
+                    self.label("Validity"),
+                    self.value(&cert.valid_from.format("%Y-%m-%d").to_string()),
+                    self.value(&cert.valid_until.format("%Y-%m-%d").to_string())
+                ));
+            }
+        }
+
+        output.join("\n")
+    }
+
+    fn format_watch(&self, report: &crate::watchlist::WatchReport) -> String {
+        let mut output = Vec::new();
+
+        output.push(self.header("Domain Watch Report"));
+
+        output.push(format!(
+            "  {}: {}",
+            self.label("Checked"),
+            self.value(
+                &report
+                    .checked_at
+                    .format("%Y-%m-%d %H:%M:%S UTC")
+                    .to_string()
+            )
+        ));
+        output.push(format!(
+            "  {}: {} domains, {} warnings",
+            self.label("Total"),
+            self.value(&report.total.to_string()),
+            if report.warnings > 0 {
+                self.warning(&report.warnings.to_string())
+            } else {
+                self.value(&report.warnings.to_string())
+            }
+        ));
+
+        for r in &report.results {
+            output.push(String::new());
+
+            let icon = if r.issues.is_empty() {
+                self.success("v")
+            } else {
+                self.warning("!")
+            };
+            output.push(format!("  {} {}", icon, self.value(&r.domain)));
+
+            // Condensed status line: SSL | Domain | HTTP
+            let ssl_str = r
+                .ssl_days_remaining
+                .map(|d| format!("{} days", d))
+                .unwrap_or_else(|| "N/A".to_string());
+            let dom_str = r
+                .domain_days_remaining
+                .map(|d| format!("{} days", d))
+                .unwrap_or_else(|| "N/A".to_string());
+            let http_str = r
+                .http_status
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "N/A".to_string());
+
+            output.push(format!(
+                "      {}: {} | {}: {} | {}: {}",
+                self.label("SSL"),
+                self.value(&ssl_str),
+                self.label("Domain"),
+                self.value(&dom_str),
+                self.label("HTTP"),
+                self.value(&http_str)
+            ));
+
+            if !r.issues.is_empty() {
+                output.push(format!("      {}:", self.label("Issues")));
+                for issue in &r.issues {
+                    output.push(format!("        - {}", self.warning(issue)));
+                }
+            }
+        }
+
+        output.join("\n")
+    }
 }

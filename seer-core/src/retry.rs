@@ -192,9 +192,11 @@ impl RetryClassifier for NetworkRetryClassifier {
             SeerError::WhoisServerNotFound(_) => false,
             SeerError::JsonError(_) => false,
             SeerError::CertificateError(_) => false,
+            SeerError::SslError(_) => false,
             SeerError::DnsResolverError(_) => false,
             SeerError::BulkOperationError { .. } => false,
             SeerError::LookupFailed { .. } => false,
+            SeerError::ConfigError(_) => false,
             SeerError::RetryExhausted { .. } => false,
             SeerError::Other(_) => false,
         }

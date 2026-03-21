@@ -1,0 +1,150 @@
+use std::collections::BTreeSet;
+
+use once_cell::sync::Lazy;
+use serde::{Deserialize, Serialize};
+use tracing::debug;
+
+use crate::error::{Result, SeerError};
+
+/// Result of subdomain enumeration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubdomainResult {
+    pub domain: String,
+    pub subdomains: Vec<String>,
+    pub source: String,
+    pub count: usize,
+}
+
+/// Enumerates subdomains using Certificate Transparency logs.
+pub struct SubdomainEnumerator;
+
+impl Default for SubdomainEnumerator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Shared HTTP client for CT log queries (connection pooling).
+static HTTP_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .user_agent("seer-domain-tool")
+        .build()
+        .expect("Failed to create HTTP client")
+});
+
+impl SubdomainEnumerator {
+    pub fn new() -> Self {
+        Self
+    }
+
+    /// Discover subdomains for a domain using Certificate Transparency logs.
+    ///
+    /// Queries crt.sh, a public CT log aggregator, to find certificates issued
+    /// for subdomains of the given domain. Returns a deduplicated, sorted list
+    /// of discovered subdomains.
+    ///
+    /// # Arguments
+    /// * `domain` - The domain name to enumerate subdomains for (e.g., "example.com")
+    ///
+    /// # Returns
+    /// * `Ok(SubdomainResult)` - List of discovered subdomains
+    /// * `Err(SeerError)` - If the CT log query fails
+    pub async fn enumerate(&self, domain: &str) -> Result<SubdomainResult> {
+        let domain = crate::validation::normalize_domain(domain)?;
+        debug!(domain = %domain, "Enumerating subdomains via CT logs");
+
+        // Query crt.sh (Certificate Transparency log aggregator)
+        let url = format!("https://crt.sh/?q=%.{}&output=json", domain);
+
+        let response = HTTP_CLIENT
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| SeerError::HttpError(format!("CT log query failed: {}", e)))?;
+
+        if !response.status().is_success() {
+            return Err(SeerError::HttpError(format!(
+                "CT log returned status {}",
+                response.status()
+            )));
+        }
+
+        let entries: Vec<CtLogEntry> = response
+            .json()
+            .await
+            .map_err(|e| SeerError::HttpError(format!("Failed to parse CT log response: {}", e)))?;
+
+        // Extract unique subdomain names
+        let mut subdomains = BTreeSet::new();
+        let suffix = format!(".{}", domain);
+
+        for entry in &entries {
+            // common_name and name_value may contain multiple domains separated by newlines
+            for name in entry.common_name.split('\n') {
+                let name = name.trim().to_lowercase();
+                if (name.ends_with(&suffix) || name == domain) && !name.starts_with('*') {
+                    subdomains.insert(name);
+                }
+            }
+            if let Some(ref name_value) = entry.name_value {
+                for name in name_value.split('\n') {
+                    let name = name.trim().to_lowercase();
+                    if (name.ends_with(&suffix) || name == domain) && !name.starts_with('*') {
+                        subdomains.insert(name);
+                    }
+                }
+            }
+        }
+
+        // Remove the base domain itself from the results
+        subdomains.remove(&domain);
+
+        let subdomains: Vec<String> = subdomains.into_iter().collect();
+        let count = subdomains.len();
+
+        Ok(SubdomainResult {
+            domain,
+            subdomains,
+            source: "crt.sh (Certificate Transparency)".to_string(),
+            count,
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct CtLogEntry {
+    #[serde(default)]
+    common_name: String,
+    #[serde(default)]
+    name_value: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_subdomain_result_serialization() {
+        let result = SubdomainResult {
+            domain: "example.com".to_string(),
+            subdomains: vec![
+                "api.example.com".to_string(),
+                "mail.example.com".to_string(),
+            ],
+            source: "crt.sh (Certificate Transparency)".to_string(),
+            count: 2,
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("api.example.com"));
+        assert!(json.contains("mail.example.com"));
+        assert!(json.contains("crt.sh"));
+    }
+
+    #[test]
+    fn test_subdomain_enumerator_default() {
+        let enumerator = SubdomainEnumerator::default();
+        // Just verify it can be constructed
+        let _ = enumerator;
+    }
+}

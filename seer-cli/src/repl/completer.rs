@@ -5,8 +5,31 @@ use rustyline::validate::Validator;
 use rustyline::Helper;
 
 const COMMANDS: &[&str] = &[
-    "help", "exit", "quit", "lookup", "whois", "rdap", "dig", "dns", "prop", "follow", "reverse",
-    "avail", "dnssec", "bulk", "status", "set", "clear",
+    "help",
+    "exit",
+    "quit",
+    "lookup",
+    "whois",
+    "rdap",
+    "dig",
+    "dns",
+    "prop",
+    "follow",
+    "reverse",
+    "avail",
+    "dnssec",
+    "bulk",
+    "status",
+    "ssl",
+    "tld",
+    "compare",
+    "subdomains",
+    "subs",
+    "diff",
+    "watch",
+    "history",
+    "set",
+    "clear",
 ];
 
 const RECORD_TYPES: &[&str] = &[
@@ -17,7 +40,9 @@ const BULK_OPERATIONS: &[&str] = &["lookup", "whois", "rdap", "dig", "prop", "st
 
 const SET_OPTIONS: &[&str] = &["output"];
 
-const OUTPUT_FORMATS: &[&str] = &["human", "json", "yaml"];
+const OUTPUT_FORMATS: &[&str] = &["human", "json", "yaml", "markdown"];
+
+const WATCH_ACTIONS: &[&str] = &["add", "remove", "list"];
 
 pub struct SeerCompleter;
 
@@ -62,7 +87,7 @@ impl Completer for SeerCompleter {
         };
 
         match command.as_str() {
-            "dig" | "dns" | "propagation" | "prop" | "follow" => {
+            "dig" | "dns" | "propagation" | "prop" | "follow" | "compare" => {
                 // Complete record types
                 if words.len() >= 2 {
                     let matches: Vec<Pair> = RECORD_TYPES
@@ -119,6 +144,20 @@ impl Completer for SeerCompleter {
                     return Ok((start, matches));
                 }
             }
+            "watch" => {
+                if words.len() == 1 || (words.len() == 2 && !line_to_cursor.ends_with(' ')) {
+                    let matches: Vec<Pair> = WATCH_ACTIONS
+                        .iter()
+                        .filter(|a| a.starts_with(current_word))
+                        .map(|a| Pair {
+                            display: a.to_string(),
+                            replacement: a.to_string(),
+                        })
+                        .collect();
+                    let start = line_to_cursor.len() - current_word.len();
+                    return Ok((start, matches));
+                }
+            }
             _ => {}
         }
 
@@ -156,7 +195,7 @@ impl Hinter for SeerCompleter {
                 Some(" <operation> <file.txt>".to_string())
             }
             "set" if words.len() == 1 && line.ends_with(' ') => {
-                Some(" output <human|json|yaml>".to_string())
+                Some(" output <human|json|yaml|markdown>".to_string())
             }
             "reverse" if words.len() == 1 && line.ends_with(' ') => Some(" <ip>".to_string()),
             "avail" if words.len() == 1 && line.ends_with(' ') => Some(" <domain>".to_string()),
@@ -164,6 +203,23 @@ impl Hinter for SeerCompleter {
             "status" if words.len() == 1 && line.ends_with(' ') => Some(" <domain>".to_string()),
             "follow" if words.len() == 1 && line.ends_with(' ') => {
                 Some(" <domain> [iterations] [interval_minutes] [type] [@server]".to_string())
+            }
+            "ssl" if words.len() == 1 && line.ends_with(' ') => Some(" <domain>".to_string()),
+            "tld" if words.len() == 1 && line.ends_with(' ') => Some(" <tld>".to_string()),
+            "compare" if words.len() == 1 && line.ends_with(' ') => {
+                Some(" <domain> [type] @<server1> @<server2>".to_string())
+            }
+            "subdomains" | "subs" if words.len() == 1 && line.ends_with(' ') => {
+                Some(" <domain>".to_string())
+            }
+            "diff" if words.len() == 1 && line.ends_with(' ') => {
+                Some(" <domain1> <domain2>".to_string())
+            }
+            "watch" if words.len() == 1 && line.ends_with(' ') => {
+                Some(" [add|remove|list] [domain]".to_string())
+            }
+            "history" if words.len() == 1 && line.ends_with(' ') => {
+                Some(" [domain] [--clear]".to_string())
             }
             _ => None,
         }

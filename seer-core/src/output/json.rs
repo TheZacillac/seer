@@ -75,6 +75,30 @@ impl OutputFormatter for JsonFormatter {
     fn format_dnssec(&self, report: &crate::dns::DnssecReport) -> String {
         self.to_json(report)
     }
+
+    fn format_tld(&self, info: &crate::tld::TldInfo) -> String {
+        self.to_json(info)
+    }
+
+    fn format_dns_comparison(&self, comparison: &crate::dns::DnsComparison) -> String {
+        self.to_json(comparison)
+    }
+
+    fn format_subdomains(&self, result: &crate::subdomains::SubdomainResult) -> String {
+        self.to_json(result)
+    }
+
+    fn format_diff(&self, diff: &crate::diff::DomainDiff) -> String {
+        self.to_json(diff)
+    }
+
+    fn format_ssl(&self, report: &crate::ssl::SslReport) -> String {
+        self.to_json(report)
+    }
+
+    fn format_watch(&self, report: &crate::watchlist::WatchReport) -> String {
+        self.to_json(report)
+    }
 }
 
 #[cfg(test)]

@@ -45,6 +45,15 @@ Seer provides a unified, high-performance toolkit for domain intelligence with m
 | **Domain Status** | HTTP status, site title, SSL certificate info, and expiration dates |
 | **Smart Lookups** | Concurrent RDAP + WHOIS with availability fallback |
 | **Bulk Operations** | Process multiple domains concurrently with configurable rate limiting |
+| **SSL Chain Inspection** | Full certificate chain, SANs, key details, and validity checking |
+| **DNS Comparison** | Compare DNS records across two nameservers to verify consistency |
+| **Domain Diff** | Side-by-side comparison of two domains (registration, DNS, SSL) |
+| **Subdomain Enumeration** | Discover subdomains via Certificate Transparency logs |
+| **TLD Info** | Look up WHOIS server, RDAP endpoint, and registry for any TLD |
+| **Domain Watchlist** | Monitor domains for expiring SSL certificates and registrations |
+| **Lookup History** | Persistent history of past domain lookups |
+| **Field Extraction** | `--quiet --fields` flags for scriptable output |
+| **Semantic Exit Codes** | Meaningful exit codes for CI/CD scripting |
 | **SSRF Protection** | Blocks requests to private/reserved IP ranges |
 | **Multiple Interfaces** | CLI, Rust library, Python library, REST API, and MCP server |
 
@@ -267,14 +276,47 @@ seer bulk whois domains.txt
 seer bulk dig domains.txt A
 seer bulk status domains.txt
 seer bulk status domains.txt -o results.csv  # Export to CSV
+
+# SSL certificate inspection
+seer ssl example.com
+
+# TLD info
+seer tld .com
+
+# Compare DNS across nameservers
+seer compare example.com A 8.8.8.8 1.1.1.1
+
+# Enumerate subdomains via CT logs
+seer subdomains example.com
+
+# Compare two domains side-by-side
+seer diff example.com google.com
+
+# Domain watchlist
+seer watch add example.com
+seer watch list
+seer watch                    # Check all domains
+seer watch remove example.com
+
+# Lookup history
+seer history example.com
+seer history --clear
+
+# Domain availability (exit code 0=available, 1=taken)
+seer avail example.com
+
+# Scriptable field extraction
+seer --quiet --fields registrar lookup example.com
+seer --quiet --fields certificate.issuer status example.com
 ```
 
 #### Output Formats
 
 ```bash
-seer --format human lookup example.com  # Human-readable (default)
-seer --format json lookup example.com   # JSON output
-seer --format yaml lookup example.com   # YAML output
+seer --format human lookup example.com     # Human-readable (default)
+seer --format json lookup example.com      # JSON output
+seer --format yaml lookup example.com      # YAML output
+seer --format markdown lookup example.com  # Markdown output
 ```
 
 #### Interactive REPL
@@ -558,6 +600,14 @@ All clients support configurable timeouts:
 - **Default concurrency:** 10
 - **Maximum concurrency:** 50
 - **Maximum domains per API request:** 100
+
+---
+
+## Roadmap
+
+Features under investigation for future releases:
+
+- **Scheduled Monitoring Daemon** — `seer monitor --config monitors.toml` running as a background service that checks domains on a schedule and sends notifications (email, Slack webhook, PagerDuty) when domains approach expiration thresholds, SSL certificates are about to expire, or DNS records change unexpectedly. This is the natural evolution of the `watch`, `follow`, and `status` commands into a persistent monitoring solution.
 
 ---
 

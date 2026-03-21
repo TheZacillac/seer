@@ -1,8 +1,10 @@
 mod human;
 mod json;
+mod markdown;
 
 pub use human::HumanFormatter;
 pub use json::JsonFormatter;
+pub use markdown::MarkdownFormatter;
 
 use serde::{Deserialize, Serialize};
 
@@ -13,6 +15,7 @@ pub enum OutputFormat {
     Human,
     Json,
     Yaml,
+    Markdown,
 }
 
 impl std::str::FromStr for OutputFormat {
@@ -23,8 +26,9 @@ impl std::str::FromStr for OutputFormat {
             "human" | "text" | "pretty" => Ok(OutputFormat::Human),
             "json" => Ok(OutputFormat::Json),
             "yaml" | "yml" => Ok(OutputFormat::Yaml),
+            "markdown" | "md" => Ok(OutputFormat::Markdown),
             _ => Err(format!(
-                "Unknown output format: {}. Use: human, json, yaml",
+                "Unknown output format: {}. Use: human, json, yaml, markdown",
                 s
             )),
         }
@@ -42,6 +46,12 @@ pub trait OutputFormatter {
     fn format_follow(&self, result: &crate::dns::FollowResult) -> String;
     fn format_availability(&self, result: &crate::availability::AvailabilityResult) -> String;
     fn format_dnssec(&self, report: &crate::dns::DnssecReport) -> String;
+    fn format_tld(&self, info: &crate::tld::TldInfo) -> String;
+    fn format_dns_comparison(&self, comparison: &crate::dns::DnsComparison) -> String;
+    fn format_subdomains(&self, result: &crate::subdomains::SubdomainResult) -> String;
+    fn format_diff(&self, diff: &crate::diff::DomainDiff) -> String;
+    fn format_ssl(&self, report: &crate::ssl::SslReport) -> String;
+    fn format_watch(&self, report: &crate::watchlist::WatchReport) -> String;
 }
 
 /// YAML output formatter that converts data structures to YAML format.
@@ -97,6 +107,24 @@ impl OutputFormatter for YamlFormatter {
         self.to_yaml_value(result)
     }
     fn format_dnssec(&self, report: &crate::dns::DnssecReport) -> String {
+        self.to_yaml_value(report)
+    }
+    fn format_tld(&self, info: &crate::tld::TldInfo) -> String {
+        self.to_yaml_value(info)
+    }
+    fn format_dns_comparison(&self, comparison: &crate::dns::DnsComparison) -> String {
+        self.to_yaml_value(comparison)
+    }
+    fn format_subdomains(&self, result: &crate::subdomains::SubdomainResult) -> String {
+        self.to_yaml_value(result)
+    }
+    fn format_diff(&self, diff: &crate::diff::DomainDiff) -> String {
+        self.to_yaml_value(diff)
+    }
+    fn format_ssl(&self, report: &crate::ssl::SslReport) -> String {
+        self.to_yaml_value(report)
+    }
+    fn format_watch(&self, report: &crate::watchlist::WatchReport) -> String {
         self.to_yaml_value(report)
     }
 }
@@ -162,6 +190,7 @@ pub fn get_formatter(format: OutputFormat) -> Box<dyn OutputFormatter> {
         OutputFormat::Human => Box::new(HumanFormatter::new()),
         OutputFormat::Json => Box::new(JsonFormatter::new()),
         OutputFormat::Yaml => Box::new(YamlFormatter::new()),
+        OutputFormat::Markdown => Box::new(MarkdownFormatter::new()),
     }
 }
 

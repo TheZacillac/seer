@@ -139,6 +139,7 @@ impl Repl {
             seer_core::output::OutputFormat::Human => "",
             seer_core::output::OutputFormat::Json => " [json]",
             seer_core::output::OutputFormat::Yaml => " [yaml]",
+            seer_core::output::OutputFormat::Markdown => " [md]",
         };
         format!(
             "{}{} ",
@@ -173,6 +174,13 @@ impl Repl {
             "bulk" => self.execute_bulk(args).await,
             "status" => self.execute_status(args).await,
             "follow" => self.execute_follow(args).await,
+            "ssl" => self.execute_ssl(args).await,
+            "tld" => self.execute_tld(args).await,
+            "compare" => self.execute_compare(args).await,
+            "subdomains" | "subs" => self.execute_subdomains(args).await,
+            "diff" => self.execute_diff(args).await,
+            "watch" => self.execute_watch(args).await,
+            "history" => self.execute_history(args),
             "set" => self.execute_set(args),
             "clear" => {
                 print!("\x1B[2J\x1B[1;1H");
@@ -227,6 +235,10 @@ impl Repl {
             "  {}",
             "Record types: A, AAAA, CNAME, MX, NS, TXT, SOA, PTR, SRV, CAA".dimmed()
         );
+        println!(
+            "  {:<34} Compare DNS records across nameservers",
+            "compare <domain> [type] @ns1 @ns2".bright_cyan()
+        );
         println!();
         println!("{}", "UTILITY COMMANDS".bright_purple().bold());
         println!(
@@ -241,11 +253,39 @@ impl Repl {
             "  {:<34} Check DNSSEC configuration",
             "dnssec <domain>".bright_cyan()
         );
+        println!(
+            "  {:<34} Look up TLD info (WHOIS server, RDAP, registry)",
+            "tld <tld>".bright_cyan()
+        );
+        println!(
+            "  {:<34} Enumerate subdomains via CT logs",
+            "subdomains <domain>".bright_cyan()
+        );
         println!();
-        println!("{}", "STATUS COMMANDS".bright_purple().bold());
+        println!("{}", "STATUS & SSL".bright_purple().bold());
         println!(
             "  {:<34} Check HTTP, SSL, and domain expiration",
             "status <domain>".bright_cyan()
+        );
+        println!(
+            "  {:<34} Inspect SSL certificate chain and SANs",
+            "ssl <domain>".bright_cyan()
+        );
+        println!();
+        println!("{}", "COMPARISON".bright_purple().bold());
+        println!(
+            "  {:<34} Compare two domains side-by-side",
+            "diff <domain1> <domain2>".bright_cyan()
+        );
+        println!();
+        println!("{}", "MONITORING".bright_purple().bold());
+        println!(
+            "  {:<34} Check watchlist / add / remove / list",
+            "watch [add|remove|list] [domain]".bright_cyan()
+        );
+        println!(
+            "  {:<34} View lookup history",
+            "history [domain] [--clear]".bright_cyan()
         );
         println!();
         println!("{}", "BULK OPERATIONS".bright_purple().bold());
@@ -261,7 +301,7 @@ impl Repl {
         println!("{}", "SETTINGS".bright_purple().bold());
         println!(
             "  {:<34} Change output format",
-            "set output <human|json|yaml>".bright_cyan()
+            "set output <human|json|yaml|markdown>".bright_cyan()
         );
         println!("  {:<34} Clear screen", "clear".bright_cyan());
         println!("  {:<34} Exit the program", "exit".bright_cyan());
@@ -887,6 +927,250 @@ impl Repl {
         }
     }
 
+    async fn execute_ssl(&self, args: &[&str]) -> CommandResult {
+        if args.is_empty() {
+            return CommandResult::Error("Usage: ssl <domain>".to_string());
+        }
+        let domain = args[0];
+        let spinner = Spinner::new(&format!("Checking SSL for {}", domain));
+        let checker = seer_core::SslChecker::new();
+        match checker.check(domain).await {
+            Ok(report) => {
+                spinner.finish();
+                let formatter = seer_core::output::get_formatter(self.context.output_format);
+                println!("{}", formatter.format_ssl(&report));
+                CommandResult::Continue
+            }
+            Err(e) => {
+                spinner.finish();
+                CommandResult::Error(e.to_string())
+            }
+        }
+    }
+
+    async fn execute_tld(&self, args: &[&str]) -> CommandResult {
+        if args.is_empty() {
+            return CommandResult::Error("Usage: tld <tld>".to_string());
+        }
+        let info = seer_core::lookup_tld(args[0]).await;
+        let formatter = seer_core::output::get_formatter(self.context.output_format);
+        println!("{}", formatter.format_tld(&info));
+        CommandResult::Continue
+    }
+
+    async fn execute_compare(&self, args: &[&str]) -> CommandResult {
+        if args.len() < 3 {
+            return CommandResult::Error(
+                "Usage: compare <domain> [type] <@server1> <@server2>".to_string(),
+            );
+        }
+        let domain = args[0];
+        let mut record_type = seer_core::RecordType::A;
+        let mut servers: Vec<&str> = Vec::new();
+
+        for arg in &args[1..] {
+            if let Some(ns) = arg.strip_prefix('@') {
+                servers.push(ns);
+            } else if let Ok(rt) = arg.parse() {
+                record_type = rt;
+            }
+        }
+
+        if servers.len() < 2 {
+            return CommandResult::Error(
+                "Need two nameservers (e.g., @8.8.8.8 @1.1.1.1)".to_string(),
+            );
+        }
+
+        let spinner = Spinner::new(&format!(
+            "Comparing {} records from {} servers",
+            domain,
+            servers.len()
+        ));
+        let comparator = seer_core::dns::DnsComparator::new();
+        match comparator
+            .compare(domain, record_type, servers[0], servers[1])
+            .await
+        {
+            Ok(comparison) => {
+                spinner.finish();
+                let formatter = seer_core::output::get_formatter(self.context.output_format);
+                println!("{}", formatter.format_dns_comparison(&comparison));
+                CommandResult::Continue
+            }
+            Err(e) => {
+                spinner.finish();
+                CommandResult::Error(e.to_string())
+            }
+        }
+    }
+
+    async fn execute_subdomains(&self, args: &[&str]) -> CommandResult {
+        if args.is_empty() {
+            return CommandResult::Error("Usage: subdomains <domain>".to_string());
+        }
+        let domain = args[0];
+        let spinner = Spinner::new(&format!("Enumerating subdomains for {}", domain));
+        let enumerator = seer_core::SubdomainEnumerator::new();
+        match enumerator.enumerate(domain).await {
+            Ok(result) => {
+                spinner.finish();
+                let formatter = seer_core::output::get_formatter(self.context.output_format);
+                println!("{}", formatter.format_subdomains(&result));
+                CommandResult::Continue
+            }
+            Err(e) => {
+                spinner.finish();
+                CommandResult::Error(e.to_string())
+            }
+        }
+    }
+
+    async fn execute_diff(&self, args: &[&str]) -> CommandResult {
+        if args.len() < 2 {
+            return CommandResult::Error("Usage: diff <domain1> <domain2>".to_string());
+        }
+        let spinner = Spinner::new(&format!("Comparing {} vs {}", args[0], args[1]));
+        let differ = seer_core::DomainDiffer::new();
+        match differ.diff(args[0], args[1]).await {
+            Ok(diff) => {
+                spinner.finish();
+                let formatter = seer_core::output::get_formatter(self.context.output_format);
+                println!("{}", formatter.format_diff(&diff));
+                CommandResult::Continue
+            }
+            Err(e) => {
+                spinner.finish();
+                CommandResult::Error(e.to_string())
+            }
+        }
+    }
+
+    async fn execute_watch(&mut self, args: &[&str]) -> CommandResult {
+        match args.first().copied() {
+            Some("add") => {
+                let domain = match args.get(1) {
+                    Some(d) => d,
+                    None => return CommandResult::Error("Usage: watch add <domain>".to_string()),
+                };
+                let mut watchlist = seer_core::Watchlist::load();
+                match watchlist.add(domain) {
+                    Ok(true) => {
+                        if let Err(e) = watchlist.save() {
+                            return CommandResult::Error(format!("Failed to save: {}", e));
+                        }
+                        println!("Added {} to watchlist", domain);
+                    }
+                    Ok(false) => {
+                        println!("{} is already in the watchlist", domain);
+                    }
+                    Err(e) => {
+                        return CommandResult::Error(format!("Invalid domain: {}", e));
+                    }
+                }
+                CommandResult::Continue
+            }
+            Some("remove") => {
+                let domain = match args.get(1) {
+                    Some(d) => d,
+                    None => {
+                        return CommandResult::Error("Usage: watch remove <domain>".to_string())
+                    }
+                };
+                let mut watchlist = seer_core::Watchlist::load();
+                if watchlist.remove(domain) {
+                    if let Err(e) = watchlist.save() {
+                        return CommandResult::Error(format!("Failed to save: {}", e));
+                    }
+                    println!("Removed {} from watchlist", domain);
+                } else {
+                    println!("{} was not in the watchlist", domain);
+                }
+                CommandResult::Continue
+            }
+            Some("list") => {
+                let watchlist = seer_core::Watchlist::load();
+                if watchlist.domains.is_empty() {
+                    println!("Watchlist is empty. Use 'watch add <domain>' to add domains.");
+                } else {
+                    println!("Watchlist ({} domains):", watchlist.domains.len());
+                    for d in &watchlist.domains {
+                        println!("  - {}", d);
+                    }
+                }
+                CommandResult::Continue
+            }
+            None => {
+                let watchlist = seer_core::Watchlist::load();
+                if watchlist.domains.is_empty() {
+                    println!("Watchlist is empty. Use 'watch add <domain>' to add domains.");
+                    return CommandResult::Continue;
+                }
+                let spinner =
+                    Spinner::new(&format!("Checking {} domains", watchlist.domains.len()));
+                let report = seer_core::check_watchlist(&watchlist.domains).await;
+                spinner.finish();
+                let formatter = seer_core::output::get_formatter(self.context.output_format);
+                println!("{}", formatter.format_watch(&report));
+                CommandResult::Continue
+            }
+            Some(other) => CommandResult::Error(format!(
+                "Unknown watch action: {}. Use: add, remove, list",
+                other
+            )),
+        }
+    }
+
+    fn execute_history(&self, args: &[&str]) -> CommandResult {
+        let mut history = seer_core::LookupHistory::load();
+        if args.contains(&"--clear") {
+            history.clear();
+            if let Err(e) = history.save() {
+                return CommandResult::Error(format!("Failed to clear: {}", e));
+            }
+            println!("Lookup history cleared");
+            return CommandResult::Continue;
+        }
+        if let Some(domain) = args.first() {
+            let entries = history.get(domain);
+            if entries.is_empty() {
+                println!("No history for {}", domain);
+            } else {
+                println!("History for {} ({} entries):", domain, entries.len());
+                for entry in entries {
+                    let source = if entry.result.is_rdap() {
+                        "RDAP"
+                    } else if entry.result.is_whois() {
+                        "WHOIS"
+                    } else {
+                        "availability"
+                    };
+                    println!(
+                        "  [{}] via {} - registrar: {}",
+                        entry.timestamp.format("%Y-%m-%d %H:%M"),
+                        source,
+                        entry.result.registrar().unwrap_or_else(|| "—".to_string())
+                    );
+                }
+            }
+        } else {
+            let total: usize = history.entries.values().map(|v| v.len()).sum();
+            if total == 0 {
+                println!("No lookup history.");
+            } else {
+                println!(
+                    "Lookup history ({} entries across {} domains):",
+                    total,
+                    history.entries.len()
+                );
+                for (domain, entries) in &history.entries {
+                    println!("  {} ({} entries)", domain, entries.len());
+                }
+            }
+        }
+        CommandResult::Continue
+    }
+
     fn execute_set(&mut self, args: &[&str]) -> CommandResult {
         if args.len() < 2 {
             return CommandResult::Error("Usage: set <setting> <value>".to_string());
@@ -899,9 +1183,9 @@ impl Repl {
                     println!("Output format set to: {}", args[1]);
                     CommandResult::Continue
                 }
-                Err(_) => {
-                    CommandResult::Error("Invalid format. Use: human, json, yaml".to_string())
-                }
+                Err(_) => CommandResult::Error(
+                    "Invalid format. Use: human, json, yaml, markdown".to_string(),
+                ),
             },
             _ => CommandResult::Error(format!("Unknown setting: {}", args[0])),
         }
