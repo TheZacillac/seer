@@ -29,6 +29,7 @@ Example Usage:
   seer bulk status domains.txt              # Output: domains_results.csv
   seer bulk lookup domains.csv              # Output: domains_results.csv
   seer bulk dig domains.txt MX              # Output: domains_results.csv
+  seer bulk avail domains.txt               # Output: domains_results.csv
   seer bulk status domains.txt -o out.csv   # Output: out.csv
 
 Example Output (status operation):
@@ -45,6 +46,11 @@ Example Output (dig operation):
   domain,success,record_type,records,duration_ms,error
   example.com,true,A,93.184.216.34,45,
   google.com,true,MX,10 smtp.google.com; 20 smtp2.google.com,38,
+
+Example Output (avail operation):
+  domain,success,available,confidence,method,details,duration_ms,error
+  nonexistent123.com,true,true,high,whois,WHOIS indicates domain is not registered,1523,
+  google.com,true,false,high,rdap,Domain is registered (status: client delete prohibited),412,
 "#;
 
 #[derive(Parser)]

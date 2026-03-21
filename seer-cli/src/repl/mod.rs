@@ -334,6 +334,10 @@ impl Repl {
             "  {}      Check HTTP, SSL, and domain expiration",
             "status".bright_green()
         );
+        println!(
+            "  {}       Check domain registration availability",
+            "avail".bright_green()
+        );
         println!();
         println!("{}", "Input File Formats:".bright_cyan());
         println!("  Plain text (one domain per line, # for comments):");
