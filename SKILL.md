@@ -116,6 +116,7 @@ seer bulk rdap domains.txt
 seer bulk dig domains.txt MX
 seer bulk prop domains.txt
 seer bulk status domains.txt
+seer bulk avail domains.txt
 seer bulk status domains.txt -o results.csv    # Custom output path
 ```
 
@@ -226,6 +227,7 @@ REPL features:
 | **lookup/whois/rdap** | domain, success, registrar, created, expires, updated, duration_ms, error |
 | **dig** | domain, success, record_type, records, duration_ms, error |
 | **prop** | domain, success, propagation_pct, servers_total, servers_responded, duration_ms, error |
+| **avail** | domain, success, available, confidence, method, details, duration_ms, error |
 
 ## REST API
 

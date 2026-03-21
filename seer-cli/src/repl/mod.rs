@@ -295,7 +295,7 @@ impl Repl {
         );
         println!(
             "  {}",
-            "Operations: lookup, whois, rdap, dig, prop, status".dimmed()
+            "Operations: lookup, whois, rdap, dig, prop, status, avail".dimmed()
         );
         println!();
         println!("{}", "SETTINGS".bright_purple().bold());
@@ -718,9 +718,13 @@ impl Repl {
                 .iter()
                 .map(|d: &String| seer_core::bulk::BulkOperation::Status { domain: d.clone() })
                 .collect(),
+            "avail" => domains
+                .iter()
+                .map(|d: &String| seer_core::bulk::BulkOperation::Avail { domain: d.clone() })
+                .collect(),
             _ => {
                 return CommandResult::Error(format!(
-                    "Unknown bulk operation: {}. Use: lookup, whois, rdap, dig/dns, prop, status",
+                    "Unknown bulk operation: {}. Use: lookup, whois, rdap, dig/dns, prop, status, avail",
                     operation
                 ))
             }
@@ -759,12 +763,13 @@ impl Repl {
             println!("\n{}", "Failures:".bright_red().bold());
             for result in results.iter().filter(|r| !r.success) {
                 let domain = match &result.operation {
-                    seer_core::bulk::BulkOperation::Whois { domain } => domain,
-                    seer_core::bulk::BulkOperation::Rdap { domain } => domain,
-                    seer_core::bulk::BulkOperation::Dns { domain, .. } => domain,
-                    seer_core::bulk::BulkOperation::Propagation { domain, .. } => domain,
-                    seer_core::bulk::BulkOperation::Lookup { domain } => domain,
-                    seer_core::bulk::BulkOperation::Status { domain } => domain,
+                    seer_core::bulk::BulkOperation::Whois { domain }
+                    | seer_core::bulk::BulkOperation::Rdap { domain }
+                    | seer_core::bulk::BulkOperation::Dns { domain, .. }
+                    | seer_core::bulk::BulkOperation::Propagation { domain, .. }
+                    | seer_core::bulk::BulkOperation::Lookup { domain }
+                    | seer_core::bulk::BulkOperation::Status { domain }
+                    | seer_core::bulk::BulkOperation::Avail { domain } => domain,
                 };
                 println!(
                     "  {} - {}",

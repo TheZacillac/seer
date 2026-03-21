@@ -8,6 +8,7 @@ use tokio::sync::Semaphore;
 use tokio::time::sleep;
 use tracing::{debug, warn};
 
+use crate::availability::{AvailabilityChecker, AvailabilityResult};
 use crate::dns::{DnsRecord, DnsResolver, PropagationChecker, PropagationResult, RecordType};
 use crate::error::Result;
 use crate::lookup::{LookupResult, SmartLookup};
@@ -41,6 +42,9 @@ pub enum BulkOperation {
     Status {
         domain: String,
     },
+    Avail {
+        domain: String,
+    },
 }
 
 /// The data returned from a bulk operation (varies by operation type).
@@ -53,6 +57,7 @@ pub enum BulkResultData {
     Propagation(PropagationResult),
     Lookup(LookupResult),
     Status(StatusResponse),
+    Avail(AvailabilityResult),
 }
 
 /// Result of a single operation within a bulk execution.
@@ -76,6 +81,7 @@ pub struct BulkExecutor {
     propagation_checker: PropagationChecker,
     smart_lookup: SmartLookup,
     status_client: StatusClient,
+    availability_checker: AvailabilityChecker,
 }
 
 impl Default for BulkExecutor {
@@ -95,6 +101,7 @@ impl BulkExecutor {
             propagation_checker: PropagationChecker::new(),
             smart_lookup: SmartLookup::new(),
             status_client: StatusClient::new(),
+            availability_checker: AvailabilityChecker::new(),
         }
     }
 
@@ -135,6 +142,7 @@ impl BulkExecutor {
                 let propagation_checker = &self.propagation_checker;
                 let smart_lookup = &self.smart_lookup;
                 let status_client = &self.status_client;
+                let availability_checker = &self.availability_checker;
 
                 async move {
                     let _permit = match semaphore.acquire().await {
@@ -158,12 +166,15 @@ impl BulkExecutor {
                     let start = std::time::Instant::now();
                     let result = execute_operation(
                         &op,
-                        whois_client,
-                        rdap_client,
-                        dns_resolver,
-                        propagation_checker,
-                        smart_lookup,
-                        status_client,
+                        &Clients {
+                            whois: whois_client,
+                            rdap: rdap_client,
+                            dns: dns_resolver,
+                            propagation: propagation_checker,
+                            lookup: smart_lookup,
+                            status: status_client,
+                            avail: availability_checker,
+                        },
                     )
                     .await;
                     let duration_ms = start.elapsed().as_millis() as u64;
@@ -177,7 +188,8 @@ impl BulkExecutor {
                             | BulkOperation::Dns { domain, .. }
                             | BulkOperation::Propagation { domain, .. }
                             | BulkOperation::Lookup { domain }
-                            | BulkOperation::Status { domain } => domain.as_str(),
+                            | BulkOperation::Status { domain }
+                            | BulkOperation::Avail { domain } => domain.as_str(),
                         };
                         progress(count, total, desc);
                     }
@@ -271,47 +283,61 @@ impl BulkExecutor {
             .collect();
         self.execute(operations, None).await
     }
+
+    pub async fn execute_avail(&self, domains: Vec<String>) -> Vec<BulkResult> {
+        let operations = domains
+            .into_iter()
+            .map(|domain| BulkOperation::Avail { domain })
+            .collect();
+        self.execute(operations, None).await
+    }
 }
 
-async fn execute_operation(
-    op: &BulkOperation,
-    whois_client: &WhoisClient,
-    rdap_client: &RdapClient,
-    dns_resolver: &DnsResolver,
-    propagation_checker: &PropagationChecker,
-    smart_lookup: &SmartLookup,
-    status_client: &StatusClient,
-) -> Result<BulkResultData> {
+struct Clients<'a> {
+    whois: &'a WhoisClient,
+    rdap: &'a RdapClient,
+    dns: &'a DnsResolver,
+    propagation: &'a PropagationChecker,
+    lookup: &'a SmartLookup,
+    status: &'a StatusClient,
+    avail: &'a AvailabilityChecker,
+}
+
+async fn execute_operation(op: &BulkOperation, clients: &Clients<'_>) -> Result<BulkResultData> {
     match op {
         BulkOperation::Whois { domain } => {
-            let result = whois_client.lookup(domain).await?;
+            let result = clients.whois.lookup(domain).await?;
             Ok(BulkResultData::Whois(result))
         }
         BulkOperation::Rdap { domain } => {
-            let result = rdap_client.lookup_domain(domain).await?;
+            let result = clients.rdap.lookup_domain(domain).await?;
             Ok(BulkResultData::Rdap(Box::new(result)))
         }
         BulkOperation::Dns {
             domain,
             record_type,
         } => {
-            let result = dns_resolver.resolve(domain, *record_type, None).await?;
+            let result = clients.dns.resolve(domain, *record_type, None).await?;
             Ok(BulkResultData::Dns(result))
         }
         BulkOperation::Propagation {
             domain,
             record_type,
         } => {
-            let result = propagation_checker.check(domain, *record_type).await?;
+            let result = clients.propagation.check(domain, *record_type).await?;
             Ok(BulkResultData::Propagation(result))
         }
         BulkOperation::Lookup { domain } => {
-            let result = smart_lookup.lookup(domain).await?;
+            let result = clients.lookup.lookup(domain).await?;
             Ok(BulkResultData::Lookup(result))
         }
         BulkOperation::Status { domain } => {
-            let result = status_client.check(domain).await?;
+            let result = clients.status.check(domain).await?;
             Ok(BulkResultData::Status(result))
+        }
+        BulkOperation::Avail { domain } => {
+            let result = clients.avail.check(domain).await?;
+            Ok(BulkResultData::Avail(result))
         }
     }
 }

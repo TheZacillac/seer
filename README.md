@@ -275,6 +275,7 @@ seer bulk lookup domains.txt
 seer bulk whois domains.txt
 seer bulk dig domains.txt A
 seer bulk status domains.txt
+seer bulk avail domains.txt
 seer bulk status domains.txt -o results.csv  # Export to CSV
 
 # SSL certificate inspection

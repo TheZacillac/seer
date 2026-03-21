@@ -29,6 +29,9 @@ pub fn bulk_results_to_csv(results: &[BulkResult], operation: &str) -> String {
                 "domain,success,propagation_pct,servers_total,servers_responded,duration_ms,error\n",
             );
         }
+        "avail" => {
+            csv.push_str("domain,success,available,confidence,method,details,duration_ms,error\n");
+        }
         _ => {
             csv.push_str("domain,success,duration_ms,error\n");
         }
@@ -270,6 +273,30 @@ pub fn bulk_results_to_csv(results: &[BulkResult], operation: &str) -> String {
                     domain, success, pct, total, responded, duration_ms, error
                 ));
             }
+            "avail" => {
+                let (available, confidence, method, details) =
+                    if let Some(BulkResultData::Avail(ref a)) = result.data {
+                        (
+                            a.available.to_string(),
+                            a.confidence.clone(),
+                            a.method.clone(),
+                            a.details.clone().unwrap_or_default(),
+                        )
+                    } else {
+                        Default::default()
+                    };
+                csv.push_str(&format!(
+                    "{},{},{},{},{},{},{},{}\n",
+                    domain,
+                    success,
+                    available,
+                    confidence,
+                    method,
+                    escape_csv_field(&details),
+                    duration_ms,
+                    error
+                ));
+            }
             _ => {
                 csv.push_str(&format!(
                     "{},{},{},{}\n",
@@ -309,6 +336,7 @@ pub fn get_domain_from_operation(op: &BulkOperation) -> String {
         BulkOperation::Propagation { domain, .. } => domain.clone(),
         BulkOperation::Lookup { domain } => domain.clone(),
         BulkOperation::Status { domain } => domain.clone(),
+        BulkOperation::Avail { domain } => domain.clone(),
     }
 }
 

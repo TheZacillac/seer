@@ -107,7 +107,7 @@ enum Commands {
     /// Execute bulk operations from a file, output results to CSV
     #[command(after_long_help = BULK_EXAMPLES)]
     Bulk {
-        /// Operation type: lookup, whois, rdap, dig, prop, status
+        /// Operation type: lookup, whois, rdap, dig, prop, status, avail
         #[arg(value_name = "OPERATION")]
         operation: String,
 
@@ -492,9 +492,13 @@ async fn execute_command(
                     .iter()
                     .map(|d: &String| seer_core::bulk::BulkOperation::Status { domain: d.clone() })
                     .collect(),
+                "avail" => domains
+                    .iter()
+                    .map(|d: &String| seer_core::bulk::BulkOperation::Avail { domain: d.clone() })
+                    .collect(),
                 _ => {
                     eprintln!(
-                        "{} Unknown operation: {}. Use: lookup, whois, rdap, dig/dns, prop, status",
+                        "{} Unknown operation: {}. Use: lookup, whois, rdap, dig/dns, prop, status, avail",
                         "Error:".ctp_red(),
                         operation
                     );
