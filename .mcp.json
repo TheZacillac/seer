@@ -3,8 +3,8 @@
     "seer": {
       "command": "uvx",
       "args": [
-        "--from", "/home/zac/Projects/seer/seer-api",
-        "--with", "/home/zac/Projects/seer/seer-py",
+        "--from", "./seer-api",
+        "--with", "./seer-py",
         "seer-mcp"
       ]
     }
