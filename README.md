@@ -725,6 +725,12 @@ seer/
 
 ---
 
+## AI Skill Definition
+
+The MCP skill definition for Seer has moved to the [scrolls](https://github.com/TheZacillac/scrolls) repository.
+
+---
+
 ## License
 
 MIT License
