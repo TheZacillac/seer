@@ -2,6 +2,17 @@
 resolver = "2"
 members = ["seer-core", "seer-cli", "seer-py"]
 
+[workspace.lints.clippy]
+unwrap_used = "warn"
+needless_pass_by_value = "warn"
+redundant_closure_for_method_calls = "warn"
+semicolon_if_nothing_returned = "warn"
+manual_let_else = "warn"
+
+[workspace.lints.rust]
+unsafe_code = "warn"
+unused_qualifications = "warn"
+
 [workspace.package]
 version = "0.13.3"
 edition = "2021"
