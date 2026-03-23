@@ -672,10 +672,8 @@ fn reverse_dns_name(ip: &IpAddr) -> String {
                     }
                     first = false;
                     let nibble = (segment >> shift) & 0xF;
-                    result.push(
-                        char::from_digit(nibble as u32, 16)
-                            .expect("nibble is always 0-15"),
-                    );
+                    result
+                        .push(char::from_digit(nibble as u32, 16).expect("nibble is always 0-15"));
                 }
             }
             result.push_str(".ip6.arpa");
