@@ -3,6 +3,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use hickory_resolver::config::{NameServerConfig, Protocol, ResolverConfig, ResolverOpts};
+use hickory_resolver::error::ResolveErrorKind;
 use hickory_resolver::proto::rr::rdata::CAA;
 use hickory_resolver::proto::rr::RecordType as HickoryRecordType;
 use hickory_resolver::TokioAsyncResolver;
@@ -11,6 +12,25 @@ use tracing::{debug, instrument};
 use super::records::{DnsRecord, RecordData, RecordType};
 use crate::error::{Result, SeerError};
 use crate::validation::normalize_domain;
+
+/// Convert a DNS lookup result, treating "no records found" as an empty vec
+/// rather than an error. This is correct DNS behavior — the absence of a
+/// record type for a domain is a valid response (NODATA), not a failure.
+fn dns_lookup_or_empty<T>(
+    result: std::result::Result<T, hickory_resolver::error::ResolveError>,
+    record_type: &str,
+) -> Result<Option<T>> {
+    match result {
+        Ok(response) => Ok(Some(response)),
+        Err(e) => match e.kind() {
+            ResolveErrorKind::NoRecordsFound { .. } => Ok(None),
+            _ => Err(SeerError::DnsError(format!(
+                "{} lookup failed: {}",
+                record_type, e
+            ))),
+        },
+    }
+}
 
 /// Default timeout for DNS queries (5 seconds).
 /// DNS is typically fast; longer timeouts indicate network issues or unreachable servers.
@@ -175,10 +195,12 @@ impl DnsResolver {
         };
         let query_name = format!("_{}._{}.{}", service, protocol, domain);
 
-        let response = resolver
-            .srv_lookup(&query_name)
-            .await
-            .map_err(|e| SeerError::DnsError(format!("SRV lookup failed: {}", e)))?;
+        let Some(response) = dns_lookup_or_empty(
+            resolver.srv_lookup(&query_name).await,
+            "SRV",
+        )? else {
+            return Ok(vec![]);
+        };
 
         let records = response
             .iter()
@@ -208,10 +230,9 @@ impl DnsResolver {
         resolver: &TokioAsyncResolver,
         domain: &str,
     ) -> Result<Vec<DnsRecord>> {
-        let response = resolver
-            .ipv4_lookup(domain)
-            .await
-            .map_err(|e| SeerError::DnsError(format!("A lookup failed: {}", e)))?;
+        let Some(response) = dns_lookup_or_empty(resolver.ipv4_lookup(domain).await, "A")? else {
+            return Ok(vec![]);
+        };
 
         let ttl = response
             .as_lookup()
@@ -240,10 +261,10 @@ impl DnsResolver {
         resolver: &TokioAsyncResolver,
         domain: &str,
     ) -> Result<Vec<DnsRecord>> {
-        let response = resolver
-            .ipv6_lookup(domain)
-            .await
-            .map_err(|e| SeerError::DnsError(format!("AAAA lookup failed: {}", e)))?;
+        let Some(response) = dns_lookup_or_empty(resolver.ipv6_lookup(domain).await, "AAAA")?
+        else {
+            return Ok(vec![]);
+        };
 
         let ttl = response
             .as_lookup()
@@ -272,10 +293,12 @@ impl DnsResolver {
         resolver: &TokioAsyncResolver,
         domain: &str,
     ) -> Result<Vec<DnsRecord>> {
-        let response = resolver
-            .lookup(domain, HickoryRecordType::CNAME)
-            .await
-            .map_err(|e| SeerError::DnsError(format!("CNAME lookup failed: {}", e)))?;
+        let Some(response) = dns_lookup_or_empty(
+            resolver.lookup(domain, HickoryRecordType::CNAME).await,
+            "CNAME",
+        )? else {
+            return Ok(vec![]);
+        };
 
         let records = response
             .record_iter()
@@ -304,10 +327,9 @@ impl DnsResolver {
         resolver: &TokioAsyncResolver,
         domain: &str,
     ) -> Result<Vec<DnsRecord>> {
-        let response = resolver
-            .mx_lookup(domain)
-            .await
-            .map_err(|e| SeerError::DnsError(format!("MX lookup failed: {}", e)))?;
+        let Some(response) = dns_lookup_or_empty(resolver.mx_lookup(domain).await, "MX")? else {
+            return Ok(vec![]);
+        };
 
         let ttl = response
             .as_lookup()
@@ -345,10 +367,9 @@ impl DnsResolver {
         resolver: &TokioAsyncResolver,
         domain: &str,
     ) -> Result<Vec<DnsRecord>> {
-        let response = resolver
-            .ns_lookup(domain)
-            .await
-            .map_err(|e| SeerError::DnsError(format!("NS lookup failed: {}", e)))?;
+        let Some(response) = dns_lookup_or_empty(resolver.ns_lookup(domain).await, "NS")? else {
+            return Ok(vec![]);
+        };
 
         let ttl = response
             .as_lookup()
@@ -377,10 +398,9 @@ impl DnsResolver {
         resolver: &TokioAsyncResolver,
         domain: &str,
     ) -> Result<Vec<DnsRecord>> {
-        let response = resolver
-            .txt_lookup(domain)
-            .await
-            .map_err(|e| SeerError::DnsError(format!("TXT lookup failed: {}", e)))?;
+        let Some(response) = dns_lookup_or_empty(resolver.txt_lookup(domain).await, "TXT")? else {
+            return Ok(vec![]);
+        };
 
         let ttl = response
             .as_lookup()
@@ -415,10 +435,9 @@ impl DnsResolver {
         resolver: &TokioAsyncResolver,
         domain: &str,
     ) -> Result<Vec<DnsRecord>> {
-        let response = resolver
-            .soa_lookup(domain)
-            .await
-            .map_err(|e| SeerError::DnsError(format!("SOA lookup failed: {}", e)))?;
+        let Some(response) = dns_lookup_or_empty(resolver.soa_lookup(domain).await, "SOA")? else {
+            return Ok(vec![]);
+        };
 
         let ttl = response
             .as_lookup()
@@ -460,10 +479,12 @@ impl DnsResolver {
             query.to_string()
         };
 
-        let response = resolver
-            .lookup(&query, HickoryRecordType::PTR)
-            .await
-            .map_err(|e| SeerError::DnsError(format!("PTR lookup failed: {}", e)))?;
+        let Some(response) = dns_lookup_or_empty(
+            resolver.lookup(&query, HickoryRecordType::PTR).await,
+            "PTR",
+        )? else {
+            return Ok(vec![]);
+        };
 
         let records = response
             .record_iter()
@@ -492,10 +513,12 @@ impl DnsResolver {
         resolver: &TokioAsyncResolver,
         domain: &str,
     ) -> Result<Vec<DnsRecord>> {
-        let response = resolver
-            .lookup(domain, HickoryRecordType::CAA)
-            .await
-            .map_err(|e| SeerError::DnsError(format!("CAA lookup failed: {}", e)))?;
+        let Some(response) = dns_lookup_or_empty(
+            resolver.lookup(domain, HickoryRecordType::CAA).await,
+            "CAA",
+        )? else {
+            return Ok(vec![]);
+        };
 
         let records = response
             .record_iter()
@@ -525,10 +548,12 @@ impl DnsResolver {
     ) -> Result<Vec<DnsRecord>> {
         use hickory_resolver::proto::rr::RData as HickoryRData;
 
-        let response = resolver
-            .lookup(domain, HickoryRecordType::DNSKEY)
-            .await
-            .map_err(|e| SeerError::DnsError(format!("DNSKEY lookup failed: {}", e)))?;
+        let Some(response) = dns_lookup_or_empty(
+            resolver.lookup(domain, HickoryRecordType::DNSKEY).await,
+            "DNSKEY",
+        )? else {
+            return Ok(vec![]);
+        };
 
         let records = response
             .record_iter()
@@ -564,10 +589,12 @@ impl DnsResolver {
     ) -> Result<Vec<DnsRecord>> {
         use hickory_resolver::proto::rr::RData as HickoryRData;
 
-        let response = resolver
-            .lookup(domain, HickoryRecordType::DS)
-            .await
-            .map_err(|e| SeerError::DnsError(format!("DS lookup failed: {}", e)))?;
+        let Some(response) = dns_lookup_or_empty(
+            resolver.lookup(domain, HickoryRecordType::DS).await,
+            "DS",
+        )? else {
+            return Ok(vec![]);
+        };
 
         let records = response
             .record_iter()
