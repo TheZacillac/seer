@@ -79,9 +79,19 @@ pub fn normalize_domain(domain: &str) -> Result<String> {
         return Err(SeerError::InvalidDomain(domain.to_string()));
     }
 
-    // Check for hyphens at start/end of labels
+    // RFC 1035: total domain name length ≤ 253 characters
+    if domain.len() > 253 {
+        return Err(SeerError::InvalidDomain(domain.to_string()));
+    }
+
+    // Check label constraints
     for label in domain.split('.') {
+        // Labels must be non-empty and not start/end with hyphens
         if label.is_empty() || label.starts_with('-') || label.ends_with('-') {
+            return Err(SeerError::InvalidDomain(domain.to_string()));
+        }
+        // RFC 1035: each label ≤ 63 characters
+        if label.len() > 63 {
             return Err(SeerError::InvalidDomain(domain.to_string()));
         }
     }

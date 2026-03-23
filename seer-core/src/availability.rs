@@ -126,12 +126,22 @@ impl AvailabilityChecker {
                                 ),
                             })
                         } else {
+                            // Both queries failed with non-"not found" errors.
+                            // We genuinely don't know — could be registered, could be
+                            // blocked by the registrar, or servers could be down.
+                            // Default to available=false to avoid misleading the user
+                            // into thinking they can register a domain that's actually taken.
+                            let rdap_detail = rdap_err.to_string();
+                            let whois_detail = whois_err.to_string();
                             Ok(AvailabilityResult {
                                 domain,
                                 available: false,
-                                confidence: "low".to_string(),
+                                confidence: "none".to_string(),
                                 method: "inconclusive".to_string(),
-                                details: Some("Could not determine availability - both RDAP and WHOIS queries failed".to_string()),
+                                details: Some(format!(
+                                    "Could not determine availability. RDAP: {}. WHOIS: {}",
+                                    rdap_detail, whois_detail
+                                )),
                             })
                         }
                     }

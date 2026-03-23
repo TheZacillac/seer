@@ -77,25 +77,43 @@ impl StatusClient {
         );
 
         // Apply HTTP info
-        if let Ok((status, status_text, title)) = http_result {
-            response.http_status = Some(status);
-            response.http_status_text = Some(status_text);
-            response.title = title;
+        match http_result {
+            Ok((status, status_text, title)) => {
+                response.http_status = Some(status);
+                response.http_status_text = Some(status_text);
+                response.title = title;
+            }
+            Err(e) => response.errors.push(super::types::StatusError {
+                check: "http".to_string(),
+                message: e.to_string(),
+            }),
         }
 
         // Apply certificate info
-        if let Ok(cert_info) = cert_result {
-            response.certificate = Some(cert_info);
+        match cert_result {
+            Ok(cert_info) => response.certificate = Some(cert_info),
+            Err(e) => response.errors.push(super::types::StatusError {
+                check: "ssl".to_string(),
+                message: e.to_string(),
+            }),
         }
 
         // Apply domain expiration info
-        if let Ok(expiry_info) = expiry_result {
-            response.domain_expiration = expiry_info;
+        match expiry_result {
+            Ok(expiry_info) => response.domain_expiration = expiry_info,
+            Err(e) => response.errors.push(super::types::StatusError {
+                check: "expiration".to_string(),
+                message: e.to_string(),
+            }),
         }
 
         // Apply DNS resolution info
-        if let Ok(dns_info) = dns_result {
-            response.dns_resolution = Some(dns_info);
+        match dns_result {
+            Ok(dns_info) => response.dns_resolution = Some(dns_info),
+            Err(e) => response.errors.push(super::types::StatusError {
+                check: "dns".to_string(),
+                message: e.to_string(),
+            }),
         }
 
         Ok(response)

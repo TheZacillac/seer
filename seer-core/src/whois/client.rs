@@ -123,14 +123,6 @@ impl WhoisClient {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<WhoisResponse>> + Send + 'a>>
     {
         Box::pin(async move {
-            // Check for excessive referral depth
-            if depth >= MAX_REFERRAL_DEPTH {
-                warn!(depth = depth, server = %whois_server, "Max referral depth exceeded");
-                return Err(SeerError::WhoisError(
-                    "maximum WHOIS referral depth exceeded".to_string(),
-                ));
-            }
-
             // Check for circular referrals
             let server_lower = whois_server.to_lowercase();
             if visited.contains(&server_lower) {
@@ -146,6 +138,12 @@ impl WhoisClient {
             // Query with retry logic
             let raw_response = self.query_server_with_retry(whois_server, domain).await?;
             let current_response = WhoisResponse::parse(domain, whois_server, &raw_response);
+
+            // Stop following referrals if we've reached max depth — return what we have
+            if depth >= MAX_REFERRAL_DEPTH {
+                warn!(depth = depth, server = %whois_server, "Max referral depth reached, returning current response");
+                return Ok(current_response);
+            }
 
             // Check for referral to another WHOIS server
             if let Some(referral) = extract_referral(&raw_response) {

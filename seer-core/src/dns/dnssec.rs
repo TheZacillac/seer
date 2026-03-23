@@ -80,18 +80,30 @@ impl DnssecChecker {
         let mut issues = Vec::new();
 
         // Query DS records (at parent zone)
-        let ds_records: Vec<crate::dns::DnsRecord> = self
+        let ds_records: Vec<crate::dns::DnsRecord> = match self
             .resolver
             .resolve(&domain, RecordType::DS, None)
             .await
-            .unwrap_or_default();
+        {
+            Ok(records) => records,
+            Err(e) => {
+                issues.push(format!("DS query failed: {}", e));
+                vec![]
+            }
+        };
 
         // Query DNSKEY records (at the domain itself)
-        let dnskey_records: Vec<crate::dns::DnsRecord> = self
+        let dnskey_records: Vec<crate::dns::DnsRecord> = match self
             .resolver
             .resolve(&domain, RecordType::DNSKEY, None)
             .await
-            .unwrap_or_default();
+        {
+            Ok(records) => records,
+            Err(e) => {
+                issues.push(format!("DNSKEY query failed: {}", e));
+                vec![]
+            }
+        };
 
         let has_ds = !ds_records.is_empty();
         let has_dnskey = !dnskey_records.is_empty();

@@ -18,6 +18,18 @@ pub struct StatusResponse {
     pub domain_expiration: Option<DomainExpiration>,
     /// DNS root record resolution information
     pub dns_resolution: Option<DnsResolution>,
+    /// Errors from sub-checks that failed (check name → error message)
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub errors: Vec<StatusError>,
+}
+
+/// An error from a specific sub-check within a status operation
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatusError {
+    /// Which check failed (e.g., "http", "ssl", "expiration", "dns")
+    pub check: String,
+    /// Error message
+    pub message: String,
 }
 
 /// SSL certificate information
@@ -74,6 +86,7 @@ impl StatusResponse {
             certificate: None,
             domain_expiration: None,
             dns_resolution: None,
+            errors: Vec::new(),
         }
     }
 }
@@ -108,6 +121,7 @@ mod tests {
                 nameservers: vec!["ns1.example.com".to_string()],
                 resolves: true,
             }),
+            errors: vec![],
         };
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("\"http_status\":200"));
