@@ -1,6 +1,6 @@
 """DNS Propagation API endpoints."""
 
-from typing import List
+import asyncio
 
 from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field
@@ -19,7 +19,7 @@ MAX_CONCURRENCY = 50
 class BulkPropagationRequest(BaseModel):
     """Request model for bulk propagation check."""
 
-    domains: List[str] = Field(..., max_length=MAX_BULK_DOMAINS)
+    domains: list[str] = Field(..., max_length=MAX_BULK_DOMAINS)
     record_type: str = "A"
     concurrency: int = Field(default=5, ge=1, le=MAX_CONCURRENCY)
 
@@ -38,7 +38,10 @@ async def propagation_check(request: Request, domain: str, record_type: str = "A
         Propagation result with percentage and per-server results
     """
     try:
-        result = seer.propagation(domain, record_type)
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(
+            None, seer.propagation, domain, record_type
+        )
         return result
     except Exception as e:
         raise http_error(e, "Propagation check failed")
@@ -57,8 +60,9 @@ async def bulk_propagation_check(request: Request, body: BulkPropagationRequest)
         List of propagation results for each domain
     """
     try:
-        results = seer.bulk_propagation(
-            body.domains, body.record_type, body.concurrency
+        loop = asyncio.get_running_loop()
+        results = await loop.run_in_executor(
+            None, seer.bulk_propagation, body.domains, body.record_type, body.concurrency
         )
         return results
     except Exception as e:

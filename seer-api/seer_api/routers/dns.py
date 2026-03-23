@@ -1,6 +1,7 @@
 """DNS API endpoints."""
 
-from typing import List, Optional
+import asyncio
+from typing import Optional
 
 from fastapi import APIRouter, Query, Request
 from pydantic import BaseModel, Field
@@ -19,7 +20,7 @@ MAX_CONCURRENCY = 50
 class BulkDnsRequest(BaseModel):
     """Request model for bulk DNS lookup."""
 
-    domains: List[str] = Field(..., max_length=MAX_BULK_DOMAINS)
+    domains: list[str] = Field(..., max_length=MAX_BULK_DOMAINS)
     record_type: str = "A"
     concurrency: int = Field(default=10, ge=1, le=MAX_CONCURRENCY)
 
@@ -44,7 +45,10 @@ async def dns_lookup(
         List of DNS records
     """
     try:
-        result = seer.dig(domain, record_type, nameserver)
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(
+            None, seer.dig, domain, record_type, nameserver
+        )
         return result
     except Exception as e:
         raise http_error(e, "DNS lookup failed")
@@ -63,7 +67,10 @@ async def bulk_dns_lookup(request: Request, body: BulkDnsRequest):
         List of DNS results for each domain
     """
     try:
-        results = seer.bulk_dig(body.domains, body.record_type, body.concurrency)
+        loop = asyncio.get_running_loop()
+        results = await loop.run_in_executor(
+            None, seer.bulk_dig, body.domains, body.record_type, body.concurrency
+        )
         return results
     except Exception as e:
         raise http_error(e, "Bulk DNS lookup failed")

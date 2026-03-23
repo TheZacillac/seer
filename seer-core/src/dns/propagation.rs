@@ -3,11 +3,11 @@ use std::time::{Duration, Instant};
 
 use futures::future::join_all;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, instrument};
+use tracing::{debug, instrument, warn};
 
 use super::records::{DnsRecord, RecordType};
 use super::resolver::DnsResolver;
-use crate::error::Result;
+use crate::error::{Result, SeerError};
 
 /// A DNS server used for propagation checking.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -160,6 +160,11 @@ impl PropagationChecker {
         self
     }
 
+    /// Outer deadline for the entire propagation check across all servers.
+    /// Individual server queries have their own per-query timeout via the resolver;
+    /// this guards against the aggregate wall-clock time exceeding a safe limit.
+    const PROPAGATION_TIMEOUT: Duration = Duration::from_secs(15);
+
     #[instrument(skip(self), fields(domain = %domain, record_type = %record_type))]
     pub async fn check(&self, domain: &str, record_type: RecordType) -> Result<PropagationResult> {
         debug!(servers = self.servers.len(), "Starting propagation check");
@@ -170,7 +175,20 @@ impl PropagationChecker {
             .map(|server| self.query_server(domain, record_type, server.clone()))
             .collect();
 
-        let results = join_all(futures).await;
+        let results = tokio::time::timeout(Self::PROPAGATION_TIMEOUT, join_all(futures))
+            .await
+            .map_err(|_| {
+                warn!(
+                    domain = %domain,
+                    timeout_secs = Self::PROPAGATION_TIMEOUT.as_secs(),
+                    "Propagation check timed out"
+                );
+                SeerError::Timeout(format!(
+                    "propagation check for {} timed out after {}s",
+                    domain,
+                    Self::PROPAGATION_TIMEOUT.as_secs()
+                ))
+            })?;
 
         let servers_checked = results.len();
         let servers_responding = results.iter().filter(|r| r.success).count();

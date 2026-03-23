@@ -131,11 +131,15 @@ def run():
     """Run the API server."""
     import uvicorn
 
+    host = os.environ.get("SEER_HOST", "0.0.0.0")
+    port = int(os.environ.get("SEER_PORT", "8000"))
+    reload = os.environ.get("SEER_RELOAD", "false").lower() in ("true", "1", "yes")
+
     uvicorn.run(
         "seer_api.main:app",
-        host="0.0.0.0",
-        port=8000,
-        reload=True,
+        host=host,
+        port=port,
+        reload=reload,
     )
 
 

@@ -44,8 +44,10 @@ pub fn normalize_domain(domain: &str) -> Result<String> {
         .or_else(|| domain.strip_prefix("https://"))
         .unwrap_or(&domain);
 
-    // Remove trailing slash and path
+    // Remove trailing slash, path, query parameters, and fragments
     let domain = domain.split('/').next().unwrap_or(domain);
+    let domain = domain.split('?').next().unwrap_or(domain);
+    let domain = domain.split('#').next().unwrap_or(domain);
 
     // Remove www. prefix
     let domain = domain.strip_prefix("www.").unwrap_or(domain);
@@ -269,6 +271,20 @@ mod tests {
         );
         assert_eq!(
             normalize_domain("  WWW.EXAMPLE.COM  ").unwrap(),
+            "example.com"
+        );
+
+        // Query parameters and fragments
+        assert_eq!(
+            normalize_domain("example.com?query=1").unwrap(),
+            "example.com"
+        );
+        assert_eq!(
+            normalize_domain("example.com#section").unwrap(),
+            "example.com"
+        );
+        assert_eq!(
+            normalize_domain("https://example.com/path?q=1#frag").unwrap(),
             "example.com"
         );
 

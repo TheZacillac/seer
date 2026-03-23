@@ -57,7 +57,7 @@ fn lookup(py: Python<'_>, domain: String) -> PyResult<PyObject> {
     let rt = get_runtime();
     let smart_lookup = get_smart_lookup();
 
-    let result = rt.block_on(async { smart_lookup.lookup(&domain).await });
+    let result = py.allow_threads(|| rt.block_on(async { smart_lookup.lookup(&domain).await }));
 
     match result {
         Ok(response) => {
@@ -74,7 +74,7 @@ fn whois(py: Python<'_>, domain: String) -> PyResult<PyObject> {
     let rt = get_runtime();
     let client = get_whois_client();
 
-    let result = rt.block_on(async { client.lookup(&domain).await });
+    let result = py.allow_threads(|| rt.block_on(async { client.lookup(&domain).await }));
 
     match result {
         Ok(response) => {
@@ -91,7 +91,7 @@ fn rdap_domain(py: Python<'_>, domain: String) -> PyResult<PyObject> {
     let rt = get_runtime();
     let client = get_rdap_client();
 
-    let result = rt.block_on(async { client.lookup_domain(&domain).await });
+    let result = py.allow_threads(|| rt.block_on(async { client.lookup_domain(&domain).await }));
 
     match result {
         Ok(response) => {
@@ -108,7 +108,7 @@ fn rdap_ip(py: Python<'_>, ip: String) -> PyResult<PyObject> {
     let rt = get_runtime();
     let client = get_rdap_client();
 
-    let result = rt.block_on(async { client.lookup_ip(&ip).await });
+    let result = py.allow_threads(|| rt.block_on(async { client.lookup_ip(&ip).await }));
 
     match result {
         Ok(response) => {
@@ -125,7 +125,7 @@ fn rdap_asn(py: Python<'_>, asn: u32) -> PyResult<PyObject> {
     let rt = get_runtime();
     let client = get_rdap_client();
 
-    let result = rt.block_on(async { client.lookup_asn(asn).await });
+    let result = py.allow_threads(|| rt.block_on(async { client.lookup_asn(asn).await }));
 
     match result {
         Ok(response) => {
@@ -152,10 +152,12 @@ fn dig(
         .parse()
         .map_err(|e: seer_core::SeerError| PyValueError::new_err(e.to_string()))?;
 
-    let result = rt.block_on(async {
-        resolver
-            .resolve(&domain, rt_parsed, nameserver.as_deref())
-            .await
+    let result = py.allow_threads(|| {
+        rt.block_on(async {
+            resolver
+                .resolve(&domain, rt_parsed, nameserver.as_deref())
+                .await
+        })
     });
 
     match result {
@@ -178,7 +180,8 @@ fn propagation(py: Python<'_>, domain: String, record_type: &str) -> PyResult<Py
         .parse()
         .map_err(|e: seer_core::SeerError| PyValueError::new_err(e.to_string()))?;
 
-    let result = rt.block_on(async { checker.check(&domain, rt_parsed).await });
+    let result =
+        py.allow_threads(|| rt.block_on(async { checker.check(&domain, rt_parsed).await }));
 
     match result {
         Ok(result) => {
@@ -201,7 +204,8 @@ fn bulk_lookup(py: Python<'_>, domains: Vec<String>, concurrency: usize) -> PyRe
         .map(|domain| BulkOperation::Lookup { domain })
         .collect();
 
-    let result = rt.block_on(async { executor.execute(operations, None).await });
+    let result =
+        py.allow_threads(|| rt.block_on(async { executor.execute(operations, None).await }));
 
     let json = serde_json::to_value(&result).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     json_to_python(py, &json)
@@ -218,7 +222,8 @@ fn bulk_whois(py: Python<'_>, domains: Vec<String>, concurrency: usize) -> PyRes
         .map(|domain| BulkOperation::Whois { domain })
         .collect();
 
-    let result = rt.block_on(async { executor.execute(operations, None).await });
+    let result =
+        py.allow_threads(|| rt.block_on(async { executor.execute(operations, None).await }));
 
     let json = serde_json::to_value(&result).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     json_to_python(py, &json)
@@ -247,7 +252,8 @@ fn bulk_dig(
         })
         .collect();
 
-    let result = rt.block_on(async { executor.execute(operations, None).await });
+    let result =
+        py.allow_threads(|| rt.block_on(async { executor.execute(operations, None).await }));
 
     let json = serde_json::to_value(&result).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     json_to_python(py, &json)
@@ -276,7 +282,8 @@ fn bulk_propagation(
         })
         .collect();
 
-    let result = rt.block_on(async { executor.execute(operations, None).await });
+    let result =
+        py.allow_threads(|| rt.block_on(async { executor.execute(operations, None).await }));
 
     let json = serde_json::to_value(&result).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     json_to_python(py, &json)
@@ -287,7 +294,7 @@ fn status(py: Python<'_>, domain: String) -> PyResult<PyObject> {
     let rt = get_runtime();
     let client = get_status_client();
 
-    let result = rt.block_on(async { client.check(&domain).await });
+    let result = py.allow_threads(|| rt.block_on(async { client.check(&domain).await }));
 
     match result {
         Ok(response) => {
@@ -310,7 +317,8 @@ fn bulk_status(py: Python<'_>, domains: Vec<String>, concurrency: usize) -> PyRe
         .map(|domain| BulkOperation::Status { domain })
         .collect();
 
-    let result = rt.block_on(async { executor.execute(operations, None).await });
+    let result =
+        py.allow_threads(|| rt.block_on(async { executor.execute(operations, None).await }));
 
     let json = serde_json::to_value(&result).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     json_to_python(py, &json)

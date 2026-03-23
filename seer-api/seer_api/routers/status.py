@@ -1,6 +1,6 @@
 """Domain status API endpoints."""
 
-from typing import List
+import asyncio
 
 from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field
@@ -19,7 +19,7 @@ MAX_CONCURRENCY = 50
 class BulkStatusRequest(BaseModel):
     """Request model for bulk status check."""
 
-    domains: List[str] = Field(..., max_length=MAX_BULK_DOMAINS)
+    domains: list[str] = Field(..., max_length=MAX_BULK_DOMAINS)
     concurrency: int = Field(default=10, ge=1, le=MAX_CONCURRENCY)
 
 
@@ -42,7 +42,8 @@ async def check_status(request: Request, domain: str):
         - Domain registration expiration (days until expiry, registrar)
     """
     try:
-        result = seer.status(domain)
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(None, seer.status, domain)
         return result
     except Exception as e:
         raise http_error(e, "Status check failed")
@@ -61,7 +62,10 @@ async def bulk_status(request: Request, body: BulkStatusRequest):
         List of status results for each domain
     """
     try:
-        results = seer.bulk_status(body.domains, body.concurrency)
+        loop = asyncio.get_running_loop()
+        results = await loop.run_in_executor(
+            None, seer.bulk_status, body.domains, body.concurrency
+        )
         return results
     except Exception as e:
         raise http_error(e, "Bulk status check failed")

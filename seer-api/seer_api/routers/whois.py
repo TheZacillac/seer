@@ -1,6 +1,6 @@
 """WHOIS API endpoints."""
 
-from typing import List
+import asyncio
 
 from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field
@@ -19,7 +19,7 @@ MAX_CONCURRENCY = 50
 class BulkWhoisRequest(BaseModel):
     """Request model for bulk WHOIS lookup."""
 
-    domains: List[str] = Field(..., max_length=MAX_BULK_DOMAINS)
+    domains: list[str] = Field(..., max_length=MAX_BULK_DOMAINS)
     concurrency: int = Field(default=10, ge=1, le=MAX_CONCURRENCY)
 
 
@@ -36,7 +36,8 @@ async def whois_lookup(request: Request, domain: str):
         WHOIS response with registrar, dates, nameservers, and status information
     """
     try:
-        result = seer.whois(domain)
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(None, seer.whois, domain)
         return result
     except Exception as e:
         raise http_error(e, "WHOIS lookup failed")
@@ -55,7 +56,10 @@ async def bulk_whois_lookup(request: Request, body: BulkWhoisRequest):
         List of WHOIS results for each domain
     """
     try:
-        results = seer.bulk_whois(body.domains, body.concurrency)
+        loop = asyncio.get_running_loop()
+        results = await loop.run_in_executor(
+            None, seer.bulk_whois, body.domains, body.concurrency
+        )
         return results
     except Exception as e:
         raise http_error(e, "Bulk WHOIS lookup failed")

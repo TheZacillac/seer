@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use chrono::Utc;
@@ -25,23 +26,14 @@ static TITLE_REGEX: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?i)<title[^>]*>([^<]+)</title>").expect("Invalid regex for HTML title extraction")
 });
 
-/// Shared HTTP client for status checks. Reusing a single Client enables
-/// connection pooling and avoids per-request TLS handshake overhead.
-static STATUS_HTTP_CLIENT: Lazy<Client> = Lazy::new(|| {
-    Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .user_agent(concat!("Seer/", env!("CARGO_PKG_VERSION")))
-        .pool_max_idle_per_host(10)
-        .build()
-        .expect("Failed to build status HTTP client - invalid configuration")
-});
-
 /// Client for checking domain status (HTTP, SSL, expiration)
 #[derive(Debug, Clone)]
 pub struct StatusClient {
     timeout: Duration,
     /// Cached DNS resolver reused across status checks.
     dns_resolver: DnsResolver,
+    /// Reusable SmartLookup for domain expiration checks.
+    smart_lookup: SmartLookup,
 }
 
 impl Default for StatusClient {
@@ -56,6 +48,7 @@ impl StatusClient {
         Self {
             timeout: DEFAULT_TIMEOUT,
             dns_resolver: DnsResolver::new(),
+            smart_lookup: SmartLookup::new(),
         }
     }
 
@@ -109,19 +102,36 @@ impl StatusClient {
     }
 
     /// Fetches the HTTP status code and page title.
+    ///
+    /// Redirects are followed manually with IP validation at each hop.
+    /// Resolved IPs are pinned on the HTTP client via `resolve_to_addrs` to
+    /// prevent DNS rebinding attacks (TOCTOU between validation and connect).
     async fn fetch_http_info(&self, domain: &str) -> Result<(u16, String, Option<String>)> {
         let mut url = Url::parse(&format!("https://{}", domain))
             .map_err(|e| SeerError::HttpError(format!("invalid URL: {}", e)))?;
         let mut visited = HashSet::new();
 
         for _ in 0..=MAX_REDIRECTS {
-            validate_url_target(&url).await?;
+            let validated_addrs = validate_url_target(&url).await?;
 
             if !visited.insert(url.clone()) {
                 return Err(SeerError::HttpError("redirect loop detected".to_string()));
             }
 
-            let response = STATUS_HTTP_CLIENT
+            // Build a per-hop client that pins the validated IPs so reqwest
+            // cannot re-resolve the hostname to a different (potentially
+            // private) address (DNS rebinding protection).
+            let host = url
+                .host_str()
+                .ok_or_else(|| SeerError::HttpError("missing URL host".to_string()))?;
+            let client = Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .user_agent(concat!("Seer/", env!("CARGO_PKG_VERSION")))
+                .resolve_to_addrs(host, &validated_addrs)
+                .build()
+                .map_err(|e| SeerError::HttpError(format!("failed to build HTTP client: {}", e)))?;
+
+            let response = client
                 .get(url.clone())
                 .timeout(self.timeout)
                 .send()
@@ -224,9 +234,7 @@ impl StatusClient {
 
     /// Fetches domain expiration info using WHOIS/RDAP.
     async fn fetch_domain_expiration(&self, domain: &str) -> Result<Option<DomainExpiration>> {
-        let lookup = SmartLookup::new();
-
-        match lookup.lookup(domain).await {
+        match self.smart_lookup.lookup(domain).await {
             Ok(result) => {
                 let (expiration_date, registrar) = result.expiration_info();
 
@@ -330,7 +338,12 @@ fn extract_title(html: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-async fn validate_url_target(url: &Url) -> Result<()> {
+/// Validates that a URL target is safe (no private/reserved IPs, no credentials,
+/// supported scheme) and returns the resolved socket addresses.
+///
+/// The caller should pin these addresses on the HTTP client to prevent DNS
+/// rebinding between validation and the actual connection.
+async fn validate_url_target(url: &Url) -> Result<Vec<SocketAddr>> {
     let scheme = url.scheme();
     if scheme != "https" && scheme != "http" {
         return Err(SeerError::HttpError(format!(
@@ -357,7 +370,7 @@ async fn validate_url_target(url: &Url) -> Result<()> {
                 ip
             )));
         }
-        return Ok(());
+        return Ok(vec![SocketAddr::new(ip, port)]);
     }
 
     let addr = format!("{}:{}", host, port);
@@ -365,6 +378,13 @@ async fn validate_url_target(url: &Url) -> Result<()> {
         .await
         .map_err(|e| SeerError::HttpError(format!("DNS lookup failed: {}", e)))?
         .collect();
+
+    if socket_addrs.is_empty() {
+        return Err(SeerError::HttpError(format!(
+            "DNS lookup returned no addresses for {}",
+            host
+        )));
+    }
 
     for socket_addr in &socket_addrs {
         if is_private_or_reserved_ip(&socket_addr.ip()) {
@@ -375,7 +395,7 @@ async fn validate_url_target(url: &Url) -> Result<()> {
         }
     }
 
-    Ok(())
+    Ok(socket_addrs)
 }
 
 /// Parses certificate information from DER-encoded certificate using x509-parser.

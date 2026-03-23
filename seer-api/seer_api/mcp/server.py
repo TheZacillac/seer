@@ -323,7 +323,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
 
 async def execute_tool(name: str, arguments: dict[str, Any]) -> Any:
     """Execute the appropriate Seer function based on tool name."""
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
     match name:
         case "seer_lookup":

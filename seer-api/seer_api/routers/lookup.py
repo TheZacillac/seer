@@ -1,6 +1,6 @@
 """Smart lookup API endpoints."""
 
-from typing import List
+import asyncio
 
 from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field
@@ -19,7 +19,7 @@ MAX_CONCURRENCY = 50
 class BulkLookupRequest(BaseModel):
     """Request model for bulk lookup."""
 
-    domains: List[str] = Field(..., max_length=MAX_BULK_DOMAINS)
+    domains: list[str] = Field(..., max_length=MAX_BULK_DOMAINS)
     concurrency: int = Field(default=10, ge=1, le=MAX_CONCURRENCY)
 
 
@@ -36,7 +36,8 @@ async def smart_lookup(request: Request, domain: str):
         Lookup result with source indicator (rdap or whois) and registration data
     """
     try:
-        result = seer.lookup(domain)
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(None, seer.lookup, domain)
         return result
     except Exception as e:
         raise http_error(e, "Lookup failed")
@@ -55,7 +56,10 @@ async def bulk_smart_lookup(request: Request, body: BulkLookupRequest):
         List of lookup results for each domain
     """
     try:
-        results = seer.bulk_lookup(body.domains, body.concurrency)
+        loop = asyncio.get_running_loop()
+        results = await loop.run_in_executor(
+            None, seer.bulk_lookup, body.domains, body.concurrency
+        )
         return results
     except Exception as e:
         raise http_error(e, "Bulk lookup failed")
