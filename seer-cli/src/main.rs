@@ -961,7 +961,7 @@ async fn execute_command(
                     }
                 }
             } else {
-                let total: usize = history.entries.values().map(|v| v.len()).sum();
+                let total: usize = history.entries.values().map(Vec::len).sum();
                 if total == 0 {
                     println!("No lookup history. Run 'seer lookup <domain>' to build history.");
                 } else {

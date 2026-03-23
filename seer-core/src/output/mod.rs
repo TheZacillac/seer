@@ -63,7 +63,7 @@ impl YamlFormatter {
     }
 
     /// Formats any serializable value as YAML output.
-    pub fn to_yaml_value<T: serde::Serialize + ?Sized>(&self, value: &T) -> String {
+    pub fn to_yaml_value<T: Serialize + ?Sized>(&self, value: &T) -> String {
         // Convert to JSON value first, then format as YAML-like output
         match serde_json::to_value(value) {
             Ok(v) => format_as_yaml(&v, 0),

@@ -145,17 +145,14 @@ impl BulkExecutor {
                 let availability_checker = &self.availability_checker;
 
                 async move {
-                    let _permit = match semaphore.acquire().await {
-                        Ok(permit) => permit,
-                        Err(_) => {
-                            return BulkResult {
-                                operation: op,
-                                success: false,
-                                data: None,
-                                error: Some("Operation cancelled".to_string()),
-                                duration_ms: 0,
-                            };
-                        }
+                    let Ok(_permit) = semaphore.acquire().await else {
+                        return BulkResult {
+                            operation: op,
+                            success: false,
+                            data: None,
+                            error: Some("Operation cancelled".to_string()),
+                            duration_ms: 0,
+                        };
                     };
 
                     // Rate limiting delay

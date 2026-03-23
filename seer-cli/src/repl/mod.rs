@@ -1067,9 +1067,8 @@ impl Repl {
     async fn execute_watch(&mut self, args: &[&str]) -> CommandResult {
         match args.first().copied() {
             Some("add") => {
-                let domain = match args.get(1) {
-                    Some(d) => d,
-                    None => return CommandResult::Error("Usage: watch add <domain>".to_string()),
+                let Some(domain) = args.get(1) else {
+                    return CommandResult::Error("Usage: watch add <domain>".to_string());
                 };
                 let mut watchlist = seer_core::Watchlist::load();
                 match watchlist.add(domain) {
@@ -1089,11 +1088,8 @@ impl Repl {
                 CommandResult::Continue
             }
             Some("remove") => {
-                let domain = match args.get(1) {
-                    Some(d) => d,
-                    None => {
-                        return CommandResult::Error("Usage: watch remove <domain>".to_string())
-                    }
+                let Some(domain) = args.get(1) else {
+                    return CommandResult::Error("Usage: watch remove <domain>".to_string());
                 };
                 let mut watchlist = seer_core::Watchlist::load();
                 if watchlist.remove(domain) {
@@ -1172,7 +1168,7 @@ impl Repl {
                 }
             }
         } else {
-            let total: usize = history.entries.values().map(|v| v.len()).sum();
+            let total: usize = history.entries.values().map(Vec::len).sum();
             if total == 0 {
                 println!("No lookup history.");
             } else {

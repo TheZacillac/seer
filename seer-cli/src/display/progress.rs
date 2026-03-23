@@ -14,19 +14,19 @@ static BULK_PROGRESS_BAR: Mutex<Option<ProgressBar>> = Mutex::new(None);
 /// Set the active bulk progress bar for tracing integration.
 /// While set, all tracing output will be printed through the progress bar.
 pub fn set_bulk_progress_bar(pb: ProgressBar) {
-    let mut guard = BULK_PROGRESS_BAR.lock().unwrap();
+    let mut guard = BULK_PROGRESS_BAR.lock().expect("progress bar mutex poisoned");
     *guard = Some(pb);
 }
 
 /// Clear the active bulk progress bar.
 pub fn clear_bulk_progress_bar() {
-    let mut guard = BULK_PROGRESS_BAR.lock().unwrap();
+    let mut guard = BULK_PROGRESS_BAR.lock().expect("progress bar mutex poisoned");
     *guard = None;
 }
 
 /// Get a clone of the current bulk progress bar if one is set.
 pub fn get_bulk_progress_bar() -> Option<ProgressBar> {
-    let guard = BULK_PROGRESS_BAR.lock().unwrap();
+    let guard = BULK_PROGRESS_BAR.lock().expect("progress bar mutex poisoned");
     guard.clone()
 }
 

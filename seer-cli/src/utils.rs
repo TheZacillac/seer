@@ -235,7 +235,7 @@ pub fn bulk_results_to_csv(results: &[BulkResult], operation: &str) -> String {
                             .first()
                             .map(|r| r.record_type.to_string())
                             .unwrap_or_default();
-                        let vals: Vec<String> = recs.iter().map(|r| r.format_short()).collect();
+                        let vals: Vec<String> = recs.iter().map(seer_core::DnsRecord::format_short).collect();
                         (rt, vals.join("; "))
                     } else {
                         Default::default()

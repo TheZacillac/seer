@@ -83,9 +83,8 @@ impl SeerConfig {
 
     /// Loads config from `~/.seer/config.toml`, falling back to defaults if not found.
     pub fn load() -> Self {
-        let path = match Self::config_path() {
-            Some(p) => p,
-            None => return Self::default(),
+        let Some(path) = Self::config_path() else {
+            return Self::default();
         };
 
         if !path.exists() {

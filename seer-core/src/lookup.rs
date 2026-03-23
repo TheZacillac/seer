@@ -245,19 +245,24 @@ impl SmartLookup {
             }
 
             // RDAP not useful, WHOIS also failed — availability fallback
-            let whois_error_str = whois_result.unwrap_err().to_string();
+            let Err(whois_err) = whois_result else {
+                unreachable!("whois_result already checked as Err above");
+            };
             return self
                 .availability_fallback(
                     domain,
                     "RDAP response incomplete".to_string(),
-                    whois_error_str,
+                    whois_err.to_string(),
                     progress,
                 )
                 .await;
         }
 
         // Phase 2: RDAP failed — use WHOIS if it succeeded
-        let rdap_error_str = rdap_result.unwrap_err().to_string();
+        let Err(rdap_err) = rdap_result else {
+            unreachable!("rdap_result already checked as Err above");
+        };
+        let rdap_error_str = rdap_err.to_string();
 
         if let Ok(whois_data) = whois_result {
             debug!("RDAP failed, using WHOIS result");
@@ -271,7 +276,10 @@ impl SmartLookup {
         }
 
         // Phase 3: Both failed — try availability check as last resort
-        let whois_error_str = whois_result.unwrap_err().to_string();
+        let Err(whois_err) = whois_result else {
+            unreachable!("whois_result already checked above");
+        };
+        let whois_error_str = whois_err.to_string();
         self.availability_fallback(domain, rdap_error_str, whois_error_str, progress)
             .await
     }

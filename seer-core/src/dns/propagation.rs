@@ -398,7 +398,7 @@ fn analyze_results(
     let (consensus_values, consensus_count) = value_counts
         .into_iter()
         .max_by_key(|(_, count)| *count)
-        .unwrap();
+        .expect("value_counts is non-empty because successful is non-empty");
 
     // Calculate propagation percentage based on consensus
     let propagation_percentage = (consensus_count as f64 / successful.len() as f64) * 100.0;

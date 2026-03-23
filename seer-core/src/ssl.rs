@@ -281,7 +281,7 @@ fn oid_to_key_type(oid: &Oid) -> Option<String> {
 /// Converts an x509-parser ASN1Time to a chrono DateTime.
 fn asn1_time_to_chrono(time: ASN1Time) -> Result<DateTime<Utc>> {
     let timestamp = time.timestamp();
-    chrono::DateTime::from_timestamp(timestamp, 0)
+    DateTime::from_timestamp(timestamp, 0)
         .ok_or_else(|| SeerError::SslError("invalid certificate timestamp".to_string()))
 }
 

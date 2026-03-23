@@ -47,9 +47,8 @@ impl Watchlist {
 
     /// Loads the watchlist from disk, returning an empty list on any failure.
     pub fn load() -> Self {
-        let path = match Self::path() {
-            Some(p) => p,
-            None => return Self::default(),
+        let Some(path) = Self::path() else {
+            return Self::default();
         };
         if !path.exists() {
             return Self::default();
