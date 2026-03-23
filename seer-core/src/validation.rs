@@ -64,10 +64,12 @@ pub fn normalize_domain(domain: &str) -> Result<String> {
         domain.to_string()
     };
 
-    // Basic validation - alphanumeric, hyphens, and dots
+    // Basic validation - alphanumeric, hyphens, dots, and underscores
+    // Underscores are valid in DNS names (RFC 8552) and required for service
+    // records like _dmarc., _domainkey., _sip._tcp., etc.
     let valid = domain
         .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-');
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_');
     if !valid {
         return Err(SeerError::InvalidDomain(domain.to_string()));
     }
@@ -286,6 +288,20 @@ mod tests {
         assert_eq!(
             normalize_domain("https://example.com/path?q=1#frag").unwrap(),
             "example.com"
+        );
+
+        // Underscore domains (DNS service records)
+        assert_eq!(
+            normalize_domain("_dmarc.example.com").unwrap(),
+            "_dmarc.example.com"
+        );
+        assert_eq!(
+            normalize_domain("selector1._domainkey.example.com").unwrap(),
+            "selector1._domainkey.example.com"
+        );
+        assert_eq!(
+            normalize_domain("_sip._tcp.example.com").unwrap(),
+            "_sip._tcp.example.com"
         );
 
         // Invalid domains
