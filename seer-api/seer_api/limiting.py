@@ -20,7 +20,9 @@ def get_client_ip(request: Request) -> str:
     if trust_proxy:
         forwarded = request.headers.get("x-forwarded-for", "")
         if forwarded:
-            return forwarded.split(",")[0].strip()
+            # Use the last (rightmost) value — the one added by the proxy
+            # closest to the server — to prevent client spoofing.
+            return forwarded.split(",")[-1].strip()
     return get_remote_address(request)
 
 

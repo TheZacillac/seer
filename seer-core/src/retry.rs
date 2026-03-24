@@ -178,10 +178,13 @@ impl RetryClassifier for NetworkRetryClassifier {
                 lower.contains("timeout") || lower.contains("temporary")
             }
 
-            // HTTP errors might be transient
+            // HTTP errors might be transient (server errors 5xx or 429 Too Many Requests)
             SeerError::HttpError(msg) => {
                 let lower = msg.to_lowercase();
-                lower.contains("timeout") || lower.contains("connection") || lower.contains("5")
+                lower.contains("timeout")
+                    || lower.contains("connection")
+                    || lower.contains("status 5")
+                    || lower.contains("status 429")
             }
 
             // Not retryable - permanent failures

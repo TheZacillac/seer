@@ -57,6 +57,9 @@ impl SubdomainEnumerator {
         // Query crt.sh (Certificate Transparency log aggregator)
         let url = format!("https://crt.sh/?q=%.{}&output=json", domain);
 
+        // Maximum response size for CT log queries (10 MB).
+        const MAX_CT_RESPONSE_SIZE: usize = 10 * 1024 * 1024;
+
         let response = HTTP_CLIENT
             .get(&url)
             .send()
@@ -70,9 +73,31 @@ impl SubdomainEnumerator {
             )));
         }
 
-        let entries: Vec<CtLogEntry> = response
-            .json()
+        // Check Content-Length header before downloading
+        if let Some(content_length) = response.content_length() {
+            if content_length as usize > MAX_CT_RESPONSE_SIZE {
+                return Err(SeerError::HttpError(format!(
+                    "CT log response too large: {} bytes (limit: {} bytes)",
+                    content_length, MAX_CT_RESPONSE_SIZE
+                )));
+            }
+        }
+
+        // Read body with size limit to guard against missing/lying Content-Length
+        let bytes = response
+            .bytes()
             .await
+            .map_err(|e| SeerError::HttpError(format!("Failed to read CT log response: {}", e)))?;
+
+        if bytes.len() > MAX_CT_RESPONSE_SIZE {
+            return Err(SeerError::HttpError(format!(
+                "CT log response too large: {} bytes (limit: {} bytes)",
+                bytes.len(),
+                MAX_CT_RESPONSE_SIZE
+            )));
+        }
+
+        let entries: Vec<CtLogEntry> = serde_json::from_slice(&bytes)
             .map_err(|e| SeerError::HttpError(format!("Failed to parse CT log response: {}", e)))?;
 
         // Extract unique subdomain names

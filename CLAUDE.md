@@ -684,7 +684,7 @@ async fn network_operation() -> Result<String> {
 ```
 
 **Current timeout values:**
-- WHOIS: 10 seconds
+- WHOIS: 15 seconds
 - RDAP: 30 seconds
 - DNS: 5 seconds (with 2 retries)
 - HTTP/SSL checks: 10 seconds
@@ -1135,7 +1135,7 @@ Before committing:
 
 ### Timeout Values
 
-- **WHOIS**: 10 seconds
+- **WHOIS**: 15 seconds
 - **RDAP**: 30 seconds
 - **DNS**: 5 seconds (with 2 retries)
 - **HTTP**: 10 seconds

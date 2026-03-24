@@ -209,6 +209,13 @@ impl StatusClient {
             .map_err(|e| SeerError::CertificateError(format!("DNS lookup failed: {}", e)))?
             .collect();
 
+        if socket_addrs.is_empty() {
+            return Err(SeerError::CertificateError(format!(
+                "DNS lookup returned no addresses for {}",
+                domain
+            )));
+        }
+
         for socket_addr in &socket_addrs {
             if is_private_or_reserved_ip(&socket_addr.ip()) {
                 return Err(SeerError::CertificateError(format!(
@@ -225,11 +232,15 @@ impl StatusClient {
 
         let connector = tokio_native_tls::TlsConnector::from(connector);
 
-        let stream = tokio::time::timeout(self.timeout, TcpStream::connect(&addr))
-            .await
-            .map_err(|_| SeerError::Timeout(format!("connection to {} timed out", domain)))?
-            .map_err(|e| SeerError::CertificateError(e.to_string()))?;
+        // Connect directly to the validated socket address to prevent DNS
+        // rebinding (TOCTOU) between validation and connect.
+        let stream =
+            tokio::time::timeout(self.timeout, TcpStream::connect(socket_addrs.as_slice()))
+                .await
+                .map_err(|_| SeerError::Timeout(format!("connection to {} timed out", domain)))?
+                .map_err(|e| SeerError::CertificateError(e.to_string()))?;
 
+        // Use the domain as SNI hostname for the TLS handshake.
         let tls_stream = tokio::time::timeout(self.timeout, connector.connect(domain, stream))
             .await
             .map_err(|_| SeerError::Timeout(format!("TLS handshake with {} timed out", domain)))?

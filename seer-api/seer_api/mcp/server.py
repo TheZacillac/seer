@@ -43,7 +43,7 @@ def _require_domains(arguments: dict[str, Any]) -> list[str]:
 def _get_concurrency(arguments: dict[str, Any], default: int = 10) -> int:
     """Extract and validate an optional concurrency argument."""
     concurrency = arguments.get("concurrency", default)
-    if not isinstance(concurrency, int) or concurrency < 1:
+    if isinstance(concurrency, bool) or not isinstance(concurrency, int) or concurrency < 1:
         raise ValueError("'concurrency' must be a positive integer")
     return min(concurrency, MAX_CONCURRENCY)
 
@@ -136,7 +136,7 @@ async def list_tools() -> list[Tool]:
                     },
                     "record_type": {
                         "type": "string",
-                        "description": "DNS record type (A, AAAA, MX, TXT, NS, SOA, CNAME, CAA, PTR, SRV, ANY)",
+                        "description": "DNS record type (A, AAAA, MX, TXT, NS, SOA, CNAME, CAA, PTR, SRV, DNSKEY, DS, ANY)",
                         "default": "A",
                     },
                     "nameserver": {

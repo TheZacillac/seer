@@ -192,7 +192,7 @@ impl SmartLookup {
             return Ok(cached);
         }
 
-        let result = self.lookup_concurrent(domain, progress).await?;
+        let result = self.lookup_concurrent(&normalized, progress).await?;
 
         // Cache the result
         LOOKUP_CACHE.insert(normalized, result.clone());

@@ -195,10 +195,8 @@ impl DnsResolver {
         };
         let query_name = format!("_{}._{}.{}", service, protocol, domain);
 
-        let Some(response) = dns_lookup_or_empty(
-            resolver.srv_lookup(&query_name).await,
-            "SRV",
-        )? else {
+        let Some(response) = dns_lookup_or_empty(resolver.srv_lookup(&query_name).await, "SRV")?
+        else {
             return Ok(vec![]);
         };
 
@@ -296,7 +294,8 @@ impl DnsResolver {
         let Some(response) = dns_lookup_or_empty(
             resolver.lookup(domain, HickoryRecordType::CNAME).await,
             "CNAME",
-        )? else {
+        )?
+        else {
             return Ok(vec![]);
         };
 
@@ -479,10 +478,9 @@ impl DnsResolver {
             query.to_string()
         };
 
-        let Some(response) = dns_lookup_or_empty(
-            resolver.lookup(&query, HickoryRecordType::PTR).await,
-            "PTR",
-        )? else {
+        let Some(response) =
+            dns_lookup_or_empty(resolver.lookup(&query, HickoryRecordType::PTR).await, "PTR")?
+        else {
             return Ok(vec![]);
         };
 
@@ -513,10 +511,9 @@ impl DnsResolver {
         resolver: &TokioAsyncResolver,
         domain: &str,
     ) -> Result<Vec<DnsRecord>> {
-        let Some(response) = dns_lookup_or_empty(
-            resolver.lookup(domain, HickoryRecordType::CAA).await,
-            "CAA",
-        )? else {
+        let Some(response) =
+            dns_lookup_or_empty(resolver.lookup(domain, HickoryRecordType::CAA).await, "CAA")?
+        else {
             return Ok(vec![]);
         };
 
@@ -551,7 +548,8 @@ impl DnsResolver {
         let Some(response) = dns_lookup_or_empty(
             resolver.lookup(domain, HickoryRecordType::DNSKEY).await,
             "DNSKEY",
-        )? else {
+        )?
+        else {
             return Ok(vec![]);
         };
 
@@ -589,10 +587,9 @@ impl DnsResolver {
     ) -> Result<Vec<DnsRecord>> {
         use hickory_resolver::proto::rr::RData as HickoryRData;
 
-        let Some(response) = dns_lookup_or_empty(
-            resolver.lookup(domain, HickoryRecordType::DS).await,
-            "DS",
-        )? else {
+        let Some(response) =
+            dns_lookup_or_empty(resolver.lookup(domain, HickoryRecordType::DS).await, "DS")?
+        else {
             return Ok(vec![]);
         };
 

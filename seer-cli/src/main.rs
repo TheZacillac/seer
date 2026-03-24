@@ -327,10 +327,16 @@ async fn execute_command(
             match lookup.lookup_with_progress(&domain, Some(progress)).await {
                 Ok(result) => {
                     spinner.finish();
-                    // Record to history
-                    let mut history = seer_core::LookupHistory::load();
-                    history.record(&domain, result.clone());
-                    let _ = history.save();
+                    // Record to history (file I/O off the async executor)
+                    let domain_for_history = domain.clone();
+                    let result_for_history = result.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let mut history = seer_core::LookupHistory::load();
+                        history.record(&domain_for_history, result_for_history);
+                        let _ = history.save();
+                    })
+                    .await
+                    .ok();
 
                     if quiet {
                         handle_quiet_output(&result, &fields);
@@ -929,10 +935,17 @@ async fn execute_command(
             }
         }
         Commands::History { domain, clear } => {
-            let mut history = seer_core::LookupHistory::load();
+            let mut history = tokio::task::spawn_blocking(seer_core::LookupHistory::load)
+                .await
+                .unwrap_or_default();
             if clear {
                 history.clear();
-                history.save()?;
+                let save_result = tokio::task::spawn_blocking(move || history.save()).await;
+                match save_result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => return Err(e.into()),
+                    Err(e) => return Err(e.into()),
+                }
                 println!("Lookup history cleared");
             } else if let Some(domain) = domain {
                 let entries = history.get(&domain);
