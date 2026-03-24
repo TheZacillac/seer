@@ -19,7 +19,7 @@ MAX_CONCURRENCY = 50
 class BulkPropagationRequest(BaseModel):
     """Request model for bulk propagation check."""
 
-    domains: list[str] = Field(..., max_length=MAX_BULK_DOMAINS)
+    domains: list[str] = Field(..., min_length=1, max_length=MAX_BULK_DOMAINS)
     record_type: str = "A"
     concurrency: int = Field(default=5, ge=1, le=MAX_CONCURRENCY)
 

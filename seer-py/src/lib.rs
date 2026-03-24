@@ -232,11 +232,23 @@ fn propagation(py: Python<'_>, domain: String, record_type: &str) -> PyResult<Py
     }
 }
 
+const MAX_CONCURRENCY: usize = 50;
+
+fn validate_concurrency(concurrency: usize) -> PyResult<usize> {
+    if concurrency > MAX_CONCURRENCY {
+        return Err(PyValueError::new_err(format!(
+            "concurrency must be <= {} (got {})",
+            MAX_CONCURRENCY, concurrency
+        )));
+    }
+    Ok(concurrency.max(1))
+}
+
 #[pyfunction]
 #[pyo3(signature = (domains, concurrency = 10))]
 fn bulk_lookup(py: Python<'_>, domains: Vec<String>, concurrency: usize) -> PyResult<PyObject> {
     let rt = get_runtime();
-    let executor = BulkExecutor::new().with_concurrency(concurrency);
+    let executor = BulkExecutor::new().with_concurrency(validate_concurrency(concurrency)?);
 
     let operations: Vec<BulkOperation> = domains
         .into_iter()
@@ -254,7 +266,7 @@ fn bulk_lookup(py: Python<'_>, domains: Vec<String>, concurrency: usize) -> PyRe
 #[pyo3(signature = (domains, concurrency = 10))]
 fn bulk_whois(py: Python<'_>, domains: Vec<String>, concurrency: usize) -> PyResult<PyObject> {
     let rt = get_runtime();
-    let executor = BulkExecutor::new().with_concurrency(concurrency);
+    let executor = BulkExecutor::new().with_concurrency(validate_concurrency(concurrency)?);
 
     let operations: Vec<BulkOperation> = domains
         .into_iter()
@@ -277,7 +289,7 @@ fn bulk_dig(
     concurrency: usize,
 ) -> PyResult<PyObject> {
     let rt = get_runtime();
-    let executor = BulkExecutor::new().with_concurrency(concurrency);
+    let executor = BulkExecutor::new().with_concurrency(validate_concurrency(concurrency)?);
 
     let rt_parsed: RecordType = record_type
         .parse()
@@ -307,7 +319,7 @@ fn bulk_propagation(
     concurrency: usize,
 ) -> PyResult<PyObject> {
     let rt = get_runtime();
-    let executor = BulkExecutor::new().with_concurrency(concurrency);
+    let executor = BulkExecutor::new().with_concurrency(validate_concurrency(concurrency)?);
 
     let rt_parsed: RecordType = record_type
         .parse()
@@ -349,7 +361,7 @@ fn status(py: Python<'_>, domain: String) -> PyResult<PyObject> {
 #[pyo3(signature = (domains, concurrency = 10))]
 fn bulk_status(py: Python<'_>, domains: Vec<String>, concurrency: usize) -> PyResult<PyObject> {
     let rt = get_runtime();
-    let executor = BulkExecutor::new().with_concurrency(concurrency);
+    let executor = BulkExecutor::new().with_concurrency(validate_concurrency(concurrency)?);
 
     let operations: Vec<BulkOperation> = domains
         .into_iter()
@@ -530,6 +542,8 @@ fn json_to_python(py: Python<'_>, value: &serde_json::Value) -> PyResult<PyObjec
         serde_json::Value::Number(n) => {
             if let Some(i) = n.as_i64() {
                 Ok(i.into_pyobject(py)?.into_any().unbind())
+            } else if let Some(u) = n.as_u64() {
+                Ok(u.into_pyobject(py)?.into_any().unbind())
             } else if let Some(f) = n.as_f64() {
                 Ok(f.into_pyobject(py)?.into_any().unbind())
             } else {

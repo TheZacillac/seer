@@ -322,12 +322,33 @@ fn extract_iana_registration_url(response: &str) -> Option<String> {
     None
 }
 
+/// Checks whether a WHOIS referral server hostname is safe to connect to.
+/// Rejects IP literals in private/reserved ranges, embedded ports, and
+/// hostnames with characters that are not valid in DNS labels.
+fn is_safe_whois_server(server: &str) -> bool {
+    // Must be a plausible hostname: alphanumeric, dots, hyphens only
+    if server.is_empty() || !server.contains('.') {
+        return false;
+    }
+    if !server
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+    {
+        return false;
+    }
+    // Reject IP address literals that resolve to private/reserved ranges
+    if let Ok(ip) = server.parse::<std::net::IpAddr>() {
+        return !crate::validation::is_private_or_reserved_ip(&ip);
+    }
+    true
+}
+
 fn extract_referral(response: &str) -> Option<String> {
     for re in REFERRAL_PATTERNS.iter() {
         if let Some(caps) = re.captures(response) {
             if let Some(m) = caps.get(1) {
                 let server = m.as_str().trim().to_lowercase();
-                if !server.is_empty() && server.contains('.') {
+                if is_safe_whois_server(&server) {
                     return Some(server);
                 }
             }

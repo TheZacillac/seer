@@ -78,7 +78,7 @@ static NAMESERVER_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
         Regex::new(r"(?i)Name Server:\s*(.+)").expect("Invalid regex for Name Server"),
         Regex::new(r"(?i)Nameserver:\s*(.+)").expect("Invalid regex for Nameserver"),
         Regex::new(r"(?i)nserver:\s*(.+)").expect("Invalid regex for nserver"),
-        Regex::new(r"(?i)NS:\s*(.+)").expect("Invalid regex for NS"),
+        Regex::new(r"(?im)^NS:\s+(.+)$").expect("Invalid regex for NS"),
     ]
 });
 

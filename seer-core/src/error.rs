@@ -9,7 +9,7 @@ pub enum SeerError {
     WhoisServerNotFound(String),
 
     #[error("WHOIS connection failed: {0}")]
-    WhoisConnectionFailed(#[from] std::io::Error),
+    WhoisConnectionFailed(String),
 
     #[error("RDAP lookup failed: {0}")]
     RdapError(String),

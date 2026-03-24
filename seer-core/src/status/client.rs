@@ -182,10 +182,14 @@ impl StatusClient {
                     .unwrap_or("");
 
                 if content_type.contains("text/html") {
-                    let body = response
-                        .text()
+                    // Read at most 64 KB for title extraction to prevent OOM
+                    // on arbitrarily large responses
+                    const MAX_TITLE_BODY: usize = 64 * 1024;
+                    let bytes = response
+                        .bytes()
                         .await
                         .map_err(|e| SeerError::HttpError(e.to_string()))?;
+                    let body = String::from_utf8_lossy(&bytes[..bytes.len().min(MAX_TITLE_BODY)]);
                     extract_title(&body)
                 } else {
                     None

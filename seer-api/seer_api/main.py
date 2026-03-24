@@ -5,7 +5,7 @@ import logging
 import os
 import sys
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
@@ -43,10 +43,8 @@ else:
 
 logging.basicConfig(level=getattr(logging, log_level, logging.INFO), handlers=[handler])
 
-# Rate limiter configuration
-# Configure via SEER_RATE_LIMIT env var (default: "30/minute")
-rate_limit = os.environ.get("SEER_RATE_LIMIT", "30/minute")
-limiter.default_limits = [rate_limit]
+# Rate limiter configuration is handled in limiting.py at construction time
+# via SEER_RATE_LIMIT env var (default: "30/minute")
 
 app = FastAPI(
     title="Seer API",
@@ -122,8 +120,17 @@ async def health():
 
 @app.get("/metrics")
 @limiter.exempt
-async def get_metrics():
-    """Request metrics endpoint for observability."""
+async def get_metrics(request: Request):
+    """Request metrics endpoint for observability.
+
+    Restricted to localhost when SEER_METRICS_ENABLED is not set.
+    """
+    metrics_enabled = os.environ.get("SEER_METRICS_ENABLED", "").lower() in ("1", "true", "yes")
+    if not metrics_enabled:
+        client_host = request.client.host if request.client else ""
+        if client_host not in ("127.0.0.1", "::1", "localhost"):
+            from fastapi import HTTPException
+            raise HTTPException(status_code=403, detail="Metrics endpoint is disabled")
     return metrics.snapshot()
 
 

@@ -344,7 +344,7 @@ async def execute_tool(name: str, arguments: dict[str, Any]) -> Any:
 
         case "seer_rdap_asn":
             asn = arguments.get("asn")
-            if not isinstance(asn, int) or asn < 0 or asn > 4294967295:
+            if isinstance(asn, bool) or not isinstance(asn, int) or asn < 0 or asn > 4294967295:
                 raise ValueError(f"'asn' must be an integer between 0 and 4294967295 (got {asn!r})")
             return await loop.run_in_executor(None, seer.rdap_asn, asn)
 

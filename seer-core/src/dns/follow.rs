@@ -153,6 +153,7 @@ impl DnsFollower {
         callback: Option<FollowProgressCallback>,
         cancel_rx: Option<watch::Receiver<bool>>,
     ) -> Result<FollowResult> {
+        let domain = crate::validation::normalize_domain(domain)?;
         let started_at = Utc::now();
         let mut iterations: Vec<FollowIteration> = Vec::with_capacity(config.iterations);
         let mut previous_values: HashSet<String> = HashSet::new();
@@ -181,11 +182,14 @@ impl DnsFollower {
             let iteration_num = i + 1;
 
             // Perform DNS lookup
-            let (records, error) =
-                match self.resolver.resolve(domain, record_type, nameserver).await {
-                    Ok(records) => (records, None),
-                    Err(e) => (Vec::new(), Some(e.to_string())),
-                };
+            let (records, error) = match self
+                .resolver
+                .resolve(&domain, record_type, nameserver)
+                .await
+            {
+                Ok(records) => (records, None),
+                Err(e) => (Vec::new(), Some(e.to_string())),
+            };
 
             // Extract record values for comparison
             let current_values: HashSet<String> =

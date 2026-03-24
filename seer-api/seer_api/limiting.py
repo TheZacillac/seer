@@ -26,4 +26,5 @@ def get_client_ip(request: Request) -> str:
     return get_remote_address(request)
 
 
-limiter = Limiter(key_func=get_client_ip)
+_default_rate_limit = os.environ.get("SEER_RATE_LIMIT", "30/minute")
+limiter = Limiter(key_func=get_client_ip, default_limits=[_default_rate_limit])

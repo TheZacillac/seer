@@ -331,6 +331,9 @@ impl RdapClient {
     }
 }
 
+/// Maximum RDAP response body size (10 MB, matching CT log response limit).
+const MAX_RDAP_RESPONSE_SIZE: usize = 10 * 1024 * 1024;
+
 /// Internal function to query an RDAP endpoint (used by retry executor).
 async fn query_rdap_internal(http: &Client, url: &str) -> Result<RdapResponse> {
     let response = http
@@ -346,7 +349,21 @@ async fn query_rdap_internal(http: &Client, url: &str) -> Result<RdapResponse> {
         )));
     }
 
-    let rdap: RdapResponse = response.json().await?;
+    // Read body with size cap to prevent memory exhaustion from malicious servers
+    let bytes = tokio::time::timeout(DEFAULT_TIMEOUT, response.bytes())
+        .await
+        .map_err(|_| SeerError::Timeout("RDAP body read timed out".to_string()))?
+        .map_err(|e| SeerError::RdapError(format!("failed to read response body: {}", e)))?;
+
+    if bytes.len() > MAX_RDAP_RESPONSE_SIZE {
+        return Err(SeerError::RdapError(format!(
+            "response too large ({} bytes, max {})",
+            bytes.len(),
+            MAX_RDAP_RESPONSE_SIZE
+        )));
+    }
+
+    let rdap: RdapResponse = serde_json::from_slice(&bytes)?;
     Ok(rdap)
 }
 

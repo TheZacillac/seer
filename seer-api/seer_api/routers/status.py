@@ -19,7 +19,7 @@ MAX_CONCURRENCY = 50
 class BulkStatusRequest(BaseModel):
     """Request model for bulk status check."""
 
-    domains: list[str] = Field(..., max_length=MAX_BULK_DOMAINS)
+    domains: list[str] = Field(..., min_length=1, max_length=MAX_BULK_DOMAINS)
     concurrency: int = Field(default=10, ge=1, le=MAX_CONCURRENCY)
 
 

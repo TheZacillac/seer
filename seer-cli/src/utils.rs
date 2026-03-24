@@ -39,7 +39,7 @@ pub fn bulk_results_to_csv(results: &[BulkResult], operation: &str) -> String {
 
     // Write data rows
     for result in results {
-        let domain = get_domain_from_operation(&result.operation);
+        let domain = escape_csv_field(&get_domain_from_operation(&result.operation));
         let success = result.success;
         let duration_ms = result.duration_ms;
         let error = escape_csv_field(result.error.as_deref().unwrap_or(""));
@@ -327,8 +327,13 @@ pub fn escape_csv_field(s: &str) -> String {
         s.to_string()
     };
 
-    // Replace commas and newlines with spaces for cleaner CSV
-    s.replace([',', '\n'], " ").replace('"', "'")
+    // RFC 4180 quoting: if the field contains a comma, double-quote, or newline,
+    // wrap it in double quotes and escape internal double-quotes by doubling them.
+    if s.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s
+    }
 }
 
 pub fn get_domain_from_operation(op: &BulkOperation) -> String {

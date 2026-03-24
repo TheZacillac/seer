@@ -106,7 +106,7 @@ impl BulkExecutor {
     }
 
     pub fn with_concurrency(mut self, concurrency: usize) -> Self {
-        self.concurrency = concurrency.max(1);
+        self.concurrency = concurrency.clamp(1, 50);
         self
     }
 

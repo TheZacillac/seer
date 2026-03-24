@@ -413,10 +413,16 @@ fn analyze_results(
     }
 
     // Find the most common value set (consensus)
-    let (consensus_values, consensus_count) = value_counts
-        .into_iter()
-        .max_by_key(|(_, count)| *count)
-        .expect("value_counts is non-empty because successful is non-empty");
+    let Some((consensus_values, consensus_count)) =
+        value_counts.into_iter().max_by_key(|(_, count)| *count)
+    else {
+        // Should never happen since successful is non-empty, but handle gracefully
+        return (
+            0.0,
+            vec![],
+            vec!["No propagation data to analyze".to_string()],
+        );
+    };
 
     // Calculate propagation percentage based on consensus
     let propagation_percentage = (consensus_count as f64 / successful.len() as f64) * 100.0;
