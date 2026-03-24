@@ -385,7 +385,10 @@ fn extract_nameservers(text: &str) -> Vec<String> {
     for re in NAMESERVER_PATTERNS.iter() {
         for caps in re.captures_iter(text) {
             if let Some(m) = caps.get(1) {
-                let ns = m.as_str().trim().to_lowercase();
+                // Strip glue IP addresses that some registries append after the hostname
+                // e.g., "ns1.example.br 200.1.2.3 2001:db8::1" → "ns1.example.br"
+                let raw = m.as_str().trim();
+                let ns = raw.split_whitespace().next().unwrap_or(raw).to_lowercase();
                 if !ns.is_empty() && seen.insert(ns.clone()) {
                     nameservers.push(ns);
                 }

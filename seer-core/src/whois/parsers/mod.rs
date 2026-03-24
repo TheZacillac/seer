@@ -6,15 +6,27 @@
 //! data extraction reliability.
 
 mod denic;
+mod educause;
+mod eurid;
 mod generic;
+mod jprs;
+mod kisa;
+mod nic_it;
 mod nominet;
+mod sidn;
 
 use once_cell::sync::Lazy;
 
 use super::parser::WhoisResponse;
 pub use denic::DenicParser;
+pub use educause::EducauseParser;
+pub use eurid::EuridParser;
 pub use generic::GenericParser;
+pub use jprs::JprsParser;
+pub use kisa::KisaParser;
+pub use nic_it::NicItParser;
 pub use nominet::NominetParser;
+pub use sidn::SidnParser;
 
 /// Trait for registry-specific WHOIS parsers.
 ///
@@ -42,8 +54,14 @@ impl ParserRegistry {
     pub fn new() -> Self {
         Self {
             parsers: vec![
-                Box::new(DenicParser::new()),   // .de
-                Box::new(NominetParser::new()), // .uk, .co.uk
+                Box::new(DenicParser::new()),    // .de
+                Box::new(EducauseParser::new()), // .edu
+                Box::new(EuridParser::new()),    // .eu
+                Box::new(JprsParser::new()),     // .jp
+                Box::new(KisaParser::new()),     // .kr
+                Box::new(NicItParser::new()),    // .it
+                Box::new(NominetParser::new()),  // .uk, .co.uk
+                Box::new(SidnParser::new()),     // .nl
             ],
             fallback: GenericParser::new(),
         }
