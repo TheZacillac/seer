@@ -38,6 +38,13 @@ from seer._seer import (
     bulk_dig,
     bulk_propagation,
     bulk_status,
+    availability,
+    subdomains,
+    ssl,
+    dnssec,
+    dns_compare,
+    dns_follow,
+    diff,
 )
 
 try:
@@ -59,6 +66,13 @@ __all__ = [
     "bulk_dig",
     "bulk_propagation",
     "bulk_status",
+    "availability",
+    "subdomains",
+    "ssl",
+    "dnssec",
+    "dns_compare",
+    "dns_follow",
+    "diff",
 ]
 
 
