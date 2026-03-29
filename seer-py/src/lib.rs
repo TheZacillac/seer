@@ -1,3 +1,5 @@
+mod bridge;
+
 use std::sync::OnceLock;
 
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
@@ -376,6 +378,24 @@ fn bulk_status(py: Python<'_>, domains: Vec<String>, concurrency: usize) -> PyRe
 }
 
 #[pyfunction]
+#[pyo3(signature = (domains, concurrency = 10))]
+fn bulk_availability(py: Python<'_>, domains: Vec<String>, concurrency: usize) -> PyResult<PyObject> {
+    let rt = get_runtime();
+    let executor = BulkExecutor::new().with_concurrency(validate_concurrency(concurrency)?);
+
+    let operations: Vec<BulkOperation> = domains
+        .into_iter()
+        .map(|domain| BulkOperation::Avail { domain })
+        .collect();
+
+    let result =
+        py.allow_threads(|| rt.block_on(async { executor.execute(operations, None).await }));
+
+    let json = serde_json::to_value(&result).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    json_to_python(py, &json)
+}
+
+#[pyfunction]
 fn availability(py: Python<'_>, domain: String) -> PyResult<PyObject> {
     let rt = get_runtime();
     let checker = get_availability_checker();
@@ -493,6 +513,10 @@ fn dns_follow(
         .parse()
         .map_err(|e: seer_core::SeerError| PyValueError::new_err(e.to_string()))?;
 
+    // Cap parameters to prevent blocking the shared Tokio runtime for excessive durations
+    let iterations = iterations.min(100);
+    let interval_minutes = interval_minutes.min(60.0).max(0.1);
+
     let config = FollowConfig {
         iterations,
         interval_secs: (interval_minutes * 60.0) as u64,
@@ -568,8 +592,17 @@ fn json_to_python(py: Python<'_>, value: &serde_json::Value) -> PyResult<PyObjec
     }
 }
 
+/// Install a tracing subscriber that forwards Rust log events into Python's
+/// ``logging`` module.  Safe to call multiple times — only the first call
+/// takes effect.
+#[pyfunction]
+fn init_rust_logging() {
+    bridge::install_bridge();
+}
+
 #[pymodule]
 fn _seer(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(init_rust_logging, m)?)?;
     m.add_function(wrap_pyfunction!(lookup, m)?)?;
     m.add_function(wrap_pyfunction!(whois, m)?)?;
     m.add_function(wrap_pyfunction!(rdap_domain, m)?)?;
@@ -583,6 +616,7 @@ fn _seer(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(bulk_dig, m)?)?;
     m.add_function(wrap_pyfunction!(bulk_propagation, m)?)?;
     m.add_function(wrap_pyfunction!(bulk_status, m)?)?;
+    m.add_function(wrap_pyfunction!(bulk_availability, m)?)?;
     m.add_function(wrap_pyfunction!(availability, m)?)?;
     m.add_function(wrap_pyfunction!(subdomains, m)?)?;
     m.add_function(wrap_pyfunction!(ssl, m)?)?;

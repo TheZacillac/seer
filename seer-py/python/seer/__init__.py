@@ -38,6 +38,7 @@ from seer._seer import (
     bulk_dig,
     bulk_propagation,
     bulk_status,
+    bulk_availability,
     availability,
     subdomains,
     ssl,
@@ -46,6 +47,11 @@ from seer._seer import (
     dns_follow,
     diff,
 )
+
+# Forward Rust tracing events into Python logging.
+# Must be called before any seer function so that the subscriber is installed.
+from seer._seer import init_rust_logging as _init_rust_logging
+_init_rust_logging()
 
 try:
     from importlib.metadata import version
@@ -66,6 +72,7 @@ __all__ = [
     "bulk_dig",
     "bulk_propagation",
     "bulk_status",
+    "bulk_availability",
     "availability",
     "subdomains",
     "ssl",
