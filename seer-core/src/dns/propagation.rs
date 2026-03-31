@@ -424,8 +424,9 @@ fn analyze_results(
         );
     };
 
-    // Calculate propagation percentage based on consensus
-    let propagation_percentage = (consensus_count as f64 / successful.len() as f64) * 100.0;
+    // Calculate propagation percentage based on ALL servers checked (not just
+    // responding ones) so unreachable servers count as non-propagated.
+    let propagation_percentage = (consensus_count as f64 / results.len() as f64) * 100.0;
 
     // Find inconsistencies (reuse pre-computed sorted value sets)
     let consensus_str = if consensus_values.is_empty() {

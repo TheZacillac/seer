@@ -20,6 +20,12 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true }
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-appender = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+opentelemetry-otlp = { workspace = true }
 futures = { workspace = true }
 async-trait = { workspace = true }
 once_cell = { workspace = true }
@@ -33,7 +39,7 @@ x509-parser = { workspace = true }
 rand = { workspace = true }
 toml = { workspace = true }
 idna = { workspace = true }
-dirs-next = "2"
+dirs = { workspace = true }
 
 [lints]
 workspace = true

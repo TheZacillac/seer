@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use tracing::{debug, instrument};
 
 use crate::dns::{DnsRecord, DnsResolver, RecordType};
 use crate::error::Result;
@@ -60,6 +61,7 @@ impl DnsComparator {
     /// # Returns
     /// A `DnsComparison` showing records from each server, whether they match,
     /// and which records are unique to each server or shared.
+    #[instrument(skip(self), fields(domain = %domain, record_type = %record_type, server_a = %server_a, server_b = %server_b))]
     pub async fn compare(
         &self,
         domain: &str,
@@ -67,10 +69,12 @@ impl DnsComparator {
         server_a: &str,
         server_b: &str,
     ) -> Result<DnsComparison> {
+        let domain = crate::validation::normalize_domain(domain)?;
+
         // Query both servers concurrently
         let (result_a, result_b) = tokio::join!(
-            self.resolver.resolve(domain, record_type, Some(server_a)),
-            self.resolver.resolve(domain, record_type, Some(server_b))
+            self.resolver.resolve(&domain, record_type, Some(server_a)),
+            self.resolver.resolve(&domain, record_type, Some(server_b))
         );
 
         let server_a_result = match result_a {
@@ -124,6 +128,14 @@ impl DnsComparator {
             && only_in_b.is_empty()
             && server_a_result.error.is_none()
             && server_b_result.error.is_none();
+
+        debug!(
+            matches = matches,
+            common = common.len(),
+            only_in_a = only_in_a.len(),
+            only_in_b = only_in_b.len(),
+            "DNS comparison complete"
+        );
 
         Ok(DnsComparison {
             domain: domain.to_string(),

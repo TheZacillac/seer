@@ -312,6 +312,17 @@ pub fn bulk_results_to_csv(results: &[BulkResult], operation: &str) -> String {
     csv
 }
 
+/// Escapes a CSV field for safe output, following RFC 4180 with Excel formula
+/// injection protection.
+///
+/// # Anti-formula protection
+/// Fields starting with `=`, `+`, `-`, `@`, `\t`, or `\r` are prefixed with a
+/// single quote (`'`) to prevent formula injection in Excel and LibreOffice.
+/// This prefix is a display convention specific to spreadsheet applications and
+/// will appear as a literal character in non-spreadsheet CSV parsers.
+///
+/// For programmatic CSV consumption (non-spreadsheet), consider using the
+/// `--format json` output instead which does not apply this transformation.
 pub fn escape_csv_field(s: &str) -> String {
     // Protect against CSV injection by prefixing formula-starting characters with a single quote
     // This prevents Excel/Sheets from interpreting the content as a formula

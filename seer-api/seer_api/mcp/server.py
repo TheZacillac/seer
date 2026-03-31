@@ -351,7 +351,11 @@ async def execute_tool(name: str, arguments: dict[str, Any]) -> Any:
         case "seer_dig":
             domain = _require_str(arguments, "domain")
             record_type = arguments.get("record_type", "A")
+            if not isinstance(record_type, str):
+                raise ValueError(f"'record_type' must be a string (got {type(record_type).__name__})")
             nameserver = arguments.get("nameserver")
+            if nameserver is not None and not isinstance(nameserver, str):
+                raise ValueError(f"'nameserver' must be a string (got {type(nameserver).__name__})")
             return await loop.run_in_executor(
                 None, seer.dig, domain, record_type, nameserver
             )
@@ -359,6 +363,8 @@ async def execute_tool(name: str, arguments: dict[str, Any]) -> Any:
         case "seer_propagation":
             domain = _require_str(arguments, "domain")
             record_type = arguments.get("record_type", "A")
+            if not isinstance(record_type, str):
+                raise ValueError(f"'record_type' must be a string (got {type(record_type).__name__})")
             return await loop.run_in_executor(
                 None, seer.propagation, domain, record_type
             )
@@ -384,6 +390,8 @@ async def execute_tool(name: str, arguments: dict[str, Any]) -> Any:
         case "seer_bulk_dig":
             domains = _require_domains(arguments)
             record_type = arguments.get("record_type", "A")
+            if not isinstance(record_type, str):
+                raise ValueError(f"'record_type' must be a string (got {type(record_type).__name__})")
             concurrency = _get_concurrency(arguments, default=10)
             return await loop.run_in_executor(
                 None, seer.bulk_dig, domains, record_type, concurrency
@@ -399,6 +407,8 @@ async def execute_tool(name: str, arguments: dict[str, Any]) -> Any:
         case "seer_bulk_propagation":
             domains = _require_domains(arguments)
             record_type = arguments.get("record_type", "A")
+            if not isinstance(record_type, str):
+                raise ValueError(f"'record_type' must be a string (got {type(record_type).__name__})")
             concurrency = _get_concurrency(arguments, default=5)
             return await loop.run_in_executor(
                 None, seer.bulk_propagation, domains, record_type, concurrency

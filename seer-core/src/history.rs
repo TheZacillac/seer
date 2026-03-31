@@ -32,7 +32,7 @@ const MAX_ENTRIES_PER_DOMAIN: usize = 50;
 impl LookupHistory {
     /// Returns the path to the history file (`~/.seer/history.json`).
     pub fn path() -> Option<PathBuf> {
-        dirs_next::home_dir().map(|h| h.join(".seer").join("history.json"))
+        dirs::home_dir().map(|h| h.join(".seer").join("history.json"))
     }
 
     /// Loads history from disk, returning an empty history on any failure.

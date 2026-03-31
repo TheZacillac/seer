@@ -7,6 +7,7 @@ pub mod diff;
 pub mod dns;
 pub mod error;
 pub mod history;
+pub mod logging;
 pub mod lookup;
 pub mod output;
 pub mod rdap;

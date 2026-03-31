@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
-use tracing::debug;
+use tracing::{debug, instrument};
 
 use crate::error::{Result, SeerError};
 
@@ -50,12 +50,13 @@ impl SubdomainEnumerator {
     /// # Returns
     /// * `Ok(SubdomainResult)` - List of discovered subdomains
     /// * `Err(SeerError)` - If the CT log query fails
+    #[instrument(skip(self), fields(domain = %domain))]
     pub async fn enumerate(&self, domain: &str) -> Result<SubdomainResult> {
         let domain = crate::validation::normalize_domain(domain)?;
         debug!(domain = %domain, "Enumerating subdomains via CT logs");
 
         // Query crt.sh (Certificate Transparency log aggregator)
-        let url = format!("https://crt.sh/?q=%.{}&output=json", domain);
+        let url = format!("https://crt.sh/?q=%25.{}&output=json", domain);
 
         // Maximum response size for CT log queries (10 MB).
         const MAX_CT_RESPONSE_SIZE: usize = 10 * 1024 * 1024;
@@ -125,7 +126,21 @@ impl SubdomainEnumerator {
         // Remove the base domain itself from the results
         subdomains.remove(&domain);
 
-        let subdomains: Vec<String> = subdomains.into_iter().collect();
+        // Filter subdomains through basic validation
+        let subdomains: Vec<String> = subdomains
+            .into_iter()
+            .filter(|s| {
+                // Must be ASCII alphanumeric, dots, hyphens, and wildcards
+                let s = s.strip_prefix("*.").unwrap_or(s);
+                !s.is_empty()
+                    && s.len() <= 253
+                    && s.chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+                    && !s.contains("..")
+                    && !s.starts_with('.')
+                    && !s.starts_with('-')
+            })
+            .collect();
         let count = subdomains.len();
 
         Ok(SubdomainResult {

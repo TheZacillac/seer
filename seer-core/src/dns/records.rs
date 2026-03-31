@@ -83,7 +83,7 @@ pub struct DnsRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
+#[serde(tag = "record_type", content = "value", rename_all = "UPPERCASE")]
 #[allow(clippy::upper_case_acronyms)]
 pub enum RecordData {
     A {

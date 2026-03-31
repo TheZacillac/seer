@@ -6,7 +6,7 @@ use futures::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 use tokio::time::sleep;
-use tracing::{debug, warn};
+use tracing::{debug, info, instrument, warn};
 
 use crate::availability::{AvailabilityChecker, AvailabilityResult};
 use crate::dns::{DnsRecord, DnsResolver, PropagationChecker, PropagationResult, RecordType};
@@ -49,7 +49,7 @@ pub enum BulkOperation {
 
 /// The data returned from a bulk operation (varies by operation type).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
+#[serde(tag = "result_type", content = "data", rename_all = "snake_case")]
 pub enum BulkResultData {
     Whois(WhoisResponse),
     Rdap(Box<RdapResponse>),
@@ -115,6 +115,7 @@ impl BulkExecutor {
         self
     }
 
+    #[instrument(skip(self, operations, progress), fields(count = operations.len(), concurrency = self.concurrency))]
     pub async fn execute(
         &self,
         operations: Vec<BulkOperation>,
@@ -124,6 +125,7 @@ impl BulkExecutor {
         let completed = Arc::new(AtomicUsize::new(0));
         let semaphore = Arc::new(Semaphore::new(self.concurrency));
 
+        info!("bulk operation started");
         debug!(
             total = total,
             concurrency = self.concurrency,
@@ -215,6 +217,15 @@ impl BulkExecutor {
             .buffer_unordered(self.concurrency)
             .collect()
             .await;
+
+        let succeeded = results.iter().filter(|r| r.success).count();
+        let failed = results.iter().filter(|r| !r.success).count();
+        info!(
+            total = total,
+            succeeded = succeeded,
+            failed = failed,
+            "bulk operation completed"
+        );
 
         results
     }
@@ -340,7 +351,7 @@ async fn execute_operation(op: &BulkOperation, clients: &Clients<'_>) -> Result<
 }
 
 pub fn parse_domains_from_file(content: &str) -> Vec<String> {
-    content
+    let mut domains: Vec<String> = content
         .lines()
         .map(|line| line.trim())
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
@@ -349,7 +360,16 @@ pub fn parse_domains_from_file(content: &str) -> Vec<String> {
             line.split(',').next().unwrap_or(line).trim().to_string()
         })
         .filter(|domain| domain.contains('.'))
-        .collect()
+        .collect();
+
+    // Skip probable CSV header: first entry has no digits (e.g., "domain.name", "host.name")
+    if let Some(first) = domains.first() {
+        if !first.chars().any(|c| c.is_ascii_digit()) {
+            domains.remove(0);
+        }
+    }
+
+    domains
 }
 
 #[cfg(test)]
@@ -360,18 +380,25 @@ mod tests {
     fn test_parse_domains_from_file() {
         let content = r#"
 # This is a comment
-example.com
-google.com
-  whitespace.com
+example1.com
+google2.com
+  whitespace3.com
 invalid
 csv,format,example.org
 "#;
 
         let domains = parse_domains_from_file(content);
         assert_eq!(domains.len(), 3);
-        assert!(domains.contains(&"example.com".to_string()));
-        assert!(domains.contains(&"google.com".to_string()));
-        assert!(domains.contains(&"whitespace.com".to_string()));
+        assert!(domains.contains(&"example1.com".to_string()));
+        assert!(domains.contains(&"google2.com".to_string()));
+        assert!(domains.contains(&"whitespace3.com".to_string()));
         // "invalid" and "csv" are filtered out because they don't contain a dot
+    }
+
+    #[test]
+    fn test_parse_domains_skip_header() {
+        let content = "host.name,owner,notes\nexample.com,Alice,Main\n";
+        let domains = parse_domains_from_file(content);
+        assert_eq!(domains, vec!["example.com"]);
     }
 }

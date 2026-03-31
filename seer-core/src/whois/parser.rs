@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, FixedOffset, Utc};
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -287,8 +287,21 @@ impl WhoisResponse {
             "does not exist",
         ];
 
-        let lower = self.raw_response.to_lowercase();
-        available_patterns.iter().any(|p| lower.contains(p))
+        // Only check the first 5 non-empty, non-comment lines to avoid
+        // false positives from boilerplate text deeper in the response.
+        let check_text: String = self
+            .raw_response
+            .lines()
+            .filter(|line| {
+                let trimmed = line.trim();
+                !trimmed.is_empty() && !trimmed.starts_with('#') && !trimmed.starts_with('%')
+            })
+            .take(5)
+            .collect::<Vec<_>>()
+            .join("\n")
+            .to_lowercase();
+
+        available_patterns.iter().any(|p| check_text.contains(p))
     }
 
     /// Checks if the response indicates the registrar doesn't have data for this domain.
@@ -341,7 +354,29 @@ fn extract_date_with_patterns(text: &str, patterns: &[Regex]) -> Option<DateTime
 }
 
 fn parse_date(date_str: &str) -> Option<DateTime<Utc>> {
-    let formats = [
+    let cleaned = date_str
+        .trim()
+        .replace(" UTC", "Z")
+        .replace(" (UTC)", "")
+        .replace(" +0000", "Z");
+
+    // First: try RFC 3339, which handles any timezone offset (e.g., +05:30, +01:00, Z)
+    if let Ok(dt) = DateTime::parse_from_rfc3339(&cleaned) {
+        return Some(dt.with_timezone(&Utc));
+    }
+
+    // Second: try ISO 8601 with timezone offset (e.g., 2024-01-15T10:30:00+05:30)
+    if let Ok(dt) = DateTime::<FixedOffset>::parse_from_str(&cleaned, "%Y-%m-%dT%H:%M:%S%z") {
+        return Some(dt.with_timezone(&Utc));
+    }
+
+    // Third: try space-separated datetime with timezone offset (e.g., 2024-01-15 10:30:00+05:30)
+    if let Ok(dt) = DateTime::<FixedOffset>::parse_from_str(&cleaned, "%Y-%m-%d %H:%M:%S%z") {
+        return Some(dt.with_timezone(&Utc));
+    }
+
+    // Fourth: try NaiveDateTime / NaiveDate formats (timezone-less dates)
+    let naive_formats = [
         "%Y-%m-%dT%H:%M:%SZ",
         "%Y-%m-%dT%H:%M:%S%.fZ",
         "%Y-%m-%d %H:%M:%S",
@@ -355,13 +390,7 @@ fn parse_date(date_str: &str) -> Option<DateTime<Utc>> {
         "%b %d %Y",
     ];
 
-    let cleaned = date_str
-        .trim()
-        .replace(" UTC", "Z")
-        .replace(" (UTC)", "")
-        .replace(" +0000", "Z");
-
-    for fmt in &formats {
+    for fmt in &naive_formats {
         if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(&cleaned, fmt) {
             return Some(dt.and_utc());
         }
@@ -370,7 +399,7 @@ fn parse_date(date_str: &str) -> Option<DateTime<Utc>> {
         }
     }
 
-    // Try parsing ISO 8601 directly
+    // Last resort: try parsing ISO 8601 directly
     if let Ok(dt) = cleaned.parse::<DateTime<Utc>>() {
         return Some(dt);
     }

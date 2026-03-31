@@ -78,7 +78,7 @@ impl Default for BulkConfig {
 impl SeerConfig {
     /// Returns the path to the config file (`~/.seer/config.toml`).
     pub fn config_path() -> Option<PathBuf> {
-        dirs_next::home_dir().map(|home| home.join(".seer").join("config.toml"))
+        dirs::home_dir().map(|home| home.join(".seer").join("config.toml"))
     }
 
     /// Loads config from `~/.seer/config.toml`, falling back to defaults if not found.

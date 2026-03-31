@@ -238,7 +238,7 @@ impl Repl {
         );
         println!(
             "  {:<34} Monitor DNS records over time",
-            "follow <domain> [n] [mins] [type] [@server]".bright_cyan()
+            "follow <domain> [n] [mins] [type] [@server] [--changes-only]".bright_cyan()
         );
         println!(
             "  {}",
@@ -662,16 +662,35 @@ impl Repl {
         });
 
         // Read domains from file
+        const MAX_BULK_FILE_SIZE: usize = 1024 * 1024; // 1 MB
+        const MAX_BULK_DOMAINS_CLI: usize = 1000;
+
         let content = match std::fs::read_to_string(file_path) {
             Ok(c) => c,
             Err(e) => return CommandResult::Error(format!("Failed to read file: {}", e)),
         };
+
+        if content.len() > MAX_BULK_FILE_SIZE {
+            return CommandResult::Error(format!(
+                "Bulk file exceeds {} byte limit ({} bytes)",
+                MAX_BULK_FILE_SIZE,
+                content.len()
+            ));
+        }
 
         let domains = seer_core::bulk::parse_domains_from_file(&content);
         if domains.is_empty() {
             return CommandResult::Error(
                 "No valid domains found in file. Expected format: one domain per line, # for comments, or CSV (first column)".to_string()
             );
+        }
+
+        if domains.len() > MAX_BULK_DOMAINS_CLI {
+            return CommandResult::Error(format!(
+                "Bulk file contains {} domains, maximum is {}",
+                domains.len(),
+                MAX_BULK_DOMAINS_CLI
+            ));
         }
 
         println!(
@@ -820,7 +839,7 @@ impl Repl {
     async fn execute_follow(&self, args: &[&str]) -> CommandResult {
         if args.is_empty() {
             return CommandResult::Error(
-                "Usage: follow <domain> [iterations] [interval_minutes] [type] [@server]"
+                "Usage: follow <domain> [iterations] [interval_minutes] [type] [@server] [--changes-only]"
                     .to_string(),
             );
         }
@@ -830,11 +849,14 @@ impl Repl {
         let mut interval_minutes: f64 = 1.0;
         let mut record_type = seer_core::RecordType::A;
         let mut nameserver: Option<&str> = None;
+        let mut changes_only = false;
 
         // Parse remaining args
         for arg in &args[1..] {
             if let Some(ns) = arg.strip_prefix('@') {
                 nameserver = Some(ns);
+            } else if *arg == "--changes-only" {
+                changes_only = true;
             } else if let Ok(n) = arg.parse::<usize>() {
                 // First number is iterations, second is interval
                 if iterations == 10 {
@@ -849,7 +871,8 @@ impl Repl {
             }
         }
 
-        let config = seer_core::FollowConfig::new(iterations, interval_minutes);
+        let config = seer_core::FollowConfig::new(iterations, interval_minutes)
+            .with_changes_only(changes_only);
 
         println!(
             "Following {} {} records ({} iterations, {} interval)",

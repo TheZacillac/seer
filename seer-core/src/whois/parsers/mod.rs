@@ -115,7 +115,7 @@ fn extract_tld(domain: &str) -> Option<String> {
 /// Extracts the second-level TLD from a domain name (e.g., "co.uk" from "example.co.uk").
 fn extract_second_level_tld(domain: &str) -> Option<String> {
     let parts: Vec<&str> = domain.rsplit('.').collect();
-    if parts.len() >= 2 {
+    if parts.len() >= 3 {
         Some(format!(
             "{}.{}",
             parts[1].to_lowercase(),
@@ -143,10 +143,7 @@ mod tests {
             extract_second_level_tld("example.co.uk"),
             Some("co.uk".to_string())
         );
-        assert_eq!(
-            extract_second_level_tld("example.com"),
-            Some("example.com".to_string())
-        );
+        assert_eq!(extract_second_level_tld("example.com"), None);
     }
 
     #[test]

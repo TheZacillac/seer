@@ -4,7 +4,7 @@
 //! WHOIS/RDAP "not found" responses.
 
 use serde::{Deserialize, Serialize};
-use tracing::debug;
+use tracing::{debug, instrument};
 
 use crate::error::Result;
 use crate::rdap::RdapClient;
@@ -47,6 +47,7 @@ impl AvailabilityChecker {
     }
 
     /// Check if a domain is available for registration.
+    #[instrument(skip(self), fields(domain = %domain))]
     pub async fn check(&self, domain: &str) -> Result<AvailabilityResult> {
         let domain = crate::validation::normalize_domain(domain)?;
         debug!(domain = %domain, "Checking domain availability");

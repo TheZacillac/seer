@@ -1,9 +1,7 @@
 """FastAPI application for Seer domain utilities."""
 
-import json
 import logging
 import os
-import sys
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -15,33 +13,15 @@ from .limiting import limiter
 from .middleware import RequestLoggingMiddleware, metrics
 from .routers import lookup, whois, rdap, dns, propagation, status
 
-# Configure structured logging
-log_format = os.environ.get("SEER_LOG_FORMAT", "text")
-log_level = os.environ.get("SEER_LOG_LEVEL", "INFO").upper()
-
-if log_format == "json":
-    # JSON structured logging for production
-    class JsonFormatter(logging.Formatter):
-        def format(self, record):
-            log_entry = {
-                "timestamp": self.formatTime(record),
-                "level": record.levelname,
-                "logger": record.name,
-                "message": record.getMessage(),
-            }
-            if record.exc_info:
-                log_entry["exception"] = self.formatException(record.exc_info)
-            return json.dumps(log_entry)
-
-    handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(JsonFormatter())
-else:
-    handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(
-        logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
-    )
-
-logging.basicConfig(level=getattr(logging, log_level, logging.INFO), handlers=[handler])
+# Configure structured logging via the unified Arcanum logging module.
+try:
+    from arcanum._logging import configure_logging
+    configure_logging("seer-api")
+except ImportError:
+    # Fallback if arcanum is not installed.
+    log_level = os.environ.get("ARCANUM_LOG_LEVEL",
+                               os.environ.get("SEER_LOG_LEVEL", "INFO")).upper()
+    logging.basicConfig(level=getattr(logging, log_level, logging.INFO))
 
 # Rate limiter configuration is handled in limiting.py at construction time
 # via SEER_RATE_LIMIT env var (default: "30/minute")

@@ -278,6 +278,7 @@ impl DnsFollower {
     }
 
     /// Simple follow without callback or cancellation
+    #[instrument(skip(self, config), fields(domain = %domain, record_type = ?record_type))]
     pub async fn follow_simple(
         &self,
         domain: &str,

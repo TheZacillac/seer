@@ -6,7 +6,7 @@ use regex::Regex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
-use tracing::{debug, instrument, warn};
+use tracing::{debug, info, instrument, warn};
 
 use super::parser::WhoisResponse;
 use super::servers::{get_tld, get_whois_server};
@@ -88,6 +88,7 @@ impl WhoisClient {
     /// to get the most detailed registration information.
     #[instrument(skip(self), fields(domain = %domain))]
     pub async fn lookup(&self, domain: &str) -> Result<WhoisResponse> {
+        let start = std::time::Instant::now();
         let domain = normalize_domain(domain)?;
         let tld = get_tld(&domain).ok_or_else(|| SeerError::InvalidDomain(domain.clone()))?;
 
@@ -110,8 +111,12 @@ impl WhoisClient {
         };
 
         let mut visited = HashSet::new();
-        self.lookup_with_referrals(&domain, &whois_server, 0, &mut visited)
-            .await
+        let result = self
+            .lookup_with_referrals(&domain, &whois_server, 0, &mut visited)
+            .await;
+        let elapsed_ms = start.elapsed().as_millis();
+        info!(elapsed_ms = elapsed_ms, "WHOIS lookup complete");
+        result
     }
 
     fn lookup_with_referrals<'a>(
@@ -148,7 +153,7 @@ impl WhoisClient {
             // Check for referral to another WHOIS server
             if let Some(referral) = extract_referral(&raw_response) {
                 if referral != whois_server && !visited.contains(&referral.to_lowercase()) {
-                    debug!(referral = %referral, "Following referral");
+                    debug!(referral_depth = depth, "following referral to {}", referral);
                     match self
                         .lookup_with_referrals(domain, &referral, depth + 1, visited)
                         .await
@@ -184,7 +189,22 @@ impl WhoisClient {
     ///
     /// Use this when you know the exact server to query, bypassing automatic
     /// server discovery and referral following.
+    #[instrument(skip(self), fields(domain = %domain, server = %server))]
     pub async fn lookup_with_server(&self, domain: &str, server: &str) -> Result<WhoisResponse> {
+        // Validate server before any network connection
+        if server.contains('\r') || server.contains('\n') {
+            return Err(SeerError::WhoisError(format!(
+                "invalid WHOIS server: contains illegal characters: {}",
+                server.replace('\r', "\\r").replace('\n', "\\n")
+            )));
+        }
+        if !is_safe_whois_server(server) {
+            return Err(SeerError::WhoisError(format!(
+                "invalid WHOIS server: {}",
+                server
+            )));
+        }
+
         let domain = normalize_domain(domain)?;
         let raw_response = self.query_server_with_retry(server, &domain).await?;
         Ok(WhoisResponse::parse(&domain, server, &raw_response))
@@ -239,6 +259,7 @@ async fn query_server_internal(
 ) -> Result<String> {
     let addr = format!("{}:{}", server, WHOIS_PORT);
 
+    debug!("WHOIS query to {}", server);
     let mut stream = timeout(timeout_duration, TcpStream::connect(&addr))
         .await
         .map_err(|_| SeerError::Timeout(format!("connection to {} timed out", server)))?
@@ -251,12 +272,26 @@ async fn query_server_internal(
         .map_err(|_| SeerError::Timeout("write timed out".to_string()))?
         .map_err(|e| SeerError::WhoisError(format!("failed to send query: {}", e)))?;
 
-    // Read response
+    // Read response with a wall-clock deadline so slow-trickle servers
+    // cannot hold the connection open indefinitely.
     let mut response = Vec::new();
     let mut buf = [0u8; 4096];
+    let deadline = tokio::time::Instant::now() + timeout_duration;
 
     loop {
-        let read_result = timeout(timeout_duration, stream.read(&mut buf)).await;
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            if !response.is_empty() {
+                tracing::warn!(
+                    "WHOIS read deadline reached with partial response ({} bytes)",
+                    response.len()
+                );
+                break;
+            }
+            return Err(SeerError::Timeout("read timed out".to_string()));
+        }
+
+        let read_result = timeout(remaining, stream.read(&mut buf)).await;
 
         match read_result {
             Ok(Ok(0)) => break, // EOF
@@ -272,6 +307,10 @@ async fn query_server_internal(
             Err(_) => {
                 // Timeout on read - if we have data, return it
                 if !response.is_empty() {
+                    tracing::warn!(
+                        "WHOIS per-read timeout with partial response ({} bytes)",
+                        response.len()
+                    );
                     break;
                 }
                 return Err(SeerError::Timeout("read timed out".to_string()));
@@ -283,11 +322,8 @@ async fn query_server_internal(
     let _ = stream.shutdown().await;
 
     // Try UTF-8, fall back to Latin-1
-    String::from_utf8(response.clone())
-        .or_else(|_| Ok(response.iter().map(|&c| c as char).collect()))
-        .map_err(|e: std::string::FromUtf8Error| {
-            SeerError::WhoisError(format!("failed to decode response: {}", e))
-        })
+    Ok(String::from_utf8(response)
+        .unwrap_or_else(|e| e.into_bytes().iter().map(|&c| c as char).collect()))
 }
 
 /// Extracts the WHOIS server from an IANA response.

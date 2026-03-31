@@ -1,6 +1,7 @@
 """WHOIS API endpoints."""
 
 import asyncio
+from typing import Annotated
 
 from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field
@@ -19,7 +20,7 @@ MAX_CONCURRENCY = 50
 class BulkWhoisRequest(BaseModel):
     """Request model for bulk WHOIS lookup."""
 
-    domains: list[str] = Field(..., min_length=1, max_length=MAX_BULK_DOMAINS)
+    domains: list[Annotated[str, Field(max_length=253)]] = Field(..., min_length=1, max_length=MAX_BULK_DOMAINS)
     concurrency: int = Field(default=10, ge=1, le=MAX_CONCURRENCY)
 
 

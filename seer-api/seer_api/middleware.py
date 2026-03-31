@@ -10,6 +10,12 @@ from collections import defaultdict
 from fastapi import Request, Response
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 
+try:
+    from arcanum._logging import set_correlation_id
+except ImportError:
+    def set_correlation_id(cid=None):
+        return cid or uuid.uuid4().hex[:16]
+
 logger = logging.getLogger("seer_api")
 
 
@@ -61,7 +67,10 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
     async def dispatch(
         self, request: Request, call_next: RequestResponseEndpoint
     ) -> Response:
-        request_id = str(uuid.uuid4())[:8]
+        request_id = request.headers.get(
+            "X-Correlation-ID", uuid.uuid4().hex[:8]
+        )
+        set_correlation_id(request_id)
         start_time = time.monotonic()
 
         # Add request ID to state for downstream use

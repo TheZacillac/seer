@@ -1,9 +1,10 @@
 """Smart lookup API endpoints."""
 
 import asyncio
+from typing import Annotated
 
 from fastapi import APIRouter, Request
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field
 from seer_api.errors import http_error
 from seer_api.limiting import limiter
 
@@ -19,17 +20,8 @@ MAX_CONCURRENCY = 50
 class BulkLookupRequest(BaseModel):
     """Request model for bulk lookup."""
 
-    domains: list[str] = Field(...)
+    domains: list[Annotated[str, Field(max_length=253)]] = Field(..., min_length=1, max_length=MAX_BULK_DOMAINS)
     concurrency: int = Field(default=10, ge=1, le=MAX_CONCURRENCY)
-
-    @field_validator("domains")
-    @classmethod
-    def validate_domains_count(cls, v: list[str]) -> list[str]:
-        if len(v) > MAX_BULK_DOMAINS:
-            raise ValueError(f"Too many domains: {len(v)} exceeds limit of {MAX_BULK_DOMAINS}")
-        if len(v) == 0:
-            raise ValueError("At least one domain is required")
-        return v
 
 
 @router.get("/{domain}")

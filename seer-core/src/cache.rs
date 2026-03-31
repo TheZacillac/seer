@@ -118,12 +118,14 @@ where
 
         if entry.is_expired() {
             debug!(
+                hit = false,
                 ?key,
                 age_secs = entry.age().as_secs(),
-                "Cache entry expired"
+                "cache lookup (expired)"
             );
             None
         } else {
+            debug!(hit = true, ?key, "cache lookup");
             Some(entry.value.clone())
         }
     }

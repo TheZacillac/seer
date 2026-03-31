@@ -42,7 +42,7 @@ pub struct WatchReport {
 impl Watchlist {
     /// Returns the path to the watchlist file (`~/.seer/watchlist.toml`).
     pub fn path() -> Option<PathBuf> {
-        dirs_next::home_dir().map(|h| h.join(".seer").join("watchlist.toml"))
+        dirs::home_dir().map(|h| h.join(".seer").join("watchlist.toml"))
     }
 
     /// Loads the watchlist from disk, returning an empty list on any failure.

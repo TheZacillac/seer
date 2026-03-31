@@ -4,7 +4,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, warn};
+use tracing::{debug, instrument, warn};
 
 use crate::availability::{AvailabilityChecker, AvailabilityResult};
 use crate::cache::TtlCache;
@@ -125,6 +125,36 @@ impl LookupResult {
     }
 }
 
+/// Before caching, trim raw WHOIS response to limit cache memory.
+/// A full WHOIS raw_response can be up to 1 MB; we cap it at 32 KB which is
+/// plenty for the parsed fields while preventing the cache from ballooning.
+fn trim_for_cache(mut result: LookupResult) -> LookupResult {
+    const MAX_RAW: usize = 32 * 1024;
+
+    match result {
+        LookupResult::Whois { ref mut data, .. } => {
+            if data.raw_response.len() > MAX_RAW {
+                data.raw_response.truncate(MAX_RAW);
+                data.raw_response.push_str("\n... [truncated for cache]");
+            }
+        }
+        LookupResult::Rdap {
+            ref mut whois_fallback,
+            ..
+        } => {
+            if let Some(ref mut w) = whois_fallback {
+                if w.raw_response.len() > MAX_RAW {
+                    w.raw_response.truncate(MAX_RAW);
+                    w.raw_response.push_str("\n... [truncated for cache]");
+                }
+            }
+        }
+        LookupResult::Available { .. } => {}
+    }
+
+    result
+}
+
 #[derive(Debug, Clone)]
 pub struct SmartLookup {
     rdap_client: RdapClient,
@@ -157,6 +187,7 @@ impl SmartLookup {
 
     /// Deprecated: both protocols are now always attempted concurrently.
     /// This method is kept for API compatibility but has no effect.
+    #[deprecated(note = "This field has no effect. RDAP is always tried concurrently with WHOIS.")]
     pub fn prefer_rdap(mut self, prefer: bool) -> Self {
         self.prefer_rdap = prefer;
         self
@@ -164,6 +195,7 @@ impl SmartLookup {
 
     /// Deprecated: WHOIS data is now always attached when available.
     /// This method is kept for API compatibility but has no effect.
+    #[deprecated(note = "This field has no effect. RDAP is always tried concurrently with WHOIS.")]
     pub fn include_fallback(mut self, include: bool) -> Self {
         self.include_fallback = include;
         self
@@ -172,6 +204,7 @@ impl SmartLookup {
     /// Performs a smart lookup for a domain, trying both RDAP and WHOIS concurrently.
     /// Falls back to an availability check if both fail.
     /// Results are cached for 5 minutes to avoid redundant network calls.
+    #[instrument(skip(self), fields(domain = %domain))]
     pub async fn lookup(&self, domain: &str) -> Result<LookupResult> {
         self.lookup_with_progress(domain, None).await
     }
@@ -179,6 +212,7 @@ impl SmartLookup {
     /// Performs a lookup with an optional progress callback.
     /// The callback is called with messages describing the current phase.
     /// Results are cached for 5 minutes.
+    #[instrument(skip(self, progress), fields(domain = %domain))]
     pub async fn lookup_with_progress(
         &self,
         domain: &str,
@@ -194,8 +228,8 @@ impl SmartLookup {
 
         let result = self.lookup_concurrent(&normalized, progress).await?;
 
-        // Cache the result
-        LOOKUP_CACHE.insert(normalized, result.clone());
+        // Cache a trimmed copy to limit memory usage
+        LOOKUP_CACHE.insert(normalized, trim_for_cache(result.clone()));
 
         Ok(result)
     }
@@ -205,6 +239,7 @@ impl SmartLookup {
         LOOKUP_CACHE.clear();
     }
 
+    #[instrument(skip(self, progress), fields(domain = %domain))]
     async fn lookup_concurrent(
         &self,
         domain: &str,
@@ -448,6 +483,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_smart_lookup_builder() {
         let lookup = SmartLookup::new().prefer_rdap(false).include_fallback(true);
         assert!(!lookup.prefer_rdap);

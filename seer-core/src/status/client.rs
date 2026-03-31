@@ -14,7 +14,7 @@ use super::types::{CertificateInfo, DnsResolution, DomainExpiration, StatusRespo
 use crate::dns::{DnsResolver, RecordData, RecordType};
 use crate::error::{Result, SeerError};
 use crate::lookup::SmartLookup;
-use crate::validation::{is_private_or_reserved_ip, normalize_domain};
+use crate::validation::{describe_reserved_ip, normalize_domain};
 
 /// Default timeout for HTTP and TLS operations (10 seconds).
 /// Balances responsiveness with allowing slow servers to respond.
@@ -124,6 +124,10 @@ impl StatusClient {
     /// Redirects are followed manually with IP validation at each hop.
     /// Resolved IPs are pinned on the HTTP client via `resolve_to_addrs` to
     /// prevent DNS rebinding attacks (TOCTOU between validation and connect).
+    ///
+    /// # Security Note
+    /// Redirect targets are validated for SSRF but the HTTP response body (page title)
+    /// comes from an unauthenticated connection and should be treated as untrusted.
     async fn fetch_http_info(&self, domain: &str) -> Result<(u16, String, Option<String>)> {
         let mut url = Url::parse(&format!("https://{}", domain))
             .map_err(|e| SeerError::HttpError(format!("invalid URL: {}", e)))?;
@@ -205,6 +209,11 @@ impl StatusClient {
     }
 
     /// Fetches SSL certificate information using native-tls.
+    ///
+    /// # Security Note
+    /// This connection uses `danger_accept_invalid_certs(true)` to inspect certificates
+    /// even when invalid. Data retrieved (issuer, subject, dates) comes from an
+    /// unauthenticated TLS connection and may have been tampered with by a MITM.
     async fn fetch_certificate_info(&self, domain: &str) -> Result<CertificateInfo> {
         // SSRF protection: resolve domain and check IPs before connecting
         let addr = format!("{}:443", domain);
@@ -221,10 +230,12 @@ impl StatusClient {
         }
 
         for socket_addr in &socket_addrs {
-            if is_private_or_reserved_ip(&socket_addr.ip()) {
+            if let Some(reason) = describe_reserved_ip(&socket_addr.ip()) {
                 return Err(SeerError::CertificateError(format!(
-                    "domain resolves to private/reserved IP: {}",
-                    socket_addr.ip()
+                    "cannot connect to {}: {} — {}",
+                    domain,
+                    socket_addr.ip(),
+                    reason
                 )));
             }
         }
@@ -396,11 +407,19 @@ async fn validate_url_target(url: &Url) -> Result<Vec<SocketAddr>> {
         .ok_or_else(|| SeerError::HttpError("missing URL host".to_string()))?;
     let port = url.port_or_known_default().unwrap_or(443);
 
+    // Only allow standard HTTP/HTTPS ports to prevent port scanning via redirects
+    if port != 80 && port != 443 {
+        return Err(SeerError::HttpError(format!(
+            "non-standard port {} is not allowed in redirects",
+            port
+        )));
+    }
+
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        if is_private_or_reserved_ip(&ip) {
+        if let Some(reason) = describe_reserved_ip(&ip) {
             return Err(SeerError::HttpError(format!(
-                "URL resolves to private/reserved IP: {}",
-                ip
+                "cannot connect to {}: {} — {}",
+                host, ip, reason
             )));
         }
         return Ok(vec![SocketAddr::new(ip, port)]);
@@ -420,10 +439,12 @@ async fn validate_url_target(url: &Url) -> Result<Vec<SocketAddr>> {
     }
 
     for socket_addr in &socket_addrs {
-        if is_private_or_reserved_ip(&socket_addr.ip()) {
+        if let Some(reason) = describe_reserved_ip(&socket_addr.ip()) {
             return Err(SeerError::HttpError(format!(
-                "URL resolves to private/reserved IP: {}",
-                socket_addr.ip()
+                "cannot connect to {}: {} — {}",
+                host,
+                socket_addr.ip(),
+                reason
             )));
         }
     }

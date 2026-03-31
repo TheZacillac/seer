@@ -379,7 +379,11 @@ fn bulk_status(py: Python<'_>, domains: Vec<String>, concurrency: usize) -> PyRe
 
 #[pyfunction]
 #[pyo3(signature = (domains, concurrency = 10))]
-fn bulk_availability(py: Python<'_>, domains: Vec<String>, concurrency: usize) -> PyResult<PyObject> {
+fn bulk_availability(
+    py: Python<'_>,
+    domains: Vec<String>,
+    concurrency: usize,
+) -> PyResult<PyObject> {
     let rt = get_runtime();
     let executor = BulkExecutor::new().with_concurrency(validate_concurrency(concurrency)?);
 
@@ -515,7 +519,17 @@ fn dns_follow(
 
     // Cap parameters to prevent blocking the shared Tokio runtime for excessive durations
     let iterations = iterations.min(100);
-    let interval_minutes = interval_minutes.min(60.0).max(0.1);
+    let interval_minutes = interval_minutes.clamp(0.1, 60.0);
+
+    // Cap total wall-clock time to 1 hour to prevent blocking the shared runtime
+    let total_minutes = iterations as f64 * interval_minutes;
+    const MAX_TOTAL_MINUTES: f64 = 60.0;
+    if total_minutes > MAX_TOTAL_MINUTES {
+        return Err(PyValueError::new_err(format!(
+            "Total follow duration ({:.0} minutes) exceeds maximum of {:.0} minutes. Reduce iterations or interval.",
+            total_minutes, MAX_TOTAL_MINUTES
+        )));
+    }
 
     let config = FollowConfig {
         iterations,

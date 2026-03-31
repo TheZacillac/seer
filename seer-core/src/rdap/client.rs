@@ -3,6 +3,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use futures::StreamExt;
 use once_cell::sync::Lazy;
 use reqwest::Client;
 use serde::Deserialize;
@@ -12,7 +13,7 @@ use tracing::{debug, instrument, warn};
 use super::types::RdapResponse;
 use crate::error::{Result, SeerError};
 use crate::retry::{RetryExecutor, RetryPolicy};
-use crate::validation::normalize_domain;
+use crate::validation::{describe_reserved_ip, normalize_domain};
 
 const IANA_BOOTSTRAP_DNS: &str = "https://data.iana.org/rdap/dns.json";
 const IANA_BOOTSTRAP_IPV4: &str = "https://data.iana.org/rdap/ipv4.json";
@@ -302,6 +303,7 @@ impl RdapClient {
     ///
     /// Loads bootstrap data if not already cached. Returns `None` if the TLD
     /// has no registered RDAP server in the IANA bootstrap registry.
+    #[instrument(skip(self), fields(tld = %tld))]
     pub async fn get_rdap_base_url_for_tld(&self, tld: &str) -> Option<String> {
         if self.ensure_bootstrap().await.is_err() {
             return None;
@@ -334,8 +336,58 @@ impl RdapClient {
 /// Maximum RDAP response body size (10 MB, matching CT log response limit).
 const MAX_RDAP_RESPONSE_SIZE: usize = 10 * 1024 * 1024;
 
+/// Validates that a URL does not resolve to a reserved/private IP address (SSRF protection).
+async fn validate_url_not_reserved(url: &str) -> Result<()> {
+    let parsed = url::Url::parse(url)
+        .map_err(|e| SeerError::RdapError(format!("invalid URL '{}': {}", url, e)))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| SeerError::RdapError(format!("URL '{}' has no host", url)))?;
+
+    // If the host is already an IP literal, check it directly
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if let Some(reason) = describe_reserved_ip(&ip) {
+            return Err(SeerError::RdapError(format!(
+                "RDAP URL resolves to reserved IP {}: {} — request blocked (SSRF protection)",
+                ip, reason
+            )));
+        }
+        return Ok(());
+    }
+
+    let port = parsed.port_or_known_default().unwrap_or(443);
+    let addr = format!("{}:{}", host, port);
+
+    let socket_addrs: Vec<_> = tokio::net::lookup_host(&addr)
+        .await
+        .map_err(|e| SeerError::RdapError(format!("failed to resolve host '{}': {}", host, e)))?
+        .collect();
+
+    if socket_addrs.is_empty() {
+        return Err(SeerError::RdapError(format!(
+            "host '{}' resolved to no addresses",
+            host
+        )));
+    }
+
+    for socket_addr in &socket_addrs {
+        if let Some(reason) = describe_reserved_ip(&socket_addr.ip()) {
+            return Err(SeerError::RdapError(format!(
+                "RDAP URL resolves to reserved IP {}: {} — request blocked (SSRF protection)",
+                socket_addr.ip(),
+                reason
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 /// Internal function to query an RDAP endpoint (used by retry executor).
 async fn query_rdap_internal(http: &Client, url: &str) -> Result<RdapResponse> {
+    // SSRF protection: validate the URL does not resolve to a reserved/private IP
+    validate_url_not_reserved(url).await?;
+
     let response = http
         .get(url)
         .header("Accept", "application/rdap+json")
@@ -349,21 +401,21 @@ async fn query_rdap_internal(http: &Client, url: &str) -> Result<RdapResponse> {
         )));
     }
 
-    // Read body with size cap to prevent memory exhaustion from malicious servers
-    let bytes = tokio::time::timeout(DEFAULT_TIMEOUT, response.bytes())
-        .await
-        .map_err(|_| SeerError::Timeout("RDAP body read timed out".to_string()))?
-        .map_err(|e| SeerError::RdapError(format!("failed to read response body: {}", e)))?;
-
-    if bytes.len() > MAX_RDAP_RESPONSE_SIZE {
-        return Err(SeerError::RdapError(format!(
-            "response too large ({} bytes, max {})",
-            bytes.len(),
-            MAX_RDAP_RESPONSE_SIZE
-        )));
+    // Stream body with incremental size check to prevent memory exhaustion
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk =
+            chunk.map_err(|e| SeerError::RdapError(format!("failed to read response: {}", e)))?;
+        body.extend_from_slice(&chunk);
+        if body.len() > MAX_RDAP_RESPONSE_SIZE {
+            return Err(SeerError::RdapError(format!(
+                "RDAP response exceeds {} byte limit",
+                MAX_RDAP_RESPONSE_SIZE
+            )));
+        }
     }
-
-    let rdap: RdapResponse = serde_json::from_slice(&bytes)?;
+    let rdap: RdapResponse = serde_json::from_slice(&body)?;
     Ok(rdap)
 }
 
@@ -377,6 +429,17 @@ async fn load_bootstrap_data_with_retry(policy: &RetryPolicy) -> Result<Bootstra
 async fn load_bootstrap_data() -> Result<BootstrapData> {
     debug!("Loading RDAP bootstrap data from IANA");
 
+    // Defense-in-depth: validate IANA bootstrap URLs don't resolve to reserved IPs
+    let bootstrap_urls = [
+        IANA_BOOTSTRAP_DNS,
+        IANA_BOOTSTRAP_IPV4,
+        IANA_BOOTSTRAP_IPV6,
+        IANA_BOOTSTRAP_ASN,
+    ];
+    for url in &bootstrap_urls {
+        validate_url_not_reserved(url).await?;
+    }
+
     let http = &*RDAP_HTTP_CLIENT;
 
     let dns_future = http.get(IANA_BOOTSTRAP_DNS).send();
@@ -387,10 +450,31 @@ async fn load_bootstrap_data() -> Result<BootstrapData> {
     let (dns_resp, ipv4_resp, ipv6_resp, asn_resp) =
         tokio::try_join!(dns_future, ipv4_future, ipv6_future, asn_future)?;
 
-    let dns_data: BootstrapResponse = dns_resp.json().await?;
-    let ipv4_data: BootstrapResponse = ipv4_resp.json().await?;
-    let ipv6_data: BootstrapResponse = ipv6_resp.json().await?;
-    let asn_data: BootstrapResponse = asn_resp.json().await?;
+    // Read bootstrap responses with incremental size check to prevent memory exhaustion
+    const MAX_BOOTSTRAP_SIZE: usize = 10 * 1024 * 1024; // 10 MB
+
+    async fn read_bootstrap(resp: reqwest::Response) -> Result<BootstrapResponse> {
+        let mut body = Vec::new();
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| {
+                SeerError::RdapBootstrapError(format!("failed to read body: {}", e))
+            })?;
+            body.extend_from_slice(&chunk);
+            if body.len() > MAX_BOOTSTRAP_SIZE {
+                return Err(SeerError::RdapBootstrapError(format!(
+                    "bootstrap response too large (exceeds {} bytes)",
+                    MAX_BOOTSTRAP_SIZE
+                )));
+            }
+        }
+        serde_json::from_slice(&body).map_err(Into::into)
+    }
+
+    let dns_data = read_bootstrap(dns_resp).await?;
+    let ipv4_data = read_bootstrap(ipv4_resp).await?;
+    let ipv6_data = read_bootstrap(ipv6_resp).await?;
+    let asn_data = read_bootstrap(asn_resp).await?;
 
     let mut dns = HashMap::new();
     let mut ipv4 = Vec::new();

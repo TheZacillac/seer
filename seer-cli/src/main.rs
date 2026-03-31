@@ -9,7 +9,6 @@ use clap_complete::{generate, Shell};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::terminal;
 use seer_core::colors::CatppuccinExt;
-use tracing_subscriber::EnvFilter;
 
 const BULK_EXAMPLES: &str = r#"
 Input File Formats:
@@ -110,7 +109,9 @@ enum Commands {
         #[arg(default_value = "A")]
         record_type: String,
     },
-    /// Execute bulk operations from a file, output results to CSV
+    /// Execute bulk operations from a file, output results to CSV.
+    /// CSV output includes anti-formula protection for spreadsheets; use `--format json`
+    /// for programmatic consumption without spreadsheet escaping.
     #[command(after_long_help = BULK_EXAMPLES)]
     Bulk {
         /// Operation type: lookup, whois, rdap, dig, prop, status, avail
@@ -234,15 +235,12 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Initialize tracing with progress-aware writer
-    // This routes log output through the progress bar when one is active,
-    // preventing logs from interfering with progress bar display
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
-        )
-        .with_writer(display::ProgressWriterFactory::new())
-        .init();
+    // Initialize tracing with progress-aware writer.
+    // Routes log output through the progress bar when one is active,
+    // preventing logs from interfering with progress bar display.
+    // Respects ARCANUM_LOG_LEVEL, ARCANUM_LOG_FORMAT, ARCANUM_LOG_FILE env vars.
+    let _log_guard =
+        seer_core::logging::init_logging_with_writer("seer", display::ProgressWriterFactory::new());
 
     let cli = Cli::parse();
 
@@ -442,7 +440,18 @@ async fn execute_command(
             record_type,
             output,
         } => {
+            const MAX_BULK_FILE_SIZE: usize = 1024 * 1024; // 1 MB
+            const MAX_BULK_DOMAINS_CLI: usize = 1000;
+
             let content = std::fs::read_to_string(&file)?;
+            if content.len() > MAX_BULK_FILE_SIZE {
+                return Err(anyhow::anyhow!(
+                    "Bulk file exceeds {} byte limit ({} bytes)",
+                    MAX_BULK_FILE_SIZE,
+                    content.len()
+                ));
+            }
+
             let domains = seer_core::bulk::parse_domains_from_file(&content);
 
             if domains.is_empty() {
@@ -451,6 +460,14 @@ async fn execute_command(
                     "Error:".ctp_red()
                 );
                 std::process::exit(1);
+            }
+
+            if domains.len() > MAX_BULK_DOMAINS_CLI {
+                return Err(anyhow::anyhow!(
+                    "Bulk file contains {} domains, maximum is {}",
+                    domains.len(),
+                    MAX_BULK_DOMAINS_CLI
+                ));
             }
 
             // Determine output path

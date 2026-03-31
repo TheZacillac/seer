@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use tracing::{debug, instrument};
 
 use crate::error::Result;
 use crate::lookup::{LookupResult, SmartLookup};
@@ -63,6 +64,7 @@ impl DomainDiffer {
     /// Compares two domains, returning their registration, DNS, and SSL differences.
     ///
     /// All four network calls (lookup + status for each domain) run concurrently.
+    #[instrument(skip(self), fields(domain_a = %domain_a, domain_b = %domain_b))]
     pub async fn diff(&self, domain_a: &str, domain_b: &str) -> Result<DomainDiff> {
         let domain_a = crate::validation::normalize_domain(domain_a)?;
         let domain_b = crate::validation::normalize_domain(domain_b)?;
@@ -77,6 +79,8 @@ impl DomainDiffer {
         let registration = build_registration_diff(lookup_a.ok().as_ref(), lookup_b.ok().as_ref());
         let dns = build_dns_diff(status_a.as_ref().ok(), status_b.as_ref().ok());
         let ssl = build_ssl_diff(status_a.as_ref().ok(), status_b.as_ref().ok());
+
+        debug!("Domain diff complete");
 
         Ok(DomainDiff {
             domain_a,

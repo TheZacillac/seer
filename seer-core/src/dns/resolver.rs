@@ -101,6 +101,14 @@ impl DnsResolver {
             .parse()
             .map_err(|_| SeerError::DnsError(format!("invalid nameserver IP: {}", nameserver)))?;
 
+        // SSRF protection: reject private/reserved IPs for user-supplied nameservers
+        if let Some(reason) = crate::validation::describe_reserved_ip(&ip) {
+            return Err(SeerError::DnsError(format!(
+                "nameserver {} blocked: {}",
+                nameserver, reason
+            )));
+        }
+
         let socket_addr = SocketAddr::new(ip, 53);
         let ns_config = NameServerConfig::new(socket_addr, Protocol::Udp);
 
@@ -165,6 +173,7 @@ impl DnsResolver {
     /// * `protocol` - The protocol (e.g., "tcp", "udp")
     /// * `domain` - The domain name
     /// * `nameserver` - Optional custom nameserver IP
+    #[instrument(skip(self), fields(domain = %domain, service = %service, protocol = %protocol))]
     pub async fn resolve_srv(
         &self,
         service: &str,

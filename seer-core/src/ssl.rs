@@ -9,12 +9,12 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpStream;
 use tokio_native_tls::TlsConnector;
-use tracing::debug;
+use tracing::{debug, instrument};
 use x509_parser::oid_registry::Oid;
 use x509_parser::prelude::*;
 
 use crate::error::{Result, SeerError};
-use crate::validation::{is_private_or_reserved_ip, normalize_domain};
+use crate::validation::{describe_reserved_ip, normalize_domain};
 
 /// Default timeout for SSL operations (10 seconds).
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -85,6 +85,7 @@ impl SslChecker {
     /// # Returns
     /// * `Ok(SslReport)` - Detailed SSL certificate information
     /// * `Err(SeerError)` - If connection or certificate parsing fails
+    #[instrument(skip(self), fields(domain = %domain))]
     pub async fn check(&self, domain: &str) -> Result<SslReport> {
         let domain = normalize_domain(domain)?;
         let addr = format!("{}:443", domain);
@@ -105,10 +106,12 @@ impl SslChecker {
         }
 
         for socket_addr in &socket_addrs {
-            if is_private_or_reserved_ip(&socket_addr.ip()) {
+            if let Some(reason) = describe_reserved_ip(&socket_addr.ip()) {
                 return Err(SeerError::SslError(format!(
-                    "domain resolves to private/reserved IP: {}",
-                    socket_addr.ip()
+                    "cannot connect to {}: {} — {}",
+                    domain,
+                    socket_addr.ip(),
+                    reason
                 )));
             }
         }
@@ -121,10 +124,13 @@ impl SslChecker {
         let connector = TlsConnector::from(connector);
 
         // TCP connect with timeout — connect to pre-resolved address to prevent DNS rebinding
-        let stream = tokio::time::timeout(DEFAULT_TIMEOUT, TcpStream::connect(socket_addrs[0]))
-            .await
-            .map_err(|_| SeerError::Timeout("SSL connection timed out".to_string()))?
-            .map_err(|e| SeerError::SslError(format!("Failed to connect to {}: {}", addr, e)))?;
+        let stream =
+            tokio::time::timeout(DEFAULT_TIMEOUT, TcpStream::connect(socket_addrs.as_slice()))
+                .await
+                .map_err(|_| SeerError::Timeout("SSL connection timed out".to_string()))?
+                .map_err(|e| {
+                    SeerError::SslError(format!("Failed to connect to {}: {}", addr, e))
+                })?;
 
         // TLS handshake with timeout
         let tls_stream = tokio::time::timeout(DEFAULT_TIMEOUT, connector.connect(&domain, stream))

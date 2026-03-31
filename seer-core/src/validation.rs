@@ -233,6 +233,75 @@ fn is_private_or_reserved_ipv6(ip: &Ipv6Addr) -> bool {
     false
 }
 
+/// Returns a human-readable reason why an IP is blocked, or `None` if it is
+/// safe.  Intended for error messages — callers should still use
+/// [`is_private_or_reserved_ip`] for the fast boolean check.
+pub fn describe_reserved_ip(ip: &IpAddr) -> Option<&'static str> {
+    match ip {
+        IpAddr::V4(v4) => {
+            if v4.is_unspecified() {
+                return Some("unspecified address (0.0.0.0) — domain has no routable IP");
+            }
+            if v4.is_loopback() {
+                return Some("loopback address (127.0.0.0/8)");
+            }
+            if v4.is_private() {
+                return Some("private network (RFC 1918)");
+            }
+            if v4.is_link_local() {
+                return Some("link-local address (169.254.0.0/16)");
+            }
+            let o = v4.octets();
+            if o[0] == 169 && o[1] == 254 && o[2] == 169 && o[3] == 254 {
+                return Some("cloud metadata endpoint (169.254.169.254)");
+            }
+            if o[0] == 169 && o[1] == 254 {
+                return Some("link-local address (169.254.0.0/16)");
+            }
+            if (o[0] == 192 && o[1] == 0 && o[2] == 2)
+                || (o[0] == 198 && o[1] == 51 && o[2] == 100)
+                || (o[0] == 203 && o[1] == 0 && o[2] == 113)
+            {
+                return Some("documentation/test range (RFC 5737)");
+            }
+            if v4.is_broadcast() {
+                return Some("broadcast address (255.255.255.255)");
+            }
+            if o[0] >= 224 && o[0] <= 239 {
+                return Some("multicast address (224.0.0.0/4)");
+            }
+            if o[0] >= 240 {
+                return Some("reserved address (240.0.0.0/4)");
+            }
+            None
+        }
+        IpAddr::V6(v6) => {
+            if v6.is_loopback() {
+                return Some("IPv6 loopback (::1)");
+            }
+            if v6.is_unspecified() {
+                return Some("IPv6 unspecified address (::) — domain has no routable IP");
+            }
+            let seg = v6.segments();
+            if (seg[0] & 0xfe00) == 0xfc00 {
+                return Some("IPv6 unique local address (fc00::/7)");
+            }
+            if (seg[0] & 0xffc0) == 0xfe80 {
+                return Some("IPv6 link-local address (fe80::/10)");
+            }
+            if seg[0] >> 8 == 0xff {
+                return Some("IPv6 multicast (ff00::/8)");
+            }
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                if is_private_or_reserved_ipv4(&v4) {
+                    return Some("IPv4-mapped IPv6 address in private/reserved range");
+                }
+            }
+            None
+        }
+    }
+}
+
 /// Validates that a domain is safe to query (SSRF protection).
 ///
 /// This function:
@@ -254,10 +323,10 @@ pub async fn validate_domain_safe(domain: &str) -> Result<String> {
     // Check all resolved IPs
     for socket_addr in socket_addrs {
         let ip = socket_addr.ip();
-        if is_private_or_reserved_ip(&ip) {
+        if let Some(reason) = describe_reserved_ip(&ip) {
             return Err(SeerError::InvalidDomain(format!(
-                "domain '{}' resolves to private or reserved IP: {} (blocked for security)",
-                normalized, ip
+                "cannot connect to '{}': {} — {}",
+                normalized, ip, reason
             )));
         }
     }
