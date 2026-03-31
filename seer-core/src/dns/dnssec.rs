@@ -470,4 +470,157 @@ mod tests {
         assert!(json.contains("\"digest_verified\":true"));
         assert!(json.contains("\"key_tag\":12345"));
     }
+
+    #[test]
+    fn test_chain_valid_all_verified() {
+        let report = DnssecReport {
+            domain: "example.com".to_string(),
+            enabled: true,
+            has_ds_records: true,
+            has_dnskey_records: true,
+            ds_records: vec![
+                DsInfo {
+                    key_tag: 12345,
+                    algorithm: 13,
+                    digest_type: 2,
+                    digest: "ABCDEF".to_string(),
+                    algorithm_name: "ECDSA P-256/SHA-256".to_string(),
+                    digest_type_name: "SHA-256".to_string(),
+                    matched_key: true,
+                    digest_verified: true,
+                },
+                DsInfo {
+                    key_tag: 12345,
+                    algorithm: 13,
+                    digest_type: 4,
+                    digest: "FEDCBA".to_string(),
+                    algorithm_name: "ECDSA P-256/SHA-256".to_string(),
+                    digest_type_name: "SHA-384".to_string(),
+                    matched_key: true,
+                    digest_verified: true,
+                },
+            ],
+            dnskey_records: vec![DnskeyInfo {
+                flags: 257,
+                protocol: 3,
+                algorithm: 13,
+                key_tag: 12345,
+                is_ksk: true,
+                is_zsk: false,
+                algorithm_name: "ECDSA P-256/SHA-256".to_string(),
+            }],
+            issues: vec![],
+            status: "secure".to_string(),
+            chain_valid: true,
+        };
+        assert!(report.chain_valid);
+        assert_eq!(report.status, "secure");
+    }
+
+    #[test]
+    fn test_chain_valid_ds_unmatched() {
+        let report = DnssecReport {
+            domain: "broken.com".to_string(),
+            enabled: true,
+            has_ds_records: true,
+            has_dnskey_records: true,
+            ds_records: vec![DsInfo {
+                key_tag: 65000,
+                algorithm: 13,
+                digest_type: 2,
+                digest: "ABCDEF".to_string(),
+                algorithm_name: "ECDSA P-256/SHA-256".to_string(),
+                digest_type_name: "SHA-256".to_string(),
+                matched_key: false,
+                digest_verified: false,
+            }],
+            dnskey_records: vec![DnskeyInfo {
+                flags: 257,
+                protocol: 3,
+                algorithm: 13,
+                key_tag: 12345,
+                is_ksk: true,
+                is_zsk: false,
+                algorithm_name: "ECDSA P-256/SHA-256".to_string(),
+            }],
+            issues: vec!["DS record (key_tag=65000) has no matching DNSKEY".to_string()],
+            status: "misconfigured".to_string(),
+            chain_valid: false,
+        };
+        assert!(!report.chain_valid);
+        assert_eq!(report.status, "misconfigured");
+    }
+
+    #[test]
+    fn test_chain_valid_digest_mismatch() {
+        let report = DnssecReport {
+            domain: "mismatch.com".to_string(),
+            enabled: true,
+            has_ds_records: true,
+            has_dnskey_records: true,
+            ds_records: vec![DsInfo {
+                key_tag: 12345,
+                algorithm: 13,
+                digest_type: 2,
+                digest: "WRONG".to_string(),
+                algorithm_name: "ECDSA P-256/SHA-256".to_string(),
+                digest_type_name: "SHA-256".to_string(),
+                matched_key: true,
+                digest_verified: false,
+            }],
+            dnskey_records: vec![DnskeyInfo {
+                flags: 257,
+                protocol: 3,
+                algorithm: 13,
+                key_tag: 12345,
+                is_ksk: true,
+                is_zsk: false,
+                algorithm_name: "ECDSA P-256/SHA-256".to_string(),
+            }],
+            issues: vec![],
+            status: "misconfigured".to_string(),
+            chain_valid: false,
+        };
+        assert!(!report.chain_valid);
+        assert!(report.ds_records[0].matched_key);
+        assert!(!report.ds_records[0].digest_verified);
+    }
+
+    #[tokio::test]
+    async fn test_live_dnssec_check_cloudflare() {
+        let checker = DnssecChecker::new();
+        let report = checker.check("cloudflare.com").await.unwrap();
+
+        // cloudflare.com has DNSSEC enabled
+        assert!(report.enabled, "cloudflare.com should have DNSSEC enabled");
+        assert!(report.has_ds_records, "should have DS records");
+        assert!(report.has_dnskey_records, "should have DNSKEY records");
+        assert!(report.chain_valid, "cloudflare.com chain should be valid");
+        assert_eq!(report.status, "secure");
+
+        // All DS records should be verified
+        for ds in &report.ds_records {
+            assert!(ds.matched_key, "DS key_tag={} should match", ds.key_tag);
+            assert!(
+                ds.digest_verified,
+                "DS key_tag={} digest should verify",
+                ds.key_tag
+            );
+        }
+
+        // Should have computed key tags on DNSKEYs
+        for key in &report.dnskey_records {
+            assert!(key.key_tag > 0, "key_tag should be computed");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_live_dnssec_check_insecure() {
+        let checker = DnssecChecker::new();
+        // wikipedia.org does not have DNSSEC (no DS or DNSKEY records)
+        let report = checker.check("wikipedia.org").await.unwrap();
+
+        assert!(!report.chain_valid);
+        assert_eq!(report.status, "insecure");
+    }
 }
