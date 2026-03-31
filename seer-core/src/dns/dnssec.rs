@@ -3,6 +3,13 @@
 //! Checks the DNSSEC chain for a domain by querying DS and DNSKEY records
 //! and reporting on the validation status.
 
+use std::collections::HashMap;
+
+use hickory_resolver::config::{ResolverConfig, ResolverOpts};
+use hickory_resolver::proto::rr::dnssec::rdata::{DNSSECRData, DNSKEY};
+use hickory_resolver::proto::rr::dnssec::DigestType;
+use hickory_resolver::proto::rr::{Name, RData, RecordType as HickoryRecordType};
+use hickory_resolver::TokioAsyncResolver;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, instrument};
 
@@ -65,6 +72,7 @@ pub struct DnskeyInfo {
 /// Checks DNSSEC configuration for a domain.
 pub struct DnssecChecker {
     resolver: DnsResolver,
+    raw_resolver: TokioAsyncResolver,
 }
 
 impl Default for DnssecChecker {
@@ -75,9 +83,43 @@ impl Default for DnssecChecker {
 
 impl DnssecChecker {
     pub fn new() -> Self {
+        let mut opts = ResolverOpts::default();
+        opts.timeout = std::time::Duration::from_secs(5);
+        opts.attempts = 2;
+        opts.use_hosts_file = false;
+
         Self {
             resolver: DnsResolver::new(),
+            raw_resolver: TokioAsyncResolver::tokio(ResolverConfig::google(), opts),
         }
+    }
+
+    /// Resolves raw hickory DNSKEY records for crypto operations.
+    /// Returns a vec of (DNSKEY, computed_key_tag) pairs.
+    async fn resolve_raw_dnskeys(&self, domain: &str) -> Vec<(DNSKEY, u16)> {
+        let lookup = match self.raw_resolver.lookup(domain, HickoryRecordType::DNSKEY).await {
+            Ok(lookup) => lookup,
+            Err(_) => return vec![],
+        };
+
+        lookup
+            .record_iter()
+            .filter_map(|record| {
+                if let Some(RData::DNSSEC(DNSSECRData::DNSKEY(dnskey))) = record.data() {
+                    match dnskey.calculate_key_tag() {
+                        Ok(tag) => Some((dnskey.clone(), tag)),
+                        Err(_) => None,
+                    }
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Converts a DS digest type number to hickory's DigestType.
+    fn to_hickory_digest_type(digest_type: u8) -> Option<DigestType> {
+        DigestType::from_u8(digest_type).ok()
     }
 
     /// Generate a DNSSEC validation report for a domain.
@@ -114,32 +156,41 @@ impl DnssecChecker {
         let has_ds = !ds_records.is_empty();
         let has_dnskey = !dnskey_records.is_empty();
 
-        // Parse DS record info
-        let ds_info: Vec<DsInfo> = ds_records
+        // Resolve raw hickory DNSKEYs for crypto operations
+        let raw_dnskeys = self.resolve_raw_dnskeys(&domain).await;
+
+        // Build lookup map: (key_tag, algorithm) -> raw DNSKEY
+        let dnskey_map: HashMap<(u16, u8), &DNSKEY> = raw_dnskeys
+            .iter()
+            .map(|(dnskey, tag)| ((*tag, u8::from(dnskey.algorithm())), dnskey))
+            .collect();
+
+        // Build set of DS key_tags for KSK orphan detection
+        let ds_key_tags: std::collections::HashSet<u16> = ds_records
             .iter()
             .filter_map(|r| {
-                if let RecordData::DS {
-                    key_tag,
-                    algorithm,
-                    digest_type,
-                    ref digest,
-                } = r.data
-                {
-                    Some(DsInfo {
-                        key_tag,
-                        algorithm,
-                        digest_type,
-                        digest: digest.clone(),
-                        algorithm_name: algorithm_name(algorithm),
-                        digest_type_name: digest_type_name(digest_type),
-                    })
+                if let RecordData::DS { key_tag, .. } = r.data {
+                    Some(key_tag)
                 } else {
                     None
                 }
             })
             .collect();
 
-        // Parse DNSKEY record info
+        // Build a map from (flags, algorithm) -> vec of computed key_tags
+        // to reliably match our RecordData DNSKEYs to the raw hickory ones.
+        let key_tag_by_algo_flags: HashMap<(u16, u8), Vec<u16>> = {
+            let mut map: HashMap<(u16, u8), Vec<u16>> = HashMap::new();
+            for (dnskey, tag) in &raw_dnskeys {
+                map.entry((dnskey.flags(), u8::from(dnskey.algorithm())))
+                    .or_default()
+                    .push(*tag);
+            }
+            map
+        };
+
+        // Parse DNSKEY record info with computed key tags
+        let mut dnskey_tag_indices: HashMap<(u16, u8), usize> = HashMap::new();
         let dnskey_info: Vec<DnskeyInfo> = dnskey_records
             .iter()
             .filter_map(|r| {
@@ -147,27 +198,30 @@ impl DnssecChecker {
                     flags,
                     protocol,
                     algorithm,
-                    ref public_key,
+                    ..
                 } = r.data
                 {
-                    let is_sep = flags & 0x0001 != 0; // SEP flag (bit 15)
-                    let is_zone = flags & 0x0100 != 0; // Zone flag (bit 7)
+                    let is_sep = flags & 0x0001 != 0;
+                    let is_zone = flags & 0x0100 != 0;
                     let is_ksk = is_sep && is_zone;
                     let is_zsk = is_zone && !is_sep;
-                    let key_tag_hint = if public_key.len() > 12 {
-                        format!(
-                            "{}...{}",
-                            &public_key[..8],
-                            &public_key[public_key.len() - 4..]
-                        )
-                    } else {
-                        public_key.clone()
-                    };
+
+                    // Find the computed key tag for this DNSKEY
+                    let idx = dnskey_tag_indices
+                        .entry((flags, algorithm))
+                        .or_insert(0);
+                    let key_tag = key_tag_by_algo_flags
+                        .get(&(flags, algorithm))
+                        .and_then(|tags| tags.get(*idx))
+                        .copied()
+                        .unwrap_or(0);
+                    *idx += 1;
+
                     Some(DnskeyInfo {
                         flags,
                         protocol,
                         algorithm,
-                        key_tag_hint,
+                        key_tag,
                         is_ksk,
                         is_zsk,
                         algorithm_name: algorithm_name(algorithm),
@@ -178,17 +232,87 @@ impl DnssecChecker {
             })
             .collect();
 
-        // Validate
-        if has_ds && !has_dnskey {
-            issues.push(
-                "DS records exist but no DNSKEY records found - DNSSEC may be broken".to_string(),
-            );
-        }
-        if !has_ds && has_dnskey {
-            issues.push(
-                "DNSKEY records exist but no DS records at parent - DNSSEC chain incomplete"
-                    .to_string(),
-            );
+        // Build Name for digest computation
+        let domain_name = Name::from_ascii(&domain)
+            .unwrap_or_else(|_| Name::from_ascii("invalid.").unwrap());
+
+        // Parse DS record info with cross-validation
+        let ds_info: Vec<DsInfo> = ds_records
+            .iter()
+            .map(|r| {
+                if let RecordData::DS {
+                    key_tag,
+                    algorithm,
+                    digest_type,
+                    ref digest,
+                } = r.data
+                {
+                    let mut matched_key = false;
+                    let mut digest_verified = false;
+
+                    // Try to match this DS to a DNSKEY
+                    if let Some(raw_dnskey) = dnskey_map.get(&(key_tag, algorithm)) {
+                        matched_key = true;
+
+                        // Verify digest
+                        if let Some(hickory_dt) = Self::to_hickory_digest_type(digest_type) {
+                            if let Ok(computed) = raw_dnskey.to_digest(&domain_name, hickory_dt) {
+                                let computed_hex: String = computed
+                                    .as_ref()
+                                    .iter()
+                                    .map(|b| format!("{:02X}", b))
+                                    .collect();
+                                digest_verified = computed_hex.eq_ignore_ascii_case(digest);
+                            }
+                        }
+
+                        if !digest_verified {
+                            issues.push(format!(
+                                "DS record (key_tag={}) digest mismatch \u{2014} registry and DNS keys do not match",
+                                key_tag
+                            ));
+                        }
+                    } else if has_dnskey {
+                        issues.push(format!(
+                            "DS record (key_tag={}) has no matching DNSKEY",
+                            key_tag
+                        ));
+                    }
+
+                    DsInfo {
+                        key_tag,
+                        algorithm,
+                        digest_type,
+                        digest: digest.clone(),
+                        algorithm_name: algorithm_name(algorithm),
+                        digest_type_name: digest_type_name(digest_type),
+                        matched_key,
+                        digest_verified,
+                    }
+                } else {
+                    // Should not happen — we only have DS records here
+                    DsInfo {
+                        key_tag: 0,
+                        algorithm: 0,
+                        digest_type: 0,
+                        digest: String::new(),
+                        algorithm_name: String::new(),
+                        digest_type_name: String::new(),
+                        matched_key: false,
+                        digest_verified: false,
+                    }
+                }
+            })
+            .collect();
+
+        // Check for KSK orphans (DNSKEY KSKs with no corresponding DS)
+        for key in &dnskey_info {
+            if key.is_ksk && !ds_key_tags.contains(&key.key_tag) {
+                issues.push(format!(
+                    "DNSKEY (key_tag={}) is a KSK with no corresponding DS record",
+                    key.key_tag
+                ));
+            }
         }
 
         // Check for deprecated algorithms in DS records
@@ -218,16 +342,38 @@ impl DnssecChecker {
             }
         }
 
+        // Derive chain_valid
+        let chain_valid = has_ds
+            && has_dnskey
+            && !ds_info.is_empty()
+            && ds_info.iter().all(|ds| ds.matched_key && ds.digest_verified);
+
+        // Derive status from chain validity (not from issues list)
         let enabled = has_ds || has_dnskey;
-        let status = if has_ds && has_dnskey && issues.is_empty() {
-            "secure".to_string()
-        } else if has_ds && has_dnskey {
-            "partial".to_string()
+        let status = if has_ds && has_dnskey {
+            if chain_valid {
+                "secure".to_string()
+            } else {
+                "misconfigured".to_string()
+            }
         } else if !has_ds && !has_dnskey {
             "insecure".to_string()
         } else {
             "partial".to_string()
         };
+
+        // Also flag the old structural issues
+        if has_ds && !has_dnskey {
+            issues.push(
+                "DS records exist but no DNSKEY records found - DNSSEC may be broken".to_string(),
+            );
+        }
+        if !has_ds && has_dnskey {
+            issues.push(
+                "DNSKEY records exist but no DS records at parent - DNSSEC chain incomplete"
+                    .to_string(),
+            );
+        }
 
         Ok(DnssecReport {
             domain,
@@ -238,6 +384,7 @@ impl DnssecChecker {
             dnskey_records: dnskey_info,
             issues,
             status,
+            chain_valid,
         })
     }
 }
