@@ -162,11 +162,17 @@ impl DnssecChecker {
         // Resolve raw hickory DNSKEYs for crypto operations
         let raw_dnskeys = self.resolve_raw_dnskeys(&domain).await;
 
-        // Build lookup map: (key_tag, algorithm) -> raw DNSKEY
-        let dnskey_map: HashMap<(u16, u8), &DNSKEY> = raw_dnskeys
-            .iter()
-            .map(|(dnskey, tag)| ((*tag, u8::from(dnskey.algorithm())), dnskey))
-            .collect();
+        // Build lookup map: (key_tag, algorithm) -> vec of raw DNSKEYs
+        // Multiple DNSKEYs can share the same key tag (RFC 4034 Section 5.1).
+        let dnskey_map: HashMap<(u16, u8), Vec<&DNSKEY>> = {
+            let mut map: HashMap<(u16, u8), Vec<&DNSKEY>> = HashMap::new();
+            for (dnskey, tag) in &raw_dnskeys {
+                map.entry((*tag, u8::from(dnskey.algorithm())))
+                    .or_default()
+                    .push(dnskey);
+            }
+            map
+        };
 
         // Build set of DS key_tags for KSK orphan detection
         let ds_key_tags: std::collections::HashSet<u16> = ds_records
@@ -252,19 +258,27 @@ impl DnssecChecker {
                     let mut matched_key = false;
                     let mut digest_verified = false;
 
-                    // Try to match this DS to a DNSKEY
-                    if let Some(raw_dnskey) = dnskey_map.get(&(key_tag, algorithm)) {
+                    // Try to match this DS to a DNSKEY (multiple candidates possible
+                    // due to key tag collisions per RFC 4034 Section 5.1)
+                    if let Some(candidates) = dnskey_map.get(&(key_tag, algorithm)) {
                         matched_key = true;
 
-                        // Verify digest
+                        // Try each candidate DNSKEY until one verifies
                         if let Some(hickory_dt) = Self::to_hickory_digest_type(digest_type) {
-                            if let Ok(computed) = raw_dnskey.to_digest(&domain_name, hickory_dt) {
-                                let computed_hex: String = computed
-                                    .as_ref()
-                                    .iter()
-                                    .map(|b| format!("{:02X}", b))
-                                    .collect();
-                                digest_verified = computed_hex.eq_ignore_ascii_case(digest);
+                            for candidate in candidates {
+                                if let Ok(computed) =
+                                    candidate.to_digest(&domain_name, hickory_dt)
+                                {
+                                    let computed_hex: String = computed
+                                        .as_ref()
+                                        .iter()
+                                        .map(|b| format!("{:02X}", b))
+                                        .collect();
+                                    if computed_hex.eq_ignore_ascii_case(digest) {
+                                        digest_verified = true;
+                                        break;
+                                    }
+                                }
                             }
                         }
 
