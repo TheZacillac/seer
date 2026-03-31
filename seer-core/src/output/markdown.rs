@@ -998,6 +998,10 @@ impl OutputFormatter for MarkdownFormatter {
         output.push(String::new());
 
         output.push(format!("- **Status**: `{}`", report.status));
+        output.push(format!(
+            "- **Chain Valid**: {}",
+            if report.chain_valid { "yes" } else { "no" }
+        ));
         output.push(format!("- **Enabled**: {}", report.enabled));
         output.push(format!("- **DS Records**: {}", report.ds_records.len()));
         output.push(format!(
@@ -1009,16 +1013,20 @@ impl OutputFormatter for MarkdownFormatter {
             output.push(String::new());
             output.push("### DS Records".to_string());
             output.push(String::new());
-            output.push("| Key Tag | Algorithm | Digest Type |".to_string());
-            output.push("| --- | --- | --- |".to_string());
+            output.push(
+                "| Key Tag | Algorithm | Digest Type | Matched | Verified |".to_string(),
+            );
+            output.push("| --- | --- | --- | --- | --- |".to_string());
             for ds in &report.ds_records {
                 output.push(format!(
-                    "| {} | {} ({}) | {} ({}) |",
+                    "| {} | {} ({}) | {} ({}) | {} | {} |",
                     ds.key_tag,
                     ds.algorithm,
                     ds.algorithm_name,
                     ds.digest_type,
-                    ds.digest_type_name
+                    ds.digest_type_name,
+                    if ds.matched_key { "yes" } else { "no" },
+                    if ds.digest_verified { "yes" } else { "no" },
                 ));
             }
         }
@@ -1027,8 +1035,8 @@ impl OutputFormatter for MarkdownFormatter {
             output.push(String::new());
             output.push("### DNSKEY Records".to_string());
             output.push(String::new());
-            output.push("| Flags | Role | Algorithm |".to_string());
-            output.push("| --- | --- | --- |".to_string());
+            output.push("| Key Tag | Flags | Role | Algorithm |".to_string());
+            output.push("| --- | --- | --- | --- |".to_string());
             for key in &report.dnskey_records {
                 let role = if key.is_ksk {
                     "KSK"
@@ -1038,8 +1046,8 @@ impl OutputFormatter for MarkdownFormatter {
                     "Other"
                 };
                 output.push(format!(
-                    "| {} | {} | {} ({}) |",
-                    key.flags, role, key.algorithm, key.algorithm_name
+                    "| {} | {} | {} | {} ({}) |",
+                    key.key_tag, key.flags, role, key.algorithm, key.algorithm_name
                 ));
             }
         }
