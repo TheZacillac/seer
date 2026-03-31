@@ -97,9 +97,12 @@ impl DnssecChecker {
     /// Resolves raw hickory DNSKEY records for crypto operations.
     /// Returns a vec of (DNSKEY, computed_key_tag) pairs.
     async fn resolve_raw_dnskeys(&self, domain: &str) -> Vec<(DNSKEY, u16)> {
-        let lookup = match self.raw_resolver.lookup(domain, HickoryRecordType::DNSKEY).await {
-            Ok(lookup) => lookup,
-            Err(_) => return vec![],
+        let Ok(lookup) = self
+            .raw_resolver
+            .lookup(domain, HickoryRecordType::DNSKEY)
+            .await
+        else {
+            return vec![];
         };
 
         lookup
@@ -207,9 +210,7 @@ impl DnssecChecker {
                     let is_zsk = is_zone && !is_sep;
 
                     // Find the computed key tag for this DNSKEY
-                    let idx = dnskey_tag_indices
-                        .entry((flags, algorithm))
-                        .or_insert(0);
+                    let idx = dnskey_tag_indices.entry((flags, algorithm)).or_insert(0);
                     let key_tag = key_tag_by_algo_flags
                         .get(&(flags, algorithm))
                         .and_then(|tags| tags.get(*idx))
@@ -233,8 +234,9 @@ impl DnssecChecker {
             .collect();
 
         // Build Name for digest computation
-        let domain_name = Name::from_ascii(&domain)
-            .unwrap_or_else(|_| Name::from_ascii("invalid.").unwrap());
+        let domain_name = Name::from_ascii(&domain).unwrap_or_else(|_| {
+            Name::from_ascii("invalid.").expect("hardcoded fallback name is valid")
+        });
 
         // Parse DS record info with cross-validation
         let ds_info: Vec<DsInfo> = ds_records
@@ -346,7 +348,9 @@ impl DnssecChecker {
         let chain_valid = has_ds
             && has_dnskey
             && !ds_info.is_empty()
-            && ds_info.iter().all(|ds| ds.matched_key && ds.digest_verified);
+            && ds_info
+                .iter()
+                .all(|ds| ds.matched_key && ds.digest_verified);
 
         // Derive status from chain validity (not from issues list)
         let enabled = has_ds || has_dnskey;

@@ -1763,7 +1763,11 @@ impl OutputFormatter for HumanFormatter {
         } else {
             self.warning("n/a")
         };
-        output.push(format!("  {}: {}", self.label("Chain Valid"), chain_colored));
+        output.push(format!(
+            "  {}: {}",
+            self.label("Chain Valid"),
+            chain_colored
+        ));
         output.push(format!(
             "  {}: {}",
             self.label("Enabled"),

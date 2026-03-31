@@ -1013,9 +1013,7 @@ impl OutputFormatter for MarkdownFormatter {
             output.push(String::new());
             output.push("### DS Records".to_string());
             output.push(String::new());
-            output.push(
-                "| Key Tag | Algorithm | Digest Type | Matched | Verified |".to_string(),
-            );
+            output.push("| Key Tag | Algorithm | Digest Type | Matched | Verified |".to_string());
             output.push("| --- | --- | --- | --- | --- |".to_string());
             for ds in &report.ds_records {
                 output.push(format!(
