@@ -4,7 +4,7 @@
 //! and reporting on the validation status.
 
 use serde::{Deserialize, Serialize};
-use tracing::debug;
+use tracing::{debug, instrument};
 
 use super::records::{RecordData, RecordType};
 use super::resolver::DnsResolver;
@@ -27,8 +27,11 @@ pub struct DnssecReport {
     pub dnskey_records: Vec<DnskeyInfo>,
     /// Validation issues found.
     pub issues: Vec<String>,
-    /// Overall status: "secure", "insecure", "partial", or "error".
+    /// Overall status: "secure", "insecure", "partial", or "misconfigured".
     pub status: String,
+    /// Whether the full DS-to-DNSKEY chain validates.
+    /// True only when every DS record matches a DNSKEY and all digests verify.
+    pub chain_valid: bool,
 }
 
 /// Summary of a DS record.
@@ -40,6 +43,10 @@ pub struct DsInfo {
     pub digest: String,
     pub algorithm_name: String,
     pub digest_type_name: String,
+    /// Whether this DS record's key_tag+algorithm matched a DNSKEY.
+    pub matched_key: bool,
+    /// Whether the computed digest from the matched DNSKEY equals this DS digest.
+    pub digest_verified: bool,
 }
 
 /// Summary of a DNSKEY record.
@@ -48,7 +55,8 @@ pub struct DnskeyInfo {
     pub flags: u16,
     pub protocol: u8,
     pub algorithm: u8,
-    pub key_tag_hint: String,
+    /// The RFC 4034 computed key tag.
+    pub key_tag: u16,
     pub is_ksk: bool,
     pub is_zsk: bool,
     pub algorithm_name: String,
@@ -73,6 +81,7 @@ impl DnssecChecker {
     }
 
     /// Generate a DNSSEC validation report for a domain.
+    #[instrument(skip(self), fields(domain = %domain))]
     pub async fn check(&self, domain: &str) -> Result<DnssecReport> {
         let domain = crate::validation::normalize_domain(domain)?;
         debug!(domain = %domain, "Checking DNSSEC");
@@ -284,12 +293,34 @@ mod tests {
             enabled: true,
             has_ds_records: true,
             has_dnskey_records: true,
-            ds_records: vec![],
-            dnskey_records: vec![],
+            ds_records: vec![DsInfo {
+                key_tag: 12345,
+                algorithm: 13,
+                digest_type: 2,
+                digest: "ABCDEF".to_string(),
+                algorithm_name: "ECDSA P-256/SHA-256".to_string(),
+                digest_type_name: "SHA-256".to_string(),
+                matched_key: true,
+                digest_verified: true,
+            }],
+            dnskey_records: vec![DnskeyInfo {
+                flags: 257,
+                protocol: 3,
+                algorithm: 13,
+                key_tag: 12345,
+                is_ksk: true,
+                is_zsk: false,
+                algorithm_name: "ECDSA P-256/SHA-256".to_string(),
+            }],
             issues: vec![],
             status: "secure".to_string(),
+            chain_valid: true,
         };
         let json = serde_json::to_string(&report).unwrap();
         assert!(json.contains("\"enabled\":true"));
+        assert!(json.contains("\"chain_valid\":true"));
+        assert!(json.contains("\"matched_key\":true"));
+        assert!(json.contains("\"digest_verified\":true"));
+        assert!(json.contains("\"key_tag\":12345"));
     }
 }
