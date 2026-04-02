@@ -305,6 +305,43 @@ async def list_tools() -> list[Tool]:
                 "required": ["domains"],
             },
         ),
+        Tool(
+            name="seer_info",
+            description="Get comprehensive domain registration info with all available fields merged from RDAP and WHOIS. Returns a flat structure with every field as a top-level key.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "domain": {
+                        "type": "string",
+                        "description": "Domain name to look up (e.g., 'example.com')",
+                    },
+                },
+                "required": ["domain"],
+            },
+        ),
+        Tool(
+            name="seer_bulk_info",
+            description="Get comprehensive domain registration info for multiple domains. Merges RDAP and WHOIS data into flat, column-per-field results for each domain.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "domains": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of domain names to look up",
+                        "maxItems": MAX_BULK_DOMAINS,
+                    },
+                    "concurrency": {
+                        "type": "integer",
+                        "description": f"Number of concurrent requests (default: 10, max: {MAX_CONCURRENCY})",
+                        "default": 10,
+                        "minimum": 1,
+                        "maximum": MAX_CONCURRENCY,
+                    },
+                },
+                "required": ["domains"],
+            },
+        ),
     ]
 
 
@@ -412,6 +449,17 @@ async def execute_tool(name: str, arguments: dict[str, Any]) -> Any:
             concurrency = _get_concurrency(arguments, default=5)
             return await loop.run_in_executor(
                 None, seer.bulk_propagation, domains, record_type, concurrency
+            )
+
+        case "seer_info":
+            domain = _require_str(arguments, "domain")
+            return await loop.run_in_executor(None, seer.info, domain)
+
+        case "seer_bulk_info":
+            domains = _require_domains(arguments)
+            concurrency = _get_concurrency(arguments, default=10)
+            return await loop.run_in_executor(
+                None, seer.bulk_info, domains, concurrency
             )
 
         case _:
