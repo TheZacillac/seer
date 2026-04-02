@@ -9,6 +9,7 @@ const COMMANDS: &[&str] = &[
     "exit",
     "quit",
     "lookup",
+    "info",
     "whois",
     "rdap",
     "dig",
@@ -36,7 +37,9 @@ const RECORD_TYPES: &[&str] = &[
     "A", "AAAA", "CNAME", "MX", "NS", "TXT", "SOA", "PTR", "SRV", "CAA", "DNSKEY", "DS", "ANY",
 ];
 
-const BULK_OPERATIONS: &[&str] = &["lookup", "whois", "rdap", "dig", "prop", "status", "avail"];
+const BULK_OPERATIONS: &[&str] = &[
+    "lookup", "whois", "rdap", "dig", "prop", "status", "avail", "info",
+];
 
 const SET_OPTIONS: &[&str] = &["output"];
 
@@ -181,6 +184,7 @@ impl Hinter for SeerCompleter {
         // Provide usage hints for commands
         match words[0].to_lowercase().as_str() {
             "lookup" if words.len() == 1 && line.ends_with(' ') => Some(" <domain>".to_string()),
+            "info" if words.len() == 1 && line.ends_with(' ') => Some(" <domain>".to_string()),
             "whois" if words.len() == 1 && line.ends_with(' ') => Some(" <domain>".to_string()),
             "rdap" if words.len() == 1 && line.ends_with(' ') => {
                 Some(" <domain|ip|asn>".to_string())

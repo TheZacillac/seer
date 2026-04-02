@@ -1150,7 +1150,9 @@ impl OutputFormatter for HumanFormatter {
                     }
                 }
             }
-            LookupResult::Whois { data, rdap_error } => {
+            LookupResult::Whois {
+                data, rdap_error, ..
+            } => {
                 let source_note = if rdap_error.is_some() {
                     "WHOIS (RDAP unavailable)"
                 } else {
@@ -2300,6 +2302,225 @@ impl OutputFormatter for HumanFormatter {
                         self.warning(&sanitize_display(issue))
                     ));
                 }
+            }
+        }
+
+        output.join("\n")
+    }
+
+    fn format_domain_info(&self, info: &crate::domain_info::DomainInfo) -> String {
+        let mut output = Vec::new();
+
+        let source_str = match info.source {
+            crate::domain_info::DomainInfoSource::Both => "both",
+            crate::domain_info::DomainInfoSource::Rdap => "rdap",
+            crate::domain_info::DomainInfoSource::Whois => "whois",
+            crate::domain_info::DomainInfoSource::Available => "available",
+        };
+
+        output.push(self.header(&format!(
+            "Domain Info: {} (source: {})",
+            sanitize_display(&info.domain),
+            source_str
+        )));
+
+        // Registration
+        if let Some(ref registrar) = info.registrar {
+            output.push(format!(
+                "  {}: {}",
+                self.label("Registrar"),
+                self.value(&sanitize_display(registrar))
+            ));
+        }
+        if let Some(ref registrant) = info.registrant {
+            output.push(format!(
+                "  {}: {}",
+                self.label("Registrant"),
+                self.value(&sanitize_display(registrant))
+            ));
+        }
+        if let Some(ref organization) = info.organization {
+            output.push(format!(
+                "  {}: {}",
+                self.label("Organization"),
+                self.value(&sanitize_display(organization))
+            ));
+        }
+
+        // Dates
+        if let Some(ref created) = info.creation_date {
+            output.push(format!(
+                "  {}: {}",
+                self.label("Created"),
+                self.value(&created.format("%Y-%m-%d").to_string())
+            ));
+        }
+        if let Some(ref expires) = info.expiration_date {
+            output.push(format!(
+                "  {}: {}",
+                self.label("Expires"),
+                self.value(&expires.format("%Y-%m-%d").to_string())
+            ));
+        }
+        if let Some(ref updated) = info.updated_date {
+            output.push(format!(
+                "  {}: {}",
+                self.label("Updated"),
+                self.value(&updated.format("%Y-%m-%d").to_string())
+            ));
+        }
+
+        // DNS
+        if !info.nameservers.is_empty() {
+            output.push(format!(
+                "  {}: {}",
+                self.label("Nameservers"),
+                self.value(&info.nameservers.join(", "))
+            ));
+        }
+        if !info.status.is_empty() {
+            output.push(format!(
+                "  {}: {}",
+                self.label("Status"),
+                self.value(&info.status.join(", "))
+            ));
+        }
+        if let Some(ref dnssec) = info.dnssec {
+            output.push(format!(
+                "  {}: {}",
+                self.label("DNSSEC"),
+                self.value(&sanitize_display(dnssec))
+            ));
+        }
+
+        // Registrant Contact
+        let has_registrant_contact = info.registrant_email.is_some()
+            || info.registrant_phone.is_some()
+            || info.registrant_address.is_some()
+            || info.registrant_country.is_some();
+        if has_registrant_contact {
+            output.push(format!("\n  {}:", self.label("Registrant Contact")));
+            if let Some(ref email) = info.registrant_email {
+                output.push(format!(
+                    "    {}: {}",
+                    self.label("Email"),
+                    self.value(&sanitize_display(email))
+                ));
+            }
+            if let Some(ref phone) = info.registrant_phone {
+                output.push(format!(
+                    "    {}: {}",
+                    self.label("Phone"),
+                    self.value(&sanitize_display(phone))
+                ));
+            }
+            if let Some(ref address) = info.registrant_address {
+                output.push(format!(
+                    "    {}: {}",
+                    self.label("Address"),
+                    self.value(&sanitize_display(address))
+                ));
+            }
+            if let Some(ref country) = info.registrant_country {
+                output.push(format!(
+                    "    {}: {}",
+                    self.label("Country"),
+                    self.value(&sanitize_display(country))
+                ));
+            }
+        }
+
+        // Admin Contact
+        let has_admin_contact = info.admin_name.is_some()
+            || info.admin_organization.is_some()
+            || info.admin_email.is_some()
+            || info.admin_phone.is_some();
+        if has_admin_contact {
+            output.push(format!("\n  {}:", self.label("Admin Contact")));
+            if let Some(ref name) = info.admin_name {
+                output.push(format!(
+                    "    {}: {}",
+                    self.label("Name"),
+                    self.value(&sanitize_display(name))
+                ));
+            }
+            if let Some(ref org) = info.admin_organization {
+                output.push(format!(
+                    "    {}: {}",
+                    self.label("Organization"),
+                    self.value(&sanitize_display(org))
+                ));
+            }
+            if let Some(ref email) = info.admin_email {
+                output.push(format!(
+                    "    {}: {}",
+                    self.label("Email"),
+                    self.value(&sanitize_display(email))
+                ));
+            }
+            if let Some(ref phone) = info.admin_phone {
+                output.push(format!(
+                    "    {}: {}",
+                    self.label("Phone"),
+                    self.value(&sanitize_display(phone))
+                ));
+            }
+        }
+
+        // Tech Contact
+        let has_tech_contact = info.tech_name.is_some()
+            || info.tech_organization.is_some()
+            || info.tech_email.is_some()
+            || info.tech_phone.is_some();
+        if has_tech_contact {
+            output.push(format!("\n  {}:", self.label("Tech Contact")));
+            if let Some(ref name) = info.tech_name {
+                output.push(format!(
+                    "    {}: {}",
+                    self.label("Name"),
+                    self.value(&sanitize_display(name))
+                ));
+            }
+            if let Some(ref org) = info.tech_organization {
+                output.push(format!(
+                    "    {}: {}",
+                    self.label("Organization"),
+                    self.value(&sanitize_display(org))
+                ));
+            }
+            if let Some(ref email) = info.tech_email {
+                output.push(format!(
+                    "    {}: {}",
+                    self.label("Email"),
+                    self.value(&sanitize_display(email))
+                ));
+            }
+            if let Some(ref phone) = info.tech_phone {
+                output.push(format!(
+                    "    {}: {}",
+                    self.label("Phone"),
+                    self.value(&sanitize_display(phone))
+                ));
+            }
+        }
+
+        // Protocol Metadata
+        let has_metadata = info.whois_server.is_some() || info.rdap_url.is_some();
+        if has_metadata {
+            output.push(format!("\n  {}:", self.label("Protocol Metadata")));
+            if let Some(ref whois_server) = info.whois_server {
+                output.push(format!(
+                    "    {}: {}",
+                    self.label("WHOIS Server"),
+                    self.value(&sanitize_display(whois_server))
+                ));
+            }
+            if let Some(ref rdap_url) = info.rdap_url {
+                output.push(format!(
+                    "    {}: {}",
+                    self.label("RDAP URL"),
+                    self.value(&sanitize_display(rdap_url))
+                ));
             }
         }
 

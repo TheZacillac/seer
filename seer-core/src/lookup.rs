@@ -34,6 +34,8 @@ pub enum LookupResult {
     Whois {
         data: WhoisResponse,
         rdap_error: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        rdap_fallback: Option<Box<RdapResponse>>,
     },
     Available {
         data: Box<AvailabilityResult>,
@@ -276,6 +278,7 @@ impl SmartLookup {
                 return Ok(LookupResult::Whois {
                     data: whois_data,
                     rdap_error: Some("RDAP response incomplete".to_string()),
+                    rdap_fallback: Some(Box::new(rdap_data)),
                 });
             }
 
@@ -307,6 +310,7 @@ impl SmartLookup {
             return Ok(LookupResult::Whois {
                 data: whois_data,
                 rdap_error: Some(rdap_error_str),
+                rdap_fallback: None,
             });
         }
 
@@ -409,6 +413,7 @@ mod tests {
                 raw_response: String::new(),
             },
             rdap_error: None,
+            rdap_fallback: None,
         };
 
         assert_eq!(result.domain_name(), Some("example.com".to_string()));
@@ -448,6 +453,7 @@ mod tests {
                 raw_response: String::new(),
             },
             rdap_error: Some("RDAP failed".to_string()),
+            rdap_fallback: None,
         };
 
         let json = serde_json::to_string(&result).unwrap();
