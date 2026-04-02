@@ -46,6 +46,8 @@ from seer._seer import (
     dns_compare,
     dns_follow,
     diff,
+    info,
+    bulk_info,
 )
 
 # Forward Rust tracing events into Python logging.
@@ -80,6 +82,8 @@ __all__ = [
     "dns_compare",
     "dns_follow",
     "diff",
+    "info",
+    "bulk_info",
 ]
 
 

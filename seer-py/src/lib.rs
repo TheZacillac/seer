@@ -573,6 +573,42 @@ fn diff(py: Python<'_>, domain_a: String, domain_b: String) -> PyResult<PyObject
     }
 }
 
+#[pyfunction]
+fn info(py: Python<'_>, domain: String) -> PyResult<PyObject> {
+    let rt = get_runtime();
+    let smart_lookup = get_smart_lookup();
+
+    let result = py.allow_threads(|| rt.block_on(async { smart_lookup.lookup(&domain).await }));
+
+    match result {
+        Ok(lookup_result) => {
+            let domain_info = seer_core::domain_info::DomainInfo::from_lookup_result(&lookup_result);
+            let json = serde_json::to_value(&domain_info)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            json_to_python(py, &json)
+        }
+        Err(e) => Err(PyRuntimeError::new_err(e.to_string())),
+    }
+}
+
+#[pyfunction]
+#[pyo3(signature = (domains, concurrency = 10))]
+fn bulk_info(py: Python<'_>, domains: Vec<String>, concurrency: usize) -> PyResult<PyObject> {
+    let rt = get_runtime();
+    let executor = BulkExecutor::new().with_concurrency(validate_concurrency(concurrency)?);
+
+    let operations: Vec<BulkOperation> = domains
+        .into_iter()
+        .map(|domain| BulkOperation::Info { domain })
+        .collect();
+
+    let result =
+        py.allow_threads(|| rt.block_on(async { executor.execute(operations, None).await }));
+
+    let json = serde_json::to_value(&result).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    json_to_python(py, &json)
+}
+
 fn json_to_python(py: Python<'_>, value: &serde_json::Value) -> PyResult<PyObject> {
     match value {
         serde_json::Value::Null => Ok(py.None()),
@@ -638,5 +674,7 @@ fn _seer(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(dns_compare, m)?)?;
     m.add_function(wrap_pyfunction!(dns_follow, m)?)?;
     m.add_function(wrap_pyfunction!(diff, m)?)?;
+    m.add_function(wrap_pyfunction!(info, m)?)?;
+    m.add_function(wrap_pyfunction!(bulk_info, m)?)?;
     Ok(())
 }
