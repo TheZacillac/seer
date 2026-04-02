@@ -29,6 +29,7 @@ Example Usage:
   seer bulk lookup domains.csv              # Output: domains_results.csv
   seer bulk dig domains.txt MX              # Output: domains_results.csv
   seer bulk avail domains.txt               # Output: domains_results.csv
+  seer bulk info domains.txt                # Output: domains_results.csv
   seer bulk status domains.txt -o out.csv   # Output: out.csv
 
 Example Output (status operation):
@@ -50,6 +51,10 @@ Example Output (avail operation):
   domain,success,available,confidence,method,details,duration_ms,error
   nonexistent123.com,true,true,high,whois,WHOIS indicates domain is not registered,1523,
   google.com,true,false,high,rdap,Domain is registered (status: client delete prohibited),412,
+
+Example Output (info operation):
+  domain,success,source,registrar,registrant,organization,created,expires,updated,nameservers,status,dnssec,...,whois_server,rdap_url,duration_ms,error
+  example.com,true,Both,RESERVED-Internet Assigned Numbers Authority,,Internet Assigned Numbers Authority,1995-08-14,2025-08-13,2024-08-14,a.iana-servers.net;b.iana-servers.net,client delete prohibited,signed,...,whois.iana.org,https://rdap.iana.org/domain/example.com,1523,
 "#;
 
 #[derive(Parser)]
