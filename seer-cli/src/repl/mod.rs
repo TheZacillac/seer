@@ -801,7 +801,8 @@ impl Repl {
                     | seer_core::bulk::BulkOperation::Propagation { domain, .. }
                     | seer_core::bulk::BulkOperation::Lookup { domain }
                     | seer_core::bulk::BulkOperation::Status { domain }
-                    | seer_core::bulk::BulkOperation::Avail { domain } => domain,
+                    | seer_core::bulk::BulkOperation::Avail { domain }
+                    | seer_core::bulk::BulkOperation::Info { domain } => domain,
                 };
                 println!(
                     "  {} - {}",

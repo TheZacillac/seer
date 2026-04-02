@@ -45,6 +45,9 @@ pub enum BulkOperation {
     Avail {
         domain: String,
     },
+    Info {
+        domain: String,
+    },
 }
 
 /// The data returned from a bulk operation (varies by operation type).
@@ -58,6 +61,7 @@ pub enum BulkResultData {
     Lookup(LookupResult),
     Status(StatusResponse),
     Avail(AvailabilityResult),
+    Info(crate::domain_info::DomainInfo),
 }
 
 /// Result of a single operation within a bulk execution.
@@ -188,7 +192,8 @@ impl BulkExecutor {
                             | BulkOperation::Propagation { domain, .. }
                             | BulkOperation::Lookup { domain }
                             | BulkOperation::Status { domain }
-                            | BulkOperation::Avail { domain } => domain.as_str(),
+                            | BulkOperation::Avail { domain }
+                            | BulkOperation::Info { domain } => domain.as_str(),
                         };
                         progress(count, total, desc);
                     }
@@ -299,6 +304,14 @@ impl BulkExecutor {
             .collect();
         self.execute(operations, None).await
     }
+
+    pub async fn execute_info(&self, domains: Vec<String>) -> Vec<BulkResult> {
+        let operations = domains
+            .into_iter()
+            .map(|domain| BulkOperation::Info { domain })
+            .collect();
+        self.execute(operations, None).await
+    }
 }
 
 struct Clients<'a> {
@@ -346,6 +359,10 @@ async fn execute_operation(op: &BulkOperation, clients: &Clients<'_>) -> Result<
         BulkOperation::Avail { domain } => {
             let result = clients.avail.check(domain).await?;
             Ok(BulkResultData::Avail(result))
+        }
+        BulkOperation::Info { domain } => {
+            let result = clients.lookup.lookup(domain).await?;
+            Ok(BulkResultData::Info(crate::domain_info::DomainInfo::from_lookup_result(&result)))
         }
     }
 }

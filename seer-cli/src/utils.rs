@@ -356,6 +356,7 @@ pub fn get_domain_from_operation(op: &BulkOperation) -> String {
         BulkOperation::Lookup { domain } => domain.clone(),
         BulkOperation::Status { domain } => domain.clone(),
         BulkOperation::Avail { domain } => domain.clone(),
+        BulkOperation::Info { domain } => domain.clone(),
     }
 }
 
