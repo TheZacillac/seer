@@ -605,7 +605,7 @@ impl OutputFormatter for MarkdownFormatter {
                     }
                 }
             }
-            LookupResult::Whois { data, rdap_error } => {
+            LookupResult::Whois { data, rdap_error, .. } => {
                 if let Some(ref error) = rdap_error {
                     output.push(format!("- **RDAP Error**: {}", error));
                 }
