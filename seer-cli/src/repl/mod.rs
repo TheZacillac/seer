@@ -173,6 +173,7 @@ impl Repl {
             }
             "exit" | "quit" | "q" => CommandResult::Exit,
             "lookup" => self.execute_lookup(args).await,
+            "info" => self.execute_info(args).await,
             "whois" => self.execute_whois(args).await,
             "rdap" => self.execute_rdap(args).await,
             "dig" | "dns" => self.execute_dig(args).await,
@@ -217,6 +218,10 @@ impl Repl {
         println!(
             "  {:<34} Smart lookup (just type a domain directly)",
             "<domain>".bright_cyan()
+        );
+        println!(
+            "  {:<34} Comprehensive domain info (RDAP + WHOIS merged)",
+            "info <domain>".bright_cyan()
         );
         println!(
             "  {:<34} Query WHOIS information",
@@ -304,7 +309,7 @@ impl Repl {
         );
         println!(
             "  {}",
-            "Operations: lookup, whois, rdap, dig, prop, status, avail".dimmed()
+            "Operations: lookup, whois, rdap, dig, prop, status, avail, info".dimmed()
         );
         println!();
         println!("{}", "SETTINGS".bright_purple().bold());
@@ -346,6 +351,10 @@ impl Repl {
         println!(
             "  {}       Check domain registration availability",
             "avail".bright_green()
+        );
+        println!(
+            "  {}        Comprehensive domain info (RDAP + WHOIS merged)",
+            "info".bright_green()
         );
         println!();
         println!("{}", "Input File Formats:".bright_cyan());
@@ -411,6 +420,33 @@ impl Repl {
             Err(e) => {
                 spinner.finish();
                 CommandResult::Error(e.to_string())
+            }
+        }
+    }
+
+    async fn execute_info(&self, args: &[&str]) -> CommandResult {
+        if args.is_empty() {
+            return CommandResult::Error("Usage: info <domain>".to_string());
+        }
+
+        let domain = args[0];
+        let spinner = Arc::new(Spinner::new(&format!(
+            "Getting comprehensive info for {}",
+            domain
+        )));
+
+        let lookup = seer_core::SmartLookup::new();
+        match lookup.lookup(domain).await {
+            Ok(result) => {
+                spinner.finish();
+                let info = seer_core::DomainInfo::from_lookup_result(&result);
+                let formatter = seer_core::output::get_formatter(self.context.output_format);
+                println!("{}", formatter.format_domain_info(&info));
+                CommandResult::Continue
+            }
+            Err(e) => {
+                spinner.finish();
+                CommandResult::Error(format!("Info failed: {}", e))
             }
         }
     }
@@ -754,9 +790,13 @@ impl Repl {
                 .iter()
                 .map(|d: &String| seer_core::bulk::BulkOperation::Avail { domain: d.clone() })
                 .collect(),
+            "info" => domains
+                .iter()
+                .map(|d: &String| seer_core::bulk::BulkOperation::Info { domain: d.clone() })
+                .collect(),
             _ => {
                 return CommandResult::Error(format!(
-                    "Unknown bulk operation: {}. Use: lookup, whois, rdap, dig/dns, prop, status, avail",
+                    "Unknown bulk operation: {}. Use: lookup, whois, rdap, dig/dns, prop, status, avail, info",
                     operation
                 ))
             }

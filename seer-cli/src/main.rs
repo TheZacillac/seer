@@ -80,6 +80,11 @@ enum Commands {
         /// Domain name to look up
         domain: String,
     },
+    /// Comprehensive domain info (merges RDAP + WHOIS into flat fields)
+    Info {
+        /// Domain name to look up
+        domain: String,
+    },
     /// Look up WHOIS information for a domain
     Whois {
         /// Domain name to look up
@@ -114,7 +119,7 @@ enum Commands {
     /// for programmatic consumption without spreadsheet escaping.
     #[command(after_long_help = BULK_EXAMPLES)]
     Bulk {
-        /// Operation type: lookup, whois, rdap, dig, prop, status, avail
+        /// Operation type: lookup, whois, rdap, dig, prop, status, avail, info
         #[arg(value_name = "OPERATION")]
         operation: String,
 
@@ -349,6 +354,30 @@ async fn execute_command(
                 }
             }
         }
+        Commands::Info { domain } => {
+            let spinner = std::sync::Arc::new(display::Spinner::new(&format!(
+                "Getting comprehensive info for {}",
+                domain
+            )));
+
+            let lookup = seer_core::SmartLookup::new();
+            match lookup.lookup(&domain).await {
+                Ok(result) => {
+                    spinner.finish();
+                    let info = seer_core::DomainInfo::from_lookup_result(&result);
+                    if quiet {
+                        handle_quiet_output(&info, &fields);
+                    } else {
+                        println!("{}", formatter.format_domain_info(&info));
+                    }
+                }
+                Err(e) => {
+                    spinner.finish();
+                    eprintln!("{} {}", "Error:".ctp_red(), e);
+                    std::process::exit(1);
+                }
+            }
+        }
         Commands::Whois { domain } => {
             let client = seer_core::WhoisClient::new();
             match client.lookup(&domain).await {
@@ -525,9 +554,13 @@ async fn execute_command(
                     .iter()
                     .map(|d: &String| seer_core::bulk::BulkOperation::Avail { domain: d.clone() })
                     .collect(),
+                "info" => domains
+                    .iter()
+                    .map(|d: &String| seer_core::bulk::BulkOperation::Info { domain: d.clone() })
+                    .collect(),
                 _ => {
                     eprintln!(
-                        "{} Unknown operation: {}. Use: lookup, whois, rdap, dig/dns, prop, status, avail",
+                        "{} Unknown operation: {}. Use: lookup, whois, rdap, dig/dns, prop, status, avail, info",
                         "Error:".ctp_red(),
                         operation
                     );

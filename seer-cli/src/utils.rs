@@ -32,6 +32,9 @@ pub fn bulk_results_to_csv(results: &[BulkResult], operation: &str) -> String {
         "avail" => {
             csv.push_str("domain,success,available,confidence,method,details,duration_ms,error\n");
         }
+        "info" => {
+            csv.push_str("domain,success,source,registrar,registrant,organization,created,expires,updated,nameservers,status,dnssec,registrant_email,registrant_phone,registrant_address,registrant_country,admin_name,admin_organization,admin_email,admin_phone,tech_name,tech_organization,tech_email,tech_phone,whois_server,rdap_url,duration_ms,error\n");
+        }
         _ => {
             csv.push_str("domain,success,duration_ms,error\n");
         }
@@ -299,6 +302,46 @@ pub fn bulk_results_to_csv(results: &[BulkResult], operation: &str) -> String {
                     duration_ms,
                     error
                 ));
+            }
+            "info" => {
+                if let Some(BulkResultData::Info(ref info)) = result.data {
+                    csv.push_str(&format!(
+                        "{},{},{:?},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+                        domain,
+                        success,
+                        info.source,
+                        escape_csv_field(info.registrar.as_deref().unwrap_or("")),
+                        escape_csv_field(info.registrant.as_deref().unwrap_or("")),
+                        escape_csv_field(info.organization.as_deref().unwrap_or("")),
+                        info.creation_date.map(|d| d.format("%Y-%m-%d").to_string()).unwrap_or_default(),
+                        info.expiration_date.map(|d| d.format("%Y-%m-%d").to_string()).unwrap_or_default(),
+                        info.updated_date.map(|d| d.format("%Y-%m-%d").to_string()).unwrap_or_default(),
+                        escape_csv_field(&info.nameservers.join(";")),
+                        escape_csv_field(&info.status.join(";")),
+                        escape_csv_field(info.dnssec.as_deref().unwrap_or("")),
+                        escape_csv_field(info.registrant_email.as_deref().unwrap_or("")),
+                        escape_csv_field(info.registrant_phone.as_deref().unwrap_or("")),
+                        escape_csv_field(info.registrant_address.as_deref().unwrap_or("")),
+                        escape_csv_field(info.registrant_country.as_deref().unwrap_or("")),
+                        escape_csv_field(info.admin_name.as_deref().unwrap_or("")),
+                        escape_csv_field(info.admin_organization.as_deref().unwrap_or("")),
+                        escape_csv_field(info.admin_email.as_deref().unwrap_or("")),
+                        escape_csv_field(info.admin_phone.as_deref().unwrap_or("")),
+                        escape_csv_field(info.tech_name.as_deref().unwrap_or("")),
+                        escape_csv_field(info.tech_organization.as_deref().unwrap_or("")),
+                        escape_csv_field(info.tech_email.as_deref().unwrap_or("")),
+                        escape_csv_field(info.tech_phone.as_deref().unwrap_or("")),
+                        escape_csv_field(info.whois_server.as_deref().unwrap_or("")),
+                        escape_csv_field(info.rdap_url.as_deref().unwrap_or("")),
+                        duration_ms,
+                        error
+                    ));
+                } else {
+                    csv.push_str(&format!(
+                        "{},{},,,,,,,,,,,,,,,,,,,,,,,,,{},{}\n",
+                        domain, success, duration_ms, error
+                    ));
+                }
             }
             _ => {
                 csv.push_str(&format!(
