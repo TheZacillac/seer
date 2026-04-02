@@ -52,6 +52,7 @@ pub trait OutputFormatter {
     fn format_diff(&self, diff: &crate::diff::DomainDiff) -> String;
     fn format_ssl(&self, report: &crate::ssl::SslReport) -> String;
     fn format_watch(&self, report: &crate::watchlist::WatchReport) -> String;
+    fn format_domain_info(&self, info: &crate::domain_info::DomainInfo) -> String;
 }
 
 /// YAML output formatter that converts data structures to YAML format.
@@ -126,6 +127,9 @@ impl OutputFormatter for YamlFormatter {
     }
     fn format_watch(&self, report: &crate::watchlist::WatchReport) -> String {
         self.to_yaml_value(report)
+    }
+    fn format_domain_info(&self, info: &crate::domain_info::DomainInfo) -> String {
+        self.to_yaml_value(info)
     }
 }
 

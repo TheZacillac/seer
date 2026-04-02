@@ -99,6 +99,10 @@ impl OutputFormatter for JsonFormatter {
     fn format_watch(&self, report: &crate::watchlist::WatchReport) -> String {
         self.to_json(report)
     }
+
+    fn format_domain_info(&self, info: &crate::domain_info::DomainInfo) -> String {
+        self.to_json(info)
+    }
 }
 
 #[cfg(test)]

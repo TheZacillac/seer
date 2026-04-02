@@ -1412,6 +1412,167 @@ impl OutputFormatter for MarkdownFormatter {
 
         output.join("\n")
     }
+
+    fn format_domain_info(&self, info: &crate::domain_info::DomainInfo) -> String {
+        let mut output = Vec::new();
+
+        let source_str = match info.source {
+            crate::domain_info::DomainInfoSource::Both => "both",
+            crate::domain_info::DomainInfoSource::Rdap => "rdap",
+            crate::domain_info::DomainInfoSource::Whois => "whois",
+            crate::domain_info::DomainInfoSource::Available => "available",
+        };
+
+        output.push(format!("## Domain Info: {}", info.domain));
+        output.push(String::new());
+        output.push(format!("**Source:** {}", source_str));
+        output.push(String::new());
+
+        // Registration table
+        output.push("### Registration".to_string());
+        output.push(String::new());
+        output.push("| Field | Value |".to_string());
+        output.push("| --- | --- |".to_string());
+        output.push(format!(
+            "| Registrar | {} |",
+            info.registrar.as_deref().unwrap_or("-")
+        ));
+        output.push(format!(
+            "| Registrant | {} |",
+            info.registrant.as_deref().unwrap_or("-")
+        ));
+        output.push(format!(
+            "| Organization | {} |",
+            info.organization.as_deref().unwrap_or("-")
+        ));
+        output.push(format!(
+            "| Created | {} |",
+            info.creation_date
+                .map(|d| d.format("%Y-%m-%d").to_string())
+                .as_deref()
+                .unwrap_or("-")
+        ));
+        output.push(format!(
+            "| Expires | {} |",
+            info.expiration_date
+                .map(|d| d.format("%Y-%m-%d").to_string())
+                .as_deref()
+                .unwrap_or("-")
+        ));
+        output.push(format!(
+            "| Updated | {} |",
+            info.updated_date
+                .map(|d| d.format("%Y-%m-%d").to_string())
+                .as_deref()
+                .unwrap_or("-")
+        ));
+        output.push(format!(
+            "| Nameservers | {} |",
+            if info.nameservers.is_empty() {
+                "-".to_string()
+            } else {
+                info.nameservers
+                    .iter()
+                    .map(|ns| format!("`{}`", ns))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+        ));
+        output.push(format!(
+            "| Status | {} |",
+            if info.status.is_empty() {
+                "-".to_string()
+            } else {
+                info.status
+                    .iter()
+                    .map(|s| format!("`{}`", s))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+        ));
+        output.push(format!(
+            "| DNSSEC | {} |",
+            info.dnssec.as_deref().unwrap_or("-")
+        ));
+
+        // Contacts table
+        let has_any_contact = info.registrant_email.is_some()
+            || info.registrant_phone.is_some()
+            || info.registrant_address.is_some()
+            || info.registrant_country.is_some()
+            || info.admin_name.is_some()
+            || info.admin_organization.is_some()
+            || info.admin_email.is_some()
+            || info.admin_phone.is_some()
+            || info.tech_name.is_some()
+            || info.tech_organization.is_some()
+            || info.tech_email.is_some()
+            || info.tech_phone.is_some();
+
+        if has_any_contact {
+            output.push(String::new());
+            output.push("### Contacts".to_string());
+            output.push(String::new());
+            output.push("| Role | Name | Organization | Email | Phone |".to_string());
+            output.push("| --- | --- | --- | --- | --- |".to_string());
+
+            let has_registrant = info.registrant_email.is_some()
+                || info.registrant_phone.is_some()
+                || info.registrant_address.is_some()
+                || info.registrant_country.is_some();
+            if has_registrant {
+                output.push(format!(
+                    "| Registrant | - | - | {} | {} |",
+                    info.registrant_email.as_deref().unwrap_or("-"),
+                    info.registrant_phone.as_deref().unwrap_or("-"),
+                ));
+            }
+
+            let has_admin = info.admin_name.is_some()
+                || info.admin_organization.is_some()
+                || info.admin_email.is_some()
+                || info.admin_phone.is_some();
+            if has_admin {
+                output.push(format!(
+                    "| Admin | {} | {} | {} | {} |",
+                    info.admin_name.as_deref().unwrap_or("-"),
+                    info.admin_organization.as_deref().unwrap_or("-"),
+                    info.admin_email.as_deref().unwrap_or("-"),
+                    info.admin_phone.as_deref().unwrap_or("-"),
+                ));
+            }
+
+            let has_tech = info.tech_name.is_some()
+                || info.tech_organization.is_some()
+                || info.tech_email.is_some()
+                || info.tech_phone.is_some();
+            if has_tech {
+                output.push(format!(
+                    "| Tech | {} | {} | {} | {} |",
+                    info.tech_name.as_deref().unwrap_or("-"),
+                    info.tech_organization.as_deref().unwrap_or("-"),
+                    info.tech_email.as_deref().unwrap_or("-"),
+                    info.tech_phone.as_deref().unwrap_or("-"),
+                ));
+            }
+        }
+
+        // Protocol Metadata
+        let has_metadata = info.whois_server.is_some() || info.rdap_url.is_some();
+        if has_metadata {
+            output.push(String::new());
+            output.push("### Protocol Metadata".to_string());
+            output.push(String::new());
+            if let Some(ref whois_server) = info.whois_server {
+                output.push(format!("- **WHOIS Server**: `{}`", whois_server));
+            }
+            if let Some(ref rdap_url) = info.rdap_url {
+                output.push(format!("- **RDAP URL**: `{}`", rdap_url));
+            }
+        }
+
+        output.join("\n")
+    }
 }
 
 #[cfg(test)]
