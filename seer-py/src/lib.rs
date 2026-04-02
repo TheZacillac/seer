@@ -582,7 +582,8 @@ fn info(py: Python<'_>, domain: String) -> PyResult<PyObject> {
 
     match result {
         Ok(lookup_result) => {
-            let domain_info = seer_core::domain_info::DomainInfo::from_lookup_result(&lookup_result);
+            let domain_info =
+                seer_core::domain_info::DomainInfo::from_lookup_result(&lookup_result);
             let json = serde_json::to_value(&domain_info)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             json_to_python(py, &json)

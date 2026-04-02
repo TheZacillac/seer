@@ -90,14 +90,8 @@ impl DomainInfo {
         }
 
         // --- Registration ---
-        let registrar = rdap_or_whois!(
-            rdap.and_then(|r| r.get_registrar()),
-            registrar
-        );
-        let registrant = rdap_or_whois!(
-            rdap.and_then(|r| r.get_registrant()),
-            registrant
-        );
+        let registrar = rdap_or_whois!(rdap.and_then(|r| r.get_registrar()), registrar);
+        let registrant = rdap_or_whois!(rdap.and_then(|r| r.get_registrant()), registrant);
         let organization = rdap_or_whois!(
             rdap.and_then(|r| r.get_registrant_organization()),
             organization
@@ -248,10 +242,7 @@ impl DomainInfo {
                 data,
                 whois_fallback,
             } => Self::from_sources(
-                &data
-                    .domain_name()
-                    .unwrap_or("unknown")
-                    .to_string(),
+                data.domain_name().unwrap_or("unknown"),
                 Some(data),
                 whois_fallback.as_ref(),
             ),

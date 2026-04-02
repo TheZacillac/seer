@@ -362,7 +362,9 @@ async fn execute_operation(op: &BulkOperation, clients: &Clients<'_>) -> Result<
         }
         BulkOperation::Info { domain } => {
             let result = clients.lookup.lookup(domain).await?;
-            Ok(BulkResultData::Info(crate::domain_info::DomainInfo::from_lookup_result(&result)))
+            Ok(BulkResultData::Info(
+                crate::domain_info::DomainInfo::from_lookup_result(&result),
+            ))
         }
     }
 }

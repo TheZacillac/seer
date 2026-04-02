@@ -1150,7 +1150,9 @@ impl OutputFormatter for HumanFormatter {
                     }
                 }
             }
-            LookupResult::Whois { data, rdap_error, .. } => {
+            LookupResult::Whois {
+                data, rdap_error, ..
+            } => {
                 let source_note = if rdap_error.is_some() {
                     "WHOIS (RDAP unavailable)"
                 } else {
