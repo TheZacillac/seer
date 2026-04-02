@@ -5,6 +5,7 @@ pub mod colors;
 pub mod config;
 pub mod diff;
 pub mod dns;
+pub mod domain_info;
 pub mod error;
 pub mod history;
 pub mod logging;
@@ -39,6 +40,7 @@ pub use whois::{WhoisClient, WhoisResponse};
 
 pub use bulk::{BulkExecutor, BulkOperation, BulkResult};
 pub use diff::{DomainDiff, DomainDiffer};
+pub use domain_info::{DomainInfo, DomainInfoSource};
 pub use history::{HistoryEntry, LookupHistory};
 pub use output::{OutputFormat, OutputFormatter};
 pub use ssl::{CertDetail, SslChecker, SslReport};
