@@ -167,7 +167,10 @@ impl WhoisClient {
             // Registry response is thin — follow the referral for more detail
             if let Some(referral) = extract_referral(&raw_response) {
                 if referral != whois_server && !visited.contains(&referral.to_lowercase()) {
-                    debug!(referral_depth = depth, "Registry response lacks core data, following referral to {}", referral);
+                    debug!(
+                        referral_depth = depth,
+                        "Registry response lacks core data, following referral to {}", referral
+                    );
                     match self
                         .lookup_with_referrals(domain, &referral, depth + 1, visited)
                         .await
