@@ -274,6 +274,16 @@ impl WhoisResponse {
         }
     }
 
+    /// Returns true if the response contains the core registration fields
+    /// that registries typically provide (registrar, dates, nameservers).
+    /// When true, following the registrar referral can be skipped since the
+    /// additional detail (contact info) is usually GDPR-redacted anyway.
+    pub fn has_core_data(&self) -> bool {
+        self.registrar.is_some()
+            && (self.creation_date.is_some() || self.expiration_date.is_some())
+            && !self.nameservers.is_empty()
+    }
+
     pub fn is_available(&self) -> bool {
         let available_patterns = [
             "no match",

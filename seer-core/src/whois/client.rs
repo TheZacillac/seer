@@ -150,17 +150,29 @@ impl WhoisClient {
                 return Ok(current_response);
             }
 
-            // Check for referral to another WHOIS server
+            // Prefer registry response when it has core data (registrar, dates,
+            // nameservers).  Registrar (referral) servers are often slow, rate-
+            // limited, or outright block non-commercial queries (e.g. CSC's
+            // whois.corporatedomains.com).  Most contact fields are GDPR-redacted
+            // anyway, so the registry response is sufficient for the vast majority
+            // of use cases.
+            if current_response.has_core_data() {
+                debug!(
+                    server = %whois_server,
+                    "Registry response has core data, skipping registrar referral"
+                );
+                return Ok(current_response);
+            }
+
+            // Registry response is thin — follow the referral for more detail
             if let Some(referral) = extract_referral(&raw_response) {
                 if referral != whois_server && !visited.contains(&referral.to_lowercase()) {
-                    debug!(referral_depth = depth, "following referral to {}", referral);
+                    debug!(referral_depth = depth, "Registry response lacks core data, following referral to {}", referral);
                     match self
                         .lookup_with_referrals(domain, &referral, depth + 1, visited)
                         .await
                     {
                         Ok(referral_response) => {
-                            // If referral indicates domain not found or has less data,
-                            // prefer the current response which has registry data
                             if referral_response.is_available()
                                 || referral_response.indicates_not_found()
                             {
@@ -173,7 +185,6 @@ impl WhoisClient {
                             return Ok(referral_response);
                         }
                         Err(e) => {
-                            // If referral fails, use the current response if it has data
                             warn!(referral = %referral, error = %e, "Referral lookup failed, using registry response");
                             return Ok(current_response);
                         }
