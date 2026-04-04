@@ -1,333 +1,241 @@
-# Seer
+<div align="center">
 
-**A multi-interface domain name utility suite for querying WHOIS, RDAP, DNS records, and domain health information.**
+# 🔮 Seer
 
-Seer provides a unified, high-performance toolkit for domain intelligence with multiple interfaces: CLI, Rust library, Python library, REST API, and MCP server for AI assistants.
+**Domain intelligence at your fingertips.**
 
----
+A high-performance, multi-interface domain utility suite — query WHOIS, RDAP, DNS, SSL, and more from the terminal, Python, REST API, or AI assistants.
 
-## Table of Contents
+[![CI](https://github.com/TheZacillac/seer/actions/workflows/ci.yml/badge.svg)](https://github.com/TheZacillac/seer/actions/workflows/ci.yml)
+[![Crates.io](https://img.shields.io/crates/v/seer-cli.svg)](https://crates.io/crates/seer-cli)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org)
+[![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org)
 
-- [Features](#features)
-- [Architecture](#architecture)
-- [Packages Overview](#packages-overview)
-- [Installation](#installation)
-  - [Installing seer-cli (Binary Only)](#installing-seer-cli-binary-only)
-  - [Installing seer-core (Rust Library)](#installing-seer-core-rust-library)
-  - [Full Installation (All Components)](#full-installation-all-components)
-  - [Python Library Only](#python-library-only)
-  - [REST API & MCP Server](#rest-api--mcp-server)
-- [Usage](#usage)
-  - [CLI](#cli)
-  - [Python Library](#python-library)
-  - [Rust Library](#rust-library)
-  - [REST API](#rest-api)
-  - [MCP Server](#mcp-server)
-- [Supported DNS Record Types](#supported-dns-record-types)
-- [Global DNS Servers](#global-dns-servers)
-- [Configuration](#configuration)
-- [Development](#development)
-- [Project Structure](#project-structure)
-- [Technology Stack](#technology-stack)
-- [License](#license)
+[Features](#-features) · [Quick Start](#-quick-start) · [CLI Usage](#-cli-usage) · [Python](#-python-library) · [REST API](#-rest-api) · [MCP Server](#-mcp-server)
+
+</div>
 
 ---
 
-## Features
+## ✨ Features
 
-| Feature | Description |
-|---------|-------------|
-| **WHOIS Lookups** | Query domain registrant and registrar information via WHOIS protocol |
-| **RDAP Lookups** | Modern Registration Data Access Protocol for domains, IPs, and ASNs |
-| **DNS Resolution** | Query 13 DNS record types with custom nameserver support |
-| **DNS Propagation** | Monitor global DNS propagation across 29 nameservers in 6 regions |
-| **DNS Monitoring** | Track DNS record changes over time with configurable intervals |
-| **Domain Status** | HTTP status, site title, SSL certificate info, and expiration dates |
-| **Smart Lookups** | Concurrent RDAP + WHOIS with availability fallback |
-| **Bulk Operations** | Process multiple domains concurrently with configurable rate limiting |
-| **SSL Chain Inspection** | Full certificate chain, SANs, key details, and validity checking |
-| **DNS Comparison** | Compare DNS records across two nameservers to verify consistency |
-| **Domain Diff** | Side-by-side comparison of two domains (registration, DNS, SSL) |
-| **Subdomain Enumeration** | Discover subdomains via Certificate Transparency logs |
-| **TLD Info** | Look up WHOIS server, RDAP endpoint, and registry for any TLD |
-| **Domain Watchlist** | Monitor domains for expiring SSL certificates and registrations |
-| **Lookup History** | Persistent history of past domain lookups |
-| **Field Extraction** | `--quiet --fields` flags for scriptable output |
-| **Semantic Exit Codes** | Meaningful exit codes for CI/CD scripting |
-| **SSRF Protection** | Blocks requests to private/reserved IP ranges |
-| **Multiple Interfaces** | CLI, Rust library, Python library, REST API, and MCP server |
+<table>
+<tr>
+<td width="50%">
 
----
+**🔍 Lookups & Discovery**
+- **Smart Lookup** — concurrent RDAP + WHOIS with fallback
+- **WHOIS** — registrant, registrar, and expiration data
+- **RDAP** — modern protocol for domains, IPs, and ASNs
+- **Domain Info** — merged RDAP + WHOIS in a flat structure
+- **Reverse DNS** — PTR lookups for IP addresses
+- **TLD Info** — WHOIS server, RDAP endpoint, and registry
+- **Subdomain Enumeration** — via Certificate Transparency logs
+- **Domain Availability** — check if a domain is registered
 
-## Architecture
+</td>
+<td width="50%">
+
+**🌐 DNS & Propagation**
+- **DNS Resolution** — 13 record types with custom nameservers
+- **DNS Propagation** — 29 servers across 6 global regions
+- **DNS Monitoring** — track record changes over time
+- **DNS Comparison** — compare records across two nameservers
+- **DNSSEC Validation** — check DNSSEC configuration
+
+</td>
+</tr>
+<tr>
+<td>
+
+**🛡️ Security & Health**
+- **Domain Status** — HTTP status, title, SSL, and expiration
+- **SSL Chain Inspection** — full chain, SANs, key details, validity
+- **Domain Watchlist** — monitor expiring certs and registrations
+- **SSRF Protection** — blocks requests to private/reserved IPs
+
+</td>
+<td>
+
+**⚡ Power Features**
+- **Bulk Operations** — process domain lists with CSV export
+- **Domain Diff** — side-by-side comparison of two domains
+- **Field Extraction** — `--quiet --fields` for scriptable output
+- **4 Output Formats** — human, JSON, YAML, markdown
+- **Interactive REPL** — with tab completion and history
+- **Semantic Exit Codes** — for CI/CD scripting
+- **Shell Completions** — bash, zsh, fish, PowerShell
+
+</td>
+</tr>
+</table>
+
+### 🏗️ Five Interfaces, One Core
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                           User Interfaces                                │
-├──────────────┬──────────────┬──────────────┬────────────────────────────┤
-│   seer-cli   │   seer-py    │   seer-api   │         seer-api           │
-│  (Terminal)  │   (Python)   │  (REST API)  │       (MCP Server)         │
-└──────┬───────┴──────┬───────┴──────┬───────┴────────────┬───────────────┘
-       │              │              │                    │
-       │              └──────────────┼────────────────────┘
-       │                             │
-       ▼                             ▼
-┌──────────────────────────────────────────────────────────────────────────┐
-│                            seer-core                                      │
-│                     (Core Rust Library)                                   │
-├────────────┬────────────┬────────────┬────────────┬─────────────────────┤
-│   WHOIS    │    RDAP    │    DNS     │   Status   │       Bulk          │
-│   Client   │   Client   │  Resolver  │   Client   │     Executor        │
-└────────────┴────────────┴────────────┴────────────┴─────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│                        User Interfaces                           │
+├─────────────┬─────────────┬──────────────┬───────────────────────┤
+│  seer-cli   │   seer-py   │   seer-api   │       seer-api        │
+│  Terminal   │   Python    │   REST API   │     MCP Server        │
+└──────┬──────┴──────┬──────┴──────┬───────┴──────────┬────────────┘
+       │             │             │                   │
+       │             └─────────────┼───────────────────┘
+       │                           │
+       ▼                           ▼
+┌──────────────────────────────────────────────────────────────────┐
+│                          seer-core                                │
+│                      Core Rust Library                            │
+├──────────┬────────┬──────┬────────┬──────┬──────┬───────────────┤
+│  WHOIS   │  RDAP  │ DNS  │ Status │ SSL  │ Bulk │  Diff/Watch   │
+└──────────┴────────┴──────┴────────┴──────┴──────┴───────────────┘
 ```
 
 ---
 
-## Packages Overview
+## 🚀 Quick Start
 
-Seer is a monorepo containing four packages. The key distinction to understand:
-
-| Package | Type | Published To | What You Get |
-|---------|------|--------------|--------------|
-| **seer-core** | Rust library | [crates.io](https://crates.io/crates/seer-core) | Core library for Rust projects — use as a dependency in your Rust code |
-| **seer-cli** | Rust binary | [crates.io](https://crates.io/crates/seer-cli) | The `seer` command-line tool — for terminal usage |
-| **seer-py** | Python extension | Source only | Python library `seer` — for Python scripts and applications |
-| **seer-api** | Python package | Source only | REST API server (`seer-api`) and MCP server (`seer-mcp`) |
-
-### seer-cli vs seer-core
-
-**Choose `seer-cli` if you want:**
-- A command-line tool to query domains from your terminal
-- An interactive REPL for exploratory domain research
-- A binary you can script with shell commands
-
-**Choose `seer-core` if you want:**
-- To integrate Seer functionality into your own Rust application
-- Programmatic access to WHOIS, RDAP, DNS, and status checking
-- Maximum performance and type safety
-
-**Key differences:**
-
-| Aspect | seer-cli | seer-core |
-|--------|----------|-----------|
-| **What it is** | Executable binary | Rust library (crate) |
-| **Install command** | `cargo install seer-cli` | Add to `Cargo.toml` |
-| **Usage** | Run `seer` in terminal | Import in Rust code |
-| **Provides** | Commands like `seer lookup example.com` | Structs like `WhoisClient`, `DnsResolver` |
-| **Depends on** | seer-core internally | Nothing (it's the foundation) |
-
----
-
-## Installation
-
-### Installing seer-cli (Binary Only)
-
-For command-line usage, install the `seer-cli` crate:
+### Install the CLI
 
 ```bash
 cargo install seer-cli
 ```
 
-This installs the `seer` binary to `~/.cargo/bin/`. Verify installation:
+### Run your first lookup
 
 ```bash
-seer --version
-seer --help
+seer lookup example.com        # Smart RDAP + WHOIS lookup
+seer dig example.com MX        # DNS query
+seer status example.com        # HTTP, SSL, and expiration check
+seer ssl example.com           # Full SSL chain inspection
+seer                           # Launch interactive REPL
 ```
 
-**Requirements:** Rust 1.70+ ([install Rust](https://rustup.rs/))
-
-### Installing seer-core (Rust Library)
-
-To use Seer in your Rust project, add `seer-core` to your `Cargo.toml`:
+### Use as a Rust library
 
 ```toml
 [dependencies]
-seer-core = "0.12"
+seer-core = "0.18"
 tokio = { version = "1", features = ["full"] }
 ```
 
-Then import and use it:
-
-```rust
-use seer_core::{WhoisClient, DnsResolver, RecordType};
-
-#[tokio::main]
-async fn main() -> seer_core::Result<()> {
-    let client = WhoisClient::new();
-    let result = client.lookup("example.com").await?;
-    println!("Registrar: {:?}", result.registrar);
-    Ok(())
-}
-```
-
-See the [Rust Library Usage](#rust-library) section for detailed examples.
-
-### Full Installation (All Components)
-
-To install everything (CLI + Python library + REST API + MCP server):
-
-```bash
-# Clone the repository
-git clone https://github.com/TheZacillac/seer.git
-cd seer
-
-# Install CLI to PATH
-cargo install --path seer-cli
-
-# Install maturin (builds Python extensions from Rust)
-uv pip install maturin
-
-# Build and install Python bindings
-cd seer-py
-maturin develop --release
-cd ..
-
-# Install REST API and MCP server
-cd seer-api
-uv pip install -e .
-cd ..
-```
-
-After installation, you'll have access to:
-- `seer` — CLI tool
-- `seer-api` — REST API server
-- `seer-mcp` — MCP server for AI assistants
-- `import seer` — Python library
-
-**Requirements:**
-- Rust 1.70+
-- Python 3.9+
-- [uv](https://docs.astral.sh/uv/) (recommended) or pip
-
-### Python Library Only
-
-```bash
-# Clone and navigate to seer-py
-git clone https://github.com/TheZacillac/seer.git
-cd seer/seer-py
-
-# Install maturin and build
-uv pip install maturin
-maturin develop --release
-```
-
-Or build a distributable wheel:
-
-```bash
-maturin build --release
-uv pip install target/wheels/seer-*.whl
-```
-
-### REST API & MCP Server
-
-> **Prerequisite:** The Python library must be installed first (see above).
-
-```bash
-cd seer-api
-uv pip install -e .
-```
-
-This provides two commands:
-- `seer-api` — Start the REST API server
-- `seer-mcp` — Start the MCP server
+> **Requirements:** Rust 1.70+ · Python 3.9+ (for Python bindings/API)
 
 ---
 
-## Usage
+## 📦 Packages
 
-### CLI
+| Package | Type | Install | Description |
+|---------|------|---------|-------------|
+| **seer-core** | Rust library | `cargo add seer-core` | Core library — all business logic |
+| **seer-cli** | Rust binary | `cargo install seer-cli` | The `seer` command-line tool |
+| **seer-py** | Python extension | `maturin develop --release` | Python bindings via PyO3 |
+| **seer-api** | Python package | `pip install -e .` | REST API + MCP server |
 
-The CLI offers two modes: **command mode** for scripts/one-off queries, and **interactive REPL** for exploratory work.
+<details>
+<summary><b>seer-cli vs seer-core — which do I need?</b></summary>
 
-#### Command Mode
+| | seer-cli | seer-core |
+|---|----------|-----------|
+| **What** | Executable binary | Rust library crate |
+| **Install** | `cargo install seer-cli` | `cargo add seer-core` |
+| **Use** | Run `seer` in your terminal | `use seer_core::*` in Rust code |
+| **Provides** | Commands, REPL, formatted output | Structs, clients, async APIs |
+| **Depends on** | seer-core internally | Nothing — it's the foundation |
+
+</details>
+
+---
+
+## 💻 CLI Usage
+
+### Command Mode
 
 ```bash
 # Smart lookup (concurrent RDAP + WHOIS)
 seer lookup example.com
 
-# WHOIS lookup
-seer whois example.com
+# Comprehensive domain info (merged RDAP + WHOIS)
+seer info example.com
 
-# RDAP lookups
-seer rdap example.com          # Domain
-seer rdap 8.8.8.8              # IP address
-seer rdap AS15169              # ASN
+# WHOIS / RDAP
+seer whois example.com
+seer rdap example.com           # Domain
+seer rdap 8.8.8.8               # IP address
+seer rdap AS15169               # ASN
 
 # DNS queries
-seer dig example.com           # A records (default)
-seer dig example.com MX        # MX records
-seer dig example.com A @8.8.8.8  # Custom nameserver
+seer dig example.com             # A records (default)
+seer dig example.com MX          # Specific record type
+seer dig example.com A -s 8.8.8.8  # Custom nameserver
 
-# DNS propagation check
+# DNS propagation & monitoring
 seer prop example.com A
+seer follow example.com 20 0.5       # 20 checks, 30s interval
+seer follow example.com 10 1 MX --changes-only
 
-# Domain status check (HTTP, SSL, expiration)
-seer status example.com
-
-# DNS monitoring over time
-seer follow example.com              # 10 iterations, 1 min interval
-seer follow example.com 20 0.5       # 20 iterations, 30 sec interval
-seer follow example.com 10 1 MX --changes-only  # Only show changes
-
-# Bulk operations
-seer bulk lookup domains.txt
-seer bulk whois domains.txt
-seer bulk dig domains.txt A
-seer bulk status domains.txt
-seer bulk avail domains.txt
-seer bulk status domains.txt -o results.csv  # Export to CSV
-
-# SSL certificate inspection
-seer ssl example.com
-
-# TLD info
-seer tld .com
-
-# Compare DNS across nameservers
+# DNSSEC & DNS comparison
+seer dnssec example.com
 seer compare example.com A 8.8.8.8 1.1.1.1
 
-# Enumerate subdomains via CT logs
-seer subdomains example.com
+# Domain health & SSL
+seer status example.com
+seer ssl example.com
 
-# Compare two domains side-by-side
+# Reverse DNS
+seer reverse 8.8.8.8
+
+# Discovery
+seer avail example.com
+seer subdomains example.com
+seer tld .com
+
+# Domain diff
 seer diff example.com google.com
 
-# Domain watchlist
+# Watchlist
 seer watch add example.com
 seer watch list
-seer watch                    # Check all domains
+seer watch                        # Check all watched domains
 seer watch remove example.com
 
 # Lookup history
 seer history example.com
 seer history --clear
 
-# Domain availability (exit code 0=available, 1=taken)
-seer avail example.com
+# Bulk operations (with CSV export)
+seer bulk lookup domains.txt
+seer bulk status domains.txt -o results.csv
+seer bulk dig domains.txt MX
+seer bulk avail domains.txt
+seer bulk info domains.txt
 
 # Scriptable field extraction
 seer --quiet --fields registrar lookup example.com
 seer --quiet --fields certificate.issuer status example.com
+
+# Shell completions
+seer completions bash >> ~/.bashrc
+seer completions zsh >> ~/.zshrc
 ```
 
-#### Output Formats
+### Output Formats
 
 ```bash
-seer --format human lookup example.com     # Human-readable (default)
-seer --format json lookup example.com      # JSON output
-seer --format yaml lookup example.com      # YAML output
-seer --format markdown lookup example.com  # Markdown output
+seer --format human lookup example.com      # Colored, human-readable (default)
+seer --format json lookup example.com       # JSON
+seer --format yaml lookup example.com       # YAML
+seer --format markdown lookup example.com   # Markdown table
 ```
 
-#### Interactive REPL
+### Interactive REPL
 
-Launch by running `seer` without arguments:
+Launch by running `seer` with no arguments:
 
-```bash
+```
 $ seer
 seer> lookup example.com
-seer> whois google.com
 seer> dig github.com MX
 seer> status cloudflare.com
 seer> set output json
@@ -335,181 +243,150 @@ seer> help
 seer> exit
 ```
 
-**REPL features:**
-- Command history (saved to `~/.seer_history`)
-- Tab completion for commands
-- Loading spinners during operations
-- Persistent session state
+Features: command history (`~/.seer_history`), tab completion, loading spinners, persistent session state.
 
-### Python Library
+---
+
+## 🐍 Python Library
 
 ```python
 import seer
 
-# Smart lookup (concurrent RDAP + WHOIS)
+# Smart lookup
 result = seer.lookup("example.com")
 
-# WHOIS lookup
+# WHOIS / RDAP
 whois = seer.whois("example.com")
+rdap  = seer.rdap_domain("example.com")
+rdap  = seer.rdap_ip("8.8.8.8")
+rdap  = seer.rdap_asn(15169)
 
-# RDAP lookups
-rdap_domain = seer.rdap_domain("example.com")
-rdap_ip = seer.rdap_ip("8.8.8.8")
-rdap_asn = seer.rdap_asn(15169)
-
-# DNS queries
-dns = seer.dig("example.com", record_type="A")
-dns = seer.dig("example.com", record_type="MX", nameserver="8.8.8.8")
-
-# DNS propagation
+# DNS
+records     = seer.dig("example.com", record_type="MX")
 propagation = seer.propagation("example.com", record_type="A")
 
-# Domain status (HTTP, SSL, expiration)
+# Domain health & SSL
 status = seer.status("example.com")
+ssl    = seer.ssl("example.com")
+dnssec = seer.dnssec("example.com")
+
+# Availability & info
+available = seer.availability("example.com")
+info      = seer.info("example.com")
+
+# Comparison & enumeration
+diff       = seer.diff("example.com", "google.com")
+comparison = seer.dns_compare("example.com", "A", "8.8.8.8", "1.1.1.1")
+subdomains = seer.subdomains("example.com")
 
 # Bulk operations
 results = seer.bulk_lookup(["example.com", "google.com"], concurrency=10)
-results = seer.bulk_whois(["example.com", "google.com"])
-results = seer.bulk_dig(["example.com", "google.com"], record_type="A")
 results = seer.bulk_status(["example.com", "google.com"])
+results = seer.bulk_dig(["example.com", "google.com"], record_type="A")
+results = seer.bulk_info(["example.com", "google.com"])
 ```
 
-#### Example: Check SSL Certificate
+<details>
+<summary><b>Example: Check SSL Certificate</b></summary>
 
 ```python
 status = seer.status("example.com")
 if cert := status.get("certificate"):
     print(f"SSL Valid: {cert['is_valid']}")
-    print(f"Expires: {cert['valid_until']}")
-    print(f"Days until expiry: {cert['days_until_expiry']}")
+    print(f"Expires:   {cert['valid_until']}")
+    print(f"Days left: {cert['days_until_expiry']}")
 ```
 
-### Rust Library
+</details>
 
-Add to `Cargo.toml`:
+---
+
+## 🦀 Rust Library
 
 ```toml
 [dependencies]
-seer-core = "0.12"
+seer-core = "0.18"
 tokio = { version = "1", features = ["full"] }
 ```
 
-#### Smart Lookup
-
 ```rust
-use seer_core::SmartLookup;
+use seer_core::{SmartLookup, DnsResolver, RecordType, StatusClient};
 
 #[tokio::main]
 async fn main() -> seer_core::Result<()> {
+    // Smart lookup (RDAP → WHOIS fallback)
     let lookup = SmartLookup::new();
     let result = lookup.lookup("example.com").await?;
 
-    match result {
-        seer_core::LookupResult::Rdap { data, .. } => {
-            println!("RDAP: {:?}", data.domain_name());
-        }
-        seer_core::LookupResult::Whois { data, .. } => {
-            println!("WHOIS: {}", data.domain);
-        }
-    }
-    Ok(())
-}
-```
-
-#### DNS Resolution
-
-```rust
-use seer_core::{DnsResolver, RecordType};
-
-#[tokio::main]
-async fn main() -> seer_core::Result<()> {
+    // DNS resolution
     let resolver = DnsResolver::new();
-    let records = resolver.resolve("example.com", RecordType::A, None).await?;
-
+    let records = resolver.resolve("example.com", RecordType::MX, None).await?;
     for record in records {
         println!("{}: {}", record.record_type, record.data);
     }
-    Ok(())
-}
-```
 
-#### Domain Status Check
-
-```rust
-use seer_core::StatusClient;
-
-#[tokio::main]
-async fn main() -> seer_core::Result<()> {
+    // Domain status check
     let client = StatusClient::new();
     let status = client.check("example.com").await?;
+    println!("HTTP: {:?}", status.http_status);
 
-    println!("HTTP Status: {:?}", status.http_status);
-    println!("SSL Valid: {:?}", status.certificate.map(|c| c.is_valid));
     Ok(())
 }
 ```
 
-See [seer-core/README.md](seer-core/README.md) for complete API documentation.
+See [seer-core/README.md](seer-core/README.md) for the full API reference.
 
-### REST API
+---
 
-Start the server:
+## 🌍 REST API
 
 ```bash
-seer-api
+seer-api   # Starts on http://localhost:8000
 ```
-
-The API runs on `http://localhost:8000` with auto-reload enabled.
-
-#### Endpoints
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/` | GET | List available endpoints |
-| `/health` | GET | Health check |
-| `/lookup/{domain}` | GET | Smart lookup |
+| `/lookup/{domain}` | GET | Smart lookup (RDAP + WHOIS) |
 | `/lookup/bulk` | POST | Bulk smart lookups |
 | `/whois/{domain}` | GET | WHOIS lookup |
 | `/rdap/domain/{domain}` | GET | RDAP domain lookup |
 | `/rdap/ip/{ip}` | GET | RDAP IP lookup |
 | `/rdap/asn/{asn}` | GET | RDAP ASN lookup |
 | `/dns/{domain}/{record_type}` | GET | DNS query |
+| `/dns/bulk` | POST | Bulk DNS queries |
 | `/propagation/{domain}/{record_type}` | GET | DNS propagation check |
+| `/propagation/bulk` | POST | Bulk propagation checks |
 | `/status/{domain}` | GET | Domain status check |
 | `/status/bulk` | POST | Bulk status checks |
-
-#### Examples
+| `/health` | GET | Health check |
 
 ```bash
-# Smart lookup
+# Examples
 curl http://localhost:8000/lookup/example.com
-
-# DNS query
 curl http://localhost:8000/dns/example.com/MX
-
-# Bulk lookup
 curl -X POST http://localhost:8000/lookup/bulk \
   -H "Content-Type: application/json" \
   -d '{"domains": ["example.com", "google.com"]}'
 ```
 
-API documentation available at:
-- **Swagger UI:** http://localhost:8000/docs
-- **ReDoc:** http://localhost:8000/redoc
+API docs: [Swagger UI](http://localhost:8000/docs) · [ReDoc](http://localhost:8000/redoc)
 
-### MCP Server
+---
 
-Start the MCP server for AI assistant integration:
+## 🤖 MCP Server
+
+Integrate Seer with AI assistants via the [Model Context Protocol](https://modelcontextprotocol.io/):
 
 ```bash
-seer-mcp
+seer-mcp   # Runs on stdio transport
 ```
 
-#### Available Tools
+**16 tools available:**
 
 | Tool | Description |
 |------|-------------|
-| `seer_lookup` | Smart domain lookup (RDAP/WHOIS) |
+| `seer_lookup` | Smart domain lookup |
+| `seer_info` | Comprehensive domain info |
 | `seer_whois` | WHOIS lookup |
 | `seer_rdap_domain` | RDAP domain lookup |
 | `seer_rdap_ip` | RDAP IP lookup |
@@ -521,8 +398,11 @@ seer-mcp
 | `seer_bulk_whois` | Bulk WHOIS lookups |
 | `seer_bulk_dig` | Bulk DNS queries |
 | `seer_bulk_status` | Bulk status checks |
+| `seer_bulk_propagation` | Bulk propagation checks |
+| `seer_bulk_info` | Bulk domain info |
 
-#### Claude Desktop Integration
+<details>
+<summary><b>Claude Desktop configuration</b></summary>
 
 Add to `claude_desktop_config.json`:
 
@@ -536,221 +416,171 @@ Add to `claude_desktop_config.json`:
 }
 ```
 
----
-
-## Supported DNS Record Types
-
-| Type | Description |
-|------|-------------|
-| `A` | IPv4 address |
-| `AAAA` | IPv6 address |
-| `MX` | Mail exchange |
-| `TXT` | Text records |
-| `NS` | Nameserver |
-| `SOA` | Start of authority |
-| `CNAME` | Canonical name |
-| `CAA` | Certification authority authorization |
-| `PTR` | Pointer record |
-| `SRV` | Service locator |
-| `DNSKEY` | DNSSEC public key |
-| `DS` | Delegation signer (DNSSEC) |
-| `ANY` | All available records |
+</details>
 
 ---
 
-## Global DNS Servers
+## 📡 DNS Record Types
 
-Propagation checks query 29 nameservers across 6 regions:
-
-| Region | Nameservers |
-|--------|-------------|
-| **North America** | Google (8.8.8.8), Cloudflare (1.1.1.1), OpenDNS (208.67.222.222), Quad9 (9.9.9.9), Level3 (4.2.2.1) |
-| **Europe** | DNS.Watch (84.200.69.80), Mullvad (194.242.2.2), dns0.eu (193.110.81.0), Yandex (77.88.8.8), UncensoredDNS (91.239.100.100) |
-| **Asia Pacific** | AliDNS (223.5.5.5), 114DNS (114.114.114.114), Tencent DNSPod (119.29.29.29), TWNIC (101.101.101.101), HiNet (168.95.1.1) |
-| **Latin America** | Claro Brasil, Telefonica Brasil, Antel Uruguay, Telmex Mexico, CenturyLink LATAM |
-| **Africa** | Liquid Telecom, SEACOM, Safaricom Kenya, MTN South Africa, Telecom Egypt |
-| **Middle East** | Etisalat UAE, STC Saudi, Bezeq Israel, Turk Telekom, Ooredoo Qatar |
+| Type | Description | | Type | Description |
+|------|-------------|---|------|-------------|
+| `A` | IPv4 address | | `CAA` | CA authorization |
+| `AAAA` | IPv6 address | | `PTR` | Pointer record |
+| `MX` | Mail exchange | | `SRV` | Service locator |
+| `TXT` | Text records | | `DNSKEY` | DNSSEC public key |
+| `NS` | Nameserver | | `DS` | Delegation signer |
+| `SOA` | Start of authority | | `ANY` | All records |
+| `CNAME` | Canonical name | | | |
 
 ---
 
-## Configuration
+## 🌏 Global DNS Propagation Servers
+
+Propagation checks query **29 nameservers** across **6 regions**:
+
+| Region | Servers |
+|--------|---------|
+| 🇺🇸 **North America** | Google `8.8.8.8` · Cloudflare `1.1.1.1` · OpenDNS · Quad9 · Level3 |
+| 🇪🇺 **Europe** | DNS.Watch · Mullvad · dns0.eu · Yandex · UncensoredDNS |
+| 🌏 **Asia Pacific** | AliDNS · 114DNS · Tencent DNSPod · TWNIC · HiNet |
+| 🌎 **Latin America** | Claro Brasil · Telefonica Brasil · Antel Uruguay · Telmex · CenturyLink |
+| 🌍 **Africa** | Liquid Telecom · SEACOM · Safaricom · MTN South Africa · Telecom Egypt |
+| 🌐 **Middle East** | Etisalat UAE · STC Saudi · Bezeq Israel · Turk Telekom · Ooredoo Qatar |
+
+---
+
+## ⚙️ Configuration
 
 ### Environment Variables
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `RUST_LOG` | Logging level (`trace`, `debug`, `info`, `warn`, `error`) | — |
-| `SEER_CORS_ORIGINS` | Comma-separated CORS origins for REST API | `*` (all) |
-| `SEER_RATE_LIMIT` | Rate limit for REST API (requests/minute) | `30` |
+| `RUST_LOG` | Logging level (`trace` / `debug` / `info` / `warn` / `error`) | — |
+| `SEER_CORS_ORIGINS` | Comma-separated CORS origins for REST API | `*` |
+| `SEER_RATE_LIMIT` | REST API rate limit (requests/minute) | `30` |
+
+### Config File
+
+Initialize a config file at `~/.seer/config.toml`:
+
+```bash
+seer config --init
+```
 
 ### Timeouts
 
-All clients support configurable timeouts:
-
-| Client | Default Timeout |
-|--------|-----------------|
-| WHOIS | 10 seconds |
-| RDAP | 30 seconds |
-| DNS | 5 seconds (with 2 retries) |
-| HTTP/SSL | 10 seconds |
+| Client | Default |
+|--------|---------|
+| WHOIS | 10s |
+| RDAP | 30s |
+| DNS | 5s (2 retries) |
+| HTTP / SSL | 10s |
+| Propagation | 15s |
 
 ### Bulk Operations
 
-- **Input formats:** Plain text (one domain per line), CSV (uses first column)
-- **Comments:** Lines starting with `#` are ignored
-- **Default concurrency:** 10
-- **Maximum concurrency:** 50
-- **Maximum domains per API request:** 100
+- **Input:** plain text (one domain per line) or CSV (first column)
+- **Comments:** lines starting with `#` are skipped
+- **Concurrency:** default 10, max 50
+- **API limit:** max 100 domains per request
 
 ---
 
-## Roadmap
+## 🔮 Roadmap
 
-Features under investigation for future releases:
-
-- **Scheduled Monitoring Daemon** — `seer monitor --config monitors.toml` running as a background service that checks domains on a schedule and sends notifications (email, Slack webhook, PagerDuty) when domains approach expiration thresholds, SSL certificates are about to expire, or DNS records change unexpectedly. This is the natural evolution of the `watch`, `follow`, and `status` commands into a persistent monitoring solution.
+- **Scheduled Monitoring Daemon** — `seer monitor --config monitors.toml` as a background service with notifications (email, Slack, PagerDuty) for expiring domains, SSL certificates, and unexpected DNS changes. The natural evolution of `watch`, `follow`, and `status` into persistent monitoring.
 
 ---
 
-## Development
+## 🛠️ Development
 
 ### Building
 
 ```bash
-# Build all Rust packages
-cargo build --release
-
-# Build Python bindings
-cd seer-py && maturin develop --release
-
-# Install API package
-cd seer-api && pip install -e .
+cargo build --release                        # All Rust packages
+cd seer-py && maturin develop --release      # Python bindings
+cd seer-api && pip install -e .              # REST API + MCP server
 ```
 
-### Running Tests
+### Testing
 
 ```bash
-# Rust tests
-cargo test
-
-# Python tests
-cd seer-api && pytest
+cargo test                    # All Rust tests
+cargo test -p seer-core       # Core library only
+cd seer-api && pytest         # Python API tests
+RUST_LOG=debug cargo test     # With debug logging
 ```
 
-### Logging
-
-Enable debug logging:
+### Linting
 
 ```bash
-RUST_LOG=debug seer lookup example.com
+cargo fmt --all -- --check    # Format check
+cargo clippy -- -D warnings   # Lint
 ```
 
----
-
-## Project Structure
+### Project Structure
 
 ```
 seer/
-├── README.md               # This file
-├── Cargo.toml              # Workspace configuration
-├── seer-core/              # Core Rust library (all business logic)
-│   ├── README.md
+├── Cargo.toml                # Workspace root
+├── seer-core/                # Core Rust library (all business logic)
 │   └── src/
-│       ├── lib.rs          # Module exports
-│       ├── error.rs        # Error types
-│       ├── lookup.rs       # Smart lookup (concurrent RDAP + WHOIS)
-│       ├── validation.rs   # Domain validation & SSRF protection
-│       ├── colors.rs       # Catppuccin color palette
-│       ├── whois/          # WHOIS client and parser
-│       ├── rdap/           # RDAP client with IANA bootstrap
-│       ├── dns/            # DNS resolver, propagation, and follow
-│       ├── status/         # Domain status checker
-│       ├── bulk/           # Bulk operation executor
-│       └── output/         # Output formatters (human/JSON/YAML)
+│       ├── lib.rs            # Module exports
+│       ├── error.rs          # Centralized error types
+│       ├── lookup.rs         # Smart lookup (RDAP + WHOIS)
+│       ├── validation.rs     # Domain validation & SSRF protection
+│       ├── config.rs         # Configuration management
+│       ├── whois/            # WHOIS client, parser, server mapping
+│       ├── rdap/             # RDAP client with IANA bootstrap
+│       ├── dns/              # Resolver, propagation, DNSSEC, follow
+│       ├── ssl/              # SSL certificate chain inspection
+│       ├── status/           # HTTP, SSL, and expiration checking
+│       ├── bulk/             # Concurrent bulk executor
+│       ├── diff/             # Domain comparison
+│       ├── availability/     # Domain availability checking
+│       ├── subdomains/       # CT log enumeration
+│       ├── tld/              # TLD information
+│       ├── watchlist/        # Domain monitoring
+│       ├── history/          # Lookup history tracking
+│       ├── domain_info/      # Flat domain info structure
+│       ├── cache/            # TTL and single-value caching
+│       ├── retry/            # Network retry with classification
+│       ├── logging/          # Structured logging + OpenTelemetry
+│       ├── output/           # Formatters (human/JSON/YAML/markdown)
+│       └── colors.rs         # Catppuccin color palette
 │
-├── seer-cli/               # CLI application
-│   ├── README.md
+├── seer-cli/                 # CLI application
 │   └── src/
-│       ├── main.rs         # Entry point with clap commands
-│       ├── display/        # Spinner and display utilities
-│       └── repl/           # Interactive REPL
+│       ├── main.rs           # Clap commands & dispatch
+│       ├── display/          # Spinner and progress utilities
+│       └── repl/             # Interactive REPL
 │
-├── seer-py/                # Python bindings (PyO3)
-│   ├── README.md
-│   ├── pyproject.toml      # Maturin build config
-│   └── src/lib.rs          # Python module definitions
+├── seer-py/                  # Python bindings (PyO3)
+│   ├── src/lib.rs            # Rust → Python bridge
+│   └── python/seer/          # Python package wrapper
 │
-└── seer-api/               # FastAPI REST server + MCP
-    ├── README.md
+└── seer-api/                 # FastAPI REST server + MCP
     └── seer_api/
-        ├── main.py         # FastAPI app
-        ├── routers/        # API endpoints
-        └── mcp/            # MCP server
+        ├── main.py           # FastAPI app
+        ├── routers/          # API endpoint modules
+        └── mcp/              # MCP server (16 tools)
 ```
 
 ---
 
-## Technology Stack
+## 🔧 Technology Stack
 
-### Core (Rust)
-
-| Dependency | Purpose |
-|------------|---------|
-| Tokio | Async runtime |
-| Reqwest | HTTP client (rustls-tls) |
-| Hickory-resolver | DNS resolution with DNSSEC |
-| Serde | Serialization |
-
-### CLI
-
-| Dependency | Purpose |
-|------------|---------|
-| Clap | Command-line parsing |
-| Rustyline | REPL line editing |
-| Indicatif | Progress indicators |
-| Colored | Terminal colors |
-
-### Python
-
-| Dependency | Purpose |
-|------------|---------|
-| PyO3 | Rust/Python bindings |
-| FastAPI | REST API framework |
-| Pydantic | Data validation |
-| MCP | Model Context Protocol |
-
-### Data Sources
-
-- WHOIS server list sourced from [WooMai/whois-servers](https://github.com/WooMai/whois-servers) (auto-synced with IANA Root Zone Database)
+| Layer | Technologies |
+|-------|-------------|
+| **Core** | Rust · Tokio · Reqwest (rustls) · Hickory-resolver (DNSSEC) · Serde · OpenTelemetry |
+| **CLI** | Clap v4 · Rustyline · Indicatif · Colored · Crossterm |
+| **Python** | PyO3 (ABI3) · FastAPI · Pydantic · MCP |
+| **Data** | WHOIS servers from [WooMai/whois-servers](https://github.com/WooMai/whois-servers) · IANA RDAP bootstrap |
 
 ---
 
-## AI Skill Definition
+## 📄 License
 
-The MCP skill definition for Seer has moved to the [scrolls](https://github.com/TheZacillac/scrolls) repository.
+MIT License — Copyright (c) 2026 Zac Roach
 
----
-
-## License
-
-MIT License
-
-Copyright (c) 2026 Zac Roach
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+See [LICENSE](LICENSE) for the full text.
