@@ -452,10 +452,12 @@ async fn load_bootstrap_data() -> Result<BootstrapData> {
     let ipv6_future = http.get(IANA_BOOTSTRAP_IPV6).send();
     let asn_future = http.get(IANA_BOOTSTRAP_ASN).send();
 
+    // Use join! instead of try_join! so one slow/failing registry doesn't
+    // block the others. We load whatever data is available.
     let (dns_resp, ipv4_resp, ipv6_resp, asn_resp) =
-        tokio::try_join!(dns_future, ipv4_future, ipv6_future, asn_future)?;
+        tokio::join!(dns_future, ipv4_future, ipv6_future, asn_future);
 
-    // Read bootstrap responses with incremental size check to prevent memory exhaustion
+    // Stream body with incremental size check to prevent memory exhaustion
     const MAX_BOOTSTRAP_SIZE: usize = 10 * 1024 * 1024; // 10 MB
 
     async fn read_bootstrap(resp: reqwest::Response) -> Result<BootstrapResponse> {
@@ -476,10 +478,42 @@ async fn load_bootstrap_data() -> Result<BootstrapData> {
         serde_json::from_slice(&body).map_err(Into::into)
     }
 
-    let dns_data = read_bootstrap(dns_resp).await?;
-    let ipv4_data = read_bootstrap(ipv4_resp).await?;
-    let ipv6_data = read_bootstrap(ipv6_resp).await?;
-    let asn_data = read_bootstrap(asn_resp).await?;
+    // Parse each response independently, logging failures
+    let dns_data = match dns_resp {
+        Ok(resp) => read_bootstrap(resp).await.ok(),
+        Err(e) => {
+            warn!(error = %e, "Failed to fetch DNS bootstrap from IANA");
+            None
+        }
+    };
+    let ipv4_data = match ipv4_resp {
+        Ok(resp) => read_bootstrap(resp).await.ok(),
+        Err(e) => {
+            warn!(error = %e, "Failed to fetch IPv4 bootstrap from IANA");
+            None
+        }
+    };
+    let ipv6_data = match ipv6_resp {
+        Ok(resp) => read_bootstrap(resp).await.ok(),
+        Err(e) => {
+            warn!(error = %e, "Failed to fetch IPv6 bootstrap from IANA");
+            None
+        }
+    };
+    let asn_data = match asn_resp {
+        Ok(resp) => read_bootstrap(resp).await.ok(),
+        Err(e) => {
+            warn!(error = %e, "Failed to fetch ASN bootstrap from IANA");
+            None
+        }
+    };
+
+    // If ALL four registries failed, that's a real error
+    if dns_data.is_none() && ipv4_data.is_none() && ipv6_data.is_none() && asn_data.is_none() {
+        return Err(SeerError::RdapBootstrapError(
+            "all IANA bootstrap registries failed".to_string(),
+        ));
+    }
 
     let mut dns = HashMap::new();
     let mut ipv4 = Vec::new();
@@ -487,14 +521,16 @@ async fn load_bootstrap_data() -> Result<BootstrapData> {
     let mut asn = Vec::new();
 
     // Parse DNS bootstrap
-    for service in dns_data.services {
-        if service.len() >= 2 {
-            if let (Some(tlds), Some(urls)) = (service[0].as_array(), service[1].as_array()) {
-                if let Some(url) = urls.first().and_then(|u| u.as_str()) {
-                    let url_arc: Arc<str> = Arc::from(url);
-                    for tld in tlds {
-                        if let Some(tld_str) = tld.as_str() {
-                            dns.insert(tld_str.to_lowercase(), Arc::clone(&url_arc));
+    if let Some(dns_data) = dns_data {
+        for service in dns_data.services {
+            if service.len() >= 2 {
+                if let (Some(tlds), Some(urls)) = (service[0].as_array(), service[1].as_array()) {
+                    if let Some(url) = urls.first().and_then(|u| u.as_str()) {
+                        let url_arc: Arc<str> = Arc::from(url);
+                        for tld in tlds {
+                            if let Some(tld_str) = tld.as_str() {
+                                dns.insert(tld_str.to_lowercase(), Arc::clone(&url_arc));
+                            }
                         }
                     }
                 }
@@ -503,19 +539,23 @@ async fn load_bootstrap_data() -> Result<BootstrapData> {
     }
 
     // Parse IPv4 bootstrap
-    for service in ipv4_data.services {
-        if service.len() >= 2 {
-            if let (Some(prefixes), Some(urls)) = (service[0].as_array(), service[1].as_array()) {
-                if let Some(url) = urls.first().and_then(|u| u.as_str()) {
-                    let url_arc: Arc<str> = Arc::from(url);
-                    for prefix in prefixes {
-                        if let Some(prefix_str) = prefix.as_str() {
-                            ipv4.push((
-                                IpRange {
-                                    prefix: prefix_str.to_string(),
-                                },
-                                Arc::clone(&url_arc),
-                            ));
+    if let Some(ipv4_data) = ipv4_data {
+        for service in ipv4_data.services {
+            if service.len() >= 2 {
+                if let (Some(prefixes), Some(urls)) =
+                    (service[0].as_array(), service[1].as_array())
+                {
+                    if let Some(url) = urls.first().and_then(|u| u.as_str()) {
+                        let url_arc: Arc<str> = Arc::from(url);
+                        for prefix in prefixes {
+                            if let Some(prefix_str) = prefix.as_str() {
+                                ipv4.push((
+                                    IpRange {
+                                        prefix: prefix_str.to_string(),
+                                    },
+                                    Arc::clone(&url_arc),
+                                ));
+                            }
                         }
                     }
                 }
@@ -524,19 +564,23 @@ async fn load_bootstrap_data() -> Result<BootstrapData> {
     }
 
     // Parse IPv6 bootstrap
-    for service in ipv6_data.services {
-        if service.len() >= 2 {
-            if let (Some(prefixes), Some(urls)) = (service[0].as_array(), service[1].as_array()) {
-                if let Some(url) = urls.first().and_then(|u| u.as_str()) {
-                    let url_arc: Arc<str> = Arc::from(url);
-                    for prefix in prefixes {
-                        if let Some(prefix_str) = prefix.as_str() {
-                            ipv6.push((
-                                IpRange {
-                                    prefix: prefix_str.to_string(),
-                                },
-                                Arc::clone(&url_arc),
-                            ));
+    if let Some(ipv6_data) = ipv6_data {
+        for service in ipv6_data.services {
+            if service.len() >= 2 {
+                if let (Some(prefixes), Some(urls)) =
+                    (service[0].as_array(), service[1].as_array())
+                {
+                    if let Some(url) = urls.first().and_then(|u| u.as_str()) {
+                        let url_arc: Arc<str> = Arc::from(url);
+                        for prefix in prefixes {
+                            if let Some(prefix_str) = prefix.as_str() {
+                                ipv6.push((
+                                    IpRange {
+                                        prefix: prefix_str.to_string(),
+                                    },
+                                    Arc::clone(&url_arc),
+                                ));
+                            }
                         }
                     }
                 }
@@ -545,15 +589,18 @@ async fn load_bootstrap_data() -> Result<BootstrapData> {
     }
 
     // Parse ASN bootstrap
-    for service in asn_data.services {
-        if service.len() >= 2 {
-            if let (Some(ranges), Some(urls)) = (service[0].as_array(), service[1].as_array()) {
-                if let Some(url) = urls.first().and_then(|u| u.as_str()) {
-                    let url_arc: Arc<str> = Arc::from(url);
-                    for range in ranges {
-                        if let Some(range_str) = range.as_str() {
-                            if let Some((start, end)) = parse_asn_range(range_str) {
-                                asn.push((AsnRange { start, end }, Arc::clone(&url_arc)));
+    if let Some(asn_data) = asn_data {
+        for service in asn_data.services {
+            if service.len() >= 2 {
+                if let (Some(ranges), Some(urls)) = (service[0].as_array(), service[1].as_array())
+                {
+                    if let Some(url) = urls.first().and_then(|u| u.as_str()) {
+                        let url_arc: Arc<str> = Arc::from(url);
+                        for range in ranges {
+                            if let Some(range_str) = range.as_str() {
+                                if let Some((start, end)) = parse_asn_range(range_str) {
+                                    asn.push((AsnRange { start, end }, Arc::clone(&url_arc)));
+                                }
                             }
                         }
                     }
@@ -713,5 +760,19 @@ mod tests {
     fn test_rdap_http_client_is_configured() {
         // Force lazy initialization and verify it doesn't panic
         let _client = &*RDAP_HTTP_CLIENT;
+    }
+
+    #[test]
+    fn test_parse_bootstrap_empty_services() {
+        // Verifies that parsing empty bootstrap data doesn't panic
+        let data = BootstrapData {
+            dns: HashMap::new(),
+            ipv4: Vec::new(),
+            ipv6: Vec::new(),
+            asn: Vec::new(),
+        };
+        // Should return None for any lookup on empty data
+        assert!(RdapClient::get_rdap_url_for_domain(&data, "example.com").is_none());
+        assert!(RdapClient::get_rdap_url_for_asn(&data, 12345).is_none());
     }
 }
