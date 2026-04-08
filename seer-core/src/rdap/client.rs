@@ -118,7 +118,7 @@ impl RdapClient {
 
     /// Sets the retry policy for transient network failures.
     ///
-    /// The default policy retries up to 3 times with exponential backoff.
+    /// The default policy retries up to 2 times with exponential backoff.
     pub fn with_retry_policy(mut self, policy: RetryPolicy) -> Self {
         self.retry_policy = policy;
         self
@@ -473,28 +473,52 @@ async fn load_bootstrap_data() -> Result<BootstrapData> {
 
     // Parse each response independently, logging failures
     let dns_data = match dns_resp {
-        Ok(resp) => read_bootstrap(resp).await.ok(),
+        Ok(resp) => match read_bootstrap(resp).await {
+            Ok(data) => Some(data),
+            Err(e) => {
+                warn!(error = %e, "Failed to parse DNS bootstrap response");
+                None
+            }
+        },
         Err(e) => {
             warn!(error = %e, "Failed to fetch DNS bootstrap from IANA");
             None
         }
     };
     let ipv4_data = match ipv4_resp {
-        Ok(resp) => read_bootstrap(resp).await.ok(),
+        Ok(resp) => match read_bootstrap(resp).await {
+            Ok(data) => Some(data),
+            Err(e) => {
+                warn!(error = %e, "Failed to parse IPv4 bootstrap response");
+                None
+            }
+        },
         Err(e) => {
             warn!(error = %e, "Failed to fetch IPv4 bootstrap from IANA");
             None
         }
     };
     let ipv6_data = match ipv6_resp {
-        Ok(resp) => read_bootstrap(resp).await.ok(),
+        Ok(resp) => match read_bootstrap(resp).await {
+            Ok(data) => Some(data),
+            Err(e) => {
+                warn!(error = %e, "Failed to parse IPv6 bootstrap response");
+                None
+            }
+        },
         Err(e) => {
             warn!(error = %e, "Failed to fetch IPv6 bootstrap from IANA");
             None
         }
     };
     let asn_data = match asn_resp {
-        Ok(resp) => read_bootstrap(resp).await.ok(),
+        Ok(resp) => match read_bootstrap(resp).await {
+            Ok(data) => Some(data),
+            Err(e) => {
+                warn!(error = %e, "Failed to parse ASN bootstrap response");
+                None
+            }
+        },
         Err(e) => {
             warn!(error = %e, "Failed to fetch ASN bootstrap from IANA");
             None
