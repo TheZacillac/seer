@@ -20,10 +20,11 @@ const IANA_BOOTSTRAP_IPV4: &str = "https://data.iana.org/rdap/ipv4.json";
 const IANA_BOOTSTRAP_IPV6: &str = "https://data.iana.org/rdap/ipv6.json";
 const IANA_BOOTSTRAP_ASN: &str = "https://data.iana.org/rdap/asn.json";
 
-/// Default timeout for RDAP queries (30 seconds).
-/// RDAP servers can be slow, especially during bootstrap loading which fetches
-/// from 4 IANA registries. Some regional registries also have high latency.
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Default timeout for RDAP queries (15 seconds).
+/// With the 5s connect_timeout, this gives 10s for the server to respond.
+/// Most RDAP servers respond within 2-5 seconds; slow ccTLD registries
+/// may need the full 15s.
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Connect timeout — fail fast when a host is unreachable rather than
 /// waiting the full request timeout on a TCP handshake that will never complete.
@@ -111,7 +112,7 @@ impl RdapClient {
     /// Creates a new RDAP client with default settings.
     pub fn new() -> Self {
         Self {
-            retry_policy: RetryPolicy::default(),
+            retry_policy: RetryPolicy::default().with_max_attempts(2),
         }
     }
 
@@ -703,7 +704,7 @@ mod tests {
     #[test]
     fn test_default_client_has_retry_policy() {
         let client = RdapClient::new();
-        assert_eq!(client.retry_policy.max_attempts, 3);
+        assert_eq!(client.retry_policy.max_attempts, 2);
     }
 
     #[test]
