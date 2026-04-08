@@ -559,8 +559,7 @@ async fn load_bootstrap_data() -> Result<BootstrapData> {
     if let Some(ipv4_data) = ipv4_data {
         for service in ipv4_data.services {
             if service.len() >= 2 {
-                if let (Some(prefixes), Some(urls)) =
-                    (service[0].as_array(), service[1].as_array())
+                if let (Some(prefixes), Some(urls)) = (service[0].as_array(), service[1].as_array())
                 {
                     if let Some(url) = urls.first().and_then(|u| u.as_str()) {
                         let url_arc: Arc<str> = Arc::from(url);
@@ -584,8 +583,7 @@ async fn load_bootstrap_data() -> Result<BootstrapData> {
     if let Some(ipv6_data) = ipv6_data {
         for service in ipv6_data.services {
             if service.len() >= 2 {
-                if let (Some(prefixes), Some(urls)) =
-                    (service[0].as_array(), service[1].as_array())
+                if let (Some(prefixes), Some(urls)) = (service[0].as_array(), service[1].as_array())
                 {
                     if let Some(url) = urls.first().and_then(|u| u.as_str()) {
                         let url_arc: Arc<str> = Arc::from(url);
@@ -609,8 +607,7 @@ async fn load_bootstrap_data() -> Result<BootstrapData> {
     if let Some(asn_data) = asn_data {
         for service in asn_data.services {
             if service.len() >= 2 {
-                if let (Some(ranges), Some(urls)) = (service[0].as_array(), service[1].as_array())
-                {
+                if let (Some(ranges), Some(urls)) = (service[0].as_array(), service[1].as_array()) {
                     if let Some(url) = urls.first().and_then(|u| u.as_str()) {
                         let url_arc: Arc<str> = Arc::from(url);
                         for range in ranges {
