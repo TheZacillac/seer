@@ -6,6 +6,8 @@ use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, instrument, warn};
 
+use tokio::time::timeout as tokio_timeout;
+
 use crate::availability::{AvailabilityChecker, AvailabilityResult};
 use crate::cache::TtlCache;
 use crate::error::{Result, SeerError};
@@ -14,6 +16,11 @@ use crate::whois::{get_registry_url, get_tld, WhoisClient, WhoisResponse};
 
 /// Cache TTL for lookup results (5 minutes).
 const LOOKUP_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+
+/// Grace period for the second protocol after the first one finishes.
+/// If WHOIS finishes and RDAP hasn't responded within this window, we
+/// use the WHOIS result rather than waiting the full RDAP timeout.
+const PROTOCOL_GRACE_PERIOD: Duration = Duration::from_secs(5);
 
 /// Global cache for lookup results to avoid redundant network calls.
 static LOOKUP_CACHE: Lazy<TtlCache<String, LookupResult>> =
@@ -253,16 +260,45 @@ impl SmartLookup {
             cb("Querying RDAP and WHOIS concurrently");
         }
 
-        let (rdap_result, whois_result) = tokio::join!(
-            self.rdap_client.lookup_domain(domain),
-            self.whois_client.lookup(domain)
-        );
+        let rdap_fut = self.rdap_client.lookup_domain(domain);
+        let whois_fut = self.whois_client.lookup(domain);
+
+        tokio::pin!(rdap_fut);
+        tokio::pin!(whois_fut);
+
+        // Race: whichever finishes first gets a grace period for the other.
+        let (rdap_result, whois_result) = tokio::select! {
+            rdap_res = &mut rdap_fut => {
+                // RDAP finished first — give WHOIS a grace period
+                let whois_res = tokio_timeout(PROTOCOL_GRACE_PERIOD, whois_fut).await;
+                let whois_result = match whois_res {
+                    Ok(res) => Some(res),
+                    Err(_) => {
+                        debug!("WHOIS did not finish within grace period, proceeding with RDAP only");
+                        None
+                    }
+                };
+                (Some(rdap_res), whois_result)
+            }
+            whois_res = &mut whois_fut => {
+                // WHOIS finished first — give RDAP a grace period
+                let rdap_res = tokio_timeout(PROTOCOL_GRACE_PERIOD, rdap_fut).await;
+                let rdap_result = match rdap_res {
+                    Ok(res) => Some(res),
+                    Err(_) => {
+                        debug!("RDAP did not finish within grace period, proceeding with WHOIS only");
+                        None
+                    }
+                };
+                (rdap_result, Some(whois_res))
+            }
+        };
 
         // Phase 1: If RDAP returned useful data, use it as primary
-        if let Ok(rdap_data) = rdap_result {
+        if let Some(Ok(rdap_data)) = rdap_result {
             if self.is_rdap_response_useful(&rdap_data) {
                 debug!("RDAP lookup successful");
-                let whois_fallback = whois_result.ok();
+                let whois_fallback = whois_result.and_then(|r| r.ok());
                 return Ok(LookupResult::Rdap {
                     data: Box::new(rdap_data),
                     whois_fallback,
@@ -270,7 +306,7 @@ impl SmartLookup {
             }
 
             // RDAP succeeded but response wasn't useful — try WHOIS
-            if let Ok(whois_data) = whois_result {
+            if let Some(Ok(whois_data)) = whois_result {
                 debug!("RDAP response incomplete, using WHOIS result");
                 if let Some(ref cb) = progress {
                     cb("RDAP response incomplete (using WHOIS)");
@@ -282,27 +318,30 @@ impl SmartLookup {
                 });
             }
 
-            // RDAP not useful, WHOIS also failed — availability fallback
-            let Err(whois_err) = whois_result else {
-                unreachable!("whois_result already checked as Err above");
+            // RDAP not useful, WHOIS also failed or timed out — availability fallback
+            let whois_err_str = match whois_result {
+                Some(Err(e)) => e.to_string(),
+                None => "WHOIS timed out waiting for RDAP".to_string(),
+                _ => unreachable!(),
             };
             return self
                 .availability_fallback(
                     domain,
                     "RDAP response incomplete".to_string(),
-                    whois_err.to_string(),
+                    whois_err_str,
                     progress,
                 )
                 .await;
         }
 
-        // Phase 2: RDAP failed — use WHOIS if it succeeded
-        let Err(rdap_err) = rdap_result else {
-            unreachable!("rdap_result already checked as Err above");
+        // Phase 2: RDAP failed or timed out — use WHOIS if it succeeded
+        let rdap_error_str = match rdap_result {
+            Some(Err(e)) => e.to_string(),
+            None => "RDAP timed out".to_string(),
+            _ => unreachable!(),
         };
-        let rdap_error_str = rdap_err.to_string();
 
-        if let Ok(whois_data) = whois_result {
+        if let Some(Ok(whois_data)) = whois_result {
             debug!("RDAP failed, using WHOIS result");
             if let Some(ref cb) = progress {
                 cb("RDAP not available (using WHOIS)");
@@ -315,10 +354,11 @@ impl SmartLookup {
         }
 
         // Phase 3: Both failed — try availability check as last resort
-        let Err(whois_err) = whois_result else {
-            unreachable!("whois_result already checked above");
+        let whois_error_str = match whois_result {
+            Some(Err(e)) => e.to_string(),
+            None => "WHOIS timed out".to_string(),
+            _ => unreachable!(),
         };
-        let whois_error_str = whois_err.to_string();
         self.availability_fallback(domain, rdap_error_str, whois_error_str, progress)
             .await
     }
