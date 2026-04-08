@@ -434,16 +434,8 @@ async fn load_bootstrap_data_with_retry(policy: &RetryPolicy) -> Result<Bootstra
 async fn load_bootstrap_data() -> Result<BootstrapData> {
     debug!("Loading RDAP bootstrap data from IANA");
 
-    // Defense-in-depth: validate IANA bootstrap URLs don't resolve to reserved IPs
-    let bootstrap_urls = [
-        IANA_BOOTSTRAP_DNS,
-        IANA_BOOTSTRAP_IPV4,
-        IANA_BOOTSTRAP_IPV6,
-        IANA_BOOTSTRAP_ASN,
-    ];
-    for url in &bootstrap_urls {
-        validate_url_not_reserved(url).await?;
-    }
+    // SSRF validation is skipped here — these are hardcoded IANA URLs, not user input.
+    // User-supplied URLs are still validated in query_rdap_internal().
 
     let http = &*RDAP_HTTP_CLIENT;
 
