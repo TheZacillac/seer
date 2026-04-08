@@ -25,6 +25,10 @@ const IANA_BOOTSTRAP_ASN: &str = "https://data.iana.org/rdap/asn.json";
 /// from 4 IANA registries. Some regional registries also have high latency.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Connect timeout — fail fast when a host is unreachable rather than
+/// waiting the full request timeout on a TCP handshake that will never complete.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// TTL for bootstrap data (24 hours)
 const BOOTSTRAP_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
@@ -33,6 +37,7 @@ const BOOTSTRAP_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 static RDAP_HTTP_CLIENT: Lazy<Client> = Lazy::new(|| {
     Client::builder()
         .timeout(DEFAULT_TIMEOUT)
+        .connect_timeout(CONNECT_TIMEOUT)
         .user_agent("Seer/1.0 (RDAP Client)")
         .pool_max_idle_per_host(10)
         .build()
@@ -702,5 +707,11 @@ mod tests {
         let ip_out: Ipv6Addr = "2001:db9::1".parse().unwrap();
         assert!(ipv6_matches_prefix("2001:db8::/33", &ip_in));
         assert!(!ipv6_matches_prefix("2001:db8::/33", &ip_out));
+    }
+
+    #[test]
+    fn test_rdap_http_client_is_configured() {
+        // Force lazy initialization and verify it doesn't panic
+        let _client = &*RDAP_HTTP_CLIENT;
     }
 }
