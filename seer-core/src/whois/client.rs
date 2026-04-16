@@ -128,6 +128,15 @@ impl WhoisClient {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<WhoisResponse>> + Send + 'a>>
     {
         Box::pin(async move {
+            // Enforce max referral depth BEFORE querying so we consult at most
+            // MAX_REFERRAL_DEPTH servers (depths 0..MAX_REFERRAL_DEPTH-1).
+            if depth >= MAX_REFERRAL_DEPTH {
+                warn!(depth = depth, server = %whois_server, "Max referral depth reached before query, aborting referral chain");
+                return Err(SeerError::WhoisError(
+                    "max WHOIS referral depth exceeded".to_string(),
+                ));
+            }
+
             // Check for circular referrals
             let server_lower = whois_server.to_lowercase();
             if visited.contains(&server_lower) {
@@ -143,12 +152,6 @@ impl WhoisClient {
             // Query with retry logic
             let raw_response = self.query_server_with_retry(whois_server, domain).await?;
             let current_response = WhoisResponse::parse(domain, whois_server, &raw_response);
-
-            // Stop following referrals if we've reached max depth — return what we have
-            if depth >= MAX_REFERRAL_DEPTH {
-                warn!(depth = depth, server = %whois_server, "Max referral depth reached, returning current response");
-                return Ok(current_response);
-            }
 
             // Prefer registry response when it has core data (registrar, dates,
             // nameservers).  Registrar (referral) servers are often slow, rate-
@@ -247,6 +250,16 @@ impl WhoisClient {
         // Parse IANA response to find the whois server
         // IANA response format includes a line like: "whois:        whois.nic.xyz"
         if let Some(server) = extract_iana_whois_server(&response) {
+            // Validate IANA-discovered hostname before trusting/caching it.
+            // A poisoned IANA response could otherwise inject a malicious
+            // WHOIS server that gets cached for 24h.
+            if !is_safe_whois_server(&server) {
+                warn!(server = %server, "IANA returned unsafe WHOIS server, rejecting");
+                return Err(SeerError::WhoisError(format!(
+                    "IANA returned unsafe WHOIS server: {}",
+                    server
+                )));
+            }
             return Ok(server);
         }
 
@@ -271,6 +284,15 @@ async fn query_server_internal(
     query: &str,
     timeout_duration: Duration,
 ) -> Result<String> {
+    // Defense in depth: reject CR/LF/NUL in the query before any TCP write.
+    // normalize_domain already filters these, but we enforce here too so
+    // alternate call paths cannot bypass the check.
+    if query.bytes().any(|b| b == 0 || b == b'\r' || b == b'\n') {
+        return Err(SeerError::WhoisError(
+            "query string must not contain CR/LF/NUL".into(),
+        ));
+    }
+
     let addr = format!("{}:{}", server, WHOIS_PORT);
 
     debug!("WHOIS query to {}", server);
@@ -441,4 +463,66 @@ mod tests {
         let client = WhoisClient::new().with_retry_policy(policy);
         assert_eq!(client.retry_policy.max_attempts, 5);
     }
+
+    #[tokio::test]
+    async fn query_server_internal_rejects_crlf_in_query() {
+        // CR in query should be rejected before any TCP connect.
+        let err = query_server_internal(
+            "whois.example.com",
+            "example.com\r\nWHOIS evil.example",
+            Duration::from_secs(1),
+        )
+        .await
+        .expect_err("CRLF in query must be rejected");
+        match err {
+            SeerError::WhoisError(msg) => {
+                assert!(msg.contains("CR/LF/NUL"), "unexpected message: {msg}");
+            }
+            other => panic!("expected WhoisError, got {other:?}"),
+        }
+
+        // LF-only and NUL should also be rejected.
+        assert!(
+            query_server_internal("whois.example.com", "a\nb", Duration::from_secs(1))
+                .await
+                .is_err()
+        );
+        assert!(
+            query_server_internal("whois.example.com", "a\0b", Duration::from_secs(1))
+                .await
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn iana_discovery_rejects_unsafe_server() {
+        // extract_iana_whois_server returns the value verbatim (lowercased).
+        // discover_whois_server_with_retry is expected to reject anything that
+        // fails is_safe_whois_server before caching it.
+        let synthetic = "refer: whois.iana.org\nwhois: 127.0.0.1\n";
+        let extracted = extract_iana_whois_server(synthetic);
+        assert_eq!(extracted.as_deref(), Some("127.0.0.1"));
+
+        // is_safe_whois_server must reject loopback IP literals, which is
+        // what the discovery wrapper now enforces before caching.
+        assert!(
+            !is_safe_whois_server(&extracted.unwrap()),
+            "is_safe_whois_server must reject 127.0.0.1"
+        );
+
+        // Sanity: hostnames with CR/LF or illegal chars are also rejected.
+        assert!(!is_safe_whois_server("whois.evil.com\r\nevil"));
+        assert!(!is_safe_whois_server("whois.evil.com:4444"));
+
+        // A legitimate hostname is accepted.
+        assert!(is_safe_whois_server("whois.nic.xyz"));
+    }
+
+    // H13 regression: with MAX_REFERRAL_DEPTH = 3, exactly 3 servers should be
+    // queried across a longer referral chain. Verifying this end-to-end
+    // requires mocking TCP WHOIS servers. The depth check in
+    // `lookup_with_referrals` now fires BEFORE `query_server_with_retry`, so
+    // the sequence 0 -> 1 -> 2 (each queries) then 3 (rejected pre-query)
+    // consults exactly MAX_REFERRAL_DEPTH servers. See the diff for
+    // Batch 5 / H13 for the fix location.
 }
