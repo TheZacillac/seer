@@ -101,11 +101,15 @@ app.add_middleware(RequestLoggingMiddleware)
 async def auth_middleware(request: Request, call_next):
     """Enforce optional bearer-token auth when SEER_API_KEY is set."""
     if API_KEY:
-        if request.url.path not in _AUTH_EXEMPT_PATHS:
-            provided = request.headers.get("Authorization", "")
-            expected = f"Bearer {API_KEY}"
-            if not hmac.compare_digest(provided, expected):
-                return JSONResponse({"detail": "unauthorized"}, status_code=401)
+        # Skip CORS preflight (OPTIONS) and public endpoints. The auth
+        # middleware runs outermost (wrapping CORSMiddleware), so rejecting
+        # OPTIONS here would strip CORS headers and break browser clients.
+        if request.method == "OPTIONS" or request.url.path in _AUTH_EXEMPT_PATHS:
+            return await call_next(request)
+        provided = request.headers.get("Authorization", "")
+        expected = f"Bearer {API_KEY}"
+        if not hmac.compare_digest(provided, expected):
+            return JSONResponse({"detail": "unauthorized"}, status_code=401)
     return await call_next(request)
 
 # Include routers

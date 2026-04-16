@@ -83,6 +83,32 @@ def test_api_key_required_when_set(monkeypatch):
     importlib.reload(main)
 
 
+def test_preflight_options_bypasses_auth(monkeypatch):
+    """CORS preflight OPTIONS must bypass auth so browsers get CORS headers."""
+    monkeypatch.setenv("SEER_API_KEY", "secret")
+    monkeypatch.setenv("SEER_CORS_ORIGINS", "https://example.org")
+    import seer_api.main as main
+
+    importlib.reload(main)
+    c = TestClient(main.app)
+
+    response = c.options(
+        "/lookup/example.com",
+        headers={
+            "Origin": "https://example.org",
+            "Access-Control-Request-Method": "GET",
+        },
+    )
+    assert response.status_code != 401, response.text
+    assert "access-control-allow-origin" in {
+        k.lower() for k in response.headers.keys()
+    }
+
+    monkeypatch.delenv("SEER_API_KEY")
+    monkeypatch.delenv("SEER_CORS_ORIGINS")
+    importlib.reload(main)
+
+
 # ---------------------------------------------------------------------------
 # M6: path param length caps
 # ---------------------------------------------------------------------------
