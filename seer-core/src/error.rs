@@ -72,6 +72,9 @@ pub enum SeerError {
     #[error("Configuration error: {0}")]
     ConfigError(String),
 
+    #[error("Invalid input: {0}")]
+    InvalidInput(String),
+
     #[error("{0}")]
     Other(String),
 
@@ -109,6 +112,7 @@ impl SeerError {
             SeerError::BulkOperationError { .. } => "Bulk operation partially failed".to_string(),
             SeerError::LookupFailed { domain, .. } => format!("Lookup failed for {}", domain),
             SeerError::ConfigError(msg) => format!("Configuration error: {}", msg),
+            SeerError::InvalidInput(msg) => format!("Invalid input: {}", msg),
             SeerError::Other(_) => "Operation failed".to_string(),
             SeerError::RetryExhausted { attempts, .. } => {
                 format!("Operation failed after {} attempts", attempts)

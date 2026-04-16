@@ -1,6 +1,6 @@
 mod bridge;
 
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -17,6 +17,20 @@ use seer_core::{
     whois::WhoisClient,
     AvailabilityChecker, DomainDiffer, SslChecker, SubdomainEnumerator,
 };
+use tokio::sync::watch;
+
+/// Global cancellation sender for the currently-active `dns_follow` call.
+///
+/// The sender is replaced at the start of each `dns_follow` invocation so that
+/// calls do not see cancellations from previous calls. `cancel_follow()`
+/// signals whatever call is currently active.
+fn follow_cancel_sender() -> &'static Mutex<watch::Sender<bool>> {
+    static INSTANCE: OnceLock<Mutex<watch::Sender<bool>>> = OnceLock::new();
+    INSTANCE.get_or_init(|| {
+        let (tx, _rx) = watch::channel(false);
+        Mutex::new(tx)
+    })
+}
 
 fn get_runtime() -> &'static tokio::runtime::Runtime {
     static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
@@ -517,11 +531,20 @@ fn dns_follow(
         .parse()
         .map_err(|e: seer_core::SeerError| PyValueError::new_err(e.to_string()))?;
 
-    // Cap parameters to prevent blocking the shared Tokio runtime for excessive durations
-    let iterations = iterations.min(100);
-    let interval_minutes = interval_minutes.clamp(0.1, 60.0);
+    // Validate iteration/interval via core; this rejects NaN/inf/negative and
+    // enforces the per-interval cap (<= 60 minutes).
+    let config = FollowConfig::new(iterations, interval_minutes)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
 
-    // Cap total wall-clock time to 1 hour to prevent blocking the shared runtime
+    // Additionally cap total wall-clock time and iteration count to prevent
+    // blocking the shared Tokio runtime for excessive durations.
+    const MAX_ITERATIONS: usize = 100;
+    if iterations > MAX_ITERATIONS {
+        return Err(PyValueError::new_err(format!(
+            "iterations must be <= {} (got {})",
+            MAX_ITERATIONS, iterations
+        )));
+    }
     let total_minutes = iterations as f64 * interval_minutes;
     const MAX_TOTAL_MINUTES: f64 = 60.0;
     if total_minutes > MAX_TOTAL_MINUTES {
@@ -531,19 +554,42 @@ fn dns_follow(
         )));
     }
 
-    let config = FollowConfig {
-        iterations,
-        interval_secs: (interval_minutes * 60.0) as u64,
-        changes_only: false,
+    // Install a fresh cancellation channel for this call so that any previous
+    // `cancel_follow()` signals do not affect it.
+    let cancel_rx = {
+        let (tx, rx) = watch::channel(false);
+        let mut slot = follow_cancel_sender()
+            .lock()
+            .expect("follow cancel sender mutex poisoned");
+        *slot = tx;
+        rx
     };
 
     let result = py.allow_threads(|| {
         rt.block_on(async {
             follower
-                .follow_simple(&domain, rt_parsed, nameserver.as_deref(), config)
+                .follow(
+                    &domain,
+                    rt_parsed,
+                    nameserver.as_deref(),
+                    config,
+                    None,
+                    Some(cancel_rx),
+                )
                 .await
         })
     });
+
+    // Reset the global sender so stale `cancel_follow()` calls after this
+    // invocation returns do not affect a subsequent call that happens to race
+    // before it installs its own sender.
+    {
+        let (tx, _rx) = watch::channel(false);
+        let mut slot = follow_cancel_sender()
+            .lock()
+            .expect("follow cancel sender mutex poisoned");
+        *slot = tx;
+    }
 
     match result {
         Ok(response) => {
@@ -553,6 +599,20 @@ fn dns_follow(
         }
         Err(e) => Err(PyRuntimeError::new_err(e.to_string())),
     }
+}
+
+/// Signal the currently-running `dns_follow` call (if any) to cancel.
+///
+/// This is a best-effort signal: the call will return on its next cancellation
+/// check point (between DNS lookups or while sleeping between iterations).
+/// If no `dns_follow` is currently running, this is a no-op.
+#[pyfunction]
+fn cancel_follow() -> PyResult<()> {
+    let slot = follow_cancel_sender()
+        .lock()
+        .expect("follow cancel sender mutex poisoned");
+    let _ = slot.send(true);
+    Ok(())
 }
 
 #[pyfunction]
@@ -674,6 +734,7 @@ fn _seer(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(dnssec, m)?)?;
     m.add_function(wrap_pyfunction!(dns_compare, m)?)?;
     m.add_function(wrap_pyfunction!(dns_follow, m)?)?;
+    m.add_function(wrap_pyfunction!(cancel_follow, m)?)?;
     m.add_function(wrap_pyfunction!(diff, m)?)?;
     m.add_function(wrap_pyfunction!(info, m)?)?;
     m.add_function(wrap_pyfunction!(bulk_info, m)?)?;

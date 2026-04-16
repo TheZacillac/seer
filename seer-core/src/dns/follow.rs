@@ -9,7 +9,7 @@ use tracing::{debug, instrument};
 
 use super::records::{DnsRecord, RecordType};
 use super::resolver::DnsResolver;
-use crate::error::Result;
+use crate::error::{Result, SeerError};
 
 /// Configuration for DNS follow operation
 #[derive(Debug, Clone)]
@@ -33,12 +33,39 @@ impl Default for FollowConfig {
 }
 
 impl FollowConfig {
-    pub fn new(iterations: usize, interval_minutes: f64) -> Self {
-        Self {
+    /// Construct a new `FollowConfig`.
+    ///
+    /// Validates:
+    /// - `iterations` must be >= 1
+    /// - `interval_minutes` must be finite (not NaN / infinity)
+    /// - `interval_minutes` must be non-negative
+    /// - `interval_minutes` must be at most 60
+    pub fn new(iterations: usize, interval_minutes: f64) -> Result<Self> {
+        if iterations == 0 {
+            return Err(SeerError::InvalidInput(
+                "iterations must be at least 1".into(),
+            ));
+        }
+        if !interval_minutes.is_finite() {
+            return Err(SeerError::InvalidInput(
+                "interval_minutes must be a finite number".into(),
+            ));
+        }
+        if interval_minutes < 0.0 {
+            return Err(SeerError::InvalidInput(
+                "interval_minutes must be non-negative".into(),
+            ));
+        }
+        if interval_minutes > 60.0 {
+            return Err(SeerError::InvalidInput(
+                "interval_minutes must be at most 60".into(),
+            ));
+        }
+        Ok(Self {
             iterations,
             interval_secs: (interval_minutes * 60.0) as u64,
             changes_only: false,
-        }
+        })
     }
 
     pub fn with_changes_only(mut self, changes_only: bool) -> Self {
@@ -305,7 +332,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_follow_config_new() {
-        let config = FollowConfig::new(5, 0.5);
+        let config = FollowConfig::new(5, 0.5).unwrap();
         assert_eq!(config.iterations, 5);
         assert_eq!(config.interval_secs, 30);
     }
@@ -313,7 +340,7 @@ mod tests {
     #[tokio::test]
     async fn test_follow_single_iteration() {
         let follower = DnsFollower::new();
-        let config = FollowConfig::new(1, 0.0);
+        let config = FollowConfig::new(1, 0.0).unwrap();
 
         let result = follower
             .follow_simple("example.com", RecordType::A, None, config)
@@ -323,5 +350,68 @@ mod tests {
         let result = result.unwrap();
         assert_eq!(result.completed_iterations(), 1);
         assert!(!result.interrupted);
+    }
+
+    #[test]
+    fn follow_config_rejects_zero_iterations() {
+        assert!(FollowConfig::new(0, 1.0).is_err());
+    }
+
+    #[test]
+    fn follow_config_rejects_infinite_interval() {
+        assert!(FollowConfig::new(10, f64::INFINITY).is_err());
+        assert!(FollowConfig::new(10, f64::NEG_INFINITY).is_err());
+    }
+
+    #[test]
+    fn follow_config_rejects_nan_interval() {
+        assert!(FollowConfig::new(10, f64::NAN).is_err());
+    }
+
+    #[test]
+    fn follow_config_rejects_negative_interval() {
+        assert!(FollowConfig::new(10, -1.0).is_err());
+    }
+
+    #[test]
+    fn follow_config_rejects_interval_above_cap() {
+        assert!(FollowConfig::new(10, 60.1).is_err());
+    }
+
+    #[test]
+    fn follow_config_accepts_valid() {
+        assert!(FollowConfig::new(10, 1.5).is_ok());
+        assert!(FollowConfig::new(1, 0.0).is_ok());
+        assert!(FollowConfig::new(1, 60.0).is_ok());
+    }
+
+    #[tokio::test]
+    async fn follow_honors_cancel() {
+        use tokio::sync::watch;
+
+        let (tx, rx) = watch::channel(false);
+        // 100 iterations with 30s intervals would take ~50 minutes.
+        let config = FollowConfig::new(100, 0.5).unwrap();
+        let follower = DnsFollower::new();
+
+        let handle = tokio::spawn(async move {
+            follower
+                .follow("example.com", RecordType::A, None, config, None, Some(rx))
+                .await
+        });
+
+        // Give the follow a tick to start and get into its first sleep.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        tx.send(true).unwrap();
+
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(10), handle)
+            .await
+            .expect("follow should return promptly after cancel");
+        let result = joined.expect("join").expect("follow result");
+        assert!(result.interrupted, "follow should be interrupted");
+        assert!(
+            result.completed_iterations() < 100,
+            "should not complete all iterations"
+        );
     }
 }

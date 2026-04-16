@@ -279,7 +279,7 @@ if result.has_inconsistencies() {
 use seer_core::dns::{DnsFollower, FollowConfig, RecordType};
 
 let follower = DnsFollower::new();
-let config = FollowConfig::new(10, 1.0)  // 10 checks, 1 minute interval
+let config = FollowConfig::new(10, 1.0)?  // 10 checks, 1 minute interval
     .with_changes_only(true);
 
 let result = follower.follow_simple("example.com", RecordType::A, None, config).await?;

@@ -728,8 +728,13 @@ async fn execute_command(
             let rt: seer_core::RecordType = record_type.parse()?;
             let ns = server.as_ref().map(|s| s.trim_start_matches('@'));
 
-            let config = seer_core::FollowConfig::new(iterations, interval_minutes)
-                .with_changes_only(changes_only);
+            let config = match seer_core::FollowConfig::new(iterations, interval_minutes) {
+                Ok(cfg) => cfg.with_changes_only(changes_only),
+                Err(e) => {
+                    eprintln!("{} {}", "Error:".ctp_red(), e);
+                    std::process::exit(1);
+                }
+            };
 
             let follower = seer_core::DnsFollower::new();
 

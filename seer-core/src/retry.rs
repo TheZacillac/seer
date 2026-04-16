@@ -200,6 +200,7 @@ impl RetryClassifier for NetworkRetryClassifier {
             SeerError::BulkOperationError { .. } => false,
             SeerError::LookupFailed { .. } => false,
             SeerError::ConfigError(_) => false,
+            SeerError::InvalidInput(_) => false,
             SeerError::RetryExhausted { .. } => false,
             SeerError::Other(_) => false,
         }

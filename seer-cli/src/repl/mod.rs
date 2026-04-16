@@ -912,8 +912,10 @@ impl Repl {
             }
         }
 
-        let config = seer_core::FollowConfig::new(iterations, interval_minutes)
-            .with_changes_only(changes_only);
+        let config = match seer_core::FollowConfig::new(iterations, interval_minutes) {
+            Ok(cfg) => cfg.with_changes_only(changes_only),
+            Err(e) => return CommandResult::Error(e.to_string()),
+        };
 
         println!(
             "Following {} {} records ({} iterations, {} interval)",
