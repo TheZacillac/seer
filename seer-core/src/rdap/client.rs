@@ -7,7 +7,7 @@ use futures::StreamExt;
 use once_cell::sync::Lazy;
 use reqwest::Client;
 use serde::Deserialize;
-use tokio::sync::RwLock;
+use tokio::sync::{Notify, RwLock};
 use tracing::{debug, instrument, warn};
 
 use super::types::RdapResponse;
@@ -60,6 +60,15 @@ static BOOTSTRAP_CACHE: Lazy<RwLock<Option<CachedBootstrap>>> = Lazy::new(|| RwL
 /// storms when IANA is unreachable.
 static BOOTSTRAP_LAST_ATTEMPT: Lazy<RwLock<Option<Instant>>> = Lazy::new(|| RwLock::new(None));
 
+/// Notifies waiters when an in-flight bootstrap load completes (success or
+/// failure). Solves the first-boot thundering-herd race where two concurrent
+/// cold-cache callers would otherwise see: caller A records its attempt
+/// timestamp, then caller B checks the timestamp and finds it "too recent"
+/// and returns a spurious `throttled and no cache available` error while A
+/// is still actively loading. Losers instead wait on this notify with a
+/// bounded timeout, then re-check the cache.
+static BOOTSTRAP_LOAD_NOTIFY: Lazy<Notify> = Lazy::new(Notify::new);
+
 /// Cached bootstrap data with timestamp for TTL tracking
 struct CachedBootstrap {
     data: BootstrapData,
@@ -110,6 +119,31 @@ struct BootstrapResponse {
     services: Vec<Vec<serde_json::Value>>,
 }
 
+/// Waits (bounded) for an in-flight bootstrap load to complete, then
+/// re-checks the cache. Used by losers of the throttle race so a concurrent
+/// cold-cache caller doesn't spuriously error with "throttled and no cache
+/// available" while the winner is still loading.
+///
+/// The `notified` future must be created BEFORE the caller observes the
+/// throttle condition — otherwise `notify_waiters()` could fire in the gap
+/// between observing "still throttled, empty cache" and subscribing, and
+/// this call would then block until timeout.
+async fn wait_for_in_flight_load(
+    notified: std::pin::Pin<&mut tokio::sync::futures::Notified<'_>>,
+) -> Result<()> {
+    // Bounded wait so we don't block forever if the winner's future was
+    // cancelled/dropped before it could notify.
+    let _ = tokio::time::timeout(DEFAULT_TIMEOUT, notified).await;
+    let cache = BOOTSTRAP_CACHE.read().await;
+    if cache.is_some() {
+        Ok(())
+    } else {
+        Err(SeerError::RdapBootstrapError(
+            "bootstrap refresh throttled and no cache available".to_string(),
+        ))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RdapClient {
     retry_policy: RetryPolicy,
@@ -153,6 +187,10 @@ impl RdapClient {
     /// Refresh attempts are also throttled to at most one per
     /// `BOOTSTRAP_REFRESH_MIN_INTERVAL` to avoid thundering-herd storms
     /// against IANA when bootstrap is down.
+    ///
+    /// Concurrent cold-cache callers coordinate via `BOOTSTRAP_LOAD_NOTIFY`:
+    /// losers of the throttle race wait (with a bounded timeout) for the
+    /// winner's load instead of erroring out immediately.
     async fn ensure_bootstrap(&self) -> Result<()> {
         // Fast path: read-lock and return if fresh.
         {
@@ -164,8 +202,17 @@ impl RdapClient {
             }
         }
 
+        // Register a notify subscription BEFORE we check the throttle gate,
+        // so a `notify_waiters()` from the winner can't slip between our
+        // "still throttled, empty cache" check and our `.notified().await`.
+        // `Notify::notified()` holds the permit slot the moment it's
+        // constructed; only `.await` blocks.
+        let notified = BOOTSTRAP_LOAD_NOTIFY.notified();
+        tokio::pin!(notified);
+
         // Throttle refresh attempts. If another caller tried very recently,
-        // return what we have (stale or empty) rather than piling on IANA.
+        // either return stale data we already have, or wait for their load
+        // to complete rather than erroring with "throttled and no cache".
         {
             let last = BOOTSTRAP_LAST_ATTEMPT.read().await;
             if let Some(ts) = *last {
@@ -176,9 +223,11 @@ impl RdapClient {
                         // We have some data (possibly stale) — accept it.
                         return Ok(());
                     }
-                    return Err(SeerError::RdapBootstrapError(
-                        "bootstrap refresh throttled and no cache available".to_string(),
-                    ));
+                    // Cache is empty AND another task is mid-load (or just
+                    // failed). Wait for them instead of returning an error.
+                    drop(cache);
+                    drop(last);
+                    return wait_for_in_flight_load(notified).await;
                 }
             }
         }
@@ -195,19 +244,20 @@ impl RdapClient {
                     if cache.is_some() {
                         return Ok(());
                     }
-                    return Err(SeerError::RdapBootstrapError(
-                        "bootstrap refresh throttled and no cache available".to_string(),
-                    ));
+                    drop(cache);
+                    return wait_for_in_flight_load(notified).await;
                 }
             }
             *last = Some(Instant::now());
         }
 
-        // Perform the actual load WITHOUT holding any cache lock.
+        // Perform the actual load WITHOUT holding any cache lock. Whichever
+        // branch exits, we must notify waiters so losers don't hang for the
+        // full bounded timeout.
         debug!("Loading/refreshing RDAP bootstrap data");
         let load_result = load_bootstrap_data_with_retry(&self.retry_policy).await;
 
-        match load_result {
+        let outcome = match load_result {
             Ok(data) => {
                 debug!(
                     dns_entries = data.dns.len(),
@@ -240,7 +290,11 @@ impl RdapClient {
                     Err(e)
                 }
             }
-        }
+        };
+
+        // Wake any losers waiting on our load. Safe to call in both branches.
+        BOOTSTRAP_LOAD_NOTIFY.notify_waiters();
+        outcome
     }
 
     /// Looks up the candidate RDAP base URLs for a domain's TLD.
@@ -411,17 +465,7 @@ impl RdapClient {
         }
 
         // All candidates failed.
-        let last = last_error
-            .unwrap_or_else(|| SeerError::RdapError("all RDAP candidates failed".to_string()));
-        if urls.len() > 1 {
-            Err(SeerError::RdapError(format!(
-                "all {} RDAP candidate URLs failed; last error: {}",
-                urls.len(),
-                last
-            )))
-        } else {
-            Err(last)
-        }
+        Err(wrap_all_candidates_failed(last_error, urls.len()))
     }
 
     /// Queries a single RDAP endpoint with retry logic.
@@ -829,6 +873,33 @@ async fn load_bootstrap_data() -> Result<BootstrapData> {
     })
 }
 
+/// Wraps the "all N candidate URLs failed" case for `query_rdap_urls`.
+///
+/// Preserves the `SeerError::Timeout` variant when the last failure was a
+/// timeout, so upstream callers that branch on `Timeout` for retry-or-not
+/// decisions can still do so. Non-timeout failures are wrapped in a generic
+/// `RdapError` with the last error's Display in the message. The
+/// single-candidate case returns the last error unchanged to avoid
+/// double-wrapping.
+fn wrap_all_candidates_failed(last_error: Option<SeerError>, candidate_count: usize) -> SeerError {
+    let last = last_error.unwrap_or_else(|| SeerError::RdapError("no candidates".to_string()));
+
+    if candidate_count <= 1 {
+        return last;
+    }
+
+    match last {
+        SeerError::Timeout(msg) => SeerError::Timeout(format!(
+            "all {} RDAP candidate URLs timed out; last error: {}",
+            candidate_count, msg
+        )),
+        other => SeerError::RdapError(format!(
+            "all {} RDAP candidate URLs failed; last error: {}",
+            candidate_count, other
+        )),
+    }
+}
+
 /// Builds full RDAP query URLs for each candidate base URL, preserving order.
 fn build_rdap_urls(bases: &[url::Url], path: &str) -> Vec<url::Url> {
     bases
@@ -1120,5 +1191,152 @@ mod tests {
     fn test_build_rdap_urls_empty_input_returns_empty() {
         let built = build_rdap_urls(&[], "domain/example.com");
         assert!(built.is_empty());
+    }
+
+    // --- wrap_all_candidates_failed tests (Issue 2 regression) ----------
+
+    #[test]
+    fn test_wrap_all_candidates_failed_preserves_timeout_variant() {
+        // When the last failure was a Timeout, the wrapped error must ALSO
+        // be a Timeout so upstream retry logic can still branch on it.
+        let last = SeerError::Timeout("body read timed out".to_string());
+        let wrapped = wrap_all_candidates_failed(Some(last), 3);
+        match wrapped {
+            SeerError::Timeout(msg) => {
+                assert!(
+                    msg.contains("all 3 RDAP candidate URLs timed out"),
+                    "expected wrapped timeout message, got: {}",
+                    msg
+                );
+                assert!(
+                    msg.contains("body read timed out"),
+                    "expected original message preserved, got: {}",
+                    msg
+                );
+            }
+            other => panic!(
+                "expected SeerError::Timeout after wrapping a Timeout, got: {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn test_wrap_all_candidates_failed_wraps_non_timeout_as_rdap_error() {
+        let last = SeerError::RdapError("500 internal error".to_string());
+        let wrapped = wrap_all_candidates_failed(Some(last), 2);
+        assert!(
+            matches!(wrapped, SeerError::RdapError(ref s) if s.contains("all 2 RDAP candidate URLs failed")),
+            "expected wrapped RdapError, got: {:?}",
+            wrapped
+        );
+    }
+
+    #[test]
+    fn test_wrap_all_candidates_failed_single_candidate_returns_unchanged() {
+        // Single-candidate case: return the last error unchanged to avoid
+        // misleading "all 1 candidates failed" wrapping.
+        let last = SeerError::Timeout("single timeout".to_string());
+        let wrapped = wrap_all_candidates_failed(Some(last), 1);
+        assert!(
+            matches!(wrapped, SeerError::Timeout(ref s) if s == "single timeout"),
+            "expected unchanged Timeout, got: {:?}",
+            wrapped
+        );
+    }
+
+    #[test]
+    fn test_wrap_all_candidates_failed_no_last_error_returns_placeholder() {
+        let wrapped = wrap_all_candidates_failed(None, 0);
+        assert!(matches!(wrapped, SeerError::RdapError(_)));
+    }
+
+    // --- BOOTSTRAP_LOAD_NOTIFY concurrency test (Issue 1 regression) ----
+    //
+    // This test spawns two concurrent `ensure_bootstrap` calls on what is
+    // effectively a cold/expired cache. The point is to exercise the
+    // throttle-race path: before the Notify fix, one of the tasks could
+    // observe `last_attempt.elapsed() < BOOTSTRAP_REFRESH_MIN_INTERVAL`
+    // with an empty cache and immediately return
+    // `RdapBootstrapError("bootstrap refresh throttled and no cache available")`.
+    //
+    // We cannot easily mock `load_bootstrap_data_with_retry`, but we CAN
+    // exercise the coordination primitives directly to verify that a waiter
+    // subscribing to BOOTSTRAP_LOAD_NOTIFY before a notify_waiters() call
+    // correctly wakes, and that a spurious wake followed by a populated
+    // cache is treated as success.
+
+    // Both bootstrap-notify tests mutate the shared BOOTSTRAP_CACHE static,
+    // so they must be serialized against each other (cargo test parallelism
+    // would otherwise race them).
+    static BOOTSTRAP_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[tokio::test]
+    async fn test_bootstrap_load_notify_wakes_waiter_when_cache_populated() {
+        let _guard = BOOTSTRAP_TEST_LOCK.lock().await;
+
+        // Start from a known-empty state.
+        {
+            let mut cache = BOOTSTRAP_CACHE.write().await;
+            *cache = None;
+        }
+
+        // Construct a notified subscription BEFORE triggering the notify,
+        // mirroring the order in ensure_bootstrap.
+        let notified = BOOTSTRAP_LOAD_NOTIFY.notified();
+        tokio::pin!(notified);
+
+        // Simulate a winning loader populating the cache and signalling.
+        {
+            let mut cache = BOOTSTRAP_CACHE.write().await;
+            *cache = Some(CachedBootstrap::new(BootstrapData {
+                dns: HashMap::new(),
+                ipv4: Vec::new(),
+                ipv6: Vec::new(),
+                asn: Vec::new(),
+            }));
+        }
+        BOOTSTRAP_LOAD_NOTIFY.notify_waiters();
+
+        let result = wait_for_in_flight_load(notified).await;
+        assert!(
+            result.is_ok(),
+            "expected waiter to see populated cache, got: {:?}",
+            result
+        );
+
+        // Clean up so we don't leak state into other tests.
+        {
+            let mut cache = BOOTSTRAP_CACHE.write().await;
+            *cache = None;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bootstrap_load_notify_empty_cache_after_wake_returns_error() {
+        let _guard = BOOTSTRAP_TEST_LOCK.lock().await;
+
+        // Ensure cache is empty.
+        {
+            let mut cache = BOOTSTRAP_CACHE.write().await;
+            *cache = None;
+        }
+
+        let notified = BOOTSTRAP_LOAD_NOTIFY.notified();
+        tokio::pin!(notified);
+
+        // Winner's load failed — they notify with empty cache.
+        BOOTSTRAP_LOAD_NOTIFY.notify_waiters();
+
+        let result = wait_for_in_flight_load(notified).await;
+        assert!(
+            matches!(
+                result,
+                Err(SeerError::RdapBootstrapError(ref s))
+                    if s.contains("throttled and no cache available")
+            ),
+            "expected throttled error when cache still empty after notify, got: {:?}",
+            result
+        );
     }
 }
