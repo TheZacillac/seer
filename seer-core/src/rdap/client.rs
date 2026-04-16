@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -33,8 +33,15 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// TTL for bootstrap data (24 hours)
 const BOOTSTRAP_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// Shared HTTP client for all RDAP operations (bootstrap + queries).
-/// Reusing a single Client enables connection pooling across requests.
+/// Minimum interval between bootstrap refresh attempts when the cache is
+/// expired-but-present or empty. Prevents a thundering herd of concurrent
+/// callers from all hammering IANA simultaneously during an outage.
+const BOOTSTRAP_REFRESH_MIN_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Shared HTTP client for bootstrap fetches against IANA.
+/// The bootstrap targets are hardcoded data.iana.org URLs, so this client
+/// does not need DNS-rebinding protection. Per-query RDAP requests build
+/// their own short-lived client that pins resolved IPs.
 static RDAP_HTTP_CLIENT: Lazy<Client> = Lazy::new(|| {
     Client::builder()
         .timeout(DEFAULT_TIMEOUT)
@@ -47,6 +54,11 @@ static RDAP_HTTP_CLIENT: Lazy<Client> = Lazy::new(|| {
 
 /// Bootstrap cache with TTL support
 static BOOTSTRAP_CACHE: Lazy<RwLock<Option<CachedBootstrap>>> = Lazy::new(|| RwLock::new(None));
+
+/// Timestamp of the most recent bootstrap refresh attempt (success or failure).
+/// Used together with `BOOTSTRAP_REFRESH_MIN_INTERVAL` to throttle retry
+/// storms when IANA is unreachable.
+static BOOTSTRAP_LAST_ATTEMPT: Lazy<RwLock<Option<Instant>>> = Lazy::new(|| RwLock::new(None));
 
 /// Cached bootstrap data with timestamp for TTL tracking
 struct CachedBootstrap {
@@ -72,13 +84,14 @@ impl CachedBootstrap {
 }
 
 /// Parsed IANA bootstrap data.
-/// Uses Arc<str> for URL strings to reduce cloning overhead when multiple
-/// TLDs/prefixes share the same RDAP server URL.
+/// Each TLD/prefix/ASN range is associated with an ordered list of
+/// candidate RDAP base URLs (IANA may list multiple per RFC 9224). Callers
+/// try them in order and fall back on failure.
 struct BootstrapData {
-    dns: HashMap<String, Arc<str>>,
-    ipv4: Vec<(IpRange, Arc<str>)>,
-    ipv6: Vec<(IpRange, Arc<str>)>,
-    asn: Vec<(AsnRange, Arc<str>)>,
+    dns: HashMap<String, Arc<Vec<url::Url>>>,
+    ipv4: Vec<(IpRange, Arc<Vec<url::Url>>)>,
+    ipv6: Vec<(IpRange, Arc<Vec<url::Url>>)>,
+    asn: Vec<(AsnRange, Arc<Vec<url::Url>>)>,
 }
 
 #[derive(Clone)]
@@ -131,9 +144,17 @@ impl RdapClient {
     }
 
     /// Ensures bootstrap data is loaded and not expired.
+    ///
     /// Uses stale-while-revalidate: if refresh fails, stale data is used.
+    /// Performs the actual network load WITHOUT holding the write lock, so
+    /// concurrent readers are never blocked by an in-flight HTTP request
+    /// (fix for the previous deadlock/await-under-lock hazard).
+    ///
+    /// Refresh attempts are also throttled to at most one per
+    /// `BOOTSTRAP_REFRESH_MIN_INTERVAL` to avoid thundering-herd storms
+    /// against IANA when bootstrap is down.
     async fn ensure_bootstrap(&self) -> Result<()> {
-        // Check if we have valid (non-expired) data
+        // Fast path: read-lock and return if fresh.
         {
             let cache = BOOTSTRAP_CACHE.read().await;
             if let Some(cached) = cache.as_ref() {
@@ -143,19 +164,50 @@ impl RdapClient {
             }
         }
 
-        // Need to load or refresh - acquire write lock
-        let mut cache = BOOTSTRAP_CACHE.write().await;
-
-        // Double-check after acquiring write lock (another task may have loaded)
-        if let Some(cached) = cache.as_ref() {
-            if !cached.is_expired() {
-                return Ok(());
+        // Throttle refresh attempts. If another caller tried very recently,
+        // return what we have (stale or empty) rather than piling on IANA.
+        {
+            let last = BOOTSTRAP_LAST_ATTEMPT.read().await;
+            if let Some(ts) = *last {
+                if ts.elapsed() < BOOTSTRAP_REFRESH_MIN_INTERVAL {
+                    // Another caller attempted a refresh very recently.
+                    let cache = BOOTSTRAP_CACHE.read().await;
+                    if cache.is_some() {
+                        // We have some data (possibly stale) — accept it.
+                        return Ok(());
+                    }
+                    return Err(SeerError::RdapBootstrapError(
+                        "bootstrap refresh throttled and no cache available".to_string(),
+                    ));
+                }
             }
         }
 
-        // Try to load fresh data
+        // Record the attempt timestamp before we begin the network load.
+        // Holding this lock is cheap (no await in between read+write here).
+        {
+            let mut last = BOOTSTRAP_LAST_ATTEMPT.write().await;
+            // Double-check in case another task just updated it.
+            if let Some(ts) = *last {
+                if ts.elapsed() < BOOTSTRAP_REFRESH_MIN_INTERVAL {
+                    drop(last);
+                    let cache = BOOTSTRAP_CACHE.read().await;
+                    if cache.is_some() {
+                        return Ok(());
+                    }
+                    return Err(SeerError::RdapBootstrapError(
+                        "bootstrap refresh throttled and no cache available".to_string(),
+                    ));
+                }
+            }
+            *last = Some(Instant::now());
+        }
+
+        // Perform the actual load WITHOUT holding any cache lock.
         debug!("Loading/refreshing RDAP bootstrap data");
-        match load_bootstrap_data_with_retry(&self.retry_policy).await {
+        let load_result = load_bootstrap_data_with_retry(&self.retry_policy).await;
+
+        match load_result {
             Ok(data) => {
                 debug!(
                     dns_entries = data.dns.len(),
@@ -164,11 +216,18 @@ impl RdapClient {
                     asn_entries = data.asn.len(),
                     "RDAP bootstrap loaded/refreshed"
                 );
-                *cache = Some(CachedBootstrap::new(data));
+                let mut cache = BOOTSTRAP_CACHE.write().await;
+                // Double-check: another task may have loaded while we ran.
+                // Only overwrite if the current cache is missing or expired.
+                let should_store = cache.as_ref().map(|c| c.is_expired()).unwrap_or(true);
+                if should_store {
+                    *cache = Some(CachedBootstrap::new(data));
+                }
                 Ok(())
             }
             Err(e) => {
-                // Stale-while-revalidate: use stale data if refresh fails
+                // Stale-while-revalidate: keep using any existing stale cache.
+                let cache = BOOTSTRAP_CACHE.read().await;
                 if let Some(cached) = cache.as_ref() {
                     warn!(
                         error = %e,
@@ -177,33 +236,33 @@ impl RdapClient {
                     );
                     Ok(())
                 } else {
-                    // No stale data available
+                    // No stale data available.
                     Err(e)
                 }
             }
         }
     }
 
-    /// Looks up the RDAP server URL for a domain's TLD from bootstrap data.
-    fn get_rdap_url_for_domain(cache: &BootstrapData, domain: &str) -> Option<Arc<str>> {
+    /// Looks up the candidate RDAP base URLs for a domain's TLD.
+    fn get_rdap_urls_for_domain(cache: &BootstrapData, domain: &str) -> Option<Arc<Vec<url::Url>>> {
         let tld = domain.rsplit('.').next()?;
         cache.dns.get(&tld.to_lowercase()).cloned()
     }
 
-    /// Looks up the RDAP server URL for an IP address from bootstrap data.
-    fn get_rdap_url_for_ip(cache: &BootstrapData, ip: &IpAddr) -> Option<Arc<str>> {
+    /// Looks up the candidate RDAP base URLs for an IP address.
+    fn get_rdap_urls_for_ip(cache: &BootstrapData, ip: &IpAddr) -> Option<Arc<Vec<url::Url>>> {
         match ip {
             IpAddr::V4(addr) => {
-                for (range, url) in &cache.ipv4 {
+                for (range, urls) in &cache.ipv4 {
                     if ipv4_matches_prefix(&range.prefix, addr) {
-                        return Some(Arc::clone(url));
+                        return Some(Arc::clone(urls));
                     }
                 }
             }
             IpAddr::V6(addr) => {
-                for (range, url) in &cache.ipv6 {
+                for (range, urls) in &cache.ipv6 {
                     if ipv6_matches_prefix(&range.prefix, addr) {
-                        return Some(Arc::clone(url));
+                        return Some(Arc::clone(urls));
                     }
                 }
             }
@@ -212,11 +271,11 @@ impl RdapClient {
         None
     }
 
-    /// Looks up the RDAP server URL for an ASN from bootstrap data.
-    fn get_rdap_url_for_asn(cache: &BootstrapData, asn: u32) -> Option<Arc<str>> {
-        for (range, url) in &cache.asn {
+    /// Looks up the candidate RDAP base URLs for an ASN.
+    fn get_rdap_urls_for_asn(cache: &BootstrapData, asn: u32) -> Option<Arc<Vec<url::Url>>> {
+        for (range, urls) in &cache.asn {
             if asn >= range.start && asn <= range.end {
-                return Some(Arc::clone(url));
+                return Some(Arc::clone(urls));
             }
         }
 
@@ -232,23 +291,21 @@ impl RdapClient {
 
         let domain = normalize_domain(domain)?;
 
-        // Extract URL while holding the lock, then release before HTTP request
-        let url = {
+        // Extract candidate URLs while holding the lock, then release before HTTP requests.
+        let urls = {
             let cache_guard = BOOTSTRAP_CACHE.read().await;
             let cache = cache_guard.as_ref().ok_or_else(|| {
                 SeerError::RdapBootstrapError("bootstrap data not loaded".to_string())
             })?;
 
-            let base_url =
-                Self::get_rdap_url_for_domain(&cache.data, &domain).ok_or_else(|| {
-                    SeerError::RdapBootstrapError(format!("no RDAP server for {}", domain))
-                })?;
+            let bases = Self::get_rdap_urls_for_domain(&cache.data, &domain).ok_or_else(|| {
+                SeerError::RdapBootstrapError(format!("no RDAP server for {}", domain))
+            })?;
 
-            build_rdap_url(&base_url, &format!("domain/{}", domain))
+            build_rdap_urls(&bases, &format!("domain/{}", domain))
         }; // Lock released here
 
-        debug!(url = %url, "Querying RDAP");
-        self.query_rdap_with_retry(&url).await
+        self.query_rdap_urls(&urls).await
     }
 
     /// Looks up RDAP registration data for an IP address.
@@ -262,22 +319,20 @@ impl RdapClient {
             .parse()
             .map_err(|_| SeerError::InvalidIpAddress(ip.to_string()))?;
 
-        // Extract URL while holding the lock, then release before HTTP request
-        let url = {
+        let urls = {
             let cache_guard = BOOTSTRAP_CACHE.read().await;
             let cache = cache_guard.as_ref().ok_or_else(|| {
                 SeerError::RdapBootstrapError("bootstrap data not loaded".to_string())
             })?;
 
-            let base_url = Self::get_rdap_url_for_ip(&cache.data, &ip_addr).ok_or_else(|| {
+            let bases = Self::get_rdap_urls_for_ip(&cache.data, &ip_addr).ok_or_else(|| {
                 SeerError::RdapBootstrapError(format!("no RDAP server for {}", ip))
             })?;
 
-            build_rdap_url(&base_url, &format!("ip/{}", ip))
-        }; // Lock released here
+            build_rdap_urls(&bases, &format!("ip/{}", ip))
+        };
 
-        debug!(url = %url, "Querying RDAP");
-        self.query_rdap_with_retry(&url).await
+        self.query_rdap_urls(&urls).await
     }
 
     /// Looks up RDAP registration data for an Autonomous System Number (ASN).
@@ -287,28 +342,27 @@ impl RdapClient {
     pub async fn lookup_asn(&self, asn: u32) -> Result<RdapResponse> {
         self.ensure_bootstrap().await?;
 
-        // Extract URL while holding the lock, then release before HTTP request
-        let url = {
+        let urls = {
             let cache_guard = BOOTSTRAP_CACHE.read().await;
             let cache = cache_guard.as_ref().ok_or_else(|| {
                 SeerError::RdapBootstrapError("bootstrap data not loaded".to_string())
             })?;
 
-            let base_url = Self::get_rdap_url_for_asn(&cache.data, asn).ok_or_else(|| {
+            let bases = Self::get_rdap_urls_for_asn(&cache.data, asn).ok_or_else(|| {
                 SeerError::RdapBootstrapError(format!("no RDAP server for AS{}", asn))
             })?;
 
-            build_rdap_url(&base_url, &format!("autnum/{}", asn))
-        }; // Lock released here
+            build_rdap_urls(&bases, &format!("autnum/{}", asn))
+        };
 
-        debug!(url = %url, "Querying RDAP");
-        self.query_rdap_with_retry(&url).await
+        self.query_rdap_urls(&urls).await
     }
 
     /// Returns the RDAP base URL for a given TLD, if known from bootstrap data.
     ///
     /// Loads bootstrap data if not already cached. Returns `None` if the TLD
-    /// has no registered RDAP server in the IANA bootstrap registry.
+    /// has no registered RDAP server in the IANA bootstrap registry. When
+    /// IANA lists multiple URLs for a TLD, the first one is returned.
     #[instrument(skip(self), fields(tld = %tld))]
     pub async fn get_rdap_base_url_for_tld(&self, tld: &str) -> Option<String> {
         if self.ensure_bootstrap().await.is_err() {
@@ -321,19 +375,64 @@ impl RdapClient {
             .data
             .dns
             .get(&tld.to_lowercase())
-            .map(|url| url.to_string())
+            .and_then(|urls| urls.first())
+            .map(|u| u.to_string())
     }
 
-    /// Queries an RDAP endpoint with retry logic.
+    /// Queries a list of candidate RDAP URLs in order, returning the first
+    /// successful response. Each URL is attempted with the full retry policy.
+    /// If all candidates fail, the last error is returned wrapped with context.
+    async fn query_rdap_urls(&self, urls: &[url::Url]) -> Result<RdapResponse> {
+        if urls.is_empty() {
+            return Err(SeerError::RdapError(
+                "no candidate RDAP URLs available".to_string(),
+            ));
+        }
+
+        let mut last_error: Option<SeerError> = None;
+        for (idx, url) in urls.iter().enumerate() {
+            let url_str = url.as_str().to_string();
+            debug!(url = %url_str, candidate = idx + 1, total = urls.len(), "Querying RDAP");
+            match self.query_rdap_with_retry(&url_str).await {
+                Ok(resp) => return Ok(resp),
+                Err(e) => {
+                    if urls.len() > 1 {
+                        warn!(
+                            url = %url_str,
+                            error = %e,
+                            candidate = idx + 1,
+                            total = urls.len(),
+                            "RDAP candidate failed, trying next",
+                        );
+                    }
+                    last_error = Some(e);
+                }
+            }
+        }
+
+        // All candidates failed.
+        let last = last_error
+            .unwrap_or_else(|| SeerError::RdapError("all RDAP candidates failed".to_string()));
+        if urls.len() > 1 {
+            Err(SeerError::RdapError(format!(
+                "all {} RDAP candidate URLs failed; last error: {}",
+                urls.len(),
+                last
+            )))
+        } else {
+            Err(last)
+        }
+    }
+
+    /// Queries a single RDAP endpoint with retry logic.
     async fn query_rdap_with_retry(&self, url: &str) -> Result<RdapResponse> {
         let executor = RetryExecutor::new(self.retry_policy.clone());
         let url = url.to_string();
 
         executor
             .execute(|| {
-                let http = RDAP_HTTP_CLIENT.clone();
                 let url = url.clone();
-                async move { query_rdap_internal(&http, &url).await }
+                async move { query_rdap_internal(&url).await }
             })
             .await
     }
@@ -343,14 +442,20 @@ impl RdapClient {
 const MAX_RDAP_RESPONSE_SIZE: usize = 10 * 1024 * 1024;
 
 /// Validates that a URL does not resolve to a reserved/private IP address (SSRF protection).
-async fn validate_url_not_reserved(url: &str) -> Result<()> {
+///
+/// Returns the full list of resolved `SocketAddr`s so the caller can pin them on a
+/// per-request HTTP client via `resolve_to_addrs`. Pinning prevents a DNS rebinding
+/// TOCTOU where the hostname could resolve to a different (private) address between
+/// validation here and the actual HTTP connect.
+async fn validate_url_not_reserved(url: &str) -> Result<Vec<SocketAddr>> {
     let parsed = url::Url::parse(url)
         .map_err(|e| SeerError::RdapError(format!("invalid URL '{}': {}", url, e)))?;
     let host = parsed
         .host_str()
         .ok_or_else(|| SeerError::RdapError(format!("URL '{}' has no host", url)))?;
+    let port = parsed.port_or_known_default().unwrap_or(443);
 
-    // If the host is already an IP literal, check it directly
+    // If the host is already an IP literal, check it directly.
     if let Ok(ip) = host.parse::<IpAddr>() {
         if let Some(reason) = describe_reserved_ip(&ip) {
             return Err(SeerError::RdapError(format!(
@@ -358,13 +463,12 @@ async fn validate_url_not_reserved(url: &str) -> Result<()> {
                 ip, reason
             )));
         }
-        return Ok(());
+        return Ok(vec![SocketAddr::new(ip, port)]);
     }
 
-    let port = parsed.port_or_known_default().unwrap_or(443);
     let addr = format!("{}:{}", host, port);
 
-    let socket_addrs: Vec<_> = tokio::net::lookup_host(&addr)
+    let socket_addrs: Vec<SocketAddr> = tokio::net::lookup_host(&addr)
         .await
         .map_err(|e| SeerError::RdapError(format!("failed to resolve host '{}': {}", host, e)))?
         .collect();
@@ -386,15 +490,72 @@ async fn validate_url_not_reserved(url: &str) -> Result<()> {
         }
     }
 
-    Ok(())
+    Ok(socket_addrs)
+}
+
+/// Validates a bootstrap-extracted URL before caching it.
+///
+/// Rejects non-https schemes, IP-literal hosts, missing hosts, and hosts
+/// containing whitespace or control characters. Returns the parsed URL on
+/// success so the caller can cache it in normalized form.
+fn validate_bootstrap_url(s: &str) -> Result<url::Url> {
+    let parsed = url::Url::parse(s)
+        .map_err(|e| SeerError::RdapError(format!("bad bootstrap URL {}: {}", s, e)))?;
+    if parsed.scheme() != "https" {
+        return Err(SeerError::RdapError(format!(
+            "bootstrap URL must be https, got {}",
+            parsed.scheme()
+        )));
+    }
+    let host = parsed
+        .host()
+        .ok_or_else(|| SeerError::RdapError(format!("bootstrap URL has no host: {}", s)))?;
+    match host {
+        url::Host::Ipv4(_) | url::Host::Ipv6(_) => {
+            return Err(SeerError::RdapError(format!(
+                "bootstrap URL must not be an IP literal: {}",
+                s
+            )));
+        }
+        url::Host::Domain(d) => {
+            if d.is_empty() || d.chars().any(|c| c.is_whitespace() || c.is_control()) {
+                return Err(SeerError::RdapError(format!(
+                    "bootstrap URL has invalid host: {}",
+                    s
+                )));
+            }
+        }
+    }
+    Ok(parsed)
 }
 
 /// Internal function to query an RDAP endpoint (used by retry executor).
-async fn query_rdap_internal(http: &Client, url: &str) -> Result<RdapResponse> {
-    // SSRF protection: validate the URL does not resolve to a reserved/private IP
-    validate_url_not_reserved(url).await?;
+///
+/// Builds a per-request HTTP client that pins the validated resolved IPs to
+/// prevent DNS rebinding (TOCTOU between validation and connect).
+async fn query_rdap_internal(url: &str) -> Result<RdapResponse> {
+    // SSRF protection: validate the URL does not resolve to reserved IPs and
+    // capture the resolved SocketAddrs so we can pin them on the HTTP client.
+    let resolved = validate_url_not_reserved(url).await?;
 
-    let response = http
+    let parsed = url::Url::parse(url)
+        .map_err(|e| SeerError::RdapError(format!("invalid URL '{}': {}", url, e)))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| SeerError::RdapError(format!("URL '{}' has no host", url)))?;
+
+    // Build a short-lived client pinning the validated IPs. If the host was
+    // an IP literal the resolved vec already holds it, so `resolve_to_addrs`
+    // is still correct.
+    let client = Client::builder()
+        .timeout(DEFAULT_TIMEOUT)
+        .connect_timeout(CONNECT_TIMEOUT)
+        .user_agent("Seer/1.0 (RDAP Client)")
+        .resolve_to_addrs(host, &resolved)
+        .build()
+        .map_err(|e| SeerError::RdapError(format!("failed to build HTTP client: {}", e)))?;
+
+    let response = client
         .get(url)
         .header("Accept", "application/rdap+json")
         .send()
@@ -407,20 +568,39 @@ async fn query_rdap_internal(http: &Client, url: &str) -> Result<RdapResponse> {
         )));
     }
 
-    // Stream body with incremental size check to prevent memory exhaustion
+    // Stream body with incremental size check to prevent memory exhaustion.
+    // Wrap the chunk loop in a timeout so a server that opens the connection
+    // but trickles bytes forever is classified as a timeout (not a generic
+    // RdapError) and retries can be driven appropriately.
     let mut body = Vec::new();
     let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk =
-            chunk.map_err(|e| SeerError::RdapError(format!("failed to read response: {}", e)))?;
-        body.extend_from_slice(&chunk);
-        if body.len() > MAX_RDAP_RESPONSE_SIZE {
-            return Err(SeerError::RdapError(format!(
-                "RDAP response exceeds {} byte limit",
-                MAX_RDAP_RESPONSE_SIZE
+    let streamed = tokio::time::timeout(DEFAULT_TIMEOUT, async {
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk
+                .map_err(|e| SeerError::RdapError(format!("failed to read response: {}", e)))?;
+            body.extend_from_slice(&chunk);
+            if body.len() > MAX_RDAP_RESPONSE_SIZE {
+                return Err(SeerError::RdapError(format!(
+                    "RDAP response exceeds {} byte limit",
+                    MAX_RDAP_RESPONSE_SIZE
+                )));
+            }
+        }
+        Ok::<(), SeerError>(())
+    })
+    .await;
+
+    match streamed {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return Err(e),
+        Err(_) => {
+            return Err(SeerError::Timeout(format!(
+                "timed out reading RDAP response body from {} after {:?}",
+                host, DEFAULT_TIMEOUT
             )));
         }
     }
+
     let rdap: RdapResponse = serde_json::from_slice(&body)?;
     Ok(rdap)
 }
@@ -537,16 +717,37 @@ async fn load_bootstrap_data() -> Result<BootstrapData> {
     let mut ipv6 = Vec::new();
     let mut asn = Vec::new();
 
+    // Helper: extract and validate all URLs in order, preserving IANA-listed
+    // ordering. Invalid URLs are logged and skipped rather than rejecting the
+    // entire service entry. Returns None when no valid URLs remain.
+    fn collect_valid_urls(urls: &[serde_json::Value]) -> Option<Arc<Vec<url::Url>>> {
+        let mut out = Vec::new();
+        for u in urls {
+            if let Some(s) = u.as_str() {
+                match validate_bootstrap_url(s) {
+                    Ok(parsed) => out.push(parsed),
+                    Err(e) => {
+                        warn!(url = s, error = %e, "Skipping invalid bootstrap URL");
+                    }
+                }
+            }
+        }
+        if out.is_empty() {
+            None
+        } else {
+            Some(Arc::new(out))
+        }
+    }
+
     // Parse DNS bootstrap
     if let Some(dns_data) = dns_data {
         for service in dns_data.services {
             if service.len() >= 2 {
                 if let (Some(tlds), Some(urls)) = (service[0].as_array(), service[1].as_array()) {
-                    if let Some(url) = urls.first().and_then(|u| u.as_str()) {
-                        let url_arc: Arc<str> = Arc::from(url);
+                    if let Some(urls_arc) = collect_valid_urls(urls) {
                         for tld in tlds {
                             if let Some(tld_str) = tld.as_str() {
-                                dns.insert(tld_str.to_lowercase(), Arc::clone(&url_arc));
+                                dns.insert(tld_str.to_lowercase(), Arc::clone(&urls_arc));
                             }
                         }
                     }
@@ -561,15 +762,14 @@ async fn load_bootstrap_data() -> Result<BootstrapData> {
             if service.len() >= 2 {
                 if let (Some(prefixes), Some(urls)) = (service[0].as_array(), service[1].as_array())
                 {
-                    if let Some(url) = urls.first().and_then(|u| u.as_str()) {
-                        let url_arc: Arc<str> = Arc::from(url);
+                    if let Some(urls_arc) = collect_valid_urls(urls) {
                         for prefix in prefixes {
                             if let Some(prefix_str) = prefix.as_str() {
                                 ipv4.push((
                                     IpRange {
                                         prefix: prefix_str.to_string(),
                                     },
-                                    Arc::clone(&url_arc),
+                                    Arc::clone(&urls_arc),
                                 ));
                             }
                         }
@@ -585,15 +785,14 @@ async fn load_bootstrap_data() -> Result<BootstrapData> {
             if service.len() >= 2 {
                 if let (Some(prefixes), Some(urls)) = (service[0].as_array(), service[1].as_array())
                 {
-                    if let Some(url) = urls.first().and_then(|u| u.as_str()) {
-                        let url_arc: Arc<str> = Arc::from(url);
+                    if let Some(urls_arc) = collect_valid_urls(urls) {
                         for prefix in prefixes {
                             if let Some(prefix_str) = prefix.as_str() {
                                 ipv6.push((
                                     IpRange {
                                         prefix: prefix_str.to_string(),
                                     },
-                                    Arc::clone(&url_arc),
+                                    Arc::clone(&urls_arc),
                                 ));
                             }
                         }
@@ -608,12 +807,11 @@ async fn load_bootstrap_data() -> Result<BootstrapData> {
         for service in asn_data.services {
             if service.len() >= 2 {
                 if let (Some(ranges), Some(urls)) = (service[0].as_array(), service[1].as_array()) {
-                    if let Some(url) = urls.first().and_then(|u| u.as_str()) {
-                        let url_arc: Arc<str> = Arc::from(url);
+                    if let Some(urls_arc) = collect_valid_urls(urls) {
                         for range in ranges {
                             if let Some(range_str) = range.as_str() {
                                 if let Some((start, end)) = parse_asn_range(range_str) {
-                                    asn.push((AsnRange { start, end }, Arc::clone(&url_arc)));
+                                    asn.push((AsnRange { start, end }, Arc::clone(&urls_arc)));
                                 }
                             }
                         }
@@ -631,13 +829,22 @@ async fn load_bootstrap_data() -> Result<BootstrapData> {
     })
 }
 
-/// Builds a full RDAP query URL from a base URL and path.
-fn build_rdap_url(base_url: &str, path: &str) -> String {
-    if base_url.ends_with('/') {
-        format!("{}{}", base_url, path)
-    } else {
-        format!("{}/{}", base_url, path)
-    }
+/// Builds full RDAP query URLs for each candidate base URL, preserving order.
+fn build_rdap_urls(bases: &[url::Url], path: &str) -> Vec<url::Url> {
+    bases
+        .iter()
+        .filter_map(|base| {
+            // Ensure the base URL ends with `/` before joining so the path is
+            // appended (not replacing the final path segment).
+            let base_str = base.as_str();
+            let normalized = if base_str.ends_with('/') {
+                base_str.to_string()
+            } else {
+                format!("{}/", base_str)
+            };
+            url::Url::parse(&normalized).and_then(|u| u.join(path)).ok()
+        })
+        .collect()
 }
 
 fn parse_asn_range(range: &str) -> Option<(u32, u32)> {
@@ -786,7 +993,132 @@ mod tests {
             asn: Vec::new(),
         };
         // Should return None for any lookup on empty data
-        assert!(RdapClient::get_rdap_url_for_domain(&data, "example.com").is_none());
-        assert!(RdapClient::get_rdap_url_for_asn(&data, 12345).is_none());
+        assert!(RdapClient::get_rdap_urls_for_domain(&data, "example.com").is_none());
+        assert!(RdapClient::get_rdap_urls_for_asn(&data, 12345).is_none());
+    }
+
+    // --- validate_bootstrap_url tests (H1) ------------------------------
+
+    #[test]
+    fn test_validate_bootstrap_url_accepts_https() {
+        let url = validate_bootstrap_url("https://rdap.example.com/").unwrap();
+        assert_eq!(url.scheme(), "https");
+        assert_eq!(url.host_str(), Some("rdap.example.com"));
+    }
+
+    #[test]
+    fn test_validate_bootstrap_url_rejects_http() {
+        let err = validate_bootstrap_url("http://rdap.example.com/").unwrap_err();
+        assert!(
+            matches!(err, SeerError::RdapError(ref s) if s.contains("https")),
+            "expected https-scheme error, got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_validate_bootstrap_url_rejects_ftp() {
+        let err = validate_bootstrap_url("ftp://rdap.example.com/").unwrap_err();
+        assert!(matches!(err, SeerError::RdapError(_)));
+    }
+
+    #[test]
+    fn test_validate_bootstrap_url_rejects_ip_literal_v4() {
+        let err = validate_bootstrap_url("https://192.0.2.1/").unwrap_err();
+        assert!(
+            matches!(err, SeerError::RdapError(ref s) if s.contains("IP literal")),
+            "expected IP-literal error, got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_validate_bootstrap_url_rejects_ip_literal_v6() {
+        let err = validate_bootstrap_url("https://[2001:db8::1]/").unwrap_err();
+        assert!(
+            matches!(err, SeerError::RdapError(ref s) if s.contains("IP literal")),
+            "expected IP-literal error, got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_validate_bootstrap_url_rejects_garbage() {
+        let err = validate_bootstrap_url("not a url").unwrap_err();
+        assert!(matches!(err, SeerError::RdapError(_)));
+    }
+
+    // --- validate_url_not_reserved tests (C1 regression) ----------------
+
+    #[tokio::test]
+    async fn test_validate_url_not_reserved_rejects_loopback_literal() {
+        let err = validate_url_not_reserved("https://127.0.0.1/domain/example.com")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, SeerError::RdapError(ref s) if s.contains("reserved IP")),
+            "expected reserved-IP error, got: {:?}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_validate_url_not_reserved_rejects_private_ipv4_literal() {
+        let err = validate_url_not_reserved("https://10.0.0.1/")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, SeerError::RdapError(ref s) if s.contains("reserved IP")),
+            "expected reserved-IP error, got: {:?}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_validate_url_not_reserved_rejects_ipv6_loopback_literal() {
+        let err = validate_url_not_reserved("https://[::1]/")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, SeerError::RdapError(ref s) if s.contains("reserved IP")),
+            "expected reserved-IP error, got: {:?}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_validate_url_not_reserved_returns_resolved_addrs_for_public_literal() {
+        // A public IP literal should return a one-element vector containing
+        // exactly that address, ready for `resolve_to_addrs` pinning.
+        let addrs = validate_url_not_reserved("https://8.8.8.8/").await.unwrap();
+        assert_eq!(addrs.len(), 1);
+        assert!(addrs[0].ip().is_ipv4());
+        assert_eq!(addrs[0].port(), 443);
+    }
+
+    // --- build_rdap_urls tests (M16) ------------------------------------
+
+    #[test]
+    fn test_build_rdap_urls_preserves_order_and_appends_path() {
+        let bases = vec![
+            url::Url::parse("https://rdap.a.example/").unwrap(),
+            url::Url::parse("https://rdap.b.example").unwrap(), // no trailing slash
+        ];
+        let built = build_rdap_urls(&bases, "domain/example.com");
+        assert_eq!(built.len(), 2);
+        assert_eq!(
+            built[0].as_str(),
+            "https://rdap.a.example/domain/example.com"
+        );
+        assert_eq!(
+            built[1].as_str(),
+            "https://rdap.b.example/domain/example.com"
+        );
+    }
+
+    #[test]
+    fn test_build_rdap_urls_empty_input_returns_empty() {
+        let built = build_rdap_urls(&[], "domain/example.com");
+        assert!(built.is_empty());
     }
 }
