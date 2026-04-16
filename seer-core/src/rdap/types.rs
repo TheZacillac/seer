@@ -1,9 +1,11 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::error::{Result, SeerError};
+
 /// RDAP response for domain, IP, or ASN lookups.
 /// Follows RFC 7483 (JSON Responses for RDAP).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RdapResponse {
     #[serde(default)]
@@ -399,6 +401,49 @@ pub struct RdapNotice {
 }
 
 impl RdapResponse {
+    /// Maximum number of keys permitted in `extra` (the serde-flatten
+    /// catch-all map). Chosen to be well above legitimate RDAP responses
+    /// (typical responses have <20 top-level keys; RFC 7483 defines ~25
+    /// canonical fields) while still blocking pathological attacker payloads
+    /// that pack the 10MB body cap full of distinct keys.
+    const MAX_EXTRA_KEYS: usize = 1024;
+
+    /// Maximum serialized size (in bytes) of the `extra` map. Bounds the
+    /// total heap cost of attacker-controlled JSON values regardless of
+    /// whether the attack is wide (many keys) or deep (nested arrays/
+    /// objects). 512KB is far larger than any field we care about preserving
+    /// for round-tripping, yet small enough to be a meaningful guardrail
+    /// against the 10MB body-cap ceiling.
+    const MAX_EXTRA_BYTES: usize = 512 * 1024;
+
+    /// Bound attacker-controlled data in `extra` (the `#[serde(flatten)]`
+    /// catch-all field) after deserialization.
+    ///
+    /// Even with the 10MB body cap applied during streaming, a malicious RDAP
+    /// server can pack the body with millions of unknown keys or deeply-
+    /// nested `serde_json::Value` trees, causing heap exhaustion in the
+    /// resulting `serde_json::Map`. This guard rejects such responses before
+    /// they propagate further into the application.
+    pub fn validate_size(&self) -> Result<()> {
+        if self.extra.len() > Self::MAX_EXTRA_KEYS {
+            return Err(SeerError::RdapError(format!(
+                "RDAP response has {} extra keys (max {})",
+                self.extra.len(),
+                Self::MAX_EXTRA_KEYS
+            )));
+        }
+        let serialized = serde_json::to_vec(&self.extra)
+            .map_err(|e| SeerError::RdapError(format!("serialize extra: {}", e)))?;
+        if serialized.len() > Self::MAX_EXTRA_BYTES {
+            return Err(SeerError::RdapError(format!(
+                "RDAP extra payload {} bytes (max {})",
+                serialized.len(),
+                Self::MAX_EXTRA_BYTES
+            )));
+        }
+        Ok(())
+    }
+
     pub fn domain_name(&self) -> Option<&str> {
         self.ldh_name.as_deref().or(self.unicode_name.as_deref())
     }
@@ -555,5 +600,38 @@ impl ContactInfo {
             || !is_redacted(&self.phone)
             || !is_redacted(&self.address)
             || !is_redacted(&self.country)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::Value;
+
+    #[test]
+    fn validate_size_accepts_normal_response() {
+        let mut resp = RdapResponse::default();
+        resp.extra.insert("notices".into(), Value::Array(vec![]));
+        assert!(resp.validate_size().is_ok());
+    }
+
+    #[test]
+    fn validate_size_rejects_too_many_keys() {
+        let mut resp = RdapResponse::default();
+        for i in 0..=RdapResponse::MAX_EXTRA_KEYS {
+            resp.extra.insert(format!("k{}", i), Value::Null);
+        }
+        let err = resp.validate_size().unwrap_err();
+        assert!(err.to_string().contains("extra keys"));
+    }
+
+    #[test]
+    fn validate_size_rejects_oversized_payload() {
+        let mut resp = RdapResponse::default();
+        // One giant value
+        let big_str: String = "x".repeat(RdapResponse::MAX_EXTRA_BYTES + 1024);
+        resp.extra.insert("blob".into(), Value::String(big_str));
+        let err = resp.validate_size().unwrap_err();
+        assert!(err.to_string().contains("bytes"));
     }
 }

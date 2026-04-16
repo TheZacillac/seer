@@ -646,6 +646,11 @@ async fn query_rdap_internal(url: &str) -> Result<RdapResponse> {
     }
 
     let rdap: RdapResponse = serde_json::from_slice(&body)?;
+    // Bound attacker-controlled `extra` map size post-deserialization.
+    // The 10MB body cap prevents unbounded download, but a well-formed
+    // response can still pack millions of keys or deeply-nested values
+    // into the serde_json::Map. See RdapResponse::validate_size.
+    rdap.validate_size()?;
     Ok(rdap)
 }
 
