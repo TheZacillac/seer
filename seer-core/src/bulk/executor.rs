@@ -4,7 +4,6 @@ use std::time::Duration;
 
 use futures::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
-use tokio::sync::Semaphore;
 use tokio::time::sleep;
 use tracing::{debug, info, instrument, warn};
 
@@ -127,7 +126,6 @@ impl BulkExecutor {
     ) -> Vec<BulkResult> {
         let total = operations.len();
         let completed = Arc::new(AtomicUsize::new(0));
-        let semaphore = Arc::new(Semaphore::new(self.concurrency));
 
         info!("bulk operation started");
         debug!(
@@ -138,7 +136,6 @@ impl BulkExecutor {
 
         let results: Vec<BulkResult> = stream::iter(operations)
             .map(|op| {
-                let semaphore = semaphore.clone();
                 let completed = completed.clone();
                 let progress = progress.as_ref();
                 let rate_limit_delay = self.rate_limit_delay;
@@ -151,16 +148,6 @@ impl BulkExecutor {
                 let availability_checker = &self.availability_checker;
 
                 async move {
-                    let Ok(_permit) = semaphore.acquire().await else {
-                        return BulkResult {
-                            operation: op,
-                            success: false,
-                            data: None,
-                            error: Some("Operation cancelled".to_string()),
-                            duration_ms: 0,
-                        };
-                    };
-
                     // Rate limiting delay
                     if !rate_limit_delay.is_zero() {
                         sleep(rate_limit_delay).await;
@@ -369,6 +356,25 @@ async fn execute_operation(op: &BulkOperation, clients: &Clients<'_>) -> Result<
     }
 }
 
+/// Keywords commonly used as CSV header labels for a domain column.
+const HEADER_KEYWORDS: &[&str] = &["domain", "host", "hostname", "url", "name", "site", "fqdn"];
+
+/// Returns true if `first` looks like a CSV header row rather than a real domain.
+///
+/// Heuristic: take the first comma-delimited column and trim it. Real domains
+/// always contain a `.` (e.g., "example.com", "domain.com"); a bare keyword
+/// like "domain" or "hostname" does not. Only treat the row as a header when
+/// the first column has no dot AND matches a known header keyword.
+fn is_csv_header_row(first: &str) -> bool {
+    let first_col = first.split(',').next().unwrap_or(first).trim();
+    // Real domains always contain a dot; a bare keyword does not.
+    if first_col.contains('.') {
+        return false;
+    }
+    let label = first_col.to_lowercase();
+    HEADER_KEYWORDS.contains(&label.as_str())
+}
+
 pub fn parse_domains_from_file(content: &str) -> Vec<String> {
     let mut domains: Vec<String> = content
         .lines()
@@ -381,11 +387,19 @@ pub fn parse_domains_from_file(content: &str) -> Vec<String> {
         .filter(|domain| domain.contains('.'))
         .collect();
 
-    // Skip probable CSV header: first entry has no digits (e.g., "domain.name", "host.name")
-    if let Some(first) = domains.first() {
-        if !first.chars().any(|c| c.is_ascii_digit()) {
-            domains.remove(0);
-        }
+    // A bare-keyword CSV header like "domain" / "hostname" has no dot and is
+    // already dropped by the filter above. `is_csv_header_row` additionally
+    // covers the edge case where the first surviving entry is a dotted header
+    // (rare, and the current heuristic treats such values as real domains —
+    // see `domain_dot_com_is_not_dropped_as_header`). The guard below is a
+    // belt-and-suspenders check that stays correct if the upstream filter
+    // ever changes.
+    if domains
+        .first()
+        .map(|d| is_csv_header_row(d))
+        .unwrap_or(false)
+    {
+        domains.remove(0);
     }
 
     domains
@@ -415,9 +429,66 @@ csv,format,example.org
     }
 
     #[test]
-    fn test_parse_domains_skip_header() {
-        let content = "host.name,owner,notes\nexample.com,Alice,Main\n";
+    fn test_parse_domains_skip_bare_header() {
+        // Bare-keyword header ("domain") is dropped by the dot filter.
+        let content = "domain\nexample.com\n";
         let domains = parse_domains_from_file(content);
         assert_eq!(domains, vec!["example.com"]);
+    }
+
+    #[test]
+    fn test_parse_domains_multi_column_csv_header_dropped() {
+        // First column is a bare keyword → whole header row has no dot in col 1
+        // and is dropped by the dot filter.
+        let content = "domain,status\ngoogle.com,live\n";
+        let domains = parse_domains_from_file(content);
+        assert_eq!(domains, vec!["google.com"]);
+        assert!(!domains.contains(&"domain".to_string()));
+    }
+
+    #[test]
+    fn first_domain_with_no_digits_is_kept() {
+        // Regression: previous heuristic dropped the first entry when it
+        // had no ASCII digits, losing "google.com" / "amazon.com" / ...
+        let input = "google.com\namazon.com\n";
+        let result = parse_domains_from_file(input);
+        assert_eq!(result, vec!["google.com", "amazon.com"]);
+    }
+
+    #[test]
+    fn header_row_named_hostname_is_dropped() {
+        let input = "hostname\nexample.com\n";
+        let result = parse_domains_from_file(input);
+        assert_eq!(result, vec!["example.com"]);
+    }
+
+    #[test]
+    fn domain_dot_com_is_not_dropped_as_header() {
+        // "domain.com" is a real domain, not a header, because it has a dot.
+        let input = "domain.com\nexample.com\n";
+        let result = parse_domains_from_file(input);
+        assert_eq!(result, vec!["domain.com", "example.com"]);
+    }
+
+    #[test]
+    fn is_csv_header_row_detects_bare_keywords() {
+        assert!(is_csv_header_row("domain"));
+        assert!(is_csv_header_row("Hostname"));
+        assert!(is_csv_header_row("URL"));
+        assert!(is_csv_header_row("domain,status,notes"));
+        assert!(is_csv_header_row("  host  "));
+    }
+
+    #[test]
+    fn is_csv_header_row_rejects_dotted_values() {
+        assert!(!is_csv_header_row("domain.com"));
+        assert!(!is_csv_header_row("google.com"));
+        assert!(!is_csv_header_row("host.name"));
+    }
+
+    #[test]
+    fn is_csv_header_row_rejects_non_keyword() {
+        assert!(!is_csv_header_row("example"));
+        assert!(!is_csv_header_row("mydata"));
     }
 }
