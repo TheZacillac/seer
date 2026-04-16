@@ -3,7 +3,7 @@
 import asyncio
 from typing import Annotated, Optional
 
-from fastapi import APIRouter, Query, Request
+from fastapi import APIRouter, Path, Query, Request
 from pydantic import BaseModel, Field
 from seer_api.errors import http_error
 from seer_api.limiting import limiter
@@ -21,7 +21,7 @@ class BulkDnsRequest(BaseModel):
     """Request model for bulk DNS lookup."""
 
     domains: list[Annotated[str, Field(max_length=253)]] = Field(..., min_length=1, max_length=MAX_BULK_DOMAINS)
-    record_type: str = "A"
+    record_type: str = Field("A", max_length=10, pattern=r"^[A-Z0-9]+$")
     concurrency: int = Field(default=10, ge=1, le=MAX_CONCURRENCY)
 
 
@@ -29,8 +29,8 @@ class BulkDnsRequest(BaseModel):
 @limiter.limit("60/minute")
 async def dns_lookup(
     request: Request,
-    domain: str,
-    record_type: str,
+    domain: str = Path(..., min_length=1, max_length=253),
+    record_type: str = Path(..., max_length=10, pattern=r"^[A-Z0-9]+$"),
     nameserver: Optional[str] = Query(None, description="Nameserver to query"),
 ):
     """

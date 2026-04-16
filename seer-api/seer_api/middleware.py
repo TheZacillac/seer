@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 import uuid
 from collections import defaultdict
@@ -67,9 +68,10 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
     async def dispatch(
         self, request: Request, call_next: RequestResponseEndpoint
     ) -> Response:
-        request_id = request.headers.get(
-            "X-Correlation-ID", uuid.uuid4().hex[:8]
-        )
+        # Sanitize X-Correlation-ID: strip non-printable/control characters
+        # (prevents log injection via embedded CR/LF) and cap length.
+        raw = request.headers.get("X-Correlation-ID", "")
+        request_id = re.sub(r"[^\x21-\x7E]", "", raw)[:64] or uuid.uuid4().hex[:8]
         set_correlation_id(request_id)
         start_time = time.monotonic()
 

@@ -3,7 +3,7 @@
 import asyncio
 from typing import Annotated
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Path, Request
 from pydantic import BaseModel, Field
 from seer_api.errors import http_error
 from seer_api.limiting import limiter
@@ -26,7 +26,10 @@ class BulkLookupRequest(BaseModel):
 
 @router.get("/{domain}")
 @limiter.limit("30/minute")
-async def smart_lookup(request: Request, domain: str):
+async def smart_lookup(
+    request: Request,
+    domain: str = Path(..., min_length=1, max_length=253),
+):
     """
     Smart lookup for a domain (tries RDAP first, falls back to WHOIS).
 

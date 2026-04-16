@@ -2,7 +2,7 @@
 
 import asyncio
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Path, Request
 from seer_api.errors import http_error
 from seer_api.limiting import limiter
 
@@ -13,7 +13,10 @@ router = APIRouter()
 
 @router.get("/domain/{domain}")
 @limiter.limit("30/minute")
-async def rdap_domain_lookup(request: Request, domain: str):
+async def rdap_domain_lookup(
+    request: Request,
+    domain: str = Path(..., min_length=1, max_length=253),
+):
     """
     Look up RDAP information for a domain.
 
@@ -33,7 +36,10 @@ async def rdap_domain_lookup(request: Request, domain: str):
 
 @router.get("/ip/{ip}")
 @limiter.limit("30/minute")
-async def rdap_ip_lookup(request: Request, ip: str):
+async def rdap_ip_lookup(
+    request: Request,
+    ip: str = Path(..., min_length=1, max_length=45),
+):
     """
     Look up RDAP information for an IP address.
 
@@ -53,7 +59,10 @@ async def rdap_ip_lookup(request: Request, ip: str):
 
 @router.get("/asn/{asn}")
 @limiter.limit("30/minute")
-async def rdap_asn_lookup(request: Request, asn: int):
+async def rdap_asn_lookup(
+    request: Request,
+    asn: int = Path(..., ge=0, le=4_294_967_295),
+):
     """
     Look up RDAP information for an Autonomous System Number.
 
