@@ -10,6 +10,6 @@ pub use dnssec::{DnskeyInfo, DnssecChecker, DnssecReport, DsInfo};
 pub use follow::{
     DnsFollower, FollowConfig, FollowIteration, FollowProgressCallback, FollowResult,
 };
-pub use propagation::{DnsServer, PropagationChecker, PropagationResult};
+pub use propagation::{DnsServer, PropagationChecker, PropagationResult, UnreachableServer};
 pub use records::{DnsRecord, RecordData, RecordType};
 pub use resolver::DnsResolver;

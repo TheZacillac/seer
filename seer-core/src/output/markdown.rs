@@ -307,6 +307,8 @@ impl OutputFormatter for MarkdownFormatter {
 
         if records.is_empty() {
             output.push("*No records found*".to_string());
+            output.push(String::new());
+            output.push("> Note: DNS responses are not DNSSEC-validated.".to_string());
             return output.join("\n");
         }
 
@@ -323,6 +325,9 @@ impl OutputFormatter for MarkdownFormatter {
                 record.name, record.ttl, record.record_type, record.data
             ));
         }
+
+        output.push(String::new());
+        output.push("> Note: DNS responses are not DNSSEC-validated.".to_string());
 
         output.join("\n")
     }
@@ -367,13 +372,27 @@ impl OutputFormatter for MarkdownFormatter {
             ));
         }
 
-        // Inconsistencies
+        // Inconsistencies (genuine answer conflicts)
         if !result.inconsistencies.is_empty() {
             output.push(String::new());
             output.push("### Inconsistencies".to_string());
             output.push(String::new());
             for inconsistency in &result.inconsistencies {
                 output.push(format!("- {}", inconsistency));
+            }
+        }
+
+        // Unreachable servers (distinct from answer conflicts)
+        if !result.unreachable_servers.is_empty() {
+            output.push(String::new());
+            output.push("### Unreachable servers".to_string());
+            output.push(String::new());
+            for unreachable in &result.unreachable_servers {
+                let error_msg = unreachable.error.as_deref().unwrap_or("no response");
+                output.push(format!(
+                    "- **{}** (`{}`): {}",
+                    unreachable.name, unreachable.ip, error_msg
+                ));
             }
         }
 
@@ -403,6 +422,11 @@ impl OutputFormatter for MarkdownFormatter {
                 "| {} | {} | `{}` | `{}` | {}ms |",
                 sr.server.name, sr.server.location, sr.server.ip, result_str, sr.response_time_ms
             ));
+        }
+
+        if !result.dnssec_validated {
+            output.push(String::new());
+            output.push("> Note: DNS responses are not DNSSEC-validated.".to_string());
         }
 
         output.join("\n")
@@ -1608,6 +1632,10 @@ mod tests {
         assert!(output.contains("## DNS A Records: example.com"));
         assert!(output.contains("| Name | TTL | Type | Data |"));
         assert!(output.contains("93.184.216.34"));
+        assert!(
+            output.contains("DNSSEC-validated"),
+            "DNS output must disclose DNSSEC is not validated"
+        );
     }
 
     #[test]
@@ -1615,6 +1643,7 @@ mod tests {
         let formatter = MarkdownFormatter::new();
         let output = formatter.format_dns(&[]);
         assert!(output.contains("No records found"));
+        assert!(output.contains("DNSSEC-validated"));
     }
 
     #[test]

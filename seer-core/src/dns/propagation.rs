@@ -101,6 +101,23 @@ pub struct ServerResult {
     pub error: Option<String>,
 }
 
+/// Record of a server that failed to respond during a propagation check.
+///
+/// Distinct from `inconsistencies` — unreachable servers returned no answer at
+/// all (timeout, network error, refused), whereas inconsistencies represent
+/// servers that successfully responded with an answer that differs from the
+/// consensus.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnreachableServer {
+    pub name: String,
+    pub ip: String,
+    pub error: Option<String>,
+}
+
+fn default_dnssec_validated() -> bool {
+    false
+}
+
 /// Aggregated result of DNS propagation check across multiple global servers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PropagationResult {
@@ -111,7 +128,22 @@ pub struct PropagationResult {
     pub propagation_percentage: f64,
     pub results: Vec<ServerResult>,
     pub consensus_values: Vec<String>,
+    /// Servers that responded successfully but with an answer that differs
+    /// from the consensus. A non-empty value means the domain has genuinely
+    /// divergent answers in flight.
     pub inconsistencies: Vec<String>,
+    /// Servers that could not be reached (timeouts, network errors, refusals).
+    /// These are NOT inconsistencies — they are missing data points.
+    #[serde(default)]
+    pub unreachable_servers: Vec<UnreachableServer>,
+    /// Whether the DNS responses in this result were DNSSEC-validated.
+    ///
+    /// Currently always `false`: Seer's resolver does not perform DNSSEC
+    /// validation, and UDP DNS responses are trivially spoofable. Callers
+    /// and formatters should surface this to avoid giving a false sense of
+    /// authenticity.
+    #[serde(default = "default_dnssec_validated")]
+    pub dnssec_validated: bool,
 }
 
 impl PropagationResult {
@@ -119,8 +151,17 @@ impl PropagationResult {
         self.propagation_percentage >= 100.0
     }
 
+    /// Returns true only when one or more servers returned an answer that
+    /// disagrees with the consensus. Servers that timed out or otherwise
+    /// failed to respond do NOT flip this to true — they are reported via
+    /// `unreachable_servers` / `has_unreachable_servers()` instead.
     pub fn has_inconsistencies(&self) -> bool {
         !self.inconsistencies.is_empty()
+    }
+
+    /// Returns true when one or more servers failed to respond.
+    pub fn has_unreachable_servers(&self) -> bool {
+        !self.unreachable_servers.is_empty()
     }
 }
 
@@ -194,7 +235,7 @@ impl PropagationChecker {
         let servers_responding = results.iter().filter(|r| r.success).count();
 
         // Calculate propagation and find consensus
-        let (propagation_percentage, consensus_values, inconsistencies) =
+        let (propagation_percentage, consensus_values, inconsistencies, unreachable_servers) =
             analyze_results(&results, record_type);
 
         Ok(PropagationResult {
@@ -206,6 +247,11 @@ impl PropagationChecker {
             results,
             consensus_values,
             inconsistencies,
+            unreachable_servers,
+            // DNSSEC validation is not currently performed by the resolver.
+            // This field exists so callers / formatters can disclose the
+            // lack of authentication to users.
+            dnssec_validated: false,
         })
     }
 
@@ -290,9 +336,12 @@ mod tests {
             results: vec![],
             consensus_values: vec!["1.2.3.4".to_string()],
             inconsistencies: vec![],
+            unreachable_servers: vec![],
+            dnssec_validated: false,
         };
         assert!(result.is_fully_propagated());
         assert!(!result.has_inconsistencies());
+        assert!(!result.has_unreachable_servers());
     }
 
     #[test]
@@ -306,9 +355,98 @@ mod tests {
             results: vec![],
             consensus_values: vec!["1.2.3.4".to_string()],
             inconsistencies: vec!["Server X has different value".to_string()],
+            unreachable_servers: vec![],
+            dnssec_validated: false,
         };
         assert!(!result.is_fully_propagated());
         assert!(result.has_inconsistencies());
+    }
+
+    #[test]
+    fn has_inconsistencies_is_false_when_only_timeouts() {
+        // 28 agreeing servers + 1 unreachable server should NOT report an
+        // inconsistency — the unreachable server is a missing data point, not
+        // a conflicting answer.
+        let result = PropagationResult {
+            domain: "example.com".to_string(),
+            record_type: RecordType::A,
+            servers_checked: 29,
+            servers_responding: 28,
+            propagation_percentage: (28.0 / 29.0) * 100.0,
+            results: vec![],
+            consensus_values: vec!["1.2.3.4".to_string()],
+            inconsistencies: vec![],
+            unreachable_servers: vec![UnreachableServer {
+                name: "Flaky DNS".to_string(),
+                ip: "203.0.113.1".to_string(),
+                error: Some("timed out".to_string()),
+            }],
+            dnssec_validated: false,
+        };
+        assert!(!result.has_inconsistencies());
+        assert!(result.has_unreachable_servers());
+    }
+
+    #[test]
+    fn has_inconsistencies_is_true_when_answers_differ() {
+        let result = PropagationResult {
+            domain: "example.com".to_string(),
+            record_type: RecordType::A,
+            servers_checked: 10,
+            servers_responding: 10,
+            propagation_percentage: 90.0,
+            results: vec![],
+            consensus_values: vec!["1.2.3.4".to_string()],
+            inconsistencies: vec![
+                "Server Y (203.0.113.2): 5.6.7.8 vs consensus: 1.2.3.4".to_string()
+            ],
+            unreachable_servers: vec![],
+            dnssec_validated: false,
+        };
+        assert!(result.has_inconsistencies());
+        assert!(!result.has_unreachable_servers());
+    }
+
+    #[test]
+    fn analyze_results_routes_failed_servers_to_unreachable() {
+        let ok_server = DnsServer::new("OK", "1.1.1.1", "NA", "OK");
+        let bad_server = DnsServer::new("Bad", "203.0.113.1", "NA", "Bad");
+
+        let results = vec![
+            ServerResult {
+                server: ok_server.clone(),
+                records: vec![DnsRecord {
+                    name: "example.com".to_string(),
+                    record_type: RecordType::A,
+                    ttl: 300,
+                    data: crate::dns::RecordData::A {
+                        address: "1.2.3.4".to_string(),
+                    },
+                }],
+                response_time_ms: 10,
+                success: true,
+                error: None,
+            },
+            ServerResult {
+                server: bad_server.clone(),
+                records: vec![],
+                response_time_ms: 5000,
+                success: false,
+                error: Some("timed out".to_string()),
+            },
+        ];
+
+        let (_pct, _consensus, inconsistencies, unreachable) =
+            analyze_results(&results, RecordType::A);
+
+        assert!(
+            inconsistencies.is_empty(),
+            "timeout must not produce an inconsistency, got: {:?}",
+            inconsistencies
+        );
+        assert_eq!(unreachable.len(), 1);
+        assert_eq!(unreachable[0].name, "Bad");
+        assert_eq!(unreachable[0].error.as_deref(), Some("timed out"));
     }
 
     #[test]
@@ -323,10 +461,11 @@ mod tests {
     #[test]
     fn test_analyze_empty_results() {
         let results: Vec<ServerResult> = vec![];
-        let (pct, consensus, issues) = analyze_results(&results, RecordType::A);
+        let (pct, consensus, issues, unreachable) = analyze_results(&results, RecordType::A);
         assert_eq!(pct, 0.0);
         assert!(consensus.is_empty());
         assert!(!issues.is_empty());
+        assert!(unreachable.is_empty());
     }
 
     #[test]
@@ -362,10 +501,11 @@ mod tests {
                 error: None,
             },
         ];
-        let (pct, consensus, issues) = analyze_results(&results, RecordType::A);
+        let (pct, consensus, issues, unreachable) = analyze_results(&results, RecordType::A);
         assert_eq!(pct, 100.0);
         assert_eq!(consensus, vec!["1.2.3.4"]);
         assert!(issues.is_empty());
+        assert!(unreachable.is_empty());
     }
 
     #[test]
@@ -379,21 +519,42 @@ mod tests {
             results: vec![],
             consensus_values: vec!["1.2.3.4".to_string()],
             inconsistencies: vec![],
+            unreachable_servers: vec![],
+            dnssec_validated: false,
         };
         let json = serde_json::to_string(&result).unwrap();
         assert!(json.contains("test.com"));
         assert!(json.contains("100"));
+        assert!(json.contains("unreachable_servers"));
+        assert!(json.contains("dnssec_validated"));
     }
 }
 
 fn analyze_results(
     results: &[ServerResult],
     record_type: RecordType,
-) -> (f64, Vec<String>, Vec<String>) {
+) -> (f64, Vec<String>, Vec<String>, Vec<UnreachableServer>) {
+    // Collect unreachable servers up front so they are reported regardless of
+    // whether any server succeeded.
+    let unreachable_servers: Vec<UnreachableServer> = results
+        .iter()
+        .filter(|r| !r.success)
+        .map(|r| UnreachableServer {
+            name: r.server.name.clone(),
+            ip: r.server.ip.clone(),
+            error: r.error.clone(),
+        })
+        .collect();
+
     let successful: Vec<_> = results.iter().filter(|r| r.success).collect();
 
     if successful.is_empty() {
-        return (0.0, vec![], vec!["No servers responded".to_string()]);
+        return (
+            0.0,
+            vec![],
+            vec!["No servers responded".to_string()],
+            unreachable_servers,
+        );
     }
 
     // Build sorted value sets once per server result
@@ -421,6 +582,7 @@ fn analyze_results(
             0.0,
             vec![],
             vec!["No propagation data to analyze".to_string()],
+            unreachable_servers,
         );
     };
 
@@ -450,14 +612,9 @@ fn analyze_results(
         }
     }
 
-    // Add failed servers to inconsistencies
-    for result in results.iter().filter(|r| !r.success) {
-        let error_msg = result.error.as_deref().unwrap_or("Unknown error");
-        inconsistencies.push(format!(
-            "{} ({}): {}",
-            result.server.name, result.server.ip, error_msg
-        ));
-    }
+    // Note: failed/unreachable servers are NOT merged into `inconsistencies`.
+    // They are reported separately via the `unreachable_servers` return value
+    // so that `has_inconsistencies()` reflects only genuine answer conflicts.
 
     // For record types where empty result is valid, adjust messaging
     if consensus_values.is_empty()
@@ -471,5 +628,6 @@ fn analyze_results(
         propagation_percentage,
         consensus_values.clone(),
         inconsistencies,
+        unreachable_servers,
     )
 }

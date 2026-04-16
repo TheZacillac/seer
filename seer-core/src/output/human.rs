@@ -650,6 +650,9 @@ impl OutputFormatter for HumanFormatter {
 
         if records.is_empty() {
             output.push(self.warning("No records found"));
+            // DNSSEC disclaimer applies whether or not records were returned.
+            output.push(String::new());
+            output.push(self.warning("Note: DNS responses are not DNSSEC-validated"));
             return output.join("\n");
         }
 
@@ -670,6 +673,11 @@ impl OutputFormatter for HumanFormatter {
                 self.success(&sanitize_display(&record.data.to_string()))
             ));
         }
+
+        // DNSSEC disclosure (M12): Seer's resolver does not validate DNSSEC,
+        // and UDP DNS is trivially spoofable. Surface this once per DNS block.
+        output.push(String::new());
+        output.push(self.warning("Note: DNS responses are not DNSSEC-validated"));
 
         output.join("\n")
     }
@@ -711,13 +719,29 @@ impl OutputFormatter for HumanFormatter {
             }
         }
 
-        // Inconsistencies
+        // Inconsistencies (genuine answer conflicts only)
         if !result.inconsistencies.is_empty() {
             output.push(format!("  {}:", self.label("Inconsistencies")));
             for inconsistency in &result.inconsistencies {
                 output.push(format!(
                     "    - {}",
                     self.warning(&sanitize_display(inconsistency))
+                ));
+            }
+        }
+
+        // Unreachable servers (timeouts, network errors) — distinct from
+        // answer conflicts. Reporting these separately prevents a single
+        // timeout from being misread as divergent DNS state.
+        if !result.unreachable_servers.is_empty() {
+            output.push(format!("  {}:", self.label("Unreachable servers")));
+            for unreachable in &result.unreachable_servers {
+                let error_msg = unreachable.error.as_deref().unwrap_or("no response");
+                output.push(format!(
+                    "    - {} ({}): {}",
+                    self.warning(&sanitize_display(&unreachable.name)),
+                    sanitize_display(&unreachable.ip),
+                    sanitize_display(error_msg),
                 ));
             }
         }
@@ -773,6 +797,14 @@ impl OutputFormatter for HumanFormatter {
                     ));
                 }
             }
+        }
+
+        // DNSSEC disclosure (M12). The resolver does not perform DNSSEC
+        // validation and UDP DNS is trivially spoofable — surface this so
+        // users don't treat the results as authenticated.
+        if !result.dnssec_validated {
+            output.push(String::new());
+            output.push(self.warning("Note: DNS responses are not DNSSEC-validated"));
         }
 
         output.join("\n")
