@@ -47,6 +47,14 @@ pub struct CertificateInfo {
     pub days_until_expiry: i64,
     /// Whether the certificate is currently valid
     pub is_valid: bool,
+    /// Whether the certificate's SAN/CN matches the queried hostname.
+    ///
+    /// This is an additive signal independent of `is_valid` (which reflects
+    /// only date-range validity). Because cert inspection uses
+    /// `danger_accept_invalid_certs(true)` to see certs on mildly-broken
+    /// sites, hostname verification is performed manually after extraction.
+    #[serde(default)]
+    pub hostname_verified: bool,
 }
 
 /// Domain registration expiration information
@@ -160,6 +168,7 @@ mod tests {
             valid_until: Utc::now(),
             days_until_expiry: 90,
             is_valid: true,
+            hostname_verified: true,
         };
         let json = serde_json::to_string(&cert).unwrap();
         assert!(json.contains("Let's Encrypt"));

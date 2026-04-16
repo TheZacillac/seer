@@ -186,14 +186,28 @@ impl StatusClient {
                     .unwrap_or("");
 
                 if content_type.contains("text/html") {
-                    // Read at most 64 KB for title extraction to prevent OOM
-                    // on arbitrarily large responses
+                    // Stream at most 64 KB for title extraction. Streaming
+                    // (rather than `response.bytes().await`) prevents a
+                    // malicious server from forcing us to buffer a huge
+                    // body before the cap is applied.
                     const MAX_TITLE_BODY: usize = 64 * 1024;
-                    let bytes = response
-                        .bytes()
-                        .await
-                        .map_err(|e| SeerError::HttpError(e.to_string()))?;
-                    let body = String::from_utf8_lossy(&bytes[..bytes.len().min(MAX_TITLE_BODY)]);
+                    use futures::StreamExt;
+                    let mut buf: Vec<u8> = Vec::with_capacity(8 * 1024);
+                    let mut stream = response.bytes_stream();
+                    while let Some(chunk) = stream.next().await {
+                        let chunk = chunk
+                            .map_err(|e| SeerError::HttpError(format!("body chunk: {}", e)))?;
+                        let remaining = MAX_TITLE_BODY.saturating_sub(buf.len());
+                        if remaining == 0 {
+                            break;
+                        }
+                        let take = remaining.min(chunk.len());
+                        buf.extend_from_slice(&chunk[..take]);
+                        if buf.len() >= MAX_TITLE_BODY {
+                            break;
+                        }
+                    }
+                    let body = String::from_utf8_lossy(&buf);
                     extract_title(&body)
                 } else {
                     None
@@ -453,7 +467,7 @@ async fn validate_url_target(url: &Url) -> Result<Vec<SocketAddr>> {
 }
 
 /// Parses certificate information from DER-encoded certificate using x509-parser.
-fn parse_certificate_der(der: &[u8], _domain: &str) -> Result<CertificateInfo> {
+fn parse_certificate_der(der: &[u8], domain: &str) -> Result<CertificateInfo> {
     use x509_parser::prelude::*;
 
     let (_, cert) = X509Certificate::from_der(der)
@@ -475,6 +489,12 @@ fn parse_certificate_der(der: &[u8], _domain: &str) -> Result<CertificateInfo> {
     let days_until_expiry = (valid_until - now).num_days();
     let is_valid = now >= valid_from && now <= valid_until;
 
+    // Hostname verification is performed manually because the TLS connector
+    // was configured with danger_accept_invalid_certs(true) to allow cert
+    // inspection on mildly-broken sites. Without this check any cert — even
+    // one issued for an unrelated domain — would be accepted.
+    let hostname_verified = cert_matches_hostname(&cert, domain);
+
     Ok(CertificateInfo {
         issuer,
         subject,
@@ -482,7 +502,59 @@ fn parse_certificate_der(der: &[u8], _domain: &str) -> Result<CertificateInfo> {
         valid_until,
         days_until_expiry,
         is_valid,
+        hostname_verified,
     })
+}
+
+/// Matches a hostname against a certificate name pattern.
+///
+/// Supports exact matches (case-insensitive) and single-label wildcards
+/// per RFC 6125 — `*.example.com` matches `a.example.com` but not
+/// `example.com` or `a.b.example.com`.
+fn hostname_matches_pattern(host: &str, pattern: &str) -> bool {
+    let host = host.to_ascii_lowercase();
+    let pattern = pattern.to_ascii_lowercase();
+    if let Some(rest) = pattern.strip_prefix("*.") {
+        // Wildcard: must match exactly one label, and must contain a dot
+        let Some(dot) = host.find('.') else {
+            return false;
+        };
+        let host_rest = &host[dot + 1..];
+        host_rest == rest
+    } else {
+        host == pattern
+    }
+}
+
+/// Checks whether a certificate's SAN dNSName entries (or CN as fallback)
+/// match the queried hostname.
+///
+/// Per RFC 6125, SAN dNSName is the authoritative source; CN is only checked
+/// as a legacy fallback.
+fn cert_matches_hostname(cert: &x509_parser::certificate::X509Certificate<'_>, host: &str) -> bool {
+    use x509_parser::prelude::*;
+
+    // SAN dNSName entries (preferred per RFC 6125)
+    if let Ok(Some(san_ext)) = cert.tbs_certificate.subject_alternative_name() {
+        for name in &san_ext.value.general_names {
+            if let GeneralName::DNSName(n) = name {
+                if hostname_matches_pattern(host, n) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    // CN fallback (legacy)
+    for cn in cert.subject().iter_common_name() {
+        if let Ok(s) = cn.as_str() {
+            if hostname_matches_pattern(host, s) {
+                return true;
+            }
+        }
+    }
+
+    false
 }
 
 /// Extracts the Common Name or Organization from an X.509 name.
@@ -539,4 +611,38 @@ fn asn1_time_to_chrono(time: x509_parser::time::ASN1Time) -> Result<chrono::Date
     let timestamp = time.timestamp();
     chrono::DateTime::from_timestamp(timestamp, 0)
         .ok_or_else(|| SeerError::CertificateError("invalid certificate timestamp".to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hostname_matches_pattern_exact() {
+        assert!(hostname_matches_pattern("example.com", "example.com"));
+        assert!(hostname_matches_pattern("EXAMPLE.COM", "example.com"));
+        assert!(hostname_matches_pattern("example.com", "EXAMPLE.COM"));
+        assert!(!hostname_matches_pattern("evil.com", "example.com"));
+        assert!(!hostname_matches_pattern("example.com", "evil.com"));
+    }
+
+    #[test]
+    fn hostname_matches_pattern_wildcard() {
+        assert!(hostname_matches_pattern("a.example.com", "*.example.com"));
+        assert!(hostname_matches_pattern("A.EXAMPLE.COM", "*.example.com"));
+        // Apex must not match wildcard (RFC 6125)
+        assert!(!hostname_matches_pattern("example.com", "*.example.com"));
+        // Wildcard only covers a single label
+        assert!(!hostname_matches_pattern(
+            "a.b.example.com",
+            "*.example.com"
+        ));
+        assert!(!hostname_matches_pattern("b.other.com", "*.example.com"));
+    }
+
+    #[test]
+    fn hostname_matches_pattern_wildcard_requires_dot() {
+        // A bare host with no dot cannot match a wildcard pattern
+        assert!(!hostname_matches_pattern("localhost", "*.example.com"));
+    }
 }

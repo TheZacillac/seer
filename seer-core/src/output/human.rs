@@ -1462,6 +1462,13 @@ impl OutputFormatter for HumanFormatter {
             };
             output.push(format!("    {}: {}", self.label("Status"), valid_status));
 
+            if !cert.hostname_verified {
+                output.push(format!(
+                    "    {}",
+                    self.error("WARNING: certificate hostname not verified")
+                ));
+            }
+
             output.push(format!(
                 "    {}: {}",
                 self.label("Valid From"),
