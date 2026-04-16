@@ -108,6 +108,28 @@ impl HumanFormatter {
             format!("\n{}\n{}", text, "-".repeat(text.len()))
         }
     }
+
+    /// Formats an expiration date with a human-readable status suffix.
+    ///
+    /// Behaviour:
+    /// - already expired (negative days): red "expired N days ago"
+    /// - <30 days remaining: red "expires in N days!"
+    /// - <90 days remaining: yellow "expires in N days"
+    /// - otherwise: green "expires in N days"
+    fn format_expiry_status(&self, expiry_str: &str, days_until: i64) -> String {
+        if days_until < 0 {
+            self.error(&format!(
+                "{} (expired {} days ago)",
+                expiry_str, -days_until
+            ))
+        } else if days_until < 30 {
+            self.error(&format!("{} (expires in {} days!)", expiry_str, days_until))
+        } else if days_until < 90 {
+            self.warning(&format!("{} (expires in {} days)", expiry_str, days_until))
+        } else {
+            self.success(&format!("{} (expires in {} days)", expiry_str, days_until))
+        }
+    }
 }
 
 impl OutputFormatter for HumanFormatter {
@@ -270,13 +292,7 @@ impl OutputFormatter for HumanFormatter {
         if let Some(expires) = response.expiration_date {
             let days_until = (expires - chrono::Utc::now()).num_days();
             let expiry_str = expires.format("%Y-%m-%d").to_string();
-            let status = if days_until < 30 {
-                self.error(&format!("{} (expires in {} days!)", expiry_str, days_until))
-            } else if days_until < 90 {
-                self.warning(&format!("{} ({} days)", expiry_str, days_until))
-            } else {
-                self.value(&format!("{} ({} days)", expiry_str, days_until))
-            };
+            let status = self.format_expiry_status(&expiry_str, days_until);
             output.push(format!("  {}: {}", self.label("Expires"), status));
         }
 
@@ -553,13 +569,7 @@ impl OutputFormatter for HumanFormatter {
         if let Some(expires) = response.expiration_date() {
             let days_until = (expires - chrono::Utc::now()).num_days();
             let expiry_str = expires.format("%Y-%m-%d").to_string();
-            let status = if days_until < 30 {
-                self.error(&format!("{} (expires in {} days!)", expiry_str, days_until))
-            } else if days_until < 90 {
-                self.warning(&format!("{} ({} days)", expiry_str, days_until))
-            } else {
-                self.value(&format!("{} ({} days)", expiry_str, days_until))
-            };
+            let status = self.format_expiry_status(&expiry_str, days_until);
             output.push(format!("  {}: {}", self.label("Expires"), status));
         }
 
@@ -937,13 +947,7 @@ impl OutputFormatter for HumanFormatter {
                 if let Some(expires) = data.expiration_date() {
                     let days_until = (expires - chrono::Utc::now()).num_days();
                     let expiry_str = expires.format("%Y-%m-%d").to_string();
-                    let status = if days_until < 30 {
-                        self.error(&format!("{} (expires in {} days!)", expiry_str, days_until))
-                    } else if days_until < 90 {
-                        self.warning(&format!("{} ({} days)", expiry_str, days_until))
-                    } else {
-                        self.value(&format!("{} ({} days)", expiry_str, days_until))
-                    };
+                    let status = self.format_expiry_status(&expiry_str, days_until);
                     output.push(format!("  {}: {}", self.label("Expires"), status));
                 }
 
@@ -1321,13 +1325,7 @@ impl OutputFormatter for HumanFormatter {
                 if let Some(expires) = data.expiration_date {
                     let days_until = (expires - chrono::Utc::now()).num_days();
                     let expiry_str = expires.format("%Y-%m-%d").to_string();
-                    let status = if days_until < 30 {
-                        self.error(&format!("{} (expires in {} days!)", expiry_str, days_until))
-                    } else if days_until < 90 {
-                        self.warning(&format!("{} ({} days)", expiry_str, days_until))
-                    } else {
-                        self.value(&format!("{} ({} days)", expiry_str, days_until))
-                    };
+                    let status = self.format_expiry_status(&expiry_str, days_until);
                     output.push(format!("  {}: {}", self.label("Expires"), status));
                 }
 
@@ -2532,5 +2530,63 @@ impl OutputFormatter for HumanFormatter {
         }
 
         output.join("\n")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn formatter() -> HumanFormatter {
+        HumanFormatter::new().without_colors()
+    }
+
+    #[test]
+    fn expired_shows_days_ago() {
+        let f = formatter();
+        let out = f.format_expiry_status("2024-01-01", -3);
+        assert!(out.contains("expired 3 days ago"), "got: {}", out);
+        assert!(!out.contains("-3"), "got: {}", out);
+    }
+
+    #[test]
+    fn expiring_soon_shows_expires_in() {
+        let f = formatter();
+        let out = f.format_expiry_status("2026-05-01", 15);
+        assert!(out.contains("expires in 15 days"), "got: {}", out);
+        assert!(!out.contains("days ago"), "got: {}", out);
+    }
+
+    #[test]
+    fn warning_window_uses_expires_in() {
+        let f = formatter();
+        let out = f.format_expiry_status("2026-07-01", 60);
+        assert!(out.contains("expires in 60 days"), "got: {}", out);
+        assert!(!out.contains("!"), "got: {}", out);
+    }
+
+    #[test]
+    fn healthy_expiry_uses_expires_in() {
+        let f = formatter();
+        let out = f.format_expiry_status("2027-01-01", 300);
+        assert!(out.contains("expires in 300 days"), "got: {}", out);
+        assert!(!out.contains("!"), "got: {}", out);
+    }
+
+    #[test]
+    fn expired_one_day_is_pluralized_simply() {
+        // We don't singularize; verify the raw format.
+        let f = formatter();
+        let out = f.format_expiry_status("2024-01-01", -1);
+        assert!(out.contains("expired 1 days ago"), "got: {}", out);
+    }
+
+    #[test]
+    fn boundary_30_days_is_warning_not_error() {
+        let f = formatter();
+        // 30 days -> not <30, so warning branch, no "!"
+        let out = f.format_expiry_status("2026-05-15", 30);
+        assert!(out.contains("expires in 30 days"), "got: {}", out);
+        assert!(!out.contains("!"), "got: {}", out);
     }
 }
