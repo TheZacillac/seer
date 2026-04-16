@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::net::Ipv6Addr;
+use std::str::FromStr;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -41,9 +43,31 @@ static LOOKUP_INFLIGHT: Lazy<Mutex<HashMap<String, Weak<Notify>>>> =
 /// Regex patterns for stripping IP literals from public error messages.
 static IPV4_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"\b(?:\d{1,3}\.){3}\d{1,3}\b").expect("IPV4_RE is a valid regex"));
-static IPV6_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"\b[0-9a-fA-F:]{2,}:[0-9a-fA-F:]+\b").expect("IPV6_RE is a valid regex")
+
+/// Candidate pattern for IPv6 literals: a hex/colon token containing either
+/// a `::` compression or at least three colons. This catches plausible IPv6
+/// addresses cheaply; each match is then validated by `Ipv6Addr::from_str`
+/// before redaction, so MAC fragments, hex hashes, and similar colon-laden
+/// tokens are left alone.
+static IPV6_CANDIDATE_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"\b[0-9a-fA-F:]*(?:::|(?:[0-9a-fA-F]{1,4}:){3,})[0-9a-fA-F:]*\b")
+        .expect("IPV6_CANDIDATE_RE is a valid regex")
 });
+
+/// Redact substrings that parse as valid IPv6 addresses, leaving non-IPv6
+/// tokens (e.g. `af:ba:12`) untouched.
+fn strip_ipv6(msg: &str) -> String {
+    IPV6_CANDIDATE_RE
+        .replace_all(msg, |caps: &regex::Captures| {
+            let candidate = &caps[0];
+            if Ipv6Addr::from_str(candidate).is_ok() {
+                "[ip-redacted]".to_string()
+            } else {
+                candidate.to_string()
+            }
+        })
+        .into_owned()
+}
 
 /// Test-only hook: counts the number of times `lookup_concurrent` is actually
 /// invoked (i.e., the underlying network race runs). Used to verify request
@@ -59,8 +83,7 @@ static LOOKUP_CONCURRENT_CALLS: Lazy<std::sync::atomic::AtomicUsize> =
 /// [`MAX_PUBLIC_ERROR_LEN`] characters.
 fn sanitize_error_for_public(msg: &str) -> String {
     let s = IPV4_RE.replace_all(msg, "[ip-redacted]");
-    let s = IPV6_RE.replace_all(&s, "[ip-redacted]");
-    let s = s.to_string();
+    let s = strip_ipv6(&s);
     if s.chars().count() > MAX_PUBLIC_ERROR_LEN {
         let mut trunc: String = s.chars().take(MAX_PUBLIC_ERROR_LEN).collect();
         trunc.push('…');
@@ -73,6 +96,15 @@ fn sanitize_error_for_public(msg: &str) -> String {
 /// RAII guard for the in-flight-lookup slot. On drop, removes the entry
 /// from `LOOKUP_INFLIGHT` and notifies any waiters so they can read the
 /// freshly-populated cache.
+///
+/// NOTE on failed-owner retry semantics:
+/// When the owning task's lookup fails, `InflightGuard::drop` runs, the
+/// `HashMap` entry is removed, and `notify_waiters()` fires. Waiters wake,
+/// observe an empty cache, and one of them becomes the new owner — triggering
+/// a fresh network race. This means transient failures are automatically
+/// retried by any concurrent waiter. Callers that observe a timeout error
+/// should not assume no work is in flight; another concurrent caller may
+/// already be retrying.
 struct InflightGuard {
     key: String,
     notify: Arc<Notify>,
@@ -80,9 +112,12 @@ struct InflightGuard {
 
 impl Drop for InflightGuard {
     fn drop(&mut self) {
-        if let Ok(mut inflight) = LOOKUP_INFLIGHT.lock() {
-            inflight.remove(&self.key);
-        }
+        // Recover from mutex poisoning rather than leaking the HashMap entry.
+        // A poisoned mutex here would otherwise strand the key in the map
+        // until process exit, permanently blocking future lookups for this
+        // domain from acquiring ownership.
+        let mut inflight = LOOKUP_INFLIGHT.lock().unwrap_or_else(|p| p.into_inner());
+        inflight.remove(&self.key);
         self.notify.notify_waiters();
     }
 }
@@ -721,6 +756,32 @@ mod tests {
         let sanitized = sanitize_error_for_public(msg);
         assert!(!sanitized.contains("fe80::1"));
         assert!(sanitized.contains("[ip-redacted]"));
+    }
+
+    #[test]
+    fn sanitize_leaves_mac_address_like_tokens_alone() {
+        let msg = "error code af:ba:12 at line 5";
+        let out = sanitize_error_for_public(msg);
+        assert!(
+            out.contains("af:ba:12"),
+            "MAC fragment should not be stripped: {}",
+            out
+        );
+    }
+
+    #[test]
+    fn sanitize_strips_real_ipv6() {
+        let msg = "cannot reach 2001:db8::1 — timeout";
+        let out = sanitize_error_for_public(msg);
+        assert!(!out.contains("2001:db8::1"));
+        assert!(out.contains("[ip-redacted]"));
+    }
+
+    #[test]
+    fn sanitize_strips_fe80_link_local() {
+        let msg = "peer at fe80::1 unreachable";
+        let out = sanitize_error_for_public(msg);
+        assert!(out.contains("[ip-redacted]"));
     }
 
     #[test]
