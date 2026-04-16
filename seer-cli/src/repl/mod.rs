@@ -697,22 +697,16 @@ impl Repl {
                 .to_string()
         });
 
-        // Read domains from file
-        const MAX_BULK_FILE_SIZE: usize = 1024 * 1024; // 1 MB
+        // Read domains from file.
+        // `read_bulk_input` rejects FIFOs, sockets, devices, directories, and
+        // oversized files via a pre-read metadata check, preventing hangs on
+        // `mkfifo`'d paths.
         const MAX_BULK_DOMAINS_CLI: usize = 1000;
 
-        let content = match std::fs::read_to_string(file_path) {
+        let content = match crate::utils::read_bulk_input(file_path) {
             Ok(c) => c,
-            Err(e) => return CommandResult::Error(format!("Failed to read file: {}", e)),
+            Err(e) => return CommandResult::Error(e),
         };
-
-        if content.len() > MAX_BULK_FILE_SIZE {
-            return CommandResult::Error(format!(
-                "Bulk file exceeds {} byte limit ({} bytes)",
-                MAX_BULK_FILE_SIZE,
-                content.len()
-            ));
-        }
 
         let domains = seer_core::bulk::parse_domains_from_file(&content);
         if domains.is_empty() {

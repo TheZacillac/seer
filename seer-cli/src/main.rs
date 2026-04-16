@@ -474,17 +474,12 @@ async fn execute_command(
             record_type,
             output,
         } => {
-            const MAX_BULK_FILE_SIZE: usize = 1024 * 1024; // 1 MB
             const MAX_BULK_DOMAINS_CLI: usize = 1000;
 
-            let content = std::fs::read_to_string(&file)?;
-            if content.len() > MAX_BULK_FILE_SIZE {
-                return Err(anyhow::anyhow!(
-                    "Bulk file exceeds {} byte limit ({} bytes)",
-                    MAX_BULK_FILE_SIZE,
-                    content.len()
-                ));
-            }
+            // `read_bulk_input` rejects FIFOs, sockets, devices, directories,
+            // and oversized files via a pre-read metadata check, so malicious
+            // `mkfifo`'d paths can't hang the process.
+            let content = utils::read_bulk_input(&file).map_err(|e| anyhow::anyhow!(e))?;
 
             let domains = seer_core::bulk::parse_domains_from_file(&content);
 

@@ -1,4 +1,40 @@
+use std::path::Path;
+
 use seer_core::bulk::{BulkOperation, BulkResult, BulkResultData};
+
+/// Maximum allowed size of a bulk input file, in bytes (1 MB).
+pub const MAX_BULK_FILE_SIZE: u64 = 1024 * 1024;
+
+/// Safely reads the contents of a bulk input file.
+///
+/// Guards against FIFOs, sockets, block/char devices, and directories by
+/// requiring the path to point at a regular file. Also rejects files larger
+/// than [`MAX_BULK_FILE_SIZE`] *before* attempting to read them, preventing
+/// indefinite hangs on special files (e.g. paths created by `mkfifo`) that
+/// would otherwise cause `read_to_string` to block forever.
+pub fn read_bulk_input<P: AsRef<Path>>(path: P) -> Result<String, String> {
+    let path = path.as_ref();
+    let metadata = std::fs::metadata(path)
+        .map_err(|e| format!("cannot stat input file {}: {}", path.display(), e))?;
+
+    if !metadata.is_file() {
+        return Err(format!(
+            "input path is not a regular file: {}",
+            path.display()
+        ));
+    }
+
+    if metadata.len() > MAX_BULK_FILE_SIZE {
+        return Err(format!(
+            "input file exceeds {} byte limit: {} bytes",
+            MAX_BULK_FILE_SIZE,
+            metadata.len()
+        ));
+    }
+
+    std::fs::read_to_string(path)
+        .map_err(|e| format!("failed to read input file {}: {}", path.display(), e))
+}
 
 pub fn format_interval(minutes: f64) -> String {
     if minutes < 1.0 {
@@ -422,4 +458,89 @@ pub fn extract_rdap_dates(r: &seer_core::rdap::RdapResponse) -> (String, String,
         .unwrap_or_default();
 
     (registrar, created, expires, updated)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_bulk_input_rejects_directory() {
+        // A directory is a readable filesystem entry but not a regular file;
+        // the metadata guard must reject it so we don't hit `read_to_string`
+        // on something that is not a plain file.
+        let dir = std::env::temp_dir();
+        let md = std::fs::metadata(&dir).expect("temp dir should exist");
+        assert!(!md.is_file(), "temp dir should not be a regular file");
+
+        let err = read_bulk_input(&dir).expect_err("directory must be rejected");
+        assert!(
+            err.contains("not a regular file"),
+            "unexpected error message: {err}"
+        );
+    }
+
+    #[test]
+    fn read_bulk_input_rejects_missing_path() {
+        let missing = std::env::temp_dir().join("seer-bulk-input-does-not-exist-xyzzy");
+        // Best-effort cleanup in case a stray entry exists.
+        let _ = std::fs::remove_file(&missing);
+
+        let err = read_bulk_input(&missing).expect_err("missing path must error");
+        assert!(
+            err.contains("cannot stat"),
+            "unexpected error message: {err}"
+        );
+    }
+
+    #[test]
+    fn read_bulk_input_reads_regular_file() {
+        let path = std::env::temp_dir().join("seer-bulk-input-regular-file.txt");
+        std::fs::write(&path, "example.com\n").expect("write temp file");
+
+        let content = read_bulk_input(&path).expect("regular file should be readable");
+        assert_eq!(content, "example.com\n");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_bulk_input_rejects_fifo() {
+        use std::os::unix::fs::FileTypeExt;
+        use std::process::Command;
+
+        let path =
+            std::env::temp_dir().join(format!("seer-bulk-input-fifo-{}", std::process::id()));
+        // Clean any leftover from a previous run.
+        let _ = std::fs::remove_file(&path);
+
+        // Create a FIFO via the system `mkfifo` binary. This keeps the test
+        // dependency-free (no `nix`, no `libc` dev-dep) while still exercising
+        // the exact filesystem type that motivated the hardening.
+        let status = Command::new("mkfifo").arg(&path).status();
+        let ok = match status {
+            Ok(s) => s.success(),
+            Err(_) => false,
+        };
+        if !ok {
+            eprintln!("skipping FIFO test: mkfifo binary unavailable or failed");
+            return;
+        }
+
+        let md = std::fs::metadata(&path).expect("stat fifo");
+        assert!(md.file_type().is_fifo(), "expected a FIFO");
+        assert!(
+            !md.is_file(),
+            "FIFO must not be classified as a regular file"
+        );
+
+        let err = read_bulk_input(&path).expect_err("FIFO must be rejected");
+        assert!(
+            err.contains("not a regular file"),
+            "unexpected error message: {err}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
 }
