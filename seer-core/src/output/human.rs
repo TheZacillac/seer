@@ -2418,6 +2418,15 @@ impl OutputFormatter for HumanFormatter {
             source_str
         )));
 
+        if let Some(verdict) = &info.availability_verdict {
+            let colored = match verdict.as_str() {
+                "available" => self.success("AVAILABLE"),
+                "likely_available" => self.warning("MAY BE AVAILABLE"),
+                _ => self.error("UNKNOWN"),
+            };
+            output.push(format!("  {}: {}", self.label("Status"), colored));
+        }
+
         // Registration
         if let Some(ref registrar) = info.registrar {
             output.push(format!(
