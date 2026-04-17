@@ -249,8 +249,11 @@ async fn main() -> anyhow::Result<()> {
     // Routes log output through the progress bar when one is active,
     // preventing logs from interfering with progress bar display.
     // Respects ARCANUM_LOG_LEVEL, ARCANUM_LOG_FORMAT, ARCANUM_LOG_FILE env vars.
-    let _log_guard =
-        seer_core::logging::init_logging_with_writer("seer", display::ProgressWriterFactory::new());
+    let _log_guard = seer_core::logging::init_logging_with_writer(
+        "seer",
+        "error",
+        display::ProgressWriterFactory::new(),
+    );
 
     let cli = Cli::parse();
 
