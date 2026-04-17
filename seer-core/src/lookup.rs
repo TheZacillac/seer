@@ -76,6 +76,22 @@ fn strip_ipv6(msg: &str) -> String {
 static LOOKUP_CONCURRENT_CALLS: Lazy<std::sync::atomic::AtomicUsize> =
     Lazy::new(|| std::sync::atomic::AtomicUsize::new(0));
 
+/// Returns true if the error is an RDAP HTTP 404 response, indicating the
+/// registry's RDAP server has no entry for this domain. Other RDAP errors
+/// (timeouts, 5xx, connection failures, etc.) do NOT match — they mean "we
+/// don't know", not "not registered".
+///
+/// Matches the format produced by `seer-core/src/rdap/client.rs:603`:
+/// `"query failed with status 404 ..."`.
+#[allow(dead_code)] // consumed by the availability-routing branch in a later task
+fn rdap_error_is_404(err: &SeerError) -> bool {
+    if let SeerError::RdapError(msg) = err {
+        msg.contains("query failed with status 404")
+    } else {
+        false
+    }
+}
+
 /// Sanitizes an error message for inclusion in a public-facing response.
 ///
 /// Strips IPv4 and IPv6 literals (to avoid leaking internal addresses when
@@ -942,5 +958,40 @@ mod tests {
         } else {
             panic!("expected Available variant");
         }
+    }
+
+    #[test]
+    fn rdap_error_is_404_matches_standard_404() {
+        let e = SeerError::RdapError("query failed with status 404 Not Found".to_string());
+        assert!(rdap_error_is_404(&e));
+    }
+
+    #[test]
+    fn rdap_error_is_404_matches_without_reason_phrase() {
+        let e = SeerError::RdapError("query failed with status 404".to_string());
+        assert!(rdap_error_is_404(&e));
+    }
+
+    #[test]
+    fn rdap_error_is_404_rejects_other_statuses() {
+        let e = SeerError::RdapError("query failed with status 500 Server Error".to_string());
+        assert!(!rdap_error_is_404(&e));
+        let e = SeerError::RdapError("query failed with status 400 Bad Request".to_string());
+        assert!(!rdap_error_is_404(&e));
+    }
+
+    #[test]
+    fn rdap_error_is_404_rejects_non_http_errors() {
+        let e = SeerError::RdapError("connection timeout".to_string());
+        assert!(!rdap_error_is_404(&e));
+        let e = SeerError::Timeout("rdap".to_string());
+        assert!(!rdap_error_is_404(&e));
+    }
+
+    #[test]
+    fn rdap_error_is_404_rejects_incidental_404_in_message() {
+        // A 404 substring inside a non-status context must not match.
+        let e = SeerError::RdapError("error 40404: database corruption".to_string());
+        assert!(!rdap_error_is_404(&e));
     }
 }
