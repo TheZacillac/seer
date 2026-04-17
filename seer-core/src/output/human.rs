@@ -1393,10 +1393,10 @@ impl OutputFormatter for HumanFormatter {
                 whois_error,
                 whois_data,
             } => {
-                let source_note = if !whois_error.is_empty() {
-                    "availability check (RDAP and WHOIS failed)"
-                } else {
+                let source_note = if whois_data.is_some() {
                     "WHOIS (RDAP unavailable)"
+                } else {
+                    "availability check (RDAP and WHOIS failed)"
                 };
                 output.push(format!(
                     "  {}: {}",
