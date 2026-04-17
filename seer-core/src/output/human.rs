@@ -2142,7 +2142,10 @@ impl OutputFormatter for HumanFormatter {
         let label_indent = "    "; // 4 spaces inside section
         let section_indent = "  "; // 2 spaces before section title
         let marker_gutter_width = 2; // "= " or "≠ "
-        let header_left_pad = label_indent.chars().count() + label_width + marker_gutter_width;
+                                     // Between label cell and marker: 2 spaces (inter-column gap).
+                                     // Marker cell: "= " or "≠ " = 2 chars.
+                                     // Total left pad before value column A = label_indent + label_width + 2 + 2.
+        let header_left_pad = label_indent.chars().count() + label_width + 2 + marker_gutter_width;
 
         // Column header block
         let header_line = format!(
@@ -3380,6 +3383,68 @@ mod tests {
         assert!(
             !out.contains('≠'),
             "all-match diff should have no ≠:\n{}",
+            out
+        );
+    }
+
+    #[test]
+    fn format_diff_all_differing_has_no_eq() {
+        let diff = DomainDiff {
+            domain_a: "a.com".to_string(),
+            domain_b: "b.com".to_string(),
+            registration: RegistrationDiff {
+                registrar: (Some("X".to_string()), Some("Y".to_string())),
+                organization: (Some("OrgX".to_string()), Some("OrgY".to_string())),
+                created: (Some("2020".to_string()), Some("2021".to_string())),
+                expires: (Some("2030".to_string()), Some("2031".to_string())),
+            },
+            dns: DnsDiff {
+                a_records: (vec!["1.1.1.1".to_string()], vec!["2.2.2.2".to_string()]),
+                nameservers: (vec!["nsa".to_string()], vec!["nsb".to_string()]),
+                resolves: (true, false),
+            },
+            ssl: SslDiff {
+                issuer: (Some("IA".to_string()), Some("IB".to_string())),
+                valid_until: (Some("2030".to_string()), Some("2031".to_string())),
+                days_remaining: (Some(10), Some(20)),
+                is_valid: (Some(true), Some(false)),
+            },
+        };
+        let out = diff_formatter().format_diff(&diff);
+        // Every field differs. Match marker must not appear on any row.
+        // We exclude the rule-line `─` and any spaces; only search within
+        // lines that contain a field label (start with four spaces).
+        for line in out.lines() {
+            if line.starts_with("    ") && line.len() > 10 {
+                assert!(
+                    !line.contains('='),
+                    "all-differing diff should have no = on field rows: {}",
+                    line
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn format_diff_uneven_list_lengths_pad_shorter_side() {
+        let mut diff = make_sample_diff();
+        diff.dns.nameservers = (
+            vec!["ns1".to_string(), "ns2".to_string(), "ns3".to_string()],
+            vec!["only".to_string()],
+        );
+        let out = diff_formatter().format_diff(&diff);
+        // All three left-side nameservers render.
+        assert!(out.contains("ns1"), "ns1 missing:\n{}", out);
+        assert!(out.contains("ns2"), "ns2 missing:\n{}", out);
+        assert!(out.contains("ns3"), "ns3 missing:\n{}", out);
+        // Right side only has one value, "only".
+        assert!(out.contains("only"), "right-side 'only' missing:\n{}", out);
+        // The "only" string must appear exactly once — it should not be
+        // mistakenly duplicated onto padding rows.
+        assert_eq!(
+            out.matches("only").count(),
+            1,
+            "right-side value must appear exactly once:\n{}",
             out
         );
     }
