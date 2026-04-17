@@ -3,9 +3,11 @@ mod repl;
 mod utils;
 
 use std::io::Write;
+use std::sync::Arc;
 
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{generate, Shell};
+use indicatif::{ProgressBar, ProgressStyle};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 #[clap(rename_all = "lowercase")]
@@ -365,14 +367,14 @@ async fn execute_command(
 
     match command {
         Commands::Lookup { domain } => {
-            let spinner = std::sync::Arc::new(display::Spinner::new(&format!(
+            let spinner = Arc::new(display::Spinner::new(&format!(
                 "Smart lookup for {} (trying RDAP first)",
                 domain
             )));
 
             // Create progress callback that updates the spinner
             let spinner_clone = spinner.clone();
-            let progress: seer_core::LookupProgressCallback = std::sync::Arc::new(move |message| {
+            let progress: seer_core::LookupProgressCallback = Arc::new(move |message| {
                 spinner_clone.set_message(message);
             });
 
@@ -405,7 +407,7 @@ async fn execute_command(
             }
         }
         Commands::Info { domain } => {
-            let spinner = std::sync::Arc::new(display::Spinner::new(&format!(
+            let spinner = Arc::new(display::Spinner::new(&format!(
                 "Getting comprehensive info for {}",
                 domain
             )));
@@ -527,7 +529,7 @@ async fn execute_command(
                 seer_core::output::OutputFormat::Yaml => "yaml",
                 seer_core::output::OutputFormat::Markdown => "markdown",
             };
-            let _progress_mode = resolve_progress_mode(progress, stderr_is_tty, format_str);
+            let progress_mode = resolve_progress_mode(progress, stderr_is_tty, format_str);
             const MAX_BULK_DOMAINS_CLI: usize = 1000;
 
             // `read_bulk_input` rejects FIFOs, sockets, devices, directories,
@@ -622,7 +624,64 @@ async fn execute_command(
                 }
             };
 
-            let results = executor.execute(operations, None).await;
+            let total = operations.len();
+
+            // Construct the progress bar (when applicable) and activate it for
+            // tracing integration so log lines route through pb.println().
+            let pb: Option<Arc<ProgressBar>> = match progress_mode {
+                ProgressMode::None => None,
+                ProgressMode::Bar | ProgressMode::Verbose | ProgressMode::Failures => {
+                    let bar = ProgressBar::new(total as u64);
+                    bar.set_style(
+                        ProgressStyle::default_bar()
+                            .template(
+                                "{bar:40.cyan/blue} {pos}/{len} ({percent}%) eta {eta} {msg}",
+                            )
+                            .expect("valid progress bar template")
+                            .progress_chars("=>-"),
+                    );
+                    display::set_bulk_progress_bar(bar.clone());
+                    Some(Arc::new(bar))
+                }
+            };
+
+            let callback: Option<seer_core::bulk::ProgressCallback> = pb.as_ref().map(|bar| {
+                let bar = bar.clone();
+                Box::new(move |completed: usize, _total: usize, domain: &str| {
+                    bar.set_position(completed as u64);
+                    bar.set_message(domain.to_string());
+                }) as seer_core::bulk::ProgressCallback
+            });
+
+            let results = executor.execute(operations, callback).await;
+
+            // Emit per-item lines according to mode, then clear the bar.
+            if let Some(bar) = pb.as_ref() {
+                for r in &results {
+                    let domain = match &r.operation {
+                        seer_core::bulk::BulkOperation::Whois { domain }
+                        | seer_core::bulk::BulkOperation::Rdap { domain }
+                        | seer_core::bulk::BulkOperation::Dns { domain, .. }
+                        | seer_core::bulk::BulkOperation::Propagation { domain, .. }
+                        | seer_core::bulk::BulkOperation::Lookup { domain }
+                        | seer_core::bulk::BulkOperation::Status { domain }
+                        | seer_core::bulk::BulkOperation::Avail { domain }
+                        | seer_core::bulk::BulkOperation::Info { domain } => domain.as_str(),
+                    };
+                    match (progress_mode, r.success) {
+                        (ProgressMode::Verbose, true) => {
+                            bar.println(format!("{} {} ({}ms)", "\u{2713}".ctp_green(), domain, r.duration_ms));
+                        }
+                        (ProgressMode::Verbose, false) | (ProgressMode::Failures, false) => {
+                            let err = r.error.as_deref().unwrap_or("unknown error");
+                            bar.println(format!("{} {} ({})", "\u{2717}".ctp_red(), domain, err));
+                        }
+                        _ => {}
+                    }
+                }
+                bar.finish_and_clear();
+                display::clear_bulk_progress_bar();
+            }
 
             // Convert results to CSV
             let csv_content = utils::bulk_results_to_csv(&results, &operation);
@@ -832,7 +891,7 @@ async fn execute_command(
             // Note: raw mode is enabled for key detection, so we need \r\n for proper line breaks
             let follow_format = output_format;
             let callback: seer_core::dns::FollowProgressCallback =
-                std::sync::Arc::new(move |iteration| {
+                Arc::new(move |iteration| {
                     let formatter = seer_core::output::get_formatter(follow_format);
                     let output = formatter.format_follow_iteration(iteration);
                     // In raw mode, \n alone doesn't return to column 0, so use \r\n
@@ -930,7 +989,7 @@ async fn execute_command(
             }
         }
         Commands::Subdomains { domain } => {
-            let spinner = std::sync::Arc::new(display::Spinner::new(&format!(
+            let spinner = Arc::new(display::Spinner::new(&format!(
                 "Enumerating subdomains for {}",
                 domain
             )));
@@ -951,7 +1010,7 @@ async fn execute_command(
             }
         }
         Commands::Diff { domain_a, domain_b } => {
-            let spinner = std::sync::Arc::new(display::Spinner::new(&format!(
+            let spinner = Arc::new(display::Spinner::new(&format!(
                 "Comparing {} vs {}",
                 domain_a, domain_b
             )));
@@ -1021,7 +1080,7 @@ async fn execute_command(
                             "Watchlist is empty. Use 'seer watch add <domain>' to add domains."
                         );
                     } else {
-                        let spinner = std::sync::Arc::new(display::Spinner::new(&format!(
+                        let spinner = Arc::new(display::Spinner::new(&format!(
                             "Checking {} domains",
                             watchlist.domains.len()
                         )));
