@@ -2126,109 +2126,100 @@ impl OutputFormatter for HumanFormatter {
             sanitize_display(&diff.domain_b)
         )));
 
-        // Registration
-        output.push(format!("\n  {}:", self.label("Registration")));
-        let reg = &diff.registration;
-        output.push(format!(
-            "    {}: {} | {}",
-            self.label("Registrar"),
-            self.value(&sanitize_display(
-                reg.registrar.0.as_deref().unwrap_or("N/A")
-            )),
-            self.value(&sanitize_display(
-                reg.registrar.1.as_deref().unwrap_or("N/A")
-            ))
-        ));
-        output.push(format!(
-            "    {}: {} | {}",
-            self.label("Organization"),
-            self.value(&sanitize_display(
-                reg.organization.0.as_deref().unwrap_or("N/A")
-            )),
-            self.value(&sanitize_display(
-                reg.organization.1.as_deref().unwrap_or("N/A")
-            ))
-        ));
-        output.push(format!(
-            "    {}: {} | {}",
-            self.label("Created"),
-            self.value(reg.created.0.as_deref().unwrap_or("N/A")),
-            self.value(reg.created.1.as_deref().unwrap_or("N/A"))
-        ));
-        output.push(format!(
-            "    {}: {} | {}",
-            self.label("Expires"),
-            self.value(reg.expires.0.as_deref().unwrap_or("N/A")),
-            self.value(reg.expires.1.as_deref().unwrap_or("N/A"))
-        ));
+        let domain_a = sanitize_display(&diff.domain_a);
+        let domain_b = sanitize_display(&diff.domain_b);
+        let sections = build_diff_sections(diff);
+        let col_width = compute_column_width(&sections, &domain_a, &domain_b);
 
-        // DNS
-        output.push(format!("\n  {}:", self.label("DNS")));
-        let dns = &diff.dns;
-        {
-            let (res_a, res_b) = dns.resolves;
-            output.push(format!(
-                "    {}: {} | {}",
-                self.label("Resolves"),
-                if res_a {
-                    self.success("yes")
-                } else {
-                    self.error("no")
-                },
-                if res_b {
-                    self.success("yes")
-                } else {
-                    self.error("no")
+        // Label gutter width: max of all field labels (not section titles).
+        let label_width = sections
+            .iter()
+            .flat_map(|s| s.rows.iter().map(|r| r.label.chars().count()))
+            .max()
+            .unwrap_or(0);
+
+        // Indents and gutters
+        let label_indent = "    "; // 4 spaces inside section
+        let section_indent = "  "; // 2 spaces before section title
+        let marker_gutter_width = 2; // "= " or "≠ "
+        let header_left_pad = label_indent.chars().count() + label_width + marker_gutter_width;
+
+        // Column header block
+        let header_line = format!(
+            "{}{}   {}",
+            " ".repeat(header_left_pad),
+            self.label(&pad_right(&domain_a, col_width)),
+            self.label(&domain_b)
+        );
+        let rule_a: String = "─".repeat(domain_a.chars().count());
+        let rule_b: String = "─".repeat(domain_b.chars().count());
+        let rule_line = format!(
+            "{}{}   {}",
+            " ".repeat(header_left_pad),
+            self.label(&pad_right(&rule_a, col_width)),
+            self.label(&rule_b)
+        );
+        output.push(String::new());
+        output.push(header_line);
+        output.push(rule_line);
+
+        for section in &sections {
+            output.push(String::new());
+            output.push(format!("{}{}", section_indent, self.label(section.title)));
+
+            for row in &section.rows {
+                // Wrap each value column independently.
+                let mut a_lines: Vec<String> = row
+                    .a_values
+                    .iter()
+                    .flat_map(|v| wrap_cell(&sanitize_display(v), col_width))
+                    .collect();
+                let mut b_lines: Vec<String> = row
+                    .b_values
+                    .iter()
+                    .flat_map(|v| wrap_cell(&sanitize_display(v), col_width))
+                    .collect();
+
+                // Pad the shorter list with blank lines so rows align.
+                let rows_needed = a_lines.len().max(b_lines.len()).max(1);
+                while a_lines.len() < rows_needed {
+                    a_lines.push(String::new());
                 }
-            ));
-        }
-        output.push(format!(
-            "    {}: {} | {}",
-            self.label("A Records"),
-            self.value(&sanitize_display(&dns.a_records.0.join(", "))),
-            self.value(&sanitize_display(&dns.a_records.1.join(", ")))
-        ));
-        output.push(format!(
-            "    {}: {} | {}",
-            self.label("Nameservers"),
-            self.value(&sanitize_display(&dns.nameservers.0.join(", "))),
-            self.value(&sanitize_display(&dns.nameservers.1.join(", ")))
-        ));
+                while b_lines.len() < rows_needed {
+                    b_lines.push(String::new());
+                }
 
-        // SSL
-        output.push(format!("\n  {}:", self.label("SSL")));
-        let ssl = &diff.ssl;
-        output.push(format!(
-            "    {}: {} | {}",
-            self.label("Issuer"),
-            self.value(&sanitize_display(ssl.issuer.0.as_deref().unwrap_or("N/A"))),
-            self.value(&sanitize_display(ssl.issuer.1.as_deref().unwrap_or("N/A")))
-        ));
-        output.push(format!(
-            "    {}: {} | {}",
-            self.label("Valid Until"),
-            self.value(ssl.valid_until.0.as_deref().unwrap_or("N/A")),
-            self.value(ssl.valid_until.1.as_deref().unwrap_or("N/A"))
-        ));
-        {
-            let a_str = ssl.days_remaining.0.map(|d| d.to_string());
-            let b_str = ssl.days_remaining.1.map(|d| d.to_string());
-            output.push(format!(
-                "    {}: {} | {}",
-                self.label("Days Remaining"),
-                self.value(a_str.as_deref().unwrap_or("N/A")),
-                self.value(b_str.as_deref().unwrap_or("N/A"))
-            ));
-        }
-        {
-            let a_str = ssl.is_valid.0.map(|v| if v { "yes" } else { "no" });
-            let b_str = ssl.is_valid.1.map(|v| if v { "yes" } else { "no" });
-            output.push(format!(
-                "    {}: {} | {}",
-                self.label("Valid"),
-                self.value(a_str.unwrap_or("N/A")),
-                self.value(b_str.unwrap_or("N/A"))
-            ));
+                let marker_glyph = if row.matches { "=" } else { "≠" };
+                let color = |s: &str| -> String {
+                    if row.matches {
+                        self.success(s)
+                    } else {
+                        self.error(s)
+                    }
+                };
+
+                for (i, (a, b)) in a_lines.iter().zip(b_lines.iter()).enumerate() {
+                    let label_cell = if i == 0 {
+                        format!("{}{}", label_indent, pad_right(row.label, label_width))
+                    } else {
+                        format!("{}{}", label_indent, " ".repeat(label_width))
+                    };
+                    let marker_cell = if i == 0 {
+                        format!("{} ", color(marker_glyph))
+                    } else {
+                        "  ".to_string()
+                    };
+                    let a_cell = color(&pad_right(a, col_width));
+                    let b_cell = color(b);
+                    output.push(format!(
+                        "{}  {}{}   {}",
+                        self.label(&label_cell),
+                        marker_cell,
+                        a_cell,
+                        b_cell
+                    ));
+                }
+            }
         }
 
         output.join("\n")
@@ -2629,7 +2620,6 @@ impl OutputFormatter for HumanFormatter {
 
 /// Compares two `Option<String>` values for equality after trimming whitespace.
 /// Empty-after-trim is treated as `None`.
-#[allow(dead_code)]
 fn eq_opt_str_trimmed(a: &Option<String>, b: &Option<String>) -> bool {
     let norm = |o: &Option<String>| -> Option<String> {
         o.as_ref()
@@ -2641,7 +2631,6 @@ fn eq_opt_str_trimmed(a: &Option<String>, b: &Option<String>) -> bool {
 
 /// Compares two string lists as sets: trims each item, drops empty items,
 /// then checks that the sorted multisets are equal.
-#[allow(dead_code)]
 fn eq_as_set(a: &[String], b: &[String]) -> bool {
     let mut an: Vec<String> = a
         .iter()
@@ -2662,7 +2651,6 @@ fn eq_as_set(a: &[String], b: &[String]) -> bool {
 /// Breaks at the last ASCII whitespace within the window when possible;
 /// otherwise hard-breaks at the cap. Widths are measured in `chars().count()`
 /// which is correct for ASCII and a reasonable fallback for other inputs.
-#[allow(dead_code)]
 fn wrap_cell(text: &str, max_width: usize) -> Vec<String> {
     let width = max_width.max(1);
     if text.is_empty() {
@@ -2704,7 +2692,6 @@ fn wrap_cell(text: &str, max_width: usize) -> Vec<String> {
 /// One labeled row in the rendered diff table. `a_values` / `b_values` each
 /// hold one item per rendered line — scalars are single-element; multi-value
 /// fields (A records, nameservers) hold one entry per item.
-#[allow(dead_code)]
 struct DiffRow {
     label: &'static str,
     a_values: Vec<String>,
@@ -2712,7 +2699,6 @@ struct DiffRow {
     matches: bool,
 }
 
-#[allow(dead_code)]
 struct DiffSection {
     title: &'static str,
     rows: Vec<DiffRow>,
@@ -2721,7 +2707,6 @@ struct DiffSection {
 /// The placeholder rendered for `None` or empty values.
 const EMPTY_PLACEHOLDER: &str = "—";
 
-#[allow(dead_code)]
 fn opt_or_placeholder(o: &Option<String>) -> String {
     o.as_ref()
         .map(|s| s.trim().to_string())
@@ -2729,13 +2714,11 @@ fn opt_or_placeholder(o: &Option<String>) -> String {
         .unwrap_or_else(|| EMPTY_PLACEHOLDER.to_string())
 }
 
-#[allow(dead_code)]
 fn opt_i64_or_placeholder(o: &Option<i64>) -> String {
     o.map(|n| n.to_string())
         .unwrap_or_else(|| EMPTY_PLACEHOLDER.to_string())
 }
 
-#[allow(dead_code)]
 fn opt_bool_or_placeholder(o: &Option<bool>) -> String {
     match o {
         Some(true) => "yes".to_string(),
@@ -2744,7 +2727,6 @@ fn opt_bool_or_placeholder(o: &Option<bool>) -> String {
     }
 }
 
-#[allow(dead_code)]
 fn bool_as_str(b: bool) -> String {
     if b {
         "yes".to_string()
@@ -2753,7 +2735,6 @@ fn bool_as_str(b: bool) -> String {
     }
 }
 
-#[allow(dead_code)]
 fn list_or_placeholder(list: &[String]) -> Vec<String> {
     let cleaned: Vec<String> = list
         .iter()
@@ -2767,7 +2748,6 @@ fn list_or_placeholder(list: &[String]) -> Vec<String> {
     }
 }
 
-#[allow(dead_code)]
 fn build_diff_sections(diff: &crate::diff::DomainDiff) -> Vec<DiffSection> {
     let reg = &diff.registration;
     let dns = &diff.dns;
@@ -2866,7 +2846,6 @@ const DIFF_COLUMN_CAP: usize = 40;
 /// Computes the shared width for both value columns: the widest item across
 /// every row of every section plus the two domain-header lengths, capped at
 /// `DIFF_COLUMN_CAP`.
-#[allow(dead_code)]
 fn compute_column_width(sections: &[DiffSection], domain_a: &str, domain_b: &str) -> usize {
     let mut widest = domain_a.chars().count().max(domain_b.chars().count());
     for section in sections {
@@ -2877,6 +2856,16 @@ fn compute_column_width(sections: &[DiffSection], domain_a: &str, domain_b: &str
         }
     }
     widest.clamp(1, DIFF_COLUMN_CAP)
+}
+
+/// Right-pads `text` with spaces to `width` display chars. Never truncates.
+fn pad_right(text: &str, width: usize) -> String {
+    let have = text.chars().count();
+    if have >= width {
+        text.to_string()
+    } else {
+        format!("{}{}", text, " ".repeat(width - have))
+    }
 }
 
 #[cfg(test)]
@@ -3226,5 +3215,172 @@ mod tests {
         }];
         let w = compute_column_width(&sections, "a", "b");
         assert!(w >= 1);
+    }
+
+    fn diff_formatter() -> HumanFormatter {
+        HumanFormatter::new().without_colors()
+    }
+
+    #[test]
+    fn format_diff_shows_column_headers_with_domain_names() {
+        let f = diff_formatter();
+        let out = f.format_diff(&make_sample_diff());
+        assert!(
+            out.contains("example.com"),
+            "missing domain_a in output:\n{}",
+            out
+        );
+        assert!(
+            out.contains("google.com"),
+            "missing domain_b in output:\n{}",
+            out
+        );
+        // A row indicating the header underline (Unicode box-drawing dash).
+        assert!(out.contains("──"), "missing header underline:\n{}", out);
+    }
+
+    #[test]
+    fn format_diff_marks_differing_rows_with_neq() {
+        let f = diff_formatter();
+        let out = f.format_diff(&make_sample_diff());
+        // Registrar differs: IANA vs MarkMonitor.
+        let registrar_line = out
+            .lines()
+            .find(|l| l.contains("Registrar"))
+            .expect("registrar line missing");
+        assert!(
+            registrar_line.contains("≠"),
+            "registrar row should be marked differ: {}",
+            registrar_line
+        );
+    }
+
+    #[test]
+    fn format_diff_marks_matching_rows_with_eq() {
+        let f = diff_formatter();
+        let out = f.format_diff(&make_sample_diff());
+        // Resolves matches (both true).
+        let resolves_line = out
+            .lines()
+            .find(|l| l.contains("Resolves"))
+            .expect("resolves line missing");
+        assert!(
+            resolves_line.contains('='),
+            "resolves row should be marked match: {}",
+            resolves_line
+        );
+        assert!(!resolves_line.contains('≠'));
+    }
+
+    #[test]
+    fn format_diff_nameservers_reversed_order_is_match() {
+        // make_sample_diff has reversed nameservers.
+        let f = diff_formatter();
+        let out = f.format_diff(&make_sample_diff());
+        let ns_line = out
+            .lines()
+            .find(|l| l.contains("Nameservers"))
+            .expect("nameservers line missing");
+        assert!(
+            ns_line.contains('=') && !ns_line.contains('≠'),
+            "nameservers row should match (set equality): {}",
+            ns_line
+        );
+    }
+
+    #[test]
+    fn format_diff_organization_none_renders_em_dash() {
+        let f = diff_formatter();
+        let out = f.format_diff(&make_sample_diff());
+        let org_line = out
+            .lines()
+            .find(|l| l.contains("Organization"))
+            .expect("organization line missing");
+        assert!(org_line.contains("—"), "expected em dash: {}", org_line);
+    }
+
+    #[test]
+    fn format_diff_multi_value_a_records_one_per_line() {
+        let mut diff = make_sample_diff();
+        diff.dns.a_records = (
+            vec!["1.1.1.1".to_string(), "2.2.2.2".to_string()],
+            vec!["3.3.3.3".to_string(), "4.4.4.4".to_string()],
+        );
+        let f = diff_formatter();
+        let out = f.format_diff(&diff);
+        assert!(out.contains("1.1.1.1"), "missing 1.1.1.1:\n{}", out);
+        assert!(out.contains("2.2.2.2"), "missing 2.2.2.2:\n{}", out);
+        assert!(out.contains("3.3.3.3"), "missing 3.3.3.3:\n{}", out);
+        assert!(out.contains("4.4.4.4"), "missing 4.4.4.4:\n{}", out);
+        // The label only appears on the first row of the field.
+        let a_records_label_count = out.matches("A Records").count();
+        assert_eq!(
+            a_records_label_count, 1,
+            "A Records label should appear exactly once:\n{}",
+            out
+        );
+    }
+
+    #[test]
+    fn format_diff_wraps_long_scalar_values() {
+        let mut diff = make_sample_diff();
+        let long = "a".repeat(60);
+        diff.ssl.issuer = (Some(long.clone()), Some("short".to_string()));
+        let f = diff_formatter();
+        let out = f.format_diff(&diff);
+        // The 60-char value should not appear on any single line in full.
+        for line in out.lines() {
+            assert!(
+                !line.contains(&long),
+                "unwrapped 60-char value on one line: {}",
+                line
+            );
+        }
+        // But the characters as a whole should still be present.
+        let chars_present = out.matches('a').count();
+        assert!(
+            chars_present >= 60,
+            "wrapped value should preserve all chars, got {}",
+            chars_present
+        );
+    }
+
+    #[test]
+    fn format_diff_plain_mode_contains_marker_glyphs() {
+        let out = diff_formatter().format_diff(&make_sample_diff());
+        assert!(out.contains('='), "plain mode missing =");
+        assert!(out.contains('≠'), "plain mode missing ≠");
+        assert!(out.contains('─'), "plain mode missing header rule ─");
+    }
+
+    #[test]
+    fn format_diff_all_matching_has_no_neq() {
+        let diff = DomainDiff {
+            domain_a: "a.com".to_string(),
+            domain_b: "a.com".to_string(),
+            registration: RegistrationDiff {
+                registrar: (Some("X".to_string()), Some("X".to_string())),
+                organization: (Some("Org".to_string()), Some("Org".to_string())),
+                created: (Some("2020".to_string()), Some("2020".to_string())),
+                expires: (Some("2030".to_string()), Some("2030".to_string())),
+            },
+            dns: DnsDiff {
+                a_records: (vec!["1.1.1.1".to_string()], vec!["1.1.1.1".to_string()]),
+                nameservers: (vec!["ns".to_string()], vec!["ns".to_string()]),
+                resolves: (true, true),
+            },
+            ssl: SslDiff {
+                issuer: (Some("I".to_string()), Some("I".to_string())),
+                valid_until: (Some("2030".to_string()), Some("2030".to_string())),
+                days_remaining: (Some(10), Some(10)),
+                is_valid: (Some(true), Some(true)),
+            },
+        };
+        let out = diff_formatter().format_diff(&diff);
+        assert!(
+            !out.contains('≠'),
+            "all-match diff should have no ≠:\n{}",
+            out
+        );
     }
 }
