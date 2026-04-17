@@ -19,6 +19,31 @@ enum ProgressMode {
     /// No bar, no per-item output (default when piped or when --format json)
     None,
 }
+
+/// Resolves the effective progress mode given the user's flag, whether stderr
+/// is a TTY, and the output format.
+///
+/// Rules:
+/// - An explicit `--progress <mode>` always wins.
+/// - Otherwise `--format json` implies `None` (JSON output must be clean).
+/// - Otherwise on a non-TTY stderr, default to `None`.
+/// - Otherwise default to `Bar`.
+fn resolve_progress_mode(
+    flag: Option<ProgressMode>,
+    stderr_is_tty: bool,
+    format: &str,
+) -> ProgressMode {
+    if let Some(mode) = flag {
+        return mode;
+    }
+    if format.eq_ignore_ascii_case("json") {
+        return ProgressMode::None;
+    }
+    if !stderr_is_tty {
+        return ProgressMode::None;
+    }
+    ProgressMode::Bar
+}
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::terminal;
 use seer_core::colors::CatppuccinExt;
@@ -495,7 +520,14 @@ async fn execute_command(
             output,
             progress,
         } => {
-            let _progress_mode = progress;
+            let stderr_is_tty = std::io::IsTerminal::is_terminal(&std::io::stderr());
+            let format_str = match output_format {
+                seer_core::output::OutputFormat::Json => "json",
+                seer_core::output::OutputFormat::Human => "human",
+                seer_core::output::OutputFormat::Yaml => "yaml",
+                seer_core::output::OutputFormat::Markdown => "markdown",
+            };
+            let _progress_mode = resolve_progress_mode(progress, stderr_is_tty, format_str);
             const MAX_BULK_DOMAINS_CLI: usize = 1000;
 
             // `read_bulk_input` rejects FIFOs, sockets, devices, directories,
@@ -1069,4 +1101,61 @@ async fn execute_command(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod progress_mode_tests {
+    use super::{resolve_progress_mode, ProgressMode};
+
+    #[test]
+    fn explicit_mode_is_honored_on_tty() {
+        assert_eq!(
+            resolve_progress_mode(Some(ProgressMode::Verbose), true, "human"),
+            ProgressMode::Verbose
+        );
+        assert_eq!(
+            resolve_progress_mode(Some(ProgressMode::None), true, "human"),
+            ProgressMode::None
+        );
+    }
+
+    #[test]
+    fn explicit_mode_is_honored_on_non_tty() {
+        assert_eq!(
+            resolve_progress_mode(Some(ProgressMode::Bar), false, "human"),
+            ProgressMode::Bar
+        );
+    }
+
+    #[test]
+    fn explicit_mode_overrides_json_format() {
+        assert_eq!(
+            resolve_progress_mode(Some(ProgressMode::Bar), true, "json"),
+            ProgressMode::Bar
+        );
+    }
+
+    #[test]
+    fn default_is_bar_on_tty_with_human_format() {
+        assert_eq!(
+            resolve_progress_mode(None, true, "human"),
+            ProgressMode::Bar
+        );
+    }
+
+    #[test]
+    fn default_is_none_on_non_tty() {
+        assert_eq!(
+            resolve_progress_mode(None, false, "human"),
+            ProgressMode::None
+        );
+    }
+
+    #[test]
+    fn default_is_none_with_json_format() {
+        assert_eq!(
+            resolve_progress_mode(None, true, "json"),
+            ProgressMode::None
+        );
+    }
 }
