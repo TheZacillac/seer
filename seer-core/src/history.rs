@@ -108,6 +108,7 @@ mod tests {
             }),
             rdap_error: "test".to_string(),
             whois_error: "test".to_string(),
+            whois_data: None,
         }
     }
 

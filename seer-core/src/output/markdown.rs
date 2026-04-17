@@ -732,6 +732,7 @@ impl OutputFormatter for MarkdownFormatter {
                 data,
                 rdap_error,
                 whois_error,
+                ..
             } => {
                 let avail_str = if data.available {
                     "**AVAILABLE**"

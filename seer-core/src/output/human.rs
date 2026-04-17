@@ -1387,6 +1387,7 @@ impl OutputFormatter for HumanFormatter {
                 data,
                 rdap_error,
                 whois_error,
+                ..
             } => {
                 output.push(format!(
                     "  {}: {}",

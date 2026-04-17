@@ -158,6 +158,11 @@ pub enum LookupResult {
         data: Box<AvailabilityResult>,
         rdap_error: String,
         whois_error: String,
+        /// Raw WHOIS response, when one was available at routing time
+        /// (Cases A and B in the design spec). `None` preserves the
+        /// pre-existing "both protocols errored" semantics.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        whois_data: Option<WhoisResponse>,
     },
 }
 
@@ -268,7 +273,17 @@ fn trim_for_cache(mut result: LookupResult) -> LookupResult {
                 }
             }
         }
-        LookupResult::Available { .. } => {}
+        LookupResult::Available {
+            ref mut whois_data,
+            ..
+        } => {
+            if let Some(ref mut w) = whois_data {
+                if w.raw_response.len() > MAX_RAW {
+                    w.raw_response.truncate(MAX_RAW);
+                    w.raw_response.push_str("\n... [truncated for cache]");
+                }
+            }
+        }
     }
 
     result
@@ -569,6 +584,7 @@ impl SmartLookup {
                 data: Box::new(avail),
                 rdap_error: sanitize_error_for_public(&rdap_error),
                 whois_error: sanitize_error_for_public(&whois_error),
+                whois_data: None,
             }),
             Err(avail_err) => {
                 let tld = get_tld(domain).unwrap_or("unknown");
@@ -697,6 +713,7 @@ mod tests {
             }),
             rdap_error: "RDAP failed".to_string(),
             whois_error: "WHOIS failed".to_string(),
+            whois_data: None,
         };
 
         let json = serde_json::to_string(&result).unwrap();
@@ -910,6 +927,7 @@ mod tests {
             }),
             rdap_error: sanitized_rdap,
             whois_error: sanitized_whois,
+            whois_data: None,
         };
         if let LookupResult::Available {
             rdap_error,
