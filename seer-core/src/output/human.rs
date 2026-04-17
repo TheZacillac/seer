@@ -2701,6 +2701,164 @@ fn wrap_cell(text: &str, max_width: usize) -> Vec<String> {
     out
 }
 
+/// One labeled row in the rendered diff table. `a_values` / `b_values` each
+/// hold one item per rendered line — scalars are single-element; multi-value
+/// fields (A records, nameservers) hold one entry per item.
+#[allow(dead_code)]
+struct DiffRow {
+    label: &'static str,
+    a_values: Vec<String>,
+    b_values: Vec<String>,
+    matches: bool,
+}
+
+#[allow(dead_code)]
+struct DiffSection {
+    title: &'static str,
+    rows: Vec<DiffRow>,
+}
+
+/// The placeholder rendered for `None` or empty values.
+const EMPTY_PLACEHOLDER: &str = "—";
+
+#[allow(dead_code)]
+fn opt_or_placeholder(o: &Option<String>) -> String {
+    o.as_ref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| EMPTY_PLACEHOLDER.to_string())
+}
+
+#[allow(dead_code)]
+fn opt_i64_or_placeholder(o: &Option<i64>) -> String {
+    o.map(|n| n.to_string())
+        .unwrap_or_else(|| EMPTY_PLACEHOLDER.to_string())
+}
+
+#[allow(dead_code)]
+fn opt_bool_or_placeholder(o: &Option<bool>) -> String {
+    match o {
+        Some(true) => "yes".to_string(),
+        Some(false) => "no".to_string(),
+        None => EMPTY_PLACEHOLDER.to_string(),
+    }
+}
+
+#[allow(dead_code)]
+fn list_or_placeholder(list: &[String]) -> Vec<String> {
+    let cleaned: Vec<String> = list
+        .iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if cleaned.is_empty() {
+        vec![EMPTY_PLACEHOLDER.to_string()]
+    } else {
+        cleaned
+    }
+}
+
+#[allow(dead_code)]
+fn build_diff_sections(diff: &crate::diff::DomainDiff) -> Vec<DiffSection> {
+    let reg = &diff.registration;
+    let dns = &diff.dns;
+    let ssl = &diff.ssl;
+
+    let registration = DiffSection {
+        title: "Registration",
+        rows: vec![
+            DiffRow {
+                label: "Registrar",
+                a_values: vec![opt_or_placeholder(&reg.registrar.0)],
+                b_values: vec![opt_or_placeholder(&reg.registrar.1)],
+                matches: eq_opt_str_trimmed(&reg.registrar.0, &reg.registrar.1),
+            },
+            DiffRow {
+                label: "Organization",
+                a_values: vec![opt_or_placeholder(&reg.organization.0)],
+                b_values: vec![opt_or_placeholder(&reg.organization.1)],
+                matches: eq_opt_str_trimmed(&reg.organization.0, &reg.organization.1),
+            },
+            DiffRow {
+                label: "Created",
+                a_values: vec![opt_or_placeholder(&reg.created.0)],
+                b_values: vec![opt_or_placeholder(&reg.created.1)],
+                matches: eq_opt_str_trimmed(&reg.created.0, &reg.created.1),
+            },
+            DiffRow {
+                label: "Expires",
+                a_values: vec![opt_or_placeholder(&reg.expires.0)],
+                b_values: vec![opt_or_placeholder(&reg.expires.1)],
+                matches: eq_opt_str_trimmed(&reg.expires.0, &reg.expires.1),
+            },
+        ],
+    };
+
+    let dns_section = DiffSection {
+        title: "DNS",
+        rows: vec![
+            DiffRow {
+                label: "Resolves",
+                a_values: vec![if dns.resolves.0 {
+                    "yes".into()
+                } else {
+                    "no".into()
+                }],
+                b_values: vec![if dns.resolves.1 {
+                    "yes".into()
+                } else {
+                    "no".into()
+                }],
+                matches: dns.resolves.0 == dns.resolves.1,
+            },
+            DiffRow {
+                label: "A Records",
+                a_values: list_or_placeholder(&dns.a_records.0),
+                b_values: list_or_placeholder(&dns.a_records.1),
+                matches: eq_as_set(&dns.a_records.0, &dns.a_records.1),
+            },
+            DiffRow {
+                label: "Nameservers",
+                a_values: list_or_placeholder(&dns.nameservers.0),
+                b_values: list_or_placeholder(&dns.nameservers.1),
+                matches: eq_as_set(&dns.nameservers.0, &dns.nameservers.1),
+            },
+        ],
+    };
+
+    let ssl_section = DiffSection {
+        title: "SSL",
+        rows: vec![
+            DiffRow {
+                label: "Issuer",
+                a_values: vec![opt_or_placeholder(&ssl.issuer.0)],
+                b_values: vec![opt_or_placeholder(&ssl.issuer.1)],
+                matches: eq_opt_str_trimmed(&ssl.issuer.0, &ssl.issuer.1),
+            },
+            DiffRow {
+                label: "Valid Until",
+                a_values: vec![opt_or_placeholder(&ssl.valid_until.0)],
+                b_values: vec![opt_or_placeholder(&ssl.valid_until.1)],
+                matches: eq_opt_str_trimmed(&ssl.valid_until.0, &ssl.valid_until.1),
+            },
+            DiffRow {
+                label: "Days Remaining",
+                a_values: vec![opt_i64_or_placeholder(&ssl.days_remaining.0)],
+                b_values: vec![opt_i64_or_placeholder(&ssl.days_remaining.1)],
+                matches: ssl.days_remaining.0 == ssl.days_remaining.1,
+            },
+            DiffRow {
+                label: "Valid",
+                a_values: vec![opt_bool_or_placeholder(&ssl.is_valid.0)],
+                b_values: vec![opt_bool_or_placeholder(&ssl.is_valid.1)],
+                matches: ssl.is_valid.0 == ssl.is_valid.1,
+            },
+        ],
+    };
+
+    vec![registration, dns_section, ssl_section]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2855,5 +3013,129 @@ mod tests {
         // we clamp to 1 to be safe.
         let out = wrap_cell("abc", 0);
         assert_eq!(out, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+    }
+
+    use crate::diff::{DnsDiff, DomainDiff, RegistrationDiff, SslDiff};
+
+    fn make_sample_diff() -> DomainDiff {
+        DomainDiff {
+            domain_a: "example.com".to_string(),
+            domain_b: "google.com".to_string(),
+            registration: RegistrationDiff {
+                registrar: (Some("IANA".to_string()), Some("MarkMonitor".to_string())),
+                organization: (None, Some("Google LLC".to_string())),
+                created: (
+                    Some("1995-08-14".to_string()),
+                    Some("1997-09-15".to_string()),
+                ),
+                expires: (
+                    Some("2026-08-13".to_string()),
+                    Some("2028-09-14".to_string()),
+                ),
+            },
+            dns: DnsDiff {
+                a_records: (
+                    vec!["93.184.216.34".to_string()],
+                    vec!["142.250.185.46".to_string()],
+                ),
+                nameservers: (
+                    vec!["ns1.example".to_string(), "ns2.example".to_string()],
+                    vec!["ns2.example".to_string(), "ns1.example".to_string()],
+                ),
+                resolves: (true, true),
+            },
+            ssl: SslDiff {
+                issuer: (
+                    Some("DigiCert".to_string()),
+                    Some("Google Trust".to_string()),
+                ),
+                valid_until: (
+                    Some("2025-03-01".to_string()),
+                    Some("2025-02-15".to_string()),
+                ),
+                days_remaining: (Some(89), Some(75)),
+                is_valid: (Some(true), Some(true)),
+            },
+        }
+    }
+
+    #[test]
+    fn build_diff_sections_produces_three_sections() {
+        let diff = make_sample_diff();
+        let sections = build_diff_sections(&diff);
+        assert_eq!(sections.len(), 3);
+        assert_eq!(sections[0].title, "Registration");
+        assert_eq!(sections[1].title, "DNS");
+        assert_eq!(sections[2].title, "SSL");
+    }
+
+    #[test]
+    fn build_diff_sections_marks_nameservers_as_match_when_sets_equal() {
+        let diff = make_sample_diff();
+        let sections = build_diff_sections(&diff);
+        let dns = &sections[1];
+        let ns_row = dns.rows.iter().find(|r| r.label == "Nameservers").unwrap();
+        assert!(ns_row.matches, "reversed-order nameservers should match");
+    }
+
+    #[test]
+    fn build_diff_sections_marks_registrar_differ() {
+        let diff = make_sample_diff();
+        let sections = build_diff_sections(&diff);
+        let reg = &sections[0];
+        let row = reg.rows.iter().find(|r| r.label == "Registrar").unwrap();
+        assert!(!row.matches);
+    }
+
+    #[test]
+    fn build_diff_sections_marks_resolves_match_when_both_true() {
+        let diff = make_sample_diff();
+        let sections = build_diff_sections(&diff);
+        let dns = &sections[1];
+        let row = dns.rows.iter().find(|r| r.label == "Resolves").unwrap();
+        assert!(row.matches);
+        assert_eq!(row.a_values, vec!["yes".to_string()]);
+        assert_eq!(row.b_values, vec!["yes".to_string()]);
+    }
+
+    #[test]
+    fn build_diff_sections_renders_none_as_em_dash() {
+        let diff = make_sample_diff();
+        let sections = build_diff_sections(&diff);
+        let reg = &sections[0];
+        let row = reg.rows.iter().find(|r| r.label == "Organization").unwrap();
+        assert_eq!(row.a_values, vec!["—".to_string()]);
+    }
+
+    #[test]
+    fn build_diff_sections_a_records_one_item_per_row() {
+        let mut diff = make_sample_diff();
+        diff.dns.a_records = (
+            vec!["1.1.1.1".to_string(), "2.2.2.2".to_string()],
+            vec!["3.3.3.3".to_string()],
+        );
+        let sections = build_diff_sections(&diff);
+        let dns = &sections[1];
+        let row = dns.rows.iter().find(|r| r.label == "A Records").unwrap();
+        assert_eq!(row.a_values.len(), 2);
+        assert_eq!(row.b_values.len(), 1);
+    }
+
+    #[test]
+    fn build_diff_sections_preserves_field_order() {
+        let diff = make_sample_diff();
+        let sections = build_diff_sections(&diff);
+        let labels: Vec<&str> = sections[0].rows.iter().map(|r| r.label).collect();
+        assert_eq!(
+            labels,
+            vec!["Registrar", "Organization", "Created", "Expires"]
+        );
+        let dns_labels: Vec<&str> = sections[1].rows.iter().map(|r| r.label).collect();
+        assert_eq!(dns_labels, vec!["Resolves", "A Records", "Nameservers"]);
+        let ssl_labels: Vec<&str> = sections[2].rows.iter().map(|r| r.label).collect();
+        assert_eq!(
+            ssl_labels,
+            vec!["Issuer", "Valid Until", "Days Remaining", "Valid"]
+        );
     }
 }
