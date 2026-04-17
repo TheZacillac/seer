@@ -90,35 +90,31 @@ impl Completer for SeerCompleter {
         };
 
         match command.as_str() {
-            "dig" | "dns" | "propagation" | "prop" | "follow" | "compare" => {
+            "dig" | "dns" | "propagation" | "prop" | "follow" | "compare" if words.len() >= 2 => {
                 // Complete record types
-                if words.len() >= 2 {
-                    let matches: Vec<Pair> = RECORD_TYPES
-                        .iter()
-                        .filter(|rt| rt.to_lowercase().starts_with(&current_word.to_lowercase()))
-                        .map(|rt| Pair {
-                            display: rt.to_string(),
-                            replacement: rt.to_string(),
-                        })
-                        .collect();
-                    let start = line_to_cursor.len() - current_word.len();
-                    return Ok((start, matches));
-                }
+                let matches: Vec<Pair> = RECORD_TYPES
+                    .iter()
+                    .filter(|rt| rt.to_lowercase().starts_with(&current_word.to_lowercase()))
+                    .map(|rt| Pair {
+                        display: rt.to_string(),
+                        replacement: rt.to_string(),
+                    })
+                    .collect();
+                let start = line_to_cursor.len() - current_word.len();
+                return Ok((start, matches));
             }
-            "bulk" => {
-                if words.len() == 1 || (words.len() == 2 && !line_to_cursor.ends_with(' ')) {
-                    // Complete bulk operation type
-                    let matches: Vec<Pair> = BULK_OPERATIONS
-                        .iter()
-                        .filter(|op| op.starts_with(current_word))
-                        .map(|op| Pair {
-                            display: op.to_string(),
-                            replacement: op.to_string(),
-                        })
-                        .collect();
-                    let start = line_to_cursor.len() - current_word.len();
-                    return Ok((start, matches));
-                }
+            "bulk" if words.len() == 1 || (words.len() == 2 && !line_to_cursor.ends_with(' ')) => {
+                // Complete bulk operation type
+                let matches: Vec<Pair> = BULK_OPERATIONS
+                    .iter()
+                    .filter(|op| op.starts_with(current_word))
+                    .map(|op| Pair {
+                        display: op.to_string(),
+                        replacement: op.to_string(),
+                    })
+                    .collect();
+                let start = line_to_cursor.len() - current_word.len();
+                return Ok((start, matches));
             }
             "set" => {
                 if words.len() == 1 || (words.len() == 2 && !line_to_cursor.ends_with(' ')) {
@@ -147,19 +143,17 @@ impl Completer for SeerCompleter {
                     return Ok((start, matches));
                 }
             }
-            "watch" => {
-                if words.len() == 1 || (words.len() == 2 && !line_to_cursor.ends_with(' ')) {
-                    let matches: Vec<Pair> = WATCH_ACTIONS
-                        .iter()
-                        .filter(|a| a.starts_with(current_word))
-                        .map(|a| Pair {
-                            display: a.to_string(),
-                            replacement: a.to_string(),
-                        })
-                        .collect();
-                    let start = line_to_cursor.len() - current_word.len();
-                    return Ok((start, matches));
-                }
+            "watch" if words.len() == 1 || (words.len() == 2 && !line_to_cursor.ends_with(' ')) => {
+                let matches: Vec<Pair> = WATCH_ACTIONS
+                    .iter()
+                    .filter(|a| a.starts_with(current_word))
+                    .map(|a| Pair {
+                        display: a.to_string(),
+                        replacement: a.to_string(),
+                    })
+                    .collect();
+                let start = line_to_cursor.len() - current_word.len();
+                return Ok((start, matches));
             }
             _ => {}
         }
