@@ -165,7 +165,7 @@ wheels = [
 
 [[package]]
 name = "seer"
-version = "0.16.0"
+version = "0.20.1"
 source = { editable = "." }
 
 [package.optional-dependencies]
