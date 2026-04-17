@@ -81,15 +81,15 @@ All 7: `bulk_lookup`, `bulk_whois`, `bulk_dig`, `bulk_propagation`, `bulk_status
 
 Add alongside the current synchronous routes:
 
+Only the 5 bulk endpoints that exist today get streaming variants. No new sync bulk endpoints are added in this plan — `rdap`, `availability`, and `info` can get bulk + streaming in a follow-up.
+
 | New endpoint | Mirrors |
 |---|---|
-| `POST /bulk/whois/stream` | `/bulk/whois` |
-| `POST /bulk/rdap/stream` | `/bulk/rdap` |
-| `POST /bulk/dns/stream` | `/bulk/dns` |
-| `POST /bulk/propagation/stream` | `/bulk/propagation` |
-| `POST /bulk/lookup/stream` | `/bulk/lookup` |
-| `POST /bulk/status/stream` | `/bulk/status` |
-| `POST /bulk/availability/stream` | `/bulk/availability` |
+| `POST /lookup/bulk/stream` | `POST /lookup/bulk` |
+| `POST /whois/bulk/stream` | `POST /whois/bulk` |
+| `POST /dns/bulk/stream` | `POST /dns/bulk` |
+| `POST /propagation/bulk/stream` | `POST /propagation/bulk` |
+| `POST /status/bulk/stream` | `POST /status/bulk` |
 
 Request body: identical to the corresponding sync endpoint.
 Response: `Content-Type: text/event-stream`.
