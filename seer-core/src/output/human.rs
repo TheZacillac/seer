@@ -2745,6 +2745,15 @@ fn opt_bool_or_placeholder(o: &Option<bool>) -> String {
 }
 
 #[allow(dead_code)]
+fn bool_as_str(b: bool) -> String {
+    if b {
+        "yes".to_string()
+    } else {
+        "no".to_string()
+    }
+}
+
+#[allow(dead_code)]
 fn list_or_placeholder(list: &[String]) -> Vec<String> {
     let cleaned: Vec<String> = list
         .iter()
@@ -2799,16 +2808,8 @@ fn build_diff_sections(diff: &crate::diff::DomainDiff) -> Vec<DiffSection> {
         rows: vec![
             DiffRow {
                 label: "Resolves",
-                a_values: vec![if dns.resolves.0 {
-                    "yes".into()
-                } else {
-                    "no".into()
-                }],
-                b_values: vec![if dns.resolves.1 {
-                    "yes".into()
-                } else {
-                    "no".into()
-                }],
+                a_values: vec![bool_as_str(dns.resolves.0)],
+                b_values: vec![bool_as_str(dns.resolves.1)],
                 matches: dns.resolves.0 == dns.resolves.1,
             },
             DiffRow {
@@ -2862,6 +2863,7 @@ fn build_diff_sections(diff: &crate::diff::DomainDiff) -> Vec<DiffSection> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::diff::{DnsDiff, DomainDiff, RegistrationDiff, SslDiff};
 
     fn formatter() -> HumanFormatter {
         HumanFormatter::new().without_colors()
@@ -3014,8 +3016,6 @@ mod tests {
         let out = wrap_cell("abc", 0);
         assert_eq!(out, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
     }
-
-    use crate::diff::{DnsDiff, DomainDiff, RegistrationDiff, SslDiff};
 
     fn make_sample_diff() -> DomainDiff {
         DomainDiff {
