@@ -319,8 +319,7 @@ fn trim_for_cache(mut result: LookupResult) -> LookupResult {
             }
         }
         LookupResult::Available {
-            ref mut whois_data,
-            ..
+            ref mut whois_data, ..
         } => {
             if let Some(ref mut w) = whois_data {
                 if w.raw_response.len() > MAX_RAW {

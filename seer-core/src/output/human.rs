@@ -1409,11 +1409,7 @@ impl OutputFormatter for HumanFormatter {
                     "medium" => self.warning("MAY BE AVAILABLE"),
                     _ => self.error("UNKNOWN"),
                 };
-                output.push(format!(
-                    "  {}: {}",
-                    self.label("Verdict"),
-                    verdict_colored
-                ));
+                output.push(format!("  {}: {}", self.label("Verdict"), verdict_colored));
 
                 let confidence_colored = match data.confidence.as_str() {
                     "high" => self.success(&data.confidence),
