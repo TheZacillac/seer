@@ -7,7 +7,7 @@
 //! # Usage
 //!
 //! ```rust,no_run
-//! let _guard = seer_core::logging::init_logging("seer");
+//! let _guard = seer_core::logging::init_logging("seer", "error");
 //! ```
 //!
 //! The returned guard **must** be kept alive for the lifetime of the process
@@ -37,14 +37,18 @@ pub struct LogGuard {
 ///
 /// Uses `stderr` as the console output destination. For a custom writer (e.g.
 /// progress-bar aware), use [`init_logging_with_writer`].
-pub fn init_logging(app_name: &str) -> LogGuard {
-    init_logging_with_writer(app_name, std::io::stderr)
+///
+/// `default_level` is used when neither `ARCANUM_LOG_LEVEL` nor `RUST_LOG`
+/// is set. Typical values: `"error"` for CLIs, `"info"` for servers.
+pub fn init_logging(app_name: &str, default_level: &str) -> LogGuard {
+    init_logging_with_writer(app_name, default_level, std::io::stderr)
 }
 
 /// Initialise the global tracing subscriber with a custom console writer.
 ///
 /// This is used by `seer-cli` to route log output through the progress bar.
-pub fn init_logging_with_writer<W>(app_name: &str, writer: W) -> LogGuard
+/// See [`init_logging`] for the meaning of `default_level`.
+pub fn init_logging_with_writer<W>(app_name: &str, default_level: &str, writer: W) -> LogGuard
 where
     W: for<'a> MakeWriter<'a> + Send + Sync + 'static,
 {
@@ -53,7 +57,7 @@ where
         return LogGuard { _file_guard: None };
     }
 
-    let env_filter = build_env_filter();
+    let env_filter = build_env_filter(default_level);
     let log_format = read_env("ARCANUM_LOG_FORMAT", "text");
     let file_enabled = matches!(
         read_env("ARCANUM_LOG_FILE", "").to_lowercase().as_str(),
@@ -128,9 +132,9 @@ pub fn log_dir() -> PathBuf {
 
 // ---- internal helpers ----
 
-fn build_env_filter() -> EnvFilter {
-    let level = read_env_chain(&["ARCANUM_LOG_LEVEL", "RUST_LOG"], "warn");
-    EnvFilter::try_new(&level).unwrap_or_else(|_| EnvFilter::new("warn"))
+fn build_env_filter(default_level: &str) -> EnvFilter {
+    let level = read_env_chain(&["ARCANUM_LOG_LEVEL", "RUST_LOG"], default_level);
+    EnvFilter::try_new(&level).unwrap_or_else(|_| EnvFilter::new(default_level))
 }
 
 fn read_env(key: &str, default: &str) -> String {
@@ -187,4 +191,72 @@ where
     std::mem::forget(tracer_provider);
 
     Some(tracing_opentelemetry::layer().with_tracer(tracer))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_env_filter;
+
+    // Serialize env-var tests so parallel runs don't collide on the shared
+    // process env.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_clean_env<F: FnOnce() -> R, R>(f: F) -> R {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let prev_arcanum = std::env::var("ARCANUM_LOG_LEVEL").ok();
+        let prev_rust = std::env::var("RUST_LOG").ok();
+        std::env::remove_var("ARCANUM_LOG_LEVEL");
+        std::env::remove_var("RUST_LOG");
+        let result = f();
+        match prev_arcanum {
+            Some(v) => std::env::set_var("ARCANUM_LOG_LEVEL", v),
+            None => std::env::remove_var("ARCANUM_LOG_LEVEL"),
+        }
+        match prev_rust {
+            Some(v) => std::env::set_var("RUST_LOG", v),
+            None => std::env::remove_var("RUST_LOG"),
+        }
+        result
+    }
+
+    #[test]
+    fn test_default_level_used_when_no_env_set() {
+        with_clean_env(|| {
+            let filter = build_env_filter("error");
+            // EnvFilter's Display renders the directive set.
+            assert_eq!(format!("{}", filter), "error");
+        });
+    }
+
+    #[test]
+    fn test_arcanum_log_level_overrides_default() {
+        with_clean_env(|| {
+            std::env::set_var("ARCANUM_LOG_LEVEL", "debug");
+            let filter = build_env_filter("error");
+            assert_eq!(format!("{}", filter), "debug");
+            std::env::remove_var("ARCANUM_LOG_LEVEL");
+        });
+    }
+
+    #[test]
+    fn test_rust_log_overrides_default() {
+        with_clean_env(|| {
+            std::env::set_var("RUST_LOG", "info");
+            let filter = build_env_filter("error");
+            assert_eq!(format!("{}", filter), "info");
+            std::env::remove_var("RUST_LOG");
+        });
+    }
+
+    #[test]
+    fn test_arcanum_log_level_takes_precedence_over_rust_log() {
+        with_clean_env(|| {
+            std::env::set_var("ARCANUM_LOG_LEVEL", "warn");
+            std::env::set_var("RUST_LOG", "trace");
+            let filter = build_env_filter("error");
+            assert_eq!(format!("{}", filter), "warn");
+            std::env::remove_var("ARCANUM_LOG_LEVEL");
+            std::env::remove_var("RUST_LOG");
+        });
+    }
 }
