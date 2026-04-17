@@ -7,6 +7,7 @@ from fastapi import APIRouter, Path, Request
 from pydantic import BaseModel, Field
 from seer_api.errors import http_error
 from seer_api.limiting import limiter
+from seer_api.streaming import stream_bulk
 
 import seer
 
@@ -73,3 +74,13 @@ async def bulk_status(request: Request, body: BulkStatusRequest):
         return results
     except Exception as e:
         raise http_error(e, "Bulk status check failed")
+
+
+@router.post("/bulk/stream")
+@limiter.limit("5/minute")
+async def bulk_status_stream(request: Request, body: BulkStatusRequest):
+    """Stream bulk status checks as Server-Sent Events."""
+    try:
+        return await stream_bulk(seer.bulk_status, body.domains, body.concurrency)
+    except Exception as e:
+        raise http_error(e, "Bulk status stream failed")

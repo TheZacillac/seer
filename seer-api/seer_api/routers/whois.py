@@ -7,6 +7,7 @@ from fastapi import APIRouter, Path, Request
 from pydantic import BaseModel, Field
 from seer_api.errors import http_error
 from seer_api.limiting import limiter
+from seer_api.streaming import stream_bulk
 
 import seer
 
@@ -67,3 +68,13 @@ async def bulk_whois_lookup(request: Request, body: BulkWhoisRequest):
         return results
     except Exception as e:
         raise http_error(e, "Bulk WHOIS lookup failed")
+
+
+@router.post("/bulk/stream")
+@limiter.limit("10/minute")
+async def bulk_whois_stream(request: Request, body: BulkWhoisRequest):
+    """Stream bulk WHOIS lookups as Server-Sent Events."""
+    try:
+        return await stream_bulk(seer.bulk_whois, body.domains, body.concurrency)
+    except Exception as e:
+        raise http_error(e, "Bulk WHOIS stream failed")

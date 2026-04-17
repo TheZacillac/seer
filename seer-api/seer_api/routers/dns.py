@@ -7,6 +7,7 @@ from fastapi import APIRouter, Path, Query, Request
 from pydantic import BaseModel, Field
 from seer_api.errors import http_error
 from seer_api.limiting import limiter
+from seer_api.streaming import stream_bulk
 
 import seer
 
@@ -74,3 +75,15 @@ async def bulk_dns_lookup(request: Request, body: BulkDnsRequest):
         return results
     except Exception as e:
         raise http_error(e, "Bulk DNS lookup failed")
+
+
+@router.post("/bulk/stream")
+@limiter.limit("10/minute")
+async def bulk_dns_stream(request: Request, body: BulkDnsRequest):
+    """Stream bulk DNS queries as Server-Sent Events."""
+    try:
+        return await stream_bulk(
+            seer.bulk_dig, body.domains, body.record_type, body.concurrency
+        )
+    except Exception as e:
+        raise http_error(e, "Bulk DNS stream failed")

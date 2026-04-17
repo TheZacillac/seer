@@ -7,6 +7,7 @@ from fastapi import APIRouter, Path, Request
 from pydantic import BaseModel, Field
 from seer_api.errors import http_error
 from seer_api.limiting import limiter
+from seer_api.streaming import stream_bulk
 
 import seer
 
@@ -72,3 +73,15 @@ async def bulk_propagation_check(request: Request, body: BulkPropagationRequest)
         return results
     except Exception as e:
         raise http_error(e, "Bulk propagation check failed")
+
+
+@router.post("/bulk/stream")
+@limiter.limit("5/minute")
+async def bulk_propagation_stream(request: Request, body: BulkPropagationRequest):
+    """Stream bulk DNS-propagation checks as Server-Sent Events."""
+    try:
+        return await stream_bulk(
+            seer.bulk_propagation, body.domains, body.record_type, body.concurrency
+        )
+    except Exception as e:
+        raise http_error(e, "Bulk propagation stream failed")

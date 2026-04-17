@@ -7,6 +7,7 @@ from fastapi import APIRouter, Path, Request
 from pydantic import BaseModel, Field
 from seer_api.errors import http_error
 from seer_api.limiting import limiter
+from seer_api.streaming import stream_bulk
 
 import seer
 
@@ -67,3 +68,17 @@ async def bulk_smart_lookup(request: Request, body: BulkLookupRequest):
         return results
     except Exception as e:
         raise http_error(e, "Bulk lookup failed")
+
+
+@router.post("/bulk/stream")
+@limiter.limit("10/minute")
+async def bulk_smart_lookup_stream(request: Request, body: BulkLookupRequest):
+    """Stream bulk smart-lookup results as Server-Sent Events.
+
+    Emits `progress`, `item`, and `done` events. Matches the sync /bulk
+    semantics — see that handler for request/response body shape.
+    """
+    try:
+        return await stream_bulk(seer.bulk_lookup, body.domains, body.concurrency)
+    except Exception as e:
+        raise http_error(e, "Bulk lookup stream failed")
