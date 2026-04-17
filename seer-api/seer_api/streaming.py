@@ -54,6 +54,7 @@ async def stream_bulk(
     async def event_stream() -> AsyncGenerator[bytes, None]:
         # Phase 1: stream progress events until the bulk call finishes.
         pending_results: list[dict] | None = None
+        pending_error: Exception | None = None
         while True:
             get_task = asyncio.create_task(queue.get())
             finished, _ = await asyncio.wait(
@@ -65,17 +66,32 @@ async def stream_bulk(
                 yield _sse(event, payload)
             else:
                 get_task.cancel()
+                try:
+                    await get_task
+                except asyncio.CancelledError:
+                    pass
             if bulk_future.done():
                 # Drain any remaining progress events that arrived after the
                 # future completed but before we noticed.
                 while not queue.empty():
                     event, payload = queue.get_nowait()
                     yield _sse(event, payload)
-                pending_results = bulk_future.result()
+                try:
+                    pending_results = bulk_future.result()
+                except Exception as e:
+                    pending_error = e
                 break
 
-        # Phase 2: emit one `item` event per result.
-        assert pending_results is not None
+        # Phase 2/3: item events + done event. If bulk_future raised, emit a
+        # terminal `error` event so clients can tell the stream ended abnormally.
+        assert pending_results is not None or pending_error is not None
+        if pending_error is not None:
+            yield _sse(
+                "error",
+                {"message": str(pending_error)},
+            )
+            return
+
         succeeded = 0
         failed = 0
         for item in pending_results:
@@ -85,7 +101,6 @@ async def stream_bulk(
                 failed += 1
             yield _sse("item", item)
 
-        # Phase 3: emit the terminal `done` event.
         yield _sse(
             "done",
             {
