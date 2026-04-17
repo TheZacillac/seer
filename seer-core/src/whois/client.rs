@@ -191,7 +191,7 @@ impl WhoisClient {
                             return Ok(referral_response);
                         }
                         Err(e) => {
-                            warn!(referral = %referral, error = %e, "Referral lookup failed, using registry response");
+                            debug!(referral = %referral, error = %e, "Referral lookup failed, using registry response");
                             return Ok(current_response);
                         }
                     }

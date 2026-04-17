@@ -5,7 +5,7 @@ use std::time::Duration;
 use futures::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::time::sleep;
-use tracing::{debug, info, instrument, warn};
+use tracing::{debug, info, instrument};
 
 use crate::availability::{AvailabilityChecker, AvailabilityResult};
 use crate::dns::{DnsRecord, DnsResolver, PropagationChecker, PropagationResult, RecordType};
@@ -194,7 +194,7 @@ impl BulkExecutor {
                             duration_ms,
                         },
                         Err(e) => {
-                            warn!(error = %e, "Bulk operation failed");
+                            debug!(error = %e, "Bulk operation failed");
                             BulkResult {
                                 operation: op,
                                 success: false,

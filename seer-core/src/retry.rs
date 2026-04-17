@@ -7,7 +7,7 @@ use std::future::Future;
 use std::time::Duration;
 
 use rand::Rng;
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::error::{Result, SeerError};
 
@@ -287,7 +287,7 @@ impl<C: RetryClassifier> RetryExecutor<C> {
 
                     if !is_retryable || attempts_remaining == 0 {
                         if attempt > 0 {
-                            warn!(
+                            debug!(
                                 attempt = attempt + 1,
                                 max_attempts = self.policy.max_attempts,
                                 error = %e,
