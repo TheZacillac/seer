@@ -816,16 +816,20 @@ impl OutputFormatter for HumanFormatter {
         let domain = result
             .domain_name()
             .unwrap_or_else(|| "Unknown".to_string());
-        let source = match result {
-            LookupResult::Rdap { .. } => "RDAP",
-            LookupResult::Whois { .. } => "WHOIS",
-            LookupResult::Available { .. } => "availability",
+        let header_suffix = match result {
+            LookupResult::Rdap { .. } => "via RDAP".to_string(),
+            LookupResult::Whois { .. } => "via WHOIS".to_string(),
+            LookupResult::Available { data, .. } => match data.confidence.as_str() {
+                "high" => "available".to_string(),
+                "medium" => "likely available".to_string(),
+                _ => "status unknown".to_string(),
+            },
         };
 
         output.push(self.header(&format!(
-            "Lookup: {} (via {})",
+            "Lookup: {} ({})",
             sanitize_display(&domain),
-            source
+            header_suffix
         )));
 
         match result {
@@ -1387,20 +1391,29 @@ impl OutputFormatter for HumanFormatter {
                 data,
                 rdap_error,
                 whois_error,
-                ..
+                whois_data,
             } => {
+                let source_note = if !whois_error.is_empty() {
+                    "availability check (RDAP and WHOIS failed)"
+                } else {
+                    "WHOIS (RDAP unavailable)"
+                };
                 output.push(format!(
                     "  {}: {}",
                     self.label("Source"),
-                    self.warning("availability check (RDAP and WHOIS failed)")
+                    self.warning(source_note)
                 ));
 
-                let avail_str = if data.available {
-                    self.success("AVAILABLE")
-                } else {
-                    self.error("TAKEN")
+                let verdict_colored = match data.confidence.as_str() {
+                    "high" => self.success("AVAILABLE"),
+                    "medium" => self.warning("MAY BE AVAILABLE"),
+                    _ => self.error("UNKNOWN"),
                 };
-                output.push(format!("  {}: {}", self.label("Availability"), avail_str));
+                output.push(format!(
+                    "  {}: {}",
+                    self.label("Verdict"),
+                    verdict_colored
+                ));
 
                 let confidence_colored = match data.confidence.as_str() {
                     "high" => self.success(&data.confidence),
@@ -1412,28 +1425,71 @@ impl OutputFormatter for HumanFormatter {
                     self.label("Confidence"),
                     confidence_colored
                 ));
+
                 output.push(format!(
                     "  {}: {}",
                     self.label("Method"),
-                    self.value(&data.method)
+                    self.value(&sanitize_display(&data.method))
                 ));
-                if let Some(ref details) = data.details {
+
+                if let Some(details) = &data.details {
                     output.push(format!(
                         "  {}: {}",
                         self.label("Details"),
-                        self.value(details)
+                        self.value(&sanitize_display(details))
                     ));
                 }
-                output.push(format!(
-                    "  {}: {}",
-                    self.label("RDAP Error"),
-                    self.error(rdap_error)
-                ));
-                output.push(format!(
-                    "  {}: {}",
-                    self.label("WHOIS Error"),
-                    self.error(whois_error)
-                ));
+
+                if !rdap_error.is_empty() {
+                    output.push(format!(
+                        "  {}: {}",
+                        self.label("RDAP Error"),
+                        self.error(rdap_error)
+                    ));
+                }
+                if !whois_error.is_empty() {
+                    output.push(format!(
+                        "  {}: {}",
+                        self.label("WHOIS Error"),
+                        self.error(whois_error)
+                    ));
+                }
+
+                if let Some(w) = whois_data {
+                    let mut extra = Vec::new();
+                    if !w.nameservers.is_empty() {
+                        extra.push(format!(
+                            "    {}: {}",
+                            self.label("Nameservers"),
+                            self.value(&sanitize_display(&w.nameservers.join(", ")))
+                        ));
+                    }
+                    if !w.status.is_empty() {
+                        extra.push(format!(
+                            "    {}: {}",
+                            self.label("Status"),
+                            self.value(&sanitize_display(&w.status.join(", ")))
+                        ));
+                    }
+                    if let Some(ref dnssec) = w.dnssec {
+                        extra.push(format!(
+                            "    {}: {}",
+                            self.label("DNSSEC"),
+                            self.value(&sanitize_display(dnssec))
+                        ));
+                    }
+                    if !w.whois_server.is_empty() {
+                        extra.push(format!(
+                            "    {}: {}",
+                            self.label("WHOIS Server"),
+                            self.value(&sanitize_display(&w.whois_server))
+                        ));
+                    }
+                    if !extra.is_empty() {
+                        output.push(format!("  {}", self.label("Additional WHOIS data:")));
+                        output.extend(extra);
+                    }
+                }
             }
         }
 
