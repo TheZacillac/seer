@@ -234,7 +234,6 @@ mod tests {
             std::env::set_var("ARCANUM_LOG_LEVEL", "debug");
             let filter = build_env_filter("error");
             assert_eq!(format!("{}", filter), "debug");
-            std::env::remove_var("ARCANUM_LOG_LEVEL");
         });
     }
 
@@ -244,7 +243,6 @@ mod tests {
             std::env::set_var("RUST_LOG", "info");
             let filter = build_env_filter("error");
             assert_eq!(format!("{}", filter), "info");
-            std::env::remove_var("RUST_LOG");
         });
     }
 
@@ -255,8 +253,6 @@ mod tests {
             std::env::set_var("RUST_LOG", "trace");
             let filter = build_env_filter("error");
             assert_eq!(format!("{}", filter), "warn");
-            std::env::remove_var("ARCANUM_LOG_LEVEL");
-            std::env::remove_var("RUST_LOG");
         });
     }
 }
