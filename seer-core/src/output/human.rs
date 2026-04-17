@@ -2627,6 +2627,35 @@ impl OutputFormatter for HumanFormatter {
     }
 }
 
+/// Compares two `Option<String>` values for equality after trimming whitespace.
+/// Empty-after-trim is treated as `None`.
+fn eq_opt_str_trimmed(a: &Option<String>, b: &Option<String>) -> bool {
+    let norm = |o: &Option<String>| -> Option<String> {
+        o.as_ref()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+    norm(a) == norm(b)
+}
+
+/// Compares two string lists as sets: trims each item, drops empty items,
+/// then checks that the sorted multisets are equal.
+fn eq_as_set(a: &[String], b: &[String]) -> bool {
+    let mut an: Vec<String> = a
+        .iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let mut bn: Vec<String> = b
+        .iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    an.sort();
+    bn.sort();
+    an == bn
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2682,5 +2711,61 @@ mod tests {
         let out = f.format_expiry_status("2026-05-15", 30);
         assert!(out.contains("expires in 30 days"), "got: {}", out);
         assert!(!out.contains("!"), "got: {}", out);
+    }
+
+    #[test]
+    fn eq_opt_str_trims_whitespace() {
+        assert!(eq_opt_str_trimmed(
+            &Some("  foo  ".to_string()),
+            &Some("foo".to_string())
+        ));
+        assert!(!eq_opt_str_trimmed(
+            &Some("foo".to_string()),
+            &Some("bar".to_string())
+        ));
+    }
+
+    #[test]
+    fn eq_opt_str_both_none_matches() {
+        assert!(eq_opt_str_trimmed(&None, &None));
+    }
+
+    #[test]
+    fn eq_opt_str_empty_string_is_none() {
+        assert!(eq_opt_str_trimmed(&None, &Some("".to_string())));
+        assert!(eq_opt_str_trimmed(&Some("   ".to_string()), &None));
+    }
+
+    #[test]
+    fn eq_opt_str_some_vs_none_differs() {
+        assert!(!eq_opt_str_trimmed(&Some("foo".to_string()), &None));
+    }
+
+    #[test]
+    fn eq_as_set_order_independent() {
+        let a = vec!["ns1".to_string(), "ns2".to_string()];
+        let b = vec!["ns2".to_string(), "ns1".to_string()];
+        assert!(eq_as_set(&a, &b));
+    }
+
+    #[test]
+    fn eq_as_set_trims_and_drops_empty() {
+        let a = vec!["ns1".to_string(), "  ".to_string(), " ns2 ".to_string()];
+        let b = vec!["ns2".to_string(), "ns1".to_string()];
+        assert!(eq_as_set(&a, &b));
+    }
+
+    #[test]
+    fn eq_as_set_different_contents() {
+        let a = vec!["1.2.3.4".to_string()];
+        let b = vec!["1.2.3.5".to_string()];
+        assert!(!eq_as_set(&a, &b));
+    }
+
+    #[test]
+    fn eq_as_set_both_empty_matches() {
+        let a: Vec<String> = vec![];
+        let b: Vec<String> = vec![];
+        assert!(eq_as_set(&a, &b));
     }
 }
