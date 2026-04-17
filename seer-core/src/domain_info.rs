@@ -63,6 +63,11 @@ pub struct DomainInfo {
     // Protocol metadata
     pub whois_server: Option<String>,
     pub rdap_url: Option<String>,
+
+    /// Availability verdict: `"available"` / `"likely_available"` / `"unknown"`
+    /// when derived from a `LookupResult::Available`. `None` otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub availability_verdict: Option<String>,
 }
 
 impl DomainInfo {
@@ -231,6 +236,7 @@ impl DomainInfo {
             tech_phone,
             whois_server,
             rdap_url,
+            availability_verdict: None,
         }
     }
 
@@ -258,6 +264,14 @@ impl DomainInfo {
             LookupResult::Available { data, .. } => {
                 let mut info = Self::from_sources(&data.domain, None, None);
                 info.source = DomainInfoSource::Available;
+                info.availability_verdict = Some(
+                    match data.confidence.as_str() {
+                        "high" => "available",
+                        "medium" => "likely_available",
+                        _ => "unknown",
+                    }
+                    .to_string(),
+                );
                 info
             }
         }
