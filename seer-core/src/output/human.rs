@@ -2658,6 +2658,49 @@ fn eq_as_set(a: &[String], b: &[String]) -> bool {
     an == bn
 }
 
+/// Wraps `text` into lines no wider than `max_width` display chars.
+/// Breaks at the last ASCII whitespace within the window when possible;
+/// otherwise hard-breaks at the cap. Widths are measured in `chars().count()`
+/// which is correct for ASCII and a reasonable fallback for other inputs.
+#[allow(dead_code)]
+fn wrap_cell(text: &str, max_width: usize) -> Vec<String> {
+    let width = max_width.max(1);
+    if text.is_empty() {
+        return vec![String::new()];
+    }
+
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= width {
+        return vec![text.to_string()];
+    }
+
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let remaining = chars.len() - i;
+        if remaining <= width {
+            out.push(chars[i..].iter().collect());
+            break;
+        }
+        // Search for last whitespace in chars[i .. i+width]
+        let window_end = i + width;
+        let break_at = (i..window_end).rev().find(|&k| chars[k].is_whitespace());
+        match break_at {
+            Some(k) if k > i => {
+                out.push(chars[i..k].iter().collect());
+                i = k + 1; // skip the whitespace itself
+            }
+            _ => {
+                // No whitespace in window (or whitespace at index i): hard break.
+                out.push(chars[i..window_end].iter().collect());
+                i = window_end;
+            }
+        }
+    }
+
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2769,5 +2812,48 @@ mod tests {
         let a: Vec<String> = vec![];
         let b: Vec<String> = vec![];
         assert!(eq_as_set(&a, &b));
+    }
+
+    #[test]
+    fn wrap_cell_short_returns_single_line() {
+        assert_eq!(wrap_cell("hello", 10), vec!["hello".to_string()]);
+    }
+
+    #[test]
+    fn wrap_cell_wraps_at_word_boundary() {
+        let out = wrap_cell("the quick brown fox", 10);
+        assert_eq!(out, vec!["the quick".to_string(), "brown fox".to_string()]);
+    }
+
+    #[test]
+    fn wrap_cell_hard_breaks_when_no_whitespace() {
+        // A long nameserver with no break points must hard-break at the cap.
+        let out = wrap_cell("a.very.long.nameserver.example", 10);
+        assert_eq!(
+            out,
+            vec![
+                "a.very.lon".to_string(),
+                "g.nameserv".to_string(),
+                "er.example".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn wrap_cell_exact_width_no_wrap() {
+        assert_eq!(wrap_cell("1234567890", 10), vec!["1234567890".to_string()]);
+    }
+
+    #[test]
+    fn wrap_cell_empty_input_returns_one_empty_line() {
+        assert_eq!(wrap_cell("", 10), vec!["".to_string()]);
+    }
+
+    #[test]
+    fn wrap_cell_zero_width_treated_as_one() {
+        // Defensive: never loop forever on width 0. Caller must not pass 0, but
+        // we clamp to 1 to be safe.
+        let out = wrap_cell("abc", 0);
+        assert_eq!(out, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
     }
 }
