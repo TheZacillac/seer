@@ -4,7 +4,8 @@ use std::sync::{Mutex, OnceLock};
 
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyAny, PyDict};
+use pyo3::Py;
 use seer_core::{
     bulk::{BulkExecutor, BulkOperation},
     dns::{
@@ -260,9 +261,34 @@ fn validate_concurrency(concurrency: usize) -> PyResult<usize> {
     Ok(concurrency.max(1))
 }
 
+/// Converts an optional Python callable into a Rust `ProgressCallback`.
+///
+/// The returned callback acquires the GIL on every invocation. Exceptions
+/// raised from the Python callable are logged at `warn` and swallowed —
+/// a broken progress callback must not kill a bulk run.
+fn build_progress_callback(
+    progress: Option<Py<PyAny>>,
+) -> Option<seer_core::bulk::ProgressCallback> {
+    progress.map(|py_cb| {
+        Box::new(move |completed: usize, total: usize, domain: &str| {
+            Python::with_gil(|py| {
+                let bound = py_cb.bind(py);
+                if let Err(err) = bound.call1((completed, total, domain)) {
+                    tracing::warn!(error = %err, "bulk progress callback raised; ignoring");
+                }
+            });
+        }) as seer_core::bulk::ProgressCallback
+    })
+}
+
 #[pyfunction]
-#[pyo3(signature = (domains, concurrency = 10))]
-fn bulk_lookup(py: Python<'_>, domains: Vec<String>, concurrency: usize) -> PyResult<PyObject> {
+#[pyo3(signature = (domains, concurrency = 10, *, progress = None))]
+fn bulk_lookup(
+    py: Python<'_>,
+    domains: Vec<String>,
+    concurrency: usize,
+    progress: Option<Py<PyAny>>,
+) -> PyResult<PyObject> {
     let rt = get_runtime();
     let executor = BulkExecutor::new().with_concurrency(validate_concurrency(concurrency)?);
 
@@ -271,16 +297,22 @@ fn bulk_lookup(py: Python<'_>, domains: Vec<String>, concurrency: usize) -> PyRe
         .map(|domain| BulkOperation::Lookup { domain })
         .collect();
 
+    let cb = build_progress_callback(progress);
     let result =
-        py.allow_threads(|| rt.block_on(async { executor.execute(operations, None).await }));
+        py.allow_threads(|| rt.block_on(async { executor.execute(operations, cb).await }));
 
     let json = serde_json::to_value(&result).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     json_to_python(py, &json)
 }
 
 #[pyfunction]
-#[pyo3(signature = (domains, concurrency = 10))]
-fn bulk_whois(py: Python<'_>, domains: Vec<String>, concurrency: usize) -> PyResult<PyObject> {
+#[pyo3(signature = (domains, concurrency = 10, *, progress = None))]
+fn bulk_whois(
+    py: Python<'_>,
+    domains: Vec<String>,
+    concurrency: usize,
+    progress: Option<Py<PyAny>>,
+) -> PyResult<PyObject> {
     let rt = get_runtime();
     let executor = BulkExecutor::new().with_concurrency(validate_concurrency(concurrency)?);
 
@@ -289,20 +321,22 @@ fn bulk_whois(py: Python<'_>, domains: Vec<String>, concurrency: usize) -> PyRes
         .map(|domain| BulkOperation::Whois { domain })
         .collect();
 
+    let cb = build_progress_callback(progress);
     let result =
-        py.allow_threads(|| rt.block_on(async { executor.execute(operations, None).await }));
+        py.allow_threads(|| rt.block_on(async { executor.execute(operations, cb).await }));
 
     let json = serde_json::to_value(&result).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     json_to_python(py, &json)
 }
 
 #[pyfunction]
-#[pyo3(signature = (domains, record_type = "A", concurrency = 10))]
+#[pyo3(signature = (domains, record_type = "A", concurrency = 10, *, progress = None))]
 fn bulk_dig(
     py: Python<'_>,
     domains: Vec<String>,
     record_type: &str,
     concurrency: usize,
+    progress: Option<Py<PyAny>>,
 ) -> PyResult<PyObject> {
     let rt = get_runtime();
     let executor = BulkExecutor::new().with_concurrency(validate_concurrency(concurrency)?);
@@ -319,20 +353,22 @@ fn bulk_dig(
         })
         .collect();
 
+    let cb = build_progress_callback(progress);
     let result =
-        py.allow_threads(|| rt.block_on(async { executor.execute(operations, None).await }));
+        py.allow_threads(|| rt.block_on(async { executor.execute(operations, cb).await }));
 
     let json = serde_json::to_value(&result).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     json_to_python(py, &json)
 }
 
 #[pyfunction]
-#[pyo3(signature = (domains, record_type = "A", concurrency = 5))]
+#[pyo3(signature = (domains, record_type = "A", concurrency = 5, *, progress = None))]
 fn bulk_propagation(
     py: Python<'_>,
     domains: Vec<String>,
     record_type: &str,
     concurrency: usize,
+    progress: Option<Py<PyAny>>,
 ) -> PyResult<PyObject> {
     let rt = get_runtime();
     let executor = BulkExecutor::new().with_concurrency(validate_concurrency(concurrency)?);
@@ -349,8 +385,9 @@ fn bulk_propagation(
         })
         .collect();
 
+    let cb = build_progress_callback(progress);
     let result =
-        py.allow_threads(|| rt.block_on(async { executor.execute(operations, None).await }));
+        py.allow_threads(|| rt.block_on(async { executor.execute(operations, cb).await }));
 
     let json = serde_json::to_value(&result).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     json_to_python(py, &json)
@@ -374,8 +411,13 @@ fn status(py: Python<'_>, domain: String) -> PyResult<PyObject> {
 }
 
 #[pyfunction]
-#[pyo3(signature = (domains, concurrency = 10))]
-fn bulk_status(py: Python<'_>, domains: Vec<String>, concurrency: usize) -> PyResult<PyObject> {
+#[pyo3(signature = (domains, concurrency = 10, *, progress = None))]
+fn bulk_status(
+    py: Python<'_>,
+    domains: Vec<String>,
+    concurrency: usize,
+    progress: Option<Py<PyAny>>,
+) -> PyResult<PyObject> {
     let rt = get_runtime();
     let executor = BulkExecutor::new().with_concurrency(validate_concurrency(concurrency)?);
 
@@ -384,19 +426,21 @@ fn bulk_status(py: Python<'_>, domains: Vec<String>, concurrency: usize) -> PyRe
         .map(|domain| BulkOperation::Status { domain })
         .collect();
 
+    let cb = build_progress_callback(progress);
     let result =
-        py.allow_threads(|| rt.block_on(async { executor.execute(operations, None).await }));
+        py.allow_threads(|| rt.block_on(async { executor.execute(operations, cb).await }));
 
     let json = serde_json::to_value(&result).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     json_to_python(py, &json)
 }
 
 #[pyfunction]
-#[pyo3(signature = (domains, concurrency = 10))]
+#[pyo3(signature = (domains, concurrency = 10, *, progress = None))]
 fn bulk_availability(
     py: Python<'_>,
     domains: Vec<String>,
     concurrency: usize,
+    progress: Option<Py<PyAny>>,
 ) -> PyResult<PyObject> {
     let rt = get_runtime();
     let executor = BulkExecutor::new().with_concurrency(validate_concurrency(concurrency)?);
@@ -406,8 +450,9 @@ fn bulk_availability(
         .map(|domain| BulkOperation::Avail { domain })
         .collect();
 
+    let cb = build_progress_callback(progress);
     let result =
-        py.allow_threads(|| rt.block_on(async { executor.execute(operations, None).await }));
+        py.allow_threads(|| rt.block_on(async { executor.execute(operations, cb).await }));
 
     let json = serde_json::to_value(&result).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     json_to_python(py, &json)
@@ -653,8 +698,13 @@ fn info(py: Python<'_>, domain: String) -> PyResult<PyObject> {
 }
 
 #[pyfunction]
-#[pyo3(signature = (domains, concurrency = 10))]
-fn bulk_info(py: Python<'_>, domains: Vec<String>, concurrency: usize) -> PyResult<PyObject> {
+#[pyo3(signature = (domains, concurrency = 10, *, progress = None))]
+fn bulk_info(
+    py: Python<'_>,
+    domains: Vec<String>,
+    concurrency: usize,
+    progress: Option<Py<PyAny>>,
+) -> PyResult<PyObject> {
     let rt = get_runtime();
     let executor = BulkExecutor::new().with_concurrency(validate_concurrency(concurrency)?);
 
@@ -663,8 +713,9 @@ fn bulk_info(py: Python<'_>, domains: Vec<String>, concurrency: usize) -> PyResu
         .map(|domain| BulkOperation::Info { domain })
         .collect();
 
+    let cb = build_progress_callback(progress);
     let result =
-        py.allow_threads(|| rt.block_on(async { executor.execute(operations, None).await }));
+        py.allow_threads(|| rt.block_on(async { executor.execute(operations, cb).await }));
 
     let json = serde_json::to_value(&result).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     json_to_python(py, &json)
