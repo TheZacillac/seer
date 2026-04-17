@@ -92,6 +92,18 @@ fn rdap_error_is_404(err: &SeerError) -> bool {
     }
 }
 
+/// Returns true if the parsed WHOIS response lacks all key registration
+/// signals: no registrar, no creation date, and no expiration date.
+///
+/// This is a necessary-but-not-sufficient signal for domain availability;
+/// `lookup_concurrent` combines it with an RDAP 404 before routing to the
+/// availability path. Nameservers alone don't disqualify thinness — some
+/// registries return placeholder nameservers for unregistered domains.
+#[allow(dead_code)] // Consumed by Task 4 availability-routing branch.
+fn whois_response_is_thin(w: &WhoisResponse) -> bool {
+    w.registrar.is_none() && w.creation_date.is_none() && w.expiration_date.is_none()
+}
+
 /// Sanitizes an error message for inclusion in a public-facing response.
 ///
 /// Strips IPv4 and IPv6 literals (to avoid leaking internal addresses when
@@ -993,5 +1005,70 @@ mod tests {
         // A 404 substring inside a non-status context must not match.
         let e = SeerError::RdapError("error 40404: database corruption".to_string());
         assert!(!rdap_error_is_404(&e));
+    }
+
+    // ---------------- whois_response_is_thin ----------------
+
+    fn empty_whois(domain: &str) -> WhoisResponse {
+        WhoisResponse {
+            domain: domain.to_string(),
+            registrar: None,
+            registrant: None,
+            organization: None,
+            registrant_email: None,
+            registrant_phone: None,
+            registrant_address: None,
+            registrant_country: None,
+            admin_name: None,
+            admin_organization: None,
+            admin_email: None,
+            admin_phone: None,
+            tech_name: None,
+            tech_organization: None,
+            tech_email: None,
+            tech_phone: None,
+            creation_date: None,
+            expiration_date: None,
+            updated_date: None,
+            nameservers: vec![],
+            status: vec![],
+            dnssec: None,
+            whois_server: String::new(),
+            raw_response: String::new(),
+        }
+    }
+
+    #[test]
+    fn whois_response_is_thin_when_all_key_fields_missing() {
+        let w = empty_whois("example.com");
+        assert!(whois_response_is_thin(&w));
+    }
+
+    #[test]
+    fn whois_response_is_not_thin_when_registrar_present() {
+        let mut w = empty_whois("example.com");
+        w.registrar = Some("Test Registrar".to_string());
+        assert!(!whois_response_is_thin(&w));
+    }
+
+    #[test]
+    fn whois_response_is_not_thin_when_creation_date_present() {
+        let mut w = empty_whois("example.com");
+        w.creation_date = Some(chrono::Utc::now());
+        assert!(!whois_response_is_thin(&w));
+    }
+
+    #[test]
+    fn whois_response_is_not_thin_when_expiration_date_present() {
+        let mut w = empty_whois("example.com");
+        w.expiration_date = Some(chrono::Utc::now());
+        assert!(!whois_response_is_thin(&w));
+    }
+
+    #[test]
+    fn whois_response_is_thin_even_with_nameservers_alone() {
+        let mut w = empty_whois("example.com");
+        w.nameservers = vec!["ns1.example.net".to_string()];
+        assert!(whois_response_is_thin(&w));
     }
 }
