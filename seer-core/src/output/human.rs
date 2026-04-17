@@ -97,6 +97,14 @@ impl HumanFormatter {
         }
     }
 
+    fn dim(&self, text: &str) -> String {
+        if self.use_colors {
+            text.overlay1().to_string()
+        } else {
+            text.to_string()
+        }
+    }
+
     fn header(&self, text: &str) -> String {
         if self.use_colors {
             format!(
@@ -2212,8 +2220,15 @@ impl OutputFormatter for HumanFormatter {
                     } else {
                         "  ".to_string()
                     };
-                    let a_cell = color(&pad_right(a, col_width));
-                    let b_cell = color(b);
+                    let color_value = |s: &str, raw: &str| -> String {
+                        if raw.trim() == EMPTY_PLACEHOLDER {
+                            self.dim(s)
+                        } else {
+                            color(s)
+                        }
+                    };
+                    let a_cell = color_value(&pad_right(a, col_width), a);
+                    let b_cell = color_value(b, b);
                     output.push(format!(
                         "{}  {}{}   {}",
                         self.label(&label_cell),
@@ -3446,6 +3461,40 @@ mod tests {
             1,
             "right-side value must appear exactly once:\n{}",
             out
+        );
+    }
+
+    #[test]
+    fn format_diff_em_dash_is_dim_not_row_color() {
+        // Colored formatter — we need to see the ANSI escape codes.
+        // Force color output even in non-TTY test environments.
+        colored::control::set_override(true);
+        let f = HumanFormatter::new();
+        let out = f.format_diff(&make_sample_diff());
+        colored::control::unset_override();
+
+        // In make_sample_diff, Organization is (None, Some("Google LLC")) →
+        // differ row. The row-level red color for differ rows is the bright-red
+        // ANSI code `\x1b[91m`. The dim em-dash cell should NOT appear inside
+        // that code.
+        //
+        // We look for the Organization line and assert that the em-dash in it
+        // is NOT wrapped in bright-red — i.e. the substring "\x1b[91m—" should
+        // not appear. The em-dash should instead appear wrapped in the dim
+        // (bright-black, `\x1b[90m`) code.
+        let org_line = out
+            .lines()
+            .find(|l| l.contains("Organization"))
+            .expect("organization line missing");
+        assert!(
+            !org_line.contains("\x1b[91m—"),
+            "em-dash should not be red on a differ row: {:?}",
+            org_line
+        );
+        assert!(
+            org_line.contains("\x1b[90m"),
+            "em-dash should be dim (bright-black ANSI): {:?}",
+            org_line
         );
     }
 }
