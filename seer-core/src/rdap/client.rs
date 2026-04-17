@@ -776,7 +776,7 @@ async fn load_bootstrap_data() -> Result<BootstrapData> {
                 match validate_bootstrap_url(s) {
                     Ok(parsed) => out.push(parsed),
                     Err(e) => {
-                        warn!(url = s, error = %e, "Skipping invalid bootstrap URL");
+                        debug!(url = s, error = %e, "Skipping invalid bootstrap URL");
                     }
                 }
             }
