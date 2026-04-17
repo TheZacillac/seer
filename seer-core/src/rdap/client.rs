@@ -259,13 +259,6 @@ impl RdapClient {
 
         let outcome = match load_result {
             Ok(data) => {
-                debug!(
-                    dns_entries = data.dns.len(),
-                    ipv4_entries = data.ipv4.len(),
-                    ipv6_entries = data.ipv6.len(),
-                    asn_entries = data.asn.len(),
-                    "RDAP bootstrap loaded/refreshed"
-                );
                 let mut cache = BOOTSTRAP_CACHE.write().await;
                 // Double-check: another task may have loaded while we ran.
                 // Only overwrite if the current cache is missing or expired.
