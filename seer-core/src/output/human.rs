@@ -2629,6 +2629,7 @@ impl OutputFormatter for HumanFormatter {
 
 /// Compares two `Option<String>` values for equality after trimming whitespace.
 /// Empty-after-trim is treated as `None`.
+#[allow(dead_code)]
 fn eq_opt_str_trimmed(a: &Option<String>, b: &Option<String>) -> bool {
     let norm = |o: &Option<String>| -> Option<String> {
         o.as_ref()
@@ -2640,6 +2641,7 @@ fn eq_opt_str_trimmed(a: &Option<String>, b: &Option<String>) -> bool {
 
 /// Compares two string lists as sets: trims each item, drops empty items,
 /// then checks that the sorted multisets are equal.
+#[allow(dead_code)]
 fn eq_as_set(a: &[String], b: &[String]) -> bool {
     let mut an: Vec<String> = a
         .iter()
