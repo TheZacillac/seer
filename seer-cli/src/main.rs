@@ -6,6 +6,19 @@ use std::io::Write;
 
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{generate, Shell};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+#[clap(rename_all = "lowercase")]
+enum ProgressMode {
+    /// Progress bar only (default in a TTY)
+    Bar,
+    /// Progress bar plus per-item completion lines
+    Verbose,
+    /// Progress bar plus per-failure lines; successes silent
+    Failures,
+    /// No bar, no per-item output (default when piped or when --format json)
+    None,
+}
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::terminal;
 use seer_core::colors::CatppuccinExt;
@@ -139,6 +152,10 @@ enum Commands {
         /// Output CSV file path (defaults to <input>_results.csv)
         #[arg(short, long, value_name = "OUTPUT")]
         output: Option<String>,
+
+        /// Progress display mode for bulk runs
+        #[arg(long, value_enum)]
+        progress: Option<ProgressMode>,
     },
     /// Check domain status (HTTP, SSL cert, registration expiration)
     Status {
@@ -476,7 +493,9 @@ async fn execute_command(
             file,
             record_type,
             output,
+            progress,
         } => {
+            let _progress_mode = progress;
             const MAX_BULK_DOMAINS_CLI: usize = 1000;
 
             // `read_bulk_input` rejects FIFOs, sockets, devices, directories,
