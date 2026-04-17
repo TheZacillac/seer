@@ -15,6 +15,15 @@ import types
 def _install_seer_stub() -> None:
     if "seer" in sys.modules:
         return
+    # Prefer the real compiled module when it's importable. The streaming
+    # integration test needs real bulk_* calls; other tests don't invoke
+    # seer at all (they exercise validation/auth paths that short-circuit
+    # before the router calls into seer).
+    try:
+        import seer  # noqa: F401
+        return
+    except ImportError:
+        pass
     stub = types.ModuleType("seer")
 
     def _unused(*_args, **_kwargs):  # pragma: no cover - never hit in unit tests
@@ -42,3 +51,14 @@ def _install_seer_stub() -> None:
 
 
 _install_seer_stub()
+
+
+import pytest
+from fastapi.testclient import TestClient
+
+from seer_api.main import app
+
+
+@pytest.fixture
+def client():
+    return TestClient(app)
