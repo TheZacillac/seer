@@ -109,11 +109,16 @@ event: done
 data: {"total": 100, "succeeded": 97, "failed": 3, "duration_ms": 12480}
 ```
 
-- `progress` fires from the Rust callback hook after each item completes — a lightweight heartbeat (count/total/domain) that clients can consume without parsing full per-item payloads.
-- `item` fires immediately after the corresponding `progress`, carrying the full `BulkResult` as JSON (same shape as an element in the current sync response's list).
+- `progress` fires from the Rust callback hook after each item completes — a lightweight heartbeat (count/total/domain) that streams live during execution. Consumers get real-time progress without parsing per-item payloads.
+- `item` events emit as a batch after the bulk call returns, one per result in completion order, carrying the full `BulkResult` as JSON (same shape as an element in the current sync response's list). Emitting items inline during execution would require changes to the Rust core's callback API (explicitly a non-goal for this plan).
 - `done` fires once at the end with final totals and elapsed duration.
 
-A simple progress-only consumer can listen to `progress` and `done`. A full-result consumer can listen to `item` and `done` (and derive progress from item count). Both events exist so each consumer picks the minimum they need.
+Ordering guarantees for SSE consumers:
+- All `progress` events fire before any `item` event.
+- `item` events appear in completion order (matching the order of `progress` heartbeats).
+- `done` is always the final event.
+
+A simple progress-only consumer listens to `progress` and `done` — they get live updates. A full-result consumer listens to `item` and `done` — they get all results at once (equivalent to the sync endpoint but delivered as events). Mixed consumers get live heartbeats plus the full result batch at the end.
 
 ### Implementation sketch
 
@@ -143,7 +148,7 @@ No new tests — the callback hook already exists and is exercised by existing b
 
 ### API
 
-- Integration test (FastAPI `TestClient`): `POST /bulk/whois/stream` with 2 domains; parse the SSE stream; assert event sequence contains exactly 2× `progress`, 2× `item`, 1× `done`, with `progress` immediately preceding its paired `item`.
+- Integration test (FastAPI `TestClient`): `POST /status/bulk/stream` with 2 domains; parse the SSE stream; assert exactly 2× `progress`, 2× `item`, 1× `done`, with all `progress` events before any `item` event, and `done` last.
 - Integration test: auth/rate-limit middleware applies to streaming routes.
 
 ### Manual end-to-end
