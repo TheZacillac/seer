@@ -83,7 +83,6 @@ static LOOKUP_CONCURRENT_CALLS: Lazy<std::sync::atomic::AtomicUsize> =
 ///
 /// Matches the format produced by `seer-core/src/rdap/client.rs:603`:
 /// `"query failed with status 404 ..."`.
-#[allow(dead_code)] // consumed by the availability-routing branch in a later task
 fn rdap_error_is_404(err: &SeerError) -> bool {
     if let SeerError::RdapError(msg) = err {
         msg.contains("query failed with status 404")
@@ -99,9 +98,27 @@ fn rdap_error_is_404(err: &SeerError) -> bool {
 /// `lookup_concurrent` combines it with an RDAP 404 before routing to the
 /// availability path. Nameservers alone don't disqualify thinness — some
 /// registries return placeholder nameservers for unregistered domains.
-#[allow(dead_code)] // Consumed by Task 4 availability-routing branch.
 fn whois_response_is_thin(w: &WhoisResponse) -> bool {
     w.registrar.is_none() && w.creation_date.is_none() && w.expiration_date.is_none()
+}
+
+/// Decides whether a WHOIS response + RDAP error combination should route
+/// to the availability path. Returns `(confidence, method)` when routing is
+/// warranted, `None` to keep the existing `LookupResult::Whois` behavior.
+///
+/// Case A: WHOIS explicitly indicates no registration (highest priority).
+/// Case B: WHOIS returned but lacks registration data AND RDAP returned 404.
+fn classify_whois_leg(
+    w: &WhoisResponse,
+    rdap_err: &SeerError,
+) -> Option<(&'static str, &'static str)> {
+    if w.is_available() {
+        return Some(("high", "whois"));
+    }
+    if whois_response_is_thin(w) && rdap_error_is_404(rdap_err) {
+        return Some(("medium", "whois_thin_response"));
+    }
+    None
 }
 
 /// Sanitizes an error message for inclusion in a public-facing response.
@@ -538,27 +555,76 @@ impl SmartLookup {
         // if it returned any response, even a thin one — this is safer than
         // falling back to the availability heuristic when we have actual
         // registry data in hand.
-        let (rdap_error_str, rdap_fallback_data) = match rdap_outcome {
+        let (rdap_error_str, rdap_fallback_data, rdap_seer_error) = match rdap_outcome {
             RdapOutcome::Useful(_) => {
                 // Unreachable in this branch (we returned above), but handle
                 // defensively rather than panicking across the FFI boundary.
                 debug!("Unexpected RdapOutcome::Useful in fallback branch");
-                (String::from("RDAP ok"), None)
+                (String::from("RDAP ok"), None, None)
             }
-            RdapOutcome::NoData(data) => {
-                ("RDAP response incomplete".to_string(), Some(Box::new(data)))
-            }
-            RdapOutcome::Error(e) => (e.to_string(), None),
+            RdapOutcome::NoData(data) => (
+                "RDAP response incomplete".to_string(),
+                Some(Box::new(data)),
+                None,
+            ),
+            RdapOutcome::Error(e) => (e.to_string(), None, Some(e)),
             RdapOutcome::GraceTimeout => (
                 format!(
                     "RDAP did not return within {}s grace period after WHOIS won",
                     PROTOCOL_GRACE_PERIOD.as_secs()
                 ),
                 None,
+                None,
             ),
         };
 
         if let LegOutcome::Completed(Ok(whois_data)) = whois_leg {
+            // Check Cases A and B: should we reclassify as Available?
+            let availability_match = rdap_seer_error
+                .as_ref()
+                .and_then(|e| classify_whois_leg(&whois_data, e))
+                .or_else(|| {
+                    // Case A can still fire even when RDAP errored for a
+                    // non-404 reason — the WHOIS signal alone is sufficient.
+                    if whois_data.is_available() {
+                        Some(("high", "whois"))
+                    } else {
+                        None
+                    }
+                });
+
+            if let Some((confidence, method)) = availability_match {
+                debug!(
+                    domain = %domain,
+                    confidence = %confidence,
+                    "Reclassifying WHOIS as availability signal"
+                );
+                if let Some(ref cb) = progress {
+                    cb("Domain appears unregistered");
+                }
+                let details = match confidence {
+                    "high" => Some("WHOIS indicates domain is not registered".to_string()),
+                    "medium" => Some(
+                        "WHOIS returned no registrar or registration dates; RDAP returned 404"
+                            .to_string(),
+                    ),
+                    _ => None,
+                };
+                let avail = AvailabilityResult {
+                    domain: domain.to_string(),
+                    available: true,
+                    confidence: confidence.to_string(),
+                    method: method.to_string(),
+                    details,
+                };
+                return Ok(LookupResult::Available {
+                    data: Box::new(avail),
+                    rdap_error: sanitize_error_for_public(&rdap_error_str),
+                    whois_error: String::new(),
+                    whois_data: Some(whois_data),
+                });
+            }
+
             debug!("Using WHOIS result (RDAP not useful)");
             if let Some(ref cb) = progress {
                 cb("RDAP not available (using WHOIS)");
@@ -1070,5 +1136,65 @@ mod tests {
         let mut w = empty_whois("example.com");
         w.nameservers = vec!["ns1.example.net".to_string()];
         assert!(whois_response_is_thin(&w));
+    }
+
+    // ---------------- classify_whois_leg ----------------
+
+    use crate::rdap::RdapResponse;
+
+    #[allow(dead_code)]
+    fn make_empty_rdap_response() -> RdapResponse {
+        serde_json::from_value(serde_json::json!({
+            "objectClassName": "domain",
+        }))
+        .expect("valid minimal RDAP response")
+    }
+
+    #[test]
+    fn classify_whois_leg_case_a_high_confidence() {
+        let mut w = empty_whois("zaccodes.com");
+        w.raw_response = "No match for \"ZACCODES.COM\".".to_string();
+        assert!(w.is_available());
+        let rdap_err = SeerError::RdapError("query failed with status 404 Not Found".to_string());
+        let (verdict, method) =
+            classify_whois_leg(&w, &rdap_err).expect("expected a routing decision");
+        assert_eq!(verdict, "high");
+        assert_eq!(method, "whois");
+    }
+
+    #[test]
+    fn classify_whois_leg_case_b_medium_confidence() {
+        let w = empty_whois("example.xyz");
+        assert!(!w.is_available(), "this WHOIS body has no 'no match' text");
+        let rdap_err = SeerError::RdapError("query failed with status 404 Not Found".to_string());
+        let (verdict, method) =
+            classify_whois_leg(&w, &rdap_err).expect("expected a routing decision");
+        assert_eq!(verdict, "medium");
+        assert_eq!(method, "whois_thin_response");
+    }
+
+    #[test]
+    fn classify_whois_leg_rejects_thin_whois_without_404() {
+        let w = empty_whois("example.xyz");
+        let rdap_err = SeerError::RdapError("connection timeout".to_string());
+        assert!(classify_whois_leg(&w, &rdap_err).is_none());
+    }
+
+    #[test]
+    fn classify_whois_leg_rejects_whois_with_real_data() {
+        let mut w = empty_whois("legacy.tld");
+        w.registrar = Some("Legacy Registry".to_string());
+        w.creation_date = Some(chrono::Utc::now());
+        let rdap_err = SeerError::RdapError("query failed with status 404 Not Found".to_string());
+        assert!(classify_whois_leg(&w, &rdap_err).is_none());
+    }
+
+    #[test]
+    fn classify_whois_leg_case_a_wins_over_case_b() {
+        let mut w = empty_whois("example.com");
+        w.raw_response = "No match for \"EXAMPLE.COM\".".to_string();
+        let rdap_err = SeerError::RdapError("query failed with status 404 Not Found".to_string());
+        let (verdict, _) = classify_whois_leg(&w, &rdap_err).unwrap();
+        assert_eq!(verdict, "high");
     }
 }
