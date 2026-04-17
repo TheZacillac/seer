@@ -732,21 +732,61 @@ impl OutputFormatter for MarkdownFormatter {
                 data,
                 rdap_error,
                 whois_error,
-                ..
+                whois_data,
             } => {
-                let avail_str = if data.available {
-                    "**AVAILABLE**"
-                } else {
-                    "**TAKEN**"
+                let verdict = match data.confidence.as_str() {
+                    "high" => "AVAILABLE",
+                    "medium" => "MAY BE AVAILABLE",
+                    _ => "UNKNOWN",
                 };
-                output.push(format!("- **Availability**: {}", avail_str));
+                output.push(format!("- **Verdict**: {}", verdict));
                 output.push(format!("- **Confidence**: {}", data.confidence));
                 output.push(format!("- **Method**: {}", data.method));
                 if let Some(ref details) = data.details {
                     output.push(format!("- **Details**: {}", details));
                 }
-                output.push(format!("- **RDAP Error**: {}", rdap_error));
-                output.push(format!("- **WHOIS Error**: {}", whois_error));
+                if !rdap_error.is_empty() {
+                    output.push(format!("- **RDAP Error**: {}", rdap_error));
+                }
+                if !whois_error.is_empty() {
+                    output.push(format!("- **WHOIS Error**: {}", whois_error));
+                }
+
+                if let Some(w) = whois_data {
+                    let mut bullets = Vec::new();
+                    if !w.nameservers.is_empty() {
+                        bullets.push(format!(
+                            "- **Nameservers**: {}",
+                            w.nameservers
+                                .iter()
+                                .map(|ns| format!("`{}`", ns))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ));
+                    }
+                    if !w.status.is_empty() {
+                        bullets.push(format!(
+                            "- **Status**: {}",
+                            w.status
+                                .iter()
+                                .map(|s| format!("`{}`", s))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ));
+                    }
+                    if let Some(ref dnssec) = w.dnssec {
+                        bullets.push(format!("- **DNSSEC**: {}", dnssec));
+                    }
+                    if !w.whois_server.is_empty() {
+                        bullets.push(format!("- **WHOIS Server**: `{}`", w.whois_server));
+                    }
+                    if !bullets.is_empty() {
+                        output.push(String::new());
+                        output.push("### Additional WHOIS data".to_string());
+                        output.push(String::new());
+                        output.extend(bullets);
+                    }
+                }
             }
         }
 
