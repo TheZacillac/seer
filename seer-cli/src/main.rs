@@ -634,9 +634,7 @@ async fn execute_command(
                     let bar = ProgressBar::new(total as u64);
                     bar.set_style(
                         ProgressStyle::default_bar()
-                            .template(
-                                "{bar:40.cyan/blue} {pos}/{len} ({percent}%) eta {eta} {msg}",
-                            )
+                            .template("{bar:40.cyan/blue} {pos}/{len} ({percent}%) eta {eta} {msg}")
                             .expect("valid progress bar template")
                             .progress_chars("=>-"),
                     );
@@ -670,7 +668,12 @@ async fn execute_command(
                     };
                     match (progress_mode, r.success) {
                         (ProgressMode::Verbose, true) => {
-                            bar.println(format!("{} {} ({}ms)", "\u{2713}".ctp_green(), domain, r.duration_ms));
+                            bar.println(format!(
+                                "{} {} ({}ms)",
+                                "\u{2713}".ctp_green(),
+                                domain,
+                                r.duration_ms
+                            ));
                         }
                         (ProgressMode::Verbose, false) | (ProgressMode::Failures, false) => {
                             let err = r.error.as_deref().unwrap_or("unknown error");
@@ -890,17 +893,16 @@ async fn execute_command(
             // Create progress callback for real-time output
             // Note: raw mode is enabled for key detection, so we need \r\n for proper line breaks
             let follow_format = output_format;
-            let callback: seer_core::dns::FollowProgressCallback =
-                Arc::new(move |iteration| {
-                    let formatter = seer_core::output::get_formatter(follow_format);
-                    let output = formatter.format_follow_iteration(iteration);
-                    // In raw mode, \n alone doesn't return to column 0, so use \r\n
-                    let output = output.replace('\n', "\r\n");
-                    let mut stdout = std::io::stdout().lock();
-                    let _ = stdout.write_all(output.as_bytes());
-                    let _ = stdout.write_all(b"\r\n");
-                    let _ = stdout.flush();
-                });
+            let callback: seer_core::dns::FollowProgressCallback = Arc::new(move |iteration| {
+                let formatter = seer_core::output::get_formatter(follow_format);
+                let output = formatter.format_follow_iteration(iteration);
+                // In raw mode, \n alone doesn't return to column 0, so use \r\n
+                let output = output.replace('\n', "\r\n");
+                let mut stdout = std::io::stdout().lock();
+                let _ = stdout.write_all(output.as_bytes());
+                let _ = stdout.write_all(b"\r\n");
+                let _ = stdout.flush();
+            });
 
             // In raw mode, use \r\n for proper line breaks
             print!(

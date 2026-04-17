@@ -298,8 +298,7 @@ fn bulk_lookup(
         .collect();
 
     let cb = build_progress_callback(progress);
-    let result =
-        py.allow_threads(|| rt.block_on(async { executor.execute(operations, cb).await }));
+    let result = py.allow_threads(|| rt.block_on(async { executor.execute(operations, cb).await }));
 
     let json = serde_json::to_value(&result).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     json_to_python(py, &json)
@@ -322,8 +321,7 @@ fn bulk_whois(
         .collect();
 
     let cb = build_progress_callback(progress);
-    let result =
-        py.allow_threads(|| rt.block_on(async { executor.execute(operations, cb).await }));
+    let result = py.allow_threads(|| rt.block_on(async { executor.execute(operations, cb).await }));
 
     let json = serde_json::to_value(&result).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     json_to_python(py, &json)
@@ -354,8 +352,7 @@ fn bulk_dig(
         .collect();
 
     let cb = build_progress_callback(progress);
-    let result =
-        py.allow_threads(|| rt.block_on(async { executor.execute(operations, cb).await }));
+    let result = py.allow_threads(|| rt.block_on(async { executor.execute(operations, cb).await }));
 
     let json = serde_json::to_value(&result).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     json_to_python(py, &json)
@@ -386,8 +383,7 @@ fn bulk_propagation(
         .collect();
 
     let cb = build_progress_callback(progress);
-    let result =
-        py.allow_threads(|| rt.block_on(async { executor.execute(operations, cb).await }));
+    let result = py.allow_threads(|| rt.block_on(async { executor.execute(operations, cb).await }));
 
     let json = serde_json::to_value(&result).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     json_to_python(py, &json)
@@ -427,8 +423,7 @@ fn bulk_status(
         .collect();
 
     let cb = build_progress_callback(progress);
-    let result =
-        py.allow_threads(|| rt.block_on(async { executor.execute(operations, cb).await }));
+    let result = py.allow_threads(|| rt.block_on(async { executor.execute(operations, cb).await }));
 
     let json = serde_json::to_value(&result).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     json_to_python(py, &json)
@@ -451,8 +446,7 @@ fn bulk_availability(
         .collect();
 
     let cb = build_progress_callback(progress);
-    let result =
-        py.allow_threads(|| rt.block_on(async { executor.execute(operations, cb).await }));
+    let result = py.allow_threads(|| rt.block_on(async { executor.execute(operations, cb).await }));
 
     let json = serde_json::to_value(&result).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     json_to_python(py, &json)
@@ -714,8 +708,7 @@ fn bulk_info(
         .collect();
 
     let cb = build_progress_callback(progress);
-    let result =
-        py.allow_threads(|| rt.block_on(async { executor.execute(operations, cb).await }));
+    let result = py.allow_threads(|| rt.block_on(async { executor.execute(operations, cb).await }));
 
     let json = serde_json::to_value(&result).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     json_to_python(py, &json)
