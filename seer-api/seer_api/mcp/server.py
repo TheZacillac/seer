@@ -12,6 +12,12 @@ from mcp.types import Tool, TextContent
 
 import seer
 
+# Configure root logging to INFO so operational milestones are visible.
+# Host environments can override via standard Python logging config.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
 logger = logging.getLogger(__name__)
 
 mcp = Server("seer")
@@ -483,6 +489,7 @@ async def execute_tool(name: str, arguments: dict[str, Any]) -> Any:
 
 async def main():
     """Run the MCP server."""
+    logger.info("MCP server started on stdio")
     async with stdio_server() as (read_stream, write_stream):
         await mcp.run(read_stream, write_stream, mcp.create_initialization_options())
 
