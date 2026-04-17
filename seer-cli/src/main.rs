@@ -78,9 +78,9 @@ Example Output (status operation):
   google.com,true,200,OK,Google,Google Trust Services,2025-02-15,75,2028-09-14,1332,MarkMonitor Inc.,true,142.250.185.46,2607:f8b0:4004:800::200e,,ns1.google.com;ns2.google.com,892,
 
 Example Output (lookup/whois/rdap operation):
-  domain,success,registrar,created,expires,updated,duration_ms,error
-  example.com,true,RESERVED-Internet Assigned Numbers Authority,1995-08-14,2025-08-13,2024-08-14,523,
-  google.com,true,MarkMonitor Inc.,1997-09-15,2028-09-14,2019-09-09,412,
+  domain,success,registrar,created,expires,updated,duration_ms,availability_verdict,error
+  example.com,true,RESERVED-Internet Assigned Numbers Authority,1995-08-14,2025-08-13,2024-08-14,523,,
+  google.com,true,MarkMonitor Inc.,1997-09-15,2028-09-14,2019-09-09,412,,
 
 Example Output (dig operation):
   domain,success,record_type,records,duration_ms,error
@@ -93,8 +93,8 @@ Example Output (avail operation):
   google.com,true,false,high,rdap,Domain is registered (status: client delete prohibited),412,
 
 Example Output (info operation):
-  domain,success,source,registrar,registrant,organization,created,expires,updated,nameservers,status,dnssec,...,whois_server,rdap_url,duration_ms,error
-  example.com,true,Both,RESERVED-Internet Assigned Numbers Authority,,Internet Assigned Numbers Authority,1995-08-14,2025-08-13,2024-08-14,a.iana-servers.net;b.iana-servers.net,client delete prohibited,signed,...,whois.iana.org,https://rdap.iana.org/domain/example.com,1523,
+  domain,success,source,registrar,registrant,organization,created,expires,updated,nameservers,status,dnssec,...,whois_server,rdap_url,availability_verdict,duration_ms,error
+  example.com,true,Both,RESERVED-Internet Assigned Numbers Authority,,Internet Assigned Numbers Authority,1995-08-14,2025-08-13,2024-08-14,a.iana-servers.net;b.iana-servers.net,client delete prohibited,signed,...,whois.iana.org,https://rdap.iana.org/domain/example.com,,1523,
 "#;
 
 #[derive(Parser)]

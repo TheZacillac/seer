@@ -55,7 +55,7 @@ pub fn bulk_results_to_csv(results: &[BulkResult], operation: &str) -> String {
             csv.push_str("domain,success,http_status,http_status_text,title,ssl_issuer,ssl_valid_until,ssl_days_remaining,domain_expires,domain_days_remaining,registrar,dns_resolves,dns_a_records,dns_aaaa_records,dns_cname,dns_nameservers,duration_ms,error\n");
         }
         "lookup" | "whois" | "rdap" => {
-            csv.push_str("domain,success,registrar,created,expires,updated,duration_ms,error\n");
+            csv.push_str("domain,success,registrar,created,expires,updated,duration_ms,availability_verdict,error\n");
         }
         "dig" | "dns" => {
             csv.push_str("domain,success,record_type,records,duration_ms,error\n");
@@ -69,7 +69,7 @@ pub fn bulk_results_to_csv(results: &[BulkResult], operation: &str) -> String {
             csv.push_str("domain,success,available,confidence,method,details,duration_ms,error\n");
         }
         "info" => {
-            csv.push_str("domain,success,source,registrar,registrant,organization,created,expires,updated,nameservers,status,dnssec,registrant_email,registrant_phone,registrant_address,registrant_country,admin_name,admin_organization,admin_email,admin_phone,tech_name,tech_organization,tech_email,tech_phone,whois_server,rdap_url,duration_ms,error\n");
+            csv.push_str("domain,success,source,registrar,registrant,organization,created,expires,updated,nameservers,status,dnssec,registrant_email,registrant_phone,registrant_address,registrant_country,admin_name,admin_organization,admin_email,admin_phone,tech_name,tech_organization,tech_email,tech_phone,whois_server,rdap_url,availability_verdict,duration_ms,error\n");
         }
         _ => {
             csv.push_str("domain,success,duration_ms,error\n");
@@ -206,8 +206,19 @@ pub fn bulk_results_to_csv(results: &[BulkResult], operation: &str) -> String {
                 } else {
                     Default::default()
                 };
+                let availability_verdict = match &result.data {
+                    Some(BulkResultData::Lookup(
+                        seer_core::lookup::LookupResult::Available { data, .. },
+                    )) => match data.confidence.as_str() {
+                        "high" => "available",
+                        "medium" => "likely_available",
+                        _ => "unknown",
+                    },
+                    _ => "",
+                };
+                let availability_verdict = escape_csv_field(availability_verdict);
                 csv.push_str(&format!(
-                    "{},{},{},{},{},{},{},{}\n",
+                    "{},{},{},{},{},{},{},{},{}\n",
                     domain,
                     success,
                     escape_csv_field(&registrar),
@@ -215,6 +226,7 @@ pub fn bulk_results_to_csv(results: &[BulkResult], operation: &str) -> String {
                     expires,
                     updated,
                     duration_ms,
+                    availability_verdict,
                     error
                 ));
             }
@@ -236,8 +248,9 @@ pub fn bulk_results_to_csv(results: &[BulkResult], operation: &str) -> String {
                     } else {
                         Default::default()
                     };
+                let availability_verdict = escape_csv_field("");
                 csv.push_str(&format!(
-                    "{},{},{},{},{},{},{},{}\n",
+                    "{},{},{},{},{},{},{},{},{}\n",
                     domain,
                     success,
                     escape_csv_field(&registrar),
@@ -245,6 +258,7 @@ pub fn bulk_results_to_csv(results: &[BulkResult], operation: &str) -> String {
                     expires,
                     updated,
                     duration_ms,
+                    availability_verdict,
                     error
                 ));
             }
@@ -255,8 +269,9 @@ pub fn bulk_results_to_csv(results: &[BulkResult], operation: &str) -> String {
                     } else {
                         Default::default()
                     };
+                let availability_verdict = escape_csv_field("");
                 csv.push_str(&format!(
-                    "{},{},{},{},{},{},{},{}\n",
+                    "{},{},{},{},{},{},{},{},{}\n",
                     domain,
                     success,
                     escape_csv_field(&registrar),
@@ -264,6 +279,7 @@ pub fn bulk_results_to_csv(results: &[BulkResult], operation: &str) -> String {
                     expires,
                     updated,
                     duration_ms,
+                    availability_verdict,
                     error
                 ));
             }
@@ -340,9 +356,16 @@ pub fn bulk_results_to_csv(results: &[BulkResult], operation: &str) -> String {
                 ));
             }
             "info" => {
+                let availability_verdict = match &result.data {
+                    Some(BulkResultData::Info(info)) => {
+                        info.availability_verdict.as_deref().unwrap_or("")
+                    }
+                    _ => "",
+                };
+                let availability_verdict = escape_csv_field(availability_verdict);
                 if let Some(BulkResultData::Info(ref info)) = result.data {
                     csv.push_str(&format!(
-                        "{},{},{:?},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+                        "{},{},{:?},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
                         domain,
                         success,
                         info.source,
@@ -369,13 +392,14 @@ pub fn bulk_results_to_csv(results: &[BulkResult], operation: &str) -> String {
                         escape_csv_field(info.tech_phone.as_deref().unwrap_or("")),
                         escape_csv_field(info.whois_server.as_deref().unwrap_or("")),
                         escape_csv_field(info.rdap_url.as_deref().unwrap_or("")),
+                        availability_verdict,
                         duration_ms,
                         error
                     ));
                 } else {
                     csv.push_str(&format!(
-                        "{},{},,,,,,,,,,,,,,,,,,,,,,,,,{},{}\n",
-                        domain, success, duration_ms, error
+                        "{},{},,,,,,,,,,,,,,,,,,,,,,,,,{},{},{}\n",
+                        domain, success, availability_verdict, duration_ms, error
                     ));
                 }
             }
