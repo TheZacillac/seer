@@ -8,7 +8,7 @@ use once_cell::sync::Lazy;
 use reqwest::Client;
 use serde::Deserialize;
 use tokio::sync::{Notify, RwLock};
-use tracing::{debug, instrument};
+use tracing::{debug, info, instrument};
 
 use super::types::RdapResponse;
 use crate::error::{Result, SeerError};
@@ -869,6 +869,14 @@ async fn load_bootstrap_data() -> Result<BootstrapData> {
             }
         }
     }
+
+    info!(
+        dns_entries = dns.len(),
+        ipv4_ranges = ipv4.len(),
+        ipv6_ranges = ipv6.len(),
+        asn_ranges = asn.len(),
+        "RDAP bootstrap loaded"
+    );
 
     Ok(BootstrapData {
         dns,
