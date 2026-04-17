@@ -2860,6 +2860,25 @@ fn build_diff_sections(diff: &crate::diff::DomainDiff) -> Vec<DiffSection> {
     vec![registration, dns_section, ssl_section]
 }
 
+/// Hard cap on a single value column (applies before wrapping).
+const DIFF_COLUMN_CAP: usize = 40;
+
+/// Computes the shared width for both value columns: the widest item across
+/// every row of every section plus the two domain-header lengths, capped at
+/// `DIFF_COLUMN_CAP`.
+#[allow(dead_code)]
+fn compute_column_width(sections: &[DiffSection], domain_a: &str, domain_b: &str) -> usize {
+    let mut widest = domain_a.chars().count().max(domain_b.chars().count());
+    for section in sections {
+        for row in &section.rows {
+            for v in row.a_values.iter().chain(row.b_values.iter()) {
+                widest = widest.max(v.chars().count());
+            }
+        }
+    }
+    widest.clamp(1, DIFF_COLUMN_CAP)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3137,5 +3156,75 @@ mod tests {
             ssl_labels,
             vec!["Issuer", "Valid Until", "Days Remaining", "Valid"]
         );
+    }
+
+    #[test]
+    fn compute_column_width_uses_widest_value_across_sections() {
+        let sections = vec![DiffSection {
+            title: "Registration",
+            rows: vec![
+                DiffRow {
+                    label: "Registrar",
+                    a_values: vec!["IANA".to_string()],
+                    b_values: vec!["MarkMonitor".to_string()],
+                    matches: false,
+                },
+                DiffRow {
+                    label: "Organization",
+                    a_values: vec!["—".to_string()],
+                    b_values: vec!["Google LLC".to_string()],
+                    matches: false,
+                },
+            ],
+        }];
+        // Widest item is "MarkMonitor" (11).
+        assert_eq!(compute_column_width(&sections, "a.com", "b.com"), 11);
+    }
+
+    #[test]
+    fn compute_column_width_respects_domain_width() {
+        let sections = vec![DiffSection {
+            title: "Registration",
+            rows: vec![DiffRow {
+                label: "Registrar",
+                a_values: vec!["x".to_string()],
+                b_values: vec!["y".to_string()],
+                matches: false,
+            }],
+        }];
+        // Domain "very-long-domain.example" is wider than any value.
+        let w = compute_column_width(&sections, "very-long-domain.example", "b.com");
+        assert_eq!(w, "very-long-domain.example".chars().count());
+    }
+
+    #[test]
+    fn compute_column_width_caps_at_40() {
+        let long_value = "x".repeat(100);
+        let sections = vec![DiffSection {
+            title: "Registration",
+            rows: vec![DiffRow {
+                label: "Registrar",
+                a_values: vec![long_value],
+                b_values: vec!["y".to_string()],
+                matches: false,
+            }],
+        }];
+        assert_eq!(compute_column_width(&sections, "a.com", "b.com"), 40);
+    }
+
+    #[test]
+    fn compute_column_width_minimum_sensible_default() {
+        // Even with tiny inputs, width should not be zero.
+        let sections = vec![DiffSection {
+            title: "Registration",
+            rows: vec![DiffRow {
+                label: "X",
+                a_values: vec!["a".to_string()],
+                b_values: vec!["b".to_string()],
+                matches: true,
+            }],
+        }];
+        let w = compute_column_width(&sections, "a", "b");
+        assert!(w >= 1);
     }
 }
