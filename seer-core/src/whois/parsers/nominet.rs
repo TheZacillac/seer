@@ -171,10 +171,8 @@ impl RegistryParser for NominetParser {
                 let value = trimmed.to_string();
 
                 match current_section {
-                    Section::Registrant if registrant.is_none() => {
-                        if !is_redacted(&value) {
-                            registrant = Some(value);
-                        }
+                    Section::Registrant if registrant.is_none() && !is_redacted(&value) => {
+                        registrant = Some(value);
                     }
                     Section::Registrar if registrar.is_none() => {
                         // Extract registrar name from format like "Example Ltd [Tag = EXAMPLE]"
@@ -198,10 +196,8 @@ impl RegistryParser for NominetParser {
                             nameservers.push(ns);
                         }
                     }
-                    Section::Status => {
-                        if !value.is_empty() && !status.contains(&value) {
-                            status.push(value);
-                        }
+                    Section::Status if !value.is_empty() && !status.contains(&value) => {
+                        status.push(value);
                     }
                     Section::Dnssec if dnssec.is_none() => {
                         dnssec = Some(value);

@@ -176,10 +176,8 @@ impl RegistryParser for SidnParser {
                         nameservers.push(ns);
                     }
                 }
-                Section::Registrar => {
-                    if registrar.is_none() {
-                        registrar = Some(trimmed.to_string());
-                    }
+                Section::Registrar if registrar.is_none() => {
+                    registrar = Some(trimmed.to_string());
                 }
                 _ => {}
             }
