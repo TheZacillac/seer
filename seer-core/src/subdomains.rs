@@ -30,14 +30,27 @@ impl Default for SubdomainEnumerator {
 /// issue a 30x response that reqwest would follow by default, turning the
 /// hardcoded CT-log fetch into an SSRF primitive. With `Policy::none()` any
 /// redirect surfaces as an error instead of a silent re-target.
-static HTTP_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
+///
+/// Wrapped in `Option` so a reqwest builder failure surfaces as a typed
+/// `SeerError::HttpError` via `client()` instead of a process panic at
+/// first use (library code must not `.expect()` on shared state).
+static HTTP_CLIENT: Lazy<Option<reqwest::Client>> = Lazy::new(|| {
     reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .user_agent("seer-domain-tool")
         .redirect(reqwest::redirect::Policy::none())
         .build()
-        .expect("Failed to create HTTP client")
+        .ok()
 });
+
+/// Returns a reference to the shared CT-log HTTP client, or a typed error
+/// if the builder failed at initialization time. Call sites use `client()?`
+/// instead of dereferencing the static directly.
+fn client() -> Result<&'static reqwest::Client> {
+    HTTP_CLIENT
+        .as_ref()
+        .ok_or_else(|| SeerError::HttpError("failed to initialize HTTP client".into()))
+}
 
 impl SubdomainEnumerator {
     pub fn new() -> Self {
@@ -67,7 +80,7 @@ impl SubdomainEnumerator {
         // Maximum response size for CT log queries (10 MB).
         const MAX_CT_RESPONSE_SIZE: usize = 10 * 1024 * 1024;
 
-        let response = HTTP_CLIENT
+        let response = client()?
             .get(&url)
             .send()
             .await

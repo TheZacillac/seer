@@ -42,15 +42,28 @@ const BOOTSTRAP_REFRESH_MIN_INTERVAL: Duration = Duration::from_secs(60);
 /// The bootstrap targets are hardcoded data.iana.org URLs, so this client
 /// does not need DNS-rebinding protection. Per-query RDAP requests build
 /// their own short-lived client that pins resolved IPs.
-static RDAP_HTTP_CLIENT: Lazy<Client> = Lazy::new(|| {
+///
+/// Wrapped in `Option` so a reqwest builder failure surfaces as a typed
+/// `SeerError::HttpError` via `rdap_http_client()` instead of a process
+/// panic at first use (library code must not `.expect()` on shared state).
+static RDAP_HTTP_CLIENT: Lazy<Option<Client>> = Lazy::new(|| {
     Client::builder()
         .timeout(DEFAULT_TIMEOUT)
         .connect_timeout(CONNECT_TIMEOUT)
         .user_agent("Seer/1.0 (RDAP Client)")
         .pool_max_idle_per_host(10)
         .build()
-        .expect("Failed to build RDAP HTTP client - invalid configuration")
+        .ok()
 });
+
+/// Returns a reference to the shared RDAP bootstrap HTTP client, or a typed
+/// error if the builder failed at initialization time. Call sites use
+/// `rdap_http_client()?` instead of dereferencing the static directly.
+fn rdap_http_client() -> Result<&'static Client> {
+    RDAP_HTTP_CLIENT
+        .as_ref()
+        .ok_or_else(|| SeerError::HttpError("failed to initialize HTTP client".into()))
+}
 
 /// Bootstrap cache with TTL support
 static BOOTSTRAP_CACHE: Lazy<RwLock<Option<CachedBootstrap>>> = Lazy::new(|| RwLock::new(None));
@@ -661,7 +674,7 @@ async fn load_bootstrap_data() -> Result<BootstrapData> {
     // SSRF validation is skipped here — these are hardcoded IANA URLs, not user input.
     // User-supplied URLs are still validated in query_rdap_internal().
 
-    let http = &*RDAP_HTTP_CLIENT;
+    let http = rdap_http_client()?;
 
     let dns_future = http.get(IANA_BOOTSTRAP_DNS).send();
     let ipv4_future = http.get(IANA_BOOTSTRAP_IPV4).send();
@@ -1078,8 +1091,10 @@ mod tests {
 
     #[test]
     fn test_rdap_http_client_is_configured() {
-        // Force lazy initialization and verify it doesn't panic
-        let _client = &*RDAP_HTTP_CLIENT;
+        // Force lazy initialization and verify it doesn't panic; the real
+        // reqwest builder is expected to succeed in any normal environment.
+        let client = rdap_http_client();
+        assert!(client.is_ok(), "RDAP HTTP client builder must succeed");
     }
 
     #[test]
