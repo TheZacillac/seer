@@ -46,15 +46,47 @@ impl Watchlist {
     }
 
     /// Loads the watchlist from disk, returning an empty list on any failure.
+    ///
+    /// When the file exists but fails to parse, it is renamed to
+    /// `<path>.corrupt` (preserving the user's data for recovery/forensics)
+    /// and a warning is logged — previously the file was silently
+    /// overwritten on the next save, dropping the user's watchlist.
     pub fn load() -> Self {
         let Some(path) = Self::path() else {
             return Self::default();
         };
+        Self::load_from_path(&path)
+    }
+
+    /// Like [`Self::load`] but reads from an explicit path. Split out so
+    /// tests can exercise the corrupt-file handling without depending on
+    /// the real `~/.seer/watchlist.toml` location.
+    pub(crate) fn load_from_path(path: &std::path::Path) -> Self {
         if !path.exists() {
             return Self::default();
         }
-        match std::fs::read_to_string(&path) {
-            Ok(content) => toml::from_str(&content).unwrap_or_default(),
+        match std::fs::read_to_string(path) {
+            Ok(content) => match toml::from_str::<Watchlist>(&content) {
+                Ok(w) => w,
+                Err(e) => {
+                    let backup = path.with_extension("corrupt");
+                    if let Err(rename_err) = std::fs::rename(path, &backup) {
+                        tracing::error!(
+                            path = %path.display(),
+                            error = %rename_err,
+                            "failed to back up corrupt watchlist",
+                        );
+                    } else {
+                        tracing::warn!(
+                            path = %path.display(),
+                            backup = %backup.display(),
+                            error = %e,
+                            "watchlist file corrupt; moved to backup",
+                        );
+                    }
+                    Watchlist::default()
+                }
+            },
             Err(_) => Self::default(),
         }
     }
@@ -241,6 +273,64 @@ mod tests {
 
         let parsed: Watchlist = toml::from_str(&toml_str).unwrap();
         assert_eq!(parsed.domains.len(), 2);
+    }
+
+    /// Creates a unique temporary file path for a load-from-disk test.
+    fn unique_temp_watchlist_path(tag: &str) -> PathBuf {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "seer-watchlist-test-{}-{}",
+            tag,
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        dir.push("watchlist.toml");
+        dir
+    }
+
+    #[test]
+    fn load_from_path_returns_default_and_backs_up_corrupt_file() {
+        let path = unique_temp_watchlist_path("corrupt");
+        let backup = path.with_extension("corrupt");
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&backup);
+
+        // TOML parsers reject stray garbage on the value side of `=`.
+        std::fs::write(&path, b"domains = not-an-array-\n").expect("seed corrupt watchlist file");
+
+        let loaded = Watchlist::load_from_path(&path);
+        assert!(
+            loaded.domains.is_empty(),
+            "corrupt watchlist must load as empty default"
+        );
+        assert!(
+            !path.exists(),
+            "original corrupt file should have been renamed away"
+        );
+        assert!(
+            backup.exists(),
+            "backup .corrupt file should exist at {}",
+            backup.display()
+        );
+
+        let _ = std::fs::remove_file(&backup);
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::remove_dir_all(parent);
+        }
+    }
+
+    #[test]
+    fn load_from_path_returns_default_when_missing() {
+        let path = unique_temp_watchlist_path("missing");
+        let _ = std::fs::remove_file(&path);
+
+        let loaded = Watchlist::load_from_path(&path);
+        assert!(loaded.domains.is_empty());
+
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::remove_dir_all(parent);
+        }
     }
 
     #[test]
