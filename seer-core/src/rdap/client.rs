@@ -676,20 +676,41 @@ async fn load_bootstrap_data() -> Result<BootstrapData> {
     const MAX_BOOTSTRAP_SIZE: usize = 10 * 1024 * 1024; // 10 MB
 
     async fn read_bootstrap(resp: reqwest::Response) -> Result<BootstrapResponse> {
+        // Bound the streaming-read loop with the same timeout used for RDAP
+        // queries. Without this, a slow or stalled IANA response (open TCP
+        // but no bytes arriving) could hang all RDAP lookups indefinitely
+        // because `ensure_bootstrap` awaits this future. Mirrors the pattern
+        // in `query_rdap_internal`.
         let mut body = Vec::new();
         let mut stream = resp.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| {
-                SeerError::RdapBootstrapError(format!("failed to read body: {}", e))
-            })?;
-            body.extend_from_slice(&chunk);
-            if body.len() > MAX_BOOTSTRAP_SIZE {
-                return Err(SeerError::RdapBootstrapError(format!(
-                    "bootstrap response too large (exceeds {} bytes)",
-                    MAX_BOOTSTRAP_SIZE
+        let streamed = tokio::time::timeout(DEFAULT_TIMEOUT, async {
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(|e| {
+                    SeerError::RdapBootstrapError(format!("failed to read body: {}", e))
+                })?;
+                body.extend_from_slice(&chunk);
+                if body.len() > MAX_BOOTSTRAP_SIZE {
+                    return Err(SeerError::RdapBootstrapError(format!(
+                        "bootstrap response too large (exceeds {} bytes)",
+                        MAX_BOOTSTRAP_SIZE
+                    )));
+                }
+            }
+            Ok::<(), SeerError>(())
+        })
+        .await;
+
+        match streamed {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                return Err(SeerError::Timeout(format!(
+                    "RDAP bootstrap body read timed out after {:?}",
+                    DEFAULT_TIMEOUT
                 )));
             }
         }
+
         serde_json::from_slice(&body).map_err(Into::into)
     }
 
