@@ -25,10 +25,16 @@ impl Default for SubdomainEnumerator {
 }
 
 /// Shared HTTP client for CT log queries (connection pooling).
+///
+/// Redirects are disabled: a compromised or hijacked crt.sh could otherwise
+/// issue a 30x response that reqwest would follow by default, turning the
+/// hardcoded CT-log fetch into an SSRF primitive. With `Policy::none()` any
+/// redirect surfaces as an error instead of a silent re-target.
 static HTTP_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
     reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .user_agent("seer-domain-tool")
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .expect("Failed to create HTTP client")
 });
