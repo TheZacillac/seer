@@ -10,6 +10,7 @@ pub mod error;
 pub mod history;
 pub mod logging;
 pub mod lookup;
+pub mod net;
 pub mod output;
 pub mod rdap;
 pub mod retry;
