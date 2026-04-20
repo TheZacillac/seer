@@ -387,7 +387,15 @@ struct ProgressPipe {
 }
 
 impl ProgressPipe {
-    fn new(py_cb: Py<PyAny>) -> Self {
+    /// Construct the pipe and spawn the drainer thread.
+    ///
+    /// Returns `Err` if the OS refuses to spawn the drainer (typically
+    /// resource exhaustion). Propagating this as a `PyErr` is mandatory:
+    /// every other `block_on` in this module is wrapped in `catch_unwind`
+    /// because a panic unwinding across the FFI boundary is UB. An
+    /// `.expect()` here would bypass that protection and abort the Python
+    /// process on a transient failure.
+    fn new(py_cb: Py<PyAny>) -> Result<Self, PyErr> {
         // Bounded channel. 1024 is deep enough to smooth over brief GIL
         // contention but shallow enough that a pathologically slow
         // callback causes `try_send` to drop events rather than ballooning
@@ -412,11 +420,13 @@ impl ProgressPipe {
                     });
                 }
             })
-            .expect("failed to spawn progress drainer thread");
-        Self {
+            .map_err(|e| {
+                PyRuntimeError::new_err(format!("failed to spawn progress drainer thread: {e}"))
+            })?;
+        Ok(Self {
             tx: Some(tx),
             drainer: Some(drainer),
-        }
+        })
     }
 
     /// Non-blocking send. Drops the event if the channel is full or the
@@ -453,23 +463,33 @@ impl Drop for ProgressPipe {
 /// The returned callback posts to a `ProgressPipe` and never touches the
 /// GIL, so Tokio workers cannot deadlock on GIL contention when the
 /// Python callback is slow. See [`ProgressPipe`] for the full rationale.
+///
+/// Returns `Err` if pipe construction fails (e.g. the OS refuses to spawn
+/// the drainer thread). Callers propagate the error with `?` so the Python
+/// caller sees a `RuntimeError` rather than a panic across FFI.
 fn build_progress_callback(
     progress: Option<Py<PyAny>>,
-) -> Option<seer_core::bulk::ProgressCallback> {
-    progress.map(|py_cb| {
-        // `Arc` so the pipe (which owns the drainer thread) lives as long
-        // as the callback itself. When the executor drops this Box at the
-        // end of the bulk run, the Arc's refcount hits zero, the
-        // ProgressPipe drops, the sender closes, and the drainer exits.
-        let pipe = std::sync::Arc::new(ProgressPipe::new(py_cb));
-        Box::new(move |completed: usize, total: usize, domain: &str| {
-            pipe.send(ProgressEvent {
-                completed,
-                total,
-                domain: domain.to_string(),
-            });
-        }) as seer_core::bulk::ProgressCallback
-    })
+) -> PyResult<Option<seer_core::bulk::ProgressCallback>> {
+    match progress {
+        None => Ok(None),
+        Some(py_cb) => {
+            // `Arc` so the pipe (which owns the drainer thread) lives as
+            // long as the callback itself. When the executor drops this
+            // Box at the end of the bulk run, the Arc's refcount hits
+            // zero, the ProgressPipe drops, the sender closes, and the
+            // drainer exits.
+            let pipe = std::sync::Arc::new(ProgressPipe::new(py_cb)?);
+            Ok(Some(
+                Box::new(move |completed: usize, total: usize, domain: &str| {
+                    pipe.send(ProgressEvent {
+                        completed,
+                        total,
+                        domain: domain.to_string(),
+                    });
+                }) as seer_core::bulk::ProgressCallback,
+            ))
+        }
+    }
 }
 
 #[pyfunction]
@@ -487,7 +507,7 @@ fn bulk_lookup(
         .map(|domain| BulkOperation::Lookup { domain })
         .collect();
 
-    let cb = build_progress_callback(progress);
+    let cb = build_progress_callback(progress)?;
     let result = run_async_infallible(py, async move { executor.execute(operations, cb).await })?;
 
     let json = serialize_response(&result)?;
@@ -509,7 +529,7 @@ fn bulk_whois(
         .map(|domain| BulkOperation::Whois { domain })
         .collect();
 
-    let cb = build_progress_callback(progress);
+    let cb = build_progress_callback(progress)?;
     let result = run_async_infallible(py, async move { executor.execute(operations, cb).await })?;
 
     let json = serialize_response(&result)?;
@@ -539,7 +559,7 @@ fn bulk_dig(
         })
         .collect();
 
-    let cb = build_progress_callback(progress);
+    let cb = build_progress_callback(progress)?;
     let result = run_async_infallible(py, async move { executor.execute(operations, cb).await })?;
 
     let json = serialize_response(&result)?;
@@ -569,7 +589,7 @@ fn bulk_propagation(
         })
         .collect();
 
-    let cb = build_progress_callback(progress);
+    let cb = build_progress_callback(progress)?;
     let result = run_async_infallible(py, async move { executor.execute(operations, cb).await })?;
 
     let json = serialize_response(&result)?;
@@ -599,7 +619,7 @@ fn bulk_status(
         .map(|domain| BulkOperation::Status { domain })
         .collect();
 
-    let cb = build_progress_callback(progress);
+    let cb = build_progress_callback(progress)?;
     let result = run_async_infallible(py, async move { executor.execute(operations, cb).await })?;
 
     let json = serialize_response(&result)?;
@@ -621,7 +641,7 @@ fn bulk_availability(
         .map(|domain| BulkOperation::Avail { domain })
         .collect();
 
-    let cb = build_progress_callback(progress);
+    let cb = build_progress_callback(progress)?;
     let result = run_async_infallible(py, async move { executor.execute(operations, cb).await })?;
 
     let json = serialize_response(&result)?;
@@ -812,7 +832,7 @@ fn bulk_info(
         .map(|domain| BulkOperation::Info { domain })
         .collect();
 
-    let cb = build_progress_callback(progress);
+    let cb = build_progress_callback(progress)?;
     let result = run_async_infallible(py, async move { executor.execute(operations, cb).await })?;
 
     let json = serialize_response(&result)?;
