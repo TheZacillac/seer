@@ -2,10 +2,17 @@
 
 One end-to-end test over /status/bulk/stream proves the shared streaming
 helper works. Other /bulk/stream endpoints use the same helper.
+
+The end-to-end test hits real DNS/HTTP for example.com and iana.org and is
+gated behind SEER_LIVE_TESTS=1. The error-sanitization tests mock seer and
+run unconditionally.
 """
 
 import json
+import os
 from unittest.mock import patch
+
+import pytest
 
 
 def _parse_sse(body: str) -> list[dict]:
@@ -25,8 +32,15 @@ def _parse_sse(body: str) -> list[dict]:
     return events
 
 
+@pytest.mark.skipif(
+    os.environ.get("SEER_LIVE_TESTS") != "1",
+    reason="live network test; set SEER_LIVE_TESTS=1 to run",
+)
 def test_status_bulk_stream_emits_expected_event_sequence(client):
-    """Submitting 2 domains should produce 2 progress, 2 item, 1 done event."""
+    """Submitting 2 domains should produce 2 progress, 2 item, 1 done event.
+
+    Hits real network (example.com + iana.org); opt-in only.
+    """
     resp = client.post(
         "/status/bulk/stream",
         json={"domains": ["example.com", "iana.org"], "concurrency": 2},

@@ -605,6 +605,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "live network; run with --ignored or SEER_LIVE_TESTS=1"]
     async fn test_live_dnssec_check_cloudflare() {
         let checker = DnssecChecker::new();
         let report = checker.check("cloudflare.com").await.unwrap();
@@ -633,6 +634,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "live network; run with --ignored or SEER_LIVE_TESTS=1"]
     async fn test_live_dnssec_check_insecure() {
         let checker = DnssecChecker::new();
         // wikipedia.org does not have DNSSEC (no DS or DNSKEY records)

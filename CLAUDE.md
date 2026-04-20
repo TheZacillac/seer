@@ -242,7 +242,7 @@ cd seer-py && maturin build --release
 ### Running Tests
 
 ```bash
-# Run all Rust tests
+# Run all Rust tests (hermetic only; live-network tests are skipped)
 cargo test
 
 # Run tests for specific package
@@ -251,10 +251,29 @@ cargo test -p seer-cli
 
 # Run Python tests
 cd seer-api && pytest
+cd seer-py && pytest
 
 # Run with logging
 RUST_LOG=debug cargo test
 ```
+
+#### Running live-network tests
+
+Tests that hit real DNS/HTTP/WHOIS servers (cloudflare.com, wikipedia.org,
+example.com, iana.org, etc.) are marked `#[ignore]` in Rust and
+`@pytest.mark.skipif` in Python. They are opt-in so `cargo test` and
+`pytest` stay hermetic by default:
+
+```bash
+# Run only the live-network Rust tests
+cargo test --workspace -- --ignored
+
+# Run Python live-network tests
+SEER_LIVE_TESTS=1 pytest
+```
+
+These tests require network connectivity and can fail transiently if the
+external services change behavior. They are not run in CI by default.
 
 ### Running the Applications
 
