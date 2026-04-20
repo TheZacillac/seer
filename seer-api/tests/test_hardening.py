@@ -445,3 +445,90 @@ def test_docs_enabled_when_flag_set(monkeypatch):
 
     monkeypatch.delenv("SEER_DOCS_ENABLED")
     importlib.reload(main)
+
+
+# ---------------------------------------------------------------------------
+# D8 (M8): typed exception classification — ValueError -> 400,
+# TimeoutError -> 504, ConnectionError -> 502, else -> 500.
+# ---------------------------------------------------------------------------
+
+
+def test_http_status_for_classifies_by_type():
+    from seer_api.errors import http_status_for
+
+    assert http_status_for(ValueError("bad input")) == 400
+    assert http_status_for(TimeoutError("upstream timed out")) == 504
+    assert http_status_for(ConnectionError("upstream unreachable")) == 502
+    assert http_status_for(RuntimeError("something broke")) == 500
+    assert http_status_for(Exception("other")) == 500
+
+
+def test_safe_error_message_strips_unknown_types():
+    from seer_api.errors import safe_error_message
+
+    # Known exception types pass through with typed mapping.
+    assert safe_error_message(ValueError("missing field foo")) == "missing field foo"
+    assert safe_error_message(TimeoutError("connection hung")) == "request timed out"
+    assert (
+        safe_error_message(ConnectionError("refused"))
+        == "upstream connection failed"
+    )
+    # Unknown types fall back — the internal detail is NOT leaked.
+    msg = safe_error_message(RuntimeError("/home/secret/path was leaked"))
+    assert msg == "Request failed"
+    assert "secret" not in msg
+
+
+def test_value_error_returns_400(client, monkeypatch):
+    """A ValueError raised from the underlying seer call surfaces as 400."""
+    import seer
+
+    def _raising(*args, **kwargs):
+        raise ValueError("invalid domain format: ' '")
+
+    monkeypatch.setattr(seer, "lookup", _raising, raising=False)
+    resp = client.get("/lookup/example.com")
+    assert resp.status_code == 400
+    assert "invalid domain" in resp.json()["detail"].lower()
+
+
+def test_timeout_returns_504(client, monkeypatch):
+    """A TimeoutError surfaces as 504 Gateway Timeout."""
+    import seer
+
+    def _raising(*args, **kwargs):
+        raise TimeoutError("upstream whois server did not respond")
+
+    monkeypatch.setattr(seer, "lookup", _raising, raising=False)
+    resp = client.get("/lookup/example.com")
+    assert resp.status_code == 504
+    assert resp.json()["detail"] == "request timed out"
+
+
+def test_connection_error_returns_502(client, monkeypatch):
+    """A ConnectionError surfaces as 502 Bad Gateway."""
+    import seer
+
+    def _raising(*args, **kwargs):
+        raise ConnectionError("upstream refused")
+
+    monkeypatch.setattr(seer, "lookup", _raising, raising=False)
+    resp = client.get("/lookup/example.com")
+    assert resp.status_code == 502
+    assert resp.json()["detail"] == "upstream connection failed"
+
+
+def test_runtime_error_returns_500(client, monkeypatch):
+    """An unclassified RuntimeError surfaces as 500 without leaking detail."""
+    import seer
+
+    def _raising(*args, **kwargs):
+        raise RuntimeError("secret internal path /tmp/abc123 exploded")
+
+    monkeypatch.setattr(seer, "lookup", _raising, raising=False)
+    resp = client.get("/lookup/example.com")
+    assert resp.status_code == 500
+    detail = resp.json()["detail"]
+    assert "secret" not in detail
+    assert "/tmp" not in detail
+    assert detail == "Lookup failed"
