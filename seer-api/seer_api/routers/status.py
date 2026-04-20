@@ -7,7 +7,7 @@ from fastapi import APIRouter, Path, Request
 from pydantic import BaseModel, Field
 from seer_api.errors import http_error
 from seer_api.limiting import limiter
-from seer_api.ssrf import guard as ssrf_guard
+from seer_api.ssrf import guard_async as ssrf_guard_async
 from seer_api.streaming import stream_bulk
 
 import seer
@@ -47,7 +47,7 @@ async def check_status(
         - SSL certificate details (issuer, validity, days until expiry)
         - Domain registration expiration (days until expiry, registrar)
     """
-    ssrf_guard(domain, 443)
+    await ssrf_guard_async(domain, 443)
     try:
         loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(None, seer.status, domain)
@@ -69,7 +69,7 @@ async def bulk_status(request: Request, body: BulkStatusRequest):
         List of status results for each domain
     """
     for d in body.domains:
-        ssrf_guard(d, 443)
+        await ssrf_guard_async(d, 443)
     try:
         loop = asyncio.get_running_loop()
         results = await loop.run_in_executor(
@@ -85,7 +85,7 @@ async def bulk_status(request: Request, body: BulkStatusRequest):
 async def bulk_status_stream(request: Request, body: BulkStatusRequest):
     """Stream bulk status checks as Server-Sent Events."""
     for d in body.domains:
-        ssrf_guard(d, 443)
+        await ssrf_guard_async(d, 443)
     try:
         return await stream_bulk(seer.bulk_status, body.domains, body.concurrency)
     except Exception as e:

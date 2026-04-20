@@ -297,6 +297,51 @@ def test_ssrf_guard_bulk_dns_rejects_reserved(client):
     assert resp.status_code == 400
 
 
+def test_guard_async_yields_event_loop(monkeypatch):
+    """H1: guard_async must offload the blocking validator to the executor
+    so concurrent requests do not serialize on the event loop.
+
+    The inner `seer.validate_public_host` is a PyO3 function that calls
+    `block_on` — running it bare from an async def pins the event loop
+    thread. We monkeypatch it to a blocking `time.sleep` so the effect is
+    deterministic, then verify that 5 concurrent `guard_async` calls
+    complete in close to max(durations), not sum(durations).
+    """
+    import asyncio
+    import time
+
+    import seer
+
+    per_call_delay = 0.15  # seconds
+    concurrency = 5
+
+    def _slow_validate(host: str, port: int) -> None:
+        time.sleep(per_call_delay)
+
+    monkeypatch.setattr(seer, "validate_public_host", _slow_validate, raising=False)
+
+    from seer_api.ssrf import guard_async
+
+    async def run_all():
+        await asyncio.gather(
+            *(guard_async("example.com", 443) for _ in range(concurrency))
+        )
+
+    start = time.perf_counter()
+    asyncio.run(run_all())
+    elapsed = time.perf_counter() - start
+
+    # Serial execution would take ~per_call_delay * concurrency = 0.75s.
+    # Parallel execution on the default thread pool should finish in
+    # close to per_call_delay. Use 2x per_call_delay as a generous ceiling
+    # to absorb scheduler jitter on loaded CI runners while still catching
+    # the serial-vs-parallel regression.
+    assert elapsed < per_call_delay * 2, (
+        f"guard_async appears to serialize: {elapsed:.3f}s for {concurrency} "
+        f"concurrent calls (expected < {per_call_delay * 2:.3f}s)"
+    )
+
+
 def test_mcp_ssrf_guard_rejects_reserved():
     """MCP tool handlers must reject reserved IPs before dispatching to seer."""
     import asyncio
