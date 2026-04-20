@@ -38,25 +38,45 @@ _AUTH_EXEMPT_PATHS = frozenset({"/health", "/docs", "/openapi.json", "/redoc"})
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    """Log deployment-mode warnings at startup."""
-    # M1: in-memory rate limit with multiple workers is per-worker.
+    """Fail-closed startup checks.
+
+    Refuses to start when the combination of settings would create an obvious
+    footgun deployment:
+      * Non-loopback bind without SEER_API_KEY would expose the API publicly
+        with no auth. We hard-fail rather than log a warning (C6).
+      * Multi-worker deployment with the default in-memory rate-limit store
+        would silently multiply the effective rate limit by the worker count.
+        We hard-fail to force operators to configure a shared store (H10).
+    """
+    # H10: in-memory rate limit with multiple workers is per-worker and
+    # therefore bypassable by rotating through workers. Refuse to start.
     storage_uri = os.environ.get("SEER_RATE_LIMIT_STORAGE", "memory://")
-    workers = int(os.environ.get("WEB_CONCURRENCY", os.environ.get("UVICORN_WORKERS", "1")))
-    if storage_uri == "memory://" and workers > 1:
-        log.warning(
-            "Rate limiter is using in-memory storage with %d workers - "
-            "limits will be per-worker. Set SEER_RATE_LIMIT_STORAGE=redis://... "
-            "for cross-worker enforcement.",
+    workers = int(
+        os.environ.get("WEB_CONCURRENCY", os.environ.get("UVICORN_WORKERS", "1"))
+    )
+    if workers > 1 and storage_uri == "memory://":
+        log.error(
+            "Multi-worker deployment (WEB_CONCURRENCY=%d) requires "
+            "SEER_RATE_LIMIT_STORAGE (e.g. redis://host:6379). Refusing to "
+            "start with an in-memory limiter that would be bypassed "
+            "per-worker.",
             workers,
         )
+        raise RuntimeError(
+            "refusing to start: multi-worker deployment requires "
+            "SEER_RATE_LIMIT_STORAGE"
+        )
 
-    # M2: bound to all interfaces without an API key.
+    # C6: bound to a non-loopback interface without any API key is an open
+    # proxy. Hard-fail rather than warn.
     host = os.environ.get("SEER_HOST", "127.0.0.1")
-    if host in ("0.0.0.0", "::") and not API_KEY:
-        log.warning(
-            "seer-api bound to %s without SEER_API_KEY - service is open to the network",
+    if host != "127.0.0.1" and not API_KEY:
+        log.error(
+            "seer-api is bound to %s with no SEER_API_KEY set. Refusing to "
+            "start. Set SEER_API_KEY or SEER_HOST=127.0.0.1.",
             host,
         )
+        raise RuntimeError("refusing to start: public bind without auth")
     yield
 
 
@@ -169,10 +189,16 @@ async def get_metrics(request: Request):
 
 
 def run():
-    """Run the API server."""
+    """Run the API server.
+
+    Defaults to binding on the loopback interface (127.0.0.1). Set
+    SEER_HOST=0.0.0.0 to bind publicly — but note that doing so also
+    requires SEER_API_KEY to be set, or the lifespan hook will refuse
+    to start.
+    """
     import uvicorn
 
-    host = os.environ.get("SEER_HOST", "0.0.0.0")
+    host = os.environ.get("SEER_HOST", "127.0.0.1")
     port = int(os.environ.get("SEER_PORT", "8000"))
     reload = os.environ.get("SEER_RELOAD", "false").lower() in ("true", "1", "yes")
 

@@ -331,3 +331,88 @@ def test_mcp_call_tool_returns_invalid_input_for_ssrf():
     assert len(result) == 1
     assert result[0].text.startswith("Invalid input:")
     assert "reserved" in result[0].text.lower()
+
+
+# ---------------------------------------------------------------------------
+# D1 (C6): fail-closed startup — public bind requires SEER_API_KEY
+# ---------------------------------------------------------------------------
+
+
+def test_refuses_public_bind_without_auth(monkeypatch):
+    """Binding to a non-loopback host without an API key must fail the lifespan."""
+    monkeypatch.setenv("SEER_HOST", "0.0.0.0")
+    monkeypatch.delenv("SEER_API_KEY", raising=False)
+    import seer_api.main as main
+
+    importlib.reload(main)
+    with pytest.raises(RuntimeError, match="public bind without auth"):
+        with TestClient(main.app):
+            pass  # lifespan runs on __enter__
+
+    monkeypatch.delenv("SEER_HOST")
+    importlib.reload(main)
+
+
+def test_public_bind_with_auth_starts(monkeypatch):
+    """With SEER_API_KEY set, public bind is allowed."""
+    monkeypatch.setenv("SEER_HOST", "0.0.0.0")
+    monkeypatch.setenv("SEER_API_KEY", "secret")
+    import seer_api.main as main
+
+    importlib.reload(main)
+    # Should not raise
+    with TestClient(main.app) as c:
+        assert c.get("/health").status_code == 200
+
+    monkeypatch.delenv("SEER_HOST")
+    monkeypatch.delenv("SEER_API_KEY")
+    importlib.reload(main)
+
+
+def test_loopback_bind_without_auth_starts(monkeypatch):
+    """Loopback bind without SEER_API_KEY is the safe default."""
+    monkeypatch.setenv("SEER_HOST", "127.0.0.1")
+    monkeypatch.delenv("SEER_API_KEY", raising=False)
+    import seer_api.main as main
+
+    importlib.reload(main)
+    with TestClient(main.app) as c:
+        assert c.get("/health").status_code == 200
+
+    monkeypatch.delenv("SEER_HOST")
+    importlib.reload(main)
+
+
+# ---------------------------------------------------------------------------
+# D7 (H10): multi-worker without shared rate-limit store is refused
+# ---------------------------------------------------------------------------
+
+
+def test_refuses_multi_worker_without_shared_store(monkeypatch):
+    """WEB_CONCURRENCY>1 with memory:// storage must hard-fail at startup."""
+    monkeypatch.setenv("WEB_CONCURRENCY", "4")
+    monkeypatch.delenv("SEER_RATE_LIMIT_STORAGE", raising=False)
+    import seer_api.main as main
+
+    importlib.reload(main)
+    with pytest.raises(RuntimeError, match="SEER_RATE_LIMIT_STORAGE"):
+        with TestClient(main.app):
+            pass
+
+    monkeypatch.delenv("WEB_CONCURRENCY")
+    importlib.reload(main)
+
+
+def test_multi_worker_with_shared_store_starts(monkeypatch):
+    """WEB_CONCURRENCY>1 with a non-memory storage URI is allowed."""
+    monkeypatch.setenv("WEB_CONCURRENCY", "4")
+    monkeypatch.setenv("SEER_RATE_LIMIT_STORAGE", "redis://localhost:6379")
+    import seer_api.main as main
+
+    importlib.reload(main)
+    with TestClient(main.app) as c:
+        assert c.get("/health").status_code == 200
+
+    monkeypatch.delenv("WEB_CONCURRENCY")
+    monkeypatch.delenv("SEER_RATE_LIMIT_STORAGE")
+    importlib.reload(main)

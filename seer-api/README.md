@@ -50,9 +50,23 @@ pip install -e .
 seer-api
 ```
 
-Server runs on `http://localhost:8000` with auto-reload enabled.
+Server runs on `http://127.0.0.1:8000` (loopback-only by default).
+
+### Breaking change: deployment defaults
+
+- **Default bind is `127.0.0.1`** (was `0.0.0.0`). To bind publicly,
+  set both `SEER_HOST=0.0.0.0` **and** `SEER_API_KEY=<token>`. The
+  server refuses to start on a non-loopback host without an auth key.
+- **API documentation endpoints are off by default.** Set
+  `SEER_DOCS_ENABLED=true` to re-enable `/docs`, `/redoc`, and
+  `/openapi.json`.
+- **Multi-worker deployments require a shared rate-limit store.**
+  With `WEB_CONCURRENCY>1`, set `SEER_RATE_LIMIT_STORAGE=redis://...`
+  or the server will refuse to start.
 
 ### API Documentation
+
+Available only when `SEER_DOCS_ENABLED=true`:
 
 - Swagger UI: `http://localhost:8000/docs`
 - ReDoc: `http://localhost:8000/redoc`
@@ -218,8 +232,8 @@ Add to `claude_desktop_config.json`:
 ### Running in Development
 
 ```bash
-# REST API with auto-reload
-uvicorn seer_api.main:app --reload --host 0.0.0.0 --port 8000
+# REST API with auto-reload (loopback only)
+uvicorn seer_api.main:app --reload --host 127.0.0.1 --port 8000
 
 # MCP server
 python -m seer_api.mcp.server

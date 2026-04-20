@@ -1122,6 +1122,31 @@ Before committing:
 |----------|-------------|---------|
 | `RUST_LOG` | Logging level (trace, debug, info, warn, error) | - |
 | `SEER_CORS_ORIGINS` | Comma-separated allowed CORS origins for API | `*` |
+| `SEER_HOST` | API bind host. Non-loopback requires `SEER_API_KEY`. | `127.0.0.1` |
+| `SEER_PORT` | API bind port | `8000` |
+| `SEER_API_KEY` | Bearer token required for all non-`/health` requests | — |
+| `SEER_DOCS_ENABLED` | Expose `/docs`, `/redoc`, `/openapi.json` | `false` |
+| `SEER_METRICS_ENABLED` | Expose `/metrics` to non-loopback clients | `false` |
+| `SEER_TRUST_PROXY` | Trust `X-Forwarded-For` when peer is in `SEER_TRUSTED_PROXY_IPS` | `false` |
+| `SEER_TRUSTED_PROXY_IPS` | Comma-separated list of IPs allowed to set XFF | — |
+| `SEER_RATE_LIMIT` | Default slowapi rate limit | `30/minute` |
+| `SEER_RATE_LIMIT_STORAGE` | Rate-limit storage URI (e.g. `redis://host:6379`) | `memory://` |
+| `WEB_CONCURRENCY` | Uvicorn worker count. `>1` requires non-`memory://` store | `1` |
+
+### Breaking change (2026-04-20)
+
+The API default bind changed from `0.0.0.0` to `127.0.0.1` and the
+lifespan hook now hard-fails the startup in two situations that
+previously only logged a warning:
+
+1. `SEER_HOST != 127.0.0.1` without `SEER_API_KEY` set — public bind
+   without auth is refused.
+2. `WEB_CONCURRENCY > 1` with `SEER_RATE_LIMIT_STORAGE=memory://` —
+   per-worker limiters would be bypassable, so multi-worker deployments
+   must configure a shared store (e.g. Redis).
+
+Additionally, `/docs`, `/redoc`, and `/openapi.json` are now disabled by
+default; set `SEER_DOCS_ENABLED=true` to re-enable.
 
 ---
 
