@@ -49,6 +49,7 @@ from seer._seer import (
     diff,
     info,
     bulk_info,
+    validate_public_host,
 )
 
 # Forward Rust tracing events into Python logging.
@@ -86,6 +87,7 @@ __all__ = [
     "diff",
     "info",
     "bulk_info",
+    "validate_public_host",
 ]
 
 

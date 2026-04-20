@@ -108,6 +108,20 @@ fn get_domain_differ() -> &'static DomainDiffer {
     INSTANCE.get_or_init(DomainDiffer::new)
 }
 
+/// Validate that a host is safe to connect to (not a reserved/loopback/private IP).
+///
+/// Wraps `seer_core::net::validate_public_host`. Raises `ValueError` if the host
+/// is an IP literal in a reserved range, or if it resolves to such an address.
+/// Used by `seer-api` to block SSRF before dispatching outbound calls.
+#[pyfunction]
+fn validate_public_host(py: Python<'_>, host: &str, port: u16) -> PyResult<()> {
+    let rt = get_runtime();
+    py.allow_threads(|| {
+        rt.block_on(async { seer_core::net::validate_public_host(host, port).await })
+            .map_err(|e| PyValueError::new_err(e.to_string()))
+    })
+}
+
 #[pyfunction]
 fn lookup(py: Python<'_>, domain: String) -> PyResult<PyObject> {
     let rt = get_runtime();
@@ -758,6 +772,7 @@ fn init_rust_logging() {
 #[pymodule]
 fn _seer(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(init_rust_logging, m)?)?;
+    m.add_function(wrap_pyfunction!(validate_public_host, m)?)?;
     m.add_function(wrap_pyfunction!(lookup, m)?)?;
     m.add_function(wrap_pyfunction!(whois, m)?)?;
     m.add_function(wrap_pyfunction!(rdap_domain, m)?)?;
