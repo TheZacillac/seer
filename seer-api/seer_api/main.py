@@ -12,8 +12,8 @@ from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 
 from . import __version__
-from .limiting import get_client_ip, limiter
-from .middleware import RequestLoggingMiddleware, metrics
+from .limiting import limiter
+from .middleware import MaxBodySizeMiddleware, RequestLoggingMiddleware, metrics
 from .routers import lookup, whois, rdap, dns, propagation, status
 
 # Configure structured logging via the unified Arcanum logging module.
@@ -125,6 +125,11 @@ app.add_middleware(
 # Add request logging middleware
 app.add_middleware(RequestLoggingMiddleware)
 
+# Body size cap — reject oversized payloads with 413 before they hit
+# any router. Default 64KB is generous for a 100-domain bulk request
+# (see middleware.DEFAULT_MAX_BODY_BYTES). M6.
+app.add_middleware(MaxBodySizeMiddleware, max_bytes=64 * 1024)
+
 
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
@@ -179,19 +184,22 @@ async def health():
 
 
 @app.get("/metrics")
-@limiter.exempt
+@limiter.limit("10/minute")
 async def get_metrics(request: Request):
     """Request metrics endpoint for observability.
 
-    Restricted to localhost when SEER_METRICS_ENABLED is not set.
+    Restricted to localhost when SEER_METRICS_ENABLED is not set. The
+    localhost gate checks ``request.client.host`` directly (the socket
+    peer) rather than routing through ``get_client_ip``, because the
+    proxy-aware helper trusts X-Forwarded-For and is therefore
+    spoofable by remote clients. Metrics must remain tied to the actual
+    TCP peer. Rate-limited independently of the auth gate to prevent
+    trivial stats-scraping amplification (H12, M9).
     """
     metrics_enabled = os.environ.get("SEER_METRICS_ENABLED", "").lower() in ("1", "true", "yes")
     if not metrics_enabled:
-        # Use the same proxy-aware client-IP resolution as the rate limiter,
-        # so deployments behind a reverse proxy with SEER_TRUST_PROXY=true
-        # see the real client IP instead of 127.0.0.1.
-        client_host = get_client_ip(request)
-        if client_host not in ("127.0.0.1", "::1", "localhost"):
+        peer = request.client.host if request.client else ""
+        if peer not in ("127.0.0.1", "::1"):
             from fastapi import HTTPException
             raise HTTPException(status_code=403, detail="Metrics endpoint is disabled")
     return metrics.snapshot()

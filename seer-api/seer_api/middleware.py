@@ -1,4 +1,4 @@
-"""Request logging and observability middleware."""
+"""Request logging, body-size, and observability middleware."""
 
 from __future__ import annotations
 
@@ -10,6 +10,107 @@ from collections import defaultdict
 
 from fastapi import Request, Response
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
+from starlette.types import ASGIApp, Receive, Scope, Send
+
+
+# Default 64KB body cap — big enough for a bulk request of 100 domains
+# (each bounded at 253 chars) with a bit of headroom, small enough to
+# block the DoS vector where a 10MB JSON blob blocks the event loop
+# while the parser chews through it.
+DEFAULT_MAX_BODY_BYTES = 64 * 1024
+
+
+class MaxBodySizeMiddleware:
+    """Reject any request whose body exceeds ``max_bytes`` with 413.
+
+    Two layers of enforcement:
+
+    1. ``Content-Length`` header — if present and over the cap, reject
+       before reading the body at all. Fast-path for clients that
+       advertise their size honestly.
+    2. Streaming byte-count — chunked requests and clients that lie
+       about Content-Length are handled by wrapping ``receive`` and
+       truncating the body after ``max_bytes``.
+
+    Implemented as a bare ASGI middleware (not
+    ``BaseHTTPMiddleware``) because we need to short-circuit the
+    response before the request body is buffered (M6).
+    """
+
+    def __init__(self, app: ASGIApp, max_bytes: int = DEFAULT_MAX_BODY_BYTES) -> None:
+        self.app = app
+        self.max_bytes = max_bytes
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        # Fast path: honest Content-Length header.
+        headers = dict(scope.get("headers") or [])
+        content_length = headers.get(b"content-length")
+        if content_length:
+            try:
+                if int(content_length) > self.max_bytes:
+                    await self._send_too_large(send)
+                    return
+            except ValueError:
+                # Malformed Content-Length — let Starlette reject it.
+                pass
+
+        # Streaming path: count bytes as we read. If we blow past the
+        # cap mid-stream, reply 413 immediately and stop forwarding.
+        total = 0
+        over_limit = False
+
+        async def receive_wrapper() -> dict:
+            nonlocal total, over_limit
+            message = await receive()
+            if message.get("type") == "http.request":
+                body = message.get("body") or b""
+                total += len(body)
+                if total > self.max_bytes:
+                    over_limit = True
+                    # Drain the rest so we don't leave bytes in the queue.
+                    return {
+                        "type": "http.request",
+                        "body": b"",
+                        "more_body": False,
+                    }
+            return message
+
+        sent_response = False
+
+        async def send_wrapper(message: dict) -> None:
+            nonlocal sent_response
+            if over_limit and not sent_response:
+                sent_response = True
+                await self._send_too_large(send)
+                return
+            if sent_response:
+                return
+            await send(message)
+
+        await self.app(scope, receive_wrapper, send_wrapper)
+        if over_limit and not sent_response:
+            sent_response = True
+            await self._send_too_large(send)
+
+    @staticmethod
+    async def _send_too_large(send: Send) -> None:
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 413,
+                "headers": [(b"content-type", b"application/json")],
+            }
+        )
+        await send(
+            {
+                "type": "http.response.body",
+                "body": b'{"detail":"request body too large"}',
+            }
+        )
 
 try:
     from arcanum._logging import set_correlation_id

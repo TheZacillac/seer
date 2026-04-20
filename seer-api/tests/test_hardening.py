@@ -532,3 +532,225 @@ def test_runtime_error_returns_500(client, monkeypatch):
     assert "secret" not in detail
     assert "/tmp" not in detail
     assert detail == "Lookup failed"
+
+
+# ---------------------------------------------------------------------------
+# D3 (H11): X-Forwarded-For is trusted only when the socket peer is in
+# the SEER_TRUSTED_PROXY_IPS allowlist.
+# ---------------------------------------------------------------------------
+
+
+def test_xff_ignored_when_trust_proxy_disabled(monkeypatch):
+    from fastapi import Request
+    from seer_api.limiting import get_client_ip
+
+    monkeypatch.delenv("SEER_TRUST_PROXY", raising=False)
+    monkeypatch.delenv("SEER_TRUSTED_PROXY_IPS", raising=False)
+    scope = {
+        "type": "http",
+        "client": ("203.0.113.5", 1234),
+        "headers": [(b"x-forwarded-for", b"1.2.3.4")],
+    }
+    req = Request(scope)
+    assert get_client_ip(req) == "203.0.113.5"
+
+
+def test_xff_ignored_from_untrusted_peer(monkeypatch):
+    """With SEER_TRUST_PROXY=true and an allowlist that does NOT
+    include the socket peer, the XFF header must be ignored."""
+    from fastapi import Request
+    from seer_api.limiting import get_client_ip
+
+    monkeypatch.setenv("SEER_TRUST_PROXY", "true")
+    monkeypatch.setenv("SEER_TRUSTED_PROXY_IPS", "10.0.0.1")
+    scope = {
+        "type": "http",
+        "client": ("203.0.113.5", 1234),
+        "headers": [(b"x-forwarded-for", b"1.2.3.4")],
+    }
+    req = Request(scope)
+    # Peer 203.0.113.5 is not in trusted list -> XFF ignored -> returns peer.
+    assert get_client_ip(req) == "203.0.113.5"
+
+
+def test_xff_trusted_from_allowlisted_peer(monkeypatch):
+    """With SEER_TRUST_PROXY=true and the socket peer in the allowlist,
+    the XFF header's first value is used as the client IP."""
+    from fastapi import Request
+    from seer_api.limiting import get_client_ip
+
+    monkeypatch.setenv("SEER_TRUST_PROXY", "true")
+    monkeypatch.setenv("SEER_TRUSTED_PROXY_IPS", "10.0.0.1,10.0.0.2")
+    scope = {
+        "type": "http",
+        "client": ("10.0.0.1", 1234),
+        "headers": [(b"x-forwarded-for", b"1.2.3.4, 10.0.0.1")],
+    }
+    req = Request(scope)
+    assert get_client_ip(req) == "1.2.3.4"
+
+
+def test_xff_ignored_when_allowlist_empty(monkeypatch):
+    """SEER_TRUST_PROXY=true but no trusted IPs configured — XFF must
+    not be honored; without an allowlist there is no safe proxy to trust."""
+    from fastapi import Request
+    from seer_api.limiting import get_client_ip
+
+    monkeypatch.setenv("SEER_TRUST_PROXY", "true")
+    monkeypatch.delenv("SEER_TRUSTED_PROXY_IPS", raising=False)
+    scope = {
+        "type": "http",
+        "client": ("10.0.0.1", 1234),
+        "headers": [(b"x-forwarded-for", b"1.2.3.4")],
+    }
+    req = Request(scope)
+    assert get_client_ip(req) == "10.0.0.1"
+
+
+# ---------------------------------------------------------------------------
+# D4 (H12, M9): /metrics uses socket peer, rate-limited
+# ---------------------------------------------------------------------------
+
+
+def _clear_limiter_storage():
+    """Reset slowapi state so each test starts from a clean slate.
+
+    Three sources of bleed need to be cleared:
+      1. ``limiter._storage`` — the per-key increment counters.
+      2. ``limiter._route_limits`` — ``importlib.reload(main)`` re-runs
+         the ``@limiter.limit`` decorators, which *append* to this dict
+         rather than replace. Without clearing, a reloaded route accrues
+         multiple identical limits and each request increments the
+         counter N times.
+      3. ``limiter._exempt_routes`` — same accumulation risk.
+    """
+    from seer_api.limiting import limiter
+
+    limiter.reset()
+    storage = getattr(limiter, "_storage", None)
+    if storage is not None:
+        try:
+            storage.reset()
+        except Exception:
+            inner = getattr(storage, "storage", None)
+            if inner is not None:
+                inner.clear()
+    # Deduplicate route limits: keep only one Limit per function name so
+    # that reloads of main don't stack multiple identical decorators.
+    route_limits = getattr(limiter, "_route_limits", None)
+    if route_limits is not None:
+        for key, limits in list(route_limits.items()):
+            # Keep the first registered Limit per route
+            route_limits[key] = limits[:1]
+
+
+@pytest.fixture
+def reset_limiter():
+    """Clear the rate limiter state so each test starts fresh.
+
+    The limiter is module-scoped and persists counters across tests;
+    without a reset the 10/minute metrics cap bleeds between tests.
+    """
+    _clear_limiter_storage()
+    yield
+    _clear_limiter_storage()
+
+
+def test_metrics_localhost_only_socket_peer(reset_limiter, app_module):
+    """The default TestClient reports client.host as 'testclient', not
+    127.0.0.1 — verify that the metrics gate uses the socket peer
+    directly (not the spoofable X-Forwarded-For) and rejects non-loopback."""
+    c = TestClient(app_module.app)
+    resp = c.get("/metrics", headers={"X-Forwarded-For": "127.0.0.1"})
+    # TestClient's synthetic peer is 'testclient' — not in the allowlist,
+    # so we should be rejected. Importantly, the XFF header must not
+    # trick the gate into letting us through.
+    assert resp.status_code == 403
+
+
+def test_metrics_allows_real_loopback(reset_limiter, app_module):
+    """When the socket peer is 127.0.0.1 the gate lets the request through."""
+    # Force the TestClient to appear as 127.0.0.1
+    c = TestClient(app_module.app, client=("127.0.0.1", 12345))
+    resp = c.get("/metrics")
+    assert resp.status_code == 200
+    assert "total_requests" in resp.json()
+
+
+def test_metrics_rate_limited(reset_limiter, monkeypatch):
+    """/metrics is now rate-limited to 10/minute (was exempt)."""
+    import seer_api.main as main
+
+    importlib.reload(main)
+    c = TestClient(main.app, client=("127.0.0.1", 12345))
+    # Send > 10 requests in a burst; at least one must be 429.
+    statuses = [c.get("/metrics").status_code for _ in range(15)]
+    assert 429 in statuses, f"expected rate-limit in {statuses}"
+
+
+# ---------------------------------------------------------------------------
+# D2 (M6): request body size cap — 64KB default, 413 on overflow.
+# ---------------------------------------------------------------------------
+
+
+def test_large_body_rejected_by_content_length(client):
+    """A request with Content-Length > 64KB must get 413 before routing."""
+    big = {"domains": ["example.com"] * 10000, "concurrency": 1}
+    resp = client.post("/lookup/bulk", json=big)
+    assert resp.status_code == 413
+    assert resp.json()["detail"] == "request body too large"
+
+
+def test_small_body_accepted(client):
+    """A normal-sized bulk payload must pass the body cap."""
+    resp = client.post(
+        "/status/bulk",
+        json={"domains": ["example.com"], "concurrency": 1},
+    )
+    # Could be 200 (succeeded via stub) or a validation/SSRF error — but
+    # NOT 413.
+    assert resp.status_code != 413
+
+
+def test_middleware_class_rejects_large_chunked_body():
+    """Unit-level: the middleware itself rejects a stream that pushes
+    past the cap in successive chunks (no Content-Length header)."""
+    import asyncio
+
+    from seer_api.middleware import MaxBodySizeMiddleware
+
+    received: list = []
+
+    async def inner_app(scope, receive, send):
+        # Drain the stream; upstream middleware should short-circuit us
+        # once the cap is blown.
+        while True:
+            msg = await receive()
+            received.append(msg)
+            if not msg.get("more_body"):
+                break
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    mw = MaxBodySizeMiddleware(inner_app, max_bytes=32)
+    sent: list = []
+
+    messages = iter(
+        [
+            {"type": "http.request", "body": b"a" * 20, "more_body": True},
+            {"type": "http.request", "body": b"b" * 20, "more_body": False},
+        ]
+    )
+
+    async def receive():
+        return next(messages)
+
+    async def send(message):
+        sent.append(message)
+
+    scope = {"type": "http", "headers": []}
+    asyncio.run(mw(scope, receive, send))
+    # First message sent must be status 413.
+    assert sent, "no response messages"
+    assert sent[0]["type"] == "http.response.start"
+    assert sent[0]["status"] == 413
