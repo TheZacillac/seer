@@ -2172,6 +2172,7 @@ dependencies = [
  "pyo3",
  "pyo3-log",
  "seer-core",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",
