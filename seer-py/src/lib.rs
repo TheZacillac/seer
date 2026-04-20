@@ -341,21 +341,129 @@ fn validate_concurrency(concurrency: usize) -> PyResult<usize> {
     Ok(concurrency.max(1))
 }
 
+/// Internal progress event carried from the Tokio workers (where
+/// `ProgressCallback` fires) to the dedicated OS thread that actually
+/// invokes the Python callable.
+struct ProgressEvent {
+    completed: usize,
+    total: usize,
+    domain: String,
+}
+
+/// Decoupling pipe between seer-core's `ProgressCallback` (called from
+/// Tokio worker threads) and the Python callable supplied by the caller.
+///
+/// Rationale: if the Python callable itself blocks — or even just yields
+/// GIL contention — a closure that acquires the GIL directly from a Tokio
+/// worker can deadlock the runtime. The GIL-holding thread may be waiting
+/// on a Tokio task that cannot make progress because every worker is
+/// parked behind `Python::with_gil`. Bulk runs with `n` domains under
+/// high concurrency turn this into an `O(n)` pile-up.
+///
+/// Instead we post lightweight events to a bounded `sync_channel`. A
+/// single dedicated OS thread drains the channel and holds the GIL only
+/// while invoking the callback. Tokio workers never touch Python.
+///
+/// Progress is advisory, so if the channel is full we drop the event
+/// rather than back-pressuring the Tokio worker.
+///
+/// Lifecycle: the pipe is kept alive by an `Arc` captured in the
+/// `ProgressCallback` closure returned from `build_progress_callback`.
+/// When seer-core drops that callback at the end of the bulk run, the
+/// `Arc` refcount drops to zero, the sender is dropped, the channel
+/// closes, `rx.recv()` returns `Err`, and the drainer thread exits.
+struct ProgressPipe {
+    /// Wrapped in `Option` so `Drop` can take ownership and drop the
+    /// sender *before* joining the drainer — otherwise the drainer would
+    /// block forever on `rx.recv()`.
+    tx: Option<std::sync::mpsc::SyncSender<ProgressEvent>>,
+    /// Drainer thread handle. Joined on drop so all queued events fire
+    /// before the bulk call returns to Python. Option so `Drop::drop`
+    /// can take ownership.
+    drainer: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ProgressPipe {
+    fn new(py_cb: Py<PyAny>) -> Self {
+        // Bounded channel. 1024 is deep enough to smooth over brief GIL
+        // contention but shallow enough that a pathologically slow
+        // callback causes `try_send` to drop events rather than ballooning
+        // memory.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<ProgressEvent>(1024);
+        let drainer = std::thread::Builder::new()
+            .name("seer-progress-drainer".to_string())
+            .spawn(move || {
+                // Blocks holding no resources until an event arrives or
+                // the last sender is dropped (= pipe teardown).
+                while let Ok(ev) = rx.recv() {
+                    Python::with_gil(|py| {
+                        let bound = py_cb.bind(py);
+                        if let Err(err) = bound.call1((ev.completed, ev.total, ev.domain)) {
+                            // A callback raising is not fatal: log and
+                            // keep draining so later events still fire.
+                            tracing::warn!(
+                                error = %err,
+                                "bulk progress callback raised; ignoring",
+                            );
+                        }
+                    });
+                }
+            })
+            .expect("failed to spawn progress drainer thread");
+        Self {
+            tx: Some(tx),
+            drainer: Some(drainer),
+        }
+    }
+
+    /// Non-blocking send. Drops the event if the channel is full or the
+    /// drainer has exited — progress is advisory.
+    fn send(&self, ev: ProgressEvent) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.try_send(ev);
+        }
+    }
+}
+
+impl Drop for ProgressPipe {
+    fn drop(&mut self) {
+        // Close the channel first by dropping the sender; otherwise the
+        // drainer's `rx.recv()` would block forever waiting on us.
+        drop(self.tx.take());
+        // Then wait for the drainer to process any still-queued events
+        // and exit. We intentionally join so that callers observe all
+        // callback invocations before `bulk_*` returns — otherwise a
+        // test that asserts "N events fired" would race with the drainer.
+        if let Some(handle) = self.drainer.take() {
+            // A panic on the drainer thread would already have been
+            // surfaced via `e.print(py)` inside the loop; a secondary
+            // panic from join itself should not crash the bulk run.
+            if let Err(e) = handle.join() {
+                tracing::warn!(?e, "progress drainer thread panicked during teardown");
+            }
+        }
+    }
+}
+
 /// Converts an optional Python callable into a Rust `ProgressCallback`.
 ///
-/// The returned callback acquires the GIL on every invocation. Exceptions
-/// raised from the Python callable are logged at `warn` and swallowed —
-/// a broken progress callback must not kill a bulk run.
+/// The returned callback posts to a `ProgressPipe` and never touches the
+/// GIL, so Tokio workers cannot deadlock on GIL contention when the
+/// Python callback is slow. See [`ProgressPipe`] for the full rationale.
 fn build_progress_callback(
     progress: Option<Py<PyAny>>,
 ) -> Option<seer_core::bulk::ProgressCallback> {
     progress.map(|py_cb| {
+        // `Arc` so the pipe (which owns the drainer thread) lives as long
+        // as the callback itself. When the executor drops this Box at the
+        // end of the bulk run, the Arc's refcount hits zero, the
+        // ProgressPipe drops, the sender closes, and the drainer exits.
+        let pipe = std::sync::Arc::new(ProgressPipe::new(py_cb));
         Box::new(move |completed: usize, total: usize, domain: &str| {
-            Python::with_gil(|py| {
-                let bound = py_cb.bind(py);
-                if let Err(err) = bound.call1((completed, total, domain)) {
-                    tracing::warn!(error = %err, "bulk progress callback raised; ignoring");
-                }
+            pipe.send(ProgressEvent {
+                completed,
+                total,
+                domain: domain.to_string(),
             });
         }) as seer_core::bulk::ProgressCallback
     })
