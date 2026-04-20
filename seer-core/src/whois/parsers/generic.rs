@@ -99,7 +99,11 @@ Name Server: ns2.example.com
     #[test]
     fn test_verisign_thick_com_fixture() {
         let parser = GenericParser::new();
-        let result = parser.parse("example.com", "whois.verisign-grs.com", VERISIGN_COM_FIXTURE);
+        let result = parser.parse(
+            "example.com",
+            "whois.verisign-grs.com",
+            VERISIGN_COM_FIXTURE,
+        );
 
         assert_eq!(result.domain, "example.com");
         assert_eq!(

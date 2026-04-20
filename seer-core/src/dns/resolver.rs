@@ -850,7 +850,11 @@ mod tests {
             name
         );
         // The first nibble (most-reversed position) must be 1 (from ::1 low bit).
-        assert!(name.starts_with("1."), "expected '1.' prefix, got: {}", name);
+        assert!(
+            name.starts_with("1."),
+            "expected '1.' prefix, got: {}",
+            name
+        );
         // 32 nibbles + 31 dots + ".ip6.arpa" (9 chars) = 72.
         assert_eq!(name.len(), 72);
     }

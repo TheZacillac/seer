@@ -321,11 +321,13 @@ mod tests {
     #[test]
     fn rdap_fail_whois_error_contains_no_match_marks_available_medium() {
         let rdap_err = SeerError::RdapError("500".to_string());
-        let whois_err = SeerError::WhoisError(
-            "whois server returned 'No match for this domain'".to_string(),
-        );
+        let whois_err =
+            SeerError::WhoisError("whois server returned 'No match for this domain'".to_string());
         let r = decide_fallback("example.test", &rdap_err, Err(whois_err));
-        assert!(r.available, "whois error containing 'no match' is available");
+        assert!(
+            r.available,
+            "whois error containing 'no match' is available"
+        );
         assert_eq!(r.confidence, "medium");
         assert_eq!(r.method, "whois_error");
     }
@@ -352,7 +354,8 @@ mod tests {
     #[test]
     fn rdap_fail_whois_error_no_entries_marks_available_medium() {
         let rdap_err = SeerError::RdapError("no".to_string());
-        let whois_err = SeerError::WhoisError("No entries found for the selected source".to_string());
+        let whois_err =
+            SeerError::WhoisError("No entries found for the selected source".to_string());
         let r = decide_fallback("example.test", &rdap_err, Err(whois_err));
         assert!(r.available);
         assert_eq!(r.confidence, "medium");

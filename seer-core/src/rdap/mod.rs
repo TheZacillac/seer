@@ -39,9 +39,7 @@ pub enum RdapRoute {
 pub fn classify(query: &str) -> Result<RdapRoute> {
     let trimmed = query.trim();
     if trimmed.is_empty() {
-        return Err(SeerError::InvalidInput(
-            "empty RDAP query".to_string(),
-        ));
+        return Err(SeerError::InvalidInput("empty RDAP query".to_string()));
     }
 
     // 1) IP literal (v4 or v6).
@@ -54,13 +52,10 @@ pub fn classify(query: &str) -> Result<RdapRoute> {
     //    "AS" (e.g. as1234.io).
     let upper = trimmed.to_uppercase();
     if let Some(rest) = upper.strip_prefix("AS") {
-        if !rest.is_empty()
-            && rest.chars().all(|c| c.is_ascii_digit())
-            && !trimmed.contains('.')
-        {
-            let asn: u32 = rest.parse().map_err(|_| {
-                SeerError::InvalidInput(format!("invalid ASN: {query}"))
-            })?;
+        if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()) && !trimmed.contains('.') {
+            let asn: u32 = rest
+                .parse()
+                .map_err(|_| SeerError::InvalidInput(format!("invalid ASN: {query}")))?;
             return Ok(RdapRoute::Asn(asn));
         }
     }
@@ -143,10 +138,7 @@ mod tests {
     #[test]
     fn bare_as_routes_to_domain() {
         // "AS" alone has an empty digit tail; not an ASN.
-        assert_eq!(
-            classify("AS").unwrap(),
-            RdapRoute::Domain("AS".to_string())
-        );
+        assert_eq!(classify("AS").unwrap(), RdapRoute::Domain("AS".to_string()));
     }
 
     #[test]

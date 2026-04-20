@@ -287,10 +287,9 @@ fn rdap_asn(py: Python<'_>, asn: u32) -> PyResult<PyObject> {
 #[pyfunction]
 fn rdap_auto(py: Python<'_>, query: String) -> PyResult<PyObject> {
     let client = get_rdap_client();
-    let response = run_async(
-        py,
-        async move { seer_core::rdap::auto_lookup(client, &query).await },
-    )?;
+    let response = run_async(py, async move {
+        seer_core::rdap::auto_lookup(client, &query).await
+    })?;
     let json = serialize_response(&response)?;
     json_to_python(py, &json)
 }
@@ -305,7 +304,9 @@ fn dig(
 ) -> PyResult<PyObject> {
     let resolver = get_dns_resolver();
 
-    let rt_parsed: RecordType = record_type.parse().map_err(|e: SeerError| seer_err_to_py(&e))?;
+    let rt_parsed: RecordType = record_type
+        .parse()
+        .map_err(|e: SeerError| seer_err_to_py(&e))?;
 
     let records = run_async(py, async move {
         resolver
@@ -322,7 +323,9 @@ fn dig(
 fn propagation(py: Python<'_>, domain: String, record_type: &str) -> PyResult<PyObject> {
     let checker = get_propagation_checker();
 
-    let rt_parsed: RecordType = record_type.parse().map_err(|e: SeerError| seer_err_to_py(&e))?;
+    let rt_parsed: RecordType = record_type
+        .parse()
+        .map_err(|e: SeerError| seer_err_to_py(&e))?;
 
     let response = run_async(py, async move { checker.check(&domain, rt_parsed).await })?;
     let json = serialize_response(&response)?;
@@ -485,8 +488,7 @@ fn bulk_lookup(
         .collect();
 
     let cb = build_progress_callback(progress);
-    let result =
-        run_async_infallible(py, async move { executor.execute(operations, cb).await })?;
+    let result = run_async_infallible(py, async move { executor.execute(operations, cb).await })?;
 
     let json = serialize_response(&result)?;
     json_to_python(py, &json)
@@ -508,8 +510,7 @@ fn bulk_whois(
         .collect();
 
     let cb = build_progress_callback(progress);
-    let result =
-        run_async_infallible(py, async move { executor.execute(operations, cb).await })?;
+    let result = run_async_infallible(py, async move { executor.execute(operations, cb).await })?;
 
     let json = serialize_response(&result)?;
     json_to_python(py, &json)
@@ -526,7 +527,9 @@ fn bulk_dig(
 ) -> PyResult<PyObject> {
     let executor = BulkExecutor::new().with_concurrency(validate_concurrency(concurrency)?);
 
-    let rt_parsed: RecordType = record_type.parse().map_err(|e: SeerError| seer_err_to_py(&e))?;
+    let rt_parsed: RecordType = record_type
+        .parse()
+        .map_err(|e: SeerError| seer_err_to_py(&e))?;
 
     let operations: Vec<BulkOperation> = domains
         .into_iter()
@@ -537,8 +540,7 @@ fn bulk_dig(
         .collect();
 
     let cb = build_progress_callback(progress);
-    let result =
-        run_async_infallible(py, async move { executor.execute(operations, cb).await })?;
+    let result = run_async_infallible(py, async move { executor.execute(operations, cb).await })?;
 
     let json = serialize_response(&result)?;
     json_to_python(py, &json)
@@ -555,7 +557,9 @@ fn bulk_propagation(
 ) -> PyResult<PyObject> {
     let executor = BulkExecutor::new().with_concurrency(validate_concurrency(concurrency)?);
 
-    let rt_parsed: RecordType = record_type.parse().map_err(|e: SeerError| seer_err_to_py(&e))?;
+    let rt_parsed: RecordType = record_type
+        .parse()
+        .map_err(|e: SeerError| seer_err_to_py(&e))?;
 
     let operations: Vec<BulkOperation> = domains
         .into_iter()
@@ -566,8 +570,7 @@ fn bulk_propagation(
         .collect();
 
     let cb = build_progress_callback(progress);
-    let result =
-        run_async_infallible(py, async move { executor.execute(operations, cb).await })?;
+    let result = run_async_infallible(py, async move { executor.execute(operations, cb).await })?;
 
     let json = serialize_response(&result)?;
     json_to_python(py, &json)
@@ -597,8 +600,7 @@ fn bulk_status(
         .collect();
 
     let cb = build_progress_callback(progress);
-    let result =
-        run_async_infallible(py, async move { executor.execute(operations, cb).await })?;
+    let result = run_async_infallible(py, async move { executor.execute(operations, cb).await })?;
 
     let json = serialize_response(&result)?;
     json_to_python(py, &json)
@@ -620,8 +622,7 @@ fn bulk_availability(
         .collect();
 
     let cb = build_progress_callback(progress);
-    let result =
-        run_async_infallible(py, async move { executor.execute(operations, cb).await })?;
+    let result = run_async_infallible(py, async move { executor.execute(operations, cb).await })?;
 
     let json = serialize_response(&result)?;
     json_to_python(py, &json)
@@ -669,7 +670,9 @@ fn dns_compare(
 ) -> PyResult<PyObject> {
     let comparator = get_dns_comparator();
 
-    let rt_parsed: RecordType = record_type.parse().map_err(|e: SeerError| seer_err_to_py(&e))?;
+    let rt_parsed: RecordType = record_type
+        .parse()
+        .map_err(|e: SeerError| seer_err_to_py(&e))?;
 
     let response = run_async(py, async move {
         comparator
@@ -698,12 +701,13 @@ fn dns_follow(
 
     let follower = get_dns_follower();
 
-    let rt_parsed: RecordType = record_type.parse().map_err(|e: SeerError| seer_err_to_py(&e))?;
+    let rt_parsed: RecordType = record_type
+        .parse()
+        .map_err(|e: SeerError| seer_err_to_py(&e))?;
 
     // Validate iteration/interval via core; this rejects NaN/inf/negative and
     // enforces the per-interval cap (<= 60 minutes).
-    let config =
-        FollowConfig::new(iterations, interval_minutes).map_err(|e| seer_err_to_py(&e))?;
+    let config = FollowConfig::new(iterations, interval_minutes).map_err(|e| seer_err_to_py(&e))?;
 
     // Additionally cap total wall-clock time and iteration count to prevent
     // blocking the shared Tokio runtime for excessive durations.
@@ -809,8 +813,7 @@ fn bulk_info(
         .collect();
 
     let cb = build_progress_callback(progress);
-    let result =
-        run_async_infallible(py, async move { executor.execute(operations, cb).await })?;
+    let result = run_async_infallible(py, async move { executor.execute(operations, cb).await })?;
 
     let json = serialize_response(&result)?;
     json_to_python(py, &json)
