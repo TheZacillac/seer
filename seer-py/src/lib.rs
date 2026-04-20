@@ -708,7 +708,33 @@ fn bulk_info(
     json_to_python(py, &json)
 }
 
+/// Maximum recursion depth permitted when converting `serde_json::Value`
+/// into a Python object graph.
+///
+/// An adversarial WHOIS or RDAP response could nest arrays or objects
+/// deeply enough to overflow the thread stack during conversion, which
+/// aborts the process unrecoverably. The cap surfaces the failure as a
+/// catchable `ValueError` instead. 128 levels is well above anything any
+/// real-world registry response has ever contained.
+const MAX_JSON_DEPTH: usize = 128;
+
+/// Entry point for converting a `serde_json::Value` into a Python object.
+/// Starts the recursion at depth 0; the inner helper enforces
+/// [`MAX_JSON_DEPTH`].
 fn json_to_python(py: Python<'_>, value: &serde_json::Value) -> PyResult<PyObject> {
+    json_to_python_inner(py, value, 0)
+}
+
+fn json_to_python_inner(
+    py: Python<'_>,
+    value: &serde_json::Value,
+    depth: usize,
+) -> PyResult<PyObject> {
+    if depth > MAX_JSON_DEPTH {
+        return Err(PyValueError::new_err(format!(
+            "JSON structure exceeds max depth {MAX_JSON_DEPTH}"
+        )));
+    }
     match value {
         serde_json::Value::Null => Ok(py.None()),
         serde_json::Value::Bool(b) => Ok(b.into_pyobject(py)?.to_owned().into_any().unbind()),
@@ -727,18 +753,39 @@ fn json_to_python(py: Python<'_>, value: &serde_json::Value) -> PyResult<PyObjec
         serde_json::Value::Array(arr) => {
             let list: Vec<PyObject> = arr
                 .iter()
-                .map(|v| json_to_python(py, v))
+                .map(|v| json_to_python_inner(py, v, depth + 1))
                 .collect::<PyResult<_>>()?;
             Ok(list.into_pyobject(py)?.into_any().unbind())
         }
         serde_json::Value::Object(obj) => {
             let dict = PyDict::new(py);
             for (k, v) in obj {
-                dict.set_item(k, json_to_python(py, v)?)?;
+                dict.set_item(k, json_to_python_inner(py, v, depth + 1)?)?;
             }
             Ok(dict.into_any().unbind())
         }
     }
+}
+
+/// Test hook: constructs a `serde_json::Value` with `depth` levels of
+/// nested arrays and runs it through [`json_to_python`].
+///
+/// Used by `tests/test_json_depth.py` to verify the [`MAX_JSON_DEPTH`]
+/// guard raises `ValueError` instead of overflowing the thread stack on
+/// an adversarial payload.
+///
+/// This is a `#[pyfunction]` rather than a `#[cfg(test)]` Rust unit test
+/// because `seer-py` is a `cdylib` crate — a Rust test binary would fail
+/// to link against `libpython`. The function is prefixed with `_` to
+/// signal that it is not part of the public API and is undocumented in
+/// `__all__`.
+#[pyfunction]
+fn _json_to_python_nested_for_test(py: Python<'_>, depth: usize) -> PyResult<PyObject> {
+    let mut v = serde_json::Value::Null;
+    for _ in 0..depth {
+        v = serde_json::Value::Array(vec![v]);
+    }
+    json_to_python(py, &v)
 }
 
 /// Install a tracing subscriber that forwards Rust log events into Python's
@@ -752,6 +799,7 @@ fn init_rust_logging() {
 #[pymodule]
 fn _seer(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(init_rust_logging, m)?)?;
+    m.add_function(wrap_pyfunction!(_json_to_python_nested_for_test, m)?)?;
     m.add_function(wrap_pyfunction!(validate_public_host, m)?)?;
     m.add_function(wrap_pyfunction!(lookup, m)?)?;
     m.add_function(wrap_pyfunction!(whois, m)?)?;
