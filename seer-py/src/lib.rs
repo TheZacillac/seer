@@ -2,7 +2,8 @@ mod bridge;
 
 use std::future::Future;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -33,6 +34,49 @@ fn follow_cancel_sender() -> &'static Mutex<watch::Sender<bool>> {
         let (tx, _rx) = watch::channel(false);
         Mutex::new(tx)
     })
+}
+
+/// Poison-tolerant lock helper for the follow cancel sender.
+///
+/// If a prior `dns_follow` panicked while holding this lock, the mutex is
+/// poisoned. We recover the inner value rather than propagating the panic —
+/// the channel's state is effectively "fresh" since the worst case is that a
+/// stale cancel signal is in the watch, and each `dns_follow` installs a new
+/// channel anyway.
+fn lock_follow() -> MutexGuard<'static, watch::Sender<bool>> {
+    follow_cancel_sender()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+}
+
+/// Guard enforcing that only a single `dns_follow` call is active at a time.
+///
+/// `dns_follow` installs a shared `watch::Sender<bool>` into a global slot so
+/// that `cancel_follow()` can signal the running task. Without a guard, a
+/// concurrent call would silently overwrite the sender, leaking the ability to
+/// cancel the earlier call. We fail loudly instead.
+static FOLLOW_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+struct FollowActiveGuard;
+
+impl FollowActiveGuard {
+    fn acquire() -> PyResult<Self> {
+        if FOLLOW_ACTIVE
+            .compare_exchange(false, true, SeqCst, SeqCst)
+            .is_err()
+        {
+            return Err(PyRuntimeError::new_err(
+                "dns_follow is already running; cancel it or wait",
+            ));
+        }
+        Ok(Self)
+    }
+}
+
+impl Drop for FollowActiveGuard {
+    fn drop(&mut self) {
+        FOLLOW_ACTIVE.store(false, SeqCst);
+    }
 }
 
 fn get_runtime() -> &'static tokio::runtime::Runtime {
@@ -524,7 +568,11 @@ fn dns_follow(
     iterations: usize,
     interval_minutes: f64,
 ) -> PyResult<PyObject> {
-    let rt = get_runtime();
+    // Refuse concurrent calls before touching any shared state — a second
+    // call would overwrite the global cancel sender, silently orphaning the
+    // first call's ability to be cancelled. The guard releases on return.
+    let _active = FollowActiveGuard::acquire()?;
+
     let follower = get_dns_follower();
 
     let rt_parsed: RecordType = record_type.parse().map_err(|e: SeerError| seer_err_to_py(&e))?;
@@ -553,29 +601,26 @@ fn dns_follow(
     }
 
     // Install a fresh cancellation channel for this call so that any previous
-    // `cancel_follow()` signals do not affect it.
+    // `cancel_follow()` signals do not affect it. Use `lock_follow` rather
+    // than `.expect` so a prior panic cannot permanently break the endpoint.
     let cancel_rx = {
         let (tx, rx) = watch::channel(false);
-        let mut slot = follow_cancel_sender()
-            .lock()
-            .expect("follow cancel sender mutex poisoned");
+        let mut slot = lock_follow();
         *slot = tx;
         rx
     };
 
-    let result = py.allow_threads(|| {
-        rt.block_on(async {
-            follower
-                .follow(
-                    &domain,
-                    rt_parsed,
-                    nameserver.as_deref(),
-                    config,
-                    None,
-                    Some(cancel_rx),
-                )
-                .await
-        })
+    let response = run_async(py, async move {
+        follower
+            .follow(
+                &domain,
+                rt_parsed,
+                nameserver.as_deref(),
+                config,
+                None,
+                Some(cancel_rx),
+            )
+            .await
     });
 
     // Reset the global sender so stale `cancel_follow()` calls after this
@@ -583,19 +628,13 @@ fn dns_follow(
     // before it installs its own sender.
     {
         let (tx, _rx) = watch::channel(false);
-        let mut slot = follow_cancel_sender()
-            .lock()
-            .expect("follow cancel sender mutex poisoned");
+        let mut slot = lock_follow();
         *slot = tx;
     }
 
-    match result {
-        Ok(response) => {
-            let json = serialize_response(&response)?;
-            json_to_python(py, &json)
-        }
-        Err(e) => Err(seer_err_to_py(&e)),
-    }
+    let response = response?;
+    let json = serialize_response(&response)?;
+    json_to_python(py, &json)
 }
 
 /// Signal the currently-running `dns_follow` call (if any) to cancel.
@@ -603,11 +642,13 @@ fn dns_follow(
 /// This is a best-effort signal: the call will return on its next cancellation
 /// check point (between DNS lookups or while sleeping between iterations).
 /// If no `dns_follow` is currently running, this is a no-op.
+///
+/// Intentionally does not acquire `FollowActiveGuard`: its purpose is to
+/// interrupt a running `dns_follow`, so it must be callable concurrently with
+/// one.
 #[pyfunction]
 fn cancel_follow() -> PyResult<()> {
-    let slot = follow_cancel_sender()
-        .lock()
-        .expect("follow cancel sender mutex poisoned");
+    let slot = lock_follow();
     let _ = slot.send(true);
     Ok(())
 }
