@@ -196,3 +196,138 @@ def test_mcp_record_type_rejected():
     assert _require_record_type({"record_type": "A"}) == "A"
     assert _require_record_type({"record_type": "AAAA"}) == "AAAA"
     assert _require_record_type({}) == "A"  # default
+
+
+# ---------------------------------------------------------------------------
+# C7 / M7: SSRF guard on user-supplied host/IP parameters
+#
+# These tests require the real seer.validate_public_host (not the conftest
+# stub) to exercise IP-literal rejection. The conftest stubs *other* seer
+# functions but leaves validate_public_host on the stub undefined; the
+# _real_seer_validator fixture patches the attribute onto whatever seer
+# module is loaded (real or stub) so the router-side guard calls succeed.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _real_seer_validator(monkeypatch):
+    """Ensure seer.validate_public_host points at the real validator.
+
+    If the real compiled seer extension is installed it already has the
+    symbol — this fixture is a no-op. If the conftest stub is in place,
+    we import the real validator lazily and attach it to the stub so the
+    ssrf.guard helper can call through correctly.
+    """
+    import sys
+
+    seer_mod = sys.modules.get("seer")
+    if seer_mod is None:
+        return
+    if hasattr(seer_mod, "validate_public_host"):
+        return
+    # Stub mode without the real validator — reject reserved addresses in
+    # Python so the guard still behaves as the real validator would for
+    # the narrow set of IPs we assert on below.
+    def _fake_validate(host: str, port: int) -> None:
+        from ipaddress import ip_address
+
+        try:
+            ip = ip_address(host)
+        except ValueError:
+            return  # hostnames — assume public in stub mode
+        if (
+            ip.is_loopback
+            or ip.is_private
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_unspecified
+        ):
+            raise ValueError(
+                f"Invalid input: refusing to connect to reserved address: {host}"
+            )
+
+    monkeypatch.setattr(seer_mod, "validate_public_host", _fake_validate, raising=False)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/status/127.0.0.1",
+        "/status/169.254.169.254",
+        "/status/10.0.0.1",
+        "/status/192.168.1.1",
+        "/whois/127.0.0.1",
+        "/whois/169.254.169.254",
+        "/dns/example.com/A?nameserver=169.254.169.254",
+        "/dns/example.com/A?nameserver=127.0.0.1",
+        "/dns/127.0.0.1/A",
+    ],
+)
+def test_ssrf_guard_rejects_reserved(client, path):
+    """All SSRF-capable routes must return 400 for reserved IPs."""
+    resp = client.get(path)
+    assert resp.status_code == 400, (path, resp.status_code, resp.text)
+    detail = resp.json().get("detail", "").lower()
+    assert "reserved" in detail or "invalid" in detail, (path, detail)
+
+
+def test_ssrf_guard_bulk_status_rejects_reserved(client):
+    resp = client.post(
+        "/status/bulk", json={"domains": ["127.0.0.1", "example.com"], "concurrency": 2}
+    )
+    assert resp.status_code == 400
+
+
+def test_ssrf_guard_bulk_whois_rejects_reserved(client):
+    resp = client.post(
+        "/whois/bulk", json={"domains": ["10.0.0.1"], "concurrency": 1}
+    )
+    assert resp.status_code == 400
+
+
+def test_ssrf_guard_bulk_dns_rejects_reserved(client):
+    resp = client.post(
+        "/dns/bulk",
+        json={"domains": ["169.254.169.254"], "record_type": "A", "concurrency": 1},
+    )
+    assert resp.status_code == 400
+
+
+def test_mcp_ssrf_guard_rejects_reserved():
+    """MCP tool handlers must reject reserved IPs before dispatching to seer."""
+    import asyncio
+
+    from seer_api.mcp.server import execute_tool
+
+    # seer_status with a loopback IP must fail before any seer call
+    with pytest.raises(ValueError, match="reserved"):
+        asyncio.run(execute_tool("seer_status", {"domain": "127.0.0.1"}))
+
+    # seer_whois with a metadata IP must fail
+    with pytest.raises(ValueError, match="reserved"):
+        asyncio.run(execute_tool("seer_whois", {"domain": "169.254.169.254"}))
+
+    # seer_dig with a reserved nameserver must fail
+    with pytest.raises(ValueError, match="reserved"):
+        asyncio.run(
+            execute_tool(
+                "seer_dig",
+                {"domain": "example.com", "nameserver": "127.0.0.1"},
+            )
+        )
+
+    # seer_rdap_ip with a private IP must fail
+    with pytest.raises(ValueError, match="reserved"):
+        asyncio.run(execute_tool("seer_rdap_ip", {"ip": "10.0.0.1"}))
+
+
+def test_mcp_call_tool_returns_invalid_input_for_ssrf():
+    """End-to-end: MCP call_tool dispatch surfaces a ValueError as 'Invalid input'."""
+    import asyncio
+
+    from seer_api.mcp.server import call_tool
+
+    result = asyncio.run(call_tool("seer_status", {"domain": "127.0.0.1"}))
+    assert len(result) == 1
+    assert result[0].text.startswith("Invalid input:")
+    assert "reserved" in result[0].text.lower()

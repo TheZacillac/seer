@@ -7,6 +7,7 @@ from fastapi import APIRouter, Path, Request
 from pydantic import BaseModel, Field
 from seer_api.errors import http_error
 from seer_api.limiting import limiter
+from seer_api.ssrf import guard as ssrf_guard
 from seer_api.streaming import stream_bulk
 
 import seer
@@ -40,6 +41,9 @@ async def whois_lookup(
     Returns:
         WHOIS response with registrar, dates, nameservers, and status information
     """
+    # WHOIS uses TCP port 43, but the SSRF guard only inspects the host's
+    # resolved IPs — the port argument is a nominal hint for lookup_host.
+    ssrf_guard(domain, 43)
     try:
         loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(None, seer.whois, domain)
@@ -60,6 +64,8 @@ async def bulk_whois_lookup(request: Request, body: BulkWhoisRequest):
     Returns:
         List of WHOIS results for each domain
     """
+    for d in body.domains:
+        ssrf_guard(d, 43)
     try:
         loop = asyncio.get_running_loop()
         results = await loop.run_in_executor(
@@ -74,6 +80,8 @@ async def bulk_whois_lookup(request: Request, body: BulkWhoisRequest):
 @limiter.limit("10/minute")
 async def bulk_whois_stream(request: Request, body: BulkWhoisRequest):
     """Stream bulk WHOIS lookups as Server-Sent Events."""
+    for d in body.domains:
+        ssrf_guard(d, 43)
     try:
         return await stream_bulk(seer.bulk_whois, body.domains, body.concurrency)
     except Exception as e:
