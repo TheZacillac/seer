@@ -1,6 +1,9 @@
 mod bridge;
 
-use std::sync::{Mutex, OnceLock};
+use std::future::Future;
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -16,7 +19,7 @@ use seer_core::{
     rdap::RdapClient,
     status::StatusClient,
     whois::WhoisClient,
-    AvailabilityChecker, DomainDiffer, SslChecker, SubdomainEnumerator,
+    AvailabilityChecker, DomainDiffer, SeerError, SslChecker, SubdomainEnumerator,
 };
 use tokio::sync::watch;
 
@@ -33,6 +36,49 @@ fn follow_cancel_sender() -> &'static Mutex<watch::Sender<bool>> {
     })
 }
 
+/// Poison-tolerant lock helper for the follow cancel sender.
+///
+/// If a prior `dns_follow` panicked while holding this lock, the mutex is
+/// poisoned. We recover the inner value rather than propagating the panic —
+/// the channel's state is effectively "fresh" since the worst case is that a
+/// stale cancel signal is in the watch, and each `dns_follow` installs a new
+/// channel anyway.
+fn lock_follow() -> MutexGuard<'static, watch::Sender<bool>> {
+    follow_cancel_sender()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+}
+
+/// Guard enforcing that only a single `dns_follow` call is active at a time.
+///
+/// `dns_follow` installs a shared `watch::Sender<bool>` into a global slot so
+/// that `cancel_follow()` can signal the running task. Without a guard, a
+/// concurrent call would silently overwrite the sender, leaking the ability to
+/// cancel the earlier call. We fail loudly instead.
+static FOLLOW_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+struct FollowActiveGuard;
+
+impl FollowActiveGuard {
+    fn acquire() -> PyResult<Self> {
+        if FOLLOW_ACTIVE
+            .compare_exchange(false, true, SeqCst, SeqCst)
+            .is_err()
+        {
+            return Err(PyRuntimeError::new_err(
+                "dns_follow is already running; cancel it or wait",
+            ));
+        }
+        Ok(Self)
+    }
+}
+
+impl Drop for FollowActiveGuard {
+    fn drop(&mut self) {
+        FOLLOW_ACTIVE.store(false, SeqCst);
+    }
+}
+
 fn get_runtime() -> &'static tokio::runtime::Runtime {
     static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
     RUNTIME.get_or_init(|| {
@@ -41,6 +87,80 @@ fn get_runtime() -> &'static tokio::runtime::Runtime {
             .build()
             .expect("Failed to create Tokio runtime")
     })
+}
+
+/// Map a `SeerError` to a Python exception using the variant-aware
+/// `sanitized_message()` so that internal URLs, hostnames, and raw system
+/// errors never leak to Python callers. Validation-shaped errors become
+/// `ValueError`; everything else is a `RuntimeError`.
+fn seer_err_to_py(e: &SeerError) -> PyErr {
+    use SeerError::*;
+    match e {
+        InvalidInput(_)
+        | InvalidDomain(_)
+        | InvalidIpAddress(_)
+        | InvalidRecordType(_)
+        | DomainNotAllowed { .. } => PyValueError::new_err(e.sanitized_message()),
+        Timeout(_) => PyRuntimeError::new_err(e.sanitized_message()),
+        RateLimited(_) => PyRuntimeError::new_err(e.sanitized_message()),
+        _ => PyRuntimeError::new_err(e.sanitized_message()),
+    }
+}
+
+/// Run an async `SeerError`-returning future on the shared Tokio runtime and
+/// marshal the outcome into a `PyResult`.
+///
+/// Wraps the `block_on` in `std::panic::catch_unwind`: a panic that unwinds
+/// through the FFI boundary is UB and would abort the Python process. Common
+/// causes include calling a blocking runtime from inside another async runtime
+/// (e.g. from `asyncio`) which tokio explicitly panics on. We surface that as
+/// a `RuntimeError` instead.
+///
+/// Errors are routed through `seer_err_to_py` so that sanitized, typed
+/// messages reach the caller.
+fn run_async<F, T>(py: Python<'_>, fut: F) -> PyResult<T>
+where
+    F: Future<Output = seer_core::Result<T>> + Send,
+    T: Send,
+{
+    py.allow_threads(
+        || match catch_unwind(AssertUnwindSafe(|| get_runtime().block_on(fut))) {
+            Ok(Ok(v)) => Ok(v),
+            Ok(Err(e)) => Err(seer_err_to_py(&e)),
+            Err(_) => Err(PyRuntimeError::new_err(
+                "panic in seer runtime (likely nested async context or internal bug)",
+            )),
+        },
+    )
+}
+
+/// Serialize a Rust response to `serde_json::Value`, mapping any error to a
+/// generic `PyRuntimeError`. `serde_json::to_value` on our own domain types
+/// should never fail; if it does, that's an internal bug — do not leak the
+/// underlying error text (which could include type/field names) to callers.
+fn serialize_response<T: serde::Serialize>(value: &T) -> PyResult<serde_json::Value> {
+    serde_json::to_value(value)
+        .map_err(|_| PyRuntimeError::new_err("internal error: failed to serialize response"))
+}
+
+/// Infallible variant of `run_async` for futures that do not return a
+/// `SeerError` (e.g. `BulkExecutor::execute` which reports per-item failures
+/// in the returned `Vec<BulkResult>`). Still wraps `block_on` in
+/// `catch_unwind` so that a panic in the runtime surfaces as a Python
+/// exception rather than aborting the process.
+fn run_async_infallible<F, T>(py: Python<'_>, fut: F) -> PyResult<T>
+where
+    F: Future<Output = T> + Send,
+    T: Send,
+{
+    py.allow_threads(
+        || match catch_unwind(AssertUnwindSafe(|| get_runtime().block_on(fut))) {
+            Ok(v) => Ok(v),
+            Err(_) => Err(PyRuntimeError::new_err(
+                "panic in seer runtime (likely nested async context or internal bug)",
+            )),
+        },
+    )
 }
 
 fn get_smart_lookup() -> &'static SmartLookup {
@@ -108,89 +228,70 @@ fn get_domain_differ() -> &'static DomainDiffer {
     INSTANCE.get_or_init(DomainDiffer::new)
 }
 
+/// Validate that a host is safe to connect to (not a reserved/loopback/private IP).
+///
+/// Wraps `seer_core::net::validate_public_host`. Raises `ValueError` if the host
+/// is an IP literal in a reserved range, or if it resolves to such an address.
+/// Used by `seer-api` to block SSRF before dispatching outbound calls.
+#[pyfunction]
+fn validate_public_host(py: Python<'_>, host: String, port: u16) -> PyResult<()> {
+    run_async(py, async move {
+        seer_core::net::validate_public_host(&host, port).await
+    })
+}
+
 #[pyfunction]
 fn lookup(py: Python<'_>, domain: String) -> PyResult<PyObject> {
-    let rt = get_runtime();
     let smart_lookup = get_smart_lookup();
-
-    let result = py.allow_threads(|| rt.block_on(async { smart_lookup.lookup(&domain).await }));
-
-    match result {
-        Ok(response) => {
-            let json = serde_json::to_value(&response)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            json_to_python(py, &json)
-        }
-        Err(e) => Err(PyRuntimeError::new_err(e.to_string())),
-    }
+    let response = run_async(py, async move { smart_lookup.lookup(&domain).await })?;
+    let json = serialize_response(&response)?;
+    json_to_python(py, &json)
 }
 
 #[pyfunction]
 fn whois(py: Python<'_>, domain: String) -> PyResult<PyObject> {
-    let rt = get_runtime();
     let client = get_whois_client();
-
-    let result = py.allow_threads(|| rt.block_on(async { client.lookup(&domain).await }));
-
-    match result {
-        Ok(response) => {
-            let json = serde_json::to_value(&response)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            json_to_python(py, &json)
-        }
-        Err(e) => Err(PyRuntimeError::new_err(e.to_string())),
-    }
+    let response = run_async(py, async move { client.lookup(&domain).await })?;
+    let json = serialize_response(&response)?;
+    json_to_python(py, &json)
 }
 
 #[pyfunction]
 fn rdap_domain(py: Python<'_>, domain: String) -> PyResult<PyObject> {
-    let rt = get_runtime();
     let client = get_rdap_client();
-
-    let result = py.allow_threads(|| rt.block_on(async { client.lookup_domain(&domain).await }));
-
-    match result {
-        Ok(response) => {
-            let json = serde_json::to_value(&response)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            json_to_python(py, &json)
-        }
-        Err(e) => Err(PyRuntimeError::new_err(e.to_string())),
-    }
+    let response = run_async(py, async move { client.lookup_domain(&domain).await })?;
+    let json = serialize_response(&response)?;
+    json_to_python(py, &json)
 }
 
 #[pyfunction]
 fn rdap_ip(py: Python<'_>, ip: String) -> PyResult<PyObject> {
-    let rt = get_runtime();
     let client = get_rdap_client();
-
-    let result = py.allow_threads(|| rt.block_on(async { client.lookup_ip(&ip).await }));
-
-    match result {
-        Ok(response) => {
-            let json = serde_json::to_value(&response)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            json_to_python(py, &json)
-        }
-        Err(e) => Err(PyRuntimeError::new_err(e.to_string())),
-    }
+    let response = run_async(py, async move { client.lookup_ip(&ip).await })?;
+    let json = serialize_response(&response)?;
+    json_to_python(py, &json)
 }
 
 #[pyfunction]
 fn rdap_asn(py: Python<'_>, asn: u32) -> PyResult<PyObject> {
-    let rt = get_runtime();
     let client = get_rdap_client();
+    let response = run_async(py, async move { client.lookup_asn(asn).await })?;
+    let json = serialize_response(&response)?;
+    json_to_python(py, &json)
+}
 
-    let result = py.allow_threads(|| rt.block_on(async { client.lookup_asn(asn).await }));
-
-    match result {
-        Ok(response) => {
-            let json = serde_json::to_value(&response)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            json_to_python(py, &json)
-        }
-        Err(e) => Err(PyRuntimeError::new_err(e.to_string())),
-    }
+/// Auto-routing RDAP lookup: classifies `query` as IP / ASN / domain in
+/// Rust and dispatches to the correct endpoint. Replaces the former
+/// Python-side dispatcher, which silently misrouted `AS`-prefixed domains
+/// like `as1234.io` to the ASN endpoint.
+#[pyfunction]
+fn rdap_auto(py: Python<'_>, query: String) -> PyResult<PyObject> {
+    let client = get_rdap_client();
+    let response = run_async(py, async move {
+        seer_core::rdap::auto_lookup(client, &query).await
+    })?;
+    let json = serialize_response(&response)?;
+    json_to_python(py, &json)
 }
 
 #[pyfunction]
@@ -201,52 +302,34 @@ fn dig(
     record_type: &str,
     nameserver: Option<String>,
 ) -> PyResult<PyObject> {
-    let rt = get_runtime();
     let resolver = get_dns_resolver();
 
     let rt_parsed: RecordType = record_type
         .parse()
-        .map_err(|e: seer_core::SeerError| PyValueError::new_err(e.to_string()))?;
+        .map_err(|e: SeerError| seer_err_to_py(&e))?;
 
-    let result = py.allow_threads(|| {
-        rt.block_on(async {
-            resolver
-                .resolve(&domain, rt_parsed, nameserver.as_deref())
-                .await
-        })
-    });
+    let records = run_async(py, async move {
+        resolver
+            .resolve(&domain, rt_parsed, nameserver.as_deref())
+            .await
+    })?;
 
-    match result {
-        Ok(records) => {
-            let json = serde_json::to_value(&records)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            json_to_python(py, &json)
-        }
-        Err(e) => Err(PyRuntimeError::new_err(e.to_string())),
-    }
+    let json = serialize_response(&records)?;
+    json_to_python(py, &json)
 }
 
 #[pyfunction]
 #[pyo3(signature = (domain, record_type = "A"))]
 fn propagation(py: Python<'_>, domain: String, record_type: &str) -> PyResult<PyObject> {
-    let rt = get_runtime();
     let checker = get_propagation_checker();
 
     let rt_parsed: RecordType = record_type
         .parse()
-        .map_err(|e: seer_core::SeerError| PyValueError::new_err(e.to_string()))?;
+        .map_err(|e: SeerError| seer_err_to_py(&e))?;
 
-    let result =
-        py.allow_threads(|| rt.block_on(async { checker.check(&domain, rt_parsed).await }));
-
-    match result {
-        Ok(result) => {
-            let json = serde_json::to_value(&result)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            json_to_python(py, &json)
-        }
-        Err(e) => Err(PyRuntimeError::new_err(e.to_string())),
-    }
+    let response = run_async(py, async move { checker.check(&domain, rt_parsed).await })?;
+    let json = serialize_response(&response)?;
+    json_to_python(py, &json)
 }
 
 const MAX_CONCURRENCY: usize = 50;
@@ -261,24 +344,152 @@ fn validate_concurrency(concurrency: usize) -> PyResult<usize> {
     Ok(concurrency.max(1))
 }
 
+/// Internal progress event carried from the Tokio workers (where
+/// `ProgressCallback` fires) to the dedicated OS thread that actually
+/// invokes the Python callable.
+struct ProgressEvent {
+    completed: usize,
+    total: usize,
+    domain: String,
+}
+
+/// Decoupling pipe between seer-core's `ProgressCallback` (called from
+/// Tokio worker threads) and the Python callable supplied by the caller.
+///
+/// Rationale: if the Python callable itself blocks — or even just yields
+/// GIL contention — a closure that acquires the GIL directly from a Tokio
+/// worker can deadlock the runtime. The GIL-holding thread may be waiting
+/// on a Tokio task that cannot make progress because every worker is
+/// parked behind `Python::with_gil`. Bulk runs with `n` domains under
+/// high concurrency turn this into an `O(n)` pile-up.
+///
+/// Instead we post lightweight events to a bounded `sync_channel`. A
+/// single dedicated OS thread drains the channel and holds the GIL only
+/// while invoking the callback. Tokio workers never touch Python.
+///
+/// Progress is advisory, so if the channel is full we drop the event
+/// rather than back-pressuring the Tokio worker.
+///
+/// Lifecycle: the pipe is kept alive by an `Arc` captured in the
+/// `ProgressCallback` closure returned from `build_progress_callback`.
+/// When seer-core drops that callback at the end of the bulk run, the
+/// `Arc` refcount drops to zero, the sender is dropped, the channel
+/// closes, `rx.recv()` returns `Err`, and the drainer thread exits.
+struct ProgressPipe {
+    /// Wrapped in `Option` so `Drop` can take ownership and drop the
+    /// sender *before* joining the drainer — otherwise the drainer would
+    /// block forever on `rx.recv()`.
+    tx: Option<std::sync::mpsc::SyncSender<ProgressEvent>>,
+    /// Drainer thread handle. Joined on drop so all queued events fire
+    /// before the bulk call returns to Python. Option so `Drop::drop`
+    /// can take ownership.
+    drainer: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ProgressPipe {
+    /// Construct the pipe and spawn the drainer thread.
+    ///
+    /// Returns `Err` if the OS refuses to spawn the drainer (typically
+    /// resource exhaustion). Propagating this as a `PyErr` is mandatory:
+    /// every other `block_on` in this module is wrapped in `catch_unwind`
+    /// because a panic unwinding across the FFI boundary is UB. An
+    /// `.expect()` here would bypass that protection and abort the Python
+    /// process on a transient failure.
+    fn new(py_cb: Py<PyAny>) -> Result<Self, PyErr> {
+        // Bounded channel. 1024 is deep enough to smooth over brief GIL
+        // contention but shallow enough that a pathologically slow
+        // callback causes `try_send` to drop events rather than ballooning
+        // memory.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<ProgressEvent>(1024);
+        let drainer = std::thread::Builder::new()
+            .name("seer-progress-drainer".to_string())
+            .spawn(move || {
+                // Blocks holding no resources until an event arrives or
+                // the last sender is dropped (= pipe teardown).
+                while let Ok(ev) = rx.recv() {
+                    Python::with_gil(|py| {
+                        let bound = py_cb.bind(py);
+                        if let Err(err) = bound.call1((ev.completed, ev.total, ev.domain)) {
+                            // A callback raising is not fatal: log and
+                            // keep draining so later events still fire.
+                            tracing::warn!(
+                                error = %err,
+                                "bulk progress callback raised; ignoring",
+                            );
+                        }
+                    });
+                }
+            })
+            .map_err(|e| {
+                PyRuntimeError::new_err(format!("failed to spawn progress drainer thread: {e}"))
+            })?;
+        Ok(Self {
+            tx: Some(tx),
+            drainer: Some(drainer),
+        })
+    }
+
+    /// Non-blocking send. Drops the event if the channel is full or the
+    /// drainer has exited — progress is advisory.
+    fn send(&self, ev: ProgressEvent) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.try_send(ev);
+        }
+    }
+}
+
+impl Drop for ProgressPipe {
+    fn drop(&mut self) {
+        // Close the channel first by dropping the sender; otherwise the
+        // drainer's `rx.recv()` would block forever waiting on us.
+        drop(self.tx.take());
+        // Then wait for the drainer to process any still-queued events
+        // and exit. We intentionally join so that callers observe all
+        // callback invocations before `bulk_*` returns — otherwise a
+        // test that asserts "N events fired" would race with the drainer.
+        if let Some(handle) = self.drainer.take() {
+            // A panic on the drainer thread would already have been
+            // surfaced via `e.print(py)` inside the loop; a secondary
+            // panic from join itself should not crash the bulk run.
+            if let Err(e) = handle.join() {
+                tracing::warn!(?e, "progress drainer thread panicked during teardown");
+            }
+        }
+    }
+}
+
 /// Converts an optional Python callable into a Rust `ProgressCallback`.
 ///
-/// The returned callback acquires the GIL on every invocation. Exceptions
-/// raised from the Python callable are logged at `warn` and swallowed —
-/// a broken progress callback must not kill a bulk run.
+/// The returned callback posts to a `ProgressPipe` and never touches the
+/// GIL, so Tokio workers cannot deadlock on GIL contention when the
+/// Python callback is slow. See [`ProgressPipe`] for the full rationale.
+///
+/// Returns `Err` if pipe construction fails (e.g. the OS refuses to spawn
+/// the drainer thread). Callers propagate the error with `?` so the Python
+/// caller sees a `RuntimeError` rather than a panic across FFI.
 fn build_progress_callback(
     progress: Option<Py<PyAny>>,
-) -> Option<seer_core::bulk::ProgressCallback> {
-    progress.map(|py_cb| {
-        Box::new(move |completed: usize, total: usize, domain: &str| {
-            Python::with_gil(|py| {
-                let bound = py_cb.bind(py);
-                if let Err(err) = bound.call1((completed, total, domain)) {
-                    tracing::warn!(error = %err, "bulk progress callback raised; ignoring");
-                }
-            });
-        }) as seer_core::bulk::ProgressCallback
-    })
+) -> PyResult<Option<seer_core::bulk::ProgressCallback>> {
+    match progress {
+        None => Ok(None),
+        Some(py_cb) => {
+            // `Arc` so the pipe (which owns the drainer thread) lives as
+            // long as the callback itself. When the executor drops this
+            // Box at the end of the bulk run, the Arc's refcount hits
+            // zero, the ProgressPipe drops, the sender closes, and the
+            // drainer exits.
+            let pipe = std::sync::Arc::new(ProgressPipe::new(py_cb)?);
+            Ok(Some(
+                Box::new(move |completed: usize, total: usize, domain: &str| {
+                    pipe.send(ProgressEvent {
+                        completed,
+                        total,
+                        domain: domain.to_string(),
+                    });
+                }) as seer_core::bulk::ProgressCallback,
+            ))
+        }
+    }
 }
 
 #[pyfunction]
@@ -289,7 +500,6 @@ fn bulk_lookup(
     concurrency: usize,
     progress: Option<Py<PyAny>>,
 ) -> PyResult<PyObject> {
-    let rt = get_runtime();
     let executor = BulkExecutor::new().with_concurrency(validate_concurrency(concurrency)?);
 
     let operations: Vec<BulkOperation> = domains
@@ -297,10 +507,10 @@ fn bulk_lookup(
         .map(|domain| BulkOperation::Lookup { domain })
         .collect();
 
-    let cb = build_progress_callback(progress);
-    let result = py.allow_threads(|| rt.block_on(async { executor.execute(operations, cb).await }));
+    let cb = build_progress_callback(progress)?;
+    let result = run_async_infallible(py, async move { executor.execute(operations, cb).await })?;
 
-    let json = serde_json::to_value(&result).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let json = serialize_response(&result)?;
     json_to_python(py, &json)
 }
 
@@ -312,7 +522,6 @@ fn bulk_whois(
     concurrency: usize,
     progress: Option<Py<PyAny>>,
 ) -> PyResult<PyObject> {
-    let rt = get_runtime();
     let executor = BulkExecutor::new().with_concurrency(validate_concurrency(concurrency)?);
 
     let operations: Vec<BulkOperation> = domains
@@ -320,10 +529,10 @@ fn bulk_whois(
         .map(|domain| BulkOperation::Whois { domain })
         .collect();
 
-    let cb = build_progress_callback(progress);
-    let result = py.allow_threads(|| rt.block_on(async { executor.execute(operations, cb).await }));
+    let cb = build_progress_callback(progress)?;
+    let result = run_async_infallible(py, async move { executor.execute(operations, cb).await })?;
 
-    let json = serde_json::to_value(&result).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let json = serialize_response(&result)?;
     json_to_python(py, &json)
 }
 
@@ -336,12 +545,11 @@ fn bulk_dig(
     concurrency: usize,
     progress: Option<Py<PyAny>>,
 ) -> PyResult<PyObject> {
-    let rt = get_runtime();
     let executor = BulkExecutor::new().with_concurrency(validate_concurrency(concurrency)?);
 
     let rt_parsed: RecordType = record_type
         .parse()
-        .map_err(|e: seer_core::SeerError| PyValueError::new_err(e.to_string()))?;
+        .map_err(|e: SeerError| seer_err_to_py(&e))?;
 
     let operations: Vec<BulkOperation> = domains
         .into_iter()
@@ -351,10 +559,10 @@ fn bulk_dig(
         })
         .collect();
 
-    let cb = build_progress_callback(progress);
-    let result = py.allow_threads(|| rt.block_on(async { executor.execute(operations, cb).await }));
+    let cb = build_progress_callback(progress)?;
+    let result = run_async_infallible(py, async move { executor.execute(operations, cb).await })?;
 
-    let json = serde_json::to_value(&result).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let json = serialize_response(&result)?;
     json_to_python(py, &json)
 }
 
@@ -367,12 +575,11 @@ fn bulk_propagation(
     concurrency: usize,
     progress: Option<Py<PyAny>>,
 ) -> PyResult<PyObject> {
-    let rt = get_runtime();
     let executor = BulkExecutor::new().with_concurrency(validate_concurrency(concurrency)?);
 
     let rt_parsed: RecordType = record_type
         .parse()
-        .map_err(|e: seer_core::SeerError| PyValueError::new_err(e.to_string()))?;
+        .map_err(|e: SeerError| seer_err_to_py(&e))?;
 
     let operations: Vec<BulkOperation> = domains
         .into_iter()
@@ -382,28 +589,19 @@ fn bulk_propagation(
         })
         .collect();
 
-    let cb = build_progress_callback(progress);
-    let result = py.allow_threads(|| rt.block_on(async { executor.execute(operations, cb).await }));
+    let cb = build_progress_callback(progress)?;
+    let result = run_async_infallible(py, async move { executor.execute(operations, cb).await })?;
 
-    let json = serde_json::to_value(&result).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let json = serialize_response(&result)?;
     json_to_python(py, &json)
 }
 
 #[pyfunction]
 fn status(py: Python<'_>, domain: String) -> PyResult<PyObject> {
-    let rt = get_runtime();
     let client = get_status_client();
-
-    let result = py.allow_threads(|| rt.block_on(async { client.check(&domain).await }));
-
-    match result {
-        Ok(response) => {
-            let json = serde_json::to_value(&response)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            json_to_python(py, &json)
-        }
-        Err(e) => Err(PyRuntimeError::new_err(e.to_string())),
-    }
+    let response = run_async(py, async move { client.check(&domain).await })?;
+    let json = serialize_response(&response)?;
+    json_to_python(py, &json)
 }
 
 #[pyfunction]
@@ -414,7 +612,6 @@ fn bulk_status(
     concurrency: usize,
     progress: Option<Py<PyAny>>,
 ) -> PyResult<PyObject> {
-    let rt = get_runtime();
     let executor = BulkExecutor::new().with_concurrency(validate_concurrency(concurrency)?);
 
     let operations: Vec<BulkOperation> = domains
@@ -422,10 +619,10 @@ fn bulk_status(
         .map(|domain| BulkOperation::Status { domain })
         .collect();
 
-    let cb = build_progress_callback(progress);
-    let result = py.allow_threads(|| rt.block_on(async { executor.execute(operations, cb).await }));
+    let cb = build_progress_callback(progress)?;
+    let result = run_async_infallible(py, async move { executor.execute(operations, cb).await })?;
 
-    let json = serde_json::to_value(&result).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let json = serialize_response(&result)?;
     json_to_python(py, &json)
 }
 
@@ -437,7 +634,6 @@ fn bulk_availability(
     concurrency: usize,
     progress: Option<Py<PyAny>>,
 ) -> PyResult<PyObject> {
-    let rt = get_runtime();
     let executor = BulkExecutor::new().with_concurrency(validate_concurrency(concurrency)?);
 
     let operations: Vec<BulkOperation> = domains
@@ -445,79 +641,43 @@ fn bulk_availability(
         .map(|domain| BulkOperation::Avail { domain })
         .collect();
 
-    let cb = build_progress_callback(progress);
-    let result = py.allow_threads(|| rt.block_on(async { executor.execute(operations, cb).await }));
+    let cb = build_progress_callback(progress)?;
+    let result = run_async_infallible(py, async move { executor.execute(operations, cb).await })?;
 
-    let json = serde_json::to_value(&result).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let json = serialize_response(&result)?;
     json_to_python(py, &json)
 }
 
 #[pyfunction]
 fn availability(py: Python<'_>, domain: String) -> PyResult<PyObject> {
-    let rt = get_runtime();
     let checker = get_availability_checker();
-
-    let result = py.allow_threads(|| rt.block_on(async { checker.check(&domain).await }));
-
-    match result {
-        Ok(response) => {
-            let json = serde_json::to_value(&response)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            json_to_python(py, &json)
-        }
-        Err(e) => Err(PyRuntimeError::new_err(e.to_string())),
-    }
+    let response = run_async(py, async move { checker.check(&domain).await })?;
+    let json = serialize_response(&response)?;
+    json_to_python(py, &json)
 }
 
 #[pyfunction]
 fn subdomains(py: Python<'_>, domain: String) -> PyResult<PyObject> {
-    let rt = get_runtime();
     let enumerator = get_subdomain_enumerator();
-
-    let result = py.allow_threads(|| rt.block_on(async { enumerator.enumerate(&domain).await }));
-
-    match result {
-        Ok(response) => {
-            let json = serde_json::to_value(&response)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            json_to_python(py, &json)
-        }
-        Err(e) => Err(PyRuntimeError::new_err(e.to_string())),
-    }
+    let response = run_async(py, async move { enumerator.enumerate(&domain).await })?;
+    let json = serialize_response(&response)?;
+    json_to_python(py, &json)
 }
 
 #[pyfunction]
 fn ssl(py: Python<'_>, domain: String) -> PyResult<PyObject> {
-    let rt = get_runtime();
     let checker = get_ssl_checker();
-
-    let result = py.allow_threads(|| rt.block_on(async { checker.check(&domain).await }));
-
-    match result {
-        Ok(response) => {
-            let json = serde_json::to_value(&response)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            json_to_python(py, &json)
-        }
-        Err(e) => Err(PyRuntimeError::new_err(e.to_string())),
-    }
+    let response = run_async(py, async move { checker.check(&domain).await })?;
+    let json = serialize_response(&response)?;
+    json_to_python(py, &json)
 }
 
 #[pyfunction]
 fn dnssec(py: Python<'_>, domain: String) -> PyResult<PyObject> {
-    let rt = get_runtime();
     let checker = get_dnssec_checker();
-
-    let result = py.allow_threads(|| rt.block_on(async { checker.check(&domain).await }));
-
-    match result {
-        Ok(response) => {
-            let json = serde_json::to_value(&response)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            json_to_python(py, &json)
-        }
-        Err(e) => Err(PyRuntimeError::new_err(e.to_string())),
-    }
+    let response = run_async(py, async move { checker.check(&domain).await })?;
+    let json = serialize_response(&response)?;
+    json_to_python(py, &json)
 }
 
 #[pyfunction]
@@ -528,29 +688,20 @@ fn dns_compare(
     server_a: String,
     server_b: String,
 ) -> PyResult<PyObject> {
-    let rt = get_runtime();
     let comparator = get_dns_comparator();
 
     let rt_parsed: RecordType = record_type
         .parse()
-        .map_err(|e: seer_core::SeerError| PyValueError::new_err(e.to_string()))?;
+        .map_err(|e: SeerError| seer_err_to_py(&e))?;
 
-    let result = py.allow_threads(|| {
-        rt.block_on(async {
-            comparator
-                .compare(&domain, rt_parsed, &server_a, &server_b)
-                .await
-        })
-    });
+    let response = run_async(py, async move {
+        comparator
+            .compare(&domain, rt_parsed, &server_a, &server_b)
+            .await
+    })?;
 
-    match result {
-        Ok(response) => {
-            let json = serde_json::to_value(&response)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            json_to_python(py, &json)
-        }
-        Err(e) => Err(PyRuntimeError::new_err(e.to_string())),
-    }
+    let json = serialize_response(&response)?;
+    json_to_python(py, &json)
 }
 
 #[pyfunction]
@@ -563,17 +714,20 @@ fn dns_follow(
     iterations: usize,
     interval_minutes: f64,
 ) -> PyResult<PyObject> {
-    let rt = get_runtime();
+    // Refuse concurrent calls before touching any shared state — a second
+    // call would overwrite the global cancel sender, silently orphaning the
+    // first call's ability to be cancelled. The guard releases on return.
+    let _active = FollowActiveGuard::acquire()?;
+
     let follower = get_dns_follower();
 
     let rt_parsed: RecordType = record_type
         .parse()
-        .map_err(|e: seer_core::SeerError| PyValueError::new_err(e.to_string()))?;
+        .map_err(|e: SeerError| seer_err_to_py(&e))?;
 
     // Validate iteration/interval via core; this rejects NaN/inf/negative and
     // enforces the per-interval cap (<= 60 minutes).
-    let config = FollowConfig::new(iterations, interval_minutes)
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let config = FollowConfig::new(iterations, interval_minutes).map_err(|e| seer_err_to_py(&e))?;
 
     // Additionally cap total wall-clock time and iteration count to prevent
     // blocking the shared Tokio runtime for excessive durations.
@@ -594,29 +748,26 @@ fn dns_follow(
     }
 
     // Install a fresh cancellation channel for this call so that any previous
-    // `cancel_follow()` signals do not affect it.
+    // `cancel_follow()` signals do not affect it. Use `lock_follow` rather
+    // than `.expect` so a prior panic cannot permanently break the endpoint.
     let cancel_rx = {
         let (tx, rx) = watch::channel(false);
-        let mut slot = follow_cancel_sender()
-            .lock()
-            .expect("follow cancel sender mutex poisoned");
+        let mut slot = lock_follow();
         *slot = tx;
         rx
     };
 
-    let result = py.allow_threads(|| {
-        rt.block_on(async {
-            follower
-                .follow(
-                    &domain,
-                    rt_parsed,
-                    nameserver.as_deref(),
-                    config,
-                    None,
-                    Some(cancel_rx),
-                )
-                .await
-        })
+    let response = run_async(py, async move {
+        follower
+            .follow(
+                &domain,
+                rt_parsed,
+                nameserver.as_deref(),
+                config,
+                None,
+                Some(cancel_rx),
+            )
+            .await
     });
 
     // Reset the global sender so stale `cancel_follow()` calls after this
@@ -624,20 +775,13 @@ fn dns_follow(
     // before it installs its own sender.
     {
         let (tx, _rx) = watch::channel(false);
-        let mut slot = follow_cancel_sender()
-            .lock()
-            .expect("follow cancel sender mutex poisoned");
+        let mut slot = lock_follow();
         *slot = tx;
     }
 
-    match result {
-        Ok(response) => {
-            let json = serde_json::to_value(&response)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            json_to_python(py, &json)
-        }
-        Err(e) => Err(PyRuntimeError::new_err(e.to_string())),
-    }
+    let response = response?;
+    let json = serialize_response(&response)?;
+    json_to_python(py, &json)
 }
 
 /// Signal the currently-running `dns_follow` call (if any) to cancel.
@@ -645,50 +789,32 @@ fn dns_follow(
 /// This is a best-effort signal: the call will return on its next cancellation
 /// check point (between DNS lookups or while sleeping between iterations).
 /// If no `dns_follow` is currently running, this is a no-op.
+///
+/// Intentionally does not acquire `FollowActiveGuard`: its purpose is to
+/// interrupt a running `dns_follow`, so it must be callable concurrently with
+/// one.
 #[pyfunction]
 fn cancel_follow() -> PyResult<()> {
-    let slot = follow_cancel_sender()
-        .lock()
-        .expect("follow cancel sender mutex poisoned");
+    let slot = lock_follow();
     let _ = slot.send(true);
     Ok(())
 }
 
 #[pyfunction]
 fn diff(py: Python<'_>, domain_a: String, domain_b: String) -> PyResult<PyObject> {
-    let rt = get_runtime();
     let differ = get_domain_differ();
-
-    let result =
-        py.allow_threads(|| rt.block_on(async { differ.diff(&domain_a, &domain_b).await }));
-
-    match result {
-        Ok(response) => {
-            let json = serde_json::to_value(&response)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            json_to_python(py, &json)
-        }
-        Err(e) => Err(PyRuntimeError::new_err(e.to_string())),
-    }
+    let response = run_async(py, async move { differ.diff(&domain_a, &domain_b).await })?;
+    let json = serialize_response(&response)?;
+    json_to_python(py, &json)
 }
 
 #[pyfunction]
 fn info(py: Python<'_>, domain: String) -> PyResult<PyObject> {
-    let rt = get_runtime();
     let smart_lookup = get_smart_lookup();
-
-    let result = py.allow_threads(|| rt.block_on(async { smart_lookup.lookup(&domain).await }));
-
-    match result {
-        Ok(lookup_result) => {
-            let domain_info =
-                seer_core::domain_info::DomainInfo::from_lookup_result(&lookup_result);
-            let json = serde_json::to_value(&domain_info)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            json_to_python(py, &json)
-        }
-        Err(e) => Err(PyRuntimeError::new_err(e.to_string())),
-    }
+    let lookup_result = run_async(py, async move { smart_lookup.lookup(&domain).await })?;
+    let domain_info = seer_core::domain_info::DomainInfo::from_lookup_result(&lookup_result);
+    let json = serialize_response(&domain_info)?;
+    json_to_python(py, &json)
 }
 
 #[pyfunction]
@@ -699,7 +825,6 @@ fn bulk_info(
     concurrency: usize,
     progress: Option<Py<PyAny>>,
 ) -> PyResult<PyObject> {
-    let rt = get_runtime();
     let executor = BulkExecutor::new().with_concurrency(validate_concurrency(concurrency)?);
 
     let operations: Vec<BulkOperation> = domains
@@ -707,14 +832,40 @@ fn bulk_info(
         .map(|domain| BulkOperation::Info { domain })
         .collect();
 
-    let cb = build_progress_callback(progress);
-    let result = py.allow_threads(|| rt.block_on(async { executor.execute(operations, cb).await }));
+    let cb = build_progress_callback(progress)?;
+    let result = run_async_infallible(py, async move { executor.execute(operations, cb).await })?;
 
-    let json = serde_json::to_value(&result).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let json = serialize_response(&result)?;
     json_to_python(py, &json)
 }
 
+/// Maximum recursion depth permitted when converting `serde_json::Value`
+/// into a Python object graph.
+///
+/// An adversarial WHOIS or RDAP response could nest arrays or objects
+/// deeply enough to overflow the thread stack during conversion, which
+/// aborts the process unrecoverably. The cap surfaces the failure as a
+/// catchable `ValueError` instead. 128 levels is well above anything any
+/// real-world registry response has ever contained.
+const MAX_JSON_DEPTH: usize = 128;
+
+/// Entry point for converting a `serde_json::Value` into a Python object.
+/// Starts the recursion at depth 0; the inner helper enforces
+/// [`MAX_JSON_DEPTH`].
 fn json_to_python(py: Python<'_>, value: &serde_json::Value) -> PyResult<PyObject> {
+    json_to_python_inner(py, value, 0)
+}
+
+fn json_to_python_inner(
+    py: Python<'_>,
+    value: &serde_json::Value,
+    depth: usize,
+) -> PyResult<PyObject> {
+    if depth > MAX_JSON_DEPTH {
+        return Err(PyValueError::new_err(format!(
+            "JSON structure exceeds max depth {MAX_JSON_DEPTH}"
+        )));
+    }
     match value {
         serde_json::Value::Null => Ok(py.None()),
         serde_json::Value::Bool(b) => Ok(b.into_pyobject(py)?.to_owned().into_any().unbind()),
@@ -733,18 +884,39 @@ fn json_to_python(py: Python<'_>, value: &serde_json::Value) -> PyResult<PyObjec
         serde_json::Value::Array(arr) => {
             let list: Vec<PyObject> = arr
                 .iter()
-                .map(|v| json_to_python(py, v))
+                .map(|v| json_to_python_inner(py, v, depth + 1))
                 .collect::<PyResult<_>>()?;
             Ok(list.into_pyobject(py)?.into_any().unbind())
         }
         serde_json::Value::Object(obj) => {
             let dict = PyDict::new(py);
             for (k, v) in obj {
-                dict.set_item(k, json_to_python(py, v)?)?;
+                dict.set_item(k, json_to_python_inner(py, v, depth + 1)?)?;
             }
             Ok(dict.into_any().unbind())
         }
     }
+}
+
+/// Test hook: constructs a `serde_json::Value` with `depth` levels of
+/// nested arrays and runs it through [`json_to_python`].
+///
+/// Used by `tests/test_json_depth.py` to verify the [`MAX_JSON_DEPTH`]
+/// guard raises `ValueError` instead of overflowing the thread stack on
+/// an adversarial payload.
+///
+/// This is a `#[pyfunction]` rather than a `#[cfg(test)]` Rust unit test
+/// because `seer-py` is a `cdylib` crate — a Rust test binary would fail
+/// to link against `libpython`. The function is prefixed with `_` to
+/// signal that it is not part of the public API and is undocumented in
+/// `__all__`.
+#[pyfunction]
+fn _json_to_python_nested_for_test(py: Python<'_>, depth: usize) -> PyResult<PyObject> {
+    let mut v = serde_json::Value::Null;
+    for _ in 0..depth {
+        v = serde_json::Value::Array(vec![v]);
+    }
+    json_to_python(py, &v)
 }
 
 /// Install a tracing subscriber that forwards Rust log events into Python's
@@ -758,11 +930,14 @@ fn init_rust_logging() {
 #[pymodule]
 fn _seer(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(init_rust_logging, m)?)?;
+    m.add_function(wrap_pyfunction!(_json_to_python_nested_for_test, m)?)?;
+    m.add_function(wrap_pyfunction!(validate_public_host, m)?)?;
     m.add_function(wrap_pyfunction!(lookup, m)?)?;
     m.add_function(wrap_pyfunction!(whois, m)?)?;
     m.add_function(wrap_pyfunction!(rdap_domain, m)?)?;
     m.add_function(wrap_pyfunction!(rdap_ip, m)?)?;
     m.add_function(wrap_pyfunction!(rdap_asn, m)?)?;
+    m.add_function(wrap_pyfunction!(rdap_auto, m)?)?;
     m.add_function(wrap_pyfunction!(dig, m)?)?;
     m.add_function(wrap_pyfunction!(propagation, m)?)?;
     m.add_function(wrap_pyfunction!(status, m)?)?;

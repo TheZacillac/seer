@@ -338,6 +338,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "live network; run with --ignored or SEER_LIVE_TESTS=1"]
     async fn test_follow_single_iteration() {
         let follower = DnsFollower::new();
         let config = FollowConfig::new(1, 0.0).unwrap();
@@ -386,6 +387,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "live network; run with --ignored or SEER_LIVE_TESTS=1"]
     async fn follow_honors_cancel() {
         use tokio::sync::watch;
 

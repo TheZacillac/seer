@@ -7,6 +7,7 @@ from fastapi import APIRouter, Path, Query, Request
 from pydantic import BaseModel, Field
 from seer_api.errors import http_error
 from seer_api.limiting import limiter
+from seer_api.ssrf import guard_async as ssrf_guard_async
 from seer_api.streaming import stream_bulk
 
 import seer
@@ -45,6 +46,14 @@ async def dns_lookup(
     Returns:
         List of DNS records
     """
+    # A DNS query uses port 53 on the resolver. The domain being queried is
+    # not a target of an outbound connection (we look it up via our resolver),
+    # but the nameserver param IS — it's where our resolver sends packets.
+    # Validate both: the domain in case the resolver chases it, and the
+    # nameserver explicitly at port 53.
+    await ssrf_guard_async(domain, 53)
+    if nameserver is not None:
+        await ssrf_guard_async(nameserver, 53)
     try:
         loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(
@@ -67,6 +76,8 @@ async def bulk_dns_lookup(request: Request, body: BulkDnsRequest):
     Returns:
         List of DNS results for each domain
     """
+    for d in body.domains:
+        await ssrf_guard_async(d, 53)
     try:
         loop = asyncio.get_running_loop()
         results = await loop.run_in_executor(
@@ -81,6 +92,8 @@ async def bulk_dns_lookup(request: Request, body: BulkDnsRequest):
 @limiter.limit("10/minute")
 async def bulk_dns_stream(request: Request, body: BulkDnsRequest):
     """Stream bulk DNS queries as Server-Sent Events."""
+    for d in body.domains:
+        await ssrf_guard_async(d, 53)
     try:
         return await stream_bulk(
             seer.bulk_dig, body.domains, body.record_type, body.concurrency

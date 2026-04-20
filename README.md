@@ -341,8 +341,21 @@ See [seer-core/README.md](seer-core/README.md) for the full API reference.
 ## 🌍 REST API
 
 ```bash
-seer-api   # Starts on http://localhost:8000
+seer-api   # Starts on http://127.0.0.1:8000 (loopback-only by default)
 ```
+
+### Deployment notes (breaking change)
+
+- **Default bind is `127.0.0.1`** (was `0.0.0.0` in previous versions).
+  To bind publicly, set both `SEER_HOST=0.0.0.0` and `SEER_API_KEY` —
+  the server refuses to start on a non-loopback host without an auth
+  key.
+- **`/docs`, `/redoc`, `/openapi.json` are disabled by default.** Set
+  `SEER_DOCS_ENABLED=true` to re-enable.
+- **Multi-worker deployments require `SEER_RATE_LIMIT_STORAGE`.** With
+  `WEB_CONCURRENCY>1` and the default in-memory limiter, the server
+  refuses to start — the per-worker limiter would be trivially
+  bypassable. Use `redis://host:6379` or another shared store.
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
@@ -369,7 +382,8 @@ curl -X POST http://localhost:8000/lookup/bulk \
   -d '{"domains": ["example.com", "google.com"]}'
 ```
 
-API docs: [Swagger UI](http://localhost:8000/docs) · [ReDoc](http://localhost:8000/redoc)
+API docs (when `SEER_DOCS_ENABLED=true`):
+[Swagger UI](http://localhost:8000/docs) · [ReDoc](http://localhost:8000/redoc)
 
 ---
 

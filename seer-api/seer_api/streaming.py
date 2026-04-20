@@ -13,11 +13,16 @@ Event ordering (see spec):
 
 import asyncio
 import json
+import logging
 import time
 from collections.abc import AsyncGenerator, Callable
 from typing import Any
 
 from starlette.responses import StreamingResponse
+
+from .errors import safe_error_message
+
+logger = logging.getLogger("seer_api")
 
 
 def _sse(event: str, data: dict) -> bytes:
@@ -84,11 +89,28 @@ async def stream_bulk(
 
         # Phase 2/3: item events + done event. If bulk_future raised, emit a
         # terminal `error` event so clients can tell the stream ended abnormally.
+        # The streamed message is routed through ``safe_error_message`` — the
+        # SSE event arrives after response headers have been sent, so we can
+        # no longer upgrade the HTTP status and must instead ensure the body
+        # never leaks internal paths, Rust panic strings, or tracebacks. The
+        # full exception is logged server-side for diagnosis (H13).
         assert pending_results is not None or pending_error is not None
         if pending_error is not None:
+            logger.exception(
+                "streaming bulk failure",
+                exc_info=(
+                    type(pending_error),
+                    pending_error,
+                    pending_error.__traceback__,
+                ),
+            )
             yield _sse(
                 "error",
-                {"message": str(pending_error)},
+                {
+                    "message": safe_error_message(
+                        pending_error, fallback="bulk operation failed"
+                    )
+                },
             )
             return
 

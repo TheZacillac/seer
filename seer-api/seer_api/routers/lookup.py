@@ -7,6 +7,7 @@ from fastapi import APIRouter, Path, Request
 from pydantic import BaseModel, Field
 from seer_api.errors import http_error
 from seer_api.limiting import limiter
+from seer_api.ssrf import guard_async as ssrf_guard_async
 from seer_api.streaming import stream_bulk
 
 import seer
@@ -40,6 +41,7 @@ async def smart_lookup(
     Returns:
         Lookup result with source indicator (rdap or whois) and registration data
     """
+    await ssrf_guard_async(domain, 443)
     try:
         loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(None, seer.lookup, domain)
@@ -60,6 +62,8 @@ async def bulk_smart_lookup(request: Request, body: BulkLookupRequest):
     Returns:
         List of lookup results for each domain
     """
+    for d in body.domains:
+        await ssrf_guard_async(d, 443)
     try:
         loop = asyncio.get_running_loop()
         results = await loop.run_in_executor(
@@ -78,6 +82,8 @@ async def bulk_smart_lookup_stream(request: Request, body: BulkLookupRequest):
     Emits `progress`, `item`, and `done` events. Matches the sync /bulk
     semantics — see that handler for request/response body shape.
     """
+    for d in body.domains:
+        await ssrf_guard_async(d, 443)
     try:
         return await stream_bulk(seer.bulk_lookup, body.domains, body.concurrency)
     except Exception as e:

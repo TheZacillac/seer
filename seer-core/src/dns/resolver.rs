@@ -730,3 +730,268 @@ fn is_valid_srv_label(label: &str) -> bool {
         && !label.starts_with('-')
         && !label.ends_with('-')
 }
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for the pure helpers and public surface of the DNS
+    //! resolver. Tests that would exercise the hickory wire protocol
+    //! are covered by live-network tests marked `#[ignore]` in the
+    //! sibling modules (`dns/dnssec.rs`, `dns/follow.rs`). Deeper
+    //! coverage of `resolve_*` paths would require a hickory mock,
+    //! which is out of scope for this module.
+    //
+    // TODO: mock hickory resolver for full path coverage.
+
+    use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    // --- RecordType::from_str edge cases -----------------------------
+
+    #[test]
+    fn record_type_from_str_accepts_lowercase() {
+        assert_eq!(RecordType::from_str("a").unwrap(), RecordType::A);
+        assert_eq!(RecordType::from_str("mx").unwrap(), RecordType::MX);
+        assert_eq!(RecordType::from_str("cname").unwrap(), RecordType::CNAME);
+        assert_eq!(RecordType::from_str("dnskey").unwrap(), RecordType::DNSKEY);
+    }
+
+    #[test]
+    fn record_type_from_str_accepts_mixed_case() {
+        assert_eq!(RecordType::from_str("Mx").unwrap(), RecordType::MX);
+        assert_eq!(RecordType::from_str("cNaMe").unwrap(), RecordType::CNAME);
+    }
+
+    #[test]
+    fn record_type_from_str_rejects_whitespace_padded() {
+        // No trim is done inside from_str; leading/trailing whitespace
+        // must currently cause a parse error so callers don't pass
+        // malformed labels through.
+        assert!(RecordType::from_str(" A").is_err());
+        assert!(RecordType::from_str("A ").is_err());
+        assert!(RecordType::from_str("\tA\n").is_err());
+    }
+
+    #[test]
+    fn record_type_from_str_rejects_unknown() {
+        assert!(RecordType::from_str("NOTAREAL").is_err());
+        assert!(RecordType::from_str("A1").is_err());
+        assert!(RecordType::from_str("").is_err());
+    }
+
+    #[test]
+    fn record_type_from_str_accepts_star_as_any() {
+        assert_eq!(RecordType::from_str("*").unwrap(), RecordType::ANY);
+        assert_eq!(RecordType::from_str("ANY").unwrap(), RecordType::ANY);
+        assert_eq!(RecordType::from_str("any").unwrap(), RecordType::ANY);
+    }
+
+    // --- is_valid_srv_label ------------------------------------------
+
+    #[test]
+    fn srv_label_accepts_alphanumeric_and_hyphen() {
+        assert!(is_valid_srv_label("http"));
+        assert!(is_valid_srv_label("ldap-tls"));
+        assert!(is_valid_srv_label("a1"));
+        assert!(is_valid_srv_label("tcp"));
+    }
+
+    #[test]
+    fn srv_label_rejects_empty() {
+        assert!(!is_valid_srv_label(""));
+    }
+
+    #[test]
+    fn srv_label_rejects_leading_or_trailing_hyphen() {
+        assert!(!is_valid_srv_label("-http"));
+        assert!(!is_valid_srv_label("http-"));
+        assert!(!is_valid_srv_label("-"));
+    }
+
+    #[test]
+    fn srv_label_rejects_dots() {
+        // Dots would let an attacker construct `_service._tcp.evil.com.target`
+        // and pivot the query to a different domain.
+        assert!(!is_valid_srv_label("http.evil"));
+        assert!(!is_valid_srv_label("a.b"));
+    }
+
+    #[test]
+    fn srv_label_rejects_special_chars() {
+        assert!(!is_valid_srv_label("http evil"));
+        assert!(!is_valid_srv_label("http/evil"));
+        assert!(!is_valid_srv_label("http\0"));
+        assert!(!is_valid_srv_label("http\n"));
+    }
+
+    #[test]
+    fn srv_label_rejects_over_63_chars() {
+        let too_long = "a".repeat(64);
+        assert!(!is_valid_srv_label(&too_long));
+        let exactly_63 = "a".repeat(63);
+        assert!(is_valid_srv_label(&exactly_63));
+    }
+
+    // --- reverse_dns_name --------------------------------------------
+
+    #[test]
+    fn reverse_dns_name_formats_ipv4_correctly() {
+        let ip: IpAddr = Ipv4Addr::new(192, 0, 2, 1).into();
+        assert_eq!(reverse_dns_name(&ip), "1.2.0.192.in-addr.arpa");
+    }
+
+    #[test]
+    fn reverse_dns_name_formats_ipv6_correctly() {
+        // ::1 (loopback) → 32 nibbles of 0 followed by ...0.0.0.1 reversed.
+        let ip: IpAddr = Ipv6Addr::LOCALHOST.into();
+        let name = reverse_dns_name(&ip);
+        assert!(
+            name.ends_with(".ip6.arpa"),
+            "must end with .ip6.arpa; got: {}",
+            name
+        );
+        // The first nibble (most-reversed position) must be 1 (from ::1 low bit).
+        assert!(
+            name.starts_with("1."),
+            "expected '1.' prefix, got: {}",
+            name
+        );
+        // 32 nibbles + 31 dots + ".ip6.arpa" (9 chars) = 72.
+        assert_eq!(name.len(), 72);
+    }
+
+    // --- DnsResolver construction ------------------------------------
+
+    #[test]
+    fn resolver_new_has_default_timeout() {
+        let r = DnsResolver::new();
+        assert_eq!(r.timeout, DEFAULT_TIMEOUT);
+    }
+
+    #[test]
+    fn resolver_with_timeout_overrides_default() {
+        let custom = Duration::from_secs(42);
+        let r = DnsResolver::new().with_timeout(custom);
+        assert_eq!(r.timeout, custom);
+    }
+
+    #[test]
+    fn resolver_default_matches_new() {
+        let a = DnsResolver::default();
+        let b = DnsResolver::new();
+        assert_eq!(a.timeout, b.timeout);
+    }
+
+    // --- create_custom_resolver validation ---------------------------
+
+    #[test]
+    fn custom_resolver_rejects_invalid_ip() {
+        let r = DnsResolver::new();
+        let err = r.create_custom_resolver("not-an-ip").unwrap_err();
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("invalid nameserver ip"),
+            "expected 'invalid nameserver ip' in error, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn custom_resolver_rejects_private_ipv4() {
+        // SSRF defense: private / reserved ranges must be blocked even
+        // when passed as a literal IP rather than a hostname.
+        let r = DnsResolver::new();
+        for reserved in ["127.0.0.1", "10.0.0.1", "192.168.1.1", "169.254.169.254"] {
+            let err = r.create_custom_resolver(reserved).unwrap_err();
+            let msg = err.to_string().to_lowercase();
+            assert!(
+                msg.contains("blocked") || msg.contains("reserved"),
+                "reserved IP {} must be rejected, got error: {}",
+                reserved,
+                msg
+            );
+        }
+    }
+
+    #[test]
+    fn custom_resolver_rejects_loopback_ipv6() {
+        let r = DnsResolver::new();
+        let err = r.create_custom_resolver("::1").unwrap_err();
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("blocked") || msg.contains("reserved"),
+            "::1 must be rejected, got error: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn custom_resolver_accepts_public_ipv4() {
+        // A known public resolver IP must be acceptable.
+        let r = DnsResolver::new();
+        let result = r.create_custom_resolver("8.8.8.8");
+        assert!(
+            result.is_ok(),
+            "8.8.8.8 must be accepted as a public nameserver, got: {:?}",
+            result.err()
+        );
+    }
+
+    // --- SRV query validation (integration between helper + resolver) ----
+
+    #[tokio::test]
+    async fn resolve_srv_rejects_invalid_service_label() {
+        let r = DnsResolver::new();
+        // With_dot service name would construct a malformed DNS query.
+        let result = r.resolve_srv("http.evil", "tcp", "example.com", None).await;
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string().to_lowercase();
+        assert!(
+            msg.contains("invalid srv service"),
+            "expected SRV service validation error, got: {}",
+            msg
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_srv_rejects_invalid_protocol_label() {
+        let r = DnsResolver::new();
+        let result = r.resolve_srv("http", "tcp.evil", "example.com", None).await;
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string().to_lowercase();
+        assert!(
+            msg.contains("invalid srv protocol"),
+            "expected SRV protocol validation error, got: {}",
+            msg
+        );
+    }
+
+    // --- Normalization applied before resolution ---------------------
+
+    #[tokio::test]
+    async fn resolve_normalizes_uppercase_domain_input() {
+        // We can't hit the network in unit tests, but we can at least
+        // assert that normalization rejects clearly-invalid input
+        // before any network call is made. Domains with a leading `.`
+        // are rejected by the normalizer.
+        let r = DnsResolver::new();
+        let result = r.resolve(".bad.example", RecordType::A, None).await;
+        assert!(result.is_err(), "leading-dot domain must be rejected");
+    }
+
+    // --- SRV record -------------------------------------------------
+
+    #[tokio::test]
+    async fn resolve_rejects_srv_record_type_without_srv_helper() {
+        // Calling `resolve` with SRV should return the helpful error
+        // instructing the caller to use `resolve_srv` instead.
+        let r = DnsResolver::new();
+        let result = r.resolve("example.com", RecordType::SRV, None).await;
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("SRV records require service name format"),
+            "expected helpful SRV error, got: {}",
+            msg
+        );
+    }
+}

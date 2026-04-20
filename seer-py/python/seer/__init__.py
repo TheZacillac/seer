@@ -30,6 +30,7 @@ from seer._seer import (
     rdap_domain,
     rdap_ip,
     rdap_asn,
+    rdap_auto,
     dig,
     propagation,
     status,
@@ -49,6 +50,7 @@ from seer._seer import (
     diff,
     info,
     bulk_info,
+    validate_public_host,
 )
 
 # Forward Rust tracing events into Python logging.
@@ -64,9 +66,11 @@ except Exception:
 __all__ = [
     "lookup",
     "whois",
+    "rdap",
     "rdap_domain",
     "rdap_ip",
     "rdap_asn",
+    "rdap_auto",
     "dig",
     "propagation",
     "status",
@@ -86,6 +90,7 @@ __all__ = [
     "diff",
     "info",
     "bulk_info",
+    "validate_public_host",
 ]
 
 
@@ -95,8 +100,12 @@ def rdap(query: str) -> dict:
 
     Automatically detects the query type based on the format:
     - IP addresses (v4 or v6) -> IP lookup
-    - ASN format (AS12345 or as12345) -> ASN lookup
+    - ASN format (AS12345 or as12345, no embedded dots) -> ASN lookup
     - Everything else -> Domain lookup
+
+    Routing is performed in Rust by ``seer_core::rdap::classify`` so that
+    domains starting with ``AS`` (e.g. ``as1234.io``) are handled correctly
+    instead of being misrouted to the ASN endpoint.
 
     Args:
         query: Domain name, IP address, or ASN (e.g., "example.com", "8.8.8.8", "AS15169")
@@ -104,22 +113,4 @@ def rdap(query: str) -> dict:
     Returns:
         dict: RDAP response data
     """
-    import ipaddress
-
-    # Check if it's an IP address
-    try:
-        ipaddress.ip_address(query)
-        return rdap_ip(query)
-    except ValueError:
-        pass
-
-    # Check if it's an ASN
-    if query.upper().startswith("AS"):
-        try:
-            asn = int(query[2:])
-            return rdap_asn(asn)
-        except ValueError:
-            pass
-
-    # Default to domain lookup
-    return rdap_domain(query)
+    return rdap_auto(query)

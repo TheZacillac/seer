@@ -42,15 +42,28 @@ const BOOTSTRAP_REFRESH_MIN_INTERVAL: Duration = Duration::from_secs(60);
 /// The bootstrap targets are hardcoded data.iana.org URLs, so this client
 /// does not need DNS-rebinding protection. Per-query RDAP requests build
 /// their own short-lived client that pins resolved IPs.
-static RDAP_HTTP_CLIENT: Lazy<Client> = Lazy::new(|| {
+///
+/// Wrapped in `Option` so a reqwest builder failure surfaces as a typed
+/// `SeerError::HttpError` via `rdap_http_client()` instead of a process
+/// panic at first use (library code must not `.expect()` on shared state).
+static RDAP_HTTP_CLIENT: Lazy<Option<Client>> = Lazy::new(|| {
     Client::builder()
         .timeout(DEFAULT_TIMEOUT)
         .connect_timeout(CONNECT_TIMEOUT)
         .user_agent("Seer/1.0 (RDAP Client)")
         .pool_max_idle_per_host(10)
         .build()
-        .expect("Failed to build RDAP HTTP client - invalid configuration")
+        .ok()
 });
+
+/// Returns a reference to the shared RDAP bootstrap HTTP client, or a typed
+/// error if the builder failed at initialization time. Call sites use
+/// `rdap_http_client()?` instead of dereferencing the static directly.
+fn rdap_http_client() -> Result<&'static Client> {
+    RDAP_HTTP_CLIENT
+        .as_ref()
+        .ok_or_else(|| SeerError::HttpError("failed to initialize HTTP client".into()))
+}
 
 /// Bootstrap cache with TTL support
 static BOOTSTRAP_CACHE: Lazy<RwLock<Option<CachedBootstrap>>> = Lazy::new(|| RwLock::new(None));
@@ -639,11 +652,12 @@ async fn query_rdap_internal(url: &str) -> Result<RdapResponse> {
     }
 
     let rdap: RdapResponse = serde_json::from_slice(&body)?;
-    // Bound attacker-controlled `extra` map size post-deserialization.
-    // The 10MB body cap prevents unbounded download, but a well-formed
-    // response can still pack millions of keys or deeply-nested values
-    // into the serde_json::Map. See RdapResponse::validate_size.
-    rdap.validate_size()?;
+    // Bound attacker-controlled payload post-deserialization. The 10MB
+    // body cap prevents unbounded download, but a well-formed response
+    // can still pack millions of keys or deeply-nested values into the
+    // serde_json::Map, and adversarial `entities` nesting can drive
+    // recursive walkers to stack-overflow. See RdapResponse::validate.
+    rdap.validate()?;
     Ok(rdap)
 }
 
@@ -660,7 +674,7 @@ async fn load_bootstrap_data() -> Result<BootstrapData> {
     // SSRF validation is skipped here — these are hardcoded IANA URLs, not user input.
     // User-supplied URLs are still validated in query_rdap_internal().
 
-    let http = &*RDAP_HTTP_CLIENT;
+    let http = rdap_http_client()?;
 
     let dns_future = http.get(IANA_BOOTSTRAP_DNS).send();
     let ipv4_future = http.get(IANA_BOOTSTRAP_IPV4).send();
@@ -676,20 +690,41 @@ async fn load_bootstrap_data() -> Result<BootstrapData> {
     const MAX_BOOTSTRAP_SIZE: usize = 10 * 1024 * 1024; // 10 MB
 
     async fn read_bootstrap(resp: reqwest::Response) -> Result<BootstrapResponse> {
+        // Bound the streaming-read loop with the same timeout used for RDAP
+        // queries. Without this, a slow or stalled IANA response (open TCP
+        // but no bytes arriving) could hang all RDAP lookups indefinitely
+        // because `ensure_bootstrap` awaits this future. Mirrors the pattern
+        // in `query_rdap_internal`.
         let mut body = Vec::new();
         let mut stream = resp.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| {
-                SeerError::RdapBootstrapError(format!("failed to read body: {}", e))
-            })?;
-            body.extend_from_slice(&chunk);
-            if body.len() > MAX_BOOTSTRAP_SIZE {
-                return Err(SeerError::RdapBootstrapError(format!(
-                    "bootstrap response too large (exceeds {} bytes)",
-                    MAX_BOOTSTRAP_SIZE
+        let streamed = tokio::time::timeout(DEFAULT_TIMEOUT, async {
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(|e| {
+                    SeerError::RdapBootstrapError(format!("failed to read body: {}", e))
+                })?;
+                body.extend_from_slice(&chunk);
+                if body.len() > MAX_BOOTSTRAP_SIZE {
+                    return Err(SeerError::RdapBootstrapError(format!(
+                        "bootstrap response too large (exceeds {} bytes)",
+                        MAX_BOOTSTRAP_SIZE
+                    )));
+                }
+            }
+            Ok::<(), SeerError>(())
+        })
+        .await;
+
+        match streamed {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                return Err(SeerError::Timeout(format!(
+                    "RDAP bootstrap body read timed out after {:?}",
+                    DEFAULT_TIMEOUT
                 )));
             }
         }
+
         serde_json::from_slice(&body).map_err(Into::into)
     }
 
@@ -1056,8 +1091,10 @@ mod tests {
 
     #[test]
     fn test_rdap_http_client_is_configured() {
-        // Force lazy initialization and verify it doesn't panic
-        let _client = &*RDAP_HTTP_CLIENT;
+        // Force lazy initialization and verify it doesn't panic; the real
+        // reqwest builder is expected to succeed in any normal environment.
+        let client = rdap_http_client();
+        assert!(client.is_ok(), "RDAP HTTP client builder must succeed");
     }
 
     #[test]
