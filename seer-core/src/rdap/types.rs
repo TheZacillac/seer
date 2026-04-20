@@ -428,8 +428,12 @@ impl RdapResponse {
     /// Recursively verifies that `entities` nesting stays within
     /// `MAX_ENTITY_DEPTH`. `depth` is the current walker depth, starting
     /// at 0 for the top-level `RdapResponse.entities` slice.
+    ///
+    /// Uses `>=` rather than `>` so that exactly `MAX_ENTITY_DEPTH` levels
+    /// of entity nesting are accepted and `MAX_ENTITY_DEPTH + 1` are
+    /// rejected — matching the documented intent of the constant.
     fn walk_depth(entities: &[RdapEntity], depth: usize) -> Result<()> {
-        if depth > Self::MAX_ENTITY_DEPTH {
+        if depth >= Self::MAX_ENTITY_DEPTH {
             return Err(SeerError::RdapError(format!(
                 "RDAP entities exceed max nesting depth {}",
                 Self::MAX_ENTITY_DEPTH
@@ -704,27 +708,30 @@ mod tests {
 
     #[test]
     fn validate_accepts_at_max_depth() {
-        // The walker treats `depth > MAX_ENTITY_DEPTH` as a violation, so
-        // a chain that terminates exactly at depth = MAX_ENTITY_DEPTH is
-        // still accepted. `nested_entity(n)` produces a chain whose empty
-        // leaf is reached by the walker at `depth = n + 1`, so the
-        // largest-accepted chain size is `MAX_ENTITY_DEPTH - 1`.
+        // The walker treats `depth >= MAX_ENTITY_DEPTH` as a violation, so
+        // a chain whose empty leaf is reached at `depth = MAX - 1` is the
+        // largest accepted form. `nested_entity(n)` produces a chain
+        // whose empty leaf is reached at `depth = n + 1`, so the
+        // largest-accepted input is `nested_entity(MAX_ENTITY_DEPTH - 2)`
+        // — which yields a chain of exactly `MAX_ENTITY_DEPTH - 1` levels.
         let mut resp = RdapResponse::default();
         resp.entities
-            .push(nested_entity(RdapResponse::MAX_ENTITY_DEPTH - 1));
+            .push(nested_entity(RdapResponse::MAX_ENTITY_DEPTH - 2));
         assert!(
             resp.validate().is_ok(),
-            "nesting at MAX_ENTITY_DEPTH must be accepted"
+            "nesting of MAX_ENTITY_DEPTH - 1 levels must be accepted"
         );
     }
 
     #[test]
-    fn validate_rejects_one_past_max_depth() {
-        // `nested_entity(MAX_ENTITY_DEPTH)` terminates at walker
-        // depth = MAX_ENTITY_DEPTH + 1, which must trip the guard.
+    fn validate_rejects_at_max_depth() {
+        // `nested_entity(MAX_ENTITY_DEPTH - 1)` terminates at walker
+        // depth = MAX_ENTITY_DEPTH, which now trips the `>=` guard.
+        // This matches the constant's documented limit: exactly
+        // `MAX_ENTITY_DEPTH` levels of nesting are rejected.
         let mut resp = RdapResponse::default();
         resp.entities
-            .push(nested_entity(RdapResponse::MAX_ENTITY_DEPTH));
+            .push(nested_entity(RdapResponse::MAX_ENTITY_DEPTH - 1));
         let err = resp.validate().unwrap_err();
         assert!(err.to_string().contains("max nesting depth"));
     }
