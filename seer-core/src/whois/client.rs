@@ -260,6 +260,12 @@ impl WhoisClient {
                     server
                 )));
             }
+            // SSRF guard: resolve the discovered hostname and refuse it if any
+            // resolved address is in a reserved range. This prevents a malicious
+            // or poisoned IANA response from caching a hostname that (via DNS
+            // rebinding or otherwise) points at internal services (H1 amplifier
+            // via 24h cache).
+            crate::net::validate_public_host(&server, WHOIS_PORT).await?;
             return Ok(server);
         }
 
@@ -292,6 +298,12 @@ async fn query_server_internal(
             "query string must not contain CR/LF/NUL".into(),
         ));
     }
+
+    // SSRF guard: resolve the server hostname and refuse any address in a
+    // reserved/private/loopback/link-local range BEFORE touching the network.
+    // This closes the referral-based SSRF vector where a malicious TLD server
+    // could redirect queries to internal TCP services (H1).
+    crate::net::validate_public_host(server, WHOIS_PORT).await?;
 
     let addr = format!("{}:{}", server, WHOIS_PORT);
 
@@ -525,4 +537,49 @@ mod tests {
     // the sequence 0 -> 1 -> 2 (each queries) then 3 (rejected pre-query)
     // consults exactly MAX_REFERRAL_DEPTH servers. See the diff for
     // Batch 5 / H13 for the fix location.
+
+    #[tokio::test]
+    async fn whois_refuses_loopback_server() {
+        // Feeding 127.0.0.1 as the server must be rejected by
+        // validate_public_host BEFORE any TCP connect is attempted.
+        let err = query_server_internal("127.0.0.1", "example.com", Duration::from_secs(1))
+            .await
+            .expect_err("loopback server must be rejected");
+        match err {
+            SeerError::InvalidInput(msg) => {
+                assert!(
+                    msg.contains("reserved") || msg.contains("127.0.0.1"),
+                    "unexpected message: {msg}"
+                );
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn whois_refuses_rfc1918_server() {
+        // Feeding an RFC1918 address must be rejected by validate_public_host
+        // BEFORE any TCP connect is attempted.
+        let err = query_server_internal("10.0.0.1", "example.com", Duration::from_secs(1))
+            .await
+            .expect_err("RFC1918 server must be rejected");
+        match err {
+            SeerError::InvalidInput(msg) => {
+                assert!(
+                    msg.contains("reserved") || msg.contains("10.0.0.1"),
+                    "unexpected message: {msg}"
+                );
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn whois_refuses_link_local_metadata_server() {
+        // The cloud metadata address 169.254.169.254 must also be rejected.
+        let err = query_server_internal("169.254.169.254", "example.com", Duration::from_secs(1))
+            .await
+            .expect_err("link-local metadata server must be rejected");
+        assert!(matches!(err, SeerError::InvalidInput(_)));
+    }
 }
