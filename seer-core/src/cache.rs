@@ -2,12 +2,21 @@
 //!
 //! This module provides a thread-safe cache with time-to-live (TTL) expiration
 //! and the ability to serve stale data during refresh failures.
+//!
+//! # Clock
+//!
+//! The cache uses [`tokio::time::Instant`] as its monotonic clock. In normal
+//! operation this is identical to [`std::time::Instant`]; when a test runs
+//! inside a `#[tokio::test(start_paused = true)]` runtime, the clock becomes
+//! virtual and can be advanced deterministically via `tokio::time::advance`,
+//! which keeps TTL unit tests fast and non-flaky.
 
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::sync::RwLock;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use tokio::time::Instant;
 use tracing::{debug, warn};
 
 /// A cache entry with TTL tracking.
@@ -506,24 +515,33 @@ mod tests {
         assert_eq!(cache.get_stale(), Some("value".to_string()));
     }
 
-    #[test]
-    fn test_needs_refresh() {
-        // TTL of 1000ms, staleness at 750ms
-        // Use large TTL to avoid flaky timing on slow CI runners
-        let cache: TtlCache<String, String> = TtlCache::new(Duration::from_millis(1000));
-
+    #[tokio::test(start_paused = true)]
+    async fn test_needs_refresh() {
+        // Uses tokio's virtual clock (TtlCache now uses tokio::time::Instant),
+        // so we advance the clock deterministically instead of real sleeps.
+        // TTL=1s, staleness threshold = 75% of TTL = 750ms.
+        let cache: TtlCache<String, String> = TtlCache::new(Duration::from_secs(1));
         cache.insert("key".to_string(), "value".to_string());
 
-        // Initially not stale
+        // Initially not stale.
         assert!(!cache.needs_refresh(&"key".to_string()));
 
-        // Wait until stale (past 75% of TTL = 750ms)
-        std::thread::sleep(Duration::from_millis(800));
+        // Advance past 75% of TTL but before expiry.
+        tokio::time::advance(Duration::from_millis(800)).await;
+        assert!(
+            cache.needs_refresh(&"key".to_string()),
+            "entry must be stale at t=800ms (>= 750ms threshold)"
+        );
+        assert!(
+            cache.get(&"key".to_string()).is_some(),
+            "entry must not be expired at t=800ms (< 1000ms TTL)"
+        );
 
-        // Now should be stale
-        assert!(cache.needs_refresh(&"key".to_string()));
-
-        // But still valid (not expired) — 200ms of headroom
-        assert!(cache.get(&"key".to_string()).is_some());
+        // Advance past expiry.
+        tokio::time::advance(Duration::from_millis(300)).await;
+        assert!(
+            cache.get(&"key".to_string()).is_none(),
+            "entry must be expired at t=1100ms (> 1000ms TTL)"
+        );
     }
 }

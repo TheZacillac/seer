@@ -733,6 +733,17 @@ impl SmartLookup {
 mod tests {
     use super::*;
 
+    /// Global serialization mutex for the three tests that share
+    /// `LOOKUP_INFLIGHT` state (coalescing, poison recovery, drop recovery).
+    /// Running them in parallel creates two races:
+    ///   1. Guard drop uses `try_lock`; if another test holds the mutex, the
+    ///      Drop path skips cleanup → stale entries fail later assertions.
+    ///   2. Poisoning one test leaves the mutex poisoned for the next test,
+    ///      which is handled by `unwrap_or_else` but still disturbs state.
+    /// Per-test unique keys (see `unique_test_key`) prevent entry-level
+    /// collisions; this mutex prevents lock-contention races on Drop.
+    static INFLIGHT_TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn test_lookup_result_domain_name_whois() {
         let result = LookupResult::Whois {
@@ -965,18 +976,28 @@ mod tests {
     // requires network access to exercise.
     #[tokio::test]
     async fn test_inflight_coalescing_map() {
+        // Serialize with sibling poisoning tests: we share LOOKUP_INFLIGHT
+        // state, and `InflightGuard::drop` uses `try_lock` — if a sibling
+        // holds the mutex during drop, cleanup is skipped and assertions
+        // fail.
+        let _serial = INFLIGHT_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         // Poison-tolerant: the sibling poisoning regression tests may run
         // earlier under `cargo test` parallelism and leave LOOKUP_INFLIGHT
         // poisoned. The production code recovers via `unwrap_or_else`,
         // so this test does the same.
+        //
+        // Use a per-run unique key so this test cannot race with the other
+        // tests that touch LOOKUP_INFLIGHT. Previously we `clear()`ed the
+        // whole map, which raced with peer tests' entries.
+        let domain = unique_test_key("__coalesce");
 
-        // Clear any prior state.
+        // Defensive: ensure our specific key is not present.
         {
             let mut m = LOOKUP_INFLIGHT.lock().unwrap_or_else(|p| p.into_inner());
-            m.clear();
+            m.remove(&domain);
         }
-
-        let domain = "__test_coalesce.example.".to_string();
 
         // First caller: no entry → becomes owner.
         let owner_notify = Arc::new(Notify::new());
@@ -1019,6 +1040,23 @@ mod tests {
         drop(waiter);
         let m = LOOKUP_INFLIGHT.lock().unwrap_or_else(|p| p.into_inner());
         assert!(m.get(&domain).and_then(|w| w.upgrade()).is_none());
+    }
+
+    /// Builds a domain key guaranteed unique per test invocation, so that
+    /// tests touching the shared LOOKUP_INFLIGHT static never collide when
+    /// `cargo test` runs them in parallel. We include a nanosecond timestamp
+    /// plus an atomic counter to defeat even hash-identical calls within the
+    /// same nanosecond.
+    fn unique_test_key(prefix: &str) -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::{SystemTime, UNIX_EPOCH};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        format!("{}_{}_{}.example.", prefix, nanos, n)
     }
 
     // Demonstrates that the `sanitize_error_for_public` helper is applied
@@ -1232,6 +1270,11 @@ mod tests {
     fn lookup_inflight_recovers_from_poisoned_mutex() {
         use std::panic::{catch_unwind, AssertUnwindSafe};
 
+        // Serialize with sibling tests that also touch LOOKUP_INFLIGHT.
+        let _serial = INFLIGHT_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+
         // Poison the real static by panicking while holding the guard.
         let _ = catch_unwind(AssertUnwindSafe(|| {
             let _guard = LOOKUP_INFLIGHT.lock().unwrap();
@@ -1242,7 +1285,8 @@ mod tests {
         // return Err(PoisonError). The recovery pattern used in
         // lookup_with_progress must still yield a usable guard.
         let mut guard = LOOKUP_INFLIGHT.lock().unwrap_or_else(|p| p.into_inner());
-        let canary = "__poison_recovery_canary.example.".to_string();
+        // Use a per-run unique canary so parallel tests cannot collide.
+        let canary = unique_test_key("__poison_recovery");
         guard.insert(canary.clone(), std::sync::Weak::new());
         assert!(guard.contains_key(&canary));
         guard.remove(&canary);
@@ -1254,8 +1298,20 @@ mod tests {
     fn inflight_guard_drop_recovers_from_poisoned_mutex() {
         use std::panic::{catch_unwind, AssertUnwindSafe};
 
-        // Seed an entry and arm a guard for it.
-        let key = "__drop_poison_canary.example.".to_string();
+        // Serialize with sibling tests that also touch LOOKUP_INFLIGHT —
+        // the critical race was `InflightGuard::drop` using `try_lock`
+        // and silently skipping cleanup when a parallel test held the
+        // mutex, leaving this test's entry in the map and failing the
+        // final assertion.
+        let _serial = INFLIGHT_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+
+        // Seed an entry and arm a guard for it. Use a per-run unique key
+        // so this test can never collide with siblings under parallel
+        // `cargo test` — previously a hard-coded key raced with the peer
+        // coalescing test's `m.clear()` call.
+        let key = unique_test_key("__drop_poison");
         let notify = Arc::new(Notify::new());
         {
             let mut map = LOOKUP_INFLIGHT.lock().unwrap_or_else(|p| p.into_inner());
