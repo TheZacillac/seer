@@ -265,6 +265,17 @@ def _real_seer_validator(monkeypatch):
         "/dns/example.com/A?nameserver=169.254.169.254",
         "/dns/example.com/A?nameserver=127.0.0.1",
         "/dns/127.0.0.1/A",
+        # M2 follow-up: lookup and rdap routes also enforce the API-layer
+        # guard so the error classification stays 400 (validation) rather
+        # than bubbling through as a 500 from the inner seer call.
+        "/lookup/127.0.0.1",
+        "/lookup/10.0.0.1",
+        "/lookup/169.254.169.254",
+        "/rdap/domain/127.0.0.1",
+        "/rdap/domain/192.168.1.1",
+        "/rdap/ip/127.0.0.1",
+        "/rdap/ip/10.0.0.1",
+        "/rdap/ip/169.254.169.254",
     ],
 )
 def test_ssrf_guard_rejects_reserved(client, path):
@@ -273,6 +284,15 @@ def test_ssrf_guard_rejects_reserved(client, path):
     assert resp.status_code == 400, (path, resp.status_code, resp.text)
     detail = resp.json().get("detail", "").lower()
     assert "reserved" in detail or "invalid" in detail, (path, detail)
+
+
+def test_ssrf_guard_bulk_lookup_rejects_reserved(client):
+    """M2 follow-up: /lookup/bulk validates each domain before dispatch."""
+    resp = client.post(
+        "/lookup/bulk",
+        json={"domains": ["127.0.0.1", "example.com"], "concurrency": 1},
+    )
+    assert resp.status_code == 400
 
 
 def test_ssrf_guard_bulk_status_rejects_reserved(client):

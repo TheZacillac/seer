@@ -5,6 +5,7 @@ import asyncio
 from fastapi import APIRouter, Path, Request
 from seer_api.errors import http_error
 from seer_api.limiting import limiter
+from seer_api.ssrf import guard_async as ssrf_guard_async
 
 import seer
 
@@ -26,6 +27,7 @@ async def rdap_domain_lookup(
     Returns:
         RDAP response with registration information
     """
+    await ssrf_guard_async(domain, 443)
     try:
         loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(None, seer.rdap_domain, domain)
@@ -49,6 +51,7 @@ async def rdap_ip_lookup(
     Returns:
         RDAP response with network registration information
     """
+    await ssrf_guard_async(ip, 443)
     try:
         loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(None, seer.rdap_ip, ip)
