@@ -416,6 +416,31 @@ impl RdapResponse {
     /// against the 10MB body-cap ceiling.
     const MAX_EXTRA_BYTES: usize = 512 * 1024;
 
+    /// Maximum nesting depth for `RdapEntity.entities`. Real-world RDAP
+    /// responses nest at most 2–3 levels (domain → registrar → abuse
+    /// contact). 16 is comfortably above any legitimate response and
+    /// small enough to keep recursive walks well clear of the Rust
+    /// stack-overflow cliff — an adversarial RDAP payload could otherwise
+    /// drive `get_registrar`/`get_entity_by_role` and future recursive
+    /// walkers to a stack-overflow abort.
+    const MAX_ENTITY_DEPTH: usize = 16;
+
+    /// Recursively verifies that `entities` nesting stays within
+    /// `MAX_ENTITY_DEPTH`. `depth` is the current walker depth, starting
+    /// at 0 for the top-level `RdapResponse.entities` slice.
+    fn walk_depth(entities: &[RdapEntity], depth: usize) -> Result<()> {
+        if depth > Self::MAX_ENTITY_DEPTH {
+            return Err(SeerError::RdapError(format!(
+                "RDAP entities exceed max nesting depth {}",
+                Self::MAX_ENTITY_DEPTH
+            )));
+        }
+        for e in entities {
+            Self::walk_depth(&e.entities, depth + 1)?;
+        }
+        Ok(())
+    }
+
     /// Bound attacker-controlled data in `extra` (the `#[serde(flatten)]`
     /// catch-all field) after deserialization.
     ///
@@ -441,6 +466,16 @@ impl RdapResponse {
                 Self::MAX_EXTRA_BYTES
             )));
         }
+        Ok(())
+    }
+
+    /// Full post-deserialization validation of a `RdapResponse`. Wraps
+    /// the existing `validate_size` size/width check with a recursive
+    /// entity-nesting depth check to prevent adversarial responses from
+    /// driving recursion to a stack-overflow abort.
+    pub fn validate(&self) -> Result<()> {
+        self.validate_size()?;
+        Self::walk_depth(&self.entities, 0)?;
         Ok(())
     }
 
@@ -633,5 +668,91 @@ mod tests {
         resp.extra.insert("blob".into(), Value::String(big_str));
         let err = resp.validate_size().unwrap_err();
         assert!(err.to_string().contains("bytes"));
+    }
+
+    /// Builds an `RdapEntity` chain `depth` levels deep. Each entity nests
+    /// the next in its `entities` vec, terminating with an empty leaf.
+    fn nested_entity(depth: usize) -> RdapEntity {
+        let mut e = RdapEntity {
+            object_class_name: Some("entity".to_string()),
+            handle: None,
+            roles: vec![],
+            public_ids: vec![],
+            vcard_array: None,
+            entities: vec![],
+            remarks: vec![],
+            links: vec![],
+            events: vec![],
+            status: vec![],
+        };
+        if depth > 0 {
+            e.entities.push(nested_entity(depth - 1));
+        }
+        e
+    }
+
+    #[test]
+    fn validate_accepts_shallow_nesting() {
+        // 3-deep chain: well within legitimate RDAP usage.
+        let mut resp = RdapResponse::default();
+        resp.entities.push(nested_entity(3));
+        assert!(
+            resp.validate().is_ok(),
+            "legitimate shallow nesting must be accepted"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_at_max_depth() {
+        // The walker treats `depth > MAX_ENTITY_DEPTH` as a violation, so
+        // a chain that terminates exactly at depth = MAX_ENTITY_DEPTH is
+        // still accepted. `nested_entity(n)` produces a chain whose empty
+        // leaf is reached by the walker at `depth = n + 1`, so the
+        // largest-accepted chain size is `MAX_ENTITY_DEPTH - 1`.
+        let mut resp = RdapResponse::default();
+        resp.entities
+            .push(nested_entity(RdapResponse::MAX_ENTITY_DEPTH - 1));
+        assert!(
+            resp.validate().is_ok(),
+            "nesting at MAX_ENTITY_DEPTH must be accepted"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_one_past_max_depth() {
+        // `nested_entity(MAX_ENTITY_DEPTH)` terminates at walker
+        // depth = MAX_ENTITY_DEPTH + 1, which must trip the guard.
+        let mut resp = RdapResponse::default();
+        resp.entities
+            .push(nested_entity(RdapResponse::MAX_ENTITY_DEPTH));
+        let err = resp.validate().unwrap_err();
+        assert!(err.to_string().contains("max nesting depth"));
+    }
+
+    #[test]
+    fn validate_rejects_deeply_nested_entities() {
+        // 20-deep chain: comfortably past the 16-level cap.
+        let mut resp = RdapResponse::default();
+        resp.entities.push(nested_entity(20));
+        let err = resp.validate().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("max nesting depth"),
+            "expected depth error, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn validate_also_enforces_size_constraints() {
+        // validate() must still catch extra-key overflow the way
+        // validate_size() does; this guards against future refactors that
+        // skip the size leg.
+        let mut resp = RdapResponse::default();
+        for i in 0..=RdapResponse::MAX_EXTRA_KEYS {
+            resp.extra.insert(format!("k{}", i), Value::Null);
+        }
+        let err = resp.validate().unwrap_err();
+        assert!(err.to_string().contains("extra keys"));
     }
 }
