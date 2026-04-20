@@ -201,7 +201,11 @@ impl RetryClassifier for NetworkRetryClassifier {
             SeerError::LookupFailed { .. } => false,
             SeerError::ConfigError(_) => false,
             SeerError::InvalidInput(_) => false,
-            SeerError::RetryExhausted { .. } => false,
+            // Transparent pass-through: if a prior attempt was wrapped into
+            // RetryExhausted upstream, defer the retryable decision to the
+            // underlying cause so a caller layering retries still sees the
+            // true fault classification instead of a non-retryable wrapper.
+            SeerError::RetryExhausted { last_error, .. } => self.is_retryable(last_error),
             SeerError::Other(_) => false,
         }
     }
@@ -297,7 +301,7 @@ impl<C: RetryClassifier> RetryExecutor<C> {
                         return Err(if attempt > 0 {
                             SeerError::RetryExhausted {
                                 attempts: attempt + 1,
-                                last_error: e.to_string(),
+                                last_error: Box::new(e),
                             }
                         } else {
                             e
@@ -547,5 +551,34 @@ mod tests {
         assert!(delay_50 <= Duration::from_secs(5));
         assert!(delay_100 <= Duration::from_secs(5));
         assert!(delay_1000 <= Duration::from_secs(5));
+    }
+
+    #[test]
+    fn retry_exhausted_is_retryable_if_inner_is() {
+        // Regression for H5: the retry classifier must look through a
+        // RetryExhausted wrapper so a caller layering retries can still see
+        // the true underlying fault classification instead of collapsing to
+        // a non-retryable wrapper.
+        let classifier = NetworkRetryClassifier::new();
+
+        let retryable_inner = SeerError::Timeout("inner timed out".to_string());
+        let wrapped_retryable = SeerError::RetryExhausted {
+            attempts: 3,
+            last_error: Box::new(retryable_inner),
+        };
+        assert!(
+            classifier.is_retryable(&wrapped_retryable),
+            "RetryExhausted wrapping a retryable Timeout should be retryable",
+        );
+
+        let non_retryable_inner = SeerError::InvalidDomain("bad.".to_string());
+        let wrapped_non_retryable = SeerError::RetryExhausted {
+            attempts: 3,
+            last_error: Box::new(non_retryable_inner),
+        };
+        assert!(
+            !classifier.is_retryable(&wrapped_non_retryable),
+            "RetryExhausted wrapping a non-retryable InvalidDomain must not be retryable",
+        );
     }
 }

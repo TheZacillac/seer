@@ -79,7 +79,10 @@ pub enum SeerError {
     Other(String),
 
     #[error("Operation failed after {attempts} attempts: {last_error}")]
-    RetryExhausted { attempts: usize, last_error: String },
+    RetryExhausted {
+        attempts: usize,
+        last_error: Box<SeerError>,
+    },
 }
 
 impl SeerError {
@@ -114,8 +117,15 @@ impl SeerError {
             SeerError::ConfigError(msg) => format!("Configuration error: {}", msg),
             SeerError::InvalidInput(msg) => format!("Invalid input: {}", msg),
             SeerError::Other(_) => "Operation failed".to_string(),
-            SeerError::RetryExhausted { attempts, .. } => {
-                format!("Operation failed after {} attempts", attempts)
+            SeerError::RetryExhausted {
+                attempts,
+                last_error,
+            } => {
+                format!(
+                    "Operation failed after {} attempts: {}",
+                    attempts,
+                    last_error.sanitized_message()
+                )
             }
         }
     }
