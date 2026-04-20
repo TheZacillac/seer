@@ -280,6 +280,21 @@ fn rdap_asn(py: Python<'_>, asn: u32) -> PyResult<PyObject> {
     json_to_python(py, &json)
 }
 
+/// Auto-routing RDAP lookup: classifies `query` as IP / ASN / domain in
+/// Rust and dispatches to the correct endpoint. Replaces the former
+/// Python-side dispatcher, which silently misrouted `AS`-prefixed domains
+/// like `as1234.io` to the ASN endpoint.
+#[pyfunction]
+fn rdap_auto(py: Python<'_>, query: String) -> PyResult<PyObject> {
+    let client = get_rdap_client();
+    let response = run_async(
+        py,
+        async move { seer_core::rdap::auto_lookup(client, &query).await },
+    )?;
+    let json = serialize_response(&response)?;
+    json_to_python(py, &json)
+}
+
 #[pyfunction]
 #[pyo3(signature = (domain, record_type = "A", nameserver = None))]
 fn dig(
@@ -743,6 +758,7 @@ fn _seer(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(rdap_domain, m)?)?;
     m.add_function(wrap_pyfunction!(rdap_ip, m)?)?;
     m.add_function(wrap_pyfunction!(rdap_asn, m)?)?;
+    m.add_function(wrap_pyfunction!(rdap_auto, m)?)?;
     m.add_function(wrap_pyfunction!(dig, m)?)?;
     m.add_function(wrap_pyfunction!(propagation, m)?)?;
     m.add_function(wrap_pyfunction!(status, m)?)?;
