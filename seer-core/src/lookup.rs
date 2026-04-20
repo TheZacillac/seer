@@ -157,12 +157,28 @@ struct InflightGuard {
 
 impl Drop for InflightGuard {
     fn drop(&mut self) {
-        // Recover from mutex poisoning rather than leaking the HashMap entry.
-        // A poisoned mutex here would otherwise strand the key in the map
-        // until process exit, permanently blocking future lookups for this
-        // domain from acquiring ownership.
-        let mut inflight = LOOKUP_INFLIGHT.lock().unwrap_or_else(|p| p.into_inner());
-        inflight.remove(&self.key);
+        // Avoid blocking on the mutex inside Drop. A cancelled future that
+        // drops this guard could otherwise starve the Tokio executor while
+        // it waits for contention to clear. `try_lock` lets us take the
+        // fast path when the map is uncontended, recover from poisoning
+        // explicitly, and simply skip cleanup when another task holds the
+        // mutex — waiters re-contend for ownership on their next wakeup,
+        // so a missed cleanup is self-healing.
+        match LOOKUP_INFLIGHT.try_lock() {
+            Ok(mut inflight) => {
+                inflight.remove(&self.key);
+            }
+            Err(std::sync::TryLockError::Poisoned(p)) => {
+                let mut inflight = p.into_inner();
+                inflight.remove(&self.key);
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                tracing::debug!(
+                    key = %self.key,
+                    "InflightGuard drop: skipping cleanup under contention"
+                );
+            }
+        }
         self.notify.notify_waiters();
     }
 }
@@ -423,9 +439,10 @@ impl SmartLookup {
             }
 
             let slot = {
-                let mut inflight = LOOKUP_INFLIGHT
-                    .lock()
-                    .expect("LOOKUP_INFLIGHT mutex poisoned");
+                // Recover from poisoning rather than panicking: a prior
+                // owner's panic should not permanently wedge the in-flight
+                // tracker for every future lookup.
+                let mut inflight = LOOKUP_INFLIGHT.lock().unwrap_or_else(|p| p.into_inner());
                 match inflight.get(&normalized).and_then(|w| w.upgrade()) {
                     Some(existing) => Slot::Waiter(existing),
                     None => {
@@ -948,9 +965,14 @@ mod tests {
     // requires network access to exercise.
     #[tokio::test]
     async fn test_inflight_coalescing_map() {
+        // Poison-tolerant: the sibling poisoning regression tests may run
+        // earlier under `cargo test` parallelism and leave LOOKUP_INFLIGHT
+        // poisoned. The production code recovers via `unwrap_or_else`,
+        // so this test does the same.
+
         // Clear any prior state.
         {
-            let mut m = LOOKUP_INFLIGHT.lock().unwrap();
+            let mut m = LOOKUP_INFLIGHT.lock().unwrap_or_else(|p| p.into_inner());
             m.clear();
         }
 
@@ -959,14 +981,14 @@ mod tests {
         // First caller: no entry → becomes owner.
         let owner_notify = Arc::new(Notify::new());
         {
-            let mut m = LOOKUP_INFLIGHT.lock().unwrap();
+            let mut m = LOOKUP_INFLIGHT.lock().unwrap_or_else(|p| p.into_inner());
             assert!(m.get(&domain).and_then(|w| w.upgrade()).is_none());
             m.insert(domain.clone(), Arc::downgrade(&owner_notify));
         }
 
         // Second caller: sees the existing Weak and upgrades.
         let waiter = {
-            let m = LOOKUP_INFLIGHT.lock().unwrap();
+            let m = LOOKUP_INFLIGHT.lock().unwrap_or_else(|p| p.into_inner());
             m.get(&domain)
                 .and_then(|w| w.upgrade())
                 .expect("Second caller must observe in-flight entry")
@@ -981,7 +1003,7 @@ mod tests {
         // Simulate owner completing.
         tokio::time::sleep(Duration::from_millis(20)).await;
         {
-            let mut m = LOOKUP_INFLIGHT.lock().unwrap();
+            let mut m = LOOKUP_INFLIGHT.lock().unwrap_or_else(|p| p.into_inner());
             m.remove(&domain);
         }
         owner_notify.notify_waiters();
@@ -995,7 +1017,7 @@ mod tests {
         // After owner removes entry and drops its Arc, the Weak is dead.
         drop(owner_notify);
         drop(waiter);
-        let m = LOOKUP_INFLIGHT.lock().unwrap();
+        let m = LOOKUP_INFLIGHT.lock().unwrap_or_else(|p| p.into_inner());
         assert!(m.get(&domain).and_then(|w| w.upgrade()).is_none());
     }
 
@@ -1195,5 +1217,69 @@ mod tests {
         let rdap_err = SeerError::RdapError("query failed with status 404 Not Found".to_string());
         let (verdict, _) = classify_whois_leg(&w, &rdap_err).unwrap();
         assert_eq!(verdict, "high");
+    }
+
+    // ---------------- Mutex poisoning recovery ----------------
+
+    /// Regression: a panic inside `LOOKUP_INFLIGHT.lock()` must not wedge
+    /// the tracker forever. After the mutex is poisoned, subsequent
+    /// acquisition attempts must still succeed via `unwrap_or_else`.
+    ///
+    /// This isolates the lookup_with_progress acquisition site (formerly a
+    /// `.expect("LOOKUP_INFLIGHT mutex poisoned")`) by exercising the same
+    /// `.lock().unwrap_or_else(|p| p.into_inner())` pattern directly.
+    #[test]
+    fn lookup_inflight_recovers_from_poisoned_mutex() {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        // Poison the real static by panicking while holding the guard.
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            let _guard = LOOKUP_INFLIGHT.lock().unwrap();
+            panic!("poisoning LOOKUP_INFLIGHT for test");
+        }));
+
+        // At this point LOOKUP_INFLIGHT is poisoned. Plain .lock() would
+        // return Err(PoisonError). The recovery pattern used in
+        // lookup_with_progress must still yield a usable guard.
+        let mut guard = LOOKUP_INFLIGHT.lock().unwrap_or_else(|p| p.into_inner());
+        let canary = "__poison_recovery_canary.example.".to_string();
+        guard.insert(canary.clone(), std::sync::Weak::new());
+        assert!(guard.contains_key(&canary));
+        guard.remove(&canary);
+    }
+
+    /// Regression: InflightGuard::drop must also tolerate mutex poisoning
+    /// without panicking — the Poisoned arm should still remove the entry.
+    #[test]
+    fn inflight_guard_drop_recovers_from_poisoned_mutex() {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        // Seed an entry and arm a guard for it.
+        let key = "__drop_poison_canary.example.".to_string();
+        let notify = Arc::new(Notify::new());
+        {
+            let mut map = LOOKUP_INFLIGHT.lock().unwrap_or_else(|p| p.into_inner());
+            map.insert(key.clone(), Arc::downgrade(&notify));
+        }
+        let guard = InflightGuard {
+            key: key.clone(),
+            notify: notify.clone(),
+        };
+
+        // Poison the mutex.
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            let _g = LOOKUP_INFLIGHT.lock().unwrap();
+            panic!("poisoning LOOKUP_INFLIGHT for drop test");
+        }));
+
+        // Dropping the guard must not panic and must remove the entry via
+        // the Poisoned branch of the new try_lock match.
+        drop(guard);
+
+        let map = LOOKUP_INFLIGHT.lock().unwrap_or_else(|p| p.into_inner());
+        assert!(
+            !map.contains_key(&key),
+            "poisoned-mutex drop path should still remove the in-flight entry"
+        );
     }
 }
