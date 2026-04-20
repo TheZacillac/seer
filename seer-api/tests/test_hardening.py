@@ -63,6 +63,9 @@ def test_correlation_id_defaulted_when_missing(client):
 
 def test_api_key_required_when_set(monkeypatch):
     monkeypatch.setenv("SEER_API_KEY", "s3cret")
+    # Enable docs so the exemption path can be exercised. Without this
+    # /docs returns 404 (see test_docs_off_by_default).
+    monkeypatch.setenv("SEER_DOCS_ENABLED", "true")
     import seer_api.main as main
 
     importlib.reload(main)
@@ -76,10 +79,11 @@ def test_api_key_required_when_set(monkeypatch):
     assert c.get("/", headers={"Authorization": "Bearer s3cret"}).status_code == 200
     # /health exempt
     assert c.get("/health").status_code == 200
-    # /docs exempt
+    # /docs exempt (only when SEER_DOCS_ENABLED=true)
     assert c.get("/docs").status_code == 200
 
     monkeypatch.delenv("SEER_API_KEY")
+    monkeypatch.delenv("SEER_DOCS_ENABLED")
     importlib.reload(main)
 
 
@@ -415,4 +419,29 @@ def test_multi_worker_with_shared_store_starts(monkeypatch):
 
     monkeypatch.delenv("WEB_CONCURRENCY")
     monkeypatch.delenv("SEER_RATE_LIMIT_STORAGE")
+    importlib.reload(main)
+
+
+# ---------------------------------------------------------------------------
+# D5 (H14): docs disabled by default, enabled via SEER_DOCS_ENABLED
+# ---------------------------------------------------------------------------
+
+
+def test_docs_off_by_default(client):
+    """The default conftest client has no SEER_DOCS_ENABLED set."""
+    assert client.get("/docs").status_code == 404
+    assert client.get("/redoc").status_code == 404
+    assert client.get("/openapi.json").status_code == 404
+
+
+def test_docs_enabled_when_flag_set(monkeypatch):
+    monkeypatch.setenv("SEER_DOCS_ENABLED", "true")
+    import seer_api.main as main
+
+    importlib.reload(main)
+    with TestClient(main.app) as c:
+        assert c.get("/docs").status_code == 200
+        assert c.get("/openapi.json").status_code == 200
+
+    monkeypatch.delenv("SEER_DOCS_ENABLED")
     importlib.reload(main)

@@ -29,9 +29,17 @@ except ImportError:
 log = logging.getLogger(__name__)
 
 # Optional bearer-token auth. When SEER_API_KEY is set, every request must
-# carry `Authorization: Bearer <key>` (except the health/docs endpoints).
+# carry `Authorization: Bearer <key>` (except /health, which is always open).
+# Docs endpoints (/docs, /redoc, /openapi.json) are gated behind
+# SEER_DOCS_ENABLED; when enabled they are also exempted from auth so the
+# interactive UIs remain usable for operators.
 API_KEY = os.environ.get("SEER_API_KEY")
-_AUTH_EXEMPT_PATHS = frozenset({"/health", "/docs", "/openapi.json", "/redoc"})
+DOCS_ENABLED = os.environ.get("SEER_DOCS_ENABLED", "").lower() in ("1", "true", "yes")
+_AUTH_EXEMPT_PATHS: frozenset[str] = (
+    frozenset({"/health", "/docs", "/openapi.json", "/redoc"})
+    if DOCS_ENABLED
+    else frozenset({"/health"})
+)
 
 # Rate limiter configuration is handled in limiting.py at construction time
 # via SEER_RATE_LIMIT env var (default: "30/minute")
@@ -84,8 +92,9 @@ app = FastAPI(
     title="Seer API",
     description="Domain name helper API - WHOIS, RDAP, DNS lookups, and propagation checking",
     version=__version__,
-    docs_url="/docs",
-    redoc_url="/redoc",
+    docs_url="/docs" if DOCS_ENABLED else None,
+    redoc_url="/redoc" if DOCS_ENABLED else None,
+    openapi_url="/openapi.json" if DOCS_ENABLED else None,
     lifespan=lifespan,
 )
 
