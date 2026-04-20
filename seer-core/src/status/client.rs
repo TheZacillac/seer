@@ -126,8 +126,17 @@ impl StatusClient {
     /// prevent DNS rebinding attacks (TOCTOU between validation and connect).
     ///
     /// # Security Note
-    /// Redirect targets are validated for SSRF but the HTTP response body (page title)
-    /// comes from an unauthenticated connection and should be treated as untrusted.
+    /// This path uses reqwest's default (validating) TLS configuration — a
+    /// bad certificate surfaces as a typed `SeerError::HttpError` and the
+    /// status check reports it as a failed "http" sub-check instead of
+    /// silently returning attacker-controlled body content as "successful".
+    /// The SSL inspection path in `ssl.rs` (and `fetch_certificate_info`
+    /// below) intentionally relaxes verification because inspecting an
+    /// invalid cert is the whole point of that code; this path MUST NOT.
+    ///
+    /// Redirect targets are validated for SSRF but the HTTP response body
+    /// (page title) comes from an unauthenticated connection and should be
+    /// treated as untrusted.
     async fn fetch_http_info(&self, domain: &str) -> Result<(u16, String, Option<String>)> {
         let mut url = Url::parse(&format!("https://{}", domain))
             .map_err(|e| SeerError::HttpError(format!("invalid URL: {}", e)))?;
