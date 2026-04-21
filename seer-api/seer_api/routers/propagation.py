@@ -1,15 +1,15 @@
 """DNS Propagation API endpoints."""
 
-import asyncio
 from typing import Annotated
 
 from fastapi import APIRouter, Path, Request
 from pydantic import BaseModel, Field
+
+import seer
+from seer_api._run import run_seer
 from seer_api.errors import http_error
 from seer_api.limiting import limiter
 from seer_api.streaming import stream_bulk
-
-import seer
 
 router = APIRouter()
 
@@ -44,11 +44,7 @@ async def propagation_check(
         Propagation result with percentage and per-server results
     """
     try:
-        loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(
-            None, seer.propagation, domain, record_type
-        )
-        return result
+        return await run_seer(seer.propagation, domain, record_type)
     except Exception as e:
         raise http_error(e, "Propagation check failed")
 
@@ -66,11 +62,9 @@ async def bulk_propagation_check(request: Request, body: BulkPropagationRequest)
         List of propagation results for each domain
     """
     try:
-        loop = asyncio.get_running_loop()
-        results = await loop.run_in_executor(
-            None, seer.bulk_propagation, body.domains, body.record_type, body.concurrency
+        return await run_seer(
+            seer.bulk_propagation, body.domains, body.record_type, body.concurrency
         )
-        return results
     except Exception as e:
         raise http_error(e, "Bulk propagation check failed")
 

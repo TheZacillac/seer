@@ -46,3 +46,15 @@ async def guard_async(host: str, port: int = 443) -> None:
     """
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, guard, host, port)
+
+
+async def guard_hosts_async(hosts: list[tuple[str, int]]) -> None:
+    """Run :func:`guard_async` against every (host, port) pair.
+
+    Used by bulk endpoints to validate every user-supplied domain before
+    dispatching the work to the Rust core. Preserves per-host error
+    granularity: the first offending host raises HTTPException(400) and
+    the bulk call short-circuits.
+    """
+    for host, port in hosts:
+        await guard_async(host, port)

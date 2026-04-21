@@ -1,16 +1,17 @@
 """Domain status API endpoints."""
 
-import asyncio
 from typing import Annotated
 
 from fastapi import APIRouter, Path, Request
 from pydantic import BaseModel, Field
+
+import seer
+from seer_api._run import run_seer
 from seer_api.errors import http_error
 from seer_api.limiting import limiter
 from seer_api.ssrf import guard_async as ssrf_guard_async
+from seer_api.ssrf import guard_hosts_async
 from seer_api.streaming import stream_bulk
-
-import seer
 
 router = APIRouter()
 
@@ -49,9 +50,7 @@ async def check_status(
     """
     await ssrf_guard_async(domain, 443)
     try:
-        loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(None, seer.status, domain)
-        return result
+        return await run_seer(seer.status, domain)
     except Exception as e:
         raise http_error(e, "Status check failed")
 
@@ -68,14 +67,9 @@ async def bulk_status(request: Request, body: BulkStatusRequest):
     Returns:
         List of status results for each domain
     """
-    for d in body.domains:
-        await ssrf_guard_async(d, 443)
+    await guard_hosts_async([(d, 443) for d in body.domains])
     try:
-        loop = asyncio.get_running_loop()
-        results = await loop.run_in_executor(
-            None, seer.bulk_status, body.domains, body.concurrency
-        )
-        return results
+        return await run_seer(seer.bulk_status, body.domains, body.concurrency)
     except Exception as e:
         raise http_error(e, "Bulk status check failed")
 
@@ -84,8 +78,7 @@ async def bulk_status(request: Request, body: BulkStatusRequest):
 @limiter.limit("5/minute")
 async def bulk_status_stream(request: Request, body: BulkStatusRequest):
     """Stream bulk status checks as Server-Sent Events."""
-    for d in body.domains:
-        await ssrf_guard_async(d, 443)
+    await guard_hosts_async([(d, 443) for d in body.domains])
     try:
         return await stream_bulk(seer.bulk_status, body.domains, body.concurrency)
     except Exception as e:
