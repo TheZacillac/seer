@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -10,6 +10,9 @@ use serde::Deserialize;
 use tokio::sync::{Notify, RwLock};
 use tracing::{debug, info, instrument};
 
+use super::bootstrap::{
+    ipv4_matches_prefix, ipv6_matches_prefix, parse_asn_range, validate_bootstrap_url,
+};
 use super::types::RdapResponse;
 use crate::error::{Result, SeerError};
 use crate::retry::{RetryExecutor, RetryPolicy};
@@ -548,37 +551,6 @@ async fn validate_url_not_reserved(url: &str) -> Result<Vec<SocketAddr>> {
 /// Rejects non-https schemes, IP-literal hosts, missing hosts, and hosts
 /// containing whitespace or control characters. Returns the parsed URL on
 /// success so the caller can cache it in normalized form.
-fn validate_bootstrap_url(s: &str) -> Result<url::Url> {
-    let parsed = url::Url::parse(s)
-        .map_err(|e| SeerError::RdapError(format!("bad bootstrap URL {}: {}", s, e)))?;
-    if parsed.scheme() != "https" {
-        return Err(SeerError::RdapError(format!(
-            "bootstrap URL must be https, got {}",
-            parsed.scheme()
-        )));
-    }
-    let host = parsed
-        .host()
-        .ok_or_else(|| SeerError::RdapError(format!("bootstrap URL has no host: {}", s)))?;
-    match host {
-        url::Host::Ipv4(_) | url::Host::Ipv6(_) => {
-            return Err(SeerError::RdapError(format!(
-                "bootstrap URL must not be an IP literal: {}",
-                s
-            )));
-        }
-        url::Host::Domain(d) => {
-            if d.is_empty() || d.chars().any(|c| c.is_whitespace() || c.is_control()) {
-                return Err(SeerError::RdapError(format!(
-                    "bootstrap URL has invalid host: {}",
-                    s
-                )));
-            }
-        }
-    }
-    Ok(parsed)
-}
-
 /// Internal function to query an RDAP endpoint (used by retry executor).
 ///
 /// Builds a per-request HTTP client that pins the validated resolved IPs to
@@ -959,84 +931,6 @@ fn build_rdap_urls(bases: &[url::Url], path: &str) -> Vec<url::Url> {
         .collect()
 }
 
-fn parse_asn_range(range: &str) -> Option<(u32, u32)> {
-    if let Some(pos) = range.find('-') {
-        let start = range[..pos].parse().ok()?;
-        let end = range[pos + 1..].parse().ok()?;
-        Some((start, end))
-    } else {
-        let num = range.parse().ok()?;
-        Some((num, num))
-    }
-}
-
-fn ipv4_matches_prefix(prefix: &str, ip: &Ipv4Addr) -> bool {
-    let (addr_part, mask_part) = match prefix.split_once('/') {
-        Some((a, m)) => (a, Some(m)),
-        None => (prefix, None),
-    };
-
-    let prefix_ip: Ipv4Addr = match addr_part.parse() {
-        Ok(ip) => ip,
-        Err(_) => return false,
-    };
-
-    let mask_bits: u32 = match mask_part.and_then(|s| s.parse().ok()) {
-        Some(bits) if bits <= 32 => bits,
-        Some(_) => return false,
-        None => 32,
-    };
-
-    let mask = if mask_bits == 0 {
-        0
-    } else {
-        u32::MAX << (32 - mask_bits)
-    };
-
-    let ip_value = u32::from(*ip);
-    let prefix_value = u32::from(prefix_ip);
-
-    (ip_value & mask) == (prefix_value & mask)
-}
-
-fn ipv6_matches_prefix(prefix: &str, ip: &Ipv6Addr) -> bool {
-    let (addr_part, mask_part) = match prefix.split_once('/') {
-        Some((a, m)) => (a, Some(m)),
-        None => (prefix, None),
-    };
-
-    let prefix_ip: Ipv6Addr = match addr_part.parse() {
-        Ok(ip) => ip,
-        Err(_) => return false,
-    };
-
-    let mask_bits: u32 = match mask_part.and_then(|s| s.parse().ok()) {
-        Some(bits) if bits <= 128 => bits,
-        Some(_) => return false,
-        None => 128,
-    };
-
-    let mask = if mask_bits == 0 {
-        0u128
-    } else {
-        u128::MAX << (128 - mask_bits)
-    };
-
-    let ip_value = ipv6_to_u128(ip);
-    let prefix_value = ipv6_to_u128(&prefix_ip);
-
-    (ip_value & mask) == (prefix_value & mask)
-}
-
-fn ipv6_to_u128(ip: &Ipv6Addr) -> u128 {
-    let segments = ip.segments();
-    let mut value = 0u128;
-    for segment in segments {
-        value = (value << 16) | segment as u128;
-    }
-    value
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1074,22 +968,6 @@ mod tests {
     }
 
     #[test]
-    fn test_ipv4_prefix_matching_partial_mask() {
-        let ip_in = Ipv4Addr::new(203, 0, 114, 1);
-        let ip_out = Ipv4Addr::new(203, 0, 120, 1);
-        assert!(ipv4_matches_prefix("203.0.112.0/21", &ip_in));
-        assert!(!ipv4_matches_prefix("203.0.112.0/21", &ip_out));
-    }
-
-    #[test]
-    fn test_ipv6_prefix_matching_partial_mask() {
-        let ip_in: Ipv6Addr = "2001:db8::1".parse().unwrap();
-        let ip_out: Ipv6Addr = "2001:db9::1".parse().unwrap();
-        assert!(ipv6_matches_prefix("2001:db8::/33", &ip_in));
-        assert!(!ipv6_matches_prefix("2001:db8::/33", &ip_out));
-    }
-
-    #[test]
     fn test_rdap_http_client_is_configured() {
         // Force lazy initialization and verify it doesn't panic; the real
         // reqwest builder is expected to succeed in any normal environment.
@@ -1109,57 +987,6 @@ mod tests {
         // Should return None for any lookup on empty data
         assert!(RdapClient::get_rdap_urls_for_domain(&data, "example.com").is_none());
         assert!(RdapClient::get_rdap_urls_for_asn(&data, 12345).is_none());
-    }
-
-    // --- validate_bootstrap_url tests (H1) ------------------------------
-
-    #[test]
-    fn test_validate_bootstrap_url_accepts_https() {
-        let url = validate_bootstrap_url("https://rdap.example.com/").unwrap();
-        assert_eq!(url.scheme(), "https");
-        assert_eq!(url.host_str(), Some("rdap.example.com"));
-    }
-
-    #[test]
-    fn test_validate_bootstrap_url_rejects_http() {
-        let err = validate_bootstrap_url("http://rdap.example.com/").unwrap_err();
-        assert!(
-            matches!(err, SeerError::RdapError(ref s) if s.contains("https")),
-            "expected https-scheme error, got: {:?}",
-            err
-        );
-    }
-
-    #[test]
-    fn test_validate_bootstrap_url_rejects_ftp() {
-        let err = validate_bootstrap_url("ftp://rdap.example.com/").unwrap_err();
-        assert!(matches!(err, SeerError::RdapError(_)));
-    }
-
-    #[test]
-    fn test_validate_bootstrap_url_rejects_ip_literal_v4() {
-        let err = validate_bootstrap_url("https://192.0.2.1/").unwrap_err();
-        assert!(
-            matches!(err, SeerError::RdapError(ref s) if s.contains("IP literal")),
-            "expected IP-literal error, got: {:?}",
-            err
-        );
-    }
-
-    #[test]
-    fn test_validate_bootstrap_url_rejects_ip_literal_v6() {
-        let err = validate_bootstrap_url("https://[2001:db8::1]/").unwrap_err();
-        assert!(
-            matches!(err, SeerError::RdapError(ref s) if s.contains("IP literal")),
-            "expected IP-literal error, got: {:?}",
-            err
-        );
-    }
-
-    #[test]
-    fn test_validate_bootstrap_url_rejects_garbage() {
-        let err = validate_bootstrap_url("not a url").unwrap_err();
-        assert!(matches!(err, SeerError::RdapError(_)));
     }
 
     // --- validate_url_not_reserved tests (C1 regression) ----------------
