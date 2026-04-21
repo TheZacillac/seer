@@ -1,16 +1,17 @@
 """DNS API endpoints."""
 
-import asyncio
 from typing import Annotated, Optional
 
 from fastapi import APIRouter, Path, Query, Request
 from pydantic import BaseModel, Field
+
+import seer
+from seer_api._run import run_seer
 from seer_api.errors import http_error
 from seer_api.limiting import limiter
 from seer_api.ssrf import guard_async as ssrf_guard_async
+from seer_api.ssrf import guard_hosts_async
 from seer_api.streaming import stream_bulk
-
-import seer
 
 router = APIRouter()
 
@@ -55,11 +56,7 @@ async def dns_lookup(
     if nameserver is not None:
         await ssrf_guard_async(nameserver, 53)
     try:
-        loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(
-            None, seer.dig, domain, record_type, nameserver
-        )
-        return result
+        return await run_seer(seer.dig, domain, record_type, nameserver)
     except Exception as e:
         raise http_error(e, "DNS lookup failed")
 
@@ -76,14 +73,9 @@ async def bulk_dns_lookup(request: Request, body: BulkDnsRequest):
     Returns:
         List of DNS results for each domain
     """
-    for d in body.domains:
-        await ssrf_guard_async(d, 53)
+    await guard_hosts_async([(d, 53) for d in body.domains])
     try:
-        loop = asyncio.get_running_loop()
-        results = await loop.run_in_executor(
-            None, seer.bulk_dig, body.domains, body.record_type, body.concurrency
-        )
-        return results
+        return await run_seer(seer.bulk_dig, body.domains, body.record_type, body.concurrency)
     except Exception as e:
         raise http_error(e, "Bulk DNS lookup failed")
 
@@ -92,8 +84,7 @@ async def bulk_dns_lookup(request: Request, body: BulkDnsRequest):
 @limiter.limit("10/minute")
 async def bulk_dns_stream(request: Request, body: BulkDnsRequest):
     """Stream bulk DNS queries as Server-Sent Events."""
-    for d in body.domains:
-        await ssrf_guard_async(d, 53)
+    await guard_hosts_async([(d, 53) for d in body.domains])
     try:
         return await stream_bulk(
             seer.bulk_dig, body.domains, body.record_type, body.concurrency

@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use futures::future::join_all;
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, instrument, warn};
 
@@ -29,8 +30,10 @@ impl DnsServer {
     }
 }
 
-/// Returns the default list of global DNS servers for propagation checking.
-pub fn default_dns_servers() -> Vec<DnsServer> {
+/// Built-in list of global DNS servers for propagation checking.
+/// Constructed once on first access; callers that need ownership call
+/// `default_dns_servers().to_vec()`.
+static DEFAULT_DNS_SERVERS: Lazy<Vec<DnsServer>> = Lazy::new(|| {
     vec![
         // North America
         DnsServer::new("Google", "8.8.8.8", "North America", "Google"),
@@ -89,6 +92,14 @@ pub fn default_dns_servers() -> Vec<DnsServer> {
         ),
         DnsServer::new("Ooredoo Qatar", "212.77.192.10", "Middle East", "Ooredoo"),
     ]
+});
+
+/// Returns the default list of global DNS servers for propagation checking.
+/// The list is built once and handed out as a borrow. Callers needing an
+/// owned `Vec` (e.g. `PropagationChecker` which allows mutation) can call
+/// `.to_vec()` on the returned slice.
+pub fn default_dns_servers() -> &'static [DnsServer] {
+    &DEFAULT_DNS_SERVERS
 }
 
 /// Result from querying a single DNS server during propagation check.
@@ -182,7 +193,7 @@ impl PropagationChecker {
     pub fn new() -> Self {
         Self {
             resolver: DnsResolver::new().with_timeout(Duration::from_secs(5)),
-            servers: default_dns_servers(),
+            servers: default_dns_servers().to_vec(),
         }
     }
 

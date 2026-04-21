@@ -1,13 +1,12 @@
 """RDAP API endpoints."""
 
-import asyncio
-
 from fastapi import APIRouter, Path, Request
+
+import seer
+from seer_api._run import run_seer
 from seer_api.errors import http_error
 from seer_api.limiting import limiter
 from seer_api.ssrf import guard_async as ssrf_guard_async
-
-import seer
 
 router = APIRouter()
 
@@ -29,9 +28,7 @@ async def rdap_domain_lookup(
     """
     await ssrf_guard_async(domain, 443)
     try:
-        loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(None, seer.rdap_domain, domain)
-        return result
+        return await run_seer(seer.rdap_domain, domain)
     except Exception as e:
         raise http_error(e, "RDAP domain lookup failed")
 
@@ -53,9 +50,7 @@ async def rdap_ip_lookup(
     """
     await ssrf_guard_async(ip, 443)
     try:
-        loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(None, seer.rdap_ip, ip)
-        return result
+        return await run_seer(seer.rdap_ip, ip)
     except Exception as e:
         raise http_error(e, "RDAP IP lookup failed")
 
@@ -76,8 +71,6 @@ async def rdap_asn_lookup(
         RDAP response with ASN registration information
     """
     try:
-        loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(None, seer.rdap_asn, asn)
-        return result
+        return await run_seer(seer.rdap_asn, asn)
     except Exception as e:
         raise http_error(e, "RDAP ASN lookup failed")

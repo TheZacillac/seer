@@ -16,6 +16,7 @@ dependencies = [
     "mcp>=1.0",
     "seer>=0.10.2",
     "slowapi>=0.1.9",
+    "orjson>=3.9",
 ]
 
 [project.optional-dependencies]

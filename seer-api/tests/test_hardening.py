@@ -265,6 +265,11 @@ def _real_seer_validator(monkeypatch):
         "/dns/example.com/A?nameserver=169.254.169.254",
         "/dns/example.com/A?nameserver=127.0.0.1",
         "/dns/127.0.0.1/A",
+        # Propagation queries external resolvers about the caller-supplied
+        # domain; guard prevents reserved hostnames from reaching our
+        # outbound DNS path.
+        "/propagation/127.0.0.1/A",
+        "/propagation/169.254.169.254/A",
         # M2 follow-up: lookup and rdap routes also enforce the API-layer
         # guard so the error classification stays 400 (validation) rather
         # than bubbling through as a 500 from the inner seer call.
@@ -286,35 +291,33 @@ def test_ssrf_guard_rejects_reserved(client, path):
     assert "reserved" in detail or "invalid" in detail, (path, detail)
 
 
-def test_ssrf_guard_bulk_lookup_rejects_reserved(client):
-    """M2 follow-up: /lookup/bulk validates each domain before dispatch."""
-    resp = client.post(
-        "/lookup/bulk",
-        json={"domains": ["127.0.0.1", "example.com"], "concurrency": 1},
-    )
-    assert resp.status_code == 400
-
-
-def test_ssrf_guard_bulk_status_rejects_reserved(client):
-    resp = client.post(
-        "/status/bulk", json={"domains": ["127.0.0.1", "example.com"], "concurrency": 2}
-    )
-    assert resp.status_code == 400
-
-
-def test_ssrf_guard_bulk_whois_rejects_reserved(client):
-    resp = client.post(
-        "/whois/bulk", json={"domains": ["10.0.0.1"], "concurrency": 1}
-    )
-    assert resp.status_code == 400
-
-
-def test_ssrf_guard_bulk_dns_rejects_reserved(client):
-    resp = client.post(
-        "/dns/bulk",
-        json={"domains": ["169.254.169.254"], "record_type": "A", "concurrency": 1},
-    )
-    assert resp.status_code == 400
+@pytest.mark.parametrize(
+    "path,body",
+    [
+        # M2 follow-up: bulk routes must validate each domain before dispatch
+        # so the error classification stays 400 rather than bubbling through
+        # as a 500 from the inner seer call.
+        ("/lookup/bulk", {"domains": ["127.0.0.1", "example.com"], "concurrency": 1}),
+        ("/status/bulk", {"domains": ["127.0.0.1", "example.com"], "concurrency": 2}),
+        ("/whois/bulk", {"domains": ["10.0.0.1"], "concurrency": 1}),
+        (
+            "/dns/bulk",
+            {"domains": ["169.254.169.254"], "record_type": "A", "concurrency": 1},
+        ),
+        (
+            "/propagation/bulk",
+            {"domains": ["10.0.0.1"], "record_type": "A", "concurrency": 1},
+        ),
+        (
+            "/propagation/bulk/stream",
+            {"domains": ["127.0.0.1"], "record_type": "A", "concurrency": 1},
+        ),
+    ],
+)
+def test_ssrf_guard_bulk_rejects_reserved(client, path, body):
+    """Bulk routes refuse any body whose domains list contains a reserved IP."""
+    resp = client.post(path, json=body)
+    assert resp.status_code == 400, (path, resp.status_code, resp.text)
 
 
 def test_guard_async_yields_event_loop(monkeypatch):

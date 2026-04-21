@@ -1,16 +1,17 @@
 """WHOIS API endpoints."""
 
-import asyncio
 from typing import Annotated
 
 from fastapi import APIRouter, Path, Request
 from pydantic import BaseModel, Field
+
+import seer
+from seer_api._run import run_seer
 from seer_api.errors import http_error
 from seer_api.limiting import limiter
 from seer_api.ssrf import guard_async as ssrf_guard_async
+from seer_api.ssrf import guard_hosts_async
 from seer_api.streaming import stream_bulk
-
-import seer
 
 router = APIRouter()
 
@@ -45,9 +46,7 @@ async def whois_lookup(
     # resolved IPs — the port argument is a nominal hint for lookup_host.
     await ssrf_guard_async(domain, 43)
     try:
-        loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(None, seer.whois, domain)
-        return result
+        return await run_seer(seer.whois, domain)
     except Exception as e:
         raise http_error(e, "WHOIS lookup failed")
 
@@ -64,14 +63,9 @@ async def bulk_whois_lookup(request: Request, body: BulkWhoisRequest):
     Returns:
         List of WHOIS results for each domain
     """
-    for d in body.domains:
-        await ssrf_guard_async(d, 43)
+    await guard_hosts_async([(d, 43) for d in body.domains])
     try:
-        loop = asyncio.get_running_loop()
-        results = await loop.run_in_executor(
-            None, seer.bulk_whois, body.domains, body.concurrency
-        )
-        return results
+        return await run_seer(seer.bulk_whois, body.domains, body.concurrency)
     except Exception as e:
         raise http_error(e, "Bulk WHOIS lookup failed")
 
@@ -80,8 +74,7 @@ async def bulk_whois_lookup(request: Request, body: BulkWhoisRequest):
 @limiter.limit("10/minute")
 async def bulk_whois_stream(request: Request, body: BulkWhoisRequest):
     """Stream bulk WHOIS lookups as Server-Sent Events."""
-    for d in body.domains:
-        await ssrf_guard_async(d, 43)
+    await guard_hosts_async([(d, 43) for d in body.domains])
     try:
         return await stream_bulk(seer.bulk_whois, body.domains, body.concurrency)
     except Exception as e:
