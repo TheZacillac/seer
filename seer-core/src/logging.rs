@@ -98,19 +98,29 @@ where
     };
 
     // Build optional OpenTelemetry OTLP layer (boxed for type erasure).
+    // Compiled out entirely when the `otel` feature is disabled.
+    #[cfg(feature = "otel")]
     let otel_layer = build_otel_layer(app_name).map(|l| l.boxed());
 
     // Use try_init() — if another subscriber is already registered (e.g.,
     // when both seer-core and tome-core are linked into the same process),
     // this silently succeeds without panicking.
-    let _ = tracing_subscriber::registry()
+    let registry = tracing_subscriber::registry()
         .with(env_filter)
         .with(console_json)
         .with(console_text)
         .with(file_layer_json)
-        .with(file_layer_text)
-        .with(otel_layer)
-        .try_init();
+        .with(file_layer_text);
+
+    #[cfg(feature = "otel")]
+    let registry = registry.with(otel_layer);
+
+    let _ = registry.try_init();
+
+    // Silence unused-variable warning when `otel` is disabled — the layer
+    // builder still consumes `app_name` in the feature-on path.
+    #[cfg(not(feature = "otel"))]
+    let _ = app_name;
 
     LogGuard {
         _file_guard: file_guard,
@@ -153,7 +163,9 @@ fn read_env_chain(keys: &[&str], default: &str) -> String {
 }
 
 /// Build the OpenTelemetry OTLP tracing layer if `ARCANUM_OTEL_ENDPOINT` is
-/// set.  Returns `None` (zero cost) when the env var is absent.
+/// set. Returns `None` (zero cost) when the env var is absent. Only compiled
+/// when the `otel` feature is enabled.
+#[cfg(feature = "otel")]
 fn build_otel_layer<S>(
     service_name: &str,
 ) -> Option<tracing_opentelemetry::OpenTelemetryLayer<S, opentelemetry_sdk::trace::SdkTracer>>
