@@ -265,6 +265,11 @@ def _real_seer_validator(monkeypatch):
         "/dns/example.com/A?nameserver=169.254.169.254",
         "/dns/example.com/A?nameserver=127.0.0.1",
         "/dns/127.0.0.1/A",
+        # Propagation queries external resolvers about the caller-supplied
+        # domain; guard prevents reserved hostnames from reaching our
+        # outbound DNS path.
+        "/propagation/127.0.0.1/A",
+        "/propagation/169.254.169.254/A",
         # M2 follow-up: lookup and rdap routes also enforce the API-layer
         # guard so the error classification stays 400 (validation) rather
         # than bubbling through as a 500 from the inner seer call.
@@ -313,6 +318,22 @@ def test_ssrf_guard_bulk_dns_rejects_reserved(client):
     resp = client.post(
         "/dns/bulk",
         json={"domains": ["169.254.169.254"], "record_type": "A", "concurrency": 1},
+    )
+    assert resp.status_code == 400
+
+
+def test_ssrf_guard_bulk_propagation_rejects_reserved(client):
+    resp = client.post(
+        "/propagation/bulk",
+        json={"domains": ["10.0.0.1"], "record_type": "A", "concurrency": 1},
+    )
+    assert resp.status_code == 400
+
+
+def test_ssrf_guard_bulk_propagation_stream_rejects_reserved(client):
+    resp = client.post(
+        "/propagation/bulk/stream",
+        json={"domains": ["127.0.0.1"], "record_type": "A", "concurrency": 1},
     )
     assert resp.status_code == 400
 
