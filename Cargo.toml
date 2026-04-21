@@ -20,7 +20,7 @@ repository = "https://github.com/TheZacillac/seer"
 
 [workspace.dependencies]
 # Async runtime
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "signal"] }
 
 # HTTP client
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"], default-features = false }
