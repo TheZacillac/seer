@@ -256,35 +256,24 @@ def _real_seer_validator(monkeypatch):
 @pytest.mark.parametrize(
     "path",
     [
+        # Status actually HTTP-connects to the target → guard the target.
         "/status/127.0.0.1",
         "/status/169.254.169.254",
         "/status/10.0.0.1",
         "/status/192.168.1.1",
-        "/whois/127.0.0.1",
-        "/whois/169.254.169.254",
+        # dig's nameserver parameter is the actual connect target.
         "/dns/example.com/A?nameserver=169.254.169.254",
         "/dns/example.com/A?nameserver=127.0.0.1",
-        "/dns/127.0.0.1/A",
-        # Propagation queries external resolvers about the caller-supplied
-        # domain; guard prevents reserved hostnames from reaching our
-        # outbound DNS path.
-        "/propagation/127.0.0.1/A",
-        "/propagation/169.254.169.254/A",
-        # M2 follow-up: lookup and rdap routes also enforce the API-layer
-        # guard so the error classification stays 400 (validation) rather
-        # than bubbling through as a 500 from the inner seer call.
-        "/lookup/127.0.0.1",
-        "/lookup/10.0.0.1",
-        "/lookup/169.254.169.254",
-        "/rdap/domain/127.0.0.1",
-        "/rdap/domain/192.168.1.1",
+        # rdap/ip rejects reserved IP literals as input validation (the
+        # looked-up IP is not a connect target, but asking RDAP about a
+        # private IP is nonsensical).
         "/rdap/ip/127.0.0.1",
         "/rdap/ip/10.0.0.1",
         "/rdap/ip/169.254.169.254",
     ],
 )
 def test_ssrf_guard_rejects_reserved(client, path):
-    """All SSRF-capable routes must return 400 for reserved IPs."""
+    """Routes whose call path connects to the target must return 400 for reserved IPs."""
     resp = client.get(path)
     assert resp.status_code == 400, (path, resp.status_code, resp.text)
     detail = resp.json().get("detail", "").lower()
@@ -294,30 +283,55 @@ def test_ssrf_guard_rejects_reserved(client, path):
 @pytest.mark.parametrize(
     "path,body",
     [
-        # M2 follow-up: bulk routes must validate each domain before dispatch
-        # so the error classification stays 400 rather than bubbling through
-        # as a 500 from the inner seer call.
-        ("/lookup/bulk", {"domains": ["127.0.0.1", "example.com"], "concurrency": 1}),
+        # Status is the only bulk endpoint where every domain is an actual
+        # outbound connection target, so it's the only one that guards.
         ("/status/bulk", {"domains": ["127.0.0.1", "example.com"], "concurrency": 2}),
-        ("/whois/bulk", {"domains": ["10.0.0.1"], "concurrency": 1}),
-        (
-            "/dns/bulk",
-            {"domains": ["169.254.169.254"], "record_type": "A", "concurrency": 1},
-        ),
-        (
-            "/propagation/bulk",
-            {"domains": ["10.0.0.1"], "record_type": "A", "concurrency": 1},
-        ),
-        (
-            "/propagation/bulk/stream",
-            {"domains": ["127.0.0.1"], "record_type": "A", "concurrency": 1},
-        ),
     ],
 )
 def test_ssrf_guard_bulk_rejects_reserved(client, path, body):
-    """Bulk routes refuse any body whose domains list contains a reserved IP."""
+    """Bulk status refuses any body whose domains list contains a reserved IP."""
     resp = client.post(path, json=body)
     assert resp.status_code == 400, (path, resp.status_code, resp.text)
+
+
+@pytest.mark.parametrize(
+    "path,seer_fn",
+    [
+        # WHOIS/RDAP-domain/lookup/propagation/DNS(target) never connect to
+        # the queried host — the network goes to the registry or a DNS
+        # resolver. Guarding the query there rejects legitimate lookups of
+        # parked or unresolvable domains (e.g., a registered domain with no
+        # A record). These routes must NOT reject reserved hosts at the API
+        # layer; the inner seer call is responsible for guarding its own
+        # outbound legs (e.g., the WHOIS server it contacts).
+        ("/whois/127.0.0.1", "whois"),
+        ("/lookup/127.0.0.1", "lookup"),
+        ("/rdap/domain/127.0.0.1", "rdap_domain"),
+        ("/propagation/127.0.0.1/A", "propagation"),
+        ("/dns/127.0.0.1/A", "dig"),
+    ],
+)
+def test_non_connecting_routes_do_not_reject_at_api_layer(monkeypatch, client, path, seer_fn):
+    """Regression: API layer must pass reserved/unresolvable targets through
+    to the inner seer call for routes whose network target is not the
+    queried host. Guarding these was a bug that blocked lookups of parked
+    or DNS-less registered domains (e.g., ``johnternus.com``).
+    """
+    import seer as seer_mod
+
+    called = {"hit": False}
+
+    def _stub(*args, **kwargs):
+        called["hit"] = True
+        return {"ok": True}
+
+    monkeypatch.setattr(seer_mod, seer_fn, _stub, raising=False)
+    resp = client.get(path)
+    assert called["hit"], (
+        f"{path} was rejected at the API layer "
+        f"(status={resp.status_code}, body={resp.text!r}) — the inner "
+        f"seer.{seer_fn} must be called"
+    )
 
 
 def test_guard_async_yields_event_loop(monkeypatch):
@@ -366,20 +380,19 @@ def test_guard_async_yields_event_loop(monkeypatch):
 
 
 def test_mcp_ssrf_guard_rejects_reserved():
-    """MCP tool handlers must reject reserved IPs before dispatching to seer."""
+    """MCP tool handlers must reject reserved IPs for the tools whose call
+    path actually connects to the host parameter.
+    """
     import asyncio
 
     from seer_api.mcp.server import execute_tool
 
-    # seer_status with a loopback IP must fail before any seer call
+    # seer_status HTTP-connects to the target — must guard.
     with pytest.raises(ValueError, match="reserved"):
         asyncio.run(execute_tool("seer_status", {"domain": "127.0.0.1"}))
 
-    # seer_whois with a metadata IP must fail
-    with pytest.raises(ValueError, match="reserved"):
-        asyncio.run(execute_tool("seer_whois", {"domain": "169.254.169.254"}))
-
-    # seer_dig with a reserved nameserver must fail
+    # seer_dig with a reserved nameserver — the nameserver is the actual
+    # UDP/TCP connect target.
     with pytest.raises(ValueError, match="reserved"):
         asyncio.run(
             execute_tool(
@@ -388,9 +401,40 @@ def test_mcp_ssrf_guard_rejects_reserved():
             )
         )
 
-    # seer_rdap_ip with a private IP must fail
+    # seer_rdap_ip with a private IP — input validation for IP literals.
     with pytest.raises(ValueError, match="reserved"):
         asyncio.run(execute_tool("seer_rdap_ip", {"ip": "10.0.0.1"}))
+
+
+@pytest.mark.parametrize(
+    "tool,args,seer_fn",
+    [
+        ("seer_lookup", {"domain": "127.0.0.1"}, "lookup"),
+        ("seer_whois", {"domain": "127.0.0.1"}, "whois"),
+        ("seer_rdap_domain", {"domain": "127.0.0.1"}, "rdap_domain"),
+        ("seer_info", {"domain": "127.0.0.1"}, "info"),
+        ("seer_propagation", {"domain": "127.0.0.1", "record_type": "A"}, "propagation"),
+        ("seer_dig", {"domain": "127.0.0.1", "record_type": "A"}, "dig"),
+    ],
+)
+def test_mcp_non_connecting_tools_do_not_reject_at_api_layer(monkeypatch, tool, args, seer_fn):
+    """Regression: MCP tools whose network target is not the queried host
+    must pass reserved/unresolvable targets through to the inner seer call.
+    """
+    import asyncio
+
+    import seer as seer_mod
+    from seer_api.mcp.server import execute_tool
+
+    called = {"hit": False}
+
+    def _stub(*a, **kw):
+        called["hit"] = True
+        return {"ok": True}
+
+    monkeypatch.setattr(seer_mod, seer_fn, _stub, raising=False)
+    asyncio.run(execute_tool(tool, args))
+    assert called["hit"], f"{tool} was rejected at the MCP layer before reaching seer.{seer_fn}"
 
 
 def test_mcp_call_tool_returns_invalid_input_for_ssrf():

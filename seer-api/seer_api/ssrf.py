@@ -1,9 +1,20 @@
-"""SSRF guard for user-supplied host/IP parameters before calling seer.
+"""SSRF guard for user-supplied connect targets before calling seer.
 
-Every outbound leg that accepts a user-provided host (WHOIS/RDAP/DNS/status
-and custom DNS nameservers) must run through this guard so that requests
-cannot be weaponized to reach loopback, RFC1918, CGNAT, cloud-metadata, or
-link-local addresses.
+Only guard hosts that are the *actual outbound connection target*, not hosts
+that appear as query parameters. WHOIS/RDAP/propagation/DNS-lookup accept a
+domain to *ask about* — the network connection goes to the registry WHOIS
+server, the registry RDAP URL, or a (fixed or user-supplied) DNS resolver,
+not the queried domain itself. Guarding the queried domain there is both a
+no-op (no SSRF vector) and a footgun (rejects legitimate lookups of parked
+or unresolvable domains).
+
+Call the guard on:
+- ``status`` endpoints (directly HTTP-connect to the target)
+- ``rdap/ip`` input (reject reserved IP literals as input validation)
+- user-supplied DNS nameservers (the resolver we actually send packets to)
+
+Do NOT call the guard on the queried domain for WHOIS/RDAP-domain/DNS-lookup
+target/propagation target — those paths don't connect to that host.
 """
 
 from __future__ import annotations

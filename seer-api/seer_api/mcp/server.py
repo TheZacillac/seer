@@ -407,17 +407,14 @@ async def execute_tool(name: str, arguments: dict[str, Any]) -> Any:
     match name:
         case "seer_lookup":
             domain = _require_str(arguments, "domain")
-            _ssrf_guard(domain, 443)
             return await loop.run_in_executor(None, seer.lookup, domain)
 
         case "seer_whois":
             domain = _require_str(arguments, "domain")
-            _ssrf_guard(domain, 43)
             return await loop.run_in_executor(None, seer.whois, domain)
 
         case "seer_rdap_domain":
             domain = _require_str(arguments, "domain")
-            _ssrf_guard(domain, 443)
             return await loop.run_in_executor(None, seer.rdap_domain, domain)
 
         case "seer_rdap_ip":
@@ -437,7 +434,6 @@ async def execute_tool(name: str, arguments: dict[str, Any]) -> Any:
             nameserver = arguments.get("nameserver")
             if nameserver is not None and not isinstance(nameserver, str):
                 raise ValueError(f"'nameserver' must be a string (got {type(nameserver).__name__})")
-            _ssrf_guard(domain, 53)
             if nameserver is not None:
                 _ssrf_guard(nameserver, 53)
             return await loop.run_in_executor(
@@ -447,7 +443,6 @@ async def execute_tool(name: str, arguments: dict[str, Any]) -> Any:
         case "seer_propagation":
             domain = _require_str(arguments, "domain")
             record_type = _require_record_type(arguments)
-            _ssrf_guard(domain, 53)
             return await loop.run_in_executor(
                 None, seer.propagation, domain, record_type
             )
@@ -460,8 +455,6 @@ async def execute_tool(name: str, arguments: dict[str, Any]) -> Any:
         case "seer_bulk_lookup":
             domains = _require_domains(arguments)
             concurrency = _get_concurrency(arguments, default=10)
-            for d in domains:
-                _ssrf_guard(d, 443)
             return await loop.run_in_executor(
                 None, seer.bulk_lookup, domains, concurrency
             )
@@ -469,8 +462,6 @@ async def execute_tool(name: str, arguments: dict[str, Any]) -> Any:
         case "seer_bulk_whois":
             domains = _require_domains(arguments)
             concurrency = _get_concurrency(arguments, default=10)
-            for d in domains:
-                _ssrf_guard(d, 43)
             return await loop.run_in_executor(
                 None, seer.bulk_whois, domains, concurrency
             )
@@ -479,8 +470,6 @@ async def execute_tool(name: str, arguments: dict[str, Any]) -> Any:
             domains = _require_domains(arguments)
             record_type = _require_record_type(arguments)
             concurrency = _get_concurrency(arguments, default=10)
-            for d in domains:
-                _ssrf_guard(d, 53)
             return await loop.run_in_executor(
                 None, seer.bulk_dig, domains, record_type, concurrency
             )
@@ -498,22 +487,17 @@ async def execute_tool(name: str, arguments: dict[str, Any]) -> Any:
             domains = _require_domains(arguments)
             record_type = _require_record_type(arguments)
             concurrency = _get_concurrency(arguments, default=5)
-            for d in domains:
-                _ssrf_guard(d, 53)
             return await loop.run_in_executor(
                 None, seer.bulk_propagation, domains, record_type, concurrency
             )
 
         case "seer_info":
             domain = _require_str(arguments, "domain")
-            _ssrf_guard(domain, 443)
             return await loop.run_in_executor(None, seer.info, domain)
 
         case "seer_bulk_info":
             domains = _require_domains(arguments)
             concurrency = _get_concurrency(arguments, default=10)
-            for d in domains:
-                _ssrf_guard(d, 443)
             return await loop.run_in_executor(
                 None, seer.bulk_info, domains, concurrency
             )

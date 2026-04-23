@@ -9,8 +9,6 @@ import seer
 from seer_api._run import run_seer
 from seer_api.errors import http_error
 from seer_api.limiting import limiter
-from seer_api.ssrf import guard_async as ssrf_guard_async
-from seer_api.ssrf import guard_hosts_async
 from seer_api.streaming import stream_bulk
 
 router = APIRouter()
@@ -42,9 +40,6 @@ async def whois_lookup(
     Returns:
         WHOIS response with registrar, dates, nameservers, and status information
     """
-    # WHOIS uses TCP port 43, but the SSRF guard only inspects the host's
-    # resolved IPs — the port argument is a nominal hint for lookup_host.
-    await ssrf_guard_async(domain, 43)
     try:
         return await run_seer(seer.whois, domain)
     except Exception as e:
@@ -63,7 +58,6 @@ async def bulk_whois_lookup(request: Request, body: BulkWhoisRequest):
     Returns:
         List of WHOIS results for each domain
     """
-    await guard_hosts_async([(d, 43) for d in body.domains])
     try:
         return await run_seer(seer.bulk_whois, body.domains, body.concurrency)
     except Exception as e:
@@ -74,7 +68,6 @@ async def bulk_whois_lookup(request: Request, body: BulkWhoisRequest):
 @limiter.limit("10/minute")
 async def bulk_whois_stream(request: Request, body: BulkWhoisRequest):
     """Stream bulk WHOIS lookups as Server-Sent Events."""
-    await guard_hosts_async([(d, 43) for d in body.domains])
     try:
         return await stream_bulk(seer.bulk_whois, body.domains, body.concurrency)
     except Exception as e:

@@ -26,7 +26,6 @@ async def rdap_domain_lookup(
     Returns:
         RDAP response with registration information
     """
-    await ssrf_guard_async(domain, 443)
     try:
         return await run_seer(seer.rdap_domain, domain)
     except Exception as e:

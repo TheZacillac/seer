@@ -10,7 +10,6 @@ from seer_api._run import run_seer
 from seer_api.errors import http_error
 from seer_api.limiting import limiter
 from seer_api.ssrf import guard_async as ssrf_guard_async
-from seer_api.ssrf import guard_hosts_async
 from seer_api.streaming import stream_bulk
 
 router = APIRouter()
@@ -47,12 +46,8 @@ async def dns_lookup(
     Returns:
         List of DNS records
     """
-    # A DNS query uses port 53 on the resolver. The domain being queried is
-    # not a target of an outbound connection (we look it up via our resolver),
-    # but the nameserver param IS — it's where our resolver sends packets.
-    # Validate both: the domain in case the resolver chases it, and the
-    # nameserver explicitly at port 53.
-    await ssrf_guard_async(domain, 53)
+    # Guard the nameserver (it's the actual connect target) but NOT the
+    # queried domain — the domain is a DNS question, not a destination.
     if nameserver is not None:
         await ssrf_guard_async(nameserver, 53)
     try:
@@ -73,7 +68,6 @@ async def bulk_dns_lookup(request: Request, body: BulkDnsRequest):
     Returns:
         List of DNS results for each domain
     """
-    await guard_hosts_async([(d, 53) for d in body.domains])
     try:
         return await run_seer(seer.bulk_dig, body.domains, body.record_type, body.concurrency)
     except Exception as e:
@@ -84,7 +78,6 @@ async def bulk_dns_lookup(request: Request, body: BulkDnsRequest):
 @limiter.limit("10/minute")
 async def bulk_dns_stream(request: Request, body: BulkDnsRequest):
     """Stream bulk DNS queries as Server-Sent Events."""
-    await guard_hosts_async([(d, 53) for d in body.domains])
     try:
         return await stream_bulk(
             seer.bulk_dig, body.domains, body.record_type, body.concurrency

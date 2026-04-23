@@ -9,8 +9,6 @@ import seer
 from seer_api._run import run_seer
 from seer_api.errors import http_error
 from seer_api.limiting import limiter
-from seer_api.ssrf import guard_async as ssrf_guard_async
-from seer_api.ssrf import guard_hosts_async
 from seer_api.streaming import stream_bulk
 
 router = APIRouter()
@@ -45,10 +43,6 @@ async def propagation_check(
     Returns:
         Propagation result with percentage and per-server results
     """
-    # Mirrors dns.py: propagation queries external resolvers about the
-    # caller-supplied domain. Guard so a reserved/internal hostname can't
-    # be used to probe what our outbound DNS path returns for it.
-    await ssrf_guard_async(domain, 53)
     try:
         return await run_seer(seer.propagation, domain, record_type)
     except Exception as e:
@@ -67,7 +61,6 @@ async def bulk_propagation_check(request: Request, body: BulkPropagationRequest)
     Returns:
         List of propagation results for each domain
     """
-    await guard_hosts_async([(d, 53) for d in body.domains])
     try:
         return await run_seer(
             seer.bulk_propagation, body.domains, body.record_type, body.concurrency
@@ -80,7 +73,6 @@ async def bulk_propagation_check(request: Request, body: BulkPropagationRequest)
 @limiter.limit("5/minute")
 async def bulk_propagation_stream(request: Request, body: BulkPropagationRequest):
     """Stream bulk DNS-propagation checks as Server-Sent Events."""
-    await guard_hosts_async([(d, 53) for d in body.domains])
     try:
         return await stream_bulk(
             seer.bulk_propagation, body.domains, body.record_type, body.concurrency

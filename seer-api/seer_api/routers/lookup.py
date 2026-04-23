@@ -9,8 +9,6 @@ import seer
 from seer_api._run import run_seer
 from seer_api.errors import http_error
 from seer_api.limiting import limiter
-from seer_api.ssrf import guard_async as ssrf_guard_async
-from seer_api.ssrf import guard_hosts_async
 from seer_api.streaming import stream_bulk
 
 router = APIRouter()
@@ -42,7 +40,6 @@ async def smart_lookup(
     Returns:
         Lookup result with source indicator (rdap or whois) and registration data
     """
-    await ssrf_guard_async(domain, 443)
     try:
         return await run_seer(seer.lookup, domain)
     except Exception as e:
@@ -61,7 +58,6 @@ async def bulk_smart_lookup(request: Request, body: BulkLookupRequest):
     Returns:
         List of lookup results for each domain
     """
-    await guard_hosts_async([(d, 443) for d in body.domains])
     try:
         return await run_seer(seer.bulk_lookup, body.domains, body.concurrency)
     except Exception as e:
@@ -76,7 +72,6 @@ async def bulk_smart_lookup_stream(request: Request, body: BulkLookupRequest):
     Emits `progress`, `item`, and `done` events. Matches the sync /bulk
     semantics — see that handler for request/response body shape.
     """
-    await guard_hosts_async([(d, 443) for d in body.domains])
     try:
         return await stream_bulk(seer.bulk_lookup, body.domains, body.concurrency)
     except Exception as e:
