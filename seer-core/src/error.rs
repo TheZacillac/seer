@@ -21,7 +21,7 @@ pub enum SeerError {
     DnsError(String),
 
     #[error("DNS resolver error: {0}")]
-    DnsResolverError(#[from] hickory_resolver::error::ResolveError),
+    DnsResolverError(#[from] hickory_resolver::net::NetError),
 
     #[error("Invalid domain name: {0}")]
     InvalidDomain(String),

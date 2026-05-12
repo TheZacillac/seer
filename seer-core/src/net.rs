@@ -8,8 +8,9 @@
 use std::net::IpAddr;
 use std::time::Duration;
 
-use hickory_resolver::config::{ResolverConfig, ResolverOpts};
-use hickory_resolver::TokioAsyncResolver;
+use hickory_resolver::config::{ResolveHosts, ResolverConfig, GOOGLE};
+use hickory_resolver::net::runtime::TokioRuntimeProvider;
+use hickory_resolver::TokioResolver;
 use once_cell::sync::Lazy;
 use tokio::net::lookup_host;
 use tracing::warn;
@@ -30,12 +31,20 @@ use crate::error::{Result, SeerError};
 /// returns a reserved IP — is still trusted and still blocked by the
 /// reserved-IP check. The pre-existing time-of-check/time-of-use window
 /// between validation and the actual outbound connect is unchanged.
-static FALLBACK_RESOLVER: Lazy<TokioAsyncResolver> = Lazy::new(|| {
-    let mut opts = ResolverOpts::default();
-    opts.timeout = Duration::from_secs(5);
-    opts.attempts = 2;
-    opts.use_hosts_file = false;
-    TokioAsyncResolver::tokio(ResolverConfig::google(), opts)
+static FALLBACK_RESOLVER: Lazy<TokioResolver> = Lazy::new(|| {
+    let mut builder = TokioResolver::builder_with_config(
+        ResolverConfig::udp_and_tcp(&GOOGLE),
+        TokioRuntimeProvider::default(),
+    );
+    {
+        let opts = builder.options_mut();
+        opts.timeout = Duration::from_secs(5);
+        opts.attempts = 2;
+        opts.use_hosts_file = ResolveHosts::Never;
+    }
+    builder
+        .build()
+        .expect("hickory fallback resolver build is infallible with no TLS features")
 });
 
 /// Reject an IP address if it belongs to any range that is not appropriate

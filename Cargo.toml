@@ -26,7 +26,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time",
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"], default-features = false }
 
 # DNS resolution
-hickory-resolver = { version = "0.24", features = ["dnssec-ring"] }
+hickory-resolver = { version = "0.26", features = ["dnssec-ring"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

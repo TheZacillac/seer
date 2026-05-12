@@ -1,12 +1,14 @@
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::str::FromStr;
 use std::time::Duration;
 
-use hickory_resolver::config::{NameServerConfig, Protocol, ResolverConfig, ResolverOpts};
-use hickory_resolver::error::ResolveErrorKind;
+use hickory_resolver::config::{NameServerConfig, ResolveHosts, ResolverConfig, GOOGLE};
+use hickory_resolver::net::runtime::TokioRuntimeProvider;
+use hickory_resolver::net::NetError;
+use hickory_resolver::proto::dnssec::PublicKey;
 use hickory_resolver::proto::rr::rdata::CAA;
-use hickory_resolver::proto::rr::RecordType as HickoryRecordType;
-use hickory_resolver::TokioAsyncResolver;
+use hickory_resolver::proto::rr::{RData as HickoryRData, RecordType as HickoryRecordType};
+use hickory_resolver::TokioResolver;
 use tracing::{debug, instrument};
 
 use super::records::{DnsRecord, RecordData, RecordType};
@@ -17,24 +19,41 @@ use crate::validation::normalize_domain;
 /// rather than an error. This is correct DNS behavior — the absence of a
 /// record type for a domain is a valid response (NODATA), not a failure.
 fn dns_lookup_or_empty<T>(
-    result: std::result::Result<T, hickory_resolver::error::ResolveError>,
+    result: std::result::Result<T, NetError>,
     record_type: &str,
 ) -> Result<Option<T>> {
     match result {
         Ok(response) => Ok(Some(response)),
-        Err(e) => match e.kind() {
-            ResolveErrorKind::NoRecordsFound { .. } => Ok(None),
-            _ => Err(SeerError::DnsError(format!(
-                "{} lookup failed: {}",
-                record_type, e
-            ))),
-        },
+        Err(e) if e.is_no_records_found() => Ok(None),
+        Err(e) => Err(SeerError::DnsError(format!(
+            "{} lookup failed: {}",
+            record_type, e
+        ))),
     }
 }
 
 /// Default timeout for DNS queries (5 seconds).
 /// DNS is typically fast; longer timeouts indicate network issues or unreachable servers.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Build a TokioResolver pre-configured with the given upstream config and
+/// our standard options (timeout, retries, no hosts-file consultation).
+///
+/// Build only fails when TLS configuration construction fails; we don't
+/// enable TLS features in seer-core so `expect` is safe here and is the
+/// cleanest expression of that invariant.
+fn build_resolver(config: ResolverConfig, timeout: Duration) -> TokioResolver {
+    let mut builder = TokioResolver::builder_with_config(config, TokioRuntimeProvider::default());
+    {
+        let opts = builder.options_mut();
+        opts.timeout = timeout;
+        opts.attempts = 2;
+        opts.use_hosts_file = ResolveHosts::Never;
+    }
+    builder
+        .build()
+        .expect("hickory resolver build is infallible without TLS features")
+}
 
 /// DNS resolver for querying various record types.
 ///
@@ -46,7 +65,7 @@ pub struct DnsResolver {
     timeout: Duration,
     /// Cached default resolver (Google DNS). Reused across all queries
     /// that don't specify a custom nameserver.
-    default_resolver: TokioAsyncResolver,
+    default_resolver: TokioResolver,
 }
 
 impl std::fmt::Debug for DnsResolver {
@@ -66,14 +85,9 @@ impl Default for DnsResolver {
 impl DnsResolver {
     /// Creates a new DNS resolver with default settings.
     pub fn new() -> Self {
-        let mut opts = ResolverOpts::default();
-        opts.timeout = DEFAULT_TIMEOUT;
-        opts.attempts = 2;
-        opts.use_hosts_file = false;
-
         Self {
             timeout: DEFAULT_TIMEOUT,
-            default_resolver: TokioAsyncResolver::tokio(ResolverConfig::google(), opts),
+            default_resolver: build_resolver(ResolverConfig::udp_and_tcp(&GOOGLE), DEFAULT_TIMEOUT),
         }
     }
 
@@ -82,21 +96,11 @@ impl DnsResolver {
     /// The default is 5 seconds, which is sufficient for most DNS queries.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
-        // Recreate default resolver with new timeout
-        let mut opts = ResolverOpts::default();
-        opts.timeout = timeout;
-        opts.attempts = 2;
-        opts.use_hosts_file = false;
-        self.default_resolver = TokioAsyncResolver::tokio(ResolverConfig::google(), opts);
+        self.default_resolver = build_resolver(ResolverConfig::udp_and_tcp(&GOOGLE), timeout);
         self
     }
 
-    fn create_custom_resolver(&self, nameserver: &str) -> Result<TokioAsyncResolver> {
-        let mut opts = ResolverOpts::default();
-        opts.timeout = self.timeout;
-        opts.attempts = 2;
-        opts.use_hosts_file = false;
-
+    fn create_custom_resolver(&self, nameserver: &str) -> Result<TokioResolver> {
         let ip: IpAddr = nameserver
             .parse()
             .map_err(|_| SeerError::DnsError(format!("invalid nameserver IP: {}", nameserver)))?;
@@ -109,13 +113,16 @@ impl DnsResolver {
             )));
         }
 
-        let socket_addr = SocketAddr::new(ip, 53);
-        let ns_config = NameServerConfig::new(socket_addr, Protocol::Udp);
+        // Build a config with a single UDP nameserver on the given IP.
+        // In hickory 0.26, NameServerConfig::udp(IpAddr) builds a
+        // ConnectionConfig with the default DNS port (53) for us, so we
+        // no longer need to construct a SocketAddr explicitly.
+        let ns_config = NameServerConfig::udp(ip);
 
-        let mut config = ResolverConfig::new();
+        let mut config = ResolverConfig::from_parts(None, vec![], vec![]);
         config.add_name_server(ns_config);
 
-        Ok(TokioAsyncResolver::tokio(config, opts))
+        Ok(build_resolver(config, self.timeout))
     }
 
     /// Resolves DNS records for a domain.
@@ -204,91 +211,93 @@ impl DnsResolver {
         };
         let query_name = format!("_{}._{}.{}", service, protocol, domain);
 
-        let Some(response) = dns_lookup_or_empty(resolver.srv_lookup(&query_name).await, "SRV")?
+        let Some(response) = dns_lookup_or_empty(
+            resolver.lookup(&query_name, HickoryRecordType::SRV).await,
+            "SRV",
+        )?
         else {
             return Ok(vec![]);
         };
 
         let records = response
+            .answers()
             .iter()
-            .map(|srv| DnsRecord {
-                name: query_name.clone(),
-                record_type: RecordType::SRV,
-                ttl: response
-                    .as_lookup()
-                    .record_iter()
-                    .next()
-                    .map(|r| r.ttl())
-                    .unwrap_or(0),
-                data: RecordData::SRV {
-                    priority: srv.priority(),
-                    weight: srv.weight(),
-                    port: srv.port(),
-                    target: srv.target().to_string(),
-                },
+            .filter_map(|record| {
+                if let HickoryRData::SRV(srv) = &record.data {
+                    Some(DnsRecord {
+                        name: query_name.clone(),
+                        record_type: RecordType::SRV,
+                        ttl: record.ttl,
+                        data: RecordData::SRV {
+                            priority: srv.priority,
+                            weight: srv.weight,
+                            port: srv.port,
+                            target: srv.target.to_string(),
+                        },
+                    })
+                } else {
+                    None
+                }
             })
             .collect();
 
         Ok(records)
     }
 
-    async fn resolve_a(
-        &self,
-        resolver: &TokioAsyncResolver,
-        domain: &str,
-    ) -> Result<Vec<DnsRecord>> {
-        let Some(response) = dns_lookup_or_empty(resolver.ipv4_lookup(domain).await, "A")? else {
+    async fn resolve_a(&self, resolver: &TokioResolver, domain: &str) -> Result<Vec<DnsRecord>> {
+        let Some(response) =
+            dns_lookup_or_empty(resolver.lookup(domain, HickoryRecordType::A).await, "A")?
+        else {
             return Ok(vec![]);
         };
 
-        let ttl = response
-            .as_lookup()
-            .record_iter()
-            .next()
-            .map(|r| r.ttl())
-            .unwrap_or(0);
-
         let records = response
+            .answers()
             .iter()
-            .map(|addr| DnsRecord {
-                name: domain.to_string(),
-                record_type: RecordType::A,
-                ttl,
-                data: RecordData::A {
-                    address: addr.to_string(),
-                },
+            .filter_map(|record| {
+                if let HickoryRData::A(addr) = &record.data {
+                    Some(DnsRecord {
+                        name: domain.to_string(),
+                        record_type: RecordType::A,
+                        ttl: record.ttl,
+                        data: RecordData::A {
+                            address: addr.0.to_string(),
+                        },
+                    })
+                } else {
+                    None
+                }
             })
             .collect();
 
         Ok(records)
     }
 
-    async fn resolve_aaaa(
-        &self,
-        resolver: &TokioAsyncResolver,
-        domain: &str,
-    ) -> Result<Vec<DnsRecord>> {
-        let Some(response) = dns_lookup_or_empty(resolver.ipv6_lookup(domain).await, "AAAA")?
+    async fn resolve_aaaa(&self, resolver: &TokioResolver, domain: &str) -> Result<Vec<DnsRecord>> {
+        let Some(response) = dns_lookup_or_empty(
+            resolver.lookup(domain, HickoryRecordType::AAAA).await,
+            "AAAA",
+        )?
         else {
             return Ok(vec![]);
         };
 
-        let ttl = response
-            .as_lookup()
-            .record_iter()
-            .next()
-            .map(|r| r.ttl())
-            .unwrap_or(0);
-
         let records = response
+            .answers()
             .iter()
-            .map(|addr| DnsRecord {
-                name: domain.to_string(),
-                record_type: RecordType::AAAA,
-                ttl,
-                data: RecordData::AAAA {
-                    address: addr.to_string(),
-                },
+            .filter_map(|record| {
+                if let HickoryRData::AAAA(addr) = &record.data {
+                    Some(DnsRecord {
+                        name: domain.to_string(),
+                        record_type: RecordType::AAAA,
+                        ttl: record.ttl,
+                        data: RecordData::AAAA {
+                            address: addr.0.to_string(),
+                        },
+                    })
+                } else {
+                    None
+                }
             })
             .collect();
 
@@ -297,7 +306,7 @@ impl DnsResolver {
 
     async fn resolve_cname(
         &self,
-        resolver: &TokioAsyncResolver,
+        resolver: &TokioResolver,
         domain: &str,
     ) -> Result<Vec<DnsRecord>> {
         let Some(response) = dns_lookup_or_empty(
@@ -309,53 +318,51 @@ impl DnsResolver {
         };
 
         let records = response
-            .record_iter()
+            .answers()
+            .iter()
             .filter_map(|record| {
-                if let Some(rdata) = record.data() {
-                    if let Some(cname) = rdata.as_cname() {
-                        return Some(DnsRecord {
-                            name: domain.to_string(),
-                            record_type: RecordType::CNAME,
-                            ttl: record.ttl(),
-                            data: RecordData::CNAME {
-                                target: cname.0.to_string(),
-                            },
-                        });
-                    }
+                if let HickoryRData::CNAME(cname) = &record.data {
+                    Some(DnsRecord {
+                        name: domain.to_string(),
+                        record_type: RecordType::CNAME,
+                        ttl: record.ttl,
+                        data: RecordData::CNAME {
+                            target: cname.0.to_string(),
+                        },
+                    })
+                } else {
+                    None
                 }
-                None
             })
             .collect();
 
         Ok(records)
     }
 
-    async fn resolve_mx(
-        &self,
-        resolver: &TokioAsyncResolver,
-        domain: &str,
-    ) -> Result<Vec<DnsRecord>> {
-        let Some(response) = dns_lookup_or_empty(resolver.mx_lookup(domain).await, "MX")? else {
+    async fn resolve_mx(&self, resolver: &TokioResolver, domain: &str) -> Result<Vec<DnsRecord>> {
+        let Some(response) =
+            dns_lookup_or_empty(resolver.lookup(domain, HickoryRecordType::MX).await, "MX")?
+        else {
             return Ok(vec![]);
         };
 
-        let ttl = response
-            .as_lookup()
-            .record_iter()
-            .next()
-            .map(|r| r.ttl())
-            .unwrap_or(0);
-
         let mut records: Vec<DnsRecord> = response
+            .answers()
             .iter()
-            .map(|mx| DnsRecord {
-                name: domain.to_string(),
-                record_type: RecordType::MX,
-                ttl,
-                data: RecordData::MX {
-                    preference: mx.preference(),
-                    exchange: mx.exchange().to_string(),
-                },
+            .filter_map(|record| {
+                if let HickoryRData::MX(mx) = &record.data {
+                    Some(DnsRecord {
+                        name: domain.to_string(),
+                        record_type: RecordType::MX,
+                        ttl: record.ttl,
+                        data: RecordData::MX {
+                            preference: mx.preference,
+                            exchange: mx.exchange.to_string(),
+                        },
+                    })
+                } else {
+                    None
+                }
             })
             .collect();
 
@@ -370,67 +377,28 @@ impl DnsResolver {
         Ok(records)
     }
 
-    async fn resolve_ns(
-        &self,
-        resolver: &TokioAsyncResolver,
-        domain: &str,
-    ) -> Result<Vec<DnsRecord>> {
-        let Some(response) = dns_lookup_or_empty(resolver.ns_lookup(domain).await, "NS")? else {
+    async fn resolve_ns(&self, resolver: &TokioResolver, domain: &str) -> Result<Vec<DnsRecord>> {
+        let Some(response) =
+            dns_lookup_or_empty(resolver.lookup(domain, HickoryRecordType::NS).await, "NS")?
+        else {
             return Ok(vec![]);
         };
 
-        let ttl = response
-            .as_lookup()
-            .record_iter()
-            .next()
-            .map(|r| r.ttl())
-            .unwrap_or(0);
-
         let records = response
+            .answers()
             .iter()
-            .map(|ns| DnsRecord {
-                name: domain.to_string(),
-                record_type: RecordType::NS,
-                ttl,
-                data: RecordData::NS {
-                    nameserver: ns.0.to_string(),
-                },
-            })
-            .collect();
-
-        Ok(records)
-    }
-
-    async fn resolve_txt(
-        &self,
-        resolver: &TokioAsyncResolver,
-        domain: &str,
-    ) -> Result<Vec<DnsRecord>> {
-        let Some(response) = dns_lookup_or_empty(resolver.txt_lookup(domain).await, "TXT")? else {
-            return Ok(vec![]);
-        };
-
-        let ttl = response
-            .as_lookup()
-            .record_iter()
-            .next()
-            .map(|r| r.ttl())
-            .unwrap_or(0);
-
-        let records = response
-            .iter()
-            .map(|txt| {
-                let text = txt
-                    .iter()
-                    .map(|data| String::from_utf8_lossy(data).to_string())
-                    .collect::<Vec<_>>()
-                    .join("");
-
-                DnsRecord {
-                    name: domain.to_string(),
-                    record_type: RecordType::TXT,
-                    ttl,
-                    data: RecordData::TXT { text },
+            .filter_map(|record| {
+                if let HickoryRData::NS(ns) = &record.data {
+                    Some(DnsRecord {
+                        name: domain.to_string(),
+                        record_type: RecordType::NS,
+                        ttl: record.ttl,
+                        data: RecordData::NS {
+                            nameserver: ns.0.to_string(),
+                        },
+                    })
+                } else {
+                    None
                 }
             })
             .collect();
@@ -438,48 +406,76 @@ impl DnsResolver {
         Ok(records)
     }
 
-    async fn resolve_soa(
-        &self,
-        resolver: &TokioAsyncResolver,
-        domain: &str,
-    ) -> Result<Vec<DnsRecord>> {
-        let Some(response) = dns_lookup_or_empty(resolver.soa_lookup(domain).await, "SOA")? else {
+    async fn resolve_txt(&self, resolver: &TokioResolver, domain: &str) -> Result<Vec<DnsRecord>> {
+        let Some(response) =
+            dns_lookup_or_empty(resolver.lookup(domain, HickoryRecordType::TXT).await, "TXT")?
+        else {
             return Ok(vec![]);
         };
 
-        let ttl = response
-            .as_lookup()
-            .record_iter()
-            .next()
-            .map(|r| r.ttl())
-            .unwrap_or(0);
-
         let records = response
+            .answers()
             .iter()
-            .map(|soa| DnsRecord {
-                name: domain.to_string(),
-                record_type: RecordType::SOA,
-                ttl,
-                data: RecordData::SOA {
-                    mname: soa.mname().to_string(),
-                    rname: soa.rname().to_string(),
-                    serial: soa.serial(),
-                    refresh: soa.refresh().try_into().unwrap_or(0),
-                    retry: soa.retry().try_into().unwrap_or(0),
-                    expire: soa.expire().try_into().unwrap_or(0),
-                    minimum: soa.minimum(),
-                },
+            .filter_map(|record| {
+                if let HickoryRData::TXT(txt) = &record.data {
+                    let text = txt
+                        .txt_data
+                        .iter()
+                        .map(|data| String::from_utf8_lossy(data).to_string())
+                        .collect::<Vec<_>>()
+                        .join("");
+
+                    Some(DnsRecord {
+                        name: domain.to_string(),
+                        record_type: RecordType::TXT,
+                        ttl: record.ttl,
+                        data: RecordData::TXT { text },
+                    })
+                } else {
+                    None
+                }
             })
             .collect();
 
         Ok(records)
     }
 
-    async fn resolve_ptr(
-        &self,
-        resolver: &TokioAsyncResolver,
-        query: &str,
-    ) -> Result<Vec<DnsRecord>> {
+    async fn resolve_soa(&self, resolver: &TokioResolver, domain: &str) -> Result<Vec<DnsRecord>> {
+        let Some(response) =
+            dns_lookup_or_empty(resolver.lookup(domain, HickoryRecordType::SOA).await, "SOA")?
+        else {
+            return Ok(vec![]);
+        };
+
+        let records = response
+            .answers()
+            .iter()
+            .filter_map(|record| {
+                if let HickoryRData::SOA(soa) = &record.data {
+                    Some(DnsRecord {
+                        name: domain.to_string(),
+                        record_type: RecordType::SOA,
+                        ttl: record.ttl,
+                        data: RecordData::SOA {
+                            mname: soa.mname.to_string(),
+                            rname: soa.rname.to_string(),
+                            serial: soa.serial,
+                            refresh: soa.refresh.try_into().unwrap_or(0),
+                            retry: soa.retry.try_into().unwrap_or(0),
+                            expire: soa.expire.try_into().unwrap_or(0),
+                            minimum: soa.minimum,
+                        },
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        Ok(records)
+    }
+
+    async fn resolve_ptr(&self, resolver: &TokioResolver, query: &str) -> Result<Vec<DnsRecord>> {
         // If it's an IP address, convert to reverse DNS format
         let query = if let Ok(ip) = IpAddr::from_str(query) {
             reverse_dns_name(&ip)
@@ -494,32 +490,28 @@ impl DnsResolver {
         };
 
         let records = response
-            .record_iter()
+            .answers()
+            .iter()
             .filter_map(|record| {
-                if let Some(rdata) = record.data() {
-                    if let Some(ptr) = rdata.as_ptr() {
-                        return Some(DnsRecord {
-                            name: query.clone(),
-                            record_type: RecordType::PTR,
-                            ttl: record.ttl(),
-                            data: RecordData::PTR {
-                                target: ptr.0.to_string(),
-                            },
-                        });
-                    }
+                if let HickoryRData::PTR(ptr) = &record.data {
+                    Some(DnsRecord {
+                        name: query.clone(),
+                        record_type: RecordType::PTR,
+                        ttl: record.ttl,
+                        data: RecordData::PTR {
+                            target: ptr.0.to_string(),
+                        },
+                    })
+                } else {
+                    None
                 }
-                None
             })
             .collect();
 
         Ok(records)
     }
 
-    async fn resolve_caa(
-        &self,
-        resolver: &TokioAsyncResolver,
-        domain: &str,
-    ) -> Result<Vec<DnsRecord>> {
+    async fn resolve_caa(&self, resolver: &TokioResolver, domain: &str) -> Result<Vec<DnsRecord>> {
         let Some(response) =
             dns_lookup_or_empty(resolver.lookup(domain, HickoryRecordType::CAA).await, "CAA")?
         else {
@@ -527,20 +519,20 @@ impl DnsResolver {
         };
 
         let records = response
-            .record_iter()
+            .answers()
+            .iter()
             .filter_map(|record| {
-                if let Some(rdata) = record.data() {
-                    if let Some(caa) = rdata.as_caa() {
-                        let (flags, tag, value) = parse_caa(caa);
-                        return Some(DnsRecord {
-                            name: domain.to_string(),
-                            record_type: RecordType::CAA,
-                            ttl: record.ttl(),
-                            data: RecordData::CAA { flags, tag, value },
-                        });
-                    }
+                if let HickoryRData::CAA(caa) = &record.data {
+                    let (flags, tag, value) = parse_caa(caa);
+                    Some(DnsRecord {
+                        name: domain.to_string(),
+                        record_type: RecordType::CAA,
+                        ttl: record.ttl,
+                        data: RecordData::CAA { flags, tag, value },
+                    })
+                } else {
+                    None
                 }
-                None
             })
             .collect();
 
@@ -549,10 +541,10 @@ impl DnsResolver {
 
     async fn resolve_dnskey(
         &self,
-        resolver: &TokioAsyncResolver,
+        resolver: &TokioResolver,
         domain: &str,
     ) -> Result<Vec<DnsRecord>> {
-        use hickory_resolver::proto::rr::RData as HickoryRData;
+        use hickory_resolver::proto::dnssec::rdata::DNSSECRData;
 
         let Some(response) = dns_lookup_or_empty(
             resolver.lookup(domain, HickoryRecordType::DNSKEY).await,
@@ -563,38 +555,36 @@ impl DnsResolver {
         };
 
         let records = response
-            .record_iter()
+            .answers()
+            .iter()
             .filter_map(|record| {
-                if let Some(HickoryRData::DNSSEC(dnssec_rdata)) = record.data() {
-                    if let Some(dnskey) = dnssec_rdata.as_dnskey() {
-                        use base64::{engine::general_purpose::STANDARD, Engine};
-                        let public_key = STANDARD.encode(dnskey.public_key());
-                        return Some(DnsRecord {
-                            name: domain.to_string(),
-                            record_type: RecordType::DNSKEY,
-                            ttl: record.ttl(),
-                            data: RecordData::DNSKEY {
-                                flags: dnskey.flags(),
-                                protocol: 3, // Protocol is always 3 for DNSSEC (RFC 4034)
-                                algorithm: u8::from(dnskey.algorithm()),
-                                public_key,
-                            },
-                        });
-                    }
+                if let HickoryRData::DNSSEC(DNSSECRData::DNSKEY(dnskey)) = &record.data {
+                    use base64::{engine::general_purpose::STANDARD, Engine};
+                    let public_key_buf = dnskey.public_key();
+                    let public_key = STANDARD.encode(public_key_buf.public_bytes());
+                    Some(DnsRecord {
+                        name: domain.to_string(),
+                        record_type: RecordType::DNSKEY,
+                        ttl: record.ttl,
+                        data: RecordData::DNSKEY {
+                            flags: dnskey.flags(),
+                            // Protocol is always 3 for DNSSEC (RFC 4034)
+                            protocol: 3,
+                            algorithm: u8::from(public_key_buf.algorithm()),
+                            public_key,
+                        },
+                    })
+                } else {
+                    None
                 }
-                None
             })
             .collect();
 
         Ok(records)
     }
 
-    async fn resolve_ds(
-        &self,
-        resolver: &TokioAsyncResolver,
-        domain: &str,
-    ) -> Result<Vec<DnsRecord>> {
-        use hickory_resolver::proto::rr::RData as HickoryRData;
+    async fn resolve_ds(&self, resolver: &TokioResolver, domain: &str) -> Result<Vec<DnsRecord>> {
+        use hickory_resolver::proto::dnssec::rdata::DNSSECRData;
 
         let Some(response) =
             dns_lookup_or_empty(resolver.lookup(domain, HickoryRecordType::DS).await, "DS")?
@@ -603,40 +593,36 @@ impl DnsResolver {
         };
 
         let records = response
-            .record_iter()
+            .answers()
+            .iter()
             .filter_map(|record| {
-                if let Some(HickoryRData::DNSSEC(dnssec_rdata)) = record.data() {
-                    if let Some(ds) = dnssec_rdata.as_ds() {
-                        let digest = ds
-                            .digest()
-                            .iter()
-                            .map(|b| format!("{:02X}", b))
-                            .collect::<String>();
-                        return Some(DnsRecord {
-                            name: domain.to_string(),
-                            record_type: RecordType::DS,
-                            ttl: record.ttl(),
-                            data: RecordData::DS {
-                                key_tag: ds.key_tag(),
-                                algorithm: u8::from(ds.algorithm()),
-                                digest_type: u8::from(ds.digest_type()),
-                                digest,
-                            },
-                        });
-                    }
+                if let HickoryRData::DNSSEC(DNSSECRData::DS(ds)) = &record.data {
+                    let digest = ds
+                        .digest()
+                        .iter()
+                        .map(|b| format!("{:02X}", b))
+                        .collect::<String>();
+                    Some(DnsRecord {
+                        name: domain.to_string(),
+                        record_type: RecordType::DS,
+                        ttl: record.ttl,
+                        data: RecordData::DS {
+                            key_tag: ds.key_tag(),
+                            algorithm: u8::from(ds.algorithm()),
+                            digest_type: u8::from(ds.digest_type()),
+                            digest,
+                        },
+                    })
+                } else {
+                    None
                 }
-                None
             })
             .collect();
 
         Ok(records)
     }
 
-    async fn resolve_any(
-        &self,
-        resolver: &TokioAsyncResolver,
-        domain: &str,
-    ) -> Result<Vec<DnsRecord>> {
+    async fn resolve_any(&self, resolver: &TokioResolver, domain: &str) -> Result<Vec<DnsRecord>> {
         let mut all_records = Vec::new();
 
         // Query common record types
@@ -662,7 +648,7 @@ impl DnsResolver {
 
     async fn resolve_type(
         &self,
-        resolver: &TokioAsyncResolver,
+        resolver: &TokioResolver,
         domain: &str,
         record_type: RecordType,
     ) -> Result<Vec<DnsRecord>> {
@@ -716,9 +702,15 @@ fn reverse_dns_name(ip: &IpAddr) -> String {
 }
 
 fn parse_caa(caa: &CAA) -> (u8, String, String) {
-    let flags = if caa.issuer_critical() { 128 } else { 0 };
-    let tag = caa.tag().as_str().to_string();
-    let value = caa.value().to_string();
+    // hickory 0.26: CAA fields are public. `issuer_critical` and `tag` are
+    // plain fields; `value` is a `Vec<u8>` because RFC 8659 permits binary
+    // values for unknown property types. For seer's reporting purposes the
+    // common tags (issue/issuewild/iodef) are always UTF-8, so a lossy
+    // conversion preserves prior behavior without panicking on the rare
+    // binary case.
+    let flags = if caa.issuer_critical { 128 } else { 0 };
+    let tag = caa.tag.clone();
+    let value = String::from_utf8_lossy(&caa.value).to_string();
     (flags, tag, value)
 }
 

@@ -5,11 +5,12 @@
 
 use std::collections::HashMap;
 
-use hickory_resolver::config::{ResolverConfig, ResolverOpts};
-use hickory_resolver::proto::rr::dnssec::rdata::{DNSSECRData, DNSKEY};
-use hickory_resolver::proto::rr::dnssec::DigestType;
+use hickory_resolver::config::{ResolveHosts, ResolverConfig, GOOGLE};
+use hickory_resolver::net::runtime::TokioRuntimeProvider;
+use hickory_resolver::proto::dnssec::rdata::{DNSSECRData, DNSKEY};
+use hickory_resolver::proto::dnssec::{DigestType, PublicKey};
 use hickory_resolver::proto::rr::{Name, RData, RecordType as HickoryRecordType};
-use hickory_resolver::TokioAsyncResolver;
+use hickory_resolver::TokioResolver;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, instrument};
 
@@ -72,7 +73,7 @@ pub struct DnskeyInfo {
 /// Checks DNSSEC configuration for a domain.
 pub struct DnssecChecker {
     resolver: DnsResolver,
-    raw_resolver: TokioAsyncResolver,
+    raw_resolver: TokioResolver,
 }
 
 impl Default for DnssecChecker {
@@ -83,14 +84,23 @@ impl Default for DnssecChecker {
 
 impl DnssecChecker {
     pub fn new() -> Self {
-        let mut opts = ResolverOpts::default();
-        opts.timeout = std::time::Duration::from_secs(5);
-        opts.attempts = 2;
-        opts.use_hosts_file = false;
+        let mut builder = TokioResolver::builder_with_config(
+            ResolverConfig::udp_and_tcp(&GOOGLE),
+            TokioRuntimeProvider::default(),
+        );
+        {
+            let opts = builder.options_mut();
+            opts.timeout = std::time::Duration::from_secs(5);
+            opts.attempts = 2;
+            opts.use_hosts_file = ResolveHosts::Never;
+        }
+        let raw_resolver = builder
+            .build()
+            .expect("hickory resolver build is infallible without TLS features");
 
         Self {
             resolver: DnsResolver::new(),
-            raw_resolver: TokioAsyncResolver::tokio(ResolverConfig::google(), opts),
+            raw_resolver,
         }
     }
 
@@ -106,9 +116,10 @@ impl DnssecChecker {
         };
 
         lookup
-            .record_iter()
+            .answers()
+            .iter()
             .filter_map(|record| {
-                if let Some(RData::DNSSEC(DNSSECRData::DNSKEY(dnskey))) = record.data() {
+                if let RData::DNSSEC(DNSSECRData::DNSKEY(dnskey)) = &record.data {
                     match dnskey.calculate_key_tag() {
                         Ok(tag) => Some((dnskey.clone(), tag)),
                         Err(_) => None,
@@ -121,8 +132,19 @@ impl DnssecChecker {
     }
 
     /// Converts a DS digest type number to hickory's DigestType.
+    ///
+    /// hickory 0.26 made `DigestType` `non_exhaustive` and removed the
+    /// fallible `from_u8` constructor in favour of `From<u8>`, which
+    /// returns `DigestType::Unknown(_)` for unsupported types. We
+    /// preserve the original 0.24 behaviour of refusing to attempt
+    /// digest computation for unsupported types.
     fn to_hickory_digest_type(digest_type: u8) -> Option<DigestType> {
-        DigestType::from_u8(digest_type).ok()
+        let dt = DigestType::from(digest_type);
+        if dt.is_supported() {
+            Some(dt)
+        } else {
+            None
+        }
     }
 
     /// Generate a DNSSEC validation report for a domain.
@@ -167,7 +189,7 @@ impl DnssecChecker {
         let dnskey_map: HashMap<(u16, u8), Vec<&DNSKEY>> = {
             let mut map: HashMap<(u16, u8), Vec<&DNSKEY>> = HashMap::new();
             for (dnskey, tag) in &raw_dnskeys {
-                map.entry((*tag, u8::from(dnskey.algorithm())))
+                map.entry((*tag, u8::from(dnskey.public_key().algorithm())))
                     .or_default()
                     .push(dnskey);
             }
@@ -191,7 +213,7 @@ impl DnssecChecker {
         let key_tag_by_algo_flags: HashMap<(u16, u8), Vec<u16>> = {
             let mut map: HashMap<(u16, u8), Vec<u16>> = HashMap::new();
             for (dnskey, tag) in &raw_dnskeys {
-                map.entry((dnskey.flags(), u8::from(dnskey.algorithm())))
+                map.entry((dnskey.flags(), u8::from(dnskey.public_key().algorithm())))
                     .or_default()
                     .push(*tag);
             }
