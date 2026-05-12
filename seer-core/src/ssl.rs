@@ -95,12 +95,18 @@ impl SslChecker {
         // SSRF protection: resolve domain and check IPs before connecting
         let socket_addrs: Vec<_> = tokio::net::lookup_host(&addr)
             .await
-            .map_err(|e| SeerError::SslError(format!("DNS lookup failed: {}", e)))?
+            .map_err(|e| {
+                SeerError::SslError(format!(
+                    "could not resolve {} to an IP address for SSL inspection \
+                     (no A or AAAA record?): {}",
+                    domain, e
+                ))
+            })?
             .collect();
 
         if socket_addrs.is_empty() {
             return Err(SeerError::SslError(format!(
-                "Domain {} did not resolve to any addresses",
+                "{} has no A or AAAA records — nothing to connect to for SSL inspection",
                 domain
             )));
         }
