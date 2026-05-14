@@ -383,6 +383,29 @@ async def list_tools() -> list[Tool]:
                 "required": ["domains"],
             },
         ),
+        Tool(
+            name="seer_bulk_ssl",
+            description="Inspect SSL certificate chains for multiple domains. Returns the full chain, SANs, key details, signature algorithm, and TLS version for each domain.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "domains": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of domain names to inspect",
+                        "maxItems": MAX_BULK_DOMAINS,
+                    },
+                    "concurrency": {
+                        "type": "integer",
+                        "description": f"Number of concurrent requests (default: 10, max: {MAX_CONCURRENCY})",
+                        "default": 10,
+                        "minimum": 1,
+                        "maximum": MAX_CONCURRENCY,
+                    },
+                },
+                "required": ["domains"],
+            },
+        ),
     ]
 
 
@@ -500,6 +523,15 @@ async def execute_tool(name: str, arguments: dict[str, Any]) -> Any:
             concurrency = _get_concurrency(arguments, default=10)
             return await loop.run_in_executor(
                 None, seer.bulk_info, domains, concurrency
+            )
+
+        case "seer_bulk_ssl":
+            domains = _require_domains(arguments)
+            concurrency = _get_concurrency(arguments, default=10)
+            for d in domains:
+                _ssrf_guard(d, 443)
+            return await loop.run_in_executor(
+                None, seer.bulk_ssl, domains, concurrency
             )
 
         case _:
