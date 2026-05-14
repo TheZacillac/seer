@@ -520,7 +520,7 @@ csv,format,example.org
         // Verifies the SSL bulk arm wires correctly: an unresolvable hostname
         // must surface as success=false with a non-empty error string. Uses
         // the IETF-reserved `.invalid` TLD so this is hermetic.
-        let executor = BulkExecutor::new();
+        let executor = BulkExecutor::new().with_rate_limit(Duration::ZERO);
         let results = executor
             .execute_ssl(vec!["seer-bulk-ssl-test.invalid".to_string()])
             .await;
