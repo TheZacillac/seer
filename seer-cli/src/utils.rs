@@ -36,6 +36,28 @@ pub fn read_bulk_input<P: AsRef<Path>>(path: P) -> Result<String, String> {
         .map_err(|e| format!("failed to read input file {}: {}", path.display(), e))
 }
 
+/// Expands a leading `~` or `~/...` in a path to the user's home directory.
+///
+/// Plain CWD-relative paths (`./foo`, `../foo`, `foo.txt`) and absolute paths
+/// are returned unchanged. If `~` appears anywhere other than the start, or
+/// `dirs::home_dir()` cannot determine a home, the input is returned as-is
+/// and the filesystem call will surface the resulting error.
+pub fn expand_tilde(s: &str) -> String {
+    if s == "~" {
+        if let Some(home) = dirs::home_dir() {
+            return home.to_string_lossy().into_owned();
+        }
+        return s.to_string();
+    }
+    if let Some(rest) = s.strip_prefix("~/") {
+        if let Some(mut home) = dirs::home_dir() {
+            home.push(rest);
+            return home.to_string_lossy().into_owned();
+        }
+    }
+    s.to_string()
+}
+
 pub fn format_interval(minutes: f64) -> String {
     if minutes < 1.0 {
         format!("{}s", (minutes * 60.0) as u64)
@@ -588,6 +610,41 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
     use seer_core::ssl::{CertDetail, SslReport};
+
+    #[test]
+    fn expand_tilde_returns_home_for_lone_tilde() {
+        let home = dirs::home_dir().expect("home dir for test");
+        assert_eq!(expand_tilde("~"), home.to_string_lossy());
+    }
+
+    #[test]
+    fn expand_tilde_joins_relative_under_home() {
+        let home = dirs::home_dir().expect("home dir for test");
+        let got = expand_tilde("~/Projects/foo/bar.txt");
+        let want = home
+            .join("Projects/foo/bar.txt")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn expand_tilde_leaves_other_paths_unchanged() {
+        // CWD-relative and absolute paths must not be rewritten.
+        for p in [
+            "domains.txt",
+            "./domains.txt",
+            "../domains.txt",
+            "/etc/hosts",
+            // `~` mid-path must NOT trigger expansion — only a leading `~/` or
+            // a bare `~`. Filenames legitimately containing `~` (rare but
+            // possible) would otherwise break.
+            "foo~bar.txt",
+            "/tmp/~something",
+        ] {
+            assert_eq!(expand_tilde(p), p, "input {p:?} should be unchanged");
+        }
+    }
 
     #[test]
     fn join_sans_returns_all_when_under_limit() {

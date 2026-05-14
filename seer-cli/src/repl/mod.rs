@@ -670,7 +670,9 @@ impl Repl {
         }
 
         let operation = args[0];
-        let file_path = args[1];
+        // Expand `~` / `~/...` once at the boundary so both the bulk-input
+        // read and the auto-derived output path see a home-resolved path.
+        let file_path = crate::utils::expand_tilde(args[1]);
 
         // Parse remaining args for record type and output path
         let mut record_type = seer_core::RecordType::A;
@@ -680,7 +682,7 @@ impl Repl {
         while i < args.len() {
             if args[i] == "-o" || args[i] == "--output" {
                 if i + 1 < args.len() {
-                    output_path = Some(args[i + 1].to_string());
+                    output_path = Some(crate::utils::expand_tilde(args[i + 1]));
                     i += 2;
                     continue;
                 }
@@ -692,7 +694,7 @@ impl Repl {
 
         // Determine output path
         let output_path = output_path.unwrap_or_else(|| {
-            let input_path = std::path::Path::new(file_path);
+            let input_path = std::path::Path::new(&file_path);
             let stem = input_path.file_stem().unwrap_or_default().to_string_lossy();
             let parent = input_path.parent().unwrap_or(std::path::Path::new("."));
             parent
@@ -707,7 +709,7 @@ impl Repl {
         // `mkfifo`'d paths.
         const MAX_BULK_DOMAINS_CLI: usize = 1000;
 
-        let content = match crate::utils::read_bulk_input(file_path) {
+        let content = match crate::utils::read_bulk_input(&file_path) {
             Ok(c) => c,
             Err(e) => return CommandResult::Error(e),
         };

@@ -537,6 +537,10 @@ async fn execute_command(
             let progress_mode = resolve_progress_mode(progress, stderr_is_tty, format_str);
             const MAX_BULK_DOMAINS_CLI: usize = 1000;
 
+            // Expand `~` / `~/...` once at the boundary so both the bulk-input
+            // read and the auto-derived output path see a home-resolved path.
+            let file = utils::expand_tilde(&file);
+
             // `read_bulk_input` rejects FIFOs, sockets, devices, directories,
             // and oversized files via a pre-read metadata check, so malicious
             // `mkfifo`'d paths can't hang the process.
@@ -560,8 +564,8 @@ async fn execute_command(
                 ));
             }
 
-            // Determine output path
-            let output_path = output.unwrap_or_else(|| {
+            // Determine output path (also tilde-expanded when supplied)
+            let output_path = output.map(|s| utils::expand_tilde(&s)).unwrap_or_else(|| {
                 let input_path = std::path::Path::new(&file);
                 let stem = input_path.file_stem().unwrap_or_default().to_string_lossy();
                 let parent = input_path.parent().unwrap_or(std::path::Path::new("."));
