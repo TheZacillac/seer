@@ -12,6 +12,7 @@ use crate::dns::{DnsRecord, DnsResolver, PropagationChecker, PropagationResult, 
 use crate::error::Result;
 use crate::lookup::{LookupResult, SmartLookup};
 use crate::rdap::{RdapClient, RdapResponse};
+use crate::ssl::{SslChecker, SslReport};
 use crate::status::{StatusClient, StatusResponse};
 use crate::whois::{WhoisClient, WhoisResponse};
 
@@ -47,6 +48,9 @@ pub enum BulkOperation {
     Info {
         domain: String,
     },
+    Ssl {
+        domain: String,
+    },
 }
 
 /// The data returned from a bulk operation (varies by operation type).
@@ -61,6 +65,7 @@ pub enum BulkResultData {
     Status(StatusResponse),
     Avail(AvailabilityResult),
     Info(crate::domain_info::DomainInfo),
+    Ssl(SslReport),
 }
 
 /// Result of a single operation within a bulk execution.
@@ -85,6 +90,7 @@ pub struct BulkExecutor {
     smart_lookup: SmartLookup,
     status_client: StatusClient,
     availability_checker: AvailabilityChecker,
+    ssl_checker: SslChecker,
 }
 
 impl Default for BulkExecutor {
@@ -105,6 +111,7 @@ impl BulkExecutor {
             smart_lookup: SmartLookup::new(),
             status_client: StatusClient::new(),
             availability_checker: AvailabilityChecker::new(),
+            ssl_checker: SslChecker::new(),
         }
     }
 
@@ -146,6 +153,7 @@ impl BulkExecutor {
                 let smart_lookup = &self.smart_lookup;
                 let status_client = &self.status_client;
                 let availability_checker = &self.availability_checker;
+                let ssl_checker = &self.ssl_checker;
 
                 async move {
                     // Rate limiting delay
@@ -164,6 +172,7 @@ impl BulkExecutor {
                             lookup: smart_lookup,
                             status: status_client,
                             avail: availability_checker,
+                            ssl: ssl_checker,
                         },
                     )
                     .await;
@@ -180,7 +189,8 @@ impl BulkExecutor {
                             | BulkOperation::Lookup { domain }
                             | BulkOperation::Status { domain }
                             | BulkOperation::Avail { domain }
-                            | BulkOperation::Info { domain } => domain.as_str(),
+                            | BulkOperation::Info { domain }
+                            | BulkOperation::Ssl { domain } => domain.as_str(),
                         };
                         progress(count, total, desc);
                     }
@@ -299,6 +309,14 @@ impl BulkExecutor {
             .collect();
         self.execute(operations, None).await
     }
+
+    pub async fn execute_ssl(&self, domains: Vec<String>) -> Vec<BulkResult> {
+        let operations = domains
+            .into_iter()
+            .map(|domain| BulkOperation::Ssl { domain })
+            .collect();
+        self.execute(operations, None).await
+    }
 }
 
 struct Clients<'a> {
@@ -309,6 +327,7 @@ struct Clients<'a> {
     lookup: &'a SmartLookup,
     status: &'a StatusClient,
     avail: &'a AvailabilityChecker,
+    ssl: &'a SslChecker,
 }
 
 async fn execute_operation(op: &BulkOperation, clients: &Clients<'_>) -> Result<BulkResultData> {
@@ -352,6 +371,10 @@ async fn execute_operation(op: &BulkOperation, clients: &Clients<'_>) -> Result<
             Ok(BulkResultData::Info(
                 crate::domain_info::DomainInfo::from_lookup_result(&result),
             ))
+        }
+        BulkOperation::Ssl { domain } => {
+            let result = clients.ssl.check(domain).await?;
+            Ok(BulkResultData::Ssl(result))
         }
     }
 }
@@ -490,5 +513,27 @@ csv,format,example.org
     fn is_csv_header_row_rejects_non_keyword() {
         assert!(!is_csv_header_row("example"));
         assert!(!is_csv_header_row("mydata"));
+    }
+
+    #[tokio::test]
+    async fn execute_ssl_failure_path_for_unresolvable_host() {
+        // Verifies the SSL bulk arm wires correctly: an unresolvable hostname
+        // must surface as success=false with a non-empty error string. Uses
+        // the IETF-reserved `.invalid` TLD so this is hermetic.
+        let executor = BulkExecutor::new();
+        let results = executor
+            .execute_ssl(vec!["seer-bulk-ssl-test.invalid".to_string()])
+            .await;
+        assert_eq!(results.len(), 1);
+        let r = &results[0];
+        assert!(!r.success, "expected failure, got success");
+        assert!(r.data.is_none(), "expected no data on failure");
+        let err = r.error.as_deref().unwrap_or("");
+        assert!(!err.is_empty(), "expected non-empty error, got: {:?}", err);
+        assert!(
+            matches!(r.operation, BulkOperation::Ssl { ref domain } if domain == "seer-bulk-ssl-test.invalid"),
+            "expected Ssl variant, got {:?}",
+            r.operation
+        );
     }
 }

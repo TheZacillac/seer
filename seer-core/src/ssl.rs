@@ -60,6 +60,7 @@ pub struct CertDetail {
 }
 
 /// Client for performing SSL certificate chain inspection.
+#[derive(Debug, Clone)]
 pub struct SslChecker;
 
 impl Default for SslChecker {
