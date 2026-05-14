@@ -169,14 +169,18 @@ impl HumanFormatter {
             ));
         }
 
-        // Always surface the informational note explaining that CAA is
-        // checked only at issuance time.
-        out.push(format!(
-            "{}  {}",
-            indent,
-            self.value(&format!("note: {}", caa.note))
-        ));
+        // Note is appended separately by the caller so it can sit at the
+        // very bottom of the overall output, un-indented.
         out
+    }
+
+    /// Appends the trailing CAA note as the very last lines of an output
+    /// buffer: a blank separator line followed by `note: …` with no
+    /// indentation, so the explanation reads as a footer to the whole
+    /// report rather than part of the CAA block.
+    fn push_caa_note_footer(&self, out: &mut Vec<String>, caa: &CaaPolicy) {
+        out.push(String::new());
+        out.push(format!("note: {}", caa.note));
     }
 
     /// Formats an expiration date with a human-readable status suffix.
@@ -1736,6 +1740,12 @@ impl OutputFormatter for HumanFormatter {
             ));
         }
 
+        // CAA note sits at the very bottom of the whole status output,
+        // un-indented, with a blank separator line.
+        if let Some(ref caa) = response.caa {
+            self.push_caa_note_footer(&mut output, caa);
+        }
+
         output.join("\n")
     }
 
@@ -2395,6 +2405,7 @@ impl OutputFormatter for HumanFormatter {
 
         if let Some(ref caa) = report.caa {
             output.extend(self.render_caa_block(caa, "  "));
+            self.push_caa_note_footer(&mut output, caa);
         }
 
         output.join("\n")
