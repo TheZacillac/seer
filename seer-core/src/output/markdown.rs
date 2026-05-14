@@ -1,4 +1,5 @@
 use super::OutputFormatter;
+use crate::caa::{CaaPolicy, IssuerCaaMatch};
 use crate::dns::{DnsRecord, FollowIteration, FollowResult, PropagationResult};
 use crate::lookup::LookupResult;
 use crate::rdap::RdapResponse;
@@ -17,6 +18,46 @@ impl Default for MarkdownFormatter {
 impl MarkdownFormatter {
     pub fn new() -> Self {
         Self
+    }
+
+    /// Renders the CAA policy as a Markdown section shared between SSL and
+    /// status reports.
+    fn render_caa_section(&self, caa: &CaaPolicy) -> Vec<String> {
+        let mut out = Vec::new();
+        out.push(String::new());
+        out.push("### CAA Policy".to_string());
+        out.push(String::new());
+
+        if !caa.has_policy {
+            out.push("*No CAA records (any CA may issue)*".to_string());
+        } else {
+            if let Some(ref eff) = caa.effective_domain {
+                out.push(format!("- **Found at**: `{}`", eff));
+            }
+            out.push(String::new());
+            out.push("| Flags | Tag | Value |".to_string());
+            out.push("| --- | --- | --- |".to_string());
+            for r in &caa.records {
+                out.push(format!("| {} | `{}` | `{}` |", r.flags, r.tag, r.value));
+            }
+        }
+
+        if let Some(m) = caa.issuer_match {
+            let rendered = match m {
+                IssuerCaaMatch::NoPolicy => "no policy — any CA permitted",
+                IssuerCaaMatch::Permitted => "issuer permitted by current CAA policy",
+                IssuerCaaMatch::Mismatch => {
+                    "issuer not in current CAA policy (informational)"
+                }
+                IssuerCaaMatch::Indeterminate => "CAA present but no issue/issuewild tags",
+            };
+            out.push(String::new());
+            out.push(format!("- **Issuer vs CAA**: {}", rendered));
+        }
+
+        out.push(String::new());
+        out.push(format!("> **Note:** {}", caa.note));
+        out
     }
 
     /// Formats a contact section for RDAP entities.
@@ -836,6 +877,10 @@ impl OutputFormatter for MarkdownFormatter {
             output.push("*Not available (HTTPS may not be configured)*".to_string());
         }
 
+        if let Some(ref caa) = response.caa {
+            output.extend(self.render_caa_section(caa));
+        }
+
         // Domain Expiration
         if let Some(ref expiry) = response.domain_expiration {
             output.push(String::new());
@@ -1424,6 +1469,10 @@ impl OutputFormatter for MarkdownFormatter {
                     key_info
                 ));
             }
+        }
+
+        if let Some(ref caa) = report.caa {
+            output.extend(self.render_caa_section(caa));
         }
 
         output.join("\n")

@@ -1,6 +1,8 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::caa::CaaPolicy;
+
 /// Complete status response for a domain
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusResponse {
@@ -18,6 +20,11 @@ pub struct StatusResponse {
     pub domain_expiration: Option<DomainExpiration>,
     /// DNS root record resolution information
     pub dns_resolution: Option<DnsResolution>,
+    /// CAA policy for the domain, with a comparison against the presented
+    /// certificate's issuer when available. CAA is issuance-time policy and
+    /// not part of validation — see the `note` on [`CaaPolicy`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caa: Option<CaaPolicy>,
     /// Errors from sub-checks that failed (check name → error message)
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub errors: Vec<StatusError>,
@@ -94,6 +101,7 @@ impl StatusResponse {
             certificate: None,
             domain_expiration: None,
             dns_resolution: None,
+            caa: None,
             errors: Vec::new(),
         }
     }
@@ -129,6 +137,7 @@ mod tests {
                 nameservers: vec!["ns1.example.com".to_string()],
                 resolves: true,
             }),
+            caa: None,
             errors: vec![],
         };
         let json = serde_json::to_string(&response).unwrap();

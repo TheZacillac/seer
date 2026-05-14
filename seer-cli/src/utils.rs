@@ -700,6 +700,7 @@ mod tests {
             san_names: vec!["example.com".to_string(), "www.example.com".to_string()],
             is_valid: true,
             days_until_expiry: 89,
+            caa: None,
         }
     }
 

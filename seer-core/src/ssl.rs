@@ -13,6 +13,8 @@ use tracing::{debug, instrument};
 use x509_parser::oid_registry::Oid;
 use x509_parser::prelude::*;
 
+use crate::caa::{self, CaaPolicy};
+use crate::dns::DnsResolver;
 use crate::error::{Result, SeerError};
 use crate::net::resolve_public_host;
 use crate::validation::normalize_domain;
@@ -35,6 +37,14 @@ pub struct SslReport {
     pub is_valid: bool,
     /// Days until the leaf certificate expires
     pub days_until_expiry: i64,
+    /// CAA (Certification Authority Authorization) policy for the domain
+    /// plus a comparison against the presented certificate's issuer.
+    ///
+    /// CAA is consulted by CAs at *issuance time*, not by clients at
+    /// *validation time*, so a mismatch here is informational — see the
+    /// `note` field on [`CaaPolicy`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caa: Option<CaaPolicy>,
 }
 
 /// Detailed information about a single certificate in the chain.
@@ -62,7 +72,10 @@ pub struct CertDetail {
 
 /// Client for performing SSL certificate chain inspection.
 #[derive(Debug, Clone)]
-pub struct SslChecker;
+pub struct SslChecker {
+    /// Cached DNS resolver used for CAA lookups alongside the TLS probe.
+    dns_resolver: DnsResolver,
+}
 
 impl Default for SslChecker {
     fn default() -> Self {
@@ -73,7 +86,9 @@ impl Default for SslChecker {
 impl SslChecker {
     /// Creates a new SslChecker instance.
     pub fn new() -> Self {
-        Self
+        Self {
+            dns_resolver: DnsResolver::new(),
+        }
     }
 
     /// Inspects the SSL certificate chain for the given domain.
@@ -93,11 +108,19 @@ impl SslChecker {
 
         debug!(domain = %domain, "Checking SSL certificate chain");
 
+        // CAA query runs concurrently with the TLS probe — it is advisory
+        // and never fails the report (a resolver error yields an empty
+        // policy).
+        let caa_future = caa::lookup_caa(&self.dns_resolver, &domain);
+
         // Resolve + SSRF check. `resolve_public_host` already falls back to
         // hickory (Google DNS) when the OS resolver fails — important for
         // hosts where Tailscale Split-DNS or a corp resolver pins the
         // domain to a nameserver that can't answer for it.
-        let socket_addrs = resolve_public_host(&domain, 443).await.map_err(|e| {
+        let resolve_future = resolve_public_host(&domain, 443);
+
+        let (caa_policy, socket_addrs) = tokio::join!(caa_future, resolve_future);
+        let socket_addrs = socket_addrs.map_err(|e| {
             SeerError::SslError(format!(
                 "could not resolve {} for SSL inspection: {}",
                 domain, e
@@ -152,6 +175,11 @@ impl SslChecker {
         let days_until_expiry = (leaf_detail.valid_until - now).num_days();
         let is_valid = now >= leaf_detail.valid_from && now <= leaf_detail.valid_until;
 
+        // Annotate the CAA policy with the issuer comparison before
+        // attaching it to the report.
+        let mut caa_policy = caa_policy;
+        caa_policy.issuer_match = Some(caa::classify_issuer(&leaf_detail.issuer, &caa_policy));
+
         Ok(SslReport {
             domain,
             chain: vec![leaf_detail],
@@ -159,6 +187,7 @@ impl SslChecker {
             san_names,
             is_valid,
             days_until_expiry,
+            caa: Some(caa_policy),
         })
     }
 }
@@ -337,6 +366,7 @@ mod tests {
             san_names: vec!["example.com".to_string(), "*.example.com".to_string()],
             is_valid: true,
             days_until_expiry: 90,
+            caa: None,
         };
         let json = serde_json::to_string(&report).unwrap();
         assert!(json.contains("example.com"));

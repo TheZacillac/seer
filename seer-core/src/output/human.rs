@@ -4,6 +4,7 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 
 use super::OutputFormatter;
+use crate::caa::{CaaPolicy, IssuerCaaMatch};
 use crate::colors::CatppuccinExt;
 use crate::dns::{DnsRecord, FollowIteration, FollowResult, PropagationResult};
 use crate::lookup::LookupResult;
@@ -115,6 +116,61 @@ impl HumanFormatter {
         } else {
             format!("\n{}\n{}", text, "-".repeat(text.len()))
         }
+    }
+
+    /// Renders the CAA policy block (records, issuer match, note) shared
+    /// between `format_status` and `format_ssl`. `indent` is the leading
+    /// whitespace per line — typically `"  "`.
+    fn render_caa_block(&self, caa: &CaaPolicy, indent: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        out.push(format!("\n{}{}:", indent, self.label("CAA Policy")));
+
+        if !caa.has_policy {
+            out.push(format!(
+                "{}  {}",
+                indent,
+                self.value("No CAA records (any CA may issue)")
+            ));
+        } else {
+            if let Some(ref eff) = caa.effective_domain {
+                out.push(format!(
+                    "{}  {}: {}",
+                    indent,
+                    self.label("Found at"),
+                    self.value(&sanitize_display(eff))
+                ));
+            }
+            for r in &caa.records {
+                out.push(format!(
+                    "{}  {} {} \"{}\"",
+                    indent,
+                    self.value(&r.flags.to_string()),
+                    self.label(&r.tag),
+                    sanitize_display(&r.value)
+                ));
+            }
+        }
+
+        if let Some(m) = caa.issuer_match {
+            let rendered = match m {
+                IssuerCaaMatch::NoPolicy => self.value("no policy — any CA permitted"),
+                IssuerCaaMatch::Permitted => {
+                    self.success("issuer permitted by current CAA policy")
+                }
+                IssuerCaaMatch::Mismatch => self.warning(
+                    "issuer not in current CAA policy (informational — see note below)",
+                ),
+                IssuerCaaMatch::Indeterminate => {
+                    self.warning("CAA present but no issue/issuewild tags")
+                }
+            };
+            out.push(format!("{}  {}: {}", indent, self.label("Issuer vs CAA"), rendered));
+        }
+
+        // Always surface the informational note explaining that CAA is
+        // checked only at issuance time.
+        out.push(format!("{}  {}", indent, self.value(&format!("note: {}", caa.note))));
+        out
     }
 
     /// Formats an expiration date with a human-readable status suffix.
@@ -1586,6 +1642,11 @@ impl OutputFormatter for HumanFormatter {
             ));
         }
 
+        // CAA policy (issuance-time authorization for certificate authorities)
+        if let Some(ref caa) = response.caa {
+            output.extend(self.render_caa_block(caa, "  "));
+        }
+
         // Domain Expiration
         if let Some(ref expiry) = response.domain_expiration {
             output.push(format!("\n  {}:", self.label("Domain Registration")));
@@ -2324,6 +2385,10 @@ impl OutputFormatter for HumanFormatter {
                     self.value(&cert.valid_until.format("%Y-%m-%d").to_string())
                 ));
             }
+        }
+
+        if let Some(ref caa) = report.caa {
+            output.extend(self.render_caa_block(caa, "  "));
         }
 
         output.join("\n")

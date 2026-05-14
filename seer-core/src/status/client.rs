@@ -11,6 +11,7 @@ use tokio::net::TcpStream;
 use tracing::{debug, instrument};
 
 use super::types::{CertificateInfo, DnsResolution, DomainExpiration, StatusResponse};
+use crate::caa::{self, CaaPolicy};
 use crate::dns::{DnsResolver, RecordData, RecordType};
 use crate::error::{Result, SeerError};
 use crate::lookup::SmartLookup;
@@ -67,13 +68,16 @@ impl StatusClient {
 
         let mut response = StatusResponse::new(domain.clone());
 
-        // Fetch HTTP status, SSL cert info, domain expiration, and DNS resolution concurrently
-        // HTTP and SSL checks include SSRF protection internally
-        let (http_result, cert_result, expiry_result, dns_result) = tokio::join!(
+        // Fetch HTTP status, SSL cert info, domain expiration, DNS
+        // resolution, and CAA policy concurrently. HTTP and SSL checks
+        // include SSRF protection internally; CAA never fails the request
+        // (a resolver error yields an empty policy).
+        let (http_result, cert_result, expiry_result, dns_result, caa_policy) = tokio::join!(
             self.fetch_http_info(&domain),
             self.fetch_certificate_info(&domain),
             self.fetch_domain_expiration(&domain),
-            self.fetch_dns_resolution(&domain)
+            self.fetch_dns_resolution(&domain),
+            caa::lookup_caa(&self.dns_resolver, &domain),
         );
 
         // Apply HTTP info
@@ -89,14 +93,21 @@ impl StatusClient {
             }),
         }
 
-        // Apply certificate info
+        // Apply certificate info and tag the CAA policy with the issuer
+        // comparison if a cert was retrieved.
+        let mut caa_policy: CaaPolicy = caa_policy;
         match cert_result {
-            Ok(cert_info) => response.certificate = Some(cert_info),
+            Ok(cert_info) => {
+                caa_policy.issuer_match =
+                    Some(caa::classify_issuer(&cert_info.issuer, &caa_policy));
+                response.certificate = Some(cert_info);
+            }
             Err(e) => response.errors.push(super::types::StatusError {
                 check: "ssl".to_string(),
                 message: e.to_string(),
             }),
         }
+        response.caa = Some(caa_policy);
 
         // Apply domain expiration info
         match expiry_result {
@@ -482,9 +493,12 @@ fn parse_certificate_der(der: &[u8], domain: &str) -> Result<CertificateInfo> {
     let (_, cert) = X509Certificate::from_der(der)
         .map_err(|e| SeerError::CertificateError(format!("failed to parse certificate: {}", e)))?;
 
-    // Extract issuer - prefer CN, fall back to O (Organization)
+    // Extract issuer — combine CN and O when both exist. Intermediate CA
+    // certs commonly have a short CN like "E7" or "R3"; without the
+    // organization the human-readable name is unhelpful and the CAA
+    // comparison cannot match the CA's well-known name.
     let issuer =
-        extract_name_from_x509(cert.issuer()).unwrap_or_else(|| "Unknown Issuer".to_string());
+        format_issuer_name(cert.issuer()).unwrap_or_else(|| "Unknown Issuer".to_string());
 
     // Extract subject - prefer CN, fall back to O (Organization)
     let subject =
@@ -564,6 +578,38 @@ fn cert_matches_hostname(cert: &x509_parser::certificate::X509Certificate<'_>, h
     }
 
     false
+}
+
+/// Builds a human-readable issuer label, combining Organization and Common
+/// Name when both exist. Used for the cert's issuer rather than the bare
+/// CN so users see "Let's Encrypt (E7)" rather than "E7".
+fn format_issuer_name(name: &x509_parser::prelude::X509Name) -> Option<String> {
+    use x509_parser::oid_registry;
+    let cn = extract_oid_value(name, &oid_registry::OID_X509_COMMON_NAME);
+    let org = extract_oid_value(name, &oid_registry::OID_X509_ORGANIZATION_NAME);
+    match (org, cn) {
+        (Some(o), Some(c)) if o != c => Some(format!("{} ({})", o, c)),
+        (Some(o), _) => Some(o),
+        (None, Some(c)) => Some(c),
+        (None, None) => None,
+    }
+}
+
+/// Pulls the first attribute matching `oid` out of an X.509 name.
+fn extract_oid_value(
+    name: &x509_parser::prelude::X509Name,
+    oid: &x509_parser::der_parser::oid::Oid<'static>,
+) -> Option<String> {
+    for rdn in name.iter() {
+        for attr in rdn.iter() {
+            if attr.attr_type() == oid {
+                if let Some(s) = extract_attr_string(attr.attr_value()) {
+                    return Some(s);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Extracts the Common Name or Organization from an X.509 name.

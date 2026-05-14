@@ -1,5 +1,6 @@
 pub mod availability;
 pub mod bulk;
+pub mod caa;
 pub mod cache;
 pub mod colors;
 pub mod config;
@@ -40,6 +41,7 @@ pub use tld::{lookup_tld, TldInfo};
 pub use whois::{WhoisClient, WhoisResponse};
 
 pub use bulk::{BulkExecutor, BulkOperation, BulkResult};
+pub use caa::{CaaPolicy, CaaRecord, IssuerCaaMatch};
 pub use diff::{DomainDiff, DomainDiffer};
 pub use domain_info::{DomainInfo, DomainInfoSource};
 pub use history::{HistoryEntry, LookupHistory};
