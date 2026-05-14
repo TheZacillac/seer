@@ -14,7 +14,7 @@ from slowapi.errors import RateLimitExceeded
 from . import __version__
 from .limiting import limiter
 from .middleware import MaxBodySizeMiddleware, RequestLoggingMiddleware, metrics
-from .routers import lookup, whois, rdap, dns, propagation, status
+from .routers import lookup, whois, rdap, dns, propagation, status, ssl
 
 # Configure structured logging via the unified Arcanum logging module.
 try:
@@ -154,6 +154,7 @@ app.include_router(rdap.router, prefix="/rdap", tags=["RDAP"])
 app.include_router(dns.router, prefix="/dns", tags=["DNS"])
 app.include_router(propagation.router, prefix="/propagation", tags=["Propagation"])
 app.include_router(status.router, prefix="/status", tags=["Status"])
+app.include_router(ssl.router, prefix="/ssl", tags=["SSL"])
 
 
 @app.get("/")
@@ -172,6 +173,7 @@ async def root():
             "dns": "/dns/{domain}/{record_type}",
             "propagation": "/propagation/{domain}/{record_type}",
             "status": "/status/{domain}",
+            "ssl_bulk": "/ssl/bulk",
         },
         "docs": "/docs",
     }
