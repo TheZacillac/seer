@@ -536,4 +536,20 @@ csv,format,example.org
             r.operation
         );
     }
+
+    #[tokio::test]
+    #[ignore = "live network: hits cloudflare.com:443"]
+    async fn execute_ssl_live_cloudflare_has_non_empty_chain() {
+        let executor = BulkExecutor::new();
+        let results = executor
+            .execute_ssl(vec!["cloudflare.com".to_string()])
+            .await;
+        assert_eq!(results.len(), 1);
+        let r = &results[0];
+        assert!(r.success, "expected success, got error: {:?}", r.error);
+        let Some(BulkResultData::Ssl(ref report)) = r.data else {
+            panic!("expected Ssl data, got {:?}", r.data);
+        };
+        assert!(!report.chain.is_empty(), "chain must not be empty");
+    }
 }
