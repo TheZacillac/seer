@@ -742,7 +742,7 @@ mod tests {
     ///      which is handled by `unwrap_or_else` but still disturbs state.
     /// Per-test unique keys (see `unique_test_key`) prevent entry-level
     /// collisions; this mutex prevents lock-contention races on Drop.
-    static INFLIGHT_TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static INFLIGHT_TEST_SERIAL: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_lookup_result_domain_name_whois() {
@@ -1179,14 +1179,14 @@ mod tests {
     #[test]
     fn whois_response_is_not_thin_when_creation_date_present() {
         let mut w = empty_whois("example.com");
-        w.creation_date = Some(chrono::Utc::now());
+        w.creation_date = Some(Utc::now());
         assert!(!whois_response_is_thin(&w));
     }
 
     #[test]
     fn whois_response_is_not_thin_when_expiration_date_present() {
         let mut w = empty_whois("example.com");
-        w.expiration_date = Some(chrono::Utc::now());
+        w.expiration_date = Some(Utc::now());
         assert!(!whois_response_is_thin(&w));
     }
 
@@ -1243,7 +1243,7 @@ mod tests {
     fn classify_whois_leg_rejects_whois_with_real_data() {
         let mut w = empty_whois("legacy.tld");
         w.registrar = Some("Legacy Registry".to_string());
-        w.creation_date = Some(chrono::Utc::now());
+        w.creation_date = Some(Utc::now());
         let rdap_err = SeerError::RdapError("query failed with status 404 Not Found".to_string());
         assert!(classify_whois_leg(&w, &rdap_err).is_none());
     }
@@ -1287,7 +1287,7 @@ mod tests {
         let mut guard = LOOKUP_INFLIGHT.lock().unwrap_or_else(|p| p.into_inner());
         // Use a per-run unique canary so parallel tests cannot collide.
         let canary = unique_test_key("__poison_recovery");
-        guard.insert(canary.clone(), std::sync::Weak::new());
+        guard.insert(canary.clone(), Weak::new());
         assert!(guard.contains_key(&canary));
         guard.remove(&canary);
     }

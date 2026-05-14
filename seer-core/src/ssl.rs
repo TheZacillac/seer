@@ -304,10 +304,8 @@ mod tests {
 
     #[test]
     fn test_ssl_checker_creation() {
-        let checker = SslChecker::new();
+        let _checker = SslChecker::new();
         let _default_checker = SslChecker::default();
-        // Just verify construction works
-        drop(checker);
     }
 
     #[test]
