@@ -632,10 +632,13 @@ mod tests {
     fn sample_report() -> SslReport {
         SslReport {
             domain: "example.com".to_string(),
-            chain: vec![sample_cert_detail(), CertDetail {
-                is_ca: true,
-                ..sample_cert_detail()
-            }],
+            chain: vec![
+                sample_cert_detail(),
+                CertDetail {
+                    is_ca: true,
+                    ..sample_cert_detail()
+                },
+            ],
             protocol_version: Some("TLS 1.3".to_string()),
             san_names: vec!["example.com".to_string(), "www.example.com".to_string()],
             is_valid: true,
@@ -647,7 +650,9 @@ mod tests {
     fn ssl_csv_emits_expected_header_and_row() {
         let report = sample_report();
         let result = BulkResult {
-            operation: BulkOperation::Ssl { domain: "example.com".to_string() },
+            operation: BulkOperation::Ssl {
+                domain: "example.com".to_string(),
+            },
             success: true,
             data: Some(BulkResultData::Ssl(report)),
             error: None,
@@ -676,7 +681,9 @@ mod tests {
     #[test]
     fn ssl_csv_failure_row_has_empty_ssl_columns() {
         let result = BulkResult {
-            operation: BulkOperation::Ssl { domain: "broken.invalid".to_string() },
+            operation: BulkOperation::Ssl {
+                domain: "broken.invalid".to_string(),
+            },
             success: false,
             data: None,
             error: Some("could not resolve broken.invalid".to_string()),
