@@ -628,6 +628,28 @@ fn bulk_status(
 
 #[pyfunction]
 #[pyo3(signature = (domains, concurrency = 10, *, progress = None))]
+fn bulk_ssl(
+    py: Python<'_>,
+    domains: Vec<String>,
+    concurrency: usize,
+    progress: Option<Py<PyAny>>,
+) -> PyResult<PyObject> {
+    let executor = BulkExecutor::new().with_concurrency(validate_concurrency(concurrency)?);
+
+    let operations: Vec<BulkOperation> = domains
+        .into_iter()
+        .map(|domain| BulkOperation::Ssl { domain })
+        .collect();
+
+    let cb = build_progress_callback(progress)?;
+    let result = run_async_infallible(py, async move { executor.execute(operations, cb).await })?;
+
+    let json = serialize_response(&result)?;
+    json_to_python(py, &json)
+}
+
+#[pyfunction]
+#[pyo3(signature = (domains, concurrency = 10, *, progress = None))]
 fn bulk_availability(
     py: Python<'_>,
     domains: Vec<String>,
@@ -946,6 +968,7 @@ fn _seer(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(bulk_dig, m)?)?;
     m.add_function(wrap_pyfunction!(bulk_propagation, m)?)?;
     m.add_function(wrap_pyfunction!(bulk_status, m)?)?;
+    m.add_function(wrap_pyfunction!(bulk_ssl, m)?)?;
     m.add_function(wrap_pyfunction!(bulk_availability, m)?)?;
     m.add_function(wrap_pyfunction!(availability, m)?)?;
     m.add_function(wrap_pyfunction!(subdomains, m)?)?;
