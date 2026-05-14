@@ -16,6 +16,8 @@ def test_bulk_ssl_cloudflare_chain_non_empty():
     assert len(results) == 1
     r = results[0]
     assert r["success"] is True, r
-    report = r["data"]["data"]
+    envelope = r["data"]
+    assert envelope["result_type"] == "ssl", envelope
+    report = envelope["data"]
     assert isinstance(report["chain"], list)
     assert len(report["chain"]) >= 1

@@ -61,6 +61,7 @@ impl BulkExecutor {
     pub async fn execute_dns(&self, domains: Vec<String>, record_type: RecordType) -> Vec<BulkResult>;
     pub async fn execute_propagation(&self, domains: Vec<String>, record_type: RecordType) -> Vec<BulkResult>;
     pub async fn execute_status(&self, domains: Vec<String>) -> Vec<BulkResult>;
+    pub async fn execute_ssl(&self, domains: Vec<String>) -> Vec<BulkResult>;
 }
 ```
 
@@ -76,6 +77,7 @@ pub enum BulkOperation {
     Propagation { domain: String, record_type: RecordType },
     Lookup { domain: String },
     Status { domain: String },
+    Ssl { domain: String },
 }
 ```
 
@@ -105,6 +107,7 @@ pub enum BulkResultData {
     Propagation(PropagationResult),
     Lookup(LookupResult),
     Status(StatusResponse),
+    Ssl(SslReport),
 }
 ```
 
