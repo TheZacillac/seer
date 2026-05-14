@@ -497,8 +497,7 @@ fn parse_certificate_der(der: &[u8], domain: &str) -> Result<CertificateInfo> {
     // certs commonly have a short CN like "E7" or "R3"; without the
     // organization the human-readable name is unhelpful and the CAA
     // comparison cannot match the CA's well-known name.
-    let issuer =
-        format_issuer_name(cert.issuer()).unwrap_or_else(|| "Unknown Issuer".to_string());
+    let issuer = format_issuer_name(cert.issuer()).unwrap_or_else(|| "Unknown Issuer".to_string());
 
     // Extract subject - prefer CN, fall back to O (Organization)
     let subject =

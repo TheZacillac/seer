@@ -154,22 +154,28 @@ impl HumanFormatter {
         if let Some(m) = caa.issuer_match {
             let rendered = match m {
                 IssuerCaaMatch::NoPolicy => self.value("no policy — any CA permitted"),
-                IssuerCaaMatch::Permitted => {
-                    self.success("issuer permitted by current CAA policy")
-                }
-                IssuerCaaMatch::Mismatch => self.warning(
-                    "issuer not in current CAA policy (informational — see note below)",
-                ),
+                IssuerCaaMatch::Permitted => self.success("issuer permitted by current CAA policy"),
+                IssuerCaaMatch::Mismatch => self
+                    .warning("issuer not in current CAA policy (informational — see note below)"),
                 IssuerCaaMatch::Indeterminate => {
                     self.warning("CAA present but no issue/issuewild tags")
                 }
             };
-            out.push(format!("{}  {}: {}", indent, self.label("Issuer vs CAA"), rendered));
+            out.push(format!(
+                "{}  {}: {}",
+                indent,
+                self.label("Issuer vs CAA"),
+                rendered
+            ));
         }
 
         // Always surface the informational note explaining that CAA is
         // checked only at issuance time.
-        out.push(format!("{}  {}", indent, self.value(&format!("note: {}", caa.note))));
+        out.push(format!(
+            "{}  {}",
+            indent,
+            self.value(&format!("note: {}", caa.note))
+        ));
         out
     }
 

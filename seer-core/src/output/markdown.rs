@@ -46,9 +46,7 @@ impl MarkdownFormatter {
             let rendered = match m {
                 IssuerCaaMatch::NoPolicy => "no policy — any CA permitted",
                 IssuerCaaMatch::Permitted => "issuer permitted by current CAA policy",
-                IssuerCaaMatch::Mismatch => {
-                    "issuer not in current CAA policy (informational)"
-                }
+                IssuerCaaMatch::Mismatch => "issuer not in current CAA policy (informational)",
                 IssuerCaaMatch::Indeterminate => "CAA present but no issue/issuewild tags",
             };
             out.push(String::new());
