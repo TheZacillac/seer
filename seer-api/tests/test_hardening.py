@@ -283,13 +283,14 @@ def test_ssrf_guard_rejects_reserved(client, path):
 @pytest.mark.parametrize(
     "path,body",
     [
-        # Status is the only bulk endpoint where every domain is an actual
-        # outbound connection target, so it's the only one that guards.
+        # Bulk endpoints where every domain is an actual outbound connect
+        # target must guard each domain against reserved addresses.
         ("/status/bulk", {"domains": ["127.0.0.1", "example.com"], "concurrency": 2}),
+        ("/ssl/bulk", {"domains": ["127.0.0.1", "example.com"], "concurrency": 2}),
     ],
 )
 def test_ssrf_guard_bulk_rejects_reserved(client, path, body):
-    """Bulk status refuses any body whose domains list contains a reserved IP."""
+    """Bulk endpoints refuse any body whose domains list contains a reserved IP."""
     resp = client.post(path, json=body)
     assert resp.status_code == 400, (path, resp.status_code, resp.text)
 
