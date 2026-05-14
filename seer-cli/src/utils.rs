@@ -71,6 +71,9 @@ pub fn bulk_results_to_csv(results: &[BulkResult], operation: &str) -> String {
         "info" => {
             csv.push_str("domain,success,source,registrar,registrant,organization,created,expires,updated,nameservers,status,dnssec,registrant_email,registrant_phone,registrant_address,registrant_country,admin_name,admin_organization,admin_email,admin_phone,tech_name,tech_organization,tech_email,tech_phone,whois_server,rdap_url,availability_verdict,duration_ms,error\n");
         }
+        "ssl" => {
+            csv.push_str("domain,success,subject,issuer,valid_from,valid_until,days_remaining,signature_algorithm,key_type,key_bits,chain_length,san_count,sans,protocol_version,is_valid,duration_ms,error\n");
+        }
         _ => {
             csv.push_str("domain,success,duration_ms,error\n");
         }
@@ -404,6 +407,83 @@ pub fn bulk_results_to_csv(results: &[BulkResult], operation: &str) -> String {
                     ));
                 }
             }
+            "ssl" => {
+                let (
+                    subject,
+                    issuer,
+                    valid_from,
+                    valid_until,
+                    days_remaining,
+                    signature_algorithm,
+                    key_type,
+                    key_bits,
+                    chain_length,
+                    san_count,
+                    sans,
+                    protocol_version,
+                    is_valid,
+                ) = if let Some(BulkResultData::Ssl(ref r)) = result.data {
+                    let leaf = r.chain.first();
+                    (
+                        leaf.map(|c| c.subject.clone()).unwrap_or_default(),
+                        leaf.map(|c| c.issuer.clone()).unwrap_or_default(),
+                        leaf.map(|c| c.valid_from.format("%Y-%m-%d").to_string())
+                            .unwrap_or_default(),
+                        leaf.map(|c| c.valid_until.format("%Y-%m-%d").to_string())
+                            .unwrap_or_default(),
+                        r.days_until_expiry.to_string(),
+                        leaf.and_then(|c| c.signature_algorithm.clone())
+                            .unwrap_or_default(),
+                        leaf.and_then(|c| c.key_type.clone()).unwrap_or_default(),
+                        leaf.and_then(|c| c.key_bits)
+                            .map(|n| n.to_string())
+                            .unwrap_or_default(),
+                        r.chain.len().to_string(),
+                        r.san_names.len().to_string(),
+                        join_sans(&r.san_names),
+                        r.protocol_version.clone().unwrap_or_default(),
+                        r.is_valid.to_string(),
+                    )
+                } else {
+                    // `Default` is only implemented for tuples up to 12 elements,
+                    // so spell out 13 empty Strings explicitly.
+                    (
+                        String::new(),
+                        String::new(),
+                        String::new(),
+                        String::new(),
+                        String::new(),
+                        String::new(),
+                        String::new(),
+                        String::new(),
+                        String::new(),
+                        String::new(),
+                        String::new(),
+                        String::new(),
+                        String::new(),
+                    )
+                };
+                csv.push_str(&format!(
+                    "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+                    domain,
+                    success,
+                    escape_csv_field(&subject),
+                    escape_csv_field(&issuer),
+                    valid_from,
+                    valid_until,
+                    days_remaining,
+                    escape_csv_field(&signature_algorithm),
+                    escape_csv_field(&key_type),
+                    key_bits,
+                    chain_length,
+                    san_count,
+                    escape_csv_field(&sans),
+                    escape_csv_field(&protocol_version),
+                    is_valid,
+                    duration_ms,
+                    error
+                ));
+            }
             _ => {
                 csv.push_str(&format!(
                     "{},{},{},{}\n",
@@ -451,6 +531,23 @@ pub fn escape_csv_field(s: &str) -> String {
     }
 }
 
+/// SAN limit before truncation in CSV output. A handful of certs have
+/// hundreds of SANs (wildcards, CDNs); writing them all into a single CSV
+/// cell makes the file unreadable. We keep the first `SAN_DISPLAY_LIMIT`
+/// and append `;…+N more` so the column stays truthful about the count.
+const SAN_DISPLAY_LIMIT: usize = 10;
+
+/// Joins a SAN list with `;`, truncating to the first `SAN_DISPLAY_LIMIT`
+/// entries and appending `;…+N more` when the list is longer.
+pub fn join_sans(sans: &[String]) -> String {
+    if sans.len() <= SAN_DISPLAY_LIMIT {
+        return sans.join(";");
+    }
+    let head = sans[..SAN_DISPLAY_LIMIT].join(";");
+    let remainder = sans.len() - SAN_DISPLAY_LIMIT;
+    format!("{head};…+{remainder} more")
+}
+
 pub fn get_domain_from_operation(op: &BulkOperation) -> String {
     match op {
         BulkOperation::Whois { domain } => domain.clone(),
@@ -489,6 +586,106 @@ pub fn extract_rdap_dates(r: &seer_core::rdap::RdapResponse) -> (String, String,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn join_sans_returns_all_when_under_limit() {
+        let sans = vec!["a.example.com".to_string(), "b.example.com".to_string()];
+        assert_eq!(join_sans(&sans), "a.example.com;b.example.com");
+    }
+
+    #[test]
+    fn join_sans_truncates_with_remainder_suffix() {
+        // 12 SANs → first 10 joined, then ";…+2 more"
+        let sans: Vec<String> = (1..=12).map(|i| format!("h{i}.example.com")).collect();
+        let joined = join_sans(&sans);
+        let expected_first_ten = (1..=10)
+            .map(|i| format!("h{i}.example.com"))
+            .collect::<Vec<_>>()
+            .join(";");
+        assert_eq!(joined, format!("{};…+2 more", expected_first_ten));
+    }
+
+    #[test]
+    fn join_sans_exactly_ten_is_not_truncated() {
+        let sans: Vec<String> = (1..=10).map(|i| format!("h{i}.example.com")).collect();
+        let joined = join_sans(&sans);
+        assert!(!joined.contains("more"), "got: {joined}");
+        assert_eq!(joined.matches(';').count(), 9);
+    }
+
+    use chrono::TimeZone;
+    use seer_core::bulk::{BulkOperation, BulkResult, BulkResultData};
+    use seer_core::ssl::{CertDetail, SslReport};
+
+    fn sample_cert_detail() -> CertDetail {
+        CertDetail {
+            subject: "CN=example.com".to_string(),
+            issuer: "CN=Test CA".to_string(),
+            valid_from: chrono::Utc.with_ymd_and_hms(2024, 1, 30, 0, 0, 0).unwrap(),
+            valid_until: chrono::Utc.with_ymd_and_hms(2025, 3, 1, 0, 0, 0).unwrap(),
+            serial_number: "deadbeef".to_string(),
+            signature_algorithm: Some("sha256WithRSAEncryption".to_string()),
+            is_ca: false,
+            key_type: Some("RSA".to_string()),
+            key_bits: Some(2048),
+        }
+    }
+
+    fn sample_report() -> SslReport {
+        SslReport {
+            domain: "example.com".to_string(),
+            chain: vec![sample_cert_detail(), CertDetail {
+                is_ca: true,
+                ..sample_cert_detail()
+            }],
+            protocol_version: Some("TLS 1.3".to_string()),
+            san_names: vec!["example.com".to_string(), "www.example.com".to_string()],
+            is_valid: true,
+            days_until_expiry: 89,
+        }
+    }
+
+    #[test]
+    fn ssl_csv_emits_expected_header_and_row() {
+        let report = sample_report();
+        let result = BulkResult {
+            operation: BulkOperation::Ssl { domain: "example.com".to_string() },
+            success: true,
+            data: Some(BulkResultData::Ssl(report)),
+            error: None,
+            duration_ms: 612,
+        };
+        let csv = bulk_results_to_csv(std::slice::from_ref(&result), "ssl");
+        let mut lines = csv.lines();
+        assert_eq!(
+            lines.next().unwrap(),
+            "domain,success,subject,issuer,valid_from,valid_until,days_remaining,signature_algorithm,key_type,key_bits,chain_length,san_count,sans,protocol_version,is_valid,duration_ms,error"
+        );
+        let row = lines.next().unwrap();
+        // Spot-check key fields are present and ordered correctly.
+        assert!(row.starts_with("example.com,true,CN=example.com,"));
+        assert!(row.contains(",2024-01-30,2025-03-01,89,"));
+        assert!(row.contains(",sha256WithRSAEncryption,RSA,2048,"));
+        // chain_length=2, san_count=2, sans joined
+        assert!(row.contains(",2,2,example.com;www.example.com,"));
+        assert!(row.contains(",TLS 1.3,true,612,"));
+    }
+
+    #[test]
+    fn ssl_csv_failure_row_has_empty_ssl_columns() {
+        let result = BulkResult {
+            operation: BulkOperation::Ssl { domain: "broken.invalid".to_string() },
+            success: false,
+            data: None,
+            error: Some("could not resolve broken.invalid".to_string()),
+            duration_ms: 12,
+        };
+        let csv = bulk_results_to_csv(std::slice::from_ref(&result), "ssl");
+        let row = csv.lines().nth(1).expect("data row");
+        // domain, success=false, then 13 empty SSL columns, then duration, then error.
+        assert!(row.starts_with("broken.invalid,false,,,,,,,,,,,,,,12,"));
+        assert!(row.ends_with("could not resolve broken.invalid"));
+    }
 
     #[test]
     fn read_bulk_input_rejects_directory() {
