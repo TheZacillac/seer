@@ -586,6 +586,8 @@ pub fn extract_rdap_dates(r: &seer_core::rdap::RdapResponse) -> (String, String,
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
+    use seer_core::ssl::{CertDetail, SslReport};
 
     #[test]
     fn join_sans_returns_all_when_under_limit() {
@@ -613,14 +615,10 @@ mod tests {
         assert_eq!(joined.matches(';').count(), 9);
     }
 
-    use chrono::TimeZone;
-    use seer_core::bulk::{BulkOperation, BulkResult, BulkResultData};
-    use seer_core::ssl::{CertDetail, SslReport};
-
     fn sample_cert_detail() -> CertDetail {
         CertDetail {
             subject: "CN=example.com".to_string(),
-            issuer: "CN=Test CA".to_string(),
+            issuer: "C=US, O=Test Org, CN=Test Root CA".to_string(),
             valid_from: chrono::Utc.with_ymd_and_hms(2024, 1, 30, 0, 0, 0).unwrap(),
             valid_until: chrono::Utc.with_ymd_and_hms(2025, 3, 1, 0, 0, 0).unwrap(),
             serial_number: "deadbeef".to_string(),
@@ -658,10 +656,10 @@ mod tests {
         let csv = bulk_results_to_csv(std::slice::from_ref(&result), "ssl");
         let mut lines = csv.lines();
         assert_eq!(
-            lines.next().unwrap(),
+            lines.next().expect("header line"),
             "domain,success,subject,issuer,valid_from,valid_until,days_remaining,signature_algorithm,key_type,key_bits,chain_length,san_count,sans,protocol_version,is_valid,duration_ms,error"
         );
-        let row = lines.next().unwrap();
+        let row = lines.next().expect("data row");
         // Spot-check key fields are present and ordered correctly.
         assert!(row.starts_with("example.com,true,CN=example.com,"));
         assert!(row.contains(",2024-01-30,2025-03-01,89,"));
@@ -669,6 +667,10 @@ mod tests {
         // chain_length=2, san_count=2, sans joined
         assert!(row.contains(",2,2,example.com;www.example.com,"));
         assert!(row.contains(",TLS 1.3,true,612,"));
+        assert!(
+            row.contains("\"C=US, O=Test Org, CN=Test Root CA\""),
+            "issuer should be RFC-4180 quoted when it contains commas; got row: {row}"
+        );
     }
 
     #[test]
