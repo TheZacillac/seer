@@ -111,7 +111,7 @@ impl SeerError {
             SeerError::Timeout(_) => "Operation timed out".to_string(),
             SeerError::RateLimited(_) => "Rate limited - please try again later".to_string(),
             SeerError::CertificateError(_) => "Certificate validation failed".to_string(),
-            SeerError::SslError(_) => "SSL inspection failed".to_string(),
+            SeerError::SslError(detail) => format!("SSL inspection failed: {}", detail),
             SeerError::BulkOperationError { .. } => "Bulk operation partially failed".to_string(),
             SeerError::LookupFailed { domain, .. } => format!("Lookup failed for {}", domain),
             SeerError::ConfigError(msg) => format!("Configuration error: {}", msg),
@@ -132,3 +132,29 @@ impl SeerError {
 }
 
 pub type Result<T> = std::result::Result<T, SeerError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ssl_error_sanitized_includes_detail() {
+        // Regression: prior to this, SslError(_) was collapsed to the
+        // generic string "SSL inspection failed", swallowing the reason
+        // (DNS failure, handshake refused, no cert presented, etc.).
+        // Callers — especially Python wrappers — need the detail to
+        // distinguish "probe failed" from "certificate genuinely missing".
+        let err = SeerError::SslError(
+            "could not resolve example.com for SSL inspection: DNS resolution failed".into(),
+        );
+        let msg = err.sanitized_message();
+        assert!(
+            msg.contains("SSL inspection failed"),
+            "expected category prefix; got: {msg}"
+        );
+        assert!(
+            msg.contains("DNS resolution failed"),
+            "expected detail to be preserved; got: {msg}"
+        );
+    }
+}

@@ -14,7 +14,8 @@ use x509_parser::oid_registry::Oid;
 use x509_parser::prelude::*;
 
 use crate::error::{Result, SeerError};
-use crate::validation::{describe_reserved_ip, normalize_domain};
+use crate::net::resolve_public_host;
+use crate::validation::normalize_domain;
 
 /// Default timeout for SSL operations (10 seconds).
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -89,39 +90,19 @@ impl SslChecker {
     #[instrument(skip(self), fields(domain = %domain))]
     pub async fn check(&self, domain: &str) -> Result<SslReport> {
         let domain = normalize_domain(domain)?;
-        let addr = format!("{}:443", domain);
 
         debug!(domain = %domain, "Checking SSL certificate chain");
 
-        // SSRF protection: resolve domain and check IPs before connecting
-        let socket_addrs: Vec<_> = tokio::net::lookup_host(&addr)
-            .await
-            .map_err(|e| {
-                SeerError::SslError(format!(
-                    "could not resolve {} to an IP address for SSL inspection \
-                     (no A or AAAA record?): {}",
-                    domain, e
-                ))
-            })?
-            .collect();
-
-        if socket_addrs.is_empty() {
-            return Err(SeerError::SslError(format!(
-                "{} has no A or AAAA records — nothing to connect to for SSL inspection",
-                domain
-            )));
-        }
-
-        for socket_addr in &socket_addrs {
-            if let Some(reason) = describe_reserved_ip(&socket_addr.ip()) {
-                return Err(SeerError::SslError(format!(
-                    "cannot connect to {}: {} — {}",
-                    domain,
-                    socket_addr.ip(),
-                    reason
-                )));
-            }
-        }
+        // Resolve + SSRF check. `resolve_public_host` already falls back to
+        // hickory (Google DNS) when the OS resolver fails — important for
+        // hosts where Tailscale Split-DNS or a corp resolver pins the
+        // domain to a nameserver that can't answer for it.
+        let socket_addrs = resolve_public_host(&domain, 443).await.map_err(|e| {
+            SeerError::SslError(format!(
+                "could not resolve {} for SSL inspection: {}",
+                domain, e
+            ))
+        })?;
 
         // Build TLS connector - accept invalid certs so we can inspect them
         let connector = native_tls::TlsConnector::builder()
@@ -136,7 +117,7 @@ impl SslChecker {
                 .await
                 .map_err(|_| SeerError::Timeout("SSL connection timed out".to_string()))?
                 .map_err(|e| {
-                    SeerError::SslError(format!("Failed to connect to {}: {}", addr, e))
+                    SeerError::SslError(format!("Failed to connect to {}:443: {}", domain, e))
                 })?;
 
         // TLS handshake with timeout
@@ -318,6 +299,23 @@ mod tests {
     fn test_oid_to_key_type() {
         let oid = Oid::from(&[1, 2, 840, 113549, 1, 1, 1][..]).unwrap();
         assert_eq!(oid_to_key_type(&oid), Some("RSA".to_string()));
+    }
+
+    /// Live-network sanity check: a real public site with valid TLS
+    /// completes a full chain inspection. Exercises the
+    /// [`resolve_public_host`] code path in `net.rs` (hickory fallback
+    /// engages if the test environment has a broken OS resolver) and the
+    /// rest of the TLS handshake + cert-parse pipeline.
+    #[tokio::test]
+    #[ignore = "requires network — performs a real TLS handshake"]
+    async fn check_live_example_com_succeeds() {
+        let report = SslChecker::new().check("example.com").await.unwrap();
+        assert_eq!(report.domain, "example.com");
+        assert!(!report.chain.is_empty(), "expected at least a leaf cert");
+        assert!(
+            report.is_valid,
+            "example.com's leaf cert should be currently valid"
+        );
     }
 
     #[test]

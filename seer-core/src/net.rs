@@ -5,7 +5,7 @@
 //! cloud-metadata address range. Used by every outbound leg of seer to ensure
 //! user-supplied domains cannot be weaponized as an SSRF primitive.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use hickory_resolver::config::{ResolveHosts, ResolverConfig, GOOGLE};
@@ -98,6 +98,20 @@ pub fn is_reserved_ip(ip: IpAddr) -> bool {
 /// otherwise. Does NOT follow CNAMEs explicitly — relies on whichever
 /// resolver answered.
 pub async fn validate_public_host(host: &str, port: u16) -> Result<()> {
+    resolve_public_host(host, port).await.map(|_| ())
+}
+
+/// Resolve a hostname to its public socket addresses, with hickory fallback.
+///
+/// Same security envelope as [`validate_public_host`] (OS resolver primary,
+/// hickory fallback on OS error, reserved-IP rejection) but returns the
+/// resolved [`SocketAddr`]s so callers can pass them to
+/// [`tokio::net::TcpStream::connect`] without a second DNS round-trip.
+///
+/// Use this from any outbound-connect path so a broken system resolver
+/// (corporate Macs, active VPNs, Tailscale Split-DNS claiming a domain
+/// MagicDNS can't answer) doesn't take the path down.
+pub async fn resolve_public_host(host: &str, port: u16) -> Result<Vec<SocketAddr>> {
     // Short-circuit: IP literal parse
     if let Ok(ip) = host.parse::<IpAddr>() {
         if is_reserved_ip(ip) {
@@ -106,11 +120,11 @@ pub async fn validate_public_host(host: &str, port: u16) -> Result<()> {
                 ip
             )));
         }
-        return Ok(());
+        return Ok(vec![SocketAddr::new(ip, port)]);
     }
 
-    let addrs: Vec<IpAddr> = match lookup_host((host, port)).await {
-        Ok(iter) => iter.map(|sa| sa.ip()).collect(),
+    let addrs: Vec<SocketAddr> = match lookup_host((host, port)).await {
+        Ok(iter) => iter.collect(),
         Err(os_err) => {
             // OS resolver failed — fall back to hickory (Google DNS) so a
             // broken system resolver doesn't take the whole tool down.
@@ -120,7 +134,7 @@ pub async fn validate_public_host(host: &str, port: u16) -> Result<()> {
                 "system DNS resolution failed; retrying via hickory fallback"
             );
             match FALLBACK_RESOLVER.lookup_ip(host).await {
-                Ok(resp) => resp.iter().collect(),
+                Ok(resp) => resp.iter().map(|ip| SocketAddr::new(ip, port)).collect(),
                 Err(fallback_err) => {
                     return Err(SeerError::InvalidInput(format!(
                         "DNS resolution failed for {host}: {os_err} (fallback: {fallback_err})"
@@ -136,15 +150,16 @@ pub async fn validate_public_host(host: &str, port: u16) -> Result<()> {
         )));
     }
 
-    for ip in &addrs {
-        if is_reserved_ip(*ip) {
+    for sa in &addrs {
+        if is_reserved_ip(sa.ip()) {
             return Err(SeerError::InvalidInput(format!(
-                "{host} resolves to reserved address {ip}"
+                "{host} resolves to reserved address {}",
+                sa.ip()
             )));
         }
     }
 
-    Ok(())
+    Ok(addrs)
 }
 
 #[cfg(test)]
