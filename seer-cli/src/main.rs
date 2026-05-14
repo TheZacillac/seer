@@ -70,6 +70,7 @@ Example Usage:
   seer bulk dig domains.txt MX              # Output: domains_results.csv
   seer bulk avail domains.txt               # Output: domains_results.csv
   seer bulk info domains.txt                # Output: domains_results.csv
+  seer bulk ssl domains.txt                 # Output: domains_results.csv
   seer bulk status domains.txt -o out.csv   # Output: out.csv
 
 Example Output (status operation):
@@ -95,6 +96,10 @@ Example Output (avail operation):
 Example Output (info operation):
   domain,success,source,registrar,registrant,organization,created,expires,updated,nameservers,status,dnssec,...,whois_server,rdap_url,availability_verdict,duration_ms,error
   example.com,true,Both,RESERVED-Internet Assigned Numbers Authority,,Internet Assigned Numbers Authority,1995-08-14,2025-08-13,2024-08-14,a.iana-servers.net;b.iana-servers.net,client delete prohibited,signed,...,whois.iana.org,https://rdap.iana.org/domain/example.com,,1523,
+
+Example Output (ssl operation):
+  domain,success,subject,issuer,valid_from,valid_until,days_remaining,signature_algorithm,key_type,key_bits,chain_length,san_count,sans,protocol_version,is_valid,duration_ms,error
+  example.com,true,CN=*.example.com,"C=US, O=DigiCert Inc, CN=DigiCert Global G2 TLS RSA SHA256 2020 CA1",2024-01-30,2025-03-01,89,sha256WithRSAEncryption,RSA,2048,3,2,*.example.com;example.com,TLS 1.3,true,612,
 "#;
 
 #[derive(Parser)]
@@ -614,9 +619,13 @@ async fn execute_command(
                     .iter()
                     .map(|d: &String| seer_core::bulk::BulkOperation::Info { domain: d.clone() })
                     .collect(),
+                "ssl" => domains
+                    .iter()
+                    .map(|d: &String| seer_core::bulk::BulkOperation::Ssl { domain: d.clone() })
+                    .collect(),
                 _ => {
                     eprintln!(
-                        "{} Unknown operation: {}. Use: lookup, whois, rdap, dig/dns, prop, status, avail, info",
+                        "{} Unknown operation: {}. Use: lookup, whois, rdap, dig/dns, prop, status, avail, info, ssl",
                         "Error:".ctp_red(),
                         operation
                     );
@@ -664,7 +673,8 @@ async fn execute_command(
                         | seer_core::bulk::BulkOperation::Lookup { domain }
                         | seer_core::bulk::BulkOperation::Status { domain }
                         | seer_core::bulk::BulkOperation::Avail { domain }
-                        | seer_core::bulk::BulkOperation::Info { domain } => domain.as_str(),
+                        | seer_core::bulk::BulkOperation::Info { domain }
+                        | seer_core::bulk::BulkOperation::Ssl { domain } => domain.as_str(),
                     };
                     match (progress_mode, r.success) {
                         (ProgressMode::Verbose, true) => {

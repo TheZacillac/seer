@@ -309,7 +309,7 @@ impl Repl {
         );
         println!(
             "  {}",
-            "Operations: lookup, whois, rdap, dig, prop, status, avail, info".dimmed()
+            "Operations: lookup, whois, rdap, dig, prop, status, avail, info, ssl".dimmed()
         );
         println!();
         println!("{}", "SETTINGS".bright_purple().bold());
@@ -355,6 +355,10 @@ impl Repl {
         println!(
             "  {}        Comprehensive domain info (RDAP + WHOIS merged)",
             "info".bright_green()
+        );
+        println!(
+            "  {}         Inspect SSL certificate chain (deep)",
+            "ssl".bright_green()
         );
         println!();
         println!("{}", "Input File Formats:".bright_cyan());
@@ -788,9 +792,13 @@ impl Repl {
                 .iter()
                 .map(|d: &String| seer_core::bulk::BulkOperation::Info { domain: d.clone() })
                 .collect(),
+            "ssl" => domains
+                .iter()
+                .map(|d: &String| seer_core::bulk::BulkOperation::Ssl { domain: d.clone() })
+                .collect(),
             _ => {
                 return CommandResult::Error(format!(
-                    "Unknown bulk operation: {}. Use: lookup, whois, rdap, dig/dns, prop, status, avail, info",
+                    "Unknown bulk operation: {}. Use: lookup, whois, rdap, dig/dns, prop, status, avail, info, ssl",
                     operation
                 ))
             }
@@ -836,7 +844,8 @@ impl Repl {
                     | seer_core::bulk::BulkOperation::Lookup { domain }
                     | seer_core::bulk::BulkOperation::Status { domain }
                     | seer_core::bulk::BulkOperation::Avail { domain }
-                    | seer_core::bulk::BulkOperation::Info { domain } => domain,
+                    | seer_core::bulk::BulkOperation::Info { domain }
+                    | seer_core::bulk::BulkOperation::Ssl { domain } => domain,
                 };
                 println!(
                     "  {} - {}",
