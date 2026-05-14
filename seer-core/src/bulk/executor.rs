@@ -538,7 +538,7 @@ csv,format,example.org
     }
 
     #[tokio::test]
-    #[ignore = "live network: hits cloudflare.com:443"]
+    #[ignore = "live network: hits cloudflare.com:443; run with --ignored"]
     async fn execute_ssl_live_cloudflare_has_non_empty_chain() {
         let executor = BulkExecutor::new();
         let results = executor
@@ -551,5 +551,15 @@ csv,format,example.org
             panic!("expected Ssl data, got {:?}", r.data);
         };
         assert!(!report.chain.is_empty(), "chain must not be empty");
+        assert!(report.is_valid, "cloudflare leaf cert should be valid");
+        assert!(
+            report.days_until_expiry > 0,
+            "cert should still be valid in the future, got {} days",
+            report.days_until_expiry
+        );
+        assert!(
+            !report.san_names.is_empty(),
+            "cloudflare cert should have SAN entries"
+        );
     }
 }
