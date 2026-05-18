@@ -140,6 +140,19 @@ pub enum RecordData {
         digest_type: u8,
         digest: String,
     },
+    TLSA {
+        cert_usage: u8,
+        selector: u8,
+        matching: u8,
+        /// Hex-encoded certificate association data (uppercase).
+        cert_data: String,
+    },
+    SSHFP {
+        algorithm: u8,
+        fingerprint_type: u8,
+        /// Hex-encoded fingerprint (uppercase).
+        fingerprint: String,
+    },
     Unknown {
         raw: String,
     },
@@ -190,6 +203,17 @@ impl fmt::Display for RecordData {
                 digest_type,
                 digest,
             } => write!(f, "{} {} {} {}", key_tag, algorithm, digest_type, digest),
+            RecordData::TLSA {
+                cert_usage,
+                selector,
+                matching,
+                cert_data,
+            } => write!(f, "{} {} {} {}", cert_usage, selector, matching, cert_data),
+            RecordData::SSHFP {
+                algorithm,
+                fingerprint_type,
+                fingerprint,
+            } => write!(f, "{} {} {}", algorithm, fingerprint_type, fingerprint),
             RecordData::Unknown { raw } => write!(f, "{}", raw),
         }
     }

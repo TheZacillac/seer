@@ -100,27 +100,57 @@ impl DnsResolver {
         self
     }
 
-    fn create_custom_resolver(&self, nameserver: &str) -> Result<TokioResolver> {
-        let ip: IpAddr = nameserver
-            .parse()
-            .map_err(|_| SeerError::DnsError(format!("invalid nameserver IP: {}", nameserver)))?;
+    async fn create_custom_resolver(&self, nameserver: &str) -> Result<TokioResolver> {
+        // Accept either a literal IP or a hostname. For hostnames, resolve
+        // via the default (Google DNS) hickory resolver so we do not depend
+        // on the OS resolver — that is the same fallback principle as the
+        // SSL probe fix: when the local system resolver is broken (split
+        // DNS, broken router, container netns), hickory still reaches the
+        // public name servers and the user-supplied authoritative server
+        // is still usable.
+        let ips: Vec<IpAddr> = if let Ok(ip) = nameserver.parse::<IpAddr>() {
+            vec![ip]
+        } else {
+            let response = self
+                .default_resolver
+                .lookup_ip(nameserver)
+                .await
+                .map_err(|e| {
+                    SeerError::DnsError(format!(
+                        "failed to resolve nameserver hostname {}: {}",
+                        nameserver, e
+                    ))
+                })?;
+            let resolved: Vec<IpAddr> = response.iter().collect();
+            if resolved.is_empty() {
+                return Err(SeerError::DnsError(format!(
+                    "nameserver {} did not resolve to any addresses",
+                    nameserver
+                )));
+            }
+            resolved
+        };
 
-        // SSRF protection: reject private/reserved IPs for user-supplied nameservers
-        if let Some(reason) = crate::validation::describe_reserved_ip(&ip) {
-            return Err(SeerError::DnsError(format!(
-                "nameserver {} blocked: {}",
-                nameserver, reason
-            )));
+        // SSRF protection: reject private/reserved IPs — whether supplied
+        // literally or returned by name resolution. Without this, a
+        // hostname under attacker control could point at internal infra.
+        for ip in &ips {
+            if let Some(reason) = crate::validation::describe_reserved_ip(ip) {
+                return Err(SeerError::DnsError(format!(
+                    "nameserver {} blocked: {}",
+                    nameserver, reason
+                )));
+            }
         }
 
-        // Build a config with a single UDP nameserver on the given IP.
+        // Build a config with all resolved IPs as upstream nameservers.
         // In hickory 0.26, NameServerConfig::udp(IpAddr) builds a
         // ConnectionConfig with the default DNS port (53) for us, so we
         // no longer need to construct a SocketAddr explicitly.
-        let ns_config = NameServerConfig::udp(ip);
-
         let mut config = ResolverConfig::from_parts(None, vec![], vec![]);
-        config.add_name_server(ns_config);
+        for ip in ips {
+            config.add_name_server(NameServerConfig::udp(ip));
+        }
 
         Ok(build_resolver(config, self.timeout))
     }
@@ -141,7 +171,7 @@ impl DnsResolver {
         // Reuse the cached default resolver when no custom nameserver is specified
         let custom_resolver;
         let resolver = if let Some(ns) = nameserver {
-            custom_resolver = self.create_custom_resolver(ns)?;
+            custom_resolver = self.create_custom_resolver(ns).await?;
             &custom_resolver
         } else {
             &self.default_resolver
@@ -165,6 +195,8 @@ impl DnsResolver {
             RecordType::CAA => self.resolve_caa(resolver, &domain).await,
             RecordType::DNSKEY => self.resolve_dnskey(resolver, &domain).await,
             RecordType::DS => self.resolve_ds(resolver, &domain).await,
+            RecordType::TLSA => self.resolve_tlsa(resolver, &domain).await,
+            RecordType::SSHFP => self.resolve_sshfp(resolver, &domain).await,
             RecordType::ANY => self.resolve_any(resolver, &domain).await,
             _ => Err(SeerError::DnsError(format!(
                 "Record type {} not implemented",
@@ -204,7 +236,7 @@ impl DnsResolver {
 
         let custom_resolver;
         let resolver = if let Some(ns) = nameserver {
-            custom_resolver = self.create_custom_resolver(ns)?;
+            custom_resolver = self.create_custom_resolver(ns).await?;
             &custom_resolver
         } else {
             &self.default_resolver
@@ -622,6 +654,92 @@ impl DnsResolver {
         Ok(records)
     }
 
+    async fn resolve_tlsa(&self, resolver: &TokioResolver, domain: &str) -> Result<Vec<DnsRecord>> {
+        // TLSA queries are how DANE clients discover the certificate
+        // association data for a TLS endpoint. The convention is
+        // `_<port>._<proto>.<host>` (e.g. `_443._tcp.example.com`); seer
+        // does not enforce the label shape because TLSA is also used for
+        // other transports.
+        let Some(response) = dns_lookup_or_empty(
+            resolver.lookup(domain, HickoryRecordType::TLSA).await,
+            "TLSA",
+        )?
+        else {
+            return Ok(vec![]);
+        };
+
+        let records = response
+            .answers()
+            .iter()
+            .filter_map(|record| {
+                if let HickoryRData::TLSA(tlsa) = &record.data {
+                    let cert_data = tlsa
+                        .cert_data
+                        .iter()
+                        .map(|b| format!("{:02X}", b))
+                        .collect::<String>();
+                    Some(DnsRecord {
+                        name: domain.to_string(),
+                        record_type: RecordType::TLSA,
+                        ttl: record.ttl,
+                        data: RecordData::TLSA {
+                            cert_usage: u8::from(tlsa.cert_usage),
+                            selector: u8::from(tlsa.selector),
+                            matching: u8::from(tlsa.matching),
+                            cert_data,
+                        },
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        Ok(records)
+    }
+
+    async fn resolve_sshfp(
+        &self,
+        resolver: &TokioResolver,
+        domain: &str,
+    ) -> Result<Vec<DnsRecord>> {
+        let Some(response) = dns_lookup_or_empty(
+            resolver.lookup(domain, HickoryRecordType::SSHFP).await,
+            "SSHFP",
+        )?
+        else {
+            return Ok(vec![]);
+        };
+
+        let records = response
+            .answers()
+            .iter()
+            .filter_map(|record| {
+                if let HickoryRData::SSHFP(sshfp) = &record.data {
+                    let fingerprint = sshfp
+                        .fingerprint
+                        .iter()
+                        .map(|b| format!("{:02X}", b))
+                        .collect::<String>();
+                    Some(DnsRecord {
+                        name: domain.to_string(),
+                        record_type: RecordType::SSHFP,
+                        ttl: record.ttl,
+                        data: RecordData::SSHFP {
+                            algorithm: u8::from(sshfp.algorithm),
+                            fingerprint_type: u8::from(sshfp.fingerprint_type),
+                            fingerprint,
+                        },
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        Ok(records)
+    }
+
     async fn resolve_any(&self, resolver: &TokioResolver, domain: &str) -> Result<Vec<DnsRecord>> {
         let mut all_records = Vec::new();
 
@@ -875,25 +993,29 @@ mod tests {
 
     // --- create_custom_resolver validation ---------------------------
 
-    #[test]
-    fn custom_resolver_rejects_invalid_ip() {
+    #[tokio::test]
+    async fn custom_resolver_rejects_invalid_input() {
+        // After hostname support was added, a string that is neither a
+        // valid IP nor a resolvable hostname should fail with a clear
+        // "failed to resolve" error rather than panicking or hanging.
+        // We pick a name that is *syntactically* impossible to resolve.
         let r = DnsResolver::new();
-        let err = r.create_custom_resolver("not-an-ip").unwrap_err();
+        let err = r.create_custom_resolver("..").await.unwrap_err();
         let msg = err.to_string().to_lowercase();
         assert!(
-            msg.contains("invalid nameserver ip"),
-            "expected 'invalid nameserver ip' in error, got: {}",
+            msg.contains("dns resolution failed") || msg.contains("invalid"),
+            "expected resolution failure, got: {}",
             msg
         );
     }
 
-    #[test]
-    fn custom_resolver_rejects_private_ipv4() {
+    #[tokio::test]
+    async fn custom_resolver_rejects_private_ipv4() {
         // SSRF defense: private / reserved ranges must be blocked even
         // when passed as a literal IP rather than a hostname.
         let r = DnsResolver::new();
         for reserved in ["127.0.0.1", "10.0.0.1", "192.168.1.1", "169.254.169.254"] {
-            let err = r.create_custom_resolver(reserved).unwrap_err();
+            let err = r.create_custom_resolver(reserved).await.unwrap_err();
             let msg = err.to_string().to_lowercase();
             assert!(
                 msg.contains("blocked") || msg.contains("reserved"),
@@ -904,10 +1026,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn custom_resolver_rejects_loopback_ipv6() {
+    #[tokio::test]
+    async fn custom_resolver_rejects_loopback_ipv6() {
         let r = DnsResolver::new();
-        let err = r.create_custom_resolver("::1").unwrap_err();
+        let err = r.create_custom_resolver("::1").await.unwrap_err();
         let msg = err.to_string().to_lowercase();
         assert!(
             msg.contains("blocked") || msg.contains("reserved"),
@@ -916,11 +1038,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn custom_resolver_accepts_public_ipv4() {
+    #[tokio::test]
+    async fn custom_resolver_accepts_public_ipv4() {
         // A known public resolver IP must be acceptable.
         let r = DnsResolver::new();
-        let result = r.create_custom_resolver("8.8.8.8");
+        let result = r.create_custom_resolver("8.8.8.8").await;
         assert!(
             result.is_ok(),
             "8.8.8.8 must be accepted as a public nameserver, got: {:?}",

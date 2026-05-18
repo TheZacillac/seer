@@ -97,8 +97,8 @@ impl SeerError {
             SeerError::RdapBootstrapError(_) => {
                 "RDAP service unavailable for this resource".to_string()
             }
-            SeerError::DnsError(_) => "DNS resolution failed".to_string(),
-            SeerError::DnsResolverError(_) => "DNS resolution failed".to_string(),
+            SeerError::DnsError(detail) => format!("DNS resolution failed: {}", detail),
+            SeerError::DnsResolverError(detail) => format!("DNS resolution failed: {}", detail),
             SeerError::InvalidDomain(domain) => format!("Invalid domain name: {}", domain),
             SeerError::DomainNotAllowed { tld, .. } => {
                 format!("Domain not allowed: TLD '{}' is not in the allowlist", tld)
@@ -136,6 +136,26 @@ pub type Result<T> = std::result::Result<T, SeerError>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dns_error_sanitized_includes_detail() {
+        // Regression: prior to this, DnsError(_) was collapsed to the
+        // generic string "DNS resolution failed", swallowing the reason.
+        // Callers — especially Python wrappers — need the detail to
+        // distinguish "invalid nameserver", "record type not implemented",
+        // "NXDOMAIN", "hostname did not resolve", and friends. Same fix
+        // shape as the earlier SslError detail-preservation fix.
+        let err = SeerError::DnsError("invalid nameserver IP: foo.example".into());
+        let msg = err.sanitized_message();
+        assert!(
+            msg.contains("DNS resolution failed"),
+            "expected category prefix; got: {msg}"
+        );
+        assert!(
+            msg.contains("invalid nameserver IP"),
+            "expected detail to be preserved; got: {msg}"
+        );
+    }
 
     #[test]
     fn ssl_error_sanitized_includes_detail() {
