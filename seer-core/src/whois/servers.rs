@@ -3,6 +3,18 @@ use std::collections::HashMap;
 
 /// Comprehensive WHOIS server list.
 /// Data sourced from https://github.com/WooMai/whois-servers (auto-synced with IANA Root Zone Database).
+///
+/// Intentional omissions
+/// ---------------------
+/// Google Registry / Charleston Road Registry TLDs (app, dev, page, google,
+/// new, how, ads, android, chrome, docs, drive, gmail, youtube, etc. — every
+/// TLD historically mapped to `whois.nic.google`) are *not* in this map.
+/// `whois.nic.google` does not resolve and IANA publishes no `whois:` field
+/// for these TLDs; they are RDAP-only. Re-adding them sends every WHOIS
+/// query to a dead hostname and produces a misleading "DNS resolution failed"
+/// instead of the clean `WhoisServerNotFound` error the discovery path
+/// generates. Use `seer.lookup()` (RDAP-first) or `seer.rdap_domain()` for
+/// these TLDs.
 pub static WHOIS_SERVERS: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(|| {
     let mut m = HashMap::new();
 
@@ -23,7 +35,6 @@ pub static WHOIS_SERVERS: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(
     m.insert("accountants", "whois.nic.accountants");
     m.insert("aco", "whois.nic.aco");
     m.insert("actor", "whois.nic.actor");
-    m.insert("ads", "whois.nic.google");
     m.insert("adult", "whois.nic.adult");
     m.insert("aeg", "whois.nic.aeg");
     m.insert("aero", "whois.aero");
@@ -46,12 +57,10 @@ pub static WHOIS_SERVERS: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(
     m.insert("americanfamily", "whois.nic.americanfamily");
     m.insert("amfam", "whois.nic.amfam");
     m.insert("amsterdam", "whois.nic.amsterdam");
-    m.insert("android", "whois.nic.google");
     m.insert("anquan", "whois.teleinfo.cn");
     m.insert("anz", "whois.nic.anz");
     m.insert("aol", "whois.nic.aol");
     m.insert("apartments", "whois.nic.apartments");
-    m.insert("app", "whois.nic.google");
     m.insert("apple", "whois.nic.apple");
     m.insert("aquarelle", "whois.nic.aquarelle");
     m.insert("arab", "whois.nic.arab");
@@ -122,7 +131,6 @@ pub static WHOIS_SERVERS: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(
     m.insert("bofa", "whois.nic.bofa");
     m.insert("bom", "whois.gtlds.nic.br");
     m.insert("bond", "whois.nic.bond");
-    m.insert("boo", "whois.nic.google");
     m.insert("book", "whois.nic.book");
     m.insert("bosch", "whois.nic.bosch");
     m.insert("bostik", "whois.nic.bostik");
@@ -144,7 +152,6 @@ pub static WHOIS_SERVERS: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(
     m.insert("bzh", "whois.nic.bzh");
     m.insert("cab", "whois.nic.cab");
     m.insert("cafe", "whois.nic.cafe");
-    m.insert("cal", "whois.nic.google");
     m.insert("call", "whois.nic.call");
     m.insert("cam", "whois.nic.cam");
     m.insert("camera", "whois.nic.camera");
@@ -173,13 +180,11 @@ pub static WHOIS_SERVERS: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(
     m.insert("cfa", "whois.nic.cfa");
     m.insert("cfd", "whois.nic.cfd");
     m.insert("chanel", "whois.nic.chanel");
-    m.insert("channel", "whois.nic.google");
     m.insert("charity", "whois.nic.charity");
     m.insert("chat", "whois.nic.chat");
     m.insert("cheap", "whois.nic.cheap");
     m.insert("chintai", "whois.nic.chintai");
     m.insert("christmas", "whois.nic.christmas");
-    m.insert("chrome", "whois.nic.google");
     m.insert("church", "whois.nic.church");
     m.insert("cipriani", "whois.nic.cipriani");
     m.insert("circle", "whois.nic.circle");
@@ -231,14 +236,11 @@ pub static WHOIS_SERVERS: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(
     m.insert("cuisinella", "whois.nic.cuisinella");
     m.insert("cymru", "whois.nic.cymru");
     m.insert("cyou", "whois.nic.cyou");
-    m.insert("dad", "whois.nic.google");
     m.insert("dance", "whois.nic.dance");
     m.insert("data", "whois.nic.data");
     m.insert("date", "whois.nic.date");
     m.insert("dating", "whois.nic.dating");
     m.insert("datsun", "whois.nic.gmo");
-    m.insert("day", "whois.nic.google");
-    m.insert("dclk", "whois.nic.google");
     m.insert("dds", "whois.nic.dds");
     m.insert("deal", "whois.nic.deal");
     m.insert("dealer", "whois.nic.dealer");
@@ -252,7 +254,6 @@ pub static WHOIS_SERVERS: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(
     m.insert("dentist", "whois.nic.dentist");
     m.insert("desi", "whois.nic.desi");
     m.insert("design", "whois.nic.design");
-    m.insert("dev", "whois.nic.google");
     m.insert("diamonds", "whois.nic.diamonds");
     m.insert("diet", "whois.nic.diet");
     m.insert("digital", "whois.nic.digital");
@@ -263,20 +264,17 @@ pub static WHOIS_SERVERS: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(
     m.insert("dish", "whois.nic.dish");
     m.insert("diy", "whois.tucowsregistry.net");
     m.insert("dnp", "whois.nic.dnp");
-    m.insert("docs", "whois.nic.google");
     m.insert("doctor", "whois.nic.doctor");
     m.insert("dog", "whois.nic.dog");
     m.insert("domains", "whois.nic.domains");
     m.insert("dot", "whois.nic.dot");
     m.insert("download", "whois.nic.download");
-    m.insert("drive", "whois.nic.google");
     m.insert("dtv", "whois.nic.dtv");
     m.insert("dubai", "whois.nic.dubai");
     m.insert("durban", "whois.nic.durban");
     m.insert("dvag", "whois.nic.dvag");
     m.insert("dvr", "whois.nic.dvr");
     m.insert("earth", "whois.nic.earth");
-    m.insert("eat", "whois.nic.google");
     m.insert("eco", "whois.nic.eco");
     m.insert("edeka", "whois.nic.edeka");
     m.insert("edu", "whois.educause.edu");
@@ -291,7 +289,6 @@ pub static WHOIS_SERVERS: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(
     m.insert("equipment", "whois.nic.equipment");
     m.insert("ericsson", "whois.nic.ericsson");
     m.insert("erni", "whois.nic.erni");
-    m.insert("esq", "whois.nic.google");
     m.insert("estate", "whois.nic.estate");
     m.insert("eurovision", "whois.nic.eurovision");
     m.insert("eus", "whois.nic.eus");
@@ -330,8 +327,6 @@ pub static WHOIS_SERVERS: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(
     m.insert("flights", "whois.nic.flights");
     m.insert("florist", "whois.nic.florist");
     m.insert("flowers", "whois.nic.flowers");
-    m.insert("fly", "whois.nic.google");
-    m.insert("foo", "whois.nic.google");
     m.insert("food", "whois.tucowsregistry.net");
     m.insert("football", "whois.nic.football");
     m.insert("forex", "whois.nic.forex");
@@ -357,7 +352,6 @@ pub static WHOIS_SERVERS: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(
     m.insert("games", "whois.nic.games");
     m.insert("garden", "whois.nic.garden");
     m.insert("gay", "whois.nic.gay");
-    m.insert("gbiz", "whois.nic.google");
     m.insert("gdn", "whois.nic.gdn");
     m.insert("gea", "whois.nic.gea");
     m.insert("gent", "whois.nic.gent");
@@ -369,10 +363,8 @@ pub static WHOIS_SERVERS: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(
     m.insert("gives", "whois.nic.gives");
     m.insert("giving", "whois.nic.giving");
     m.insert("glass", "whois.nic.glass");
-    m.insert("gle", "whois.nic.google");
     m.insert("global", "whois.nic.global");
     m.insert("globo", "whois.gtlds.nic.br");
-    m.insert("gmail", "whois.nic.google");
     m.insert("gmbh", "whois.nic.gmbh");
     m.insert("gmo", "whois.nic.gmo");
     m.insert("gmx", "whois.nic.gmx");
@@ -381,8 +373,6 @@ pub static WHOIS_SERVERS: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(
     m.insert("goldpoint", "whois.nic.goldpoint");
     m.insert("golf", "whois.nic.golf");
     m.insert("goodyear", "whois.nic.goodyear");
-    m.insert("goog", "whois.nic.google");
-    m.insert("google", "whois.nic.google");
     m.insert("gop", "whois.nic.gop");
     m.insert("got", "whois.nic.got");
     m.insert("gov", "whois.nic.gov");
@@ -393,20 +383,17 @@ pub static WHOIS_SERVERS: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(
     m.insert("grocery", "whois.nic.grocery");
     m.insert("group", "whois.nic.group");
     m.insert("gucci", "whois.nic.gucci");
-    m.insert("guge", "whois.nic.google");
     m.insert("guide", "whois.nic.guide");
     m.insert("guitars", "whois.nic.guitars");
     m.insert("guru", "whois.nic.guru");
     m.insert("hair", "whois.nic.hair");
     m.insert("hamburg", "whois.nic.hamburg");
-    m.insert("hangout", "whois.nic.google");
     m.insert("haus", "whois.nic.haus");
     m.insert("hdfc", "whois.nic.hdfc");
     m.insert("hdfcbank", "whois.nic.hdfcbank");
     m.insert("healthcare", "whois.nic.healthcare");
     m.insert("help", "whois.nic.help");
     m.insert("helsinki", "whois.nic.helsinki");
-    m.insert("here", "whois.nic.google");
     m.insert("hermes", "whois.nic.hermes");
     m.insert("hiphop", "whois.nic.hiphop");
     m.insert("hisamitsu", "whois.nic.gmo");
@@ -427,7 +414,6 @@ pub static WHOIS_SERVERS: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(
     m.insert("hotels", "whois.nic.hotels");
     m.insert("hotmail", "whois.nic.hotmail");
     m.insert("house", "whois.nic.house");
-    m.insert("how", "whois.nic.google");
     m.insert("hughes", "whois.nic.hughes");
     m.insert("hyundai", "whois.nic.hyundai");
     m.insert("ibm", "whois.nic.ibm");
@@ -444,7 +430,6 @@ pub static WHOIS_SERVERS: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(
     m.insert("industries", "whois.nic.industries");
     m.insert("infiniti", "whois.nic.gmo");
     m.insert("info", "whois.nic.info");
-    m.insert("ing", "whois.nic.google");
     m.insert("ink", "whois.nic.ink");
     m.insert("institute", "whois.nic.institute");
     m.insert("insurance", "whois.nic.insurance");
@@ -544,7 +529,6 @@ pub static WHOIS_SERVERS: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(
     m.insert("man", "whois.nic.man");
     m.insert("management", "whois.nic.management");
     m.insert("mango", "whois.nic.mango");
-    m.insert("map", "whois.nic.google");
     m.insert("market", "whois.nic.market");
     m.insert("marketing", "whois.nic.marketing");
     m.insert("markets", "whois.nic.markets");
@@ -553,9 +537,7 @@ pub static WHOIS_SERVERS: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(
     m.insert("mckinsey", "whois.nic.mckinsey");
     m.insert("med", "whois.nic.med");
     m.insert("media", "whois.nic.media");
-    m.insert("meet", "whois.nic.google");
     m.insert("melbourne", "whois.nic.melbourne");
-    m.insert("meme", "whois.nic.google");
     m.insert("memorial", "whois.nic.memorial");
     m.insert("men", "whois.nic.men");
     m.insert("menu", "whois.nic.menu");
@@ -582,7 +564,6 @@ pub static WHOIS_SERVERS: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(
     m.insert("moscow", "whois.nic.moscow");
     m.insert("moto", "whois.nic.moto");
     m.insert("motorcycles", "whois.nic.motorcycles");
-    m.insert("mov", "whois.nic.google");
     m.insert("movie", "whois.nic.movie");
     m.insert("msd", "whois.nic.msd");
     m.insert("mtn", "whois.nic.mtn");
@@ -597,11 +578,9 @@ pub static WHOIS_SERVERS: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(
     m.insert("net", "whois.verisign-grs.com");
     m.insert("netbank", "whois.nic.netbank");
     m.insert("network", "whois.nic.network");
-    m.insert("new", "whois.nic.google");
     m.insert("news", "whois.nic.news");
     m.insert("next", "whois.nic.next");
     m.insert("nextdirect", "whois.nic.nextdirect");
-    m.insert("nexus", "whois.nic.google");
     m.insert("ngo", "whois.nic.ngo");
     m.insert("nhk", "whois.nic.nhk");
     m.insert("nico", "whois.nic.nico");
@@ -641,7 +620,6 @@ pub static WHOIS_SERVERS: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(
     m.insert("otsuka", "whois.nic.otsuka");
     m.insert("ott", "whois.nic.ott");
     m.insert("ovh", "whois.nic.ovh");
-    m.insert("page", "whois.nic.google");
     m.insert("panasonic", "whois.nic.gmo");
     m.insert("paris", "whois.nic.paris");
     m.insert("pars", "whois.nic.pars");
@@ -652,7 +630,6 @@ pub static WHOIS_SERVERS: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(
     m.insert("pccw", "whois.nic.pccw");
     m.insert("pet", "whois.nic.pet");
     m.insert("pharmacy", "whois.nic.pharmacy");
-    m.insert("phd", "whois.nic.google");
     m.insert("philips", "whois.nic.philips");
     m.insert("phone", "whois.nic.phone");
     m.insert("photo", "whois.nic.photo");
@@ -669,7 +646,6 @@ pub static WHOIS_SERVERS: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(
     m.insert("pioneer", "whois.nic.pioneer");
     m.insert("pizza", "whois.nic.pizza");
     m.insert("place", "whois.nic.place");
-    m.insert("play", "whois.nic.google");
     m.insert("playstation", "whois.nic.playstation");
     m.insert("plumbing", "whois.nic.plumbing");
     m.insert("plus", "whois.nic.plus");
@@ -682,9 +658,7 @@ pub static WHOIS_SERVERS: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(
     m.insert("press", "whois.nic.press");
     m.insert("prime", "whois.nic.prime");
     m.insert("pro", "whois.nic.pro");
-    m.insert("prod", "whois.nic.google");
     m.insert("productions", "whois.nic.productions");
-    m.insert("prof", "whois.nic.google");
     m.insert("progressive", "whois.nic.progressive");
     m.insert("promo", "whois.nic.promo");
     m.insert("properties", "whois.nic.properties");
@@ -730,7 +704,6 @@ pub static WHOIS_SERVERS: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(
     m.insert("rodeo", "whois.nic.rodeo");
     m.insert("rogers", "whois.nic.rogers");
     m.insert("room", "whois.nic.room");
-    m.insert("rsvp", "whois.nic.google");
     m.insert("rugby", "whois.nic.rugby");
     m.insert("ruhr", "whois.nic.ruhr");
     m.insert("run", "whois.nic.run");
@@ -762,7 +735,6 @@ pub static WHOIS_SERVERS: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(
     m.insert("schwarz", "whois.nic.schwarz");
     m.insert("science", "whois.nic.science");
     m.insert("scot", "whois.nic.scot");
-    m.insert("search", "whois.nic.google");
     m.insert("seat", "whois.nic.seat");
     m.insert("secure", "whois.nic.secure");
     m.insert("security", "whois.nic.security");
@@ -805,7 +777,6 @@ pub static WHOIS_SERVERS: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(
     m.insert("solutions", "whois.nic.solutions");
     m.insert("song", "whois.nic.song");
     m.insert("sony", "whois.nic.sony");
-    m.insert("soy", "whois.nic.google");
     m.insert("spa", "whois.nic.spa");
     m.insert("space", "whois.nic.space");
     m.insert("sport", "whois.nic.sport");
@@ -961,12 +932,10 @@ pub static WHOIS_SERVERS: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(
     m.insert("yoga", "whois.nic.yoga");
     m.insert("yokohama", "whois.nic.yokohama");
     m.insert("you", "whois.nic.you");
-    m.insert("youtube", "whois.nic.google");
     m.insert("yun", "whois.teleinfo.cn");
     m.insert("zappos", "whois.nic.zappos");
     m.insert("zara", "whois.nic.zara");
     m.insert("zero", "whois.nic.zero");
-    m.insert("zip", "whois.nic.google");
     m.insert("zone", "whois.nic.zone");
     m.insert("zuerich", "whois.nic.zuerich");
 
@@ -1228,7 +1197,6 @@ pub static WHOIS_SERVERS: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(
     m.insert("xn--fiqs8s", "whois.cnnic.cn");
     m.insert("xn--fiqz9s", "whois.cnnic.cn");
     m.insert("xn--fjq720a", "whois.nic.xn--fjq720a");
-    m.insert("xn--flw351e", "whois.nic.google");
     m.insert("xn--fpcrj9c3d", "whois.nixiregistry.in");
     m.insert("xn--fzc2c9e2c", "whois.nic.lk");
     m.insert("xn--fzys8d69uvgm", "whois.nic.xn--fzys8d69uvgm");
@@ -1283,8 +1251,6 @@ pub static WHOIS_SERVERS: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(
     m.insert("xn--pgbs0dh", "whois.ati.tn");
     m.insert("xn--pssy2u", "whois.nic.xn--pssy2u");
     m.insert("xn--q7ce6a", "whois.nic.la");
-    m.insert("xn--q9jyb4c", "whois.nic.google");
-    m.insert("xn--qcka1pmc", "whois.nic.google");
     m.insert("xn--qxa6a", "whois.eu");
     m.insert("xn--rovu88b", "whois.nic.xn--rovu88b");
     m.insert("xn--rvc1e0am3e", "whois.nixiregistry.in");
@@ -1389,10 +1355,8 @@ pub static WHOIS_SERVERS: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(
     m.insert("คอม", "whois.nic.xn--42c2d9a");
     m.insert("ไทย", "whois.thnic.co.th");
     m.insert("ລາວ", "whois.nic.la");
-    m.insert("みんな", "whois.nic.google");
     m.insert("アマゾン", "whois.nic.xn--cckwcxetd");
     m.insert("クラウド", "whois.nic.xn--gckr3f0f");
-    m.insert("グーグル", "whois.nic.google");
     m.insert("コム", "whois.nic.xn--tckwe");
     m.insert("ストア", "whois.nic.xn--cck2b3b");
     m.insert("セール", "whois.nic.xn--1ck2e1b");
@@ -1443,7 +1407,6 @@ pub static WHOIS_SERVERS: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(
     m.insert("网站", "whois.nic.xn--5tzm5g");
     m.insert("网络", "whois.ngtld.cn");
     m.insert("联通", "whois.nic.xn--8y0a063a");
-    m.insert("谷歌", "whois.nic.google");
     m.insert("购物", "whois.nic.xn--g2xx48c");
     m.insert("通販", "whois.nic.xn--gk3at1e");
     m.insert("集团", "whois.zdns.cn");

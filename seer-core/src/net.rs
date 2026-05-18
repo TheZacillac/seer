@@ -13,7 +13,7 @@ use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use hickory_resolver::TokioResolver;
 use once_cell::sync::Lazy;
 use tokio::net::lookup_host;
-use tracing::warn;
+use tracing::debug;
 
 use crate::error::{Result, SeerError};
 
@@ -126,12 +126,17 @@ pub async fn resolve_public_host(host: &str, port: u16) -> Result<Vec<SocketAddr
     let addrs: Vec<SocketAddr> = match lookup_host((host, port)).await {
         Ok(iter) => iter.collect(),
         Err(os_err) => {
-            // OS resolver failed — fall back to hickory (Google DNS) so a
-            // broken system resolver doesn't take the whole tool down.
-            warn!(
+            // OS resolver could not answer — fall back to hickory (Google DNS)
+            // so a broken system resolver doesn't take the whole tool down.
+            // Logged at debug! because the fallback is transparent by design;
+            // NXDOMAIN for a host that genuinely doesn't exist (e.g. a stale
+            // WHOIS server entry) lands here too, so warn! would cry wolf on
+            // benign negative answers. If BOTH resolvers fail, the
+            // InvalidInput error below is the load-bearing signal.
+            debug!(
                 host = %host,
                 error = %os_err,
-                "system DNS resolution failed; retrying via hickory fallback"
+                "OS resolver could not resolve host; trying hickory fallback"
             );
             match FALLBACK_RESOLVER.lookup_ip(host).await {
                 Ok(resp) => resp.iter().map(|ip| SocketAddr::new(ip, port)).collect(),

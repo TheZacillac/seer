@@ -91,7 +91,9 @@ impl SeerError {
     pub fn sanitized_message(&self) -> String {
         match self {
             SeerError::WhoisError(_) => "WHOIS lookup failed".to_string(),
-            SeerError::WhoisServerNotFound(_) => "WHOIS server not found for this TLD".to_string(),
+            SeerError::WhoisServerNotFound(detail) => {
+                format!("WHOIS server not found for this TLD: {}", detail)
+            }
             SeerError::WhoisConnectionFailed(_) => "WHOIS connection failed".to_string(),
             SeerError::RdapError(_) => "RDAP lookup failed".to_string(),
             SeerError::RdapBootstrapError(_) => {
