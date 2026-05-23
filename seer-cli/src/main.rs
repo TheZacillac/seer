@@ -851,10 +851,7 @@ async fn execute_command(
             use rand::RngCore;
 
             if bytes == 0 || bytes > 4096 {
-                eprintln!(
-                    "{} --bytes must be between 1 and 4096",
-                    "Error:".ctp_red()
-                );
+                eprintln!("{} --bytes must be between 1 and 4096", "Error:".ctp_red());
                 std::process::exit(2);
             }
             let mut buf = vec![0u8; bytes];
