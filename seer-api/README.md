@@ -157,12 +157,15 @@ seer-mcp
 
 ### Streamable HTTP transport
 
-Start the API server as usual; the MCP endpoint is at `POST /mcp`:
+Start the API server as usual; the MCP endpoint is at `POST /mcp`. Mint a
+fresh bearer token with the `seer` CLI:
 
 ```bash
-SEER_API_KEY=<token> seer-api
+eval "$(seer generate-key --export)"   # exports SEER_API_KEY
+seer-api
+
 curl -N -X POST http://127.0.0.1:8000/mcp \
-  -H "Authorization: Bearer <token>" \
+  -H "Authorization: Bearer $SEER_API_KEY" \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'

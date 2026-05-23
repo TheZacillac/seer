@@ -425,6 +425,18 @@ process and inherits `SEER_API_KEY` auth, request logging, and the body-size
 cap. See [seer-api/README.md](seer-api/README.md#streamable-http-transport)
 for the wire format.
 
+Generate a random bearer token for the connector:
+
+```bash
+# Capture into a shell var
+KEY=$(seer generate-key)
+
+# Or eval directly into the current shell
+eval "$(seer generate-key --export)"
+
+SEER_API_KEY=$KEY SEER_HOST=0.0.0.0 seer-api
+```
+
 **16 tools available:**
 
 | Tool | Description |

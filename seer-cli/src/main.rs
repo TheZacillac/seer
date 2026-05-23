@@ -242,6 +242,20 @@ enum Commands {
         #[arg(long)]
         init: bool,
     },
+    /// Generate a random API key for seer-api / MCP Streamable HTTP
+    ///
+    /// Plain mode prints just the token, so you can capture it:
+    ///   KEY=$(seer generate-key)
+    /// `--export` prints a shell line ready for `eval`:
+    ///   eval "$(seer generate-key --export)"
+    GenerateKey {
+        /// Print as `export SEER_API_KEY=...` for shell `eval`
+        #[arg(long)]
+        export: bool,
+        /// Number of random bytes (default: 32 = 256 bits of entropy)
+        #[arg(long, default_value_t = 32)]
+        bytes: usize,
+    },
     /// Inspect SSL certificate chain for a domain
     Ssl {
         /// Domain name to check
@@ -831,6 +845,26 @@ async fn execute_command(
         Commands::Completions { shell } => {
             let mut cmd = Cli::command();
             generate(shell, &mut cmd, "seer", &mut std::io::stdout());
+        }
+        Commands::GenerateKey { export, bytes } => {
+            use base64::Engine;
+            use rand::RngCore;
+
+            if bytes == 0 || bytes > 4096 {
+                eprintln!(
+                    "{} --bytes must be between 1 and 4096",
+                    "Error:".ctp_red()
+                );
+                std::process::exit(2);
+            }
+            let mut buf = vec![0u8; bytes];
+            rand::rngs::OsRng.fill_bytes(&mut buf);
+            let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&buf);
+            if export {
+                println!("export SEER_API_KEY={}", token);
+            } else {
+                println!("{}", token);
+            }
         }
         Commands::Config { init } => {
             if init {
