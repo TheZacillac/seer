@@ -417,6 +417,19 @@ impl Repl {
         match lookup.lookup_with_progress(domain, Some(progress)).await {
             Ok(result) => {
                 spinner.finish();
+                // Record to history (file I/O off the async executor),
+                // matching the non-REPL `Commands::Lookup` path. Without this
+                // the `history` REPL command always reports an empty file.
+                let domain_for_history = domain.to_string();
+                let result_for_history = result.clone();
+                tokio::task::spawn_blocking(move || {
+                    let mut history = seer_core::LookupHistory::load();
+                    history.record(&domain_for_history, result_for_history);
+                    let _ = history.save();
+                })
+                .await
+                .ok();
+
                 let formatter = seer_core::output::get_formatter(self.context.output_format);
                 println!("{}", formatter.format_lookup(&result));
                 CommandResult::Continue
@@ -812,9 +825,11 @@ impl Repl {
         clear_bulk_progress_bar();
         progress.finish_and_clear();
 
-        // Write results to CSV
+        // Write results to CSV atomically — a crash or disk-full mid-write
+        // must not leave a truncated CSV that downstream pipelines treat as
+        // authoritative.
         let csv_content = crate::utils::bulk_results_to_csv(&results, operation);
-        if let Err(e) = std::fs::write(&output_path, csv_content) {
+        if let Err(e) = crate::utils::atomic_write(&output_path, &csv_content) {
             return CommandResult::Error(format!("Failed to write output file: {}", e));
         }
 

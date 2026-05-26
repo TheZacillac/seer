@@ -1911,13 +1911,17 @@ impl OutputFormatter for HumanFormatter {
         output.push(format!(
             "  {}: {}",
             self.label("Method"),
-            self.value(&result.method)
+            self.value(&sanitize_display(&result.method))
         ));
         if let Some(ref details) = result.details {
+            // `details` in `decide_fallback` can interpolate raw `rdap_err`
+            // / `whois_err` strings — those originate from third-party
+            // servers and may contain ANSI escapes. Strip before display
+            // matching every other value-rendering site in this formatter.
             output.push(format!(
                 "  {}: {}",
                 self.label("Details"),
-                self.value(details)
+                self.value(&sanitize_display(details))
             ));
         }
 

@@ -133,6 +133,20 @@ pub fn classify_issuer(issuer: &str, policy: &CaaPolicy) -> IssuerCaaMatch {
         return IssuerCaaMatch::NoPolicy;
     }
 
+    // RFC 8659 §4.1: if any CAA record has the Issuer Critical flag (bit 7,
+    // 0x80) set AND its tag is unknown to us, the spec mandates that
+    // issuance be treated as forbidden — we cannot honor a critical
+    // property we don't understand. Surface that as `Mismatch` so callers
+    // see a non-permitted verdict.
+    const KNOWN_TAGS: &[&str] = &["issue", "issuewild", "iodef"];
+    let critical_unknown = policy
+        .records
+        .iter()
+        .any(|r| (r.flags & 0x80) != 0 && !KNOWN_TAGS.contains(&r.tag.as_str()));
+    if critical_unknown {
+        return IssuerCaaMatch::Mismatch;
+    }
+
     let issue_values: Vec<String> = policy
         .records
         .iter()
@@ -310,5 +324,86 @@ mod tests {
         assert!(!p.has_policy);
         assert!(p.issuer_match.is_none());
         assert_eq!(p.note, ISSUANCE_TIME_NOTE);
+    }
+
+    /// RFC 8659 §4.1: a CAA record carrying an unknown tag with the Issuer
+    /// Critical flag (bit 7 of `flags`) set MUST be treated as forbidding
+    /// issuance — we cannot honor a critical property we don't understand.
+    #[test]
+    fn classify_unknown_critical_tag_forces_mismatch() {
+        let policy = CaaPolicy {
+            records: vec![
+                // Valid issue that would otherwise match Let's Encrypt.
+                CaaRecord {
+                    flags: 0,
+                    tag: "issue".to_string(),
+                    value: "letsencrypt.org".to_string(),
+                },
+                // Unknown tag with critical flag — must veto issuance.
+                CaaRecord {
+                    flags: 0x80,
+                    tag: "auth".to_string(),
+                    value: "future-extension".to_string(),
+                },
+            ],
+            effective_domain: Some("example.com".to_string()),
+            has_policy: true,
+            issuer_match: None,
+            note: ISSUANCE_TIME_NOTE.to_string(),
+        };
+        assert_eq!(
+            classify_issuer("CN=R3, O=Let's Encrypt", &policy),
+            IssuerCaaMatch::Mismatch,
+            "critical unknown tag must veto otherwise-matching issue"
+        );
+    }
+
+    #[test]
+    fn classify_unknown_non_critical_tag_does_not_veto() {
+        // Same shape but flags = 0 (non-critical). Per RFC the unknown tag
+        // is ignored; the matching `issue` carries through.
+        let policy = CaaPolicy {
+            records: vec![
+                CaaRecord {
+                    flags: 0,
+                    tag: "issue".to_string(),
+                    value: "letsencrypt.org".to_string(),
+                },
+                CaaRecord {
+                    flags: 0,
+                    tag: "auth".to_string(),
+                    value: "future-extension".to_string(),
+                },
+            ],
+            effective_domain: Some("example.com".to_string()),
+            has_policy: true,
+            issuer_match: None,
+            note: ISSUANCE_TIME_NOTE.to_string(),
+        };
+        assert_eq!(
+            classify_issuer("CN=R3, O=Let's Encrypt", &policy),
+            IssuerCaaMatch::Permitted
+        );
+    }
+
+    #[test]
+    fn classify_critical_known_tag_does_not_veto() {
+        // A critical `issue` (a known tag) is just a normal critical-issue.
+        // It must NOT trip the unknown-critical veto.
+        let policy = CaaPolicy {
+            records: vec![CaaRecord {
+                flags: 0x80,
+                tag: "issue".to_string(),
+                value: "letsencrypt.org".to_string(),
+            }],
+            effective_domain: Some("example.com".to_string()),
+            has_policy: true,
+            issuer_match: None,
+            note: ISSUANCE_TIME_NOTE.to_string(),
+        };
+        assert_eq!(
+            classify_issuer("CN=R3, O=Let's Encrypt", &policy),
+            IssuerCaaMatch::Permitted
+        );
     }
 }

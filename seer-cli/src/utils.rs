@@ -2,6 +2,29 @@ use std::path::Path;
 
 use seer_core::bulk::{BulkOperation, BulkResult, BulkResultData};
 
+/// Write `content` to `path` atomically: write to a sibling `.tmp` file and
+/// then `rename` it over the destination. `rename` is atomic on POSIX, so a
+/// crash mid-write cannot leave the destination truncated. Mirrors the same
+/// pattern used by `seer_core::LookupHistory::save`.
+pub fn atomic_write<P: AsRef<Path>>(path: P, content: &str) -> std::io::Result<()> {
+    let path = path.as_ref();
+    let tmp_path = match path.extension() {
+        Some(ext) => {
+            let mut ext = ext.to_os_string();
+            ext.push(".tmp");
+            path.with_extension(ext)
+        }
+        None => path.with_extension("tmp"),
+    };
+    std::fs::write(&tmp_path, content)?;
+    if let Err(e) = std::fs::rename(&tmp_path, path) {
+        // Best-effort cleanup so we don't leave the `.tmp` behind.
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+    Ok(())
+}
+
 /// Maximum allowed size of a bulk input file, in bytes (1 MB).
 pub const MAX_BULK_FILE_SIZE: u64 = 1024 * 1024;
 

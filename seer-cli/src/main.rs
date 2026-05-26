@@ -697,9 +697,11 @@ async fn execute_command(
                 display::clear_bulk_progress_bar();
             }
 
-            // Convert results to CSV
+            // Convert results to CSV. Write atomically so a crash mid-write
+            // cannot leave a truncated CSV that downstream pipelines treat
+            // as authoritative.
             let csv_content = utils::bulk_results_to_csv(&results, &operation);
-            std::fs::write(&output_path, csv_content)?;
+            utils::atomic_write(&output_path, &csv_content)?;
 
             let success_count = results.iter().filter(|r| r.success).count();
             let fail_count = results.len() - success_count;

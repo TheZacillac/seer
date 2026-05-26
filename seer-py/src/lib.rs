@@ -5,7 +5,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
-use pyo3::exceptions::{PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyConnectionError, PyRuntimeError, PyTimeoutError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict};
 use pyo3::Py;
@@ -101,8 +101,12 @@ fn seer_err_to_py(e: &SeerError) -> PyErr {
         | InvalidIpAddress(_)
         | InvalidRecordType(_)
         | DomainNotAllowed { .. } => PyValueError::new_err(e.sanitized_message()),
-        Timeout(_) => PyRuntimeError::new_err(e.sanitized_message()),
-        RateLimited(_) => PyRuntimeError::new_err(e.sanitized_message()),
+        // Map transient categories to specific Python builtin exceptions so
+        // downstream consumers (MCP server, direct seer-py users) can do
+        // targeted `except TimeoutError` / `except ConnectionError` retries
+        // instead of catching the broad `RuntimeError` umbrella.
+        Timeout(_) => PyTimeoutError::new_err(e.sanitized_message()),
+        WhoisConnectionFailed { .. } => PyConnectionError::new_err(e.sanitized_message()),
         _ => PyRuntimeError::new_err(e.sanitized_message()),
     }
 }

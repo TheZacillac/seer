@@ -391,11 +391,25 @@ impl StatusClient {
 // Domain normalization and validation is now handled by the validation module
 
 /// Extracts the title from HTML content.
+///
+/// Strips ASCII control characters (NUL, ESC, etc.) at extraction time so
+/// the value is safe for every downstream sink — JSON (which would happily
+/// encode ` ` and pass it to an LLM via the MCP server), the human
+/// formatter (which sanitises again at render time), and the bulk-CSV
+/// writer. Without the strip, a crafted `<title>Foo\x00Bar</title>` reaches
+/// the LLM context window.
 fn extract_title(html: &str) -> Option<String> {
     TITLE_REGEX
         .captures(html)
         .and_then(|caps| caps.get(1))
-        .map(|m| m.as_str().trim().to_string())
+        .map(|m| {
+            m.as_str()
+                .chars()
+                .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
+                .collect::<String>()
+                .trim()
+                .to_string()
+        })
         .filter(|s| !s.is_empty())
 }
 

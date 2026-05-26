@@ -418,6 +418,20 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         return [TextContent(type="text", text=payload)]
     except ValueError as e:
         return [TextContent(type="text", text=f"Invalid input: {e}")]
+    except (TimeoutError, ConnectionError) as e:
+        # PyO3 maps SeerError::Timeout to TimeoutError and connection-class
+        # errors to ConnectionError. These are transient — surface a clear
+        # retryable signal so the host LLM can decide to back off and try
+        # again. We do not include the error text (which can carry server
+        # response data) — the binary classification is enough.
+        logger.warning("Tool %s failed with transient error: %s", name, e)
+        return [TextContent(type="text", text="Transient error — retry suggested.")]
+    except RuntimeError as e:
+        # PyO3 maps other SeerError variants (RateLimited, RdapBootstrapError,
+        # etc.) to RuntimeError. Most are transient at the network level even
+        # if the underlying cause varies; treat as retryable.
+        logger.warning("Tool %s failed with runtime error: %s", name, e)
+        return [TextContent(type="text", text="Transient error — retry suggested.")]
     except Exception:
         logger.exception("Tool %s failed", name)
         return [TextContent(type="text", text="An internal error occurred while processing your request.")]
