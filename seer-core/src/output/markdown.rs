@@ -5,6 +5,46 @@ use crate::lookup::LookupResult;
 use crate::rdap::RdapResponse;
 use crate::status::StatusResponse;
 use crate::whois::WhoisResponse;
+use std::fmt::{self, Write as _};
+
+/// `Display` adapter that renders attacker-controlled WHOIS/RDAP/DNS/SSL
+/// strings safely inside Markdown that will be forwarded to an LLM (via
+/// the MCP server). Strips ANSI escape sequences and ASCII control
+/// characters, collapses newlines/CR/tabs to spaces (so attacker text
+/// cannot break out of a table row or look like a new heading), and
+/// neutralizes backticks (so an attacker can't terminate a code span and
+/// inject Markdown structure).
+pub(super) struct MdSafe<'a>(pub &'a str);
+
+impl fmt::Display for MdSafe<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut iter = self.0.chars();
+        while let Some(c) = iter.next() {
+            match c {
+                '\x1b' => {
+                    // Consume the rest of the ANSI escape sequence (CSI or
+                    // OSC). The byte right after ESC is the introducer
+                    // (`[` for CSI, `]` for OSC, etc.) — skip it
+                    // unconditionally so it isn't treated as a terminator.
+                    // Then look for the terminator: CSI ends on a byte in
+                    // `@`-`~`; OSC ends on BEL (0x07) or ST. Cap
+                    // consumption defensively.
+                    let _ = iter.next();
+                    for inner in iter.by_ref().take(64) {
+                        if matches!(inner as u32, 0x40..=0x7E) || inner == '\x07' {
+                            break;
+                        }
+                    }
+                }
+                '\n' | '\r' | '\t' => f.write_str(" ")?,
+                '`' => f.write_str("'")?,
+                c if c.is_control() => {}
+                c => f.write_char(c)?,
+            }
+        }
+        Ok(())
+    }
+}
 
 /// Markdown output formatter that produces clean, readable Markdown.
 pub struct MarkdownFormatter;
@@ -32,13 +72,18 @@ impl MarkdownFormatter {
             out.push("*No CAA records (any CA may issue)*".to_string());
         } else {
             if let Some(ref eff) = caa.effective_domain {
-                out.push(format!("- **Found at**: `{}`", eff));
+                out.push(format!("- **Found at**: `{}`", MdSafe(eff)));
             }
             out.push(String::new());
             out.push("| Flags | Tag | Value |".to_string());
             out.push("| --- | --- | --- |".to_string());
             for r in &caa.records {
-                out.push(format!("| {} | `{}` | `{}` |", r.flags, r.tag, r.value));
+                out.push(format!(
+                    "| {} | `{}` | `{}` |",
+                    r.flags,
+                    MdSafe(&r.tag),
+                    MdSafe(&r.value)
+                ));
             }
         }
 
@@ -72,22 +117,22 @@ impl MarkdownFormatter {
         output.push(format!("### {}", label));
         output.push(String::new());
         if let Some(ref name) = contact.name {
-            output.push(format!("- **Name**: {}", name));
+            output.push(format!("- **Name**: {}", MdSafe(name)));
         }
         if let Some(ref org) = contact.organization {
-            output.push(format!("- **Organization**: {}", org));
+            output.push(format!("- **Organization**: {}", MdSafe(org)));
         }
         if let Some(ref email) = contact.email {
-            output.push(format!("- **Email**: `{}`", email));
+            output.push(format!("- **Email**: `{}`", MdSafe(email)));
         }
         if let Some(ref phone) = contact.phone {
-            output.push(format!("- **Phone**: {}", phone));
+            output.push(format!("- **Phone**: {}", MdSafe(phone)));
         }
         if let Some(ref address) = contact.address {
-            output.push(format!("- **Address**: {}", address));
+            output.push(format!("- **Address**: {}", MdSafe(address)));
         }
         if let Some(ref country) = contact.country {
-            output.push(format!("- **Country**: {}", country));
+            output.push(format!("- **Country**: {}", MdSafe(country)));
         }
     }
 
@@ -110,16 +155,16 @@ impl MarkdownFormatter {
         output.push(format!("### {}", label));
         output.push(String::new());
         if let Some(ref v) = *name {
-            output.push(format!("- **Name**: {}", v));
+            output.push(format!("- **Name**: {}", MdSafe(v)));
         }
         if let Some(ref v) = *organization {
-            output.push(format!("- **Organization**: {}", v));
+            output.push(format!("- **Organization**: {}", MdSafe(v)));
         }
         if let Some(ref v) = *email {
-            output.push(format!("- **Email**: `{}`", v));
+            output.push(format!("- **Email**: `{}`", MdSafe(v)));
         }
         if let Some(ref v) = *phone {
-            output.push(format!("- **Phone**: {}", v));
+            output.push(format!("- **Phone**: {}", MdSafe(v)));
         }
     }
 }
@@ -128,7 +173,7 @@ impl OutputFormatter for MarkdownFormatter {
     fn format_whois(&self, response: &WhoisResponse) -> String {
         let mut output = Vec::new();
 
-        output.push(format!("## WHOIS: {}", response.domain));
+        output.push(format!("## WHOIS: {}", MdSafe(&response.domain)));
         output.push(String::new());
 
         if response.is_available() {
@@ -137,13 +182,13 @@ impl OutputFormatter for MarkdownFormatter {
         }
 
         if let Some(ref registrar) = response.registrar {
-            output.push(format!("- **Registrar**: {}", registrar));
+            output.push(format!("- **Registrar**: {}", MdSafe(registrar)));
         }
         if let Some(ref registrant) = response.registrant {
-            output.push(format!("- **Registrant**: {}", registrant));
+            output.push(format!("- **Registrant**: {}", MdSafe(registrant)));
         }
         if let Some(ref organization) = response.organization {
-            output.push(format!("- **Organization**: {}", organization));
+            output.push(format!("- **Organization**: {}", MdSafe(organization)));
         }
 
         // Registrant contact details
@@ -157,16 +202,16 @@ impl OutputFormatter for MarkdownFormatter {
             output.push("### Registrant Contact".to_string());
             output.push(String::new());
             if let Some(ref email) = response.registrant_email {
-                output.push(format!("- **Email**: `{}`", email));
+                output.push(format!("- **Email**: `{}`", MdSafe(email)));
             }
             if let Some(ref phone) = response.registrant_phone {
-                output.push(format!("- **Phone**: {}", phone));
+                output.push(format!("- **Phone**: {}", MdSafe(phone)));
             }
             if let Some(ref address) = response.registrant_address {
-                output.push(format!("- **Address**: {}", address));
+                output.push(format!("- **Address**: {}", MdSafe(address)));
             }
             if let Some(ref country) = response.registrant_country {
-                output.push(format!("- **Country**: {}", country));
+                output.push(format!("- **Country**: {}", MdSafe(country)));
             }
         }
 
@@ -211,7 +256,7 @@ impl OutputFormatter for MarkdownFormatter {
                 response
                     .nameservers
                     .iter()
-                    .map(|ns| format!("`{}`", ns))
+                    .map(|ns| format!("`{}`", MdSafe(ns)))
                     .collect::<Vec<_>>()
                     .join(", ")
             ));
@@ -223,17 +268,20 @@ impl OutputFormatter for MarkdownFormatter {
                 response
                     .status
                     .iter()
-                    .map(|s| format!("`{}`", s))
+                    .map(|s| format!("`{}`", MdSafe(s)))
                     .collect::<Vec<_>>()
                     .join(", ")
             ));
         }
 
         if let Some(ref dnssec) = response.dnssec {
-            output.push(format!("- **DNSSEC**: {}", dnssec));
+            output.push(format!("- **DNSSEC**: {}", MdSafe(dnssec)));
         }
 
-        output.push(format!("- **WHOIS Server**: `{}`", response.whois_server));
+        output.push(format!(
+            "- **WHOIS Server**: `{}`",
+            MdSafe(&response.whois_server)
+        ));
 
         output.join("\n")
     }
@@ -245,20 +293,20 @@ impl OutputFormatter for MarkdownFormatter {
             .domain_name()
             .or(response.name.as_deref())
             .unwrap_or("Unknown");
-        output.push(format!("## RDAP: {}", name));
+        output.push(format!("## RDAP: {}", MdSafe(name)));
         output.push(String::new());
 
         if let Some(ref handle) = response.handle {
-            output.push(format!("- **Handle**: `{}`", handle));
+            output.push(format!("- **Handle**: `{}`", MdSafe(handle)));
         }
         if let Some(registrar) = response.get_registrar() {
-            output.push(format!("- **Registrar**: {}", registrar));
+            output.push(format!("- **Registrar**: {}", MdSafe(&registrar)));
         }
         if let Some(registrant) = response.get_registrant() {
-            output.push(format!("- **Registrant**: {}", registrant));
+            output.push(format!("- **Registrant**: {}", MdSafe(&registrant)));
         }
         if let Some(organization) = response.get_registrant_organization() {
-            output.push(format!("- **Organization**: {}", organization));
+            output.push(format!("- **Organization**: {}", MdSafe(&organization)));
         }
 
         // Contact sections
@@ -296,7 +344,7 @@ impl OutputFormatter for MarkdownFormatter {
                 response
                     .status
                     .iter()
-                    .map(|s| format!("`{}`", s))
+                    .map(|s| format!("`{}`", MdSafe(s)))
                     .collect::<Vec<_>>()
                     .join(", ")
             ));
@@ -308,7 +356,7 @@ impl OutputFormatter for MarkdownFormatter {
                 "- **Nameservers**: {}",
                 nameservers
                     .iter()
-                    .map(|ns| format!("`{}`", ns))
+                    .map(|ns| format!("`{}`", MdSafe(ns)))
                     .collect::<Vec<_>>()
                     .join(", ")
             ));
@@ -320,13 +368,13 @@ impl OutputFormatter for MarkdownFormatter {
 
         // IP-specific fields
         if let Some(ref start) = response.start_address {
-            output.push(format!("- **Start Address**: `{}`", start));
+            output.push(format!("- **Start Address**: `{}`", MdSafe(start)));
         }
         if let Some(ref end) = response.end_address {
-            output.push(format!("- **End Address**: `{}`", end));
+            output.push(format!("- **End Address**: `{}`", MdSafe(end)));
         }
         if let Some(ref country) = response.country {
-            output.push(format!("- **Country**: {}", country));
+            output.push(format!("- **Country**: {}", MdSafe(country)));
         }
 
         // ASN-specific fields
@@ -353,15 +401,23 @@ impl OutputFormatter for MarkdownFormatter {
 
         let domain = &records[0].name;
         let record_type = &records[0].record_type;
-        output.push(format!("## DNS {} Records: {}", record_type, domain));
+        output.push(format!(
+            "## DNS {} Records: {}",
+            record_type,
+            MdSafe(domain)
+        ));
         output.push(String::new());
         output.push("| Name | TTL | Type | Data |".to_string());
         output.push("| --- | --- | --- | --- |".to_string());
 
         for record in records {
+            let data_str = record.data.to_string();
             output.push(format!(
                 "| `{}` | {} | {} | `{}` |",
-                record.name, record.ttl, record.record_type, record.data
+                MdSafe(&record.name),
+                record.ttl,
+                record.record_type,
+                MdSafe(&data_str)
             ));
         }
 
@@ -376,7 +432,8 @@ impl OutputFormatter for MarkdownFormatter {
 
         output.push(format!(
             "## Propagation: {} {}",
-            result.domain, result.record_type
+            MdSafe(&result.domain),
+            result.record_type
         ));
         output.push(String::new());
 
@@ -405,7 +462,7 @@ impl OutputFormatter for MarkdownFormatter {
                 result
                     .consensus_values
                     .iter()
-                    .map(|v| format!("`{}`", v))
+                    .map(|v| format!("`{}`", MdSafe(v)))
                     .collect::<Vec<_>>()
                     .join(", ")
             ));
@@ -417,7 +474,7 @@ impl OutputFormatter for MarkdownFormatter {
             output.push("### Inconsistencies".to_string());
             output.push(String::new());
             for inconsistency in &result.inconsistencies {
-                output.push(format!("- {}", inconsistency));
+                output.push(format!("- {}", MdSafe(inconsistency)));
             }
         }
 
@@ -430,7 +487,9 @@ impl OutputFormatter for MarkdownFormatter {
                 let error_msg = unreachable.error.as_deref().unwrap_or("no response");
                 output.push(format!(
                     "- **{}** (`{}`): {}",
-                    unreachable.name, unreachable.ip, error_msg
+                    unreachable.name,
+                    unreachable.ip,
+                    MdSafe(error_msg)
                 ));
             }
         }
@@ -459,7 +518,11 @@ impl OutputFormatter for MarkdownFormatter {
 
             output.push(format!(
                 "| {} | {} | `{}` | `{}` | {}ms |",
-                sr.server.name, sr.server.location, sr.server.ip, result_str, sr.response_time_ms
+                sr.server.name,
+                sr.server.location,
+                sr.server.ip,
+                MdSafe(&result_str),
+                sr.response_time_ms
             ));
         }
 
@@ -483,7 +546,7 @@ impl OutputFormatter for MarkdownFormatter {
             LookupResult::Available { .. } => "availability",
         };
 
-        output.push(format!("## Lookup: {}", domain));
+        output.push(format!("## Lookup: {}", MdSafe(&domain)));
         output.push(String::new());
         output.push(format!("- **Source**: {}", source));
 
@@ -493,13 +556,13 @@ impl OutputFormatter for MarkdownFormatter {
                 whois_fallback,
             } => {
                 if let Some(registrar) = data.get_registrar() {
-                    output.push(format!("- **Registrar**: {}", registrar));
+                    output.push(format!("- **Registrar**: {}", MdSafe(&registrar)));
                 }
                 if let Some(registrant) = data.get_registrant() {
-                    output.push(format!("- **Registrant**: {}", registrant));
+                    output.push(format!("- **Registrant**: {}", MdSafe(&registrant)));
                 }
                 if let Some(organization) = data.get_registrant_organization() {
-                    output.push(format!("- **Organization**: {}", organization));
+                    output.push(format!("- **Organization**: {}", MdSafe(&organization)));
                 }
 
                 // Contact sections from RDAP
@@ -530,7 +593,7 @@ impl OutputFormatter for MarkdownFormatter {
                         "- **Status**: {}",
                         data.status
                             .iter()
-                            .map(|s| format!("`{}`", s))
+                            .map(|s| format!("`{}`", MdSafe(s)))
                             .collect::<Vec<_>>()
                             .join(", ")
                     ));
@@ -542,7 +605,7 @@ impl OutputFormatter for MarkdownFormatter {
                         "- **Nameservers**: {}",
                         nameservers
                             .iter()
-                            .map(|ns| format!("`{}`", ns))
+                            .map(|ns| format!("`{}`", MdSafe(ns)))
                             .collect::<Vec<_>>()
                             .join(", ")
                     ));
@@ -558,12 +621,12 @@ impl OutputFormatter for MarkdownFormatter {
 
                     if data.get_registrant().is_none() {
                         if let Some(ref registrant) = whois.registrant {
-                            extra.push(format!("- **Registrant**: {}", registrant));
+                            extra.push(format!("- **Registrant**: {}", MdSafe(registrant)));
                         }
                     }
                     if data.get_registrant_organization().is_none() {
                         if let Some(ref org) = whois.organization {
-                            extra.push(format!("- **Organization**: {}", org));
+                            extra.push(format!("- **Organization**: {}", MdSafe(org)));
                         }
                     }
 
@@ -582,16 +645,16 @@ impl OutputFormatter for MarkdownFormatter {
                             extra.push("### Registrant Contact".to_string());
                             extra.push(String::new());
                             if let Some(ref email) = whois.registrant_email {
-                                extra.push(format!("- **Email**: `{}`", email));
+                                extra.push(format!("- **Email**: `{}`", MdSafe(email)));
                             }
                             if let Some(ref phone) = whois.registrant_phone {
-                                extra.push(format!("- **Phone**: {}", phone));
+                                extra.push(format!("- **Phone**: {}", MdSafe(phone)));
                             }
                             if let Some(ref address) = whois.registrant_address {
-                                extra.push(format!("- **Address**: {}", address));
+                                extra.push(format!("- **Address**: {}", MdSafe(address)));
                             }
                             if let Some(ref country) = whois.registrant_country {
-                                extra.push(format!("- **Country**: {}", country));
+                                extra.push(format!("- **Country**: {}", MdSafe(country)));
                             }
                         }
                     }
@@ -607,16 +670,16 @@ impl OutputFormatter for MarkdownFormatter {
                             extra.push("### Admin Contact".to_string());
                             extra.push(String::new());
                             if let Some(ref name) = whois.admin_name {
-                                extra.push(format!("- **Name**: {}", name));
+                                extra.push(format!("- **Name**: {}", MdSafe(name)));
                             }
                             if let Some(ref org) = whois.admin_organization {
-                                extra.push(format!("- **Organization**: {}", org));
+                                extra.push(format!("- **Organization**: {}", MdSafe(org)));
                             }
                             if let Some(ref email) = whois.admin_email {
-                                extra.push(format!("- **Email**: `{}`", email));
+                                extra.push(format!("- **Email**: `{}`", MdSafe(email)));
                             }
                             if let Some(ref phone) = whois.admin_phone {
-                                extra.push(format!("- **Phone**: {}", phone));
+                                extra.push(format!("- **Phone**: {}", MdSafe(phone)));
                             }
                         }
                     }
@@ -632,16 +695,16 @@ impl OutputFormatter for MarkdownFormatter {
                             extra.push("### Tech Contact".to_string());
                             extra.push(String::new());
                             if let Some(ref name) = whois.tech_name {
-                                extra.push(format!("- **Name**: {}", name));
+                                extra.push(format!("- **Name**: {}", MdSafe(name)));
                             }
                             if let Some(ref org) = whois.tech_organization {
-                                extra.push(format!("- **Organization**: {}", org));
+                                extra.push(format!("- **Organization**: {}", MdSafe(org)));
                             }
                             if let Some(ref email) = whois.tech_email {
-                                extra.push(format!("- **Email**: `{}`", email));
+                                extra.push(format!("- **Email**: `{}`", MdSafe(email)));
                             }
                             if let Some(ref phone) = whois.tech_phone {
-                                extra.push(format!("- **Phone**: {}", phone));
+                                extra.push(format!("- **Phone**: {}", MdSafe(phone)));
                             }
                         }
                     }
@@ -652,12 +715,15 @@ impl OutputFormatter for MarkdownFormatter {
 
                     if !data.is_dnssec_signed() {
                         if let Some(ref dnssec) = whois.dnssec {
-                            extra.push(format!("- **DNSSEC**: {}", dnssec));
+                            extra.push(format!("- **DNSSEC**: {}", MdSafe(dnssec)));
                         }
                     }
 
                     if !whois.whois_server.is_empty() {
-                        extra.push(format!("- **WHOIS Server**: `{}`", whois.whois_server));
+                        extra.push(format!(
+                            "- **WHOIS Server**: `{}`",
+                            MdSafe(&whois.whois_server)
+                        ));
                     }
 
                     if !extra.is_empty() {
@@ -672,17 +738,17 @@ impl OutputFormatter for MarkdownFormatter {
                 data, rdap_error, ..
             } => {
                 if let Some(ref error) = rdap_error {
-                    output.push(format!("- **RDAP Error**: {}", error));
+                    output.push(format!("- **RDAP Error**: {}", MdSafe(error)));
                 }
 
                 if let Some(ref registrar) = data.registrar {
-                    output.push(format!("- **Registrar**: {}", registrar));
+                    output.push(format!("- **Registrar**: {}", MdSafe(registrar)));
                 }
                 if let Some(ref registrant) = data.registrant {
-                    output.push(format!("- **Registrant**: {}", registrant));
+                    output.push(format!("- **Registrant**: {}", MdSafe(registrant)));
                 }
                 if let Some(ref organization) = data.organization {
-                    output.push(format!("- **Organization**: {}", organization));
+                    output.push(format!("- **Organization**: {}", MdSafe(organization)));
                 }
 
                 // Registrant contact details
@@ -696,16 +762,16 @@ impl OutputFormatter for MarkdownFormatter {
                     output.push("### Registrant Contact".to_string());
                     output.push(String::new());
                     if let Some(ref email) = data.registrant_email {
-                        output.push(format!("- **Email**: `{}`", email));
+                        output.push(format!("- **Email**: `{}`", MdSafe(email)));
                     }
                     if let Some(ref phone) = data.registrant_phone {
-                        output.push(format!("- **Phone**: {}", phone));
+                        output.push(format!("- **Phone**: {}", MdSafe(phone)));
                     }
                     if let Some(ref address) = data.registrant_address {
-                        output.push(format!("- **Address**: {}", address));
+                        output.push(format!("- **Address**: {}", MdSafe(address)));
                     }
                     if let Some(ref country) = data.registrant_country {
-                        output.push(format!("- **Country**: {}", country));
+                        output.push(format!("- **Country**: {}", MdSafe(country)));
                     }
                 }
 
@@ -746,7 +812,7 @@ impl OutputFormatter for MarkdownFormatter {
                         "- **Status**: {}",
                         data.status
                             .iter()
-                            .map(|s| format!("`{}`", s))
+                            .map(|s| format!("`{}`", MdSafe(s)))
                             .collect::<Vec<_>>()
                             .join(", ")
                     ));
@@ -757,14 +823,14 @@ impl OutputFormatter for MarkdownFormatter {
                         "- **Nameservers**: {}",
                         data.nameservers
                             .iter()
-                            .map(|ns| format!("`{}`", ns))
+                            .map(|ns| format!("`{}`", MdSafe(ns)))
                             .collect::<Vec<_>>()
                             .join(", ")
                     ));
                 }
 
                 if let Some(ref dnssec) = data.dnssec {
-                    output.push(format!("- **DNSSEC**: {}", dnssec));
+                    output.push(format!("- **DNSSEC**: {}", MdSafe(dnssec)));
                 }
             }
             LookupResult::Available {
@@ -782,13 +848,13 @@ impl OutputFormatter for MarkdownFormatter {
                 output.push(format!("- **Confidence**: {}", data.confidence));
                 output.push(format!("- **Method**: {}", data.method));
                 if let Some(ref details) = data.details {
-                    output.push(format!("- **Details**: {}", details));
+                    output.push(format!("- **Details**: {}", MdSafe(details)));
                 }
                 if !rdap_error.is_empty() {
-                    output.push(format!("- **RDAP Error**: {}", rdap_error));
+                    output.push(format!("- **RDAP Error**: {}", MdSafe(rdap_error)));
                 }
                 if !whois_error.is_empty() {
-                    output.push(format!("- **WHOIS Error**: {}", whois_error));
+                    output.push(format!("- **WHOIS Error**: {}", MdSafe(whois_error)));
                 }
 
                 if let Some(w) = whois_data {
@@ -798,7 +864,7 @@ impl OutputFormatter for MarkdownFormatter {
                             "- **Nameservers**: {}",
                             w.nameservers
                                 .iter()
-                                .map(|ns| format!("`{}`", ns))
+                                .map(|ns| format!("`{}`", MdSafe(ns)))
                                 .collect::<Vec<_>>()
                                 .join(", ")
                         ));
@@ -808,16 +874,16 @@ impl OutputFormatter for MarkdownFormatter {
                             "- **Status**: {}",
                             w.status
                                 .iter()
-                                .map(|s| format!("`{}`", s))
+                                .map(|s| format!("`{}`", MdSafe(s)))
                                 .collect::<Vec<_>>()
                                 .join(", ")
                         ));
                     }
                     if let Some(ref dnssec) = w.dnssec {
-                        bullets.push(format!("- **DNSSEC**: {}", dnssec));
+                        bullets.push(format!("- **DNSSEC**: {}", MdSafe(dnssec)));
                     }
                     if !w.whois_server.is_empty() {
-                        bullets.push(format!("- **WHOIS Server**: `{}`", w.whois_server));
+                        bullets.push(format!("- **WHOIS Server**: `{}`", MdSafe(&w.whois_server)));
                     }
                     if !bullets.is_empty() {
                         output.push(String::new());
@@ -835,18 +901,22 @@ impl OutputFormatter for MarkdownFormatter {
     fn format_status(&self, response: &StatusResponse) -> String {
         let mut output = Vec::new();
 
-        output.push(format!("## Status: {}", response.domain));
+        output.push(format!("## Status: {}", MdSafe(&response.domain)));
         output.push(String::new());
 
         // HTTP Status
         if let Some(status) = response.http_status {
             let status_text = response.http_status_text.as_deref().unwrap_or("Unknown");
-            output.push(format!("- **HTTP Status**: `{}` ({})", status, status_text));
+            output.push(format!(
+                "- **HTTP Status**: `{}` ({})",
+                status,
+                MdSafe(status_text)
+            ));
         }
 
         // Site Title
         if let Some(ref title) = response.title {
-            output.push(format!("- **Site Title**: {}", title));
+            output.push(format!("- **Site Title**: {}", MdSafe(title)));
         }
 
         // SSL Certificate
@@ -854,8 +924,8 @@ impl OutputFormatter for MarkdownFormatter {
         if let Some(ref cert) = response.certificate {
             output.push("### SSL Certificate".to_string());
             output.push(String::new());
-            output.push(format!("- **Subject**: `{}`", cert.subject));
-            output.push(format!("- **Issuer**: {}", cert.issuer));
+            output.push(format!("- **Subject**: `{}`", MdSafe(&cert.subject)));
+            output.push(format!("- **Issuer**: {}", MdSafe(&cert.issuer)));
             output.push(format!(
                 "- **Status**: {}",
                 if cert.is_valid { "Valid" } else { "Invalid" }
@@ -885,7 +955,7 @@ impl OutputFormatter for MarkdownFormatter {
             output.push("### Domain Registration".to_string());
             output.push(String::new());
             if let Some(ref registrar) = expiry.registrar {
-                output.push(format!("- **Registrar**: {}", registrar));
+                output.push(format!("- **Registrar**: {}", MdSafe(registrar)));
             }
             output.push(format!(
                 "- **Expires**: `{}` ({} days)",
@@ -905,14 +975,14 @@ impl OutputFormatter for MarkdownFormatter {
             ));
 
             if let Some(ref cname) = dns.cname_target {
-                output.push(format!("- **CNAME**: `{}`", cname));
+                output.push(format!("- **CNAME**: `{}`", MdSafe(cname)));
             }
             if !dns.a_records.is_empty() {
                 output.push(format!(
                     "- **IPv4 (A)**: {}",
                     dns.a_records
                         .iter()
-                        .map(|ip| format!("`{}`", ip))
+                        .map(|ip| format!("`{}`", MdSafe(ip)))
                         .collect::<Vec<_>>()
                         .join(", ")
                 ));
@@ -922,7 +992,7 @@ impl OutputFormatter for MarkdownFormatter {
                     "- **IPv6 (AAAA)**: {}",
                     dns.aaaa_records
                         .iter()
-                        .map(|ip| format!("`{}`", ip))
+                        .map(|ip| format!("`{}`", MdSafe(ip)))
                         .collect::<Vec<_>>()
                         .join(", ")
                 ));
@@ -932,7 +1002,7 @@ impl OutputFormatter for MarkdownFormatter {
                     "- **Nameservers**: {}",
                     dns.nameservers
                         .iter()
-                        .map(|ns| format!("`{}`", ns))
+                        .map(|ns| format!("`{}`", MdSafe(ns)))
                         .collect::<Vec<_>>()
                         .join(", ")
                 ));
@@ -952,7 +1022,10 @@ impl OutputFormatter for MarkdownFormatter {
         if let Some(ref error) = iteration.error {
             return format!(
                 "[{}] Iteration {}/{}: **ERROR** - {}",
-                time_str, iteration.iteration, iteration.total_iterations, error
+                time_str,
+                iteration.iteration,
+                iteration.total_iterations,
+                MdSafe(error)
             );
         }
 
@@ -974,7 +1047,8 @@ impl OutputFormatter for MarkdownFormatter {
         let values_str = if values.is_empty() {
             String::new()
         } else {
-            format!(" `{}`", values.join(", "))
+            let joined = values.join(", ");
+            format!(" `{}`", MdSafe(&joined))
         };
 
         format!(
@@ -993,7 +1067,8 @@ impl OutputFormatter for MarkdownFormatter {
 
         output.push(format!(
             "## DNS Follow: {} {}",
-            result.domain, result.record_type
+            MdSafe(&result.domain),
+            result.record_type
         ));
         output.push(String::new());
 
@@ -1057,7 +1132,7 @@ impl OutputFormatter for MarkdownFormatter {
     fn format_availability(&self, result: &crate::availability::AvailabilityResult) -> String {
         let mut output = Vec::new();
 
-        output.push(format!("## Availability: {}", result.domain));
+        output.push(format!("## Availability: {}", MdSafe(&result.domain)));
         output.push(String::new());
 
         let avail_str = if result.available {
@@ -1069,7 +1144,7 @@ impl OutputFormatter for MarkdownFormatter {
         output.push(format!("- **Confidence**: {}", result.confidence));
         output.push(format!("- **Method**: {}", result.method));
         if let Some(ref details) = result.details {
-            output.push(format!("- **Details**: {}", details));
+            output.push(format!("- **Details**: {}", MdSafe(details)));
         }
 
         output.join("\n")
@@ -1078,23 +1153,25 @@ impl OutputFormatter for MarkdownFormatter {
     fn format_tld(&self, info: &crate::tld::TldInfo) -> String {
         let mut output = Vec::new();
 
-        output.push(format!("## TLD Info: .{}", info.tld));
+        output.push(format!("## TLD Info: .{}", MdSafe(&info.tld)));
         output.push(String::new());
 
-        output.push(format!("- **Type**: {}", info.tld_type));
+        output.push(format!("- **Type**: {}", MdSafe(&info.tld_type)));
 
         match info.whois_server {
-            Some(ref server) => output.push(format!("- **WHOIS Server**: `{}`", server)),
+            Some(ref server) => {
+                output.push(format!("- **WHOIS Server**: `{}`", MdSafe(server)));
+            }
             None => output.push("- **WHOIS Server**: *not available*".to_string()),
         }
 
         match info.rdap_url {
-            Some(ref url) => output.push(format!("- **RDAP URL**: `{}`", url)),
+            Some(ref url) => output.push(format!("- **RDAP URL**: `{}`", MdSafe(url))),
             None => output.push("- **RDAP URL**: *not available*".to_string()),
         }
 
         match info.registry_url {
-            Some(ref url) => output.push(format!("- **Registry URL**: {}", url)),
+            Some(ref url) => output.push(format!("- **Registry URL**: {}", MdSafe(url))),
             None => output.push("- **Registry URL**: *not available*".to_string()),
         }
 
@@ -1104,10 +1181,10 @@ impl OutputFormatter for MarkdownFormatter {
     fn format_dnssec(&self, report: &crate::dns::DnssecReport) -> String {
         let mut output = Vec::new();
 
-        output.push(format!("## DNSSEC: {}", report.domain));
+        output.push(format!("## DNSSEC: {}", MdSafe(&report.domain)));
         output.push(String::new());
 
-        output.push(format!("- **Status**: `{}`", report.status));
+        output.push(format!("- **Status**: `{}`", MdSafe(&report.status)));
         output.push(format!(
             "- **Chain Valid**: {}",
             if report.chain_valid { "yes" } else { "no" }
@@ -1165,7 +1242,7 @@ impl OutputFormatter for MarkdownFormatter {
             output.push("### Issues".to_string());
             output.push(String::new());
             for issue in &report.issues {
-                output.push(format!("- {}", issue));
+                output.push(format!("- {}", MdSafe(issue)));
             }
         }
 
@@ -1177,7 +1254,8 @@ impl OutputFormatter for MarkdownFormatter {
 
         output.push(format!(
             "## DNS Comparison: {} {}",
-            comparison.domain, comparison.record_type
+            MdSafe(&comparison.domain),
+            comparison.record_type
         ));
         output.push(String::new());
 
@@ -1189,33 +1267,41 @@ impl OutputFormatter for MarkdownFormatter {
         output.push(String::new());
 
         // Server A
-        output.push(format!("### Server A ({})", comparison.server_a.nameserver));
+        output.push(format!(
+            "### Server A ({})",
+            MdSafe(&comparison.server_a.nameserver)
+        ));
         output.push(String::new());
         if let Some(ref err) = comparison.server_a.error {
-            output.push(format!("**Error**: {}", err));
+            output.push(format!("**Error**: {}", MdSafe(err)));
         } else if comparison.server_a.records.is_empty() {
             output.push("*No records found*".to_string());
         } else {
             output.push("| Record |".to_string());
             output.push("| --- |".to_string());
             for record in &comparison.server_a.records {
-                output.push(format!("| `{}` |", record.format_short()));
+                let s = record.format_short();
+                output.push(format!("| `{}` |", MdSafe(&s)));
             }
         }
         output.push(String::new());
 
         // Server B
-        output.push(format!("### Server B ({})", comparison.server_b.nameserver));
+        output.push(format!(
+            "### Server B ({})",
+            MdSafe(&comparison.server_b.nameserver)
+        ));
         output.push(String::new());
         if let Some(ref err) = comparison.server_b.error {
-            output.push(format!("**Error**: {}", err));
+            output.push(format!("**Error**: {}", MdSafe(err)));
         } else if comparison.server_b.records.is_empty() {
             output.push("*No records found*".to_string());
         } else {
             output.push("| Record |".to_string());
             output.push("| --- |".to_string());
             for record in &comparison.server_b.records {
-                output.push(format!("| `{}` |", record.format_short()));
+                let s = record.format_short();
+                output.push(format!("| `{}` |", MdSafe(&s)));
             }
         }
         output.push(String::new());
@@ -1232,7 +1318,7 @@ impl OutputFormatter for MarkdownFormatter {
                 comparison
                     .common
                     .iter()
-                    .map(|r| format!("`{}`", r))
+                    .map(|r| format!("`{}`", MdSafe(r)))
                     .collect::<Vec<_>>()
                     .join(", ")
             ));
@@ -1241,16 +1327,16 @@ impl OutputFormatter for MarkdownFormatter {
         if comparison.only_in_a.is_empty() {
             output.push(format!(
                 "- **Only in {}**: *(none)*",
-                comparison.server_a.nameserver
+                MdSafe(&comparison.server_a.nameserver)
             ));
         } else {
             output.push(format!(
                 "- **Only in {}**: {}",
-                comparison.server_a.nameserver,
+                MdSafe(&comparison.server_a.nameserver),
                 comparison
                     .only_in_a
                     .iter()
-                    .map(|r| format!("`{}`", r))
+                    .map(|r| format!("`{}`", MdSafe(r)))
                     .collect::<Vec<_>>()
                     .join(", ")
             ));
@@ -1259,16 +1345,16 @@ impl OutputFormatter for MarkdownFormatter {
         if comparison.only_in_b.is_empty() {
             output.push(format!(
                 "- **Only in {}**: *(none)*",
-                comparison.server_b.nameserver
+                MdSafe(&comparison.server_b.nameserver)
             ));
         } else {
             output.push(format!(
                 "- **Only in {}**: {}",
-                comparison.server_b.nameserver,
+                MdSafe(&comparison.server_b.nameserver),
                 comparison
                     .only_in_b
                     .iter()
-                    .map(|r| format!("`{}`", r))
+                    .map(|r| format!("`{}`", MdSafe(r)))
                     .collect::<Vec<_>>()
                     .join(", ")
             ));
@@ -1280,9 +1366,9 @@ impl OutputFormatter for MarkdownFormatter {
     fn format_subdomains(&self, result: &crate::subdomains::SubdomainResult) -> String {
         let mut output = Vec::new();
 
-        output.push(format!("## Subdomains: {}", result.domain));
+        output.push(format!("## Subdomains: {}", MdSafe(&result.domain)));
         output.push(String::new());
-        output.push(format!("- **Source**: {}", result.source));
+        output.push(format!("- **Source**: {}", MdSafe(&result.source)));
         output.push(format!("- **Count**: {}", result.count));
         output.push(String::new());
 
@@ -1290,7 +1376,7 @@ impl OutputFormatter for MarkdownFormatter {
             output.push("*No subdomains found*".to_string());
         } else {
             for subdomain in &result.subdomains {
-                output.push(format!("- `{}`", subdomain));
+                output.push(format!("- `{}`", MdSafe(subdomain)));
             }
         }
 
@@ -1301,45 +1387,70 @@ impl OutputFormatter for MarkdownFormatter {
         let dash = "\u{2014}";
         let mut output = Vec::new();
 
+        // Helper for "value or dash"; wraps attacker-controlled value in MdSafe.
+        let opt_or_dash = |o: &Option<String>| -> String {
+            match o {
+                Some(v) => format!("{}", MdSafe(v)),
+                None => dash.to_string(),
+            }
+        };
+        let list_or_dash = |v: &Vec<String>| -> String {
+            if v.is_empty() {
+                dash.to_string()
+            } else {
+                let joined = v.join("`, `");
+                format!("`{}`", MdSafe(&joined))
+            }
+        };
+
         output.push(format!(
             "## Domain Comparison: {} vs {}",
-            diff.domain_a, diff.domain_b
+            MdSafe(&diff.domain_a),
+            MdSafe(&diff.domain_b)
         ));
         output.push(String::new());
 
         // Registration table
         output.push("### Registration".to_string());
         output.push(String::new());
-        output.push(format!("| Field | {} | {} |", diff.domain_a, diff.domain_b));
+        output.push(format!(
+            "| Field | {} | {} |",
+            MdSafe(&diff.domain_a),
+            MdSafe(&diff.domain_b)
+        ));
         output.push("| --- | --- | --- |".to_string());
 
         let reg = &diff.registration;
         output.push(format!(
             "| Registrar | {} | {} |",
-            reg.registrar.0.as_deref().unwrap_or(dash),
-            reg.registrar.1.as_deref().unwrap_or(dash)
+            opt_or_dash(&reg.registrar.0),
+            opt_or_dash(&reg.registrar.1)
         ));
         output.push(format!(
             "| Organization | {} | {} |",
-            reg.organization.0.as_deref().unwrap_or(dash),
-            reg.organization.1.as_deref().unwrap_or(dash)
+            opt_or_dash(&reg.organization.0),
+            opt_or_dash(&reg.organization.1)
         ));
         output.push(format!(
             "| Created | {} | {} |",
-            reg.created.0.as_deref().unwrap_or(dash),
-            reg.created.1.as_deref().unwrap_or(dash)
+            opt_or_dash(&reg.created.0),
+            opt_or_dash(&reg.created.1)
         ));
         output.push(format!(
             "| Expires | {} | {} |",
-            reg.expires.0.as_deref().unwrap_or(dash),
-            reg.expires.1.as_deref().unwrap_or(dash)
+            opt_or_dash(&reg.expires.0),
+            opt_or_dash(&reg.expires.1)
         ));
 
         // DNS table
         output.push(String::new());
         output.push("### DNS".to_string());
         output.push(String::new());
-        output.push(format!("| Field | {} | {} |", diff.domain_a, diff.domain_b));
+        output.push(format!(
+            "| Field | {} | {} |",
+            MdSafe(&diff.domain_a),
+            MdSafe(&diff.domain_b)
+        ));
         output.push("| --- | --- | --- |".to_string());
         let dns = &diff.dns;
         output.push(format!(
@@ -1347,45 +1458,33 @@ impl OutputFormatter for MarkdownFormatter {
             if dns.resolves.0 { "yes" } else { "no" },
             if dns.resolves.1 { "yes" } else { "no" }
         ));
-        let a_recs_a = if dns.a_records.0.is_empty() {
-            dash.to_string()
-        } else {
-            format!("`{}`", dns.a_records.0.join("`, `"))
-        };
-        let a_recs_b = if dns.a_records.1.is_empty() {
-            dash.to_string()
-        } else {
-            format!("`{}`", dns.a_records.1.join("`, `"))
-        };
+        let a_recs_a = list_or_dash(&dns.a_records.0);
+        let a_recs_b = list_or_dash(&dns.a_records.1);
         output.push(format!("| A Records | {} | {} |", a_recs_a, a_recs_b));
-        let ns_a = if dns.nameservers.0.is_empty() {
-            dash.to_string()
-        } else {
-            format!("`{}`", dns.nameservers.0.join("`, `"))
-        };
-        let ns_b = if dns.nameservers.1.is_empty() {
-            dash.to_string()
-        } else {
-            format!("`{}`", dns.nameservers.1.join("`, `"))
-        };
+        let ns_a = list_or_dash(&dns.nameservers.0);
+        let ns_b = list_or_dash(&dns.nameservers.1);
         output.push(format!("| Nameservers | {} | {} |", ns_a, ns_b));
 
         // SSL table
         output.push(String::new());
         output.push("### SSL".to_string());
         output.push(String::new());
-        output.push(format!("| Field | {} | {} |", diff.domain_a, diff.domain_b));
+        output.push(format!(
+            "| Field | {} | {} |",
+            MdSafe(&diff.domain_a),
+            MdSafe(&diff.domain_b)
+        ));
         output.push("| --- | --- | --- |".to_string());
         let ssl = &diff.ssl;
         output.push(format!(
             "| Issuer | {} | {} |",
-            ssl.issuer.0.as_deref().unwrap_or(dash),
-            ssl.issuer.1.as_deref().unwrap_or(dash)
+            opt_or_dash(&ssl.issuer.0),
+            opt_or_dash(&ssl.issuer.1)
         ));
         output.push(format!(
             "| Valid Until | {} | {} |",
-            ssl.valid_until.0.as_deref().unwrap_or(dash),
-            ssl.valid_until.1.as_deref().unwrap_or(dash)
+            opt_or_dash(&ssl.valid_until.0),
+            opt_or_dash(&ssl.valid_until.1)
         ));
         output.push(format!(
             "| Days Remaining | {} | {} |",
@@ -1418,7 +1517,7 @@ impl OutputFormatter for MarkdownFormatter {
     fn format_ssl(&self, report: &crate::ssl::SslReport) -> String {
         let mut output = Vec::new();
 
-        output.push(format!("## SSL Report: {}", report.domain));
+        output.push(format!("## SSL Report: {}", MdSafe(&report.domain)));
         output.push(String::new());
 
         output.push(format!(
@@ -1431,7 +1530,7 @@ impl OutputFormatter for MarkdownFormatter {
         ));
 
         if let Some(ref proto) = report.protocol_version {
-            output.push(format!("- **Protocol**: {}", proto));
+            output.push(format!("- **Protocol**: {}", MdSafe(proto)));
         }
 
         if !report.san_names.is_empty() {
@@ -1440,7 +1539,7 @@ impl OutputFormatter for MarkdownFormatter {
                 report
                     .san_names
                     .iter()
-                    .map(|s| format!("`{}`", s))
+                    .map(|s| format!("`{}`", MdSafe(s)))
                     .collect::<Vec<_>>()
                     .join(", ")
             ));
@@ -1454,15 +1553,15 @@ impl OutputFormatter for MarkdownFormatter {
             output.push("| --- | --- | --- | --- | --- |".to_string());
             for (i, cert) in report.chain.iter().enumerate() {
                 let key_info = match (&cert.key_type, cert.key_bits) {
-                    (Some(kt), Some(bits)) => format!("{} ({} bits)", kt, bits),
-                    (Some(kt), None) => kt.clone(),
+                    (Some(kt), Some(bits)) => format!("{} ({} bits)", MdSafe(kt), bits),
+                    (Some(kt), None) => format!("{}", MdSafe(kt)),
                     _ => "N/A".to_string(),
                 };
                 output.push(format!(
                     "| {} | {} | {} | {} | {} |",
                     i,
-                    cert.subject,
-                    cert.issuer,
+                    MdSafe(&cert.subject),
+                    MdSafe(&cert.issuer),
                     cert.valid_until.format("%Y-%m-%d"),
                     key_info
                 ));
@@ -1520,7 +1619,12 @@ impl OutputFormatter for MarkdownFormatter {
             };
             output.push(format!(
                 "| {} | {} | {} | {} | {} | {} |",
-                icon, r.domain, ssl, dom, http, issues
+                icon,
+                MdSafe(&r.domain),
+                ssl,
+                dom,
+                http,
+                MdSafe(&issues)
             ));
         }
 
@@ -1537,7 +1641,15 @@ impl OutputFormatter for MarkdownFormatter {
             crate::domain_info::DomainInfoSource::Available => "available",
         };
 
-        output.push(format!("## Domain Info: {}", info.domain));
+        // Helper: render Option<String> via MdSafe or fall back to "-".
+        let opt_md = |o: &Option<String>| -> String {
+            match o {
+                Some(v) => format!("{}", MdSafe(v)),
+                None => "-".to_string(),
+            }
+        };
+
+        output.push(format!("## Domain Info: {}", MdSafe(&info.domain)));
         output.push(String::new());
         output.push(format!("**Source:** {}", source_str));
         output.push(String::new());
@@ -1547,18 +1659,9 @@ impl OutputFormatter for MarkdownFormatter {
         output.push(String::new());
         output.push("| Field | Value |".to_string());
         output.push("| --- | --- |".to_string());
-        output.push(format!(
-            "| Registrar | {} |",
-            info.registrar.as_deref().unwrap_or("-")
-        ));
-        output.push(format!(
-            "| Registrant | {} |",
-            info.registrant.as_deref().unwrap_or("-")
-        ));
-        output.push(format!(
-            "| Organization | {} |",
-            info.organization.as_deref().unwrap_or("-")
-        ));
+        output.push(format!("| Registrar | {} |", opt_md(&info.registrar)));
+        output.push(format!("| Registrant | {} |", opt_md(&info.registrant)));
+        output.push(format!("| Organization | {} |", opt_md(&info.organization)));
         output.push(format!(
             "| Created | {} |",
             info.creation_date
@@ -1587,7 +1690,7 @@ impl OutputFormatter for MarkdownFormatter {
             } else {
                 info.nameservers
                     .iter()
-                    .map(|ns| format!("`{}`", ns))
+                    .map(|ns| format!("`{}`", MdSafe(ns)))
                     .collect::<Vec<_>>()
                     .join(", ")
             }
@@ -1599,15 +1702,12 @@ impl OutputFormatter for MarkdownFormatter {
             } else {
                 info.status
                     .iter()
-                    .map(|s| format!("`{}`", s))
+                    .map(|s| format!("`{}`", MdSafe(s)))
                     .collect::<Vec<_>>()
                     .join(", ")
             }
         ));
-        output.push(format!(
-            "| DNSSEC | {} |",
-            info.dnssec.as_deref().unwrap_or("-")
-        ));
+        output.push(format!("| DNSSEC | {} |", opt_md(&info.dnssec)));
 
         // Contacts table
         let has_any_contact = info.registrant_email.is_some()
@@ -1637,8 +1737,8 @@ impl OutputFormatter for MarkdownFormatter {
             if has_registrant {
                 output.push(format!(
                     "| Registrant | - | - | {} | {} |",
-                    info.registrant_email.as_deref().unwrap_or("-"),
-                    info.registrant_phone.as_deref().unwrap_or("-"),
+                    opt_md(&info.registrant_email),
+                    opt_md(&info.registrant_phone),
                 ));
             }
 
@@ -1649,10 +1749,10 @@ impl OutputFormatter for MarkdownFormatter {
             if has_admin {
                 output.push(format!(
                     "| Admin | {} | {} | {} | {} |",
-                    info.admin_name.as_deref().unwrap_or("-"),
-                    info.admin_organization.as_deref().unwrap_or("-"),
-                    info.admin_email.as_deref().unwrap_or("-"),
-                    info.admin_phone.as_deref().unwrap_or("-"),
+                    opt_md(&info.admin_name),
+                    opt_md(&info.admin_organization),
+                    opt_md(&info.admin_email),
+                    opt_md(&info.admin_phone),
                 ));
             }
 
@@ -1663,10 +1763,10 @@ impl OutputFormatter for MarkdownFormatter {
             if has_tech {
                 output.push(format!(
                     "| Tech | {} | {} | {} | {} |",
-                    info.tech_name.as_deref().unwrap_or("-"),
-                    info.tech_organization.as_deref().unwrap_or("-"),
-                    info.tech_email.as_deref().unwrap_or("-"),
-                    info.tech_phone.as_deref().unwrap_or("-"),
+                    opt_md(&info.tech_name),
+                    opt_md(&info.tech_organization),
+                    opt_md(&info.tech_email),
+                    opt_md(&info.tech_phone),
                 ));
             }
         }
@@ -1678,10 +1778,10 @@ impl OutputFormatter for MarkdownFormatter {
             output.push("### Protocol Metadata".to_string());
             output.push(String::new());
             if let Some(ref whois_server) = info.whois_server {
-                output.push(format!("- **WHOIS Server**: `{}`", whois_server));
+                output.push(format!("- **WHOIS Server**: `{}`", MdSafe(whois_server)));
             }
             if let Some(ref rdap_url) = info.rdap_url {
-                output.push(format!("- **RDAP URL**: `{}`", rdap_url));
+                output.push(format!("- **RDAP URL**: `{}`", MdSafe(rdap_url)));
             }
         }
 
@@ -1748,5 +1848,130 @@ mod tests {
         assert!(output.contains("## Availability: test.com"));
         assert!(output.contains("**AVAILABLE**"));
         assert!(output.contains("high"));
+    }
+
+    // --- MdSafe sanitization tests -----------------------------------------
+
+    fn md(s: &str) -> String {
+        format!("{}", MdSafe(s))
+    }
+
+    #[test]
+    fn test_mdsafe_strips_ansi_escape() {
+        assert_eq!(md("\x1b[31mfoo\x1b[0m"), "foo");
+    }
+
+    #[test]
+    fn test_mdsafe_collapses_newlines_cr_tab() {
+        assert_eq!(md("a\nb"), "a b");
+        assert_eq!(md("a\rb"), "a b");
+        assert_eq!(md("a\tb"), "a b");
+        // CRLF becomes two spaces (each replaced individually); that's fine —
+        // the goal is to prevent breaking the line, not perfect whitespace.
+        assert_eq!(md("a\r\nb"), "a  b");
+    }
+
+    #[test]
+    fn test_mdsafe_neutralizes_backticks() {
+        assert_eq!(md("`bad`"), "'bad'");
+        assert_eq!(md("a `b` c"), "a 'b' c");
+    }
+
+    #[test]
+    fn test_mdsafe_drops_other_control_chars() {
+        // NUL and DEL must vanish entirely.
+        assert_eq!(md("a\0b\x7fc"), "abc");
+    }
+
+    #[test]
+    fn test_mdsafe_preserves_unicode() {
+        assert_eq!(md("café — résumé"), "café — résumé");
+    }
+
+    fn empty_whois(domain: &str) -> WhoisResponse {
+        WhoisResponse {
+            domain: domain.to_string(),
+            registrar: None,
+            registrant: None,
+            organization: None,
+            registrant_email: None,
+            registrant_phone: None,
+            registrant_address: None,
+            registrant_country: None,
+            admin_name: None,
+            admin_organization: None,
+            admin_email: None,
+            admin_phone: None,
+            tech_name: None,
+            tech_organization: None,
+            tech_email: None,
+            tech_phone: None,
+            creation_date: None,
+            expiration_date: None,
+            updated_date: None,
+            nameservers: vec![],
+            status: vec!["clientTransferProhibited".to_string()],
+            dnssec: None,
+            whois_server: "whois.example.invalid".to_string(),
+            raw_response: String::new(),
+        }
+    }
+
+    #[test]
+    fn test_markdown_whois_registrar_newline_neutralized() {
+        let mut w = empty_whois("example.com");
+        w.registrar = Some("Foo\nIgnore previous".to_string());
+        let output = MarkdownFormatter::new().format_whois(&w);
+        // Newline must be collapsed to a single space so attacker text can't
+        // start a new Markdown line / heading.
+        assert!(
+            output.contains("- **Registrar**: Foo Ignore previous"),
+            "expected sanitized registrar in output:\n{}",
+            output
+        );
+        // Make sure the literal newline did not survive inside the registrar
+        // value: split on lines and check no line starts with "Ignore".
+        for line in output.lines() {
+            assert!(
+                !line.trim_start().starts_with("Ignore previous"),
+                "attacker payload broke onto its own line:\n{}",
+                output
+            );
+        }
+    }
+
+    #[test]
+    fn test_markdown_rdap_entity_name_backtick_neutralized() {
+        use crate::rdap::RdapResponse;
+
+        // Construct via serde JSON to avoid needing to import the private
+        // `RdapEntity` type. `get_registrar()` falls back to `handle` when
+        // there is no vCard `fn` property.
+        let json = serde_json::json!({
+            "ldhName": "example.com",
+            "entities": [
+                {
+                    "objectClassName": "entity",
+                    "handle": "Evil`Registrar`Co",
+                    "roles": ["registrar"],
+                }
+            ]
+        });
+        let response: RdapResponse = serde_json::from_value(json).unwrap();
+
+        let output = MarkdownFormatter::new().format_rdap(&response);
+        // Backtick must be rendered as a single quote, not as a literal
+        // backtick (which could close the surrounding code span and let an
+        // attacker inject Markdown).
+        assert!(
+            output.contains("- **Registrar**: Evil'Registrar'Co"),
+            "expected backticks neutralized in RDAP output:\n{}",
+            output
+        );
+        assert!(
+            !output.contains("Evil`Registrar`Co"),
+            "raw backticks survived into output:\n{}",
+            output
+        );
     }
 }
