@@ -235,11 +235,7 @@ pub fn bulk_results_to_csv(results: &[BulkResult], operation: &str) -> String {
                     Some(BulkResultData::Lookup(seer_core::lookup::LookupResult::Available {
                         data,
                         ..
-                    })) => match data.confidence.as_str() {
-                        "high" => "available",
-                        "medium" => "likely_available",
-                        _ => "unknown",
-                    },
+                    })) => data.verdict(),
                     _ => "",
                 };
                 let availability_verdict = escape_csv_field(availability_verdict);

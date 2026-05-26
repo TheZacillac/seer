@@ -893,9 +893,11 @@ impl OutputFormatter for HumanFormatter {
         let header_suffix = match result {
             LookupResult::Rdap { .. } => "via RDAP".to_string(),
             LookupResult::Whois { .. } => "via WHOIS".to_string(),
-            LookupResult::Available { data, .. } => match data.confidence.as_str() {
-                "high" => "available".to_string(),
-                "medium" => "likely available".to_string(),
+            LookupResult::Available { data, .. } => match data.verdict() {
+                "available" => "available".to_string(),
+                "likely_available" => "likely available".to_string(),
+                "registered" => "registered".to_string(),
+                "likely_registered" => "likely registered".to_string(),
                 _ => "status unknown".to_string(),
             },
         };
@@ -1478,13 +1480,17 @@ impl OutputFormatter for HumanFormatter {
                     self.warning(source_note)
                 ));
 
-                let verdict_colored = match data.confidence.as_str() {
-                    "high" => self.success("AVAILABLE"),
-                    "medium" => self.warning("MAY BE AVAILABLE"),
+                let verdict_colored = match data.verdict() {
+                    "available" => self.success("AVAILABLE"),
+                    "likely_available" => self.warning("MAY BE AVAILABLE"),
+                    "registered" => self.value("REGISTERED"),
+                    "likely_registered" => self.warning("LIKELY REGISTERED"),
                     _ => self.error("UNKNOWN"),
                 };
                 output.push(format!("  {}: {}", self.label("Verdict"), verdict_colored));
 
+                // Confidence colouring is purely about certainty, independent of
+                // the registered/available answer.
                 let confidence_colored = match data.confidence.as_str() {
                     "high" => self.success(&data.confidence),
                     "medium" => self.warning(&data.confidence),
@@ -2509,6 +2515,8 @@ impl OutputFormatter for HumanFormatter {
             let colored = match verdict.as_str() {
                 "available" => self.success("AVAILABLE"),
                 "likely_available" => self.warning("MAY BE AVAILABLE"),
+                "registered" => self.value("REGISTERED"),
+                "likely_registered" => self.warning("LIKELY REGISTERED"),
                 _ => self.error("UNKNOWN"),
             };
             output.push(format!("  {}: {}", self.label("Status"), colored));
@@ -3544,6 +3552,77 @@ mod tests {
             "right-side value must appear exactly once:\n{}",
             out
         );
+    }
+
+    fn availability_lookup(available: bool, confidence: &str) -> LookupResult {
+        LookupResult::Available {
+            data: Box::new(crate::availability::AvailabilityResult {
+                domain: "myroyalcanin.lv".to_string(),
+                available,
+                confidence: confidence.to_string(),
+                method: "whois".to_string(),
+                details: None,
+            }),
+            rdap_error: "bootstrap failed".to_string(),
+            whois_error: String::new(),
+            whois_data: None,
+        }
+    }
+
+    #[test]
+    fn format_lookup_registered_high_confidence_does_not_say_available() {
+        // Regression: a `LookupResult::Available` with `available: false` was
+        // previously rendered as "AVAILABLE" because the formatter branched on
+        // `confidence` alone. See myroyalcanin.lv investigation.
+        let f = formatter();
+        let out = f.format_lookup(&availability_lookup(false, "high"));
+        assert!(
+            !out.contains("AVAILABLE"),
+            "must not claim available:\n{}",
+            out
+        );
+        assert!(
+            out.contains("REGISTERED"),
+            "must render REGISTERED:\n{}",
+            out
+        );
+        assert!(
+            out.contains("(registered)"),
+            "header suffix must say registered:\n{}",
+            out
+        );
+    }
+
+    #[test]
+    fn format_lookup_available_high_confidence_still_says_available() {
+        let f = formatter();
+        let out = f.format_lookup(&availability_lookup(true, "high"));
+        assert!(
+            out.contains("AVAILABLE"),
+            "high-confidence available:\n{}",
+            out
+        );
+        assert!(out.contains("(available)"), "header suffix:\n{}", out);
+    }
+
+    #[test]
+    fn format_lookup_likely_registered_medium_confidence() {
+        let f = formatter();
+        let out = f.format_lookup(&availability_lookup(false, "medium"));
+        assert!(out.contains("LIKELY REGISTERED"), "medium reg:\n{}", out);
+        assert!(
+            !out.contains("MAY BE AVAILABLE"),
+            "must not say MAY BE AVAILABLE:\n{}",
+            out
+        );
+    }
+
+    #[test]
+    fn domain_info_verdict_registered_for_high_confidence_unavailable() {
+        // Regression: DomainInfo::availability_verdict ignored data.available.
+        let lookup = availability_lookup(false, "high");
+        let info = crate::domain_info::DomainInfo::from_lookup_result(&lookup);
+        assert_eq!(info.availability_verdict.as_deref(), Some("registered"));
     }
 
     #[test]

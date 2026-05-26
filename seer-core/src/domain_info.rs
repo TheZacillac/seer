@@ -264,14 +264,7 @@ impl DomainInfo {
             LookupResult::Available { data, .. } => {
                 let mut info = Self::from_sources(&data.domain, None, None);
                 info.source = DomainInfoSource::Available;
-                info.availability_verdict = Some(
-                    match data.confidence.as_str() {
-                        "high" => "available",
-                        "medium" => "likely_available",
-                        _ => "unknown",
-                    }
-                    .to_string(),
-                );
+                info.availability_verdict = Some(data.verdict().to_string());
                 info
             }
         }
