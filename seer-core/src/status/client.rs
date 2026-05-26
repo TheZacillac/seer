@@ -249,30 +249,13 @@ impl StatusClient {
     /// even when invalid. Data retrieved (issuer, subject, dates) comes from an
     /// unauthenticated TLS connection and may have been tampered with by a MITM.
     async fn fetch_certificate_info(&self, domain: &str) -> Result<CertificateInfo> {
-        // SSRF protection: resolve domain and check IPs before connecting
-        let addr = format!("{}:443", domain);
-        let socket_addrs: Vec<_> = tokio::net::lookup_host(&addr)
+        // SSRF protection: resolve and reject reserved IPs before connecting.
+        // Use crate::net::resolve_public_host so we get the Hickory fallback
+        // when the OS resolver is broken (corporate Macs, Tailscale split-DNS,
+        // etc.) — the same path every other outbound-connect uses.
+        let socket_addrs = crate::net::resolve_public_host(domain, 443)
             .await
-            .map_err(|e| SeerError::CertificateError(format!("DNS lookup failed: {}", e)))?
-            .collect();
-
-        if socket_addrs.is_empty() {
-            return Err(SeerError::CertificateError(format!(
-                "DNS lookup returned no addresses for {}",
-                domain
-            )));
-        }
-
-        for socket_addr in &socket_addrs {
-            if let Some(reason) = describe_reserved_ip(&socket_addr.ip()) {
-                return Err(SeerError::CertificateError(format!(
-                    "cannot connect to {}: {} — {}",
-                    domain,
-                    socket_addr.ip(),
-                    reason
-                )));
-            }
-        }
+            .map_err(|e| SeerError::CertificateError(e.to_string()))?;
 
         let connector = TlsConnector::builder()
             .danger_accept_invalid_certs(true) // We want to see the cert even if invalid

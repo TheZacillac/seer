@@ -277,10 +277,16 @@ impl WhoisResponse {
     /// that registries typically provide (registrar, dates, nameservers).
     /// When true, following the registrar referral can be skipped since the
     /// additional detail (contact info) is usually GDPR-redacted anyway.
+    ///
+    /// Some registries (NIC.LV, SIDN/.nl) intentionally omit creation/expiry
+    /// from their WHOIS, so accept a non-empty `status` field as an
+    /// alternative registry signal alongside registrar + nameservers — this
+    /// avoids a wasted referral attempt on every lookup for those TLDs.
     pub fn has_core_data(&self) -> bool {
-        self.registrar.is_some()
-            && (self.creation_date.is_some() || self.expiration_date.is_some())
-            && !self.nameservers.is_empty()
+        let has_dates_or_status = self.creation_date.is_some()
+            || self.expiration_date.is_some()
+            || !self.status.is_empty();
+        self.registrar.is_some() && has_dates_or_status && !self.nameservers.is_empty()
     }
 
     pub fn is_available(&self) -> bool {

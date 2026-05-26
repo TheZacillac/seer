@@ -387,10 +387,10 @@ pub fn bulk_results_to_csv(results: &[BulkResult], operation: &str) -> String {
                 let availability_verdict = escape_csv_field(availability_verdict);
                 if let Some(BulkResultData::Info(ref info)) = result.data {
                     csv.push_str(&format!(
-                        "{},{},{:?},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+                        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
                         domain,
                         success,
-                        info.source,
+                        info.source, // Display impl renders the same lowercase form as JSON
                         escape_csv_field(info.registrar.as_deref().unwrap_or("")),
                         escape_csv_field(info.registrant.as_deref().unwrap_or("")),
                         escape_csv_field(info.organization.as_deref().unwrap_or("")),

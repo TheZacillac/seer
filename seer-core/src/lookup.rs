@@ -571,6 +571,13 @@ impl SmartLookup {
         // if it returned any response, even a thin one — this is safer than
         // falling back to the availability heuristic when we have actual
         // registry data in hand.
+        //
+        // We separately track whether RDAP returned an HTTP 200 (NoData):
+        // even a thin RDAP 200 is positive evidence the domain object
+        // exists. In that case we must NOT reclassify a WHOIS "no match"
+        // signal as availability — WHOIS lag against a freshly-provisioned
+        // domain would otherwise produce a false "available" verdict.
+        let rdap_returned_200 = matches!(rdap_outcome, RdapOutcome::NoData(_));
         let (rdap_error_str, rdap_fallback_data, rdap_seer_error) = match rdap_outcome {
             RdapOutcome::Useful(_) => {
                 // Unreachable in this branch (we returned above), but handle
@@ -596,18 +603,26 @@ impl SmartLookup {
 
         if let LegOutcome::Completed(Ok(whois_data)) = whois_leg {
             // Check Cases A and B: should we reclassify as Available?
-            let availability_match = rdap_seer_error
-                .as_ref()
-                .and_then(|e| classify_whois_leg(&whois_data, e))
-                .or_else(|| {
-                    // Case A can still fire even when RDAP errored for a
-                    // non-404 reason — the WHOIS signal alone is sufficient.
-                    if whois_data.is_available() {
-                        Some(("high", "whois"))
-                    } else {
-                        None
-                    }
-                });
+            //
+            // Skip the entire reclassification path when RDAP returned a 200:
+            // a successful RDAP response (even thin) proves the domain exists,
+            // so a WHOIS "no match" is propagation lag, not availability.
+            let availability_match = if rdap_returned_200 {
+                None
+            } else {
+                rdap_seer_error
+                    .as_ref()
+                    .and_then(|e| classify_whois_leg(&whois_data, e))
+                    .or_else(|| {
+                        // Case A can still fire even when RDAP errored for a
+                        // non-404 reason — the WHOIS signal alone is sufficient.
+                        if whois_data.is_available() {
+                            Some(("high", "whois"))
+                        } else {
+                            None
+                        }
+                    })
+            };
 
             if let Some((confidence, method)) = availability_match {
                 debug!(

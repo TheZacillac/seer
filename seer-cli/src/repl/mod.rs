@@ -190,7 +190,7 @@ impl Repl {
             "subdomains" | "subs" => self.execute_subdomains(args).await,
             "diff" => self.execute_diff(args).await,
             "watch" => self.execute_watch(args).await,
-            "history" => self.execute_history(args),
+            "history" => self.execute_history(args).await,
             "set" => self.execute_set(args),
             "clear" => {
                 print!("\x1B[2J\x1B[1;1H");
@@ -1206,12 +1206,20 @@ impl Repl {
         }
     }
 
-    fn execute_history(&self, args: &[&str]) -> CommandResult {
-        let mut history = seer_core::LookupHistory::load();
+    async fn execute_history(&self, args: &[&str]) -> CommandResult {
+        // History I/O is blocking file work; offload off the Tokio worker so
+        // the REPL stays responsive to other in-flight tasks.
+        let mut history = match tokio::task::spawn_blocking(seer_core::LookupHistory::load).await {
+            Ok(h) => h,
+            Err(e) => return CommandResult::Error(format!("Failed to load history: {}", e)),
+        };
         if args.contains(&"--clear") {
             history.clear();
-            if let Err(e) = history.save() {
-                return CommandResult::Error(format!("Failed to clear: {}", e));
+            let save_result = tokio::task::spawn_blocking(move || history.save()).await;
+            match save_result {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => return CommandResult::Error(format!("Failed to clear: {}", e)),
+                Err(e) => return CommandResult::Error(format!("Failed to clear: {}", e)),
             }
             println!("Lookup history cleared");
             return CommandResult::Continue;

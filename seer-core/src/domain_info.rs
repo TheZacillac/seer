@@ -19,6 +19,20 @@ pub enum DomainInfoSource {
     Available,
 }
 
+impl std::fmt::Display for DomainInfoSource {
+    /// Render the same lowercase form serde uses, so JSON output and any
+    /// non-JSON sink (CSV, logs) carry identical strings.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            DomainInfoSource::Both => "both",
+            DomainInfoSource::Rdap => "rdap",
+            DomainInfoSource::Whois => "whois",
+            DomainInfoSource::Available => "available",
+        };
+        f.write_str(s)
+    }
+}
+
 /// A flat, merged view of domain registration data from RDAP and WHOIS.
 ///
 /// RDAP fields take priority when both sources are present; WHOIS fills gaps.

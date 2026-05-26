@@ -453,14 +453,11 @@ async fn execute_command(
         }
         Commands::Rdap { query } => {
             let client = seer_core::RdapClient::new();
-            let result = if query.starts_with("AS") || query.starts_with("as") {
-                let asn: u32 = query[2..].parse()?;
-                client.lookup_asn(asn).await
-            } else if query.parse::<std::net::IpAddr>().is_ok() {
-                client.lookup_ip(&query).await
-            } else {
-                client.lookup_domain(&query).await
-            };
+            // Use seer_core::rdap::auto_lookup so the `AS<digits>` route only
+            // fires when the remainder is all digits AND the query contains no
+            // `.` — otherwise `as1234.io` / `asset.io` would misroute to ASN
+            // and surface a "parse" error instead of a domain lookup.
+            let result = seer_core::rdap::auto_lookup(&client, &query).await;
 
             match result {
                 Ok(response) => {
