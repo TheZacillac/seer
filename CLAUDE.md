@@ -186,7 +186,7 @@ seer-api/
     │   ├── propagation.py  # DNS propagation
     │   └── status.py       # Domain status
     └── mcp/
-        └── server.py       # MCP server (13 tools, stdio transport)
+        └── server.py       # MCP server (16 tools, stdio transport)
 ```
 
 **Key Points:**

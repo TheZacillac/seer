@@ -500,8 +500,13 @@ async def execute_tool(name: str, arguments: dict[str, Any]) -> Any:
         case "seer_bulk_status":
             domains = _require_domains(arguments)
             concurrency = _get_concurrency(arguments, default=10)
-            for d in domains:
-                _ssrf_guard(d, 443)
+            # Move the per-domain SSRF guard off the event-loop thread.
+            # Each `_ssrf_guard` call enters PyO3 and `block_on`s a DNS
+            # resolution; doing that serially on the event loop pins it
+            # for up to (N * resolver_timeout) for a 100-domain payload.
+            await loop.run_in_executor(
+                None, lambda: [_ssrf_guard(d, 443) for d in domains]
+            )
             return await loop.run_in_executor(
                 None, seer.bulk_status, domains, concurrency
             )
@@ -528,8 +533,9 @@ async def execute_tool(name: str, arguments: dict[str, Any]) -> Any:
         case "seer_bulk_ssl":
             domains = _require_domains(arguments)
             concurrency = _get_concurrency(arguments, default=10)
-            for d in domains:
-                _ssrf_guard(d, 443)
+            await loop.run_in_executor(
+                None, lambda: [_ssrf_guard(d, 443) for d in domains]
+            )
             return await loop.run_in_executor(
                 None, seer.bulk_ssl, domains, concurrency
             )
