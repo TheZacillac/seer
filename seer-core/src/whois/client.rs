@@ -6,7 +6,7 @@ use regex::Regex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
-use tracing::{debug, info, instrument, warn};
+use tracing::{debug, instrument, warn};
 
 use super::parser::WhoisResponse;
 use super::servers::{get_tld, get_whois_server};
@@ -115,7 +115,11 @@ impl WhoisClient {
             .lookup_with_referrals(&domain, &whois_server, 0, &mut visited)
             .await;
         let elapsed_ms = start.elapsed().as_millis();
-        info!(elapsed_ms = elapsed_ms, "WHOIS lookup complete");
+        debug!(
+            domain = %domain,
+            elapsed_ms = elapsed_ms,
+            "WHOIS lookup complete"
+        );
         result
     }
 

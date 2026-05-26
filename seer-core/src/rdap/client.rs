@@ -8,7 +8,7 @@ use once_cell::sync::Lazy;
 use reqwest::Client;
 use serde::Deserialize;
 use tokio::sync::{Notify, RwLock};
-use tracing::{debug, info, instrument};
+use tracing::{debug, info, instrument, warn};
 
 use super::bootstrap::{
     ipv4_matches_prefix, ipv6_matches_prefix, parse_asn_range, validate_bootstrap_url,
@@ -705,12 +705,12 @@ async fn load_bootstrap_data() -> Result<BootstrapData> {
         Ok(resp) => match read_bootstrap(resp).await {
             Ok(data) => Some(data),
             Err(e) => {
-                debug!(error = %e, "Failed to parse DNS bootstrap response");
+                warn!(error = %e, "Failed to parse DNS bootstrap response");
                 None
             }
         },
         Err(e) => {
-            debug!(error = %e, "Failed to fetch DNS bootstrap from IANA");
+            warn!(error = %e, "Failed to fetch DNS bootstrap from IANA");
             None
         }
     };
@@ -718,12 +718,12 @@ async fn load_bootstrap_data() -> Result<BootstrapData> {
         Ok(resp) => match read_bootstrap(resp).await {
             Ok(data) => Some(data),
             Err(e) => {
-                debug!(error = %e, "Failed to parse IPv4 bootstrap response");
+                warn!(error = %e, "Failed to parse IPv4 bootstrap response");
                 None
             }
         },
         Err(e) => {
-            debug!(error = %e, "Failed to fetch IPv4 bootstrap from IANA");
+            warn!(error = %e, "Failed to fetch IPv4 bootstrap from IANA");
             None
         }
     };
@@ -731,12 +731,12 @@ async fn load_bootstrap_data() -> Result<BootstrapData> {
         Ok(resp) => match read_bootstrap(resp).await {
             Ok(data) => Some(data),
             Err(e) => {
-                debug!(error = %e, "Failed to parse IPv6 bootstrap response");
+                warn!(error = %e, "Failed to parse IPv6 bootstrap response");
                 None
             }
         },
         Err(e) => {
-            debug!(error = %e, "Failed to fetch IPv6 bootstrap from IANA");
+            warn!(error = %e, "Failed to fetch IPv6 bootstrap from IANA");
             None
         }
     };
@@ -744,12 +744,12 @@ async fn load_bootstrap_data() -> Result<BootstrapData> {
         Ok(resp) => match read_bootstrap(resp).await {
             Ok(data) => Some(data),
             Err(e) => {
-                debug!(error = %e, "Failed to parse ASN bootstrap response");
+                warn!(error = %e, "Failed to parse ASN bootstrap response");
                 None
             }
         },
         Err(e) => {
-            debug!(error = %e, "Failed to fetch ASN bootstrap from IANA");
+            warn!(error = %e, "Failed to fetch ASN bootstrap from IANA");
             None
         }
     };

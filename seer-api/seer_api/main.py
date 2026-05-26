@@ -83,9 +83,12 @@ async def lifespan(_app: FastAPI):
     # C6: bound to a non-loopback interface without any API key is an open
     # proxy. Hard-fail rather than warn. Read SEER_API_KEY directly from
     # the environment here (not from a module-level constant) so a deploy
-    # that sets the key just before startup is honoured.
+    # that sets the key just before startup is honoured. Use `.strip()`
+    # so a blank value from a secrets-manager placeholder
+    # (`SEER_API_KEY=""`) still trips the guard instead of silently
+    # disabling auth.
     host = os.environ.get("SEER_HOST", "127.0.0.1")
-    if host != "127.0.0.1" and not os.environ.get("SEER_API_KEY"):
+    if host != "127.0.0.1" and not (os.environ.get("SEER_API_KEY") or "").strip():
         log.error(
             "seer-api is bound to %s with no SEER_API_KEY set. Refusing to "
             "start. Set SEER_API_KEY or SEER_HOST=127.0.0.1.",
@@ -114,8 +117,12 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 # For production, set SEER_CORS_ORIGINS to comma-separated list of allowed origins
 # e.g., SEER_CORS_ORIGINS="https://example.com,https://app.example.com"
 cors_origins_env = os.environ.get("SEER_CORS_ORIGINS", "")
-if cors_origins_env:
-    allowed_origins = [origin.strip() for origin in cors_origins_env.split(",")]
+# Filter empty entries first so `SEER_CORS_ORIGINS=",,"` and trailing
+# commas land in the dev-mode branch instead of producing a list of
+# empty strings that CORSMiddleware silently never matches.
+_cors_parsed = [o for o in (s.strip() for s in cors_origins_env.split(",")) if o]
+if _cors_parsed:
+    allowed_origins = _cors_parsed
     allow_credentials = True
     # `Access-Control-Allow-Origin: *` with `allow_credentials=True` is a
     # CORS spec violation — browsers reject it and Starlette raises a
@@ -157,7 +164,10 @@ async def auth_middleware(request: Request, call_next):
     constant, so tests and rotating-secret deployments don't need an import
     reload to pick up the current key.
     """
-    api_key = os.environ.get("SEER_API_KEY")
+    # Treat a blank value (e.g. `SEER_API_KEY=""` from a misconfigured
+    # secrets-manager placeholder) as "no key set" rather than letting
+    # it silently disable auth via Python's empty-string falsy check.
+    api_key = (os.environ.get("SEER_API_KEY") or "").strip()
     if api_key:
         # Skip CORS preflight (OPTIONS) and public endpoints. The auth
         # middleware runs outermost (wrapping CORSMiddleware), so rejecting

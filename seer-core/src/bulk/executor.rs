@@ -4,7 +4,8 @@ use std::time::Duration;
 
 use futures::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
-use tokio::time::sleep;
+use tokio::sync::Mutex;
+use tokio::time::{interval, MissedTickBehavior};
 use tracing::{debug, info, instrument};
 
 use crate::availability::{AvailabilityChecker, AvailabilityResult};
@@ -141,11 +142,28 @@ impl BulkExecutor {
             "Starting bulk execution"
         );
 
+        // Per-batch rate limiter. The previous design slept `rate_limit_delay`
+        // INSIDE every per-item future, but those futures run concurrently
+        // under `buffer_unordered`, so the sleep just added uniform latency
+        // and did not serialize dispatch at all. A shared `Interval` ticks
+        // at the requested rate, and each task acquires the next tick before
+        // dispatching the operation — concurrency still applies on the
+        // execution side, but dispatch is rate-limited globally.
+        let limiter = if self.rate_limit_delay.is_zero() {
+            None
+        } else {
+            let mut iv = interval(self.rate_limit_delay);
+            // The first `tick()` resolves immediately, so the first item
+            // dispatches without waiting — desirable. Skip catch-up bursts.
+            iv.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            Some(Arc::new(Mutex::new(iv)))
+        };
+
         let results: Vec<BulkResult> = stream::iter(operations)
             .map(|op| {
                 let completed = completed.clone();
                 let progress = progress.as_ref();
-                let rate_limit_delay = self.rate_limit_delay;
+                let limiter = limiter.clone();
                 let whois_client = &self.whois_client;
                 let rdap_client = &self.rdap_client;
                 let dns_resolver = &self.dns_resolver;
@@ -156,9 +174,12 @@ impl BulkExecutor {
                 let ssl_checker = &self.ssl_checker;
 
                 async move {
-                    // Rate limiting delay
-                    if !rate_limit_delay.is_zero() {
-                        sleep(rate_limit_delay).await;
+                    // Rate-limited dispatch: wait for our turn at the shared
+                    // interval before the operation starts. With no limiter
+                    // (zero delay) every task dispatches immediately and the
+                    // semaphore-like effect comes from `buffer_unordered`.
+                    if let Some(limiter) = &limiter {
+                        limiter.lock().await.tick().await;
                     }
 
                     let start = std::time::Instant::now();

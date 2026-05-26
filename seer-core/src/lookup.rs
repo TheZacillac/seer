@@ -121,6 +121,33 @@ fn classify_whois_leg(
     None
 }
 
+/// Wraps `classify_whois_leg` with the "RDAP returned 200" veto: a successful
+/// RDAP response (HTTP 200, even if the body is thin) is positive evidence
+/// that the domain object exists, so we never let a WHOIS-only signal flip
+/// the verdict to "available" in that case. This guards against WHOIS
+/// propagation lag against freshly-provisioned domains the registry has
+/// already begun serving via RDAP. v0.26.6 regression fix.
+fn should_route_to_availability(
+    rdap_returned_200: bool,
+    rdap_seer_error: Option<&SeerError>,
+    whois_data: &WhoisResponse,
+) -> Option<(&'static str, &'static str)> {
+    if rdap_returned_200 {
+        return None;
+    }
+    rdap_seer_error
+        .and_then(|e| classify_whois_leg(whois_data, e))
+        .or_else(|| {
+            // Case A can still fire even when RDAP errored for a non-404
+            // reason — the WHOIS signal alone is sufficient.
+            if whois_data.is_available() {
+                Some(("high", "whois"))
+            } else {
+                None
+            }
+        })
+}
+
 /// Sanitizes an error message for inclusion in a public-facing response.
 ///
 /// Strips IPv4 and IPv6 literals (to avoid leaking internal addresses when
@@ -602,27 +629,14 @@ impl SmartLookup {
         };
 
         if let LegOutcome::Completed(Ok(whois_data)) = whois_leg {
-            // Check Cases A and B: should we reclassify as Available?
-            //
-            // Skip the entire reclassification path when RDAP returned a 200:
-            // a successful RDAP response (even thin) proves the domain exists,
-            // so a WHOIS "no match" is propagation lag, not availability.
-            let availability_match = if rdap_returned_200 {
-                None
-            } else {
-                rdap_seer_error
-                    .as_ref()
-                    .and_then(|e| classify_whois_leg(&whois_data, e))
-                    .or_else(|| {
-                        // Case A can still fire even when RDAP errored for a
-                        // non-404 reason — the WHOIS signal alone is sufficient.
-                        if whois_data.is_available() {
-                            Some(("high", "whois"))
-                        } else {
-                            None
-                        }
-                    })
-            };
+            // Check Cases A and B: should we reclassify as Available? The
+            // `should_route_to_availability` helper also enforces the
+            // "RDAP returned 200 vetoes WHOIS availability claims" rule.
+            let availability_match = should_route_to_availability(
+                rdap_returned_200,
+                rdap_seer_error.as_ref(),
+                &whois_data,
+            );
 
             if let Some((confidence, method)) = availability_match {
                 debug!(
@@ -1270,6 +1284,73 @@ mod tests {
         let rdap_err = SeerError::RdapError("query failed with status 404 Not Found".to_string());
         let (verdict, _) = classify_whois_leg(&w, &rdap_err).unwrap();
         assert_eq!(verdict, "high");
+    }
+
+    // ---------------- should_route_to_availability ----------------
+    //
+    // Regression coverage for the v0.26.6 fix: when RDAP returned an HTTP 200
+    // (even with thin body), a WHOIS "no match" must NOT be treated as
+    // evidence of availability — that would let propagation lag flip the
+    // verdict for a domain the registry has already provisioned.
+
+    #[test]
+    fn rdap_200_vetoes_whois_no_match() {
+        let mut w = empty_whois("freshly-registered.com");
+        w.raw_response = "No match for \"FRESHLY-REGISTERED.COM\".".to_string();
+        // rdap_returned_200 = true, no rdap_seer_error (NoData has no error).
+        assert!(
+            should_route_to_availability(true, None, &w).is_none(),
+            "RDAP 200 must veto WHOIS-only availability claim",
+        );
+    }
+
+    #[test]
+    fn rdap_200_vetoes_even_with_thin_whois() {
+        let w = empty_whois("freshly-registered.com");
+        // Thin WHOIS without is_available() patterns.
+        assert!(
+            should_route_to_availability(true, None, &w).is_none(),
+            "RDAP 200 must veto even when WHOIS is thin",
+        );
+    }
+
+    #[test]
+    fn rdap_404_with_whois_no_match_routes_to_available() {
+        let mut w = empty_whois("genuinely-free.com");
+        w.raw_response = "No match for \"GENUINELY-FREE.COM\".".to_string();
+        let rdap_err = SeerError::RdapError("query failed with status 404".to_string());
+        let result = should_route_to_availability(false, Some(&rdap_err), &w);
+        assert_eq!(result, Some(("high", "whois")));
+    }
+
+    #[test]
+    fn rdap_error_with_whois_is_available_still_routes_case_a() {
+        let mut w = empty_whois("genuinely-free.com");
+        w.raw_response = "Domain not found".to_string();
+        // RDAP errored for a non-404 reason (e.g. bootstrap failure); WHOIS
+        // signal alone should still route to availability.
+        let rdap_err = SeerError::RdapBootstrapError("all registries failed".to_string());
+        let result = should_route_to_availability(false, Some(&rdap_err), &w);
+        assert_eq!(result, Some(("high", "whois")));
+    }
+
+    #[test]
+    fn rdap_grace_timeout_with_whois_is_available_routes_case_a() {
+        // GraceTimeout path: rdap_returned_200 = false, rdap_seer_error = None.
+        let mut w = empty_whois("genuinely-free.com");
+        w.raw_response = "No match".to_string();
+        let result = should_route_to_availability(false, None, &w);
+        assert_eq!(result, Some(("high", "whois")));
+    }
+
+    #[test]
+    fn no_rdap_200_no_error_thick_whois_stays_in_whois_path() {
+        let mut w = empty_whois("registered.com");
+        w.registrar = Some("Example Registrar Ltd".to_string());
+        // GraceTimeout-like: rdap_returned_200=false, no error, and WHOIS
+        // does not look free. Must return None so the caller picks
+        // `LookupResult::Whois`.
+        assert!(should_route_to_availability(false, None, &w).is_none());
     }
 
     // ---------------- Mutex poisoning recovery ----------------
