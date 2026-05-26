@@ -141,25 +141,17 @@ impl RegistryParser for NicLvParser {
                         status.push(v);
                     }
                 }
-                (Section::Holder, "name") => {
-                    if registrant.is_none() {
-                        registrant = Some(value.to_string());
-                    }
+                (Section::Holder, "name") if registrant.is_none() => {
+                    registrant = Some(value.to_string());
                 }
-                (Section::Holder, "address") => {
-                    if registrant_address.is_none() {
-                        registrant_address = Some(value.to_string());
-                    }
+                (Section::Holder, "address") if registrant_address.is_none() => {
+                    registrant_address = Some(value.to_string());
                 }
-                (Section::Holder, "country") => {
-                    if registrant_country.is_none() {
-                        registrant_country = Some(value.to_string());
-                    }
+                (Section::Holder, "country") if registrant_country.is_none() => {
+                    registrant_country = Some(value.to_string());
                 }
-                (Section::Registrar, "name") => {
-                    if registrar.is_none() {
-                        registrar = Some(value.to_string());
-                    }
+                (Section::Registrar, "name") if registrar.is_none() => {
+                    registrar = Some(value.to_string());
                 }
                 (Section::Nservers, "nserver") => {
                     let ns = value.to_ascii_lowercase();
@@ -167,10 +159,8 @@ impl RegistryParser for NicLvParser {
                         nameservers.push(ns);
                     }
                 }
-                (Section::Whois, "updated") => {
-                    if updated_date.is_none() {
-                        updated_date = Self::parse_iso8601(value);
-                    }
+                (Section::Whois, "updated") if updated_date.is_none() => {
+                    updated_date = Self::parse_iso8601(value);
                 }
                 _ => {}
             }

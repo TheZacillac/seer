@@ -180,70 +180,44 @@ impl RegistryParser for EisParser {
                         status.push(short);
                     }
                 }
-                (Section::Domain, "registered") => {
-                    if creation_date.is_none() {
-                        creation_date = Self::parse_date(&value);
-                    }
+                (Section::Domain, "registered") if creation_date.is_none() => {
+                    creation_date = Self::parse_date(&value);
                 }
-                (Section::Domain, "changed") => {
-                    if updated_date.is_none() {
-                        updated_date = Self::parse_date(&value);
-                    }
+                (Section::Domain, "changed") if updated_date.is_none() => {
+                    updated_date = Self::parse_date(&value);
                 }
-                (Section::Domain, "expire") => {
-                    if expiration_date.is_none() {
-                        expiration_date = Self::parse_date(&value);
-                    }
+                (Section::Domain, "expire") if expiration_date.is_none() => {
+                    expiration_date = Self::parse_date(&value);
                 }
-                (Section::Registrant, "name") => {
-                    if registrant.is_none() {
-                        registrant = Some(value);
-                    }
+                (Section::Registrant, "name") if registrant.is_none() => {
+                    registrant = Some(value);
                 }
-                (Section::Registrant, "org id") => {
-                    if organization.is_none() {
-                        organization = Some(value);
-                    }
+                (Section::Registrant, "org id") if organization.is_none() => {
+                    organization = Some(value);
                 }
-                (Section::Registrant, "country") => {
-                    if registrant_country.is_none() {
-                        registrant_country = Some(value);
-                    }
+                (Section::Registrant, "country") if registrant_country.is_none() => {
+                    registrant_country = Some(value);
                 }
-                (Section::Registrant, "email") => {
-                    if registrant_email.is_none() {
-                        registrant_email = Some(value);
-                    }
+                (Section::Registrant, "email") if registrant_email.is_none() => {
+                    registrant_email = Some(value);
                 }
-                (Section::Registrant, "phone") => {
-                    if registrant_phone.is_none() {
-                        registrant_phone = Some(value);
-                    }
+                (Section::Registrant, "phone") if registrant_phone.is_none() => {
+                    registrant_phone = Some(value);
                 }
-                (Section::Admin, "name") => {
-                    if admin_name.is_none() {
-                        admin_name = Some(value);
-                    }
+                (Section::Admin, "name") if admin_name.is_none() => {
+                    admin_name = Some(value);
                 }
-                (Section::Admin, "email") => {
-                    if admin_email.is_none() {
-                        admin_email = Some(value);
-                    }
+                (Section::Admin, "email") if admin_email.is_none() => {
+                    admin_email = Some(value);
                 }
-                (Section::Tech, "name") => {
-                    if tech_name.is_none() {
-                        tech_name = Some(value);
-                    }
+                (Section::Tech, "name") if tech_name.is_none() => {
+                    tech_name = Some(value);
                 }
-                (Section::Tech, "email") => {
-                    if tech_email.is_none() {
-                        tech_email = Some(value);
-                    }
+                (Section::Tech, "email") if tech_email.is_none() => {
+                    tech_email = Some(value);
                 }
-                (Section::Registrar, "name") => {
-                    if registrar.is_none() {
-                        registrar = Some(value);
-                    }
+                (Section::Registrar, "name") if registrar.is_none() => {
+                    registrar = Some(value);
                 }
                 (Section::Nameservers, "nserver") => {
                     // EIS sometimes appends a glue IP after the host.
@@ -256,10 +230,8 @@ impl RegistryParser for EisParser {
                         nameservers.push(ns);
                     }
                 }
-                (Section::Dnssec, "dnskey") => {
-                    if dnssec.is_none() {
-                        dnssec = Some("signedDelegation".to_string());
-                    }
+                (Section::Dnssec, "dnskey") if dnssec.is_none() => {
+                    dnssec = Some("signedDelegation".to_string());
                 }
                 _ => {}
             }
