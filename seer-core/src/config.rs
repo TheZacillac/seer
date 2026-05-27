@@ -92,10 +92,10 @@ impl SeerConfig {
         }
 
         match std::fs::read_to_string(&path) {
-            Ok(content) => match toml::from_str(&content) {
+            Ok(content) => match toml::from_str::<SeerConfig>(&content) {
                 Ok(config) => {
                     debug!(?path, "Loaded config");
-                    config
+                    config.clamped()
                 }
                 Err(e) => {
                     tracing::warn!(?path, error = %e, "Failed to parse config, using defaults");
@@ -107,6 +107,22 @@ impl SeerConfig {
                 Self::default()
             }
         }
+    }
+
+    /// Clamp loaded values into sane ranges. Without this, a user
+    /// (accidentally or maliciously) setting `bulk.concurrency = 0` would
+    /// hand `Semaphore::new(0)` to every bulk operation and block forever;
+    /// `bulk.concurrency = 10000` would spawn thousands of concurrent
+    /// connections. Timeouts of `0` would error every network call
+    /// immediately. Apply the same bounds the public API enforces so a
+    /// config file can't bypass them.
+    fn clamped(mut self) -> Self {
+        self.bulk.concurrency = self.bulk.concurrency.clamp(1, 50);
+        self.timeouts.whois_secs = self.timeouts.whois_secs.clamp(1, 300);
+        self.timeouts.rdap_secs = self.timeouts.rdap_secs.clamp(1, 300);
+        self.timeouts.dns_secs = self.timeouts.dns_secs.clamp(1, 60);
+        self.timeouts.http_secs = self.timeouts.http_secs.clamp(1, 120);
+        self
     }
 
     /// Returns the WHOIS timeout as a Duration.

@@ -166,9 +166,14 @@ fn decide_fallback(
                     available: false,
                     confidence: "none".to_string(),
                     method: "inconclusive".to_string(),
+                    // Use the sanitized error projection so this string —
+                    // which flows into JSON / CSV / MCP output paths —
+                    // never carries raw ANSI escapes or internal IPs from
+                    // a third-party WHOIS/RDAP server's error message.
                     details: Some(format!(
                         "Could not determine availability. RDAP: {}. WHOIS: {}",
-                        rdap_err, whois_err
+                        rdap_err.sanitized_message(),
+                        whois_err.sanitized_message()
                     )),
                 }
             }

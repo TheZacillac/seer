@@ -96,7 +96,12 @@ impl LookupHistory {
         }
         let content = serde_json::to_string_pretty(self)
             .map_err(|e| SeerError::ConfigError(e.to_string()))?;
-        let tmp_path = path.with_extension("json.tmp");
+        // Per-PID temp filename so two concurrent `seer` processes don't
+        // race on the same intermediate path. Without this, process B's
+        // `fs::write` could truncate A's `.tmp` after A finished writing
+        // but before A's `rename` — A would then rename a truncated file
+        // and silently lose history.
+        let tmp_path = path.with_extension(format!("json.{}.tmp", std::process::id()));
         std::fs::write(&tmp_path, content).map_err(|e| SeerError::ConfigError(e.to_string()))?;
         std::fs::rename(&tmp_path, &path).map_err(|e| {
             // Best-effort cleanup of the temp file so we don't litter on

@@ -887,7 +887,11 @@ fn json_to_python_inner(
     value: &serde_json::Value,
     depth: usize,
 ) -> PyResult<PyObject> {
-    if depth > MAX_JSON_DEPTH {
+    // `>=` (not `>`) so the boundary matches the stated contract: depths
+    // 0..MAX_JSON_DEPTH are accepted (that's MAX_JSON_DEPTH levels), depth
+    // MAX_JSON_DEPTH itself is rejected. Matches the `walk_depth` pattern
+    // in `rdap/types.rs`.
+    if depth >= MAX_JSON_DEPTH {
         return Err(PyValueError::new_err(format!(
             "JSON structure exceeds max depth {MAX_JSON_DEPTH}"
         )));

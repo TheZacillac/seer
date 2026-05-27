@@ -403,9 +403,14 @@ fn extract_title(html: &str) -> Option<String> {
         .captures(html)
         .and_then(|caps| caps.get(1))
         .map(|m| {
+            // Strip ALL control characters. A raw `\n` or `\t` inside a
+            // `<title>` element is meaningless HTML whitespace (browsers
+            // collapse it to a single space); preserving them would
+            // produce multi-line JSON field values and break CSV column
+            // alignment downstream.
             m.as_str()
                 .chars()
-                .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
+                .filter(|c| !c.is_control())
                 .collect::<String>()
                 .trim()
                 .to_string()

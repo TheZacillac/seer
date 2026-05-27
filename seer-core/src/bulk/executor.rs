@@ -5,7 +5,7 @@ use std::time::Duration;
 use futures::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
-use tokio::time::{interval, MissedTickBehavior};
+use tokio::time::{sleep_until, Instant as TokioInstant};
 use tracing::{debug, info, instrument};
 
 use crate::availability::{AvailabilityChecker, AvailabilityResult};
@@ -142,22 +142,24 @@ impl BulkExecutor {
             "Starting bulk execution"
         );
 
-        // Per-batch rate limiter. The previous design slept `rate_limit_delay`
-        // INSIDE every per-item future, but those futures run concurrently
-        // under `buffer_unordered`, so the sleep just added uniform latency
-        // and did not serialize dispatch at all. A shared `Interval` ticks
-        // at the requested rate, and each task acquires the next tick before
-        // dispatching the operation — concurrency still applies on the
-        // execution side, but dispatch is rate-limited globally.
+        // Per-batch rate limiter. The naive `interval(...).tick().await` inside
+        // a `Mutex` would hold the lock across the await, serializing all
+        // dispatch through the lock at 1 / rate_limit_delay — exactly the
+        // regression v0.26.7 tried to fix from the other direction.
+        //
+        // Instead each task locks briefly to *claim* its dispatch slot (the
+        // next monotonically-increasing deadline at `rate_limit_delay`
+        // spacing), then releases the lock and `sleep_until`s its assigned
+        // slot. With concurrency=N and rate=D, N tasks can be sleeping
+        // simultaneously on N distinct deadlines, and execution begins at
+        // each task's deadline — so global dispatch rate is 1/D while up
+        // to N tasks run their operation concurrently.
         let limiter = if self.rate_limit_delay.is_zero() {
             None
         } else {
-            let mut iv = interval(self.rate_limit_delay);
-            // The first `tick()` resolves immediately, so the first item
-            // dispatches without waiting — desirable. Skip catch-up bursts.
-            iv.set_missed_tick_behavior(MissedTickBehavior::Delay);
-            Some(Arc::new(Mutex::new(iv)))
+            Some(Arc::new(Mutex::new(None::<TokioInstant>)))
         };
+        let rate_limit_delay = self.rate_limit_delay;
 
         let results: Vec<BulkResult> = stream::iter(operations)
             .map(|op| {
@@ -174,12 +176,21 @@ impl BulkExecutor {
                 let ssl_checker = &self.ssl_checker;
 
                 async move {
-                    // Rate-limited dispatch: wait for our turn at the shared
-                    // interval before the operation starts. With no limiter
-                    // (zero delay) every task dispatches immediately and the
-                    // semaphore-like effect comes from `buffer_unordered`.
+                    // Rate-limited dispatch: claim our slot quickly under the
+                    // lock, then `sleep_until` outside the lock so multiple
+                    // tasks can be sleeping in parallel on their own slots.
                     if let Some(limiter) = &limiter {
-                        limiter.lock().await.tick().await;
+                        let my_slot = {
+                            let mut next = limiter.lock().await;
+                            let now = TokioInstant::now();
+                            let slot = match *next {
+                                Some(prev) if prev > now => prev,
+                                _ => now,
+                            };
+                            *next = Some(slot + rate_limit_delay);
+                            slot
+                        };
+                        sleep_until(my_slot).await;
                     }
 
                     let start = std::time::Instant::now();

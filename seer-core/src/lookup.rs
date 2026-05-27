@@ -184,28 +184,21 @@ struct InflightGuard {
 
 impl Drop for InflightGuard {
     fn drop(&mut self) {
-        // Avoid blocking on the mutex inside Drop. A cancelled future that
-        // drops this guard could otherwise starve the Tokio executor while
-        // it waits for contention to clear. `try_lock` lets us take the
-        // fast path when the map is uncontended, recover from poisoning
-        // explicitly, and simply skip cleanup when another task holds the
-        // mutex — waiters re-contend for ownership on their next wakeup,
-        // so a missed cleanup is self-healing.
-        match LOOKUP_INFLIGHT.try_lock() {
-            Ok(mut inflight) => {
-                inflight.remove(&self.key);
-            }
-            Err(std::sync::TryLockError::Poisoned(p)) => {
-                let mut inflight = p.into_inner();
-                inflight.remove(&self.key);
-            }
-            Err(std::sync::TryLockError::WouldBlock) => {
-                tracing::debug!(
-                    key = %self.key,
-                    "InflightGuard drop: skipping cleanup under contention"
-                );
-            }
-        }
+        // Always remove the entry before notifying. The earlier `try_lock`
+        // design skipped removal under contention, but that left a stale
+        // `Weak<Notify>` in the map: a caller arriving in the brief window
+        // between `notify_waiters()` firing and the owner's `Arc<Notify>`
+        // dropping could upgrade the Weak, register as a waiter on the
+        // already-fired Notify, and block forever (notify_waiters only
+        // wakes currently-registered waiters; it does not accumulate
+        // permits for later registrations).
+        //
+        // Contention windows on this `std::sync::Mutex<HashMap>` are
+        // microseconds — the brief block here is safer than the stale-entry
+        // hazard. Poisoned-mutex recovery is preserved.
+        let mut inflight = LOOKUP_INFLIGHT.lock().unwrap_or_else(|p| p.into_inner());
+        inflight.remove(&self.key);
+        drop(inflight);
         self.notify.notify_waiters();
     }
 }

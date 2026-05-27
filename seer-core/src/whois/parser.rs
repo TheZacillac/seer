@@ -293,18 +293,23 @@ impl WhoisResponse {
         // Scan the full response (excluding empty lines and comment lines). Some
         // registries (TWNIC, JPRS, NIC.br) prepend 3-4 notice lines before the
         // "no match" line, which would escape a small take(N) window.
-        let lower = self
-            .raw_response
-            .lines()
-            .filter(|line| {
-                let trimmed = line.trim();
-                !trimmed.is_empty() && !trimmed.starts_with('#') && !trimmed.starts_with('%')
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-            .to_lowercase();
-
-        AVAILABILITY_PATTERNS.iter().any(|p| lower.contains(p))
+        //
+        // Stream the scan line-by-line — avoids the ~1 MB `Vec<&str>` +
+        // ~1 MB joined `String` the previous implementation allocated for
+        // every call. Each line's lowercase form is a fresh small `String`
+        // (the size of one line, not the whole body) which is dropped at
+        // the end of the iteration.
+        for line in self.raw_response.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('%') {
+                continue;
+            }
+            let lower = trimmed.to_lowercase();
+            if AVAILABILITY_PATTERNS.iter().any(|p| lower.contains(p)) {
+                return true;
+            }
+        }
+        false
     }
 
     /// Checks if the response indicates the registrar doesn't have data for this domain.
@@ -444,12 +449,21 @@ fn parse_date(date_str: &str) -> Option<DateTime<Utc>> {
     None
 }
 
+/// Maximum number of nameservers extracted from a single WHOIS response.
+/// Real domains have ≤ 13 NS records (DNS protocol limit). Cap defensively
+/// to prevent a malicious / malformed registry response from driving
+/// unbounded allocation.
+const MAX_NAMESERVERS: usize = 32;
+
 fn extract_nameservers(text: &str) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut nameservers = Vec::new();
 
     for re in NAMESERVER_PATTERNS.iter() {
         for caps in re.captures_iter(text) {
+            if nameservers.len() >= MAX_NAMESERVERS {
+                return nameservers;
+            }
             if let Some(m) = caps.get(1) {
                 // Strip glue IP addresses that some registries append after the hostname
                 // e.g., "ns1.example.br 200.1.2.3 2001:db8::1" → "ns1.example.br"
@@ -465,6 +479,12 @@ fn extract_nameservers(text: &str) -> Vec<String> {
     nameservers
 }
 
+/// Maximum number of domain-level status codes we extract. EPP defines
+/// ~16 status values; a real domain rarely has more than 5-6. Cap to
+/// prevent a malicious registry response from driving unbounded
+/// allocation.
+const MAX_STATUSES: usize = 32;
+
 /// Extracts Status values only from the top-level domain block of a WHOIS
 /// response. Stops scanning as soon as a RIPE-style `[Section-Header]` line is
 /// encountered, which prevents contact-object `Status:` lines (e.g., inside
@@ -474,6 +494,9 @@ fn extract_status_top_level(raw: &str) -> Vec<String> {
     let mut statuses = Vec::new();
 
     for line in raw.lines() {
+        if statuses.len() >= MAX_STATUSES {
+            break;
+        }
         let trimmed = line.trim_start();
 
         // Stop at the first RIPE/JPRS-style sub-object section header.
