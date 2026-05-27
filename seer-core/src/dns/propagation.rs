@@ -110,6 +110,14 @@ pub struct ServerResult {
     pub response_time_ms: u64,
     pub success: bool,
     pub error: Option<String>,
+    /// For NS-record propagation checks: A/AAAA addresses **this resolver**
+    /// returns when asked for each nameserver hostname it observed. Captures
+    /// the per-vantage view so glue-record propagation lag (one regional
+    /// recursor still serving the old IP) is visible. Keys are lowercased
+    /// FQDNs; values are sorted+deduped. Empty for non-NS checks or when
+    /// the follow-up A/AAAA lookups failed.
+    #[serde(default)]
+    pub nameserver_ips: HashMap<String, Vec<String>>,
 }
 
 /// A consensus DNS value tagged with the record type it was observed for.
@@ -168,6 +176,45 @@ pub struct Inconsistency {
     pub consensus: Vec<String>,
 }
 
+/// Per-vantage disagreement on a nameserver's A/AAAA addresses observed
+/// during an NS-record propagation check.
+///
+/// Produced when a propagation resolver, asked directly for the A/AAAA of an
+/// NS hostname returned in the NS answer, gives a value set that differs from
+/// the cross-server consensus. This is the primary signal for glue-record
+/// propagation lag: a regional recursor still serving the previous IP for
+/// `ns1.example.com` shows up here even when every server agrees on the NS
+/// names themselves.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NameserverIpInconsistency {
+    pub server_name: String,
+    pub server_ip: String,
+    pub nameserver: String,
+    pub values: Vec<String>,
+    pub consensus: Vec<String>,
+}
+
+impl std::fmt::Display for NameserverIpInconsistency {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let render = |v: &[String]| -> String {
+            if v.is_empty() {
+                "no records".to_string()
+            } else {
+                v.join(", ")
+            }
+        };
+        write!(
+            f,
+            "{} ({}) for {}: {} vs consensus: {}",
+            self.server_name,
+            self.server_ip,
+            self.nameserver,
+            render(&self.values),
+            render(&self.consensus),
+        )
+    }
+}
+
 impl std::fmt::Display for Inconsistency {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let render = |v: &[String]| -> String {
@@ -219,12 +266,21 @@ pub struct PropagationResult {
     /// authenticity.
     #[serde(default = "default_dnssec_validated")]
     pub dnssec_validated: bool,
-    /// Resolved A/AAAA addresses for any nameserver hostnames returned by an
-    /// NS-record propagation check. Keyed by the hostname as it appears in the
-    /// record (typically FQDN with trailing dot). Empty for non-NS checks or
-    /// when resolution fails.
+    /// Consensus A/AAAA addresses for nameserver hostnames returned by an
+    /// NS-record propagation check, aggregated across all responding
+    /// propagation servers (i.e. the value set the largest number of global
+    /// recursors agree on). Keys are lowercased FQDNs (typically with trailing
+    /// dot). Empty for non-NS checks. For per-vantage views see
+    /// `results[i].nameserver_ips`; for resolvers that disagree with the
+    /// consensus see `nameserver_inconsistencies`.
     #[serde(default)]
     pub resolved_ips: HashMap<String, Vec<String>>,
+    /// Per-vantage A/AAAA mismatches: a propagation resolver returned IPs for
+    /// a nameserver hostname that differ from the cross-server consensus.
+    /// This is the primary signal for glue-record propagation lag — empty for
+    /// non-NS checks.
+    #[serde(default)]
+    pub nameserver_inconsistencies: Vec<NameserverIpInconsistency>,
 }
 
 impl PropagationResult {
@@ -243,6 +299,13 @@ impl PropagationResult {
     /// Returns true when one or more servers failed to respond.
     pub fn has_unreachable_servers(&self) -> bool {
         !self.unreachable_servers.is_empty()
+    }
+
+    /// Returns true when one or more propagation resolvers reported A/AAAA
+    /// for a nameserver hostname that differs from the cross-server consensus.
+    /// Only meaningful for NS-record checks.
+    pub fn has_nameserver_inconsistencies(&self) -> bool {
+        !self.nameserver_inconsistencies.is_empty()
     }
 }
 
@@ -290,7 +353,11 @@ impl PropagationChecker {
     /// Hard cap on the post-check nameserver-IP enrichment step for NS lookups.
     /// If it expires, propagation results are returned without IP annotations
     /// rather than failing the whole call — enrichment is best-effort.
-    const NS_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(5);
+    /// Bumped from the single-vantage version (5s) because per-vantage
+    /// resolution fans out 29 servers × N nameservers; even fully parallel,
+    /// the slowest single A/AAAA query gates completion and DNS-over-WAN to
+    /// distant resolvers can exceed the per-query timeout.
+    const NS_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(8);
 
     #[instrument(skip(self), fields(domain = %domain, record_type = %record_type))]
     pub async fn check(&self, domain: &str, record_type: RecordType) -> Result<PropagationResult> {
@@ -317,6 +384,7 @@ impl PropagationChecker {
                 ))
             })?;
 
+        let mut results = results;
         let servers_checked = results.len();
         let servers_responding = results.iter().filter(|r| r.success).count();
 
@@ -324,27 +392,33 @@ impl PropagationChecker {
         let (propagation_percentage, consensus_values, inconsistencies, unreachable_servers) =
             analyze_results(&results, record_type);
 
-        // For NS lookups, resolve each unique nameserver hostname to its IP
-        // address(es) so output formatters can show "ns1.example.com (1.2.3.4)".
-        // Bounded by NS_RESOLUTION_TIMEOUT so a slow secondary lookup cannot
-        // extend total wall-clock beyond the documented bound; on timeout we
-        // surface the propagation result without IP annotations.
-        let resolved_ips = if record_type == RecordType::NS {
-            tokio::time::timeout(
+        // For NS lookups, ask each responding propagation server what A/AAAA
+        // it returns for every nameserver hostname observed in the NS answers.
+        // This is the per-vantage view that surfaces glue-record propagation
+        // lag — a regional recursor still serving the previous IP shows up as
+        // a `NameserverIpInconsistency`. Bounded by NS_RESOLUTION_TIMEOUT so a
+        // slow secondary lookup cannot extend total wall-clock beyond the
+        // documented bound; on timeout we surface results without IP
+        // annotations rather than failing the call.
+        let (resolved_ips, nameserver_inconsistencies) = if record_type == RecordType::NS {
+            match tokio::time::timeout(
                 Self::NS_RESOLUTION_TIMEOUT,
-                self.resolve_nameserver_ips(&results),
+                self.resolve_nameserver_ips_per_vantage(&mut results),
             )
             .await
-            .unwrap_or_else(|_| {
-                warn!(
-                    domain = %domain,
-                    timeout_secs = Self::NS_RESOLUTION_TIMEOUT.as_secs(),
-                    "Nameserver IP enrichment timed out; returning results without IP annotations"
-                );
-                HashMap::new()
-            })
+            {
+                Ok((consensus, inconsistencies)) => (consensus, inconsistencies),
+                Err(_) => {
+                    warn!(
+                        domain = %domain,
+                        timeout_secs = Self::NS_RESOLUTION_TIMEOUT.as_secs(),
+                        "Per-vantage nameserver IP enrichment timed out; returning results without IP annotations"
+                    );
+                    (HashMap::new(), Vec::new())
+                }
+            }
         } else {
-            HashMap::new()
+            (HashMap::new(), Vec::new())
         };
 
         Ok(PropagationResult {
@@ -362,58 +436,91 @@ impl PropagationChecker {
             // lack of authentication to users.
             dnssec_validated: false,
             resolved_ips,
+            nameserver_inconsistencies,
         })
     }
 
-    /// Collects unique NS hostnames across all server results and resolves
-    /// each to A/AAAA addresses via the default resolver. Failures yield an
-    /// empty list for that hostname — the caller treats missing IPs the same
-    /// as a failed resolution.
+    /// Per-vantage resolution: for every unique nameserver hostname returned
+    /// across all NS answers, ask each successfully-responding propagation
+    /// server (via its own IP) for that hostname's A/AAAA addresses. Each
+    /// server's view is written into `ServerResult.nameserver_ips`; the
+    /// cross-server consensus and the set of disagreeing resolvers are
+    /// returned to the caller.
+    ///
+    /// Failed A/AAAA lookups from a given vantage are recorded as an empty
+    /// list — empty matches an NXDOMAIN/NODATA response, and either way the
+    /// resolver couldn't provide an IP. If that empty differs from the
+    /// consensus it surfaces as a `NameserverIpInconsistency`.
     ///
     /// Hostnames are lowercased for dedup so case-variant responses from
     /// different upstream resolvers do not trigger redundant lookups.
     /// Formatters must lowercase the record value before looking up the map.
-    async fn resolve_nameserver_ips(
+    async fn resolve_nameserver_ips_per_vantage(
         &self,
-        results: &[ServerResult],
-    ) -> HashMap<String, Vec<String>> {
-        let mut unique: HashSet<String> = HashSet::new();
-        for sr in results {
-            for record in &sr.records {
-                if let RecordData::NS { nameserver } = &record.data {
-                    unique.insert(nameserver.to_ascii_lowercase());
-                }
+        results: &mut [ServerResult],
+    ) -> (HashMap<String, Vec<String>>, Vec<NameserverIpInconsistency>) {
+        let unique: HashSet<String> = results
+            .iter()
+            .flat_map(|sr| sr.records.iter())
+            .filter_map(|r| match &r.data {
+                RecordData::NS { nameserver } => Some(nameserver.to_ascii_lowercase()),
+                _ => None,
+            })
+            .collect();
+
+        if unique.is_empty() {
+            return (HashMap::new(), Vec::new());
+        }
+
+        // Build a flat (server_index, nameserver) work list of A+AAAA lookups
+        // and fan out in parallel. Only successful propagation servers — those
+        // that already answered the NS query — are queried; an unreachable
+        // server can't meaningfully report a per-vantage IP either.
+        let unique_vec: Vec<String> = unique.into_iter().collect();
+        let mut tasks = Vec::new();
+        for (idx, sr) in results.iter().enumerate() {
+            if !sr.success {
+                continue;
+            }
+            for ns in &unique_vec {
+                let resolver = self.resolver.clone();
+                let server_ip = sr.server.ip.clone();
+                let ns = ns.clone();
+                tasks.push(async move {
+                    let (a_res, aaaa_res) = tokio::join!(
+                        resolver.resolve(&ns, RecordType::A, Some(&server_ip)),
+                        resolver.resolve(&ns, RecordType::AAAA, Some(&server_ip)),
+                    );
+                    let mut ips: Vec<String> = Vec::new();
+                    if let Ok(records) = a_res {
+                        for r in &records {
+                            if let RecordData::A { address } = &r.data {
+                                ips.push(address.clone());
+                            }
+                        }
+                    }
+                    if let Ok(records) = aaaa_res {
+                        for r in &records {
+                            if let RecordData::AAAA { address } = &r.data {
+                                ips.push(address.clone());
+                            }
+                        }
+                    }
+                    ips.sort();
+                    ips.dedup();
+                    (idx, ns, ips)
+                });
             }
         }
 
-        let futures = unique.into_iter().map(|ns| {
-            let resolver = self.resolver.clone();
-            async move {
-                let (a_res, aaaa_res) = tokio::join!(
-                    resolver.resolve(&ns, RecordType::A, None),
-                    resolver.resolve(&ns, RecordType::AAAA, None),
-                );
+        let outputs = join_all(tasks).await;
+        for (idx, ns, ips) in outputs {
+            results[idx].nameserver_ips.insert(ns, ips);
+        }
 
-                let mut ips: Vec<String> = Vec::new();
-                if let Ok(records) = a_res {
-                    for r in &records {
-                        if let RecordData::A { address } = &r.data {
-                            ips.push(address.clone());
-                        }
-                    }
-                }
-                if let Ok(records) = aaaa_res {
-                    for r in &records {
-                        if let RecordData::AAAA { address } = &r.data {
-                            ips.push(address.clone());
-                        }
-                    }
-                }
-                (ns, ips)
-            }
-        });
-
-        join_all(futures).await.into_iter().collect()
+        let consensus = build_nameserver_consensus(results, &unique_vec);
+        let inconsistencies = build_nameserver_inconsistencies(results, &consensus);
+        (consensus, inconsistencies)
     }
 
     async fn query_server(
@@ -443,6 +550,7 @@ impl PropagationChecker {
                     response_time_ms,
                     success: true,
                     error: None,
+                    nameserver_ips: HashMap::new(),
                 }
             }
             Err(e) => {
@@ -458,6 +566,7 @@ impl PropagationChecker {
                     response_time_ms,
                     success: false,
                     error: Some(e.to_string()),
+                    nameserver_ips: HashMap::new(),
                 }
             }
         }
@@ -500,6 +609,7 @@ mod tests {
             unreachable_servers: vec![],
             dnssec_validated: false,
             resolved_ips: HashMap::new(),
+            nameserver_inconsistencies: vec![],
         };
         assert!(result.is_fully_propagated());
         assert!(!result.has_inconsistencies());
@@ -526,6 +636,7 @@ mod tests {
             unreachable_servers: vec![],
             dnssec_validated: false,
             resolved_ips: HashMap::new(),
+            nameserver_inconsistencies: vec![],
         };
         assert!(!result.is_fully_propagated());
         assert!(result.has_inconsistencies());
@@ -552,6 +663,7 @@ mod tests {
             }],
             dnssec_validated: false,
             resolved_ips: HashMap::new(),
+            nameserver_inconsistencies: vec![],
         };
         assert!(!result.has_inconsistencies());
         assert!(result.has_unreachable_servers());
@@ -577,6 +689,7 @@ mod tests {
             unreachable_servers: vec![],
             dnssec_validated: false,
             resolved_ips: HashMap::new(),
+            nameserver_inconsistencies: vec![],
         };
         assert!(result.has_inconsistencies());
         assert!(!result.has_unreachable_servers());
@@ -601,6 +714,7 @@ mod tests {
                 response_time_ms: 10,
                 success: true,
                 error: None,
+                nameserver_ips: HashMap::new(),
             },
             ServerResult {
                 server: bad_server.clone(),
@@ -608,6 +722,7 @@ mod tests {
                 response_time_ms: 5000,
                 success: false,
                 error: Some("timed out".to_string()),
+                nameserver_ips: HashMap::new(),
             },
         ];
 
@@ -663,6 +778,7 @@ mod tests {
                 response_time_ms: 10,
                 success: true,
                 error: None,
+                nameserver_ips: HashMap::new(),
             },
             ServerResult {
                 server: server.clone(),
@@ -677,6 +793,7 @@ mod tests {
                 response_time_ms: 15,
                 success: true,
                 error: None,
+                nameserver_ips: HashMap::new(),
             },
         ];
         let (pct, consensus, issues, unreachable) = analyze_results(&results, RecordType::A);
@@ -687,6 +804,107 @@ mod tests {
         );
         assert!(issues.is_empty());
         assert!(unreachable.is_empty());
+    }
+
+    fn ns_server_result(name: &str, ip: &str, ns_ips: &[(&str, &[&str])]) -> ServerResult {
+        let mut map: HashMap<String, Vec<String>> = HashMap::new();
+        for (ns, ips) in ns_ips {
+            let mut v: Vec<String> = ips.iter().map(|s| s.to_string()).collect();
+            v.sort();
+            map.insert(ns.to_string(), v);
+        }
+        ServerResult {
+            server: DnsServer::new(name, ip, "NA", "Test"),
+            records: vec![],
+            response_time_ms: 10,
+            success: true,
+            error: None,
+            nameserver_ips: map,
+        }
+    }
+
+    #[test]
+    fn nameserver_consensus_picks_majority_ip_set() {
+        // Two resolvers see 1.2.3.4 for ns1, one stale resolver sees 9.9.9.9.
+        let results = vec![
+            ns_server_result("A", "1.1.1.1", &[("ns1.example.com.", &["1.2.3.4"])]),
+            ns_server_result("B", "8.8.8.8", &[("ns1.example.com.", &["1.2.3.4"])]),
+            ns_server_result("C", "9.9.9.9", &[("ns1.example.com.", &["9.9.9.9"])]),
+        ];
+        let consensus = build_nameserver_consensus(&results, &["ns1.example.com.".to_string()]);
+        assert_eq!(
+            consensus.get("ns1.example.com.").cloned(),
+            Some(vec!["1.2.3.4".to_string()])
+        );
+    }
+
+    #[test]
+    fn nameserver_inconsistencies_flag_stale_vantage() {
+        // The third resolver still serves the old glue IP — it must surface
+        // as an inconsistency, not silently fold into the consensus.
+        let results = vec![
+            ns_server_result("A", "1.1.1.1", &[("ns1.example.com.", &["1.2.3.4"])]),
+            ns_server_result("B", "8.8.8.8", &[("ns1.example.com.", &["1.2.3.4"])]),
+            ns_server_result("Stale", "9.9.9.9", &[("ns1.example.com.", &["9.9.9.9"])]),
+        ];
+        let consensus = build_nameserver_consensus(&results, &["ns1.example.com.".to_string()]);
+        let inconsistencies = build_nameserver_inconsistencies(&results, &consensus);
+        assert_eq!(inconsistencies.len(), 1);
+        let inc = &inconsistencies[0];
+        assert_eq!(inc.server_name, "Stale");
+        assert_eq!(inc.nameserver, "ns1.example.com.");
+        assert_eq!(inc.values, vec!["9.9.9.9".to_string()]);
+        assert_eq!(inc.consensus, vec!["1.2.3.4".to_string()]);
+    }
+
+    #[test]
+    fn nameserver_inconsistencies_skip_servers_without_data() {
+        // Server C never got a chance to answer the A/AAAA followup (no entry
+        // in nameserver_ips) — must NOT be treated as "saw nothing" / a
+        // disagreement. Missing data ≠ wrong data.
+        let mut c = ns_server_result("C", "9.9.9.9", &[]);
+        c.nameserver_ips.clear();
+        let results = vec![
+            ns_server_result("A", "1.1.1.1", &[("ns1.example.com.", &["1.2.3.4"])]),
+            ns_server_result("B", "8.8.8.8", &[("ns1.example.com.", &["1.2.3.4"])]),
+            c,
+        ];
+        let consensus = build_nameserver_consensus(&results, &["ns1.example.com.".to_string()]);
+        let inconsistencies = build_nameserver_inconsistencies(&results, &consensus);
+        assert!(inconsistencies.is_empty(), "got: {:?}", inconsistencies);
+    }
+
+    #[test]
+    fn nameserver_inconsistencies_ignore_unsuccessful_servers() {
+        // Failed propagation servers must not contribute to consensus or
+        // inconsistency — they're missing data points, not divergent answers.
+        let mut failed = ns_server_result("Down", "203.0.113.1", &[]);
+        failed.success = false;
+        failed.error = Some("timed out".to_string());
+        let results = vec![
+            ns_server_result("A", "1.1.1.1", &[("ns1.example.com.", &["1.2.3.4"])]),
+            failed,
+        ];
+        let consensus = build_nameserver_consensus(&results, &["ns1.example.com.".to_string()]);
+        assert_eq!(
+            consensus.get("ns1.example.com.").cloned(),
+            Some(vec!["1.2.3.4".to_string()])
+        );
+        let inconsistencies = build_nameserver_inconsistencies(&results, &consensus);
+        assert!(inconsistencies.is_empty());
+    }
+
+    #[test]
+    fn nameserver_inconsistencies_skip_empty_consensus() {
+        // If nobody could resolve a nameserver, consensus is absent / empty —
+        // we have no "right" answer to compare against, so no inconsistency.
+        let results = vec![
+            ns_server_result("A", "1.1.1.1", &[("ns1.example.com.", &[])]),
+            ns_server_result("B", "8.8.8.8", &[("ns1.example.com.", &[])]),
+        ];
+        let consensus = build_nameserver_consensus(&results, &["ns1.example.com.".to_string()]);
+        let inconsistencies = build_nameserver_inconsistencies(&results, &consensus);
+        assert!(inconsistencies.is_empty(), "got: {:?}", inconsistencies);
     }
 
     #[test]
@@ -703,6 +921,7 @@ mod tests {
             unreachable_servers: vec![],
             dnssec_validated: false,
             resolved_ips: HashMap::new(),
+            nameserver_inconsistencies: vec![],
         };
         let json = serde_json::to_string(&result).unwrap();
         assert!(json.contains("test.com"));
@@ -710,6 +929,68 @@ mod tests {
         assert!(json.contains("unreachable_servers"));
         assert!(json.contains("dnssec_validated"));
     }
+}
+
+/// Compute the cross-server consensus IP set for each nameserver hostname.
+///
+/// For each hostname, picks the value set (sorted+deduped IPs) that the largest
+/// number of *successfully-responding* propagation servers agree on. Ties are
+/// broken by `HashMap` iteration order — fine in practice because ties only
+/// occur during active flux, which is exactly when the propagation report is
+/// meant to be ambiguous. Servers without an entry for a hostname (e.g. the
+/// per-vantage A/AAAA lookup wasn't issued) are skipped, not counted as empty.
+fn build_nameserver_consensus(
+    results: &[ServerResult],
+    nameservers: &[String],
+) -> HashMap<String, Vec<String>> {
+    let mut consensus = HashMap::new();
+    for ns in nameservers {
+        let mut counts: HashMap<&Vec<String>, usize> = HashMap::new();
+        for sr in results.iter().filter(|sr| sr.success) {
+            if let Some(ips) = sr.nameserver_ips.get(ns) {
+                *counts.entry(ips).or_insert(0) += 1;
+            }
+        }
+        if let Some((winner, _)) = counts.into_iter().max_by_key(|(_, c)| *c) {
+            consensus.insert(ns.clone(), winner.clone());
+        }
+    }
+    consensus
+}
+
+/// Build per-vantage inconsistencies: any successful server whose IP set for a
+/// nameserver disagrees with the consensus for that nameserver. Servers
+/// without an observed IP set for a given hostname are skipped (no data ≠ a
+/// disagreement). When the consensus itself is empty for a nameserver, no
+/// inconsistencies are emitted for that hostname — we only have a "wrong"
+/// answer if there's a "right" one to compare against.
+fn build_nameserver_inconsistencies(
+    results: &[ServerResult],
+    consensus: &HashMap<String, Vec<String>>,
+) -> Vec<NameserverIpInconsistency> {
+    let mut out = Vec::new();
+    for sr in results.iter().filter(|sr| sr.success) {
+        for (ns, ips) in &sr.nameserver_ips {
+            let Some(expected) = consensus.get(ns) else {
+                continue;
+            };
+            if expected.is_empty() {
+                continue;
+            }
+            if ips != expected {
+                out.push(NameserverIpInconsistency {
+                    server_name: sr.server.name.clone(),
+                    server_ip: sr.server.ip.clone(),
+                    nameserver: ns.clone(),
+                    values: ips.clone(),
+                    consensus: expected.clone(),
+                });
+            }
+        }
+    }
+    // Stable ordering for deterministic test output and human-readable diffs.
+    out.sort_by(|a, b| (&a.nameserver, &a.server_name).cmp(&(&b.nameserver, &b.server_name)));
+    out
 }
 
 fn analyze_results(

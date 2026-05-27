@@ -524,6 +524,33 @@ impl OutputFormatter for MarkdownFormatter {
             }
         }
 
+        // Per-vantage nameserver-IP disagreements (glue-update lag).
+        if !result.nameserver_inconsistencies.is_empty() {
+            output.push(String::new());
+            output.push("### Nameserver IP inconsistencies".to_string());
+            output.push(String::new());
+
+            let mut by_ns: std::collections::BTreeMap<&str, Vec<&_>> =
+                std::collections::BTreeMap::new();
+            for inc in &result.nameserver_inconsistencies {
+                by_ns.entry(inc.nameserver.as_str()).or_default().push(inc);
+            }
+
+            let single = by_ns.len() == 1;
+            for (ns, items) in &by_ns {
+                if !single {
+                    output.push(format!("**{}**", MdSafe(ns)));
+                    output.push(String::new());
+                }
+                for inc in items {
+                    output.push(format!("- {}", MdSafe(&inc.to_string())));
+                }
+                if !single {
+                    output.push(String::new());
+                }
+            }
+        }
+
         // Unreachable servers (distinct from answer conflicts)
         if !result.unreachable_servers.is_empty() {
             output.push(String::new());
@@ -556,11 +583,19 @@ impl OutputFormatter for MarkdownFormatter {
                         .iter()
                         .map(|r| {
                             let short = r.format_short();
-                            match result.resolved_ips.get(&short.to_ascii_lowercase()) {
-                                Some(ips) if !ips.is_empty() => {
-                                    format!("{} ({})", short, ips.join(", "))
-                                }
-                                _ => short,
+                            let key = short.to_ascii_lowercase();
+                            // Per-vantage view first, then cross-server
+                            // consensus as a fallback.
+                            let ips = sr
+                                .nameserver_ips
+                                .get(&key)
+                                .filter(|v| !v.is_empty())
+                                .or_else(|| {
+                                    result.resolved_ips.get(&key).filter(|v| !v.is_empty())
+                                });
+                            match ips {
+                                Some(ips) => format!("{} ({})", short, ips.join(", ")),
+                                None => short,
                             }
                         })
                         .collect::<Vec<_>>()

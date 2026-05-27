@@ -851,6 +851,40 @@ impl OutputFormatter for HumanFormatter {
             }
         }
 
+        // Per-vantage nameserver-IP disagreements. Surfaced alongside the
+        // NS-name inconsistency block because for glue-update tracking this
+        // is the *primary* signal — a regional resolver still serving the
+        // old IP for a nameserver hostname.
+        if !result.nameserver_inconsistencies.is_empty() {
+            output.push(format!(
+                "  {}:",
+                self.label("Nameserver IP inconsistencies")
+            ));
+
+            let mut by_ns: std::collections::BTreeMap<&str, Vec<&_>> =
+                std::collections::BTreeMap::new();
+            for inc in &result.nameserver_inconsistencies {
+                by_ns.entry(inc.nameserver.as_str()).or_default().push(inc);
+            }
+
+            let single = by_ns.len() == 1;
+            for (ns, items) in &by_ns {
+                let item_indent = if single {
+                    "    "
+                } else {
+                    output.push(format!("    {}:", self.label(ns)));
+                    "      "
+                };
+                for inc in items {
+                    output.push(format!(
+                        "{}- {}",
+                        item_indent,
+                        self.warning(&sanitize_display(&inc.to_string()))
+                    ));
+                }
+            }
+        }
+
         // Unreachable servers (timeouts, network errors) — distinct from
         // answer conflicts. Reporting these separately prevents a single
         // timeout from being misread as divergent DNS state.
@@ -903,11 +937,22 @@ impl OutputFormatter for HumanFormatter {
                                 .map(|r| {
                                     let short = r.format_short();
                                     let display = sanitize_display(&short);
-                                    match result.resolved_ips.get(&short.to_ascii_lowercase()) {
-                                        Some(ips) if !ips.is_empty() => {
-                                            format!("{} ({})", display, ips.join(", "))
-                                        }
-                                        _ => display,
+                                    // Prefer the per-vantage view: the IPs
+                                    // *this* resolver returned for the NS
+                                    // hostname. Fall back to the cross-server
+                                    // consensus only when the per-vantage
+                                    // lookup wasn't issued or yielded nothing.
+                                    let key = short.to_ascii_lowercase();
+                                    let ips = server_result
+                                        .nameserver_ips
+                                        .get(&key)
+                                        .filter(|v| !v.is_empty())
+                                        .or_else(|| {
+                                            result.resolved_ips.get(&key).filter(|v| !v.is_empty())
+                                        });
+                                    match ips {
+                                        Some(ips) => format!("{} ({})", display, ips.join(", ")),
+                                        None => display,
                                     }
                                 })
                                 .collect::<Vec<_>>()
@@ -3750,6 +3795,7 @@ mod tests {
             unreachable_servers: vec![],
             dnssec_validated: false,
             resolved_ips: std::collections::HashMap::new(),
+            nameserver_inconsistencies: vec![],
         }
     }
 
