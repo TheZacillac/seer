@@ -853,7 +853,16 @@ impl OutputFormatter for HumanFormatter {
                             server_result
                                 .records
                                 .iter()
-                                .map(|r| sanitize_display(&r.format_short()))
+                                .map(|r| {
+                                    let short = r.format_short();
+                                    let display = sanitize_display(&short);
+                                    match result.resolved_ips.get(&short.to_ascii_lowercase()) {
+                                        Some(ips) if !ips.is_empty() => {
+                                            format!("{} ({})", display, ips.join(", "))
+                                        }
+                                        _ => display,
+                                    }
+                                })
                                 .collect::<Vec<_>>()
                                 .join(", ")
                         }

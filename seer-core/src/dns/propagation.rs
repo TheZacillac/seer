@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use futures::future::join_all;
@@ -6,7 +6,7 @@ use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, instrument, warn};
 
-use super::records::{DnsRecord, RecordType};
+use super::records::{DnsRecord, RecordData, RecordType};
 use super::resolver::DnsResolver;
 use crate::error::{Result, SeerError};
 
@@ -155,6 +155,12 @@ pub struct PropagationResult {
     /// authenticity.
     #[serde(default = "default_dnssec_validated")]
     pub dnssec_validated: bool,
+    /// Resolved A/AAAA addresses for any nameserver hostnames returned by an
+    /// NS-record propagation check. Keyed by the hostname as it appears in the
+    /// record (typically FQDN with trailing dot). Empty for non-NS checks or
+    /// when resolution fails.
+    #[serde(default)]
+    pub resolved_ips: HashMap<String, Vec<String>>,
 }
 
 impl PropagationResult {
@@ -217,6 +223,11 @@ impl PropagationChecker {
     /// this guards against the aggregate wall-clock time exceeding a safe limit.
     const PROPAGATION_TIMEOUT: Duration = Duration::from_secs(15);
 
+    /// Hard cap on the post-check nameserver-IP enrichment step for NS lookups.
+    /// If it expires, propagation results are returned without IP annotations
+    /// rather than failing the whole call — enrichment is best-effort.
+    const NS_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(5);
+
     #[instrument(skip(self), fields(domain = %domain, record_type = %record_type))]
     pub async fn check(&self, domain: &str, record_type: RecordType) -> Result<PropagationResult> {
         debug!(servers = self.servers.len(), "Starting propagation check");
@@ -249,6 +260,29 @@ impl PropagationChecker {
         let (propagation_percentage, consensus_values, inconsistencies, unreachable_servers) =
             analyze_results(&results, record_type);
 
+        // For NS lookups, resolve each unique nameserver hostname to its IP
+        // address(es) so output formatters can show "ns1.example.com (1.2.3.4)".
+        // Bounded by NS_RESOLUTION_TIMEOUT so a slow secondary lookup cannot
+        // extend total wall-clock beyond the documented bound; on timeout we
+        // surface the propagation result without IP annotations.
+        let resolved_ips = if record_type == RecordType::NS {
+            tokio::time::timeout(
+                Self::NS_RESOLUTION_TIMEOUT,
+                self.resolve_nameserver_ips(&results),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                warn!(
+                    domain = %domain,
+                    timeout_secs = Self::NS_RESOLUTION_TIMEOUT.as_secs(),
+                    "Nameserver IP enrichment timed out; returning results without IP annotations"
+                );
+                HashMap::new()
+            })
+        } else {
+            HashMap::new()
+        };
+
         Ok(PropagationResult {
             domain: domain.to_string(),
             record_type,
@@ -263,7 +297,59 @@ impl PropagationChecker {
             // This field exists so callers / formatters can disclose the
             // lack of authentication to users.
             dnssec_validated: false,
+            resolved_ips,
         })
+    }
+
+    /// Collects unique NS hostnames across all server results and resolves
+    /// each to A/AAAA addresses via the default resolver. Failures yield an
+    /// empty list for that hostname — the caller treats missing IPs the same
+    /// as a failed resolution.
+    ///
+    /// Hostnames are lowercased for dedup so case-variant responses from
+    /// different upstream resolvers do not trigger redundant lookups.
+    /// Formatters must lowercase the record value before looking up the map.
+    async fn resolve_nameserver_ips(
+        &self,
+        results: &[ServerResult],
+    ) -> HashMap<String, Vec<String>> {
+        let mut unique: HashSet<String> = HashSet::new();
+        for sr in results {
+            for record in &sr.records {
+                if let RecordData::NS { nameserver } = &record.data {
+                    unique.insert(nameserver.to_ascii_lowercase());
+                }
+            }
+        }
+
+        let futures = unique.into_iter().map(|ns| {
+            let resolver = self.resolver.clone();
+            async move {
+                let (a_res, aaaa_res) = tokio::join!(
+                    resolver.resolve(&ns, RecordType::A, None),
+                    resolver.resolve(&ns, RecordType::AAAA, None),
+                );
+
+                let mut ips: Vec<String> = Vec::new();
+                if let Ok(records) = a_res {
+                    for r in &records {
+                        if let RecordData::A { address } = &r.data {
+                            ips.push(address.clone());
+                        }
+                    }
+                }
+                if let Ok(records) = aaaa_res {
+                    for r in &records {
+                        if let RecordData::AAAA { address } = &r.data {
+                            ips.push(address.clone());
+                        }
+                    }
+                }
+                (ns, ips)
+            }
+        });
+
+        join_all(futures).await.into_iter().collect()
     }
 
     async fn query_server(
@@ -349,6 +435,7 @@ mod tests {
             inconsistencies: vec![],
             unreachable_servers: vec![],
             dnssec_validated: false,
+            resolved_ips: HashMap::new(),
         };
         assert!(result.is_fully_propagated());
         assert!(!result.has_inconsistencies());
@@ -368,6 +455,7 @@ mod tests {
             inconsistencies: vec!["Server X has different value".to_string()],
             unreachable_servers: vec![],
             dnssec_validated: false,
+            resolved_ips: HashMap::new(),
         };
         assert!(!result.is_fully_propagated());
         assert!(result.has_inconsistencies());
@@ -393,6 +481,7 @@ mod tests {
                 error: Some("timed out".to_string()),
             }],
             dnssec_validated: false,
+            resolved_ips: HashMap::new(),
         };
         assert!(!result.has_inconsistencies());
         assert!(result.has_unreachable_servers());
@@ -413,6 +502,7 @@ mod tests {
             ],
             unreachable_servers: vec![],
             dnssec_validated: false,
+            resolved_ips: HashMap::new(),
         };
         assert!(result.has_inconsistencies());
         assert!(!result.has_unreachable_servers());
@@ -532,6 +622,7 @@ mod tests {
             inconsistencies: vec![],
             unreachable_servers: vec![],
             dnssec_validated: false,
+            resolved_ips: HashMap::new(),
         };
         let json = serde_json::to_string(&result).unwrap();
         assert!(json.contains("test.com"));

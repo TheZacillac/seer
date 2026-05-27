@@ -508,7 +508,15 @@ impl OutputFormatter for MarkdownFormatter {
                 } else {
                     sr.records
                         .iter()
-                        .map(|r| r.format_short())
+                        .map(|r| {
+                            let short = r.format_short();
+                            match result.resolved_ips.get(&short.to_ascii_lowercase()) {
+                                Some(ips) if !ips.is_empty() => {
+                                    format!("{} ({})", short, ips.join(", "))
+                                }
+                                _ => short,
+                            }
+                        })
                         .collect::<Vec<_>>()
                         .join(", ")
                 }
