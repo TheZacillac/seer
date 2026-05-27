@@ -112,6 +112,34 @@ pub struct ServerResult {
     pub error: Option<String>,
 }
 
+/// A consensus DNS value tagged with the record type it was observed for.
+///
+/// Carries the record type alongside the value so downstream consumers
+/// (formatters, API clients) do not have to cross-reference the parent
+/// `PropagationResult.record_type` to know what kind of record a given
+/// consensus entry represents.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ConsensusValue {
+    #[serde(rename = "type")]
+    pub record_type: RecordType,
+    pub value: String,
+}
+
+impl ConsensusValue {
+    pub fn new(record_type: RecordType, value: impl Into<String>) -> Self {
+        Self {
+            record_type,
+            value: value.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for ConsensusValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.record_type, self.value)
+    }
+}
+
 /// Record of a server that failed to respond during a propagation check.
 ///
 /// Distinct from `inconsistencies` — unreachable servers returned no answer at
@@ -123,6 +151,42 @@ pub struct UnreachableServer {
     pub name: String,
     pub ip: String,
     pub error: Option<String>,
+}
+
+/// A server that responded successfully but with an answer that differs from
+/// the consensus. Carries the queried record type and the raw value sets on
+/// both sides so consumers can render or compare them without parsing strings.
+///
+/// Empty `values` / `consensus` represent NXDOMAIN (no records).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Inconsistency {
+    #[serde(rename = "type")]
+    pub record_type: RecordType,
+    pub server_name: String,
+    pub server_ip: String,
+    pub values: Vec<String>,
+    pub consensus: Vec<String>,
+}
+
+impl std::fmt::Display for Inconsistency {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let render = |v: &[String]| -> String {
+            if v.is_empty() {
+                "NXDOMAIN".to_string()
+            } else {
+                v.join(", ")
+            }
+        };
+        write!(
+            f,
+            "{} ({}) [{}]: {} vs consensus: {}",
+            self.server_name,
+            self.server_ip,
+            self.record_type,
+            render(&self.values),
+            render(&self.consensus),
+        )
+    }
 }
 
 fn default_dnssec_validated() -> bool {
@@ -138,11 +202,11 @@ pub struct PropagationResult {
     pub servers_responding: usize,
     pub propagation_percentage: f64,
     pub results: Vec<ServerResult>,
-    pub consensus_values: Vec<String>,
+    pub consensus_values: Vec<ConsensusValue>,
     /// Servers that responded successfully but with an answer that differs
     /// from the consensus. A non-empty value means the domain has genuinely
     /// divergent answers in flight.
-    pub inconsistencies: Vec<String>,
+    pub inconsistencies: Vec<Inconsistency>,
     /// Servers that could not be reached (timeouts, network errors, refusals).
     /// These are NOT inconsistencies — they are missing data points.
     #[serde(default)]
@@ -431,7 +495,7 @@ mod tests {
             servers_responding: 10,
             propagation_percentage: 100.0,
             results: vec![],
-            consensus_values: vec!["1.2.3.4".to_string()],
+            consensus_values: vec![ConsensusValue::new(RecordType::A, "1.2.3.4")],
             inconsistencies: vec![],
             unreachable_servers: vec![],
             dnssec_validated: false,
@@ -451,8 +515,14 @@ mod tests {
             servers_responding: 8,
             propagation_percentage: 75.0,
             results: vec![],
-            consensus_values: vec!["1.2.3.4".to_string()],
-            inconsistencies: vec!["Server X has different value".to_string()],
+            consensus_values: vec![ConsensusValue::new(RecordType::A, "1.2.3.4")],
+            inconsistencies: vec![Inconsistency {
+                record_type: RecordType::A,
+                server_name: "Server X".to_string(),
+                server_ip: "203.0.113.99".to_string(),
+                values: vec!["9.9.9.9".to_string()],
+                consensus: vec!["1.2.3.4".to_string()],
+            }],
             unreachable_servers: vec![],
             dnssec_validated: false,
             resolved_ips: HashMap::new(),
@@ -473,7 +543,7 @@ mod tests {
             servers_responding: 28,
             propagation_percentage: (28.0 / 29.0) * 100.0,
             results: vec![],
-            consensus_values: vec!["1.2.3.4".to_string()],
+            consensus_values: vec![ConsensusValue::new(RecordType::A, "1.2.3.4")],
             inconsistencies: vec![],
             unreachable_servers: vec![UnreachableServer {
                 name: "Flaky DNS".to_string(),
@@ -496,10 +566,14 @@ mod tests {
             servers_responding: 10,
             propagation_percentage: 90.0,
             results: vec![],
-            consensus_values: vec!["1.2.3.4".to_string()],
-            inconsistencies: vec![
-                "Server Y (203.0.113.2): 5.6.7.8 vs consensus: 1.2.3.4".to_string()
-            ],
+            consensus_values: vec![ConsensusValue::new(RecordType::A, "1.2.3.4")],
+            inconsistencies: vec![Inconsistency {
+                record_type: RecordType::A,
+                server_name: "Server Y".to_string(),
+                server_ip: "203.0.113.2".to_string(),
+                values: vec!["5.6.7.8".to_string()],
+                consensus: vec!["1.2.3.4".to_string()],
+            }],
             unreachable_servers: vec![],
             dnssec_validated: false,
             resolved_ips: HashMap::new(),
@@ -561,11 +635,14 @@ mod tests {
 
     #[test]
     fn test_analyze_empty_results() {
+        // No servers at all → no consensus, no inconsistencies (a missing
+        // answer is reported via unreachable_servers / servers_responding,
+        // not as a fake "no servers responded" inconsistency).
         let results: Vec<ServerResult> = vec![];
         let (pct, consensus, issues, unreachable) = analyze_results(&results, RecordType::A);
         assert_eq!(pct, 0.0);
         assert!(consensus.is_empty());
-        assert!(!issues.is_empty());
+        assert!(issues.is_empty());
         assert!(unreachable.is_empty());
     }
 
@@ -604,7 +681,7 @@ mod tests {
         ];
         let (pct, consensus, issues, unreachable) = analyze_results(&results, RecordType::A);
         assert_eq!(pct, 100.0);
-        assert_eq!(consensus, vec!["1.2.3.4"]);
+        assert_eq!(consensus, vec![ConsensusValue::new(RecordType::A, "1.2.3.4")]);
         assert!(issues.is_empty());
         assert!(unreachable.is_empty());
     }
@@ -618,7 +695,7 @@ mod tests {
             servers_responding: 5,
             propagation_percentage: 100.0,
             results: vec![],
-            consensus_values: vec!["1.2.3.4".to_string()],
+            consensus_values: vec![ConsensusValue::new(RecordType::A, "1.2.3.4")],
             inconsistencies: vec![],
             unreachable_servers: vec![],
             dnssec_validated: false,
@@ -635,7 +712,12 @@ mod tests {
 fn analyze_results(
     results: &[ServerResult],
     record_type: RecordType,
-) -> (f64, Vec<String>, Vec<String>, Vec<UnreachableServer>) {
+) -> (
+    f64,
+    Vec<ConsensusValue>,
+    Vec<Inconsistency>,
+    Vec<UnreachableServer>,
+) {
     // Collect unreachable servers up front so they are reported regardless of
     // whether any server succeeded.
     let unreachable_servers: Vec<UnreachableServer> = results
@@ -651,12 +733,10 @@ fn analyze_results(
     let successful: Vec<_> = results.iter().filter(|r| r.success).collect();
 
     if successful.is_empty() {
-        return (
-            0.0,
-            vec![],
-            vec!["No servers responded".to_string()],
-            unreachable_servers,
-        );
+        // No genuine answer conflicts — every server is in `unreachable_servers`.
+        // Callers detect "no data" via `servers_responding == 0`, not via
+        // a synthetic inconsistency.
+        return (0.0, vec![], vec![], unreachable_servers);
     }
 
     // Build sorted value sets once per server result
@@ -679,38 +759,28 @@ fn analyze_results(
     let Some((consensus_values, consensus_count)) =
         value_counts.into_iter().max_by_key(|(_, count)| *count)
     else {
-        // Should never happen since successful is non-empty, but handle gracefully
-        return (
-            0.0,
-            vec![],
-            vec!["No propagation data to analyze".to_string()],
-            unreachable_servers,
-        );
+        // Should never happen since `successful` is non-empty (every successful
+        // result contributes a value set), but handle gracefully.
+        return (0.0, vec![], vec![], unreachable_servers);
     };
 
     // Calculate propagation percentage based on ALL servers checked (not just
     // responding ones) so unreachable servers count as non-propagated.
     let propagation_percentage = (consensus_count as f64 / results.len() as f64) * 100.0;
 
-    // Find inconsistencies (reuse pre-computed sorted value sets)
-    let consensus_str = if consensus_values.is_empty() {
-        "NXDOMAIN".to_string()
-    } else {
-        consensus_values.join(", ")
-    };
-
-    let mut inconsistencies = Vec::new();
+    // Find inconsistencies (reuse pre-computed sorted value sets).
+    // We emit structured records carrying the record type and raw value sets;
+    // formatters can render however they like via `Display`.
+    let mut inconsistencies: Vec<Inconsistency> = Vec::new();
     for (result, values) in successful.iter().zip(sorted_value_sets.iter()) {
         if values != consensus_values {
-            let server_values = if values.is_empty() {
-                "NXDOMAIN".to_string()
-            } else {
-                values.join(", ")
-            };
-            inconsistencies.push(format!(
-                "{} ({}): {} vs consensus: {}",
-                result.server.name, result.server.ip, server_values, consensus_str
-            ));
+            inconsistencies.push(Inconsistency {
+                record_type,
+                server_name: result.server.name.clone(),
+                server_ip: result.server.ip.clone(),
+                values: values.clone(),
+                consensus: consensus_values.clone(),
+            });
         }
     }
 
@@ -726,9 +796,16 @@ fn analyze_results(
         // No records is a valid state for optional record types
     }
 
+    // Tag each consensus value with the queried record type so downstream
+    // consumers don't have to cross-reference `PropagationResult.record_type`.
+    let tagged_consensus: Vec<ConsensusValue> = consensus_values
+        .iter()
+        .map(|v| ConsensusValue::new(record_type, v.clone()))
+        .collect();
+
     (
         propagation_percentage,
-        consensus_values.clone(),
+        tagged_consensus,
         inconsistencies,
         unreachable_servers,
     )

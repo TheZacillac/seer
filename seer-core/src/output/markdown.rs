@@ -455,26 +455,68 @@ impl OutputFormatter for MarkdownFormatter {
             result.servers_responding, result.servers_checked
         ));
 
-        // Consensus values
+        // Consensus values, grouped by record type. Single-type results
+        // collapse to one line; multi-type results get one line per type.
         if !result.consensus_values.is_empty() {
-            output.push(format!(
-                "- **Consensus values**: {}",
-                result
-                    .consensus_values
+            let mut grouped: std::collections::BTreeMap<String, Vec<&str>> =
+                std::collections::BTreeMap::new();
+            for v in &result.consensus_values {
+                grouped
+                    .entry(v.record_type.to_string())
+                    .or_default()
+                    .push(v.value.as_str());
+            }
+
+            if grouped.len() == 1 {
+                let (_, values) = grouped.iter().next().unwrap();
+                let rendered = values
                     .iter()
                     .map(|v| format!("`{}`", MdSafe(v)))
                     .collect::<Vec<_>>()
-                    .join(", ")
-            ));
+                    .join(", ");
+                output.push(format!("- **Consensus values**: {}", rendered));
+            } else {
+                output.push("- **Consensus values**:".to_string());
+                for (record_type, values) in &grouped {
+                    let rendered = values
+                        .iter()
+                        .map(|v| format!("`{}`", MdSafe(v)))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    output.push(format!("    - **{}**: {}", MdSafe(record_type), rendered));
+                }
+            }
         }
 
-        // Inconsistencies (genuine answer conflicts)
+        // Inconsistencies (genuine answer conflicts), grouped by record type.
         if !result.inconsistencies.is_empty() {
             output.push(String::new());
             output.push("### Inconsistencies".to_string());
             output.push(String::new());
-            for inconsistency in &result.inconsistencies {
-                output.push(format!("- {}", MdSafe(inconsistency)));
+
+            let mut grouped: std::collections::BTreeMap<
+                String,
+                Vec<&crate::dns::Inconsistency>,
+            > = std::collections::BTreeMap::new();
+            for inc in &result.inconsistencies {
+                grouped
+                    .entry(inc.record_type.to_string())
+                    .or_default()
+                    .push(inc);
+            }
+
+            let single_type = grouped.len() == 1;
+            for (record_type, items) in &grouped {
+                if !single_type {
+                    output.push(format!("**{}**", MdSafe(record_type)));
+                    output.push(String::new());
+                }
+                for inc in items {
+                    output.push(format!("- {}", MdSafe(&inc.to_string())));
+                }
+                if !single_type {
+                    output.push(String::new());
+                }
             }
         }
 

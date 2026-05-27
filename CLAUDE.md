@@ -1167,6 +1167,26 @@ previously only logged a warning:
 Additionally, `/docs`, `/redoc`, and `/openapi.json` are now disabled by
 default; set `SEER_DOCS_ENABLED=true` to re-enable.
 
+### Breaking change (2026-05-27) — propagation result shape
+
+`PropagationResult.consensus_values` and `PropagationResult.inconsistencies`
+on `/propagation/*` (and the equivalent MCP tool) changed shape:
+
+- `consensus_values` was `Vec<String>` (e.g. `["1.2.3.4"]`). It is now
+  `Vec<ConsensusValue>` where each entry is `{"type": "A", "value": "1.2.3.4"}`,
+  so consumers no longer have to cross-reference `record_type` to know what
+  kind of record a value represents.
+- `inconsistencies` was `Vec<String>` of pre-formatted lines
+  (`"Quad9 (9.9.9.9): 5.6.7.8 vs consensus: 1.2.3.4"`). It is now
+  `Vec<Inconsistency>` where each entry is
+  `{"type": "A", "server_name": "Quad9", "server_ip": "9.9.9.9",
+  "values": ["5.6.7.8"], "consensus": ["1.2.3.4"]}`. The `Display` impl
+  reproduces the old format (now `[A]`-tagged) for human-readable logs.
+
+The human and markdown formatters group both fields by record type and
+collapse the per-type subheader when only one type is present (the common
+case today).
+
 ---
 
 ## Performance Considerations

@@ -6,7 +6,7 @@ use regex::Regex;
 use super::OutputFormatter;
 use crate::caa::{CaaPolicy, IssuerCaaMatch};
 use crate::colors::CatppuccinExt;
-use crate::dns::{DnsRecord, FollowIteration, FollowResult, PropagationResult};
+use crate::dns::{DnsRecord, FollowIteration, FollowResult, Inconsistency, PropagationResult};
 use crate::lookup::LookupResult;
 use crate::rdap::RdapResponse;
 use crate::status::StatusResponse;
@@ -785,22 +785,69 @@ impl OutputFormatter for HumanFormatter {
             result.servers_checked
         ));
 
-        // Consensus values
+        // Consensus values, grouped by record type. When only one type is
+        // present (the common case — `check()` queries a single type), we
+        // skip the per-type subheader to keep output tight; multi-type
+        // results get a labeled block per type.
         if !result.consensus_values.is_empty() {
             output.push(format!("  {}:", self.label("Consensus values")));
-            for value in &result.consensus_values {
-                output.push(format!("    - {}", self.success(&sanitize_display(value))));
+
+            let mut grouped: std::collections::BTreeMap<String, Vec<&str>> =
+                std::collections::BTreeMap::new();
+            for v in &result.consensus_values {
+                grouped
+                    .entry(v.record_type.to_string())
+                    .or_default()
+                    .push(v.value.as_str());
+            }
+
+            let single_type = grouped.len() == 1;
+            for (record_type, values) in &grouped {
+                let item_indent = if single_type {
+                    "    "
+                } else {
+                    output.push(format!("    {}:", self.label(record_type)));
+                    "      "
+                };
+                for v in values {
+                    output.push(format!(
+                        "{}- {}",
+                        item_indent,
+                        self.success(&sanitize_display(v))
+                    ));
+                }
             }
         }
 
-        // Inconsistencies (genuine answer conflicts only)
+        // Inconsistencies (genuine answer conflicts only). Same grouping
+        // rule as consensus values for symmetry.
         if !result.inconsistencies.is_empty() {
             output.push(format!("  {}:", self.label("Inconsistencies")));
-            for inconsistency in &result.inconsistencies {
-                output.push(format!(
-                    "    - {}",
-                    self.warning(&sanitize_display(inconsistency))
-                ));
+
+            let mut grouped: std::collections::BTreeMap<String, Vec<&Inconsistency>> =
+                std::collections::BTreeMap::new();
+            for inc in &result.inconsistencies {
+                grouped
+                    .entry(inc.record_type.to_string())
+                    .or_default()
+                    .push(inc);
+            }
+
+            let single_type = grouped.len() == 1;
+            for (record_type, items) in &grouped {
+                let item_indent = if single_type {
+                    "    "
+                } else {
+                    output.push(format!("    {}:", self.label(record_type)));
+                    "      "
+                };
+                for inc in items {
+                    output.push(format!(
+                        "{}- {}",
+                        item_indent,
+                        self.warning(&sanitize_display(&inc.to_string()))
+                    ));
+                }
             }
         }
 
@@ -3669,6 +3716,113 @@ mod tests {
             org_line.contains("\x1b[90m"),
             "em-dash should be dim (bright-black ANSI): {:?}",
             org_line
+        );
+    }
+
+    fn propagation_fixture(
+        consensus: Vec<(crate::dns::RecordType, &str)>,
+        inconsistencies: Vec<(crate::dns::RecordType, &str, &str, Vec<&str>, Vec<&str>)>,
+    ) -> PropagationResult {
+        PropagationResult {
+            domain: "example.com".to_string(),
+            record_type: consensus
+                .first()
+                .map(|(t, _)| *t)
+                .unwrap_or(crate::dns::RecordType::A),
+            servers_checked: 5,
+            servers_responding: 5,
+            propagation_percentage: 100.0,
+            results: vec![],
+            consensus_values: consensus
+                .into_iter()
+                .map(|(t, v)| crate::dns::ConsensusValue::new(t, v))
+                .collect(),
+            inconsistencies: inconsistencies
+                .into_iter()
+                .map(|(t, name, ip, values, cons)| Inconsistency {
+                    record_type: t,
+                    server_name: name.to_string(),
+                    server_ip: ip.to_string(),
+                    values: values.into_iter().map(String::from).collect(),
+                    consensus: cons.into_iter().map(String::from).collect(),
+                })
+                .collect(),
+            unreachable_servers: vec![],
+            dnssec_validated: false,
+            resolved_ips: std::collections::HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn propagation_single_type_skips_per_type_subheader() {
+        let f = formatter();
+        let result = propagation_fixture(
+            vec![
+                (crate::dns::RecordType::A, "1.2.3.4"),
+                (crate::dns::RecordType::A, "5.6.7.8"),
+            ],
+            vec![],
+        );
+        let out = f.format_propagation(&result);
+
+        assert!(out.contains("Consensus values:"), "got: {}", out);
+        // Single-type: values appear directly under the section header
+        // without an extra "A:" sub-label.
+        assert!(out.contains("    - 1.2.3.4"), "got: {}", out);
+        assert!(out.contains("    - 5.6.7.8"), "got: {}", out);
+        // No per-type subheader for the only type present.
+        assert!(
+            !out.contains("    A:"),
+            "single-type output should not emit a type subheader, got: {}",
+            out
+        );
+    }
+
+    #[test]
+    fn propagation_multi_type_groups_with_subheaders() {
+        let f = formatter();
+        let result = propagation_fixture(
+            vec![
+                (crate::dns::RecordType::A, "1.2.3.4"),
+                (crate::dns::RecordType::AAAA, "2001:db8::1"),
+            ],
+            vec![],
+        );
+        let out = f.format_propagation(&result);
+
+        // Multi-type: each type gets its own subheader and items indent deeper.
+        assert!(out.contains("    A:"), "missing A subheader, got: {}", out);
+        assert!(
+            out.contains("    AAAA:"),
+            "missing AAAA subheader, got: {}",
+            out
+        );
+        assert!(out.contains("      - 1.2.3.4"), "got: {}", out);
+        assert!(out.contains("      - 2001:db8::1"), "got: {}", out);
+    }
+
+    #[test]
+    fn propagation_inconsistencies_render_with_record_type() {
+        let f = formatter();
+        let result = propagation_fixture(
+            vec![(crate::dns::RecordType::A, "1.2.3.4")],
+            vec![(
+                crate::dns::RecordType::A,
+                "Quad9",
+                "9.9.9.9",
+                vec!["5.6.7.8"],
+                vec!["1.2.3.4"],
+            )],
+        );
+        let out = f.format_propagation(&result);
+
+        // The Display impl on Inconsistency tags the record type inline so a
+        // consumer reading a flat log line still sees what kind of record
+        // diverged.
+        assert!(
+            out.contains("Quad9 (9.9.9.9) [A]: 5.6.7.8 vs consensus: 1.2.3.4"),
+            "expected typed inconsistency line, got: {}",
+            out
         );
     }
 }
