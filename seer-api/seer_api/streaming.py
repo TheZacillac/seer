@@ -94,7 +94,14 @@ async def stream_bulk(
         # no longer upgrade the HTTP status and must instead ensure the body
         # never leaks internal paths, Rust panic strings, or tracebacks. The
         # full exception is logged server-side for diagnosis (H13).
-        assert pending_results is not None or pending_error is not None
+        # Explicit `raise` rather than `assert` — `assert` is stripped under
+        # `python -O`, which would let a logic bug fall into the
+        # `pending_results` for-loop below with `None` and raise TypeError
+        # to the client instead of being caught here.
+        if pending_results is None and pending_error is None:
+            raise RuntimeError(
+                "unreachable: bulk future completed with no result and no error"
+            )
         if pending_error is not None:
             logger.exception(
                 "streaming bulk failure",

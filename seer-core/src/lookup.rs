@@ -135,17 +135,21 @@ fn should_route_to_availability(
     if rdap_returned_200 {
         return None;
     }
-    rdap_seer_error
-        .and_then(|e| classify_whois_leg(whois_data, e))
-        .or_else(|| {
-            // Case A can still fire even when RDAP errored for a non-404
-            // reason — the WHOIS signal alone is sufficient.
-            if whois_data.is_available() {
-                Some(("high", "whois"))
-            } else {
-                None
-            }
-        })
+    // `is_available()` streams the raw response (~1 MB worst case) line by
+    // line. Compute it once and reuse — `classify_whois_leg` also calls it,
+    // so the original code paid the scan twice on every non-404 RDAP-error
+    // path. We pre-check Case A here; if it doesn't fire we drop into the
+    // 404+thin Case B branch via `classify_whois_leg`.
+    if whois_data.is_available() {
+        return Some(("high", "whois"));
+    }
+    rdap_seer_error.and_then(|e| {
+        // Case B only: WHOIS is not available, so the only remaining path
+        // is "thin WHOIS + RDAP 404". `classify_whois_leg` will re-check
+        // `is_available()` for free (it's false now), so this is a single
+        // additional thin-check call.
+        classify_whois_leg(whois_data, e)
+    })
 }
 
 /// Sanitizes an error message for inclusion in a public-facing response.

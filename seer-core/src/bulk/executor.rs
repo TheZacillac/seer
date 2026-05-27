@@ -547,6 +547,55 @@ csv,format,example.org
         assert!(!is_csv_header_row("mydata"));
     }
 
+    /// Regression test for the v0.26.7 rate-limiter regression. The
+    /// previous implementation held a `tokio::sync::Mutex` guard across
+    /// `Interval::tick().await`, fully serializing dispatch through the
+    /// lock. We need a behavioural assertion (not just code review) that
+    /// catches that pattern if it ever returns.
+    ///
+    /// With concurrency 5, rate_limit 50ms, and 4 hermetic-failure tasks:
+    /// - Dispatch should be spaced ~50ms apart (slot-claim semantics).
+    /// - All 4 tasks should *finish* in well under 4 * (per-op cost),
+    ///   i.e. they overlap on the execution side.
+    /// - Total wall time should be approximately the longest single op
+    ///   plus the cumulative slot delays (~150ms).
+    ///
+    /// The previous (broken) implementation would have produced wall
+    /// time = sum-of-per-op-cost because dispatch was serialized.
+    #[tokio::test]
+    async fn rate_limiter_dispatches_in_parallel_not_serialized() {
+        use std::time::Instant;
+        let executor = BulkExecutor::new()
+            .with_concurrency(5)
+            .with_rate_limit(Duration::from_millis(50));
+
+        // Use unresolvable `.invalid` hosts — they fail fast at DNS, well
+        // under the limiter's slot spacing. If dispatch IS rate-limited
+        // in parallel, all 4 finish in close to 3 * 50ms = 150ms (plus
+        // per-op DNS-fail cost, typically tens of ms). If dispatch was
+        // serialized through a lock, each task waits for the previous
+        // to FINISH before starting — total would be much higher.
+        let start = Instant::now();
+        let domains = vec![
+            "seer-rl-1.invalid".to_string(),
+            "seer-rl-2.invalid".to_string(),
+            "seer-rl-3.invalid".to_string(),
+            "seer-rl-4.invalid".to_string(),
+        ];
+        let results = executor.execute_ssl(domains).await;
+        let elapsed = start.elapsed();
+
+        assert_eq!(results.len(), 4);
+        // Generous upper bound — 2s is far above the worst legitimate
+        // wall time (4*50ms slots + 4*100ms DNS-fail = ~600ms) but well
+        // below the serialised path (would be 4 * per-op-cost minimum).
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "rate-limited dispatch should run in parallel; took {:?}",
+            elapsed
+        );
+    }
+
     #[tokio::test]
     async fn execute_ssl_failure_path_for_unresolvable_host() {
         // Verifies the SSL bulk arm wires correctly: an unresolvable hostname

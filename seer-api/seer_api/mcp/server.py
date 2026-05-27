@@ -456,7 +456,11 @@ async def execute_tool(name: str, arguments: dict[str, Any]) -> Any:
 
         case "seer_rdap_ip":
             ip = _require_str(arguments, "ip")
-            _ssrf_guard(ip, 443)
+            # Move the SSRF guard off the event loop — `_ssrf_guard` enters
+            # PyO3 and `block_on`s a DNS resolution, which would pin the
+            # event loop for the resolver timeout. Mirrors the
+            # `seer_bulk_status` / `seer_bulk_ssl` pattern.
+            await loop.run_in_executor(None, _ssrf_guard, ip, 443)
             return await loop.run_in_executor(None, seer.rdap_ip, ip)
 
         case "seer_rdap_asn":
@@ -472,7 +476,7 @@ async def execute_tool(name: str, arguments: dict[str, Any]) -> Any:
             if nameserver is not None and not isinstance(nameserver, str):
                 raise ValueError(f"'nameserver' must be a string (got {type(nameserver).__name__})")
             if nameserver is not None:
-                _ssrf_guard(nameserver, 53)
+                await loop.run_in_executor(None, _ssrf_guard, nameserver, 53)
             return await loop.run_in_executor(
                 None, seer.dig, domain, record_type, nameserver
             )
@@ -486,7 +490,7 @@ async def execute_tool(name: str, arguments: dict[str, Any]) -> Any:
 
         case "seer_status":
             domain = _require_str(arguments, "domain")
-            _ssrf_guard(domain, 443)
+            await loop.run_in_executor(None, _ssrf_guard, domain, 443)
             return await loop.run_in_executor(None, seer.status, domain)
 
         case "seer_bulk_lookup":

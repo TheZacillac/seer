@@ -1203,13 +1203,18 @@ impl OutputFormatter for MarkdownFormatter {
             output.push("| Key Tag | Algorithm | Digest Type | Matched | Verified |".to_string());
             output.push("| --- | --- | --- | --- | --- |".to_string());
             for ds in &report.ds_records {
+                // `algorithm_name` / `digest_type_name` come from a small
+                // internal lookup table today, but wrapping in MdSafe is
+                // cheap and prevents a future contributor adding a parser
+                // path that pulls these from the wire from producing a
+                // Markdown injection.
                 output.push(format!(
                     "| {} | {} ({}) | {} ({}) | {} | {} |",
                     ds.key_tag,
                     ds.algorithm,
-                    ds.algorithm_name,
+                    MdSafe(&ds.algorithm_name),
                     ds.digest_type,
-                    ds.digest_type_name,
+                    MdSafe(&ds.digest_type_name),
                     if ds.matched_key { "yes" } else { "no" },
                     if ds.digest_verified { "yes" } else { "no" },
                 ));
@@ -1232,7 +1237,11 @@ impl OutputFormatter for MarkdownFormatter {
                 };
                 output.push(format!(
                     "| {} | {} | {} | {} ({}) |",
-                    key.key_tag, key.flags, role, key.algorithm, key.algorithm_name
+                    key.key_tag,
+                    key.flags,
+                    role,
+                    key.algorithm,
+                    MdSafe(&key.algorithm_name)
                 ));
             }
         }
