@@ -681,7 +681,10 @@ mod tests {
         ];
         let (pct, consensus, issues, unreachable) = analyze_results(&results, RecordType::A);
         assert_eq!(pct, 100.0);
-        assert_eq!(consensus, vec![ConsensusValue::new(RecordType::A, "1.2.3.4")]);
+        assert_eq!(
+            consensus,
+            vec![ConsensusValue::new(RecordType::A, "1.2.3.4")]
+        );
         assert!(issues.is_empty());
         assert!(unreachable.is_empty());
     }

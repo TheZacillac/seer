@@ -468,7 +468,13 @@ impl OutputFormatter for MarkdownFormatter {
             }
 
             if grouped.len() == 1 {
-                let (_, values) = grouped.iter().next().unwrap();
+                // grouped is non-empty here (len == 1), so `next()` always
+                // yields. Using `expect()` keeps `-D clippy::unwrap_used`
+                // happy and documents the invariant.
+                let (_, values) = grouped
+                    .iter()
+                    .next()
+                    .expect("BTreeMap with len == 1 always yields one entry");
                 let rendered = values
                     .iter()
                     .map(|v| format!("`{}`", MdSafe(v)))
@@ -494,10 +500,8 @@ impl OutputFormatter for MarkdownFormatter {
             output.push("### Inconsistencies".to_string());
             output.push(String::new());
 
-            let mut grouped: std::collections::BTreeMap<
-                String,
-                Vec<&crate::dns::Inconsistency>,
-            > = std::collections::BTreeMap::new();
+            let mut grouped: std::collections::BTreeMap<String, Vec<&crate::dns::Inconsistency>> =
+                std::collections::BTreeMap::new();
             for inc in &result.inconsistencies {
                 grouped
                     .entry(inc.record_type.to_string())
