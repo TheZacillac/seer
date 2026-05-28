@@ -25,11 +25,13 @@ pub(super) type PerVantage = HashMap<String, HashMap<String, Vec<String>>>;
 /// Compute the cross-server consensus IP set for each nameserver hostname.
 ///
 /// For each hostname, picks the value set (sorted+deduped IPs) that the largest
-/// number of *successfully-responding* propagation servers agree on. Ties are
-/// broken by `HashMap` iteration order — fine in practice because ties only
-/// occur during active flux, which is exactly when the propagation report is
-/// meant to be ambiguous. Servers without an entry for a hostname (e.g. the
-/// per-vantage A/AAAA lookup wasn't issued) are skipped, not counted as empty.
+/// number of *successfully-responding* propagation servers agree on. Ties (two
+/// value sets seen by an equal number of servers — only happens during active
+/// flux) are broken deterministically in favour of the lexicographically
+/// smallest set, so repeated runs over identical input produce identical output
+/// instead of flapping on `HashMap` iteration order. Servers without an entry
+/// for a hostname (e.g. the per-vantage A/AAAA lookup wasn't issued) are
+/// skipped, not counted as empty.
 pub(super) fn build_nameserver_consensus(
     results: &[ServerResult],
     per_vantage: &PerVantage,
@@ -43,11 +45,25 @@ pub(super) fn build_nameserver_consensus(
                 *counts.entry(ips).or_insert(0) += 1;
             }
         }
-        if let Some((winner, _)) = counts.into_iter().max_by_key(|(_, c)| *c) {
+        if let Some((winner, _)) = pick_consensus(counts) {
             consensus.insert(ns.clone(), winner.clone());
         }
     }
     consensus
+}
+
+/// Pick the winning value set from a `set -> count` map: highest count wins,
+/// ties broken by the lexicographically smallest set for deterministic output.
+/// Returns the winning set together with its count, or `None` when the map is
+/// empty.
+fn pick_consensus(counts: HashMap<&Vec<String>, usize>) -> Option<(&Vec<String>, usize)> {
+    counts
+        .into_iter()
+        .max_by(|(a_set, a_count), (b_set, b_count)| {
+            // Higher count is "greater" (chosen); on a tie the smaller set is
+            // "greater" so `max_by` returns it.
+            a_count.cmp(b_count).then_with(|| b_set.cmp(a_set))
+        })
 }
 
 /// Build per-vantage inconsistencies: any successful server whose IP set for a
@@ -135,10 +151,10 @@ pub(super) fn analyze_results(
         *value_counts.entry(values).or_insert(0) += 1;
     }
 
-    // Find the most common value set (consensus)
-    let Some((consensus_values, consensus_count)) =
-        value_counts.into_iter().max_by_key(|(_, count)| *count)
-    else {
+    // Find the most common value set (consensus). Ties break toward the
+    // lexicographically smallest set so output is deterministic run-to-run
+    // (see `pick_consensus`).
+    let Some((consensus_values, consensus_count)) = pick_consensus(value_counts) else {
         // Should never happen since `successful` is non-empty (every successful
         // result contributes a value set), but handle gracefully.
         return AnalysisOutcome {
@@ -327,6 +343,31 @@ mod tests {
             consensus.get("ns1.example.com.").cloned(),
             Some(vec!["1.2.3.4".to_string()])
         );
+    }
+
+    #[test]
+    fn nameserver_consensus_breaks_ties_deterministically() {
+        // A perfect 1-1 split: one resolver sees 1.1.1.1, the other sees
+        // 2.2.2.2. Neither has a majority, so the tie must resolve to the
+        // lexicographically smallest set ("1.1.1.1") rather than flapping on
+        // HashMap iteration order. Running the same input repeatedly must
+        // always yield the same winner.
+        let (results, per_vantage) = assemble(vec![
+            ns_vantage("A", "1.1.1.1", &[("ns1.example.com.", &["1.1.1.1"])]),
+            ns_vantage("B", "8.8.8.8", &[("ns1.example.com.", &["2.2.2.2"])]),
+        ]);
+        for _ in 0..50 {
+            let consensus = build_nameserver_consensus(
+                &results,
+                &per_vantage,
+                &["ns1.example.com.".to_string()],
+            );
+            assert_eq!(
+                consensus.get("ns1.example.com.").cloned(),
+                Some(vec!["1.1.1.1".to_string()]),
+                "tie must resolve to the lexicographically smallest set"
+            );
+        }
     }
 
     #[test]
