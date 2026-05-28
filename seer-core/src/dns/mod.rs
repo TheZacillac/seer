@@ -11,8 +11,8 @@ pub use follow::{
     DnsFollower, FollowConfig, FollowIteration, FollowProgressCallback, FollowResult,
 };
 pub use propagation::{
-    ConsensusValue, DnsServer, Inconsistency, NameserverIpInconsistency, PropagationChecker,
-    PropagationResult, UnreachableServer,
+    ConsensusValue, DnsServer, Inconsistency, NameserverDetails, NameserverIpInconsistency,
+    PropagationChecker, PropagationResult, UnreachableServer,
 };
 pub use records::{DnsRecord, RecordData, RecordType};
 pub use resolver::DnsResolver;

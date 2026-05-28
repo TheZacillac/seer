@@ -32,14 +32,6 @@ pub struct ServerResult {
     pub response_time_ms: u64,
     pub success: bool,
     pub error: Option<String>,
-    /// For NS-record propagation checks: A/AAAA addresses **this resolver**
-    /// returns when asked for each nameserver hostname it observed. Captures
-    /// the per-vantage view so glue-record propagation lag (one regional
-    /// recursor still serving the old IP) is visible. Keys are lowercased
-    /// FQDNs; values are sorted+deduped. Empty for non-NS checks or when
-    /// the follow-up A/AAAA lookups failed.
-    #[serde(default)]
-    pub nameserver_ips: HashMap<String, Vec<String>>,
 }
 
 /// A consensus DNS value tagged with the record type it was observed for.
@@ -154,6 +146,42 @@ impl std::fmt::Display for Inconsistency {
     }
 }
 
+/// NS-record-specific propagation detail.
+///
+/// All three fields below are only meaningful for NS-record checks. Grouping
+/// them under a single `Option<NameserverDetails>` on `PropagationResult`
+/// keeps the generic propagation type free of NS-only data and makes the
+/// optionality explicit — non-NS checks serialize the field as absent rather
+/// than as three empty collections sitting on the wire.
+///
+/// Maps use lowercased FQDNs (typically with trailing dot) as nameserver
+/// keys; `per_vantage` keys are propagation server IPs (matching
+/// `ServerResult.server.ip`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NameserverDetails {
+    /// Cross-server consensus: for each nameserver hostname, the A/AAAA value
+    /// set that the largest number of *successfully-responding* propagation
+    /// resolvers agreed on. Sorted+deduped per entry.
+    pub consensus: HashMap<String, Vec<String>>,
+    /// Per-vantage view: for each propagation server (keyed by its IP), the
+    /// A/AAAA value set that resolver returned when asked for each nameserver
+    /// hostname. Missing entries mean the per-vantage A/AAAA lookup wasn't
+    /// issued or yielded nothing.
+    pub per_vantage: HashMap<String, HashMap<String, Vec<String>>>,
+    /// Propagation resolvers whose per-vantage IPs disagree with `consensus`.
+    /// The primary signal for glue-record propagation lag — a regional
+    /// recursor still serving the previous IP for an NS hostname.
+    pub inconsistencies: Vec<NameserverIpInconsistency>,
+}
+
+impl NameserverDetails {
+    /// True if any propagation resolver returned IPs for a nameserver
+    /// hostname that differ from the cross-server consensus.
+    pub fn has_inconsistencies(&self) -> bool {
+        !self.inconsistencies.is_empty()
+    }
+}
+
 fn default_dnssec_validated() -> bool {
     false
 }
@@ -184,21 +212,11 @@ pub struct PropagationResult {
     /// authenticity.
     #[serde(default = "default_dnssec_validated")]
     pub dnssec_validated: bool,
-    /// Consensus A/AAAA addresses for nameserver hostnames returned by an
-    /// NS-record propagation check, aggregated across all responding
-    /// propagation servers (i.e. the value set the largest number of global
-    /// recursors agree on). Keys are lowercased FQDNs (typically with trailing
-    /// dot). Empty for non-NS checks. For per-vantage views see
-    /// `results[i].nameserver_ips`; for resolvers that disagree with the
-    /// consensus see `nameserver_inconsistencies`.
-    #[serde(default)]
-    pub resolved_ips: HashMap<String, Vec<String>>,
-    /// Per-vantage A/AAAA mismatches: a propagation resolver returned IPs for
-    /// a nameserver hostname that differ from the cross-server consensus.
-    /// This is the primary signal for glue-record propagation lag — empty for
-    /// non-NS checks.
-    #[serde(default)]
-    pub nameserver_inconsistencies: Vec<NameserverIpInconsistency>,
+    /// NS-record-specific propagation detail (consensus, per-vantage view,
+    /// inconsistencies). `None` for non-NS lookups and for NS lookups that
+    /// observed no NS records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nameserver_details: Option<NameserverDetails>,
 }
 
 impl PropagationResult {
@@ -223,13 +241,31 @@ impl PropagationResult {
     /// for a nameserver hostname that differs from the cross-server consensus.
     /// Only meaningful for NS-record checks.
     pub fn has_nameserver_inconsistencies(&self) -> bool {
-        !self.nameserver_inconsistencies.is_empty()
+        self.nameserver_details
+            .as_ref()
+            .is_some_and(NameserverDetails::has_inconsistencies)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn empty_result(domain: &str, propagation_percentage: f64) -> PropagationResult {
+        PropagationResult {
+            domain: domain.to_string(),
+            record_type: RecordType::A,
+            servers_checked: 0,
+            servers_responding: 0,
+            propagation_percentage,
+            results: vec![],
+            consensus_values: vec![ConsensusValue::new(RecordType::A, "1.2.3.4")],
+            inconsistencies: vec![],
+            unreachable_servers: vec![],
+            dnssec_validated: false,
+            nameserver_details: None,
+        }
+    }
 
     #[test]
     fn test_dns_server_new() {
@@ -242,47 +278,27 @@ mod tests {
 
     #[test]
     fn test_propagation_result_methods() {
-        let result = PropagationResult {
-            domain: "example.com".to_string(),
-            record_type: RecordType::A,
-            servers_checked: 10,
-            servers_responding: 10,
-            propagation_percentage: 100.0,
-            results: vec![],
-            consensus_values: vec![ConsensusValue::new(RecordType::A, "1.2.3.4")],
-            inconsistencies: vec![],
-            unreachable_servers: vec![],
-            dnssec_validated: false,
-            resolved_ips: HashMap::new(),
-            nameserver_inconsistencies: vec![],
-        };
+        let mut result = empty_result("example.com", 100.0);
+        result.servers_checked = 10;
+        result.servers_responding = 10;
         assert!(result.is_fully_propagated());
         assert!(!result.has_inconsistencies());
         assert!(!result.has_unreachable_servers());
+        assert!(!result.has_nameserver_inconsistencies());
     }
 
     #[test]
     fn test_propagation_result_with_inconsistencies() {
-        let result = PropagationResult {
-            domain: "example.com".to_string(),
+        let mut result = empty_result("example.com", 75.0);
+        result.servers_checked = 10;
+        result.servers_responding = 8;
+        result.inconsistencies = vec![Inconsistency {
             record_type: RecordType::A,
-            servers_checked: 10,
-            servers_responding: 8,
-            propagation_percentage: 75.0,
-            results: vec![],
-            consensus_values: vec![ConsensusValue::new(RecordType::A, "1.2.3.4")],
-            inconsistencies: vec![Inconsistency {
-                record_type: RecordType::A,
-                server_name: "Server X".to_string(),
-                server_ip: "203.0.113.99".to_string(),
-                values: vec!["9.9.9.9".to_string()],
-                consensus: vec!["1.2.3.4".to_string()],
-            }],
-            unreachable_servers: vec![],
-            dnssec_validated: false,
-            resolved_ips: HashMap::new(),
-            nameserver_inconsistencies: vec![],
-        };
+            server_name: "Server X".to_string(),
+            server_ip: "203.0.113.99".to_string(),
+            values: vec!["9.9.9.9".to_string()],
+            consensus: vec!["1.2.3.4".to_string()],
+        }];
         assert!(!result.is_fully_propagated());
         assert!(result.has_inconsistencies());
     }
@@ -292,74 +308,91 @@ mod tests {
         // 28 agreeing servers + 1 unreachable server should NOT report an
         // inconsistency — the unreachable server is a missing data point, not
         // a conflicting answer.
-        let result = PropagationResult {
-            domain: "example.com".to_string(),
-            record_type: RecordType::A,
-            servers_checked: 29,
-            servers_responding: 28,
-            propagation_percentage: (28.0 / 29.0) * 100.0,
-            results: vec![],
-            consensus_values: vec![ConsensusValue::new(RecordType::A, "1.2.3.4")],
-            inconsistencies: vec![],
-            unreachable_servers: vec![UnreachableServer {
-                name: "Flaky DNS".to_string(),
-                ip: "203.0.113.1".to_string(),
-                error: Some("timed out".to_string()),
-            }],
-            dnssec_validated: false,
-            resolved_ips: HashMap::new(),
-            nameserver_inconsistencies: vec![],
-        };
+        let mut result = empty_result("example.com", (28.0 / 29.0) * 100.0);
+        result.servers_checked = 29;
+        result.servers_responding = 28;
+        result.unreachable_servers = vec![UnreachableServer {
+            name: "Flaky DNS".to_string(),
+            ip: "203.0.113.1".to_string(),
+            error: Some("timed out".to_string()),
+        }];
         assert!(!result.has_inconsistencies());
         assert!(result.has_unreachable_servers());
     }
 
     #[test]
     fn has_inconsistencies_is_true_when_answers_differ() {
-        let result = PropagationResult {
-            domain: "example.com".to_string(),
+        let mut result = empty_result("example.com", 90.0);
+        result.servers_checked = 10;
+        result.servers_responding = 10;
+        result.inconsistencies = vec![Inconsistency {
             record_type: RecordType::A,
-            servers_checked: 10,
-            servers_responding: 10,
-            propagation_percentage: 90.0,
-            results: vec![],
-            consensus_values: vec![ConsensusValue::new(RecordType::A, "1.2.3.4")],
-            inconsistencies: vec![Inconsistency {
-                record_type: RecordType::A,
-                server_name: "Server Y".to_string(),
-                server_ip: "203.0.113.2".to_string(),
-                values: vec!["5.6.7.8".to_string()],
-                consensus: vec!["1.2.3.4".to_string()],
-            }],
-            unreachable_servers: vec![],
-            dnssec_validated: false,
-            resolved_ips: HashMap::new(),
-            nameserver_inconsistencies: vec![],
-        };
+            server_name: "Server Y".to_string(),
+            server_ip: "203.0.113.2".to_string(),
+            values: vec!["5.6.7.8".to_string()],
+            consensus: vec!["1.2.3.4".to_string()],
+        }];
         assert!(result.has_inconsistencies());
         assert!(!result.has_unreachable_servers());
     }
 
     #[test]
-    fn test_propagation_result_serialization() {
-        let result = PropagationResult {
-            domain: "test.com".to_string(),
-            record_type: RecordType::A,
-            servers_checked: 5,
-            servers_responding: 5,
-            propagation_percentage: 100.0,
-            results: vec![],
-            consensus_values: vec![ConsensusValue::new(RecordType::A, "1.2.3.4")],
+    fn has_nameserver_inconsistencies_reflects_details_field() {
+        let mut result = empty_result("example.com", 100.0);
+        assert!(!result.has_nameserver_inconsistencies());
+
+        // NS lookup with no glue-lag → some details, no inconsistencies.
+        result.nameserver_details = Some(NameserverDetails {
+            consensus: HashMap::new(),
+            per_vantage: HashMap::new(),
             inconsistencies: vec![],
-            unreachable_servers: vec![],
-            dnssec_validated: false,
-            resolved_ips: HashMap::new(),
-            nameserver_inconsistencies: vec![],
-        };
+        });
+        assert!(!result.has_nameserver_inconsistencies());
+
+        // NS lookup with glue-lag → details with at least one inconsistency.
+        result.nameserver_details = Some(NameserverDetails {
+            consensus: HashMap::new(),
+            per_vantage: HashMap::new(),
+            inconsistencies: vec![NameserverIpInconsistency {
+                server_name: "Stale".to_string(),
+                server_ip: "9.9.9.9".to_string(),
+                nameserver: "ns1.example.com.".to_string(),
+                values: vec!["9.9.9.9".to_string()],
+                consensus: vec!["1.2.3.4".to_string()],
+            }],
+        });
+        assert!(result.has_nameserver_inconsistencies());
+    }
+
+    #[test]
+    fn test_propagation_result_serialization() {
+        let mut result = empty_result("test.com", 100.0);
+        result.servers_checked = 5;
+        result.servers_responding = 5;
         let json = serde_json::to_string(&result).unwrap();
         assert!(json.contains("test.com"));
         assert!(json.contains("100"));
         assert!(json.contains("unreachable_servers"));
         assert!(json.contains("dnssec_validated"));
+        // Non-NS lookup: nameserver_details should be omitted from the
+        // serialized form rather than emitted as `null`.
+        assert!(!json.contains("nameserver_details"));
+    }
+
+    #[test]
+    fn nameserver_details_serializes_when_present() {
+        let mut result = empty_result("test.com", 100.0);
+        result.record_type = RecordType::NS;
+        result.nameserver_details = Some(NameserverDetails {
+            consensus: [("ns1.example.com.".to_string(), vec!["1.2.3.4".to_string()])]
+                .into_iter()
+                .collect(),
+            per_vantage: HashMap::new(),
+            inconsistencies: vec![],
+        });
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("nameserver_details"));
+        assert!(json.contains("consensus"));
+        assert!(json.contains("ns1.example.com"));
     }
 }
