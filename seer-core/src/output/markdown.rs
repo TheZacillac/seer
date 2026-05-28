@@ -1,3 +1,4 @@
+use super::grouping::render_grouped;
 use super::OutputFormatter;
 use crate::caa::{CaaPolicy, IssuerCaaMatch};
 use crate::dns::{DnsRecord, FollowIteration, FollowResult, PropagationResult};
@@ -456,7 +457,10 @@ impl OutputFormatter for MarkdownFormatter {
         ));
 
         // Consensus values, grouped by record type. Single-type results
-        // collapse to one line; multi-type results get one line per type.
+        // collapse to one inline line; multi-type results get a header line
+        // plus one rendered line per type. Unlike the inconsistency blocks
+        // below, the per-group items are joined into a single line — so this
+        // block doesn't share the `render_grouped` helper they use.
         if !result.consensus_values.is_empty() {
             let mut grouped: std::collections::BTreeMap<String, Vec<&str>> =
                 std::collections::BTreeMap::new();
@@ -467,29 +471,25 @@ impl OutputFormatter for MarkdownFormatter {
                     .push(v.value.as_str());
             }
 
-            if grouped.len() == 1 {
-                // grouped is non-empty here (len == 1), so `next()` always
-                // yields. Using `expect()` keeps `-D clippy::unwrap_used`
-                // happy and documents the invariant.
-                let (_, values) = grouped
-                    .iter()
-                    .next()
-                    .expect("BTreeMap with len == 1 always yields one entry");
-                let rendered = values
+            let render_values = |values: &[&str]| -> String {
+                values
                     .iter()
                     .map(|v| format!("`{}`", MdSafe(v)))
                     .collect::<Vec<_>>()
-                    .join(", ");
-                output.push(format!("- **Consensus values**: {}", rendered));
+                    .join(", ")
+            };
+
+            if grouped.len() == 1 {
+                let (_, values) = grouped.iter().next().expect("non-empty by check above");
+                output.push(format!("- **Consensus values**: {}", render_values(values)));
             } else {
                 output.push("- **Consensus values**:".to_string());
                 for (record_type, values) in &grouped {
-                    let rendered = values
-                        .iter()
-                        .map(|v| format!("`{}`", MdSafe(v)))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    output.push(format!("    - **{}**: {}", MdSafe(record_type), rendered));
+                    output.push(format!(
+                        "    - **{}**: {}",
+                        MdSafe(record_type),
+                        render_values(values)
+                    ));
                 }
             }
         }
@@ -499,56 +499,34 @@ impl OutputFormatter for MarkdownFormatter {
             output.push(String::new());
             output.push("### Inconsistencies".to_string());
             output.push(String::new());
-
-            let mut grouped: std::collections::BTreeMap<String, Vec<&crate::dns::Inconsistency>> =
-                std::collections::BTreeMap::new();
-            for inc in &result.inconsistencies {
-                grouped
-                    .entry(inc.record_type.to_string())
-                    .or_default()
-                    .push(inc);
-            }
-
-            let single_type = grouped.len() == 1;
-            for (record_type, items) in &grouped {
-                if !single_type {
-                    output.push(format!("**{}**", MdSafe(record_type)));
-                    output.push(String::new());
-                }
-                for inc in items {
-                    output.push(format!("- {}", MdSafe(&inc.to_string())));
-                }
-                if !single_type {
-                    output.push(String::new());
-                }
-            }
+            render_grouped(
+                &mut output,
+                &result.inconsistencies,
+                |inc| inc.record_type.to_string(),
+                |out, hdr| {
+                    out.push(format!("**{}**", MdSafe(hdr)));
+                    out.push(String::new());
+                },
+                |out, inc, _nested| out.push(format!("- {}", MdSafe(&inc.to_string()))),
+            );
         }
 
-        // Per-vantage nameserver-IP disagreements (glue-update lag).
+        // Per-vantage nameserver-IP disagreements (glue-update lag), grouped
+        // by NS hostname.
         if !result.nameserver_inconsistencies.is_empty() {
             output.push(String::new());
             output.push("### Nameserver IP inconsistencies".to_string());
             output.push(String::new());
-
-            let mut by_ns: std::collections::BTreeMap<&str, Vec<&_>> =
-                std::collections::BTreeMap::new();
-            for inc in &result.nameserver_inconsistencies {
-                by_ns.entry(inc.nameserver.as_str()).or_default().push(inc);
-            }
-
-            let single = by_ns.len() == 1;
-            for (ns, items) in &by_ns {
-                if !single {
-                    output.push(format!("**{}**", MdSafe(ns)));
-                    output.push(String::new());
-                }
-                for inc in items {
-                    output.push(format!("- {}", MdSafe(&inc.to_string())));
-                }
-                if !single {
-                    output.push(String::new());
-                }
-            }
+            render_grouped(
+                &mut output,
+                &result.nameserver_inconsistencies,
+                |inc| inc.nameserver.clone(),
+                |out, hdr| {
+                    out.push(format!("**{}**", MdSafe(hdr)));
+                    out.push(String::new());
+                },
+                |out, inc, _nested| out.push(format!("- {}", MdSafe(&inc.to_string()))),
+            );
         }
 
         // Unreachable servers (distinct from answer conflicts)

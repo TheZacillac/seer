@@ -3,10 +3,11 @@ use colored::Colorize;
 use once_cell::sync::Lazy;
 use regex::Regex;
 
+use super::grouping::render_grouped;
 use super::OutputFormatter;
 use crate::caa::{CaaPolicy, IssuerCaaMatch};
 use crate::colors::CatppuccinExt;
-use crate::dns::{DnsRecord, FollowIteration, FollowResult, Inconsistency, PropagationResult};
+use crate::dns::{DnsRecord, FollowIteration, FollowResult, PropagationResult};
 use crate::lookup::LookupResult;
 use crate::rdap::RdapResponse;
 use crate::status::StatusResponse;
@@ -786,103 +787,69 @@ impl OutputFormatter for HumanFormatter {
         ));
 
         // Consensus values, grouped by record type. When only one type is
-        // present (the common case — `check()` queries a single type), we
-        // skip the per-type subheader to keep output tight; multi-type
-        // results get a labeled block per type.
+        // present (the common case — `check()` queries a single type), the
+        // per-type subheader is elided for compactness; multi-type results
+        // get a labeled block per type. Same rule applies to the two
+        // inconsistency blocks below.
         if !result.consensus_values.is_empty() {
             output.push(format!("  {}:", self.label("Consensus values")));
-
-            let mut grouped: std::collections::BTreeMap<String, Vec<&str>> =
-                std::collections::BTreeMap::new();
-            for v in &result.consensus_values {
-                grouped
-                    .entry(v.record_type.to_string())
-                    .or_default()
-                    .push(v.value.as_str());
-            }
-
-            let single_type = grouped.len() == 1;
-            for (record_type, values) in &grouped {
-                let item_indent = if single_type {
-                    "    "
-                } else {
-                    output.push(format!("    {}:", self.label(record_type)));
-                    "      "
-                };
-                for v in values {
-                    output.push(format!(
+            render_grouped(
+                &mut output,
+                &result.consensus_values,
+                |v| v.record_type.to_string(),
+                |out, hdr| out.push(format!("    {}:", self.label(hdr))),
+                |out, v, nested| {
+                    let indent = if nested { "      " } else { "    " };
+                    out.push(format!(
                         "{}- {}",
-                        item_indent,
-                        self.success(&sanitize_display(v))
+                        indent,
+                        self.success(&sanitize_display(&v.value))
                     ));
-                }
-            }
+                },
+            );
         }
 
-        // Inconsistencies (genuine answer conflicts only). Same grouping
-        // rule as consensus values for symmetry.
         if !result.inconsistencies.is_empty() {
             output.push(format!("  {}:", self.label("Inconsistencies")));
-
-            let mut grouped: std::collections::BTreeMap<String, Vec<&Inconsistency>> =
-                std::collections::BTreeMap::new();
-            for inc in &result.inconsistencies {
-                grouped
-                    .entry(inc.record_type.to_string())
-                    .or_default()
-                    .push(inc);
-            }
-
-            let single_type = grouped.len() == 1;
-            for (record_type, items) in &grouped {
-                let item_indent = if single_type {
-                    "    "
-                } else {
-                    output.push(format!("    {}:", self.label(record_type)));
-                    "      "
-                };
-                for inc in items {
-                    output.push(format!(
+            render_grouped(
+                &mut output,
+                &result.inconsistencies,
+                |inc| inc.record_type.to_string(),
+                |out, hdr| out.push(format!("    {}:", self.label(hdr))),
+                |out, inc, nested| {
+                    let indent = if nested { "      " } else { "    " };
+                    out.push(format!(
                         "{}- {}",
-                        item_indent,
+                        indent,
                         self.warning(&sanitize_display(&inc.to_string()))
                     ));
-                }
-            }
+                },
+            );
         }
 
-        // Per-vantage nameserver-IP disagreements. Surfaced alongside the
-        // NS-name inconsistency block because for glue-update tracking this
-        // is the *primary* signal — a regional resolver still serving the
-        // old IP for a nameserver hostname.
+        // Per-vantage nameserver-IP disagreements: the primary signal for
+        // glue-record propagation lag (a regional resolver still serving the
+        // old IP for a nameserver hostname). Grouped by NS hostname rather
+        // than record type.
         if !result.nameserver_inconsistencies.is_empty() {
             output.push(format!(
                 "  {}:",
                 self.label("Nameserver IP inconsistencies")
             ));
-
-            let mut by_ns: std::collections::BTreeMap<&str, Vec<&_>> =
-                std::collections::BTreeMap::new();
-            for inc in &result.nameserver_inconsistencies {
-                by_ns.entry(inc.nameserver.as_str()).or_default().push(inc);
-            }
-
-            let single = by_ns.len() == 1;
-            for (ns, items) in &by_ns {
-                let item_indent = if single {
-                    "    "
-                } else {
-                    output.push(format!("    {}:", self.label(ns)));
-                    "      "
-                };
-                for inc in items {
-                    output.push(format!(
+            render_grouped(
+                &mut output,
+                &result.nameserver_inconsistencies,
+                |inc| inc.nameserver.clone(),
+                |out, hdr| out.push(format!("    {}:", self.label(hdr))),
+                |out, inc, nested| {
+                    let indent = if nested { "      " } else { "    " };
+                    out.push(format!(
                         "{}- {}",
-                        item_indent,
+                        indent,
                         self.warning(&sanitize_display(&inc.to_string()))
                     ));
-                }
-            }
+                },
+            );
         }
 
         // Unreachable servers (timeouts, network errors) — distinct from
@@ -3784,7 +3751,7 @@ mod tests {
                 .collect(),
             inconsistencies: inconsistencies
                 .into_iter()
-                .map(|(t, name, ip, values, cons)| Inconsistency {
+                .map(|(t, name, ip, values, cons)| crate::dns::Inconsistency {
                     record_type: t,
                     server_name: name.to_string(),
                     server_ip: ip.to_string(),
