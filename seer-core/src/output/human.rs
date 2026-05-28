@@ -830,15 +830,16 @@ impl OutputFormatter for HumanFormatter {
         // Per-vantage nameserver-IP disagreements: the primary signal for
         // glue-record propagation lag (a regional resolver still serving the
         // old IP for a nameserver hostname). Grouped by NS hostname rather
-        // than record type.
-        if !result.nameserver_inconsistencies.is_empty() {
+        // than record type. Only present for NS-record lookups.
+        let ns_details = result.nameserver_details.as_ref();
+        if let Some(details) = ns_details.filter(|d| !d.inconsistencies.is_empty()) {
             output.push(format!(
                 "  {}:",
                 self.label("Nameserver IP inconsistencies")
             ));
             render_grouped(
                 &mut output,
-                &result.nameserver_inconsistencies,
+                &details.inconsistencies,
                 |inc| inc.nameserver.clone(),
                 |out, hdr| out.push(format!("    {}:", self.label(hdr))),
                 |out, inc, nested| {
@@ -910,13 +911,15 @@ impl OutputFormatter for HumanFormatter {
                                     // consensus only when the per-vantage
                                     // lookup wasn't issued or yielded nothing.
                                     let key = short.to_ascii_lowercase();
-                                    let ips = server_result
-                                        .nameserver_ips
-                                        .get(&key)
-                                        .filter(|v| !v.is_empty())
-                                        .or_else(|| {
-                                            result.resolved_ips.get(&key).filter(|v| !v.is_empty())
-                                        });
+                                    let ips = ns_details.and_then(|d| {
+                                        d.per_vantage
+                                            .get(&server_result.server.ip)
+                                            .and_then(|m| m.get(&key))
+                                            .filter(|v| !v.is_empty())
+                                            .or_else(|| {
+                                                d.consensus.get(&key).filter(|v| !v.is_empty())
+                                            })
+                                    });
                                     match ips {
                                         Some(ips) => format!("{} ({})", display, ips.join(", ")),
                                         None => display,
@@ -3761,8 +3764,7 @@ mod tests {
                 .collect(),
             unreachable_servers: vec![],
             dnssec_validated: false,
-            resolved_ips: std::collections::HashMap::new(),
-            nameserver_inconsistencies: vec![],
+            nameserver_details: None,
         }
     }
 

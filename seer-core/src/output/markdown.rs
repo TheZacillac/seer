@@ -512,14 +512,15 @@ impl OutputFormatter for MarkdownFormatter {
         }
 
         // Per-vantage nameserver-IP disagreements (glue-update lag), grouped
-        // by NS hostname.
-        if !result.nameserver_inconsistencies.is_empty() {
+        // by NS hostname. Only present for NS-record lookups.
+        let ns_details = result.nameserver_details.as_ref();
+        if let Some(details) = ns_details.filter(|d| !d.inconsistencies.is_empty()) {
             output.push(String::new());
             output.push("### Nameserver IP inconsistencies".to_string());
             output.push(String::new());
             render_grouped(
                 &mut output,
-                &result.nameserver_inconsistencies,
+                &details.inconsistencies,
                 |inc| inc.nameserver.clone(),
                 |out, hdr| {
                     out.push(format!("**{}**", MdSafe(hdr)));
@@ -564,13 +565,13 @@ impl OutputFormatter for MarkdownFormatter {
                             let key = short.to_ascii_lowercase();
                             // Per-vantage view first, then cross-server
                             // consensus as a fallback.
-                            let ips = sr
-                                .nameserver_ips
-                                .get(&key)
-                                .filter(|v| !v.is_empty())
-                                .or_else(|| {
-                                    result.resolved_ips.get(&key).filter(|v| !v.is_empty())
-                                });
+                            let ips = ns_details.and_then(|d| {
+                                d.per_vantage
+                                    .get(&sr.server.ip)
+                                    .and_then(|m| m.get(&key))
+                                    .filter(|v| !v.is_empty())
+                                    .or_else(|| d.consensus.get(&key).filter(|v| !v.is_empty()))
+                            });
                             match ips {
                                 Some(ips) => format!("{} ({})", short, ips.join(", ")),
                                 None => short,

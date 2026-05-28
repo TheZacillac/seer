@@ -5,10 +5,10 @@ use futures::future::join_all;
 use tracing::{debug, instrument, warn};
 
 use super::analysis::{
-    analyze_results, build_nameserver_consensus, build_nameserver_inconsistencies,
+    analyze_results, build_nameserver_consensus, build_nameserver_inconsistencies, PerVantage,
 };
 use super::servers::default_dns_servers;
-use super::types::{DnsServer, NameserverIpInconsistency, PropagationResult, ServerResult};
+use super::types::{DnsServer, NameserverDetails, PropagationResult, ServerResult};
 use crate::dns::records::{RecordData, RecordType};
 use crate::dns::resolver::DnsResolver;
 use crate::error::{Result, SeerError};
@@ -73,7 +73,7 @@ impl PropagationChecker {
             .map(|server| self.query_server(domain, record_type, server.clone()))
             .collect();
 
-        let mut results = tokio::time::timeout(Self::PROPAGATION_TIMEOUT, join_all(futures))
+        let results = tokio::time::timeout(Self::PROPAGATION_TIMEOUT, join_all(futures))
             .await
             .map_err(|_| {
                 warn!(
@@ -101,25 +101,25 @@ impl PropagationChecker {
         // slow secondary lookup cannot extend total wall-clock beyond the
         // documented bound; on timeout we surface results without IP
         // annotations rather than failing the call.
-        let (resolved_ips, nameserver_inconsistencies) = if record_type == RecordType::NS {
+        let nameserver_details = if record_type == RecordType::NS {
             match tokio::time::timeout(
                 Self::NS_RESOLUTION_TIMEOUT,
-                self.resolve_nameserver_ips_per_vantage(&mut results),
+                self.resolve_nameserver_details(&results),
             )
             .await
             {
-                Ok(pair) => pair,
+                Ok(details) => details,
                 Err(_) => {
                     warn!(
                         domain = %domain,
                         timeout_secs = Self::NS_RESOLUTION_TIMEOUT.as_secs(),
                         "Per-vantage nameserver IP enrichment timed out; returning results without IP annotations"
                     );
-                    (HashMap::new(), Vec::new())
+                    None
                 }
             }
         } else {
-            (HashMap::new(), Vec::new())
+            None
         };
 
         Ok(PropagationResult {
@@ -136,30 +136,28 @@ impl PropagationChecker {
             // This field exists so callers / formatters can disclose the
             // lack of authentication to users.
             dnssec_validated: false,
-            resolved_ips,
-            nameserver_inconsistencies,
+            nameserver_details,
         })
     }
 
     /// Per-vantage resolution: for every unique nameserver hostname returned
     /// across all NS answers, ask each successfully-responding propagation
-    /// server (via its own IP) for that hostname's A/AAAA addresses. Each
-    /// server's view is written into `ServerResult.nameserver_ips`; the
-    /// cross-server consensus and the set of disagreeing resolvers are
-    /// returned to the caller.
+    /// server (via its own IP) for that hostname's A/AAAA addresses.
+    /// Returns `None` when there are no NS records to enrich; otherwise
+    /// returns `Some(NameserverDetails { consensus, per_vantage, inconsistencies })`.
     ///
-    /// Failed A/AAAA lookups from a given vantage are recorded as an empty
-    /// list — empty matches an NXDOMAIN/NODATA response, and either way the
-    /// resolver couldn't provide an IP. If that empty differs from the
-    /// consensus it surfaces as a `NameserverIpInconsistency`.
+    /// Failed A/AAAA lookups from a given vantage produce an empty list —
+    /// empty matches an NXDOMAIN/NODATA response, and either way the resolver
+    /// couldn't provide an IP. If that empty differs from the consensus it
+    /// surfaces as a `NameserverIpInconsistency`.
     ///
     /// Hostnames are lowercased for dedup so case-variant responses from
     /// different upstream resolvers do not trigger redundant lookups.
     /// Formatters must lowercase the record value before looking up the map.
-    async fn resolve_nameserver_ips_per_vantage(
+    async fn resolve_nameserver_details(
         &self,
-        results: &mut [ServerResult],
-    ) -> (HashMap<String, Vec<String>>, Vec<NameserverIpInconsistency>) {
+        results: &[ServerResult],
+    ) -> Option<NameserverDetails> {
         let unique: HashSet<String> = results
             .iter()
             .flat_map(|sr| sr.records.iter())
@@ -170,19 +168,16 @@ impl PropagationChecker {
             .collect();
 
         if unique.is_empty() {
-            return (HashMap::new(), Vec::new());
+            return None;
         }
 
-        // Build a flat (server_index, nameserver) work list of A+AAAA lookups
+        // Build a flat (server_ip, nameserver) work list of A+AAAA lookups
         // and fan out in parallel. Only successful propagation servers — those
         // that already answered the NS query — are queried; an unreachable
         // server can't meaningfully report a per-vantage IP either.
         let unique_vec: Vec<String> = unique.into_iter().collect();
         let mut tasks = Vec::new();
-        for (idx, sr) in results.iter().enumerate() {
-            if !sr.success {
-                continue;
-            }
+        for sr in results.iter().filter(|sr| sr.success) {
             for ns in &unique_vec {
                 let resolver = self.resolver.clone();
                 let server_ip = sr.server.ip.clone();
@@ -209,19 +204,25 @@ impl PropagationChecker {
                     }
                     ips.sort();
                     ips.dedup();
-                    (idx, ns, ips)
+                    (server_ip, ns, ips)
                 });
             }
         }
 
         let outputs = join_all(tasks).await;
-        for (idx, ns, ips) in outputs {
-            results[idx].nameserver_ips.insert(ns, ips);
+        let mut per_vantage: PerVantage = HashMap::new();
+        for (server_ip, ns, ips) in outputs {
+            per_vantage.entry(server_ip).or_default().insert(ns, ips);
         }
 
-        let consensus = build_nameserver_consensus(results, &unique_vec);
-        let inconsistencies = build_nameserver_inconsistencies(results, &consensus);
-        (consensus, inconsistencies)
+        let consensus = build_nameserver_consensus(results, &per_vantage, &unique_vec);
+        let inconsistencies = build_nameserver_inconsistencies(results, &per_vantage, &consensus);
+
+        Some(NameserverDetails {
+            consensus,
+            per_vantage,
+            inconsistencies,
+        })
     }
 
     async fn query_server(
@@ -251,7 +252,6 @@ impl PropagationChecker {
                     response_time_ms,
                     success: true,
                     error: None,
-                    nameserver_ips: HashMap::new(),
                 }
             }
             Err(e) => {
@@ -267,7 +267,6 @@ impl PropagationChecker {
                     response_time_ms,
                     success: false,
                     error: Some(e.to_string()),
-                    nameserver_ips: HashMap::new(),
                 }
             }
         }

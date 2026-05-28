@@ -17,6 +17,11 @@ pub(super) struct AnalysisOutcome {
     pub unreachable_servers: Vec<UnreachableServer>,
 }
 
+/// Per-vantage NS lookup map: `server_ip -> { nameserver_fqdn -> sorted IPs }`.
+/// Built by the checker during NS-record propagation and consumed by the
+/// consensus / inconsistency helpers below.
+pub(super) type PerVantage = HashMap<String, HashMap<String, Vec<String>>>;
+
 /// Compute the cross-server consensus IP set for each nameserver hostname.
 ///
 /// For each hostname, picks the value set (sorted+deduped IPs) that the largest
@@ -27,13 +32,14 @@ pub(super) struct AnalysisOutcome {
 /// per-vantage A/AAAA lookup wasn't issued) are skipped, not counted as empty.
 pub(super) fn build_nameserver_consensus(
     results: &[ServerResult],
+    per_vantage: &PerVantage,
     nameservers: &[String],
 ) -> HashMap<String, Vec<String>> {
     let mut consensus = HashMap::new();
     for ns in nameservers {
         let mut counts: HashMap<&Vec<String>, usize> = HashMap::new();
         for sr in results.iter().filter(|sr| sr.success) {
-            if let Some(ips) = sr.nameserver_ips.get(ns) {
+            if let Some(ips) = per_vantage.get(&sr.server.ip).and_then(|m| m.get(ns)) {
                 *counts.entry(ips).or_insert(0) += 1;
             }
         }
@@ -52,11 +58,15 @@ pub(super) fn build_nameserver_consensus(
 /// answer if there's a "right" one to compare against.
 pub(super) fn build_nameserver_inconsistencies(
     results: &[ServerResult],
+    per_vantage: &PerVantage,
     consensus: &HashMap<String, Vec<String>>,
 ) -> Vec<NameserverIpInconsistency> {
     let mut out = Vec::new();
     for sr in results.iter().filter(|sr| sr.success) {
-        for (ns, ips) in &sr.nameserver_ips {
+        let Some(vantage) = per_vantage.get(&sr.server.ip) else {
+            continue;
+        };
+        for (ns, ips) in vantage {
             let Some(expected) = consensus.get(ns) else {
                 continue;
             };
@@ -200,7 +210,6 @@ mod tests {
                 response_time_ms: 10,
                 success: true,
                 error: None,
-                nameserver_ips: HashMap::new(),
             },
             ServerResult {
                 server: bad_server.clone(),
@@ -208,7 +217,6 @@ mod tests {
                 response_time_ms: 5000,
                 success: false,
                 error: Some("timed out".to_string()),
-                nameserver_ips: HashMap::new(),
             },
         ];
 
@@ -243,38 +251,21 @@ mod tests {
     #[test]
     fn test_analyze_consistent_results() {
         let server = DnsServer::new("Test", "1.1.1.1", "Test", "Test");
-        let results = vec![
-            ServerResult {
-                server: server.clone(),
-                records: vec![DnsRecord {
-                    name: "example.com".to_string(),
-                    record_type: RecordType::A,
-                    ttl: 300,
-                    data: RecordData::A {
-                        address: "1.2.3.4".to_string(),
-                    },
-                }],
-                response_time_ms: 10,
-                success: true,
-                error: None,
-                nameserver_ips: HashMap::new(),
-            },
-            ServerResult {
-                server: server.clone(),
-                records: vec![DnsRecord {
-                    name: "example.com".to_string(),
-                    record_type: RecordType::A,
-                    ttl: 300,
-                    data: RecordData::A {
-                        address: "1.2.3.4".to_string(),
-                    },
-                }],
-                response_time_ms: 15,
-                success: true,
-                error: None,
-                nameserver_ips: HashMap::new(),
-            },
-        ];
+        let make_result = || ServerResult {
+            server: server.clone(),
+            records: vec![DnsRecord {
+                name: "example.com".to_string(),
+                record_type: RecordType::A,
+                ttl: 300,
+                data: RecordData::A {
+                    address: "1.2.3.4".to_string(),
+                },
+            }],
+            response_time_ms: 10,
+            success: true,
+            error: None,
+        };
+        let results = vec![make_result(), make_result()];
         let outcome = analyze_results(&results, RecordType::A);
         assert_eq!(outcome.propagation_percentage, 100.0);
         assert_eq!(
@@ -285,32 +276,53 @@ mod tests {
         assert!(outcome.unreachable_servers.is_empty());
     }
 
-    fn ns_server_result(name: &str, ip: &str, ns_ips: &[(&str, &[&str])]) -> ServerResult {
-        let mut map: HashMap<String, Vec<String>> = HashMap::new();
+    /// Build a successful `ServerResult` + the corresponding entry for a
+    /// `PerVantage` map. Returns both so tests can assemble both inputs to
+    /// the nameserver-consensus / -inconsistency helpers.
+    fn ns_vantage(
+        name: &str,
+        ip: &str,
+        ns_ips: &[(&str, &[&str])],
+    ) -> (ServerResult, (String, HashMap<String, Vec<String>>)) {
+        let mut vantage: HashMap<String, Vec<String>> = HashMap::new();
         for (ns, ips) in ns_ips {
             let mut v: Vec<String> = ips.iter().map(|s| s.to_string()).collect();
             v.sort();
-            map.insert(ns.to_string(), v);
+            vantage.insert(ns.to_string(), v);
         }
-        ServerResult {
+        let server_ip = ip.to_string();
+        let sr = ServerResult {
             server: DnsServer::new(name, ip, "NA", "Test"),
             records: vec![],
             response_time_ms: 10,
             success: true,
             error: None,
-            nameserver_ips: map,
+        };
+        (sr, (server_ip, vantage))
+    }
+
+    fn assemble(
+        entries: Vec<(ServerResult, (String, HashMap<String, Vec<String>>))>,
+    ) -> (Vec<ServerResult>, PerVantage) {
+        let mut results = Vec::new();
+        let mut per_vantage = HashMap::new();
+        for (sr, (ip, m)) in entries {
+            results.push(sr);
+            per_vantage.insert(ip, m);
         }
+        (results, per_vantage)
     }
 
     #[test]
     fn nameserver_consensus_picks_majority_ip_set() {
         // Two resolvers see 1.2.3.4 for ns1, one stale resolver sees 9.9.9.9.
-        let results = vec![
-            ns_server_result("A", "1.1.1.1", &[("ns1.example.com.", &["1.2.3.4"])]),
-            ns_server_result("B", "8.8.8.8", &[("ns1.example.com.", &["1.2.3.4"])]),
-            ns_server_result("C", "9.9.9.9", &[("ns1.example.com.", &["9.9.9.9"])]),
-        ];
-        let consensus = build_nameserver_consensus(&results, &["ns1.example.com.".to_string()]);
+        let (results, per_vantage) = assemble(vec![
+            ns_vantage("A", "1.1.1.1", &[("ns1.example.com.", &["1.2.3.4"])]),
+            ns_vantage("B", "8.8.8.8", &[("ns1.example.com.", &["1.2.3.4"])]),
+            ns_vantage("C", "9.9.9.9", &[("ns1.example.com.", &["9.9.9.9"])]),
+        ]);
+        let consensus =
+            build_nameserver_consensus(&results, &per_vantage, &["ns1.example.com.".to_string()]);
         assert_eq!(
             consensus.get("ns1.example.com.").cloned(),
             Some(vec!["1.2.3.4".to_string()])
@@ -321,13 +333,14 @@ mod tests {
     fn nameserver_inconsistencies_flag_stale_vantage() {
         // The third resolver still serves the old glue IP — it must surface
         // as an inconsistency, not silently fold into the consensus.
-        let results = vec![
-            ns_server_result("A", "1.1.1.1", &[("ns1.example.com.", &["1.2.3.4"])]),
-            ns_server_result("B", "8.8.8.8", &[("ns1.example.com.", &["1.2.3.4"])]),
-            ns_server_result("Stale", "9.9.9.9", &[("ns1.example.com.", &["9.9.9.9"])]),
-        ];
-        let consensus = build_nameserver_consensus(&results, &["ns1.example.com.".to_string()]);
-        let inconsistencies = build_nameserver_inconsistencies(&results, &consensus);
+        let (results, per_vantage) = assemble(vec![
+            ns_vantage("A", "1.1.1.1", &[("ns1.example.com.", &["1.2.3.4"])]),
+            ns_vantage("B", "8.8.8.8", &[("ns1.example.com.", &["1.2.3.4"])]),
+            ns_vantage("Stale", "9.9.9.9", &[("ns1.example.com.", &["9.9.9.9"])]),
+        ]);
+        let consensus =
+            build_nameserver_consensus(&results, &per_vantage, &["ns1.example.com.".to_string()]);
+        let inconsistencies = build_nameserver_inconsistencies(&results, &per_vantage, &consensus);
         assert_eq!(inconsistencies.len(), 1);
         let inc = &inconsistencies[0];
         assert_eq!(inc.server_name, "Stale");
@@ -338,18 +351,23 @@ mod tests {
 
     #[test]
     fn nameserver_inconsistencies_skip_servers_without_data() {
-        // Server C never got a chance to answer the A/AAAA followup (no entry
-        // in nameserver_ips) — must NOT be treated as "saw nothing" / a
-        // disagreement. Missing data ≠ wrong data.
-        let mut c = ns_server_result("C", "9.9.9.9", &[]);
-        c.nameserver_ips.clear();
-        let results = vec![
-            ns_server_result("A", "1.1.1.1", &[("ns1.example.com.", &["1.2.3.4"])]),
-            ns_server_result("B", "8.8.8.8", &[("ns1.example.com.", &["1.2.3.4"])]),
-            c,
-        ];
-        let consensus = build_nameserver_consensus(&results, &["ns1.example.com.".to_string()]);
-        let inconsistencies = build_nameserver_inconsistencies(&results, &consensus);
+        // Server C has no entry in the per-vantage map at all — must NOT be
+        // treated as "saw nothing" / a disagreement. Missing data ≠ wrong data.
+        let (mut results, per_vantage) = assemble(vec![
+            ns_vantage("A", "1.1.1.1", &[("ns1.example.com.", &["1.2.3.4"])]),
+            ns_vantage("B", "8.8.8.8", &[("ns1.example.com.", &["1.2.3.4"])]),
+        ]);
+        results.push(ServerResult {
+            server: DnsServer::new("C", "9.9.9.9", "NA", "Test"),
+            records: vec![],
+            response_time_ms: 10,
+            success: true,
+            error: None,
+        });
+
+        let consensus =
+            build_nameserver_consensus(&results, &per_vantage, &["ns1.example.com.".to_string()]);
+        let inconsistencies = build_nameserver_inconsistencies(&results, &per_vantage, &consensus);
         assert!(inconsistencies.is_empty(), "got: {:?}", inconsistencies);
     }
 
@@ -357,19 +375,21 @@ mod tests {
     fn nameserver_inconsistencies_ignore_unsuccessful_servers() {
         // Failed propagation servers must not contribute to consensus or
         // inconsistency — they're missing data points, not divergent answers.
-        let mut failed = ns_server_result("Down", "203.0.113.1", &[]);
-        failed.success = false;
-        failed.error = Some("timed out".to_string());
-        let results = vec![
-            ns_server_result("A", "1.1.1.1", &[("ns1.example.com.", &["1.2.3.4"])]),
-            failed,
-        ];
-        let consensus = build_nameserver_consensus(&results, &["ns1.example.com.".to_string()]);
+        let (mut results, per_vantage) = assemble(vec![
+            ns_vantage("A", "1.1.1.1", &[("ns1.example.com.", &["1.2.3.4"])]),
+            ns_vantage("Down", "203.0.113.1", &[]),
+        ]);
+        // Mark the second server unsuccessful.
+        results[1].success = false;
+        results[1].error = Some("timed out".to_string());
+
+        let consensus =
+            build_nameserver_consensus(&results, &per_vantage, &["ns1.example.com.".to_string()]);
         assert_eq!(
             consensus.get("ns1.example.com.").cloned(),
             Some(vec!["1.2.3.4".to_string()])
         );
-        let inconsistencies = build_nameserver_inconsistencies(&results, &consensus);
+        let inconsistencies = build_nameserver_inconsistencies(&results, &per_vantage, &consensus);
         assert!(inconsistencies.is_empty());
     }
 
@@ -377,12 +397,13 @@ mod tests {
     fn nameserver_inconsistencies_skip_empty_consensus() {
         // If nobody could resolve a nameserver, consensus is absent / empty —
         // we have no "right" answer to compare against, so no inconsistency.
-        let results = vec![
-            ns_server_result("A", "1.1.1.1", &[("ns1.example.com.", &[])]),
-            ns_server_result("B", "8.8.8.8", &[("ns1.example.com.", &[])]),
-        ];
-        let consensus = build_nameserver_consensus(&results, &["ns1.example.com.".to_string()]);
-        let inconsistencies = build_nameserver_inconsistencies(&results, &consensus);
+        let (results, per_vantage) = assemble(vec![
+            ns_vantage("A", "1.1.1.1", &[("ns1.example.com.", &[])]),
+            ns_vantage("B", "8.8.8.8", &[("ns1.example.com.", &[])]),
+        ]);
+        let consensus =
+            build_nameserver_consensus(&results, &per_vantage, &["ns1.example.com.".to_string()]);
+        let inconsistencies = build_nameserver_inconsistencies(&results, &per_vantage, &consensus);
         assert!(inconsistencies.is_empty(), "got: {:?}", inconsistencies);
     }
 }
