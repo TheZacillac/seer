@@ -353,11 +353,10 @@ mod tests {
     fn nameserver_inconsistencies_skip_servers_without_data() {
         // Server C has no entry in the per-vantage map at all — must NOT be
         // treated as "saw nothing" / a disagreement. Missing data ≠ wrong data.
-        let (mut results, mut per_vantage) = assemble(vec![
+        let (mut results, per_vantage) = assemble(vec![
             ns_vantage("A", "1.1.1.1", &[("ns1.example.com.", &["1.2.3.4"])]),
             ns_vantage("B", "8.8.8.8", &[("ns1.example.com.", &["1.2.3.4"])]),
         ]);
-        // Append C without an entry in `per_vantage`.
         results.push(ServerResult {
             server: DnsServer::new("C", "9.9.9.9", "NA", "Test"),
             records: vec![],
@@ -365,7 +364,6 @@ mod tests {
             success: true,
             error: None,
         });
-        let _ = &mut per_vantage; // already populated for A and B only
 
         let consensus =
             build_nameserver_consensus(&results, &per_vantage, &["ns1.example.com.".to_string()]);

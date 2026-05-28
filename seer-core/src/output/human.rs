@@ -832,27 +832,25 @@ impl OutputFormatter for HumanFormatter {
         // old IP for a nameserver hostname). Grouped by NS hostname rather
         // than record type. Only present for NS-record lookups.
         let ns_details = result.nameserver_details.as_ref();
-        if let Some(details) = ns_details {
-            if !details.inconsistencies.is_empty() {
-                output.push(format!(
-                    "  {}:",
-                    self.label("Nameserver IP inconsistencies")
-                ));
-                render_grouped(
-                    &mut output,
-                    &details.inconsistencies,
-                    |inc| inc.nameserver.clone(),
-                    |out, hdr| out.push(format!("    {}:", self.label(hdr))),
-                    |out, inc, nested| {
-                        let indent = if nested { "      " } else { "    " };
-                        out.push(format!(
-                            "{}- {}",
-                            indent,
-                            self.warning(&sanitize_display(&inc.to_string()))
-                        ));
-                    },
-                );
-            }
+        if let Some(details) = ns_details.filter(|d| !d.inconsistencies.is_empty()) {
+            output.push(format!(
+                "  {}:",
+                self.label("Nameserver IP inconsistencies")
+            ));
+            render_grouped(
+                &mut output,
+                &details.inconsistencies,
+                |inc| inc.nameserver.clone(),
+                |out, hdr| out.push(format!("    {}:", self.label(hdr))),
+                |out, inc, nested| {
+                    let indent = if nested { "      " } else { "    " };
+                    out.push(format!(
+                        "{}- {}",
+                        indent,
+                        self.warning(&sanitize_display(&inc.to_string()))
+                    ));
+                },
+            );
         }
 
         // Unreachable servers (timeouts, network errors) — distinct from

@@ -514,22 +514,20 @@ impl OutputFormatter for MarkdownFormatter {
         // Per-vantage nameserver-IP disagreements (glue-update lag), grouped
         // by NS hostname. Only present for NS-record lookups.
         let ns_details = result.nameserver_details.as_ref();
-        if let Some(details) = ns_details {
-            if !details.inconsistencies.is_empty() {
-                output.push(String::new());
-                output.push("### Nameserver IP inconsistencies".to_string());
-                output.push(String::new());
-                render_grouped(
-                    &mut output,
-                    &details.inconsistencies,
-                    |inc| inc.nameserver.clone(),
-                    |out, hdr| {
-                        out.push(format!("**{}**", MdSafe(hdr)));
-                        out.push(String::new());
-                    },
-                    |out, inc, _nested| out.push(format!("- {}", MdSafe(&inc.to_string()))),
-                );
-            }
+        if let Some(details) = ns_details.filter(|d| !d.inconsistencies.is_empty()) {
+            output.push(String::new());
+            output.push("### Nameserver IP inconsistencies".to_string());
+            output.push(String::new());
+            render_grouped(
+                &mut output,
+                &details.inconsistencies,
+                |inc| inc.nameserver.clone(),
+                |out, hdr| {
+                    out.push(format!("**{}**", MdSafe(hdr)));
+                    out.push(String::new());
+                },
+                |out, inc, _nested| out.push(format!("- {}", MdSafe(&inc.to_string()))),
+            );
         }
 
         // Unreachable servers (distinct from answer conflicts)
