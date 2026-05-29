@@ -403,10 +403,10 @@ mod tests {
         });
 
         // Give the follow a tick to start and get into its first sleep.
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
         tx.send(true).unwrap();
 
-        let joined = tokio::time::timeout(std::time::Duration::from_secs(10), handle)
+        let joined = tokio::time::timeout(Duration::from_secs(10), handle)
             .await
             .expect("follow should return promptly after cancel");
         let result = joined.expect("join").expect("follow result");

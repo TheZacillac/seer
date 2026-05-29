@@ -13,8 +13,11 @@ use tracing::{debug, instrument};
 use x509_parser::oid_registry::Oid;
 use x509_parser::prelude::*;
 
+use crate::caa::{self, CaaPolicy};
+use crate::dns::DnsResolver;
 use crate::error::{Result, SeerError};
-use crate::validation::{describe_reserved_ip, normalize_domain};
+use crate::net::resolve_public_host;
+use crate::validation::normalize_domain;
 
 /// Default timeout for SSL operations (10 seconds).
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -34,6 +37,14 @@ pub struct SslReport {
     pub is_valid: bool,
     /// Days until the leaf certificate expires
     pub days_until_expiry: i64,
+    /// CAA (Certification Authority Authorization) policy for the domain
+    /// plus a comparison against the presented certificate's issuer.
+    ///
+    /// CAA is consulted by CAs at *issuance time*, not by clients at
+    /// *validation time*, so a mismatch here is informational — see the
+    /// `note` field on [`CaaPolicy`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caa: Option<CaaPolicy>,
 }
 
 /// Detailed information about a single certificate in the chain.
@@ -60,7 +71,11 @@ pub struct CertDetail {
 }
 
 /// Client for performing SSL certificate chain inspection.
-pub struct SslChecker;
+#[derive(Debug, Clone)]
+pub struct SslChecker {
+    /// Cached DNS resolver used for CAA lookups alongside the TLS probe.
+    dns_resolver: DnsResolver,
+}
 
 impl Default for SslChecker {
     fn default() -> Self {
@@ -71,7 +86,9 @@ impl Default for SslChecker {
 impl SslChecker {
     /// Creates a new SslChecker instance.
     pub fn new() -> Self {
-        Self
+        Self {
+            dns_resolver: DnsResolver::new(),
+        }
     }
 
     /// Inspects the SSL certificate chain for the given domain.
@@ -88,39 +105,27 @@ impl SslChecker {
     #[instrument(skip(self), fields(domain = %domain))]
     pub async fn check(&self, domain: &str) -> Result<SslReport> {
         let domain = normalize_domain(domain)?;
-        let addr = format!("{}:443", domain);
 
         debug!(domain = %domain, "Checking SSL certificate chain");
 
-        // SSRF protection: resolve domain and check IPs before connecting
-        let socket_addrs: Vec<_> = tokio::net::lookup_host(&addr)
-            .await
-            .map_err(|e| {
-                SeerError::SslError(format!(
-                    "could not resolve {} to an IP address for SSL inspection \
-                     (no A or AAAA record?): {}",
-                    domain, e
-                ))
-            })?
-            .collect();
+        // CAA query runs concurrently with the TLS probe — it is advisory
+        // and never fails the report (a resolver error yields an empty
+        // policy).
+        let caa_future = caa::lookup_caa(&self.dns_resolver, &domain);
 
-        if socket_addrs.is_empty() {
-            return Err(SeerError::SslError(format!(
-                "{} has no A or AAAA records — nothing to connect to for SSL inspection",
-                domain
-            )));
-        }
+        // Resolve + SSRF check. `resolve_public_host` already falls back to
+        // hickory (Google DNS) when the OS resolver fails — important for
+        // hosts where Tailscale Split-DNS or a corp resolver pins the
+        // domain to a nameserver that can't answer for it.
+        let resolve_future = resolve_public_host(&domain, 443);
 
-        for socket_addr in &socket_addrs {
-            if let Some(reason) = describe_reserved_ip(&socket_addr.ip()) {
-                return Err(SeerError::SslError(format!(
-                    "cannot connect to {}: {} — {}",
-                    domain,
-                    socket_addr.ip(),
-                    reason
-                )));
-            }
-        }
+        let (caa_policy, socket_addrs) = tokio::join!(caa_future, resolve_future);
+        let socket_addrs = socket_addrs.map_err(|e| {
+            SeerError::SslError(format!(
+                "could not resolve {} for SSL inspection: {}",
+                domain, e
+            ))
+        })?;
 
         // Build TLS connector - accept invalid certs so we can inspect them
         let connector = native_tls::TlsConnector::builder()
@@ -135,7 +140,7 @@ impl SslChecker {
                 .await
                 .map_err(|_| SeerError::Timeout("SSL connection timed out".to_string()))?
                 .map_err(|e| {
-                    SeerError::SslError(format!("Failed to connect to {}: {}", addr, e))
+                    SeerError::SslError(format!("Failed to connect to {}:443: {}", domain, e))
                 })?;
 
         // TLS handshake with timeout
@@ -170,6 +175,11 @@ impl SslChecker {
         let days_until_expiry = (leaf_detail.valid_until - now).num_days();
         let is_valid = now >= leaf_detail.valid_from && now <= leaf_detail.valid_until;
 
+        // Annotate the CAA policy with the issuer comparison before
+        // attaching it to the report.
+        let mut caa_policy = caa_policy;
+        caa_policy.issuer_match = Some(caa::classify_issuer(&leaf_detail.issuer, &caa_policy));
+
         Ok(SslReport {
             domain,
             chain: vec![leaf_detail],
@@ -177,6 +187,7 @@ impl SslChecker {
             san_names,
             is_valid,
             days_until_expiry,
+            caa: Some(caa_policy),
         })
     }
 }
@@ -303,10 +314,8 @@ mod tests {
 
     #[test]
     fn test_ssl_checker_creation() {
-        let checker = SslChecker::new();
+        let _checker = SslChecker::new();
         let _default_checker = SslChecker::default();
-        // Just verify construction works
-        drop(checker);
     }
 
     #[test]
@@ -319,6 +328,23 @@ mod tests {
     fn test_oid_to_key_type() {
         let oid = Oid::from(&[1, 2, 840, 113549, 1, 1, 1][..]).unwrap();
         assert_eq!(oid_to_key_type(&oid), Some("RSA".to_string()));
+    }
+
+    /// Live-network sanity check: a real public site with valid TLS
+    /// completes a full chain inspection. Exercises the
+    /// [`resolve_public_host`] code path in `net.rs` (hickory fallback
+    /// engages if the test environment has a broken OS resolver) and the
+    /// rest of the TLS handshake + cert-parse pipeline.
+    #[tokio::test]
+    #[ignore = "requires network — performs a real TLS handshake"]
+    async fn check_live_example_com_succeeds() {
+        let report = SslChecker::new().check("example.com").await.unwrap();
+        assert_eq!(report.domain, "example.com");
+        assert!(!report.chain.is_empty(), "expected at least a leaf cert");
+        assert!(
+            report.is_valid,
+            "example.com's leaf cert should be currently valid"
+        );
     }
 
     #[test]
@@ -340,6 +366,7 @@ mod tests {
             san_names: vec!["example.com".to_string(), "*.example.com".to_string()],
             is_valid: true,
             days_until_expiry: 90,
+            caa: None,
         };
         let json = serde_json::to_string(&report).unwrap();
         assert!(json.contains("example.com"));

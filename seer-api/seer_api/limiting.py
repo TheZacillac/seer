@@ -2,24 +2,44 @@
 
 from __future__ import annotations
 
+import ipaddress
+import logging
 import os
 
 from fastapi import Request
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 
+log = logging.getLogger("seer_api")
+
 
 def _trusted_proxies() -> set[str]:
     """Parse ``SEER_TRUSTED_PROXY_IPS`` into a set of trusted peer IPs.
 
+    Only literal IPv4/IPv6 addresses are accepted — CIDR-style entries
+    (`10.0.0.0/8`) silently never match `request.client.host` (always a
+    bare IP) and would fail open. Reject them at parse time with a log
+    warning rather than silently disabling proxy trust.
+
     Evaluated on every request (not cached at import time) so that tests
     can set the env var via monkeypatch without reloading the module.
     """
-    return {
-        ip.strip()
-        for ip in os.environ.get("SEER_TRUSTED_PROXY_IPS", "").split(",")
-        if ip.strip()
-    }
+    out: set[str] = set()
+    for raw in os.environ.get("SEER_TRUSTED_PROXY_IPS", "").split(","):
+        entry = raw.strip()
+        if not entry:
+            continue
+        try:
+            ipaddress.ip_address(entry)
+        except ValueError:
+            log.warning(
+                "SEER_TRUSTED_PROXY_IPS entry %r is not a bare IP address; "
+                "ignoring (CIDR ranges are not supported)",
+                entry,
+            )
+            continue
+        out.add(entry)
+    return out
 
 
 def _proxy_trust_enabled() -> bool:

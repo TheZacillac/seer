@@ -91,10 +91,22 @@ class MaxBodySizeMiddleware:
                 return
             await send(message)
 
-        await self.app(scope, receive_wrapper, send_wrapper)
-        if over_limit and not sent_response:
-            sent_response = True
-            await self._send_too_large(send)
+        # `try/finally` so the 413 always fires when the body went over,
+        # even if the downstream app raises an unhandled exception
+        # (rare — FastAPI's exception handlers convert most failures into
+        # responses that flow through `send_wrapper` — but a bare ASGI
+        # exception would otherwise produce a 500 instead of 413).
+        try:
+            await self.app(scope, receive_wrapper, send_wrapper)
+        finally:
+            if over_limit and not sent_response:
+                sent_response = True
+                try:
+                    await self._send_too_large(send)
+                except Exception:
+                    # Best-effort: if the ASGI server has already given up,
+                    # don't mask the original failure.
+                    pass
 
     @staticmethod
     async def _send_too_large(send: Send) -> None:

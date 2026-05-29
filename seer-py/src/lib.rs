@@ -5,7 +5,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
-use pyo3::exceptions::{PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyConnectionError, PyRuntimeError, PyTimeoutError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict};
 use pyo3::Py;
@@ -101,8 +101,12 @@ fn seer_err_to_py(e: &SeerError) -> PyErr {
         | InvalidIpAddress(_)
         | InvalidRecordType(_)
         | DomainNotAllowed { .. } => PyValueError::new_err(e.sanitized_message()),
-        Timeout(_) => PyRuntimeError::new_err(e.sanitized_message()),
-        RateLimited(_) => PyRuntimeError::new_err(e.sanitized_message()),
+        // Map transient categories to specific Python builtin exceptions so
+        // downstream consumers (MCP server, direct seer-py users) can do
+        // targeted `except TimeoutError` / `except ConnectionError` retries
+        // instead of catching the broad `RuntimeError` umbrella.
+        Timeout(_) => PyTimeoutError::new_err(e.sanitized_message()),
+        WhoisConnectionFailed { .. } => PyConnectionError::new_err(e.sanitized_message()),
         _ => PyRuntimeError::new_err(e.sanitized_message()),
     }
 }
@@ -628,6 +632,28 @@ fn bulk_status(
 
 #[pyfunction]
 #[pyo3(signature = (domains, concurrency = 10, *, progress = None))]
+fn bulk_ssl(
+    py: Python<'_>,
+    domains: Vec<String>,
+    concurrency: usize,
+    progress: Option<Py<PyAny>>,
+) -> PyResult<PyObject> {
+    let executor = BulkExecutor::new().with_concurrency(validate_concurrency(concurrency)?);
+
+    let operations: Vec<BulkOperation> = domains
+        .into_iter()
+        .map(|domain| BulkOperation::Ssl { domain })
+        .collect();
+
+    let cb = build_progress_callback(progress)?;
+    let result = run_async_infallible(py, async move { executor.execute(operations, cb).await })?;
+
+    let json = serialize_response(&result)?;
+    json_to_python(py, &json)
+}
+
+#[pyfunction]
+#[pyo3(signature = (domains, concurrency = 10, *, progress = None))]
 fn bulk_availability(
     py: Python<'_>,
     domains: Vec<String>,
@@ -861,7 +887,11 @@ fn json_to_python_inner(
     value: &serde_json::Value,
     depth: usize,
 ) -> PyResult<PyObject> {
-    if depth > MAX_JSON_DEPTH {
+    // `>=` (not `>`) so the boundary matches the stated contract: depths
+    // 0..MAX_JSON_DEPTH are accepted (that's MAX_JSON_DEPTH levels), depth
+    // MAX_JSON_DEPTH itself is rejected. Matches the `walk_depth` pattern
+    // in `rdap/types.rs`.
+    if depth >= MAX_JSON_DEPTH {
         return Err(PyValueError::new_err(format!(
             "JSON structure exceeds max depth {MAX_JSON_DEPTH}"
         )));
@@ -946,6 +976,7 @@ fn _seer(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(bulk_dig, m)?)?;
     m.add_function(wrap_pyfunction!(bulk_propagation, m)?)?;
     m.add_function(wrap_pyfunction!(bulk_status, m)?)?;
+    m.add_function(wrap_pyfunction!(bulk_ssl, m)?)?;
     m.add_function(wrap_pyfunction!(bulk_availability, m)?)?;
     m.add_function(wrap_pyfunction!(availability, m)?)?;
     m.add_function(wrap_pyfunction!(subdomains, m)?)?;

@@ -70,6 +70,7 @@ Example Usage:
   seer bulk dig domains.txt MX              # Output: domains_results.csv
   seer bulk avail domains.txt               # Output: domains_results.csv
   seer bulk info domains.txt                # Output: domains_results.csv
+  seer bulk ssl domains.txt                 # Output: domains_results.csv
   seer bulk status domains.txt -o out.csv   # Output: out.csv
 
 Example Output (status operation):
@@ -95,6 +96,10 @@ Example Output (avail operation):
 Example Output (info operation):
   domain,success,source,registrar,registrant,organization,created,expires,updated,nameservers,status,dnssec,...,whois_server,rdap_url,availability_verdict,duration_ms,error
   example.com,true,Both,RESERVED-Internet Assigned Numbers Authority,,Internet Assigned Numbers Authority,1995-08-14,2025-08-13,2024-08-14,a.iana-servers.net;b.iana-servers.net,client delete prohibited,signed,...,whois.iana.org,https://rdap.iana.org/domain/example.com,,1523,
+
+Example Output (ssl operation):
+  domain,success,subject,issuer,valid_from,valid_until,days_remaining,signature_algorithm,key_type,key_bits,chain_length,san_count,sans,protocol_version,is_valid,duration_ms,error
+  example.com,true,CN=*.example.com,"C=US, O=DigiCert Inc, CN=DigiCert Global G2 TLS RSA SHA256 2020 CA1",2024-01-30,2025-03-01,89,sha256WithRSAEncryption,RSA,2048,3,2,*.example.com;example.com,TLS 1.3,true,612,
 "#;
 
 #[derive(Parser)]
@@ -448,14 +453,11 @@ async fn execute_command(
         }
         Commands::Rdap { query } => {
             let client = seer_core::RdapClient::new();
-            let result = if query.starts_with("AS") || query.starts_with("as") {
-                let asn: u32 = query[2..].parse()?;
-                client.lookup_asn(asn).await
-            } else if query.parse::<std::net::IpAddr>().is_ok() {
-                client.lookup_ip(&query).await
-            } else {
-                client.lookup_domain(&query).await
-            };
+            // Use seer_core::rdap::auto_lookup so the `AS<digits>` route only
+            // fires when the remainder is all digits AND the query contains no
+            // `.` — otherwise `as1234.io` / `asset.io` would misroute to ASN
+            // and surface a "parse" error instead of a domain lookup.
+            let result = seer_core::rdap::auto_lookup(&client, &query).await;
 
             match result {
                 Ok(response) => {
@@ -532,6 +534,10 @@ async fn execute_command(
             let progress_mode = resolve_progress_mode(progress, stderr_is_tty, format_str);
             const MAX_BULK_DOMAINS_CLI: usize = 1000;
 
+            // Expand `~` / `~/...` once at the boundary so both the bulk-input
+            // read and the auto-derived output path see a home-resolved path.
+            let file = utils::expand_tilde(&file);
+
             // `read_bulk_input` rejects FIFOs, sockets, devices, directories,
             // and oversized files via a pre-read metadata check, so malicious
             // `mkfifo`'d paths can't hang the process.
@@ -555,8 +561,8 @@ async fn execute_command(
                 ));
             }
 
-            // Determine output path
-            let output_path = output.unwrap_or_else(|| {
+            // Determine output path (also tilde-expanded when supplied)
+            let output_path = output.map(|s| utils::expand_tilde(&s)).unwrap_or_else(|| {
                 let input_path = std::path::Path::new(&file);
                 let stem = input_path.file_stem().unwrap_or_default().to_string_lossy();
                 let parent = input_path.parent().unwrap_or(std::path::Path::new("."));
@@ -614,9 +620,13 @@ async fn execute_command(
                     .iter()
                     .map(|d: &String| seer_core::bulk::BulkOperation::Info { domain: d.clone() })
                     .collect(),
+                "ssl" => domains
+                    .iter()
+                    .map(|d: &String| seer_core::bulk::BulkOperation::Ssl { domain: d.clone() })
+                    .collect(),
                 _ => {
                     eprintln!(
-                        "{} Unknown operation: {}. Use: lookup, whois, rdap, dig/dns, prop, status, avail, info",
+                        "{} Unknown operation: {}. Use: lookup, whois, rdap, dig/dns, prop, status, avail, info, ssl",
                         "Error:".ctp_red(),
                         operation
                     );
@@ -664,7 +674,8 @@ async fn execute_command(
                         | seer_core::bulk::BulkOperation::Lookup { domain }
                         | seer_core::bulk::BulkOperation::Status { domain }
                         | seer_core::bulk::BulkOperation::Avail { domain }
-                        | seer_core::bulk::BulkOperation::Info { domain } => domain.as_str(),
+                        | seer_core::bulk::BulkOperation::Info { domain }
+                        | seer_core::bulk::BulkOperation::Ssl { domain } => domain.as_str(),
                     };
                     match (progress_mode, r.success) {
                         (ProgressMode::Verbose, true) => {
@@ -686,9 +697,11 @@ async fn execute_command(
                 display::clear_bulk_progress_bar();
             }
 
-            // Convert results to CSV
+            // Convert results to CSV. Write atomically so a crash mid-write
+            // cannot leave a truncated CSV that downstream pipelines treat
+            // as authoritative.
             let csv_content = utils::bulk_results_to_csv(&results, &operation);
-            std::fs::write(&output_path, csv_content)?;
+            utils::atomic_write(&output_path, &csv_content)?;
 
             let success_count = results.iter().filter(|r| r.success).count();
             let fail_count = results.len() - success_count;

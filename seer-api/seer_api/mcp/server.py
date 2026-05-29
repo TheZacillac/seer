@@ -383,6 +383,29 @@ async def list_tools() -> list[Tool]:
                 "required": ["domains"],
             },
         ),
+        Tool(
+            name="seer_bulk_ssl",
+            description="Inspect SSL certificate chains for multiple domains. Returns the full chain, SANs, key details, signature algorithm, and TLS version for each domain.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "domains": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of domain names to inspect",
+                        "maxItems": MAX_BULK_DOMAINS,
+                    },
+                    "concurrency": {
+                        "type": "integer",
+                        "description": f"Number of concurrent requests (default: 10, max: {MAX_CONCURRENCY})",
+                        "default": 10,
+                        "minimum": 1,
+                        "maximum": MAX_CONCURRENCY,
+                    },
+                },
+                "required": ["domains"],
+            },
+        ),
     ]
 
 
@@ -395,6 +418,20 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         return [TextContent(type="text", text=payload)]
     except ValueError as e:
         return [TextContent(type="text", text=f"Invalid input: {e}")]
+    except (TimeoutError, ConnectionError) as e:
+        # PyO3 maps SeerError::Timeout to TimeoutError and connection-class
+        # errors to ConnectionError. These are transient — surface a clear
+        # retryable signal so the host LLM can decide to back off and try
+        # again. We do not include the error text (which can carry server
+        # response data) — the binary classification is enough.
+        logger.warning("Tool %s failed with transient error: %s", name, e)
+        return [TextContent(type="text", text="Transient error — retry suggested.")]
+    except RuntimeError as e:
+        # PyO3 maps other SeerError variants (RateLimited, RdapBootstrapError,
+        # etc.) to RuntimeError. Most are transient at the network level even
+        # if the underlying cause varies; treat as retryable.
+        logger.warning("Tool %s failed with runtime error: %s", name, e)
+        return [TextContent(type="text", text="Transient error — retry suggested.")]
     except Exception:
         logger.exception("Tool %s failed", name)
         return [TextContent(type="text", text="An internal error occurred while processing your request.")]
@@ -419,7 +456,11 @@ async def execute_tool(name: str, arguments: dict[str, Any]) -> Any:
 
         case "seer_rdap_ip":
             ip = _require_str(arguments, "ip")
-            _ssrf_guard(ip, 443)
+            # Move the SSRF guard off the event loop — `_ssrf_guard` enters
+            # PyO3 and `block_on`s a DNS resolution, which would pin the
+            # event loop for the resolver timeout. Mirrors the
+            # `seer_bulk_status` / `seer_bulk_ssl` pattern.
+            await loop.run_in_executor(None, _ssrf_guard, ip, 443)
             return await loop.run_in_executor(None, seer.rdap_ip, ip)
 
         case "seer_rdap_asn":
@@ -435,7 +476,7 @@ async def execute_tool(name: str, arguments: dict[str, Any]) -> Any:
             if nameserver is not None and not isinstance(nameserver, str):
                 raise ValueError(f"'nameserver' must be a string (got {type(nameserver).__name__})")
             if nameserver is not None:
-                _ssrf_guard(nameserver, 53)
+                await loop.run_in_executor(None, _ssrf_guard, nameserver, 53)
             return await loop.run_in_executor(
                 None, seer.dig, domain, record_type, nameserver
             )
@@ -449,7 +490,7 @@ async def execute_tool(name: str, arguments: dict[str, Any]) -> Any:
 
         case "seer_status":
             domain = _require_str(arguments, "domain")
-            _ssrf_guard(domain, 443)
+            await loop.run_in_executor(None, _ssrf_guard, domain, 443)
             return await loop.run_in_executor(None, seer.status, domain)
 
         case "seer_bulk_lookup":
@@ -477,8 +518,13 @@ async def execute_tool(name: str, arguments: dict[str, Any]) -> Any:
         case "seer_bulk_status":
             domains = _require_domains(arguments)
             concurrency = _get_concurrency(arguments, default=10)
-            for d in domains:
-                _ssrf_guard(d, 443)
+            # Move the per-domain SSRF guard off the event-loop thread.
+            # Each `_ssrf_guard` call enters PyO3 and `block_on`s a DNS
+            # resolution; doing that serially on the event loop pins it
+            # for up to (N * resolver_timeout) for a 100-domain payload.
+            await loop.run_in_executor(
+                None, lambda: [_ssrf_guard(d, 443) for d in domains]
+            )
             return await loop.run_in_executor(
                 None, seer.bulk_status, domains, concurrency
             )
@@ -500,6 +546,16 @@ async def execute_tool(name: str, arguments: dict[str, Any]) -> Any:
             concurrency = _get_concurrency(arguments, default=10)
             return await loop.run_in_executor(
                 None, seer.bulk_info, domains, concurrency
+            )
+
+        case "seer_bulk_ssl":
+            domains = _require_domains(arguments)
+            concurrency = _get_concurrency(arguments, default=10)
+            await loop.run_in_executor(
+                None, lambda: [_ssrf_guard(d, 443) for d in domains]
+            )
+            return await loop.run_in_executor(
+                None, seer.bulk_ssl, domains, concurrency
             )
 
         case _:

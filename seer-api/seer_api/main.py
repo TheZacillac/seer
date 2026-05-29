@@ -14,7 +14,7 @@ from slowapi.errors import RateLimitExceeded
 from . import __version__
 from .limiting import limiter
 from .middleware import MaxBodySizeMiddleware, RequestLoggingMiddleware, metrics
-from .routers import lookup, whois, rdap, dns, propagation, status
+from .routers import lookup, whois, rdap, dns, propagation, status, ssl
 
 # Configure structured logging via the unified Arcanum logging module.
 try:
@@ -33,7 +33,12 @@ log = logging.getLogger(__name__)
 # Docs endpoints (/docs, /redoc, /openapi.json) are gated behind
 # SEER_DOCS_ENABLED; when enabled they are also exempted from auth so the
 # interactive UIs remain usable for operators.
-API_KEY = os.environ.get("SEER_API_KEY")
+#
+# `DOCS_ENABLED` is read at import time because it gates `docs_url=` /
+# `redoc_url=` / `openapi_url=` on the FastAPI() constructor; those args
+# can't change at runtime. `SEER_API_KEY`, by contrast, is consulted on
+# every request via `auth_middleware` so tests and rotating-secret deploys
+# don't need an import reload to pick up changes.
 DOCS_ENABLED = os.environ.get("SEER_DOCS_ENABLED", "").lower() in ("1", "true", "yes")
 _AUTH_EXEMPT_PATHS: frozenset[str] = (
     frozenset({"/health", "/docs", "/openapi.json", "/redoc"})
@@ -76,9 +81,14 @@ async def lifespan(_app: FastAPI):
         )
 
     # C6: bound to a non-loopback interface without any API key is an open
-    # proxy. Hard-fail rather than warn.
+    # proxy. Hard-fail rather than warn. Read SEER_API_KEY directly from
+    # the environment here (not from a module-level constant) so a deploy
+    # that sets the key just before startup is honoured. Use `.strip()`
+    # so a blank value from a secrets-manager placeholder
+    # (`SEER_API_KEY=""`) still trips the guard instead of silently
+    # disabling auth.
     host = os.environ.get("SEER_HOST", "127.0.0.1")
-    if host != "127.0.0.1" and not API_KEY:
+    if host != "127.0.0.1" and not (os.environ.get("SEER_API_KEY") or "").strip():
         log.error(
             "seer-api is bound to %s with no SEER_API_KEY set. Refusing to "
             "start. Set SEER_API_KEY or SEER_HOST=127.0.0.1.",
@@ -107,9 +117,23 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 # For production, set SEER_CORS_ORIGINS to comma-separated list of allowed origins
 # e.g., SEER_CORS_ORIGINS="https://example.com,https://app.example.com"
 cors_origins_env = os.environ.get("SEER_CORS_ORIGINS", "")
-if cors_origins_env:
-    allowed_origins = [origin.strip() for origin in cors_origins_env.split(",")]
+# Filter empty entries first so `SEER_CORS_ORIGINS=",,"` and trailing
+# commas land in the dev-mode branch instead of producing a list of
+# empty strings that CORSMiddleware silently never matches.
+_cors_parsed = [o for o in (s.strip() for s in cors_origins_env.split(",")) if o]
+if _cors_parsed:
+    allowed_origins = _cors_parsed
     allow_credentials = True
+    # `Access-Control-Allow-Origin: *` with `allow_credentials=True` is a
+    # CORS spec violation — browsers reject it and Starlette raises a
+    # ValueError on first preflight. Catch the misconfig at startup so the
+    # operator gets a clear message instead of an opaque 500 later.
+    if "*" in allowed_origins:
+        raise RuntimeError(
+            "SEER_CORS_ORIGINS cannot contain '*' (credentials would be "
+            "exposed to any origin). List explicit origins, or unset the "
+            "variable to use the credential-less development mode."
+        )
 else:
     # Development mode: allow all origins but disable credentials
     allowed_origins = ["*"]
@@ -134,15 +158,24 @@ app.add_middleware(MaxBodySizeMiddleware, max_bytes=64 * 1024)
 
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
-    """Enforce optional bearer-token auth when SEER_API_KEY is set."""
-    if API_KEY:
+    """Enforce optional bearer-token auth when SEER_API_KEY is set.
+
+    Reads `SEER_API_KEY` per request rather than from a module-level
+    constant, so tests and rotating-secret deployments don't need an import
+    reload to pick up the current key.
+    """
+    # Treat a blank value (e.g. `SEER_API_KEY=""` from a misconfigured
+    # secrets-manager placeholder) as "no key set" rather than letting
+    # it silently disable auth via Python's empty-string falsy check.
+    api_key = (os.environ.get("SEER_API_KEY") or "").strip()
+    if api_key:
         # Skip CORS preflight (OPTIONS) and public endpoints. The auth
         # middleware runs outermost (wrapping CORSMiddleware), so rejecting
         # OPTIONS here would strip CORS headers and break browser clients.
         if request.method == "OPTIONS" or request.url.path in _AUTH_EXEMPT_PATHS:
             return await call_next(request)
         provided = request.headers.get("Authorization", "")
-        expected = f"Bearer {API_KEY}"
+        expected = f"Bearer {api_key}"
         if not hmac.compare_digest(provided, expected):
             return JSONResponse({"detail": "unauthorized"}, status_code=401)
     return await call_next(request)
@@ -154,6 +187,7 @@ app.include_router(rdap.router, prefix="/rdap", tags=["RDAP"])
 app.include_router(dns.router, prefix="/dns", tags=["DNS"])
 app.include_router(propagation.router, prefix="/propagation", tags=["Propagation"])
 app.include_router(status.router, prefix="/status", tags=["Status"])
+app.include_router(ssl.router, prefix="/ssl", tags=["SSL"])
 
 
 @app.get("/")
@@ -172,6 +206,7 @@ async def root():
             "dns": "/dns/{domain}/{record_type}",
             "propagation": "/propagation/{domain}/{record_type}",
             "status": "/status/{domain}",
+            "ssl_bulk": "/ssl/bulk",
         },
         "docs": "/docs",
     }

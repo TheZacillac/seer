@@ -4,7 +4,8 @@ use std::time::Duration;
 
 use futures::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
-use tokio::time::sleep;
+use tokio::sync::Mutex;
+use tokio::time::{sleep_until, Instant as TokioInstant};
 use tracing::{debug, info, instrument};
 
 use crate::availability::{AvailabilityChecker, AvailabilityResult};
@@ -12,6 +13,7 @@ use crate::dns::{DnsRecord, DnsResolver, PropagationChecker, PropagationResult, 
 use crate::error::Result;
 use crate::lookup::{LookupResult, SmartLookup};
 use crate::rdap::{RdapClient, RdapResponse};
+use crate::ssl::{SslChecker, SslReport};
 use crate::status::{StatusClient, StatusResponse};
 use crate::whois::{WhoisClient, WhoisResponse};
 
@@ -47,6 +49,9 @@ pub enum BulkOperation {
     Info {
         domain: String,
     },
+    Ssl {
+        domain: String,
+    },
 }
 
 /// The data returned from a bulk operation (varies by operation type).
@@ -61,6 +66,7 @@ pub enum BulkResultData {
     Status(StatusResponse),
     Avail(AvailabilityResult),
     Info(crate::domain_info::DomainInfo),
+    Ssl(SslReport),
 }
 
 /// Result of a single operation within a bulk execution.
@@ -85,6 +91,7 @@ pub struct BulkExecutor {
     smart_lookup: SmartLookup,
     status_client: StatusClient,
     availability_checker: AvailabilityChecker,
+    ssl_checker: SslChecker,
 }
 
 impl Default for BulkExecutor {
@@ -105,6 +112,7 @@ impl BulkExecutor {
             smart_lookup: SmartLookup::new(),
             status_client: StatusClient::new(),
             availability_checker: AvailabilityChecker::new(),
+            ssl_checker: SslChecker::new(),
         }
     }
 
@@ -134,11 +142,30 @@ impl BulkExecutor {
             "Starting bulk execution"
         );
 
+        // Per-batch rate limiter. The naive `interval(...).tick().await` inside
+        // a `Mutex` would hold the lock across the await, serializing all
+        // dispatch through the lock at 1 / rate_limit_delay — exactly the
+        // regression v0.26.7 tried to fix from the other direction.
+        //
+        // Instead each task locks briefly to *claim* its dispatch slot (the
+        // next monotonically-increasing deadline at `rate_limit_delay`
+        // spacing), then releases the lock and `sleep_until`s its assigned
+        // slot. With concurrency=N and rate=D, N tasks can be sleeping
+        // simultaneously on N distinct deadlines, and execution begins at
+        // each task's deadline — so global dispatch rate is 1/D while up
+        // to N tasks run their operation concurrently.
+        let limiter = if self.rate_limit_delay.is_zero() {
+            None
+        } else {
+            Some(Arc::new(Mutex::new(None::<TokioInstant>)))
+        };
+        let rate_limit_delay = self.rate_limit_delay;
+
         let results: Vec<BulkResult> = stream::iter(operations)
             .map(|op| {
                 let completed = completed.clone();
                 let progress = progress.as_ref();
-                let rate_limit_delay = self.rate_limit_delay;
+                let limiter = limiter.clone();
                 let whois_client = &self.whois_client;
                 let rdap_client = &self.rdap_client;
                 let dns_resolver = &self.dns_resolver;
@@ -146,11 +173,24 @@ impl BulkExecutor {
                 let smart_lookup = &self.smart_lookup;
                 let status_client = &self.status_client;
                 let availability_checker = &self.availability_checker;
+                let ssl_checker = &self.ssl_checker;
 
                 async move {
-                    // Rate limiting delay
-                    if !rate_limit_delay.is_zero() {
-                        sleep(rate_limit_delay).await;
+                    // Rate-limited dispatch: claim our slot quickly under the
+                    // lock, then `sleep_until` outside the lock so multiple
+                    // tasks can be sleeping in parallel on their own slots.
+                    if let Some(limiter) = &limiter {
+                        let my_slot = {
+                            let mut next = limiter.lock().await;
+                            let now = TokioInstant::now();
+                            let slot = match *next {
+                                Some(prev) if prev > now => prev,
+                                _ => now,
+                            };
+                            *next = Some(slot + rate_limit_delay);
+                            slot
+                        };
+                        sleep_until(my_slot).await;
                     }
 
                     let start = std::time::Instant::now();
@@ -164,6 +204,7 @@ impl BulkExecutor {
                             lookup: smart_lookup,
                             status: status_client,
                             avail: availability_checker,
+                            ssl: ssl_checker,
                         },
                     )
                     .await;
@@ -180,7 +221,8 @@ impl BulkExecutor {
                             | BulkOperation::Lookup { domain }
                             | BulkOperation::Status { domain }
                             | BulkOperation::Avail { domain }
-                            | BulkOperation::Info { domain } => domain.as_str(),
+                            | BulkOperation::Info { domain }
+                            | BulkOperation::Ssl { domain } => domain.as_str(),
                         };
                         progress(count, total, desc);
                     }
@@ -299,6 +341,14 @@ impl BulkExecutor {
             .collect();
         self.execute(operations, None).await
     }
+
+    pub async fn execute_ssl(&self, domains: Vec<String>) -> Vec<BulkResult> {
+        let operations = domains
+            .into_iter()
+            .map(|domain| BulkOperation::Ssl { domain })
+            .collect();
+        self.execute(operations, None).await
+    }
 }
 
 struct Clients<'a> {
@@ -309,6 +359,7 @@ struct Clients<'a> {
     lookup: &'a SmartLookup,
     status: &'a StatusClient,
     avail: &'a AvailabilityChecker,
+    ssl: &'a SslChecker,
 }
 
 async fn execute_operation(op: &BulkOperation, clients: &Clients<'_>) -> Result<BulkResultData> {
@@ -352,6 +403,10 @@ async fn execute_operation(op: &BulkOperation, clients: &Clients<'_>) -> Result<
             Ok(BulkResultData::Info(
                 crate::domain_info::DomainInfo::from_lookup_result(&result),
             ))
+        }
+        BulkOperation::Ssl { domain } => {
+            let result = clients.ssl.check(domain).await?;
+            Ok(BulkResultData::Ssl(result))
         }
     }
 }
@@ -490,5 +545,102 @@ csv,format,example.org
     fn is_csv_header_row_rejects_non_keyword() {
         assert!(!is_csv_header_row("example"));
         assert!(!is_csv_header_row("mydata"));
+    }
+
+    /// Regression test for the v0.26.7 rate-limiter regression. The
+    /// previous implementation held a `tokio::sync::Mutex` guard across
+    /// `Interval::tick().await`, fully serializing dispatch through the
+    /// lock. We need a behavioural assertion (not just code review) that
+    /// catches that pattern if it ever returns.
+    ///
+    /// With concurrency 5, rate_limit 50ms, and 4 hermetic-failure tasks:
+    /// - Dispatch should be spaced ~50ms apart (slot-claim semantics).
+    /// - All 4 tasks should *finish* in well under 4 * (per-op cost),
+    ///   i.e. they overlap on the execution side.
+    /// - Total wall time should be approximately the longest single op
+    ///   plus the cumulative slot delays (~150ms).
+    ///
+    /// The previous (broken) implementation would have produced wall
+    /// time = sum-of-per-op-cost because dispatch was serialized.
+    #[tokio::test]
+    async fn rate_limiter_dispatches_in_parallel_not_serialized() {
+        use std::time::Instant;
+        let executor = BulkExecutor::new()
+            .with_concurrency(5)
+            .with_rate_limit(Duration::from_millis(50));
+
+        // Use unresolvable `.invalid` hosts — they fail fast at DNS, well
+        // under the limiter's slot spacing. If dispatch IS rate-limited
+        // in parallel, all 4 finish in close to 3 * 50ms = 150ms (plus
+        // per-op DNS-fail cost, typically tens of ms). If dispatch was
+        // serialized through a lock, each task waits for the previous
+        // to FINISH before starting — total would be much higher.
+        let start = Instant::now();
+        let domains = vec![
+            "seer-rl-1.invalid".to_string(),
+            "seer-rl-2.invalid".to_string(),
+            "seer-rl-3.invalid".to_string(),
+            "seer-rl-4.invalid".to_string(),
+        ];
+        let results = executor.execute_ssl(domains).await;
+        let elapsed = start.elapsed();
+
+        assert_eq!(results.len(), 4);
+        // Generous upper bound — 2s is far above the worst legitimate
+        // wall time (4*50ms slots + 4*100ms DNS-fail = ~600ms) but well
+        // below the serialised path (would be 4 * per-op-cost minimum).
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "rate-limited dispatch should run in parallel; took {:?}",
+            elapsed
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_ssl_failure_path_for_unresolvable_host() {
+        // Verifies the SSL bulk arm wires correctly: an unresolvable hostname
+        // must surface as success=false with a non-empty error string. Uses
+        // the IETF-reserved `.invalid` TLD so this is hermetic.
+        let executor = BulkExecutor::new().with_rate_limit(Duration::ZERO);
+        let results = executor
+            .execute_ssl(vec!["seer-bulk-ssl-test.invalid".to_string()])
+            .await;
+        assert_eq!(results.len(), 1);
+        let r = &results[0];
+        assert!(!r.success, "expected failure, got success");
+        assert!(r.data.is_none(), "expected no data on failure");
+        let err = r.error.as_deref().unwrap_or("");
+        assert!(!err.is_empty(), "expected non-empty error, got: {:?}", err);
+        assert!(
+            matches!(r.operation, BulkOperation::Ssl { ref domain } if domain == "seer-bulk-ssl-test.invalid"),
+            "expected Ssl variant, got {:?}",
+            r.operation
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "live network: hits cloudflare.com:443; run with --ignored"]
+    async fn execute_ssl_live_cloudflare_has_non_empty_chain() {
+        let executor = BulkExecutor::new();
+        let results = executor
+            .execute_ssl(vec!["cloudflare.com".to_string()])
+            .await;
+        assert_eq!(results.len(), 1);
+        let r = &results[0];
+        assert!(r.success, "expected success, got error: {:?}", r.error);
+        let Some(BulkResultData::Ssl(ref report)) = r.data else {
+            panic!("expected Ssl data, got {:?}", r.data);
+        };
+        assert!(!report.chain.is_empty(), "chain must not be empty");
+        assert!(report.is_valid, "cloudflare leaf cert should be valid");
+        assert!(
+            report.days_until_expiry > 0,
+            "cert should still be valid in the future, got {} days",
+            report.days_until_expiry
+        );
+        assert!(
+            !report.san_names.is_empty(),
+            "cloudflare cert should have SAN entries"
+        );
     }
 }

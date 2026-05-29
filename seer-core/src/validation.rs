@@ -52,6 +52,12 @@ pub fn normalize_domain(domain: &str) -> Result<String> {
     // Remove www. prefix
     let domain = domain.strip_prefix("www.").unwrap_or(domain);
 
+    // Strip a single trailing dot (FQDN form: `example.com.` → `example.com`).
+    // DNS libraries and copy-paste from `dig` output routinely include the
+    // root-label dot; rejecting it would force callers to pre-clean inputs
+    // that are otherwise valid.
+    let domain = domain.strip_suffix('.').unwrap_or(domain);
+
     // Validate domain format
     if domain.is_empty() || !domain.contains('.') {
         return Err(SeerError::InvalidDomain(domain.to_string()));
@@ -388,9 +394,18 @@ mod tests {
         assert!(normalize_domain("nodots").is_err());
         assert!(normalize_domain("example..com").is_err());
         assert!(normalize_domain(".example.com").is_err());
-        assert!(normalize_domain("example.com.").is_err());
         assert!(normalize_domain("-example.com").is_err());
         assert!(normalize_domain("example-.com").is_err());
+
+        // FQDN form is accepted: single trailing dot is stripped.
+        assert_eq!(normalize_domain("example.com.").unwrap(), "example.com");
+        assert_eq!(
+            normalize_domain("https://example.com.").unwrap(),
+            "example.com"
+        );
+        // Double trailing dot is still invalid (would leave a trailing dot
+        // after stripping just one).
+        assert!(normalize_domain("example.com..").is_err());
     }
 
     #[test]

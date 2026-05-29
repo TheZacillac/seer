@@ -429,15 +429,20 @@ impl DnssecChecker {
     }
 }
 
+/// Maps a DNSSEC algorithm number to a human-readable name. Numbers come
+/// from the IANA "DNSSEC Algorithm Numbers" registry. Algorithm 9 is
+/// reserved (not assigned). 7 and 12 are operationally discouraged per
+/// RFC 8624; we flag both as deprecated.
 fn algorithm_name(algo: u8) -> String {
     match algo {
         1 => "RSA/MD5 (deprecated)".to_string(),
         3 => "DSA/SHA-1 (deprecated)".to_string(),
         5 => "RSA/SHA-1 (deprecated)".to_string(),
         6 => "DSA-NSEC3-SHA1 (deprecated)".to_string(),
-        7 => "RSASHA1-NSEC3-SHA1".to_string(),
+        7 => "RSASHA1-NSEC3-SHA1 (deprecated)".to_string(),
         8 => "RSA/SHA-256".to_string(),
         10 => "RSA/SHA-512".to_string(),
+        12 => "ECC-GOST (deprecated)".to_string(),
         13 => "ECDSA P-256/SHA-256".to_string(),
         14 => "ECDSA P-384/SHA-384".to_string(),
         15 => "Ed25519".to_string(),

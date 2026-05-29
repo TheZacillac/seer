@@ -91,7 +91,14 @@ impl Watchlist {
         }
     }
 
-    /// Persists the watchlist to disk.
+    /// Persists the watchlist to disk via write-and-rename so a crash mid-write
+    /// cannot leave the file truncated (the next `load()` would see corrupt
+    /// TOML and silently fall back to the default empty watchlist, losing
+    /// the user's domains). Mirrors `LookupHistory::save`.
+    ///
+    /// The temp filename is suffixed with the current PID so two concurrent
+    /// `seer` processes don't write to the same intermediate path and race
+    /// each other's `rename`s.
     pub fn save(&self) -> Result<()> {
         let path = Self::path()
             .ok_or_else(|| SeerError::ConfigError("Cannot determine home directory".to_string()))?;
@@ -100,7 +107,12 @@ impl Watchlist {
         }
         let content =
             toml::to_string_pretty(self).map_err(|e| SeerError::ConfigError(e.to_string()))?;
-        std::fs::write(&path, content).map_err(|e| SeerError::ConfigError(e.to_string()))?;
+        let tmp_path = path.with_extension(format!("toml.{}.tmp", std::process::id()));
+        std::fs::write(&tmp_path, content).map_err(|e| SeerError::ConfigError(e.to_string()))?;
+        std::fs::rename(&tmp_path, &path).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp_path);
+            SeerError::ConfigError(e.to_string())
+        })?;
         Ok(())
     }
 
@@ -195,25 +207,22 @@ pub async fn check_watchlist(domains: &[String]) -> WatchReport {
         .await;
 
     let total = results.len();
+    // A result counts as critical if ANY of: SSL expires within 30 days,
+    // domain registration expires within 30 days, or an issue string mentions
+    // "invalid" / "failed". Flat OR of three predicates, evaluated
+    // independently — the previous version nested the numeric checks inside
+    // an `any()` over issue strings, which made the critical count depend
+    // on iteration order over `issues` and could short-circuit incorrectly.
     let critical = results
         .iter()
         .filter(|r| {
-            r.issues.iter().any(|i| {
-                i.contains("invalid") || i.contains("failed") || {
-                    // Check for expiry under 30 days
-                    if let Some(ssl) = r.ssl_days_remaining {
-                        if ssl < 30 {
-                            return true;
-                        }
-                    }
-                    if let Some(dom) = r.domain_days_remaining {
-                        if dom < 30 {
-                            return true;
-                        }
-                    }
-                    false
-                }
-            })
+            let bad_ssl = r.ssl_days_remaining.is_some_and(|d| d < 30);
+            let bad_domain = r.domain_days_remaining.is_some_and(|d| d < 30);
+            let bad_issue = r
+                .issues
+                .iter()
+                .any(|i| i.contains("invalid") || i.contains("failed"));
+            bad_ssl || bad_domain || bad_issue
         })
         .count();
     let warnings = results.iter().filter(|r| !r.issues.is_empty()).count();

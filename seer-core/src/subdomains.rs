@@ -13,6 +13,16 @@ use crate::error::{Result, SeerError};
 /// forever can't tie up an enumerate() call indefinitely.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// crt.sh is well-known for transient 5xx responses under load. Retry a
+/// small number of times with exponential backoff before surfacing the
+/// failure to the caller. Only transient failures (5xx, connect errors,
+/// body-read timeouts) are retried — a 4xx or parse error is terminal.
+const MAX_ATTEMPTS: u32 = 3;
+const RETRY_BASE_BACKOFF: Duration = Duration::from_millis(500);
+
+/// Maximum response size for CT log queries (10 MB).
+const MAX_CT_RESPONSE_SIZE: usize = 10 * 1024 * 1024;
+
 /// Result of subdomain enumeration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubdomainResult {
@@ -84,66 +94,7 @@ impl SubdomainEnumerator {
         // Query crt.sh (Certificate Transparency log aggregator)
         let url = format!("https://crt.sh/?q=%25.{}&output=json", domain);
 
-        // Maximum response size for CT log queries (10 MB).
-        const MAX_CT_RESPONSE_SIZE: usize = 10 * 1024 * 1024;
-
-        let response = client()?
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| SeerError::HttpError(format!("CT log query failed: {}", e)))?;
-
-        if !response.status().is_success() {
-            return Err(SeerError::HttpError(format!(
-                "CT log returned status {}",
-                response.status()
-            )));
-        }
-
-        // Check Content-Length header before downloading
-        if let Some(content_length) = response.content_length() {
-            if content_length as usize > MAX_CT_RESPONSE_SIZE {
-                return Err(SeerError::HttpError(format!(
-                    "CT log response too large: {} bytes (limit: {} bytes)",
-                    content_length, MAX_CT_RESPONSE_SIZE
-                )));
-            }
-        }
-
-        // Stream the body with an incremental size check so a server that
-        // omits (or lies about) Content-Length cannot force us to buffer an
-        // unbounded payload into memory. Wrapped in a total-duration timeout
-        // so a server that trickles bytes forever cannot hang the caller.
-        // Mirrors the pattern in rdap::client::query_rdap_internal.
-        let mut body: Vec<u8> = Vec::new();
-        let mut stream = response.bytes_stream();
-        let streamed = tokio::time::timeout(DEFAULT_TIMEOUT, async {
-            while let Some(chunk) = stream.next().await {
-                let chunk = chunk.map_err(|e| {
-                    SeerError::HttpError(format!("Failed to read CT log response: {}", e))
-                })?;
-                if body.len() + chunk.len() > MAX_CT_RESPONSE_SIZE {
-                    return Err(SeerError::HttpError(format!(
-                        "CT log response too large (exceeds {} bytes)",
-                        MAX_CT_RESPONSE_SIZE
-                    )));
-                }
-                body.extend_from_slice(&chunk);
-            }
-            Ok::<(), SeerError>(())
-        })
-        .await;
-
-        match streamed {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => return Err(e),
-            Err(_) => {
-                return Err(SeerError::Timeout(format!(
-                    "CT log body read timed out after {:?}",
-                    DEFAULT_TIMEOUT
-                )));
-            }
-        }
+        let body = fetch_with_retry(&url).await?;
 
         let entries: Vec<CtLogEntry> = serde_json::from_slice(&body)
             .map_err(|e| SeerError::HttpError(format!("Failed to parse CT log response: {}", e)))?;
@@ -197,6 +148,107 @@ impl SubdomainEnumerator {
             count,
         })
     }
+}
+
+/// Fetch the crt.sh body, retrying up to `MAX_ATTEMPTS` times on transient
+/// failures (5xx, connect/read errors, body-read timeouts). 4xx responses
+/// and oversize-body errors are terminal.
+async fn fetch_with_retry(url: &str) -> Result<Vec<u8>> {
+    let mut last_err: Option<SeerError> = None;
+    for attempt in 0..MAX_ATTEMPTS {
+        match fetch_once(url).await {
+            Ok(body) => return Ok(body),
+            Err(FetchOutcome::Terminal(e)) => return Err(e),
+            Err(FetchOutcome::Retryable(e)) => {
+                debug!(
+                    attempt = attempt + 1,
+                    max_attempts = MAX_ATTEMPTS,
+                    error = %e,
+                    "Transient CT log failure, retrying"
+                );
+                last_err = Some(e);
+                if attempt + 1 < MAX_ATTEMPTS {
+                    let backoff = RETRY_BASE_BACKOFF * 2u32.pow(attempt);
+                    tokio::time::sleep(backoff).await;
+                }
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        SeerError::HttpError("CT log query failed with no recorded error".into())
+    }))
+}
+
+/// Single-attempt fetch. Splits failures into retryable vs terminal so the
+/// caller can decide whether another attempt is worth making.
+async fn fetch_once(url: &str) -> std::result::Result<Vec<u8>, FetchOutcome> {
+    let response = client()
+        .map_err(FetchOutcome::Terminal)?
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| {
+            FetchOutcome::Retryable(SeerError::HttpError(format!("CT log query failed: {}", e)))
+        })?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let err = SeerError::HttpError(format!("CT log returned status {}", status));
+        return Err(if status.is_server_error() {
+            FetchOutcome::Retryable(err)
+        } else {
+            FetchOutcome::Terminal(err)
+        });
+    }
+
+    if let Some(content_length) = response.content_length() {
+        if content_length as usize > MAX_CT_RESPONSE_SIZE {
+            return Err(FetchOutcome::Terminal(SeerError::HttpError(format!(
+                "CT log response too large: {} bytes (limit: {} bytes)",
+                content_length, MAX_CT_RESPONSE_SIZE
+            ))));
+        }
+    }
+
+    // Stream the body with an incremental size check so a server that
+    // omits (or lies about) Content-Length cannot force us to buffer an
+    // unbounded payload into memory. Wrapped in a total-duration timeout
+    // so a server that trickles bytes forever cannot hang the caller.
+    let mut body: Vec<u8> = Vec::new();
+    let mut stream = response.bytes_stream();
+    let streamed = tokio::time::timeout(DEFAULT_TIMEOUT, async {
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| {
+                FetchOutcome::Retryable(SeerError::HttpError(format!(
+                    "Failed to read CT log response: {}",
+                    e
+                )))
+            })?;
+            if body.len() + chunk.len() > MAX_CT_RESPONSE_SIZE {
+                return Err(FetchOutcome::Terminal(SeerError::HttpError(format!(
+                    "CT log response too large (exceeds {} bytes)",
+                    MAX_CT_RESPONSE_SIZE
+                ))));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(body)
+    })
+    .await;
+
+    match streamed {
+        Ok(Ok(body)) => Ok(body),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(FetchOutcome::Retryable(SeerError::Timeout(format!(
+            "CT log body read timed out after {:?}",
+            DEFAULT_TIMEOUT
+        )))),
+    }
+}
+
+enum FetchOutcome {
+    Retryable(SeerError),
+    Terminal(SeerError),
 }
 
 #[derive(Debug, Deserialize)]

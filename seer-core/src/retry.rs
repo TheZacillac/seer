@@ -99,9 +99,13 @@ impl RetryPolicy {
         let capped_delay = base_delay.min(self.max_delay.as_millis() as f64);
 
         let final_delay = if self.jitter {
-            // Add jitter: random value between 50% and 100% of the delay
+            // Full jitter (AWS "Exponential Backoff and Jitter"):
+            // sleep ∈ [0, capped_delay]. Half-jitter ([0.5..1.0]) clusters
+            // retries in the upper half of the window, which leaves
+            // measurable thundering-herd behaviour after a brief outage.
+            // Full jitter spreads retries uniformly across the window.
             let mut rng = rand::thread_rng();
-            let jitter_factor = rng.gen_range(0.5..1.0);
+            let jitter_factor = rng.gen_range(0.0..1.0);
             capped_delay * jitter_factor
         } else {
             capped_delay

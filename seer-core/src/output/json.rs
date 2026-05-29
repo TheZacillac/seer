@@ -131,7 +131,7 @@ mod tests {
 
     #[test]
     fn test_json_format_dns_records() {
-        let records = vec![crate::dns::DnsRecord {
+        let records = vec![DnsRecord {
             name: "example.com".to_string(),
             record_type: RecordType::A,
             ttl: 300,

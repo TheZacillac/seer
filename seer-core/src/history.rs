@@ -81,7 +81,13 @@ impl LookupHistory {
         }
     }
 
-    /// Persists history to disk.
+    /// Persists history to disk via a write-and-rename so a kill mid-write
+    /// can't leave the file truncated. `std::fs::write` is open(O_TRUNC)
+    /// followed by write — if the process dies between the two, the next
+    /// `load()` finds an empty/partial file, the corrupt-file branch fires,
+    /// and the user's history is silently moved to `.corrupt`. Writing to
+    /// a sibling temp file and `rename`-ing over the target is atomic on
+    /// POSIX and survives that crash.
     pub fn save(&self) -> Result<()> {
         let path = Self::path()
             .ok_or_else(|| SeerError::ConfigError("Cannot determine home directory".to_string()))?;
@@ -90,7 +96,20 @@ impl LookupHistory {
         }
         let content = serde_json::to_string_pretty(self)
             .map_err(|e| SeerError::ConfigError(e.to_string()))?;
-        std::fs::write(&path, content).map_err(|e| SeerError::ConfigError(e.to_string()))?;
+        // Per-PID temp filename so two concurrent `seer` processes don't
+        // race on the same intermediate path. Without this, process B's
+        // `fs::write` could truncate A's `.tmp` after A finished writing
+        // but before A's `rename` — A would then rename a truncated file
+        // and silently lose history.
+        let tmp_path = path.with_extension(format!("json.{}.tmp", std::process::id()));
+        std::fs::write(&tmp_path, content).map_err(|e| SeerError::ConfigError(e.to_string()))?;
+        std::fs::rename(&tmp_path, &path).map_err(|e| {
+            // Best-effort cleanup of the temp file so we don't litter on
+            // failure. Swallow the cleanup error — the original rename
+            // error is what we want to surface.
+            let _ = std::fs::remove_file(&tmp_path);
+            SeerError::ConfigError(e.to_string())
+        })?;
         Ok(())
     }
 

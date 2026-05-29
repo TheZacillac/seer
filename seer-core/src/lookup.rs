@@ -121,6 +121,37 @@ fn classify_whois_leg(
     None
 }
 
+/// Wraps `classify_whois_leg` with the "RDAP returned 200" veto: a successful
+/// RDAP response (HTTP 200, even if the body is thin) is positive evidence
+/// that the domain object exists, so we never let a WHOIS-only signal flip
+/// the verdict to "available" in that case. This guards against WHOIS
+/// propagation lag against freshly-provisioned domains the registry has
+/// already begun serving via RDAP. v0.26.6 regression fix.
+fn should_route_to_availability(
+    rdap_returned_200: bool,
+    rdap_seer_error: Option<&SeerError>,
+    whois_data: &WhoisResponse,
+) -> Option<(&'static str, &'static str)> {
+    if rdap_returned_200 {
+        return None;
+    }
+    // `is_available()` streams the raw response (~1 MB worst case) line by
+    // line. Compute it once and reuse — `classify_whois_leg` also calls it,
+    // so the original code paid the scan twice on every non-404 RDAP-error
+    // path. We pre-check Case A here; if it doesn't fire we drop into the
+    // 404+thin Case B branch via `classify_whois_leg`.
+    if whois_data.is_available() {
+        return Some(("high", "whois"));
+    }
+    rdap_seer_error.and_then(|e| {
+        // Case B only: WHOIS is not available, so the only remaining path
+        // is "thin WHOIS + RDAP 404". `classify_whois_leg` will re-check
+        // `is_available()` for free (it's false now), so this is a single
+        // additional thin-check call.
+        classify_whois_leg(whois_data, e)
+    })
+}
+
 /// Sanitizes an error message for inclusion in a public-facing response.
 ///
 /// Strips IPv4 and IPv6 literals (to avoid leaking internal addresses when
@@ -157,28 +188,21 @@ struct InflightGuard {
 
 impl Drop for InflightGuard {
     fn drop(&mut self) {
-        // Avoid blocking on the mutex inside Drop. A cancelled future that
-        // drops this guard could otherwise starve the Tokio executor while
-        // it waits for contention to clear. `try_lock` lets us take the
-        // fast path when the map is uncontended, recover from poisoning
-        // explicitly, and simply skip cleanup when another task holds the
-        // mutex — waiters re-contend for ownership on their next wakeup,
-        // so a missed cleanup is self-healing.
-        match LOOKUP_INFLIGHT.try_lock() {
-            Ok(mut inflight) => {
-                inflight.remove(&self.key);
-            }
-            Err(std::sync::TryLockError::Poisoned(p)) => {
-                let mut inflight = p.into_inner();
-                inflight.remove(&self.key);
-            }
-            Err(std::sync::TryLockError::WouldBlock) => {
-                tracing::debug!(
-                    key = %self.key,
-                    "InflightGuard drop: skipping cleanup under contention"
-                );
-            }
-        }
+        // Always remove the entry before notifying. The earlier `try_lock`
+        // design skipped removal under contention, but that left a stale
+        // `Weak<Notify>` in the map: a caller arriving in the brief window
+        // between `notify_waiters()` firing and the owner's `Arc<Notify>`
+        // dropping could upgrade the Weak, register as a waiter on the
+        // already-fired Notify, and block forever (notify_waiters only
+        // wakes currently-registered waiters; it does not accumulate
+        // permits for later registrations).
+        //
+        // Contention windows on this `std::sync::Mutex<HashMap>` are
+        // microseconds — the brief block here is safer than the stale-entry
+        // hazard. Poisoned-mutex recovery is preserved.
+        let mut inflight = LOOKUP_INFLIGHT.lock().unwrap_or_else(|p| p.into_inner());
+        inflight.remove(&self.key);
+        drop(inflight);
         self.notify.notify_waiters();
     }
 }
@@ -571,6 +595,13 @@ impl SmartLookup {
         // if it returned any response, even a thin one — this is safer than
         // falling back to the availability heuristic when we have actual
         // registry data in hand.
+        //
+        // We separately track whether RDAP returned an HTTP 200 (NoData):
+        // even a thin RDAP 200 is positive evidence the domain object
+        // exists. In that case we must NOT reclassify a WHOIS "no match"
+        // signal as availability — WHOIS lag against a freshly-provisioned
+        // domain would otherwise produce a false "available" verdict.
+        let rdap_returned_200 = matches!(rdap_outcome, RdapOutcome::NoData(_));
         let (rdap_error_str, rdap_fallback_data, rdap_seer_error) = match rdap_outcome {
             RdapOutcome::Useful(_) => {
                 // Unreachable in this branch (we returned above), but handle
@@ -595,19 +626,14 @@ impl SmartLookup {
         };
 
         if let LegOutcome::Completed(Ok(whois_data)) = whois_leg {
-            // Check Cases A and B: should we reclassify as Available?
-            let availability_match = rdap_seer_error
-                .as_ref()
-                .and_then(|e| classify_whois_leg(&whois_data, e))
-                .or_else(|| {
-                    // Case A can still fire even when RDAP errored for a
-                    // non-404 reason — the WHOIS signal alone is sufficient.
-                    if whois_data.is_available() {
-                        Some(("high", "whois"))
-                    } else {
-                        None
-                    }
-                });
+            // Check Cases A and B: should we reclassify as Available? The
+            // `should_route_to_availability` helper also enforces the
+            // "RDAP returned 200 vetoes WHOIS availability claims" rule.
+            let availability_match = should_route_to_availability(
+                rdap_returned_200,
+                rdap_seer_error.as_ref(),
+                &whois_data,
+            );
 
             if let Some((confidence, method)) = availability_match {
                 debug!(
@@ -742,7 +768,7 @@ mod tests {
     ///      which is handled by `unwrap_or_else` but still disturbs state.
     /// Per-test unique keys (see `unique_test_key`) prevent entry-level
     /// collisions; this mutex prevents lock-contention races on Drop.
-    static INFLIGHT_TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static INFLIGHT_TEST_SERIAL: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_lookup_result_domain_name_whois() {
@@ -1179,14 +1205,14 @@ mod tests {
     #[test]
     fn whois_response_is_not_thin_when_creation_date_present() {
         let mut w = empty_whois("example.com");
-        w.creation_date = Some(chrono::Utc::now());
+        w.creation_date = Some(Utc::now());
         assert!(!whois_response_is_thin(&w));
     }
 
     #[test]
     fn whois_response_is_not_thin_when_expiration_date_present() {
         let mut w = empty_whois("example.com");
-        w.expiration_date = Some(chrono::Utc::now());
+        w.expiration_date = Some(Utc::now());
         assert!(!whois_response_is_thin(&w));
     }
 
@@ -1243,7 +1269,7 @@ mod tests {
     fn classify_whois_leg_rejects_whois_with_real_data() {
         let mut w = empty_whois("legacy.tld");
         w.registrar = Some("Legacy Registry".to_string());
-        w.creation_date = Some(chrono::Utc::now());
+        w.creation_date = Some(Utc::now());
         let rdap_err = SeerError::RdapError("query failed with status 404 Not Found".to_string());
         assert!(classify_whois_leg(&w, &rdap_err).is_none());
     }
@@ -1255,6 +1281,73 @@ mod tests {
         let rdap_err = SeerError::RdapError("query failed with status 404 Not Found".to_string());
         let (verdict, _) = classify_whois_leg(&w, &rdap_err).unwrap();
         assert_eq!(verdict, "high");
+    }
+
+    // ---------------- should_route_to_availability ----------------
+    //
+    // Regression coverage for the v0.26.6 fix: when RDAP returned an HTTP 200
+    // (even with thin body), a WHOIS "no match" must NOT be treated as
+    // evidence of availability — that would let propagation lag flip the
+    // verdict for a domain the registry has already provisioned.
+
+    #[test]
+    fn rdap_200_vetoes_whois_no_match() {
+        let mut w = empty_whois("freshly-registered.com");
+        w.raw_response = "No match for \"FRESHLY-REGISTERED.COM\".".to_string();
+        // rdap_returned_200 = true, no rdap_seer_error (NoData has no error).
+        assert!(
+            should_route_to_availability(true, None, &w).is_none(),
+            "RDAP 200 must veto WHOIS-only availability claim",
+        );
+    }
+
+    #[test]
+    fn rdap_200_vetoes_even_with_thin_whois() {
+        let w = empty_whois("freshly-registered.com");
+        // Thin WHOIS without is_available() patterns.
+        assert!(
+            should_route_to_availability(true, None, &w).is_none(),
+            "RDAP 200 must veto even when WHOIS is thin",
+        );
+    }
+
+    #[test]
+    fn rdap_404_with_whois_no_match_routes_to_available() {
+        let mut w = empty_whois("genuinely-free.com");
+        w.raw_response = "No match for \"GENUINELY-FREE.COM\".".to_string();
+        let rdap_err = SeerError::RdapError("query failed with status 404".to_string());
+        let result = should_route_to_availability(false, Some(&rdap_err), &w);
+        assert_eq!(result, Some(("high", "whois")));
+    }
+
+    #[test]
+    fn rdap_error_with_whois_is_available_still_routes_case_a() {
+        let mut w = empty_whois("genuinely-free.com");
+        w.raw_response = "Domain not found".to_string();
+        // RDAP errored for a non-404 reason (e.g. bootstrap failure); WHOIS
+        // signal alone should still route to availability.
+        let rdap_err = SeerError::RdapBootstrapError("all registries failed".to_string());
+        let result = should_route_to_availability(false, Some(&rdap_err), &w);
+        assert_eq!(result, Some(("high", "whois")));
+    }
+
+    #[test]
+    fn rdap_grace_timeout_with_whois_is_available_routes_case_a() {
+        // GraceTimeout path: rdap_returned_200 = false, rdap_seer_error = None.
+        let mut w = empty_whois("genuinely-free.com");
+        w.raw_response = "No match".to_string();
+        let result = should_route_to_availability(false, None, &w);
+        assert_eq!(result, Some(("high", "whois")));
+    }
+
+    #[test]
+    fn no_rdap_200_no_error_thick_whois_stays_in_whois_path() {
+        let mut w = empty_whois("registered.com");
+        w.registrar = Some("Example Registrar Ltd".to_string());
+        // GraceTimeout-like: rdap_returned_200=false, no error, and WHOIS
+        // does not look free. Must return None so the caller picks
+        // `LookupResult::Whois`.
+        assert!(should_route_to_availability(false, None, &w).is_none());
     }
 
     // ---------------- Mutex poisoning recovery ----------------
@@ -1287,7 +1380,7 @@ mod tests {
         let mut guard = LOOKUP_INFLIGHT.lock().unwrap_or_else(|p| p.into_inner());
         // Use a per-run unique canary so parallel tests cannot collide.
         let canary = unique_test_key("__poison_recovery");
-        guard.insert(canary.clone(), std::sync::Weak::new());
+        guard.insert(canary.clone(), Weak::new());
         assert!(guard.contains_key(&canary));
         guard.remove(&canary);
     }

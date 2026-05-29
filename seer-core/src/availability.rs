@@ -25,6 +25,21 @@ pub struct AvailabilityResult {
     pub details: Option<String>,
 }
 
+impl AvailabilityResult {
+    /// Stable verdict string derived from `(available, confidence)`. Use this
+    /// instead of branching on `confidence` alone — a `confidence: "high"`
+    /// result can still mean "registered" when `available == false`.
+    pub fn verdict(&self) -> &'static str {
+        match (self.available, self.confidence.as_str()) {
+            (true, "high") => "available",
+            (true, "medium") => "likely_available",
+            (false, "high") => "registered",
+            (false, "medium") => "likely_registered",
+            _ => "unknown",
+        }
+    }
+}
+
 /// Checks domain availability by attempting lookups and interpreting failures.
 #[derive(Debug, Clone)]
 pub struct AvailabilityChecker {
@@ -151,9 +166,14 @@ fn decide_fallback(
                     available: false,
                     confidence: "none".to_string(),
                     method: "inconclusive".to_string(),
+                    // Use the sanitized error projection so this string —
+                    // which flows into JSON / CSV / MCP output paths —
+                    // never carries raw ANSI escapes or internal IPs from
+                    // a third-party WHOIS/RDAP server's error message.
                     details: Some(format!(
                         "Could not determine availability. RDAP: {}. WHOIS: {}",
-                        rdap_err, whois_err
+                        rdap_err.sanitized_message(),
+                        whois_err.sanitized_message()
                     )),
                 }
             }
@@ -167,6 +187,23 @@ mod tests {
     use crate::error::SeerError;
     use crate::rdap::RdapResponse;
     use crate::whois::WhoisResponse;
+
+    #[test]
+    fn verdict_matrix() {
+        let make = |available, confidence: &str| AvailabilityResult {
+            domain: "example.test".to_string(),
+            available,
+            confidence: confidence.to_string(),
+            method: "whois".to_string(),
+            details: None,
+        };
+        assert_eq!(make(true, "high").verdict(), "available");
+        assert_eq!(make(true, "medium").verdict(), "likely_available");
+        assert_eq!(make(false, "high").verdict(), "registered");
+        assert_eq!(make(false, "medium").verdict(), "likely_registered");
+        assert_eq!(make(false, "none").verdict(), "unknown");
+        assert_eq!(make(true, "low").verdict(), "unknown");
+    }
 
     #[test]
     fn test_availability_result_serialization() {

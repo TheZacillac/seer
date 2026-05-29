@@ -38,7 +38,7 @@ const RECORD_TYPES: &[&str] = &[
 ];
 
 const BULK_OPERATIONS: &[&str] = &[
-    "lookup", "whois", "rdap", "dig", "prop", "status", "avail", "info",
+    "lookup", "whois", "rdap", "dig", "prop", "status", "avail", "info", "ssl",
 ];
 
 const SET_OPTIONS: &[&str] = &["output"];

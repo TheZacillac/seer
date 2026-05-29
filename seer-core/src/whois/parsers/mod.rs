@@ -7,11 +7,13 @@
 
 mod denic;
 mod educause;
+mod eis;
 mod eurid;
 mod generic;
 mod jprs;
 mod kisa;
 mod nic_it;
+mod nic_lv;
 mod nominet;
 mod sidn;
 
@@ -20,11 +22,13 @@ use once_cell::sync::Lazy;
 use super::parser::WhoisResponse;
 pub use denic::DenicParser;
 pub use educause::EducauseParser;
+pub use eis::EisParser;
 pub use eurid::EuridParser;
 pub use generic::GenericParser;
 pub use jprs::JprsParser;
 pub use kisa::KisaParser;
 pub use nic_it::NicItParser;
+pub use nic_lv::NicLvParser;
 pub use nominet::NominetParser;
 pub use sidn::SidnParser;
 
@@ -56,10 +60,12 @@ impl ParserRegistry {
             parsers: vec![
                 Box::new(DenicParser::new()),    // .de
                 Box::new(EducauseParser::new()), // .edu
+                Box::new(EisParser::new()),      // .ee
                 Box::new(EuridParser::new()),    // .eu
                 Box::new(JprsParser::new()),     // .jp
                 Box::new(KisaParser::new()),     // .kr
                 Box::new(NicItParser::new()),    // .it
+                Box::new(NicLvParser::new()),    // .lv
                 Box::new(NominetParser::new()),  // .uk, .co.uk
                 Box::new(SidnParser::new()),     // .nl
             ],

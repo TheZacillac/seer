@@ -47,6 +47,32 @@ def _install_seer_stub() -> None:
         "bulk_info",
     ):
         setattr(stub, name, _unused)
+
+    # bulk_ssl needs a returning stub (parallel shape to a real bulk_*
+    # result) so the validation/SSRF tests that exercise /ssl/bulk don't
+    # blow up if a request makes it past the guard to the seer call.
+    def _stub_bulk_ssl(domains, concurrency, progress=None):  # pragma: no cover
+        results = []
+        for idx, domain in enumerate(domains, start=1):
+            if progress is not None:
+                progress(idx, len(domains), domain)
+            results.append(
+                {
+                    "success": True,
+                    "data": {
+                        "domain": domain,
+                        "chain": [],
+                        "san_names": [],
+                        "is_valid": True,
+                    },
+                    "error": None,
+                    "duration_ms": 0,
+                    "operation": {"result_type": "ssl"},
+                }
+            )
+        return results
+
+    stub.bulk_ssl = _stub_bulk_ssl
     sys.modules["seer"] = stub
 
 

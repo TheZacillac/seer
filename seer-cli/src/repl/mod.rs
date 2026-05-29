@@ -190,7 +190,7 @@ impl Repl {
             "subdomains" | "subs" => self.execute_subdomains(args).await,
             "diff" => self.execute_diff(args).await,
             "watch" => self.execute_watch(args).await,
-            "history" => self.execute_history(args),
+            "history" => self.execute_history(args).await,
             "set" => self.execute_set(args),
             "clear" => {
                 print!("\x1B[2J\x1B[1;1H");
@@ -309,7 +309,7 @@ impl Repl {
         );
         println!(
             "  {}",
-            "Operations: lookup, whois, rdap, dig, prop, status, avail, info".dimmed()
+            "Operations: lookup, whois, rdap, dig, prop, status, avail, info, ssl".dimmed()
         );
         println!();
         println!("{}", "SETTINGS".bright_purple().bold());
@@ -355,6 +355,10 @@ impl Repl {
         println!(
             "  {}        Comprehensive domain info (RDAP + WHOIS merged)",
             "info".bright_green()
+        );
+        println!(
+            "  {}         Inspect SSL certificate chain (deep)",
+            "ssl".bright_green()
         );
         println!();
         println!("{}", "Input File Formats:".bright_cyan());
@@ -413,6 +417,19 @@ impl Repl {
         match lookup.lookup_with_progress(domain, Some(progress)).await {
             Ok(result) => {
                 spinner.finish();
+                // Record to history (file I/O off the async executor),
+                // matching the non-REPL `Commands::Lookup` path. Without this
+                // the `history` REPL command always reports an empty file.
+                let domain_for_history = domain.to_string();
+                let result_for_history = result.clone();
+                tokio::task::spawn_blocking(move || {
+                    let mut history = seer_core::LookupHistory::load();
+                    history.record(&domain_for_history, result_for_history);
+                    let _ = history.save();
+                })
+                .await
+                .ok();
+
                 let formatter = seer_core::output::get_formatter(self.context.output_format);
                 println!("{}", formatter.format_lookup(&result));
                 CommandResult::Continue
@@ -666,7 +683,9 @@ impl Repl {
         }
 
         let operation = args[0];
-        let file_path = args[1];
+        // Expand `~` / `~/...` once at the boundary so both the bulk-input
+        // read and the auto-derived output path see a home-resolved path.
+        let file_path = crate::utils::expand_tilde(args[1]);
 
         // Parse remaining args for record type and output path
         let mut record_type = seer_core::RecordType::A;
@@ -676,7 +695,7 @@ impl Repl {
         while i < args.len() {
             if args[i] == "-o" || args[i] == "--output" {
                 if i + 1 < args.len() {
-                    output_path = Some(args[i + 1].to_string());
+                    output_path = Some(crate::utils::expand_tilde(args[i + 1]));
                     i += 2;
                     continue;
                 }
@@ -688,7 +707,7 @@ impl Repl {
 
         // Determine output path
         let output_path = output_path.unwrap_or_else(|| {
-            let input_path = std::path::Path::new(file_path);
+            let input_path = std::path::Path::new(&file_path);
             let stem = input_path.file_stem().unwrap_or_default().to_string_lossy();
             let parent = input_path.parent().unwrap_or(std::path::Path::new("."));
             parent
@@ -703,7 +722,7 @@ impl Repl {
         // `mkfifo`'d paths.
         const MAX_BULK_DOMAINS_CLI: usize = 1000;
 
-        let content = match crate::utils::read_bulk_input(file_path) {
+        let content = match crate::utils::read_bulk_input(&file_path) {
             Ok(c) => c,
             Err(e) => return CommandResult::Error(e),
         };
@@ -788,9 +807,13 @@ impl Repl {
                 .iter()
                 .map(|d: &String| seer_core::bulk::BulkOperation::Info { domain: d.clone() })
                 .collect(),
+            "ssl" => domains
+                .iter()
+                .map(|d: &String| seer_core::bulk::BulkOperation::Ssl { domain: d.clone() })
+                .collect(),
             _ => {
                 return CommandResult::Error(format!(
-                    "Unknown bulk operation: {}. Use: lookup, whois, rdap, dig/dns, prop, status, avail, info",
+                    "Unknown bulk operation: {}. Use: lookup, whois, rdap, dig/dns, prop, status, avail, info, ssl",
                     operation
                 ))
             }
@@ -802,9 +825,11 @@ impl Repl {
         clear_bulk_progress_bar();
         progress.finish_and_clear();
 
-        // Write results to CSV
+        // Write results to CSV atomically — a crash or disk-full mid-write
+        // must not leave a truncated CSV that downstream pipelines treat as
+        // authoritative.
         let csv_content = crate::utils::bulk_results_to_csv(&results, operation);
-        if let Err(e) = std::fs::write(&output_path, csv_content) {
+        if let Err(e) = crate::utils::atomic_write(&output_path, &csv_content) {
             return CommandResult::Error(format!("Failed to write output file: {}", e));
         }
 
@@ -836,7 +861,8 @@ impl Repl {
                     | seer_core::bulk::BulkOperation::Lookup { domain }
                     | seer_core::bulk::BulkOperation::Status { domain }
                     | seer_core::bulk::BulkOperation::Avail { domain }
-                    | seer_core::bulk::BulkOperation::Info { domain } => domain,
+                    | seer_core::bulk::BulkOperation::Info { domain }
+                    | seer_core::bulk::BulkOperation::Ssl { domain } => domain,
                 };
                 println!(
                     "  {} - {}",
@@ -1195,12 +1221,20 @@ impl Repl {
         }
     }
 
-    fn execute_history(&self, args: &[&str]) -> CommandResult {
-        let mut history = seer_core::LookupHistory::load();
+    async fn execute_history(&self, args: &[&str]) -> CommandResult {
+        // History I/O is blocking file work; offload off the Tokio worker so
+        // the REPL stays responsive to other in-flight tasks.
+        let mut history = match tokio::task::spawn_blocking(seer_core::LookupHistory::load).await {
+            Ok(h) => h,
+            Err(e) => return CommandResult::Error(format!("Failed to load history: {}", e)),
+        };
         if args.contains(&"--clear") {
             history.clear();
-            if let Err(e) = history.save() {
-                return CommandResult::Error(format!("Failed to clear: {}", e));
+            let save_result = tokio::task::spawn_blocking(move || history.save()).await;
+            match save_result {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => return CommandResult::Error(format!("Failed to clear: {}", e)),
+                Err(e) => return CommandResult::Error(format!("Failed to clear: {}", e)),
             }
             println!("Lookup history cleared");
             return CommandResult::Continue;
