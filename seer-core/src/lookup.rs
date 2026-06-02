@@ -15,8 +15,9 @@ use tokio::time::timeout as tokio_timeout;
 
 use crate::availability::{AvailabilityChecker, AvailabilityResult};
 use crate::cache::TtlCache;
+use crate::dns::{DnsPresence, DnsResolver};
 use crate::error::{Result, SeerError};
-use crate::rdap::{RdapClient, RdapResponse};
+use crate::rdap::{rdap_error_is_404, RdapClient, RdapResponse};
 use crate::whois::{get_registry_url, get_tld, WhoisClient, WhoisResponse};
 
 /// Cache TTL for lookup results (5 minutes).
@@ -75,21 +76,6 @@ fn strip_ipv6(msg: &str) -> String {
 #[cfg(test)]
 static LOOKUP_CONCURRENT_CALLS: Lazy<std::sync::atomic::AtomicUsize> =
     Lazy::new(|| std::sync::atomic::AtomicUsize::new(0));
-
-/// Returns true if the error is an RDAP HTTP 404 response, indicating the
-/// registry's RDAP server has no entry for this domain. Other RDAP errors
-/// (timeouts, 5xx, connection failures, etc.) do NOT match — they mean "we
-/// don't know", not "not registered".
-///
-/// Matches the format produced by `seer-core/src/rdap/client.rs:603`:
-/// `"query failed with status 404 ..."`.
-fn rdap_error_is_404(err: &SeerError) -> bool {
-    if let SeerError::RdapError(msg) = err {
-        msg.contains("query failed with status 404")
-    } else {
-        false
-    }
-}
 
 /// Returns true if the parsed WHOIS response lacks all key registration
 /// signals: no registrar, no creation date, and no expiration date.
@@ -150,6 +136,19 @@ fn should_route_to_availability(
         // additional thin-check call.
         classify_whois_leg(whois_data, e)
     })
+}
+
+/// Decides whether a thin WHOIS leg should be reclassified as "available" on
+/// the strength of a DNS NXDOMAIN. Pure so the veto rules are unit-tested
+/// without a resolver.
+///
+/// Routes to availability only when ALL hold:
+/// * the WHOIS body was thin — no registrar/dates (`is_thin`),
+/// * RDAP did NOT return an HTTP 200 (`rdap_returned_200` is false) — a 200,
+///   even with a thin body, proves the domain object exists, and
+/// * the apex has no DNS presence ([`DnsPresence::Absent`] / NXDOMAIN).
+fn nxdomain_confirms_available(is_thin: bool, rdap_returned_200: bool, dns: DnsPresence) -> bool {
+    is_thin && !rdap_returned_200 && matches!(dns, DnsPresence::Absent)
 }
 
 /// Sanitizes an error message for inclusion in a public-facing response.
@@ -378,6 +377,7 @@ pub struct SmartLookup {
     rdap_client: RdapClient,
     whois_client: WhoisClient,
     availability_checker: AvailabilityChecker,
+    dns_resolver: DnsResolver,
     /// Deprecated: both protocols are now always attempted concurrently.
     prefer_rdap: bool,
     /// Deprecated: WHOIS data is now always attached when available.
@@ -398,6 +398,7 @@ impl SmartLookup {
             rdap_client: RdapClient::new(),
             whois_client: WhoisClient::new(),
             availability_checker: AvailabilityChecker::new(),
+            dns_resolver: DnsResolver::new(),
             prefer_rdap: true,
             include_fallback: false,
         }
@@ -667,6 +668,38 @@ impl SmartLookup {
                 });
             }
 
+            // Fix #2 safety net: a thin WHOIS body plus an RDAP failure that
+            // was not an authoritative 404 leaves us without registry data.
+            // If the apex also has no DNS presence (NXDOMAIN), reclassify as
+            // likely-available rather than emitting an empty WHOIS record. The
+            // cheap thin / not-200 preconditions gate the DNS probe so we
+            // don't pay for it on the common paths.
+            let whois_is_thin = whois_response_is_thin(&whois_data);
+            if whois_is_thin && !rdap_returned_200 {
+                let dns_presence = self.dns_resolver.presence(domain).await;
+                if nxdomain_confirms_available(whois_is_thin, rdap_returned_200, dns_presence) {
+                    debug!(domain = %domain, "Thin WHOIS + NXDOMAIN, reclassifying as available");
+                    if let Some(ref cb) = progress {
+                        cb("Domain appears unregistered (no DNS presence)");
+                    }
+                    let avail = AvailabilityResult {
+                        domain: domain.to_string(),
+                        available: true,
+                        confidence: "medium".to_string(),
+                        method: "dns_nxdomain".to_string(),
+                        details: Some(
+                            "No registry data available; domain has no DNS presence (NXDOMAIN)"
+                                .to_string(),
+                        ),
+                    };
+                    return Ok(LookupResult::Available {
+                        data: Box::new(avail),
+                        rdap_error: sanitize_error_for_public(&rdap_error_str),
+                        whois_error: String::new(),
+                        whois_data: Some(whois_data),
+                    });
+                }
+            }
             debug!("Using WHOIS result (RDAP not useful)");
             if let Some(ref cb) = progress {
                 cb("RDAP not available (using WHOIS)");
@@ -1348,6 +1381,52 @@ mod tests {
         // does not look free. Must return None so the caller picks
         // `LookupResult::Whois`.
         assert!(should_route_to_availability(false, None, &w).is_none());
+    }
+
+    // ---------------- nxdomain_confirms_available ----------------
+
+    #[test]
+    fn nxdomain_confirms_available_thin_no200_absent() {
+        assert!(nxdomain_confirms_available(
+            true,
+            false,
+            DnsPresence::Absent
+        ));
+    }
+
+    #[test]
+    fn nxdomain_confirms_available_vetoed_by_rdap_200() {
+        // A 200 from RDAP (object exists) must veto the NXDOMAIN signal even
+        // if the apex currently has no delegation.
+        assert!(!nxdomain_confirms_available(
+            true,
+            true,
+            DnsPresence::Absent
+        ));
+    }
+
+    #[test]
+    fn nxdomain_confirms_available_requires_thin_whois() {
+        // A WHOIS body with real data is never overridden by DNS.
+        assert!(!nxdomain_confirms_available(
+            false,
+            false,
+            DnsPresence::Absent
+        ));
+    }
+
+    #[test]
+    fn nxdomain_confirms_available_requires_absent_dns() {
+        assert!(!nxdomain_confirms_available(
+            true,
+            false,
+            DnsPresence::Present
+        ));
+        assert!(!nxdomain_confirms_available(
+            true,
+            false,
+            DnsPresence::Unknown
+        ));
     }
 
     // ---------------- Mutex poisoning recovery ----------------

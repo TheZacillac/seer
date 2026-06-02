@@ -786,6 +786,45 @@ impl DnsResolver {
     }
 }
 
+/// Whether a domain appears to exist in the public DNS. Used as a
+/// corroborating availability signal when registry data (RDAP/WHOIS) is
+/// inconclusive — e.g. a thin/blocked WHOIS body and an RDAP failure that is
+/// not an authoritative 404.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DnsPresence {
+    /// The apex returned NS records — the domain is delegated and exists.
+    Present,
+    /// NXDOMAIN / empty answer — the domain has no DNS presence.
+    Absent,
+    /// The DNS query itself failed; presence is unknown.
+    Unknown,
+}
+
+/// Maps an apex NS lookup result to a [`DnsPresence`]. Pure so the mapping is
+/// unit-testable without a live resolver. `resolve(.., NS, ..)` already folds
+/// NXDOMAIN/NODATA into `Ok(vec![])` (see `dns_lookup_or_empty`), so an empty
+/// `Ok` is the "no presence" signal and an `Err` is a genuine query failure.
+fn classify_ns_presence(result: &Result<Vec<DnsRecord>>) -> DnsPresence {
+    match result {
+        Ok(records) if records.is_empty() => DnsPresence::Absent,
+        Ok(_) => DnsPresence::Present,
+        Err(_) => DnsPresence::Unknown,
+    }
+}
+
+impl DnsResolver {
+    /// Probes whether a domain has any DNS presence by querying its apex NS
+    /// records. A registered, delegated domain returns NS records; an
+    /// unregistered domain returns NXDOMAIN (an empty record set).
+    ///
+    /// This is a heuristic, not proof: a registered-but-undelegated domain
+    /// also has no NS records, so callers should treat
+    /// [`DnsPresence::Absent`] as "likely available" (medium confidence).
+    pub async fn presence(&self, domain: &str) -> DnsPresence {
+        classify_ns_presence(&self.resolve(domain, RecordType::NS, None).await)
+    }
+}
+
 // Domain normalization is now handled by the shared validation module
 
 fn reverse_dns_name(ip: &IpAddr) -> String {
@@ -939,6 +978,35 @@ mod tests {
         assert!(!is_valid_srv_label(&too_long));
         let exactly_63 = "a".repeat(63);
         assert!(is_valid_srv_label(&exactly_63));
+    }
+
+    // --- classify_ns_presence ----------------------------------------
+
+    #[test]
+    fn classify_ns_presence_absent_on_empty_ok() {
+        // resolve(.., NS) folds NXDOMAIN/NODATA into Ok(vec![]).
+        let r: Result<Vec<DnsRecord>> = Ok(vec![]);
+        assert_eq!(classify_ns_presence(&r), DnsPresence::Absent);
+    }
+
+    #[test]
+    fn classify_ns_presence_present_on_records() {
+        let rec = DnsRecord {
+            name: "example.test.".to_string(),
+            record_type: RecordType::NS,
+            ttl: 3600,
+            data: RecordData::NS {
+                nameserver: "ns1.example.net.".to_string(),
+            },
+        };
+        let r: Result<Vec<DnsRecord>> = Ok(vec![rec]);
+        assert_eq!(classify_ns_presence(&r), DnsPresence::Present);
+    }
+
+    #[test]
+    fn classify_ns_presence_unknown_on_error() {
+        let r: Result<Vec<DnsRecord>> = Err(SeerError::DnsError("servfail".to_string()));
+        assert_eq!(classify_ns_presence(&r), DnsPresence::Unknown);
     }
 
     // --- reverse_dns_name --------------------------------------------

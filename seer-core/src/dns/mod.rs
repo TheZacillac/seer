@@ -15,4 +15,4 @@ pub use propagation::{
     PropagationChecker, PropagationResult, UnreachableServer,
 };
 pub use records::{DnsRecord, RecordData, RecordType};
-pub use resolver::DnsResolver;
+pub use resolver::{DnsPresence, DnsResolver};

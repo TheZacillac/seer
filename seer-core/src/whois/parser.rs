@@ -304,8 +304,13 @@ impl WhoisResponse {
             if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('%') {
                 continue;
             }
+            // Normalize internal whitespace (tabs, runs of spaces) to single
+            // spaces before matching. Registries like DNS Belgium print
+            // "Status:\tAVAILABLE" with a tab, which would otherwise slip
+            // past space-delimited patterns such as "status: available".
             let lower = trimmed.to_lowercase();
-            if AVAILABILITY_PATTERNS.iter().any(|p| lower.contains(p)) {
+            let normalized = lower.split_whitespace().collect::<Vec<_>>().join(" ");
+            if AVAILABILITY_PATTERNS.iter().any(|p| normalized.contains(p)) {
                 return true;
             }
         }
@@ -338,6 +343,9 @@ const AVAILABILITY_PATTERNS: &[&str] = &[
     "domain not found",
     "available for registration",
     "not registered",
+    // HKIRC (.hk / .香港) phrases it "has not been registered" — the bare
+    // "not registered" above does not cover the interposed "been".
+    "not been registered",
     "status: available",
     "status: free",
     "no object found",
@@ -595,6 +603,35 @@ Registrar: Example Registrar, Inc.
 Creation Date: 2020-01-01T00:00:00Z
 Name Server: ns1.example.com
 ";
+        assert!(!make_response(raw).is_available());
+    }
+
+    #[test]
+    fn is_available_hkirc_has_not_been_registered() {
+        // HKIRC (.hk and the IDN .香港/xn--j6w193g) signals an unregistered
+        // domain with "The domain has not been registered." — note the
+        // wording is "has not BEEN registered", which does NOT contain the
+        // bare "not registered" substring the old pattern list relied on.
+        let raw = "The domain has not been registered.\n";
+        assert!(make_response(raw).is_available());
+    }
+
+    #[test]
+    fn is_available_tab_delimited_status_available() {
+        // DNS Belgium (.be) and similar registries separate the label and
+        // value with a TAB: "Status:\tAVAILABLE". The scan must normalize
+        // internal whitespace so the "status: available" pattern still hits.
+        let raw = "Domain:\tfoo.be\nStatus:\tAVAILABLE\n";
+        assert!(make_response(raw).is_available());
+    }
+
+    #[test]
+    fn is_not_available_tab_delimited_status_not_available() {
+        // Guard against a false positive from whitespace normalization:
+        // "Status:\tNOT AVAILABLE" (a registered .be domain) must NOT be
+        // read as available — "status: available" is not a substring of
+        // "status: not available".
+        let raw = "Domain:\tfoo.be\nStatus:\tNOT AVAILABLE\n";
         assert!(!make_response(raw).is_available());
     }
 

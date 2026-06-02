@@ -6,8 +6,9 @@
 use serde::{Deserialize, Serialize};
 use tracing::{debug, instrument};
 
+use crate::dns::{DnsPresence, DnsResolver};
 use crate::error::Result;
-use crate::rdap::RdapClient;
+use crate::rdap::{rdap_error_is_404, RdapClient};
 use crate::whois::WhoisClient;
 
 /// Result of a domain availability check.
@@ -45,6 +46,7 @@ impl AvailabilityResult {
 pub struct AvailabilityChecker {
     rdap_client: RdapClient,
     whois_client: WhoisClient,
+    dns_resolver: DnsResolver,
 }
 
 impl Default for AvailabilityChecker {
@@ -58,6 +60,7 @@ impl AvailabilityChecker {
         Self {
             rdap_client: RdapClient::new(),
             whois_client: WhoisClient::new(),
+            dns_resolver: DnsResolver::new(),
         }
     }
 
@@ -71,9 +74,21 @@ impl AvailabilityChecker {
         match self.rdap_client.lookup_domain(&domain).await {
             Ok(response) => Ok(decide_from_rdap(&domain, response)),
             Err(rdap_err) => {
-                debug!(error = %rdap_err, "RDAP lookup failed, falling back to WHOIS");
-                let whois_result = self.whois_client.lookup(&domain).await;
-                Ok(decide_fallback(&domain, &rdap_err, whois_result))
+                debug!(error = %rdap_err, "RDAP lookup failed, falling back to WHOIS + DNS");
+                // Probe WHOIS and the apex DNS presence concurrently. DNS is
+                // only the tie-breaker when WHOIS is thin/blocked and the RDAP
+                // failure was not an authoritative 404, so running it alongside
+                // WHOIS (rather than on demand) adds no extra wall-clock time.
+                let (whois_result, dns_presence) = tokio::join!(
+                    self.whois_client.lookup(&domain),
+                    self.dns_resolver.presence(&domain),
+                );
+                Ok(decide_fallback(
+                    &domain,
+                    &rdap_err,
+                    whois_result,
+                    dns_presence,
+                ))
             }
         }
     }
@@ -111,14 +126,26 @@ fn decide_from_rdap(domain: &str, response: crate::rdap::RdapResponse) -> Availa
 }
 
 /// Pure decision function: build an `AvailabilityResult` when RDAP failed
-/// and WHOIS is the fallback. Extracted from `check()` for table-testing.
+/// and WHOIS (plus a DNS presence probe) is the fallback. Extracted from
+/// `check()` for table-testing. `dns_presence` is only consulted when the
+/// registry signals are inconclusive — a thin/blocked WHOIS body and a
+/// non-404 RDAP failure; an apex with no DNS presence (NXDOMAIN) then reads
+/// as likely-available at medium confidence.
 fn decide_fallback(
     domain: &str,
     rdap_err: &crate::error::SeerError,
     whois_result: Result<crate::whois::WhoisResponse>,
+    dns_presence: DnsPresence,
 ) -> AvailabilityResult {
     match whois_result {
         Ok(whois_response) => {
+            // "Thin" = no positive registration signal at all (no registrar,
+            // no creation/expiry dates). A thin body is what blocked or
+            // RDAP-first registries return for an unregistered domain.
+            let thin = whois_response.registrar.is_none()
+                && whois_response.creation_date.is_none()
+                && whois_response.expiration_date.is_none();
+
             if whois_response.is_available() {
                 AvailabilityResult {
                     domain: domain.to_string(),
@@ -127,7 +154,9 @@ fn decide_fallback(
                     method: "whois".to_string(),
                     details: Some("WHOIS indicates domain is not registered".to_string()),
                 }
-            } else {
+            } else if !thin {
+                // A concrete registration signal (registrar / dates) is
+                // present → the domain is registered.
                 AvailabilityResult {
                     domain: domain.to_string(),
                     available: false,
@@ -137,9 +166,54 @@ fn decide_fallback(
                         .registrar
                         .map(|r| format!("Registered with {}", r)),
                 }
+            } else if rdap_error_is_404(rdap_err) {
+                // Thin WHOIS — often an access-blocked refusal like SWITCH's
+                // ".ch" — but the registry's own RDAP authoritatively 404'd.
+                AvailabilityResult {
+                    domain: domain.to_string(),
+                    available: true,
+                    confidence: "high".to_string(),
+                    method: "rdap".to_string(),
+                    details: Some("Registry RDAP reports no such domain (HTTP 404)".to_string()),
+                }
+            } else if dns_presence == DnsPresence::Absent {
+                // Thin WHOIS, RDAP did not 404, and the apex is NXDOMAIN —
+                // corroborating evidence the domain is unregistered.
+                AvailabilityResult {
+                    domain: domain.to_string(),
+                    available: true,
+                    confidence: "medium".to_string(),
+                    method: "dns_nxdomain".to_string(),
+                    details: Some(
+                        "No registry data available; domain has no DNS presence (NXDOMAIN)"
+                            .to_string(),
+                    ),
+                }
+            } else {
+                // Thin WHOIS we could not interpret and no corroborating
+                // NXDOMAIN — fail safe toward "registered".
+                AvailabilityResult {
+                    domain: domain.to_string(),
+                    available: false,
+                    confidence: "high".to_string(),
+                    method: "whois".to_string(),
+                    details: None,
+                }
             }
         }
         Err(whois_err) => {
+            // RDAP 404 is authoritative even when the WHOIS leg errored: the
+            // registry's RDAP server reports no such object, so the domain is
+            // unregistered regardless of why WHOIS failed.
+            if rdap_error_is_404(rdap_err) {
+                return AvailabilityResult {
+                    domain: domain.to_string(),
+                    available: true,
+                    confidence: "high".to_string(),
+                    method: "rdap".to_string(),
+                    details: Some("Registry RDAP reports no such domain (HTTP 404)".to_string()),
+                };
+            }
             // Both failed - domain might be available or queries blocked
             let whois_msg = whois_err.to_string().to_lowercase();
             let likely_available = whois_msg.contains("no match")
@@ -155,12 +229,25 @@ fn decide_fallback(
                     method: "whois_error".to_string(),
                     details: Some("WHOIS server indicates no matching records".to_string()),
                 }
+            } else if dns_presence == DnsPresence::Absent {
+                // Both registry legs failed, but the apex is NXDOMAIN — the
+                // domain has no DNS presence, so it is likely unregistered.
+                AvailabilityResult {
+                    domain: domain.to_string(),
+                    available: true,
+                    confidence: "medium".to_string(),
+                    method: "dns_nxdomain".to_string(),
+                    details: Some(
+                        "Registry lookups failed; domain has no DNS presence (NXDOMAIN)"
+                            .to_string(),
+                    ),
+                }
             } else {
-                // Both queries failed with non-"not found" errors.
-                // We genuinely don't know — could be registered, could be
-                // blocked by the registrar, or servers could be down.
-                // Default to available=false to avoid misleading the user
-                // into thinking they can register a domain that's actually taken.
+                // Both queries failed with non-"not found" errors and the
+                // domain still resolves (or DNS was unknown). We genuinely
+                // don't know — could be registered, blocked, or servers down.
+                // Default to available=false so we never tell the user a taken
+                // domain is free.
                 AvailabilityResult {
                     domain: domain.to_string(),
                     available: false,
@@ -320,7 +407,7 @@ mod tests {
         // that every TLD uses to signal unregistered.
         let whois = whois_with("No match for \"example.test\".\n", None);
         let rdap_err = SeerError::RdapError("404 not found".to_string());
-        let r = decide_fallback("example.test", &rdap_err, Ok(whois));
+        let r = decide_fallback("example.test", &rdap_err, Ok(whois), DnsPresence::Unknown);
         assert!(r.available, "WHOIS 'no match' must mark available");
         assert_eq!(r.confidence, "high");
         assert_eq!(r.method, "whois");
@@ -330,7 +417,7 @@ mod tests {
     fn rdap_fail_whois_says_registered_high_confidence() {
         let whois = whois_with("Domain Name: example.test\n", Some("Test Registrar"));
         let rdap_err = SeerError::RdapError("404 not found".to_string());
-        let r = decide_fallback("example.test", &rdap_err, Ok(whois));
+        let r = decide_fallback("example.test", &rdap_err, Ok(whois), DnsPresence::Unknown);
         assert!(!r.available);
         assert_eq!(r.confidence, "high");
         assert_eq!(r.method, "whois");
@@ -343,7 +430,7 @@ mod tests {
         // details string is None (registrar field is None).
         let whois = whois_with("Domain Name: example.test\n", None);
         let rdap_err = SeerError::RdapError("404".to_string());
-        let r = decide_fallback("example.test", &rdap_err, Ok(whois));
+        let r = decide_fallback("example.test", &rdap_err, Ok(whois), DnsPresence::Unknown);
         assert!(!r.available);
         assert_eq!(r.confidence, "high");
         assert!(
@@ -360,7 +447,12 @@ mod tests {
         let rdap_err = SeerError::RdapError("500".to_string());
         let whois_err =
             SeerError::WhoisError("whois server returned 'No match for this domain'".to_string());
-        let r = decide_fallback("example.test", &rdap_err, Err(whois_err));
+        let r = decide_fallback(
+            "example.test",
+            &rdap_err,
+            Err(whois_err),
+            DnsPresence::Unknown,
+        );
         assert!(
             r.available,
             "whois error containing 'no match' is available"
@@ -373,7 +465,12 @@ mod tests {
     fn rdap_fail_whois_error_not_found_marks_available_medium() {
         let rdap_err = SeerError::RdapError("500".to_string());
         let whois_err = SeerError::WhoisError("Domain not found".to_string());
-        let r = decide_fallback("example.test", &rdap_err, Err(whois_err));
+        let r = decide_fallback(
+            "example.test",
+            &rdap_err,
+            Err(whois_err),
+            DnsPresence::Unknown,
+        );
         assert!(r.available);
         assert_eq!(r.confidence, "medium");
         assert_eq!(r.method, "whois_error");
@@ -383,7 +480,12 @@ mod tests {
     fn rdap_fail_whois_error_no_data_found_marks_available_medium() {
         let rdap_err = SeerError::RdapError("no".to_string());
         let whois_err = SeerError::WhoisError("No Data Found for query".to_string());
-        let r = decide_fallback("example.test", &rdap_err, Err(whois_err));
+        let r = decide_fallback(
+            "example.test",
+            &rdap_err,
+            Err(whois_err),
+            DnsPresence::Unknown,
+        );
         assert!(r.available);
         assert_eq!(r.confidence, "medium");
     }
@@ -393,7 +495,12 @@ mod tests {
         let rdap_err = SeerError::RdapError("no".to_string());
         let whois_err =
             SeerError::WhoisError("No entries found for the selected source".to_string());
-        let r = decide_fallback("example.test", &rdap_err, Err(whois_err));
+        let r = decide_fallback(
+            "example.test",
+            &rdap_err,
+            Err(whois_err),
+            DnsPresence::Unknown,
+        );
         assert!(r.available);
         assert_eq!(r.confidence, "medium");
     }
@@ -402,7 +509,12 @@ mod tests {
     fn rdap_fail_whois_timeout_marks_inconclusive_none_confidence() {
         let rdap_err = SeerError::Timeout("rdap timed out".to_string());
         let whois_err = SeerError::Timeout("whois timed out".to_string());
-        let r = decide_fallback("example.test", &rdap_err, Err(whois_err));
+        let r = decide_fallback(
+            "example.test",
+            &rdap_err,
+            Err(whois_err),
+            DnsPresence::Unknown,
+        );
         assert!(
             !r.available,
             "inconclusive means NOT available (fail-safe default)"
@@ -419,7 +531,12 @@ mod tests {
         let whois_err = SeerError::WhoisError(
             "failed to connect to whois.example: connection refused".to_string(),
         );
-        let r = decide_fallback("example.test", &rdap_err, Err(whois_err));
+        let r = decide_fallback(
+            "example.test",
+            &rdap_err,
+            Err(whois_err),
+            DnsPresence::Unknown,
+        );
         assert!(!r.available);
         assert_eq!(r.confidence, "none");
         assert_eq!(r.method, "inconclusive");
@@ -431,8 +548,129 @@ mod tests {
         // form still classifies correctly.
         let rdap_err = SeerError::RdapError("500".to_string());
         let whois_err = SeerError::WhoisError("NOT FOUND in registry".to_string());
-        let r = decide_fallback("example.test", &rdap_err, Err(whois_err));
+        let r = decide_fallback(
+            "example.test",
+            &rdap_err,
+            Err(whois_err),
+            DnsPresence::Unknown,
+        );
         assert!(r.available, "'NOT FOUND' should classify as available");
         assert_eq!(r.confidence, "medium");
+    }
+
+    // --- RDAP-404-is-authoritative branches (Fix #4) -----------------
+
+    #[test]
+    fn rdap_404_with_blocked_whois_marks_available() {
+        // SWITCH (.ch) blocks port-43 WHOIS with a refusal carrying no
+        // registration data and no availability phrase. The registry's own
+        // RDAP authoritatively 404s for an unregistered domain — that 404 is
+        // the signal and must win over the unhelpful WHOIS body.
+        let whois = whois_with("Requests of this client are not permitted.\n", None);
+        let rdap_err = SeerError::RdapError("query failed with status 404 Not Found".to_string());
+        let r = decide_fallback("example.ch", &rdap_err, Ok(whois), DnsPresence::Unknown);
+        assert!(
+            r.available,
+            "RDAP 404 must mark available even with blocked WHOIS"
+        );
+        assert_eq!(r.confidence, "high");
+        assert_eq!(r.method, "rdap");
+    }
+
+    #[test]
+    fn rdap_404_with_whois_error_marks_available() {
+        // RDAP 404 is authoritative even when WHOIS itself errored out.
+        let rdap_err = SeerError::RdapError("query failed with status 404".to_string());
+        let whois_err = SeerError::WhoisError("connection refused".to_string());
+        let r = decide_fallback(
+            "example.test",
+            &rdap_err,
+            Err(whois_err),
+            DnsPresence::Unknown,
+        );
+        assert!(r.available);
+        assert_eq!(r.confidence, "high");
+        assert_eq!(r.method, "rdap");
+    }
+
+    #[test]
+    fn rdap_404_but_whois_has_full_registration_marks_registered() {
+        // Conflict case: RDAP 404 but WHOIS returns real registration data
+        // (registrar + dates + nameservers). Prefer the concrete registration
+        // so we never tell the user a registered domain is free.
+        let mut whois = whois_with("Domain Name: example.test\n", Some("Real Registrar"));
+        whois.creation_date = Some(chrono::Utc::now());
+        whois.nameservers = vec!["ns1.example.net".to_string()];
+        let rdap_err = SeerError::RdapError("query failed with status 404 Not Found".to_string());
+        let r = decide_fallback("example.test", &rdap_err, Ok(whois), DnsPresence::Unknown);
+        assert!(
+            !r.available,
+            "concrete WHOIS registration must win over RDAP 404"
+        );
+        assert_eq!(r.confidence, "high");
+        assert_eq!(r.method, "whois");
+    }
+
+    // --- DNS-NXDOMAIN safety net (Fix #2) ----------------------------
+
+    #[test]
+    fn thin_whois_non404_dns_absent_marks_likely_available() {
+        // Red.es (.es) returns a port-43 "Conditions of use" banner that
+        // parses to nothing, and .es has no RDAP server (a non-404 failure).
+        // The apex is NXDOMAIN, so the domain is likely available.
+        let whois = whois_with(
+            "Conditions of use for the whois service via port 43\n",
+            None,
+        );
+        let rdap_err = SeerError::RdapBootstrapError("no RDAP server for example.es".to_string());
+        let r = decide_fallback("example.es", &rdap_err, Ok(whois), DnsPresence::Absent);
+        assert!(r.available);
+        assert_eq!(r.confidence, "medium");
+        assert_eq!(r.method, "dns_nxdomain");
+    }
+
+    #[test]
+    fn thin_whois_non404_dns_present_stays_unavailable() {
+        // Same thin WHOIS + non-404 RDAP failure, but the apex resolves — we
+        // must not claim availability.
+        let whois = whois_with(
+            "Conditions of use for the whois service via port 43\n",
+            None,
+        );
+        let rdap_err = SeerError::RdapBootstrapError("no RDAP server for example.es".to_string());
+        let r = decide_fallback("example.es", &rdap_err, Ok(whois), DnsPresence::Present);
+        assert!(!r.available);
+        assert_ne!(r.method, "dns_nxdomain");
+    }
+
+    #[test]
+    fn thin_whois_non404_dns_unknown_stays_unavailable_failsafe() {
+        // Thin WHOIS, non-404 RDAP failure, DNS itself failed → genuinely
+        // unknown; fail safe to not-available so we never call a taken domain
+        // free on a transient DNS blip.
+        let whois = whois_with(
+            "Conditions of use for the whois service via port 43\n",
+            None,
+        );
+        let rdap_err = SeerError::RdapBootstrapError("no RDAP server".to_string());
+        let r = decide_fallback("example.es", &rdap_err, Ok(whois), DnsPresence::Unknown);
+        assert!(!r.available);
+    }
+
+    #[test]
+    fn both_legs_failed_dns_absent_marks_likely_available() {
+        // RDAP errored (non-404), WHOIS errored (not a "not found" message),
+        // but the apex is NXDOMAIN.
+        let rdap_err = SeerError::Timeout("rdap timed out".to_string());
+        let whois_err = SeerError::WhoisError("connection refused".to_string());
+        let r = decide_fallback(
+            "example.test",
+            &rdap_err,
+            Err(whois_err),
+            DnsPresence::Absent,
+        );
+        assert!(r.available);
+        assert_eq!(r.confidence, "medium");
+        assert_eq!(r.method, "dns_nxdomain");
     }
 }
