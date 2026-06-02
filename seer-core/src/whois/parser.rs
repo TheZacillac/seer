@@ -350,6 +350,16 @@ const AVAILABILITY_PATTERNS: &[&str] = &[
     "status: free",
     "no object found",
     "does not exist",
+    // Additional registry phrasings surfaced by a cross-TLD audit, mostly
+    // no-RDAP ccTLDs where WHOIS is the only registry signal. All are unique
+    // to "not found" responses (verified not to collide with registered or
+    // "not available" bodies).
+    "nothing found",   // KazNIC .kz / .қаз ("*** Nothing found for this query.")
+    "no found",        // TWNIC .tw / 台灣 / 台湾 ("No Found")
+    "no record found", // .ls and others ("No record found for '...'.")
+    "no information was found", // .africa ("No information was found matching that query.")
+    "object not found", // generic ("Object not found")
+    "not find matchingrecord", // CONAC .政务 / .公益 ("Not find MatchingRecord")
 ];
 
 /// Patterns indicating the registrar didn't have data for this domain.
@@ -633,6 +643,43 @@ Name Server: ns1.example.com
         // "status: not available".
         let raw = "Domain:\tfoo.be\nStatus:\tNOT AVAILABLE\n";
         assert!(!make_response(raw).is_available());
+    }
+
+    #[test]
+    fn is_available_recognizes_additional_registry_phrasings() {
+        // "Not found" wordings surfaced by the cross-TLD audit, mostly from
+        // no-RDAP ccTLDs where WHOIS is the only registry signal.
+        for raw in [
+            "*** Nothing found for this query.\n", // .kz / .қаз (KazNIC)
+            "No Found\n",                          // TWNIC .tw / 台灣 / 台湾
+            "No record found for 'example.ls'.\n", // .ls (Lesotho)
+            "No information was found matching that query.\n", // .africa
+            "Object not found\n",                  // generic
+            "Not find MatchingRecord\n",           // CONAC .政务 / .公益
+        ] {
+            assert!(
+                make_response(raw).is_available(),
+                "should detect available from: {raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn is_available_does_not_match_registered_or_blocked_phrasings() {
+        // Guard against false positives from the broadened pattern list: a
+        // registered domain, a "not available" status, a port-43 refusal, and
+        // TOS prose containing "free" must all stay NOT-available.
+        for raw in [
+            "Domain Status: clientTransferProhibited\nRegistrar: Example, Inc.\n",
+            "Status: NOT AVAILABLE\n",
+            "Requests of this client are not permitted. Please use the web form.\n",
+            "This WHOIS service is free for personal, non-commercial use.\n",
+        ] {
+            assert!(
+                !make_response(raw).is_available(),
+                "must NOT detect available from: {raw:?}"
+            );
+        }
     }
 
     // --- M19: indicates_not_found anchors at line start -----------------
