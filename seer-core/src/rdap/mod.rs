@@ -80,6 +80,24 @@ pub async fn auto_lookup(client: &RdapClient, query: &str) -> Result<RdapRespons
     }
 }
 
+/// Returns true if `err` is an RDAP HTTP 404 — the registry's RDAP server
+/// authoritatively reports no such object. For a domain query this is the
+/// strongest available-ness signal there is. Every other RDAP failure
+/// (timeout, 5xx, 429, bootstrap/connection error) means "we don't know",
+/// NOT "available", and must not match.
+///
+/// Matches the message produced by `client::query_rdap_internal`
+/// (`"query failed with status 404 ..."`), looking through both the
+/// `RetryExhausted` wrapper and the multi-candidate "all N ... failed; last
+/// error: ..." wrapper, each of which preserves the original 404 marker.
+pub fn rdap_error_is_404(err: &SeerError) -> bool {
+    match err {
+        SeerError::RdapError(msg) => msg.contains("query failed with status 404"),
+        SeerError::RetryExhausted { last_error, .. } => rdap_error_is_404(last_error),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,5 +196,59 @@ mod tests {
             classify("AS99999999999999").unwrap_err(),
             SeerError::InvalidInput(_)
         ));
+    }
+
+    // --- rdap_error_is_404 -------------------------------------------------
+
+    #[test]
+    fn rdap_error_is_404_matches_canonical_marker() {
+        assert!(rdap_error_is_404(&SeerError::RdapError(
+            "query failed with status 404 Not Found".into()
+        )));
+        assert!(rdap_error_is_404(&SeerError::RdapError(
+            "query failed with status 404".into()
+        )));
+    }
+
+    #[test]
+    fn rdap_error_is_404_rejects_other_statuses_and_kinds() {
+        assert!(!rdap_error_is_404(&SeerError::RdapError(
+            "query failed with status 500 Server Error".into()
+        )));
+        assert!(!rdap_error_is_404(&SeerError::RdapError(
+            "query failed with status 429 Too Many Requests".into()
+        )));
+        assert!(!rdap_error_is_404(&SeerError::RdapBootstrapError(
+            "no RDAP server for example.hk".into()
+        )));
+        assert!(!rdap_error_is_404(&SeerError::Timeout("rdap".into())));
+    }
+
+    #[test]
+    fn rdap_error_is_404_rejects_incidental_digits() {
+        // A "404" buried in an unrelated numeric context must not match.
+        assert!(!rdap_error_is_404(&SeerError::RdapError(
+            "error 40404: database corruption".into()
+        )));
+    }
+
+    #[test]
+    fn rdap_error_is_404_looks_through_retry_exhausted() {
+        let inner = SeerError::RdapError("query failed with status 404 Not Found".into());
+        let wrapped = SeerError::RetryExhausted {
+            attempts: 2,
+            last_error: Box::new(inner),
+        };
+        assert!(rdap_error_is_404(&wrapped));
+    }
+
+    #[test]
+    fn rdap_error_is_404_matches_multi_candidate_wrapper() {
+        // wrap_all_candidates_failed embeds the original marker in its message.
+        let err = SeerError::RdapError(
+            "all 2 RDAP candidate URLs failed; last error: query failed with status 404 Not Found"
+                .into(),
+        );
+        assert!(rdap_error_is_404(&err));
     }
 }

@@ -304,8 +304,13 @@ impl WhoisResponse {
             if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('%') {
                 continue;
             }
+            // Normalize internal whitespace (tabs, runs of spaces) to single
+            // spaces before matching. Registries like DNS Belgium print
+            // "Status:\tAVAILABLE" with a tab, which would otherwise slip
+            // past space-delimited patterns such as "status: available".
             let lower = trimmed.to_lowercase();
-            if AVAILABILITY_PATTERNS.iter().any(|p| lower.contains(p)) {
+            let normalized = lower.split_whitespace().collect::<Vec<_>>().join(" ");
+            if AVAILABILITY_PATTERNS.iter().any(|p| normalized.contains(p)) {
                 return true;
             }
         }
@@ -338,10 +343,23 @@ const AVAILABILITY_PATTERNS: &[&str] = &[
     "domain not found",
     "available for registration",
     "not registered",
+    // HKIRC (.hk / .香港) phrases it "has not been registered" — the bare
+    // "not registered" above does not cover the interposed "been".
+    "not been registered",
     "status: available",
     "status: free",
     "no object found",
     "does not exist",
+    // Additional registry phrasings surfaced by a cross-TLD audit, mostly
+    // no-RDAP ccTLDs where WHOIS is the only registry signal. All are unique
+    // to "not found" responses (verified not to collide with registered or
+    // "not available" bodies).
+    "nothing found",   // KazNIC .kz / .қаз ("*** Nothing found for this query.")
+    "no found",        // TWNIC .tw / 台灣 / 台湾 ("No Found")
+    "no record found", // .ls and others ("No record found for '...'.")
+    "no information was found", // .africa ("No information was found matching that query.")
+    "object not found", // generic ("Object not found")
+    "not find matchingrecord", // CONAC .政务 / .公益 ("Not find MatchingRecord")
 ];
 
 /// Patterns indicating the registrar didn't have data for this domain.
@@ -596,6 +614,72 @@ Creation Date: 2020-01-01T00:00:00Z
 Name Server: ns1.example.com
 ";
         assert!(!make_response(raw).is_available());
+    }
+
+    #[test]
+    fn is_available_hkirc_has_not_been_registered() {
+        // HKIRC (.hk and the IDN .香港/xn--j6w193g) signals an unregistered
+        // domain with "The domain has not been registered." — note the
+        // wording is "has not BEEN registered", which does NOT contain the
+        // bare "not registered" substring the old pattern list relied on.
+        let raw = "The domain has not been registered.\n";
+        assert!(make_response(raw).is_available());
+    }
+
+    #[test]
+    fn is_available_tab_delimited_status_available() {
+        // DNS Belgium (.be) and similar registries separate the label and
+        // value with a TAB: "Status:\tAVAILABLE". The scan must normalize
+        // internal whitespace so the "status: available" pattern still hits.
+        let raw = "Domain:\tfoo.be\nStatus:\tAVAILABLE\n";
+        assert!(make_response(raw).is_available());
+    }
+
+    #[test]
+    fn is_not_available_tab_delimited_status_not_available() {
+        // Guard against a false positive from whitespace normalization:
+        // "Status:\tNOT AVAILABLE" (a registered .be domain) must NOT be
+        // read as available — "status: available" is not a substring of
+        // "status: not available".
+        let raw = "Domain:\tfoo.be\nStatus:\tNOT AVAILABLE\n";
+        assert!(!make_response(raw).is_available());
+    }
+
+    #[test]
+    fn is_available_recognizes_additional_registry_phrasings() {
+        // "Not found" wordings surfaced by the cross-TLD audit, mostly from
+        // no-RDAP ccTLDs where WHOIS is the only registry signal.
+        for raw in [
+            "*** Nothing found for this query.\n", // .kz / .қаз (KazNIC)
+            "No Found\n",                          // TWNIC .tw / 台灣 / 台湾
+            "No record found for 'example.ls'.\n", // .ls (Lesotho)
+            "No information was found matching that query.\n", // .africa
+            "Object not found\n",                  // generic
+            "Not find MatchingRecord\n",           // CONAC .政务 / .公益
+        ] {
+            assert!(
+                make_response(raw).is_available(),
+                "should detect available from: {raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn is_available_does_not_match_registered_or_blocked_phrasings() {
+        // Guard against false positives from the broadened pattern list: a
+        // registered domain, a "not available" status, a port-43 refusal, and
+        // TOS prose containing "free" must all stay NOT-available.
+        for raw in [
+            "Domain Status: clientTransferProhibited\nRegistrar: Example, Inc.\n",
+            "Status: NOT AVAILABLE\n",
+            "Requests of this client are not permitted. Please use the web form.\n",
+            "This WHOIS service is free for personal, non-commercial use.\n",
+        ] {
+            assert!(
+                !make_response(raw).is_available(),
+                "must NOT detect available from: {raw:?}"
+            );
+        }
     }
 
     // --- M19: indicates_not_found anchors at line start -----------------

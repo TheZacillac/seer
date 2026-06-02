@@ -15,7 +15,7 @@ use super::bootstrap::{
 };
 use super::types::RdapResponse;
 use crate::error::{Result, SeerError};
-use crate::retry::{RetryExecutor, RetryPolicy};
+use crate::retry::{NetworkRetryClassifier, RetryClassifier, RetryExecutor, RetryPolicy};
 use crate::validation::{describe_reserved_ip, normalize_domain};
 
 const IANA_BOOTSTRAP_DNS: &str = "https://data.iana.org/rdap/dns.json";
@@ -175,7 +175,16 @@ impl RdapClient {
     /// Creates a new RDAP client with default settings.
     pub fn new() -> Self {
         Self {
-            retry_policy: RetryPolicy::default().with_max_attempts(2),
+            // RDAP registries rate-limit hard. Give 429s a few jittered,
+            // server-hint-aware retries to clear a *brief* limit, but keep the
+            // total bounded (≈10s worst case) so a sticky rate limit falls
+            // through to the WHOIS/DNS fallback fast instead of hanging an
+            // interactive lookup. The old 2× 100ms never cleared a real limit;
+            // a multi-attempt 30s honor was the opposite mistake.
+            retry_policy: RetryPolicy::new()
+                .with_max_attempts(3)
+                .with_initial_delay(Duration::from_millis(500))
+                .with_max_delay(Duration::from_secs(5)),
         }
     }
 
@@ -477,22 +486,55 @@ impl RdapClient {
         Err(wrap_all_candidates_failed(last_error, urls.len()))
     }
 
-    /// Queries a single RDAP endpoint with retry logic.
+    /// Queries a single RDAP endpoint, retrying transient failures. Unlike the
+    /// generic `RetryExecutor`, this honors a `Retry-After` header on HTTP 429
+    /// responses — registries rate-limit aggressively, and the server-suggested
+    /// delay clears the limit far more reliably than blind exponential backoff.
     async fn query_rdap_with_retry(&self, url: &str) -> Result<RdapResponse> {
-        let executor = RetryExecutor::new(self.retry_policy.clone());
-        let url = url.to_string();
-
-        executor
-            .execute(|| {
-                let url = url.clone();
-                async move { query_rdap_internal(&url).await }
-            })
-            .await
+        let classifier = NetworkRetryClassifier::new();
+        let mut attempt = 0;
+        loop {
+            match query_rdap_attempt(url).await {
+                Ok(resp) => return Ok(resp),
+                Err((err, retry_after)) => {
+                    let attempts_remaining =
+                        self.retry_policy.max_attempts.saturating_sub(attempt + 1);
+                    if !classifier.is_retryable(&err) || attempts_remaining == 0 {
+                        return Err(if attempt > 0 {
+                            SeerError::RetryExhausted {
+                                attempts: attempt + 1,
+                                last_error: Box::new(err),
+                            }
+                        } else {
+                            err
+                        });
+                    }
+                    let backoff = self.retry_policy.delay_for_attempt(attempt);
+                    let delay = effective_retry_delay(backoff, retry_after);
+                    debug!(
+                        url = %url,
+                        attempt = attempt + 1,
+                        max_attempts = self.retry_policy.max_attempts,
+                        delay_ms = delay.as_millis(),
+                        error = %err,
+                        "Retrying RDAP after transient error"
+                    );
+                    tokio::time::sleep(delay).await;
+                    attempt += 1;
+                }
+            }
+        }
     }
 }
 
 /// Maximum RDAP response body size (10 MB, matching CT log response limit).
 const MAX_RDAP_RESPONSE_SIZE: usize = 10 * 1024 * 1024;
+
+/// Cap on how long we'll honor a server-supplied `Retry-After`. Real RDAP
+/// 429s ask for a second or two; anything larger we treat as "give up and
+/// fall back to WHOIS/DNS" rather than hang an interactive lookup — and the
+/// cap also stops a hostile/misconfigured header from pinning the client.
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(5);
 
 /// Validates that a URL does not resolve to a reserved/private IP address (SSRF protection).
 ///
@@ -546,16 +588,27 @@ async fn validate_url_not_reserved(url: &str) -> Result<Vec<SocketAddr>> {
     Ok(socket_addrs)
 }
 
-/// Validates a bootstrap-extracted URL before caching it.
-///
-/// Rejects non-https schemes, IP-literal hosts, missing hosts, and hosts
-/// containing whitespace or control characters. Returns the parsed URL on
-/// success so the caller can cache it in normalized form.
-/// Internal function to query an RDAP endpoint (used by retry executor).
-///
-/// Builds a per-request HTTP client that pins the validated resolved IPs to
-/// prevent DNS rebinding (TOCTOU between validation and connect).
-async fn query_rdap_internal(url: &str) -> Result<RdapResponse> {
+/// Parses an HTTP `Retry-After` header value. Supports the common
+/// delta-seconds form (`Retry-After: 5`); the HTTP-date form is not used by
+/// RDAP rate limiters in practice and yields `None` (caller falls back to
+/// exponential backoff).
+fn parse_retry_after(value: &str) -> Option<Duration> {
+    value.trim().parse::<u64>().ok().map(Duration::from_secs)
+}
+
+/// Chooses the delay before the next RDAP attempt: honor the server's
+/// `Retry-After` (capped at [`MAX_RETRY_AFTER`]) when present, otherwise use
+/// the policy's exponential backoff.
+fn effective_retry_delay(backoff: Duration, retry_after: Option<Duration>) -> Duration {
+    match retry_after {
+        Some(hint) => hint.min(MAX_RETRY_AFTER),
+        None => backoff,
+    }
+}
+
+/// Sends one RDAP request: SSRF-validates the URL and pins the resolved IPs on
+/// a short-lived client (DNS-rebinding defense), returning the raw response.
+async fn send_rdap_request(url: &str) -> Result<reqwest::Response> {
     // SSRF protection: validate the URL does not resolve to reserved IPs and
     // capture the resolved SocketAddrs so we can pin them on the HTTP client.
     let resolved = validate_url_not_reserved(url).await?;
@@ -577,19 +630,17 @@ async fn query_rdap_internal(url: &str) -> Result<RdapResponse> {
         .build()
         .map_err(|e| SeerError::RdapError(format!("failed to build HTTP client: {}", e)))?;
 
-    let response = client
+    client
         .get(url)
         .header("Accept", "application/rdap+json")
         .send()
-        .await?;
+        .await
+        .map_err(Into::into)
+}
 
-    if !response.status().is_success() {
-        return Err(SeerError::RdapError(format!(
-            "query failed with status {}",
-            response.status()
-        )));
-    }
-
+/// Streams, size-bounds, and parses an RDAP response body. `url` is only used
+/// for the timeout error message.
+async fn read_and_parse_rdap_body(response: reqwest::Response, url: &str) -> Result<RdapResponse> {
     // Stream body with incremental size check to prevent memory exhaustion.
     // Wrap the chunk loop in a timeout so a server that opens the connection
     // but trickles bytes forever is classified as a timeout (not a generic
@@ -618,7 +669,7 @@ async fn query_rdap_internal(url: &str) -> Result<RdapResponse> {
         Err(_) => {
             return Err(SeerError::Timeout(format!(
                 "timed out reading RDAP response body from {} after {:?}",
-                host, DEFAULT_TIMEOUT
+                url, DEFAULT_TIMEOUT
             )));
         }
     }
@@ -631,6 +682,40 @@ async fn query_rdap_internal(url: &str) -> Result<RdapResponse> {
     // recursive walkers to stack-overflow. See RdapResponse::validate.
     rdap.validate()?;
     Ok(rdap)
+}
+
+/// One RDAP attempt. On failure, returns the error together with an optional
+/// server-suggested retry delay parsed from a 429 `Retry-After` header so the
+/// caller's backoff can honor it. Builds a per-request HTTP client that pins
+/// the validated resolved IPs to prevent DNS rebinding (TOCTOU between
+/// validation and connect).
+async fn query_rdap_attempt(
+    url: &str,
+) -> std::result::Result<RdapResponse, (SeerError, Option<Duration>)> {
+    let response = send_rdap_request(url).await.map_err(|e| (e, None))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        // A 429 may carry a `Retry-After`; surface it so the retry loop can
+        // wait exactly as long as the registry asks instead of guessing.
+        let retry_after = if status.as_u16() == 429 {
+            response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(parse_retry_after)
+        } else {
+            None
+        };
+        return Err((
+            SeerError::RdapError(format!("query failed with status {}", status)),
+            retry_after,
+        ));
+    }
+
+    read_and_parse_rdap_body(response, url)
+        .await
+        .map_err(|e| (e, None))
 }
 
 /// Loads IANA RDAP bootstrap data from all registries with retry.
@@ -938,7 +1023,50 @@ mod tests {
     #[test]
     fn test_default_client_has_retry_policy() {
         let client = RdapClient::new();
-        assert_eq!(client.retry_policy.max_attempts, 2);
+        // Tuned up from 2 so 429 rate limits get a couple of backoff-and-retry
+        // chances, but kept small so a sticky limit falls through to the
+        // WHOIS/DNS fallback fast instead of hanging.
+        assert_eq!(client.retry_policy.max_attempts, 3);
+    }
+
+    // --- Retry-After parsing / delay selection (Fix #1) ------------------
+
+    #[test]
+    fn parse_retry_after_parses_delta_seconds() {
+        assert_eq!(parse_retry_after("5"), Some(Duration::from_secs(5)));
+        assert_eq!(parse_retry_after("  10 "), Some(Duration::from_secs(10)));
+        assert_eq!(parse_retry_after("0"), Some(Duration::from_secs(0)));
+    }
+
+    #[test]
+    fn parse_retry_after_rejects_http_date_and_junk() {
+        // Only the delta-seconds form is supported; an HTTP-date or garbage
+        // value yields None (caller falls back to exponential backoff).
+        assert_eq!(parse_retry_after("Wed, 21 Oct 2015 07:28:00 GMT"), None);
+        assert_eq!(parse_retry_after("soon"), None);
+        assert_eq!(parse_retry_after(""), None);
+    }
+
+    #[test]
+    fn effective_retry_delay_prefers_capped_retry_after() {
+        // Honors the server hint when present.
+        assert_eq!(
+            effective_retry_delay(Duration::from_millis(100), Some(Duration::from_secs(5))),
+            Duration::from_secs(5)
+        );
+        // Caps an excessive hint at MAX_RETRY_AFTER so a bad header can't pin us.
+        assert_eq!(
+            effective_retry_delay(Duration::from_millis(100), Some(Duration::from_secs(600))),
+            MAX_RETRY_AFTER
+        );
+    }
+
+    #[test]
+    fn effective_retry_delay_falls_back_to_backoff() {
+        assert_eq!(
+            effective_retry_delay(Duration::from_millis(250), None),
+            Duration::from_millis(250)
+        );
     }
 
     #[test]
