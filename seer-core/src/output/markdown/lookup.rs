@@ -306,9 +306,16 @@ impl MarkdownFormatter {
                 whois_error,
                 whois_data,
             } => {
-                let verdict = match data.confidence.as_str() {
-                    "high" => "AVAILABLE",
-                    "medium" => "MAY BE AVAILABLE",
+                // Branch on the stable verdict (which considers `available`),
+                // not `confidence` alone: a confidence:"high" result still
+                // means "registered" when available == false. Mirrors the
+                // human formatter; without this a registered domain reached
+                // via the availability fallback rendered as "AVAILABLE".
+                let verdict = match data.verdict() {
+                    "available" => "AVAILABLE",
+                    "likely_available" => "MAY BE AVAILABLE",
+                    "registered" => "REGISTERED",
+                    "likely_registered" => "LIKELY REGISTERED",
                     _ => "UNKNOWN",
                 };
                 output.push(format!("- **Verdict**: {}", verdict));
@@ -408,5 +415,37 @@ mod tests {
         assert!(output.contains("## Availability: test.com"));
         assert!(output.contains("**AVAILABLE**"));
         assert!(output.contains("high"));
+    }
+
+    #[test]
+    fn format_lookup_registered_high_confidence_does_not_say_available() {
+        // Regression: the Available arm branched on `confidence` alone, so a
+        // confidently-*registered* domain (available:false, confidence:"high")
+        // rendered as "AVAILABLE". It must say REGISTERED — the same fix the
+        // human formatter already carries. This is the markdown rendering of
+        // the dns_present "registered" verdict (e.g. zac.email).
+        let result = crate::lookup::LookupResult::Available {
+            data: Box::new(crate::availability::AvailabilityResult {
+                domain: "zac.email".to_string(),
+                available: false,
+                confidence: "high".to_string(),
+                method: "dns_present".to_string(),
+                details: Some("Domain is registered (delegated in DNS).".to_string()),
+            }),
+            rdap_error: String::new(),
+            whois_error: String::new(),
+            whois_data: None,
+        };
+        let out = MarkdownFormatter::new().format_lookup(&result);
+        assert!(
+            out.contains("REGISTERED"),
+            "must render REGISTERED:\n{}",
+            out
+        );
+        assert!(
+            !out.contains("AVAILABLE"),
+            "must not render AVAILABLE for a registered domain:\n{}",
+            out
+        );
     }
 }

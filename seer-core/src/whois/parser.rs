@@ -289,6 +289,47 @@ impl WhoisResponse {
         self.registrar.is_some() && has_dates_or_status && !self.nameservers.is_empty()
     }
 
+    /// Returns true when the registry's WHOIS server replied with a
+    /// service-level "this TLD is not served here" / malformed-query sentinel
+    /// instead of domain data — i.e. there is no usable port-43 WHOIS for this
+    /// query. This is common for Identity Digital RDAP-only TLDs (.email,
+    /// .life, .ninja, …) whose `whois.nic.<tld>` host answers "TLD is not
+    /// supported." to every query and whose RDAP advertises `port43: null`.
+    ///
+    /// Distinct from [`is_available`](Self::is_available) (the domain is
+    /// unregistered) and from a thin-but-valid record: it only fires when no
+    /// registration field was extracted AND the body matches a known
+    /// service-error sentinel at the start of a line.
+    pub fn registry_unavailable(&self) -> bool {
+        // Only meaningful when we extracted no registration data at all — a
+        // record with a registrar / dates / nameservers / status is real data,
+        // never a service error.
+        if self.registrar.is_some()
+            || self.creation_date.is_some()
+            || self.expiration_date.is_some()
+            || !self.nameservers.is_empty()
+            || !self.status.is_empty()
+        {
+            return false;
+        }
+        // Match known service-error sentinels at the start of a (trimmed) line,
+        // mirroring `indicates_not_found`'s anchoring to avoid false positives
+        // from TOS boilerplate that may quote these phrases.
+        const SERVICE_ERROR_SENTINELS: &[&str] = &[
+            "tld is not supported",
+            "this tld is not",
+            "malformed request",
+            "invalid query",
+            "no whois server is known",
+            "this server does not",
+        ];
+        let lower = self.raw_response.to_lowercase();
+        lower.lines().any(|line| {
+            let t = line.trim_start();
+            SERVICE_ERROR_SENTINELS.iter().any(|s| t.starts_with(s))
+        })
+    }
+
     pub fn is_available(&self) -> bool {
         // Scan the full response (excluding empty lines and comment lines). Some
         // registries (TWNIC, JPRS, NIC.br) prepend 3-4 notice lines before the
@@ -614,6 +655,49 @@ Creation Date: 2020-01-01T00:00:00Z
 Name Server: ns1.example.com
 ";
         assert!(!make_response(raw).is_available());
+    }
+
+    // --- registry_unavailable(): registry serves no usable WHOIS --------
+
+    #[test]
+    fn registry_unavailable_true_for_tld_not_supported_sentinel() {
+        // Identity Digital (.email/.life/.ninja/…) port-43 servers reply
+        // "TLD is not supported." with no domain fields — RDAP-only TLDs.
+        let raw = "\
+TLD is not supported.
+>>> Last update of WHOIS database: 2026-06-03T22:45:28Z <<<
+
+Terms of Use: Access to WHOIS information is provided to assist persons ...
+";
+        assert!(make_response(raw).registry_unavailable());
+    }
+
+    #[test]
+    fn registry_unavailable_true_for_malformed_request_sentinel() {
+        let raw = "\
+Malformed request.
+>>> Last update of WHOIS database: 2026-06-03T22:46:35Z <<<
+";
+        assert!(make_response(raw).registry_unavailable());
+    }
+
+    #[test]
+    fn registry_unavailable_false_for_registered_domain() {
+        let raw = "\
+Domain Name: example.com
+Registrar: Example Registrar, Inc.
+Creation Date: 2020-01-01T00:00:00Z
+Name Server: ns1.example.com
+";
+        assert!(!make_response(raw).registry_unavailable());
+    }
+
+    #[test]
+    fn registry_unavailable_false_for_available_domain() {
+        // An unregistered-domain "no match" response is NOT a service error —
+        // it must read as available, not registry-unavailable.
+        let raw = "No match for domain EXAMPLE.\n";
+        assert!(!make_response(raw).registry_unavailable());
     }
 
     #[test]
