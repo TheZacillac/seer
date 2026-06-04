@@ -24,7 +24,10 @@ pub enum PaneOutcome {
     Action(Action),
     EditField(EditTarget),
     /// Show a transient toast (App calls `set_toast`).
-    Toast { tone: &'static str, msg: &'static str },
+    Toast {
+        tone: &'static str,
+        msg: &'static str,
+    },
 }
 
 #[derive(Default)]

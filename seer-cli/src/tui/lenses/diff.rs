@@ -315,7 +315,18 @@ mod tests {
         let backend = TestBackend::new(90, 20);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|f| render(f, f.area(), &theme, Some("a.com"), "b.com", None, false, &state))
+            .draw(|f| {
+                render(
+                    f,
+                    f.area(),
+                    &theme,
+                    Some("a.com"),
+                    "b.com",
+                    None,
+                    false,
+                    &state,
+                )
+            })
             .unwrap();
         let text = buf_text(terminal.backend().buffer());
         assert!(text.contains("NameCheap"), "table renders registrar A");

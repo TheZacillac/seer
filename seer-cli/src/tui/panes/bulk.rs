@@ -185,7 +185,10 @@ mod tests {
 
     #[test]
     fn parse_domains_input_caps_at_50() {
-        let many = (0..80).map(|i| format!("d{i}.com")).collect::<Vec<_>>().join(" ");
+        let many = (0..80)
+            .map(|i| format!("d{i}.com"))
+            .collect::<Vec<_>>()
+            .join(" ");
         assert_eq!(parse_domains_input(&many).len(), 50);
     }
 

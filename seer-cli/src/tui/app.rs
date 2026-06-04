@@ -436,9 +436,7 @@ impl App {
             EditTarget::FollowInterval
             | EditTarget::FollowCount
             | EditTarget::BulkPath
-            | EditTarget::BulkDomains => {
-                self.panes.apply_field(target, value, self.domain.clone())
-            }
+            | EditTarget::BulkDomains => self.panes.apply_field(target, value, self.domain.clone()),
         }
     }
 
@@ -1278,7 +1276,13 @@ mod tests {
         // First entry → a History fetch is issued.
         let a1 = app.fetch_current();
         assert!(
-            matches!(a1, Some(Action::Fetch { req: FetchReq::History, .. })),
+            matches!(
+                a1,
+                Some(Action::Fetch {
+                    req: FetchReq::History,
+                    ..
+                })
+            ),
             "first visit should fetch history, got {a1:?}",
         );
         // Simulate the result arriving.
@@ -1289,7 +1293,13 @@ mod tests {
         // Second entry → cache is dropped, so it fetches again (fresh disk read).
         let a2 = app.fetch_current();
         assert!(
-            matches!(a2, Some(Action::Fetch { req: FetchReq::History, .. })),
+            matches!(
+                a2,
+                Some(Action::Fetch {
+                    req: FetchReq::History,
+                    ..
+                })
+            ),
             "history must always refetch even when already Loaded, got {a2:?}",
         );
     }
@@ -1300,7 +1310,13 @@ mod tests {
         app.lens = history_lens_idx();
         let a = app.fetch_current();
         assert!(
-            matches!(a, Some(Action::Fetch { req: FetchReq::History, .. })),
+            matches!(
+                a,
+                Some(Action::Fetch {
+                    req: FetchReq::History,
+                    ..
+                })
+            ),
             "history should load with no domain set, got {a:?}",
         );
     }
