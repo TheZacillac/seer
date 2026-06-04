@@ -151,6 +151,28 @@ fn nxdomain_confirms_available(is_thin: bool, rdap_returned_200: bool, dns: DnsP
     is_thin && !rdap_returned_200 && matches!(dns, DnsPresence::Absent)
 }
 
+/// Symmetric counterpart to [`nxdomain_confirms_available`]: decides whether a
+/// thin / no-service WHOIS leg plus an RDAP failure should be reported as
+/// *registered* on the strength of a positive DNS delegation.
+///
+/// Routes to "registered" only when ALL hold:
+/// * the WHOIS body was thin — no registrar/dates (`is_thin`),
+/// * RDAP did NOT return an HTTP 200 (`rdap_returned_200` is false), and
+/// * the apex IS delegated in DNS ([`DnsPresence::Present`] — has NS records).
+///
+/// This prevents emitting an empty [`LookupResult::Whois`] for a domain that is
+/// provably registered when the registry offers no usable WHOIS (e.g. Identity
+/// Digital RDAP-only TLDs like `.email`) and RDAP was throttled or
+/// grace-truncated. `DnsPresence::Unknown` deliberately does not qualify — a
+/// failed DNS probe is not positive evidence of registration.
+fn dns_present_confirms_registered(
+    is_thin: bool,
+    rdap_returned_200: bool,
+    dns: DnsPresence,
+) -> bool {
+    is_thin && !rdap_returned_200 && matches!(dns, DnsPresence::Present)
+}
+
 /// Sanitizes an error message for inclusion in a public-facing response.
 ///
 /// Strips IPv4 and IPv6 literals (to avoid leaking internal addresses when
@@ -691,6 +713,42 @@ impl SmartLookup {
                             "No registry data available; domain has no DNS presence (NXDOMAIN)"
                                 .to_string(),
                         ),
+                    };
+                    return Ok(LookupResult::Available {
+                        data: Box::new(avail),
+                        rdap_error: sanitize_error_for_public(&rdap_error_str),
+                        whois_error: String::new(),
+                        whois_data: Some(whois_data),
+                    });
+                }
+
+                // Symmetric safety net: thin / no-service WHOIS, RDAP not a
+                // 200, but the apex IS delegated in DNS — the domain is
+                // registered. Report that (with the DNS-derived reason) instead
+                // of emitting an empty WHOIS record. Fixes RDAP-only TLDs (e.g.
+                // Identity Digital's .email/.life/.ninja) whose `whois.nic.*`
+                // answers "TLD is not supported." and whose throttled RDAP can
+                // be grace-truncated by that fast non-answer.
+                if dns_present_confirms_registered(whois_is_thin, rdap_returned_200, dns_presence) {
+                    debug!(domain = %domain, "Thin/no-service WHOIS + DNS delegation, reporting registered");
+                    if let Some(ref cb) = progress {
+                        cb("Domain is registered (registry detail unavailable)");
+                    }
+                    let details = if whois_data.registry_unavailable() {
+                        "Domain is registered (the apex is delegated in DNS). This TLD's \
+                         registry provides no port-43 WHOIS data and RDAP was unavailable \
+                         (rate-limited or unreachable); retry shortly for full RDAP detail."
+                    } else {
+                        "Domain is registered (the apex is delegated in DNS). Registry detail \
+                         was unavailable (RDAP rate-limited or unreachable and WHOIS returned \
+                         no data); retry shortly for full detail."
+                    };
+                    let avail = AvailabilityResult {
+                        domain: domain.to_string(),
+                        available: false,
+                        confidence: "high".to_string(),
+                        method: "dns_present".to_string(),
+                        details: Some(details.to_string()),
                     };
                     return Ok(LookupResult::Available {
                         data: Box::new(avail),
@@ -1426,6 +1484,56 @@ mod tests {
             true,
             false,
             DnsPresence::Unknown
+        ));
+    }
+
+    // ---------------- dns_present_confirms_registered ----------------
+
+    #[test]
+    fn dns_present_confirms_registered_thin_no200_present() {
+        // The zac.email / Identity-Digital case: a no-service WHOIS leg, RDAP
+        // unavailable (throttled / grace-truncated), but the apex IS delegated
+        // in DNS — the domain is registered and must not render as blank.
+        assert!(dns_present_confirms_registered(
+            true,
+            false,
+            DnsPresence::Present
+        ));
+    }
+
+    #[test]
+    fn dns_present_confirms_registered_requires_present_dns() {
+        // NXDOMAIN is the "available" signal, not "registered"; Unknown is not
+        // positive evidence of registration.
+        assert!(!dns_present_confirms_registered(
+            true,
+            false,
+            DnsPresence::Absent
+        ));
+        assert!(!dns_present_confirms_registered(
+            true,
+            false,
+            DnsPresence::Unknown
+        ));
+    }
+
+    #[test]
+    fn dns_present_confirms_registered_requires_thin_whois() {
+        // A WHOIS body with real registration data uses the normal Whois path.
+        assert!(!dns_present_confirms_registered(
+            false,
+            false,
+            DnsPresence::Present
+        ));
+    }
+
+    #[test]
+    fn dns_present_confirms_registered_vetoed_by_rdap_200() {
+        // A thin RDAP 200 already proves the object exists; keep that path.
+        assert!(!dns_present_confirms_registered(
+            true,
+            true,
+            DnsPresence::Present
         ));
     }
 
