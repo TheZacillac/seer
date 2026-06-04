@@ -1,5 +1,6 @@
 mod display;
 mod repl;
+mod tui;
 mod utils;
 
 use std::io::Write;
@@ -289,6 +290,11 @@ enum Commands {
         /// Clear all history
         #[arg(long)]
         clear: bool,
+    },
+    /// Launch the full-screen interactive TUI
+    Tui {
+        /// Optional domain to look up on launch
+        domain: Option<String>,
     },
 }
 
@@ -1182,6 +1188,9 @@ async fn execute_command(
                     }
                 }
             }
+        }
+        Commands::Tui { domain } => {
+            tui::run(domain).await?;
         }
     }
 
