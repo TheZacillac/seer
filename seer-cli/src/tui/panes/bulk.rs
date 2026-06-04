@@ -45,6 +45,10 @@ pub struct BulkState {
     pub running: bool,
     /// Optional status note (e.g. error from file load).
     pub note: Option<String>,
+    /// Generation counter — callbacks from superseded runs are dropped.
+    pub gen: u64,
+    /// Expected row count for the current run (drives the gauge denominator).
+    pub total: usize,
 }
 
 impl BulkState {
@@ -93,9 +97,13 @@ impl BulkState {
                 self.rows.clear();
                 self.running = true;
                 self.note = None;
+                self.gen += 1;
+                let domains = self.sample_domains();
+                self.total = domains.len();
                 Some(PaneOutcome::Action(Action::StartBulk(BulkParams {
                     op: self.op().to_string(),
-                    domains: self.sample_domains(),
+                    domains,
+                    gen: self.gen,
                 })))
             }
             // Open file-path field
@@ -204,12 +212,13 @@ mod tests {
         let out = s.handle_key(key(KeyCode::Char('r')));
         assert!(s.running);
         assert!(s.rows.is_empty());
+        assert_eq!(s.gen, 1, "gen must be bumped to 1 on first start");
         let expected_domains = s.sample_domains();
         // Re-create sample for comparison (s.op() is still "lookup" here)
         assert!(matches!(
             out,
             Some(PaneOutcome::Action(Action::StartBulk(ref p)))
-            if p.op == "lookup" && !p.domains.is_empty()
+            if p.op == "lookup" && !p.domains.is_empty() && p.gen == 1
         ));
         // Domains should match the first sample
         if let Some(PaneOutcome::Action(Action::StartBulk(p))) = out {

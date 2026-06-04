@@ -17,7 +17,6 @@ use crossterm::event::KeyEvent;
 
 use crate::tui::action::{Action, EditTarget, FetchReq};
 
-#[allow(dead_code)] // fleshed out in Phase 4
 #[derive(Debug)]
 pub enum PaneOutcome {
     None,
@@ -84,9 +83,13 @@ impl Panes {
                 self.bulk.running = true;
                 self.bulk.rows.clear();
                 self.bulk.note = None;
+                self.bulk.gen += 1;
+                // total is unknown for file loads; 0 means the gauge falls back to rows.
+                self.bulk.total = 0;
                 vec![Action::StartBulkFromFile {
                     op: self.bulk.op().to_string(),
                     path: v,
+                    gen: self.bulk.gen,
                 }]
             }
             _ => vec![],

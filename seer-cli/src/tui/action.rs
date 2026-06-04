@@ -20,7 +20,6 @@ impl Focus {
 
 /// Which text field an `InputMode::Field` is editing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // Phase 3 variants wired up in pane components
 pub enum EditTarget {
     Target,
     DiffB,
@@ -44,7 +43,6 @@ pub enum InputMode {
 /// A parameterized lookup request. The single source of truth for what
 /// `data::fetch` runs and which lens key owns the result.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // Phase 2/3 variants wired up progressively
 pub enum FetchReq {
     Overview(String),
     Whois(String),
@@ -107,6 +105,8 @@ pub struct FollowParams {
     pub domain: String,
     pub iterations: usize,
     pub interval_secs: u64,
+    /// Generation tag — stale callbacks from a superseded run are dropped.
+    pub gen: u64,
 }
 
 /// Parameters for a streaming Bulk run.
@@ -114,13 +114,19 @@ pub struct FollowParams {
 pub struct BulkParams {
     pub op: String, // "lookup" | "status" | "dig" | "avail" | "info"
     pub domains: Vec<String>,
+    /// Generation tag — stale callbacks from a superseded run are dropped.
+    pub gen: u64,
 }
 
 /// Side-effecting intents returned by `App`/components for the loop to perform.
 #[derive(Debug, Clone)]
 pub enum Action {
     Quit,
-    Fetch(FetchReq),
+    /// Parameterized lookup with a generation tag for stale-result detection.
+    Fetch {
+        req: FetchReq,
+        gen: u64,
+    },
     Copy {
         text: String,
         label: String,
@@ -131,6 +137,7 @@ pub enum Action {
     StartBulkFromFile {
         op: String,
         path: String,
+        gen: u64,
     },
     WriteCsv {
         path: String,
@@ -161,7 +168,6 @@ pub enum LensData {
     Compare(Box<seer_core::DnsComparison>),
     Diff(Box<seer_core::DomainDiff>),
     Watch(Box<seer_core::WatchReport>),
-    #[allow(dead_code)] // rendered in Phase 2 (Task 13)
     History(Vec<seer_core::HistoryEntry>),
     Subdomains(Box<seer_core::SubdomainResult>),
 }
@@ -181,16 +187,27 @@ pub enum Msg {
     Tick,
     Data {
         lens: String,
+        gen: u64,
         result: Result<LensData, String>,
     },
     CopyResult {
         ok: bool,
         label: String,
     },
-    FollowStep(Box<seer_core::dns::FollowIteration>),
-    FollowDone,
-    BulkStep(Box<seer_core::bulk::BulkResult>),
-    BulkDone,
+    FollowStep {
+        gen: u64,
+        it: Box<seer_core::dns::FollowIteration>,
+    },
+    FollowDone {
+        gen: u64,
+    },
+    BulkStep {
+        gen: u64,
+        result: Box<seer_core::bulk::BulkResult>,
+    },
+    BulkDone {
+        gen: u64,
+    },
 }
 
 #[cfg(test)]

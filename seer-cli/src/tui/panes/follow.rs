@@ -14,6 +14,8 @@ pub struct FollowState {
     pub running: bool,
     /// Log of completed iterations, newest first.
     pub log: Vec<seer_core::dns::FollowIteration>,
+    /// Generation counter — callbacks from superseded runs are dropped.
+    pub gen: u64,
 }
 
 impl Default for FollowState {
@@ -23,6 +25,7 @@ impl Default for FollowState {
             count: 20,
             running: false,
             log: vec![],
+            gen: 0,
         }
     }
 }
@@ -47,10 +50,12 @@ impl FollowState {
                 };
                 self.log.clear();
                 self.running = true;
+                self.gen += 1;
                 Some(PaneOutcome::Action(Action::StartFollow(FollowParams {
                     domain: d.to_string(),
                     iterations: self.count,
                     interval_secs: self.interval_secs,
+                    gen: self.gen,
                 })))
             }
             // 'i' — edit interval
@@ -95,7 +100,7 @@ mod tests {
         assert!(matches!(
             outcome,
             Some(PaneOutcome::Action(Action::StartFollow(ref p)))
-            if p.domain == "x.com" && p.iterations == 20 && p.interval_secs == 30
+            if p.domain == "x.com" && p.iterations == 20 && p.interval_secs == 30 && p.gen == 1
         ));
     }
 

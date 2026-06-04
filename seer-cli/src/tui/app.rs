@@ -42,6 +42,8 @@ pub struct App {
     pub panes: Panes,
     states: HashMap<&'static str, LensState>,
     startup: Vec<Action>,
+    /// Per-lens generation counter; stale results carry a lower gen and are dropped.
+    fetch_gen: HashMap<&'static str, u64>,
 }
 
 impl App {
@@ -61,6 +63,7 @@ impl App {
             panes: Panes::default(),
             states: HashMap::new(),
             startup: Vec::new(),
+            fetch_gen: HashMap::new(),
         };
         if let Some(d) = domain {
             if let Some(action) = app.set_domain_and_fetch(&d) {
@@ -91,6 +94,19 @@ impl App {
             msg: msg.to_string(),
             ticks_left: TOAST_TICKS,
         });
+    }
+
+    /// Increment and return the generation counter for a lens key.
+    fn bump_fetch_gen(&mut self, key: &'static str) -> u64 {
+        let g = self.fetch_gen.entry(key).or_insert(0);
+        *g += 1;
+        *g
+    }
+
+    /// Build a `Fetch` action with the current generation for staleness detection.
+    fn fetch_action(&mut self, req: FetchReq) -> Action {
+        let gen = self.bump_fetch_gen(req.lens_key());
+        Action::Fetch { req, gen }
     }
 
     /// Number of selectable rows in the current lens's loaded data.
@@ -140,7 +156,7 @@ impl App {
         let domain = self.domain.clone()?;
         let req = self.default_req(key, &domain)?;
         self.states.insert(key, LensState::Loading);
-        Some(Action::Fetch(req))
+        Some(self.fetch_action(req))
     }
 
     /// Default fetch request for a lens at `domain` (used by nav/number-jump).
@@ -197,6 +213,35 @@ impl App {
         self.fetch_with_current()
     }
 
+    /// Populate `panes.dns.resolved_ip` from DNS or Status results so the RDAP
+    /// IP tab can auto-fetch without an explicit `:rdap <ip>` command.
+    fn extract_resolved_ip_if_needed(&mut self, data: &LensData) {
+        match data {
+            LensData::Dns(records) => {
+                let ip = records.iter().find_map(|r| {
+                    if let seer_core::dns::RecordData::A { address } = &r.data {
+                        Some(address.clone())
+                    } else {
+                        None
+                    }
+                });
+                if ip.is_some() {
+                    self.panes.dns.resolved_ip = ip;
+                }
+            }
+            LensData::Status(s) => {
+                let ip = s
+                    .dns_resolution
+                    .as_ref()
+                    .and_then(|d| d.a_records.first().cloned());
+                if ip.is_some() {
+                    self.panes.dns.resolved_ip = ip;
+                }
+            }
+            _ => {}
+        }
+    }
+
     pub fn update(&mut self, msg: Msg) -> Vec<Action> {
         match msg {
             Msg::Tick => {
@@ -209,16 +254,22 @@ impl App {
                 }
                 vec![]
             }
-            Msg::Data { lens, result } => {
+            Msg::Data { lens, gen, result } => {
                 // Resolve the string key back to a &'static str via the registry.
                 if let Some(reg) = lenses::lenses().iter().find(|l| l.key == lens) {
-                    self.states.insert(
-                        reg.key,
-                        match result {
-                            Ok(data) => LensState::Loaded(data),
+                    // Drop stale results — only store if the generation matches.
+                    let current_gen = self.fetch_gen.get(reg.key).copied().unwrap_or(0);
+                    if current_gen == gen {
+                        let new_state = match result {
+                            Ok(data) => {
+                                // Side-effect: extract resolved IP from DNS/Status results.
+                                self.extract_resolved_ip_if_needed(&data);
+                                LensState::Loaded(data)
+                            }
                             Err(e) => LensState::Error(e),
-                        },
-                    );
+                        };
+                        self.states.insert(reg.key, new_state);
+                    }
                 }
                 vec![]
             }
@@ -230,20 +281,30 @@ impl App {
                 }
                 vec![]
             }
-            Msg::FollowStep(it) => {
-                self.panes.follow.push(*it);
+            Msg::FollowStep { gen, it } => {
+                // Drop steps from a superseded run.
+                if gen == self.panes.follow.gen {
+                    self.panes.follow.push(*it);
+                }
                 vec![]
             }
-            Msg::FollowDone => {
-                self.panes.follow.running = false;
+            Msg::FollowDone { gen } => {
+                if gen == self.panes.follow.gen {
+                    self.panes.follow.running = false;
+                }
                 vec![]
             }
-            Msg::BulkStep(r) => {
-                self.panes.bulk.push(*r);
+            Msg::BulkStep { gen, result } => {
+                // Drop results from a superseded run.
+                if gen == self.panes.bulk.gen {
+                    self.panes.bulk.push(*result);
+                }
                 vec![]
             }
-            Msg::BulkDone => {
-                self.panes.bulk.running = false;
+            Msg::BulkDone { gen } => {
+                if gen == self.panes.bulk.gen {
+                    self.panes.bulk.running = false;
+                }
                 vec![]
             }
             // Only Press events — ignoring Repeat/Release avoids double-input on
@@ -336,10 +397,9 @@ impl App {
                 match self.domain.clone() {
                     Some(a) if !self.panes.diff.b.is_empty() => {
                         self.states.remove("diff");
-                        vec![Action::Fetch(FetchReq::Diff {
-                            a,
-                            b: self.panes.diff.b.clone(),
-                        })]
+                        let b = self.panes.diff.b.clone();
+                        let action = self.fetch_action(FetchReq::Diff { a, b });
+                        vec![action]
                     }
                     _ => vec![],
                 }
@@ -450,7 +510,7 @@ impl App {
             PaneOutcome::None => vec![],
             PaneOutcome::Fetch(req) => {
                 self.states.remove(req.lens_key());
-                vec![Action::Fetch(req)]
+                vec![self.fetch_action(req)]
             }
             PaneOutcome::Action(a) => vec![a],
             PaneOutcome::EditField(target) => {
@@ -490,6 +550,12 @@ impl App {
                 vec![]
             }
             CmdOutcome::Lens { lens, target } => {
+                // Smart :rdap <target>: route to the right RDAP sub-tab based on target type.
+                if lens == "rdap" {
+                    if let Some(t) = target {
+                        return self.rdap_command(&t);
+                    }
+                }
                 if let Some(i) = lenses::find_by_cmd_or_key(&lens) {
                     self.lens = i;
                     self.sel = 0;
@@ -516,7 +582,8 @@ impl App {
                 }
                 self.panes.diff.b = b.clone();
                 self.states.remove("diff");
-                vec![Action::Fetch(FetchReq::Diff { a, b })]
+                let action = self.fetch_action(FetchReq::Diff { a, b });
+                vec![action]
             }
             CmdOutcome::Compare { domain, a, b } => {
                 if let Some(i) = lenses::find_by_cmd_or_key("dns") {
@@ -528,18 +595,59 @@ impl App {
                 self.panes.compare.a = a.clone();
                 self.panes.compare.b = b.clone();
                 self.states.remove("dns");
-                vec![Action::Fetch(FetchReq::Compare {
+                let action = self.fetch_action(FetchReq::Compare {
                     domain,
                     record_type: RecordType::A,
                     a,
                     b,
-                })]
+                });
+                vec![action]
             }
             CmdOutcome::Unknown(c) => {
                 self.set_toast("fail", &format!("unknown command: {c}"));
                 vec![]
             }
         }
+    }
+
+    /// Handle `:rdap <target>` — routes to the correct RDAP sub-tab based on
+    /// whether the target looks like an IP address, an ASN, or a domain name.
+    fn rdap_command(&mut self, target: &str) -> Vec<Action> {
+        let Some(rdap_idx) = lenses::find_by_cmd_or_key("rdap") else {
+            return vec![];
+        };
+        self.lens = rdap_idx;
+        self.sel = 0;
+        self.focus = Focus::Nav;
+
+        // IP address?
+        if target.parse::<std::net::IpAddr>().is_ok() {
+            self.tab = 1;
+            self.states.remove("rdap");
+            return vec![self.fetch_action(FetchReq::RdapIp(target.to_string()))];
+        }
+
+        // ASN? Match AS15169, as15169, or bare 15169.
+        let asn_digits: String = target
+            .trim_start_matches(|c: char| c.is_alphabetic())
+            .to_string();
+        if !asn_digits.is_empty()
+            && asn_digits.chars().all(|c| c.is_ascii_digit())
+            && target
+                .to_uppercase()
+                .starts_with(|c: char| c == 'A' || c.is_ascii_digit())
+        {
+            if let Ok(asn) = asn_digits.parse::<u32>() {
+                self.tab = 2;
+                self.states.remove("rdap");
+                return vec![self.fetch_action(FetchReq::RdapAsn(asn))];
+            }
+        }
+
+        // Default: domain lookup on tab 0.
+        self.tab = 0;
+        self.states.remove("rdap");
+        vec![self.fetch_action(FetchReq::RdapDomain(target.to_string()))]
     }
 
     /// Fetch the current lens at the existing domain (if any).
@@ -621,7 +729,12 @@ impl App {
                 self.refetch_for_tab()
             }
             KeyAction::EnterPane => {
-                if self.row_count() > 0 {
+                // Allow entering interactive lenses even when row_count is 0 (they have
+                // in-pane controls that work without pre-loaded rows).
+                const INTERACTIVE_LENSES: &[&str] =
+                    &["tld", "diff", "compare", "follow", "bulk", "dns", "rdap"];
+                let lens_key = self.current_lens().key;
+                if self.row_count() > 0 || INTERACTIVE_LENSES.contains(&lens_key) {
                     self.focus = Focus::Pane;
                 }
                 vec![]
@@ -714,7 +827,10 @@ mod tests {
         let actions = app.take_startup_actions();
         assert!(matches!(
             actions.as_slice(),
-            [Action::Fetch(FetchReq::Overview(_))]
+            [Action::Fetch {
+                req: FetchReq::Overview(_),
+                ..
+            }]
         ));
     }
 
@@ -724,9 +840,13 @@ mod tests {
         let _ = app.take_startup_actions();
         let actions = key(&mut app, KeyCode::Char('2'));
         assert_eq!(app.lens, 1);
-        assert!(actions
-            .iter()
-            .any(|a| matches!(a, Action::Fetch(FetchReq::Whois(_)))));
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            Action::Fetch {
+                req: FetchReq::Whois(_),
+                ..
+            }
+        )));
     }
 
     #[test]
@@ -745,16 +865,22 @@ mod tests {
         }
         let actions = key(&mut app, KeyCode::Enter);
         assert_eq!(app.domain.as_deref(), Some("acme.io"));
-        assert!(actions
-            .iter()
-            .any(|a| matches!(a, Action::Fetch(FetchReq::Overview(_)))));
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            Action::Fetch {
+                req: FetchReq::Overview(_),
+                ..
+            }
+        )));
     }
 
     #[test]
     fn data_message_keyed_by_lens_string_stores_state() {
         let mut app = App::new(None);
+        // gen 0 matches the initial fetch_gen (entry absent → 0), so result is stored.
         app.update(Msg::Data {
             lens: "dns".into(),
+            gen: 0,
             result: Ok(LensData::Dns(vec![])),
         });
         let dns_idx = crate::tui::lenses::find_by_cmd_or_key("dns").unwrap();
@@ -903,9 +1029,13 @@ mod tests {
         assert_eq!(app.focus, Focus::Nav);
         // Should emit a fetch for the selected domain
         assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, Action::Fetch(FetchReq::Overview(_)))),
+            actions.iter().any(|a| matches!(
+                a,
+                Action::Fetch {
+                    req: FetchReq::Overview(_),
+                    ..
+                }
+            )),
             "expected Fetch(Overview), got {actions:?}",
         );
     }
@@ -943,10 +1073,172 @@ mod tests {
         let actions = key(&mut app, KeyCode::Enter);
         assert_eq!(app.lens, 0, "should switch to overview lens");
         assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, Action::Fetch(FetchReq::Overview(_)))),
+            actions.iter().any(|a| matches!(
+                a,
+                Action::Fetch {
+                    req: FetchReq::Overview(_),
+                    ..
+                }
+            )),
             "expected Fetch(Overview), got {actions:?}",
+        );
+    }
+
+    // ---- Generation guard tests ----
+
+    #[test]
+    fn stale_data_msg_is_dropped() {
+        let mut app = App::new(None);
+        let dns_idx = crate::tui::lenses::find_by_cmd_or_key("dns").unwrap();
+        // Bump gen to 1 by simulating a fetch (domain set → fetch triggered).
+        app.domain = Some("example.com".into());
+        app.fetch_gen
+            .insert(crate::tui::lenses::lenses()[dns_idx].key, 1);
+        // Send a stale result with gen 0.
+        app.update(Msg::Data {
+            lens: "dns".into(),
+            gen: 0,
+            result: Ok(LensData::Dns(vec![])),
+        });
+        // Lens should remain Idle — stale result was dropped.
+        assert!(
+            matches!(app.state_of(dns_idx), LensState::Idle),
+            "stale gen-0 result must be dropped when current gen is 1",
+        );
+    }
+
+    #[test]
+    fn current_gen_data_msg_is_stored() {
+        let mut app = App::new(None);
+        let dns_idx = crate::tui::lenses::find_by_cmd_or_key("dns").unwrap();
+        app.fetch_gen
+            .insert(crate::tui::lenses::lenses()[dns_idx].key, 2);
+        app.update(Msg::Data {
+            lens: "dns".into(),
+            gen: 2,
+            result: Ok(LensData::Dns(vec![])),
+        });
+        assert!(
+            matches!(app.state_of(dns_idx), LensState::Loaded(_)),
+            "matching gen must be stored",
+        );
+    }
+
+    #[test]
+    fn follow_step_dropped_on_stale_gen() {
+        use chrono::Utc;
+        let mut app = App::new(None);
+        // panes.follow.gen starts at 0; send a step with gen 5 (old run).
+        app.panes.follow.gen = 3;
+        let it = seer_core::dns::FollowIteration {
+            iteration: 1,
+            total_iterations: 5,
+            timestamp: Utc::now(),
+            records: vec![],
+            changed: false,
+            added: vec![],
+            removed: vec![],
+            error: None,
+        };
+        app.update(Msg::FollowStep {
+            gen: 5,
+            it: Box::new(it),
+        });
+        assert!(
+            app.panes.follow.log.is_empty(),
+            "stale follow step must be dropped"
+        );
+    }
+
+    #[test]
+    fn follow_step_accepted_on_matching_gen() {
+        use chrono::Utc;
+        let mut app = App::new(None);
+        app.panes.follow.gen = 7;
+        let it = seer_core::dns::FollowIteration {
+            iteration: 1,
+            total_iterations: 5,
+            timestamp: Utc::now(),
+            records: vec![],
+            changed: false,
+            added: vec![],
+            removed: vec![],
+            error: None,
+        };
+        app.update(Msg::FollowStep {
+            gen: 7,
+            it: Box::new(it),
+        });
+        assert_eq!(
+            app.panes.follow.log.len(),
+            1,
+            "matching gen follow step must be accepted"
+        );
+    }
+
+    #[test]
+    fn rdap_command_ip_routes_to_tab1() {
+        let mut app = App::new(None);
+        let actions = app.rdap_command("8.8.8.8");
+        assert_eq!(app.tab, 1, ":rdap <ip> must switch to tab 1");
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::Fetch {
+                    req: FetchReq::RdapIp(_),
+                    ..
+                }
+            )),
+            "expected Fetch(RdapIp), got {actions:?}",
+        );
+    }
+
+    #[test]
+    fn rdap_command_asn_routes_to_tab2() {
+        let mut app = App::new(None);
+        let actions = app.rdap_command("AS15169");
+        assert_eq!(app.tab, 2, ":rdap AS<n> must switch to tab 2");
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::Fetch {
+                    req: FetchReq::RdapAsn(15169),
+                    ..
+                }
+            )),
+            "expected Fetch(RdapAsn(15169)), got {actions:?}",
+        );
+    }
+
+    #[test]
+    fn rdap_command_domain_routes_to_tab0() {
+        let mut app = App::new(None);
+        let actions = app.rdap_command("example.com");
+        assert_eq!(app.tab, 0, ":rdap <domain> must stay on tab 0");
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::Fetch {
+                    req: FetchReq::RdapDomain(_),
+                    ..
+                }
+            )),
+            "expected Fetch(RdapDomain), got {actions:?}",
+        );
+    }
+
+    #[test]
+    fn enter_pane_allowed_for_bulk_lens_empty() {
+        let mut app = App::new(None);
+        let bulk_idx = crate::tui::lenses::find_by_cmd_or_key("bulk").unwrap();
+        app.lens = bulk_idx;
+        assert_eq!(app.row_count(), 0, "no rows");
+        // Enter maps to KeyAction::EnterPane when focus is Nav.
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.focus,
+            Focus::Pane,
+            "bulk lens should allow EnterPane even with 0 rows",
         );
     }
 }
