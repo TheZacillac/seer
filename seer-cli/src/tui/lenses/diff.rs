@@ -93,10 +93,14 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
         iv_b.map(|b| b.to_string()).unwrap_or_else(|| dash.clone()),
     ));
 
-    // Layout: header line + table
+    // Layout: header line + table + footer hint
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(0),
+            Constraint::Length(1),
+        ])
         .split(inner);
 
     // Header
@@ -158,6 +162,15 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
     )
     .column_spacing(1);
     f.render_widget(table, chunks[1]);
+
+    // Footer hint reminding the user how to change domain B
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "e: set domain B",
+            Style::default().fg(theme.overlay0),
+        ))),
+        chunks[2],
+    );
 }
 
 #[cfg(test)]

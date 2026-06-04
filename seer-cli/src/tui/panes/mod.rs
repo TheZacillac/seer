@@ -1,9 +1,11 @@
 //! Interactive lens components: per-lens state + key routing.
 pub mod compare;
+pub mod diff;
 pub mod dns;
 pub mod tld;
 
 pub use compare::CompareState;
+pub use diff::DiffState;
 pub use dns::DnsState;
 pub use tld::TldState;
 
@@ -48,6 +50,7 @@ impl Panes {
                 2 => self.compare.handle_key(key, domain),
                 _ => None,
             },
+            "diff" => self.diff.handle_key(key),
             _ => None,
         }
     }
@@ -61,15 +64,12 @@ impl Panes {
         vec![]
     }
 
-    pub fn field_value(&self, _t: EditTarget) -> String {
-        String::new()
+    pub fn field_value(&self, t: EditTarget) -> String {
+        match t {
+            EditTarget::DiffB => self.diff.b.clone(),
+            _ => String::new(),
+        }
     }
-}
-
-#[allow(dead_code)] // fleshed out in Phase 2/3
-#[derive(Default)]
-pub struct DiffState {
-    pub b: String,
 }
 
 #[allow(dead_code)] // fleshed out in Phase 4
