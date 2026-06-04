@@ -290,6 +290,21 @@ impl WhoisResponse {
     }
 
     pub fn is_available(&self) -> bool {
+        // A response carrying concrete registration data is registered, full
+        // stop — never let an unanchored substring match (a "not found" /
+        // "object not found" fragment buried in an abuse-contact line, notice,
+        // or registrant value) flip a registered domain to "available". This
+        // guards the H6 false-positive class without having to anchor every
+        // pattern (which would regress legitimate mid-line phrasings like
+        // TWNIC "Domain not found." or HKIRC "...has not been registered.").
+        if self.registrar.is_some()
+            || self.creation_date.is_some()
+            || self.expiration_date.is_some()
+            || !self.nameservers.is_empty()
+        {
+            return false;
+        }
+
         // Scan the full response (excluding empty lines and comment lines). Some
         // registries (TWNIC, JPRS, NIC.br) prepend 3-4 notice lines before the
         // "no match" line, which would escape a small take(N) window.
@@ -610,6 +625,23 @@ Notice: Do not use for spam.
 Domain not found.
 ";
         assert!(make_response(raw).is_available());
+    }
+
+    #[test]
+    fn is_available_false_when_registration_data_present_despite_noise() {
+        // A registered domain whose WHOIS prose contains an availability
+        // fragment (here in an abuse-contact/notice line) must NOT read as
+        // available — concrete registration data (registrar/dates/NS) wins
+        // over an unanchored substring match. This is the H6 false-positive
+        // class: "<registered domain> reported AVAILABLE".
+        let raw = "\
+Domain Name: example.com
+Registrar: Example Registrar, Inc.
+Creation Date: 2020-01-01T00:00:00Z
+Name Server: ns1.example.com
+Registrar Abuse Contact: please report if the object not found in directory
+";
+        assert!(!make_response(raw).is_available());
     }
 
     #[test]
