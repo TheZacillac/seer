@@ -192,7 +192,10 @@ mod tests {
         ];
         for (err, category, leak) in cases {
             let msg = err.sanitized_message();
-            assert!(msg.contains(category), "expected category {category}; got: {msg}");
+            assert!(
+                msg.contains(category),
+                "expected category {category}; got: {msg}"
+            );
             assert!(
                 !msg.contains(leak),
                 "detail '{leak}' must NOT leak into sanitized message; got: {msg}"
