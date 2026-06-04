@@ -62,6 +62,36 @@ pub fn cycle_tab(lens: &Lens, current: usize, forward: bool) -> usize {
     }
 }
 
+use ratatui::layout::Rect;
+use ratatui::Frame;
+
+use crate::tui::action::LensData;
+use crate::tui::theme::Theme;
+
+/// Dispatch human-view rendering to the lens's renderer. Implemented in Task 11.
+#[allow(clippy::too_many_arguments)]
+pub fn render(
+    f: &mut Frame,
+    area: Rect,
+    theme: &Theme,
+    key: &str,
+    tab: usize,
+    data: &LensData,
+    focused: bool,
+    sel: usize,
+) {
+    match key {
+        "overview" => overview::render(f, area, theme, data),
+        "whois" => whois::render(f, area, theme, data),
+        "rdap" => rdap::render(f, area, theme, tab, data),
+        "dns" => dns::render(f, area, theme, tab, data, focused, sel),
+        "ssl" => ssl::render(f, area, theme, data),
+        "status" => status::render(f, area, theme, data),
+        "propagation" => propagation::render(f, area, theme, data, focused, sel),
+        other => placeholder::render(f, area, theme, other),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
