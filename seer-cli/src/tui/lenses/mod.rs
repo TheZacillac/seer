@@ -13,6 +13,7 @@ pub mod rdap;
 pub mod reverse;
 pub mod ssl;
 pub mod status;
+pub mod subdomains;
 pub mod tld;
 pub mod watch;
 pub mod whois;
@@ -138,7 +139,7 @@ pub fn lenses() -> &'static [Lens] {
             cmd: "subdomains",
             group: "SECURITY",
             tabs: NO_TABS,
-            implemented: false,
+            implemented: true,
         },
         Lens {
             key: "diff",
@@ -236,6 +237,7 @@ pub fn render(
         "diff" => diff::render(f, area, theme, data),
         "watch" => watch::render(f, area, theme, data, focused, sel),
         "history" => history::render(f, area, theme, data, focused, sel),
+        "subdomains" => subdomains::render(f, area, theme, data, focused, sel),
         // Phase 3/4 — keep as placeholders
         "follow" => placeholder::render(f, area, theme, "Follow"),
         "bulk" => placeholder::render(f, area, theme, "Bulk"),
@@ -285,6 +287,7 @@ mod tests {
                 "propagation",
                 "ssl",
                 "status",
+                "subdomains",
                 "diff",
                 "watch",
                 "history"

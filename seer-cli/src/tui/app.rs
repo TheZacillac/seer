@@ -101,6 +101,7 @@ impl App {
             LensState::Loaded(LensData::Reverse(r)) => r.len(),
             LensState::Loaded(LensData::Watch(w)) => w.results.len(),
             LensState::Loaded(LensData::History(e)) => e.len(),
+            LensState::Loaded(LensData::Subdomains(s)) => s.subdomains.len(),
             _ => 0,
         }
     }
@@ -177,6 +178,7 @@ impl App {
             "diff" => return None, // needs a second domain (DiffB field)
             "watch" => FetchReq::Watch,
             "history" => FetchReq::History,
+            "subdomains" => FetchReq::Subdomains(d),
             "follow" | "bulk" => return None, // streaming — started explicitly
             _ => return None,
         })

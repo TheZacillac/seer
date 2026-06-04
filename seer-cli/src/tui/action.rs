@@ -75,6 +75,7 @@ pub enum FetchReq {
     },
     Watch,
     History,
+    Subdomains(String),
 }
 
 impl FetchReq {
@@ -95,6 +96,7 @@ impl FetchReq {
             FetchReq::Diff { .. } => "diff",
             FetchReq::Watch => "watch",
             FetchReq::History => "history",
+            FetchReq::Subdomains(_) => "subdomains",
         }
     }
 }
@@ -152,6 +154,7 @@ pub enum LensData {
     Watch(Box<seer_core::WatchReport>),
     #[allow(dead_code)] // rendered in Phase 2 (Task 13)
     History(Vec<seer_core::HistoryEntry>),
+    Subdomains(Box<seer_core::SubdomainResult>),
 }
 
 #[derive(Debug, Clone, Default)]

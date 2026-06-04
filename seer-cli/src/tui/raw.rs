@@ -22,6 +22,7 @@ pub fn serialize(data: &LensData, format: OutputFormat) -> String {
         LensData::Diff(d) => fmt.format_diff(d),
         LensData::Watch(w) => fmt.format_watch(w),
         LensData::History(_) => "history (raw view not applicable)".to_string(),
+        LensData::Subdomains(s) => fmt.format_subdomains(s),
     }
 }
 

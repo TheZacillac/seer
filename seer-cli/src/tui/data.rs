@@ -107,5 +107,10 @@ pub async fn fetch(req: FetchReq) -> Result<LensData, String> {
             flat.sort_by_key(|e| std::cmp::Reverse(e.timestamp));
             Ok(LensData::History(flat))
         }
+        FetchReq::Subdomains(d) => seer_core::SubdomainEnumerator::new()
+            .enumerate(&d)
+            .await
+            .map(|r| LensData::Subdomains(Box::new(r)))
+            .map_err(e),
     }
 }
