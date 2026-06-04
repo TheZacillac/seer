@@ -99,6 +99,8 @@ impl App {
             LensState::Loaded(LensData::Dns(r)) => r.len(),
             LensState::Loaded(LensData::Prop(p)) => p.results.len(),
             LensState::Loaded(LensData::Reverse(r)) => r.len(),
+            LensState::Loaded(LensData::Watch(w)) => w.results.len(),
+            LensState::Loaded(LensData::History(e)) => e.len(),
             _ => 0,
         }
     }

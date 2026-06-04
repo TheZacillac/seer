@@ -1,13 +1,20 @@
 //! Registry of the 16 lenses shown in the left nav, grouped LOOKUP / DNS /
-//! SECURITY / POWER. Only 7 are wired this pass (`implemented = true`).
+//! SECURITY / POWER.
 
+pub mod avail;
+pub mod diff;
 pub mod dns;
+pub mod dnssec;
+pub mod history;
 pub mod overview;
 pub mod placeholder;
 pub mod propagation;
 pub mod rdap;
+pub mod reverse;
 pub mod ssl;
 pub mod status;
+pub mod tld;
+pub mod watch;
 pub mod whois;
 
 #[derive(Debug, Clone, Copy)]
@@ -59,7 +66,7 @@ pub fn lenses() -> &'static [Lens] {
             cmd: "reverse",
             group: "LOOKUP",
             tabs: NO_TABS,
-            implemented: false,
+            implemented: true,
         },
         Lens {
             key: "avail",
@@ -68,7 +75,7 @@ pub fn lenses() -> &'static [Lens] {
             cmd: "avail",
             group: "LOOKUP",
             tabs: NO_TABS,
-            implemented: false,
+            implemented: true,
         },
         Lens {
             key: "tld",
@@ -77,7 +84,7 @@ pub fn lenses() -> &'static [Lens] {
             cmd: "tld",
             group: "LOOKUP",
             tabs: NO_TABS,
-            implemented: false,
+            implemented: true,
         },
         Lens {
             key: "dns",
@@ -140,7 +147,7 @@ pub fn lenses() -> &'static [Lens] {
             cmd: "diff",
             group: "POWER",
             tabs: NO_TABS,
-            implemented: false,
+            implemented: true,
         },
         Lens {
             key: "bulk",
@@ -158,7 +165,7 @@ pub fn lenses() -> &'static [Lens] {
             cmd: "watch",
             group: "POWER",
             tabs: NO_TABS,
-            implemented: false,
+            implemented: true,
         },
         Lens {
             key: "history",
@@ -167,7 +174,7 @@ pub fn lenses() -> &'static [Lens] {
             cmd: "history",
             group: "POWER",
             tabs: NO_TABS,
-            implemented: false,
+            implemented: true,
         },
     ]
 }
@@ -196,9 +203,12 @@ use ratatui::layout::Rect;
 use ratatui::Frame;
 
 use crate::tui::action::LensData;
+use crate::tui::panes::Panes;
 use crate::tui::theme::Theme;
 
-/// Dispatch human-view rendering to the lens's renderer. Implemented in Task 11.
+/// Dispatch human-view rendering to the lens's renderer.
+/// `panes` carries interactive component state; Phase-2 renderers may ignore it
+/// (param prefixed `_panes` in those signatures to suppress clippy).
 #[allow(clippy::too_many_arguments)]
 pub fn render(
     f: &mut Frame,
@@ -209,6 +219,7 @@ pub fn render(
     data: &LensData,
     focused: bool,
     sel: usize,
+    panes: &Panes,
 ) {
     match key {
         "overview" => overview::render(f, area, theme, data),
@@ -218,6 +229,16 @@ pub fn render(
         "ssl" => ssl::render(f, area, theme, data),
         "status" => status::render(f, area, theme, data),
         "propagation" => propagation::render(f, area, theme, data, focused, sel),
+        // Phase 2 renderers
+        "reverse" => reverse::render(f, area, theme, data),
+        "avail" => avail::render(f, area, theme, data),
+        "tld" => tld::render(f, area, theme, data, panes),
+        "diff" => diff::render(f, area, theme, data),
+        "watch" => watch::render(f, area, theme, data, focused, sel),
+        "history" => history::render(f, area, theme, data, focused, sel),
+        // Phase 3/4 — keep as placeholders
+        "follow" => placeholder::render(f, area, theme, "Follow"),
+        "bulk" => placeholder::render(f, area, theme, "Bulk"),
         other => placeholder::render(f, area, theme, other),
     }
 }
@@ -244,22 +265,29 @@ mod tests {
     }
 
     #[test]
-    fn seven_core_lenses_are_implemented() {
+    fn phase2_lenses_are_implemented() {
         let implemented: Vec<&str> = lenses()
             .iter()
             .filter(|l| l.implemented)
             .map(|l| l.key)
             .collect();
+        // Phase 1 core lenses + Phase 2 static renderers (follow/bulk remain Phase 3/4)
         assert_eq!(
             implemented,
             vec![
                 "overview",
                 "whois",
                 "rdap",
+                "reverse",
+                "avail",
+                "tld",
                 "dns",
                 "propagation",
                 "ssl",
-                "status"
+                "status",
+                "diff",
+                "watch",
+                "history"
             ]
         );
     }

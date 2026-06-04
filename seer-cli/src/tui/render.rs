@@ -216,7 +216,9 @@ fn main_pane(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     // Human view: dispatch to the lens renderer.
     if let LensState::Loaded(data) = app.state_of(app.lens) {
         let focused = app.focus == crate::tui::action::Focus::Pane;
-        lenses::render(f, content, theme, lens.key, app.tab, data, focused, app.sel);
+        lenses::render(
+            f, content, theme, lens.key, app.tab, data, focused, app.sel, &app.panes,
+        );
     }
 }
 
