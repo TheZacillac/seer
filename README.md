@@ -110,6 +110,7 @@ seer dig example.com MX        # DNS query
 seer status example.com        # HTTP, SSL, and expiration check
 seer ssl example.com           # Full SSL chain inspection
 seer                           # Launch interactive REPL
+seer tui example.com           # Launch the full-screen TUI
 ```
 
 ### Use as a Rust library
@@ -149,6 +150,19 @@ tokio = { version = "1", features = ["full"] }
 ---
 
 ## 💻 CLI Usage
+
+### Interactive TUI
+
+Launch the full-screen, keyboard-first terminal UI (Catppuccin Frappé):
+
+```bash
+seer tui                  # start on the target prompt
+seer tui example.com      # look up a domain on launch
+```
+
+A grouped **lens** sidebar (Overview · WHOIS · RDAP · DNS · SSL · Status · Propagation, with more on the way) drives a live detail pane backed by the same `seer-core` engine as the CLI.
+
+**Keys:** `j`/`k` move · `1`–`9` jump to a lens · `Tab` focus nav⇄pane · `[` `]` sub-tabs · `r` raw output (json/yaml/markdown) · `y` copy · `/` look up a domain · `:` command · `?` help · `:q` quit.
 
 ### Command Mode
 
