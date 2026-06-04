@@ -186,6 +186,16 @@ fn main_pane(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
                 );
                 return;
             }
+            "bulk" => {
+                lenses::bulk::render(
+                    f,
+                    content,
+                    theme,
+                    &app.panes.bulk,
+                    field_buf(&app.input_mode, EditTarget::BulkDomains),
+                );
+                return;
+            }
             _ => {}
         }
     }

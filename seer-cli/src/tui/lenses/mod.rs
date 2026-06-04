@@ -241,9 +241,8 @@ pub fn render(
         "history" => history::render(f, area, theme, data, focused, sel),
         "subdomains" => subdomains::render(f, area, theme, data, focused, sel),
         // Phase 4 — streaming lenses
-        // ("follow" is handled in render.rs::main_pane before the state match,
-        //  since it never reaches LensState::Loaded — this arm is unreachable)
-        "bulk" => bulk::render(f, area, theme, &panes.bulk),
+        // ("follow" and "bulk" are handled in render.rs::main_pane before the
+        //  state match, since they never reach LensState::Loaded — unreachable)
         other => placeholder::render(f, area, theme, other),
     }
 }

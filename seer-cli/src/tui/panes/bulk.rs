@@ -8,37 +8,13 @@ use crate::tui::panes::PaneOutcome;
 /// Operation presets selectable with `o`.
 pub const OPS: &[&str] = &["lookup", "status", "dig", "avail", "info"];
 
-/// Built-in sample domain lists selectable with `t`.
-pub const SAMPLES: &[(&str, &[&str])] = &[
-    (
-        "top-sites",
-        &[
-            "google.com",
-            "github.com",
-            "cloudflare.com",
-            "wikipedia.org",
-        ],
-    ),
-    ("portfolio", &["example.com", "rust-lang.org", "python.org"]),
-    (
-        "infrastructure",
-        &[
-            "1.1.1.1",
-            "8.8.8.8",
-            "github.com",
-            "fastly.com",
-            "akamai.com",
-        ],
-    ),
-];
-
-/// State for the Bulk lens — op selection, source selection, rows, run status.
+/// State for the Bulk lens — op selection, entered domains, rows, run status.
 #[derive(Default)]
 pub struct BulkState {
     /// Index into `OPS`.
     pub op_idx: usize,
-    /// Index into `SAMPLES`.
-    pub source_idx: usize,
+    /// Raw domains text entered/pasted by the user (space/comma/newline separated).
+    pub domains: String,
     /// Accumulated results for the current run.
     pub rows: Vec<BulkResult>,
     /// True while a bulk task is in flight.
@@ -51,24 +27,27 @@ pub struct BulkState {
     pub total: usize,
 }
 
+/// Parse a free-form domains blob (typed or pasted) into a capped list. Same
+/// filtering as `parse_domains_from_file` (trim, skip blank/`#`, require a dot)
+/// but split on whitespace / comma / newline so single- or multi-line input works.
+/// Lines starting with `#` are dropped before token splitting so that a token
+/// following the comment marker on the same line is also excluded.
+pub fn parse_domains_input(s: &str) -> Vec<String> {
+    s.lines()
+        .map(str::trim)
+        .filter(|line| !line.starts_with('#'))
+        .flat_map(|line| line.split([',', ' ', '\t']))
+        .map(str::trim)
+        .filter(|t| !t.is_empty() && !t.starts_with('#') && t.contains('.'))
+        .map(str::to_string)
+        .take(50)
+        .collect()
+}
+
 impl BulkState {
     /// Current operation name.
     pub fn op(&self) -> &str {
         OPS[self.op_idx]
-    }
-
-    /// Current sample source name.
-    pub fn source_name(&self) -> &str {
-        SAMPLES[self.source_idx].0
-    }
-
-    /// Domain list for the currently selected sample.
-    pub fn sample_domains(&self) -> Vec<String> {
-        SAMPLES[self.source_idx]
-            .1
-            .iter()
-            .map(|s| s.to_string())
-            .collect()
     }
 
     /// Append a result row (called from `App::update` on `Msg::BulkStep`).
@@ -76,10 +55,7 @@ impl BulkState {
         self.rows.push(r);
     }
 
-    /// Handle a key event for the Bulk pane.
-    ///
-    /// Returns `Some(outcome)` when consumed, `None` to fall through.
-    /// Never swallows `Esc`.
+    /// Handle a key event for the Bulk pane. `Some(_)` = consumed; never `Esc`.
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<PaneOutcome> {
         match key.code {
             // Cycle operation
@@ -87,18 +63,21 @@ impl BulkState {
                 self.op_idx = (self.op_idx + 1) % OPS.len();
                 Some(PaneOutcome::None)
             }
-            // Cycle sample source
-            KeyCode::Char('t') => {
-                self.source_idx = (self.source_idx + 1) % SAMPLES.len();
-                Some(PaneOutcome::None)
-            }
-            // Start a run with the selected sample
+            // Edit the domains list
+            KeyCode::Char('d') => Some(PaneOutcome::EditField(EditTarget::BulkDomains)),
+            // Start a run with the entered domains
             KeyCode::Char('r') | KeyCode::Enter => {
+                let domains = parse_domains_input(&self.domains);
+                if domains.is_empty() {
+                    return Some(PaneOutcome::Toast {
+                        tone: "info",
+                        msg: "enter domains first (d)",
+                    });
+                }
                 self.rows.clear();
                 self.running = true;
                 self.note = None;
                 self.gen += 1;
-                let domains = self.sample_domains();
                 self.total = domains.len();
                 Some(PaneOutcome::Action(Action::StartBulk(BulkParams {
                     op: self.op().to_string(),
@@ -118,7 +97,6 @@ impl BulkState {
                     Some(PaneOutcome::Action(Action::WriteCsv { path, contents }))
                 }
             }
-            // Esc and anything else → fall through
             _ => None,
         }
     }
@@ -178,7 +156,7 @@ mod tests {
     fn default_state_is_zeroed() {
         let s = BulkState::default();
         assert_eq!(s.op_idx, 0);
-        assert_eq!(s.source_idx, 0);
+        assert!(s.domains.is_empty());
         assert!(!s.running);
         assert!(s.rows.is_empty());
         assert!(s.note.is_none());
@@ -199,42 +177,51 @@ mod tests {
     }
 
     #[test]
-    fn t_cycles_source() {
-        let mut s = BulkState::default();
-        assert_eq!(s.source_name(), SAMPLES[0].0);
-        s.handle_key(key(KeyCode::Char('t')));
-        assert_eq!(s.source_name(), SAMPLES[1].0);
+    fn parse_domains_input_splits_and_filters() {
+        let got = parse_domains_input("google.com, github.com\nrust-lang.org  bad\n# comment.skip");
+        assert_eq!(got, vec!["google.com", "github.com", "rust-lang.org"]);
+        // "bad" has no dot → dropped; "# comment.skip" starts with # → dropped.
     }
 
     #[test]
-    fn r_sets_running_and_returns_start_bulk() {
+    fn parse_domains_input_caps_at_50() {
+        let many = (0..80).map(|i| format!("d{i}.com")).collect::<Vec<_>>().join(" ");
+        assert_eq!(parse_domains_input(&many).len(), 50);
+    }
+
+    #[test]
+    fn d_opens_domains_field() {
+        let mut s = BulkState::default();
+        let out = s.handle_key(key(KeyCode::Char('d')));
+        assert!(matches!(
+            out,
+            Some(PaneOutcome::EditField(EditTarget::BulkDomains))
+        ));
+    }
+
+    #[test]
+    fn r_with_empty_domains_toasts_and_does_not_run() {
         let mut s = BulkState::default();
         let out = s.handle_key(key(KeyCode::Char('r')));
-        assert!(s.running);
-        assert!(s.rows.is_empty());
-        assert_eq!(s.gen, 1, "gen must be bumped to 1 on first start");
-        let expected_domains = s.sample_domains();
-        // Re-create sample for comparison (s.op() is still "lookup" here)
-        assert!(matches!(
-            out,
-            Some(PaneOutcome::Action(Action::StartBulk(ref p)))
-            if p.op == "lookup" && !p.domains.is_empty() && p.gen == 1
-        ));
-        // Domains should match the first sample
-        if let Some(PaneOutcome::Action(Action::StartBulk(p))) = out {
-            assert_eq!(p.domains, expected_domains);
-        }
+        assert!(!s.running, "empty run must not start");
+        assert!(matches!(out, Some(PaneOutcome::Toast { .. })));
     }
 
     #[test]
-    fn enter_also_starts_run() {
+    fn r_with_domains_starts_run_with_parsed_list() {
         let mut s = BulkState::default();
-        let out = s.handle_key(key(KeyCode::Enter));
+        s.domains = "a.com b.com".into();
+        let out = s.handle_key(key(KeyCode::Char('r')));
         assert!(s.running);
-        assert!(matches!(
-            out,
-            Some(PaneOutcome::Action(Action::StartBulk(_)))
-        ));
+        assert_eq!(s.gen, 1);
+        match out {
+            Some(PaneOutcome::Action(Action::StartBulk(p))) => {
+                assert_eq!(p.op, "lookup");
+                assert_eq!(p.domains, vec!["a.com", "b.com"]);
+                assert_eq!(p.gen, 1);
+            }
+            other => panic!("expected StartBulk, got {other:?}"),
+        }
     }
 
     #[test]

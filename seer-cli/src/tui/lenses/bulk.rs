@@ -6,17 +6,17 @@ use ratatui::widgets::{Paragraph, Row, Table};
 use ratatui::Frame;
 
 use crate::tui::app::SPIN;
-use crate::tui::panes::bulk::{op_domain, BulkState, OPS, SAMPLES};
+use crate::tui::panes::bulk::{op_domain, BulkState, OPS};
 use crate::tui::theme::Theme;
 use crate::tui::widgets::{dot, gauge, panel};
 
-pub fn render(f: &mut Frame, area: Rect, theme: &Theme, bulk: &BulkState) {
+pub fn render(f: &mut Frame, area: Rect, theme: &Theme, bulk: &BulkState, editing: Option<&str>) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(6), Constraint::Min(0)])
+        .constraints([Constraint::Length(7), Constraint::Min(0)])
         .split(area);
 
-    // ── top panel: op chips + source + gauge + hints ─────────────────────────
+    // ── top panel: op chips + domains + gauge + hints ────────────────────────
     let top_title = format!("Bulk  ·  {}", bulk.op());
     let top_block = panel::block(theme, &top_title, theme.mauve, false);
     let top_inner = top_block.inner(rows[0]);
@@ -42,16 +42,37 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, bulk: &BulkState) {
         Line::from(spans)
     };
 
-    // Source + count label
-    let sample_count = SAMPLES[bulk.source_idx].1.len();
-    let source_line = Line::from(vec![
-        Span::styled("source: ", Style::default().fg(theme.overlay0)),
-        Span::styled(bulk.source_name(), Style::default().fg(theme.sky)),
-        Span::styled(
-            format!("  ({sample_count} domains)"),
-            Style::default().fg(theme.overlay0),
-        ),
-    ]);
+    // Domains line — show edit cursor when field is active, preview otherwise
+    let domains_line = if let Some(buf) = editing {
+        Line::from(vec![
+            Span::styled("domains: ", Style::default().fg(theme.overlay0)),
+            Span::styled(format!("{buf}▏"), Style::default().fg(theme.text)),
+        ])
+    } else {
+        let parsed = crate::tui::panes::bulk::parse_domains_input(&bulk.domains);
+        if parsed.is_empty() {
+            Line::from(Span::styled(
+                "domains: none — press d to enter",
+                Style::default().fg(theme.overlay0),
+            ))
+        } else {
+            let preview = parsed
+                .iter()
+                .take(3)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ");
+            let more = if parsed.len() > 3 { ", …" } else { "" };
+            Line::from(vec![
+                Span::styled("domains: ", Style::default().fg(theme.overlay0)),
+                Span::styled(parsed.len().to_string(), Style::default().fg(theme.sky)),
+                Span::styled(
+                    format!(" · {preview}{more}"),
+                    Style::default().fg(theme.overlay0),
+                ),
+            ])
+        }
+    };
 
     // Progress gauge: use bulk.total when set (file loads or explicit run).
     // Falls back to rows.len() so the gauge is never stuck at 0%.
@@ -85,11 +106,11 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, bulk: &BulkState) {
     )]);
 
     // Hints
-    let hints = "o op  ·  t source  ·  r run  ·  f file  ·  e export";
+    let hints = "d domains  ·  o op  ·  r run  ·  f file  ·  e export";
     let hints_line = Line::from(Span::styled(hints, Style::default().fg(theme.overlay0)));
 
     // Optional note (e.g. file error)
-    let mut lines = vec![op_chips, source_line, gauge_line, status_line, hints_line];
+    let mut lines = vec![op_chips, domains_line, gauge_line, status_line, hints_line];
     if let Some(note) = &bulk.note {
         lines.push(Line::from(Span::styled(
             note.as_str(),
@@ -108,7 +129,7 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, bulk: &BulkState) {
     if bulk.rows.is_empty() {
         f.render_widget(
             Paragraph::new(Line::from(vec![Span::styled(
-                "no results — press r to run a sample or f to load a file",
+                "enter domains (d) or load a file (f), then r to run",
                 Style::default()
                     .fg(theme.overlay0)
                     .add_modifier(Modifier::ITALIC),
@@ -200,7 +221,7 @@ mod tests {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|f| render(f, f.area(), &theme, &bulk))
+            .draw(|f| render(f, f.area(), &theme, &bulk, None))
             .unwrap();
         let text = buf_text(&terminal);
         assert!(
@@ -217,12 +238,12 @@ mod tests {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|f| render(f, f.area(), &theme, &bulk))
+            .draw(|f| render(f, f.area(), &theme, &bulk, None))
             .unwrap();
         let text = buf_text(&terminal);
         assert!(
-            text.contains("no results"),
-            "empty state should show 'no results' placeholder"
+            text.contains("enter domains"),
+            "empty state should show 'enter domains' placeholder"
         );
     }
 
@@ -234,10 +255,24 @@ mod tests {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|f| render(f, f.area(), &theme, &bulk))
+            .draw(|f| render(f, f.area(), &theme, &bulk, None))
             .unwrap();
         let text = buf_text(&terminal);
         assert!(text.contains("lookup"), "op chips should show 'lookup'");
         assert!(text.contains("status"), "op chips should show 'status'");
+    }
+
+    #[test]
+    fn empty_state_prompts_for_domains() {
+        let theme = Theme::frappe();
+        let bulk = BulkState::default();
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| render(f, f.area(), &theme, &bulk, None))
+            .unwrap();
+        let text = buf_text(&terminal);
+        assert!(text.contains("press d to enter"), "prompts for domains");
+        assert!(text.contains("d domains"), "shows the new hint row");
     }
 }

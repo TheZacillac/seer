@@ -23,6 +23,8 @@ pub enum PaneOutcome {
     Fetch(FetchReq),
     Action(Action),
     EditField(EditTarget),
+    /// Show a transient toast (App calls `set_toast`).
+    Toast { tone: &'static str, msg: &'static str },
 }
 
 #[derive(Default)]
@@ -92,6 +94,10 @@ impl Panes {
                     gen: self.bulk.gen,
                 }]
             }
+            EditTarget::BulkDomains => {
+                self.bulk.domains = v;
+                vec![]
+            }
             _ => vec![],
         }
     }
@@ -102,6 +108,7 @@ impl Panes {
             EditTarget::FollowInterval => self.follow.interval_secs.to_string(),
             EditTarget::FollowCount => self.follow.count.to_string(),
             EditTarget::BulkPath => String::new(),
+            EditTarget::BulkDomains => self.bulk.domains.clone(),
             _ => String::new(),
         }
     }

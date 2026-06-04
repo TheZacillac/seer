@@ -433,7 +433,10 @@ impl App {
                     remove: None,
                 }]
             }
-            EditTarget::FollowInterval | EditTarget::FollowCount | EditTarget::BulkPath => {
+            EditTarget::FollowInterval
+            | EditTarget::FollowCount
+            | EditTarget::BulkPath
+            | EditTarget::BulkDomains => {
                 self.panes.apply_field(target, value, self.domain.clone())
             }
         }
@@ -536,6 +539,10 @@ impl App {
             PaneOutcome::EditField(target) => {
                 let cur = self.panes.field_value(target);
                 self.input_mode = InputMode::Field { target, buf: cur };
+                vec![]
+            }
+            PaneOutcome::Toast { tone, msg } => {
+                self.set_toast(tone, msg);
                 vec![]
             }
         }
