@@ -26,6 +26,7 @@ pub enum EditTarget {
     FollowInterval,
     FollowCount,
     BulkPath,
+    BulkDomains,
     WatchAdd,
 }
 

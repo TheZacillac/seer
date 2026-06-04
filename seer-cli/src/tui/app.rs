@@ -136,25 +136,35 @@ impl App {
     }
 
     /// Queue a fetch for the current lens at the current domain, marking it
-    /// Loading. Returns None if the lens isn't implemented or no domain set.
+    /// Loading. Returns None if the lens isn't implemented or there's nothing
+    /// to fetch. History and Watch do not require a target domain.
     fn fetch_current(&mut self) -> Option<Action> {
         let lens = self.current_lens();
         let (key, implemented) = (lens.key, lens.implemented);
         if !implemented {
             return None;
         }
-        // Cached (or already in flight) for the current domain → re-visiting a
-        // lens is instant and never re-fetches. Errored lenses are allowed to
-        // retry. `states` is cleared whenever the target domain changes (see
-        // `set_domain_and_fetch`), so a Loaded entry here is always current.
+        // History reflects on-disk state that lookups mutate behind its back;
+        // always re-read it rather than serving a cached (possibly empty) view.
+        if key == "history" {
+            self.states.remove(key);
+        }
+        // Cached (or in flight) for the current domain → revisiting is instant.
         if matches!(
             self.states.get(key),
             Some(LensState::Loaded(_) | LensState::Loading)
         ) {
             return None;
         }
-        let domain = self.domain.clone()?;
-        let req = self.default_req(key, &domain)?;
+        // Most lenses need a target; History/Watch are global views.
+        let req = match self.domain.clone() {
+            Some(domain) => self.default_req(key, &domain)?,
+            None => match key {
+                "history" => FetchReq::History,
+                "watch" => FetchReq::Watch,
+                _ => return None,
+            },
+        };
         self.states.insert(key, LensState::Loading);
         Some(self.fetch_action(req))
     }
@@ -310,6 +320,16 @@ impl App {
             // Only Press events — ignoring Repeat/Release avoids double-input on
             // Windows legacy consoles. (Held-key auto-repeat is not relied upon.)
             Msg::Input(Event::Key(key)) if key.kind == KeyEventKind::Press => self.on_key(key),
+            Msg::Input(Event::Paste(s)) => {
+                // Bracketed paste lands here as one string. Route it into whatever
+                // text buffer is active so multi-line domain lists paste cleanly.
+                match &mut self.input_mode {
+                    InputMode::Field { buf, .. } => buf.push_str(&s),
+                    InputMode::Command(buf) => buf.push_str(&s),
+                    InputMode::Normal => {}
+                }
+                vec![]
+            }
             Msg::Input(_) => vec![],
         }
     }
@@ -413,9 +433,10 @@ impl App {
                     remove: None,
                 }]
             }
-            EditTarget::FollowInterval | EditTarget::FollowCount | EditTarget::BulkPath => {
-                self.panes.apply_field(target, value, self.domain.clone())
-            }
+            EditTarget::FollowInterval
+            | EditTarget::FollowCount
+            | EditTarget::BulkPath
+            | EditTarget::BulkDomains => self.panes.apply_field(target, value, self.domain.clone()),
         }
     }
 
@@ -516,6 +537,10 @@ impl App {
             PaneOutcome::EditField(target) => {
                 let cur = self.panes.field_value(target);
                 self.input_mode = InputMode::Field { target, buf: cur };
+                vec![]
+            }
+            PaneOutcome::Toast { tone, msg } => {
+                self.set_toast(tone, msg);
                 vec![]
             }
         }
@@ -1239,6 +1264,87 @@ mod tests {
             app.focus,
             Focus::Pane,
             "bulk lens should allow EnterPane even with 0 rows",
+        );
+    }
+
+    #[test]
+    fn history_always_refetches_even_when_loaded() {
+        let mut app = App::new(None);
+        app.domain = Some("example.com".into());
+        let hidx = history_lens_idx();
+        app.lens = hidx;
+        // First entry → a History fetch is issued.
+        let a1 = app.fetch_current();
+        assert!(
+            matches!(
+                a1,
+                Some(Action::Fetch {
+                    req: FetchReq::History,
+                    ..
+                })
+            ),
+            "first visit should fetch history, got {a1:?}",
+        );
+        // Simulate the result arriving.
+        app.states.insert(
+            crate::tui::lenses::lenses()[hidx].key,
+            LensState::Loaded(LensData::History(vec![])),
+        );
+        // Second entry → cache is dropped, so it fetches again (fresh disk read).
+        let a2 = app.fetch_current();
+        assert!(
+            matches!(
+                a2,
+                Some(Action::Fetch {
+                    req: FetchReq::History,
+                    ..
+                })
+            ),
+            "history must always refetch even when already Loaded, got {a2:?}",
+        );
+    }
+
+    #[test]
+    fn history_fetches_without_a_domain() {
+        let mut app = App::new(None); // no target domain
+        app.lens = history_lens_idx();
+        let a = app.fetch_current();
+        assert!(
+            matches!(
+                a,
+                Some(Action::Fetch {
+                    req: FetchReq::History,
+                    ..
+                })
+            ),
+            "history should load with no domain set, got {a:?}",
+        );
+    }
+
+    #[test]
+    fn paste_appends_into_active_field() {
+        let mut app = App::new(None);
+        app.input_mode = InputMode::Field {
+            target: EditTarget::DiffB,
+            buf: "a.com ".into(),
+        };
+        app.update(Msg::Input(Event::Paste("b.com c.com".into())));
+        assert!(
+            matches!(&app.input_mode, InputMode::Field { buf, .. } if buf == "a.com b.com c.com"),
+            "paste should append to the field buffer, got {:?}",
+            app.input_mode
+        );
+    }
+
+    #[test]
+    fn paste_appends_into_command_buffer() {
+        let mut app = App::new(None);
+        app.input_mode = InputMode::Command("look".into());
+        app.update(Msg::Input(Event::Paste("up x.com".into())));
+        assert!(
+            matches!(&app.input_mode, InputMode::Command(buf) if buf == "lookup x.com"),
+            "paste should append to the command buffer, got {:?}",
+            app.input_mode
         );
     }
 }

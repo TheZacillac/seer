@@ -237,13 +237,12 @@ pub fn render(
         "reverse" => reverse::render(f, area, theme, data),
         "avail" => avail::render(f, area, theme, data),
         "tld" => tld::render(f, area, theme, data, panes),
-        "diff" => diff::render(f, area, theme, data),
         "watch" => watch::render(f, area, theme, data, focused, sel),
         "history" => history::render(f, area, theme, data, focused, sel),
         "subdomains" => subdomains::render(f, area, theme, data, focused, sel),
         // Phase 4 — streaming lenses
-        "follow" => follow::render(f, area, theme, &panes.follow),
-        "bulk" => bulk::render(f, area, theme, &panes.bulk),
+        // ("follow" and "bulk" are handled in render.rs::main_pane before the
+        //  state match, since they never reach LensState::Loaded — unreachable)
         other => placeholder::render(f, area, theme, other),
     }
 }

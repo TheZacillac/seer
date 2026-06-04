@@ -7,11 +7,19 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
-use crate::tui::action::{EditTarget, InputMode, LensState};
+use crate::tui::action::{EditTarget, Focus, InputMode, LensState};
 use crate::tui::app::{App, SPIN};
 use crate::tui::lenses::{self};
 use crate::tui::theme::Theme;
 use crate::tui::widgets::panel;
+
+/// The in-progress edit buffer for `target`, if a matching field is active.
+fn field_buf(mode: &InputMode, target: EditTarget) -> Option<&str> {
+    match mode {
+        InputMode::Field { target: t, buf } if *t == target => Some(buf.as_str()),
+        _ => None,
+    }
+}
 
 pub fn view(f: &mut Frame, app: &App, theme: &Theme) {
     let area = f.area();
@@ -54,7 +62,7 @@ fn top_bar(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         LensState::Loading => format!("{} resolving…", SPIN[app.spin]),
         _ => String::new(),
     };
-    let mode = if app.focus == crate::tui::action::Focus::Pane {
+    let mode = if app.focus == Focus::Pane {
         "‹pane›"
     } else {
         "‹nav›"
@@ -156,6 +164,42 @@ fn main_pane(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         area
     };
 
+    // Pane-driven interactive lenses render from `app.panes` state, not from a
+    // fetched `LensData`, so they never reach `LensState::Loaded`. Render them
+    // here in every state (human view only — they have no raw serialization).
+    if app.format == seer_core::output::OutputFormat::Human {
+        match lens.key {
+            "follow" => {
+                lenses::follow::render(f, content, theme, &app.panes.follow);
+                return;
+            }
+            "diff" => {
+                lenses::diff::render(
+                    f,
+                    content,
+                    theme,
+                    app.domain.as_deref(),
+                    &app.panes.diff.b,
+                    field_buf(&app.input_mode, EditTarget::DiffB),
+                    app.focus == Focus::Pane,
+                    app.state_of(app.lens),
+                );
+                return;
+            }
+            "bulk" => {
+                lenses::bulk::render(
+                    f,
+                    content,
+                    theme,
+                    &app.panes.bulk,
+                    field_buf(&app.input_mode, EditTarget::BulkDomains),
+                );
+                return;
+            }
+            _ => {}
+        }
+    }
+
     match app.state_of(app.lens) {
         LensState::Loading => {
             let line = Line::from(Span::styled(
@@ -222,7 +266,7 @@ fn main_pane(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
 
     // Human view: dispatch to the lens renderer.
     if let LensState::Loaded(data) = app.state_of(app.lens) {
-        let focused = app.focus == crate::tui::action::Focus::Pane;
+        let focused = app.focus == Focus::Pane;
         lenses::render(
             f, content, theme, lens.key, app.tab, data, focused, app.sel, &app.panes,
         );
@@ -346,6 +390,33 @@ mod tests {
     use crate::tui::app::App;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+
+    fn full_buf(app: &App, theme: &Theme) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| view(f, app, theme)).unwrap();
+        let buf = terminal.backend().buffer();
+        let area = buf.area();
+        let mut s = String::new();
+        for y in 0..area.height {
+            for x in 0..area.width {
+                s.push_str(buf[(x, y)].symbol());
+            }
+        }
+        s
+    }
+
+    #[test]
+    fn follow_lens_renders_its_pane_not_the_generic_hint() {
+        let theme = Theme::frappe();
+        let mut app = App::new(None);
+        app.lens = crate::tui::lenses::find_by_cmd_or_key("follow").unwrap();
+        let s = full_buf(&app, &theme);
+        assert!(s.contains("s start"), "Follow pane (hints) should render");
+        assert!(
+            !s.contains("press / to look up a domain"),
+            "Follow must not fall back to the generic idle hint"
+        );
+    }
 
     #[test]
     fn shell_renders_without_panicking() {
