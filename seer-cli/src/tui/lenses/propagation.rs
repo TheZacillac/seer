@@ -81,4 +81,4 @@ pub fn render(
     f.render_widget(table, inner);
 }
 
-// Verified to compile; exercised by the live smoke test.
+// (Verified to compile; runtime rendering not yet exercised on a live terminal.)

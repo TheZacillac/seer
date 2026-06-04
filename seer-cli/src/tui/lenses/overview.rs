@@ -64,4 +64,4 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
     kv::render(f, inner, theme, theme.blue, &rows);
 }
 
-// Verified to compile; exercised by the live smoke test with `example.com`.
+// Verified to compile; runtime rendering not yet exercised on a live terminal.

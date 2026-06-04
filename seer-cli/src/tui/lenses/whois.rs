@@ -47,5 +47,5 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
 }
 
 // No unit test: WhoisResponse has ~25 fields and derives no Default, so a
-// fixture is impractical. The WHOIS lens is covered by the live smoke test
-// (Task 13) and verified to compile here.
+// fixture is impractical. The WHOIS lens is verified to compile; runtime
+// rendering not yet exercised on a live terminal.

@@ -1,8 +1,9 @@
 //! Full-screen ratatui TUI for Seer. Launched via `seer tui [domain]`.
 //!
-//! NOTE: `run()` is a stub here; the real terminal lifecycle + event loop are
-//! added in a later task once App, render, data, and clipboard exist. The
-//! submodules are scaffolded (empty or stub) so the crate compiles green.
+//! `run()` sets up the terminal (raw mode + alternate screen + panic-restore
+//! hook) and drives an async `tokio::select!` loop over crossterm input, a
+//! results channel, and an animation tick. `App` (in `app`) is the pure state
+//! machine; `render` draws it; `data` dispatches lookups to `seer-core`.
 
 mod action;
 mod app;

@@ -100,7 +100,11 @@ impl App {
     /// if it is implemented. Returns None for unimplemented lenses.
     fn set_domain_and_fetch(&mut self, raw: &str) -> Option<Action> {
         let normalized = seer_core::normalize_domain(raw).unwrap_or_else(|_| raw.to_lowercase());
-        self.domain = Some(normalized.clone());
+        // A new target invalidates every cached lens.
+        if self.domain.as_deref() != Some(normalized.as_str()) {
+            self.states.clear();
+        }
+        self.domain = Some(normalized);
         self.sel = 0;
         self.fetch_current()
     }
@@ -110,10 +114,20 @@ impl App {
     fn fetch_current(&mut self) -> Option<Action> {
         let lens = self.current_lens();
         let (key, implemented) = (lens.key, lens.implemented);
-        let domain = self.domain.clone()?;
         if !implemented {
             return None;
         }
+        // Cached (or already in flight) for the current domain → re-visiting a
+        // lens is instant and never re-fetches. Errored lenses are allowed to
+        // retry. `states` is cleared whenever the target domain changes (see
+        // `set_domain_and_fetch`), so a Loaded entry here is always current.
+        if matches!(
+            self.states.get(key),
+            Some(LensState::Loaded(_) | LensState::Loading)
+        ) {
+            return None;
+        }
+        let domain = self.domain.clone()?;
         self.states.insert(key, LensState::Loading);
         Some(Action::Fetch {
             lens: self.lens,
@@ -161,6 +175,8 @@ impl App {
                 }
                 vec![]
             }
+            // Only Press events — ignoring Repeat/Release avoids double-input on
+            // Windows legacy consoles. (Held-key auto-repeat is not relied upon.)
             Msg::Input(Event::Key(key)) if key.kind == KeyEventKind::Press => self.on_key(key),
             Msg::Input(_) => vec![],
         }
@@ -361,10 +377,12 @@ impl App {
             }
             KeyAction::NextTab => {
                 self.tab = lenses::cycle_tab(self.current_lens(), self.tab, true);
+                self.sel = 0;
                 vec![]
             }
             KeyAction::PrevTab => {
                 self.tab = lenses::cycle_tab(self.current_lens(), self.tab, false);
+                self.sel = 0;
                 vec![]
             }
             KeyAction::EnterPane => {
@@ -542,5 +560,51 @@ mod tests {
             app.update(Msg::Tick);
         }
         assert!(app.toast.is_none());
+    }
+
+    #[test]
+    fn revisiting_loaded_lens_does_not_refetch() {
+        let mut app = App::new(Some("example.com".into()));
+        let _ = app.take_startup_actions();
+        // Jump to DNS (index 6) — first visit fetches.
+        let first = key(&mut app, KeyCode::Char('7'));
+        assert!(first
+            .iter()
+            .any(|a| matches!(a, Action::Fetch { lens: 6, .. })));
+        app.update(Msg::Data {
+            lens: 6,
+            domain: "example.com".into(),
+            result: Ok(LensData::Dns(vec![])),
+        });
+        // Leave and return — the second visit is served from cache, no re-fetch.
+        let _ = key(&mut app, KeyCode::Char('1'));
+        let revisit = key(&mut app, KeyCode::Char('7'));
+        assert!(
+            !revisit
+                .iter()
+                .any(|a| matches!(a, Action::Fetch { lens: 6, .. })),
+            "revisiting a Loaded lens must not re-fetch"
+        );
+    }
+
+    #[test]
+    fn changing_domain_clears_cache() {
+        let mut app = App::new(Some("example.com".into()));
+        let _ = app.take_startup_actions();
+        let _ = key(&mut app, KeyCode::Char('7')); // dns
+        app.update(Msg::Data {
+            lens: 6,
+            domain: "example.com".into(),
+            result: Ok(LensData::Dns(vec![])),
+        });
+        assert!(matches!(app.state_of(6), LensState::Loaded(_)));
+        // Look up a different domain via the command line.
+        key(&mut app, KeyCode::Char(':'));
+        for c in "acme.io".chars() {
+            key(&mut app, KeyCode::Char(c));
+        }
+        let _ = key(&mut app, KeyCode::Enter);
+        // The previous domain's cached DNS state is gone.
+        assert!(matches!(app.state_of(6), LensState::Idle));
     }
 }

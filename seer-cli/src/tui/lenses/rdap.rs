@@ -45,5 +45,5 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, tab: usize, data: &LensD
     kv::render(f, inner, theme, theme.mauve, &rows);
 }
 
-// No unit test for RDAP — `RdapResponse` is large to fixture; covered by the
-// live smoke test in Task 13. Verified to compile.
+// No unit test for RDAP — RdapResponse is large to fixture. Verified to compile;
+// runtime rendering not yet exercised on a live terminal.
