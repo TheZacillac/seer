@@ -8,7 +8,13 @@ use ratatui::Frame;
 use crate::tui::theme::Theme;
 
 /// Render rows of `(key, value)` with dotted leaders filling `area` width.
-pub fn render(f: &mut Frame, area: Rect, theme: &Theme, key_color: ratatui::style::Color, rows: &[(String, String)]) {
+pub fn render(
+    f: &mut Frame,
+    area: Rect,
+    theme: &Theme,
+    key_color: ratatui::style::Color,
+    rows: &[(String, String)],
+) {
     let width = area.width as usize;
     let lines: Vec<Line> = rows
         .iter()
@@ -17,7 +23,10 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, key_color: ratatui::styl
             let dots = width.saturating_sub(used).max(1);
             Line::from(vec![
                 Span::styled(k.clone(), Style::default().fg(key_color)),
-                Span::styled(format!(" {} ", ".".repeat(dots)), Style::default().fg(theme.surface1)),
+                Span::styled(
+                    format!(" {} ", ".".repeat(dots)),
+                    Style::default().fg(theme.surface1),
+                ),
                 Span::styled(v.clone(), Style::default().fg(theme.text)),
             ])
         })

@@ -7,7 +7,12 @@ use ratatui::widgets::{Block, BorderType, Borders};
 use crate::tui::theme::Theme;
 
 /// Build a titled, accent-bordered Block. `focused` brightens the border.
-pub fn block<'a>(theme: &Theme, title: &'a str, accent: ratatui::style::Color, focused: bool) -> Block<'a> {
+pub fn block<'a>(
+    theme: &Theme,
+    title: &'a str,
+    accent: ratatui::style::Color,
+    focused: bool,
+) -> Block<'a> {
     let border_color = if focused { accent } else { theme.surface1 };
     Block::default()
         .borders(Borders::ALL)

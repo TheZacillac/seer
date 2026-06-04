@@ -115,7 +115,10 @@ impl App {
             return None;
         }
         self.states.insert(key, LensState::Loading);
-        Some(Action::Fetch { lens: self.lens, domain })
+        Some(Action::Fetch {
+            lens: self.lens,
+            domain,
+        })
     }
 
     pub fn update(&mut self, msg: Msg) -> Vec<Action> {
@@ -130,10 +133,15 @@ impl App {
                 }
                 vec![]
             }
-            Msg::Data { lens, domain, result } => {
+            Msg::Data {
+                lens,
+                domain,
+                result,
+            } => {
                 // Ignore stale results for a domain we've since changed.
                 // When self.domain is None (no domain set yet), accept any data.
-                if self.domain.as_deref().map_or(true, |d| d == domain.as_str()) {
+                let current = self.domain.as_deref();
+                if current.is_none() || current == Some(domain.as_str()) {
                     let key = lenses::lenses()[lens].key;
                     self.states.insert(
                         key,
@@ -166,12 +174,17 @@ impl App {
             InputMode::Normal => {}
         }
         if self.help {
-            if matches!(key.code, KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q')) {
+            if matches!(
+                key.code,
+                KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q')
+            ) {
                 self.help = false;
             }
             return vec![];
         }
-        let Some(ka) = event::map(key) else { return vec![] };
+        let Some(ka) = event::map(key) else {
+            return vec![];
+        };
         self.on_normal_action(ka)
     }
 
@@ -426,7 +439,10 @@ mod tests {
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 
     fn key(app: &mut App, code: KeyCode) -> Vec<crate::tui::action::Action> {
-        app.update(Msg::Input(Event::Key(KeyEvent::new(code, KeyModifiers::NONE))))
+        app.update(Msg::Input(Event::Key(KeyEvent::new(
+            code,
+            KeyModifiers::NONE,
+        ))))
     }
 
     #[test]
@@ -441,7 +457,10 @@ mod tests {
     fn startup_with_domain_emits_fetch() {
         let mut app = App::new(Some("example.com".into()));
         let actions = app.take_startup_actions();
-        assert!(matches!(actions.as_slice(), [crate::tui::action::Action::Fetch { lens: 0, .. }]));
+        assert!(matches!(
+            actions.as_slice(),
+            [crate::tui::action::Action::Fetch { lens: 0, .. }]
+        ));
         assert_eq!(app.domain.as_deref(), Some("example.com"));
     }
 
@@ -458,7 +477,9 @@ mod tests {
         let _ = app.take_startup_actions();
         let actions = key(&mut app, KeyCode::Char('2')); // whois
         assert_eq!(app.lens, 1);
-        assert!(actions.iter().any(|a| matches!(a, crate::tui::action::Action::Fetch { lens: 1, .. })));
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, crate::tui::action::Action::Fetch { lens: 1, .. })));
     }
 
     #[test]
@@ -469,7 +490,9 @@ mod tests {
         key(&mut app, KeyCode::Char('q'));
         assert_eq!(app.input_mode, InputMode::Command("q".into()));
         let actions = key(&mut app, KeyCode::Enter);
-        assert!(actions.iter().any(|a| matches!(a, crate::tui::action::Action::Quit)));
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, crate::tui::action::Action::Quit)));
         assert!(app.should_quit);
     }
 
@@ -505,7 +528,9 @@ mod tests {
         }
         let actions = key(&mut app, KeyCode::Enter);
         assert_eq!(app.domain.as_deref(), Some("acme.io"));
-        assert!(actions.iter().any(|a| matches!(a, crate::tui::action::Action::Fetch { lens: 0, .. })));
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, crate::tui::action::Action::Fetch { lens: 0, .. })));
     }
 
     #[test]

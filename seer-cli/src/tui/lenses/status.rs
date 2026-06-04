@@ -20,18 +20,29 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
         .constraints([Constraint::Length(2), Constraint::Min(0)])
         .split(inner);
 
-    let code = s.http_status.map(|c| c.to_string()).unwrap_or_else(|| "—".into());
+    let code = s
+        .http_status
+        .map(|c| c.to_string())
+        .unwrap_or_else(|| "—".into());
     let text = s.http_status_text.clone().unwrap_or_default();
     f.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled(format!("{code} "), Style::default().fg(theme.green).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!("{code} "),
+                Style::default()
+                    .fg(theme.green)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(text, Style::default().fg(theme.subtext)),
         ])),
         chunks[0],
     );
 
     let mut rows: Vec<(String, String)> = Vec::new();
-    rows.push(("title".into(), s.title.clone().unwrap_or_else(|| "—".into())));
+    rows.push((
+        "title".into(),
+        s.title.clone().unwrap_or_else(|| "—".into()),
+    ));
     if let Some(c) = &s.certificate {
         rows.push(("ssl issuer".into(), c.issuer.clone()));
         rows.push(("ssl valid".into(), format!("{}d", c.days_until_expiry)));
@@ -40,7 +51,14 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
         rows.push(("expires in".into(), format!("{}d", e.days_until_expiry)));
     }
     if let Some(dns) = &s.dns_resolution {
-        rows.push(("resolves".into(), if dns.resolves { "yes".into() } else { "no".into() }));
+        rows.push((
+            "resolves".into(),
+            if dns.resolves {
+                "yes".into()
+            } else {
+                "no".into()
+            },
+        ));
     }
     kv::render(f, chunks[1], theme, theme.green, &rows);
 }
@@ -72,7 +90,9 @@ mod tests {
         let data = LensData::Status(Box::new(sr));
         let backend = TestBackend::new(60, 8);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| render(f, f.area(), &theme, &data)).unwrap();
+        terminal
+            .draw(|f| render(f, f.area(), &theme, &data))
+            .unwrap();
         assert!(buf_text(terminal.backend().buffer()).contains("200"));
     }
 }

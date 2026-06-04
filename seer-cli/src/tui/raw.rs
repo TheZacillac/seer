@@ -29,7 +29,9 @@ mod tests {
             name: "example.com".into(),
             record_type: RecordType::A,
             ttl: 300,
-            data: RecordData::A { address: "1.2.3.4".into() },
+            data: RecordData::A {
+                address: "1.2.3.4".into(),
+            },
         }]);
         let out = serialize(&data, OutputFormat::Json);
         assert!(out.contains("1.2.3.4"));

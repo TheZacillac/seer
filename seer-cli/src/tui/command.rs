@@ -12,7 +12,10 @@ pub enum CmdOutcome {
     SetFormat(String),
     BadFormat,
     /// Switch to a lens (by cmd alias / key), optionally looking up a target.
-    Lens { lens: String, target: Option<String> },
+    Lens {
+        lens: String,
+        target: Option<String>,
+    },
     /// `lookup <domain>` or a bare domain.
     Lookup(String),
     Unknown(String),
@@ -87,29 +90,53 @@ mod tests {
 
     #[test]
     fn parses_set_output() {
-        assert_eq!(parse("set output json"), CmdOutcome::SetFormat("json".into()));
-        assert_eq!(parse("set format yaml"), CmdOutcome::SetFormat("yaml".into()));
+        assert_eq!(
+            parse("set output json"),
+            CmdOutcome::SetFormat("json".into())
+        );
+        assert_eq!(
+            parse("set format yaml"),
+            CmdOutcome::SetFormat("yaml".into())
+        );
         assert_eq!(parse("set output bogus"), CmdOutcome::BadFormat);
     }
 
     #[test]
     fn parses_lens_with_and_without_target() {
-        assert_eq!(parse("whois"), CmdOutcome::Lens { lens: "whois".into(), target: None });
+        assert_eq!(
+            parse("whois"),
+            CmdOutcome::Lens {
+                lens: "whois".into(),
+                target: None
+            }
+        );
         assert_eq!(
             parse("dig example.com"),
-            CmdOutcome::Lens { lens: "dig".into(), target: Some("example.com".into()) }
+            CmdOutcome::Lens {
+                lens: "dig".into(),
+                target: Some("example.com".into())
+            }
         );
     }
 
     #[test]
     fn parses_bare_domain_and_lookup() {
-        assert_eq!(parse("example.com"), CmdOutcome::Lookup("example.com".into()));
-        assert_eq!(parse("lookup acme.io"), CmdOutcome::Lookup("acme.io".into()));
+        assert_eq!(
+            parse("example.com"),
+            CmdOutcome::Lookup("example.com".into())
+        );
+        assert_eq!(
+            parse("lookup acme.io"),
+            CmdOutcome::Lookup("acme.io".into())
+        );
     }
 
     #[test]
     fn empty_is_noop_unknown_is_error() {
         assert_eq!(parse("   "), CmdOutcome::Noop);
-        assert_eq!(parse("frobnicate"), CmdOutcome::Unknown("frobnicate".into()));
+        assert_eq!(
+            parse("frobnicate"),
+            CmdOutcome::Unknown("frobnicate".into())
+        );
     }
 }

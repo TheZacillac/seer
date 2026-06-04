@@ -3,6 +3,10 @@
 
 use ratatui::style::Color;
 
+/// Full Catppuccin Frappé palette. A few accent fields are not yet read by the
+/// seven wired lenses; they are consumed by the lenses added in follow-up
+/// passes (e.g. sapphire for Reverse DNS, pink for Subdomains).
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub struct Theme {
     pub crust: Color,

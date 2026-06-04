@@ -9,7 +9,16 @@ use crate::tui::widgets::{kv, panel};
 
 pub fn render(f: &mut Frame, area: Rect, theme: &Theme, tab: usize, data: &LensData) {
     if tab != 0 {
-        placeholder::render(f, area, theme, if tab == 1 { "RDAP · IP" } else { "RDAP · ASN" });
+        placeholder::render(
+            f,
+            area,
+            theme,
+            if tab == 1 {
+                "RDAP · IP"
+            } else {
+                "RDAP · ASN"
+            },
+        );
         return;
     }
     let LensData::Rdap(r) = data else { return };

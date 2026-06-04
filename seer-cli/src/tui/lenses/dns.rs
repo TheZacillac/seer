@@ -9,7 +9,15 @@ use crate::tui::lenses::placeholder;
 use crate::tui::theme::Theme;
 use crate::tui::widgets::panel;
 
-pub fn render(f: &mut Frame, area: Rect, theme: &Theme, tab: usize, data: &LensData, focused: bool, sel: usize) {
+pub fn render(
+    f: &mut Frame,
+    area: Rect,
+    theme: &Theme,
+    tab: usize,
+    data: &LensData,
+    focused: bool,
+    sel: usize,
+) {
     if tab != 0 {
         let label = if tab == 1 { "DNSSEC" } else { "Compare" };
         placeholder::render(f, area, theme, label);
@@ -20,8 +28,8 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, tab: usize, data: &LensD
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let header = Row::new(["TYPE", "NAME", "DATA", "TTL"])
-        .style(Style::default().fg(theme.overlay0));
+    let header =
+        Row::new(["TYPE", "NAME", "DATA", "TTL"]).style(Style::default().fg(theme.overlay0));
     let rows = records.iter().enumerate().map(|(i, r)| {
         let style = if focused && i == sel {
             Style::default().fg(theme.text).bg(theme.surface0)
@@ -38,7 +46,12 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, tab: usize, data: &LensD
     });
     let table = Table::new(
         rows,
-        [Constraint::Length(7), Constraint::Percentage(35), Constraint::Percentage(45), Constraint::Length(8)],
+        [
+            Constraint::Length(7),
+            Constraint::Percentage(35),
+            Constraint::Percentage(45),
+            Constraint::Length(8),
+        ],
     )
     .header(header)
     .column_spacing(1)
@@ -72,11 +85,15 @@ mod tests {
             name: "example.com".into(),
             record_type: RecordType::A,
             ttl: 300,
-            data: RecordData::A { address: "93.184.215.14".into() },
+            data: RecordData::A {
+                address: "93.184.215.14".into(),
+            },
         }]);
         let backend = TestBackend::new(70, 8);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| render(f, f.area(), &theme, 0, &data, false, 0)).unwrap();
+        terminal
+            .draw(|f| render(f, f.area(), &theme, 0, &data, false, 0))
+            .unwrap();
         let text = buf_text(terminal.backend().buffer());
         assert!(text.contains("93.184.215.14"));
         assert!(text.contains("example.com"));

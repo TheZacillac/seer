@@ -20,7 +20,10 @@ pub fn line<'a>(ratio: f64, width: u16, color: Color, label: Option<&'a str>) ->
     ];
     if let Some(l) = label {
         spans.push(Span::raw("  "));
-        spans.push(Span::styled(l.to_string(), Style::default().fg(Color::Rgb(0xb5, 0xbf, 0xe2))));
+        spans.push(Span::styled(
+            l.to_string(),
+            Style::default().fg(Color::Rgb(0xb5, 0xbf, 0xe2)),
+        ));
     }
     Line::from(spans)
 }

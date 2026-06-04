@@ -112,7 +112,11 @@ fn handle_action(action: Action, tx: &tokio::sync::mpsc::UnboundedSender<Msg>) {
             let tx = tx.clone();
             tokio::spawn(async move {
                 let result = data::fetch(lens, &domain).await;
-                let _ = tx.send(Msg::Data { lens, domain, result });
+                let _ = tx.send(Msg::Data {
+                    lens,
+                    domain,
+                    result,
+                });
             });
         }
         Action::Copy { text, label } => {

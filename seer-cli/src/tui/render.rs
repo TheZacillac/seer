@@ -17,7 +17,11 @@ pub fn view(f: &mut Frame, app: &App, theme: &Theme) {
     let area = f.area();
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(0), Constraint::Length(1)])
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(0),
+            Constraint::Length(1),
+        ])
         .split(area);
 
     top_bar(f, rows[0], app, theme);
@@ -46,9 +50,18 @@ fn top_bar(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         LensState::Loading => format!("{} resolving…", SPIN[app.spin]),
         _ => String::new(),
     };
-    let mode = if app.focus == crate::tui::action::Focus::Pane { "‹pane›" } else { "‹nav›" };
+    let mode = if app.focus == crate::tui::action::Focus::Pane {
+        "‹pane›"
+    } else {
+        "‹nav›"
+    };
     let mut spans = vec![
-        Span::styled("🔮 seer", Style::default().fg(theme.mauve).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "🔮 seer",
+            Style::default()
+                .fg(theme.mauve)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled("  │  ", Style::default().fg(theme.surface1)),
         Span::styled("target ", Style::default().fg(theme.overlay)),
         Span::styled(target, Style::default().fg(theme.text)),
@@ -60,7 +73,10 @@ fn top_bar(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             Style::default().fg(theme.green),
         ));
     }
-    spans.push(Span::styled(format!("  {mode}  "), Style::default().fg(theme.lavender)));
+    spans.push(Span::styled(
+        format!("  {mode}  "),
+        Style::default().fg(theme.lavender),
+    ));
     spans.push(Span::styled(
         format!("│ v{}", env!("CARGO_PKG_VERSION")),
         Style::default().fg(theme.overlay0),
@@ -85,11 +101,17 @@ fn nav(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         if new_group {
             lines.push(Line::from(Span::styled(
                 l.group,
-                Style::default().fg(theme.overlay0).add_modifier(Modifier::DIM),
+                Style::default()
+                    .fg(theme.overlay0)
+                    .add_modifier(Modifier::DIM),
             )));
         }
         let active = i == app.lens;
-        let num = if i < 9 { (b'1' + i as u8) as char } else { '·' };
+        let num = if i < 9 {
+            (b'1' + i as u8) as char
+        } else {
+            '·'
+        };
         let label_color = if !l.implemented {
             theme.overlay0
         } else if active {
@@ -100,10 +122,16 @@ fn nav(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         let glyph_color = if active { theme.blue } else { theme.lavender };
         let prefix = if active { "▸ " } else { "  " };
         lines.push(Line::from(vec![
-            Span::styled(format!("{prefix}{num} "), Style::default().fg(if active { theme.blue } else { theme.overlay0 })),
+            Span::styled(
+                format!("{prefix}{num} "),
+                Style::default().fg(if active { theme.blue } else { theme.overlay0 }),
+            ),
             Span::styled(format!("{} ", l.glyph), Style::default().fg(glyph_color)),
             Span::styled(l.label, Style::default().fg(label_color)),
-            Span::styled(if l.tabs.is_empty() { "" } else { " ⋯" }, Style::default().fg(theme.overlay0)),
+            Span::styled(
+                if l.tabs.is_empty() { "" } else { " ⋯" },
+                Style::default().fg(theme.overlay0),
+            ),
         ]));
     }
     f.render_widget(Paragraph::new(lines), inner);
@@ -127,7 +155,11 @@ fn main_pane(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     match app.state_of(app.lens) {
         LensState::Loading => {
             let line = Line::from(Span::styled(
-                format!("{} querying {}…", SPIN[app.spin], app.domain.as_deref().unwrap_or("")),
+                format!(
+                    "{} querying {}…",
+                    SPIN[app.spin],
+                    app.domain.as_deref().unwrap_or("")
+                ),
                 Style::default().fg(theme.overlay),
             ));
             f.render_widget(Paragraph::new(line), content);
@@ -138,7 +170,10 @@ fn main_pane(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             let inner = block.inner(content);
             f.render_widget(block, content);
             f.render_widget(
-                Paragraph::new(Line::from(Span::styled(e.clone(), Style::default().fg(theme.red)))),
+                Paragraph::new(Line::from(Span::styled(
+                    e.clone(),
+                    Style::default().fg(theme.red),
+                ))),
                 inner,
             );
             return;
@@ -166,7 +201,10 @@ fn main_pane(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             let block = panel::block(theme, &raw_title, theme.green, false);
             let inner = block.inner(content);
             f.render_widget(block, content);
-            f.render_widget(Paragraph::new(text).style(Style::default().fg(theme.subtext)), inner);
+            f.render_widget(
+                Paragraph::new(text).style(Style::default().fg(theme.subtext)),
+                inner,
+            );
         }
         return;
     }
@@ -174,7 +212,7 @@ fn main_pane(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     // Human view: dispatch to the lens renderer.
     if let LensState::Loaded(data) = app.state_of(app.lens) {
         let focused = app.focus == crate::tui::action::Focus::Pane;
-        crate::tui::lenses::render(f, content, theme, lens.key, app.tab, data, focused, app.sel);
+        lenses::render(f, content, theme, lens.key, app.tab, data, focused, app.sel);
     }
 }
 
@@ -189,17 +227,28 @@ fn sub_tabs(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         ));
         spans.push(Span::raw(" "));
     }
-    spans.push(Span::styled("[ ] switch tab", Style::default().fg(theme.overlay0)));
+    spans.push(Span::styled(
+        "[ ] switch tab",
+        Style::default().fg(theme.overlay0),
+    ));
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn status_or_command(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     if let InputMode::Command(buf) = &app.input_mode {
         let line = Line::from(vec![
-            Span::styled("seer> ", Style::default().fg(theme.mauve).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "seer> ",
+                Style::default()
+                    .fg(theme.mauve)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(format!("{buf}█"), Style::default().fg(theme.text)),
         ]);
-        f.render_widget(Paragraph::new(line).style(Style::default().bg(theme.mantle)), area);
+        f.render_widget(
+            Paragraph::new(line).style(Style::default().bg(theme.mantle)),
+            area,
+        );
         return;
     }
     let lens = app.current_lens();
@@ -208,14 +257,35 @@ fn status_or_command(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         Style::default().fg(theme.lavender),
     )];
     if let Some(t) = &app.toast {
-        spans.push(Span::styled(format!("● {}", t.msg), Style::default().fg(theme.tone(&t.tone))));
+        spans.push(Span::styled(
+            format!("● {}", t.msg),
+            Style::default().fg(theme.tone(&t.tone)),
+        ));
     }
     spans.push(Span::raw("   "));
-    for (k, t) in [("j/k", "move"), ("tab", "focus"), ("[ ]", "tab"), ("r", "raw"), ("y", "copy"), ("/", "lookup"), (":", "cmd"), ("?", "help")] {
-        spans.push(Span::styled(format!(" {k}"), Style::default().fg(theme.crust).bg(theme.overlay)));
-        spans.push(Span::styled(format!(" {t} "), Style::default().fg(theme.overlay0)));
+    for (k, t) in [
+        ("j/k", "move"),
+        ("tab", "focus"),
+        ("[ ]", "tab"),
+        ("r", "raw"),
+        ("y", "copy"),
+        ("/", "lookup"),
+        (":", "cmd"),
+        ("?", "help"),
+    ] {
+        spans.push(Span::styled(
+            format!(" {k}"),
+            Style::default().fg(theme.crust).bg(theme.overlay),
+        ));
+        spans.push(Span::styled(
+            format!(" {t} "),
+            Style::default().fg(theme.overlay0),
+        ));
     }
-    f.render_widget(Paragraph::new(Line::from(spans)).style(Style::default().bg(theme.mantle)), area);
+    f.render_widget(
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(theme.mantle)),
+        area,
+    );
 }
 
 fn help_overlay(f: &mut Frame, area: Rect, theme: &Theme) {

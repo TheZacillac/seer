@@ -17,10 +17,28 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
     let rows: Vec<(String, String)> = vec![
         ("domain".into(), w.domain.clone()),
         ("registrar".into(), w.registrar.clone().unwrap_or_else(dash)),
-        ("organization".into(), w.organization.clone().unwrap_or_else(dash)),
-        ("created".into(), w.creation_date.map(|d| d.date_naive().to_string()).unwrap_or_else(dash)),
-        ("updated".into(), w.updated_date.map(|d| d.date_naive().to_string()).unwrap_or_else(dash)),
-        ("expires".into(), w.expiration_date.map(|d| d.date_naive().to_string()).unwrap_or_else(dash)),
+        (
+            "organization".into(),
+            w.organization.clone().unwrap_or_else(dash),
+        ),
+        (
+            "created".into(),
+            w.creation_date
+                .map(|d| d.date_naive().to_string())
+                .unwrap_or_else(dash),
+        ),
+        (
+            "updated".into(),
+            w.updated_date
+                .map(|d| d.date_naive().to_string())
+                .unwrap_or_else(dash),
+        ),
+        (
+            "expires".into(),
+            w.expiration_date
+                .map(|d| d.date_naive().to_string())
+                .unwrap_or_else(dash),
+        ),
         ("dnssec".into(), w.dnssec.clone().unwrap_or_else(dash)),
         ("nameservers".into(), w.nameservers.join("  ")),
         ("status".into(), w.status.join(", ")),

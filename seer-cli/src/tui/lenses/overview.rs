@@ -10,7 +10,9 @@ use crate::tui::theme::Theme;
 use crate::tui::widgets::{kv, panel};
 
 pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
-    let LensData::Overview(result) = data else { return };
+    let LensData::Overview(result) = data else {
+        return;
+    };
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -31,7 +33,10 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
                 Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
             ),
             Span::raw("  "),
-            Span::styled(source.0, Style::default().fg(source.1).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                source.0,
+                Style::default().fg(source.1).add_modifier(Modifier::BOLD),
+            ),
         ])),
         chunks[0],
     );
@@ -44,8 +49,16 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
     let (expiry, registrar) = result.expiration_info();
     let rows: Vec<(String, String)> = vec![
         ("registrar".into(), registrar.unwrap_or_else(dash)),
-        ("organization".into(), result.organization().unwrap_or_else(dash)),
-        ("expires".into(), expiry.map(|d| d.date_naive().to_string()).unwrap_or_else(dash)),
+        (
+            "organization".into(),
+            result.organization().unwrap_or_else(dash),
+        ),
+        (
+            "expires".into(),
+            expiry
+                .map(|d| d.date_naive().to_string())
+                .unwrap_or_else(dash),
+        ),
         ("source".into(), source.0.to_string()),
     ];
     kv::render(f, inner, theme, theme.blue, &rows);

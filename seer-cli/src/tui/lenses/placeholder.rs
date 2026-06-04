@@ -15,7 +15,9 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, label: &str) {
     let lines = vec![
         Line::from(Span::styled(
             "planned — not yet wired",
-            Style::default().fg(theme.overlay).add_modifier(Modifier::ITALIC),
+            Style::default()
+                .fg(theme.overlay)
+                .add_modifier(Modifier::ITALIC),
         )),
         Line::raw(""),
         Line::from(Span::styled(
