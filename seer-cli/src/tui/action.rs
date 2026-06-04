@@ -1,6 +1,7 @@
-//! Intent (`Action`) and message (`Msg`) types plus per-lens state.
+//! Intent (`Action`) and message (`Msg`) types plus per-lens data/state.
 
 use crossterm::event::Event;
+use seer_core::RecordType;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Focus {
@@ -8,7 +9,6 @@ pub enum Focus {
     Nav,
     Pane,
 }
-
 impl Focus {
     pub fn toggled(self) -> Self {
         match self {
@@ -18,26 +18,122 @@ impl Focus {
     }
 }
 
-/// What the keyboard is currently bound to.
+/// Which text field an `InputMode::Field` is editing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // Phase 3 variants wired up in pane components
+pub enum EditTarget {
+    Target,
+    DiffB,
+    FollowInterval,
+    FollowCount,
+    BulkPath,
+    WatchAdd,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum InputMode {
     #[default]
     Normal,
-    /// `:` command line, holding the in-progress buffer.
     Command(String),
-    /// Editing the top-bar target field, holding the in-progress buffer.
-    EditDomain(String),
+    Field {
+        target: EditTarget,
+        buf: String,
+    },
 }
 
-/// Side-effecting intents returned by `App::update` for the loop to perform.
+/// A parameterized lookup request. The single source of truth for what
+/// `data::fetch` runs and which lens key owns the result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // Phase 2/3 variants wired up progressively
+pub enum FetchReq {
+    Overview(String),
+    Whois(String),
+    RdapDomain(String),
+    RdapIp(String),
+    RdapAsn(u32),
+    Dns {
+        domain: String,
+        record_type: RecordType,
+        nameserver: Option<String>,
+    },
+    Dnssec(String),
+    Compare {
+        domain: String,
+        record_type: RecordType,
+        a: String,
+        b: String,
+    },
+    Ssl(String),
+    Status(String),
+    Prop(String),
+    Reverse(String),
+    Avail(String),
+    Tld(String),
+    Diff {
+        a: String,
+        b: String,
+    },
+    Watch,
+    History,
+}
+
+impl FetchReq {
+    /// The registry lens key this request's result belongs to.
+    pub fn lens_key(&self) -> &'static str {
+        match self {
+            FetchReq::Overview(_) => "overview",
+            FetchReq::Whois(_) => "whois",
+            FetchReq::RdapDomain(_) | FetchReq::RdapIp(_) | FetchReq::RdapAsn(_) => "rdap",
+            FetchReq::Dns { .. } => "dns",
+            FetchReq::Dnssec(_) | FetchReq::Compare { .. } => "dns",
+            FetchReq::Ssl(_) => "ssl",
+            FetchReq::Status(_) => "status",
+            FetchReq::Prop(_) => "propagation",
+            FetchReq::Reverse(_) => "reverse",
+            FetchReq::Avail(_) => "avail",
+            FetchReq::Tld(_) => "tld",
+            FetchReq::Diff { .. } => "diff",
+            FetchReq::Watch => "watch",
+            FetchReq::History => "history",
+        }
+    }
+}
+
+/// Parameters for a streaming Follow run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FollowParams {
+    pub domain: String,
+    pub iterations: usize,
+    pub interval_secs: u64,
+}
+
+/// Parameters for a streaming Bulk run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BulkParams {
+    pub op: String, // "lookup" | "status" | "dig" | "avail" | "info"
+    pub domains: Vec<String>,
+}
+
+/// Side-effecting intents returned by `App`/components for the loop to perform.
 #[derive(Debug, Clone)]
 pub enum Action {
     Quit,
-    Fetch { lens: usize, domain: String },
-    Copy { text: String, label: String },
+    Fetch(FetchReq),
+    Copy {
+        text: String,
+        label: String,
+    },
+    #[allow(dead_code)] // wired in Phase 4
+    StartFollow(FollowParams),
+    #[allow(dead_code)] // wired in Phase 4
+    StartBulk(BulkParams),
+    #[allow(dead_code)] // wired in Phase 4
+    WriteCsv {
+        path: String,
+        contents: String,
+    },
 }
 
-/// Live data for a wired lens. Boxed to keep the enum small.
 #[derive(Debug, Clone)]
 pub enum LensData {
     Overview(Box<seer_core::LookupResult>),
@@ -47,6 +143,15 @@ pub enum LensData {
     Ssl(Box<seer_core::SslReport>),
     Status(Box<seer_core::StatusResponse>),
     Prop(Box<seer_core::PropagationResult>),
+    Reverse(Vec<seer_core::DnsRecord>),
+    Avail(Box<seer_core::AvailabilityResult>),
+    Tld(Box<seer_core::TldInfo>),
+    Dnssec(Box<seer_core::DnssecReport>),
+    Compare(Box<seer_core::DnsComparison>),
+    Diff(Box<seer_core::DomainDiff>),
+    Watch(Box<seer_core::WatchReport>),
+    #[allow(dead_code)] // rendered in Phase 2 (Task 13)
+    History(Vec<seer_core::HistoryEntry>),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -58,20 +163,26 @@ pub enum LensState {
     Error(String),
 }
 
-/// Messages that drive `App::update`.
 #[derive(Debug)]
 pub enum Msg {
     Input(Event),
     Tick,
     Data {
-        lens: usize,
-        domain: String,
+        lens: String,
         result: Result<LensData, String>,
     },
     CopyResult {
         ok: bool,
         label: String,
     },
+    #[allow(dead_code)] // wired in Phase 4
+    FollowStep(Box<seer_core::dns::FollowIteration>),
+    #[allow(dead_code)] // wired in Phase 4
+    FollowDone,
+    #[allow(dead_code)] // wired in Phase 4
+    BulkStep(Box<seer_core::bulk::BulkResult>),
+    #[allow(dead_code)] // wired in Phase 4
+    BulkDone,
 }
 
 #[cfg(test)]
@@ -79,13 +190,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn input_mode_defaults_to_normal() {
-        assert_eq!(InputMode::Normal, InputMode::default());
+    fn fetch_req_lens_keys() {
+        assert_eq!(FetchReq::RdapIp("1.2.3.4".into()).lens_key(), "rdap");
+        assert_eq!(FetchReq::Dnssec("x".into()).lens_key(), "dns");
+        assert_eq!(
+            FetchReq::Compare {
+                domain: "x".into(),
+                record_type: RecordType::A,
+                a: "8.8.8.8".into(),
+                b: "1.1.1.1".into()
+            }
+            .lens_key(),
+            "dns"
+        );
+        assert_eq!(FetchReq::Tld(".com".into()).lens_key(), "tld");
     }
 
     #[test]
-    fn focus_toggles() {
+    fn input_mode_default_and_focus() {
+        assert_eq!(InputMode::Normal, InputMode::default());
         assert_eq!(Focus::Nav.toggled(), Focus::Pane);
-        assert_eq!(Focus::Pane.toggled(), Focus::Nav);
     }
 }
