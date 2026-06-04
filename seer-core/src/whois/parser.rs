@@ -529,14 +529,21 @@ fn extract_status_top_level(raw: &str) -> Vec<String> {
         // Match "Domain Status:", "Status:", "status:", "state:" case-insensitively
         // via a prefix check on the lowercased line.
         let lower = trimmed.to_lowercase();
-        let value_opt = if let Some(rest) = lower.strip_prefix("domain status:") {
-            Some(&trimmed[trimmed.len() - rest.len()..])
-        } else if let Some(rest) = lower.strip_prefix("status:") {
-            Some(&trimmed[trimmed.len() - rest.len()..])
+        // Slice the ORIGINAL line by the ASCII prefix length. The prefixes are
+        // pure ASCII, so their byte length is identical in `trimmed` and
+        // `lower`; deriving the slice point from `lower`'s suffix length is
+        // unsound because `to_lowercase()` is not length-preserving for all
+        // Unicode (e.g. Turkish İ → i̇ grows 2→3 bytes), which could make the
+        // lowercased suffix longer than the whole original line and underflow
+        // `trimmed.len() - rest.len()` into an out-of-bounds slice panic.
+        let value_opt = if lower.starts_with("domain status:") {
+            Some(&trimmed["domain status:".len()..])
+        } else if lower.starts_with("status:") {
+            Some(&trimmed["status:".len()..])
+        } else if lower.starts_with("state:") {
+            Some(&trimmed["state:".len()..])
         } else {
-            lower
-                .strip_prefix("state:")
-                .map(|rest| &trimmed[trimmed.len() - rest.len()..])
+            None
         };
 
         if let Some(rest) = value_opt {
@@ -614,6 +621,22 @@ Creation Date: 2020-01-01T00:00:00Z
 Name Server: ns1.example.com
 ";
         assert!(!make_response(raw).is_available());
+    }
+
+    #[test]
+    fn extract_status_does_not_panic_on_unicode_lowercasing_expansion() {
+        // Turkish dotted capital İ (2 bytes) lowercases to i̇ (3 bytes), so a
+        // status VALUE full of them makes the lowercased line longer than the
+        // original. The old code sliced the original by a length derived from
+        // the lowercased copy (`trimmed.len() - rest.len()`), which underflowed
+        // and panicked out-of-bounds. `raw` is attacker-controlled (a hostile
+        // WHOIS server), so this was a remotely-triggerable panic / DoS.
+        let raw = format!("Domain Status: {}\n", "İ".repeat(40));
+        let r = make_response(&raw); // must not panic
+        assert!(
+            !r.status.is_empty(),
+            "status value should still be extracted"
+        );
     }
 
     #[test]
