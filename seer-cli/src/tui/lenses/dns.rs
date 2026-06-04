@@ -1,11 +1,11 @@
-//! DNS Records lens (Records tab). DNSSEC/Compare tabs are placeholders.
+//! DNS Records lens — Records tab (tab 0), DNSSEC tab (tab 1), Compare tab (tab 2, placeholder).
 use ratatui::layout::{Constraint, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::widgets::{Row, Table};
 use ratatui::Frame;
 
 use crate::tui::action::LensData;
-use crate::tui::lenses::placeholder;
+use crate::tui::lenses::{dnssec, placeholder};
 use crate::tui::theme::Theme;
 use crate::tui::widgets::panel;
 
@@ -18,9 +18,12 @@ pub fn render(
     focused: bool,
     sel: usize,
 ) {
-    if tab != 0 {
-        let label = if tab == 1 { "DNSSEC" } else { "Compare" };
-        placeholder::render(f, area, theme, label);
+    if tab == 1 {
+        dnssec::render(f, area, theme, data);
+        return;
+    }
+    if tab == 2 {
+        placeholder::render(f, area, theme, "Compare");
         return;
     }
     let LensData::Dns(records) = data else { return };
