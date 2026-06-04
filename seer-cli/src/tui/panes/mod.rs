@@ -1,9 +1,25 @@
-//! Interactive lens components (stub — completed in Task 8+).
+//! Interactive lens components: per-lens state + key routing.
+pub mod compare;
+pub mod dns;
+pub mod tld;
+
+pub use compare::CompareState;
+pub use dns::DnsState;
+pub use tld::TldState;
+
 use crossterm::event::KeyEvent;
 
 use crate::tui::action::{Action, EditTarget, FetchReq};
 
-#[allow(dead_code)] // fleshed out in Phase 2/3
+#[allow(dead_code)] // fleshed out in Phase 4
+#[derive(Debug)]
+pub enum PaneOutcome {
+    None,
+    Fetch(FetchReq),
+    Action(Action),
+    EditField(EditTarget),
+}
+
 #[derive(Default)]
 pub struct Panes {
     pub tld: TldState,
@@ -14,24 +30,28 @@ pub struct Panes {
     pub bulk: BulkState,
 }
 
-#[allow(dead_code)] // fleshed out in Phase 2/3
-pub enum PaneOutcome {
-    None,
-    Fetch(FetchReq),
-    Action(Action),
-    EditField(EditTarget),
-}
-
 impl Panes {
+    /// Route a key to the right pane component. Returns `Some(outcome)` if the
+    /// component consumed the key, `None` otherwise (App handles it normally).
+    /// CRITICAL: never swallow `Esc` — components must return `None` for it.
     pub fn handle_key(
         &mut self,
-        _lens_key: &str,
-        _tab: usize,
-        _key: KeyEvent,
-        _domain: Option<&str>,
+        lens_key: &str,
+        tab: usize,
+        key: KeyEvent,
+        domain: Option<&str>,
     ) -> Option<PaneOutcome> {
-        None
+        match lens_key {
+            "tld" => self.tld.handle_key(key),
+            "dns" => match tab {
+                0 => self.dns.handle_key(key, domain),
+                2 => self.compare.handle_key(key, domain),
+                _ => None,
+            },
+            _ => None,
+        }
     }
+
     pub fn apply_field(
         &mut self,
         _t: EditTarget,
@@ -40,39 +60,10 @@ impl Panes {
     ) -> Vec<Action> {
         vec![]
     }
+
     pub fn field_value(&self, _t: EditTarget) -> String {
         String::new()
     }
-}
-
-#[allow(dead_code)] // fleshed out in Phase 2/3
-#[derive(Default)]
-pub struct TldState {
-    pub idx: usize,
-}
-impl TldState {
-    pub fn current(&self) -> String {
-        ".com".to_string()
-    }
-}
-
-#[allow(dead_code)] // fleshed out in Phase 2/3
-#[derive(Default)]
-pub struct DnsState {
-    pub ns_idx: usize,
-    pub resolved_ip: Option<String>,
-}
-impl DnsState {
-    pub fn nameserver(&self) -> Option<String> {
-        None
-    }
-}
-
-#[allow(dead_code)] // fleshed out in Phase 2/3
-#[derive(Default)]
-pub struct CompareState {
-    pub a: String,
-    pub b: String,
 }
 
 #[allow(dead_code)] // fleshed out in Phase 2/3
@@ -81,7 +72,7 @@ pub struct DiffState {
     pub b: String,
 }
 
-#[allow(dead_code)] // fleshed out in Phase 2/3
+#[allow(dead_code)] // fleshed out in Phase 4
 #[derive(Default)]
 pub struct FollowState {
     pub running: bool,
@@ -93,7 +84,7 @@ impl FollowState {
     }
 }
 
-#[allow(dead_code)] // fleshed out in Phase 2/3
+#[allow(dead_code)] // fleshed out in Phase 4
 #[derive(Default)]
 pub struct BulkState {
     pub running: bool,

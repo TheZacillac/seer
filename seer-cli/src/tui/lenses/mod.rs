@@ -2,6 +2,7 @@
 //! SECURITY / POWER.
 
 pub mod avail;
+pub mod compare;
 pub mod diff;
 pub mod dns;
 pub mod dnssec;
@@ -226,7 +227,7 @@ pub fn render(
         "overview" => overview::render(f, area, theme, data),
         "whois" => whois::render(f, area, theme, data),
         "rdap" => rdap::render(f, area, theme, tab, data),
-        "dns" => dns::render(f, area, theme, tab, data, focused, sel),
+        "dns" => dns::render(f, area, theme, tab, data, focused, sel, panes),
         "ssl" => ssl::render(f, area, theme, data),
         "status" => status::render(f, area, theme, data),
         "propagation" => propagation::render(f, area, theme, data, focused, sel),
