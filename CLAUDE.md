@@ -149,7 +149,7 @@ seer-cli/src/
 └── tui/                # Full-screen ratatui TUI (`seer tui`)
     ├── mod.rs          # run(): terminal lifecycle + async select! loop
     ├── app.rs          # pure App state + update() (no ratatui imports)
-    ├── action.rs       # Action / Msg / LensData / LensState types
+    ├── action.rs       # FetchReq / Action / Msg / LensData / InputMode types
     ├── command.rs      # `:` command-line parser
     ├── event.rs        # normal-mode key → action mapping
     ├── data.rs         # async seer-core dispatch (the only core-coupled module)
@@ -158,7 +158,8 @@ seer-cli/src/
     ├── clipboard.rs    # OSC52 terminal clipboard copy
     ├── render.rs       # frame rendering (shell + lens dispatch)
     ├── widgets/        # panel, kv, gauge, dot, chips
-    └── lenses/         # registry + 7 wired lenses + placeholder pane
+    ├── panes/          # interactive lens components (tld/dns/compare/diff/follow/bulk): state + handle_key
+    └── lenses/         # registry + all 16 lens renderers
 ```
 
 **Key Points:**
@@ -168,9 +169,13 @@ seer-cli/src/
 - REPL history saved to `~/.seer_history`
 - `seer tui [domain]` launches a full-screen ratatui TUI (additive — the REPL
   and all subcommands are unchanged). Architecture: async `tokio::select!` loop,
-  pure `App` state, lookups dispatched to `seer-core` over a channel. 7 core
-  lenses wired (Overview, WHOIS, RDAP, DNS, SSL, Status, Propagation); the other
-  9 nav entries render a "planned" placeholder.
+  pure `App` state (no I/O — file I/O runs in `mod.rs` via `spawn_blocking`),
+  parameterized `FetchReq` lookups dispatched to `seer-core` over a channel, and
+  interactive lenses as `panes/` components (`handle_key -> PaneOutcome`). All 16
+  lenses are wired with live data + full in-pane inputs, including the streaming
+  Follow (live monitor) and Bulk (concurrent + CSV export) lenses. A per-lens /
+  per-stream generation guard drops stale async results (on domain/tab change or
+  run restart).
 
 ### seer-py/ (Python Bindings)
 
