@@ -156,6 +156,14 @@ fn main_pane(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         area
     };
 
+    // Pane-driven interactive lenses render from `app.panes` state, not from a
+    // fetched `LensData`, so they never reach `LensState::Loaded`. Render them
+    // here in every state (human view only — they have no raw serialization).
+    if app.format == seer_core::output::OutputFormat::Human && lens.key == "follow" {
+        lenses::follow::render(f, content, theme, &app.panes.follow);
+        return;
+    }
+
     match app.state_of(app.lens) {
         LensState::Loading => {
             let line = Line::from(Span::styled(
@@ -346,6 +354,33 @@ mod tests {
     use crate::tui::app::App;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+
+    fn full_buf(app: &App, theme: &Theme) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| view(f, app, theme)).unwrap();
+        let buf = terminal.backend().buffer();
+        let area = buf.area();
+        let mut s = String::new();
+        for y in 0..area.height {
+            for x in 0..area.width {
+                s.push_str(buf[(x, y)].symbol());
+            }
+        }
+        s
+    }
+
+    #[test]
+    fn follow_lens_renders_its_pane_not_the_generic_hint() {
+        let theme = Theme::frappe();
+        let mut app = App::new(None);
+        app.lens = crate::tui::lenses::find_by_cmd_or_key("follow").unwrap();
+        let s = full_buf(&app, &theme);
+        assert!(s.contains("s start"), "Follow pane (hints) should render");
+        assert!(
+            !s.contains("press / to look up a domain"),
+            "Follow must not fall back to the generic idle hint"
+        );
+    }
 
     #[test]
     fn shell_renders_without_panicking() {
