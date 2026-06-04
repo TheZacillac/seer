@@ -320,6 +320,16 @@ impl App {
             // Only Press events — ignoring Repeat/Release avoids double-input on
             // Windows legacy consoles. (Held-key auto-repeat is not relied upon.)
             Msg::Input(Event::Key(key)) if key.kind == KeyEventKind::Press => self.on_key(key),
+            Msg::Input(Event::Paste(s)) => {
+                // Bracketed paste lands here as one string. Route it into whatever
+                // text buffer is active so multi-line domain lists paste cleanly.
+                match &mut self.input_mode {
+                    InputMode::Field { buf, .. } => buf.push_str(&s),
+                    InputMode::Command(buf) => buf.push_str(&s),
+                    InputMode::Normal => {}
+                }
+                vec![]
+            }
             Msg::Input(_) => vec![],
         }
     }
@@ -1285,6 +1295,33 @@ mod tests {
         assert!(
             matches!(a, Some(Action::Fetch { req: FetchReq::History, .. })),
             "history should load with no domain set, got {a:?}",
+        );
+    }
+
+    #[test]
+    fn paste_appends_into_active_field() {
+        let mut app = App::new(None);
+        app.input_mode = InputMode::Field {
+            target: EditTarget::DiffB,
+            buf: "a.com ".into(),
+        };
+        app.update(Msg::Input(Event::Paste("b.com c.com".into())));
+        assert!(
+            matches!(&app.input_mode, InputMode::Field { buf, .. } if buf == "a.com b.com c.com"),
+            "paste should append to the field buffer, got {:?}",
+            app.input_mode
+        );
+    }
+
+    #[test]
+    fn paste_appends_into_command_buffer() {
+        let mut app = App::new(None);
+        app.input_mode = InputMode::Command("look".into());
+        app.update(Msg::Input(Event::Paste("up x.com".into())));
+        assert!(
+            matches!(&app.input_mode, InputMode::Command(buf) if buf == "lookup x.com"),
+            "paste should append to the command buffer, got {:?}",
+            app.input_mode
         );
     }
 }

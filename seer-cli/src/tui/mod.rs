@@ -22,7 +22,7 @@ use std::io::{self, Stdout};
 use std::time::Duration;
 
 use anyhow::Result;
-use crossterm::event::EventStream;
+use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste, EventStream};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -50,13 +50,17 @@ pub async fn run(domain: Option<String>) -> Result<()> {
 fn setup_terminal() -> Result<Term> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
     Ok(Terminal::new(CrosstermBackend::new(stdout))?)
 }
 
 fn restore_terminal(terminal: &mut Term) -> Result<()> {
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        DisableBracketedPaste,
+        LeaveAlternateScreen
+    )?;
     terminal.show_cursor()?;
     Ok(())
 }
@@ -66,7 +70,7 @@ fn install_panic_hook() {
     let original = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        let _ = execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen);
         original(info);
     }));
 }
