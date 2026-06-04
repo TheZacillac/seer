@@ -36,9 +36,19 @@ pub struct DnssecReport {
     /// Validation issues found.
     pub issues: Vec<String>,
     /// Overall status: "secure", "insecure", "partial", or "misconfigured".
+    ///
+    /// IMPORTANT: this reflects DS↔DNSKEY *digest consistency* (RFC 4509)
+    /// observed over plain, unauthenticated DNS. It does NOT verify any RRSIG
+    /// signatures, signature validity periods, or a chain of trust to the root
+    /// anchor. "secure" therefore means "the published DS and DNSKEY are
+    /// digest-consistent", NOT "the records are cryptographically
+    /// authenticated" — an on-path or spoofing attacker can fabricate a
+    /// self-consistent DS+DNSKEY pair. Do not treat this as proof of
+    /// authenticity.
     pub status: String,
-    /// Whether the full DS-to-DNSKEY chain validates.
-    /// True only when every DS record matches a DNSKEY and all digests verify.
+    /// Whether every DS record's digest matches a published DNSKEY (RFC 4509
+    /// digest consistency). This is NOT signature / chain-of-trust validation —
+    /// see the caveat on `status`.
     pub chain_valid: bool,
 }
 

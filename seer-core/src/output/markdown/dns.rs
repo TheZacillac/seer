@@ -163,6 +163,11 @@ impl MarkdownFormatter {
             "- **Chain Valid**: {}",
             if report.chain_valid { "yes" } else { "no" }
         ));
+        output.push(
+            "> Note: reflects DS/DNSKEY digest consistency only — RRSIG signatures, validity \
+             periods, and the chain to the root are NOT cryptographically verified."
+                .to_string(),
+        );
         output.push(format!("- **Enabled**: {}", report.enabled));
         output.push(format!("- **DS Records**: {}", report.ds_records.len()));
         output.push(format!(

@@ -199,6 +199,10 @@ impl HumanFormatter {
             self.label("Chain Valid"),
             chain_colored
         ));
+        output.push(self.warning(
+            "  Note: reflects DS/DNSKEY digest consistency only — RRSIG signatures, validity \
+             periods, and the chain to the root are NOT cryptographically verified.",
+        ));
         output.push(format!(
             "  {}: {}",
             self.label("Enabled"),
