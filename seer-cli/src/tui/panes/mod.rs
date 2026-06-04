@@ -58,7 +58,7 @@ impl Panes {
                 2 => self.compare.handle_key(key, domain),
                 _ => None,
             },
-            "diff" => self.diff.handle_key(key),
+            "diff" => self.diff.handle_key(key, domain),
             "follow" => self.follow.handle_key(key, domain),
             "bulk" => self.bulk.handle_key(key),
             _ => None,
