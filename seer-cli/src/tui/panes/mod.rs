@@ -6,7 +6,6 @@ use crate::tui::action::{Action, EditTarget, FetchReq};
 #[allow(dead_code)] // fleshed out in Phase 2/3
 #[derive(Default)]
 pub struct Panes {
-    pub rdap_tab: usize,
     pub tld: TldState,
     pub dns: DnsState,
     pub compare: CompareState,

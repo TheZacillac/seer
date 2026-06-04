@@ -149,7 +149,7 @@ impl App {
         Some(match key {
             "overview" => FetchReq::Overview(d),
             "whois" => FetchReq::Whois(d),
-            "rdap" => match self.panes.rdap_tab {
+            "rdap" => match self.tab {
                 0 => FetchReq::RdapDomain(d),
                 1 => FetchReq::RdapIp(self.panes.dns.resolved_ip.clone().unwrap_or(d)),
                 _ => return None, // ASN needs explicit :rdap AS…
@@ -180,6 +180,19 @@ impl App {
             "follow" | "bulk" => return None, // streaming — started explicitly
             _ => return None,
         })
+    }
+
+    /// After a sub-tab change, a tab-bearing lens needs the new tab's data
+    /// (the per-lens cache is keyed by lens, not tab), so drop the cached state
+    /// and re-fetch for the now-active tab.
+    fn refetch_for_tab(&mut self) -> Vec<Action> {
+        let lens = self.current_lens();
+        if lens.tabs.is_empty() {
+            return vec![];
+        }
+        let key = lens.key;
+        self.states.remove(key);
+        self.fetch_with_current()
     }
 
     pub fn update(&mut self, msg: Msg) -> Vec<Action> {
@@ -516,12 +529,12 @@ impl App {
             KeyAction::NextTab => {
                 self.tab = lenses::cycle_tab(self.current_lens(), self.tab, true);
                 self.sel = 0;
-                vec![]
+                self.refetch_for_tab()
             }
             KeyAction::PrevTab => {
                 self.tab = lenses::cycle_tab(self.current_lens(), self.tab, false);
                 self.sel = 0;
-                vec![]
+                self.refetch_for_tab()
             }
             KeyAction::EnterPane => {
                 if self.row_count() > 0 {
