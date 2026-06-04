@@ -144,8 +144,21 @@ seer-cli/src/
 │   ├── mod.rs          # REPL main loop, session state
 │   ├── commands.rs     # Command parsing and context
 │   └── completer.rs    # Tab completion
-└── display/            # UI utilities
-    └── spinner.rs      # Loading spinner for async operations
+├── display/            # UI utilities
+│   └── spinner.rs      # Loading spinner for async operations
+└── tui/                # Full-screen ratatui TUI (`seer tui`)
+    ├── mod.rs          # run(): terminal lifecycle + async select! loop
+    ├── app.rs          # pure App state + update() (no ratatui imports)
+    ├── action.rs       # Action / Msg / LensData / LensState types
+    ├── command.rs      # `:` command-line parser
+    ├── event.rs        # normal-mode key → action mapping
+    ├── data.rs         # async seer-core dispatch (the only core-coupled module)
+    ├── theme.rs        # Catppuccin Frappé palette → ratatui Color
+    ├── raw.rs          # raw output via seer-core's get_formatter
+    ├── clipboard.rs    # OSC52 terminal clipboard copy
+    ├── render.rs       # frame rendering (shell + lens dispatch)
+    ├── widgets/        # panel, kv, gauge, dot, chips
+    └── lenses/         # registry + 7 wired lenses + placeholder pane
 ```
 
 **Key Points:**
@@ -153,6 +166,11 @@ seer-cli/src/
 - Defaults to REPL when no command provided
 - Supports global `--format` flag (human/json) — must be placed before the subcommand
 - REPL history saved to `~/.seer_history`
+- `seer tui [domain]` launches a full-screen ratatui TUI (additive — the REPL
+  and all subcommands are unchanged). Architecture: async `tokio::select!` loop,
+  pure `App` state, lookups dispatched to `seer-core` over a channel. 7 core
+  lenses wired (Overview, WHOIS, RDAP, DNS, SSL, Status, Propagation); the other
+  9 nav entries render a "planned" placeholder.
 
 ### seer-py/ (Python Bindings)
 
