@@ -18,6 +18,17 @@ pub enum CmdOutcome {
     },
     /// `lookup <domain>` or a bare domain.
     Lookup(String),
+    /// `diff a.com b.com` — compare two domains.
+    Diff {
+        a: String,
+        b: String,
+    },
+    /// `compare domain.com ns-a ns-b` — compare DNS between two nameservers.
+    Compare {
+        domain: String,
+        a: String,
+        b: String,
+    },
     Unknown(String),
 }
 
@@ -51,6 +62,26 @@ pub fn parse(raw: &str) -> CmdOutcome {
             };
         }
         _ => {}
+    }
+
+    if head == "diff" {
+        return match (parts.get(1), parts.get(2)) {
+            (Some(a), Some(b)) => CmdOutcome::Diff {
+                a: a.to_string(),
+                b: b.to_string(),
+            },
+            _ => CmdOutcome::Unknown(line.to_string()),
+        };
+    }
+    if head == "compare" {
+        return match (parts.get(1), parts.get(2), parts.get(3)) {
+            (Some(d), Some(a), Some(b)) => CmdOutcome::Compare {
+                domain: d.to_string(),
+                a: a.to_string(),
+                b: b.to_string(),
+            },
+            _ => CmdOutcome::Unknown(line.to_string()),
+        };
     }
 
     // A known lens command (whois, dig, ssl, status, prop, rdap, ...).
@@ -137,6 +168,39 @@ mod tests {
         assert_eq!(
             parse("frobnicate"),
             CmdOutcome::Unknown("frobnicate".into())
+        );
+    }
+
+    #[test]
+    fn parses_new_lens_commands() {
+        assert_eq!(
+            parse("reverse 8.8.8.8"),
+            CmdOutcome::Lens {
+                lens: "reverse".into(),
+                target: Some("8.8.8.8".into())
+            }
+        );
+        assert_eq!(
+            parse("tld .com"),
+            CmdOutcome::Lens {
+                lens: "tld".into(),
+                target: Some(".com".into())
+            }
+        );
+        assert_eq!(
+            parse("diff a.com b.com"),
+            CmdOutcome::Diff {
+                a: "a.com".into(),
+                b: "b.com".into()
+            }
+        );
+        assert_eq!(
+            parse("compare ex.com 8.8.8.8 1.1.1.1"),
+            CmdOutcome::Compare {
+                domain: "ex.com".into(),
+                a: "8.8.8.8".into(),
+                b: "1.1.1.1".into()
+            }
         );
     }
 }
