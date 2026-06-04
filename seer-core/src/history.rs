@@ -93,6 +93,13 @@ impl LookupHistory {
             .ok_or_else(|| SeerError::ConfigError("Cannot determine home directory".to_string()))?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| SeerError::ConfigError(e.to_string()))?;
+            // Lookup history is sensitive reconnaissance metadata; keep the
+            // ~/.seer dir owner-only on Unix (best-effort defense in depth).
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+            }
         }
         let content = serde_json::to_string_pretty(self)
             .map_err(|e| SeerError::ConfigError(e.to_string()))?;
@@ -103,6 +110,13 @@ impl LookupHistory {
         // and silently lose history.
         let tmp_path = path.with_extension(format!("json.{}.tmp", std::process::id()));
         std::fs::write(&tmp_path, content).map_err(|e| SeerError::ConfigError(e.to_string()))?;
+        // Owner-only before the rename so the published file is never briefly
+        // world-readable.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600));
+        }
         std::fs::rename(&tmp_path, &path).map_err(|e| {
             // Best-effort cleanup of the temp file so we don't litter on
             // failure. Swallow the cleanup error — the original rename
