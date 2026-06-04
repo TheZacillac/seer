@@ -93,20 +93,10 @@ pub async fn fetch(req: FetchReq) -> Result<LensData, String> {
             .map(|r| LensData::Diff(Box::new(r)))
             .map_err(e),
         FetchReq::Watch => {
-            // check_watchlist uses stream::iter with a HRTB closure that prevents
-            // direct tokio::spawn. Run it in spawn_blocking with its own mini-runtime
-            // to break the lifetime chain while remaining non-blocking to the TUI.
-            let domains = seer_core::Watchlist::load().domains;
-            let report = tokio::task::spawn_blocking(move || {
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map(|rt| rt.block_on(seer_core::check_watchlist(&domains)))
-                    .map_err(|e| e.to_string())
-            })
-            .await
-            .map_err(|err| err.to_string())??;
-            Ok(LensData::Watch(Box::new(report)))
+            let wl = seer_core::Watchlist::load();
+            Ok(LensData::Watch(Box::new(
+                seer_core::check_watchlist(&wl.domains).await,
+            )))
         }
         FetchReq::History => {
             let h = tokio::task::spawn_blocking(seer_core::LookupHistory::load)
