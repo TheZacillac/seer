@@ -186,10 +186,17 @@ fn main_pane(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             if !lens.implemented {
                 lenses::placeholder::render(f, content, theme, lens.label);
             } else {
-                let hint = Line::from(Span::styled(
-                    "press / to look up a domain",
-                    Style::default().fg(theme.overlay0),
-                ));
+                // Tab-specific idle hints for the RDAP lens.
+                let hint_text = if lens.key == "rdap" {
+                    match app.tab {
+                        2 => "use :rdap AS<number>  (e.g. :rdap AS15169)",
+                        1 => "use :rdap <ip>  or navigate to a domain first",
+                        _ => "press / to look up a domain",
+                    }
+                } else {
+                    "press / to look up a domain"
+                };
+                let hint = Line::from(Span::styled(hint_text, Style::default().fg(theme.overlay0)));
                 f.render_widget(Paragraph::new(hint), content);
             }
             return;

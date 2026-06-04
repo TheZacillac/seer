@@ -1,5 +1,8 @@
 //! RDAP lens — Domain, IP, and ASN tabs.
 use ratatui::layout::Rect;
+use ratatui::style::Style;
+use ratatui::text::{Line, Span};
+use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::tui::action::LensData;
@@ -7,15 +10,41 @@ use crate::tui::theme::Theme;
 use crate::tui::widgets::{kv, panel};
 
 pub fn render(f: &mut Frame, area: Rect, theme: &Theme, tab: usize, data: &LensData) {
-    let LensData::Rdap(r) = data else {
-        return;
-    };
-
-    match tab {
-        0 => render_domain(f, area, theme, r),
-        1 => render_ip(f, area, theme, r),
-        _ => render_asn(f, area, theme, r),
+    // When there's no loaded RDAP data yet, show a tab-appropriate hint.
+    if let LensData::Rdap(r) = data {
+        match tab {
+            0 => return render_domain(f, area, theme, r),
+            1 => return render_ip(f, area, theme, r),
+            _ => return render_asn(f, area, theme, r),
+        }
     }
+
+    // No data: show a hint so the pane isn't just blank.
+    let hint_text = match tab {
+        2 => "use :rdap AS<number>  (e.g. :rdap AS15169)",
+        1 => "use :rdap <ip>  (e.g. :rdap 8.8.8.8)",
+        _ => "enter a domain to look up",
+    };
+    let title = match tab {
+        2 => "RDAP Object · ASN",
+        1 => "RDAP Object · IP",
+        _ => "RDAP Object · domain",
+    };
+    let accent = match tab {
+        2 => theme.lavender,
+        1 => theme.blue,
+        _ => theme.mauve,
+    };
+    let block = panel::block(theme, title, accent, false);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    f.render_widget(
+        Paragraph::new(Line::from(vec![Span::styled(
+            hint_text,
+            Style::default().fg(theme.subtext),
+        )])),
+        inner,
+    );
 }
 
 fn render_domain(f: &mut Frame, area: Rect, theme: &Theme, r: &seer_core::RdapResponse) {
