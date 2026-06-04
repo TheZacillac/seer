@@ -2,6 +2,7 @@
 //! SECURITY / POWER.
 
 pub mod avail;
+pub mod bulk;
 pub mod compare;
 pub mod diff;
 pub mod dns;
@@ -159,7 +160,7 @@ pub fn lenses() -> &'static [Lens] {
             cmd: "bulk",
             group: "POWER",
             tabs: NO_TABS,
-            implemented: false,
+            implemented: true,
         },
         Lens {
             key: "watch",
@@ -242,7 +243,7 @@ pub fn render(
         "subdomains" => subdomains::render(f, area, theme, data, focused, sel),
         // Phase 4 — streaming lenses
         "follow" => follow::render(f, area, theme, &panes.follow),
-        "bulk" => placeholder::render(f, area, theme, "Bulk"),
+        "bulk" => bulk::render(f, area, theme, &panes.bulk),
         other => placeholder::render(f, area, theme, other),
     }
 }
@@ -269,13 +270,13 @@ mod tests {
     }
 
     #[test]
-    fn phase2_lenses_are_implemented() {
+    fn all_lenses_are_implemented() {
         let implemented: Vec<&str> = lenses()
             .iter()
             .filter(|l| l.implemented)
             .map(|l| l.key)
             .collect();
-        // Phase 1+2+3+4a lenses (bulk remains Phase 4b)
+        // All 16 lenses — Phase 1+2+3+4a+4b
         assert_eq!(
             implemented,
             vec![
@@ -292,6 +293,7 @@ mod tests {
                 "status",
                 "subdomains",
                 "diff",
+                "bulk",
                 "watch",
                 "history"
             ]

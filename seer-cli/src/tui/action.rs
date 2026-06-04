@@ -125,11 +125,13 @@ pub enum Action {
         text: String,
         label: String,
     },
-    #[allow(dead_code)] // wired in Phase 4
     StartFollow(FollowParams),
-    #[allow(dead_code)] // wired in Phase 4
     StartBulk(BulkParams),
-    #[allow(dead_code)] // wired in Phase 4
+    /// Trigger a bulk run from a newline-separated domain file (read off-thread in mod.rs).
+    StartBulkFromFile {
+        op: String,
+        path: String,
+    },
     WriteCsv {
         path: String,
         contents: String,
@@ -185,13 +187,9 @@ pub enum Msg {
         ok: bool,
         label: String,
     },
-    #[allow(dead_code)] // wired in Phase 4
     FollowStep(Box<seer_core::dns::FollowIteration>),
-    #[allow(dead_code)] // wired in Phase 4
     FollowDone,
-    #[allow(dead_code)] // wired in Phase 4
     BulkStep(Box<seer_core::bulk::BulkResult>),
-    #[allow(dead_code)] // wired in Phase 4
     BulkDone,
 }
 

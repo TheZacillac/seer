@@ -1,10 +1,12 @@
 //! Interactive lens components: per-lens state + key routing.
+pub mod bulk;
 pub mod compare;
 pub mod diff;
 pub mod dns;
 pub mod follow;
 pub mod tld;
 
+pub use bulk::BulkState;
 pub use compare::CompareState;
 pub use diff::DiffState;
 pub use dns::DnsState;
@@ -54,6 +56,7 @@ impl Panes {
             },
             "diff" => self.diff.handle_key(key),
             "follow" => self.follow.handle_key(key, domain),
+            "bulk" => self.bulk.handle_key(key),
             _ => None,
         }
     }
@@ -77,6 +80,15 @@ impl Panes {
                 }
                 vec![]
             }
+            EditTarget::BulkPath => {
+                self.bulk.running = true;
+                self.bulk.rows.clear();
+                self.bulk.note = None;
+                vec![Action::StartBulkFromFile {
+                    op: self.bulk.op().to_string(),
+                    path: v,
+                }]
+            }
             _ => vec![],
         }
     }
@@ -86,19 +98,8 @@ impl Panes {
             EditTarget::DiffB => self.diff.b.clone(),
             EditTarget::FollowInterval => self.follow.interval_secs.to_string(),
             EditTarget::FollowCount => self.follow.count.to_string(),
+            EditTarget::BulkPath => String::new(),
             _ => String::new(),
         }
-    }
-}
-
-#[allow(dead_code)] // fleshed out in Phase 4
-#[derive(Default)]
-pub struct BulkState {
-    pub running: bool,
-    pub rows: Vec<seer_core::bulk::BulkResult>,
-}
-impl BulkState {
-    pub fn push(&mut self, r: seer_core::bulk::BulkResult) {
-        self.rows.push(r);
     }
 }

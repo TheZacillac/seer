@@ -190,7 +190,66 @@ fn handle_action(action: Action, tx: &tokio::sync::mpsc::UnboundedSender<Msg>) {
                 let _ = tx.send(Msg::FollowDone);
             });
         }
-        // StartBulk / WriteCsv are wired in Phase 4b; until then they fall through.
-        _ => {}
+        Action::StartBulk(p) => {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let ex = seer_core::BulkExecutor::new();
+                let results = match p.op.as_str() {
+                    "status" => ex.execute_status(p.domains).await,
+                    "dig" => ex.execute_dns(p.domains, seer_core::RecordType::A).await,
+                    "avail" => ex.execute_avail(p.domains).await,
+                    "info" => ex.execute_info(p.domains).await,
+                    _ => ex.execute_lookup(p.domains).await,
+                };
+                for r in results {
+                    let _ = tx.send(Msg::BulkStep(Box::new(r)));
+                }
+                let _ = tx.send(Msg::BulkDone);
+            });
+        }
+        Action::StartBulkFromFile { op, path } => {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let read_result =
+                    tokio::task::spawn_blocking(move || std::fs::read_to_string(&path)).await;
+                let Ok(Ok(content)) = read_result else {
+                    let _ = tx.send(Msg::CopyResult {
+                        ok: false,
+                        label: "bulk file not found".into(),
+                    });
+                    let _ = tx.send(Msg::BulkDone);
+                    return;
+                };
+                let mut domains = seer_core::bulk::parse_domains_from_file(&content);
+                // Cap to 50 to match CLI bulk limit
+                domains.truncate(50);
+                let ex = seer_core::BulkExecutor::new();
+                let results = match op.as_str() {
+                    "status" => ex.execute_status(domains).await,
+                    "dig" => ex.execute_dns(domains, seer_core::RecordType::A).await,
+                    "avail" => ex.execute_avail(domains).await,
+                    "info" => ex.execute_info(domains).await,
+                    _ => ex.execute_lookup(domains).await,
+                };
+                for r in results {
+                    let _ = tx.send(Msg::BulkStep(Box::new(r)));
+                }
+                let _ = tx.send(Msg::BulkDone);
+            });
+        }
+        Action::WriteCsv { path, contents } => {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let path_clone = path.clone();
+                let ok = tokio::task::spawn_blocking(move || std::fs::write(&path_clone, contents))
+                    .await
+                    .map(|r| r.is_ok())
+                    .unwrap_or(false);
+                let _ = tx.send(Msg::CopyResult {
+                    ok,
+                    label: format!("wrote {path}"),
+                });
+            });
+        }
     }
 }
