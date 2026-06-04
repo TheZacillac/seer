@@ -53,13 +53,15 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, bulk: &BulkState) {
         ),
     ]);
 
-    // Progress gauge
-    let ratio = if sample_count > 0 {
-        bulk.rows.len() as f64 / sample_count as f64
+    // Progress gauge: use bulk.total when set (file loads or explicit run).
+    // Falls back to rows.len() so the gauge is never stuck at 0%.
+    let denom = if bulk.total > 0 {
+        bulk.total
     } else {
-        0.0
+        bulk.rows.len().max(1)
     };
-    let gauge_label = format!("{}/{} done", bulk.rows.len(), sample_count);
+    let ratio = bulk.rows.len() as f64 / denom as f64;
+    let gauge_label = format!("{}/{} done", bulk.rows.len(), denom);
     let gauge_line = gauge::line(ratio, 24, theme.mauve, Some(&gauge_label));
 
     // Running status

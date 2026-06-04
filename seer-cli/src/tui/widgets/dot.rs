@@ -5,8 +5,6 @@ use ratatui::text::{Line, Span};
 use crate::tui::theme::Theme;
 
 /// `● label` colored by tone. `wait` uses a half-circle glyph.
-/// Part of the status-dot toolkit; consumed by lenses added in follow-up passes.
-#[allow(dead_code)]
 pub fn line<'a>(theme: &Theme, tone: &str, label: impl Into<String>) -> Line<'a> {
     let glyph = if tone == "wait" { "◐ " } else { "● " };
     Line::from(vec![
