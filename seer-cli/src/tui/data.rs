@@ -11,11 +11,19 @@ fn e(e: seer_core::SeerError) -> String {
 
 pub async fn fetch(req: FetchReq) -> Result<LensData, String> {
     match req {
-        FetchReq::Overview(d) => seer_core::SmartLookup::new()
-            .lookup(&d)
-            .await
-            .map(|r| LensData::Overview(Box::new(r)))
-            .map_err(e),
+        FetchReq::Overview(d) => {
+            let r = seer_core::SmartLookup::new().lookup(&d).await.map_err(e)?;
+            // Record to history — best-effort, off the async reactor. Mirrors the
+            // CLI lookup handler (main.rs). Detached (not awaited): the Overview
+            // result renders immediately; the save lands a beat later.
+            let result = r.clone();
+            tokio::task::spawn_blocking(move || {
+                let mut h = seer_core::LookupHistory::load();
+                h.record(&d, result);
+                let _ = h.save();
+            });
+            Ok(LensData::Overview(Box::new(r)))
+        }
         FetchReq::Whois(d) => seer_core::WhoisClient::new()
             .lookup(&d)
             .await
