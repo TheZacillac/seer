@@ -24,9 +24,10 @@ mod whois;
 /// strings safely inside Markdown that will be forwarded to an LLM (via
 /// the MCP server). Strips ANSI escape sequences and ASCII control
 /// characters, collapses newlines/CR/tabs to spaces (so attacker text
-/// cannot break out of a table row or look like a new heading), and
-/// neutralizes backticks (so an attacker can't terminate a code span and
-/// inject Markdown structure).
+/// cannot break out of a table row or look like a new heading), neutralizes
+/// backticks (so an attacker can't terminate a code span and inject Markdown
+/// structure), and escapes the table-cell delimiter `|` (so a value can't add
+/// columns or break out of a cell).
 pub(super) struct MdSafe<'a>(pub &'a str);
 
 impl fmt::Display for MdSafe<'_> {
@@ -51,6 +52,11 @@ impl fmt::Display for MdSafe<'_> {
                 }
                 '\n' | '\r' | '\t' => f.write_str(" ")?,
                 '`' => f.write_str("'")?,
+                // GFM table-cell delimiter: a bare `|` from attacker-controlled
+                // data would add columns / break out of the cell (and, with a
+                // backtick, escape the code-span defense). Backslash-pipe is the
+                // spec escape and renders as a literal `|` in and out of tables.
+                '|' => f.write_str("\\|")?,
                 c if c.is_control() => {}
                 c => f.write_char(c)?,
             }
@@ -268,6 +274,16 @@ mod tests {
     fn test_mdsafe_neutralizes_backticks() {
         assert_eq!(md("`bad`"), "'bad'");
         assert_eq!(md("a `b` c"), "a 'b' c");
+    }
+
+    #[test]
+    fn test_mdsafe_escapes_table_pipe() {
+        // A bare `|` from attacker-controlled data (DNS TXT, cert subject,
+        // WHOIS contact) breaks out of a Markdown table cell / fabricates
+        // columns. GFM's cell escape is backslash-pipe, a literal `|` both
+        // inside and outside tables.
+        assert_eq!(md("a|b"), "a\\|b");
+        assert_eq!(md("x | y | z"), "x \\| y \\| z");
     }
 
     #[test]
