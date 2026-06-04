@@ -375,8 +375,13 @@ async fn query_server_internal(
     let _ = stream.shutdown().await;
 
     // Try UTF-8, fall back to Latin-1
+    // Preserve valid UTF-8 (CJK ccTLD registries — JPRS, KISA, CONAC, TWNIC,
+    // NIC.br — emit UTF-8) and replace only the invalid bytes, rather than
+    // reinterpreting the WHOLE body as Latin-1, which would mojibake every
+    // multi-byte character after a single stray byte and silently drop CJK
+    // nameservers/dates from the parsed result.
     Ok(String::from_utf8(response)
-        .unwrap_or_else(|e| e.into_bytes().iter().map(|&c| c as char).collect()))
+        .unwrap_or_else(|e| String::from_utf8_lossy(&e.into_bytes()).into_owned()))
 }
 
 /// Extracts the WHOIS server from an IANA response.

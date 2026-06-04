@@ -11,6 +11,11 @@ use super::records::{DnsRecord, RecordType};
 use super::resolver::DnsResolver;
 use crate::error::{Result, SeerError};
 
+/// Upper bound on follow iterations. A non-interactive caller (API / Python
+/// bindings) passing a huge count would otherwise schedule an effectively
+/// unbounded long-running loop; the interval is already capped at 60 minutes.
+const MAX_FOLLOW_ITERATIONS: usize = 10_000;
+
 /// Configuration for DNS follow operation
 #[derive(Debug, Clone)]
 pub struct FollowConfig {
@@ -45,6 +50,11 @@ impl FollowConfig {
             return Err(SeerError::InvalidInput(
                 "iterations must be at least 1".into(),
             ));
+        }
+        if iterations > MAX_FOLLOW_ITERATIONS {
+            return Err(SeerError::InvalidInput(format!(
+                "iterations must be at most {MAX_FOLLOW_ITERATIONS}"
+            )));
         }
         if !interval_minutes.is_finite() {
             return Err(SeerError::InvalidInput(
@@ -328,6 +338,14 @@ mod tests {
         assert_eq!(config.iterations, 10);
         assert_eq!(config.interval_secs, 60);
         assert!(!config.changes_only);
+    }
+
+    #[test]
+    fn follow_config_rejects_unbounded_iterations() {
+        assert!(FollowConfig::new(MAX_FOLLOW_ITERATIONS, 1.0).is_ok());
+        let err = FollowConfig::new(MAX_FOLLOW_ITERATIONS + 1, 1.0).unwrap_err();
+        assert!(matches!(err, SeerError::InvalidInput(_)));
+        assert!(FollowConfig::new(usize::MAX, 1.0).is_err());
     }
 
     #[tokio::test]
