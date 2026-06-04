@@ -331,6 +331,21 @@ impl WhoisResponse {
     }
 
     pub fn is_available(&self) -> bool {
+        // A response carrying concrete registration data is registered, full
+        // stop — never let an unanchored substring match (a "not found" /
+        // "object not found" fragment buried in an abuse-contact line, notice,
+        // or registrant value) flip a registered domain to "available". This
+        // guards the H6 false-positive class without having to anchor every
+        // pattern (which would regress legitimate mid-line phrasings like
+        // TWNIC "Domain not found." or HKIRC "...has not been registered.").
+        if self.registrar.is_some()
+            || self.creation_date.is_some()
+            || self.expiration_date.is_some()
+            || !self.nameservers.is_empty()
+        {
+            return false;
+        }
+
         // Scan the full response (excluding empty lines and comment lines). Some
         // registries (TWNIC, JPRS, NIC.br) prepend 3-4 notice lines before the
         // "no match" line, which would escape a small take(N) window.
@@ -570,14 +585,21 @@ fn extract_status_top_level(raw: &str) -> Vec<String> {
         // Match "Domain Status:", "Status:", "status:", "state:" case-insensitively
         // via a prefix check on the lowercased line.
         let lower = trimmed.to_lowercase();
-        let value_opt = if let Some(rest) = lower.strip_prefix("domain status:") {
-            Some(&trimmed[trimmed.len() - rest.len()..])
-        } else if let Some(rest) = lower.strip_prefix("status:") {
-            Some(&trimmed[trimmed.len() - rest.len()..])
+        // Slice the ORIGINAL line by the ASCII prefix length. The prefixes are
+        // pure ASCII, so their byte length is identical in `trimmed` and
+        // `lower`; deriving the slice point from `lower`'s suffix length is
+        // unsound because `to_lowercase()` is not length-preserving for all
+        // Unicode (e.g. Turkish İ → i̇ grows 2→3 bytes), which could make the
+        // lowercased suffix longer than the whole original line and underflow
+        // `trimmed.len() - rest.len()` into an out-of-bounds slice panic.
+        let value_opt = if lower.starts_with("domain status:") {
+            Some(&trimmed["domain status:".len()..])
+        } else if lower.starts_with("status:") {
+            Some(&trimmed["status:".len()..])
+        } else if lower.starts_with("state:") {
+            Some(&trimmed["state:".len()..])
         } else {
-            lower
-                .strip_prefix("state:")
-                .map(|rest| &trimmed[trimmed.len() - rest.len()..])
+            None
         };
 
         if let Some(rest) = value_opt {
@@ -647,6 +669,23 @@ Domain not found.
     }
 
     #[test]
+    fn is_available_false_when_registration_data_present_despite_noise() {
+        // A registered domain whose WHOIS prose contains an availability
+        // fragment (here in an abuse-contact/notice line) must NOT read as
+        // available — concrete registration data (registrar/dates/NS) wins
+        // over an unanchored substring match. This is the H6 false-positive
+        // class: "<registered domain> reported AVAILABLE".
+        let raw = "\
+Domain Name: example.com
+Registrar: Example Registrar, Inc.
+Creation Date: 2020-01-01T00:00:00Z
+Name Server: ns1.example.com
+Registrar Abuse Contact: please report if the object not found in directory
+";
+        assert!(!make_response(raw).is_available());
+    }
+
+    #[test]
     fn is_available_false_for_registered_domain() {
         let raw = "\
 Domain Name: example.com
@@ -698,6 +737,22 @@ Name Server: ns1.example.com
         // it must read as available, not registry-unavailable.
         let raw = "No match for domain EXAMPLE.\n";
         assert!(!make_response(raw).registry_unavailable());
+    }
+
+    #[test]
+    fn extract_status_does_not_panic_on_unicode_lowercasing_expansion() {
+        // Turkish dotted capital İ (2 bytes) lowercases to i̇ (3 bytes), so a
+        // status VALUE full of them makes the lowercased line longer than the
+        // original. The old code sliced the original by a length derived from
+        // the lowercased copy (`trimmed.len() - rest.len()`), which underflowed
+        // and panicked out-of-bounds. `raw` is attacker-controlled (a hostile
+        // WHOIS server), so this was a remotely-triggerable panic / DoS.
+        let raw = format!("Domain Status: {}\n", "İ".repeat(40));
+        let r = make_response(&raw); // must not panic
+        assert!(
+            !r.status.is_empty(),
+            "status value should still be extracted"
+        );
     }
 
     #[test]

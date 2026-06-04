@@ -119,14 +119,19 @@ impl HumanFormatter {
     }
 
     fn header(&self, text: &str) -> String {
+        // Underline width is the character count, not the byte length: a header
+        // containing an IDN / non-ASCII domain would otherwise be over-ruled by
+        // one or more extra dashes per multi-byte char. (Matches the diff
+        // formatter's chars().count() convention.)
+        let width = text.chars().count();
         if self.use_colors {
             format!(
                 "\n{}\n{}",
                 text.lavender().bold(),
-                "─".repeat(text.len()).subtext0()
+                "─".repeat(width).subtext0()
             )
         } else {
-            format!("\n{}\n{}", text, "-".repeat(text.len()))
+            format!("\n{}\n{}", text, "-".repeat(width))
         }
     }
 

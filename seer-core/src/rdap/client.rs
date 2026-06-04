@@ -55,6 +55,10 @@ static RDAP_HTTP_CLIENT: Lazy<Option<Client>> = Lazy::new(|| {
         .connect_timeout(CONNECT_TIMEOUT)
         .user_agent("Seer/1.0 (RDAP Client)")
         .pool_max_idle_per_host(10)
+        // Bootstrap targets are hardcoded https://data.iana.org URLs that return
+        // terminal JSON; disable redirect-following for defense in depth so a
+        // compromised/MITM'd hop can't bounce the fetch to an internal address.
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .ok()
 });
@@ -627,6 +631,15 @@ async fn send_rdap_request(url: &str) -> Result<reqwest::Response> {
         .connect_timeout(CONNECT_TIMEOUT)
         .user_agent("Seer/1.0 (RDAP Client)")
         .resolve_to_addrs(host, &resolved)
+        // SSRF defense: `resolve_to_addrs` pins only THIS host's validated IPs.
+        // reqwest's default policy would follow up to 10 redirects, re-resolving
+        // each new host with its own resolver — so a 3xx to http://169.254.169.254
+        // (or any internal host) would bypass the reserved-IP guard entirely.
+        // RDAP base URLs come from the IANA bootstrap as terminal https endpoints
+        // and cross-server references are JSON `links`, not HTTP redirects, so we
+        // fail closed: a redirecting RDAP server makes the lookup fall through to
+        // WHOIS/availability rather than chasing an unvalidated hop.
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| SeerError::RdapError(format!("failed to build HTTP client: {}", e)))?;
 

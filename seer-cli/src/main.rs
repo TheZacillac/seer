@@ -362,6 +362,33 @@ fn handle_quiet_output<T: serde::Serialize>(value: &T, fields: &Option<Vec<Strin
     }
 }
 
+/// Renders a machine-readable CLI error payload for non-human formats so that
+/// `--format json|yaml` stays parseable on the error path. Returns `None` for
+/// Human (rendered with color by [`emit_error`]). JSON is a subset of YAML, so
+/// the same `{"error": ...}` document is valid for both.
+fn machine_error(output_format: seer_core::output::OutputFormat, msg: &str) -> Option<String> {
+    use seer_core::output::OutputFormat;
+    match output_format {
+        OutputFormat::Human => None,
+        OutputFormat::Json | OutputFormat::Yaml => {
+            Some(serde_json::json!({ "error": msg }).to_string())
+        }
+        OutputFormat::Markdown => Some(format!("**Error:** {}", msg)),
+    }
+}
+
+/// Prints a format-appropriate error to stderr and exits non-zero. Honors the
+/// global `--format` flag so scripted consumers get structured output instead
+/// of ANSI-colored prose when a command fails.
+fn emit_error<E: std::fmt::Display>(output_format: seer_core::output::OutputFormat, e: &E) -> ! {
+    let msg = e.to_string();
+    match machine_error(output_format, &msg) {
+        Some(structured) => eprintln!("{}", structured),
+        None => eprintln!("{} {}", "Error:".ctp_red(), msg),
+    }
+    std::process::exit(1);
+}
+
 async fn execute_command(
     command: Commands,
     output_format: seer_core::output::OutputFormat,
@@ -406,8 +433,7 @@ async fn execute_command(
                 }
                 Err(e) => {
                     spinner.finish();
-                    eprintln!("{} {}", "Error:".ctp_red(), e);
-                    std::process::exit(1);
+                    emit_error(output_format, &e);
                 }
             }
         }
@@ -430,8 +456,7 @@ async fn execute_command(
                 }
                 Err(e) => {
                     spinner.finish();
-                    eprintln!("{} {}", "Error:".ctp_red(), e);
-                    std::process::exit(1);
+                    emit_error(output_format, &e);
                 }
             }
         }
@@ -446,8 +471,7 @@ async fn execute_command(
                     }
                 }
                 Err(e) => {
-                    eprintln!("{} {}", "Error:".ctp_red(), e);
-                    std::process::exit(1);
+                    emit_error(output_format, &e);
                 }
             }
         }
@@ -468,8 +492,7 @@ async fn execute_command(
                     }
                 }
                 Err(e) => {
-                    eprintln!("{} {}", "Error:".ctp_red(), e);
-                    std::process::exit(1);
+                    emit_error(output_format, &e);
                 }
             }
         }
@@ -491,8 +514,7 @@ async fn execute_command(
                     }
                 }
                 Err(e) => {
-                    eprintln!("{} {}", "Error:".ctp_red(), e);
-                    std::process::exit(1);
+                    emit_error(output_format, &e);
                 }
             }
         }
@@ -512,8 +534,7 @@ async fn execute_command(
                     }
                 }
                 Err(e) => {
-                    eprintln!("{} {}", "Error:".ctp_red(), e);
-                    std::process::exit(1);
+                    emit_error(output_format, &e);
                 }
             }
         }
@@ -743,8 +764,7 @@ async fn execute_command(
                     }
                 }
                 Err(e) => {
-                    eprintln!("{} {}", "Error:".ctp_red(), e);
-                    std::process::exit(1);
+                    emit_error(output_format, &e);
                 }
             }
         }
@@ -762,8 +782,7 @@ async fn execute_command(
                     }
                 }
                 Err(e) => {
-                    eprintln!("{} {}", "Error:".ctp_red(), e);
-                    std::process::exit(1);
+                    emit_error(output_format, &e);
                 }
             }
         }
@@ -781,8 +800,7 @@ async fn execute_command(
                     }
                 }
                 Err(e) => {
-                    eprintln!("{} {}", "Error:".ctp_red(), e);
-                    std::process::exit(1);
+                    emit_error(output_format, &e);
                 }
             }
         }
@@ -800,8 +818,7 @@ async fn execute_command(
                     }
                 }
                 Err(e) => {
-                    eprintln!("{} {}", "Error:".ctp_red(), e);
-                    std::process::exit(1);
+                    emit_error(output_format, &e);
                 }
             }
         }
@@ -855,8 +872,7 @@ async fn execute_command(
             let config = match seer_core::FollowConfig::new(iterations, interval_minutes) {
                 Ok(cfg) => cfg.with_changes_only(changes_only),
                 Err(e) => {
-                    eprintln!("{} {}", "Error:".ctp_red(), e);
-                    std::process::exit(1);
+                    emit_error(output_format, &e);
                 }
             };
 
@@ -950,8 +966,7 @@ async fn execute_command(
                     println!("\n{}", formatter.format_follow(&result));
                 }
                 Err(e) => {
-                    eprintln!("{} {}", "Error:".ctp_red(), e);
-                    std::process::exit(1);
+                    emit_error(output_format, &e);
                 }
             }
         }
@@ -965,8 +980,7 @@ async fn execute_command(
                     }
                 }
                 Err(e) => {
-                    eprintln!("{} {}", "Error:".ctp_red(), e);
-                    std::process::exit(1);
+                    emit_error(output_format, &e);
                 }
             }
         }
@@ -998,8 +1012,7 @@ async fn execute_command(
                     }
                 }
                 Err(e) => {
-                    eprintln!("{} {}", "Error:".ctp_red(), e);
-                    std::process::exit(1);
+                    emit_error(output_format, &e);
                 }
             }
         }
@@ -1019,8 +1032,7 @@ async fn execute_command(
                 }
                 Err(e) => {
                     spinner.finish();
-                    eprintln!("{} {}", "Error:".ctp_red(), e);
-                    std::process::exit(1);
+                    emit_error(output_format, &e);
                 }
             }
         }
@@ -1040,8 +1052,7 @@ async fn execute_command(
                 }
                 Err(e) => {
                     spinner.finish();
-                    eprintln!("{} {}", "Error:".ctp_red(), e);
-                    std::process::exit(1);
+                    emit_error(output_format, &e);
                 }
             }
         }
@@ -1175,6 +1186,40 @@ async fn execute_command(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod cli_error_tests {
+    use super::machine_error;
+    use seer_core::output::OutputFormat;
+
+    #[test]
+    fn json_error_is_parseable_and_carries_message() {
+        let s = machine_error(OutputFormat::Json, "lookup failed: boom").unwrap();
+        let v: serde_json::Value = serde_json::from_str(&s).expect("valid JSON on error path");
+        assert_eq!(v["error"], "lookup failed: boom");
+    }
+
+    #[test]
+    fn yaml_error_is_structured_json_subset() {
+        // JSON is a valid YAML document; assert it parses and carries the message.
+        let s = machine_error(OutputFormat::Yaml, "boom").unwrap();
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["error"], "boom");
+    }
+
+    #[test]
+    fn human_error_has_no_machine_payload() {
+        assert!(machine_error(OutputFormat::Human, "boom").is_none());
+    }
+
+    #[test]
+    fn markdown_error_is_rendered() {
+        assert_eq!(
+            machine_error(OutputFormat::Markdown, "boom").unwrap(),
+            "**Error:** boom"
+        );
+    }
 }
 
 #[cfg(test)]

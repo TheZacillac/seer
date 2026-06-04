@@ -35,10 +35,20 @@ pub struct DnssecReport {
     pub dnskey_records: Vec<DnskeyInfo>,
     /// Validation issues found.
     pub issues: Vec<String>,
-    /// Overall status: "secure", "insecure", "partial", or "misconfigured".
+    /// Overall status: "signed", "unsigned", "partial", or "misconfigured".
+    ///
+    /// IMPORTANT: this reflects DS↔DNSKEY *digest consistency* (RFC 4509)
+    /// observed over plain, unauthenticated DNS. It does NOT verify any RRSIG
+    /// signatures, signature validity periods, or a chain of trust to the root
+    /// anchor. "signed" therefore means "the published DS and DNSKEY are
+    /// digest-consistent", NOT "the records are cryptographically
+    /// authenticated" — an on-path or spoofing attacker can fabricate a
+    /// self-consistent DS+DNSKEY pair. Do not treat this as proof of
+    /// authenticity.
     pub status: String,
-    /// Whether the full DS-to-DNSKEY chain validates.
-    /// True only when every DS record matches a DNSKEY and all digests verify.
+    /// Whether every DS record's digest matches a published DNSKEY (RFC 4509
+    /// digest consistency). This is NOT signature / chain-of-trust validation —
+    /// see the caveat on `status`.
     pub chain_valid: bool,
 }
 
@@ -388,16 +398,22 @@ impl DnssecChecker {
                 .iter()
                 .all(|ds| ds.matched_key && ds.digest_verified);
 
-        // Derive status from chain validity (not from issues list)
+        // Derive status from chain validity (not from issues list).
+        //
+        // Vocabulary deliberately avoids "secure"/"insecure": we verify only
+        // DS<->DNSKEY digest consistency, NOT RRSIG signatures, so we report
+        // the observable FACT (the zone is signed / unsigned) rather than a
+        // validated security state. See the `status` field doc on
+        // DnssecReport.
         let enabled = has_ds || has_dnskey;
         let status = if has_ds && has_dnskey {
             if chain_valid {
-                "secure".to_string()
+                "signed".to_string()
             } else {
                 "misconfigured".to_string()
             }
         } else if !has_ds && !has_dnskey {
-            "insecure".to_string()
+            "unsigned".to_string()
         } else {
             "partial".to_string()
         };
@@ -505,7 +521,7 @@ mod tests {
                 algorithm_name: "ECDSA P-256/SHA-256".to_string(),
             }],
             issues: vec![],
-            status: "secure".to_string(),
+            status: "signed".to_string(),
             chain_valid: true,
         };
         let json = serde_json::to_string(&report).unwrap();
@@ -555,11 +571,11 @@ mod tests {
                 algorithm_name: "ECDSA P-256/SHA-256".to_string(),
             }],
             issues: vec![],
-            status: "secure".to_string(),
+            status: "signed".to_string(),
             chain_valid: true,
         };
         assert!(report.chain_valid);
-        assert_eq!(report.status, "secure");
+        assert_eq!(report.status, "signed");
     }
 
     #[test]
@@ -642,7 +658,7 @@ mod tests {
         assert!(report.has_ds_records, "should have DS records");
         assert!(report.has_dnskey_records, "should have DNSKEY records");
         assert!(report.chain_valid, "cloudflare.com chain should be valid");
-        assert_eq!(report.status, "secure");
+        assert_eq!(report.status, "signed");
 
         // All DS records should be verified
         for ds in &report.ds_records {
@@ -668,6 +684,6 @@ mod tests {
         let report = checker.check("wikipedia.org").await.unwrap();
 
         assert!(!report.chain_valid);
-        assert_eq!(report.status, "insecure");
+        assert_eq!(report.status, "unsigned");
     }
 }

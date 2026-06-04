@@ -182,8 +182,8 @@ impl HumanFormatter {
         output.push(String::new());
 
         let status_colored = match report.status.as_str() {
-            "secure" => self.success(&report.status),
-            "insecure" | "partial" => self.warning(&report.status),
+            "signed" => self.success(&report.status),
+            "unsigned" | "partial" => self.warning(&report.status),
             _ => self.error(&report.status),
         };
         output.push(format!("  {}: {}", self.label("Status"), status_colored));
@@ -198,6 +198,10 @@ impl HumanFormatter {
             "  {}: {}",
             self.label("Chain Valid"),
             chain_colored
+        ));
+        output.push(self.warning(
+            "  Note: reflects DS/DNSKEY digest consistency only — RRSIG signatures, validity \
+             periods, and the chain to the root are NOT cryptographically verified.",
         ));
         output.push(format!(
             "  {}: {}",

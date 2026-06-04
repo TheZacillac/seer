@@ -112,8 +112,8 @@ impl MarkdownFormatter {
                 let error_msg = unreachable.error.as_deref().unwrap_or("no response");
                 output.push(format!(
                     "- **{}** (`{}`): {}",
-                    unreachable.name,
-                    unreachable.ip,
+                    MdSafe(&unreachable.name),
+                    MdSafe(&unreachable.ip),
                     MdSafe(error_msg)
                 ));
             }
@@ -159,9 +159,9 @@ impl MarkdownFormatter {
 
             output.push(format!(
                 "| {} | {} | `{}` | `{}` | {}ms |",
-                sr.server.name,
-                sr.server.location,
-                sr.server.ip,
+                MdSafe(&sr.server.name),
+                MdSafe(&sr.server.location),
+                MdSafe(&sr.server.ip),
                 MdSafe(&result_str),
                 sr.response_time_ms
             ));
