@@ -1,30 +1,121 @@
-//! Diff lens — 3-column comparison table (FIELD | A | B).
+//! Diff lens — always-visible A⇄B input bar + 3-column comparison (FIELD|A|B).
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Row, Table};
 use ratatui::Frame;
 
-use crate::tui::action::LensData;
+use crate::tui::action::{LensData, LensState};
 use crate::tui::theme::Theme;
 use crate::tui::widgets::panel;
 
-pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
-    let LensData::Diff(d) = data else {
-        return;
-    };
-
-    let title = format!("A · {}  ⇄  B · {}", d.domain_a, d.domain_b);
-    let block = panel::block(theme, &title, theme.yellow, false);
+/// Render the Diff lens. Pure function of its inputs (no `App` coupling):
+/// - `domain`  current target = domain A
+/// - `b`       committed second domain (B)
+/// - `editing` `Some(buf)` while the B field is being typed
+/// - `focused` whether the pane has focus
+/// - `state`   the lens load state (drives the body)
+#[allow(clippy::too_many_arguments)]
+pub fn render(
+    f: &mut Frame,
+    area: Rect,
+    theme: &Theme,
+    domain: Option<&str>,
+    b: &str,
+    editing: Option<&str>,
+    focused: bool,
+    state: &LensState,
+) {
+    let block = panel::block(theme, "Diff", theme.yellow, focused);
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let dash = "—".to_string();
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // input bar
+            Constraint::Length(1), // hint
+            Constraint::Min(0),    // body
+        ])
+        .split(inner);
 
-    // Build comparison rows: (field, a_val, b_val)
+    // ── input bar: A · <domain>   ⇄   B · <value> ────────────────────────────
+    let a = domain.unwrap_or("(no target)");
+    let (b_text, b_color) = match editing {
+        Some(buf) => (format!("{buf}▏"), theme.text),
+        None if !b.is_empty() => (b.to_string(), theme.text),
+        None => ("[ press e ]".to_string(), theme.overlay0),
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("A · ", Style::default().fg(theme.overlay0)),
+            Span::styled(a.to_string(), Style::default().fg(theme.text)),
+            Span::styled("   ⇄   ", Style::default().fg(theme.yellow)),
+            Span::styled("B · ", Style::default().fg(theme.overlay0)),
+            Span::styled(b_text, Style::default().fg(b_color)),
+        ])),
+        chunks[0],
+    );
+
+    // ── hint (focus-aware) ───────────────────────────────────────────────────
+    let hint = if focused {
+        "e edit B · ↵ compare"
+    } else {
+        "↵ focus pane"
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            hint,
+            Style::default().fg(theme.overlay0),
+        ))),
+        chunks[1],
+    );
+
+    // ── body by state ────────────────────────────────────────────────────────
+    match state {
+        LensState::Loaded(LensData::Diff(d)) => comparison_table(f, chunks[2], theme, d),
+        LensState::Loading => {
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    format!("⠋ comparing {a} ⇄ {b}…"),
+                    Style::default().fg(theme.overlay),
+                ))),
+                chunks[2],
+            );
+        }
+        LensState::Error(msg) => {
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    msg.clone(),
+                    Style::default().fg(theme.red),
+                ))),
+                chunks[2],
+            );
+        }
+        _ => {
+            let idle = if domain.is_some() {
+                format!("set a second domain (e) to compare against {a}")
+            } else {
+                "look up a domain first (/)".to_string()
+            };
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    idle,
+                    Style::default()
+                        .fg(theme.overlay0)
+                        .add_modifier(Modifier::ITALIC),
+                ))),
+                chunks[2],
+            );
+        }
+    }
+}
+
+/// The FIELD | A | B comparison table for a completed diff.
+fn comparison_table(f: &mut Frame, area: Rect, theme: &Theme, d: &seer_core::diff::DomainDiff) {
+    let dash = "—".to_string();
     let mut raw: Vec<(&str, String, String)> = Vec::new();
 
-    // Registration
     let (ra, rb) = &d.registration.registrar;
     raw.push((
         "registrar",
@@ -49,8 +140,6 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
         ea.clone().unwrap_or_else(|| dash.clone()),
         eb.clone().unwrap_or_else(|| dash.clone()),
     ));
-
-    // DNS
     raw.push((
         "A records",
         d.dns.a_records.0.join(", "),
@@ -66,8 +155,6 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
         d.dns.resolves.0.to_string(),
         d.dns.resolves.1.to_string(),
     ));
-
-    // SSL
     let (ia, ib) = &d.ssl.issuer;
     raw.push((
         "ssl issuer",
@@ -93,42 +180,6 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
         iv_b.map(|b| b.to_string()).unwrap_or_else(|| dash.clone()),
     ));
 
-    // Layout: header line + table + footer hint
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Min(0),
-            Constraint::Length(1),
-        ])
-        .split(inner);
-
-    // Header
-    f.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(
-                format!("{:<20}", "FIELD"),
-                Style::default()
-                    .fg(theme.overlay0)
-                    .add_modifier(Modifier::DIM),
-            ),
-            Span::styled(
-                format!("{:<30}", "A"),
-                Style::default()
-                    .fg(theme.overlay0)
-                    .add_modifier(Modifier::DIM),
-            ),
-            Span::styled(
-                format!("{:<30}", "B"),
-                Style::default()
-                    .fg(theme.overlay0)
-                    .add_modifier(Modifier::DIM),
-            ),
-        ])),
-        chunks[0],
-    );
-
-    // Build table rows
     let rows: Vec<Row> = raw
         .iter()
         .map(|(field, a_val, b_val)| {
@@ -161,16 +212,7 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
         ],
     )
     .column_spacing(1);
-    f.render_widget(table, chunks[1]);
-
-    // Footer hint reminding the user how to change domain B
-    f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            "e: set domain B",
-            Style::default().fg(theme.overlay0),
-        ))),
-        chunks[2],
-    );
+    f.render_widget(table, area);
 }
 
 #[cfg(test)]
@@ -216,16 +258,67 @@ mod tests {
     }
 
     #[test]
-    fn renders_domain_names() {
+    fn idle_shows_input_bar_with_domain_a() {
         let theme = Theme::frappe();
-        let data = LensData::Diff(Box::new(diff_fixture()));
         let backend = TestBackend::new(90, 20);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|f| render(f, f.area(), &theme, &data))
+            .draw(|f| {
+                render(
+                    f,
+                    f.area(),
+                    &theme,
+                    Some("acme.io"),
+                    "",
+                    None,
+                    false,
+                    &LensState::Idle,
+                )
+            })
             .unwrap();
         let text = buf_text(terminal.backend().buffer());
-        assert!(text.contains("a.com"), "expected a.com in output");
-        assert!(text.contains("b.com"), "expected b.com in output");
+        assert!(text.contains("A ·"), "input bar shows A");
+        assert!(text.contains("B ·"), "input bar shows B");
+        assert!(text.contains("acme.io"), "shows current domain as A");
+        assert!(text.contains("press e"), "prompts how to set B");
+    }
+
+    #[test]
+    fn editing_shows_live_buffer() {
+        let theme = Theme::frappe();
+        let backend = TestBackend::new(90, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                render(
+                    f,
+                    f.area(),
+                    &theme,
+                    Some("acme.io"),
+                    "",
+                    Some("typed.io"),
+                    true,
+                    &LensState::Idle,
+                )
+            })
+            .unwrap();
+        assert!(
+            buf_text(terminal.backend().buffer()).contains("typed.io"),
+            "live edit buffer should render"
+        );
+    }
+
+    #[test]
+    fn loaded_shows_comparison_table() {
+        let theme = Theme::frappe();
+        let state = LensState::Loaded(LensData::Diff(Box::new(diff_fixture())));
+        let backend = TestBackend::new(90, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| render(f, f.area(), &theme, Some("a.com"), "b.com", None, false, &state))
+            .unwrap();
+        let text = buf_text(terminal.backend().buffer());
+        assert!(text.contains("NameCheap"), "table renders registrar A");
+        assert!(text.contains("GoDaddy"), "table renders registrar B");
     }
 }
