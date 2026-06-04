@@ -344,10 +344,18 @@ impl App {
                     _ => vec![],
                 }
             }
-            EditTarget::FollowInterval
-            | EditTarget::FollowCount
-            | EditTarget::BulkPath
-            | EditTarget::WatchAdd => self.panes.apply_field(target, value, self.domain.clone()),
+            EditTarget::WatchAdd => {
+                if value.is_empty() {
+                    return vec![];
+                }
+                vec![Action::WatchMutate {
+                    add: Some(value),
+                    remove: None,
+                }]
+            }
+            EditTarget::FollowInterval | EditTarget::FollowCount | EditTarget::BulkPath => {
+                self.panes.apply_field(target, value, self.domain.clone())
+            }
         }
     }
 
@@ -356,11 +364,85 @@ impl App {
             return None;
         }
         let lens_key = self.current_lens().key;
+        // Watch and history actions need App state (selected row, loaded data),
+        // so they are handled here before generic pane delegation.
+        if lens_key == "watch" {
+            if let Some(actions) = self.handle_watch_key(key) {
+                return Some(actions);
+            }
+            return None; // fall through to normal nav for unhandled keys
+        }
+        if lens_key == "history" {
+            if let Some(actions) = self.handle_history_key(key) {
+                return Some(actions);
+            }
+            return None;
+        }
         let domain = self.domain.clone();
         let outcome = self
             .panes
             .handle_key(lens_key, self.tab, key, domain.as_deref())?;
         Some(self.apply_pane_outcome(outcome))
+    }
+
+    /// Watch lens key handling (App-side — needs selected row + loaded data).
+    /// Returns `Some(actions)` for consumed keys, `None` to fall through.
+    fn handle_watch_key(&mut self, key: KeyEvent) -> Option<Vec<Action>> {
+        match key.code {
+            KeyCode::Char('a') => {
+                self.input_mode = InputMode::Field {
+                    target: EditTarget::WatchAdd,
+                    buf: String::new(),
+                };
+                Some(vec![])
+            }
+            KeyCode::Char('d') => {
+                let domain = self.selected_watch_domain()?;
+                Some(vec![Action::WatchMutate {
+                    add: None,
+                    remove: Some(domain),
+                }])
+            }
+            KeyCode::Enter => {
+                let domain = self.selected_watch_domain()?;
+                self.lens = 0; // switch to Overview
+                self.focus = Focus::Nav;
+                Some(self.fetch_with(&domain))
+            }
+            _ => None,
+        }
+    }
+
+    /// History lens key handling (App-side).
+    fn handle_history_key(&mut self, key: KeyEvent) -> Option<Vec<Action>> {
+        match key.code {
+            KeyCode::Enter => {
+                let domain = self.selected_history_domain()?;
+                self.lens = 0;
+                self.focus = Focus::Nav;
+                Some(self.fetch_with(&domain))
+            }
+            KeyCode::Char('c') => Some(vec![Action::HistoryClear]),
+            _ => None,
+        }
+    }
+
+    /// Returns the domain of the currently selected watchlist row, if available.
+    fn selected_watch_domain(&self) -> Option<String> {
+        if let LensState::Loaded(LensData::Watch(w)) = self.state_of(self.lens) {
+            w.results.get(self.sel).map(|r| r.domain.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Returns the domain of the currently selected history entry, if available.
+    fn selected_history_domain(&self) -> Option<String> {
+        if let LensState::Loaded(LensData::History(entries)) = self.state_of(self.lens) {
+            entries.get(self.sel).map(|e| e.domain.clone())
+        } else {
+            None
+        }
     }
 
     fn apply_pane_outcome(&mut self, outcome: PaneOutcome) -> Vec<Action> {
@@ -695,5 +777,176 @@ mod tests {
             app.update(Msg::Tick);
         }
         assert!(app.toast.is_none());
+    }
+
+    // ---- Watch lens action tests ----
+
+    fn make_watch_state(domain: &str) -> LensState {
+        use chrono::DateTime;
+        let checked_at = DateTime::<chrono::Utc>::from_timestamp(0, 0).unwrap();
+        LensState::Loaded(LensData::Watch(Box::new(seer_core::WatchReport {
+            checked_at,
+            results: vec![seer_core::WatchResult {
+                domain: domain.to_string(),
+                ssl_days_remaining: None,
+                domain_days_remaining: None,
+                registrar: None,
+                http_status: None,
+                issues: vec![],
+            }],
+            total: 1,
+            warnings: 0,
+            critical: 0,
+        })))
+    }
+
+    fn make_history_state(domain: &str) -> LensState {
+        use chrono::DateTime;
+        use seer_core::{HistoryEntry, LookupResult, WhoisResponse};
+        let timestamp = DateTime::<chrono::Utc>::from_timestamp(0, 0).unwrap();
+        let whois = WhoisResponse {
+            domain: domain.to_string(),
+            registrar: None,
+            registrant: None,
+            organization: None,
+            registrant_email: None,
+            registrant_phone: None,
+            registrant_address: None,
+            registrant_country: None,
+            admin_name: None,
+            admin_organization: None,
+            admin_email: None,
+            admin_phone: None,
+            tech_name: None,
+            tech_organization: None,
+            tech_email: None,
+            tech_phone: None,
+            creation_date: None,
+            expiration_date: None,
+            updated_date: None,
+            nameservers: vec![],
+            status: vec![],
+            dnssec: None,
+            whois_server: String::new(),
+            raw_response: String::new(),
+        };
+        LensState::Loaded(LensData::History(vec![HistoryEntry {
+            domain: domain.to_string(),
+            timestamp,
+            result: LookupResult::Whois {
+                data: whois,
+                rdap_error: None,
+                rdap_fallback: None,
+            },
+        }]))
+    }
+
+    fn watch_lens_idx() -> usize {
+        crate::tui::lenses::find_by_cmd_or_key("watch").unwrap()
+    }
+
+    fn history_lens_idx() -> usize {
+        crate::tui::lenses::find_by_cmd_or_key("history").unwrap()
+    }
+
+    fn app_on_watch_with_domain(domain: &str) -> App {
+        let mut app = App::new(None);
+        let idx = watch_lens_idx();
+        app.lens = idx;
+        app.focus = Focus::Pane;
+        app.sel = 0;
+        app.states.insert(
+            crate::tui::lenses::lenses()[idx].key,
+            make_watch_state(domain),
+        );
+        app
+    }
+
+    #[test]
+    fn watch_d_emits_watch_mutate_remove() {
+        let mut app = app_on_watch_with_domain("example.com");
+        let actions = key(&mut app, KeyCode::Char('d'));
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::WatchMutate {
+                    add: None,
+                    remove: Some(domain),
+                } if domain == "example.com"
+            )),
+            "expected WatchMutate{{remove: Some(example.com)}}, got {actions:?}",
+        );
+    }
+
+    #[test]
+    fn watch_a_enters_field_watch_add() {
+        let mut app = app_on_watch_with_domain("example.com");
+        key(&mut app, KeyCode::Char('a'));
+        assert!(
+            matches!(
+                app.input_mode,
+                InputMode::Field {
+                    target: EditTarget::WatchAdd,
+                    ..
+                }
+            ),
+            "expected Field{{WatchAdd}}, got {:?}",
+            app.input_mode
+        );
+    }
+
+    #[test]
+    fn watch_enter_switches_to_overview() {
+        let mut app = app_on_watch_with_domain("example.com");
+        let actions = key(&mut app, KeyCode::Enter);
+        assert_eq!(app.lens, 0, "should switch to overview lens");
+        assert_eq!(app.focus, Focus::Nav);
+        // Should emit a fetch for the selected domain
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::Fetch(FetchReq::Overview(_)))),
+            "expected Fetch(Overview), got {actions:?}",
+        );
+    }
+
+    // ---- History lens action tests ----
+
+    #[test]
+    fn history_c_emits_history_clear() {
+        let mut app = App::new(None);
+        let idx = history_lens_idx();
+        app.lens = idx;
+        app.focus = Focus::Pane;
+        app.states.insert(
+            crate::tui::lenses::lenses()[idx].key,
+            make_history_state("old.com"),
+        );
+        let actions = key(&mut app, KeyCode::Char('c'));
+        assert!(
+            actions.iter().any(|a| matches!(a, Action::HistoryClear)),
+            "expected HistoryClear, got {actions:?}",
+        );
+    }
+
+    #[test]
+    fn history_enter_switches_to_overview() {
+        let mut app = App::new(None);
+        let idx = history_lens_idx();
+        app.lens = idx;
+        app.focus = Focus::Pane;
+        app.sel = 0;
+        app.states.insert(
+            crate::tui::lenses::lenses()[idx].key,
+            make_history_state("old.com"),
+        );
+        let actions = key(&mut app, KeyCode::Enter);
+        assert_eq!(app.lens, 0, "should switch to overview lens");
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::Fetch(FetchReq::Overview(_)))),
+            "expected Fetch(Overview), got {actions:?}",
+        );
     }
 }

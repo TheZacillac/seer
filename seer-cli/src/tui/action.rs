@@ -134,6 +134,13 @@ pub enum Action {
         path: String,
         contents: String,
     },
+    /// Add or remove a domain from the watchlist. Handled in `mod.rs`.
+    WatchMutate {
+        add: Option<String>,
+        remove: Option<String>,
+    },
+    /// Clear all lookup history. Handled in `mod.rs`.
+    HistoryClear,
 }
 
 #[derive(Debug, Clone)]

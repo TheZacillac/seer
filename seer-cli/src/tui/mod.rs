@@ -33,6 +33,7 @@ use ratatui::Terminal;
 
 use action::{Action, Msg};
 use app::App;
+use seer_core::{LookupHistory, Watchlist};
 use theme::Theme;
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
@@ -122,7 +123,49 @@ fn handle_action(action: Action, tx: &tokio::sync::mpsc::UnboundedSender<Msg>) {
             let ok = clipboard::copy(&text).is_ok();
             let _ = tx.send(Msg::CopyResult { ok, label });
         }
-        // StartFollow / StartBulk / WriteCsv are wired in Tasks 17–20; until then they fall through.
+        Action::WatchMutate { add, remove } => {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                // File I/O is blocking — run in spawn_blocking to keep the async loop free.
+                tokio::task::spawn_blocking(move || {
+                    let mut wl = Watchlist::load();
+                    if let Some(a) = add {
+                        let _ = wl.add(&a);
+                    }
+                    if let Some(r) = remove {
+                        wl.remove(&r);
+                    }
+                    let _ = wl.save();
+                })
+                .await
+                .ok();
+                // Refresh the watchlist lens after mutation.
+                let result = data::fetch(action::FetchReq::Watch).await;
+                let _ = tx.send(Msg::Data {
+                    lens: "watch".into(),
+                    result,
+                });
+            });
+        }
+        Action::HistoryClear => {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                tokio::task::spawn_blocking(|| {
+                    let mut h = LookupHistory::load();
+                    h.clear();
+                    let _ = h.save();
+                })
+                .await
+                .ok();
+                // Refresh the history lens after clearing.
+                let result = data::fetch(action::FetchReq::History).await;
+                let _ = tx.send(Msg::Data {
+                    lens: "history".into(),
+                    result,
+                });
+            });
+        }
+        // StartFollow / StartBulk / WriteCsv are wired in Phase 4; until then they fall through.
         _ => {}
     }
 }
