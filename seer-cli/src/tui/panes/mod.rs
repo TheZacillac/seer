@@ -2,11 +2,13 @@
 pub mod compare;
 pub mod diff;
 pub mod dns;
+pub mod follow;
 pub mod tld;
 
 pub use compare::CompareState;
 pub use diff::DiffState;
 pub use dns::DnsState;
+pub use follow::FollowState;
 pub use tld::TldState;
 
 use crossterm::event::KeyEvent;
@@ -51,36 +53,41 @@ impl Panes {
                 _ => None,
             },
             "diff" => self.diff.handle_key(key),
+            "follow" => self.follow.handle_key(key, domain),
             _ => None,
         }
     }
 
     pub fn apply_field(
         &mut self,
-        _t: EditTarget,
-        _v: String,
+        t: EditTarget,
+        v: String,
         _domain: Option<String>,
     ) -> Vec<Action> {
-        vec![]
+        match t {
+            EditTarget::FollowInterval => {
+                if let Ok(val) = v.parse::<u64>() {
+                    self.follow.interval_secs = val.max(1);
+                }
+                vec![]
+            }
+            EditTarget::FollowCount => {
+                if let Ok(val) = v.parse::<usize>() {
+                    self.follow.count = val.max(1);
+                }
+                vec![]
+            }
+            _ => vec![],
+        }
     }
 
     pub fn field_value(&self, t: EditTarget) -> String {
         match t {
             EditTarget::DiffB => self.diff.b.clone(),
+            EditTarget::FollowInterval => self.follow.interval_secs.to_string(),
+            EditTarget::FollowCount => self.follow.count.to_string(),
             _ => String::new(),
         }
-    }
-}
-
-#[allow(dead_code)] // fleshed out in Phase 4
-#[derive(Default)]
-pub struct FollowState {
-    pub running: bool,
-    pub log: Vec<seer_core::dns::FollowIteration>,
-}
-impl FollowState {
-    pub fn push(&mut self, it: seer_core::dns::FollowIteration) {
-        self.log.insert(0, it);
     }
 }
 

@@ -6,6 +6,7 @@ pub mod compare;
 pub mod diff;
 pub mod dns;
 pub mod dnssec;
+pub mod follow;
 pub mod history;
 pub mod overview;
 pub mod placeholder;
@@ -113,7 +114,7 @@ pub fn lenses() -> &'static [Lens] {
             cmd: "follow",
             group: "DNS",
             tabs: NO_TABS,
-            implemented: false,
+            implemented: true,
         },
         Lens {
             key: "ssl",
@@ -239,8 +240,8 @@ pub fn render(
         "watch" => watch::render(f, area, theme, data, focused, sel),
         "history" => history::render(f, area, theme, data, focused, sel),
         "subdomains" => subdomains::render(f, area, theme, data, focused, sel),
-        // Phase 3/4 — keep as placeholders
-        "follow" => placeholder::render(f, area, theme, "Follow"),
+        // Phase 4 — streaming lenses
+        "follow" => follow::render(f, area, theme, &panes.follow),
         "bulk" => placeholder::render(f, area, theme, "Bulk"),
         other => placeholder::render(f, area, theme, other),
     }
@@ -274,7 +275,7 @@ mod tests {
             .filter(|l| l.implemented)
             .map(|l| l.key)
             .collect();
-        // Phase 1 core lenses + Phase 2 static renderers (follow/bulk remain Phase 3/4)
+        // Phase 1+2+3+4a lenses (bulk remains Phase 4b)
         assert_eq!(
             implemented,
             vec![
@@ -286,6 +287,7 @@ mod tests {
                 "tld",
                 "dns",
                 "propagation",
+                "follow",
                 "ssl",
                 "status",
                 "subdomains",

@@ -165,7 +165,32 @@ fn handle_action(action: Action, tx: &tokio::sync::mpsc::UnboundedSender<Msg>) {
                 });
             });
         }
-        // StartFollow / StartBulk / WriteCsv are wired in Phase 4; until then they fall through.
+        Action::StartFollow(p) => {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let interval_minutes = p.interval_secs as f64 / 60.0;
+                if let Ok(config) = seer_core::FollowConfig::new(p.iterations, interval_minutes) {
+                    let config = config.with_changes_only(false);
+                    let cb_tx = tx.clone();
+                    let cb: seer_core::dns::FollowProgressCallback =
+                        std::sync::Arc::new(move |it: &seer_core::dns::FollowIteration| {
+                            let _ = cb_tx.send(Msg::FollowStep(Box::new(it.clone())));
+                        });
+                    let _ = seer_core::DnsFollower::new()
+                        .follow(
+                            &p.domain,
+                            seer_core::RecordType::A,
+                            None,
+                            config,
+                            Some(cb),
+                            None,
+                        )
+                        .await;
+                }
+                let _ = tx.send(Msg::FollowDone);
+            });
+        }
+        // StartBulk / WriteCsv are wired in Phase 4b; until then they fall through.
         _ => {}
     }
 }

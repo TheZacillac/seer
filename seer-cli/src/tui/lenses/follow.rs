@@ -1,0 +1,201 @@
+//! Follow lens — live DNS monitor: progress gauge + change log table.
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Paragraph, Row, Table};
+use ratatui::Frame;
+
+use crate::tui::app::SPIN;
+use crate::tui::panes::FollowState;
+use crate::tui::theme::Theme;
+use crate::tui::widgets::{dot, gauge, panel};
+
+pub fn render(f: &mut Frame, area: Rect, theme: &Theme, follow: &FollowState) {
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(5), Constraint::Min(0)])
+        .split(area);
+
+    // ── top panel: progress gauge + status ──────────────────────────────────
+    let top_title = format!(
+        "Follow  ·  {}s interval  ·  {} checks",
+        follow.interval_secs, follow.count
+    );
+    let top_block = panel::block(theme, &top_title, theme.teal, false);
+    let top_inner = top_block.inner(rows[0]);
+    f.render_widget(top_block, rows[0]);
+
+    let ratio = if follow.count > 0 {
+        follow.log.len() as f64 / follow.count as f64
+    } else {
+        0.0
+    };
+    let gauge_label = format!("{}/{} done", follow.log.len(), follow.count);
+    let gauge_line = gauge::line(ratio, 30, theme.teal, Some(&gauge_label));
+
+    let spin_text = if follow.running {
+        format!("  {} polling…", SPIN[0])
+    } else {
+        "  idle".to_string()
+    };
+    let status_line = Line::from(vec![Span::styled(
+        spin_text,
+        Style::default().fg(if follow.running {
+            theme.teal
+        } else {
+            theme.overlay0
+        }),
+    )]);
+
+    let hints_line = Line::from(vec![Span::styled(
+        "s start  ·  i interval  ·  n count  ·  x stop",
+        Style::default().fg(theme.overlay0),
+    )]);
+
+    let top_para = Paragraph::new(vec![gauge_line, status_line, hints_line]);
+    f.render_widget(top_para, top_inner);
+
+    // ── bottom panel: change log table ──────────────────────────────────────
+    let log_block = panel::block(theme, "Change Log", theme.teal, false);
+    let log_inner = log_block.inner(rows[1]);
+    f.render_widget(log_block, rows[1]);
+
+    if follow.log.is_empty() {
+        f.render_widget(
+            Paragraph::new(Line::from(vec![Span::styled(
+                "waiting for first check…",
+                Style::default()
+                    .fg(theme.overlay0)
+                    .add_modifier(Modifier::ITALIC),
+            )])),
+            log_inner,
+        );
+        return;
+    }
+
+    let header =
+        Row::new(["#", "TIME", "A RECORD", "Δ"]).style(Style::default().fg(theme.overlay0));
+
+    let body = follow.log.iter().map(|it| {
+        let a_record = it
+            .records
+            .first()
+            .map(|r| r.format_short())
+            .unwrap_or_else(|| "—".into());
+        let delta = if it.changed {
+            dot::line(theme, "warn", "CHANGED")
+        } else {
+            dot::line(theme, "ok", "—")
+        };
+        Row::new(vec![
+            Line::from(it.iteration.to_string()),
+            Line::from(it.timestamp.format("%H:%M:%S").to_string()),
+            Line::from(a_record),
+            delta,
+        ])
+        .style(Style::default().fg(theme.text))
+    });
+
+    let table = Table::new(
+        body,
+        [
+            Constraint::Length(4),
+            Constraint::Length(10),
+            Constraint::Percentage(50),
+            Constraint::Min(10),
+        ],
+    )
+    .header(header)
+    .column_spacing(1);
+
+    f.render_widget(table, log_inner);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    use seer_core::dns::FollowIteration;
+
+    fn make_iteration(iteration: usize, record_value: &str, changed: bool) -> FollowIteration {
+        use seer_core::dns::{DnsRecord, RecordData};
+        use seer_core::RecordType;
+
+        let records = if record_value.is_empty() {
+            vec![]
+        } else {
+            vec![DnsRecord {
+                name: "example.com".into(),
+                record_type: RecordType::A,
+                ttl: 300,
+                data: RecordData::A {
+                    address: record_value.into(),
+                },
+            }]
+        };
+
+        FollowIteration {
+            iteration,
+            total_iterations: 5,
+            timestamp: Utc::now(),
+            records,
+            changed,
+            added: if changed {
+                vec![record_value.into()]
+            } else {
+                vec![]
+            },
+            removed: vec![],
+            error: None,
+        }
+    }
+
+    fn buf_text(terminal: &Terminal<TestBackend>) -> String {
+        let area = terminal.backend().buffer().area();
+        let mut s = String::new();
+        for y in 0..area.height {
+            for x in 0..area.width {
+                s.push_str(terminal.backend().buffer()[(x, y)].symbol());
+            }
+        }
+        s
+    }
+
+    #[test]
+    fn renders_a_record_in_log() {
+        let theme = Theme::frappe();
+        let mut follow = FollowState::default();
+        follow.push(make_iteration(1, "1.2.3.4", false));
+        follow.push(make_iteration(2, "1.2.3.4", true));
+
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| render(f, f.area(), &theme, &follow))
+            .unwrap();
+        let text = buf_text(&terminal);
+        assert!(
+            text.contains("1.2.3.4"),
+            "rendered buffer should contain A record IP"
+        );
+    }
+
+    #[test]
+    fn renders_waiting_when_log_empty() {
+        let theme = Theme::frappe();
+        let follow = FollowState::default();
+
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| render(f, f.area(), &theme, &follow))
+            .unwrap();
+        let text = buf_text(&terminal);
+        assert!(
+            text.contains("waiting"),
+            "empty log should show 'waiting' placeholder"
+        );
+    }
+}
