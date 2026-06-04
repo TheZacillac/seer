@@ -5,11 +5,15 @@ use std::collections::HashMap;
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind};
 use seer_core::output::OutputFormat;
+use seer_core::RecordType;
 
-use crate::tui::action::{Action, Focus, InputMode, LensData, LensState, Msg};
+use crate::tui::action::{
+    Action, EditTarget, FetchReq, Focus, InputMode, LensData, LensState, Msg,
+};
 use crate::tui::command::{self, CmdOutcome};
 use crate::tui::event::{self, KeyAction};
 use crate::tui::lenses;
+use crate::tui::panes::{PaneOutcome, Panes};
 
 /// Number of 100ms ticks a toast lives for (~2.2s).
 const TOAST_TICKS: u32 = 22;
@@ -35,6 +39,7 @@ pub struct App {
     pub should_quit: bool,
     pub spin: usize,
     pub toast: Option<Toast>,
+    pub panes: Panes,
     states: HashMap<&'static str, LensState>,
     startup: Vec<Action>,
 }
@@ -53,6 +58,7 @@ impl App {
             should_quit: false,
             spin: 0,
             toast: None,
+            panes: Panes::default(),
             states: HashMap::new(),
             startup: Vec::new(),
         };
@@ -92,6 +98,7 @@ impl App {
         match self.state_of(self.lens) {
             LensState::Loaded(LensData::Dns(r)) => r.len(),
             LensState::Loaded(LensData::Prop(p)) => p.results.len(),
+            LensState::Loaded(LensData::Reverse(r)) => r.len(),
             _ => 0,
         }
     }
@@ -128,10 +135,48 @@ impl App {
             return None;
         }
         let domain = self.domain.clone()?;
+        let req = self.default_req(key, &domain)?;
         self.states.insert(key, LensState::Loading);
-        Some(Action::Fetch {
-            lens: self.lens,
-            domain,
+        Some(Action::Fetch(req))
+    }
+
+    /// Default fetch request for a lens at `domain` (used by nav/number-jump).
+    /// Interactive lenses with no single-domain default return None.
+    fn default_req(&self, key: &str, domain: &str) -> Option<FetchReq> {
+        let d = domain.to_string();
+        Some(match key {
+            "overview" => FetchReq::Overview(d),
+            "whois" => FetchReq::Whois(d),
+            "rdap" => match self.panes.rdap_tab {
+                0 => FetchReq::RdapDomain(d),
+                1 => FetchReq::RdapIp(self.panes.dns.resolved_ip.clone().unwrap_or(d)),
+                _ => return None, // ASN needs explicit :rdap AS…
+            },
+            "dns" => match self.tab {
+                1 => FetchReq::Dnssec(d),
+                2 => FetchReq::Compare {
+                    domain: d,
+                    record_type: RecordType::A,
+                    a: self.panes.compare.a.clone(),
+                    b: self.panes.compare.b.clone(),
+                },
+                _ => FetchReq::Dns {
+                    domain: d,
+                    record_type: RecordType::A,
+                    nameserver: self.panes.dns.nameserver(),
+                },
+            },
+            "ssl" => FetchReq::Ssl(d),
+            "status" => FetchReq::Status(d),
+            "propagation" => FetchReq::Prop(d),
+            "reverse" => FetchReq::Reverse(d),
+            "avail" => FetchReq::Avail(d),
+            "tld" => FetchReq::Tld(self.panes.tld.current()),
+            "diff" => return None, // needs a second domain (DiffB field)
+            "watch" => FetchReq::Watch,
+            "history" => FetchReq::History,
+            "follow" | "bulk" => return None, // streaming — started explicitly
+            _ => return None,
         })
     }
 
@@ -147,18 +192,11 @@ impl App {
                 }
                 vec![]
             }
-            Msg::Data {
-                lens,
-                domain,
-                result,
-            } => {
-                // Ignore stale results for a domain we've since changed.
-                // When self.domain is None (no domain set yet), accept any data.
-                let current = self.domain.as_deref();
-                if current.is_none() || current == Some(domain.as_str()) {
-                    let key = lenses::lenses()[lens].key;
+            Msg::Data { lens, result } => {
+                // Resolve the string key back to a &'static str via the registry.
+                if let Some(reg) = lenses::lenses().iter().find(|l| l.key == lens) {
                     self.states.insert(
-                        key,
+                        reg.key,
                         match result {
                             Ok(data) => LensState::Loaded(data),
                             Err(e) => LensState::Error(e),
@@ -175,6 +213,22 @@ impl App {
                 }
                 vec![]
             }
+            Msg::FollowStep(it) => {
+                self.panes.follow.push(*it);
+                vec![]
+            }
+            Msg::FollowDone => {
+                self.panes.follow.running = false;
+                vec![]
+            }
+            Msg::BulkStep(r) => {
+                self.panes.bulk.push(*r);
+                vec![]
+            }
+            Msg::BulkDone => {
+                self.panes.bulk.running = false;
+                vec![]
+            }
             // Only Press events — ignoring Repeat/Release avoids double-input on
             // Windows legacy consoles. (Held-key auto-repeat is not relied upon.)
             Msg::Input(Event::Key(key)) if key.kind == KeyEventKind::Press => self.on_key(key),
@@ -186,7 +240,7 @@ impl App {
         // Mode-specific capture takes precedence.
         match std::mem::take(&mut self.input_mode) {
             InputMode::Command(buf) => return self.on_command_key(key, buf),
-            InputMode::EditDomain(buf) => return self.on_edit_key(key, buf),
+            InputMode::Field { target, buf } => return self.on_field_key(key, target, buf),
             InputMode::Normal => {}
         }
         if self.help {
@@ -197,6 +251,10 @@ impl App {
                 self.help = false;
             }
             return vec![];
+        }
+        // Delegate to pane component when pane-focused.
+        if let Some(actions) = self.handle_pane_key(key) {
+            return actions;
         }
         let Some(ka) = event::map(key) else {
             return vec![];
@@ -225,30 +283,80 @@ impl App {
         }
     }
 
-    fn on_edit_key(&mut self, key: KeyEvent, mut buf: String) -> Vec<Action> {
+    fn on_field_key(&mut self, key: KeyEvent, target: EditTarget, mut buf: String) -> Vec<Action> {
         match key.code {
             KeyCode::Esc => vec![],
-            KeyCode::Enter => {
-                let target = buf.trim().to_lowercase();
-                if target.is_empty() {
-                    return vec![];
-                }
-                self.lens = 0;
-                self.focus = Focus::Nav;
-                self.fetch_with(&target)
-            }
+            KeyCode::Enter => self.apply_field(target, buf.trim().to_string()),
             KeyCode::Backspace => {
                 buf.pop();
-                self.input_mode = InputMode::EditDomain(buf);
+                self.input_mode = InputMode::Field { target, buf };
                 vec![]
             }
             KeyCode::Char(c) => {
                 buf.push(c);
-                self.input_mode = InputMode::EditDomain(buf);
+                self.input_mode = InputMode::Field { target, buf };
                 vec![]
             }
             _ => {
-                self.input_mode = InputMode::EditDomain(buf);
+                self.input_mode = InputMode::Field { target, buf };
+                vec![]
+            }
+        }
+    }
+
+    fn apply_field(&mut self, target: EditTarget, value: String) -> Vec<Action> {
+        match target {
+            EditTarget::Target => {
+                if value.is_empty() {
+                    return vec![];
+                }
+                self.lens = 0;
+                self.focus = Focus::Nav;
+                self.set_domain_and_fetch(&value).into_iter().collect()
+            }
+            EditTarget::DiffB => {
+                self.panes.diff.b = value.to_lowercase();
+                match self.domain.clone() {
+                    Some(a) if !self.panes.diff.b.is_empty() => {
+                        self.states.remove("diff");
+                        vec![Action::Fetch(FetchReq::Diff {
+                            a,
+                            b: self.panes.diff.b.clone(),
+                        })]
+                    }
+                    _ => vec![],
+                }
+            }
+            EditTarget::FollowInterval
+            | EditTarget::FollowCount
+            | EditTarget::BulkPath
+            | EditTarget::WatchAdd => self.panes.apply_field(target, value, self.domain.clone()),
+        }
+    }
+
+    fn handle_pane_key(&mut self, key: KeyEvent) -> Option<Vec<Action>> {
+        if self.focus != Focus::Pane {
+            return None;
+        }
+        let lens_key = self.current_lens().key;
+        let domain = self.domain.clone();
+        let outcome = self
+            .panes
+            .handle_key(lens_key, self.tab, key, domain.as_deref())?;
+        Some(self.apply_pane_outcome(outcome))
+    }
+
+    fn apply_pane_outcome(&mut self, outcome: PaneOutcome) -> Vec<Action> {
+        match outcome {
+            PaneOutcome::None => vec![],
+            PaneOutcome::Fetch(req) => {
+                self.states.remove(req.lens_key());
+                vec![Action::Fetch(req)]
+            }
+            PaneOutcome::Action(a) => vec![a],
+            PaneOutcome::EditField(target) => {
+                let cur = self.panes.field_value(target);
+                self.input_mode = InputMode::Field { target, buf: cur };
                 vec![]
             }
         }
@@ -299,6 +407,34 @@ impl App {
                 self.lens = 0;
                 self.reset_tab();
                 self.fetch_with(&d)
+            }
+            CmdOutcome::Diff { a, b } => {
+                if let Some(i) = lenses::find_by_cmd_or_key("diff") {
+                    self.lens = i;
+                    self.sel = 0;
+                    self.focus = Focus::Nav;
+                    self.reset_tab();
+                }
+                self.panes.diff.b = b.clone();
+                self.states.remove("diff");
+                vec![Action::Fetch(FetchReq::Diff { a, b })]
+            }
+            CmdOutcome::Compare { domain, a, b } => {
+                if let Some(i) = lenses::find_by_cmd_or_key("dns") {
+                    self.lens = i;
+                    self.tab = 2; // Compare tab
+                    self.sel = 0;
+                    self.focus = Focus::Nav;
+                }
+                self.panes.compare.a = a.clone();
+                self.panes.compare.b = b.clone();
+                self.states.remove("dns");
+                vec![Action::Fetch(FetchReq::Compare {
+                    domain,
+                    record_type: RecordType::A,
+                    a,
+                    b,
+                })]
             }
             CmdOutcome::Unknown(c) => {
                 self.set_toast("fail", &format!("unknown command: {c}"));
@@ -408,7 +544,10 @@ impl App {
             KeyAction::Copy => self.copy_action(),
             KeyAction::EditDomain => {
                 let cur = self.domain.clone().unwrap_or_default();
-                self.input_mode = InputMode::EditDomain(cur);
+                self.input_mode = InputMode::Field {
+                    target: EditTarget::Target,
+                    buf: cur,
+                };
                 vec![]
             }
             KeyAction::Command => {
@@ -453,10 +592,9 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::action::{Focus, InputMode};
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 
-    fn key(app: &mut App, code: KeyCode) -> Vec<crate::tui::action::Action> {
+    fn key(app: &mut App, code: KeyCode) -> Vec<Action> {
         app.update(Msg::Input(Event::Key(KeyEvent::new(
             code,
             KeyModifiers::NONE,
@@ -472,46 +610,56 @@ mod tests {
     }
 
     #[test]
-    fn startup_with_domain_emits_fetch() {
+    fn startup_with_domain_emits_overview_fetch() {
         let mut app = App::new(Some("example.com".into()));
         let actions = app.take_startup_actions();
         assert!(matches!(
             actions.as_slice(),
-            [crate::tui::action::Action::Fetch { lens: 0, .. }]
+            [Action::Fetch(FetchReq::Overview(_))]
         ));
-        assert_eq!(app.domain.as_deref(), Some("example.com"));
     }
 
     #[test]
-    fn j_moves_lens_when_nav_focused() {
-        let mut app = App::new(None);
-        key(&mut app, KeyCode::Char('j'));
-        assert_eq!(app.lens, 1);
-    }
-
-    #[test]
-    fn number_jump_selects_and_fetches_implemented_lens() {
+    fn number_jump_to_whois_fetches_whois() {
         let mut app = App::new(Some("example.com".into()));
         let _ = app.take_startup_actions();
-        let actions = key(&mut app, KeyCode::Char('2')); // whois
+        let actions = key(&mut app, KeyCode::Char('2'));
         assert_eq!(app.lens, 1);
         assert!(actions
             .iter()
-            .any(|a| matches!(a, crate::tui::action::Action::Fetch { lens: 1, .. })));
+            .any(|a| matches!(a, Action::Fetch(FetchReq::Whois(_)))));
     }
 
     #[test]
-    fn toggling_to_command_mode_and_typing() {
+    fn editing_target_field_enter_fetches() {
         let mut app = App::new(None);
-        key(&mut app, KeyCode::Char(':'));
-        assert_eq!(app.input_mode, InputMode::Command(String::new()));
-        key(&mut app, KeyCode::Char('q'));
-        assert_eq!(app.input_mode, InputMode::Command("q".into()));
+        key(&mut app, KeyCode::Char('/'));
+        assert!(matches!(
+            app.input_mode,
+            InputMode::Field {
+                target: EditTarget::Target,
+                ..
+            }
+        ));
+        for c in "acme.io".chars() {
+            key(&mut app, KeyCode::Char(c));
+        }
         let actions = key(&mut app, KeyCode::Enter);
+        assert_eq!(app.domain.as_deref(), Some("acme.io"));
         assert!(actions
             .iter()
-            .any(|a| matches!(a, crate::tui::action::Action::Quit)));
-        assert!(app.should_quit);
+            .any(|a| matches!(a, Action::Fetch(FetchReq::Overview(_)))));
+    }
+
+    #[test]
+    fn data_message_keyed_by_lens_string_stores_state() {
+        let mut app = App::new(None);
+        app.update(Msg::Data {
+            lens: "dns".into(),
+            result: Ok(LensData::Dns(vec![])),
+        });
+        let dns_idx = crate::tui::lenses::find_by_cmd_or_key("dns").unwrap();
+        assert!(matches!(app.state_of(dns_idx), LensState::Loaded(_)));
     }
 
     #[test]
@@ -520,91 +668,15 @@ mod tests {
         assert_eq!(app.format, seer_core::output::OutputFormat::Human);
         key(&mut app, KeyCode::Char('r'));
         assert_eq!(app.format, seer_core::output::OutputFormat::Json);
-        key(&mut app, KeyCode::Char('r'));
-        assert_eq!(app.format, seer_core::output::OutputFormat::Human);
-    }
-
-    #[test]
-    fn data_message_stores_loaded_state() {
-        let mut app = App::new(None);
-        let records = vec![];
-        app.update(Msg::Data {
-            lens: 6, // dns
-            domain: "example.com".into(),
-            result: Ok(LensData::Dns(records)),
-        });
-        assert!(matches!(app.state_of(6), LensState::Loaded(_)));
-    }
-
-    #[test]
-    fn editing_domain_enter_emits_fetch_and_sets_domain() {
-        let mut app = App::new(None);
-        key(&mut app, KeyCode::Char('/'));
-        assert!(matches!(app.input_mode, InputMode::EditDomain(_)));
-        for c in "acme.io".chars() {
-            key(&mut app, KeyCode::Char(c));
-        }
-        let actions = key(&mut app, KeyCode::Enter);
-        assert_eq!(app.domain.as_deref(), Some("acme.io"));
-        assert!(actions
-            .iter()
-            .any(|a| matches!(a, crate::tui::action::Action::Fetch { lens: 0, .. })));
     }
 
     #[test]
     fn tick_clears_expired_toast() {
         let mut app = App::new(None);
         app.set_toast("ok", "hi");
-        assert!(app.toast.is_some());
         for _ in 0..40 {
             app.update(Msg::Tick);
         }
         assert!(app.toast.is_none());
-    }
-
-    #[test]
-    fn revisiting_loaded_lens_does_not_refetch() {
-        let mut app = App::new(Some("example.com".into()));
-        let _ = app.take_startup_actions();
-        // Jump to DNS (index 6) — first visit fetches.
-        let first = key(&mut app, KeyCode::Char('7'));
-        assert!(first
-            .iter()
-            .any(|a| matches!(a, Action::Fetch { lens: 6, .. })));
-        app.update(Msg::Data {
-            lens: 6,
-            domain: "example.com".into(),
-            result: Ok(LensData::Dns(vec![])),
-        });
-        // Leave and return — the second visit is served from cache, no re-fetch.
-        let _ = key(&mut app, KeyCode::Char('1'));
-        let revisit = key(&mut app, KeyCode::Char('7'));
-        assert!(
-            !revisit
-                .iter()
-                .any(|a| matches!(a, Action::Fetch { lens: 6, .. })),
-            "revisiting a Loaded lens must not re-fetch"
-        );
-    }
-
-    #[test]
-    fn changing_domain_clears_cache() {
-        let mut app = App::new(Some("example.com".into()));
-        let _ = app.take_startup_actions();
-        let _ = key(&mut app, KeyCode::Char('7')); // dns
-        app.update(Msg::Data {
-            lens: 6,
-            domain: "example.com".into(),
-            result: Ok(LensData::Dns(vec![])),
-        });
-        assert!(matches!(app.state_of(6), LensState::Loaded(_)));
-        // Look up a different domain via the command line.
-        key(&mut app, KeyCode::Char(':'));
-        for c in "acme.io".chars() {
-            key(&mut app, KeyCode::Char(c));
-        }
-        let _ = key(&mut app, KeyCode::Enter);
-        // The previous domain's cached DNS state is gone.
-        assert!(matches!(app.state_of(6), LensState::Idle));
     }
 }

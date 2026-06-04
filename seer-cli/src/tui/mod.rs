@@ -12,6 +12,7 @@ mod command;
 mod data;
 mod event;
 mod lenses;
+mod panes;
 mod raw;
 mod render;
 mod theme;
@@ -109,20 +110,19 @@ async fn run_loop(terminal: &mut Term, domain: Option<String>) -> Result<()> {
 fn handle_action(action: Action, tx: &tokio::sync::mpsc::UnboundedSender<Msg>) {
     match action {
         Action::Quit => {}
-        Action::Fetch { lens, domain } => {
+        Action::Fetch(req) => {
             let tx = tx.clone();
+            let lens = req.lens_key().to_string();
             tokio::spawn(async move {
-                let result = data::fetch(lens, &domain).await;
-                let _ = tx.send(Msg::Data {
-                    lens,
-                    domain,
-                    result,
-                });
+                let result = data::fetch(req).await;
+                let _ = tx.send(Msg::Data { lens, result });
             });
         }
         Action::Copy { text, label } => {
             let ok = clipboard::copy(&text).is_ok();
             let _ = tx.send(Msg::CopyResult { ok, label });
         }
+        // StartFollow / StartBulk / WriteCsv are wired in Tasks 17–20; until then they fall through.
+        _ => {}
     }
 }
