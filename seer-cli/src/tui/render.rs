@@ -7,7 +7,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
-use crate::tui::action::{InputMode, LensState};
+use crate::tui::action::{EditTarget, InputMode, LensState};
 use crate::tui::app::{App, SPIN};
 use crate::tui::lenses::{self};
 use crate::tui::theme::Theme;
@@ -43,7 +43,11 @@ pub fn view(f: &mut Frame, app: &App, theme: &Theme) {
 fn top_bar(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     let domain = app.domain.as_deref().unwrap_or("(no target)");
     let target = match &app.input_mode {
-        InputMode::EditDomain(buf) => format!("⌕ {buf}▏"),
+        InputMode::Field {
+            target: EditTarget::Target,
+            buf,
+        } => format!("⌕ {buf}▏"),
+        // Other field targets are rendered inside their panes; top-bar shows current domain.
         _ => format!("⌕ {domain}"),
     };
     let ip = match app.state_of(app.lens) {
