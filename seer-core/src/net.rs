@@ -50,12 +50,19 @@ static FALLBACK_RESOLVER: Lazy<TokioResolver> = Lazy::new(|| {
 /// Reject an IP address if it belongs to any range that is not appropriate
 /// for outbound queries from a public-facing tool.
 ///
-/// This covers: loopback, private (RFC1918), link-local (incl. 169.254.169.254
-/// cloud metadata), multicast, unspecified, documentation, benchmarking,
-/// IPv6 ULA, and IPv6 link-local.
+/// This is the single source of truth for SSRF range checks across every
+/// outbound leg (RDAP, WHOIS, status, DNS). It covers, for IPv4: loopback,
+/// private (RFC1918), link-local (incl. 169.254.169.254 metadata), multicast,
+/// broadcast, unspecified, 0.0.0.0/8, documentation (RFC5737), CGNAT
+/// (100.64/10), IETF 192.0.0.0/24, benchmark (198.18/15), and class-E
+/// (240/4); and for IPv6: loopback, multicast, unspecified, ULA (fc00::/7),
+/// link-local (fe80::/10), documentation (2001:db8::/32), 6to4 (2002::/16),
+/// NAT64 (64:ff9b::/96), and the IPv4-mapped/-compatible forms (re-checking
+/// the embedded IPv4).
 pub fn is_reserved_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
+            let o = v4.octets();
             v4.is_loopback()
                 || v4.is_private()
                 || v4.is_link_local()
@@ -63,25 +70,74 @@ pub fn is_reserved_ip(ip: IpAddr) -> bool {
                 || v4.is_broadcast()
                 || v4.is_unspecified()
                 || v4.is_documentation()
+                // 0.0.0.0/8 — "this network" (RFC 1122).
+                || o[0] == 0
+                // 240.0.0.0/4 — reserved (former class E).
+                || o[0] >= 240
                 // 100.64.0.0/10 — carrier-grade NAT / shared address space.
-                || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xC0) == 64)
-                // 192.0.0.0/24 — IETF reserved.
-                || (v4.octets()[0] == 192 && v4.octets()[1] == 0 && v4.octets()[2] == 0)
+                || (o[0] == 100 && (o[1] & 0xC0) == 64)
+                // 192.0.0.0/24 — IETF protocol assignments.
+                || (o[0] == 192 && o[1] == 0 && o[2] == 0)
                 // 198.18.0.0/15 — network benchmark.
-                || (v4.octets()[0] == 198 && (v4.octets()[1] == 18 || v4.octets()[1] == 19))
+                || (o[0] == 198 && (o[1] == 18 || o[1] == 19))
         }
         IpAddr::V6(v6) => {
-            v6.is_loopback()
-                || v6.is_multicast()
-                || v6.is_unspecified()
-                // Unique-local fc00::/7
-                || (v6.segments()[0] & 0xfe00) == 0xfc00
-                // Link-local fe80::/10
-                || (v6.segments()[0] & 0xffc0) == 0xfe80
-                // IPv4-mapped (::ffff:0:0/96) — check embedded IPv4
-                || v6
-                    .to_ipv4_mapped()
-                    .is_some_and(|v4| is_reserved_ip(IpAddr::V4(v4)))
+            if v6.is_loopback() || v6.is_multicast() || v6.is_unspecified() {
+                return true;
+            }
+            let seg = v6.segments();
+            // Unique-local fc00::/7
+            if (seg[0] & 0xfe00) == 0xfc00 {
+                return true;
+            }
+            // Link-local fe80::/10
+            if (seg[0] & 0xffc0) == 0xfe80 {
+                return true;
+            }
+            // Documentation 2001:db8::/32
+            if seg[0] == 0x2001 && seg[1] == 0x0db8 {
+                return true;
+            }
+            // 6to4 2002::/16 — embeds an IPv4 a 6to4 relay can reach (e.g.
+            // 2002:a9fe:a9fe:: -> 169.254.169.254); block the whole prefix.
+            if seg[0] == 0x2002 {
+                return true;
+            }
+            // NAT64 well-known prefix 64:ff9b::/96 — a NAT64 gateway translates
+            // the embedded IPv4, including private/metadata ranges.
+            if seg[0] == 0x0064
+                && seg[1] == 0xff9b
+                && seg[2] == 0
+                && seg[3] == 0
+                && seg[4] == 0
+                && seg[5] == 0
+            {
+                return true;
+            }
+            // IPv4-mapped (::ffff:0:0/96) — re-check the embedded IPv4.
+            if v6
+                .to_ipv4_mapped()
+                .is_some_and(|v4| is_reserved_ip(IpAddr::V4(v4)))
+            {
+                return true;
+            }
+            // IPv4-compatible (::/96, deprecated) — high 96 bits zero, low 32
+            // an IPv4. `to_ipv4_mapped()` does NOT catch this form, so re-check
+            // the embedded IPv4 (catches ::169.254.169.254). :: and ::1 are
+            // already handled above.
+            if seg[0] == 0
+                && seg[1] == 0
+                && seg[2] == 0
+                && seg[3] == 0
+                && seg[4] == 0
+                && seg[5] == 0
+            {
+                let embedded = std::net::Ipv4Addr::from(((seg[6] as u32) << 16) | seg[7] as u32);
+                if is_reserved_ip(IpAddr::V4(embedded)) {
+                    return true;
+                }
+            }
+            false
         }
     }
 }
@@ -212,6 +268,55 @@ mod tests {
     #[test]
     fn rejects_ipv4_mapped_loopback() {
         assert!(is_reserved_ip("::ffff:127.0.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn rejects_ipv4_mapped_cgnat() {
+        // ::ffff:100.64.0.1 must inherit the embedded IPv4's CGNAT block.
+        assert!(is_reserved_ip("::ffff:100.64.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn rejects_class_e_reserved() {
+        assert!(is_reserved_ip("240.0.0.1".parse().unwrap()));
+        assert!(is_reserved_ip("250.1.2.3".parse().unwrap()));
+    }
+
+    #[test]
+    fn rejects_this_network_0_8() {
+        // 0.0.0.0/8 "this network" (RFC 1122), not just 0.0.0.0.
+        assert!(is_reserved_ip("0.1.2.3".parse().unwrap()));
+    }
+
+    #[test]
+    fn rejects_ipv6_nat64_of_metadata() {
+        // 64:ff9b::169.254.169.254 — NAT64 well-known prefix wrapping the
+        // cloud-metadata endpoint.
+        assert!(is_reserved_ip("64:ff9b::a9fe:a9fe".parse().unwrap()));
+    }
+
+    #[test]
+    fn rejects_ipv6_6to4() {
+        // 2002:a9fe:a9fe:: — 6to4 encoding of 169.254.169.254.
+        assert!(is_reserved_ip("2002:a9fe:a9fe::".parse().unwrap()));
+    }
+
+    #[test]
+    fn rejects_ipv4_compatible_metadata() {
+        // ::169.254.169.254 — deprecated IPv4-compatible form embedding the
+        // metadata IP (to_ipv4_mapped() does NOT catch this).
+        assert!(is_reserved_ip("::a9fe:a9fe".parse().unwrap()));
+    }
+
+    #[test]
+    fn rejects_ipv6_documentation() {
+        assert!(is_reserved_ip("2001:db8::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn allows_ipv4_compatible_public() {
+        // ::8.8.8.8 embeds a public IPv4 — not reserved.
+        assert!(!is_reserved_ip("::808:808".parse().unwrap()));
     }
 
     #[test]
