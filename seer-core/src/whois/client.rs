@@ -303,16 +303,17 @@ async fn query_server_internal(
         ));
     }
 
-    // SSRF guard: resolve the server hostname and refuse any address in a
-    // reserved/private/loopback/link-local range BEFORE touching the network.
-    // This closes the referral-based SSRF vector where a malicious TLD server
-    // could redirect queries to internal TCP services (H1).
-    crate::net::validate_public_host(server, WHOIS_PORT).await?;
-
-    let addr = format!("{}:{}", server, WHOIS_PORT);
+    // SSRF guard: resolve the server hostname, refuse any address in a
+    // reserved/private/loopback/link-local range, and connect to the VALIDATED
+    // SocketAddrs. Connecting to the resolved addresses (rather than letting
+    // TcpStream::connect("host:port") re-resolve) closes the DNS-rebinding
+    // TOCTOU where a hostile authoritative DNS for a referral/IANA-discovered
+    // server could answer the validation lookup with a public IP and the
+    // connect lookup with 127.0.0.1 / 169.254.169.254 / RFC1918.
+    let addrs = crate::net::resolve_public_host(server, WHOIS_PORT).await?;
 
     debug!("WHOIS query to {}", server);
-    let mut stream = timeout(timeout_duration, TcpStream::connect(&addr))
+    let mut stream = timeout(timeout_duration, TcpStream::connect(addrs.as_slice()))
         .await
         .map_err(|_| SeerError::Timeout(format!("connection to {} timed out", server)))?
         .map_err(|e| SeerError::WhoisError(format!("failed to connect to {}: {}", server, e)))?;
