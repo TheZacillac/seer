@@ -14,6 +14,15 @@ pub fn serialize(data: &LensData, format: OutputFormat) -> String {
         LensData::Ssl(s) => fmt.format_ssl(s),
         LensData::Status(s) => fmt.format_status(s),
         LensData::Prop(p) => fmt.format_propagation(p),
+        LensData::Reverse(records) => fmt.format_dns(records),
+        LensData::Avail(a) => fmt.format_availability(a),
+        LensData::Tld(t) => fmt.format_tld(t),
+        LensData::Dnssec(r) => fmt.format_dnssec(r),
+        LensData::Compare(c) => fmt.format_dns_comparison(c),
+        LensData::Diff(d) => fmt.format_diff(d),
+        LensData::Watch(w) => fmt.format_watch(w),
+        LensData::History(_) => "history (raw view not applicable)".to_string(),
+        LensData::Subdomains(s) => fmt.format_subdomains(s),
     }
 }
 

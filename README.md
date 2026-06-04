@@ -160,9 +160,16 @@ seer tui                  # start on the target prompt
 seer tui example.com      # look up a domain on launch
 ```
 
-A grouped **lens** sidebar (Overview · WHOIS · RDAP · DNS · SSL · Status · Propagation, with more on the way) drives a live detail pane backed by the same `seer-core` engine as the CLI.
+The **lens** sidebar covers every Seer capability, grouped, each pulling live data from the same `seer-core` engine as the CLI with full in-pane controls:
 
-**Keys:** `j`/`k` move · `1`–`9` jump to a lens · `Tab` focus nav⇄pane · `[` `]` sub-tabs · `r` raw output (json/yaml/markdown) · `y` copy · `/` look up a domain · `:` command · `?` help · `:q` quit.
+- **LOOKUP** — Overview · WHOIS · RDAP (Domain · IP · ASN) · Reverse DNS · Availability · TLD Info
+- **DNS** — Records (+ custom nameserver) · DNSSEC · Compare (two resolvers) · Propagation · Follow (live monitor)
+- **SECURITY** — SSL / Cert · Status · Subdomains
+- **POWER** — Diff · Bulk (streaming + CSV export) · Watchlist · History
+
+**Keys:** `j`/`k` move · `1`–`9` jump to a lens · `Tab` focus nav⇄pane · `[` `]` sub-tabs · `r` raw output (json/yaml/markdown) · `y` copy · `/` look up a domain · `:` command · `?` help · `:q` quit. In-pane: switchers (TLD, nameserver, Compare resolvers, Bulk op) and editable fields (Diff's 2nd domain, Follow interval/count, Bulk file path).
+
+**Commands (`:`):** `lookup`, `whois`, `rdap <domain|ip|AS####>`, `dig`, `ssl`, `status`, `reverse <ip>`, `tld <.tld>`, `compare <domain> <nsA> <nsB>`, `diff <a> <b>`, `set output <human|json|yaml|markdown>`, `copy`, `q`.
 
 ### Command Mode
 

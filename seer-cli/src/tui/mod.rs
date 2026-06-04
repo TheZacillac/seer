@@ -12,6 +12,7 @@ mod command;
 mod data;
 mod event;
 mod lenses;
+mod panes;
 mod raw;
 mod render;
 mod theme;
@@ -32,6 +33,7 @@ use ratatui::Terminal;
 
 use action::{Action, Msg};
 use app::App;
+use seer_core::{LookupHistory, Watchlist};
 use theme::Theme;
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
@@ -109,20 +111,162 @@ async fn run_loop(terminal: &mut Term, domain: Option<String>) -> Result<()> {
 fn handle_action(action: Action, tx: &tokio::sync::mpsc::UnboundedSender<Msg>) {
     match action {
         Action::Quit => {}
-        Action::Fetch { lens, domain } => {
+        Action::Fetch { req, gen } => {
             let tx = tx.clone();
+            let lens = req.lens_key().to_string();
             tokio::spawn(async move {
-                let result = data::fetch(lens, &domain).await;
-                let _ = tx.send(Msg::Data {
-                    lens,
-                    domain,
-                    result,
-                });
+                let result = data::fetch(req).await;
+                let _ = tx.send(Msg::Data { lens, gen, result });
             });
         }
         Action::Copy { text, label } => {
             let ok = clipboard::copy(&text).is_ok();
             let _ = tx.send(Msg::CopyResult { ok, label });
+        }
+        Action::WatchMutate { add, remove } => {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                // File I/O is blocking — run in spawn_blocking to keep the async loop free.
+                tokio::task::spawn_blocking(move || {
+                    let mut wl = Watchlist::load();
+                    if let Some(a) = add {
+                        let _ = wl.add(&a);
+                    }
+                    if let Some(r) = remove {
+                        wl.remove(&r);
+                    }
+                    let _ = wl.save();
+                })
+                .await
+                .ok();
+                // Refresh the watchlist lens after mutation.
+                // gen 0 is always accepted: WatchMutate bypasses the fetch_action
+                // path so fetch_gen["watch"] stays at 0 unless a lens navigation fetch
+                // has already bumped it (rare race — see generation guard in app.rs).
+                let result = data::fetch(action::FetchReq::Watch).await;
+                let _ = tx.send(Msg::Data {
+                    lens: "watch".into(),
+                    gen: 0,
+                    result,
+                });
+            });
+        }
+        Action::HistoryClear => {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                tokio::task::spawn_blocking(|| {
+                    let mut h = LookupHistory::load();
+                    h.clear();
+                    let _ = h.save();
+                })
+                .await
+                .ok();
+                // Refresh the history lens after clearing.
+                // gen 0: same rationale as WatchMutate above.
+                let result = data::fetch(action::FetchReq::History).await;
+                let _ = tx.send(Msg::Data {
+                    lens: "history".into(),
+                    gen: 0,
+                    result,
+                });
+            });
+        }
+        Action::StartFollow(p) => {
+            let tx = tx.clone();
+            let gen = p.gen;
+            tokio::spawn(async move {
+                let interval_minutes = p.interval_secs as f64 / 60.0;
+                if let Ok(config) = seer_core::FollowConfig::new(p.iterations, interval_minutes) {
+                    let config = config.with_changes_only(false);
+                    let cb_tx = tx.clone();
+                    let cb: seer_core::dns::FollowProgressCallback =
+                        std::sync::Arc::new(move |it: &seer_core::dns::FollowIteration| {
+                            let _ = cb_tx.send(Msg::FollowStep {
+                                gen,
+                                it: Box::new(it.clone()),
+                            });
+                        });
+                    let _ = seer_core::DnsFollower::new()
+                        .follow(
+                            &p.domain,
+                            seer_core::RecordType::A,
+                            None,
+                            config,
+                            Some(cb),
+                            None,
+                        )
+                        .await;
+                }
+                let _ = tx.send(Msg::FollowDone { gen });
+            });
+        }
+        Action::StartBulk(p) => {
+            let tx = tx.clone();
+            let gen = p.gen;
+            tokio::spawn(async move {
+                let ex = seer_core::BulkExecutor::new();
+                let results = match p.op.as_str() {
+                    "status" => ex.execute_status(p.domains).await,
+                    "dig" => ex.execute_dns(p.domains, seer_core::RecordType::A).await,
+                    "avail" => ex.execute_avail(p.domains).await,
+                    "info" => ex.execute_info(p.domains).await,
+                    _ => ex.execute_lookup(p.domains).await,
+                };
+                for r in results {
+                    let _ = tx.send(Msg::BulkStep {
+                        gen,
+                        result: Box::new(r),
+                    });
+                }
+                let _ = tx.send(Msg::BulkDone { gen });
+            });
+        }
+        Action::StartBulkFromFile { op, path, gen } => {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let read_result =
+                    tokio::task::spawn_blocking(move || std::fs::read_to_string(&path)).await;
+                let Ok(Ok(content)) = read_result else {
+                    let _ = tx.send(Msg::CopyResult {
+                        ok: false,
+                        label: "bulk file not found".into(),
+                    });
+                    let _ = tx.send(Msg::BulkDone { gen });
+                    return;
+                };
+                let mut domains = seer_core::bulk::parse_domains_from_file(&content);
+                // Cap to 50 to match CLI bulk limit
+                domains.truncate(50);
+                let ex = seer_core::BulkExecutor::new();
+                let results = match op.as_str() {
+                    "status" => ex.execute_status(domains).await,
+                    "dig" => ex.execute_dns(domains, seer_core::RecordType::A).await,
+                    "avail" => ex.execute_avail(domains).await,
+                    "info" => ex.execute_info(domains).await,
+                    _ => ex.execute_lookup(domains).await,
+                };
+                for r in results {
+                    let _ = tx.send(Msg::BulkStep {
+                        gen,
+                        result: Box::new(r),
+                    });
+                }
+                let _ = tx.send(Msg::BulkDone { gen });
+            });
+        }
+        Action::WriteCsv { path, contents } => {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let path_clone = path.clone();
+                let ok = tokio::task::spawn_blocking(move || std::fs::write(&path_clone, contents))
+                    .await
+                    .map(|r| r.is_ok())
+                    .unwrap_or(false);
+                let _ = tx.send(Msg::CopyResult {
+                    ok,
+                    label: format!("wrote {path}"),
+                });
+            });
         }
     }
 }

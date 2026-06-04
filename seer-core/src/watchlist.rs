@@ -151,11 +151,16 @@ impl Watchlist {
 pub async fn check_watchlist(domains: &[String]) -> WatchReport {
     use futures::stream::{self, StreamExt};
 
-    let client = StatusClient::new();
+    // Each per-domain future owns its `client` (via `Arc`) and `domain`
+    // (owned `String`) so the `buffer_unordered` futures are `Send + 'static`
+    // and the whole `check_watchlist` future can be used from `tokio::spawn`
+    // (e.g. the TUI). Borrowing `&client`/`&String` here makes the closure fail
+    // the higher-ranked `FnOnce` bound `tokio::spawn` requires.
+    let client = std::sync::Arc::new(StatusClient::new());
 
-    let results: Vec<WatchResult> = stream::iter(domains)
+    let results: Vec<WatchResult> = stream::iter(domains.iter().cloned())
         .map(|domain| {
-            let client = &client;
+            let client = client.clone();
             async move {
                 let mut watch_result = WatchResult {
                     domain: domain.clone(),
@@ -166,7 +171,7 @@ pub async fn check_watchlist(domains: &[String]) -> WatchReport {
                     issues: vec![],
                 };
 
-                match client.check(domain).await {
+                match client.check(&domain).await {
                     Ok(status) => {
                         watch_result.http_status = status.http_status;
 

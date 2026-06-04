@@ -7,7 +7,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
-use crate::tui::action::{InputMode, LensState};
+use crate::tui::action::{EditTarget, InputMode, LensState};
 use crate::tui::app::{App, SPIN};
 use crate::tui::lenses::{self};
 use crate::tui::theme::Theme;
@@ -43,7 +43,11 @@ pub fn view(f: &mut Frame, app: &App, theme: &Theme) {
 fn top_bar(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     let domain = app.domain.as_deref().unwrap_or("(no target)");
     let target = match &app.input_mode {
-        InputMode::EditDomain(buf) => format!("⌕ {buf}▏"),
+        InputMode::Field {
+            target: EditTarget::Target,
+            buf,
+        } => format!("⌕ {buf}▏"),
+        // Other field targets are rendered inside their panes; top-bar shows current domain.
         _ => format!("⌕ {domain}"),
     };
     let ip = match app.state_of(app.lens) {
@@ -182,10 +186,17 @@ fn main_pane(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             if !lens.implemented {
                 lenses::placeholder::render(f, content, theme, lens.label);
             } else {
-                let hint = Line::from(Span::styled(
-                    "press / to look up a domain",
-                    Style::default().fg(theme.overlay0),
-                ));
+                // Tab-specific idle hints for the RDAP lens.
+                let hint_text = if lens.key == "rdap" {
+                    match app.tab {
+                        2 => "use :rdap AS<number>  (e.g. :rdap AS15169)",
+                        1 => "use :rdap <ip>  or navigate to a domain first",
+                        _ => "press / to look up a domain",
+                    }
+                } else {
+                    "press / to look up a domain"
+                };
+                let hint = Line::from(Span::styled(hint_text, Style::default().fg(theme.overlay0)));
                 f.render_widget(Paragraph::new(hint), content);
             }
             return;
@@ -212,7 +223,9 @@ fn main_pane(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     // Human view: dispatch to the lens renderer.
     if let LensState::Loaded(data) = app.state_of(app.lens) {
         let focused = app.focus == crate::tui::action::Focus::Pane;
-        lenses::render(f, content, theme, lens.key, app.tab, data, focused, app.sel);
+        lenses::render(
+            f, content, theme, lens.key, app.tab, data, focused, app.sel, &app.panes,
+        );
     }
 }
 
