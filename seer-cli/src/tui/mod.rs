@@ -125,9 +125,17 @@ fn handle_action(action: Action, tx: &tokio::sync::mpsc::UnboundedSender<Msg>) {
         }
         Action::Copy { text, label } => {
             let ok = clipboard::copy(&text).is_ok();
+            // On success the label names the copied content ("copied <label>");
+            // on failure the CopyResult handler shows the label verbatim, so
+            // substitute a clipboard-specific error message.
+            let label = if ok {
+                label
+            } else {
+                "copy failed — clipboard unavailable".to_string()
+            };
             let _ = tx.send(Msg::CopyResult { ok, label });
         }
-        Action::WatchMutate { add, remove } => {
+        Action::WatchMutate { add, remove, gen } => {
             let tx = tx.clone();
             tokio::spawn(async move {
                 // File I/O is blocking — run in spawn_blocking to keep the async loop free.
@@ -143,19 +151,18 @@ fn handle_action(action: Action, tx: &tokio::sync::mpsc::UnboundedSender<Msg>) {
                 })
                 .await
                 .ok();
-                // Refresh the watchlist lens after mutation.
-                // gen 0 is always accepted: WatchMutate bypasses the fetch_action
-                // path so fetch_gen["watch"] stays at 0 unless a lens navigation fetch
-                // has already bumped it (rare race — see generation guard in app.rs).
+                // Refresh the watchlist lens after mutation. `gen` is the watch
+                // lens's current fetch generation (bumped by App when emitting
+                // this action), so the refresh survives the staleness guard.
                 let result = data::fetch(action::FetchReq::Watch).await;
                 let _ = tx.send(Msg::Data {
                     lens: "watch".into(),
-                    gen: 0,
+                    gen,
                     result,
                 });
             });
         }
-        Action::HistoryClear => {
+        Action::HistoryClear { gen } => {
             let tx = tx.clone();
             tokio::spawn(async move {
                 tokio::task::spawn_blocking(|| {
@@ -165,12 +172,12 @@ fn handle_action(action: Action, tx: &tokio::sync::mpsc::UnboundedSender<Msg>) {
                 })
                 .await
                 .ok();
-                // Refresh the history lens after clearing.
-                // gen 0: same rationale as WatchMutate above.
+                // Refresh the history lens after clearing. `gen` is the history
+                // lens's current fetch generation (see WatchMutate above).
                 let result = data::fetch(action::FetchReq::History).await;
                 let _ = tx.send(Msg::Data {
                     lens: "history".into(),
-                    gen: 0,
+                    gen,
                     result,
                 });
             });
@@ -266,10 +273,12 @@ fn handle_action(action: Action, tx: &tokio::sync::mpsc::UnboundedSender<Msg>) {
                     .await
                     .map(|r| r.is_ok())
                     .unwrap_or(false);
-                let _ = tx.send(Msg::CopyResult {
-                    ok,
-                    label: format!("wrote {path}"),
-                });
+                let label = if ok {
+                    format!("wrote {path}")
+                } else {
+                    format!("failed to write {path}")
+                };
+                let _ = tx.send(Msg::CopyResult { ok, label });
             });
         }
     }

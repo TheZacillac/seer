@@ -241,7 +241,9 @@ impl BulkExecutor {
                                 operation: op,
                                 success: false,
                                 data: None,
-                                error: Some(e.to_string()),
+                                // Store the sanitized form for external return;
+                                // full detail stays in the debug log above.
+                                error: Some(e.sanitized_message()),
                                 duration_ms,
                             }
                         }

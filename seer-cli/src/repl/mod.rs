@@ -498,20 +498,11 @@ impl Repl {
         let query = args[0];
         let spinner = Spinner::new(&format!("Looking up RDAP for {}", query));
 
-        // Determine query type
-        let result = if query.starts_with("AS") || query.starts_with("as") {
-            match query[2..].parse::<u32>() {
-                Ok(asn) => self.rdap_client.lookup_asn(asn).await,
-                Err(_) => {
-                    spinner.finish();
-                    return CommandResult::Error("Invalid ASN format".to_string());
-                }
-            }
-        } else if query.parse::<std::net::IpAddr>().is_ok() {
-            self.rdap_client.lookup_ip(query).await
-        } else {
-            self.rdap_client.lookup_domain(query).await
-        };
+        // Mirror the non-REPL CLI path: seer_core::rdap::auto_lookup classifies
+        // the query so the `AS<digits>` route only fires when the remainder is
+        // all digits AND there's no `.` — otherwise `asana.com` / `as1234.io`
+        // would misroute to ASN and surface a parse error.
+        let result = seer_core::rdap::auto_lookup(&self.rdap_client, query).await;
 
         match result {
             Ok(response) => {
@@ -911,6 +902,10 @@ impl Repl {
         let mut record_type = seer_core::RecordType::A;
         let mut nameserver: Option<&str> = None;
         let mut changes_only = false;
+        // Track whether the first numeric positional (iterations) has been
+        // consumed. Comparing against the default `10` is wrong because
+        // `follow x 10 5` would treat the explicit `10` as "not yet set".
+        let mut iterations_set = false;
 
         // Parse remaining args
         for arg in &args[1..] {
@@ -920,8 +915,9 @@ impl Repl {
                 changes_only = true;
             } else if let Ok(n) = arg.parse::<usize>() {
                 // First number is iterations, second is interval
-                if iterations == 10 {
+                if !iterations_set {
                     iterations = n;
+                    iterations_set = true;
                 } else {
                     interval_minutes = n as f64;
                 }

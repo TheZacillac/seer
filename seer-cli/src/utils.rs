@@ -718,6 +718,7 @@ mod tests {
             protocol_version: Some("TLS 1.3".to_string()),
             san_names: vec!["example.com".to_string(), "www.example.com".to_string()],
             is_valid: true,
+            hostname_verified: true,
             days_until_expiry: 89,
             caa: None,
         }

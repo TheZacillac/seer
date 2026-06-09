@@ -33,8 +33,25 @@ pub struct SslReport {
     pub protocol_version: Option<String>,
     /// Subject Alternative Names from the leaf certificate
     pub san_names: Vec<String>,
-    /// Whether the certificate chain is currently valid
+    /// Whether the leaf certificate is within its validity period.
+    ///
+    /// This reflects ONLY the date-range check (`notBefore <= now <=
+    /// notAfter`) of the leaf certificate. It does NOT verify the certificate
+    /// chain's trust (this checker uses `danger_accept_invalid_certs(true)` to
+    /// inspect broken/self-signed certs) nor that the certificate matches the
+    /// requested hostname — see [`SslReport::hostname_verified`]. A
+    /// date-valid cert may still be self-signed, issued by an untrusted CA, or
+    /// presented for the wrong host.
     pub is_valid: bool,
+    /// Whether the leaf certificate's SAN dNSNames (or CN as a legacy
+    /// fallback) match the requested domain, per RFC 6125 (exact and
+    /// single-label wildcard matches).
+    ///
+    /// This is an additive signal independent of `is_valid`. Chain trust is
+    /// NOT verified here: a `true` value means the cert was presented for the
+    /// right host, not that it was issued by a trusted CA.
+    #[serde(default)]
+    pub hostname_verified: bool,
     /// Days until the leaf certificate expires
     pub days_until_expiry: i64,
     /// CAA (Certification Authority Authorization) policy for the domain
@@ -175,6 +192,17 @@ impl SslChecker {
         let days_until_expiry = (leaf_detail.valid_until - now).num_days();
         let is_valid = now >= leaf_detail.valid_from && now <= leaf_detail.valid_until;
 
+        // Hostname verification: does the leaf cert's SAN (or CN fallback)
+        // match the requested domain? This is independent of `is_valid` and of
+        // chain trust (which is not verified here — see the field docs). Lets
+        // consumers tell a date-valid-but-wrong-host cert apart from a real
+        // match. The CN fallback is read from the leaf subject string since the
+        // SANs are already extracted.
+        let hostname_verified = san_names
+            .iter()
+            .any(|san| hostname_matches_pattern(&domain, san))
+            || subject_cn_matches_host(&x509, &domain);
+
         // Annotate the CAA policy with the issuer comparison before
         // attaching it to the report.
         let mut caa_policy = caa_policy;
@@ -186,10 +214,43 @@ impl SslChecker {
             protocol_version: None,
             san_names,
             is_valid,
+            hostname_verified,
             days_until_expiry,
             caa: Some(caa_policy),
         })
     }
+}
+
+/// Returns true if `host` matches the certificate name `pattern`, supporting
+/// exact (case-insensitive) matches and single-label wildcards per RFC 6125
+/// (`*.example.com` matches `a.example.com` but not `example.com` or
+/// `a.b.example.com`).
+fn hostname_matches_pattern(host: &str, pattern: &str) -> bool {
+    let host = host.to_ascii_lowercase();
+    let pattern = pattern.to_ascii_lowercase();
+    if let Some(rest) = pattern.strip_prefix("*.") {
+        let Some(dot) = host.find('.') else {
+            return false;
+        };
+        let host_rest = &host[dot + 1..];
+        host_rest == rest
+    } else {
+        host == pattern
+    }
+}
+
+/// Legacy CN fallback for hostname verification: checks the leaf certificate's
+/// subject Common Name(s) against `host`. SAN dNSNames are authoritative per
+/// RFC 6125; CN is only consulted when no SAN matched.
+fn subject_cn_matches_host(cert: &X509Certificate, host: &str) -> bool {
+    for cn in cert.subject().iter_common_name() {
+        if let Ok(s) = cn.as_str() {
+            if hostname_matches_pattern(host, s) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Extracts Subject Alternative Names from a certificate.
@@ -365,6 +426,7 @@ mod tests {
             protocol_version: None,
             san_names: vec!["example.com".to_string(), "*.example.com".to_string()],
             is_valid: true,
+            hostname_verified: true,
             days_until_expiry: 90,
             caa: None,
         };
@@ -372,5 +434,20 @@ mod tests {
         assert!(json.contains("example.com"));
         assert!(json.contains("SHA-256 with RSA"));
         assert!(json.contains("\"is_valid\":true"));
+        assert!(json.contains("\"hostname_verified\":true"));
+    }
+
+    #[test]
+    fn hostname_matches_pattern_exact_and_wildcard() {
+        assert!(hostname_matches_pattern("example.com", "example.com"));
+        assert!(hostname_matches_pattern("EXAMPLE.COM", "example.com"));
+        // Single-label wildcard.
+        assert!(hostname_matches_pattern("a.example.com", "*.example.com"));
+        // Apex must not match a wildcard (RFC 6125).
+        assert!(!hostname_matches_pattern("example.com", "*.example.com"));
+        // Wildcard matches only one label.
+        assert!(!hostname_matches_pattern("a.b.example.com", "*.example.com"));
+        // Mismatched host.
+        assert!(!hostname_matches_pattern("evil.test", "example.com"));
     }
 }

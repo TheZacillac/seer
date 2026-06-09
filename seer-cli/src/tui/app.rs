@@ -129,6 +129,10 @@ impl App {
         // A new target invalidates every cached lens.
         if self.domain.as_deref() != Some(normalized.as_str()) {
             self.states.clear();
+            // The resolved IP is derived from the OLD domain's DNS/Status
+            // results; clearing it prevents the RDAP "IP" tab from looking up
+            // the previous domain's address under the new domain.
+            self.panes.dns.resolved_ip = None;
         }
         self.domain = Some(normalized);
         self.sel = 0;
@@ -287,7 +291,10 @@ impl App {
                 if ok {
                     self.set_toast("ok", &format!("copied {label}"));
                 } else {
-                    self.set_toast("fail", "copy failed — clipboard unavailable");
+                    // The failure label carries a caller-specific message (clipboard
+                    // unavailable, bulk file not found, CSV write failed, …), so it
+                    // is shown verbatim rather than assuming a clipboard error.
+                    self.set_toast("fail", &label);
                 }
                 vec![]
             }
@@ -428,9 +435,11 @@ impl App {
                 if value.is_empty() {
                     return vec![];
                 }
+                let gen = self.bump_fetch_gen("watch");
                 vec![Action::WatchMutate {
                     add: Some(value),
                     remove: None,
+                    gen,
                 }]
             }
             EditTarget::FollowInterval
@@ -479,9 +488,11 @@ impl App {
             }
             KeyCode::Char('d') => {
                 let domain = self.selected_watch_domain()?;
+                let gen = self.bump_fetch_gen("watch");
                 Some(vec![Action::WatchMutate {
                     add: None,
                     remove: Some(domain),
+                    gen,
                 }])
             }
             KeyCode::Enter => {
@@ -503,7 +514,10 @@ impl App {
                 self.focus = Focus::Nav;
                 Some(self.fetch_with(&domain))
             }
-            KeyCode::Char('c') => Some(vec![Action::HistoryClear]),
+            KeyCode::Char('c') => {
+                let gen = self.bump_fetch_gen("history");
+                Some(vec![Action::HistoryClear { gen }])
+            }
             _ => None,
         }
     }
@@ -579,6 +593,14 @@ impl App {
                 if lens == "rdap" {
                     if let Some(t) = target {
                         return self.rdap_command(&t);
+                    }
+                }
+                // `:tld <tld>` selects the TLD switcher slot rather than treating
+                // the argument as a domain — using `fetch_with` here would clobber
+                // the session domain with e.g. ".io".
+                if lens == "tld" {
+                    if let Some(t) = target {
+                        return self.tld_command(&t);
                     }
                 }
                 if let Some(i) = lenses::find_by_cmd_or_key(&lens) {
@@ -673,6 +695,26 @@ impl App {
         self.tab = 0;
         self.states.remove("rdap");
         vec![self.fetch_action(FetchReq::RdapDomain(target.to_string()))]
+    }
+
+    /// Handle `:tld <tld>` — select the requested TLD slot in the switcher and
+    /// fetch its info WITHOUT touching the global session domain. If the TLD is
+    /// not one of the known slots, show an error toast and change nothing.
+    fn tld_command(&mut self, tld: &str) -> Vec<Action> {
+        let Some(tld_idx) = lenses::find_by_cmd_or_key("tld") else {
+            return vec![];
+        };
+        if !self.panes.tld.select(tld) {
+            self.set_toast("fail", &format!("unknown tld: {tld}"));
+            return vec![];
+        }
+        self.lens = tld_idx;
+        self.sel = 0;
+        self.focus = Focus::Nav;
+        self.reset_tab();
+        // Drop any cached TLD state so the newly selected slot is fetched.
+        self.states.remove("tld");
+        vec![self.fetch_action(FetchReq::Tld(self.panes.tld.current()))]
     }
 
     /// Fetch the current lens at the existing domain (if any).
@@ -932,10 +974,10 @@ mod tests {
 
     // ---- Watch lens action tests ----
 
-    fn make_watch_state(domain: &str) -> LensState {
+    fn make_watch_state_data(domain: &str) -> LensData {
         use chrono::DateTime;
         let checked_at = DateTime::<chrono::Utc>::from_timestamp(0, 0).unwrap();
-        LensState::Loaded(LensData::Watch(Box::new(seer_core::WatchReport {
+        LensData::Watch(Box::new(seer_core::WatchReport {
             checked_at,
             results: vec![seer_core::WatchResult {
                 domain: domain.to_string(),
@@ -948,7 +990,11 @@ mod tests {
             total: 1,
             warnings: 0,
             critical: 0,
-        })))
+        }))
+    }
+
+    fn make_watch_state(domain: &str) -> LensState {
+        LensState::Loaded(make_watch_state_data(domain))
     }
 
     fn make_history_state(domain: &str) -> LensState {
@@ -1023,6 +1069,7 @@ mod tests {
                 Action::WatchMutate {
                     add: None,
                     remove: Some(domain),
+                    ..
                 } if domain == "example.com"
             )),
             "expected WatchMutate{{remove: Some(example.com)}}, got {actions:?}",
@@ -1079,7 +1126,7 @@ mod tests {
         );
         let actions = key(&mut app, KeyCode::Char('c'));
         assert!(
-            actions.iter().any(|a| matches!(a, Action::HistoryClear)),
+            actions.iter().any(|a| matches!(a, Action::HistoryClear { .. })),
             "expected HistoryClear, got {actions:?}",
         );
     }
@@ -1249,6 +1296,63 @@ mod tests {
                 }
             )),
             "expected Fetch(RdapDomain), got {actions:?}",
+        );
+    }
+
+    #[test]
+    fn tld_command_selects_slot_without_clobbering_domain() {
+        let mut app = App::new(Some("example.com".into()));
+        let _ = app.take_startup_actions();
+        let actions = app.exec_command("tld .io");
+        let tld_idx = crate::tui::lenses::find_by_cmd_or_key("tld").unwrap();
+        assert_eq!(app.lens, tld_idx, ":tld must switch to the tld lens");
+        // The session domain must NOT be overwritten by ".io".
+        assert_eq!(app.domain.as_deref(), Some("example.com"));
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::Fetch { req: FetchReq::Tld(t), .. } if t == ".io"
+            )),
+            "expected Fetch(Tld(.io)), got {actions:?}",
+        );
+    }
+
+    #[test]
+    fn tld_command_unknown_tld_errors_and_keeps_domain() {
+        let mut app = App::new(Some("example.com".into()));
+        let _ = app.take_startup_actions();
+        let actions = app.exec_command("tld .zzz");
+        assert!(actions.is_empty(), "unknown tld should emit no fetch");
+        assert_eq!(app.domain.as_deref(), Some("example.com"));
+        assert!(
+            matches!(&app.toast, Some(t) if t.tone == "fail"),
+            "unknown tld should set a fail toast",
+        );
+    }
+
+    #[test]
+    fn watch_mutate_refresh_uses_current_gen() {
+        // Loading the watch lens bumps fetch_gen["watch"]; the mutation must
+        // refresh with the SAME (current) gen so the Data is not dropped.
+        let mut app = app_on_watch_with_domain("example.com");
+        // Simulate the lens having been fetched once (gen → 1).
+        app.fetch_gen
+            .insert(crate::tui::lenses::lenses()[watch_lens_idx()].key, 1);
+        let actions = key(&mut app, KeyCode::Char('d'));
+        let gen = actions.iter().find_map(|a| match a {
+            Action::WatchMutate { gen, .. } => Some(*gen),
+            _ => None,
+        });
+        assert_eq!(gen, Some(2), "mutation must carry a freshly-bumped gen");
+        // A Data refresh at that gen must be accepted (not dropped as stale).
+        app.update(Msg::Data {
+            lens: "watch".into(),
+            gen: 2,
+            result: Ok(make_watch_state_data("kept.com")),
+        });
+        assert!(
+            matches!(app.state_of(watch_lens_idx()), LensState::Loaded(LensData::Watch(w)) if w.results[0].domain == "kept.com"),
+            "gen-correct watch refresh must replace the cached view",
         );
     }
 

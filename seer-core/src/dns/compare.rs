@@ -83,11 +83,15 @@ impl DnsComparator {
                 records,
                 error: None,
             },
-            Err(e) => ServerResult {
-                nameserver: server_a.to_string(),
-                records: vec![],
-                error: Some(e.to_string()),
-            },
+            Err(e) => {
+                debug!(server = %server_a, error = %e, "DNS compare query failed");
+                ServerResult {
+                    nameserver: server_a.to_string(),
+                    records: vec![],
+                    // Sanitized for external return; full detail logged above.
+                    error: Some(e.sanitized_message()),
+                }
+            }
         };
 
         let server_b_result = match result_b {
@@ -96,11 +100,15 @@ impl DnsComparator {
                 records,
                 error: None,
             },
-            Err(e) => ServerResult {
-                nameserver: server_b.to_string(),
-                records: vec![],
-                error: Some(e.to_string()),
-            },
+            Err(e) => {
+                debug!(server = %server_b, error = %e, "DNS compare query failed");
+                ServerResult {
+                    nameserver: server_b.to_string(),
+                    records: vec![],
+                    // Sanitized for external return; full detail logged above.
+                    error: Some(e.sanitized_message()),
+                }
+            }
         };
 
         // Compare record values using format_short for comparison

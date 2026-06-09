@@ -113,9 +113,54 @@ app = FastAPI(
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
+# Add request logging middleware
+app.add_middleware(RequestLoggingMiddleware)
+
+# Body size cap — reject oversized payloads with 413 before they hit
+# any router. Default 64KB is generous for a 100-domain bulk request
+# (see middleware.DEFAULT_MAX_BODY_BYTES). M6.
+app.add_middleware(MaxBodySizeMiddleware, max_bytes=64 * 1024)
+
+
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next):
+    """Enforce optional bearer-token auth when SEER_API_KEY is set.
+
+    Reads `SEER_API_KEY` per request rather than from a module-level
+    constant, so tests and rotating-secret deployments don't need an import
+    reload to pick up the current key.
+    """
+    # Treat a blank value (e.g. `SEER_API_KEY=""` from a misconfigured
+    # secrets-manager placeholder) as "no key set" rather than letting
+    # it silently disable auth via Python's empty-string falsy check.
+    api_key = (os.environ.get("SEER_API_KEY") or "").strip()
+    if api_key:
+        # Public endpoints are exempt. OPTIONS preflight is handled by the
+        # outer CORSMiddleware and never reaches here, but we still short
+        # the rare OPTIONS that falls through (non-preflight) so it isn't
+        # spuriously rejected.
+        if request.method == "OPTIONS" or request.url.path in _AUTH_EXEMPT_PATHS:
+            return await call_next(request)
+        provided = request.headers.get("Authorization", "")
+        expected = f"Bearer {api_key}"
+        if not hmac.compare_digest(provided, expected):
+            return JSONResponse({"detail": "unauthorized"}, status_code=401)
+    return await call_next(request)
+
+
 # CORS middleware - configure allowed origins via SEER_CORS_ORIGINS env var
 # For production, set SEER_CORS_ORIGINS to comma-separated list of allowed origins
 # e.g., SEER_CORS_ORIGINS="https://example.com,https://app.example.com"
+#
+# Registered LAST so it is the OUTERMOST middleware, wrapping both
+# auth_middleware and MaxBodySizeMiddleware. This matters because Starlette
+# runs the most-recently-added middleware first: CORSMiddleware therefore
+# attaches `Access-Control-Allow-Origin` to the short-circuit error
+# responses (401 from auth, 413 from the body-size cap) for allowed
+# origins, instead of those errors arriving at the browser opaque. Auth
+# still runs before any route handler — CORS only adds response headers and
+# answers preflight; it does not bypass downstream middleware for real
+# requests.
 cors_origins_env = os.environ.get("SEER_CORS_ORIGINS", "")
 # Filter empty entries first so `SEER_CORS_ORIGINS=",,"` and trailing
 # commas land in the dev-mode branch instead of producing a list of
@@ -146,39 +191,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# Add request logging middleware
-app.add_middleware(RequestLoggingMiddleware)
-
-# Body size cap — reject oversized payloads with 413 before they hit
-# any router. Default 64KB is generous for a 100-domain bulk request
-# (see middleware.DEFAULT_MAX_BODY_BYTES). M6.
-app.add_middleware(MaxBodySizeMiddleware, max_bytes=64 * 1024)
-
-
-@app.middleware("http")
-async def auth_middleware(request: Request, call_next):
-    """Enforce optional bearer-token auth when SEER_API_KEY is set.
-
-    Reads `SEER_API_KEY` per request rather than from a module-level
-    constant, so tests and rotating-secret deployments don't need an import
-    reload to pick up the current key.
-    """
-    # Treat a blank value (e.g. `SEER_API_KEY=""` from a misconfigured
-    # secrets-manager placeholder) as "no key set" rather than letting
-    # it silently disable auth via Python's empty-string falsy check.
-    api_key = (os.environ.get("SEER_API_KEY") or "").strip()
-    if api_key:
-        # Skip CORS preflight (OPTIONS) and public endpoints. The auth
-        # middleware runs outermost (wrapping CORSMiddleware), so rejecting
-        # OPTIONS here would strip CORS headers and break browser clients.
-        if request.method == "OPTIONS" or request.url.path in _AUTH_EXEMPT_PATHS:
-            return await call_next(request)
-        provided = request.headers.get("Authorization", "")
-        expected = f"Bearer {api_key}"
-        if not hmac.compare_digest(provided, expected):
-            return JSONResponse({"detail": "unauthorized"}, status_code=401)
-    return await call_next(request)
 
 # Include routers
 app.include_router(lookup.router, prefix="/lookup", tags=["Lookup"])

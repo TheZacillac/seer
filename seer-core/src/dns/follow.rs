@@ -225,7 +225,11 @@ impl DnsFollower {
                 .await
             {
                 Ok(records) => (records, None),
-                Err(e) => (Vec::new(), Some(e.to_string())),
+                Err(e) => {
+                    debug!(domain = %domain, error = %e, "DNS follow query failed");
+                    // Sanitized for external return; full detail logged above.
+                    (Vec::new(), Some(e.sanitized_message()))
+                }
             };
 
             // Extract record values for comparison

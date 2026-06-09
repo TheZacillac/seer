@@ -427,11 +427,60 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         logger.warning("Tool %s failed with transient error: %s", name, e)
         return [TextContent(type="text", text="Transient error — retry suggested.")]
     except RuntimeError as e:
-        # PyO3 maps other SeerError variants (RateLimited, RdapBootstrapError,
-        # etc.) to RuntimeError. Most are transient at the network level even
-        # if the underlying cause varies; treat as retryable.
+        # PyO3 collapses many SeerError variants into a bare RuntimeError
+        # (see seer-py/src/lib.rs `seer_err_to_py`): some are transient
+        # (RateLimited, RDAP/HTTP 5xx/429, bootstrap-while-IANA-down) but
+        # several are PERMANENTLY non-retryable per seer-core's
+        # `retry.rs::is_retryable` (WhoisServerNotFound/unsupported TLD,
+        # parse/JSON errors, LookupFailed, certificate/SSL failures,
+        # resolver/config errors). Blanket-labelling every RuntimeError as
+        # retryable tells the host LLM to burn its budget re-running permanent
+        # failures. Until the binding exposes core's `is_retryable` directly
+        # (the proper long-term fix), sniff the already-sanitized message for
+        # known-permanent signals — these strings are the fixed output of
+        # `SeerError::sanitized_message`, so the match is stable, not heuristic
+        # parsing of free-form text.
+        msg = str(e)
+        lower = msg.lower()
+        # Stable sanitized prefixes for non-retryable variants.
+        permanent_signals = (
+            "whois server not found",          # WhoisServerNotFound (unsupported TLD)
+            "response parsing failed",         # JsonError (parse failure)
+            "lookup failed for",               # LookupFailed
+            "certificate validation failed",   # CertificateError
+            "ssl inspection failed",           # SslError
+            "configuration error",             # ConfigError
+            "bulk operation partially failed", # BulkOperationError
+        )
+        if any(sig in lower for sig in permanent_signals):
+            logger.warning("Tool %s failed with permanent error: %s", name, e)
+            return [
+                TextContent(
+                    type="text",
+                    text=(
+                        f"Error: {msg}. This looks like a permanent failure; "
+                        "do not retry."
+                    ),
+                )
+            ]
+        # Explicitly transient: rate limiting. Other remaining RuntimeErrors
+        # (generic "RDAP lookup failed" / "HTTP request failed") are ambiguous
+        # because sanitization collapses 5xx and 4xx into one string, so we
+        # cannot confidently promise a retry will help — say so rather than
+        # over-promise.
+        if "rate limited" in lower:
+            logger.warning("Tool %s rate limited: %s", name, e)
+            return [TextContent(type="text", text="Rate limited — retry after a short backoff.")]
         logger.warning("Tool %s failed with runtime error: %s", name, e)
-        return [TextContent(type="text", text="Transient error — retry suggested.")]
+        return [
+            TextContent(
+                type="text",
+                text=(
+                    f"Error: {msg}. This may be transient (e.g. an upstream 5xx) "
+                    "or permanent (e.g. a 4xx); retry at most once with backoff."
+                ),
+            )
+        ]
     except Exception:
         logger.exception("Tool %s failed", name)
         return [TextContent(type="text", text="An internal error occurred while processing your request.")]

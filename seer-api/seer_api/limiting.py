@@ -68,10 +68,20 @@ def get_client_ip(request: Request) -> str:
         if peer and peer in trusted:
             forwarded = request.headers.get("x-forwarded-for", "")
             if forwarded:
-                # Use the first (leftmost) value — the original client IP.
-                # The outermost trusted proxy must strip/overwrite any
-                # client-supplied X-Forwarded-For before appending the real IP.
-                return forwarded.split(",")[0].strip()
+                # Standard reverse proxies (e.g. nginx
+                # `$proxy_add_x_forwarded_for`) APPEND the real client IP to
+                # any existing X-Forwarded-For, so the LEFTMOST entry is
+                # client-supplied and spoofable. Walk the list from the
+                # RIGHT, skipping entries that are themselves trusted
+                # proxies, and return the first untrusted entry — the real
+                # client as seen by the innermost proxy we trust. If every
+                # entry is a trusted proxy or the header is malformed, fall
+                # back to the direct socket peer.
+                for raw in reversed(forwarded.split(",")):
+                    entry = raw.strip()
+                    if not entry or entry in trusted:
+                        continue
+                    return entry
         # Either no allowlist set or the peer is not in it: ignore XFF.
     return get_remote_address(request) if not peer else peer
 

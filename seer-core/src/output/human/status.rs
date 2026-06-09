@@ -200,6 +200,15 @@ impl HumanFormatter {
         ));
         output.push(format!(
             "  {}: {}",
+            self.label("Hostname Match"),
+            if report.hostname_verified {
+                self.success("yes")
+            } else {
+                self.error("no")
+            }
+        ));
+        output.push(format!(
+            "  {}: {}",
             self.label("Days Until Expiry"),
             self.value(&report.days_until_expiry.to_string())
         ));

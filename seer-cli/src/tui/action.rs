@@ -145,12 +145,18 @@ pub enum Action {
         contents: String,
     },
     /// Add or remove a domain from the watchlist. Handled in `mod.rs`.
+    /// `gen` is the watch lens's current fetch generation so the post-mutation
+    /// refresh `Msg::Data` is not dropped by the staleness guard.
     WatchMutate {
         add: Option<String>,
         remove: Option<String>,
+        gen: u64,
     },
-    /// Clear all lookup history. Handled in `mod.rs`.
-    HistoryClear,
+    /// Clear all lookup history. Handled in `mod.rs`. `gen` is the history
+    /// lens's current fetch generation (see `WatchMutate`).
+    HistoryClear {
+        gen: u64,
+    },
 }
 
 #[derive(Debug, Clone)]

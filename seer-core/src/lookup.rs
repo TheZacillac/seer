@@ -31,6 +31,14 @@ const PROTOCOL_GRACE_PERIOD: Duration = Duration::from_secs(5);
 /// Maximum length for public-facing error strings.
 const MAX_PUBLIC_ERROR_LEN: usize = 256;
 
+/// Upper bound a coalesced waiter will block on the owner's in-flight lookup
+/// before falling through to re-contend for ownership itself. Bounds the wait
+/// so a lost notification (e.g. the owner's future was cancelled/dropped before
+/// it could notify) can't hang the waiter forever. Sized to comfortably exceed
+/// a full concurrent RDAP+WHOIS race (≈15s per protocol plus the grace period
+/// and retries) so the common path always wakes via `notify_waiters()`.
+const DEFAULT_INFLIGHT_WAIT: Duration = Duration::from_secs(30);
+
 /// Global cache for lookup results to avoid redundant network calls.
 static LOOKUP_CACHE: Lazy<TtlCache<String, LookupResult>> =
     Lazy::new(|| TtlCache::new(LOOKUP_CACHE_TTL));
@@ -355,6 +363,22 @@ impl LookupResult {
     }
 }
 
+/// Truncates `s` to at most `max` bytes, backing up to the nearest UTF-8 char
+/// boundary at or below `max`. `String::truncate` panics if the byte offset is
+/// not a char boundary, and WHOIS `raw_response` is server-controlled and may
+/// preserve multi-byte UTF-8, so we must not truncate blindly at a fixed byte
+/// offset. (`str::floor_char_boundary` would do this, but it is unstable on
+/// stable Rust, so we walk backwards manually.)
+fn truncate_on_char_boundary(s: &mut String, max: usize) {
+    if s.len() > max {
+        let mut end = max;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        s.truncate(end);
+    }
+}
+
 /// Before caching, trim raw WHOIS response to limit cache memory.
 /// A full WHOIS raw_response can be up to 1 MB; we cap it at 32 KB which is
 /// plenty for the parsed fields while preventing the cache from ballooning.
@@ -364,7 +388,7 @@ fn trim_for_cache(mut result: LookupResult) -> LookupResult {
     match result {
         LookupResult::Whois { ref mut data, .. } => {
             if data.raw_response.len() > MAX_RAW {
-                data.raw_response.truncate(MAX_RAW);
+                truncate_on_char_boundary(&mut data.raw_response, MAX_RAW);
                 data.raw_response.push_str("\n... [truncated for cache]");
             }
         }
@@ -374,7 +398,7 @@ fn trim_for_cache(mut result: LookupResult) -> LookupResult {
         } => {
             if let Some(ref mut w) = whois_fallback {
                 if w.raw_response.len() > MAX_RAW {
-                    w.raw_response.truncate(MAX_RAW);
+                    truncate_on_char_boundary(&mut w.raw_response, MAX_RAW);
                     w.raw_response.push_str("\n... [truncated for cache]");
                 }
             }
@@ -384,7 +408,7 @@ fn trim_for_cache(mut result: LookupResult) -> LookupResult {
         } => {
             if let Some(ref mut w) = whois_data {
                 if w.raw_response.len() > MAX_RAW {
-                    w.raw_response.truncate(MAX_RAW);
+                    truncate_on_char_boundary(&mut w.raw_response, MAX_RAW);
                     w.raw_response.push_str("\n... [truncated for cache]");
                 }
             }
@@ -506,12 +530,38 @@ impl SmartLookup {
             match slot {
                 Slot::Waiter(n) => {
                     debug!(domain = %normalized, "Waiting for in-flight lookup to complete");
-                    n.notified().await;
+                    // Ordering requirement (mirrors rdap::client::ensure_bootstrap):
+                    // construct and pin the `Notified` future BEFORE we re-check
+                    // the cache. `Notify::notified()` reserves the wakeup slot the
+                    // moment it is constructed (only `.await` blocks), so a
+                    // `notify_waiters()` fired by the owner's `InflightGuard::drop`
+                    // after this point cannot be missed. Without this, the owner
+                    // could drop (removing the map entry and firing
+                    // `notify_waiters()`) in the gap between us releasing the lock
+                    // above and subscribing here — `notify_waiters` stores no
+                    // permit for late subscribers, so the waiter would hang.
+                    let notified = n.notified();
+                    tokio::pin!(notified);
+
+                    // Re-check the cache now that we're subscribed: the owner may
+                    // have populated it and notified in the gap between the lock
+                    // release and our subscription.
                     if let Some(cached) = LOOKUP_CACHE.get(&normalized) {
                         return Ok(cached);
                     }
-                    // Owner finished without populating the cache (failed
-                    // or errored). Re-contend for ownership.
+
+                    // Bounded wait: if the owner's future was cancelled/dropped
+                    // without notifying, or the notification was otherwise lost,
+                    // fall through and re-contend for ownership rather than
+                    // hanging forever. The RDAP timeout is a sensible bound for a
+                    // single domain lookup race.
+                    let _ = tokio_timeout(DEFAULT_INFLIGHT_WAIT, notified.as_mut()).await;
+
+                    if let Some(cached) = LOOKUP_CACHE.get(&normalized) {
+                        return Ok(cached);
+                    }
+                    // Owner finished without populating the cache (failed or
+                    // errored), or the wait timed out. Re-contend for ownership.
                     continue;
                 }
                 Slot::Owner(guard) => break guard,
@@ -979,6 +1029,48 @@ mod tests {
     fn test_lookup_cache_clear() {
         SmartLookup::clear_cache();
         assert!(LOOKUP_CACHE.is_empty());
+    }
+
+    // ---------------- trim_for_cache char-boundary safety ----------------
+
+    #[test]
+    fn truncate_on_char_boundary_does_not_panic_on_multibyte_straddle() {
+        const MAX_RAW: usize = 32 * 1024;
+        // Build a string longer than MAX_RAW with a 3-byte char straddling the
+        // MAX_RAW byte offset: fill up to MAX_RAW-1 bytes of ASCII, then a
+        // multi-byte char so byte MAX_RAW lands mid-character.
+        let mut s = "a".repeat(MAX_RAW - 1);
+        s.push('€'); // 3 bytes (E2 82 AC) — byte MAX_RAW is NOT a boundary
+        s.push_str(&"b".repeat(100));
+        assert!(!s.is_char_boundary(MAX_RAW));
+
+        // Must not panic.
+        truncate_on_char_boundary(&mut s, MAX_RAW);
+        assert!(s.len() <= MAX_RAW);
+        // Result is valid UTF-8 (String invariant upheld) — backed up below
+        // the straddling char.
+        assert_eq!(s.len(), MAX_RAW - 1);
+    }
+
+    #[test]
+    fn trim_for_cache_truncates_multibyte_whois_without_panic() {
+        const MAX_RAW: usize = 32 * 1024;
+        let mut raw = "a".repeat(MAX_RAW - 1);
+        raw.push('€');
+        raw.push_str(&"b".repeat(1000));
+
+        let mut w = empty_whois("example.com");
+        w.raw_response = raw;
+        let result = trim_for_cache(LookupResult::Whois {
+            data: w,
+            rdap_error: None,
+            rdap_fallback: None,
+        });
+        if let LookupResult::Whois { data, .. } = result {
+            assert!(data.raw_response.ends_with("[truncated for cache]"));
+        } else {
+            panic!("expected Whois variant");
+        }
     }
 
     // ---------------- sanitize_error_for_public ----------------

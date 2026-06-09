@@ -101,12 +101,15 @@ impl BulkState {
         }
     }
 
-    /// Build a CSV string from the current rows.
+    /// Build a CSV string from the current rows. Reuses the CLI's
+    /// `escape_csv_field` so the export is RFC 4180 quoted and protected
+    /// against spreadsheet formula injection.
     pub fn to_csv(&self) -> String {
+        use crate::utils::{escape_csv_field, get_domain_from_operation};
         let mut out = String::from("domain,success,error,duration_ms\n");
         for r in &self.rows {
-            let domain = op_domain(&r.operation);
-            let err = r.error.as_deref().unwrap_or("").replace(',', ";");
+            let domain = escape_csv_field(&get_domain_from_operation(&r.operation));
+            let err = escape_csv_field(r.error.as_deref().unwrap_or(""));
             out.push_str(&format!(
                 "{},{},{},{}\n",
                 domain, r.success, err, r.duration_ms
@@ -117,6 +120,7 @@ impl BulkState {
 }
 
 /// Extract the domain string from a `BulkOperation` (all variants carry one).
+/// Used by the lens renderer for per-row display.
 pub fn op_domain(op: &BulkOperation) -> &str {
     match op {
         BulkOperation::Whois { domain }
@@ -284,9 +288,32 @@ mod tests {
             duration_ms: 10,
         });
         let csv = s.to_csv();
-        // Commas inside the error field must be replaced with semicolons
-        assert!(csv.contains("timeout; retry failed"));
-        assert!(!csv.contains("timeout, retry failed"));
+        // Commas inside the error field must be RFC 4180 quoted (not stripped).
+        assert!(
+            csv.contains("\"timeout, retry failed\""),
+            "error with comma must be quoted, got: {csv}"
+        );
+    }
+
+    #[test]
+    fn to_csv_protects_against_formula_injection() {
+        let mut s = BulkState::default();
+        s.rows.push(BulkResult {
+            operation: BulkOperation::Lookup {
+                domain: "=cmd.com".to_string(),
+            },
+            success: false,
+            data: None,
+            error: Some("=HYPERLINK(\"evil\")".to_string()),
+            duration_ms: 10,
+        });
+        let csv = s.to_csv();
+        // Formula-leading fields are prefixed with a single quote.
+        assert!(csv.contains("'=cmd.com"), "domain must be guarded: {csv}");
+        assert!(
+            csv.contains("\"'=HYPERLINK(\"\"evil\"\")\""),
+            "error must be guarded + quoted: {csv}"
+        );
     }
 
     #[test]
