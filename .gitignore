@@ -78,3 +78,6 @@ logs/
 # Local configuration
 .envrc
 *.local
+
+# Claude Code worktrees (local, ephemeral)
+.claude/worktrees/
