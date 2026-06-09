@@ -1126,7 +1126,9 @@ mod tests {
         );
         let actions = key(&mut app, KeyCode::Char('c'));
         assert!(
-            actions.iter().any(|a| matches!(a, Action::HistoryClear { .. })),
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::HistoryClear { .. })),
             "expected HistoryClear, got {actions:?}",
         );
     }

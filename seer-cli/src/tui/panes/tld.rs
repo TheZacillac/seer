@@ -21,10 +21,7 @@ impl TldState {
     /// `true` and updates the index if found in `TLDS`, `false` otherwise.
     pub fn select(&mut self, tld: &str) -> bool {
         let want = tld.trim().trim_start_matches('.').to_lowercase();
-        if let Some(i) = TLDS
-            .iter()
-            .position(|t| t.trim_start_matches('.') == want)
-        {
+        if let Some(i) = TLDS.iter().position(|t| t.trim_start_matches('.') == want) {
             self.idx = i;
             true
         } else {

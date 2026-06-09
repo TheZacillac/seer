@@ -446,7 +446,10 @@ mod tests {
         // Apex must not match a wildcard (RFC 6125).
         assert!(!hostname_matches_pattern("example.com", "*.example.com"));
         // Wildcard matches only one label.
-        assert!(!hostname_matches_pattern("a.b.example.com", "*.example.com"));
+        assert!(!hostname_matches_pattern(
+            "a.b.example.com",
+            "*.example.com"
+        ));
         // Mismatched host.
         assert!(!hostname_matches_pattern("evil.test", "example.com"));
     }
