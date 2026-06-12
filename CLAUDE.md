@@ -89,50 +89,44 @@ seer-core/src/
 ├── lib.rs              # Module exports and re-exports
 ├── error.rs            # Centralized error types (SeerError enum)
 ├── colors.rs           # Catppuccin color palette for terminal output
-├── lookup.rs           # Smart lookup (RDAP-first with WHOIS fallback)
+├── config.rs           # User config file (~/.seer/config.toml), clamped ranges
+├── lookup.rs           # Smart lookup (RDAP-first with WHOIS fallback, in-flight coalescing)
+├── availability.rs     # Domain availability detection (RDAP 404 + DNS + patterns)
+├── domain_info.rs      # Merged RDAP + WHOIS flat structure
+├── retry.rs            # RetryPolicy/RetryExecutor: exponential backoff + jitter
+├── cache.rs            # Generic TtlCache (stale-while-revalidate, capacity-bounded)
+├── net.rs              # SSRF guards: resolve/validate public hosts (refuses loopback/private)
+├── validation.rs       # Domain normalization, reserved-IP checks, SEER_DOMAIN_ALLOWLIST
+├── ssl.rs              # SSL chain inspection (single-attempt by design)
+├── caa.rs              # CAA policy lookup + issuer comparison
+├── subdomains.rs       # Subdomain enumeration via Certificate Transparency
+├── diff.rs             # Side-by-side domain comparison
+├── watchlist.rs        # Cert/registration expiry watchlist
+├── history.rs          # Lookup history
+├── logging.rs          # tracing setup (+ optional OTel via `otel` feature)
 │
-├── whois/              # WHOIS functionality
-│   ├── mod.rs          # Public interface
-│   ├── client.rs       # TCP WHOIS client with referral following
-│   ├── parser.rs       # Regex-based response parser
-│   └── servers.rs      # TLD-to-WHOIS-server mapping
-│
-├── rdap/               # RDAP functionality
-│   ├── mod.rs          # Public interface
-│   ├── client.rs       # HTTP RDAP client with IANA bootstrap
-│   └── types.rs        # RDAP response structures
-│
-├── dns/                # DNS functionality
-│   ├── mod.rs          # Public interface
-│   ├── resolver.rs     # DNS resolver (hickory-resolver)
-│   ├── records.rs      # Record type definitions
-│   └── propagation.rs  # Global DNS propagation checker
-│
-├── status/             # Domain health checking
-│   ├── mod.rs          # Public interface
-│   ├── client.rs       # HTTP/SSL/expiration checker
-│   └── types.rs        # Status response structures
-│
-├── bulk/               # Bulk operations
-│   ├── mod.rs          # Public interface
-│   └── executor.rs     # Concurrent operation executor with rate limiting
-│
-└── output/             # Output formatting
-    ├── mod.rs          # OutputFormat enum
-    ├── human.rs        # Human-readable formatter (colored)
-    └── json.rs         # JSON formatter
+├── whois/              # WHOIS: TCP client w/ referral following, parsers/ registry, TLD map
+├── rdap/               # RDAP: HTTP client, IANA bootstrap (+bootstrap.rs), types
+├── dns/                # DNS: resolver, records, propagation/, compare, follow, DNSSEC
+├── status/             # Domain health: HTTP/SSL/expiration/DNS (single-attempt by design)
+├── tld/                # TLD info (WHOIS server, RDAP endpoint, registry URL)
+├── bulk/               # Concurrent executor with semaphore rate limiting
+└── output/             # OutputFormat enum + human/ (colored), markdown/, json, yaml
 ```
 
 #### Module Responsibilities
 
 - **error.rs**: All error types in one place, uses thiserror
-- **whois/**: WHOIS protocol, parsing, referral following (max depth: 3)
-- **rdap/**: RDAP protocol, IANA bootstrap caching, domain/IP/ASN lookups
-- **dns/**: DNS resolution (all record types), propagation checking (29 servers)
-- **status/**: HTTP status, SSL certificates, domain expiration checking
+- **config.rs**: Loads `~/.seer/config.toml` (timeouts, concurrency, output format, nameserver); values clamped to safe ranges; `seer config --init` scaffolds it
+- **whois/**: WHOIS protocol, parsing (per-registry `parsers/` registry), referral following (max depth: 3), IANA discovery fallback for unmapped TLDs (24h TTL cache)
+- **rdap/**: RDAP protocol, IANA bootstrap caching (24h TTL, stale-while-revalidate), domain/IP/ASN lookups, multi-candidate base-URL fallback, 429 Retry-After honoring
+- **dns/**: DNS resolution (16 record types), propagation checking (30 servers), compare, follow (live monitor), DNSSEC validation
+- **status/**: HTTP status, SSL certificates, domain expiration checking — deliberately single-attempt (see module docs: health probes must not retry-mask flakiness)
 - **lookup.rs**: Smart lookup orchestration (RDAP → WHOIS fallback)
 - **bulk/**: Semaphore-based concurrent execution, file parsing
-- **output/**: Human (colored) and JSON formatters
+- **retry.rs**: Shared retry framework — used by WHOIS/RDAP clients; dns/status/ssl intentionally don't (documented at their module level)
+- **net.rs / validation.rs**: SSRF protection — all outbound hosts resolved and checked against reserved/private ranges before connect
+- **output/**: Human (colored), JSON, YAML, and Markdown formatters behind `get_formatter(OutputFormat)`
 - **colors.rs**: Catppuccin Frappe color palette
 
 ### seer-cli/ (CLI Application)
@@ -165,7 +159,8 @@ seer-cli/src/
 **Key Points:**
 - Uses Clap v4 with derive macros
 - Defaults to REPL when no command provided
-- Supports global `--format` flag (human/json) — must be placed before the subcommand
+- Supports global `--format` flag (human/json/yaml/markdown) — must be placed before the subcommand
+- `seer generate-key` mints a random API key (OsRng, 256-bit, URL-safe base64) for `SEER_API_KEY`
 - REPL history saved to `~/.seer_history`
 - `seer tui [domain]` launches a full-screen ratatui TUI (additive — the REPL
   and all subcommands are unchanged). Architecture: async `tokio::select!` loop,
@@ -209,14 +204,18 @@ seer-api/
     │   ├── propagation.py  # DNS propagation
     │   └── status.py       # Domain status
     └── mcp/
-        └── server.py       # MCP server (16 tools, stdio transport)
+        └── server.py       # MCP server (16 tools)
 ```
 
 **Key Points:**
 - CORS configured via `SEER_CORS_ORIGINS` env var
-- OpenAPI docs at `/docs` and `/redoc`
+- OpenAPI docs at `/docs` and `/redoc` (gated by `SEER_DOCS_ENABLED`)
 - Bulk endpoints have limits (max 100 domains, max 50 concurrency)
-- MCP server exposes all operations as tools for AI assistants
+- MCP server exposes all operations as tools for AI assistants over TWO
+  transports: stdio (`seer-mcp`) and Streamable HTTP at `POST /mcp` on the
+  FastAPI app (same tool registry; session manager rebuilt per lifespan;
+  DNS-rebinding protection opt-in via `SEER_MCP_ALLOWED_HOSTS`/`_ORIGINS`).
+  `/mcp` is covered by the same `SEER_API_KEY` auth middleware as the REST API.
 
 ---
 
@@ -297,6 +296,27 @@ SEER_LIVE_TESTS=1 pytest
 
 These tests require network connectivity and can fail transiently if the
 external services change behavior. They are not run in CI by default.
+
+#### Deterministic protocol tests (mock servers)
+
+The protocol clients also have hermetic mock-server tests that DO run in CI:
+
+- **WHOIS** (`whois/client.rs` tests): a local `tokio::net::TcpListener`
+  fixture serves canned responses through the full client path (referrals,
+  cycles, timeouts).
+- **RDAP** (`rdap/client.rs` tests): `wiremock` scripts 404/429/malformed
+  responses against `query_rdap_with_retry` directly — no IANA bootstrap, so
+  the global bootstrap cache stays untouched.
+- **Formatters** (`seer-core/tests/format_snapshots.rs`): `insta` snapshots of
+  human + markdown output. After an intentional formatting change, run the
+  test, inspect the generated `.snap.new` files, and rename them over the
+  `.snap` baselines (or use `cargo insta review`).
+
+The SSRF guards deliberately refuse loopback, so the clients expose
+`#[cfg(test)]`-only seams (`allowing_private_hosts`/`with_port` on
+`WhoisClient`, `allowing_reserved_for_tests` on `RdapClient`). These do not
+exist in release builds — never weaken the production validation path to make
+a test reachable; thread the test flag instead.
 
 ### Running the Applications
 
@@ -727,7 +747,7 @@ async fn network_operation() -> Result<String> {
 
 **Current timeout values:**
 - WHOIS: 15 seconds
-- RDAP: 30 seconds
+- RDAP: 15 seconds (5s connect timeout)
 - DNS: 5 seconds (with 2 retries)
 - HTTP/SSL checks: 10 seconds
 
@@ -1156,6 +1176,34 @@ Before committing:
 5. ✅ Test Python bindings if changed: `cd seer-py && maturin develop`
 6. ✅ Test API if changed: `cd seer-api && pytest`
 
+CI runs check/fmt/clippy/test (3 OSes), a rustsec audit, AND a `python` job
+(maturin-builds seer-py, installs seer-api, runs both pytest suites) — Python
+test failures block merges just like Rust ones.
+
+### Release Process
+
+Releases are tag-driven; pushing a version tag is the entire entry point:
+
+```bash
+# 1. Bump version in Cargo.toml [workspace.package] AND both pyproject.toml files
+# 2. Sync README version refs (Quick Start + Rust Library sections)
+# 3. Commit, then:
+git tag v0.33.0 && git push --tags
+```
+
+What happens automatically:
+1. `release.yml` (cargo-dist) builds `seer` binaries for 5 targets + shell/
+   PowerShell installers, and creates the GitHub Release.
+2. `publish.yml` fires on `release: published`: publishes seer-core then
+   seer-cli to crates.io, and attaches seer-py wheels (abi3, one per platform)
+   to the release.
+
+PyPI is NOT part of the flow: the name `seer` is taken there. Wheels are
+installed from release assets unless/until the distribution is renamed.
+
+`dist-workspace.toml` holds the cargo-dist config; after editing it, run
+`dist generate` to regenerate `release.yml` (never hand-edit that file).
+
 ---
 
 ## Environment Variables
@@ -1163,7 +1211,10 @@ Before committing:
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `RUST_LOG` | Logging level (trace, debug, info, warn, error) | - |
+| `SEER_DOMAIN_ALLOWLIST` | Comma-separated allowlist restricting queryable domains | — |
 | `SEER_CORS_ORIGINS` | Comma-separated allowed CORS origins for API | `*` |
+| `SEER_MCP_ALLOWED_HOSTS` | `Host:` values for `POST /mcp`; setting enables DNS-rebinding protection | — |
+| `SEER_MCP_ALLOWED_ORIGINS` | `Origin:` values for `POST /mcp` (browser clients) | — |
 | `SEER_HOST` | API bind host. Non-loopback requires `SEER_API_KEY`. | `127.0.0.1` |
 | `SEER_PORT` | API bind port | `8000` |
 | `SEER_API_KEY` | Bearer token required for all non-`/health` requests | — |
@@ -1174,6 +1225,15 @@ Before committing:
 | `SEER_RATE_LIMIT` | Default slowapi rate limit | `30/minute` |
 | `SEER_RATE_LIMIT_STORAGE` | Rate-limit storage URI (e.g. `redis://host:6379`) | `memory://` |
 | `WEB_CONCURRENCY` | Uvicorn worker count. `>1` requires non-`memory://` store | `1` |
+
+### User Config File
+
+`seer-core/src/config.rs` loads `~/.seer/config.toml` at client construction
+(missing file → defaults). `seer config --init` scaffolds it. Settings:
+default output format, nameserver, per-protocol timeouts, bulk concurrency,
+rate-limit delay — all clamped to safe ranges (concurrency 1–50, timeouts
+1–300s). When adding a tunable, prefer wiring it through `SeerConfig` over a
+new env var or hardcoded const.
 
 ### Breaking change (2026-04-20)
 
@@ -1223,10 +1283,12 @@ case today).
 ### Timeout Values
 
 - **WHOIS**: 15 seconds
-- **RDAP**: 30 seconds
+- **RDAP**: 15 seconds (5s connect timeout)
 - **DNS**: 5 seconds (with 2 retries)
 - **HTTP**: 10 seconds
 - **SSL check**: 10 seconds
+
+All user-tunable via `~/.seer/config.toml` (values clamped to 1–300s).
 
 ### Memory Considerations
 
@@ -1357,5 +1419,5 @@ For issues and questions:
 
 ---
 
-**Last Updated**: 2026-01-16
-**Document Version**: 1.0.0
+**Last Updated**: 2026-06-12
+**Document Version**: 1.1.0
