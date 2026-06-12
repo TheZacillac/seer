@@ -20,7 +20,9 @@ dependencies = [
     "uvicorn[standard]>=0.27",
     "pydantic>=2.0",
     "mcp>=1.0",
-    "seer>=0.10.2",
+    # The seer Python bindings; distributed on PyPI as `domain-seer`
+    # (import name remains `seer`).
+    "domain-seer>=0.32",
     "slowapi>=0.1.9",
     "orjson>=3.9",
 ]

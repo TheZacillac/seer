@@ -61,7 +61,8 @@ _init_rust_logging()
 
 try:
     from importlib.metadata import version
-    __version__ = version("seer")
+    # Distribution name on PyPI (the import name stays `seer`).
+    __version__ = version("domain-seer")
 except Exception:
     __version__ = "unknown"
 __all__ = [
