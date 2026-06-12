@@ -85,11 +85,11 @@ A high-performance, multi-interface domain utility suite — query WHOIS, RDAP, 
        │                           │
        ▼                           ▼
 ┌──────────────────────────────────────────────────────────────────┐
-│                          seer-core                                │
-│                      Core Rust Library                            │
-├──────────┬────────┬──────┬────────┬──────┬──────┬───────────────┤
-│  WHOIS   │  RDAP  │ DNS  │ Status │ SSL  │ Bulk │  Diff/Watch   │
-└──────────┴────────┴──────┴────────┴──────┴──────┴───────────────┘
+│                          seer-core                               │
+│                      Core Rust Library                           │
+├──────────┬────────┬──────┬────────┬──────┬──────┬────────────────┤
+│  WHOIS   │  RDAP  │ DNS  │ Status │ SSL  │ Bulk │   Diff/Watch   │
+└──────────┴────────┴──────┴────────┴──────┴──────┴────────────────┘
 ```
 
 ---
