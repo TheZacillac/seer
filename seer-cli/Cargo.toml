@@ -16,7 +16,7 @@ name = "seer"
 path = "src/main.rs"
 
 [dependencies]
-seer-core = { version = "0.32.0", path = "../seer-core" }
+seer-core = { version = "0.33.0", path = "../seer-core" }
 tokio = { workspace = true }
 rustyline = { workspace = true }
 colored = { workspace = true }
