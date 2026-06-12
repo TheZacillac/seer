@@ -38,8 +38,8 @@ A high-performance, multi-interface domain utility suite — query WHOIS, RDAP, 
 <td width="50%">
 
 **🌐 DNS & Propagation**
-- **DNS Resolution** — 13 record types with custom nameservers
-- **DNS Propagation** — 29 servers across 6 global regions
+- **DNS Resolution** — 16 record types with custom nameservers
+- **DNS Propagation** — 30 servers across 6 global regions
 - **DNS Monitoring** — track record changes over time
 - **DNS Comparison** — compare records across two nameservers
 - **DNSSEC Validation** — check DNSSEC configuration
@@ -117,7 +117,7 @@ seer tui example.com           # Launch the full-screen TUI
 
 ```toml
 [dependencies]
-seer-core = "0.18"
+seer-core = "0.32"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -305,6 +305,8 @@ results = seer.bulk_lookup(["example.com", "google.com"], concurrency=10)
 results = seer.bulk_status(["example.com", "google.com"])
 results = seer.bulk_dig(["example.com", "google.com"], record_type="A")
 results = seer.bulk_info(["example.com", "google.com"])
+results = seer.bulk_ssl(["example.com", "google.com"])
+results = seer.bulk_availability(["example.com", "google.com"])
 ```
 
 <details>
@@ -326,7 +328,7 @@ if cert := status.get("certificate"):
 
 ```toml
 [dependencies]
-seer-core = "0.18"
+seer-core = "0.32"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -383,6 +385,7 @@ seer-api   # Starts on http://127.0.0.1:8000 (loopback-only by default)
 | `/lookup/{domain}` | GET | Smart lookup (RDAP + WHOIS) |
 | `/lookup/bulk` | POST | Bulk smart lookups |
 | `/whois/{domain}` | GET | WHOIS lookup |
+| `/whois/bulk` | POST | Bulk WHOIS lookups |
 | `/rdap/domain/{domain}` | GET | RDAP domain lookup |
 | `/rdap/ip/{ip}` | GET | RDAP IP lookup |
 | `/rdap/asn/{asn}` | GET | RDAP ASN lookup |
@@ -392,7 +395,13 @@ seer-api   # Starts on http://127.0.0.1:8000 (loopback-only by default)
 | `/propagation/bulk` | POST | Bulk propagation checks |
 | `/status/{domain}` | GET | Domain status check |
 | `/status/bulk` | POST | Bulk status checks |
+| `/ssl/bulk` | POST | Bulk SSL certificate checks |
 | `/health` | GET | Health check |
+| `/metrics` | GET | Prometheus metrics (when `SEER_METRICS_ENABLED=true`) |
+
+Every bulk endpoint also has a streaming sibling at `…/bulk/stream` that
+emits results incrementally as Server-Sent Events (`text/event-stream`)
+instead of buffering the full response.
 
 ```bash
 # Examples
@@ -456,6 +465,7 @@ SEER_API_KEY=$KEY SEER_HOST=0.0.0.0 seer-api
 | `seer_bulk_status` | Bulk status checks |
 | `seer_bulk_propagation` | Bulk propagation checks |
 | `seer_bulk_info` | Bulk domain info |
+| `seer_bulk_ssl` | Bulk SSL certificate checks |
 
 <details>
 <summary><b>Claude Desktop configuration</b></summary>
@@ -480,19 +490,20 @@ Add to `claude_desktop_config.json`:
 
 | Type | Description | | Type | Description |
 |------|-------------|---|------|-------------|
-| `A` | IPv4 address | | `CAA` | CA authorization |
-| `AAAA` | IPv6 address | | `PTR` | Pointer record |
-| `MX` | Mail exchange | | `SRV` | Service locator |
+| `A` | IPv4 address | | `PTR` | Pointer record |
+| `AAAA` | IPv6 address | | `SRV` | Service locator |
+| `MX` | Mail exchange | | `NAPTR` | Naming authority pointer |
 | `TXT` | Text records | | `DNSKEY` | DNSSEC public key |
 | `NS` | Nameserver | | `DS` | Delegation signer |
-| `SOA` | Start of authority | | `ANY` | All records |
-| `CNAME` | Canonical name | | | |
+| `SOA` | Start of authority | | `SSHFP` | SSH key fingerprint |
+| `CNAME` | Canonical name | | `TLSA` | DANE TLS association |
+| `CAA` | CA authorization | | `ANY` | All records |
 
 ---
 
 ## 🌏 Global DNS Propagation Servers
 
-Propagation checks query **29 nameservers** across **6 regions**:
+Propagation checks query **30 nameservers** across **6 regions**:
 
 | Region | Servers |
 |--------|---------|
@@ -512,10 +523,20 @@ Propagation checks query **29 nameservers** across **6 regions**:
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `RUST_LOG` | Logging level (`trace` / `debug` / `info` / `warn` / `error`) | — |
+| `SEER_DOMAIN_ALLOWLIST` | Comma-separated allowlist restricting which domains may be queried | — |
+| `SEER_HOST` | API bind host. Non-loopback requires `SEER_API_KEY` | `127.0.0.1` |
+| `SEER_PORT` | API bind port | `8000` |
+| `SEER_API_KEY` | Bearer token required for all non-`/health` requests | — |
 | `SEER_CORS_ORIGINS` | Comma-separated CORS origins for REST API | `*` |
-| `SEER_RATE_LIMIT` | REST API rate limit (requests/minute) | `30` |
+| `SEER_DOCS_ENABLED` | Expose `/docs`, `/redoc`, `/openapi.json` | `false` |
+| `SEER_METRICS_ENABLED` | Expose `/metrics` to non-loopback clients | `false` |
+| `SEER_RATE_LIMIT` | Default REST API rate limit | `30/minute` |
+| `SEER_RATE_LIMIT_STORAGE` | Rate-limit storage URI (e.g. `redis://host:6379`) | `memory://` |
+| `SEER_TRUST_PROXY` | Trust `X-Forwarded-For` from `SEER_TRUSTED_PROXY_IPS` | `false` |
+| `SEER_TRUSTED_PROXY_IPS` | Comma-separated IPs allowed to set `X-Forwarded-For` | — |
 | `SEER_MCP_ALLOWED_HOSTS` | Comma-separated `Host:` values for the MCP `/mcp` endpoint — setting this turns on DNS-rebinding protection | — |
 | `SEER_MCP_ALLOWED_ORIGINS` | Comma-separated `Origin:` values for the MCP `/mcp` endpoint (browser hosts) | — |
+| `WEB_CONCURRENCY` | Uvicorn worker count. `>1` requires a non-`memory://` store | `1` |
 
 ### Config File
 
@@ -529,8 +550,8 @@ seer config --init
 
 | Client | Default |
 |--------|---------|
-| WHOIS | 10s |
-| RDAP | 30s |
+| WHOIS | 15s |
+| RDAP | 15s |
 | DNS | 5s (2 retries) |
 | HTTP / SSL | 10s |
 | Propagation | 15s |
