@@ -1,3 +1,11 @@
+//! Domain health checking (HTTP status, SSL, expiration, DNS resolution).
+//!
+//! Retry boundary (deliberate): checks here are single-attempt, unlike the
+//! WHOIS/RDAP clients. This module's job is to OBSERVE a domain's health at a
+//! point in time — automatic retries would mask exactly the flakiness a
+//! health probe exists to surface. Callers that want tolerance to transient
+//! failures (e.g. watch mode) own that policy at their layer.
+
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::time::Duration;

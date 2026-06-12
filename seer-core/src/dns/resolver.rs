@@ -1,3 +1,13 @@
+//! DNS resolution over hickory-resolver.
+//!
+//! Retry boundary (deliberate): unlike the WHOIS/RDAP clients, this module
+//! does NOT wrap queries in [`crate::retry::RetryPolicy`]. hickory-resolver
+//! already performs its own retransmission (`opts.attempts` below) against
+//! the configured nameserver within the per-query timeout; stacking an outer
+//! retry loop on top would multiply worst-case latency without improving
+//! resolution odds. If a retry knob is ever needed here, tune
+//! `ResolverOpts::attempts` rather than adding a wrapper.
+
 use std::net::IpAddr;
 use std::str::FromStr;
 use std::time::Duration;
