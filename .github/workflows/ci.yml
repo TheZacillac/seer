@@ -53,6 +53,25 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
 
+  python:
+    name: Python (seer-py + seer-api)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build and install seer-py (PEP 517 via maturin)
+        run: pip install './seer-py[dev]'
+      - name: Install seer-api
+        run: pip install -e './seer-api[dev]'
+      - name: Test seer-py
+        run: python -m pytest seer-py/tests -q
+      - name: Test seer-api
+        run: python -m pytest seer-api/tests -q
+
   audit:
     name: Security Audit
     runs-on: ubuntu-latest
