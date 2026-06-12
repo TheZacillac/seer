@@ -2,6 +2,11 @@
 //!
 //! Provides detailed SSL/TLS certificate information including the certificate
 //! chain, Subject Alternative Names (SANs), key details, and validity status.
+//!
+//! Retry boundary (deliberate): single-attempt, like [`crate::status`] — a
+//! certificate inspection is a point-in-time observation, and retrying would
+//! hide intermittent TLS failures from the user. Transient-failure tolerance
+//! belongs to callers (e.g. watch mode).
 
 use std::time::Duration;
 
