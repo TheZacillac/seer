@@ -17,11 +17,18 @@ use crate::validation::normalize_domain;
 
 /// Pre-compiled regexes for extracting WHOIS referral servers.
 static REFERRAL_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
+    // The value MUST be on the SAME line as the key. Use `[ \t]*` (horizontal
+    // whitespace only) rather than `\s*` between the key and the capture
+    // group: `\s*` matches newlines, so an EMPTY `Registrar WHOIS Server:`
+    // line would otherwise swallow the line break and capture the following
+    // line's content as the referral server. `[ \t]*` keeps the match anchored
+    // to the key's own line, and the `(.+)` capture (where `.` excludes `\n`)
+    // yields no match for an empty value.
     vec![
-        Regex::new(r"(?i)Registrar WHOIS Server:\s*(.+)")
+        Regex::new(r"(?i)Registrar WHOIS Server:[ \t]*(.+)")
             .expect("Invalid regex pattern for Registrar WHOIS Server"),
-        Regex::new(r"(?i)Whois Server:\s*(.+)").expect("Invalid regex pattern for Whois Server"),
-        Regex::new(r"(?i)ReferralServer:\s*whois://(.+)")
+        Regex::new(r"(?i)Whois Server:[ \t]*(.+)").expect("Invalid regex pattern for Whois Server"),
+        Regex::new(r"(?i)ReferralServer:[ \t]*whois://(.+)")
             .expect("Invalid regex pattern for ReferralServer"),
     ]
 });
@@ -471,6 +478,27 @@ mod tests {
     fn test_default_client_has_retry_policy() {
         let client = WhoisClient::new();
         assert_eq!(client.retry_policy.max_attempts, 3);
+    }
+
+    #[test]
+    fn extract_referral_same_line_value() {
+        let response = "Registrar WHOIS Server: whois.registrar.example\n";
+        assert_eq!(
+            extract_referral(response),
+            Some("whois.registrar.example".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_referral_empty_key_line_does_not_capture_next_line() {
+        // An empty `Registrar WHOIS Server:` line must NOT capture the
+        // following line's content as the referral server.
+        let response = "Registrar WHOIS Server:\nwhois.victim.example\n";
+        assert_eq!(
+            extract_referral(response),
+            None,
+            "empty referral key line must not swallow the next line"
+        );
     }
 
     #[test]

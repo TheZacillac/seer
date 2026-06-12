@@ -266,7 +266,8 @@ impl PropagationChecker {
                     records: vec![],
                     response_time_ms,
                     success: false,
-                    error: Some(e.to_string()),
+                    // Sanitized for external return; full detail logged above.
+                    error: Some(e.sanitized_message()),
                 }
             }
         }

@@ -20,6 +20,7 @@ from typing import Any
 
 from starlette.responses import StreamingResponse
 
+from ._run import _DISPATCH_EXECUTOR
 from .errors import safe_error_message
 
 logger = logging.getLogger("seer_api")
@@ -52,8 +53,13 @@ async def stream_bulk(
             ("progress", {"completed": completed, "total": total, "current_domain": domain}),
         )
 
+    # Dispatch on the bounded seer-dispatch pool (see _run.py), not the
+    # default asyncio executor. The default pool is shared with
+    # ssrf.guard_async; a long bulk stream sitting on default-pool threads
+    # would starve SSRF guards and stall /status, /ssl, etc. `run_seer`
+    # can't be used here because it doesn't forward the `progress` kwarg.
     bulk_future = loop.run_in_executor(
-        None, lambda: bulk_call(*args, progress=progress_cb, **kwargs)
+        _DISPATCH_EXECUTOR, lambda: bulk_call(*args, progress=progress_cb, **kwargs)
     )
 
     async def event_stream() -> AsyncGenerator[bytes, None]:

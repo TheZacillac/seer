@@ -17,6 +17,18 @@ impl TldState {
         TLDS[self.idx].to_string()
     }
 
+    /// Select a TLD by name (tolerant of a leading dot and case). Returns
+    /// `true` and updates the index if found in `TLDS`, `false` otherwise.
+    pub fn select(&mut self, tld: &str) -> bool {
+        let want = tld.trim().trim_start_matches('.').to_lowercase();
+        if let Some(i) = TLDS.iter().position(|t| t.trim_start_matches('.') == want) {
+            self.idx = i;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Handle a key event. Consumes only `h`/`l` for cycling; returns `None`
     /// for all other keys so App's normal handling (Esc, Tab, etc.) still runs.
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<PaneOutcome> {

@@ -451,6 +451,69 @@ def test_mcp_call_tool_returns_invalid_input_for_ssrf():
 
 
 # ---------------------------------------------------------------------------
+# MCP retry-hint classification: permanent RuntimeErrors must NOT be labelled
+# retryable. seer-core's retry.rs::is_retryable classifies several
+# RuntimeError-mapped variants (WhoisServerNotFound, JsonError parse failures,
+# LookupFailed, certificate/SSL errors) as permanent.
+# ---------------------------------------------------------------------------
+
+
+def _run_call_tool_with_error(monkeypatch, exc: Exception) -> str:
+    """Drive call_tool's error handler by making execute_tool raise `exc`."""
+    import asyncio
+
+    from seer_api.mcp import server as mcp_server
+
+    async def _boom(_name, _arguments):
+        raise exc
+
+    monkeypatch.setattr(mcp_server, "execute_tool", _boom)
+    result = asyncio.run(mcp_server.call_tool("seer_lookup", {"domain": "x.test"}))
+    assert len(result) == 1
+    return result[0].text
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "WHOIS server not found for this TLD",
+        "Response parsing failed",
+        "Lookup failed for example.invalidtld",
+        "Certificate validation failed",
+        "SSL inspection failed",
+        "Configuration error",
+        "Bulk operation partially failed: ssl",
+    ],
+)
+def test_mcp_permanent_runtimeerror_not_labelled_retryable(monkeypatch, message):
+    text = _run_call_tool_with_error(monkeypatch, RuntimeError(message))
+    assert "permanent failure" in text.lower()
+    assert "do not retry" in text.lower()
+
+
+def test_mcp_rate_limited_runtimeerror_is_retryable(monkeypatch):
+    text = _run_call_tool_with_error(
+        monkeypatch, RuntimeError("Rate limited - please try again later")
+    )
+    assert "retry" in text.lower()
+    assert "permanent failure" not in text.lower()
+
+
+def test_mcp_ambiguous_runtimeerror_is_cautious(monkeypatch):
+    # Generic transport failures collapse to one sanitized string; we must
+    # not over-promise a successful retry.
+    text = _run_call_tool_with_error(monkeypatch, RuntimeError("RDAP lookup failed"))
+    assert "permanent failure" not in text.lower()
+    assert "at most once" in text.lower()
+
+
+def test_mcp_timeout_is_retryable(monkeypatch):
+    text = _run_call_tool_with_error(monkeypatch, TimeoutError("Operation timed out"))
+    assert "transient" in text.lower()
+    assert "retry suggested" in text.lower()
+
+
+# ---------------------------------------------------------------------------
 # D1 (C6): fail-closed startup — public bind requires SEER_API_KEY
 # ---------------------------------------------------------------------------
 
@@ -701,6 +764,44 @@ def test_xff_trusted_from_allowlisted_peer(monkeypatch):
     }
     req = Request(scope)
     assert get_client_ip(req) == "1.2.3.4"
+
+
+def test_xff_uses_rightmost_untrusted_entry(monkeypatch):
+    """A spoofed leftmost XFF entry must be ignored. With a chain of
+    proxies appending the real client IP, the rightmost entry that is NOT
+    itself a trusted proxy is the genuine client."""
+    from fastapi import Request
+    from seer_api.limiting import get_client_ip
+
+    monkeypatch.setenv("SEER_TRUST_PROXY", "true")
+    monkeypatch.setenv("SEER_TRUSTED_PROXY_IPS", "10.0.0.1,10.0.0.2")
+    scope = {
+        "type": "http",
+        "client": ("10.0.0.1", 1234),
+        # Attacker forged "1.1.1.1" as the leftmost value; the real client
+        # is 203.0.113.9, appended by the edge proxy, then forwarded
+        # through trusted hops 10.0.0.2 / 10.0.0.1.
+        "headers": [(b"x-forwarded-for", b"1.1.1.1, 203.0.113.9, 10.0.0.2, 10.0.0.1")],
+    }
+    req = Request(scope)
+    assert get_client_ip(req) == "203.0.113.9"
+
+
+def test_xff_all_trusted_falls_back_to_peer(monkeypatch):
+    """If every XFF entry is a trusted proxy, fall back to the socket peer
+    rather than attributing the request to a proxy IP."""
+    from fastapi import Request
+    from seer_api.limiting import get_client_ip
+
+    monkeypatch.setenv("SEER_TRUST_PROXY", "true")
+    monkeypatch.setenv("SEER_TRUSTED_PROXY_IPS", "10.0.0.1,10.0.0.2")
+    scope = {
+        "type": "http",
+        "client": ("10.0.0.1", 1234),
+        "headers": [(b"x-forwarded-for", b"10.0.0.2, 10.0.0.1")],
+    }
+    req = Request(scope)
+    assert get_client_ip(req) == "10.0.0.1"
 
 
 def test_xff_ignored_when_allowlist_empty(monkeypatch):

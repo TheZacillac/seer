@@ -130,6 +130,14 @@ impl MarkdownFormatter {
             if report.is_valid { "yes" } else { "no" }
         ));
         output.push(format!(
+            "- **Hostname Match**: {}",
+            if report.hostname_verified {
+                "yes"
+            } else {
+                "no"
+            }
+        ));
+        output.push(format!(
             "- **Days Until Expiry**: {}",
             report.days_until_expiry
         ));

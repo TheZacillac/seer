@@ -49,6 +49,19 @@ pub fn normalize_domain(domain: &str) -> Result<String> {
     let domain = domain.split('?').next().unwrap_or(domain);
     let domain = domain.split('#').next().unwrap_or(domain);
 
+    // Strip userinfo (`user:pass@host`) — take the host portion after the
+    // last '@'. This runs after path stripping so a stray '@' in a path
+    // segment can't affect the host.
+    let domain = domain.rsplit('@').next().unwrap_or(domain);
+
+    // Strip a trailing port (`host:8443`) but only when it is `:` followed
+    // entirely by digits, so we never truncate anything else (and IPv6
+    // literals, which are not valid here anyway, won't match this shape).
+    let domain = match domain.rsplit_once(':') {
+        Some((host, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => host,
+        _ => domain,
+    };
+
     // Remove www. prefix
     let domain = domain.strip_prefix("www.").unwrap_or(domain);
 
@@ -315,6 +328,21 @@ mod tests {
         assert!(normalize_domain(".example.com").is_err());
         assert!(normalize_domain("-example.com").is_err());
         assert!(normalize_domain("example-.com").is_err());
+
+        // Port and userinfo are stripped from the host.
+        assert_eq!(
+            normalize_domain("https://example.com:8443/admin").unwrap(),
+            "example.com"
+        );
+        assert_eq!(normalize_domain("example.com:443").unwrap(), "example.com");
+        assert_eq!(
+            normalize_domain("https://user@example.com/").unwrap(),
+            "example.com"
+        );
+        assert_eq!(
+            normalize_domain("https://user:pass@example.com:8443/path").unwrap(),
+            "example.com"
+        );
 
         // FQDN form is accepted: single trailing dot is stripped.
         assert_eq!(normalize_domain("example.com.").unwrap(), "example.com");

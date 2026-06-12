@@ -62,6 +62,7 @@ mod tests {
             protocol_version: None,
             san_names: vec!["example.com".into(), "*.example.com".into()],
             is_valid: true,
+            hostname_verified: true,
             days_until_expiry: 225,
             caa: None,
         }
