@@ -50,6 +50,14 @@ static DISCOVERED_SERVERS: Lazy<TtlCache<String, String>> =
 pub struct WhoisClient {
     timeout: Duration,
     retry_policy: RetryPolicy,
+    /// Target port for WHOIS queries. Always [`WHOIS_PORT`] in production;
+    /// overridable only through the `#[cfg(test)]` seam so mock-server tests
+    /// can bind an ephemeral local port.
+    port: u16,
+    /// When true, skips the SSRF/public-host validation so tests can point
+    /// the client at a 127.0.0.1 fixture. Not settable outside `#[cfg(test)]`
+    /// builds — production paths always validate.
+    allow_private_hosts: bool,
 }
 
 impl Default for WhoisClient {
@@ -64,7 +72,23 @@ impl WhoisClient {
         Self {
             timeout: DEFAULT_TIMEOUT,
             retry_policy: RetryPolicy::default(),
+            port: WHOIS_PORT,
+            allow_private_hosts: false,
         }
+    }
+
+    /// Test-only: allow connections to loopback/private hosts (mock servers).
+    #[cfg(test)]
+    pub(crate) fn allowing_private_hosts(mut self) -> Self {
+        self.allow_private_hosts = true;
+        self
+    }
+
+    /// Test-only: query a non-standard port (mock servers bind ephemeral ports).
+    #[cfg(test)]
+    pub(crate) fn with_port(mut self, port: u16) -> Self {
+        self.port = port;
+        self
     }
 
     /// Sets the timeout for WHOIS queries.
@@ -179,7 +203,7 @@ impl WhoisClient {
             }
 
             // Registry response is thin — follow the referral for more detail
-            if let Some(referral) = extract_referral(&raw_response) {
+            if let Some(referral) = extract_referral_with(&raw_response, self.allow_private_hosts) {
                 if referral != whois_server && !visited.contains(&referral.to_lowercase()) {
                     debug!(
                         referral_depth = depth,
@@ -226,7 +250,7 @@ impl WhoisClient {
                 server.replace('\r', "\\r").replace('\n', "\\n")
             )));
         }
-        if !is_safe_whois_server(server) {
+        if !self.allow_private_hosts && !is_safe_whois_server(server) {
             return Err(SeerError::WhoisError(format!(
                 "invalid WHOIS server: {}",
                 server
@@ -244,12 +268,23 @@ impl WhoisClient {
         let server = server.to_string();
         let query = query.to_string();
         let timeout_duration = self.timeout;
+        let port = self.port;
+        let allow_private_hosts = self.allow_private_hosts;
 
         executor
             .execute(|| {
                 let server = server.clone();
                 let query = query.clone();
-                async move { query_server_internal(&server, &query, timeout_duration).await }
+                async move {
+                    query_server_internal_with(
+                        &server,
+                        &query,
+                        timeout_duration,
+                        port,
+                        allow_private_hosts,
+                    )
+                    .await
+                }
             })
             .await
     }
@@ -295,11 +330,30 @@ impl WhoisClient {
     }
 }
 
-/// Internal function to query a WHOIS server (used by retry executor).
+/// Test-facing wrapper with the historical 3-arg signature: standard port,
+/// full SSRF validation. Production goes through [`query_server_internal_with`]
+/// via `WhoisClient`, whose `port`/`allow_private_hosts` fields are only
+/// non-default in `#[cfg(test)]` builds.
+#[cfg(test)]
 async fn query_server_internal(
     server: &str,
     query: &str,
     timeout_duration: Duration,
+) -> Result<String> {
+    query_server_internal_with(server, query, timeout_duration, WHOIS_PORT, false).await
+}
+
+/// Like [`query_server_internal`], parameterized over port and host
+/// validation so `#[cfg(test)]` mock-server tests can target 127.0.0.1 on an
+/// ephemeral port. Every production call site goes through the validating
+/// wrapper above or a `WhoisClient` constructed with `allow_private_hosts:
+/// false` (the only kind constructible outside test builds).
+async fn query_server_internal_with(
+    server: &str,
+    query: &str,
+    timeout_duration: Duration,
+    port: u16,
+    allow_private_hosts: bool,
 ) -> Result<String> {
     // Defense in depth: reject CR/LF/NUL in the query before any TCP write.
     // normalize_domain already filters these, but we enforce here too so
@@ -317,7 +371,14 @@ async fn query_server_internal(
     // TOCTOU where a hostile authoritative DNS for a referral/IANA-discovered
     // server could answer the validation lookup with a public IP and the
     // connect lookup with 127.0.0.1 / 169.254.169.254 / RFC1918.
-    let addrs = crate::net::resolve_public_host(server, WHOIS_PORT).await?;
+    let addrs: Vec<std::net::SocketAddr> = if allow_private_hosts {
+        tokio::net::lookup_host((server, port))
+            .await
+            .map_err(|e| SeerError::WhoisError(format!("failed to resolve {}: {}", server, e)))?
+            .collect()
+    } else {
+        crate::net::resolve_public_host(server, port).await?
+    };
 
     debug!("WHOIS query to {}", server);
     let mut stream = timeout(timeout_duration, TcpStream::connect(addrs.as_slice()))
@@ -444,12 +505,23 @@ fn is_safe_whois_server(server: &str) -> bool {
     true
 }
 
+/// Test-facing wrapper preserving the historical 1-arg signature (production
+/// semantics: safe-hostname filter applied).
+#[cfg(test)]
 fn extract_referral(response: &str) -> Option<String> {
+    extract_referral_with(response, false)
+}
+
+/// Like [`extract_referral`], but `allow_private_hosts` skips the
+/// safe-hostname filter so `#[cfg(test)]` mock servers (loopback, no dots)
+/// can act as referral targets. Production callers pass the client's
+/// `allow_private_hosts`, which is always false outside test builds.
+fn extract_referral_with(response: &str, allow_private_hosts: bool) -> Option<String> {
     for re in REFERRAL_PATTERNS.iter() {
         if let Some(caps) = re.captures(response) {
             if let Some(m) = caps.get(1) {
                 let server = m.as_str().trim().to_lowercase();
-                if is_safe_whois_server(&server) {
+                if allow_private_hosts || is_safe_whois_server(&server) {
                     return Some(server);
                 }
             }
@@ -619,5 +691,111 @@ mod tests {
             .await
             .expect_err("link-local metadata server must be rejected");
         assert!(matches!(err, SeerError::InvalidInput(_)));
+    }
+
+    // ---- deterministic mock-server tests -----------------------------------
+    //
+    // These run a real TCP listener on 127.0.0.1 and exercise the full client
+    // path (connect → query → read-to-EOF → parse → referral logic) without
+    // touching the network. The SSRF guards deliberately refuse loopback, so
+    // the client under test uses the `#[cfg(test)]`-only `allowing_private_hosts`
+    // / `with_port` seams, which do not exist in release builds.
+
+    /// Serves one canned WHOIS response per accepted connection, in order,
+    /// then stops accepting. Returns the bound port.
+    async fn spawn_mock_whois(responses: Vec<&'static str>) -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            for response in responses {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = [0u8; 512];
+                let _ = sock.read(&mut buf).await; // consume "domain\r\n"
+                let _ = sock.write_all(response.as_bytes()).await;
+                // drop(sock) → FIN → client reads to EOF
+            }
+        });
+        port
+    }
+
+    fn mock_client(port: u16) -> WhoisClient {
+        WhoisClient::new()
+            .without_retries()
+            .allowing_private_hosts()
+            .with_port(port)
+    }
+
+    #[tokio::test]
+    async fn mock_basic_lookup_parses_canned_response() {
+        let port = spawn_mock_whois(vec![
+            "Domain Name: EXAMPLE.COM\nRegistrar: Mock Registrar Inc.\nCreation Date: 2020-01-01T00:00:00Z\n",
+        ])
+        .await;
+        let resp = mock_client(port)
+            .lookup_with_server("example.com", "127.0.0.1")
+            .await
+            .unwrap();
+        assert_eq!(resp.registrar.as_deref(), Some("Mock Registrar Inc."));
+    }
+
+    #[tokio::test]
+    async fn mock_referral_is_followed_when_registry_response_is_thin() {
+        // Registry response (127.0.0.1) lacks core data and refers to
+        // "localhost"; both names resolve to the same fixture, which serves
+        // the responses in connection order.
+        let port = spawn_mock_whois(vec![
+            "Registry data follows.\nRegistrar WHOIS Server: localhost\n",
+            "Domain Name: EXAMPLE.COM\nRegistrar: Mock Registrar Two\nCreation Date: 2021-02-02T00:00:00Z\n",
+        ])
+        .await;
+        let client = mock_client(port);
+        let mut visited = HashSet::new();
+        let resp = client
+            .lookup_with_referrals("example.com", "127.0.0.1", 0, &mut visited)
+            .await
+            .unwrap();
+        assert_eq!(resp.registrar.as_deref(), Some("Mock Registrar Two"));
+        assert_eq!(resp.whois_server, "localhost");
+    }
+
+    #[tokio::test]
+    async fn mock_circular_referral_terminates_with_last_response() {
+        // A (127.0.0.1) refers to B (localhost); B refers back to A, which is
+        // already in the visited set. The chain must terminate gracefully —
+        // returning B's response — instead of looping or erroring.
+        let port = spawn_mock_whois(vec![
+            "Registry data follows.\nRegistrar WHOIS Server: localhost\n",
+            "Registrar data follows.\nRegistrar WHOIS Server: 127.0.0.1\n",
+        ])
+        .await;
+        let client = mock_client(port);
+        let mut visited = HashSet::new();
+        let resp = client
+            .lookup_with_referrals("example.com", "127.0.0.1", 0, &mut visited)
+            .await
+            .unwrap();
+        assert_eq!(resp.whois_server, "localhost");
+    }
+
+    #[tokio::test]
+    async fn mock_silent_server_times_out() {
+        // Listener accepts but never writes: the read deadline must surface
+        // as SeerError::Timeout rather than hanging.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let Ok((_sock, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        });
+        let client = mock_client(port).with_timeout(Duration::from_millis(200));
+        let err = client
+            .lookup_with_server("example.com", "127.0.0.1")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SeerError::Timeout(_)), "got: {err:?}");
     }
 }
