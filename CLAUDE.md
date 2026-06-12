@@ -1198,8 +1198,12 @@ What happens automatically:
    seer-cli to crates.io, and attaches seer-py wheels (abi3, one per platform)
    to the release.
 
-PyPI is NOT part of the flow: the name `seer` is taken there. Wheels are
-installed from release assets unless/until the distribution is renamed.
+PyPI: the bindings publish as **`domain-seer`** (the bare name `seer` is taken
+by an unrelated project; the import name remains `seer`). Publishing uses PyPI
+Trusted Publishing (OIDC) from `publish.yml` — no token secret. seer-api
+depends on `domain-seer>=0.32`. When bumping versions, remember
+`importlib.metadata.version("domain-seer")` in `seer-py/python/seer/__init__.py`
+keys off the distribution name.
 
 `dist-workspace.toml` holds the cargo-dist config; after editing it, run
 `dist generate` to regenerate `release.yml` (never hand-edit that file).

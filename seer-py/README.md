@@ -12,6 +12,12 @@ Python bindings for the Seer domain utility library.
 
 ## Installation
 
+### From PyPI
+
+```bash
+pip install domain-seer   # distribution name; the import name is `seer`
+```
+
 ### From Source (Development)
 
 ```bash
@@ -28,7 +34,7 @@ maturin develop --release
 ```bash
 cd seer-py
 maturin build --release
-pip install target/wheels/seer-*.whl
+pip install target/wheels/domain_seer-*.whl
 ```
 
 ## Files
