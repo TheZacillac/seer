@@ -1194,9 +1194,13 @@ git tag v0.33.0 && git push --tags
 What happens automatically:
 1. `release.yml` (cargo-dist) builds `seer` binaries for 5 targets + shell/
    PowerShell installers, and creates the GitHub Release.
-2. `publish.yml` fires on `release: published`: publishes seer-core then
-   seer-cli to crates.io, and attaches seer-py wheels (abi3, one per platform)
-   to the release.
+2. **Manual step — dispatch the publish workflow:** `gh workflow run
+   publish.yml`. It does NOT fire automatically: dist creates the release
+   with the workflow's `GITHUB_TOKEN`, and GitHub suppresses events from
+   such actions (anti-recursion), so the `release: published` trigger never
+   sees it. The dispatched run publishes seer-core then seer-cli to
+   crates.io. (Wheels/PyPI jobs are still release-event-gated — see the
+   workflow; proper fix is folding them into dist's `publish-jobs`.)
 
 PyPI: the bindings publish as **`domain-seer`** (the bare name `seer` is taken
 by an unrelated project; the import name remains `seer`). Publishing uses PyPI
