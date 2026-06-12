@@ -87,6 +87,7 @@ Available only when `SEER_DOCS_ENABLED=true`:
 | `/propagation/{domain}/{record_type}` | GET | DNS propagation check |
 | `/status/{domain}` | GET | Domain status check |
 | `/status/bulk` | POST | Bulk status checks |
+| `/mcp` | GET/POST | MCP Streamable HTTP transport (see [MCP Server](#mcp-server)) |
 
 ### Usage Examples
 
@@ -140,13 +141,47 @@ Default: 30 requests/minute
 
 ## MCP Server
 
-### Starting the Server
+Two transports expose the same tool registry:
+
+- **stdio** (`seer-mcp`) — local subprocess, used by Claude Desktop and other
+  desktop AI clients.
+- **Streamable HTTP** (`POST /mcp` on the `seer-api` process) — for remote
+  AI clients and web hosts. Mounted on the existing FastAPI app, so it
+  inherits `SEER_API_KEY` auth, body-size cap, request logging, and CORS.
+
+### Starting the stdio server
 
 ```bash
 seer-mcp
 ```
 
-The MCP server uses stdio transport for communication with AI assistants.
+### Streamable HTTP transport
+
+Start the API server as usual; the MCP endpoint is at `POST /mcp`. Mint a
+fresh bearer token with the `seer` CLI:
+
+```bash
+eval "$(seer generate-key --export)"   # exports SEER_API_KEY
+seer-api
+
+curl -N -X POST http://127.0.0.1:8000/mcp \
+  -H "Authorization: Bearer $SEER_API_KEY" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+```
+
+The transport runs in **stateless mode** — each POST is a fresh session,
+so the server scales across `WEB_CONCURRENCY` workers without a shared
+session store. Responses are SSE-framed so `tools/call` can stream long
+bulk operations back to the client.
+
+Optional env vars:
+
+| Variable | Description |
+|----------|-------------|
+| `SEER_MCP_ALLOWED_HOSTS` | Comma-separated `Host:` values to allow. Enabling this turns on DNS-rebinding protection. |
+| `SEER_MCP_ALLOWED_ORIGINS` | Comma-separated `Origin:` values to allow (browser hosts). |
 
 ### Available Tools
 

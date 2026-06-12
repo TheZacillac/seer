@@ -8,13 +8,17 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, ORJSONResponse
+from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+from mcp.server.transport_security import TransportSecuritySettings
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
+from starlette.routing import Route
 
 from . import __version__
 from .limiting import limiter
+from .mcp.server import mcp as mcp_server
 from .middleware import MaxBodySizeMiddleware, RequestLoggingMiddleware, metrics
-from .routers import lookup, whois, rdap, dns, propagation, status, ssl
+from .routers import dns, lookup, propagation, rdap, ssl, status, whois
 
 # Configure structured logging via the unified Arcanum logging module.
 try:
@@ -45,6 +49,61 @@ _AUTH_EXEMPT_PATHS: frozenset[str] = (
     if DOCS_ENABLED
     else frozenset({"/health"})
 )
+
+
+def _build_mcp_session_manager() -> StreamableHTTPSessionManager:
+    """Construct the Streamable HTTP MCP session manager.
+
+    Built fresh per lifespan entry — ``StreamableHTTPSessionManager.run()``
+    refuses to re-enter on the same instance, so a long-lived module-level
+    singleton would break uvicorn restarts and TestClient re-use.
+
+    Runs in stateless mode so it can scale across uvicorn workers without a
+    shared session store. DNS-rebinding protection is opt-in via
+    ``SEER_MCP_ALLOWED_HOSTS`` / ``SEER_MCP_ALLOWED_ORIGINS`` (the SDK
+    middleware blocks all requests unless at least one host pattern is
+    configured, so we only enable it when the operator provides one).
+    """
+    allowed_hosts_env = os.environ.get("SEER_MCP_ALLOWED_HOSTS", "")
+    allowed_origins_env = os.environ.get("SEER_MCP_ALLOWED_ORIGINS", "")
+    if allowed_hosts_env or allowed_origins_env:
+        security = TransportSecuritySettings(
+            enable_dns_rebinding_protection=True,
+            allowed_hosts=[h.strip() for h in allowed_hosts_env.split(",") if h.strip()],
+            allowed_origins=[o.strip() for o in allowed_origins_env.split(",") if o.strip()],
+        )
+    else:
+        security = None
+    return StreamableHTTPSessionManager(
+        app=mcp_server,
+        stateless=True,
+        json_response=False,
+        security_settings=security,
+    )
+
+
+class _McpAsgiApp:
+    """ASGI3 callable that delegates to the active MCP session manager.
+
+    Defined as a class (not a plain function) so Starlette's ``Route``
+    treats it as a raw ASGI app instead of wrapping it as a request /
+    response endpoint — which lets the session manager own the SSE stream.
+
+    Holds the manager via a mutable attribute so the lifespan can swap in a
+    fresh instance on each entry (the SDK forbids re-entering ``run()`` on
+    the same instance) without rebuilding the route table.
+    """
+
+    def __init__(self) -> None:
+        self.manager: StreamableHTTPSessionManager | None = None
+
+    async def __call__(self, scope, receive, send) -> None:
+        if self.manager is None:
+            raise RuntimeError("MCP session manager not started; lifespan did not run")
+        await self.manager.handle_request(scope, receive, send)
+
+
+_mcp_asgi_app = _McpAsgiApp()
 
 # Rate limiter configuration is handled in limiting.py at construction time
 # via SEER_RATE_LIMIT env var (default: "30/minute")
@@ -95,7 +154,19 @@ async def lifespan(_app: FastAPI):
             host,
         )
         raise RuntimeError("refusing to start: public bind without auth")
-    yield
+
+    # Streamable HTTP MCP transport needs its own task group to manage
+    # per-request transports. Build a fresh session manager per lifespan
+    # entry — the SDK forbids re-running an instance — and expose it to
+    # the mounted ASGI handler for the duration of the run.
+    manager = _build_mcp_session_manager()
+    _mcp_asgi_app.manager = manager
+    try:
+        async with manager.run():
+            log.info("MCP Streamable HTTP transport mounted at /mcp (stateless)")
+            yield
+    finally:
+        _mcp_asgi_app.manager = None
 
 
 app = FastAPI(
@@ -201,6 +272,13 @@ app.include_router(propagation.router, prefix="/propagation", tags=["Propagation
 app.include_router(status.router, prefix="/status", tags=["Status"])
 app.include_router(ssl.router, prefix="/ssl", tags=["SSL"])
 
+# MCP Streamable HTTP transport. Registered as a Starlette Route (not
+# FastAPI mount) so the session manager owns the full request lifecycle,
+# including SSE streaming for tools/call responses, with no /mcp -> /mcp/
+# redirect. Auth, body-size cap, and request logging wrap it transparently
+# via the middleware stack.
+app.router.routes.append(Route("/mcp", endpoint=_mcp_asgi_app))
+
 
 @app.get("/")
 async def root():
@@ -219,6 +297,7 @@ async def root():
             "propagation": "/propagation/{domain}/{record_type}",
             "status": "/status/{domain}",
             "ssl_bulk": "/ssl/bulk",
+            "mcp": "/mcp",
         },
         "docs": "/docs",
     }

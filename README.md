@@ -410,10 +410,31 @@ API docs (when `SEER_DOCS_ENABLED=true`):
 
 ## 🤖 MCP Server
 
-Integrate Seer with AI assistants via the [Model Context Protocol](https://modelcontextprotocol.io/):
+Integrate Seer with AI assistants via the [Model Context Protocol](https://modelcontextprotocol.io/). Two transports expose the same tools:
 
 ```bash
-seer-mcp   # Runs on stdio transport
+# Local subprocess transport (Claude Desktop, etc.)
+seer-mcp   # stdio
+
+# Remote / web transport (mounted on the REST API)
+seer-api   # exposes POST /mcp using MCP Streamable HTTP
+```
+
+The Streamable HTTP endpoint runs stateless inside the existing `seer-api`
+process and inherits `SEER_API_KEY` auth, request logging, and the body-size
+cap. See [seer-api/README.md](seer-api/README.md#streamable-http-transport)
+for the wire format.
+
+Generate a random bearer token for the connector:
+
+```bash
+# Capture into a shell var
+KEY=$(seer generate-key)
+
+# Or eval directly into the current shell
+eval "$(seer generate-key --export)"
+
+SEER_API_KEY=$KEY SEER_HOST=0.0.0.0 seer-api
 ```
 
 **16 tools available:**
@@ -493,6 +514,8 @@ Propagation checks query **29 nameservers** across **6 regions**:
 | `RUST_LOG` | Logging level (`trace` / `debug` / `info` / `warn` / `error`) | — |
 | `SEER_CORS_ORIGINS` | Comma-separated CORS origins for REST API | `*` |
 | `SEER_RATE_LIMIT` | REST API rate limit (requests/minute) | `30` |
+| `SEER_MCP_ALLOWED_HOSTS` | Comma-separated `Host:` values for the MCP `/mcp` endpoint — setting this turns on DNS-rebinding protection | — |
+| `SEER_MCP_ALLOWED_ORIGINS` | Comma-separated `Origin:` values for the MCP `/mcp` endpoint (browser hosts) | — |
 
 ### Config File
 

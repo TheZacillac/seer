@@ -33,6 +33,7 @@ ratatui = "0.29"
 futures = { workspace = true }
 base64 = { workspace = true }
 dirs = { workspace = true }
+rand = { workspace = true }
 
 [lints]
 workspace = true
