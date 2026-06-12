@@ -1,0 +1,14 @@
+---
+source: seer-core/tests/format_snapshots.rs
+assertion_line: 153
+expression: markdown().format_rdap(&fixture_rdap())
+---
+## RDAP: EXAMPLE.COM
+
+- **Handle**: `2336799_DOMAIN_COM-VRSN`
+- **Registrar**: Mock Registrar Inc.
+- **Created**: `2010-03-15`
+- **Expires**: `2099-03-15` ([N] days)
+- **Updated**: `2024-02-01`
+- **Status**: `client transfer prohibited`, `server delete prohibited`
+- **Nameservers**: `NS1.EXAMPLE.COM`, `NS2.EXAMPLE.COM`
