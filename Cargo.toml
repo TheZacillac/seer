@@ -75,6 +75,9 @@ toml = "0.8"
 # IDN support
 idna = "1"
 
+# Test-only: deterministic HTTP mocking
+wiremock = "0.6"
+
 # Directory paths
 dirs = "5"
 
