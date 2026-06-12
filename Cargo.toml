@@ -17,6 +17,7 @@ edition = "2021"
 authors = ["Zac Roach"]
 license = "MIT"
 repository = "https://github.com/TheZacillac/seer"
+homepage = "https://github.com/TheZacillac/seer"
 
 [workspace.dependencies]
 # Async runtime

@@ -5,6 +5,7 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 description = "Interactive CLI for Seer domain name utilities"
 readme = "../README.md"
 keywords = ["whois", "rdap", "dns", "domain", "cli"]
