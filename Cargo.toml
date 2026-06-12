@@ -93,7 +93,16 @@ lto = "thin"
 codegen-units = 1
 strip = "symbols"
 
-# The profile that 'dist' will build with
+# The profile that 'dist' will build with.
+#
+# LTO is OFF here (unlike [profile.release]): thin-LTO intermediate objects
+# deterministically trip Windows Defender's realtime scan on GitHub's
+# windows-latest runners ("could not write output ... permission denied",
+# identical on two consecutive v0.33.0 attempts), killing the build. The
+# dev/test profiles never trip it. Different codegen → different bytes →
+# no false positive. Costs ~10% binary size on prebuilt artifacts only;
+# `cargo install seer-cli` still uses [profile.release] with thin LTO.
 [profile.dist]
 inherits = "release"
-lto = "thin"
+lto = false
+codegen-units = 16
