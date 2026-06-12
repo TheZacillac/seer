@@ -1,0 +1,13 @@
+---
+source: seer-core/tests/format_snapshots.rs
+assertion_line: 158
+expression: human().format_dns(&fixture_dns_records())
+---
+
+[1;95mDNS A Records: example.com[0m
+[37m──────────────────────────[0m
+  [97mexample.com[0m [1;96m3600[0m [1;96mA[0m [1;92m93.184.216.34[0m
+  [97mexample.com[0m [1;96m1800[0m [1;96mMX[0m [1;92m10 mail.example.com[0m
+  [97mwww.example.com[0m [1;96m300[0m [1;96mCNAME[0m [1;92mexample.com[0m
+
+[1;93mNote: DNS responses are not DNSSEC-validated[0m

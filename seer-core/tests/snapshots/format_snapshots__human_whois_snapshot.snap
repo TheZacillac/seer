@@ -1,0 +1,23 @@
+---
+source: seer-core/tests/format_snapshots.rs
+assertion_line: 138
+expression: human().format_whois(&fixture_whois())
+---
+
+[1;95mWHOIS: example.com[0m
+[37m──────────────────[0m
+  [1;96mRegistrar[0m: [97mMock Registrar Inc.[0m
+  [1;96mOrganization[0m: [97mExample Holdings LLC[0m
+
+  [1;96mRegistrant Contact[0m:
+    [1;96mCountry[0m: [97mUS[0m
+  [1;96mCreated[0m: [97m2010-03-15[0m
+  [1;96mExpires[0m: [1;92m2099-03-15 (expires in [N] days)[0m
+  [1;96mUpdated[0m: [97m2024-02-01[0m
+  [1;96mNameservers[0m:
+    - [97mns1.example.com[0m
+    - [97mns2.example.com[0m
+  [1;96mStatus[0m:
+    - [97mclientTransferProhibited[0m
+  [1;96mDNSSEC[0m: [97msignedDelegation[0m
+  [1;96mWHOIS Server[0m: [97mwhois.verisign-grs.com[0m

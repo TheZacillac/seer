@@ -75,6 +75,10 @@ toml = "0.8"
 # IDN support
 idna = "1"
 
+# Test-only: deterministic HTTP mocking and snapshot assertions
+wiremock = "0.6"
+insta = { version = "1", features = ["filters"] }
+
 # Directory paths
 dirs = "5"
 

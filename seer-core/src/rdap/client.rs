@@ -167,6 +167,10 @@ async fn wait_for_in_flight_load(
 #[derive(Debug, Clone)]
 pub struct RdapClient {
     retry_policy: RetryPolicy,
+    /// When true, skips the reserved-IP SSRF validation so tests can target a
+    /// 127.0.0.1 wiremock fixture. Not settable outside `#[cfg(test)]` builds
+    /// — production requests always validate and pin resolved IPs.
+    allow_reserved: bool,
 }
 
 impl Default for RdapClient {
@@ -189,7 +193,15 @@ impl RdapClient {
                 .with_max_attempts(3)
                 .with_initial_delay(Duration::from_millis(500))
                 .with_max_delay(Duration::from_secs(5)),
+            allow_reserved: false,
         }
+    }
+
+    /// Test-only: allow requests to loopback/reserved addresses (mock servers).
+    #[cfg(test)]
+    pub(crate) fn allowing_reserved_for_tests(mut self) -> Self {
+        self.allow_reserved = true;
+        self
     }
 
     /// Sets the retry policy for transient network failures.
@@ -498,7 +510,7 @@ impl RdapClient {
         let classifier = NetworkRetryClassifier::new();
         let mut attempt = 0;
         loop {
-            match query_rdap_attempt(url).await {
+            match query_rdap_attempt(url, self.allow_reserved).await {
                 Ok(resp) => return Ok(resp),
                 Err((err, retry_after)) => {
                     let attempts_remaining =
@@ -612,7 +624,27 @@ fn effective_retry_delay(backoff: Duration, retry_after: Option<Duration>) -> Du
 
 /// Sends one RDAP request: SSRF-validates the URL and pins the resolved IPs on
 /// a short-lived client (DNS-rebinding defense), returning the raw response.
-async fn send_rdap_request(url: &str) -> Result<reqwest::Response> {
+///
+/// `allow_reserved` (test seam, see [`RdapClient::allow_reserved`]) skips the
+/// validation and IP pinning so `#[cfg(test)]` mock servers on loopback are
+/// reachable; it is always false on production paths.
+async fn send_rdap_request(url: &str, allow_reserved: bool) -> Result<reqwest::Response> {
+    if allow_reserved {
+        let client = Client::builder()
+            .timeout(DEFAULT_TIMEOUT)
+            .connect_timeout(CONNECT_TIMEOUT)
+            .user_agent("Seer/1.0 (RDAP Client)")
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|e| SeerError::RdapError(format!("failed to build HTTP client: {}", e)))?;
+        return client
+            .get(url)
+            .header("Accept", "application/rdap+json")
+            .send()
+            .await
+            .map_err(Into::into);
+    }
+
     // SSRF protection: validate the URL does not resolve to reserved IPs and
     // capture the resolved SocketAddrs so we can pin them on the HTTP client.
     let resolved = validate_url_not_reserved(url).await?;
@@ -704,8 +736,11 @@ async fn read_and_parse_rdap_body(response: reqwest::Response, url: &str) -> Res
 /// validation and connect).
 async fn query_rdap_attempt(
     url: &str,
+    allow_reserved: bool,
 ) -> std::result::Result<RdapResponse, (SeerError, Option<Duration>)> {
-    let response = send_rdap_request(url).await.map_err(|e| (e, None))?;
+    let response = send_rdap_request(url, allow_reserved)
+        .await
+        .map_err(|e| (e, None))?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -1349,5 +1384,109 @@ mod tests {
             "expected throttled error when cache still empty after notify, got: {:?}",
             result
         );
+    }
+
+    // ---- deterministic mock-server tests -----------------------------------
+    //
+    // wiremock serves scripted RDAP responses on 127.0.0.1. These exercise the
+    // single-endpoint query path (`query_rdap_with_retry` / `query_rdap_urls`)
+    // directly — no IANA bootstrap involved, so the global bootstrap cache is
+    // untouched and tests stay parallel-safe. The SSRF guard deliberately
+    // refuses loopback, so the client uses the `#[cfg(test)]`-only
+    // `allowing_reserved_for_tests` seam, absent from release builds.
+
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn mock_rdap_404_is_nonretryable_typed_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let client = RdapClient::new()
+            .without_retries()
+            .allowing_reserved_for_tests();
+        let err = client
+            .query_rdap_with_retry(&format!("{}/domain/example.com", server.uri()))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, SeerError::RdapError(ref m) if m.contains("404")),
+            "got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mock_rdap_429_honors_retry_after_and_succeeds() {
+        let server = MockServer::start().await;
+        // First request: rate-limited with an immediate retry hint. The mock
+        // expires after one use, so the retry falls through to the 200 below.
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "0"))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                r#"{"objectClassName":"domain","handle":"MOCK-1"}"#,
+                "application/rdap+json",
+            ))
+            .mount(&server)
+            .await;
+
+        let client = RdapClient::new().allowing_reserved_for_tests();
+        let resp = client
+            .query_rdap_with_retry(&format!("{}/domain/example.com", server.uri()))
+            .await
+            .unwrap();
+        assert_eq!(resp.handle.as_deref(), Some("MOCK-1"));
+    }
+
+    #[tokio::test]
+    async fn mock_rdap_malformed_body_is_parse_error_not_panic() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw("not json", "text/plain"))
+            .mount(&server)
+            .await;
+
+        let client = RdapClient::new()
+            .without_retries()
+            .allowing_reserved_for_tests();
+        let err = client
+            .query_rdap_with_retry(&format!("{}/domain/example.com", server.uri()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SeerError::JsonError(_)), "got: {err:?}");
+    }
+
+    #[tokio::test]
+    async fn mock_rdap_candidate_fallback_uses_second_url() {
+        let bad = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&bad)
+            .await;
+        let good = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                r#"{"objectClassName":"domain","handle":"MOCK-2"}"#,
+                "application/rdap+json",
+            ))
+            .mount(&good)
+            .await;
+
+        let client = RdapClient::new()
+            .without_retries()
+            .allowing_reserved_for_tests();
+        let urls = vec![
+            url::Url::parse(&format!("{}/domain/example.com", bad.uri())).unwrap(),
+            url::Url::parse(&format!("{}/domain/example.com", good.uri())).unwrap(),
+        ];
+        let resp = client.query_rdap_urls(&urls).await.unwrap();
+        assert_eq!(resp.handle.as_deref(), Some("MOCK-2"));
     }
 }

@@ -1,0 +1,22 @@
+---
+source: seer-core/tests/format_snapshots.rs
+assertion_line: 173
+expression: markdown().format_status(&fixture_status())
+---
+## Status: example.com
+
+- **HTTP Status**: `200` (OK)
+- **Site Title**: Example Domain
+
+### SSL Certificate
+
+*Not available (HTTPS may not be configured)*
+
+### Domain Registration
+
+- **Registrar**: Mock Registrar Inc.
+- **Expires**: `2099-03-15` ([N] days)
+
+### DNS Resolution
+
+*Check failed*

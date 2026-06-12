@@ -55,3 +55,6 @@ workspace = true
 
 [dev-dependencies]
 tokio-test = "0.4"
+wiremock = { workspace = true }
+insta = { workspace = true }
+colored = { workspace = true }
