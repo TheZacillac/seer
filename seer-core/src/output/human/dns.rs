@@ -13,7 +13,15 @@ impl HumanFormatter {
         }
 
         let domain = &records[0].name;
-        let record_type = &records[0].record_type;
+        // Label the block by the record type when the set is uniform. An ANY
+        // query returns mixed types, so labeling by records[0] (e.g. "A") is
+        // misleading — fall back to "ANY" whenever more than one type appears.
+        let first_type = records[0].record_type;
+        let record_type = if records.iter().all(|r| r.record_type == first_type) {
+            first_type.to_string()
+        } else {
+            "ANY".to_string()
+        };
         output.push(self.header(&format!(
             "DNS {} Records: {}",
             record_type,

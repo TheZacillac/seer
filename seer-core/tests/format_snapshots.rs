@@ -163,6 +163,48 @@ fn markdown_dns_snapshot() {
     snap!(markdown().format_dns(&fixture_dns_records()));
 }
 
+/// A single A record. Used to assert the uniform-type header path.
+fn fixture_uniform_a_records() -> Vec<DnsRecord> {
+    vec![DnsRecord {
+        name: "example.com".into(),
+        record_type: RecordType::A,
+        ttl: 60,
+        data: RecordData::A {
+            address: "1.2.3.4".into(),
+        },
+    }]
+}
+
+#[test]
+fn human_dns_header_labels_mixed_record_types_as_any() {
+    // Regression: the header was derived from records[0].record_type, so an
+    // ANY query (which returns A + AAAA + MX + ...) was mislabeled "DNS A
+    // Records". A mixed result set must not be labeled by whichever type
+    // happened to come back first.
+    let out = human().format_dns(&fixture_dns_records()); // A + MX + CNAME
+    assert!(
+        out.contains("DNS ANY Records"),
+        "mixed-type header should say ANY, got:\n{out}"
+    );
+    assert!(
+        !out.contains("DNS A Records"),
+        "mixed-type header must not be labeled by the first record type:\n{out}"
+    );
+}
+
+#[test]
+fn human_dns_header_uses_single_type_for_uniform_records() {
+    let out = human().format_dns(&fixture_uniform_a_records());
+    assert!(out.contains("DNS A Records"), "got:\n{out}");
+}
+
+#[test]
+fn markdown_dns_header_labels_mixed_record_types_as_any() {
+    let out = markdown().format_dns(&fixture_dns_records());
+    assert!(out.contains("DNS ANY Records"), "got:\n{out}");
+    assert!(!out.contains("DNS A Records"), "got:\n{out}");
+}
+
 #[test]
 fn human_status_snapshot() {
     snap!(human().format_status(&fixture_status()));

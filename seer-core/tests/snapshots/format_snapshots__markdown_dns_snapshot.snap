@@ -3,7 +3,7 @@ source: seer-core/tests/format_snapshots.rs
 assertion_line: 163
 expression: markdown().format_dns(&fixture_dns_records())
 ---
-## DNS A Records: example.com
+## DNS ANY Records: example.com
 
 | Name | TTL | Type | Data |
 | --- | --- | --- | --- |
