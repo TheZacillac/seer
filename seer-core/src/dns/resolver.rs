@@ -524,9 +524,15 @@ impl DnsResolver {
                             mname: soa.mname.to_string(),
                             rname: soa.rname.to_string(),
                             serial: soa.serial,
-                            refresh: soa.refresh.try_into().unwrap_or(0),
-                            retry: soa.retry.try_into().unwrap_or(0),
-                            expire: soa.expire.try_into().unwrap_or(0),
+                            // hickory models refresh/retry/expire as i32, but
+                            // they are unsigned 32-bit wire intervals. A value
+                            // >= 2^31 arrives as a negative i32; `try_into()`
+                            // would fail and zero it out, hiding the real
+                            // (large) value. `as u32` reinterprets the bits to
+                            // the correct unsigned value instead.
+                            refresh: soa.refresh as u32,
+                            retry: soa.retry as u32,
+                            expire: soa.expire as u32,
                             minimum: soa.minimum,
                         },
                     })
@@ -829,14 +835,26 @@ impl DnsResolver {
             RecordType::CAA,
         ];
 
+        // Track whether any sub-query actually succeeded (an empty answer
+        // for an existing domain still counts as success). If every type
+        // errored — e.g. the resolver is unreachable — surface that error
+        // rather than returning an empty set that reads as "no records".
+        let mut any_ok = false;
+        let mut last_err = None;
         for record_type in record_types {
             match self.resolve_type(resolver, domain, record_type).await {
-                Ok(records) => all_records.extend(records),
-                Err(_) => continue, // Skip record types that don't exist
+                Ok(records) => {
+                    any_ok = true;
+                    all_records.extend(records);
+                }
+                Err(e) => last_err = Some(e),
             }
         }
 
-        Ok(all_records)
+        match last_err {
+            Some(e) if !any_ok => Err(e),
+            _ => Ok(all_records),
+        }
     }
 
     async fn resolve_type(

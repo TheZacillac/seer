@@ -86,7 +86,11 @@ def _get_concurrency(arguments: dict[str, Any], default: int = 10) -> int:
     concurrency = arguments.get("concurrency", default)
     if isinstance(concurrency, bool) or not isinstance(concurrency, int) or concurrency < 1:
         raise ValueError("'concurrency' must be a positive integer")
-    return min(concurrency, MAX_CONCURRENCY)
+    # Reject (rather than silently clamp) an over-limit value so the MCP and
+    # REST interfaces enforce the same contract.
+    if concurrency > MAX_CONCURRENCY:
+        raise ValueError(f"'concurrency' exceeds maximum of {MAX_CONCURRENCY}")
+    return concurrency
 
 
 @mcp.list_tools()

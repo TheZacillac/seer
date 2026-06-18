@@ -34,7 +34,10 @@ static DOMAIN_ALLOWLIST: Lazy<Option<HashSet<String>>> = Lazy::new(|| {
 /// - Converts to lowercase
 /// - Converts internationalized domain names (IDN) to Punycode (ASCII)
 /// - Validates format (must contain dots, only alphanumeric/hyphens/dots)
-/// - Does NOT perform SSRF checks (use `validate_domain_safe` for network operations)
+/// - Does NOT perform SSRF checks. For network operations, resolve and
+///   validate via `crate::net::resolve_public_host` (or `validate_public_host`),
+///   which returns the vetted `SocketAddr`s to connect to — closing the
+///   resolve-then-connect (DNS-rebinding) window.
 pub fn normalize_domain(domain: &str) -> Result<String> {
     let domain = domain.trim().to_lowercase();
 
@@ -237,38 +240,6 @@ pub fn describe_reserved_ip(ip: &IpAddr) -> Option<&'static str> {
             None
         }
     }
-}
-
-/// Validates that a domain is safe to query (SSRF protection).
-///
-/// This function:
-/// 1. Normalizes the domain
-/// 2. Resolves it to IP addresses
-/// 3. Checks that none of the IPs are in private/reserved ranges
-///
-/// Use this before making HTTP/TLS connections to user-supplied domains.
-pub async fn validate_domain_safe(domain: &str) -> Result<String> {
-    // First normalize the domain
-    let normalized = normalize_domain(domain)?;
-
-    // Resolve the domain to IP addresses
-    let addr = format!("{}:443", normalized);
-    let socket_addrs = tokio::net::lookup_host(&addr)
-        .await
-        .map_err(|e| SeerError::InvalidDomain(format!("failed to resolve domain: {}", e)))?;
-
-    // Check all resolved IPs
-    for socket_addr in socket_addrs {
-        let ip = socket_addr.ip();
-        if let Some(reason) = describe_reserved_ip(&ip) {
-            return Err(SeerError::InvalidDomain(format!(
-                "cannot connect to '{}': {} — {}",
-                normalized, ip, reason
-            )));
-        }
-    }
-
-    Ok(normalized)
 }
 
 #[cfg(test)]

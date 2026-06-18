@@ -68,16 +68,9 @@ impl HumanFormatter {
             ));
 
             let expiry_str = cert.valid_until.format("%Y-%m-%d").to_string();
-            let expiry_display = if cert.days_until_expiry < 30 {
-                self.error(&format!(
-                    "{} ({} days!)",
-                    expiry_str, cert.days_until_expiry
-                ))
-            } else if cert.days_until_expiry < 90 {
-                self.warning(&format!("{} ({} days)", expiry_str, cert.days_until_expiry))
-            } else {
-                self.value(&format!("{} ({} days)", expiry_str, cert.days_until_expiry))
-            };
+            // Shared helper renders the already-expired (negative) case as
+            // "expired N days ago" instead of a confusing "(-N days!)".
+            let expiry_display = self.format_expiry_status(&expiry_str, cert.days_until_expiry);
             output.push(format!("    {}: {}", self.label("Expires"), expiry_display));
         } else {
             output.push(format!(
@@ -105,22 +98,7 @@ impl HumanFormatter {
             }
 
             let expiry_str = expiry.expiration_date.format("%Y-%m-%d").to_string();
-            let expiry_display = if expiry.days_until_expiry < 30 {
-                self.error(&format!(
-                    "{} ({} days!)",
-                    expiry_str, expiry.days_until_expiry
-                ))
-            } else if expiry.days_until_expiry < 90 {
-                self.warning(&format!(
-                    "{} ({} days)",
-                    expiry_str, expiry.days_until_expiry
-                ))
-            } else {
-                self.value(&format!(
-                    "{} ({} days)",
-                    expiry_str, expiry.days_until_expiry
-                ))
-            };
+            let expiry_display = self.format_expiry_status(&expiry_str, expiry.days_until_expiry);
             output.push(format!("    {}: {}", self.label("Expires"), expiry_display));
         }
 

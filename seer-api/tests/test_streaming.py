@@ -121,7 +121,12 @@ def test_sse_error_is_sanitized(client):
     def _raising_bulk_status(domains, concurrency, progress=None):
         raise RuntimeError(leaked)
 
-    with patch.object(seer, "bulk_status", _raising_bulk_status):
+    # The SSRF guard runs before the bulk call; with the stubbed `seer`
+    # module it has no `validate_public_host`, so mock it as a no-op (the real
+    # binding allows the public host example.com) to reach the bulk path.
+    with patch.object(seer, "bulk_status", _raising_bulk_status), patch.object(
+        seer, "validate_public_host", lambda *a, **k: None, create=True
+    ):
         resp = client.post(
             "/status/bulk/stream",
             json={"domains": ["example.com"], "concurrency": 1},
@@ -149,7 +154,11 @@ def test_sse_error_value_error_surfaces_message(client):
     def _raising_bulk_status(domains, concurrency, progress=None):
         raise ValueError("refusing to connect to reserved address: 10.0.0.1")
 
-    with patch.object(seer, "bulk_status", _raising_bulk_status):
+    # See note above: the stubbed `seer` lacks `validate_public_host`; mock it
+    # so the SSRF guard passes and the request reaches the bulk call.
+    with patch.object(seer, "bulk_status", _raising_bulk_status), patch.object(
+        seer, "validate_public_host", lambda *a, **k: None, create=True
+    ):
         resp = client.post(
             "/status/bulk/stream",
             json={"domains": ["example.com"], "concurrency": 1},

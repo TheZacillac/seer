@@ -1,5 +1,16 @@
 use super::*;
 
+/// Human-readable expiry phrase for markdown (no color). Mirrors the human
+/// formatter's `format_expiry_status` wording, including the already-expired
+/// case which previously rendered as a confusing "(-N days)".
+fn expiry_phrase(days_until: i64) -> String {
+    if days_until < 0 {
+        format!("expired {} days ago", -days_until)
+    } else {
+        format!("expires in {} days", days_until)
+    }
+}
+
 impl MarkdownFormatter {
     pub(super) fn format_status(&self, response: &StatusResponse) -> String {
         let mut output = Vec::new();
@@ -38,9 +49,9 @@ impl MarkdownFormatter {
                 cert.valid_from.format("%Y-%m-%d")
             ));
             output.push(format!(
-                "- **Expires**: `{}` ({} days)",
+                "- **Expires**: `{}` ({})",
                 cert.valid_until.format("%Y-%m-%d"),
-                cert.days_until_expiry
+                expiry_phrase(cert.days_until_expiry)
             ));
         } else {
             output.push("### SSL Certificate".to_string());
@@ -61,9 +72,9 @@ impl MarkdownFormatter {
                 output.push(format!("- **Registrar**: {}", MdSafe(registrar)));
             }
             output.push(format!(
-                "- **Expires**: `{}` ({} days)",
+                "- **Expires**: `{}` ({})",
                 expiry.expiration_date.format("%Y-%m-%d"),
-                expiry.days_until_expiry
+                expiry_phrase(expiry.days_until_expiry)
             ));
         }
 

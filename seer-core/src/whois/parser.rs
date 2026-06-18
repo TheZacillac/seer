@@ -365,7 +365,18 @@ impl WhoisResponse {
             // "Status:\tAVAILABLE" with a tab, which would otherwise slip
             // past space-delimited patterns such as "status: available".
             let lower = trimmed.to_lowercase();
-            let normalized = lower.split_whitespace().collect::<Vec<_>>().join(" ");
+            let words: Vec<&str> = lower.split_whitespace().collect();
+            // Availability indicators are short status lines — the longest
+            // known registry phrasing ("No information was found matching
+            // that query.") is 7 words. Anything longer is prose (a TOS or
+            // notice footer) that may merely quote a phrase like "not found"
+            // or "does not exist"; skipping it avoids flipping a registered
+            // (but thin, fieldless) response to "available". The H6 guard
+            // above already covers responses that DO carry registration data.
+            if words.len() > MAX_STATUS_LINE_WORDS {
+                continue;
+            }
+            let normalized = words.join(" ");
             if AVAILABILITY_PATTERNS.iter().any(|p| normalized.contains(p)) {
                 return true;
             }
@@ -388,8 +399,16 @@ impl WhoisResponse {
     }
 }
 
+/// Maximum word count for a line to be considered an availability *status*
+/// line rather than prose. Registry "not found" phrasings are short (the
+/// longest observed is 7 words); TOS/notice footers that merely quote such
+/// phrases run much longer. Lines above this bound are ignored by
+/// `is_available()` so footer prose can't flip a thin response to available.
+const MAX_STATUS_LINE_WORDS: usize = 10;
+
 /// Patterns indicating a domain is available (unregistered).
-/// Matched case-insensitively via `contains()` on the filtered response.
+/// Matched case-insensitively via `contains()` on short status lines only
+/// (see `MAX_STATUS_LINE_WORDS`).
 const AVAILABILITY_PATTERNS: &[&str] = &[
     "no match for",
     "no match",
@@ -464,7 +483,11 @@ fn extract_date_with_patterns(text: &str, patterns: &[Regex]) -> Option<DateTime
     parse_date(&date_str)
 }
 
-fn parse_date(date_str: &str) -> Option<DateTime<Utc>> {
+/// Parse a date string from registry output into a UTC datetime, tolerating
+/// the ~20 formats registries emit in practice. Shared with the RDAP parser
+/// (RDAP's `eventDate` is nominally strict RFC 3339, but real servers are as
+/// sloppy as WHOIS, so both reuse this tolerant parser).
+pub(crate) fn parse_date(date_str: &str) -> Option<DateTime<Utc>> {
     let cleaned = date_str
         .trim()
         .replace(" UTC", "Z")
@@ -501,8 +524,16 @@ fn parse_date(date_str: &str) -> Option<DateTime<Utc>> {
         "%d-%B-%Y",
         "%Y.%m.%d",
         "%Y/%m/%d",
+        // Day-first (international norm). Ambiguous all-numeric dates (both
+        // day and month <= 12) are interpreted here, so DMY wins ties.
         "%d.%m.%Y",
         "%d/%m/%Y",
+        // US month-first fallback: only reached when the day-first parse
+        // above fails (i.e. the leading field is > 12), recovering
+        // unambiguous MDY dates that would otherwise be dropped. This never
+        // changes the interpretation of a date the day-first formats accept.
+        "%m.%d.%Y",
+        "%m/%d/%Y",
         "%b %d %Y",
     ];
 
@@ -821,6 +852,24 @@ Name Server: ns1.example.com
         }
     }
 
+    #[test]
+    fn is_available_ignores_not_found_phrase_buried_in_prose() {
+        // A thin response with NO parsed registration fields (so the H6
+        // registration-data guard does not fire) whose only "does not exist"
+        // / "not found" occurrence is inside a long prose/notice sentence
+        // must NOT be read as available. Availability indicators are short
+        // status lines, not phrases buried in footer prose.
+        let raw = "\
+This is an informational banner from the registry WHOIS service provider.
+Note that if the queried object does not exist in our database we simply return an empty result rather than an error response.
+Records not found in this directory may still exist upstream in the thick registry, so please check with the sponsoring registrar.
+";
+        assert!(
+            !make_response(raw).is_available(),
+            "long prose sentences must not trigger availability"
+        );
+    }
+
     // --- M19: indicates_not_found anchors at line start -----------------
 
     #[test]
@@ -908,6 +957,35 @@ Domain Status: clientTransferProhibited
         let parsed = parse_date("15-Jan-2024").expect("should parse");
         use chrono::Datelike;
         assert_eq!(parsed.year(), 2024);
+    }
+
+    // --- parse_date: ambiguous numeric dates default to day-first, but
+    //     unambiguous US month-first dates are recovered (not dropped) ----
+
+    #[test]
+    fn parse_date_recovers_unambiguous_us_mdy() {
+        // Some registrars emit US month-first numeric dates. When the day
+        // field is > 12 the date is unambiguously MDY and was previously
+        // dropped (there was no %m/%d/%Y format). Recover it rather than
+        // returning None.
+        use chrono::Datelike;
+        let parsed = parse_date("02/13/2024").expect("unambiguous MDY should parse");
+        assert_eq!(parsed.year(), 2024);
+        assert_eq!(parsed.month(), 2);
+        assert_eq!(parsed.day(), 13);
+    }
+
+    #[test]
+    fn parse_date_ambiguous_numeric_is_day_first() {
+        // Documented precedence: ambiguous all-numeric dates (both fields
+        // <= 12) are interpreted day-first (the international norm), matching
+        // the %d/%m/%Y format ordering. "06/07/2024" => 6 July 2024. The
+        // month-first fallback must NOT change this.
+        use chrono::Datelike;
+        let parsed = parse_date("06/07/2024").expect("should parse");
+        assert_eq!(parsed.year(), 2024);
+        assert_eq!(parsed.month(), 7);
+        assert_eq!(parsed.day(), 6);
     }
 
     // --- H3: raw_response is not serialized -----------------------------

@@ -36,6 +36,16 @@ impl FollowState {
         self.log.insert(0, it);
     }
 
+    /// Invalidate any in-flight run when the followed domain changes. Bumping
+    /// `gen` causes late callbacks from the previous domain's run to be
+    /// dropped by the generation guard; the log and running flag are cleared.
+    /// User settings (interval/count) are intentionally preserved.
+    pub fn reset_for_new_domain(&mut self) {
+        self.gen += 1;
+        self.running = false;
+        self.log.clear();
+    }
+
     /// Handle a key event for the Follow pane.
     ///
     /// Returns `Some(outcome)` when the key is consumed, `None` to fall through.

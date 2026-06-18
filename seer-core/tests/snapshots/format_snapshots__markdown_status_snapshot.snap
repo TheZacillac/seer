@@ -1,6 +1,6 @@
 ---
 source: seer-core/tests/format_snapshots.rs
-assertion_line: 173
+assertion_line: 255
 expression: markdown().format_status(&fixture_status())
 ---
 ## Status: example.com
@@ -15,7 +15,7 @@ expression: markdown().format_status(&fixture_status())
 ### Domain Registration
 
 - **Registrar**: Mock Registrar Inc.
-- **Expires**: `2099-03-15` ([N] days)
+- **Expires**: `2099-03-15` (expires in [N] days)
 
 ### DNS Resolution
 

@@ -14,6 +14,7 @@ Event ordering (see spec):
 import asyncio
 import json
 import logging
+import os
 import time
 from collections.abc import AsyncGenerator, Callable
 from typing import Any
@@ -24,6 +25,29 @@ from ._run import _DISPATCH_EXECUTOR
 from .errors import safe_error_message
 
 logger = logging.getLogger("seer_api")
+
+# Cap concurrent in-flight bulk-stream jobs *per worker process*. A blocking
+# bulk job dispatched to the executor cannot be cancelled, so a client that
+# disconnects mid-stream still runs its job to completion. Without a bound, a
+# flood of large requests that disconnect immediately would pin every dispatch
+# thread and stall the whole API. Tunable via SEER_MAX_CONCURRENT_STREAMS.
+_MAX_CONCURRENT_STREAMS = max(1, int(os.getenv("SEER_MAX_CONCURRENT_STREAMS", "8")))
+_stream_semaphore: asyncio.Semaphore | None = None
+_stream_semaphore_loop: asyncio.AbstractEventLoop | None = None
+
+
+def _get_stream_semaphore() -> asyncio.Semaphore:
+    """Return the per-event-loop stream semaphore, creating it lazily.
+
+    Built inside the running loop (not at import) so it binds to the correct
+    loop, and rebuilt if the running loop changes (e.g. across test loops).
+    """
+    global _stream_semaphore, _stream_semaphore_loop
+    loop = asyncio.get_running_loop()
+    if _stream_semaphore is None or _stream_semaphore_loop is not loop:
+        _stream_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_STREAMS)
+        _stream_semaphore_loop = loop
+    return _stream_semaphore
 
 
 def _sse(event: str, data: dict) -> bytes:
@@ -53,14 +77,27 @@ async def stream_bulk(
             ("progress", {"completed": completed, "total": total, "current_domain": domain}),
         )
 
+    # Acquire a slot before dispatching the (uncancellable) blocking job. A
+    # client that disconnects mid-stream cannot stop the job, so this bound is
+    # what prevents a disconnect-flood from pinning every dispatch thread.
+    semaphore = _get_stream_semaphore()
+    await semaphore.acquire()
+
     # Dispatch on the bounded seer-dispatch pool (see _run.py), not the
     # default asyncio executor. The default pool is shared with
     # ssrf.guard_async; a long bulk stream sitting on default-pool threads
     # would starve SSRF guards and stall /status, /ssl, etc. `run_seer`
     # can't be used here because it doesn't forward the `progress` kwarg.
-    bulk_future = loop.run_in_executor(
-        _DISPATCH_EXECUTOR, lambda: bulk_call(*args, progress=progress_cb, **kwargs)
-    )
+    try:
+        bulk_future = loop.run_in_executor(
+            _DISPATCH_EXECUTOR, lambda: bulk_call(*args, progress=progress_cb, **kwargs)
+        )
+    except BaseException:
+        semaphore.release()
+        raise
+    # Release the slot when the job actually finishes — even if the client has
+    # already disconnected and the stream generator is never consumed.
+    bulk_future.add_done_callback(lambda _f: semaphore.release())
 
     async def event_stream() -> AsyncGenerator[bytes, None]:
         # Phase 1: stream progress events until the bulk call finishes.

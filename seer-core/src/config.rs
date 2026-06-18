@@ -59,7 +59,9 @@ impl Default for TimeoutConfig {
     fn default() -> Self {
         Self {
             whois_secs: 15,
-            rdap_secs: 30,
+            // Matches the RDAP client's own DEFAULT_TIMEOUT (15s) and the
+            // documented value; the client uses 15s, so the default must too.
+            rdap_secs: 15,
             dns_secs: 5,
             http_secs: 10,
         }
@@ -114,8 +116,9 @@ impl SeerConfig {
     /// hand `Semaphore::new(0)` to every bulk operation and block forever;
     /// `bulk.concurrency = 10000` would spawn thousands of concurrent
     /// connections. Timeouts of `0` would error every network call
-    /// immediately. Apply the same bounds the public API enforces so a
-    /// config file can't bypass them.
+    /// immediately. The bounds are per-protocol (a config file can't bypass
+    /// them): concurrency 1–50; whois/rdap timeouts 1–300s; dns 1–60s;
+    /// http 1–120s.
     fn clamped(mut self) -> Self {
         self.bulk.concurrency = self.bulk.concurrency.clamp(1, 50);
         self.timeouts.whois_secs = self.timeouts.whois_secs.clamp(1, 300);
@@ -160,7 +163,7 @@ mod tests {
         let config = SeerConfig::default();
         assert_eq!(config.output_format, "human");
         assert_eq!(config.timeouts.whois_secs, 15);
-        assert_eq!(config.timeouts.rdap_secs, 30);
+        assert_eq!(config.timeouts.rdap_secs, 15);
         assert_eq!(config.timeouts.dns_secs, 5);
         assert_eq!(config.bulk.concurrency, 10);
     }
@@ -198,7 +201,7 @@ concurrency = 20
     fn test_timeout_durations() {
         let config = SeerConfig::default();
         assert_eq!(config.whois_timeout(), Duration::from_secs(15));
-        assert_eq!(config.rdap_timeout(), Duration::from_secs(30));
+        assert_eq!(config.rdap_timeout(), Duration::from_secs(15));
         assert_eq!(config.dns_timeout(), Duration::from_secs(5));
         assert_eq!(config.http_timeout(), Duration::from_secs(10));
     }
