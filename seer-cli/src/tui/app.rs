@@ -133,6 +133,11 @@ impl App {
             // results; clearing it prevents the RDAP "IP" tab from looking up
             // the previous domain's address under the new domain.
             self.panes.dns.resolved_ip = None;
+            // The Follow lens tracks this domain; invalidate any in-flight run
+            // so its streaming callbacks don't append the old domain's results
+            // under the new one. (The Bulk pane operates on its own
+            // independent domain list, so it is intentionally left alone.)
+            self.panes.follow.reset_for_new_domain();
         }
         self.domain = Some(normalized);
         self.sel = 0;
@@ -1247,6 +1252,58 @@ mod tests {
             app.panes.follow.log.len(),
             1,
             "matching gen follow step must be accepted"
+        );
+    }
+
+    #[test]
+    fn switching_domain_resets_follow_pane_and_drops_stale_steps() {
+        use chrono::Utc;
+        let make_iter = || seer_core::dns::FollowIteration {
+            iteration: 1,
+            total_iterations: 5,
+            timestamp: Utc::now(),
+            records: vec![],
+            changed: false,
+            added: vec![],
+            removed: vec![],
+            error: None,
+        };
+
+        let mut app = App::new(None);
+        // Establish an in-flight follow run on the first domain.
+        let _ = app.set_domain_and_fetch("a.com");
+        app.panes.follow.gen = 1;
+        app.panes.follow.running = true;
+        app.update(Msg::FollowStep {
+            gen: 1,
+            it: Box::new(make_iter()),
+        });
+        assert_eq!(
+            app.panes.follow.log.len(),
+            1,
+            "precondition: one logged step"
+        );
+
+        // Switch the target domain — the follow pane must be invalidated.
+        let _ = app.set_domain_and_fetch("b.com");
+        assert!(
+            app.panes.follow.gen > 1,
+            "gen must advance so the old run's callbacks are superseded"
+        );
+        assert!(!app.panes.follow.running, "running flag must clear");
+        assert!(
+            app.panes.follow.log.is_empty(),
+            "old domain's results must be cleared from the pane"
+        );
+
+        // A late callback from the old (a.com) run must now be dropped.
+        app.update(Msg::FollowStep {
+            gen: 1,
+            it: Box::new(make_iter()),
+        });
+        assert!(
+            app.panes.follow.log.is_empty(),
+            "stale step from the previous domain must be dropped"
         );
     }
 

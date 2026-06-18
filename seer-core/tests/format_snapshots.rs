@@ -133,6 +133,52 @@ fn fixture_status() -> StatusResponse {
     }
 }
 
+/// An already-expired domain (negative days remaining). Exercises the
+/// expired-rendering path that previously printed "(-N days!)".
+fn fixture_status_expired() -> StatusResponse {
+    StatusResponse {
+        domain: "expired.example".into(),
+        http_status: Some(200),
+        http_status_text: Some("OK".into()),
+        title: None,
+        certificate: None,
+        domain_expiration: Some(DomainExpiration {
+            expiration_date: "2020-01-01T00:00:00Z".parse().unwrap(),
+            days_until_expiry: -45,
+            registrar: Some("Mock Registrar Inc.".into()),
+        }),
+        dns_resolution: None,
+        caa: None,
+        errors: Vec::new(),
+    }
+}
+
+#[test]
+fn human_status_expired_domain_says_expired() {
+    let out = human().format_status(&fixture_status_expired());
+    assert!(
+        out.contains("expired"),
+        "human output should say 'expired': {out}"
+    );
+    assert!(
+        !out.contains("(-"),
+        "must not render a negative day count like (-45 days!): {out}"
+    );
+}
+
+#[test]
+fn markdown_status_expired_domain_says_expired() {
+    let out = markdown().format_status(&fixture_status_expired());
+    assert!(
+        out.contains("expired"),
+        "markdown output should say 'expired': {out}"
+    );
+    assert!(
+        !out.contains("(-"),
+        "must not render a negative day count: {out}"
+    );
+}
+
 #[test]
 fn human_whois_snapshot() {
     snap!(human().format_whois(&fixture_whois()));

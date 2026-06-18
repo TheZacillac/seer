@@ -1239,9 +1239,10 @@ keys off the distribution name.
 `seer-core/src/config.rs` loads `~/.seer/config.toml` at client construction
 (missing file → defaults). `seer config --init` scaffolds it. Settings:
 default output format, nameserver, per-protocol timeouts, bulk concurrency,
-rate-limit delay — all clamped to safe ranges (concurrency 1–50, timeouts
-1–300s). When adding a tunable, prefer wiring it through `SeerConfig` over a
-new env var or hardcoded const.
+rate-limit delay — all clamped to safe, per-protocol ranges (concurrency
+1–50; whois/rdap timeouts 1–300s; dns 1–60s; http 1–120s). When adding a
+tunable, prefer wiring it through `SeerConfig` over a new env var or
+hardcoded const.
 
 ### Breaking change (2026-04-20)
 
@@ -1296,7 +1297,8 @@ case today).
 - **HTTP**: 10 seconds
 - **SSL check**: 10 seconds
 
-All user-tunable via `~/.seer/config.toml` (values clamped to 1–300s).
+All user-tunable via `~/.seer/config.toml` (clamped per-protocol: whois/rdap
+1–300s, dns 1–60s, http 1–120s).
 
 ### Memory Considerations
 

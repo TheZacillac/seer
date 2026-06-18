@@ -64,7 +64,10 @@ impl Completer for SeerCompleter {
         pos: usize,
         _ctx: &rustyline::Context<'_>,
     ) -> rustyline::Result<(usize, Vec<Pair>)> {
-        let line_to_cursor = &line[..pos];
+        // `pos` is a byte offset from rustyline; slicing with `&line[..pos]`
+        // panics if it lands inside a multibyte char. `get(..pos)` returns
+        // None on a non-char-boundary, so fall back to the whole line.
+        let line_to_cursor = line.get(..pos).unwrap_or(line);
         let words: Vec<&str> = line_to_cursor.split_whitespace().collect();
 
         if words.is_empty() || (words.len() == 1 && !line_to_cursor.ends_with(' ')) {
@@ -227,3 +230,25 @@ impl Hinter for SeerCompleter {
 impl Highlighter for SeerCompleter {}
 impl Validator for SeerCompleter {}
 impl Helper for SeerCompleter {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustyline::history::DefaultHistory;
+
+    #[test]
+    fn complete_does_not_panic_on_multibyte_cursor_midchar() {
+        // pos lands inside a multibyte char ('é' occupies bytes 3..5), i.e. a
+        // non-char-boundary. `&line[..pos]` would panic there; the completer
+        // must handle a mid-char cursor gracefully instead of crashing the
+        // REPL (a panic drops the terminal out of a usable state).
+        let completer = SeerCompleter::new();
+        let history = DefaultHistory::new();
+        let ctx = rustyline::Context::new(&history);
+        let result = completer.complete("café", 4, &ctx);
+        assert!(
+            result.is_ok(),
+            "completer must not panic on a non-char-boundary cursor"
+        );
+    }
+}

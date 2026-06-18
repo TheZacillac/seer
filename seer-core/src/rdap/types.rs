@@ -95,7 +95,11 @@ pub struct RdapEvent {
 
 impl RdapEvent {
     pub fn parsed_date(&self) -> Option<DateTime<Utc>> {
-        self.event_date.as_ref()?.parse().ok()
+        // RFC 9083 mandates strict RFC 3339, but registries are as sloppy
+        // with RDAP dates as with WHOIS, so reuse the tolerant shared parser
+        // instead of a bare `.parse()` that silently drops anything but
+        // strict RFC 3339 (e.g. date-only or space-separated datetimes).
+        crate::whois::parse_date(self.event_date.as_ref()?)
     }
 }
 
@@ -652,6 +656,30 @@ mod tests {
         let mut resp = RdapResponse::default();
         resp.extra.insert("notices".into(), Value::Array(vec![]));
         assert!(resp.validate_size().is_ok());
+    }
+
+    #[test]
+    fn parsed_date_accepts_non_strict_rfc3339_forms() {
+        // RFC 9083 mandates RFC 3339, but real registries emit looser forms.
+        // parsed_date() must recover date-only and space-separated datetimes
+        // (the shared WHOIS date parser already handles these) instead of
+        // dropping the date and making the domain look date-less.
+        use chrono::Datelike;
+        let date_only = RdapEvent {
+            event_action: "registration".to_string(),
+            event_date: Some("2020-01-15".to_string()),
+            event_actor: None,
+        };
+        let d = date_only.parsed_date().expect("date-only should parse");
+        assert_eq!((d.year(), d.month(), d.day()), (2020, 1, 15));
+
+        // Strict RFC 3339 must still work.
+        let strict = RdapEvent {
+            event_action: "registration".to_string(),
+            event_date: Some("2020-01-15T10:30:00Z".to_string()),
+            event_actor: None,
+        };
+        assert_eq!(strict.parsed_date().expect("rfc3339").year(), 2020);
     }
 
     #[test]

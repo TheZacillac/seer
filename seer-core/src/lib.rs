@@ -28,7 +28,7 @@ pub use cache::{SingleValueCache, TtlCache};
 pub use config::SeerConfig;
 pub use error::{Result, SeerError};
 pub use retry::{NetworkRetryClassifier, RetryClassifier, RetryExecutor, RetryPolicy};
-pub use validation::{normalize_domain, validate_domain_safe};
+pub use validation::normalize_domain;
 
 pub use dns::{
     DnsComparator, DnsComparison, DnsFollower, DnsRecord, DnsResolver, DnssecChecker, DnssecReport,

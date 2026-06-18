@@ -99,9 +99,20 @@ impl AvailabilityChecker {
 /// table-tested without a network stack.
 fn decide_from_rdap(domain: &str, response: crate::rdap::RdapResponse) -> AvailabilityResult {
     let statuses: Vec<String> = response.status.clone();
-    let is_redemption = statuses
-        .iter()
-        .any(|s| s.contains("redemption") || s.contains("pending delete"));
+    let is_redemption = statuses.iter().any(|s| {
+        // RDAP/EPP status tokens are a controlled vocabulary; match the
+        // standard redemption / pending-delete tokens exactly (case- and
+        // whitespace-insensitive) rather than by substring, so a verbose
+        // status such as "clientHold (no redemption requested)" is not
+        // misread as the redemption state, and a capitalized "Redemption
+        // Period" is still detected.
+        let norm: String = s
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>()
+            .to_lowercase();
+        matches!(norm.as_str(), "redemptionperiod" | "pendingdelete")
+    });
 
     if is_redemption {
         return AvailabilityResult {
@@ -214,12 +225,18 @@ fn decide_fallback(
                     details: Some("Registry RDAP reports no such domain (HTTP 404)".to_string()),
                 };
             }
-            // Both failed - domain might be available or queries blocked
-            let whois_msg = whois_err.to_string().to_lowercase();
-            let likely_available = whois_msg.contains("no match")
-                || whois_msg.contains("not found")
-                || whois_msg.contains("no data found")
-                || whois_msg.contains("no entries found");
+            // Both registry legs failed. Only a WHOIS-*protocol* error can
+            // carry a registry "no match" signal; a transport failure
+            // (timeout, connection reset, DNS, SSRF refusal) tells us nothing
+            // about registration, so we must not infer availability from its
+            // text even if it incidentally contains a phrase like "no match".
+            let likely_available = matches!(whois_err, crate::error::SeerError::WhoisError(_)) && {
+                let whois_msg = whois_err.to_string().to_lowercase();
+                whois_msg.contains("no match")
+                    || whois_msg.contains("not found")
+                    || whois_msg.contains("no data found")
+                    || whois_msg.contains("no entries found")
+            };
 
             if likely_available {
                 AvailabilityResult {
@@ -399,6 +416,32 @@ mod tests {
         assert!(r.details.as_deref().unwrap().contains("redemption"));
     }
 
+    #[test]
+    fn rdap_status_substring_redemption_not_misclassified() {
+        // A non-standard verbose status that merely CONTAINS the word
+        // "redemption" must not be misread as the redemption-period state
+        // (which would wrongly drop confidence to medium).
+        let rdap = rdap_with(&["clientHold (no redemption requested)"]);
+        let r = decide_from_rdap("example.test", rdap);
+        assert!(!r.available, "still registered");
+        assert_eq!(
+            r.confidence, "high",
+            "verbose status must not be downgraded to redemption/medium"
+        );
+    }
+
+    #[test]
+    fn rdap_status_redemption_detected_case_insensitively() {
+        // A capitalized standard token must still be detected (the old
+        // case-sensitive `contains` missed "Redemption Period").
+        let rdap = rdap_with(&["Redemption Period"]);
+        let r = decide_from_rdap("example.test", rdap);
+        assert_eq!(
+            r.confidence, "medium",
+            "standard token detected regardless of case"
+        );
+    }
+
     // --- WHOIS fallback branches -------------------------------------
 
     #[test]
@@ -523,6 +566,28 @@ mod tests {
         assert_eq!(r.method, "inconclusive");
         assert!(r.details.as_deref().unwrap().contains("RDAP:"));
         assert!(r.details.as_deref().unwrap().contains("WHOIS:"));
+    }
+
+    #[test]
+    fn rdap_fail_whois_transport_error_with_phrase_not_available() {
+        // A transport-level WHOIS failure (here a timeout) whose message
+        // merely contains "no match" must NOT be read as available — only a
+        // WHOIS-*protocol* error (WhoisError) can carry a registry no-match
+        // signal. Otherwise an error string that incidentally quotes the
+        // phrase flips a possibly-registered domain to "available".
+        let rdap_err = SeerError::RdapError("503 service unavailable".to_string());
+        let whois_err =
+            SeerError::Timeout("no match within deadline querying whois.nic.test".to_string());
+        let r = decide_fallback(
+            "example.test",
+            &rdap_err,
+            Err(whois_err),
+            DnsPresence::Present,
+        );
+        assert!(
+            !r.available,
+            "transport error text must not infer availability"
+        );
     }
 
     #[test]

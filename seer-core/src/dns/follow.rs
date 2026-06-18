@@ -71,9 +71,18 @@ impl FollowConfig {
                 "interval_minutes must be at most 60".into(),
             ));
         }
+        // A sub-second interval truncates to 0 seconds. For a multi-iteration
+        // follow that means back-to-back live DNS queries with no spacing — a
+        // self-inflicted query flood. Floor to 1s whenever more than one
+        // iteration will run; a single-shot follow (iterations == 1) does no
+        // looping and may keep a 0s interval.
+        let mut interval_secs = (interval_minutes * 60.0) as u64;
+        if iterations > 1 {
+            interval_secs = interval_secs.max(1);
+        }
         Ok(Self {
             iterations,
-            interval_secs: (interval_minutes * 60.0) as u64,
+            interval_secs,
             changes_only: false,
         })
     }
@@ -406,6 +415,27 @@ mod tests {
         assert!(FollowConfig::new(10, 1.5).is_ok());
         assert!(FollowConfig::new(1, 0.0).is_ok());
         assert!(FollowConfig::new(1, 60.0).is_ok());
+    }
+
+    #[test]
+    fn follow_config_floors_subsecond_interval_for_multi_iteration() {
+        // A sub-second interval truncates to 0s; with many iterations that is
+        // a back-to-back live-DNS query flood. Multi-iteration follows must
+        // be floored to at least 1s between queries.
+        let config = FollowConfig::new(10_000, 0.001).unwrap();
+        assert!(
+            config.interval_secs >= 1,
+            "multi-iteration interval must be floored to >= 1s, got {}",
+            config.interval_secs
+        );
+    }
+
+    #[test]
+    fn follow_config_allows_zero_interval_for_single_iteration() {
+        // A single-shot follow does no looping, so a 0s interval is harmless
+        // and must not be forced to 1s.
+        let config = FollowConfig::new(1, 0.0).unwrap();
+        assert_eq!(config.interval_secs, 0);
     }
 
     #[tokio::test]

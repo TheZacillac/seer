@@ -102,7 +102,10 @@ mod tests {
         terminal
             .draw(|f| render(f, f.area(), &theme, &data, false, 0))
             .unwrap();
-        // Should not panic; hint line present
-        assert!(buf_text(terminal.backend().buffer()).contains("history") || true);
+        // Should not panic, and the empty state still renders the panel
+        // title and the hint line.
+        let text = buf_text(terminal.backend().buffer());
+        assert!(text.contains("History"), "panel title missing: {text:?}");
+        assert!(text.contains("replay"), "hint line missing: {text:?}");
     }
 }

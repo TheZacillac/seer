@@ -218,8 +218,15 @@ impl DnssecChecker {
             })
             .collect();
 
-        // Build a map from (flags, algorithm) -> vec of computed key_tags
-        // to reliably match our RecordData DNSKEYs to the raw hickory ones.
+        // Build a map from (flags, algorithm) -> computed key_tags to attach a
+        // key tag to each RecordData DNSKEY. NOTE: this correlates two
+        // independent DNSKEY queries (dnskey_records vs raw_dnskeys) by
+        // position within each (flags, algorithm) group. That is correct when a
+        // group has a single key (the common case) but can mis-assign tags if a
+        // zone has >= 2 keys sharing identical flags+algorithm AND the two
+        // queries returned them in different orders. Removing this assumption
+        // requires a single DNSKEY query that carries both the display fields
+        // and the computed tag; deferred to keep this crypto path stable.
         let key_tag_by_algo_flags: HashMap<(u16, u8), Vec<u16>> = {
             let mut map: HashMap<(u16, u8), Vec<u16>> = HashMap::new();
             for (dnskey, tag) in &raw_dnskeys {
