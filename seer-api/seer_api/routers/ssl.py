@@ -35,7 +35,7 @@ async def bulk_ssl(request: Request, body: BulkSslRequest):
     Inspect SSL certificate chains for multiple domains.
 
     Returns the full SSL report per domain (chain, SANs, key details,
-    signature algorithm, TLS version).
+    signature algorithm).
     """
     await guard_hosts_async([(d, 443) for d in body.domains])
     try:
