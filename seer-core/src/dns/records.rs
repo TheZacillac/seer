@@ -153,6 +153,14 @@ pub enum RecordData {
         /// Hex-encoded fingerprint (uppercase).
         fingerprint: String,
     },
+    NAPTR {
+        order: u16,
+        preference: u16,
+        flags: String,
+        services: String,
+        regexp: String,
+        replacement: String,
+    },
     Unknown {
         raw: String,
     },
@@ -214,6 +222,18 @@ impl fmt::Display for RecordData {
                 fingerprint_type,
                 fingerprint,
             } => write!(f, "{} {} {}", algorithm, fingerprint_type, fingerprint),
+            RecordData::NAPTR {
+                order,
+                preference,
+                flags,
+                services,
+                regexp,
+                replacement,
+            } => write!(
+                f,
+                "{} {} \"{}\" \"{}\" \"{}\" {}",
+                order, preference, flags, services, regexp, replacement
+            ),
             RecordData::Unknown { raw } => write!(f, "{}", raw),
         }
     }
@@ -330,5 +350,22 @@ mod tests {
         let display = format!("{}", soa);
         assert!(display.contains("ns1.example.com"));
         assert!(display.contains("2024010101"));
+    }
+
+    #[test]
+    fn test_naptr_display() {
+        // dig-style: order preference "flags" "services" "regexp" replacement
+        let naptr = RecordData::NAPTR {
+            order: 100,
+            preference: 50,
+            flags: "s".to_string(),
+            services: "http+N2L+N2C+N2R".to_string(),
+            regexp: String::new(),
+            replacement: "www.example.com.".to_string(),
+        };
+        assert_eq!(
+            format!("{}", naptr),
+            "100 50 \"s\" \"http+N2L+N2C+N2R\" \"\" www.example.com."
+        );
     }
 }

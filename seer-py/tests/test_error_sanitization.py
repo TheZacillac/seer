@@ -36,6 +36,16 @@ def test_invalid_domain_is_value_error():
         seer.whois("not a valid domain with spaces")
 
 
+def test_dig_bare_srv_is_value_error():
+    """A bare-domain SRV query (no `_service._proto` labels) is a usage error,
+    not a transient DNS failure. It must raise ValueError (via InvalidInput) so
+    the MCP/HTTP layers classify it as permanent and never advise a retry.
+    Resolves at parse time in seer-core, so this is hermetic — no network."""
+    with pytest.raises(ValueError) as exc:
+        seer.dig("example.com", "SRV")
+    assert "_service._proto" in str(exc.value)
+
+
 def test_sanitized_message_has_no_internal_leakage():
     """Error text from validate_public_host must not contain file paths or
     reqwest-style URLs. The sanitized_message() path keeps it to a terse

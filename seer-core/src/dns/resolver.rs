@@ -186,7 +186,7 @@ impl DnsResolver {
         } else {
             &self.default_resolver
         };
-        let domain = normalize_domain(domain)?;
+        let domain = prepare_query(domain, record_type)?;
 
         debug!(nameserver = nameserver.unwrap_or("system"), "Resolving DNS");
 
@@ -199,19 +199,25 @@ impl DnsResolver {
             RecordType::TXT => self.resolve_txt(resolver, &domain).await,
             RecordType::SOA => self.resolve_soa(resolver, &domain).await,
             RecordType::PTR => self.resolve_ptr(resolver, &domain).await,
-            RecordType::SRV => Err(SeerError::DnsError(
-                "SRV records require service name format: _service._proto.name".to_string(),
-            )),
+            RecordType::SRV => match parse_srv_query(&domain) {
+                // dig-style `_service._proto.name` queries resolve directly.
+                Some((service, protocol, name)) => {
+                    self.resolve_srv_core(resolver, &service, &protocol, &name)
+                        .await
+                }
+                // A bare domain isn't a valid SRV query — surface a usage hint
+                // as an input error (permanent), not a transient DNS failure.
+                None => Err(SeerError::InvalidInput(
+                    "SRV records require service name format: _service._proto.name".to_string(),
+                )),
+            },
             RecordType::CAA => self.resolve_caa(resolver, &domain).await,
             RecordType::DNSKEY => self.resolve_dnskey(resolver, &domain).await,
             RecordType::DS => self.resolve_ds(resolver, &domain).await,
             RecordType::TLSA => self.resolve_tlsa(resolver, &domain).await,
             RecordType::SSHFP => self.resolve_sshfp(resolver, &domain).await,
+            RecordType::NAPTR => self.resolve_naptr(resolver, &domain).await,
             RecordType::ANY => self.resolve_any(resolver, &domain).await,
-            _ => Err(SeerError::DnsError(format!(
-                "Record type {} not implemented",
-                record_type
-            ))),
         }
     }
 
@@ -230,20 +236,6 @@ impl DnsResolver {
         domain: &str,
         nameserver: Option<&str>,
     ) -> Result<Vec<DnsRecord>> {
-        // Validate service and protocol to prevent DNS query injection
-        if !is_valid_srv_label(service) {
-            return Err(SeerError::DnsError(format!(
-                "invalid SRV service name: {}",
-                service
-            )));
-        }
-        if !is_valid_srv_label(protocol) {
-            return Err(SeerError::DnsError(format!(
-                "invalid SRV protocol name: {}",
-                protocol
-            )));
-        }
-
         let custom_resolver;
         let resolver = if let Some(ns) = nameserver {
             custom_resolver = self.create_custom_resolver(ns).await?;
@@ -251,6 +243,36 @@ impl DnsResolver {
         } else {
             &self.default_resolver
         };
+        self.resolve_srv_core(resolver, service, protocol, domain)
+            .await
+    }
+
+    /// Core SRV resolution against an already-built resolver. Validates the
+    /// service/protocol labels (DNS query-injection guard) then queries
+    /// `_service._proto.domain`. Shared by the public [`resolve_srv`] entry
+    /// point and the `dig`-style SRV path in [`resolve`]. Label-validation
+    /// failures are [`SeerError::InvalidInput`] — they are caller mistakes, not
+    /// transient DNS failures, so they must not be advertised as retryable.
+    async fn resolve_srv_core(
+        &self,
+        resolver: &TokioResolver,
+        service: &str,
+        protocol: &str,
+        domain: &str,
+    ) -> Result<Vec<DnsRecord>> {
+        if !is_valid_srv_label(service) {
+            return Err(SeerError::InvalidInput(format!(
+                "invalid SRV service name: {}",
+                service
+            )));
+        }
+        if !is_valid_srv_label(protocol) {
+            return Err(SeerError::InvalidInput(format!(
+                "invalid SRV protocol name: {}",
+                protocol
+            )));
+        }
+
         let query_name = format!("_{}._{}.{}", service, protocol, domain);
 
         let Some(response) = dns_lookup_or_empty(
@@ -750,6 +772,49 @@ impl DnsResolver {
         Ok(records)
     }
 
+    async fn resolve_naptr(
+        &self,
+        resolver: &TokioResolver,
+        domain: &str,
+    ) -> Result<Vec<DnsRecord>> {
+        let Some(response) = dns_lookup_or_empty(
+            resolver.lookup(domain, HickoryRecordType::NAPTR).await,
+            "NAPTR",
+        )?
+        else {
+            return Ok(vec![]);
+        };
+
+        let records = response
+            .answers()
+            .iter()
+            .filter_map(|record| {
+                if let HickoryRData::NAPTR(naptr) = &record.data {
+                    Some(DnsRecord {
+                        name: domain.to_string(),
+                        record_type: RecordType::NAPTR,
+                        ttl: record.ttl,
+                        // flags/services/regexp are DNS <character-string>s
+                        // (raw bytes); they are conventionally ASCII, so a
+                        // lossy decode is a faithful, panic-free rendering.
+                        data: RecordData::NAPTR {
+                            order: naptr.order,
+                            preference: naptr.preference,
+                            flags: String::from_utf8_lossy(&naptr.flags).into_owned(),
+                            services: String::from_utf8_lossy(&naptr.services).into_owned(),
+                            regexp: String::from_utf8_lossy(&naptr.regexp).into_owned(),
+                            replacement: naptr.replacement.to_string(),
+                        },
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        Ok(records)
+    }
+
     async fn resolve_any(&self, resolver: &TokioResolver, domain: &str) -> Result<Vec<DnsRecord>> {
         let mut all_records = Vec::new();
 
@@ -836,6 +901,40 @@ impl DnsResolver {
 }
 
 // Domain normalization is now handled by the shared validation module
+
+/// Prepares the query string for a DNS lookup.
+///
+/// PTR queries may be given a raw IP literal. IPv6 literals in particular must
+/// NOT pass through [`normalize_domain`]: its trailing-`:port` strip heuristic
+/// truncates the final hextet (e.g. `::1111` → dropped) and the remaining `:`
+/// separators then fail character validation, so IPv6 reverse lookups errored
+/// out with "Invalid domain name" before ever reaching `resolve_ptr`. For PTR
+/// queries we therefore detect an IP literal up front and pass it through in
+/// canonical form; everything else (domains, and PTR queries given a
+/// reverse-DNS name such as `1.1.1.1.in-addr.arpa`) is normalized as usual.
+fn prepare_query(domain: &str, record_type: RecordType) -> Result<String> {
+    if record_type == RecordType::PTR {
+        if let Ok(ip) = IpAddr::from_str(domain.trim()) {
+            return Ok(ip.to_string());
+        }
+    }
+    normalize_domain(domain)
+}
+
+/// Parses a `dig`-style SRV query name of the form `_service._proto.name` into
+/// its `(service, protocol, name)` parts, with the leading underscores
+/// stripped. Returns `None` when the input is not in that shape — e.g. a bare
+/// domain with no service/proto labels — so callers can surface a usage hint.
+fn parse_srv_query(name: &str) -> Option<(String, String, String)> {
+    let mut parts = name.splitn(3, '.');
+    let service = parts.next()?.strip_prefix('_')?;
+    let protocol = parts.next()?.strip_prefix('_')?;
+    let rest = parts.next()?;
+    if service.is_empty() || protocol.is_empty() || rest.is_empty() {
+        return None;
+    }
+    Some((service.to_string(), protocol.to_string(), rest.to_string()))
+}
 
 fn reverse_dns_name(ip: &IpAddr) -> String {
     match ip {
@@ -1172,18 +1271,123 @@ mod tests {
 
     // --- SRV record -------------------------------------------------
 
-    #[tokio::test]
-    async fn resolve_rejects_srv_record_type_without_srv_helper() {
-        // Calling `resolve` with SRV should return the helpful error
-        // instructing the caller to use `resolve_srv` instead.
-        let r = DnsResolver::new();
-        let result = r.resolve("example.com", RecordType::SRV, None).await;
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(
-            msg.contains("SRV records require service name format"),
-            "expected helpful SRV error, got: {}",
-            msg
+    // --- SRV via dig-style names (parse_srv_query) -------------------
+
+    #[test]
+    fn parse_srv_query_extracts_service_proto_and_name() {
+        assert_eq!(
+            parse_srv_query("_sip._tcp.example.com"),
+            Some((
+                "sip".to_string(),
+                "tcp".to_string(),
+                "example.com".to_string()
+            ))
         );
+    }
+
+    #[test]
+    fn parse_srv_query_keeps_multilabel_domain() {
+        assert_eq!(
+            parse_srv_query("_sip._tcp.sip.voice.google.com"),
+            Some((
+                "sip".to_string(),
+                "tcp".to_string(),
+                "sip.voice.google.com".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_srv_query_rejects_bare_domain() {
+        assert_eq!(parse_srv_query("example.com"), None);
+    }
+
+    #[test]
+    fn parse_srv_query_rejects_missing_proto_label() {
+        // Second label must be an `_proto` label.
+        assert_eq!(parse_srv_query("_sip.example.com"), None);
+    }
+
+    #[tokio::test]
+    async fn resolve_rejects_bare_domain_for_srv_as_input_error() {
+        // A bare domain (no _service._proto labels) cannot be an SRV query.
+        // This is a usage/input error — NOT a transient DNS failure — so it
+        // must surface as InvalidInput (which maps to a permanent, non-retryable
+        // signal across the Python/MCP boundary), and still carry the hint.
+        let r = DnsResolver::new();
+        let err = r
+            .resolve("example.com", RecordType::SRV, None)
+            .await
+            .expect_err("bare-domain SRV must error");
+        assert!(
+            matches!(err, SeerError::InvalidInput(_)),
+            "bare-domain SRV should be an input error, got: {err:?}"
+        );
+        assert!(err.to_string().contains("_service._proto"));
+    }
+
+    #[tokio::test]
+    #[ignore = "live network"]
+    async fn resolve_srv_via_dig_style_name_returns_records() {
+        // _caldavs._tcp.google.com is a long-standing public SRV record
+        // (CalDAV discovery → calendar.google.com:443).
+        let r = DnsResolver::new();
+        let records = r
+            .resolve("_caldavs._tcp.google.com", RecordType::SRV, None)
+            .await
+            .expect("dig-style SRV lookup should succeed");
+        assert!(!records.is_empty(), "expected SRV records");
+        assert!(records.iter().all(|r| r.record_type == RecordType::SRV));
+    }
+
+    #[tokio::test]
+    #[ignore = "live network"]
+    async fn resolve_naptr_returns_records() {
+        // sip2sip.info publishes stable NAPTR records for SIP discovery.
+        let r = DnsResolver::new();
+        let records = r
+            .resolve("sip2sip.info", RecordType::NAPTR, None)
+            .await
+            .expect("NAPTR lookup should succeed");
+        assert!(!records.is_empty(), "expected NAPTR records");
+        assert!(records.iter().all(|r| r.record_type == RecordType::NAPTR));
+    }
+
+    // --- prepare_query: PTR must accept raw IP literals (incl. IPv6) --
+
+    #[test]
+    fn prepare_query_passes_ipv6_literal_through_for_ptr() {
+        // Regression: normalize_domain's port-strip heuristic mangled IPv6
+        // literals (the trailing `:1111` group looks like a `:port`), so IPv6
+        // reverse lookups failed with "Invalid domain name" before ever
+        // reaching resolve_ptr. PTR queries for IP literals must bypass domain
+        // normalization.
+        let out = prepare_query("2606:4700:4700::1111", RecordType::PTR).unwrap();
+        assert_eq!(out, "2606:4700:4700::1111");
+    }
+
+    #[test]
+    fn prepare_query_passes_ipv6_loopback_through_for_ptr() {
+        let out = prepare_query("::1", RecordType::PTR).unwrap();
+        assert_eq!(out, "::1");
+    }
+
+    #[test]
+    fn prepare_query_passes_ipv4_literal_through_for_ptr() {
+        let out = prepare_query("8.8.8.8", RecordType::PTR).unwrap();
+        assert_eq!(out, "8.8.8.8");
+    }
+
+    #[test]
+    fn prepare_query_normalizes_non_ip_ptr_names() {
+        // A reverse-DNS name (not an IP literal) still gets normalized.
+        let out = prepare_query("1.1.1.1.in-addr.arpa", RecordType::PTR).unwrap();
+        assert_eq!(out, "1.1.1.1.in-addr.arpa");
+    }
+
+    #[test]
+    fn prepare_query_normalizes_domains_for_non_ptr() {
+        let out = prepare_query("HTTPS://WWW.Example.com/path", RecordType::A).unwrap();
+        assert_eq!(out, "example.com");
     }
 }
