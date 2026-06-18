@@ -93,6 +93,24 @@ def _get_concurrency(arguments: dict[str, Any], default: int = 10) -> int:
     return concurrency
 
 
+_INVALID_INPUT_PREFIX = "Invalid input: "
+
+
+def _invalid_input_message(exc: Exception) -> str:
+    """Render a ValueError as an 'Invalid input:' message, prefixed once.
+
+    Local validators here (``_require_str`` et al.) raise bare messages that
+    need the marker. But seer-core's ``InvalidInput`` Display already prepends
+    'Invalid input:' (e.g. the SSRF guard's reserved-address refusal), and
+    PyO3 surfaces that text verbatim — so blindly prefixing would produce a
+    doubled 'Invalid input: Invalid input:'. Add the marker only when absent.
+    """
+    msg = str(exc)
+    if msg.startswith(_INVALID_INPUT_PREFIX):
+        return msg
+    return _INVALID_INPUT_PREFIX + msg
+
+
 @mcp.list_tools()
 async def list_tools() -> list[Tool]:
     """List available Seer tools."""
@@ -389,7 +407,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="seer_bulk_ssl",
-            description="Inspect SSL certificate chains for multiple domains. Returns the full chain, SANs, key details, signature algorithm, and TLS version for each domain.",
+            description="Inspect SSL certificate chains for multiple domains. Returns the full chain, SANs, key details, and signature algorithm for each domain.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -421,7 +439,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         payload = UNTRUSTED_PREAMBLE + json.dumps(result, indent=2, default=str)
         return [TextContent(type="text", text=payload)]
     except ValueError as e:
-        return [TextContent(type="text", text=f"Invalid input: {e}")]
+        return [TextContent(type="text", text=_invalid_input_message(e))]
     except (TimeoutError, ConnectionError) as e:
         # PyO3 maps SeerError::Timeout to TimeoutError and connection-class
         # errors to ConnectionError. These are transient — surface a clear
