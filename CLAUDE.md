@@ -1199,13 +1199,21 @@ What happens automatically:
    with the workflow's `GITHUB_TOKEN`, and GitHub suppresses events from
    such actions (anti-recursion), so the `release: published` trigger never
    sees it. The dispatched run publishes seer-core then seer-cli to
-   crates.io. (Wheels/PyPI jobs are still release-event-gated — see the
-   workflow; proper fix is folding them into dist's `publish-jobs`.)
+   crates.io. (`publish.yml` currently publishes **only** to crates.io.)
 
-PyPI: the bindings publish as **`domain-seer`** (the bare name `seer` is taken
-by an unrelated project; the import name remains `seer`). Publishing uses PyPI
-Trusted Publishing (OIDC) from `publish.yml` — no token secret. seer-api
-depends on `domain-seer>=0.32`. When bumping versions, remember
+**Deferred publishers (tracked for later):** Homebrew and PyPI publishing are
+currently disabled.
+- *Homebrew*: removed from `installers`/`tap`/`publish-jobs` in
+  `dist-workspace.toml` (re-enable per the note there, then `dist generate`).
+  It also needs a `TheZacillac/homebrew-tap` repo and a `HOMEBREW_TAP_TOKEN`
+  secret (a cross-repo-write PAT — `GITHUB_TOKEN` can't push cross-repo).
+- *PyPI*: the `wheels`/`sdist`/`publish-pypi` jobs were removed from
+  `publish.yml` (restore from git history to re-enable).
+
+When PyPI is re-enabled: the bindings publish as **`domain-seer`** (the bare
+name `seer` is taken by an unrelated project; the import name remains `seer`)
+via PyPI Trusted Publishing (OIDC), no token secret. seer-api depends on
+`domain-seer>=0.32`. When bumping versions, remember
 `importlib.metadata.version("domain-seer")` in `seer-py/python/seer/__init__.py`
 keys off the distribution name.
 

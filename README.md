@@ -131,7 +131,7 @@ tokio = { version = "1", features = ["full"] }
 |---------|------|---------|-------------|
 | **seer-core** | Rust library | `cargo add seer-core` | Core library — all business logic |
 | **seer-cli** | Rust binary | `cargo install seer-cli` | The `seer` command-line tool |
-| **seer-py** | Python extension | `pip install domain-seer` | Python bindings via PyO3 (`import seer`) |
+| **seer-py** | Python extension | `pip install ./seer-py` | Python bindings via PyO3 (`import seer`); PyPI (`domain-seer`) planned |
 | **seer-api** | Python package | `pip install -e .` | REST API + MCP server |
 
 <details>
