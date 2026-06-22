@@ -1,5 +1,12 @@
 name: Publish to crates.io
 
+# NOTE: PyPI publishing for the Python bindings (`domain-seer`) is deferred
+# (tracked for later). The `wheels` / `sdist` / `publish-pypi` jobs were removed
+# from this workflow; see git history for the previous implementation. To
+# re-enable: restore those jobs (maturin build → upload artifacts →
+# pypa/gh-action-pypi-publish via PyPI Trusted Publishing/OIDC, environment
+# `pypi`) and complete the one-time PyPI publisher setup for `domain-seer`.
+
 on:
   release:
     types: [published]
@@ -58,72 +65,3 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_API_KEY }}
         run: cargo publish -p seer-cli
-
-  # Build seer-py wheels (PyPI distribution: `domain-seer`; import name stays
-  # `seer`). abi3-py39 → one wheel per platform covers Python 3.9+. Wheels are
-  # both attached to the GitHub release AND published to PyPI below.
-  wheels:
-    name: domain-seer wheels (${{ matrix.os }})
-    if: github.event_name == 'release'
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: PyO3/maturin-action@v1
-        with:
-          working-directory: seer-py
-          command: build
-          args: --release
-      - name: Upload wheels to the GitHub release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
-        shell: bash
-        run: gh release upload "$RELEASE_TAG" target/wheels/*.whl --clobber
-      - uses: actions/upload-artifact@v4
-        with:
-          name: wheels-${{ matrix.os }}
-          path: target/wheels/*.whl
-
-  sdist:
-    name: domain-seer sdist
-    if: github.event_name == 'release'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: PyO3/maturin-action@v1
-        with:
-          working-directory: seer-py
-          command: sdist
-      - uses: actions/upload-artifact@v4
-        with:
-          name: sdist
-          path: target/wheels/*.tar.gz
-
-  # Publishes via PyPI Trusted Publishing (OIDC) — no API token secret.
-  # One-time PyPI-side setup: add a publisher for project `domain-seer`
-  # (owner TheZacillac, repo seer, workflow publish.yml, environment pypi).
-  publish-pypi:
-    name: Publish domain-seer to PyPI
-    if: github.event_name == 'release'
-    needs: [wheels, sdist]
-    runs-on: ubuntu-latest
-    environment: pypi
-    permissions:
-      id-token: write
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: wheels-*
-          merge-multiple: true
-          path: dist
-      - uses: actions/download-artifact@v4
-        with:
-          name: sdist
-          path: dist
-      - uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          packages-dir: dist
