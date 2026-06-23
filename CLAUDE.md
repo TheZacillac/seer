@@ -99,7 +99,7 @@ seer-core/src/
 ├── validation.rs       # Domain normalization, reserved-IP checks, SEER_DOMAIN_ALLOWLIST
 ├── ssl.rs              # SSL chain inspection (single-attempt by design)
 ├── caa.rs              # CAA policy lookup + issuer comparison
-├── subdomains.rs       # Subdomain enumeration via Certificate Transparency
+├── subdomains/         # Subdomain enumeration via CT logs: ordered source chain (crt.sh→certspotter) + per-source retry treating crt.sh 404/429/HTML-body as transient
 ├── diff.rs             # Side-by-side domain comparison
 ├── watchlist.rs        # Cert/registration expiry watchlist
 ├── history.rs          # Lookup history
