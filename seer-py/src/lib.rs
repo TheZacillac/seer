@@ -349,6 +349,12 @@ const MAX_CONCURRENCY: usize = 50;
 /// `Vec` / JSON value / Python object graph with no backpressure (issue #58).
 const MAX_BULK_DOMAINS: usize = 100;
 
+/// Validates a requested bulk concurrency. The two bounds are intentionally
+/// asymmetric: `> MAX_CONCURRENCY` is a hard ceiling and is *rejected* (a DoS
+/// guard — see issue #58), whereas `0` is a nonsensical request that is quietly
+/// *floored to 1* rather than erroring, so a caller that derives concurrency
+/// from arithmetic (e.g. `len / chunk`) can't accidentally deadlock on a
+/// zero-permit semaphore.
 fn validate_concurrency(concurrency: usize) -> PyResult<usize> {
     if concurrency > MAX_CONCURRENCY {
         return Err(PyValueError::new_err(format!(
@@ -784,8 +790,12 @@ fn dns_follow<'py>(
     // enforces the per-interval cap (<= 60 minutes).
     let config = FollowConfig::new(iterations, interval_minutes).map_err(|e| seer_err_to_py(&e))?;
 
-    // Additionally cap total wall-clock time and iteration count to prevent
-    // blocking the shared Tokio runtime for excessive durations.
+    // Binding-specific caps, intentionally STRICTER than `FollowConfig`'s core
+    // limits (10_000 iterations / 60-min interval): seer-py drives a single
+    // shared, process-wide Tokio runtime, so an over-long follow would block it
+    // for every other caller. These are not redundant with the core caps — do
+    // not "deduplicate" them away; they bound total wall-clock on the shared
+    // runtime, which the core (used by the CLI's own runtime) does not.
     const MAX_ITERATIONS: usize = 100;
     if iterations > MAX_ITERATIONS {
         return Err(PyValueError::new_err(format!(

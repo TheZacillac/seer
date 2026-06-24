@@ -64,6 +64,15 @@ impl AvailabilityChecker {
         }
     }
 
+    /// Builds a checker whose sub-clients honor the timeouts in `config`.
+    pub fn from_config(config: &crate::config::SeerConfig) -> Self {
+        Self {
+            rdap_client: RdapClient::new().with_timeout(config.rdap_timeout()),
+            whois_client: WhoisClient::new().with_timeout(config.whois_timeout()),
+            dns_resolver: DnsResolver::new().with_timeout(config.dns_timeout()),
+        }
+    }
+
     /// Check if a domain is available for registration.
     #[instrument(skip(self), fields(domain = %domain))]
     pub async fn check(&self, domain: &str) -> Result<AvailabilityResult> {

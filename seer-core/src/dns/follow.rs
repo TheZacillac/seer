@@ -241,25 +241,18 @@ impl DnsFollower {
                 }
             };
 
-            // Extract record values for comparison
-            let current_values: HashSet<String> =
-                records.iter().map(|r| r.data.to_string()).collect();
+            // Extract record values (original casing) for this iteration.
+            let current_values: Vec<String> = records.iter().map(|r| r.data.to_string()).collect();
 
-            // Compare with previous iteration
+            // Compare with previous iteration. The diff is case-insensitive so
+            // a resolver applying 0x20 query-name randomization (returning the
+            // same record with different casing) is not reported as a spurious
+            // change; `added`/`removed` still carry the original casing.
             let (changed, added, removed) = if i == 0 {
                 // First iteration - no previous to compare
                 (false, Vec::new(), Vec::new())
             } else {
-                let added: Vec<String> = current_values
-                    .difference(&previous_values)
-                    .cloned()
-                    .collect();
-                let removed: Vec<String> = previous_values
-                    .difference(&current_values)
-                    .cloned()
-                    .collect();
-                let changed = !added.is_empty() || !removed.is_empty();
-                (changed, added, removed)
+                diff_record_values(&current_values, &previous_values)
             };
 
             if changed {
@@ -286,7 +279,11 @@ impl DnsFollower {
             }
 
             iterations.push(iteration);
-            previous_values = current_values;
+            // Store case-folded keys for the next iteration's comparison.
+            previous_values = current_values
+                .iter()
+                .map(|v| v.to_ascii_lowercase())
+                .collect();
 
             // Sleep before next iteration (unless this is the last one)
             if i < config.iterations - 1 {
@@ -341,9 +338,51 @@ impl DnsFollower {
     }
 }
 
+/// Diffs the current iteration's record values against the previous
+/// iteration's case-folded key set. Returns `(changed, added, removed)` where
+/// `added`/`removed` preserve the original casing for display, but membership
+/// is decided on the lowercased key — so a record that reappears with only a
+/// case difference (0x20 query-name randomization) is not flagged as a change.
+fn diff_record_values(
+    current_values: &[String],
+    previous_keys: &HashSet<String>,
+) -> (bool, Vec<String>, Vec<String>) {
+    let current_keys: HashSet<String> = current_values
+        .iter()
+        .map(|v| v.to_ascii_lowercase())
+        .collect();
+
+    // Added: present now (by key) but absent from the previous key set.
+    let mut added: Vec<String> = current_values
+        .iter()
+        .filter(|v| !previous_keys.contains(&v.to_ascii_lowercase()))
+        .cloned()
+        .collect();
+    // Removed: previous keys no longer present. The original casing is not
+    // retained across iterations, so emit the lowercased key.
+    let mut removed: Vec<String> = previous_keys
+        .iter()
+        .filter(|k| !current_keys.contains(*k))
+        .cloned()
+        .collect();
+    added.sort();
+    added.dedup();
+    removed.sort();
+    removed.dedup();
+
+    let changed = !added.is_empty() || !removed.is_empty();
+    (changed, added, removed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Builds a case-folded key set the same way `follow()` stores
+    /// `previous_values`, for use in the diff helper tests.
+    fn lowercased_set<const N: usize>(values: [&str; N]) -> HashSet<String> {
+        values.iter().map(|v| v.to_ascii_lowercase()).collect()
+    }
 
     #[tokio::test]
     async fn test_follow_config_default() {
@@ -351,6 +390,34 @@ mod tests {
         assert_eq!(config.iterations, 10);
         assert_eq!(config.interval_secs, 60);
         assert!(!config.changes_only);
+    }
+
+    /// Records that differ only in case between iterations (e.g. a resolver that
+    /// applies 0x20 query-name randomization to NS answers) must NOT be reported
+    /// as a change. The comparison key is case-folded.
+    #[test]
+    fn diff_values_ignores_case_only_differences() {
+        let previous = lowercased_set(["NS1.EXAMPLE.COM.", "ns2.example.com."]);
+        let current = vec![
+            "ns1.example.com.".to_string(),
+            "NS2.EXAMPLE.COM.".to_string(),
+        ];
+        let (changed, added, removed) = diff_record_values(&current, &previous);
+        assert!(!changed, "case-only differences must not count as a change");
+        assert!(added.is_empty(), "no added values: {added:?}");
+        assert!(removed.is_empty(), "no removed values: {removed:?}");
+    }
+
+    /// A genuine value change is still detected, and `added`/`removed` carry the
+    /// original casing for display.
+    #[test]
+    fn diff_values_detects_real_change_preserving_case() {
+        let previous = lowercased_set(["ns1.example.com."]);
+        let current = vec!["NS2.Example.Com.".to_string()];
+        let (changed, added, removed) = diff_record_values(&current, &previous);
+        assert!(changed, "a different nameserver is a real change");
+        assert_eq!(added, vec!["NS2.Example.Com.".to_string()]);
+        assert_eq!(removed, vec!["ns1.example.com.".to_string()]);
     }
 
     #[test]

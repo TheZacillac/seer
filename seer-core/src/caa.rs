@@ -192,8 +192,13 @@ pub fn classify_issuer(issuer: &str, policy: &CaaPolicy) -> IssuerCaaMatch {
 /// We use a small alias table for the common public CAs and fall back to a
 /// direct substring check.
 fn ca_value_matches_issuer(caa_value: &str, issuer_lc: &str) -> bool {
-    // 1. The CAA value appears verbatim in the issuer (e.g. "ssl.com").
-    if issuer_lc.contains(caa_value) {
+    // 1. The CAA value appears verbatim in the issuer (e.g. "ssl.com"), but
+    //    only when it is long enough AND lands on a word boundary. A
+    //    pathologically short value ("ca", "ssl") would otherwise blanket-match
+    //    any issuer that merely contains those letters — the same over-match the
+    //    base-label fallback guards against (issue #56). Length is gated by
+    //    MIN_FALLBACK_BASE_LEN so the verbatim and base paths share one bar.
+    if caa_value.len() >= MIN_FALLBACK_BASE_LEN && contains_word(issuer_lc, caa_value) {
         return true;
     }
     // 2. Curated aliases for well-known CAs — preferred over the generic base
@@ -327,6 +332,32 @@ mod tests {
         assert_eq!(
             classify_issuer("CN=R3, O=Let's Encrypt", &policy),
             IssuerCaaMatch::Mismatch
+        );
+    }
+
+    #[test]
+    fn classify_verbatim_match_is_length_guarded() {
+        // A pathologically short CAA `issue` value (here "ca") must not
+        // blanket-match an unrelated issuer just because the two letters appear
+        // verbatim somewhere in the issuer string. The verbatim path is now
+        // length-guarded just like the base-label fallback (issue #56 follow-up).
+        let policy = policy_with(vec![("issue", "ca")]);
+        assert_eq!(
+            classify_issuer("CN=Verisign Class 3 CA, O=Symantec", &policy),
+            IssuerCaaMatch::Mismatch,
+            "two-letter verbatim CAA value must not over-match unrelated issuers"
+        );
+    }
+
+    #[test]
+    fn classify_full_domain_verbatim_still_matches() {
+        // A real, full-domain CAA value that appears verbatim in the issuer is
+        // still Permitted — the length guard must not break the common case.
+        let policy = policy_with(vec![("issue", "letsencrypt.org")]);
+        assert_eq!(
+            classify_issuer("CN=R3, O=letsencrypt.org", &policy),
+            IssuerCaaMatch::Permitted,
+            "full-domain verbatim value must still match"
         );
     }
 

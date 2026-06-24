@@ -86,7 +86,7 @@ pub async fn auto_lookup(client: &RdapClient, query: &str) -> Result<RdapRespons
 /// (timeout, 5xx, 429, bootstrap/connection error) means "we don't know",
 /// NOT "available", and must not match.
 ///
-/// Matches the message produced by `client::query_rdap_internal`
+/// Matches the message produced by `client::query_rdap_attempt`
 /// (`"query failed with status 404 ..."`), looking through both the
 /// `RetryExhausted` wrapper and the multi-candidate "all N ... failed; last
 /// error: ..." wrapper, each of which preserves the original 404 marker.

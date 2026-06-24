@@ -31,15 +31,23 @@ impl HumanFormatter {
                                      // Total left pad before value column A = label_indent + label_width + 2 + 2.
         let header_left_pad = label_indent.chars().count() + label_width + 2 + marker_gutter_width;
 
-        // Column header block
+        // Column header block. Data cells wrap to `col_width` (capped at
+        // DIFF_COLUMN_CAP), so the header domain names must be elided to the
+        // same width or a domain longer than the cap drifts the header out of
+        // alignment with the body (and its rule). Elide (single-line) rather
+        // than wrap to keep the header one row tall.
+        let header_a = elide_to(&domain_a, col_width);
+        let header_b = elide_to(&domain_b, col_width);
         let header_line = format!(
             "{}{}   {}",
             " ".repeat(header_left_pad),
-            self.label(&pad_right(&domain_a, col_width)),
-            self.label(&domain_b)
+            self.label(&pad_right(&header_a, col_width)),
+            self.label(&header_b)
         );
-        let rule_a: String = "─".repeat(domain_a.chars().count());
-        let rule_b: String = "─".repeat(domain_b.chars().count());
+        // Rules match the rendered (elided) header cell widths, never the raw
+        // domain length.
+        let rule_a: String = "─".repeat(header_a.chars().count());
+        let rule_b: String = "─".repeat(header_b.chars().count());
         let rule_line = format!(
             "{}{}   {}",
             " ".repeat(header_left_pad),
@@ -368,6 +376,26 @@ fn pad_right(text: &str, width: usize) -> String {
     } else {
         format!("{}{}", text, " ".repeat(width - have))
     }
+}
+
+/// Elides `text` to at most `width` display chars, appending a single-char
+/// ellipsis (`…`) when truncation occurs so the result is exactly `width` chars.
+/// Char-boundary-safe (operates on `chars()`, never byte indices). A `width` of
+/// 0 yields an empty string; a `width` of 1 yields just the ellipsis when
+/// truncating.
+fn elide_to(text: &str, width: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= width {
+        return text.to_string();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    // Keep width-1 chars and add the ellipsis to land on exactly `width`.
+    let keep = width - 1;
+    let mut out: String = chars[..keep].iter().collect();
+    out.push('…');
+    out
 }
 
 #[cfg(test)]
@@ -892,6 +920,58 @@ mod tests {
             1,
             "right-side value must appear exactly once:\n{}",
             out
+        );
+    }
+
+    #[test]
+    fn elide_to_truncates_with_ellipsis_and_respects_width() {
+        // Short text is returned unchanged.
+        assert_eq!(elide_to("short", 40), "short");
+        assert_eq!(elide_to("exactlyten", 10), "exactlyten");
+        // Over-width text is elided to exactly `width` chars including the
+        // ellipsis.
+        let long = "a".repeat(50);
+        let out = elide_to(&long, 40);
+        assert_eq!(out.chars().count(), 40, "elided width must equal the cap");
+        assert!(out.ends_with('…'), "elision marker expected: {out}");
+    }
+
+    #[test]
+    fn format_diff_header_aligns_when_domain_exceeds_column_cap() {
+        // A domain longer than DIFF_COLUMN_CAP must not drift the header out of
+        // alignment with the body: the A-column header cell and its rule are
+        // both bounded to col_width (== DIFF_COLUMN_CAP here), matching the
+        // wrapped data cells.
+        let mut diff = make_sample_diff();
+        let long_domain = format!("{}.example.com", "x".repeat(50)); // > 40 chars
+        diff.domain_a = long_domain.clone();
+
+        let f = diff_formatter();
+        let out = f.format_diff(&diff);
+
+        // The full, untruncated domain must never appear on a header/body line
+        // (it would blow past the column). The title line is exempt — it shows
+        // both domains in full intentionally.
+        for line in out.lines() {
+            if line.starts_with("Diff:") {
+                continue;
+            }
+            assert!(
+                !line.contains(&long_domain),
+                "untruncated long domain leaked onto an aligned line: {line}"
+            );
+        }
+
+        // The A-column rule under the header must be exactly col_width dashes
+        // (40), proving the header column matches the capped body column rather
+        // than stretching to the raw domain length.
+        let cap = DIFF_COLUMN_CAP;
+        let has_capped_rule = out
+            .lines()
+            .any(|l| l.contains(&"─".repeat(cap)) && !l.contains(&"─".repeat(cap + 1)));
+        assert!(
+            has_capped_rule,
+            "expected an A-column rule capped at {cap} dashes:\n{out}"
         );
     }
 

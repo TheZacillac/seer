@@ -32,24 +32,10 @@ pub(super) struct MdSafe<'a>(pub &'a str);
 
 impl fmt::Display for MdSafe<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut iter = self.0.chars();
+        let mut iter = self.0.chars().peekable();
         while let Some(c) = iter.next() {
             match c {
-                '\x1b' => {
-                    // Consume the rest of the ANSI escape sequence (CSI or
-                    // OSC). The byte right after ESC is the introducer
-                    // (`[` for CSI, `]` for OSC, etc.) — skip it
-                    // unconditionally so it isn't treated as a terminator.
-                    // Then look for the terminator: CSI ends on a byte in
-                    // `@`-`~`; OSC ends on BEL (0x07) or ST. Cap
-                    // consumption defensively.
-                    let _ = iter.next();
-                    for inner in iter.by_ref().take(64) {
-                        if matches!(inner as u32, 0x40..=0x7E) || inner == '\x07' {
-                            break;
-                        }
-                    }
-                }
+                '\x1b' => consume_escape(&mut iter),
                 '\n' | '\r' | '\t' => f.write_str(" ")?,
                 '`' => f.write_str("'")?,
                 // GFM table-cell delimiter: a bare `|` from attacker-controlled
@@ -62,6 +48,79 @@ impl fmt::Display for MdSafe<'_> {
             }
         }
         Ok(())
+    }
+}
+
+/// Maximum chars consumed while scanning for an ANSI escape terminator. A
+/// well-formed CSI/OSC/DCS sequence is far shorter; the cap stops a malformed
+/// sequence from eating an unbounded run of legitimate text.
+const ANSI_SCAN_CAP: usize = 64;
+
+/// Consumes the remainder of an ANSI escape sequence after the leading ESC has
+/// already been read, given a peekable char iterator positioned at the
+/// introducer.
+///
+/// Critically, the introducer is only consumed when it is *actually* one — a
+/// lone/truncated ESC (e.g. `ESC` then `X` or `|`) drops only the ESC and
+/// leaves the following character for normal escaping, instead of swallowing
+/// it. Scans also bail on a newline/CR so a terminator-less sequence can't eat
+/// across a line.
+fn consume_escape(iter: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    match iter.peek() {
+        // CSI: `ESC [` … final byte in `@`-`~` (0x40-0x7E).
+        Some('[') => {
+            iter.next(); // consume '['
+            for _ in 0..ANSI_SCAN_CAP {
+                match iter.peek() {
+                    // Bail before consuming a newline/CR — it's layout, not
+                    // part of the (malformed, unterminated) sequence.
+                    Some('\n') | Some('\r') | None => break,
+                    Some(&ch) => {
+                        iter.next();
+                        if matches!(ch as u32, 0x40..=0x7E) {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        // String-type sequences: OSC (`ESC ]`) and DCS (`ESC P`). Both run
+        // until BEL (0x07) or ST (`ESC \\`).
+        Some(']') | Some('P') => {
+            iter.next(); // consume introducer
+            for _ in 0..ANSI_SCAN_CAP {
+                match iter.peek() {
+                    Some('\n') | Some('\r') | None => break,
+                    Some('\x07') => {
+                        iter.next();
+                        break;
+                    }
+                    Some('\x1b') => {
+                        // Possible ST: consume ESC, then `\\` if present.
+                        iter.next();
+                        if iter.peek() == Some(&'\\') {
+                            iter.next();
+                        }
+                        break;
+                    }
+                    Some(_) => {
+                        iter.next();
+                    }
+                }
+            }
+        }
+        // Charset-designation escapes: `ESC ( <id>` / `ESC ) <id>` and the
+        // 96-char variants `ESC * <id>` / `ESC + <id>`. Consume the introducer
+        // plus exactly the one designator char (never a newline).
+        Some('(') | Some(')') | Some('*') | Some('+') => {
+            iter.next(); // consume introducer
+            if !matches!(iter.peek(), Some('\n') | Some('\r') | None) {
+                iter.next();
+            }
+        }
+        // Not a recognized introducer (lone/truncated ESC). Drop only the ESC;
+        // leave the next char to be escaped normally by the main loop.
+        _ => {}
     }
 }
 
@@ -295,5 +354,36 @@ mod tests {
     #[test]
     fn test_mdsafe_preserves_unicode() {
         assert_eq!(md("café — résumé"), "café — résumé");
+    }
+
+    #[test]
+    fn test_mdsafe_lone_esc_does_not_swallow_following_text() {
+        // A bare ESC not followed by a real ANSI introducer must drop only the
+        // ESC, not the following characters. `X` is not a CSI/OSC introducer, so
+        // "hello" must survive — and the `|` is still escaped for table safety.
+        assert_eq!(md("\x1bXhello|world"), "Xhello\\|world");
+    }
+
+    #[test]
+    fn test_mdsafe_truncated_escape_does_not_swallow_newline_or_text() {
+        // ESC + introducer `[` with no terminator before a newline: the scan
+        // must bail at the newline (re-emitting it as a space) rather than
+        // consuming "Ignore" while hunting for a terminator that never comes.
+        assert_eq!(md("\x1b[\nIgnore"), " Ignore");
+    }
+
+    #[test]
+    fn test_mdsafe_still_strips_wellformed_ansi() {
+        // Regression: a complete CSI color sequence is still fully removed.
+        assert_eq!(md("\x1b[31mfoo\x1b[0m"), "foo");
+        // OSC terminated by BEL is still removed.
+        assert_eq!(md("\x1b]0;title\x07rest"), "rest");
+    }
+
+    #[test]
+    fn test_mdsafe_esc_then_pipe_still_escapes_pipe() {
+        // After dropping a lone ESC, a following structural `|` must still be
+        // escaped — the ANSI handling must not bypass the table-cell defense.
+        assert_eq!(md("\x1b|col"), "\\|col");
     }
 }

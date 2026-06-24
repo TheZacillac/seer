@@ -31,7 +31,7 @@ use crate::error::{Result, SeerError};
 /// returns a reserved IP — is still trusted and still blocked by the
 /// reserved-IP check. The pre-existing time-of-check/time-of-use window
 /// between validation and the actual outbound connect is unchanged.
-static FALLBACK_RESOLVER: Lazy<TokioResolver> = Lazy::new(|| {
+static FALLBACK_RESOLVER: Lazy<Option<TokioResolver>> = Lazy::new(|| {
     let mut builder = TokioResolver::builder_with_config(
         ResolverConfig::udp_and_tcp(&GOOGLE),
         TokioRuntimeProvider::default(),
@@ -42,9 +42,11 @@ static FALLBACK_RESOLVER: Lazy<TokioResolver> = Lazy::new(|| {
         opts.attempts = 2;
         opts.use_hosts_file = ResolveHosts::Never;
     }
-    builder
-        .build()
-        .expect("hickory fallback resolver build is infallible with no TLS features")
+    // Mirror the `Lazy<Option<…>>` pattern used for the shared HTTP clients
+    // rather than `.expect()` in a library initializer: the build is infallible
+    // today (no TLS features), but a `None` here degrades to a typed DNS error
+    // at the call site instead of a process panic if that ever changes.
+    builder.build().ok()
 });
 
 /// Reject an IP address if it belongs to any range that is not appropriate
@@ -56,7 +58,8 @@ static FALLBACK_RESOLVER: Lazy<TokioResolver> = Lazy::new(|| {
 /// broadcast, unspecified, 0.0.0.0/8, documentation (RFC5737), CGNAT
 /// (100.64/10), IETF 192.0.0.0/24, benchmark (198.18/15), and class-E
 /// (240/4); and for IPv6: loopback, multicast, unspecified, ULA (fc00::/7),
-/// link-local (fe80::/10), documentation (2001:db8::/32), 6to4 (2002::/16),
+/// link-local (fe80::/10), site-local (fec0::/10), documentation
+/// (2001:db8::/32), 6to4 (2002::/16),
 /// NAT64 (64:ff9b::/96), and the IPv4-mapped/-compatible forms (re-checking
 /// the embedded IPv4).
 pub fn is_reserved_ip(ip: IpAddr) -> bool {
@@ -92,6 +95,11 @@ pub fn is_reserved_ip(ip: IpAddr) -> bool {
             }
             // Link-local fe80::/10
             if (seg[0] & 0xffc0) == 0xfe80 {
+                return true;
+            }
+            // Site-local fec0::/10 (RFC 3879, deprecated but still a non-global,
+            // internal-only range a malicious AAAA could point at).
+            if (seg[0] & 0xffc0) == 0xfec0 {
                 return true;
             }
             // Documentation 2001:db8::/32
@@ -199,7 +207,12 @@ pub async fn resolve_public_host(host: &str, port: u16) -> Result<Vec<SocketAddr
                 error = %os_err,
                 "OS resolver could not resolve host; trying hickory fallback"
             );
-            match FALLBACK_RESOLVER.lookup_ip(host).await {
+            let Some(resolver) = FALLBACK_RESOLVER.as_ref() else {
+                return Err(SeerError::InvalidInput(format!(
+                    "DNS resolution failed for {host}: {os_err} (no fallback resolver available)"
+                )));
+            };
+            match resolver.lookup_ip(host).await {
                 Ok(resp) => resp.iter().map(|ip| SocketAddr::new(ip, port)).collect(),
                 Err(fallback_err) => {
                     return Err(SeerError::InvalidInput(format!(
@@ -276,6 +289,13 @@ mod tests {
     #[test]
     fn rejects_ipv6_ula() {
         assert!(is_reserved_ip("fd00::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn rejects_ipv6_site_local() {
+        // fec0::/10 (RFC 3879, deprecated) is a non-global internal range.
+        assert!(is_reserved_ip("fec0::1".parse().unwrap()));
+        assert!(is_reserved_ip("feff::1".parse().unwrap()));
     }
 
     #[test]

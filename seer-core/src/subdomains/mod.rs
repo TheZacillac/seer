@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, instrument, warn};
 
 use crate::error::{Result, SeerError};
-use sources::Source;
+use sources::{PaginationSpec, Source};
 
 /// Result of subdomain enumeration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,17 +66,20 @@ async fn enumerate_with_sources(domain: &str, srcs: &[Source]) -> Result<Subdoma
     let mut last_err: Option<SeerError> = None;
 
     for src in srcs {
-        let url = (src.build_url)(&src.base, domain);
-        match http::fetch_with_retry(&url).await {
-            Ok(body) => match (src.parse)(&body) {
-                Ok(names) => return Ok(build_result(domain, names, src.name)),
-                Err(e) => {
-                    warn!(source = src.name, error = %e, "CT source returned unparseable data");
-                    last_err = Some(e);
+        let fetched = match &src.paginate {
+            Some(spec) => fetch_paginated(domain, &src.base, spec).await,
+            None => {
+                let url = (src.build_url)(&src.base, domain);
+                match http::fetch_with_retry(&url).await {
+                    Ok(body) => (src.parse)(&body),
+                    Err(e) => Err(e),
                 }
-            },
+            }
+        };
+        match fetched {
+            Ok(names) => return Ok(build_result(domain, names, src.name)),
             Err(e) => {
-                warn!(source = src.name, error = %e, "CT source unavailable, trying next");
+                warn!(source = src.name, error = %e, "CT source unavailable or unparseable, trying next");
                 last_err = Some(e);
             }
         }
@@ -88,6 +91,43 @@ async fn enumerate_with_sources(domain: &str, srcs: &[Source]) -> Result<Subdoma
                 .into(),
         )
     }))
+}
+
+/// Fetches a cursor-paginated source page by page, accumulating DNS names until
+/// the cursor is exhausted or `max_pages` is reached. A failure on the FIRST
+/// page propagates (the source is down — let the chain fall through); a failure
+/// on a LATER page returns what was gathered so far rather than discarding the
+/// earlier pages.
+async fn fetch_paginated(domain: &str, base: &str, spec: &PaginationSpec) -> Result<Vec<String>> {
+    let mut names = Vec::new();
+    let mut cursor: Option<String> = None;
+
+    for page_num in 0..spec.max_pages {
+        let url = (spec.url_after)(base, domain, cursor.as_deref());
+        let page = match http::fetch_with_retry(&url)
+            .await
+            .and_then(|body| (spec.parse_page)(&body))
+        {
+            Ok(page) => page,
+            Err(e) if page_num == 0 => return Err(e),
+            Err(e) => {
+                warn!(error = %e, page = page_num, "pagination stopped early; returning partial results");
+                break;
+            }
+        };
+
+        if page.names.is_empty() {
+            break;
+        }
+        names.extend(page.names);
+
+        match page.next_cursor {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+
+    Ok(names)
 }
 
 /// Filter and normalize raw certificate names into the final subdomain list:
@@ -201,12 +241,14 @@ mod tests {
                 base: primary.uri(),
                 build_url: |b, d| format!("{}/?q={}", b, d),
                 parse: sources::parse_crtsh,
+                paginate: None,
             },
             Source {
                 name: "fallback",
                 base: fallback.uri(),
                 build_url: |b, d| format!("{}/?domain={}", b, d),
                 parse: sources::parse_certspotter,
+                paginate: None,
             },
         ];
 
@@ -230,9 +272,72 @@ mod tests {
             base: down.uri(),
             build_url: |b, d| format!("{}/?q={}", b, d),
             parse: sources::parse_crtsh,
+            paginate: None,
         }];
 
         let err = enumerate_with_sources("example.com", &srcs).await;
         assert!(err.is_err());
+    }
+
+    /// A paginated source must follow the `after=` cursor and accumulate names
+    /// across pages instead of silently truncating to the first page.
+    #[tokio::test]
+    async fn paginated_source_follows_cursor_across_pages() {
+        use wiremock::matchers::{query_param, query_param_is_missing};
+
+        let server = MockServer::start().await;
+
+        // Page 1 (no cursor): id 100 -> next cursor "100".
+        Mock::given(method("GET"))
+            .and(query_param_is_missing("after"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"[{"id":"100","dns_names":["a.example.com"]}]"#),
+            )
+            .mount(&server)
+            .await;
+
+        // Page 2 (after=100): id 200 -> next cursor "200".
+        Mock::given(method("GET"))
+            .and(query_param("after", "100"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"[{"id":"200","dns_names":["b.example.com"]}]"#),
+            )
+            .mount(&server)
+            .await;
+
+        // Page 3 (after=200): empty -> pagination ends.
+        Mock::given(method("GET"))
+            .and(query_param("after", "200"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("[]"))
+            .mount(&server)
+            .await;
+
+        let srcs = vec![Source {
+            name: "paged",
+            base: server.uri(),
+            build_url: |b, d| format!("{}/?domain={}", b, d),
+            parse: sources::parse_certspotter,
+            paginate: Some(PaginationSpec {
+                url_after: |base, domain, after| {
+                    let mut url = format!("{}/v1/issuances?domain={}", base, domain);
+                    if let Some(c) = after {
+                        url.push_str("&after=");
+                        url.push_str(c);
+                    }
+                    url
+                },
+                parse_page: sources::parse_certspotter_page,
+                max_pages: 10,
+            }),
+        }];
+
+        let result = enumerate_with_sources("example.com", &srcs).await.unwrap();
+        assert_eq!(
+            result.subdomains,
+            vec!["a.example.com", "b.example.com"],
+            "names from both pages must be accumulated"
+        );
     }
 }

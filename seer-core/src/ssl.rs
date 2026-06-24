@@ -97,6 +97,8 @@ pub struct CertDetail {
 pub struct SslChecker {
     /// Cached DNS resolver used for CAA lookups alongside the TLS probe.
     dns_resolver: DnsResolver,
+    /// Timeout for the TCP connect and TLS handshake.
+    timeout: Duration,
 }
 
 impl Default for SslChecker {
@@ -110,7 +112,15 @@ impl SslChecker {
     pub fn new() -> Self {
         Self {
             dns_resolver: DnsResolver::new(),
+            timeout: DEFAULT_TIMEOUT,
         }
+    }
+
+    /// Sets the timeout for the TCP connect and TLS handshake.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self.dns_resolver = DnsResolver::new().with_timeout(timeout);
+        self
     }
 
     /// Inspects the SSL certificate chain for the given domain.
@@ -158,7 +168,7 @@ impl SslChecker {
 
         // TCP connect with timeout — connect to pre-resolved address to prevent DNS rebinding
         let stream =
-            tokio::time::timeout(DEFAULT_TIMEOUT, TcpStream::connect(socket_addrs.as_slice()))
+            tokio::time::timeout(self.timeout, TcpStream::connect(socket_addrs.as_slice()))
                 .await
                 .map_err(|_| SeerError::Timeout("SSL connection timed out".to_string()))?
                 .map_err(|e| {
@@ -166,7 +176,7 @@ impl SslChecker {
                 })?;
 
         // TLS handshake with timeout
-        let tls_stream = tokio::time::timeout(DEFAULT_TIMEOUT, connector.connect(&domain, stream))
+        let tls_stream = tokio::time::timeout(self.timeout, connector.connect(&domain, stream))
             .await
             .map_err(|_| SeerError::Timeout("TLS handshake timed out".to_string()))?
             .map_err(|e| SeerError::SslError(format!("TLS handshake failed: {}", e)))?;
@@ -268,29 +278,35 @@ fn extract_sans(cert: &X509Certificate) -> Vec<String> {
                     sans.push(dns.to_string());
                 }
                 GeneralName::IPAddress(ip_bytes) => {
-                    // IP addresses are encoded as bytes
-                    let ip_str = match ip_bytes.len() {
-                        4 => format!(
-                            "{}.{}.{}.{}",
-                            ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3]
-                        ),
-                        16 => {
-                            // IPv6
-                            let mut parts = Vec::new();
-                            for chunk in ip_bytes.chunks(2) {
-                                parts.push(format!("{:02x}{:02x}", chunk[0], chunk[1]));
-                            }
-                            parts.join(":")
-                        }
-                        _ => format!("{:?}", ip_bytes),
-                    };
-                    sans.push(ip_str);
+                    sans.push(format_ip_san(ip_bytes));
                 }
                 _ => {}
             }
         }
     }
     sans
+}
+
+/// Renders an IPAddress SAN from its raw bytes into canonical text form.
+///
+/// A 4-byte value becomes dotted-quad IPv4; a 16-byte value becomes a
+/// zero-compressed IPv6 address (e.g. `::1`, not `0000:0000:...:0001`) by going
+/// through `std::net::Ipv6Addr`'s `Display`. Any other length is unexpected for
+/// an IPAddress general name, so it falls back to a debug rendering of the bytes
+/// rather than guessing.
+fn format_ip_san(ip_bytes: &[u8]) -> String {
+    match ip_bytes.len() {
+        4 => {
+            let octets: [u8; 4] = [ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3]];
+            std::net::Ipv4Addr::from(octets).to_string()
+        }
+        16 => {
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(ip_bytes);
+            std::net::Ipv6Addr::from(octets).to_string()
+        }
+        _ => format!("{:?}", ip_bytes),
+    }
 }
 
 /// Parses detailed information from an X.509 certificate.
@@ -440,6 +456,25 @@ mod tests {
         assert!(json.contains("SHA-256 with RSA"));
         assert!(json.contains("\"is_valid\":true"));
         assert!(json.contains("\"hostname_verified\":true"));
+    }
+
+    #[test]
+    fn format_ip_san_renders_canonical_addresses() {
+        // IPv4: dotted quad.
+        assert_eq!(format_ip_san(&[192, 168, 0, 1]), "192.168.0.1");
+        // IPv6 ::1 — must be zero-compressed, NOT 0000:0000:...:0001.
+        let mut loopback = [0u8; 16];
+        loopback[15] = 1;
+        assert_eq!(format_ip_san(&loopback), "::1");
+        // A fuller IPv6 address still round-trips through canonical form.
+        // 2001:db8::1
+        let mut addr = [0u8; 16];
+        addr[0] = 0x20;
+        addr[1] = 0x01;
+        addr[2] = 0x0d;
+        addr[3] = 0xb8;
+        addr[15] = 1;
+        assert_eq!(format_ip_san(&addr), "2001:db8::1");
     }
 
     #[test]
