@@ -88,12 +88,16 @@ fn install_panic_hook() {
 async fn run_loop(terminal: &mut Term, domain: Option<String>) -> Result<()> {
     let theme = Theme::frappe();
     let mut app = App::new(domain);
+    // Cancel token for the in-flight live-follow run. Held here (not in the pure
+    // App) because it owns I/O: a new run or a stop signals the old background
+    // DNS loop so restarts don't stack live tasks.
+    let mut follow_cancel: Option<tokio::sync::watch::Sender<bool>> = None;
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Msg>();
     let mut events = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(100));
 
     for action in app.take_startup_actions() {
-        handle_action(action, &tx);
+        handle_action(action, &tx, &mut follow_cancel);
     }
 
     terminal.draw(|f| render::view(f, &app, &theme))?;
@@ -110,7 +114,7 @@ async fn run_loop(terminal: &mut Term, domain: Option<String>) -> Result<()> {
 
         let actions = app.update(msg);
         for action in actions {
-            handle_action(action, &tx);
+            handle_action(action, &tx, &mut follow_cancel);
         }
 
         if app.should_quit {
@@ -122,7 +126,11 @@ async fn run_loop(terminal: &mut Term, domain: Option<String>) -> Result<()> {
 }
 
 /// Execute a side-effecting Action returned by `App::update`.
-fn handle_action(action: Action, tx: &tokio::sync::mpsc::UnboundedSender<Msg>) {
+fn handle_action(
+    action: Action,
+    tx: &tokio::sync::mpsc::UnboundedSender<Msg>,
+    follow_cancel: &mut Option<tokio::sync::watch::Sender<bool>>,
+) {
     match action {
         Action::Quit => {}
         Action::Fetch { req, gen } => {
@@ -193,6 +201,13 @@ fn handle_action(action: Action, tx: &tokio::sync::mpsc::UnboundedSender<Msg>) {
             });
         }
         Action::StartFollow(p) => {
+            // Cancel any prior run so restarts don't stack live DNS loops, then
+            // arm a fresh cancel token for this run.
+            if let Some(prev) = follow_cancel.take() {
+                let _ = prev.send(true);
+            }
+            let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+            *follow_cancel = Some(cancel_tx);
             let tx = tx.clone();
             let gen = p.gen;
             tokio::spawn(async move {
@@ -214,12 +229,19 @@ fn handle_action(action: Action, tx: &tokio::sync::mpsc::UnboundedSender<Msg>) {
                             None,
                             config,
                             Some(cb),
-                            None,
+                            Some(cancel_rx),
                         )
                         .await;
                 }
                 let _ = tx.send(Msg::FollowDone { gen });
             });
+        }
+        Action::StopFollow => {
+            // Signal the in-flight follow's cancel token (if any) so its
+            // background DNS loop stops instead of running to completion.
+            if let Some(prev) = follow_cancel.take() {
+                let _ = prev.send(true);
+            }
         }
         Action::StartBulk(p) => {
             let tx = tx.clone();

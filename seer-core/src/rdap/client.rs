@@ -167,6 +167,8 @@ async fn wait_for_in_flight_load(
 #[derive(Debug, Clone)]
 pub struct RdapClient {
     retry_policy: RetryPolicy,
+    /// Per-request timeout for RDAP queries (default [`DEFAULT_TIMEOUT`]).
+    timeout: Duration,
     /// When true, skips the reserved-IP SSRF validation so tests can target a
     /// 127.0.0.1 wiremock fixture. Not settable outside `#[cfg(test)]` builds
     /// — production requests always validate and pin resolved IPs.
@@ -193,8 +195,15 @@ impl RdapClient {
                 .with_max_attempts(3)
                 .with_initial_delay(Duration::from_millis(500))
                 .with_max_delay(Duration::from_secs(5)),
+            timeout: DEFAULT_TIMEOUT,
             allow_reserved: false,
         }
+    }
+
+    /// Sets the per-request timeout for RDAP queries.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
     }
 
     /// Test-only: allow requests to loopback/reserved addresses (mock servers).
@@ -459,10 +468,15 @@ impl RdapClient {
 
         let cache_guard = BOOTSTRAP_CACHE.read().await;
         let cache = cache_guard.as_ref()?;
+        // IANA bootstrap keys are A-labels (punycode); convert a Unicode TLD
+        // (e.g. "рф" -> "xn--p1ai") so it matches. ASCII TLDs are unchanged;
+        // an un-convertible value falls back to the lowercased input.
+        let lower = tld.to_lowercase();
+        let key = crate::validation::domain_to_ascii(&lower).unwrap_or(lower);
         cache
             .data
             .dns
-            .get(&tld.to_lowercase())
+            .get(&key)
             .and_then(|urls| urls.first())
             .map(|u| u.to_string())
     }
@@ -510,7 +524,7 @@ impl RdapClient {
         let classifier = NetworkRetryClassifier::new();
         let mut attempt = 0;
         loop {
-            match query_rdap_attempt(url, self.allow_reserved).await {
+            match query_rdap_attempt(url, self.timeout, self.allow_reserved).await {
                 Ok(resp) => return Ok(resp),
                 Err((err, retry_after)) => {
                     let attempts_remaining =
@@ -561,6 +575,17 @@ const MAX_RETRY_AFTER: Duration = Duration::from_secs(5);
 async fn validate_url_not_reserved(url: &str) -> Result<Vec<SocketAddr>> {
     let parsed = url::Url::parse(url)
         .map_err(|e| SeerError::RdapError(format!("invalid URL '{}': {}", url, e)))?;
+    // Defense-in-depth: RDAP is HTTPS-only. Enforce the scheme at fetch time so
+    // this guard does not silently depend on the bootstrap's parse-time check.
+    // A plaintext `http://` (downgrade) or any non-https URL — including a
+    // server-supplied link or redirect target ever fed in — must never be
+    // fetched, even when the host resolves to a public address.
+    if parsed.scheme() != "https" {
+        return Err(SeerError::RdapError(format!(
+            "RDAP URL '{}' is not https — request blocked (downgrade/SSRF protection)",
+            url
+        )));
+    }
     let host = parsed
         .host_str()
         .ok_or_else(|| SeerError::RdapError(format!("URL '{}' has no host", url)))?;
@@ -628,11 +653,18 @@ fn effective_retry_delay(backoff: Duration, retry_after: Option<Duration>) -> Du
 /// `allow_reserved` (test seam, see [`RdapClient::allow_reserved`]) skips the
 /// validation and IP pinning so `#[cfg(test)]` mock servers on loopback are
 /// reachable; it is always false on production paths.
-async fn send_rdap_request(url: &str, allow_reserved: bool) -> Result<reqwest::Response> {
+async fn send_rdap_request(
+    url: &str,
+    timeout: Duration,
+    allow_reserved: bool,
+) -> Result<reqwest::Response> {
+    // Keep the connect timeout no larger than the overall request timeout so a
+    // sub-5s configured timeout stays internally consistent.
+    let connect_timeout = CONNECT_TIMEOUT.min(timeout);
     if allow_reserved {
         let client = Client::builder()
-            .timeout(DEFAULT_TIMEOUT)
-            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(timeout)
+            .connect_timeout(connect_timeout)
             .user_agent("Seer/1.0 (RDAP Client)")
             .redirect(reqwest::redirect::Policy::none())
             .build()
@@ -659,8 +691,8 @@ async fn send_rdap_request(url: &str, allow_reserved: bool) -> Result<reqwest::R
     // an IP literal the resolved vec already holds it, so `resolve_to_addrs`
     // is still correct.
     let client = Client::builder()
-        .timeout(DEFAULT_TIMEOUT)
-        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(timeout)
+        .connect_timeout(connect_timeout)
         .user_agent("Seer/1.0 (RDAP Client)")
         .resolve_to_addrs(host, &resolved)
         // SSRF defense: `resolve_to_addrs` pins only THIS host's validated IPs.
@@ -736,9 +768,10 @@ async fn read_and_parse_rdap_body(response: reqwest::Response, url: &str) -> Res
 /// validation and connect).
 async fn query_rdap_attempt(
     url: &str,
+    timeout: Duration,
     allow_reserved: bool,
 ) -> std::result::Result<RdapResponse, (SeerError, Option<Duration>)> {
-    let response = send_rdap_request(url, allow_reserved)
+    let response = send_rdap_request(url, timeout, allow_reserved)
         .await
         .map_err(|e| (e, None))?;
 
@@ -777,7 +810,8 @@ async fn load_bootstrap_data() -> Result<BootstrapData> {
     debug!("Loading RDAP bootstrap data from IANA");
 
     // SSRF validation is skipped here — these are hardcoded IANA URLs, not user input.
-    // User-supplied URLs are still validated in query_rdap_internal().
+    // User-supplied URLs are still validated in send_rdap_request() via
+    // validate_url_not_reserved() (which also enforces the https scheme).
 
     let http = rdap_http_client()?;
 
@@ -799,7 +833,7 @@ async fn load_bootstrap_data() -> Result<BootstrapData> {
         // queries. Without this, a slow or stalled IANA response (open TCP
         // but no bytes arriving) could hang all RDAP lookups indefinitely
         // because `ensure_bootstrap` awaits this future. Mirrors the pattern
-        // in `query_rdap_internal`.
+        // in `read_and_parse_rdap_body`.
         let mut body = Vec::new();
         let mut stream = resp.bytes_stream();
         let streamed = tokio::time::timeout(DEFAULT_TIMEOUT, async {
@@ -1187,6 +1221,21 @@ mod tests {
         assert!(
             matches!(err, SeerError::RdapError(ref s) if s.contains("reserved IP")),
             "expected reserved-IP error, got: {:?}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_validate_url_not_reserved_rejects_non_https_scheme() {
+        // Defense-in-depth (M3): an http:// URL to an otherwise-public host must
+        // be refused at fetch time, independent of bootstrap parse-time
+        // validation. Uses an IP literal so the check is hermetic (no DNS).
+        let err = validate_url_not_reserved("http://93.184.216.34/domain/example.com")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, SeerError::RdapError(ref s) if s.contains("not https")),
+            "expected non-https rejection, got: {:?}",
             err
         );
     }

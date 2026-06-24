@@ -133,6 +133,8 @@ pub enum Action {
         label: String,
     },
     StartFollow(FollowParams),
+    /// Cancel the in-flight live-follow run (its background DNS loop), if any.
+    StopFollow,
     StartBulk(BulkParams),
     /// Trigger a bulk run from a newline-separated domain file (read off-thread in mod.rs).
     StartBulkFromFile {

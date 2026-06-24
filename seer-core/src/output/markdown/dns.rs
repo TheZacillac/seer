@@ -115,15 +115,10 @@ impl MarkdownFormatter {
 
         output.push(format!("- **Total changes**: {}", result.total_changes));
 
+        // Reuse the shared duration formatter rather than re-deriving the
+        // <60 / <3600 / else breakdown (kept identical to the human path).
         let duration = result.ended_at - result.started_at;
-        let total_secs = duration.num_seconds();
-        let duration_str = if total_secs < 60 {
-            format!("{}s", total_secs)
-        } else if total_secs < 3600 {
-            format!("{}m {}s", total_secs / 60, total_secs % 60)
-        } else {
-            format!("{}h {}m", total_secs / 3600, (total_secs % 3600) / 60)
-        };
+        let duration_str = crate::output::human::format_duration(duration);
         output.push(format!("- **Duration**: {}", duration_str));
 
         // Iteration details table
@@ -391,5 +386,36 @@ mod tests {
         let output = formatter.format_dns(&[]);
         assert!(output.contains("No records found"));
         assert!(output.contains("DNSSEC-validated"));
+    }
+
+    #[test]
+    fn markdown_follow_duration_matches_shared_formatter() {
+        use chrono::{Duration, Utc};
+
+        // 125s span → "2m 5s" via the shared helper. The markdown follow
+        // formatter must reuse that exact string (no re-derived breakdown).
+        let started = Utc::now();
+        let ended = started + Duration::seconds(125);
+        let result = FollowResult {
+            domain: "example.com".to_string(),
+            record_type: RecordType::A,
+            nameserver: None,
+            iterations_requested: 1,
+            interval_secs: 0,
+            iterations: Vec::new(),
+            interrupted: false,
+            total_changes: 0,
+            started_at: started,
+            ended_at: ended,
+        };
+
+        let expected = crate::output::human::format_duration(ended - started);
+        assert_eq!(expected, "2m 5s", "sanity: shared formatter output");
+
+        let out = MarkdownFormatter::new().format_follow(&result);
+        assert!(
+            out.contains(&format!("- **Duration**: {}", expected)),
+            "markdown duration must match the shared formatter:\n{out}"
+        );
     }
 }

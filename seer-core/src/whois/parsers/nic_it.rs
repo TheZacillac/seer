@@ -30,7 +30,7 @@ use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use once_cell::sync::Lazy;
 use regex::Regex;
 
-use super::RegistryParser;
+use super::{push_bounded, RegistryParser, MAX_NAMESERVERS, MAX_STATUSES};
 use crate::whois::parser::WhoisResponse;
 
 static DOMAIN_PATTERN: Lazy<Regex> =
@@ -131,9 +131,7 @@ impl RegistryParser for NicItParser {
                 if let Some(caps) = STATUS_PATTERN.captures(trimmed) {
                     if let Some(m) = caps.get(1) {
                         let s = m.as_str().trim().to_string();
-                        if !s.is_empty() && !status.contains(&s) {
-                            status.push(s);
-                        }
+                        push_bounded(&mut status, s, MAX_STATUSES);
                     }
                     current_section = Section::None;
                     continue;
@@ -215,9 +213,7 @@ impl RegistryParser for NicItParser {
             match current_section {
                 Section::Nameservers => {
                     let ns = trimmed.to_lowercase();
-                    if !ns.is_empty() && !nameservers.contains(&ns) {
-                        nameservers.push(ns);
-                    }
+                    push_bounded(&mut nameservers, ns, MAX_NAMESERVERS);
                 }
                 Section::Registrant => {
                     if let Some(val) = extract_indented_field(trimmed, "Organization") {
@@ -289,13 +285,21 @@ impl RegistryParser for NicItParser {
 }
 
 /// Extract a value from an indented "Key: Value" line.
+///
+/// Matches `key` case-insensitively, immediately followed by `:` (no leading
+/// whitespace), then returns the trimmed remainder with original casing.
+///
+/// The value is sliced at the actual `:` separator (always a valid char
+/// boundary) rather than by `key.len()`. `key.len()` is the byte length of the
+/// ASCII key, but `to_lowercase()` is not length-preserving for all Unicode, so
+/// indexing the untrusted original line by it could land off a char boundary
+/// and panic.
 fn extract_indented_field(line: &str, key: &str) -> Option<String> {
-    let lower_line = line.to_lowercase();
-    let lower_key = key.to_lowercase();
-    if lower_line.starts_with(&format!("{}:", lower_key)) {
-        let val = line[key.len() + 1..].trim().to_string();
-        if !val.is_empty() {
-            return Some(val);
+    let (prefix, value) = line.split_once(':')?;
+    if prefix.eq_ignore_ascii_case(key) {
+        let value = value.trim();
+        if !value.is_empty() {
+            return Some(value.to_string());
         }
     }
     None
@@ -422,5 +426,41 @@ Nameservers
     fn test_supported_tlds() {
         let parser = NicItParser::new();
         assert_eq!(parser.supported_tlds(), &["it"]);
+    }
+
+    #[test]
+    fn extract_indented_field_is_char_boundary_safe() {
+        // The old impl sliced the ORIGINAL line by `key.len() + 1`, a length
+        // derived from the ASCII key. WHOIS bodies are untrusted: a multibyte
+        // character whose lowercase form changes byte length (e.g. Turkish İ →
+        // i̇, 2→3 bytes) could make that index land off a char boundary and
+        // panic. The helper must locate the value via the actual `:` separator
+        // (always a valid boundary), preserving the original-case value.
+        //
+        // Multibyte content sitting at and after the byte offset the old code
+        // would have indexed (`"Name".len() + 1` = 5) — must extract cleanly.
+        assert_eq!(
+            extract_indented_field("Name: Köln Über AG", "Name").as_deref(),
+            Some("Köln Über AG")
+        );
+        // A leading multibyte char in the value, right where the old byte index
+        // pointed, must not be split mid-codepoint.
+        assert_eq!(
+            extract_indented_field("Name:Über", "Name").as_deref(),
+            Some("Über")
+        );
+    }
+
+    #[test]
+    fn extract_indented_field_preserves_strict_match_semantics() {
+        // Regression guard: behaviour must match the old `starts_with("key:")`
+        // gate exactly — no leading whitespace, key immediately before colon.
+        assert_eq!(
+            extract_indented_field("Organization: Google LLC", "Organization").as_deref(),
+            Some("Google LLC")
+        );
+        assert_eq!(extract_indented_field("Name:", "Name"), None); // empty value
+        assert_eq!(extract_indented_field("Other: x", "Name"), None); // wrong key
+        assert_eq!(extract_indented_field("Name : x", "Name"), None); // space before colon
     }
 }

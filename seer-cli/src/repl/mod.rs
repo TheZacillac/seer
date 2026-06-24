@@ -122,6 +122,16 @@ impl Repl {
 
         let _ = self.editor.save_history(&history_path);
 
+        // The history file records every queried domain/IP/ASN. Restrict it to
+        // the owner (0600), mirroring the posture of the ~/.seer/* state files
+        // (history.rs / watchlist.rs); it lives at ~/.seer_history, outside the
+        // 0700 ~/.seer dir, so the directory mode does not protect it.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&history_path, std::fs::Permissions::from_mode(0o600));
+        }
+
         Ok(())
     }
 

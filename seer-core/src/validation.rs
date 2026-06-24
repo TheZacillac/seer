@@ -16,7 +16,7 @@ static DOMAIN_ALLOWLIST: Lazy<Option<HashSet<String>>> = Lazy::new(|| {
     let set: HashSet<String> = std::env::var("SEER_DOMAIN_ALLOWLIST")
         .ok()?
         .split(',')
-        .map(|s| s.trim().to_lowercase())
+        .map(normalize_allowlist_entry)
         .filter(|s| !s.is_empty())
         .collect();
 
@@ -26,6 +26,20 @@ static DOMAIN_ALLOWLIST: Lazy<Option<HashSet<String>>> = Lazy::new(|| {
         Some(set)
     }
 });
+
+/// Normalizes a single allowlist entry: trims, lowercases, and converts an IDN
+/// entry to its ASCII A-label. This must mirror the IDN handling in
+/// [`normalize_domain`] so an internationalized entry matches the punycode form
+/// that queries are normalized to (an entry that fails IDN conversion is kept
+/// as-is and simply won't match).
+fn normalize_allowlist_entry(entry: &str) -> String {
+    let lowered = entry.trim().to_lowercase();
+    if lowered.is_ascii() {
+        lowered
+    } else {
+        domain_to_ascii(&lowered).unwrap_or(lowered)
+    }
+}
 
 /// Normalizes and validates a domain name.
 ///
@@ -156,7 +170,7 @@ fn domain_matches_allowlist(domain: &str, allowlist: &HashSet<String>) -> bool {
 }
 
 /// Converts an internationalized domain name to ASCII (Punycode).
-fn domain_to_ascii(domain: &str) -> Result<String> {
+pub(crate) fn domain_to_ascii(domain: &str) -> Result<String> {
     idna::domain_to_ascii(domain).map_err(|_| {
         SeerError::InvalidDomain(format!("invalid internationalized domain: {}", domain))
     })
@@ -246,6 +260,9 @@ pub fn describe_reserved_ip(ip: &IpAddr) -> Option<&'static str> {
             if (seg[0] & 0xffc0) == 0xfe80 {
                 return Some("IPv6 link-local address (fe80::/10)");
             }
+            if (seg[0] & 0xffc0) == 0xfec0 {
+                return Some("IPv6 site-local address (fec0::/10)");
+            }
             if seg[0] >> 8 == 0xff {
                 return Some("IPv6 multicast (ff00::/8)");
             }
@@ -268,6 +285,22 @@ pub fn describe_reserved_ip(ip: &IpAddr) -> Option<&'static str> {
 mod tests {
     use super::*;
     use std::net::Ipv6Addr;
+
+    #[test]
+    fn allowlist_entry_idn_is_punycoded() {
+        // IDN allowlist entries are converted to their A-label so they match
+        // the punycode query produced by `normalize_domain`.
+        assert_eq!(normalize_allowlist_entry("münchen.de"), "xn--mnchen-3ya.de");
+        assert_eq!(normalize_allowlist_entry(" Example.COM "), "example.com");
+    }
+
+    #[test]
+    fn allowlist_matches_idn_after_normalization() {
+        let mut set = std::collections::HashSet::new();
+        set.insert(normalize_allowlist_entry("münchen.de"));
+        // `normalize_domain("münchen.de")` yields the A-label below.
+        assert!(domain_matches_allowlist("xn--mnchen-3ya.de", &set));
+    }
 
     #[test]
     fn test_normalize_domain() {

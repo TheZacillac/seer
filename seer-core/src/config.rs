@@ -121,6 +121,9 @@ impl SeerConfig {
     /// http 1–120s.
     fn clamped(mut self) -> Self {
         self.bulk.concurrency = self.bulk.concurrency.clamp(1, 50);
+        // A multi-day per-operation delay would stall bulk runs indefinitely;
+        // cap at 60s (0 is valid — no inter-operation delay).
+        self.bulk.rate_limit_ms = self.bulk.rate_limit_ms.min(60_000);
         self.timeouts.whois_secs = self.timeouts.whois_secs.clamp(1, 300);
         self.timeouts.rdap_secs = self.timeouts.rdap_secs.clamp(1, 300);
         self.timeouts.dns_secs = self.timeouts.dns_secs.clamp(1, 60);
@@ -146,6 +149,11 @@ impl SeerConfig {
     /// Returns the HTTP timeout as a Duration.
     pub fn http_timeout(&self) -> Duration {
         Duration::from_secs(self.timeouts.http_secs)
+    }
+
+    /// Returns the inter-operation bulk rate-limit delay as a Duration.
+    pub fn bulk_rate_limit(&self) -> Duration {
+        Duration::from_millis(self.bulk.rate_limit_ms)
     }
 
     /// Generates a default config file content as TOML.
@@ -204,5 +212,15 @@ concurrency = 20
         assert_eq!(config.rdap_timeout(), Duration::from_secs(15));
         assert_eq!(config.dns_timeout(), Duration::from_secs(5));
         assert_eq!(config.http_timeout(), Duration::from_secs(10));
+    }
+
+    #[test]
+    fn clamp_bounds_rate_limit_ms() {
+        // An unbounded rate-limit delay (once wired into the bulk executor)
+        // would stall every operation for the configured duration; clamp it.
+        let mut config = SeerConfig::default();
+        config.bulk.rate_limit_ms = 10_000_000;
+        let config = config.clamped();
+        assert!(config.bulk.rate_limit_ms <= 60_000);
     }
 }

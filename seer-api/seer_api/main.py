@@ -251,12 +251,15 @@ app = FastAPI(
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-# Add request logging middleware
-app.add_middleware(RequestLoggingMiddleware)
-
 # Body size cap — reject oversized payloads with 413 before they hit
 # any router. Default 64KB is generous for a 100-domain bulk request
 # (see middleware.DEFAULT_MAX_BODY_BYTES). M6.
+#
+# RequestLoggingMiddleware is intentionally registered LATER (just before
+# CORS) so it wraps both this body-size cap and auth_middleware. Starlette
+# runs the most-recently-added middleware first, so registering logging here
+# (innermost) would let the 413/401/403/429 short-circuits from the outer
+# middlewares bypass it — they would never be logged or counted in /metrics.
 app.add_middleware(MaxBodySizeMiddleware, max_bytes=64 * 1024)
 
 
@@ -342,6 +345,22 @@ else:
     # Development mode: allow all origins but disable credentials
     allowed_origins = ["*"]
     allow_credentials = False
+
+# Request logging / metrics middleware. Registered here — AFTER
+# auth_middleware and MaxBodySizeMiddleware, but BEFORE CORS below — so it
+# wraps the auth + body-size + /mcp-guard logic. Starlette runs the
+# most-recently-added middleware first, so this becomes the OUTERMOST
+# application middleware just inside CORS. The resolved order is therefore:
+#
+#   CORS -> RequestLogging -> auth -> body-size -> route
+#
+# which means the short-circuit rejections that never reach a route handler
+# — the 401 from auth, the 413 from the body-size cap, and the /mcp 403/429
+# guards — all flow back out through RequestLogging and are logged + counted
+# in /metrics (previously they were registered innermost and were silently
+# unobservable). CORS stays outermost so it can annotate those error
+# responses with Access-Control-Allow-Origin headers.
+app.add_middleware(RequestLoggingMiddleware)
 
 app.add_middleware(
     CORSMiddleware,

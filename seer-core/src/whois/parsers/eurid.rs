@@ -26,7 +26,7 @@
 use once_cell::sync::Lazy;
 use regex::Regex;
 
-use super::RegistryParser;
+use super::{push_bounded, RegistryParser, MAX_NAMESERVERS};
 use crate::whois::parser::WhoisResponse;
 
 static REGISTRANT_SECTION: Lazy<Regex> =
@@ -126,9 +126,7 @@ impl RegistryParser for EuridParser {
                             .next()
                             .unwrap_or(trimmed)
                             .to_lowercase();
-                        if !ns.is_empty() && !nameservers.contains(&ns) {
-                            nameservers.push(ns);
-                        }
+                        push_bounded(&mut nameservers, ns, MAX_NAMESERVERS);
                     }
                     Section::Registrar => {
                         if let Some(val) = extract_field(trimmed, "Name") {
@@ -193,13 +191,22 @@ impl RegistryParser for EuridParser {
     }
 }
 
+/// Extract a value from a `Key: Value` line.
+///
+/// Matches `key` case-insensitively, immediately followed by `:`, then returns
+/// the trimmed remainder with original casing.
+///
+/// The value is sliced at the actual `:` separator (always a valid char
+/// boundary) rather than by `key.len()`. `key.len()` is the byte length of the
+/// ASCII key, but `to_lowercase()` is not length-preserving for all Unicode, so
+/// indexing the untrusted original line by it could land off a char boundary
+/// and panic.
 fn extract_field(line: &str, key: &str) -> Option<String> {
-    let lower_line = line.to_lowercase();
-    let lower_key = format!("{}:", key.to_lowercase());
-    if lower_line.starts_with(&lower_key) {
-        let val = line[key.len() + 1..].trim().to_string();
-        if !val.is_empty() {
-            return Some(val);
+    let (prefix, value) = line.split_once(':')?;
+    if prefix.eq_ignore_ascii_case(key) {
+        let value = value.trim();
+        if !value.is_empty() {
+            return Some(value.to_string());
         }
     }
     None
@@ -321,5 +328,35 @@ Please visit www.eurid.eu for more info."#;
     fn test_supported_tlds() {
         let parser = EuridParser::new();
         assert_eq!(parser.supported_tlds(), &["eu"]);
+    }
+
+    #[test]
+    fn extract_field_is_char_boundary_safe() {
+        // WHOIS bodies are untrusted. The old impl sliced the ORIGINAL line by
+        // `key.len() + 1`, derived from the lowercased copy; `to_lowercase()` is
+        // not length-preserving for all Unicode (e.g. Turkish İ → i̇, 2→3
+        // bytes), so that index could fall off a char boundary and panic. The
+        // value must come from the actual `:` separator (always a boundary) and
+        // keep its original casing, including multibyte content.
+        assert_eq!(
+            extract_field("Name: Müller & Söhne KG", "Name").as_deref(),
+            Some("Müller & Söhne KG")
+        );
+        assert_eq!(
+            extract_field("Website:Ünïcode", "Website").as_deref(),
+            Some("Ünïcode")
+        );
+    }
+
+    #[test]
+    fn extract_field_preserves_strict_match_semantics() {
+        // Regression guard: matches the old `starts_with("key:")` gate exactly.
+        assert_eq!(
+            extract_field("Website: https://example.eu", "Website").as_deref(),
+            Some("https://example.eu")
+        );
+        assert_eq!(extract_field("Name:", "Name"), None); // empty value
+        assert_eq!(extract_field("Other: x", "Name"), None); // wrong key
+        assert_eq!(extract_field("Name : x", "Name"), None); // space before colon
     }
 }

@@ -60,12 +60,18 @@ async def guard_async(host: str, port: int = 443) -> None:
 
 
 async def guard_hosts_async(hosts: list[tuple[str, int]]) -> None:
-    """Run :func:`guard_async` against every (host, port) pair.
+    """Run :func:`guard_async` against every (host, port) pair concurrently.
 
     Used by bulk endpoints to validate every user-supplied domain before
-    dispatching the work to the Rust core. Preserves per-host error
-    granularity: the first offending host raises HTTPException(400) and
-    the bulk call short-circuits.
+    dispatching the work to the Rust core. A bulk request can carry up to 100
+    hosts; awaiting each guard in sequence would serialize up to 100 blocking
+    DNS resolutions before any work starts. ``asyncio.gather`` fans them out
+    onto the executor at once.
+
+    Error contract is preserved: ``gather`` re-raises the first exception it
+    observes, so an offending host still raises ``HTTPException(400)`` and the
+    bulk call short-circuits. (Ordering of *which* offending host is reported
+    is no longer strictly first-in-list, but the exception class and status
+    code are identical.)
     """
-    for host, port in hosts:
-        await guard_async(host, port)
+    await asyncio.gather(*(guard_async(host, port) for host, port in hosts))

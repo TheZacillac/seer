@@ -111,31 +111,20 @@ impl DnsComparator {
             }
         };
 
-        // Compare record values using format_short for comparison
-        let values_a: std::collections::HashSet<String> = server_a_result
-            .records
-            .iter()
-            .map(|r| r.format_short())
-            .collect();
-        let values_b: std::collections::HashSet<String> = server_b_result
-            .records
-            .iter()
-            .map(|r| r.format_short())
-            .collect();
+        // Compare record values case-insensitively. Two servers returning the
+        // same record with different casing (common with 0x20 query-name
+        // randomization, e.g. `NS1.EXAMPLE.COM.` vs `ns1.example.com.`) must be
+        // treated as equal, not a spurious mismatch.
+        let (values_equal, only_in_a, only_in_b) =
+            compare_server_values(&server_a_result, &server_b_result);
 
-        let mut only_in_a: Vec<String> = values_a.difference(&values_b).cloned().collect();
-        let mut only_in_b: Vec<String> = values_b.difference(&values_a).cloned().collect();
-        let mut common: Vec<String> = values_a.intersection(&values_b).cloned().collect();
-
-        // Sort for deterministic output
-        only_in_a.sort();
-        only_in_b.sort();
+        // `common` is informational; build it case-insensitively too but emit
+        // the original-cased values from server A for display.
+        let mut common = case_insensitive_common(&server_a_result, &server_b_result);
         common.sort();
 
-        let matches = only_in_a.is_empty()
-            && only_in_b.is_empty()
-            && server_a_result.error.is_none()
-            && server_b_result.error.is_none();
+        let matches =
+            values_equal && server_a_result.error.is_none() && server_b_result.error.is_none();
 
         debug!(
             matches = matches,
@@ -156,6 +145,65 @@ impl DnsComparator {
             common,
         })
     }
+}
+
+/// Compares the record sets of two servers case-insensitively, returning
+/// `(values_equal, only_in_a, only_in_b)`. Each `only_in_*` entry is the
+/// original-cased `format_short()` value so display preserves what the server
+/// actually returned, but membership is decided on the lowercased key.
+fn compare_server_values(a: &ServerResult, b: &ServerResult) -> (bool, Vec<String>, Vec<String>) {
+    use std::collections::HashSet;
+
+    let keys_a: HashSet<String> = a
+        .records
+        .iter()
+        .map(|r| r.format_short().to_ascii_lowercase())
+        .collect();
+    let keys_b: HashSet<String> = b
+        .records
+        .iter()
+        .map(|r| r.format_short().to_ascii_lowercase())
+        .collect();
+
+    let mut only_in_a: Vec<String> = a
+        .records
+        .iter()
+        .filter(|r| !keys_b.contains(&r.format_short().to_ascii_lowercase()))
+        .map(|r| r.format_short())
+        .collect();
+    let mut only_in_b: Vec<String> = b
+        .records
+        .iter()
+        .filter(|r| !keys_a.contains(&r.format_short().to_ascii_lowercase()))
+        .map(|r| r.format_short())
+        .collect();
+    only_in_a.sort();
+    only_in_a.dedup();
+    only_in_b.sort();
+    only_in_b.dedup();
+
+    let values_equal = only_in_a.is_empty() && only_in_b.is_empty();
+    (values_equal, only_in_a, only_in_b)
+}
+
+/// Returns the values present (case-insensitively) on both servers, emitting
+/// server A's original casing for each shared value.
+fn case_insensitive_common(a: &ServerResult, b: &ServerResult) -> Vec<String> {
+    use std::collections::HashSet;
+    let keys_b: HashSet<String> = b
+        .records
+        .iter()
+        .map(|r| r.format_short().to_ascii_lowercase())
+        .collect();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut common = Vec::new();
+    for r in &a.records {
+        let key = r.format_short().to_ascii_lowercase();
+        if keys_b.contains(&key) && seen.insert(key) {
+            common.push(r.format_short());
+        }
+    }
+    common
 }
 
 #[cfg(test)]
@@ -214,5 +262,48 @@ mod tests {
 
         let json = serde_json::to_string(&result).unwrap();
         assert!(json.contains("connection timed out"));
+    }
+
+    /// Two servers returning the same NS record with different casing (common
+    /// with 0x20 query-name randomization) must be treated as a match, not a
+    /// mismatch. The comparison key is case-folded so `NS1.EXAMPLE.COM.` and
+    /// `ns1.example.com.` are equal.
+    #[test]
+    fn compare_values_case_insensitive_match() {
+        let upper = ServerResult {
+            nameserver: "8.8.8.8".to_string(),
+            records: vec![DnsRecord {
+                name: "example.com".to_string(),
+                record_type: RecordType::NS,
+                ttl: 300,
+                data: RecordData::NS {
+                    nameserver: "NS1.EXAMPLE.COM.".to_string(),
+                },
+            }],
+            error: None,
+        };
+        let lower = ServerResult {
+            nameserver: "1.1.1.1".to_string(),
+            records: vec![DnsRecord {
+                name: "example.com".to_string(),
+                record_type: RecordType::NS,
+                ttl: 300,
+                data: RecordData::NS {
+                    nameserver: "ns1.example.com.".to_string(),
+                },
+            }],
+            error: None,
+        };
+
+        let (matches, only_in_a, only_in_b) = compare_server_values(&upper, &lower);
+        assert!(matches, "case-only difference must be a match");
+        assert!(
+            only_in_a.is_empty(),
+            "no records unique to A: {only_in_a:?}"
+        );
+        assert!(
+            only_in_b.is_empty(),
+            "no records unique to B: {only_in_b:?}"
+        );
     }
 }

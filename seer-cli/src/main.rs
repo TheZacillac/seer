@@ -110,9 +110,10 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 
-    /// Output format (human, json, yaml, or markdown)
-    #[arg(short, long, default_value = "human")]
-    format: String,
+    /// Output format (human, json, yaml, or markdown).
+    /// Defaults to the config file's `output_format`, or "human".
+    #[arg(short, long)]
+    format: Option<String>,
 
     /// Quiet mode - suppress headers and formatting, output raw values only
     #[arg(short, long)]
@@ -325,22 +326,33 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
-    // Use config file default when --format is not explicitly provided
-    let output_format: seer_core::output::OutputFormat = if cli.format == "human" {
-        // Could be explicit or default; check config for a different preference
-        let config = seer_core::SeerConfig::load();
-        config.output_format.parse().unwrap_or_default()
-    } else {
-        cli.format.parse().unwrap_or_default()
-    };
+    // Load the user config once: it provides the default output format plus the
+    // per-protocol timeouts, nameserver, and bulk settings threaded into the
+    // command handlers below.
+    let config = seer_core::SeerConfig::load();
+    let output_format = resolve_output_format(cli.format.as_deref(), &config.output_format);
 
     match cli.command {
-        Some(cmd) => execute_command(cmd, output_format, cli.quiet, cli.fields).await,
+        Some(cmd) => execute_command(cmd, output_format, cli.quiet, cli.fields, &config).await,
         None => {
             // Start interactive REPL
             let mut repl = repl::Repl::new()?;
             repl.run().await
         }
+    }
+}
+
+/// Resolves the effective output format. An explicit `--format` flag always
+/// wins; otherwise the config file's `output_format` applies; otherwise the
+/// `Default`. An unparseable value falls back to the `Default` (matching the
+/// prior lenient behavior).
+fn resolve_output_format(
+    cli_format: Option<&str>,
+    config_format: &str,
+) -> seer_core::output::OutputFormat {
+    match cli_format {
+        Some(f) => f.parse().unwrap_or_default(),
+        None => config_format.parse().unwrap_or_default(),
     }
 }
 
@@ -413,6 +425,7 @@ async fn execute_command(
     output_format: seer_core::output::OutputFormat,
     quiet: bool,
     fields: Option<Vec<String>>,
+    config: &seer_core::SeerConfig,
 ) -> anyhow::Result<()> {
     let formatter = seer_core::output::get_formatter(output_format);
 
@@ -429,7 +442,7 @@ async fn execute_command(
                 spinner_clone.set_message(message);
             });
 
-            let lookup = seer_core::SmartLookup::new();
+            let lookup = seer_core::SmartLookup::from_config(config);
             match lookup.lookup_with_progress(&domain, Some(progress)).await {
                 Ok(result) => {
                     spinner.finish();
@@ -462,7 +475,7 @@ async fn execute_command(
                 domain
             )));
 
-            let lookup = seer_core::SmartLookup::new();
+            let lookup = seer_core::SmartLookup::from_config(config);
             match lookup.lookup(&domain).await {
                 Ok(result) => {
                     spinner.finish();
@@ -480,7 +493,7 @@ async fn execute_command(
             }
         }
         Commands::Whois { domain } => {
-            let client = seer_core::WhoisClient::new();
+            let client = seer_core::WhoisClient::new().with_timeout(config.whois_timeout());
             match client.lookup(&domain).await {
                 Ok(response) => {
                     if quiet {
@@ -495,7 +508,7 @@ async fn execute_command(
             }
         }
         Commands::Rdap { query } => {
-            let client = seer_core::RdapClient::new();
+            let client = seer_core::RdapClient::new().with_timeout(config.rdap_timeout());
             // Use seer_core::rdap::auto_lookup so the `AS<digits>` route only
             // fires when the remainder is all digits AND the query contains no
             // `.` — otherwise `as1234.io` / `asset.io` would misroute to ASN
@@ -520,9 +533,12 @@ async fn execute_command(
             record_type,
             server,
         } => {
-            let resolver = seer_core::DnsResolver::new();
+            let resolver = seer_core::DnsResolver::new().with_timeout(config.dns_timeout());
             let rt: seer_core::RecordType = record_type.parse()?;
-            let ns = server.as_ref().map(|s| s.trim_start_matches('@'));
+            let ns = server
+                .as_ref()
+                .map(|s| s.trim_start_matches('@'))
+                .or(config.nameserver.as_deref());
 
             match resolver.resolve(&domain, rt, ns).await {
                 Ok(records) => {
@@ -613,7 +629,9 @@ async fn execute_command(
             });
 
             let rt: seer_core::RecordType = record_type.parse().unwrap_or(seer_core::RecordType::A);
-            let executor = seer_core::BulkExecutor::new();
+            let executor = seer_core::BulkExecutor::new()
+                .with_concurrency(config.bulk.concurrency)
+                .with_rate_limit(config.bulk_rate_limit());
 
             println!(
                 "Processing {} domains with {} operation...",
@@ -758,7 +776,7 @@ async fn execute_command(
             );
         }
         Commands::Status { domain } => {
-            let client = seer_core::StatusClient::new();
+            let client = seer_core::StatusClient::new().with_timeout(config.http_timeout());
             match client.check(&domain).await {
                 Ok(response) => {
                     if quiet {
@@ -788,7 +806,7 @@ async fn execute_command(
             }
         }
         Commands::Reverse { ip } => {
-            let resolver = seer_core::DnsResolver::new();
+            let resolver = seer_core::DnsResolver::new().with_timeout(config.dns_timeout());
             match resolver
                 .resolve(&ip, seer_core::RecordType::PTR, None)
                 .await
@@ -806,7 +824,7 @@ async fn execute_command(
             }
         }
         Commands::Avail { domain } => {
-            let checker = seer_core::AvailabilityChecker::new();
+            let checker = seer_core::AvailabilityChecker::from_config(config);
             match checker.check(&domain).await {
                 Ok(result) => {
                     if quiet {
@@ -903,7 +921,10 @@ async fn execute_command(
             changes_only,
         } => {
             let rt: seer_core::RecordType = record_type.parse()?;
-            let ns = server.as_ref().map(|s| s.trim_start_matches('@'));
+            let ns = server
+                .as_ref()
+                .map(|s| s.trim_start_matches('@'))
+                .or(config.nameserver.as_deref());
 
             let config = match seer_core::FollowConfig::new(iterations, interval_minutes) {
                 Ok(cfg) => cfg.with_changes_only(changes_only),
@@ -1008,7 +1029,7 @@ async fn execute_command(
             }
         }
         Commands::Ssl { domain } => {
-            let checker = seer_core::SslChecker::new();
+            let checker = seer_core::SslChecker::new().with_timeout(config.http_timeout());
             match checker.check(&domain).await {
                 Ok(report) => {
                     if quiet && handle_quiet_output(&report, &fields) {
@@ -1315,6 +1336,48 @@ mod progress_mode_tests {
         assert_eq!(
             resolve_progress_mode(None, true, "json"),
             ProgressMode::None
+        );
+    }
+
+    #[test]
+    fn explicit_format_flag_overrides_config_default() {
+        use seer_core::output::OutputFormat;
+        // An explicit `--format human` must win even when the config default
+        // is non-human — the previous code re-read config in that case and
+        // silently ignored the flag.
+        assert_eq!(
+            super::resolve_output_format(Some("human"), "json"),
+            OutputFormat::Human
+        );
+        assert_eq!(
+            super::resolve_output_format(Some("json"), "human"),
+            OutputFormat::Json
+        );
+    }
+
+    #[test]
+    fn format_falls_back_to_config_when_flag_absent() {
+        use seer_core::output::OutputFormat;
+        assert_eq!(
+            super::resolve_output_format(None, "yaml"),
+            OutputFormat::Yaml
+        );
+        assert_eq!(
+            super::resolve_output_format(None, "json"),
+            OutputFormat::Json
+        );
+    }
+
+    #[test]
+    fn format_defaults_when_unset_or_invalid() {
+        use seer_core::output::OutputFormat;
+        assert_eq!(
+            super::resolve_output_format(None, ""),
+            OutputFormat::default()
+        );
+        assert_eq!(
+            super::resolve_output_format(Some("bogus"), "json"),
+            OutputFormat::default()
         );
     }
 }

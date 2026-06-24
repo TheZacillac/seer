@@ -20,7 +20,7 @@ use chrono::{DateTime, NaiveDateTime, Utc};
 use once_cell::sync::Lazy;
 use regex::Regex;
 
-use super::RegistryParser;
+use super::{push_bounded, RegistryParser, MAX_NAMESERVERS, MAX_STATUSES};
 use crate::whois::parser::WhoisResponse;
 
 /// Matches nameserver lines: `p. [ネームサーバ]   value`
@@ -107,9 +107,7 @@ impl RegistryParser for JprsParser {
         for caps in NS_PATTERN.captures_iter(raw) {
             if let Some(m) = caps.get(1) {
                 let ns = m.as_str().trim().to_lowercase();
-                if !ns.is_empty() && !nameservers.contains(&ns) {
-                    nameservers.push(ns);
-                }
+                push_bounded(&mut nameservers, ns, MAX_NAMESERVERS);
             }
         }
 
@@ -119,9 +117,7 @@ impl RegistryParser for JprsParser {
             for caps in NS_EN_PATTERN.captures_iter(raw) {
                 if let Some(m) = caps.get(1) {
                     let ns = m.as_str().trim().to_lowercase();
-                    if !ns.is_empty() && !nameservers.contains(&ns) {
-                        nameservers.push(ns);
-                    }
+                    push_bounded(&mut nameservers, ns, MAX_NAMESERVERS);
                 }
             }
         }
@@ -150,9 +146,7 @@ impl RegistryParser for JprsParser {
         if let Some(caps) = STATUS_PATTERN.captures(raw) {
             if let Some(m) = caps.get(1) {
                 let s = m.as_str().trim().to_string();
-                if !s.is_empty() {
-                    status.push(s);
-                }
+                push_bounded(&mut status, s, MAX_STATUSES);
             }
         }
 

@@ -47,7 +47,11 @@ pub(super) fn sanitize_display(s: &str) -> String {
         .collect()
 }
 
-pub(super) fn format_duration(duration: TimeDelta) -> String {
+/// Formats a [`TimeDelta`] as a compact human duration (`Ns` / `Nm Ns` /
+/// `Nh Nm`). Shared across the human and markdown formatters — `pub(crate)` so
+/// the markdown follow formatter can reuse it instead of duplicating the
+/// breakdown.
+pub(crate) fn format_duration(duration: TimeDelta) -> String {
     let total_secs = duration.num_seconds();
     if total_secs < 60 {
         format!("{}s", total_secs)

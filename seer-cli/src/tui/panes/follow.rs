@@ -72,10 +72,11 @@ impl FollowState {
             KeyCode::Char('i') => Some(PaneOutcome::EditField(EditTarget::FollowInterval)),
             // 'n' — edit iteration count
             KeyCode::Char('n') => Some(PaneOutcome::EditField(EditTarget::FollowCount)),
-            // 'x' — stop showing as running (in-flight task is not cancelled)
+            // 'x' — stop the run: clear the running flag AND cancel the
+            // in-flight background DNS loop (StopFollow signals its cancel token).
             KeyCode::Char('x') => {
                 self.running = false;
-                Some(PaneOutcome::None)
+                Some(PaneOutcome::Action(Action::StopFollow))
             }
             // Esc and everything else → fall through
             _ => None,
@@ -154,12 +155,16 @@ mod tests {
     }
 
     #[test]
-    fn x_stops_running() {
+    fn x_stops_running_and_cancels_follow() {
         let mut s = FollowState::default();
         s.running = true;
         let outcome = s.handle_key(key(KeyCode::Char('x')), None);
         assert!(!s.running);
-        assert!(matches!(outcome, Some(PaneOutcome::None)));
+        // 'x' now also cancels the in-flight background follow loop.
+        assert!(matches!(
+            outcome,
+            Some(PaneOutcome::Action(Action::StopFollow))
+        ));
     }
 
     #[test]

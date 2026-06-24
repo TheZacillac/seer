@@ -146,39 +146,51 @@ fn should_route_to_availability(
     })
 }
 
-/// Decides whether a thin WHOIS leg should be reclassified as "available" on
-/// the strength of a DNS NXDOMAIN. Pure so the veto rules are unit-tested
-/// without a resolver.
-///
-/// Routes to availability only when ALL hold:
-/// * the WHOIS body was thin — no registrar/dates (`is_thin`),
-/// * RDAP did NOT return an HTTP 200 (`rdap_returned_200` is false) — a 200,
-///   even with a thin body, proves the domain object exists, and
-/// * the apex has no DNS presence ([`DnsPresence::Absent`] / NXDOMAIN).
-fn nxdomain_confirms_available(is_thin: bool, rdap_returned_200: bool, dns: DnsPresence) -> bool {
-    is_thin && !rdap_returned_200 && matches!(dns, DnsPresence::Absent)
+/// Verdict for the "thin WHOIS leg + non-200 RDAP failure" fallback block in
+/// [`SmartLookup::lookup_concurrent`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThinFallback {
+    /// The registry refused/throttled the query — no usable registration
+    /// signal. Report inconclusive rather than guessing.
+    Inconclusive,
+    /// Thin WHOIS, RDAP not 200, apex is NXDOMAIN — likely available.
+    Available,
+    /// Thin/no-service WHOIS, RDAP unavailable, apex IS delegated — registered.
+    Registered,
+    /// Preconditions not met — keep the existing [`LookupResult::Whois`].
+    UseWhois,
 }
 
-/// Symmetric counterpart to [`nxdomain_confirms_available`]: decides whether a
-/// thin / no-service WHOIS leg plus an RDAP failure should be reported as
-/// *registered* on the strength of a positive DNS delegation.
+/// Pure decision for the thin-WHOIS fallback block. Encodes the same issue-#45
+/// precedence as [`crate::availability::decide_fallback`] so the smart-lookup
+/// hot path and the dedicated availability path cannot diverge: a registry that
+/// *refused/throttled* the query (rather than authoritatively answering) is
+/// inconclusive and must NOT be inverted into "available" or fail-safed to
+/// "registered" on the strength of DNS presence.
 ///
-/// Routes to "registered" only when ALL hold:
-/// * the WHOIS body was thin — no registrar/dates (`is_thin`),
-/// * RDAP did NOT return an HTTP 200 (`rdap_returned_200` is false), and
-/// * the apex IS delegated in DNS ([`DnsPresence::Present`] — has NS records).
-///
-/// This prevents emitting an empty [`LookupResult::Whois`] for a domain that is
-/// provably registered when the registry offers no usable WHOIS (e.g. Identity
-/// Digital RDAP-only TLDs like `.email`) and RDAP was throttled or
-/// grace-truncated. `DnsPresence::Unknown` deliberately does not qualify — a
-/// failed DNS probe is not positive evidence of registration.
-fn dns_present_confirms_registered(
+/// `whois_refuses` is [`crate::whois::WhoisResponse::indicates_registry_refusal`]
+/// precomputed by the caller. Routes are only considered when the WHOIS body was
+/// thin (no registrar/dates) and RDAP did NOT return an HTTP 200 — a 200, even
+/// with a thin body, proves the domain object exists and vetoes every
+/// DNS-derived reclassification. [`DnsPresence::Unknown`] (a failed probe) is not
+/// positive evidence either way, so it falls through to WHOIS.
+fn classify_thin_fallback(
     is_thin: bool,
     rdap_returned_200: bool,
+    whois_refuses: bool,
     dns: DnsPresence,
-) -> bool {
-    is_thin && !rdap_returned_200 && matches!(dns, DnsPresence::Present)
+) -> ThinFallback {
+    if !is_thin || rdap_returned_200 {
+        return ThinFallback::UseWhois;
+    }
+    if whois_refuses {
+        return ThinFallback::Inconclusive;
+    }
+    match dns {
+        DnsPresence::Absent => ThinFallback::Available,
+        DnsPresence::Present => ThinFallback::Registered,
+        DnsPresence::Unknown => ThinFallback::UseWhois,
+    }
 }
 
 /// Sanitizes an error message for inclusion in a public-facing response.
@@ -445,6 +457,19 @@ impl SmartLookup {
             whois_client: WhoisClient::new(),
             availability_checker: AvailabilityChecker::new(),
             dns_resolver: DnsResolver::new(),
+            prefer_rdap: true,
+            include_fallback: false,
+        }
+    }
+
+    /// Builds a SmartLookup whose RDAP/WHOIS/DNS sub-clients honor the
+    /// per-protocol timeouts in `config`.
+    pub fn from_config(config: &crate::config::SeerConfig) -> Self {
+        Self {
+            rdap_client: RdapClient::new().with_timeout(config.rdap_timeout()),
+            whois_client: WhoisClient::new().with_timeout(config.whois_timeout()),
+            availability_checker: AvailabilityChecker::from_config(config),
+            dns_resolver: DnsResolver::new().with_timeout(config.dns_timeout()),
             prefer_rdap: true,
             include_fallback: false,
         }
@@ -740,72 +765,104 @@ impl SmartLookup {
                 });
             }
 
-            // Fix #2 safety net: a thin WHOIS body plus an RDAP failure that
-            // was not an authoritative 404 leaves us without registry data.
-            // If the apex also has no DNS presence (NXDOMAIN), reclassify as
-            // likely-available rather than emitting an empty WHOIS record. The
-            // cheap thin / not-200 preconditions gate the DNS probe so we
-            // don't pay for it on the common paths.
+            // Fix #2 safety net: a thin WHOIS body plus an RDAP failure that was
+            // not an authoritative 404 leaves us without registry data. Route the
+            // verdict through `classify_thin_fallback`, which shares the issue-#45
+            // precedence with `availability::decide_fallback` so the two fallback
+            // paths cannot diverge: a registry refusal/throttle is inconclusive
+            // (never inverted into "available" or fail-safed to "registered");
+            // otherwise an NXDOMAIN apex reads as available and a delegated apex
+            // reads as registered. The cheap thin / not-200 preconditions gate the
+            // DNS probe so we don't pay for it on the common paths, and a refusal
+            // short-circuits before the probe entirely.
             let whois_is_thin = whois_response_is_thin(&whois_data);
             if whois_is_thin && !rdap_returned_200 {
-                let dns_presence = self.dns_resolver.presence(domain).await;
-                if nxdomain_confirms_available(whois_is_thin, rdap_returned_200, dns_presence) {
-                    debug!(domain = %domain, "Thin WHOIS + NXDOMAIN, reclassifying as available");
-                    if let Some(ref cb) = progress {
-                        cb("Domain appears unregistered (no DNS presence)");
+                let whois_refuses = whois_data.indicates_registry_refusal();
+                let dns_presence = if whois_refuses {
+                    // A refusal already settles the verdict; skip the DNS probe.
+                    DnsPresence::Unknown
+                } else {
+                    self.dns_resolver.presence(domain).await
+                };
+                match classify_thin_fallback(
+                    whois_is_thin,
+                    rdap_returned_200,
+                    whois_refuses,
+                    dns_presence,
+                ) {
+                    ThinFallback::Inconclusive => {
+                        debug!(domain = %domain, "Thin WHOIS is a registry refusal/throttle; availability inconclusive (issue #45)");
+                        if let Some(ref cb) = progress {
+                            cb("Registry refused or throttled the query (availability inconclusive)");
+                        }
+                        let avail = AvailabilityResult {
+                            domain: domain.to_string(),
+                            available: false,
+                            confidence: "none".to_string(),
+                            method: "inconclusive".to_string(),
+                            details: Some(
+                                "Registry refused or throttled the query; availability is inconclusive"
+                                    .to_string(),
+                            ),
+                        };
+                        return Ok(LookupResult::Available {
+                            data: Box::new(avail),
+                            rdap_error: sanitize_error_for_public(&rdap_error_str),
+                            whois_error: String::new(),
+                            whois_data: Some(whois_data),
+                        });
                     }
-                    let avail = AvailabilityResult {
-                        domain: domain.to_string(),
-                        available: true,
-                        confidence: "medium".to_string(),
-                        method: "dns_nxdomain".to_string(),
-                        details: Some(
-                            "No registry data available; domain has no DNS presence (NXDOMAIN)"
-                                .to_string(),
-                        ),
-                    };
-                    return Ok(LookupResult::Available {
-                        data: Box::new(avail),
-                        rdap_error: sanitize_error_for_public(&rdap_error_str),
-                        whois_error: String::new(),
-                        whois_data: Some(whois_data),
-                    });
-                }
-
-                // Symmetric safety net: thin / no-service WHOIS, RDAP not a
-                // 200, but the apex IS delegated in DNS — the domain is
-                // registered. Report that (with the DNS-derived reason) instead
-                // of emitting an empty WHOIS record. Fixes RDAP-only TLDs (e.g.
-                // Identity Digital's .email/.life/.ninja) whose `whois.nic.*`
-                // answers "TLD is not supported." and whose throttled RDAP can
-                // be grace-truncated by that fast non-answer.
-                if dns_present_confirms_registered(whois_is_thin, rdap_returned_200, dns_presence) {
-                    debug!(domain = %domain, "Thin/no-service WHOIS + DNS delegation, reporting registered");
-                    if let Some(ref cb) = progress {
-                        cb("Domain is registered (registry detail unavailable)");
+                    ThinFallback::Available => {
+                        debug!(domain = %domain, "Thin WHOIS + NXDOMAIN, reclassifying as available");
+                        if let Some(ref cb) = progress {
+                            cb("Domain appears unregistered (no DNS presence)");
+                        }
+                        let avail = AvailabilityResult {
+                            domain: domain.to_string(),
+                            available: true,
+                            confidence: "medium".to_string(),
+                            method: "dns_nxdomain".to_string(),
+                            details: Some(
+                                "No registry data available; domain has no DNS presence (NXDOMAIN)"
+                                    .to_string(),
+                            ),
+                        };
+                        return Ok(LookupResult::Available {
+                            data: Box::new(avail),
+                            rdap_error: sanitize_error_for_public(&rdap_error_str),
+                            whois_error: String::new(),
+                            whois_data: Some(whois_data),
+                        });
                     }
-                    let details = if whois_data.registry_unavailable() {
-                        "Domain is registered (the apex is delegated in DNS). This TLD's \
-                         registry provides no port-43 WHOIS data and RDAP was unavailable \
-                         (rate-limited or unreachable); retry shortly for full RDAP detail."
-                    } else {
-                        "Domain is registered (the apex is delegated in DNS). Registry detail \
-                         was unavailable (RDAP rate-limited or unreachable and WHOIS returned \
-                         no data); retry shortly for full detail."
-                    };
-                    let avail = AvailabilityResult {
-                        domain: domain.to_string(),
-                        available: false,
-                        confidence: "high".to_string(),
-                        method: "dns_present".to_string(),
-                        details: Some(details.to_string()),
-                    };
-                    return Ok(LookupResult::Available {
-                        data: Box::new(avail),
-                        rdap_error: sanitize_error_for_public(&rdap_error_str),
-                        whois_error: String::new(),
-                        whois_data: Some(whois_data),
-                    });
+                    ThinFallback::Registered => {
+                        debug!(domain = %domain, "Thin/no-service WHOIS + DNS delegation, reporting registered");
+                        if let Some(ref cb) = progress {
+                            cb("Domain is registered (registry detail unavailable)");
+                        }
+                        let details = if whois_data.registry_unavailable() {
+                            "Domain is registered (the apex is delegated in DNS). This TLD's \
+                             registry provides no port-43 WHOIS data and RDAP was unavailable \
+                             (rate-limited or unreachable); retry shortly for full RDAP detail."
+                        } else {
+                            "Domain is registered (the apex is delegated in DNS). Registry detail \
+                             was unavailable (RDAP rate-limited or unreachable and WHOIS returned \
+                             no data); retry shortly for full detail."
+                        };
+                        let avail = AvailabilityResult {
+                            domain: domain.to_string(),
+                            available: false,
+                            confidence: "high".to_string(),
+                            method: "dns_present".to_string(),
+                            details: Some(details.to_string()),
+                        };
+                        return Ok(LookupResult::Available {
+                            data: Box::new(avail),
+                            rdap_error: sanitize_error_for_public(&rdap_error_str),
+                            whois_error: String::new(),
+                            whois_data: Some(whois_data),
+                        });
+                    }
+                    ThinFallback::UseWhois => {}
                 }
             }
             debug!("Using WHOIS result (RDAP not useful)");
@@ -1533,100 +1590,75 @@ mod tests {
         assert!(should_route_to_availability(false, None, &w).is_none());
     }
 
-    // ---------------- nxdomain_confirms_available ----------------
+    // ---------------- classify_thin_fallback ----------------
 
     #[test]
-    fn nxdomain_confirms_available_thin_no200_absent() {
-        assert!(nxdomain_confirms_available(
-            true,
-            false,
-            DnsPresence::Absent
-        ));
+    fn thin_fallback_refusal_is_inconclusive_regardless_of_dns() {
+        // issue #45: a registry refusal/throttle must never be guessed into
+        // "available" (from NXDOMAIN) or "registered" (from delegation). This
+        // is the inversion that was fixed in `availability::decide_fallback`
+        // but previously bypassed on the smart-lookup hot path.
+        for dns in [
+            DnsPresence::Absent,
+            DnsPresence::Present,
+            DnsPresence::Unknown,
+        ] {
+            assert_eq!(
+                classify_thin_fallback(true, false, true, dns),
+                ThinFallback::Inconclusive
+            );
+        }
     }
 
     #[test]
-    fn nxdomain_confirms_available_vetoed_by_rdap_200() {
-        // A 200 from RDAP (object exists) must veto the NXDOMAIN signal even
-        // if the apex currently has no delegation.
-        assert!(!nxdomain_confirms_available(
-            true,
-            true,
-            DnsPresence::Absent
-        ));
+    fn thin_fallback_nxdomain_is_available() {
+        assert_eq!(
+            classify_thin_fallback(true, false, false, DnsPresence::Absent),
+            ThinFallback::Available
+        );
     }
 
     #[test]
-    fn nxdomain_confirms_available_requires_thin_whois() {
-        // A WHOIS body with real data is never overridden by DNS.
-        assert!(!nxdomain_confirms_available(
-            false,
-            false,
-            DnsPresence::Absent
-        ));
-    }
-
-    #[test]
-    fn nxdomain_confirms_available_requires_absent_dns() {
-        assert!(!nxdomain_confirms_available(
-            true,
-            false,
-            DnsPresence::Present
-        ));
-        assert!(!nxdomain_confirms_available(
-            true,
-            false,
-            DnsPresence::Unknown
-        ));
-    }
-
-    // ---------------- dns_present_confirms_registered ----------------
-
-    #[test]
-    fn dns_present_confirms_registered_thin_no200_present() {
+    fn thin_fallback_delegated_is_registered() {
         // The zac.email / Identity-Digital case: a no-service WHOIS leg, RDAP
         // unavailable (throttled / grace-truncated), but the apex IS delegated
         // in DNS — the domain is registered and must not render as blank.
-        assert!(dns_present_confirms_registered(
-            true,
-            false,
-            DnsPresence::Present
-        ));
+        assert_eq!(
+            classify_thin_fallback(true, false, false, DnsPresence::Present),
+            ThinFallback::Registered
+        );
     }
 
     #[test]
-    fn dns_present_confirms_registered_requires_present_dns() {
-        // NXDOMAIN is the "available" signal, not "registered"; Unknown is not
-        // positive evidence of registration.
-        assert!(!dns_present_confirms_registered(
-            true,
-            false,
-            DnsPresence::Absent
-        ));
-        assert!(!dns_present_confirms_registered(
-            true,
-            false,
-            DnsPresence::Unknown
-        ));
+    fn thin_fallback_unknown_dns_uses_whois() {
+        // A failed DNS probe is not positive evidence either way.
+        assert_eq!(
+            classify_thin_fallback(true, false, false, DnsPresence::Unknown),
+            ThinFallback::UseWhois
+        );
     }
 
     #[test]
-    fn dns_present_confirms_registered_requires_thin_whois() {
+    fn thin_fallback_requires_thin_whois() {
         // A WHOIS body with real registration data uses the normal Whois path.
-        assert!(!dns_present_confirms_registered(
-            false,
-            false,
-            DnsPresence::Present
-        ));
+        assert_eq!(
+            classify_thin_fallback(false, false, false, DnsPresence::Absent),
+            ThinFallback::UseWhois
+        );
     }
 
     #[test]
-    fn dns_present_confirms_registered_vetoed_by_rdap_200() {
-        // A thin RDAP 200 already proves the object exists; keep that path.
-        assert!(!dns_present_confirms_registered(
-            true,
-            true,
-            DnsPresence::Present
-        ));
+    fn thin_fallback_vetoed_by_rdap_200() {
+        // A 200 from RDAP (object exists) vetoes any DNS-derived reclassification
+        // — and even a refusal banner — because the object provably exists.
+        assert_eq!(
+            classify_thin_fallback(true, true, false, DnsPresence::Absent),
+            ThinFallback::UseWhois
+        );
+        assert_eq!(
+            classify_thin_fallback(true, true, true, DnsPresence::Present),
+            ThinFallback::UseWhois
+        );
     }
 
     // ---------------- Mutex poisoning recovery ----------------

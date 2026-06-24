@@ -71,12 +71,17 @@ impl PropagationChecker {
 
     #[instrument(skip(self), fields(domain = %domain, record_type = %record_type))]
     pub async fn check(&self, domain: &str, record_type: RecordType) -> Result<PropagationResult> {
+        // Normalize once up front so the stored `domain` field agrees with what
+        // every per-server query actually resolves, instead of echoing the raw
+        // input and re-normalizing ~29 times lazily inside the resolver. (The
+        // DNSSEC checker already normalizes this way.)
+        let domain = crate::validation::normalize_domain(domain)?;
         debug!(servers = self.servers.len(), "Starting propagation check");
 
         let futures: Vec<_> = self
             .servers
             .iter()
-            .map(|server| self.query_server(domain, record_type, server.clone()))
+            .map(|server| self.query_server(&domain, record_type, server.clone()))
             .collect();
 
         let results = tokio::time::timeout(Self::PROPAGATION_TIMEOUT, join_all(futures))
@@ -239,6 +244,14 @@ impl PropagationChecker {
         })
     }
 
+    #[cfg(test)]
+    fn empty_for_tests() -> Self {
+        Self {
+            resolver: DnsResolver::new(),
+            servers: Vec::new(),
+        }
+    }
+
     async fn query_server(
         &self,
         domain: &str,
@@ -285,5 +298,29 @@ impl PropagationChecker {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `check()` must normalize the input domain ONCE at the top and store the
+    /// normalized value, rather than echoing back the raw (messy) input. An
+    /// empty server list keeps this hermetic — no live DNS is performed.
+    #[tokio::test]
+    async fn check_stores_normalized_domain() {
+        let checker = PropagationChecker::empty_for_tests();
+        let result = checker
+            .check("HTTPS://WWW.Example.COM/some/path", RecordType::A)
+            .await
+            .expect("check with empty server list should succeed");
+        assert_eq!(
+            result.domain, "example.com",
+            "stored domain must be the normalized form, not the raw input"
+        );
+        // Sanity: with no servers, nothing was queried.
+        assert_eq!(result.servers_checked, 0);
+        assert_eq!(result.servers_responding, 0);
     }
 }
