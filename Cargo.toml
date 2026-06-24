@@ -75,7 +75,7 @@ regex = "1"
 url = "2"
 base64 = "0.22"
 rand = "0.8"
-toml = "0.8"
+toml = "1.1"
 
 # IDN support
 idna = "1"
