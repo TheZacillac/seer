@@ -42,7 +42,7 @@ chrono = { version = "0.4", features = ["serde"] }
 
 # CLI
 rustyline = "14"
-colored = "2"
+colored = "3"
 indicatif = "0.18"
 comfy-table = "7"
 clap = { version = "4", features = ["derive"] }
