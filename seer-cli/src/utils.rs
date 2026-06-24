@@ -2,6 +2,40 @@ use std::path::Path;
 
 use seer_core::bulk::{BulkOperation, BulkResult, BulkResultData};
 
+/// RAII guard that enables crossterm raw mode on creation and disables it on
+/// drop — including when a panic unwinds through the guarded region. The
+/// `follow` command (CLI and REPL) enables raw mode to capture an Esc/Ctrl-C
+/// keypress; without a Drop guard, a panic during a live follow left the
+/// terminal stuck in raw mode and the user needed `reset` (issue #60).
+///
+/// If enabling raw mode fails (e.g. stdin is not a TTY), the guard is inert and
+/// its drop is a no-op, so we never disable a mode we did not enable.
+pub struct RawModeGuard {
+    enabled: bool,
+}
+
+impl RawModeGuard {
+    /// Enables raw mode, returning a guard that restores cooked mode on drop.
+    pub fn new() -> Self {
+        let enabled = crossterm::terminal::enable_raw_mode().is_ok();
+        Self { enabled }
+    }
+}
+
+impl Default for RawModeGuard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        if self.enabled {
+            let _ = crossterm::terminal::disable_raw_mode();
+        }
+    }
+}
+
 /// Write `content` to `path` atomically: write to a sibling `.tmp` file and
 /// then `rename` it over the destination. `rename` is atomic on POSIX, so a
 /// crash mid-write cannot leave the destination truncated. Mirrors the same
@@ -629,6 +663,15 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
     use seer_core::ssl::{CertDetail, SslReport};
+
+    #[test]
+    fn raw_mode_guard_constructs_and_drops_without_panic() {
+        // In a non-TTY test environment enable_raw_mode() fails, so the guard
+        // is inert; constructing and dropping it must be safe either way, and
+        // Drop must never disable a mode that was never enabled (issue #60).
+        let guard = RawModeGuard::new();
+        drop(guard); // must not panic
+    }
 
     #[test]
     fn expand_tilde_returns_home_for_lone_tilde() {
