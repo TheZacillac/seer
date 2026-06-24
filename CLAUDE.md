@@ -1187,7 +1187,10 @@ Releases are tag-driven; pushing a version tag is the entire entry point:
 ```bash
 # 1. Bump version in Cargo.toml [workspace.package] AND both pyproject.toml files
 # 2. Sync README version refs (Quick Start + Rust Library sections)
-# 3. Commit, then:
+# 3. Move CHANGELOG.md [Unreleased] entries into a new version section and add
+#    its compare link at the bottom (cargo-dist uses that section verbatim as
+#    the GitHub Release body, so keep it user-facing and accurate)
+# 4. Commit, then:
 git tag v0.33.0 && git push --tags
 ```
 
