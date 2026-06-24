@@ -6,7 +6,7 @@
 use std::future::Future;
 use std::time::Duration;
 
-use rand::Rng;
+use rand::RngExt;
 use tracing::debug;
 
 use crate::error::{Result, SeerError};
@@ -104,8 +104,8 @@ impl RetryPolicy {
             // retries in the upper half of the window, which leaves
             // measurable thundering-herd behaviour after a brief outage.
             // Full jitter spreads retries uniformly across the window.
-            let mut rng = rand::thread_rng();
-            let jitter_factor = rng.gen_range(0.0..1.0);
+            let mut rng = rand::rng();
+            let jitter_factor = rng.random_range(0.0..1.0);
             capped_delay * jitter_factor
         } else {
             capped_delay

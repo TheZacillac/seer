@@ -865,14 +865,19 @@ async fn execute_command(
         }
         Commands::GenerateKey { export, bytes } => {
             use base64::Engine;
-            use rand::RngCore;
 
             if bytes == 0 || bytes > 4096 {
                 eprintln!("{} --bytes must be between 1 and 4096", "Error:".ctp_red());
                 std::process::exit(2);
             }
             let mut buf = vec![0u8; bytes];
-            rand::rngs::OsRng.fill_bytes(&mut buf);
+            // Fill with OS entropy directly via getrandom — the CSPRNG source
+            // that rand's OsRng merely wraps. It's the right primitive for key
+            // material and immune to rand's RNG-trait churn across versions.
+            if let Err(e) = getrandom::fill(&mut buf) {
+                eprintln!("{} OS RNG unavailable: {}", "Error:".ctp_red(), e);
+                std::process::exit(1);
+            }
             let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&buf);
             if export {
                 println!("export SEER_API_KEY={}", token);
