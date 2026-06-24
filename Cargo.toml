@@ -50,7 +50,7 @@ clap_complete = "4"
 crossterm = "0.28"
 
 # Python bindings
-pyo3 = { version = "0.24", features = ["extension-module", "abi3-py39"] }
+pyo3 = { version = "0.29", features = ["extension-module", "abi3-py39"] }
 
 # Logging
 tracing = "0.1"
