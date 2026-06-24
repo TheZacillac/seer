@@ -30,7 +30,7 @@ anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 crossterm = { workspace = true, features = ["event-stream"] }
-ratatui = "0.29"
+ratatui = "0.30"
 futures = { workspace = true }
 base64 = { workspace = true }
 dirs = { workspace = true }
