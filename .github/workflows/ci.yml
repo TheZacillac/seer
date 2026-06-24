@@ -19,6 +19,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace
+      # The `otel` feature is optional and off by default, so the line above
+      # never compiles it. Check it explicitly so the OpenTelemetry integration
+      # (and its dependency bumps) can't silently break.
+      - name: Check optional features (otel)
+        run: cargo check -p seer-core --features otel
 
   fmt:
     name: Format

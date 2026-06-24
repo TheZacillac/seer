@@ -17,6 +17,14 @@ updates:
     commit-message:
       prefix: "fix(deps)"
     groups:
+      # The OpenTelemetry crates release in lockstep and pin compatible versions
+      # of each other — bump them as ONE PR (any update-type) so a partial 0.x
+      # bump can't leave `--features otel` unbuildable. Listed first so it wins
+      # over the catch-all below.
+      opentelemetry:
+        patterns:
+          - "opentelemetry*"
+          - "tracing-opentelemetry"
       cargo-minor-patch:
         patterns: ["*"]
         update-types: ["minor", "patch"]
