@@ -11,6 +11,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.35.5] - 2026-06-24
+
+### Changed
+- **MSRV is now Rust 1.88**, pinned in `Cargo.toml` and enforced by a CI job. The
+  previous "1.70" claim was untested and incorrect (the floor comes from
+  `x509-parser → time → time-macros`).
+- Dependency updates, several major: ratatui 0.30, rustyline 17, rand 0.10,
+  colored 3, toml 1.1, crossterm 0.29, dirs 6, x509-parser 0.18, and the
+  OpenTelemetry stack (opentelemetry 0.32 / tracing-opentelemetry 0.33).
+- CLI API-key generation (`seer generate-key`) now draws OS entropy via
+  `getrandom` directly (the correct CSPRNG primitive); `seer-cli` no longer
+  depends on `rand`.
+
+### Internal
+- CI now compiles the optional `otel` feature (`cargo check --features otel`),
+  which was previously never built, and Dependabot groups the OpenTelemetry
+  crates and leaves the MSRV toolchain pin alone.
+
 ## [0.35.4] - 2026-06-24
 
 ### Added
@@ -172,7 +190,8 @@ Two notable breaking changes landed in this period (see `CLAUDE.md` for details)
   `inconsistencies` became typed (`ConsensusValue` / `Inconsistency`) instead of
   pre-formatted strings.
 
-[Unreleased]: https://github.com/TheZacillac/seer/compare/v0.35.4...HEAD
+[Unreleased]: https://github.com/TheZacillac/seer/compare/v0.35.5...HEAD
+[0.35.5]: https://github.com/TheZacillac/seer/compare/v0.35.4...v0.35.5
 [0.35.4]: https://github.com/TheZacillac/seer/compare/v0.35.3...v0.35.4
 [0.35.3]: https://github.com/TheZacillac/seer/compare/v0.35.2...v0.35.3
 [0.35.2]: https://github.com/TheZacillac/seer/compare/v0.35.1...v0.35.2
