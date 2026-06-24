@@ -37,7 +37,7 @@ use chrono::{DateTime, NaiveDate, Utc};
 use once_cell::sync::Lazy;
 use regex::Regex;
 
-use super::RegistryParser;
+use super::{push_bounded, RegistryParser, MAX_NAMESERVERS};
 use crate::whois::parser::WhoisResponse;
 
 /// Regex patterns for EDUCAUSE-specific fields.
@@ -214,28 +214,35 @@ impl RegistryParser for EducauseParser {
                         registrant = Some(value);
                     }
                     Section::AdminContact => {
-                        if admin_name.is_none() {
-                            admin_name = Some(value);
-                        } else if EMAIL_PATTERN.is_match(trimmed) && admin_email.is_none() {
+                        // Check email/phone first so a contact block that leads
+                        // with an email or phone (no name line) doesn't have it
+                        // mis-stored as the name.
+                        if EMAIL_PATTERN.is_match(trimmed) && admin_email.is_none() {
                             admin_email = Some(trimmed.to_string());
                         } else if PHONE_PATTERN.is_match(trimmed) && admin_phone.is_none() {
                             admin_phone = Some(trimmed.to_string());
+                        } else if admin_name.is_none()
+                            && !EMAIL_PATTERN.is_match(trimmed)
+                            && !PHONE_PATTERN.is_match(trimmed)
+                        {
+                            admin_name = Some(value);
                         }
                     }
                     Section::TechContact => {
-                        if tech_name.is_none() {
-                            tech_name = Some(value);
-                        } else if EMAIL_PATTERN.is_match(trimmed) && tech_email.is_none() {
+                        if EMAIL_PATTERN.is_match(trimmed) && tech_email.is_none() {
                             tech_email = Some(trimmed.to_string());
                         } else if PHONE_PATTERN.is_match(trimmed) && tech_phone.is_none() {
                             tech_phone = Some(trimmed.to_string());
+                        } else if tech_name.is_none()
+                            && !EMAIL_PATTERN.is_match(trimmed)
+                            && !PHONE_PATTERN.is_match(trimmed)
+                        {
+                            tech_name = Some(value);
                         }
                     }
                     Section::NameServers => {
                         let ns = value.to_lowercase();
-                        if !ns.is_empty() && !nameservers.contains(&ns) {
-                            nameservers.push(ns);
-                        }
+                        push_bounded(&mut nameservers, ns, MAX_NAMESERVERS);
                     }
                     _ => {}
                 }
@@ -426,5 +433,49 @@ Domain expires:             31-Jul-2027"#;
         let tlds = parser.supported_tlds();
         assert!(tlds.contains(&"edu"));
         assert_eq!(tlds.len(), 1);
+    }
+
+    /// A contact block whose first indented line is an email (not a name).
+    /// The old `else if` ordering took the first indented line as the name
+    /// unconditionally, mis-storing the email as `admin_name` / `tech_name`.
+    const SAMPLE_LEADING_EMAIL: &str = r#"Domain Name: EX.EDU
+
+Administrative Contact:
+	admin@ex.edu
+	+1.5551234567
+
+Technical Contact:
+	noc@ex.edu
+	+1.5559876543
+
+Name Servers:
+	NS1.EX.EDU
+
+Domain record activated:    05-Mar-1999"#;
+
+    #[test]
+    fn test_educause_contact_leading_email_not_stored_as_name() {
+        let parser = EducauseParser::new();
+        let result = parser.parse("ex.edu", "whois.educause.edu", SAMPLE_LEADING_EMAIL);
+
+        // The leading email must NOT be captured as the contact name.
+        assert_ne!(result.admin_name.as_deref(), Some("admin@ex.edu"));
+        assert_ne!(result.tech_name.as_deref(), Some("noc@ex.edu"));
+        assert!(
+            result.admin_name.is_none(),
+            "no real name in block; admin_name should stay None, got {:?}",
+            result.admin_name
+        );
+        assert!(
+            result.tech_name.is_none(),
+            "no real name in block; tech_name should stay None, got {:?}",
+            result.tech_name
+        );
+
+        // The email and phone must still be captured into the right fields.
+        assert_eq!(result.admin_email.as_deref(), Some("admin@ex.edu"));
+        assert_eq!(result.admin_phone.as_deref(), Some("+1.5551234567"));
+        assert_eq!(result.tech_email.as_deref(), Some("noc@ex.edu"));
+        assert_eq!(result.tech_phone.as_deref(), Some("+1.5559876543"));
     }
 }

@@ -26,7 +26,7 @@ use chrono::{DateTime, NaiveDate, Utc};
 use once_cell::sync::Lazy;
 use regex::Regex;
 
-use super::RegistryParser;
+use super::{push_bounded, RegistryParser, MAX_NAMESERVERS, MAX_STATUSES};
 use crate::whois::parser::WhoisResponse;
 
 static STATUS_PATTERN: Lazy<Regex> =
@@ -102,9 +102,7 @@ impl RegistryParser for SidnParser {
                 if let Some(caps) = STATUS_PATTERN.captures(trimmed) {
                     if let Some(m) = caps.get(1) {
                         let s = m.as_str().trim().to_string();
-                        if !s.is_empty() && !status.contains(&s) {
-                            status.push(s);
-                        }
+                        push_bounded(&mut status, s, MAX_STATUSES);
                     }
                     current_section = Section::None;
                     continue;
@@ -172,9 +170,7 @@ impl RegistryParser for SidnParser {
                         .next()
                         .unwrap_or(trimmed)
                         .to_lowercase();
-                    if !ns.is_empty() && !nameservers.contains(&ns) {
-                        nameservers.push(ns);
-                    }
+                    push_bounded(&mut nameservers, ns, MAX_NAMESERVERS);
                 }
                 Section::Registrar if registrar.is_none() => {
                     registrar = Some(trimmed.to_string());

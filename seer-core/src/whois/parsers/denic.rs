@@ -16,7 +16,7 @@ use chrono::{DateTime, Utc};
 use once_cell::sync::Lazy;
 use regex::Regex;
 
-use super::RegistryParser;
+use super::{push_bounded, RegistryParser, MAX_NAMESERVERS, MAX_STATUSES};
 use crate::whois::parser::WhoisResponse;
 
 /// Regex patterns for DENIC-specific fields.
@@ -113,9 +113,7 @@ impl RegistryParser for DenicParser {
                     let ns = m.as_str().trim().to_lowercase();
                     // DENIC may include IP addresses after the hostname
                     let ns = ns.split_whitespace().next().unwrap_or(&ns).to_string();
-                    if !ns.is_empty() && !nameservers.contains(&ns) {
-                        nameservers.push(ns);
-                    }
+                    push_bounded(&mut nameservers, ns, MAX_NAMESERVERS);
                 }
             }
 
@@ -123,9 +121,7 @@ impl RegistryParser for DenicParser {
             if let Some(caps) = STATUS_PATTERN.captures(line) {
                 if let Some(m) = caps.get(1) {
                     let s = m.as_str().trim().to_string();
-                    if !s.is_empty() && !status.contains(&s) {
-                        status.push(s);
-                    }
+                    push_bounded(&mut status, s, MAX_STATUSES);
                 }
             }
 

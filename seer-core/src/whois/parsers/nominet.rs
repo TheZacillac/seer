@@ -26,7 +26,7 @@ use chrono::{DateTime, NaiveDate, Utc};
 use once_cell::sync::Lazy;
 use regex::Regex;
 
-use super::RegistryParser;
+use super::{push_bounded, RegistryParser, MAX_NAMESERVERS, MAX_STATUSES};
 use crate::whois::parser::WhoisResponse;
 
 /// Regex patterns for Nominet-specific fields.
@@ -48,6 +48,13 @@ static EXPIRY_DATE: Lazy<Regex> =
 
 static LAST_UPDATED: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?i)^Last updated:\s*$").expect("Invalid Nominet last updated regex")
+});
+
+/// `.uk` output groups dates under a single `Relevant dates:` header with
+/// indented inline `Registered on:` / `Expiry date:` / `Last updated:`
+/// sub-fields, rather than as standalone per-date section headers.
+static RELEVANT_DATES_SECTION: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)^Relevant dates:\s*$").expect("Invalid Nominet relevant dates regex")
 });
 
 static NAME_SERVERS_SECTION: Lazy<Regex> = Lazy::new(|| {
@@ -118,6 +125,7 @@ impl RegistryParser for NominetParser {
             RegistrationDate,
             ExpiryDate,
             LastUpdated,
+            RelevantDates,
             NameServers,
             Status,
             Dnssec,
@@ -143,6 +151,9 @@ impl RegistryParser for NominetParser {
                 continue;
             } else if LAST_UPDATED.is_match(trimmed) {
                 current_section = Section::LastUpdated;
+                continue;
+            } else if RELEVANT_DATES_SECTION.is_match(trimmed) {
+                current_section = Section::RelevantDates;
                 continue;
             } else if NAME_SERVERS_SECTION.is_match(trimmed) {
                 current_section = Section::NameServers;
@@ -190,14 +201,35 @@ impl RegistryParser for NominetParser {
                     Section::LastUpdated if updated_date.is_none() => {
                         updated_date = Self::parse_nominet_date(&value);
                     }
-                    Section::NameServers => {
-                        let ns = value.to_lowercase();
-                        if !ns.is_empty() && !nameservers.contains(&ns) {
-                            nameservers.push(ns);
+                    Section::RelevantDates => {
+                        // Indented inline `Sub-field: value` lines. Match the
+                        // sub-field name case-insensitively and slice the value
+                        // at the actual `:` (char-boundary safe).
+                        if let Some((field, raw_date)) = value.split_once(':') {
+                            let date = raw_date.trim();
+                            let field = field.trim();
+                            if field.eq_ignore_ascii_case("Registered on")
+                                && creation_date.is_none()
+                            {
+                                creation_date = Self::parse_nominet_date(date);
+                            } else if (field.eq_ignore_ascii_case("Expiry date")
+                                || field.eq_ignore_ascii_case("Renewal date"))
+                                && expiration_date.is_none()
+                            {
+                                expiration_date = Self::parse_nominet_date(date);
+                            } else if field.eq_ignore_ascii_case("Last updated")
+                                && updated_date.is_none()
+                            {
+                                updated_date = Self::parse_nominet_date(date);
+                            }
                         }
                     }
-                    Section::Status if !value.is_empty() && !status.contains(&value) => {
-                        status.push(value);
+                    Section::NameServers => {
+                        let ns = value.to_lowercase();
+                        push_bounded(&mut nameservers, ns, MAX_NAMESERVERS);
+                    }
+                    Section::Status => {
+                        push_bounded(&mut status, value, MAX_STATUSES);
                     }
                     Section::Dnssec if dnssec.is_none() => {
                         dnssec = Some(value);
@@ -272,7 +304,6 @@ mod tests {
     use super::*;
     use chrono::Datelike;
 
-    #[allow(dead_code)]
     const SAMPLE_NOMINET_RESPONSE: &str = r#"
     Domain name:
         example.co.uk
@@ -404,5 +435,60 @@ DNSSEC:
         let result = parser.parse("example.co.uk", "whois.nic.uk", SAMPLE_NOMINET_RESPONSE_2);
 
         assert_eq!(result.registrant_country, Some("GB".to_string()));
+    }
+
+    #[test]
+    fn test_nominet_relevant_dates_block() {
+        // Real .uk output groups creation/expiry/updated under a single
+        // `Relevant dates:` header with indented inline sub-fields, not as
+        // standalone `Registration date:` / `Expiry date:` headers. All three
+        // dates must be parsed from that block.
+        let parser = NominetParser::new();
+        let result = parser.parse("example.co.uk", "whois.nic.uk", SAMPLE_NOMINET_RESPONSE);
+
+        let creation = result
+            .creation_date
+            .expect("creation date from Registered on:");
+        assert_eq!(creation.year(), 2020);
+        assert_eq!(creation.month(), 1);
+        assert_eq!(creation.day(), 1);
+
+        let expiry = result
+            .expiration_date
+            .expect("expiry date from Expiry date:");
+        assert_eq!(expiry.year(), 2025);
+        assert_eq!(expiry.month(), 1);
+        assert_eq!(expiry.day(), 1);
+
+        let updated = result
+            .updated_date
+            .expect("updated date from Last updated:");
+        assert_eq!(updated.year(), 2023);
+        assert_eq!(updated.month(), 6);
+        assert_eq!(updated.day(), 15);
+    }
+
+    #[test]
+    fn test_nominet_relevant_dates_renewal_alias() {
+        // Some .uk responses use `Renewal date:` instead of `Expiry date:`
+        // inside the Relevant dates block.
+        let raw = "\
+Domain name:
+    example.co.uk
+
+Relevant dates:
+    Registered on: 03-March-2018
+    Renewal date: 03-March-2026
+    Last updated: 10-October-2023
+";
+        let parser = NominetParser::new();
+        let result = parser.parse("example.co.uk", "whois.nic.uk", raw);
+
+        let expiry = result
+            .expiration_date
+            .expect("expiry date from Renewal date:");
+        assert_eq!(expiry.year(), 2026);
+        assert_eq!(expiry.month(), 3);
+        assert_eq!(expiry.day(), 3);
     }
 }

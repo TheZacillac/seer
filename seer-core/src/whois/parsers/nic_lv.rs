@@ -44,7 +44,7 @@ use chrono::{DateTime, Utc};
 use once_cell::sync::Lazy;
 use regex::Regex;
 
-use super::RegistryParser;
+use super::{push_bounded, RegistryParser, MAX_NAMESERVERS, MAX_STATUSES};
 use crate::whois::parser::WhoisResponse;
 
 static SECTION_HEADER: Lazy<Regex> =
@@ -136,10 +136,7 @@ impl RegistryParser for NicLvParser {
 
             match (current, key.as_str()) {
                 (Section::Domain, "status") => {
-                    let v = value.to_string();
-                    if !status.contains(&v) {
-                        status.push(v);
-                    }
+                    push_bounded(&mut status, value.to_string(), MAX_STATUSES);
                 }
                 (Section::Holder, "name") if registrant.is_none() => {
                     registrant = Some(value.to_string());
@@ -154,10 +151,11 @@ impl RegistryParser for NicLvParser {
                     registrar = Some(value.to_string());
                 }
                 (Section::Nservers, "nserver") => {
-                    let ns = value.to_ascii_lowercase();
-                    if !nameservers.contains(&ns) {
-                        nameservers.push(ns);
-                    }
+                    push_bounded(
+                        &mut nameservers,
+                        value.to_ascii_lowercase(),
+                        MAX_NAMESERVERS,
+                    );
                 }
                 (Section::Whois, "updated") if updated_date.is_none() => {
                     updated_date = Self::parse_iso8601(value);

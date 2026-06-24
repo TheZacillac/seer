@@ -40,7 +40,7 @@ use chrono::{DateTime, Utc};
 use once_cell::sync::Lazy;
 use regex::Regex;
 
-use super::RegistryParser;
+use super::{push_bounded, RegistryParser, MAX_NAMESERVERS, MAX_STATUSES};
 use crate::whois::parser::WhoisResponse;
 
 static KEY_VALUE: Lazy<Regex> = Lazy::new(|| {
@@ -176,9 +176,7 @@ impl RegistryParser for EisParser {
                         .next()
                         .unwrap_or(&value)
                         .to_string();
-                    if !status.contains(&short) {
-                        status.push(short);
-                    }
+                    push_bounded(&mut status, short, MAX_STATUSES);
                 }
                 (Section::Domain, "registered") if creation_date.is_none() => {
                     creation_date = Self::parse_date(&value);
@@ -226,9 +224,7 @@ impl RegistryParser for EisParser {
                         .next()
                         .unwrap_or(&value)
                         .to_ascii_lowercase();
-                    if !ns.is_empty() && !nameservers.contains(&ns) {
-                        nameservers.push(ns);
-                    }
+                    push_bounded(&mut nameservers, ns, MAX_NAMESERVERS);
                 }
                 (Section::Dnssec, "dnskey") if dnssec.is_none() => {
                     dnssec = Some("signedDelegation".to_string());
@@ -389,5 +385,24 @@ changed:   2023-05-08 09:20:15 +03:00\n";
     #[test]
     fn supported_tlds() {
         assert_eq!(EisParser::new().supported_tlds(), &["ee"]);
+    }
+
+    #[test]
+    fn nameservers_are_capped_against_hostile_body() {
+        // A hostile WHOIS body with far more distinct nameserver lines than any
+        // real domain. The per-registry parser must apply the same cap as the
+        // generic parser (MAX_NAMESERVERS) so the O(n) `Vec::contains` dedup
+        // can't be driven into O(n^2) CPU.
+        let mut body = String::from("Name servers:\n");
+        for i in 0..100 {
+            body.push_str(&format!("nserver:    ns{i}.example.com\n"));
+        }
+        let r = parse(&body);
+        assert!(
+            r.nameservers.len() <= MAX_NAMESERVERS,
+            "nameservers must be capped at {}, got {}",
+            MAX_NAMESERVERS,
+            r.nameservers.len()
+        );
     }
 }

@@ -17,7 +17,7 @@ use chrono::{DateTime, NaiveDate, Utc};
 use once_cell::sync::Lazy;
 use regex::Regex;
 
-use super::RegistryParser;
+use super::{push_bounded, RegistryParser, MAX_NAMESERVERS};
 use crate::whois::parser::WhoisResponse;
 
 /// Matches nameserver host lines in both Korean and English sections.
@@ -121,9 +121,7 @@ impl RegistryParser for KisaParser {
         for caps in HOST_NAME_PATTERN.captures_iter(english_section) {
             if let Some(m) = caps.get(1) {
                 let ns = m.as_str().trim().to_lowercase();
-                if !ns.is_empty() && !nameservers.contains(&ns) {
-                    nameservers.push(ns);
-                }
+                push_bounded(&mut nameservers, ns, MAX_NAMESERVERS);
             }
         }
 
@@ -132,9 +130,7 @@ impl RegistryParser for KisaParser {
             for caps in HOST_NAME_PATTERN.captures_iter(raw) {
                 if let Some(m) = caps.get(1) {
                     let ns = m.as_str().trim().to_lowercase();
-                    if !ns.is_empty() && !nameservers.contains(&ns) {
-                        nameservers.push(ns);
-                    }
+                    push_bounded(&mut nameservers, ns, MAX_NAMESERVERS);
                 }
             }
         }
