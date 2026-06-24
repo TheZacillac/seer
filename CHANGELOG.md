@@ -11,6 +11,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.35.4] - 2026-06-24
+
+### Added
+- `CHANGELOG.md` — backfilled release history in Keep a Changelog format, wired
+  into the release process so future releases stay documented.
+- Dependabot configuration covering the cargo (workspace), github-actions, pip
+  (`seer-api`), and uv (`seer-py`) ecosystems, grouping minor/patch updates per
+  ecosystem to reduce PR noise.
+- CI `Coverage` job (cargo-llvm-cov) that prints a coverage summary and uploads
+  an HTML report artifact. Informational — it does not gate merges.
+
 ## [0.35.3] - 2026-06-24
 
 ### Fixed
@@ -161,7 +172,8 @@ Two notable breaking changes landed in this period (see `CLAUDE.md` for details)
   `inconsistencies` became typed (`ConsensusValue` / `Inconsistency`) instead of
   pre-formatted strings.
 
-[Unreleased]: https://github.com/TheZacillac/seer/compare/v0.35.3...HEAD
+[Unreleased]: https://github.com/TheZacillac/seer/compare/v0.35.4...HEAD
+[0.35.4]: https://github.com/TheZacillac/seer/compare/v0.35.3...v0.35.4
 [0.35.3]: https://github.com/TheZacillac/seer/compare/v0.35.2...v0.35.3
 [0.35.2]: https://github.com/TheZacillac/seer/compare/v0.35.1...v0.35.2
 [0.35.1]: https://github.com/TheZacillac/seer/compare/v0.35.0...v0.35.1

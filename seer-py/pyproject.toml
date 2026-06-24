@@ -6,7 +6,7 @@ build-backend = "maturin"
 # Distribution name on PyPI ("seer" is taken there); the import name is
 # still `seer` — set by [tool.maturin] python-source/module-name below.
 name = "domain-seer"
-version = "0.35.3"
+version = "0.35.4"
 description = "Domain name helper - WHOIS, RDAP, DIG, and propagation checking"
 readme = "README.md"
 license = { text = "MIT" }
