@@ -822,9 +822,10 @@ impl DnsResolver {
     }
 
     async fn resolve_any(&self, resolver: &TokioResolver, domain: &str) -> Result<Vec<DnsRecord>> {
-        let mut all_records = Vec::new();
-
-        // Query common record types
+        // Query common record types concurrently — previously these ran
+        // serially, making `ANY` ~7x slower than a single query (#61).
+        // `join_all` preserves input order, so the merged record list keeps the
+        // A, AAAA, MX, … ordering.
         let record_types = [
             RecordType::A,
             RecordType::AAAA,
@@ -835,14 +836,22 @@ impl DnsResolver {
             RecordType::CAA,
         ];
 
+        let results = futures::future::join_all(
+            record_types
+                .into_iter()
+                .map(|record_type| self.resolve_type(resolver, domain, record_type)),
+        )
+        .await;
+
         // Track whether any sub-query actually succeeded (an empty answer
         // for an existing domain still counts as success). If every type
         // errored — e.g. the resolver is unreachable — surface that error
         // rather than returning an empty set that reads as "no records".
+        let mut all_records = Vec::new();
         let mut any_ok = false;
         let mut last_err = None;
-        for record_type in record_types {
-            match self.resolve_type(resolver, domain, record_type).await {
+        for result in results {
+            match result {
                 Ok(records) => {
                     any_ok = true;
                     all_records.extend(records);

@@ -250,6 +250,10 @@ impl BulkExecutor {
                     }
                 }
             })
+            // CONTRACT (#61): results come back in COMPLETION order, not input
+            // order (`buffer_unordered`). Consumers must re-key by
+            // `BulkResult.operation` rather than rely on positional index; do
+            // not assume `results[i]` corresponds to `operations[i]`.
             .buffer_unordered(self.concurrency)
             .collect()
             .await;

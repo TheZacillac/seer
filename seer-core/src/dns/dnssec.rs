@@ -237,7 +237,15 @@ impl DnssecChecker {
             map
         };
 
-        // Parse DNSKEY record info with computed key tags
+        // Parse DNSKEY record info with computed key tags.
+        //
+        // NOTE (#61): the per-DNSKEY key_tag is attached by position-correlating
+        // two separate query result sets (DNSKEY records vs the computed-tag
+        // list). When ≥2 keys share the same (flags, algorithm), an ordering
+        // difference between those result sets can mislabel which tag belongs to
+        // which key. This affects only the DISPLAY tag and the KSK-orphan
+        // heuristic — `chain_valid` is computed from DS↔DNSKEY digest matching
+        // (below) and is unaffected.
         let mut dnskey_tag_indices: HashMap<(u16, u8), usize> = HashMap::new();
         let dnskey_info: Vec<DnskeyInfo> = dnskey_records
             .iter()
