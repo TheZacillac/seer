@@ -61,7 +61,7 @@ tracing-appender = "0.2"
 tracing-opentelemetry = "0.32"
 opentelemetry = "0.31"
 opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic"] }
+opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic"] }
 
 # Utilities
 futures = "0.3"
