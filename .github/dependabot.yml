@@ -1,0 +1,58 @@
+# Dependabot keeps dependencies fresh and surfaces security advisories early.
+# One update config per dependency manifest in the repo. Minor/patch bumps are
+# grouped into a single PR per ecosystem to cut review noise; major bumps still
+# open individually so breaking changes get scrutinized on their own.
+#
+# The CI `audit` job (rustsec/audit-check) is the safety net for the Rust side —
+# prefer keeping these green so advisories don't pile up.
+version: 2
+updates:
+  # Rust workspace: seer-core, seer-cli, and the seer-py crate (resolved via the
+  # root Cargo.lock — the cargo ecosystem at "/" covers all workspace members).
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: "fix(deps)"
+    groups:
+      cargo-minor-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+
+  # GitHub Actions pinned in ci.yml / release.yml / publish.yml.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "ci(deps)"
+    groups:
+      github-actions:
+        patterns: ["*"]
+
+  # seer-api (FastAPI + MCP): PEP 621 pyproject.toml managed with pip/hatchling.
+  - package-ecosystem: "pip"
+    directory: "/seer-api"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: "fix(deps)"
+    groups:
+      seer-api-minor-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+
+  # seer-py (PyO3 bindings): uv-managed dev environment (uv.lock).
+  - package-ecosystem: "uv"
+    directory: "/seer-py"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "fix(deps)"
+    groups:
+      seer-py-minor-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
