@@ -468,10 +468,15 @@ impl RdapClient {
 
         let cache_guard = BOOTSTRAP_CACHE.read().await;
         let cache = cache_guard.as_ref()?;
+        // IANA bootstrap keys are A-labels (punycode); convert a Unicode TLD
+        // (e.g. "рф" -> "xn--p1ai") so it matches. ASCII TLDs are unchanged;
+        // an un-convertible value falls back to the lowercased input.
+        let lower = tld.to_lowercase();
+        let key = crate::validation::domain_to_ascii(&lower).unwrap_or(lower);
         cache
             .data
             .dns
-            .get(&tld.to_lowercase())
+            .get(&key)
             .and_then(|urls| urls.first())
             .map(|u| u.to_string())
     }

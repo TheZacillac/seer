@@ -170,7 +170,7 @@ fn domain_matches_allowlist(domain: &str, allowlist: &HashSet<String>) -> bool {
 }
 
 /// Converts an internationalized domain name to ASCII (Punycode).
-fn domain_to_ascii(domain: &str) -> Result<String> {
+pub(crate) fn domain_to_ascii(domain: &str) -> Result<String> {
     idna::domain_to_ascii(domain).map_err(|_| {
         SeerError::InvalidDomain(format!("invalid internationalized domain: {}", domain))
     })

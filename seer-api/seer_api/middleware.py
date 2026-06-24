@@ -167,6 +167,11 @@ class RequestMetrics:
         self._total_latency_ms = 0.0
 
     def record(self, path: str, status_code: int, latency_ms: float):
+        # MUST be called only from the event-loop thread (the logging
+        # middleware's dispatch). The counters below are non-atomic, so calling
+        # this from a worker thread (e.g. inside a run_in_executor callback)
+        # would race and silently lose increments — keep metric recording on the
+        # loop thread.
         self._total_requests += 1
         self._status_counts[status_code] += 1
         # Bound the key set: count known keys, otherwise bucket under "<other>"
