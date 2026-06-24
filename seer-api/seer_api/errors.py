@@ -16,6 +16,7 @@ Two responsibilities:
 from __future__ import annotations
 
 import logging
+import re
 
 from fastapi import HTTPException
 
@@ -26,6 +27,21 @@ logger = logging.getLogger("seer_api")
 # length here as defense-in-depth against a hypothetical verbose
 # validation error.
 _MAX_VALUE_ERROR_LEN = 200
+
+# C0/C1 control characters (incl. CR/LF and the ESC that begins an ANSI
+# escape sequence). Mirrors the CR/LF stripping done for the correlation id
+# in middleware.py — a future verbose core error could carry ANSI colour
+# codes or an embedded NUL that must never land in a REST body or SSE event.
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def _sanitize_value_error(msg: str) -> str:
+    """Strip control/ANSI bytes from ``msg``, then cap its length.
+
+    Stripping happens *before* the length cap so that a message padded with
+    control bytes cannot push its visible content past the cap.
+    """
+    return _CONTROL_CHARS_RE.sub("", msg)[:_MAX_VALUE_ERROR_LEN]
 
 
 def safe_error_message(exc: BaseException, fallback: str = "Request failed") -> str:
@@ -39,7 +55,7 @@ def safe_error_message(exc: BaseException, fallback: str = "Request failed") -> 
     mapped to canonical strings; anything else returns ``fallback``.
     """
     if isinstance(exc, ValueError):
-        return str(exc)[:_MAX_VALUE_ERROR_LEN]
+        return _sanitize_value_error(str(exc))
     if isinstance(exc, TimeoutError):
         return "request timed out"
     if isinstance(exc, ConnectionError):
