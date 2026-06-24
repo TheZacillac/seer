@@ -127,7 +127,7 @@ where
     F: Future<Output = seer_core::Result<T>> + Send,
     T: Send,
 {
-    py.allow_threads(
+    py.detach(
         || match catch_unwind(AssertUnwindSafe(|| get_runtime().block_on(fut))) {
             Ok(Ok(v)) => Ok(v),
             Ok(Err(e)) => Err(seer_err_to_py(&e)),
@@ -157,7 +157,7 @@ where
     F: Future<Output = T> + Send,
     T: Send,
 {
-    py.allow_threads(
+    py.detach(
         || match catch_unwind(AssertUnwindSafe(|| get_runtime().block_on(fut))) {
             Ok(v) => Ok(v),
             Err(_) => Err(PyRuntimeError::new_err(
@@ -245,7 +245,7 @@ fn validate_public_host(py: Python<'_>, host: String, port: u16) -> PyResult<()>
 }
 
 #[pyfunction]
-fn lookup(py: Python<'_>, domain: String) -> PyResult<PyObject> {
+fn lookup<'py>(py: Python<'py>, domain: String) -> PyResult<Bound<'py, PyAny>> {
     let smart_lookup = get_smart_lookup();
     let response = run_async(py, async move { smart_lookup.lookup(&domain).await })?;
     let json = serialize_response(&response)?;
@@ -253,7 +253,7 @@ fn lookup(py: Python<'_>, domain: String) -> PyResult<PyObject> {
 }
 
 #[pyfunction]
-fn whois(py: Python<'_>, domain: String) -> PyResult<PyObject> {
+fn whois<'py>(py: Python<'py>, domain: String) -> PyResult<Bound<'py, PyAny>> {
     let client = get_whois_client();
     let response = run_async(py, async move { client.lookup(&domain).await })?;
     let json = serialize_response(&response)?;
@@ -261,7 +261,7 @@ fn whois(py: Python<'_>, domain: String) -> PyResult<PyObject> {
 }
 
 #[pyfunction]
-fn rdap_domain(py: Python<'_>, domain: String) -> PyResult<PyObject> {
+fn rdap_domain<'py>(py: Python<'py>, domain: String) -> PyResult<Bound<'py, PyAny>> {
     let client = get_rdap_client();
     let response = run_async(py, async move { client.lookup_domain(&domain).await })?;
     let json = serialize_response(&response)?;
@@ -269,7 +269,7 @@ fn rdap_domain(py: Python<'_>, domain: String) -> PyResult<PyObject> {
 }
 
 #[pyfunction]
-fn rdap_ip(py: Python<'_>, ip: String) -> PyResult<PyObject> {
+fn rdap_ip<'py>(py: Python<'py>, ip: String) -> PyResult<Bound<'py, PyAny>> {
     let client = get_rdap_client();
     let response = run_async(py, async move { client.lookup_ip(&ip).await })?;
     let json = serialize_response(&response)?;
@@ -277,7 +277,7 @@ fn rdap_ip(py: Python<'_>, ip: String) -> PyResult<PyObject> {
 }
 
 #[pyfunction]
-fn rdap_asn(py: Python<'_>, asn: u32) -> PyResult<PyObject> {
+fn rdap_asn<'py>(py: Python<'py>, asn: u32) -> PyResult<Bound<'py, PyAny>> {
     let client = get_rdap_client();
     let response = run_async(py, async move { client.lookup_asn(asn).await })?;
     let json = serialize_response(&response)?;
@@ -289,7 +289,7 @@ fn rdap_asn(py: Python<'_>, asn: u32) -> PyResult<PyObject> {
 /// Python-side dispatcher, which silently misrouted `AS`-prefixed domains
 /// like `as1234.io` to the ASN endpoint.
 #[pyfunction]
-fn rdap_auto(py: Python<'_>, query: String) -> PyResult<PyObject> {
+fn rdap_auto<'py>(py: Python<'py>, query: String) -> PyResult<Bound<'py, PyAny>> {
     let client = get_rdap_client();
     let response = run_async(py, async move {
         seer_core::rdap::auto_lookup(client, &query).await
@@ -300,12 +300,12 @@ fn rdap_auto(py: Python<'_>, query: String) -> PyResult<PyObject> {
 
 #[pyfunction]
 #[pyo3(signature = (domain, record_type = "A", nameserver = None))]
-fn dig(
-    py: Python<'_>,
+fn dig<'py>(
+    py: Python<'py>,
     domain: String,
     record_type: &str,
     nameserver: Option<String>,
-) -> PyResult<PyObject> {
+) -> PyResult<Bound<'py, PyAny>> {
     let resolver = get_dns_resolver();
 
     let rt_parsed: RecordType = record_type
@@ -324,7 +324,11 @@ fn dig(
 
 #[pyfunction]
 #[pyo3(signature = (domain, record_type = "A"))]
-fn propagation(py: Python<'_>, domain: String, record_type: &str) -> PyResult<PyObject> {
+fn propagation<'py>(
+    py: Python<'py>,
+    domain: String,
+    record_type: &str,
+) -> PyResult<Bound<'py, PyAny>> {
     let checker = get_propagation_checker();
 
     let rt_parsed: RecordType = record_type
@@ -411,7 +415,7 @@ impl ProgressPipe {
                 // Blocks holding no resources until an event arrives or
                 // the last sender is dropped (= pipe teardown).
                 while let Ok(ev) = rx.recv() {
-                    Python::with_gil(|py| {
+                    Python::attach(|py| {
                         let bound = py_cb.bind(py);
                         if let Err(err) = bound.call1((ev.completed, ev.total, ev.domain)) {
                             // A callback raising is not fatal: log and
@@ -498,12 +502,12 @@ fn build_progress_callback(
 
 #[pyfunction]
 #[pyo3(signature = (domains, concurrency = 10, *, progress = None))]
-fn bulk_lookup(
-    py: Python<'_>,
+fn bulk_lookup<'py>(
+    py: Python<'py>,
     domains: Vec<String>,
     concurrency: usize,
     progress: Option<Py<PyAny>>,
-) -> PyResult<PyObject> {
+) -> PyResult<Bound<'py, PyAny>> {
     let executor = BulkExecutor::new().with_concurrency(validate_concurrency(concurrency)?);
 
     let operations: Vec<BulkOperation> = domains
@@ -520,12 +524,12 @@ fn bulk_lookup(
 
 #[pyfunction]
 #[pyo3(signature = (domains, concurrency = 10, *, progress = None))]
-fn bulk_whois(
-    py: Python<'_>,
+fn bulk_whois<'py>(
+    py: Python<'py>,
     domains: Vec<String>,
     concurrency: usize,
     progress: Option<Py<PyAny>>,
-) -> PyResult<PyObject> {
+) -> PyResult<Bound<'py, PyAny>> {
     let executor = BulkExecutor::new().with_concurrency(validate_concurrency(concurrency)?);
 
     let operations: Vec<BulkOperation> = domains
@@ -542,13 +546,13 @@ fn bulk_whois(
 
 #[pyfunction]
 #[pyo3(signature = (domains, record_type = "A", concurrency = 10, *, progress = None))]
-fn bulk_dig(
-    py: Python<'_>,
+fn bulk_dig<'py>(
+    py: Python<'py>,
     domains: Vec<String>,
     record_type: &str,
     concurrency: usize,
     progress: Option<Py<PyAny>>,
-) -> PyResult<PyObject> {
+) -> PyResult<Bound<'py, PyAny>> {
     let executor = BulkExecutor::new().with_concurrency(validate_concurrency(concurrency)?);
 
     let rt_parsed: RecordType = record_type
@@ -572,13 +576,13 @@ fn bulk_dig(
 
 #[pyfunction]
 #[pyo3(signature = (domains, record_type = "A", concurrency = 5, *, progress = None))]
-fn bulk_propagation(
-    py: Python<'_>,
+fn bulk_propagation<'py>(
+    py: Python<'py>,
     domains: Vec<String>,
     record_type: &str,
     concurrency: usize,
     progress: Option<Py<PyAny>>,
-) -> PyResult<PyObject> {
+) -> PyResult<Bound<'py, PyAny>> {
     let executor = BulkExecutor::new().with_concurrency(validate_concurrency(concurrency)?);
 
     let rt_parsed: RecordType = record_type
@@ -601,7 +605,7 @@ fn bulk_propagation(
 }
 
 #[pyfunction]
-fn status(py: Python<'_>, domain: String) -> PyResult<PyObject> {
+fn status<'py>(py: Python<'py>, domain: String) -> PyResult<Bound<'py, PyAny>> {
     let client = get_status_client();
     let response = run_async(py, async move { client.check(&domain).await })?;
     let json = serialize_response(&response)?;
@@ -610,12 +614,12 @@ fn status(py: Python<'_>, domain: String) -> PyResult<PyObject> {
 
 #[pyfunction]
 #[pyo3(signature = (domains, concurrency = 10, *, progress = None))]
-fn bulk_status(
-    py: Python<'_>,
+fn bulk_status<'py>(
+    py: Python<'py>,
     domains: Vec<String>,
     concurrency: usize,
     progress: Option<Py<PyAny>>,
-) -> PyResult<PyObject> {
+) -> PyResult<Bound<'py, PyAny>> {
     let executor = BulkExecutor::new().with_concurrency(validate_concurrency(concurrency)?);
 
     let operations: Vec<BulkOperation> = domains
@@ -632,12 +636,12 @@ fn bulk_status(
 
 #[pyfunction]
 #[pyo3(signature = (domains, concurrency = 10, *, progress = None))]
-fn bulk_ssl(
-    py: Python<'_>,
+fn bulk_ssl<'py>(
+    py: Python<'py>,
     domains: Vec<String>,
     concurrency: usize,
     progress: Option<Py<PyAny>>,
-) -> PyResult<PyObject> {
+) -> PyResult<Bound<'py, PyAny>> {
     let executor = BulkExecutor::new().with_concurrency(validate_concurrency(concurrency)?);
 
     let operations: Vec<BulkOperation> = domains
@@ -654,12 +658,12 @@ fn bulk_ssl(
 
 #[pyfunction]
 #[pyo3(signature = (domains, concurrency = 10, *, progress = None))]
-fn bulk_availability(
-    py: Python<'_>,
+fn bulk_availability<'py>(
+    py: Python<'py>,
     domains: Vec<String>,
     concurrency: usize,
     progress: Option<Py<PyAny>>,
-) -> PyResult<PyObject> {
+) -> PyResult<Bound<'py, PyAny>> {
     let executor = BulkExecutor::new().with_concurrency(validate_concurrency(concurrency)?);
 
     let operations: Vec<BulkOperation> = domains
@@ -675,7 +679,7 @@ fn bulk_availability(
 }
 
 #[pyfunction]
-fn availability(py: Python<'_>, domain: String) -> PyResult<PyObject> {
+fn availability<'py>(py: Python<'py>, domain: String) -> PyResult<Bound<'py, PyAny>> {
     let checker = get_availability_checker();
     let response = run_async(py, async move { checker.check(&domain).await })?;
     let json = serialize_response(&response)?;
@@ -683,7 +687,7 @@ fn availability(py: Python<'_>, domain: String) -> PyResult<PyObject> {
 }
 
 #[pyfunction]
-fn subdomains(py: Python<'_>, domain: String) -> PyResult<PyObject> {
+fn subdomains<'py>(py: Python<'py>, domain: String) -> PyResult<Bound<'py, PyAny>> {
     let enumerator = get_subdomain_enumerator();
     let response = run_async(py, async move { enumerator.enumerate(&domain).await })?;
     let json = serialize_response(&response)?;
@@ -691,7 +695,7 @@ fn subdomains(py: Python<'_>, domain: String) -> PyResult<PyObject> {
 }
 
 #[pyfunction]
-fn ssl(py: Python<'_>, domain: String) -> PyResult<PyObject> {
+fn ssl<'py>(py: Python<'py>, domain: String) -> PyResult<Bound<'py, PyAny>> {
     let checker = get_ssl_checker();
     let response = run_async(py, async move { checker.check(&domain).await })?;
     let json = serialize_response(&response)?;
@@ -699,7 +703,7 @@ fn ssl(py: Python<'_>, domain: String) -> PyResult<PyObject> {
 }
 
 #[pyfunction]
-fn dnssec(py: Python<'_>, domain: String) -> PyResult<PyObject> {
+fn dnssec<'py>(py: Python<'py>, domain: String) -> PyResult<Bound<'py, PyAny>> {
     let checker = get_dnssec_checker();
     let response = run_async(py, async move { checker.check(&domain).await })?;
     let json = serialize_response(&response)?;
@@ -707,13 +711,13 @@ fn dnssec(py: Python<'_>, domain: String) -> PyResult<PyObject> {
 }
 
 #[pyfunction]
-fn dns_compare(
-    py: Python<'_>,
+fn dns_compare<'py>(
+    py: Python<'py>,
     domain: String,
     record_type: &str,
     server_a: String,
     server_b: String,
-) -> PyResult<PyObject> {
+) -> PyResult<Bound<'py, PyAny>> {
     let comparator = get_dns_comparator();
 
     let rt_parsed: RecordType = record_type
@@ -732,14 +736,14 @@ fn dns_compare(
 
 #[pyfunction]
 #[pyo3(signature = (domain, record_type="A", nameserver=None, iterations=3, interval_minutes=1.0))]
-fn dns_follow(
-    py: Python<'_>,
+fn dns_follow<'py>(
+    py: Python<'py>,
     domain: String,
     record_type: &str,
     nameserver: Option<String>,
     iterations: usize,
     interval_minutes: f64,
-) -> PyResult<PyObject> {
+) -> PyResult<Bound<'py, PyAny>> {
     // Refuse concurrent calls before touching any shared state — a second
     // call would overwrite the global cancel sender, silently orphaning the
     // first call's ability to be cancelled. The guard releases on return.
@@ -827,7 +831,7 @@ fn cancel_follow() -> PyResult<()> {
 }
 
 #[pyfunction]
-fn diff(py: Python<'_>, domain_a: String, domain_b: String) -> PyResult<PyObject> {
+fn diff<'py>(py: Python<'py>, domain_a: String, domain_b: String) -> PyResult<Bound<'py, PyAny>> {
     let differ = get_domain_differ();
     let response = run_async(py, async move { differ.diff(&domain_a, &domain_b).await })?;
     let json = serialize_response(&response)?;
@@ -835,7 +839,7 @@ fn diff(py: Python<'_>, domain_a: String, domain_b: String) -> PyResult<PyObject
 }
 
 #[pyfunction]
-fn info(py: Python<'_>, domain: String) -> PyResult<PyObject> {
+fn info<'py>(py: Python<'py>, domain: String) -> PyResult<Bound<'py, PyAny>> {
     let smart_lookup = get_smart_lookup();
     let lookup_result = run_async(py, async move { smart_lookup.lookup(&domain).await })?;
     let domain_info = seer_core::domain_info::DomainInfo::from_lookup_result(&lookup_result);
@@ -845,12 +849,12 @@ fn info(py: Python<'_>, domain: String) -> PyResult<PyObject> {
 
 #[pyfunction]
 #[pyo3(signature = (domains, concurrency = 10, *, progress = None))]
-fn bulk_info(
-    py: Python<'_>,
+fn bulk_info<'py>(
+    py: Python<'py>,
     domains: Vec<String>,
     concurrency: usize,
     progress: Option<Py<PyAny>>,
-) -> PyResult<PyObject> {
+) -> PyResult<Bound<'py, PyAny>> {
     let executor = BulkExecutor::new().with_concurrency(validate_concurrency(concurrency)?);
 
     let operations: Vec<BulkOperation> = domains
@@ -878,15 +882,15 @@ const MAX_JSON_DEPTH: usize = 128;
 /// Entry point for converting a `serde_json::Value` into a Python object.
 /// Starts the recursion at depth 0; the inner helper enforces
 /// [`MAX_JSON_DEPTH`].
-fn json_to_python(py: Python<'_>, value: &serde_json::Value) -> PyResult<PyObject> {
+fn json_to_python<'py>(py: Python<'py>, value: &serde_json::Value) -> PyResult<Bound<'py, PyAny>> {
     json_to_python_inner(py, value, 0)
 }
 
-fn json_to_python_inner(
-    py: Python<'_>,
+fn json_to_python_inner<'py>(
+    py: Python<'py>,
     value: &serde_json::Value,
     depth: usize,
-) -> PyResult<PyObject> {
+) -> PyResult<Bound<'py, PyAny>> {
     // `>` (not `>=`): unlike `walk_depth` in `rdap/types.rs` (which only
     // recurses into entity arrays), this function visits EVERY node — the
     // leaf value of a structure nested MAX_JSON_DEPTH levels deep arrives
@@ -900,33 +904,33 @@ fn json_to_python_inner(
         )));
     }
     match value {
-        serde_json::Value::Null => Ok(py.None()),
-        serde_json::Value::Bool(b) => Ok(b.into_pyobject(py)?.to_owned().into_any().unbind()),
+        serde_json::Value::Null => Ok(py.None().into_bound(py)),
+        serde_json::Value::Bool(b) => Ok(b.into_pyobject(py)?.to_owned().into_any()),
         serde_json::Value::Number(n) => {
             if let Some(i) = n.as_i64() {
-                Ok(i.into_pyobject(py)?.into_any().unbind())
+                Ok(i.into_pyobject(py)?.into_any())
             } else if let Some(u) = n.as_u64() {
-                Ok(u.into_pyobject(py)?.into_any().unbind())
+                Ok(u.into_pyobject(py)?.into_any())
             } else if let Some(f) = n.as_f64() {
-                Ok(f.into_pyobject(py)?.into_any().unbind())
+                Ok(f.into_pyobject(py)?.into_any())
             } else {
                 Err(PyRuntimeError::new_err("Invalid number"))
             }
         }
-        serde_json::Value::String(s) => Ok(s.into_pyobject(py)?.to_owned().into_any().unbind()),
+        serde_json::Value::String(s) => Ok(s.into_pyobject(py)?.to_owned().into_any()),
         serde_json::Value::Array(arr) => {
-            let list: Vec<PyObject> = arr
+            let list: Vec<Bound<'py, PyAny>> = arr
                 .iter()
                 .map(|v| json_to_python_inner(py, v, depth + 1))
                 .collect::<PyResult<_>>()?;
-            Ok(list.into_pyobject(py)?.into_any().unbind())
+            Ok(list.into_pyobject(py)?.into_any())
         }
         serde_json::Value::Object(obj) => {
             let dict = PyDict::new(py);
             for (k, v) in obj {
                 dict.set_item(k, json_to_python_inner(py, v, depth + 1)?)?;
             }
-            Ok(dict.into_any().unbind())
+            Ok(dict.into_any())
         }
     }
 }
@@ -944,7 +948,10 @@ fn json_to_python_inner(
 /// signal that it is not part of the public API and is undocumented in
 /// `__all__`.
 #[pyfunction]
-fn _json_to_python_nested_for_test(py: Python<'_>, depth: usize) -> PyResult<PyObject> {
+fn _json_to_python_nested_for_test<'py>(
+    py: Python<'py>,
+    depth: usize,
+) -> PyResult<Bound<'py, PyAny>> {
     let mut v = serde_json::Value::Null;
     for _ in 0..depth {
         v = serde_json::Value::Array(vec![v]);
