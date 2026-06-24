@@ -99,6 +99,14 @@ impl Watchlist {
     /// The temp filename is suffixed with the current PID so two concurrent
     /// `seer` processes don't write to the same intermediate path and race
     /// each other's `rename`s.
+    ///
+    /// # Concurrency
+    ///
+    /// As with [`crate::history::LookupHistory::save`], the write is atomic but
+    /// the load → add/remove → save cycle is not cross-process locked: two
+    /// concurrent writers can lose one side's add/remove (last-writer-wins). No
+    /// corruption occurs. A cross-process advisory lock would close the window;
+    /// it is omitted to avoid a new dependency for a low-frequency edge case.
     pub fn save(&self) -> Result<()> {
         let path = Self::path()
             .ok_or_else(|| SeerError::ConfigError("Cannot determine home directory".to_string()))?;
@@ -147,6 +155,40 @@ impl Watchlist {
     }
 }
 
+/// SSL or domain-registration expiry within this many days is *critical*.
+const EXPIRY_CRITICAL_DAYS: i64 = 30;
+/// Domain-registration expiry within this many days surfaces an informational
+/// (warning-band) issue even before it becomes critical. SSL uses only the
+/// critical band. Defined as named constants so the issue-push thresholds and
+/// the critical tally are a single source of truth (issue #57).
+const DOMAIN_EXPIRY_WARN_DAYS: i64 = 90;
+/// Exact issue strings this module emits, so the critical predicate can match
+/// them structurally rather than scanning free text for "invalid"/"failed".
+const SSL_INVALID_ISSUE: &str = "SSL certificate invalid";
+const CHECK_FAILED_PREFIX: &str = "Check failed:";
+
+/// Returns true if a checked result is *critical* (vs merely a warning): an SSL
+/// or registration expiry within [`EXPIRY_CRITICAL_DAYS`], an invalid SSL
+/// certificate, or a failed check. Uses the numeric day fields and the exact
+/// issue markers this module emits — not a locale/text-fragile substring scan
+/// for "invalid"/"failed" (issue #57).
+fn result_is_critical(r: &WatchResult) -> bool {
+    let bad_ssl = r
+        .ssl_days_remaining
+        .is_some_and(|d| d < EXPIRY_CRITICAL_DAYS);
+    let bad_domain = r
+        .domain_days_remaining
+        .is_some_and(|d| d < EXPIRY_CRITICAL_DAYS);
+    // Match the exact markers this module emits, not arbitrary free text, so a
+    // benign issue line that happens to contain "failed"/"invalid" can't be
+    // miscounted as critical.
+    let bad_issue = r
+        .issues
+        .iter()
+        .any(|i| i == SSL_INVALID_ISSUE || i.starts_with(CHECK_FAILED_PREFIX));
+    bad_ssl || bad_domain || bad_issue
+}
+
 /// Checks all given domains concurrently and produces a [`WatchReport`].
 pub async fn check_watchlist(domains: &[String]) -> WatchReport {
     use futures::stream::{self, StreamExt};
@@ -177,23 +219,21 @@ pub async fn check_watchlist(domains: &[String]) -> WatchReport {
 
                         if let Some(ref cert) = status.certificate {
                             watch_result.ssl_days_remaining = Some(cert.days_until_expiry);
-                            if cert.days_until_expiry < 30 {
+                            if cert.days_until_expiry < EXPIRY_CRITICAL_DAYS {
                                 watch_result.issues.push(format!(
                                     "SSL expires in {} days",
                                     cert.days_until_expiry
                                 ));
                             }
                             if !cert.is_valid {
-                                watch_result
-                                    .issues
-                                    .push("SSL certificate invalid".to_string());
+                                watch_result.issues.push(SSL_INVALID_ISSUE.to_string());
                             }
                         }
 
                         if let Some(ref exp) = status.domain_expiration {
                             watch_result.domain_days_remaining = Some(exp.days_until_expiry);
                             watch_result.registrar = exp.registrar.clone();
-                            if exp.days_until_expiry < 90 {
+                            if exp.days_until_expiry < DOMAIN_EXPIRY_WARN_DAYS {
                                 watch_result.issues.push(format!(
                                     "Domain expires in {} days",
                                     exp.days_until_expiry
@@ -210,7 +250,9 @@ pub async fn check_watchlist(domains: &[String]) -> WatchReport {
                         }
                     }
                     Err(e) => {
-                        watch_result.issues.push(format!("Check failed: {}", e));
+                        watch_result
+                            .issues
+                            .push(format!("{} {}", CHECK_FAILED_PREFIX, e));
                     }
                 }
 
@@ -222,24 +264,11 @@ pub async fn check_watchlist(domains: &[String]) -> WatchReport {
         .await;
 
     let total = results.len();
-    // A result counts as critical if ANY of: SSL expires within 30 days,
-    // domain registration expires within 30 days, or an issue string mentions
-    // "invalid" / "failed". Flat OR of three predicates, evaluated
-    // independently — the previous version nested the numeric checks inside
-    // an `any()` over issue strings, which made the critical count depend
-    // on iteration order over `issues` and could short-circuit incorrectly.
-    let critical = results
-        .iter()
-        .filter(|r| {
-            let bad_ssl = r.ssl_days_remaining.is_some_and(|d| d < 30);
-            let bad_domain = r.domain_days_remaining.is_some_and(|d| d < 30);
-            let bad_issue = r
-                .issues
-                .iter()
-                .any(|i| i.contains("invalid") || i.contains("failed"));
-            bad_ssl || bad_domain || bad_issue
-        })
-        .count();
+    // Critical vs warning use explicit, shared bands (see `result_is_critical`
+    // and the EXPIRY_* constants) so the tally lines up with the human-visible
+    // issue lines: a registration expiry in the 30..90-day warning band shows
+    // an issue and counts as a warning, while < 30 days counts as critical.
+    let critical = results.iter().filter(|r| result_is_critical(r)).count();
     let warnings = results.iter().filter(|r| !r.issues.is_empty()).count();
 
     WatchReport {
@@ -355,6 +384,62 @@ mod tests {
         if let Some(parent) = path.parent() {
             let _ = std::fs::remove_dir_all(parent);
         }
+    }
+
+    fn result_with(ssl: Option<i64>, domain: Option<i64>, issues: &[&str]) -> WatchResult {
+        WatchResult {
+            domain: "x.test".to_string(),
+            ssl_days_remaining: ssl,
+            domain_days_remaining: domain,
+            registrar: None,
+            http_status: Some(200),
+            issues: issues.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn critical_uses_explicit_expiry_bands() {
+        // Registration expiry in the 30..90-day warning band is NOT critical,
+        // even though it surfaces an issue line; < 30 days IS critical (#57).
+        assert!(!result_is_critical(&result_with(
+            None,
+            Some(60),
+            &["Domain expires in 60 days"]
+        )));
+        assert!(result_is_critical(&result_with(
+            None,
+            Some(20),
+            &["Domain expires in 20 days"]
+        )));
+        // SSL critical band and invalid cert.
+        assert!(result_is_critical(&result_with(Some(10), None, &[])));
+        assert!(result_is_critical(&result_with(
+            Some(200),
+            None,
+            &["SSL certificate invalid"]
+        )));
+        // Failed check is critical.
+        assert!(result_is_critical(&result_with(
+            None,
+            None,
+            &["Check failed: connection refused"]
+        )));
+    }
+
+    #[test]
+    fn critical_predicate_is_structured_not_freetext() {
+        // A healthy domain whose issue text merely contains the word "failed"
+        // (or "invalid") must NOT be counted critical — the old predicate
+        // scanned free text and was locale/wording-fragile (issue #57).
+        let r = result_with(
+            Some(200),
+            Some(200),
+            &["Note: a prior validation failed last week"],
+        );
+        assert!(
+            !result_is_critical(&r),
+            "free-text 'failed' must not trip the critical predicate"
+        );
     }
 
     #[test]

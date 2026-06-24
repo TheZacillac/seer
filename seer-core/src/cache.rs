@@ -206,16 +206,28 @@ where
                 debug!(removed, "Evicted expired entries to make room");
             }
 
-            // If still at capacity, evict the oldest entry
+            // If still at capacity, evict the oldest entries in a single batch
+            // down to a low-water mark (~90% of capacity). Doing this in one
+            // pass amortizes the O(n) selection across the next inserts instead
+            // of re-running it on every insert once full — which serialized all
+            // writers behind an O(n) scan and became a write-lock contention
+            // cliff at large capacities (issue #51). Exact-LRU is preserved:
+            // the genuinely oldest entries are the ones removed.
             if entries.len() >= self.max_capacity {
-                if let Some(oldest_key) = entries
-                    .iter()
-                    .max_by_key(|(_, entry)| entry.age())
-                    .map(|(k, _)| k.clone())
-                {
-                    entries.remove(&oldest_key);
-                    debug!(?oldest_key, "Evicted oldest entry to make room");
+                let low_water = self.max_capacity.saturating_mul(9) / 10;
+                let to_remove = entries.len().saturating_sub(low_water).max(1);
+                let mut aged: Vec<(K, Duration)> =
+                    entries.iter().map(|(k, e)| (k.clone(), e.age())).collect();
+                let take = to_remove.min(aged.len());
+                if take < aged.len() {
+                    // Partition the `take` oldest (largest age) to the front; an
+                    // O(n) average partial-select, no full sort.
+                    aged.select_nth_unstable_by(take - 1, |a, b| b.1.cmp(&a.1));
                 }
+                for (k, _) in aged.into_iter().take(take) {
+                    entries.remove(&k);
+                }
+                debug!(evicted = take, "Batch-evicted oldest entries to make room");
             }
         }
 
@@ -470,6 +482,42 @@ mod tests {
         // Only the fresh entry should remain
         assert_eq!(cache.len(), 1);
         assert_eq!(cache.get(&"key3".to_string()), Some("value3".to_string()));
+    }
+
+    #[test]
+    fn capacity_eviction_batches_to_low_water_mark() {
+        // Eviction removes a BATCH of the oldest entries down to a low-water
+        // mark in a single pass, so the O(n) selection is amortized across the
+        // next inserts rather than re-run on every insert once full (issue #51).
+        // After crossing capacity the size drops below it, not hovering at it.
+        let cap = 100;
+        let cache: TtlCache<u32, u32> = TtlCache::with_max_capacity(Duration::from_secs(3600), cap);
+        for i in 0..=cap as u32 {
+            // 0..=100 => 101 distinct keys, crossing capacity once.
+            cache.insert(i, i);
+        }
+        assert!(
+            cache.len() <= (cap * 9 / 10) + 1,
+            "batch eviction should drop to ~90% low-water, got len {}",
+            cache.len()
+        );
+        assert!(
+            cache.len() < cap,
+            "must be below capacity after a batch evict"
+        );
+        // Exact-LRU preserved: newest survives, oldest evicted.
+        assert_eq!(cache.get(&(cap as u32)), Some(cap as u32));
+        assert_eq!(cache.get(&0), None);
+    }
+
+    #[test]
+    fn capacity_eviction_never_exceeds_capacity_under_churn() {
+        let cap = 50;
+        let cache: TtlCache<u32, u32> = TtlCache::with_max_capacity(Duration::from_secs(3600), cap);
+        for i in 0..1000u32 {
+            cache.insert(i, i);
+            assert!(cache.len() <= cap, "len {} exceeded cap {cap}", cache.len());
+        }
     }
 
     #[test]
