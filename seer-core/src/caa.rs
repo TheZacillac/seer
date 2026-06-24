@@ -192,23 +192,55 @@ pub fn classify_issuer(issuer: &str, policy: &CaaPolicy) -> IssuerCaaMatch {
 /// We use a small alias table for the common public CAs and fall back to a
 /// direct substring check.
 fn ca_value_matches_issuer(caa_value: &str, issuer_lc: &str) -> bool {
+    // 1. The CAA value appears verbatim in the issuer (e.g. "ssl.com").
     if issuer_lc.contains(caa_value) {
         return true;
     }
-    // Strip the registrable trailing label (e.g. ".org", ".com") to match
-    // base names — "letsencrypt" in "let's encrypt".
-    let base = caa_value
-        .rsplit_once('.')
-        .map(|(b, _)| b)
-        .unwrap_or(caa_value);
-    if !base.is_empty() && issuer_lc.contains(base) {
-        return true;
-    }
-    // Curated aliases for well-known CAs.
+    // 2. Curated aliases for well-known CAs — preferred over the generic base
+    //    fallback so a precise mapping wins (e.g. "ssl.com" -> "ssl.com",
+    //    never bare "ssl").
     for (cv, aliases) in CA_ALIASES {
         if caa_value == *cv && aliases.iter().any(|a| issuer_lc.contains(a)) {
             return true;
         }
+    }
+    // 3. Generic fallback for CAs not in the alias table: the base label (the
+    //    CAA value minus its trailing TLD) appears in the issuer AS A WHOLE
+    //    WORD. Guarded by a minimum length so a short, ambiguous base — "ssl"
+    //    from "ssl.com" — can't collide with unrelated issuer text like
+    //    "...SSL CA..." and report a genuine mismatch as Permitted (issue #56).
+    let base = caa_value
+        .rsplit_once('.')
+        .map(|(b, _)| b)
+        .unwrap_or(caa_value);
+    base.len() >= MIN_FALLBACK_BASE_LEN && contains_word(issuer_lc, base)
+}
+
+/// Minimum base-label length for the generic substring fallback in
+/// [`ca_value_matches_issuer`]. Shorter bases (e.g. "ssl", "ca", "pki") are too
+/// ambiguous to match by substring and must go through the curated alias table
+/// or a verbatim value match instead.
+const MIN_FALLBACK_BASE_LEN: usize = 6;
+
+/// Returns true if `needle` occurs in `haystack` as a whole word — i.e. bounded
+/// by string start/end or a non-alphanumeric character on each side — so a base
+/// like "examplecorp" matches "ExampleCorp Root" but not "NotExamplecorporated".
+/// Both arguments are expected lowercase.
+fn contains_word(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    let bytes = haystack.as_bytes();
+    let mut from = 0;
+    while let Some(rel) = haystack[from..].find(needle) {
+        let start = from + rel;
+        let end = start + needle.len();
+        let before_ok = start == 0 || !bytes[start - 1].is_ascii_alphanumeric();
+        let after_ok = end == bytes.len() || !bytes[end].is_ascii_alphanumeric();
+        if before_ok && after_ok {
+            return true;
+        }
+        from = start + 1;
     }
     false
 }
@@ -295,6 +327,40 @@ mod tests {
         assert_eq!(
             classify_issuer("CN=R3, O=Let's Encrypt", &policy),
             IssuerCaaMatch::Mismatch
+        );
+    }
+
+    #[test]
+    fn classify_does_not_overmatch_short_base_substring() {
+        // CAA `issue "ssl.com"` must NOT mark an unrelated issuer that merely
+        // contains the substring "ssl" as permitted — the base "ssl" is too
+        // short/ambiguous for the generic fallback (issue #56).
+        let policy = policy_with(vec![("issue", "ssl.com")]);
+        assert_eq!(
+            classify_issuer("CN=WoanWolf SSL Root CA, O=Other", &policy),
+            IssuerCaaMatch::Mismatch,
+            "bare 'ssl' substring must not over-match"
+        );
+        // The genuine SSL.com issuer (value appears verbatim) is still permitted.
+        assert_eq!(
+            classify_issuer("CN=SSL.com RSA SSL subCA, O=SSL Corp", &policy),
+            IssuerCaaMatch::Permitted
+        );
+    }
+
+    #[test]
+    fn classify_unknown_ca_base_matches_only_on_word_boundary() {
+        // A long, distinctive base still matches via the guarded fallback — but
+        // only as a whole word, never buried inside a larger token (issue #56).
+        let policy = policy_with(vec![("issue", "examplecorp.test")]);
+        assert_eq!(
+            classify_issuer("CN=ExampleCorp Root, O=ExampleCorp", &policy),
+            IssuerCaaMatch::Permitted
+        );
+        assert_eq!(
+            classify_issuer("CN=NotExamplecorporated CA", &policy),
+            IssuerCaaMatch::Mismatch,
+            "base inside a larger word must not match"
         );
     }
 

@@ -25,14 +25,26 @@ mod status;
 mod whois;
 
 /// Strips ANSI escape sequences from untrusted external strings to prevent
-/// terminal injection via malicious WHOIS/RDAP response data.
+/// terminal injection via malicious WHOIS/RDAP response data. The OSC branch
+/// accepts both BEL (`\x07`) and ST (`\x1b\\`) terminators (and excludes ESC
+/// from the payload run so it can't over-consume across sequences).
 static ANSI_ESCAPE_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"\x1b\[[0-9;]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[A-Z@-_]")
+    Regex::new(r"\x1b\[[0-9;]*[a-zA-Z]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[A-Z@-_]")
         .expect("Invalid ANSI escape regex")
 });
 
+/// Sanitizes untrusted external text (WHOIS/RDAP field values) for safe display
+/// on a terminal. First removes well-formed ANSI escape sequences, then drops
+/// any remaining C0/C1 control characters (bare CR, backspace, BEL, stray ESC,
+/// the C1 range, DEL) that could overwrite or spoof rendered lines — keeping
+/// only `\n` and `\t`, which are legitimate layout. Mirrors the markdown
+/// `MdSafe` guard so the human path is no longer the weaker one (issue #53).
 pub(super) fn sanitize_display(s: &str) -> String {
-    ANSI_ESCAPE_RE.replace_all(s, "").to_string()
+    ANSI_ESCAPE_RE
+        .replace_all(s, "")
+        .chars()
+        .filter(|&c| c == '\n' || c == '\t' || !c.is_control())
+        .collect()
 }
 
 pub(super) fn format_duration(duration: TimeDelta) -> String {
@@ -335,5 +347,71 @@ mod tests {
         let out = f.format_expiry_status("2026-05-15", 30);
         assert!(out.contains("expires in 30 days"), "got: {}", out);
         assert!(!out.contains("!"), "got: {}", out);
+    }
+
+    // --- #53: terminal-escape / control-char sanitization ---------------
+
+    #[test]
+    fn sanitize_display_strips_bare_control_chars_keeps_newline_tab() {
+        // The old regex only removed ESC-introduced sequences; bare C0/C1
+        // control chars (CR, backspace, BEL, C1 CSI 0x9B) survived and could
+        // overwrite or spoof rendered lines. They must be stripped; newline
+        // and tab are legitimate layout and must be preserved.
+        let evil = "a\rb\x08c\x07d\u{009b}e";
+        let clean = sanitize_display(evil);
+        for bad in ['\r', '\x08', '\x07', '\u{009b}', '\u{001b}'] {
+            assert!(
+                !clean.contains(bad),
+                "{bad:?} must be stripped from {clean:?}"
+            );
+        }
+        assert!(
+            clean.contains('a') && clean.contains('e'),
+            "text kept: {clean:?}"
+        );
+        assert_eq!(
+            sanitize_display("line1\nline2\tcol"),
+            "line1\nline2\tcol",
+            "newline and tab must be preserved"
+        );
+    }
+
+    #[test]
+    fn sanitize_display_strips_osc_with_st_terminator() {
+        // OSC terminated by ST (ESC \\) rather than BEL previously slipped
+        // through, leaking the payload as visible text.
+        let clean = sanitize_display("\x1b]0;malicious title\x1b\\visible");
+        assert_eq!(
+            clean, "visible",
+            "OSC+ST sequence must be fully removed: {clean:?}"
+        );
+        assert!(!clean.contains('\x1b'));
+        // Regression: classic CSI color codes still stripped.
+        assert_eq!(sanitize_display("\x1b[31mred\x1b[0m"), "red");
+    }
+
+    #[test]
+    fn domain_info_sanitizes_nameserver_and_status_fields() {
+        // Nameserver/status values come from attacker-controlled WHOIS parsing
+        // and were printed without sanitize_display (unlike the adjacent DNSSEC
+        // field), so an injected ANSI/OSC sequence reached the terminal.
+        let whois = WhoisResponse::parse(
+            "evil.example",
+            "whois.test",
+            "Name Server: ns1.evil\x1b[31mhidden\n\
+             Domain Status: ok\x1b]0;pwn\x07\n\
+             Registrar: Test Registrar\n\
+             Creation Date: 2020-01-01T00:00:00Z\n",
+        );
+        let info = crate::domain_info::DomainInfo::from_sources("evil.example", None, Some(&whois));
+        let out = formatter().format_domain_info(&info);
+        assert!(
+            !out.contains('\x1b'),
+            "ESC must not reach terminal: {out:?}"
+        );
+        assert!(
+            !out.contains('\x07'),
+            "BEL must not reach terminal: {out:?}"
+        );
     }
 }

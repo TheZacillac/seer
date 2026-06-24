@@ -9,7 +9,6 @@ use std::sync::Arc;
 
 use colored::Colorize;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
-use crossterm::terminal;
 use rustyline::error::ReadlineError;
 use rustyline::history::DefaultHistory;
 use rustyline::{CompletionType, Editor};
@@ -962,8 +961,10 @@ impl Repl {
             let _ = stdout.flush();
         });
 
-        // Enable raw mode to capture key presses
-        let raw_mode_enabled = terminal::enable_raw_mode().is_ok();
+        // Enable raw mode to capture key presses. The RAII guard restores
+        // cooked mode on scope exit, including if a panic unwinds through the
+        // follow loop (issue #60).
+        let raw_guard = crate::utils::RawModeGuard::new();
 
         // Spawn a task to listen for Escape key or Ctrl+C
         let cancel_tx_clone = cancel_tx.clone();
@@ -1008,11 +1009,10 @@ impl Repl {
             )
             .await;
 
-        // Clean up: abort the key listener and disable raw mode
+        // Clean up: stop the key listener and restore cooked mode before
+        // printing results. The guard's Drop also restores on a panic above.
         key_listener.abort();
-        if raw_mode_enabled {
-            let _ = terminal::disable_raw_mode();
-        }
+        drop(raw_guard);
 
         match result {
             Ok(result) => {

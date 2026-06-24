@@ -48,7 +48,6 @@ fn resolve_progress_mode(
     ProgressMode::Bar
 }
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
-use crossterm::terminal;
 use seer_core::colors::CatppuccinExt;
 
 const BULK_EXAMPLES: &str = r#"
@@ -926,7 +925,9 @@ async fn execute_command(
             });
 
             // Enable raw mode for Escape key detection
-            let raw_mode_enabled = terminal::enable_raw_mode().is_ok();
+            // RAII guard: restores cooked mode on scope exit, including if a
+            // panic unwinds through the follow loop (issue #60).
+            let raw_guard = utils::RawModeGuard::new();
 
             // Spawn a task to listen for Escape key
             let cancel_tx_esc = cancel_tx.clone();
@@ -989,11 +990,10 @@ async fn execute_command(
                 .follow(&domain, rt, ns, config, Some(callback), Some(cancel_rx))
                 .await;
 
-            // Clean up
+            // Clean up: stop the key listener and restore cooked mode before
+            // printing results. The guard's Drop also restores on a panic above.
             key_listener.abort();
-            if raw_mode_enabled {
-                let _ = terminal::disable_raw_mode();
-            }
+            drop(raw_guard);
 
             match result {
                 Ok(result) => {

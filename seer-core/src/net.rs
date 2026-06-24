@@ -114,6 +114,11 @@ pub fn is_reserved_ip(ip: IpAddr) -> bool {
             {
                 return true;
             }
+            // NAT64 RFC 8215 local-use prefix 64:ff9b:1::/48 — same translation
+            // risk as the well-known /96; block the whole /48 (issue #52).
+            if seg[0] == 0x0064 && seg[1] == 0xff9b && seg[2] == 0x0001 {
+                return true;
+            }
             // IPv4-mapped (::ffff:0:0/96) — re-check the embedded IPv4.
             if v6
                 .to_ipv4_mapped()
@@ -213,9 +218,17 @@ pub async fn resolve_public_host(host: &str, port: u16) -> Result<Vec<SocketAddr
 
     for sa in &addrs {
         if is_reserved_ip(sa.ip()) {
+            // Keep the resolved IP out of the client-facing error: echoing it
+            // turned the SSRF guard into an internal-DNS oracle (a caller could
+            // learn that `internal.corp.example` resolves to 10.1.2.3). The
+            // detailed reason stays in the server logs only (issue #49).
+            debug!(
+                host = %host,
+                resolved_ip = %sa.ip(),
+                "refusing host: resolves to a reserved (non-public) address"
+            );
             return Err(SeerError::InvalidInput(format!(
-                "{host} resolves to reserved address {}",
-                sa.ip()
+                "{host} is not permitted (resolves to a non-public address)"
             )));
         }
     }
@@ -302,6 +315,18 @@ mod tests {
     }
 
     #[test]
+    fn rejects_ipv6_nat64_rfc8215_local_use_prefix() {
+        // RFC 8215 local-use NAT64 prefix 64:ff9b:1::/48 — a NAT64 gateway on
+        // this prefix translates the embedded IPv4 (incl. metadata), so the
+        // whole /48 must be blocked alongside the well-known /96 (issue #52).
+        assert!(is_reserved_ip("64:ff9b:1::a9fe:a9fe".parse().unwrap()));
+        assert!(is_reserved_ip("64:ff9b:1:ffff::1".parse().unwrap()));
+        // A different second-label value is NOT the local-use prefix and is a
+        // normal global-unicast address — must remain allowed.
+        assert!(!is_reserved_ip("64:ff9b:2::1".parse().unwrap()));
+    }
+
+    #[test]
     fn rejects_ipv4_compatible_metadata() {
         // ::169.254.169.254 — deprecated IPv4-compatible form embedding the
         // metadata IP (to_ipv4_mapped() does NOT catch this).
@@ -347,6 +372,26 @@ mod tests {
     #[tokio::test]
     async fn validate_allows_public_ip_literal() {
         validate_public_host("8.8.8.8", 53).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reserved_resolution_error_does_not_leak_resolved_ip() {
+        // A hostname that resolves to a reserved address must be refused
+        // WITHOUT echoing the resolved internal IP to the caller — that turned
+        // the SSRF guard into an internal-DNS oracle (issue #49). `localhost`
+        // resolves to a loopback address via the OS resolver/hosts file.
+        let err = validate_public_host("localhost", 80).await.unwrap_err();
+        assert!(matches!(err, SeerError::InvalidInput(_)));
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("127.0.0.1"),
+            "must not leak resolved IPv4: {msg}"
+        );
+        assert!(!msg.contains("::1"), "must not leak resolved IPv6: {msg}");
+        assert!(
+            !msg.contains("resolves to reserved address"),
+            "must not echo the resolved-address detail: {msg}"
+        );
     }
 
     /// Live-network sanity check for the fallback branch.

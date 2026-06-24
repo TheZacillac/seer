@@ -238,9 +238,29 @@ impl WhoisResponse {
         let tech_organization = extract_field_with_patterns(raw, &TECH_ORG_PATTERNS);
         let tech_email = extract_field_with_patterns(raw, &TECH_EMAIL_PATTERNS);
         let tech_phone = extract_field_with_patterns(raw, &TECH_PHONE_PATTERNS);
-        let creation_date = extract_date_with_patterns(raw, &CREATION_DATE_PATTERNS);
-        let expiration_date = extract_date_with_patterns(raw, &EXPIRATION_DATE_PATTERNS);
-        let updated_date = extract_date_with_patterns(raw, &UPDATED_DATE_PATTERNS);
+        // Extract the raw date strings first so the registry's date order can
+        // be inferred from any unambiguous one before parsing the ambiguous
+        // ones (issue #47). A registry is internally consistent, so the order
+        // revealed by one date applies to all dates in the response.
+        let creation_str = extract_field_with_patterns(raw, &CREATION_DATE_PATTERNS);
+        let expiration_str = extract_field_with_patterns(raw, &EXPIRATION_DATE_PATTERNS);
+        let updated_str = extract_field_with_patterns(raw, &UPDATED_DATE_PATTERNS);
+        let date_order = infer_date_order(
+            [&creation_str, &expiration_str, &updated_str]
+                .into_iter()
+                .flatten()
+                .map(String::as_str),
+        )
+        .unwrap_or(DateOrder::DayFirst);
+        let creation_date = creation_str
+            .as_deref()
+            .and_then(|s| parse_date_with_order(s, date_order));
+        let expiration_date = expiration_str
+            .as_deref()
+            .and_then(|s| parse_date_with_order(s, date_order));
+        let updated_date = updated_str
+            .as_deref()
+            .and_then(|s| parse_date_with_order(s, date_order));
         let nameservers = extract_nameservers(raw);
         let status = extract_status_top_level(raw);
         let dnssec = extract_field_with_patterns(raw, &DNSSEC_PATTERNS);
@@ -377,6 +397,19 @@ impl WhoisResponse {
                 continue;
             }
             let normalized = words.join(" ");
+            // A line that negates or refuses availability is never an
+            // availability indicator, even when it contains an availability
+            // substring (e.g. "available for registration" inside "not
+            // available for registration", or "no data found" inside a
+            // rate-limit banner). Skip it BEFORE the positive match so the
+            // unanchored contains() cannot invert a refused/reserved name into
+            // "available" (issue #45).
+            if NON_AVAILABILITY_PATTERNS
+                .iter()
+                .any(|p| normalized.contains(p))
+            {
+                continue;
+            }
             if AVAILABILITY_PATTERNS.iter().any(|p| normalized.contains(p)) {
                 return true;
             }
@@ -396,6 +429,37 @@ impl WhoisResponse {
             let t = line.trim_start();
             NOT_FOUND_PATTERNS.iter().any(|p| t.starts_with(p))
         })
+    }
+
+    /// Returns true when the WHOIS body explicitly *refuses*, *throttles*, or
+    /// *negates* availability rather than answering it: a rate-limit / quota /
+    /// access-denied banner, a port-43 refusal, a reserved/blocked status, or an
+    /// explicit "not available for registration". Used by the availability
+    /// fallback ([`crate::availability`]) to route such bodies to an
+    /// inconclusive verdict instead of guessing "available"/"registered" from
+    /// weaker signals like DNS presence.
+    ///
+    /// Distinct from [`is_available`](Self::is_available) (a conclusive
+    /// "no match") and [`registry_unavailable`](Self::registry_unavailable)
+    /// (the TLD has no usable port-43 WHOIS server at all). Scans every
+    /// non-comment line (no word-count gate) so a sentence-form refusal like
+    /// SWITCH's "Requests of this client are not permitted." is caught.
+    pub fn indicates_registry_refusal(&self) -> bool {
+        for line in self.raw_response.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('%') {
+                continue;
+            }
+            let lower = trimmed.to_lowercase();
+            let normalized = lower.split_whitespace().collect::<Vec<_>>().join(" ");
+            if NON_AVAILABILITY_PATTERNS
+                .iter()
+                .any(|p| normalized.contains(p))
+            {
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -435,6 +499,32 @@ const AVAILABILITY_PATTERNS: &[&str] = &[
     "no information was found", // .africa ("No information was found matching that query.")
     "object not found", // generic ("Object not found")
     "not find matchingrecord", // CONAC .政务 / .公益 ("Not find MatchingRecord")
+];
+
+/// Phrases that mark a status line as the *opposite* of available — an explicit
+/// negation ("not available"), a reserved/blocked status, or a throttle/refusal
+/// (rate limit, quota, access denied). Checked BEFORE [`AVAILABILITY_PATTERNS`]
+/// in `is_available` so an unanchored positive substring (e.g. "available for
+/// registration" inside "not available for registration", or "no data found"
+/// inside a rate-limit banner) cannot invert a refused/reserved name into
+/// "available, high confidence" (issue #45). Also backs
+/// [`WhoisResponse::indicates_registry_refusal`] for routing such bodies to an
+/// inconclusive availability verdict.
+const NON_AVAILABILITY_PATTERNS: &[&str] = &[
+    "not available", // "...is not available for registration."
+    "reserved",      // "reserved - not registered for public use"
+    "rate limit",    // "rate limited" / "Access rate limited; ..."
+    "rate-limit",    // hyphenated variant
+    "rate exceeded",
+    "quota",
+    "too many requests",
+    "access denied",
+    "denied",
+    "not permitted", // SWITCH .ch "Requests of this client are not permitted."
+    "refused",
+    "try again", // throttle hint ("please try again later")
+    "temporarily unavailable",
+    "blocked",
 ];
 
 /// Patterns indicating the registrar didn't have data for this domain.
@@ -478,16 +568,59 @@ fn extract_field_with_patterns(text: &str, patterns: &[Regex]) -> Option<String>
     None
 }
 
-fn extract_date_with_patterns(text: &str, patterns: &[Regex]) -> Option<DateTime<Utc>> {
-    let date_str = extract_field_with_patterns(text, patterns)?;
-    parse_date(&date_str)
+/// Interpretation order for ambiguous all-numeric dates (`A/B/YYYY` /
+/// `A.B.YYYY` where both `A` and `B` are <= 12). `DayFirst` reads them as
+/// `DD/MM` (the international norm, Seer's documented default); `MonthFirst`
+/// reads them as `MM/DD` (the US convention). Unambiguous dates (a field > 12,
+/// ISO, or named-month) parse identically under either order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DateOrder {
+    DayFirst,
+    MonthFirst,
 }
 
-/// Parse a date string from registry output into a UTC datetime, tolerating
-/// the ~20 formats registries emit in practice. Shared with the RDAP parser
-/// (RDAP's `eventDate` is nominally strict RFC 3339, but real servers are as
-/// sloppy as WHOIS, so both reuse this tolerant parser).
+/// Infer the date order for a response from any *unambiguous* candidate date: a
+/// numeric `A/B/YYYY` or `A.B.YYYY` where exactly one of the first two fields
+/// exceeds 12 reveals whether the registry writes day-first or month-first.
+/// Registries are internally consistent, so one unambiguous date fixes the order
+/// for every ambiguous date in the same response. Returns `None` when nothing
+/// disambiguates (ISO, named-month, or both fields no greater than 12) — callers
+/// then fall back to the documented [`DateOrder::DayFirst`] default. This
+/// replaces the old hardcoded global DMY tie-break with per-response (hence
+/// per-registry) evidence, fixing US `MM/DD/YYYY` registries without a fragile
+/// server table (issue #47).
+fn infer_date_order<'a>(candidates: impl IntoIterator<Item = &'a str>) -> Option<DateOrder> {
+    static NUMERIC_DATE: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"^\s*(\d{1,2})[/.](\d{1,2})[/.]\d{4}\b").expect("numeric date"));
+    for s in candidates {
+        if let Some(c) = NUMERIC_DATE.captures(s) {
+            if let (Ok(a), Ok(b)) = (c[1].parse::<u32>(), c[2].parse::<u32>()) {
+                if a > 12 && b <= 12 {
+                    return Some(DateOrder::DayFirst); // first field can only be a day
+                }
+                if b > 12 && a <= 12 {
+                    return Some(DateOrder::MonthFirst); // second field can only be a day
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Parse a date string from registry output into a UTC datetime, using the
+/// documented international day-first interpretation for ambiguous all-numeric
+/// dates. Thin wrapper over [`parse_date_with_order`].
 pub(crate) fn parse_date(date_str: &str) -> Option<DateTime<Utc>> {
+    parse_date_with_order(date_str, DateOrder::DayFirst)
+}
+
+/// Parse a date string from registry output into a UTC datetime, tolerating the
+/// ~20 formats registries emit in practice. `order` decides how an ambiguous
+/// all-numeric date is read (see [`DateOrder`]); unambiguous dates parse the
+/// same either way. Shared with the RDAP parser (RDAP's `eventDate` is nominally
+/// strict RFC 3339, but real servers are as sloppy as WHOIS, so both reuse this
+/// tolerant parser).
+pub(crate) fn parse_date_with_order(date_str: &str, order: DateOrder) -> Option<DateTime<Utc>> {
     let cleaned = date_str
         .trim()
         .replace(" UTC", "Z")
@@ -509,8 +642,10 @@ pub(crate) fn parse_date(date_str: &str) -> Option<DateTime<Utc>> {
         return Some(dt.with_timezone(&Utc));
     }
 
-    // Fourth: try NaiveDateTime / NaiveDate formats (timezone-less dates)
-    let naive_formats = [
+    // Fourth: try NaiveDateTime / NaiveDate formats (timezone-less dates).
+    // Unambiguous formats (year-first, named-month) first — these never depend
+    // on the day/month order.
+    const UNAMBIGUOUS_FORMATS: &[&str] = &[
         "%Y-%m-%dT%H:%M:%SZ",
         "%Y-%m-%dT%H:%M:%S%.fZ",
         "%Y-%m-%d %H:%M:%S",
@@ -524,20 +659,24 @@ pub(crate) fn parse_date(date_str: &str) -> Option<DateTime<Utc>> {
         "%d-%B-%Y",
         "%Y.%m.%d",
         "%Y/%m/%d",
-        // Day-first (international norm). Ambiguous all-numeric dates (both
-        // day and month <= 12) are interpreted here, so DMY wins ties.
-        "%d.%m.%Y",
-        "%d/%m/%Y",
-        // US month-first fallback: only reached when the day-first parse
-        // above fails (i.e. the leading field is > 12), recovering
-        // unambiguous MDY dates that would otherwise be dropped. This never
-        // changes the interpretation of a date the day-first formats accept.
-        "%m.%d.%Y",
-        "%m/%d/%Y",
         "%b %d %Y",
     ];
+    // Ambiguous all-numeric pairs, tried in the hinted order first. The other
+    // order is still tried second so an unambiguous date (a field > 12) is
+    // recovered rather than dropped — the second pass can only succeed for an
+    // input the first rejected, so it never reinterprets an accepted date.
+    const DAY_FIRST: &[&str] = &["%d.%m.%Y", "%d/%m/%Y"];
+    const MONTH_FIRST: &[&str] = &["%m.%d.%Y", "%m/%d/%Y"];
+    let (first_pair, second_pair) = match order {
+        DateOrder::DayFirst => (DAY_FIRST, MONTH_FIRST),
+        DateOrder::MonthFirst => (MONTH_FIRST, DAY_FIRST),
+    };
 
-    for fmt in &naive_formats {
+    for fmt in UNAMBIGUOUS_FORMATS
+        .iter()
+        .chain(first_pair.iter())
+        .chain(second_pair.iter())
+    {
         if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(&cleaned, fmt) {
             return Some(dt.and_utc());
         }
@@ -853,6 +992,65 @@ Name Server: ns1.example.com
     }
 
     #[test]
+    fn is_available_false_for_negation_and_refusal_lines() {
+        // Regression for the availability-inversion bug (#45): the per-line
+        // scan matched AVAILABILITY_PATTERNS via an unanchored contains() with
+        // no negation guard, so a short status line that *negates* or *refuses*
+        // availability ("not available for registration", "not registered" in a
+        // reserved status, "no data found" while rate-limited) was inverted into
+        // "available, high confidence". All three must read as NOT available.
+        for raw in [
+            // reserved/premium — registry refuses registration (contains the
+            // "available for registration" substring after "not ").
+            "This domain name is not available for registration.\n",
+            // reserved/blocked status (contains the "not registered" substring).
+            "Domain Status: reserved - not registered for public use\n",
+            // throttled — inconclusive, not free (contains "no data found").
+            "Access rate limited; no data found for unauthenticated clients\n",
+        ] {
+            assert!(
+                !make_response(raw).is_available(),
+                "negation/refusal line must NOT read as available: {raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn indicates_registry_refusal_detects_throttle_and_negation() {
+        // The refusal detector backs decide_fallback's inconclusive routing: a
+        // thin body that explicitly refuses / throttles / negates availability
+        // must be flagged so the fallback decision does not guess.
+        for raw in [
+            "This domain name is not available for registration.\n",
+            "Domain Status: reserved - not registered for public use\n",
+            "Access rate limited; no data found for unauthenticated clients\n",
+            "Requests of this client are not permitted. Please use the web form.\n",
+        ] {
+            assert!(
+                make_response(raw).indicates_registry_refusal(),
+                "should flag refusal/throttle/negation: {raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn indicates_registry_refusal_false_for_plain_not_found_and_registered() {
+        // A genuine "no match" availability response and a registered domain
+        // must NOT be flagged as refusal — those are conclusive signals.
+        for raw in [
+            "No match for domain EXAMPLE.\n",
+            "Domain not found.\n",
+            "Conditions of use for the whois service via port 43\n",
+            "Domain Name: example.com\nRegistrar: Example, Inc.\nName Server: ns1.example.com\n",
+        ] {
+            assert!(
+                !make_response(raw).indicates_registry_refusal(),
+                "must NOT flag as refusal: {raw:?}"
+            );
+        }
+    }
+
+    #[test]
     fn is_available_ignores_not_found_phrase_buried_in_prose() {
         // A thin response with NO parsed registration fields (so the H6
         // registration-data guard does not fire) whose only "does not exist"
@@ -986,6 +1184,75 @@ Domain Status: clientTransferProhibited
         assert_eq!(parsed.year(), 2024);
         assert_eq!(parsed.month(), 7);
         assert_eq!(parsed.day(), 6);
+    }
+
+    // --- #47: per-registry date order disambiguation --------------------
+
+    #[test]
+    fn parse_date_with_order_disambiguates_month_first() {
+        // The same ambiguous string reads differently per order hint:
+        // day-first => 3 April; month-first (US) => 4 March.
+        use chrono::Datelike;
+        let dmy = parse_date_with_order("03/04/2024", DateOrder::DayFirst).expect("parse");
+        assert_eq!(
+            (dmy.month(), dmy.day()),
+            (4, 3),
+            "day-first reads 03/04 as 3 April"
+        );
+        let mdy = parse_date_with_order("03/04/2024", DateOrder::MonthFirst).expect("parse");
+        assert_eq!(
+            (mdy.month(), mdy.day()),
+            (3, 4),
+            "month-first reads 03/04 as 4 March"
+        );
+    }
+
+    #[test]
+    fn parse_date_with_order_unambiguous_is_order_independent() {
+        // A field > 12 disambiguates the date regardless of the hint.
+        use chrono::Datelike;
+        for s in ["13/04/2024", "04/13/2024"] {
+            for order in [DateOrder::DayFirst, DateOrder::MonthFirst] {
+                let d = parse_date_with_order(s, order).expect("parse");
+                assert_eq!(
+                    (d.year(), d.month(), d.day()),
+                    (2024, 4, 13),
+                    "{s:?} under {order:?} must be 2024-04-13"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn parse_internal_infers_us_month_first_from_unambiguous_sibling() {
+        // A US-format registry response: the ambiguous creation date
+        // "03/04/2024" (both fields <= 12) must be read month-first (4 March)
+        // because the sibling expiry "04/15/2034" is unambiguously month-first
+        // (day 15). Registries are internally consistent, so one unambiguous
+        // date reveals the order for the whole response (issue #47).
+        use chrono::Datelike;
+        let raw = "Creation Date: 03/04/2024\nRegistry Expiry Date: 04/15/2034\n";
+        let r = make_response(raw);
+        let creation = r.creation_date.expect("creation parsed");
+        assert_eq!(
+            (creation.month(), creation.day()),
+            (3, 4),
+            "ambiguous date must follow the registry's revealed month-first order"
+        );
+    }
+
+    #[test]
+    fn parse_internal_defaults_day_first_without_disambiguating_sibling() {
+        // No unambiguous sibling → the documented day-first default holds.
+        use chrono::Datelike;
+        let raw = "Creation Date: 06/07/2024\n";
+        let r = make_response(raw);
+        let creation = r.creation_date.expect("creation parsed");
+        assert_eq!(
+            (creation.month(), creation.day()),
+            (7, 6),
+            "no disambiguating sibling keeps the day-first default"
+        );
     }
 
     // --- H3: raw_response is not serialized -----------------------------

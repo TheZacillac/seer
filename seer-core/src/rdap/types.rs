@@ -436,6 +436,14 @@ impl RdapResponse {
     /// Uses `>=` rather than `>` so that exactly `MAX_ENTITY_DEPTH` levels
     /// of entity nesting are accepted and `MAX_ENTITY_DEPTH + 1` are
     /// rejected — matching the documented intent of the constant.
+    ///
+    /// NOTE (#61): this only walks the *typed* `entities` tree. The
+    /// `#[serde(flatten)] extra` map and `vcard_array` hold arbitrary
+    /// `serde_json::Value`s whose nesting depth is bounded solely by
+    /// serde_json's default 128-level recursion limit. That default is
+    /// load-bearing here — do NOT call `serde_json`'s
+    /// `disable_recursion_limit()` on the RDAP deserialization path, or deeply
+    /// nested attacker JSON could exhaust the stack.
     fn walk_depth(entities: &[RdapEntity], depth: usize) -> Result<()> {
         if depth >= Self::MAX_ENTITY_DEPTH {
             return Err(SeerError::RdapError(format!(

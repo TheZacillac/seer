@@ -29,6 +29,17 @@ pub struct LookupHistory {
 /// Maximum number of history entries retained per domain.
 const MAX_ENTRIES_PER_DOMAIN: usize = 50;
 
+/// Maximum number of distinct domains retained. The per-domain cap above
+/// bounds entries within a domain, but the number of distinct domain keys was
+/// previously unbounded — long-lived/automated use could grow `history.json`
+/// without limit. When exceeded, the domain whose most-recent entry is oldest
+/// is evicted (LRU by most-recent activity). (issue #59)
+const MAX_DOMAINS: usize = 1000;
+
+/// Entries older than this are pruned. Bounds growth and the per-save rewrite
+/// cost under long-lived use. (issue #59)
+const MAX_ENTRY_AGE_DAYS: i64 = 365;
+
 impl LookupHistory {
     /// Returns the path to the history file (`~/.seer/history.json`).
     pub fn path() -> Option<PathBuf> {
@@ -88,6 +99,18 @@ impl LookupHistory {
     /// and the user's history is silently moved to `.corrupt`. Writing to
     /// a sibling temp file and `rename`-ing over the target is atomic on
     /// POSIX and survives that crash.
+    ///
+    /// # Concurrency
+    ///
+    /// The save itself is atomic (temp + rename) so a reader never sees a
+    /// torn file. However the load → mutate → save cycle is **not** guarded by
+    /// a cross-process lock: if two `seer` processes load, each appends, and
+    /// each saves, the later `rename` wins and the earlier process's new entry
+    /// is lost (last-writer-wins). This is data loss of at most a single
+    /// concurrent entry — never corruption — and is bounded further by the
+    /// growth caps above. A future cross-process advisory lock (or an
+    /// append-only log) would close the remaining window; it is intentionally
+    /// omitted here to avoid a new dependency for a low-frequency edge case.
     pub fn save(&self) -> Result<()> {
         let path = Self::path()
             .ok_or_else(|| SeerError::ConfigError("Cannot determine home directory".to_string()))?;
@@ -140,6 +163,31 @@ impl LookupHistory {
         if entries.len() > MAX_ENTRIES_PER_DOMAIN {
             let drain_count = entries.len() - MAX_ENTRIES_PER_DOMAIN;
             entries.drain(..drain_count);
+        }
+        self.prune();
+    }
+
+    /// Bounds total growth: drops entries older than [`MAX_ENTRY_AGE_DAYS`],
+    /// removes any domain left with no entries, then evicts least-recently-active
+    /// domains until at most [`MAX_DOMAINS`] remain (issue #59).
+    fn prune(&mut self) {
+        let cutoff = Utc::now() - chrono::Duration::days(MAX_ENTRY_AGE_DAYS);
+        self.entries.retain(|_, v| {
+            v.retain(|e| e.timestamp >= cutoff);
+            !v.is_empty()
+        });
+        // Evict whole domains (least-recently-active first) until under the cap.
+        // `record` adds one domain at a time, so this normally runs at most once.
+        while self.entries.len() > MAX_DOMAINS {
+            let Some(victim) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, v)| v.iter().map(|e| e.timestamp).max())
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            self.entries.remove(&victim);
         }
     }
 
@@ -217,6 +265,39 @@ mod tests {
         }
         let entries = history.get("example.com");
         assert_eq!(entries.len(), MAX_ENTRIES_PER_DOMAIN);
+    }
+
+    #[test]
+    fn history_global_domain_cap_bounds_distinct_domains() {
+        // History caps entries PER domain, but the number of distinct domains
+        // was unbounded. A global cap must bound total domains (issue #59).
+        let mut h = LookupHistory::default();
+        for i in 0..(MAX_DOMAINS + 50) {
+            h.record(&format!("d{i}.example"), make_lookup_result("x"));
+        }
+        assert!(
+            h.entries.len() <= MAX_DOMAINS,
+            "distinct domains must be capped at {MAX_DOMAINS}, got {}",
+            h.entries.len()
+        );
+    }
+
+    #[test]
+    fn history_prunes_entries_older_than_max_age() {
+        // Entries older than the max age are trimmed so the file can't grow
+        // without bound under long-lived/automated use (issue #59).
+        let mut h = LookupHistory::default();
+        h.record("old.example", make_lookup_result("x"));
+        // Backdate the entry beyond the retention window.
+        h.entries.get_mut("old.example").unwrap()[0].timestamp =
+            Utc::now() - chrono::Duration::days(MAX_ENTRY_AGE_DAYS + 10);
+        // Any subsequent record triggers a prune.
+        h.record("new.example", make_lookup_result("x"));
+        assert!(
+            h.get("old.example").is_empty(),
+            "entry older than the retention window must be pruned"
+        );
+        assert!(!h.get("new.example").is_empty(), "fresh entry retained");
     }
 
     #[test]

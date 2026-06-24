@@ -134,6 +134,67 @@ impl OutputFormatter for YamlFormatter {
     }
 }
 
+/// Returns true when a string cannot be emitted as a YAML *plain* scalar and
+/// must be double-quoted. Covers the cases the old `contains('\n'|':'|'#')`
+/// predicate missed (issue #54): empty strings, leading/trailing whitespace,
+/// any control character, a leading YAML indicator character, an interior
+/// `": "` / trailing `:` / `" #"` (which break a plain scalar), and the YAML
+/// 1.1 bool/null tokens (`null`, `~`, `true`, `false`, `yes`, `no`, `on`,
+/// `off`) which would otherwise round-trip as the wrong type.
+fn yaml_needs_quoting(s: &str) -> bool {
+    if s.is_empty() || s != s.trim() {
+        return true;
+    }
+    if s.chars().any(|c| c.is_control()) {
+        return true;
+    }
+    if matches!(
+        s.to_ascii_lowercase().as_str(),
+        "null" | "~" | "true" | "false" | "yes" | "no" | "on" | "off"
+    ) {
+        return true;
+    }
+    // A leading YAML indicator char makes the whole scalar non-plain.
+    if let Some(first) = s.chars().next() {
+        if "-?:,[]{}#&*!|>'\"%@`".contains(first) {
+            return true;
+        }
+    }
+    s.contains(": ") || s.ends_with(':') || s.contains(" #")
+}
+
+/// Emits `s` as a YAML double-quoted scalar, escaping `"`, `\`, and control
+/// characters (so attacker ANSI/control bytes can't reach the terminal or
+/// break the document).
+fn yaml_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            '\0' => out.push_str("\\0"),
+            // C0/C1 controls + DEL → YAML \xXX escape (all <= 0x9F, two digits).
+            c if c.is_control() => out.push_str(&format!("\\x{:02x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Emits a scalar string as a plain YAML scalar when safe, else double-quoted.
+fn yaml_scalar(s: &str) -> String {
+    if yaml_needs_quoting(s) {
+        yaml_quote(s)
+    } else {
+        s.to_string()
+    }
+}
+
 /// Simple YAML-like formatter from serde_json::Value.
 fn format_as_yaml(value: &serde_json::Value, indent: usize) -> String {
     let prefix = "  ".repeat(indent);
@@ -141,13 +202,7 @@ fn format_as_yaml(value: &serde_json::Value, indent: usize) -> String {
         serde_json::Value::Null => "null".to_string(),
         serde_json::Value::Bool(b) => b.to_string(),
         serde_json::Value::Number(n) => n.to_string(),
-        serde_json::Value::String(s) => {
-            if s.contains('\n') || s.contains(':') || s.contains('#') {
-                format!("\"{}\"", s.replace('"', "\\\""))
-            } else {
-                s.clone()
-            }
-        }
+        serde_json::Value::String(s) => yaml_scalar(s),
         serde_json::Value::Array(arr) => {
             if arr.is_empty() {
                 return "[]".to_string();
@@ -174,7 +229,9 @@ fn format_as_yaml(value: &serde_json::Value, indent: usize) -> String {
                 }
                 first = false;
                 out.push_str(&prefix);
-                out.push_str(key);
+                // Keys can be attacker-controlled (e.g. RDAP `extra` flattened
+                // map), so quote them under the same rules as scalar values.
+                out.push_str(&yaml_scalar(key));
                 out.push_str(": ");
                 match val {
                     serde_json::Value::Object(_) | serde_json::Value::Array(_) => {
@@ -262,5 +319,66 @@ mod tests {
     fn test_format_as_yaml_empty_collections() {
         assert_eq!(format_as_yaml(&serde_json::json!([]), 0), "[]");
         assert_eq!(format_as_yaml(&serde_json::json!({}), 0), "{}");
+    }
+
+    // --- #54: YAML scalar quoting hardening ----------------------------
+
+    #[test]
+    fn yaml_scalar_quoting_hardened() {
+        use serde_json::json;
+        let y = |s: &str| format_as_yaml(&json!(s), 0);
+
+        // YAML 1.1 bool/null tokens must be quoted to stay strings.
+        assert_eq!(y("No"), "\"No\"");
+        assert_eq!(y("true"), "\"true\"");
+        assert_eq!(y("null"), "\"null\"");
+        assert_eq!(y("~"), "\"~\"");
+
+        // Empty + leading/trailing whitespace.
+        assert_eq!(y(""), "\"\"");
+        assert_eq!(y(" leading"), "\" leading\"");
+        assert_eq!(y("trailing "), "\"trailing \"");
+
+        // Leading YAML indicator characters.
+        for s in [
+            "- dash", "@at", "*star", "[brk", "{brace", "#hash", "!bang", "&amp", "|pipe", ">gt",
+            "%pct", "`tick", "?q", ",comma",
+        ] {
+            assert_eq!(
+                y(s),
+                format!("\"{s}\""),
+                "must quote leading-indicator {s:?}"
+            );
+        }
+
+        // Colon-space breaks a plain scalar.
+        assert_eq!(y("key: value"), "\"key: value\"");
+
+        // Control chars / ANSI are escaped, never emitted raw.
+        assert_eq!(y("a\tb"), "\"a\\tb\"");
+        assert_eq!(y("a\rb"), "\"a\\rb\"");
+        assert_eq!(y("x\x1b[31m"), "\"x\\x1b[31m\"");
+
+        // Safe plain scalars must NOT be over-quoted.
+        assert_eq!(y("plain-value"), "plain-value");
+        assert_eq!(y("has internal spaces"), "has internal spaces");
+        assert_eq!(y("ns1.example.com"), "ns1.example.com");
+    }
+
+    #[test]
+    fn yaml_object_keys_with_significant_chars_are_quoted() {
+        // Keys from attacker-controlled flattened maps (e.g. RDAP `extra`) must
+        // be quoted too, or a key like "a\ninjected: true" forges structure.
+        let doc = format_as_yaml(&serde_json::json!({ "a\nb": "v" }), 0);
+        assert!(
+            doc.contains("\"a\\nb\""),
+            "malicious key must be quoted/escaped: {doc:?}"
+        );
+        // Normal identifier keys stay unquoted.
+        let doc = format_as_yaml(&serde_json::json!({ "domain": "x" }), 0);
+        assert!(
+            doc.starts_with("domain:"),
+            "plain key must not be quoted: {doc:?}"
+        );
     }
 }

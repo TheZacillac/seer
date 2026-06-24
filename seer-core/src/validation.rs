@@ -7,9 +7,11 @@ use once_cell::sync::Lazy;
 
 use crate::error::{Result, SeerError};
 
-/// TLD allowlist loaded from the `SEER_DOMAIN_ALLOWLIST` environment variable.
-/// When set (e.g., `SEER_DOMAIN_ALLOWLIST="com,org,net"`), only domains with
-/// matching TLDs are permitted. When unset, all TLDs are allowed.
+/// Domain allowlist loaded from the `SEER_DOMAIN_ALLOWLIST` environment
+/// variable. Entries match by label-boundary suffix (see
+/// [`domain_matches_allowlist`]): `com` permits all `*.com`, and `example.com`
+/// permits `example.com` and its subdomains. When unset, all domains are
+/// allowed.
 static DOMAIN_ALLOWLIST: Lazy<Option<HashSet<String>>> = Lazy::new(|| {
     let set: HashSet<String> = std::env::var("SEER_DOMAIN_ALLOWLIST")
         .ok()?
@@ -118,19 +120,39 @@ pub fn normalize_domain(domain: &str) -> Result<String> {
         }
     }
 
-    // Check TLD against allowlist (if configured)
+    // Check against the allowlist (if configured) using suffix matching.
     if let Some(ref allowlist) = *DOMAIN_ALLOWLIST {
-        if let Some(tld) = domain.rsplit('.').next() {
-            if !allowlist.contains(tld) {
-                return Err(SeerError::DomainNotAllowed {
-                    domain: domain.to_string(),
-                    tld: tld.to_string(),
-                });
-            }
+        if !domain_matches_allowlist(&domain, allowlist) {
+            let tld = domain.rsplit('.').next().unwrap_or(&domain).to_string();
+            return Err(SeerError::DomainNotAllowed {
+                domain: domain.to_string(),
+                tld,
+            });
         }
     }
 
     Ok(domain.to_string())
+}
+
+/// Returns true if `domain` is permitted by `allowlist` using label-boundary
+/// suffix matching: an entry matches the domain itself or any subdomain of it.
+///
+/// This fixes the misleading control where `SEER_DOMAIN_ALLOWLIST` only compared
+/// the final label, so a full-domain entry like `example.com` matched nothing
+/// (issue #61). A bare-TLD entry (e.g. `com`) still matches all `*.com` domains,
+/// so existing TLD-style configs keep working; a full-domain entry (e.g.
+/// `example.com`) now matches `example.com` and `sub.example.com` as the name
+/// implies. Both `domain` and the entries are already lowercased.
+fn domain_matches_allowlist(domain: &str, allowlist: &HashSet<String>) -> bool {
+    allowlist.iter().any(|entry| {
+        if domain == entry.as_str() {
+            return true;
+        }
+        // Subdomain match: `domain` ends with ".<entry>" on a label boundary.
+        domain.len() > entry.len()
+            && domain.ends_with(entry.as_str())
+            && domain.as_bytes()[domain.len() - entry.len() - 1] == b'.'
+    })
 }
 
 /// Converts an internationalized domain name to ASCII (Punycode).
@@ -352,6 +374,34 @@ mod tests {
         assert!(normalize_domain("example.com").is_ok());
         assert!(normalize_domain("example.xyz").is_ok());
         assert!(normalize_domain("example.co.uk").is_ok());
+    }
+
+    #[test]
+    fn allowlist_suffix_matching() {
+        // #61: a full-domain entry must match the domain and its subdomains
+        // (the previous code only matched the final label, so "example.com"
+        // matched nothing), while a bare-TLD entry stays backward compatible.
+        let full: HashSet<String> = ["example.com".to_string()].into_iter().collect();
+        assert!(domain_matches_allowlist("example.com", &full));
+        assert!(domain_matches_allowlist("sub.example.com", &full));
+        assert!(
+            !domain_matches_allowlist("notexample.com", &full),
+            "label boundary"
+        );
+        assert!(!domain_matches_allowlist("example.org", &full));
+
+        let tld: HashSet<String> = ["com".to_string()].into_iter().collect();
+        assert!(
+            domain_matches_allowlist("example.com", &tld),
+            "bare TLD still works"
+        );
+        assert!(domain_matches_allowlist("a.b.com", &tld));
+        assert!(domain_matches_allowlist("com", &tld));
+        assert!(!domain_matches_allowlist("example.org", &tld));
+        assert!(
+            !domain_matches_allowlist("scam", &tld),
+            "must not match mid-label"
+        );
     }
 
     #[test]

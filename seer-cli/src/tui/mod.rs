@@ -66,11 +66,21 @@ fn restore_terminal(terminal: &mut Term) -> Result<()> {
 }
 
 /// Restore the terminal even if a panic unwinds through the draw loop.
+///
+/// Mirrors [`restore_terminal`], including re-showing the cursor: ratatui hides
+/// the cursor on every `draw`, so without `cursor::Show` a panic after the first
+/// frame would return the user to a working shell with an invisible cursor
+/// (issue #60).
 fn install_panic_hook() {
     let original = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen);
+        let _ = execute!(
+            io::stdout(),
+            DisableBracketedPaste,
+            LeaveAlternateScreen,
+            crossterm::cursor::Show
+        );
         original(info);
     }));
 }

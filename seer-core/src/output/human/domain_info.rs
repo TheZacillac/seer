@@ -231,19 +231,20 @@ impl HumanFormatter {
             ));
         }
 
-        // DNS
+        // DNS. Nameservers/status originate from attacker-controlled WHOIS/RDAP
+        // parsing, so sanitize them like the adjacent DNSSEC field (issue #53).
         if !info.nameservers.is_empty() {
             output.push(format!(
                 "  {}: {}",
                 self.label("Nameservers"),
-                self.value(&info.nameservers.join(", "))
+                self.value(&sanitize_display(&info.nameservers.join(", ")))
             ));
         }
         if !info.status.is_empty() {
             output.push(format!(
                 "  {}: {}",
                 self.label("Status"),
-                self.value(&info.status.join(", "))
+                self.value(&sanitize_display(&info.status.join(", ")))
             ));
         }
         if let Some(ref dnssec) = info.dnssec {

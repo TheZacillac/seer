@@ -1,7 +1,9 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures::future::join_all;
+use tokio::sync::Semaphore;
 use tracing::{debug, instrument, warn};
 
 use super::analysis::{
@@ -12,6 +14,10 @@ use super::types::{DnsServer, NameserverDetails, PropagationResult, ServerResult
 use crate::dns::records::{RecordData, RecordType};
 use crate::dns::resolver::DnsResolver;
 use crate::error::{Result, SeerError};
+
+/// Caps concurrent A/AAAA lookups during nameserver-IP enrichment so a large
+/// custom server list can't trigger an unbounded burst of DNS queries (#61).
+const MAX_CONCURRENT_NS_LOOKUPS: usize = 50;
 
 /// Checks DNS propagation across multiple global DNS servers.
 #[derive(Debug, Clone)]
@@ -176,13 +182,21 @@ impl PropagationChecker {
         // that already answered the NS query — are queried; an unreachable
         // server can't meaningfully report a per-vantage IP either.
         let unique_vec: Vec<String> = unique.into_iter().collect();
+        // Bound the fan-out: this loop produces `responding_servers × unique_ns`
+        // tasks, each doing 2 lookups. Harmless at the built-in 29-server list,
+        // but a large custom `with_servers` list would otherwise spawn an
+        // unbounded burst of concurrent DNS queries (#61).
+        let sem = Arc::new(Semaphore::new(MAX_CONCURRENT_NS_LOOKUPS));
         let mut tasks = Vec::new();
         for sr in results.iter().filter(|sr| sr.success) {
             for ns in &unique_vec {
                 let resolver = self.resolver.clone();
                 let server_ip = sr.server.ip.clone();
                 let ns = ns.clone();
+                let sem = sem.clone();
                 tasks.push(async move {
+                    // Held for the task's lifetime; caps concurrent lookups.
+                    let _permit = sem.acquire().await.ok();
                     let (a_res, aaaa_res) = tokio::join!(
                         resolver.resolve(&ns, RecordType::A, Some(&server_ip)),
                         resolver.resolve(&ns, RecordType::AAAA, Some(&server_ip)),

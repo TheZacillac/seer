@@ -14,13 +14,13 @@ Event ordering (see spec):
 import asyncio
 import json
 import logging
-import os
 import time
 from collections.abc import AsyncGenerator, Callable
 from typing import Any
 
 from starlette.responses import StreamingResponse
 
+from ._env import env_int
 from ._run import _DISPATCH_EXECUTOR
 from .errors import safe_error_message
 
@@ -31,7 +31,7 @@ logger = logging.getLogger("seer_api")
 # disconnects mid-stream still runs its job to completion. Without a bound, a
 # flood of large requests that disconnect immediately would pin every dispatch
 # thread and stall the whole API. Tunable via SEER_MAX_CONCURRENT_STREAMS.
-_MAX_CONCURRENT_STREAMS = max(1, int(os.getenv("SEER_MAX_CONCURRENT_STREAMS", "8")))
+_MAX_CONCURRENT_STREAMS = env_int("SEER_MAX_CONCURRENT_STREAMS", 8, min_value=1)
 _stream_semaphore: asyncio.Semaphore | None = None
 _stream_semaphore_loop: asyncio.AbstractEventLoop | None = None
 
@@ -154,6 +154,11 @@ async def stream_bulk(
                     pending_error.__traceback__,
                 ),
             )
+            # SECURITY (#61, related to #49): the SSE error event must NEVER
+            # carry an unsanitized core error — a third-party WHOIS/RDAP server's
+            # error text can contain ANSI escapes or a resolved internal IP.
+            # `safe_error_message` (sanitize + 200-char cap) is load-bearing
+            # here; do not replace it with `str(pending_error)`.
             yield _sse(
                 "error",
                 {
