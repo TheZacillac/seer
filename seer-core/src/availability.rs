@@ -187,6 +187,23 @@ fn decide_fallback(
                     method: "rdap".to_string(),
                     details: Some("Registry RDAP reports no such domain (HTTP 404)".to_string()),
                 }
+            } else if whois_response.indicates_registry_refusal() {
+                // Thin WHOIS that explicitly refused / throttled / negated the
+                // query (rate limit, access denied, reserved, "not available
+                // for registration") while RDAP did not authoritatively 404.
+                // There is no usable registration signal — report inconclusive
+                // rather than inverting the refusal into "available" or guessing
+                // from DNS presence / fail-safing to "registered" (issue #45).
+                AvailabilityResult {
+                    domain: domain.to_string(),
+                    available: false,
+                    confidence: "none".to_string(),
+                    method: "inconclusive".to_string(),
+                    details: Some(
+                        "Registry refused or throttled the query; availability is inconclusive"
+                            .to_string(),
+                    ),
+                }
             } else if dns_presence == DnsPresence::Absent {
                 // Thin WHOIS, RDAP did not 404, and the apex is NXDOMAIN —
                 // corroborating evidence the domain is unregistered.
@@ -737,5 +754,55 @@ mod tests {
         assert!(r.available);
         assert_eq!(r.confidence, "medium");
         assert_eq!(r.method, "dns_nxdomain");
+    }
+
+    // --- #45: refusal/throttle bodies route to inconclusive --------------
+
+    #[test]
+    fn rdap_fail_thin_whois_refusal_marks_inconclusive() {
+        // A throttled thin WHOIS body (no registration data) with a non-404
+        // RDAP failure must route to an inconclusive verdict — even with DNS
+        // absent, which would otherwise read as likely-available — instead of
+        // inverting a rate-limit banner ("no data found") into "available".
+        let whois = whois_with(
+            "Access rate limited; no data found for unauthenticated clients\n",
+            None,
+        );
+        let rdap_err = SeerError::RdapError("503 service unavailable".to_string());
+        let r = decide_fallback("example.test", &rdap_err, Ok(whois), DnsPresence::Absent);
+        assert!(
+            !r.available,
+            "refusal/throttle must not be called available"
+        );
+        assert_eq!(r.confidence, "none");
+        assert_eq!(r.method, "inconclusive");
+    }
+
+    #[test]
+    fn rdap_fail_thin_whois_not_available_for_registration_marks_inconclusive() {
+        // "not available for registration" (reserved/premium) previously
+        // inverted to available; with RDAP also failing non-404 it must be
+        // inconclusive, not a DNS-presence guess.
+        let whois = whois_with(
+            "This domain name is not available for registration.\n",
+            None,
+        );
+        let rdap_err = SeerError::RdapBootstrapError("no RDAP server".to_string());
+        let r = decide_fallback("example.test", &rdap_err, Ok(whois), DnsPresence::Absent);
+        assert!(!r.available);
+        assert_eq!(r.confidence, "none");
+        assert_eq!(r.method, "inconclusive");
+    }
+
+    #[test]
+    fn rdap_404_with_refusal_whois_still_marks_available() {
+        // The refusal routing must NOT override an authoritative RDAP 404: a
+        // refused/throttled port-43 body with an RDAP 404 is still available.
+        let whois = whois_with("Access rate limited; please try again later.\n", None);
+        let rdap_err = SeerError::RdapError("query failed with status 404 Not Found".to_string());
+        let r = decide_fallback("example.test", &rdap_err, Ok(whois), DnsPresence::Unknown);
+        assert!(r.available, "RDAP 404 is authoritative over a refusal body");
+        assert_eq!(r.confidence, "high");
+        assert_eq!(r.method, "rdap");
     }
 }
