@@ -72,6 +72,18 @@ jobs:
       - name: Test seer-api
         run: python -m pytest seer-api/tests -q
 
+  msrv:
+    name: MSRV (Rust 1.88)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+      # Verify the workspace compiles on the declared MSRV against the committed
+      # Cargo.lock (no re-resolution). If a dependency bump raises the floor this
+      # fails — bump `rust-version` in Cargo.toml and the README/CLAUDE.md refs.
+      - run: cargo check --workspace --locked
+
   coverage:
     name: Coverage
     runs-on: ubuntu-latest

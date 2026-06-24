@@ -1417,7 +1417,9 @@ cargo check
 ## Version Information
 
 - **Rust Edition**: 2021
-- **Minimum Rust Version**: 1.70+
+- **Minimum Rust Version**: 1.88+ (enforced by the `msrv` CI job; floor set by
+  `x509-parser → time → time-macros`. Note: `std::fs::File::lock` is 1.89, only
+  one version above the floor — the earlier avoidance to "keep 1.70" was moot.)
 - **Python**: 3.9+ (ABI3 compatibility)
 - **License**: MIT
 
