@@ -342,6 +342,13 @@ fn propagation<'py>(
 
 const MAX_CONCURRENCY: usize = 50;
 
+/// Maximum number of domains accepted by a single `bulk_*` call. Mirrors the
+/// FastAPI router's `MAX_BULK_DOMAINS` (seer-api) so the binding — the real
+/// trust boundary for direct seer-py and MCP callers, which bypass the REST
+/// router — rejects oversized lists up front instead of buffering an unbounded
+/// `Vec` / JSON value / Python object graph with no backpressure (issue #58).
+const MAX_BULK_DOMAINS: usize = 100;
+
 fn validate_concurrency(concurrency: usize) -> PyResult<usize> {
     if concurrency > MAX_CONCURRENCY {
         return Err(PyValueError::new_err(format!(
@@ -350,6 +357,17 @@ fn validate_concurrency(concurrency: usize) -> PyResult<usize> {
         )));
     }
     Ok(concurrency.max(1))
+}
+
+fn validate_domains(domains: &[String]) -> PyResult<()> {
+    if domains.len() > MAX_BULK_DOMAINS {
+        return Err(PyValueError::new_err(format!(
+            "too many domains: {} (max {})",
+            domains.len(),
+            MAX_BULK_DOMAINS
+        )));
+    }
+    Ok(())
 }
 
 /// Internal progress event carried from the Tokio workers (where
@@ -508,6 +526,7 @@ fn bulk_lookup<'py>(
     concurrency: usize,
     progress: Option<Py<PyAny>>,
 ) -> PyResult<Bound<'py, PyAny>> {
+    validate_domains(&domains)?;
     let executor = BulkExecutor::new().with_concurrency(validate_concurrency(concurrency)?);
 
     let operations: Vec<BulkOperation> = domains
@@ -530,6 +549,7 @@ fn bulk_whois<'py>(
     concurrency: usize,
     progress: Option<Py<PyAny>>,
 ) -> PyResult<Bound<'py, PyAny>> {
+    validate_domains(&domains)?;
     let executor = BulkExecutor::new().with_concurrency(validate_concurrency(concurrency)?);
 
     let operations: Vec<BulkOperation> = domains
@@ -553,6 +573,7 @@ fn bulk_dig<'py>(
     concurrency: usize,
     progress: Option<Py<PyAny>>,
 ) -> PyResult<Bound<'py, PyAny>> {
+    validate_domains(&domains)?;
     let executor = BulkExecutor::new().with_concurrency(validate_concurrency(concurrency)?);
 
     let rt_parsed: RecordType = record_type
@@ -583,6 +604,7 @@ fn bulk_propagation<'py>(
     concurrency: usize,
     progress: Option<Py<PyAny>>,
 ) -> PyResult<Bound<'py, PyAny>> {
+    validate_domains(&domains)?;
     let executor = BulkExecutor::new().with_concurrency(validate_concurrency(concurrency)?);
 
     let rt_parsed: RecordType = record_type
@@ -620,6 +642,7 @@ fn bulk_status<'py>(
     concurrency: usize,
     progress: Option<Py<PyAny>>,
 ) -> PyResult<Bound<'py, PyAny>> {
+    validate_domains(&domains)?;
     let executor = BulkExecutor::new().with_concurrency(validate_concurrency(concurrency)?);
 
     let operations: Vec<BulkOperation> = domains
@@ -642,6 +665,7 @@ fn bulk_ssl<'py>(
     concurrency: usize,
     progress: Option<Py<PyAny>>,
 ) -> PyResult<Bound<'py, PyAny>> {
+    validate_domains(&domains)?;
     let executor = BulkExecutor::new().with_concurrency(validate_concurrency(concurrency)?);
 
     let operations: Vec<BulkOperation> = domains
@@ -664,6 +688,7 @@ fn bulk_availability<'py>(
     concurrency: usize,
     progress: Option<Py<PyAny>>,
 ) -> PyResult<Bound<'py, PyAny>> {
+    validate_domains(&domains)?;
     let executor = BulkExecutor::new().with_concurrency(validate_concurrency(concurrency)?);
 
     let operations: Vec<BulkOperation> = domains
@@ -855,6 +880,7 @@ fn bulk_info<'py>(
     concurrency: usize,
     progress: Option<Py<PyAny>>,
 ) -> PyResult<Bound<'py, PyAny>> {
+    validate_domains(&domains)?;
     let executor = BulkExecutor::new().with_concurrency(validate_concurrency(concurrency)?);
 
     let operations: Vec<BulkOperation> = domains
