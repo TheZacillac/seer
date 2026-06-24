@@ -133,6 +133,24 @@ except ImportError:
 logger = logging.getLogger("seer_api")
 
 
+# Hard cap on the number of distinct endpoint keys retained, as defense in
+# depth behind the route-template keying. Bounds the dict (and the `/metrics`
+# body) even if a high-cardinality label ever reaches `record` (issue #46).
+_MAX_ENDPOINT_KEYS = 256
+
+
+def _route_label(request: Request) -> str:
+    """Return the matched route's path *template* (e.g. ``/lookup/{domain}``)
+    rather than the concrete path (``/lookup/example.com``), so all values of a
+    path parameter collapse to one bounded key. Unmatched paths (404s) carry no
+    route in scope and are bucketed under a single fixed label so an attacker
+    cannot grow the metrics dict with arbitrary paths (issue #46).
+    """
+    route = request.scope.get("route")
+    template = getattr(route, "path", None)
+    return template if isinstance(template, str) and template else "<unmatched>"
+
+
 class RequestMetrics:
     """Request metrics collector.
 
@@ -151,7 +169,12 @@ class RequestMetrics:
     def record(self, path: str, status_code: int, latency_ms: float):
         self._total_requests += 1
         self._status_counts[status_code] += 1
-        self._endpoint_counts[path] += 1
+        # Bound the key set: count known keys, otherwise bucket under "<other>"
+        # so a flood of distinct labels can't grow the dict without bound.
+        if path in self._endpoint_counts or len(self._endpoint_counts) < _MAX_ENDPOINT_KEYS:
+            self._endpoint_counts[path] += 1
+        else:
+            self._endpoint_counts["<other>"] += 1
         self._total_latency_ms += latency_ms
         if status_code >= 400:
             self._total_errors += 1
@@ -195,7 +218,7 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
             response = await call_next(request)
         except Exception:
             latency_ms = (time.monotonic() - start_time) * 1000
-            metrics.record(request.url.path, 500, latency_ms)
+            metrics.record(_route_label(request), 500, latency_ms)
             logger.exception(
                 "request_id=%s method=%s path=%s status=500 latency_ms=%.1f",
                 request_id,
@@ -206,7 +229,7 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
             raise
 
         latency_ms = (time.monotonic() - start_time) * 1000
-        metrics.record(request.url.path, response.status_code, latency_ms)
+        metrics.record(_route_label(request), response.status_code, latency_ms)
 
         # Add request ID to response headers
         response.headers["X-Request-ID"] = request_id

@@ -4,10 +4,14 @@ import hmac
 import logging
 import os
 from contextlib import asynccontextmanager
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, ORJSONResponse
+from limits import parse as _parse_rate_limit
+from limits.storage import storage_from_string as _rate_storage_from_string
+from limits.strategies import MovingWindowRateLimiter
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from mcp.server.transport_security import TransportSecuritySettings
 from slowapi import _rate_limit_exceeded_handler
@@ -15,7 +19,8 @@ from slowapi.errors import RateLimitExceeded
 from starlette.routing import Route
 
 from . import __version__
-from .limiting import limiter
+from ._env import env_int
+from .limiting import get_client_ip, limiter
 from .mcp.server import mcp as mcp_server
 from .middleware import MaxBodySizeMiddleware, RequestLoggingMiddleware, metrics
 from .routers import dns, lookup, propagation, rdap, ssl, status, whois
@@ -105,6 +110,63 @@ class _McpAsgiApp:
 
 _mcp_asgi_app = _McpAsgiApp()
 
+
+# --- POST /mcp hardening (issue #55) ---------------------------------------
+# /mcp is a raw Starlette Route, so the per-route `@limiter.limit` decorators do
+# not cover it, and slowapi has no SlowAPIMiddleware registered (decorator mode).
+# Rate-limit the highest-fan-out surface (it can drive seer_bulk_* = up to 100
+# domains x concurrency) explicitly here, using the same env config as the REST
+# limiter so an operator's SEER_RATE_LIMIT / SEER_RATE_LIMIT_STORAGE applies.
+#
+# Built lazily on first /mcp request (not at import) so that configuring a
+# backend whose driver isn't installed — e.g. SEER_RATE_LIMIT_STORAGE=redis://
+# without the redis package — doesn't crash module import; it surfaces only if
+# /mcp is actually used, mirroring slowapi's own lazy storage behavior.
+_mcp_rate_limiter: MovingWindowRateLimiter | None = None
+_mcp_rate_value = None
+
+
+def _mcp_rate_ok(client_ip: str) -> bool:
+    """Record a hit for ``client_ip`` against the /mcp limit; False if over."""
+    global _mcp_rate_limiter, _mcp_rate_value
+    if _mcp_rate_limiter is None:
+        _mcp_rate_value = _parse_rate_limit(
+            os.environ.get("SEER_RATE_LIMIT", "30/minute")
+        )
+        _mcp_rate_limiter = MovingWindowRateLimiter(
+            _rate_storage_from_string(
+                os.environ.get("SEER_RATE_LIMIT_STORAGE", "memory://")
+            )
+        )
+    return _mcp_rate_limiter.hit(_mcp_rate_value, "mcp", client_ip)
+
+
+_LOCALHOST_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def _header_host(value: str) -> str:
+    """Lowercased hostname of an Origin/Host header value, or '' if absent."""
+    if not value:
+        return ""
+    parsed = urlsplit(value if "://" in value else "//" + value)
+    return (parsed.hostname or "").lower()
+
+
+def _mcp_browser_guard_active() -> bool:
+    """Whether the default localhost-Origin guard for /mcp applies.
+
+    Only in the unauthenticated dev posture with no explicit MCP allowlist: when
+    SEER_API_KEY is set, auth already blocks a drive-by (no bearer token); when
+    SEER_MCP_ALLOWED_HOSTS/_ORIGINS is set, the SDK's DNS-rebinding protection
+    covers it.
+    """
+    api_key = (os.environ.get("SEER_API_KEY") or "").strip()
+    allowlist = (
+        os.environ.get("SEER_MCP_ALLOWED_HOSTS", "")
+        or os.environ.get("SEER_MCP_ALLOWED_ORIGINS", "")
+    ).strip()
+    return not api_key and not allowlist
+
 # Rate limiter configuration is handled in limiting.py at construction time
 # via SEER_RATE_LIMIT env var (default: "30/minute")
 
@@ -123,8 +185,13 @@ async def lifespan(_app: FastAPI):
     # H10: in-memory rate limit with multiple workers is per-worker and
     # therefore bypassable by rotating through workers. Refuse to start.
     storage_uri = os.environ.get("SEER_RATE_LIMIT_STORAGE", "memory://")
-    workers = int(
-        os.environ.get("WEB_CONCURRENCY", os.environ.get("UVICORN_WORKERS", "1"))
+    # WEB_CONCURRENCY wins; UVICORN_WORKERS is the fallback; default 1. A
+    # non-integer (e.g. the PaaS convention WEB_CONCURRENCY=auto) raises a clear
+    # RuntimeError here instead of an opaque ValueError traceback (issue #50).
+    workers = env_int(
+        "WEB_CONCURRENCY",
+        env_int("UVICORN_WORKERS", 1, min_value=1),
+        min_value=1,
     )
     if workers > 1 and storage_uri == "memory://":
         log.error(
@@ -201,6 +268,27 @@ async def auth_middleware(request: Request, call_next):
     constant, so tests and rotating-secret deployments don't need an import
     reload to pick up the current key.
     """
+    # POST /mcp hardening (issue #55), applied before auth so an unauthenticated
+    # flood is throttled and a drive-by is refused regardless of credentials.
+    if request.url.path == "/mcp":
+        # Browser drive-by guard: a malicious page's fetch() carries a non-local
+        # Origin; non-browser MCP clients (curl, stdio bridges) send none.
+        if _mcp_browser_guard_active():
+            origin = request.headers.get("origin", "")
+            if origin and _header_host(origin) not in _LOCALHOST_HOSTS:
+                return JSONResponse(
+                    {
+                        "detail": "cross-origin /mcp blocked; set "
+                        "SEER_MCP_ALLOWED_ORIGINS or SEER_API_KEY to allow"
+                    },
+                    status_code=403,
+                )
+        # Rate-limit the raw /mcp route that the @limiter.limit decorators miss.
+        if not _mcp_rate_ok(get_client_ip(request)):
+            return JSONResponse(
+                {"detail": "rate limit exceeded"}, status_code=429
+            )
+
     # Treat a blank value (e.g. `SEER_API_KEY=""` from a misconfigured
     # secrets-manager placeholder) as "no key set" rather than letting
     # it silently disable auth via Python's empty-string falsy check.

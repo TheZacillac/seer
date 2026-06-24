@@ -12,6 +12,8 @@ from mcp.types import Tool, TextContent
 
 import seer
 
+from .._run import run_seer
+
 
 def _ssrf_guard(host: str, port: int = 443) -> None:
     """Raise ValueError if the host resolves to a reserved/internal address.
@@ -509,21 +511,25 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
 
 
 async def execute_tool(name: str, arguments: dict[str, Any]) -> Any:
-    """Execute the appropriate Seer function based on tool name."""
-    loop = asyncio.get_running_loop()
+    """Execute the appropriate Seer function based on tool name.
 
+    All blocking PyO3 calls are dispatched through ``run_seer`` (the bounded
+    ``_DISPATCH_EXECUTOR``) so the MCP-over-HTTP transport honors
+    ``SEER_DISPATCH_THREADS`` exactly like the REST routes, instead of spilling
+    onto asyncio's unbounded default executor (issue #48).
+    """
     match name:
         case "seer_lookup":
             domain = _require_str(arguments, "domain")
-            return await loop.run_in_executor(None, seer.lookup, domain)
+            return await run_seer(seer.lookup, domain)
 
         case "seer_whois":
             domain = _require_str(arguments, "domain")
-            return await loop.run_in_executor(None, seer.whois, domain)
+            return await run_seer(seer.whois, domain)
 
         case "seer_rdap_domain":
             domain = _require_str(arguments, "domain")
-            return await loop.run_in_executor(None, seer.rdap_domain, domain)
+            return await run_seer(seer.rdap_domain, domain)
 
         case "seer_rdap_ip":
             ip = _require_str(arguments, "ip")
@@ -531,14 +537,14 @@ async def execute_tool(name: str, arguments: dict[str, Any]) -> Any:
             # PyO3 and `block_on`s a DNS resolution, which would pin the
             # event loop for the resolver timeout. Mirrors the
             # `seer_bulk_status` / `seer_bulk_ssl` pattern.
-            await loop.run_in_executor(None, _ssrf_guard, ip, 443)
-            return await loop.run_in_executor(None, seer.rdap_ip, ip)
+            await run_seer(_ssrf_guard, ip, 443)
+            return await run_seer(seer.rdap_ip, ip)
 
         case "seer_rdap_asn":
             asn = arguments.get("asn")
             if isinstance(asn, bool) or not isinstance(asn, int) or asn < 0 or asn > 4294967295:
                 raise ValueError(f"'asn' must be an integer between 0 and 4294967295 (got {asn!r})")
-            return await loop.run_in_executor(None, seer.rdap_asn, asn)
+            return await run_seer(seer.rdap_asn, asn)
 
         case "seer_dig":
             domain = _require_str(arguments, "domain")
@@ -547,43 +553,43 @@ async def execute_tool(name: str, arguments: dict[str, Any]) -> Any:
             if nameserver is not None and not isinstance(nameserver, str):
                 raise ValueError(f"'nameserver' must be a string (got {type(nameserver).__name__})")
             if nameserver is not None:
-                await loop.run_in_executor(None, _ssrf_guard, nameserver, 53)
-            return await loop.run_in_executor(
-                None, seer.dig, domain, record_type, nameserver
+                await run_seer(_ssrf_guard, nameserver, 53)
+            return await run_seer(
+                seer.dig, domain, record_type, nameserver
             )
 
         case "seer_propagation":
             domain = _require_str(arguments, "domain")
             record_type = _require_record_type(arguments)
-            return await loop.run_in_executor(
-                None, seer.propagation, domain, record_type
+            return await run_seer(
+                seer.propagation, domain, record_type
             )
 
         case "seer_status":
             domain = _require_str(arguments, "domain")
-            await loop.run_in_executor(None, _ssrf_guard, domain, 443)
-            return await loop.run_in_executor(None, seer.status, domain)
+            await run_seer(_ssrf_guard, domain, 443)
+            return await run_seer(seer.status, domain)
 
         case "seer_bulk_lookup":
             domains = _require_domains(arguments)
             concurrency = _get_concurrency(arguments, default=10)
-            return await loop.run_in_executor(
-                None, seer.bulk_lookup, domains, concurrency
+            return await run_seer(
+                seer.bulk_lookup, domains, concurrency
             )
 
         case "seer_bulk_whois":
             domains = _require_domains(arguments)
             concurrency = _get_concurrency(arguments, default=10)
-            return await loop.run_in_executor(
-                None, seer.bulk_whois, domains, concurrency
+            return await run_seer(
+                seer.bulk_whois, domains, concurrency
             )
 
         case "seer_bulk_dig":
             domains = _require_domains(arguments)
             record_type = _require_record_type(arguments)
             concurrency = _get_concurrency(arguments, default=10)
-            return await loop.run_in_executor(
-                None, seer.bulk_dig, domains, record_type, concurrency
+            return await run_seer(
+                seer.bulk_dig, domains, record_type, concurrency
             )
 
         case "seer_bulk_status":
@@ -593,40 +599,40 @@ async def execute_tool(name: str, arguments: dict[str, Any]) -> Any:
             # Each `_ssrf_guard` call enters PyO3 and `block_on`s a DNS
             # resolution; doing that serially on the event loop pins it
             # for up to (N * resolver_timeout) for a 100-domain payload.
-            await loop.run_in_executor(
-                None, lambda: [_ssrf_guard(d, 443) for d in domains]
+            await run_seer(
+                lambda: [_ssrf_guard(d, 443) for d in domains]
             )
-            return await loop.run_in_executor(
-                None, seer.bulk_status, domains, concurrency
+            return await run_seer(
+                seer.bulk_status, domains, concurrency
             )
 
         case "seer_bulk_propagation":
             domains = _require_domains(arguments)
             record_type = _require_record_type(arguments)
             concurrency = _get_concurrency(arguments, default=5)
-            return await loop.run_in_executor(
-                None, seer.bulk_propagation, domains, record_type, concurrency
+            return await run_seer(
+                seer.bulk_propagation, domains, record_type, concurrency
             )
 
         case "seer_info":
             domain = _require_str(arguments, "domain")
-            return await loop.run_in_executor(None, seer.info, domain)
+            return await run_seer(seer.info, domain)
 
         case "seer_bulk_info":
             domains = _require_domains(arguments)
             concurrency = _get_concurrency(arguments, default=10)
-            return await loop.run_in_executor(
-                None, seer.bulk_info, domains, concurrency
+            return await run_seer(
+                seer.bulk_info, domains, concurrency
             )
 
         case "seer_bulk_ssl":
             domains = _require_domains(arguments)
             concurrency = _get_concurrency(arguments, default=10)
-            await loop.run_in_executor(
-                None, lambda: [_ssrf_guard(d, 443) for d in domains]
+            await run_seer(
+                lambda: [_ssrf_guard(d, 443) for d in domains]
             )
-            return await loop.run_in_executor(
-                None, seer.bulk_ssl, domains, concurrency
+            return await run_seer(
+                seer.bulk_ssl, domains, concurrency
             )
 
         case _:
