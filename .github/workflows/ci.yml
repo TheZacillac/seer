@@ -72,6 +72,36 @@ jobs:
       - name: Test seer-api
         run: python -m pytest seer-api/tests -q
 
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      - uses: Swatinem/rust-cache@v2
+      # Run the hermetic test suite once under instrumentation, then render
+      # report formats from the same profile data (no re-run). Informational
+      # only — this job does not gate merges on a coverage threshold.
+      - name: Collect coverage
+        run: cargo llvm-cov --workspace --no-report
+      - name: Print summary
+        run: cargo llvm-cov report --summary-only
+      - name: Generate HTML + lcov reports
+        run: |
+          cargo llvm-cov report --html
+          cargo llvm-cov report --lcov --output-path lcov.info
+      - name: Upload HTML report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-html
+          path: target/llvm-cov/html/
+          if-no-files-found: error
+
   audit:
     name: Security Audit
     runs-on: ubuntu-latest
