@@ -9,7 +9,7 @@ A high-performance, multi-interface domain utility suite — query WHOIS, RDAP, 
 [![CI](https://github.com/TheZacillac/seer/actions/workflows/ci.yml/badge.svg)](https://github.com/TheZacillac/seer/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/seer-cli.svg)](https://crates.io/crates/seer-cli)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org)
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org)
 
 [Features](#-features) · [Quick Start](#-quick-start) · [CLI Usage](#-cli-usage) · [Python](#-python-library) · [REST API](#-rest-api) · [MCP Server](#-mcp-server)
@@ -121,7 +121,7 @@ seer-core = "0.35"
 tokio = { version = "1", features = ["full"] }
 ```
 
-> **Requirements:** Rust 1.70+ · Python 3.9+ (for Python bindings/API)
+> **Requirements:** Rust 1.88+ · Python 3.9+ (for Python bindings/API)
 
 ---
 
