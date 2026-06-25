@@ -205,7 +205,14 @@ pub struct WhoisResponse {
     // downstream LLM consumers. The field is still populated internally for
     // is_available() / indicates_not_found() scanning and for callers that
     // access it directly via struct field.
-    #[serde(skip_serializing)]
+    //
+    // `default` is required alongside `skip_serializing`: without it, a
+    // round-trip through serialized JSON (e.g. lookup history persistence,
+    // the lookup cache) fails to deserialize with "missing field
+    // `raw_response`", because—unlike `Option`—a bare `String` is not
+    // defaulted on absence. The skip keeps it out of the JSON; the default
+    // lets it read back as empty.
+    #[serde(skip_serializing, default)]
     pub raw_response: String,
 }
 
@@ -1275,6 +1282,24 @@ Domain Status: clientTransferProhibited
             !json.contains("Domain Name: example.com"),
             "raw response content must not leak in JSON: {}",
             json
+        );
+    }
+
+    /// Regression: a serialized `WhoisResponse` must deserialize back.
+    /// `raw_response` is `skip_serializing` (the 1 MB raw blob must never leak),
+    /// but it also needs `default` — otherwise deserialization fails with
+    /// "missing field `raw_response`", which silently corrupts persisted lookup
+    /// history / cache files (the corrupt-file branch then discards them).
+    #[test]
+    fn whois_response_survives_json_round_trip() {
+        let parsed = make_response("Domain Name: example.com\nRegistrar: Example Registrar\n");
+        let json = serde_json::to_string(&parsed).expect("serialize");
+        let back: WhoisResponse =
+            serde_json::from_str(&json).expect("round-trip must not fail (missing field?)");
+        assert_eq!(back.domain, parsed.domain, "domain survives round-trip");
+        assert!(
+            back.raw_response.is_empty(),
+            "skipped raw_response defaults to empty on load"
         );
     }
 }

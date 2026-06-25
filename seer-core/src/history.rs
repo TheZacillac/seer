@@ -322,6 +322,40 @@ mod tests {
         assert_eq!(parsed.get("example.com").len(), 1);
     }
 
+    /// Regression: history must round-trip a WHOIS-bearing result.
+    ///
+    /// `test_history_serialization_roundtrip` above only exercises the
+    /// `Available` variant (`whois_data: None`), so it missed that
+    /// `WhoisResponse.raw_response` (`skip_serializing`) failed to deserialize
+    /// without `default`: every saved history containing a WHOIS lookup was
+    /// rejected as "missing field `raw_response`" on the next load, moved to
+    /// `.corrupt`, and silently dropped — so `seer history` and the TUI History
+    /// lens were always empty after a real lookup.
+    #[test]
+    fn history_roundtrips_a_whois_bearing_result() {
+        let whois = crate::whois::WhoisResponse::parse(
+            "example.com",
+            "whois.verisign-grs.com",
+            "Domain Name: example.com\nRegistrar: Example Registrar\n",
+        );
+        let result = LookupResult::Whois {
+            data: whois,
+            rdap_error: None,
+            rdap_fallback: None,
+        };
+        let mut history = LookupHistory::default();
+        history.record("example.com", result);
+
+        let json = serde_json::to_string(&history).expect("serialize");
+        let parsed: LookupHistory = serde_json::from_str(&json)
+            .expect("WHOIS-bearing history must deserialize (raw_response needs default)");
+        assert_eq!(
+            parsed.get("example.com").len(),
+            1,
+            "the WHOIS entry survives"
+        );
+    }
+
     /// Creates a unique temporary file path for a load-from-disk test.
     /// Returned path does not exist and the parent directory is created.
     /// The caller is responsible for cleaning up on drop (via the helper).
