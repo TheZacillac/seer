@@ -69,11 +69,16 @@ impl DomainDiffer {
         let domain_a = crate::validation::normalize_domain(domain_a)?;
         let domain_b = crate::validation::normalize_domain(domain_b)?;
 
+        // Box::pin each branch so the four heavyweight futures live on the heap
+        // instead of inlining into the join! state. Each lookup/status future
+        // itself joins many protocol futures; inlined, the combined `diff`
+        // future is ~105 KB and a single poll overflows a tokio worker stack in
+        // debug builds (TUI `:diff a b` crash). Boxing keeps the poll shallow.
         let (lookup_a, lookup_b, status_a, status_b) = tokio::join!(
-            self.lookup.lookup(&domain_a),
-            self.lookup.lookup(&domain_b),
-            self.status_client.check(&domain_a),
-            self.status_client.check(&domain_b),
+            Box::pin(self.lookup.lookup(&domain_a)),
+            Box::pin(self.lookup.lookup(&domain_b)),
+            Box::pin(self.status_client.check(&domain_a)),
+            Box::pin(self.status_client.check(&domain_b)),
         );
 
         let registration = build_registration_diff(lookup_a.ok().as_ref(), lookup_b.ok().as_ref());
@@ -281,5 +286,27 @@ mod tests {
         let (exp, created) = extract_dates(None);
         assert!(exp.is_none());
         assert!(created.is_none());
+    }
+
+    /// Regression guard for a debug-build stack overflow (TUI `:diff a b`).
+    ///
+    /// `diff()` joins four heavyweight futures (lookup ×2, status ×2), each of
+    /// which internally joins many protocol futures (RDAP/WHOIS/DNS/SSL/...).
+    /// If those four are inlined into the `join!` state instead of boxed, the
+    /// combined future balloons to tens of KB; a single inline poll then
+    /// overflows a 2 MB tokio worker stack once nested under the TUI's extra
+    /// `handle_action → data::fetch` wrapper frames. Boxing the joined futures
+    /// keeps this future small and the poll shallow.
+    #[test]
+    fn diff_future_stays_small_enough_for_the_stack() {
+        let differ = DomainDiffer::new();
+        // Construct but never await — keeps the test hermetic (no network).
+        let fut = differ.diff("example.com", "example.org");
+        let size = std::mem::size_of_val(&fut);
+        assert!(
+            size < 8_192,
+            "diff() future is {size} bytes; the four joined lookup/status \
+             futures must be boxed so they don't inline onto the poll stack"
+        );
     }
 }
