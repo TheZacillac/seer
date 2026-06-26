@@ -187,7 +187,13 @@ impl App {
             "whois" => FetchReq::Whois(d),
             "rdap" => match self.tab {
                 0 => FetchReq::RdapDomain(d),
-                1 => FetchReq::RdapIp(self.panes.dns.resolved_ip.clone().unwrap_or(d)),
+                // IP tab: only auto-fetch when a real IP has been resolved (from
+                // a prior DNS/Status lookup). Without one, fall back to the idle
+                // hint rather than firing RdapIp against a domain string.
+                1 => match self.panes.dns.resolved_ip.clone() {
+                    Some(ip) => FetchReq::RdapIp(ip),
+                    None => return None,
+                },
                 _ => return None, // ASN needs explicit :rdap AS…
             },
             "dns" => match self.tab {

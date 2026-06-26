@@ -7,7 +7,7 @@ use ratatui::Frame;
 
 use crate::tui::action::LensData;
 use crate::tui::theme::Theme;
-use crate::tui::widgets::panel;
+use crate::tui::widgets::{panel, scroll_to};
 
 pub fn render(
     f: &mut Frame,
@@ -53,7 +53,8 @@ pub fn render(
     let table = Table::new(rows, [Constraint::Percentage(100)])
         .header(header)
         .column_spacing(1);
-    f.render_widget(table, inner);
+    let mut state = scroll_to(focused.then_some(sel));
+    f.render_stateful_widget(table, inner, &mut state);
 }
 
 #[cfg(test)]
@@ -90,6 +91,30 @@ mod tests {
             .unwrap();
         let text = buf_text(terminal.backend().buffer());
         assert!(text.contains("www.example.com"));
+    }
+
+    #[test]
+    fn selecting_past_viewport_scrolls_last_row_into_view() {
+        let theme = Theme::frappe();
+        let hosts: Vec<String> = (0..60).map(|i| format!("h{i}.example.com")).collect();
+        let data = LensData::Subdomains(Box::new(SubdomainResult {
+            domain: "example.com".into(),
+            subdomains: hosts,
+            source: "crt.sh".into(),
+            count: 60,
+        }));
+        // Short terminal can't fit 60 rows; without scrolling the last host
+        // would never render even when selected.
+        let backend = TestBackend::new(60, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| render(f, f.area(), &theme, &data, true, 59))
+            .unwrap();
+        let text = buf_text(terminal.backend().buffer());
+        assert!(
+            text.contains("h59.example.com"),
+            "selecting the last row must scroll it into view"
+        );
     }
 
     #[test]

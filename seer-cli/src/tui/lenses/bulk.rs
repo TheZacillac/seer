@@ -8,7 +8,7 @@ use ratatui::Frame;
 use crate::tui::app::SPIN;
 use crate::tui::panes::bulk::{op_domain, BulkState, OPS};
 use crate::tui::theme::Theme;
-use crate::tui::widgets::{dot, gauge, panel};
+use crate::tui::widgets::{dot, gauge, panel, scroll_to};
 
 pub fn render(f: &mut Frame, area: Rect, theme: &Theme, bulk: &BulkState, editing: Option<&str>) {
     let rows = Layout::default()
@@ -175,7 +175,10 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, bulk: &BulkState, editin
     .header(header)
     .column_spacing(1);
 
-    f.render_widget(table, results_inner);
+    // Results stream in and append; keep the newest row in view by pinning the
+    // scroll to the last row.
+    let mut state = scroll_to(Some(bulk.rows.len().saturating_sub(1)));
+    f.render_stateful_widget(table, results_inner, &mut state);
 }
 
 #[cfg(test)]
@@ -227,6 +230,27 @@ mod tests {
         assert!(
             text.contains("rust-lang.org"),
             "rendered buffer should contain the domain"
+        );
+    }
+
+    #[test]
+    fn streaming_rows_keep_the_newest_in_view() {
+        let theme = Theme::frappe();
+        let mut bulk = BulkState::default();
+        // More rows than fit in a short terminal; the newest (last) row must
+        // stay visible as results stream in.
+        for i in 0..50 {
+            bulk.rows.push(make_result(&format!("d{i}.com"), true));
+        }
+        let backend = TestBackend::new(80, 14);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| render(f, f.area(), &theme, &bulk, None))
+            .unwrap();
+        let text = buf_text(&terminal);
+        assert!(
+            text.contains("d49.com"),
+            "the newest streamed row should be pinned in view"
         );
     }
 
