@@ -12,7 +12,7 @@ unsafe_code = "warn"
 unused_qualifications = "warn"
 
 [workspace.package]
-version = "0.35.5"
+version = "0.35.6"
 edition = "2021"
 # Real MSRV, enforced by the `msrv` CI job. The floor comes from the default
 # build path (x509-parser -> time -> time-macros requires 1.88). Bump this when

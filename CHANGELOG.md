@@ -11,6 +11,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.35.6] - 2026-06-26
+
+### Fixed
+- **TUI: selectable list lenses now scroll.** Propagation, Subdomains, History,
+  Watchlist, and DNS-records rendered plain non-scrolling tables, so a selection
+  moved past the viewport edge became invisible with no way to bring it back
+  (worst on Propagation's ~30 resolvers and Subdomains' often-hundreds of rows).
+  They now render statefully and keep the selected row in view; the Bulk results
+  table pins to the newest row as results stream in. ([#94])
+- **TUI: pane-driven lenses render in raw mode.** Toggling `r` (raw output) on
+  the Follow, Diff, or Bulk lens no longer drops them to the generic
+  "press / to look up a domain" idle hint — they have no raw serialization, so
+  they now render their normal pane in every output format. ([#94])
+- **TUI: RDAP IP tab** no longer fires an RDAP-IP lookup against a domain string
+  when no address has been resolved yet; it shows the idle hint instead. ([#94])
+
 ## [0.35.5] - 2026-06-24
 
 ### Changed
@@ -190,7 +206,8 @@ Two notable breaking changes landed in this period (see `CLAUDE.md` for details)
   `inconsistencies` became typed (`ConsensusValue` / `Inconsistency`) instead of
   pre-formatted strings.
 
-[Unreleased]: https://github.com/TheZacillac/seer/compare/v0.35.5...HEAD
+[Unreleased]: https://github.com/TheZacillac/seer/compare/v0.35.6...HEAD
+[0.35.6]: https://github.com/TheZacillac/seer/compare/v0.35.5...v0.35.6
 [0.35.5]: https://github.com/TheZacillac/seer/compare/v0.35.4...v0.35.5
 [0.35.4]: https://github.com/TheZacillac/seer/compare/v0.35.3...v0.35.4
 [0.35.3]: https://github.com/TheZacillac/seer/compare/v0.35.2...v0.35.3
@@ -208,3 +225,4 @@ Two notable breaking changes landed in this period (see `CLAUDE.md` for details)
 [#44]: https://github.com/TheZacillac/seer/pull/44
 [#62]: https://github.com/TheZacillac/seer/pull/62
 [#63]: https://github.com/TheZacillac/seer/pull/63
+[#94]: https://github.com/TheZacillac/seer/pull/94
