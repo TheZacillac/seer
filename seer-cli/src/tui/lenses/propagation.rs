@@ -6,7 +6,7 @@ use ratatui::Frame;
 
 use crate::tui::action::LensData;
 use crate::tui::theme::Theme;
-use crate::tui::widgets::{gauge, panel};
+use crate::tui::widgets::{gauge, panel, scroll_to};
 
 pub fn render(
     f: &mut Frame,
@@ -78,7 +78,6 @@ pub fn render(
     )
     .header(header)
     .column_spacing(1);
-    f.render_widget(table, inner);
+    let mut state = scroll_to(focused.then_some(sel));
+    f.render_stateful_widget(table, inner, &mut state);
 }
-
-// (Verified to compile; runtime rendering not yet exercised on a live terminal.)

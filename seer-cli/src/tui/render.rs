@@ -165,39 +165,38 @@ fn main_pane(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     };
 
     // Pane-driven interactive lenses render from `app.panes` state, not from a
-    // fetched `LensData`, so they never reach `LensState::Loaded`. Render them
-    // here in every state (human view only — they have no raw serialization).
-    if app.format == seer_core::output::OutputFormat::Human {
-        match lens.key {
-            "follow" => {
-                lenses::follow::render(f, content, theme, &app.panes.follow);
-                return;
-            }
-            "diff" => {
-                lenses::diff::render(
-                    f,
-                    content,
-                    theme,
-                    app.domain.as_deref(),
-                    &app.panes.diff.b,
-                    field_buf(&app.input_mode, EditTarget::DiffB),
-                    app.focus == Focus::Pane,
-                    app.state_of(app.lens),
-                );
-                return;
-            }
-            "bulk" => {
-                lenses::bulk::render(
-                    f,
-                    content,
-                    theme,
-                    &app.panes.bulk,
-                    field_buf(&app.input_mode, EditTarget::BulkDomains),
-                );
-                return;
-            }
-            _ => {}
+    // fetched `LensData`, so they never reach `LensState::Loaded`. They have no
+    // raw serialization either, so render them the same way in every format —
+    // otherwise toggling `r` would drop them to the generic "press /" idle hint.
+    match lens.key {
+        "follow" => {
+            lenses::follow::render(f, content, theme, &app.panes.follow);
+            return;
         }
+        "diff" => {
+            lenses::diff::render(
+                f,
+                content,
+                theme,
+                app.domain.as_deref(),
+                &app.panes.diff.b,
+                field_buf(&app.input_mode, EditTarget::DiffB),
+                app.focus == Focus::Pane,
+                app.state_of(app.lens),
+            );
+            return;
+        }
+        "bulk" => {
+            lenses::bulk::render(
+                f,
+                content,
+                theme,
+                &app.panes.bulk,
+                field_buf(&app.input_mode, EditTarget::BulkDomains),
+            );
+            return;
+        }
+        _ => {}
     }
 
     match app.state_of(app.lens) {

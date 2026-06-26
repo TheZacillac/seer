@@ -9,7 +9,7 @@ use crate::tui::action::LensData;
 use crate::tui::lenses::{compare, dnssec};
 use crate::tui::panes::Panes;
 use crate::tui::theme::Theme;
-use crate::tui::widgets::panel;
+use crate::tui::widgets::{panel, scroll_to};
 
 /// Nameserver labels matching `panes/dns.rs` NAMESERVERS order.
 const NS_LABELS: &[&str] = &["system", "8.8.8.8", "1.1.1.1"];
@@ -104,7 +104,8 @@ pub fn render(
     .header(header)
     .column_spacing(1)
     .style(Style::default().add_modifier(Modifier::empty()));
-    f.render_widget(table, chunks[2]);
+    let mut state = scroll_to(focused.then_some(sel));
+    f.render_stateful_widget(table, chunks[2], &mut state);
 }
 
 #[cfg(test)]
