@@ -85,7 +85,8 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, bulk: &BulkState, editin
     let gauge_label = format!("{}/{} done", bulk.rows.len(), denom);
     let gauge_line = gauge::line(ratio, 24, theme.mauve, Some(&gauge_label));
 
-    // Running status
+    // Running status + ok/failed tally
+    let (ok, failed) = bulk.tally();
     let spin_text = if bulk.running {
         format!("  {} running…", SPIN[0])
     } else if !bulk.rows.is_empty() {
@@ -100,13 +101,23 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, bulk: &BulkState, editin
     } else {
         theme.overlay0
     };
-    let status_line = Line::from(vec![Span::styled(
-        spin_text,
-        Style::default().fg(status_fg),
-    )]);
+    let mut status_spans = vec![Span::styled(spin_text, Style::default().fg(status_fg))];
+    if !bulk.rows.is_empty() {
+        status_spans.push(Span::styled(
+            format!("  ·  {ok} ok"),
+            Style::default().fg(theme.green),
+        ));
+        if failed > 0 {
+            status_spans.push(Span::styled(
+                format!("  ·  {failed} failed"),
+                Style::default().fg(theme.red),
+            ));
+        }
+    }
+    let status_line = Line::from(status_spans);
 
     // Hints
-    let hints = "d domains  ·  o op  ·  r run  ·  f file  ·  e export";
+    let hints = "d domains · o op · r run · x stop · j/k select · v detail · f file · e export";
     let hints_line = Line::from(Span::styled(hints, Style::default().fg(theme.overlay0)));
 
     // Optional note (e.g. file error)
@@ -120,11 +131,25 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, bulk: &BulkState, editin
 
     f.render_widget(Paragraph::new(lines), top_inner);
 
-    // ── bottom panel: results table ──────────────────────────────────────────
+    // ── bottom panel: results table (+ optional detail panel) ────────────────
+    let selected = bulk.effective_selected();
+
+    // When the detail panel is open and a row is selected, split the bottom
+    // area into the results table (top) and a detail panel (bottom).
+    let (table_area, detail_area) = if bulk.detail && selected.is_some() {
+        let split = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(3), Constraint::Length(9)])
+            .split(rows[1]);
+        (split[0], Some(split[1]))
+    } else {
+        (rows[1], None)
+    };
+
     let results_title = format!("Results  ·  seer bulk {}", bulk.op());
     let results_block = panel::block(theme, &results_title, theme.mauve, false);
-    let results_inner = results_block.inner(rows[1]);
-    f.render_widget(results_block, rows[1]);
+    let results_inner = results_block.inner(table_area);
+    f.render_widget(results_block, table_area);
 
     if bulk.rows.is_empty() {
         f.render_widget(
@@ -141,7 +166,7 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, bulk: &BulkState, editin
 
     let header = Row::new(["DOMAIN", "RESULT", "⚑"]).style(Style::default().fg(theme.overlay0));
 
-    let body = bulk.rows.iter().map(|r| {
+    let body = bulk.rows.iter().enumerate().map(|(i, r)| {
         let domain = op_domain(&r.operation).to_string();
         let result_text = if r.success {
             "ok".to_string()
@@ -153,6 +178,12 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, bulk: &BulkState, editin
         } else {
             dot::line(theme, "fail", "●")
         };
+        // Highlight the selected row so j/k navigation is visible.
+        let row_style = if Some(i) == selected {
+            Style::default().fg(theme.text).bg(theme.surface0)
+        } else {
+            Style::default().fg(theme.text)
+        };
         Row::new(vec![
             Line::from(domain),
             Line::from(Span::styled(
@@ -161,7 +192,7 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, bulk: &BulkState, editin
             )),
             flag,
         ])
-        .style(Style::default().fg(theme.text))
+        .style(row_style)
     });
 
     let table = Table::new(
@@ -175,10 +206,74 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, bulk: &BulkState, editin
     .header(header)
     .column_spacing(1);
 
-    // Results stream in and append; keep the newest row in view by pinning the
-    // scroll to the last row.
-    let mut state = scroll_to(Some(bulk.rows.len().saturating_sub(1)));
+    // Keep the selected row in view. While streaming with no manual selection,
+    // `effective_selected` is the tail, so newest rows stay pinned; once the
+    // user moves the selection it follows their choice instead.
+    let mut state = scroll_to(selected);
     f.render_stateful_widget(table, results_inner, &mut state);
+
+    // ── detail panel for the selected row ────────────────────────────────────
+    if let (Some(area), Some(idx)) = (detail_area, selected) {
+        if let Some(row) = bulk.rows.get(idx) {
+            let detail_block = panel::block(theme, "Detail", theme.sky, false);
+            let detail_inner = detail_block.inner(area);
+            f.render_widget(detail_block, area);
+            f.render_widget(
+                Paragraph::new(detail_lines(theme, row))
+                    .wrap(ratatui::widgets::Wrap { trim: false }),
+                detail_inner,
+            );
+        }
+    }
+}
+
+/// Build the detail view lines for a single result: a header row of facts plus
+/// the error or a pretty-printed JSON dump of the returned data.
+fn detail_lines<'a>(theme: &Theme, r: &seer_core::bulk::BulkResult) -> Vec<Line<'a>> {
+    let domain = op_domain(&r.operation).to_string();
+    let status = if r.success { "ok" } else { "failed" };
+    let status_fg = if r.success { theme.green } else { theme.red };
+
+    let mut lines = vec![Line::from(vec![
+        Span::styled(domain, Style::default().fg(theme.text)),
+        Span::styled("  ·  ", Style::default().fg(theme.overlay0)),
+        Span::styled(status, Style::default().fg(status_fg)),
+        Span::styled(
+            format!("  ·  {} ms", r.duration_ms),
+            Style::default().fg(theme.overlay0),
+        ),
+    ])];
+
+    if let Some(err) = &r.error {
+        lines.push(Line::from(Span::styled(
+            err.clone(),
+            Style::default().fg(theme.red),
+        )));
+    }
+
+    match &r.data {
+        Some(data) => match serde_json::to_string_pretty(data) {
+            Ok(json) => {
+                for l in json.lines() {
+                    lines.push(Line::from(Span::styled(
+                        l.to_string(),
+                        Style::default().fg(theme.subtext),
+                    )));
+                }
+            }
+            Err(_) => lines.push(Line::from(Span::styled(
+                "(could not render data)",
+                Style::default().fg(theme.overlay0),
+            ))),
+        },
+        None if r.error.is_none() => lines.push(Line::from(Span::styled(
+            "(no data)",
+            Style::default().fg(theme.overlay0),
+        ))),
+        None => {}
+    }
+
+    lines
 }
 
 #[cfg(test)]
@@ -298,5 +393,41 @@ mod tests {
         let text = buf_text(&terminal);
         assert!(text.contains("press d to enter"), "prompts for domains");
         assert!(text.contains("d domains"), "shows the new hint row");
+    }
+
+    #[test]
+    fn shows_ok_failed_summary() {
+        let theme = Theme::frappe();
+        let mut bulk = BulkState::default();
+        bulk.rows.push(make_result("ok.com", true));
+        bulk.rows.push(make_result("bad.com", false));
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| render(f, f.area(), &theme, &bulk, None))
+            .unwrap();
+        let text = buf_text(&terminal);
+        assert!(text.contains("1 ok"), "summary should report ok count");
+        assert!(text.contains("1 failed"), "summary should report failures");
+    }
+
+    #[test]
+    fn detail_panel_shows_error_for_selected_row() {
+        let theme = Theme::frappe();
+        let mut bulk = BulkState::default();
+        bulk.rows.push(make_result("bad.com", false)); // error: "timeout"
+        bulk.selected = Some(0);
+        bulk.detail = true;
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| render(f, f.area(), &theme, &bulk, None))
+            .unwrap();
+        let text = buf_text(&terminal);
+        assert!(text.contains("Detail"), "detail panel header should render");
+        assert!(
+            text.contains("timeout"),
+            "detail panel should show the row error"
+        );
     }
 }

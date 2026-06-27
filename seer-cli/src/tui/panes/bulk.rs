@@ -6,7 +6,9 @@ use crate::tui::action::{Action, BulkParams, EditTarget};
 use crate::tui::panes::PaneOutcome;
 
 /// Operation presets selectable with `o`.
-pub const OPS: &[&str] = &["lookup", "status", "dig", "avail", "info"];
+pub const OPS: &[&str] = &[
+    "lookup", "status", "dig", "avail", "info", "whois", "rdap", "ssl", "prop",
+];
 
 /// State for the Bulk lens — op selection, entered domains, rows, run status.
 #[derive(Default)]
@@ -25,6 +27,11 @@ pub struct BulkState {
     pub gen: u64,
     /// Expected row count for the current run (drives the gauge denominator).
     pub total: usize,
+    /// Selected result row. `None` follows the tail (newest row, the default
+    /// while streaming); `Some(i)` pins a user-chosen row for inspection.
+    pub selected: Option<usize>,
+    /// Whether the detail panel for the selected row is expanded.
+    pub detail: bool,
 }
 
 /// Parse a free-form domains blob (typed or pasted) into a capped list. Same
@@ -55,6 +62,47 @@ impl BulkState {
         self.rows.push(r);
     }
 
+    /// Count of successful / failed rows in the current run.
+    pub fn tally(&self) -> (usize, usize) {
+        let ok = self.rows.iter().filter(|r| r.success).count();
+        (ok, self.rows.len() - ok)
+    }
+
+    /// Effective selected row index: the user's pinned selection, or the tail
+    /// (newest row) when following the stream. `None` only when there are no
+    /// rows yet.
+    pub fn effective_selected(&self) -> Option<usize> {
+        if self.rows.is_empty() {
+            return None;
+        }
+        Some(
+            self.selected
+                .unwrap_or(self.rows.len() - 1)
+                .min(self.rows.len() - 1),
+        )
+    }
+
+    /// Reset run-scoped view state shared by `r` and file-load starts.
+    fn begin_run(&mut self) {
+        self.rows.clear();
+        self.running = true;
+        self.note = None;
+        self.gen += 1;
+        self.selected = None;
+        self.detail = false;
+    }
+
+    /// Move the selection by `delta` rows, pinning it (leaving tail-follow).
+    fn move_selection(&mut self, delta: isize) {
+        if self.rows.is_empty() {
+            return;
+        }
+        let last = self.rows.len() - 1;
+        let cur = self.selected.unwrap_or(last) as isize;
+        let next = (cur + delta).clamp(0, last as isize) as usize;
+        self.selected = Some(next);
+    }
+
     /// Handle a key event for the Bulk pane. `Some(_)` = consumed; never `Esc`.
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<PaneOutcome> {
         match key.code {
@@ -66,24 +114,36 @@ impl BulkState {
             // Edit the domains list
             KeyCode::Char('d') => Some(PaneOutcome::EditField(EditTarget::BulkDomains)),
             // Start a run with the entered domains
-            KeyCode::Char('r') | KeyCode::Enter => {
-                let domains = parse_domains_input(&self.domains);
-                if domains.is_empty() {
-                    return Some(PaneOutcome::Toast {
-                        tone: "info",
-                        msg: "enter domains first (d)",
-                    });
+            KeyCode::Char('r') => Some(self.start_run()),
+            // Move the result selection
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.move_selection(1);
+                Some(PaneOutcome::None)
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.move_selection(-1);
+                Some(PaneOutcome::None)
+            }
+            // Enter / 'v' — toggle the detail panel for the selected row when
+            // results exist; otherwise Enter starts a run (empty-state shortcut).
+            KeyCode::Enter | KeyCode::Char('v') => {
+                if self.rows.is_empty() {
+                    if matches!(key.code, KeyCode::Enter) {
+                        return Some(self.start_run());
+                    }
+                    return Some(PaneOutcome::None);
                 }
-                self.rows.clear();
-                self.running = true;
-                self.note = None;
-                self.gen += 1;
-                self.total = domains.len();
-                Some(PaneOutcome::Action(Action::StartBulk(BulkParams {
-                    op: self.op().to_string(),
-                    domains,
-                    gen: self.gen,
-                })))
+                self.detail = !self.detail;
+                Some(PaneOutcome::None)
+            }
+            // Cancel an in-flight run
+            KeyCode::Char('x') => {
+                if self.running {
+                    self.running = false;
+                    Some(PaneOutcome::Action(Action::StopBulk))
+                } else {
+                    Some(PaneOutcome::None)
+                }
             }
             // Open file-path field
             KeyCode::Char('f') => Some(PaneOutcome::EditField(EditTarget::BulkPath)),
@@ -99,6 +159,25 @@ impl BulkState {
             }
             _ => None,
         }
+    }
+
+    /// Validate the entered domains and emit a `StartBulk` action, or a toast
+    /// when the list is empty.
+    fn start_run(&mut self) -> PaneOutcome {
+        let domains = parse_domains_input(&self.domains);
+        if domains.is_empty() {
+            return PaneOutcome::Toast {
+                tone: "info",
+                msg: "enter domains first (d)",
+            };
+        }
+        self.begin_run();
+        self.total = domains.len();
+        PaneOutcome::Action(Action::StartBulk(BulkParams {
+            op: self.op().to_string(),
+            domains,
+            gen: self.gen,
+        }))
     }
 
     /// Build a CSV string from the current rows. Reuses the CLI's
@@ -264,6 +343,129 @@ mod tests {
         let mut s = BulkState::default();
         let out = s.handle_key(key(KeyCode::Esc));
         assert!(out.is_none(), "Esc must not be swallowed");
+    }
+
+    #[test]
+    fn enter_with_no_rows_starts_run() {
+        let mut s = BulkState::default();
+        s.domains = "a.com".into();
+        let out = s.handle_key(key(KeyCode::Enter));
+        assert!(s.running, "Enter in the empty state should start a run");
+        assert!(matches!(
+            out,
+            Some(PaneOutcome::Action(Action::StartBulk(_)))
+        ));
+    }
+
+    #[test]
+    fn enter_with_rows_toggles_detail_not_run() {
+        let mut s = BulkState::default();
+        s.rows.push(make_lookup_result("x.com"));
+        assert!(!s.detail);
+        let out = s.handle_key(key(KeyCode::Enter));
+        assert!(s.detail, "Enter with rows should open the detail panel");
+        assert!(!s.running, "Enter with rows must not start a run");
+        assert!(matches!(out, Some(PaneOutcome::None)));
+        // Toggling again closes it.
+        s.handle_key(key(KeyCode::Enter));
+        assert!(!s.detail);
+    }
+
+    #[test]
+    fn v_toggles_detail() {
+        let mut s = BulkState::default();
+        s.rows.push(make_lookup_result("x.com"));
+        s.handle_key(key(KeyCode::Char('v')));
+        assert!(s.detail);
+    }
+
+    #[test]
+    fn jk_move_selection_and_pin() {
+        let mut s = BulkState::default();
+        for i in 0..4 {
+            s.rows.push(make_lookup_result(&format!("d{i}.com")));
+        }
+        // No manual selection → effective selection follows the tail.
+        assert_eq!(s.selected, None);
+        assert_eq!(s.effective_selected(), Some(3));
+        // k moves up from the tail and pins.
+        s.handle_key(key(KeyCode::Char('k')));
+        assert_eq!(s.selected, Some(2));
+        // j moves down.
+        s.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(s.selected, Some(3));
+        // j is clamped at the last row.
+        s.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(s.selected, Some(3));
+    }
+
+    #[test]
+    fn arrows_also_move_selection() {
+        let mut s = BulkState::default();
+        s.rows.push(make_lookup_result("a.com"));
+        s.rows.push(make_lookup_result("b.com"));
+        s.handle_key(key(KeyCode::Up));
+        assert_eq!(s.selected, Some(0));
+        s.handle_key(key(KeyCode::Down));
+        assert_eq!(s.selected, Some(1));
+    }
+
+    #[test]
+    fn x_stops_running_and_cancels() {
+        let mut s = BulkState::default();
+        s.running = true;
+        let out = s.handle_key(key(KeyCode::Char('x')));
+        assert!(!s.running);
+        assert!(matches!(out, Some(PaneOutcome::Action(Action::StopBulk))));
+    }
+
+    #[test]
+    fn x_when_idle_is_noop() {
+        let mut s = BulkState::default();
+        let out = s.handle_key(key(KeyCode::Char('x')));
+        assert!(matches!(out, Some(PaneOutcome::None)));
+    }
+
+    #[test]
+    fn run_resets_selection_and_detail() {
+        let mut s = BulkState::default();
+        s.domains = "a.com b.com".into();
+        s.rows.push(make_lookup_result("old.com"));
+        s.selected = Some(0);
+        s.detail = true;
+        s.handle_key(key(KeyCode::Char('r')));
+        assert_eq!(s.selected, None, "selection resets on a new run");
+        assert!(!s.detail, "detail closes on a new run");
+        assert!(s.rows.is_empty(), "prior rows cleared on a new run");
+    }
+
+    #[test]
+    fn tally_counts_ok_and_failed() {
+        let mut s = BulkState::default();
+        s.rows.push(make_lookup_result("ok1.com"));
+        s.rows.push(BulkResult {
+            operation: BulkOperation::Lookup {
+                domain: "bad.com".into(),
+            },
+            success: false,
+            data: None,
+            error: Some("nope".into()),
+            duration_ms: 1,
+        });
+        assert_eq!(s.tally(), (1, 1));
+    }
+
+    #[test]
+    fn effective_selected_is_none_when_empty() {
+        let s = BulkState::default();
+        assert_eq!(s.effective_selected(), None);
+    }
+
+    #[test]
+    fn extended_ops_are_available() {
+        for op in ["whois", "rdap", "ssl", "prop"] {
+            assert!(OPS.contains(&op), "op preset {op} should be selectable");
+        }
     }
 
     #[test]

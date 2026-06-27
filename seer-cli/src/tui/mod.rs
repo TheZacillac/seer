@@ -92,12 +92,15 @@ async fn run_loop(terminal: &mut Term, domain: Option<String>) -> Result<()> {
     // App) because it owns I/O: a new run or a stop signals the old background
     // DNS loop so restarts don't stack live tasks.
     let mut follow_cancel: Option<tokio::sync::watch::Sender<bool>> = None;
+    // Abort handle for the in-flight bulk run. A new run or an explicit stop
+    // aborts the prior task so restarts don't stack concurrent batches.
+    let mut bulk_cancel: Option<tokio::task::AbortHandle> = None;
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Msg>();
     let mut events = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(100));
 
     for action in app.take_startup_actions() {
-        handle_action(action, &tx, &mut follow_cancel);
+        handle_action(action, &tx, &mut follow_cancel, &mut bulk_cancel);
     }
 
     terminal.draw(|f| render::view(f, &app, &theme))?;
@@ -114,7 +117,7 @@ async fn run_loop(terminal: &mut Term, domain: Option<String>) -> Result<()> {
 
         let actions = app.update(msg);
         for action in actions {
-            handle_action(action, &tx, &mut follow_cancel);
+            handle_action(action, &tx, &mut follow_cancel, &mut bulk_cancel);
         }
 
         if app.should_quit {
@@ -126,10 +129,64 @@ async fn run_loop(terminal: &mut Term, domain: Option<String>) -> Result<()> {
 }
 
 /// Execute a side-effecting Action returned by `App::update`.
+/// Build the bulk operation list for a TUI op preset. `dig`/`prop` default to
+/// an `A` record (matching the previous behaviour); unknown ops fall back to
+/// the smart lookup.
+fn build_bulk_operations(op: &str, domains: Vec<String>) -> Vec<seer_core::bulk::BulkOperation> {
+    use seer_core::bulk::BulkOperation;
+    use seer_core::RecordType;
+    domains
+        .into_iter()
+        .map(|domain| match op {
+            "status" => BulkOperation::Status { domain },
+            "dig" => BulkOperation::Dns {
+                domain,
+                record_type: RecordType::A,
+            },
+            "avail" => BulkOperation::Avail { domain },
+            "info" => BulkOperation::Info { domain },
+            "whois" => BulkOperation::Whois { domain },
+            "rdap" => BulkOperation::Rdap { domain },
+            "ssl" => BulkOperation::Ssl { domain },
+            "prop" => BulkOperation::Propagation {
+                domain,
+                record_type: RecordType::A,
+            },
+            _ => BulkOperation::Lookup { domain },
+        })
+        .collect()
+}
+
+/// Run a bulk batch, streaming each result over `tx` as it completes and a
+/// terminal `BulkDone`. Returns the spawned task's abort handle so the run can
+/// be cancelled.
+fn spawn_bulk_run(
+    tx: &tokio::sync::mpsc::UnboundedSender<Msg>,
+    operations: Vec<seer_core::bulk::BulkOperation>,
+    gen: u64,
+) -> tokio::task::AbortHandle {
+    let tx = tx.clone();
+    let handle = tokio::spawn(async move {
+        let ex = seer_core::BulkExecutor::new();
+        let cb_tx = tx.clone();
+        let cb: seer_core::bulk::ResultCallback =
+            Box::new(move |r: &seer_core::bulk::BulkResult| {
+                let _ = cb_tx.send(Msg::BulkStep {
+                    gen,
+                    result: Box::new(r.clone()),
+                });
+            });
+        let _ = ex.execute_streaming(operations, cb).await;
+        let _ = tx.send(Msg::BulkDone { gen });
+    });
+    handle.abort_handle()
+}
+
 fn handle_action(
     action: Action,
     tx: &tokio::sync::mpsc::UnboundedSender<Msg>,
     follow_cancel: &mut Option<tokio::sync::watch::Sender<bool>>,
+    bulk_cancel: &mut Option<tokio::task::AbortHandle>,
 ) {
     match action {
         Action::Quit => {}
@@ -244,29 +301,27 @@ fn handle_action(
             }
         }
         Action::StartBulk(p) => {
-            let tx = tx.clone();
-            let gen = p.gen;
-            tokio::spawn(async move {
-                let ex = seer_core::BulkExecutor::new();
-                let results = match p.op.as_str() {
-                    "status" => ex.execute_status(p.domains).await,
-                    "dig" => ex.execute_dns(p.domains, seer_core::RecordType::A).await,
-                    "avail" => ex.execute_avail(p.domains).await,
-                    "info" => ex.execute_info(p.domains).await,
-                    _ => ex.execute_lookup(p.domains).await,
-                };
-                for r in results {
-                    let _ = tx.send(Msg::BulkStep {
-                        gen,
-                        result: Box::new(r),
-                    });
-                }
-                let _ = tx.send(Msg::BulkDone { gen });
-            });
+            // Cancel any prior run so restarts don't stack concurrent batches.
+            if let Some(prev) = bulk_cancel.take() {
+                prev.abort();
+            }
+            let operations = build_bulk_operations(&p.op, p.domains);
+            *bulk_cancel = Some(spawn_bulk_run(tx, operations, p.gen));
+        }
+        Action::StopBulk => {
+            if let Some(prev) = bulk_cancel.take() {
+                prev.abort();
+            }
         }
         Action::StartBulkFromFile { op, path, gen } => {
+            // Cancel any prior run before starting the file-driven one.
+            if let Some(prev) = bulk_cancel.take() {
+                prev.abort();
+            }
             let tx = tx.clone();
-            tokio::spawn(async move {
+            // The file read is blocking and the run must own the abort handle,
+            // so the whole load+run lives in one task; we store its handle.
+            let handle = tokio::spawn(async move {
                 let read_result =
                     tokio::task::spawn_blocking(move || std::fs::read_to_string(&path)).await;
                 let Ok(Ok(content)) = read_result else {
@@ -280,22 +335,20 @@ fn handle_action(
                 let mut domains = seer_core::bulk::parse_domains_from_file(&content);
                 // Cap to 50 to match CLI bulk limit
                 domains.truncate(50);
+                let operations = build_bulk_operations(&op, domains);
                 let ex = seer_core::BulkExecutor::new();
-                let results = match op.as_str() {
-                    "status" => ex.execute_status(domains).await,
-                    "dig" => ex.execute_dns(domains, seer_core::RecordType::A).await,
-                    "avail" => ex.execute_avail(domains).await,
-                    "info" => ex.execute_info(domains).await,
-                    _ => ex.execute_lookup(domains).await,
-                };
-                for r in results {
-                    let _ = tx.send(Msg::BulkStep {
-                        gen,
-                        result: Box::new(r),
+                let cb_tx = tx.clone();
+                let cb: seer_core::bulk::ResultCallback =
+                    Box::new(move |r: &seer_core::bulk::BulkResult| {
+                        let _ = cb_tx.send(Msg::BulkStep {
+                            gen,
+                            result: Box::new(r.clone()),
+                        });
                     });
-                }
+                let _ = ex.execute_streaming(operations, cb).await;
                 let _ = tx.send(Msg::BulkDone { gen });
             });
+            *bulk_cancel = Some(handle.abort_handle());
         }
         Action::WriteCsv { path, contents } => {
             let tx = tx.clone();

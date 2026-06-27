@@ -89,6 +89,8 @@ impl Panes {
                 self.bulk.rows.clear();
                 self.bulk.note = None;
                 self.bulk.gen += 1;
+                self.bulk.selected = None;
+                self.bulk.detail = false;
                 // total is unknown for file loads; 0 means the gauge falls back to rows.
                 self.bulk.total = 0;
                 vec![Action::StartBulkFromFile {
