@@ -28,6 +28,7 @@ pub enum EditTarget {
     BulkPath,
     BulkDomains,
     WatchAdd,
+    TldFilter,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -136,6 +137,8 @@ pub enum Action {
     /// Cancel the in-flight live-follow run (its background DNS loop), if any.
     StopFollow,
     StartBulk(BulkParams),
+    /// Cancel the in-flight bulk run (aborts its background task), if any.
+    StopBulk,
     /// Trigger a bulk run from a newline-separated domain file (read off-thread in mod.rs).
     StartBulkFromFile {
         op: String,

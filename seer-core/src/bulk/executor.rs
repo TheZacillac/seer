@@ -19,6 +19,14 @@ use crate::whois::{WhoisClient, WhoisResponse};
 
 pub type ProgressCallback = Box<dyn Fn(usize, usize, &str) + Send + Sync>;
 
+/// Callback invoked with each [`BulkResult`] the moment it completes.
+///
+/// Results are delivered in completion order (matching the return-vec ordering
+/// contract on [`BulkExecutor::execute`]), so a UI can stream rows as they
+/// finish instead of waiting for the whole batch. The full vec is still
+/// returned for callers that want it.
+pub type ResultCallback = Box<dyn Fn(&BulkResult) + Send + Sync>;
+
 /// A single operation to perform in a bulk execution batch.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -132,6 +140,27 @@ impl BulkExecutor {
         operations: Vec<BulkOperation>,
         progress: Option<ProgressCallback>,
     ) -> Vec<BulkResult> {
+        self.execute_inner(operations, progress, None).await
+    }
+
+    /// Like [`execute`](Self::execute), but also invokes `on_result` with each
+    /// [`BulkResult`] as soon as it completes (completion order). Enables live
+    /// streaming of rows to a UI while the batch is still running.
+    pub async fn execute_streaming(
+        &self,
+        operations: Vec<BulkOperation>,
+        on_result: ResultCallback,
+    ) -> Vec<BulkResult> {
+        self.execute_inner(operations, None, Some(on_result)).await
+    }
+
+    #[instrument(skip(self, operations, progress, on_result), fields(count = operations.len(), concurrency = self.concurrency))]
+    async fn execute_inner(
+        &self,
+        operations: Vec<BulkOperation>,
+        progress: Option<ProgressCallback>,
+        on_result: Option<ResultCallback>,
+    ) -> Vec<BulkResult> {
         let total = operations.len();
         let completed = Arc::new(AtomicUsize::new(0));
 
@@ -165,6 +194,7 @@ impl BulkExecutor {
             .map(|op| {
                 let completed = completed.clone();
                 let progress = progress.as_ref();
+                let on_result = on_result.as_ref();
                 let limiter = limiter.clone();
                 let whois_client = &self.whois_client;
                 let rdap_client = &self.rdap_client;
@@ -227,7 +257,7 @@ impl BulkExecutor {
                         progress(count, total, desc);
                     }
 
-                    match result {
+                    let bulk_result = match result {
                         Ok(data) => BulkResult {
                             operation: op,
                             success: true,
@@ -247,7 +277,15 @@ impl BulkExecutor {
                                 duration_ms,
                             }
                         }
+                    };
+
+                    // Stream the row to any subscriber before it is folded into
+                    // the collected vec, so a UI sees results as they finish.
+                    if let Some(on_result) = on_result {
+                        on_result(&bulk_result);
                     }
+
+                    bulk_result
                 }
             })
             // CONTRACT (#61): results come back in COMPLETION order, not input
@@ -621,6 +659,38 @@ csv,format,example.org
             matches!(r.operation, BulkOperation::Ssl { ref domain } if domain == "seer-bulk-ssl-test.invalid"),
             "expected Ssl variant, got {:?}",
             r.operation
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_streaming_invokes_callback_per_result() {
+        use std::sync::atomic::AtomicUsize;
+        // Hermetic: `.invalid` hosts fail fast at DNS. We only assert the
+        // streaming contract — one callback per operation, and the callback
+        // count equals the returned vec length.
+        let executor = BulkExecutor::new().with_rate_limit(Duration::ZERO);
+        let seen = Arc::new(AtomicUsize::new(0));
+        let seen_cb = seen.clone();
+        let cb: ResultCallback = Box::new(move |_r: &BulkResult| {
+            seen_cb.fetch_add(1, Ordering::Relaxed);
+        });
+        let operations = vec![
+            BulkOperation::Avail {
+                domain: "seer-stream-1.invalid".to_string(),
+            },
+            BulkOperation::Avail {
+                domain: "seer-stream-2.invalid".to_string(),
+            },
+            BulkOperation::Avail {
+                domain: "seer-stream-3.invalid".to_string(),
+            },
+        ];
+        let results = executor.execute_streaming(operations, cb).await;
+        assert_eq!(results.len(), 3, "all operations should be returned");
+        assert_eq!(
+            seen.load(Ordering::Relaxed),
+            3,
+            "callback must fire exactly once per result"
         );
     }
 

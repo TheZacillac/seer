@@ -453,6 +453,18 @@ impl App {
                     gen,
                 }]
             }
+            EditTarget::TldFilter => {
+                // Commit the filter, then load details for the first match so the
+                // detail panel reflects the new selection without an extra ↵.
+                self.panes.tld.set_filter(value);
+                self.states.remove("tld");
+                let cur = self.panes.tld.current();
+                if cur.is_empty() {
+                    vec![]
+                } else {
+                    vec![self.fetch_action(FetchReq::Tld(cur))]
+                }
+            }
             EditTarget::FollowInterval
             | EditTarget::FollowCount
             | EditTarget::BulkPath

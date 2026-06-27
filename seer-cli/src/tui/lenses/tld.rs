@@ -1,77 +1,181 @@
-//! TLD Info lens — chip switcher + KV display of TLD registry data.
+//! TLD Browser lens — live-filterable, scrollable list over the full TLD
+//! catalog with a per-TLD registry detail panel.
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Paragraph, Row, Table};
 use ratatui::Frame;
 
-use crate::tui::action::LensData;
-use crate::tui::panes::{tld::TLDS, Panes};
+use crate::tui::panes::tld::{filter_catalog, TldState};
 use crate::tui::theme::Theme;
-use crate::tui::widgets::{kv, panel};
+use crate::tui::widgets::{kv, panel, scroll_to};
+use seer_core::TldInfo;
 
-pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData, panes: &Panes) {
-    let LensData::Tld(t) = data else {
-        return;
-    };
-
-    let block = panel::block(theme, "TLD Info", theme.maroon, false);
+/// Render the TLD browser. `loaded` is the detail for the most recently fetched
+/// TLD (if any); `loading` is true while a fetch is in flight; `editing` is the
+/// in-progress filter buffer when the filter field is active (drives live
+/// filtering).
+pub fn render(
+    f: &mut Frame,
+    area: Rect,
+    theme: &Theme,
+    state: &TldState,
+    loaded: Option<&TldInfo>,
+    loading: bool,
+    editing: Option<&str>,
+) {
+    let block = panel::block(theme, "TLD Browser", theme.maroon, false);
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    // Split into: chips row (1 line) + hint (1 line) + KV
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Min(0),
+            Constraint::Length(1), // filter line
+            Constraint::Length(1), // hint line
+            Constraint::Min(3),    // list
+            Constraint::Length(8), // detail
         ])
         .split(inner);
 
-    // Chip row — highlight selected TLD with mauve, others with subtext
-    let selected = panes.tld.idx;
-    let mut spans: Vec<Span> = Vec::new();
-    for (i, tld) in TLDS.iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::raw(" "));
-        }
-        let style = if i == selected {
-            Style::default().fg(theme.base).bg(theme.mauve)
-        } else {
-            Style::default().fg(theme.subtext).bg(theme.surface0)
-        };
-        spans.push(Span::styled(format!(" {tld} "), style));
-    }
-    f.render_widget(Paragraph::new(Line::from(spans)), chunks[0]);
+    // The list filters live against the in-progress edit buffer when the filter
+    // field is active, otherwise against the committed filter.
+    let effective_filter = editing.unwrap_or(&state.filter);
+    let list = filter_catalog(effective_filter);
+    let sel = if list.is_empty() {
+        0
+    } else {
+        state.sel.min(list.len() - 1)
+    };
 
-    // Hint line
+    // ── filter line ──────────────────────────────────────────────────────────
+    let filter_line = if let Some(buf) = editing {
+        Line::from(vec![
+            Span::styled("filter: ", Style::default().fg(theme.overlay0)),
+            Span::styled(format!("{buf}▏"), Style::default().fg(theme.text)),
+            Span::styled(
+                format!("   {} match{}", list.len(), plural(list.len())),
+                Style::default().fg(theme.overlay0),
+            ),
+        ])
+    } else if state.filter.is_empty() {
+        Line::from(vec![
+            Span::styled("filter: ", Style::default().fg(theme.overlay0)),
+            Span::styled(
+                format!("(all {} TLDs)", list.len()),
+                Style::default().fg(theme.overlay0),
+            ),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled("filter: ", Style::default().fg(theme.overlay0)),
+            Span::styled(state.filter.clone(), Style::default().fg(theme.sky)),
+            Span::styled(
+                format!("   {} match{}", list.len(), plural(list.len())),
+                Style::default().fg(theme.overlay0),
+            ),
+        ])
+    };
+    f.render_widget(Paragraph::new(filter_line), chunks[0]);
+
+    // ── hint line ──────────────────────────────────────────────────────────
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "h/l switch TLD",
+            "/ filter  ·  j/k move  ·  g/G top/bottom  ·  ↵ load details",
             Style::default().fg(theme.overlay0),
         ))),
         chunks[1],
     );
 
-    let dash = || "—".to_string();
-    let rows: Vec<(String, String)> = vec![
-        ("tld".into(), t.tld.clone()),
-        ("type".into(), t.tld_type.clone()),
-        ("whois".into(), t.whois_server.clone().unwrap_or_else(dash)),
-        ("rdap".into(), t.rdap_url.clone().unwrap_or_else(dash)),
-        (
-            "registry".into(),
-            t.registry_url.clone().unwrap_or_else(dash),
-        ),
-    ];
-    kv::render(f, chunks[2], theme, theme.maroon, &rows);
+    // ── list ─────────────────────────────────────────────────────────────────
+    if list.is_empty() {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "no TLDs match — adjust the filter",
+                Style::default().fg(theme.overlay0),
+            ))),
+            chunks[2],
+        );
+    } else {
+        let rows = list.iter().enumerate().map(|(i, tld)| {
+            let style = if i == sel {
+                Style::default().fg(theme.text).bg(theme.surface0)
+            } else {
+                Style::default().fg(theme.subtext)
+            };
+            Row::new(vec![Line::from(format!(".{tld}"))]).style(style)
+        });
+        let table = Table::new(rows, [Constraint::Percentage(100)]).column_spacing(0);
+        let mut ts = scroll_to(Some(sel));
+        f.render_stateful_widget(table, chunks[2], &mut ts);
+    }
+
+    // ── detail ─────────────────────────────────────────────────────────────
+    let detail_block = panel::block(theme, "Registry", theme.maroon, false);
+    let detail_inner = detail_block.inner(chunks[3]);
+    f.render_widget(detail_block, chunks[3]);
+
+    let selected_dotted = list.get(sel).map(|t| format!(".{t}")).unwrap_or_default();
+
+    if loading {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!("querying {selected_dotted}…"),
+                Style::default().fg(theme.overlay),
+            ))),
+            detail_inner,
+        );
+        return;
+    }
+
+    // Only show the loaded detail when it matches the highlighted TLD, so moving
+    // the selection without reloading doesn't show stale data for another TLD.
+    let detail_matches = loaded.is_some_and(|t| {
+        let want = selected_dotted.trim_start_matches('.');
+        t.tld.trim_start_matches('.') == want
+    });
+
+    if let (true, Some(t)) = (detail_matches, loaded) {
+        let dash = || "—".to_string();
+        let rows: Vec<(String, String)> = vec![
+            ("tld".into(), t.tld.clone()),
+            ("type".into(), t.tld_type.clone()),
+            ("whois".into(), t.whois_server.clone().unwrap_or_else(dash)),
+            ("rdap".into(), t.rdap_url.clone().unwrap_or_else(dash)),
+            (
+                "registry".into(),
+                t.registry_url.clone().unwrap_or_else(dash),
+            ),
+        ];
+        kv::render(f, detail_inner, theme, theme.maroon, &rows);
+    } else {
+        let hint = if selected_dotted.is_empty() {
+            "—".to_string()
+        } else {
+            format!("press ↵ to load details for {selected_dotted}")
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                hint,
+                Style::default().fg(theme.overlay0),
+            ))),
+            detail_inner,
+        );
+    }
+}
+
+fn plural(n: usize) -> &'static str {
+    if n == 1 {
+        ""
+    } else {
+        "es"
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::panes::Panes;
+    use crate::tui::panes::tld::TldState;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
     use seer_core::TldInfo;
@@ -87,60 +191,75 @@ mod tests {
         s
     }
 
-    fn tld_fixture() -> seer_core::TldInfo {
+    fn com_info() -> TldInfo {
         TldInfo {
-            tld: ".com".into(),
+            tld: "com".into(),
             whois_server: Some("whois.verisign-grs.com".into()),
             rdap_url: None,
             registry_url: None,
-            tld_type: "gTLD".into(),
+            tld_type: "generic".into(),
         }
     }
 
-    #[test]
-    fn renders_whois_server() {
+    fn draw(state: &TldState, loaded: Option<&TldInfo>, editing: Option<&str>) -> String {
         let theme = Theme::frappe();
-        let data = LensData::Tld(Box::new(tld_fixture()));
-        let panes = Panes::default();
-        let backend = TestBackend::new(70, 12);
+        let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|f| render(f, f.area(), &theme, &data, &panes))
+            .draw(|f| render(f, f.area(), &theme, state, loaded, false, editing))
             .unwrap();
-        assert!(buf_text(terminal.backend().buffer()).contains("whois.verisign-grs.com"));
+        buf_text(terminal.backend().buffer())
     }
 
     #[test]
-    fn renders_chip_row_with_all_tlds() {
-        let theme = Theme::frappe();
-        let data = LensData::Tld(Box::new(tld_fixture()));
-        let panes = Panes::default();
-        let backend = TestBackend::new(80, 12);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| render(f, f.area(), &theme, &data, &panes))
-            .unwrap();
-        let text = buf_text(terminal.backend().buffer());
-        assert!(text.contains(".com"), "chip row should contain .com");
-        assert!(text.contains(".net"), "chip row should contain .net");
-        assert!(text.contains(".io"), "chip row should contain .io");
+    fn lists_many_tlds_and_count() {
+        let state = TldState::default();
+        let text = draw(&state, None, None);
+        // The "(all N TLDs)" count should reflect the full catalog.
+        assert!(text.contains("all "), "should show the all-TLDs count");
+        assert!(text.contains("TLDs"), "should label the count");
+        // A few well-known TLDs should be visible somewhere in the rendered list.
+        assert!(text.contains(".com"), "list should contain .com");
     }
 
     #[test]
-    fn selected_chip_matches_pane_idx() {
-        let theme = Theme::frappe();
-        let data = LensData::Tld(Box::new(tld_fixture()));
-        let mut panes = Panes::default();
-        panes.tld.idx = 2; // .org
-        let backend = TestBackend::new(80, 12);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| render(f, f.area(), &theme, &data, &panes))
-            .unwrap();
-        let text = buf_text(terminal.backend().buffer());
+    fn live_filter_buffer_narrows_the_list() {
+        let state = TldState::default();
+        // Editing buffer "shop" filters live without mutating committed state.
+        let text = draw(&state, None, Some("shop"));
+        assert!(text.contains("filter: shop"), "shows the edit buffer");
+        assert!(text.contains(".shop"), "filtered list shows .shop");
+        assert!(!text.contains(".com "), "unrelated TLDs filtered out");
+    }
+
+    #[test]
+    fn detail_shows_loaded_tld_matching_selection() {
+        let state = TldState::default(); // selected .com
+        let info = com_info();
+        let text = draw(&state, Some(&info), None);
         assert!(
-            text.contains(".org"),
-            "selected chip .org should be visible"
+            text.contains("whois.verisign-grs.com"),
+            "detail panel should render the loaded TLD's whois server"
+        );
+    }
+
+    #[test]
+    fn detail_hint_when_nothing_loaded() {
+        let state = TldState::default();
+        let text = draw(&state, None, None);
+        assert!(
+            text.contains("press ↵ to load details"),
+            "should prompt to load details when none are loaded"
+        );
+    }
+
+    #[test]
+    fn empty_filter_match_shows_placeholder() {
+        let state = TldState::default();
+        let text = draw(&state, None, Some("zzzznotatld"));
+        assert!(
+            text.contains("no TLDs match"),
+            "empty match set should show a placeholder"
         );
     }
 }

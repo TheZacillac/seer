@@ -11,6 +11,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **TUI Bulk lens: live streaming results.** A new `execute_streaming` path in
+  `seer-core` streams each `BulkResult` to the UI the moment it completes, so the
+  progress gauge and results table fill in row-by-row during a run instead of
+  snapping from 0% to 100% only when the whole batch finished.
+- **TUI Bulk lens: inspect individual results.** Move the selection with `j`/`k`
+  (or the arrow keys) and press `↵`/`v` to open a detail panel showing the
+  selected row's status, duration, error, and a pretty-printed dump of the
+  returned data.
+- **TUI Bulk lens: cancel a run.** Press `x` to abort an in-flight batch,
+  mirroring the Follow lens's stop control.
+- **TUI Bulk lens: ok/failed summary** in the status line, plus four more op
+  presets — `whois`, `rdap`, `ssl`, and `prop`.
+- **TUI TLD lens: full catalog browser.** The TLD lens previously cycled a
+  hardcoded list of 7 TLDs with `h`/`l`. It is now a live-filterable, scrollable
+  browser over the entire ~1,400-entry TLD catalog: `/` (or `f`) edits a
+  substring filter that narrows the list as you type, `j`/`k`/arrows move,
+  `g`/`G` jump to top/bottom, and `↵`/`l` loads the selected TLD's registry
+  detail (WHOIS server, RDAP URL, registry URL, type). New
+  `seer_core::all_tlds()` exposes the catalog (WHOIS server map ∪ RDAP-only
+  TLDs).
+
 ## [0.35.6] - 2026-06-26
 
 ### Fixed

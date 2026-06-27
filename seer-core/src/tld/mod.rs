@@ -3,6 +3,11 @@ use serde::{Deserialize, Serialize};
 use crate::rdap::RdapClient;
 use crate::whois::{get_registry_url, get_whois_server};
 
+/// The full catalog of TLDs seer knows about (sorted, deduplicated). Re-exported
+/// from the WHOIS server registry so callers can browse every TLD, not just the
+/// ones with a static WHOIS server.
+pub use crate::whois::all_tlds;
+
 /// Information about a Top-Level Domain (TLD).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TldInfo {
