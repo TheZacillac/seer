@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.36.0] - 2026-06-27
+
 ### Added
 - **TUI Bulk lens: live streaming results.** A new `execute_streaming` path in
   `seer-core` streams each `BulkResult` to the UI the moment it completes, so the
@@ -228,7 +230,8 @@ Two notable breaking changes landed in this period (see `CLAUDE.md` for details)
   `inconsistencies` became typed (`ConsensusValue` / `Inconsistency`) instead of
   pre-formatted strings.
 
-[Unreleased]: https://github.com/TheZacillac/seer/compare/v0.35.6...HEAD
+[Unreleased]: https://github.com/TheZacillac/seer/compare/v0.36.0...HEAD
+[0.36.0]: https://github.com/TheZacillac/seer/compare/v0.35.6...v0.36.0
 [0.35.6]: https://github.com/TheZacillac/seer/compare/v0.35.5...v0.35.6
 [0.35.5]: https://github.com/TheZacillac/seer/compare/v0.35.4...v0.35.5
 [0.35.4]: https://github.com/TheZacillac/seer/compare/v0.35.3...v0.35.4
