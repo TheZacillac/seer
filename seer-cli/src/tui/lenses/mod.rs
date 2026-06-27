@@ -236,13 +236,12 @@ pub fn render(
         // Phase 2 renderers
         "reverse" => reverse::render(f, area, theme, data),
         "avail" => avail::render(f, area, theme, data),
-        "tld" => tld::render(f, area, theme, data, panes),
         "watch" => watch::render(f, area, theme, data, focused, sel),
         "history" => history::render(f, area, theme, data, focused, sel),
         "subdomains" => subdomains::render(f, area, theme, data, focused, sel),
-        // Phase 4 — streaming lenses
-        // ("follow" and "bulk" are handled in render.rs::main_pane before the
-        //  state match, since they never reach LensState::Loaded — unreachable)
+        // Pane-driven lenses ("follow", "bulk", "tld") are handled in
+        // render.rs::main_pane before the state match — they render from
+        // `app.panes` state and never reach this generic dispatch.
         other => placeholder::render(f, area, theme, other),
     }
 }

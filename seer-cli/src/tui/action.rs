@@ -28,6 +28,7 @@ pub enum EditTarget {
     BulkPath,
     BulkDomains,
     WatchAdd,
+    TldFilter,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]

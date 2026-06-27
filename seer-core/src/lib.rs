@@ -37,7 +37,7 @@ pub use dns::{
 pub use lookup::{LookupProgressCallback, LookupResult, SmartLookup};
 pub use rdap::{RdapClient, RdapResponse};
 pub use status::{CertificateInfo, DnsResolution, DomainExpiration, StatusClient, StatusResponse};
-pub use tld::{lookup_tld, TldInfo};
+pub use tld::{all_tlds, lookup_tld, TldInfo};
 pub use whois::{WhoisClient, WhoisResponse};
 
 pub use bulk::{BulkExecutor, BulkOperation, BulkResult};

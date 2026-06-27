@@ -1471,3 +1471,56 @@ pub fn get_registry_url(tld: &str) -> Option<String> {
         tld_lower
     ))
 }
+
+/// TLDs that are intentionally absent from `WHOIS_SERVERS` (RDAP-only — see the
+/// note on that map) but are still valid, lookupable TLDs. Listed here so the
+/// TLD browser can surface them even though they have no WHOIS server. These
+/// all resolve via RDAP (`lookup_tld` fills `rdap_url` from IANA bootstrap).
+pub const RDAP_ONLY_TLDS: &[&str] = &[
+    "ads", "android", "app", "boo", "cal", "channel", "chrome", "dad", "day", "dev", "docs",
+    "drive", "eat", "esq", "fly", "foo", "gle", "gmail", "goog", "google", "hangout", "here",
+    "how", "ing", "meet", "meme", "mov", "new", "nexus", "page", "phd", "play", "prof", "rsvp",
+    "search", "soy", "youtube", "zip",
+];
+
+/// Returns every TLD seer knows about: the WHOIS server map keys unioned with
+/// the RDAP-only TLDs, sorted and deduplicated. Backs the TUI TLD browser so it
+/// can list the full ~1,400-entry catalog instead of a hardcoded handful.
+pub fn all_tlds() -> &'static [&'static str] {
+    static ALL: Lazy<Vec<&'static str>> = Lazy::new(|| {
+        let mut v: Vec<&'static str> = WHOIS_SERVERS.keys().copied().collect();
+        v.extend_from_slice(RDAP_ONLY_TLDS);
+        v.sort_unstable();
+        v.dedup();
+        v
+    });
+    &ALL
+}
+
+#[cfg(test)]
+mod all_tlds_tests {
+    use super::*;
+
+    #[test]
+    fn all_tlds_is_sorted_deduped_and_large() {
+        let tlds = all_tlds();
+        assert!(
+            tlds.len() > 1000,
+            "expected the full catalog, got {}",
+            tlds.len()
+        );
+        // Sorted + deduplicated.
+        for w in tlds.windows(2) {
+            assert!(w[0] < w[1], "not strictly sorted at {:?}", w);
+        }
+    }
+
+    #[test]
+    fn all_tlds_includes_whois_and_rdap_only() {
+        let tlds = all_tlds();
+        // A WHOIS-mapped TLD and an RDAP-only one both appear.
+        assert!(tlds.contains(&"com"), "com (WHOIS) should be present");
+        assert!(tlds.contains(&"app"), "app (RDAP-only) should be present");
+        assert!(tlds.contains(&"dev"), "dev (RDAP-only) should be present");
+    }
+}

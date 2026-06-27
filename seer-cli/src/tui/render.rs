@@ -7,7 +7,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
-use crate::tui::action::{EditTarget, Focus, InputMode, LensState};
+use crate::tui::action::{EditTarget, Focus, InputMode, LensData, LensState};
 use crate::tui::app::{App, SPIN};
 use crate::tui::lenses::{self};
 use crate::tui::theme::Theme;
@@ -193,6 +193,23 @@ fn main_pane(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
                 theme,
                 &app.panes.bulk,
                 field_buf(&app.input_mode, EditTarget::BulkDomains),
+            );
+            return;
+        }
+        "tld" => {
+            let (loaded, loading) = match app.state_of(app.lens) {
+                LensState::Loaded(LensData::Tld(t)) => (Some(t.as_ref()), false),
+                LensState::Loading => (None, true),
+                _ => (None, false),
+            };
+            lenses::tld::render(
+                f,
+                content,
+                theme,
+                &app.panes.tld,
+                loaded,
+                loading,
+                field_buf(&app.input_mode, EditTarget::TldFilter),
             );
             return;
         }

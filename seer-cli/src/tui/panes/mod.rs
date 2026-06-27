@@ -114,6 +114,7 @@ impl Panes {
             EditTarget::FollowCount => self.follow.count.to_string(),
             EditTarget::BulkPath => String::new(),
             EditTarget::BulkDomains => self.bulk.domains.clone(),
+            EditTarget::TldFilter => self.tld.filter.clone(),
             _ => String::new(),
         }
     }

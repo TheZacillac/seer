@@ -24,6 +24,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mirroring the Follow lens's stop control.
 - **TUI Bulk lens: ok/failed summary** in the status line, plus four more op
   presets — `whois`, `rdap`, `ssl`, and `prop`.
+- **TUI TLD lens: full catalog browser.** The TLD lens previously cycled a
+  hardcoded list of 7 TLDs with `h`/`l`. It is now a live-filterable, scrollable
+  browser over the entire ~1,400-entry TLD catalog: `/` (or `f`) edits a
+  substring filter that narrows the list as you type, `j`/`k`/arrows move,
+  `g`/`G` jump to top/bottom, and `↵`/`l` loads the selected TLD's registry
+  detail (WHOIS server, RDAP URL, registry URL, type). New
+  `seer_core::all_tlds()` exposes the catalog (WHOIS server map ∪ RDAP-only
+  TLDs).
 
 ## [0.35.6] - 2026-06-26
 
