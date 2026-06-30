@@ -49,6 +49,22 @@ pub async fn run(domain: Option<String>) -> Result<()> {
 
 fn setup_terminal() -> Result<Term> {
     enable_raw_mode()?;
+    // From here on, raw mode is active. If any later step fails, `?` would
+    // return without disabling it, leaving the user's shell wedged (no echo /
+    // no line buffering). Undo the terminal state we entered on any error,
+    // mirroring the panic-hook cleanup (best-effort).
+    setup_terminal_after_raw().inspect_err(|_| {
+        let _ = execute!(
+            io::stdout(),
+            DisableBracketedPaste,
+            LeaveAlternateScreen,
+            crossterm::cursor::Show
+        );
+        let _ = disable_raw_mode();
+    })
+}
+
+fn setup_terminal_after_raw() -> Result<Term> {
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
     Ok(Terminal::new(CrosstermBackend::new(stdout))?)

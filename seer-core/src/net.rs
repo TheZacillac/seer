@@ -49,6 +49,12 @@ static FALLBACK_RESOLVER: Lazy<Option<TokioResolver>> = Lazy::new(|| {
     builder.build().ok()
 });
 
+/// Upper bound on the primary OS-resolver (`getaddrinfo`) lookup in
+/// [`resolve_public_host`]. `getaddrinfo` has no built-in deadline; this cap
+/// stops a single hostile/black-holed hostname from hanging a worker thread
+/// indefinitely. Matches the fallback resolver's 5s per-attempt budget.
+const PRIMARY_RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Reject an IP address if it belongs to any range that is not appropriate
 /// for outbound queries from a public-facing tool.
 ///
@@ -192,16 +198,34 @@ pub async fn resolve_public_host(host: &str, port: u16) -> Result<Vec<SocketAddr
         return Ok(vec![SocketAddr::new(ip, port)]);
     }
 
-    let addrs: Vec<SocketAddr> = match lookup_host((host, port)).await {
-        Ok(iter) => iter.collect(),
-        Err(os_err) => {
-            // OS resolver could not answer — fall back to hickory (Google DNS)
-            // so a broken system resolver doesn't take the whole tool down.
-            // Logged at debug! because the fallback is transparent by design;
-            // NXDOMAIN for a host that genuinely doesn't exist (e.g. a stale
-            // WHOIS server entry) lands here too, so warn! would cry wolf on
-            // benign negative answers. If BOTH resolvers fail, the
-            // InvalidInput error below is the load-bearing signal.
+    // Cap the primary OS-resolver (`getaddrinfo`) lookup: it has no built-in
+    // deadline and can hang indefinitely against a black-holed authoritative
+    // server, which would pin a worker/dispatch thread forever (a cheap DoS).
+    // On timeout we treat it like an OS-resolver error and fall through to the
+    // hickory fallback, which is itself bounded (opts.timeout / attempts).
+    let addrs: Vec<SocketAddr> = match tokio::time::timeout(
+        PRIMARY_RESOLVE_TIMEOUT,
+        lookup_host((host, port)),
+    )
+    .await
+    {
+        Ok(Ok(iter)) => iter.collect(),
+        os_failure => {
+            // OS resolver could not answer (error or timeout) — fall back to
+            // hickory (Google DNS) so a broken/hung system resolver doesn't
+            // take the whole tool down. Logged at debug! because the fallback
+            // is transparent by design; NXDOMAIN for a host that genuinely
+            // doesn't exist (e.g. a stale WHOIS server entry) lands here too,
+            // so warn! would cry wolf on benign negative answers. If BOTH
+            // resolvers fail, the InvalidInput error below is the
+            // load-bearing signal.
+            let os_err = match os_failure {
+                Ok(Err(e)) => e.to_string(),
+                _ => format!(
+                    "OS resolver timed out after {}s",
+                    PRIMARY_RESOLVE_TIMEOUT.as_secs()
+                ),
+            };
             debug!(
                 host = %host,
                 error = %os_err,

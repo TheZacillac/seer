@@ -12,12 +12,17 @@ impl MarkdownFormatter {
                 None => dash.to_string(),
             }
         };
+        // Sanitize and wrap each item in its own code span BEFORE joining, so
+        // the `, ` separator's backticks aren't fed through MdSafe (which would
+        // mangle them into apostrophes). Mirrors every other markdown formatter.
         let list_or_dash = |v: &Vec<String>| -> String {
             if v.is_empty() {
                 dash.to_string()
             } else {
-                let joined = v.join("`, `");
-                format!("`{}`", MdSafe(&joined))
+                v.iter()
+                    .map(|s| format!("`{}`", MdSafe(s)))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             }
         };
 
@@ -130,5 +135,57 @@ impl MarkdownFormatter {
         ));
 
         output.join("\n")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::diff::{DnsDiff, DomainDiff, RegistrationDiff, SslDiff};
+    use crate::output::markdown::MarkdownFormatter;
+
+    fn diff_with_nameservers(ns: Vec<String>) -> DomainDiff {
+        DomainDiff {
+            domain_a: "a.com".to_string(),
+            domain_b: "b.com".to_string(),
+            registration: RegistrationDiff {
+                registrar: (None, None),
+                organization: (None, None),
+                created: (None, None),
+                expires: (None, None),
+            },
+            dns: DnsDiff {
+                a_records: (Vec::new(), Vec::new()),
+                nameservers: (ns, Vec::new()),
+                resolves: (true, false),
+            },
+            ssl: SslDiff {
+                issuer: (None, None),
+                valid_until: (None, None),
+                days_remaining: (None, None),
+                is_valid: (None, None),
+            },
+        }
+    }
+
+    #[test]
+    fn test_markdown_diff_list_renders_per_item_code_spans() {
+        let diff = diff_with_nameservers(vec![
+            "ns1.example.com".to_string(),
+            "ns2.example.com".to_string(),
+        ]);
+        let output = MarkdownFormatter::new().format_diff(&diff);
+
+        // Each item must be its own inline-code span, joined by a plain ", ".
+        assert!(
+            output.contains("`ns1.example.com`, `ns2.example.com`"),
+            "expected per-item code spans, got:\n{}",
+            output
+        );
+        // The separator backticks must NOT have been mangled into apostrophes.
+        assert!(
+            !output.contains("ns1.example.com', 'ns2.example.com"),
+            "separator backticks were corrupted into apostrophes:\n{}",
+            output
+        );
     }
 }

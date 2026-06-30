@@ -101,7 +101,12 @@ pub async fn fetch(req: FetchReq) -> Result<LensData, String> {
             .map(|r| LensData::Diff(Box::new(r)))
             .map_err(e),
         FetchReq::Watch => {
-            let wl = seer_core::Watchlist::load();
+            // Watchlist load is blocking file I/O — offload it so the TUI's
+            // async select! loop keeps servicing other in-flight lookups
+            // (mirrors the History path below).
+            let wl = tokio::task::spawn_blocking(seer_core::Watchlist::load)
+                .await
+                .map_err(|err| err.to_string())?;
             Ok(LensData::Watch(Box::new(
                 seer_core::check_watchlist(&wl.domains).await,
             )))

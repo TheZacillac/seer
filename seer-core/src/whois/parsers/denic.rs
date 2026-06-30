@@ -140,14 +140,18 @@ impl RegistryParser for DenicParser {
             }
         }
 
-        // Map DENIC status to more descriptive values
+        // Map DENIC's status vocabulary to more descriptive values. These are
+        // DENIC-specific terms, NOT EPP statuses — in particular `failed` means
+        // the registry's automated nameserver delegation check failed (the
+        // domain is registered but its DNS is misconfigured), which is unrelated
+        // to the EPP `redemptionPeriod` deletion-grace state.
         let mapped_status: Vec<String> = status
             .iter()
             .map(|s| match s.as_str() {
                 "connect" => "active".to_string(),
                 "free" => "available".to_string(),
                 "invalid" => "invalid".to_string(),
-                "failed" => "redemptionPeriod".to_string(),
+                "failed" => "failed (nameserver check failed)".to_string(),
                 other => other.to_string(),
             })
             .collect();
@@ -244,6 +248,37 @@ Name: Technical Contact
         assert_eq!(dt.year(), 2023);
         assert_eq!(dt.month(), 1);
         assert_eq!(dt.day(), 15);
+    }
+
+    const SAMPLE_DENIC_FAILED: &str = r#"
+Domain: broken.de
+Nserver: ns1.broken.de
+Status: failed
+Changed: 2023-01-15T10:30:00+01:00
+"#;
+
+    /// DENIC `Status: failed` means the registry's nameserver delegation check
+    /// failed (DNS misconfigured) — the registration itself is intact. It must
+    /// NOT be relabeled `redemptionPeriod`, an EPP/RGP concept (domain pending
+    /// deletion) that doesn't apply to .de and would mislead the user into
+    /// thinking the domain is about to be released.
+    #[test]
+    fn test_denic_failed_status_is_not_redemption_period() {
+        let parser = DenicParser::new();
+        let result = parser.parse("broken.de", "whois.denic.de", SAMPLE_DENIC_FAILED);
+
+        assert!(
+            !result.status.contains(&"redemptionPeriod".to_string()),
+            "DENIC 'failed' must not be mapped to redemptionPeriod, got {:?}",
+            result.status
+        );
+        assert!(
+            result
+                .status
+                .contains(&"failed (nameserver check failed)".to_string()),
+            "expected a delegation-failure label, got {:?}",
+            result.status
+        );
     }
 
     #[test]

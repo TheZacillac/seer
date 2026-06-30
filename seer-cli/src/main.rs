@@ -420,6 +420,20 @@ fn emit_error<E: std::fmt::Display>(output_format: seer_core::output::OutputForm
     std::process::exit(1);
 }
 
+/// Parses a DNS record type, routing a bad value through [`emit_error`] so the
+/// `--format json|yaml` error contract still holds. Using `?` here instead would
+/// bubble a raw `anyhow` error past the formatter and print ANSI prose even when
+/// the caller asked for structured output.
+fn parse_record_type(
+    record_type: &str,
+    output_format: seer_core::output::OutputFormat,
+) -> seer_core::RecordType {
+    match record_type.parse::<seer_core::RecordType>() {
+        Ok(rt) => rt,
+        Err(e) => emit_error(output_format, &e),
+    }
+}
+
 async fn execute_command(
     command: Commands,
     output_format: seer_core::output::OutputFormat,
@@ -534,7 +548,7 @@ async fn execute_command(
             server,
         } => {
             let resolver = seer_core::DnsResolver::new().with_timeout(config.dns_timeout());
-            let rt: seer_core::RecordType = record_type.parse()?;
+            let rt = parse_record_type(&record_type, output_format);
             let ns = server
                 .as_ref()
                 .map(|s| s.trim_start_matches('@'))
@@ -558,7 +572,7 @@ async fn execute_command(
             record_type,
         } => {
             let checker = seer_core::dns::PropagationChecker::new();
-            let rt: seer_core::RecordType = record_type.parse()?;
+            let rt = parse_record_type(&record_type, output_format);
 
             match checker.check(&domain, rt).await {
                 Ok(result) => {
@@ -925,7 +939,7 @@ async fn execute_command(
             server,
             changes_only,
         } => {
-            let rt: seer_core::RecordType = record_type.parse()?;
+            let rt = parse_record_type(&record_type, output_format);
             let ns = server
                 .as_ref()
                 .map(|s| s.trim_start_matches('@'))
@@ -1061,7 +1075,7 @@ async fn execute_command(
             server_b,
         } => {
             let comparator = seer_core::dns::DnsComparator::new();
-            let rt: seer_core::RecordType = record_type.parse()?;
+            let rt = parse_record_type(&record_type, output_format);
             let ns_a = server_a.trim_start_matches('@');
             let ns_b = server_b.trim_start_matches('@');
             match comparator.compare(&domain, rt, ns_a, ns_b).await {
@@ -1120,7 +1134,11 @@ async fn execute_command(
             }
         }
         Commands::Watch { action, domain } => {
-            let mut watchlist = seer_core::Watchlist::load();
+            // Watchlist file I/O is blocking — run it on a blocking thread so it
+            // doesn't stall the async runtime (mirrors the History handler).
+            let mut watchlist = tokio::task::spawn_blocking(seer_core::Watchlist::load)
+                .await
+                .unwrap_or_default();
             match action.as_deref() {
                 Some("add") => {
                     let domain = domain
@@ -1128,7 +1146,13 @@ async fn execute_command(
                         .ok_or_else(|| anyhow::anyhow!("Usage: seer watch add <domain>"))?;
                     match watchlist.add(domain) {
                         Ok(true) => {
-                            watchlist.save()?;
+                            let save_result =
+                                tokio::task::spawn_blocking(move || watchlist.save()).await;
+                            match save_result {
+                                Ok(Ok(())) => {}
+                                Ok(Err(e)) => return Err(e.into()),
+                                Err(e) => return Err(e.into()),
+                            }
                             println!("Added {} to watchlist", domain.ctp_green());
                         }
                         Ok(false) => {
@@ -1145,7 +1169,13 @@ async fn execute_command(
                         .as_deref()
                         .ok_or_else(|| anyhow::anyhow!("Usage: seer watch remove <domain>"))?;
                     if watchlist.remove(domain) {
-                        watchlist.save()?;
+                        let save_result =
+                            tokio::task::spawn_blocking(move || watchlist.save()).await;
+                        match save_result {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => return Err(e.into()),
+                            Err(e) => return Err(e.into()),
+                        }
                         println!("Removed {} from watchlist", domain.ctp_green());
                     } else {
                         println!("{} was not in the watchlist", domain);

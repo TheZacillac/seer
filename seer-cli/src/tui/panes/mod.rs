@@ -74,13 +74,16 @@ impl Panes {
         match t {
             EditTarget::FollowInterval => {
                 if let Ok(val) = v.parse::<u64>() {
-                    self.follow.interval_secs = val.max(1);
+                    // Clamp to the same range core enforces so a valid-looking
+                    // over-range value can't fail FollowConfig::new and silently
+                    // no-op the run.
+                    self.follow.interval_secs = val.clamp(1, seer_core::MAX_FOLLOW_INTERVAL_SECS);
                 }
                 vec![]
             }
             EditTarget::FollowCount => {
                 if let Ok(val) = v.parse::<usize>() {
-                    self.follow.count = val.max(1);
+                    self.follow.count = val.clamp(1, seer_core::MAX_FOLLOW_ITERATIONS);
                 }
                 vec![]
             }
@@ -117,5 +120,45 @@ impl Panes {
             EditTarget::TldFilter => self.tld.filter.clone(),
             _ => String::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Follow interval/count edits must be clamped to the SAME upper bound
+    /// `seer_core::FollowConfig::new` enforces. Otherwise an in-range-looking
+    /// value (e.g. 3601s / 10001 iterations) passes the field-level check but is
+    /// later rejected by core, and the run silently no-ops with no feedback.
+    #[test]
+    fn follow_interval_is_clamped_to_core_max() {
+        let mut panes = Panes::default();
+        panes.apply_field(EditTarget::FollowInterval, "3601".to_string(), None);
+        assert_eq!(
+            panes.follow.interval_secs,
+            seer_core::MAX_FOLLOW_INTERVAL_SECS,
+            "over-range interval must be clamped to the core maximum"
+        );
+    }
+
+    #[test]
+    fn follow_count_is_clamped_to_core_max() {
+        let mut panes = Panes::default();
+        panes.apply_field(EditTarget::FollowCount, "10001".to_string(), None);
+        assert_eq!(
+            panes.follow.count,
+            seer_core::MAX_FOLLOW_ITERATIONS,
+            "over-range count must be clamped to the core maximum"
+        );
+    }
+
+    #[test]
+    fn follow_fields_keep_lower_bound_of_one() {
+        let mut panes = Panes::default();
+        panes.apply_field(EditTarget::FollowInterval, "0".to_string(), None);
+        panes.apply_field(EditTarget::FollowCount, "0".to_string(), None);
+        assert_eq!(panes.follow.interval_secs, 1);
+        assert_eq!(panes.follow.count, 1);
     }
 }
