@@ -203,49 +203,45 @@ pub async fn resolve_public_host(host: &str, port: u16) -> Result<Vec<SocketAddr
     // server, which would pin a worker/dispatch thread forever (a cheap DoS).
     // On timeout we treat it like an OS-resolver error and fall through to the
     // hickory fallback, which is itself bounded (opts.timeout / attempts).
-    let addrs: Vec<SocketAddr> = match tokio::time::timeout(
-        PRIMARY_RESOLVE_TIMEOUT,
-        lookup_host((host, port)),
-    )
-    .await
-    {
-        Ok(Ok(iter)) => iter.collect(),
-        os_failure => {
-            // OS resolver could not answer (error or timeout) — fall back to
-            // hickory (Google DNS) so a broken/hung system resolver doesn't
-            // take the whole tool down. Logged at debug! because the fallback
-            // is transparent by design; NXDOMAIN for a host that genuinely
-            // doesn't exist (e.g. a stale WHOIS server entry) lands here too,
-            // so warn! would cry wolf on benign negative answers. If BOTH
-            // resolvers fail, the InvalidInput error below is the
-            // load-bearing signal.
-            let os_err = match os_failure {
-                Ok(Err(e)) => e.to_string(),
-                _ => format!(
-                    "OS resolver timed out after {}s",
-                    PRIMARY_RESOLVE_TIMEOUT.as_secs()
-                ),
-            };
-            debug!(
-                host = %host,
-                error = %os_err,
-                "OS resolver could not resolve host; trying hickory fallback"
-            );
-            let Some(resolver) = FALLBACK_RESOLVER.as_ref() else {
-                return Err(SeerError::InvalidInput(format!(
+    let addrs: Vec<SocketAddr> =
+        match tokio::time::timeout(PRIMARY_RESOLVE_TIMEOUT, lookup_host((host, port))).await {
+            Ok(Ok(iter)) => iter.collect(),
+            os_failure => {
+                // OS resolver could not answer (error or timeout) — fall back to
+                // hickory (Google DNS) so a broken/hung system resolver doesn't
+                // take the whole tool down. Logged at debug! because the fallback
+                // is transparent by design; NXDOMAIN for a host that genuinely
+                // doesn't exist (e.g. a stale WHOIS server entry) lands here too,
+                // so warn! would cry wolf on benign negative answers. If BOTH
+                // resolvers fail, the InvalidInput error below is the
+                // load-bearing signal.
+                let os_err = match os_failure {
+                    Ok(Err(e)) => e.to_string(),
+                    _ => format!(
+                        "OS resolver timed out after {}s",
+                        PRIMARY_RESOLVE_TIMEOUT.as_secs()
+                    ),
+                };
+                debug!(
+                    host = %host,
+                    error = %os_err,
+                    "OS resolver could not resolve host; trying hickory fallback"
+                );
+                let Some(resolver) = FALLBACK_RESOLVER.as_ref() else {
+                    return Err(SeerError::InvalidInput(format!(
                     "DNS resolution failed for {host}: {os_err} (no fallback resolver available)"
                 )));
-            };
-            match resolver.lookup_ip(host).await {
-                Ok(resp) => resp.iter().map(|ip| SocketAddr::new(ip, port)).collect(),
-                Err(fallback_err) => {
-                    return Err(SeerError::InvalidInput(format!(
-                        "DNS resolution failed for {host}: {os_err} (fallback: {fallback_err})"
-                    )));
+                };
+                match resolver.lookup_ip(host).await {
+                    Ok(resp) => resp.iter().map(|ip| SocketAddr::new(ip, port)).collect(),
+                    Err(fallback_err) => {
+                        return Err(SeerError::InvalidInput(format!(
+                            "DNS resolution failed for {host}: {os_err} (fallback: {fallback_err})"
+                        )));
+                    }
                 }
             }
-        }
-    };
+        };
 
     if addrs.is_empty() {
         return Err(SeerError::InvalidInput(format!(
