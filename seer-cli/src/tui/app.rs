@@ -73,6 +73,16 @@ impl App {
         app
     }
 
+    /// Seeds session defaults from the user config (`~/.seer/config.toml`).
+    ///
+    /// Pure: the caller (`mod.rs`) performs the file I/O and passes the loaded
+    /// config in, keeping this `App` layer free of I/O. Currently seeds the
+    /// output format used by the raw-output view; the DNS pane's nameserver is
+    /// a fixed system/Google/Cloudflare picker and is intentionally left alone.
+    pub fn apply_config(&mut self, config: &seer_core::SeerConfig) {
+        self.format = config.output_format.parse().unwrap_or(OutputFormat::Human);
+    }
+
     /// Drain the actions queued at construction (initial lookup).
     pub fn take_startup_actions(&mut self) -> Vec<Action> {
         std::mem::take(&mut self.startup)

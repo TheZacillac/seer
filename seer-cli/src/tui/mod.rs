@@ -104,6 +104,9 @@ fn install_panic_hook() {
 async fn run_loop(terminal: &mut Term, domain: Option<String>) -> Result<()> {
     let theme = Theme::frappe();
     let mut app = App::new(domain);
+    // Seed session defaults (output format) from ~/.seer/config.toml so the TUI
+    // honors the user's config like the CLI subcommands do.
+    app.apply_config(&seer_core::SeerConfig::load());
     // Cancel token for the in-flight live-follow run. Held here (not in the pure
     // App) because it owns I/O: a new run or a stop signals the old background
     // DNS loop so restarts don't stack live tasks.

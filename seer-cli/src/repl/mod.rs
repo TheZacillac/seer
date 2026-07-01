@@ -51,17 +51,28 @@ impl Repl {
 
         let _ = editor.load_history(&history_path);
 
+        // Build clients from the user config so the REPL honors per-protocol
+        // timeouts / nameserver / bulk concurrency (propagation + DNSSEC keep
+        // their own tuned timeouts by design — see the config wiring note).
+        let context = CommandContext::new();
+        let cfg = &context.config;
+        let whois_client = seer_core::WhoisClient::new().with_timeout(cfg.whois_timeout());
+        let rdap_client = seer_core::RdapClient::new().with_timeout(cfg.rdap_timeout());
+        let dns_resolver = seer_core::DnsResolver::new().with_timeout(cfg.dns_timeout());
+        let status_client = seer_core::StatusClient::new().with_timeout(cfg.http_timeout());
+        let availability_checker = seer_core::AvailabilityChecker::from_config(cfg);
+
         Ok(Self {
             editor,
-            context: CommandContext::new(),
-            whois_client: seer_core::WhoisClient::new(),
-            rdap_client: seer_core::RdapClient::new(),
-            dns_resolver: seer_core::DnsResolver::new(),
+            whois_client,
+            rdap_client,
+            dns_resolver,
             propagation_checker: seer_core::dns::PropagationChecker::new(),
-            status_client: seer_core::StatusClient::new(),
+            status_client,
             dnssec_checker: seer_core::DnssecChecker::new(),
-            availability_checker: seer_core::AvailabilityChecker::new(),
+            availability_checker,
             dns_follower: seer_core::DnsFollower::new(),
+            context,
         })
     }
 
@@ -422,7 +433,7 @@ impl Repl {
             spinner_clone.set_message(message);
         });
 
-        let lookup = seer_core::SmartLookup::new();
+        let lookup = seer_core::SmartLookup::from_config(&self.context.config);
         match lookup.lookup_with_progress(domain, Some(progress)).await {
             Ok(result) => {
                 spinner.finish();
@@ -461,7 +472,7 @@ impl Repl {
             domain
         )));
 
-        let lookup = seer_core::SmartLookup::new();
+        let lookup = seer_core::SmartLookup::from_config(&self.context.config);
         match lookup.lookup(domain).await {
             Ok(result) => {
                 spinner.finish();
@@ -543,6 +554,9 @@ impl Repl {
                 record_type = rt;
             }
         }
+
+        // Fall back to the configured nameserver when none is given inline.
+        let nameserver = nameserver.or(self.context.config.nameserver.as_deref());
 
         let spinner = Spinner::new(&format!("Querying {} {} records", domain, record_type));
 
@@ -759,7 +773,9 @@ impl Repl {
         // Register progress bar for tracing integration
         set_bulk_progress_bar(progress.clone());
 
-        let executor = seer_core::BulkExecutor::new().with_concurrency(5);
+        let executor = seer_core::BulkExecutor::new()
+            .with_concurrency(self.context.config.bulk.concurrency)
+            .with_rate_limit(self.context.config.bulk_rate_limit());
 
         let progress_callback = progress.clone();
         let callback: seer_core::bulk::ProgressCallback =
