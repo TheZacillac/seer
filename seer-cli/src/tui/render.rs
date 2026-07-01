@@ -285,11 +285,23 @@ fn main_pane(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         return;
     }
 
-    // Human view: dispatch to the lens renderer.
+    // Human view: dispatch to the lens renderer. Row-based lenses are filtered
+    // centrally here (same `filter::apply` used by `App::row_count`) so the
+    // renderer, selection, and scroll all see the same visible subset.
     if let LensState::Loaded(data) = app.state_of(app.lens) {
         let focused = app.focus == Focus::Pane;
+        let filtered = crate::tui::filter::apply(data, &app.active_filter());
+        let render_data = filtered.as_ref().unwrap_or(data);
         lenses::render(
-            f, content, theme, lens.key, app.tab, data, focused, app.sel, &app.panes,
+            f,
+            content,
+            theme,
+            lens.key,
+            app.tab,
+            render_data,
+            focused,
+            app.sel,
+            &app.panes,
         );
     }
 }
@@ -313,6 +325,36 @@ fn sub_tabs(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
 }
 
 fn status_or_command(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
+    if let InputMode::Field {
+        target: EditTarget::LensFilter,
+        buf,
+    } = &app.input_mode
+    {
+        let s = buf.as_str();
+        let cur = buf.cursor();
+        let matches = app.row_count();
+        let line = Line::from(vec![
+            Span::styled(
+                "filter> ",
+                Style::default()
+                    .fg(theme.mauve)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("{}█{}", &s[..cur], &s[cur..]),
+                Style::default().fg(theme.text),
+            ),
+            Span::styled(
+                format!("   {matches} match(es)  [enter apply · esc cancel]"),
+                Style::default().fg(theme.overlay0),
+            ),
+        ]);
+        f.render_widget(
+            Paragraph::new(line).style(Style::default().bg(theme.mantle)),
+            area,
+        );
+        return;
+    }
     if let InputMode::Command(buf) = &app.input_mode {
         let line = Line::from(vec![
             Span::styled(
@@ -345,6 +387,14 @@ fn status_or_command(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         spans.push(Span::styled(
             format!("● {}", t.msg),
             Style::default().fg(theme.tone(&t.tone)),
+        ));
+    }
+    // Show an active committed in-lens filter (press `/` on the pane to edit).
+    let active_filter = app.active_filter();
+    if !active_filter.is_empty() {
+        spans.push(Span::styled(
+            format!("filter:/{}/  ", active_filter),
+            Style::default().fg(theme.mauve),
         ));
     }
     spans.push(Span::raw("   "));

@@ -29,6 +29,8 @@ pub enum EditTarget {
     BulkDomains,
     WatchAdd,
     TldFilter,
+    /// Live `/`-filter for a table lens (subdomains/history/propagation).
+    LensFilter,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]

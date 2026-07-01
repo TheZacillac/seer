@@ -44,6 +44,8 @@ pub struct App {
     startup: Vec<Action>,
     /// Per-lens generation counter; stale results carry a lower gen and are dropped.
     fetch_gen: HashMap<&'static str, u64>,
+    /// Committed in-lens `/`-filter per lens key (subdomains/history/propagation).
+    lens_filter: HashMap<&'static str, String>,
 }
 
 impl App {
@@ -64,6 +66,7 @@ impl App {
             states: HashMap::new(),
             startup: Vec::new(),
             fetch_gen: HashMap::new(),
+            lens_filter: HashMap::new(),
         };
         if let Some(d) = domain {
             if let Some(action) = app.set_domain_and_fetch(&d) {
@@ -120,14 +123,38 @@ impl App {
     }
 
     /// Number of selectable rows in the current lens's loaded data.
+    /// The active in-lens filter for the current lens: the live edit buffer
+    /// while the filter field is open, else the committed filter (empty if
+    /// none). Used by both the renderer and `row_count`, so the visible rows
+    /// and the selection index space always agree.
+    pub fn active_filter(&self) -> String {
+        if let InputMode::Field {
+            target: EditTarget::LensFilter,
+            buf,
+        } = &self.input_mode
+        {
+            return buf.as_str().to_string();
+        }
+        self.lens_filter
+            .get(self.current_lens().key)
+            .cloned()
+            .unwrap_or_default()
+    }
+
     pub fn row_count(&self) -> usize {
-        match self.state_of(self.lens) {
-            LensState::Loaded(LensData::Dns(r)) => r.len(),
-            LensState::Loaded(LensData::Prop(p)) => p.results.len(),
-            LensState::Loaded(LensData::Reverse(r)) => r.len(),
-            LensState::Loaded(LensData::Watch(w)) => w.results.len(),
-            LensState::Loaded(LensData::History(e)) => e.len(),
-            LensState::Loaded(LensData::Subdomains(s)) => s.subdomains.len(),
+        let LensState::Loaded(data) = self.state_of(self.lens) else {
+            return 0;
+        };
+        // Count the filtered rows so selection stays within the visible subset.
+        let filtered = crate::tui::filter::apply(data, &self.active_filter());
+        let data = filtered.as_ref().unwrap_or(data);
+        match data {
+            LensData::Dns(r) => r.len(),
+            LensData::Prop(p) => p.results.len(),
+            LensData::Reverse(r) => r.len(),
+            LensData::Watch(w) => w.results.len(),
+            LensData::History(e) => e.len(),
+            LensData::Subdomains(s) => s.subdomains.len(),
             _ => 0,
         }
     }
@@ -139,6 +166,8 @@ impl App {
         // A new target invalidates every cached lens.
         if self.domain.as_deref() != Some(normalized.as_str()) {
             self.states.clear();
+            // A new target invalidates any per-lens filters too.
+            self.lens_filter.clear();
             // The resolved IP is derived from the OLD domain's DNS/Status
             // results; clearing it prevents the RDAP "IP" tab from looking up
             // the previous domain's address under the new domain.
@@ -382,6 +411,24 @@ impl App {
         if let Some(actions) = self.handle_pane_key(key) {
             return actions;
         }
+        // `/` opens the in-lens filter when a filterable result lens is
+        // pane-focused; when nav-focused it stays the domain-edit shortcut.
+        if key.code == KeyCode::Char('/')
+            && self.focus == Focus::Pane
+            && crate::tui::filter::is_filterable(self.current_lens().key)
+            && matches!(self.state_of(self.lens), LensState::Loaded(_))
+        {
+            let cur = self
+                .lens_filter
+                .get(self.current_lens().key)
+                .cloned()
+                .unwrap_or_default();
+            self.input_mode = InputMode::Field {
+                target: EditTarget::LensFilter,
+                buf: cur.into(),
+            };
+            return vec![];
+        }
         let Some(ka) = event::map(key) else {
             return vec![];
         };
@@ -430,6 +477,17 @@ impl App {
                 self.lens = 0;
                 self.focus = Focus::Nav;
                 self.set_domain_and_fetch(&value).into_iter().collect()
+            }
+            EditTarget::LensFilter => {
+                // Commit the filter for the current lens; empty clears it.
+                let key = self.current_lens().key;
+                if value.is_empty() {
+                    self.lens_filter.remove(key);
+                } else {
+                    self.lens_filter.insert(key, value);
+                }
+                self.sel = 0;
+                vec![]
             }
             EditTarget::DiffB => {
                 self.panes.diff.b = value.to_lowercase();
@@ -1519,6 +1577,26 @@ mod tests {
             "paste should append to the field buffer, got {:?}",
             app.input_mode
         );
+    }
+
+    #[test]
+    fn lens_filter_live_buffer_wins_then_commits_and_clears() {
+        let mut app = App::new(None);
+        // While the filter field is open, the live edit buffer is the active filter.
+        app.input_mode = InputMode::Field {
+            target: EditTarget::LensFilter,
+            buf: "api".into(),
+        };
+        assert_eq!(app.active_filter(), "api");
+
+        // Committing stores it for the current lens.
+        let _ = app.apply_field(EditTarget::LensFilter, "api".to_string());
+        app.input_mode = InputMode::Normal;
+        assert_eq!(app.active_filter(), "api");
+
+        // Committing an empty value clears the filter.
+        let _ = app.apply_field(EditTarget::LensFilter, String::new());
+        assert_eq!(app.active_filter(), "");
     }
 
     #[test]

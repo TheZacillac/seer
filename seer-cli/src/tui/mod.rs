@@ -11,6 +11,7 @@ mod clipboard;
 mod command;
 mod data;
 mod event;
+mod filter;
 mod lenses;
 mod line_editor;
 mod panes;
