@@ -64,6 +64,17 @@ pub struct CaaPolicy {
     /// `None` if no cert was supplied for comparison.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub issuer_match: Option<IssuerCaaMatch>,
+    /// `iodef` incident-reporting contacts declared in the policy (RFC 8659
+    /// §4.4) — a takedown/abuse channel available nowhere else in seer.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub iodef: Vec<String>,
+    /// A note when the wildcard issuance policy (`issuewild`) is *broader* than
+    /// the base (`issue`) policy — i.e. a CA may issue wildcard certs it is not
+    /// permitted to issue named certs for. `None` when the policies are
+    /// consistent, or `issuewild`/`issue` is absent (RFC 8659 §4.3: absent
+    /// `issuewild` inherits `issue`, which is NOT a gap).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wildcard_note: Option<String>,
     /// Informational note about CAA semantics. Always populated.
     pub note: String,
 }
@@ -76,8 +87,80 @@ impl CaaPolicy {
             effective_domain: None,
             has_policy: false,
             issuer_match: None,
+            iodef: Vec::new(),
+            wildcard_note: None,
             note: ISSUANCE_TIME_NOTE.to_string(),
         }
+    }
+
+    /// Builds a populated policy from discovered records, deriving the `iodef`
+    /// contacts and the wildcard-vs-base consistency note.
+    fn from_records(records: Vec<CaaRecord>, effective_domain: String) -> Self {
+        let iodef = records
+            .iter()
+            .filter(|r| r.tag == "iodef")
+            .map(|r| r.value.clone())
+            .filter(|v| !v.is_empty())
+            .collect();
+        let wildcard_note = analyze_wildcard(&records);
+        Self {
+            has_policy: true,
+            records,
+            effective_domain: Some(effective_domain),
+            issuer_match: None,
+            iodef,
+            wildcard_note,
+            note: ISSUANCE_TIME_NOTE.to_string(),
+        }
+    }
+}
+
+/// The non-empty CA-domain values permitted by a given tag (`issue` /
+/// `issuewild`). An empty value (from a bare `";"`) means "forbid all" and is
+/// filtered out here so callers reason only about explicitly-permitted CAs.
+fn permitted_cas(records: &[CaaRecord], tag: &str) -> Vec<String> {
+    records
+        .iter()
+        .filter(|r| r.tag == tag)
+        .map(|r| {
+            r.value
+                .split(';')
+                .next()
+                .unwrap_or(&r.value)
+                .trim()
+                .to_ascii_lowercase()
+        })
+        .filter(|v| !v.is_empty())
+        .collect()
+}
+
+/// Detects the genuine wildcard-policy asymmetry: when both `issue` and
+/// `issuewild` are present and `issuewild` permits a CA that `issue` does not,
+/// wildcard issuance is broader than named issuance. Returns a describing note,
+/// or `None` when the policies are consistent.
+///
+/// Note the RFC 8659 §4.3 subtlety: an *absent* `issuewild` inherits the
+/// `issue` policy, so absence is NOT a gap and is deliberately not flagged.
+fn analyze_wildcard(records: &[CaaRecord]) -> Option<String> {
+    let has_issue = records.iter().any(|r| r.tag == "issue");
+    let has_issuewild = records.iter().any(|r| r.tag == "issuewild");
+    if !has_issue || !has_issuewild {
+        return None;
+    }
+    let issue = permitted_cas(records, "issue");
+    let issuewild = permitted_cas(records, "issuewild");
+    let looser: Vec<String> = issuewild
+        .iter()
+        .filter(|w| !issue.iter().any(|i| i == *w))
+        .cloned()
+        .collect();
+    if looser.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "issuewild permits CA(s) not allowed by issue ({}) — wildcard issuance is broader than named issuance",
+            looser.join(", ")
+        ))
     }
 }
 
@@ -106,13 +189,7 @@ pub async fn lookup_caa(resolver: &DnsResolver, domain: &str) -> CaaPolicy {
                     .collect();
 
                 if !caa.is_empty() {
-                    return CaaPolicy {
-                        has_policy: true,
-                        records: caa,
-                        effective_domain: Some(current),
-                        issuer_match: None,
-                        note: ISSUANCE_TIME_NOTE.to_string(),
-                    };
+                    return CaaPolicy::from_records(caa, current);
                 }
             }
             Ok(_) | Err(_) => {}
@@ -273,20 +350,59 @@ mod tests {
     use super::*;
 
     fn policy_with(records: Vec<(&str, &str)>) -> CaaPolicy {
-        CaaPolicy {
-            records: records
-                .into_iter()
-                .map(|(tag, value)| CaaRecord {
-                    flags: 0,
-                    tag: tag.to_string(),
-                    value: value.to_string(),
-                })
-                .collect(),
-            effective_domain: Some("example.com".to_string()),
-            has_policy: true,
-            issuer_match: None,
-            note: ISSUANCE_TIME_NOTE.to_string(),
-        }
+        // Route through the real constructor so tests also exercise iodef +
+        // wildcard-note derivation.
+        let records = records
+            .into_iter()
+            .map(|(tag, value)| CaaRecord {
+                flags: 0,
+                tag: tag.to_string(),
+                value: value.to_string(),
+            })
+            .collect();
+        CaaPolicy::from_records(records, "example.com".to_string())
+    }
+
+    #[test]
+    fn iodef_contacts_are_extracted() {
+        let policy = policy_with(vec![
+            ("issue", "letsencrypt.org"),
+            ("iodef", "mailto:security@example.com"),
+        ]);
+        assert_eq!(policy.iodef, vec!["mailto:security@example.com"]);
+    }
+
+    #[test]
+    fn wildcard_note_flags_broader_wildcard_policy() {
+        // issue locks named issuance to Let's Encrypt, but issuewild also
+        // permits DigiCert for wildcards — genuinely broader.
+        let policy = policy_with(vec![
+            ("issue", "letsencrypt.org"),
+            ("issuewild", "digicert.com"),
+        ]);
+        let note = policy
+            .wildcard_note
+            .expect("looser wildcard policy flagged");
+        assert!(
+            note.contains("digicert.com"),
+            "note names the extra CA: {note}"
+        );
+    }
+
+    #[test]
+    fn wildcard_note_absent_when_issuewild_missing() {
+        // RFC 8659 §4.3: absent issuewild inherits issue — NOT a gap.
+        let policy = policy_with(vec![("issue", "letsencrypt.org")]);
+        assert!(policy.wildcard_note.is_none());
+    }
+
+    #[test]
+    fn wildcard_note_absent_when_policies_consistent() {
+        let policy = policy_with(vec![
+            ("issue", "letsencrypt.org"),
+            ("issuewild", "letsencrypt.org"),
+        ]);
+        assert!(policy.wildcard_note.is_none());
     }
 
     #[test]
@@ -446,6 +562,8 @@ mod tests {
             effective_domain: Some("example.com".to_string()),
             has_policy: true,
             issuer_match: None,
+            iodef: Vec::new(),
+            wildcard_note: None,
             note: ISSUANCE_TIME_NOTE.to_string(),
         };
         assert_eq!(
@@ -475,6 +593,8 @@ mod tests {
             effective_domain: Some("example.com".to_string()),
             has_policy: true,
             issuer_match: None,
+            iodef: Vec::new(),
+            wildcard_note: None,
             note: ISSUANCE_TIME_NOTE.to_string(),
         };
         assert_eq!(
@@ -496,6 +616,8 @@ mod tests {
             effective_domain: Some("example.com".to_string()),
             has_policy: true,
             issuer_match: None,
+            iodef: Vec::new(),
+            wildcard_note: None,
             note: ISSUANCE_TIME_NOTE.to_string(),
         };
         assert_eq!(
