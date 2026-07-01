@@ -174,7 +174,8 @@ enum Commands {
         #[arg(value_name = "OPERATION")]
         operation: String,
 
-        /// Input file path (text or CSV format)
+        /// Input file path (text or CSV format), or `-` to read the domain
+        /// list from stdin (e.g. `grep … | seer bulk status -`)
         #[arg(value_name = "FILE")]
         file: String,
 

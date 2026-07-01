@@ -742,6 +742,69 @@ fn dnssec<'py>(py: Python<'py>, domain: String) -> PyResult<Bound<'py, PyAny>> {
 }
 
 #[pyfunction]
+fn caa<'py>(py: Python<'py>, domain: String) -> PyResult<Bound<'py, PyAny>> {
+    let resolver = get_dns_resolver();
+    let normalized = seer_core::normalize_domain(&domain).map_err(|e| seer_err_to_py(&e))?;
+    let policy = run_async_infallible(py, async move {
+        seer_core::caa::lookup_caa(resolver, &normalized).await
+    })?;
+    let json = serialize_response(&policy)?;
+    json_to_python(py, &json)
+}
+
+#[pyfunction]
+fn posture<'py>(py: Python<'py>, domain: String) -> PyResult<Bound<'py, PyAny>> {
+    let resolver = get_dns_resolver();
+    let response = run_async(py, async move {
+        seer_core::lookup_email_posture(resolver, &domain).await
+    })?;
+    let json = serialize_response(&response)?;
+    json_to_python(py, &json)
+}
+
+#[pyfunction]
+#[pyo3(signature = (domain, concurrency = 10))]
+fn confusables<'py>(
+    py: Python<'py>,
+    domain: String,
+    concurrency: usize,
+) -> PyResult<Bound<'py, PyAny>> {
+    let lookup = get_smart_lookup();
+    let concurrency = validate_concurrency(concurrency)?;
+    let response = run_async(py, async move {
+        seer_core::find_confusables(lookup, &domain, concurrency).await
+    })?;
+    let json = serialize_response(&response)?;
+    json_to_python(py, &json)
+}
+
+#[pyfunction]
+#[pyo3(signature = (domain, concurrency = 10))]
+fn subdomains_classify<'py>(
+    py: Python<'py>,
+    domain: String,
+    concurrency: usize,
+) -> PyResult<Bound<'py, PyAny>> {
+    let enumerator = get_subdomain_enumerator();
+    let resolver = get_dns_resolver();
+    let concurrency = validate_concurrency(concurrency)?;
+    let response = run_async(py, async move {
+        let result = enumerator.enumerate(&domain).await?;
+        Ok::<_, SeerError>(
+            seer_core::classify_subdomains(
+                resolver,
+                &result.domain,
+                result.subdomains,
+                concurrency,
+            )
+            .await,
+        )
+    })?;
+    let json = serialize_response(&response)?;
+    json_to_python(py, &json)
+}
+
+#[pyfunction]
 fn dns_compare<'py>(
     py: Python<'py>,
     domain: String,
@@ -1028,6 +1091,10 @@ fn _seer(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(subdomains, m)?)?;
     m.add_function(wrap_pyfunction!(ssl, m)?)?;
     m.add_function(wrap_pyfunction!(dnssec, m)?)?;
+    m.add_function(wrap_pyfunction!(caa, m)?)?;
+    m.add_function(wrap_pyfunction!(posture, m)?)?;
+    m.add_function(wrap_pyfunction!(confusables, m)?)?;
+    m.add_function(wrap_pyfunction!(subdomains_classify, m)?)?;
     m.add_function(wrap_pyfunction!(dns_compare, m)?)?;
     m.add_function(wrap_pyfunction!(dns_follow, m)?)?;
     m.add_function(wrap_pyfunction!(cancel_follow, m)?)?;
