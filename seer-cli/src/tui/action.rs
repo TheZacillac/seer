@@ -29,16 +29,18 @@ pub enum EditTarget {
     BulkDomains,
     WatchAdd,
     TldFilter,
+    /// Live `/`-filter for a table lens (subdomains/history/propagation).
+    LensFilter,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum InputMode {
     #[default]
     Normal,
-    Command(String),
+    Command(crate::tui::line_editor::LineEditor),
     Field {
         target: EditTarget,
-        buf: String,
+        buf: crate::tui::line_editor::LineEditor,
     },
 }
 

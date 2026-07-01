@@ -3,7 +3,7 @@ mod client;
 mod types;
 
 pub use client::RdapClient;
-pub use types::{ContactInfo, RdapResponse};
+pub use types::{ContactInfo, RdapResponse, RegistrarDetail};
 
 use std::net::IpAddr;
 

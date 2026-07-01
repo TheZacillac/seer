@@ -44,6 +44,8 @@ pub struct App {
     startup: Vec<Action>,
     /// Per-lens generation counter; stale results carry a lower gen and are dropped.
     fetch_gen: HashMap<&'static str, u64>,
+    /// Committed in-lens `/`-filter per lens key (subdomains/history/propagation).
+    lens_filter: HashMap<&'static str, String>,
 }
 
 impl App {
@@ -64,6 +66,7 @@ impl App {
             states: HashMap::new(),
             startup: Vec::new(),
             fetch_gen: HashMap::new(),
+            lens_filter: HashMap::new(),
         };
         if let Some(d) = domain {
             if let Some(action) = app.set_domain_and_fetch(&d) {
@@ -71,6 +74,16 @@ impl App {
             }
         }
         app
+    }
+
+    /// Seeds session defaults from the user config (`~/.seer/config.toml`).
+    ///
+    /// Pure: the caller (`mod.rs`) performs the file I/O and passes the loaded
+    /// config in, keeping this `App` layer free of I/O. Currently seeds the
+    /// output format used by the raw-output view; the DNS pane's nameserver is
+    /// a fixed system/Google/Cloudflare picker and is intentionally left alone.
+    pub fn apply_config(&mut self, config: &seer_core::SeerConfig) {
+        self.format = config.output_format.parse().unwrap_or(OutputFormat::Human);
     }
 
     /// Drain the actions queued at construction (initial lookup).
@@ -110,14 +123,38 @@ impl App {
     }
 
     /// Number of selectable rows in the current lens's loaded data.
+    /// The active in-lens filter for the current lens: the live edit buffer
+    /// while the filter field is open, else the committed filter (empty if
+    /// none). Used by both the renderer and `row_count`, so the visible rows
+    /// and the selection index space always agree.
+    pub fn active_filter(&self) -> String {
+        if let InputMode::Field {
+            target: EditTarget::LensFilter,
+            buf,
+        } = &self.input_mode
+        {
+            return buf.as_str().to_string();
+        }
+        self.lens_filter
+            .get(self.current_lens().key)
+            .cloned()
+            .unwrap_or_default()
+    }
+
     pub fn row_count(&self) -> usize {
-        match self.state_of(self.lens) {
-            LensState::Loaded(LensData::Dns(r)) => r.len(),
-            LensState::Loaded(LensData::Prop(p)) => p.results.len(),
-            LensState::Loaded(LensData::Reverse(r)) => r.len(),
-            LensState::Loaded(LensData::Watch(w)) => w.results.len(),
-            LensState::Loaded(LensData::History(e)) => e.len(),
-            LensState::Loaded(LensData::Subdomains(s)) => s.subdomains.len(),
+        let LensState::Loaded(data) = self.state_of(self.lens) else {
+            return 0;
+        };
+        // Count the filtered rows so selection stays within the visible subset.
+        let filtered = crate::tui::filter::apply(data, &self.active_filter());
+        let data = filtered.as_ref().unwrap_or(data);
+        match data {
+            LensData::Dns(r) => r.len(),
+            LensData::Prop(p) => p.results.len(),
+            LensData::Reverse(r) => r.len(),
+            LensData::Watch(w) => w.results.len(),
+            LensData::History(e) => e.len(),
+            LensData::Subdomains(s) => s.subdomains.len(),
             _ => 0,
         }
     }
@@ -129,6 +166,8 @@ impl App {
         // A new target invalidates every cached lens.
         if self.domain.as_deref() != Some(normalized.as_str()) {
             self.states.clear();
+            // A new target invalidates any per-lens filters too.
+            self.lens_filter.clear();
             // The resolved IP is derived from the OLD domain's DNS/Status
             // results; clearing it prevents the RDAP "IP" tab from looking up
             // the previous domain's address under the new domain.
@@ -342,8 +381,8 @@ impl App {
                 // Bracketed paste lands here as one string. Route it into whatever
                 // text buffer is active so multi-line domain lists paste cleanly.
                 match &mut self.input_mode {
-                    InputMode::Field { buf, .. } => buf.push_str(&s),
-                    InputMode::Command(buf) => buf.push_str(&s),
+                    InputMode::Field { buf, .. } => buf.insert_str(&s),
+                    InputMode::Command(buf) => buf.insert_str(&s),
                     InputMode::Normal => {}
                 }
                 vec![]
@@ -372,48 +411,57 @@ impl App {
         if let Some(actions) = self.handle_pane_key(key) {
             return actions;
         }
+        // `/` opens the in-lens filter when a filterable result lens is
+        // pane-focused; when nav-focused it stays the domain-edit shortcut.
+        if key.code == KeyCode::Char('/')
+            && self.focus == Focus::Pane
+            && crate::tui::filter::is_filterable(self.current_lens().key)
+            && matches!(self.state_of(self.lens), LensState::Loaded(_))
+        {
+            let cur = self
+                .lens_filter
+                .get(self.current_lens().key)
+                .cloned()
+                .unwrap_or_default();
+            self.input_mode = InputMode::Field {
+                target: EditTarget::LensFilter,
+                buf: cur.into(),
+            };
+            return vec![];
+        }
         let Some(ka) = event::map(key) else {
             return vec![];
         };
         self.on_normal_action(ka)
     }
 
-    fn on_command_key(&mut self, key: KeyEvent, mut buf: String) -> Vec<Action> {
-        match key.code {
-            KeyCode::Esc => vec![],
-            KeyCode::Enter => self.exec_command(&buf),
-            KeyCode::Backspace => {
-                buf.pop();
-                self.input_mode = InputMode::Command(buf);
-                vec![]
-            }
-            KeyCode::Char(c) => {
-                buf.push(c);
-                self.input_mode = InputMode::Command(buf);
-                vec![]
-            }
-            _ => {
+    fn on_command_key(
+        &mut self,
+        key: KeyEvent,
+        mut buf: crate::tui::line_editor::LineEditor,
+    ) -> Vec<Action> {
+        use crate::tui::line_editor::EditOutcome;
+        match buf.handle_key(key) {
+            EditOutcome::Cancel => vec![],
+            EditOutcome::Submit => self.exec_command(buf.as_str()),
+            EditOutcome::Continue => {
                 self.input_mode = InputMode::Command(buf);
                 vec![]
             }
         }
     }
 
-    fn on_field_key(&mut self, key: KeyEvent, target: EditTarget, mut buf: String) -> Vec<Action> {
-        match key.code {
-            KeyCode::Esc => vec![],
-            KeyCode::Enter => self.apply_field(target, buf.trim().to_string()),
-            KeyCode::Backspace => {
-                buf.pop();
-                self.input_mode = InputMode::Field { target, buf };
-                vec![]
-            }
-            KeyCode::Char(c) => {
-                buf.push(c);
-                self.input_mode = InputMode::Field { target, buf };
-                vec![]
-            }
-            _ => {
+    fn on_field_key(
+        &mut self,
+        key: KeyEvent,
+        target: EditTarget,
+        mut buf: crate::tui::line_editor::LineEditor,
+    ) -> Vec<Action> {
+        use crate::tui::line_editor::EditOutcome;
+        match buf.handle_key(key) {
+            EditOutcome::Cancel => vec![],
+            EditOutcome::Submit => self.apply_field(target, buf.as_str().trim().to_string()),
+            EditOutcome::Continue => {
                 self.input_mode = InputMode::Field { target, buf };
                 vec![]
             }
@@ -429,6 +477,17 @@ impl App {
                 self.lens = 0;
                 self.focus = Focus::Nav;
                 self.set_domain_and_fetch(&value).into_iter().collect()
+            }
+            EditTarget::LensFilter => {
+                // Commit the filter for the current lens; empty clears it.
+                let key = self.current_lens().key;
+                if value.is_empty() {
+                    self.lens_filter.remove(key);
+                } else {
+                    self.lens_filter.insert(key, value);
+                }
+                self.sel = 0;
+                vec![]
             }
             EditTarget::DiffB => {
                 self.panes.diff.b = value.to_lowercase();
@@ -505,7 +564,7 @@ impl App {
             KeyCode::Char('a') => {
                 self.input_mode = InputMode::Field {
                     target: EditTarget::WatchAdd,
-                    buf: String::new(),
+                    buf: crate::tui::line_editor::LineEditor::new(),
                 };
                 Some(vec![])
             }
@@ -573,7 +632,10 @@ impl App {
             PaneOutcome::Action(a) => vec![a],
             PaneOutcome::EditField(target) => {
                 let cur = self.panes.field_value(target);
-                self.input_mode = InputMode::Field { target, buf: cur };
+                self.input_mode = InputMode::Field {
+                    target,
+                    buf: cur.into(),
+                };
                 vec![]
             }
             PaneOutcome::Toast { tone, msg } => {
@@ -848,12 +910,12 @@ impl App {
                 let cur = self.domain.clone().unwrap_or_default();
                 self.input_mode = InputMode::Field {
                     target: EditTarget::Target,
-                    buf: cur,
+                    buf: cur.into(),
                 };
                 vec![]
             }
             KeyAction::Command => {
-                self.input_mode = InputMode::Command(String::new());
+                self.input_mode = InputMode::Command(crate::tui::line_editor::LineEditor::new());
                 vec![]
             }
             KeyAction::Help => {
@@ -1511,10 +1573,30 @@ mod tests {
         };
         app.update(Msg::Input(Event::Paste("b.com c.com".into())));
         assert!(
-            matches!(&app.input_mode, InputMode::Field { buf, .. } if buf == "a.com b.com c.com"),
+            matches!(&app.input_mode, InputMode::Field { buf, .. } if buf.as_str() == "a.com b.com c.com"),
             "paste should append to the field buffer, got {:?}",
             app.input_mode
         );
+    }
+
+    #[test]
+    fn lens_filter_live_buffer_wins_then_commits_and_clears() {
+        let mut app = App::new(None);
+        // While the filter field is open, the live edit buffer is the active filter.
+        app.input_mode = InputMode::Field {
+            target: EditTarget::LensFilter,
+            buf: "api".into(),
+        };
+        assert_eq!(app.active_filter(), "api");
+
+        // Committing stores it for the current lens.
+        let _ = app.apply_field(EditTarget::LensFilter, "api".to_string());
+        app.input_mode = InputMode::Normal;
+        assert_eq!(app.active_filter(), "api");
+
+        // Committing an empty value clears the filter.
+        let _ = app.apply_field(EditTarget::LensFilter, String::new());
+        assert_eq!(app.active_filter(), "");
     }
 
     #[test]
@@ -1523,7 +1605,7 @@ mod tests {
         app.input_mode = InputMode::Command("look".into());
         app.update(Msg::Input(Event::Paste("up x.com".into())));
         assert!(
-            matches!(&app.input_mode, InputMode::Command(buf) if buf == "lookup x.com"),
+            matches!(&app.input_mode, InputMode::Command(buf) if buf.as_str() == "lookup x.com"),
             "paste should append to the command buffer, got {:?}",
             app.input_mode
         );

@@ -27,6 +27,96 @@ use crate::validation::normalize_domain;
 /// Default timeout for SSL operations (10 seconds).
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Minimum acceptable RSA key size in bits (NIST SP 800-57 / CA/B Forum).
+const RSA_MIN_KEY_BITS: u32 = 2048;
+/// Minimum acceptable elliptic-curve key size in bits.
+const EC_MIN_KEY_BITS: u32 = 256;
+/// Days-until-expiry threshold below which a still-valid cert is flagged.
+const CERT_EXPIRING_SOON_DAYS: i64 = 30;
+
+/// Derives security-posture [`CertWarning`]s from an already-parsed leaf
+/// certificate plus the computed validity/hostname signals. Pure — no network
+/// calls — so it is unit-testable in isolation.
+fn derive_cert_warnings(
+    leaf: &CertDetail,
+    is_valid: bool,
+    hostname_verified: bool,
+    days_until_expiry: i64,
+) -> Vec<CertWarning> {
+    let mut warnings = Vec::new();
+    let critical = |message: String| CertWarning {
+        severity: CertWarningSeverity::Critical,
+        message,
+    };
+    let warn = |message: String| CertWarning {
+        severity: CertWarningSeverity::Warning,
+        message,
+    };
+
+    // Weak public key.
+    if let (Some(kt), Some(bits)) = (leaf.key_type.as_deref(), leaf.key_bits) {
+        match kt {
+            "RSA" if bits < RSA_MIN_KEY_BITS => warnings.push(critical(format!(
+                "RSA key size {bits} is below the {RSA_MIN_KEY_BITS}-bit minimum"
+            ))),
+            "EC" if bits < EC_MIN_KEY_BITS => warnings.push(critical(format!(
+                "EC key size {bits} is below the {EC_MIN_KEY_BITS}-bit minimum"
+            ))),
+            _ => {}
+        }
+    }
+
+    // Deprecated signature algorithm (SHA-1 / MD5).
+    if let Some(sig) = leaf.signature_algorithm.as_deref() {
+        let lower = sig.to_lowercase();
+        if lower.contains("sha-1") || lower.contains("sha1") || lower.contains("md5") {
+            warnings.push(critical(format!(
+                "Certificate uses deprecated signature algorithm: {sig}"
+            )));
+        }
+    }
+
+    // Self-signed (issuer equals subject).
+    if leaf.subject == leaf.issuer {
+        warnings.push(warn(
+            "Certificate is self-signed (issuer equals subject)".to_string(),
+        ));
+    }
+
+    // Leaf certificate marked as a CA (basic-constraints misuse).
+    if leaf.is_ca {
+        warnings.push(warn(
+            "Leaf certificate is marked as a CA certificate".to_string(),
+        ));
+    }
+
+    // Validity window.
+    if days_until_expiry < 0 {
+        warnings.push(critical(format!(
+            "Certificate expired {} day(s) ago",
+            -days_until_expiry
+        )));
+    } else if !is_valid {
+        // Date-valid check failed but not past expiry → notBefore is future.
+        warnings.push(critical(
+            "Certificate is not yet valid (notBefore is in the future)".to_string(),
+        ));
+    } else if days_until_expiry <= CERT_EXPIRING_SOON_DAYS {
+        warnings.push(warn(format!(
+            "Certificate expires in {days_until_expiry} day(s)"
+        )));
+    }
+
+    // Hostname mismatch.
+    if !hostname_verified {
+        warnings.push(critical(
+            "Certificate does not match the requested hostname".to_string(),
+        ));
+    }
+
+    warnings
+}
+
 /// Full SSL certificate report for a domain.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SslReport {
@@ -67,6 +157,36 @@ pub struct SslReport {
     /// `note` field on [`CaaPolicy`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub caa: Option<CaaPolicy>,
+    /// Security-posture warnings derived from the leaf certificate: weak keys,
+    /// deprecated signatures, self-signed / CA-marked leaves, expiry, and
+    /// hostname mismatch. Empty when the leaf presents no notable issues.
+    ///
+    /// These are pure post-processing of already-parsed fields (no extra
+    /// network calls) — a summary so consumers don't have to eyeball key sizes
+    /// and algorithms.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<CertWarning>,
+}
+
+/// Severity of a [`CertWarning`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CertWarningSeverity {
+    /// A trust-affecting problem (weak key, deprecated signature, expired,
+    /// hostname mismatch).
+    Critical,
+    /// A notable-but-not-fatal signal (self-signed, CA-marked leaf, expiring
+    /// soon).
+    Warning,
+}
+
+/// A single security-posture warning about a certificate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CertWarning {
+    /// How serious the finding is.
+    pub severity: CertWarningSeverity,
+    /// Human-readable description of the finding.
+    pub message: String,
 }
 
 /// Detailed information about a single certificate in the chain.
@@ -225,6 +345,10 @@ impl SslChecker {
         let mut caa_policy = caa_policy;
         caa_policy.issuer_match = Some(caa::classify_issuer(&leaf_detail.issuer, &caa_policy));
 
+        // Derive posture warnings from the parsed leaf (pure post-processing).
+        let warnings =
+            derive_cert_warnings(&leaf_detail, is_valid, hostname_verified, days_until_expiry);
+
         Ok(SslReport {
             domain,
             chain: vec![leaf_detail],
@@ -234,6 +358,7 @@ impl SslChecker {
             hostname_verified,
             days_until_expiry,
             caa: Some(caa_policy),
+            warnings,
         })
     }
 }
@@ -453,6 +578,7 @@ mod tests {
             hostname_verified: true,
             days_until_expiry: 90,
             caa: None,
+            warnings: vec![],
         };
         let json = serde_json::to_string(&report).unwrap();
         assert!(json.contains("example.com"));
@@ -478,6 +604,71 @@ mod tests {
         addr[3] = 0xb8;
         addr[15] = 1;
         assert_eq!(format_ip_san(&addr), "2001:db8::1");
+    }
+
+    fn sample_leaf() -> CertDetail {
+        CertDetail {
+            subject: "CN=example.com".to_string(),
+            issuer: "CN=R3, O=Let's Encrypt".to_string(),
+            valid_from: Utc::now(),
+            valid_until: Utc::now(),
+            serial_number: "abc123".to_string(),
+            signature_algorithm: Some("SHA-256 with RSA".to_string()),
+            is_ca: false,
+            key_type: Some("RSA".to_string()),
+            key_bits: Some(2048),
+        }
+    }
+
+    #[test]
+    fn derive_cert_warnings_clean_cert_has_none() {
+        let w = derive_cert_warnings(&sample_leaf(), true, true, 90);
+        assert!(w.is_empty(), "clean cert should have no warnings: {:?}", w);
+    }
+
+    #[test]
+    fn derive_cert_warnings_flags_weak_rsa_key() {
+        let mut leaf = sample_leaf();
+        leaf.key_bits = Some(1024);
+        let w = derive_cert_warnings(&leaf, true, true, 90);
+        assert!(w.iter().any(|x| x.message.contains("RSA key size 1024")
+            && x.severity == CertWarningSeverity::Critical));
+    }
+
+    #[test]
+    fn derive_cert_warnings_flags_sha1_signature() {
+        let mut leaf = sample_leaf();
+        leaf.signature_algorithm = Some("SHA-1 with RSA".to_string());
+        let w = derive_cert_warnings(&leaf, true, true, 90);
+        assert!(w
+            .iter()
+            .any(|x| x.message.to_lowercase().contains("deprecated signature")));
+    }
+
+    #[test]
+    fn derive_cert_warnings_flags_self_signed_expired_and_mismatch() {
+        let mut leaf = sample_leaf();
+        leaf.issuer = leaf.subject.clone();
+        let w = derive_cert_warnings(&leaf, false, false, -3);
+        assert!(w.iter().any(|x| x.message.contains("self-signed")));
+        assert!(w.iter().any(|x| x.message.contains("expired 3 day(s) ago")));
+        assert!(w.iter().any(|x| x.message.contains("does not match")));
+    }
+
+    #[test]
+    fn derive_cert_warnings_flags_expiring_soon_as_warning() {
+        let w = derive_cert_warnings(&sample_leaf(), true, true, 10);
+        assert_eq!(w.len(), 1);
+        assert_eq!(w[0].severity, CertWarningSeverity::Warning);
+        assert!(w[0].message.contains("expires in 10 day(s)"));
+    }
+
+    #[test]
+    fn derive_cert_warnings_flags_ca_marked_leaf() {
+        let mut leaf = sample_leaf();
+        leaf.is_ca = true;
+        let w = derive_cert_warnings(&leaf, true, true, 90);
+        assert!(w.iter().any(|x| x.message.contains("marked as a CA")));
     }
 
     #[test]

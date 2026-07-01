@@ -40,6 +40,18 @@ mcp = Server("seer")
 MAX_BULK_DOMAINS = 100
 MAX_CONCURRENCY = 50
 
+# Shared input schema for the single-domain tools.
+_DOMAIN_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "domain": {
+            "type": "string",
+            "description": "Domain name (e.g., 'example.com')",
+        },
+    },
+    "required": ["domain"],
+}
+
 # Prompt-injection hardening: every tool result contains data fetched from
 # third-party registries/registrars/DNS responses, which we do not control.
 # Prefix each payload with an explicit untrusted-data marker so host LLMs
@@ -430,6 +442,108 @@ async def list_tools() -> list[Tool]:
                 "required": ["domains"],
             },
         ),
+        Tool(
+            name="seer_ssl",
+            description="Inspect the SSL/TLS certificate chain for a domain. Returns the chain, SANs, key details, and derived security-posture warnings (weak key, deprecated signature, self-signed, expiry, hostname mismatch).",
+            inputSchema=_DOMAIN_SCHEMA,
+        ),
+        Tool(
+            name="seer_availability",
+            description="Check whether a domain appears to be available for registration (RDAP-404 + DNS + WHOIS signals).",
+            inputSchema=_DOMAIN_SCHEMA,
+        ),
+        Tool(
+            name="seer_dnssec",
+            description="DNSSEC validation report for a domain: DS/DNSKEY digest consistency, chain validity, and the verification-depth tier.",
+            inputSchema=_DOMAIN_SCHEMA,
+        ),
+        Tool(
+            name="seer_caa",
+            description="Look up the CAA (Certification Authority Authorization) policy for a domain, including iodef incident contacts and a wildcard-vs-base consistency analysis.",
+            inputSchema=_DOMAIN_SCHEMA,
+        ),
+        Tool(
+            name="seer_posture",
+            description="Inspect a domain's email/DNS security posture: SPF, DMARC, MTA-STS, BIMI, and DANE (TLSA), with per-mechanism verdicts and advisories. A lax/absent DMARC means the domain is spoofable.",
+            inputSchema=_DOMAIN_SCHEMA,
+        ),
+        Tool(
+            name="seer_subdomains",
+            description="Enumerate subdomains via Certificate Transparency logs. With resolve=true, each name is resolved and classified (live/dead/wildcard) and dangling CNAMEs to takeover-prone providers are flagged.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "domain": {
+                        "type": "string",
+                        "description": "Domain to enumerate subdomains for",
+                    },
+                    "resolve": {
+                        "type": "boolean",
+                        "description": "Resolve and classify each name (default: false)",
+                        "default": False,
+                    },
+                    "concurrency": {
+                        "type": "integer",
+                        "description": f"Concurrency for the resolve pass (default: 10, max: {MAX_CONCURRENCY})",
+                        "default": 10,
+                        "minimum": 1,
+                        "maximum": MAX_CONCURRENCY,
+                    },
+                },
+                "required": ["domain"],
+            },
+        ),
+        Tool(
+            name="seer_confusables",
+            description="Generate typosquat / homoglyph look-alike domains for a domain and report which are registered, ranking freshly-registered squats first. A brand-protection / phishing-defense scan.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "domain": {
+                        "type": "string",
+                        "description": "Domain to generate and score look-alikes for",
+                    },
+                    "concurrency": {
+                        "type": "integer",
+                        "description": f"Concurrency for the registration scan (default: 10, max: {MAX_CONCURRENCY})",
+                        "default": 10,
+                        "minimum": 1,
+                        "maximum": MAX_CONCURRENCY,
+                    },
+                },
+                "required": ["domain"],
+            },
+        ),
+        Tool(
+            name="seer_dns_compare",
+            description="Compare DNS records for a domain across two nameservers, reporting whether they agree.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "domain": {"type": "string", "description": "Domain to query"},
+                    "record_type": {
+                        "type": "string",
+                        "description": "Record type (A, AAAA, MX, etc.)",
+                        "default": "A",
+                    },
+                    "server_a": {"type": "string", "description": "First nameserver (e.g. 8.8.8.8)"},
+                    "server_b": {"type": "string", "description": "Second nameserver (e.g. 1.1.1.1)"},
+                },
+                "required": ["domain", "server_a", "server_b"],
+            },
+        ),
+        Tool(
+            name="seer_diff",
+            description="Compare two domains side-by-side (registration, DNS, SSL).",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "domain_a": {"type": "string", "description": "First domain"},
+                    "domain_b": {"type": "string", "description": "Second domain"},
+                },
+                "required": ["domain_a", "domain_b"],
+            },
+        ),
     ]
 
 
@@ -634,6 +748,58 @@ async def execute_tool(name: str, arguments: dict[str, Any]) -> Any:
             return await run_seer(
                 seer.bulk_ssl, domains, concurrency
             )
+
+        case "seer_ssl":
+            domain = _require_str(arguments, "domain")
+            # The domain is the connect target (port 443) here.
+            await run_seer(_ssrf_guard, domain, 443)
+            return await run_seer(seer.ssl, domain)
+
+        case "seer_availability":
+            domain = _require_str(arguments, "domain")
+            return await run_seer(seer.availability, domain)
+
+        case "seer_dnssec":
+            domain = _require_str(arguments, "domain")
+            return await run_seer(seer.dnssec, domain)
+
+        case "seer_caa":
+            domain = _require_str(arguments, "domain")
+            return await run_seer(seer.caa, domain)
+
+        case "seer_posture":
+            domain = _require_str(arguments, "domain")
+            return await run_seer(seer.posture, domain)
+
+        case "seer_subdomains":
+            domain = _require_str(arguments, "domain")
+            resolve = arguments.get("resolve", False)
+            if not isinstance(resolve, bool):
+                raise ValueError(f"'resolve' must be a boolean (got {type(resolve).__name__})")
+            if resolve:
+                concurrency = _get_concurrency(arguments, default=10)
+                return await run_seer(seer.subdomains_classify, domain, concurrency)
+            return await run_seer(seer.subdomains, domain)
+
+        case "seer_confusables":
+            domain = _require_str(arguments, "domain")
+            concurrency = _get_concurrency(arguments, default=10)
+            return await run_seer(seer.confusables, domain, concurrency)
+
+        case "seer_dns_compare":
+            domain = _require_str(arguments, "domain")
+            record_type = _require_record_type(arguments)
+            server_a = _require_str(arguments, "server_a")
+            server_b = _require_str(arguments, "server_b")
+            # Both servers are actual connect targets (port 53).
+            await run_seer(_ssrf_guard, server_a, 53)
+            await run_seer(_ssrf_guard, server_b, 53)
+            return await run_seer(seer.dns_compare, domain, record_type, server_a, server_b)
+
+        case "seer_diff":
+            domain_a = _require_str(arguments, "domain_a")
+            domain_b = _require_str(arguments, "domain_b")
+            return await run_seer(seer.diff, domain_a, domain_b)
 
         case _:
             raise ValueError(f"Unknown tool: {name}")

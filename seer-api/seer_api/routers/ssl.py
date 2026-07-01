@@ -1,14 +1,15 @@
-"""SSL chain inspection API endpoints (bulk only)."""
+"""SSL chain inspection API endpoints (single + bulk)."""
 
 from typing import Annotated
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Path, Request
 from pydantic import BaseModel, Field
 
 import seer
 from seer_api._run import run_seer
 from seer_api.errors import http_error
 from seer_api.limiting import limiter
+from seer_api.ssrf import guard_async as ssrf_guard_async
 from seer_api.ssrf import guard_hosts_async
 from seer_api.streaming import stream_bulk
 
@@ -17,6 +18,24 @@ router = APIRouter()
 # Bulk operation limits — mirrors status.py.
 MAX_BULK_DOMAINS = 100
 MAX_CONCURRENCY = 50
+
+
+@router.get("/{domain}")
+@limiter.limit("30/minute")
+async def ssl_inspect(
+    request: Request,
+    domain: Annotated[str, Path(min_length=1, max_length=253)],
+):
+    """Inspect the SSL/TLS certificate chain for a single domain.
+
+    Returns the full report including the derived security-posture warnings.
+    """
+    # The domain IS the connect target here (port 443), so guard it.
+    await ssrf_guard_async(domain, 443)
+    try:
+        return await run_seer(seer.ssl, domain)
+    except Exception as e:
+        raise http_error(e, "SSL inspection failed")
 
 
 class BulkSslRequest(BaseModel):

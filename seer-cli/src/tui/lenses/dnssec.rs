@@ -144,6 +144,8 @@ mod tests {
             issues: vec![],
             status: "signed".into(),
             chain_valid: true,
+            authentication_tier: seer_core::AuthenticationTier::DigestOnly,
+            rrsig_records: vec![],
         }));
         let backend = TestBackend::new(70, 14);
         let mut terminal = Terminal::new(backend).unwrap();

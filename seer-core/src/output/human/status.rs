@@ -191,6 +191,17 @@ impl HumanFormatter {
             self.value(&report.days_until_expiry.to_string())
         ));
 
+        if !report.warnings.is_empty() {
+            output.push(format!("  {}:", self.label("Warnings")));
+            for w in &report.warnings {
+                let rendered = match w.severity {
+                    crate::ssl::CertWarningSeverity::Critical => self.error(&w.message),
+                    crate::ssl::CertWarningSeverity::Warning => self.warning(&w.message),
+                };
+                output.push(format!("    {} {}", self.error("⚠"), rendered));
+            }
+        }
+
         if let Some(ref proto) = report.protocol_version {
             output.push(format!(
                 "  {}: {}",
