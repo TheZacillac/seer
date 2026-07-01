@@ -11,6 +11,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.37.0] - 2026-06-30
+
+### Added
+- **`seer_core::MAX_FOLLOW_INTERVAL_SECS` / `MAX_FOLLOW_ITERATIONS`** are now
+  public, so front-ends can clamp follow interval/count to the same range
+  `FollowConfig::new` enforces.
+
+### Fixed
+- **`.edu` availability inversion.** The EDUCAUSE WHOIS parser stamped every
+  response with `registrar = "EDUCAUSE"`, including "No match" (unregistered)
+  bodies — which made `is_available()` short-circuit to "registered" and also
+  bypassed the thin-response availability fallback. The registrar is now set
+  only when a real record is present, so unregistered `.edu` domains report as
+  available again.
+- **RDAP multi-candidate 404 loss.** When an earlier candidate URL returned a
+  definitive 404 but a later one failed differently (timeout/5xx), the
+  authoritative not-found signal was discarded, misreporting an available
+  domain as inconclusive. The 404 is now preserved across candidates.
+- **DNS propagation: `SRV` against a bare domain** deterministically failed on
+  every server and was rendered as a network-wide outage. It is now rejected up
+  front with a clear input error.
+- **Watchlist file I/O** ran synchronously on the async runtime in the CLI,
+  REPL, and TUI; it now runs on a blocking thread, matching the history paths.
+- **TUI Follow lens** clamped interval/count only on the low end, so an
+  over-range value silently no-op'd the run. Both are now clamped to the valid
+  range.
+- **DNS resolver timeout.** The primary system-resolver lookup had no timeout;
+  a black-holed host could hang a worker thread. It is now bounded, falling
+  through to the (already bounded) fallback resolver.
+- **`.jp` WHOIS** could capture a bracket label into a nameserver value in the
+  English-format fallback; it now extracts only the hostname.
+- **`.de` WHOIS** mislabeled `Status: failed` (a nameserver-delegation failure)
+  as the unrelated EPP `redemptionPeriod`; it now reads
+  `failed (nameserver check failed)`.
+- **Markdown diff** rendered multi-item lists with mangled separators (backticks
+  turned into apostrophes); each item is now sanitized individually.
+- **`--format json|yaml` on bad record types.** `dig`/`prop`/`follow`/`compare`
+  printed a raw error instead of the structured `{"error": ...}` payload; they
+  now honor the requested format.
+- **`compare` argument order.** The defaulted `record_type` positional preceded
+  the required nameservers, which panicked clap in debug builds and parsed
+  ambiguously. Usage is now
+  `seer compare <domain> <server_a> <server_b> [record_type]`.
+- **TUI terminal restore.** If terminal setup failed after entering raw mode,
+  the shell was left wedged in raw mode; setup now restores terminal state on
+  error.
+
 ## [0.36.0] - 2026-06-27
 
 ### Added
@@ -231,6 +278,7 @@ Two notable breaking changes landed in this period (see `CLAUDE.md` for details)
   pre-formatted strings.
 
 [Unreleased]: https://github.com/TheZacillac/seer/compare/v0.36.0...HEAD
+[0.37.0]: https://github.com/TheZacillac/seer/compare/v0.36.0...v0.37.0
 [0.36.0]: https://github.com/TheZacillac/seer/compare/v0.35.6...v0.36.0
 [0.35.6]: https://github.com/TheZacillac/seer/compare/v0.35.5...v0.35.6
 [0.35.5]: https://github.com/TheZacillac/seer/compare/v0.35.4...v0.35.5
