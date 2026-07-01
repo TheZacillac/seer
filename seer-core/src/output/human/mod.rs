@@ -301,7 +301,7 @@ impl OutputFormatter for HumanFormatter {
     fn format_posture(&self, posture: &crate::posture::EmailPosture) -> String {
         self.format_posture(posture)
     }
-    fn format_caa(&self, policy: &crate::caa::CaaPolicy) -> String {
+    fn format_caa(&self, policy: &CaaPolicy) -> String {
         self.format_caa(policy)
     }
     fn format_confusables(&self, report: &crate::confusables::ConfusableReport) -> String {

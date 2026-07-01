@@ -222,7 +222,7 @@ impl DnssecChecker {
         let Ok(lookup) = resolver.lookup(domain, HickoryRecordType::RRSIG).await else {
             return vec![];
         };
-        let now = chrono::Utc::now().timestamp();
+        let now = Utc::now().timestamp();
         lookup
             .answers()
             .iter()
