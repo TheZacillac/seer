@@ -33,6 +33,121 @@ impl std::fmt::Display for DomainInfoSource {
     }
 }
 
+/// Number of days before expiration at which a domain is flagged as
+/// "expiring soon" by [`ExpiryStatus`]. Mirrors common registrar grace
+/// windows and the watchlist's near-expiry alerting.
+const EXPIRING_SOON_DAYS: i64 = 30;
+
+/// A coarse lifecycle band for a domain's registration, derived from its
+/// expiration date and EPP status codes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExpiryStatus {
+    /// Registered and not near expiry.
+    Active,
+    /// Within [`EXPIRING_SOON_DAYS`] of the expiration date.
+    ExpiringSoon,
+    /// Past the expiration date (may still be recoverable — see `Redemption`).
+    Expired,
+    /// In the post-expiry redemption grace period (recoverable by the registrant).
+    Redemption,
+    /// Scheduled for deletion back to the available pool.
+    PendingDelete,
+}
+
+impl std::fmt::Display for ExpiryStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            ExpiryStatus::Active => "active",
+            ExpiryStatus::ExpiringSoon => "expiring-soon",
+            ExpiryStatus::Expired => "expired",
+            ExpiryStatus::Redemption => "redemption",
+            ExpiryStatus::PendingDelete => "pending-delete",
+        };
+        f.write_str(s)
+    }
+}
+
+/// A decoded EPP/RDAP domain status code paired with a plain-English meaning.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatusDescription {
+    /// The status code as reported by the registry (e.g. `clientTransferProhibited`).
+    pub code: String,
+    /// A human-readable description of what the code means.
+    pub description: String,
+}
+
+/// Normalizes an EPP or RDAP status token to a comparison key.
+///
+/// WHOIS reports EPP camelCase (`clientTransferProhibited`) while RDAP reports
+/// space-separated lowercase (`client transfer prohibited`); both collapse to
+/// the same key here so [`describe_epp_status`] and `derive_expiry_status`
+/// handle either source. Any trailing ` (URL)` an RDAP server appends is
+/// dropped because only alphanumerics survive the filter.
+fn normalize_status_key(code: &str) -> String {
+    code.chars()
+        .take_while(|c| *c != '(')
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+/// Decodes a domain status code (EPP or RDAP form) into a plain-English
+/// description, or `None` if the code is unrecognized.
+pub fn describe_epp_status(code: &str) -> Option<&'static str> {
+    let desc = match normalize_status_key(code).as_str() {
+        "ok" | "active" => "no restrictions (standard registered state)",
+        "inactive" => "no nameservers delegated",
+        "addperiod" => "recently registered (add grace period)",
+        "autorenewperiod" => "recently auto-renewed (grace period)",
+        "renewperiod" => "recently renewed (grace period)",
+        "transferperiod" => "recently transferred (grace period)",
+        "redemptionperiod" => "recently expired, recoverable (redemption period)",
+        "pendingrestore" => "restore requested from redemption",
+        "pendingcreate" => "creation requested, pending",
+        "pendingdelete" => "scheduled for deletion",
+        "pendingrenew" => "renewal requested, pending",
+        "pendingtransfer" => "transfer requested, pending",
+        "pendingupdate" => "update requested, pending",
+        "clientdeleteprohibited" => "deletion locked (by registrar)",
+        "clienthold" => "resolution suspended (by registrar)",
+        "clientrenewprohibited" => "renewal locked (by registrar)",
+        "clienttransferprohibited" => "transfer locked (by registrar)",
+        "clientupdateprohibited" => "updates locked (by registrar)",
+        "serverdeleteprohibited" => "deletion locked (by registry)",
+        "serverhold" => "resolution suspended (by registry)",
+        "serverrenewprohibited" => "renewal locked (by registry)",
+        "servertransferprohibited" => "transfer locked (by registry)",
+        "serverupdateprohibited" => "updates locked (by registry)",
+        _ => return None,
+    };
+    Some(desc)
+}
+
+/// Derives a coarse [`ExpiryStatus`] band from the days-until-expiration and the
+/// domain's status codes. Status codes take priority: a `pendingDelete` or
+/// `redemptionPeriod` state describes the lifecycle better than the raw date.
+fn derive_expiry_status(
+    days_until_expiration: Option<i64>,
+    status: &[String],
+) -> Option<ExpiryStatus> {
+    let has = |needle: &str| status.iter().any(|s| normalize_status_key(s) == needle);
+    if has("pendingdelete") {
+        return Some(ExpiryStatus::PendingDelete);
+    }
+    if has("redemptionperiod") {
+        return Some(ExpiryStatus::Redemption);
+    }
+    let days = days_until_expiration?;
+    Some(if days < 0 {
+        ExpiryStatus::Expired
+    } else if days <= EXPIRING_SOON_DAYS {
+        ExpiryStatus::ExpiringSoon
+    } else {
+        ExpiryStatus::Active
+    })
+}
+
 /// A flat, merged view of domain registration data from RDAP and WHOIS.
 ///
 /// RDAP fields take priority when both sources are present; WHOIS fills gaps.
@@ -78,10 +193,40 @@ pub struct DomainInfo {
     pub whois_server: Option<String>,
     pub rdap_url: Option<String>,
 
+    // Registrar object detail (from the RDAP registrar entity)
+    /// ICANN-required registrar abuse contact email (for takedown reports).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registrar_abuse_email: Option<String>,
+    /// Registrar abuse contact phone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registrar_abuse_phone: Option<String>,
+    /// IANA Registrar ID (uniquely identifies the registrar).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registrar_iana_id: Option<String>,
+    /// Registrar URL (the `about` link on the registrar entity).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registrar_url: Option<String>,
+
     /// Availability verdict: `"available"` / `"likely_available"` / `"unknown"`
     /// when derived from a `LookupResult::Available`. `None` otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub availability_verdict: Option<String>,
+
+    // --- Derived lifecycle fields (computed at construction) ---
+    /// Days until the registration expires (negative if already past),
+    /// computed from `expiration_date`. `None` when the date is unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub days_until_expiration: Option<i64>,
+    /// Age of the registration in days, computed from `creation_date`.
+    /// `None` when the creation date is unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain_age_days: Option<i64>,
+    /// Coarse lifecycle band derived from the expiry date and status codes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expiry_status: Option<ExpiryStatus>,
+    /// Plain-English decodings of recognized `status` codes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub status_descriptions: Vec<StatusDescription>,
 }
 
 impl DomainInfo {
@@ -224,7 +369,19 @@ impl DomainInfo {
             .map(|w| w.whois_server.clone())
             .filter(|s| !s.is_empty());
 
-        DomainInfo {
+        // Registrar object detail is RDAP-only structured data (abuse contact,
+        // IANA ID, URL). WHOIS carries no equivalently structured fields.
+        let registrar_detail = rdap.and_then(|r| r.get_registrar_detail());
+        let registrar_abuse_email = registrar_detail
+            .as_ref()
+            .and_then(|d| d.abuse_email.clone());
+        let registrar_abuse_phone = registrar_detail
+            .as_ref()
+            .and_then(|d| d.abuse_phone.clone());
+        let registrar_iana_id = registrar_detail.as_ref().and_then(|d| d.iana_id.clone());
+        let registrar_url = registrar_detail.as_ref().and_then(|d| d.url.clone());
+
+        let mut info = DomainInfo {
             domain: domain.to_string(),
             source,
             registrar,
@@ -250,8 +407,37 @@ impl DomainInfo {
             tech_phone,
             whois_server,
             rdap_url,
+            registrar_abuse_email,
+            registrar_abuse_phone,
+            registrar_iana_id,
+            registrar_url,
             availability_verdict: None,
-        }
+            days_until_expiration: None,
+            domain_age_days: None,
+            expiry_status: None,
+            status_descriptions: Vec::new(),
+        };
+        info.compute_lifecycle(Utc::now());
+        info
+    }
+
+    /// Populates the computed lifecycle fields (`days_until_expiration`,
+    /// `domain_age_days`, `expiry_status`, `status_descriptions`) relative to
+    /// `now`. Pure given `now`, so it is unit-testable with a fixed clock.
+    fn compute_lifecycle(&mut self, now: DateTime<Utc>) {
+        self.days_until_expiration = self.expiration_date.map(|e| (e - now).num_days());
+        self.domain_age_days = self.creation_date.map(|c| (now - c).num_days());
+        self.expiry_status = derive_expiry_status(self.days_until_expiration, &self.status);
+        self.status_descriptions = self
+            .status
+            .iter()
+            .filter_map(|code| {
+                describe_epp_status(code).map(|d| StatusDescription {
+                    code: code.clone(),
+                    description: d.to_string(),
+                })
+            })
+            .collect();
     }
 
     /// Constructs a `DomainInfo` from a `LookupResult`, extracting RDAP and WHOIS
@@ -554,6 +740,125 @@ mod tests {
         assert_eq!(info.domain, "example.com");
         assert_eq!(info.registrar.as_deref(), Some("WHOIS Registrar Inc."));
         assert!(info.rdap_url.is_none());
+    }
+
+    #[test]
+    fn from_sources_populates_registrar_detail() {
+        let rdap: RdapResponse = serde_json::from_value(serde_json::json!({
+            "objectClassName": "domain",
+            "ldhName": "example.com",
+            "entities": [{
+                "objectClassName": "entity",
+                "roles": ["registrar"],
+                "publicIds": [{"type": "IANA Registrar ID", "identifier": "292"}],
+                "links": [{"rel": "about", "href": "https://registrar.example"}],
+                "vcardArray": ["vcard", [["fn", {}, "text", "Example Registrar"]]],
+                "entities": [{
+                    "objectClassName": "entity",
+                    "roles": ["abuse"],
+                    "vcardArray": ["vcard", [
+                        ["email", {}, "text", "abuse@registrar.example"],
+                        ["tel", {}, "text", "+1.5551230000"]
+                    ]]
+                }]
+            }]
+        }))
+        .unwrap();
+        let info = DomainInfo::from_sources("example.com", Some(&rdap), None);
+        assert_eq!(info.registrar_iana_id.as_deref(), Some("292"));
+        assert_eq!(
+            info.registrar_url.as_deref(),
+            Some("https://registrar.example")
+        );
+        assert_eq!(
+            info.registrar_abuse_email.as_deref(),
+            Some("abuse@registrar.example")
+        );
+        assert_eq!(info.registrar_abuse_phone.as_deref(), Some("+1.5551230000"));
+    }
+
+    #[test]
+    fn describe_epp_status_decodes_known_codes() {
+        assert_eq!(
+            describe_epp_status("clientTransferProhibited"),
+            Some("transfer locked (by registrar)")
+        );
+        // RDAP space-separated form maps to the same description.
+        assert_eq!(
+            describe_epp_status("client transfer prohibited"),
+            Some("transfer locked (by registrar)")
+        );
+        assert_eq!(
+            describe_epp_status("serverHold"),
+            Some("resolution suspended (by registry)")
+        );
+        assert_eq!(
+            describe_epp_status("redemptionPeriod"),
+            Some("recently expired, recoverable (redemption period)")
+        );
+        // A trailing RDAP URL annotation is ignored.
+        assert_eq!(
+            describe_epp_status("client hold (https://example.com/info)"),
+            Some("resolution suspended (by registrar)")
+        );
+        assert_eq!(describe_epp_status("totally unknown code"), None);
+    }
+
+    #[test]
+    fn derive_expiry_status_bands_by_days_and_codes() {
+        // Status codes win over the date math.
+        assert_eq!(
+            derive_expiry_status(Some(200), &["pendingDelete".into()]),
+            Some(ExpiryStatus::PendingDelete)
+        );
+        assert_eq!(
+            derive_expiry_status(Some(200), &["redemptionPeriod".into()]),
+            Some(ExpiryStatus::Redemption)
+        );
+        // Date bands.
+        assert_eq!(
+            derive_expiry_status(Some(365), &[]),
+            Some(ExpiryStatus::Active)
+        );
+        assert_eq!(
+            derive_expiry_status(Some(30), &[]),
+            Some(ExpiryStatus::ExpiringSoon)
+        );
+        assert_eq!(
+            derive_expiry_status(Some(0), &[]),
+            Some(ExpiryStatus::ExpiringSoon)
+        );
+        assert_eq!(
+            derive_expiry_status(Some(-5), &[]),
+            Some(ExpiryStatus::Expired)
+        );
+        // Unknown date with no informative codes → None.
+        assert_eq!(derive_expiry_status(None, &["ok".into()]), None);
+    }
+
+    #[test]
+    fn compute_lifecycle_uses_fixed_clock() {
+        use chrono::TimeZone;
+        // make_test_whois: creation 2019-06-01, expiration 2024-06-01,
+        // status clientTransferProhibited.
+        let whois = make_test_whois();
+        let mut info = DomainInfo::from_sources("example.com", None, Some(&whois));
+        let now = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+        info.compute_lifecycle(now);
+
+        let expected_days = (Utc.with_ymd_and_hms(2024, 6, 1, 0, 0, 0).unwrap() - now).num_days();
+        assert_eq!(info.days_until_expiration, Some(expected_days));
+        assert!(info.days_until_expiration.unwrap() > 0);
+        assert!(info.domain_age_days.unwrap() > 0);
+        // ~152 days out (>30) → Active.
+        assert_eq!(info.expiry_status, Some(ExpiryStatus::Active));
+        // clientTransferProhibited is decoded.
+        assert_eq!(info.status_descriptions.len(), 1);
+        assert_eq!(info.status_descriptions[0].code, "clientTransferProhibited");
+        assert_eq!(
+            info.status_descriptions[0].description,
+            "transfer locked (by registrar)"
+        );
     }
 
     #[test]

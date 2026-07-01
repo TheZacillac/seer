@@ -6,7 +6,7 @@ mod records;
 mod resolver;
 
 pub use compare::{DnsComparator, DnsComparison, ServerResult};
-pub use dnssec::{DnskeyInfo, DnssecChecker, DnssecReport, DsInfo};
+pub use dnssec::{AuthenticationTier, DnskeyInfo, DnssecChecker, DnssecReport, DsInfo, RrsigInfo};
 pub use follow::{
     DnsFollower, FollowConfig, FollowIteration, FollowProgressCallback, FollowResult,
     MAX_FOLLOW_INTERVAL_SECS, MAX_FOLLOW_ITERATIONS,

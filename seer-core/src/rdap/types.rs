@@ -508,6 +508,60 @@ impl RdapResponse {
         None
     }
 
+    /// Extracts structured registrar object detail — ICANN abuse contact, IANA
+    /// registrar ID, and registrar URL — from the `registrar` entity.
+    ///
+    /// These fields are already carried by the RDAP response (the abuse contact
+    /// as a nested `abuse`-role entity per RFC 9083, the IANA ID in
+    /// `public_ids`, the URL in `links`) but `get_registrar` collapses the
+    /// entity to just a name. Returns `None` when there is no registrar entity
+    /// or it carries none of these fields.
+    pub fn get_registrar_detail(&self) -> Option<RegistrarDetail> {
+        let entity = self.get_entity_by_role("registrar")?;
+
+        // IANA Registrar ID from public_ids (RFC 7484 uses the type string
+        // "IANA Registrar ID"; match loosely on "iana" for registry variance).
+        let iana_id = entity
+            .public_ids
+            .iter()
+            .find(|p| p.id_type.to_lowercase().contains("iana"))
+            .map(|p| p.identifier.clone());
+
+        // Registrar URL: prefer a link with rel="about", else the first http(s)
+        // href on the entity.
+        let url = entity
+            .links
+            .iter()
+            .find(|l| l.rel.as_deref() == Some("about"))
+            .and_then(|l| l.href.clone())
+            .or_else(|| {
+                entity
+                    .links
+                    .iter()
+                    .find_map(|l| l.href.clone().filter(|h| h.starts_with("http")))
+            });
+
+        // Abuse contact: the nested entity with role "abuse".
+        let (abuse_email, abuse_phone) = entity
+            .entities
+            .iter()
+            .find(|e| e.roles.iter().any(|r| r == "abuse"))
+            .map(|a| (a.get_email(), a.get_phone()))
+            .unwrap_or((None, None));
+
+        let detail = RegistrarDetail {
+            abuse_email,
+            abuse_phone,
+            iana_id,
+            url,
+        };
+        if detail.is_empty() {
+            None
+        } else {
+            Some(detail)
+        }
+    }
+
     pub fn get_registrant(&self) -> Option<String> {
         for entity in &self.entities {
             if entity.roles.iter().any(|r| r == "registrant") {
@@ -606,6 +660,38 @@ impl RdapResponse {
     }
 }
 
+/// Structured registrar object detail extracted from the RDAP `registrar`
+/// entity: the ICANN abuse contact, IANA registrar ID, and registrar URL.
+///
+/// All three are already present in RDAP responses but discarded by
+/// [`RdapResponse::get_registrar`], which returns only the registrar name.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RegistrarDetail {
+    /// ICANN-required abuse contact email (from the nested `abuse` entity).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub abuse_email: Option<String>,
+    /// Abuse contact phone (from the nested `abuse` entity).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub abuse_phone: Option<String>,
+    /// IANA Registrar ID (uniquely identifies the registrar for correlation).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub iana_id: Option<String>,
+    /// Registrar URL (the `about` link on the registrar entity).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+}
+
+impl RegistrarDetail {
+    /// True when no field carries data (used to collapse an empty detail to
+    /// `None`).
+    pub fn is_empty(&self) -> bool {
+        self.abuse_email.is_none()
+            && self.abuse_phone.is_none()
+            && self.iana_id.is_none()
+            && self.url.is_none()
+    }
+}
+
 /// Contact information extracted from RDAP entity.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ContactInfo {
@@ -687,6 +773,53 @@ mod tests {
             ..Default::default()
         };
         assert!(real.has_info());
+    }
+
+    #[test]
+    fn get_registrar_detail_extracts_abuse_iana_url() {
+        let resp: RdapResponse = serde_json::from_value(serde_json::json!({
+            "objectClassName": "domain",
+            "ldhName": "example.com",
+            "entities": [{
+                "objectClassName": "entity",
+                "roles": ["registrar"],
+                "publicIds": [{"type": "IANA Registrar ID", "identifier": "292"}],
+                "links": [{"rel": "about", "href": "https://registrar.example"}],
+                "vcardArray": ["vcard", [["fn", {}, "text", "Example Registrar"]]],
+                "entities": [{
+                    "objectClassName": "entity",
+                    "roles": ["abuse"],
+                    "vcardArray": ["vcard", [
+                        ["email", {}, "text", "abuse@registrar.example"],
+                        ["tel", {}, "text", "+1.5551230000"]
+                    ]]
+                }]
+            }]
+        }))
+        .unwrap();
+
+        let detail = resp.get_registrar_detail().expect("registrar detail");
+        assert_eq!(detail.iana_id.as_deref(), Some("292"));
+        assert_eq!(detail.url.as_deref(), Some("https://registrar.example"));
+        assert_eq!(
+            detail.abuse_email.as_deref(),
+            Some("abuse@registrar.example")
+        );
+        assert_eq!(detail.abuse_phone.as_deref(), Some("+1.5551230000"));
+    }
+
+    #[test]
+    fn get_registrar_detail_none_without_registrar() {
+        // No registrar entity at all.
+        assert!(RdapResponse::default().get_registrar_detail().is_none());
+
+        // Registrar entity present but carrying none of the detail fields.
+        let resp: RdapResponse = serde_json::from_value(serde_json::json!({
+            "entities": [{"objectClassName": "entity", "roles": ["registrar"],
+                "vcardArray": ["vcard", [["fn", {}, "text", "Bare Registrar"]]]}]
+        }))
+        .unwrap();
+        assert!(resp.get_registrar_detail().is_none());
     }
 
     #[test]
