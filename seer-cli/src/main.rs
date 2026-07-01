@@ -270,13 +270,15 @@ enum Commands {
     Compare {
         /// Domain name to query
         domain: String,
-        /// Record type (A, AAAA, MX, etc.)
-        #[arg(default_value = "A")]
-        record_type: String,
         /// First nameserver (e.g., 8.8.8.8)
         server_a: String,
         /// Second nameserver (e.g., 1.1.1.1)
         server_b: String,
+        /// Record type (A, AAAA, MX, etc.)
+        // Trails the required nameservers: clap forbids a defaulted positional
+        // from preceding a required one (it panics on a debug_assert otherwise).
+        #[arg(default_value = "A")]
+        record_type: String,
     },
     /// Enumerate subdomains via Certificate Transparency logs
     Subdomains {
@@ -420,6 +422,20 @@ fn emit_error<E: std::fmt::Display>(output_format: seer_core::output::OutputForm
     std::process::exit(1);
 }
 
+/// Parses a DNS record type, routing a bad value through [`emit_error`] so the
+/// `--format json|yaml` error contract still holds. Using `?` here instead would
+/// bubble a raw `anyhow` error past the formatter and print ANSI prose even when
+/// the caller asked for structured output.
+fn parse_record_type(
+    record_type: &str,
+    output_format: seer_core::output::OutputFormat,
+) -> seer_core::RecordType {
+    match record_type.parse::<seer_core::RecordType>() {
+        Ok(rt) => rt,
+        Err(e) => emit_error(output_format, &e),
+    }
+}
+
 async fn execute_command(
     command: Commands,
     output_format: seer_core::output::OutputFormat,
@@ -534,7 +550,7 @@ async fn execute_command(
             server,
         } => {
             let resolver = seer_core::DnsResolver::new().with_timeout(config.dns_timeout());
-            let rt: seer_core::RecordType = record_type.parse()?;
+            let rt = parse_record_type(&record_type, output_format);
             let ns = server
                 .as_ref()
                 .map(|s| s.trim_start_matches('@'))
@@ -558,7 +574,7 @@ async fn execute_command(
             record_type,
         } => {
             let checker = seer_core::dns::PropagationChecker::new();
-            let rt: seer_core::RecordType = record_type.parse()?;
+            let rt = parse_record_type(&record_type, output_format);
 
             match checker.check(&domain, rt).await {
                 Ok(result) => {
@@ -925,7 +941,7 @@ async fn execute_command(
             server,
             changes_only,
         } => {
-            let rt: seer_core::RecordType = record_type.parse()?;
+            let rt = parse_record_type(&record_type, output_format);
             let ns = server
                 .as_ref()
                 .map(|s| s.trim_start_matches('@'))
@@ -1061,7 +1077,7 @@ async fn execute_command(
             server_b,
         } => {
             let comparator = seer_core::dns::DnsComparator::new();
-            let rt: seer_core::RecordType = record_type.parse()?;
+            let rt = parse_record_type(&record_type, output_format);
             let ns_a = server_a.trim_start_matches('@');
             let ns_b = server_b.trim_start_matches('@');
             match comparator.compare(&domain, rt, ns_a, ns_b).await {
@@ -1120,7 +1136,11 @@ async fn execute_command(
             }
         }
         Commands::Watch { action, domain } => {
-            let mut watchlist = seer_core::Watchlist::load();
+            // Watchlist file I/O is blocking — run it on a blocking thread so it
+            // doesn't stall the async runtime (mirrors the History handler).
+            let mut watchlist = tokio::task::spawn_blocking(seer_core::Watchlist::load)
+                .await
+                .unwrap_or_default();
             match action.as_deref() {
                 Some("add") => {
                     let domain = domain
@@ -1128,7 +1148,13 @@ async fn execute_command(
                         .ok_or_else(|| anyhow::anyhow!("Usage: seer watch add <domain>"))?;
                     match watchlist.add(domain) {
                         Ok(true) => {
-                            watchlist.save()?;
+                            let save_result =
+                                tokio::task::spawn_blocking(move || watchlist.save()).await;
+                            match save_result {
+                                Ok(Ok(())) => {}
+                                Ok(Err(e)) => return Err(e.into()),
+                                Err(e) => return Err(e.into()),
+                            }
                             println!("Added {} to watchlist", domain.ctp_green());
                         }
                         Ok(false) => {
@@ -1145,7 +1171,13 @@ async fn execute_command(
                         .as_deref()
                         .ok_or_else(|| anyhow::anyhow!("Usage: seer watch remove <domain>"))?;
                     if watchlist.remove(domain) {
-                        watchlist.save()?;
+                        let save_result =
+                            tokio::task::spawn_blocking(move || watchlist.save()).await;
+                        match save_result {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => return Err(e.into()),
+                            Err(e) => return Err(e.into()),
+                        }
                         println!("Removed {} from watchlist", domain.ctp_green());
                     } else {
                         println!("{} was not in the watchlist", domain);
@@ -1285,6 +1317,46 @@ mod cli_error_tests {
             machine_error(OutputFormat::Markdown, "boom").unwrap(),
             "**Error:** boom"
         );
+    }
+}
+
+#[cfg(test)]
+mod compare_cli_tests {
+    use super::{Cli, Commands};
+    use clap::Parser;
+
+    /// `compare` must parse cleanly. The required `server_a`/`server_b`
+    /// positionals previously sat AFTER the defaulted `record_type`, which trips
+    /// clap's debug_assert (a required positional cannot follow an optional one)
+    /// and panics on parse in debug builds. record_type must default to "A".
+    #[test]
+    fn compare_parses_with_default_record_type() {
+        let cli = Cli::try_parse_from(["seer", "compare", "example.com", "8.8.8.8", "1.1.1.1"])
+            .expect("compare should parse");
+        let Some(Commands::Compare {
+            domain,
+            server_a,
+            server_b,
+            record_type,
+        }) = cli.command
+        else {
+            panic!("expected Compare command");
+        };
+        assert_eq!(domain, "example.com");
+        assert_eq!(server_a, "8.8.8.8");
+        assert_eq!(server_b, "1.1.1.1");
+        assert_eq!(record_type, "A");
+    }
+
+    #[test]
+    fn compare_parses_with_explicit_record_type() {
+        let cli =
+            Cli::try_parse_from(["seer", "compare", "example.com", "8.8.8.8", "1.1.1.1", "MX"])
+                .expect("compare with explicit type should parse");
+        let Some(Commands::Compare { record_type, .. }) = cli.command else {
+            panic!("expected Compare command");
+        };
+        assert_eq!(record_type, "MX");
     }
 }
 

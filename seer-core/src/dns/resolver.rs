@@ -207,9 +207,7 @@ impl DnsResolver {
                 }
                 // A bare domain isn't a valid SRV query — surface a usage hint
                 // as an input error (permanent), not a transient DNS failure.
-                None => Err(SeerError::InvalidInput(
-                    "SRV records require service name format: _service._proto.name".to_string(),
-                )),
+                None => Err(srv_format_error()),
             },
             RecordType::CAA => self.resolve_caa(resolver, &domain).await,
             RecordType::DNSKEY => self.resolve_dnskey(resolver, &domain).await,
@@ -952,7 +950,7 @@ fn prepare_query(domain: &str, record_type: RecordType) -> Result<String> {
 /// its `(service, protocol, name)` parts, with the leading underscores
 /// stripped. Returns `None` when the input is not in that shape — e.g. a bare
 /// domain with no service/proto labels — so callers can surface a usage hint.
-fn parse_srv_query(name: &str) -> Option<(String, String, String)> {
+pub(crate) fn parse_srv_query(name: &str) -> Option<(String, String, String)> {
     let mut parts = name.splitn(3, '.');
     let service = parts.next()?.strip_prefix('_')?;
     let protocol = parts.next()?.strip_prefix('_')?;
@@ -961,6 +959,15 @@ fn parse_srv_query(name: &str) -> Option<(String, String, String)> {
         return None;
     }
     Some((service.to_string(), protocol.to_string(), rest.to_string()))
+}
+
+/// The canonical "bad SRV query name" error, shared by the single-query resolver
+/// path and the propagation checker so both reject a bare-domain SRV query with
+/// the identical permanent `InvalidInput` message.
+pub(crate) fn srv_format_error() -> SeerError {
+    SeerError::InvalidInput(
+        "SRV records require service name format: _service._proto.name".to_string(),
+    )
 }
 
 fn reverse_dns_name(ip: &IpAddr) -> String {

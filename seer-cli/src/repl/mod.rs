@@ -1162,10 +1162,13 @@ impl Repl {
                 let Some(domain) = args.get(1) else {
                     return CommandResult::Error("Usage: watch add <domain>".to_string());
                 };
-                let mut watchlist = seer_core::Watchlist::load();
+                let mut watchlist = match load_watchlist_async().await {
+                    Ok(w) => w,
+                    Err(e) => return CommandResult::Error(e),
+                };
                 match watchlist.add(domain) {
                     Ok(true) => {
-                        if let Err(e) = watchlist.save() {
+                        if let Err(e) = save_watchlist_async(watchlist).await {
                             return CommandResult::Error(format!("Failed to save: {}", e));
                         }
                         println!("Added {} to watchlist", domain);
@@ -1183,9 +1186,12 @@ impl Repl {
                 let Some(domain) = args.get(1) else {
                     return CommandResult::Error("Usage: watch remove <domain>".to_string());
                 };
-                let mut watchlist = seer_core::Watchlist::load();
+                let mut watchlist = match load_watchlist_async().await {
+                    Ok(w) => w,
+                    Err(e) => return CommandResult::Error(e),
+                };
                 if watchlist.remove(domain) {
-                    if let Err(e) = watchlist.save() {
+                    if let Err(e) = save_watchlist_async(watchlist).await {
                         return CommandResult::Error(format!("Failed to save: {}", e));
                     }
                     println!("Removed {} from watchlist", domain);
@@ -1195,7 +1201,10 @@ impl Repl {
                 CommandResult::Continue
             }
             Some("list") => {
-                let watchlist = seer_core::Watchlist::load();
+                let watchlist = match load_watchlist_async().await {
+                    Ok(w) => w,
+                    Err(e) => return CommandResult::Error(e),
+                };
                 if watchlist.domains.is_empty() {
                     println!("Watchlist is empty. Use 'watch add <domain>' to add domains.");
                 } else {
@@ -1207,7 +1216,10 @@ impl Repl {
                 CommandResult::Continue
             }
             None => {
-                let watchlist = seer_core::Watchlist::load();
+                let watchlist = match load_watchlist_async().await {
+                    Ok(w) => w,
+                    Err(e) => return CommandResult::Error(e),
+                };
                 if watchlist.domains.is_empty() {
                     println!("Watchlist is empty. Use 'watch add <domain>' to add domains.");
                     return CommandResult::Continue;
@@ -1303,5 +1315,24 @@ impl Repl {
             },
             _ => CommandResult::Error(format!("Unknown setting: {}", args[0])),
         }
+    }
+}
+
+/// Load the watchlist off the Tokio worker. The file read + TOML parse are
+/// blocking; offloading keeps the REPL responsive to other in-flight tasks
+/// (mirrors the history I/O handling in `execute_history`).
+async fn load_watchlist_async() -> Result<seer_core::Watchlist, String> {
+    tokio::task::spawn_blocking(seer_core::Watchlist::load)
+        .await
+        .map_err(|e| format!("Failed to load watchlist: {}", e))
+}
+
+/// Save the watchlist off the Tokio worker. Flattens the `spawn_blocking` join
+/// error and the inner save error into a single message.
+async fn save_watchlist_async(watchlist: seer_core::Watchlist) -> Result<(), String> {
+    match tokio::task::spawn_blocking(move || watchlist.save()).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(e) => Err(e.to_string()),
     }
 }

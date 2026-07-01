@@ -58,9 +58,13 @@ static SIGNING_KEY_LINE: Lazy<Regex> = Lazy::new(|| {
 });
 
 // Also support the English-appended format (when /e is used)
-/// Matches: `Name Server:   value`
+/// Matches `Name Server:   value` and the `p.`-prefixed form. For the `p.`
+/// branch an optional bracketed label (e.g. `[Name Server]`) is consumed but
+/// not captured, so only the trailing hostname lands in the capture group —
+/// otherwise a `p. [label] host` line yields `[label] host` as the nameserver.
 static NS_EN_PATTERN: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?im)^(?:Name Server|p\.)\s*:?\s+(.+)$").expect("Invalid JPRS NS EN regex")
+    Regex::new(r"(?im)^(?:Name Server\s*:?|p\.\s*(?:\[[^\]]*\])?)\s+(.+)$")
+        .expect("Invalid JPRS NS EN regex")
 });
 
 /// Parser for .jp domains using the JPRS format.
@@ -303,6 +307,29 @@ s. [署名鍵]
 
         // s. [署名鍵] is empty, so no DNSSEC
         assert!(result.dnssec.is_none());
+    }
+
+    /// English-appended (/e) variant whose NS lines carry a `p.` prefix and a
+    /// bracketed label that is NOT the exact Japanese `[ネームサーバ]`. The strict
+    /// Japanese NS_PATTERN doesn't match, so parsing falls back to NS_EN_PATTERN.
+    /// That fallback must extract only the hostname, not swallow the bracket
+    /// label into the nameserver value.
+    const SAMPLE_JPRS_EN_BRACKET_NS: &str = r#"Domain Information:
+a. [Domain Name]                EXAMPLE.JP
+p.        [Name Server]              a.dns.jp
+p.        [Name Server]              b.dns.jp
+[State]                         Active"#;
+
+    #[test]
+    fn test_jprs_en_fallback_strips_bracket_label() {
+        let parser = JprsParser::new();
+        let result = parser.parse("example.jp", "whois.jprs.jp", SAMPLE_JPRS_EN_BRACKET_NS);
+
+        assert_eq!(
+            result.nameservers,
+            vec!["a.dns.jp".to_string(), "b.dns.jp".to_string()],
+            "fallback must capture only the hostname, not the bracket label"
+        );
     }
 
     #[test]

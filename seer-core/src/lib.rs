@@ -33,6 +33,7 @@ pub use validation::normalize_domain;
 pub use dns::{
     DnsComparator, DnsComparison, DnsFollower, DnsRecord, DnsResolver, DnssecChecker, DnssecReport,
     FollowConfig, FollowIteration, FollowResult, PropagationResult, RecordType,
+    MAX_FOLLOW_INTERVAL_SECS, MAX_FOLLOW_ITERATIONS,
 };
 pub use lookup::{LookupProgressCallback, LookupResult, SmartLookup};
 pub use rdap::{RdapClient, RdapResponse};

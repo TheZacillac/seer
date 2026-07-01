@@ -76,6 +76,18 @@ impl PropagationChecker {
         // input and re-normalizing ~29 times lazily inside the resolver. (The
         // DNSSEC checker already normalizes this way.)
         let domain = crate::validation::normalize_domain(domain)?;
+
+        // An SRV query needs a `_service._proto.name` query name. A bare domain
+        // is a deterministic input error: without this guard it fails identically
+        // on every one of the ~29 servers, and the aggregate result (0% / all
+        // unreachable) is indistinguishable from a real network-wide outage.
+        // Reject it once, up front, before any fan-out.
+        if record_type == RecordType::SRV
+            && crate::dns::resolver::parse_srv_query(&domain).is_none()
+        {
+            return Err(crate::dns::resolver::srv_format_error());
+        }
+
         debug!(servers = self.servers.len(), "Starting propagation check");
 
         let futures: Vec<_> = self
@@ -322,5 +334,35 @@ mod tests {
         // Sanity: with no servers, nothing was queried.
         assert_eq!(result.servers_checked, 0);
         assert_eq!(result.servers_responding, 0);
+    }
+
+    /// An SRV query against a bare domain is a deterministic input error, not a
+    /// network condition. `check()` must reject it up front with `InvalidInput`
+    /// rather than fanning out and reporting every server as failed (which is
+    /// indistinguishable from a real outage). Uses the empty-server seam, so the
+    /// rejection must happen before any server fan-out for this to pass.
+    #[tokio::test]
+    async fn check_rejects_srv_against_bare_domain() {
+        let checker = PropagationChecker::empty_for_tests();
+        let err = checker
+            .check("example.com", RecordType::SRV)
+            .await
+            .expect_err("bare-domain SRV must be rejected as an input error");
+        assert!(
+            matches!(err, SeerError::InvalidInput(_)),
+            "expected InvalidInput, got: {err:?}"
+        );
+    }
+
+    /// A properly-formed `_service._proto.name` SRV query must NOT be rejected
+    /// by the upfront guard (it should proceed to the normal fan-out path).
+    #[tokio::test]
+    async fn check_allows_well_formed_srv_query() {
+        let checker = PropagationChecker::empty_for_tests();
+        let result = checker
+            .check("_sip._tcp.example.com", RecordType::SRV)
+            .await
+            .expect("well-formed SRV query must pass the upfront guard");
+        assert_eq!(result.servers_checked, 0);
     }
 }

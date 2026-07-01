@@ -138,6 +138,11 @@ impl RegistryParser for EducauseParser {
         }
 
         let mut current_section = Section::None;
+        // Tracks whether the body actually contained a registration record. A
+        // not-found response ("No match for ...") has no `Domain Name:` line, so
+        // we must not stamp it with a registrar — that would make
+        // WhoisResponse::is_available() short-circuit to "registered".
+        let mut domain_found = false;
 
         for line in raw.lines() {
             let trimmed = line.trim();
@@ -185,6 +190,7 @@ impl RegistryParser for EducauseParser {
                 current_section = Section::NameServers;
                 continue;
             } else if DOMAIN_NAME.is_match(trimmed) {
+                domain_found = true;
                 current_section = Section::None;
                 continue;
             }
@@ -254,7 +260,10 @@ impl RegistryParser for EducauseParser {
 
         WhoisResponse {
             domain: domain.to_string(),
-            registrar: Some("EDUCAUSE".to_string()),
+            // Only attribute the record to EDUCAUSE when the response actually
+            // carried a registration record; a "No match" body must stay
+            // registrar-less so availability detection works.
+            registrar: domain_found.then(|| "EDUCAUSE".to_string()),
             registrant: registrant.clone(),
             organization: registrant,
             registrant_email: None,
@@ -452,6 +461,44 @@ Name Servers:
 	NS1.EX.EDU
 
 Domain record activated:    05-Mar-1999"#;
+
+    /// EDUCAUSE's not-found body for an unregistered .edu domain. It carries the
+    /// standard notice preamble followed by a "No match for ..." line and no
+    /// `Domain Name:` record. The parser must NOT stamp a registrar onto it, or
+    /// `is_available()` short-circuits to `false` and the domain is wrongly
+    /// reported as registered.
+    const SAMPLE_NO_MATCH: &str = r#"This Registry database contains ONLY .EDU domains.
+The data in the EDUCAUSE Whois database is provided
+by EDUCAUSE for information purposes in order to
+assist in the process of obtaining information about
+or related to .edu domain registration records.
+
+-------------------------------------------------------------
+
+No match for "NOTAREALDOMAIN123XYZ.EDU"."#;
+
+    #[test]
+    fn test_educause_no_match_reports_available() {
+        let parser = EducauseParser::new();
+        let result = parser.parse(
+            "notarealdomain123xyz.edu",
+            "whois.educause.edu",
+            SAMPLE_NO_MATCH,
+        );
+
+        // A not-found response carries no registration record, so it must not
+        // claim a registrar.
+        assert_eq!(
+            result.registrar, None,
+            "not-found response must not carry a registrar"
+        );
+        // With no registrar/dates/nameservers, is_available() can see the
+        // "No match" sentinel and correctly report the domain as available.
+        assert!(
+            result.is_available(),
+            "unregistered .edu domain should be reported available"
+        );
+    }
 
     #[test]
     fn test_educause_contact_leading_email_not_stored_as_name() {

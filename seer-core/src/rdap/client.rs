@@ -492,6 +492,12 @@ impl RdapClient {
         }
 
         let mut last_error: Option<SeerError> = None;
+        // A definitive 404 from any candidate is the strongest available-ness
+        // signal there is. Preserve the first one we see so a later candidate's
+        // non-404 failure (timeout/5xx/conn) can't bury it — otherwise
+        // `rdap_error_is_404` would return false and a genuinely available
+        // domain would be misreported as inconclusive.
+        let mut not_found_error: Option<SeerError> = None;
         for (idx, url) in urls.iter().enumerate() {
             let url_str = url.as_str().to_string();
             debug!(url = %url_str, candidate = idx + 1, total = urls.len(), "Querying RDAP");
@@ -507,13 +513,21 @@ impl RdapClient {
                             "RDAP candidate failed, trying next",
                         );
                     }
-                    last_error = Some(e);
+                    if not_found_error.is_none() && crate::rdap::rdap_error_is_404(&e) {
+                        not_found_error = Some(e);
+                    } else {
+                        last_error = Some(e);
+                    }
                 }
             }
         }
 
-        // All candidates failed.
-        Err(wrap_all_candidates_failed(last_error, urls.len()))
+        // All candidates failed. Prefer a preserved 404 over a later non-404
+        // failure so the authoritative not-found signal reaches the caller.
+        Err(wrap_all_candidates_failed(
+            not_found_error.or(last_error),
+            urls.len(),
+        ))
     }
 
     /// Queries a single RDAP endpoint, retrying transient failures. Unlike the
@@ -1537,5 +1551,37 @@ mod tests {
         ];
         let resp = client.query_rdap_urls(&urls).await.unwrap();
         assert_eq!(resp.handle.as_deref(), Some("MOCK-2"));
+    }
+
+    /// When an earlier candidate authoritatively reports 404 (no such object)
+    /// but a later candidate fails for a different reason (5xx/timeout/conn),
+    /// the definitive 404 — the strongest availability signal — must survive in
+    /// the returned error. Otherwise `rdap_error_is_404` returns false and a
+    /// genuinely available domain is misreported as inconclusive.
+    #[tokio::test]
+    async fn mock_rdap_404_on_first_candidate_survives_later_non_404_failure() {
+        let not_found = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&not_found)
+            .await;
+        let broken = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&broken)
+            .await;
+
+        let client = RdapClient::new()
+            .without_retries()
+            .allowing_reserved_for_tests();
+        let urls = vec![
+            url::Url::parse(&format!("{}/domain/example.com", not_found.uri())).unwrap(),
+            url::Url::parse(&format!("{}/domain/example.com", broken.uri())).unwrap(),
+        ];
+        let err = client.query_rdap_urls(&urls).await.unwrap_err();
+        assert!(
+            crate::rdap::rdap_error_is_404(&err),
+            "404 from candidate 1 must survive candidate 2's non-404 failure, got: {err:?}"
+        );
     }
 }

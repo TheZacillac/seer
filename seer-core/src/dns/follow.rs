@@ -14,7 +14,13 @@ use crate::error::{Result, SeerError};
 /// Upper bound on follow iterations. A non-interactive caller (API / Python
 /// bindings) passing a huge count would otherwise schedule an effectively
 /// unbounded long-running loop; the interval is already capped at 60 minutes.
-const MAX_FOLLOW_ITERATIONS: usize = 10_000;
+pub const MAX_FOLLOW_ITERATIONS: usize = 10_000;
+
+/// Upper bound on the follow interval, in seconds (60 minutes). Exposed so
+/// front-ends (e.g. the TUI) can clamp user input to the same range
+/// `FollowConfig::new` enforces, instead of letting an over-range value fail
+/// validation and silently no-op.
+pub const MAX_FOLLOW_INTERVAL_SECS: u64 = 3600;
 
 /// Configuration for DNS follow operation
 #[derive(Debug, Clone)]
@@ -66,7 +72,7 @@ impl FollowConfig {
                 "interval_minutes must be non-negative".into(),
             ));
         }
-        if interval_minutes > 60.0 {
+        if interval_minutes > MAX_FOLLOW_INTERVAL_SECS as f64 / 60.0 {
             return Err(SeerError::InvalidInput(
                 "interval_minutes must be at most 60".into(),
             ));

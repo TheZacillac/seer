@@ -198,7 +198,7 @@ seer follow example.com 10 1 MX --changes-only
 
 # DNSSEC & DNS comparison
 seer dnssec example.com
-seer compare example.com A 8.8.8.8 1.1.1.1
+seer compare example.com 8.8.8.8 1.1.1.1 MX   # record type trails; defaults to A
 
 # Domain health & SSL
 seer status example.com
