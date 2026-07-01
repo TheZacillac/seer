@@ -352,8 +352,8 @@ impl App {
                 // Bracketed paste lands here as one string. Route it into whatever
                 // text buffer is active so multi-line domain lists paste cleanly.
                 match &mut self.input_mode {
-                    InputMode::Field { buf, .. } => buf.push_str(&s),
-                    InputMode::Command(buf) => buf.push_str(&s),
+                    InputMode::Field { buf, .. } => buf.insert_str(&s),
+                    InputMode::Command(buf) => buf.insert_str(&s),
                     InputMode::Normal => {}
                 }
                 vec![]
@@ -388,42 +388,33 @@ impl App {
         self.on_normal_action(ka)
     }
 
-    fn on_command_key(&mut self, key: KeyEvent, mut buf: String) -> Vec<Action> {
-        match key.code {
-            KeyCode::Esc => vec![],
-            KeyCode::Enter => self.exec_command(&buf),
-            KeyCode::Backspace => {
-                buf.pop();
-                self.input_mode = InputMode::Command(buf);
-                vec![]
-            }
-            KeyCode::Char(c) => {
-                buf.push(c);
-                self.input_mode = InputMode::Command(buf);
-                vec![]
-            }
-            _ => {
+    fn on_command_key(
+        &mut self,
+        key: KeyEvent,
+        mut buf: crate::tui::line_editor::LineEditor,
+    ) -> Vec<Action> {
+        use crate::tui::line_editor::EditOutcome;
+        match buf.handle_key(key) {
+            EditOutcome::Cancel => vec![],
+            EditOutcome::Submit => self.exec_command(buf.as_str()),
+            EditOutcome::Continue => {
                 self.input_mode = InputMode::Command(buf);
                 vec![]
             }
         }
     }
 
-    fn on_field_key(&mut self, key: KeyEvent, target: EditTarget, mut buf: String) -> Vec<Action> {
-        match key.code {
-            KeyCode::Esc => vec![],
-            KeyCode::Enter => self.apply_field(target, buf.trim().to_string()),
-            KeyCode::Backspace => {
-                buf.pop();
-                self.input_mode = InputMode::Field { target, buf };
-                vec![]
-            }
-            KeyCode::Char(c) => {
-                buf.push(c);
-                self.input_mode = InputMode::Field { target, buf };
-                vec![]
-            }
-            _ => {
+    fn on_field_key(
+        &mut self,
+        key: KeyEvent,
+        target: EditTarget,
+        mut buf: crate::tui::line_editor::LineEditor,
+    ) -> Vec<Action> {
+        use crate::tui::line_editor::EditOutcome;
+        match buf.handle_key(key) {
+            EditOutcome::Cancel => vec![],
+            EditOutcome::Submit => self.apply_field(target, buf.as_str().trim().to_string()),
+            EditOutcome::Continue => {
                 self.input_mode = InputMode::Field { target, buf };
                 vec![]
             }
@@ -515,7 +506,7 @@ impl App {
             KeyCode::Char('a') => {
                 self.input_mode = InputMode::Field {
                     target: EditTarget::WatchAdd,
-                    buf: String::new(),
+                    buf: crate::tui::line_editor::LineEditor::new(),
                 };
                 Some(vec![])
             }
@@ -583,7 +574,10 @@ impl App {
             PaneOutcome::Action(a) => vec![a],
             PaneOutcome::EditField(target) => {
                 let cur = self.panes.field_value(target);
-                self.input_mode = InputMode::Field { target, buf: cur };
+                self.input_mode = InputMode::Field {
+                    target,
+                    buf: cur.into(),
+                };
                 vec![]
             }
             PaneOutcome::Toast { tone, msg } => {
@@ -858,12 +852,12 @@ impl App {
                 let cur = self.domain.clone().unwrap_or_default();
                 self.input_mode = InputMode::Field {
                     target: EditTarget::Target,
-                    buf: cur,
+                    buf: cur.into(),
                 };
                 vec![]
             }
             KeyAction::Command => {
-                self.input_mode = InputMode::Command(String::new());
+                self.input_mode = InputMode::Command(crate::tui::line_editor::LineEditor::new());
                 vec![]
             }
             KeyAction::Help => {
@@ -1521,7 +1515,7 @@ mod tests {
         };
         app.update(Msg::Input(Event::Paste("b.com c.com".into())));
         assert!(
-            matches!(&app.input_mode, InputMode::Field { buf, .. } if buf == "a.com b.com c.com"),
+            matches!(&app.input_mode, InputMode::Field { buf, .. } if buf.as_str() == "a.com b.com c.com"),
             "paste should append to the field buffer, got {:?}",
             app.input_mode
         );
@@ -1533,7 +1527,7 @@ mod tests {
         app.input_mode = InputMode::Command("look".into());
         app.update(Msg::Input(Event::Paste("up x.com".into())));
         assert!(
-            matches!(&app.input_mode, InputMode::Command(buf) if buf == "lookup x.com"),
+            matches!(&app.input_mode, InputMode::Command(buf) if buf.as_str() == "lookup x.com"),
             "paste should append to the command buffer, got {:?}",
             app.input_mode
         );

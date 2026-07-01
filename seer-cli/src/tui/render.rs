@@ -54,7 +54,12 @@ fn top_bar(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         InputMode::Field {
             target: EditTarget::Target,
             buf,
-        } => format!("⌕ {buf}▏"),
+        } => {
+            // Caret at the cursor position (byte offset is on a char boundary).
+            let s = buf.as_str();
+            let cur = buf.cursor();
+            format!("⌕ {}▏{}", &s[..cur], &s[cur..])
+        }
         // Other field targets are rendered inside their panes; top-bar shows current domain.
         _ => format!("⌕ {domain}"),
     };
@@ -316,7 +321,14 @@ fn status_or_command(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
                     .fg(theme.mauve)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(format!("{buf}█"), Style::default().fg(theme.text)),
+            Span::styled(
+                {
+                    let s = buf.as_str();
+                    let cur = buf.cursor();
+                    format!("{}█{}", &s[..cur], &s[cur..])
+                },
+                Style::default().fg(theme.text),
+            ),
         ]);
         f.render_widget(
             Paragraph::new(line).style(Style::default().bg(theme.mantle)),

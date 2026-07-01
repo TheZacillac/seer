@@ -12,6 +12,7 @@ mod command;
 mod data;
 mod event;
 mod lenses;
+mod line_editor;
 mod panes;
 mod raw;
 mod render;

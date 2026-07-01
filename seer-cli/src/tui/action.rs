@@ -35,10 +35,10 @@ pub enum EditTarget {
 pub enum InputMode {
     #[default]
     Normal,
-    Command(String),
+    Command(crate::tui::line_editor::LineEditor),
     Field {
         target: EditTarget,
-        buf: String,
+        buf: crate::tui::line_editor::LineEditor,
     },
 }
 
