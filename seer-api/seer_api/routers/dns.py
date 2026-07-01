@@ -27,6 +27,27 @@ class BulkDnsRequest(BaseModel):
     concurrency: int = Field(default=10, ge=1, le=MAX_CONCURRENCY)
 
 
+# NOTE: registered before `/{domain}/{record_type}` so `/compare/...` is not
+# swallowed by the two-segment record-lookup route.
+@router.get("/compare/{domain}")
+@limiter.limit("30/minute")
+async def dns_compare(
+    request: Request,
+    domain: str = Path(..., min_length=1, max_length=253),
+    server_a: str = Query(..., description="First nameserver (e.g. 8.8.8.8)"),
+    server_b: str = Query(..., description="Second nameserver (e.g. 1.1.1.1)"),
+    record_type: str = Query("A", max_length=10, pattern=r"^[A-Z0-9]+$"),
+):
+    """Compare DNS records for a domain across two nameservers."""
+    # Both servers are actual connect targets (port 53), so guard them.
+    await ssrf_guard_async(server_a, 53)
+    await ssrf_guard_async(server_b, 53)
+    try:
+        return await run_seer(seer.dns_compare, domain, record_type, server_a, server_b)
+    except Exception as e:
+        raise http_error(e, "DNS comparison failed")
+
+
 @router.get("/{domain}/{record_type}")
 @limiter.limit("60/minute")
 async def dns_lookup(

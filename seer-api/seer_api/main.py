@@ -23,7 +23,7 @@ from ._env import env_int
 from .limiting import get_client_ip, limiter
 from .mcp.server import mcp as mcp_server
 from .middleware import MaxBodySizeMiddleware, RequestLoggingMiddleware, metrics
-from .routers import dns, lookup, propagation, rdap, ssl, status, whois
+from .routers import dns, intel, lookup, propagation, rdap, ssl, status, whois
 
 # Configure structured logging via the unified Arcanum logging module.
 try:
@@ -378,6 +378,14 @@ app.include_router(dns.router, prefix="/dns", tags=["DNS"])
 app.include_router(propagation.router, prefix="/propagation", tags=["Propagation"])
 app.include_router(status.router, prefix="/status", tags=["Status"])
 app.include_router(ssl.router, prefix="/ssl", tags=["SSL"])
+app.include_router(intel.availability_router, prefix="/availability", tags=["Availability"])
+app.include_router(intel.info_router, prefix="/info", tags=["Info"])
+app.include_router(intel.subdomains_router, prefix="/subdomains", tags=["Subdomains"])
+app.include_router(intel.dnssec_router, prefix="/dnssec", tags=["DNSSEC"])
+app.include_router(intel.diff_router, prefix="/diff", tags=["Diff"])
+app.include_router(intel.caa_router, prefix="/caa", tags=["CAA"])
+app.include_router(intel.posture_router, prefix="/posture", tags=["Posture"])
+app.include_router(intel.confusables_router, prefix="/confusables", tags=["Confusables"])
 
 # MCP Streamable HTTP transport. Registered as a Starlette Route (not
 # FastAPI mount) so the session manager owns the full request lifecycle,

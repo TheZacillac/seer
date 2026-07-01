@@ -24,6 +24,13 @@ _DISPATCH_EXECUTOR = ThreadPoolExecutor(
     max_workers=_DISPATCH_THREADS, thread_name_prefix="seer-dispatch"
 )
 
+# Optional per-request deadline (seconds); 0 disables it. When set, a single
+# stuck upstream (WHOIS/RDAP) returns a prompt 504 to the client instead of
+# tying up a bounded dispatch thread for the full core timeout. The dispatch
+# thread itself cannot be cancelled — it finishes on its own — but the client
+# is freed deterministically, which is what an operator SLO cares about.
+_REQUEST_TIMEOUT = env_int("SEER_REQUEST_TIMEOUT", 0, min_value=0)
+
 
 async def run_seer(fn: Callable[..., Any], *args: Any) -> Any:
     """Dispatch ``fn(*args)`` on the bounded seer-dispatch thread pool.
@@ -32,6 +39,16 @@ async def run_seer(fn: Callable[..., Any], *args: Any) -> Any:
     Calling them directly from an async handler would pin the event
     loop thread. ``run_in_executor`` releases the loop for other
     requests while the lookup is in flight.
+
+    When ``SEER_REQUEST_TIMEOUT`` is set, the wait is bounded and a
+    ``TimeoutError`` (mapped to HTTP 504 by ``errors.http_error``) is raised
+    once the deadline elapses.
     """
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(_DISPATCH_EXECUTOR, fn, *args)
+    fut = loop.run_in_executor(_DISPATCH_EXECUTOR, fn, *args)
+    if _REQUEST_TIMEOUT > 0:
+        try:
+            return await asyncio.wait_for(fut, timeout=_REQUEST_TIMEOUT)
+        except (asyncio.TimeoutError, TimeoutError) as exc:
+            raise TimeoutError("request exceeded SEER_REQUEST_TIMEOUT") from exc
+    return await fut
