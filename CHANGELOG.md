@@ -11,6 +11,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.38.0] - 2026-07-01
+
+A feature release adding a suite of domain-intelligence capabilities and wiring
+them through every interface — CLI, REPL, TUI, Python library, REST, and MCP
+([#101]).
+
+### Added
+- **Domain drift** (`seer drift <domain>`) — diffs a fresh lookup against the
+  last stored history snapshot (nameservers, registrar, expiry, DNSSEC,
+  registrant) and exits non-zero on material change, for cron/CI monitoring.
+- **Email/DNS security posture** (`seer posture <domain>`) — reports SPF, DMARC,
+  MTA-STS, BIMI, and DANE (TLSA) with per-mechanism verdicts and advisories.
+- **CAA policy** (`seer caa <domain>`) — surfaces the iodef incident-reporting
+  contact and flags when the wildcard (`issuewild`) issuance policy is broader
+  than the base (`issue`) policy.
+- **Typosquat / look-alike scan** (`seer confusables <domain>`) — generates
+  homoglyph and typo variants and reports which are registered, freshly
+  registered first.
+- **Subdomain classification** (`seer subdomains --resolve`) — resolves each
+  discovered name, marks it live/dead/wildcard, and flags dangling CNAMEs that
+  point at takeover-prone providers.
+- **Richer lookups** — merged domain info now includes derived lifecycle fields
+  (days-to-expiry, age, expiry band, plain-English status decoding) and the
+  registrar abuse contact / IANA ID / URL. SSL reports include security-posture
+  warnings (weak key, deprecated signature, self-signed, expiry, hostname
+  mismatch); DNSSEC reports include a verification-depth tier and an opt-in
+  RRSIG expiry check.
+- **REST + MCP parity** — new single-domain endpoints and tools for ssl,
+  availability, subdomains, dnssec, dns/compare, diff, info, caa, posture, and
+  confusables, plus an optional `SEER_REQUEST_TIMEOUT` request deadline.
+- **Python bindings** for `caa`, `posture`, `confusables`, and
+  `subdomains_classify`.
+- **Bulk over stdin** — `seer bulk <op> -` reads the domain list from stdin,
+  and `--format json`/`yaml` streams a structured result array to stdout.
+- **TUI** — full cursor-aware line editing in every input field (Home/End,
+  Ctrl-W, mid-string edits) and an in-lens `/` find-filter for the subdomains,
+  history, and propagation lenses.
+
+### Changed
+- The REPL and TUI now honor `~/.seer/config.toml` (per-protocol timeouts,
+  nameserver, bulk concurrency; output format), matching the CLI subcommands.
+- `seer bulk` writes its progress/summary lines to stderr so stdout is reserved
+  for structured (`--format json/yaml`) output.
+
 ## [0.37.1] - 2026-06-30
 
 A bug-fix and hardening release resolving 13 defects surfaced by a full-codebase
@@ -322,7 +366,8 @@ Two notable breaking changes landed in this period (see `CLAUDE.md` for details)
   `inconsistencies` became typed (`ConsensusValue` / `Inconsistency`) instead of
   pre-formatted strings.
 
-[Unreleased]: https://github.com/TheZacillac/seer/compare/v0.37.1...HEAD
+[Unreleased]: https://github.com/TheZacillac/seer/compare/v0.38.0...HEAD
+[0.38.0]: https://github.com/TheZacillac/seer/compare/v0.37.1...v0.38.0
 [0.37.1]: https://github.com/TheZacillac/seer/compare/v0.37.0...v0.37.1
 [0.37.0]: https://github.com/TheZacillac/seer/compare/v0.36.0...v0.37.0
 [0.36.0]: https://github.com/TheZacillac/seer/compare/v0.35.6...v0.36.0
@@ -346,3 +391,4 @@ Two notable breaking changes landed in this period (see `CLAUDE.md` for details)
 [#63]: https://github.com/TheZacillac/seer/pull/63
 [#94]: https://github.com/TheZacillac/seer/pull/94
 [#98]: https://github.com/TheZacillac/seer/pull/98
+[#101]: https://github.com/TheZacillac/seer/pull/101
