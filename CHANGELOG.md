@@ -11,6 +11,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.37.1] - 2026-06-30
+
+A bug-fix and hardening release resolving 13 defects surfaced by a full-codebase
+audit ([#98]).
+
+### Security
+- **RDAP error sanitization gap.** When a lookup fell back to WHOIS, the RDAP
+  error string was returned unsanitized, so an SSRF-guard rejection could leak
+  an internal/reserved IP address. It is now redacted like every other path.
+- **Status redirect SSRF oracle.** A blocked redirect target echoed the
+  resolved internal IP in the error message, acting as an internal-DNS oracle.
+  The detail is now logged at debug and a generic message is returned.
+- **SSL hostname verification.** The certificate Common Name was consulted even
+  when Subject Alternative Names were present, contrary to RFC 6125, which could
+  report a certificate as matching the host when it did not. The CN is now used
+  only when no SANs exist.
+
+### Fixed
+- **RDAP contact redaction.** Contacts whose only populated fields were redacted
+  ("REDACTED FOR PRIVACY") were still displayed; the redaction filter now works.
+- **RDAP response timeout.** A configured RDAP timeout above 15s was ignored
+  while reading the response body; the configured value is now honored end to
+  end.
+- **DNS follow change counts.** A transient resolver error mid-run was counted
+  as every record being removed and then re-added, inflating the change count.
+  Errored iterations no longer produce phantom changes.
+- **DNSSEC unsupported digest types.** A DS record using a digest type Seer
+  cannot compute (e.g. GOST) marked an otherwise-valid signed zone as
+  "misconfigured"; such records are now treated as "not evaluated".
+- **Domain diff creation date.** The creation date now falls back to WHOIS when
+  RDAP omits it, matching the expiration date's behavior.
+- **Registry URL for brand TLDs.** TLDs that share a WHOIS host (e.g. `.datsun`)
+  no longer derive an unrelated registry URL; they fall back to the IANA page.
+- **WHOIS organization parsing.** A bare `Organization:` field could capture the
+  admin or tech contact's organization and mislabel it as the registrant's; the
+  patterns are now line-anchored.
+- **Subdomain enumeration.** Underscore service labels (e.g. `_acme-challenge`,
+  `_dmarc`) present in Certificate Transparency logs were silently dropped and
+  are now kept.
+- **WHOIS connect retries.** Transient connect failures such as "network
+  unreachable" / "no route to host" were not retried; they now use the
+  retryable error path so the configured retry policy applies.
+- **TUI Follow lens.** Failed DNS checks were rendered as healthy; they now show
+  as an error row.
+
 ## [0.37.0] - 2026-06-30
 
 ### Added
@@ -277,7 +322,8 @@ Two notable breaking changes landed in this period (see `CLAUDE.md` for details)
   `inconsistencies` became typed (`ConsensusValue` / `Inconsistency`) instead of
   pre-formatted strings.
 
-[Unreleased]: https://github.com/TheZacillac/seer/compare/v0.36.0...HEAD
+[Unreleased]: https://github.com/TheZacillac/seer/compare/v0.37.1...HEAD
+[0.37.1]: https://github.com/TheZacillac/seer/compare/v0.37.0...v0.37.1
 [0.37.0]: https://github.com/TheZacillac/seer/compare/v0.36.0...v0.37.0
 [0.36.0]: https://github.com/TheZacillac/seer/compare/v0.35.6...v0.36.0
 [0.35.6]: https://github.com/TheZacillac/seer/compare/v0.35.5...v0.35.6
@@ -299,3 +345,4 @@ Two notable breaking changes landed in this period (see `CLAUDE.md` for details)
 [#62]: https://github.com/TheZacillac/seer/pull/62
 [#63]: https://github.com/TheZacillac/seer/pull/63
 [#94]: https://github.com/TheZacillac/seer/pull/94
+[#98]: https://github.com/TheZacillac/seer/pull/98
