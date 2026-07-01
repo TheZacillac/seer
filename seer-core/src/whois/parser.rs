@@ -26,9 +26,13 @@ static ORGANIZATION_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
     vec![
         Regex::new(r"(?i)Registrant Organization:\s*(.+)")
             .expect("Invalid regex for Registrant Organization"),
-        Regex::new(r"(?i)Organization:\s*(.+)").expect("Invalid regex for Organization"),
-        Regex::new(r"(?i)org-name:\s*(.+)").expect("Invalid regex for org-name"),
-        Regex::new(r"(?i)Org Name:\s*(.+)").expect("Invalid regex for Org Name"),
+        // Anchor the bare/ambiguous org labels to the start of a line (allowing
+        // indentation) so they cannot match the "Organization:" substring
+        // inside "Admin Organization:" / "Tech Organization:" lines and thereby
+        // attribute another contact's org to the registrant.
+        Regex::new(r"(?im)^[ \t]*Organization:\s*(.+)").expect("Invalid regex for Organization"),
+        Regex::new(r"(?im)^[ \t]*org-name:\s*(.+)").expect("Invalid regex for org-name"),
+        Regex::new(r"(?im)^[ \t]*Org Name:\s*(.+)").expect("Invalid regex for Org Name"),
     ]
 });
 
@@ -798,6 +802,31 @@ mod tests {
 
     fn make_response(raw: &str) -> WhoisResponse {
         WhoisResponse::parse_internal("example.jp", "whois.jprs.jp", raw)
+    }
+
+    #[test]
+    fn organization_pattern_ignores_admin_and_tech_org_lines() {
+        // With no registrant organization present, the bare `Organization:`
+        // pattern must not capture the org from an `Admin Organization:` /
+        // `Tech Organization:` line and mislabel it as the registrant org.
+        let raw = "Domain Name: example.com\n\
+                   Admin Organization: AcmeAdminCorp\n\
+                   Tech Organization: AcmeTechCorp\n";
+        assert_eq!(
+            extract_field_with_patterns(raw, &ORGANIZATION_PATTERNS),
+            None
+        );
+
+        // A genuine (possibly indented) registrant Organization: line is still
+        // captured.
+        let raw2 = "Domain Name: example.com\n\
+                    Registrant Contact:\n\
+                    \tOrganization: Real Registrant LLC\n\
+                    Admin Organization: AcmeAdminCorp\n";
+        assert_eq!(
+            extract_field_with_patterns(raw2, &ORGANIZATION_PATTERNS).as_deref(),
+            Some("Real Registrant LLC")
+        );
     }
 
     // --- H10: is_available() scans the full response --------------------

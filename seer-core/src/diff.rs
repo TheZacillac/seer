@@ -120,8 +120,16 @@ fn extract_dates(result: Option<&LookupResult>) -> (Option<String>, Option<Strin
         .map(|r| {
             let (exp, _) = r.expiration_info();
             let created = match r {
-                LookupResult::Rdap { data, .. } => data
+                // Mirror the expiration ladder in `LookupResult::expiration_info`:
+                // fall back to the WHOIS creation date when the RDAP response has
+                // no `registration` event, so both date fields use the same
+                // fallback and a diff isn't left internally inconsistent.
+                LookupResult::Rdap {
+                    data,
+                    whois_fallback,
+                } => data
                     .creation_date()
+                    .or_else(|| whois_fallback.as_ref().and_then(|w| w.creation_date))
                     .map(|d| d.format("%Y-%m-%d").to_string()),
                 LookupResult::Whois { data, .. } => {
                     data.creation_date.map(|d| d.format("%Y-%m-%d").to_string())
@@ -235,6 +243,36 @@ mod tests {
         assert!(json.contains("google.com"));
         assert!(json.contains("IANA"));
         assert!(json.contains("MarkMonitor"));
+    }
+
+    #[test]
+    fn extract_dates_rdap_falls_back_to_whois_creation_date() {
+        use crate::rdap::RdapResponse;
+        use crate::whois::WhoisResponse;
+
+        // RDAP response with no `registration` event -> creation_date() is None.
+        let rdap = RdapResponse::default();
+        assert!(rdap.creation_date().is_none());
+
+        // WHOIS fallback carries a creation date.
+        let whois = WhoisResponse::parse_internal(
+            "example.com",
+            "whois.verisign-grs.com",
+            "Domain Name: example.com\nCreation Date: 1995-08-14T04:00:00Z\n",
+        );
+        assert!(
+            whois.creation_date.is_some(),
+            "whois should parse creation date"
+        );
+
+        let result = LookupResult::Rdap {
+            data: Box::new(rdap),
+            whois_fallback: Some(whois),
+        };
+        // created must use the WHOIS fallback, matching the expiration ladder,
+        // rather than being left None.
+        let (_, created) = extract_dates(Some(&result));
+        assert_eq!(created.as_deref(), Some("1995-08-14"));
     }
 
     #[test]

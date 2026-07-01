@@ -1452,9 +1452,16 @@ pub fn get_registry_url(tld: &str) -> Option<String> {
 
     // Try to derive URL from WHOIS server
     if let Some(whois_server) = get_whois_server(&tld_lower) {
-        // Pattern: whois.nic.XX -> https://nic.XX
+        // Pattern: whois.nic.XX -> https://nic.XX, but ONLY when the trailing
+        // label actually equals the queried TLD. Many brand TLDs share a single
+        // registry host (e.g. datsun/nissan/jcb -> whois.nic.gmo), so blindly
+        // stripping the prefix would point users at an unrelated registry
+        // (https://nic.gmo). When it doesn't match, fall through to the IANA
+        // page, which is always correct for the requested TLD.
         if let Some(suffix) = whois_server.strip_prefix("whois.nic.") {
-            return Some(format!("https://nic.{}", suffix));
+            if suffix == tld_lower {
+                return Some(format!("https://nic.{}", suffix));
+            }
         }
         // Pattern: whois.XX -> https://www.nic.XX or https://XX registry
         if whois_server.starts_with("whois.") {
@@ -1522,5 +1529,18 @@ mod all_tlds_tests {
         assert!(tlds.contains(&"com"), "com (WHOIS) should be present");
         assert!(tlds.contains(&"app"), "app (RDAP-only) should be present");
         assert!(tlds.contains(&"dev"), "dev (RDAP-only) should be present");
+    }
+
+    #[test]
+    fn get_registry_url_does_not_misattribute_shared_whois_hosts() {
+        // Many brand TLDs share one registry host (whois.nic.gmo). Deriving the
+        // URL by stripping the prefix must NOT point .datsun at the .gmo
+        // registry; it should fall through to the always-correct IANA page.
+        assert_eq!(
+            get_registry_url("datsun").as_deref(),
+            Some("https://www.iana.org/domains/root/db/datsun.html")
+        );
+        // But when the trailing label really is the TLD, the derivation is kept.
+        assert_eq!(get_registry_url("gmo").as_deref(), Some("https://nic.gmo"));
     }
 }

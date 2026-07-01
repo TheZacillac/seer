@@ -730,15 +730,21 @@ async fn send_rdap_request(
 }
 
 /// Streams, size-bounds, and parses an RDAP response body. `url` is only used
-/// for the timeout error message.
-async fn read_and_parse_rdap_body(response: reqwest::Response, url: &str) -> Result<RdapResponse> {
+/// for the timeout error message. `timeout` is the per-request deadline for the
+/// body-read phase, so a caller-configured timeout is honored end-to-end (not
+/// silently capped at the hardcoded default).
+async fn read_and_parse_rdap_body(
+    response: reqwest::Response,
+    url: &str,
+    timeout: Duration,
+) -> Result<RdapResponse> {
     // Stream body with incremental size check to prevent memory exhaustion.
     // Wrap the chunk loop in a timeout so a server that opens the connection
     // but trickles bytes forever is classified as a timeout (not a generic
     // RdapError) and retries can be driven appropriately.
     let mut body = Vec::new();
     let mut stream = response.bytes_stream();
-    let streamed = tokio::time::timeout(DEFAULT_TIMEOUT, async {
+    let streamed = tokio::time::timeout(timeout, async {
         while let Some(chunk) = stream.next().await {
             let chunk = chunk
                 .map_err(|e| SeerError::RdapError(format!("failed to read response: {}", e)))?;
@@ -760,7 +766,7 @@ async fn read_and_parse_rdap_body(response: reqwest::Response, url: &str) -> Res
         Err(_) => {
             return Err(SeerError::Timeout(format!(
                 "timed out reading RDAP response body from {} after {:?}",
-                url, DEFAULT_TIMEOUT
+                url, timeout
             )));
         }
     }
@@ -808,7 +814,7 @@ async fn query_rdap_attempt(
         ));
     }
 
-    read_and_parse_rdap_body(response, url)
+    read_and_parse_rdap_body(response, url, timeout)
         .await
         .map_err(|e| (e, None))
 }

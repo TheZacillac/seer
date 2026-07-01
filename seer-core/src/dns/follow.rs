@@ -254,8 +254,12 @@ impl DnsFollower {
             // a resolver applying 0x20 query-name randomization (returning the
             // same record with different casing) is not reported as a spurious
             // change; `added`/`removed` still carry the original casing.
-            let (changed, added, removed) = if i == 0 {
-                // First iteration - no previous to compare
+            let (changed, added, removed) = if i == 0 || error.is_some() {
+                // First iteration - no previous to compare. Also skip the diff
+                // on an errored iteration: a transient resolver failure yields
+                // an empty record set that would otherwise look like every
+                // record was removed (and every record re-added on recovery),
+                // inflating total_changes with phantom events.
                 (false, Vec::new(), Vec::new())
             } else {
                 diff_record_values(&current_values, &previous_values)
@@ -264,6 +268,9 @@ impl DnsFollower {
             if changed {
                 total_changes += 1;
             }
+
+            // Capture before `error` is moved into the iteration struct.
+            let error_is_none = error.is_none();
 
             let iteration = FollowIteration {
                 iteration: iteration_num,
@@ -285,11 +292,17 @@ impl DnsFollower {
             }
 
             iterations.push(iteration);
-            // Store case-folded keys for the next iteration's comparison.
-            previous_values = current_values
-                .iter()
-                .map(|v| v.to_ascii_lowercase())
-                .collect();
+            // Store case-folded keys for the next iteration's comparison. Skip
+            // on an errored iteration so the last known-good observation is
+            // preserved: the next successful iteration is then compared against
+            // real prior values rather than an empty set (which would fabricate
+            // a full re-addition).
+            if error_is_none {
+                previous_values = current_values
+                    .iter()
+                    .map(|v| v.to_ascii_lowercase())
+                    .collect();
+            }
 
             // Sleep before next iteration (unless this is the last one)
             if i < config.iterations - 1 {

@@ -871,7 +871,7 @@ impl SmartLookup {
             }
             return Ok(LookupResult::Whois {
                 data: whois_data,
-                rdap_error: Some(rdap_error_str),
+                rdap_error: Some(sanitize_error_for_public(&rdap_error_str)),
                 rdap_fallback: rdap_fallback_data,
             });
         }

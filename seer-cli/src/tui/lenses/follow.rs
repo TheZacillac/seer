@@ -77,15 +77,27 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, follow: &FollowState) {
         Row::new(["#", "TIME", "A RECORD", "Δ"]).style(Style::default().fg(theme.overlay0));
 
     let body = follow.log.iter().map(|it| {
-        let a_record = it
-            .records
-            .first()
-            .map(|r| r.format_short())
-            .unwrap_or_else(|| "—".into());
-        let delta = if it.changed {
-            dot::line(theme, "warn", "CHANGED")
+        // An errored iteration (NXDOMAIN/timeout/resolver failure) has empty
+        // records and changed=false; without inspecting it.error it would paint
+        // identically to a healthy no-A-record check. Surface the failure.
+        let (a_record, delta) = if !it.success() {
+            let msg = it.error.as_deref().unwrap_or("error");
+            (
+                msg.chars().take(40).collect::<String>(),
+                dot::line(theme, "fail", "ERROR"),
+            )
         } else {
-            dot::line(theme, "ok", "—")
+            let a = it
+                .records
+                .first()
+                .map(|r| r.format_short())
+                .unwrap_or_else(|| "—".into());
+            let d = if it.changed {
+                dot::line(theme, "warn", "CHANGED")
+            } else {
+                dot::line(theme, "ok", "—")
+            };
+            (a, d)
         };
         Row::new(vec![
             Line::from(it.iteration.to_string()),
@@ -179,6 +191,39 @@ mod tests {
         assert!(
             text.contains("1.2.3.4"),
             "rendered buffer should contain A record IP"
+        );
+    }
+
+    #[test]
+    fn renders_error_iteration_as_failure_not_healthy() {
+        // An errored iteration (empty records, changed=false) must NOT be
+        // painted like a healthy no-record check; it should surface the error.
+        let theme = Theme::frappe();
+        let mut follow = FollowState::default();
+        follow.push(FollowIteration {
+            iteration: 1,
+            total_iterations: 5,
+            timestamp: Utc::now(),
+            records: vec![],
+            changed: false,
+            added: vec![],
+            removed: vec![],
+            error: Some("NXDOMAIN".into()),
+        });
+
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| render(f, f.area(), &theme, &follow))
+            .unwrap();
+        let text = buf_text(&terminal);
+        assert!(
+            text.contains("ERROR"),
+            "errored iteration should render an ERROR marker"
+        );
+        assert!(
+            text.contains("NXDOMAIN"),
+            "errored iteration should surface the error message"
         );
     }
 
