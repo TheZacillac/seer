@@ -284,6 +284,10 @@ enum Commands {
     Subdomains {
         /// Domain to enumerate subdomains for
         domain: String,
+        /// Resolve each discovered name and classify live/dead + dangling-CNAME
+        /// takeover risk
+        #[arg(long)]
+        resolve: bool,
     },
     /// Compare two domains side-by-side (registration, DNS, SSL)
     Diff {
@@ -306,6 +310,34 @@ enum Commands {
         /// Clear all history
         #[arg(long)]
         clear: bool,
+    },
+    /// Detect drift versus the previous stored lookup for a domain
+    ///
+    /// Compares a fresh lookup against the most recent history snapshot and
+    /// reports changed fields (nameservers, registrar, expiry, DNSSEC,
+    /// registrant). Exits non-zero when material drift is found.
+    Drift {
+        /// Domain to check for drift
+        domain: String,
+        /// Record the fresh lookup to history after comparing (establishes or
+        /// updates the baseline)
+        #[arg(long)]
+        record: bool,
+    },
+    /// Look up the CAA (Certification Authority Authorization) policy
+    Caa {
+        /// Domain to look up
+        domain: String,
+    },
+    /// Inspect email/DNS security posture (SPF, DMARC, MTA-STS, BIMI, DANE)
+    Posture {
+        /// Domain to inspect
+        domain: String,
+    },
+    /// Find registered typosquat / look-alike domains for a domain
+    Confusables {
+        /// Domain to generate and score look-alikes for
+        domain: String,
     },
     /// Launch the full-screen interactive TUI
     Tui {
@@ -606,14 +638,39 @@ async fn execute_command(
             let progress_mode = resolve_progress_mode(progress, stderr_is_tty, format_str);
             const MAX_BULK_DOMAINS_CLI: usize = 1000;
 
+            // `-` reads a newline/CSV-delimited domain list from stdin so bulk
+            // composes with shell pipelines (`grep … | seer bulk status -`).
+            let from_stdin = file == "-";
             // Expand `~` / `~/...` once at the boundary so both the bulk-input
             // read and the auto-derived output path see a home-resolved path.
-            let file = utils::expand_tilde(&file);
+            // For stdin, use a synthetic "bulk" stem for any derived CSV path.
+            let file = if from_stdin {
+                "bulk".to_string()
+            } else {
+                utils::expand_tilde(&file)
+            };
 
             // `read_bulk_input` rejects FIFOs, sockets, devices, directories,
             // and oversized files via a pre-read metadata check, so malicious
             // `mkfifo`'d paths can't hang the process.
-            let content = utils::read_bulk_input(&file).map_err(|e| anyhow::anyhow!(e))?;
+            let content = if from_stdin {
+                use std::io::Read;
+                let mut buf = String::new();
+                std::io::stdin()
+                    .read_to_string(&mut buf)
+                    .map_err(|e| anyhow::anyhow!("reading domains from stdin: {e}"))?;
+                buf
+            } else {
+                utils::read_bulk_input(&file).map_err(|e| anyhow::anyhow!(e))?
+            };
+
+            // When a structured global format is requested, bulk streams results
+            // to stdout instead of writing a CSV — pipeline-friendly and free of
+            // the spreadsheet-safety escaping CSV requires.
+            let structured_output = matches!(
+                output_format,
+                seer_core::output::OutputFormat::Json | seer_core::output::OutputFormat::Yaml
+            );
 
             let domains = seer_core::bulk::parse_domains_from_file(&content);
 
@@ -649,7 +706,8 @@ async fn execute_command(
                 .with_concurrency(config.bulk.concurrency)
                 .with_rate_limit(config.bulk_rate_limit());
 
-            println!(
+            // Status goes to stderr so it never pollutes a structured stdout stream.
+            eprintln!(
                 "Processing {} domains with {} operation...",
                 domains.len().to_string().ctp_green(),
                 operation.ctp_yellow()
@@ -771,25 +829,42 @@ async fn execute_command(
                 display::clear_bulk_progress_bar();
             }
 
-            // Convert results to CSV. Write atomically so a crash mid-write
-            // cannot leave a truncated CSV that downstream pipelines treat
-            // as authoritative.
-            let csv_content = utils::bulk_results_to_csv(&results, &operation);
-            utils::atomic_write(&output_path, &csv_content)?;
-
             let success_count = results.iter().filter(|r| r.success).count();
             let fail_count = results.len() - success_count;
 
-            println!("Results written to: {}", output_path.ctp_green());
-            println!(
-                "  {} successful, {} failed",
-                success_count.to_string().ctp_green(),
-                if fail_count > 0 {
-                    fail_count.to_string().ctp_red()
-                } else {
-                    fail_count.to_string().ctp_green()
-                }
-            );
+            if structured_output {
+                // Serialize the full result set to stdout (JSON array / YAML).
+                let rendered = match output_format {
+                    seer_core::output::OutputFormat::Yaml => {
+                        seer_core::output::YamlFormatter::new().to_yaml_value(&results)
+                    }
+                    _ => serde_json::to_string_pretty(&results)
+                        .unwrap_or_else(|e| format!("{{\"error\":\"{}\"}}", e)),
+                };
+                println!("{}", rendered);
+                eprintln!(
+                    "  {} successful, {} failed",
+                    success_count.to_string().ctp_green(),
+                    fail_count
+                );
+            } else {
+                // Convert results to CSV. Write atomically so a crash mid-write
+                // cannot leave a truncated CSV that downstream pipelines treat
+                // as authoritative.
+                let csv_content = utils::bulk_results_to_csv(&results, &operation);
+                utils::atomic_write(&output_path, &csv_content)?;
+
+                println!("Results written to: {}", output_path.ctp_green());
+                println!(
+                    "  {} successful, {} failed",
+                    success_count.to_string().ctp_green(),
+                    if fail_count > 0 {
+                        fail_count.to_string().ctp_red()
+                    } else {
+                        fail_count.to_string().ctp_green()
+                    }
+                );
+            }
         }
         Commands::Status { domain } => {
             let client = seer_core::StatusClient::new().with_timeout(config.http_timeout());
@@ -1095,7 +1170,7 @@ async fn execute_command(
                 }
             }
         }
-        Commands::Subdomains { domain } => {
+        Commands::Subdomains { domain, resolve } => {
             let spinner = Arc::new(display::Spinner::new(&format!(
                 "Enumerating subdomains for {}",
                 domain
@@ -1103,10 +1178,142 @@ async fn execute_command(
             let enumerator = seer_core::SubdomainEnumerator::new();
             match enumerator.enumerate(&domain).await {
                 Ok(result) => {
-                    spinner.finish();
-                    if quiet && handle_quiet_output(&result, &fields) {
+                    if resolve {
+                        spinner.set_message("Resolving and classifying discovered names");
+                        let resolver =
+                            seer_core::DnsResolver::new().with_timeout(config.dns_timeout());
+                        let classification = seer_core::classify_subdomains(
+                            &resolver,
+                            &result.domain,
+                            result.subdomains.clone(),
+                            config.bulk.concurrency,
+                        )
+                        .await;
+                        spinner.finish();
+                        if quiet && handle_quiet_output(&classification, &fields) {
+                        } else {
+                            println!(
+                                "{}",
+                                formatter.format_subdomain_classification(&classification)
+                            );
+                        }
                     } else {
-                        println!("{}", formatter.format_subdomains(&result));
+                        spinner.finish();
+                        if quiet && handle_quiet_output(&result, &fields) {
+                        } else {
+                            println!("{}", formatter.format_subdomains(&result));
+                        }
+                    }
+                }
+                Err(e) => {
+                    spinner.finish();
+                    emit_error(output_format, &e);
+                }
+            }
+        }
+        Commands::Drift { domain, record } => {
+            let spinner = Arc::new(display::Spinner::new(&format!("Looking up {}", domain)));
+            let lookup = seer_core::SmartLookup::from_config(config);
+            match lookup.lookup(&domain).await {
+                Ok(result) => {
+                    spinner.finish();
+                    // Compare the fresh lookup against the most recent stored
+                    // snapshot before (optionally) recording the new one.
+                    let domain_key = domain.clone();
+                    let previous = tokio::task::spawn_blocking(move || {
+                        seer_core::LookupHistory::load()
+                            .get(&domain_key)
+                            .last()
+                            .map(|e| e.result.clone())
+                    })
+                    .await
+                    .ok()
+                    .flatten();
+
+                    let report = match &previous {
+                        Some(prev) => seer_core::DriftReport::from_lookups(&domain, prev, &result),
+                        None => seer_core::DriftReport {
+                            domain: domain.clone(),
+                            changes: Vec::new(),
+                        },
+                    };
+
+                    if record {
+                        let d = domain.clone();
+                        let r = result.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let mut history = seer_core::LookupHistory::load();
+                            history.record(&d, r);
+                            let _ = history.save();
+                        })
+                        .await
+                        .ok();
+                    }
+
+                    if previous.is_none() {
+                        eprintln!(
+                            "{} no previous snapshot for {} — {}",
+                            "note:".ctp_yellow(),
+                            domain,
+                            if record {
+                                "recorded a baseline"
+                            } else {
+                                "run with --record to establish a baseline"
+                            }
+                        );
+                    }
+
+                    if quiet && handle_quiet_output(&report, &fields) {
+                    } else {
+                        println!("{}", formatter.format_drift(&report));
+                    }
+                    if report.has_drift() {
+                        std::process::exit(1);
+                    }
+                }
+                Err(e) => {
+                    spinner.finish();
+                    emit_error(output_format, &e);
+                }
+            }
+        }
+        Commands::Caa { domain } => {
+            let resolver = seer_core::DnsResolver::new().with_timeout(config.dns_timeout());
+            match seer_core::normalize_domain(&domain) {
+                Ok(normalized) => {
+                    let policy = seer_core::caa::lookup_caa(&resolver, &normalized).await;
+                    if quiet && handle_quiet_output(&policy, &fields) {
+                    } else {
+                        println!("{}", formatter.format_caa(&policy));
+                    }
+                }
+                Err(e) => emit_error(output_format, &e),
+            }
+        }
+        Commands::Posture { domain } => {
+            let resolver = seer_core::DnsResolver::new().with_timeout(config.dns_timeout());
+            match seer_core::lookup_email_posture(&resolver, &domain).await {
+                Ok(posture) => {
+                    if quiet && handle_quiet_output(&posture, &fields) {
+                    } else {
+                        println!("{}", formatter.format_posture(&posture));
+                    }
+                }
+                Err(e) => emit_error(output_format, &e),
+            }
+        }
+        Commands::Confusables { domain } => {
+            let spinner = Arc::new(display::Spinner::new(&format!(
+                "Scanning look-alikes for {}",
+                domain
+            )));
+            let lookup = seer_core::SmartLookup::from_config(config);
+            match seer_core::find_confusables(&lookup, &domain, config.bulk.concurrency).await {
+                Ok(report) => {
+                    spinner.finish();
+                    if quiet && handle_quiet_output(&report, &fields) {
+                    } else {
+                        println!("{}", formatter.format_confusables(&report));
                     }
                 }
                 Err(e) => {

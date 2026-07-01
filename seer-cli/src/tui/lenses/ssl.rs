@@ -65,6 +65,7 @@ mod tests {
             hostname_verified: true,
             days_until_expiry: 225,
             caa: None,
+            warnings: vec![],
         }
     }
 
