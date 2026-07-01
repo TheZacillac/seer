@@ -384,7 +384,14 @@ async fn query_server_internal_with(
     let mut stream = timeout(timeout_duration, TcpStream::connect(addrs.as_slice()))
         .await
         .map_err(|_| SeerError::Timeout(format!("connection to {} timed out", server)))?
-        .map_err(|e| SeerError::WhoisError(format!("failed to connect to {}: {}", server, e)))?;
+        // Use the unconditionally-retryable variant: the substring-gated
+        // WhoisError classifier misses transient connect failures whose OS
+        // message lacks "connection"/"refused"/"reset"/"timeout" (e.g.
+        // "Network is unreachable", "No route to host"), so those would not be
+        // retried despite the configured RetryPolicy.
+        .map_err(|e| {
+            SeerError::WhoisConnectionFailed(format!("failed to connect to {}: {}", server, e))
+        })?;
 
     // Send query with CRLF
     let query_bytes = format!("{}\r\n", query);

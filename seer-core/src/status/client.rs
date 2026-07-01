@@ -484,11 +484,21 @@ async fn validate_url_target(url: &Url) -> Result<Vec<SocketAddr>> {
 
     for socket_addr in &socket_addrs {
         if let Some(reason) = describe_reserved_ip(&socket_addr.ip()) {
+            // Do NOT echo the resolved IP back to the caller: for a redirect
+            // target chosen by an attacker-controlled server, interpolating the
+            // resolved address turns this SSRF guard into an internal-DNS
+            // oracle (leaking whether an internal name exists and its exact
+            // address). Log it at debug for operators; return a generic message.
+            // Mirrors the hardening in net.rs::resolve_public_host (issue #49).
+            debug!(
+                host = %host,
+                resolved_ip = %socket_addr.ip(),
+                reason = %reason,
+                "refusing redirect target: resolves to a reserved (non-public) address"
+            );
             return Err(SeerError::HttpError(format!(
-                "cannot connect to {}: {} — {}",
-                host,
-                socket_addr.ip(),
-                reason
+                "{} is not permitted (resolves to a non-public address)",
+                host
             )));
         }
     }

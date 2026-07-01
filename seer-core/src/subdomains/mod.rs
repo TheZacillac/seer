@@ -153,8 +153,12 @@ fn build_result(domain: &str, raw_names: Vec<String>, source: &str) -> Subdomain
             let s = s.strip_prefix("*.").unwrap_or(s);
             !s.is_empty()
                 && s.len() <= 253
+                // Underscores are valid in DNS names (RFC 8552 service labels,
+                // e.g. `_acme-challenge`, `_dmarc`) and appear in CT-log SANs;
+                // matches the charset normalize_domain accepts on input, so they
+                // are not silently dropped here.
                 && s.chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
                 && !s.contains("..")
                 && !s.starts_with('.')
                 && !s.starts_with('-')
@@ -212,6 +216,24 @@ mod tests {
         assert_eq!(r.subdomains, vec!["api.example.com", "ok.example.com"]);
         assert_eq!(r.count, 2);
         assert_eq!(r.source, "test");
+    }
+
+    #[test]
+    fn build_result_keeps_underscore_service_labels() {
+        // RFC 8552 service labels (routinely present in CT-log SANs) must not be
+        // silently dropped by the hostname-charset filter.
+        let raw = vec![
+            "_acme-challenge.example.com".to_string(),
+            "_dmarc.example.com".to_string(),
+            "www.example.com".to_string(),
+        ];
+        let r = build_result("example.com", raw, "test");
+        assert!(r
+            .subdomains
+            .contains(&"_acme-challenge.example.com".to_string()));
+        assert!(r.subdomains.contains(&"_dmarc.example.com".to_string()));
+        assert!(r.subdomains.contains(&"www.example.com".to_string()));
+        assert_eq!(r.count, 3);
     }
 
     /// The headline regression: when the primary source rate-limits (429, the

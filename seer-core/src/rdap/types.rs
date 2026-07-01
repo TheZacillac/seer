@@ -607,7 +607,7 @@ impl RdapResponse {
 }
 
 /// Contact information extracted from RDAP entity.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ContactInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
@@ -625,32 +625,26 @@ pub struct ContactInfo {
 
 impl ContactInfo {
     /// Checks if the contact has any non-redacted information.
+    ///
+    /// Returns true only when at least one field carries genuine (present,
+    /// non-empty, non-redacted) data. A per-field positive check is required:
+    /// negating a redaction predicate is unsound because an absent (`None`)
+    /// field is trivially "not redacted", which would let a contact whose only
+    /// populated field is redacted still report as having info.
     pub fn has_info(&self) -> bool {
-        let has_data = self.name.is_some()
-            || self.organization.is_some()
-            || self.email.is_some()
-            || self.phone.is_some()
-            || self.address.is_some()
-            || self.country.is_some();
-
-        if !has_data {
-            return false;
-        }
-
-        // Filter out redacted values
-        let is_redacted = |s: &Option<String>| {
+        let is_real = |s: &Option<String>| {
             s.as_ref().is_some_and(|v| {
                 let lower = v.to_lowercase();
-                lower.contains("redacted") || lower.contains("data protected") || v.is_empty()
+                !v.is_empty() && !lower.contains("redacted") && !lower.contains("data protected")
             })
         };
 
-        !is_redacted(&self.name)
-            || !is_redacted(&self.organization)
-            || !is_redacted(&self.email)
-            || !is_redacted(&self.phone)
-            || !is_redacted(&self.address)
-            || !is_redacted(&self.country)
+        is_real(&self.name)
+            || is_real(&self.organization)
+            || is_real(&self.email)
+            || is_real(&self.phone)
+            || is_real(&self.address)
+            || is_real(&self.country)
     }
 }
 
@@ -658,6 +652,42 @@ impl ContactInfo {
 mod tests {
     use super::*;
     use serde_json::Value;
+
+    #[test]
+    fn has_info_suppresses_redacted_only_contacts() {
+        // A contact whose only populated field is redacted must NOT report as
+        // having info — otherwise the formatter renders "REDACTED FOR PRIVACY".
+        let redacted = ContactInfo {
+            organization: Some("REDACTED FOR PRIVACY".to_string()),
+            ..Default::default()
+        };
+        assert!(!redacted.has_info());
+
+        // "Data Protected" is also treated as redacted.
+        let protected = ContactInfo {
+            name: Some("Data Protected".to_string()),
+            ..Default::default()
+        };
+        assert!(!protected.has_info());
+
+        // Empty-string field is not "info".
+        let empty = ContactInfo {
+            email: Some(String::new()),
+            ..Default::default()
+        };
+        assert!(!empty.has_info());
+
+        // Fully absent -> no info.
+        assert!(!ContactInfo::default().has_info());
+
+        // A genuine value -> has info, even if other fields are None/redacted.
+        let real = ContactInfo {
+            organization: Some("REDACTED FOR PRIVACY".to_string()),
+            name: Some("Acme Corp".to_string()),
+            ..Default::default()
+        };
+        assert!(real.has_info());
+    }
 
     #[test]
     fn validate_size_accepts_normal_response() {

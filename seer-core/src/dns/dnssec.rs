@@ -310,30 +310,43 @@ impl DnssecChecker {
                     if let Some(candidates) = dnskey_map.get(&(key_tag, algorithm)) {
                         matched_key = true;
 
-                        // Try each candidate DNSKEY until one verifies
-                        if let Some(hickory_dt) = Self::to_hickory_digest_type(digest_type) {
-                            for candidate in candidates {
-                                if let Ok(computed) =
-                                    candidate.to_digest(&domain_name, hickory_dt)
-                                {
-                                    let computed_hex: String = computed
-                                        .as_ref()
-                                        .iter()
-                                        .map(|b| format!("{:02X}", b))
-                                        .collect();
-                                    if computed_hex.eq_ignore_ascii_case(digest) {
-                                        digest_verified = true;
-                                        break;
+                        // Try each candidate DNSKEY until one verifies. Only a
+                        // digest type our crypto backend can compute yields a
+                        // meaningful verified/mismatch verdict; an unsupported
+                        // type (e.g. GOST) is "not evaluated", NOT a mismatch —
+                        // flagging it as a mismatch would mark an otherwise-valid
+                        // signed zone as misconfigured.
+                        match Self::to_hickory_digest_type(digest_type) {
+                            Some(hickory_dt) => {
+                                for candidate in candidates {
+                                    if let Ok(computed) =
+                                        candidate.to_digest(&domain_name, hickory_dt)
+                                    {
+                                        let computed_hex: String = computed
+                                            .as_ref()
+                                            .iter()
+                                            .map(|b| format!("{:02X}", b))
+                                            .collect();
+                                        if computed_hex.eq_ignore_ascii_case(digest) {
+                                            digest_verified = true;
+                                            break;
+                                        }
                                     }
                                 }
-                            }
-                        }
 
-                        if !digest_verified {
-                            issues.push(format!(
-                                "DS record (key_tag={}) digest mismatch \u{2014} registry and DNS keys do not match",
-                                key_tag
-                            ));
+                                if !digest_verified {
+                                    issues.push(format!(
+                                        "DS record (key_tag={}) digest mismatch \u{2014} registry and DNS keys do not match",
+                                        key_tag
+                                    ));
+                                }
+                            }
+                            None => {
+                                issues.push(format!(
+                                    "DS record (key_tag={}) uses unsupported digest type {} \u{2014} cannot verify",
+                                    key_tag, digest_type
+                                ));
+                            }
                         }
                     } else if has_dnskey {
                         issues.push(format!(
@@ -405,12 +418,19 @@ impl DnssecChecker {
             }
         }
 
-        // Derive chain_valid
+        // Derive chain_valid. A DS whose digest type we cannot compute is
+        // excluded from the "all must verify" check (we can't judge it), but we
+        // still require at least one computable DS to have actually verified —
+        // otherwise a zone we can't evaluate at all would be reported as valid.
         let chain_valid = has_ds
             && has_dnskey
             && !ds_info.is_empty()
             && ds_info
                 .iter()
+                .any(|ds| ds.matched_key && ds.digest_verified)
+            && ds_info
+                .iter()
+                .filter(|ds| Self::to_hickory_digest_type(ds.digest_type).is_some())
                 .all(|ds| ds.matched_key && ds.digest_verified);
 
         // Derive status from chain validity (not from issues list).

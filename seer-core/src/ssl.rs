@@ -211,12 +211,14 @@ impl SslChecker {
         // match the requested domain? This is independent of `is_valid` and of
         // chain trust (which is not verified here — see the field docs). Lets
         // consumers tell a date-valid-but-wrong-host cert apart from a real
-        // match. The CN fallback is read from the leaf subject string since the
-        // SANs are already extracted.
+        // match. Per RFC 6125 §6.4.4 the CN is consulted ONLY when the cert
+        // presents no identifier SANs at all; if any dNSName/IPAddress SAN is
+        // present the CN must be ignored, otherwise a cert whose SANs cover
+        // other hosts but whose CN happens to match would falsely verify.
         let hostname_verified = san_names
             .iter()
             .any(|san| hostname_matches_pattern(&domain, san))
-            || subject_cn_matches_host(&x509, &domain);
+            || (san_names.is_empty() && subject_cn_matches_host(&x509, &domain));
 
         // Annotate the CAA policy with the issuer comparison before
         // attaching it to the report.
@@ -256,7 +258,8 @@ fn hostname_matches_pattern(host: &str, pattern: &str) -> bool {
 
 /// Legacy CN fallback for hostname verification: checks the leaf certificate's
 /// subject Common Name(s) against `host`. SAN dNSNames are authoritative per
-/// RFC 6125; CN is only consulted when no SAN matched.
+/// RFC 6125; CN is only consulted when the certificate presents no identifier
+/// SANs at all (the caller gates this on `san_names.is_empty()`).
 fn subject_cn_matches_host(cert: &X509Certificate, host: &str) -> bool {
     for cn in cert.subject().iter_common_name() {
         if let Ok(s) = cn.as_str() {
