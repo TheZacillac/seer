@@ -54,6 +54,14 @@ pub trait OutputFormatter {
     fn format_ssl(&self, report: &crate::ssl::SslReport) -> String;
     fn format_watch(&self, report: &crate::watchlist::WatchReport) -> String;
     fn format_domain_info(&self, info: &crate::domain_info::DomainInfo) -> String;
+    fn format_drift(&self, report: &crate::drift::DriftReport) -> String;
+    fn format_posture(&self, posture: &crate::posture::EmailPosture) -> String;
+    fn format_caa(&self, policy: &crate::caa::CaaPolicy) -> String;
+    fn format_confusables(&self, report: &crate::confusables::ConfusableReport) -> String;
+    fn format_subdomain_classification(
+        &self,
+        result: &crate::subdomains::SubdomainClassification,
+    ) -> String;
 }
 
 /// YAML output formatter that converts data structures to YAML format.
@@ -131,6 +139,24 @@ impl OutputFormatter for YamlFormatter {
     }
     fn format_domain_info(&self, info: &crate::domain_info::DomainInfo) -> String {
         self.to_yaml_value(info)
+    }
+    fn format_drift(&self, report: &crate::drift::DriftReport) -> String {
+        self.to_yaml_value(report)
+    }
+    fn format_posture(&self, posture: &crate::posture::EmailPosture) -> String {
+        self.to_yaml_value(posture)
+    }
+    fn format_caa(&self, policy: &crate::caa::CaaPolicy) -> String {
+        self.to_yaml_value(policy)
+    }
+    fn format_confusables(&self, report: &crate::confusables::ConfusableReport) -> String {
+        self.to_yaml_value(report)
+    }
+    fn format_subdomain_classification(
+        &self,
+        result: &crate::subdomains::SubdomainClassification,
+    ) -> String {
+        self.to_yaml_value(result)
     }
 }
 

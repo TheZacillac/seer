@@ -207,6 +207,16 @@ impl HumanFormatter {
             self.label("Chain Valid"),
             chain_colored
         ));
+        let tier = match report.authentication_tier {
+            crate::dns::AuthenticationTier::Unsigned => "unsigned (no DNSSEC records)",
+            crate::dns::AuthenticationTier::DigestOnly => "digest-only (DS↔DNSKEY consistency)",
+            crate::dns::AuthenticationTier::RrsigChecked => "rrsig-checked (signature windows)",
+        };
+        output.push(format!(
+            "  {}: {}",
+            self.label("Verification depth"),
+            self.value(tier)
+        ));
         output.push(self.warning(
             "  Note: reflects DS/DNSKEY digest consistency only — RRSIG signatures, validity \
              periods, and the chain to the root are NOT cryptographically verified.",

@@ -365,7 +365,7 @@ fn build_notes(
             "SPF does not end in -all/~all — it permits unlisted senders (spoofable).".to_string(),
         ),
         PostureVerdict::Moderate => {
-            notes.push("SPF uses ~all (softfail); -all provides stricter enforcement.".to_string())
+            notes.push("SPF uses ~all (softfail); -all provides stricter enforcement.".to_string());
         }
         _ => {}
     }

@@ -21,6 +21,7 @@ mod domain_info;
 mod lookup;
 mod propagation;
 mod rdap;
+mod security;
 mod status;
 mod whois;
 
@@ -293,6 +294,24 @@ impl OutputFormatter for HumanFormatter {
     }
     fn format_domain_info(&self, info: &crate::domain_info::DomainInfo) -> String {
         self.format_domain_info(info)
+    }
+    fn format_drift(&self, report: &crate::drift::DriftReport) -> String {
+        self.format_drift(report)
+    }
+    fn format_posture(&self, posture: &crate::posture::EmailPosture) -> String {
+        self.format_posture(posture)
+    }
+    fn format_caa(&self, policy: &crate::caa::CaaPolicy) -> String {
+        self.format_caa(policy)
+    }
+    fn format_confusables(&self, report: &crate::confusables::ConfusableReport) -> String {
+        self.format_confusables(report)
+    }
+    fn format_subdomain_classification(
+        &self,
+        result: &crate::subdomains::SubdomainClassification,
+    ) -> String {
+        self.format_subdomain_classification(result)
     }
 }
 
