@@ -23,7 +23,7 @@ use crate::caa::{self, CaaPolicy};
 use crate::dns::{DnsResolver, RecordData, RecordType};
 use crate::error::{Result, SeerError};
 use crate::lookup::SmartLookup;
-use crate::validation::{describe_reserved_ip, normalize_domain};
+use crate::validation::normalize_domain;
 
 /// Default timeout for HTTP and TLS operations (10 seconds).
 /// Balances responsiveness with allowing slow servers to respond.
@@ -431,6 +431,15 @@ fn extract_title(html: &str) -> Option<String> {
 ///
 /// The caller should pin these addresses on the HTTP client to prevent DNS
 /// rebinding between validation and the actual connection.
+///
+/// Resolution goes through [`crate::net::resolve_public_host`] — the shared
+/// SSRF guard used by every other outbound leg — which bounds the OS-resolver
+/// lookup (`getaddrinfo` has no deadline, and redirect targets are
+/// attacker-influenceable, so a black-holed hostname could otherwise pin this
+/// task indefinitely) and falls back to hickory when the system resolver is
+/// broken. The reserved-range policy is unchanged (the previous local check
+/// delegated to the same `net::is_reserved_ip`), and the guard's error already
+/// omits the resolved IP (internal-DNS-oracle hardening, issue #49).
 async fn validate_url_target(url: &Url) -> Result<Vec<SocketAddr>> {
     let scheme = url.scheme();
     if scheme != "https" && scheme != "http" {
@@ -446,9 +455,14 @@ async fn validate_url_target(url: &Url) -> Result<Vec<SocketAddr>> {
         ));
     }
 
-    let host = url
-        .host_str()
-        .ok_or_else(|| SeerError::HttpError("missing URL host".to_string()))?;
+    // Use `host()` (not `host_str()`) so an IPv6 literal comes back
+    // unbracketed and hits the guard's IP-literal short-circuit.
+    let host = match url.host() {
+        Some(url::Host::Domain(d)) => d.to_string(),
+        Some(url::Host::Ipv4(ip)) => ip.to_string(),
+        Some(url::Host::Ipv6(ip)) => ip.to_string(),
+        None => return Err(SeerError::HttpError("missing URL host".to_string())),
+    };
     let port = url.port_or_known_default().unwrap_or(443);
 
     // Only allow standard HTTP/HTTPS ports to prevent port scanning via redirects
@@ -459,51 +473,9 @@ async fn validate_url_target(url: &Url) -> Result<Vec<SocketAddr>> {
         )));
     }
 
-    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        if let Some(reason) = describe_reserved_ip(&ip) {
-            return Err(SeerError::HttpError(format!(
-                "cannot connect to {}: {} — {}",
-                host, ip, reason
-            )));
-        }
-        return Ok(vec![SocketAddr::new(ip, port)]);
-    }
-
-    let addr = format!("{}:{}", host, port);
-    let socket_addrs: Vec<_> = tokio::net::lookup_host(&addr)
+    crate::net::resolve_public_host(&host, port)
         .await
-        .map_err(|e| SeerError::HttpError(format!("DNS lookup failed: {}", e)))?
-        .collect();
-
-    if socket_addrs.is_empty() {
-        return Err(SeerError::HttpError(format!(
-            "DNS lookup returned no addresses for {}",
-            host
-        )));
-    }
-
-    for socket_addr in &socket_addrs {
-        if let Some(reason) = describe_reserved_ip(&socket_addr.ip()) {
-            // Do NOT echo the resolved IP back to the caller: for a redirect
-            // target chosen by an attacker-controlled server, interpolating the
-            // resolved address turns this SSRF guard into an internal-DNS
-            // oracle (leaking whether an internal name exists and its exact
-            // address). Log it at debug for operators; return a generic message.
-            // Mirrors the hardening in net.rs::resolve_public_host (issue #49).
-            debug!(
-                host = %host,
-                resolved_ip = %socket_addr.ip(),
-                reason = %reason,
-                "refusing redirect target: resolves to a reserved (non-public) address"
-            );
-            return Err(SeerError::HttpError(format!(
-                "{} is not permitted (resolves to a non-public address)",
-                host
-            )));
-        }
-    }
-
-    Ok(socket_addrs)
+        .map_err(|e| SeerError::HttpError(e.to_string()))
 }
 
 /// Parses certificate information from DER-encoded certificate using x509-parser.
@@ -718,5 +690,68 @@ mod tests {
     fn hostname_matches_pattern_wildcard_requires_dot() {
         // A bare host with no dot cannot match a wildcard pattern
         assert!(!hostname_matches_pattern("localhost", "*.example.com"));
+    }
+
+    // --- validate_url_target tests (hermetic: IP literals, no DNS) -------
+
+    #[tokio::test]
+    async fn validate_url_target_rejects_unsupported_scheme() {
+        let url = Url::parse("ftp://example.com/").unwrap();
+        let err = validate_url_target(&url).await.unwrap_err();
+        assert!(
+            matches!(err, SeerError::HttpError(ref s) if s.contains("unsupported URL scheme")),
+            "got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_url_target_rejects_credentials() {
+        let url = Url::parse("https://user:pass@example.com/").unwrap();
+        let err = validate_url_target(&url).await.unwrap_err();
+        assert!(
+            matches!(err, SeerError::HttpError(ref s) if s.contains("credentials")),
+            "got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_url_target_rejects_non_standard_port() {
+        let url = Url::parse("https://8.8.8.8:8443/").unwrap();
+        let err = validate_url_target(&url).await.unwrap_err();
+        assert!(
+            matches!(err, SeerError::HttpError(ref s) if s.contains("non-standard port")),
+            "got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_url_target_rejects_loopback_literal() {
+        let url = Url::parse("https://127.0.0.1/").unwrap();
+        let err = validate_url_target(&url).await.unwrap_err();
+        assert!(
+            matches!(err, SeerError::HttpError(ref s) if s.contains("reserved")),
+            "got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_url_target_rejects_bracketed_ipv6_loopback_literal() {
+        // `Url::host_str()` keeps the brackets on an IPv6 literal; the
+        // `Url::host()` extraction must unbracket it so the shared guard's
+        // IP-literal short-circuit catches it (no DNS involved).
+        let url = Url::parse("https://[::1]/").unwrap();
+        let err = validate_url_target(&url).await.unwrap_err();
+        assert!(
+            matches!(err, SeerError::HttpError(ref s) if s.contains("reserved")),
+            "got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_url_target_allows_public_ip_literal() {
+        let url = Url::parse("https://8.8.8.8/").unwrap();
+        let addrs = validate_url_target(&url).await.unwrap();
+        assert_eq!(addrs.len(), 1);
+        assert_eq!(addrs[0].port(), 443);
     }
 }

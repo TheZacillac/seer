@@ -1,6 +1,14 @@
 use thiserror::Error;
 
+/// Central error type for all seer-core operations.
+///
+/// Marked `#[non_exhaustive]` so adding a variant is not a semver break for
+/// downstream consumers (matches need a wildcard arm). Third-party error
+/// types (reqwest, hickory) are converted to owned data at the `From`
+/// boundary instead of being embedded, so a major bump of those dependencies
+/// no longer changes this public API.
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum SeerError {
     #[error("WHOIS lookup failed: {0}")]
     WhoisError(String),
@@ -20,8 +28,10 @@ pub enum SeerError {
     #[error("DNS resolution failed: {0}")]
     DnsError(String),
 
+    /// Low-level resolver transport failure, captured as text at the
+    /// `From<hickory_resolver::net::NetError>` boundary.
     #[error("DNS resolver error: {0}")]
-    DnsResolverError(#[from] hickory_resolver::net::NetError),
+    DnsResolverError(String),
 
     #[error("Invalid domain name: {0}")]
     InvalidDomain(String),
@@ -38,8 +48,17 @@ pub enum SeerError {
     #[error("HTTP request failed: {0}")]
     HttpError(String),
 
-    #[error("Reqwest error: {0}")]
-    ReqwestError(#[from] reqwest::Error),
+    /// Transport-level HTTP failure, captured as owned data at the
+    /// `From<reqwest::Error>` boundary.
+    #[error("Reqwest error: {message}")]
+    ReqwestError {
+        /// Upstream error text (reqwest's `Display`), kept for logging.
+        message: String,
+        /// Whether the failure is transient (connect / timeout / 429 / 5xx),
+        /// classified once while the typed error is still available. Read by
+        /// the retry classifier ([`crate::retry::NetworkRetryClassifier`]).
+        transient: bool,
+    },
 
     #[error("JSON parsing failed: {0}")]
     JsonError(#[from] serde_json::Error),
@@ -85,6 +104,62 @@ pub enum SeerError {
     },
 }
 
+/// Classifies a reqwest error as transient (worth retrying): connect
+/// failures, timeouts, HTTP 429 and 5xx. Other status codes and request/body
+/// construction errors are permanent; unknown kinds default to transient.
+///
+/// Runs at the `From<reqwest::Error>` boundary — the only place the typed
+/// error is still available — so the enum can store an owned flag instead of
+/// the reqwest type.
+fn is_transient_reqwest_error(error: &reqwest::Error) -> bool {
+    // Connection errors are transient
+    if error.is_connect() {
+        return true;
+    }
+
+    // Timeout errors are transient
+    if error.is_timeout() {
+        return true;
+    }
+
+    // Check HTTP status codes
+    if let Some(status) = error.status() {
+        // 429 Too Many Requests - rate limited, retry with backoff
+        if status.as_u16() == 429 {
+            return true;
+        }
+        // 5xx Server errors are transient
+        if status.is_server_error() {
+            return true;
+        }
+        // 4xx Client errors (except 429) are not retryable
+        return false;
+    }
+
+    // Request/body errors are generally not retryable
+    if error.is_request() || error.is_body() {
+        return false;
+    }
+
+    // Default: assume transient for unknown errors
+    true
+}
+
+impl From<reqwest::Error> for SeerError {
+    fn from(e: reqwest::Error) -> Self {
+        SeerError::ReqwestError {
+            message: e.to_string(),
+            transient: is_transient_reqwest_error(&e),
+        }
+    }
+}
+
+impl From<hickory_resolver::net::NetError> for SeerError {
+    fn from(e: hickory_resolver::net::NetError) -> Self {
+        SeerError::DnsResolverError(e.to_string())
+    }
+}
+
 impl SeerError {
     /// Returns a sanitized error message safe for external exposure
     /// (API responses, MCP tool results, Python exceptions).
@@ -115,7 +190,7 @@ impl SeerError {
             SeerError::InvalidIpAddress(ip) => format!("Invalid IP address: {}", ip),
             SeerError::InvalidRecordType(rt) => format!("Invalid record type: {}", rt),
             SeerError::HttpError(_) => "HTTP request failed".to_string(),
-            SeerError::ReqwestError(_) => "HTTP request failed".to_string(),
+            SeerError::ReqwestError { .. } => "HTTP request failed".to_string(),
             SeerError::JsonError(_) => "Response parsing failed".to_string(),
             SeerError::Timeout(_) => "Operation timed out".to_string(),
             SeerError::RateLimited(_) => "Rate limited - please try again later".to_string(),
@@ -212,5 +287,95 @@ mod tests {
         assert!(SeerError::InvalidRecordType("ZZZ".into())
             .sanitized_message()
             .contains("ZZZ"));
+    }
+
+    // ---- boundary conversion (owned payloads, classify-at-conversion) ----
+
+    #[tokio::test]
+    async fn reqwest_status_errors_classified_at_conversion() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let cases: &[(u16, bool)] = &[
+            (429, true), // rate limited: retry with backoff
+            (500, true), // 5xx: transient server errors
+            (503, true),
+            (400, false), // other 4xx: permanent
+            (404, false),
+        ];
+        for (status, _) in cases {
+            Mock::given(method("GET"))
+                .and(path(format!("/s{status}")))
+                .respond_with(ResponseTemplate::new(*status))
+                .mount(&server)
+                .await;
+        }
+
+        let client = reqwest::Client::new();
+        for (status, expect_transient) in cases {
+            let reqwest_err = client
+                .get(format!("{}/s{}", server.uri(), status))
+                .send()
+                .await
+                .expect("mock server is reachable")
+                .error_for_status()
+                .expect_err("status is an error");
+            match SeerError::from(reqwest_err) {
+                SeerError::ReqwestError { message, transient } => {
+                    assert_eq!(
+                        transient, *expect_transient,
+                        "status {status} transiency misclassified"
+                    );
+                    // Status-code detail must survive into the owned message.
+                    assert!(
+                        message.contains(&status.to_string()),
+                        "status {status} missing from message: {message}"
+                    );
+                }
+                other => panic!("expected ReqwestError, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn reqwest_connect_error_classified_transient_at_conversion() {
+        // Bind-and-drop to obtain a loopback port with no listener; the
+        // connect is refused locally, no external network involved.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        drop(listener);
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .expect("client builds");
+        let reqwest_err = client
+            .get(format!("http://127.0.0.1:{port}/"))
+            .send()
+            .await
+            .expect_err("connect must fail");
+        match SeerError::from(reqwest_err) {
+            SeerError::ReqwestError { transient, .. } => {
+                assert!(transient, "connect failures must classify as transient");
+            }
+            other => panic!("expected ReqwestError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dns_resolver_error_converts_to_owned_message() {
+        // The hickory type is dropped at the boundary; its detail survives
+        // as text and the Display output is unchanged from the #[from] era.
+        let err: SeerError = hickory_resolver::net::NetError::Timeout.into();
+        match &err {
+            SeerError::DnsResolverError(msg) => {
+                assert!(msg.contains("timed out"), "detail must survive: {msg}");
+            }
+            other => panic!("expected DnsResolverError, got {other:?}"),
+        }
+        assert_eq!(err.to_string(), "DNS resolver error: request timed out");
     }
 }

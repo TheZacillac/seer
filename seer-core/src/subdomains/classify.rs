@@ -16,6 +16,15 @@ use crate::dns::{DnsResolver, RecordData, RecordType};
 /// and per-name "live" verdicts based on an A record alone are unreliable.
 const WILDCARD_PROBE_LABEL: &str = "zzzz-seer-wildcard-probe-does-not-exist";
 
+/// Upper bound on the number of enumerated names that get resolved and
+/// classified in a single pass. CT logs can return tens of thousands of names
+/// for a large target, and each name issues two live DNS queries (A + CNAME);
+/// the `concurrency` limit caps parallelism but not total work. 2000 names
+/// (up to ~4000 queries) is a defensible ceiling that covers essentially every
+/// real zone while bounding the DNS fan-out. Names beyond the cap are reported
+/// as skipped rather than silently dropped.
+const MAX_CLASSIFY_NAMES: usize = 2000;
+
 /// Curated CNAME-suffix → provider table for subdomain-takeover detection.
 /// A dangling CNAME to one of these (whose target no longer resolves) is a
 /// resource an attacker can often re-claim.
@@ -81,6 +90,12 @@ pub struct SubdomainClassification {
     /// Whether the zone answers for a random nonexistent name (wildcard DNS).
     pub wildcard_detected: bool,
     pub subdomains: Vec<ClassifiedSubdomain>,
+    /// Number of enumerated names dropped before classification because the
+    /// input exceeded [`MAX_CLASSIFY_NAMES`]. Zero when nothing was capped.
+    /// `#[serde(default)]` keeps older history files (without this field)
+    /// deserializable.
+    #[serde(default)]
+    pub names_skipped: usize,
 }
 
 /// Returns the takeover-prone provider for a CNAME target, or `None`.
@@ -155,17 +170,34 @@ async fn resolve_name(resolver: &DnsResolver, name: &str) -> (Vec<String>, Optio
     (addresses, cname)
 }
 
+/// Truncates `names` to at most [`MAX_CLASSIFY_NAMES`] in place and returns how
+/// many were dropped. Pure so the cap can be unit-tested without a resolver.
+fn apply_classify_cap(names: &mut Vec<String>) -> usize {
+    let skipped = names.len().saturating_sub(MAX_CLASSIFY_NAMES);
+    if skipped > 0 {
+        names.truncate(MAX_CLASSIFY_NAMES);
+    }
+    skipped
+}
+
 /// Resolves and classifies each name in `names` for `domain`, detecting
 /// wildcard DNS to suppress false-positive "live" verdicts and flagging
-/// dangling CNAMEs to takeover-prone providers. Runs up to `concurrency`
+/// dangling CNAMEs to takeover-prone providers. At most [`MAX_CLASSIFY_NAMES`]
+/// names are resolved (see `apply_classify_cap`); any beyond that are reported
+/// in [`SubdomainClassification::names_skipped`]. Runs up to `concurrency`
 /// resolutions at a time.
 pub async fn classify_subdomains(
     resolver: &DnsResolver,
     domain: &str,
-    names: Vec<String>,
+    mut names: Vec<String>,
     concurrency: usize,
 ) -> SubdomainClassification {
     use futures::stream::{self, StreamExt};
+
+    // Cap total work: classify at most MAX_CLASSIFY_NAMES names (the caller has
+    // already deduped/sorted them via `build_result`), keeping the first N and
+    // reporting the remainder as skipped so the truncation is never silent.
+    let names_skipped = apply_classify_cap(&mut names);
 
     // Probe for wildcard DNS once.
     let probe = format!("{WILDCARD_PROBE_LABEL}.{domain}");
@@ -206,6 +238,7 @@ pub async fn classify_subdomains(
         domain: domain.to_string(),
         wildcard_detected,
         subdomains,
+        names_skipped,
     }
 }
 
@@ -274,5 +307,25 @@ mod tests {
             &wildcard,
         );
         assert_eq!(c.status, SubdomainStatus::Live);
+    }
+
+    #[test]
+    fn classify_cap_keeps_first_n_and_reports_skipped() {
+        // Over the cap: keep exactly MAX_CLASSIFY_NAMES, report the overflow.
+        let over = MAX_CLASSIFY_NAMES + 37;
+        let mut names: Vec<String> = (0..over).map(|i| format!("h{i}.example.com")).collect();
+        let skipped = apply_classify_cap(&mut names);
+        assert_eq!(names.len(), MAX_CLASSIFY_NAMES);
+        assert_eq!(skipped, 37);
+        // The first N (in the caller's already-sorted order) are the ones kept.
+        assert_eq!(names[0], "h0.example.com");
+    }
+
+    #[test]
+    fn classify_cap_is_noop_under_limit() {
+        let mut names: Vec<String> = (0..10).map(|i| format!("h{i}.example.com")).collect();
+        let skipped = apply_classify_cap(&mut names);
+        assert_eq!(names.len(), 10);
+        assert_eq!(skipped, 0);
     }
 }

@@ -146,6 +146,13 @@ impl MarkdownFormatter {
                 "> ⚠️ Wildcard DNS detected — some \"live\" verdicts may be zone wildcards.\n\n",
             );
         }
+        if result.names_skipped > 0 {
+            let _ = writeln!(
+                out,
+                "> ⚠️ {} more names exceeded the classification cap and were not resolved.\n",
+                result.names_skipped
+            );
+        }
         out.push_str("| Name | Status | CNAME | Takeover risk |\n|---|---|---|---|\n");
         for s in &result.subdomains {
             let _ = writeln!(

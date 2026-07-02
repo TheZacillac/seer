@@ -62,6 +62,23 @@ pub enum BulkOperation {
     },
 }
 
+impl BulkOperation {
+    /// Returns the domain this operation targets, regardless of variant.
+    pub fn domain(&self) -> &str {
+        match self {
+            Self::Whois { domain }
+            | Self::Rdap { domain }
+            | Self::Dns { domain, .. }
+            | Self::Propagation { domain, .. }
+            | Self::Lookup { domain }
+            | Self::Status { domain }
+            | Self::Avail { domain }
+            | Self::Info { domain }
+            | Self::Ssl { domain } => domain,
+        }
+    }
+}
+
 /// The data returned from a bulk operation (varies by operation type).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "result_type", content = "data", rename_all = "snake_case")]
@@ -243,25 +260,14 @@ impl BulkExecutor {
                     let count = completed.fetch_add(1, Ordering::Relaxed) + 1;
 
                     if let Some(progress) = progress {
-                        let desc = match &op {
-                            BulkOperation::Whois { domain }
-                            | BulkOperation::Rdap { domain }
-                            | BulkOperation::Dns { domain, .. }
-                            | BulkOperation::Propagation { domain, .. }
-                            | BulkOperation::Lookup { domain }
-                            | BulkOperation::Status { domain }
-                            | BulkOperation::Avail { domain }
-                            | BulkOperation::Info { domain }
-                            | BulkOperation::Ssl { domain } => domain.as_str(),
-                        };
-                        progress(count, total, desc);
+                        progress(count, total, op.domain());
                     }
 
                     let bulk_result = match result {
                         Ok(data) => BulkResult {
                             operation: op,
                             success: true,
-                            data: Some(data),
+                            data: Some(trim_result_data(data)),
                             error: None,
                             duration_ms,
                         },
@@ -392,6 +398,26 @@ impl BulkExecutor {
             .map(|domain| BulkOperation::Ssl { domain })
             .collect();
         self.execute(operations, None).await
+    }
+}
+
+/// Trims retained raw WHOIS bodies before a result enters the buffered vec.
+///
+/// `WhoisResponse.raw_response` is `#[serde(skip_serializing)]`, so no bulk
+/// output path (JSON/YAML/CSV) ever emits it — the truncation is invisible
+/// to consumers. Without it, each Whois/Lookup result can retain up to 1 MB
+/// of raw body (the WHOIS client's response cap), which an adversarial batch
+/// could inflate to ~1 GB at the CLI's 1000-domain cap.
+fn trim_result_data(data: BulkResultData) -> BulkResultData {
+    match data {
+        BulkResultData::Whois(mut whois) => {
+            crate::lookup::trim_whois_raw(&mut whois);
+            BulkResultData::Whois(whois)
+        }
+        BulkResultData::Lookup(result) => {
+            BulkResultData::Lookup(crate::lookup::trim_raw_response(result))
+        }
+        other => other,
     }
 }
 
@@ -589,6 +615,71 @@ csv,format,example.org
     fn is_csv_header_row_rejects_non_keyword() {
         assert!(!is_csv_header_row("example"));
         assert!(!is_csv_header_row("mydata"));
+    }
+
+    #[test]
+    fn bulk_operation_domain_returns_domain_for_every_variant() {
+        let d = "example.com".to_string();
+        let ops = vec![
+            BulkOperation::Whois { domain: d.clone() },
+            BulkOperation::Rdap { domain: d.clone() },
+            BulkOperation::Dns {
+                domain: d.clone(),
+                record_type: RecordType::A,
+            },
+            BulkOperation::Propagation {
+                domain: d.clone(),
+                record_type: RecordType::A,
+            },
+            BulkOperation::Lookup { domain: d.clone() },
+            BulkOperation::Status { domain: d.clone() },
+            BulkOperation::Avail { domain: d.clone() },
+            BulkOperation::Info { domain: d.clone() },
+            BulkOperation::Ssl { domain: d.clone() },
+        ];
+        for op in &ops {
+            assert_eq!(op.domain(), "example.com", "variant {:?}", op);
+        }
+    }
+
+    /// An oversized WHOIS raw_response must come out truncated when the
+    /// result enters the buffer (`trim_result_data` runs on every Ok result
+    /// in `execute_inner`). 32 KB cap + marker — see lookup::trim_whois_raw.
+    #[test]
+    fn bulk_whois_oversized_raw_response_is_truncated() {
+        const MAX_RAW: usize = 32 * 1024;
+        let raw = "a".repeat(MAX_RAW + 1000);
+        let whois = WhoisResponse::parse("example.com", "whois.example.com", &raw);
+        assert!(whois.raw_response.len() > MAX_RAW);
+
+        let trimmed = trim_result_data(BulkResultData::Whois(whois));
+        let BulkResultData::Whois(whois) = trimmed else {
+            panic!("expected Whois variant");
+        };
+        assert!(
+            whois.raw_response.len() <= MAX_RAW + "\n... [truncated]".len(),
+            "raw_response not bounded: {} bytes",
+            whois.raw_response.len()
+        );
+        assert!(whois.raw_response.ends_with("[truncated]"));
+    }
+
+    #[test]
+    fn bulk_lookup_oversized_raw_response_is_truncated() {
+        const MAX_RAW: usize = 32 * 1024;
+        let raw = "a".repeat(MAX_RAW + 1000);
+        let whois = WhoisResponse::parse("example.com", "whois.example.com", &raw);
+
+        let trimmed = trim_result_data(BulkResultData::Lookup(LookupResult::Whois {
+            data: whois,
+            rdap_error: None,
+            rdap_fallback: None,
+        }));
+        let BulkResultData::Lookup(LookupResult::Whois { data, .. }) = trimmed else {
+            panic!("expected Lookup(Whois) variant");
+        };
+        assert!(data.raw_response.len() <= MAX_RAW + "\n... [truncated]".len());
+        assert!(data.raw_response.ends_with("[truncated]"));
     }
 
     /// Regression test for the v0.26.7 rate-limiter regression. The

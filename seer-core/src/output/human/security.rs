@@ -182,6 +182,12 @@ impl HumanFormatter {
                     .to_string()
             ),
         ));
+        if result.names_skipped > 0 {
+            out.push(self.warning(&format!(
+                "{} more names exceeded the classification cap and were not resolved",
+                result.names_skipped
+            )));
+        }
         out.push(String::new());
         for s in &result.subdomains {
             let status = match s.status {

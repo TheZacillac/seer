@@ -13,7 +13,7 @@ use tracing::{debug, instrument, warn};
 
 use tokio::time::timeout as tokio_timeout;
 
-use crate::availability::{AvailabilityChecker, AvailabilityResult};
+use crate::availability::{AvailabilityChecker, AvailabilityResult, PriorRdap, PriorWhois};
 use crate::cache::TtlCache;
 use crate::dns::{DnsPresence, DnsResolver};
 use crate::error::{Result, SeerError};
@@ -391,38 +391,38 @@ fn truncate_on_char_boundary(s: &mut String, max: usize) {
     }
 }
 
-/// Before caching, trim raw WHOIS response to limit cache memory.
-/// A full WHOIS raw_response can be up to 1 MB; we cap it at 32 KB which is
-/// plenty for the parsed fields while preventing the cache from ballooning.
-fn trim_for_cache(mut result: LookupResult) -> LookupResult {
+/// Trims an oversized WHOIS `raw_response` in place (char-boundary safe),
+/// appending a truncation marker. A raw body can be up to 1 MB (the WHOIS
+/// client's response cap); 32 KB is plenty for the parsed fields while
+/// bounding memory wherever responses are retained — the lookup cache here
+/// and the bulk executor's buffered results.
+pub(crate) fn trim_whois_raw(whois: &mut WhoisResponse) {
     const MAX_RAW: usize = 32 * 1024;
+    if whois.raw_response.len() > MAX_RAW {
+        truncate_on_char_boundary(&mut whois.raw_response, MAX_RAW);
+        whois.raw_response.push_str("\n... [truncated]");
+    }
+}
 
+/// Trims any retained raw WHOIS body inside a [`LookupResult`] via
+/// [`trim_whois_raw`]. Applied before caching lookups and by the bulk
+/// executor before buffering results.
+pub(crate) fn trim_raw_response(mut result: LookupResult) -> LookupResult {
     match result {
-        LookupResult::Whois { ref mut data, .. } => {
-            if data.raw_response.len() > MAX_RAW {
-                truncate_on_char_boundary(&mut data.raw_response, MAX_RAW);
-                data.raw_response.push_str("\n... [truncated for cache]");
-            }
-        }
+        LookupResult::Whois { ref mut data, .. } => trim_whois_raw(data),
         LookupResult::Rdap {
             ref mut whois_fallback,
             ..
         } => {
-            if let Some(ref mut w) = whois_fallback {
-                if w.raw_response.len() > MAX_RAW {
-                    truncate_on_char_boundary(&mut w.raw_response, MAX_RAW);
-                    w.raw_response.push_str("\n... [truncated for cache]");
-                }
+            if let Some(w) = whois_fallback {
+                trim_whois_raw(w);
             }
         }
         LookupResult::Available {
             ref mut whois_data, ..
         } => {
-            if let Some(ref mut w) = whois_data {
-                if w.raw_response.len() > MAX_RAW {
-                    truncate_on_char_boundary(&mut w.raw_response, MAX_RAW);
-                    w.raw_response.push_str("\n... [truncated for cache]");
-                }
+            if let Some(w) = whois_data {
+                trim_whois_raw(w);
             }
         }
     }
@@ -597,7 +597,7 @@ impl SmartLookup {
 
         // Cache a trimmed copy to limit memory usage before releasing
         // waiters (via guard drop) so they observe the cached value.
-        LOOKUP_CACHE.insert(normalized.clone(), trim_for_cache(result.clone()));
+        LOOKUP_CACHE.insert(normalized.clone(), trim_raw_response(result.clone()));
 
         Ok(result)
     }
@@ -878,8 +878,9 @@ impl SmartLookup {
 
         // Both sides failed to provide useful data. Craft a precise WHOIS
         // error string that distinguishes true errors from grace-period
-        // truncation.
-        let whois_error_str = match whois_leg {
+        // truncation. Borrow the leg here so we can move it into the reuse
+        // token below.
+        let whois_error_str = match &whois_leg {
             LegOutcome::Completed(Err(e)) => e.to_string(),
             LegOutcome::Completed(Ok(_)) => {
                 // Already handled above; treat defensively.
@@ -892,13 +893,44 @@ impl SmartLookup {
             ),
         };
 
-        self.availability_fallback(domain, rdap_error_str, whois_error_str, progress)
-            .await
+        // Reuse what the race already learned rather than re-querying the same
+        // registries: a thin HTTP 200 still proves the object exists (feed it
+        // back), a concrete error is reused as-is, and only a grace-truncated
+        // leg (genuinely missing) is re-queried by the checker.
+        let prior_rdap = if rdap_returned_200 {
+            match rdap_fallback_data {
+                // `rdap_fallback_data` is already the boxed NoData response.
+                Some(resp) => PriorRdap::Response(resp),
+                None => PriorRdap::Missing,
+            }
+        } else if let Some(e) = rdap_seer_error {
+            PriorRdap::Failed(e)
+        } else {
+            PriorRdap::Missing
+        };
+        let prior_whois = match whois_leg {
+            LegOutcome::Completed(Err(e)) => PriorWhois::Failed(e),
+            // Handled above; the availability path never reuses an Ok WHOIS.
+            LegOutcome::Completed(Ok(_)) => PriorWhois::Missing,
+            LegOutcome::GraceTruncated => PriorWhois::Missing,
+        };
+
+        self.availability_fallback(
+            domain,
+            prior_rdap,
+            prior_whois,
+            rdap_error_str,
+            whois_error_str,
+            progress,
+        )
+        .await
     }
 
     async fn availability_fallback(
         &self,
         domain: &str,
+        prior_rdap: PriorRdap,
+        prior_whois: PriorWhois,
         rdap_error: String,
         whois_error: String,
         progress: Option<LookupProgressCallback>,
@@ -913,7 +945,11 @@ impl SmartLookup {
             "Both RDAP and WHOIS failed, falling back to availability check"
         );
 
-        match self.availability_checker.check(domain).await {
+        match self
+            .availability_checker
+            .check_with_prior(domain, prior_rdap, prior_whois)
+            .await
+        {
             Ok(avail) => Ok(LookupResult::Available {
                 data: Box::new(avail),
                 rdap_error: sanitize_error_for_public(&rdap_error),
@@ -950,6 +986,14 @@ impl SmartLookup {
 
         // Consider useful if we have the name plus at least one other piece of info
         has_name && (has_dates || has_entities || has_nameservers || has_status)
+    }
+
+    /// DNS presence passthrough over this lookup's private resolver, exposing
+    /// the same cheap availability pre-signal the fallback ladder uses. The
+    /// confusables scan uses it to skip NXDOMAIN candidates before paying for a
+    /// full RDAP+WHOIS race on each one.
+    pub(crate) async fn presence(&self, domain: &str) -> DnsPresence {
+        self.dns_resolver.presence(domain).await
     }
 }
 
@@ -1088,7 +1132,7 @@ mod tests {
         assert!(LOOKUP_CACHE.is_empty());
     }
 
-    // ---------------- trim_for_cache char-boundary safety ----------------
+    // ---------------- trim_raw_response char-boundary safety ----------------
 
     #[test]
     fn truncate_on_char_boundary_does_not_panic_on_multibyte_straddle() {
@@ -1110,7 +1154,7 @@ mod tests {
     }
 
     #[test]
-    fn trim_for_cache_truncates_multibyte_whois_without_panic() {
+    fn trim_raw_response_truncates_multibyte_whois_without_panic() {
         const MAX_RAW: usize = 32 * 1024;
         let mut raw = "a".repeat(MAX_RAW - 1);
         raw.push('€');
@@ -1118,13 +1162,13 @@ mod tests {
 
         let mut w = empty_whois("example.com");
         w.raw_response = raw;
-        let result = trim_for_cache(LookupResult::Whois {
+        let result = trim_raw_response(LookupResult::Whois {
             data: w,
             rdap_error: None,
             rdap_fallback: None,
         });
         if let LookupResult::Whois { data, .. } = result {
-            assert!(data.raw_response.ends_with("[truncated for cache]"));
+            assert!(data.raw_response.ends_with("[truncated]"));
         } else {
             panic!("expected Whois variant");
         }
