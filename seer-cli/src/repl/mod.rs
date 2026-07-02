@@ -29,6 +29,7 @@ pub struct Repl {
     status_client: seer_core::StatusClient,
     dnssec_checker: seer_core::DnssecChecker,
     availability_checker: seer_core::AvailabilityChecker,
+    ssl_checker: seer_core::SslChecker,
     dns_follower: seer_core::DnsFollower,
 }
 
@@ -56,21 +57,17 @@ impl Repl {
         // their own tuned timeouts by design — see the config wiring note).
         let context = CommandContext::new();
         let cfg = &context.config;
-        let whois_client = seer_core::WhoisClient::new().with_timeout(cfg.whois_timeout());
-        let rdap_client = seer_core::RdapClient::new().with_timeout(cfg.rdap_timeout());
-        let dns_resolver = seer_core::DnsResolver::new().with_timeout(cfg.dns_timeout());
-        let status_client = seer_core::StatusClient::new().with_timeout(cfg.http_timeout());
-        let availability_checker = seer_core::AvailabilityChecker::from_config(cfg);
 
         Ok(Self {
             editor,
-            whois_client,
-            rdap_client,
-            dns_resolver,
+            whois_client: seer_core::WhoisClient::from_config(cfg),
+            rdap_client: seer_core::RdapClient::from_config(cfg),
+            dns_resolver: seer_core::DnsResolver::from_config(cfg),
             propagation_checker: seer_core::dns::PropagationChecker::new(),
-            status_client,
+            status_client: seer_core::StatusClient::from_config(cfg),
             dnssec_checker: seer_core::DnssecChecker::new(),
-            availability_checker,
+            availability_checker: seer_core::AvailabilityChecker::from_config(cfg),
+            ssl_checker: seer_core::SslChecker::from_config(cfg),
             dns_follower: seer_core::DnsFollower::new(),
             context,
         })
@@ -209,6 +206,10 @@ impl Repl {
             "compare" => self.execute_compare(args).await,
             "subdomains" | "subs" => self.execute_subdomains(args).await,
             "diff" => self.execute_diff(args).await,
+            "drift" => self.execute_drift(args).await,
+            "caa" => self.execute_caa(args).await,
+            "posture" => self.execute_posture(args).await,
+            "confusables" => self.execute_confusables(args).await,
             "watch" => self.execute_watch(args).await,
             "history" => self.execute_history(args).await,
             "set" => self.execute_set(args),
@@ -306,6 +307,20 @@ impl Repl {
             "ssl <domain>".bright_cyan()
         );
         println!();
+        println!("{}", "SECURITY".bright_purple().bold());
+        println!(
+            "  {:<34} Look up CAA (cert authority) policy",
+            "caa <domain>".bright_cyan()
+        );
+        println!(
+            "  {:<34} Email/DNS posture (SPF, DMARC, MTA-STS, BIMI, DANE)",
+            "posture <domain>".bright_cyan()
+        );
+        println!(
+            "  {:<34} Find registered look-alike domains",
+            "confusables <domain>".bright_cyan()
+        );
+        println!();
         println!("{}", "COMPARISON".bright_purple().bold());
         println!(
             "  {:<34} Compare two domains side-by-side",
@@ -321,6 +336,10 @@ impl Repl {
             "  {:<34} View lookup history",
             "history [domain] [--clear]".bright_cyan()
         );
+        println!(
+            "  {:<34} Detect drift vs the last stored lookup",
+            "drift <domain> [--record]".bright_cyan()
+        );
         println!();
         println!("{}", "BULK OPERATIONS".bright_purple().bold());
         println!(
@@ -329,7 +348,7 @@ impl Repl {
         );
         println!(
             "  {}",
-            "Operations: lookup, whois, rdap, dig, prop, status, avail, info, ssl".dimmed()
+            format!("Operations: {}", crate::ops::BULK_OPS_SUMMARY).dimmed()
         );
         println!();
         println!("{}", "SETTINGS".bright_purple().bold());
@@ -379,6 +398,18 @@ impl Repl {
         println!(
             "  {}         Inspect SSL certificate chain (deep)",
             "ssl".bright_green()
+        );
+        println!(
+            "  {}     Email/DNS posture (SPF, DMARC, MTA-STS, BIMI, DANE)",
+            "posture".bright_green()
+        );
+        println!(
+            "  {} Registered look-alike scan (expensive per domain)",
+            "confusables".bright_green()
+        );
+        println!(
+            "  {}         Look up CAA (cert authority) policy",
+            "caa".bright_green()
         );
         println!();
         println!("{}", "Input File Formats:".bright_cyan());
@@ -440,15 +471,7 @@ impl Repl {
                 // Record to history (file I/O off the async executor),
                 // matching the non-REPL `Commands::Lookup` path. Without this
                 // the `history` REPL command always reports an empty file.
-                let domain_for_history = domain.to_string();
-                let result_for_history = result.clone();
-                tokio::task::spawn_blocking(move || {
-                    let mut history = seer_core::LookupHistory::load();
-                    history.record(&domain_for_history, result_for_history);
-                    let _ = history.save();
-                })
-                .await
-                .ok();
+                crate::ops::record_lookup_history(domain, result.clone()).await;
 
                 let formatter = seer_core::output::get_formatter(self.context.output_format);
                 println!("{}", formatter.format_lookup(&result));
@@ -689,77 +712,49 @@ impl Repl {
             return CommandResult::Continue;
         }
 
-        if args.len() < 2 {
-            return CommandResult::Error(
-                "Usage: bulk <operation> <file> [type] [-o output.csv]\nType 'bulk -h' for detailed help."
-                    .to_string(),
-            );
-        }
+        let parsed = match commands::parse_bulk_args(args) {
+            Ok(p) => p,
+            Err(e) => return CommandResult::Error(e),
+        };
 
-        let operation = args[0];
         // Expand `~` / `~/...` once at the boundary so both the bulk-input
         // read and the auto-derived output path see a home-resolved path.
-        let file_path = crate::utils::expand_tilde(args[1]);
-
-        // Parse remaining args for record type and output path
-        let mut record_type = seer_core::RecordType::A;
-        let mut output_path: Option<String> = None;
-
-        let mut i = 2;
-        while i < args.len() {
-            if args[i] == "-o" || args[i] == "--output" {
-                if i + 1 < args.len() {
-                    output_path = Some(crate::utils::expand_tilde(args[i + 1]));
-                    i += 2;
-                    continue;
-                }
-            } else if let Ok(rt) = args[i].parse() {
-                record_type = rt;
-            }
-            i += 1;
-        }
-
-        // Determine output path
-        let output_path = output_path.unwrap_or_else(|| {
-            let input_path = std::path::Path::new(&file_path);
-            let stem = input_path.file_stem().unwrap_or_default().to_string_lossy();
-            let parent = input_path.parent().unwrap_or(std::path::Path::new("."));
-            parent
-                .join(format!("{}_results.csv", stem))
-                .to_string_lossy()
-                .to_string()
-        });
+        let file_path = crate::utils::expand_tilde(&parsed.file);
+        let output_path = parsed
+            .output
+            .as_deref()
+            .map(crate::utils::expand_tilde)
+            .unwrap_or_else(|| crate::ops::default_bulk_output_path(&file_path));
 
         // Read domains from file.
         // `read_bulk_input` rejects FIFOs, sockets, devices, directories, and
         // oversized files via a pre-read metadata check, preventing hangs on
         // `mkfifo`'d paths.
-        const MAX_BULK_DOMAINS_CLI: usize = 1000;
-
         let content = match crate::utils::read_bulk_input(&file_path) {
             Ok(c) => c,
             Err(e) => return CommandResult::Error(e),
         };
 
-        let domains = seer_core::bulk::parse_domains_from_file(&content);
-        if domains.is_empty() {
-            return CommandResult::Error(
-                "No valid domains found in file. Expected format: one domain per line, # for comments, or CSV (first column)".to_string()
-            );
-        }
+        let domains = match crate::ops::parse_bulk_domains(&content) {
+            Ok(d) => d,
+            Err(e) => return CommandResult::Error(e),
+        };
 
-        if domains.len() > MAX_BULK_DOMAINS_CLI {
-            return CommandResult::Error(format!(
-                "Bulk file contains {} domains, maximum is {}",
-                domains.len(),
-                MAX_BULK_DOMAINS_CLI
-            ));
-        }
+        // Validate the operation before any progress UI is set up so an
+        // unknown op can't leave a stale progress bar registered.
+        let operations = match crate::ops::build_bulk_operations(
+            &parsed.operation,
+            &domains,
+            parsed.record_type,
+        ) {
+            Ok(operations) => operations,
+            Err(e) => return CommandResult::Error(e),
+        };
 
         println!(
             "Processing {} domains with {} operation...",
             domains.len().to_string().bright_green(),
-            operation.bright_yellow()
+            parsed.operation.bright_yellow()
         );
 
         let progress = indicatif::ProgressBar::new(domains.len() as u64);
@@ -773,67 +768,8 @@ impl Repl {
         // Register progress bar for tracing integration
         set_bulk_progress_bar(progress.clone());
 
-        let executor = seer_core::BulkExecutor::new()
-            .with_concurrency(self.context.config.bulk.concurrency)
-            .with_rate_limit(self.context.config.bulk_rate_limit());
-
-        let progress_callback = progress.clone();
-        let callback: seer_core::bulk::ProgressCallback =
-            Box::new(move |current, _total, domain| {
-                progress_callback.set_position(current as u64);
-                progress_callback.set_message(domain.to_string());
-            });
-
-        let operations: Vec<seer_core::bulk::BulkOperation> = match operation {
-            "whois" => domains
-                .iter()
-                .map(|d: &String| seer_core::bulk::BulkOperation::Whois { domain: d.clone() })
-                .collect(),
-            "rdap" => domains
-                .iter()
-                .map(|d: &String| seer_core::bulk::BulkOperation::Rdap { domain: d.clone() })
-                .collect(),
-            "dig" | "dns" => domains
-                .iter()
-                .map(|d: &String| seer_core::bulk::BulkOperation::Dns {
-                    domain: d.clone(),
-                    record_type,
-                })
-                .collect(),
-            "propagation" | "prop" => domains
-                .iter()
-                .map(|d: &String| seer_core::bulk::BulkOperation::Propagation {
-                    domain: d.clone(),
-                    record_type,
-                })
-                .collect(),
-            "lookup" => domains
-                .iter()
-                .map(|d: &String| seer_core::bulk::BulkOperation::Lookup { domain: d.clone() })
-                .collect(),
-            "status" => domains
-                .iter()
-                .map(|d: &String| seer_core::bulk::BulkOperation::Status { domain: d.clone() })
-                .collect(),
-            "avail" => domains
-                .iter()
-                .map(|d: &String| seer_core::bulk::BulkOperation::Avail { domain: d.clone() })
-                .collect(),
-            "info" => domains
-                .iter()
-                .map(|d: &String| seer_core::bulk::BulkOperation::Info { domain: d.clone() })
-                .collect(),
-            "ssl" => domains
-                .iter()
-                .map(|d: &String| seer_core::bulk::BulkOperation::Ssl { domain: d.clone() })
-                .collect(),
-            _ => {
-                return CommandResult::Error(format!(
-                    "Unknown bulk operation: {}. Use: lookup, whois, rdap, dig/dns, prop, status, avail, info, ssl",
-                    operation
-                ))
-            }
-        };
+        let executor = seer_core::BulkExecutor::from_config(&self.context.config);
+        let callback = crate::ops::bar_progress_callback(&progress);
 
         let results = executor.execute(operations, Some(callback)).await;
 
@@ -844,7 +780,7 @@ impl Repl {
         // Write results to CSV atomically — a crash or disk-full mid-write
         // must not leave a truncated CSV that downstream pipelines treat as
         // authoritative.
-        let csv_content = crate::utils::bulk_results_to_csv(&results, operation);
+        let csv_content = crate::utils::bulk_results_to_csv(&results, &parsed.operation);
         if let Err(e) = crate::utils::atomic_write(&output_path, &csv_content) {
             return CommandResult::Error(format!("Failed to write output file: {}", e));
         }
@@ -869,17 +805,7 @@ impl Repl {
         if failed > 0 {
             println!("\n{}", "Failures:".bright_red().bold());
             for result in results.iter().filter(|r| !r.success) {
-                let domain = match &result.operation {
-                    seer_core::bulk::BulkOperation::Whois { domain }
-                    | seer_core::bulk::BulkOperation::Rdap { domain }
-                    | seer_core::bulk::BulkOperation::Dns { domain, .. }
-                    | seer_core::bulk::BulkOperation::Propagation { domain, .. }
-                    | seer_core::bulk::BulkOperation::Lookup { domain }
-                    | seer_core::bulk::BulkOperation::Status { domain }
-                    | seer_core::bulk::BulkOperation::Avail { domain }
-                    | seer_core::bulk::BulkOperation::Info { domain }
-                    | seer_core::bulk::BulkOperation::Ssl { domain } => domain,
-                };
+                let domain = result.operation.domain();
                 println!(
                     "  {} - {}",
                     domain,
@@ -914,44 +840,17 @@ impl Repl {
     }
 
     async fn execute_follow(&self, args: &[&str]) -> CommandResult {
-        if args.is_empty() {
-            return CommandResult::Error(
-                "Usage: follow <domain> [iterations] [interval_minutes] [type] [@server] [--changes-only]"
-                    .to_string(),
-            );
-        }
-
-        let domain = args[0];
-        let mut iterations: usize = 10;
-        let mut interval_minutes: f64 = 1.0;
-        let mut record_type = seer_core::RecordType::A;
-        let mut nameserver: Option<&str> = None;
-        let mut changes_only = false;
-        // Track whether the first numeric positional (iterations) has been
-        // consumed. Comparing against the default `10` is wrong because
-        // `follow x 10 5` would treat the explicit `10` as "not yet set".
-        let mut iterations_set = false;
-
-        // Parse remaining args
-        for arg in &args[1..] {
-            if let Some(ns) = arg.strip_prefix('@') {
-                nameserver = Some(ns);
-            } else if *arg == "--changes-only" {
-                changes_only = true;
-            } else if let Ok(n) = arg.parse::<usize>() {
-                // First number is iterations, second is interval
-                if !iterations_set {
-                    iterations = n;
-                    iterations_set = true;
-                } else {
-                    interval_minutes = n as f64;
-                }
-            } else if let Ok(mins) = arg.parse::<f64>() {
-                interval_minutes = mins;
-            } else if let Ok(rt) = arg.parse() {
-                record_type = rt;
-            }
-        }
+        let commands::FollowArgs {
+            domain,
+            iterations,
+            interval_minutes,
+            record_type,
+            nameserver,
+            changes_only,
+        } = match commands::parse_follow_args(args) {
+            Ok(p) => p,
+            Err(e) => return CommandResult::Error(e),
+        };
 
         let config = match seer_core::FollowConfig::new(iterations, interval_minutes) {
             Ok(cfg) => cfg.with_changes_only(changes_only),
@@ -1026,9 +925,9 @@ impl Repl {
         let result = self
             .dns_follower
             .follow(
-                domain,
+                &domain,
                 record_type,
-                nameserver,
+                nameserver.as_deref(),
                 config,
                 Some(callback),
                 Some(cancel_rx),
@@ -1059,8 +958,7 @@ impl Repl {
         }
         let domain = args[0];
         let spinner = Spinner::new(&format!("Checking SSL for {}", domain));
-        let checker = seer_core::SslChecker::new();
-        match checker.check(domain).await {
+        match self.ssl_checker.check(domain).await {
             Ok(report) => {
                 spinner.finish();
                 let formatter = seer_core::output::get_formatter(self.context.output_format);
@@ -1163,6 +1061,99 @@ impl Repl {
                 spinner.finish();
                 let formatter = seer_core::output::get_formatter(self.context.output_format);
                 println!("{}", formatter.format_diff(&diff));
+                CommandResult::Continue
+            }
+            Err(e) => {
+                spinner.finish();
+                CommandResult::Error(e.to_string())
+            }
+        }
+    }
+
+    async fn execute_drift(&self, args: &[&str]) -> CommandResult {
+        if args.is_empty() {
+            return CommandResult::Error("Usage: drift <domain> [--record]".to_string());
+        }
+        let domain = args[0];
+        let record = args.contains(&"--record");
+        let spinner = Spinner::new(&format!("Looking up {}", domain));
+        // Same history-snapshot semantics as the CLI `drift` subcommand —
+        // shared via ops::drift_check so the two surfaces cannot diverge.
+        let lookup = seer_core::SmartLookup::from_config(&self.context.config);
+        match crate::ops::drift_check(&lookup, domain, record).await {
+            Ok(outcome) => {
+                spinner.finish();
+                if !outcome.had_previous {
+                    println!(
+                        "{} {}",
+                        "note:".ctp_yellow(),
+                        crate::ops::no_baseline_note(domain, record)
+                    );
+                }
+                let formatter = seer_core::output::get_formatter(self.context.output_format);
+                println!("{}", formatter.format_drift(&outcome.report));
+                CommandResult::Continue
+            }
+            Err(e) => {
+                spinner.finish();
+                CommandResult::Error(e.to_string())
+            }
+        }
+    }
+
+    async fn execute_caa(&self, args: &[&str]) -> CommandResult {
+        if args.is_empty() {
+            return CommandResult::Error("Usage: caa <domain>".to_string());
+        }
+        // Normalize first so `caa HTTPS://WWW.EXAMPLE.COM` behaves like the
+        // CLI subcommand and an invalid domain surfaces a clean error.
+        match seer_core::normalize_domain(args[0]) {
+            Ok(domain) => {
+                let spinner = Spinner::new(&format!("Looking up CAA policy for {}", domain));
+                let policy = seer_core::caa::lookup_caa(&self.dns_resolver, &domain).await;
+                spinner.finish();
+                let formatter = seer_core::output::get_formatter(self.context.output_format);
+                println!("{}", formatter.format_caa(&policy));
+                CommandResult::Continue
+            }
+            Err(e) => CommandResult::Error(e.to_string()),
+        }
+    }
+
+    async fn execute_posture(&self, args: &[&str]) -> CommandResult {
+        if args.is_empty() {
+            return CommandResult::Error("Usage: posture <domain>".to_string());
+        }
+        let domain = args[0];
+        let spinner = Spinner::new(&format!("Inspecting email posture for {}", domain));
+        match seer_core::lookup_email_posture(&self.dns_resolver, domain).await {
+            Ok(posture) => {
+                spinner.finish();
+                let formatter = seer_core::output::get_formatter(self.context.output_format);
+                println!("{}", formatter.format_posture(&posture));
+                CommandResult::Continue
+            }
+            Err(e) => {
+                spinner.finish();
+                CommandResult::Error(e.to_string())
+            }
+        }
+    }
+
+    async fn execute_confusables(&self, args: &[&str]) -> CommandResult {
+        if args.is_empty() {
+            return CommandResult::Error("Usage: confusables <domain>".to_string());
+        }
+        let domain = args[0];
+        let spinner = Spinner::new(&format!("Scanning look-alikes for {}", domain));
+        let lookup = seer_core::SmartLookup::from_config(&self.context.config);
+        match seer_core::find_confusables(&lookup, domain, self.context.config.bulk.concurrency)
+            .await
+        {
+            Ok(report) => {
+                spinner.finish();
+                let formatter = seer_core::output::get_formatter(self.context.output_format);
+                println!("{}", formatter.format_confusables(&report));
                 CommandResult::Continue
             }
             Err(e) => {

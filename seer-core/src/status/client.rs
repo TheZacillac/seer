@@ -61,6 +61,22 @@ impl StatusClient {
         }
     }
 
+    /// Builds a client honoring `~/.seer/config.toml` settings.
+    ///
+    /// Reads `timeouts.http_secs` (clamped to 1–120s by
+    /// [`crate::config::SeerConfig::load`]) for the HTTP/TLS probes, plus
+    /// `timeouts.dns_secs`, `timeouts.whois_secs`, and `timeouts.rdap_secs`
+    /// for the internal DNS resolver and expiration lookup — matching the
+    /// [`crate::availability::AvailabilityChecker::from_config`] precedent of
+    /// per-protocol timeouts on every sub-client.
+    pub fn from_config(config: &crate::config::SeerConfig) -> Self {
+        Self {
+            timeout: config.http_timeout(),
+            dns_resolver: DnsResolver::from_config(config),
+            smart_lookup: SmartLookup::from_config(config),
+        }
+    }
+
     /// Sets the timeout for HTTP and TLS operations.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
@@ -662,6 +678,14 @@ fn asn1_time_to_chrono(time: x509_parser::time::ASN1Time) -> Result<chrono::Date
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn from_config_applies_http_timeout() {
+        let mut config = crate::config::SeerConfig::default();
+        config.timeouts.http_secs = 55;
+        let client = StatusClient::from_config(&config);
+        assert_eq!(client.timeout, Duration::from_secs(55));
+    }
 
     #[test]
     fn hostname_matches_pattern_exact() {

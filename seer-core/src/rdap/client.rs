@@ -201,6 +201,16 @@ impl RdapClient {
         }
     }
 
+    /// Builds a client honoring `~/.seer/config.toml` settings.
+    ///
+    /// Reads `timeouts.rdap_secs` (already clamped to 1–300s by
+    /// [`crate::config::SeerConfig::load`]). Sugar over
+    /// [`RdapClient::with_timeout`] — equivalent to
+    /// `RdapClient::new().with_timeout(config.rdap_timeout())`.
+    pub fn from_config(config: &crate::config::SeerConfig) -> Self {
+        Self::new().with_timeout(config.rdap_timeout())
+    }
+
     /// Sets the per-request timeout for RDAP queries.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
@@ -1164,6 +1174,14 @@ fn build_rdap_urls(bases: &[url::Url], path: &str) -> Vec<url::Url> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn from_config_applies_rdap_timeout() {
+        let mut config = crate::config::SeerConfig::default();
+        config.timeouts.rdap_secs = 33;
+        let client = RdapClient::from_config(&config);
+        assert_eq!(client.timeout, Duration::from_secs(33));
+    }
 
     #[test]
     fn test_default_client_has_retry_policy() {

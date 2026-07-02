@@ -77,6 +77,16 @@ impl WhoisClient {
         }
     }
 
+    /// Builds a client honoring `~/.seer/config.toml` settings.
+    ///
+    /// Reads `timeouts.whois_secs` (already clamped to 1–300s by
+    /// [`crate::config::SeerConfig::load`]). Sugar over
+    /// [`WhoisClient::with_timeout`] — equivalent to
+    /// `WhoisClient::new().with_timeout(config.whois_timeout())`.
+    pub fn from_config(config: &crate::config::SeerConfig) -> Self {
+        Self::new().with_timeout(config.whois_timeout())
+    }
+
     /// Test-only: allow connections to loopback/private hosts (mock servers).
     #[cfg(test)]
     pub(crate) fn allowing_private_hosts(mut self) -> Self {
@@ -541,6 +551,14 @@ fn extract_referral_with(response: &str, allow_private_hosts: bool) -> Option<St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn from_config_applies_whois_timeout() {
+        let mut config = crate::config::SeerConfig::default();
+        config.timeouts.whois_secs = 42;
+        let client = WhoisClient::from_config(&config);
+        assert_eq!(client.timeout, Duration::from_secs(42));
+    }
 
     #[test]
     fn test_normalize_domain() {

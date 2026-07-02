@@ -115,6 +115,21 @@ impl DnsResolver {
         }
     }
 
+    /// Builds a resolver honoring `~/.seer/config.toml` settings.
+    ///
+    /// Reads `timeouts.dns_secs` (already clamped to 1–60s by
+    /// [`crate::config::SeerConfig::load`]). Sugar over
+    /// [`DnsResolver::with_timeout`] — equivalent to
+    /// `DnsResolver::new().with_timeout(config.dns_timeout())`.
+    ///
+    /// The `nameserver` config key is deliberately NOT applied here: the
+    /// resolver takes the nameserver per-query (see [`DnsResolver::resolve`]),
+    /// so callers thread `config.nameserver` at the call site where it can be
+    /// overridden per-invocation.
+    pub fn from_config(config: &crate::config::SeerConfig) -> Self {
+        Self::new().with_timeout(config.dns_timeout())
+    }
+
     /// Test-only: allow custom nameservers on loopback/private hosts (mock servers).
     #[cfg(test)]
     pub(crate) fn allowing_private_hosts(mut self) -> Self {
@@ -740,6 +755,14 @@ mod tests {
     //! (`dns/dnssec.rs`, `dns/follow.rs`).
 
     use super::*;
+
+    #[test]
+    fn from_config_applies_dns_timeout() {
+        let mut config = crate::config::SeerConfig::default();
+        config.timeouts.dns_secs = 9;
+        let resolver = DnsResolver::from_config(&config);
+        assert_eq!(resolver.timeout, Duration::from_secs(9));
+    }
     use std::net::{Ipv4Addr, Ipv6Addr};
 
     // --- RecordType::from_str edge cases -----------------------------
