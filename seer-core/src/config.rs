@@ -14,7 +14,14 @@ use tracing::debug;
 pub struct SeerConfig {
     /// Default output format ("human", "json", "yaml")
     pub output_format: String,
-    /// Default DNS nameserver (e.g., "8.8.8.8")
+    /// Default DNS nameserver spec. Accepts a bare IP/hostname with an
+    /// optional port (UDP, e.g. `"8.8.8.8"`, `"dns.google"`,
+    /// `"[2001:4860:4860::8888]:53"`), `tls://host[:port]` for DNS over TLS
+    /// (default port 853, e.g. `"tls://1.1.1.1"`), or
+    /// `https://host[:port][/path]` for DNS over HTTPS (default port 443,
+    /// default path `/dns-query`, e.g. `"https://cloudflare-dns.com/dns-query"`).
+    /// Parsed by [`crate::dns::NameserverSpec`]; invalid specs surface as an
+    /// error on first use rather than at load time.
     pub nameserver: Option<String>,
     /// Timeout settings
     pub timeouts: TimeoutConfig,
@@ -196,6 +203,15 @@ concurrency = 20
         assert_eq!(config.timeouts.rdap_secs, 45);
         assert_eq!(config.timeouts.dns_secs, 5); // default
         assert_eq!(config.bulk.concurrency, 20);
+    }
+
+    #[test]
+    fn nameserver_accepts_dot_doh_specs_opaquely() {
+        // The nameserver key is an opaque spec string: DoT/DoH forms load
+        // unchanged and are validated by NameserverSpec::parse on first use,
+        // not at config-load time.
+        let config: SeerConfig = toml::from_str(r#"nameserver = "tls://1.1.1.1""#).unwrap();
+        assert_eq!(config.nameserver.as_deref(), Some("tls://1.1.1.1"));
     }
 
     #[test]

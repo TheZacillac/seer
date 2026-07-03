@@ -1,6 +1,7 @@
 mod compare;
 mod dnssec;
 mod follow;
+mod nameserver;
 mod propagation;
 mod records;
 mod resolver;
@@ -11,6 +12,7 @@ pub use follow::{
     DnsFollower, FollowConfig, FollowIteration, FollowProgressCallback, FollowResult,
     MAX_FOLLOW_INTERVAL_SECS, MAX_FOLLOW_ITERATIONS,
 };
+pub use nameserver::{NameserverProtocol, NameserverSpec};
 pub use propagation::{
     ConsensusValue, DnsServer, Inconsistency, NameserverDetails, NameserverIpInconsistency,
     PropagationChecker, PropagationResult, UnreachableServer,

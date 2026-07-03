@@ -296,6 +296,10 @@ impl Repl {
             "  {:<34} Enumerate subdomains via CT logs",
             "subdomains <domain>".bright_cyan()
         );
+        println!(
+            "  {:<34} Diff subdomains vs the stored baseline",
+            "subdomains <domain> --diff [--record]".bright_cyan()
+        );
         println!();
         println!("{}", "STATUS & SSL".bright_purple().bold());
         println!(
@@ -1031,10 +1035,57 @@ impl Repl {
 
     async fn execute_subdomains(&self, args: &[&str]) -> CommandResult {
         if args.is_empty() {
-            return CommandResult::Error("Usage: subdomains <domain>".to_string());
+            return CommandResult::Error(
+                "Usage: subdomains <domain> [--diff] [--record]".to_string(),
+            );
         }
         let domain = args[0];
+        let diff = args.contains(&"--diff");
+        let record = args.contains(&"--record");
         let spinner = Spinner::new(&format!("Enumerating subdomains for {}", domain));
+
+        if diff || record {
+            // Same baseline semantics as the CLI `subdomains --diff/--record`
+            // — shared via ops::subdomain_baseline_check so the two surfaces
+            // cannot diverge (mirrors execute_drift below).
+            match crate::ops::subdomain_baseline_check(domain, record).await {
+                Ok(outcome) => {
+                    spinner.finish();
+                    let formatter = seer_core::output::get_formatter(self.context.output_format);
+                    if diff {
+                        if outcome.report.baseline_missing {
+                            println!(
+                                "{} {}",
+                                "note:".ctp_yellow(),
+                                crate::ops::no_subdomain_baseline_note(
+                                    &outcome.result.domain,
+                                    record
+                                )
+                            );
+                        }
+                        println!(
+                            "{}",
+                            formatter.format_subdomain_baseline_diff(&outcome.report)
+                        );
+                    } else {
+                        // --record alone: plain listing plus a confirmation.
+                        println!("{}", formatter.format_subdomains(&outcome.result));
+                        println!(
+                            "{} recorded subdomain baseline for {} ({} names)",
+                            "note:".ctp_yellow(),
+                            outcome.result.domain,
+                            outcome.result.count
+                        );
+                    }
+                    return CommandResult::Continue;
+                }
+                Err(e) => {
+                    spinner.finish();
+                    return CommandResult::Error(e.to_string());
+                }
+            }
+        }
+
         let enumerator = seer_core::SubdomainEnumerator::new();
         match enumerator.enumerate(domain).await {
             Ok(result) => {

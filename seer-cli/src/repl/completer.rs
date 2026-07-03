@@ -217,7 +217,7 @@ impl Hinter for SeerCompleter {
                 Some(" <domain> [type] @<server1> @<server2>".to_string())
             }
             "subdomains" | "subs" if words.len() == 1 && line.ends_with(' ') => {
-                Some(" <domain>".to_string())
+                Some(" <domain> [--diff] [--record]".to_string())
             }
             "diff" if words.len() == 1 && line.ends_with(' ') => {
                 Some(" <domain1> <domain2>".to_string())

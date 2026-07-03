@@ -5,6 +5,7 @@
 //! responses (see [`http`]), and an ordered chain of independent sources (see
 //! [`sources`]) so a downed primary falls through to a fallback provider.
 
+mod baseline;
 mod classify;
 mod http;
 mod sources;
@@ -14,6 +15,7 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, instrument, warn};
 
+pub use baseline::{SubdomainBaseline, SubdomainBaselineDiff, SubdomainBaselines};
 pub use classify::{
     classify_subdomains, ClassifiedSubdomain, SubdomainClassification, SubdomainStatus,
 };

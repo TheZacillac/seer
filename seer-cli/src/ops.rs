@@ -214,6 +214,66 @@ pub fn no_baseline_note(domain: &str, record: bool) -> String {
     )
 }
 
+/// Outcome of a [`subdomain_baseline_check`]: the fresh enumeration plus its
+/// diff against the stored baseline (`report.baseline_missing` drives the
+/// "no baseline" note the way [`DriftOutcome::had_previous`] does for drift).
+pub struct SubdomainBaselineOutcome {
+    /// The fresh CT-log enumeration.
+    pub result: seer_core::SubdomainResult,
+    /// Diff of the fresh enumeration against the stored baseline.
+    pub report: seer_core::SubdomainBaselineDiff,
+}
+
+/// Enumerates subdomains for `domain` and diffs the result against the stored
+/// baseline (`~/.seer/subdomain_baselines.json`), optionally recording the
+/// fresh set as the new baseline afterwards. Single source of the
+/// `subdomains --diff/--record` semantics shared by the CLI subcommand and
+/// the REPL command, mirroring [`drift_check`].
+///
+/// Unlike lookup history (best-effort), a failed baseline save propagates:
+/// recording is the whole point of `--record`, so silently losing it would
+/// make every later diff lie.
+pub async fn subdomain_baseline_check(
+    domain: &str,
+    record: bool,
+) -> seer_core::Result<SubdomainBaselineOutcome> {
+    let enumerator = seer_core::SubdomainEnumerator::new();
+    // `enumerate` normalizes the domain; use `result.domain` as the key so
+    // the baseline store and the note agree on the canonical name.
+    let result = enumerator.enumerate(domain).await?;
+
+    // Baseline file I/O is blocking — keep it off the async executor.
+    let domain_key = result.domain.clone();
+    let names = result.subdomains.clone();
+    let source = result.source.clone();
+    let report = tokio::task::spawn_blocking(move || -> seer_core::Result<_> {
+        let mut baselines = seer_core::SubdomainBaselines::load();
+        let report = baselines.diff(&domain_key, &names);
+        if record {
+            baselines.record(&domain_key, &names, &source);
+            baselines.save()?;
+        }
+        Ok(report)
+    })
+    .await
+    .map_err(|e| seer_core::SeerError::ConfigError(format!("baseline task failed: {e}")))??;
+
+    Ok(SubdomainBaselineOutcome { result, report })
+}
+
+/// The advisory note shown when a subdomain diff finds no stored baseline.
+pub fn no_subdomain_baseline_note(domain: &str, record: bool) -> String {
+    format!(
+        "no subdomain baseline for {} — {}",
+        domain,
+        if record {
+            "recorded one from this run"
+        } else {
+            "run with --record to establish a baseline"
+        }
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -317,5 +377,11 @@ mod tests {
     fn no_baseline_note_reflects_record_flag() {
         assert!(no_baseline_note("a.com", true).contains("recorded a baseline"));
         assert!(no_baseline_note("a.com", false).contains("--record"));
+    }
+
+    #[test]
+    fn no_subdomain_baseline_note_reflects_record_flag() {
+        assert!(no_subdomain_baseline_note("a.com", true).contains("recorded one"));
+        assert!(no_subdomain_baseline_note("a.com", false).contains("--record"));
     }
 }

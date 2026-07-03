@@ -1,0 +1,8 @@
+---
+source: seer-core/tests/format_snapshots.rs
+assertion_line: 306
+expression: markdown().format_subdomain_baseline_diff(&fixture_subdomain_baseline_diff_missing())
+---
+## Subdomain diff: example.com
+
+_No stored baseline to compare against (first run)._

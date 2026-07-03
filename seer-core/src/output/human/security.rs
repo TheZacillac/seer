@@ -8,7 +8,7 @@ use crate::caa::CaaPolicy;
 use crate::confusables::ConfusableReport;
 use crate::drift::DriftReport;
 use crate::posture::{EmailPosture, PostureVerdict};
-use crate::subdomains::{SubdomainClassification, SubdomainStatus};
+use crate::subdomains::{SubdomainBaselineDiff, SubdomainClassification, SubdomainStatus};
 
 impl HumanFormatter {
     /// Colors a posture verdict token.
@@ -36,6 +36,65 @@ impl HumanFormatter {
                     self.dim(&sanitize_display(old)),
                     self.warning("→"),
                     self.value(&sanitize_display(new)),
+                ));
+            }
+        }
+        out.join("\n")
+    }
+
+    pub(super) fn format_subdomain_baseline_diff(&self, report: &SubdomainBaselineDiff) -> String {
+        let mut out = vec![self.header(&format!(
+            "Subdomain diff: {}",
+            sanitize_display(&report.domain)
+        ))];
+
+        if report.baseline_missing {
+            // Neutral phrasing: the CLI/REPL note carries the actionable
+            // "--record" hint (it knows whether a baseline was just recorded).
+            out.push(self.warning("No stored baseline to compare against (first run)"));
+            return out.join("\n");
+        }
+
+        if let Some(at) = report.baseline_recorded_at {
+            out.push(format!(
+                "{}: {}",
+                self.label("Baseline recorded"),
+                self.value(&at.format("%Y-%m-%d %H:%M UTC").to_string()),
+            ));
+        }
+        out.push(format!(
+            "{} added, {} removed, {} unchanged",
+            self.value(&report.added.len().to_string()),
+            self.value(&report.removed.len().to_string()),
+            self.value(&report.unchanged_count.to_string()),
+        ));
+
+        if report.added.is_empty() && report.removed.is_empty() {
+            out.push(self.success("No changes since the baseline"));
+            return out.join("\n");
+        }
+
+        if !report.added.is_empty() {
+            out.push(String::new());
+            out.push(self.label("Added:"));
+            for name in &report.added {
+                out.push(format!(
+                    "  {} {}",
+                    self.warning("+"),
+                    self.value(&sanitize_display(name))
+                ));
+            }
+        }
+        if !report.removed.is_empty() {
+            out.push(String::new());
+            // Removals are informational: CT logs are append-mostly, so a
+            // vanished name usually means source flakiness (see baseline.rs).
+            out.push(self.label("Removed (informational — often CT source flakiness):"));
+            for name in &report.removed {
+                out.push(format!(
+                    "  {} {}",
+                    self.dim("-"),
+                    self.dim(&sanitize_display(name))
                 ));
             }
         }

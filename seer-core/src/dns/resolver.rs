@@ -10,6 +10,7 @@
 
 use std::net::IpAddr;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use hickory_resolver::config::{NameServerConfig, ResolveHosts, ResolverConfig, GOOGLE};
@@ -21,6 +22,7 @@ use hickory_resolver::proto::rr::{RData as HickoryRData, RecordType as HickoryRe
 use hickory_resolver::TokioResolver;
 use tracing::{debug, instrument};
 
+use super::nameserver::{NameserverProtocol, NameserverSpec};
 use super::records::{DnsRecord, RecordData, RecordType};
 use crate::error::{Result, SeerError};
 use crate::validation::normalize_domain;
@@ -46,16 +48,15 @@ fn dns_lookup_or_empty<T>(
 /// DNS is typically fast; longer timeouts indicate network issues or unreachable servers.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Standard DNS port for custom-nameserver queries.
-const DNS_PORT: u16 = 53;
-
 /// Build a TokioResolver pre-configured with the given upstream config and
 /// our standard options (timeout, retries, no hosts-file consultation).
 ///
-/// Build only fails when TLS configuration construction fails; we don't
-/// enable TLS features in seer-core so `expect` is safe here and is the
-/// cleanest expression of that invariant.
-fn build_resolver(config: ResolverConfig, timeout: Duration) -> TokioResolver {
+/// Build only fails when hickory cannot construct its rustls TLS context
+/// (needed for DoT/DoH upstreams). With the `webpki-roots` feature supplying
+/// the root store, that construction is infallible in practice, but the
+/// fallible signature is kept honest so a future root-store change degrades
+/// to a typed error instead of a panic.
+fn build_resolver(config: ResolverConfig, timeout: Duration) -> Result<TokioResolver> {
     let mut builder = TokioResolver::builder_with_config(config, TokioRuntimeProvider::default());
     {
         let opts = builder.options_mut();
@@ -65,12 +66,59 @@ fn build_resolver(config: ResolverConfig, timeout: Duration) -> TokioResolver {
     }
     builder
         .build()
-        .expect("hickory resolver build is infallible without TLS features")
+        .map_err(|e| SeerError::DnsError(format!("failed to construct DNS resolver: {}", e)))
+}
+
+/// Build the default (Google DNS over UDP/TCP) resolver.
+///
+/// The `expect` expresses an invariant rather than laziness: with the
+/// `webpki-roots` root store compiled in, hickory's TLS-context construction
+/// (the only fallible step in [`build_resolver`]) cannot fail, and the
+/// infallible `new()`/`with_timeout()` constructors predate DoT/DoH support.
+fn build_default_resolver(timeout: Duration) -> TokioResolver {
+    build_resolver(ResolverConfig::udp_and_tcp(&GOOGLE), timeout)
+        .expect("default resolver build cannot fail with the bundled webpki root store")
+}
+
+/// Build the hickory upstream config for a parsed nameserver spec and its
+/// resolved (and already SSRF-validated) addresses.
+///
+/// One `NameServerConfig` is added per IP, all speaking the spec's protocol
+/// on the spec's port. For DoT/DoH the TLS server name is the spec's host —
+/// the hostname when one was given, or the IP literal itself (verified
+/// against the certificate's IP SANs, which the major public resolvers
+/// carry). `port_override` is the `#[cfg(test)]` mock-server seam and is
+/// always `None` in production.
+fn build_upstream_config(
+    spec: &NameserverSpec,
+    ips: &[IpAddr],
+    port_override: Option<u16>,
+) -> ResolverConfig {
+    let mut config = ResolverConfig::from_parts(None, vec![], vec![]);
+    let port = port_override.unwrap_or(spec.port);
+    for ip in ips {
+        let mut ns = match spec.protocol {
+            NameserverProtocol::Udp => NameServerConfig::udp(*ip),
+            NameserverProtocol::Tls => NameServerConfig::tls(*ip, Arc::from(spec.tls_name())),
+            NameserverProtocol::Https => NameServerConfig::https(
+                *ip,
+                Arc::from(spec.tls_name()),
+                spec.path.as_deref().map(Arc::from),
+            ),
+        };
+        for connection in &mut ns.connections {
+            connection.port = port;
+        }
+        config.add_name_server(ns);
+    }
+    config
 }
 
 /// DNS resolver for querying various record types.
 ///
-/// Uses Google DNS (8.8.8.8) by default, but supports custom nameservers.
+/// Uses Google DNS (8.8.8.8) by default, but supports custom nameservers
+/// over plain UDP, DNS over TLS (`tls://`), and DNS over HTTPS (`https://`)
+/// — see [`NameserverSpec`](super::NameserverSpec) for the accepted forms.
 /// The default resolver is cached and reused across queries to avoid
 /// repeated initialization overhead.
 #[derive(Clone)]
@@ -79,10 +127,11 @@ pub struct DnsResolver {
     /// Cached default resolver (Google DNS). Reused across all queries
     /// that don't specify a custom nameserver.
     default_resolver: TokioResolver,
-    /// Target port for custom-nameserver queries. Always [`DNS_PORT`] in
-    /// production; overridable only through the `#[cfg(test)]` seam so
-    /// mock-server tests can bind an ephemeral local port.
-    port: u16,
+    /// Port override for custom-nameserver queries. Always `None` in
+    /// production (the port comes from the parsed [`NameserverSpec`]);
+    /// settable only through the `#[cfg(test)]` seam so mock-server tests
+    /// can bind an ephemeral local port.
+    port_override: Option<u16>,
     /// When true, skips the SSRF/reserved-IP validation on custom
     /// nameservers so tests can point the resolver at a 127.0.0.1 fixture.
     /// Not settable outside `#[cfg(test)]` builds — production paths always
@@ -109,8 +158,8 @@ impl DnsResolver {
     pub fn new() -> Self {
         Self {
             timeout: DEFAULT_TIMEOUT,
-            default_resolver: build_resolver(ResolverConfig::udp_and_tcp(&GOOGLE), DEFAULT_TIMEOUT),
-            port: DNS_PORT,
+            default_resolver: build_default_resolver(DEFAULT_TIMEOUT),
+            port_override: None,
             allow_private_hosts: false,
         }
     }
@@ -141,7 +190,7 @@ impl DnsResolver {
     /// servers bind ephemeral ports).
     #[cfg(test)]
     pub(crate) fn with_port(mut self, port: u16) -> Self {
-        self.port = port;
+        self.port_override = Some(port);
         self
     }
 
@@ -150,44 +199,52 @@ impl DnsResolver {
     /// The default is 5 seconds, which is sufficient for most DNS queries.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
-        self.default_resolver = build_resolver(ResolverConfig::udp_and_tcp(&GOOGLE), timeout);
+        self.default_resolver = build_default_resolver(timeout);
         self
     }
 
     async fn create_custom_resolver(&self, nameserver: &str) -> Result<TokioResolver> {
+        // Parse the spec first: bare IP/host (UDP), tls:// (DoT), https://
+        // (DoH). Every surface (CLI, REPL, config.toml, py/REST/MCP) funnels
+        // its opaque nameserver string through here, so this one parse gives
+        // all of them every transport.
+        let spec = NameserverSpec::parse(nameserver)?;
+
         // Accept either a literal IP or a hostname. For hostnames, resolve
         // via the default (Google DNS) hickory resolver so we do not depend
         // on the OS resolver — that is the same fallback principle as the
         // SSL probe fix: when the local system resolver is broken (split
         // DNS, broken router, container netns), hickory still reaches the
         // public name servers and the user-supplied authoritative server
-        // is still usable.
-        let ips: Vec<IpAddr> = if let Ok(ip) = nameserver.parse::<IpAddr>() {
+        // is still usable. DoT/DoH hostnames bootstrap-resolve through this
+        // exact same path (the TLS handshake still verifies the hostname).
+        let ips: Vec<IpAddr> = if let Ok(ip) = spec.host.parse::<IpAddr>() {
             vec![ip]
         } else {
             let response = self
                 .default_resolver
-                .lookup_ip(nameserver)
+                .lookup_ip(spec.host.as_str())
                 .await
                 .map_err(|e| {
                     SeerError::DnsError(format!(
                         "failed to resolve nameserver hostname {}: {}",
-                        nameserver, e
+                        spec.host, e
                     ))
                 })?;
             let resolved: Vec<IpAddr> = response.iter().collect();
             if resolved.is_empty() {
                 return Err(SeerError::DnsError(format!(
                     "nameserver {} did not resolve to any addresses",
-                    nameserver
+                    spec.host
                 )));
             }
             resolved
         };
 
         // SSRF protection: reject private/reserved IPs — whether supplied
-        // literally or returned by name resolution. Without this, a
-        // hostname under attacker control could point at internal infra.
+        // literally or returned by name resolution, and identically for
+        // UDP, tls://, and https:// specs. Without this, a hostname under
+        // attacker control could point at internal infra.
         // `allow_private_hosts` is only settable via the `#[cfg(test)]`
         // seam; production builds always validate.
         if !self.allow_private_hosts {
@@ -201,20 +258,10 @@ impl DnsResolver {
             }
         }
 
-        // Build a config with all resolved IPs as upstream nameservers.
-        // In hickory 0.26, NameServerConfig::udp(IpAddr) builds a
-        // ConnectionConfig with the default DNS port (53) for us; `self.port`
-        // only differs from 53 under the `#[cfg(test)]` mock-server seam.
-        let mut config = ResolverConfig::from_parts(None, vec![], vec![]);
-        for ip in ips {
-            let mut ns = NameServerConfig::udp(ip);
-            for connection in &mut ns.connections {
-                connection.port = self.port;
-            }
-            config.add_name_server(ns);
-        }
-
-        Ok(build_resolver(config, self.timeout))
+        build_resolver(
+            build_upstream_config(&spec, &ips, self.port_override),
+            self.timeout,
+        )
     }
 
     /// Resolves DNS records for a domain.
@@ -222,7 +269,10 @@ impl DnsResolver {
     /// # Arguments
     /// * `domain` - The domain name to query
     /// * `record_type` - The type of DNS record to look up (A, AAAA, MX, etc.)
-    /// * `nameserver` - Optional custom nameserver IP; uses Google DNS if None
+    /// * `nameserver` - Optional custom nameserver spec; uses Google DNS if
+    ///   None. Accepts a bare IP/hostname with optional port (UDP),
+    ///   `tls://host[:port]` (DNS over TLS), or `https://host[:port][/path]`
+    ///   (DNS over HTTPS) — see [`NameserverSpec`](super::NameserverSpec)
     #[instrument(skip(self), fields(domain = %domain, record_type = %record_type))]
     pub async fn resolve(
         &self,
@@ -987,6 +1037,212 @@ mod tests {
             "8.8.8.8 must be accepted as a public nameserver, got: {:?}",
             result.err()
         );
+    }
+
+    // --- DoT/DoH: SSRF refusal parity ---------------------------------
+    //
+    // The reserved-IP guard must apply identically to tls:// and https://
+    // specs — an encrypted transport is not a bypass of the SSRF policy.
+
+    #[tokio::test]
+    async fn custom_resolver_rejects_private_ip_for_dot_and_doh() {
+        let r = DnsResolver::new();
+        for reserved in [
+            "tls://127.0.0.1",
+            "tls://192.168.1.1:853",
+            "tls://[::1]",
+            "https://10.0.0.1/dns-query",
+            "https://169.254.169.254",
+            "https://[fd00::1]:443/dns-query",
+        ] {
+            let err = r.create_custom_resolver(reserved).await.unwrap_err();
+            let msg = err.to_string().to_lowercase();
+            assert!(
+                msg.contains("blocked") || msg.contains("reserved"),
+                "reserved spec {} must be rejected, got error: {}",
+                reserved,
+                msg
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn custom_resolver_accepts_public_dot_and_doh_literals() {
+        // Construction (parse → validate → config build) must succeed for
+        // public DoT/DoH IP literals without any network traffic.
+        let r = DnsResolver::new();
+        for spec in ["tls://1.1.1.1", "https://8.8.8.8/dns-query"] {
+            let result = r.create_custom_resolver(spec).await;
+            assert!(
+                result.is_ok(),
+                "{} must be accepted, got: {:?}",
+                spec,
+                result.err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn custom_resolver_rejects_unknown_scheme() {
+        let r = DnsResolver::new();
+        let err = r.create_custom_resolver("ftp://8.8.8.8").await.unwrap_err();
+        assert!(
+            matches!(err, SeerError::InvalidInput(_)),
+            "unknown scheme must be an input error, got: {err:?}"
+        );
+    }
+
+    // --- build_upstream_config: protocol/port/tls-name construction ----
+
+    fn spec(s: &str) -> NameserverSpec {
+        NameserverSpec::parse(s).unwrap_or_else(|e| panic!("{s:?} must parse: {e}"))
+    }
+
+    #[test]
+    fn upstream_config_udp_defaults() {
+        use hickory_resolver::config::ProtocolConfig;
+
+        let ip: IpAddr = "8.8.8.8".parse().unwrap();
+        let config = build_upstream_config(&spec("8.8.8.8"), &[ip], None);
+        let servers = config.name_servers();
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].ip, ip);
+        assert_eq!(servers[0].connections.len(), 1);
+        assert_eq!(servers[0].connections[0].port, 53);
+        assert!(matches!(
+            servers[0].connections[0].protocol,
+            ProtocolConfig::Udp
+        ));
+    }
+
+    #[test]
+    fn upstream_config_udp_explicit_port() {
+        let ip: IpAddr = "9.9.9.9".parse().unwrap();
+        let config = build_upstream_config(&spec("9.9.9.9:5353"), &[ip], None);
+        assert_eq!(config.name_servers()[0].connections[0].port, 5353);
+    }
+
+    #[test]
+    fn upstream_config_tls_sets_protocol_port_and_server_name() {
+        use hickory_resolver::config::ProtocolConfig;
+
+        let ip: IpAddr = "9.9.9.9".parse().unwrap();
+        let config = build_upstream_config(&spec("tls://dns.quad9.net"), &[ip], None);
+        let ns = &config.name_servers()[0];
+        assert_eq!(ns.ip, ip);
+        assert_eq!(ns.connections.len(), 1);
+        assert_eq!(ns.connections[0].port, 853);
+        match &ns.connections[0].protocol {
+            ProtocolConfig::Tls { server_name } => {
+                assert_eq!(&**server_name, "dns.quad9.net");
+            }
+            other => panic!("expected Tls protocol, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn upstream_config_tls_ip_literal_uses_ip_as_server_name() {
+        use hickory_resolver::config::ProtocolConfig;
+
+        let ip: IpAddr = "1.1.1.1".parse().unwrap();
+        let config = build_upstream_config(&spec("tls://1.1.1.1"), &[ip], None);
+        match &config.name_servers()[0].connections[0].protocol {
+            ProtocolConfig::Tls { server_name } => assert_eq!(&**server_name, "1.1.1.1"),
+            other => panic!("expected Tls protocol, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn upstream_config_https_sets_protocol_port_path_and_server_name() {
+        use hickory_resolver::config::ProtocolConfig;
+
+        let ip: IpAddr = "104.16.248.249".parse().unwrap();
+        let config = build_upstream_config(&spec("https://cloudflare-dns.com"), &[ip], None);
+        let ns = &config.name_servers()[0];
+        assert_eq!(ns.connections[0].port, 443);
+        match &ns.connections[0].protocol {
+            ProtocolConfig::Https { server_name, path } => {
+                assert_eq!(&**server_name, "cloudflare-dns.com");
+                assert_eq!(&**path, "/dns-query");
+            }
+            other => panic!("expected Https protocol, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn upstream_config_https_custom_port_and_path() {
+        use hickory_resolver::config::ProtocolConfig;
+
+        let ip: IpAddr = "8.8.8.8".parse().unwrap();
+        let config = build_upstream_config(&spec("https://dns.google:8443/resolve"), &[ip], None);
+        let ns = &config.name_servers()[0];
+        assert_eq!(ns.connections[0].port, 8443);
+        match &ns.connections[0].protocol {
+            ProtocolConfig::Https { server_name, path } => {
+                assert_eq!(&**server_name, "dns.google");
+                assert_eq!(&**path, "/resolve");
+            }
+            other => panic!("expected Https protocol, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn upstream_config_multiple_ips_share_spec() {
+        // A hostname spec resolving to several addresses gets one upstream
+        // per IP, all speaking the same protocol/port/TLS name.
+        use hickory_resolver::config::ProtocolConfig;
+
+        let ips: Vec<IpAddr> = vec![
+            "9.9.9.9".parse().unwrap(),
+            "149.112.112.112".parse().unwrap(),
+        ];
+        let config = build_upstream_config(&spec("tls://dns.quad9.net"), &ips, None);
+        let servers = config.name_servers();
+        assert_eq!(servers.len(), 2);
+        for (ns, expected_ip) in servers.iter().zip(&ips) {
+            assert_eq!(&ns.ip, expected_ip);
+            assert_eq!(ns.connections[0].port, 853);
+            assert!(matches!(
+                &ns.connections[0].protocol,
+                ProtocolConfig::Tls { server_name } if &**server_name == "dns.quad9.net"
+            ));
+        }
+    }
+
+    #[test]
+    fn upstream_config_test_port_override_wins() {
+        // The #[cfg(test)] mock-server seam must override the spec's port.
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let config = build_upstream_config(&spec("127.0.0.1"), &[ip], Some(9999));
+        assert_eq!(config.name_servers()[0].connections[0].port, 9999);
+    }
+
+    // --- Live DoT/DoH queries (opt-in only) ----------------------------
+
+    #[tokio::test]
+    #[ignore = "live network — DoT query against Cloudflare"]
+    async fn live_resolve_over_dot() {
+        let r = DnsResolver::new();
+        let records = r
+            .resolve("example.com", RecordType::A, Some("tls://1.1.1.1"))
+            .await
+            .expect("DoT lookup should succeed");
+        assert!(!records.is_empty(), "expected A records over DoT");
+    }
+
+    #[tokio::test]
+    #[ignore = "live network — DoH query against Cloudflare"]
+    async fn live_resolve_over_doh() {
+        let r = DnsResolver::new();
+        let records = r
+            .resolve(
+                "example.com",
+                RecordType::A,
+                Some("https://cloudflare-dns.com/dns-query"),
+            )
+            .await
+            .expect("DoH lookup should succeed");
+        assert!(!records.is_empty(), "expected A records over DoH");
     }
 
     // --- SRV query validation (integration between helper + resolver) ----

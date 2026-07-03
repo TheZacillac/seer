@@ -179,7 +179,9 @@ enum Commands {
         /// Record type (A, AAAA, MX, TXT, NS, SOA, etc.)
         #[arg(default_value = "A")]
         record_type: String,
-        /// Nameserver to query (e.g., @8.8.8.8)
+        /// Nameserver to query: IP/host[:port] (UDP), tls://host[:port] (DoT),
+        /// or https://host[/path] (DoH) — e.g. 8.8.8.8, tls://1.1.1.1,
+        /// https://cloudflare-dns.com/dns-query
         #[arg(short, long)]
         server: Option<String>,
     },
@@ -234,7 +236,9 @@ enum Commands {
         /// Record type (A, AAAA, MX, NS, TXT, etc.)
         #[arg(default_value = "A")]
         record_type: String,
-        /// Nameserver to query (e.g., @8.8.8.8)
+        /// Nameserver to query: IP/host[:port] (UDP), tls://host[:port] (DoT),
+        /// or https://host[/path] (DoH) — e.g. 8.8.8.8, tls://1.1.1.1,
+        /// https://cloudflare-dns.com/dns-query
         #[arg(short, long)]
         server: Option<String>,
         /// Only show output when records change
@@ -296,9 +300,9 @@ enum Commands {
     Compare {
         /// Domain name to query
         domain: String,
-        /// First nameserver (e.g., 8.8.8.8)
+        /// First nameserver (e.g., 8.8.8.8 or tls://1.1.1.1)
         server_a: String,
-        /// Second nameserver (e.g., 1.1.1.1)
+        /// Second nameserver (e.g., 1.1.1.1 or https://dns.google/dns-query)
         server_b: String,
         /// Record type (A, AAAA, MX, etc.)
         // Trails the required nameservers: clap forbids a defaulted positional
@@ -307,6 +311,11 @@ enum Commands {
         record_type: String,
     },
     /// Enumerate subdomains via Certificate Transparency logs
+    ///
+    /// With --diff, compares the fresh enumeration against the stored
+    /// baseline and exits 1 when NEW names appeared (removals are reported
+    /// but non-fatal — CT logs are append-mostly, so a vanished name usually
+    /// means source flakiness). A first run with no baseline exits 0.
     Subdomains {
         /// Domain to enumerate subdomains for
         domain: String,
@@ -314,6 +323,14 @@ enum Commands {
         /// takeover risk
         #[arg(long)]
         resolve: bool,
+        /// Diff the fresh enumeration against the stored baseline (exits 1
+        /// when new names appeared)
+        #[arg(long, conflicts_with = "resolve")]
+        diff: bool,
+        /// Record the fresh enumeration as the new baseline after reporting
+        /// (usable alone or with --diff)
+        #[arg(long, conflicts_with = "resolve")]
+        record: bool,
     },
     /// Compare two domains side-by-side (registration, DNS, SSL)
     Diff {
@@ -1118,11 +1135,65 @@ async fn execute_command(
                 }
             }
         }
-        Commands::Subdomains { domain, resolve } => {
+        Commands::Subdomains {
+            domain,
+            resolve,
+            diff,
+            record,
+        } => {
             let spinner = Arc::new(display::Spinner::new(&format!(
                 "Enumerating subdomains for {}",
                 domain
             )));
+            if diff || record {
+                // Baseline diff/record pipeline — shared with the REPL via
+                // ops::subdomain_baseline_check so the two surfaces cannot
+                // diverge (mirrors the drift arm above).
+                match ops::subdomain_baseline_check(&domain, record).await {
+                    Ok(outcome) => {
+                        spinner.finish();
+                        if diff {
+                            if outcome.report.baseline_missing {
+                                eprintln!(
+                                    "{} {}",
+                                    "note:".ctp_yellow(),
+                                    ops::no_subdomain_baseline_note(&outcome.result.domain, record)
+                                );
+                            }
+                            if quiet && handle_quiet_output(&outcome.report, &fields) {
+                            } else {
+                                println!(
+                                    "{}",
+                                    formatter.format_subdomain_baseline_diff(&outcome.report)
+                                );
+                            }
+                            // Only ADDED names are material; removals and a
+                            // missing baseline (first run) exit 0.
+                            if outcome.report.has_new_names() {
+                                std::process::exit(1);
+                            }
+                        } else {
+                            // --record alone: plain listing, then confirm the
+                            // baseline write on stderr.
+                            if quiet && handle_quiet_output(&outcome.result, &fields) {
+                            } else {
+                                println!("{}", formatter.format_subdomains(&outcome.result));
+                            }
+                            eprintln!(
+                                "{} recorded subdomain baseline for {} ({} names)",
+                                "note:".ctp_yellow(),
+                                outcome.result.domain,
+                                outcome.result.count
+                            );
+                        }
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        spinner.finish();
+                        emit_error(output_format, &e);
+                    }
+                }
+            }
             let enumerator = seer_core::SubdomainEnumerator::new();
             match enumerator.enumerate(&domain).await {
                 Ok(result) => {

@@ -1,0 +1,17 @@
+---
+source: seer-core/tests/format_snapshots.rs
+assertion_line: 291
+expression: human().format_subdomain_baseline_diff(&fixture_subdomain_baseline_diff())
+---
+
+[1;95mSubdomain diff: example.com[0m
+[37m───────────────────────────[0m
+[1;96mBaseline recorded[0m: [97m2026-06-01 12:00 UTC[0m
+[97m2[0m added, [97m1[0m removed, [97m12[0m unchanged
+
+[1;96mAdded:[0m
+  [1;93m+[0m [97mapi.example.com[0m
+  [1;93m+[0m [97mstaging.example.com[0m
+
+[1;96mRemoved (informational — often CT source flakiness):[0m
+  [90m-[0m [90mold.example.com[0m
