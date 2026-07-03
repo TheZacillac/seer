@@ -367,9 +367,16 @@ mod tests {
             default_bulk_output_path("domains.txt"),
             "domains_results.csv"
         );
+        // Build the expected sibling path through the same Path API so the
+        // separator matches the host OS (Windows joins with `\`, not `/`).
+        let nested = std::path::Path::new("lists").join("domains.csv");
+        let expected = std::path::Path::new("lists")
+            .join("domains_results.csv")
+            .to_string_lossy()
+            .to_string();
         assert_eq!(
-            default_bulk_output_path("/tmp/lists/domains.csv"),
-            "/tmp/lists/domains_results.csv"
+            default_bulk_output_path(&nested.to_string_lossy()),
+            expected
         );
     }
 
