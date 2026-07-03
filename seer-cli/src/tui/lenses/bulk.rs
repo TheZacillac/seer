@@ -6,7 +6,7 @@ use ratatui::widgets::{Paragraph, Row, Table};
 use ratatui::Frame;
 
 use crate::tui::app::SPIN;
-use crate::tui::panes::bulk::{op_domain, BulkState, OPS};
+use crate::tui::panes::bulk::{BulkState, OPS};
 use crate::tui::theme::Theme;
 use crate::tui::widgets::{dot, gauge, panel, scroll_to};
 
@@ -167,7 +167,7 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, bulk: &BulkState, editin
     let header = Row::new(["DOMAIN", "RESULT", "⚑"]).style(Style::default().fg(theme.overlay0));
 
     let body = bulk.rows.iter().enumerate().map(|(i, r)| {
-        let domain = op_domain(&r.operation).to_string();
+        let domain = r.operation.domain().to_string();
         let result_text = if r.success {
             "ok".to_string()
         } else {
@@ -230,7 +230,7 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, bulk: &BulkState, editin
 /// Build the detail view lines for a single result: a header row of facts plus
 /// the error or a pretty-printed JSON dump of the returned data.
 fn detail_lines<'a>(theme: &Theme, r: &seer_core::bulk::BulkResult) -> Vec<Line<'a>> {
-    let domain = op_domain(&r.operation).to_string();
+    let domain = r.operation.domain().to_string();
     let status = if r.success { "ok" } else { "failed" };
     let status_fg = if r.success { theme.green } else { theme.red };
 

@@ -9,10 +9,28 @@
 //!
 //! Candidate generation is pure and unit-tested; only the registration scoring
 //! is async.
+//!
+//! ## DNS presence pre-filter (scoring)
+//!
+//! Most generated candidates are unregistered typos, so before paying for a
+//! full RDAP+WHOIS race on each one, [`score_candidates`] first probes every
+//! candidate with a cheap [`DnsResolver::presence`](crate::dns::DnsResolver::presence)
+//! query and drops the ones that answer `NXDOMAIN` — the same signal the
+//! smart-lookup thin-fallback ladder uses to call an apex unregistered. Only
+//! `Present`/`Unknown` candidates get the full lookup (a failed probe is not
+//! evidence, so it is never skipped).
+//!
+//! Caveat: DNS presence is a cheaper but slightly different signal from a
+//! registry lookup. A registered-but-unresolvable domain only looks `Absent`
+//! via NXDOMAIN, which for a registered name is rare; parked squats are
+//! `Present` and still receive the full lookup. The pre-filter therefore trades
+//! a negligible miss rate for a large reduction in registry queries (a
+//! rate-limit-ban risk against port-43 WHOIS).
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::dns::DnsPresence;
 use crate::domain_info::{DomainInfo, DomainInfoSource};
 use crate::error::Result;
 use crate::lookup::SmartLookup;
@@ -21,6 +39,11 @@ use crate::validation::normalize_domain;
 /// Upper bound on generated candidates, to keep the subsequent network scoring
 /// bounded regardless of label length.
 const MAX_CANDIDATES: usize = 600;
+
+/// Concurrency for the cheap DNS presence pre-filter. DNS probes are far
+/// lighter than a full RDAP+WHOIS race, so we fan them out wider than the
+/// (registry-facing) full-lookup concurrency to keep the pre-filter fast.
+const PREFILTER_CONCURRENCY: usize = 50;
 
 /// Common alternate TLDs used for TLD-swap squats.
 const SWAP_TLDS: &[&str] = &[
@@ -249,18 +272,52 @@ pub fn generate_candidates(domain: &str) -> Vec<ConfusableCandidate> {
     out
 }
 
-/// Scores which `candidates` are registered by looking each up and inspecting
-/// the merged [`DomainInfo`] (a non-`Available` source means registered).
-/// Runs up to `concurrency` lookups at a time.
+/// Whether a candidate survives the DNS presence pre-filter and warrants a
+/// full registry lookup. `Absent` (NXDOMAIN) is treated as unregistered and
+/// dropped; `Unknown` (a failed probe) is not evidence, so it is kept — this
+/// mirrors the smart-lookup thin-fallback ladder's handling of a failed probe.
+fn survives_prefilter(presence: DnsPresence) -> bool {
+    !matches!(presence, DnsPresence::Absent)
+}
+
+/// Scores which `candidates` are registered.
+///
+/// Candidates are first pre-filtered by a cheap DNS presence probe: those that
+/// return `NXDOMAIN` are unregistered and dropped without a registry lookup
+/// (see the module docs). The survivors get a full smart lookup and are kept
+/// when the merged [`DomainInfo`] reports a non-`Available` source.
+///
+/// Returns the ranked registered look-alikes together with the number of
+/// candidates that passed the pre-filter and received a full lookup — the
+/// accurate `candidates_checked` figure for the report.
+///
+/// The full lookups run up to `concurrency` at a time; the pre-filter probes
+/// run at [`PREFILTER_CONCURRENCY`].
 pub async fn score_candidates(
     lookup: &SmartLookup,
     candidates: Vec<ConfusableCandidate>,
     concurrency: usize,
-) -> Vec<RegisteredLookalike> {
+) -> (Vec<RegisteredLookalike>, usize) {
     use futures::stream::{self, StreamExt};
 
     let concurrency = concurrency.max(1);
-    let mut registered: Vec<RegisteredLookalike> = stream::iter(candidates)
+
+    // Pre-filter: probe DNS presence and drop NXDOMAIN candidates before any
+    // registry query. A wider fan-out is fine here — DNS is far cheaper than a
+    // full RDAP+WHOIS race.
+    let prefilter_concurrency = concurrency.max(PREFILTER_CONCURRENCY);
+    let survivors: Vec<ConfusableCandidate> = stream::iter(candidates)
+        .map(|cand| async move {
+            survives_prefilter(lookup.presence(&cand.domain).await).then_some(cand)
+        })
+        .buffer_unordered(prefilter_concurrency)
+        .filter_map(|c| async move { c })
+        .collect()
+        .await;
+
+    let candidates_checked = survivors.len();
+
+    let mut registered: Vec<RegisteredLookalike> = stream::iter(survivors)
         .map(|cand| async move {
             let result = lookup.lookup(&cand.domain).await.ok()?;
             let info = DomainInfo::from_lookup_result(&result);
@@ -288,7 +345,7 @@ pub async fn score_candidates(
         (None, Some(_)) => std::cmp::Ordering::Greater,
         (None, None) => a.domain.cmp(&b.domain),
     });
-    registered
+    (registered, candidates_checked)
 }
 
 /// Generates look-alike candidates for `domain` and scores which are
@@ -301,11 +358,11 @@ pub async fn find_confusables(
     let domain = normalize_domain(domain)?;
     let candidates = generate_candidates(&domain);
     let candidates_generated = candidates.len();
-    let registered = score_candidates(lookup, candidates, concurrency).await;
+    let (registered, candidates_checked) = score_candidates(lookup, candidates, concurrency).await;
     Ok(ConfusableReport {
         domain,
         candidates_generated,
-        candidates_checked: candidates_generated,
+        candidates_checked,
         registered,
     })
 }
@@ -375,5 +432,16 @@ mod tests {
     #[test]
     fn single_label_input_yields_nothing() {
         assert!(generate_candidates("localhost").is_empty());
+    }
+
+    #[test]
+    fn prefilter_drops_only_nxdomain_candidates() {
+        // NXDOMAIN (Absent) is the unregistered signal → drop it. A delegated
+        // apex (Present) and a failed probe (Unknown) both survive to the full
+        // lookup; a failed probe is not evidence, mirroring the smart-lookup
+        // thin-fallback ladder.
+        assert!(!survives_prefilter(DnsPresence::Absent));
+        assert!(survives_prefilter(DnsPresence::Present));
+        assert!(survives_prefilter(DnsPresence::Unknown));
     }
 }

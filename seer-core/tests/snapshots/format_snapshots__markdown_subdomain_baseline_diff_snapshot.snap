@@ -1,0 +1,19 @@
+---
+source: seer-core/tests/format_snapshots.rs
+assertion_line: 296
+expression: markdown().format_subdomain_baseline_diff(&fixture_subdomain_baseline_diff())
+---
+## Subdomain diff: example.com
+
+**Baseline recorded:** 2026-06-01 12:00 UTC
+
+2 added, 1 removed, 12 unchanged.
+
+### Added
+
+- `api.example.com`
+- `staging.example.com`
+
+### Removed (informational — often CT source flakiness)
+
+- `old.example.com`

@@ -41,6 +41,31 @@ impl AvailabilityResult {
     }
 }
 
+/// A prior RDAP attempt handed to [`AvailabilityChecker::check_with_prior`], so
+/// the checker can reuse the smart-lookup race's result instead of re-issuing
+/// the identical query that just ran (and re-hammering a throttling registry).
+pub(crate) enum PriorRdap {
+    /// RDAP returned a response (HTTP 200); reuse it rather than re-querying.
+    /// Boxed because an `RdapResponse` dwarfs the other variants.
+    Response(Box<crate::rdap::RdapResponse>),
+    /// RDAP failed with this error; reuse it rather than re-querying.
+    Failed(crate::error::SeerError),
+    /// No usable RDAP result (e.g. grace-truncated); query fresh.
+    Missing,
+}
+
+/// A prior WHOIS attempt handed to [`AvailabilityChecker::check_with_prior`].
+///
+/// There is no `Response` variant: a successful WHOIS is consumed before the
+/// smart-lookup ever reaches the availability fallback, so the checker only
+/// ever reuses a failed leg or re-queries a genuinely missing one.
+pub(crate) enum PriorWhois {
+    /// WHOIS failed with this error; reuse it rather than re-querying.
+    Failed(crate::error::SeerError),
+    /// No usable WHOIS result (e.g. grace-truncated); query fresh.
+    Missing,
+}
+
 /// Checks domain availability by attempting lookups and interpreting failures.
 #[derive(Debug, Clone)]
 pub struct AvailabilityChecker {
@@ -92,6 +117,57 @@ impl AvailabilityChecker {
                     self.whois_client.lookup(&domain),
                     self.dns_resolver.presence(&domain),
                 );
+                Ok(decide_fallback(
+                    &domain,
+                    &rdap_err,
+                    whois_result,
+                    dns_presence,
+                ))
+            }
+        }
+    }
+
+    /// Like [`check`](Self::check), but reuses protocol outcomes already
+    /// gathered by the caller (the smart-lookup RDAP+WHOIS race), issuing only
+    /// the queries that are genuinely missing or were grace-truncated. The DNS
+    /// presence probe runs exactly as in `check`.
+    ///
+    /// Routing through the same pure deciders (`decide_from_rdap` /
+    /// `decide_fallback`) guarantees an identical verdict to `check` for the
+    /// same protocol outcomes — this path only removes redundant network calls,
+    /// so the two availability ladders stay in lockstep.
+    #[instrument(skip(self, prior_rdap, prior_whois), fields(domain = %domain))]
+    pub(crate) async fn check_with_prior(
+        &self,
+        domain: &str,
+        prior_rdap: PriorRdap,
+        prior_whois: PriorWhois,
+    ) -> Result<AvailabilityResult> {
+        let domain = crate::validation::normalize_domain(domain)?;
+        debug!(domain = %domain, "Checking availability (reusing prior protocol outcomes)");
+
+        // Reuse the prior RDAP result; only re-query when it is truly absent
+        // (grace-truncated), never when it already succeeded or errored.
+        let rdap = match prior_rdap {
+            PriorRdap::Response(r) => Ok(*r),
+            PriorRdap::Failed(e) => Err(e),
+            PriorRdap::Missing => self.rdap_client.lookup_domain(&domain).await,
+        };
+
+        match rdap {
+            Ok(response) => Ok(decide_from_rdap(&domain, response)),
+            Err(rdap_err) => {
+                // Reuse the prior WHOIS result; only re-query when absent. The
+                // DNS presence probe always runs (it is the tie-breaker
+                // `decide_fallback` consults), concurrently with a fresh WHOIS
+                // query when one is needed.
+                let (whois_result, dns_presence) = match prior_whois {
+                    PriorWhois::Failed(e) => (Err(e), self.dns_resolver.presence(&domain).await),
+                    PriorWhois::Missing => tokio::join!(
+                        self.whois_client.lookup(&domain),
+                        self.dns_resolver.presence(&domain),
+                    ),
+                };
                 Ok(decide_fallback(
                     &domain,
                     &rdap_err,
@@ -812,6 +888,48 @@ mod tests {
         let r = decide_fallback("example.test", &rdap_err, Ok(whois), DnsPresence::Unknown);
         assert!(r.available, "RDAP 404 is authoritative over a refusal body");
         assert_eq!(r.confidence, "high");
+        assert_eq!(r.method, "rdap");
+    }
+
+    // --- check_with_prior: reuse without re-querying ------------------
+
+    #[tokio::test]
+    async fn check_with_prior_reuses_rdap_response_without_network() {
+        // A prior successful RDAP response short-circuits to `decide_from_rdap`
+        // with no WHOIS or DNS I/O — proving the in-hand outcome is reused
+        // rather than re-queried, and yielding the same verdict `check` would
+        // for that response.
+        let checker = AvailabilityChecker::new();
+        let rdap = rdap_with(&["active"]);
+        let r = checker
+            .check_with_prior(
+                "example.test",
+                PriorRdap::Response(Box::new(rdap)),
+                PriorWhois::Missing,
+            )
+            .await
+            .expect("prior-response path must not error");
+        assert!(!r.available, "an existing RDAP object means registered");
+        assert_eq!(r.confidence, "high");
+        assert_eq!(r.method, "rdap");
+    }
+
+    #[tokio::test]
+    async fn check_with_prior_reuses_redemption_status_verdict() {
+        // The reused response flows through the identical redemption decision as
+        // `decide_from_rdap`, so a redemption status still drops to medium.
+        let checker = AvailabilityChecker::new();
+        let rdap = rdap_with(&["redemption period"]);
+        let r = checker
+            .check_with_prior(
+                "example.test",
+                PriorRdap::Response(Box::new(rdap)),
+                PriorWhois::Missing,
+            )
+            .await
+            .expect("prior-response path must not error");
+        assert!(!r.available);
+        assert_eq!(r.confidence, "medium");
         assert_eq!(r.method, "rdap");
     }
 }

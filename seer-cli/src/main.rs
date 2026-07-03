@@ -1,4 +1,5 @@
 mod display;
+mod ops;
 mod repl;
 mod tui;
 mod utils;
@@ -50,6 +51,16 @@ fn resolve_progress_mode(
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use seer_core::colors::CatppuccinExt;
 
+/// Severity threshold for `seer watch`'s non-zero exit (`--fail-on`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+#[clap(rename_all = "lowercase")]
+enum FailOn {
+    /// Exit 1 when any issue is reported (warnings or critical)
+    Warning,
+    /// Exit 1 only when critical issues are reported
+    Critical,
+}
+
 const BULK_EXAMPLES: &str = r#"
 Input File Formats:
   Plain text (one domain per line, # for comments):
@@ -71,6 +82,9 @@ Example Usage:
   seer bulk avail domains.txt               # Output: domains_results.csv
   seer bulk info domains.txt                # Output: domains_results.csv
   seer bulk ssl domains.txt                 # Output: domains_results.csv
+  seer bulk posture domains.txt             # Output: domains_results.csv
+  seer bulk confusables domains.txt         # Output: domains_results.csv
+  seer bulk caa domains.txt                 # Output: domains_results.csv
   seer bulk status domains.txt -o out.csv   # Output: out.csv
 
 Example Output (status operation):
@@ -100,6 +114,18 @@ Example Output (info operation):
 Example Output (ssl operation):
   domain,success,subject,issuer,valid_from,valid_until,days_remaining,signature_algorithm,key_type,key_bits,chain_length,san_count,sans,protocol_version,is_valid,duration_ms,error
   example.com,true,CN=*.example.com,"C=US, O=DigiCert Inc, CN=DigiCert Global G2 TLS RSA SHA256 2020 CA1",2024-01-30,2025-03-01,89,sha256WithRSAEncryption,RSA,2048,3,2,*.example.com;example.com,TLS 1.3,true,612,
+
+Example Output (posture operation):
+  domain,success,spf_verdict,spf_all_qualifier,dmarc_verdict,dmarc_policy,mta_sts_verdict,bimi_verdict,dane_verdict,notes,duration_ms,error
+  example.com,true,strict,-,strict,reject,present,absent,absent,,842,
+
+Example Output (confusables operation):
+  domain,success,candidates_generated,candidates_checked,registered_count,registered,duration_ms,error
+  example.com,true,214,180,2,examp1e.com(homoglyph);exampel.com(transposition),9214,
+
+Example Output (caa operation):
+  domain,success,has_policy,effective_domain,issue,issuewild,iodef,wildcard_note,duration_ms,error
+  example.com,true,true,example.com,letsencrypt.org;digicert.com,,mailto:security@example.com,,133,
 "#;
 
 #[derive(Parser)]
@@ -153,7 +179,9 @@ enum Commands {
         /// Record type (A, AAAA, MX, TXT, NS, SOA, etc.)
         #[arg(default_value = "A")]
         record_type: String,
-        /// Nameserver to query (e.g., @8.8.8.8)
+        /// Nameserver to query: IP/host[:port] (UDP), tls://host[:port] (DoT),
+        /// or https://host[/path] (DoH) — e.g. 8.8.8.8, tls://1.1.1.1,
+        /// https://cloudflare-dns.com/dns-query
         #[arg(short, long)]
         server: Option<String>,
     },
@@ -170,8 +198,7 @@ enum Commands {
     /// for programmatic consumption without spreadsheet escaping.
     #[command(after_long_help = BULK_EXAMPLES)]
     Bulk {
-        /// Operation type: lookup, whois, rdap, dig, prop, status, avail, info
-        #[arg(value_name = "OPERATION")]
+        #[arg(value_name = "OPERATION", help = ops::BULK_OP_HELP)]
         operation: String,
 
         /// Input file path (text or CSV format), or `-` to read the domain
@@ -209,7 +236,9 @@ enum Commands {
         /// Record type (A, AAAA, MX, NS, TXT, etc.)
         #[arg(default_value = "A")]
         record_type: String,
-        /// Nameserver to query (e.g., @8.8.8.8)
+        /// Nameserver to query: IP/host[:port] (UDP), tls://host[:port] (DoT),
+        /// or https://host[/path] (DoH) — e.g. 8.8.8.8, tls://1.1.1.1,
+        /// https://cloudflare-dns.com/dns-query
         #[arg(short, long)]
         server: Option<String>,
         /// Only show output when records change
@@ -271,9 +300,9 @@ enum Commands {
     Compare {
         /// Domain name to query
         domain: String,
-        /// First nameserver (e.g., 8.8.8.8)
+        /// First nameserver (e.g., 8.8.8.8 or tls://1.1.1.1)
         server_a: String,
-        /// Second nameserver (e.g., 1.1.1.1)
+        /// Second nameserver (e.g., 1.1.1.1 or https://dns.google/dns-query)
         server_b: String,
         /// Record type (A, AAAA, MX, etc.)
         // Trails the required nameservers: clap forbids a defaulted positional
@@ -282,6 +311,11 @@ enum Commands {
         record_type: String,
     },
     /// Enumerate subdomains via Certificate Transparency logs
+    ///
+    /// With --diff, compares the fresh enumeration against the stored
+    /// baseline and exits 1 when NEW names appeared (removals are reported
+    /// but non-fatal — CT logs are append-mostly, so a vanished name usually
+    /// means source flakiness). A first run with no baseline exits 0.
     Subdomains {
         /// Domain to enumerate subdomains for
         domain: String,
@@ -289,6 +323,14 @@ enum Commands {
         /// takeover risk
         #[arg(long)]
         resolve: bool,
+        /// Diff the fresh enumeration against the stored baseline (exits 1
+        /// when new names appeared)
+        #[arg(long, conflicts_with = "resolve")]
+        diff: bool,
+        /// Record the fresh enumeration as the new baseline after reporting
+        /// (usable alone or with --diff)
+        #[arg(long, conflicts_with = "resolve")]
+        record: bool,
     },
     /// Compare two domains side-by-side (registration, DNS, SSL)
     Diff {
@@ -298,11 +340,19 @@ enum Commands {
         domain_b: String,
     },
     /// Monitor domain watchlist for expiration and health issues
+    ///
+    /// The check-all form (`seer watch` with no action) exits 1 when the
+    /// report contains issues at or above the `--fail-on` threshold
+    /// (default: critical), and 0 otherwise — so it can gate cron jobs and
+    /// CI checks like `drift` does. `add`/`remove`/`list` exit 0 on success.
     Watch {
         /// Subcommand: add, remove, list (or omit to check all)
         action: Option<String>,
         /// Domain for add/remove actions
         domain: Option<String>,
+        /// Severity threshold for a non-zero exit when checking all domains
+        #[arg(long, value_enum, default_value_t = FailOn::Critical)]
+        fail_on: FailOn,
     },
     /// Show lookup history for a domain
     History {
@@ -496,15 +546,7 @@ async fn execute_command(
                 Ok(result) => {
                     spinner.finish();
                     // Record to history (file I/O off the async executor)
-                    let domain_for_history = domain.clone();
-                    let result_for_history = result.clone();
-                    tokio::task::spawn_blocking(move || {
-                        let mut history = seer_core::LookupHistory::load();
-                        history.record(&domain_for_history, result_for_history);
-                        let _ = history.save();
-                    })
-                    .await
-                    .ok();
+                    ops::record_lookup_history(&domain, result.clone()).await;
 
                     if quiet {
                         handle_quiet_output(&result, &fields);
@@ -542,7 +584,7 @@ async fn execute_command(
             }
         }
         Commands::Whois { domain } => {
-            let client = seer_core::WhoisClient::new().with_timeout(config.whois_timeout());
+            let client = seer_core::WhoisClient::from_config(config);
             match client.lookup(&domain).await {
                 Ok(response) => {
                     if quiet {
@@ -557,7 +599,7 @@ async fn execute_command(
             }
         }
         Commands::Rdap { query } => {
-            let client = seer_core::RdapClient::new().with_timeout(config.rdap_timeout());
+            let client = seer_core::RdapClient::from_config(config);
             // Use seer_core::rdap::auto_lookup so the `AS<digits>` route only
             // fires when the remainder is all digits AND the query contains no
             // `.` — otherwise `as1234.io` / `asset.io` would misroute to ASN
@@ -582,7 +624,7 @@ async fn execute_command(
             record_type,
             server,
         } => {
-            let resolver = seer_core::DnsResolver::new().with_timeout(config.dns_timeout());
+            let resolver = seer_core::DnsResolver::from_config(config);
             let rt = parse_record_type(&record_type, output_format);
             let ns = server
                 .as_ref()
@@ -637,7 +679,6 @@ async fn execute_command(
                 seer_core::output::OutputFormat::Markdown => "markdown",
             };
             let progress_mode = resolve_progress_mode(progress, stderr_is_tty, format_str);
-            const MAX_BULK_DOMAINS_CLI: usize = 1000;
 
             // `-` reads a newline/CSV-delimited domain list from stdin so bulk
             // composes with shell pipelines (`grep … | seer bulk status -`).
@@ -673,39 +714,29 @@ async fn execute_command(
                 seer_core::output::OutputFormat::Json | seer_core::output::OutputFormat::Yaml
             );
 
-            let domains = seer_core::bulk::parse_domains_from_file(&content);
-
-            if domains.is_empty() {
-                eprintln!(
-                    "{} No valid domains found in file. Expected format: one domain per line, # for comments, or CSV (first column)",
-                    "Error:".ctp_red()
-                );
-                std::process::exit(1);
-            }
-
-            if domains.len() > MAX_BULK_DOMAINS_CLI {
-                return Err(anyhow::anyhow!(
-                    "Bulk file contains {} domains, maximum is {}",
-                    domains.len(),
-                    MAX_BULK_DOMAINS_CLI
-                ));
-            }
+            let domains = match ops::parse_bulk_domains(&content) {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("{} {}", "Error:".ctp_red(), e);
+                    std::process::exit(1);
+                }
+            };
 
             // Determine output path (also tilde-expanded when supplied)
-            let output_path = output.map(|s| utils::expand_tilde(&s)).unwrap_or_else(|| {
-                let input_path = std::path::Path::new(&file);
-                let stem = input_path.file_stem().unwrap_or_default().to_string_lossy();
-                let parent = input_path.parent().unwrap_or(std::path::Path::new("."));
-                parent
-                    .join(format!("{}_results.csv", stem))
-                    .to_string_lossy()
-                    .to_string()
-            });
+            let output_path = output
+                .map(|s| utils::expand_tilde(&s))
+                .unwrap_or_else(|| ops::default_bulk_output_path(&file));
 
             let rt: seer_core::RecordType = record_type.parse().unwrap_or(seer_core::RecordType::A);
-            let executor = seer_core::BulkExecutor::new()
-                .with_concurrency(config.bulk.concurrency)
-                .with_rate_limit(config.bulk_rate_limit());
+            let executor = seer_core::BulkExecutor::from_config(config);
+
+            let operations = match ops::build_bulk_operations(&operation, &domains, rt) {
+                Ok(operations) => operations,
+                Err(e) => {
+                    eprintln!("{} {}", "Error:".ctp_red(), e);
+                    std::process::exit(1);
+                }
+            };
 
             // Status goes to stderr so it never pollutes a structured stdout stream.
             eprintln!(
@@ -713,59 +744,6 @@ async fn execute_command(
                 domains.len().to_string().ctp_green(),
                 operation.ctp_yellow()
             );
-
-            let operations: Vec<seer_core::bulk::BulkOperation> = match operation.as_str() {
-                "lookup" => domains
-                    .iter()
-                    .map(|d: &String| seer_core::bulk::BulkOperation::Lookup { domain: d.clone() })
-                    .collect(),
-                "whois" => domains
-                    .iter()
-                    .map(|d: &String| seer_core::bulk::BulkOperation::Whois { domain: d.clone() })
-                    .collect(),
-                "rdap" => domains
-                    .iter()
-                    .map(|d: &String| seer_core::bulk::BulkOperation::Rdap { domain: d.clone() })
-                    .collect(),
-                "dig" | "dns" => domains
-                    .iter()
-                    .map(|d: &String| seer_core::bulk::BulkOperation::Dns {
-                        domain: d.clone(),
-                        record_type: rt,
-                    })
-                    .collect(),
-                "propagation" | "prop" => domains
-                    .iter()
-                    .map(|d: &String| seer_core::bulk::BulkOperation::Propagation {
-                        domain: d.clone(),
-                        record_type: rt,
-                    })
-                    .collect(),
-                "status" => domains
-                    .iter()
-                    .map(|d: &String| seer_core::bulk::BulkOperation::Status { domain: d.clone() })
-                    .collect(),
-                "avail" => domains
-                    .iter()
-                    .map(|d: &String| seer_core::bulk::BulkOperation::Avail { domain: d.clone() })
-                    .collect(),
-                "info" => domains
-                    .iter()
-                    .map(|d: &String| seer_core::bulk::BulkOperation::Info { domain: d.clone() })
-                    .collect(),
-                "ssl" => domains
-                    .iter()
-                    .map(|d: &String| seer_core::bulk::BulkOperation::Ssl { domain: d.clone() })
-                    .collect(),
-                _ => {
-                    eprintln!(
-                        "{} Unknown operation: {}. Use: lookup, whois, rdap, dig/dns, prop, status, avail, info, ssl",
-                        "Error:".ctp_red(),
-                        operation
-                    );
-                    std::process::exit(1);
-                }
-            };
 
             let total = operations.len();
 
@@ -786,30 +764,16 @@ async fn execute_command(
                 }
             };
 
-            let callback: Option<seer_core::bulk::ProgressCallback> = pb.as_ref().map(|bar| {
-                let bar = bar.clone();
-                Box::new(move |completed: usize, _total: usize, domain: &str| {
-                    bar.set_position(completed as u64);
-                    bar.set_message(domain.to_string());
-                }) as seer_core::bulk::ProgressCallback
-            });
+            let callback: Option<seer_core::bulk::ProgressCallback> = pb
+                .as_ref()
+                .map(|bar| ops::bar_progress_callback(bar.as_ref()));
 
             let results = executor.execute(operations, callback).await;
 
             // Emit per-item lines according to mode, then clear the bar.
             if let Some(bar) = pb.as_ref() {
                 for r in &results {
-                    let domain = match &r.operation {
-                        seer_core::bulk::BulkOperation::Whois { domain }
-                        | seer_core::bulk::BulkOperation::Rdap { domain }
-                        | seer_core::bulk::BulkOperation::Dns { domain, .. }
-                        | seer_core::bulk::BulkOperation::Propagation { domain, .. }
-                        | seer_core::bulk::BulkOperation::Lookup { domain }
-                        | seer_core::bulk::BulkOperation::Status { domain }
-                        | seer_core::bulk::BulkOperation::Avail { domain }
-                        | seer_core::bulk::BulkOperation::Info { domain }
-                        | seer_core::bulk::BulkOperation::Ssl { domain } => domain.as_str(),
-                    };
+                    let domain = r.operation.domain();
                     match (progress_mode, r.success) {
                         (ProgressMode::Verbose, true) => {
                             bar.println(format!(
@@ -868,7 +832,7 @@ async fn execute_command(
             }
         }
         Commands::Status { domain } => {
-            let client = seer_core::StatusClient::new().with_timeout(config.http_timeout());
+            let client = seer_core::StatusClient::from_config(config);
             match client.check(&domain).await {
                 Ok(response) => {
                     if quiet {
@@ -898,7 +862,7 @@ async fn execute_command(
             }
         }
         Commands::Reverse { ip } => {
-            let resolver = seer_core::DnsResolver::new().with_timeout(config.dns_timeout());
+            let resolver = seer_core::DnsResolver::from_config(config);
             match resolver
                 .resolve(&ip, seer_core::RecordType::PTR, None)
                 .await
@@ -1126,7 +1090,7 @@ async fn execute_command(
             }
         }
         Commands::Ssl { domain } => {
-            let checker = seer_core::SslChecker::new().with_timeout(config.http_timeout());
+            let checker = seer_core::SslChecker::from_config(config);
             match checker.check(&domain).await {
                 Ok(report) => {
                     if quiet && handle_quiet_output(&report, &fields) {
@@ -1171,18 +1135,71 @@ async fn execute_command(
                 }
             }
         }
-        Commands::Subdomains { domain, resolve } => {
+        Commands::Subdomains {
+            domain,
+            resolve,
+            diff,
+            record,
+        } => {
             let spinner = Arc::new(display::Spinner::new(&format!(
                 "Enumerating subdomains for {}",
                 domain
             )));
+            if diff || record {
+                // Baseline diff/record pipeline — shared with the REPL via
+                // ops::subdomain_baseline_check so the two surfaces cannot
+                // diverge (mirrors the drift arm above).
+                match ops::subdomain_baseline_check(&domain, record).await {
+                    Ok(outcome) => {
+                        spinner.finish();
+                        if diff {
+                            if outcome.report.baseline_missing {
+                                eprintln!(
+                                    "{} {}",
+                                    "note:".ctp_yellow(),
+                                    ops::no_subdomain_baseline_note(&outcome.result.domain, record)
+                                );
+                            }
+                            if quiet && handle_quiet_output(&outcome.report, &fields) {
+                            } else {
+                                println!(
+                                    "{}",
+                                    formatter.format_subdomain_baseline_diff(&outcome.report)
+                                );
+                            }
+                            // Only ADDED names are material; removals and a
+                            // missing baseline (first run) exit 0.
+                            if outcome.report.has_new_names() {
+                                std::process::exit(1);
+                            }
+                        } else {
+                            // --record alone: plain listing, then confirm the
+                            // baseline write on stderr.
+                            if quiet && handle_quiet_output(&outcome.result, &fields) {
+                            } else {
+                                println!("{}", formatter.format_subdomains(&outcome.result));
+                            }
+                            eprintln!(
+                                "{} recorded subdomain baseline for {} ({} names)",
+                                "note:".ctp_yellow(),
+                                outcome.result.domain,
+                                outcome.result.count
+                            );
+                        }
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        spinner.finish();
+                        emit_error(output_format, &e);
+                    }
+                }
+            }
             let enumerator = seer_core::SubdomainEnumerator::new();
             match enumerator.enumerate(&domain).await {
                 Ok(result) => {
                     if resolve {
                         spinner.set_message("Resolving and classifying discovered names");
-                        let resolver =
-                            seer_core::DnsResolver::new().with_timeout(config.dns_timeout());
+                        let resolver = seer_core::DnsResolver::from_config(config);
                         let classification = seer_core::classify_subdomains(
                             &resolver,
                             &result.domain,
@@ -1215,60 +1232,22 @@ async fn execute_command(
         Commands::Drift { domain, record } => {
             let spinner = Arc::new(display::Spinner::new(&format!("Looking up {}", domain)));
             let lookup = seer_core::SmartLookup::from_config(config);
-            match lookup.lookup(&domain).await {
-                Ok(result) => {
+            match ops::drift_check(&lookup, &domain, record).await {
+                Ok(outcome) => {
                     spinner.finish();
-                    // Compare the fresh lookup against the most recent stored
-                    // snapshot before (optionally) recording the new one.
-                    let domain_key = domain.clone();
-                    let previous = tokio::task::spawn_blocking(move || {
-                        seer_core::LookupHistory::load()
-                            .get(&domain_key)
-                            .last()
-                            .map(|e| e.result.clone())
-                    })
-                    .await
-                    .ok()
-                    .flatten();
-
-                    let report = match &previous {
-                        Some(prev) => seer_core::DriftReport::from_lookups(&domain, prev, &result),
-                        None => seer_core::DriftReport {
-                            domain: domain.clone(),
-                            changes: Vec::new(),
-                        },
-                    };
-
-                    if record {
-                        let d = domain.clone();
-                        let r = result.clone();
-                        tokio::task::spawn_blocking(move || {
-                            let mut history = seer_core::LookupHistory::load();
-                            history.record(&d, r);
-                            let _ = history.save();
-                        })
-                        .await
-                        .ok();
-                    }
-
-                    if previous.is_none() {
+                    if !outcome.had_previous {
                         eprintln!(
-                            "{} no previous snapshot for {} — {}",
+                            "{} {}",
                             "note:".ctp_yellow(),
-                            domain,
-                            if record {
-                                "recorded a baseline"
-                            } else {
-                                "run with --record to establish a baseline"
-                            }
+                            ops::no_baseline_note(&domain, record)
                         );
                     }
 
-                    if quiet && handle_quiet_output(&report, &fields) {
+                    if quiet && handle_quiet_output(&outcome.report, &fields) {
                     } else {
-                        println!("{}", formatter.format_drift(&report));
+                        println!("{}", formatter.format_drift(&outcome.report));
                     }
-                    if report.has_drift() {
+                    if outcome.report.has_drift() {
                         std::process::exit(1);
                     }
                 }
@@ -1279,7 +1258,7 @@ async fn execute_command(
             }
         }
         Commands::Caa { domain } => {
-            let resolver = seer_core::DnsResolver::new().with_timeout(config.dns_timeout());
+            let resolver = seer_core::DnsResolver::from_config(config);
             match seer_core::normalize_domain(&domain) {
                 Ok(normalized) => {
                     let policy = seer_core::caa::lookup_caa(&resolver, &normalized).await;
@@ -1292,7 +1271,7 @@ async fn execute_command(
             }
         }
         Commands::Posture { domain } => {
-            let resolver = seer_core::DnsResolver::new().with_timeout(config.dns_timeout());
+            let resolver = seer_core::DnsResolver::from_config(config);
             match seer_core::lookup_email_posture(&resolver, &domain).await {
                 Ok(posture) => {
                     if quiet && handle_quiet_output(&posture, &fields) {
@@ -1343,7 +1322,11 @@ async fn execute_command(
                 }
             }
         }
-        Commands::Watch { action, domain } => {
+        Commands::Watch {
+            action,
+            domain,
+            fail_on,
+        } => {
             // Watchlist file I/O is blocking — run it on a blocking thread so it
             // doesn't stall the async runtime (mirrors the History handler).
             let mut watchlist = tokio::task::spawn_blocking(seer_core::Watchlist::load)
@@ -1418,6 +1401,18 @@ async fn execute_command(
                         if quiet && handle_quiet_output(&report, &fields) {
                         } else {
                             println!("{}", formatter.format_watch(&report));
+                        }
+                        // Exit 1 when issues at or above the --fail-on
+                        // threshold exist (mirrors drift/avail/dnssec).
+                        // `warnings` counts every result with issues, so it
+                        // already subsumes the critical ones; the `||` keeps
+                        // the check robust if that tally ever changes.
+                        let should_fail = match fail_on {
+                            FailOn::Critical => report.critical > 0,
+                            FailOn::Warning => report.warnings > 0 || report.critical > 0,
+                        };
+                        if should_fail {
+                            std::process::exit(1);
                         }
                     }
                 }

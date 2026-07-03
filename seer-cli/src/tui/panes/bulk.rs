@@ -1,13 +1,24 @@
 //! Bulk pane component — multi-domain batch operation state + key handling.
 use crossterm::event::{KeyCode, KeyEvent};
-use seer_core::bulk::{BulkOperation, BulkResult};
+use seer_core::bulk::BulkResult;
 
 use crate::tui::action::{Action, BulkParams, EditTarget};
 use crate::tui::panes::PaneOutcome;
 
 /// Operation presets selectable with `o`.
 pub const OPS: &[&str] = &[
-    "lookup", "status", "dig", "avail", "info", "whois", "rdap", "ssl", "prop",
+    "lookup",
+    "status",
+    "dig",
+    "avail",
+    "info",
+    "whois",
+    "rdap",
+    "ssl",
+    "prop",
+    "posture",
+    "confusables",
+    "caa",
 ];
 
 /// State for the Bulk lens — op selection, entered domains, rows, run status.
@@ -184,10 +195,10 @@ impl BulkState {
     /// `escape_csv_field` so the export is RFC 4180 quoted and protected
     /// against spreadsheet formula injection.
     pub fn to_csv(&self) -> String {
-        use crate::utils::{escape_csv_field, get_domain_from_operation};
+        use crate::utils::escape_csv_field;
         let mut out = String::from("domain,success,error,duration_ms\n");
         for r in &self.rows {
-            let domain = escape_csv_field(&get_domain_from_operation(&r.operation));
+            let domain = escape_csv_field(r.operation.domain());
             let err = escape_csv_field(r.error.as_deref().unwrap_or(""));
             out.push_str(&format!(
                 "{},{},{},{}\n",
@@ -198,26 +209,11 @@ impl BulkState {
     }
 }
 
-/// Extract the domain string from a `BulkOperation` (all variants carry one).
-/// Used by the lens renderer for per-row display.
-pub fn op_domain(op: &BulkOperation) -> &str {
-    match op {
-        BulkOperation::Whois { domain }
-        | BulkOperation::Rdap { domain }
-        | BulkOperation::Lookup { domain }
-        | BulkOperation::Status { domain }
-        | BulkOperation::Avail { domain }
-        | BulkOperation::Info { domain }
-        | BulkOperation::Ssl { domain }
-        | BulkOperation::Dns { domain, .. }
-        | BulkOperation::Propagation { domain, .. } => domain.as_str(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use seer_core::bulk::BulkOperation;
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -463,8 +459,29 @@ mod tests {
 
     #[test]
     fn extended_ops_are_available() {
-        for op in ["whois", "rdap", "ssl", "prop"] {
+        for op in [
+            "whois",
+            "rdap",
+            "ssl",
+            "prop",
+            "posture",
+            "confusables",
+            "caa",
+        ] {
             assert!(OPS.contains(&op), "op preset {op} should be selectable");
+        }
+    }
+
+    #[test]
+    fn every_op_preset_is_a_valid_bulk_operation() {
+        // The pane's presets must all map through the shared ops-module
+        // mapping (no preset may silently fall back to `lookup`).
+        for op in OPS {
+            assert!(
+                crate::ops::bulk_operation_for(op, "a.com".into(), seer_core::RecordType::A)
+                    .is_some(),
+                "preset {op} must map to a BulkOperation"
+            );
         }
     }
 
@@ -515,31 +532,6 @@ mod tests {
         assert!(
             csv.contains("\"'=HYPERLINK(\"\"evil\"\")\""),
             "error must be guarded + quoted: {csv}"
-        );
-    }
-
-    #[test]
-    fn op_domain_works_for_all_variants() {
-        use seer_core::RecordType;
-        assert_eq!(
-            op_domain(&BulkOperation::Whois {
-                domain: "a.com".into()
-            }),
-            "a.com"
-        );
-        assert_eq!(
-            op_domain(&BulkOperation::Dns {
-                domain: "b.com".into(),
-                record_type: RecordType::A
-            }),
-            "b.com"
-        );
-        assert_eq!(
-            op_domain(&BulkOperation::Propagation {
-                domain: "c.com".into(),
-                record_type: RecordType::MX
-            }),
-            "c.com"
         );
     }
 }

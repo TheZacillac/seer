@@ -260,3 +260,48 @@ fn human_status_snapshot() {
 fn markdown_status_snapshot() {
     snap!(markdown().format_status(&fixture_status()));
 }
+
+/// A subdomain baseline diff with additions, removals, and unchanged names.
+/// The fixed `baseline_recorded_at` keeps the snapshot deterministic.
+fn fixture_subdomain_baseline_diff() -> seer_core::subdomains::SubdomainBaselineDiff {
+    seer_core::subdomains::SubdomainBaselineDiff {
+        domain: "example.com".into(),
+        baseline_recorded_at: Some("2026-06-01T12:00:00Z".parse().unwrap()),
+        added: vec!["api.example.com".into(), "staging.example.com".into()],
+        removed: vec!["old.example.com".into()],
+        unchanged_count: 12,
+        baseline_missing: false,
+    }
+}
+
+/// First run: no stored baseline to compare against.
+fn fixture_subdomain_baseline_diff_missing() -> seer_core::subdomains::SubdomainBaselineDiff {
+    seer_core::subdomains::SubdomainBaselineDiff {
+        domain: "example.com".into(),
+        baseline_recorded_at: None,
+        added: Vec::new(),
+        removed: Vec::new(),
+        unchanged_count: 0,
+        baseline_missing: true,
+    }
+}
+
+#[test]
+fn human_subdomain_baseline_diff_snapshot() {
+    snap!(human().format_subdomain_baseline_diff(&fixture_subdomain_baseline_diff()));
+}
+
+#[test]
+fn markdown_subdomain_baseline_diff_snapshot() {
+    snap!(markdown().format_subdomain_baseline_diff(&fixture_subdomain_baseline_diff()));
+}
+
+#[test]
+fn human_subdomain_baseline_diff_missing_snapshot() {
+    snap!(human().format_subdomain_baseline_diff(&fixture_subdomain_baseline_diff_missing()));
+}
+
+#[test]
+fn markdown_subdomain_baseline_diff_missing_snapshot() {
+    snap!(markdown().format_subdomain_baseline_diff(&fixture_subdomain_baseline_diff_missing()));
+}

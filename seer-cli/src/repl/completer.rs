@@ -27,19 +27,25 @@ const COMMANDS: &[&str] = &[
     "subdomains",
     "subs",
     "diff",
+    "drift",
+    "caa",
+    "posture",
+    "confusables",
     "watch",
     "history",
     "set",
     "clear",
 ];
 
+// Note: "CAA" here is the DNS record type completed after `dig`/`prop`/etc.,
+// distinct from the lowercase `caa` policy-lookup command in COMMANDS above.
 const RECORD_TYPES: &[&str] = &[
     "A", "AAAA", "CNAME", "MX", "NS", "TXT", "SOA", "PTR", "SRV", "CAA", "DNSKEY", "DS", "ANY",
 ];
 
-const BULK_OPERATIONS: &[&str] = &[
-    "lookup", "whois", "rdap", "dig", "prop", "status", "avail", "info", "ssl",
-];
+/// Bulk operation names come from the shared ops module so the completer can
+/// never drift from what `bulk` actually accepts.
+const BULK_OPERATIONS: &[&str] = crate::ops::BULK_OPS;
 
 const SET_OPTIONS: &[&str] = &["output"];
 
@@ -211,10 +217,16 @@ impl Hinter for SeerCompleter {
                 Some(" <domain> [type] @<server1> @<server2>".to_string())
             }
             "subdomains" | "subs" if words.len() == 1 && line.ends_with(' ') => {
-                Some(" <domain>".to_string())
+                Some(" <domain> [--diff] [--record]".to_string())
             }
             "diff" if words.len() == 1 && line.ends_with(' ') => {
                 Some(" <domain1> <domain2>".to_string())
+            }
+            "drift" if words.len() == 1 && line.ends_with(' ') => {
+                Some(" <domain> [--record]".to_string())
+            }
+            "caa" | "posture" | "confusables" if words.len() == 1 && line.ends_with(' ') => {
+                Some(" <domain>".to_string())
             }
             "watch" if words.len() == 1 && line.ends_with(' ') => {
                 Some(" [add|remove|list] [domain]".to_string())
@@ -249,6 +261,28 @@ mod tests {
         assert!(
             result.is_ok(),
             "completer must not panic on a non-char-boundary cursor"
+        );
+    }
+
+    #[test]
+    fn new_commands_are_completable() {
+        for cmd in ["drift", "caa", "posture", "confusables"] {
+            assert!(COMMANDS.contains(&cmd), "{cmd} should be a known command");
+        }
+        // The lowercase `caa` command must not displace the CAA record type.
+        assert!(RECORD_TYPES.contains(&"CAA"));
+    }
+
+    #[test]
+    fn bulk_completion_offers_new_operations() {
+        let completer = SeerCompleter::new();
+        let history = DefaultHistory::new();
+        let ctx = rustyline::Context::new(&history);
+        let line = "bulk po";
+        let (_, candidates) = completer.complete(line, line.len(), &ctx).expect("ok");
+        assert!(
+            candidates.iter().any(|c| c.replacement == "posture"),
+            "bulk completion should offer posture"
         );
     }
 }

@@ -236,6 +236,22 @@ impl SslChecker {
         }
     }
 
+    /// Builds a checker honoring `~/.seer/config.toml` settings.
+    ///
+    /// Reads `timeouts.http_secs` (clamped to 1–120s by
+    /// [`crate::config::SeerConfig::load`]) for the TCP connect + TLS
+    /// handshake, and `timeouts.dns_secs` (1–60s) for the internal resolver
+    /// used by the parallel CAA lookup. Unlike the coarse
+    /// [`SslChecker::with_timeout`] (which reuses the TLS timeout for DNS),
+    /// this applies each protocol's own configured timeout — matching the
+    /// [`crate::availability::AvailabilityChecker::from_config`] precedent.
+    pub fn from_config(config: &crate::config::SeerConfig) -> Self {
+        Self {
+            dns_resolver: DnsResolver::from_config(config),
+            timeout: config.http_timeout(),
+        }
+    }
+
     /// Sets the timeout for the TCP connect and TLS handshake.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
@@ -526,6 +542,14 @@ mod tests {
     fn test_ssl_checker_creation() {
         let _checker = SslChecker::new();
         let _default_checker = SslChecker::default();
+    }
+
+    #[test]
+    fn from_config_applies_http_timeout() {
+        let mut config = crate::config::SeerConfig::default();
+        config.timeouts.http_secs = 77;
+        let checker = SslChecker::from_config(&config);
+        assert_eq!(checker.timeout, Duration::from_secs(77));
     }
 
     #[test]

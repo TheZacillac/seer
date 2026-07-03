@@ -7,7 +7,7 @@ use crate::caa::CaaPolicy;
 use crate::confusables::ConfusableReport;
 use crate::drift::DriftReport;
 use crate::posture::EmailPosture;
-use crate::subdomains::SubdomainClassification;
+use crate::subdomains::{SubdomainBaselineDiff, SubdomainClassification};
 
 impl MarkdownFormatter {
     pub(super) fn format_drift(&self, report: &DriftReport) -> String {
@@ -25,6 +25,54 @@ impl MarkdownFormatter {
                 MdSafe(c.old.as_deref().unwrap_or("—")),
                 MdSafe(c.new.as_deref().unwrap_or("—")),
             );
+        }
+        out
+    }
+
+    pub(super) fn format_subdomain_baseline_diff(&self, report: &SubdomainBaselineDiff) -> String {
+        let mut out = format!("## Subdomain diff: {}\n\n", MdSafe(&report.domain));
+
+        if report.baseline_missing {
+            // Neutral phrasing: the CLI/REPL note carries the actionable
+            // "--record" hint (it knows whether a baseline was just recorded).
+            out.push_str("_No stored baseline to compare against (first run)._\n");
+            return out;
+        }
+
+        if let Some(at) = report.baseline_recorded_at {
+            let _ = writeln!(
+                out,
+                "**Baseline recorded:** {}\n",
+                at.format("%Y-%m-%d %H:%M UTC")
+            );
+        }
+        let _ = writeln!(
+            out,
+            "{} added, {} removed, {} unchanged.\n",
+            report.added.len(),
+            report.removed.len(),
+            report.unchanged_count
+        );
+
+        if report.added.is_empty() && report.removed.is_empty() {
+            out.push_str("_No changes since the baseline._\n");
+            return out;
+        }
+
+        if !report.added.is_empty() {
+            out.push_str("### Added\n\n");
+            for name in &report.added {
+                let _ = writeln!(out, "- `{}`", MdSafe(name));
+            }
+            out.push('\n');
+        }
+        if !report.removed.is_empty() {
+            // Removals are informational: CT logs are append-mostly, so a
+            // vanished name usually means source flakiness (see baseline.rs).
+            out.push_str("### Removed (informational — often CT source flakiness)\n\n");
+            for name in &report.removed {
+                let _ = writeln!(out, "- `{}`", MdSafe(name));
+            }
         }
         out
     }
@@ -144,6 +192,13 @@ impl MarkdownFormatter {
         if result.wildcard_detected {
             out.push_str(
                 "> ⚠️ Wildcard DNS detected — some \"live\" verdicts may be zone wildcards.\n\n",
+            );
+        }
+        if result.names_skipped > 0 {
+            let _ = writeln!(
+                out,
+                "> ⚠️ {} more names exceeded the classification cap and were not resolved.\n",
+                result.names_skipped
             );
         }
         out.push_str("| Name | Status | CNAME | Takeover risk |\n|---|---|---|---|\n");

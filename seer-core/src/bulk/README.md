@@ -41,6 +41,10 @@ impl BulkExecutor {
     /// Create a new executor with default settings
     pub fn new() -> Self;
 
+    /// Create an executor honoring ~/.seer/config.toml (bulk concurrency,
+    /// rate limit, and per-protocol timeouts on every sub-client)
+    pub fn from_config(config: &SeerConfig) -> Self;
+
     /// Set maximum concurrent operations (default: 10, max: 50)
     pub fn with_concurrency(self, concurrency: usize) -> Self;
 
@@ -61,7 +65,12 @@ impl BulkExecutor {
     pub async fn execute_dns(&self, domains: Vec<String>, record_type: RecordType) -> Vec<BulkResult>;
     pub async fn execute_propagation(&self, domains: Vec<String>, record_type: RecordType) -> Vec<BulkResult>;
     pub async fn execute_status(&self, domains: Vec<String>) -> Vec<BulkResult>;
+    pub async fn execute_avail(&self, domains: Vec<String>) -> Vec<BulkResult>;
+    pub async fn execute_info(&self, domains: Vec<String>) -> Vec<BulkResult>;
     pub async fn execute_ssl(&self, domains: Vec<String>) -> Vec<BulkResult>;
+    pub async fn execute_posture(&self, domains: Vec<String>) -> Vec<BulkResult>;
+    pub async fn execute_confusables(&self, domains: Vec<String>) -> Vec<BulkResult>; // expensive: per-domain candidate scan
+    pub async fn execute_caa(&self, domains: Vec<String>) -> Vec<BulkResult>;
 }
 ```
 
@@ -77,7 +86,12 @@ pub enum BulkOperation {
     Propagation { domain: String, record_type: RecordType },
     Lookup { domain: String },
     Status { domain: String },
+    Avail { domain: String },
+    Info { domain: String },
     Ssl { domain: String },
+    Posture { domain: String },
+    Confusables { domain: String }, // expensive: fans out its own candidate scan per domain
+    Caa { domain: String },
 }
 ```
 
@@ -107,7 +121,12 @@ pub enum BulkResultData {
     Propagation(PropagationResult),
     Lookup(LookupResult),
     Status(StatusResponse),
+    Avail(AvailabilityResult),
+    Info(DomainInfo),
     Ssl(SslReport),
+    Posture(EmailPosture),
+    Confusables(ConfusableReport),
+    Caa(CaaPolicy),
 }
 ```
 

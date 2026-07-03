@@ -69,7 +69,7 @@ where
     // Build file appender layer if enabled
     let (file_layer_json, file_layer_text, file_guard) = if file_enabled {
         let dir = log_dir();
-        std::fs::create_dir_all(&dir).ok();
+        ensure_log_dir(&dir);
         let file_appender = tracing_appender::rolling::daily(&dir, format!("{app_name}.log"));
         let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
@@ -138,6 +138,23 @@ pub fn log_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".arcanum")
         .join("logs")
+}
+
+/// Creates the log directory (best-effort) and restricts it to owner-only
+/// (0700) on Unix. Log files carry internal-IP diagnostic detail that is
+/// deliberately kept out of client-facing errors (e.g. the SSRF guard's
+/// resolved-IP debug lines), so the directory gets the same owner-only
+/// treatment as `~/.seer` (see history.rs / watchlist.rs). Non-unix keeps
+/// platform-default permissions.
+fn ensure_log_dir(dir: &std::path::Path) {
+    let _ = std::fs::create_dir_all(dir);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // Also tightens a pre-existing directory created by older versions
+        // with default permissions.
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    }
 }
 
 // ---- internal helpers ----
@@ -266,5 +283,40 @@ mod tests {
             let filter = build_env_filter("error");
             assert_eq!(format!("{}", filter), "warn");
         });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn test_ensure_log_dir_sets_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir =
+            std::env::temp_dir().join(format!("seer-ensure-log-dir-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Fresh directory must come out owner-only.
+        super::ensure_log_dir(&dir);
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o700,
+            "fresh log dir must be owner-only, got {:o}",
+            mode & 0o777
+        );
+
+        // A pre-existing directory with loose permissions (e.g. created by an
+        // older version with defaults) must be tightened, not left as-is.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        super::ensure_log_dir(&dir);
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o700,
+            "pre-existing log dir must be tightened to owner-only, got {:o}",
+            mode & 0o777
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

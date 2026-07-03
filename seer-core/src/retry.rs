@@ -150,8 +150,9 @@ impl RetryClassifier for NetworkRetryClassifier {
             SeerError::WhoisConnectionFailed(_) => true,
             SeerError::RateLimited(_) => true,
 
-            // Reqwest errors need deeper inspection
-            SeerError::ReqwestError(e) => is_transient_reqwest_error(e),
+            // Transiency was already classified at the From<reqwest::Error>
+            // boundary (see error.rs); just read the stored flag.
+            SeerError::ReqwestError { transient, .. } => *transient,
 
             // WHOIS errors might be transient if they're connection-related
             SeerError::WhoisError(msg) => {
@@ -213,41 +214,6 @@ impl RetryClassifier for NetworkRetryClassifier {
             SeerError::Other(_) => false,
         }
     }
-}
-
-/// Checks if a reqwest error is transient and worth retrying.
-fn is_transient_reqwest_error(error: &reqwest::Error) -> bool {
-    // Connection errors are transient
-    if error.is_connect() {
-        return true;
-    }
-
-    // Timeout errors are transient
-    if error.is_timeout() {
-        return true;
-    }
-
-    // Check HTTP status codes
-    if let Some(status) = error.status() {
-        // 429 Too Many Requests - rate limited, retry with backoff
-        if status.as_u16() == 429 {
-            return true;
-        }
-        // 5xx Server errors are transient
-        if status.is_server_error() {
-            return true;
-        }
-        // 4xx Client errors (except 429) are not retryable
-        return false;
-    }
-
-    // Request/body errors are generally not retryable
-    if error.is_request() || error.is_body() {
-        return false;
-    }
-
-    // Default: assume transient for unknown errors
-    true
 }
 
 /// Executes operations with retry logic using exponential backoff.
@@ -423,6 +389,21 @@ mod tests {
     fn test_classifier_rate_limited_is_retryable() {
         let classifier = NetworkRetryClassifier::new();
         assert!(classifier.is_retryable(&SeerError::RateLimited("test".to_string())));
+    }
+
+    #[test]
+    fn test_classifier_reads_reqwest_transient_flag() {
+        // Transiency is classified once at the From<reqwest::Error> boundary
+        // (tested in error.rs); the classifier only reads the stored flag.
+        let classifier = NetworkRetryClassifier::new();
+        assert!(classifier.is_retryable(&SeerError::ReqwestError {
+            message: "HTTP status server error (503 Service Unavailable)".to_string(),
+            transient: true,
+        }));
+        assert!(!classifier.is_retryable(&SeerError::ReqwestError {
+            message: "HTTP status client error (404 Not Found)".to_string(),
+            transient: false,
+        }));
     }
 
     #[tokio::test]

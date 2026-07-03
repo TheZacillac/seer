@@ -62,6 +62,10 @@ pub trait OutputFormatter {
         &self,
         result: &crate::subdomains::SubdomainClassification,
     ) -> String;
+    fn format_subdomain_baseline_diff(
+        &self,
+        report: &crate::subdomains::SubdomainBaselineDiff,
+    ) -> String;
 }
 
 /// YAML output formatter that converts data structures to YAML format.
@@ -157,6 +161,12 @@ impl OutputFormatter for YamlFormatter {
         result: &crate::subdomains::SubdomainClassification,
     ) -> String {
         self.to_yaml_value(result)
+    }
+    fn format_subdomain_baseline_diff(
+        &self,
+        report: &crate::subdomains::SubdomainBaselineDiff,
+    ) -> String {
+        self.to_yaml_value(report)
     }
 }
 

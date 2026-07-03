@@ -9,9 +9,12 @@ use tokio::time::{sleep_until, Instant as TokioInstant};
 use tracing::{debug, info, instrument};
 
 use crate::availability::{AvailabilityChecker, AvailabilityResult};
+use crate::caa::CaaPolicy;
+use crate::confusables::ConfusableReport;
 use crate::dns::{DnsRecord, DnsResolver, PropagationChecker, PropagationResult, RecordType};
 use crate::error::Result;
 use crate::lookup::{LookupResult, SmartLookup};
+use crate::posture::EmailPosture;
 use crate::rdap::{RdapClient, RdapResponse};
 use crate::ssl::{SslChecker, SslReport};
 use crate::status::{StatusClient, StatusResponse};
@@ -60,6 +63,46 @@ pub enum BulkOperation {
     Ssl {
         domain: String,
     },
+    /// Email/DNS security posture (SPF, DMARC, MTA-STS, BIMI, DANE).
+    Posture {
+        domain: String,
+    },
+    /// Registered look-alike (confusable) scan.
+    ///
+    /// EXPENSIVE relative to the other operations: each domain fans out its
+    /// own candidate generation, a DNS presence pre-filter over every
+    /// candidate, and a full smart lookup per surviving candidate. A batch of
+    /// N domains therefore multiplies into N independent candidate scans —
+    /// budget bulk sizes accordingly. Dispatch is throttled only by the
+    /// executor's existing semaphore/rate limiter (deliberately no extra
+    /// per-op limiting).
+    Confusables {
+        domain: String,
+    },
+    /// CAA (Certification Authority Authorization) policy lookup.
+    Caa {
+        domain: String,
+    },
+}
+
+impl BulkOperation {
+    /// Returns the domain this operation targets, regardless of variant.
+    pub fn domain(&self) -> &str {
+        match self {
+            Self::Whois { domain }
+            | Self::Rdap { domain }
+            | Self::Dns { domain, .. }
+            | Self::Propagation { domain, .. }
+            | Self::Lookup { domain }
+            | Self::Status { domain }
+            | Self::Avail { domain }
+            | Self::Info { domain }
+            | Self::Ssl { domain }
+            | Self::Posture { domain }
+            | Self::Confusables { domain }
+            | Self::Caa { domain } => domain,
+        }
+    }
 }
 
 /// The data returned from a bulk operation (varies by operation type).
@@ -75,6 +118,9 @@ pub enum BulkResultData {
     Avail(AvailabilityResult),
     Info(crate::domain_info::DomainInfo),
     Ssl(SslReport),
+    Posture(EmailPosture),
+    Confusables(ConfusableReport),
+    Caa(CaaPolicy),
 }
 
 /// Result of a single operation within a bulk execution.
@@ -122,6 +168,28 @@ impl BulkExecutor {
             availability_checker: AvailabilityChecker::new(),
             ssl_checker: SslChecker::new(),
         }
+    }
+
+    /// Builds an executor honoring `~/.seer/config.toml` settings.
+    ///
+    /// Reads `bulk.concurrency` (clamped to 1–50) and `bulk.rate_limit_ms`
+    /// for dispatch pacing, plus every per-protocol timeout
+    /// (`timeouts.whois_secs` / `rdap_secs` / `dns_secs` / `http_secs`) for
+    /// the internal sub-clients. The propagation checker deliberately keeps
+    /// its own tuned timeouts (30-server fan-out has different latency
+    /// characteristics than a single query).
+    pub fn from_config(config: &crate::config::SeerConfig) -> Self {
+        let mut executor = Self::new()
+            .with_concurrency(config.bulk.concurrency)
+            .with_rate_limit(config.bulk_rate_limit());
+        executor.whois_client = WhoisClient::from_config(config);
+        executor.rdap_client = RdapClient::from_config(config);
+        executor.dns_resolver = DnsResolver::from_config(config);
+        executor.smart_lookup = SmartLookup::from_config(config);
+        executor.status_client = StatusClient::from_config(config);
+        executor.availability_checker = AvailabilityChecker::from_config(config);
+        executor.ssl_checker = SslChecker::from_config(config);
+        executor
     }
 
     pub fn with_concurrency(mut self, concurrency: usize) -> Self {
@@ -204,6 +272,7 @@ impl BulkExecutor {
                 let status_client = &self.status_client;
                 let availability_checker = &self.availability_checker;
                 let ssl_checker = &self.ssl_checker;
+                let confusables_concurrency = self.concurrency;
 
                 async move {
                     // Rate-limited dispatch: claim our slot quickly under the
@@ -235,6 +304,7 @@ impl BulkExecutor {
                             status: status_client,
                             avail: availability_checker,
                             ssl: ssl_checker,
+                            confusables_concurrency,
                         },
                     )
                     .await;
@@ -243,25 +313,14 @@ impl BulkExecutor {
                     let count = completed.fetch_add(1, Ordering::Relaxed) + 1;
 
                     if let Some(progress) = progress {
-                        let desc = match &op {
-                            BulkOperation::Whois { domain }
-                            | BulkOperation::Rdap { domain }
-                            | BulkOperation::Dns { domain, .. }
-                            | BulkOperation::Propagation { domain, .. }
-                            | BulkOperation::Lookup { domain }
-                            | BulkOperation::Status { domain }
-                            | BulkOperation::Avail { domain }
-                            | BulkOperation::Info { domain }
-                            | BulkOperation::Ssl { domain } => domain.as_str(),
-                        };
-                        progress(count, total, desc);
+                        progress(count, total, op.domain());
                     }
 
                     let bulk_result = match result {
                         Ok(data) => BulkResult {
                             operation: op,
                             success: true,
-                            data: Some(data),
+                            data: Some(trim_result_data(data)),
                             error: None,
                             duration_ms,
                         },
@@ -393,6 +452,52 @@ impl BulkExecutor {
             .collect();
         self.execute(operations, None).await
     }
+
+    pub async fn execute_posture(&self, domains: Vec<String>) -> Vec<BulkResult> {
+        let operations = domains
+            .into_iter()
+            .map(|domain| BulkOperation::Posture { domain })
+            .collect();
+        self.execute(operations, None).await
+    }
+
+    /// Bulk look-alike scan. See [`BulkOperation::Confusables`] for the cost
+    /// caveat — each domain fans out its own candidate scan.
+    pub async fn execute_confusables(&self, domains: Vec<String>) -> Vec<BulkResult> {
+        let operations = domains
+            .into_iter()
+            .map(|domain| BulkOperation::Confusables { domain })
+            .collect();
+        self.execute(operations, None).await
+    }
+
+    pub async fn execute_caa(&self, domains: Vec<String>) -> Vec<BulkResult> {
+        let operations = domains
+            .into_iter()
+            .map(|domain| BulkOperation::Caa { domain })
+            .collect();
+        self.execute(operations, None).await
+    }
+}
+
+/// Trims retained raw WHOIS bodies before a result enters the buffered vec.
+///
+/// `WhoisResponse.raw_response` is `#[serde(skip_serializing)]`, so no bulk
+/// output path (JSON/YAML/CSV) ever emits it — the truncation is invisible
+/// to consumers. Without it, each Whois/Lookup result can retain up to 1 MB
+/// of raw body (the WHOIS client's response cap), which an adversarial batch
+/// could inflate to ~1 GB at the CLI's 1000-domain cap.
+fn trim_result_data(data: BulkResultData) -> BulkResultData {
+    match data {
+        BulkResultData::Whois(mut whois) => {
+            crate::lookup::trim_whois_raw(&mut whois);
+            BulkResultData::Whois(whois)
+        }
+        BulkResultData::Lookup(result) => {
+            BulkResultData::Lookup(crate::lookup::trim_raw_response(result))
+        }
+        other => other,
+    }
 }
 
 struct Clients<'a> {
@@ -404,6 +509,10 @@ struct Clients<'a> {
     status: &'a StatusClient,
     avail: &'a AvailabilityChecker,
     ssl: &'a SslChecker,
+    /// Per-domain fan-out width for the confusables candidate scan
+    /// (mirrors the executor's own concurrency, like the CLI's single-domain
+    /// command uses `bulk.concurrency`).
+    confusables_concurrency: usize,
 }
 
 async fn execute_operation(op: &BulkOperation, clients: &Clients<'_>) -> Result<BulkResultData> {
@@ -451,6 +560,28 @@ async fn execute_operation(op: &BulkOperation, clients: &Clients<'_>) -> Result<
         BulkOperation::Ssl { domain } => {
             let result = clients.ssl.check(domain).await?;
             Ok(BulkResultData::Ssl(result))
+        }
+        BulkOperation::Posture { domain } => {
+            let result = crate::posture::lookup_email_posture(clients.dns, domain).await?;
+            Ok(BulkResultData::Posture(result))
+        }
+        BulkOperation::Confusables { domain } => {
+            let result = crate::confusables::find_confusables(
+                clients.lookup,
+                domain,
+                clients.confusables_concurrency,
+            )
+            .await?;
+            Ok(BulkResultData::Confusables(result))
+        }
+        BulkOperation::Caa { domain } => {
+            // lookup_caa itself never fails (CAA is advisory; resolver errors
+            // yield an empty policy) but expects a normalized domain — the
+            // same normalize-then-query shape the CLI's single-domain command
+            // uses, so an invalid domain still surfaces as a per-row error.
+            let domain = crate::validation::normalize_domain(domain)?;
+            let policy = crate::caa::lookup_caa(clients.dns, &domain).await;
+            Ok(BulkResultData::Caa(policy))
         }
     }
 }
@@ -589,6 +720,146 @@ csv,format,example.org
     fn is_csv_header_row_rejects_non_keyword() {
         assert!(!is_csv_header_row("example"));
         assert!(!is_csv_header_row("mydata"));
+    }
+
+    #[test]
+    fn bulk_operation_domain_returns_domain_for_every_variant() {
+        let d = "example.com".to_string();
+        let ops = vec![
+            BulkOperation::Whois { domain: d.clone() },
+            BulkOperation::Rdap { domain: d.clone() },
+            BulkOperation::Dns {
+                domain: d.clone(),
+                record_type: RecordType::A,
+            },
+            BulkOperation::Propagation {
+                domain: d.clone(),
+                record_type: RecordType::A,
+            },
+            BulkOperation::Lookup { domain: d.clone() },
+            BulkOperation::Status { domain: d.clone() },
+            BulkOperation::Avail { domain: d.clone() },
+            BulkOperation::Info { domain: d.clone() },
+            BulkOperation::Ssl { domain: d.clone() },
+            BulkOperation::Posture { domain: d.clone() },
+            BulkOperation::Confusables { domain: d.clone() },
+            BulkOperation::Caa { domain: d.clone() },
+        ];
+        for op in &ops {
+            assert_eq!(op.domain(), "example.com", "variant {:?}", op);
+        }
+    }
+
+    /// The serde tags on the new variants are part of the public bulk API
+    /// (REST/MCP consumers match on `type` / `result_type`); pin them.
+    #[test]
+    fn new_bulk_variants_serialize_with_snake_case_tags() {
+        let op = BulkOperation::Posture {
+            domain: "example.com".to_string(),
+        };
+        let json = serde_json::to_string(&op).expect("serialize Posture op");
+        assert!(json.contains(r#""type":"posture""#), "got: {json}");
+
+        let op = BulkOperation::Confusables {
+            domain: "example.com".to_string(),
+        };
+        let json = serde_json::to_string(&op).expect("serialize Confusables op");
+        assert!(json.contains(r#""type":"confusables""#), "got: {json}");
+
+        let op = BulkOperation::Caa {
+            domain: "example.com".to_string(),
+        };
+        let json = serde_json::to_string(&op).expect("serialize Caa op");
+        assert!(json.contains(r#""type":"caa""#), "got: {json}");
+
+        let data = BulkResultData::Caa(CaaPolicy::empty());
+        let json = serde_json::to_string(&data).expect("serialize Caa result");
+        assert!(json.contains(r#""result_type":"caa""#), "got: {json}");
+    }
+
+    /// The three new arms must surface an invalid domain as a per-row failure
+    /// (success=false, sanitized error) instead of panicking or hanging.
+    /// Fully offline: normalization rejects the input before any I/O.
+    #[tokio::test]
+    async fn new_bulk_arms_fail_cleanly_on_invalid_domain() {
+        let executor = BulkExecutor::new().with_rate_limit(Duration::ZERO);
+        let bad = "not a domain".to_string();
+
+        for (name, results) in [
+            ("posture", executor.execute_posture(vec![bad.clone()]).await),
+            (
+                "confusables",
+                executor.execute_confusables(vec![bad.clone()]).await,
+            ),
+            ("caa", executor.execute_caa(vec![bad.clone()]).await),
+        ] {
+            assert_eq!(results.len(), 1, "{name}: expected one result");
+            let r = &results[0];
+            assert!(!r.success, "{name}: expected failure for invalid domain");
+            assert!(r.data.is_none(), "{name}: expected no data on failure");
+            let err = r.error.as_deref().unwrap_or("");
+            assert!(!err.is_empty(), "{name}: expected non-empty error");
+            assert_eq!(r.operation.domain(), "not a domain", "{name}");
+        }
+    }
+
+    /// `from_config` must apply bulk pacing settings and clamp concurrency
+    /// through the same builder path as manual construction.
+    #[test]
+    fn from_config_applies_bulk_settings() {
+        let mut config = crate::config::SeerConfig::default();
+        config.bulk.concurrency = 25;
+        config.bulk.rate_limit_ms = 250;
+
+        let executor = BulkExecutor::from_config(&config);
+        assert_eq!(executor.concurrency, 25);
+        assert_eq!(executor.rate_limit_delay, Duration::from_millis(250));
+
+        // Out-of-range concurrency is clamped by the builder (defense in
+        // depth on top of SeerConfig::load's own clamping).
+        config.bulk.concurrency = 500;
+        let executor = BulkExecutor::from_config(&config);
+        assert_eq!(executor.concurrency, 50);
+    }
+
+    /// An oversized WHOIS raw_response must come out truncated when the
+    /// result enters the buffer (`trim_result_data` runs on every Ok result
+    /// in `execute_inner`). 32 KB cap + marker — see lookup::trim_whois_raw.
+    #[test]
+    fn bulk_whois_oversized_raw_response_is_truncated() {
+        const MAX_RAW: usize = 32 * 1024;
+        let raw = "a".repeat(MAX_RAW + 1000);
+        let whois = WhoisResponse::parse("example.com", "whois.example.com", &raw);
+        assert!(whois.raw_response.len() > MAX_RAW);
+
+        let trimmed = trim_result_data(BulkResultData::Whois(whois));
+        let BulkResultData::Whois(whois) = trimmed else {
+            panic!("expected Whois variant");
+        };
+        assert!(
+            whois.raw_response.len() <= MAX_RAW + "\n... [truncated]".len(),
+            "raw_response not bounded: {} bytes",
+            whois.raw_response.len()
+        );
+        assert!(whois.raw_response.ends_with("[truncated]"));
+    }
+
+    #[test]
+    fn bulk_lookup_oversized_raw_response_is_truncated() {
+        const MAX_RAW: usize = 32 * 1024;
+        let raw = "a".repeat(MAX_RAW + 1000);
+        let whois = WhoisResponse::parse("example.com", "whois.example.com", &raw);
+
+        let trimmed = trim_result_data(BulkResultData::Lookup(LookupResult::Whois {
+            data: whois,
+            rdap_error: None,
+            rdap_fallback: None,
+        }));
+        let BulkResultData::Lookup(LookupResult::Whois { data, .. }) = trimmed else {
+            panic!("expected Lookup(Whois) variant");
+        };
+        assert!(data.raw_response.len() <= MAX_RAW + "\n... [truncated]".len());
+        assert!(data.raw_response.ends_with("[truncated]"));
     }
 
     /// Regression test for the v0.26.7 rate-limiter regression. The

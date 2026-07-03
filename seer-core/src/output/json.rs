@@ -121,6 +121,13 @@ impl OutputFormatter for JsonFormatter {
     ) -> String {
         self.to_json(result)
     }
+
+    fn format_subdomain_baseline_diff(
+        &self,
+        report: &crate::subdomains::SubdomainBaselineDiff,
+    ) -> String {
+        self.to_json(report)
+    }
 }
 
 #[cfg(test)]

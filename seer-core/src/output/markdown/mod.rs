@@ -321,6 +321,12 @@ impl OutputFormatter for MarkdownFormatter {
     ) -> String {
         self.format_subdomain_classification(result)
     }
+    fn format_subdomain_baseline_diff(
+        &self,
+        report: &crate::subdomains::SubdomainBaselineDiff,
+    ) -> String {
+        self.format_subdomain_baseline_diff(report)
+    }
 }
 
 #[cfg(test)]

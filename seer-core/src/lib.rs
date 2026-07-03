@@ -63,7 +63,8 @@ pub use posture::{
 };
 pub use ssl::{CertDetail, CertWarning, CertWarningSeverity, SslChecker, SslReport};
 pub use subdomains::{
-    classify_subdomains, ClassifiedSubdomain, SubdomainClassification, SubdomainEnumerator,
-    SubdomainResult, SubdomainStatus,
+    classify_subdomains, ClassifiedSubdomain, SubdomainBaseline, SubdomainBaselineDiff,
+    SubdomainBaselines, SubdomainClassification, SubdomainEnumerator, SubdomainResult,
+    SubdomainStatus,
 };
 pub use watchlist::{check_watchlist, WatchReport, WatchResult, Watchlist};

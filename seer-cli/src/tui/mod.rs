@@ -149,32 +149,21 @@ async fn run_loop(terminal: &mut Term, domain: Option<String>) -> Result<()> {
     Ok(())
 }
 
-/// Execute a side-effecting Action returned by `App::update`.
-/// Build the bulk operation list for a TUI op preset. `dig`/`prop` default to
-/// an `A` record (matching the previous behaviour); unknown ops fall back to
-/// the smart lookup.
+/// Build the bulk operation list for a TUI op preset via the shared
+/// `ops::bulk_operation_for` mapping (so new operations land here for free).
+/// `dig`/`prop` default to an `A` record (matching the previous behaviour);
+/// unknown presets fall back to the smart lookup.
 fn build_bulk_operations(op: &str, domains: Vec<String>) -> Vec<seer_core::bulk::BulkOperation> {
-    use seer_core::bulk::BulkOperation;
     use seer_core::RecordType;
+    // Resolve the preset once (with a throwaway domain); unknown → "lookup".
+    let op = if crate::ops::bulk_operation_for(op, String::new(), RecordType::A).is_some() {
+        op
+    } else {
+        "lookup"
+    };
     domains
         .into_iter()
-        .map(|domain| match op {
-            "status" => BulkOperation::Status { domain },
-            "dig" => BulkOperation::Dns {
-                domain,
-                record_type: RecordType::A,
-            },
-            "avail" => BulkOperation::Avail { domain },
-            "info" => BulkOperation::Info { domain },
-            "whois" => BulkOperation::Whois { domain },
-            "rdap" => BulkOperation::Rdap { domain },
-            "ssl" => BulkOperation::Ssl { domain },
-            "prop" => BulkOperation::Propagation {
-                domain,
-                record_type: RecordType::A,
-            },
-            _ => BulkOperation::Lookup { domain },
-        })
+        .filter_map(|domain| crate::ops::bulk_operation_for(op, domain, RecordType::A))
         .collect()
 }
 
@@ -203,6 +192,7 @@ fn spawn_bulk_run(
     handle.abort_handle()
 }
 
+/// Execute a side-effecting Action returned by `App::update`.
 fn handle_action(
     action: Action,
     tx: &tokio::sync::mpsc::UnboundedSender<Msg>,

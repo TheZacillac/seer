@@ -16,7 +16,7 @@ use super::bootstrap::{
 use super::types::RdapResponse;
 use crate::error::{Result, SeerError};
 use crate::retry::{NetworkRetryClassifier, RetryClassifier, RetryExecutor, RetryPolicy};
-use crate::validation::{describe_reserved_ip, normalize_domain};
+use crate::validation::normalize_domain;
 
 const IANA_BOOTSTRAP_DNS: &str = "https://data.iana.org/rdap/dns.json";
 const IANA_BOOTSTRAP_IPV4: &str = "https://data.iana.org/rdap/ipv4.json";
@@ -43,8 +43,9 @@ const BOOTSTRAP_REFRESH_MIN_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Shared HTTP client for bootstrap fetches against IANA.
 /// The bootstrap targets are hardcoded data.iana.org URLs, so this client
-/// does not need DNS-rebinding protection. Per-query RDAP requests build
-/// their own short-lived client that pins resolved IPs.
+/// does not need DNS-rebinding protection. Per-query RDAP requests use
+/// per-host clients that pin validated resolved IPs, cached briefly in
+/// [`PINNED_CLIENT_CACHE`].
 ///
 /// Wrapped in `Option` so a reqwest builder failure surfaces as a typed
 /// `SeerError::HttpError` via `rdap_http_client()` instead of a process
@@ -198,6 +199,16 @@ impl RdapClient {
             timeout: DEFAULT_TIMEOUT,
             allow_reserved: false,
         }
+    }
+
+    /// Builds a client honoring `~/.seer/config.toml` settings.
+    ///
+    /// Reads `timeouts.rdap_secs` (already clamped to 1–300s by
+    /// [`crate::config::SeerConfig::load`]). Sugar over
+    /// [`RdapClient::with_timeout`] — equivalent to
+    /// `RdapClient::new().with_timeout(config.rdap_timeout())`.
+    pub fn from_config(config: &crate::config::SeerConfig) -> Self {
+        Self::new().with_timeout(config.rdap_timeout())
     }
 
     /// Sets the per-request timeout for RDAP queries.
@@ -580,67 +591,61 @@ const MAX_RDAP_RESPONSE_SIZE: usize = 10 * 1024 * 1024;
 /// cap also stops a hostile/misconfigured header from pinning the client.
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(5);
 
-/// Validates that a URL does not resolve to a reserved/private IP address (SSRF protection).
+/// Parses an RDAP URL and enforces the https-only scheme, returning the
+/// (unbracketed) host and effective port.
 ///
-/// Returns the full list of resolved `SocketAddr`s so the caller can pin them on a
-/// per-request HTTP client via `resolve_to_addrs`. Pinning prevents a DNS rebinding
-/// TOCTOU where the hostname could resolve to a different (private) address between
-/// validation here and the actual HTTP connect.
-async fn validate_url_not_reserved(url: &str) -> Result<Vec<SocketAddr>> {
+/// Defense-in-depth: RDAP is HTTPS-only. The scheme is enforced here — on
+/// every request, pinned-client cache hit or miss — so the guard does not
+/// silently depend on the bootstrap's parse-time check. A plaintext `http://`
+/// (downgrade) or any non-https URL — including a server-supplied link or
+/// redirect target ever fed in — must never be fetched, even when the host
+/// resolves to a public address.
+fn parse_rdap_url(url: &str) -> Result<(String, u16)> {
     let parsed = url::Url::parse(url)
         .map_err(|e| SeerError::RdapError(format!("invalid URL '{}': {}", url, e)))?;
-    // Defense-in-depth: RDAP is HTTPS-only. Enforce the scheme at fetch time so
-    // this guard does not silently depend on the bootstrap's parse-time check.
-    // A plaintext `http://` (downgrade) or any non-https URL — including a
-    // server-supplied link or redirect target ever fed in — must never be
-    // fetched, even when the host resolves to a public address.
     if parsed.scheme() != "https" {
         return Err(SeerError::RdapError(format!(
             "RDAP URL '{}' is not https — request blocked (downgrade/SSRF protection)",
             url
         )));
     }
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| SeerError::RdapError(format!("URL '{}' has no host", url)))?;
+    // Use `host()` (not `host_str()`) so an IPv6 literal comes back
+    // unbracketed and hits the shared guard's IP-literal short-circuit.
+    let host = match parsed.host() {
+        Some(url::Host::Domain(d)) => d.to_string(),
+        Some(url::Host::Ipv4(ip)) => ip.to_string(),
+        Some(url::Host::Ipv6(ip)) => ip.to_string(),
+        None => return Err(SeerError::RdapError(format!("URL '{}' has no host", url))),
+    };
     let port = parsed.port_or_known_default().unwrap_or(443);
+    Ok((host, port))
+}
 
-    // If the host is already an IP literal, check it directly.
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        if let Some(reason) = describe_reserved_ip(&ip) {
-            return Err(SeerError::RdapError(format!(
-                "RDAP URL resolves to reserved IP {}: {} — request blocked (SSRF protection)",
-                ip, reason
-            )));
-        }
-        return Ok(vec![SocketAddr::new(ip, port)]);
-    }
-
-    let addr = format!("{}:{}", host, port);
-
-    let socket_addrs: Vec<SocketAddr> = tokio::net::lookup_host(&addr)
+/// Resolves an RDAP host through the shared SSRF guard
+/// ([`crate::net::resolve_public_host`]), mapping failures into the RDAP
+/// error domain.
+///
+/// The shared guard bounds the OS-resolver lookup (`getaddrinfo` has no
+/// deadline, so a black-holed hostname could otherwise pin a worker thread)
+/// and falls back to hickory when the system resolver is broken — the same
+/// envelope as every other outbound leg. The reserved-range policy is
+/// unchanged (the previous local check delegated to the same
+/// `net::is_reserved_ip`), and the guard's error deliberately omits the
+/// resolved IP (internal-DNS-oracle hardening, issue #49).
+async fn resolve_rdap_host(host: &str, port: u16) -> Result<Vec<SocketAddr>> {
+    crate::net::resolve_public_host(host, port)
         .await
-        .map_err(|e| SeerError::RdapError(format!("failed to resolve host '{}': {}", host, e)))?
-        .collect();
+        .map_err(|e| SeerError::RdapError(format!("{} — request blocked (SSRF protection)", e)))
+}
 
-    if socket_addrs.is_empty() {
-        return Err(SeerError::RdapError(format!(
-            "host '{}' resolved to no addresses",
-            host
-        )));
-    }
-
-    for socket_addr in &socket_addrs {
-        if let Some(reason) = describe_reserved_ip(&socket_addr.ip()) {
-            return Err(SeerError::RdapError(format!(
-                "RDAP URL resolves to reserved IP {}: {} — request blocked (SSRF protection)",
-                socket_addr.ip(),
-                reason
-            )));
-        }
-    }
-
-    Ok(socket_addrs)
+/// Validates that a URL is https and does not resolve to a reserved/private IP
+/// address (SSRF protection). Test-only composition of the two production
+/// pieces: [`send_rdap_request`] runs [`parse_rdap_url`] on every request and
+/// [`resolve_rdap_host`] on pinned-client cache misses.
+#[cfg(test)]
+async fn validate_url_not_reserved(url: &str) -> Result<Vec<SocketAddr>> {
+    let (host, port) = parse_rdap_url(url)?;
+    resolve_rdap_host(&host, port).await
 }
 
 /// Parses an HTTP `Retry-After` header value. Supports the common
@@ -661,8 +666,38 @@ fn effective_retry_delay(backoff: Duration, retry_after: Option<Duration>) -> Du
     }
 }
 
+/// TTL for cached pinned RDAP clients. Short by design: on expiry the next
+/// request re-runs the full SSRF validation (fresh DNS + reserved-range
+/// check), so pinned addresses are re-checked against rebinding at most a
+/// minute apart, while bulk lookups, confusables scans, and per-query retries
+/// inside the window reuse one connection pool instead of paying DNS + TCP +
+/// TLS handshake per attempt.
+const PINNED_CLIENT_TTL: Duration = Duration::from_secs(60);
+
+/// Cache key for pinned RDAP clients: (host, port, request timeout). The
+/// timeout is part of the key because it is baked into the built
+/// `reqwest::Client` — two `RdapClient`s configured with different timeouts
+/// must not share one pinned client.
+type PinnedClientKey = (String, u16, Duration);
+
+/// Pinned per-host RDAP clients. `reqwest::Client` is Arc-backed, so cloning
+/// out of the cache shares the underlying connection pool. Entries are only
+/// ever inserted after full SSRF validation ([`validate_url_not_reserved`]);
+/// the `#[cfg(test)]` allow-reserved mode bypasses this cache entirely in
+/// both directions (never inserts, never reads). Capacity-bounded: evicting
+/// a live entry merely forces a re-validate + rebuild on next use.
+static PINNED_CLIENT_CACHE: Lazy<crate::cache::TtlCache<PinnedClientKey, Client>> =
+    Lazy::new(|| crate::cache::TtlCache::with_max_capacity(PINNED_CLIENT_TTL, 64));
+
 /// Sends one RDAP request: SSRF-validates the URL and pins the resolved IPs on
-/// a short-lived client (DNS-rebinding defense), returning the raw response.
+/// a cached per-host client (DNS-rebinding defense), returning the raw response.
+///
+/// The pinned client is cached for [`PINNED_CLIENT_TTL`] keyed by
+/// (host, port, timeout), so repeated queries — and retry attempts within one
+/// query — skip the DNS lookup and client build. The cheap URL-shape checks
+/// (parse + https enforcement) still run on every request: keying on host:port
+/// alone would otherwise let a cached https entry serve a plaintext `http://`
+/// URL aimed at the same port.
 ///
 /// `allow_reserved` (test seam, see [`RdapClient::allow_reserved`]) skips the
 /// validation and IP pinning so `#[cfg(test)]` mock servers on loopback are
@@ -676,6 +711,9 @@ async fn send_rdap_request(
     // sub-5s configured timeout stays internally consistent.
     let connect_timeout = CONNECT_TIMEOUT.min(timeout);
     if allow_reserved {
+        // Test seam: build a one-off unpinned client and never touch the
+        // shared pinned-client cache — a test-mode client reaching loopback
+        // must not be servable to a production request (nor vice versa).
         let client = Client::builder()
             .timeout(timeout)
             .connect_timeout(connect_timeout)
@@ -691,42 +729,57 @@ async fn send_rdap_request(
             .map_err(Into::into);
     }
 
-    // SSRF protection: validate the URL does not resolve to reserved IPs and
-    // capture the resolved SocketAddrs so we can pin them on the HTTP client.
-    let resolved = validate_url_not_reserved(url).await?;
+    // Always-on URL-shape checks (parse + https-only enforcement).
+    let (host, port) = parse_rdap_url(url)?;
 
-    let parsed = url::Url::parse(url)
-        .map_err(|e| SeerError::RdapError(format!("invalid URL '{}': {}", url, e)))?;
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| SeerError::RdapError(format!("URL '{}' has no host", url)))?;
+    let key = (host.clone(), port, timeout);
+    let client = match PINNED_CLIENT_CACHE.get(&key) {
+        Some(client) => client,
+        None => {
+            // SSRF protection: validate the URL does not resolve to reserved
+            // IPs and capture the resolved SocketAddrs so we can pin them on
+            // the HTTP client. If the host is an IP literal the resolved vec
+            // already holds it, so `resolve_to_addrs` is still correct.
+            let resolved = resolve_rdap_host(&host, port).await?;
+            let client = Client::builder()
+                .timeout(timeout)
+                .connect_timeout(connect_timeout)
+                .user_agent("Seer/1.0 (RDAP Client)")
+                .resolve_to_addrs(&host, &resolved)
+                // SSRF defense: `resolve_to_addrs` pins only THIS host's validated IPs.
+                // reqwest's default policy would follow up to 10 redirects, re-resolving
+                // each new host with its own resolver — so a 3xx to http://169.254.169.254
+                // (or any internal host) would bypass the reserved-IP guard entirely.
+                // RDAP base URLs come from the IANA bootstrap as terminal https endpoints
+                // and cross-server references are JSON `links`, not HTTP redirects, so we
+                // fail closed: a redirecting RDAP server makes the lookup fall through to
+                // WHOIS/availability rather than chasing an unvalidated hop.
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .map_err(|e| SeerError::RdapError(format!("failed to build HTTP client: {}", e)))?;
+            PINNED_CLIENT_CACHE.insert(key.clone(), client.clone());
+            client
+        }
+    };
 
-    // Build a short-lived client pinning the validated IPs. If the host was
-    // an IP literal the resolved vec already holds it, so `resolve_to_addrs`
-    // is still correct.
-    let client = Client::builder()
-        .timeout(timeout)
-        .connect_timeout(connect_timeout)
-        .user_agent("Seer/1.0 (RDAP Client)")
-        .resolve_to_addrs(host, &resolved)
-        // SSRF defense: `resolve_to_addrs` pins only THIS host's validated IPs.
-        // reqwest's default policy would follow up to 10 redirects, re-resolving
-        // each new host with its own resolver — so a 3xx to http://169.254.169.254
-        // (or any internal host) would bypass the reserved-IP guard entirely.
-        // RDAP base URLs come from the IANA bootstrap as terminal https endpoints
-        // and cross-server references are JSON `links`, not HTTP redirects, so we
-        // fail closed: a redirecting RDAP server makes the lookup fall through to
-        // WHOIS/availability rather than chasing an unvalidated hop.
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|e| SeerError::RdapError(format!("failed to build HTTP client: {}", e)))?;
-
-    client
+    match client
         .get(url)
         .header("Accept", "application/rdap+json")
         .send()
         .await
-        .map_err(Into::into)
+    {
+        Ok(resp) => Ok(resp),
+        Err(e) => {
+            // A connect-level failure may mean the pinned addresses went
+            // stale (host re-IP'd inside the TTL). Evict so the next attempt
+            // re-resolves instead of failing on the same dead pin for the
+            // rest of the window.
+            if e.is_connect() {
+                PINNED_CLIENT_CACHE.remove(&key);
+            }
+            Err(e.into())
+        }
+    }
 }
 
 /// Streams, size-bounds, and parses an RDAP response body. `url` is only used
@@ -783,9 +836,9 @@ async fn read_and_parse_rdap_body(
 
 /// One RDAP attempt. On failure, returns the error together with an optional
 /// server-suggested retry delay parsed from a 429 `Retry-After` header so the
-/// caller's backoff can honor it. Builds a per-request HTTP client that pins
+/// caller's backoff can honor it. Uses a cached per-host HTTP client that pins
 /// the validated resolved IPs to prevent DNS rebinding (TOCTOU between
-/// validation and connect).
+/// validation and connect); see [`send_rdap_request`].
 async fn query_rdap_attempt(
     url: &str,
     timeout: Duration,
@@ -1123,6 +1176,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn from_config_applies_rdap_timeout() {
+        let mut config = crate::config::SeerConfig::default();
+        config.timeouts.rdap_secs = 33;
+        let client = RdapClient::from_config(&config);
+        assert_eq!(client.timeout, Duration::from_secs(33));
+    }
+
+    #[test]
     fn test_default_client_has_retry_policy() {
         let client = RdapClient::new();
         // Tuned up from 2 so 429 rate limits get a couple of backoff-and-retry
@@ -1227,7 +1288,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(err, SeerError::RdapError(ref s) if s.contains("reserved IP")),
+            matches!(err, SeerError::RdapError(ref s) if s.contains("reserved")),
             "expected reserved-IP error, got: {:?}",
             err
         );
@@ -1239,7 +1300,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(err, SeerError::RdapError(ref s) if s.contains("reserved IP")),
+            matches!(err, SeerError::RdapError(ref s) if s.contains("reserved")),
             "expected reserved-IP error, got: {:?}",
             err
         );
@@ -1262,11 +1323,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_validate_url_not_reserved_rejects_ipv6_loopback_literal() {
+        // Also exercises the `Url::host()` unbracketing: "[::1]" must reach
+        // the shared guard as the parseable literal "::1".
         let err = validate_url_not_reserved("https://[::1]/")
             .await
             .unwrap_err();
         assert!(
-            matches!(err, SeerError::RdapError(ref s) if s.contains("reserved IP")),
+            matches!(err, SeerError::RdapError(ref s) if s.contains("reserved")),
             "expected reserved-IP error, got: {:?}",
             err
         );
@@ -1588,6 +1651,89 @@ mod tests {
         assert!(
             crate::rdap::rdap_error_is_404(&err),
             "404 from candidate 1 must survive candidate 2's non-404 failure, got: {err:?}"
+        );
+    }
+
+    // ---- pinned-client cache tests ------------------------------------
+
+    /// A cache hit must skip DNS resolution and the SSRF re-validation
+    /// entirely. The test seeds the cache under a host that can never
+    /// resolve (`.invalid`, RFC 2606): if `send_rdap_request` consults the
+    /// cache, the request proceeds to the pinned (dead) loopback address and
+    /// fails with a connect-level `ReqwestError`; if the cache were bypassed,
+    /// validation would fail first with the DNS-failed `RdapError`.
+    /// Hermetic: no DNS happens on the hit path, and the loopback connect is
+    /// refused immediately.
+    #[tokio::test]
+    async fn pinned_client_cache_hit_skips_dns_and_revalidation() {
+        let host = "pinned-cache-hit.seer-test.invalid";
+        let timeout = Duration::from_secs(2);
+        let key = (host.to_string(), 443u16, timeout);
+
+        // Simulate a prior validated build (production inserts only after
+        // validate; the pinned address here is loopback purely so the connect
+        // fails fast without any network). NOTE: `resolve_to_addrs` ignores
+        // the SocketAddr port — traffic goes to the URL's port (443).
+        let pinned: Vec<SocketAddr> = vec!["127.0.0.1:443".parse().expect("valid addr")];
+        let client = Client::builder()
+            .timeout(timeout)
+            .connect_timeout(timeout)
+            .resolve_to_addrs(host, &pinned)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("client builds");
+        PINNED_CLIENT_CACHE.insert(key.clone(), client);
+
+        let err = send_rdap_request(
+            &format!("https://{}/domain/example.com", host),
+            timeout,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, SeerError::ReqwestError { .. }),
+            "cache hit must reach the connect stage (ReqwestError), not fail \
+             SSRF validation (RdapError) — got: {err:?}"
+        );
+
+        // Don't leak the synthetic entry into other tests (the connect-error
+        // eviction usually removes it already; this makes it unconditional).
+        PINNED_CLIENT_CACHE.remove(&key);
+    }
+
+    /// The `#[cfg(test)]` allow-reserved seam must bypass the shared cache in
+    /// both directions: a test-mode request (whose client would happily reach
+    /// loopback) must never insert an entry a production request could be
+    /// served from.
+    #[tokio::test]
+    async fn test_mode_requests_never_populate_pinned_client_cache() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                r#"{"objectClassName":"domain","handle":"MOCK-CACHE"}"#,
+                "application/rdap+json",
+            ))
+            .mount(&server)
+            .await;
+
+        let client = RdapClient::new()
+            .without_retries()
+            .allowing_reserved_for_tests();
+        let uri = format!("{}/domain/example.com", server.uri());
+        let resp = client.query_rdap_with_retry(&uri).await.unwrap();
+        assert_eq!(resp.handle.as_deref(), Some("MOCK-CACHE"));
+
+        // The key the production path would have used for this host must be
+        // absent (test-mode requests run with the client's default timeout).
+        let parsed = url::Url::parse(&uri).unwrap();
+        let host = parsed.host_str().unwrap().to_string();
+        let port = parsed.port_or_known_default().unwrap();
+        assert!(
+            PINNED_CLIENT_CACHE
+                .get(&(host, port, DEFAULT_TIMEOUT))
+                .is_none(),
+            "test-mode request must not populate the shared pinned-client cache"
         );
     }
 }

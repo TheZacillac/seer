@@ -30,8 +30,14 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time",
 # HTTP client
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"], default-features = false }
 
-# DNS resolution
-hickory-resolver = { version = "0.26", features = ["dnssec-ring"] }
+# DNS resolution.
+# tls-ring/https-ring enable DoT/DoH upstream nameservers (tls:// and https://
+# specs); webpki-roots supplies the rustls root store hickory verifies those
+# TLS connections against (without it the root store would be empty and every
+# DoT/DoH handshake would fail). ring + rustls + webpki-roots are already in
+# the dependency tree via reqwest's rustls-tls and dnssec-ring, so this adds
+# no new TLS stack.
+hickory-resolver = { version = "0.26", features = ["dnssec-ring", "tls-ring", "https-ring", "webpki-roots"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

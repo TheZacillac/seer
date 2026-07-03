@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use seer_core::bulk::{BulkOperation, BulkResult, BulkResultData};
+use seer_core::bulk::{BulkResult, BulkResultData};
 
 /// RAII guard that enables crossterm raw mode on creation and disables it on
 /// drop — including when a panic unwinds through the guarded region. The
@@ -153,6 +153,15 @@ pub fn bulk_results_to_csv(results: &[BulkResult], operation: &str) -> String {
         "ssl" => {
             csv.push_str("domain,success,subject,issuer,valid_from,valid_until,days_remaining,signature_algorithm,key_type,key_bits,chain_length,san_count,sans,protocol_version,is_valid,duration_ms,error\n");
         }
+        "posture" => {
+            csv.push_str("domain,success,spf_verdict,spf_all_qualifier,dmarc_verdict,dmarc_policy,mta_sts_verdict,bimi_verdict,dane_verdict,notes,duration_ms,error\n");
+        }
+        "confusables" => {
+            csv.push_str("domain,success,candidates_generated,candidates_checked,registered_count,registered,duration_ms,error\n");
+        }
+        "caa" => {
+            csv.push_str("domain,success,has_policy,effective_domain,issue,issuewild,iodef,wildcard_note,duration_ms,error\n");
+        }
         _ => {
             csv.push_str("domain,success,duration_ms,error\n");
         }
@@ -160,7 +169,7 @@ pub fn bulk_results_to_csv(results: &[BulkResult], operation: &str) -> String {
 
     // Write data rows
     for result in results {
-        let domain = escape_csv_field(&get_domain_from_operation(&result.operation));
+        let domain = escape_csv_field(result.operation.domain());
         let success = result.success;
         let duration_ms = result.duration_ms;
         let error = escape_csv_field(result.error.as_deref().unwrap_or(""));
@@ -559,6 +568,104 @@ pub fn bulk_results_to_csv(results: &[BulkResult], operation: &str) -> String {
                     error
                 ));
             }
+            "posture" => {
+                let (spf_verdict, spf_all, dmarc_verdict, dmarc_policy, mta_sts, bimi, dane, notes) =
+                    if let Some(BulkResultData::Posture(ref p)) = result.data {
+                        (
+                            posture_verdict_str(p.spf.verdict).to_string(),
+                            p.spf.all_qualifier.clone().unwrap_or_default(),
+                            posture_verdict_str(p.dmarc.verdict).to_string(),
+                            p.dmarc.policy.clone().unwrap_or_default(),
+                            posture_verdict_str(p.mta_sts.verdict).to_string(),
+                            posture_verdict_str(p.bimi.verdict).to_string(),
+                            posture_verdict_str(p.dane.verdict).to_string(),
+                            p.notes.join(";"),
+                        )
+                    } else {
+                        Default::default()
+                    };
+                csv.push_str(&format!(
+                    "{},{},{},{},{},{},{},{},{},{},{},{}\n",
+                    domain,
+                    success,
+                    spf_verdict,
+                    escape_csv_field(&spf_all),
+                    dmarc_verdict,
+                    escape_csv_field(&dmarc_policy),
+                    mta_sts,
+                    bimi,
+                    dane,
+                    escape_csv_field(&notes),
+                    duration_ms,
+                    error
+                ));
+            }
+            "confusables" => {
+                let (generated, checked, count, registered) =
+                    if let Some(BulkResultData::Confusables(ref r)) = result.data {
+                        let joined = r
+                            .registered
+                            .iter()
+                            .map(|l| format!("{}({})", l.domain, l.technique))
+                            .collect::<Vec<_>>()
+                            .join(";");
+                        (
+                            r.candidates_generated.to_string(),
+                            r.candidates_checked.to_string(),
+                            r.registered.len().to_string(),
+                            joined,
+                        )
+                    } else {
+                        Default::default()
+                    };
+                csv.push_str(&format!(
+                    "{},{},{},{},{},{},{},{}\n",
+                    domain,
+                    success,
+                    generated,
+                    checked,
+                    count,
+                    escape_csv_field(&registered),
+                    duration_ms,
+                    error
+                ));
+            }
+            "caa" => {
+                let (has_policy, effective_domain, issue, issuewild, iodef, wildcard_note) =
+                    if let Some(BulkResultData::Caa(ref p)) = result.data {
+                        let tag_values = |tag: &str| {
+                            p.records
+                                .iter()
+                                .filter(|r| r.tag == tag)
+                                .map(|r| r.value.clone())
+                                .collect::<Vec<_>>()
+                                .join(";")
+                        };
+                        (
+                            p.has_policy.to_string(),
+                            p.effective_domain.clone().unwrap_or_default(),
+                            tag_values("issue"),
+                            tag_values("issuewild"),
+                            p.iodef.join(";"),
+                            p.wildcard_note.clone().unwrap_or_default(),
+                        )
+                    } else {
+                        Default::default()
+                    };
+                csv.push_str(&format!(
+                    "{},{},{},{},{},{},{},{},{},{}\n",
+                    domain,
+                    success,
+                    has_policy,
+                    escape_csv_field(&effective_domain),
+                    escape_csv_field(&issue),
+                    escape_csv_field(&issuewild),
+                    escape_csv_field(&iodef),
+                    escape_csv_field(&wildcard_note),
+                    duration_ms,
+                    error
+                ));
+            }
             _ => {
                 csv.push_str(&format!(
                     "{},{},{},{}\n",
@@ -569,6 +676,19 @@ pub fn bulk_results_to_csv(results: &[BulkResult], operation: &str) -> String {
     }
 
     csv
+}
+
+/// CSV cell rendering for a [`seer_core::PostureVerdict`] — matches the
+/// kebab-case serde form used in JSON output.
+fn posture_verdict_str(v: seer_core::PostureVerdict) -> &'static str {
+    use seer_core::PostureVerdict;
+    match v {
+        PostureVerdict::Absent => "absent",
+        PostureVerdict::Weak => "weak",
+        PostureVerdict::Moderate => "moderate",
+        PostureVerdict::Strict => "strict",
+        PostureVerdict::Present => "present",
+    }
 }
 
 /// Escapes a CSV field for safe output, following RFC 4180 with Excel formula
@@ -623,20 +743,6 @@ pub fn join_sans(sans: &[String]) -> String {
     format!("{head};…+{remainder} more")
 }
 
-pub fn get_domain_from_operation(op: &BulkOperation) -> String {
-    match op {
-        BulkOperation::Whois { domain } => domain.clone(),
-        BulkOperation::Rdap { domain } => domain.clone(),
-        BulkOperation::Dns { domain, .. } => domain.clone(),
-        BulkOperation::Propagation { domain, .. } => domain.clone(),
-        BulkOperation::Lookup { domain } => domain.clone(),
-        BulkOperation::Status { domain } => domain.clone(),
-        BulkOperation::Avail { domain } => domain.clone(),
-        BulkOperation::Info { domain } => domain.clone(),
-        BulkOperation::Ssl { domain } => domain.clone(),
-    }
-}
-
 pub fn extract_rdap_dates(r: &seer_core::rdap::RdapResponse) -> (String, String, String, String) {
     let registrar = r.get_registrar().unwrap_or_default();
 
@@ -662,6 +768,7 @@ pub fn extract_rdap_dates(r: &seer_core::rdap::RdapResponse) -> (String, String,
 mod tests {
     use super::*;
     use chrono::TimeZone;
+    use seer_core::bulk::BulkOperation;
     use seer_core::ssl::{CertDetail, SslReport};
 
     #[test]
@@ -856,6 +963,206 @@ mod tests {
         assert_eq!(content, "example.com\n");
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    fn sample_posture() -> seer_core::EmailPosture {
+        use seer_core::{
+            BimiPolicy, DanePolicy, DmarcPolicy, EmailPosture, MtaStsPolicy, PostureVerdict,
+            SpfPolicy,
+        };
+        EmailPosture {
+            domain: "example.com".to_string(),
+            spf: SpfPolicy {
+                present: true,
+                record: Some("v=spf1 -all".to_string()),
+                all_qualifier: Some("-".to_string()),
+                verdict: PostureVerdict::Strict,
+            },
+            dmarc: DmarcPolicy {
+                present: true,
+                record: Some("v=DMARC1; p=reject".to_string()),
+                policy: Some("reject".to_string()),
+                subdomain_policy: None,
+                aggregate_reports: vec![],
+                percent: None,
+                verdict: PostureVerdict::Strict,
+            },
+            mta_sts: MtaStsPolicy {
+                present: true,
+                record: Some("v=STSv1; id=2024".to_string()),
+                id: Some("2024".to_string()),
+                verdict: PostureVerdict::Present,
+            },
+            bimi: BimiPolicy {
+                present: false,
+                record: None,
+                logo_url: None,
+                authority_url: None,
+                verdict: PostureVerdict::Absent,
+            },
+            dane: DanePolicy {
+                present: false,
+                records: vec![],
+                verdict: PostureVerdict::Absent,
+            },
+            notes: vec!["strong posture".to_string()],
+        }
+    }
+
+    #[test]
+    fn posture_csv_emits_expected_header_and_row() {
+        let result = BulkResult {
+            operation: BulkOperation::Posture {
+                domain: "example.com".to_string(),
+            },
+            success: true,
+            data: Some(BulkResultData::Posture(sample_posture())),
+            error: None,
+            duration_ms: 842,
+        };
+        let csv = bulk_results_to_csv(std::slice::from_ref(&result), "posture");
+        let mut lines = csv.lines();
+        assert_eq!(
+            lines.next().expect("header line"),
+            "domain,success,spf_verdict,spf_all_qualifier,dmarc_verdict,dmarc_policy,mta_sts_verdict,bimi_verdict,dane_verdict,notes,duration_ms,error"
+        );
+        let row = lines.next().expect("data row");
+        // The `-` all-qualifier must be formula-guarded (leading `-` in a cell).
+        assert!(
+            row.starts_with("example.com,true,strict,'-,strict,reject,present,absent,absent,"),
+            "got row: {row}"
+        );
+        assert!(row.contains("strong posture"));
+        assert!(row.contains(",842,"));
+    }
+
+    #[test]
+    fn confusables_csv_emits_expected_header_and_row() {
+        let report = seer_core::ConfusableReport {
+            domain: "example.com".to_string(),
+            candidates_generated: 214,
+            candidates_checked: 180,
+            registered: vec![seer_core::RegisteredLookalike {
+                domain: "examp1e.com".to_string(),
+                technique: "homoglyph".to_string(),
+                registrar: None,
+                creation_date: None,
+                nameservers: vec![],
+            }],
+        };
+        let result = BulkResult {
+            operation: BulkOperation::Confusables {
+                domain: "example.com".to_string(),
+            },
+            success: true,
+            data: Some(BulkResultData::Confusables(report)),
+            error: None,
+            duration_ms: 9214,
+        };
+        let csv = bulk_results_to_csv(std::slice::from_ref(&result), "confusables");
+        let mut lines = csv.lines();
+        assert_eq!(
+            lines.next().expect("header line"),
+            "domain,success,candidates_generated,candidates_checked,registered_count,registered,duration_ms,error"
+        );
+        let row = lines.next().expect("data row");
+        assert!(
+            row.starts_with("example.com,true,214,180,1,examp1e.com(homoglyph),9214,"),
+            "got row: {row}"
+        );
+    }
+
+    #[test]
+    fn caa_csv_emits_expected_header_and_row() {
+        let policy = seer_core::CaaPolicy {
+            records: vec![
+                seer_core::CaaRecord {
+                    flags: 0,
+                    tag: "issue".to_string(),
+                    value: "letsencrypt.org".to_string(),
+                },
+                seer_core::CaaRecord {
+                    flags: 0,
+                    tag: "issue".to_string(),
+                    value: "digicert.com".to_string(),
+                },
+                seer_core::CaaRecord {
+                    flags: 0,
+                    tag: "iodef".to_string(),
+                    value: "mailto:security@example.com".to_string(),
+                },
+            ],
+            effective_domain: Some("example.com".to_string()),
+            has_policy: true,
+            issuer_match: None,
+            iodef: vec!["mailto:security@example.com".to_string()],
+            wildcard_note: None,
+            note: "CAA restricts which CAs may issue".to_string(),
+        };
+        let result = BulkResult {
+            operation: BulkOperation::Caa {
+                domain: "example.com".to_string(),
+            },
+            success: true,
+            data: Some(BulkResultData::Caa(policy)),
+            error: None,
+            duration_ms: 133,
+        };
+        let csv = bulk_results_to_csv(std::slice::from_ref(&result), "caa");
+        let mut lines = csv.lines();
+        assert_eq!(
+            lines.next().expect("header line"),
+            "domain,success,has_policy,effective_domain,issue,issuewild,iodef,wildcard_note,duration_ms,error"
+        );
+        let row = lines.next().expect("data row");
+        assert!(
+            row.starts_with(
+                "example.com,true,true,example.com,letsencrypt.org;digicert.com,,mailto:security@example.com,,133,"
+            ),
+            "got row: {row}"
+        );
+    }
+
+    #[test]
+    fn new_op_failure_rows_have_empty_data_columns() {
+        for (op, operation) in [
+            (
+                "posture",
+                BulkOperation::Posture {
+                    domain: "bad.invalid".to_string(),
+                },
+            ),
+            (
+                "confusables",
+                BulkOperation::Confusables {
+                    domain: "bad.invalid".to_string(),
+                },
+            ),
+            (
+                "caa",
+                BulkOperation::Caa {
+                    domain: "bad.invalid".to_string(),
+                },
+            ),
+        ] {
+            let result = BulkResult {
+                operation,
+                success: false,
+                data: None,
+                error: Some("boom".to_string()),
+                duration_ms: 7,
+            };
+            let csv = bulk_results_to_csv(std::slice::from_ref(&result), op);
+            let header = csv.lines().next().expect("header");
+            let row = csv.lines().nth(1).expect("data row");
+            assert_eq!(
+                header.matches(',').count(),
+                row.matches(',').count(),
+                "{op} failure row must match header column count; row: {row}"
+            );
+            assert!(row.starts_with("bad.invalid,false,"), "got: {row}");
+            assert!(row.ends_with(",7,boom"), "got: {row}");
+        }
     }
 
     #[cfg(unix)]
