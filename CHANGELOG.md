@@ -11,6 +11,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.39.0] - 2026-07-03
+
+A feature release adding encrypted DNS transports, subdomain-change monitoring,
+and broader bulk coverage, on top of internal core hardening ([#102]).
+
+### Added
+- **DoT / DoH nameservers** — every surface that accepts a custom nameserver
+  (`seer dig --server`, `seer dns compare`, the REPL `@server` selector, and the
+  `~/.seer/config.toml` `nameserver` setting) now understands `tls://host[:port]`
+  (DNS over TLS) and `https://host/dns-query` (DNS over HTTPS), plus `host:port`
+  and bracketed-IPv6 (`[2001:db8::1]:5353`) forms. Bare IPs/hostnames keep their
+  existing UDP behavior byte-for-byte.
+- **Subdomain baseline monitoring** — `seer subdomains <domain> --record` stores
+  a CT-log enumeration snapshot under `~/.seer/subdomain_baselines.json`, and
+  `--diff` compares a fresh enumeration against it, exiting 1 when NEW names have
+  appeared (a classic phishing / zone-compromise signal) for cron/CI use. A
+  first run with no baseline exits 0; removals are reported but not treated as
+  material, since CT logs are append-mostly. Mirrors the `seer drift` model.
+- **`seer watch --fail-on <warning|critical>`** — controls the severity
+  threshold at which the check-all form exits non-zero (default `critical`).
+- **More bulk operations** — `seer bulk` now supports `info`, `ssl`, `posture`,
+  `confusables`, and `caa` in addition to the existing lookup/whois/rdap/dig/
+  prop/status/avail operations.
+
+### Changed
+- Core hardening: unified the SSRF validation path, reused a single RDAP client
+  across lookups, collapsed DNS resolver construction, and decoupled error
+  classification from transport internals — no user-facing behavior change.
+- The CLI and REPL now share a single subdomain-baseline / drift pipeline so the
+  two surfaces cannot diverge.
+
 ## [0.38.0] - 2026-07-01
 
 A feature release adding a suite of domain-intelligence capabilities and wiring
@@ -366,7 +397,8 @@ Two notable breaking changes landed in this period (see `CLAUDE.md` for details)
   `inconsistencies` became typed (`ConsensusValue` / `Inconsistency`) instead of
   pre-formatted strings.
 
-[Unreleased]: https://github.com/TheZacillac/seer/compare/v0.38.0...HEAD
+[Unreleased]: https://github.com/TheZacillac/seer/compare/v0.39.0...HEAD
+[0.39.0]: https://github.com/TheZacillac/seer/compare/v0.38.0...v0.39.0
 [0.38.0]: https://github.com/TheZacillac/seer/compare/v0.37.1...v0.38.0
 [0.37.1]: https://github.com/TheZacillac/seer/compare/v0.37.0...v0.37.1
 [0.37.0]: https://github.com/TheZacillac/seer/compare/v0.36.0...v0.37.0
@@ -392,3 +424,4 @@ Two notable breaking changes landed in this period (see `CLAUDE.md` for details)
 [#94]: https://github.com/TheZacillac/seer/pull/94
 [#98]: https://github.com/TheZacillac/seer/pull/98
 [#101]: https://github.com/TheZacillac/seer/pull/101
+[#102]: https://github.com/TheZacillac/seer/pull/102
