@@ -15,6 +15,13 @@ use std::collections::HashMap;
 /// instead of the clean `WhoisServerNotFound` error the discovery path
 /// generates. Use `seer.lookup()` (RDAP-first) or `seer.rdap_domain()` for
 /// these TLDs.
+///
+/// For the same reason, these TLDs were removed 2026-07-04 after a full-TLD
+/// live sweep found their WHOIS hostnames dead in DNS and their IANA records
+/// no longer publishing a `whois:` field (RDAP-only transitions): `apple`,
+/// `brussels`, `cymru`, `wales`, `vlaanderen`, `pharmacy`, `na`, `xn--p1acf`
+/// (+ its `рус` alias). Do not re-add them from stale upstream lists without
+/// re-checking IANA (`whois -h whois.iana.org <tld>`).
 pub static WHOIS_SERVERS: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(|| {
     let mut m = HashMap::new();
 
@@ -61,7 +68,6 @@ pub static WHOIS_SERVERS: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(
     m.insert("anz", "whois.nic.anz");
     m.insert("aol", "whois.nic.aol");
     m.insert("apartments", "whois.nic.apartments");
-    m.insert("apple", "whois.nic.apple");
     m.insert("aquarelle", "whois.nic.aquarelle");
     m.insert("arab", "whois.nic.arab");
     m.insert("archi", "whois.nic.archi");
@@ -143,7 +149,6 @@ pub static WHOIS_SERVERS: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(
     m.insert("broadway", "whois.nic.broadway");
     m.insert("broker", "whois.nic.broker");
     m.insert("brother", "whois.nic.brother");
-    m.insert("brussels", "whois.nic.brussels");
     m.insert("build", "whois.nic.build");
     m.insert("builders", "whois.nic.builders");
     m.insert("business", "whois.nic.business");
@@ -234,7 +239,6 @@ pub static WHOIS_SERVERS: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(
     m.insert("cruise", "whois.nic.cruise");
     m.insert("cruises", "whois.nic.cruises");
     m.insert("cuisinella", "whois.nic.cuisinella");
-    m.insert("cymru", "whois.nic.cymru");
     m.insert("cyou", "whois.nic.cyou");
     m.insert("dance", "whois.nic.dance");
     m.insert("data", "whois.nic.data");
@@ -629,7 +633,6 @@ pub static WHOIS_SERVERS: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(
     m.insert("pay", "whois.nic.pay");
     m.insert("pccw", "whois.nic.pccw");
     m.insert("pet", "whois.nic.pet");
-    m.insert("pharmacy", "whois.nic.pharmacy");
     m.insert("philips", "whois.nic.philips");
     m.insert("phone", "whois.nic.phone");
     m.insert("photo", "whois.nic.photo");
@@ -883,14 +886,12 @@ pub static WHOIS_SERVERS: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(
     m.insert("visa", "whois.nic.visa");
     m.insert("vision", "whois.nic.vision");
     m.insert("viva", "whois.nic.viva");
-    m.insert("vlaanderen", "whois.nic.vlaanderen");
     m.insert("vodka", "whois.nic.vodka");
     m.insert("volvo", "whois.nic.volvo");
     m.insert("vote", "whois.nic.vote");
     m.insert("voting", "whois.nic.voting");
     m.insert("voto", "whois.nic.voto");
     m.insert("voyage", "whois.nic.voyage");
-    m.insert("wales", "whois.nic.wales");
     m.insert("walmart", "whois.nic.walmart");
     m.insert("walter", "whois.nic.walter");
     m.insert("wang", "whois.gtld.zdns.cn");
@@ -1063,7 +1064,6 @@ pub static WHOIS_SERVERS: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(
     m.insert("mx", "whois.mx");
     m.insert("my", "whois.mynic.my");
     m.insert("mz", "whois.nic.mz");
-    m.insert("na", "whois.na-nic.com.na");
     m.insert("nc", "whois.nc");
     m.insert("nf", "whois.nic.nf");
     m.insert("ng", "whois.nic.net.ng");
@@ -1246,7 +1246,6 @@ pub static WHOIS_SERVERS: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(
     m.insert("xn--nqv7fs00ema", "whois.nic.xn--nqv7fs00ema");
     m.insert("xn--o3cw4h", "whois.thnic.co.th");
     m.insert("xn--ogbpf8fl", "whois.tld.sy");
-    m.insert("xn--p1acf", "whois.nic.xn--p1acf");
     m.insert("xn--p1ai", "whois.tcinet.ru");
     m.insert("xn--pgbs0dh", "whois.ati.tn");
     m.insert("xn--pssy2u", "whois.nic.xn--pssy2u");
@@ -1299,7 +1298,6 @@ pub static WHOIS_SERVERS: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(
     m.insert("москва", "whois.nic.xn--80adxhks");
     m.insert("онлайн", "whois.nic.xn--80asehdb");
     m.insert("орг", "whois.nic.xn--c1avg");
-    m.insert("рус", "whois.nic.xn--p1acf");
     m.insert("рф", "whois.tcinet.ru");
     m.insert("сайт", "whois.nic.xn--80aswg");
     m.insert("срб", "whois.rnids.rs");
@@ -1542,5 +1540,29 @@ mod all_tlds_tests {
         );
         // But when the trailing label really is the TLD, the derivation is kept.
         assert_eq!(get_registry_url("gmo").as_deref(), Some("https://nic.gmo"));
+    }
+
+    /// TLDs whose WHOIS hostnames are dead and whose IANA records no longer
+    /// publish a `whois:` field (RDAP-only transitions, removed 2026-07-04)
+    /// must stay out of the map — see the module-level "Intentional
+    /// omissions" doc before re-adding any of them.
+    #[test]
+    fn iana_delisted_whois_servers_stay_removed() {
+        for tld in [
+            "apple",
+            "brussels",
+            "cymru",
+            "wales",
+            "vlaanderen",
+            "pharmacy",
+            "na",
+            "xn--p1acf",
+            "рус",
+        ] {
+            assert!(
+                get_whois_server(tld).is_none(),
+                ".{tld} must not be mapped (IANA-delisted, dead hostname)"
+            );
+        }
     }
 }

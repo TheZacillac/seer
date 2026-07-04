@@ -218,15 +218,25 @@ impl RegistryParser for JprsParser {
             }
         }
 
+        // Only claim JPRS identity fields when the response actually carried
+        // registration data. Synthesizing them onto a "No match!!" response
+        // would trip is_available()'s registered-data guard, making
+        // unregistered .jp domains impossible to report as available.
+        let has_data = organization.is_some()
+            || !nameservers.is_empty()
+            || creation_date.is_some()
+            || expiration_date.is_some()
+            || !status.is_empty();
+
         WhoisResponse {
             domain: domain.to_string(),
-            registrar: Some("JPRS".to_string()),
+            registrar: has_data.then(|| "JPRS".to_string()),
             registrant: organization.clone(),
             organization,
             registrant_email: None,
             registrant_phone: None,
             registrant_address: None,
-            registrant_country: Some("JP".to_string()),
+            registrant_country: has_data.then(|| "JP".to_string()),
             admin_name: None,
             admin_organization: None,
             admin_email: None,
@@ -437,6 +447,27 @@ Domain Information: [ドメイン情報]
             Some("Japan Registry Services Co.,Ltd.")
         );
         assert_eq!(result.dnssec.as_deref(), Some("signedDelegation"));
+    }
+
+    /// Unregistered .jp: JPRS answers "No match!!". The parser must not
+    /// hardcode registrar/country onto a no-match response — a synthesized
+    /// registrar makes `is_available()` bail via its registered-data guard,
+    /// so unregistered .jp domains could never be reported available.
+    #[test]
+    fn test_jprs_no_match_is_available() {
+        let raw = "[ JPRS database provides information on network administration. Its use is    ]\n\
+                   [ restricted to network administration purposes. For further information,     ]\n\
+                   No match!!\n";
+        let parser = JprsParser::new();
+        let result = parser.parse("nosuchdomain.jp", "whois.jprs.jp", raw);
+        assert!(
+            result.registrar.is_none(),
+            "no-match must not synthesize a registrar"
+        );
+        assert!(
+            result.is_available(),
+            "No match!! must mark the domain available"
+        );
     }
 
     #[test]
