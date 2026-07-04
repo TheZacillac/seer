@@ -11,12 +11,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.40.0] - 2026-07-04
+
 ### Added
 - **Homebrew distribution** — Seer is now installable via a Homebrew tap:
   `brew install TheZacillac/tap/seer` (macOS/Linux, prebuilt binary, no Rust
   toolchain required). The formula is generated and pushed to
   [`TheZacillac/homebrew-tap`](https://github.com/TheZacillac/homebrew-tap)
-  automatically by cargo-dist on each tagged release.
+  automatically by cargo-dist on each tagged release. ([#103])
 
 ## [0.39.0] - 2026-07-03
 
@@ -404,7 +406,8 @@ Two notable breaking changes landed in this period (see `CLAUDE.md` for details)
   `inconsistencies` became typed (`ConsensusValue` / `Inconsistency`) instead of
   pre-formatted strings.
 
-[Unreleased]: https://github.com/TheZacillac/seer/compare/v0.39.0...HEAD
+[Unreleased]: https://github.com/TheZacillac/seer/compare/v0.40.0...HEAD
+[0.40.0]: https://github.com/TheZacillac/seer/compare/v0.39.0...v0.40.0
 [0.39.0]: https://github.com/TheZacillac/seer/compare/v0.38.0...v0.39.0
 [0.38.0]: https://github.com/TheZacillac/seer/compare/v0.37.1...v0.38.0
 [0.37.1]: https://github.com/TheZacillac/seer/compare/v0.37.0...v0.37.1
@@ -432,3 +435,4 @@ Two notable breaking changes landed in this period (see `CLAUDE.md` for details)
 [#98]: https://github.com/TheZacillac/seer/pull/98
 [#101]: https://github.com/TheZacillac/seer/pull/101
 [#102]: https://github.com/TheZacillac/seer/pull/102
+[#103]: https://github.com/TheZacillac/seer/pull/103
