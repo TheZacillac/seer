@@ -31,7 +31,7 @@ A high-performance, multi-interface domain utility suite — query WHOIS, RDAP, 
 - **Domain Info** — merged RDAP + WHOIS in a flat structure
 - **Reverse DNS** — PTR lookups for IP addresses
 - **TLD Info** — WHOIS server, RDAP endpoint, and registry
-- **Subdomain Enumeration** — via Certificate Transparency logs
+- **Subdomain Enumeration** — CT logs, with live/dead + takeover-risk classification and baseline diffing
 - **Domain Availability** — check if a domain is registered
 
 </td>
@@ -39,6 +39,7 @@ A high-performance, multi-interface domain utility suite — query WHOIS, RDAP, 
 
 **🌐 DNS & Propagation**
 - **DNS Resolution** — 16 record types with custom nameservers
+- **Encrypted DNS** — DoT (`tls://`) and DoH (`https://`) transports
 - **DNS Propagation** — 30 servers across 6 global regions
 - **DNS Monitoring** — track record changes over time
 - **DNS Comparison** — compare records across two nameservers
@@ -52,6 +53,10 @@ A high-performance, multi-interface domain utility suite — query WHOIS, RDAP, 
 **🛡️ Security & Health**
 - **Domain Status** — HTTP status, title, SSL, and expiration
 - **SSL Chain Inspection** — full chain, SANs, key details, validity
+- **CAA Policy** — who may issue certs, vs. actual issuer
+- **Email Posture** — SPF, DMARC, and MTA-STS checks
+- **Look-alike Detection** — confusable/homoglyph domains
+- **Registration Drift** — diff live registration vs. a baseline
 - **Domain Watchlist** — monitor expiring certs and registrations
 - **SSRF Protection** — blocks requests to private/reserved IPs
 
@@ -200,7 +205,9 @@ seer rdap AS15169               # ASN
 # DNS queries
 seer dig example.com             # A records (default)
 seer dig example.com MX          # Specific record type
-seer dig example.com A -s 8.8.8.8  # Custom nameserver
+seer dig example.com A -s 8.8.8.8                          # Custom nameserver (UDP)
+seer dig example.com A -s tls://1.1.1.1                    # DNS over TLS
+seer dig example.com A -s https://cloudflare-dns.com/dns-query  # DNS over HTTPS
 
 # DNS propagation & monitoring
 seer prop example.com A
@@ -214,6 +221,12 @@ seer compare example.com 8.8.8.8 1.1.1.1 MX   # record type trails; defaults to 
 # Domain health & SSL
 seer status example.com
 seer ssl example.com
+seer caa example.com              # CAA policy vs. actual cert issuer
+seer posture example.com          # SPF / DMARC / MTA-STS email posture
+
+# Security intel
+seer confusables example.com      # Look-alike / homoglyph domains
+seer drift example.com --record   # Diff registration vs. baseline, then update it
 
 # Reverse DNS
 seer reverse 8.8.8.8
@@ -221,6 +234,9 @@ seer reverse 8.8.8.8
 # Discovery
 seer avail example.com
 seer subdomains example.com
+seer subdomains example.com --classify   # Resolve each name: live/dead + takeover risk
+seer subdomains example.com --record     # Store a CT-log baseline
+seer subdomains example.com --diff       # Exit 1 when new names appear (cron/CI)
 seer tld .com
 
 # Domain diff
@@ -230,18 +246,21 @@ seer diff example.com google.com
 seer watch add example.com
 seer watch list
 seer watch                        # Check all watched domains
+seer watch --fail-on warning      # Exit non-zero at warning severity (default: critical)
 seer watch remove example.com
 
 # Lookup history
 seer history example.com
 seer history --clear
 
-# Bulk operations (with CSV export)
+# Bulk operations (with CSV export) — ops: lookup, whois, rdap, dig, prop,
+# status, avail, info, ssl, caa, posture, confusables
 seer bulk lookup domains.txt
 seer bulk status domains.txt -o results.csv
 seer bulk dig domains.txt MX
-seer bulk avail domains.txt
-seer bulk info domains.txt
+seer bulk ssl domains.txt
+seer bulk posture domains.txt
+cat domains.txt | seer bulk avail -      # Read the list from stdin
 
 # Scriptable field extraction
 seer --quiet --fields registrar lookup example.com
@@ -301,6 +320,11 @@ propagation = seer.propagation("example.com", record_type="A")
 status = seer.status("example.com")
 ssl    = seer.ssl("example.com")
 dnssec = seer.dnssec("example.com")
+caa    = seer.caa("example.com")
+
+# Security intel
+posture     = seer.posture("example.com")        # SPF / DMARC / MTA-STS
+confusables = seer.confusables("example.com")    # Look-alike domains
 
 # Availability & info
 available = seer.availability("example.com")
@@ -310,6 +334,7 @@ info      = seer.info("example.com")
 diff       = seer.diff("example.com", "google.com")
 comparison = seer.dns_compare("example.com", "A", "8.8.8.8", "1.1.1.1")
 subdomains = seer.subdomains("example.com")
+classified = seer.subdomains_classify("example.com")  # live/dead + takeover risk
 
 # Bulk operations
 results = seer.bulk_lookup(["example.com", "google.com"], concurrency=10)
@@ -394,25 +419,31 @@ seer-api   # Starts on http://127.0.0.1:8000 (loopback-only by default)
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/lookup/{domain}` | GET | Smart lookup (RDAP + WHOIS) |
-| `/lookup/bulk` | POST | Bulk smart lookups |
+| `/info/{domain}` | GET | Merged RDAP + WHOIS domain info |
 | `/whois/{domain}` | GET | WHOIS lookup |
-| `/whois/bulk` | POST | Bulk WHOIS lookups |
 | `/rdap/domain/{domain}` | GET | RDAP domain lookup |
 | `/rdap/ip/{ip}` | GET | RDAP IP lookup |
 | `/rdap/asn/{asn}` | GET | RDAP ASN lookup |
 | `/dns/{domain}/{record_type}` | GET | DNS query |
-| `/dns/bulk` | POST | Bulk DNS queries |
+| `/dns/compare/{domain}` | GET | Compare records across two nameservers |
+| `/dnssec/{domain}` | GET | DNSSEC validation |
 | `/propagation/{domain}/{record_type}` | GET | DNS propagation check |
-| `/propagation/bulk` | POST | Bulk propagation checks |
 | `/status/{domain}` | GET | Domain status check |
-| `/status/bulk` | POST | Bulk status checks |
-| `/ssl/bulk` | POST | Bulk SSL certificate checks |
+| `/ssl/{domain}` | GET | SSL chain inspection |
+| `/caa/{domain}` | GET | CAA policy + issuer comparison |
+| `/posture/{domain}` | GET | Email security posture (SPF/DMARC/MTA-STS) |
+| `/confusables/{domain}` | GET | Look-alike domain detection |
+| `/availability/{domain}` | GET | Domain availability |
+| `/subdomains/{domain}` | GET | Subdomain enumeration |
+| `/diff/{domain_a}/{domain_b}` | GET | Side-by-side domain comparison |
 | `/health` | GET | Health check |
 | `/metrics` | GET | Prometheus metrics (when `SEER_METRICS_ENABLED=true`) |
 
-Every bulk endpoint also has a streaming sibling at `…/bulk/stream` that
-emits results incrementally as Server-Sent Events (`text/event-stream`)
-instead of buffering the full response.
+**Bulk variants:** `lookup`, `whois`, `dns`, `propagation`, `status`, `ssl`,
+`availability`, and `info` accept a `POST …/bulk` with a domain list. All of
+those except `availability` and `info` also have a streaming sibling at
+`…/bulk/stream` that emits results incrementally as Server-Sent Events
+(`text/event-stream`) instead of buffering the full response.
 
 ```bash
 # Examples
@@ -457,26 +488,23 @@ eval "$(seer generate-key --export)"
 SEER_API_KEY=$KEY SEER_HOST=0.0.0.0 seer-api
 ```
 
-**16 tools available:**
+**25 tools available:**
 
-| Tool | Description |
-|------|-------------|
-| `seer_lookup` | Smart domain lookup |
-| `seer_info` | Comprehensive domain info |
-| `seer_whois` | WHOIS lookup |
-| `seer_rdap_domain` | RDAP domain lookup |
-| `seer_rdap_ip` | RDAP IP lookup |
-| `seer_rdap_asn` | RDAP ASN lookup |
-| `seer_dig` | DNS query |
-| `seer_propagation` | DNS propagation check |
-| `seer_status` | Domain status check |
-| `seer_bulk_lookup` | Bulk smart lookups |
-| `seer_bulk_whois` | Bulk WHOIS lookups |
-| `seer_bulk_dig` | Bulk DNS queries |
-| `seer_bulk_status` | Bulk status checks |
-| `seer_bulk_propagation` | Bulk propagation checks |
-| `seer_bulk_info` | Bulk domain info |
-| `seer_bulk_ssl` | Bulk SSL certificate checks |
+| Tool | Description | | Tool | Description |
+|------|-------------|---|------|-------------|
+| `seer_lookup` | Smart domain lookup | | `seer_dnssec` | DNSSEC validation |
+| `seer_info` | Comprehensive domain info | | `seer_caa` | CAA policy + issuer comparison |
+| `seer_whois` | WHOIS lookup | | `seer_posture` | Email security posture |
+| `seer_rdap_domain` | RDAP domain lookup | | `seer_confusables` | Look-alike domain detection |
+| `seer_rdap_ip` | RDAP IP lookup | | `seer_availability` | Domain availability |
+| `seer_rdap_asn` | RDAP ASN lookup | | `seer_subdomains` | Subdomain enumeration |
+| `seer_dig` | DNS query | | `seer_diff` | Side-by-side domain comparison |
+| `seer_dns_compare` | Compare two nameservers | | `seer_bulk_lookup` | Bulk smart lookups |
+| `seer_propagation` | DNS propagation check | | `seer_bulk_whois` | Bulk WHOIS lookups |
+| `seer_status` | Domain status check | | `seer_bulk_dig` | Bulk DNS queries |
+| `seer_ssl` | SSL chain inspection | | `seer_bulk_status` | Bulk status checks |
+| `seer_bulk_propagation` | Bulk propagation checks | | `seer_bulk_info` | Bulk domain info |
+| `seer_bulk_ssl` | Bulk SSL certificate checks | | | |
 
 <details>
 <summary><b>Claude Desktop configuration</b></summary>
@@ -557,6 +585,10 @@ Initialize a config file at `~/.seer/config.toml`:
 seer config --init
 ```
 
+Settings: default output format, nameserver (UDP, `tls://`, or `https://`),
+per-protocol timeouts, bulk concurrency, and rate-limit delay — all clamped to
+safe ranges. Applies to the CLI and REPL.
+
 ### Timeouts
 
 | Client | Default |
@@ -622,20 +654,25 @@ seer/
 │       ├── config.rs         # Configuration management
 │       ├── whois/            # WHOIS client, parser, server mapping
 │       ├── rdap/             # RDAP client with IANA bootstrap
-│       ├── dns/              # Resolver, propagation, DNSSEC, follow
-│       ├── ssl/              # SSL certificate chain inspection
+│       ├── dns/              # Resolver (UDP/DoT/DoH), propagation, DNSSEC, follow
+│       ├── ssl.rs            # SSL certificate chain inspection
+│       ├── caa.rs            # CAA policy lookup + issuer comparison
+│       ├── posture.rs        # Email security posture (SPF/DMARC/MTA-STS)
+│       ├── confusables.rs    # Look-alike / homoglyph domain detection
+│       ├── drift.rs          # Registration drift vs. baseline
 │       ├── status/           # HTTP, SSL, and expiration checking
 │       ├── bulk/             # Concurrent bulk executor
-│       ├── diff/             # Domain comparison
-│       ├── availability/     # Domain availability checking
-│       ├── subdomains/       # CT log enumeration
+│       ├── diff.rs           # Domain comparison
+│       ├── availability.rs   # Domain availability checking
+│       ├── subdomains/       # CT log enumeration + classification/baselines
 │       ├── tld/              # TLD information
-│       ├── watchlist/        # Domain monitoring
-│       ├── history/          # Lookup history tracking
-│       ├── domain_info/      # Flat domain info structure
-│       ├── cache/            # TTL and single-value caching
-│       ├── retry/            # Network retry with classification
-│       ├── logging/          # Structured logging + OpenTelemetry
+│       ├── watchlist.rs      # Domain monitoring
+│       ├── history.rs        # Lookup history tracking
+│       ├── domain_info.rs    # Flat domain info structure
+│       ├── cache.rs          # TTL caching (stale-while-revalidate)
+│       ├── retry.rs          # Network retry with classification
+│       ├── net.rs            # SSRF guards (public-host validation)
+│       ├── logging.rs        # Structured logging + OpenTelemetry
 │       ├── output/           # Formatters (human/JSON/YAML/markdown)
 │       └── colors.rs         # Catppuccin color palette
 │
@@ -643,7 +680,8 @@ seer/
 │   └── src/
 │       ├── main.rs           # Clap commands & dispatch
 │       ├── display/          # Spinner and progress utilities
-│       └── repl/             # Interactive REPL
+│       ├── repl/             # Interactive REPL
+│       └── tui/              # Full-screen ratatui TUI (16 lenses)
 │
 ├── seer-py/                  # Python bindings (PyO3)
 │   ├── src/lib.rs            # Rust → Python bridge
@@ -653,7 +691,7 @@ seer/
     └── seer_api/
         ├── main.py           # FastAPI app
         ├── routers/          # API endpoint modules
-        └── mcp/              # MCP server (16 tools)
+        └── mcp/              # MCP server (25 tools)
 ```
 
 ---
