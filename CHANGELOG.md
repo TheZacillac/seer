@@ -11,6 +11,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **WHOIS registry-format refresh** — a live audit against real registries fixed
+  four gaps ([#106]):
+  - `.de`: DENIC is now queried with `-T dn,ace`, restoring nameservers, DNSKEY,
+    and change date (a bare query returns only `Status: connect`).
+  - `.jp`: the JPRS parser understands the current bracket-label format
+    (`[Name Server]`, `[Registrant]`, Japanese and `/e` English variants) and
+    extracts the expiration date JPRS now publishes; the client sends the `/e`
+    suffix for English responses.
+  - `.lv`: the `Nserver: -` no-delegation placeholder is no longer reported as a
+    literal nameserver.
+  - `.dk`: Punktum's `Hostname:` nameserver lines and `Registered:` creation
+    date now parse.
+
 ## [0.40.0] - 2026-07-04
 
 ### Added
@@ -436,3 +450,4 @@ Two notable breaking changes landed in this period (see `CLAUDE.md` for details)
 [#101]: https://github.com/TheZacillac/seer/pull/101
 [#102]: https://github.com/TheZacillac/seer/pull/102
 [#103]: https://github.com/TheZacillac/seer/pull/103
+[#106]: https://github.com/TheZacillac/seer/pull/106

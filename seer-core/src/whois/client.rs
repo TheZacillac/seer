@@ -195,7 +195,8 @@ impl WhoisClient {
             debug!(whois_server = %whois_server, depth = depth, "Querying WHOIS server");
 
             // Query with retry logic
-            let raw_response = self.query_server_with_retry(whois_server, domain).await?;
+            let query = format_query_for_server(whois_server, domain);
+            let raw_response = self.query_server_with_retry(whois_server, &query).await?;
             let current_response = WhoisResponse::parse(domain, whois_server, &raw_response);
 
             // Prefer registry response when it has core data (registrar, dates,
@@ -268,7 +269,8 @@ impl WhoisClient {
         }
 
         let domain = normalize_domain(domain)?;
-        let raw_response = self.query_server_with_retry(server, &domain).await?;
+        let query = format_query_for_server(server, &domain);
+        let raw_response = self.query_server_with_retry(server, &query).await?;
         Ok(WhoisResponse::parse(&domain, server, &raw_response))
     }
 
@@ -337,6 +339,18 @@ impl WhoisClient {
             "No WHOIS server found for TLD '{}'",
             tld
         )))
+    }
+}
+
+/// Formats the wire query for registries whose port-43 servers need more
+/// than the bare domain: DENIC returns only `Status: connect` unless queried
+/// with `-T dn,ace`, and JPRS answers in Japanese without a `/e` suffix.
+/// Everything else gets the domain unchanged.
+fn format_query_for_server(server: &str, domain: &str) -> String {
+    match server.to_ascii_lowercase().as_str() {
+        "whois.denic.de" => format!("-T dn,ace {}", domain),
+        "whois.jprs.jp" => format!("{}/e", domain),
+        _ => domain.to_string(),
     }
 }
 
@@ -822,5 +836,30 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, SeerError::Timeout(_)), "got: {err:?}");
+    }
+
+    /// Registries whose port-43 servers need a non-bare query: DENIC returns
+    /// only `Status: connect` without `-T dn,ace`, and JPRS responds in
+    /// Japanese without the `/e` suffix.
+    #[test]
+    fn format_query_for_server_registry_specific() {
+        assert_eq!(
+            format_query_for_server("whois.denic.de", "example.de"),
+            "-T dn,ace example.de"
+        );
+        assert_eq!(
+            format_query_for_server("WHOIS.DENIC.DE", "example.de"),
+            "-T dn,ace example.de",
+            "server hostname match must be case-insensitive"
+        );
+        assert_eq!(
+            format_query_for_server("whois.jprs.jp", "example.jp"),
+            "example.jp/e"
+        );
+        assert_eq!(
+            format_query_for_server("whois.verisign-grs.com", "example.com"),
+            "example.com",
+            "all other servers get the bare domain"
+        );
     }
 }

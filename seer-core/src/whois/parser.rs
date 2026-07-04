@@ -45,6 +45,8 @@ static CREATION_DATE_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
         Regex::new(r"(?i)Registration Date:\s*(.+)").expect("Invalid regex for Registration Date"),
         Regex::new(r"(?i)Domain Registration Date:\s*(.+)")
             .expect("Invalid regex for Domain Registration Date"),
+        // Punktum (.dk) style: `Registered:           2018-01-25`
+        Regex::new(r"(?im)^\s*Registered:\s*(.+)$").expect("Invalid regex for Registered"),
     ]
 });
 
@@ -83,6 +85,10 @@ static NAMESERVER_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
         Regex::new(r"(?i)Nameserver:\s*(.+)").expect("Invalid regex for Nameserver"),
         Regex::new(r"(?i)nserver:\s*(.+)").expect("Invalid regex for nserver"),
         Regex::new(r"(?im)^NS:\s+(.+)$").expect("Invalid regex for NS"),
+        // Punktum (.dk) lists nameservers as `Hostname:` lines under a
+        // `Nameservers` heading. Anchored to line start to avoid matching
+        // hostname mentions inside prose.
+        Regex::new(r"(?im)^\s*Hostname:\s*(.+)$").expect("Invalid regex for Hostname"),
     ]
 });
 
@@ -1330,5 +1336,35 @@ Domain Status: clientTransferProhibited
             back.raw_response.is_empty(),
             "skipped raw_response defaults to empty on load"
         );
+    }
+
+    /// Punktum (.dk) format, captured live 2026-07: nameservers appear as
+    /// `Hostname:` lines under a `Nameservers` heading, and the creation
+    /// date is labelled `Registered:`.
+    #[test]
+    fn punktum_dk_hostnames_and_registered_date() {
+        let raw = "Domain:               punktum.dk\n\
+                   DNS:                  punktum.dk\n\
+                   Registered:           2018-01-25\n\
+                   Expires:              2027-01-31\n\
+                   Registration period:  1 year\n\
+                   DNSSEC:               Signed delegation\n\
+                   Status:               Active\n\
+                   \n\
+                   Nameservers\n\
+                   Hostname:             auth01.ns.dk-hostmaster.dk\n\
+                   Hostname:             auth02.ns.dk-hostmaster.dk\n\
+                   Hostname:             auth03.ns.dk-hostmaster.dk\n";
+        let r = WhoisResponse::parse("punktum.dk", "whois.punktum.dk", raw);
+        assert_eq!(
+            r.nameservers,
+            vec![
+                "auth01.ns.dk-hostmaster.dk",
+                "auth02.ns.dk-hostmaster.dk",
+                "auth03.ns.dk-hostmaster.dk"
+            ]
+        );
+        assert!(r.creation_date.is_some(), "created from 'Registered:'");
+        assert!(r.expiration_date.is_some(), "expires from 'Expires:'");
     }
 }

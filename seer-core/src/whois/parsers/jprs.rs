@@ -23,9 +23,12 @@ use regex::Regex;
 use super::{push_bounded, RegistryParser, MAX_NAMESERVERS, MAX_STATUSES};
 use crate::whois::parser::WhoisResponse;
 
-/// Matches nameserver lines: `p. [ネームサーバ]   value`
+/// Matches nameserver lines in both the legacy lettered format
+/// (`p. [ネームサーバ]   value`) and the current bracket-only format
+/// (`[Name Server]   value` / `[ネームサーバ]   value`).
 static NS_PATTERN: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?m)^p\.\s+\[ネームサーバ\]\s+(.+)$").expect("Invalid JPRS NS regex")
+    Regex::new(r"(?m)^(?:p\.\s+\[ネームサーバ\]|\[(?:Name Server|ネームサーバ)\])\s+(.+)$")
+        .expect("Invalid JPRS NS regex")
 });
 
 /// Matches organization (English): `g. [Organization]   value`
@@ -37,24 +40,44 @@ static ORG_PATTERN: Lazy<Regex> = Lazy::new(|| {
 static ORG_JP_PATTERN: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?m)^f\.\s+\[組織名\]\s+(.+)$").expect("Invalid JPRS org JP regex"));
 
-/// Matches state: `[状態]   value`
-static STATUS_PATTERN: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?m)^\[状態\]\s+(.+)$").expect("Invalid JPRS status regex"));
-
-/// Matches last updated: `[最終更新]   YYYY/MM/DD HH:MM:SS (JST)`
-static UPDATED_PATTERN: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?m)^\[最終更新\]\s+(.+)$").expect("Invalid JPRS updated regex"));
-
-/// Matches creation date: `[登録年月日]   YYYY/MM/DD` or `[接続年月日]   YYYY/MM/DD`
-static CREATED_PATTERN: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?m)^\[(?:登録年月日|接続年月日)\]\s+(.+)$").expect("Invalid JPRS created regex")
+/// Matches state: `[状態]   value` / `[Status]   value` / `[State]   value`
+static STATUS_PATTERN: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?m)^\[(?:状態|Status|State)\]\s+(.+)$").expect("Invalid JPRS status regex")
 });
 
-/// Matches DNSSEC signing key line: `s. [署名鍵]   value`
-/// The value portion is optional — an empty value means unsigned.
-/// Uses `[^\S\n]*` instead of `\s*` to avoid matching across newlines in multiline mode.
+/// Matches last updated: `[最終更新]` / `[Last Updated]`   YYYY/MM/DD HH:MM:SS (JST)
+static UPDATED_PATTERN: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?m)^\[(?:最終更新|Last Updated)\]\s+(.+)$").expect("Invalid JPRS updated regex")
+});
+
+/// Matches creation date: `[登録年月日]` / `[接続年月日]` / `[Created on]`   YYYY/MM/DD
+static CREATED_PATTERN: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?m)^\[(?:登録年月日|接続年月日|Created on)\]\s+(.+)$")
+        .expect("Invalid JPRS created regex")
+});
+
+/// Matches expiration date: `[有効期限]` / `[Expires on]`   YYYY/MM/DD
+static EXPIRES_PATTERN: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?m)^\[(?:有効期限|Expires on)\]\s+(.+)$").expect("Invalid JPRS expires regex")
+});
+
+/// Matches DNSSEC signing key line, legacy `s. [署名鍵]` or current
+/// `[Signing Key]` / `[署名鍵]`. The value portion is optional — an empty
+/// value means unsigned. Uses `[^\S\n]*` instead of `\s*` to avoid matching
+/// across newlines in multiline mode.
 static SIGNING_KEY_LINE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?m)^s\.\s+\[署名鍵\][^\S\n]*(.+)?$").expect("Invalid JPRS signing key regex")
+    Regex::new(r"(?m)^(?:s\.\s+\[署名鍵\]|\[(?:Signing Key|署名鍵)\])[^\S\n]*(.+)?$")
+        .expect("Invalid JPRS signing key regex")
+});
+
+/// Matches registrant lines in the current bracket format: prefer the English
+/// `[Registrant]` value; fall back to the Japanese `[登録者名]`.
+static REGISTRANT_EN_PATTERN: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?m)^\[Registrant\]\s+(.+)$").expect("Invalid JPRS registrant regex")
+});
+
+static REGISTRANT_JP_PATTERN: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?m)^\[登録者名\]\s+(.+)$").expect("Invalid JPRS registrant JP regex")
 });
 
 // Also support the English-appended format (when /e is used)
@@ -145,6 +168,20 @@ impl RegistryParser for JprsParser {
                 }
             }
         }
+        // Current bracket format: [Registrant] (English) / [登録者名] (Japanese)
+        for pattern in [&REGISTRANT_EN_PATTERN, &REGISTRANT_JP_PATTERN] {
+            if organization.is_some() {
+                break;
+            }
+            if let Some(caps) = pattern.captures(raw) {
+                if let Some(m) = caps.get(1) {
+                    let org = m.as_str().trim().to_string();
+                    if !org.is_empty() {
+                        organization = Some(org);
+                    }
+                }
+            }
+        }
 
         // Extract status
         if let Some(caps) = STATUS_PATTERN.captures(raw) {
@@ -163,6 +200,12 @@ impl RegistryParser for JprsParser {
         if let Some(caps) = CREATED_PATTERN.captures(raw) {
             if let Some(m) = caps.get(1) {
                 creation_date = Self::parse_jprs_date(m.as_str());
+            }
+        }
+        let mut expiration_date = None;
+        if let Some(caps) = EXPIRES_PATTERN.captures(raw) {
+            if let Some(m) = caps.get(1) {
+                expiration_date = Self::parse_jprs_date(m.as_str());
             }
         }
 
@@ -193,7 +236,7 @@ impl RegistryParser for JprsParser {
             tech_email: None,
             tech_phone: None,
             creation_date,
-            expiration_date: None, // JPRS doesn't include expiry in public WHOIS
+            expiration_date,
             updated_date,
             nameservers,
             status,
@@ -336,5 +379,75 @@ p.        [Name Server]              b.dns.jp
     fn test_supported_tlds() {
         let parser = JprsParser::new();
         assert_eq!(parser.supported_tlds(), &["jp"]);
+    }
+
+    /// Current JPRS format (captured live 2026-07): bracket labels with NO
+    /// letter prefixes — `[Name Server]`, Japanese date labels, and an expiry
+    /// field `[有効期限]` that JPRS now publishes.
+    const SAMPLE_JPRS_CURRENT: &str = r#"[ JPRS database provides information on network administration. Its use is    ]
+Domain Information: [ドメイン情報]
+[Domain Name]                   JPRS.JP
+
+[登録者名]                      株式会社日本レジストリサービス
+[Registrant]                    Japan Registry Services Co.,Ltd.
+
+[Name Server]                   ns1.jprs.jp
+[Name Server]                   ns2.jprs.jp
+[Name Server]                   ns3.jprs.jp
+[Name Server]                   ns4.jprs.jp
+[Signing Key]                   7240 8 2 (
+                                E147A85589E24FE0DBB5980C73501B5D
+                                D656BE5550714F150BE574AE8777B77D )
+
+[登録年月日]                    2001/02/02
+[有効期限]                      2027/02/28
+[状態]                          Active
+[最終更新]                      2026/03/01 01:05:03 (JST)"#;
+
+    /// Same record queried with the `/e` suffix: English-only labels.
+    const SAMPLE_JPRS_CURRENT_EN: &str = r#"Domain Information:
+[Domain Name]                   JPRS.JP
+
+[Registrant]                    Japan Registry Services Co.,Ltd.
+
+[Name Server]                   ns1.jprs.jp
+[Name Server]                   ns2.jprs.jp
+[Signing Key]                   7240 8 2 (
+                                E147A85589E24FE0DBB5980C73501B5D )
+
+[Created on]                    2001/02/02
+[Expires on]                    2027/02/28
+[Status]                        Active
+[Last Updated]                  2026/03/01 01:05:03 (JST)"#;
+
+    #[test]
+    fn test_jprs_current_format_nameservers_and_dates() {
+        let parser = JprsParser::new();
+        let result = parser.parse("jprs.jp", "whois.jprs.jp", SAMPLE_JPRS_CURRENT);
+
+        assert_eq!(
+            result.nameservers,
+            vec!["ns1.jprs.jp", "ns2.jprs.jp", "ns3.jprs.jp", "ns4.jprs.jp"]
+        );
+        assert!(result.creation_date.is_some(), "created from [登録年月日]");
+        assert!(result.expiration_date.is_some(), "expiry from [有効期限]");
+        assert!(result.status.contains(&"Active".to_string()));
+        assert_eq!(
+            result.organization.as_deref(),
+            Some("Japan Registry Services Co.,Ltd.")
+        );
+        assert_eq!(result.dnssec.as_deref(), Some("signedDelegation"));
+    }
+
+    #[test]
+    fn test_jprs_current_format_english_labels() {
+        let parser = JprsParser::new();
+        let result = parser.parse("jprs.jp", "whois.jprs.jp", SAMPLE_JPRS_CURRENT_EN);
+
+        assert_eq!(result.nameservers, vec!["ns1.jprs.jp", "ns2.jprs.jp"]);
+        assert!(result.creation_date.is_some(), "created from [Created on]");
+        assert!(result.expiration_date.is_some(), "expiry from [Expires on]");
+        assert!(result.status.contains(&"Active".to_string()));
+        assert_eq!(result.dnssec.as_deref(), Some("signedDelegation"));
     }
 }

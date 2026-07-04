@@ -150,7 +150,9 @@ impl RegistryParser for NicLvParser {
                 (Section::Registrar, "name") if registrar.is_none() => {
                     registrar = Some(value.to_string());
                 }
-                (Section::Nservers, "nserver") => {
+                // NIC.LV emits `Nserver: -` for domains with no delegation;
+                // the dash is a placeholder, not a nameserver.
+                (Section::Nservers, "nserver") if value != "-" => {
                     push_bounded(
                         &mut nameservers,
                         value.to_ascii_lowercase(),
@@ -312,6 +314,19 @@ Updated: 2026-05-26T11:12:34.874386+00:00\n";
     #[test]
     fn supported_tlds() {
         assert_eq!(NicLvParser::new().supported_tlds(), &["lv"]);
+    }
+
+    #[test]
+    fn placeholder_dash_nserver_is_skipped() {
+        // NIC.LV emits `Nserver: -` when a domain has no delegation (seen
+        // live on nic.lv itself); "-" must not be recorded as a nameserver.
+        let raw = "[Domain]\nDomain: nic.lv\nStatus: active\n\n[Nservers]\nNserver: -\n";
+        let r = parse(raw);
+        assert!(
+            r.nameservers.is_empty(),
+            "placeholder '-' must not be a nameserver, got {:?}",
+            r.nameservers
+        );
     }
 
     #[test]
