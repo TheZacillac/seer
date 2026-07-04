@@ -156,7 +156,7 @@ tokio = { version = "1", features = ["full"] }
 | | seer-cli | seer-core |
 |---|----------|-----------|
 | **What** | Executable binary | Rust library crate |
-| **Install** | `cargo install seer-cli` | `cargo add seer-core` |
+| **Install** | `brew install TheZacillac/tap/seer` or `cargo install seer-cli` | `cargo add seer-core` |
 | **Use** | Run `seer` in your terminal | `use seer_core::*` in Rust code |
 | **Provides** | Commands, REPL, formatted output | Structs, clients, async APIs |
 | **Depends on** | seer-core internally | Nothing — it's the foundation |
