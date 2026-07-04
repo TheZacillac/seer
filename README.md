@@ -76,7 +76,7 @@ A high-performance, multi-interface domain utility suite — query WHOIS, RDAP, 
 </tr>
 </table>
 
-### 🏗️ Five Interfaces, One Core
+### 🏗️ Four Interfaces, One Core
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
@@ -85,8 +85,8 @@ A high-performance, multi-interface domain utility suite — query WHOIS, RDAP, 
 │  seer-cli   │   seer-py   │   seer-api   │       seer-api        │
 │  Terminal   │   Python    │   REST API   │     MCP Server        │
 └──────┬──────┴──────┬──────┴──────┬───────┴──────────┬────────────┘
-       │             │             │                   │
-       │             └─────────────┼───────────────────┘
+       │             │             │                  │
+       │             └─────────────┼──────────────────┘
        │                           │
        ▼                           ▼
 ┌──────────────────────────────────────────────────────────────────┐
