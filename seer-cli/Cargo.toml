@@ -15,6 +15,11 @@ categories = ["command-line-utilities", "network-programming"]
 name = "seer"
 path = "src/main.rs"
 
+# cargo-dist: name the Homebrew formula after the binary (`seer`) rather than
+# the crate (`seer-cli`), so the install is `brew install TheZacillac/tap/seer`.
+[package.metadata.dist]
+formula = "seer"
+
 [dependencies]
 seer-core = { version = "0.39.0", path = "../seer-core" }
 tokio = { workspace = true }

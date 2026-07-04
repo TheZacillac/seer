@@ -8,11 +8,12 @@ cargo-dist-version = "0.32.0"
 # CI backends to support
 ci = "github"
 # The installers to generate for each app.
-# NOTE: Homebrew publishing is deferred (tracked for later). To re-enable, add
-# "homebrew" below plus `tap = "TheZacillac/homebrew-tap"` and
-# `publish-jobs = ["homebrew"]`, then create the tap repo and a
+installers = ["shell", "powershell", "homebrew"]
+# Homebrew tap to publish the formula to. The `publish-homebrew-formula` job in
+# release.yml pushes `Formula/seer.rb` here on each tagged release, using the
 # `HOMEBREW_TAP_TOKEN` repo secret (a PAT with cross-repo write access —
-# GITHUB_TOKEN cannot push cross-repo). Re-run `dist generate` afterward.
-installers = ["shell", "powershell"]
+# GITHUB_TOKEN cannot push cross-repo). Install: `brew install TheZacillac/tap/seer`.
+tap = "TheZacillac/homebrew-tap"
+publish-jobs = ["homebrew"]
 # Target platforms to build apps for (Rust target-triple syntax)
 targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
