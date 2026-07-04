@@ -12,6 +12,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **Availability detection across ~30 registries** — a full sweep of all 1,246
+  mapped TLDs (registered + unregistered probe per TLD) found and fixed several
+  gaps in WHOIS availability detection ([#107]):
+  - Verdicts printed on `%`/`#` comment lines (AFNIC `%% NOT FOUND`, NIC.br
+    `% No match for`, CZ.NIC `%ERROR:101: no entries found`, NORID, NIC.AT,
+    ISNIC, RNIDS, RESTENA, NIC.SN, and others) are now detected — comment
+    markers are stripped rather than the line skipped, with the existing
+    word-count gate and refusal veto still applied.
+  - Sentence-form verdicts longer than the status-line word gate (KISA `.kr`,
+    EDUCAUSE `.edu`, NASK `.pl`) match anchored at line start.
+  - New phrasings: RESTENA `.lu` "No such domain", NIC Mexico's
+    `Object_Not_Found` token, NIC Argentina's Spanish response, and
+    suffix-anchored "<domain> is free" (SIDN `.nl`, SETAR `.aw`).
+  - The JPRS (`.jp`) and EDUCAUSE (`.edu`) parsers stamped a synthesized
+    registrar onto *not-found* responses (EDUCAUSE's current format echoes the
+    queried `Domain Name:`, defeating its old guard), which made unregistered
+    domains impossible to report as available.
+- **WHOIS-retirement notices** (ICANN RDAP transition) — registries that
+  retired port-43 WHOIS (e.g. GMO Registry's 35 brand TLDs, May 2026) answer
+  every query with a retirement notice; it is now classified as "no usable
+  WHOIS service" so the smart-lookup ladder routes to RDAP instead of treating
+  the notice as a thin record. ([#107])
+- **Removed 8 dead WHOIS server mappings** (`apple`, `brussels`, `cymru`,
+  `wales`, `vlaanderen`, `pharmacy`, `na`, `xn--p1acf`/`рус`) whose hostnames
+  no longer resolve and whose IANA records no longer publish a `whois:` field
+  (RDAP-only transitions). `seer whois` on these TLDs now returns the clean
+  "check whois via <registry URL>" guidance instead of a DNS failure. ([#107])
 - **WHOIS registry-format refresh** — a live audit against real registries fixed
   four gaps ([#106]):
   - `.de`: DENIC is now queried with `-T dn,ace`, restoring nameservers, DNSKEY,
@@ -451,3 +478,4 @@ Two notable breaking changes landed in this period (see `CLAUDE.md` for details)
 [#102]: https://github.com/TheZacillac/seer/pull/102
 [#103]: https://github.com/TheZacillac/seer/pull/103
 [#106]: https://github.com/TheZacillac/seer/pull/106
+[#107]: https://github.com/TheZacillac/seer/pull/107

@@ -258,18 +258,28 @@ impl RegistryParser for EducauseParser {
             }
         }
 
+        // Only attribute the record to EDUCAUSE when the response actually
+        // carried registration DATA; a not-found body must stay registrar-less
+        // so availability detection works. The current not-found format echoes
+        // the query as a `Domain Name:` line, so `domain_found` alone is not
+        // sufficient evidence of a registration record.
+        let has_data = domain_found
+            && (registrant.is_some()
+                || !nameservers.is_empty()
+                || creation_date.is_some()
+                || expiration_date.is_some()
+                || admin_name.is_some()
+                || tech_name.is_some());
+
         WhoisResponse {
             domain: domain.to_string(),
-            // Only attribute the record to EDUCAUSE when the response actually
-            // carried a registration record; a "No match" body must stay
-            // registrar-less so availability detection works.
-            registrar: domain_found.then(|| "EDUCAUSE".to_string()),
+            registrar: has_data.then(|| "EDUCAUSE".to_string()),
             registrant: registrant.clone(),
             organization: registrant,
             registrant_email: None,
             registrant_phone: None,
             registrant_address: None,
-            registrant_country: Some("US".to_string()),
+            registrant_country: has_data.then(|| "US".to_string()),
             admin_name,
             admin_organization: None,
             admin_email,
@@ -476,6 +486,35 @@ or related to .edu domain registration records.
 -------------------------------------------------------------
 
 No match for "NOTAREALDOMAIN123XYZ.EDU"."#;
+
+    /// EDUCAUSE's CURRENT not-found body (captured live 2026-07) ECHOES the
+    /// queried domain as a `Domain Name:` line before the not-found sentence,
+    /// so `Domain Name:` presence alone must not count as a registration
+    /// record — only extracted data (registrant, nameservers, dates,
+    /// contacts) may stamp the registrar.
+    const SAMPLE_NO_MATCH_CURRENT: &str = r#"Domain Name: SEER-SWEEP-ZK8QV3XW.EDU
+
+The domain name you requested was not found in our database.
+
+>>> Last update of WHOIS database: 2026-07-04T22:55:30+00:00 <<<"#;
+
+    #[test]
+    fn test_educause_current_not_found_reports_available() {
+        let parser = EducauseParser::new();
+        let result = parser.parse(
+            "seer-sweep-zk8qv3xw.edu",
+            "whois.educause.edu",
+            SAMPLE_NO_MATCH_CURRENT,
+        );
+        assert_eq!(
+            result.registrar, None,
+            "domain-name echo alone must not stamp a registrar"
+        );
+        assert!(
+            result.is_available(),
+            "current-format not-found must be reported available"
+        );
+    }
 
     #[test]
     fn test_educause_no_match_reports_available() {

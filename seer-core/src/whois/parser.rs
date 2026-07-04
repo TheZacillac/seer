@@ -360,10 +360,17 @@ impl WhoisResponse {
             "no whois server is known",
             "this server does not",
         ];
+        // Registries retiring port-43 WHOIS under ICANN's RDAP transition
+        // (e.g. GMO Registry, May 2026) answer every query with a prose
+        // retirement notice; the phrase can sit mid-sentence, so it is
+        // matched with contains() rather than the line-start sentinels.
+        const SERVICE_RETIRED_PHRASES: &[&str] =
+            &["whois service has been retired", "whois has been retired"];
         let lower = self.raw_response.to_lowercase();
         lower.lines().any(|line| {
             let t = line.trim_start();
             SERVICE_ERROR_SENTINELS.iter().any(|s| t.starts_with(s))
+                || SERVICE_RETIRED_PHRASES.iter().any(|s| t.contains(s))
         })
     }
 
@@ -383,9 +390,16 @@ impl WhoisResponse {
             return false;
         }
 
-        // Scan the full response (excluding empty lines and comment lines). Some
+        // Scan the full response line-by-line (excluding empty lines). Some
         // registries (TWNIC, JPRS, NIC.br) prepend 3-4 notice lines before the
         // "no match" line, which would escape a small take(N) window.
+        //
+        // Comment markers are STRIPPED rather than skipped: many ccTLD
+        // registries print the verdict itself on a comment line (AFNIC
+        // "%% NOT FOUND", NORID "% No match", CZ.NIC "%ERROR:101: no entries
+        // found", RESTENA "% No such domain" — captured live 2026-07). The
+        // word-count gate and the non-availability veto below still shield
+        // against TOS prose on those same comment lines.
         //
         // Stream the scan line-by-line — avoids the ~1 MB `Vec<&str>` +
         // ~1 MB joined `String` the previous implementation allocated for
@@ -393,26 +407,16 @@ impl WhoisResponse {
         // (the size of one line, not the whole body) which is dropped at
         // the end of the iteration.
         for line in self.raw_response.lines() {
-            let trimmed = line.trim();
-            if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('%') {
+            let content = line.trim().trim_start_matches(['%', '#']).trim_start();
+            if content.is_empty() {
                 continue;
             }
             // Normalize internal whitespace (tabs, runs of spaces) to single
             // spaces before matching. Registries like DNS Belgium print
             // "Status:\tAVAILABLE" with a tab, which would otherwise slip
             // past space-delimited patterns such as "status: available".
-            let lower = trimmed.to_lowercase();
+            let lower = content.to_lowercase();
             let words: Vec<&str> = lower.split_whitespace().collect();
-            // Availability indicators are short status lines — the longest
-            // known registry phrasing ("No information was found matching
-            // that query.") is 7 words. Anything longer is prose (a TOS or
-            // notice footer) that may merely quote a phrase like "not found"
-            // or "does not exist"; skipping it avoids flipping a registered
-            // (but thin, fieldless) response to "available". The H6 guard
-            // above already covers responses that DO carry registration data.
-            if words.len() > MAX_STATUS_LINE_WORDS {
-                continue;
-            }
             let normalized = words.join(" ");
             // A line that negates or refuses availability is never an
             // availability indicator, even when it contains an availability
@@ -427,7 +431,31 @@ impl WhoisResponse {
             {
                 continue;
             }
+            // Sentence-form verdicts (KISA, EDUCAUSE, NASK) run past the word
+            // gate; they are matched anchored at line start instead, which a
+            // footer merely *quoting* the phrase mid-sentence cannot satisfy.
+            if AVAILABILITY_SENTENCE_PATTERNS
+                .iter()
+                .any(|p| normalized.starts_with(p))
+            {
+                return true;
+            }
+            // Availability indicators are short status lines — the longest
+            // known registry phrasing ("No information was found matching
+            // that query.") is 7 words. Anything longer is prose (a TOS or
+            // notice footer) that may merely quote a phrase like "not found"
+            // or "does not exist"; skipping it avoids flipping a registered
+            // (but thin, fieldless) response to "available". The H6 guard
+            // above already covers responses that DO carry registration data.
+            if words.len() > MAX_STATUS_LINE_WORDS {
+                continue;
+            }
             if AVAILABILITY_PATTERNS.iter().any(|p| normalized.contains(p)) {
+                return true;
+            }
+            // SIDN (.nl) / SETAR (.aw) style "<domain> is free": suffix-anchored
+            // so prose like "registration is free of charge" cannot match.
+            if normalized.ends_with(" is free") {
                 return true;
             }
         }
@@ -510,12 +538,32 @@ const AVAILABILITY_PATTERNS: &[&str] = &[
     // no-RDAP ccTLDs where WHOIS is the only registry signal. All are unique
     // to "not found" responses (verified not to collide with registered or
     // "not available" bodies).
-    "nothing found",   // KazNIC .kz / .қаз ("*** Nothing found for this query.")
-    "no found",        // TWNIC .tw / 台灣 / 台湾 ("No Found")
+    "nothing found", // KazNIC .kz / .қаз ("*** Nothing found for this query.") and NIC.AT .at
+    "no found",      // TWNIC .tw / 台灣 / 台湾 ("No Found")
     "no record found", // .ls and others ("No record found for '...'.")
     "no information was found", // .africa ("No information was found matching that query.")
     "object not found", // generic ("Object not found")
     "not find matchingrecord", // CONAC .政务 / .公益 ("Not find MatchingRecord")
+    // Phrasings surfaced by the 2026-07 full-TLD live sweep:
+    "no such domain",             // RESTENA .lu ("% No such domain")
+    "object_not_found",           // NIC Mexico .mx ("No_Se_Encontro_El_Objeto/Object_Not_Found")
+    "no se encuentra registrado", // NIC Argentina .ar (Spanish-only response)
+];
+
+/// Sentence-form "not found" verdicts that exceed [`MAX_STATUS_LINE_WORDS`].
+/// Matched with `starts_with` on the normalized line (anchored), so TOS
+/// footers that merely quote such a phrase mid-sentence cannot match.
+/// Wording captured live 2026-07.
+const AVAILABILITY_SENTENCE_PATTERNS: &[&str] = &[
+    // KISA .kr: "The requested domain was not found in the Registry or
+    // Registrar’s WHOIS Server."
+    "the requested domain was not found",
+    // EDUCAUSE .edu: "The domain name you requested was not found in our
+    // database."
+    "the domain name you requested was not found",
+    // NASK .pl: "No information available about domain name <x> in the
+    // Registry NASK database."
+    "no information available about domain name",
 ];
 
 /// Phrases that mark a status line as the *opposite* of available — an explicit
@@ -1366,5 +1414,121 @@ Domain Status: clientTransferProhibited
         );
         assert!(r.creation_date.is_some(), "created from 'Registered:'");
         assert!(r.expiration_date.is_some(), "expires from 'Expires:'");
+    }
+
+    /// Many ccTLD registries print the availability verdict on `%`-comment
+    /// lines (wording captured live 2026-07). The comment marker must be
+    /// stripped and the remainder evaluated, not skipped wholesale.
+    #[test]
+    fn availability_verdicts_on_comment_lines_are_detected() {
+        let cases: &[(&str, &str)] = &[
+            (
+                "fr/AFNIC",
+                "%% This is the AFNIC Whois server.\n%%\n%% NOT FOUND\n",
+            ),
+            (
+                "br/NIC.br",
+                "% Copyright (c) Nic.br\n% No match for seer-sweep.br\n",
+            ),
+            ("no/NORID", "% Norid AS holds the copyright\n% No match\n"),
+            (
+                "at/NIC.AT",
+                "% Copyright (c)2026 by NIC.AT (1)\n% nothing found\n",
+            ),
+            (
+                "cz/CZ.NIC",
+                "%ERROR:101: no entries found\n% No entries found.\n",
+            ),
+            ("rs/RNIDS", "%ERROR:103: Domain is not registered\n"),
+            (
+                "is/ISNIC",
+                "% Rights restricted by copyright.\n% No entries found for query \"x.is\".\n",
+            ),
+            ("lu/RESTENA", "% WHOIS x.lu\n% No such domain\n"),
+            ("dz/NIC.DZ", "% No match for domain 'X.DZ'.\n"),
+            ("sn/NIC.SN", "%% NOT FOUND\n"),
+        ];
+        for (name, raw) in cases {
+            let r = WhoisResponse::parse("example.test", "whois.test", raw);
+            assert!(
+                r.is_available(),
+                "{name}: comment-line verdict must mark available:\n{raw}"
+            );
+        }
+    }
+
+    /// Sentence-form "not found" phrasings exceed the 10-word status-line
+    /// gate; they are matched anchored at line start instead (live 2026-07).
+    #[test]
+    fn availability_sentence_phrasings_are_detected() {
+        let cases: &[(&str, &str)] = &[
+            (
+                "kr/KISA",
+                "query : x.kr\nThe requested domain was not found in the Registry or Registrar\u{2019}s WHOIS Server.\n",
+            ),
+            (
+                "edu/EDUCAUSE",
+                "Domain Name: X.EDU\nThe domain name you requested was not found in our database.\n",
+            ),
+            (
+                "pl/NASK",
+                "No information available about domain name x.pl in the Registry NASK database.\n",
+            ),
+        ];
+        for (name, raw) in cases {
+            let r = WhoisResponse::parse("example.test", "whois.test", raw);
+            assert!(
+                r.is_available(),
+                "{name}: sentence-form verdict must mark available:\n{raw}"
+            );
+        }
+    }
+
+    /// Registry-specific short phrasings captured live 2026-07: SIDN/.aw
+    /// "<domain> is free" (suffix-anchored so prose like "registration is
+    /// free of charge" cannot match), NIC Mexico's underscore token, and
+    /// NIC Argentina's Spanish phrasing.
+    #[test]
+    fn availability_special_short_phrasings_are_detected() {
+        for (name, raw) in [
+            ("nl/SIDN", "x.nl is free\n"),
+            ("aw/SETAR", "x.aw is free\n"),
+            (
+                "mx/NICMexico",
+                "No_Se_Encontro_El_Objeto/Object_Not_Found\n",
+            ),
+            (
+                "ar/NICArgentina",
+                "El dominio no se encuentra registrado en NIC Argentina\n",
+            ),
+        ] {
+            let r = WhoisResponse::parse("example.test", "whois.test", raw);
+            assert!(r.is_available(), "{name} must mark available:\n{raw}");
+        }
+        // Suffix anchoring: "is free" mid-sentence must NOT flip availability.
+        let prose = WhoisResponse::parse(
+            "example.test",
+            "whois.test",
+            "Registration is free of charge today\n",
+        );
+        assert!(
+            !prose.is_available(),
+            "'is free' inside prose must not mark available"
+        );
+    }
+
+    /// GMO Registry retired port-43 WHOIS (May 2026, ICANN RDAP transition)
+    /// and now answers every query with a retirement notice. That is a
+    /// service-level "no usable WHOIS" signal, not a registered/available
+    /// verdict.
+    #[test]
+    fn whois_retirement_notice_is_registry_unavailable() {
+        let raw = "Notice: Effective May 1, 2026, the WHOIS service has been retired in accordance with ICANN's RDAP transition policy. All registration data queries are now served via RDAP. The Registration Data Access Protocol (RDAP) base URL is: https://rdap.gmoregistry.net/rdap/";
+        let r = WhoisResponse::parse("nic.canon", "whois.nic.canon", raw);
+        assert!(
+            r.registry_unavailable(),
+            "retirement notice must be registry_unavailable"
+        );
+        assert!(!r.is_available(), "retirement notice is not 'available'");
     }
 }
