@@ -11,6 +11,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Homebrew distribution** — Seer is now installable via a Homebrew tap:
+  `brew install TheZacillac/tap/seer` (macOS/Linux, prebuilt binary, no Rust
+  toolchain required). The formula is generated and pushed to
+  [`TheZacillac/homebrew-tap`](https://github.com/TheZacillac/homebrew-tap)
+  automatically by cargo-dist on each tagged release.
+
 ## [0.39.0] - 2026-07-03
 
 A feature release adding encrypted DNS transports, subdomain-change monitoring,

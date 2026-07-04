@@ -1197,19 +1197,28 @@ git tag v0.33.0 && git push --tags
 What happens automatically:
 1. `release.yml` (cargo-dist) builds `seer` binaries for 5 targets + shell/
    PowerShell installers, and creates the GitHub Release.
-2. **Manual step — dispatch the publish workflow:** `gh workflow run
+2. **Homebrew formula publish (automatic):** the `publish-homebrew-formula`
+   job in `release.yml` pushes `Formula/seer.rb` to the
+   `TheZacillac/homebrew-tap` repo using the `HOMEBREW_TAP_TOKEN` secret. This
+   runs *inside* the release plan (not `publish.yml`), so the anti-recursion
+   quirk below does not affect it. Install: `brew install TheZacillac/tap/seer`.
+   The formula is named `seer` (not `seer-cli`) via `formula = "seer"` in
+   `seer-cli/Cargo.toml`'s `[package.metadata.dist]`.
+3. **Manual step — dispatch the publish workflow:** `gh workflow run
    publish.yml`. It does NOT fire automatically: dist creates the release
    with the workflow's `GITHUB_TOKEN`, and GitHub suppresses events from
    such actions (anti-recursion), so the `release: published` trigger never
    sees it. The dispatched run publishes seer-core then seer-cli to
    crates.io. (`publish.yml` currently publishes **only** to crates.io.)
 
-**Deferred publishers (tracked for later):** Homebrew and PyPI publishing are
-currently disabled.
-- *Homebrew*: removed from `installers`/`tap`/`publish-jobs` in
-  `dist-workspace.toml` (re-enable per the note there, then `dist generate`).
-  It also needs a `TheZacillac/homebrew-tap` repo and a `HOMEBREW_TAP_TOKEN`
-  secret (a cross-repo-write PAT — `GITHUB_TOKEN` can't push cross-repo).
+**Homebrew (enabled 2026-07-04):** `installers` includes `"homebrew"`, with
+`tap = "TheZacillac/homebrew-tap"` and `publish-jobs = ["homebrew"]` in
+`dist-workspace.toml`. The tap repo is public and the `HOMEBREW_TAP_TOKEN` repo
+secret is a fine-grained PAT with Contents:read/write scoped to the tap repo
+only (`GITHUB_TOKEN` can't push cross-repo). If the tap push ever 403s, the PAT
+has expired/been revoked — mint a new one and re-set the secret.
+
+**Deferred publishers (tracked for later):** PyPI publishing is still disabled.
 - *PyPI*: the `wheels`/`sdist`/`publish-pypi` jobs were removed from
   `publish.yml` (restore from git history to re-enable).
 

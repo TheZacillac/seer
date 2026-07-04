@@ -98,9 +98,20 @@ A high-performance, multi-interface domain utility suite — query WHOIS, RDAP, 
 
 ### Install the CLI
 
+**Homebrew** (macOS/Linux — prebuilt binary, no Rust toolchain required):
+
+```bash
+brew install TheZacillac/tap/seer
+```
+
+**Cargo** (builds from source):
+
 ```bash
 cargo install seer-cli
 ```
+
+Prebuilt binaries and shell/PowerShell installers for each release are also on
+the [Releases page](https://github.com/TheZacillac/seer/releases).
 
 ### Run your first lookup
 
@@ -130,7 +141,7 @@ tokio = { version = "1", features = ["full"] }
 | Package | Type | Install | Description |
 |---------|------|---------|-------------|
 | **seer-core** | Rust library | `cargo add seer-core` | Core library — all business logic |
-| **seer-cli** | Rust binary | `cargo install seer-cli` | The `seer` command-line tool |
+| **seer-cli** | Rust binary | `brew install TheZacillac/tap/seer` or `cargo install seer-cli` | The `seer` command-line tool |
 | **seer-py** | Python extension | `pip install ./seer-py` | Python bindings via PyO3 (`import seer`); PyPI (`domain-seer`) planned |
 | **seer-api** | Python package | `pip install -e .` | REST API + MCP server |
 
