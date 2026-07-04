@@ -8,6 +8,7 @@ A high-performance, multi-interface domain utility suite — query WHOIS, RDAP, 
 
 [![CI](https://github.com/TheZacillac/seer/actions/workflows/ci.yml/badge.svg)](https://github.com/TheZacillac/seer/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/seer-cli.svg)](https://crates.io/crates/seer-cli)
+[![Homebrew](https://img.shields.io/badge/dynamic/regex?url=https%3A%2F%2Fraw.githubusercontent.com%2FTheZacillac%2Fhomebrew-tap%2Fmain%2FFormula%2Fseer.rb&search=version%20%22(%5B%5E%22%5D%2B)%22&replace=%241&label=homebrew&logo=homebrew&logoColor=white&color=fbb040)](https://github.com/TheZacillac/homebrew-tap)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org)
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org)
