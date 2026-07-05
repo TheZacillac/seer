@@ -11,6 +11,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Second-level registry zone support** — some ccTLDs have no top-level
+  port-43 WHOIS while registrations live under SLD zones with a working
+  registry server. WHOIS lookups now resolve the most specific zone first,
+  starting with ZACR's `co.za`/`net.za`/`org.za`/`web.za`
+  (`whois.registry.net.za`) — `seer whois google.co.za` previously failed
+  with "no WHOIS server for .za" and now returns the full record. ([#108])
+
+### Fixed
+- **Removed 5 more dead WHOIS mappings** found by a ccTLD follow-up audit:
+  `lk` (+ its Sinhala/Tamil IDN variants), `mt`, and `ps` — servers answer
+  nothing and IANA no longer publishes a `whois:` field for them. These TLDs
+  now get the clean "check whois via <registry URL>" guidance. A sweep of all
+  248 IANA ccTLDs confirmed no other ccTLD has a port-43 server seer is
+  missing (the 54 unmapped ones, `.gr` included, are web-only registries).
+  ([#108])
+
 ## [0.40.1] - 2026-07-04
 
 A WHOIS reliability release: every one of the 1,246 mapped TLDs was exercised
@@ -486,3 +503,4 @@ Two notable breaking changes landed in this period (see `CLAUDE.md` for details)
 [#103]: https://github.com/TheZacillac/seer/pull/103
 [#106]: https://github.com/TheZacillac/seer/pull/106
 [#107]: https://github.com/TheZacillac/seer/pull/107
+[#108]: https://github.com/TheZacillac/seer/pull/108

@@ -20,8 +20,16 @@ use std::collections::HashMap;
 /// live sweep found their WHOIS hostnames dead in DNS and their IANA records
 /// no longer publishing a `whois:` field (RDAP-only transitions): `apple`,
 /// `brussels`, `cymru`, `wales`, `vlaanderen`, `pharmacy`, `na`, `xn--p1acf`
-/// (+ its `рус` alias). Do not re-add them from stale upstream lists without
-/// re-checking IANA (`whois -h whois.iana.org <tld>`).
+/// (+ its `рус` alias); second wave same day from a ccTLD follow-up audit:
+/// `lk` (+ `xn--fzc2c9e2c`/`ලංකා`, `xn--xkc2al3hye2a`/`இலங்கை`), `mt`, `ps`
+/// (its `xn--ygbi2ammx`/`فلسطين` alias stays — IANA still publishes the
+/// server there, though it currently answers nothing). Do not re-add any of
+/// them from stale upstream lists without re-checking IANA
+/// (`whois -h whois.iana.org <tld>`).
+///
+/// Second-level registry zones (e.g. ZACR's `co.za`) live in
+/// [`SLD_WHOIS_SERVERS`] below, resolved domain-first via
+/// [`get_whois_server_for_domain`].
 pub static WHOIS_SERVERS: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(|| {
     let mut m = HashMap::new();
 
@@ -1039,7 +1047,6 @@ pub static WHOIS_SERVERS: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(
     m.insert("lb", "whois.lbdr.org.lb");
     m.insert("lc", "whois.afilias-grs.info");
     m.insert("li", "whois.nic.li");
-    m.insert("lk", "whois.nic.lk");
     m.insert("ls", "whois.nic.ls");
     m.insert("lt", "whois.domreg.lt");
     m.insert("lu", "whois.dns.lu");
@@ -1058,7 +1065,6 @@ pub static WHOIS_SERVERS: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(
     m.insert("mq", "whois.mediaserv.net");
     m.insert("mr", "whois.nic.mr");
     m.insert("ms", "whois.nic.ms");
-    m.insert("mt", "whois.nic.org.mt");
     m.insert("mu", "whois.tld.mu");
     m.insert("mw", "whois.nic.mw");
     m.insert("mx", "whois.mx");
@@ -1079,7 +1085,6 @@ pub static WHOIS_SERVERS: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(
     m.insert("pl", "whois.dns.pl");
     m.insert("pm", "whois.nic.pm");
     m.insert("pr", "whois.afilias-srs.net");
-    m.insert("ps", "whois.pnina.ps");
     m.insert("pt", "whois.dns.pt");
     m.insert("pw", "whois.nic.pw");
     m.insert("qa", "whois.registry.qa");
@@ -1198,7 +1203,6 @@ pub static WHOIS_SERVERS: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(
     m.insert("xn--fiqz9s", "whois.cnnic.cn");
     m.insert("xn--fjq720a", "whois.nic.xn--fjq720a");
     m.insert("xn--fpcrj9c3d", "whois.nixiregistry.in");
-    m.insert("xn--fzc2c9e2c", "whois.nic.lk");
     m.insert("xn--fzys8d69uvgm", "whois.nic.xn--fzys8d69uvgm");
     m.insert("xn--g2xx48c", "whois.nic.xn--g2xx48c");
     m.insert("xn--gckr3f0f", "whois.nic.xn--gckr3f0f");
@@ -1274,7 +1278,6 @@ pub static WHOIS_SERVERS: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(
     m.insert("xn--wgbh1c", "whois.dotmasr.eg");
     m.insert("xn--wgbl6a", "whois.registry.qa");
     m.insert("xn--xhq521b", "whois.ngtld.cn");
-    m.insert("xn--xkc2al3hye2a", "whois.nic.lk");
     m.insert("xn--xkc2dl3a5ee0h", "whois.nixiregistry.in");
     m.insert("xn--y9a3aq", "whois.amnic.net");
     m.insert("xn--yfro4i67o", "whois.zh.sgnic.sg");
@@ -1344,12 +1347,10 @@ pub static WHOIS_SERVERS: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(
     m.insert("ભારત", "whois.nixiregistry.in");
     m.insert("ଭାରତ", "whois.nixiregistry.in");
     m.insert("இந்தியா", "whois.nixiregistry.in");
-    m.insert("இலங்கை", "whois.nic.lk");
     m.insert("சிங்கப்பூர்", "whois.ta.sgnic.sg");
     m.insert("భారత్", "whois.nixiregistry.in");
     m.insert("ಭಾರತ", "whois.nixiregistry.in");
     m.insert("ഭാരതം", "whois.nixiregistry.in");
-    m.insert("ලංකා", "whois.nic.lk");
     m.insert("คอม", "whois.nic.xn--42c2d9a");
     m.insert("ไทย", "whois.thnic.co.th");
     m.insert("ລາວ", "whois.nic.la");
@@ -1421,8 +1422,39 @@ pub static WHOIS_SERVERS: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(
     m
 });
 
+/// WHOIS servers for *second-level* registry zones. Some ccTLDs have no
+/// port-43 WHOIS at the TLD itself (IANA publishes an empty `whois:` field)
+/// while registrations live under SLD zones with a working registry server.
+/// Kept separate from [`WHOIS_SERVERS`] so the TLD catalog ([`all_tlds`])
+/// and TLD-keyed lookups stay pure-TLD.
+static SLD_WHOIS_SERVERS: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(|| {
+    let mut m = HashMap::new();
+    // ZACR (ZA Central Registry) — .za has no top-level WHOIS.
+    m.insert("co.za", "whois.registry.net.za");
+    m.insert("net.za", "whois.registry.net.za");
+    m.insert("org.za", "whois.registry.net.za");
+    m.insert("web.za", "whois.registry.net.za");
+    m
+});
+
 pub fn get_whois_server(tld: &str) -> Option<&'static str> {
     WHOIS_SERVERS.get(tld.to_lowercase().as_str()).copied()
+}
+
+/// Resolves the WHOIS server for a full domain name, preferring the most
+/// specific match: a second-level registry zone (e.g. `co.za`) before the
+/// plain TLD. Use this over [`get_whois_server`] whenever the full domain is
+/// available.
+pub fn get_whois_server_for_domain(domain: &str) -> Option<&'static str> {
+    let lower = domain.trim_end_matches('.').to_lowercase();
+    let labels: Vec<&str> = lower.rsplit('.').collect();
+    if labels.len() >= 2 {
+        let sld_zone = format!("{}.{}", labels[1], labels[0]);
+        if let Some(server) = SLD_WHOIS_SERVERS.get(sld_zone.as_str()) {
+            return Some(server);
+        }
+    }
+    labels.first().and_then(|tld| get_whois_server(tld))
 }
 
 pub fn get_tld(domain: &str) -> Option<&str> {
@@ -1558,11 +1590,53 @@ mod all_tlds_tests {
             "na",
             "xn--p1acf",
             "рус",
+            // Second wave (ccTLD follow-up audit, same day): servers answer
+            // nothing and IANA's whois: field is empty.
+            "lk",
+            "xn--fzc2c9e2c",
+            "xn--xkc2al3hye2a",
+            "mt",
+            "ps",
         ] {
             assert!(
                 get_whois_server(tld).is_none(),
                 ".{tld} must not be mapped (IANA-delisted, dead hostname)"
             );
         }
+    }
+
+    /// Registries that operate WHOIS for *second-level* zones only: the bare
+    /// ccTLD has no port-43 WHOIS (IANA `whois:` is empty), but registrations
+    /// live under SLD zones with a working registry server — e.g. ZACR serves
+    /// co.za/net.za/org.za/web.za via whois.registry.net.za.
+    #[test]
+    fn sld_zones_resolve_before_tld() {
+        assert_eq!(
+            get_whois_server_for_domain("google.co.za"),
+            Some("whois.registry.net.za")
+        );
+        assert_eq!(
+            get_whois_server_for_domain("example.web.za"),
+            Some("whois.registry.net.za")
+        );
+        // Bare .za still has no server (IANA publishes none).
+        assert_eq!(get_whois_server_for_domain("nic.za"), None);
+        // Regular TLD lookups are unaffected.
+        assert_eq!(
+            get_whois_server_for_domain("example.com"),
+            Some("whois.verisign-grs.com")
+        );
+        // A two-label suffix that is NOT an SLD zone falls through to the TLD
+        // (uk covers co.uk).
+        assert_eq!(
+            get_whois_server_for_domain("bbc.co.uk"),
+            Some("whois.nic.uk")
+        );
+        // Single-label input (just a TLD) must not panic; it resolves via the
+        // plain TLD path.
+        assert_eq!(
+            get_whois_server_for_domain("com"),
+            Some("whois.verisign-grs.com")
+        );
     }
 }
