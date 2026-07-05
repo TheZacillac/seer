@@ -11,6 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.40.1] - 2026-07-04
+
+A WHOIS reliability release: every one of the 1,246 mapped TLDs was exercised
+live against its registry (registered + unregistered probes), and everything
+that surfaced was fixed.
+
 ### Fixed
 - **Availability detection across ~30 registries** — a full sweep of all 1,246
   mapped TLDs (registered + unregistered probe per TLD) found and fixed several
@@ -448,6 +454,7 @@ Two notable breaking changes landed in this period (see `CLAUDE.md` for details)
   pre-formatted strings.
 
 [Unreleased]: https://github.com/TheZacillac/seer/compare/v0.40.0...HEAD
+[0.40.1]: https://github.com/TheZacillac/seer/compare/v0.40.0...v0.40.1
 [0.40.0]: https://github.com/TheZacillac/seer/compare/v0.39.0...v0.40.0
 [0.39.0]: https://github.com/TheZacillac/seer/compare/v0.38.0...v0.39.0
 [0.38.0]: https://github.com/TheZacillac/seer/compare/v0.37.1...v0.38.0
