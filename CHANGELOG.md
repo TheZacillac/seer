@@ -11,6 +11,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Second-level registry zone support** — some ccTLDs have no top-level
+  port-43 WHOIS while registrations live under SLD zones with a working
+  registry server. WHOIS lookups now resolve the most specific zone first,
+  starting with ZACR's `co.za`/`net.za`/`org.za`/`web.za`
+  (`whois.registry.net.za`) — `seer whois google.co.za` previously failed
+  with "no WHOIS server for .za" and now returns the full record. ([#108])
+
+- **`.ga` (Gabon) WHOIS support** — ANINF (post-Freenom) runs a port-43
+  server at `whois.nic.ga` that IANA does not advertise; found by live
+  hostname probing. The generic parser also learned ANINF's French field
+  labels (`Date de création`, `Date d'expiration`, `Dernière modification`,
+  `Serveur de noms`), which benefits other francophone registries. ([#108])
+
+### Fixed
+- **`.ps` (Palestine) WHOIS restored** — PNINA relocated its registry server
+  from the dead `whois.pnina.ps` (still listed by IANA) to
+  `whois.registry.ps`, found by live hostname probing; the map and the
+  Arabic IDN alias now point at the working server. ([#108])
+- **Removed 4 dead WHOIS mappings** found by the same ccTLD follow-up audit:
+  `lk` (+ its Sinhala/Tamil IDN variants) and `mt` — servers answer nothing
+  and IANA no longer publishes a `whois:` field for them. These TLDs now get
+  the clean "check whois via <registry URL>" guidance. A probe of all 248
+  IANA ccTLDs (516 candidate hostnames) confirmed no other ccTLD has a
+  reachable port-43 server seer is missing — the remaining unmapped ones,
+  `.gr` included, are web-only registries. ([#108])
+
 ## [0.40.1] - 2026-07-04
 
 A WHOIS reliability release: every one of the 1,246 mapped TLDs was exercised
@@ -486,3 +513,4 @@ Two notable breaking changes landed in this period (see `CLAUDE.md` for details)
 [#103]: https://github.com/TheZacillac/seer/pull/103
 [#106]: https://github.com/TheZacillac/seer/pull/106
 [#107]: https://github.com/TheZacillac/seer/pull/107
+[#108]: https://github.com/TheZacillac/seer/pull/108

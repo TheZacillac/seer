@@ -47,6 +47,9 @@ static CREATION_DATE_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
             .expect("Invalid regex for Domain Registration Date"),
         // Punktum (.dk) style: `Registered:           2018-01-25`
         Regex::new(r"(?im)^\s*Registered:\s*(.+)$").expect("Invalid regex for Registered"),
+        // French registries (ANINF .ga): `Date de création:`
+        Regex::new(r"(?im)^\s*Date de création:\s*(.+)$")
+            .expect("Invalid regex for Date de création"),
     ]
 });
 
@@ -59,6 +62,9 @@ static EXPIRATION_DATE_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
         Regex::new(r"(?i)Expires:\s*(.+)").expect("Invalid regex for Expires"),
         Regex::new(r"(?i)Expiry Date:\s*(.+)").expect("Invalid regex for Expiry Date"),
         Regex::new(r"(?i)paid-till:\s*(.+)").expect("Invalid regex for paid-till"),
+        // French registries (ANINF .ga): `Date d'expiration:`
+        Regex::new(r"(?im)^\s*Date d'expiration:\s*(.+)$")
+            .expect("Invalid regex for Date d'expiration"),
     ]
 });
 
@@ -69,6 +75,11 @@ static UPDATED_DATE_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
         Regex::new(r"(?i)Last Modified:\s*(.+)").expect("Invalid regex for Last Modified"),
         Regex::new(r"(?i)Last Update:\s*(.+)").expect("Invalid regex for Last Update"),
         Regex::new(r"(?i)Modified:\s*(.+)").expect("Invalid regex for Modified"),
+        // French registries (ANINF .ga): `Dernière modification:` — contact
+        // blocks repeat this label; extract_field_with_patterns takes the
+        // first match, which is the domain-level line.
+        Regex::new(r"(?im)^\s*Dernière modification:\s*(.+)$")
+            .expect("Invalid regex for Dernière modification"),
     ]
 });
 
@@ -89,6 +100,9 @@ static NAMESERVER_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
         // `Nameservers` heading. Anchored to line start to avoid matching
         // hostname mentions inside prose.
         Regex::new(r"(?im)^\s*Hostname:\s*(.+)$").expect("Invalid regex for Hostname"),
+        // French registries (ANINF .ga): `Serveur de noms:` lines.
+        Regex::new(r"(?im)^\s*Serveur de noms:\s*(.+)$")
+            .expect("Invalid regex for Serveur de noms"),
     ]
 });
 
@@ -1514,6 +1528,47 @@ Domain Status: clientTransferProhibited
         assert!(
             !prose.is_available(),
             "'is free' inside prose must not mark available"
+        );
+    }
+
+    /// ANINF (.ga, captured live 2026-07) answers in French: dates are
+    /// `Date de création:` / `Date d'expiration:` / `Dernière modification:`
+    /// and nameservers are `Serveur de noms:` lines. Contact blocks carry
+    /// their own `Dernière modification:` — the domain-level one (first in
+    /// the body) must win.
+    #[test]
+    fn aninf_ga_french_labels_parse() {
+        let raw = "Domain ID:                     DOM8624-GA\n\
+                   Nom de domaine:                google.ga\n\
+                   Date de création:              2023-06-06T19:15:12.718385Z\n\
+                   Dernière modification:         2026-05-12T17:27:38.344508Z\n\
+                   Date d'expiration:             2027-06-06T19:15:12.694489Z\n\
+                   Registrar:                     MARKMONITOR Inc.\n\
+                   Statut:                        actif\n\
+                   \n\
+                   [TECH_C]\n\
+                   Nom:                           REDACTED_FOR_PRIVACY\n\
+                   Dernière modification:         2023-11-09T18:15:51.973324Z\n\
+                   \n\
+                   Serveur de noms:               ns1.google.com\n\
+                   Serveur de noms:               ns2.google.com\n\
+                   \n\
+                   DNSSEC:                        unsigned\n";
+        let r = WhoisResponse::parse("google.ga", "whois.nic.ga", raw);
+        assert_eq!(r.nameservers, vec!["ns1.google.com", "ns2.google.com"]);
+        let created = r.creation_date.expect("creation from Date de création");
+        assert_eq!(
+            created.format("%Y-%m-%d").to_string(),
+            "2023-06-06",
+            "domain creation date"
+        );
+        let expires = r.expiration_date.expect("expiry from Date d'expiration");
+        assert_eq!(expires.format("%Y-%m-%d").to_string(), "2027-06-06");
+        let updated = r.updated_date.expect("updated from Dernière modification");
+        assert_eq!(
+            updated.format("%Y-%m-%d").to_string(),
+            "2026-05-12",
+            "domain-level modification must win over the contact block's"
         );
     }
 

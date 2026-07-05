@@ -9,7 +9,7 @@ use tokio::time::timeout;
 use tracing::{debug, instrument, warn};
 
 use super::parser::WhoisResponse;
-use super::servers::{get_tld, get_whois_server};
+use super::servers::{get_tld, get_whois_server_for_domain};
 use crate::cache::TtlCache;
 use crate::error::{Result, SeerError};
 use crate::retry::{RetryExecutor, RetryPolicy};
@@ -133,8 +133,9 @@ impl WhoisClient {
         let domain = normalize_domain(domain)?;
         let tld = get_tld(&domain).ok_or_else(|| SeerError::InvalidDomain(domain.clone()))?;
 
-        // Try static mapping first
-        let whois_server = if let Some(server) = get_whois_server(tld) {
+        // Try the static mapping first — most-specific match wins (a
+        // second-level registry zone like co.za before the plain TLD).
+        let whois_server = if let Some(server) = get_whois_server_for_domain(&domain) {
             server.to_string()
         } else {
             let tld_lower = tld.to_lowercase();
