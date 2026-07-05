@@ -11,6 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.41.0] - 2026-07-05
+
+A ccTLD coverage release: second-level registry zones (`.co.za` and friends)
+now resolve, and live probing recovered two working registries IANA doesn't
+advertise (`.ga`, relocated `.ps`).
+
 ### Added
 - **Second-level registry zone support** — some ccTLDs have no top-level
   port-43 WHOIS while registrations live under SLD zones with a working
@@ -481,6 +487,7 @@ Two notable breaking changes landed in this period (see `CLAUDE.md` for details)
   pre-formatted strings.
 
 [Unreleased]: https://github.com/TheZacillac/seer/compare/v0.40.0...HEAD
+[0.41.0]: https://github.com/TheZacillac/seer/compare/v0.40.1...v0.41.0
 [0.40.1]: https://github.com/TheZacillac/seer/compare/v0.40.0...v0.40.1
 [0.40.0]: https://github.com/TheZacillac/seer/compare/v0.39.0...v0.40.0
 [0.39.0]: https://github.com/TheZacillac/seer/compare/v0.38.0...v0.39.0
