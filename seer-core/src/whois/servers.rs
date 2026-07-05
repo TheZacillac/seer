@@ -21,11 +21,14 @@ use std::collections::HashMap;
 /// no longer publishing a `whois:` field (RDAP-only transitions): `apple`,
 /// `brussels`, `cymru`, `wales`, `vlaanderen`, `pharmacy`, `na`, `xn--p1acf`
 /// (+ its `рус` alias); second wave same day from a ccTLD follow-up audit:
-/// `lk` (+ `xn--fzc2c9e2c`/`ලංකා`, `xn--xkc2al3hye2a`/`இலங்கை`), `mt`, `ps`
-/// (its `xn--ygbi2ammx`/`فلسطين` alias stays — IANA still publishes the
-/// server there, though it currently answers nothing). Do not re-add any of
-/// them from stale upstream lists without re-checking IANA
-/// (`whois -h whois.iana.org <tld>`).
+/// `lk` (+ `xn--fzc2c9e2c`/`ලංකා`, `xn--xkc2al3hye2a`/`இலங்கை`) and `mt`.
+/// Do not re-add any of them from stale upstream lists without re-checking
+/// IANA (`whois -h whois.iana.org <tld>`).
+///
+/// Conversely, two entries here deliberately DISAGREE with IANA (live-probed
+/// 2026-07-04): `ga` → `whois.nic.ga` (ANINF runs port-43 but IANA lists no
+/// server, Freenom aftermath) and `ps` → `whois.registry.ps` (PNINA
+/// relocated; IANA still lists the dead `whois.pnina.ps`).
 ///
 /// Second-level registry zones (e.g. ZACR's `co.za`) live in
 /// [`SLD_WHOIS_SERVERS`] below, resolved domain-first via
@@ -1005,6 +1008,7 @@ pub static WHOIS_SERVERS: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(
     m.insert("fm", "whois.nic.fm");
     m.insert("fo", "whois.nic.fo");
     m.insert("fr", "whois.nic.fr");
+    m.insert("ga", "whois.nic.ga");
     m.insert("gd", "whois.nic.gd");
     m.insert("ge", "whois.nic.ge");
     m.insert("gf", "whois.mediaserv.net");
@@ -1085,6 +1089,7 @@ pub static WHOIS_SERVERS: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(
     m.insert("pl", "whois.dns.pl");
     m.insert("pm", "whois.nic.pm");
     m.insert("pr", "whois.afilias-srs.net");
+    m.insert("ps", "whois.registry.ps");
     m.insert("pt", "whois.dns.pt");
     m.insert("pw", "whois.nic.pw");
     m.insert("qa", "whois.registry.qa");
@@ -1281,7 +1286,7 @@ pub static WHOIS_SERVERS: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(
     m.insert("xn--xkc2dl3a5ee0h", "whois.nixiregistry.in");
     m.insert("xn--y9a3aq", "whois.amnic.net");
     m.insert("xn--yfro4i67o", "whois.zh.sgnic.sg");
-    m.insert("xn--ygbi2ammx", "whois.pnina.ps");
+    m.insert("xn--ygbi2ammx", "whois.registry.ps");
     m.insert("xn--zfr164b", "whois.conac.cn");
 
     // ============================================================
@@ -1325,7 +1330,7 @@ pub static WHOIS_SERVERS: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(
     m.insert("عراق", "whois.cmc.iq");
     m.insert("عرب", "whois.nic.xn--ngbrx");
     m.insert("عمان", "whois.registry.om");
-    m.insert("فلسطين", "whois.pnina.ps");
+    m.insert("فلسطين", "whois.registry.ps");
     m.insert("قطر", "whois.registry.qa");
     m.insert("كاثوليك", "whois.nic.xn--mgbi4ecexp");
     m.insert("كوم", "whois.nic.xn--fhbei");
@@ -1591,18 +1596,31 @@ mod all_tlds_tests {
             "xn--p1acf",
             "рус",
             // Second wave (ccTLD follow-up audit, same day): servers answer
-            // nothing and IANA's whois: field is empty.
+            // nothing and IANA's whois: field is empty. (.ps is NOT here: its
+            // registry moved to whois.registry.ps — see relocated test below.)
             "lk",
             "xn--fzc2c9e2c",
             "xn--xkc2al3hye2a",
             "mt",
-            "ps",
         ] {
             assert!(
                 get_whois_server(tld).is_none(),
                 ".{tld} must not be mapped (IANA-delisted, dead hostname)"
             );
         }
+    }
+
+    /// Registries found by live probing (2026-07-04 hostname-pattern hunt)
+    /// whose working servers are NOT what IANA/upstream lists publish:
+    /// ANINF runs port-43 for .ga at whois.nic.ga (IANA lists none, Freenom
+    /// aftermath) and PNINA relocated .ps from the dead whois.pnina.ps to
+    /// whois.registry.ps (IANA record stale). Aliases follow the base TLD.
+    #[test]
+    fn relocated_and_unlisted_cctld_servers_are_mapped() {
+        assert_eq!(get_whois_server("ga"), Some("whois.nic.ga"));
+        assert_eq!(get_whois_server("ps"), Some("whois.registry.ps"));
+        assert_eq!(get_whois_server("xn--ygbi2ammx"), Some("whois.registry.ps"));
+        assert_eq!(get_whois_server("فلسطين"), Some("whois.registry.ps"));
     }
 
     /// Registries that operate WHOIS for *second-level* zones only: the bare

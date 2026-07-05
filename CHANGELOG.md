@@ -19,14 +19,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`whois.registry.net.za`) — `seer whois google.co.za` previously failed
   with "no WHOIS server for .za" and now returns the full record. ([#108])
 
+- **`.ga` (Gabon) WHOIS support** — ANINF (post-Freenom) runs a port-43
+  server at `whois.nic.ga` that IANA does not advertise; found by live
+  hostname probing. The generic parser also learned ANINF's French field
+  labels (`Date de création`, `Date d'expiration`, `Dernière modification`,
+  `Serveur de noms`), which benefits other francophone registries. ([#108])
+
 ### Fixed
-- **Removed 5 more dead WHOIS mappings** found by a ccTLD follow-up audit:
-  `lk` (+ its Sinhala/Tamil IDN variants), `mt`, and `ps` — servers answer
-  nothing and IANA no longer publishes a `whois:` field for them. These TLDs
-  now get the clean "check whois via <registry URL>" guidance. A sweep of all
-  248 IANA ccTLDs confirmed no other ccTLD has a port-43 server seer is
-  missing (the 54 unmapped ones, `.gr` included, are web-only registries).
-  ([#108])
+- **`.ps` (Palestine) WHOIS restored** — PNINA relocated its registry server
+  from the dead `whois.pnina.ps` (still listed by IANA) to
+  `whois.registry.ps`, found by live hostname probing; the map and the
+  Arabic IDN alias now point at the working server. ([#108])
+- **Removed 4 dead WHOIS mappings** found by the same ccTLD follow-up audit:
+  `lk` (+ its Sinhala/Tamil IDN variants) and `mt` — servers answer nothing
+  and IANA no longer publishes a `whois:` field for them. These TLDs now get
+  the clean "check whois via <registry URL>" guidance. A probe of all 248
+  IANA ccTLDs (516 candidate hostnames) confirmed no other ccTLD has a
+  reachable port-43 server seer is missing — the remaining unmapped ones,
+  `.gr` included, are web-only registries. ([#108])
 
 ## [0.40.1] - 2026-07-04
 
