@@ -11,9 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.42.0] - 2026-07-12
+
 A defect-sweep release: 15 fixes from a full-codebase multi-agent review
 (2026-07-11), spanning availability-verdict consistency, output completeness,
-CLI/REPL parity, TUI lifecycle, and API rate-limit parity.
+CLI/REPL parity, TUI lifecycle, and API rate-limit parity. ([#111])
 
 ### Fixed
 - **Registrar detail + lifecycle fields now rendered** — the seven 0.38.0
@@ -551,7 +553,8 @@ Two notable breaking changes landed in this period (see `CLAUDE.md` for details)
   `inconsistencies` became typed (`ConsensusValue` / `Inconsistency`) instead of
   pre-formatted strings.
 
-[Unreleased]: https://github.com/TheZacillac/seer/compare/v0.40.0...HEAD
+[Unreleased]: https://github.com/TheZacillac/seer/compare/v0.42.0...HEAD
+[0.42.0]: https://github.com/TheZacillac/seer/compare/v0.41.0...v0.42.0
 [0.41.0]: https://github.com/TheZacillac/seer/compare/v0.40.1...v0.41.0
 [0.40.1]: https://github.com/TheZacillac/seer/compare/v0.40.0...v0.40.1
 [0.40.0]: https://github.com/TheZacillac/seer/compare/v0.39.0...v0.40.0
@@ -586,3 +589,4 @@ Two notable breaking changes landed in this period (see `CLAUDE.md` for details)
 [#106]: https://github.com/TheZacillac/seer/pull/106
 [#107]: https://github.com/TheZacillac/seer/pull/107
 [#108]: https://github.com/TheZacillac/seer/pull/108
+[#111]: https://github.com/TheZacillac/seer/pull/111

@@ -134,7 +134,7 @@ seer tui example.com           # Launch the full-screen TUI
 
 ```toml
 [dependencies]
-seer-core = "0.41"
+seer-core = "0.42"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -365,7 +365,7 @@ if cert := status.get("certificate"):
 
 ```toml
 [dependencies]
-seer-core = "0.41"
+seer-core = "0.42"
 tokio = { version = "1", features = ["full"] }
 ```
 
