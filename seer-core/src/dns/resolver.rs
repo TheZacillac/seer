@@ -323,6 +323,9 @@ impl DnsResolver {
         domain: &str,
         nameserver: Option<&str>,
     ) -> Result<Vec<DnsRecord>> {
+        // Same normalization/validation as every other public entry point —
+        // callers may hand us URL-form or unvalidated input.
+        let domain = normalize_domain(domain)?;
         let custom_resolver;
         let resolver = if let Some(ns) = nameserver {
             custom_resolver = self.create_custom_resolver(ns).await?;
@@ -330,7 +333,7 @@ impl DnsResolver {
         } else {
             &self.default_resolver
         };
-        self.resolve_srv_core(resolver, service, protocol, domain)
+        self.resolve_srv_core(resolver, service, protocol, &domain)
             .await
     }
 
@@ -1271,6 +1274,23 @@ mod tests {
             msg.contains("invalid srv protocol"),
             "expected SRV protocol validation error, got: {}",
             msg
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_srv_normalizes_and_validates_domain_input() {
+        // resolve_srv was the one public entry point that skipped
+        // normalize_domain, so garbage input reached query construction as a
+        // (misclassified) DNS failure instead of an input error, and URL-form
+        // input built a literal `_http._tcp.HTTPS://…` query name
+        // (2026-07-11 review).
+        let r = DnsResolver::new();
+        let result = r
+            .resolve_srv("http", "tcp", "not a valid domain", None)
+            .await;
+        assert!(
+            matches!(result, Err(SeerError::InvalidDomain(_))),
+            "expected InvalidDomain from domain validation, got: {result:?}"
         );
     }
 

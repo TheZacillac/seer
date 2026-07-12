@@ -69,9 +69,8 @@ impl App {
             lens_filter: HashMap::new(),
         };
         if let Some(d) = domain {
-            if let Some(action) = app.set_domain_and_fetch(&d) {
-                app.startup.push(action);
-            }
+            let actions = app.set_domain_and_fetch(&d);
+            app.startup.extend(actions);
         }
         app
     }
@@ -161,8 +160,9 @@ impl App {
 
     /// Normalize + record the domain and produce a Fetch for the current lens
     /// if it is implemented. Returns None for unimplemented lenses.
-    fn set_domain_and_fetch(&mut self, raw: &str) -> Option<Action> {
+    fn set_domain_and_fetch(&mut self, raw: &str) -> Vec<Action> {
         let normalized = seer_core::normalize_domain(raw).unwrap_or_else(|_| raw.to_lowercase());
+        let mut actions = Vec::new();
         // A new target invalidates every cached lens.
         if self.domain.as_deref() != Some(normalized.as_str()) {
             self.states.clear();
@@ -172,15 +172,21 @@ impl App {
             // results; clearing it prevents the RDAP "IP" tab from looking up
             // the previous domain's address under the new domain.
             self.panes.dns.resolved_ip = None;
-            // The Follow lens tracks this domain; invalidate any in-flight run
-            // so its streaming callbacks don't append the old domain's results
-            // under the new one. (The Bulk pane operates on its own
-            // independent domain list, so it is intentionally left alone.)
+            // The Follow lens tracks this domain; cancel any in-flight run —
+            // the generation bump below only drops its UI callbacks, while
+            // StopFollow makes run_loop signal the background DNS loop itself,
+            // which would otherwise keep polling the old domain. (The Bulk
+            // pane operates on its own independent domain list, so it is
+            // intentionally left alone.)
+            if self.panes.follow.running {
+                actions.push(Action::StopFollow);
+            }
             self.panes.follow.reset_for_new_domain();
         }
         self.domain = Some(normalized);
         self.sel = 0;
-        self.fetch_current()
+        actions.extend(self.fetch_current());
+        actions
     }
 
     /// Queue a fetch for the current lens at the current domain, marking it
@@ -229,10 +235,7 @@ impl App {
                 // IP tab: only auto-fetch when a real IP has been resolved (from
                 // a prior DNS/Status lookup). Without one, fall back to the idle
                 // hint rather than firing RdapIp against a domain string.
-                1 => match self.panes.dns.resolved_ip.clone() {
-                    Some(ip) => FetchReq::RdapIp(ip),
-                    None => return None,
-                },
+                1 => FetchReq::RdapIp(self.panes.dns.resolved_ip.clone()?),
                 _ => return None, // ASN needs explicit :rdap AS…
             },
             "dns" => match self.tab {
@@ -476,7 +479,7 @@ impl App {
                 }
                 self.lens = 0;
                 self.focus = Focus::Nav;
-                self.set_domain_and_fetch(&value).into_iter().collect()
+                self.set_domain_and_fetch(&value)
             }
             EditTarget::LensFilter => {
                 // Commit the filter for the current lens; empty clears it.
@@ -646,10 +649,7 @@ impl App {
     }
 
     fn fetch_with(&mut self, domain: &str) -> Vec<Action> {
-        match self.set_domain_and_fetch(domain) {
-            Some(a) => vec![a],
-            None => vec![],
-        }
+        self.set_domain_and_fetch(domain)
     }
 
     fn exec_command(&mut self, line: &str) -> Vec<Action> {
@@ -1364,8 +1364,15 @@ mod tests {
             "precondition: one logged step"
         );
 
-        // Switch the target domain — the follow pane must be invalidated.
-        let _ = app.set_domain_and_fetch("b.com");
+        // Switch the target domain — the follow pane must be invalidated AND
+        // the in-flight background run cancelled. Without StopFollow the old
+        // domain's DNS loop kept polling invisibly for up to 10 minutes; the
+        // generation guard only drops its UI updates (2026-07-11 review).
+        let actions = app.set_domain_and_fetch("b.com");
+        assert!(
+            actions.iter().any(|a| matches!(a, Action::StopFollow)),
+            "domain switch with a live follow run must emit StopFollow"
+        );
         assert!(
             app.panes.follow.gen > 1,
             "gen must advance so the old run's callbacks are superseded"

@@ -10,7 +10,7 @@ use crate::tui::panes::FollowState;
 use crate::tui::theme::Theme;
 use crate::tui::widgets::{dot, gauge, panel};
 
-pub fn render(f: &mut Frame, area: Rect, theme: &Theme, follow: &FollowState) {
+pub fn render(f: &mut Frame, area: Rect, theme: &Theme, follow: &FollowState, spin: usize) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(5), Constraint::Min(0)])
@@ -34,7 +34,7 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, follow: &FollowState) {
     let gauge_line = gauge::line(ratio, 30, theme.teal, Some(&gauge_label));
 
     let spin_text = if follow.running {
-        format!("  {} polling…", SPIN[0])
+        format!("  {} polling…", SPIN[spin % SPIN.len()])
     } else {
         "  idle".to_string()
     };
@@ -185,7 +185,7 @@ mod tests {
         let backend = TestBackend::new(80, 20);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|f| render(f, f.area(), &theme, &follow))
+            .draw(|f| render(f, f.area(), &theme, &follow, 0))
             .unwrap();
         let text = buf_text(&terminal);
         assert!(
@@ -214,7 +214,7 @@ mod tests {
         let backend = TestBackend::new(80, 20);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|f| render(f, f.area(), &theme, &follow))
+            .draw(|f| render(f, f.area(), &theme, &follow, 0))
             .unwrap();
         let text = buf_text(&terminal);
         assert!(
@@ -228,6 +228,27 @@ mod tests {
     }
 
     #[test]
+    fn spinner_animates_with_app_spin_index() {
+        // The polling spinner was hardcoded to SPIN[0], so it froze on the
+        // first frame for the whole run while every other loading indicator
+        // in the TUI animates via app.spin (2026-07-11 review).
+        let theme = Theme::frappe();
+        let mut follow = FollowState::default();
+        follow.running = true;
+
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| render(f, f.area(), &theme, &follow, 3))
+            .unwrap();
+        let text = buf_text(&terminal);
+        assert!(
+            text.contains(crate::tui::app::SPIN[3]),
+            "spinner should render the current animation frame"
+        );
+    }
+
+    #[test]
     fn renders_waiting_when_log_empty() {
         let theme = Theme::frappe();
         let follow = FollowState::default();
@@ -235,7 +256,7 @@ mod tests {
         let backend = TestBackend::new(80, 20);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|f| render(f, f.area(), &theme, &follow))
+            .draw(|f| render(f, f.area(), &theme, &follow, 0))
             .unwrap();
         let text = buf_text(&terminal);
         assert!(

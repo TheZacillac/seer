@@ -52,6 +52,7 @@ chrono = { version = "0.4", features = ["serde"] }
 
 # CLI
 rustyline = "17"
+shlex = "2"
 colored = "3"
 indicatif = "0.18"
 comfy-table = "7"

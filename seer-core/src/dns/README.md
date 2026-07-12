@@ -5,10 +5,12 @@ DNS resolution, propagation checking, and record monitoring.
 ## Overview
 
 This module provides comprehensive DNS functionality:
-- DNS record resolution for all common record types
-- Global DNS propagation checking across 29 nameservers
+- DNS record resolution for 16 record types
+- Global DNS propagation checking across 30 nameservers
 - DNS record monitoring over time (follow mode)
-- Custom nameserver support
+- Side-by-side comparison of answers from two nameservers
+- DNSSEC chain validation
+- Custom nameserver support over UDP, DoT (`tls://`), and DoH (`https://`)
 
 ## Files
 
@@ -17,7 +19,10 @@ This module provides comprehensive DNS functionality:
 | `mod.rs` | Module exports and public interface |
 | `resolver.rs` | DNS resolver using hickory-resolver |
 | `records.rs` | DNS record type definitions |
-| `propagation.rs` | Global DNS propagation checker |
+| `nameserver.rs` | Nameserver spec parsing (UDP / `tls://` DoT / `https://` DoH) |
+| `propagation/` | Global DNS propagation checker (checker, analysis, types, server list) |
+| `compare.rs` | Compare answers between two nameservers |
+| `dnssec.rs` | DNSSEC chain validation |
 | `follow.rs` | DNS record monitoring over time |
 
 ## Public API
@@ -31,8 +36,17 @@ pub use resolver::DnsResolver;
 // Records
 pub use records::{DnsRecord, RecordData, RecordType};
 
-// Propagation
-pub use propagation::{DnsServer, PropagationChecker, PropagationResult};
+// Nameserver specs (UDP / DoT / DoH)
+pub use nameserver::{NameserverProtocol, NameserverSpec};
+
+// Propagation (see propagation/types.rs for the full re-export list)
+pub use propagation::{
+    ConsensusValue, DnsServer, Inconsistency, PropagationChecker, PropagationResult,
+};
+
+// Compare + DNSSEC
+pub use compare::{DnsComparator, DnsComparison, ServerResult};
+pub use dnssec::{DnssecChecker, DnssecReport};
 
 // Follow
 pub use follow::{DnsFollower, FollowConfig, FollowIteration, FollowProgressCallback, FollowResult};
@@ -85,8 +99,11 @@ pub enum RecordType {
     PTR,     // Pointer (reverse DNS)
     SRV,     // Service locator
     CAA,     // Certification authority authorization
+    NAPTR,   // Naming authority pointer
     DNSKEY,  // DNSSEC public key
     DS,      // Delegation signer (DNSSEC)
+    TLSA,    // DANE certificate association
+    SSHFP,   // SSH host key fingerprint
     ANY,     // All available records
 }
 ```
@@ -114,8 +131,11 @@ pub enum RecordData {
     PTR { target: String },
     SRV { priority: u16, weight: u16, port: u16, target: String },
     CAA { flags: u8, tag: String, value: String },
+    NAPTR { order: u16, preference: u16, flags: String, services: String, regexp: String, replacement: String },
     DNSKEY { flags: u16, protocol: u8, algorithm: u8, public_key: String },
     DS { key_tag: u16, algorithm: u8, digest_type: u8, digest: String },
+    TLSA { cert_usage: u8, selector: u8, matching: u8, cert_data: String },
+    SSHFP { algorithm: u8, fingerprint_type: u8, fingerprint: String },
 }
 ```
 
@@ -154,8 +174,11 @@ pub struct PropagationResult {
     pub servers_responding: usize,
     pub propagation_percentage: f64,
     pub results: Vec<ServerResult>,
-    pub consensus_values: Vec<String>,
-    pub inconsistencies: Vec<String>,
+    // Typed since 2026-05-27 (breaking change — see CLAUDE.md):
+    pub consensus_values: Vec<ConsensusValue>,   // { type, value }
+    pub inconsistencies: Vec<Inconsistency>,     // { type, server_name, server_ip, values, consensus }
+    // Unreachable servers are missing data points, NOT inconsistencies:
+    pub unreachable_servers: Vec<UnreachableServer>,
 }
 
 impl PropagationResult {
@@ -223,6 +246,16 @@ impl FollowConfig {
 
 ## Usage Examples
 
+### Nameserver specs
+
+Anywhere a nameserver is accepted, three forms are supported:
+
+```text
+8.8.8.8                              # plain UDP (port 53)
+tls://1.1.1.1                        # DoT (port 853)
+https://cloudflare-dns.com/dns-query # DoH (port 443, default path /dns-query)
+```
+
 ### Basic DNS Resolution
 
 ```rust
@@ -268,6 +301,8 @@ println!("Consensus: {:?}", result.consensus_values);
 if result.has_inconsistencies() {
     println!("Inconsistencies:");
     for issue in &result.inconsistencies {
+        // `Inconsistency` is a typed struct; its Display impl renders the
+        // classic "<server> (<ip>): <values> vs consensus: <...>" line.
         println!("  - {}", issue);
     }
 }
@@ -295,7 +330,7 @@ for iter in &result.iterations {
 
 ## Global DNS Servers
 
-The propagation checker uses 29 DNS servers across 6 regions:
+The propagation checker uses 30 DNS servers across 6 regions:
 
 **North America**
 - Google (8.8.8.8), Cloudflare (1.1.1.1), OpenDNS (208.67.222.222), Quad9 (9.9.9.9), Level3 (4.2.2.1)

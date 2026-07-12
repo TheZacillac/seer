@@ -478,20 +478,7 @@ fn handle_quiet_output<T: serde::Serialize>(value: &T, fields: &Option<Vec<Strin
     }
 }
 
-/// Renders a machine-readable CLI error payload for non-human formats so that
-/// `--format json|yaml` stays parseable on the error path. Returns `None` for
-/// Human (rendered with color by [`emit_error`]). JSON is a subset of YAML, so
-/// the same `{"error": ...}` document is valid for both.
-fn machine_error(output_format: seer_core::output::OutputFormat, msg: &str) -> Option<String> {
-    use seer_core::output::OutputFormat;
-    match output_format {
-        OutputFormat::Human => None,
-        OutputFormat::Json | OutputFormat::Yaml => {
-            Some(serde_json::json!({ "error": msg }).to_string())
-        }
-        OutputFormat::Markdown => Some(format!("**Error:** {}", msg)),
-    }
-}
+use utils::machine_error;
 
 /// Prints a format-appropriate error to stderr and exits non-zero. Honors the
 /// global `--format` flag so scripted consumers get structured output instead
@@ -829,6 +816,13 @@ async fn execute_command(
                         fail_count.to_string().ctp_green()
                     }
                 );
+            }
+
+            // A run with zero successes is a total failure (network down,
+            // every domain malformed) — scripted callers gate on $?.
+            let exit_code = utils::bulk_exit_code(success_count, results.len());
+            if exit_code != 0 {
+                std::process::exit(exit_code);
             }
         }
         Commands::Status { domain } => {
@@ -1487,40 +1481,6 @@ async fn execute_command(
     }
 
     Ok(())
-}
-
-#[cfg(test)]
-mod cli_error_tests {
-    use super::machine_error;
-    use seer_core::output::OutputFormat;
-
-    #[test]
-    fn json_error_is_parseable_and_carries_message() {
-        let s = machine_error(OutputFormat::Json, "lookup failed: boom").unwrap();
-        let v: serde_json::Value = serde_json::from_str(&s).expect("valid JSON on error path");
-        assert_eq!(v["error"], "lookup failed: boom");
-    }
-
-    #[test]
-    fn yaml_error_is_structured_json_subset() {
-        // JSON is a valid YAML document; assert it parses and carries the message.
-        let s = machine_error(OutputFormat::Yaml, "boom").unwrap();
-        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
-        assert_eq!(v["error"], "boom");
-    }
-
-    #[test]
-    fn human_error_has_no_machine_payload() {
-        assert!(machine_error(OutputFormat::Human, "boom").is_none());
-    }
-
-    #[test]
-    fn markdown_error_is_rendered() {
-        assert_eq!(
-            machine_error(OutputFormat::Markdown, "boom").unwrap(),
-            "**Error:** boom"
-        );
-    }
 }
 
 #[cfg(test)]

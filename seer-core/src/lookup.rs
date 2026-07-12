@@ -110,7 +110,10 @@ fn classify_whois_leg(
         return Some(("high", "whois"));
     }
     if whois_response_is_thin(w) && rdap_error_is_404(rdap_err) {
-        return Some(("medium", "whois_thin_response"));
+        // Must stay in lockstep with `availability::decide_fallback`'s
+        // RDAP-404 branch: the registry's own 404 is authoritative, so the
+        // verdict is high-confidence via RDAP — not a hedged WHOIS signal.
+        return Some(("high", "rdap"));
     }
     None
 }
@@ -742,12 +745,12 @@ impl SmartLookup {
                 if let Some(ref cb) = progress {
                     cb("Domain appears unregistered");
                 }
-                let details = match confidence {
-                    "high" => Some("WHOIS indicates domain is not registered".to_string()),
-                    "medium" => Some(
-                        "WHOIS returned no registrar or registration dates; RDAP returned 404"
-                            .to_string(),
-                    ),
+                // Keyed off `method` (not confidence) so the text names the
+                // signal that actually decided the verdict, matching
+                // `availability::decide_fallback`'s wording for the same cases.
+                let details = match method {
+                    "whois" => Some("WHOIS indicates domain is not registered".to_string()),
+                    "rdap" => Some("Registry RDAP reports no such domain (HTTP 404)".to_string()),
                     _ => None,
                 };
                 let avail = AvailabilityResult {
@@ -1532,14 +1535,20 @@ mod tests {
     }
 
     #[test]
-    fn classify_whois_leg_case_b_medium_confidence() {
+    fn classify_whois_leg_case_b_matches_decide_fallback() {
+        // Case B (thin WHOIS + RDAP 404) must classify identically to
+        // `availability::decide_fallback`'s branch for the same precondition:
+        // the registry's own RDAP 404 is the authoritative signal, so both
+        // ladders report ("high", "rdap"). Divergence here made `seer check`
+        // say "available" while `seer lookup` said "likely_available" for the
+        // same domain (2026-07-11 review).
         let w = empty_whois("example.xyz");
         assert!(!w.is_available(), "this WHOIS body has no 'no match' text");
         let rdap_err = SeerError::RdapError("query failed with status 404 Not Found".to_string());
         let (verdict, method) =
             classify_whois_leg(&w, &rdap_err).expect("expected a routing decision");
-        assert_eq!(verdict, "medium");
-        assert_eq!(method, "whois_thin_response");
+        assert_eq!(verdict, "high");
+        assert_eq!(method, "rdap");
     }
 
     #[test]

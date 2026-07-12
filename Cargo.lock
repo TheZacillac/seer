@@ -2950,6 +2950,7 @@ dependencies = [
  "seer-core",
  "serde",
  "serde_json",
+ "shlex",
  "tokio",
  "tracing",
  "tracing-subscriber",

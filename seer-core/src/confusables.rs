@@ -252,7 +252,11 @@ pub fn generate_candidates(domain: &str) -> Vec<ConfusableCandidate> {
         }
     }
 
-    // TLD swap: keep the label, swap the TLD.
+    // TLD swap: keep the label, swap the TLD. Collected separately so the
+    // cap below cannot drop them: label permutations grow with label length
+    // (insertion alone is 26×(L+1)), and a plain tail truncation silently
+    // discarded every tld-swap for ~16+ char labels.
+    let mut swaps = Vec::new();
     for &swap in SWAP_TLDS {
         if swap != tld {
             let candidate = match sub {
@@ -260,7 +264,7 @@ pub fn generate_candidates(domain: &str) -> Vec<ConfusableCandidate> {
                 None => format!("{label}.{swap}"),
             };
             if candidate != normalized && seen.insert(candidate.clone()) {
-                out.push(ConfusableCandidate {
+                swaps.push(ConfusableCandidate {
                     domain: candidate,
                     technique: "tld-swap".to_string(),
                 });
@@ -268,7 +272,10 @@ pub fn generate_candidates(domain: &str) -> Vec<ConfusableCandidate> {
         }
     }
 
-    out.truncate(MAX_CANDIDATES);
+    // Budget the cap: tld-swaps (a dozen at most) always fit; the label
+    // permutations absorb the truncation.
+    out.truncate(MAX_CANDIDATES.saturating_sub(swaps.len()));
+    out.extend(swaps);
     out
 }
 
@@ -417,6 +424,24 @@ mod tests {
         // A long label produces many insertions; the cap must hold.
         let cands = generate_candidates("averylongexamplelabelname.com");
         assert!(cands.len() <= MAX_CANDIDATES);
+    }
+
+    #[test]
+    fn tld_swaps_survive_the_cap_for_long_labels() {
+        // tld-swaps are generated last; a naive tail truncation dropped every
+        // one of them for ~16+ char labels (insertion alone is 26×(L+1)),
+        // silently disabling one of the most common real squat patterns for
+        // exactly the brand names most worth checking (2026-07-11 review).
+        for domain in ["wellsfargobanking.com", "averylongexamplelabelname.com"] {
+            let cands = generate_candidates(domain);
+            assert!(cands.len() <= MAX_CANDIDATES);
+            let swaps = cands.iter().filter(|c| c.technique == "tld-swap").count();
+            assert_eq!(
+                swaps,
+                SWAP_TLDS.len() - 1, // minus the domain's own TLD
+                "{domain}: every tld-swap candidate must survive the cap"
+            );
+        }
     }
 
     #[test]
