@@ -1,3 +1,4 @@
+mod clipboard;
 mod display;
 mod ops;
 mod repl;

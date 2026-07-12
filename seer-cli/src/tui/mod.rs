@@ -7,7 +7,6 @@
 
 mod action;
 mod app;
-mod clipboard;
 mod command;
 mod data;
 mod event;
@@ -37,6 +36,8 @@ use action::{Action, Msg};
 use app::App;
 use seer_core::{LookupHistory, Watchlist};
 use theme::Theme;
+
+use crate::clipboard;
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
