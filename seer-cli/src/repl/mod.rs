@@ -1417,11 +1417,12 @@ impl Repl {
     /// Pure part of `copy`: pick the format, serialize the last result.
     /// Returns (text to place on the clipboard, confirmation message).
     fn render_copy(&self, args: &[&str]) -> Result<(String, String), String> {
-        let format = match args.first().copied() {
+        let arg = args.first().map(|s| s.to_lowercase());
+        let format = match arg.as_deref() {
             None => seer_core::output::OutputFormat::Markdown,
             Some("markdown") | Some("md") => seer_core::output::OutputFormat::Markdown,
             Some("json") => seer_core::output::OutputFormat::Json,
-            Some("yaml") => seer_core::output::OutputFormat::Yaml,
+            Some("yaml") | Some("yml") => seer_core::output::OutputFormat::Yaml,
             Some(other) => {
                 return Err(format!(
                     "Unknown format '{other}'. Usage: copy [markdown|json|yaml]"
@@ -1544,6 +1545,10 @@ mod copy_tests {
         assert!(!yaml.is_empty());
         let (md, _) = repl.render_copy(&["markdown"]).expect("markdown");
         assert!(md.contains("1.2.3.4"));
+        let (json_upper, _) = repl.render_copy(&["JSON"]).expect("JSON");
+        assert!(json_upper.trim_start().starts_with('['));
+        let (yml, _) = repl.render_copy(&["yml"]).expect("yml");
+        assert!(!yml.is_empty());
     }
 
     #[test]
