@@ -31,6 +31,8 @@ pub struct Repl {
     availability_checker: seer_core::AvailabilityChecker,
     ssl_checker: seer_core::SslChecker,
     dns_follower: seer_core::DnsFollower,
+    /// Last single-result command output, for the `copy` command.
+    last_result: Option<crate::payload::Payload>,
 }
 
 impl Repl {
@@ -69,6 +71,7 @@ impl Repl {
             availability_checker: seer_core::AvailabilityChecker::from_config(cfg),
             ssl_checker: seer_core::SslChecker::from_config(cfg),
             dns_follower: seer_core::DnsFollower::new(),
+            last_result: None,
             context,
         })
     }
@@ -226,6 +229,7 @@ impl Repl {
             "watch" => self.execute_watch(args).await,
             "history" => self.execute_history(args).await,
             "set" => self.execute_set(args),
+            "copy" => self.execute_copy(args),
             "clear" => {
                 print!("\x1B[2J\x1B[1;1H");
                 let _ = std::io::stdout().flush();
@@ -1372,6 +1376,54 @@ impl Repl {
         CommandResult::Continue
     }
 
+    /// Pure part of `copy`: pick the format, serialize the last result.
+    /// Returns (text to place on the clipboard, confirmation message).
+    fn render_copy(&self, args: &[&str]) -> Result<(String, String), String> {
+        let format = match args.first().copied() {
+            None => seer_core::output::OutputFormat::Markdown,
+            Some("markdown") | Some("md") => seer_core::output::OutputFormat::Markdown,
+            Some("json") => seer_core::output::OutputFormat::Json,
+            Some("yaml") => seer_core::output::OutputFormat::Yaml,
+            Some(other) => {
+                return Err(format!(
+                    "Unknown format '{other}'. Usage: copy [markdown|json|yaml]"
+                ))
+            }
+        };
+        let Some(payload) = &self.last_result else {
+            return Err("Nothing to copy yet — run a lookup first".to_string());
+        };
+        let text = crate::payload::serialize(payload, format);
+        let msg = format!(
+            "Copied {} result as {}",
+            payload.kind(),
+            format!("{format:?}").to_lowercase()
+        );
+        Ok((text, msg))
+    }
+
+    fn execute_copy(&self, args: &[&str]) -> CommandResult {
+        match self.render_copy(args) {
+            Ok((text, msg)) => {
+                if let Err(e) = crate::clipboard::copy(&text) {
+                    return CommandResult::Error(format!("Clipboard write failed: {e}"));
+                }
+                println!("{}", msg.green());
+                CommandResult::Continue
+            }
+            Err(msg) => {
+                // "Nothing to copy" is guidance, not an error; usage/format
+                // problems go through the error path like other commands.
+                if msg.starts_with("Nothing to copy") {
+                    println!("{}", msg.yellow());
+                    CommandResult::Continue
+                } else {
+                    CommandResult::Error(msg)
+                }
+            }
+        }
+    }
+
     fn execute_set(&mut self, args: &[&str]) -> CommandResult {
         if args.len() < 2 {
             return CommandResult::Error("Usage: set <setting> <value>".to_string());
@@ -1409,5 +1461,57 @@ async fn save_watchlist_async(watchlist: seer_core::Watchlist) -> Result<(), Str
         Ok(Ok(())) => Ok(()),
         Ok(Err(e)) => Err(e.to_string()),
         Err(e) => Err(e.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod copy_tests {
+    use super::*;
+    use seer_core::dns::{RecordData, RecordType};
+
+    fn repl_with_result() -> Repl {
+        let mut repl = Repl::new().expect("repl construction is offline");
+        repl.last_result = Some(crate::payload::Payload::Dns(vec![seer_core::DnsRecord {
+            name: "example.com".into(),
+            record_type: RecordType::A,
+            ttl: 300,
+            data: RecordData::A {
+                address: "1.2.3.4".into(),
+            },
+        }]));
+        repl
+    }
+
+    #[test]
+    fn copy_with_no_result_is_friendly() {
+        let repl = Repl::new().expect("repl construction is offline");
+        let err = repl.render_copy(&[]).unwrap_err();
+        assert!(err.contains("Nothing to copy"));
+    }
+
+    #[test]
+    fn copy_defaults_to_markdown() {
+        let repl = repl_with_result();
+        let (text, msg) = repl.render_copy(&[]).expect("copyable");
+        assert!(text.contains("1.2.3.4"));
+        assert!(msg.contains("dns") && msg.contains("markdown"));
+    }
+
+    #[test]
+    fn copy_accepts_explicit_formats() {
+        let repl = repl_with_result();
+        let (json, _) = repl.render_copy(&["json"]).expect("json");
+        assert!(json.trim_start().starts_with('['));
+        let (yaml, _) = repl.render_copy(&["yaml"]).expect("yaml");
+        assert!(!yaml.is_empty());
+        let (md, _) = repl.render_copy(&["markdown"]).expect("markdown");
+        assert!(md.contains("1.2.3.4"));
+    }
+
+    #[test]
+    fn copy_rejects_unknown_format() {
+        let repl = repl_with_result();
+        let err = repl.render_copy(&["bogus"]).unwrap_err();
+        assert!(err.contains("Usage: copy"));
     }
 }
