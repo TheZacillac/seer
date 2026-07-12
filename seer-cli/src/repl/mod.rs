@@ -377,6 +377,10 @@ impl Repl {
             "  {:<34} Change output format",
             "set output <human|json|yaml|markdown>".bright_cyan()
         );
+        println!(
+            "  {:<34} Copy last result to clipboard (default: markdown)",
+            "copy [markdown|json|yaml]".bright_cyan()
+        );
         println!("  {:<34} Clear screen", "clear".bright_cyan());
         println!("  {:<34} Exit the program", "exit".bright_cyan());
         println!();

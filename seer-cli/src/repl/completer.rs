@@ -35,6 +35,7 @@ const COMMANDS: &[&str] = &[
     "history",
     "set",
     "clear",
+    "copy",
 ];
 
 // Note: "CAA" here is the DNS record type completed after `dig`/`prop`/etc.,
@@ -234,6 +235,9 @@ impl Hinter for SeerCompleter {
             "history" if words.len() == 1 && line.ends_with(' ') => {
                 Some(" [domain] [--clear]".to_string())
             }
+            "copy" if words.len() == 1 && line.ends_with(' ') => {
+                Some(" [markdown|json|yaml]".to_string())
+            }
             _ => None,
         }
     }
@@ -266,7 +270,7 @@ mod tests {
 
     #[test]
     fn new_commands_are_completable() {
-        for cmd in ["drift", "caa", "posture", "confusables"] {
+        for cmd in ["drift", "caa", "posture", "confusables", "copy"] {
             assert!(COMMANDS.contains(&cmd), "{cmd} should be a known command");
         }
         // The lowercase `caa` command must not displace the CAA record type.

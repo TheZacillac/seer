@@ -11,6 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- REPL `copy [markdown|json|yaml]` command — copies the last shown result
+  (lookup/whois/rdap/dig/ssl/…) to the clipboard via OSC52, defaulting to
+  Markdown. The payload/serialize/clipboard stack is now shared between the
+  REPL and the TUI (which already had `y`).
+
 ## [0.42.0] - 2026-07-12
 
 A defect-sweep release: 15 fixes from a full-codebase multi-agent review
