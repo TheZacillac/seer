@@ -591,9 +591,20 @@ const AVAILABILITY_SENTENCE_PATTERNS: &[&str] = &[
 /// inconclusive availability verdict.
 const NON_AVAILABILITY_PATTERNS: &[&str] = &[
     "not available", // "...is not available for registration."
-    "reserved",      // "reserved - not registered for public use"
-    "rate limit",    // "rate limited" / "Access rate limited; ..."
-    "rate-limit",    // hyphenated variant
+    // Reserved-status phrasings. Deliberately NOT the bare word "reserved":
+    // nearly every WHOIS body ends with an "All rights reserved." copyright
+    // footer, and matching it would misroute genuinely-unregistered domains
+    // to "inconclusive" before the DNS tie-breaker runs.
+    "reserved -",    // "reserved - not registered for public use"
+    "is reserved",   // "this name is reserved by the registry"
+    "been reserved", // "this domain has been reserved"
+    "reserved by",   // "reserved by the registry operator"
+    "reserved for",  // "reserved for future use"
+    "status: reserved",
+    "reserved domain", // "Reserved Domain Name" (ICANN reserved names)
+    "reserved name",
+    "rate limit", // "rate limited" / "Access rate limited; ..."
+    "rate-limit", // hyphenated variant
     "rate exceeded",
     "quota",
     "too many requests",
@@ -1146,6 +1157,12 @@ Name Server: ns1.example.com
             "Domain not found.\n",
             "Conditions of use for the whois service via port 43\n",
             "Domain Name: example.com\nRegistrar: Example, Inc.\nName Server: ns1.example.com\n",
+            // Near-universal copyright footers contain the word "reserved" but
+            // are not a refusal — a thin response whose only non-comment line
+            // is such a footer must stay eligible for the DNS tie-breaker
+            // instead of short-circuiting to "inconclusive".
+            "Copyright (c) 2024 Example Registry Corp. All rights reserved.\n",
+            "All rights reserved. Use of this service is subject to the terms of use.\n",
         ] {
             assert!(
                 !make_response(raw).indicates_registry_refusal(),

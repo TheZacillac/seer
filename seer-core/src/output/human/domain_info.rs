@@ -231,6 +231,36 @@ impl HumanFormatter {
             ));
         }
 
+        // Derived lifecycle (computed at construction from the dates above).
+        if let Some(days) = info.days_until_expiration {
+            let rendered = format!("{} days", days);
+            output.push(format!(
+                "  {}: {}",
+                self.label("Days Until Expiry"),
+                if days <= 30 {
+                    self.warning(&rendered)
+                } else {
+                    self.value(&rendered)
+                }
+            ));
+        }
+        if let Some(age) = info.domain_age_days {
+            output.push(format!(
+                "  {}: {}",
+                self.label("Domain Age"),
+                self.value(&format!("{} days", age))
+            ));
+        }
+        if let Some(expiry_status) = info.expiry_status {
+            let rendered = expiry_status.to_string();
+            let colored = match expiry_status {
+                crate::domain_info::ExpiryStatus::Active => self.value(&rendered),
+                crate::domain_info::ExpiryStatus::ExpiringSoon => self.warning(&rendered),
+                _ => self.error(&rendered),
+            };
+            output.push(format!("  {}: {}", self.label("Expiry Status"), colored));
+        }
+
         // DNS. Nameservers/status originate from attacker-controlled WHOIS/RDAP
         // parsing, so sanitize them like the adjacent DNSSEC field (issue #53).
         if !info.nameservers.is_empty() {
@@ -253,6 +283,18 @@ impl HumanFormatter {
                 self.label("DNSSEC"),
                 self.value(&sanitize_display(dnssec))
             ));
+        }
+
+        // Plain-English decodings of recognized EPP status codes.
+        if !info.status_descriptions.is_empty() {
+            output.push(format!("\n  {}:", self.label("Status Codes")));
+            for sd in &info.status_descriptions {
+                output.push(format!(
+                    "    {}: {}",
+                    self.label(&sanitize_display(&sd.code)),
+                    self.value(&sanitize_display(&sd.description))
+                ));
+            }
         }
 
         // Registrant Contact
@@ -361,6 +403,43 @@ impl HumanFormatter {
                 output.push(format!(
                     "    {}: {}",
                     self.label("Phone"),
+                    self.value(&sanitize_display(phone))
+                ));
+            }
+        }
+
+        // Registrar Detail (RDAP registrar entity: abuse contact, IANA ID, URL)
+        let has_registrar_detail = info.registrar_iana_id.is_some()
+            || info.registrar_url.is_some()
+            || info.registrar_abuse_email.is_some()
+            || info.registrar_abuse_phone.is_some();
+        if has_registrar_detail {
+            output.push(format!("\n  {}:", self.label("Registrar Detail")));
+            if let Some(ref iana_id) = info.registrar_iana_id {
+                output.push(format!(
+                    "    {}: {}",
+                    self.label("IANA ID"),
+                    self.value(&sanitize_display(iana_id))
+                ));
+            }
+            if let Some(ref url) = info.registrar_url {
+                output.push(format!(
+                    "    {}: {}",
+                    self.label("URL"),
+                    self.value(&sanitize_display(url))
+                ));
+            }
+            if let Some(ref email) = info.registrar_abuse_email {
+                output.push(format!(
+                    "    {}: {}",
+                    self.label("Abuse Email"),
+                    self.value(&sanitize_display(email))
+                ));
+            }
+            if let Some(ref phone) = info.registrar_abuse_phone {
+                output.push(format!(
+                    "    {}: {}",
+                    self.label("Abuse Phone"),
                     self.value(&sanitize_display(phone))
                 ));
             }

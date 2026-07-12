@@ -10,7 +10,14 @@ use crate::tui::panes::bulk::{BulkState, OPS};
 use crate::tui::theme::Theme;
 use crate::tui::widgets::{dot, gauge, panel, scroll_to};
 
-pub fn render(f: &mut Frame, area: Rect, theme: &Theme, bulk: &BulkState, editing: Option<&str>) {
+pub fn render(
+    f: &mut Frame,
+    area: Rect,
+    theme: &Theme,
+    bulk: &BulkState,
+    editing: Option<&str>,
+    spin: usize,
+) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(7), Constraint::Min(0)])
@@ -88,7 +95,7 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, bulk: &BulkState, editin
     // Running status + ok/failed tally
     let (ok, failed) = bulk.tally();
     let spin_text = if bulk.running {
-        format!("  {} running…", SPIN[0])
+        format!("  {} running…", SPIN[spin % SPIN.len()])
     } else if !bulk.rows.is_empty() {
         "  done".to_string()
     } else {
@@ -319,7 +326,7 @@ mod tests {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|f| render(f, f.area(), &theme, &bulk, None))
+            .draw(|f| render(f, f.area(), &theme, &bulk, None, 0))
             .unwrap();
         let text = buf_text(&terminal);
         assert!(
@@ -340,12 +347,32 @@ mod tests {
         let backend = TestBackend::new(80, 14);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|f| render(f, f.area(), &theme, &bulk, None))
+            .draw(|f| render(f, f.area(), &theme, &bulk, None, 0))
             .unwrap();
         let text = buf_text(&terminal);
         assert!(
             text.contains("d49.com"),
             "the newest streamed row should be pinned in view"
+        );
+    }
+
+    #[test]
+    fn spinner_animates_with_app_spin_index() {
+        // Mirror of the follow-lens regression: the running spinner was
+        // hardcoded to SPIN[0] and never animated (2026-07-11 review).
+        let theme = Theme::frappe();
+        let mut bulk = BulkState::default();
+        bulk.running = true;
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| render(f, f.area(), &theme, &bulk, None, 3))
+            .unwrap();
+        let text = buf_text(&terminal);
+        assert!(
+            text.contains(crate::tui::app::SPIN[3]),
+            "spinner should render the current animation frame"
         );
     }
 
@@ -357,7 +384,7 @@ mod tests {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|f| render(f, f.area(), &theme, &bulk, None))
+            .draw(|f| render(f, f.area(), &theme, &bulk, None, 0))
             .unwrap();
         let text = buf_text(&terminal);
         assert!(
@@ -374,7 +401,7 @@ mod tests {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|f| render(f, f.area(), &theme, &bulk, None))
+            .draw(|f| render(f, f.area(), &theme, &bulk, None, 0))
             .unwrap();
         let text = buf_text(&terminal);
         assert!(text.contains("lookup"), "op chips should show 'lookup'");
@@ -388,7 +415,7 @@ mod tests {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|f| render(f, f.area(), &theme, &bulk, None))
+            .draw(|f| render(f, f.area(), &theme, &bulk, None, 0))
             .unwrap();
         let text = buf_text(&terminal);
         assert!(text.contains("press d to enter"), "prompts for domains");
@@ -404,7 +431,7 @@ mod tests {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|f| render(f, f.area(), &theme, &bulk, None))
+            .draw(|f| render(f, f.area(), &theme, &bulk, None, 0))
             .unwrap();
         let text = buf_text(&terminal);
         assert!(text.contains("1 ok"), "summary should report ok count");
@@ -421,7 +448,7 @@ mod tests {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|f| render(f, f.area(), &theme, &bulk, None))
+            .draw(|f| render(f, f.area(), &theme, &bulk, None, 0))
             .unwrap();
         let text = buf_text(&terminal);
         assert!(text.contains("Detail"), "detail panel header should render");

@@ -1525,13 +1525,37 @@ pub const RDAP_ONLY_TLDS: &[&str] = &[
     "search", "soy", "youtube", "zip",
 ];
 
+/// TLDs whose port-43 WHOIS servers are dead and were removed from
+/// `WHOIS_SERVERS` (2026-07-04 cleanup waves — see the module-level
+/// "Intentional omissions" doc). They are still valid, delegated TLDs, so the
+/// catalog must keep listing them: the gTLDs resolve via RDAP, and the ccTLDs
+/// fall back to `lookup_tld`'s registry-URL guidance. IDN TLDs appear in both
+/// Unicode and punycode forms, matching how `WHOIS_SERVERS` keyed them.
+pub const WHOIS_RETIRED_TLDS: &[&str] = &[
+    "apple",
+    "brussels",
+    "cymru",
+    "wales",
+    "vlaanderen",
+    "pharmacy",
+    "na",
+    "xn--p1acf",
+    "рус",
+    "lk",
+    "xn--fzc2c9e2c",
+    "xn--xkc2al3hye2a",
+    "mt",
+];
+
 /// Returns every TLD seer knows about: the WHOIS server map keys unioned with
-/// the RDAP-only TLDs, sorted and deduplicated. Backs the TUI TLD browser so it
-/// can list the full ~1,400-entry catalog instead of a hardcoded handful.
+/// the RDAP-only and WHOIS-retired TLDs, sorted and deduplicated. Backs the
+/// TUI TLD browser so it can list the full ~1,400-entry catalog instead of a
+/// hardcoded handful.
 pub fn all_tlds() -> &'static [&'static str] {
     static ALL: Lazy<Vec<&'static str>> = Lazy::new(|| {
         let mut v: Vec<&'static str> = WHOIS_SERVERS.keys().copied().collect();
         v.extend_from_slice(RDAP_ONLY_TLDS);
+        v.extend_from_slice(WHOIS_RETIRED_TLDS);
         v.sort_unstable();
         v.dedup();
         v
@@ -1542,6 +1566,35 @@ pub fn all_tlds() -> &'static [&'static str] {
 #[cfg(test)]
 mod all_tlds_tests {
     use super::*;
+
+    /// TLDs whose dead WHOIS servers were removed from the map (2026-07-04
+    /// cleanup waves) are still valid TLDs and must remain discoverable in
+    /// the catalog — losing them from `all_tlds()` breaks the TUI's `:tld`
+    /// command and browser for legitimate TLDs.
+    #[test]
+    fn whois_retired_tlds_stay_in_catalog() {
+        let tlds = all_tlds();
+        for tld in [
+            "apple",
+            "brussels",
+            "cymru",
+            "wales",
+            "vlaanderen",
+            "pharmacy",
+            "na",
+            "xn--p1acf",
+            "рус",
+            "lk",
+            "xn--fzc2c9e2c",
+            "xn--xkc2al3hye2a",
+            "mt",
+        ] {
+            assert!(
+                tlds.binary_search(&tld).is_ok(),
+                ".{tld} missing from all_tlds() — WHOIS-retired TLDs must stay in the catalog"
+            );
+        }
+    }
 
     #[test]
     fn all_tlds_is_sorted_deduped_and_large() {

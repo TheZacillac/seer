@@ -183,6 +183,32 @@ impl MarkdownFormatter {
         ));
         output.push(format!("| DNSSEC | {} |", opt_md(&info.dnssec)));
 
+        // Derived lifecycle rows — only when computed, to keep sparse
+        // (e.g. available-domain) tables free of dash-only noise.
+        if let Some(days) = info.days_until_expiration {
+            output.push(format!("| Days Until Expiry | {} |", days));
+        }
+        if let Some(age) = info.domain_age_days {
+            output.push(format!("| Domain Age (days) | {} |", age));
+        }
+        if let Some(expiry_status) = info.expiry_status {
+            output.push(format!("| Expiry Status | {} |", expiry_status));
+        }
+
+        // Plain-English decodings of recognized EPP status codes.
+        if !info.status_descriptions.is_empty() {
+            output.push(String::new());
+            output.push("### Status Codes".to_string());
+            output.push(String::new());
+            for sd in &info.status_descriptions {
+                output.push(format!(
+                    "- `{}` — {}",
+                    MdSafe(&sd.code),
+                    MdSafe(&sd.description)
+                ));
+            }
+        }
+
         // Contacts table
         let has_any_contact = info.registrant_email.is_some()
             || info.registrant_phone.is_some()
@@ -242,6 +268,29 @@ impl MarkdownFormatter {
                     opt_md(&info.tech_email),
                     opt_md(&info.tech_phone),
                 ));
+            }
+        }
+
+        // Registrar Detail (RDAP registrar entity: abuse contact, IANA ID, URL)
+        let has_registrar_detail = info.registrar_iana_id.is_some()
+            || info.registrar_url.is_some()
+            || info.registrar_abuse_email.is_some()
+            || info.registrar_abuse_phone.is_some();
+        if has_registrar_detail {
+            output.push(String::new());
+            output.push("### Registrar Detail".to_string());
+            output.push(String::new());
+            if let Some(ref iana_id) = info.registrar_iana_id {
+                output.push(format!("- **IANA ID**: {}", MdSafe(iana_id)));
+            }
+            if let Some(ref url) = info.registrar_url {
+                output.push(format!("- **URL**: {}", MdSafe(url)));
+            }
+            if let Some(ref email) = info.registrar_abuse_email {
+                output.push(format!("- **Abuse Email**: {}", MdSafe(email)));
+            }
+            if let Some(ref phone) = info.registrar_abuse_phone {
+                output.push(format!("- **Abuse Phone**: {}", MdSafe(phone)));
             }
         }
 

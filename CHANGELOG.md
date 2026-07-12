@@ -11,6 +11,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+A defect-sweep release: 15 fixes from a full-codebase multi-agent review
+(2026-07-11), spanning availability-verdict consistency, output completeness,
+CLI/REPL parity, TUI lifecycle, and API rate-limit parity.
+
+### Fixed
+- **Registrar detail + lifecycle fields now rendered** — the seven 0.38.0
+  fields (registrar abuse email/phone, IANA ID, URL; days-until-expiration,
+  domain age, expiry status, decoded status codes) were computed and
+  serialized but never shown by the human/markdown formatters or the bulk
+  `info` CSV; they were JSON/YAML-only. `seer info` now shows a
+  "Registrar Detail" block, lifecycle lines, and decoded status codes in
+  every format, and the info CSV gained the seven matching columns.
+- **WHOIS-retired TLDs restored to the catalog** — the 0.40.1/0.41.0
+  dead-server cleanups removed 12 TLDs (`apple`, `brussels`, `cymru`,
+  `wales`, `vlaanderen`, `pharmacy`, `na`, `рус`, `lk` + IDN aliases, `mt`)
+  from `WHOIS_SERVERS` without listing them as WHOIS-less, so they vanished
+  from `all_tlds()` and the TUI's `:tld` command rejected them. A new
+  `WHOIS_RETIRED_TLDS` constant keeps them discoverable.
+- **Availability ladders agree on RDAP-404 confidence** — for a thin WHOIS
+  response plus an authoritative registry RDAP 404, `seer lookup` reported
+  `likely_available` (medium/whois_thin_response) while `seer check`
+  reported `available` (high/rdap) for the same domain. Both now classify as
+  high-confidence via RDAP.
+- **"All rights reserved." no longer reads as a registry refusal** — the
+  bare `reserved` substring in the refusal patterns matched the near-universal
+  copyright footer, short-circuiting genuinely-unregistered domains to
+  "inconclusive" before the DNS tie-breaker. Replaced with anchored
+  reserved-status phrasings.
+- **`seer bulk` exits non-zero on total failure** — a run where every domain
+  failed (network down, malformed list) previously exited 0, giving scripted
+  callers a false green. Zero successes over a non-empty batch now exits 1;
+  partial failures still exit 0 (per-row status is in the output).
+- **First retry now jittered** — `RetryPolicy::delay_for_attempt(0)` returned
+  the fixed initial delay before the jitter branch, so concurrent callers
+  hit by the same 429/outage all retried in lockstep (thundering herd on
+  exactly the attempt where it matters most).
+- **TLD-swap look-alikes survive the candidate cap** — confusable candidates
+  were truncated after concatenation with tld-swaps generated last, so
+  labels of ~16+ characters (`wellsfargobanking.com`) silently lost every
+  TLD-swap candidate. Swaps now have a reserved budget.
+- **REPL `follow` honors the configured nameserver** — unlike `dig` and the
+  CLI's `seer follow`, the REPL's follow ignored `nameserver` from
+  `~/.seer/config.toml` and always used the default resolver.
+- **REPL errors honor `set output json|yaml|markdown`** — errors now render
+  the same `{"error": ...}` / `**Error:**` shapes as the CLI instead of
+  always printing ANSI-colored prose.
+- **TUI: switching domains cancels a live Follow run** — the background DNS
+  monitor for the old domain previously kept polling (invisibly, up to its
+  full iteration budget) after a domain switch; only its UI updates were
+  dropped. The switch now emits `StopFollow`.
+- **TUI: Follow/Bulk spinners animate** — both lenses rendered a frozen
+  first-frame glyph instead of the shared spinner animation.
+- **`resolve_srv` normalizes its domain input** — the one public resolver
+  entry point that skipped `normalize_domain`, so URL-form/garbage input
+  produced a misclassified DNS error instead of an input-validation error.
+- **MCP per-tool rate limits match REST** — `seer_bulk_ssl`/`seer_bulk_status`/
+  `seer_bulk_propagation`/`seer_confusables` are now limited to 5/minute and
+  the other bulk tools to 10/minute (mirroring the REST routers' per-route
+  limits) on both MCP transports, instead of only the flat `SEER_RATE_LIMIT`.
+
+### Added
+- **Quote-aware REPL tokenization** — arguments may now be quoted
+  shell-style, so `bulk lookup "Domain Lists/prod.txt"` works; unbalanced
+  quotes produce a clear error instead of garbage tokens.
+
 ## [0.41.0] - 2026-07-05
 
 A ccTLD coverage release: second-level registry zones (`.co.za` and friends)

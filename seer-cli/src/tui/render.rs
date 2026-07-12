@@ -175,7 +175,7 @@ fn main_pane(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     // otherwise toggling `r` would drop them to the generic "press /" idle hint.
     match lens.key {
         "follow" => {
-            lenses::follow::render(f, content, theme, &app.panes.follow);
+            lenses::follow::render(f, content, theme, &app.panes.follow, app.spin);
             return;
         }
         "diff" => {
@@ -198,6 +198,7 @@ fn main_pane(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
                 theme,
                 &app.panes.bulk,
                 field_buf(&app.input_mode, EditTarget::BulkDomains),
+                app.spin,
             );
             return;
         }

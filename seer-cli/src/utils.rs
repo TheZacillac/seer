@@ -125,6 +125,34 @@ pub fn format_interval(minutes: f64) -> String {
     }
 }
 
+/// Renders a machine-readable error payload for non-human formats so that
+/// `--format json|yaml` (and the REPL's `set output json|yaml`) stays
+/// parseable on the error path. Returns `None` for Human (callers render
+/// colored prose). JSON is a subset of YAML, so the same `{"error": ...}`
+/// document is valid for both.
+pub fn machine_error(output_format: seer_core::output::OutputFormat, msg: &str) -> Option<String> {
+    use seer_core::output::OutputFormat;
+    match output_format {
+        OutputFormat::Human => None,
+        OutputFormat::Json | OutputFormat::Yaml => {
+            Some(serde_json::json!({ "error": msg }).to_string())
+        }
+        OutputFormat::Markdown => Some(format!("**Error:** {}", msg)),
+    }
+}
+
+/// Process exit code for a completed bulk run. Zero successes over a
+/// non-empty batch means the run as a whole failed (network down, every
+/// domain malformed) and scripted callers must see a non-zero exit; partial
+/// failures keep exit 0 because per-row status is already in the output.
+pub fn bulk_exit_code(success_count: usize, total: usize) -> i32 {
+    if total > 0 && success_count == 0 {
+        1
+    } else {
+        0
+    }
+}
+
 pub fn bulk_results_to_csv(results: &[BulkResult], operation: &str) -> String {
     let mut csv = String::new();
 
@@ -148,7 +176,7 @@ pub fn bulk_results_to_csv(results: &[BulkResult], operation: &str) -> String {
             csv.push_str("domain,success,available,confidence,method,details,duration_ms,error\n");
         }
         "info" => {
-            csv.push_str("domain,success,source,registrar,registrant,organization,created,expires,updated,nameservers,status,dnssec,registrant_email,registrant_phone,registrant_address,registrant_country,admin_name,admin_organization,admin_email,admin_phone,tech_name,tech_organization,tech_email,tech_phone,whois_server,rdap_url,availability_verdict,duration_ms,error\n");
+            csv.push_str("domain,success,source,registrar,registrant,organization,created,expires,updated,nameservers,status,dnssec,registrant_email,registrant_phone,registrant_address,registrant_country,admin_name,admin_organization,admin_email,admin_phone,tech_name,tech_organization,tech_email,tech_phone,whois_server,rdap_url,registrar_abuse_email,registrar_abuse_phone,registrar_iana_id,registrar_url,days_until_expiration,domain_age_days,expiry_status,availability_verdict,duration_ms,error\n");
         }
         "ssl" => {
             csv.push_str("domain,success,subject,issuer,valid_from,valid_until,days_remaining,signature_algorithm,key_type,key_bits,chain_length,san_count,sans,protocol_version,is_valid,duration_ms,error\n");
@@ -453,7 +481,7 @@ pub fn bulk_results_to_csv(results: &[BulkResult], operation: &str) -> String {
                 let availability_verdict = escape_csv_field(availability_verdict);
                 if let Some(BulkResultData::Info(ref info)) = result.data {
                     csv.push_str(&format!(
-                        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+                        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
                         domain,
                         success,
                         info.source, // Display impl renders the same lowercase form as JSON
@@ -480,13 +508,20 @@ pub fn bulk_results_to_csv(results: &[BulkResult], operation: &str) -> String {
                         escape_csv_field(info.tech_phone.as_deref().unwrap_or("")),
                         escape_csv_field(info.whois_server.as_deref().unwrap_or("")),
                         escape_csv_field(info.rdap_url.as_deref().unwrap_or("")),
+                        escape_csv_field(info.registrar_abuse_email.as_deref().unwrap_or("")),
+                        escape_csv_field(info.registrar_abuse_phone.as_deref().unwrap_or("")),
+                        escape_csv_field(info.registrar_iana_id.as_deref().unwrap_or("")),
+                        escape_csv_field(info.registrar_url.as_deref().unwrap_or("")),
+                        info.days_until_expiration.map(|d| d.to_string()).unwrap_or_default(),
+                        info.domain_age_days.map(|d| d.to_string()).unwrap_or_default(),
+                        info.expiry_status.map(|s| s.to_string()).unwrap_or_default(),
                         availability_verdict,
                         duration_ms,
                         error
                     ));
                 } else {
                     csv.push_str(&format!(
-                        "{},{},,,,,,,,,,,,,,,,,,,,,,,,,{},{},{}\n",
+                        "{},{},,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,{},{},{}\n",
                         domain, success, availability_verdict, duration_ms, error
                     ));
                 }
@@ -1162,6 +1197,116 @@ mod tests {
             );
             assert!(row.starts_with("bad.invalid,false,"), "got: {row}");
             assert!(row.ends_with(",7,boom"), "got: {row}");
+        }
+    }
+
+    #[test]
+    fn json_error_is_parseable_and_carries_message() {
+        use seer_core::output::OutputFormat;
+        let s = machine_error(OutputFormat::Json, "lookup failed: boom").unwrap();
+        let v: serde_json::Value = serde_json::from_str(&s).expect("valid JSON on error path");
+        assert_eq!(v["error"], "lookup failed: boom");
+    }
+
+    #[test]
+    fn yaml_error_is_structured_json_subset() {
+        use seer_core::output::OutputFormat;
+        // JSON is a valid YAML document; assert it parses and carries the message.
+        let s = machine_error(OutputFormat::Yaml, "boom").unwrap();
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["error"], "boom");
+    }
+
+    #[test]
+    fn human_error_has_no_machine_payload() {
+        use seer_core::output::OutputFormat;
+        assert!(machine_error(OutputFormat::Human, "boom").is_none());
+    }
+
+    #[test]
+    fn markdown_error_is_rendered() {
+        use seer_core::output::OutputFormat;
+        assert_eq!(
+            machine_error(OutputFormat::Markdown, "boom").unwrap(),
+            "**Error:** boom"
+        );
+    }
+
+    #[test]
+    fn bulk_exit_code_signals_total_failure_only() {
+        // `seer bulk` exited 0 even when every domain failed (network down,
+        // malformed list), giving scripted callers a false green
+        // (2026-07-11 review). All-fail → 1; partial failure stays 0 since
+        // per-row status lives in the CSV/JSON output.
+        assert_eq!(bulk_exit_code(0, 5), 1, "all failed");
+        assert_eq!(bulk_exit_code(3, 5), 0, "partial failure");
+        assert_eq!(bulk_exit_code(5, 5), 0, "all succeeded");
+        assert_eq!(bulk_exit_code(0, 0), 0, "empty batch is not a failure");
+    }
+
+    #[test]
+    fn info_csv_includes_registrar_detail_and_lifecycle_columns() {
+        // The PR #101 registrar-detail + lifecycle fields must reach the bulk
+        // "info" CSV export, matching what JSON/YAML already expose
+        // (2026-07-11 review). Also guards header/row column parity for both
+        // the populated and the failure row shapes.
+        let whois = seer_core::WhoisResponse::parse(
+            "example.com",
+            "whois.test",
+            "Registrar: Example Registrar\n\
+             Creation Date: 2020-01-01T00:00:00Z\n\
+             Registry Expiry Date: 2099-01-01T00:00:00Z\n\
+             Domain Status: clientTransferProhibited\n",
+        );
+        let mut info =
+            seer_core::domain_info::DomainInfo::from_sources("example.com", None, Some(&whois));
+        info.registrar_abuse_email = Some("abuse@registrar.test".to_string());
+        info.registrar_iana_id = Some("9999".to_string());
+
+        let results = [
+            BulkResult {
+                operation: BulkOperation::Info {
+                    domain: "example.com".to_string(),
+                },
+                success: true,
+                data: Some(seer_core::bulk::BulkResultData::Info(info)),
+                error: None,
+                duration_ms: 5,
+            },
+            BulkResult {
+                operation: BulkOperation::Info {
+                    domain: "bad.invalid".to_string(),
+                },
+                success: false,
+                data: None,
+                error: Some("boom".to_string()),
+                duration_ms: 7,
+            },
+        ];
+        let csv = bulk_results_to_csv(&results, "info");
+        let mut lines = csv.lines();
+        let header = lines.next().expect("header");
+        for col in [
+            "registrar_abuse_email",
+            "registrar_abuse_phone",
+            "registrar_iana_id",
+            "registrar_url",
+            "days_until_expiration",
+            "domain_age_days",
+            "expiry_status",
+        ] {
+            assert!(header.contains(col), "missing column {col} in: {header}");
+        }
+        let populated = lines.next().expect("populated row");
+        assert!(populated.contains("abuse@registrar.test"), "{populated}");
+        assert!(populated.contains("9999"), "{populated}");
+        let failure = lines.next().expect("failure row");
+        for row in [populated, failure] {
+            assert_eq!(
+                header.matches(',').count(),
+                row.matches(',').count(),
+                "info row must match header column count; row: {row}"
+            );
         }
     }
 

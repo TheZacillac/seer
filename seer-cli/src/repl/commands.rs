@@ -34,6 +34,16 @@ pub enum CommandResult {
     Error(String),
 }
 
+/// Splits a REPL input line into tokens, honoring shell-style single/double
+/// quotes so arguments containing spaces (e.g. `bulk lookup "Domain
+/// Lists/prod.txt"`) survive intact — the CLI gets this for free from the OS
+/// shell, but the REPL tokenizes its own input. Errors on unbalanced quotes
+/// instead of silently producing garbage tokens.
+pub fn tokenize_line(line: &str) -> Result<Vec<String>, String> {
+    shlex::split(line)
+        .ok_or_else(|| "Unbalanced quote in command line (close the \" or ' )".to_string())
+}
+
 /// Parsed arguments for the REPL `bulk` command.
 ///
 /// Paths are returned exactly as typed — tilde expansion is the caller's
@@ -284,5 +294,45 @@ mod tests {
         assert_eq!(got.record_type, RecordType::AAAA);
         assert_eq!(got.nameserver.as_deref(), Some("1.1.1.1"));
         assert!(!got.changes_only);
+    }
+
+    // ---------------- tokenize_line ----------------
+
+    #[test]
+    fn tokenize_splits_plain_words_like_whitespace_split() {
+        let got = tokenize_line("bulk lookup domains.txt").expect("valid");
+        assert_eq!(got, vec!["bulk", "lookup", "domains.txt"]);
+    }
+
+    #[test]
+    fn tokenize_keeps_quoted_path_with_spaces_intact() {
+        // The REPL previously split purely on whitespace, so a bulk file at
+        // "Domain Lists/prod.txt" was mangled into two garbage tokens with a
+        // literal quote character (2026-07-11 review).
+        let got = tokenize_line("bulk lookup \"Domain Lists/prod.txt\"").expect("valid");
+        assert_eq!(got, vec!["bulk", "lookup", "Domain Lists/prod.txt"]);
+    }
+
+    #[test]
+    fn tokenize_supports_single_quotes() {
+        let got = tokenize_line("bulk lookup 'my domains.txt' -o 'out dir/r.csv'").expect("valid");
+        assert_eq!(
+            got,
+            vec!["bulk", "lookup", "my domains.txt", "-o", "out dir/r.csv"]
+        );
+    }
+
+    #[test]
+    fn tokenize_rejects_unbalanced_quote_with_usage_hint() {
+        let err = tokenize_line("bulk lookup \"unterminated").unwrap_err();
+        assert!(
+            err.to_lowercase().contains("quote"),
+            "error should mention quoting: {err}"
+        );
+    }
+
+    #[test]
+    fn tokenize_empty_line_yields_no_tokens() {
+        assert_eq!(tokenize_line("   ").expect("valid"), Vec::<String>::new());
     }
 }

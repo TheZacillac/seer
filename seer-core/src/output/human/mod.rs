@@ -420,6 +420,46 @@ mod tests {
     }
 
     #[test]
+    fn domain_info_renders_registrar_detail_and_lifecycle_fields() {
+        // The PR #101 registrar-detail + derived-lifecycle fields were
+        // computed and serialized but never rendered by the human formatter,
+        // so `seer info` (default format) silently hid a documented feature
+        // (2026-07-11 review).
+        let whois = WhoisResponse::parse(
+            "example.com",
+            "whois.test",
+            "Registrar: Example Registrar\n\
+             Creation Date: 2020-01-01T00:00:00Z\n\
+             Registry Expiry Date: 2099-01-01T00:00:00Z\n\
+             Domain Status: clientTransferProhibited\n",
+        );
+        let mut info =
+            crate::domain_info::DomainInfo::from_sources("example.com", None, Some(&whois));
+        info.registrar_abuse_email = Some("abuse@registrar.test".to_string());
+        info.registrar_abuse_phone = Some("+1.5555550100".to_string());
+        info.registrar_iana_id = Some("9999".to_string());
+        info.registrar_url = Some("https://registrar.test".to_string());
+
+        assert!(info.days_until_expiration.is_some(), "lifecycle computed");
+        assert!(!info.status_descriptions.is_empty(), "status decoded");
+
+        let out = formatter().format_domain_info(&info);
+        for needle in [
+            "Registrar Detail",
+            "abuse@registrar.test",
+            "+1.5555550100",
+            "9999",
+            "https://registrar.test",
+            "Days Until Expiry",
+            "Domain Age",
+            "Expiry Status",
+            "clientTransferProhibited:",
+        ] {
+            assert!(out.contains(needle), "missing {needle:?} in:\n{out}");
+        }
+    }
+
+    #[test]
     fn domain_info_sanitizes_nameserver_and_status_fields() {
         // Nameserver/status values come from attacker-controlled WHOIS parsing
         // and were printed without sanitize_display (unlike the adjacent DNSSEC

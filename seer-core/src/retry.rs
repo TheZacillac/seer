@@ -87,14 +87,13 @@ impl RetryPolicy {
     /// The attempt number is internally capped to prevent integer overflow
     /// in the exponential calculation.
     pub fn delay_for_attempt(&self, attempt: usize) -> Duration {
-        if attempt == 0 {
-            return self.initial_delay;
-        }
-
         // Cap attempt to prevent overflow in powi() - 20 attempts with multiplier 2.0
         // gives 2^20 = ~1 million, which is safe for f64 and reasonable for delays
         let safe_attempt = attempt.min(20) as i32;
 
+        // powi(0) == 1.0, so attempt 0 naturally yields initial_delay — no
+        // short-circuit, which would skip the jitter branch below on the very
+        // attempt where concurrent callers are most likely in lockstep.
         let base_delay = self.initial_delay.as_millis() as f64 * self.multiplier.powi(safe_attempt);
         let capped_delay = base_delay.min(self.max_delay.as_millis() as f64);
 
@@ -353,6 +352,26 @@ mod tests {
         assert_eq!(policy.delay_for_attempt(1), Duration::from_millis(200));
         assert_eq!(policy.delay_for_attempt(2), Duration::from_millis(400));
         assert_eq!(policy.delay_for_attempt(3), Duration::from_millis(800));
+    }
+
+    #[test]
+    fn test_first_retry_is_jittered() {
+        // The first retry (attempt 0) is exactly where a shared outage or
+        // 429 hits every concurrent caller at once, so full jitter matters
+        // most there. A fixed `initial_delay` short-circuit produced a
+        // thundering herd of lockstep retries (2026-07-11 review).
+        let policy = RetryPolicy::new()
+            .with_initial_delay(Duration::from_millis(100))
+            .with_jitter(true);
+
+        let delays: Vec<Duration> = (0..64).map(|_| policy.delay_for_attempt(0)).collect();
+        // Full jitter: every sample within [0, initial_delay] ...
+        assert!(delays.iter().all(|d| *d <= Duration::from_millis(100)));
+        // ... and actually randomized (64 identical samples ≈ impossible).
+        assert!(
+            delays.iter().any(|d| *d != delays[0]),
+            "attempt-0 delay is constant — jitter not applied to the first retry"
+        );
     }
 
     #[test]

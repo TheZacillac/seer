@@ -411,4 +411,40 @@ mod tests {
         // escaped — the ANSI handling must not bypass the table-cell defense.
         assert_eq!(md("\x1b|col"), "\\|col");
     }
+
+    #[test]
+    fn domain_info_renders_registrar_detail_and_lifecycle_fields() {
+        // Mirror of the human-formatter regression: the PR #101
+        // registrar-detail + derived-lifecycle fields must be visible in
+        // `--format markdown`, not just JSON/YAML (2026-07-11 review).
+        let whois = crate::whois::WhoisResponse::parse(
+            "example.com",
+            "whois.test",
+            "Registrar: Example Registrar\n\
+             Creation Date: 2020-01-01T00:00:00Z\n\
+             Registry Expiry Date: 2099-01-01T00:00:00Z\n\
+             Domain Status: clientTransferProhibited\n",
+        );
+        let mut info =
+            crate::domain_info::DomainInfo::from_sources("example.com", None, Some(&whois));
+        info.registrar_abuse_email = Some("abuse@registrar.test".to_string());
+        info.registrar_abuse_phone = Some("+1.5555550100".to_string());
+        info.registrar_iana_id = Some("9999".to_string());
+        info.registrar_url = Some("https://registrar.test".to_string());
+
+        let out = MarkdownFormatter::new().format_domain_info(&info);
+        for needle in [
+            "Registrar Detail",
+            "abuse@registrar.test",
+            "+1.5555550100",
+            "9999",
+            "https://registrar.test",
+            "Days Until Expiry",
+            "Domain Age",
+            "Expiry Status",
+            "clientTransferProhibited",
+        ] {
+            assert!(out.contains(needle), "missing {needle:?} in:\n{out}");
+        }
+    }
 }

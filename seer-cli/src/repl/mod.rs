@@ -95,7 +95,14 @@ impl Repl {
                         CommandResult::Continue => {}
                         CommandResult::Exit => break,
                         CommandResult::Error(e) => {
-                            eprintln!("{} {}", "Error:".ctp_red().bold(), e);
+                            // Honor `set output json|yaml|markdown` on the
+                            // error path too, so a wrapper consuming REPL
+                            // output gets the same structured `{"error": ...}`
+                            // shape the CLI emits.
+                            match crate::utils::machine_error(self.context.output_format, &e) {
+                                Some(structured) => eprintln!("{}", structured),
+                                None => eprintln!("{} {}", "Error:".ctp_red().bold(), e),
+                            }
                         }
                     }
 
@@ -175,7 +182,13 @@ impl Repl {
     }
 
     async fn execute_line(&mut self, line: &str) -> CommandResult {
-        let parts: Vec<&str> = line.split_whitespace().collect();
+        // Shell-style tokenization so quoted arguments (e.g. a bulk file path
+        // containing spaces) survive — plain whitespace splitting mangled them.
+        let tokens = match commands::tokenize_line(line) {
+            Ok(t) => t,
+            Err(e) => return CommandResult::Error(e),
+        };
+        let parts: Vec<&str> = tokens.iter().map(|s| s.as_str()).collect();
         if parts.is_empty() {
             return CommandResult::Continue;
         }
@@ -855,6 +868,10 @@ impl Repl {
             Ok(p) => p,
             Err(e) => return CommandResult::Error(e),
         };
+
+        // Fall back to the configured nameserver when none is given inline,
+        // matching `execute_dig` and the CLI's `seer follow`.
+        let nameserver = nameserver.or_else(|| self.context.config.nameserver.clone());
 
         let config = match seer_core::FollowConfig::new(iterations, interval_minutes) {
             Ok(cfg) => cfg.with_changes_only(changes_only),

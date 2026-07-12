@@ -3,9 +3,13 @@
 import asyncio
 import json
 import logging
+import os
 import re
 from typing import Any
 
+from limits import parse as _parse_rate_limit
+from limits.storage import storage_from_string as _rate_storage_from_string
+from limits.strategies import MovingWindowRateLimiter
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
@@ -547,9 +551,66 @@ async def list_tools() -> list[Tool]:
     ]
 
 
+# Per-tool rate limits for the expensive fan-out tools, mirroring the REST
+# routers' per-route ``@limiter.limit`` decorators (bulk_ssl / bulk_status /
+# bulk_propagation / confusables are 5/minute there; the remaining bulk
+# endpoints 10/minute). The flat /mcp gate in main.py applies SEER_RATE_LIMIT
+# to every call equally, so without this an MCP client could drive e.g.
+# seer_bulk_ssl 6x more often than REST permits for the identical operation.
+# Keyed per-process, not per-client: no request identity reaches tool handlers
+# through the MCP session, and these limits exist to protect upstream
+# registries and outbound IP reputation, which are per-process concerns. The
+# same table covers stdio, where the flat /mcp gate doesn't apply at all.
+_TOOL_RATE_LIMITS: dict[str, str] = {
+    "seer_bulk_ssl": "5/minute",
+    "seer_bulk_status": "5/minute",
+    "seer_bulk_propagation": "5/minute",
+    "seer_confusables": "5/minute",
+    "seer_bulk_lookup": "10/minute",
+    "seer_bulk_whois": "10/minute",
+    "seer_bulk_dig": "10/minute",
+    "seer_bulk_info": "10/minute",
+}
+
+# Built lazily on first limited call (not at import) so a configured storage
+# backend whose driver isn't installed only surfaces if a limited tool is
+# actually used — mirroring main.py's /mcp limiter.
+_tool_rate_limiter: MovingWindowRateLimiter | None = None
+
+
+def _tool_rate_ok(name: str) -> bool:
+    """Record a hit against ``name``'s per-tool limit; False if over.
+
+    Tools without an entry in ``_TOOL_RATE_LIMITS`` are always allowed here —
+    the flat /mcp limit (HTTP transport) is their only throttle.
+    """
+    global _tool_rate_limiter
+    limit = _TOOL_RATE_LIMITS.get(name)
+    if limit is None:
+        return True
+    if _tool_rate_limiter is None:
+        _tool_rate_limiter = MovingWindowRateLimiter(
+            _rate_storage_from_string(
+                os.environ.get("SEER_RATE_LIMIT_STORAGE", "memory://")
+            )
+        )
+    return _tool_rate_limiter.hit(_parse_rate_limit(limit), "mcp-tool", name)
+
+
 @mcp.call_tool()
 async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
     """Execute a Seer tool."""
+    if not _tool_rate_ok(name):
+        logger.warning("Tool %s throttled by per-tool rate limit", name)
+        return [
+            TextContent(
+                type="text",
+                text=(
+                    f"Rate limit exceeded for {name} "
+                    f"({_TOOL_RATE_LIMITS[name]}) — retry after a short backoff."
+                ),
+            )
+        ]
     try:
         result = await execute_tool(name, arguments)
         payload = UNTRUSTED_PREAMBLE + json.dumps(result, indent=2, default=str)
