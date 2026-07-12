@@ -468,7 +468,7 @@ impl Repl {
         println!();
     }
 
-    async fn execute_lookup(&self, args: &[&str]) -> CommandResult {
+    async fn execute_lookup(&mut self, args: &[&str]) -> CommandResult {
         if args.is_empty() {
             return CommandResult::Error("Usage: lookup <domain>".to_string());
         }
@@ -496,6 +496,8 @@ impl Repl {
 
                 let formatter = seer_core::output::get_formatter(self.context.output_format);
                 println!("{}", formatter.format_lookup(&result));
+                self.last_result =
+                    Some(crate::payload::Payload::Overview(Box::new(result.clone())));
                 CommandResult::Continue
             }
             Err(e) => {
@@ -505,7 +507,7 @@ impl Repl {
         }
     }
 
-    async fn execute_info(&self, args: &[&str]) -> CommandResult {
+    async fn execute_info(&mut self, args: &[&str]) -> CommandResult {
         if args.is_empty() {
             return CommandResult::Error("Usage: info <domain>".to_string());
         }
@@ -523,6 +525,7 @@ impl Repl {
                 let info = seer_core::DomainInfo::from_lookup_result(&result);
                 let formatter = seer_core::output::get_formatter(self.context.output_format);
                 println!("{}", formatter.format_domain_info(&info));
+                self.last_result = Some(crate::payload::Payload::Info(Box::new(info.clone())));
                 CommandResult::Continue
             }
             Err(e) => {
@@ -532,7 +535,7 @@ impl Repl {
         }
     }
 
-    async fn execute_whois(&self, args: &[&str]) -> CommandResult {
+    async fn execute_whois(&mut self, args: &[&str]) -> CommandResult {
         if args.is_empty() {
             return CommandResult::Error("Usage: whois <domain>".to_string());
         }
@@ -545,6 +548,7 @@ impl Repl {
                 spinner.finish();
                 let formatter = seer_core::output::get_formatter(self.context.output_format);
                 println!("{}", formatter.format_whois(&response));
+                self.last_result = Some(crate::payload::Payload::Whois(Box::new(response.clone())));
                 CommandResult::Continue
             }
             Err(e) => {
@@ -554,7 +558,7 @@ impl Repl {
         }
     }
 
-    async fn execute_rdap(&self, args: &[&str]) -> CommandResult {
+    async fn execute_rdap(&mut self, args: &[&str]) -> CommandResult {
         if args.is_empty() {
             return CommandResult::Error("Usage: rdap <domain|ip|asn>".to_string());
         }
@@ -573,6 +577,7 @@ impl Repl {
                 spinner.finish();
                 let formatter = seer_core::output::get_formatter(self.context.output_format);
                 println!("{}", formatter.format_rdap(&response));
+                self.last_result = Some(crate::payload::Payload::Rdap(Box::new(response.clone())));
                 CommandResult::Continue
             }
             Err(e) => {
@@ -582,7 +587,7 @@ impl Repl {
         }
     }
 
-    async fn execute_dig(&self, args: &[&str]) -> CommandResult {
+    async fn execute_dig(&mut self, args: &[&str]) -> CommandResult {
         if args.is_empty() {
             return CommandResult::Error("Usage: dig <domain> [type] [@server]".to_string());
         }
@@ -613,6 +618,7 @@ impl Repl {
                 spinner.finish();
                 let formatter = seer_core::output::get_formatter(self.context.output_format);
                 println!("{}", formatter.format_dns(&records));
+                self.last_result = Some(crate::payload::Payload::Dns(records.clone()));
                 CommandResult::Continue
             }
             Err(e) => {
@@ -622,7 +628,7 @@ impl Repl {
         }
     }
 
-    async fn execute_propagation(&self, args: &[&str]) -> CommandResult {
+    async fn execute_propagation(&mut self, args: &[&str]) -> CommandResult {
         if args.is_empty() {
             return CommandResult::Error("Usage: prop <domain> [type]".to_string());
         }
@@ -643,6 +649,7 @@ impl Repl {
                 spinner.finish();
                 let formatter = seer_core::output::get_formatter(self.context.output_format);
                 println!("{}", formatter.format_propagation(&result));
+                self.last_result = Some(crate::payload::Payload::Prop(Box::new(result.clone())));
                 CommandResult::Continue
             }
             Err(e) => {
@@ -652,7 +659,7 @@ impl Repl {
         }
     }
 
-    async fn execute_reverse(&self, args: &[&str]) -> CommandResult {
+    async fn execute_reverse(&mut self, args: &[&str]) -> CommandResult {
         if args.is_empty() {
             return CommandResult::Error("Usage: reverse <ip>".to_string());
         }
@@ -669,6 +676,7 @@ impl Repl {
                 spinner.finish();
                 let formatter = seer_core::output::get_formatter(self.context.output_format);
                 println!("{}", formatter.format_dns(&records));
+                self.last_result = Some(crate::payload::Payload::Reverse(records.clone()));
                 CommandResult::Continue
             }
             Err(e) => {
@@ -678,7 +686,7 @@ impl Repl {
         }
     }
 
-    async fn execute_avail(&self, args: &[&str]) -> CommandResult {
+    async fn execute_avail(&mut self, args: &[&str]) -> CommandResult {
         if args.is_empty() {
             return CommandResult::Error("Usage: avail <domain>".to_string());
         }
@@ -691,6 +699,7 @@ impl Repl {
                 spinner.finish();
                 let formatter = seer_core::output::get_formatter(self.context.output_format);
                 println!("{}", formatter.format_availability(&result));
+                self.last_result = Some(crate::payload::Payload::Avail(Box::new(result.clone())));
                 CommandResult::Continue
             }
             Err(e) => {
@@ -700,7 +709,7 @@ impl Repl {
         }
     }
 
-    async fn execute_dnssec(&self, args: &[&str]) -> CommandResult {
+    async fn execute_dnssec(&mut self, args: &[&str]) -> CommandResult {
         if args.is_empty() {
             return CommandResult::Error("Usage: dnssec <domain>".to_string());
         }
@@ -713,6 +722,7 @@ impl Repl {
                 spinner.finish();
                 let formatter = seer_core::output::get_formatter(self.context.output_format);
                 println!("{}", formatter.format_dnssec(&report));
+                self.last_result = Some(crate::payload::Payload::Dnssec(Box::new(report.clone())));
                 CommandResult::Continue
             }
             Err(e) => {
@@ -838,7 +848,7 @@ impl Repl {
         CommandResult::Continue
     }
 
-    async fn execute_status(&self, args: &[&str]) -> CommandResult {
+    async fn execute_status(&mut self, args: &[&str]) -> CommandResult {
         if args.is_empty() {
             return CommandResult::Error("Usage: status <domain>".to_string());
         }
@@ -851,6 +861,8 @@ impl Repl {
                 spinner.finish();
                 let formatter = seer_core::output::get_formatter(self.context.output_format);
                 println!("{}", formatter.format_status(&response));
+                self.last_result =
+                    Some(crate::payload::Payload::Status(Box::new(response.clone())));
                 CommandResult::Continue
             }
             Err(e) => {
@@ -977,7 +989,7 @@ impl Repl {
         }
     }
 
-    async fn execute_ssl(&self, args: &[&str]) -> CommandResult {
+    async fn execute_ssl(&mut self, args: &[&str]) -> CommandResult {
         if args.is_empty() {
             return CommandResult::Error("Usage: ssl <domain>".to_string());
         }
@@ -988,6 +1000,7 @@ impl Repl {
                 spinner.finish();
                 let formatter = seer_core::output::get_formatter(self.context.output_format);
                 println!("{}", formatter.format_ssl(&report));
+                self.last_result = Some(crate::payload::Payload::Ssl(Box::new(report.clone())));
                 CommandResult::Continue
             }
             Err(e) => {
@@ -997,17 +1010,18 @@ impl Repl {
         }
     }
 
-    async fn execute_tld(&self, args: &[&str]) -> CommandResult {
+    async fn execute_tld(&mut self, args: &[&str]) -> CommandResult {
         if args.is_empty() {
             return CommandResult::Error("Usage: tld <tld>".to_string());
         }
         let info = seer_core::lookup_tld(args[0]).await;
         let formatter = seer_core::output::get_formatter(self.context.output_format);
         println!("{}", formatter.format_tld(&info));
+        self.last_result = Some(crate::payload::Payload::Tld(Box::new(info.clone())));
         CommandResult::Continue
     }
 
-    async fn execute_compare(&self, args: &[&str]) -> CommandResult {
+    async fn execute_compare(&mut self, args: &[&str]) -> CommandResult {
         if args.len() < 3 {
             return CommandResult::Error(
                 "Usage: compare <domain> [type] <@server1> <@server2>".to_string(),
@@ -1045,6 +1059,9 @@ impl Repl {
                 spinner.finish();
                 let formatter = seer_core::output::get_formatter(self.context.output_format);
                 println!("{}", formatter.format_dns_comparison(&comparison));
+                self.last_result = Some(crate::payload::Payload::Compare(Box::new(
+                    comparison.clone(),
+                )));
                 CommandResult::Continue
             }
             Err(e) => {
@@ -1054,7 +1071,7 @@ impl Repl {
         }
     }
 
-    async fn execute_subdomains(&self, args: &[&str]) -> CommandResult {
+    async fn execute_subdomains(&mut self, args: &[&str]) -> CommandResult {
         if args.is_empty() {
             return CommandResult::Error(
                 "Usage: subdomains <domain> [--diff] [--record]".to_string(),
@@ -1098,6 +1115,9 @@ impl Repl {
                             outcome.result.count
                         );
                     }
+                    self.last_result = Some(crate::payload::Payload::Subdomains(Box::new(
+                        outcome.result.clone(),
+                    )));
                     return CommandResult::Continue;
                 }
                 Err(e) => {
@@ -1113,6 +1133,9 @@ impl Repl {
                 spinner.finish();
                 let formatter = seer_core::output::get_formatter(self.context.output_format);
                 println!("{}", formatter.format_subdomains(&result));
+                self.last_result = Some(crate::payload::Payload::Subdomains(Box::new(
+                    result.clone(),
+                )));
                 CommandResult::Continue
             }
             Err(e) => {
@@ -1122,7 +1145,7 @@ impl Repl {
         }
     }
 
-    async fn execute_diff(&self, args: &[&str]) -> CommandResult {
+    async fn execute_diff(&mut self, args: &[&str]) -> CommandResult {
         if args.len() < 2 {
             return CommandResult::Error("Usage: diff <domain1> <domain2>".to_string());
         }
@@ -1133,6 +1156,7 @@ impl Repl {
                 spinner.finish();
                 let formatter = seer_core::output::get_formatter(self.context.output_format);
                 println!("{}", formatter.format_diff(&diff));
+                self.last_result = Some(crate::payload::Payload::Diff(Box::new(diff.clone())));
                 CommandResult::Continue
             }
             Err(e) => {
@@ -1142,7 +1166,7 @@ impl Repl {
         }
     }
 
-    async fn execute_drift(&self, args: &[&str]) -> CommandResult {
+    async fn execute_drift(&mut self, args: &[&str]) -> CommandResult {
         if args.is_empty() {
             return CommandResult::Error("Usage: drift <domain> [--record]".to_string());
         }
@@ -1164,6 +1188,9 @@ impl Repl {
                 }
                 let formatter = seer_core::output::get_formatter(self.context.output_format);
                 println!("{}", formatter.format_drift(&outcome.report));
+                self.last_result = Some(crate::payload::Payload::Drift(Box::new(
+                    outcome.report.clone(),
+                )));
                 CommandResult::Continue
             }
             Err(e) => {
@@ -1173,7 +1200,7 @@ impl Repl {
         }
     }
 
-    async fn execute_caa(&self, args: &[&str]) -> CommandResult {
+    async fn execute_caa(&mut self, args: &[&str]) -> CommandResult {
         if args.is_empty() {
             return CommandResult::Error("Usage: caa <domain>".to_string());
         }
@@ -1186,13 +1213,14 @@ impl Repl {
                 spinner.finish();
                 let formatter = seer_core::output::get_formatter(self.context.output_format);
                 println!("{}", formatter.format_caa(&policy));
+                self.last_result = Some(crate::payload::Payload::Caa(Box::new(policy.clone())));
                 CommandResult::Continue
             }
             Err(e) => CommandResult::Error(e.to_string()),
         }
     }
 
-    async fn execute_posture(&self, args: &[&str]) -> CommandResult {
+    async fn execute_posture(&mut self, args: &[&str]) -> CommandResult {
         if args.is_empty() {
             return CommandResult::Error("Usage: posture <domain>".to_string());
         }
@@ -1203,6 +1231,8 @@ impl Repl {
                 spinner.finish();
                 let formatter = seer_core::output::get_formatter(self.context.output_format);
                 println!("{}", formatter.format_posture(&posture));
+                self.last_result =
+                    Some(crate::payload::Payload::Posture(Box::new(posture.clone())));
                 CommandResult::Continue
             }
             Err(e) => {
@@ -1212,7 +1242,7 @@ impl Repl {
         }
     }
 
-    async fn execute_confusables(&self, args: &[&str]) -> CommandResult {
+    async fn execute_confusables(&mut self, args: &[&str]) -> CommandResult {
         if args.is_empty() {
             return CommandResult::Error("Usage: confusables <domain>".to_string());
         }
@@ -1226,6 +1256,9 @@ impl Repl {
                 spinner.finish();
                 let formatter = seer_core::output::get_formatter(self.context.output_format);
                 println!("{}", formatter.format_confusables(&report));
+                self.last_result = Some(crate::payload::Payload::Confusables(Box::new(
+                    report.clone(),
+                )));
                 CommandResult::Continue
             }
             Err(e) => {
@@ -1309,6 +1342,7 @@ impl Repl {
                 spinner.finish();
                 let formatter = seer_core::output::get_formatter(self.context.output_format);
                 println!("{}", formatter.format_watch(&report));
+                self.last_result = Some(crate::payload::Payload::Watch(Box::new(report.clone())));
                 CommandResult::Continue
             }
             Some(other) => CommandResult::Error(format!(
@@ -1513,5 +1547,21 @@ mod copy_tests {
         let repl = repl_with_result();
         let err = repl.render_copy(&["bogus"]).unwrap_err();
         assert!(err.contains("Usage: copy"));
+    }
+
+    // `tld` looks offline (static WHOIS-server/registry-URL tables), but
+    // `seer_core::lookup_tld` also calls `RdapClient::get_rdap_base_url_for_tld`,
+    // which fetches/refreshes the IANA RDAP bootstrap data over the network
+    // when the process-global cache is cold — so this is a live-network test
+    // by the project's convention (see e.g. seer-core/src/rdap/client.rs).
+    #[tokio::test]
+    #[ignore = "live network; run with --ignored or SEER_LIVE_TESTS=1"]
+    async fn tld_command_populates_last_result() {
+        let mut repl = Repl::new().expect("repl construction is offline");
+        let _ = repl.execute_line("tld com").await;
+        assert!(
+            matches!(repl.last_result, Some(crate::payload::Payload::Tld(_))),
+            "tld should store a copyable payload"
+        );
     }
 }

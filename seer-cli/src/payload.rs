@@ -22,22 +22,15 @@ pub enum Payload {
     Watch(Box<seer_core::WatchReport>),
     History(Vec<seer_core::HistoryEntry>),
     Subdomains(Box<seer_core::SubdomainResult>),
-    // Constructed by the REPL `copy` work in a later task; allow until then.
-    #[allow(dead_code)]
     Info(Box<seer_core::DomainInfo>),
-    #[allow(dead_code)]
     Drift(Box<seer_core::DriftReport>),
-    #[allow(dead_code)]
     Posture(Box<seer_core::EmailPosture>),
-    #[allow(dead_code)]
     Caa(Box<seer_core::CaaPolicy>),
-    #[allow(dead_code)]
     Confusables(Box<seer_core::ConfusableReport>),
 }
 
 impl Payload {
     /// Short lowercase label for user-facing messages ("copied whois …").
-    #[allow(dead_code)]
     pub fn kind(&self) -> &'static str {
         match self {
             Payload::Overview(_) => "lookup",
