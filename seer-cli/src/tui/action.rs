@@ -166,25 +166,8 @@ pub enum Action {
     },
 }
 
-#[derive(Debug, Clone)]
-pub enum LensData {
-    Overview(Box<seer_core::LookupResult>),
-    Whois(Box<seer_core::WhoisResponse>),
-    Rdap(Box<seer_core::RdapResponse>),
-    Dns(Vec<seer_core::DnsRecord>),
-    Ssl(Box<seer_core::SslReport>),
-    Status(Box<seer_core::StatusResponse>),
-    Prop(Box<seer_core::PropagationResult>),
-    Reverse(Vec<seer_core::DnsRecord>),
-    Avail(Box<seer_core::AvailabilityResult>),
-    Tld(Box<seer_core::TldInfo>),
-    Dnssec(Box<seer_core::DnssecReport>),
-    Compare(Box<seer_core::DnsComparison>),
-    Diff(Box<seer_core::DomainDiff>),
-    Watch(Box<seer_core::WatchReport>),
-    History(Vec<seer_core::HistoryEntry>),
-    Subdomains(Box<seer_core::SubdomainResult>),
-}
+/// Per-lens payload — the shared `Payload` enum under its TUI-local name.
+pub use crate::payload::Payload as LensData;
 
 #[derive(Debug, Clone, Default)]
 pub enum LensState {

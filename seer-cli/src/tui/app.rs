@@ -939,7 +939,7 @@ impl App {
                 } else {
                     self.format
                 };
-                let text = crate::tui::raw::serialize(data, fmt);
+                let text = crate::payload::serialize(data, fmt);
                 vec![Action::Copy {
                     text,
                     label: format!("{label} as {fmt:?}").to_lowercase(),

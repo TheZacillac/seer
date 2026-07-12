@@ -14,7 +14,6 @@ mod filter;
 mod lenses;
 mod line_editor;
 mod panes;
-mod raw;
 mod render;
 mod theme;
 mod widgets;
