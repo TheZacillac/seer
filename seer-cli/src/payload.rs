@@ -4,12 +4,6 @@
 //! copied text matches `seer --format …` exactly.
 use seer_core::output::{get_formatter, OutputFormat};
 
-// Info/Drift/Posture/Caa/Confusables and `kind()` have no constructors/callers
-// yet in this crate — they are the interface for the REPL `copy` command
-// landing in the next step of this feature's plan, which will construct and
-// read them. Suppressing dead_code here (rather than deferring the variants)
-// keeps this module's public shape identical to what downstream code expects.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum Payload {
     Overview(Box<seer_core::LookupResult>),
@@ -28,10 +22,16 @@ pub enum Payload {
     Watch(Box<seer_core::WatchReport>),
     History(Vec<seer_core::HistoryEntry>),
     Subdomains(Box<seer_core::SubdomainResult>),
+    // Constructed by the REPL `copy` work in a later task; allow until then.
+    #[allow(dead_code)]
     Info(Box<seer_core::DomainInfo>),
+    #[allow(dead_code)]
     Drift(Box<seer_core::DriftReport>),
+    #[allow(dead_code)]
     Posture(Box<seer_core::EmailPosture>),
+    #[allow(dead_code)]
     Caa(Box<seer_core::CaaPolicy>),
+    #[allow(dead_code)]
     Confusables(Box<seer_core::ConfusableReport>),
 }
 
