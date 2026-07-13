@@ -51,7 +51,7 @@ anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
 
 # CLI
-rustyline = "17"
+rustyline = "18"
 shlex = "2"
 colored = "3"
 indicatif = "0.18"
