@@ -14,10 +14,10 @@ unused_qualifications = "warn"
 [workspace.package]
 version = "0.43.0"
 edition = "2021"
-# Real MSRV, enforced by the `msrv` CI job. The floor comes from the default
-# build path (x509-parser -> time -> time-macros requires 1.88). Bump this when
-# a dependency raises it; don't lower it below what CI verifies.
-rust-version = "1.88"
+# Real MSRV, enforced by the `msrv` CI job. The floor comes from rustyline 18
+# (uses `File::lock`, stabilized in 1.89). Bump this when a dependency raises
+# it; don't lower it below what CI verifies.
+rust-version = "1.89"
 authors = ["Zac Roach"]
 license = "MIT"
 repository = "https://github.com/TheZacillac/seer"
@@ -51,7 +51,7 @@ anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
 
 # CLI
-rustyline = "17"
+rustyline = "18"
 shlex = "2"
 colored = "3"
 indicatif = "0.18"
