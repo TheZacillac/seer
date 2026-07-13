@@ -50,6 +50,7 @@ impl Repl {
 | `prop <domain> [type]` | DNS propagation check |
 | `status <domain>` | Domain status check |
 | `set output <format>` | Change output format (human/json) |
+| `copy [markdown\|json\|yaml]` | Copy last result to clipboard (default: markdown) |
 | `help` | Show help message |
 | `exit` / `quit` | Exit REPL |
 
@@ -70,6 +71,8 @@ impl Repl {
 
 - Output format persists across commands
 - Can be changed with `set output`
+- The last shown result (`last_result`) is cached so `copy` can serialize and
+  clipboard-copy it via OSC52
 
 ### Error Handling
 

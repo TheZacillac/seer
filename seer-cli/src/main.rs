@@ -1,5 +1,7 @@
+mod clipboard;
 mod display;
 mod ops;
+mod payload;
 mod repl;
 mod tui;
 mod utils;

@@ -273,7 +273,7 @@ fn main_pane(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     // Raw view takes over for non-human formats.
     if app.format != seer_core::output::OutputFormat::Human {
         if let LensState::Loaded(data) = app.state_of(app.lens) {
-            let text = crate::tui::raw::serialize(data, app.format);
+            let text = crate::payload::serialize(data, app.format);
             let raw_title = format!("{} · raw", lens.label);
             let block = panel::block(theme, &raw_title, theme.green, false);
             let inner = block.inner(content);
