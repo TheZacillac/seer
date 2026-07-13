@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- MSRV raised from Rust 1.88 to 1.89: rustyline 18 (REPL line editor,
+  dependabot bump) uses `std::fs::File::lock`, stabilized in 1.89.
+
 ## [0.43.0] - 2026-07-12
 
 Adds a REPL `copy` command for grabbing results straight to the clipboard. ([#112])
