@@ -2919,7 +2919,7 @@ dependencies = [
 
 [[package]]
 name = "seer-cli"
-version = "0.43.0"
+version = "0.43.1"
 dependencies = [
  "anyhow",
  "base64",
@@ -2946,7 +2946,7 @@ dependencies = [
 
 [[package]]
 name = "seer-core"
-version = "0.43.0"
+version = "0.43.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2984,7 +2984,7 @@ dependencies = [
 
 [[package]]
 name = "seer-py"
-version = "0.43.0"
+version = "0.43.1"
 dependencies = [
  "log",
  "pyo3",

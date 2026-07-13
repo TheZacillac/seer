@@ -11,6 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.43.1] - 2026-07-12
+
+A maintenance release: raises the minimum supported Rust version and
+refreshes dependencies (rustyline 18, regex 1.13, rand 0.10.2,
+getrandom 0.4).
+
 ### Changed
 - MSRV raised from Rust 1.88 to 1.89: rustyline 18 (REPL line editor,
   dependabot bump) uses `std::fs::File::lock`, stabilized in 1.89.
@@ -567,7 +573,8 @@ Two notable breaking changes landed in this period (see `CLAUDE.md` for details)
   `inconsistencies` became typed (`ConsensusValue` / `Inconsistency`) instead of
   pre-formatted strings.
 
-[Unreleased]: https://github.com/TheZacillac/seer/compare/v0.43.0...HEAD
+[Unreleased]: https://github.com/TheZacillac/seer/compare/v0.43.1...HEAD
+[0.43.1]: https://github.com/TheZacillac/seer/compare/v0.43.0...v0.43.1
 [0.43.0]: https://github.com/TheZacillac/seer/compare/v0.42.0...v0.43.0
 [0.42.0]: https://github.com/TheZacillac/seer/compare/v0.41.0...v0.42.0
 [0.41.0]: https://github.com/TheZacillac/seer/compare/v0.40.1...v0.41.0
