@@ -110,9 +110,10 @@ impl AvailabilityChecker {
             Err(rdap_err) => {
                 debug!(error = %rdap_err, "RDAP lookup failed, falling back to WHOIS + DNS");
                 // Probe WHOIS and the apex DNS presence concurrently. DNS is
-                // only the tie-breaker when WHOIS is thin/blocked and the RDAP
-                // failure was not an authoritative 404, so running it alongside
-                // WHOIS (rather than on demand) adds no extra wall-clock time.
+                // only the tie-breaker when WHOIS is thin/blocked/errored and
+                // the RDAP failure was not an authoritative 404, so running it
+                // alongside WHOIS (rather than on demand) adds no extra
+                // wall-clock time.
                 let (whois_result, dns_presence) = tokio::join!(
                     self.whois_client.lookup(&domain),
                     self.dns_resolver.presence(&domain),
@@ -224,9 +225,11 @@ fn decide_from_rdap(domain: &str, response: crate::rdap::RdapResponse) -> Availa
 /// Pure decision function: build an `AvailabilityResult` when RDAP failed
 /// and WHOIS (plus a DNS presence probe) is the fallback. Extracted from
 /// `check()` for table-testing. `dns_presence` is only consulted when the
-/// registry signals are inconclusive — a thin/blocked WHOIS body and a
-/// non-404 RDAP failure; an apex with no DNS presence (NXDOMAIN) then reads
-/// as likely-available at medium confidence.
+/// registry signals are inconclusive — a thin/blocked WHOIS body or a
+/// transport-failed WHOIS leg, with a non-404 RDAP failure. An apex with no
+/// DNS presence (NXDOMAIN) then reads as likely-available at medium
+/// confidence; a delegated apex behind two transport failures reads as
+/// likely-registered at medium confidence.
 fn decide_fallback(
     domain: &str,
     rdap_err: &crate::error::SeerError,
@@ -361,12 +364,32 @@ fn decide_fallback(
                             .to_string(),
                     ),
                 }
+            } else if dns_presence == DnsPresence::Present {
+                // Both registry legs failed with transport errors, but the
+                // apex IS delegated in DNS. Delegation in the TLD zone is
+                // strong evidence of registration (mirrors the
+                // `classify_thin_fallback` Present → Registered route), so
+                // report likely_registered instead of a blank "unknown".
+                // This is the safe direction: it can never call a taken
+                // domain free. Note this arm is a transport failure, not a
+                // registry refusal — refusals arrive as an Ok body and are
+                // kept inconclusive above (issue #45).
+                AvailabilityResult {
+                    domain: domain.to_string(),
+                    available: false,
+                    confidence: "medium".to_string(),
+                    method: "dns_present".to_string(),
+                    details: Some(
+                        "Registry lookups failed, but the apex is delegated in DNS \
+                         (NS records present) — the domain is almost certainly registered"
+                            .to_string(),
+                    ),
+                }
             } else {
-                // Both queries failed with non-"not found" errors and the
-                // domain still resolves (or DNS was unknown). We genuinely
-                // don't know — could be registered, blocked, or servers down.
-                // Default to available=false so we never tell the user a taken
-                // domain is free.
+                // Both queries failed with non-"not found" errors and DNS was
+                // unknown. We genuinely don't know — could be registered,
+                // blocked, or servers down. Default to available=false so we
+                // never tell the user a taken domain is free.
                 AvailabilityResult {
                     domain: domain.to_string(),
                     available: false,
@@ -839,6 +862,36 @@ mod tests {
         assert!(r.available);
         assert_eq!(r.confidence, "medium");
         assert_eq!(r.method, "dns_nxdomain");
+    }
+
+    #[test]
+    fn both_legs_failed_dns_present_marks_likely_registered() {
+        // The .ru-behind-a-firewall case: the TLD has no RDAP server at all
+        // (bootstrap miss) and WHOIS is unreachable (transport timeout), but
+        // the apex IS delegated in DNS. Delegation in the TLD zone is strong
+        // evidence of registration — report likely_registered rather than a
+        // blank "unknown".
+        let rdap_err = SeerError::RdapBootstrapError("no RDAP server for example.ru".to_string());
+        let whois_err = SeerError::Timeout(
+            "Operation failed after 3 attempts: Operation timed out".to_string(),
+        );
+        let r = decide_fallback(
+            "example.ru",
+            &rdap_err,
+            Err(whois_err),
+            DnsPresence::Present,
+        );
+        assert!(
+            !r.available,
+            "a delegated apex must never read as available"
+        );
+        assert_eq!(r.confidence, "medium");
+        assert_eq!(r.method, "dns_present");
+        assert_eq!(r.verdict(), "likely_registered");
+        assert!(
+            r.details.as_deref().unwrap().contains("delegated"),
+            "details should explain the DNS-delegation evidence"
+        );
     }
 
     // --- #45: refusal/throttle bodies route to inconclusive --------------
