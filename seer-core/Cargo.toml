@@ -55,6 +55,7 @@ otel = [
 workspace = true
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 tokio-test = "0.4"
 wiremock = { workspace = true }
 insta = { workspace = true }

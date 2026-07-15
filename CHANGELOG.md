@@ -11,6 +11,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Smart lookup no longer cuts the WHOIS query off 5 seconds after an RDAP
+  *failure* (and vice versa). The grace-period truncation now applies only
+  when the first protocol to finish actually returned usable data; a winner
+  that failed — e.g. the instant "no RDAP server" bootstrap miss on RDAP-less
+  TLDs such as `.ru` — lets the other protocol run to its own full timeout.
+  Slow-but-working WHOIS servers on those TLDs now return their full record
+  instead of degrading to an availability heuristic, and failed lookups no
+  longer pay for the same WHOIS query twice.
+- When both RDAP and WHOIS fail with transport errors but the domain's apex
+  is delegated in DNS (NS records present), availability now reports
+  `likely_registered` (method `dns_present`, medium confidence) instead of a
+  blank `unknown` — delegation in the TLD zone is strong evidence of
+  registration, and this direction can never mislabel a taken domain as free.
+
+### Fixed
+- Grace-period error messages no longer say the other protocol "won" when it
+  merely finished first: truncation only happens behind a data-bearing
+  answer, and the message now reads "… after RDAP answered" / "… after WHOIS
+  answered".
+
 ## [0.43.1] - 2026-07-12
 
 A maintenance release: raises the minimum supported Rust version and

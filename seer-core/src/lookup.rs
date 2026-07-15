@@ -23,9 +23,13 @@ use crate::whois::{get_registry_url, get_tld, WhoisClient, WhoisResponse};
 /// Cache TTL for lookup results (5 minutes).
 const LOOKUP_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 
-/// Grace period for the second protocol after the first one finishes.
-/// If WHOIS finishes and RDAP hasn't responded within this window, we
-/// use the WHOIS result rather than waiting the full RDAP timeout.
+/// Grace period for the second protocol after the first one finishes *with
+/// usable data*. If RDAP answers and WHOIS hasn't responded within this
+/// window (or vice versa), we use the answer in hand rather than waiting the
+/// loser's full timeout. A winner that failed — or returned an unusable
+/// body — grants no such truncation: the other leg is then the only possible
+/// source of registry data and runs to its own bounded completion (see
+/// [`race_with_grace`]).
 const PROTOCOL_GRACE_PERIOD: Duration = Duration::from_secs(5);
 
 /// Maximum length for public-facing error strings.
@@ -94,6 +98,22 @@ static LOOKUP_CONCURRENT_CALLS: Lazy<std::sync::atomic::AtomicUsize> =
 /// registries return placeholder nameservers for unregistered domains.
 fn whois_response_is_thin(w: &WhoisResponse) -> bool {
     w.registrar.is_none() && w.creation_date.is_none() && w.expiration_date.is_none()
+}
+
+/// Returns true if an RDAP response carries enough data to serve as the
+/// primary lookup result: the domain name plus at least one other piece of
+/// information (dates, entities, nameservers, or status).
+fn rdap_response_is_useful(response: &RdapResponse) -> bool {
+    let has_name = response.ldh_name.is_some() || response.unicode_name.is_some();
+    let has_dates = response
+        .events
+        .iter()
+        .any(|e| e.event_action == "registration" || e.event_action == "expiration");
+    let has_entities = !response.entities.is_empty();
+    let has_nameservers = !response.nameservers.is_empty();
+    let has_status = !response.status.is_empty();
+
+    has_name && (has_dates || has_entities || has_nameservers || has_status)
 }
 
 /// Decides whether a WHOIS response + RDAP error combination should route
@@ -251,6 +271,83 @@ impl Drop for InflightGuard {
     }
 }
 
+/// Outcome of one leg of the concurrent RDAP/WHOIS race.
+///
+/// Tracks whether the leg completed naturally or was truncated by the grace
+/// period, so downstream error messages can distinguish a true timeout from a
+/// loser-truncation.
+enum LegOutcome<T> {
+    /// The leg ran to its own completion (success or error).
+    Completed(T),
+    /// The leg was abandoned because the other protocol answered first with
+    /// usable data and this leg did not finish within
+    /// [`PROTOCOL_GRACE_PERIOD`] of that answer.
+    GraceTruncated,
+}
+
+/// Races the RDAP and WHOIS legs of a smart lookup.
+///
+/// Whichever leg finishes first is inspected with its `*_has_data` predicate:
+///
+/// * Winner brought usable data → the still-running leg is merely
+///   supplementary, so it gets [`PROTOCOL_GRACE_PERIOD`] to finish before
+///   being truncated.
+/// * Winner came back empty-handed (an error, or a response the caller's
+///   predicate rejects) → the other leg is now the only possible source of
+///   registry data, so it runs to its own (already timeout-bounded)
+///   completion. This matters for RDAP-less TLDs such as .ru: the bootstrap
+///   miss fails in microseconds and must not shave the WHOIS budget down to
+///   the grace period. It also avoids pure waste — a truncated leg was
+///   re-queried in full by the availability fallback anyway.
+async fn race_with_grace<R, W>(
+    rdap_fut: impl std::future::Future<Output = R>,
+    whois_fut: impl std::future::Future<Output = W>,
+    rdap_has_data: impl Fn(&R) -> bool,
+    whois_has_data: impl Fn(&W) -> bool,
+) -> (LegOutcome<R>, LegOutcome<W>) {
+    tokio::pin!(rdap_fut);
+    tokio::pin!(whois_fut);
+
+    tokio::select! {
+        rdap_res = &mut rdap_fut => {
+            let whois_leg = if rdap_has_data(&rdap_res) {
+                match tokio_timeout(PROTOCOL_GRACE_PERIOD, whois_fut).await {
+                    Ok(res) => LegOutcome::Completed(res),
+                    Err(_) => LegOutcome::GraceTruncated,
+                }
+            } else {
+                LegOutcome::Completed(whois_fut.await)
+            };
+            (LegOutcome::Completed(rdap_res), whois_leg)
+        }
+        whois_res = &mut whois_fut => {
+            let rdap_leg = if whois_has_data(&whois_res) {
+                match tokio_timeout(PROTOCOL_GRACE_PERIOD, rdap_fut).await {
+                    Ok(res) => LegOutcome::Completed(res),
+                    Err(_) => LegOutcome::GraceTruncated,
+                }
+            } else {
+                LegOutcome::Completed(rdap_fut.await)
+            };
+            (rdap_leg, LegOutcome::Completed(whois_res))
+        }
+    }
+}
+
+/// Public-facing error string for a grace-truncated leg. Truncation only
+/// happens when the other protocol answered first with usable data (see
+/// [`race_with_grace`]), so the wording says the winner "answered" — the old
+/// "after RDAP won" phrasing misled when the winner had merely finished first
+/// with an error.
+fn grace_truncated_error(truncated: &str, winner: &str) -> String {
+    format!(
+        "{} did not respond within the {}s grace period after {} answered",
+        truncated,
+        PROTOCOL_GRACE_PERIOD.as_secs(),
+        winner
+    )
+}
+
 /// Internal classification of the RDAP leg of a concurrent lookup.
 ///
 /// Distinguishing `NoData` (HTTP 200 but response was missing useful fields)
@@ -260,8 +357,8 @@ enum RdapOutcome {
     Useful(RdapResponse),
     NoData(RdapResponse),
     Error(SeerError),
-    /// RDAP future did not complete within the grace period after the other
-    /// protocol finished.
+    /// RDAP future did not complete within the grace period after WHOIS
+    /// answered with a response.
     GraceTimeout,
 }
 
@@ -628,48 +725,29 @@ impl SmartLookup {
         let rdap_fut = self.rdap_client.lookup_domain(domain);
         let whois_fut = self.whois_client.lookup(domain);
 
-        tokio::pin!(rdap_fut);
-        tokio::pin!(whois_fut);
+        // Race: a winner with usable data grants the loser only a grace
+        // period; a winner that failed (or returned an unusable body) leaves
+        // the loser as the sole possible data source, so it runs to its own
+        // bounded completion. See `race_with_grace`.
+        let (rdap_leg, whois_leg) = race_with_grace(
+            rdap_fut,
+            whois_fut,
+            |r| matches!(r, Ok(data) if rdap_response_is_useful(data)),
+            |w| w.is_ok(),
+        )
+        .await;
 
-        // Race: whichever finishes first gets a grace period for the other.
-        //
-        // We track whether each side completed naturally or was truncated by
-        // the grace period, so downstream error messages can distinguish a
-        // true timeout from a loser-truncation.
-        enum LegOutcome<T> {
-            Completed(T),
-            GraceTruncated,
+        if matches!(whois_leg, LegOutcome::GraceTruncated) {
+            debug!("WHOIS did not finish within grace period after RDAP answered, proceeding with RDAP only");
         }
-
-        let (rdap_leg, whois_leg) = tokio::select! {
-            rdap_res = &mut rdap_fut => {
-                // RDAP finished first — give WHOIS a grace period
-                let whois_leg = match tokio_timeout(PROTOCOL_GRACE_PERIOD, whois_fut).await {
-                    Ok(res) => LegOutcome::Completed(res),
-                    Err(_) => {
-                        debug!("WHOIS did not finish within grace period, proceeding with RDAP only");
-                        LegOutcome::GraceTruncated
-                    }
-                };
-                (LegOutcome::Completed(rdap_res), whois_leg)
-            }
-            whois_res = &mut whois_fut => {
-                // WHOIS finished first — give RDAP a grace period
-                let rdap_leg = match tokio_timeout(PROTOCOL_GRACE_PERIOD, rdap_fut).await {
-                    Ok(res) => LegOutcome::Completed(res),
-                    Err(_) => {
-                        debug!("RDAP did not finish within grace period, proceeding with WHOIS only");
-                        LegOutcome::GraceTruncated
-                    }
-                };
-                (rdap_leg, LegOutcome::Completed(whois_res))
-            }
-        };
+        if matches!(rdap_leg, LegOutcome::GraceTruncated) {
+            debug!("RDAP did not finish within grace period after WHOIS answered, proceeding with WHOIS only");
+        }
 
         // Classify the RDAP leg.
         let rdap_outcome = match rdap_leg {
             LegOutcome::Completed(Ok(data)) => {
-                if self.is_rdap_response_useful(&data) {
+                if rdap_response_is_useful(&data) {
                     RdapOutcome::Useful(data)
                 } else {
                     RdapOutcome::NoData(data)
@@ -716,14 +794,7 @@ impl SmartLookup {
                 None,
             ),
             RdapOutcome::Error(e) => (e.to_string(), None, Some(e)),
-            RdapOutcome::GraceTimeout => (
-                format!(
-                    "RDAP did not return within {}s grace period after WHOIS won",
-                    PROTOCOL_GRACE_PERIOD.as_secs()
-                ),
-                None,
-                None,
-            ),
+            RdapOutcome::GraceTimeout => (grace_truncated_error("RDAP", "WHOIS"), None, None),
         };
 
         if let LegOutcome::Completed(Ok(whois_data)) = whois_leg {
@@ -890,10 +961,10 @@ impl SmartLookup {
                 debug!("Unexpected completed-Ok WHOIS in availability fallback branch");
                 "WHOIS returned but was not used".to_string()
             }
-            LegOutcome::GraceTruncated => format!(
-                "WHOIS did not return within {}s grace period after RDAP won",
-                PROTOCOL_GRACE_PERIOD.as_secs()
-            ),
+            // Unreachable under `race_with_grace` semantics: WHOIS is only
+            // truncated behind a useful RDAP answer, and that path returned
+            // early above. Kept as a defensive arm.
+            LegOutcome::GraceTruncated => grace_truncated_error("WHOIS", "RDAP"),
         };
 
         // Reuse what the race already learned rather than re-querying the same
@@ -974,21 +1045,6 @@ impl SmartLookup {
                 })
             }
         }
-    }
-
-    fn is_rdap_response_useful(&self, response: &RdapResponse) -> bool {
-        // Check if we have at least some meaningful data
-        let has_name = response.ldh_name.is_some() || response.unicode_name.is_some();
-        let has_dates = response
-            .events
-            .iter()
-            .any(|e| e.event_action == "registration" || e.event_action == "expiration");
-        let has_entities = !response.entities.is_empty();
-        let has_nameservers = !response.nameservers.is_empty();
-        let has_status = !response.status.is_empty();
-
-        // Consider useful if we have the name plus at least one other piece of info
-        has_name && (has_dates || has_entities || has_nameservers || has_status)
     }
 
     /// DNS presence passthrough over this lookup's private resolver, exposing
@@ -1265,9 +1321,8 @@ mod tests {
             ldh_name: Some("example.com".to_string()),
             ..Default::default()
         };
-        let lookup = SmartLookup::new();
         assert!(
-            !lookup.is_rdap_response_useful(&resp),
+            !rdap_response_is_useful(&resp),
             "Response with only a name should be classified as NoData"
         );
 
@@ -1277,7 +1332,7 @@ mod tests {
             status: vec!["active".to_string()],
             ..Default::default()
         };
-        assert!(lookup.is_rdap_response_useful(&useful));
+        assert!(rdap_response_is_useful(&useful));
     }
 
     // ---------------- Coalescing ----------------
@@ -1712,6 +1767,120 @@ mod tests {
             classify_thin_fallback(true, true, true, DnsPresence::Present),
             ThinFallback::UseWhois
         );
+    }
+
+    // ---------------- race_with_grace ----------------
+    //
+    // Paused-clock tests of the RDAP/WHOIS race semantics: the losing leg is
+    // grace-truncated ONLY when the winner brought usable data. A winner that
+    // failed (or returned an unusable body) leaves the other leg as the sole
+    // possible source of registry data, so it must run to its own completion.
+    // This is the .ru case: the RDAP bootstrap miss fails in microseconds and
+    // must not shave the WHOIS budget down to the grace period.
+
+    /// A leg that resolves to `value` after `secs` of (paused, auto-advanced)
+    /// tokio time.
+    async fn leg<T>(secs: u64, value: T) -> T {
+        tokio::time::sleep(Duration::from_secs(secs)).await;
+        value
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn race_awaits_whois_fully_when_rdap_errors_first() {
+        let rdap = leg(0, Err::<&str, &str>("no RDAP server for example.ru"));
+        // Well beyond the grace period, within the WHOIS client's own budget.
+        let whois = leg(20, Ok::<&str, &str>("whois data"));
+        let (r, w) = race_with_grace(rdap, whois, |r| r.is_ok(), |w| w.is_ok()).await;
+        assert!(matches!(r, LegOutcome::Completed(Err(_))));
+        assert!(
+            matches!(w, LegOutcome::Completed(Ok("whois data"))),
+            "WHOIS must not be grace-truncated behind an RDAP failure"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn race_awaits_rdap_fully_when_whois_errors_first() {
+        let rdap = leg(20, Ok::<&str, &str>("rdap data"));
+        let whois = leg(0, Err::<&str, &str>("connection refused"));
+        let (r, w) = race_with_grace(rdap, whois, |r| r.is_ok(), |w| w.is_ok()).await;
+        assert!(
+            matches!(r, LegOutcome::Completed(Ok("rdap data"))),
+            "RDAP must not be grace-truncated behind a WHOIS failure"
+        );
+        assert!(matches!(w, LegOutcome::Completed(Err(_))));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn race_truncates_whois_when_rdap_answers_with_data() {
+        let rdap = leg(0, Ok::<&str, &str>("useful rdap"));
+        let whois = leg(20, Ok::<&str, &str>("whois data"));
+        let (r, w) = race_with_grace(rdap, whois, |r| r.is_ok(), |w| w.is_ok()).await;
+        assert!(matches!(r, LegOutcome::Completed(Ok(_))));
+        assert!(
+            matches!(w, LegOutcome::GraceTruncated),
+            "a data-bearing RDAP winner only owes WHOIS the grace period"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn race_truncates_rdap_when_whois_answers_with_data() {
+        let rdap = leg(20, Ok::<&str, &str>("rdap data"));
+        let whois = leg(0, Ok::<&str, &str>("whois data"));
+        let (r, w) = race_with_grace(rdap, whois, |r| r.is_ok(), |w| w.is_ok()).await;
+        assert!(matches!(r, LegOutcome::GraceTruncated));
+        assert!(matches!(w, LegOutcome::Completed(Ok(_))));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn race_loser_inside_grace_period_still_completes() {
+        let rdap = leg(0, Ok::<&str, &str>("useful rdap"));
+        // Within the 5s grace period.
+        let whois = leg(2, Ok::<&str, &str>("whois data"));
+        let (r, w) = race_with_grace(rdap, whois, |r| r.is_ok(), |w| w.is_ok()).await;
+        assert!(matches!(r, LegOutcome::Completed(Ok(_))));
+        assert!(matches!(w, LegOutcome::Completed(Ok("whois data"))));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn race_awaits_whois_fully_when_rdap_wins_with_unusable_data() {
+        // An Ok the predicate rejects (e.g. a thin RDAP 200 with no useful
+        // fields) is not "data in hand" — WHOIS still runs to completion.
+        let rdap = leg(0, Ok::<&str, &str>("thin"));
+        let whois = leg(20, Ok::<&str, &str>("whois data"));
+        let (r, w) = race_with_grace(
+            rdap,
+            whois,
+            |r| matches!(r, Ok(s) if *s == "useful"),
+            |w| w.is_ok(),
+        )
+        .await;
+        assert!(matches!(r, LegOutcome::Completed(Ok("thin"))));
+        assert!(matches!(w, LegOutcome::Completed(Ok("whois data"))));
+    }
+
+    // ---------------- grace_truncated_error ----------------
+
+    #[test]
+    fn grace_truncated_error_says_answered_not_won() {
+        // Truncation only happens behind a data-bearing winner, so the message
+        // must say the winner *answered* — the old "after RDAP won" wording
+        // misled when the winner had merely finished first with an error.
+        let msg = grace_truncated_error("WHOIS", "RDAP");
+        assert_eq!(
+            msg,
+            format!(
+                "WHOIS did not respond within the {}s grace period after RDAP answered",
+                PROTOCOL_GRACE_PERIOD.as_secs()
+            )
+        );
+        assert!(!msg.contains("won"));
+    }
+
+    #[test]
+    fn grace_truncated_error_is_symmetric() {
+        let msg = grace_truncated_error("RDAP", "WHOIS");
+        assert!(msg.starts_with("RDAP did not respond"));
+        assert!(msg.ends_with("after WHOIS answered"));
     }
 
     // ---------------- Mutex poisoning recovery ----------------
