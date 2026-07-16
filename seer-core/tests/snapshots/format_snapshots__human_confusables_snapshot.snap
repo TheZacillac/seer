@@ -1,0 +1,12 @@
+---
+source: seer-core/tests/format_snapshots.rs
+assertion_line: 387
+expression: human().format_confusables(&fixture_confusables())
+---
+
+[1;95mLook-alikes: example.com[0m
+[37m────────────────────────[0m
+[97m42[0m candidates generated, [97m2[0m registered
+
+[1;93mexamp1e.com[0m  [[90mhomoglyph[0m]  registered [97m2025-11-02[0m  via [90mMock Registrar Inc.[0m
+[1;93mexampel.com[0m  [[90mtransposition[0m]  registered [97munknown[0m  via [90m-[0m

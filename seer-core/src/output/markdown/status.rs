@@ -169,6 +169,19 @@ impl MarkdownFormatter {
             ));
         }
 
+        if !report.warnings.is_empty() {
+            output.push(String::new());
+            output.push("### Warnings".to_string());
+            output.push(String::new());
+            for w in &report.warnings {
+                let tag = match w.severity {
+                    crate::ssl::CertWarningSeverity::Critical => "**Critical**",
+                    crate::ssl::CertWarningSeverity::Warning => "Warning",
+                };
+                output.push(format!("- ⚠ {}: {}", tag, MdSafe(&w.message)));
+            }
+        }
+
         if !report.chain.is_empty() {
             output.push(String::new());
             output.push("### Certificate Chain".to_string());

@@ -101,18 +101,38 @@ impl SeerConfig {
         }
 
         match std::fs::read_to_string(&path) {
-            Ok(content) => match toml::from_str::<SeerConfig>(&content) {
-                Ok(config) => {
-                    debug!(?path, "Loaded config");
-                    config.clamped()
-                }
-                Err(e) => {
-                    tracing::warn!(?path, error = %e, "Failed to parse config, using defaults");
-                    Self::default()
-                }
-            },
+            Ok(content) => Self::parse_or_default(&content, &path),
             Err(e) => {
                 debug!(?path, error = %e, "Could not read config, using defaults");
+                Self::default()
+            }
+        }
+    }
+
+    /// Parses config file content, falling back to defaults on malformed
+    /// TOML. The failure is reported on stderr in addition to `tracing` —
+    /// at the default log level a `warn!` is invisible, and `seer config`
+    /// would then display defaults as though they came from the file.
+    fn parse_or_default(content: &str, path: &std::path::Path) -> Self {
+        match toml::from_str::<SeerConfig>(content) {
+            Ok(config) => {
+                debug!(?path, "Loaded config");
+                config.clamped()
+            }
+            Err(e) => {
+                tracing::warn!(?path, error = %e, "Failed to parse config, using defaults");
+                // Config loads several times per process (startup + per-command
+                // and per-client construction); warn on stderr only once — the
+                // CLI always loads first at startup, so the warning also lands
+                // before the TUI enters its alternate screen.
+                static WARN_ONCE: std::sync::Once = std::sync::Once::new();
+                WARN_ONCE.call_once(|| {
+                    eprintln!(
+                        "Warning: ignoring malformed config file {} (using defaults):\n{}",
+                        path.display(),
+                        e
+                    );
+                });
                 Self::default()
             }
         }
@@ -228,6 +248,35 @@ concurrency = 20
         assert_eq!(config.rdap_timeout(), Duration::from_secs(15));
         assert_eq!(config.dns_timeout(), Duration::from_secs(5));
         assert_eq!(config.http_timeout(), Duration::from_secs(10));
+    }
+
+    #[test]
+    fn malformed_toml_falls_back_to_defaults() {
+        let path = std::path::Path::new("~/.seer/config.toml");
+        // Both a syntax error and a type error must yield defaults, not a panic.
+        for content in ["output_format = [not toml", "output_format = 42"] {
+            let config = SeerConfig::parse_or_default(content, path);
+            assert_eq!(config.output_format, "human");
+            assert_eq!(config.bulk.concurrency, 10);
+        }
+    }
+
+    #[test]
+    fn unknown_keys_are_tolerated() {
+        // Forward-compat: a config written by a newer seer (or with a typo'd
+        // extra key) must not hard-fail — no deny_unknown_fields.
+        let path = std::path::Path::new("~/.seer/config.toml");
+        let config =
+            SeerConfig::parse_or_default("output_format = \"json\"\nfuture_option = true\n", path);
+        assert_eq!(config.output_format, "json");
+    }
+
+    #[test]
+    fn valid_content_is_clamped_through_parse_seam() {
+        // parse_or_default must apply the same clamping load() always did.
+        let path = std::path::Path::new("~/.seer/config.toml");
+        let config = SeerConfig::parse_or_default("[bulk]\nconcurrency = 10000\n", path);
+        assert_eq!(config.bulk.concurrency, 50);
     }
 
     #[test]

@@ -116,6 +116,19 @@ fn rdap_response_is_useful(response: &RdapResponse) -> bool {
     has_name && (has_dates || has_entities || has_nameservers || has_status)
 }
 
+/// Race predicate for the WHOIS leg of [`race_with_grace`]: only a response
+/// carrying real registration data counts as "data in hand" for
+/// grace-truncation purposes. A thin body — e.g. an Identity-Digital-style
+/// "no WHOIS service" sentinel, or a "no match" banner — must not cut a
+/// viable in-flight RDAP query down to the grace period: RDAP is then the
+/// only possible source of registry data, and for "no match" bodies a late
+/// RDAP 200 must remain able to veto the availability claim (v0.26.6 rule).
+/// Mirrors the RDAP-side [`rdap_response_is_useful`] gate; thinness is
+/// [`whois_response_is_thin`], the same signal the fallback ladders use.
+fn whois_leg_has_data(w: &Result<WhoisResponse>) -> bool {
+    matches!(w, Ok(data) if !whois_response_is_thin(data))
+}
+
 /// Decides whether a WHOIS response + RDAP error combination should route
 /// to the availability path. Returns `(confidence, method)` when routing is
 /// warranted, `None` to keep the existing `LookupResult::Whois` behavior.
@@ -728,12 +741,15 @@ impl SmartLookup {
         // Race: a winner with usable data grants the loser only a grace
         // period; a winner that failed (or returned an unusable body) leaves
         // the loser as the sole possible data source, so it runs to its own
-        // bounded completion. See `race_with_grace`.
+        // bounded completion. Both predicates gate on usefulness — RDAP via
+        // `rdap_response_is_useful`, WHOIS via `whois_leg_has_data`
+        // (non-thin) — so neither side's empty answer can truncate the
+        // other. See `race_with_grace`.
         let (rdap_leg, whois_leg) = race_with_grace(
             rdap_fut,
             whois_fut,
             |r| matches!(r, Ok(data) if rdap_response_is_useful(data)),
-            |w| w.is_ok(),
+            whois_leg_has_data,
         )
         .await;
 
@@ -1060,13 +1076,15 @@ impl SmartLookup {
 mod tests {
     use super::*;
 
-    /// Global serialization mutex for the three tests that share
-    /// `LOOKUP_INFLIGHT` state (coalescing, poison recovery, drop recovery).
+    /// Global serialization mutex for the tests that share `LOOKUP_INFLIGHT`
+    /// or `LOOKUP_CACHE` state (map coalescing, waiter coalescing, cache
+    /// clear, poison recovery, drop recovery).
     /// Running them in parallel creates two races:
     ///   1. Guard drop uses `try_lock`; if another test holds the mutex, the
     ///      Drop path skips cleanup → stale entries fail later assertions.
     ///   2. Poisoning one test leaves the mutex poisoned for the next test,
     ///      which is handled by `unwrap_or_else` but still disturbs state.
+    ///
     /// Per-test unique keys (see `unique_test_key`) prevent entry-level
     /// collisions; this mutex prevents lock-contention races on Drop.
     static INFLIGHT_TEST_SERIAL: Mutex<()> = Mutex::new(());
@@ -1187,6 +1205,12 @@ mod tests {
 
     #[test]
     fn test_lookup_cache_clear() {
+        // Serialized: the waiter-coalescing test inserts into LOOKUP_CACHE,
+        // and an unsynchronized clear here would race both its insert (this
+        // assert) and its waiters' cache read (that test's counter assert).
+        let _serial = INFLIGHT_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         SmartLookup::clear_cache();
         assert!(LOOKUP_CACHE.is_empty());
     }
@@ -1408,6 +1432,91 @@ mod tests {
         drop(waiter);
         let m = LOOKUP_INFLIGHT.lock().unwrap_or_else(|p| p.into_inner());
         assert!(m.get(&domain).and_then(|w| w.upgrade()).is_none());
+    }
+
+    // Executes the real waiter branch of `lookup_with_progress` (not just the
+    // map primitive above): two concurrent `lookup_with_progress` calls find
+    // an in-flight entry for their domain, subscribe to its Notify, and — once
+    // the owner populates the cache, removes the entry, and notifies (the
+    // exact `InflightGuard::drop` sequence) — both return the cached result
+    // WITHOUT running their own network race. `LOOKUP_CONCURRENT_CALLS` is the
+    // coalescing proof: it is incremented at the top of `lookup_concurrent`
+    // before any I/O, so if a waiter ever falls through to ownership the
+    // counter moves and this test fails deterministically.
+    //
+    // The owner itself is simulated (cache insert + entry removal + notify)
+    // rather than a third real lookup: a real owner's `lookup_concurrent`
+    // needs RDAP bootstrap + WHOIS server discovery against live endpoints,
+    // and those clients expose no in-scope hermetic seam for full-path
+    // injection.
+    #[tokio::test]
+    async fn waiters_coalesce_on_inflight_lookup_and_read_owners_cache() {
+        use std::sync::atomic::Ordering;
+
+        let _serial = INFLIGHT_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+
+        let raw = unique_test_key("coalesce-waiter");
+        let normalized = crate::validation::normalize_domain(&raw).expect("test key normalizes");
+        LOOKUP_CACHE.remove(&normalized);
+
+        // Simulated owner claims the in-flight slot before the waiters arrive.
+        let owner_notify = Arc::new(Notify::new());
+        {
+            let mut m = LOOKUP_INFLIGHT.lock().unwrap_or_else(|p| p.into_inner());
+            m.insert(normalized.clone(), Arc::downgrade(&owner_notify));
+        }
+
+        let calls_before = LOOKUP_CONCURRENT_CALLS.load(Ordering::SeqCst);
+
+        // Two real concurrent callers: both must take the Waiter branch.
+        let lookup = SmartLookup::new();
+        let spawn_waiter = |l: SmartLookup, d: String| {
+            tokio::spawn(async move { l.lookup_with_progress(&d, None).await })
+        };
+        let h1 = spawn_waiter(lookup.clone(), raw.clone());
+        let h2 = spawn_waiter(lookup, raw);
+
+        // Current-thread runtime: awaiting here runs both waiters up to their
+        // `notified` await (their path to it is fully synchronous), so the
+        // owner's completion below cannot slip in before they subscribe.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Owner completes: populate the cache, then remove the entry and
+        // notify — the same order `InflightGuard::drop` uses.
+        let canned = LookupResult::Whois {
+            data: empty_whois(&normalized),
+            rdap_error: None,
+            rdap_fallback: None,
+        };
+        LOOKUP_CACHE.insert(normalized.clone(), canned);
+        {
+            let mut m = LOOKUP_INFLIGHT.lock().unwrap_or_else(|p| p.into_inner());
+            m.remove(&normalized);
+        }
+        owner_notify.notify_waiters();
+
+        // Both waiters must wake promptly (well under DEFAULT_INFLIGHT_WAIT)
+        // and observe the owner's result.
+        for handle in [h1, h2] {
+            let result = tokio::time::timeout(Duration::from_secs(5), handle)
+                .await
+                .expect("waiter must wake via notify, not the bounded-wait timeout")
+                .expect("waiter task joined cleanly")
+                .expect("waiter must read the owner's cached result");
+            assert!(result.is_whois());
+            assert_eq!(result.domain_name(), Some(normalized.clone()));
+        }
+
+        // Coalescing proof: neither waiter ran its own `lookup_concurrent`.
+        let calls_after = LOOKUP_CONCURRENT_CALLS.load(Ordering::SeqCst);
+        assert_eq!(
+            calls_before, calls_after,
+            "coalesced waiters must not start a second network race"
+        );
+
+        LOOKUP_CACHE.remove(&normalized);
     }
 
     /// Builds a domain key guaranteed unique per test invocation, so that
@@ -1856,6 +1965,69 @@ mod tests {
         .await;
         assert!(matches!(r, LegOutcome::Completed(Ok("thin"))));
         assert!(matches!(w, LegOutcome::Completed(Ok("whois data"))));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn race_awaits_rdap_fully_when_whois_wins_with_thin_body() {
+        // The Identity-Digital case from the WHOIS side: the registry's
+        // port-43 endpoint answers Ok instantly but the body carries no
+        // registration data (a "no service"/"not supported" sentinel). Under
+        // the old bare `is_ok()` predicate that thin win grace-truncated the
+        // only viable protocol — RDAP — guaranteeing a thin result. With the
+        // production `whois_leg_has_data` predicate, RDAP runs to its own
+        // bounded completion, mirroring the RDAP-side usefulness gate.
+        let rdap = leg(20, Ok::<&str, &str>("rdap data"));
+        let whois = leg(0, Ok::<_, SeerError>(empty_whois("zac.email")));
+        let (r, w) = race_with_grace(rdap, whois, |r| r.is_ok(), whois_leg_has_data).await;
+        assert!(
+            matches!(r, LegOutcome::Completed(Ok("rdap data"))),
+            "RDAP must not be grace-truncated behind a thin WHOIS answer"
+        );
+        assert!(matches!(w, LegOutcome::Completed(Ok(_))));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn race_truncates_rdap_when_whois_wins_with_real_data() {
+        // Complement: a WHOIS win that DOES carry registration data still
+        // only owes RDAP the grace period.
+        let mut whois_data = empty_whois("example.com");
+        whois_data.registrar = Some("Mock Registrar".to_string());
+        let rdap = leg(20, Ok::<&str, &str>("rdap data"));
+        let whois = leg(0, Ok::<_, SeerError>(whois_data));
+        let (r, w) = race_with_grace(rdap, whois, |r| r.is_ok(), whois_leg_has_data).await;
+        assert!(
+            matches!(r, LegOutcome::GraceTruncated),
+            "a data-bearing WHOIS winner only owes RDAP the grace period"
+        );
+        assert!(matches!(w, LegOutcome::Completed(Ok(_))));
+    }
+
+    // ---------------- whois_leg_has_data ----------------
+
+    #[test]
+    fn whois_leg_has_data_rejects_thin_ok_and_errors() {
+        // Thin Ok bodies — including "No match" availability sentinels — are
+        // not data in hand: the race must keep RDAP alive so a late RDAP 200
+        // can still veto a stale WHOIS "no match" (v0.26.6 rule).
+        assert!(!whois_leg_has_data(&Ok(empty_whois("example.email"))));
+        let mut no_match = empty_whois("example.com");
+        no_match.raw_response = "No match for \"EXAMPLE.COM\".".to_string();
+        assert!(!whois_leg_has_data(&Ok(no_match)));
+        assert!(!whois_leg_has_data(&Err(SeerError::WhoisError(
+            "connection refused".to_string()
+        ))));
+    }
+
+    #[test]
+    fn whois_leg_has_data_accepts_registration_data() {
+        // Stays in lockstep with `whois_response_is_thin`: any of the three
+        // key registration signals makes the leg a data-bearing winner.
+        let mut w = empty_whois("example.com");
+        w.registrar = Some("Mock Registrar".to_string());
+        assert!(whois_leg_has_data(&Ok(w)));
+        let mut w = empty_whois("example.com");
+        w.expiration_date = Some(Utc::now());
+        assert!(whois_leg_has_data(&Ok(w)));
     }
 
     // ---------------- grace_truncated_error ----------------

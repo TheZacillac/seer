@@ -454,6 +454,91 @@ mod tests {
         assert_eq!(config.interval_secs, 30);
     }
 
+    /// Hermetic follow-loop test against the sequenced mock DNS fixture in
+    /// [`crate::dns::test_support`]. Covers the loop end-to-end: the initial
+    /// snapshot (never a "change"), one record-change detection event with
+    /// the correct added/removed diff, a steady-state iteration, callback
+    /// delivery for every iteration, and a clean (uninterrupted) exit.
+    #[tokio::test]
+    async fn follow_loop_detects_change_against_mock_dns() {
+        use std::sync::Mutex;
+
+        use hickory_resolver::proto::rr::rdata as wire;
+        use hickory_resolver::proto::rr::RData as HickoryRData;
+
+        use crate::dns::test_support::{mock_dns_resolver, spawn_mock_dns_sequence};
+
+        let a = |last_octet: u8| {
+            HickoryRData::A(wire::A(std::net::Ipv4Addr::new(192, 0, 2, last_octet)))
+        };
+        // Iteration 1 sees .1; iteration 2 sees .2 (the change); iteration 3
+        // sees .2 again (steady state).
+        let port = spawn_mock_dns_sequence(vec![vec![a(1)], vec![a(2)], vec![a(2)]]).await;
+
+        // Built literally rather than via FollowConfig::new: the constructor
+        // floors multi-iteration intervals to 1s (anti-flood), but against a
+        // loopback fixture a 0s interval is harmless and keeps the test fast.
+        let config = FollowConfig {
+            iterations: 3,
+            interval_secs: 0,
+            changes_only: false,
+        };
+
+        let seen: Arc<Mutex<Vec<(usize, bool)>>> = Arc::new(Mutex::new(Vec::new()));
+        let callback: FollowProgressCallback = {
+            let seen = Arc::clone(&seen);
+            Arc::new(move |it: &FollowIteration| {
+                seen.lock()
+                    .expect("callback mutex")
+                    .push((it.iteration, it.changed));
+            })
+        };
+
+        let follower = DnsFollower::with_resolver(mock_dns_resolver(port));
+        let result = follower
+            .follow(
+                "seer.test",
+                RecordType::A,
+                Some("127.0.0.1"),
+                config,
+                Some(callback),
+                None,
+            )
+            .await
+            .expect("follow against the mock fixture must succeed");
+
+        // Clean loop exit: every iteration ran, none errored, no interrupt.
+        assert_eq!(result.completed_iterations(), 3);
+        assert_eq!(result.successful_iterations(), 3);
+        assert!(!result.interrupted);
+        assert_eq!(result.domain, "seer.test");
+        assert_eq!(result.record_type, RecordType::A);
+
+        // Iteration 1 — initial snapshot: records present, no diff baseline.
+        let first = &result.iterations[0];
+        assert_eq!(first.record_count(), 1);
+        assert_eq!(first.records[0].data.to_string(), "192.0.2.1");
+        assert!(!first.changed, "first iteration is never a change");
+        assert!(first.added.is_empty() && first.removed.is_empty());
+
+        // Iteration 2 — the record set changed and the diff names both sides.
+        let second = &result.iterations[1];
+        assert!(second.changed, "record change must be detected");
+        assert_eq!(second.added, vec!["192.0.2.2".to_string()]);
+        assert_eq!(second.removed, vec!["192.0.2.1".to_string()]);
+
+        // Iteration 3 — steady state: same records, no phantom change.
+        let third = &result.iterations[2];
+        assert!(!third.changed, "unchanged records must not be a change");
+        assert!(third.added.is_empty() && third.removed.is_empty());
+
+        assert_eq!(result.total_changes, 1);
+
+        // changes_only=false → the callback fired for every iteration.
+        let seen = seen.lock().expect("callback mutex");
+        assert_eq!(*seen, vec![(1, false), (2, true), (3, false)]);
+    }
+
     #[tokio::test]
     #[ignore = "live network; run with --ignored or SEER_LIVE_TESTS=1"]
     async fn test_follow_single_iteration() {

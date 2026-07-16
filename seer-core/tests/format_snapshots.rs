@@ -12,10 +12,18 @@
 //!   `Utc::now()`; fixtures use far-future expiries (stable color bucket for
 //!   decades) and an insta filter redacts the changing day count.
 
+use seer_core::caa::{CaaPolicy, CaaRecord, ISSUANCE_TIME_NOTE};
+use seer_core::confusables::{ConfusableReport, RegisteredLookalike};
 use seer_core::dns::{DnsRecord, RecordData, RecordType};
 use seer_core::output::{get_formatter, OutputFormat, OutputFormatter};
+use seer_core::posture::{
+    BimiPolicy, DanePolicy, DmarcPolicy, EmailPosture, MtaStsPolicy, PostureVerdict, SpfPolicy,
+    TlsaRecord,
+};
 use seer_core::rdap::RdapResponse;
+use seer_core::ssl::{CertDetail, CertWarning, CertWarningSeverity, SslReport};
 use seer_core::status::{DomainExpiration, StatusResponse};
+use seer_core::subdomains::{ClassifiedSubdomain, SubdomainClassification, SubdomainStatus};
 use seer_core::whois::WhoisResponse;
 
 fn human() -> Box<dyn OutputFormatter> {
@@ -284,6 +292,247 @@ fn fixture_subdomain_baseline_diff_missing() -> seer_core::subdomains::Subdomain
         unchanged_count: 0,
         baseline_missing: true,
     }
+}
+
+/// Email posture with a spread of verdicts (strict SPF, moderate DMARC,
+/// absent MTA-STS, present BIMI/DANE) plus advisory notes, exercising the
+/// detail-suffix paths (`-all`, `p=quarantine`, TLSA count).
+fn fixture_posture() -> EmailPosture {
+    EmailPosture {
+        domain: "example.com".into(),
+        spf: SpfPolicy {
+            present: true,
+            record: Some("v=spf1 include:_spf.example.com -all".into()),
+            all_qualifier: Some("-".into()),
+            verdict: PostureVerdict::Strict,
+        },
+        dmarc: DmarcPolicy {
+            present: true,
+            record: Some("v=DMARC1; p=quarantine; pct=50; rua=mailto:dmarc@example.com".into()),
+            policy: Some("quarantine".into()),
+            subdomain_policy: None,
+            aggregate_reports: vec!["mailto:dmarc@example.com".into()],
+            percent: Some(50),
+            verdict: PostureVerdict::Moderate,
+        },
+        mta_sts: MtaStsPolicy {
+            present: false,
+            record: None,
+            id: None,
+            verdict: PostureVerdict::Absent,
+        },
+        bimi: BimiPolicy {
+            present: true,
+            record: Some("v=BIMI1; l=https://example.com/logo.svg".into()),
+            logo_url: Some("https://example.com/logo.svg".into()),
+            authority_url: None,
+            verdict: PostureVerdict::Present,
+        },
+        dane: DanePolicy {
+            present: true,
+            records: vec![TlsaRecord {
+                scope: "_25._tcp".into(),
+                cert_usage: 3,
+                selector: 1,
+                matching: 1,
+                cert_data: "ABCDEF0123".into(),
+            }],
+            verdict: PostureVerdict::Present,
+        },
+        notes: vec![
+            "DMARC pct=50 applies the policy to only half of spoofed mail".into(),
+            "MTA-STS is not configured".into(),
+        ],
+    }
+}
+
+#[test]
+fn human_posture_snapshot() {
+    snap!(human().format_posture(&fixture_posture()));
+}
+
+#[test]
+fn markdown_posture_snapshot() {
+    snap!(markdown().format_posture(&fixture_posture()));
+}
+
+/// Registered look-alikes with both fully-populated and sparse (no
+/// registrar/creation date) entries.
+fn fixture_confusables() -> ConfusableReport {
+    ConfusableReport {
+        domain: "example.com".into(),
+        candidates_generated: 42,
+        candidates_checked: 42,
+        registered: vec![
+            RegisteredLookalike {
+                domain: "examp1e.com".into(),
+                technique: "homoglyph".into(),
+                registrar: Some("Mock Registrar Inc.".into()),
+                creation_date: Some("2025-11-02T00:00:00Z".parse().unwrap()),
+                nameservers: vec!["ns1.parking.example".into()],
+            },
+            RegisteredLookalike {
+                domain: "exampel.com".into(),
+                technique: "transposition".into(),
+                registrar: None,
+                creation_date: None,
+                nameservers: Vec::new(),
+            },
+        ],
+    }
+}
+
+#[test]
+fn human_confusables_snapshot() {
+    snap!(human().format_confusables(&fixture_confusables()));
+}
+
+#[test]
+fn markdown_confusables_snapshot() {
+    snap!(markdown().format_confusables(&fixture_confusables()));
+}
+
+/// Classified subdomains covering all three statuses, a dangling-CNAME
+/// takeover risk, a wildcard-detected banner, and a skipped-names notice.
+fn fixture_subdomain_classification() -> SubdomainClassification {
+    SubdomainClassification {
+        domain: "example.com".into(),
+        wildcard_detected: true,
+        subdomains: vec![
+            ClassifiedSubdomain {
+                name: "www.example.com".into(),
+                status: SubdomainStatus::Live,
+                addresses: vec!["93.184.216.34".into()],
+                cname: None,
+                takeover_risk: None,
+            },
+            ClassifiedSubdomain {
+                name: "docs.example.com".into(),
+                status: SubdomainStatus::Dead,
+                addresses: Vec::new(),
+                cname: Some("example.github.io.".into()),
+                takeover_risk: Some("GitHub Pages".into()),
+            },
+            ClassifiedSubdomain {
+                name: "random.example.com".into(),
+                status: SubdomainStatus::Wildcard,
+                addresses: vec!["203.0.113.9".into()],
+                cname: None,
+                takeover_risk: None,
+            },
+        ],
+        names_skipped: 3,
+    }
+}
+
+#[test]
+fn human_subdomain_classification_snapshot() {
+    snap!(human().format_subdomain_classification(&fixture_subdomain_classification()));
+}
+
+#[test]
+fn markdown_subdomain_classification_snapshot() {
+    snap!(markdown().format_subdomain_classification(&fixture_subdomain_classification()));
+}
+
+/// A CAA policy exercising the PR #101 extensions: iodef incident-reporting
+/// contacts and a wildcard-broader-than-named issuance note (mirrors what
+/// `CaaPolicy::from_records` derives for these records).
+fn fixture_caa_policy() -> CaaPolicy {
+    CaaPolicy {
+        records: vec![
+            CaaRecord {
+                flags: 0,
+                tag: "issue".into(),
+                value: "letsencrypt.org".into(),
+            },
+            CaaRecord {
+                flags: 0,
+                tag: "issuewild".into(),
+                value: "pki.goog".into(),
+            },
+            CaaRecord {
+                flags: 128,
+                tag: "iodef".into(),
+                value: "mailto:security@example.com".into(),
+            },
+        ],
+        effective_domain: Some("example.com".into()),
+        has_policy: true,
+        issuer_match: None,
+        iodef: vec!["mailto:security@example.com".into()],
+        wildcard_note: Some(
+            "issuewild permits CA(s) not allowed by issue (pki.goog) — wildcard issuance is \
+             broader than named issuance"
+                .into(),
+        ),
+        note: ISSUANCE_TIME_NOTE.to_string(),
+    }
+}
+
+#[test]
+fn human_caa_snapshot() {
+    snap!(human().format_caa(&fixture_caa_policy()));
+}
+
+#[test]
+fn markdown_caa_snapshot() {
+    snap!(markdown().format_caa(&fixture_caa_policy()));
+}
+
+/// A date-valid but troubled leaf certificate whose warnings mirror what
+/// `derive_cert_warnings` produces for these fields: weak RSA key, deprecated
+/// SHA-1 signature, self-signed (subject == issuer), hostname mismatch.
+/// `days_until_expiry` is a fixed struct field, so the output is stable.
+fn fixture_ssl_report_with_warnings() -> SslReport {
+    SslReport {
+        domain: "example.com".into(),
+        chain: vec![CertDetail {
+            subject: "CN=example.com".into(),
+            issuer: "CN=example.com".into(),
+            valid_from: "2025-01-01T00:00:00Z".parse().unwrap(),
+            valid_until: "2027-01-01T00:00:00Z".parse().unwrap(),
+            serial_number: "04:AB:CD:EF".into(),
+            signature_algorithm: Some("SHA1-RSA".into()),
+            is_ca: false,
+            key_type: Some("RSA".into()),
+            key_bits: Some(1024),
+        }],
+        protocol_version: Some("TLSv1.3".into()),
+        san_names: vec!["example.com".into(), "www.example.com".into()],
+        is_valid: true,
+        hostname_verified: false,
+        days_until_expiry: 180,
+        caa: None,
+        warnings: vec![
+            CertWarning {
+                severity: CertWarningSeverity::Critical,
+                message: "RSA key size 1024 is below the 2048-bit minimum".into(),
+            },
+            CertWarning {
+                severity: CertWarningSeverity::Critical,
+                message: "Certificate uses deprecated signature algorithm: SHA1-RSA".into(),
+            },
+            CertWarning {
+                severity: CertWarningSeverity::Warning,
+                message: "Certificate is self-signed (issuer equals subject)".into(),
+            },
+            CertWarning {
+                severity: CertWarningSeverity::Critical,
+                message: "Certificate does not match the requested hostname".into(),
+            },
+        ],
+    }
+}
+
+#[test]
+fn human_ssl_warnings_snapshot() {
+    snap!(human().format_ssl(&fixture_ssl_report_with_warnings()));
+}
+
+#[test]
+fn markdown_ssl_snapshot() {
+    snap!(markdown().format_ssl(&fixture_ssl_report_with_warnings()));
 }
 
 #[test]

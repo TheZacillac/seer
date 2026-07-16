@@ -1,0 +1,13 @@
+---
+source: seer-core/tests/format_snapshots.rs
+assertion_line: 392
+expression: markdown().format_confusables(&fixture_confusables())
+---
+## Look-alikes: example.com
+
+42 candidates generated, 2 registered.
+
+| Domain | Technique | Registered | Registrar |
+|---|---|---|---|
+| examp1e.com | homoglyph | 2025-11-02 | Mock Registrar Inc. |
+| exampel.com | transposition | — | — |

@@ -96,9 +96,10 @@ impl Watchlist {
     /// TOML and silently fall back to the default empty watchlist, losing
     /// the user's domains). Mirrors `LookupHistory::save`.
     ///
-    /// The temp filename is suffixed with the current PID so two concurrent
-    /// `seer` processes don't write to the same intermediate path and race
-    /// each other's `rename`s.
+    /// The temp filename is unique per call (PID + process-wide counter, see
+    /// `unique_tmp_path`) so concurrent saves — whether from two `seer`
+    /// processes or two tasks in one process — never write to the same
+    /// intermediate path and race each other's `rename`s.
     ///
     /// # Concurrency
     ///
@@ -110,6 +111,12 @@ impl Watchlist {
     pub fn save(&self) -> Result<()> {
         let path = Self::path()
             .ok_or_else(|| SeerError::ConfigError("Cannot determine home directory".to_string()))?;
+        self.save_to_path(&path)
+    }
+
+    /// Like [`Self::save`] but writes to an explicit path. Split out so tests
+    /// can exercise the atomic-save path without touching `~/.seer`.
+    pub(crate) fn save_to_path(&self, path: &std::path::Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| SeerError::ConfigError(e.to_string()))?;
             #[cfg(unix)]
@@ -120,14 +127,14 @@ impl Watchlist {
         }
         let content =
             toml::to_string_pretty(self).map_err(|e| SeerError::ConfigError(e.to_string()))?;
-        let tmp_path = path.with_extension(format!("toml.{}.tmp", std::process::id()));
+        let tmp_path = unique_tmp_path(path, "toml");
         std::fs::write(&tmp_path, content).map_err(|e| SeerError::ConfigError(e.to_string()))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600));
         }
-        std::fs::rename(&tmp_path, &path).map_err(|e| {
+        std::fs::rename(&tmp_path, path).map_err(|e| {
             let _ = std::fs::remove_file(&tmp_path);
             SeerError::ConfigError(e.to_string())
         })?;
@@ -153,6 +160,18 @@ impl Watchlist {
         self.domains.retain(|d| d != &domain);
         self.domains.len() < len_before
     }
+}
+
+/// Returns a per-call-unique sibling temp path for an atomic save. The PID
+/// alone is not unique enough: same-process concurrent saves are reachable
+/// (e.g. detached TUI writes), and a shared temp path lets one writer
+/// truncate the other's finished bytes before its rename — a torn rename
+/// that publishes a corrupt file. Mirrors `history::unique_tmp_path`.
+fn unique_tmp_path(path: &std::path::Path, ext: &str) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SAVE_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let seq = SAVE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    path.with_extension(format!("{}.{}.{}.tmp", ext, std::process::id(), seq))
 }
 
 /// SSL or domain-registration expiry within this many days is *critical*.
@@ -380,6 +399,60 @@ mod tests {
 
         let loaded = Watchlist::load_from_path(&path);
         assert!(loaded.domains.is_empty());
+
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::remove_dir_all(parent);
+        }
+    }
+
+    #[test]
+    fn tmp_paths_are_unique_per_call() {
+        // PID-only temp names collide across same-process concurrent saves;
+        // every call must get its own temp path.
+        let target = std::path::Path::new("/some/dir/watchlist.toml");
+        assert_ne!(
+            unique_tmp_path(target, "toml"),
+            unique_tmp_path(target, "toml"),
+            "two saves in one process must not share a temp path"
+        );
+    }
+
+    #[test]
+    fn concurrent_saves_do_not_corrupt_the_file() {
+        // Two same-process writers saving to the same target concurrently:
+        // with a shared (PID-only) temp path one writer truncates the other's
+        // finished bytes and the loser's rename fails (or publishes a torn
+        // file). With per-call temp paths every save succeeds and the last
+        // rename wins with a complete file. Mirrors the history.rs test.
+        let path = unique_temp_watchlist_path("concurrent");
+        let _ = std::fs::remove_file(&path);
+
+        let mut a = Watchlist::default();
+        a.add("a.example").unwrap();
+        let mut b = Watchlist::default();
+        for i in 0..100 {
+            b.add(&format!("b{i}.example")).unwrap();
+        }
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let spawn_saver =
+            |wl: Watchlist, path: PathBuf, barrier: std::sync::Arc<std::sync::Barrier>| {
+                std::thread::spawn(move || {
+                    for _ in 0..50 {
+                        barrier.wait();
+                        wl.save_to_path(&path).expect("concurrent save failed");
+                    }
+                })
+            };
+        let ta = spawn_saver(a, path.clone(), barrier.clone());
+        let tb = spawn_saver(b, path.clone(), barrier);
+        ta.join().expect("thread A panicked");
+        tb.join().expect("thread B panicked");
+
+        // Whichever writer won the last rename, the file must be complete.
+        let content = std::fs::read_to_string(&path).expect("saved file exists");
+        toml::from_str::<Watchlist>(&content)
+            .expect("concurrently saved watchlist must parse (no torn rename)");
 
         if let Some(parent) = path.parent() {
             let _ = std::fs::remove_dir_all(parent);

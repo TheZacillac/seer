@@ -1,0 +1,25 @@
+---
+source: seer-core/tests/format_snapshots.rs
+assertion_line: 535
+expression: markdown().format_ssl(&fixture_ssl_report_with_warnings())
+---
+## SSL Report: example.com
+
+- **Valid**: yes
+- **Hostname Match**: no
+- **Days Until Expiry**: 180
+- **Protocol**: TLSv1.3
+- **SANs**: `example.com`, `www.example.com`
+
+### Warnings
+
+- ⚠ **Critical**: RSA key size 1024 is below the 2048-bit minimum
+- ⚠ **Critical**: Certificate uses deprecated signature algorithm: SHA1-RSA
+- ⚠ Warning: Certificate is self-signed (issuer equals subject)
+- ⚠ **Critical**: Certificate does not match the requested hostname
+
+### Certificate Chain
+
+| # | Subject | Issuer | Valid Until | Key |
+| --- | --- | --- | --- | --- |
+| 0 | CN=example.com | CN=example.com | 2027-01-01 | RSA (1024 bits) |

@@ -494,6 +494,19 @@ fn emit_error<E: std::fmt::Display>(output_format: seer_core::output::OutputForm
     std::process::exit(1);
 }
 
+/// Every name `RecordType::from_str` accepts, for error messages —
+/// `SeerError::InvalidRecordType` names only the offending input.
+pub(crate) const VALID_RECORD_TYPES: &str =
+    "A, AAAA, CNAME, MX, NS, TXT, SOA, PTR, SRV, CAA, NAPTR, DNSKEY, DS, TLSA, SSHFP, ANY";
+
+/// Parses a DNS record type, extending the core error with the list of valid
+/// types. A typo must surface as a visible error, never silently fall back to
+/// A records. Shared with the REPL, which maps the error to `CommandResult`.
+pub(crate) fn try_parse_record_type(s: &str) -> Result<seer_core::RecordType, String> {
+    s.parse::<seer_core::RecordType>()
+        .map_err(|e| format!("{} (valid types: {})", e, VALID_RECORD_TYPES))
+}
+
 /// Parses a DNS record type, routing a bad value through [`emit_error`] so the
 /// `--format json|yaml` error contract still holds. Using `?` here instead would
 /// bubble a raw `anyhow` error past the formatter and print ANSI prose even when
@@ -502,7 +515,7 @@ fn parse_record_type(
     record_type: &str,
     output_format: seer_core::output::OutputFormat,
 ) -> seer_core::RecordType {
-    match record_type.parse::<seer_core::RecordType>() {
+    match try_parse_record_type(record_type) {
         Ok(rt) => rt,
         Err(e) => emit_error(output_format, &e),
     }
@@ -716,7 +729,7 @@ async fn execute_command(
                 .map(|s| utils::expand_tilde(&s))
                 .unwrap_or_else(|| ops::default_bulk_output_path(&file));
 
-            let rt: seer_core::RecordType = record_type.parse().unwrap_or(seer_core::RecordType::A);
+            let rt = parse_record_type(&record_type, output_format);
             let executor = seer_core::BulkExecutor::from_config(config);
 
             let operations = match ops::build_bulk_operations(&operation, &domains, rt) {
@@ -1522,6 +1535,50 @@ mod compare_cli_tests {
             panic!("expected Compare command");
         };
         assert_eq!(record_type, "MX");
+    }
+}
+
+#[cfg(test)]
+mod record_type_parse_tests {
+    use super::try_parse_record_type;
+
+    #[test]
+    fn parses_valid_types_case_insensitively() {
+        assert_eq!(
+            try_parse_record_type("mx").unwrap(),
+            seer_core::RecordType::MX
+        );
+        assert_eq!(
+            try_parse_record_type("AAAA").unwrap(),
+            seer_core::RecordType::AAAA
+        );
+    }
+
+    /// A typo'd type previously fell back to A silently (bulk dig/prop
+    /// returned A answers for a user who asked for MX). The error must name
+    /// the bad input and list the valid types, since the core error doesn't.
+    #[test]
+    fn invalid_type_error_names_input_and_lists_valid_types() {
+        let err = try_parse_record_type("MXX").unwrap_err();
+        assert!(err.contains("MXX"), "error should name the input: {err}");
+        assert!(
+            err.contains("AAAA") && err.contains("SSHFP"),
+            "error should list valid types: {err}"
+        );
+    }
+
+    /// Guards `VALID_RECORD_TYPES` against drifting from
+    /// `RecordType::from_str` — a renamed or removed core type would
+    /// otherwise leave the error message advertising a name that no
+    /// longer parses.
+    #[test]
+    fn valid_types_list_stays_parseable() {
+        for name in super::VALID_RECORD_TYPES.split(", ") {
+            assert!(
+                try_parse_record_type(name).is_ok(),
+                "VALID_RECORD_TYPES lists {name}, which no longer parses"
+            );
+        }
     }
 }
 

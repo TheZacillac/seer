@@ -1,0 +1,18 @@
+---
+source: seer-core/tests/format_snapshots.rs
+assertion_line: 475
+expression: human().format_caa(&fixture_caa_policy())
+---
+
+[1;95mCAA Policy[0m
+[37m──────────[0m
+
+[1;96mCAA Policy[0m:
+  [1;96mFound at[0m: [97mexample.com[0m
+  [97m0[0m [1;96missue[0m "letsencrypt.org"
+  [97m0[0m [1;96missuewild[0m "pki.goog"
+  [97m128[0m [1;96miodef[0m "mailto:security@example.com"
+  [1;96miodef (incident reporting)[0m: [97mmailto:security@example.com[0m
+  [1;96mWildcard[0m: [1;93missuewild permits CA(s) not allowed by issue (pki.goog) — wildcard issuance is broader than named issuance[0m
+
+note: CAA is checked by CAs at issuance time, not by clients at validation time. A cert whose issuer is not in the current CAA policy is not invalid — it may have been issued before the policy was set, or under a parent zone. Treat mismatches as informational.

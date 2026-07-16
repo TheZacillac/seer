@@ -166,6 +166,13 @@ impl App {
         // A new target invalidates every cached lens.
         if self.domain.as_deref() != Some(normalized.as_str()) {
             self.states.clear();
+            // Bump EVERY lens's generation, not just the current one's (which
+            // fetch_current bumps below): an in-flight fetch on another lens,
+            // started under the old domain, would otherwise still match its
+            // unchanged gen and land as the new domain's data.
+            for gen in self.fetch_gen.values_mut() {
+                *gen += 1;
+            }
             // A new target invalidates any per-lens filters too.
             self.lens_filter.clear();
             // The resolved IP is derived from the OLD domain's DNS/Status
@@ -277,6 +284,11 @@ impl App {
         }
         let key = lens.key;
         self.states.remove(key);
+        // Invalidate any in-flight fetch for the previous tab even when the
+        // new tab has no default request (RDAP IP tab without a resolved IP,
+        // ASN tab): no fetch_action follows to bump the gen there, and the
+        // old tab's late result would otherwise render as this tab's data.
+        self.bump_fetch_gen(key);
         self.fetch_with_current()
     }
 
@@ -617,8 +629,15 @@ impl App {
     }
 
     /// Returns the domain of the currently selected history entry, if available.
+    /// `sel` indexes the FILTERED view (`row_count` counts filtered rows), so
+    /// the active `/`-filter must be applied before indexing.
     fn selected_history_domain(&self) -> Option<String> {
-        if let LensState::Loaded(LensData::History(entries)) = self.state_of(self.lens) {
+        let LensState::Loaded(data) = self.state_of(self.lens) else {
+            return None;
+        };
+        let filtered = crate::tui::filter::apply(data, &self.active_filter());
+        let data = filtered.as_ref().unwrap_or(data);
+        if let LensData::History(entries) = data {
             entries.get(self.sel).map(|e| e.domain.clone())
         } else {
             None
@@ -1082,7 +1101,7 @@ mod tests {
         LensState::Loaded(make_watch_state_data(domain))
     }
 
-    fn make_history_state(domain: &str) -> LensState {
+    fn make_history_entry(domain: &str) -> seer_core::HistoryEntry {
         use chrono::DateTime;
         use seer_core::{HistoryEntry, LookupResult, WhoisResponse};
         let timestamp = DateTime::<chrono::Utc>::from_timestamp(0, 0).unwrap();
@@ -1112,7 +1131,7 @@ mod tests {
             whois_server: String::new(),
             raw_response: String::new(),
         };
-        LensState::Loaded(LensData::History(vec![HistoryEntry {
+        HistoryEntry {
             domain: domain.to_string(),
             timestamp,
             result: LookupResult::Whois {
@@ -1120,7 +1139,11 @@ mod tests {
                 rdap_error: None,
                 rdap_fallback: None,
             },
-        }]))
+        }
+    }
+
+    fn make_history_state(domain: &str) -> LensState {
+        LensState::Loaded(LensData::History(vec![make_history_entry(domain)]))
     }
 
     fn watch_lens_idx() -> usize {
@@ -1604,6 +1627,95 @@ mod tests {
         // Committing an empty value clears the filter.
         let _ = app.apply_field(EditTarget::LensFilter, String::new());
         assert_eq!(app.active_filter(), "");
+    }
+
+    #[test]
+    fn domain_switch_invalidates_other_lenses_inflight_fetches() {
+        let mut app = App::new(None);
+        let _ = app.set_domain_and_fetch("a.com");
+        // Simulate an in-flight DNS fetch for a.com on a non-current lens.
+        let dns_idx = crate::tui::lenses::find_by_cmd_or_key("dns").unwrap();
+        let dns_key = crate::tui::lenses::lenses()[dns_idx].key;
+        app.fetch_gen.insert(dns_key, 1);
+        app.states.insert(dns_key, LensState::Loading);
+        // Switch domains, then let the old domain's result land late.
+        let _ = app.set_domain_and_fetch("b.com");
+        app.update(Msg::Data {
+            lens: "dns".into(),
+            gen: 1,
+            result: Ok(LensData::Dns(vec![])),
+        });
+        assert!(
+            !matches!(app.state_of(dns_idx), LensState::Loaded(_)),
+            "a late result fetched under the old domain must not be stored as the new domain's data",
+        );
+    }
+
+    #[test]
+    fn history_enter_with_filter_pivots_to_filtered_selection() {
+        let mut app = App::new(None);
+        let idx = history_lens_idx();
+        app.lens = idx;
+        app.focus = Focus::Pane;
+        app.states.insert(
+            crate::tui::lenses::lenses()[idx].key,
+            LensState::Loaded(LensData::History(vec![
+                make_history_entry("alpha.com"),
+                make_history_entry("beta.com"),
+            ])),
+        );
+        // Commit a `/`-filter matching only the second entry; sel 0 now points
+        // at beta.com in the filtered view.
+        let _ = app.apply_field(EditTarget::LensFilter, "beta".into());
+        let actions = key(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.domain.as_deref(),
+            Some("beta.com"),
+            "Enter must resolve the selection against the filtered view, not the unfiltered list",
+        );
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::Fetch {
+                    req: FetchReq::Overview(d),
+                    ..
+                } if d == "beta.com"
+            )),
+            "expected Fetch(Overview(beta.com)), got {actions:?}",
+        );
+    }
+
+    #[test]
+    fn rdap_tab_switch_without_default_req_drops_inflight_result() {
+        let mut app = App::new(None);
+        app.domain = Some("example.com".into());
+        let idx = crate::tui::lenses::find_by_cmd_or_key("rdap").unwrap();
+        let rdap_key = crate::tui::lenses::lenses()[idx].key;
+        app.lens = idx;
+        // Simulate an in-flight domain-tab fetch.
+        app.fetch_gen.insert(rdap_key, 1);
+        app.states.insert(rdap_key, LensState::Loading);
+        // Switch to the IP tab with no resolved IP: there is no default
+        // request, so no new fetch is issued...
+        app.tab = 1;
+        let actions = app.refetch_for_tab();
+        assert!(
+            actions.is_empty(),
+            "IP tab without a resolved IP must not fetch, got {actions:?}",
+        );
+        // ...and the stale domain-tab result landing late must be dropped, not
+        // rendered as the IP tab's data.
+        let rdap: seer_core::RdapResponse =
+            serde_json::from_str("{}").expect("empty RDAP object deserializes");
+        app.update(Msg::Data {
+            lens: "rdap".into(),
+            gen: 1,
+            result: Ok(LensData::Rdap(Box::new(rdap))),
+        });
+        assert!(
+            !matches!(app.state_of(idx), LensState::Loaded(_)),
+            "stale domain result must not render as the IP/ASN tab's data",
+        );
     }
 
     #[test]

@@ -99,8 +99,11 @@ seer-core/src/
 ├── validation.rs       # Domain normalization, reserved-IP checks, SEER_DOMAIN_ALLOWLIST
 ├── ssl.rs              # SSL chain inspection (single-attempt by design)
 ├── caa.rs              # CAA policy lookup + issuer comparison
+├── posture.rs          # Email/DNS security posture: SPF/DMARC/MTA-STS/BIMI/DANE verdicts
+├── confusables.rs      # Typosquat/homoglyph look-alike generation + registration scoring
 ├── subdomains/         # Subdomain enumeration via CT logs: ordered source chain (crt.sh→certspotter) + per-source retry treating crt.sh 404/429/HTML-body as transient
 ├── diff.rs             # Side-by-side domain comparison
+├── drift.rs            # Registration drift detection vs stored history snapshot
 ├── watchlist.rs        # Cert/registration expiry watchlist
 ├── history.rs          # Lookup history
 ├── logging.rs          # tracing setup (+ optional OTel via `otel` feature)
@@ -177,7 +180,7 @@ seer-cli/src/
 ```
 seer-py/
 ├── Cargo.toml          # Library config with crate-type = ["cdylib"]
-├── pyproject.toml      # Maturin build config, ABI3 (Python 3.9+)
+├── pyproject.toml      # Maturin build config, ABI3 (Python 3.10+)
 ├── src/lib.rs          # PyO3 bindings, async→sync conversion
 └── python/seer/        # Python wrapper package
     └── __init__.py     # Re-exports and convenience functions
@@ -204,7 +207,7 @@ seer-api/
     │   ├── propagation.py  # DNS propagation
     │   └── status.py       # Domain status
     └── mcp/
-        └── server.py       # MCP server (16 tools)
+        └── server.py       # MCP server (25 tools)
 ```
 
 **Key Points:**
@@ -1239,6 +1242,7 @@ keys off the distribution name.
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `RUST_LOG` | Logging level (trace, debug, info, warn, error) | - |
+| `SEER_LOG_LEVEL` | API log level when the `arcanum` logging module isn't installed (`ARCANUM_LOG_LEVEL` wins) | `INFO` |
 | `SEER_DOMAIN_ALLOWLIST` | Comma-separated allowlist restricting queryable domains | — |
 | `SEER_CORS_ORIGINS` | Comma-separated allowed CORS origins for API | `*` |
 | `SEER_MCP_ALLOWED_HOSTS` | `Host:` values for `POST /mcp`; setting enables DNS-rebinding protection | — |
@@ -1252,7 +1256,12 @@ keys off the distribution name.
 | `SEER_TRUSTED_PROXY_IPS` | Comma-separated list of IPs allowed to set XFF | — |
 | `SEER_RATE_LIMIT` | Default slowapi rate limit | `30/minute` |
 | `SEER_RATE_LIMIT_STORAGE` | Rate-limit storage URI (e.g. `redis://host:6379`) | `memory://` |
+| `SEER_REQUEST_TIMEOUT` | Per-request deadline (seconds) for dispatched core calls; on expiry the client gets a 504. `0` disables | `0` |
+| `SEER_DISPATCH_THREADS` | Max threads in the bounded pool that runs blocking PyO3 calls (REST + `/mcp`) | `50` |
+| `SEER_MAX_CONCURRENT_STREAMS` | Max in-flight bulk SSE stream jobs per worker process | `8` |
+| `SEER_RELOAD` | Uvicorn auto-reload for the `seer-api` entry point (dev only) | `false` |
 | `WEB_CONCURRENCY` | Uvicorn worker count. `>1` requires non-`memory://` store | `1` |
+| `UVICORN_WORKERS` | Fallback worker count when `WEB_CONCURRENCY` is unset (same `>1` store rule) | `1` |
 
 ### User Config File
 
@@ -1429,7 +1438,7 @@ cargo check
 - **Minimum Rust Version**: 1.89+ (enforced by the `msrv` CI job; floor set by
   rustyline 18's use of `std::fs::File::lock`, stabilized in 1.89. Previous
   floor was 1.88 via `x509-parser → time → time-macros`.)
-- **Python**: 3.9+ (ABI3 compatibility)
+- **Python**: 3.10+ (ABI3 compatibility)
 - **License**: MIT
 
 ---
@@ -1451,5 +1460,5 @@ For issues and questions:
 
 ---
 
-**Last Updated**: 2026-06-12
-**Document Version**: 1.1.0
+**Last Updated**: 2026-07-16
+**Document Version**: 1.2.0

@@ -114,6 +114,12 @@ impl LookupHistory {
     pub fn save(&self) -> Result<()> {
         let path = Self::path()
             .ok_or_else(|| SeerError::ConfigError("Cannot determine home directory".to_string()))?;
+        self.save_to_path(&path)
+    }
+
+    /// Like [`Self::save`] but writes to an explicit path. Split out so tests
+    /// can exercise the atomic-save path without touching `~/.seer`.
+    pub(crate) fn save_to_path(&self, path: &std::path::Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| SeerError::ConfigError(e.to_string()))?;
             // Lookup history is sensitive reconnaissance metadata; keep the
@@ -126,12 +132,7 @@ impl LookupHistory {
         }
         let content = serde_json::to_string_pretty(self)
             .map_err(|e| SeerError::ConfigError(e.to_string()))?;
-        // Per-PID temp filename so two concurrent `seer` processes don't
-        // race on the same intermediate path. Without this, process B's
-        // `fs::write` could truncate A's `.tmp` after A finished writing
-        // but before A's `rename` — A would then rename a truncated file
-        // and silently lose history.
-        let tmp_path = path.with_extension(format!("json.{}.tmp", std::process::id()));
+        let tmp_path = unique_tmp_path(path, "json");
         std::fs::write(&tmp_path, content).map_err(|e| SeerError::ConfigError(e.to_string()))?;
         // Owner-only before the rename so the published file is never briefly
         // world-readable.
@@ -140,7 +141,7 @@ impl LookupHistory {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600));
         }
-        std::fs::rename(&tmp_path, &path).map_err(|e| {
+        std::fs::rename(&tmp_path, path).map_err(|e| {
             // Best-effort cleanup of the temp file so we don't litter on
             // failure. Swallow the cleanup error — the original rename
             // error is what we want to surface.
@@ -152,12 +153,13 @@ impl LookupHistory {
 
     /// Records a lookup result for the given domain, trimming old entries if needed.
     pub fn record(&mut self, domain: &str, result: LookupResult) {
+        let key = history_key(domain);
         let entry = HistoryEntry {
-            domain: domain.to_lowercase(),
+            domain: key.clone(),
             timestamp: Utc::now(),
             result,
         };
-        let entries = self.entries.entry(domain.to_lowercase()).or_default();
+        let entries = self.entries.entry(key).or_default();
         entries.push(entry);
         // Keep at most MAX_ENTRIES_PER_DOMAIN entries
         if entries.len() > MAX_ENTRIES_PER_DOMAIN {
@@ -194,7 +196,7 @@ impl LookupHistory {
     /// Returns all history entries for a domain, newest last.
     pub fn get(&self, domain: &str) -> Vec<&HistoryEntry> {
         self.entries
-            .get(&domain.to_lowercase())
+            .get(&history_key(domain))
             .map(|entries| entries.iter().collect())
             .unwrap_or_default()
     }
@@ -203,6 +205,33 @@ impl LookupHistory {
     pub fn clear(&mut self) {
         self.entries.clear();
     }
+}
+
+/// Canonical history key for a domain: the crate's `normalize_domain`
+/// (strips scheme/`www.`/port, lowercases, IDN→punycode), so
+/// `www.example.com` and `https://EXAMPLE.COM` coalesce with `example.com`
+/// on both the write (`record`) and read (`get`) paths. Callers pass raw
+/// user input, so keying by plain `to_lowercase()` made
+/// `lookup www.example.com` + `drift example.com` miss each other (false
+/// "no baseline"). Inputs that fail validation fall back to lowercasing so
+/// record/get stay infallible and consistent with each other. Legacy files
+/// keyed under un-normalized names are not migrated: reads normalize the
+/// lookup key, so legacy entries are simply superseded by new writes.
+fn history_key(domain: &str) -> String {
+    crate::validation::normalize_domain(domain).unwrap_or_else(|_| domain.to_lowercase())
+}
+
+/// Returns a per-call-unique sibling temp path for an atomic save. The PID
+/// alone is not unique enough: same-process concurrent saves are reachable
+/// (e.g. the TUI's detached history writes), and a shared temp path lets one
+/// writer truncate the other's finished bytes before its rename — a torn
+/// rename that publishes a corrupt file. A process-wide counter alongside the
+/// PID makes every (process, call) pair unique.
+fn unique_tmp_path(path: &std::path::Path, ext: &str) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SAVE_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let seq = SAVE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    path.with_extension(format!("{}.{}.{}.tmp", ext, std::process::id(), seq))
 }
 
 #[cfg(test)]
@@ -255,6 +284,31 @@ mod tests {
 
         let entries = history.get("example.com");
         assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn history_key_coalesces_www_scheme_and_case_variants() {
+        // `seer lookup www.example.com` followed by `seer drift example.com`
+        // must find the baseline: all spellings share one normalized key.
+        let mut history = LookupHistory::default();
+        history.record("www.example.com", make_lookup_result("www.example.com"));
+        history.record(
+            "https://EXAMPLE.COM/path",
+            make_lookup_result("example.com"),
+        );
+
+        assert_eq!(
+            history.get("example.com").len(),
+            2,
+            "www./scheme/case variants must land under the same history key"
+        );
+        assert_eq!(history.entries.len(), 1, "exactly one key stored");
+        assert!(
+            history.entries.contains_key("example.com"),
+            "the stored key is the normalized form"
+        );
+        // Reads normalize too, so any variant retrieves the shared entries.
+        assert_eq!(history.get("WWW.example.com").len(), 2);
     }
 
     #[test]
@@ -408,6 +462,61 @@ mod tests {
 
         let loaded = LookupHistory::load_from_path(&path);
         assert!(loaded.entries.is_empty());
+
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::remove_dir_all(parent);
+        }
+    }
+
+    #[test]
+    fn tmp_paths_are_unique_per_call() {
+        // PID-only temp names collide across same-process concurrent saves
+        // (the TUI's detached writes make those reachable); every call must
+        // get its own temp path.
+        let target = std::path::Path::new("/some/dir/history.json");
+        assert_ne!(
+            unique_tmp_path(target, "json"),
+            unique_tmp_path(target, "json"),
+            "two saves in one process must not share a temp path"
+        );
+    }
+
+    #[test]
+    fn concurrent_saves_do_not_corrupt_the_file() {
+        // Two same-process writers saving to the same target concurrently:
+        // with a shared (PID-only) temp path one writer truncates the other's
+        // finished bytes and the loser's rename fails (or publishes a torn
+        // file). With per-call temp paths every save succeeds and the last
+        // rename wins with a complete file.
+        let path = unique_temp_history_path("concurrent");
+        let _ = std::fs::remove_file(&path);
+
+        let mut a = LookupHistory::default();
+        a.record("a.example", make_lookup_result("a.example"));
+        let mut b = LookupHistory::default();
+        for i in 0..100 {
+            b.record(&format!("b{i}.example"), make_lookup_result("x"));
+        }
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let spawn_saver =
+            |history: LookupHistory, path: PathBuf, barrier: std::sync::Arc<std::sync::Barrier>| {
+                std::thread::spawn(move || {
+                    for _ in 0..50 {
+                        barrier.wait();
+                        history.save_to_path(&path).expect("concurrent save failed");
+                    }
+                })
+            };
+        let ta = spawn_saver(a, path.clone(), barrier.clone());
+        let tb = spawn_saver(b, path.clone(), barrier);
+        ta.join().expect("thread A panicked");
+        tb.join().expect("thread B panicked");
+
+        // Whichever writer won the last rename, the file must be complete.
+        let content = std::fs::read_to_string(&path).expect("saved file exists");
+        serde_json::from_str::<LookupHistory>(&content)
+            .expect("concurrently saved history must parse (no torn rename)");
 
         if let Some(parent) = path.parent() {
             let _ = std::fs::remove_dir_all(parent);

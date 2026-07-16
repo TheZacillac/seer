@@ -10,13 +10,16 @@ version = "0.43.1"
 description = "Domain name helper - WHOIS, RDAP, DIG, and propagation checking"
 readme = "README.md"
 license = { text = "MIT" }
-requires-python = ">=3.9"
+# Floor is 3.10: seer-api (and its mcp SDK dependency) requires >=3.10, so
+# advertising 3.9 here would fail at pip resolution time. The pyo3
+# abi3-py39 feature flag below stays — abi3 wheels built for 3.9 remain
+# forward-compatible with every newer CPython.
+requires-python = ">=3.10"
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",

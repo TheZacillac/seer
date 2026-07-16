@@ -107,6 +107,11 @@ fn seer_err_to_py(e: &SeerError) -> PyErr {
         // instead of catching the broad `RuntimeError` umbrella.
         Timeout(_) => PyTimeoutError::new_err(e.sanitized_message()),
         WhoisConnectionFailed { .. } => PyConnectionError::new_err(e.sanitized_message()),
+        // RetryExhausted wraps the retry framework's final failure; classify
+        // by the inner error so a retried timeout still surfaces as
+        // TimeoutError (which seer-api maps to 504/502) rather than a generic
+        // RuntimeError. Recursion also unwraps layered retry wrappers.
+        RetryExhausted { last_error, .. } => seer_err_to_py(last_error),
         _ => PyRuntimeError::new_err(e.sanitized_message()),
     }
 }
@@ -1058,6 +1063,36 @@ fn _json_to_python_nested_for_test<'py>(
     json_to_python(py, &v)
 }
 
+/// Test hook: build a `RetryExhausted`-wrapped `SeerError` of the given
+/// `kind` and raise it through [`seer_err_to_py`], so the Python suite can
+/// pin the exception-type mapping without a live network failure.
+///
+/// A `#[pyfunction]` rather than a Rust unit test for the same reason as
+/// [`_json_to_python_nested_for_test`]: `seer-py` is a `cdylib` crate and
+/// cannot link libpython from a test binary.
+#[pyfunction]
+fn _raise_retry_exhausted_for_test(kind: &str) -> PyResult<()> {
+    let inner = match kind {
+        "timeout" => SeerError::Timeout("operation timed out".to_string()),
+        "connection" => SeerError::WhoisConnectionFailed("connection refused".to_string()),
+        "rate_limited" => SeerError::RateLimited("throttled".to_string()),
+        // Doubly wrapped: layered retries must still unwrap to the leaf type.
+        "nested_timeout" => SeerError::RetryExhausted {
+            attempts: 2,
+            last_error: Box::new(SeerError::Timeout("operation timed out".to_string())),
+        },
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "unknown test error kind: {other}"
+            )))
+        }
+    };
+    Err(seer_err_to_py(&SeerError::RetryExhausted {
+        attempts: 3,
+        last_error: Box::new(inner),
+    }))
+}
+
 /// Install a tracing subscriber that forwards Rust log events into Python's
 /// ``logging`` module.  Safe to call multiple times — only the first call
 /// takes effect.
@@ -1070,6 +1105,7 @@ fn init_rust_logging() {
 fn _seer(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(init_rust_logging, m)?)?;
     m.add_function(wrap_pyfunction!(_json_to_python_nested_for_test, m)?)?;
+    m.add_function(wrap_pyfunction!(_raise_retry_exhausted_for_test, m)?)?;
     m.add_function(wrap_pyfunction!(validate_public_host, m)?)?;
     m.add_function(wrap_pyfunction!(lookup, m)?)?;
     m.add_function(wrap_pyfunction!(whois, m)?)?;
