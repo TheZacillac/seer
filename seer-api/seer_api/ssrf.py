@@ -43,7 +43,7 @@ def guard(host: str, port: int = 443) -> None:
     try:
         seer.validate_public_host(host, port)
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 async def guard_async(host: str, port: int = 443) -> None:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import re
 import time
@@ -11,7 +12,6 @@ from collections import defaultdict
 from fastapi import Request, Response
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.types import ASGIApp, Receive, Scope, Send
-
 
 # Default 64KB body cap — big enough for a bulk request of 100 domains
 # (each bounded at 253 chars) with a bit of headroom, small enough to
@@ -101,12 +101,10 @@ class MaxBodySizeMiddleware:
         finally:
             if over_limit and not sent_response:
                 sent_response = True
-                try:
+                # Best-effort: if the ASGI server has already given up,
+                # don't mask the original failure.
+                with contextlib.suppress(Exception):
                     await self._send_too_large(send)
-                except Exception:
-                    # Best-effort: if the ASGI server has already given up,
-                    # don't mask the original failure.
-                    pass
 
     @staticmethod
     async def _send_too_large(send: Send) -> None:

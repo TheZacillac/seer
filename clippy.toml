@@ -1,0 +1,7 @@
+# unwrap_used is denied in production code (workspace lints), but unwrap/
+# unwrap_err are idiomatic in tests: a failed unwrap IS the test failure,
+# with a backtrace pointing at the exact line. This keeps `clippy
+# --all-targets` (CI) signal-rich instead of drowning real warnings in
+# hundreds of test-code unwraps.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true

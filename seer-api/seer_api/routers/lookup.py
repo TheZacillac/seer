@@ -21,7 +21,9 @@ MAX_CONCURRENCY = 50
 class BulkLookupRequest(BaseModel):
     """Request model for bulk lookup."""
 
-    domains: list[Annotated[str, Field(max_length=253)]] = Field(..., min_length=1, max_length=MAX_BULK_DOMAINS)
+    domains: list[Annotated[str, Field(max_length=253)]] = Field(
+        ..., min_length=1, max_length=MAX_BULK_DOMAINS
+    )
     concurrency: int = Field(default=10, ge=1, le=MAX_CONCURRENCY)
 
 
@@ -43,7 +45,7 @@ async def smart_lookup(
     try:
         return await run_seer(seer.lookup, domain)
     except Exception as e:
-        raise http_error(e, "Lookup failed")
+        raise http_error(e, "Lookup failed") from e
 
 
 @router.post("/bulk")
@@ -61,7 +63,7 @@ async def bulk_smart_lookup(request: Request, body: BulkLookupRequest):
     try:
         return await run_seer(seer.bulk_lookup, body.domains, body.concurrency)
     except Exception as e:
-        raise http_error(e, "Bulk lookup failed")
+        raise http_error(e, "Bulk lookup failed") from e
 
 
 @router.post("/bulk/stream")
@@ -75,4 +77,4 @@ async def bulk_smart_lookup_stream(request: Request, body: BulkLookupRequest):
     try:
         return await stream_bulk(seer.bulk_lookup, body.domains, body.concurrency)
     except Exception as e:
-        raise http_error(e, "Bulk lookup stream failed")
+        raise http_error(e, "Bulk lookup stream failed") from e

@@ -209,9 +209,18 @@ mod tests {
         HumanFormatter::new().without_colors()
     }
 
+    /// Inconsistency fixture row: (type, server name, server ip, values, consensus).
+    type InconsistencyRow<'a> = (
+        crate::dns::RecordType,
+        &'a str,
+        &'a str,
+        Vec<&'a str>,
+        Vec<&'a str>,
+    );
+
     fn propagation_fixture(
         consensus: Vec<(crate::dns::RecordType, &str)>,
-        inconsistencies: Vec<(crate::dns::RecordType, &str, &str, Vec<&str>, Vec<&str>)>,
+        inconsistencies: Vec<InconsistencyRow<'_>>,
     ) -> PropagationResult {
         PropagationResult {
             domain: "example.com".to_string(),

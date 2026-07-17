@@ -340,7 +340,7 @@ mod tests {
         let differ = DomainDiffer::new();
         // Construct but never await — keeps the test hermetic (no network).
         let fut = differ.diff("example.com", "example.org");
-        let size = std::mem::size_of_val(&fut);
+        let size = size_of_val(&fut);
         assert!(
             size < 8_192,
             "diff() future is {size} bytes; the four joined lookup/status \

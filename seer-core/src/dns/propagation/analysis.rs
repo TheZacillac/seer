@@ -317,9 +317,10 @@ mod tests {
         (sr, (server_ip, vantage))
     }
 
-    fn assemble(
-        entries: Vec<(ServerResult, (String, HashMap<String, Vec<String>>))>,
-    ) -> (Vec<ServerResult>, PerVantage) {
+    /// One `assemble` input row: a server result with its (ip, vantage map).
+    type EntryRow = (ServerResult, (String, HashMap<String, Vec<String>>));
+
+    fn assemble(entries: Vec<EntryRow>) -> (Vec<ServerResult>, PerVantage) {
         let mut results = Vec::new();
         let mut per_vantage = HashMap::new();
         for (sr, (ip, m)) in entries {

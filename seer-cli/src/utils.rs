@@ -1269,7 +1269,7 @@ mod tests {
                     domain: "example.com".to_string(),
                 },
                 success: true,
-                data: Some(seer_core::bulk::BulkResultData::Info(info)),
+                data: Some(BulkResultData::Info(info)),
                 error: None,
                 duration_ms: 5,
             },

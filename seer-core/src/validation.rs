@@ -296,7 +296,7 @@ mod tests {
 
     #[test]
     fn allowlist_matches_idn_after_normalization() {
-        let mut set = std::collections::HashSet::new();
+        let mut set = HashSet::new();
         set.insert(normalize_allowlist_entry("münchen.de"));
         // `normalize_domain("münchen.de")` yields the A-label below.
         assert!(domain_matches_allowlist("xn--mnchen-3ya.de", &set));

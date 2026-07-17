@@ -23,7 +23,9 @@ MAX_CONCURRENCY = 50
 class BulkStatusRequest(BaseModel):
     """Request model for bulk status check."""
 
-    domains: list[Annotated[str, Field(max_length=253)]] = Field(..., min_length=1, max_length=MAX_BULK_DOMAINS)
+    domains: list[Annotated[str, Field(max_length=253)]] = Field(
+        ..., min_length=1, max_length=MAX_BULK_DOMAINS
+    )
     concurrency: int = Field(default=10, ge=1, le=MAX_CONCURRENCY)
 
 
@@ -52,7 +54,7 @@ async def check_status(
     try:
         return await run_seer(seer.status, domain)
     except Exception as e:
-        raise http_error(e, "Status check failed")
+        raise http_error(e, "Status check failed") from e
 
 
 @router.post("/bulk")
@@ -71,7 +73,7 @@ async def bulk_status(request: Request, body: BulkStatusRequest):
     try:
         return await run_seer(seer.bulk_status, body.domains, body.concurrency)
     except Exception as e:
-        raise http_error(e, "Bulk status check failed")
+        raise http_error(e, "Bulk status check failed") from e
 
 
 @router.post("/bulk/stream")
@@ -82,4 +84,4 @@ async def bulk_status_stream(request: Request, body: BulkStatusRequest):
     try:
         return await stream_bulk(seer.bulk_status, body.domains, body.concurrency)
     except Exception as e:
-        raise http_error(e, "Bulk status stream failed")
+        raise http_error(e, "Bulk status stream failed") from e

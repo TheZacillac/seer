@@ -233,8 +233,10 @@ mod tests {
         // first frame for the whole run while every other loading indicator
         // in the TUI animates via app.spin (2026-07-11 review).
         let theme = Theme::frappe();
-        let mut follow = FollowState::default();
-        follow.running = true;
+        let follow = FollowState {
+            running: true,
+            ..Default::default()
+        };
 
         let backend = TestBackend::new(80, 20);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -243,7 +245,7 @@ mod tests {
             .unwrap();
         let text = buf_text(&terminal);
         assert!(
-            text.contains(crate::tui::app::SPIN[3]),
+            text.contains(SPIN[3]),
             "spinner should render the current animation frame"
         );
     }

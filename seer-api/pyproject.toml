@@ -46,7 +46,7 @@ packages = ["seer_api"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py39"
+target-version = "py310"
 
 [tool.ruff.lint]
 select = [
@@ -58,6 +58,9 @@ select = [
     "B",    # flake8-bugbear
     "SIM",  # flake8-simplify
     "RUF",  # ruff-specific
+]
+ignore = [
+    "RUF002",  # docstrings deliberately use typographic characters ("x" would misread "progress × N")
 ]
 
 [tool.ruff.lint.isort]

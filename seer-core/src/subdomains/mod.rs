@@ -206,7 +206,7 @@ mod tests {
 
     #[test]
     fn test_subdomain_enumerator_default() {
-        let _ = SubdomainEnumerator::default();
+        let _ = SubdomainEnumerator;
     }
 
     #[test]

@@ -47,7 +47,7 @@ async def availability(request: Request, domain: _Domain):
     try:
         return await run_seer(seer.availability, domain)
     except Exception as e:
-        raise http_error(e, "Availability check failed")
+        raise http_error(e, "Availability check failed") from e
 
 
 @availability_router.post("/bulk")
@@ -57,7 +57,7 @@ async def bulk_availability(request: Request, body: _BulkRequest):
     try:
         return await run_seer(seer.bulk_availability, body.domains, body.concurrency)
     except Exception as e:
-        raise http_error(e, "Bulk availability check failed")
+        raise http_error(e, "Bulk availability check failed") from e
 
 
 # --- info ----------------------------------------------------------------
@@ -72,7 +72,7 @@ async def info(request: Request, domain: _Domain):
     try:
         return await run_seer(seer.info, domain)
     except Exception as e:
-        raise http_error(e, "Info lookup failed")
+        raise http_error(e, "Info lookup failed") from e
 
 
 @info_router.post("/bulk")
@@ -82,7 +82,7 @@ async def bulk_info(request: Request, body: _BulkRequest):
     try:
         return await run_seer(seer.bulk_info, body.domains, body.concurrency)
     except Exception as e:
-        raise http_error(e, "Bulk info lookup failed")
+        raise http_error(e, "Bulk info lookup failed") from e
 
 
 # --- subdomains ----------------------------------------------------------
@@ -111,7 +111,7 @@ async def subdomains(
             return await run_seer(seer.subdomains_classify, domain, concurrency)
         return await run_seer(seer.subdomains, domain)
     except Exception as e:
-        raise http_error(e, "Subdomain enumeration failed")
+        raise http_error(e, "Subdomain enumeration failed") from e
 
 
 # --- dnssec --------------------------------------------------------------
@@ -126,7 +126,7 @@ async def dnssec(request: Request, domain: _Domain):
     try:
         return await run_seer(seer.dnssec, domain)
     except Exception as e:
-        raise http_error(e, "DNSSEC check failed")
+        raise http_error(e, "DNSSEC check failed") from e
 
 
 # --- diff ----------------------------------------------------------------
@@ -145,7 +145,7 @@ async def diff(
     try:
         return await run_seer(seer.diff, domain_a, domain_b)
     except Exception as e:
-        raise http_error(e, "Domain diff failed")
+        raise http_error(e, "Domain diff failed") from e
 
 
 # --- caa -----------------------------------------------------------------
@@ -161,7 +161,7 @@ async def caa(request: Request, domain: _Domain):
     try:
         return await run_seer(seer.caa, domain)
     except Exception as e:
-        raise http_error(e, "CAA lookup failed")
+        raise http_error(e, "CAA lookup failed") from e
 
 
 # --- posture -------------------------------------------------------------
@@ -176,7 +176,7 @@ async def posture(request: Request, domain: _Domain):
     try:
         return await run_seer(seer.posture, domain)
     except Exception as e:
-        raise http_error(e, "Posture check failed")
+        raise http_error(e, "Posture check failed") from e
 
 
 # --- confusables ---------------------------------------------------------
@@ -195,4 +195,4 @@ async def confusables(
     try:
         return await run_seer(seer.confusables, domain, concurrency)
     except Exception as e:
-        raise http_error(e, "Confusables scan failed")
+        raise http_error(e, "Confusables scan failed") from e

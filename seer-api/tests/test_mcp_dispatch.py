@@ -12,7 +12,6 @@ import asyncio
 import threading
 
 import seer
-
 from seer_api.mcp.server import execute_tool
 
 

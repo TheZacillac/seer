@@ -29,7 +29,7 @@ async def rdap_domain_lookup(
     try:
         return await run_seer(seer.rdap_domain, domain)
     except Exception as e:
-        raise http_error(e, "RDAP domain lookup failed")
+        raise http_error(e, "RDAP domain lookup failed") from e
 
 
 @router.get("/ip/{ip}")
@@ -51,7 +51,7 @@ async def rdap_ip_lookup(
     try:
         return await run_seer(seer.rdap_ip, ip)
     except Exception as e:
-        raise http_error(e, "RDAP IP lookup failed")
+        raise http_error(e, "RDAP IP lookup failed") from e
 
 
 @router.get("/asn/{asn}")
@@ -72,4 +72,4 @@ async def rdap_asn_lookup(
     try:
         return await run_seer(seer.rdap_asn, asn)
     except Exception as e:
-        raise http_error(e, "RDAP ASN lookup failed")
+        raise http_error(e, "RDAP ASN lookup failed") from e

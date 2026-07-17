@@ -417,7 +417,7 @@ mod tests {
         // Mirror of the human-formatter regression: the PR #101
         // registrar-detail + derived-lifecycle fields must be visible in
         // `--format markdown`, not just JSON/YAML (2026-07-11 review).
-        let whois = crate::whois::WhoisResponse::parse(
+        let whois = WhoisResponse::parse(
             "example.com",
             "whois.test",
             "Registrar: Example Registrar\n\

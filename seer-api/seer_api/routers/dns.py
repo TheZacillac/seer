@@ -1,6 +1,6 @@
 """DNS API endpoints."""
 
-from typing import Annotated, Optional
+from typing import Annotated
 
 from fastapi import APIRouter, Path, Query, Request
 from pydantic import BaseModel, Field
@@ -22,7 +22,9 @@ MAX_CONCURRENCY = 50
 class BulkDnsRequest(BaseModel):
     """Request model for bulk DNS lookup."""
 
-    domains: list[Annotated[str, Field(max_length=253)]] = Field(..., min_length=1, max_length=MAX_BULK_DOMAINS)
+    domains: list[Annotated[str, Field(max_length=253)]] = Field(
+        ..., min_length=1, max_length=MAX_BULK_DOMAINS
+    )
     record_type: str = Field("A", max_length=10, pattern=r"^[A-Z0-9]+$")
     concurrency: int = Field(default=10, ge=1, le=MAX_CONCURRENCY)
 
@@ -45,7 +47,7 @@ async def dns_compare(
     try:
         return await run_seer(seer.dns_compare, domain, record_type, server_a, server_b)
     except Exception as e:
-        raise http_error(e, "DNS comparison failed")
+        raise http_error(e, "DNS comparison failed") from e
 
 
 @router.get("/{domain}/{record_type}")
@@ -54,7 +56,7 @@ async def dns_lookup(
     request: Request,
     domain: str = Path(..., min_length=1, max_length=253),
     record_type: str = Path(..., max_length=10, pattern=r"^[A-Z0-9]+$"),
-    nameserver: Optional[str] = Query(None, description="Nameserver to query"),
+    nameserver: str | None = Query(None, description="Nameserver to query"),
 ):
     """
     Query DNS records for a domain.
@@ -74,7 +76,7 @@ async def dns_lookup(
     try:
         return await run_seer(seer.dig, domain, record_type, nameserver)
     except Exception as e:
-        raise http_error(e, "DNS lookup failed")
+        raise http_error(e, "DNS lookup failed") from e
 
 
 @router.post("/bulk")
@@ -92,7 +94,7 @@ async def bulk_dns_lookup(request: Request, body: BulkDnsRequest):
     try:
         return await run_seer(seer.bulk_dig, body.domains, body.record_type, body.concurrency)
     except Exception as e:
-        raise http_error(e, "Bulk DNS lookup failed")
+        raise http_error(e, "Bulk DNS lookup failed") from e
 
 
 @router.post("/bulk/stream")
@@ -104,4 +106,4 @@ async def bulk_dns_stream(request: Request, body: BulkDnsRequest):
             seer.bulk_dig, body.domains, body.record_type, body.concurrency
         )
     except Exception as e:
-        raise http_error(e, "Bulk DNS stream failed")
+        raise http_error(e, "Bulk DNS stream failed") from e

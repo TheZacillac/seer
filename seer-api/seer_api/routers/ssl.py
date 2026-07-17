@@ -35,7 +35,7 @@ async def ssl_inspect(
     try:
         return await run_seer(seer.ssl, domain)
     except Exception as e:
-        raise http_error(e, "SSL inspection failed")
+        raise http_error(e, "SSL inspection failed") from e
 
 
 class BulkSslRequest(BaseModel):
@@ -60,7 +60,7 @@ async def bulk_ssl(request: Request, body: BulkSslRequest):
     try:
         return await run_seer(seer.bulk_ssl, body.domains, body.concurrency)
     except Exception as e:
-        raise http_error(e, "Bulk SSL inspection failed")
+        raise http_error(e, "Bulk SSL inspection failed") from e
 
 
 @router.post("/bulk/stream")
@@ -71,4 +71,4 @@ async def bulk_ssl_stream(request: Request, body: BulkSslRequest):
     try:
         return await stream_bulk(seer.bulk_ssl, body.domains, body.concurrency)
     except Exception as e:
-        raise http_error(e, "Bulk SSL stream failed")
+        raise http_error(e, "Bulk SSL stream failed") from e
