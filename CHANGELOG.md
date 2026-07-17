@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.44.0] - 2026-07-17
+
 ### Added
 - **`seer doctor` — environment self-diagnosis** — runs four concurrent
   probes (config file parse, DNS resolution, WHOIS port-43 reachability,
@@ -66,6 +68,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   registration, and this direction can never mislabel a taken domain as free.
 
 ### Fixed
+- **TUI overview availability inversion** — the overview lens rendered every
+  availability-path result as bold green AVAILABLE, including registered
+  domains proven by DNS delegation and inconclusive results. It now renders
+  the graded verdict exactly like the CLI formatter: AVAILABLE, MAY BE
+  AVAILABLE, REGISTERED, LIKELY REGISTERED, or UNKNOWN.
+- Lookup history is keyed by the normalized domain on both read and write,
+  so `seer lookup www.example.com` followed by `seer drift example.com`
+  finds the baseline instead of reporting a false "no baseline".
+- Concurrent saves from one process (reachable via the TUI's background
+  writes) can no longer corrupt the history or watchlist files — atomic-save
+  temp names are now unique per call, not per process.
+- More TUI staleness fixes: switching domains drops in-flight results for
+  every lens (not just the current one); Enter in a `/`-filtered history
+  list pivots to the row actually selected; the RDAP IP/ASN tab no longer
+  renders the previous tab's late result; and the SSL lens now shows
+  certificate warnings and hostname verification.
+- The markdown formatter now renders SSL certificate warnings (previously
+  human-output-only, so `--format markdown` silently dropped them).
+- An invalid DNS record type now errors with the list of valid types instead
+  of silently querying A records (bulk dig/propagation on the CLI; dig,
+  propagation, compare, and bulk in the REPL).
+- A malformed `~/.seer/config.toml` now warns visibly on stderr (once) while
+  still falling back to defaults — `seer config` previously displayed the
+  defaults as though they had come from the file.
+- MCP tool failures now set `isError` and carry the untrusted-content
+  preamble; retried WHOIS timeouts surface as `TimeoutError` through the
+  Python bindings again, restoring the REST API's 504/502 error mapping.
+- Python packaging floor corrected to `requires-python >=3.10` (the mcp SDK
+  already requires 3.10, so an advertised 3.9 install failed at pip
+  resolution).
 - Grace-period error messages no longer say the other protocol "won" when it
   merely finished first: truncation only happens behind a data-bearing
   answer, and the message now reads "… after RDAP answered" / "… after WHOIS
@@ -633,7 +665,8 @@ Two notable breaking changes landed in this period (see `CLAUDE.md` for details)
   `inconsistencies` became typed (`ConsensusValue` / `Inconsistency`) instead of
   pre-formatted strings.
 
-[Unreleased]: https://github.com/TheZacillac/seer/compare/v0.43.1...HEAD
+[Unreleased]: https://github.com/TheZacillac/seer/compare/v0.44.0...HEAD
+[0.44.0]: https://github.com/TheZacillac/seer/compare/v0.43.1...v0.44.0
 [0.43.1]: https://github.com/TheZacillac/seer/compare/v0.43.0...v0.43.1
 [0.43.0]: https://github.com/TheZacillac/seer/compare/v0.42.0...v0.43.0
 [0.42.0]: https://github.com/TheZacillac/seer/compare/v0.41.0...v0.42.0
