@@ -22,6 +22,16 @@ def _reset_limiter(monkeypatch):
     monkeypatch.setattr(server, "_tool_rate_limiter", None)
 
 
+def _text(out) -> str:
+    """Text body from either call_tool result shape.
+
+    Success is a content list (the SDK stamps isError=False); failures are a
+    CallToolResult with isError=True.
+    """
+    content = out.content if hasattr(out, "content") else out
+    return content[0].text
+
+
 def test_bulk_ssl_is_limited_to_five_per_minute(monkeypatch):
     _reset_limiter(monkeypatch)
     calls = {"n": 0}
@@ -39,9 +49,10 @@ def test_bulk_ssl_is_limited_to_five_per_minute(monkeypatch):
     args = {"domains": ["example.com"]}
     for _ in range(5):
         out = asyncio.run(server.call_tool("seer_bulk_ssl", args))
-        assert "rate limit" not in out[0].text.lower(), out[0].text
+        assert "rate limit" not in _text(out).lower(), _text(out)
     out = asyncio.run(server.call_tool("seer_bulk_ssl", args))
-    assert "rate limit" in out[0].text.lower(), out[0].text
+    assert out.isError is True
+    assert "rate limit" in _text(out).lower(), _text(out)
     assert calls["n"] == 5, "the over-limit call must not reach the binding"
 
 
@@ -58,9 +69,10 @@ def test_confusables_is_limited_to_five_per_minute(monkeypatch):
     args = {"domain": "example.com"}
     for _ in range(5):
         out = asyncio.run(server.call_tool("seer_confusables", args))
-        assert "rate limit" not in out[0].text.lower(), out[0].text
+        assert "rate limit" not in _text(out).lower(), _text(out)
     out = asyncio.run(server.call_tool("seer_confusables", args))
-    assert "rate limit" in out[0].text.lower(), out[0].text
+    assert out.isError is True
+    assert "rate limit" in _text(out).lower(), _text(out)
     assert calls["n"] == 5
 
 
@@ -76,4 +88,4 @@ def test_unlimited_tools_are_not_throttled_per_tool(monkeypatch):
     # (SEER_RATE_LIMIT) is the only throttle. 12 calls must all pass.
     for _ in range(12):
         out = asyncio.run(server.call_tool("seer_lookup", {"domain": "example.com"}))
-        assert "rate limit" not in out[0].text.lower(), out[0].text
+        assert "rate limit" not in _text(out).lower(), _text(out)

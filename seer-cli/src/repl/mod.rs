@@ -603,8 +603,12 @@ impl Repl {
         for arg in &args[1..] {
             if let Some(ns) = arg.strip_prefix('@') {
                 nameserver = Some(ns);
-            } else if let Ok(rt) = arg.parse() {
-                record_type = rt;
+            } else {
+                // A typo'd type must error, not silently query A records.
+                match crate::try_parse_record_type(arg) {
+                    Ok(rt) => record_type = rt,
+                    Err(e) => return CommandResult::Error(e),
+                }
             }
         }
 
@@ -638,10 +642,14 @@ impl Repl {
         }
 
         let domain = args[0];
-        let record_type: seer_core::RecordType = args
-            .get(1)
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(seer_core::RecordType::A);
+        // A typo'd type must error, not silently check A-record propagation.
+        let record_type = match args.get(1) {
+            Some(arg) => match crate::try_parse_record_type(arg) {
+                Ok(rt) => rt,
+                Err(e) => return CommandResult::Error(e),
+            },
+            None => seer_core::RecordType::A,
+        };
 
         let spinner = Spinner::new(&format!(
             "Checking {} {} propagation across DNS servers",
@@ -1038,8 +1046,12 @@ impl Repl {
         for arg in &args[1..] {
             if let Some(ns) = arg.strip_prefix('@') {
                 servers.push(ns);
-            } else if let Ok(rt) = arg.parse() {
-                record_type = rt;
+            } else {
+                // A typo'd type must error, not silently compare A records.
+                match crate::try_parse_record_type(arg) {
+                    Ok(rt) => record_type = rt,
+                    Err(e) => return CommandResult::Error(e),
+                }
             }
         }
 
@@ -1572,5 +1584,47 @@ mod copy_tests {
             matches!(repl.last_result, Some(crate::payload::Payload::Tld(_))),
             "tld should store a copyable payload"
         );
+    }
+}
+
+// A typo'd record type previously fell back to A silently, so `dig example.com
+// MXX` returned A answers while the user believed they queried MX. Validation
+// now rejects the input before any network I/O, keeping these tests hermetic.
+#[cfg(test)]
+mod record_type_tests {
+    use super::*;
+
+    fn assert_rejects(result: &CommandResult) {
+        let CommandResult::Error(msg) = result else {
+            panic!("expected error for invalid record type, got {result:?}");
+        };
+        assert!(msg.contains("BOGUS"), "error should name the input: {msg}");
+        assert!(
+            msg.contains("MX") && msg.contains("SSHFP"),
+            "error should list valid types: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dig_rejects_invalid_record_type() {
+        let mut repl = Repl::new().expect("repl construction is offline");
+        let result = repl.execute_dig(&["example.com", "BOGUS"]).await;
+        assert_rejects(&result);
+    }
+
+    #[tokio::test]
+    async fn propagation_rejects_invalid_record_type() {
+        let mut repl = Repl::new().expect("repl construction is offline");
+        let result = repl.execute_propagation(&["example.com", "BOGUS"]).await;
+        assert_rejects(&result);
+    }
+
+    #[tokio::test]
+    async fn compare_rejects_invalid_record_type() {
+        let mut repl = Repl::new().expect("repl construction is offline");
+        let result = repl
+            .execute_compare(&["example.com", "BOGUS", "@8.8.8.8", "@1.1.1.1"])
+            .await;
+        assert_rejects(&result);
     }
 }

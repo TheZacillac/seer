@@ -261,6 +261,8 @@ def _real_seer_validator(monkeypatch):
         "/status/169.254.169.254",
         "/status/10.0.0.1",
         "/status/192.168.1.1",
+        # SSL inspection TLS-connects to the target (port 443) → guard it.
+        "/ssl/127.0.0.1",
         # dig's nameserver parameter is the actual connect target.
         "/dns/example.com/A?nameserver=169.254.169.254",
         "/dns/example.com/A?nameserver=127.0.0.1",
@@ -410,17 +412,51 @@ def test_mcp_ssrf_guard_rejects_reserved():
 @pytest.mark.parametrize(
     "tool,args,seer_fn",
     [
+        # Non-connecting tools keep reserved-IP arguments: they must pass the
+        # queried host through to the inner seer call unguarded (regression —
+        # guarding these blocked lookups of parked/DNS-less domains).
         ("seer_lookup", {"domain": "127.0.0.1"}, "lookup"),
         ("seer_whois", {"domain": "127.0.0.1"}, "whois"),
         ("seer_rdap_domain", {"domain": "127.0.0.1"}, "rdap_domain"),
         ("seer_info", {"domain": "127.0.0.1"}, "info"),
         ("seer_propagation", {"domain": "127.0.0.1", "record_type": "A"}, "propagation"),
         ("seer_dig", {"domain": "127.0.0.1", "record_type": "A"}, "dig"),
+        ("seer_rdap_asn", {"asn": 15169}, "rdap_asn"),
+        ("seer_availability", {"domain": "example.com"}, "availability"),
+        ("seer_dnssec", {"domain": "example.com"}, "dnssec"),
+        ("seer_caa", {"domain": "example.com"}, "caa"),
+        ("seer_posture", {"domain": "example.com"}, "posture"),
+        ("seer_subdomains", {"domain": "example.com"}, "subdomains"),
+        (
+            "seer_subdomains",
+            {"domain": "example.com", "resolve": True},
+            "subdomains_classify",
+        ),
+        ("seer_confusables", {"domain": "example.com"}, "confusables"),
+        ("seer_diff", {"domain_a": "example.com", "domain_b": "example.org"}, "diff"),
+        ("seer_bulk_lookup", {"domains": ["example.com"]}, "bulk_lookup"),
+        ("seer_bulk_whois", {"domains": ["example.com"]}, "bulk_whois"),
+        ("seer_bulk_dig", {"domains": ["example.com"]}, "bulk_dig"),
+        ("seer_bulk_propagation", {"domains": ["example.com"]}, "bulk_propagation"),
+        ("seer_bulk_info", {"domains": ["example.com"]}, "bulk_info"),
+        # Connecting tools use public IP literals: the SSRF guard validates
+        # IP literals without a DNS round-trip, keeping the test hermetic
+        # under both the stub and the real compiled binding.
+        ("seer_status", {"domain": "1.1.1.1"}, "status"),
+        ("seer_ssl", {"domain": "1.1.1.1"}, "ssl"),
+        ("seer_rdap_ip", {"ip": "1.1.1.1"}, "rdap_ip"),
+        ("seer_bulk_status", {"domains": ["1.1.1.1"]}, "bulk_status"),
+        ("seer_bulk_ssl", {"domains": ["1.1.1.1"]}, "bulk_ssl"),
+        (
+            "seer_dns_compare",
+            {"domain": "example.com", "server_a": "8.8.8.8", "server_b": "1.1.1.1"},
+            "dns_compare",
+        ),
     ],
 )
-def test_mcp_non_connecting_tools_do_not_reject_at_api_layer(monkeypatch, tool, args, seer_fn):
-    """Regression: MCP tools whose network target is not the queried host
-    must pass reserved/unresolvable targets through to the inner seer call.
+def test_mcp_dispatch_table_reaches_seer_binding(monkeypatch, tool, args, seer_fn):
+    """Every tool arm in execute_tool must dispatch to its seer binding
+    function. Covers all 25 dispatch arms (seer_subdomains has two paths).
     """
     import asyncio
 
@@ -439,15 +475,20 @@ def test_mcp_non_connecting_tools_do_not_reject_at_api_layer(monkeypatch, tool, 
 
 
 def test_mcp_call_tool_returns_invalid_input_for_ssrf():
-    """End-to-end: MCP call_tool dispatch surfaces a ValueError as 'Invalid input'."""
+    """End-to-end: MCP call_tool dispatch surfaces a ValueError as 'Invalid input'
+    with the MCP error flag set and the untrusted-data preamble applied."""
     import asyncio
 
-    from seer_api.mcp.server import call_tool
+    from seer_api.mcp.server import UNTRUSTED_PREAMBLE, call_tool
 
     result = asyncio.run(call_tool("seer_status", {"domain": "127.0.0.1"}))
-    assert len(result) == 1
-    assert result[0].text.startswith("Invalid input:")
-    assert "reserved" in result[0].text.lower()
+    assert result.isError is True
+    assert len(result.content) == 1
+    text = result.content[0].text
+    assert text.startswith(UNTRUSTED_PREAMBLE)
+    body = text[len(UNTRUSTED_PREAMBLE):]
+    assert body.startswith("Invalid input:")
+    assert "reserved" in body.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -459,7 +500,11 @@ def test_mcp_call_tool_returns_invalid_input_for_ssrf():
 
 
 def _run_call_tool_with_error(monkeypatch, exc: Exception) -> str:
-    """Drive call_tool's error handler by making execute_tool raise `exc`."""
+    """Drive call_tool's error handler by making execute_tool raise `exc`.
+
+    Every failure must come back as a CallToolResult with isError=True and
+    the untrusted-data preamble; returns the text after the preamble.
+    """
     import asyncio
 
     from seer_api.mcp import server as mcp_server
@@ -469,8 +514,11 @@ def _run_call_tool_with_error(monkeypatch, exc: Exception) -> str:
 
     monkeypatch.setattr(mcp_server, "execute_tool", _boom)
     result = asyncio.run(mcp_server.call_tool("seer_lookup", {"domain": "x.test"}))
-    assert len(result) == 1
-    return result[0].text
+    assert result.isError is True
+    assert len(result.content) == 1
+    text = result.content[0].text
+    assert text.startswith(mcp_server.UNTRUSTED_PREAMBLE)
+    return text[len(mcp_server.UNTRUSTED_PREAMBLE):]
 
 
 @pytest.mark.parametrize(

@@ -11,7 +11,7 @@ A high-performance, multi-interface domain utility suite — query WHOIS, RDAP, 
 [![Homebrew](https://img.shields.io/badge/dynamic/regex?url=https%3A%2F%2Fraw.githubusercontent.com%2FTheZacillac%2Fhomebrew-tap%2Fmain%2FFormula%2Fseer.rb&search=version%20%22(%5B%5E%22%5D%2B)%22&replace=%241&label=homebrew&logo=homebrew&logoColor=white&color=fbb040)](https://github.com/TheZacillac/homebrew-tap)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.89%2B-orange.svg)](https://www.rust-lang.org)
-[![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org)
+[![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org)
 
 [Features](#-features) · [Quick Start](#-quick-start) · [CLI Usage](#-cli-usage) · [Python](#-python-library) · [REST API](#-rest-api) · [MCP Server](#-mcp-server)
 
@@ -138,7 +138,7 @@ seer-core = "0.43"
 tokio = { version = "1", features = ["full"] }
 ```
 
-> **Requirements:** Rust 1.89+ · Python 3.9+ (for Python bindings/API)
+> **Requirements:** Rust 1.89+ · Python 3.10+ (for Python bindings/API)
 
 ---
 
@@ -235,7 +235,7 @@ seer reverse 8.8.8.8
 # Discovery
 seer avail example.com
 seer subdomains example.com
-seer subdomains example.com --classify   # Resolve each name: live/dead + takeover risk
+seer subdomains example.com --resolve    # Resolve each name: live/dead + takeover risk
 seer subdomains example.com --record     # Store a CT-log baseline
 seer subdomains example.com --diff       # Exit 1 when new names appear (cron/CI)
 seer tld .com
@@ -280,6 +280,31 @@ seer --format json lookup example.com       # JSON
 seer --format yaml lookup example.com       # YAML
 seer --format markdown lookup example.com   # Markdown table
 ```
+
+### Exit Codes
+
+Every command follows the same contract, so `$?` is safe to gate cron jobs and CI on:
+
+| Code | Meaning |
+|------|---------|
+| `0` | Success (and, for check commands, the check passed) |
+| `1` | Operational error (network, parse, invalid input) — or a check command's negative result |
+| `2` | Usage error (bad flags or arguments) |
+
+Check commands exit `1` on a negative result even when the command itself ran fine:
+
+| Command | Exits `1` when… |
+|---------|-----------------|
+| `seer status` | HTTP status is missing or non-2xx, the SSL cert is invalid or expires within 30 days, or the domain expires within 30 days |
+| `seer avail` | The domain is **not** available (already registered) |
+| `seer dnssec` | The validation chain is anything other than fully `secure` |
+| `seer compare` | The two nameservers return different record sets |
+| `seer drift` | Material drift is found vs. the stored baseline (a first run with no baseline exits `0`) |
+| `seer subdomains --diff` | New names appeared vs. the stored baseline (removals and a missing baseline exit `0`) |
+| `seer watch` | Issues at or above the `--fail-on` threshold: `critical` (default) fails only on critical issues, `warning` fails on warnings too. `add`/`remove`/`list` exit `0` on success |
+| `seer bulk` | **Every** domain in the batch failed — partial failures exit `0`, since per-row status is already in the CSV/JSON output |
+
+All other commands exit `0` on success and `1` on error. With `--format json`, `yaml`, or `markdown`, errors are written to stderr in that format (e.g. `{"error": "..."}`) instead of colored prose.
 
 ### Interactive REPL
 

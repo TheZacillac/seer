@@ -5,6 +5,8 @@ mod nameserver;
 mod propagation;
 mod records;
 mod resolver;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 pub use compare::{DnsComparator, DnsComparison, ServerResult};
 pub use dnssec::{AuthenticationTier, DnskeyInfo, DnssecChecker, DnssecReport, DsInfo, RrsigInfo};

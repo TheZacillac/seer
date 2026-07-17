@@ -89,9 +89,7 @@ pub fn parse_bulk_args(args: &[&str]) -> Result<BulkArgs, String> {
                 i += 2;
             }
             other => {
-                if let Ok(rt) = other.parse() {
-                    record_type = rt;
-                }
+                record_type = crate::try_parse_record_type(other)?;
                 i += 1;
             }
         }
@@ -201,9 +199,10 @@ mod tests {
     fn bulk_parses_record_type_positional() {
         let got = parse_bulk_args(&["dig", "domains.txt", "MX"]).expect("valid");
         assert_eq!(got.record_type, RecordType::MX);
-        // Unparseable type tokens are ignored (matching the CLI's leniency).
-        let got = parse_bulk_args(&["dig", "domains.txt", "NOTATYPE"]).expect("valid");
-        assert_eq!(got.record_type, RecordType::A);
+        // Unparseable type tokens error instead of silently falling back to A.
+        let err = parse_bulk_args(&["dig", "domains.txt", "NOTATYPE"]).expect_err("must error");
+        assert!(err.contains("NOTATYPE"));
+        assert!(err.contains("valid types"));
     }
 
     #[test]

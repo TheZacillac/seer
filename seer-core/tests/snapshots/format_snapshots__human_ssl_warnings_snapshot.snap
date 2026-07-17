@@ -1,0 +1,25 @@
+---
+source: seer-core/tests/format_snapshots.rs
+assertion_line: 530
+expression: human().format_ssl(&fixture_ssl_report_with_warnings())
+---
+
+[1;95mSSL Report: example.com[0m
+[37m───────────────────────[0m
+  [1;96mValid[0m: [1;92myes[0m
+  [1;96mHostname Match[0m: [1;91mno[0m
+  [1;96mDays Until Expiry[0m: [97m180[0m
+  [1;96mWarnings[0m:
+    [1;91m⚠[0m [1;91mRSA key size 1024 is below the 2048-bit minimum[0m
+    [1;91m⚠[0m [1;91mCertificate uses deprecated signature algorithm: SHA1-RSA[0m
+    [1;91m⚠[0m [1;93mCertificate is self-signed (issuer equals subject)[0m
+    [1;91m⚠[0m [1;91mCertificate does not match the requested hostname[0m
+  [1;96mProtocol[0m: [97mTLSv1.3[0m
+  [1;96mSANs[0m: [97mexample.com, www.example.com[0m
+
+  [1;96mCertificate Chain[0m:
+    [0] [97mCN=example.com[0m
+        [1;96mIssuer[0m: [97mCN=example.com[0m
+        [1;96mAlgorithm[0m: [97mSHA1-RSA[0m
+        [1;96mKey[0m: [97mRSA (1024 bits)[0m
+        [1;96mValidity[0m: [97m2025-01-01[0m to [97m2027-01-01[0m

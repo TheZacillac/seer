@@ -74,6 +74,10 @@ def test_call_tool_ssrf_refusal_has_single_prefix(monkeypatch) -> None:
     monkeypatch.setattr(seer, "validate_public_host", _reserved, raising=False)
 
     result = asyncio.run(server.call_tool("seer_rdap_ip", {"ip": "127.0.0.1"}))
-    text = result[0].text
-    assert text == "Invalid input: refusing to connect to reserved address: 127.0.0.1"
+    assert result.isError is True
+    text = result.content[0].text
+    assert text == (
+        server.UNTRUSTED_PREAMBLE
+        + "Invalid input: refusing to connect to reserved address: 127.0.0.1"
+    )
     assert text.count("Invalid input:") == 1

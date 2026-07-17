@@ -29,12 +29,17 @@ def _install_seer_stub() -> None:
     def _unused(*_args, **_kwargs):  # pragma: no cover - never hit in unit tests
         raise RuntimeError("seer stub should not be called in these tests")
 
+    # Keep in sync with the #[pymodule] registrations in seer-py/src/lib.rs.
+    # `validate_public_host` is intentionally NOT stubbed: test_hardening's
+    # autouse `_real_seer_validator` fixture keys off the attribute being
+    # absent to install a Python fallback validator for SSRF tests.
     for name in (
         "lookup",
         "whois",
         "rdap_domain",
         "rdap_ip",
         "rdap_asn",
+        "rdap_auto",
         "dig",
         "propagation",
         "status",
@@ -45,6 +50,19 @@ def _install_seer_stub() -> None:
         "bulk_status",
         "bulk_propagation",
         "bulk_info",
+        "bulk_availability",
+        "availability",
+        "subdomains",
+        "subdomains_classify",
+        "ssl",
+        "dnssec",
+        "caa",
+        "posture",
+        "confusables",
+        "dns_compare",
+        "dns_follow",
+        "cancel_follow",
+        "diff",
     ):
         setattr(stub, name, _unused)
 

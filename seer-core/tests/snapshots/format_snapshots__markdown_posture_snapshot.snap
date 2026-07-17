@@ -1,0 +1,19 @@
+---
+source: seer-core/tests/format_snapshots.rs
+assertion_line: 356
+expression: markdown().format_posture(&fixture_posture())
+---
+## Email posture: example.com
+
+| Mechanism | Verdict | Detail |
+|---|---|---|
+| SPF | Strict | -all |
+| DMARC | Moderate | p=quarantine |
+| MTA-STS | Absent |  |
+| BIMI | Present |  |
+| DANE | Present | 1 TLSA |
+
+### Advisories
+
+- DMARC pct=50 applies the policy to only half of spoofed mail
+- MTA-STS is not configured
