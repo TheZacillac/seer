@@ -15,6 +15,7 @@ pub(super) use crate::status::StatusResponse;
 pub(super) use crate::whois::WhoisResponse;
 pub(super) use colored::Colorize;
 
+mod delegation;
 mod diff;
 mod dns;
 mod domain_info;
@@ -273,6 +274,9 @@ impl OutputFormatter for HumanFormatter {
     }
     fn format_dnssec(&self, report: &crate::dns::DnssecReport) -> String {
         self.format_dnssec(report)
+    }
+    fn format_delegation(&self, report: &crate::dns::DelegationReport) -> String {
+        self.format_delegation(report)
     }
     fn format_tld(&self, info: &crate::tld::TldInfo) -> String {
         self.format_tld(info)

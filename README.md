@@ -45,6 +45,7 @@ A high-performance, multi-interface domain utility suite — query WHOIS, RDAP, 
 - **DNS Monitoring** — track record changes over time
 - **DNS Comparison** — compare records across two nameservers
 - **DNSSEC Validation** — check DNSSEC configuration
+- **NS Delegation Check** — parent delegation vs. zone NS, with lame-server probing
 
 </td>
 </tr>
@@ -58,7 +59,7 @@ A high-performance, multi-interface domain utility suite — query WHOIS, RDAP, 
 - **Email Posture** — SPF, DMARC, and MTA-STS checks
 - **Look-alike Detection** — confusable/homoglyph domains
 - **Registration Drift** — diff live registration vs. a baseline
-- **Domain Watchlist** — monitor expiring certs and registrations
+- **Domain Watchlist** — monitor expiring certs and registrations, with optional webhook alerts
 - **SSRF Protection** — blocks requests to private/reserved IPs
 
 </td>
@@ -70,8 +71,9 @@ A high-performance, multi-interface domain utility suite — query WHOIS, RDAP, 
 - **Field Extraction** — `--quiet --fields` for scriptable output
 - **4 Output Formats** — human, JSON, YAML, markdown
 - **Interactive REPL** — with tab completion and history
+- **Environment Doctor** — one-shot config/DNS/WHOIS/RDAP diagnosis
 - **Semantic Exit Codes** — for CI/CD scripting
-- **Shell Completions** — bash, zsh, fish, PowerShell
+- **Shell Completions** — bash, zsh, fish, PowerShell (plus man pages)
 
 </td>
 </tr>
@@ -170,7 +172,7 @@ tokio = { version = "1", features = ["full"] }
 
 ### Interactive TUI
 
-Launch the full-screen, keyboard-first terminal UI (Catppuccin Frappé):
+Launch the full-screen, keyboard-first terminal UI (Catppuccin Frappé, with a Latte light theme):
 
 ```bash
 seer tui                  # start on the target prompt
@@ -186,7 +188,9 @@ The **lens** sidebar covers every Seer capability, grouped, each pulling live da
 
 **Keys:** `j`/`k` move · `1`–`9` jump to a lens · `Tab` focus nav⇄pane · `[` `]` sub-tabs · `r` raw output (json/yaml/markdown) · `y` copy · `/` look up a domain · `:` command · `?` help · `:q` quit. In-pane: switchers (TLD, nameserver, Compare resolvers, Bulk op) and editable fields (Diff's 2nd domain, Follow interval/count, Bulk file path).
 
-**Commands (`:`):** `lookup`, `whois`, `rdap <domain|ip|AS####>`, `dig`, `ssl`, `status`, `reverse <ip>`, `tld <.tld>`, `compare <domain> <nsA> <nsB>`, `diff <a> <b>`, `set output <human|json|yaml|markdown>`, `copy`, `q`.
+**Commands (`:`):** `lookup`, `whois`, `rdap <domain|ip|AS####>`, `dig`, `ssl`, `status`, `reverse <ip>`, `tld <.tld>`, `compare <domain> <nsA> <nsB>`, `diff <a> <b>`, `set output <human|json|yaml|markdown>`, `theme <frappe|latte>`, `copy`, `q`.
+
+The startup theme comes from `[tui] theme` in `~/.seer/config.toml` (`"frappe"` — the default — or `"latte"`; unknown names fall back to Frappé). Switch live with `:theme latte`.
 
 ### Command Mode
 
@@ -218,6 +222,7 @@ seer follow example.com 10 1 MX --changes-only
 # DNSSEC & DNS comparison
 seer dnssec example.com
 seer compare example.com 8.8.8.8 1.1.1.1 MX   # record type trails; defaults to A
+seer delegation example.com      # Parent delegation vs. zone NS + lame-server probe
 
 # Domain health & SSL
 seer status example.com
@@ -248,6 +253,7 @@ seer watch add example.com
 seer watch list
 seer watch                        # Check all watched domains
 seer watch --fail-on warning      # Exit non-zero at warning severity (default: critical)
+seer watch --webhook https://hooks.example.com/seer   # Also POST the report as JSON
 seer watch remove example.com
 
 # Lookup history
@@ -263,14 +269,20 @@ seer bulk ssl domains.txt
 seer bulk posture domains.txt
 cat domains.txt | seer bulk avail -      # Read the list from stdin
 
+# Environment diagnosis (config, DNS, WHOIS port 43, RDAP bootstrap HTTPS)
+seer doctor
+
 # Scriptable field extraction
 seer --quiet --fields registrar lookup example.com
 seer --quiet --fields certificate.issuer status example.com
 
-# Shell completions
+# Shell completions & man pages
 seer completions bash >> ~/.bashrc
 seer completions zsh >> ~/.zshrc
+seer mangen ./man                 # Write seer.1 + one page per subcommand
 ```
+
+`seer watch --webhook` (or `webhook_url` under `[watch]` in `~/.seer/config.toml` — the flag wins) POSTs the check-all report as JSON. Delivery is best-effort: a failed POST prints a stderr warning and never changes the exit code, and the URL passes the same SSRF guard as every other outbound request.
 
 ### Output Formats
 
@@ -299,6 +311,8 @@ Check commands exit `1` on a negative result even when the command itself ran fi
 | `seer avail` | The domain is **not** available (already registered) |
 | `seer dnssec` | The validation chain is anything other than fully `secure` |
 | `seer compare` | The two nameservers return different record sets |
+| `seer delegation` | The parent's delegation NS set and the zone's own NS RRset are out of sync, or any delegated server answers lamely |
+| `seer doctor` | Any check reports **FAIL**. `WARN` (degraded but usable, e.g. a malformed config file running on defaults) still exits `0` |
 | `seer drift` | Material drift is found vs. the stored baseline (a first run with no baseline exits `0`) |
 | `seer subdomains --diff` | New names appeared vs. the stored baseline (removals and a missing baseline exit `0`) |
 | `seer watch` | Issues at or above the `--fail-on` threshold: `critical` (default) fails only on critical issues, `warning` fails on warnings too. `add`/`remove`/`list` exit `0` on success |
@@ -315,6 +329,8 @@ $ seer
 seer> lookup example.com
 seer> dig github.com MX
 seer> status cloudflare.com
+seer> delegation example.com
+seer> doctor
 seer> set output json
 seer> help
 seer> exit
@@ -341,6 +357,7 @@ rdap  = seer.rdap_asn(15169)
 # DNS
 records     = seer.dig("example.com", record_type="MX")
 propagation = seer.propagation("example.com", record_type="A")
+delegation  = seer.delegation("example.com")     # Parent vs. zone NS + lameness
 
 # Domain health & SSL
 status = seer.status("example.com")
@@ -355,6 +372,8 @@ confusables = seer.confusables("example.com")    # Look-alike domains
 # Availability & info
 available = seer.availability("example.com")
 info      = seer.info("example.com")
+tld       = seer.tld_info(".com")                # WHOIS server, RDAP endpoint, registry
+tlds      = seer.all_tlds()                      # Every TLD seer knows about
 
 # Comparison & enumeration
 diff       = seer.diff("example.com", "google.com")
@@ -453,6 +472,7 @@ seer-api   # Starts on http://127.0.0.1:8000 (loopback-only by default)
 | `/dns/{domain}/{record_type}` | GET | DNS query |
 | `/dns/compare/{domain}` | GET | Compare records across two nameservers |
 | `/dnssec/{domain}` | GET | DNSSEC validation |
+| `/delegation/{domain}` | GET | NS delegation health (parent vs. zone, lameness) |
 | `/propagation/{domain}/{record_type}` | GET | DNS propagation check |
 | `/status/{domain}` | GET | Domain status check |
 | `/ssl/{domain}` | GET | SSL chain inspection |
@@ -462,6 +482,8 @@ seer-api   # Starts on http://127.0.0.1:8000 (loopback-only by default)
 | `/availability/{domain}` | GET | Domain availability |
 | `/subdomains/{domain}` | GET | Subdomain enumeration |
 | `/diff/{domain_a}/{domain_b}` | GET | Side-by-side domain comparison |
+| `/tld/{tld}` | GET | TLD info (WHOIS server, RDAP endpoint, registry) |
+| `/tld/` | GET | Full catalog of known TLDs |
 | `/health` | GET | Health check |
 | `/metrics` | GET | Prometheus metrics (when `SEER_METRICS_ENABLED=true`) |
 
@@ -514,7 +536,7 @@ eval "$(seer generate-key --export)"
 SEER_API_KEY=$KEY SEER_HOST=0.0.0.0 seer-api
 ```
 
-**25 tools available:**
+**28 tools available:**
 
 | Tool | Description | | Tool | Description |
 |------|-------------|---|------|-------------|
@@ -530,7 +552,8 @@ SEER_API_KEY=$KEY SEER_HOST=0.0.0.0 seer-api
 | `seer_status` | Domain status check | | `seer_bulk_dig` | Bulk DNS queries |
 | `seer_ssl` | SSL chain inspection | | `seer_bulk_status` | Bulk status checks |
 | `seer_bulk_propagation` | Bulk propagation checks | | `seer_bulk_info` | Bulk domain info |
-| `seer_bulk_ssl` | Bulk SSL certificate checks | | | |
+| `seer_bulk_ssl` | Bulk SSL certificate checks | | `seer_bulk_availability` | Bulk availability checks |
+| `seer_delegation` | NS delegation health check | | `seer_tld_info` | TLD info (WHOIS/RDAP/registry) |
 
 <details>
 <summary><b>Claude Desktop configuration</b></summary>
@@ -612,8 +635,10 @@ seer config --init
 ```
 
 Settings: default output format, nameserver (UDP, `tls://`, or `https://`),
-per-protocol timeouts, bulk concurrency, and rate-limit delay — all clamped to
-safe ranges. Applies to the CLI and REPL.
+per-protocol timeouts, bulk concurrency, rate-limit delay — all clamped to
+safe ranges — plus a `[watch]` table (`webhook_url` for `seer watch` report
+delivery) and a `[tui]` table (`theme = "frappe"` or `"latte"`). Applies to
+the CLI and REPL; the TUI reads the output format and theme.
 
 ### Timeouts
 
@@ -664,6 +689,7 @@ RUST_LOG=debug cargo test     # With debug logging
 ```bash
 cargo fmt --all -- --check    # Format check
 cargo clippy -- -D warnings   # Lint
+cargo deny check              # Supply-chain policy (advisories, licenses, sources)
 ```
 
 ### Project Structure
@@ -680,7 +706,7 @@ seer/
 │       ├── config.rs         # Configuration management
 │       ├── whois/            # WHOIS client, parser, server mapping
 │       ├── rdap/             # RDAP client with IANA bootstrap
-│       ├── dns/              # Resolver (UDP/DoT/DoH), propagation, DNSSEC, follow
+│       ├── dns/              # Resolver (UDP/DoT/DoH), propagation, DNSSEC, follow, delegation
 │       ├── ssl.rs            # SSL certificate chain inspection
 │       ├── caa.rs            # CAA policy lookup + issuer comparison
 │       ├── posture.rs        # Email security posture (SPF/DMARC/MTA-STS)
@@ -693,6 +719,8 @@ seer/
 │       ├── subdomains/       # CT log enumeration + classification/baselines
 │       ├── tld/              # TLD information
 │       ├── watchlist.rs      # Domain monitoring
+│       ├── webhook.rs        # SSRF-guarded webhook delivery (watch --webhook)
+│       ├── doctor.rs         # Environment self-diagnosis (seer doctor)
 │       ├── history.rs        # Lookup history tracking
 │       ├── domain_info.rs    # Flat domain info structure
 │       ├── cache.rs          # TTL caching (stale-while-revalidate)
@@ -717,7 +745,7 @@ seer/
     └── seer_api/
         ├── main.py           # FastAPI app
         ├── routers/          # API endpoint modules
-        └── mcp/              # MCP server (25 tools)
+        └── mcp/              # MCP server (28 tools)
 ```
 
 ---

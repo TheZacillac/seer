@@ -75,6 +75,26 @@ def test_confusables_is_limited_to_five_per_minute(monkeypatch):
     assert calls["n"] == 5
 
 
+def test_bulk_availability_is_limited_to_ten_per_minute(monkeypatch):
+    _reset_limiter(monkeypatch)
+    calls = {"n": 0}
+
+    def fake_bulk_availability(domains, concurrency):
+        calls["n"] += 1
+        return []
+
+    monkeypatch.setattr(seer, "bulk_availability", fake_bulk_availability, raising=False)
+
+    args = {"domains": ["example.com"]}
+    for _ in range(10):
+        out = asyncio.run(server.call_tool("seer_bulk_availability", args))
+        assert "rate limit" not in _text(out).lower(), _text(out)
+    out = asyncio.run(server.call_tool("seer_bulk_availability", args))
+    assert out.isError is True
+    assert "rate limit" in _text(out).lower(), _text(out)
+    assert calls["n"] == 10, "the over-limit call must not reach the binding"
+
+
 def test_unlimited_tools_are_not_throttled_per_tool(monkeypatch):
     _reset_limiter(monkeypatch)
 

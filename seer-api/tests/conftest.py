@@ -56,6 +56,7 @@ def _install_seer_stub() -> None:
         "subdomains_classify",
         "ssl",
         "dnssec",
+        "delegation",
         "caa",
         "posture",
         "confusables",
@@ -63,6 +64,8 @@ def _install_seer_stub() -> None:
         "dns_follow",
         "cancel_follow",
         "diff",
+        "tld_info",
+        "all_tlds",
     ):
         setattr(stub, name, _unused)
 

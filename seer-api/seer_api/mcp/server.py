@@ -82,6 +82,25 @@ def _error_result(text: str) -> CallToolResult:
 
 _RECORD_TYPE_PATTERN = re.compile(r"[A-Z0-9]{1,10}")
 
+# Plausible TLD token: optional leading dot, then 1-63 ASCII
+# letters/digits/hyphens without a leading or trailing hyphen (covers
+# punycode A-labels like "xn--p1ai"). Never a URL/connect target — this only
+# rejects junk with a clear error instead of an all-null payload. Keep in
+# sync with the copy in seer_api/routers/tld.py (REST returns 400 for the
+# same inputs this rejects).
+_TLD_TOKEN_RE = re.compile(r"^\.?[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$", re.IGNORECASE)
+
+
+def _require_tld(arguments: dict[str, Any]) -> str:
+    """Extract and validate a required TLD argument."""
+    tld = _require_str(arguments, "tld")
+    if not _TLD_TOKEN_RE.fullmatch(tld):
+        raise ValueError(
+            "'tld' must be ASCII letters/digits/hyphens (punycode allowed), "
+            "optionally with a leading dot (e.g., 'com' or '.com')"
+        )
+    return tld
+
 
 def _require_record_type(arguments: dict[str, Any], default: str = "A") -> str:
     """Extract and validate an optional DNS record type argument."""
@@ -542,10 +561,66 @@ async def list_tools() -> list[Tool]:
             inputSchema=_DOMAIN_SCHEMA,
         ),
         Tool(
+            name="seer_bulk_availability",
+            description=(
+                "Check registration availability for multiple domains at once (RDAP-404 + DNS + "
+                "WHOIS signals per domain). Efficient for scanning candidate names."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "domains": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of domain names to check",
+                        "maxItems": MAX_BULK_DOMAINS,
+                    },
+                    "concurrency": {
+                        "type": "integer",
+                        "description": (
+                            f"Number of concurrent requests (default: 10, max: {MAX_CONCURRENCY})"
+                        ),
+                        "default": 10,
+                        "minimum": 1,
+                        "maximum": MAX_CONCURRENCY,
+                    },
+                },
+                "required": ["domains"],
+            },
+        ),
+        Tool(
+            name="seer_tld_info",
+            description=(
+                "Look up information about a top-level domain (TLD): WHOIS server, RDAP "
+                "endpoint, registry URL, and classification (generic, country-code, sponsored, "
+                "or infrastructure)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "tld": {
+                        "type": "string",
+                        "description": "TLD with or without leading dot (e.g., 'com' or '.com')",
+                    },
+                },
+                "required": ["tld"],
+            },
+        ),
+        Tool(
             name="seer_dnssec",
             description=(
                 "DNSSEC validation report for a domain: DS/DNSKEY digest consistency, chain "
                 "validity, and the verification-depth tier."
+            ),
+            inputSchema=_DOMAIN_SCHEMA,
+        ),
+        Tool(
+            name="seer_delegation",
+            description=(
+                "NS delegation health check: compares the parent zone's delegation NS set "
+                "against the zone's own authoritative NS RRset (missing/extra entries, in-sync "
+                "verdict) and probes each delegated nameserver for lameness (refused, timeout, "
+                "non-authoritative, referral, empty answer, NXDOMAIN)."
             ),
             inputSchema=_DOMAIN_SCHEMA,
         ),
@@ -688,6 +763,7 @@ _TOOL_RATE_LIMITS: dict[str, str] = {
     "seer_bulk_whois": "10/minute",
     "seer_bulk_dig": "10/minute",
     "seer_bulk_info": "10/minute",
+    "seer_bulk_availability": "10/minute",
 }
 
 # Built lazily on first limited call (not at import) so a configured storage
@@ -931,9 +1007,22 @@ async def execute_tool(name: str, arguments: dict[str, Any]) -> Any:
             domain = _require_str(arguments, "domain")
             return await run_seer(seer.availability, domain)
 
+        case "seer_bulk_availability":
+            domains = _require_domains(arguments)
+            concurrency = _get_concurrency(arguments, default=10)
+            return await run_seer(seer.bulk_availability, domains, concurrency)
+
+        case "seer_tld_info":
+            tld = _require_tld(arguments)
+            return await run_seer(seer.tld_info, tld)
+
         case "seer_dnssec":
             domain = _require_str(arguments, "domain")
             return await run_seer(seer.dnssec, domain)
+
+        case "seer_delegation":
+            domain = _require_str(arguments, "domain")
+            return await run_seer(seer.delegation, domain)
 
         case "seer_caa":
             domain = _require_str(arguments, "domain")

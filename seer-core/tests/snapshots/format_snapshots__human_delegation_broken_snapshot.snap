@@ -1,0 +1,29 @@
+---
+source: seer-core/tests/format_snapshots.rs
+assertion_line: 591
+expression: human().format_delegation(&fixture_delegation_broken())
+---
+Delegation Report for [1;92mexample.com[0m
+
+  [1;96mParent zone[0m: [97mcom[0m
+  [1;96mParent servers queried[0m: [97ma.gtld-servers.net[0m
+  [1;96mDelegation[0m: [1;91mout of sync[0m
+
+  [1;96mDelegated NS (parent view)[0m:
+    [1;91m✗[0m [97mns-old.example.net[0m
+    [1;92m✓[0m [97mns1.example.com[0m
+  [1;96mZone NS (authoritative view)[0m:
+    [1;92m✓[0m [97mns1.example.com[0m
+    [1;91m✗[0m [97mns2.example.com[0m
+
+  [1;96mListed at parent but missing from zone[0m:
+    [1;91m✗[0m [97mns-old.example.net[0m
+
+  [1;96mListed in zone but missing from parent[0m:
+    [1;91m✗[0m [97mns2.example.com[0m
+
+  [1;96mLame servers[0m:
+    [1;91m✗[0m [97mns-old.example.net[0m — [1;91mrefused the query (REFUSED)[0m
+
+  [1;96mWarnings[0m:
+    [1;93m•[0m skipped parent server b.gtld-servers.net: could not resolve

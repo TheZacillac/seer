@@ -355,6 +355,12 @@ enum Commands {
         /// Severity threshold for a non-zero exit when checking all domains
         #[arg(long, value_enum, default_value_t = FailOn::Critical)]
         fail_on: FailOn,
+        /// POST the check-all report as JSON to this webhook URL (overrides
+        /// the config file's `watch.webhook_url`). Delivery is best-effort:
+        /// a failed POST prints a stderr warning but never changes the
+        /// check's exit code.
+        #[arg(long, value_name = "URL")]
+        webhook: Option<String>,
     },
     /// Show lookup history for a domain
     History {
@@ -391,6 +397,29 @@ enum Commands {
     Confusables {
         /// Domain to generate and score look-alikes for
         domain: String,
+    },
+    /// Diagnose the seer environment (config, DNS, WHOIS, RDAP reachability)
+    ///
+    /// Runs four checks — config file parse, DNS resolution, WHOIS port-43
+    /// reachability, and RDAP bootstrap HTTPS — and reports PASS/WARN/FAIL
+    /// per check. Exits 1 only when a check FAILs; WARN (degraded but
+    /// usable, e.g. a malformed config running on defaults) still exits 0.
+    Doctor,
+    /// Check NS delegation health (parent delegation vs zone NS, lame servers)
+    ///
+    /// Compares the parent zone's delegation NS set against the zone's own
+    /// authoritative NS RRset and probes each delegated server for lameness.
+    /// Check-style command: exits 1 when the sets are out of sync or any
+    /// delegated server answers lamely, 0 when the delegation is healthy.
+    Delegation {
+        /// Domain to check (e.g. example.com)
+        domain: String,
+    },
+    /// Generate man pages for seer and all subcommands into a directory
+    #[command(hide = true)]
+    Mangen {
+        /// Output directory (created if missing)
+        dir: std::path::PathBuf,
     },
     /// Launch the full-screen interactive TUI
     Tui {
@@ -1335,6 +1364,7 @@ async fn execute_command(
             action,
             domain,
             fail_on,
+            webhook,
         } => {
             // Watchlist file I/O is blocking — run it on a blocking thread so it
             // doesn't stall the async runtime (mirrors the History handler).
@@ -1410,6 +1440,22 @@ async fn execute_command(
                         if quiet && handle_quiet_output(&report, &fields) {
                         } else {
                             println!("{}", formatter.format_watch(&report));
+                        }
+                        // Best-effort webhook delivery of the report: the
+                        // --webhook flag overrides the config file's
+                        // watch.webhook_url. A failed POST warns on stderr
+                        // but never alters the check's exit code below.
+                        let webhook_url =
+                            webhook.as_deref().or(config.watch.webhook_url.as_deref());
+                        if let Some(url) = webhook_url {
+                            let client = seer_core::webhook::WebhookClient::from_config(config);
+                            if let Err(e) = client.post_json(url, &report).await {
+                                eprintln!(
+                                    "{} webhook delivery failed: {}",
+                                    "Warning:".ctp_yellow(),
+                                    e
+                                );
+                            }
                         }
                         // Exit 1 when issues at or above the --fail-on
                         // threshold exist (mirrors drift/avail/dnssec).
@@ -1490,12 +1536,125 @@ async fn execute_command(
                 }
             }
         }
+        Commands::Doctor => {
+            let spinner = Arc::new(display::Spinner::new("Running environment diagnostics"));
+            let doctor = seer_core::doctor::Doctor::from_config(config);
+            // Infallible by design: probe failures become Fail checks.
+            let report = doctor.run().await;
+            spinner.finish();
+            if quiet && handle_quiet_output(&report, &fields) {
+            } else {
+                println!("{}", render_doctor_report(&report, output_format));
+            }
+            // Exit contract (see help text): only FAIL is fatal; WARN exits 0.
+            if report.overall == seer_core::doctor::CheckStatus::Fail {
+                std::process::exit(1);
+            }
+        }
+        Commands::Delegation { domain } => {
+            let spinner = Arc::new(display::Spinner::new(&format!(
+                "Checking NS delegation for {}",
+                domain
+            )));
+            let checker = seer_core::dns::DelegationChecker::from_config(config);
+            match checker.check(&domain).await {
+                Ok(report) => {
+                    spinner.finish();
+                    if quiet && handle_quiet_output(&report, &fields) {
+                    } else {
+                        println!("{}", formatter.format_delegation(&report));
+                    }
+                    // Check-style exit: lame servers already veto in_sync,
+                    // but keep the explicit || so the exit contract survives
+                    // if that coupling ever changes in the report type.
+                    if !report.in_sync || !report.lame.is_empty() {
+                        std::process::exit(1);
+                    }
+                }
+                Err(e) => {
+                    spinner.finish();
+                    emit_error(output_format, &e);
+                }
+            }
+        }
+        Commands::Mangen { dir } => {
+            std::fs::create_dir_all(&dir)?;
+            // Renders seer.1 plus one page per (non-hidden) subcommand,
+            // recursively — `mangen` itself is hidden and skipped.
+            clap_mangen::generate_to(Cli::command(), &dir)?;
+            println!(
+                "Man pages written to: {}",
+                dir.display().to_string().ctp_green()
+            );
+        }
         Commands::Tui { domain } => {
             tui::run(domain).await?;
         }
     }
 
     Ok(())
+}
+
+/// Renders a doctor report in the requested output format. Shared with the
+/// REPL `doctor` command so both surfaces present diagnostics identically.
+/// Human output mirrors the summary style of sibling commands (Catppuccin
+/// status colors); markdown is a simple inline table since no
+/// `OutputFormatter` method exists for doctor reports.
+pub(crate) fn render_doctor_report(
+    report: &seer_core::doctor::DoctorReport,
+    format: seer_core::output::OutputFormat,
+) -> String {
+    use colored::Colorize as _;
+    use seer_core::doctor::CheckStatus;
+    use seer_core::output::OutputFormat;
+
+    match format {
+        OutputFormat::Json => serde_json::to_string_pretty(report)
+            .unwrap_or_else(|e| format!("{{\"error\":\"{}\"}}", e)),
+        OutputFormat::Yaml => seer_core::output::YamlFormatter::new().to_yaml_value(report),
+        OutputFormat::Markdown => {
+            let mut out = String::from(
+                "# Doctor Report\n\n| Check | Status | Latency | Detail |\n|---|---|---|---|\n",
+            );
+            for check in &report.checks {
+                let latency = check
+                    .latency_ms
+                    .map(|ms| format!("{}ms", ms))
+                    .unwrap_or_else(|| "—".to_string());
+                // Escape pipes so a probe error message can't break the table.
+                let detail = check.detail.replace('|', "\\|");
+                out.push_str(&format!(
+                    "| {} | {} | {} | {} |\n",
+                    check.name, check.status, latency, detail
+                ));
+            }
+            out.push_str(&format!("\n**Overall:** {}\n", report.overall));
+            out
+        }
+        OutputFormat::Human => {
+            let status_str = |s: CheckStatus| match s {
+                CheckStatus::Pass => "PASS".ctp_green().bold().to_string(),
+                CheckStatus::Warn => "WARN".ctp_yellow().bold().to_string(),
+                CheckStatus::Fail => "FAIL".ctp_red().bold().to_string(),
+            };
+            let mut out = format!("{}\n\n", "Doctor Report".sky().bold());
+            for check in &report.checks {
+                let latency = check
+                    .latency_ms
+                    .map(|ms| format!(" ({}ms)", ms))
+                    .unwrap_or_default();
+                out.push_str(&format!(
+                    "  {} {:<16} {}{}\n",
+                    status_str(check.status),
+                    check.name,
+                    check.detail,
+                    latency
+                ));
+            }
+            out.push_str(&format!("\nOverall: {}", status_str(report.overall)));
+            out
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1535,6 +1694,161 @@ mod compare_cli_tests {
             panic!("expected Compare command");
         };
         assert_eq!(record_type, "MX");
+    }
+}
+
+#[cfg(test)]
+mod feature_suite_cli_tests {
+    use super::{Cli, Commands};
+    use clap::Parser;
+
+    #[test]
+    fn doctor_parses_with_no_args() {
+        let cli = Cli::try_parse_from(["seer", "doctor"]).expect("doctor should parse");
+        assert!(matches!(cli.command, Some(Commands::Doctor)));
+    }
+
+    #[test]
+    fn delegation_requires_a_domain() {
+        assert!(Cli::try_parse_from(["seer", "delegation"]).is_err());
+        let cli = Cli::try_parse_from(["seer", "delegation", "example.com"])
+            .expect("delegation should parse");
+        let Some(Commands::Delegation { domain }) = cli.command else {
+            panic!("expected Delegation command");
+        };
+        assert_eq!(domain, "example.com");
+    }
+
+    #[test]
+    fn watch_webhook_flag_parses_and_defaults_to_none() {
+        let cli = Cli::try_parse_from([
+            "seer",
+            "watch",
+            "--webhook",
+            "https://hooks.example.com/seer",
+        ])
+        .expect("watch --webhook should parse");
+        let Some(Commands::Watch { webhook, .. }) = cli.command else {
+            panic!("expected Watch command");
+        };
+        assert_eq!(webhook.as_deref(), Some("https://hooks.example.com/seer"));
+
+        let cli = Cli::try_parse_from(["seer", "watch"]).expect("bare watch should parse");
+        let Some(Commands::Watch { webhook, .. }) = cli.command else {
+            panic!("expected Watch command");
+        };
+        assert_eq!(webhook, None);
+    }
+
+    #[test]
+    fn mangen_parses_and_is_hidden_from_help() {
+        let cli = Cli::try_parse_from(["seer", "mangen", "/tmp/man"]).expect("mangen parses");
+        let Some(Commands::Mangen { dir }) = cli.command else {
+            panic!("expected Mangen command");
+        };
+        assert_eq!(dir, std::path::PathBuf::from("/tmp/man"));
+
+        // Hidden: the subcommand must not appear in --help output.
+        use clap::CommandFactory;
+        let mut help = Vec::new();
+        Cli::command()
+            .write_long_help(&mut help)
+            .expect("help renders");
+        let help = String::from_utf8(help).expect("utf8 help");
+        assert!(
+            !help.contains("mangen"),
+            "mangen should be hidden from help"
+        );
+    }
+
+    /// Smoke test: mangen generates seer.1 plus per-subcommand pages into a
+    /// fresh directory (hermetic — pure file I/O, no network).
+    #[test]
+    fn mangen_generates_root_and_subcommand_pages() {
+        use clap::CommandFactory;
+        let dir = std::env::temp_dir().join(format!(
+            "seer-mangen-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create tempdir");
+
+        clap_mangen::generate_to(Cli::command(), &dir).expect("man generation succeeds");
+
+        assert!(dir.join("seer.1").is_file(), "root page seer.1 missing");
+        assert!(
+            dir.join("seer-lookup.1").is_file(),
+            "subcommand page seer-lookup.1 missing"
+        );
+        assert!(
+            dir.join("seer-doctor.1").is_file(),
+            "subcommand page seer-doctor.1 missing"
+        );
+        // Hidden subcommands get no page.
+        assert!(
+            !dir.join("seer-mangen.1").exists(),
+            "hidden mangen must not get a man page"
+        );
+
+        std::fs::remove_dir_all(&dir).expect("cleanup tempdir");
+    }
+}
+
+#[cfg(test)]
+mod doctor_render_tests {
+    use super::render_doctor_report;
+    use seer_core::doctor::{CheckStatus, DoctorCheck, DoctorReport};
+    use seer_core::output::OutputFormat;
+
+    fn sample_report() -> DoctorReport {
+        DoctorReport::from_checks(vec![
+            DoctorCheck {
+                name: "config".into(),
+                status: CheckStatus::Pass,
+                detail: "using built-in defaults".into(),
+                latency_ms: None,
+            },
+            DoctorCheck {
+                name: "dns".into(),
+                status: CheckStatus::Fail,
+                detail: "query timed out | resolver unreachable".into(),
+                latency_ms: Some(5000),
+            },
+        ])
+    }
+
+    #[test]
+    fn human_output_lists_checks_and_overall() {
+        let out = render_doctor_report(&sample_report(), OutputFormat::Human);
+        assert!(out.contains("config"));
+        assert!(out.contains("PASS"));
+        assert!(out.contains("FAIL"));
+        assert!(out.contains("5000ms"));
+        assert!(out.contains("Overall:"));
+    }
+
+    #[test]
+    fn json_output_round_trips_through_serde() {
+        let out = render_doctor_report(&sample_report(), OutputFormat::Json);
+        let parsed: DoctorReport = serde_json::from_str(&out).expect("valid JSON report");
+        assert_eq!(parsed.overall, CheckStatus::Fail);
+        assert_eq!(parsed.checks.len(), 2);
+    }
+
+    #[test]
+    fn markdown_output_is_a_table_with_escaped_pipes() {
+        let out = render_doctor_report(&sample_report(), OutputFormat::Markdown);
+        assert!(out.starts_with("# Doctor Report"));
+        assert!(out.contains("| config | PASS |"));
+        // The pipe inside the detail must be escaped so the table stays valid.
+        assert!(out.contains("timed out \\| resolver"));
+        assert!(out.contains("**Overall:** FAIL"));
+    }
+
+    #[test]
+    fn yaml_output_is_non_empty() {
+        let out = render_doctor_report(&sample_report(), OutputFormat::Yaml);
+        assert!(out.contains("overall"));
     }
 }
 

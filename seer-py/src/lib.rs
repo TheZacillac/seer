@@ -12,8 +12,8 @@ use pyo3::Py;
 use seer_core::{
     bulk::{BulkExecutor, BulkOperation},
     dns::{
-        DnsComparator, DnsFollower, DnsResolver, DnssecChecker, FollowConfig, PropagationChecker,
-        RecordType,
+        DelegationChecker, DnsComparator, DnsFollower, DnsResolver, DnssecChecker, FollowConfig,
+        PropagationChecker, RecordType,
     },
     lookup::SmartLookup,
     rdap::RdapClient,
@@ -220,6 +220,11 @@ fn get_ssl_checker() -> &'static SslChecker {
 fn get_dnssec_checker() -> &'static DnssecChecker {
     static INSTANCE: OnceLock<DnssecChecker> = OnceLock::new();
     INSTANCE.get_or_init(DnssecChecker::new)
+}
+
+fn get_delegation_checker() -> &'static DelegationChecker {
+    static INSTANCE: OnceLock<DelegationChecker> = OnceLock::new();
+    INSTANCE.get_or_init(DelegationChecker::new)
 }
 
 fn get_dns_comparator() -> &'static DnsComparator {
@@ -747,6 +752,14 @@ fn dnssec<'py>(py: Python<'py>, domain: String) -> PyResult<Bound<'py, PyAny>> {
 }
 
 #[pyfunction]
+fn delegation<'py>(py: Python<'py>, domain: String) -> PyResult<Bound<'py, PyAny>> {
+    let checker = get_delegation_checker();
+    let response = run_async(py, async move { checker.check(&domain).await })?;
+    let json = serialize_response(&response)?;
+    json_to_python(py, &json)
+}
+
+#[pyfunction]
 fn caa<'py>(py: Python<'py>, domain: String) -> PyResult<Bound<'py, PyAny>> {
     let resolver = get_dns_resolver();
     let normalized = seer_core::normalize_domain(&domain).map_err(|e| seer_err_to_py(&e))?;
@@ -973,6 +986,32 @@ fn bulk_info<'py>(
     json_to_python(py, &json)
 }
 
+/// Look up information about a TLD: WHOIS server, RDAP endpoint, registry
+/// URL, and classification (generic/country-code/sponsored/infrastructure).
+///
+/// Accepts the TLD with or without a leading dot (e.g. "com" or ".com").
+/// The WHOIS server / registry URL / classification come from the embedded
+/// TLD map; the RDAP URL requires the IANA bootstrap data (async network
+/// call, cached 24h) and is `None` when the bootstrap is unavailable.
+#[pyfunction]
+fn tld_info<'py>(py: Python<'py>, tld: String) -> PyResult<Bound<'py, PyAny>> {
+    // `lookup_tld` is infallible: unknown TLDs yield a TldInfo with None
+    // fields rather than an error.
+    let info = run_async_infallible(py, async move { seer_core::lookup_tld(&tld).await })?;
+    let json = serialize_response(&info)?;
+    json_to_python(py, &json)
+}
+
+/// Return the full catalog of TLDs seer knows about (sorted, deduplicated).
+/// Purely embedded data — no network access.
+#[pyfunction]
+fn all_tlds() -> Vec<String> {
+    seer_core::all_tlds()
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
 /// Maximum recursion depth permitted when converting `serde_json::Value`
 /// into a Python object graph.
 ///
@@ -1127,6 +1166,7 @@ fn _seer(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(subdomains, m)?)?;
     m.add_function(wrap_pyfunction!(ssl, m)?)?;
     m.add_function(wrap_pyfunction!(dnssec, m)?)?;
+    m.add_function(wrap_pyfunction!(delegation, m)?)?;
     m.add_function(wrap_pyfunction!(caa, m)?)?;
     m.add_function(wrap_pyfunction!(posture, m)?)?;
     m.add_function(wrap_pyfunction!(confusables, m)?)?;
@@ -1137,5 +1177,7 @@ fn _seer(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(diff, m)?)?;
     m.add_function(wrap_pyfunction!(info, m)?)?;
     m.add_function(wrap_pyfunction!(bulk_info, m)?)?;
+    m.add_function(wrap_pyfunction!(tld_info, m)?)?;
+    m.add_function(wrap_pyfunction!(all_tlds, m)?)?;
     Ok(())
 }

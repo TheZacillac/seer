@@ -12,8 +12,10 @@ Core Rust library containing all business logic for the Seer domain utility suit
 |--------|-------------|
 | [`whois`](src/whois/) | WHOIS protocol client with referral following |
 | [`rdap`](src/rdap/) | RDAP (Registration Data Access Protocol) client |
-| [`dns`](src/dns/) | DNS resolver, propagation checker, and DNS follower |
+| [`dns`](src/dns/) | DNS resolver, propagation checker, DNS follower, and delegation health |
 | [`status`](src/status/) | Domain health checking (HTTP, SSL, expiration) |
+| [`doctor`](src/doctor.rs) | Environment self-diagnosis (config, DNS, WHOIS, RDAP bootstrap) |
+| [`webhook`](src/webhook.rs) | SSRF-guarded JSON webhook delivery for watch notifications |
 | [`bulk`](src/bulk/) | Concurrent bulk operation executor |
 | [`output`](src/output/) | Human and JSON output formatters |
 | [`lookup`](src/lookup.rs) | Smart lookup orchestration (RDAP → WHOIS fallback) |

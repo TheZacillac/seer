@@ -19,7 +19,7 @@
 
 use seer_core::caa::{CaaPolicy, CaaRecord, ISSUANCE_TIME_NOTE};
 use seer_core::confusables::{ConfusableReport, RegisteredLookalike};
-use seer_core::dns::{DnsRecord, RecordData, RecordType};
+use seer_core::dns::{DelegationReport, DnsRecord, LameNs, RecordData, RecordType};
 use seer_core::output::{get_formatter, OutputFormat, OutputFormatter};
 use seer_core::posture::{
     BimiPolicy, DanePolicy, DmarcPolicy, EmailPosture, MtaStsPolicy, PostureVerdict, SpfPolicy,
@@ -538,6 +538,62 @@ fn human_ssl_warnings_snapshot() {
 #[test]
 fn markdown_ssl_snapshot() {
     snap!(markdown().format_ssl(&fixture_ssl_report_with_warnings()));
+}
+
+/// A healthy delegation: parent and zone agree on the NS set, nothing lame.
+fn fixture_delegation_healthy() -> DelegationReport {
+    DelegationReport {
+        domain: "example.com".into(),
+        parent_zone: "com".into(),
+        parent_server_queried: vec!["a.gtld-servers.net".into(), "b.gtld-servers.net".into()],
+        delegated_ns: vec!["ns1.example.com".into(), "ns2.example.com".into()],
+        zone_ns: vec!["ns1.example.com".into(), "ns2.example.com".into()],
+        in_sync: true,
+        missing_from_zone: Vec::new(),
+        missing_from_parent: Vec::new(),
+        lame: Vec::new(),
+        warnings: Vec::new(),
+    }
+}
+
+/// A broken delegation exercising every problem section: a set mismatch in
+/// both directions, a lame (refusing) server, and a warning.
+fn fixture_delegation_broken() -> DelegationReport {
+    DelegationReport {
+        domain: "example.com".into(),
+        parent_zone: "com".into(),
+        parent_server_queried: vec!["a.gtld-servers.net".into()],
+        delegated_ns: vec!["ns-old.example.net".into(), "ns1.example.com".into()],
+        zone_ns: vec!["ns1.example.com".into(), "ns2.example.com".into()],
+        in_sync: false,
+        missing_from_zone: vec!["ns-old.example.net".into()],
+        missing_from_parent: vec!["ns2.example.com".into()],
+        lame: vec![LameNs {
+            host: "ns-old.example.net".into(),
+            reason: "refused the query (REFUSED)".into(),
+        }],
+        warnings: vec!["skipped parent server b.gtld-servers.net: could not resolve".into()],
+    }
+}
+
+#[test]
+fn human_delegation_healthy_snapshot() {
+    snap!(human().format_delegation(&fixture_delegation_healthy()));
+}
+
+#[test]
+fn markdown_delegation_healthy_snapshot() {
+    snap!(markdown().format_delegation(&fixture_delegation_healthy()));
+}
+
+#[test]
+fn human_delegation_broken_snapshot() {
+    snap!(human().format_delegation(&fixture_delegation_broken()));
+}
+
+#[test]
+fn markdown_delegation_broken_snapshot() {
+    snap!(markdown().format_delegation(&fixture_delegation_broken()));
 }
 
 #[test]

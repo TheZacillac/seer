@@ -25,6 +25,7 @@ Example usage:
 """
 
 from seer._seer import (
+    all_tlds,
     availability,
     bulk_availability,
     bulk_dig,
@@ -37,6 +38,7 @@ from seer._seer import (
     caa,
     cancel_follow,
     confusables,
+    delegation,
     diff,
     dig,
     dns_compare,
@@ -54,6 +56,7 @@ from seer._seer import (
     status,
     subdomains,
     subdomains_classify,
+    tld_info,
     validate_public_host,
     whois,
 )
@@ -71,6 +74,7 @@ try:
 except Exception:
     __version__ = "unknown"
 __all__ = [
+    "all_tlds",
     "availability",
     "bulk_availability",
     "bulk_dig",
@@ -83,6 +87,7 @@ __all__ = [
     "caa",
     "cancel_follow",
     "confusables",
+    "delegation",
     "diff",
     "dig",
     "dns_compare",
@@ -101,6 +106,7 @@ __all__ = [
     "status",
     "subdomains",
     "subdomains_classify",
+    "tld_info",
     "validate_public_host",
     "whois",
 ]

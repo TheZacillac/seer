@@ -1,0 +1,15 @@
+---
+source: seer-core/tests/format_snapshots.rs
+assertion_line: 586
+expression: markdown().format_delegation(&fixture_delegation_healthy())
+---
+## Delegation: example.com
+
+- **Parent zone**: `com`
+- **Parent servers queried**: `a.gtld-servers.net`, `b.gtld-servers.net`
+- **In sync**: yes
+
+| Nameserver | Parent | Zone |
+| --- | --- | --- |
+| `ns1.example.com` | yes | yes |
+| `ns2.example.com` | yes | yes |

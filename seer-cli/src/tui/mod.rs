@@ -34,7 +34,6 @@ use ratatui::Terminal;
 use action::{Action, Msg};
 use app::App;
 use seer_core::{LookupHistory, Watchlist};
-use theme::Theme;
 
 use crate::clipboard;
 
@@ -104,11 +103,14 @@ fn install_panic_hook() {
 }
 
 async fn run_loop(terminal: &mut Term, domain: Option<String>) -> Result<()> {
-    let theme = Theme::frappe();
     let mut app = App::new(domain);
-    // Seed session defaults (output format) from ~/.seer/config.toml so the TUI
-    // honors the user's config like the CLI subcommands do.
-    app.apply_config(&seer_core::SeerConfig::load());
+    // Seed session defaults (output format + theme) from ~/.seer/config.toml
+    // so the TUI honors the user's config like the CLI subcommands do.
+    // tui_theme() clamps to a known name (unknown → "frappe"), so the theme
+    // swap cannot fail; App keeps Frappé if it somehow did.
+    let config = seer_core::SeerConfig::load();
+    app.apply_config(&config);
+    app.set_theme_by_name(config.tui_theme());
     // Cancel token for the in-flight live-follow run. Held here (not in the pure
     // App) because it owns I/O: a new run or a stop signals the old background
     // DNS loop so restarts don't stack live tasks.
@@ -124,7 +126,7 @@ async fn run_loop(terminal: &mut Term, domain: Option<String>) -> Result<()> {
         handle_action(action, &tx, &mut follow_cancel, &mut bulk_cancel);
     }
 
-    terminal.draw(|f| render::view(f, &app, &theme))?;
+    terminal.draw(|f| render::view(f, &app, app.theme()))?;
 
     loop {
         let msg = tokio::select! {
@@ -144,7 +146,7 @@ async fn run_loop(terminal: &mut Term, domain: Option<String>) -> Result<()> {
         if app.should_quit {
             break;
         }
-        terminal.draw(|f| render::view(f, &app, &theme))?;
+        terminal.draw(|f| render::view(f, &app, app.theme()))?;
     }
     Ok(())
 }

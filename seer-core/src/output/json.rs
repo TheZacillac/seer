@@ -76,6 +76,10 @@ impl OutputFormatter for JsonFormatter {
         self.to_json(report)
     }
 
+    fn format_delegation(&self, report: &crate::dns::DelegationReport) -> String {
+        self.to_json(report)
+    }
+
     fn format_tld(&self, info: &crate::tld::TldInfo) -> String {
         self.to_json(info)
     }

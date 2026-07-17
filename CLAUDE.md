@@ -89,7 +89,8 @@ seer-core/src/
 ├── lib.rs              # Module exports and re-exports
 ├── error.rs            # Centralized error types (SeerError enum)
 ├── colors.rs           # Catppuccin color palette for terminal output
-├── config.rs           # User config file (~/.seer/config.toml), clamped ranges
+├── config.rs           # User config file (~/.seer/config.toml), clamped ranges; [watch]/[tui] tables
+├── doctor.rs           # `seer doctor` self-diagnosis: 4 concurrent probes (config/DNS/WHOIS-43/RDAP-bootstrap)
 ├── lookup.rs           # Smart lookup (RDAP-first with WHOIS fallback, in-flight coalescing)
 ├── availability.rs     # Domain availability detection (RDAP 404 + DNS + patterns)
 ├── domain_info.rs      # Merged RDAP + WHOIS flat structure
@@ -105,12 +106,13 @@ seer-core/src/
 ├── diff.rs             # Side-by-side domain comparison
 ├── drift.rs            # Registration drift detection vs stored history snapshot
 ├── watchlist.rs        # Cert/registration expiry watchlist
+├── webhook.rs          # SSRF-guarded JSON webhook POST (watch --webhook): pinned addrs, no redirects
 ├── history.rs          # Lookup history
 ├── logging.rs          # tracing setup (+ optional OTel via `otel` feature)
 │
 ├── whois/              # WHOIS: TCP client w/ referral following, parsers/ registry, TLD map
 ├── rdap/               # RDAP: HTTP client, IANA bootstrap (+bootstrap.rs), types
-├── dns/                # DNS: resolver, records, propagation/, compare, follow, DNSSEC
+├── dns/                # DNS: resolver, records, propagation/, compare, follow, DNSSEC, delegation
 ├── status/             # Domain health: HTTP/SSL/expiration/DNS (single-attempt by design)
 ├── tld/                # TLD info (WHOIS server, RDAP endpoint, registry URL)
 ├── bulk/               # Concurrent executor with semaphore rate limiting
@@ -120,12 +122,14 @@ seer-core/src/
 #### Module Responsibilities
 
 - **error.rs**: All error types in one place, uses thiserror
-- **config.rs**: Loads `~/.seer/config.toml` (timeouts, concurrency, output format, nameserver); values clamped to safe ranges; `seer config --init` scaffolds it
+- **config.rs**: Loads `~/.seer/config.toml` (timeouts, concurrency, output format, nameserver, `[watch] webhook_url`, `[tui] theme`); values clamped to safe ranges; `seer config --init` scaffolds it
 - **whois/**: WHOIS protocol, parsing (per-registry `parsers/` registry), referral following (max depth: 3), IANA discovery fallback for unmapped TLDs (24h TTL cache)
 - **rdap/**: RDAP protocol, IANA bootstrap caching (24h TTL, stale-while-revalidate), domain/IP/ASN lookups, multi-candidate base-URL fallback, 429 Retry-After honoring
-- **dns/**: DNS resolution (16 record types), propagation checking (30 servers), compare, follow (live monitor), DNSSEC validation
+- **dns/**: DNS resolution (16 record types), propagation checking (30 servers), compare, follow (live monitor), DNSSEC validation, NS delegation health (delegation.rs: parent NS set vs zone NS RRset + per-server RD=0 lameness probes, SSRF-vetted)
 - **status/**: HTTP status, SSL certificates, domain expiration checking — deliberately single-attempt (see module docs: health probes must not retry-mask flakiness)
 - **lookup.rs**: Smart lookup orchestration (RDAP → WHOIS fallback)
+- **doctor.rs**: `seer doctor` diagnosis — 4 concurrent probes (config parse, DNS resolve, WHOIS port-43, RDAP bootstrap HTTPS), each 5s-bounded; `overall` = worst check (malformed config = Warn since defaults still work; unreachable network = Fail); probe endpoints injectable via `#[cfg(test)]`-only seams
+- **webhook.rs**: SSRF-guarded JSON webhook delivery for `seer watch --webhook` — resolved addresses vetted then pinned on the client (rebinding defense), redirects disabled, single-attempt, 10s timeout, non-2xx surfaces status only (never the body)
 - **bulk/**: Semaphore-based concurrent execution, file parsing
 - **retry.rs**: Shared retry framework — used by WHOIS/RDAP clients; dns/status/ssl intentionally don't (documented at their module level)
 - **net.rs / validation.rs**: SSRF protection — all outbound hosts resolved and checked against reserved/private ranges before connect
@@ -150,7 +154,7 @@ seer-cli/src/
     ├── command.rs      # `:` command-line parser
     ├── event.rs        # normal-mode key → action mapping
     ├── data.rs         # async seer-core dispatch (the only core-coupled module)
-    ├── theme.rs        # Catppuccin Frappé palette → ratatui Color
+    ├── theme.rs        # Catppuccin Frappé + Latte palettes → ratatui Color (Theme::from_name)
     ├── raw.rs          # raw output via seer-core's get_formatter
     ├── clipboard.rs    # OSC52 terminal clipboard copy
     ├── render.rs       # frame rendering (shell + lens dispatch)
@@ -164,6 +168,21 @@ seer-cli/src/
 - Defaults to REPL when no command provided
 - Supports global `--format` flag (human/json/yaml/markdown) — must be placed before the subcommand
 - `seer generate-key` mints a random API key (OsRng, 256-bit, URL-safe base64) for `SEER_API_KEY`
+- `seer doctor` runs `seer_core::doctor` and exits 1 only when `overall` is
+  FAIL (WARN exits 0 — documented in its help). Rendering lives in the shared
+  `pub(crate) render_doctor_report` (main.rs), used by both the CLI and the
+  REPL `doctor` command since no `OutputFormatter` method exists for doctor
+  reports.
+- `seer delegation <domain>` is check-style: exits 1 when `!report.in_sync ||
+  !report.lame.is_empty()`, 0 when healthy. Output goes through
+  `get_formatter(format).format_delegation()`.
+- `seer watch --webhook <URL>` POSTs the check-all `WatchReport` as JSON via
+  `seer_core::webhook::WebhookClient`; the flag overrides the config file's
+  `watch.webhook_url`. Delivery is best-effort: failure prints a stderr
+  warning and never changes the exit code.
+- `seer mangen <DIR>` (hidden via `#[command(hide = true)]`) writes `seer.1`
+  plus one page per visible subcommand with `clap_mangen::generate_to` —
+  hidden commands (mangen itself) get no page.
 - REPL history saved to `~/.seer_history`
 - `seer tui [domain]` launches a full-screen ratatui TUI (additive — the REPL
   and all subcommands are unchanged). Architecture: async `tokio::select!` loop,
@@ -173,7 +192,10 @@ seer-cli/src/
   lenses are wired with live data + full in-pane inputs, including the streaming
   Follow (live monitor) and Bulk (concurrent + CSV export) lenses. A per-lens /
   per-stream generation guard drops stale async results (on domain/tab change or
-  run restart).
+  run restart). Two themes: Catppuccin Frappé (default) and Latte (light) —
+  startup theme from `[tui] theme` in the config (`SeerConfig::tui_theme()`
+  clamps unknown names to "frappe"), switchable live with `:theme <name>`
+  through `App::set_theme_by_name`.
 
 ### seer-py/ (Python Bindings)
 
@@ -205,9 +227,12 @@ seer-api/
     │   ├── rdap.py         # RDAP lookups
     │   ├── dns.py          # DNS queries
     │   ├── propagation.py  # DNS propagation
-    │   └── status.py       # Domain status
+    │   ├── status.py       # Domain status
+    │   ├── ssl.py          # SSL chain inspection
+    │   ├── intel.py        # availability/info/subdomains/dnssec/delegation/diff/caa/posture/confusables routers
+    │   └── tld.py          # TLD info (/tld/{tld}) + full catalog (/tld/)
     └── mcp/
-        └── server.py       # MCP server (25 tools)
+        └── server.py       # MCP server (28 tools)
 ```
 
 **Key Points:**
@@ -1179,9 +1204,13 @@ Before committing:
 5. ✅ Test Python bindings if changed: `cd seer-py && maturin develop`
 6. ✅ Test API if changed: `cd seer-api && pytest`
 
-CI runs check/fmt/clippy/test (3 OSes), a rustsec audit, AND a `python` job
-(maturin-builds seer-py, installs seer-api, runs both pytest suites) — Python
-test failures block merges just like Rust ones.
+CI runs check/fmt/clippy/test (3 OSes), a rustsec audit, a cargo-deny
+supply-chain gate (`deny` job via EmbarkStudios/cargo-deny-action, policy in
+root `deny.toml`: RUSTSEC advisories, explicit license allow-list,
+wildcard-version ban, crates.io-only sources — run locally with
+`cargo deny check`), AND a `python` job (maturin-builds seer-py, installs
+seer-api, runs both pytest suites) — Python test failures block merges just
+like Rust ones.
 
 ### Release Process
 
@@ -1269,9 +1298,13 @@ keys off the distribution name.
 (missing file → defaults). `seer config --init` scaffolds it. Settings:
 default output format, nameserver, per-protocol timeouts, bulk concurrency,
 rate-limit delay — all clamped to safe, per-protocol ranges (concurrency
-1–50; whois/rdap timeouts 1–300s; dns 1–60s; http 1–120s). When adding a
-tunable, prefer wiring it through `SeerConfig` over a new env var or
-hardcoded const.
+1–50; whois/rdap timeouts 1–300s; dns 1–60s; http 1–120s) — plus two tables:
+`[watch]` with `webhook_url` (Option, default None; the `--webhook` CLI flag
+overrides it) and `[tui]` with `theme` (default `"frappe"`; read through
+`SeerConfig::tui_theme()`, which trims/lowercases and clamps anything that
+isn't `"latte"` — including `"frappé"` and unknown names — to `"frappe"`).
+When adding a tunable, prefer wiring it through `SeerConfig` over a new env
+var or hardcoded const.
 
 ### Breaking change (2026-04-20)
 
@@ -1461,4 +1494,4 @@ For issues and questions:
 ---
 
 **Last Updated**: 2026-07-16
-**Document Version**: 1.2.0
+**Document Version**: 1.3.0
