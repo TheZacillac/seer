@@ -682,7 +682,15 @@ mod tests {
             base_doctor(&SeerConfig::default()).with_whois_addr(format!("127.0.0.1:{port}"));
         let check = doctor.check_whois().await;
         assert_eq!(check.status, CheckStatus::Fail);
-        assert!(check.detail.contains("connect"), "got: {}", check.detail);
+        // The failure reason is transport-specific: unix reports the refused
+        // connect immediately, while Windows retries SYNs against a closed
+        // port long enough that the probe deadline fires first. The contract
+        // is the Fail status plus a detail naming the probed address.
+        assert!(
+            check.detail.contains(&format!("127.0.0.1:{port}")),
+            "got: {}",
+            check.detail
+        );
     }
 
     #[tokio::test]
