@@ -47,6 +47,7 @@ pub trait OutputFormatter {
     fn format_follow(&self, result: &crate::dns::FollowResult) -> String;
     fn format_availability(&self, result: &crate::availability::AvailabilityResult) -> String;
     fn format_dnssec(&self, report: &crate::dns::DnssecReport) -> String;
+    fn format_delegation(&self, report: &crate::dns::DelegationReport) -> String;
     fn format_tld(&self, info: &crate::tld::TldInfo) -> String;
     fn format_dns_comparison(&self, comparison: &crate::dns::DnsComparison) -> String;
     fn format_subdomains(&self, result: &crate::subdomains::SubdomainResult) -> String;
@@ -121,6 +122,9 @@ impl OutputFormatter for YamlFormatter {
         self.to_yaml_value(result)
     }
     fn format_dnssec(&self, report: &crate::dns::DnssecReport) -> String {
+        self.to_yaml_value(report)
+    }
+    fn format_delegation(&self, report: &crate::dns::DelegationReport) -> String {
         self.to_yaml_value(report)
     }
     fn format_tld(&self, info: &crate::tld::TldInfo) -> String {

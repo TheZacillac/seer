@@ -436,7 +436,7 @@ fn help_overlay(f: &mut Frame, area: Rect, theme: &Theme) {
         ("r", "raw output ⇄ human view"),
         ("y", "copy current output to clipboard"),
         ("/", "look up a domain"),
-        (":", "command (lookup · dig · ssl · set output · q)"),
+        (":", "command (lookup · dig · ssl · set output · theme · q)"),
         ("?", "this help · Esc closes"),
     ];
     let w = 60u16.min(area.width.saturating_sub(4));
@@ -514,5 +514,23 @@ mod tests {
         assert!(s.contains("seer"), "top-bar brand missing");
         assert!(s.contains("Overview"), "first lens label missing");
         assert!(s.contains("LOOKUP"), "group header missing");
+    }
+
+    /// Draw with the App-owned theme (the call `mod.rs` makes each frame) and
+    /// verify a live `:theme latte` swap actually recolors the frame.
+    #[test]
+    fn live_theme_swap_recolors_the_frame() {
+        let top_bar_bg = |app: &App| {
+            let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+            terminal.draw(|f| view(f, app, app.theme())).unwrap();
+            terminal.backend().buffer()[(0, 0)].bg
+        };
+
+        let mut app = App::new(None);
+        assert_eq!(top_bar_bg(&app), Theme::frappe().mantle);
+
+        assert!(app.set_theme_by_name("latte"));
+        assert_eq!(top_bar_bg(&app), Theme::latte().mantle);
+        assert_ne!(Theme::frappe().mantle, Theme::latte().mantle);
     }
 }

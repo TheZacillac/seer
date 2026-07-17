@@ -15,6 +15,8 @@ const COMMANDS: &[&str] = &[
     "dig",
     "dns",
     "prop",
+    "delegation",
+    "doctor",
     "follow",
     "reverse",
     "avail",
@@ -199,6 +201,9 @@ impl Hinter for SeerCompleter {
             "propagation" | "prop" if words.len() == 1 && line.ends_with(' ') => {
                 Some(" <domain> [type]".to_string())
             }
+            "delegation" if words.len() == 1 && line.ends_with(' ') => {
+                Some(" <domain>".to_string())
+            }
             "bulk" if words.len() == 1 && line.ends_with(' ') => {
                 Some(" <operation> <file.txt>".to_string())
             }
@@ -270,7 +275,15 @@ mod tests {
 
     #[test]
     fn new_commands_are_completable() {
-        for cmd in ["drift", "caa", "posture", "confusables", "copy"] {
+        for cmd in [
+            "drift",
+            "caa",
+            "posture",
+            "confusables",
+            "copy",
+            "delegation",
+            "doctor",
+        ] {
             assert!(COMMANDS.contains(&cmd), "{cmd} should be a known command");
         }
         // The lowercase `caa` command must not displace the CAA record type.

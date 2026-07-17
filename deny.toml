@@ -1,0 +1,47 @@
+# cargo-deny supply-chain policy (config schema v2 — the default since
+# cargo-deny 0.16, so no `version = 2` keys are needed).
+#
+# Run locally with: cargo deny check
+# CI runs this via EmbarkStudios/cargo-deny-action in the `deny` job.
+
+[graph]
+# Lint the full feature surface (including the optional `otel` feature) so a
+# vulnerable or wrongly-licensed dep can't hide behind an off-by-default flag.
+all-features = true
+
+[advisories]
+# v2 defaults: any RUSTSEC vulnerability/unsound/unmaintained advisory is an
+# error unless explicitly ignored here with a justification.
+ignore = [
+    # (none currently)
+]
+
+[licenses]
+# Explicit allow-list built from what the dependency tree actually uses.
+# Adding a dep under a new license means consciously extending this list.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "ISC",
+    "MPL-2.0",              # colored, option-ext (file-level copyleft only)
+    "Unicode-3.0",          # ICU4X crates pulled in by idna/url
+    "Unlicense",
+    "Zlib",
+    "CDLA-Permissive-2.0",  # webpki-roots (Mozilla CA bundle data)
+]
+
+[bans]
+# The tree has known duplicate versions (transitive churn); warn, don't fail.
+multiple-versions = "warn"
+# Wildcard version requirements are never acceptable — they defeat Cargo.lock
+# review and make builds unreproducible.
+wildcards = "deny"
+
+[sources]
+# crates.io only: no git dependencies, no alternate registries.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

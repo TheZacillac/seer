@@ -7,6 +7,7 @@ pub mod config;
 pub mod confusables;
 pub mod diff;
 pub mod dns;
+pub mod doctor;
 pub mod domain_info;
 pub mod drift;
 pub mod error;
@@ -24,6 +25,7 @@ pub mod subdomains;
 pub mod tld;
 pub mod validation;
 pub mod watchlist;
+pub mod webhook;
 pub mod whois;
 
 pub use availability::{AvailabilityChecker, AvailabilityResult};

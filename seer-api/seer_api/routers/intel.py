@@ -129,6 +129,24 @@ async def dnssec(request: Request, domain: _Domain):
         raise http_error(e, "DNSSEC check failed") from e
 
 
+# --- delegation ------------------------------------------------------------
+
+delegation_router = APIRouter()
+
+
+@delegation_router.get("/{domain}")
+# 30/minute (matching /posture, not /dnssec's 60): each check fans out to
+# parent-zone NS queries plus a lameness probe per delegated nameserver.
+@limiter.limit("30/minute")
+async def delegation(request: Request, domain: _Domain):
+    """NS delegation health: parent delegation vs zone NS RRset, plus a
+    lameness probe of each delegated nameserver."""
+    try:
+        return await run_seer(seer.delegation, domain)
+    except Exception as e:
+        raise http_error(e, "Delegation check failed") from e
+
+
 # --- diff ----------------------------------------------------------------
 
 diff_router = APIRouter()

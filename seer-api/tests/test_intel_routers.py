@@ -26,6 +26,7 @@ import seer
         ("/info/example.com", "info", ("example.com",)),
         ("/subdomains/example.com", "subdomains", ("example.com",)),
         ("/dnssec/example.com", "dnssec", ("example.com",)),
+        ("/delegation/example.com", "delegation", ("example.com",)),
         ("/caa/example.com", "caa", ("example.com",)),
         ("/posture/example.com", "posture", ("example.com",)),
         ("/confusables/example.com", "confusables", ("example.com", 10)),
@@ -131,6 +132,32 @@ def test_intel_route_maps_runtime_error_to_500_with_fallback(client, monkeypatch
     detail = resp.json()["detail"]
     assert detail == "CAA lookup failed"
     assert "internal detail" not in detail
+
+
+def test_delegation_maps_value_error_to_400(client, monkeypatch):
+    """seer-core validates the domain before any network I/O; the resulting
+    ValueError (PyValueError from InvalidDomain) must surface as a 400."""
+
+    def _raising(*_args):
+        raise ValueError("Invalid domain: bad_domain")
+
+    monkeypatch.setattr(seer, "delegation", _raising, raising=False)
+    resp = client.get("/delegation/bad_domain")
+    assert resp.status_code == 400
+    assert "Invalid domain" in resp.json()["detail"]
+
+
+def test_delegation_maps_runtime_error_to_500_with_fallback(client, monkeypatch):
+    """DnsError (no responsive parent server) arrives as RuntimeError; the
+    detail must be the fixed fallback, never the internal message."""
+
+    def _raising(*_args):
+        raise RuntimeError("no parent-zone (com) nameserver answered")
+
+    monkeypatch.setattr(seer, "delegation", _raising, raising=False)
+    resp = client.get("/delegation/example.com")
+    assert resp.status_code == 500
+    assert resp.json()["detail"] == "Delegation check failed"
 
 
 # ---------------------------------------------------------------------------

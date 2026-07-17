@@ -2,6 +2,7 @@
 //! interprets. Mirrors the CLI/REPL command surface.
 
 use crate::tui::lenses;
+use crate::tui::theme::Theme;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CmdOutcome {
@@ -11,6 +12,10 @@ pub enum CmdOutcome {
     Copy,
     SetFormat(String),
     BadFormat,
+    /// `theme <name>` with a name `Theme::from_name` accepts.
+    SetTheme(String),
+    /// `theme` with a missing or unknown name.
+    BadTheme,
     /// Switch to a lens (by cmd alias / key), optionally looking up a target.
     Lens {
         lens: String,
@@ -54,6 +59,13 @@ pub fn parse(raw: &str) -> CmdOutcome {
                 return CmdOutcome::BadFormat;
             }
             return CmdOutcome::Unknown(line.to_string());
+        }
+        "theme" => {
+            let val = parts.get(1).map(|s| s.to_lowercase()).unwrap_or_default();
+            if Theme::from_name(&val).is_some() {
+                return CmdOutcome::SetTheme(val);
+            }
+            return CmdOutcome::BadTheme;
         }
         "lookup" | "info" => {
             return match parts.get(1) {
@@ -130,6 +142,18 @@ mod tests {
             CmdOutcome::SetFormat("yaml".into())
         );
         assert_eq!(parse("set output bogus"), CmdOutcome::BadFormat);
+    }
+
+    #[test]
+    fn parses_theme_command() {
+        assert_eq!(parse("theme latte"), CmdOutcome::SetTheme("latte".into()));
+        assert_eq!(parse("theme frappe"), CmdOutcome::SetTheme("frappe".into()));
+        // Args are lowercased before validation, so mixed case parses.
+        assert_eq!(parse("theme LATTE"), CmdOutcome::SetTheme("latte".into()));
+        assert_eq!(parse("theme Frappé"), CmdOutcome::SetTheme("frappé".into()));
+        // Missing or unknown names both surface the standard error.
+        assert_eq!(parse("theme"), CmdOutcome::BadTheme);
+        assert_eq!(parse("theme mocha"), CmdOutcome::BadTheme);
     }
 
     #[test]

@@ -1,0 +1,24 @@
+---
+source: seer-core/tests/format_snapshots.rs
+assertion_line: 596
+expression: markdown().format_delegation(&fixture_delegation_broken())
+---
+## Delegation: example.com
+
+- **Parent zone**: `com`
+- **Parent servers queried**: `a.gtld-servers.net`
+- **In sync**: no
+
+| Nameserver | Parent | Zone |
+| --- | --- | --- |
+| `ns-old.example.net` | yes | no |
+| `ns1.example.com` | yes | yes |
+| `ns2.example.com` | no | yes |
+
+### Lame servers
+
+- `ns-old.example.net` — refused the query (REFUSED)
+
+### Warnings
+
+- skipped parent server b.gtld-servers.net: could not resolve

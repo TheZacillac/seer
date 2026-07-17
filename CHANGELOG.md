@@ -11,6 +11,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`seer doctor` — environment self-diagnosis** — runs four concurrent
+  probes (config file parse, DNS resolution, WHOIS port-43 reachability,
+  RDAP bootstrap HTTPS), each with its own 5-second deadline, and reports
+  PASS/WARN/FAIL per check in all four output formats. Exits 1 only when a
+  check FAILs; a malformed config file is a WARN (seer still runs on built-in
+  defaults) and exits 0. Also available as `doctor` in the REPL.
+- **`seer delegation <domain>` — NS delegation health check** — compares the
+  parent zone's delegation NS set against the zone's own authoritative NS
+  RRset (missing/extra entries, in-sync verdict) and probes each delegated
+  nameserver for lameness (refused, timeout, non-authoritative, empty).
+  Check-style exit codes: 1 when the sets are out of sync or any server
+  answers lamely, 0 when healthy. Available on every surface: CLI, REPL,
+  Python (`seer.delegation`), REST (`GET /delegation/{domain}`), and MCP
+  (`seer_delegation`).
+- **Watchlist webhook notifications** — `seer watch --webhook <URL>` (or
+  `webhook_url` under `[watch]` in `~/.seer/config.toml`; the flag wins)
+  POSTs the check-all report as JSON. Delivery is best-effort — a failed POST
+  warns on stderr and never changes the exit code — and the URL goes through
+  the same SSRF guard as every other outbound request (resolved-address
+  pinning, redirects refused).
+- **Catppuccin Latte light theme for the TUI** — set `theme = "latte"` under
+  `[tui]` in `~/.seer/config.toml` for startup, or switch live with
+  `:theme latte` / `:theme frappe`; unknown names fall back to Frappé.
+- **TLD info on the Python/REST/MCP surfaces** — `seer.tld_info(".com")` and
+  `seer.all_tlds()` in Python, `GET /tld/{tld}` and the full-catalog
+  `GET /tld/` in the REST API, and a `seer_tld_info` MCP tool (the CLI
+  already had `seer tld`).
+- **`seer_bulk_availability` MCP tool** — availability checks for a whole
+  list of candidate names in one call, matching the existing Python/REST
+  bulk-availability surface. With `seer_tld_info` and `seer_delegation`, the
+  MCP registry now exposes 28 tools.
+- **Man pages** — the hidden `seer mangen <dir>` command writes `seer.1` plus
+  one page per subcommand (via clap_mangen), ready for distro packaging.
+- **cargo-deny supply-chain gate** — a new `deny.toml` policy (RUSTSEC
+  advisories, explicit license allow-list, wildcard-version ban,
+  crates.io-only sources) enforced by a new CI job; run locally with
+  `cargo deny check`.
+
 ### Changed
 - Smart lookup no longer cuts the WHOIS query off 5 seconds after an RDAP
   *failure* (and vice versa). The grace-period truncation now applies only

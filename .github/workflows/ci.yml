@@ -150,3 +150,14 @@ jobs:
       - uses: rustsec/audit-check@v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+
+  deny:
+    name: Supply Chain (cargo-deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # Gates the dependency tree against deny.toml: RUSTSEC advisories,
+      # the explicit license allow-list, wildcard/duplicate version bans,
+      # and crates.io-only sources. Complements the rustsec `audit` job
+      # (which only covers advisories) with license + provenance policy.
+      - uses: EmbarkStudios/cargo-deny-action@v2

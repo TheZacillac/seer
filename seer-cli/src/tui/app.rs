@@ -14,6 +14,7 @@ use crate::tui::command::{self, CmdOutcome};
 use crate::tui::event::{self, KeyAction};
 use crate::tui::lenses;
 use crate::tui::panes::{PaneOutcome, Panes};
+use crate::tui::theme::Theme;
 
 /// Number of 100ms ticks a toast lives for (~2.2s).
 const TOAST_TICKS: u32 = 22;
@@ -40,6 +41,9 @@ pub struct App {
     pub spin: usize,
     pub toast: Option<Toast>,
     pub panes: Panes,
+    /// Active color theme (Frappé by default). Private so swaps go through
+    /// `set_theme_by_name`, keeping `theme.name` canonical.
+    theme: Theme,
     states: HashMap<&'static str, LensState>,
     startup: Vec<Action>,
     /// Per-lens generation counter; stale results carry a lower gen and are dropped.
@@ -63,6 +67,7 @@ impl App {
             spin: 0,
             toast: None,
             panes: Panes::default(),
+            theme: Theme::frappe(),
             states: HashMap::new(),
             startup: Vec::new(),
             fetch_gen: HashMap::new(),
@@ -88,6 +93,25 @@ impl App {
     /// Drain the actions queued at construction (initial lookup).
     pub fn take_startup_actions(&mut self) -> Vec<Action> {
         std::mem::take(&mut self.startup)
+    }
+
+    /// The active theme — `mod.rs` passes this to `render::view` each frame.
+    pub fn theme(&self) -> &Theme {
+        &self.theme
+    }
+
+    /// Swap the active theme by name ("frappe" | "latte", case-insensitive;
+    /// see `Theme::from_name`). Unknown names leave the current theme in
+    /// place and return false. Shared seam: used by the `:theme` command and
+    /// by config wiring in `mod.rs`.
+    pub fn set_theme_by_name(&mut self, name: &str) -> bool {
+        match Theme::from_name(name) {
+            Some(t) => {
+                self.theme = t;
+                true
+            }
+            None => false,
+        }
     }
 
     pub fn current_lens(&self) -> &'static lenses::Lens {
@@ -692,6 +716,20 @@ impl App {
                 self.set_toast("fail", "formats: human · json · yaml · markdown");
                 vec![]
             }
+            CmdOutcome::SetTheme(name) => {
+                if self.set_theme_by_name(&name) {
+                    let msg = format!("theme → {}", self.theme.name);
+                    self.set_toast("ok", &msg);
+                } else {
+                    // Parser validates names, but stay robust if they drift.
+                    self.bad_theme_toast();
+                }
+                vec![]
+            }
+            CmdOutcome::BadTheme => {
+                self.bad_theme_toast();
+                vec![]
+            }
             CmdOutcome::Lens { lens, target } => {
                 // Smart :rdap <target>: route to the right RDAP sub-tab based on target type.
                 if lens == "rdap" {
@@ -819,6 +857,12 @@ impl App {
         // Drop any cached TLD state so the newly selected slot is fetched.
         self.states.remove("tld");
         vec![self.fetch_action(FetchReq::Tld(self.panes.tld.current()))]
+    }
+
+    /// Standard `:theme` error, naming the valid themes (mirrors BadFormat).
+    fn bad_theme_toast(&mut self) {
+        let msg = format!("themes: {}", Theme::NAMES.join(" · "));
+        self.set_toast("fail", &msg);
     }
 
     /// Fetch the current lens at the existing domain (if any).
@@ -1708,6 +1752,66 @@ mod tests {
             !matches!(app.state_of(idx), LensState::Loaded(_)),
             "stale domain result must not render as the IP/ASN tab's data",
         );
+    }
+
+    // ---- Theme tests ----
+
+    #[test]
+    fn theme_command_swaps_live_theme() {
+        let mut app = App::new(None);
+        assert_eq!(app.theme().name, "frappe", "Frappé must be the default");
+        let frappe_base = app.theme().base;
+        let actions = app.exec_command("theme latte");
+        assert!(actions.is_empty(), ":theme must not emit actions");
+        assert_eq!(app.theme().name, "latte");
+        assert_ne!(
+            app.theme().base,
+            frappe_base,
+            "latte must actually change the base color"
+        );
+        assert_eq!(app.theme().base, Theme::latte().base);
+        assert_eq!(app.theme().text, Theme::latte().text);
+        assert!(
+            matches!(&app.toast, Some(t) if t.tone == "ok" && t.msg.contains("latte")),
+            "expected ok toast naming latte, got {:?}",
+            app.toast
+        );
+    }
+
+    #[test]
+    fn unknown_theme_errors_and_keeps_current_theme() {
+        let mut app = App::new(None);
+        let _ = app.exec_command("theme latte");
+        let actions = app.exec_command("theme mocha");
+        assert!(actions.is_empty());
+        assert_eq!(
+            app.theme().name,
+            "latte",
+            "an unknown theme must not change the active theme"
+        );
+        assert!(
+            matches!(
+                &app.toast,
+                Some(t) if t.tone == "fail" && t.msg.contains("frappe") && t.msg.contains("latte")
+            ),
+            "error toast must name the valid themes, got {:?}",
+            app.toast
+        );
+        // Bare `:theme` gets the same error.
+        let _ = app.exec_command("theme");
+        assert!(matches!(&app.toast, Some(t) if t.tone == "fail"));
+        assert_eq!(app.theme().name, "latte");
+    }
+
+    #[test]
+    fn set_theme_by_name_seam_round_trips() {
+        let mut app = App::new(None);
+        assert!(app.set_theme_by_name("latte"));
+        assert_eq!(app.theme().name, "latte");
+        assert!(app.set_theme_by_name("Frappé"), "accented alias must work");
+        assert_eq!(app.theme().name, "frappe");
+        assert!(!app.set_theme_by_name("nord"));
+        assert_eq!(app.theme().name, "frappe", "failed swap keeps old theme");
     }
 
     #[test]

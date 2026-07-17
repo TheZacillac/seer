@@ -27,6 +27,10 @@ pub struct SeerConfig {
     pub timeouts: TimeoutConfig,
     /// Bulk operation settings
     pub bulk: BulkConfig,
+    /// Watchlist settings (`seer watch`)
+    pub watch: WatchConfig,
+    /// TUI settings (`seer tui`)
+    pub tui: TuiConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,6 +55,32 @@ pub struct BulkConfig {
     pub rate_limit_ms: u64,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WatchConfig {
+    /// Webhook URL the `seer watch` check-all report is POSTed to as JSON.
+    /// `None` (the default) disables delivery; the CLI `--webhook` flag
+    /// overrides this value.
+    pub webhook_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TuiConfig {
+    /// TUI color theme name. Known names: "frappe" (default) and "latte";
+    /// read through [`SeerConfig::tui_theme`], which falls back to "frappe"
+    /// on anything unrecognized so config parsing stays tolerant.
+    pub theme: String,
+}
+
+impl Default for TuiConfig {
+    fn default() -> Self {
+        Self {
+            theme: "frappe".to_string(),
+        }
+    }
+}
+
 impl Default for SeerConfig {
     fn default() -> Self {
         Self {
@@ -58,6 +88,8 @@ impl Default for SeerConfig {
             nameserver: None,
             timeouts: TimeoutConfig::default(),
             bulk: BulkConfig::default(),
+            watch: WatchConfig::default(),
+            tui: TuiConfig::default(),
         }
     }
 }
@@ -183,6 +215,19 @@ impl SeerConfig {
         Duration::from_millis(self.bulk.rate_limit_ms)
     }
 
+    /// Returns the configured TUI theme, clamped to a known canonical name.
+    ///
+    /// Accepts "frappe" / "frappé" / "latte" (case-insensitive, trimmed);
+    /// anything else falls back to "frappe" so a typo'd config degrades to
+    /// the default look instead of erroring. Keep the accepted set in sync
+    /// with the TUI's `Theme::from_name` (seer-cli/src/tui/theme.rs).
+    pub fn tui_theme(&self) -> &'static str {
+        match self.tui.theme.trim().to_lowercase().as_str() {
+            "latte" => "latte",
+            _ => "frappe",
+        }
+    }
+
     /// Generates a default config file content as TOML.
     pub fn default_toml() -> String {
         toml::to_string_pretty(&Self::default()).unwrap_or_else(|_| String::new())
@@ -277,6 +322,63 @@ concurrency = 20
         let path = std::path::Path::new("~/.seer/config.toml");
         let config = SeerConfig::parse_or_default("[bulk]\nconcurrency = 10000\n", path);
         assert_eq!(config.bulk.concurrency, 50);
+    }
+
+    #[test]
+    fn watch_webhook_url_parses_and_defaults_to_none() {
+        let config: SeerConfig =
+            toml::from_str("[watch]\nwebhook_url = \"https://hooks.example.com/seer\"\n").unwrap();
+        assert_eq!(
+            config.watch.webhook_url.as_deref(),
+            Some("https://hooks.example.com/seer")
+        );
+
+        let config = SeerConfig::default();
+        assert_eq!(config.watch.webhook_url, None);
+    }
+
+    #[test]
+    fn tui_theme_parses_and_defaults_to_frappe() {
+        let config: SeerConfig = toml::from_str("[tui]\ntheme = \"latte\"\n").unwrap();
+        assert_eq!(config.tui.theme, "latte");
+        assert_eq!(config.tui_theme(), "latte");
+
+        let config = SeerConfig::default();
+        assert_eq!(config.tui.theme, "frappe");
+        assert_eq!(config.tui_theme(), "frappe");
+    }
+
+    #[test]
+    fn tui_theme_accessor_is_case_insensitive_and_trims() {
+        for raw in ["Latte", "LATTE", "  latte  "] {
+            let mut config = SeerConfig::default();
+            config.tui.theme = raw.to_string();
+            assert_eq!(config.tui_theme(), "latte", "input: {raw:?}");
+        }
+        for raw in ["Frappe", "frappé", "FRAPPÉ"] {
+            let mut config = SeerConfig::default();
+            config.tui.theme = raw.to_string();
+            assert_eq!(config.tui_theme(), "frappe", "input: {raw:?}");
+        }
+    }
+
+    #[test]
+    fn tui_theme_unknown_name_falls_back_to_frappe() {
+        // Config parsing stays tolerant: an unknown theme loads unchanged but
+        // the accessor clamps it to the default instead of erroring.
+        let config: SeerConfig = toml::from_str("[tui]\ntheme = \"nord\"\n").unwrap();
+        assert_eq!(config.tui.theme, "nord");
+        assert_eq!(config.tui_theme(), "frappe");
+    }
+
+    #[test]
+    fn new_sections_survive_default_toml_roundtrip() {
+        // default_toml must serialize the new [watch]/[tui] tables without
+        // erroring (webhook_url = None is omitted by the toml serializer).
+        let toml_str = SeerConfig::default_toml();
+        let config: SeerConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(config.tui.theme, "frappe");
+        assert_eq!(config.watch.webhook_url, None);
     }
 
     #[test]

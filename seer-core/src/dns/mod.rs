@@ -1,4 +1,5 @@
 mod compare;
+mod delegation;
 mod dnssec;
 mod follow;
 mod nameserver;
@@ -9,6 +10,7 @@ mod resolver;
 pub(crate) mod test_support;
 
 pub use compare::{DnsComparator, DnsComparison, ServerResult};
+pub use delegation::{DelegationChecker, DelegationReport, LameNs};
 pub use dnssec::{AuthenticationTier, DnskeyInfo, DnssecChecker, DnssecReport, DsInfo, RrsigInfo};
 pub use follow::{
     DnsFollower, FollowConfig, FollowIteration, FollowProgressCallback, FollowResult,

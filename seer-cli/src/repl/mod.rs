@@ -211,6 +211,8 @@ impl Repl {
             "rdap" => self.execute_rdap(args).await,
             "dig" | "dns" => self.execute_dig(args).await,
             "propagation" | "prop" => self.execute_propagation(args).await,
+            "delegation" => self.execute_delegation(args).await,
+            "doctor" => self.execute_doctor().await,
             "reverse" => self.execute_reverse(args).await,
             "avail" => self.execute_avail(args).await,
             "dnssec" => self.execute_dnssec(args).await,
@@ -291,6 +293,10 @@ impl Repl {
             "  {:<34} Compare DNS records across nameservers",
             "compare <domain> [type] @ns1 @ns2".bright_cyan()
         );
+        println!(
+            "  {:<34} Check NS delegation health (parent vs zone, lameness)",
+            "delegation <domain>".bright_cyan()
+        );
         println!();
         println!("{}", "UTILITY COMMANDS".bright_purple().bold());
         println!(
@@ -316,6 +322,10 @@ impl Repl {
         println!(
             "  {:<34} Diff subdomains vs the stored baseline",
             "subdomains <domain> --diff [--record]".bright_cyan()
+        );
+        println!(
+            "  {:<34} Diagnose seer environment (config, DNS, WHOIS, RDAP)",
+            "doctor".bright_cyan()
         );
         println!();
         println!("{}", "STATUS & SSL".bright_purple().bold());
@@ -669,6 +679,46 @@ impl Repl {
                 CommandResult::Error(e.to_string())
             }
         }
+    }
+
+    async fn execute_delegation(&mut self, args: &[&str]) -> CommandResult {
+        if args.is_empty() {
+            return CommandResult::Error("Usage: delegation <domain>".to_string());
+        }
+
+        let domain = args[0];
+        let spinner = Spinner::new(&format!("Checking NS delegation for {}", domain));
+
+        // check() normalizes/validates the domain before any network I/O, so
+        // an invalid input errors immediately (keeps the tests hermetic).
+        let checker = seer_core::dns::DelegationChecker::from_config(&self.context.config);
+        match checker.check(domain).await {
+            Ok(report) => {
+                spinner.finish();
+                let formatter = seer_core::output::get_formatter(self.context.output_format);
+                println!("{}", formatter.format_delegation(&report));
+                CommandResult::Continue
+            }
+            Err(e) => {
+                spinner.finish();
+                CommandResult::Error(e.to_string())
+            }
+        }
+    }
+
+    async fn execute_doctor(&mut self) -> CommandResult {
+        let spinner = Spinner::new("Running environment diagnostics");
+
+        // Infallible by design: probe failures become Fail checks in the
+        // report rather than an Err, so there is no error branch here.
+        let doctor = seer_core::doctor::Doctor::from_config(&self.context.config);
+        let report = doctor.run().await;
+        spinner.finish();
+        println!(
+            "{}",
+            crate::render_doctor_report(&report, self.context.output_format)
+        );
+        CommandResult::Continue
     }
 
     async fn execute_reverse(&mut self, args: &[&str]) -> CommandResult {
@@ -1583,6 +1633,38 @@ mod copy_tests {
         assert!(
             matches!(repl.last_result, Some(crate::payload::Payload::Tld(_))),
             "tld should store a copyable payload"
+        );
+    }
+}
+
+// Hermetic arg-validation tests for the delegation command: both the usage
+// error and the invalid-domain error surface before any network I/O.
+#[cfg(test)]
+mod delegation_repl_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn delegation_requires_a_domain() {
+        let mut repl = Repl::new().expect("repl construction is offline");
+        let result = repl.execute_delegation(&[]).await;
+        let CommandResult::Error(msg) = result else {
+            panic!("expected usage error, got {result:?}");
+        };
+        assert!(msg.contains("Usage: delegation"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn delegation_rejects_invalid_domain_before_network() {
+        let mut repl = Repl::new().expect("repl construction is offline");
+        // Consecutive dots fail normalize_domain inside check() before any
+        // network I/O, so this stays hermetic.
+        let result = repl.execute_delegation(&["bad..domain"]).await;
+        let CommandResult::Error(msg) = result else {
+            panic!("expected invalid-domain error, got {result:?}");
+        };
+        assert!(
+            msg.to_lowercase().contains("invalid") && msg.contains("bad..domain"),
+            "error should name the invalid input: {msg}"
         );
     }
 }
