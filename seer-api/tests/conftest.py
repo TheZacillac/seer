@@ -97,10 +97,12 @@ def _install_seer_stub() -> None:
 _install_seer_stub()
 
 
-import pytest
-from fastapi.testclient import TestClient
+# These imports must come after _install_seer_stub(): importing seer_api.main
+# pulls in the `seer` module, which must already be stubbed.
+import pytest  # noqa: E402
+from fastapi.testclient import TestClient  # noqa: E402
 
-from seer_api.main import app
+from seer_api.main import app  # noqa: E402
 
 
 @pytest.fixture

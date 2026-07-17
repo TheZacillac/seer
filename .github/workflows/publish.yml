@@ -35,6 +35,27 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Publishing version: $VERSION"
 
+      # Manual dispatches (the normal path — dist-created releases never fire
+      # the `published` event, see CLAUDE.md) check out main HEAD, not the
+      # release tag. Refuse to publish when the version in Cargo.toml has no
+      # tag, or when HEAD isn't the tagged commit — either would put a
+      # crates.io release on different code than the GitHub release binaries.
+      - name: Verify version matches its release tag
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          git fetch --tags --quiet origin
+          TAG="v${VERSION}"
+          if ! git rev-parse -q --verify "refs/tags/${TAG}^{commit}" >/dev/null; then
+            echo "::error::Tag ${TAG} does not exist — tag the release before dispatching publish."
+            exit 1
+          fi
+          if [ "$(git rev-parse "refs/tags/${TAG}^{commit}")" != "$(git rev-parse HEAD)" ]; then
+            echo "::error::HEAD is not the commit tagged ${TAG} — refusing to publish diverging code."
+            exit 1
+          fi
+          echo "HEAD matches ${TAG}; publishing."
+
       - name: Publish seer-core
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_API_KEY }}

@@ -11,6 +11,7 @@ normalization layer before any socket is opened.
 """
 
 import pytest
+
 import seer
 
 

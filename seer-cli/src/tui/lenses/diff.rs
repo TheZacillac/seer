@@ -273,7 +273,7 @@ mod tests {
                     None,
                     false,
                     &LensState::Idle,
-                )
+                );
             })
             .unwrap();
         let text = buf_text(terminal.backend().buffer());
@@ -299,7 +299,7 @@ mod tests {
                     Some("typed.io"),
                     true,
                     &LensState::Idle,
-                )
+                );
             })
             .unwrap();
         assert!(
@@ -325,7 +325,7 @@ mod tests {
                     None,
                     false,
                     &state,
-                )
+                );
             })
             .unwrap();
         let text = buf_text(terminal.backend().buffer());

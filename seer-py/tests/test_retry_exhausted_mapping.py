@@ -31,7 +31,7 @@ def test_exhausted_connection_failure_is_connection_error():
 def test_exhausted_rate_limited_stays_runtime_error():
     # No builtin maps RateLimited; it must remain RuntimeError carrying the
     # inner sanitized message (the MCP layer sniffs for "rate limited").
-    with pytest.raises(RuntimeError, match="[Rr]ate limited"):
+    with pytest.raises(RuntimeError, match=r"[Rr]ate limited"):
         _raise_retry_exhausted_for_test("rate_limited")
 
 

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import importlib
-import os
 
 import pytest
 from fastapi.testclient import TestClient
@@ -104,9 +103,7 @@ def test_preflight_options_bypasses_auth(monkeypatch):
         },
     )
     assert response.status_code != 401, response.text
-    assert "access-control-allow-origin" in {
-        k.lower() for k in response.headers.keys()
-    }
+    assert "access-control-allow-origin" in {k.lower() for k in response.headers}
 
     monkeypatch.delenv("SEER_API_KEY")
     monkeypatch.delenv("SEER_CORS_ORIGINS")
@@ -573,9 +570,8 @@ def test_refuses_public_bind_without_auth(monkeypatch):
     import seer_api.main as main
 
     importlib.reload(main)
-    with pytest.raises(RuntimeError, match="public bind without auth"):
-        with TestClient(main.app):
-            pass  # lifespan runs on __enter__
+    with pytest.raises(RuntimeError, match="public bind without auth"), TestClient(main.app):
+        pass  # lifespan runs on __enter__
 
     monkeypatch.delenv("SEER_HOST")
     importlib.reload(main)
@@ -623,9 +619,8 @@ def test_refuses_multi_worker_without_shared_store(monkeypatch):
     import seer_api.main as main
 
     importlib.reload(main)
-    with pytest.raises(RuntimeError, match="SEER_RATE_LIMIT_STORAGE"):
-        with TestClient(main.app):
-            pass
+    with pytest.raises(RuntimeError, match="SEER_RATE_LIMIT_STORAGE"), TestClient(main.app):
+        pass
 
     monkeypatch.delenv("WEB_CONCURRENCY")
     importlib.reload(main)
@@ -766,6 +761,7 @@ def test_runtime_error_returns_500(client, monkeypatch):
 
 def test_xff_ignored_when_trust_proxy_disabled(monkeypatch):
     from fastapi import Request
+
     from seer_api.limiting import get_client_ip
 
     monkeypatch.delenv("SEER_TRUST_PROXY", raising=False)
@@ -783,6 +779,7 @@ def test_xff_ignored_from_untrusted_peer(monkeypatch):
     """With SEER_TRUST_PROXY=true and an allowlist that does NOT
     include the socket peer, the XFF header must be ignored."""
     from fastapi import Request
+
     from seer_api.limiting import get_client_ip
 
     monkeypatch.setenv("SEER_TRUST_PROXY", "true")
@@ -801,6 +798,7 @@ def test_xff_trusted_from_allowlisted_peer(monkeypatch):
     """With SEER_TRUST_PROXY=true and the socket peer in the allowlist,
     the XFF header's first value is used as the client IP."""
     from fastapi import Request
+
     from seer_api.limiting import get_client_ip
 
     monkeypatch.setenv("SEER_TRUST_PROXY", "true")
@@ -819,6 +817,7 @@ def test_xff_uses_rightmost_untrusted_entry(monkeypatch):
     proxies appending the real client IP, the rightmost entry that is NOT
     itself a trusted proxy is the genuine client."""
     from fastapi import Request
+
     from seer_api.limiting import get_client_ip
 
     monkeypatch.setenv("SEER_TRUST_PROXY", "true")
@@ -839,6 +838,7 @@ def test_xff_all_trusted_falls_back_to_peer(monkeypatch):
     """If every XFF entry is a trusted proxy, fall back to the socket peer
     rather than attributing the request to a proxy IP."""
     from fastapi import Request
+
     from seer_api.limiting import get_client_ip
 
     monkeypatch.setenv("SEER_TRUST_PROXY", "true")
@@ -856,6 +856,7 @@ def test_xff_ignored_when_allowlist_empty(monkeypatch):
     """SEER_TRUST_PROXY=true but no trusted IPs configured — XFF must
     not be honored; without an allowlist there is no safe proxy to trust."""
     from fastapi import Request
+
     from seer_api.limiting import get_client_ip
 
     monkeypatch.setenv("SEER_TRUST_PROXY", "true")

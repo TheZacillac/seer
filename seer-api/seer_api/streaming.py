@@ -12,6 +12,7 @@ Event ordering (see spec):
 """
 
 import asyncio
+import contextlib
 import json
 import logging
 import time
@@ -114,10 +115,8 @@ async def stream_bulk(
                 yield _sse(event, payload)
             else:
                 get_task.cancel()
-                try:
+                with contextlib.suppress(asyncio.CancelledError):
                     await get_task
-                except asyncio.CancelledError:
-                    pass
             if bulk_future.done():
                 # Drain any remaining progress events that arrived after the
                 # future completed but before we noticed.

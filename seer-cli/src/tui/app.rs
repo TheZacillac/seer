@@ -1054,16 +1054,16 @@ mod tests {
             gen: 0,
             result: Ok(LensData::Dns(vec![])),
         });
-        let dns_idx = crate::tui::lenses::find_by_cmd_or_key("dns").unwrap();
+        let dns_idx = lenses::find_by_cmd_or_key("dns").unwrap();
         assert!(matches!(app.state_of(dns_idx), LensState::Loaded(_)));
     }
 
     #[test]
     fn r_toggles_raw_format() {
         let mut app = App::new(None);
-        assert_eq!(app.format, seer_core::output::OutputFormat::Human);
+        assert_eq!(app.format, OutputFormat::Human);
         key(&mut app, KeyCode::Char('r'));
-        assert_eq!(app.format, seer_core::output::OutputFormat::Json);
+        assert_eq!(app.format, OutputFormat::Json);
     }
 
     #[test]
@@ -1147,11 +1147,11 @@ mod tests {
     }
 
     fn watch_lens_idx() -> usize {
-        crate::tui::lenses::find_by_cmd_or_key("watch").unwrap()
+        lenses::find_by_cmd_or_key("watch").unwrap()
     }
 
     fn history_lens_idx() -> usize {
-        crate::tui::lenses::find_by_cmd_or_key("history").unwrap()
+        lenses::find_by_cmd_or_key("history").unwrap()
     }
 
     fn app_on_watch_with_domain(domain: &str) -> App {
@@ -1160,10 +1160,8 @@ mod tests {
         app.lens = idx;
         app.focus = Focus::Pane;
         app.sel = 0;
-        app.states.insert(
-            crate::tui::lenses::lenses()[idx].key,
-            make_watch_state(domain),
-        );
+        app.states
+            .insert(lenses::lenses()[idx].key, make_watch_state(domain));
         app
     }
 
@@ -1228,10 +1226,8 @@ mod tests {
         let idx = history_lens_idx();
         app.lens = idx;
         app.focus = Focus::Pane;
-        app.states.insert(
-            crate::tui::lenses::lenses()[idx].key,
-            make_history_state("old.com"),
-        );
+        app.states
+            .insert(lenses::lenses()[idx].key, make_history_state("old.com"));
         let actions = key(&mut app, KeyCode::Char('c'));
         assert!(
             actions
@@ -1248,10 +1244,8 @@ mod tests {
         app.lens = idx;
         app.focus = Focus::Pane;
         app.sel = 0;
-        app.states.insert(
-            crate::tui::lenses::lenses()[idx].key,
-            make_history_state("old.com"),
-        );
+        app.states
+            .insert(lenses::lenses()[idx].key, make_history_state("old.com"));
         let actions = key(&mut app, KeyCode::Enter);
         assert_eq!(app.lens, 0, "should switch to overview lens");
         assert!(
@@ -1271,11 +1265,10 @@ mod tests {
     #[test]
     fn stale_data_msg_is_dropped() {
         let mut app = App::new(None);
-        let dns_idx = crate::tui::lenses::find_by_cmd_or_key("dns").unwrap();
+        let dns_idx = lenses::find_by_cmd_or_key("dns").unwrap();
         // Bump gen to 1 by simulating a fetch (domain set → fetch triggered).
         app.domain = Some("example.com".into());
-        app.fetch_gen
-            .insert(crate::tui::lenses::lenses()[dns_idx].key, 1);
+        app.fetch_gen.insert(lenses::lenses()[dns_idx].key, 1);
         // Send a stale result with gen 0.
         app.update(Msg::Data {
             lens: "dns".into(),
@@ -1292,9 +1285,8 @@ mod tests {
     #[test]
     fn current_gen_data_msg_is_stored() {
         let mut app = App::new(None);
-        let dns_idx = crate::tui::lenses::find_by_cmd_or_key("dns").unwrap();
-        app.fetch_gen
-            .insert(crate::tui::lenses::lenses()[dns_idx].key, 2);
+        let dns_idx = lenses::find_by_cmd_or_key("dns").unwrap();
+        app.fetch_gen.insert(lenses::lenses()[dns_idx].key, 2);
         app.update(Msg::Data {
             lens: "dns".into(),
             gen: 2,
@@ -1473,7 +1465,7 @@ mod tests {
         let mut app = App::new(Some("example.com".into()));
         let _ = app.take_startup_actions();
         let actions = app.exec_command("tld .io");
-        let tld_idx = crate::tui::lenses::find_by_cmd_or_key("tld").unwrap();
+        let tld_idx = lenses::find_by_cmd_or_key("tld").unwrap();
         assert_eq!(app.lens, tld_idx, ":tld must switch to the tld lens");
         // The session domain must NOT be overwritten by ".io".
         assert_eq!(app.domain.as_deref(), Some("example.com"));
@@ -1506,7 +1498,7 @@ mod tests {
         let mut app = app_on_watch_with_domain("example.com");
         // Simulate the lens having been fetched once (gen → 1).
         app.fetch_gen
-            .insert(crate::tui::lenses::lenses()[watch_lens_idx()].key, 1);
+            .insert(lenses::lenses()[watch_lens_idx()].key, 1);
         let actions = key(&mut app, KeyCode::Char('d'));
         let gen = actions.iter().find_map(|a| match a {
             Action::WatchMutate { gen, .. } => Some(*gen),
@@ -1528,7 +1520,7 @@ mod tests {
     #[test]
     fn enter_pane_allowed_for_bulk_lens_empty() {
         let mut app = App::new(None);
-        let bulk_idx = crate::tui::lenses::find_by_cmd_or_key("bulk").unwrap();
+        let bulk_idx = lenses::find_by_cmd_or_key("bulk").unwrap();
         app.lens = bulk_idx;
         assert_eq!(app.row_count(), 0, "no rows");
         // Enter maps to KeyAction::EnterPane when focus is Nav.
@@ -1560,7 +1552,7 @@ mod tests {
         );
         // Simulate the result arriving.
         app.states.insert(
-            crate::tui::lenses::lenses()[hidx].key,
+            lenses::lenses()[hidx].key,
             LensState::Loaded(LensData::History(vec![])),
         );
         // Second entry → cache is dropped, so it fetches again (fresh disk read).
@@ -1634,8 +1626,8 @@ mod tests {
         let mut app = App::new(None);
         let _ = app.set_domain_and_fetch("a.com");
         // Simulate an in-flight DNS fetch for a.com on a non-current lens.
-        let dns_idx = crate::tui::lenses::find_by_cmd_or_key("dns").unwrap();
-        let dns_key = crate::tui::lenses::lenses()[dns_idx].key;
+        let dns_idx = lenses::find_by_cmd_or_key("dns").unwrap();
+        let dns_key = lenses::lenses()[dns_idx].key;
         app.fetch_gen.insert(dns_key, 1);
         app.states.insert(dns_key, LensState::Loading);
         // Switch domains, then let the old domain's result land late.
@@ -1658,7 +1650,7 @@ mod tests {
         app.lens = idx;
         app.focus = Focus::Pane;
         app.states.insert(
-            crate::tui::lenses::lenses()[idx].key,
+            lenses::lenses()[idx].key,
             LensState::Loaded(LensData::History(vec![
                 make_history_entry("alpha.com"),
                 make_history_entry("beta.com"),
@@ -1689,8 +1681,8 @@ mod tests {
     fn rdap_tab_switch_without_default_req_drops_inflight_result() {
         let mut app = App::new(None);
         app.domain = Some("example.com".into());
-        let idx = crate::tui::lenses::find_by_cmd_or_key("rdap").unwrap();
-        let rdap_key = crate::tui::lenses::lenses()[idx].key;
+        let idx = lenses::find_by_cmd_or_key("rdap").unwrap();
+        let rdap_key = lenses::lenses()[idx].key;
         app.lens = idx;
         // Simulate an in-flight domain-tab fetch.
         app.fetch_gen.insert(rdap_key, 1);

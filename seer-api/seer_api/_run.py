@@ -8,8 +8,9 @@ rather than pinning the event loop thread.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Callable
+from typing import Any
 
 from ._env import env_int
 

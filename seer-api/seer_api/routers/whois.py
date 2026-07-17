@@ -21,7 +21,9 @@ MAX_CONCURRENCY = 50
 class BulkWhoisRequest(BaseModel):
     """Request model for bulk WHOIS lookup."""
 
-    domains: list[Annotated[str, Field(max_length=253)]] = Field(..., min_length=1, max_length=MAX_BULK_DOMAINS)
+    domains: list[Annotated[str, Field(max_length=253)]] = Field(
+        ..., min_length=1, max_length=MAX_BULK_DOMAINS
+    )
     concurrency: int = Field(default=10, ge=1, le=MAX_CONCURRENCY)
 
 
@@ -43,7 +45,7 @@ async def whois_lookup(
     try:
         return await run_seer(seer.whois, domain)
     except Exception as e:
-        raise http_error(e, "WHOIS lookup failed")
+        raise http_error(e, "WHOIS lookup failed") from e
 
 
 @router.post("/bulk")
@@ -61,7 +63,7 @@ async def bulk_whois_lookup(request: Request, body: BulkWhoisRequest):
     try:
         return await run_seer(seer.bulk_whois, body.domains, body.concurrency)
     except Exception as e:
-        raise http_error(e, "Bulk WHOIS lookup failed")
+        raise http_error(e, "Bulk WHOIS lookup failed") from e
 
 
 @router.post("/bulk/stream")
@@ -71,4 +73,4 @@ async def bulk_whois_stream(request: Request, body: BulkWhoisRequest):
     try:
         return await stream_bulk(seer.bulk_whois, body.domains, body.concurrency)
     except Exception as e:
-        raise http_error(e, "Bulk WHOIS stream failed")
+        raise http_error(e, "Bulk WHOIS stream failed") from e

@@ -156,8 +156,10 @@ mod tests {
 
     #[test]
     fn x_stops_running_and_cancels_follow() {
-        let mut s = FollowState::default();
-        s.running = true;
+        let mut s = FollowState {
+            running: true,
+            ..Default::default()
+        };
         let outcome = s.handle_key(key(KeyCode::Char('x')), None);
         assert!(!s.running);
         // 'x' now also cancels the in-flight background follow loop.

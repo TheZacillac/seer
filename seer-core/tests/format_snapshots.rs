@@ -12,6 +12,11 @@
 //!   `Utc::now()`; fixtures use far-future expiries (stable color bucket for
 //!   decades) and an insta filter redacts the changing day count.
 
+// Integration-test target: helper fns here run outside `#[test]` bodies, so
+// clippy's `allow-unwrap-in-tests` doesn't reach them; unwrap is as idiomatic
+// here as in unit tests.
+#![allow(clippy::unwrap_used)]
+
 use seer_core::caa::{CaaPolicy, CaaRecord, ISSUANCE_TIME_NOTE};
 use seer_core::confusables::{ConfusableReport, RegisteredLookalike};
 use seer_core::dns::{DnsRecord, RecordData, RecordType};

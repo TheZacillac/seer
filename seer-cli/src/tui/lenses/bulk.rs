@@ -361,8 +361,10 @@ mod tests {
         // Mirror of the follow-lens regression: the running spinner was
         // hardcoded to SPIN[0] and never animated (2026-07-11 review).
         let theme = Theme::frappe();
-        let mut bulk = BulkState::default();
-        bulk.running = true;
+        let bulk = BulkState {
+            running: true,
+            ..Default::default()
+        };
 
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -371,7 +373,7 @@ mod tests {
             .unwrap();
         let text = buf_text(&terminal);
         assert!(
-            text.contains(crate::tui::app::SPIN[3]),
+            text.contains(SPIN[3]),
             "spinner should render the current animation frame"
         );
     }

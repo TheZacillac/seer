@@ -83,7 +83,7 @@ def get_client_ip(request: Request) -> str:
                         continue
                     return entry
         # Either no allowlist set or the peer is not in it: ignore XFF.
-    return get_remote_address(request) if not peer else peer
+    return peer if peer else get_remote_address(request)
 
 
 # NOTE: In-memory rate limiting is per-worker. With multiple uvicorn workers,

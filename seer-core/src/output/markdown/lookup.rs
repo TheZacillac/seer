@@ -424,7 +424,7 @@ mod tests {
         // rendered as "AVAILABLE". It must say REGISTERED — the same fix the
         // human formatter already carries. This is the markdown rendering of
         // the dns_present "registered" verdict (e.g. zac.email).
-        let result = crate::lookup::LookupResult::Available {
+        let result = LookupResult::Available {
             data: Box::new(crate::availability::AvailabilityResult {
                 domain: "zac.email".to_string(),
                 available: false,

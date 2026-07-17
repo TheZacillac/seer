@@ -291,8 +291,10 @@ mod tests {
 
     #[test]
     fn r_with_domains_starts_run_with_parsed_list() {
-        let mut s = BulkState::default();
-        s.domains = "a.com b.com".into();
+        let mut s = BulkState {
+            domains: "a.com b.com".into(),
+            ..Default::default()
+        };
         let out = s.handle_key(key(KeyCode::Char('r')));
         assert!(s.running);
         assert_eq!(s.gen, 1);
@@ -343,8 +345,10 @@ mod tests {
 
     #[test]
     fn enter_with_no_rows_starts_run() {
-        let mut s = BulkState::default();
-        s.domains = "a.com".into();
+        let mut s = BulkState {
+            domains: "a.com".into(),
+            ..Default::default()
+        };
         let out = s.handle_key(key(KeyCode::Enter));
         assert!(s.running, "Enter in the empty state should start a run");
         assert!(matches!(
@@ -408,8 +412,10 @@ mod tests {
 
     #[test]
     fn x_stops_running_and_cancels() {
-        let mut s = BulkState::default();
-        s.running = true;
+        let mut s = BulkState {
+            running: true,
+            ..Default::default()
+        };
         let out = s.handle_key(key(KeyCode::Char('x')));
         assert!(!s.running);
         assert!(matches!(out, Some(PaneOutcome::Action(Action::StopBulk))));
@@ -424,8 +430,10 @@ mod tests {
 
     #[test]
     fn run_resets_selection_and_detail() {
-        let mut s = BulkState::default();
-        s.domains = "a.com b.com".into();
+        let mut s = BulkState {
+            domains: "a.com b.com".into(),
+            ..Default::default()
+        };
         s.rows.push(make_lookup_result("old.com"));
         s.selected = Some(0);
         s.detail = true;

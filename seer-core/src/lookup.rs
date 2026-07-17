@@ -1366,6 +1366,10 @@ mod tests {
     // and become waiters rather than racing a second lookup. We test the
     // map-level primitive here because the full SmartLookup pipeline
     // requires network access to exercise.
+    // INFLIGHT_TEST_SERIAL is a std Mutex held across awaits on purpose: it
+    // serializes whole async tests that share process-global state; an
+    // async-aware mutex would defeat that.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn test_inflight_coalescing_map() {
         // Serialize with sibling poisoning tests: we share LOOKUP_INFLIGHT
@@ -1449,6 +1453,9 @@ mod tests {
     // needs RDAP bootstrap + WHOIS server discovery against live endpoints,
     // and those clients expose no in-scope hermetic seam for full-path
     // injection.
+    // Deliberately holds INFLIGHT_TEST_SERIAL across awaits — see
+    // test_inflight_coalescing_map.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn waiters_coalesce_on_inflight_lookup_and_read_owners_cache() {
         use std::sync::atomic::Ordering;

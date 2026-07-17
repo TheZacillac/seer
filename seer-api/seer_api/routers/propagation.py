@@ -21,7 +21,9 @@ MAX_CONCURRENCY = 50
 class BulkPropagationRequest(BaseModel):
     """Request model for bulk propagation check."""
 
-    domains: list[Annotated[str, Field(max_length=253)]] = Field(..., min_length=1, max_length=MAX_BULK_DOMAINS)
+    domains: list[Annotated[str, Field(max_length=253)]] = Field(
+        ..., min_length=1, max_length=MAX_BULK_DOMAINS
+    )
     record_type: str = Field("A", max_length=10, pattern=r"^[A-Z0-9]+$")
     concurrency: int = Field(default=5, ge=1, le=MAX_CONCURRENCY)
 
@@ -46,7 +48,7 @@ async def propagation_check(
     try:
         return await run_seer(seer.propagation, domain, record_type)
     except Exception as e:
-        raise http_error(e, "Propagation check failed")
+        raise http_error(e, "Propagation check failed") from e
 
 
 @router.post("/bulk")
@@ -66,7 +68,7 @@ async def bulk_propagation_check(request: Request, body: BulkPropagationRequest)
             seer.bulk_propagation, body.domains, body.record_type, body.concurrency
         )
     except Exception as e:
-        raise http_error(e, "Bulk propagation check failed")
+        raise http_error(e, "Bulk propagation check failed") from e
 
 
 @router.post("/bulk/stream")
@@ -78,4 +80,4 @@ async def bulk_propagation_stream(request: Request, body: BulkPropagationRequest
             seer.bulk_propagation, body.domains, body.record_type, body.concurrency
         )
     except Exception as e:
-        raise http_error(e, "Bulk propagation stream failed")
+        raise http_error(e, "Bulk propagation stream failed") from e

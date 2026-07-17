@@ -29,7 +29,7 @@ def _ssrf_guard(host: str, port: int = 443) -> None:
     try:
         seer.validate_public_host(host, port)
     except ValueError as exc:
-        raise ValueError(str(exc))
+        raise ValueError(str(exc)) from exc
 
 # Configure root logging to INFO so operational milestones are visible.
 # Host environments can override via standard Python logging config.
@@ -150,7 +150,11 @@ async def list_tools() -> list[Tool]:
     return [
         Tool(
             name="seer_lookup",
-            description="Smart domain lookup that tries RDAP first (modern protocol with structured data) and falls back to WHOIS if RDAP is unavailable. Returns registration data with source indicator.",
+            description=(
+                "Smart domain lookup that tries RDAP first (modern protocol with structured data) "
+                "and falls back to WHOIS if RDAP is unavailable. Returns registration data with "
+                "source indicator."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -164,7 +168,10 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="seer_whois",
-            description="Look up WHOIS information for a domain name. Returns registrar, creation date, expiration date, nameservers, and status information.",
+            description=(
+                "Look up WHOIS information for a domain name. Returns registrar, creation date, "
+                "expiration date, nameservers, and status information."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -178,7 +185,11 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="seer_rdap_domain",
-            description="Look up RDAP (Registration Data Access Protocol) information for a domain. Returns structured registration data including registrar, dates, nameservers, and DNSSEC status.",
+            description=(
+                "Look up RDAP (Registration Data Access Protocol) information for a domain. "
+                "Returns structured registration data including registrar, dates, nameservers, "
+                "and DNSSEC status."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -192,7 +203,10 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="seer_rdap_ip",
-            description="Look up RDAP information for an IP address. Returns network registration information including the network range, country, and responsible organization.",
+            description=(
+                "Look up RDAP information for an IP address. Returns network registration "
+                "information including the network range, country, and responsible organization."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -206,7 +220,10 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="seer_rdap_asn",
-            description="Look up RDAP information for an Autonomous System Number (ASN). Returns organization and network range information.",
+            description=(
+                "Look up RDAP information for an Autonomous System Number (ASN). Returns "
+                "organization and network range information."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -222,7 +239,10 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="seer_dig",
-            description="Query DNS records for a domain, similar to the 'dig' command. Supports all major record types.",
+            description=(
+                "Query DNS records for a domain, similar to the 'dig' command. Supports all major "
+                "record types."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -232,7 +252,10 @@ async def list_tools() -> list[Tool]:
                     },
                     "record_type": {
                         "type": "string",
-                        "description": "DNS record type (A, AAAA, MX, TXT, NS, SOA, CNAME, CAA, PTR, SRV, DNSKEY, DS, ANY)",
+                        "description": (
+                            "DNS record type (A, AAAA, MX, TXT, NS, SOA, CNAME, CAA, PTR, SRV, "
+                            "DNSKEY, DS, ANY)"
+                        ),
                         "default": "A",
                     },
                     "nameserver": {
@@ -245,7 +268,10 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="seer_propagation",
-            description="Check DNS propagation for a domain across multiple global DNS servers. Shows which servers have the record and identifies inconsistencies.",
+            description=(
+                "Check DNS propagation for a domain across multiple global DNS servers. Shows "
+                "which servers have the record and identifies inconsistencies."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -264,7 +290,10 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="seer_status",
-            description="Check the health status of a domain including HTTP accessibility, SSL certificate validity, and domain expiration.",
+            description=(
+                "Check the health status of a domain including HTTP accessibility, SSL "
+                "certificate validity, and domain expiration."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -278,7 +307,10 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="seer_bulk_lookup",
-            description="Smart lookup for multiple domains at once (tries RDAP first, falls back to WHOIS). Efficient for checking many domains.",
+            description=(
+                "Smart lookup for multiple domains at once (tries RDAP first, falls back to "
+                "WHOIS). Efficient for checking many domains."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -290,7 +322,9 @@ async def list_tools() -> list[Tool]:
                     },
                     "concurrency": {
                         "type": "integer",
-                        "description": f"Number of concurrent requests (default: 10, max: {MAX_CONCURRENCY})",
+                        "description": (
+                            f"Number of concurrent requests (default: 10, max: {MAX_CONCURRENCY})"
+                        ),
                         "default": 10,
                         "minimum": 1,
                         "maximum": MAX_CONCURRENCY,
@@ -301,7 +335,10 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="seer_bulk_whois",
-            description="Look up WHOIS information for multiple domains at once. Efficient for checking many domains.",
+            description=(
+                "Look up WHOIS information for multiple domains at once. Efficient for checking "
+                "many domains."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -313,7 +350,9 @@ async def list_tools() -> list[Tool]:
                     },
                     "concurrency": {
                         "type": "integer",
-                        "description": f"Number of concurrent requests (default: 10, max: {MAX_CONCURRENCY})",
+                        "description": (
+                            f"Number of concurrent requests (default: 10, max: {MAX_CONCURRENCY})"
+                        ),
                         "default": 10,
                         "minimum": 1,
                         "maximum": MAX_CONCURRENCY,
@@ -341,7 +380,9 @@ async def list_tools() -> list[Tool]:
                     },
                     "concurrency": {
                         "type": "integer",
-                        "description": f"Number of concurrent requests (default: 10, max: {MAX_CONCURRENCY})",
+                        "description": (
+                            f"Number of concurrent requests (default: 10, max: {MAX_CONCURRENCY})"
+                        ),
                         "default": 10,
                         "minimum": 1,
                         "maximum": MAX_CONCURRENCY,
@@ -352,7 +393,10 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="seer_bulk_status",
-            description="Check health status for multiple domains at once. Returns HTTP, SSL, and expiration status for each domain.",
+            description=(
+                "Check health status for multiple domains at once. Returns HTTP, SSL, and "
+                "expiration status for each domain."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -364,7 +408,9 @@ async def list_tools() -> list[Tool]:
                     },
                     "concurrency": {
                         "type": "integer",
-                        "description": f"Number of concurrent requests (default: 10, max: {MAX_CONCURRENCY})",
+                        "description": (
+                            f"Number of concurrent requests (default: 10, max: {MAX_CONCURRENCY})"
+                        ),
                         "default": 10,
                         "minimum": 1,
                         "maximum": MAX_CONCURRENCY,
@@ -375,7 +421,9 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="seer_bulk_propagation",
-            description="Check DNS propagation for multiple domains at once across global DNS servers.",
+            description=(
+                "Check DNS propagation for multiple domains at once across global DNS servers."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -392,7 +440,9 @@ async def list_tools() -> list[Tool]:
                     },
                     "concurrency": {
                         "type": "integer",
-                        "description": f"Number of concurrent requests (default: 5, max: {MAX_CONCURRENCY})",
+                        "description": (
+                            f"Number of concurrent requests (default: 5, max: {MAX_CONCURRENCY})"
+                        ),
                         "default": 5,
                         "minimum": 1,
                         "maximum": MAX_CONCURRENCY,
@@ -403,7 +453,10 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="seer_info",
-            description="Get comprehensive domain registration info with all available fields merged from RDAP and WHOIS. Returns a flat structure with every field as a top-level key.",
+            description=(
+                "Get comprehensive domain registration info with all available fields merged from "
+                "RDAP and WHOIS. Returns a flat structure with every field as a top-level key."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -417,7 +470,10 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="seer_bulk_info",
-            description="Get comprehensive domain registration info for multiple domains. Merges RDAP and WHOIS data into flat, column-per-field results for each domain.",
+            description=(
+                "Get comprehensive domain registration info for multiple domains. Merges RDAP and "
+                "WHOIS data into flat, column-per-field results for each domain."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -429,7 +485,9 @@ async def list_tools() -> list[Tool]:
                     },
                     "concurrency": {
                         "type": "integer",
-                        "description": f"Number of concurrent requests (default: 10, max: {MAX_CONCURRENCY})",
+                        "description": (
+                            f"Number of concurrent requests (default: 10, max: {MAX_CONCURRENCY})"
+                        ),
                         "default": 10,
                         "minimum": 1,
                         "maximum": MAX_CONCURRENCY,
@@ -440,7 +498,10 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="seer_bulk_ssl",
-            description="Inspect SSL certificate chains for multiple domains. Returns the full chain, SANs, key details, and signature algorithm for each domain.",
+            description=(
+                "Inspect SSL certificate chains for multiple domains. Returns the full chain, "
+                "SANs, key details, and signature algorithm for each domain."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -452,7 +513,9 @@ async def list_tools() -> list[Tool]:
                     },
                     "concurrency": {
                         "type": "integer",
-                        "description": f"Number of concurrent requests (default: 10, max: {MAX_CONCURRENCY})",
+                        "description": (
+                            f"Number of concurrent requests (default: 10, max: {MAX_CONCURRENCY})"
+                        ),
                         "default": 10,
                         "minimum": 1,
                         "maximum": MAX_CONCURRENCY,
@@ -463,32 +526,53 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="seer_ssl",
-            description="Inspect the SSL/TLS certificate chain for a domain. Returns the chain, SANs, key details, and derived security-posture warnings (weak key, deprecated signature, self-signed, expiry, hostname mismatch).",
+            description=(
+                "Inspect the SSL/TLS certificate chain for a domain. Returns the chain, SANs, key "
+                "details, and derived security-posture warnings (weak key, deprecated signature, "
+                "self-signed, expiry, hostname mismatch)."
+            ),
             inputSchema=_DOMAIN_SCHEMA,
         ),
         Tool(
             name="seer_availability",
-            description="Check whether a domain appears to be available for registration (RDAP-404 + DNS + WHOIS signals).",
+            description=(
+                "Check whether a domain appears to be available for registration (RDAP-404 + DNS "
+                "+ WHOIS signals)."
+            ),
             inputSchema=_DOMAIN_SCHEMA,
         ),
         Tool(
             name="seer_dnssec",
-            description="DNSSEC validation report for a domain: DS/DNSKEY digest consistency, chain validity, and the verification-depth tier.",
+            description=(
+                "DNSSEC validation report for a domain: DS/DNSKEY digest consistency, chain "
+                "validity, and the verification-depth tier."
+            ),
             inputSchema=_DOMAIN_SCHEMA,
         ),
         Tool(
             name="seer_caa",
-            description="Look up the CAA (Certification Authority Authorization) policy for a domain, including iodef incident contacts and a wildcard-vs-base consistency analysis.",
+            description=(
+                "Look up the CAA (Certification Authority Authorization) policy for a domain, "
+                "including iodef incident contacts and a wildcard-vs-base consistency analysis."
+            ),
             inputSchema=_DOMAIN_SCHEMA,
         ),
         Tool(
             name="seer_posture",
-            description="Inspect a domain's email/DNS security posture: SPF, DMARC, MTA-STS, BIMI, and DANE (TLSA), with per-mechanism verdicts and advisories. A lax/absent DMARC means the domain is spoofable.",
+            description=(
+                "Inspect a domain's email/DNS security posture: SPF, DMARC, MTA-STS, BIMI, and "
+                "DANE (TLSA), with per-mechanism verdicts and advisories. A lax/absent DMARC "
+                "means the domain is spoofable."
+            ),
             inputSchema=_DOMAIN_SCHEMA,
         ),
         Tool(
             name="seer_subdomains",
-            description="Enumerate subdomains via Certificate Transparency logs. With resolve=true, each name is resolved and classified (live/dead/wildcard) and dangling CNAMEs to takeover-prone providers are flagged.",
+            description=(
+                "Enumerate subdomains via Certificate Transparency logs. With resolve=true, each "
+                "name is resolved and classified (live/dead/wildcard) and dangling CNAMEs to "
+                "takeover-prone providers are flagged."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -503,7 +587,10 @@ async def list_tools() -> list[Tool]:
                     },
                     "concurrency": {
                         "type": "integer",
-                        "description": f"Concurrency for the resolve pass (default: 10, max: {MAX_CONCURRENCY})",
+                        "description": (
+                            "Concurrency for the resolve pass (default: 10, max: "
+                            f"{MAX_CONCURRENCY})"
+                        ),
                         "default": 10,
                         "minimum": 1,
                         "maximum": MAX_CONCURRENCY,
@@ -514,7 +601,11 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="seer_confusables",
-            description="Generate typosquat / homoglyph look-alike domains for a domain and report which are registered, ranking freshly-registered squats first. A brand-protection / phishing-defense scan.",
+            description=(
+                "Generate typosquat / homoglyph look-alike domains for a domain and report which "
+                "are registered, ranking freshly-registered squats first. A brand-protection / "
+                "phishing-defense scan."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -524,7 +615,10 @@ async def list_tools() -> list[Tool]:
                     },
                     "concurrency": {
                         "type": "integer",
-                        "description": f"Concurrency for the registration scan (default: 10, max: {MAX_CONCURRENCY})",
+                        "description": (
+                            "Concurrency for the registration scan (default: 10, max: "
+                            f"{MAX_CONCURRENCY})"
+                        ),
                         "default": 10,
                         "minimum": 1,
                         "maximum": MAX_CONCURRENCY,
@@ -535,7 +629,10 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="seer_dns_compare",
-            description="Compare DNS records for a domain across two nameservers, reporting whether they agree.",
+            description=(
+                "Compare DNS records for a domain across two nameservers, reporting whether they "
+                "agree."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -545,8 +642,14 @@ async def list_tools() -> list[Tool]:
                         "description": "Record type (A, AAAA, MX, etc.)",
                         "default": "A",
                     },
-                    "server_a": {"type": "string", "description": "First nameserver (e.g. 8.8.8.8)"},
-                    "server_b": {"type": "string", "description": "Second nameserver (e.g. 1.1.1.1)"},
+                    "server_a": {
+                        "type": "string",
+                        "description": "First nameserver (e.g. 8.8.8.8)",
+                    },
+                    "server_b": {
+                        "type": "string",
+                        "description": "Second nameserver (e.g. 1.1.1.1)",
+                    },
                 },
                 "required": ["domain", "server_a", "server_b"],
             },

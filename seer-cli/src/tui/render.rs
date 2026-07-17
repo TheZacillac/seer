@@ -488,7 +488,7 @@ mod tests {
     fn follow_lens_renders_its_pane_not_the_generic_hint() {
         let theme = Theme::frappe();
         let mut app = App::new(None);
-        app.lens = crate::tui::lenses::find_by_cmd_or_key("follow").unwrap();
+        app.lens = lenses::find_by_cmd_or_key("follow").unwrap();
         let s = full_buf(&app, &theme);
         assert!(s.contains("s start"), "Follow pane (hints) should render");
         assert!(

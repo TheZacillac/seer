@@ -13,7 +13,6 @@ from __future__ import annotations
 import asyncio
 
 import seer
-
 from seer_api.mcp import server
 
 

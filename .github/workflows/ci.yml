@@ -6,6 +6,13 @@ on:
   pull_request:
     branches: [main]
 
+# Cancel superseded runs of the same ref (PR force-pushes, rapid re-pushes)
+# instead of burning runners on stale commits. Pushes to main are never
+# cancelled so its history keeps a complete run per commit.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -44,7 +51,9 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --workspace -- -D warnings
+      # --all-targets lints tests/benches too (clippy.toml allows unwrap in
+      # tests, so this stays signal-rich rather than noisy).
+      - run: cargo clippy --workspace --all-targets -- -D warnings
 
   test:
     name: Test
@@ -68,6 +77,13 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
+      # Lint before the (slow) maturin build so style failures surface fast.
+      # Both packages configure ruff in their own pyproject.toml; ruff's
+      # per-file config discovery applies the right one to each tree.
+      - name: Lint (ruff)
+        run: |
+          pip install ruff
+          ruff check seer-py/python seer-py/tests seer-api
       - name: Build and install seer-py (PEP 517 via maturin)
         run: pip install './seer-py[dev]'
       - name: Install seer-api
