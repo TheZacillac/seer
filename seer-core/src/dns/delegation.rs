@@ -141,6 +141,11 @@ enum DirectNs {
     Rcode(ResponseCode),
     /// No usable response (timeout / transport failure), with the reason.
     Unreachable(String),
+    /// The probe packet never left this host (no route for the address
+    /// family — e.g. an IPv6-only server probed from an IPv4-only host).
+    /// The same epistemic state as unresolvable glue: nothing is known
+    /// about the server's authority, so this maps to a skip, not lameness.
+    LocalNoRoute(String),
 }
 
 /// Per-server outcome of a lameness probe.
@@ -356,6 +361,12 @@ impl DelegationChecker {
                         host, reason
                     ));
                 }
+                DirectNs::LocalNoRoute(reason) => {
+                    warnings.push(format!(
+                        "parent server {} not probed — no route from this host ({})",
+                        host, reason
+                    ));
+                }
             }
         }
 
@@ -566,34 +577,44 @@ impl DelegationChecker {
             Err(reason) => return ProbeOutcome::Skipped(reason),
         };
         debug!(server = %host, %ip, "probing delegated nameserver");
-        match self.direct_ns_query(host, ip, domain).await {
-            DirectNs::Response {
-                response_code: ResponseCode::NXDomain,
-                ..
-            } => ProbeOutcome::Lame("returned NXDOMAIN for its own zone".to_string()),
-            DirectNs::Response {
-                authoritative: true,
-                answer_ns,
-                ..
-            } if !answer_ns.is_empty() => ProbeOutcome::Healthy(answer_ns),
-            DirectNs::Response {
-                authoritative: true,
-                ..
-            } => ProbeOutcome::Lame("authoritative answer contained no NS records".to_string()),
-            DirectNs::Response { answer_ns, .. } if !answer_ns.is_empty() => {
-                ProbeOutcome::Lame("answered non-authoritatively (AA bit not set)".to_string())
-            }
-            DirectNs::Response { authority_ns, .. } if !authority_ns.is_empty() => {
-                ProbeOutcome::Lame("not authoritative — referred the query elsewhere".to_string())
-            }
-            DirectNs::Response { .. } => {
-                ProbeOutcome::Lame("returned an empty answer (no NS records)".to_string())
-            }
-            DirectNs::Rcode(code) => ProbeOutcome::Lame(format!("refused the query ({})", code)),
-            DirectNs::Unreachable(reason) => {
-                ProbeOutcome::Lame(format!("no usable response: {}", reason))
-            }
+        outcome_for_direct(self.direct_ns_query(host, ip, domain).await)
+    }
+}
+
+/// Maps a direct-query result onto the per-server probe verdict. Pure so the
+/// lameness-vs-skip policy is unit-testable without a live probe.
+fn outcome_for_direct(direct: DirectNs) -> ProbeOutcome {
+    match direct {
+        DirectNs::Response {
+            response_code: ResponseCode::NXDomain,
+            ..
+        } => ProbeOutcome::Lame("returned NXDOMAIN for its own zone".to_string()),
+        DirectNs::Response {
+            authoritative: true,
+            answer_ns,
+            ..
+        } if !answer_ns.is_empty() => ProbeOutcome::Healthy(answer_ns),
+        DirectNs::Response {
+            authoritative: true,
+            ..
+        } => ProbeOutcome::Lame("authoritative answer contained no NS records".to_string()),
+        DirectNs::Response { answer_ns, .. } if !answer_ns.is_empty() => {
+            ProbeOutcome::Lame("answered non-authoritatively (AA bit not set)".to_string())
         }
+        DirectNs::Response { authority_ns, .. } if !authority_ns.is_empty() => {
+            ProbeOutcome::Lame("not authoritative — referred the query elsewhere".to_string())
+        }
+        DirectNs::Response { .. } => {
+            ProbeOutcome::Lame("returned an empty answer (no NS records)".to_string())
+        }
+        DirectNs::Rcode(code) => ProbeOutcome::Lame(format!("refused the query ({})", code)),
+        DirectNs::Unreachable(reason) => {
+            ProbeOutcome::Lame(format!("no usable response: {}", reason))
+        }
+        DirectNs::LocalNoRoute(reason) => ProbeOutcome::Skipped(format!(
+            "no route from this host ({}) — server not probed (e.g. an IPv6-only nameserver on an IPv4-only host)",
+            reason
+        )),
     }
 }
 
@@ -647,8 +668,38 @@ fn classify_net_error(err: NetError, domain: &str) -> DirectNs {
         },
         NetError::Dns(DnsError::ResponseCode(code)) => DirectNs::Rcode(code),
         NetError::Timeout => DirectNs::Unreachable("timed out".to_string()),
+        // What `resolver.lookup()` actually returns when every transport
+        // attempt died at the local socket layer (verified against
+        // hickory-resolver 0.26): the pool's error fold (`most_specific`)
+        // always prefers the non-`Io` side and its accumulator starts as
+        // `NoConnections`, so all-`Io` failures surface as `NoConnections`.
+        // For these fresh single-server pools that can only mean local
+        // socket errors (no route / address family unavailable): hickory's
+        // UDP is unconnected (`send_to`/`recv_from`), so a *remote* refusal
+        // never yields `Io` on the UDP leg — a dark or refusing server
+        // times out instead, and `Timeout` outranks `NoConnections` in the
+        // fold. The server was therefore never reached: local, not lame.
+        NetError::NoConnections => DirectNs::LocalNoRoute(
+            "every connection attempt failed at the local socket layer".to_string(),
+        ),
+        // Defense in depth should hickory ever surface the socket error
+        // directly instead of folding it into `NoConnections`.
+        NetError::Io(io_err) if is_local_no_route(&io_err) => {
+            DirectNs::LocalNoRoute(io_err.to_string())
+        }
         other => DirectNs::Unreachable(other.to_string()),
     }
+}
+
+/// True when an io transport error means the packet never left this host:
+/// the kernel had no route for the destination's address family. `TimedOut`
+/// never reaches here — `From<io::Error> for NetError` folds it into
+/// `NetError::Timeout` (which stays a lameness signal: packets were sent).
+fn is_local_no_route(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::NetworkUnreachable | std::io::ErrorKind::HostUnreachable
+    )
 }
 
 /// The parent zone of a normalized domain: everything after the leftmost
@@ -765,6 +816,55 @@ mod tests {
     fn fqdn_appends_root_dot_once() {
         assert_eq!(fqdn("example.com"), "example.com.");
         assert_eq!(fqdn("example.com."), "example.com.");
+    }
+
+    #[test]
+    fn local_no_route_transport_errors_classify_as_local() {
+        use std::io;
+        // ENETUNREACH/EHOSTUNREACH mean the probe packet never left this
+        // host (e.g. an IPv6-only NS probed from an IPv4-only host); hickory
+        // surfaces them as `NetError::Io`. They say nothing about the
+        // server's authority, so they must not classify as a remote failure.
+        for kind in [
+            io::ErrorKind::NetworkUnreachable,
+            io::ErrorKind::HostUnreachable,
+        ] {
+            let direct = classify_net_error(io::Error::new(kind, "no route").into(), "example.com");
+            assert!(
+                matches!(direct, DirectNs::LocalNoRoute(_)),
+                "{kind:?} classified as {direct:?}"
+            );
+        }
+        // What `resolver.lookup()` actually surfaces for the all-local-
+        // failure case: the pool folds per-attempt `Io` errors away
+        // (`most_specific` always prefers the non-`Io` side, and the
+        // accumulator starts as `NoConnections`), so a no-route probe comes
+        // back as `NoConnections`, never `Io`. It must classify as local.
+        let pooled = classify_net_error(NetError::NoConnections, "example.com");
+        assert!(
+            matches!(pooled, DirectNs::LocalNoRoute(_)),
+            "NoConnections classified as {pooled:?}"
+        );
+        // A refused connection is the remote host answering: a genuine
+        // remote signal that must keep reading as Unreachable (→ lame).
+        let refused = classify_net_error(
+            io::Error::new(io::ErrorKind::ConnectionRefused, "refused").into(),
+            "example.com",
+        );
+        assert!(
+            matches!(refused, DirectNs::Unreachable(_)),
+            "refused classified as {refused:?}"
+        );
+    }
+
+    #[test]
+    fn local_no_route_probe_outcome_is_skipped_not_lame() {
+        let outcome =
+            outcome_for_direct(DirectNs::LocalNoRoute("Network is unreachable".to_string()));
+        assert!(
+            matches!(outcome, ProbeOutcome::Skipped(_)),
+            "got {outcome:?}"
+        );
     }
 
     #[test]

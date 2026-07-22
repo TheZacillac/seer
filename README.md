@@ -56,7 +56,7 @@ A high-performance, multi-interface domain utility suite — query WHOIS, RDAP, 
 - **Domain Status** — HTTP status, title, SSL, and expiration
 - **SSL Chain Inspection** — full chain, SANs, key details, validity
 - **CAA Policy** — who may issue certs, vs. actual issuer
-- **Email Posture** — SPF, DMARC, and MTA-STS checks
+- **Email Posture** — SPF, DMARC, MTA-STS, BIMI, and DANE checks
 - **Look-alike Detection** — confusable/homoglyph domains
 - **Registration Drift** — diff live registration vs. a baseline
 - **Domain Watchlist** — monitor expiring certs and registrations, with optional webhook alerts
@@ -611,6 +611,7 @@ Propagation checks query **30 nameservers** across **6 regions**:
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `RUST_LOG` | Logging level (`trace` / `debug` / `info` / `warn` / `error`) | — |
+| `SEER_LOG_LEVEL` | API log level; `ARCANUM_LOG_LEVEL` takes precedence when set | `INFO` |
 | `SEER_DOMAIN_ALLOWLIST` | Comma-separated allowlist restricting which domains may be queried | — |
 | `SEER_HOST` | API bind host. Non-loopback requires `SEER_API_KEY` | `127.0.0.1` |
 | `SEER_PORT` | API bind port | `8000` |
@@ -618,13 +619,18 @@ Propagation checks query **30 nameservers** across **6 regions**:
 | `SEER_CORS_ORIGINS` | Comma-separated CORS origins for REST API | `*` |
 | `SEER_DOCS_ENABLED` | Expose `/docs`, `/redoc`, `/openapi.json` | `false` |
 | `SEER_METRICS_ENABLED` | Expose `/metrics` to non-loopback clients | `false` |
-| `SEER_RATE_LIMIT` | Default REST API rate limit | `30/minute` |
+| `SEER_RATE_LIMIT` | Default REST API rate limit (`<count>/<period>`) | `30/minute` |
 | `SEER_RATE_LIMIT_STORAGE` | Rate-limit storage URI (e.g. `redis://host:6379`) | `memory://` |
+| `SEER_REQUEST_TIMEOUT` | Per-request deadline (seconds) for dispatched core calls; `0` disables | `0` |
+| `SEER_DISPATCH_THREADS` | Max threads in the pool running blocking core calls (REST + `/mcp`) | `50` |
+| `SEER_MAX_CONCURRENT_STREAMS` | Max in-flight bulk SSE stream jobs per worker process | `8` |
 | `SEER_TRUST_PROXY` | Trust `X-Forwarded-For` from `SEER_TRUSTED_PROXY_IPS` | `false` |
 | `SEER_TRUSTED_PROXY_IPS` | Comma-separated IPs allowed to set `X-Forwarded-For` | — |
 | `SEER_MCP_ALLOWED_HOSTS` | Comma-separated `Host:` values for the MCP `/mcp` endpoint — setting this turns on DNS-rebinding protection | — |
 | `SEER_MCP_ALLOWED_ORIGINS` | Comma-separated `Origin:` values for the MCP `/mcp` endpoint (browser hosts) | — |
 | `WEB_CONCURRENCY` | Uvicorn worker count. `>1` requires a non-`memory://` store | `1` |
+| `UVICORN_WORKERS` | Fallback worker count when `WEB_CONCURRENCY` is unset (same `>1` store rule) | `1` |
+| `SEER_RELOAD` | Uvicorn auto-reload for the `seer-api` entry point (dev only) | `false` |
 
 ### Config File
 

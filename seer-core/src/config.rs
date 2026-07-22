@@ -1,6 +1,7 @@
 //! Configuration file support for Seer.
 //!
-//! Loads settings from `~/.seer/config.toml` with environment variable overrides.
+//! Loads settings from `~/.seer/config.toml` (a missing or malformed file
+//! falls back to built-in defaults; values are clamped to safe ranges).
 
 use std::path::PathBuf;
 use std::time::Duration;

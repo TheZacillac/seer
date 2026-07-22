@@ -77,17 +77,33 @@ Available only when `SEER_DOCS_ENABLED=true`:
 |----------|--------|-------------|
 | `/` | GET | List available endpoints |
 | `/health` | GET | Health check |
-| `/lookup/{domain}` | GET | Smart lookup |
-| `/lookup/bulk` | POST | Bulk smart lookups |
+| `/metrics` | GET | Operational metrics (loopback always; non-loopback gated by `SEER_METRICS_ENABLED`) |
+| `/lookup/{domain}` | GET | Smart lookup (RDAP → WHOIS fallback) |
 | `/whois/{domain}` | GET | WHOIS lookup |
 | `/rdap/domain/{domain}` | GET | RDAP domain lookup |
 | `/rdap/ip/{ip}` | GET | RDAP IP lookup |
 | `/rdap/asn/{asn}` | GET | RDAP ASN lookup |
 | `/dns/{domain}/{record_type}` | GET | DNS query |
+| `/dns/compare/{domain}` | GET | Compare records across nameservers |
 | `/propagation/{domain}/{record_type}` | GET | DNS propagation check |
 | `/status/{domain}` | GET | Domain status check |
-| `/status/bulk` | POST | Bulk status checks |
+| `/ssl/{domain}` | GET | SSL certificate chain inspection |
+| `/availability/{domain}` | GET | Domain availability check |
+| `/info/{domain}` | GET | Merged RDAP + WHOIS domain info |
+| `/subdomains/{domain}` | GET | Subdomain enumeration (CT logs) |
+| `/dnssec/{domain}` | GET | DNSSEC validation |
+| `/delegation/{domain}` | GET | NS delegation health |
+| `/diff/{domain_a}/{domain_b}` | GET | Side-by-side domain comparison |
+| `/caa/{domain}` | GET | CAA policy lookup |
+| `/posture/{domain}` | GET | Email/DNS security posture |
+| `/confusables/{domain}` | GET | Look-alike (typosquat) generation |
+| `/tld/{tld}` | GET | TLD info (WHOIS server, RDAP endpoint) |
+| `/tld/` | GET | Full TLD catalog |
 | `/mcp` | GET/POST | MCP Streamable HTTP transport (see [MCP Server](#mcp-server)) |
+
+Bulk variants: `lookup`, `whois`, `dns`, `propagation`, `status`, and `ssl`
+accept `POST /<prefix>/bulk` plus an SSE-streaming `POST /<prefix>/bulk/stream`;
+`availability` and `info` accept `POST /<prefix>/bulk`.
 
 ### Usage Examples
 
@@ -130,14 +146,16 @@ Default: `*` (all origins)
 
 #### Rate Limiting
 
-Set rate limit via environment variable:
+Set the rate limit via environment variable, in the `<count>/<period>`
+format the `limits` library parses (a bare number like `60` is rejected
+and breaks every rate-limited request):
 
 ```bash
-export SEER_RATE_LIMIT=60  # requests per minute
+export SEER_RATE_LIMIT="60/minute"
 seer-api
 ```
 
-Default: 30 requests/minute
+Default: `30/minute`
 
 ## MCP Server
 
@@ -185,18 +203,38 @@ Optional env vars:
 
 ### Available Tools
 
+All 28 tools, on both transports:
+
 | Tool | Description |
 |------|-------------|
-| `seer_lookup` | Smart domain lookup (RDAP/WHOIS) |
+| `seer_lookup` | Smart domain lookup (RDAP → WHOIS fallback) |
 | `seer_whois` | WHOIS lookup |
 | `seer_rdap_domain` | RDAP domain lookup |
 | `seer_rdap_ip` | RDAP IP lookup |
 | `seer_rdap_asn` | RDAP ASN lookup |
 | `seer_dig` | DNS query |
+| `seer_dns_compare` | Compare records across nameservers |
 | `seer_propagation` | DNS propagation check |
+| `seer_status` | Domain status check |
+| `seer_ssl` | SSL certificate chain inspection |
+| `seer_availability` | Domain availability check |
+| `seer_info` | Merged RDAP + WHOIS domain info |
+| `seer_subdomains` | Subdomain enumeration (CT logs) |
+| `seer_dnssec` | DNSSEC validation |
+| `seer_delegation` | NS delegation health |
+| `seer_diff` | Side-by-side domain comparison |
+| `seer_caa` | CAA policy lookup |
+| `seer_posture` | Email/DNS security posture |
+| `seer_confusables` | Look-alike (typosquat) generation |
+| `seer_tld_info` | TLD info (WHOIS server, RDAP endpoint) |
 | `seer_bulk_lookup` | Bulk smart lookups |
 | `seer_bulk_whois` | Bulk WHOIS lookups |
 | `seer_bulk_dig` | Bulk DNS queries |
+| `seer_bulk_propagation` | Bulk propagation checks |
+| `seer_bulk_status` | Bulk status checks |
+| `seer_bulk_ssl` | Bulk SSL inspections |
+| `seer_bulk_info` | Bulk domain info |
+| `seer_bulk_availability` | Bulk availability checks |
 
 ### Tool Schemas
 
@@ -281,7 +319,14 @@ seer-api/
 ├── pyproject.toml          # Package configuration
 └── seer_api/
     ├── __init__.py         # Package init
-    ├── main.py             # FastAPI app
+    ├── main.py             # FastAPI app, middleware, lifespan checks
+    ├── _env.py             # strict integer env-var parsing
+    ├── _run.py             # bounded dispatch pool + request deadlines
+    ├── errors.py           # error → HTTP status mapping
+    ├── limiting.py         # slowapi rate limiting
+    ├── middleware.py       # auth, body-size cap, request logging
+    ├── ssrf.py             # API-layer SSRF guards
+    ├── streaming.py        # SSE bulk-stream plumbing
     ├── routers/            # API endpoints
     │   ├── __init__.py
     │   ├── lookup.py
@@ -289,8 +334,11 @@ seer-api/
     │   ├── rdap.py
     │   ├── dns.py
     │   ├── propagation.py
-    │   └── status.py
-    └── mcp/                # MCP server
+    │   ├── status.py
+    │   ├── ssl.py
+    │   ├── intel.py        # availability/info/subdomains/dnssec/delegation/diff/caa/posture/confusables
+    │   └── tld.py
+    └── mcp/                # MCP server (stdio + Streamable HTTP)
         ├── __init__.py
         └── server.py
 ```

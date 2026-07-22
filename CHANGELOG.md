@@ -11,6 +11,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`seer doctor`'s WHOIS probe now resolves the target the same way
+  production WHOIS connects** (vetted resolution with the hickory fallback).
+  Previously it used the OS resolver alone, so environments with a broken
+  system resolver — where `seer whois` still works via the fallback —
+  reported a false `whois: FAIL` (exit 1) with a misleading "port 43 may be
+  blocked" detail. Resolution failures are now reported distinctly from
+  connect/exchange failures, so the timeout message only fires once
+  resolution has succeeded.
+- **`seer delegation` no longer flags IPv6-only nameservers as lame on
+  IPv4-only hosts.** A "network unreachable" from the local kernel means the
+  probe packet never left the machine, so the server's authority was never
+  tested: it is now skipped with a warning (like unresolvable glue) instead
+  of counting as lameness and failing the check with exit 1.
+- **TUI: gauge track and label colors now follow the active theme.** They
+  were the TUI's only hardcoded Frappé colors, which left the Propagation,
+  Bulk, and Follow gauge labels effectively unreadable under Latte.
+- **TUI: the whole frame is painted with the theme's base background.**
+  Latte in a dark terminal no longer renders as light bars floating on the
+  terminal's own background with near-invisible text.
+- **Subdomain baseline saves now use per-call-unique temp files.** The
+  atomic-save envelope is factored into one shared helper (`fsutil`) used by
+  history, watchlist, and subdomain baselines, closing the same-process
+  concurrent-save race in the one copy the v0.44.0 fix missed.
+
+### Documentation
+- seer-api README: fixed the `SEER_RATE_LIMIT` example — the value must be
+  `"60/minute"` (`<count>/<period>`), not a bare number, which the limits
+  parser rejects at request time; refreshed the endpoint table, the MCP tool
+  table (all 28 tools), and the project structure to match v0.44.0.
+- Root README: added the six missing API environment variables
+  (`SEER_LOG_LEVEL`, `SEER_REQUEST_TIMEOUT`, `SEER_DISPATCH_THREADS`,
+  `SEER_MAX_CONCURRENT_STREAMS`, `SEER_RELOAD`, `UVICORN_WORKERS`) and
+  BIMI/DANE to the email-posture feature line.
+- `config.rs` module doc no longer claims environment-variable overrides
+  that never existed; CLAUDE.md propagation concurrency corrected to 30.
+
 ## [0.44.0] - 2026-07-17
 
 ### Added

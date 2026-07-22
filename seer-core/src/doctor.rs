@@ -15,6 +15,7 @@
 //! fixtures. The seams do not exist in release builds: production probes
 //! always target the real, hardcoded endpoints below.
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -150,6 +151,11 @@ pub struct Doctor {
     bootstrap_url: String,
     /// Per-probe deadline.
     probe_timeout: Duration,
+    /// Test-only: resolve probe targets with the plain OS resolver instead
+    /// of [`crate::net::resolve_public_host`], so loopback fixtures are
+    /// reachable (mirrors `WhoisClient::allowing_private_hosts`).
+    #[cfg(test)]
+    allow_reserved_probe_hosts: bool,
 }
 
 impl Doctor {
@@ -164,6 +170,8 @@ impl Doctor {
             whois_addr: DEFAULT_WHOIS_ADDR.to_string(),
             bootstrap_url: IANA_BOOTSTRAP_DNS.to_string(),
             probe_timeout: DEFAULT_PROBE_TIMEOUT,
+            #[cfg(test)]
+            allow_reserved_probe_hosts: false,
         }
     }
 
@@ -211,6 +219,15 @@ impl Doctor {
     #[cfg(test)]
     pub(crate) fn with_probe_timeout(mut self, timeout: Duration) -> Self {
         self.probe_timeout = timeout;
+        self
+    }
+
+    /// Test-only: let the WHOIS probe reach loopback fixtures by resolving
+    /// with the plain OS resolver instead of the reserved-range-refusing
+    /// [`crate::net::resolve_public_host`].
+    #[cfg(test)]
+    pub(crate) fn allowing_reserved_for_tests(mut self) -> Self {
+        self.allow_reserved_probe_hosts = true;
         self
     }
 
@@ -355,11 +372,32 @@ impl Doctor {
         }
     }
 
-    /// TCP-connects to the WHOIS server, sends one query line, and requires
-    /// at least one response byte.
+    /// Resolves the WHOIS server with the production connection strategy,
+    /// then TCP-connects, sends one query line, and requires at least one
+    /// response byte.
     async fn check_whois(&self) -> DoctorCheck {
         let start = Instant::now();
-        let outcome = timeout(self.probe_timeout, self.whois_probe()).await;
+        // Stage 1: resolution. Deliberately outside `probe_timeout` — it is
+        // already bounded inside resolve_public_host (getaddrinfo capped,
+        // hickory fallback bounded), and sharing the exchange deadline would
+        // let a hung OS resolver eat the whole budget before the fallback
+        // runs: a false FAIL in exactly the broken-resolver environments the
+        // fallback exists for. Splitting the stages also keeps the timeout
+        // message below honest — it fires only once resolution succeeded.
+        let addrs = match self.resolve_whois_target().await {
+            Ok(addrs) => addrs,
+            Err(detail) => {
+                return DoctorCheck::new(
+                    CHECK_WHOIS,
+                    CheckStatus::Fail,
+                    detail,
+                    Some(latency_since(start)),
+                )
+            }
+        };
+        // Stage 2: the TCP exchange proper — a timeout here genuinely
+        // points at port-43 trouble.
+        let outcome = timeout(self.probe_timeout, self.whois_exchange(&addrs)).await;
         let latency = Some(latency_since(start));
         match outcome {
             Ok(Ok(detail)) => DoctorCheck::new(CHECK_WHOIS, CheckStatus::Pass, detail, latency),
@@ -376,11 +414,34 @@ impl Doctor {
         }
     }
 
-    /// The raw WHOIS exchange; `Err` carries the failure detail. The probe
-    /// target is the hardcoded IANA server in production (the address is
-    /// only injectable under `#[cfg(test)]`), so no SSRF validation applies.
-    async fn whois_probe(&self) -> Result<String, String> {
-        let mut stream = TcpStream::connect(&self.whois_addr)
+    /// Resolves and vets the probe target through the exact path the WHOIS
+    /// client connects with ([`crate::net::resolve_public_host`]: OS
+    /// resolver capped, hickory fallback, reserved-range refusal) so the
+    /// doctor's verdict tracks what `seer whois` will actually do. `Err`
+    /// carries the resolution-stage failure detail.
+    async fn resolve_whois_target(&self) -> Result<Vec<SocketAddr>, String> {
+        let (host, port) = self
+            .whois_addr
+            .rsplit_once(':')
+            .and_then(|(host, port)| port.parse::<u16>().ok().map(|port| (host, port)))
+            .ok_or_else(|| format!("invalid WHOIS probe address {}", self.whois_addr))?;
+        #[cfg(test)]
+        if self.allow_reserved_probe_hosts {
+            return tokio::net::lookup_host((host, port))
+                .await
+                .map(|iter| iter.collect())
+                .map_err(|e| format!("resolving {} failed: {}", host, e));
+        }
+        crate::net::resolve_public_host(host, port)
+            .await
+            .map_err(|e| format!("resolving {} failed: {}", host, e))
+    }
+
+    /// The raw WHOIS exchange against pre-vetted addresses; `Err` carries
+    /// the failure detail. The probe target is the hardcoded IANA server in
+    /// production (only injectable under `#[cfg(test)]`).
+    async fn whois_exchange(&self, addrs: &[SocketAddr]) -> Result<String, String> {
+        let mut stream = TcpStream::connect(addrs)
             .await
             .map_err(|e| format!("connect to {} failed: {}", self.whois_addr, e))?;
         stream
@@ -562,9 +623,13 @@ mod tests {
     fn base_doctor(config: &SeerConfig) -> Doctor {
         // Point the config check away from the developer's real
         // ~/.seer/config.toml — every test overrides what it exercises.
+        // The reserved-range seam lets the WHOIS probe reach the loopback
+        // fixtures; the vetting path itself is covered by
+        // `whois_check_vets_probe_target_through_resolve_public_host`.
         Doctor::from_config(config)
             .with_config_path(TmpFile::unique("unused").0.clone())
             .with_probe_timeout(Duration::from_secs(2))
+            .allowing_reserved_for_tests()
     }
 
     /// Doctor whose DNS probe is wired to the loopback mock fixture.
@@ -713,6 +778,28 @@ mod tests {
             base_doctor(&SeerConfig::default()).with_whois_addr(format!("127.0.0.1:{port}"));
         let check = doctor.check_whois().await;
         assert_eq!(check.status, CheckStatus::Fail, "got: {}", check.detail);
+    }
+
+    #[tokio::test]
+    async fn whois_check_vets_probe_target_through_resolve_public_host() {
+        // The production probe must share the WHOIS client's connection
+        // strategy (net::resolve_public_host): without the test seam, a
+        // reserved-range target is refused during the resolution stage —
+        // it must never reach a connect attempt that ends in a misleading
+        // "(port 43 may be blocked)" timeout.
+        let unused = TmpFile::unique("reserved");
+        let doctor = Doctor::from_config(&SeerConfig::default())
+            .with_config_path(unused.0.clone())
+            .with_whois_addr("10.255.255.1:43".to_string())
+            .with_probe_timeout(Duration::from_millis(300));
+        let check = doctor.check_whois().await;
+        assert_eq!(check.status, CheckStatus::Fail, "got: {}", check.detail);
+        assert!(check.detail.contains("reserved"), "got: {}", check.detail);
+        assert!(
+            !check.detail.contains("port 43 may be blocked"),
+            "got: {}",
+            check.detail
+        );
     }
 
     #[tokio::test]

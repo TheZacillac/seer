@@ -11,6 +11,7 @@ pub mod doctor;
 pub mod domain_info;
 pub mod drift;
 pub mod error;
+mod fsutil;
 pub mod history;
 pub mod logging;
 pub mod lookup;

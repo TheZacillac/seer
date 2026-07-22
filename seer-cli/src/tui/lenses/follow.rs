@@ -31,7 +31,7 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, follow: &FollowState, sp
         0.0
     };
     let gauge_label = format!("{}/{} done", follow.log.len(), follow.count);
-    let gauge_line = gauge::line(ratio, 30, theme.teal, Some(&gauge_label));
+    let gauge_line = gauge::line(theme, ratio, 30, theme.teal, Some(&gauge_label));
 
     let spin_text = if follow.running {
         format!("  {} polling…", SPIN[spin % SPIN.len()])

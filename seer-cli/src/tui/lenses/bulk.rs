@@ -90,7 +90,7 @@ pub fn render(
     };
     let ratio = bulk.rows.len() as f64 / denom as f64;
     let gauge_label = format!("{}/{} done", bulk.rows.len(), denom);
-    let gauge_line = gauge::line(ratio, 24, theme.mauve, Some(&gauge_label));
+    let gauge_line = gauge::line(theme, ratio, 24, theme.mauve, Some(&gauge_label));
 
     // Running status + ok/failed tally
     let (ok, failed) = bulk.tally();

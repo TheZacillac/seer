@@ -128,7 +128,7 @@ seer-core/src/
 - **dns/**: DNS resolution (16 record types), propagation checking (30 servers), compare, follow (live monitor), DNSSEC validation, NS delegation health (delegation.rs: parent NS set vs zone NS RRset + per-server RD=0 lameness probes, SSRF-vetted)
 - **status/**: HTTP status, SSL certificates, domain expiration checking — deliberately single-attempt (see module docs: health probes must not retry-mask flakiness)
 - **lookup.rs**: Smart lookup orchestration (RDAP → WHOIS fallback)
-- **doctor.rs**: `seer doctor` diagnosis — 4 concurrent probes (config parse, DNS resolve, WHOIS port-43, RDAP bootstrap HTTPS), each 5s-bounded; `overall` = worst check (malformed config = Warn since defaults still work; unreachable network = Fail); probe endpoints injectable via `#[cfg(test)]`-only seams
+- **doctor.rs**: `seer doctor` diagnosis — 4 concurrent probes (config parse, DNS resolve, WHOIS port-43, RDAP bootstrap HTTPS), each stage-bounded (exchange legs 5s; the WHOIS probe's resolution stage runs through `net::resolve_public_host`, separately capped there, for parity with how production WHOIS connects); `overall` = worst check (malformed config = Warn since defaults still work; unreachable network = Fail); probe endpoints injectable via `#[cfg(test)]`-only seams
 - **webhook.rs**: SSRF-guarded JSON webhook delivery for `seer watch --webhook` — resolved addresses vetted then pinned on the client (rebinding defense), redirects disabled, single-attempt, 10s timeout, non-2xx surfaces status only (never the body)
 - **bulk/**: Semaphore-based concurrent execution, file parsing
 - **retry.rs**: Shared retry framework — used by WHOIS/RDAP clients; dns/status/ssl intentionally don't (documented at their module level)
@@ -1348,7 +1348,7 @@ case today).
 ### Concurrency Limits
 
 - **Bulk operations**: Default 10, max 50
-- **DNS propagation**: 29 concurrent queries (one per server)
+- **DNS propagation**: 30 concurrent queries (one per server)
 - **RDAP bootstrap**: 4 concurrent requests (one per registry)
 
 ### Timeout Values
