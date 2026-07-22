@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.44.1] - 2026-07-21
+
 ### Fixed
 - **`seer doctor`'s WHOIS probe now resolves the target the same way
   production WHOIS connects** (vetted resolution with the hickory fallback).
@@ -702,7 +704,8 @@ Two notable breaking changes landed in this period (see `CLAUDE.md` for details)
   `inconsistencies` became typed (`ConsensusValue` / `Inconsistency`) instead of
   pre-formatted strings.
 
-[Unreleased]: https://github.com/TheZacillac/seer/compare/v0.44.0...HEAD
+[Unreleased]: https://github.com/TheZacillac/seer/compare/v0.44.1...HEAD
+[0.44.1]: https://github.com/TheZacillac/seer/compare/v0.44.0...v0.44.1
 [0.44.0]: https://github.com/TheZacillac/seer/compare/v0.43.1...v0.44.0
 [0.43.1]: https://github.com/TheZacillac/seer/compare/v0.43.0...v0.43.1
 [0.43.0]: https://github.com/TheZacillac/seer/compare/v0.42.0...v0.43.0
