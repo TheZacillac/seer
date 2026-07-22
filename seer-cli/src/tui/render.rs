@@ -23,6 +23,15 @@ fn field_buf(mode: &InputMode, target: EditTarget) -> Option<&str> {
 
 pub fn view(f: &mut Frame, app: &App, theme: &Theme) {
     let area = f.area();
+    // Paint the whole canvas before any widget: both themes must be
+    // self-contained on any terminal. Cells no widget backfills otherwise
+    // keep the terminal's own background, which renders Latte in a dark
+    // terminal as light bars floating on a dark canvas. The mantle bars and
+    // selection stripes then read as the intended contrast against base.
+    f.render_widget(
+        Block::default().style(Style::default().bg(theme.base).fg(theme.text)),
+        area,
+    );
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -448,6 +457,12 @@ fn help_overlay(f: &mut Frame, area: Rect, theme: &Theme) {
         height: h,
     };
     f.render_widget(Clear, popup);
+    // Clear resets the popup cells to the terminal default; re-apply the
+    // theme base so the overlay stays self-contained like the main canvas.
+    f.render_widget(
+        Block::default().style(Style::default().bg(theme.base).fg(theme.text)),
+        popup,
+    );
     let block = panel::block(theme, "keybindings", theme.lavender, true);
     let inner = block.inner(popup);
     f.render_widget(block, popup);
@@ -514,6 +529,39 @@ mod tests {
         assert!(s.contains("seer"), "top-bar brand missing");
         assert!(s.contains("Overview"), "first lens label missing");
         assert!(s.contains("LOOKUP"), "group header missing");
+    }
+
+    /// Every canvas cell must carry the theme's base background: with Latte
+    /// in a dark terminal, cells no widget paints otherwise keep the
+    /// terminal's own background, rendering the theme as light bars floating
+    /// on a dark canvas with near-invisible dark text.
+    #[test]
+    fn frame_canvas_is_painted_with_theme_base() {
+        let mut app = App::new(None);
+        assert!(app.set_theme_by_name("latte"));
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| view(f, &app, app.theme())).unwrap();
+        let buffer = terminal.backend().buffer();
+        let latte = Theme::latte();
+        // Main-pane interior and nav-column cells that no widget backfills.
+        for (x, y) in [(60u16, 15u16), (2, 20)] {
+            assert_eq!(buffer[(x, y)].bg, latte.base, "cell ({x},{y})");
+        }
+    }
+
+    /// The help popup must stay theme-painted too: `Clear` resets its cells
+    /// to the terminal default, so the overlay needs its own base fill or it
+    /// renders as a hole of terminal-default color in the painted canvas.
+    #[test]
+    fn help_overlay_keeps_theme_base_background() {
+        let mut app = App::new(None);
+        assert!(app.set_theme_by_name("latte"));
+        app.help = true;
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| view(f, &app, app.theme())).unwrap();
+        let buffer = terminal.backend().buffer();
+        // Popup interior on a 100x30 frame (popup is 60x16 centered).
+        assert_eq!(buffer[(50, 15)].bg, Theme::latte().base);
     }
 
     /// Draw with the App-owned theme (the call `mod.rs` makes each frame) and

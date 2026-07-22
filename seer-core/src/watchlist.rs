@@ -97,7 +97,7 @@ impl Watchlist {
     /// the user's domains). Mirrors `LookupHistory::save`.
     ///
     /// The temp filename is unique per call (PID + process-wide counter, see
-    /// `unique_tmp_path`) so concurrent saves — whether from two `seer`
+    /// `crate::fsutil`) so concurrent saves — whether from two `seer`
     /// processes or two tasks in one process — never write to the same
     /// intermediate path and race each other's `rename`s.
     ///
@@ -117,28 +117,9 @@ impl Watchlist {
     /// Like [`Self::save`] but writes to an explicit path. Split out so tests
     /// can exercise the atomic-save path without touching `~/.seer`.
     pub(crate) fn save_to_path(&self, path: &std::path::Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| SeerError::ConfigError(e.to_string()))?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
-            }
-        }
         let content =
             toml::to_string_pretty(self).map_err(|e| SeerError::ConfigError(e.to_string()))?;
-        let tmp_path = unique_tmp_path(path, "toml");
-        std::fs::write(&tmp_path, content).map_err(|e| SeerError::ConfigError(e.to_string()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600));
-        }
-        std::fs::rename(&tmp_path, path).map_err(|e| {
-            let _ = std::fs::remove_file(&tmp_path);
-            SeerError::ConfigError(e.to_string())
-        })?;
-        Ok(())
+        crate::fsutil::write_atomic_owner_only(path, &content, "toml")
     }
 
     /// Adds a domain to the watchlist. Returns `Ok(true)` if the domain was newly added.
@@ -160,18 +141,6 @@ impl Watchlist {
         self.domains.retain(|d| d != &domain);
         self.domains.len() < len_before
     }
-}
-
-/// Returns a per-call-unique sibling temp path for an atomic save. The PID
-/// alone is not unique enough: same-process concurrent saves are reachable
-/// (e.g. detached TUI writes), and a shared temp path lets one writer
-/// truncate the other's finished bytes before its rename — a torn rename
-/// that publishes a corrupt file. Mirrors `history::unique_tmp_path`.
-fn unique_tmp_path(path: &std::path::Path, ext: &str) -> PathBuf {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SAVE_COUNTER: AtomicU64 = AtomicU64::new(0);
-    let seq = SAVE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    path.with_extension(format!("{}.{}.{}.tmp", ext, std::process::id(), seq))
 }
 
 /// SSL or domain-registration expiry within this many days is *critical*.
@@ -403,18 +372,6 @@ mod tests {
         if let Some(parent) = path.parent() {
             let _ = std::fs::remove_dir_all(parent);
         }
-    }
-
-    #[test]
-    fn tmp_paths_are_unique_per_call() {
-        // PID-only temp names collide across same-process concurrent saves;
-        // every call must get its own temp path.
-        let target = std::path::Path::new("/some/dir/watchlist.toml");
-        assert_ne!(
-            unique_tmp_path(target, "toml"),
-            unique_tmp_path(target, "toml"),
-            "two saves in one process must not share a temp path"
-        );
     }
 
     #[test]

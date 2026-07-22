@@ -32,7 +32,7 @@ pub fn render(
     };
     let label = format!("{}/{} resolved", p.servers_responding, p.servers_checked);
     f.render_widget(
-        Paragraph::new(gauge::line(ratio, 30, theme.green, Some(&label))),
+        Paragraph::new(gauge::line(theme, ratio, 30, theme.green, Some(&label))),
         top_inner,
     );
 

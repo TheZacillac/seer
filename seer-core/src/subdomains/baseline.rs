@@ -201,32 +201,9 @@ impl SubdomainBaselines {
     /// Like [`Self::save`] but writes to an explicit path (test seam — same
     /// split as `load_from_path`).
     pub(crate) fn save_to_path(&self, path: &std::path::Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| SeerError::ConfigError(e.to_string()))?;
-            // Subdomain inventories are sensitive reconnaissance metadata;
-            // keep the data dir owner-only on Unix (best-effort defense in
-            // depth, matching history.rs).
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
-            }
-        }
         let content = serde_json::to_string_pretty(self)
             .map_err(|e| SeerError::ConfigError(e.to_string()))?;
-        let tmp_path = path.with_extension(format!("json.{}.tmp", std::process::id()));
-        std::fs::write(&tmp_path, content).map_err(|e| SeerError::ConfigError(e.to_string()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600));
-        }
-        std::fs::rename(&tmp_path, path).map_err(|e| {
-            // Best-effort temp cleanup; surface the original rename error.
-            let _ = std::fs::remove_file(&tmp_path);
-            SeerError::ConfigError(e.to_string())
-        })?;
-        Ok(())
+        crate::fsutil::write_atomic_owner_only(path, &content, "json")
     }
 
     /// Records `names` as the new baseline for `domain`, replacing any

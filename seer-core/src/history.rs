@@ -120,35 +120,9 @@ impl LookupHistory {
     /// Like [`Self::save`] but writes to an explicit path. Split out so tests
     /// can exercise the atomic-save path without touching `~/.seer`.
     pub(crate) fn save_to_path(&self, path: &std::path::Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| SeerError::ConfigError(e.to_string()))?;
-            // Lookup history is sensitive reconnaissance metadata; keep the
-            // ~/.seer dir owner-only on Unix (best-effort defense in depth).
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
-            }
-        }
         let content = serde_json::to_string_pretty(self)
             .map_err(|e| SeerError::ConfigError(e.to_string()))?;
-        let tmp_path = unique_tmp_path(path, "json");
-        std::fs::write(&tmp_path, content).map_err(|e| SeerError::ConfigError(e.to_string()))?;
-        // Owner-only before the rename so the published file is never briefly
-        // world-readable.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600));
-        }
-        std::fs::rename(&tmp_path, path).map_err(|e| {
-            // Best-effort cleanup of the temp file so we don't litter on
-            // failure. Swallow the cleanup error — the original rename
-            // error is what we want to surface.
-            let _ = std::fs::remove_file(&tmp_path);
-            SeerError::ConfigError(e.to_string())
-        })?;
-        Ok(())
+        crate::fsutil::write_atomic_owner_only(path, &content, "json")
     }
 
     /// Records a lookup result for the given domain, trimming old entries if needed.
@@ -219,19 +193,6 @@ impl LookupHistory {
 /// lookup key, so legacy entries are simply superseded by new writes.
 fn history_key(domain: &str) -> String {
     crate::validation::normalize_domain(domain).unwrap_or_else(|_| domain.to_lowercase())
-}
-
-/// Returns a per-call-unique sibling temp path for an atomic save. The PID
-/// alone is not unique enough: same-process concurrent saves are reachable
-/// (e.g. the TUI's detached history writes), and a shared temp path lets one
-/// writer truncate the other's finished bytes before its rename — a torn
-/// rename that publishes a corrupt file. A process-wide counter alongside the
-/// PID makes every (process, call) pair unique.
-fn unique_tmp_path(path: &std::path::Path, ext: &str) -> PathBuf {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SAVE_COUNTER: AtomicU64 = AtomicU64::new(0);
-    let seq = SAVE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    path.with_extension(format!("{}.{}.{}.tmp", ext, std::process::id(), seq))
 }
 
 #[cfg(test)]
@@ -466,19 +427,6 @@ mod tests {
         if let Some(parent) = path.parent() {
             let _ = std::fs::remove_dir_all(parent);
         }
-    }
-
-    #[test]
-    fn tmp_paths_are_unique_per_call() {
-        // PID-only temp names collide across same-process concurrent saves
-        // (the TUI's detached writes make those reachable); every call must
-        // get its own temp path.
-        let target = std::path::Path::new("/some/dir/history.json");
-        assert_ne!(
-            unique_tmp_path(target, "json"),
-            unique_tmp_path(target, "json"),
-            "two saves in one process must not share a temp path"
-        );
     }
 
     #[test]
