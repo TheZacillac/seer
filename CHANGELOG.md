@@ -11,6 +11,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.44.2] - 2026-07-23
+
+### Fixed
+- **DNS propagation checks no longer report a spurious timeout when a fast
+  domain resolves fine.** The whole 30-server fan-out was wrapped in one 15s
+  aggregate deadline; a single slow or unreachable regional-ISP resolver
+  exhausting its per-query retries could push past that deadline and fail the
+  ENTIRE check — discarding every server that had already answered. Each
+  vantage point is now bounded by its own budget and slow/dead servers are
+  reported as unreachable, so the servers that answered are always preserved
+  (visible in `seer propagation`, the TUI Propagation lens, and the API/MCP
+  propagation tools).
+
+### Maintenance
+- Dependency and CI housekeeping (no functional changes):
+  - `clap_mangen` 0.2.33 → 0.3.0.
+  - Grouped cargo minor/patch bump covering six workspace dependencies.
+  - Dev/test tooling: `pytest` 8.4.2 → 9.1.1 and `pytest-asyncio`
+    1.2.0 → 1.4.0 (seer-py).
+  - CI: `actions/setup-python` v6 → v7.
+
 ## [0.44.1] - 2026-07-21
 
 ### Fixed
@@ -704,7 +725,8 @@ Two notable breaking changes landed in this period (see `CLAUDE.md` for details)
   `inconsistencies` became typed (`ConsensusValue` / `Inconsistency`) instead of
   pre-formatted strings.
 
-[Unreleased]: https://github.com/TheZacillac/seer/compare/v0.44.1...HEAD
+[Unreleased]: https://github.com/TheZacillac/seer/compare/v0.44.2...HEAD
+[0.44.2]: https://github.com/TheZacillac/seer/compare/v0.44.1...v0.44.2
 [0.44.1]: https://github.com/TheZacillac/seer/compare/v0.44.0...v0.44.1
 [0.44.0]: https://github.com/TheZacillac/seer/compare/v0.43.1...v0.44.0
 [0.43.1]: https://github.com/TheZacillac/seer/compare/v0.43.0...v0.43.1
