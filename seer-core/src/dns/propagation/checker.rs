@@ -13,17 +13,33 @@ use super::servers::default_dns_servers;
 use super::types::{DnsServer, NameserverDetails, PropagationResult, ServerResult};
 use crate::dns::records::{RecordData, RecordType};
 use crate::dns::resolver::DnsResolver;
-use crate::error::{Result, SeerError};
+use crate::error::Result;
 
 /// Caps concurrent A/AAAA lookups during nameserver-IP enrichment so a large
 /// custom server list can't trigger an unbounded burst of DNS queries (#61).
 const MAX_CONCURRENT_NS_LOOKUPS: usize = 50;
+
+/// Per-server wall-clock budget derived from the resolver's per-query timeout.
+///
+/// A slow or unreachable vantage point is capped at this budget and reported as
+/// a failed `ServerResult`, so it can never drag the whole fan-out out — nor, as
+/// it once could under a single aggregate deadline, discard every server that
+/// already answered. Allows the resolver its per-query timeout plus one retry
+/// (2×) with a 1s margin so a responsive-but-distant resolver is not cut short.
+fn per_server_budget(query_timeout: Duration) -> Duration {
+    query_timeout
+        .saturating_mul(2)
+        .saturating_add(Duration::from_secs(1))
+}
 
 /// Checks DNS propagation across multiple global DNS servers.
 #[derive(Debug, Clone)]
 pub struct PropagationChecker {
     resolver: DnsResolver,
     servers: Vec<DnsServer>,
+    /// The resolver's per-query timeout, mirrored here so the per-server
+    /// wall-clock budget (see [`per_server_budget`]) can scale with it.
+    query_timeout: Duration,
 }
 
 impl Default for PropagationChecker {
@@ -34,9 +50,11 @@ impl Default for PropagationChecker {
 
 impl PropagationChecker {
     pub fn new() -> Self {
+        let query_timeout = Duration::from_secs(5);
         Self {
-            resolver: DnsResolver::new().with_timeout(Duration::from_secs(5)),
+            resolver: DnsResolver::new().with_timeout(query_timeout),
             servers: default_dns_servers().to_vec(),
+            query_timeout,
         }
     }
 
@@ -52,13 +70,9 @@ impl PropagationChecker {
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.resolver = DnsResolver::new().with_timeout(timeout);
+        self.query_timeout = timeout;
         self
     }
-
-    /// Outer deadline for the entire propagation check across all servers.
-    /// Individual server queries have their own per-query timeout via the resolver;
-    /// this guards against the aggregate wall-clock time exceeding a safe limit.
-    const PROPAGATION_TIMEOUT: Duration = Duration::from_secs(15);
 
     /// Hard cap on the post-check nameserver-IP enrichment step for NS lookups.
     /// If it expires, propagation results are returned without IP annotations
@@ -90,26 +104,26 @@ impl PropagationChecker {
 
         debug!(servers = self.servers.len(), "Starting propagation check");
 
+        // Bound each vantage point independently rather than wrapping the whole
+        // fan-out in one aggregate deadline. A single slow or unreachable
+        // resolver (the default list includes regional ISP recursors that don't
+        // answer external queries) exhausting its per-query retries used to push
+        // the aggregate past the outer deadline and fail the ENTIRE check —
+        // discarding every server that had already answered, so a domain that
+        // resolves instantly on the major resolvers reported a spurious timeout.
+        // With a per-server budget the stragglers come back as failed
+        // `ServerResult`s (routed to `unreachable_servers` by `analyze_results`)
+        // and the servers that answered are always preserved.
+        let budget = per_server_budget(self.query_timeout);
         let futures: Vec<_> = self
             .servers
             .iter()
-            .map(|server| self.query_server(&domain, record_type, server.clone()))
+            .map(|server| self.query_server_bounded(&domain, record_type, server.clone(), budget))
             .collect();
 
-        let results = tokio::time::timeout(Self::PROPAGATION_TIMEOUT, join_all(futures))
-            .await
-            .map_err(|_| {
-                warn!(
-                    domain = %domain,
-                    timeout_secs = Self::PROPAGATION_TIMEOUT.as_secs(),
-                    "Propagation check timed out"
-                );
-                SeerError::Timeout(format!(
-                    "propagation check for {} timed out after {}s",
-                    domain,
-                    Self::PROPAGATION_TIMEOUT.as_secs()
-                ))
-            })?;
+        // Every future is individually capped at `budget`, so `join_all`
+        // completes in at most `budget` no matter how many vantage points hang.
+        let results = join_all(futures).await;
 
         let servers_checked = results.len();
         let servers_responding = results.iter().filter(|r| r.success).count();
@@ -261,6 +275,46 @@ impl PropagationChecker {
         Self {
             resolver: DnsResolver::new(),
             servers: Vec::new(),
+            query_timeout: Duration::from_secs(5),
+        }
+    }
+
+    /// [`query_server`](Self::query_server) wrapped in a per-server timeout.
+    ///
+    /// On expiry the vantage point is recorded as a failed `ServerResult`
+    /// (`success: false`) rather than left to hang, so one unreachable resolver
+    /// can neither hold up nor discard the whole propagation result. The
+    /// resolver has its own per-query timeout/retries; this is the outer bound
+    /// that also covers a resolver whose retries would otherwise run long.
+    async fn query_server_bounded(
+        &self,
+        domain: &str,
+        record_type: RecordType,
+        server: DnsServer,
+        budget: Duration,
+    ) -> ServerResult {
+        let start = Instant::now();
+        match tokio::time::timeout(
+            budget,
+            self.query_server(domain, record_type, server.clone()),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                debug!(
+                    server = %server.name,
+                    budget_secs = budget.as_secs(),
+                    "Server exceeded per-server budget; recording as unreachable"
+                );
+                ServerResult {
+                    server,
+                    records: vec![],
+                    response_time_ms: start.elapsed().as_millis() as u64,
+                    success: false,
+                    error: Some("query timed out".to_string()),
+                }
+            }
         }
     }
 
@@ -316,6 +370,7 @@ impl PropagationChecker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::SeerError;
 
     /// `check()` must normalize the input domain ONCE at the top and store the
     /// normalized value, rather than echoing back the raw (messy) input. An
@@ -364,5 +419,49 @@ mod tests {
             .await
             .expect("well-formed SRV query must pass the upfront guard");
         assert_eq!(result.servers_checked, 0);
+    }
+
+    /// The per-server budget must allow the resolver's per-query timeout plus a
+    /// retry (2×) and never collapse to zero, so a responsive-but-distant
+    /// resolver is not cut short.
+    #[test]
+    fn per_server_budget_allows_a_retry_plus_margin() {
+        assert_eq!(
+            per_server_budget(Duration::from_secs(5)),
+            Duration::from_secs(11)
+        );
+        // Scales with a custom (e.g. config-driven) timeout.
+        assert_eq!(
+            per_server_budget(Duration::from_secs(2)),
+            Duration::from_secs(5)
+        );
+        // Degenerate zero timeout still yields a usable, non-zero budget.
+        assert_eq!(
+            per_server_budget(Duration::from_secs(0)),
+            Duration::from_secs(1)
+        );
+    }
+
+    /// A vantage point that fails must NOT sink the whole check: the failing
+    /// server is reported as unreachable and the overall call still returns
+    /// `Ok` with partial results. This is the regression guard for the outer
+    /// all-or-nothing timeout that used to discard every server's data when a
+    /// slow minority ran long. Hermetic: reserved IPs are rejected by the SSRF
+    /// guard before any network I/O, so each server fails fast without a live
+    /// query.
+    #[tokio::test]
+    async fn check_returns_partial_results_when_servers_fail() {
+        let servers = vec![
+            DnsServer::new("Reserved-A", "10.0.0.1", "Test", "Test"),
+            DnsServer::new("Reserved-B", "192.168.1.1", "Test", "Test"),
+        ];
+        let checker = PropagationChecker::new().with_servers(servers);
+        let result = checker
+            .check("example.com", RecordType::A)
+            .await
+            .expect("failing servers must yield Ok partial results, not a whole-check error");
+        assert_eq!(result.servers_checked, 2);
+        assert_eq!(result.servers_responding, 0);
+        assert_eq!(result.unreachable_servers.len(), 2);
     }
 }

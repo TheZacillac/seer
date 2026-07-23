@@ -11,6 +11,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **DNS propagation checks no longer report a spurious timeout when a fast
+  domain resolves fine.** The whole 30-server fan-out was wrapped in one 15s
+  aggregate deadline; a single slow or unreachable regional-ISP resolver
+  exhausting its per-query retries could push past that deadline and fail the
+  ENTIRE check — discarding every server that had already answered. Each
+  vantage point is now bounded by its own budget and slow/dead servers are
+  reported as unreachable, so the servers that answered are always preserved
+  (visible in `seer propagation`, the TUI Propagation lens, and the API/MCP
+  propagation tools).
+
 ## [0.44.1] - 2026-07-21
 
 ### Fixed
