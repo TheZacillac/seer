@@ -525,15 +525,20 @@ fn emit_error<E: std::fmt::Display>(output_format: seer_core::output::OutputForm
 
 /// Every name `RecordType::from_str` accepts, for error messages —
 /// `SeerError::InvalidRecordType` names only the offending input.
-pub(crate) const VALID_RECORD_TYPES: &str =
-    "A, AAAA, CNAME, MX, NS, TXT, SOA, PTR, SRV, CAA, NAPTR, DNSKEY, DS, TLSA, SSHFP, ANY";
+///
+/// Rendered from `RecordType::ALL_NAMES` rather than re-typed, so it cannot
+/// advertise a type core rejects (or omit one it accepts). `LazyLock` because
+/// joining needs an allocation a `const` can't do; only the error path and
+/// the drift test read it.
+pub(crate) static VALID_RECORD_TYPES: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| seer_core::RecordType::ALL_NAMES.join(", "));
 
 /// Parses a DNS record type, extending the core error with the list of valid
 /// types. A typo must surface as a visible error, never silently fall back to
 /// A records. Shared with the REPL, which maps the error to `CommandResult`.
 pub(crate) fn try_parse_record_type(s: &str) -> Result<seer_core::RecordType, String> {
     s.parse::<seer_core::RecordType>()
-        .map_err(|e| format!("{} (valid types: {})", e, VALID_RECORD_TYPES))
+        .map_err(|e| format!("{} (valid types: {})", e, *VALID_RECORD_TYPES))
 }
 
 /// Parses a DNS record type, routing a bad value through [`emit_error`] so the

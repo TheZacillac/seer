@@ -11,6 +11,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.44.3] - 2026-08-01
+
+### Fixed
+- **All 16 DNS record types are now discoverable everywhere.** The record-type
+  list was hand-mirrored into three surfaces and two had drifted: the REPL's
+  tab-completion and the MCP tool schemas both advertised only 13 types, so
+  `NAPTR`, `TLSA`, and `SSHFP` were fully queryable but invisible — MCP
+  clients reading the schema had no way to know they could ask for them.
+  `RecordType::ALL` / `ALL_NAMES` in seer-core is now the single source of
+  truth: the CLI error text, the REPL completer, and every MCP tool schema
+  render from it via the new `seer.record_types()` binding. Drift guards in
+  both the Rust and Python suites fail if a fourth surface re-types the list.
+- **Dependency floors no longer resolve to versions missing the symbols that
+  depend on them.** `seer-api` was pinned at `domain-seer>=0.32` while the
+  routers call `seer.delegation` and `seer.all_tlds` (both v0.44.0) — a
+  resolver picking an older release installed cleanly and then failed with
+  `AttributeError` at request time on `/delegation/{domain}` and `/tld/`.
+  `seer-cli` and `seer-py` had the same gap against `seer-core` (declared
+  `0.44.0`), which only bites on a crates.io build, where cargo drops the
+  `path` and resolves the version for real. All three floors now track the
+  release that actually contains what they call.
+
+### Added
+- `seer.record_types()` in the Python bindings — the canonical DNS record
+  type list, rendered from core. Purely embedded data, no network access.
+
 ## [0.44.2] - 2026-07-23
 
 ### Fixed
@@ -725,7 +751,8 @@ Two notable breaking changes landed in this period (see `CLAUDE.md` for details)
   `inconsistencies` became typed (`ConsensusValue` / `Inconsistency`) instead of
   pre-formatted strings.
 
-[Unreleased]: https://github.com/TheZacillac/seer/compare/v0.44.2...HEAD
+[Unreleased]: https://github.com/TheZacillac/seer/compare/v0.44.3...HEAD
+[0.44.3]: https://github.com/TheZacillac/seer/compare/v0.44.2...v0.44.3
 [0.44.2]: https://github.com/TheZacillac/seer/compare/v0.44.1...v0.44.2
 [0.44.1]: https://github.com/TheZacillac/seer/compare/v0.44.0...v0.44.1
 [0.44.0]: https://github.com/TheZacillac/seer/compare/v0.43.1...v0.44.0

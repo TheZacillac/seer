@@ -82,6 +82,14 @@ def _error_result(text: str) -> CallToolResult:
 
 _RECORD_TYPE_PATTERN = re.compile(r"[A-Z0-9]{1,10}")
 
+# Rendered from the core enum via the bindings rather than re-typed: the
+# hand-written list this replaces advertised 13 of 16 types, so NAPTR, TLSA,
+# and SSHFP were queryable but invisible to the AI clients that read these
+# schemas. One string, used by every tool that takes a `record_type`.
+_RECORD_TYPE_DESC = (
+    f"DNS record type — one of: {', '.join(seer.record_types())} (default: A)"
+)
+
 # Plausible TLD token: optional leading dot, then 1-63 ASCII
 # letters/digits/hyphens without a leading or trailing hyphen (covers
 # punycode A-labels like "xn--p1ai"). Never a URL/connect target — this only
@@ -271,10 +279,7 @@ async def list_tools() -> list[Tool]:
                     },
                     "record_type": {
                         "type": "string",
-                        "description": (
-                            "DNS record type (A, AAAA, MX, TXT, NS, SOA, CNAME, CAA, PTR, SRV, "
-                            "DNSKEY, DS, ANY)"
-                        ),
+                        "description": _RECORD_TYPE_DESC,
                         "default": "A",
                     },
                     "nameserver": {
@@ -300,7 +305,7 @@ async def list_tools() -> list[Tool]:
                     },
                     "record_type": {
                         "type": "string",
-                        "description": "DNS record type to check (default: A)",
+                        "description": _RECORD_TYPE_DESC,
                         "default": "A",
                     },
                 },
@@ -394,7 +399,7 @@ async def list_tools() -> list[Tool]:
                     },
                     "record_type": {
                         "type": "string",
-                        "description": "DNS record type (default: A)",
+                        "description": _RECORD_TYPE_DESC,
                         "default": "A",
                     },
                     "concurrency": {
@@ -454,7 +459,7 @@ async def list_tools() -> list[Tool]:
                     },
                     "record_type": {
                         "type": "string",
-                        "description": "DNS record type to check (default: A)",
+                        "description": _RECORD_TYPE_DESC,
                         "default": "A",
                     },
                     "concurrency": {
@@ -714,7 +719,7 @@ async def list_tools() -> list[Tool]:
                     "domain": {"type": "string", "description": "Domain to query"},
                     "record_type": {
                         "type": "string",
-                        "description": "Record type (A, AAAA, MX, etc.)",
+                        "description": _RECORD_TYPE_DESC,
                         "default": "A",
                     },
                     "server_a": {

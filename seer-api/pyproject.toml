@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "seer-api"
-version = "0.44.2"
+version = "0.44.3"
 description = "FastAPI server and MCP integration for Seer domain utilities"
 readme = "README.md"
 license = { text = "MIT" }
@@ -25,7 +25,13 @@ dependencies = [
     "mcp>=1.0",
     # The seer Python bindings; distributed on PyPI as `domain-seer`
     # (import name remains `seer`).
-    "domain-seer>=0.32",
+    #
+    # Floor tracks the oldest bindings release exposing every symbol the
+    # routers and MCP server call. 0.44 is required for `delegation` and
+    # `all_tlds` (added in v0.44.0) and `record_types` (v0.44.3) — a lower
+    # resolution installs cleanly and then AttributeErrors at request time,
+    # so bump this whenever a new binding is called.
+    "domain-seer>=0.44.3",
     "slowapi>=0.1.9",
     "orjson>=3.9",
 ]
