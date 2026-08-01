@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 
@@ -653,39 +654,31 @@ def test_non_loopback_binds_still_refused_without_auth(monkeypatch, host):
 # ---------------------------------------------------------------------------
 
 
-def test_root_index_lists_every_registered_route(monkeypatch):
-    """Drift guard: the `/` endpoint index is generated from `app.routes`.
+def test_root_index_lists_every_registered_route(client):
+    """Drift guard: the `/` endpoint index is generated from the route table.
 
     The hand-written literal it replaces listed 10 entries against 20 mounted
     routers, so most of the API was undiscoverable from the index whose entire
     job is to advertise it.
 
-    Reloads `main` first rather than trusting ambient module state: this file
-    reloads the module in ~30 other tests, and a reload that raises partway
-    (e.g. the SEER_CORS_ORIGINS='*' guard, which fires BEFORE the
-    include_router calls) leaves `main.app` with no routers at all. Without
-    this the test passes or fails on ordering, not on the code under test.
+    Uses the shared `client` fixture — whose app conftest binds once, before
+    any test reloads the module — and introspects `client.app`, the very app
+    serving the request. An earlier version read module-global state and so
+    passed or failed on test ordering rather than on the code under test.
     """
-    monkeypatch.delenv("SEER_CORS_ORIGINS", raising=False)
-    monkeypatch.delenv("SEER_DOCS_ENABLED", raising=False)
-    import seer_api.main as main
-
-    importlib.reload(main)
-    app = main.app
-
-    with TestClient(app) as c:
-        body = c.get("/").json()
+    app = client.app
+    body = client.get("/").json()
 
     assert "endpoints" in body, f"root returned no endpoint index: {body}"
     index = body["endpoints"]
     registered = {
         r.path for r in app.routes if getattr(r, "path", None) and r.path != "/"
     }
-    # Guards against a half-built app making the self-referential asserts
-    # below pass vacuously.
+    # The two set comparisons below are self-referential — both sides derive
+    # from the same route table — so they pass vacuously against a half-built
+    # app. This floor is what makes them meaningful.
     assert len(registered) > 30, (
-        f"app looks half-built ({len(registered)} routes) — a previous test "
-        f"likely left a failed reload behind: {sorted(registered)}"
+        f"app looks half-built ({len(registered)} routes): {sorted(registered)}"
     )
     assert set(index.values()) == registered, (
         f"index out of sync; missing={registered - set(index.values())} "
@@ -706,7 +699,32 @@ def test_root_index_lists_every_registered_route(monkeypatch):
     for name in ("delegation", "posture", "caa", "confusables", "dnssec", "subdomains"):
         assert name in index, f"{name} missing from the root index"
 
-    importlib.reload(main)
+
+def test_root_index_describes_the_serving_app_not_module_state(monkeypatch):
+    """`/` must describe the app handling the request, even after a reload.
+
+    `_endpoint_index` used to read the module-global `app`. Reloading the
+    module rebinds that global while an already-built client keeps serving the
+    original app, so the index described a DIFFERENT app than the caller was
+    talking to — which is exactly how this surfaced in CI (a pristine app
+    served the request; the index reported the 3 non-router routes of a
+    half-built global).
+    """
+    import seer_api.main as main
+
+    serving_app = main.app
+    with TestClient(serving_app) as c:
+        before = c.get("/").json()["endpoints"]
+
+    # Rebind the module global to a DIFFERENT, near-empty app.
+    monkeypatch.setattr(main, "app", FastAPI())
+    with TestClient(serving_app) as c:
+        after = c.get("/").json()["endpoints"]
+
+    assert after == before, (
+        "index followed the module global instead of the serving app"
+    )
+    assert "lookup" in after
 
 
 # ---------------------------------------------------------------------------

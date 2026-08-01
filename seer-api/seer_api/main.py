@@ -441,14 +441,22 @@ def _endpoint_name(path: str) -> str:
     return name
 
 
-def _endpoint_index() -> dict[str, str]:
-    """Map a stable name to every registered route template.
+def _endpoint_index(target: FastAPI) -> dict[str, str]:
+    """Map a stable name to every route template registered on ``target``.
 
-    Generated from ``app.routes`` rather than hand-maintained: the literal
+    Generated from the route table rather than hand-maintained: the literal
     this replaces listed 10 entries against 20 mounted routers, so most of the
     API (availability, info, subdomains, dnssec, delegation, diff, caa,
     posture, confusables, tld, and every bulk/stream route) was undiscoverable
     from the index whose whole job is to advertise it.
+
+    Takes the app explicitly — the caller passes ``request.app`` — rather than
+    closing over the module-global ``app``. The two are not always the same
+    object: anything that rebuilds the module (``importlib.reload``, which the
+    hardening tests do ~30 times) rebinds the global while already-constructed
+    clients keep serving the original app, so a module-global lookup would
+    describe an app the caller is not talking to. Introspecting the app that
+    is actually handling the request is the only answer that is always right.
 
     Keys match the previous scheme so existing consumers keep working. A
     hardening test asserts every route appears exactly once, so a future route
@@ -456,7 +464,7 @@ def _endpoint_index() -> dict[str, str]:
     another entry.
     """
     index: dict[str, str] = {}
-    for route in app.routes:
+    for route in target.routes:
         path = getattr(route, "path", None)
         if not path or path == "/":
             continue
@@ -465,13 +473,13 @@ def _endpoint_index() -> dict[str, str]:
 
 
 @app.get("/")
-async def root():
+async def root(request: Request):
     """Root endpoint with API information."""
     return {
         "name": "Seer API",
         "version": __version__,
         "description": "Domain name helper API",
-        "endpoints": _endpoint_index(),
+        "endpoints": _endpoint_index(request.app),
         "docs": "/docs" if DOCS_ENABLED else None,
     }
 

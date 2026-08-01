@@ -27,9 +27,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hand-written literal listing 10 entries against 20 mounted routers, so
   availability, info, subdomains, dnssec, delegation, diff, caa, posture,
   confusables, tld, and every bulk/stream route were missing from the index
-  whose only job is to advertise them. It is now generated from the router
-  table (37 entries), keeping the existing key scheme, and `docs` reports
-  `null` when `SEER_DOCS_ENABLED` is off rather than pointing at a 404.
+  whose only job is to advertise them. It is now generated from the route
+  table of the app actually serving the request (37 entries), keeping the
+  existing key scheme, and `docs` reports `null` when `SEER_DOCS_ENABLED` is
+  off rather than pointing at a 404.
 - `SEER_PORT` is parsed with the same validated `env_int` helper as the other
   integer tunables, so a non-numeric value gives a readable error instead of
   an opaque `ValueError` traceback out of the entry point.
