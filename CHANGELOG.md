@@ -33,6 +33,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `path` and resolves the version for real. All three floors now track the
   release that actually contains what they call.
 
+- **`seer-api` no longer installs an MCP SDK it cannot run against.** The
+  `mcp>=1.0` requirement had no upper bound, so once SDK 2.0 shipped every
+  fresh install resolved to it and failed at import with `AttributeError:
+  'Server' object has no attribute 'list_tools'` — 2.0 removed the low-level
+  decorator API (`@mcp.list_tools()` / `@mcp.call_tool()`) this server is
+  built on. Bounded to `>=1.0,<2` (resolves to 1.29.0); the 2.x migration is
+  tracked separately. This was breaking CI on every open PR, not just new
+  installs.
+
 ### Added
 - `seer.record_types()` in the Python bindings — the canonical DNS record
   type list, rendered from core. Purely embedded data, no network access.

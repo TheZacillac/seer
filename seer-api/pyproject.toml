@@ -22,7 +22,14 @@ dependencies = [
     "fastapi>=0.109,!=0.136.3",
     "uvicorn[standard]>=0.27",
     "pydantic>=2.0",
-    "mcp>=1.0",
+    # Upper-bounded at <2: the MCP SDK 2.0 (released 2026-07) removed the 1.x
+    # low-level decorator API this server is built on (`@mcp.list_tools()` /
+    # `@mcp.call_tool()` on `mcp.server.Server`), so an unbounded `>=1.0`
+    # resolves to 2.x and fails at import with
+    # `AttributeError: 'Server' object has no attribute 'list_tools'`.
+    # Migrating to the 2.x API is tracked separately; until then this bound is
+    # what keeps a fresh install working.
+    "mcp>=1.0,<2",
     # The seer Python bindings; distributed on PyPI as `domain-seer`
     # (import name remains `seer`).
     #
