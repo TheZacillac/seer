@@ -40,11 +40,13 @@ const COMMANDS: &[&str] = &[
     "copy",
 ];
 
-// Note: "CAA" here is the DNS record type completed after `dig`/`prop`/etc.,
-// distinct from the lowercase `caa` policy-lookup command in COMMANDS above.
-const RECORD_TYPES: &[&str] = &[
-    "A", "AAAA", "CNAME", "MX", "NS", "TXT", "SOA", "PTR", "SRV", "CAA", "DNSKEY", "DS", "ANY",
-];
+/// Record types come from core so completion can never drift from what
+/// `RecordType::from_str` accepts — the hand-mirrored list this replaces had
+/// silently lost NAPTR, TLSA, and SSHFP.
+///
+/// Note: "CAA" here is the DNS record type completed after `dig`/`prop`/etc.,
+/// distinct from the lowercase `caa` policy-lookup command in COMMANDS above.
+const RECORD_TYPES: &[&str] = seer_core::RecordType::ALL_NAMES;
 
 /// Bulk operation names come from the shared ops module so the completer can
 /// never drift from what `bulk` actually accepts.

@@ -25,26 +25,67 @@ pub enum RecordType {
     ANY,
 }
 
+impl RecordType {
+    /// Every queryable record type, in the canonical order the CLI help,
+    /// REPL tab-completion, and the MCP tool schema all present.
+    ///
+    /// Single source of truth: those surfaces used to hand-mirror this list
+    /// and two of the three had drifted (NAPTR/TLSA/SSHFP were missing from
+    /// the REPL completer and the MCP schema, so the types were queryable but
+    /// undiscoverable). Render from this — never re-type the list.
+    pub const ALL: &'static [RecordType] = &[
+        RecordType::A,
+        RecordType::AAAA,
+        RecordType::CNAME,
+        RecordType::MX,
+        RecordType::NS,
+        RecordType::TXT,
+        RecordType::SOA,
+        RecordType::PTR,
+        RecordType::SRV,
+        RecordType::CAA,
+        RecordType::NAPTR,
+        RecordType::DNSKEY,
+        RecordType::DS,
+        RecordType::TLSA,
+        RecordType::SSHFP,
+        RecordType::ANY,
+    ];
+
+    /// The same list as `&'static str` names, for surfaces that need string
+    /// slices directly (completion candidates, help text, JSON schemas).
+    pub const ALL_NAMES: &'static [&'static str] = &[
+        "A", "AAAA", "CNAME", "MX", "NS", "TXT", "SOA", "PTR", "SRV", "CAA", "NAPTR", "DNSKEY",
+        "DS", "TLSA", "SSHFP", "ANY",
+    ];
+
+    /// The canonical uppercase name. Exhaustive match, so adding a variant
+    /// fails to compile here first — the prompt to also extend [`Self::ALL`].
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            RecordType::A => "A",
+            RecordType::AAAA => "AAAA",
+            RecordType::CNAME => "CNAME",
+            RecordType::MX => "MX",
+            RecordType::NS => "NS",
+            RecordType::TXT => "TXT",
+            RecordType::SOA => "SOA",
+            RecordType::PTR => "PTR",
+            RecordType::SRV => "SRV",
+            RecordType::CAA => "CAA",
+            RecordType::NAPTR => "NAPTR",
+            RecordType::DNSKEY => "DNSKEY",
+            RecordType::DS => "DS",
+            RecordType::TLSA => "TLSA",
+            RecordType::SSHFP => "SSHFP",
+            RecordType::ANY => "ANY",
+        }
+    }
+}
+
 impl fmt::Display for RecordType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            RecordType::A => write!(f, "A"),
-            RecordType::AAAA => write!(f, "AAAA"),
-            RecordType::CNAME => write!(f, "CNAME"),
-            RecordType::MX => write!(f, "MX"),
-            RecordType::NS => write!(f, "NS"),
-            RecordType::TXT => write!(f, "TXT"),
-            RecordType::SOA => write!(f, "SOA"),
-            RecordType::PTR => write!(f, "PTR"),
-            RecordType::SRV => write!(f, "SRV"),
-            RecordType::CAA => write!(f, "CAA"),
-            RecordType::NAPTR => write!(f, "NAPTR"),
-            RecordType::DNSKEY => write!(f, "DNSKEY"),
-            RecordType::DS => write!(f, "DS"),
-            RecordType::TLSA => write!(f, "TLSA"),
-            RecordType::SSHFP => write!(f, "SSHFP"),
-            RecordType::ANY => write!(f, "ANY"),
-        }
+        f.write_str(self.as_str())
     }
 }
 
@@ -367,5 +408,32 @@ mod tests {
             format!("{}", naptr),
             "100 50 \"s\" \"http+N2L+N2C+N2R\" \"\" www.example.com."
         );
+    }
+
+    /// Drift guard for the three surfaces that render `RecordType::ALL`
+    /// (CLI help, REPL completion, MCP tool schema). Adding a variant breaks
+    /// `as_str`'s exhaustive match at compile time; this pins the count so the
+    /// author must also extend `ALL`/`ALL_NAMES` rather than only `as_str`.
+    #[test]
+    fn all_is_complete() {
+        assert_eq!(
+            RecordType::ALL.len(),
+            16,
+            "new RecordType variant — add it to ALL and ALL_NAMES too"
+        );
+        assert_eq!(RecordType::ALL.len(), RecordType::ALL_NAMES.len());
+    }
+
+    /// `ALL`, `ALL_NAMES`, `as_str`, and `FromStr` must agree entry-for-entry:
+    /// a name a surface advertises has to be one `from_str` actually accepts.
+    #[test]
+    fn all_names_match_and_round_trip() {
+        for (rt, name) in RecordType::ALL.iter().zip(RecordType::ALL_NAMES) {
+            assert_eq!(&rt.as_str(), name, "ALL/ALL_NAMES out of order");
+            assert_eq!(
+                name.parse::<RecordType>().expect("advertised name parses"),
+                *rt
+            );
+        }
     }
 }

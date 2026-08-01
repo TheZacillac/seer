@@ -1012,6 +1012,21 @@ fn all_tlds() -> Vec<String> {
         .collect()
 }
 
+/// Return every DNS record type `dig`/`propagation` accept, in canonical
+/// order. Purely embedded data — no network access.
+///
+/// Exists so Python surfaces (the MCP tool schema, in particular) can render
+/// the list instead of hand-mirroring it: the MCP schema had drifted to 13 of
+/// 16 types, leaving NAPTR/TLSA/SSHFP queryable but undiscoverable by the AI
+/// clients that read it.
+#[pyfunction]
+fn record_types() -> Vec<String> {
+    RecordType::ALL_NAMES
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
 /// Maximum recursion depth permitted when converting `serde_json::Value`
 /// into a Python object graph.
 ///
@@ -1179,5 +1194,6 @@ fn _seer(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(bulk_info, m)?)?;
     m.add_function(wrap_pyfunction!(tld_info, m)?)?;
     m.add_function(wrap_pyfunction!(all_tlds, m)?)?;
+    m.add_function(wrap_pyfunction!(record_types, m)?)?;
     Ok(())
 }

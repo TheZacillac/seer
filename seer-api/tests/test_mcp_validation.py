@@ -152,3 +152,34 @@ def test_call_tool_ssrf_refusal_has_single_prefix(monkeypatch) -> None:
         + "Invalid input: refusing to connect to reserved address: 127.0.0.1"
     )
     assert text.count("Invalid input:") == 1
+
+
+def test_record_type_description_covers_every_type_core_accepts() -> None:
+    """Drift guard for the MCP tool schemas.
+
+    The record-type list was hand-mirrored into the schema descriptions and
+    drifted to 13 of 16 types, leaving NAPTR/TLSA/SSHFP queryable but
+    undiscoverable by the AI clients that read these schemas. The description
+    is now rendered from ``seer.record_types()`` (which is itself rendered from
+    core's ``RecordType::ALL_NAMES``), so this asserts the rendering actually
+    reaches the schema rather than that the two lists match.
+    """
+    types = seer.record_types()
+    assert len(types) >= 16
+    for name in types:
+        assert name in server._RECORD_TYPE_DESC, f"{name} missing from schema description"
+
+
+def test_every_record_type_argument_advertises_the_full_list() -> None:
+    """No tool may carry a `record_type` argument with a hand-written
+    description — all five must share the rendered constant, or the next one
+    added will silently reintroduce the drift."""
+    tools = asyncio.run(server.list_tools())
+    described = [
+        t.inputSchema.get("properties", {}).get("record_type")
+        for t in tools
+        if "record_type" in t.inputSchema.get("properties", {})
+    ]
+    assert described, "expected at least one tool with a record_type argument"
+    for prop in described:
+        assert prop["description"] == server._RECORD_TYPE_DESC
