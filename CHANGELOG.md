@@ -34,6 +34,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `SEER_PORT` is parsed with the same validated `env_int` helper as the other
   integer tunables, so a non-numeric value gives a readable error instead of
   an opaque `ValueError` traceback out of the entry point.
+- **`/metrics` no longer merges distinct endpoints into one bucket.** As of
+  FastAPI 0.141 a route mounted via `include_router(prefix=...)` reports its
+  template *without* the prefix, so `/info/{domain}`, `/availability/{domain}`,
+  `/posture/{domain}` and every other `/{domain}` route collapsed into a
+  single `/{domain}` label — per-endpoint metrics were wrong, not merely
+  coarse. The label now reconstructs the prefix from the request, which is a
+  no-op on older FastAPI (where templates were already absolute).
 
 ## [0.44.3] - 2026-08-01
 

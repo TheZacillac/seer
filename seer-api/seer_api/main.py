@@ -462,11 +462,27 @@ def _endpoint_index(target: FastAPI) -> dict[str, str]:
     hardening test asserts every route appears exactly once, so a future route
     whose derived name collides fails loudly instead of silently displacing
     another entry.
+
+    Two sources, because neither alone is complete:
+
+    * ``openapi()["paths"]`` for the documented API routes. Walking
+      ``target.routes`` is NOT sufficient — as of FastAPI 0.141 an included
+      router stays a lazy ``_IncludedRouter`` wrapper that exposes no ``path``
+      and never flattens into ``routes``, so every router-mounted endpoint is
+      invisible there. Older FastAPI did flatten, which is why this only shows
+      up against a current release. The OpenAPI schema is the public,
+      version-stable inventory and is cached on the app after first build.
+    * ``target.routes`` entries that expose a plain ``path``, for raw
+      Starlette routes the schema omits — today that is the ``/mcp`` ASGI
+      mount, plus ``/health`` and ``/metrics``.
     """
+    paths: set[str] = set(target.openapi().get("paths", {}))
+    paths.update(
+        path for route in target.routes if (path := getattr(route, "path", None))
+    )
     index: dict[str, str] = {}
-    for route in target.routes:
-        path = getattr(route, "path", None)
-        if not path or path == "/":
+    for path in paths:
+        if path == "/":
             continue
         index[_endpoint_name(path)] = path
     return dict(sorted(index.items()))
