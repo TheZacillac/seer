@@ -607,6 +607,88 @@ def test_loopback_bind_without_auth_starts(monkeypatch):
     importlib.reload(main)
 
 
+@pytest.mark.parametrize("host", ["::1", "[::1]", "localhost", "127.0.0.2", "::ffff:127.0.0.1"])
+def test_other_loopback_forms_start_without_auth(monkeypatch, host):
+    """Every loopback spelling is as private as 127.0.0.1 and must start.
+
+    The guard used to be a literal `!= "127.0.0.1"`, so binding to IPv6
+    loopback refused to start with a "public bind without auth" error that
+    misdescribed the bind. Covers IPv6 loopback (bare and bracketed), the
+    `localhost` hostname, the rest of 127.0.0.0/8, and the IPv4-mapped form.
+    """
+    monkeypatch.setenv("SEER_HOST", host)
+    monkeypatch.delenv("SEER_API_KEY", raising=False)
+    import seer_api.main as main
+
+    importlib.reload(main)
+    with TestClient(main.app) as c:
+        assert c.get("/health").status_code == 200
+
+    monkeypatch.delenv("SEER_HOST")
+    importlib.reload(main)
+
+
+@pytest.mark.parametrize("host", ["0.0.0.0", "::", "example.com", "10.0.0.5", "not-an-ip!"])
+def test_non_loopback_binds_still_refused_without_auth(monkeypatch, host):
+    """The widened check must not become permissive.
+
+    A wildcard bind (`0.0.0.0` / `::`) *includes* loopback but is reachable
+    off-box, and an unparseable value must fail closed rather than be waved
+    through as "probably local".
+    """
+    monkeypatch.setenv("SEER_HOST", host)
+    monkeypatch.delenv("SEER_API_KEY", raising=False)
+    import seer_api.main as main
+
+    importlib.reload(main)
+    with pytest.raises(RuntimeError, match="public bind without auth"), TestClient(main.app):
+        pass
+
+    monkeypatch.delenv("SEER_HOST")
+    importlib.reload(main)
+
+
+# ---------------------------------------------------------------------------
+# Root index must advertise every mounted route
+# ---------------------------------------------------------------------------
+
+
+def test_root_index_lists_every_registered_route():
+    """Drift guard: the `/` endpoint index is generated from `app.routes`.
+
+    The hand-written literal it replaces listed 10 entries against 20 mounted
+    routers, so most of the API was undiscoverable from the index whose entire
+    job is to advertise it.
+    """
+    from seer_api.main import app
+
+    with TestClient(app) as c:
+        body = c.get("/").json()
+
+    index = body["endpoints"]
+    registered = {
+        r.path for r in app.routes if getattr(r, "path", None) and r.path != "/"
+    }
+    assert set(index.values()) == registered, (
+        f"index out of sync; missing={registered - set(index.values())} "
+        f"extra={set(index.values()) - registered}"
+    )
+    # Every route must get its OWN key: a derived name that collides would
+    # silently displace another entry instead of failing.
+    assert len(index) == len(registered), "derived endpoint names collided"
+    # Key scheme preserved from the hand-written index it replaces.
+    assert index["lookup"] == "/lookup/{domain}"
+    assert index["rdap_domain"] == "/rdap/domain/{domain}"
+    assert index["ssl_bulk"] == "/ssl/bulk"
+    assert index["mcp"] == "/mcp"
+    # Collection vs item route disambiguation.
+    assert index["tld_index"] == "/tld/"
+    assert index["tld"] == "/tld/{tld}"
+    # Spot-check routes the old literal omitted entirely.
+    for name in ("delegation", "posture", "caa", "confusables", "dnssec", "subdomains"):
+        assert name in index, f"{name} missing from the root index"
+
+
 # ---------------------------------------------------------------------------
 # D7 (H10): multi-worker without shared rate-limit store is refused
 # ---------------------------------------------------------------------------

@@ -718,6 +718,7 @@ impl Repl {
             "{}",
             crate::render_doctor_report(&report, self.context.output_format)
         );
+        self.last_result = Some(crate::payload::Payload::Doctor(Box::new(report)));
         CommandResult::Continue
     }
 
@@ -1625,6 +1626,82 @@ mod copy_tests {
     // which fetches/refreshes the IANA RDAP bootstrap data over the network
     // when the process-global cache is cold — so this is a live-network test
     // by the project's convention (see e.g. seer-core/src/rdap/client.rs).
+    /// The `doctor` command previously rendered its report without touching
+    /// `last_result`, so a following `copy` silently copied whatever ran
+    /// BEFORE it — wrong output, no error. Seed a DNS result (the stale value
+    /// the bug would have surfaced), then confirm a doctor payload wins.
+    #[test]
+    fn copy_after_doctor_copies_the_doctor_report_not_the_previous_result() {
+        use seer_core::doctor::{CheckStatus, DoctorCheck, DoctorReport};
+
+        let mut repl = repl_with_result();
+        // Pre-condition: the stale payload the bug would have copied.
+        assert_eq!(repl.last_result.as_ref().expect("seeded").kind(), "dns");
+
+        repl.last_result = Some(crate::payload::Payload::Doctor(Box::new(
+            DoctorReport::from_checks(vec![DoctorCheck {
+                name: "dns".into(),
+                status: CheckStatus::Pass,
+                detail: "resolved example.com".into(),
+                latency_ms: Some(12),
+            }]),
+        )));
+
+        let (text, msg) = repl.render_copy(&[]).expect("doctor payload is copyable");
+        assert!(
+            msg.contains("doctor"),
+            "confirmation should name doctor: {msg}"
+        );
+        assert!(
+            text.contains("resolved example.com"),
+            "copied text should be the doctor report: {text}"
+        );
+        assert!(
+            !text.contains("1.2.3.4"),
+            "must not copy the stale DNS result: {text}"
+        );
+    }
+
+    /// Every copy format must render a doctor payload — `copy` offers
+    /// markdown/json/yaml, and doctor is the one payload with no
+    /// `OutputFormatter` method behind it.
+    #[test]
+    fn doctor_payload_serializes_in_every_copy_format() {
+        use seer_core::doctor::{CheckStatus, DoctorCheck, DoctorReport};
+        use seer_core::output::OutputFormat;
+
+        let payload = crate::payload::Payload::Doctor(Box::new(DoctorReport::from_checks(vec![
+            DoctorCheck {
+                name: "whois".into(),
+                status: CheckStatus::Warn,
+                detail: "port 43 slow".into(),
+                latency_ms: Some(4200),
+            },
+        ])));
+        for format in [
+            OutputFormat::Markdown,
+            OutputFormat::Json,
+            OutputFormat::Yaml,
+        ] {
+            let out = crate::payload::serialize(&payload, format);
+            assert!(
+                out.contains("whois"),
+                "{format:?} output missing check name: {out}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "live network; run with --ignored or SEER_LIVE_TESTS=1"]
+    async fn doctor_command_populates_last_result() {
+        let mut repl = Repl::new().expect("repl construction is offline");
+        let _ = repl.execute_line("doctor").await;
+        assert!(
+            matches!(repl.last_result, Some(crate::payload::Payload::Doctor(_))),
+            "doctor should store a copyable payload"
+        );
+    }
+
     #[tokio::test]
     #[ignore = "live network; run with --ignored or SEER_LIVE_TESTS=1"]
     async fn tld_command_populates_last_result() {
