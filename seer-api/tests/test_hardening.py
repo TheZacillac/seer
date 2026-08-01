@@ -739,7 +739,6 @@ def test_metrics_labels_keep_the_router_prefix(monkeypatch):
     templates, so this only appears against a current release.
     """
     import seer
-
     from seer_api.main import app
     from seer_api.middleware import metrics
 
