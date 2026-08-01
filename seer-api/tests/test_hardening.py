@@ -653,22 +653,40 @@ def test_non_loopback_binds_still_refused_without_auth(monkeypatch, host):
 # ---------------------------------------------------------------------------
 
 
-def test_root_index_lists_every_registered_route():
+def test_root_index_lists_every_registered_route(monkeypatch):
     """Drift guard: the `/` endpoint index is generated from `app.routes`.
 
     The hand-written literal it replaces listed 10 entries against 20 mounted
     routers, so most of the API was undiscoverable from the index whose entire
     job is to advertise it.
+
+    Reloads `main` first rather than trusting ambient module state: this file
+    reloads the module in ~30 other tests, and a reload that raises partway
+    (e.g. the SEER_CORS_ORIGINS='*' guard, which fires BEFORE the
+    include_router calls) leaves `main.app` with no routers at all. Without
+    this the test passes or fails on ordering, not on the code under test.
     """
-    from seer_api.main import app
+    monkeypatch.delenv("SEER_CORS_ORIGINS", raising=False)
+    monkeypatch.delenv("SEER_DOCS_ENABLED", raising=False)
+    import seer_api.main as main
+
+    importlib.reload(main)
+    app = main.app
 
     with TestClient(app) as c:
         body = c.get("/").json()
 
+    assert "endpoints" in body, f"root returned no endpoint index: {body}"
     index = body["endpoints"]
     registered = {
         r.path for r in app.routes if getattr(r, "path", None) and r.path != "/"
     }
+    # Guards against a half-built app making the self-referential asserts
+    # below pass vacuously.
+    assert len(registered) > 30, (
+        f"app looks half-built ({len(registered)} routes) — a previous test "
+        f"likely left a failed reload behind: {sorted(registered)}"
+    )
     assert set(index.values()) == registered, (
         f"index out of sync; missing={registered - set(index.values())} "
         f"extra={set(index.values()) - registered}"
@@ -687,6 +705,8 @@ def test_root_index_lists_every_registered_route():
     # Spot-check routes the old literal omitted entirely.
     for name in ("delegation", "posture", "caa", "confusables", "dnssec", "subdomains"):
         assert name in index, f"{name} missing from the root index"
+
+    importlib.reload(main)
 
 
 # ---------------------------------------------------------------------------
