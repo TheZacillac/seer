@@ -50,7 +50,7 @@ def test_bulk_ssl_is_limited_to_five_per_minute(monkeypatch):
         out = asyncio.run(server.call_tool("seer_bulk_ssl", args))
         assert "rate limit" not in _text(out).lower(), _text(out)
     out = asyncio.run(server.call_tool("seer_bulk_ssl", args))
-    assert out.isError is True
+    assert out.is_error is True
     assert "rate limit" in _text(out).lower(), _text(out)
     assert calls["n"] == 5, "the over-limit call must not reach the binding"
 
@@ -70,7 +70,7 @@ def test_confusables_is_limited_to_five_per_minute(monkeypatch):
         out = asyncio.run(server.call_tool("seer_confusables", args))
         assert "rate limit" not in _text(out).lower(), _text(out)
     out = asyncio.run(server.call_tool("seer_confusables", args))
-    assert out.isError is True
+    assert out.is_error is True
     assert "rate limit" in _text(out).lower(), _text(out)
     assert calls["n"] == 5
 
@@ -90,7 +90,7 @@ def test_bulk_availability_is_limited_to_ten_per_minute(monkeypatch):
         out = asyncio.run(server.call_tool("seer_bulk_availability", args))
         assert "rate limit" not in _text(out).lower(), _text(out)
     out = asyncio.run(server.call_tool("seer_bulk_availability", args))
-    assert out.isError is True
+    assert out.is_error is True
     assert "rate limit" in _text(out).lower(), _text(out)
     assert calls["n"] == 10, "the over-limit call must not reach the binding"
 

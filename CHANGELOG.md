@@ -11,6 +11,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Migrated to MCP SDK 2.0.** 2.0 removed the `@server.list_tools()` /
+  `@server.call_tool()` decorators; handlers are now registered by protocol
+  method name and receive `(request_context, params)`. The tool registry and
+  dispatcher keep their original signatures — thin adapters do the protocol
+  marshalling the decorators used to do implicitly — so all 28 tools, the
+  per-tool rate limits, and the `is_error` contract that distinguishes genuine
+  tool failures from data are unchanged. `StreamableHTTPSessionManager` and
+  `Server.run` kept their signatures, so `/mcp` and the stdio transport needed
+  no wiring changes. Verified end-to-end over real JSON-RPC on stdio
+  (initialize + tools/list returning all 28) as well as by the suite.
+  `seer-api` now requires `mcp>=2.0`, replacing the temporary `<2` bound.
+- **Rust dependencies refreshed**, including reqwest 0.12 → 0.13. Its TLS
+  feature was renamed `rustls-tls` → `rustls` and now selects aws-lc-rs where
+  0.12 used ring, so both providers sit in the tree; each configures its own
+  explicitly, verified over plain DNS, DoT, DoH, and RDAP-over-HTTPS.
+
 ### Fixed
 - **REPL: `copy` after `doctor` copied the wrong result.** `doctor` rendered
   its report without recording it, so a following `copy` silently copied

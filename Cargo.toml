@@ -28,14 +28,25 @@ homepage = "https://github.com/TheZacillac/seer"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "signal"] }
 
 # HTTP client
-reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"], default-features = false }
+# reqwest 0.13 renamed the TLS feature `rustls-tls` -> `rustls`, and that
+# feature now selects aws-lc-rs as the crypto provider where 0.12's
+# `rustls-tls` used ring. Both providers therefore sit in the tree (hickory
+# still pins ring via dnssec-ring/tls-ring/https-ring), which is fine because
+# each configures its own explicitly rather than relying on rustls' ambiguous
+# process-level default — verified end-to-end over plain DNS, DoT, DoH, and
+# RDAP-over-HTTPS. `aws-lc-sys` does add a cmake/C build step, which matters
+# for the cargo-dist cross-compiled release targets.
+# `default-features = false` keeps reqwest off its own default-tls path; the
+# native-tls in the tree is seer-core's own dependency for SSL chain
+# inspection (ssl.rs), unrelated to this.
+reqwest = { version = "0.13", features = ["json", "rustls", "stream"], default-features = false }
 
 # DNS resolution.
 # tls-ring/https-ring enable DoT/DoH upstream nameservers (tls:// and https://
 # specs); webpki-roots supplies the rustls root store hickory verifies those
 # TLS connections against (without it the root store would be empty and every
 # DoT/DoH handshake would fail). ring + rustls + webpki-roots are already in
-# the dependency tree via reqwest's rustls-tls and dnssec-ring, so this adds
+# the dependency tree via reqwest's rustls feature and dnssec-ring, so this adds
 # no new TLS stack.
 hickory-resolver = { version = "0.26", features = ["dnssec-ring", "tls-ring", "https-ring", "webpki-roots"] }
 

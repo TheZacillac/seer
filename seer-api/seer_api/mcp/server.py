@@ -10,9 +10,16 @@ from typing import Any
 from limits import parse as _parse_rate_limit
 from limits.storage import storage_from_string as _rate_storage_from_string
 from limits.strategies import MovingWindowRateLimiter
-from mcp.server import Server
+from mcp.server import Server, ServerRequestContext
 from mcp.server.stdio import stdio_server
-from mcp.types import CallToolResult, TextContent, Tool
+from mcp.types import (
+    CallToolRequestParams,
+    CallToolResult,
+    ListToolsResult,
+    PaginatedRequestParams,
+    TextContent,
+    Tool,
+)
 
 import seer
 
@@ -68,15 +75,15 @@ UNTRUSTED_PREAMBLE = (
 def _error_result(text: str) -> CallToolResult:
     """Build a failure result with the MCP error flag set.
 
-    Returning an explicit ``CallToolResult`` with ``isError=True`` (instead of
-    a bare content list, which the SDK wraps as ``isError=False``) lets hosts
+    Returning an explicit ``CallToolResult`` with ``is_error=True`` (instead of
+    a bare content list, which the adapter wraps as ``is_error=False``) lets hosts
     distinguish genuine tool failures from data. Error text gets the same
     untrusted-data preamble as success payloads: failure messages can embed
     content derived from WHOIS/RDAP/DNS responses we do not control.
     """
     return CallToolResult(
         content=[TextContent(type="text", text=UNTRUSTED_PREAMBLE + text)],
-        isError=True,
+        is_error=True,
     )
 
 
@@ -171,7 +178,6 @@ def _invalid_input_message(exc: Exception) -> str:
     return _INVALID_INPUT_PREFIX + msg
 
 
-@mcp.list_tools()
 async def list_tools() -> list[Tool]:
     """List available Seer tools."""
     return [
@@ -796,7 +802,6 @@ def _tool_rate_ok(name: str) -> bool:
     return _tool_rate_limiter.hit(_parse_rate_limit(limit), "mcp-tool", name)
 
 
-@mcp.call_tool()
 async def call_tool(
     name: str, arguments: dict[str, Any]
 ) -> list[TextContent] | CallToolResult:
@@ -1069,6 +1074,42 @@ async def execute_tool(name: str, arguments: dict[str, Any]) -> Any:
 
         case _:
             raise ValueError(f"Unknown tool: {name}")
+
+
+# --- MCP 2.x handler registration -------------------------------------------
+# MCP SDK 2.0 removed the `@server.list_tools()` / `@server.call_tool()`
+# decorators; handlers are now registered by protocol method name and receive
+# `(request_context, params)`. `list_tools` and `call_tool` above keep their
+# original signatures — they are the tool registry and dispatcher, called
+# directly by the test suite — and these thin adapters do the protocol
+# marshalling the decorators used to do implicitly.
+
+
+async def _handle_list_tools(
+    _ctx: ServerRequestContext[Any], _params: PaginatedRequestParams | None
+) -> ListToolsResult:
+    return ListToolsResult(tools=await list_tools())
+
+
+async def _handle_call_tool(
+    _ctx: ServerRequestContext[Any], params: CallToolRequestParams
+) -> CallToolResult:
+    """Adapt the dispatcher's return to a `CallToolResult`.
+
+    `call_tool` returns a bare content list on success — which the 1.x SDK
+    wrapped with `isError=False` — and an explicit `CallToolResult` on every
+    failure branch so `isError=True` survives. 2.0 wraps nothing, so the
+    success case is wrapped here; preserving that split is what keeps genuine
+    tool failures distinguishable from data at the client.
+    """
+    result = await call_tool(params.name, params.arguments or {})
+    if isinstance(result, CallToolResult):
+        return result
+    return CallToolResult(content=result)
+
+
+mcp.add_request_handler("tools/list", PaginatedRequestParams, _handle_list_tools)
+mcp.add_request_handler("tools/call", CallToolRequestParams, _handle_call_tool)
 
 
 async def main():

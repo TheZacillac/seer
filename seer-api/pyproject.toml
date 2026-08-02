@@ -29,7 +29,7 @@ dependencies = [
     # `AttributeError: 'Server' object has no attribute 'list_tools'`.
     # Migrating to the 2.x API is tracked separately; until then this bound is
     # what keeps a fresh install working.
-    "mcp>=1.0,<2",
+    "mcp>=2.0",
     # The seer Python bindings; distributed on PyPI as `domain-seer`
     # (import name remains `seer`).
     #

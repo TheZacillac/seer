@@ -49,7 +49,7 @@ def test_every_failure_branch_sets_iserror_and_preamble(monkeypatch, exc):
         "failures must return CallToolResult, not a bare content list "
         "(which the SDK stamps isError=False)"
     )
-    assert result.isError is True
+    assert result.is_error is True
     assert len(result.content) == 1
     assert result.content[0].text.startswith(mcp_server.UNTRUSTED_PREAMBLE)
 
@@ -60,20 +60,26 @@ def test_per_tool_rate_limit_throttle_sets_iserror(monkeypatch):
         mcp_server.call_tool("seer_bulk_ssl", {"domains": ["example.com"]})
     )
     assert isinstance(result, types.CallToolResult)
-    assert result.isError is True
+    assert result.is_error is True
     assert "rate limit" in result.content[0].text.lower()
 
 
 def _run_sdk_handler(name: str, arguments: dict) -> types.CallToolResult:
     """Drive the registered SDK request handler — the exact code path both
     the stdio and streamable-HTTP transports invoke for tools/call."""
-    handler = mcp_server.mcp.request_handlers[types.CallToolRequest]
-    req = types.CallToolRequest(
-        method="tools/call",
-        params=types.CallToolRequestParams(name=name, arguments=arguments),
-    )
-    result = asyncio.run(handler(req))
-    ctr = result.root
+    # MCP 2.x: handlers are keyed by protocol method name via the public
+    # `get_request_handler`, take `(request_context, params)`, and return the
+    # result directly rather than wrapped in a `.root` union member.
+    entry = mcp_server.mcp.get_request_handler("tools/call")
+    assert entry is not None, "tools/call handler is not registered"
+    # `get_request_handler` returns a HandlerEntry pairing the callable with
+    # the params model the runner validates against; validate through that
+    # model so this exercises the same shape the transports deliver.
+    params = entry.params_type.model_validate({"name": name, "arguments": arguments})
+    handler = entry.handler
+    # The registered adapter ignores the request context, so None is safe and
+    # keeps this focused on the dispatch path rather than session plumbing.
+    ctr = asyncio.run(handler(None, params))
     assert isinstance(ctr, types.CallToolResult)
     return ctr
 
@@ -84,7 +90,7 @@ def test_sdk_handler_stamps_iserror_on_failure(monkeypatch):
 
     monkeypatch.setattr(mcp_server, "execute_tool", _boom)
     ctr = _run_sdk_handler("seer_lookup", {"domain": "example.com"})
-    assert ctr.isError is True
+    assert ctr.is_error is True
     assert ctr.content[0].text.startswith(mcp_server.UNTRUSTED_PREAMBLE)
 
 
@@ -94,6 +100,6 @@ def test_sdk_handler_success_is_not_error(monkeypatch):
 
     monkeypatch.setattr(seer, "lookup", _ok, raising=False)
     ctr = _run_sdk_handler("seer_lookup", {"domain": "example.com"})
-    assert ctr.isError is False
+    assert ctr.is_error is False
     assert ctr.content[0].text.startswith(mcp_server.UNTRUSTED_PREAMBLE)
     assert "example.com" in ctr.content[0].text
