@@ -114,7 +114,7 @@ def test_call_tool_tld_info_junk_is_invalid_input(monkeypatch) -> None:
 
     monkeypatch.setattr(seer, "tld_info", _must_not_run, raising=False)
     result = asyncio.run(server.call_tool("seer_tld_info", {"tld": "not_a_tld!"}))
-    assert result.isError is True
+    assert result.is_error is True
     assert "Invalid input:" in result.content[0].text
 
 
@@ -127,7 +127,7 @@ def test_new_tools_are_listed() -> None:
 
 def test_call_tool_delegation_missing_domain_is_invalid_input() -> None:
     result = asyncio.run(server.call_tool("seer_delegation", {}))
-    assert result.isError is True
+    assert result.is_error is True
     assert "Required argument 'domain'" in result.content[0].text
 
 
@@ -145,7 +145,7 @@ def test_call_tool_ssrf_refusal_has_single_prefix(monkeypatch) -> None:
     monkeypatch.setattr(seer, "validate_public_host", _reserved, raising=False)
 
     result = asyncio.run(server.call_tool("seer_rdap_ip", {"ip": "127.0.0.1"}))
-    assert result.isError is True
+    assert result.is_error is True
     text = result.content[0].text
     assert text == (
         server.UNTRUSTED_PREAMBLE
@@ -176,9 +176,9 @@ def test_every_record_type_argument_advertises_the_full_list() -> None:
     added will silently reintroduce the drift."""
     tools = asyncio.run(server.list_tools())
     described = [
-        t.inputSchema.get("properties", {}).get("record_type")
+        t.input_schema.get("properties", {}).get("record_type")
         for t in tools
-        if "record_type" in t.inputSchema.get("properties", {})
+        if "record_type" in t.input_schema.get("properties", {})
     ]
     assert described, "expected at least one tool with a record_type argument"
     for prop in described:

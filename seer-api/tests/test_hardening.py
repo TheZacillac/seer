@@ -480,7 +480,7 @@ def test_mcp_call_tool_returns_invalid_input_for_ssrf():
     from seer_api.mcp.server import UNTRUSTED_PREAMBLE, call_tool
 
     result = asyncio.run(call_tool("seer_status", {"domain": "127.0.0.1"}))
-    assert result.isError is True
+    assert result.is_error is True
     assert len(result.content) == 1
     text = result.content[0].text
     assert text.startswith(UNTRUSTED_PREAMBLE)
@@ -512,7 +512,7 @@ def _run_call_tool_with_error(monkeypatch, exc: Exception) -> str:
 
     monkeypatch.setattr(mcp_server, "execute_tool", _boom)
     result = asyncio.run(mcp_server.call_tool("seer_lookup", {"domain": "x.test"}))
-    assert result.isError is True
+    assert result.is_error is True
     assert len(result.content) == 1
     text = result.content[0].text
     assert text.startswith(mcp_server.UNTRUSTED_PREAMBLE)
