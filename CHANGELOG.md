@@ -11,109 +11,94 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.45.0] - 2026-08-01
+
+Consolidates everything since v0.44.2. (A `0.44.3` version number briefly
+existed in-tree but was never tagged or released; its changes are folded in
+here.)
+
 ### Changed
-- **Migrated to MCP SDK 2.0.** 2.0 removed the `@server.list_tools()` /
-  `@server.call_tool()` decorators; handlers are now registered by protocol
-  method name and receive `(request_context, params)`. The tool registry and
-  dispatcher keep their original signatures — thin adapters do the protocol
-  marshalling the decorators used to do implicitly — so all 28 tools, the
-  per-tool rate limits, and the `is_error` contract that distinguishes genuine
-  tool failures from data are unchanged. `StreamableHTTPSessionManager` and
-  `Server.run` kept their signatures, so `/mcp` and the stdio transport needed
-  no wiring changes. Verified end-to-end over real JSON-RPC on stdio
-  (initialize + tools/list returning all 28) as well as by the suite.
-  `seer-api` now requires `mcp>=2.0`, replacing the temporary `<2` bound.
+- **BREAKING (embedders): `seer-api` now requires MCP SDK 2.0** (`mcp>=2.0`).
+  2.0 removed the `@server.list_tools()` / `@server.call_tool()` decorators the
+  server was built on; handlers are now registered by protocol method name and
+  receive `(request_context, params)`. The tool registry and dispatcher keep
+  their original signatures — thin adapters do the protocol marshalling the
+  decorators used to do implicitly — so all 28 tools, the per-tool rate limits,
+  and the `is_error` contract that distinguishes genuine tool failures from
+  data are unchanged. `StreamableHTTPSessionManager` and `Server.run` kept
+  their signatures, so `/mcp` and the stdio transport needed no wiring changes.
+  Verified end-to-end over real JSON-RPC on stdio (initialize + tools/list
+  returning all 28).
 - **Rust dependencies refreshed**, including reqwest 0.12 → 0.13. Its TLS
   feature was renamed `rustls-tls` → `rustls` and now selects aws-lc-rs where
   0.12 used ring, so both providers sit in the tree; each configures its own
   explicitly, verified over plain DNS, DoT, DoH, and RDAP-over-HTTPS.
 
-### Fixed
-- **Intermittent 5-second DNS stalls, and spurious `seer doctor` DNS
-  failures, on hosts with advertised-but-dead IPv6.** The default upstream
-  group (Google DNS) carries two IPv4 and two IPv6 addresses, and hickory
-  queries two servers in parallel. Its default `QueryStatistics` ordering
-  ranks servers by observed performance — sound for a long-lived process, but
-  a short-lived CLI run has collected no statistics, leaving the effective
-  order arbitrary. Roughly one run in six drew both IPv6 servers; on a network
-  that advertises an IPv6 default route without real transit (common on
-  consumer connections) those queries black-hole and burn the full 5s
-  per-query budget. `seer dig` recovered after the stall by failing over to
-  IPv4; `seer doctor` reported an outright DNS failure and exited 1, because
-  its probe deadline equals that same 5s and left no budget to fail over.
-  The server order is now pinned so the parallel pair is deterministically the
-  IPv4 servers. IPv6 entries remain in the list for IPv6-only hosts, where the
-  IPv4 sends fail immediately with ENETUNREACH instead of timing out.
-  Measured on an affected host: stalls and failures went from 3/20 and 4/15 to
-  0/20 and 0/15. The SSRF fallback resolver in `net.rs` carried a hand-copied
-  copy of the same options and is now built from the shared helper, so the two
-  cannot drift.
+### Added
+- `seer.record_types()` in the Python bindings — the canonical DNS record type
+  list, rendered from core. Purely embedded data, no network access.
 
 ### Fixed
-- **REPL: `copy` after `doctor` copied the wrong result.** `doctor` rendered
-  its report without recording it, so a following `copy` silently copied
-  whatever command ran *before* it — wrong output, no error. Doctor reports
-  are now a first-class copy payload in every format `copy` offers.
-- **The API no longer refuses to start on IPv6 loopback.** The public-bind
-  guard compared `SEER_HOST` literally against `"127.0.0.1"`, so
-  `SEER_HOST=::1` — a bind exactly as private as the default — failed startup
-  with a "public bind without auth" error that misdescribed it. The check now
-  recognizes every loopback form (all of 127.0.0.0/8, `::1`, the IPv4-mapped
-  form, and `localhost`) and still fails closed on anything else, including
-  the wildcard binds `0.0.0.0` / `::`.
-- **`GET /` now advertises the whole API.** The endpoint index was a
-  hand-written literal listing 10 entries against 20 mounted routers, so
-  availability, info, subdomains, dnssec, delegation, diff, caa, posture,
-  confusables, tld, and every bulk/stream route were missing from the index
-  whose only job is to advertise them. It is now generated from the route
-  table of the app actually serving the request (37 entries), keeping the
-  existing key scheme, and `docs` reports `null` when `SEER_DOCS_ENABLED` is
-  off rather than pointing at a 404.
-- `SEER_PORT` is parsed with the same validated `env_int` helper as the other
-  integer tunables, so a non-numeric value gives a readable error instead of
-  an opaque `ValueError` traceback out of the entry point.
-- **`/metrics` no longer merges distinct endpoints into one bucket.** As of
-  FastAPI 0.141 a route mounted via `include_router(prefix=...)` reports its
-  template *without* the prefix, so `/info/{domain}`, `/availability/{domain}`,
-  `/posture/{domain}` and every other `/{domain}` route collapsed into a
-  single `/{domain}` label — per-endpoint metrics were wrong, not merely
-  coarse. The label now reconstructs the prefix from the request, which is a
-  no-op on older FastAPI (where templates were already absolute).
-
-## [0.44.3] - 2026-08-01
-
-### Fixed
+- **Intermittent 5-second DNS stalls, and spurious `seer doctor` DNS failures,
+  on hosts with advertised-but-dead IPv6.** The default upstream group (Google
+  DNS) carries two IPv4 and two IPv6 addresses, and hickory queries two servers
+  in parallel. Its default `QueryStatistics` ordering ranks servers by observed
+  performance — sound for a long-lived process, but a short-lived CLI run has
+  collected no statistics, leaving the effective order arbitrary. Roughly one
+  run in six drew both IPv6 servers; on a network that advertises an IPv6
+  default route without real transit (common on consumer connections) those
+  queries black-hole and burn the full 5s per-query budget. `seer dig`
+  recovered after the stall by failing over to IPv4; `seer doctor` reported an
+  outright DNS failure and exited 1, because its probe deadline equals that
+  same 5s and left no budget to fail over. The server order is now pinned so
+  the parallel pair is deterministically the IPv4 servers. IPv6 entries remain
+  for IPv6-only hosts, where the IPv4 sends fail immediately with ENETUNREACH
+  instead of timing out. Measured on an affected host: 3/20 stalls and 4/15
+  failures before, 0/20 and 0/15 after.
 - **All 16 DNS record types are now discoverable everywhere.** The record-type
   list was hand-mirrored into three surfaces and two had drifted: the REPL's
   tab-completion and the MCP tool schemas both advertised only 13 types, so
-  `NAPTR`, `TLSA`, and `SSHFP` were fully queryable but invisible — MCP
-  clients reading the schema had no way to know they could ask for them.
+  `NAPTR`, `TLSA`, and `SSHFP` were fully queryable but invisible — MCP clients
+  reading the schema had no way to know they could ask for them.
   `RecordType::ALL` / `ALL_NAMES` in seer-core is now the single source of
-  truth: the CLI error text, the REPL completer, and every MCP tool schema
-  render from it via the new `seer.record_types()` binding. Drift guards in
-  both the Rust and Python suites fail if a fourth surface re-types the list.
+  truth, rendered into the CLI error text, the REPL completer, and every MCP
+  tool schema. Drift guards in both the Rust and Python suites fail if a fourth
+  surface re-types the list.
 - **Dependency floors no longer resolve to versions missing the symbols that
   depend on them.** `seer-api` was pinned at `domain-seer>=0.32` while the
   routers call `seer.delegation` and `seer.all_tlds` (both v0.44.0) — a
   resolver picking an older release installed cleanly and then failed with
   `AttributeError` at request time on `/delegation/{domain}` and `/tld/`.
-  `seer-cli` and `seer-py` had the same gap against `seer-core` (declared
-  `0.44.0`), which only bites on a crates.io build, where cargo drops the
-  `path` and resolves the version for real. All three floors now track the
-  release that actually contains what they call.
-
-- **`seer-api` no longer installs an MCP SDK it cannot run against.** The
-  `mcp>=1.0` requirement had no upper bound, so once SDK 2.0 shipped every
-  fresh install resolved to it and failed at import with `AttributeError:
-  'Server' object has no attribute 'list_tools'` — 2.0 removed the low-level
-  decorator API (`@mcp.list_tools()` / `@mcp.call_tool()`) this server is
-  built on. Bounded to `>=1.0,<2` (resolves to 1.29.0); the 2.x migration is
-  tracked separately. This was breaking CI on every open PR, not just new
-  installs.
-
-### Added
-- `seer.record_types()` in the Python bindings — the canonical DNS record
-  type list, rendered from core. Purely embedded data, no network access.
+  `seer-cli` and `seer-py` had the same gap against `seer-core`, which only
+  bites on a crates.io build where cargo drops the `path` and resolves the
+  version for real.
+- **REPL: `copy` after `doctor` copied the wrong result.** `doctor` rendered
+  its report without recording it, so a following `copy` silently copied
+  whatever command ran *before* it — wrong output, no error. Doctor reports are
+  now a first-class copy payload in every format `copy` offers.
+- **The API no longer refuses to start on IPv6 loopback.** The public-bind
+  guard compared `SEER_HOST` literally against `"127.0.0.1"`, so
+  `SEER_HOST=::1` — a bind exactly as private as the default — failed startup
+  with a "public bind without auth" error that misdescribed it. The check now
+  recognizes every loopback form (all of 127.0.0.0/8, `::1`, the IPv4-mapped
+  form, and `localhost`) and still fails closed on anything else, including the
+  wildcard binds `0.0.0.0` / `::`.
+- **`GET /` now advertises the whole API.** The endpoint index was a
+  hand-written literal listing 10 entries against 20 mounted routers, so
+  availability, info, subdomains, dnssec, delegation, diff, caa, posture,
+  confusables, tld, and every bulk/stream route were missing from the index
+  whose only job is to advertise them. It is now generated from the route table
+  of the app actually serving the request (37 entries), and `docs` reports
+  `null` when `SEER_DOCS_ENABLED` is off rather than pointing at a 404.
+- **`/metrics` no longer merges distinct endpoints into one bucket.** As of
+  FastAPI 0.141 a route mounted via `include_router(prefix=...)` reports its
+  template *without* the prefix, so `/info/{domain}`, `/availability/{domain}`,
+  `/posture/{domain}` and every other `/{domain}` route collapsed into a single
+  `/{domain}` label — per-endpoint metrics were wrong, not merely coarse. The
+  label now reconstructs the prefix from the request, a no-op on older FastAPI.
+- `SEER_PORT` is parsed with the same validated `env_int` helper as the other
+  integer tunables, so a non-numeric value gives a readable error instead of an
+  opaque `ValueError` traceback out of the entry point.
 
 ## [0.44.2] - 2026-07-23
 
@@ -829,8 +814,8 @@ Two notable breaking changes landed in this period (see `CLAUDE.md` for details)
   `inconsistencies` became typed (`ConsensusValue` / `Inconsistency`) instead of
   pre-formatted strings.
 
-[Unreleased]: https://github.com/TheZacillac/seer/compare/v0.44.3...HEAD
-[0.44.3]: https://github.com/TheZacillac/seer/compare/v0.44.2...v0.44.3
+[Unreleased]: https://github.com/TheZacillac/seer/compare/v0.45.0...HEAD
+[0.45.0]: https://github.com/TheZacillac/seer/compare/v0.44.2...v0.45.0
 [0.44.2]: https://github.com/TheZacillac/seer/compare/v0.44.1...v0.44.2
 [0.44.1]: https://github.com/TheZacillac/seer/compare/v0.44.0...v0.44.1
 [0.44.0]: https://github.com/TheZacillac/seer/compare/v0.43.1...v0.44.0

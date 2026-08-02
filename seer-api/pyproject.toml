@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "seer-api"
-version = "0.44.3"
+version = "0.45.0"
 description = "FastAPI server and MCP integration for Seer domain utilities"
 readme = "README.md"
 license = { text = "MIT" }
@@ -22,23 +22,20 @@ dependencies = [
     "fastapi>=0.109,!=0.136.3",
     "uvicorn[standard]>=0.27",
     "pydantic>=2.0",
-    # Upper-bounded at <2: the MCP SDK 2.0 (released 2026-07) removed the 1.x
-    # low-level decorator API this server is built on (`@mcp.list_tools()` /
-    # `@mcp.call_tool()` on `mcp.server.Server`), so an unbounded `>=1.0`
-    # resolves to 2.x and fails at import with
-    # `AttributeError: 'Server' object has no attribute 'list_tools'`.
-    # Migrating to the 2.x API is tracked separately; until then this bound is
-    # what keeps a fresh install working.
+    # Floored at 2.0: the server registers handlers through the 2.x API
+    # (`add_request_handler` by protocol method name). SDK 1.x has no such
+    # method — it used the `@server.list_tools()` / `@server.call_tool()`
+    # decorators 2.0 removed — so a 1.x resolution fails at import.
     "mcp>=2.0",
     # The seer Python bindings; distributed on PyPI as `domain-seer`
     # (import name remains `seer`).
     #
     # Floor tracks the oldest bindings release exposing every symbol the
     # routers and MCP server call. 0.44 is required for `delegation` and
-    # `all_tlds` (added in v0.44.0) and `record_types` (v0.44.3) — a lower
+    # `all_tlds` (added in v0.44.0) and `record_types` (v0.45.0) — a lower
     # resolution installs cleanly and then AttributeErrors at request time,
     # so bump this whenever a new binding is called.
-    "domain-seer>=0.44.3",
+    "domain-seer>=0.45.0",
     "slowapi>=0.1.9",
     "orjson>=3.9",
 ]
