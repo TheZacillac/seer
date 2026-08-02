@@ -12,7 +12,7 @@ unsafe_code = "warn"
 unused_qualifications = "warn"
 
 [workspace.package]
-version = "0.45.0"
+version = "0.45.1"
 edition = "2021"
 # Real MSRV, enforced by the `msrv` CI job. The floor comes from rustyline 18
 # (uses `File::lock`, stabilized in 1.89). Bump this when a dependency raises
