@@ -146,7 +146,35 @@ def _route_label(request: Request) -> str:
     """
     route = request.scope.get("route")
     template = getattr(route, "path", None)
-    return template if isinstance(template, str) and template else "<unmatched>"
+    if not isinstance(template, str) or not template:
+        return "<unmatched>"
+
+    # As of FastAPI 0.141 a route reached through `include_router(prefix=...)`
+    # reports its template WITHOUT the mount prefix — `/info/{domain}` arrives
+    # as `/{domain}` — and neither `root_path` nor the scope's router carries
+    # the prefix back. Left alone that silently MERGES distinct endpoints:
+    # /info/{domain}, /availability/{domain}, /posture/{domain} and friends all
+    # become one `/{domain}` bucket, which makes the per-endpoint breakdown in
+    # /metrics wrong rather than merely coarse.
+    #
+    # Recover the prefix from the request itself: substituting the matched path
+    # params back into the template reproduces the tail of the concrete path,
+    # so whatever precedes that tail is the mount prefix. On older FastAPI the
+    # template is already absolute, the tail is the whole path, and the prefix
+    # is empty — so this is a no-op there rather than a version fork.
+    params = request.scope.get("path_params") or {}
+    concrete = request.scope.get("path") or ""
+    if params and concrete:
+        rendered = template
+        for key, value in params.items():
+            rendered = rendered.replace(f"{{{key}}}", str(value))
+        if rendered != template and concrete.endswith(rendered):
+            prefix = concrete[: -len(rendered)]
+            # Guard against a pathological substitution producing something
+            # that isn't a real prefix (e.g. a param value containing a slash).
+            if prefix.startswith("/") or prefix == "":
+                return f"{prefix}{template}"
+    return template
 
 
 class RequestMetrics:

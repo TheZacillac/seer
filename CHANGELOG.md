@@ -11,6 +11,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **REPL: `copy` after `doctor` copied the wrong result.** `doctor` rendered
+  its report without recording it, so a following `copy` silently copied
+  whatever command ran *before* it — wrong output, no error. Doctor reports
+  are now a first-class copy payload in every format `copy` offers.
+- **The API no longer refuses to start on IPv6 loopback.** The public-bind
+  guard compared `SEER_HOST` literally against `"127.0.0.1"`, so
+  `SEER_HOST=::1` — a bind exactly as private as the default — failed startup
+  with a "public bind without auth" error that misdescribed it. The check now
+  recognizes every loopback form (all of 127.0.0.0/8, `::1`, the IPv4-mapped
+  form, and `localhost`) and still fails closed on anything else, including
+  the wildcard binds `0.0.0.0` / `::`.
+- **`GET /` now advertises the whole API.** The endpoint index was a
+  hand-written literal listing 10 entries against 20 mounted routers, so
+  availability, info, subdomains, dnssec, delegation, diff, caa, posture,
+  confusables, tld, and every bulk/stream route were missing from the index
+  whose only job is to advertise them. It is now generated from the route
+  table of the app actually serving the request (37 entries), keeping the
+  existing key scheme, and `docs` reports `null` when `SEER_DOCS_ENABLED` is
+  off rather than pointing at a 404.
+- `SEER_PORT` is parsed with the same validated `env_int` helper as the other
+  integer tunables, so a non-numeric value gives a readable error instead of
+  an opaque `ValueError` traceback out of the entry point.
+- **`/metrics` no longer merges distinct endpoints into one bucket.** As of
+  FastAPI 0.141 a route mounted via `include_router(prefix=...)` reports its
+  template *without* the prefix, so `/info/{domain}`, `/availability/{domain}`,
+  `/posture/{domain}` and every other `/{domain}` route collapsed into a
+  single `/{domain}` label — per-endpoint metrics were wrong, not merely
+  coarse. The label now reconstructs the prefix from the request, which is a
+  no-op on older FastAPI (where templates were already absolute).
+
 ## [0.44.3] - 2026-08-01
 
 ### Fixed

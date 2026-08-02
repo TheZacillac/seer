@@ -1,6 +1,7 @@
 """FastAPI application for Seer domain utilities."""
 
 import hmac
+import ipaddress
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -144,6 +145,33 @@ def _mcp_rate_ok(client_ip: str) -> bool:
 _LOCALHOST_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 
 
+def _is_loopback_bind(host: str) -> bool:
+    """Whether ``SEER_HOST`` names an interface that is unreachable off-box.
+
+    Covers the whole IPv4 loopback range (127.0.0.0/8, not just 127.0.0.1),
+    IPv6 loopback (``::1``, and the IPv4-mapped ``::ffff:127.0.0.1``), and the
+    ``localhost`` hostname. The previous check was a literal ``!=
+    "127.0.0.1"``, which refused to start on ``SEER_HOST=::1`` — a bind that
+    is exactly as private as the default — with a "public bind without auth"
+    error that misdescribed the situation.
+
+    **Fails closed**: anything that isn't provably loopback (a real address, a
+    hostname, ``0.0.0.0``, ``::``, or junk) returns False and therefore still
+    requires ``SEER_API_KEY``. A wildcard bind like ``0.0.0.0`` is emphatically
+    not loopback even though it *includes* the loopback interface.
+    """
+    candidate = host.strip().strip("[]").lower()
+    if not candidate:
+        return False
+    if candidate == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(candidate).is_loopback
+    except ValueError:
+        # A hostname we can't resolve to a literal — treat as public.
+        return False
+
+
 def _header_host(value: str) -> str:
     """Lowercased hostname of an Origin/Host header value, or '' if absent."""
     if not value:
@@ -214,7 +242,7 @@ async def lifespan(_app: FastAPI):
     # (`SEER_API_KEY=""`) still trips the guard instead of silently
     # disabling auth.
     host = os.environ.get("SEER_HOST", "127.0.0.1")
-    if host != "127.0.0.1" and not (os.environ.get("SEER_API_KEY") or "").strip():
+    if not _is_loopback_bind(host) and not (os.environ.get("SEER_API_KEY") or "").strip():
         log.error(
             "seer-api is bound to %s with no SEER_API_KEY set. Refusing to "
             "start. Set SEER_API_KEY or SEER_HOST=127.0.0.1.",
@@ -397,26 +425,78 @@ app.include_router(tld.router, prefix="/tld", tags=["TLD"])
 app.router.routes.append(Route("/mcp", endpoint=_mcp_asgi_app))
 
 
+def _endpoint_name(path: str) -> str:
+    """Derive the index key for a route template.
+
+    Joins the literal (non-parameter) segments with ``_``, which reproduces
+    the keys the old hand-written index used: ``/lookup/{domain}`` -> ``lookup``,
+    ``/rdap/domain/{domain}`` -> ``rdap_domain``, ``/ssl/bulk`` -> ``ssl_bulk``.
+    A collection route (trailing slash, e.g. ``/tld/``) gets an ``_index``
+    suffix so it does not collide with its item route ``/tld/{tld}``.
+    """
+    segments = [s for s in path.split("/") if s and not s.startswith("{")]
+    name = "_".join(segments) or "root"
+    if path.endswith("/") and path != "/":
+        name = f"{name}_index"
+    return name
+
+
+def _endpoint_index(target: FastAPI) -> dict[str, str]:
+    """Map a stable name to every route template registered on ``target``.
+
+    Generated from the route table rather than hand-maintained: the literal
+    this replaces listed 10 entries against 20 mounted routers, so most of the
+    API (availability, info, subdomains, dnssec, delegation, diff, caa,
+    posture, confusables, tld, and every bulk/stream route) was undiscoverable
+    from the index whose whole job is to advertise it.
+
+    Takes the app explicitly — the caller passes ``request.app`` — rather than
+    closing over the module-global ``app``. The two are not always the same
+    object: anything that rebuilds the module (``importlib.reload``, which the
+    hardening tests do ~30 times) rebinds the global while already-constructed
+    clients keep serving the original app, so a module-global lookup would
+    describe an app the caller is not talking to. Introspecting the app that
+    is actually handling the request is the only answer that is always right.
+
+    Keys match the previous scheme so existing consumers keep working. A
+    hardening test asserts every route appears exactly once, so a future route
+    whose derived name collides fails loudly instead of silently displacing
+    another entry.
+
+    Two sources, because neither alone is complete:
+
+    * ``openapi()["paths"]`` for the documented API routes. Walking
+      ``target.routes`` is NOT sufficient — as of FastAPI 0.141 an included
+      router stays a lazy ``_IncludedRouter`` wrapper that exposes no ``path``
+      and never flattens into ``routes``, so every router-mounted endpoint is
+      invisible there. Older FastAPI did flatten, which is why this only shows
+      up against a current release. The OpenAPI schema is the public,
+      version-stable inventory and is cached on the app after first build.
+    * ``target.routes`` entries that expose a plain ``path``, for raw
+      Starlette routes the schema omits — today that is the ``/mcp`` ASGI
+      mount, plus ``/health`` and ``/metrics``.
+    """
+    paths: set[str] = set(target.openapi().get("paths", {}))
+    paths.update(
+        path for route in target.routes if (path := getattr(route, "path", None))
+    )
+    index: dict[str, str] = {}
+    for path in paths:
+        if path == "/":
+            continue
+        index[_endpoint_name(path)] = path
+    return dict(sorted(index.items()))
+
+
 @app.get("/")
-async def root():
+async def root(request: Request):
     """Root endpoint with API information."""
     return {
         "name": "Seer API",
         "version": __version__,
         "description": "Domain name helper API",
-        "endpoints": {
-            "lookup": "/lookup/{domain}",
-            "whois": "/whois/{domain}",
-            "rdap_domain": "/rdap/domain/{domain}",
-            "rdap_ip": "/rdap/ip/{ip}",
-            "rdap_asn": "/rdap/asn/{asn}",
-            "dns": "/dns/{domain}/{record_type}",
-            "propagation": "/propagation/{domain}/{record_type}",
-            "status": "/status/{domain}",
-            "ssl_bulk": "/ssl/bulk",
-            "mcp": "/mcp",
-        },
-        "docs": "/docs",
+        "endpoints": _endpoint_index(request.app),
+        "docs": "/docs" if DOCS_ENABLED else None,
     }
 
 
@@ -460,7 +540,10 @@ def run():
     import uvicorn
 
     host = os.environ.get("SEER_HOST", "127.0.0.1")
-    port = int(os.environ.get("SEER_PORT", "8000"))
+    # env_int, not a bare int(): a non-numeric SEER_PORT should give the same
+    # readable RuntimeError the other tunables do (issue #50), not an opaque
+    # ValueError traceback out of the entry point.
+    port = env_int("SEER_PORT", 8000, min_value=1)
     reload = os.environ.get("SEER_RELOAD", "false").lower() in ("true", "1", "yes")
 
     uvicorn.run(

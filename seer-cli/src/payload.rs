@@ -27,6 +27,12 @@ pub enum Payload {
     Posture(Box<seer_core::EmailPosture>),
     Caa(Box<seer_core::CaaPolicy>),
     Confusables(Box<seer_core::ConfusableReport>),
+    /// Unlike the others this has no `OutputFormatter` method — doctor reports
+    /// render through `crate::render_doctor_report`, the same helper the CLI
+    /// and REPL print with. Carried here anyway so `copy` after `doctor`
+    /// copies the doctor report instead of silently copying whatever ran
+    /// before it.
+    Doctor(Box<seer_core::doctor::DoctorReport>),
 }
 
 impl Payload {
@@ -54,6 +60,7 @@ impl Payload {
             Payload::Posture(_) => "posture",
             Payload::Caa(_) => "caa",
             Payload::Confusables(_) => "confusables",
+            Payload::Doctor(_) => "doctor",
         }
     }
 }
@@ -82,6 +89,9 @@ pub fn serialize(data: &Payload, format: OutputFormat) -> String {
         Payload::Posture(p) => fmt.format_posture(p),
         Payload::Caa(c) => fmt.format_caa(c),
         Payload::Confusables(c) => fmt.format_confusables(c),
+        // No formatter method exists for doctor reports; reuse the shared
+        // renderer so copied text matches what `seer doctor --format …` prints.
+        Payload::Doctor(r) => crate::render_doctor_report(r, format),
     }
 }
 

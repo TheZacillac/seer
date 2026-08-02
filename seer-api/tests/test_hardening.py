@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 
@@ -605,6 +606,159 @@ def test_loopback_bind_without_auth_starts(monkeypatch):
 
     monkeypatch.delenv("SEER_HOST")
     importlib.reload(main)
+
+
+@pytest.mark.parametrize("host", ["::1", "[::1]", "localhost", "127.0.0.2", "::ffff:127.0.0.1"])
+def test_other_loopback_forms_start_without_auth(monkeypatch, host):
+    """Every loopback spelling is as private as 127.0.0.1 and must start.
+
+    The guard used to be a literal `!= "127.0.0.1"`, so binding to IPv6
+    loopback refused to start with a "public bind without auth" error that
+    misdescribed the bind. Covers IPv6 loopback (bare and bracketed), the
+    `localhost` hostname, the rest of 127.0.0.0/8, and the IPv4-mapped form.
+    """
+    monkeypatch.setenv("SEER_HOST", host)
+    monkeypatch.delenv("SEER_API_KEY", raising=False)
+    import seer_api.main as main
+
+    importlib.reload(main)
+    with TestClient(main.app) as c:
+        assert c.get("/health").status_code == 200
+
+    monkeypatch.delenv("SEER_HOST")
+    importlib.reload(main)
+
+
+@pytest.mark.parametrize("host", ["0.0.0.0", "::", "example.com", "10.0.0.5", "not-an-ip!"])
+def test_non_loopback_binds_still_refused_without_auth(monkeypatch, host):
+    """The widened check must not become permissive.
+
+    A wildcard bind (`0.0.0.0` / `::`) *includes* loopback but is reachable
+    off-box, and an unparseable value must fail closed rather than be waved
+    through as "probably local".
+    """
+    monkeypatch.setenv("SEER_HOST", host)
+    monkeypatch.delenv("SEER_API_KEY", raising=False)
+    import seer_api.main as main
+
+    importlib.reload(main)
+    with pytest.raises(RuntimeError, match="public bind without auth"), TestClient(main.app):
+        pass
+
+    monkeypatch.delenv("SEER_HOST")
+    importlib.reload(main)
+
+
+# ---------------------------------------------------------------------------
+# Root index must advertise every mounted route
+# ---------------------------------------------------------------------------
+
+
+# Every prefix main.py mounts a router under. Independent of how routes are
+# introspected, which is the point: the index regressed precisely because
+# `app.routes` stopped containing router endpoints in FastAPI 0.141, and a
+# test that derived its expectation the same way could not have caught it.
+MOUNTED_PREFIXES = [
+    "/lookup", "/whois", "/rdap", "/dns", "/propagation", "/status", "/ssl",
+    "/availability", "/info", "/subdomains", "/dnssec", "/delegation",
+    "/diff", "/caa", "/posture", "/confusables", "/tld",
+]
+
+
+def test_root_index_lists_every_registered_route(client):
+    """Drift guard: `/` must advertise every mounted endpoint.
+
+    The hand-written literal it replaces listed 10 entries against 20 mounted
+    routers, so most of the API was undiscoverable from the index whose entire
+    job is to advertise it.
+    """
+    body = client.get("/").json()
+
+    assert "endpoints" in body, f"root returned no endpoint index: {body}"
+    index = body["endpoints"]
+
+    # Independent expectation: every mounted router must contribute at least
+    # one endpoint, and the raw non-router routes must be present too.
+    for prefix in MOUNTED_PREFIXES:
+        assert any(path.startswith(prefix + "/") for path in index.values()), (
+            f"no endpoint advertised under {prefix}; index={sorted(index.values())}"
+        )
+    for path in ("/mcp", "/health", "/metrics"):
+        assert path in index.values(), f"{path} missing from the index"
+
+    assert len(index) > 30, f"index looks truncated: {sorted(index.values())}"
+    # Every route must get its OWN key: a derived name that collides would
+    # silently displace another entry instead of failing.
+    assert len(index) == len(set(index.values())), "derived endpoint names collided"
+    # Key scheme preserved from the hand-written index it replaces.
+    assert index["lookup"] == "/lookup/{domain}"
+    assert index["rdap_domain"] == "/rdap/domain/{domain}"
+    assert index["ssl_bulk"] == "/ssl/bulk"
+    assert index["mcp"] == "/mcp"
+    # Collection vs item route disambiguation.
+    assert index["tld_index"] == "/tld/"
+    assert index["tld"] == "/tld/{tld}"
+    # Bulk + streaming variants, absent from the old literal.
+    assert index["lookup_bulk"] == "/lookup/bulk"
+    assert index["lookup_bulk_stream"] == "/lookup/bulk/stream"
+
+
+def test_root_index_describes_the_serving_app_not_module_state(monkeypatch):
+    """`/` must describe the app handling the request, even after a reload.
+
+    `_endpoint_index` used to read the module-global `app`. Reloading the
+    module rebinds that global while an already-built client keeps serving the
+    original app, so the index would describe a DIFFERENT app than the caller
+    is talking to.
+    """
+    import seer_api.main as main
+
+    serving_app = main.app
+    with TestClient(serving_app) as c:
+        before = c.get("/").json()["endpoints"]
+
+    # Rebind the module global to a DIFFERENT, near-empty app.
+    monkeypatch.setattr(main, "app", FastAPI())
+    with TestClient(serving_app) as c:
+        after = c.get("/").json()["endpoints"]
+
+    assert after == before, (
+        "index followed the module global instead of the serving app"
+    )
+    assert "lookup" in after
+
+
+def test_metrics_labels_keep_the_router_prefix(monkeypatch):
+    """Distinct endpoints must not share a metrics bucket.
+
+    As of FastAPI 0.141 a route reached via `include_router(prefix=...)`
+    reports its template WITHOUT the prefix, so `/info/{domain}`,
+    `/availability/{domain}` and `/posture/{domain}` all arrived as
+    `/{domain}` and collapsed into one bucket — silently wrong per-endpoint
+    metrics, not merely coarse ones. Older FastAPI reported absolute
+    templates, so this only appears against a current release.
+    """
+    import seer
+    from seer_api.main import app
+    from seer_api.middleware import metrics
+
+    monkeypatch.setattr(seer, "info", lambda d: {"d": d}, raising=False)
+    monkeypatch.setattr(seer, "availability", lambda d: {"d": d}, raising=False)
+    monkeypatch.setattr(seer, "posture", lambda d: {"d": d}, raising=False)
+
+    before = dict(metrics.snapshot()["endpoints"])
+    with TestClient(app) as c:
+        c.get("/info/a.com")
+        c.get("/availability/b.com")
+        c.get("/posture/c.com")
+    after = metrics.snapshot()["endpoints"]
+    added = {k: after[k] - before.get(k, 0) for k in after if after[k] - before.get(k, 0)}
+
+    assert set(added) == {
+        "/info/{domain}",
+        "/availability/{domain}",
+        "/posture/{domain}",
+    }, f"router prefix lost from metrics labels: {added}"
 
 
 # ---------------------------------------------------------------------------
