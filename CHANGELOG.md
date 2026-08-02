@@ -11,6 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.45.1] - 2026-08-02
+
+A small maintenance release: one user-visible MCP fix and one release-tooling
+fix. No behavior changes to any lookup, and no dependency changes.
+
 ### Fixed
 - **MCP `serverInfo.version` is no longer empty.** The low-level `Server` was
   constructed without a `version=`, so the SDK's `""` default was reported in
@@ -827,7 +832,8 @@ Two notable breaking changes landed in this period (see `CLAUDE.md` for details)
   `inconsistencies` became typed (`ConsensusValue` / `Inconsistency`) instead of
   pre-formatted strings.
 
-[Unreleased]: https://github.com/TheZacillac/seer/compare/v0.45.0...HEAD
+[Unreleased]: https://github.com/TheZacillac/seer/compare/v0.45.1...HEAD
+[0.45.1]: https://github.com/TheZacillac/seer/compare/v0.45.0...v0.45.1
 [0.45.0]: https://github.com/TheZacillac/seer/compare/v0.44.2...v0.45.0
 [0.44.2]: https://github.com/TheZacillac/seer/compare/v0.44.1...v0.44.2
 [0.44.1]: https://github.com/TheZacillac/seer/compare/v0.44.0...v0.44.1
