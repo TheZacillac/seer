@@ -29,6 +29,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   explicitly, verified over plain DNS, DoT, DoH, and RDAP-over-HTTPS.
 
 ### Fixed
+- **Intermittent 5-second DNS stalls, and spurious `seer doctor` DNS
+  failures, on hosts with advertised-but-dead IPv6.** The default upstream
+  group (Google DNS) carries two IPv4 and two IPv6 addresses, and hickory
+  queries two servers in parallel. Its default `QueryStatistics` ordering
+  ranks servers by observed performance — sound for a long-lived process, but
+  a short-lived CLI run has collected no statistics, leaving the effective
+  order arbitrary. Roughly one run in six drew both IPv6 servers; on a network
+  that advertises an IPv6 default route without real transit (common on
+  consumer connections) those queries black-hole and burn the full 5s
+  per-query budget. `seer dig` recovered after the stall by failing over to
+  IPv4; `seer doctor` reported an outright DNS failure and exited 1, because
+  its probe deadline equals that same 5s and left no budget to fail over.
+  The server order is now pinned so the parallel pair is deterministically the
+  IPv4 servers. IPv6 entries remain in the list for IPv6-only hosts, where the
+  IPv4 sends fail immediately with ENETUNREACH instead of timing out.
+  Measured on an affected host: stalls and failures went from 3/20 and 4/15 to
+  0/20 and 0/15. The SSRF fallback resolver in `net.rs` carried a hand-copied
+  copy of the same options and is now built from the shared helper, so the two
+  cannot drift.
+
+### Fixed
 - **REPL: `copy` after `doctor` copied the wrong result.** `doctor` rendered
   its report without recording it, so a following `copy` silently copied
   whatever command ran *before* it — wrong output, no error. Doctor reports

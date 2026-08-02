@@ -23,3 +23,6 @@ pub use propagation::{
 };
 pub use records::{DnsRecord, RecordData, RecordType};
 pub use resolver::{DnsPresence, DnsResolver};
+// Crate-internal: shared with `net.rs` so the SSRF fallback resolver and the
+// main resolver cannot drift apart on option settings.
+pub(crate) use resolver::apply_standard_opts;
