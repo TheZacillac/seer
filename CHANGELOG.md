@@ -11,6 +11,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **MCP `serverInfo.version` is no longer empty.** The low-level `Server` was
+  constructed without a `version=`, so the SDK's `""` default was reported in
+  the `initialize` response and hosts displayed a blank server version. It now
+  reports the installed `seer-api` version over both transports (stdio and
+  `POST /mcp`, which share the same `Server` instance).
+- **`release.yml` now checks out with `actions/checkout@v7`,** matching
+  `ci.yml` and `publish.yml`. dist 0.32.0 still defaults to `v6`, so Dependabot
+  kept reopening a github-actions PR that hand-edited the generated workflow —
+  which then failed the `plan` job. The ref is now pinned through the supported
+  `[dist.github-action-commits]` table in `dist-workspace.toml` and applied with
+  `dist generate`.
+
 ## [0.45.0] - 2026-08-01
 
 Consolidates everything since v0.44.2. (A `0.44.3` version number briefly

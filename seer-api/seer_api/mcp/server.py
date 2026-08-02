@@ -23,6 +23,7 @@ from mcp.types import (
 
 import seer
 
+from .. import __version__
 from .._run import run_seer
 
 
@@ -46,7 +47,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-mcp = Server("seer")
+# `version=` is what the SDK reports as `serverInfo.version` in the initialize
+# response; without it `create_initialization_options()` falls back to "" and
+# hosts see an empty version over both transports (stdio and POST /mcp, which
+# share this Server instance).
+mcp = Server("seer", version=__version__)
 
 MAX_BULK_DOMAINS = 100
 MAX_CONCURRENCY = 50

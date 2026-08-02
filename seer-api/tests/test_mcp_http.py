@@ -49,6 +49,12 @@ def test_mcp_initialize_returns_server_info(client):
     payload = _parse_sse(resp.text)
     assert payload["id"] == 1
     assert payload["result"]["serverInfo"]["name"] == "seer"
+    # Regression: `Server("seer")` without an explicit `version=` leaves the
+    # SDK default of "", so hosts render a blank server version.
+    from seer_api import __version__
+
+    assert payload["result"]["serverInfo"]["version"] == __version__
+    assert payload["result"]["serverInfo"]["version"] != ""
     assert "tools" in payload["result"]["capabilities"]
 
 
