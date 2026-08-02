@@ -13,7 +13,9 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hickory_resolver::config::{NameServerConfig, ResolveHosts, ResolverConfig, GOOGLE};
+use hickory_resolver::config::{
+    NameServerConfig, ResolveHosts, ResolverConfig, ResolverOpts, ServerOrderingStrategy, GOOGLE,
+};
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use hickory_resolver::net::NetError;
 use hickory_resolver::proto::dnssec::PublicKey;
@@ -48,6 +50,40 @@ fn dns_lookup_or_empty<T>(
 /// DNS is typically fast; longer timeouts indicate network issues or unreachable servers.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Apply seer's standard resolver options.
+///
+/// Extracted from [`build_resolver`] so the option set is assertable without
+/// standing up a resolver (hickory exposes no getter for a built resolver's
+/// options), and shared with `net.rs`'s SSRF fallback resolver so the two
+/// cannot drift — they previously carried hand-copied option sets and the
+/// server-ordering fix below would have landed in only one of them.
+pub(crate) fn apply_standard_opts(opts: &mut ResolverOpts, timeout: Duration) {
+    opts.timeout = timeout;
+    opts.attempts = 2;
+    opts.use_hosts_file = ResolveHosts::Never;
+    // Pin the query order to the configured list instead of hickory's default
+    // `QueryStatistics`. The default orders servers by observed performance,
+    // which is the right call for a long-lived process but meaningless in a
+    // short-lived CLI run that has collected no statistics yet — leaving the
+    // effective order arbitrary.
+    //
+    // That mattered because the default upstream group (`GOOGLE`) carries two
+    // IPv4 and two IPv6 addresses, and hickory queries `num_concurrent_reqs`
+    // (2) of them in parallel. On a host advertising an IPv6 default route
+    // with no working IPv6 transit — RA-advertised IPv6 that black-holes,
+    // common on consumer networks — a pair that happened to be both IPv6 sent
+    // into the void and burned the full per-query timeout. Roughly one run in
+    // six stalled 5s, and `seer doctor` reported an outright DNS failure
+    // because its probe deadline equals that timeout, leaving no budget to
+    // fail over.
+    //
+    // With the order pinned, the parallel pair is deterministically the two
+    // IPv4 servers. IPv6 entries stay in the list and remain reachable as
+    // fallback: on a genuinely IPv6-only host the IPv4 sends fail immediately
+    // with ENETUNREACH rather than timing out, so failover stays fast.
+    opts.server_ordering_strategy = ServerOrderingStrategy::UserProvidedOrder;
+}
+
 /// Build a TokioResolver pre-configured with the given upstream config and
 /// our standard options (timeout, retries, no hosts-file consultation).
 ///
@@ -58,12 +94,7 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 /// to a typed error instead of a panic.
 fn build_resolver(config: ResolverConfig, timeout: Duration) -> Result<TokioResolver> {
     let mut builder = TokioResolver::builder_with_config(config, TokioRuntimeProvider::default());
-    {
-        let opts = builder.options_mut();
-        opts.timeout = timeout;
-        opts.attempts = 2;
-        opts.use_hosts_file = ResolveHosts::Never;
-    }
+    apply_standard_opts(builder.options_mut(), timeout);
     builder
         .build()
         .map_err(|e| SeerError::DnsError(format!("failed to construct DNS resolver: {}", e)))
@@ -808,6 +839,53 @@ mod tests {
     //! (`dns/dnssec.rs`, `dns/follow.rs`).
 
     use super::*;
+
+    /// Regression: an intermittent 5-second stall on every default-resolver
+    /// lookup, and an outright `seer doctor` FAIL, on hosts that advertise an
+    /// IPv6 default route but have no working IPv6 transit (RA-advertised
+    /// IPv6 with no real transit is common on consumer networks).
+    ///
+    /// `GOOGLE` carries two IPv4 and two IPv6 addresses. hickory queries
+    /// `num_concurrent_reqs` (default 2) servers in parallel, and under the
+    /// default `QueryStatistics` ordering a short-lived CLI process has no
+    /// statistics to order by — so roughly one run in six drew both IPv6
+    /// servers, black-holed, and burned the full per-query timeout.
+    ///
+    /// `UserProvidedOrder` makes the first two picks deterministically the
+    /// IPv4 servers. IPv6 stays in the list for IPv6-only hosts, where the
+    /// IPv4 sends fail immediately with ENETUNREACH rather than timing out.
+    #[test]
+    fn standard_opts_pin_server_order_so_ipv4_is_tried_first() {
+        let mut opts = ResolverOpts::default();
+        apply_standard_opts(&mut opts, Duration::from_secs(5));
+        assert_eq!(
+            opts.server_ordering_strategy,
+            ServerOrderingStrategy::UserProvidedOrder,
+            "QueryStatistics ordering is nondeterministic in a short-lived \
+             process and can draw only black-holed IPv6 servers"
+        );
+    }
+
+    /// The ordering fix is only meaningful if the configured list actually
+    /// starts with IPv4 servers, and only sufficient if at least
+    /// `num_concurrent_reqs` of them are IPv4 — otherwise a parallel pair
+    /// still includes a black-holeable IPv6 server.
+    #[test]
+    fn default_config_lists_enough_ipv4_servers_before_any_ipv6() {
+        let config = ResolverConfig::udp_and_tcp(&GOOGLE);
+        let ips: Vec<_> = config.name_servers().iter().map(|ns| ns.ip).collect();
+        let concurrent = ResolverOpts::default().num_concurrent_reqs.max(1);
+        assert!(
+            ips.len() > concurrent,
+            "expected more servers than the concurrency window: {ips:?}"
+        );
+        for (i, ip) in ips.iter().take(concurrent).enumerate() {
+            assert!(
+                ip.is_ipv4(),
+                "server {i} in the concurrency window is not IPv4: {ips:?}"
+            );
+        }
+    }
 
     #[test]
     fn from_config_applies_dns_timeout() {

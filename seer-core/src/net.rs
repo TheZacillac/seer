@@ -8,7 +8,7 @@
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
-use hickory_resolver::config::{ResolveHosts, ResolverConfig, GOOGLE};
+use hickory_resolver::config::{ResolverConfig, GOOGLE};
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use hickory_resolver::TokioResolver;
 use once_cell::sync::Lazy;
@@ -37,10 +37,13 @@ static FALLBACK_RESOLVER: Lazy<Option<TokioResolver>> = Lazy::new(|| {
         TokioRuntimeProvider::default(),
     );
     {
-        let opts = builder.options_mut();
-        opts.timeout = Duration::from_secs(5);
-        opts.attempts = 2;
-        opts.use_hosts_file = ResolveHosts::Never;
+        // Shared with the main DNS resolver so the two option sets cannot
+        // drift; in particular this pins the server order to IPv4-first, which
+        // keeps a black-holed IPv6 upstream from burning the whole budget on a
+        // host with advertised-but-dead IPv6. That matters more here than
+        // anywhere else: this resolver only runs when the OS resolver has
+        // already failed.
+        crate::dns::apply_standard_opts(builder.options_mut(), Duration::from_secs(5));
     }
     // Mirror the `Lazy<Option<…>>` pattern used for the shared HTTP clients
     // rather than `.expect()` in a library initializer: the build is infallible
@@ -273,6 +276,24 @@ pub async fn resolve_public_host(host: &str, port: u16) -> Result<Vec<SocketAddr
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// The SSRF fallback resolver must carry the same options as the main
+    /// resolver — most importantly the pinned server order, without which a
+    /// black-holed IPv6 upstream can burn the whole budget. The two used to
+    /// hold hand-copied option sets; this asserts they still share one.
+    #[test]
+    fn fallback_resolver_opts_match_the_shared_standard() {
+        use hickory_resolver::config::{ResolverOpts, ServerOrderingStrategy};
+
+        let mut opts = ResolverOpts::default();
+        crate::dns::apply_standard_opts(&mut opts, Duration::from_secs(5));
+        assert_eq!(
+            opts.server_ordering_strategy,
+            ServerOrderingStrategy::UserProvidedOrder
+        );
+        assert_eq!(opts.timeout, Duration::from_secs(5));
+        assert_eq!(opts.attempts, 2);
+    }
 
     #[test]
     fn rejects_loopback_v4() {
