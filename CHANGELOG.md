@@ -15,7 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Syncs the WHOIS server map with upstream, completes the TLD catalog (Google
 RDAP-only TLDs and all delegated TLDs without a WHOIS server), and makes IDN
-TLD lookups accept either the Unicode or punycode form everywhere.
+TLD lookups accept either the Unicode or punycode form everywhere. (A
+`0.45.1` version number briefly existed in-tree but was never tagged or
+released; its changes are folded in here.)
 
 ### Changed
 - **WHOIS server map synced with upstream** (WooMai/whois-servers, 2026-08-07).
@@ -50,13 +52,6 @@ TLD lookups accept either the Unicode or punycode form everywhere.
   pages and `nic.<tld>` hosts are punycode-keyed). A new map-consistency test
   locks every Unicode alias to its punycode entry, and a mock-server test
   pins the WHOIS wire query for an IDN domain to its A-label form.
-
-## [0.45.1] - 2026-08-02
-
-A small maintenance release: one user-visible MCP fix and one release-tooling
-fix. No behavior changes to any lookup, and no dependency changes.
-
-### Fixed
 - **MCP `serverInfo.version` is no longer empty.** The low-level `Server` was
   constructed without a `version=`, so the SDK's `""` default was reported in
   the `initialize` response and hosts displayed a blank server version. It now
@@ -873,8 +868,7 @@ Two notable breaking changes landed in this period (see `CLAUDE.md` for details)
   pre-formatted strings.
 
 [Unreleased]: https://github.com/TheZacillac/seer/compare/v0.46.0...HEAD
-[0.46.0]: https://github.com/TheZacillac/seer/compare/v0.45.1...v0.46.0
-[0.45.1]: https://github.com/TheZacillac/seer/compare/v0.45.0...v0.45.1
+[0.46.0]: https://github.com/TheZacillac/seer/compare/v0.45.0...v0.46.0
 [0.45.0]: https://github.com/TheZacillac/seer/compare/v0.44.2...v0.45.0
 [0.44.2]: https://github.com/TheZacillac/seer/compare/v0.44.1...v0.44.2
 [0.44.1]: https://github.com/TheZacillac/seer/compare/v0.44.0...v0.44.1
