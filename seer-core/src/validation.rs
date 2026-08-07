@@ -398,6 +398,22 @@ mod tests {
         // With protocol prefix
         let result = normalize_domain("https://münchen.de/path").unwrap();
         assert_eq!(result, "xn--mnchen-3ya.de");
+
+        // Cyrillic, including uppercase input (lowercased before conversion)
+        assert_eq!(
+            normalize_domain("пример.рф").unwrap(),
+            "xn--e1afmkfd.xn--p1ai"
+        );
+        assert_eq!(
+            normalize_domain("ПРИМЕР.РФ").unwrap(),
+            "xn--e1afmkfd.xn--p1ai"
+        );
+
+        // Already-punycode input passes through unchanged
+        assert_eq!(
+            normalize_domain("xn--e1afmkfd.xn--p1ai").unwrap(),
+            "xn--e1afmkfd.xn--p1ai"
+        );
     }
 
     #[test]

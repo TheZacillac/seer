@@ -767,6 +767,48 @@ mod tests {
             .with_port(port)
     }
 
+    /// Like [`spawn_mock_whois`] but also captures the raw query line the
+    /// client sent, so tests can assert what actually went over the wire.
+    async fn spawn_mock_whois_capturing(
+        response: &'static str,
+    ) -> (u16, tokio::sync::oneshot::Receiver<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = [0u8; 512];
+            let n = sock.read(&mut buf).await.unwrap_or(0);
+            let _ = tx.send(String::from_utf8_lossy(&buf[..n]).into_owned());
+            let _ = sock.write_all(response.as_bytes()).await;
+        });
+        (port, rx)
+    }
+
+    /// An IDN (U-label) domain must reach the wire as its punycode A-labels:
+    /// port-43 registries are only required to accept ACE per RFC 3912/5891,
+    /// and sending raw UTF-8 gets "no match" from most of them.
+    #[tokio::test]
+    async fn mock_idn_domain_is_queried_as_punycode() {
+        let (port, rx) = spawn_mock_whois_capturing(
+            "Domain Name: XN--E1AFMKFD.XN--P1AI\nRegistrar: Mock IDN Registrar\n",
+        )
+        .await;
+        let resp = mock_client(port)
+            .lookup_with_server("пример.рф", "127.0.0.1")
+            .await
+            .unwrap();
+        assert_eq!(
+            rx.await.unwrap(),
+            "xn--e1afmkfd.xn--p1ai\r\n",
+            "wire query must be the A-label form, never raw Unicode"
+        );
+        assert_eq!(resp.domain, "xn--e1afmkfd.xn--p1ai");
+        assert_eq!(resp.registrar.as_deref(), Some("Mock IDN Registrar"));
+    }
+
     #[tokio::test]
     async fn mock_basic_lookup_parses_canned_response() {
         let port = spawn_mock_whois(vec![
