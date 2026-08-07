@@ -23,6 +23,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `谷歌` in both Unicode and punycode forms) as RDAP-only entries, and the
   Unicode forms `ලංකා`/`இலங்கை` of the retired `.lk` IDN TLDs are now listed
   alongside their punycode forms.
+- **TLD catalog now lists the 159 delegated TLDs with no WHOIS server.** A new
+  `NO_WHOIS_TLDS` const covers the TLDs for which IANA publishes no `whois:`
+  server at all — dot-brand gTLDs (`.netflix`, `.hsbc`, `.web`) and a number
+  of ccTLDs and IDN ccTLDs (`.al`, `.aq`, `.eg`, `.gb`, `.za`, `ελ`, `世界`, …;
+  IDN entries in both Unicode and punycode forms). Previously these were
+  absent from `all_tlds()`, so the TUI TLD browser and `/tld/` API catalog
+  couldn't surface them. They remain unmapped for WHOIS (there is no server);
+  `lookup_tld` supplies RDAP endpoints where the registry runs RDAP, plus
+  registry-URL guidance, and `.za`'s SLD registry zones (`co.za`, …) still
+  resolve via the SLD WHOIS map.
 
 ### Fixed
 - **IDN TLD lookups now accept either form everywhere.** `get_whois_server`,

@@ -1633,15 +1633,189 @@ pub const WHOIS_RETIRED_TLDS: &[&str] = &[
     "mt",
 ];
 
+/// Delegated TLDs for which IANA publishes no `whois:` server at all — mostly
+/// dot-brand gTLDs (`.netflix`, `.hsbc`) plus a number of ccTLDs (`.al`,
+/// `.aq`, `.eg`) and IDN ccTLDs. Sourced from the same upstream sync as
+/// [`WHOIS_SERVERS`] (entries with a null server, cross-checked against IANA
+/// 2026-08-07). Catalog-only: there is nothing to put in the WHOIS map, but
+/// they are valid, lookupable TLDs the TLD browser must list — `lookup_tld`
+/// fills `rdap_url` from IANA bootstrap where the registry runs RDAP and
+/// always supplies registry-URL guidance. `.za` is special: no top-level
+/// WHOIS, but its SLD registry zones (`co.za`, …) resolve via
+/// [`SLD_WHOIS_SERVERS`]. IDN TLDs appear in both Unicode and punycode forms,
+/// matching how `WHOIS_SERVERS` keys its IDN entries.
+pub const NO_WHOIS_TLDS: &[&str] = &[
+    "able",
+    "aetna",
+    "aig",
+    "al",
+    "americanexpress",
+    "amex",
+    "amica",
+    "analytics",
+    "ao",
+    "aq",
+    "aramco",
+    "athleta",
+    "axa",
+    "az",
+    "ba",
+    "banamex",
+    "bb",
+    "bd",
+    "booking",
+    "bs",
+    "bt",
+    "bv",
+    "calvinklein",
+    "caravan",
+    "cbn",
+    "cbre",
+    "cg",
+    "chase",
+    "cisco",
+    "citi",
+    "citic",
+    "ck",
+    "cu",
+    "cw",
+    "cy",
+    "dell",
+    "dhl",
+    "dj",
+    "dupont",
+    "eg",
+    "er",
+    "et",
+    "farmers",
+    "ferrero",
+    "fk",
+    "flickr",
+    "flir",
+    "ford",
+    "frontier",
+    "ftr",
+    "gap",
+    "gb",
+    "gm",
+    "gr",
+    "grainger",
+    "gt",
+    "gu",
+    "gw",
+    "hbo",
+    "health",
+    "homegoods",
+    "homesense",
+    "hsbc",
+    "hyatt",
+    "ieee",
+    "intuit",
+    "ipiranga",
+    "itau",
+    "jm",
+    "jmp",
+    "jnj",
+    "jo",
+    "jpmorgan",
+    "kh",
+    "km",
+    "kp",
+    "kpmg",
+    "kpn",
+    "kred",
+    "lanxess",
+    "lilly",
+    "lincoln",
+    "lr",
+    "marshalls",
+    "mattel",
+    "mh",
+    "mil",
+    "mint",
+    "mlb",
+    "mp",
+    "mv",
+    "nba",
+    "ne",
+    "netflix",
+    "neustar",
+    "nfl",
+    "ni",
+    "nike",
+    "np",
+    "nr",
+    "pa",
+    "pfizer",
+    "ph",
+    "pn",
+    "praxi",
+    "pru",
+    "prudential",
+    "py",
+    "sas",
+    "sj",
+    "sohu",
+    "staples",
+    "statefarm",
+    "sv",
+    "sz",
+    "target",
+    "tj",
+    "tjmaxx",
+    "tjx",
+    "tkmaxx",
+    "tt",
+    "va",
+    "vivo",
+    "vn",
+    "weather",
+    "weatherchannel",
+    "web",
+    "williamhill",
+    "winners",
+    "xn--54b7fta0cc",
+    "xn--czr694b",
+    "xn--imr513n",
+    "xn--mgba3a3ejt",
+    "xn--mgbai9azgqp6j",
+    "xn--mgbayh7gpa",
+    "xn--mgbc0a9azcg",
+    "xn--mgbcpq6gpa1a",
+    "xn--mgbpl2fh",
+    "xn--node",
+    "xn--nyqy26a",
+    "xn--otu796d",
+    "xn--qxam",
+    "xn--rhqv96g",
+    "za",
+    "zw",
+    "ελ",
+    "ارامكو",
+    "الاردن",
+    "البحرين",
+    "المغرب",
+    "سودان",
+    "پاکستان",
+    "বাংলা",
+    "გე",
+    "世界",
+    "健康",
+    "商标",
+    "招聘",
+    "餐厅",
+];
+
 /// Returns every TLD seer knows about: the WHOIS server map keys unioned with
-/// the RDAP-only and WHOIS-retired TLDs, sorted and deduplicated. Backs the
-/// TUI TLD browser so it can list the full ~1,400-entry catalog instead of a
-/// hardcoded handful.
+/// the RDAP-only, WHOIS-retired, and no-WHOIS TLDs, sorted and deduplicated.
+/// Backs the TUI TLD browser so it can list the full ~1,570-entry catalog
+/// instead of a hardcoded handful.
 pub fn all_tlds() -> &'static [&'static str] {
     static ALL: Lazy<Vec<&'static str>> = Lazy::new(|| {
         let mut v: Vec<&'static str> = WHOIS_SERVERS.keys().copied().collect();
         v.extend_from_slice(RDAP_ONLY_TLDS);
         v.extend_from_slice(WHOIS_RETIRED_TLDS);
+        v.extend_from_slice(NO_WHOIS_TLDS);
         v.sort_unstable();
         v.dedup();
         v
@@ -1688,14 +1862,64 @@ mod all_tlds_tests {
     fn all_tlds_is_sorted_deduped_and_large() {
         let tlds = all_tlds();
         assert!(
-            tlds.len() > 1000,
-            "expected the full catalog, got {}",
+            tlds.len() > 1500,
+            "expected the full catalog (incl. no-WHOIS TLDs), got {}",
             tlds.len()
         );
         // Sorted + deduplicated.
         for w in tlds.windows(2) {
             assert!(w[0] < w[1], "not strictly sorted at {:?}", w);
         }
+    }
+
+    /// Delegated TLDs with no IANA-published WHOIS server (dot-brands, some
+    /// ccTLDs) are catalog-only: they must appear in `all_tlds()` so the TLD
+    /// browser lists them, must NOT have a `WHOIS_SERVERS` entry (there is no
+    /// server), and must not double-list in the other catalog consts.
+    #[test]
+    fn no_whois_tlds_are_catalog_only_and_disjoint() {
+        let tlds = all_tlds();
+        for tld in NO_WHOIS_TLDS {
+            assert!(
+                tlds.binary_search(tld).is_ok(),
+                ".{tld} missing from all_tlds() — no-WHOIS TLDs must stay in the catalog"
+            );
+            assert!(
+                get_whois_server(tld).is_none(),
+                ".{tld} is listed as no-WHOIS but resolves to a WHOIS server"
+            );
+            assert!(
+                !RDAP_ONLY_TLDS.contains(tld) && !WHOIS_RETIRED_TLDS.contains(tld),
+                ".{tld} must appear in exactly one catalog list"
+            );
+        }
+    }
+
+    /// IDN entries in `NO_WHOIS_TLDS` appear in both Unicode and punycode
+    /// forms, exactly paired — same convention (and same drift-guard) as the
+    /// WHOIS server map's alias entries.
+    #[test]
+    fn no_whois_idn_tlds_are_paired_in_both_forms() {
+        let set: std::collections::HashSet<&str> = NO_WHOIS_TLDS.iter().copied().collect();
+        let unicode_entries: Vec<&&str> = NO_WHOIS_TLDS.iter().filter(|t| !t.is_ascii()).collect();
+        assert!(!unicode_entries.is_empty(), "expected IDN no-WHOIS TLDs");
+        for tld in &unicode_entries {
+            let ascii = crate::validation::domain_to_ascii(tld)
+                .unwrap_or_else(|_| panic!("no-WHOIS IDN TLD {tld} must convert to an A-label"));
+            assert!(
+                set.contains(ascii.as_str()),
+                "Unicode no-WHOIS TLD {tld} lacks its punycode form {ascii}"
+            );
+        }
+        let punycode_count = NO_WHOIS_TLDS
+            .iter()
+            .filter(|t| t.starts_with("xn--"))
+            .count();
+        assert_eq!(
+            unicode_entries.len(),
+            punycode_count,
+            "every punycode no-WHOIS entry must have exactly one Unicode form"
+        );
     }
 
     #[test]
