@@ -30,6 +30,14 @@ use std::collections::HashMap;
 /// server, Freenom aftermath) and `ps` → `whois.registry.ps` (PNINA
 /// relocated; IANA still lists the dead `whois.pnina.ps`).
 ///
+/// Last upstream sync: 2026-08-07. Delta applied: CONAC's two gTLDs moved off
+/// the shared `whois.conac.cn` host to per-TLD servers (`xn--55qw42g`/公益 →
+/// `whois.nic.xn--55qw42g`, `xn--zfr164b`/政务 → `whois.nic.xn--zfr164b`;
+/// IANA records changed 2026-07-21, both hostnames verified in DNS). Every
+/// retired TLD above was re-checked against IANA the same day: all still
+/// publish an empty `whois:` field, so the upstream entries for them remain
+/// stale and none were re-added.
+///
 /// Second-level registry zones (e.g. ZACR's `co.za`) live in
 /// [`SLD_WHOIS_SERVERS`] below, resolved domain-first via
 /// [`get_whois_server_for_domain`].
@@ -1167,7 +1175,7 @@ pub static WHOIS_SERVERS: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(
     m.insert("xn--45q11c", "whois.gtld.zdns.cn");
     m.insert("xn--4dbrk0ce", "whois.isoc.org.il");
     m.insert("xn--4gbrim", "whois.nic.xn--4gbrim");
-    m.insert("xn--55qw42g", "whois.conac.cn");
+    m.insert("xn--55qw42g", "whois.nic.xn--55qw42g");
     m.insert("xn--55qx5d", "whois.ngtld.cn");
     m.insert("xn--5su34j936bgsg", "whois.nic.xn--5su34j936bgsg");
     m.insert("xn--5tzm5g", "whois.nic.xn--5tzm5g");
@@ -1287,7 +1295,7 @@ pub static WHOIS_SERVERS: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(
     m.insert("xn--y9a3aq", "whois.amnic.net");
     m.insert("xn--yfro4i67o", "whois.zh.sgnic.sg");
     m.insert("xn--ygbi2ammx", "whois.registry.ps");
-    m.insert("xn--zfr164b", "whois.conac.cn");
+    m.insert("xn--zfr164b", "whois.nic.xn--zfr164b");
 
     // ============================================================
     // Internationalized TLDs — Unicode aliases
@@ -1376,7 +1384,7 @@ pub static WHOIS_SERVERS: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(
     m.insert("信息", "whois.teleinfo.cn");
     m.insert("八卦", "whois.gtld.zdns.cn");
     m.insert("公司", "whois.ngtld.cn");
-    m.insert("公益", "whois.conac.cn");
+    m.insert("公益", "whois.nic.xn--55qw42g");
     m.insert("台湾", "whois.twnic.net.tw");
     m.insert("台灣", "whois.twnic.net.tw");
     m.insert("商城", "whois.gtld.zdns.cn");
@@ -1393,7 +1401,7 @@ pub static WHOIS_SERVERS: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(
     m.insert("慈善", "whois.gtld.zdns.cn");
     m.insert("我爱你", "whois.gtld.zdns.cn");
     m.insert("手机", "whois.nic.xn--kput3i");
-    m.insert("政务", "whois.conac.cn");
+    m.insert("政务", "whois.nic.xn--zfr164b");
     m.insert("政府", "whois.nic.xn--mxtq1m");
     m.insert("新加坡", "whois.zh.sgnic.sg");
     m.insert("新闻", "whois.gtld.zdns.cn");
@@ -1442,16 +1450,37 @@ static SLD_WHOIS_SERVERS: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(
     m
 });
 
+/// Looks up the WHOIS server for a TLD, accepting either form of an IDN TLD:
+/// the Unicode U-label (e.g. `рф`, `中国`) or the punycode A-label
+/// (`xn--p1ai`, `xn--fiqs8s`). The map keys both forms for every IDN entry,
+/// and a non-ASCII input that misses (or drifts out of the alias section) is
+/// additionally retried under its A-label, so the two forms can never resolve
+/// differently.
 pub fn get_whois_server(tld: &str) -> Option<&'static str> {
-    WHOIS_SERVERS.get(tld.to_lowercase().as_str()).copied()
+    let lower = tld.to_lowercase();
+    if let Some(server) = WHOIS_SERVERS.get(lower.as_str()) {
+        return Some(server);
+    }
+    if !lower.is_ascii() {
+        if let Ok(ascii) = crate::validation::domain_to_ascii(&lower) {
+            return WHOIS_SERVERS.get(ascii.as_str()).copied();
+        }
+    }
+    None
 }
 
 /// Resolves the WHOIS server for a full domain name, preferring the most
 /// specific match: a second-level registry zone (e.g. `co.za`) before the
 /// plain TLD. Use this over [`get_whois_server`] whenever the full domain is
-/// available.
+/// available. An IDN domain is converted to its A-labels first, so callers
+/// may pass either `пример.рф` or `xn--e1afmkfd.xn--p1ai`.
 pub fn get_whois_server_for_domain(domain: &str) -> Option<&'static str> {
     let lower = domain.trim_end_matches('.').to_lowercase();
+    let lower = if lower.is_ascii() {
+        lower
+    } else {
+        crate::validation::domain_to_ascii(&lower).unwrap_or(lower)
+    };
     let labels: Vec<&str> = lower.rsplit('.').collect();
     if labels.len() >= 2 {
         let sld_zone = format!("{}.{}", labels[1], labels[0]);
@@ -1467,9 +1496,17 @@ pub fn get_tld(domain: &str) -> Option<&str> {
 }
 
 /// Returns a suggested registry website URL for a TLD.
-/// Derives the URL from the WHOIS server hostname when possible.
+/// Derives the URL from the WHOIS server hostname when possible. A Unicode
+/// IDN TLD is converted to its A-label so derived URLs and the IANA fallback
+/// page use the canonical punycode form (IANA's root-db URLs are A-label
+/// keyed: `.../db/xn--p1ai.html`, not `.../db/рф.html`).
 pub fn get_registry_url(tld: &str) -> Option<String> {
     let tld_lower = tld.to_lowercase();
+    let tld_lower = if tld_lower.is_ascii() {
+        tld_lower
+    } else {
+        crate::validation::domain_to_ascii(&tld_lower).unwrap_or(tld_lower)
+    };
 
     // Special cases for well-known registries
     match tld_lower.as_str() {
@@ -1518,11 +1555,58 @@ pub fn get_registry_url(tld: &str) -> Option<String> {
 /// note on that map) but are still valid, lookupable TLDs. Listed here so the
 /// TLD browser can surface them even though they have no WHOIS server. These
 /// all resolve via RDAP (`lookup_tld` fills `rdap_url` from IANA bootstrap).
+/// The Google IDN TLDs appear in both punycode and Unicode forms, matching how
+/// `WHOIS_SERVERS` keys its IDN entries.
 pub const RDAP_ONLY_TLDS: &[&str] = &[
-    "ads", "android", "app", "boo", "cal", "channel", "chrome", "dad", "day", "dev", "docs",
-    "drive", "eat", "esq", "fly", "foo", "gle", "gmail", "goog", "google", "hangout", "here",
-    "how", "ing", "meet", "meme", "mov", "new", "nexus", "page", "phd", "play", "prof", "rsvp",
-    "search", "soy", "youtube", "zip",
+    "ads",
+    "android",
+    "app",
+    "boo",
+    "cal",
+    "channel",
+    "chrome",
+    "dad",
+    "day",
+    "dclk",
+    "dev",
+    "docs",
+    "drive",
+    "eat",
+    "esq",
+    "fly",
+    "foo",
+    "gbiz",
+    "gle",
+    "gmail",
+    "goog",
+    "google",
+    "guge",
+    "hangout",
+    "here",
+    "how",
+    "ing",
+    "map",
+    "meet",
+    "meme",
+    "mov",
+    "new",
+    "nexus",
+    "page",
+    "phd",
+    "play",
+    "prod",
+    "prof",
+    "rsvp",
+    "search",
+    "soy",
+    "youtube",
+    "zip",
+    "xn--flw351e",
+    "xn--q9jyb4c",
+    "xn--qcka1pmc",
+    "みんな",
+    "グーグル",
+    "谷歌",
 ];
 
 /// TLDs whose port-43 WHOIS servers are dead and were removed from
@@ -1543,7 +1627,9 @@ pub const WHOIS_RETIRED_TLDS: &[&str] = &[
     "рус",
     "lk",
     "xn--fzc2c9e2c",
+    "ලංකා",
     "xn--xkc2al3hye2a",
+    "இலங்கை",
     "mt",
 ];
 
@@ -1586,7 +1672,9 @@ mod all_tlds_tests {
             "рус",
             "lk",
             "xn--fzc2c9e2c",
+            "ලංකා",
             "xn--xkc2al3hye2a",
+            "இலங்கை",
             "mt",
         ] {
             assert!(
@@ -1617,6 +1705,121 @@ mod all_tlds_tests {
         assert!(tlds.contains(&"com"), "com (WHOIS) should be present");
         assert!(tlds.contains(&"app"), "app (RDAP-only) should be present");
         assert!(tlds.contains(&"dev"), "dev (RDAP-only) should be present");
+        // Google TLDs added in the 2026-08-07 upstream sync, including the
+        // IDN ones in both forms.
+        for tld in ["dclk", "map", "prod", "xn--q9jyb4c", "みんな", "谷歌"] {
+            assert!(
+                tlds.binary_search(&tld).is_ok(),
+                ".{tld} (Google, RDAP-only) should be in the catalog"
+            );
+        }
+    }
+
+    /// The map keys every IDN TLD under both its punycode A-label and its
+    /// Unicode U-label. Lock the two sections together: each Unicode key must
+    /// convert to an A-label that is also in the map with the SAME server,
+    /// and the section sizes must match (each A-label has exactly one
+    /// U-label), so neither side can drift when syncing from upstream.
+    #[test]
+    fn unicode_aliases_agree_with_punycode_entries() {
+        let unicode_keys: Vec<&str> = WHOIS_SERVERS
+            .keys()
+            .copied()
+            .filter(|k| !k.is_ascii())
+            .collect();
+        assert!(!unicode_keys.is_empty(), "expected Unicode alias entries");
+        for key in &unicode_keys {
+            let ascii = crate::validation::domain_to_ascii(key)
+                .unwrap_or_else(|_| panic!("Unicode key {key} must convert to an A-label"));
+            assert_eq!(
+                WHOIS_SERVERS.get(ascii.as_str()),
+                WHOIS_SERVERS.get(key),
+                "alias {key} and its A-label {ascii} must map to the same server"
+            );
+        }
+        let punycode_count = WHOIS_SERVERS
+            .keys()
+            .filter(|k| k.starts_with("xn--"))
+            .count();
+        assert_eq!(
+            unicode_keys.len(),
+            punycode_count,
+            "every punycode entry must have exactly one Unicode alias"
+        );
+    }
+
+    /// `get_whois_server` accepts either form of an IDN TLD (and any casing);
+    /// both must resolve to the same server.
+    #[test]
+    fn get_whois_server_accepts_unicode_and_punycode_forms() {
+        assert_eq!(get_whois_server("рф"), Some("whois.tcinet.ru"));
+        assert_eq!(get_whois_server("xn--p1ai"), Some("whois.tcinet.ru"));
+        assert_eq!(get_whois_server("РФ"), Some("whois.tcinet.ru"));
+        assert_eq!(get_whois_server("XN--P1AI"), Some("whois.tcinet.ru"));
+        assert_eq!(get_whois_server("中国"), Some("whois.cnnic.cn"));
+        assert_eq!(get_whois_server("ไทย"), Some("whois.thnic.co.th"));
+    }
+
+    /// 2026-08-07 upstream sync: CONAC's gTLDs moved off the shared
+    /// whois.conac.cn host to per-TLD servers (IANA records changed
+    /// 2026-07-21). Both forms must follow.
+    #[test]
+    fn conac_tlds_moved_to_per_tld_servers() {
+        assert_eq!(
+            get_whois_server("xn--55qw42g"),
+            Some("whois.nic.xn--55qw42g")
+        );
+        assert_eq!(get_whois_server("公益"), Some("whois.nic.xn--55qw42g"));
+        assert_eq!(
+            get_whois_server("xn--zfr164b"),
+            Some("whois.nic.xn--zfr164b")
+        );
+        assert_eq!(get_whois_server("政务"), Some("whois.nic.xn--zfr164b"));
+    }
+
+    /// Full IDN domains resolve to their TLD's server whether given as
+    /// U-labels or A-labels (callers may bypass normalize_domain).
+    #[test]
+    fn get_whois_server_for_domain_accepts_idn_domains() {
+        assert_eq!(
+            get_whois_server_for_domain("пример.рф"),
+            Some("whois.tcinet.ru")
+        );
+        assert_eq!(
+            get_whois_server_for_domain("xn--e1afmkfd.xn--p1ai"),
+            Some("whois.tcinet.ru")
+        );
+        // FQDN form (trailing root dot) still converts.
+        assert_eq!(
+            get_whois_server_for_domain("пример.рф."),
+            Some("whois.tcinet.ru")
+        );
+        assert_eq!(
+            get_whois_server_for_domain("例え.jp"),
+            Some("whois.jprs.jp")
+        );
+    }
+
+    /// Registry URLs for IDN TLDs use the canonical A-label: IANA's root-db
+    /// pages are punycode-keyed, and derived nic.<tld> hosts only exist in
+    /// DNS under their A-label.
+    #[test]
+    fn get_registry_url_uses_punycode_for_idn_tlds() {
+        assert_eq!(
+            get_registry_url("рф").as_deref(),
+            Some("https://www.iana.org/domains/root/db/xn--p1ai.html")
+        );
+        // whois.nic.xn--d1acj3b matches the converted TLD, so the derived
+        // registry URL is kept — under the A-label, never the U-label.
+        assert_eq!(
+            get_registry_url("дети").as_deref(),
+            Some("https://nic.xn--d1acj3b")
+        );
+        assert_eq!(
+            get_registry_url("дети"),
+            get_registry_url("xn--d1acj3b"),
+            "both forms of an IDN TLD must produce the same registry URL"
+        );
     }
 
     #[test]
@@ -1651,9 +1854,13 @@ mod all_tlds_tests {
             // Second wave (ccTLD follow-up audit, same day): servers answer
             // nothing and IANA's whois: field is empty. (.ps is NOT here: its
             // registry moved to whois.registry.ps — see relocated test below.)
+            // The Unicode forms of the .lk IDN TLDs must miss too — the
+            // punycode fallback in get_whois_server must not resurrect them.
             "lk",
             "xn--fzc2c9e2c",
+            "ලංකා",
             "xn--xkc2al3hye2a",
+            "இலங்கை",
             "mt",
         ] {
             assert!(

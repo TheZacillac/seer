@@ -11,6 +11,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **WHOIS server map synced with upstream** (WooMai/whois-servers, 2026-08-07).
+  CONAC's two gTLDs moved off the shared `whois.conac.cn` host to per-TLD
+  servers: `.公益`/`xn--55qw42g` → `whois.nic.xn--55qw42g` and
+  `.政务`/`xn--zfr164b` → `whois.nic.xn--zfr164b` (IANA records changed
+  2026-07-21; hostnames verified in DNS). The 13 WHOIS-retired TLDs were
+  re-checked against IANA the same day — all still publish no `whois:` server,
+  so none were re-added. The TLD catalog gained 11 previously missing Google
+  Registry TLDs (`dclk`, `gbiz`, `guge`, `map`, `prod`, and `みんな`/`グーグル`/
+  `谷歌` in both Unicode and punycode forms) as RDAP-only entries, and the
+  Unicode forms `ලංකා`/`இலங்கை` of the retired `.lk` IDN TLDs are now listed
+  alongside their punycode forms.
+
+### Fixed
+- **IDN TLD lookups now accept either form everywhere.** `get_whois_server`,
+  `get_whois_server_for_domain`, and `get_registry_url` convert Unicode
+  (U-label) input to punycode (A-label) instead of relying solely on the
+  hand-maintained Unicode alias entries, so `рф` and `xn--p1ai` (or
+  `пример.рф` and `xn--e1afmkfd.xn--p1ai`) can never resolve differently.
+  Registry URLs for IDN TLDs now use the canonical A-label (IANA root-db
+  pages and `nic.<tld>` hosts are punycode-keyed). A new map-consistency test
+  locks every Unicode alias to its punycode entry, and a mock-server test
+  pins the WHOIS wire query for an IDN domain to its A-label form.
+
 ## [0.45.1] - 2026-08-02
 
 A small maintenance release: one user-visible MCP fix and one release-tooling
