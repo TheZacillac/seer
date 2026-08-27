@@ -11,6 +11,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.47.0] - 2026-08-27
+
+Adds two security/pen-test features. `seer headers` grades what an origin
+serves over HTTP — the one security layer seer did not yet inspect, having
+already covered transport (`ssl`, `caa`), DNS/email (`posture`, `dnssec`,
+`delegation`), and registration (`whois`, `rdap`, `drift`). `seer takeover`
+completes an existing signal: `subdomains --resolve` only caught a dangling
+CNAME that stopped resolving, missing the commoner case where the provider
+still answers for a deprovisioned resource and only the response body says
+otherwise.
+
+Both are available across every surface — CLI, REPL, Python, REST, MCP
+(30 tools), and the TUI (18 lenses) — and share a new SSRF-guarded HTTP
+fetch path. This release also clears two RUSTSEC advisories and drops an
+unused dependency.
+
 ### Added
 - **`seer headers` — HTTP security-header audit.** Seer already inspected a
   domain's transport (`ssl`, `caa`), DNS/email (`posture`, `dnssec`,
@@ -940,7 +956,8 @@ Two notable breaking changes landed in this period (see `CLAUDE.md` for details)
   `inconsistencies` became typed (`ConsensusValue` / `Inconsistency`) instead of
   pre-formatted strings.
 
-[Unreleased]: https://github.com/TheZacillac/seer/compare/v0.46.0...HEAD
+[Unreleased]: https://github.com/TheZacillac/seer/compare/v0.47.0...HEAD
+[0.47.0]: https://github.com/TheZacillac/seer/compare/v0.46.0...v0.47.0
 [0.46.0]: https://github.com/TheZacillac/seer/compare/v0.45.0...v0.46.0
 [0.45.0]: https://github.com/TheZacillac/seer/compare/v0.44.2...v0.45.0
 [0.44.2]: https://github.com/TheZacillac/seer/compare/v0.44.1...v0.44.2
