@@ -305,6 +305,12 @@ impl OutputFormatter for HumanFormatter {
     fn format_posture(&self, posture: &crate::posture::EmailPosture) -> String {
         self.format_posture(posture)
     }
+    fn format_headers(&self, report: &crate::headers::HeaderReport) -> String {
+        self.format_headers(report)
+    }
+    fn format_takeover(&self, report: &crate::takeover::TakeoverReport) -> String {
+        self.format_takeover(report)
+    }
     fn format_caa(&self, policy: &CaaPolicy) -> String {
         self.format_caa(policy)
     }

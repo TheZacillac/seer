@@ -6,8 +6,10 @@ use super::{MarkdownFormatter, MdSafe};
 use crate::caa::CaaPolicy;
 use crate::confusables::ConfusableReport;
 use crate::drift::DriftReport;
+use crate::headers::HeaderReport;
 use crate::posture::EmailPosture;
 use crate::subdomains::{SubdomainBaselineDiff, SubdomainClassification};
+use crate::takeover::{TakeoverReport, TakeoverVerdict};
 
 impl MarkdownFormatter {
     pub(super) fn format_drift(&self, report: &DriftReport) -> String {
@@ -115,6 +117,116 @@ impl MarkdownFormatter {
         if !posture.notes.is_empty() {
             out.push_str("\n### Advisories\n\n");
             for note in &posture.notes {
+                let _ = writeln!(out, "- {}", MdSafe(note));
+            }
+        }
+        out
+    }
+
+    pub(super) fn format_headers(&self, report: &HeaderReport) -> String {
+        let mut out = format!("## HTTP security headers: {}\n\n", MdSafe(&report.domain));
+        let _ = writeln!(
+            out,
+            "**Grade: {} ({}/100)** — `{}` (HTTP {})\n",
+            MdSafe(&report.grade),
+            report.score,
+            MdSafe(&report.url),
+            report.status
+        );
+
+        out.push_str("| Header | Verdict | Value |\n|---|---|---|\n");
+        for f in &report.headers {
+            let _ = writeln!(
+                out,
+                "| {} | {:?} | {} |",
+                MdSafe(&f.header),
+                f.verdict,
+                MdSafe(f.value.as_deref().unwrap_or(""))
+            );
+        }
+
+        if !report.cookies.is_empty() {
+            out.push_str("\n### Cookies\n\n");
+            out.push_str(
+                "| Cookie | Verdict | Secure | HttpOnly | SameSite |\n|---|---|---|---|---|\n",
+            );
+            for c in &report.cookies {
+                let _ = writeln!(
+                    out,
+                    "| {} | {:?} | {} | {} | {} |",
+                    MdSafe(&c.name),
+                    c.verdict,
+                    c.secure,
+                    c.http_only,
+                    MdSafe(c.same_site.as_deref().unwrap_or("—"))
+                );
+            }
+        }
+
+        if !report.disclosures.is_empty() {
+            out.push_str("\n### Disclosed software\n\n");
+            for d in &report.disclosures {
+                let _ = writeln!(
+                    out,
+                    "- `{}`: {}{}",
+                    MdSafe(&d.header),
+                    MdSafe(&d.value),
+                    if d.versioned { " (versioned)" } else { "" }
+                );
+            }
+        }
+
+        if !report.notes.is_empty() {
+            out.push_str("\n### Advisories\n\n");
+            for note in &report.notes {
+                let _ = writeln!(out, "- {}", MdSafe(note));
+            }
+        }
+        out
+    }
+
+    pub(super) fn format_takeover(&self, report: &TakeoverReport) -> String {
+        let mut out = format!("## Takeover scan: {}\n\n", MdSafe(&report.domain));
+        let _ = writeln!(
+            out,
+            "{} host(s) checked — **{} vulnerable**, {} potential\n",
+            report.hosts_checked, report.vulnerable, report.potential
+        );
+        if report.hosts_skipped > 0 {
+            let _ = writeln!(
+                out,
+                "_{} host(s) exceeded the scan cap and were not examined._\n",
+                report.hosts_skipped
+            );
+        }
+
+        if report.findings.is_empty() {
+            out.push_str("_No takeover signals found._\n");
+        } else {
+            out.push_str(
+                "| Host | Verdict | Provider | CNAME | Evidence |\n|---|---|---|---|---|\n",
+            );
+            for f in &report.findings {
+                let verdict = match f.verdict {
+                    TakeoverVerdict::Vulnerable => "**VULNERABLE**",
+                    TakeoverVerdict::Potential => "potential",
+                    TakeoverVerdict::Safe => "safe",
+                };
+                let _ = writeln!(
+                    out,
+                    "| {} | {} | {} | {} | {} |",
+                    MdSafe(&f.host),
+                    verdict,
+                    MdSafe(f.provider.as_deref().unwrap_or("—")),
+                    MdSafe(f.cname.as_deref().unwrap_or("—")),
+                    MdSafe(f.evidence.as_deref().unwrap_or("—"))
+                );
+            }
+        }
+
+        if !report.notes.is_empty() {
+            out.push_str("\n### Advisories\n\n");
+            for note in &report.notes {
                 let _ = writeln!(out, "- {}", MdSafe(note));
             }
         }

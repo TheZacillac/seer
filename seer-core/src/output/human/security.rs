@@ -7,8 +7,10 @@ use super::HumanFormatter;
 use crate::caa::CaaPolicy;
 use crate::confusables::ConfusableReport;
 use crate::drift::DriftReport;
+use crate::headers::{HeaderReport, HeaderVerdict};
 use crate::posture::{EmailPosture, PostureVerdict};
 use crate::subdomains::{SubdomainBaselineDiff, SubdomainClassification, SubdomainStatus};
+use crate::takeover::{TakeoverReport, TakeoverVerdict};
 
 impl HumanFormatter {
     /// Colors a posture verdict token.
@@ -19,6 +21,18 @@ impl HumanFormatter {
             PostureVerdict::Weak => self.warning("weak"),
             PostureVerdict::Present => self.value("present"),
             PostureVerdict::Absent => self.error("absent"),
+        }
+    }
+
+    /// Colors a header verdict token. Mirrors [`Self::posture_verdict`] so the
+    /// two security reports read identically.
+    fn header_verdict(&self, verdict: HeaderVerdict) -> String {
+        match verdict {
+            HeaderVerdict::Strict => self.success("strict"),
+            HeaderVerdict::Moderate => self.warning("moderate"),
+            HeaderVerdict::Weak => self.warning("weak"),
+            HeaderVerdict::Present => self.value("present"),
+            HeaderVerdict::Absent => self.error("absent"),
         }
     }
 
@@ -152,6 +166,182 @@ impl HumanFormatter {
                     self.warning("•"),
                     sanitize_display(note)
                 ));
+            }
+        }
+        out.join("\n")
+    }
+
+    pub(super) fn format_headers(&self, report: &HeaderReport) -> String {
+        let mut out = vec![self.header(&format!(
+            "HTTP security headers: {}",
+            sanitize_display(&report.domain)
+        ))];
+
+        // Color the grade by band so the headline verdict is readable at a
+        // glance: A/A+ passing, B–C partial, D and below failing.
+        let grade = match report.grade.as_str() {
+            "A+" | "A" => self.success(&report.grade),
+            "B" | "C" => self.warning(&report.grade),
+            _ => self.error(&report.grade),
+        };
+        out.push(format!(
+            "{}: {} ({}/100)",
+            self.label("Grade"),
+            grade,
+            self.value(&report.score.to_string()),
+        ));
+        out.push(format!(
+            "{}: {} {}",
+            self.label("URL"),
+            self.value(&sanitize_display(&report.url)),
+            self.dim(&format!("[HTTP {}]", report.status)),
+        ));
+        if report.redirects > 0 {
+            out.push(format!(
+                "{}: {}",
+                self.label("Redirects followed"),
+                self.value(&report.redirects.to_string()),
+            ));
+        }
+
+        out.push(String::new());
+        for finding in &report.headers {
+            let mut line = format!(
+                "{}: {}",
+                self.label(&finding.header),
+                self.header_verdict(finding.verdict),
+            );
+            if let Some(value) = &finding.value {
+                line.push_str(&format!(" {}", self.dim(&sanitize_display(value))));
+            }
+            out.push(line);
+        }
+
+        if !report.cookies.is_empty() {
+            out.push(String::new());
+            out.push(self.label("Cookies:"));
+            for cookie in &report.cookies {
+                let flags = [
+                    ("Secure", cookie.secure),
+                    ("HttpOnly", cookie.http_only),
+                    ("SameSite", cookie.same_site.is_some()),
+                ]
+                .iter()
+                .map(|(name, set)| {
+                    if *set {
+                        self.success(name)
+                    } else {
+                        self.error(&format!("no {name}"))
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+                out.push(format!(
+                    "  {} [{}] {}",
+                    self.value(&sanitize_display(&cookie.name)),
+                    self.header_verdict(cookie.verdict),
+                    self.dim(&flags),
+                ));
+            }
+        }
+
+        if !report.disclosures.is_empty() {
+            out.push(String::new());
+            out.push(self.label("Disclosed software:"));
+            for d in &report.disclosures {
+                let value = sanitize_display(&d.value);
+                out.push(format!(
+                    "  {}: {}",
+                    self.dim(&d.header),
+                    if d.versioned {
+                        self.warning(&value)
+                    } else {
+                        self.value(&value)
+                    },
+                ));
+            }
+        }
+
+        if !report.notes.is_empty() {
+            out.push(String::new());
+            out.push(self.label("Advisories:"));
+            for note in &report.notes {
+                out.push(format!(
+                    "  {} {}",
+                    self.warning("•"),
+                    sanitize_display(note)
+                ));
+            }
+        }
+        out.join("\n")
+    }
+
+    pub(super) fn format_takeover(&self, report: &TakeoverReport) -> String {
+        let mut out = vec![self.header(&format!(
+            "Takeover scan: {}",
+            sanitize_display(&report.domain)
+        ))];
+
+        out.push(format!(
+            "{} host(s) checked — {} vulnerable, {} potential",
+            self.value(&report.hosts_checked.to_string()),
+            if report.vulnerable > 0 {
+                self.error(&report.vulnerable.to_string())
+            } else {
+                self.success("0")
+            },
+            if report.potential > 0 {
+                self.warning(&report.potential.to_string())
+            } else {
+                self.success("0")
+            },
+        ));
+        if report.hosts_skipped > 0 {
+            out.push(self.warning(&format!(
+                "{} more host(s) exceeded the scan cap and were not examined",
+                report.hosts_skipped
+            )));
+        }
+
+        if !report.findings.is_empty() {
+            out.push(String::new());
+            for f in &report.findings {
+                let verdict = match f.verdict {
+                    TakeoverVerdict::Vulnerable => self.error("VULNERABLE"),
+                    TakeoverVerdict::Potential => self.warning("potential"),
+                    TakeoverVerdict::Safe => self.success("safe"),
+                };
+                let mut line = format!("{}  [{}]", self.value(&sanitize_display(&f.host)), verdict);
+                if let Some(provider) = &f.provider {
+                    line.push_str(&format!("  {}", self.dim(&sanitize_display(provider))));
+                }
+                out.push(line);
+                if let Some(cname) = &f.cname {
+                    out.push(format!(
+                        "    {} {}",
+                        self.label("CNAME →"),
+                        self.dim(&sanitize_display(cname)),
+                    ));
+                }
+                // The matched fingerprint is the evidence for a VULNERABLE
+                // claim — always show it so the finding can be verified.
+                if let Some(evidence) = &f.evidence {
+                    out.push(format!(
+                        "    {} {}",
+                        self.label("Evidence:"),
+                        self.error(&sanitize_display(evidence)),
+                    ));
+                }
+                if let Some(note) = &f.probe_note {
+                    out.push(format!("    {}", self.dim(&sanitize_display(note))));
+                }
+            }
+        }
+
+        if !report.notes.is_empty() {
+            out.push(String::new());
+            for note in &report.notes {
+                out.push(format!("{} {}", self.warning("•"), sanitize_display(note)));
             }
         }
         out.join("\n")

@@ -456,42 +456,13 @@ fn extract_title(html: &str) -> Option<String> {
 /// broken. The reserved-range policy is unchanged (the previous local check
 /// delegated to the same `net::is_reserved_ip`), and the guard's error already
 /// omits the resolved IP (internal-DNS-oracle hardening, issue #49).
+///
+/// The policy itself lives in [`crate::net::validate_http_url`], shared with
+/// the other HTTP fetch paths (`headers`, `takeover`) so the scheme,
+/// credential, port, and reserved-range rules cannot drift between them. This
+/// wrapper is kept as the status module's named entry point.
 async fn validate_url_target(url: &Url) -> Result<Vec<SocketAddr>> {
-    let scheme = url.scheme();
-    if scheme != "https" && scheme != "http" {
-        return Err(SeerError::HttpError(format!(
-            "unsupported URL scheme: {}",
-            scheme
-        )));
-    }
-
-    if !url.username().is_empty() || url.password().is_some() {
-        return Err(SeerError::HttpError(
-            "URL credentials are not allowed".to_string(),
-        ));
-    }
-
-    // Use `host()` (not `host_str()`) so an IPv6 literal comes back
-    // unbracketed and hits the guard's IP-literal short-circuit.
-    let host = match url.host() {
-        Some(url::Host::Domain(d)) => d.to_string(),
-        Some(url::Host::Ipv4(ip)) => ip.to_string(),
-        Some(url::Host::Ipv6(ip)) => ip.to_string(),
-        None => return Err(SeerError::HttpError("missing URL host".to_string())),
-    };
-    let port = url.port_or_known_default().unwrap_or(443);
-
-    // Only allow standard HTTP/HTTPS ports to prevent port scanning via redirects
-    if port != 80 && port != 443 {
-        return Err(SeerError::HttpError(format!(
-            "non-standard port {} is not allowed in redirects",
-            port
-        )));
-    }
-
-    crate::net::resolve_public_host(&host, port)
-        .await
-        .map_err(|e| SeerError::HttpError(e.to_string()))
+    crate::net::validate_http_url(url).await
 }
 
 /// Parses certificate information from DER-encoded certificate using x509-parser.
