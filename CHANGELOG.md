@@ -39,6 +39,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Available as `seer takeover <domain>`, the REPL `takeover` command,
   `seer.takeover()`, `GET /takeover/{domain}`, and the `seer_takeover` MCP
   tool (rate-limited to 5/minute like `confusables`).
+- **TUI lenses for both features** (18 lenses, was 16). `HTTP Headers` renders
+  the grade as a gauge with per-header verdicts colored by severity — a column
+  of same-colored words would bury the absent headers among the strict ones —
+  plus a cookie summary and the advisory list. `Takeover` is a selectable
+  findings table (host / verdict / provider / evidence) whose border tracks the
+  worst finding, listing only actionable hosts while the title carries how many
+  were checked; it supports `/`-filtering like the other table lenses, with the
+  headline counts recomputed for the visible subset. Both are reachable from
+  the nav, by `:headers` / `:takeover`, and through `r` raw output and `y` copy.
 
 ### Changed
 - **MCP server now exposes 30 tools** (was 28), adding `seer_headers` and

@@ -178,6 +178,9 @@ impl App {
             LensData::Watch(w) => w.results.len(),
             LensData::History(e) => e.len(),
             LensData::Subdomains(s) => s.subdomains.len(),
+            // Only reported (non-safe) hosts are listed, so the selection
+            // index space is the findings vec, not hosts_checked.
+            LensData::Takeover(t) => t.findings.len(),
             _ => 0,
         }
     }
@@ -293,6 +296,8 @@ impl App {
             "watch" => FetchReq::Watch,
             "history" => FetchReq::History,
             "subdomains" => FetchReq::Subdomains(d),
+            "headers" => FetchReq::Headers(d),
+            "takeover" => FetchReq::Takeover(d),
             "follow" | "bulk" => return None, // streaming — started explicitly
             _ => return None,
         })
@@ -1502,6 +1507,83 @@ mod tests {
             )),
             "expected Fetch(RdapDomain), got {actions:?}",
         );
+    }
+
+    #[test]
+    fn headers_command_selects_lens_and_fetches_the_domain() {
+        let mut app = App::new(Some("example.com".into()));
+        let _ = app.take_startup_actions();
+        let actions = app.exec_command("headers");
+        let idx = lenses::find_by_cmd_or_key("headers").unwrap();
+        assert_eq!(app.lens, idx, ":headers must switch to the headers lens");
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::Fetch { req: FetchReq::Headers(d), .. } if d == "example.com"
+            )),
+            "expected Fetch(Headers(example.com)), got {actions:?}",
+        );
+    }
+
+    #[test]
+    fn takeover_command_selects_lens_and_fetches_the_domain() {
+        let mut app = App::new(Some("example.com".into()));
+        let _ = app.take_startup_actions();
+        let actions = app.exec_command("takeover");
+        let idx = lenses::find_by_cmd_or_key("takeover").unwrap();
+        assert_eq!(app.lens, idx, ":takeover must switch to the takeover lens");
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::Fetch { req: FetchReq::Takeover(d), .. } if d == "example.com"
+            )),
+            "expected Fetch(Takeover(example.com)), got {actions:?}",
+        );
+    }
+
+    #[test]
+    fn takeover_row_count_uses_reported_findings_not_hosts_checked() {
+        use seer_core::{TakeoverFinding, TakeoverReport, TakeoverVerdict};
+        let mut app = App::new(Some("example.com".into()));
+        let _ = app.take_startup_actions();
+        app.lens = lenses::find_by_cmd_or_key("takeover").unwrap();
+        let report = TakeoverReport {
+            domain: "example.com".into(),
+            // 40 hosts scanned, but only 2 are actionable and listed — the
+            // selection index space must follow the table, not the scan.
+            hosts_checked: 40,
+            hosts_skipped: 0,
+            vulnerable: 1,
+            potential: 1,
+            findings: vec![
+                TakeoverFinding {
+                    host: "a.example.com".into(),
+                    verdict: TakeoverVerdict::Vulnerable,
+                    provider: None,
+                    cname: None,
+                    addresses: vec![],
+                    evidence: None,
+                    http_status: None,
+                    probe_note: None,
+                },
+                TakeoverFinding {
+                    host: "b.example.com".into(),
+                    verdict: TakeoverVerdict::Potential,
+                    provider: None,
+                    cname: None,
+                    addresses: vec![],
+                    evidence: None,
+                    http_status: None,
+                    probe_note: None,
+                },
+            ],
+            notes: vec![],
+        };
+        app.states.insert(
+            "takeover",
+            LensState::Loaded(LensData::Takeover(Box::new(report))),
+        );
+        assert_eq!(app.row_count(), 2);
     }
 
     #[test]

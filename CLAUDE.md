@@ -166,7 +166,7 @@ seer-cli/src/
     ├── render.rs       # frame rendering (shell + lens dispatch)
     ├── widgets/        # panel, kv, gauge, dot, chips
     ├── panes/          # interactive lens components (tld/dns/compare/diff/follow/bulk): state + handle_key
-    └── lenses/         # registry + all 16 lens renderers
+    └── lenses/         # registry + all 18 lens renderers
 ```
 
 **Key Points:**
@@ -204,7 +204,7 @@ seer-cli/src/
   and all subcommands are unchanged). Architecture: async `tokio::select!` loop,
   pure `App` state (no I/O — file I/O runs in `mod.rs` via `spawn_blocking`),
   parameterized `FetchReq` lookups dispatched to `seer-core` over a channel, and
-  interactive lenses as `panes/` components (`handle_key -> PaneOutcome`). All 16
+  interactive lenses as `panes/` components (`handle_key -> PaneOutcome`). All 18
   lenses are wired with live data + full in-pane inputs, including the streaming
   Follow (live monitor) and Bulk (concurrent + CSV export) lenses. A per-lens /
   per-stream generation guard drops stale async results (on domain/tab change or

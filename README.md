@@ -183,12 +183,12 @@ The **lens** sidebar covers every Seer capability, grouped, each pulling live da
 
 - **LOOKUP** — Overview · WHOIS · RDAP (Domain · IP · ASN) · Reverse DNS · Availability · TLD Info
 - **DNS** — Records (+ custom nameserver) · DNSSEC · Compare (two resolvers) · Propagation · Follow (live monitor)
-- **SECURITY** — SSL / Cert · Status · Subdomains
+- **SECURITY** — SSL / Cert · Status · Subdomains · HTTP Headers · Takeover
 - **POWER** — Diff · Bulk (streaming + CSV export) · Watchlist · History
 
 **Keys:** `j`/`k` move · `1`–`9` jump to a lens · `Tab` focus nav⇄pane · `[` `]` sub-tabs · `r` raw output (json/yaml/markdown) · `y` copy · `/` look up a domain · `:` command · `?` help · `:q` quit. In-pane: switchers (TLD, nameserver, Compare resolvers, Bulk op) and editable fields (Diff's 2nd domain, Follow interval/count, Bulk file path).
 
-**Commands (`:`):** `lookup`, `whois`, `rdap <domain|ip|AS####>`, `dig`, `ssl`, `status`, `reverse <ip>`, `tld <.tld>`, `compare <domain> <nsA> <nsB>`, `diff <a> <b>`, `set output <human|json|yaml|markdown>`, `theme <frappe|latte>`, `copy`, `q`.
+**Commands (`:`):** `lookup`, `whois`, `rdap <domain|ip|AS####>`, `dig`, `ssl`, `status`, `headers`, `takeover`, `reverse <ip>`, `tld <.tld>`, `compare <domain> <nsA> <nsB>`, `diff <a> <b>`, `set output <human|json|yaml|markdown>`, `theme <frappe|latte>`, `copy`, `q`.
 
 The startup theme comes from `[tui] theme` in `~/.seer/config.toml` (`"frappe"` — the default — or `"latte"`; unknown names fall back to Frappé). Switch live with `:theme latte`.
 
@@ -752,7 +752,7 @@ seer/
 │       ├── main.rs           # Clap commands & dispatch
 │       ├── display/          # Spinner and progress utilities
 │       ├── repl/             # Interactive REPL
-│       └── tui/              # Full-screen ratatui TUI (16 lenses)
+│       └── tui/              # Full-screen ratatui TUI (18 lenses)
 │
 ├── seer-py/                  # Python bindings (PyO3)
 │   ├── src/lib.rs            # Rust → Python bridge
