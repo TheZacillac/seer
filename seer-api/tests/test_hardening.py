@@ -424,6 +424,8 @@ def test_mcp_ssrf_guard_rejects_reserved():
         ("seer_dnssec", {"domain": "example.com"}, "dnssec"),
         ("seer_caa", {"domain": "example.com"}, "caa"),
         ("seer_posture", {"domain": "example.com"}, "posture"),
+        ("seer_headers", {"domain": "example.com"}, "headers"),
+        ("seer_takeover", {"domain": "example.com"}, "takeover"),
         ("seer_subdomains", {"domain": "example.com"}, "subdomains"),
         (
             "seer_subdomains",
@@ -454,7 +456,7 @@ def test_mcp_ssrf_guard_rejects_reserved():
 )
 def test_mcp_dispatch_table_reaches_seer_binding(monkeypatch, tool, args, seer_fn):
     """Every tool arm in execute_tool must dispatch to its seer binding
-    function. Covers all 25 dispatch arms (seer_subdomains has two paths).
+    function. Covers all 27 dispatch arms (seer_subdomains has two paths).
     """
     import asyncio
 

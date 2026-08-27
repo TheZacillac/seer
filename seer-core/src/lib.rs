@@ -63,6 +63,7 @@ pub use domain_info::{
 pub use drift::{drift_from_history, DriftReport, FieldChange};
 pub use headers::{
     audit_headers, CookieFinding, Disclosure, HeaderFinding, HeaderReport, HeaderVerdict,
+    DEFAULT_HEADER_TIMEOUT,
 };
 pub use history::{HistoryEntry, LookupHistory};
 pub use output::{OutputFormat, OutputFormatter};

@@ -130,6 +130,10 @@ pub struct HeaderReport {
     pub notes: Vec<String>,
 }
 
+/// Default per-audit HTTP timeout, for callers with no configured value of
+/// their own (the Python bindings). The CLI passes `config.http_timeout()`.
+pub const DEFAULT_HEADER_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Per-header weights, summing to 100. Ordering here is also the display order.
 ///
 /// The weighting reflects blast radius: HSTS and CSP each defend against a

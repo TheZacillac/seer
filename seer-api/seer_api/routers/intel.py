@@ -2,12 +2,16 @@
 
 Reaches parity with the CLI/library surface (availability, subdomains, DNSSEC,
 diff, info) and exposes the newer intelligence features (CAA policy, email
-security posture, typosquat look-alikes). Each router is mounted under its own
-prefix in ``main.py``.
+security posture, HTTP header audit, subdomain-takeover scan, typosquat
+look-alikes). Each router is mounted under its own prefix in ``main.py``.
 
-The queried domain is a DNS/RDAP/WHOIS *question*, not a connect target, so —
-like ``dns.dns_lookup`` — these routes do not apply an API-layer SSRF guard;
-the seer-core network layer guards the eventual connect targets itself.
+For most routes here the queried domain is a DNS/RDAP/WHOIS *question*, not a
+connect target, so — like ``dns.dns_lookup`` — they apply no API-layer SSRF
+guard. ``headers`` and ``takeover`` are the exceptions: they do connect to the
+queried host over HTTPS. They still apply no API-layer guard, for the same
+reason ``ssl`` does not — seer-core resolves and vets every target itself and
+pins the validated addresses, so a second check here would add nothing but its
+own TOCTOU window.
 """
 
 from typing import Annotated
@@ -195,6 +199,56 @@ async def posture(request: Request, domain: _Domain):
         return await run_seer(seer.posture, domain)
     except Exception as e:
         raise http_error(e, "Posture check failed") from e
+
+
+# --- headers -------------------------------------------------------------
+
+headers_router = APIRouter()
+
+
+@headers_router.get("/{domain}")
+@limiter.limit("20/minute")
+async def headers(request: Request, domain: _Domain):
+    """Audit HTTP security headers, cookie flags, and version disclosure.
+
+    Unlike its sibling routes, this one *connects* to the queried domain over
+    HTTPS. No API-layer SSRF guard is applied here for the same reason it is
+    not applied to ``ssl``: seer-core resolves and vets the target itself
+    (refusing reserved/private addresses and pinning the validated addresses
+    per redirect hop), so duplicating the check here would only add a second
+    resolution with its own TOCTOU window.
+    """
+    try:
+        return await run_seer(seer.headers, domain)
+    except Exception as e:
+        raise http_error(e, "Header audit failed") from e
+
+
+# --- takeover ------------------------------------------------------------
+
+takeover_router = APIRouter()
+
+
+@takeover_router.get("/{domain}")
+@limiter.limit("5/minute")
+async def takeover(
+    request: Request,
+    domain: _Domain,
+    concurrency: int = Query(10, ge=1, le=MAX_CONCURRENCY),
+):
+    """Scan a domain's subdomains for takeover exposure.
+
+    Enumerates via Certificate Transparency logs, then checks each host whose
+    CNAME points at a takeover-prone provider. A host serving that provider's
+    unclaimed-resource page is reported as vulnerable with the matched
+    fingerprint as evidence; a dangling CNAME that does not resolve is
+    reported as potential. Rate-limited like ``confusables`` because it fans
+    out across the whole enumerated zone.
+    """
+    try:
+        return await run_seer(seer.takeover, domain, concurrency)
+    except Exception as e:
+        raise http_error(e, "Takeover scan failed") from e
 
 
 # --- confusables ---------------------------------------------------------

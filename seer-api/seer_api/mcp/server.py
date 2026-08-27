@@ -658,6 +658,45 @@ async def list_tools() -> list[Tool]:
             inputSchema=_DOMAIN_SCHEMA,
         ),
         Tool(
+            name="seer_headers",
+            description=(
+                "Audit a domain's HTTP security headers with one non-intrusive GET. Grades HSTS, "
+                "CSP, X-Frame-Options, X-Content-Type-Options, Referrer-Policy, "
+                "Permissions-Policy, and COOP/COEP/CORP, plus Set-Cookie flags (Secure/HttpOnly/"
+                "SameSite) and version-disclosing banners, as a 0-100 score and a letter grade."
+            ),
+            inputSchema=_DOMAIN_SCHEMA,
+        ),
+        Tool(
+            name="seer_takeover",
+            description=(
+                "Scan a domain's subdomains for takeover exposure. Enumerates via Certificate "
+                "Transparency logs, then checks each host whose CNAME points at a takeover-prone "
+                "provider. A host serving that provider's unclaimed-resource page is reported "
+                "vulnerable with the matched fingerprint as evidence; a dangling CNAME that does "
+                "not resolve is reported as potential (unconfirmed)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "domain": {
+                        "type": "string",
+                        "description": "Domain to scan for subdomain takeover",
+                    },
+                    "concurrency": {
+                        "type": "integer",
+                        "description": (
+                            f"Concurrent host checks (default: 10, max: {MAX_CONCURRENCY})"
+                        ),
+                        "default": 10,
+                        "minimum": 1,
+                        "maximum": MAX_CONCURRENCY,
+                    },
+                },
+                "required": ["domain"],
+            },
+        ),
+        Tool(
             name="seer_subdomains",
             description=(
                 "Enumerate subdomains via Certificate Transparency logs. With resolve=true, each "
@@ -775,6 +814,7 @@ _TOOL_RATE_LIMITS: dict[str, str] = {
     "seer_bulk_status": "5/minute",
     "seer_bulk_propagation": "5/minute",
     "seer_confusables": "5/minute",
+    "seer_takeover": "5/minute",
     "seer_bulk_lookup": "10/minute",
     "seer_bulk_whois": "10/minute",
     "seer_bulk_dig": "10/minute",
@@ -1046,6 +1086,15 @@ async def execute_tool(name: str, arguments: dict[str, Any]) -> Any:
         case "seer_posture":
             domain = _require_str(arguments, "domain")
             return await run_seer(seer.posture, domain)
+
+        case "seer_headers":
+            domain = _require_str(arguments, "domain")
+            return await run_seer(seer.headers, domain)
+
+        case "seer_takeover":
+            domain = _require_str(arguments, "domain")
+            concurrency = _get_concurrency(arguments, default=10)
+            return await run_seer(seer.takeover, domain, concurrency)
 
         case "seer_subdomains":
             domain = _require_str(arguments, "domain")

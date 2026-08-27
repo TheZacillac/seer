@@ -414,6 +414,8 @@ app.include_router(intel.delegation_router, prefix="/delegation", tags=["Delegat
 app.include_router(intel.diff_router, prefix="/diff", tags=["Diff"])
 app.include_router(intel.caa_router, prefix="/caa", tags=["CAA"])
 app.include_router(intel.posture_router, prefix="/posture", tags=["Posture"])
+app.include_router(intel.headers_router, prefix="/headers", tags=["Headers"])
+app.include_router(intel.takeover_router, prefix="/takeover", tags=["Takeover"])
 app.include_router(intel.confusables_router, prefix="/confusables", tags=["Confusables"])
 app.include_router(tld.router, prefix="/tld", tags=["TLD"])
 
