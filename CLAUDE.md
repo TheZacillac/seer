@@ -101,6 +101,9 @@ seer-core/src/
 ├── ssl.rs              # SSL chain inspection (single-attempt by design)
 ├── caa.rs              # CAA policy lookup + issuer comparison
 ├── posture.rs          # Email/DNS security posture: SPF/DMARC/MTA-STS/BIMI/DANE verdicts
+├── headers.rs          # HTTP security-header + cookie audit, weighted 0-100 score -> A+-F grade
+├── takeover.rs         # Subdomain takeover: provider CNAME match + HTTP body fingerprint confirmation
+├── http.rs             # (private) SSRF-guarded HTTP GET: manual per-hop redirect validation, pinned addrs, capped body
 ├── confusables.rs      # Typosquat/homoglyph look-alike generation + registration scoring
 ├── subdomains/         # Subdomain enumeration via CT logs: ordered source chain (crt.sh→certspotter) + per-source retry treating crt.sh 404/429/HTML-body as transient
 ├── diff.rs             # Side-by-side domain comparison
@@ -130,9 +133,12 @@ seer-core/src/
 - **lookup.rs**: Smart lookup orchestration (RDAP → WHOIS fallback)
 - **doctor.rs**: `seer doctor` diagnosis — 4 concurrent probes (config parse, DNS resolve, WHOIS port-43, RDAP bootstrap HTTPS), each stage-bounded (exchange legs 5s; the WHOIS probe's resolution stage runs through `net::resolve_public_host`, separately capped there, for parity with how production WHOIS connects); `overall` = worst check (malformed config = Warn since defaults still work; unreachable network = Fail); probe endpoints injectable via `#[cfg(test)]`-only seams
 - **webhook.rs**: SSRF-guarded JSON webhook delivery for `seer watch --webhook` — resolved addresses vetted then pinned on the client (rebinding defense), redirects disabled, single-attempt, 10s timeout, non-2xx surfaces status only (never the body)
+- **headers.rs**: `seer headers` — one non-intrusive GET graded across the security headers (HSTS, CSP, XFO, nosniff, Referrer-Policy, Permissions-Policy, COOP/COEP/CORP), every `Set-Cookie`'s Secure/HttpOnly/SameSite flags, and version-disclosing banners. Weighted 0–100 score (weights sum to 100, asserted by a test) minus bounded cookie/disclosure penalties → A+–F. Verdicts reuse posture's Absent/Weak/Moderate/Strict/Present scale; CSP `frame-ancestors` counts as superseding `X-Frame-Options`. All grading is pure and unit-tested; only the fetch is async
+- **takeover.rs**: `seer takeover` — the HTTP half of subdomain-takeover detection. `subdomains/classify.rs` already flags a dangling CNAME whose name stops resolving; this catches the commoner case where the provider still answers for a deprovisioned resource and only the response *body* says otherwise. 27 provider fingerprints; `Vulnerable` requires a matched body marker and always records it as evidence, `Potential` is an unconfirmable dangling CNAME — never promote one to the other without evidence. Hosts whose CNAME matches no provider are never fetched, bounding the HTTP fan-out
+- **http.rs** (private): SSRF-guarded HTTP GET shared by headers/takeover. Redirects are followed **manually** with `net::validate_http_url` re-run at every hop — reqwest's own redirect policy would skip the guard (redirect-SSRF bypass) — validated addresses are pinned per hop against rebinding, and the body streams under an incremental cap. Single-attempt, like status/ssl
 - **bulk/**: Semaphore-based concurrent execution, file parsing
 - **retry.rs**: Shared retry framework — used by WHOIS/RDAP clients; dns/status/ssl intentionally don't (documented at their module level)
-- **net.rs / validation.rs**: SSRF protection — all outbound hosts resolved and checked against reserved/private ranges before connect
+- **net.rs / validation.rs**: SSRF protection — all outbound hosts resolved and checked against reserved/private ranges before connect. `net::validate_http_url` is the single URL-shaped entry point (scheme, no credentials, ports 80/443 only, reserved-range check) shared by every HTTP fetch path — status, headers, takeover — so the policy cannot drift between them
 - **output/**: Human (colored), JSON, YAML, and Markdown formatters behind `get_formatter(OutputFormat)`
 - **colors.rs**: Catppuccin Frappe color palette
 
@@ -176,6 +182,16 @@ seer-cli/src/
 - `seer delegation <domain>` is check-style: exits 1 when `!report.in_sync ||
   !report.lame.is_empty()`, 0 when healthy. Output goes through
   `get_formatter(format).format_delegation()`.
+- `seer headers <domain>` audits HTTP security headers via
+  `seer_core::audit_headers(&domain, config.http_timeout())`. Not check-style —
+  it reports a grade and always exits 0, matching `posture`. Output goes
+  through `get_formatter(format).format_headers()`.
+- `seer takeover <domain>` is check-style: exits 1 when
+  `report.has_findings()` (any vulnerable OR potential host), 0 when clean.
+  Enumerates via `SubdomainEnumerator` then calls `seer_core::scan_takeover`
+  with `config.bulk.concurrency`; `--host <HOST>` (repeatable) skips CT
+  enumeration entirely and scans the given hosts. Output goes through
+  `get_formatter(format).format_takeover()`.
 - `seer watch --webhook <URL>` POSTs the check-all `WatchReport` as JSON via
   `seer_core::webhook::WebhookClient`; the flag overrides the config file's
   `watch.webhook_url`. Delivery is best-effort: failure prints a stderr
@@ -1493,5 +1509,5 @@ For issues and questions:
 
 ---
 
-**Last Updated**: 2026-07-16
-**Document Version**: 1.3.0
+**Last Updated**: 2026-08-27
+**Document Version**: 1.4.0

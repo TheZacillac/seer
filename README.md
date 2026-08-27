@@ -370,6 +370,8 @@ caa    = seer.caa("example.com")
 
 # Security intel
 posture     = seer.posture("example.com")        # SPF / DMARC / MTA-STS
+headers     = seer.headers("example.com")        # HTTP security headers, graded A+-F
+takeover    = seer.takeover("example.com")       # Subdomain takeover scan
 confusables = seer.confusables("example.com")    # Look-alike domains
 
 # Availability & info
@@ -722,6 +724,9 @@ seer/
 │       ├── ssl.rs            # SSL certificate chain inspection
 │       ├── caa.rs            # CAA policy lookup + issuer comparison
 │       ├── posture.rs        # Email security posture (SPF/DMARC/MTA-STS)
+│       ├── headers.rs        # HTTP security header + cookie audit (graded A+–F)
+│       ├── takeover.rs       # Subdomain takeover scan (HTTP-confirmed)
+│       ├── http.rs           # SSRF-guarded HTTP GET (per-hop redirect validation)
 │       ├── confusables.rs    # Look-alike / homoglyph domain detection
 │       ├── drift.rs          # Registration drift vs. baseline
 │       ├── status/           # HTTP, SSL, and expiration checking
