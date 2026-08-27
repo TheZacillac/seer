@@ -96,6 +96,8 @@ Available only when `SEER_DOCS_ENABLED=true`:
 | `/diff/{domain_a}/{domain_b}` | GET | Side-by-side domain comparison |
 | `/caa/{domain}` | GET | CAA policy lookup |
 | `/posture/{domain}` | GET | Email/DNS security posture |
+| `/headers/{domain}` | GET | HTTP security header + cookie audit |
+| `/takeover/{domain}` | GET | Subdomain takeover exposure scan |
 | `/confusables/{domain}` | GET | Look-alike (typosquat) generation |
 | `/tld/{tld}` | GET | TLD info (WHOIS server, RDAP endpoint) |
 | `/tld/` | GET | Full TLD catalog |
@@ -203,7 +205,7 @@ Optional env vars:
 
 ### Available Tools
 
-All 28 tools, on both transports:
+All 30 tools, on both transports:
 
 | Tool | Description |
 |------|-------------|
@@ -225,6 +227,8 @@ All 28 tools, on both transports:
 | `seer_diff` | Side-by-side domain comparison |
 | `seer_caa` | CAA policy lookup |
 | `seer_posture` | Email/DNS security posture |
+| `seer_headers` | HTTP security header + cookie audit (graded A+–F) |
+| `seer_takeover` | Subdomain takeover scan (HTTP-confirmed) |
 | `seer_confusables` | Look-alike (typosquat) generation |
 | `seer_tld_info` | TLD info (WHOIS server, RDAP endpoint) |
 | `seer_bulk_lookup` | Bulk smart lookups |
@@ -336,7 +340,7 @@ seer-api/
     │   ├── propagation.py
     │   ├── status.py
     │   ├── ssl.py
-    │   ├── intel.py        # availability/info/subdomains/dnssec/delegation/diff/caa/posture/confusables
+    │   ├── intel.py        # availability/info/subdomains/dnssec/delegation/diff/caa/posture/headers/takeover/confusables
     │   └── tld.py
     └── mcp/                # MCP server (stdio + Streamable HTTP)
         ├── __init__.py

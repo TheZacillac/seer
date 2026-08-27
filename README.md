@@ -229,10 +229,13 @@ seer status example.com
 seer ssl example.com
 seer caa example.com              # CAA policy vs. actual cert issuer
 seer posture example.com          # SPF / DMARC / MTA-STS email posture
+seer headers example.com          # HTTP security headers + cookie flags, graded A+-F
 
 # Security intel
 seer confusables example.com      # Look-alike / homoglyph domains
 seer drift example.com --record   # Diff registration vs. baseline, then update it
+seer takeover example.com         # Subdomain takeover scan (exit 1 on findings)
+seer takeover example.com --host app.example.com   # Check known hosts, skip CT lookup
 
 # Reverse DNS
 seer reverse 8.8.8.8
@@ -478,6 +481,8 @@ seer-api   # Starts on http://127.0.0.1:8000 (loopback-only by default)
 | `/ssl/{domain}` | GET | SSL chain inspection |
 | `/caa/{domain}` | GET | CAA policy + issuer comparison |
 | `/posture/{domain}` | GET | Email security posture (SPF/DMARC/MTA-STS) |
+| `/headers/{domain}` | GET | HTTP security headers + cookie audit (graded) |
+| `/takeover/{domain}` | GET | Subdomain takeover scan (HTTP-confirmed) |
 | `/confusables/{domain}` | GET | Look-alike domain detection |
 | `/availability/{domain}` | GET | Domain availability |
 | `/subdomains/{domain}` | GET | Subdomain enumeration |
@@ -536,7 +541,7 @@ eval "$(seer generate-key --export)"
 SEER_API_KEY=$KEY SEER_HOST=0.0.0.0 seer-api
 ```
 
-**28 tools available:**
+**30 tools available:**
 
 | Tool | Description | | Tool | Description |
 |------|-------------|---|------|-------------|
@@ -554,6 +559,7 @@ SEER_API_KEY=$KEY SEER_HOST=0.0.0.0 seer-api
 | `seer_bulk_propagation` | Bulk propagation checks | | `seer_bulk_info` | Bulk domain info |
 | `seer_bulk_ssl` | Bulk SSL certificate checks | | `seer_bulk_availability` | Bulk availability checks |
 | `seer_delegation` | NS delegation health check | | `seer_tld_info` | TLD info (WHOIS/RDAP/registry) |
+| `seer_headers` | HTTP security header audit (A+–F) | | `seer_takeover` | Subdomain takeover exposure scan |
 
 <details>
 <summary><b>Claude Desktop configuration</b></summary>
@@ -751,7 +757,7 @@ seer/
     └── seer_api/
         ├── main.py           # FastAPI app
         ├── routers/          # API endpoint modules
-        └── mcp/              # MCP server (28 tools)
+        └── mcp/              # MCP server (30 tools)
 ```
 
 ---

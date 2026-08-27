@@ -69,8 +69,18 @@ const PROBE_BODY_LIMIT: usize = 32 * 1024;
 struct ProviderFingerprint {
     provider: &'static str,
     /// CNAME suffixes, each with a leading dot so the provider's own apex
-    /// (e.g. `github.io`) does not match — only a name *under* it.
+    /// (e.g. `github.io`) does not match — only a name *under* it. Matched
+    /// with `ends_with`, which is deliberately strict: a `contains` match
+    /// would also fire on an attacker-chosen target like
+    /// `x.github.io.attacker.example`.
     cname_suffixes: &'static [&'static str],
+    /// Interior fragments matched with `contains`, for providers whose
+    /// endpoint embeds a variable component the suffix cannot cover — S3
+    /// website endpoints carry the region in the middle
+    /// (`bucket.s3-website-us-east-1.amazonaws.com`). Kept separate from
+    /// `cname_suffixes` so the loose match is opt-in per provider rather than
+    /// the default for all of them.
+    cname_infixes: &'static [&'static str],
     /// Literal markers that appear in the provider's unclaimed-resource page.
     /// Matched case-insensitively. Empty means the provider has no body
     /// fingerprint stable enough to assert on, so only the DNS signal applies.
@@ -88,6 +98,7 @@ const PROVIDERS: &[ProviderFingerprint] = &[
     ProviderFingerprint {
         provider: "GitHub Pages",
         cname_suffixes: &[".github.io"],
+        cname_infixes: &[],
         body_markers: &[
             "There isn't a GitHub Pages site here.",
             "For root URLs (like http://example.com/) you must provide an index.html file",
@@ -96,17 +107,20 @@ const PROVIDERS: &[ProviderFingerprint] = &[
     ProviderFingerprint {
         provider: "Heroku",
         cname_suffixes: &[".herokuapp.com", ".herokudns.com", ".herokussl.com"],
+        cname_infixes: &[],
         body_markers: &["No such app", "herokucdn.com/error-pages/no-such-app.html"],
     },
     ProviderFingerprint {
         provider: "AWS S3",
-        cname_suffixes: &[".s3.amazonaws.com", ".s3-website"],
+        cname_suffixes: &[".s3.amazonaws.com"],
+        cname_infixes: &[".s3-website"],
         body_markers: &["NoSuchBucket", "The specified bucket does not exist"],
     },
     ProviderFingerprint {
         provider: "AWS CloudFront",
         cname_suffixes: &[".cloudfront.net"],
         // CloudFront's error page is generic ("Bad request"); DNS signal only.
+        cname_infixes: &[],
         body_markers: &[],
     },
     ProviderFingerprint {
@@ -117,21 +131,25 @@ const PROVIDERS: &[ProviderFingerprint] = &[
             ".cloudapp.azure.com",
             ".azureedge.net",
         ],
+        cname_infixes: &[],
         body_markers: &["404 Web Site not found", "Error 404 - Web app not found"],
     },
     ProviderFingerprint {
         provider: "Azure Traffic Manager",
         cname_suffixes: &[".trafficmanager.net"],
+        cname_infixes: &[],
         body_markers: &[],
     },
     ProviderFingerprint {
         provider: "Azure Blob Storage",
         cname_suffixes: &[".blob.core.windows.net"],
+        cname_infixes: &[],
         body_markers: &["The specified container does not exist"],
     },
     ProviderFingerprint {
         provider: "Shopify",
         cname_suffixes: &[".myshopify.com"],
+        cname_infixes: &[],
         body_markers: &[
             "Sorry, this shop is currently unavailable",
             "Only one step left!",
@@ -140,96 +158,115 @@ const PROVIDERS: &[ProviderFingerprint] = &[
     ProviderFingerprint {
         provider: "Fastly",
         cname_suffixes: &[".fastly.net"],
+        cname_infixes: &[],
         body_markers: &["Fastly error: unknown domain"],
     },
     ProviderFingerprint {
         provider: "Ghost",
         cname_suffixes: &[".ghost.io"],
+        cname_infixes: &[],
         body_markers: &["The thing you were looking for is no longer here"],
     },
     ProviderFingerprint {
         provider: "Surge.sh",
         cname_suffixes: &[".surge.sh"],
+        cname_infixes: &[],
         body_markers: &["project not found"],
     },
     ProviderFingerprint {
         provider: "Bitbucket",
         cname_suffixes: &[".bitbucket.io"],
+        cname_infixes: &[],
         body_markers: &["Repository not found"],
     },
     ProviderFingerprint {
         provider: "Pantheon",
         cname_suffixes: &[".pantheonsite.io"],
+        cname_infixes: &[],
         body_markers: &["The gods are wise, but do not know of the site which you seek"],
     },
     ProviderFingerprint {
         provider: "Read the Docs",
         cname_suffixes: &[".readthedocs.io"],
+        cname_infixes: &[],
         body_markers: &["unknown to Read the Docs"],
     },
     ProviderFingerprint {
         provider: "WP Engine",
         cname_suffixes: &[".wpengine.com"],
+        cname_infixes: &[],
         body_markers: &["The site you were looking for couldn't be found"],
     },
     ProviderFingerprint {
         provider: "Zendesk",
         cname_suffixes: &[".zendesk.com"],
+        cname_infixes: &[],
         body_markers: &["Help Center Closed"],
     },
     ProviderFingerprint {
         provider: "Netlify",
         cname_suffixes: &[".netlify.app", ".netlify.com"],
+        cname_infixes: &[],
         body_markers: &["Not Found - Request ID"],
     },
     ProviderFingerprint {
         provider: "Statuspage",
         cname_suffixes: &[".statuspage.io"],
+        cname_infixes: &[],
         body_markers: &[],
     },
     ProviderFingerprint {
         provider: "Unbounce",
         cname_suffixes: &[".unbouncepages.com"],
+        cname_infixes: &[],
         body_markers: &["The requested URL was not found on this server"],
     },
     ProviderFingerprint {
         provider: "Help Scout",
         cname_suffixes: &[".helpscoutdocs.com"],
+        cname_infixes: &[],
         body_markers: &["No settings were found for this company"],
     },
     ProviderFingerprint {
         provider: "LaunchRock",
         cname_suffixes: &[".launchrock.com"],
+        cname_infixes: &[],
         body_markers: &["It looks like you may have taken a wrong turn somewhere"],
     },
     ProviderFingerprint {
         provider: "Tumblr",
         cname_suffixes: &[".domains.tumblr.com"],
+        cname_infixes: &[],
         body_markers: &["Whatever you were looking for doesn't currently exist at this address"],
     },
     ProviderFingerprint {
         provider: "Webflow",
         cname_suffixes: &[".proxy-ssl.webflow.com", ".proxy.webflow.com"],
+        cname_infixes: &[],
         body_markers: &["The page you are looking for doesn't exist or has been moved"],
     },
     ProviderFingerprint {
         provider: "Intercom",
         cname_suffixes: &[".custom.intercom.help"],
+        cname_infixes: &[],
         body_markers: &["This page is reserved for artistic dogs"],
     },
     ProviderFingerprint {
         provider: "UserVoice",
         cname_suffixes: &[".uservoice.com"],
+        cname_infixes: &[],
         body_markers: &["This UserVoice subdomain is currently available"],
     },
     ProviderFingerprint {
         provider: "Wufoo",
         cname_suffixes: &[".wufoo.com"],
+        cname_infixes: &[],
         body_markers: &["Profile not found"],
     },
     ProviderFingerprint {
         provider: "FeedPress",
         cname_suffixes: &[".redirect.feedpress.me"],
+        cname_infixes: &[],
         body_markers: &["The feed has not been found"],
     },
 ];
@@ -304,9 +341,8 @@ impl TakeoverReport {
 fn match_provider(cname: &str) -> Option<&'static ProviderFingerprint> {
     let c = cname.trim_end_matches('.').to_ascii_lowercase();
     PROVIDERS.iter().find(|p| {
-        p.cname_suffixes
-            .iter()
-            .any(|suffix| c.contains(suffix) || c.ends_with(suffix))
+        p.cname_suffixes.iter().any(|suffix| c.ends_with(suffix))
+            || p.cname_infixes.iter().any(|infix| c.contains(infix))
     })
 }
 
@@ -647,6 +683,44 @@ mod tests {
         // Even a body that looks like an error must not produce evidence for a
         // provider we deliberately have no fingerprint for.
         assert_eq!(match_body_marker(cf, "404 Not Found"), None);
+    }
+
+    #[test]
+    fn suffix_match_is_anchored_at_the_end() {
+        // A `contains` match would fire here and let an attacker-chosen CNAME
+        // target impersonate a provider, then serve that provider's claim-page
+        // text to manufacture a "confirmed" finding.
+        assert!(match_provider("x.github.io.attacker.example").is_none());
+        assert!(match_provider("app.herokuapp.com.evil.test").is_none());
+    }
+
+    #[test]
+    fn s3_website_region_endpoints_match_via_infix() {
+        // S3 website endpoints carry the region mid-name, so the suffix alone
+        // cannot cover them — this is why the infix list exists.
+        assert_eq!(
+            match_provider("bucket.s3-website-us-east-1.amazonaws.com").map(|p| p.provider),
+            Some("AWS S3")
+        );
+        assert_eq!(
+            match_provider("bucket.s3-website.eu-west-2.amazonaws.com").map(|p| p.provider),
+            Some("AWS S3")
+        );
+    }
+
+    #[test]
+    fn only_s3_opts_into_loose_infix_matching() {
+        // The loose match must stay opt-in; if it spreads to other providers
+        // the anchoring guarantee above quietly stops holding for them.
+        for p in PROVIDERS {
+            if p.provider != "AWS S3" {
+                assert!(
+                    p.cname_infixes.is_empty(),
+                    "{} must not use infix matching without a documented reason",
+                    p.provider
+                );
+            }
+        }
     }
 
     #[test]

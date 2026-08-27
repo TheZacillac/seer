@@ -229,10 +229,10 @@ seer-api/
     │   ├── propagation.py  # DNS propagation
     │   ├── status.py       # Domain status
     │   ├── ssl.py          # SSL chain inspection
-    │   ├── intel.py        # availability/info/subdomains/dnssec/delegation/diff/caa/posture/confusables routers
+    │   ├── intel.py        # availability/info/subdomains/dnssec/delegation/diff/caa/posture/headers/takeover/confusables routers
     │   └── tld.py          # TLD info (/tld/{tld}) + full catalog (/tld/)
     └── mcp/
-        └── server.py       # MCP server (28 tools)
+        └── server.py       # MCP server (30 tools)
 ```
 
 **Key Points:**

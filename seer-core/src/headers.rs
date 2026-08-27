@@ -432,10 +432,16 @@ fn grade_cookies(cookies: &[String]) -> Vec<CookieFinding> {
         .map(|raw| {
             let attrs = parse_attributes(raw);
             // The first pair is `name=value`; everything after is attributes.
-            let name = attrs
-                .first()
-                .map(|(k, _)| k.clone())
-                .unwrap_or_else(|| "(unnamed)".to_string());
+            // Take the name from the raw header rather than the parsed attrs:
+            // cookie names are case-sensitive, and `parse_attributes`
+            // lowercases keys so attribute lookups can be case-insensitive.
+            let name = raw
+                .split(';')
+                .next()
+                .map(|first| first.split_once('=').map_or(first, |(k, _)| k).trim())
+                .filter(|n| !n.is_empty())
+                .unwrap_or("(unnamed)")
+                .to_string();
 
             let secure = attr(&attrs, "secure").is_some();
             let http_only = attr(&attrs, "httponly").is_some();
@@ -867,6 +873,21 @@ mod tests {
             HeaderVerdict::Weak
         );
         assert_eq!(grade_content_type_options(None).0, HeaderVerdict::Absent);
+    }
+
+    #[test]
+    fn cookie_names_preserve_case() {
+        // Cookie names are case-sensitive; reporting JSESSIONID as
+        // "jsessionid" would misname the cookie an operator has to go fix.
+        let findings = grade_cookies(&[
+            "JSESSIONID=abc; Secure".to_string(),
+            "WMF-Last-Access=1; Secure; HttpOnly".to_string(),
+        ]);
+        assert_eq!(findings[0].name, "JSESSIONID");
+        assert_eq!(findings[1].name, "WMF-Last-Access");
+        // Attribute matching stays case-insensitive.
+        assert!(findings[1].secure);
+        assert!(findings[1].http_only);
     }
 
     #[test]
