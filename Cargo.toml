@@ -66,7 +66,6 @@ rustyline = "18"
 shlex = "2"
 colored = "3"
 indicatif = "0.18"
-comfy-table = "8"
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 clap_mangen = "0.3"
