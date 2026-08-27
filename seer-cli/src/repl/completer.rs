@@ -32,6 +32,8 @@ const COMMANDS: &[&str] = &[
     "drift",
     "caa",
     "posture",
+    "headers",
+    "takeover",
     "confusables",
     "watch",
     "history",
@@ -233,7 +235,9 @@ impl Hinter for SeerCompleter {
             "drift" if words.len() == 1 && line.ends_with(' ') => {
                 Some(" <domain> [--record]".to_string())
             }
-            "caa" | "posture" | "confusables" if words.len() == 1 && line.ends_with(' ') => {
+            "caa" | "posture" | "confusables" | "headers" | "takeover"
+                if words.len() == 1 && line.ends_with(' ') =>
+            {
                 Some(" <domain>".to_string())
             }
             "watch" if words.len() == 1 && line.ends_with(' ') => {

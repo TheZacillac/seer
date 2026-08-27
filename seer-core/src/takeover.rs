@@ -395,6 +395,44 @@ async fn resolve_host(resolver: &DnsResolver, host: &str) -> (Vec<String>, Optio
     (addresses, cname)
 }
 
+/// Turns a completed probe into a finding.
+///
+/// This is the step that decides `Vulnerable` vs `Safe`, so it is split out as
+/// a pure function: the rule that a confirmed takeover requires a matched body
+/// marker (never a mere status code, and never a provider match on its own) is
+/// the load-bearing claim of this module and is unit-tested directly.
+fn finding_from_probe(
+    host: String,
+    provider: &ProviderFingerprint,
+    cname: Option<String>,
+    addresses: Vec<String>,
+    response: &crate::http::FetchedResponse,
+) -> TakeoverFinding {
+    let evidence = match_body_marker(provider, &response.body);
+    let verdict = if evidence.is_some() {
+        TakeoverVerdict::Vulnerable
+    } else {
+        TakeoverVerdict::Safe
+    };
+
+    TakeoverFinding {
+        host,
+        verdict,
+        provider: Some(provider.provider.to_string()),
+        cname,
+        addresses,
+        evidence: evidence.map(str::to_string),
+        http_status: Some(response.status),
+        // A provider we have no fingerprint for can never be confirmed here,
+        // so say so rather than letting `Safe` imply it was checked.
+        probe_note: if evidence.is_none() && provider.body_markers.is_empty() {
+            Some("provider has no reliable body fingerprint; verify this host manually".to_string())
+        } else {
+            None
+        },
+    }
+}
+
 /// Assesses a single host: resolve, match the provider, and confirm over HTTP
 /// when the host answers.
 async fn check_host(
@@ -440,31 +478,7 @@ async fn check_host(
 
     // The host resolves — ask the provider's edge what it serves.
     match fetcher.get(&format!("https://{host}/")).await {
-        Ok(response) => {
-            let evidence = match_body_marker(provider, &response.body);
-            let verdict = if evidence.is_some() {
-                TakeoverVerdict::Vulnerable
-            } else {
-                TakeoverVerdict::Safe
-            };
-            TakeoverFinding {
-                host,
-                verdict,
-                provider: Some(provider.provider.to_string()),
-                cname,
-                addresses,
-                evidence: evidence.map(str::to_string),
-                http_status: Some(response.status),
-                probe_note: if evidence.is_none() && provider.body_markers.is_empty() {
-                    Some(
-                        "provider has no reliable body fingerprint; verify this host manually"
-                            .to_string(),
-                    )
-                } else {
-                    None
-                },
-            }
-        }
+        Ok(response) => finding_from_probe(host, provider, cname, addresses, &response),
         Err(e) => {
             debug!(host = %host, error = %e, "takeover probe failed");
             // A failed probe is not evidence of anything. Report the host with
@@ -653,6 +667,92 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Synthetic probe response, so the confirmation rule is testable without
+    /// DNS or HTTP.
+    fn probe(status: u16, body: &str) -> crate::http::FetchedResponse {
+        crate::http::FetchedResponse {
+            final_url: "https://gone.example.com/".to_string(),
+            status,
+            headers: vec![],
+            body: body.to_string(),
+            redirects: 0,
+        }
+    }
+
+    #[test]
+    fn matching_body_marker_confirms_vulnerable_with_evidence() {
+        let gh = match_provider("gone.github.io").expect("github provider");
+        let finding = finding_from_probe(
+            "gone.example.com".to_string(),
+            gh,
+            Some("gone.github.io".to_string()),
+            vec!["185.199.108.153".to_string()],
+            &probe(404, "<h1>There isn't a GitHub Pages site here.</h1>"),
+        );
+        assert_eq!(finding.verdict, TakeoverVerdict::Vulnerable);
+        // The evidence is what makes the claim auditable.
+        assert_eq!(
+            finding.evidence.as_deref(),
+            Some("There isn't a GitHub Pages site here.")
+        );
+        assert_eq!(finding.http_status, Some(404));
+    }
+
+    #[test]
+    fn a_live_site_on_a_provider_cname_is_safe() {
+        // The common false positive to avoid: a perfectly healthy site hosted
+        // on a takeover-prone provider must NOT be reported.
+        let gh = match_provider("user.github.io").expect("github provider");
+        let finding = finding_from_probe(
+            "blog.example.com".to_string(),
+            gh,
+            Some("user.github.io".to_string()),
+            vec!["185.199.108.153".to_string()],
+            &probe(200, "<html><body><h1>My Blog</h1></body></html>"),
+        );
+        assert_eq!(finding.verdict, TakeoverVerdict::Safe);
+        assert!(finding.evidence.is_none());
+    }
+
+    #[test]
+    fn a_404_alone_never_confirms_a_takeover() {
+        // Status codes are not evidence: plenty of live sites 404 their root.
+        // Only a provider's own claim-page text confirms.
+        let gh = match_provider("user.github.io").expect("github provider");
+        let finding = finding_from_probe(
+            "blog.example.com".to_string(),
+            gh,
+            Some("user.github.io".to_string()),
+            vec!["185.199.108.153".to_string()],
+            &probe(404, "<h1>Page not found</h1>"),
+        );
+        assert_eq!(finding.verdict, TakeoverVerdict::Safe);
+    }
+
+    #[test]
+    fn fingerprintless_provider_says_it_could_not_confirm() {
+        // CloudFront has no reliable body marker, so a Safe verdict there must
+        // carry a note rather than implying the host was actually cleared.
+        let cf = match_provider("d123.cloudfront.net").expect("cloudfront provider");
+        let finding = finding_from_probe(
+            "cdn.example.com".to_string(),
+            cf,
+            Some("d123.cloudfront.net".to_string()),
+            vec!["203.0.113.9".to_string()],
+            &probe(403, "Bad request"),
+        );
+        assert_eq!(finding.verdict, TakeoverVerdict::Safe);
+        assert!(
+            finding
+                .probe_note
+                .as_deref()
+                .unwrap_or_default()
+                .contains("verify this host manually"),
+            "got {:?}",
+            finding.probe_note
+        );
     }
 
     #[test]

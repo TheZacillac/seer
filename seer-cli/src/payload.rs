@@ -25,6 +25,8 @@ pub enum Payload {
     Info(Box<seer_core::DomainInfo>),
     Drift(Box<seer_core::DriftReport>),
     Posture(Box<seer_core::EmailPosture>),
+    Headers(Box<seer_core::HeaderReport>),
+    Takeover(Box<seer_core::TakeoverReport>),
     Caa(Box<seer_core::CaaPolicy>),
     Confusables(Box<seer_core::ConfusableReport>),
     /// Unlike the others this has no `OutputFormatter` method — doctor reports
@@ -58,6 +60,8 @@ impl Payload {
             Payload::Info(_) => "info",
             Payload::Drift(_) => "drift",
             Payload::Posture(_) => "posture",
+            Payload::Headers(_) => "headers",
+            Payload::Takeover(_) => "takeover",
             Payload::Caa(_) => "caa",
             Payload::Confusables(_) => "confusables",
             Payload::Doctor(_) => "doctor",
@@ -87,6 +91,8 @@ pub fn serialize(data: &Payload, format: OutputFormat) -> String {
         Payload::Info(i) => fmt.format_domain_info(i),
         Payload::Drift(d) => fmt.format_drift(d),
         Payload::Posture(p) => fmt.format_posture(p),
+        Payload::Headers(h) => fmt.format_headers(h),
+        Payload::Takeover(t) => fmt.format_takeover(t),
         Payload::Caa(c) => fmt.format_caa(c),
         Payload::Confusables(c) => fmt.format_confusables(c),
         // No formatter method exists for doctor reports; reuse the shared
