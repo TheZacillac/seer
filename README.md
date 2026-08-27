@@ -183,12 +183,12 @@ The **lens** sidebar covers every Seer capability, grouped, each pulling live da
 
 - **LOOKUP** — Overview · WHOIS · RDAP (Domain · IP · ASN) · Reverse DNS · Availability · TLD Info
 - **DNS** — Records (+ custom nameserver) · DNSSEC · Compare (two resolvers) · Propagation · Follow (live monitor)
-- **SECURITY** — SSL / Cert · Status · Subdomains
+- **SECURITY** — SSL / Cert · Status · Subdomains · HTTP Headers · Takeover
 - **POWER** — Diff · Bulk (streaming + CSV export) · Watchlist · History
 
 **Keys:** `j`/`k` move · `1`–`9` jump to a lens · `Tab` focus nav⇄pane · `[` `]` sub-tabs · `r` raw output (json/yaml/markdown) · `y` copy · `/` look up a domain · `:` command · `?` help · `:q` quit. In-pane: switchers (TLD, nameserver, Compare resolvers, Bulk op) and editable fields (Diff's 2nd domain, Follow interval/count, Bulk file path).
 
-**Commands (`:`):** `lookup`, `whois`, `rdap <domain|ip|AS####>`, `dig`, `ssl`, `status`, `reverse <ip>`, `tld <.tld>`, `compare <domain> <nsA> <nsB>`, `diff <a> <b>`, `set output <human|json|yaml|markdown>`, `theme <frappe|latte>`, `copy`, `q`.
+**Commands (`:`):** `lookup`, `whois`, `rdap <domain|ip|AS####>`, `dig`, `ssl`, `status`, `headers`, `takeover`, `reverse <ip>`, `tld <.tld>`, `compare <domain> <nsA> <nsB>`, `diff <a> <b>`, `set output <human|json|yaml|markdown>`, `theme <frappe|latte>`, `copy`, `q`.
 
 The startup theme comes from `[tui] theme` in `~/.seer/config.toml` (`"frappe"` — the default — or `"latte"`; unknown names fall back to Frappé). Switch live with `:theme latte`.
 
@@ -229,10 +229,13 @@ seer status example.com
 seer ssl example.com
 seer caa example.com              # CAA policy vs. actual cert issuer
 seer posture example.com          # SPF / DMARC / MTA-STS email posture
+seer headers example.com          # HTTP security headers + cookie flags, graded A+-F
 
 # Security intel
 seer confusables example.com      # Look-alike / homoglyph domains
 seer drift example.com --record   # Diff registration vs. baseline, then update it
+seer takeover example.com         # Subdomain takeover scan (exit 1 on findings)
+seer takeover example.com --host app.example.com   # Check known hosts, skip CT lookup
 
 # Reverse DNS
 seer reverse 8.8.8.8
@@ -367,6 +370,8 @@ caa    = seer.caa("example.com")
 
 # Security intel
 posture     = seer.posture("example.com")        # SPF / DMARC / MTA-STS
+headers     = seer.headers("example.com")        # HTTP security headers, graded A+-F
+takeover    = seer.takeover("example.com")       # Subdomain takeover scan
 confusables = seer.confusables("example.com")    # Look-alike domains
 
 # Availability & info
@@ -478,6 +483,8 @@ seer-api   # Starts on http://127.0.0.1:8000 (loopback-only by default)
 | `/ssl/{domain}` | GET | SSL chain inspection |
 | `/caa/{domain}` | GET | CAA policy + issuer comparison |
 | `/posture/{domain}` | GET | Email security posture (SPF/DMARC/MTA-STS) |
+| `/headers/{domain}` | GET | HTTP security headers + cookie audit (graded) |
+| `/takeover/{domain}` | GET | Subdomain takeover scan (HTTP-confirmed) |
 | `/confusables/{domain}` | GET | Look-alike domain detection |
 | `/availability/{domain}` | GET | Domain availability |
 | `/subdomains/{domain}` | GET | Subdomain enumeration |
@@ -536,7 +543,7 @@ eval "$(seer generate-key --export)"
 SEER_API_KEY=$KEY SEER_HOST=0.0.0.0 seer-api
 ```
 
-**28 tools available:**
+**30 tools available:**
 
 | Tool | Description | | Tool | Description |
 |------|-------------|---|------|-------------|
@@ -554,6 +561,7 @@ SEER_API_KEY=$KEY SEER_HOST=0.0.0.0 seer-api
 | `seer_bulk_propagation` | Bulk propagation checks | | `seer_bulk_info` | Bulk domain info |
 | `seer_bulk_ssl` | Bulk SSL certificate checks | | `seer_bulk_availability` | Bulk availability checks |
 | `seer_delegation` | NS delegation health check | | `seer_tld_info` | TLD info (WHOIS/RDAP/registry) |
+| `seer_headers` | HTTP security header audit (A+–F) | | `seer_takeover` | Subdomain takeover exposure scan |
 
 <details>
 <summary><b>Claude Desktop configuration</b></summary>
@@ -716,6 +724,9 @@ seer/
 │       ├── ssl.rs            # SSL certificate chain inspection
 │       ├── caa.rs            # CAA policy lookup + issuer comparison
 │       ├── posture.rs        # Email security posture (SPF/DMARC/MTA-STS)
+│       ├── headers.rs        # HTTP security header + cookie audit (graded A+–F)
+│       ├── takeover.rs       # Subdomain takeover scan (HTTP-confirmed)
+│       ├── http.rs           # SSRF-guarded HTTP GET (per-hop redirect validation)
 │       ├── confusables.rs    # Look-alike / homoglyph domain detection
 │       ├── drift.rs          # Registration drift vs. baseline
 │       ├── status/           # HTTP, SSL, and expiration checking
@@ -741,7 +752,7 @@ seer/
 │       ├── main.rs           # Clap commands & dispatch
 │       ├── display/          # Spinner and progress utilities
 │       ├── repl/             # Interactive REPL
-│       └── tui/              # Full-screen ratatui TUI (16 lenses)
+│       └── tui/              # Full-screen ratatui TUI (18 lenses)
 │
 ├── seer-py/                  # Python bindings (PyO3)
 │   ├── src/lib.rs            # Rust → Python bridge
@@ -751,7 +762,7 @@ seer/
     └── seer_api/
         ├── main.py           # FastAPI app
         ├── routers/          # API endpoint modules
-        └── mcp/              # MCP server (28 tools)
+        └── mcp/              # MCP server (30 tools)
 ```
 
 ---

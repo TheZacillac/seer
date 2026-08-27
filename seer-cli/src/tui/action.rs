@@ -78,6 +78,8 @@ pub enum FetchReq {
     Watch,
     History,
     Subdomains(String),
+    Headers(String),
+    Takeover(String),
 }
 
 impl FetchReq {
@@ -99,6 +101,8 @@ impl FetchReq {
             FetchReq::Watch => "watch",
             FetchReq::History => "history",
             FetchReq::Subdomains(_) => "subdomains",
+            FetchReq::Headers(_) => "headers",
+            FetchReq::Takeover(_) => "takeover",
         }
     }
 }
@@ -226,6 +230,8 @@ mod tests {
             "dns"
         );
         assert_eq!(FetchReq::Tld(".com".into()).lens_key(), "tld");
+        assert_eq!(FetchReq::Headers("x".into()).lens_key(), "headers");
+        assert_eq!(FetchReq::Takeover("x".into()).lens_key(), "takeover");
     }
 
     #[test]

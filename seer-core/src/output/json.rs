@@ -113,6 +113,14 @@ impl OutputFormatter for JsonFormatter {
     fn format_posture(&self, posture: &crate::posture::EmailPosture) -> String {
         self.to_json(posture)
     }
+
+    fn format_headers(&self, report: &crate::headers::HeaderReport) -> String {
+        self.to_json(report)
+    }
+
+    fn format_takeover(&self, report: &crate::takeover::TakeoverReport) -> String {
+        self.to_json(report)
+    }
     fn format_caa(&self, policy: &crate::caa::CaaPolicy) -> String {
         self.to_json(policy)
     }

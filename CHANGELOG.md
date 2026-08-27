@@ -11,6 +11,79 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`seer headers` — HTTP security-header audit.** Seer already inspected a
+  domain's transport (`ssl`, `caa`), DNS/email (`posture`, `dnssec`,
+  `delegation`), and registration (`whois`, `rdap`, `drift`) layers; this
+  covers the remaining one. A single non-intrusive GET is graded across the
+  security headers (HSTS, CSP, X-Frame-Options, X-Content-Type-Options,
+  Referrer-Policy, Permissions-Policy, COOP/COEP/CORP), every `Set-Cookie`'s
+  `Secure`/`HttpOnly`/`SameSite` flags, and version-disclosing banners,
+  producing a weighted 0–100 score and an A+–F grade. Each finding carries an
+  advisory explaining the verdict. Verdicts use the same
+  Absent/Weak/Moderate/Strict/Present scale as `posture`, and CSP
+  `frame-ancestors` is honored as superseding `X-Frame-Options`. Available as
+  `seer headers <domain>`, the REPL `headers` command, `seer.headers()`,
+  `GET /headers/{domain}`, and the `seer_headers` MCP tool.
+- **`seer takeover` — subdomain-takeover detection with HTTP confirmation.**
+  `subdomains --resolve` already reported the DNS half of this signal (a
+  dangling CNAME to a known provider). That misses the common case: most
+  providers still answer for a deprovisioned resource, so DNS looks healthy
+  and only the response body says otherwise. `takeover` adds the HTTP half —
+  27 provider fingerprints matched against the response body. `Vulnerable` is
+  reserved for a confirmed body match and always records the matched
+  fingerprint as evidence; an unconfirmable dangling CNAME is reported as
+  `potential`. Hosts whose CNAME matches no provider are never fetched, so the
+  HTTP fan-out stays proportional to real candidates. Check-style: exits 1 when
+  anything is found. `--host` skips CT enumeration to re-check known hosts.
+  Available as `seer takeover <domain>`, the REPL `takeover` command,
+  `seer.takeover()`, `GET /takeover/{domain}`, and the `seer_takeover` MCP
+  tool (rate-limited to 5/minute like `confusables`).
+- **TUI lenses for both features** (18 lenses, was 16). `HTTP Headers` renders
+  the grade as a gauge with per-header verdicts colored by severity — a column
+  of same-colored words would bury the absent headers among the strict ones —
+  plus a cookie summary and the advisory list. `Takeover` is a selectable
+  findings table (host / verdict / provider / evidence) whose border tracks the
+  worst finding, listing only actionable hosts while the title carries how many
+  were checked; it supports `/`-filtering like the other table lenses, with the
+  headline counts recomputed for the visible subset. Both are reachable from
+  the nav, by `:headers` / `:takeover`, and through `r` raw output and `y` copy.
+
+### Changed
+- **MCP server now exposes 30 tools** (was 28), adding `seer_headers` and
+  `seer_takeover`.
+- **Dependency bumps** picked up from the open Dependabot PRs: `async-trait`
+  0.1.92, `base64` 0.23.1, `clap` 4.6.6 (with `clap_builder`, `clap_complete`
+  4.6.9, `clap_mangen` 0.3.3), `log` 0.4.34, `pyo3` 0.29.2 (with its four
+  companion crates), and `thiserror` 2.0.20.
+
+### Security
+- **Bumped `h2` to 0.4.19** for RUSTSEC-2026-0258 (unbounded empty DATA frames:
+  undrained streams could grow memory without limit, or panic on length
+  overflow). Reached transitively via `hickory-net` and `hyper`.
+- **Bumped `lru` to 0.18.2** for RUSTSEC-2026-0253 (use-after-free: a panicking
+  key `Drop` during `LruCache::pop()` left dangling pointers in the internal
+  list). Reported by `cargo audit` as `unsound` rather than a vulnerability, so
+  it was not failing CI.
+
+### Removed
+- **Dropped the `comfy-table` dependency.** `seer-cli` declared it but no
+  source file ever referenced it — every table in the tree is `ratatui`'s, in
+  the TUI lenses. Removing it retires the dependency (and the Dependabot 7 → 8
+  major-bump PR that came with it) rather than carrying an unused crate
+  forward.
+
+### Internal
+- New `seer-core::http` module: an SSRF-guarded HTTP GET shared by `headers`
+  and `takeover`. Redirects are followed manually with the guard re-applied at
+  every hop (reqwest's own redirect policy would skip it — the classic
+  redirect-SSRF bypass), validated addresses are pinned per hop against DNS
+  rebinding, and the body is streamed under an incremental cap.
+- The URL-shape guard moved from `status/client.rs` to `net.rs` as
+  `validate_http_url`, so the scheme, credential, port, and reserved-range
+  rules have a single implementation across all three HTTP fetch paths instead
+  of two copies. `status` keeps its named wrapper and its tests unchanged.
+
 ## [0.46.0] - 2026-08-07
 
 Syncs the WHOIS server map with upstream, completes the TLD catalog (Google

@@ -12,6 +12,7 @@ use hickory_resolver::config::{ResolverConfig, GOOGLE};
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use hickory_resolver::TokioResolver;
 use once_cell::sync::Lazy;
+use reqwest::Url;
 use tokio::net::lookup_host;
 use tracing::debug;
 
@@ -270,6 +271,62 @@ pub async fn resolve_public_host(host: &str, port: u16) -> Result<Vec<SocketAddr
     }
 
     Ok(addrs)
+}
+
+/// Validates an HTTP(S) URL as an outbound target and returns the public
+/// socket addresses to pin the connection to.
+///
+/// This is the URL-shaped entry point to the same policy
+/// [`resolve_public_host`] enforces for bare hosts, and is the single
+/// implementation shared by every HTTP fetch that follows a user- or
+/// server-supplied URL (`status`, `headers`, `takeover`). Beyond the
+/// reserved-range check it enforces three URL-level rules:
+///
+/// - **Scheme**: only `http`/`https`. A `file://`/`gopher://` redirect target
+///   would otherwise escape the HTTP threat model entirely.
+/// - **No credentials**: an embedded `user:pass@` is refused, so a redirect
+///   cannot smuggle credentials into a request seer originates.
+/// - **Standard ports only** (80/443): without this a redirect chain becomes a
+///   port scanner against whatever the resolved host exposes.
+///
+/// Returns [`SeerError::HttpError`] for URL-shape violations and for a host
+/// that fails the reserved-range check.
+pub(crate) async fn validate_http_url(url: &Url) -> Result<Vec<SocketAddr>> {
+    let scheme = url.scheme();
+    if scheme != "https" && scheme != "http" {
+        return Err(SeerError::HttpError(format!(
+            "unsupported URL scheme: {}",
+            scheme
+        )));
+    }
+
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(SeerError::HttpError(
+            "URL credentials are not allowed".to_string(),
+        ));
+    }
+
+    // Use `host()` (not `host_str()`) so an IPv6 literal comes back
+    // unbracketed and hits the guard's IP-literal short-circuit.
+    let host = match url.host() {
+        Some(url::Host::Domain(d)) => d.to_string(),
+        Some(url::Host::Ipv4(ip)) => ip.to_string(),
+        Some(url::Host::Ipv6(ip)) => ip.to_string(),
+        None => return Err(SeerError::HttpError("missing URL host".to_string())),
+    };
+    let port = url.port_or_known_default().unwrap_or(443);
+
+    // Only allow standard HTTP/HTTPS ports to prevent port scanning via redirects
+    if port != 80 && port != 443 {
+        return Err(SeerError::HttpError(format!(
+            "non-standard port {} is not allowed in redirects",
+            port
+        )));
+    }
+
+    resolve_public_host(&host, port)
+        .await
+        .map_err(|e| SeerError::HttpError(e.to_string()))
 }
 
 #[cfg(test)]

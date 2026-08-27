@@ -59,6 +59,8 @@ def _install_seer_stub() -> None:
         "delegation",
         "caa",
         "posture",
+        "headers",
+        "takeover",
         "confusables",
         "dns_compare",
         "dns_follow",

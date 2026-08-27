@@ -12,7 +12,9 @@ pub mod domain_info;
 pub mod drift;
 pub mod error;
 mod fsutil;
+pub mod headers;
 pub mod history;
+mod http;
 pub mod logging;
 pub mod lookup;
 pub mod net;
@@ -23,6 +25,7 @@ pub mod retry;
 pub mod ssl;
 pub mod status;
 pub mod subdomains;
+pub mod takeover;
 pub mod tld;
 pub mod validation;
 pub mod watchlist;
@@ -58,6 +61,10 @@ pub use domain_info::{
     describe_epp_status, DomainInfo, DomainInfoSource, ExpiryStatus, StatusDescription,
 };
 pub use drift::{drift_from_history, DriftReport, FieldChange};
+pub use headers::{
+    audit_headers, CookieFinding, Disclosure, HeaderFinding, HeaderReport, HeaderVerdict,
+    DEFAULT_HEADER_TIMEOUT,
+};
 pub use history::{HistoryEntry, LookupHistory};
 pub use output::{OutputFormat, OutputFormatter};
 pub use posture::{
@@ -70,4 +77,5 @@ pub use subdomains::{
     SubdomainBaselines, SubdomainClassification, SubdomainEnumerator, SubdomainResult,
     SubdomainStatus,
 };
+pub use takeover::{scan_takeover, TakeoverFinding, TakeoverReport, TakeoverVerdict};
 pub use watchlist::{check_watchlist, WatchReport, WatchResult, Watchlist};

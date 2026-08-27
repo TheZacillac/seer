@@ -227,6 +227,8 @@ impl Repl {
             "drift" => self.execute_drift(args).await,
             "caa" => self.execute_caa(args).await,
             "posture" => self.execute_posture(args).await,
+            "headers" => self.execute_headers(args).await,
+            "takeover" => self.execute_takeover(args).await,
             "confusables" => self.execute_confusables(args).await,
             "watch" => self.execute_watch(args).await,
             "history" => self.execute_history(args).await,
@@ -346,6 +348,14 @@ impl Repl {
         println!(
             "  {:<34} Email/DNS posture (SPF, DMARC, MTA-STS, BIMI, DANE)",
             "posture <domain>".bright_cyan()
+        );
+        println!(
+            "  {:<34} Audit HTTP security headers + cookie flags",
+            "headers <domain>".bright_cyan()
+        );
+        println!(
+            "  {:<34} Scan subdomains for takeover exposure",
+            "takeover <domain>".bright_cyan()
         );
         println!(
             "  {:<34} Find registered look-alike domains",
@@ -1300,6 +1310,67 @@ impl Repl {
                 println!("{}", formatter.format_posture(&posture));
                 self.last_result =
                     Some(crate::payload::Payload::Posture(Box::new(posture.clone())));
+                CommandResult::Continue
+            }
+            Err(e) => {
+                spinner.finish();
+                CommandResult::Error(e.to_string())
+            }
+        }
+    }
+
+    async fn execute_headers(&mut self, args: &[&str]) -> CommandResult {
+        if args.is_empty() {
+            return CommandResult::Error("Usage: headers <domain>".to_string());
+        }
+        let domain = args[0];
+        let spinner = Spinner::new(&format!("Auditing HTTP security headers for {}", domain));
+        match seer_core::audit_headers(domain, self.context.config.http_timeout()).await {
+            Ok(report) => {
+                spinner.finish();
+                let formatter = seer_core::output::get_formatter(self.context.output_format);
+                println!("{}", formatter.format_headers(&report));
+                self.last_result = Some(crate::payload::Payload::Headers(Box::new(report)));
+                CommandResult::Continue
+            }
+            Err(e) => {
+                spinner.finish();
+                CommandResult::Error(e.to_string())
+            }
+        }
+    }
+
+    async fn execute_takeover(&mut self, args: &[&str]) -> CommandResult {
+        if args.is_empty() {
+            return CommandResult::Error("Usage: takeover <domain>".to_string());
+        }
+        let domain = args[0];
+        let spinner = Spinner::new(&format!("Enumerating subdomains for {}", domain));
+        let hosts = match seer_core::SubdomainEnumerator::new()
+            .enumerate(domain)
+            .await
+        {
+            Ok(result) => result.subdomains,
+            Err(e) => {
+                spinner.finish();
+                return CommandResult::Error(e.to_string());
+            }
+        };
+
+        spinner.set_message(&format!("Checking {} host(s) for takeover", hosts.len()));
+        match seer_core::scan_takeover(
+            &self.dns_resolver,
+            domain,
+            hosts,
+            self.context.config.bulk.concurrency,
+        )
+        .await
+        {
+            Ok(report) => {
+                spinner.finish();
+                let formatter = seer_core::output::get_formatter(self.context.output_format);
+                println!("{}", formatter.format_takeover(&report));
+                self.last_result = Some(crate::payload::Payload::Takeover(Box::new(report)));
                 CommandResult::Continue
             }
             Err(e) => {

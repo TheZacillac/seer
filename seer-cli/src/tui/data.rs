@@ -9,6 +9,11 @@ fn e(e: seer_core::SeerError) -> String {
     e.to_string()
 }
 
+/// Concurrent host checks for the takeover scan. The TUI builds its clients
+/// with `::new()` defaults rather than loading `~/.seer/config.toml`, so this
+/// mirrors `SeerConfig`'s own `bulk.concurrency` default instead of reading it.
+const TAKEOVER_CONCURRENCY: usize = 10;
+
 pub async fn fetch(req: FetchReq) -> Result<LensData, String> {
     match req {
         FetchReq::Overview(d) => {
@@ -125,5 +130,29 @@ pub async fn fetch(req: FetchReq) -> Result<LensData, String> {
             .await
             .map(|r| LensData::Subdomains(Box::new(r)))
             .map_err(e),
+        FetchReq::Headers(d) => seer_core::audit_headers(&d, seer_core::DEFAULT_HEADER_TIMEOUT)
+            .await
+            .map(|r| LensData::Headers(Box::new(r)))
+            .map_err(e),
+        FetchReq::Takeover(d) => {
+            // Two stages, like the CLI's takeover command: enumerate via CT
+            // logs, then scan. Enumeration failure aborts — with no host list
+            // there is nothing to scan, and reporting an empty clean result
+            // would be a false all-clear.
+            let enumerated = seer_core::SubdomainEnumerator::new()
+                .enumerate(&d)
+                .await
+                .map_err(e)?;
+            let resolver = seer_core::DnsResolver::new();
+            seer_core::scan_takeover(
+                &resolver,
+                &enumerated.domain,
+                enumerated.subdomains,
+                TAKEOVER_CONCURRENCY,
+            )
+            .await
+            .map(|r| LensData::Takeover(Box::new(r)))
+            .map_err(e)
+        }
     }
 }

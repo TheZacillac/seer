@@ -393,6 +393,31 @@ enum Commands {
         /// Domain to inspect
         domain: String,
     },
+    /// Audit HTTP security headers, cookie flags, and version disclosure
+    ///
+    /// Issues one non-intrusive GET and grades the response: security headers
+    /// (HSTS, CSP, X-Frame-Options, nosniff, Referrer-Policy,
+    /// Permissions-Policy, COOP/COEP/CORP), Set-Cookie flags, and
+    /// version-disclosing banners, as a 0-100 score and a letter grade.
+    Headers {
+        /// Domain to audit
+        domain: String,
+    },
+    /// Scan subdomains for takeover exposure, confirmed over HTTP
+    ///
+    /// Enumerates subdomains via Certificate Transparency logs, then checks
+    /// each one whose CNAME points at a takeover-prone provider. A host that
+    /// serves the provider's unclaimed-resource page is reported VULNERABLE
+    /// with the matched fingerprint as evidence; a dangling CNAME that does
+    /// not resolve is reported as potential (nothing answered to confirm it).
+    /// Check-style command: exits 1 when any host is vulnerable or potential.
+    Takeover {
+        /// Domain to scan (e.g. example.com)
+        domain: String,
+        /// Scan these hosts instead of enumerating via CT logs (repeatable)
+        #[arg(long = "host", value_name = "HOST")]
+        hosts: Vec<String>,
+    },
     /// Find registered typosquat / look-alike domains for a domain
     Confusables {
         /// Domain to generate and score look-alikes for
@@ -1325,6 +1350,70 @@ async fn execute_command(
                 Err(e) => emit_error(output_format, &e),
             }
         }
+        Commands::Headers { domain } => {
+            let spinner = Arc::new(display::Spinner::new(&format!(
+                "Auditing HTTP security headers for {}",
+                domain
+            )));
+            match seer_core::audit_headers(&domain, config.http_timeout()).await {
+                Ok(report) => {
+                    spinner.finish();
+                    if quiet && handle_quiet_output(&report, &fields) {
+                    } else {
+                        println!("{}", formatter.format_headers(&report));
+                    }
+                }
+                Err(e) => {
+                    spinner.finish();
+                    emit_error(output_format, &e);
+                }
+            }
+        }
+        Commands::Takeover { domain, hosts } => {
+            let spinner = Arc::new(display::Spinner::new(&format!(
+                "Scanning {} for takeover exposure",
+                domain
+            )));
+            // --host skips CT enumeration entirely, which keeps a targeted
+            // re-check of known hosts fast and offline-of-CT.
+            let hosts = if hosts.is_empty() {
+                spinner.set_message("Enumerating subdomains via CT logs");
+                match seer_core::SubdomainEnumerator::new()
+                    .enumerate(&domain)
+                    .await
+                {
+                    Ok(result) => result.subdomains,
+                    Err(e) => {
+                        spinner.finish();
+                        emit_error(output_format, &e);
+                    }
+                }
+            } else {
+                hosts
+            };
+
+            spinner.set_message(&format!("Checking {} host(s) for takeover", hosts.len()));
+            let resolver = seer_core::DnsResolver::from_config(config);
+            match seer_core::scan_takeover(&resolver, &domain, hosts, config.bulk.concurrency).await
+            {
+                Ok(report) => {
+                    spinner.finish();
+                    if quiet && handle_quiet_output(&report, &fields) {
+                    } else {
+                        println!("{}", formatter.format_takeover(&report));
+                    }
+                    // Check-style exit: any confirmed or potential takeover is
+                    // actionable, so both fail a CI run.
+                    if report.has_findings() {
+                        std::process::exit(1);
+                    }
+                }
+                Err(e) => {
+                    spinner.finish();
+                    emit_error(output_format, &e);
+                }
+            }
+        }
         Commands::Confusables { domain } => {
             let spinner = Arc::new(display::Spinner::new(&format!(
                 "Scanning look-alikes for {}",
@@ -1722,6 +1811,48 @@ mod feature_suite_cli_tests {
             panic!("expected Delegation command");
         };
         assert_eq!(domain, "example.com");
+    }
+
+    #[test]
+    fn headers_requires_a_domain() {
+        assert!(Cli::try_parse_from(["seer", "headers"]).is_err());
+        let cli =
+            Cli::try_parse_from(["seer", "headers", "example.com"]).expect("headers should parse");
+        let Some(Commands::Headers { domain }) = cli.command else {
+            panic!("expected Headers command");
+        };
+        assert_eq!(domain, "example.com");
+    }
+
+    #[test]
+    fn takeover_requires_a_domain_and_defaults_to_ct_enumeration() {
+        assert!(Cli::try_parse_from(["seer", "takeover"]).is_err());
+        let cli = Cli::try_parse_from(["seer", "takeover", "example.com"])
+            .expect("takeover should parse");
+        let Some(Commands::Takeover { domain, hosts }) = cli.command else {
+            panic!("expected Takeover command");
+        };
+        assert_eq!(domain, "example.com");
+        // No --host means enumerate via CT logs.
+        assert!(hosts.is_empty());
+    }
+
+    #[test]
+    fn takeover_host_flag_is_repeatable() {
+        let cli = Cli::try_parse_from([
+            "seer",
+            "takeover",
+            "example.com",
+            "--host",
+            "a.example.com",
+            "--host",
+            "b.example.com",
+        ])
+        .expect("takeover --host should parse");
+        let Some(Commands::Takeover { hosts, .. }) = cli.command else {
+            panic!("expected Takeover command");
+        };
+        assert_eq!(hosts, vec!["a.example.com", "b.example.com"]);
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! Registry of the 16 lenses shown in the left nav, grouped LOOKUP / DNS /
+//! Registry of the 18 lenses shown in the left nav, grouped LOOKUP / DNS /
 //! SECURITY / POWER.
 
 pub mod avail;
@@ -8,6 +8,7 @@ pub mod diff;
 pub mod dns;
 pub mod dnssec;
 pub mod follow;
+pub mod headers;
 pub mod history;
 pub mod overview;
 pub mod placeholder;
@@ -17,6 +18,7 @@ pub mod reverse;
 pub mod ssl;
 pub mod status;
 pub mod subdomains;
+pub mod takeover;
 pub mod tld;
 pub mod watch;
 pub mod whois;
@@ -145,6 +147,24 @@ pub fn lenses() -> &'static [Lens] {
             implemented: true,
         },
         Lens {
+            key: "headers",
+            label: "HTTP Headers",
+            glyph: "☰",
+            cmd: "headers",
+            group: "SECURITY",
+            tabs: NO_TABS,
+            implemented: true,
+        },
+        Lens {
+            key: "takeover",
+            label: "Takeover",
+            glyph: "⚑",
+            cmd: "takeover",
+            group: "SECURITY",
+            tabs: NO_TABS,
+            implemented: true,
+        },
+        Lens {
             key: "diff",
             label: "Diff",
             glyph: "⇄",
@@ -239,6 +259,8 @@ pub fn render(
         "watch" => watch::render(f, area, theme, data, focused, sel),
         "history" => history::render(f, area, theme, data, focused, sel),
         "subdomains" => subdomains::render(f, area, theme, data, focused, sel),
+        "headers" => headers::render(f, area, theme, data),
+        "takeover" => takeover::render(f, area, theme, data, focused, sel),
         // Pane-driven lenses ("follow", "bulk", "tld") are handled in
         // render.rs::main_pane before the state match — they render from
         // `app.panes` state and never reach this generic dispatch.
@@ -251,9 +273,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn registry_has_sixteen_lenses_in_four_groups() {
+    fn registry_has_eighteen_lenses_in_four_groups() {
         let ls = lenses();
-        assert_eq!(ls.len(), 16);
+        assert_eq!(ls.len(), 18);
         assert_eq!(ls[0].key, "overview");
         assert_eq!(ls[0].group, "LOOKUP");
         let groups: Vec<&str> = ls.iter().map(|l| l.group).collect();
@@ -274,7 +296,7 @@ mod tests {
             .filter(|l| l.implemented)
             .map(|l| l.key)
             .collect();
-        // All 16 lenses — Phase 1+2+3+4a+4b
+        // All 18 lenses — Phase 1+2+3+4a+4b, plus headers/takeover.
         assert_eq!(
             implemented,
             vec![
@@ -290,12 +312,37 @@ mod tests {
                 "ssl",
                 "status",
                 "subdomains",
+                "headers",
+                "takeover",
                 "diff",
                 "bulk",
                 "watch",
                 "history"
             ]
         );
+    }
+
+    #[test]
+    fn lens_keys_and_glyphs_are_unique() {
+        // The nav renders glyph + label; a shared glyph makes two rows look
+        // like the same lens at a glance (headers originally reused WHOIS's ▤).
+        let mut keys: Vec<&str> = lenses().iter().map(|l| l.key).collect();
+        keys.sort_unstable();
+        let before = keys.len();
+        keys.dedup();
+        assert_eq!(keys.len(), before, "duplicate lens key");
+
+        let mut glyphs: Vec<&str> = lenses().iter().map(|l| l.glyph).collect();
+        glyphs.sort_unstable();
+        let before = glyphs.len();
+        glyphs.dedup();
+        assert_eq!(glyphs.len(), before, "duplicate lens glyph");
+
+        let mut cmds: Vec<&str> = lenses().iter().map(|l| l.cmd).collect();
+        cmds.sort_unstable();
+        let before = cmds.len();
+        cmds.dedup();
+        assert_eq!(cmds.len(), before, "duplicate lens cmd alias");
     }
 
     #[test]
@@ -311,6 +358,14 @@ mod tests {
         assert_eq!(
             find_by_cmd_or_key("prop").map(|i| lenses()[i].key),
             Some("propagation")
+        );
+        assert_eq!(
+            find_by_cmd_or_key("headers").map(|i| lenses()[i].key),
+            Some("headers")
+        );
+        assert_eq!(
+            find_by_cmd_or_key("takeover").map(|i| lenses()[i].key),
+            Some("takeover")
         );
         assert_eq!(find_by_cmd_or_key("nope"), None);
     }

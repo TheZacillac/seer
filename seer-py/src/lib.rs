@@ -781,6 +781,33 @@ fn posture<'py>(py: Python<'py>, domain: String) -> PyResult<Bound<'py, PyAny>> 
 }
 
 #[pyfunction]
+fn headers<'py>(py: Python<'py>, domain: String) -> PyResult<Bound<'py, PyAny>> {
+    let response = run_async(py, async move {
+        seer_core::audit_headers(&domain, seer_core::DEFAULT_HEADER_TIMEOUT).await
+    })?;
+    let json = serialize_response(&response)?;
+    json_to_python(py, &json)
+}
+
+#[pyfunction]
+#[pyo3(signature = (domain, concurrency = 10))]
+fn takeover<'py>(
+    py: Python<'py>,
+    domain: String,
+    concurrency: usize,
+) -> PyResult<Bound<'py, PyAny>> {
+    let enumerator = get_subdomain_enumerator();
+    let resolver = get_dns_resolver();
+    let concurrency = validate_concurrency(concurrency)?;
+    let response = run_async(py, async move {
+        let result = enumerator.enumerate(&domain).await?;
+        seer_core::scan_takeover(resolver, &result.domain, result.subdomains, concurrency).await
+    })?;
+    let json = serialize_response(&response)?;
+    json_to_python(py, &json)
+}
+
+#[pyfunction]
 #[pyo3(signature = (domain, concurrency = 10))]
 fn confusables<'py>(
     py: Python<'py>,
@@ -1184,6 +1211,8 @@ fn _seer(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(delegation, m)?)?;
     m.add_function(wrap_pyfunction!(caa, m)?)?;
     m.add_function(wrap_pyfunction!(posture, m)?)?;
+    m.add_function(wrap_pyfunction!(headers, m)?)?;
+    m.add_function(wrap_pyfunction!(takeover, m)?)?;
     m.add_function(wrap_pyfunction!(confusables, m)?)?;
     m.add_function(wrap_pyfunction!(subdomains_classify, m)?)?;
     m.add_function(wrap_pyfunction!(dns_compare, m)?)?;

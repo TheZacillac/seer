@@ -64,6 +64,30 @@ pub trait OutputFormatter {
     fn format_status(&self, response: &StatusResponse) -> String;
     fn format_follow_iteration(&self, iteration: &FollowIteration) -> String;
     fn format_follow(&self, result: &FollowResult) -> String;
+    fn format_availability(&self, result: &AvailabilityResult) -> String;
+    fn format_dnssec(&self, report: &DnssecReport) -> String;
+    fn format_delegation(&self, report: &DelegationReport) -> String;
+    fn format_tld(&self, info: &TldInfo) -> String;
+    fn format_dns_comparison(&self, comparison: &DnsComparison) -> String;
+    fn format_subdomains(&self, result: &SubdomainResult) -> String;
+    fn format_diff(&self, diff: &DomainDiff) -> String;
+    fn format_ssl(&self, report: &SslReport) -> String;
+    fn format_watch(&self, report: &WatchReport) -> String;
+    fn format_domain_info(&self, info: &DomainInfo) -> String;
+    fn format_drift(&self, report: &DriftReport) -> String;
+    fn format_posture(&self, posture: &EmailPosture) -> String;
+    fn format_headers(&self, report: &HeaderReport) -> String;
+    fn format_takeover(&self, report: &TakeoverReport) -> String;
+    fn format_caa(&self, policy: &CaaPolicy) -> String;
+    fn format_confusables(&self, report: &ConfusableReport) -> String;
+    fn format_subdomain_classification(
+        &self,
+        result: &SubdomainClassification,
+    ) -> String;
+    fn format_subdomain_baseline_diff(
+        &self,
+        report: &SubdomainBaselineDiff,
+    ) -> String;
 }
 ```
 

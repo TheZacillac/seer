@@ -1,5 +1,5 @@
 //! Case-insensitive in-lens row filtering for the table lenses (subdomains,
-//! history, propagation).
+//! history, propagation, takeover).
 //!
 //! [`apply`] returns a filtered clone of the lens data; it is used by BOTH the
 //! renderer and `App::row_count`, so the displayed rows, the selection index
@@ -15,7 +15,10 @@ pub fn matches(text: &str, filter: &str) -> bool {
 
 /// Whether a lens key supports in-lens `/`-filtering.
 pub fn is_filterable(lens_key: &str) -> bool {
-    matches!(lens_key, "subdomains" | "history" | "propagation")
+    matches!(
+        lens_key,
+        "subdomains" | "history" | "propagation" | "takeover"
+    )
 }
 
 /// The filterable text for a history row (mirrors the columns the lens shows).
@@ -57,6 +60,33 @@ pub fn apply(data: &LensData, filter: &str) -> Option<LensData> {
                 .collect();
             Some(LensData::History(filtered))
         }
+        LensData::Takeover(t) => {
+            let mut r = (**t).clone();
+            // Match the columns the lens shows, so what the user types lines
+            // up with what they can see.
+            r.findings.retain(|fnd| {
+                let label = format!(
+                    "{} {} {}",
+                    fnd.host,
+                    fnd.provider.as_deref().unwrap_or(""),
+                    fnd.evidence.as_deref().unwrap_or(""),
+                );
+                matches(&label, filter)
+            });
+            // The headline counts must describe the visible subset, or a
+            // filtered view would claim findings it is no longer showing.
+            r.vulnerable = r
+                .findings
+                .iter()
+                .filter(|f| f.verdict == seer_core::TakeoverVerdict::Vulnerable)
+                .count();
+            r.potential = r
+                .findings
+                .iter()
+                .filter(|f| f.verdict == seer_core::TakeoverVerdict::Potential)
+                .count();
+            Some(LensData::Takeover(Box::new(r)))
+        }
         LensData::Prop(p) => {
             let mut r = (**p).clone();
             // Inline label (avoids naming the per-server element type).
@@ -95,6 +125,48 @@ mod tests {
         assert!(is_filterable("history"));
         assert!(is_filterable("propagation"));
         assert!(!is_filterable("whois"));
+    }
+
+    #[test]
+    fn apply_filters_takeover_and_recomputes_counts() {
+        use seer_core::{TakeoverFinding, TakeoverReport, TakeoverVerdict};
+        let mk = |host: &str, verdict| TakeoverFinding {
+            host: host.into(),
+            verdict,
+            provider: Some("GitHub Pages".into()),
+            cname: None,
+            addresses: vec![],
+            evidence: None,
+            http_status: None,
+            probe_note: None,
+        };
+        let report = TakeoverReport {
+            domain: "example.com".into(),
+            hosts_checked: 3,
+            hosts_skipped: 0,
+            vulnerable: 1,
+            potential: 2,
+            findings: vec![
+                mk("api.example.com", TakeoverVerdict::Vulnerable),
+                mk("mail.example.com", TakeoverVerdict::Potential),
+                mk("api-staging.example.com", TakeoverVerdict::Potential),
+            ],
+            notes: vec![],
+        };
+        let filtered = apply(&LensData::Takeover(Box::new(report)), "api").expect("filter applies");
+        let LensData::Takeover(t) = filtered else {
+            panic!("wrong variant");
+        };
+        assert_eq!(t.findings.len(), 2);
+        // Counts must describe the visible subset, not the pre-filter scan —
+        // otherwise the title claims findings the table no longer shows.
+        assert_eq!(t.vulnerable, 1);
+        assert_eq!(t.potential, 1);
+    }
+
+    #[test]
+    fn takeover_is_filterable() {
+        assert!(is_filterable("takeover"));
     }
 
     #[test]

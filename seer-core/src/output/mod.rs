@@ -57,6 +57,8 @@ pub trait OutputFormatter {
     fn format_domain_info(&self, info: &crate::domain_info::DomainInfo) -> String;
     fn format_drift(&self, report: &crate::drift::DriftReport) -> String;
     fn format_posture(&self, posture: &crate::posture::EmailPosture) -> String;
+    fn format_headers(&self, report: &crate::headers::HeaderReport) -> String;
+    fn format_takeover(&self, report: &crate::takeover::TakeoverReport) -> String;
     fn format_caa(&self, policy: &crate::caa::CaaPolicy) -> String;
     fn format_confusables(&self, report: &crate::confusables::ConfusableReport) -> String;
     fn format_subdomain_classification(
@@ -153,6 +155,12 @@ impl OutputFormatter for YamlFormatter {
     }
     fn format_posture(&self, posture: &crate::posture::EmailPosture) -> String {
         self.to_yaml_value(posture)
+    }
+    fn format_headers(&self, report: &crate::headers::HeaderReport) -> String {
+        self.to_yaml_value(report)
+    }
+    fn format_takeover(&self, report: &crate::takeover::TakeoverReport) -> String {
+        self.to_yaml_value(report)
     }
     fn format_caa(&self, policy: &crate::caa::CaaPolicy) -> String {
         self.to_yaml_value(policy)

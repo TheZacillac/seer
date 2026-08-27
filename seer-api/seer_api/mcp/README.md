@@ -36,6 +36,9 @@ Uses stdio transport for communication:
 
 ## Available Tools
 
+All 30 tools are registered on both transports. `seer-api/README.md` carries
+the same table; keep the two in sync when adding a tool.
+
 ### Domain Lookup Tools
 
 | Tool | Description |
@@ -45,13 +48,33 @@ Uses stdio transport for communication:
 | `seer_rdap_domain` | RDAP domain lookup |
 | `seer_rdap_ip` | RDAP IP lookup |
 | `seer_rdap_asn` | RDAP ASN lookup |
+| `seer_info` | Merged RDAP + WHOIS domain info |
+| `seer_availability` | Domain availability check |
+| `seer_diff` | Side-by-side domain comparison |
+| `seer_tld_info` | TLD info (WHOIS server, RDAP endpoint) |
 
 ### DNS Tools
 
 | Tool | Description |
 |------|-------------|
 | `seer_dig` | DNS query |
+| `seer_dns_compare` | Compare records across nameservers |
 | `seer_propagation` | DNS propagation check |
+| `seer_dnssec` | DNSSEC validation |
+| `seer_delegation` | NS delegation health |
+| `seer_subdomains` | Subdomain enumeration (CT logs) |
+
+### Security Tools
+
+| Tool | Description |
+|------|-------------|
+| `seer_status` | Domain status check |
+| `seer_ssl` | SSL certificate chain inspection |
+| `seer_caa` | CAA policy lookup |
+| `seer_posture` | Email/DNS security posture |
+| `seer_headers` | HTTP security header + cookie audit (graded A+–F) |
+| `seer_takeover` | Subdomain takeover scan (HTTP-confirmed) |
+| `seer_confusables` | Look-alike (typosquat) generation |
 
 ### Bulk Tools
 
@@ -60,6 +83,11 @@ Uses stdio transport for communication:
 | `seer_bulk_lookup` | Bulk smart lookups |
 | `seer_bulk_whois` | Bulk WHOIS lookups |
 | `seer_bulk_dig` | Bulk DNS queries |
+| `seer_bulk_propagation` | Bulk propagation checks |
+| `seer_bulk_status` | Bulk status checks |
+| `seer_bulk_ssl` | Bulk SSL inspections |
+| `seer_bulk_availability` | Bulk availability checks |
+| `seer_bulk_info` | Bulk domain info |
 
 ## Tool Definitions
 
