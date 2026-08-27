@@ -44,6 +44,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **MCP server now exposes 30 tools** (was 28), adding `seer_headers` and
   `seer_takeover`.
 
+### Security
+- **Bumped `h2` to 0.4.19** for RUSTSEC-2026-0258 (unbounded empty DATA frames:
+  undrained streams could grow memory without limit, or panic on length
+  overflow). Reached transitively via `hickory-net` and `hyper`.
+- **Bumped `lru` to 0.18.2** for RUSTSEC-2026-0253 (use-after-free: a panicking
+  key `Drop` during `LruCache::pop()` left dangling pointers in the internal
+  list). Reported by `cargo audit` as `unsound` rather than a vulnerability, so
+  it was not failing CI.
+
+### Changed
+- **Dependency bumps** picked up from the open Dependabot PRs: `comfy-table`
+  7.2.2 → 8.0.0 (major; the crate is declared by `seer-cli` but not referenced
+  in any source file, so the bump is API-inert), plus the grouped minor/patch
+  set — `async-trait` 0.1.92, `base64` 0.23.1, `clap` 4.6.6 (with
+  `clap_builder`, `clap_complete` 4.6.9, `clap_mangen` 0.3.3), `log` 0.4.34,
+  `pyo3` 0.29.2 (with its four companion crates), and `thiserror` 2.0.20.
+
 ### Internal
 - New `seer-core::http` module: an SSRF-guarded HTTP GET shared by `headers`
   and `takeover`. Redirects are followed manually with the guard re-applied at
