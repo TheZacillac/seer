@@ -562,6 +562,9 @@ const AVAILABILITY_PATTERNS: &[&str] = &[
     "no such domain",             // RESTENA .lu ("% No such domain")
     "object_not_found",           // NIC Mexico .mx ("No_Se_Encontro_El_Objeto/Object_Not_Found")
     "no se encuentra registrado", // NIC Argentina .ar (Spanish-only response)
+    // ISOC-IL .il / .ישראל: "% No data was found to match the request
+    // criteria." — "was" breaks the bare "no data found" pattern above.
+    "no data was found",
 ];
 
 /// Sentence-form "not found" verdicts that exceed [`MAX_STATUS_LINE_WORDS`].
@@ -1080,6 +1083,7 @@ Name Server: ns1.example.com
             "No information was found matching that query.\n", // .africa
             "Object not found\n",                  // generic
             "Not find MatchingRecord\n",           // CONAC .政务 / .公益
+            "% No data was found to match the request criteria.\n", // ISOC-IL .il
         ] {
             assert!(
                 make_response(raw).is_available(),

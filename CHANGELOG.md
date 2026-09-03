@@ -11,6 +11,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`.il` domains (`.co.il`, `.org.il`, `.ac.il`, …, `.ישראל`) now report
+  registration and expiration dates.** `.il` has no RDAP service, so
+  `whois.isoc.org.il` is the only registration source — and ISOC-IL labels the
+  expiry `validity:` in `DD-MM-YYYY` form and buries the creation date in a
+  `changed: … YYYYMMDD (Assigned)` audit line, neither of which the generic
+  parser recognised, so `lookup`/`whois`/`info` showed no dates at all. A
+  dedicated ISOC-IL parser now extracts creation, expiration (`N/A` on legacy
+  names correctly yields none), and last-changed dates, the full
+  `Transfer Locked`/`Transfer Allowed` status (previously truncated to
+  `Transfer`), holder/admin/tech contacts (with the registry's `user AT host`
+  e-mail obfuscation undone), DNSSEC state, and glue-stripped nameservers.
+  ISOC-IL's `No data was found to match the request criteria.` reply is also
+  recognised as "available" — the interposed *was* had defeated the generic
+  `no data found` pattern.
+
 ## [0.47.0] - 2026-08-27
 
 Adds two security/pen-test features. `seer headers` grades what an origin

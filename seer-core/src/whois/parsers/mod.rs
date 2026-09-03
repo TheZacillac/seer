@@ -10,6 +10,7 @@ mod educause;
 mod eis;
 mod eurid;
 mod generic;
+mod isoc_il;
 mod jprs;
 mod kisa;
 mod nic_it;
@@ -25,6 +26,7 @@ pub use educause::EducauseParser;
 pub use eis::EisParser;
 pub use eurid::EuridParser;
 pub use generic::GenericParser;
+pub use isoc_il::IsocIlParser;
 pub use jprs::JprsParser;
 pub use kisa::KisaParser;
 pub use nic_it::NicItParser;
@@ -83,6 +85,7 @@ impl ParserRegistry {
                 Box::new(EducauseParser::new()), // .edu
                 Box::new(EisParser::new()),      // .ee
                 Box::new(EuridParser::new()),    // .eu
+                Box::new(IsocIlParser::new()),   // .il (co.il, org.il, …), .ישראל
                 Box::new(JprsParser::new()),     // .jp
                 Box::new(KisaParser::new()),     // .kr
                 Box::new(NicItParser::new()),    // .it
