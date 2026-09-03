@@ -138,18 +138,19 @@ jobs:
   audit:
     name: Security Audit
     runs-on: ubuntu-latest
-    # rustsec/audit-check reports by creating a check-run, which needs
-    # `checks: write`. On `pull_request` the default token grants it, but on
-    # `push` to main it does not — without this block the job fails with
-    # "Resource not accessible by integration" on every merge.
-    permissions:
-      contents: read
-      checks: write
     steps:
       - uses: actions/checkout@v7
-      - uses: rustsec/audit-check@v2.0.0
+      # Install a prebuilt cargo-audit binary rather than compiling it from
+      # source on every run. rustsec/audit-check did `cargo install
+      # cargo-audit` with an unlocked resolution, so a broken release of any
+      # transitive dependency (tinyvec 1.13.0 on 2026-09-03, which fails to
+      # build) turned the job red with no change on our side. The prebuilt
+      # binary is built against a locked tree, so only cargo-audit's own
+      # releases can move it.
+      - uses: taiki-e/install-action@v2
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          tool: cargo-audit
+      - run: cargo audit
 
   deny:
     name: Supply Chain (cargo-deny)
