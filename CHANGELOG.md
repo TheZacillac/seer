@@ -11,6 +11,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.47.1] - 2026-09-03
+
+Patch release. `.co.il` and the other `.il` second-level domains now report
+their registration and expiration dates — ISOC-IL's WHOIS was the only
+source for them (there is no `.il` RDAP) and its format was not understood.
+Also hardens the CI security-audit job against upstream build breaks.
+
 ### Fixed
 - **`.il` domains (`.co.il`, `.org.il`, `.ac.il`, …, `.ישראל`) now report
   registration and expiration dates.** `.il` has no RDAP service, so
@@ -26,6 +33,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ISOC-IL's `No data was found to match the request criteria.` reply is also
   recognised as "available" — the interposed *was* had defeated the generic
   `no data found` pattern.
+
+### Internal
+- **CI: the Security Audit job installs a prebuilt `cargo-audit`** instead of
+  compiling it from source on every run. The previous action resolved
+  cargo-audit's dependencies unlocked, so a broken upstream release (tinyvec
+  1.13.0) turned the job red on `main` with no change on Seer's side.
 
 ## [0.47.0] - 2026-08-27
 
@@ -972,7 +985,8 @@ Two notable breaking changes landed in this period (see `CLAUDE.md` for details)
   `inconsistencies` became typed (`ConsensusValue` / `Inconsistency`) instead of
   pre-formatted strings.
 
-[Unreleased]: https://github.com/TheZacillac/seer/compare/v0.47.0...HEAD
+[Unreleased]: https://github.com/TheZacillac/seer/compare/v0.47.1...HEAD
+[0.47.1]: https://github.com/TheZacillac/seer/compare/v0.47.0...v0.47.1
 [0.47.0]: https://github.com/TheZacillac/seer/compare/v0.46.0...v0.47.0
 [0.46.0]: https://github.com/TheZacillac/seer/compare/v0.45.0...v0.46.0
 [0.45.0]: https://github.com/TheZacillac/seer/compare/v0.44.2...v0.45.0
