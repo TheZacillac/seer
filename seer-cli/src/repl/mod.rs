@@ -8,7 +8,6 @@ use std::io::Write;
 use std::sync::Arc;
 
 use colored::Colorize;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use rustyline::error::ReadlineError;
 use rustyline::history::DefaultHistory;
 use rustyline::{CompletionType, Editor};
@@ -35,16 +34,28 @@ pub struct Repl {
     last_result: Option<crate::payload::Payload>,
 }
 
+/// The line editor configuration. `history_ignore_space` lets a user keep a
+/// sensitive query out of `~/.seer_history` by typing a leading space.
+fn editor_config() -> rustyline::Config {
+    rustyline::Config::builder()
+        .history_ignore_space(true)
+        .completion_type(CompletionType::List)
+        .edit_mode(rustyline::EditMode::Emacs)
+        .build()
+}
+
+/// The text recorded in history for a raw input line: trailing whitespace is
+/// dropped, but LEADING whitespace must survive — rustyline decides whether to
+/// honor `history_ignore_space` by looking at it. Adding the fully trimmed
+/// line (as the loop used to) saved ` whois secret.com` anyway.
+fn history_entry(line: &str) -> &str {
+    line.trim_end()
+}
+
 impl Repl {
     pub fn new() -> anyhow::Result<Self> {
-        let config = rustyline::Config::builder()
-            .history_ignore_space(true)
-            .completion_type(CompletionType::List)
-            .edit_mode(rustyline::EditMode::Emacs)
-            .build();
-
         let completer = SeerCompleter::new();
-        let mut editor = Editor::with_config(config)?;
+        let mut editor = Editor::with_config(editor_config())?;
         editor.set_helper(Some(completer));
 
         // Load history
@@ -70,10 +81,19 @@ impl Repl {
             dnssec_checker: seer_core::DnssecChecker::new(),
             availability_checker: seer_core::AvailabilityChecker::from_config(cfg),
             ssl_checker: seer_core::SslChecker::from_config(cfg),
-            dns_follower: seer_core::DnsFollower::new(),
+            // Honor the config file's DNS timeout like `dig` does.
+            dns_follower: seer_core::DnsFollower::with_resolver(
+                seer_core::DnsResolver::from_config(cfg),
+            ),
             last_result: None,
             context,
         })
+    }
+
+    /// Sets the session's output format, as `set output <fmt>` does. Used to
+    /// carry an explicit `seer --format <fmt>` into the REPL.
+    pub fn set_output_format(&mut self, format: seer_core::output::OutputFormat) {
+        self.context.output_format = format;
     }
 
     pub async fn run(&mut self) -> anyhow::Result<()> {
@@ -87,14 +107,14 @@ impl Repl {
             match self.editor.readline(&prompt) {
                 Ok(line) => {
                     last_ctrl_c = None;
-                    let line = line.trim();
-                    if line.is_empty() {
+                    let command_line = line.trim();
+                    if command_line.is_empty() {
                         continue;
                     }
 
-                    self.editor.add_history_entry(line)?;
+                    self.editor.add_history_entry(history_entry(&line))?;
 
-                    match self.execute_line(line).await {
+                    match self.execute_line(command_line).await {
                         CommandResult::Continue => {}
                         CommandResult::Exit => break,
                         CommandResult::Error(e) => {
@@ -197,9 +217,25 @@ impl Repl {
         }
 
         let command = parts[0].to_lowercase();
+        let result = self.dispatch(&command, &parts).await;
+
+        // A failed command must not leave the PREVIOUS result behind for
+        // `copy` to hand out as if it were this command's output. `copy` and
+        // `set` only act on session state, so their errors (bad format name)
+        // keep the buffer.
+        if matches!(result, CommandResult::Error(_)) && !matches!(command.as_str(), "copy" | "set")
+        {
+            self.last_result = None;
+        }
+        result
+    }
+
+    /// Routes a tokenized line (`parts[0]` is the command as typed, `command`
+    /// its lowercased form) to its handler.
+    async fn dispatch(&mut self, command: &str, parts: &[&str]) -> CommandResult {
         let args = &parts[1..];
 
-        match command.as_str() {
+        match command {
             "help" | "?" => {
                 self.print_help();
                 CommandResult::Continue
@@ -243,7 +279,7 @@ impl Repl {
             _ => {
                 // If the input contains a dot, assume it's a domain and run lookup
                 if command.contains('.') {
-                    self.execute_lookup(&parts).await
+                    self.execute_lookup(parts).await
                 } else {
                     CommandResult::Error(format!(
                         "Unknown command: {}. Type 'help' for available commands.",
@@ -322,6 +358,10 @@ impl Repl {
             "subdomains <domain>".bright_cyan()
         );
         println!(
+            "  {:<34} ...and classify live/dead + dangling CNAMEs",
+            "subdomains <domain> --resolve".bright_cyan()
+        );
+        println!(
             "  {:<34} Diff subdomains vs the stored baseline",
             "subdomains <domain> --diff [--record]".bright_cyan()
         );
@@ -355,7 +395,7 @@ impl Repl {
         );
         println!(
             "  {:<34} Scan subdomains for takeover exposure",
-            "takeover <domain>".bright_cyan()
+            "takeover <domain> [--host <h>]...".bright_cyan()
         );
         println!(
             "  {:<34} Find registered look-alike domains",
@@ -707,6 +747,7 @@ impl Repl {
                 spinner.finish();
                 let formatter = seer_core::output::get_formatter(self.context.output_format);
                 println!("{}", formatter.format_delegation(&report));
+                self.last_result = Some(crate::payload::Payload::Delegation(Box::new(report)));
                 CommandResult::Continue
             }
             Err(e) => {
@@ -740,9 +781,14 @@ impl Repl {
         let ip = args[0];
         let spinner = Spinner::new(&format!("Looking up PTR for {}", ip));
 
+        // Honor the configured nameserver, like `dig`.
         match self
             .dns_resolver
-            .resolve(ip, seer_core::RecordType::PTR, None)
+            .resolve(
+                ip,
+                seer_core::RecordType::PTR,
+                self.context.config.nameserver.as_deref(),
+            )
             .await
         {
             Ok(records) => {
@@ -980,7 +1026,9 @@ impl Repl {
             "Ctrl+C".ctp_yellow()
         );
 
-        // Set up cancellation channel
+        // Set up cancellation channel. `cancel_tx` must stay alive until the
+        // follow returns even when no key listener runs: once every sender is
+        // dropped, the follow's interruptible sleep wakes immediately.
         let (cancel_tx, cancel_rx) = watch::channel(false);
 
         // Create progress callback for real-time output
@@ -1001,36 +1049,10 @@ impl Repl {
         // follow loop (issue #60).
         let raw_guard = crate::utils::RawModeGuard::new();
 
-        // Spawn a task to listen for Escape key or Ctrl+C
-        let cancel_tx_clone = cancel_tx.clone();
-        let key_listener = tokio::spawn(async move {
-            loop {
-                // Poll for events with a short timeout
-                if event::poll(std::time::Duration::from_millis(100)).unwrap_or(false) {
-                    if let Ok(Event::Key(KeyEvent {
-                        code, modifiers, ..
-                    })) = event::read()
-                    {
-                        match code {
-                            KeyCode::Esc => {
-                                let _ = cancel_tx_clone.send(true);
-                                break;
-                            }
-                            KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
-                                let _ = cancel_tx_clone.send(true);
-                                break;
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-
-                // Check if we should stop listening (main task completed)
-                if cancel_tx_clone.is_closed() {
-                    break;
-                }
-            }
-        });
+        // Listen for Esc / Ctrl+C on a blocking thread — only when there is a
+        // terminal to read from (see `FollowKeyListener`).
+        let key_listener =
+            crate::utils::FollowKeyListener::spawn(cancel_tx.clone(), raw_guard.is_enabled());
 
         let result = self
             .dns_follower
@@ -1044,9 +1066,13 @@ impl Repl {
             )
             .await;
 
-        // Clean up: stop the key listener and restore cooked mode before
-        // printing results. The guard's Drop also restores on a panic above.
-        key_listener.abort();
+        // Clean up: stop the key listener (waiting for its thread, so it can't
+        // swallow keystrokes meant for the next prompt) and restore cooked
+        // mode before printing results. The guard's Drop also restores on a
+        // panic above.
+        if let Some(listener) = key_listener {
+            listener.stop().await;
+        }
         drop(raw_guard);
 
         match result {
@@ -1149,14 +1175,16 @@ impl Repl {
     }
 
     async fn execute_subdomains(&mut self, args: &[&str]) -> CommandResult {
-        if args.is_empty() {
-            return CommandResult::Error(
-                "Usage: subdomains <domain> [--diff] [--record]".to_string(),
-            );
-        }
-        let domain = args[0];
-        let diff = args.contains(&"--diff");
-        let record = args.contains(&"--record");
+        let commands::SubdomainsArgs {
+            domain,
+            resolve,
+            diff,
+            record,
+        } = match commands::parse_subdomains_args(args) {
+            Ok(p) => p,
+            Err(e) => return CommandResult::Error(e),
+        };
+        let domain = domain.as_str();
         let spinner = Spinner::new(&format!("Enumerating subdomains for {}", domain));
 
         if diff || record {
@@ -1167,9 +1195,11 @@ impl Repl {
                 Ok(outcome) => {
                     spinner.finish();
                     let formatter = seer_core::output::get_formatter(self.context.output_format);
+                    // Advisory notes go to stderr, as in the CLI, so stdout
+                    // carries only the formatted result.
                     if diff {
                         if outcome.report.baseline_missing {
-                            println!(
+                            eprintln!(
                                 "{} {}",
                                 "note:".ctp_yellow(),
                                 crate::ops::no_subdomain_baseline_note(
@@ -1185,7 +1215,7 @@ impl Repl {
                     } else {
                         // --record alone: plain listing plus a confirmation.
                         println!("{}", formatter.format_subdomains(&outcome.result));
-                        println!(
+                        eprintln!(
                             "{} recorded subdomain baseline for {} ({} names)",
                             "note:".ctp_yellow(),
                             outcome.result.domain,
@@ -1206,6 +1236,27 @@ impl Repl {
 
         let enumerator = seer_core::SubdomainEnumerator::new();
         match enumerator.enumerate(domain).await {
+            Ok(result) if resolve => {
+                // Same pipeline as the CLI's `subdomains --resolve`.
+                spinner.set_message("Resolving and classifying discovered names");
+                let classification = seer_core::classify_subdomains(
+                    &self.dns_resolver,
+                    &result.domain,
+                    result.subdomains.clone(),
+                    self.context.config.bulk.concurrency,
+                )
+                .await;
+                spinner.finish();
+                let formatter = seer_core::output::get_formatter(self.context.output_format);
+                println!(
+                    "{}",
+                    formatter.format_subdomain_classification(&classification)
+                );
+                self.last_result = Some(crate::payload::Payload::SubdomainClassification(
+                    Box::new(classification),
+                ));
+                CommandResult::Continue
+            }
             Ok(result) => {
                 spinner.finish();
                 let formatter = seer_core::output::get_formatter(self.context.output_format);
@@ -1244,11 +1295,11 @@ impl Repl {
     }
 
     async fn execute_drift(&mut self, args: &[&str]) -> CommandResult {
-        if args.is_empty() {
-            return CommandResult::Error("Usage: drift <domain> [--record]".to_string());
-        }
-        let domain = args[0];
-        let record = args.contains(&"--record");
+        let commands::DriftArgs { domain, record } = match commands::parse_drift_args(args) {
+            Ok(p) => p,
+            Err(e) => return CommandResult::Error(e),
+        };
+        let domain = domain.as_str();
         let spinner = Spinner::new(&format!("Looking up {}", domain));
         // Same history-snapshot semantics as the CLI `drift` subcommand —
         // shared via ops::drift_check so the two surfaces cannot diverge.
@@ -1257,7 +1308,8 @@ impl Repl {
             Ok(outcome) => {
                 spinner.finish();
                 if !outcome.had_previous {
-                    println!(
+                    // Advisory note on stderr, as in the CLI.
+                    eprintln!(
                         "{} {}",
                         "note:".ctp_yellow(),
                         crate::ops::no_baseline_note(domain, record)
@@ -1341,20 +1393,27 @@ impl Repl {
     }
 
     async fn execute_takeover(&mut self, args: &[&str]) -> CommandResult {
-        if args.is_empty() {
-            return CommandResult::Error("Usage: takeover <domain>".to_string());
-        }
-        let domain = args[0];
-        let spinner = Spinner::new(&format!("Enumerating subdomains for {}", domain));
-        let hosts = match seer_core::SubdomainEnumerator::new()
-            .enumerate(domain)
-            .await
-        {
-            Ok(result) => result.subdomains,
-            Err(e) => {
-                spinner.finish();
-                return CommandResult::Error(e.to_string());
+        let commands::TakeoverArgs { domain, hosts } = match commands::parse_takeover_args(args) {
+            Ok(p) => p,
+            Err(e) => return CommandResult::Error(e),
+        };
+        let domain = domain.as_str();
+        let spinner = Spinner::new(&format!("Scanning {} for takeover exposure", domain));
+        // `--host` skips CT enumeration entirely, as in the CLI.
+        let hosts = if hosts.is_empty() {
+            spinner.set_message(&format!("Enumerating subdomains for {}", domain));
+            match seer_core::SubdomainEnumerator::new()
+                .enumerate(domain)
+                .await
+            {
+                Ok(result) => result.subdomains,
+                Err(e) => {
+                    spinner.finish();
+                    return CommandResult::Error(e.to_string());
+                }
             }
+        } else {
+            hosts
         };
 
         spinner.set_message(&format!("Checking {} host(s) for takeover", hosts.len()));
@@ -1476,7 +1535,11 @@ impl Repl {
                 }
                 let spinner =
                     Spinner::new(&format!("Checking {} domains", watchlist.domains.len()));
-                let report = seer_core::check_watchlist(&watchlist.domains).await;
+                let report = seer_core::check_watchlist_with_config(
+                    &watchlist.domains,
+                    &self.context.config,
+                )
+                .await;
                 spinner.finish();
                 let formatter = seer_core::output::get_formatter(self.context.output_format);
                 println!("{}", formatter.format_watch(&report));
@@ -1762,6 +1825,57 @@ mod copy_tests {
         }
     }
 
+    /// `delegation` previously never stored a payload, so `copy` after it
+    /// silently copied whatever ran before.
+    #[test]
+    fn delegation_payload_is_copyable() {
+        let mut repl = repl_with_result();
+        repl.last_result = Some(crate::payload::Payload::Delegation(Box::new(
+            seer_core::dns::DelegationReport {
+                domain: "example.com".into(),
+                parent_zone: "com".into(),
+                parent_server_queried: vec!["a.gtld-servers.net".into()],
+                delegated_ns: vec!["a.iana-servers.net".into()],
+                zone_ns: vec!["a.iana-servers.net".into()],
+                in_sync: true,
+                missing_from_zone: vec![],
+                missing_from_parent: vec![],
+                lame: vec![],
+                warnings: vec![],
+            },
+        )));
+        let (text, msg) = repl.render_copy(&["json"]).expect("copyable");
+        assert!(msg.contains("delegation"), "got: {msg}");
+        assert!(text.contains("a.iana-servers.net"), "got: {text}");
+        assert!(!text.contains("1.2.3.4"), "must not copy the stale result");
+    }
+
+    /// A failed command must not leave the previous result for `copy` to
+    /// hand out as if it were this command's output. The usage error fires
+    /// before any network I/O, so this stays hermetic.
+    #[tokio::test]
+    async fn failed_command_clears_the_copy_buffer() {
+        let mut repl = repl_with_result();
+        let result = repl.execute_line("delegation").await;
+        assert!(matches!(result, CommandResult::Error(_)), "got {result:?}");
+        assert!(repl.last_result.is_none(), "stale payload must be dropped");
+        let err = repl.render_copy(&[]).unwrap_err();
+        assert!(err.contains("Nothing to copy"), "got: {err}");
+    }
+
+    /// `copy`/`set` errors are about the request itself (bad format name),
+    /// not a failed lookup, so they keep the buffer.
+    #[tokio::test]
+    async fn copy_and_set_errors_keep_the_copy_buffer() {
+        let mut repl = repl_with_result();
+        let result = repl.execute_line("copy bogus").await;
+        assert!(matches!(result, CommandResult::Error(_)), "got {result:?}");
+        assert!(repl.last_result.is_some());
+        let result = repl.execute_line("set output bogus").await;
+        assert!(matches!(result, CommandResult::Error(_)), "got {result:?}");
+        assert!(repl.last_result.is_some());
+    }
+
     #[tokio::test]
     #[ignore = "live network; run with --ignored or SEER_LIVE_TESTS=1"]
     async fn doctor_command_populates_last_result() {
@@ -1814,6 +1928,66 @@ mod delegation_repl_tests {
             msg.to_lowercase().contains("invalid") && msg.contains("bad..domain"),
             "error should name the invalid input: {msg}"
         );
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+    use rustyline::history::History;
+
+    /// The loop trimmed the line before `add_history_entry`, so rustyline
+    /// never saw the leading space that `history_ignore_space` keys on and
+    /// ` whois secret.com` was persisted to ~/.seer_history anyway.
+    #[test]
+    fn leading_space_line_is_kept_out_of_history() {
+        let mut history = DefaultHistory::with_config(&editor_config());
+        history
+            .add(history_entry(" whois secret.com"))
+            .expect("history add");
+        assert!(history.is_empty(), "leading-space line must not be saved");
+        history
+            .add(history_entry("whois public.com  "))
+            .expect("history add");
+        assert_eq!(history.len(), 1);
+    }
+
+    /// `seer --format json` with no subcommand used to start the REPL in the
+    /// config default, discarding the flag.
+    #[test]
+    fn explicit_format_carries_into_the_repl() {
+        let mut repl = Repl::new().expect("repl construction is offline");
+        repl.set_output_format(seer_core::output::OutputFormat::Json);
+        assert_eq!(
+            repl.context.output_format,
+            seer_core::output::OutputFormat::Json
+        );
+        assert!(repl.get_prompt().contains("[json]"));
+    }
+
+    /// Mistyped flags used to be silently ignored (`drift x --recrod` ran a
+    /// non-recording check). They now fail before any network I/O.
+    #[tokio::test]
+    async fn repl_rejects_unknown_flags_before_network() {
+        let mut repl = Repl::new().expect("repl construction is offline");
+        for line in [
+            "drift example.com --recrod",
+            "subdomains example.com --reslove",
+            "takeover example.com --hots a.example.com",
+            "follow example.com 5 MXX",
+        ] {
+            let result = repl.execute_line(line).await;
+            let CommandResult::Error(msg) = result else {
+                panic!("{line:?} should be rejected, got {result:?}");
+            };
+            assert!(
+                msg.contains("--recrod")
+                    || msg.contains("--reslove")
+                    || msg.contains("--hots")
+                    || msg.contains("MXX"),
+                "{line:?}: error should name the bad token: {msg}"
+            );
+        }
     }
 }
 

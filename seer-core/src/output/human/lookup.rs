@@ -174,7 +174,7 @@ impl HumanFormatter {
                 }
 
                 if let Some(expires) = data.expiration_date() {
-                    let days_until = (expires - chrono::Utc::now()).num_days();
+                    let days_until = days_until(expires);
                     let expiry_str = expires.format("%Y-%m-%d").to_string();
                     let status = self.format_expiry_status(&expiry_str, days_until);
                     output.push(format!("  {}: {}", self.label("Expires"), status));
@@ -397,11 +397,14 @@ impl HumanFormatter {
                     self.warning(source_note)
                 ));
 
+                // Error strings can carry upstream server text (e.g. an
+                // IANA-returned WHOIS server name), so sanitize like any
+                // other remote-sourced value.
                 if let Some(ref error) = rdap_error {
                     output.push(format!(
                         "  {}: {}",
                         self.label("RDAP Error"),
-                        self.error(error)
+                        self.error(&sanitize_display(error))
                     ));
                 }
 
@@ -552,7 +555,7 @@ impl HumanFormatter {
                 }
 
                 if let Some(expires) = data.expiration_date {
-                    let days_until = (expires - chrono::Utc::now()).num_days();
+                    let days_until = days_until(expires);
                     let expiry_str = expires.format("%Y-%m-%d").to_string();
                     let status = self.format_expiry_status(&expiry_str, days_until);
                     output.push(format!("  {}: {}", self.label("Expires"), status));
@@ -637,14 +640,14 @@ impl HumanFormatter {
                     output.push(format!(
                         "  {}: {}",
                         self.label("RDAP Error"),
-                        self.error(rdap_error)
+                        self.error(&sanitize_display(rdap_error))
                     ));
                 }
                 if !whois_error.is_empty() {
                     output.push(format!(
                         "  {}: {}",
                         self.label("WHOIS Error"),
-                        self.error(whois_error)
+                        self.error(&sanitize_display(whois_error))
                     ));
                 }
 
@@ -802,6 +805,41 @@ mod tests {
             "must not say MAY BE AVAILABLE:\n{}",
             out
         );
+    }
+
+    #[test]
+    fn format_lookup_sanitizes_protocol_error_strings() {
+        // rdap_error / whois_error can carry upstream server text (e.g. an
+        // IANA-returned WHOIS server name); they were printed raw while every
+        // adjacent value went through sanitize_display.
+        let evil = "connect to whois.evil\x1b]52;c;AAAA\x07\x1b[2J failed";
+        let whois = WhoisResponse::parse("example.com", "whois.test", "Registrar: R\n");
+        let whois_variant = LookupResult::Whois {
+            data: whois,
+            rdap_error: Some(evil.to_string()),
+            rdap_fallback: None,
+        };
+        let available_variant = LookupResult::Available {
+            data: Box::new(crate::availability::AvailabilityResult {
+                domain: "example.com".to_string(),
+                available: false,
+                confidence: "low".to_string(),
+                method: "none".to_string(),
+                details: None,
+            }),
+            rdap_error: evil.to_string(),
+            whois_error: evil.to_string(),
+            whois_data: None,
+        };
+        for result in [whois_variant, available_variant] {
+            let out = formatter().format_lookup(&result);
+            assert!(!out.contains('\x1b'), "ESC reached terminal: {out:?}");
+            assert!(!out.contains('\x07'), "BEL reached terminal: {out:?}");
+            assert!(
+                out.contains("connect to whois.evil failed"),
+                "error text kept: {out:?}"
+            );
+        }
     }
 
     #[test]

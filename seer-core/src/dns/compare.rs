@@ -69,7 +69,10 @@ impl DnsComparator {
         server_a: &str,
         server_b: &str,
     ) -> Result<DnsComparison> {
-        let domain = crate::validation::normalize_domain(domain)?;
+        // Same per-name normalization `resolve` applies, so the stored name
+        // matches what was queried: `www.` is kept, and an IPv6 PTR literal
+        // is passed through instead of being mangled as `host:port`.
+        let domain = crate::dns::resolver::prepare_query(domain, record_type)?;
 
         // Query both servers concurrently
         let (result_a, result_b) = tokio::join!(
@@ -111,16 +114,16 @@ impl DnsComparator {
             }
         };
 
-        // Compare record values case-insensitively. Two servers returning the
-        // same record with different casing (common with 0x20 query-name
-        // randomization, e.g. `NS1.EXAMPLE.COM.` vs `ns1.example.com.`) must be
-        // treated as equal, not a spurious mismatch.
+        // Compare record values on their comparison key: domain-name fields
+        // case-insensitively (two servers returning `NS1.EXAMPLE.COM.` vs
+        // `ns1.example.com.` under 0x20 randomization agree), case-sensitive
+        // data (TXT, DNSKEY) verbatim. See `RecordData::comparison_key`.
         let (values_equal, only_in_a, only_in_b) =
             compare_server_values(&server_a_result, &server_b_result);
 
-        // `common` is informational; build it case-insensitively too but emit
-        // the original-cased values from server A for display.
-        let mut common = case_insensitive_common(&server_a_result, &server_b_result);
+        // `common` is informational; build it on the same key but emit the
+        // original-cased values from server A for display.
+        let mut common = common_values(&server_a_result, &server_b_result);
         common.sort();
 
         let matches =
@@ -147,34 +150,28 @@ impl DnsComparator {
     }
 }
 
-/// Compares the record sets of two servers case-insensitively, returning
+/// Compares the record sets of two servers, returning
 /// `(values_equal, only_in_a, only_in_b)`. Each `only_in_*` entry is the
 /// original-cased `format_short()` value so display preserves what the server
-/// actually returned, but membership is decided on the lowercased key.
+/// actually returned, but membership is decided on
+/// [`RecordData::comparison_key`](crate::dns::RecordData::comparison_key)
+/// (domain names case-folded, case-sensitive data verbatim).
 fn compare_server_values(a: &ServerResult, b: &ServerResult) -> (bool, Vec<String>, Vec<String>) {
     use std::collections::HashSet;
 
-    let keys_a: HashSet<String> = a
-        .records
-        .iter()
-        .map(|r| r.format_short().to_ascii_lowercase())
-        .collect();
-    let keys_b: HashSet<String> = b
-        .records
-        .iter()
-        .map(|r| r.format_short().to_ascii_lowercase())
-        .collect();
+    let keys_a: HashSet<String> = a.records.iter().map(|r| r.data.comparison_key()).collect();
+    let keys_b: HashSet<String> = b.records.iter().map(|r| r.data.comparison_key()).collect();
 
     let mut only_in_a: Vec<String> = a
         .records
         .iter()
-        .filter(|r| !keys_b.contains(&r.format_short().to_ascii_lowercase()))
+        .filter(|r| !keys_b.contains(&r.data.comparison_key()))
         .map(|r| r.format_short())
         .collect();
     let mut only_in_b: Vec<String> = b
         .records
         .iter()
-        .filter(|r| !keys_a.contains(&r.format_short().to_ascii_lowercase()))
+        .filter(|r| !keys_a.contains(&r.data.comparison_key()))
         .map(|r| r.format_short())
         .collect();
     only_in_a.sort();
@@ -186,19 +183,15 @@ fn compare_server_values(a: &ServerResult, b: &ServerResult) -> (bool, Vec<Strin
     (values_equal, only_in_a, only_in_b)
 }
 
-/// Returns the values present (case-insensitively) on both servers, emitting
+/// Returns the values present (by comparison key) on both servers, emitting
 /// server A's original casing for each shared value.
-fn case_insensitive_common(a: &ServerResult, b: &ServerResult) -> Vec<String> {
+fn common_values(a: &ServerResult, b: &ServerResult) -> Vec<String> {
     use std::collections::HashSet;
-    let keys_b: HashSet<String> = b
-        .records
-        .iter()
-        .map(|r| r.format_short().to_ascii_lowercase())
-        .collect();
+    let keys_b: HashSet<String> = b.records.iter().map(|r| r.data.comparison_key()).collect();
     let mut seen: HashSet<String> = HashSet::new();
     let mut common = Vec::new();
     for r in &a.records {
-        let key = r.format_short().to_ascii_lowercase();
+        let key = r.data.comparison_key();
         if keys_b.contains(&key) && seen.insert(key) {
             common.push(r.format_short());
         }
@@ -305,5 +298,65 @@ mod tests {
             only_in_b.is_empty(),
             "no records unique to B: {only_in_b:?}"
         );
+    }
+
+    /// TXT data is case-sensitive: a verification token that differs only in
+    /// case between two servers is a real disagreement, not a 0x20 artefact.
+    /// (Case was previously folded for every record type.)
+    #[test]
+    fn compare_values_txt_case_difference_is_a_mismatch() {
+        let txt = |ns: &str, text: &str| ServerResult {
+            nameserver: ns.to_string(),
+            records: vec![DnsRecord {
+                name: "example.com".to_string(),
+                record_type: RecordType::TXT,
+                ttl: 300,
+                data: RecordData::TXT {
+                    text: text.to_string(),
+                },
+            }],
+            error: None,
+        };
+        let (matches, only_in_a, only_in_b) = compare_server_values(
+            &txt("8.8.8.8", "verify=AbCd"),
+            &txt("1.1.1.1", "verify=abcd"),
+        );
+        assert!(!matches);
+        assert_eq!(only_in_a, vec!["\"verify=AbCd\"".to_string()]);
+        assert_eq!(only_in_b, vec!["\"verify=abcd\"".to_string()]);
+    }
+
+    /// End to end against the mock fixture: `compare` must keep `www.` and
+    /// accept an IPv6 PTR literal, like `resolve` does. It previously ran
+    /// `normalize_domain`, which stripped `www.` (querying the apex) and
+    /// mangled `2606:4700:4700::1111` as `host:port`.
+    #[tokio::test]
+    async fn compare_uses_per_name_normalization() {
+        use crate::dns::test_support::{mock_dns_resolver, spawn_mock_dns, MockMode};
+
+        let port = spawn_mock_dns(MockMode::Zone).await;
+        let comparator = DnsComparator {
+            resolver: mock_dns_resolver(port),
+        };
+
+        let cmp = comparator
+            .compare("www.seer.test", RecordType::CNAME, "127.0.0.1", "127.0.0.1")
+            .await
+            .expect("compare www");
+        assert_eq!(cmp.domain, "www.seer.test");
+        assert!(cmp.matches);
+        assert_eq!(cmp.common, vec!["edge.cdn.test.".to_string()]);
+
+        let cmp = comparator
+            .compare(
+                "2606:4700:4700::1111",
+                RecordType::PTR,
+                "127.0.0.1",
+                "127.0.0.1",
+            )
+            .await
+            .expect("IPv6 PTR literal must be accepted");
+        assert_eq!(cmp.domain, "2606:4700:4700::1111");
+        assert_eq!(cmp.common, vec!["one.one.one.one.".to_string()]);
     }
 }

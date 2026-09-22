@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use seer_core::output::OutputFormat;
 use seer_core::RecordType;
 
@@ -50,6 +50,11 @@ pub struct App {
     fetch_gen: HashMap<&'static str, u64>,
     /// Committed in-lens `/`-filter per lens key (subdomains/history/propagation).
     lens_filter: HashMap<&'static str, String>,
+    /// The request each lens's cached state was last fetched for. The state
+    /// cache is keyed by lens only, so this is what tells `fetch_current` that
+    /// a cached result belongs to another sub-tab or an ad-hoc target
+    /// (`:rdap AS15169`, `:compare other.com …`) and must not be re-served.
+    last_req: HashMap<&'static str, FetchReq>,
 }
 
 impl App {
@@ -72,6 +77,7 @@ impl App {
             startup: Vec::new(),
             fetch_gen: HashMap::new(),
             lens_filter: HashMap::new(),
+            last_req: HashMap::new(),
         };
         if let Some(d) = domain {
             let actions = app.set_domain_and_fetch(&d);
@@ -139,10 +145,24 @@ impl App {
         *g
     }
 
-    /// Build a `Fetch` action with the current generation for staleness detection.
+    /// Build a `Fetch` action with a fresh generation for staleness detection.
+    /// Every dispatch marks its lens Loading (so explicit requests show a
+    /// spinner instead of the lens's idle hint) and records the request the
+    /// lens's state will belong to.
     fn fetch_action(&mut self, req: FetchReq) -> Action {
-        let gen = self.bump_fetch_gen(req.lens_key());
+        let key = req.lens_key();
+        let gen = self.bump_fetch_gen(key);
+        self.states.insert(key, LensState::Loading);
+        self.last_req.insert(key, req.clone());
         Action::Fetch { req, gen }
+    }
+
+    /// What the in-flight/last fetch for `lens` is querying (for the loading
+    /// indicator), if a request was recorded.
+    pub fn pending_target(&self, lens: usize) -> Option<String> {
+        self.last_req
+            .get(lenses::lenses()[lens].key)
+            .map(FetchReq::target)
     }
 
     /// Number of selectable rows in the current lens's loaded data.
@@ -169,14 +189,16 @@ impl App {
             return 0;
         };
         // Count the filtered rows so selection stays within the visible subset.
-        let filtered = crate::tui::filter::apply(data, &self.active_filter());
+        let filter = self.active_filter();
+        let filtered = crate::tui::filter::apply(data, &filter);
         let data = filtered.as_ref().unwrap_or(data);
         match data {
             LensData::Dns(r) => r.len(),
             LensData::Prop(p) => p.results.len(),
             LensData::Reverse(r) => r.len(),
             LensData::Watch(w) => w.results.len(),
-            LensData::History(e) => e.len(),
+            // Filtered by reference (entries are too heavy to clone per frame).
+            LensData::History(e) => crate::tui::filter::history_rows(e, &filter).count(),
             LensData::Subdomains(s) => s.subdomains.len(),
             // Only reported (non-safe) hosts are listed, so the selection
             // index space is the findings vec, not hosts_checked.
@@ -193,6 +215,11 @@ impl App {
         // A new target invalidates every cached lens.
         if self.domain.as_deref() != Some(normalized.as_str()) {
             self.states.clear();
+            self.last_req.clear();
+            // `:diff a b` / `:compare d …` overrides follow the session target
+            // only until it changes; the new target becomes domain A again.
+            self.panes.diff.a.clear();
+            self.panes.compare.domain = None;
             // Bump EVERY lens's generation, not just the current one's (which
             // fetch_current bumps below): an in-flight fetch on another lens,
             // started under the old domain, would otherwise still match its
@@ -237,24 +264,37 @@ impl App {
         if key == "history" {
             self.states.remove(key);
         }
-        // Cached (or in flight) for the current domain → revisiting is instant.
+        // Most lenses need a target; History/Watch are global views.
+        let want = match self.domain.clone() {
+            Some(domain) => self.default_req(key, &domain),
+            None => match key {
+                "history" => Some(FetchReq::History),
+                "watch" => Some(FetchReq::Watch),
+                _ => None,
+            },
+        };
+        // Cached (or in flight) for the current domain → revisiting is instant,
+        // unless the cache was produced for another sub-tab or target: lens
+        // switches reset the tab to 0, so e.g. a cached DNSSEC (tab 1) or
+        // `:rdap AS…` (tab 2) result would otherwise render under tab 0.
         if matches!(
             self.states.get(key),
             Some(LensState::Loaded(_) | LensState::Loading)
         ) {
-            return None;
+            let stale = self.last_req.get(key).is_some_and(|prev| {
+                prev.tab() != self.tab || want.as_ref().is_some_and(|w| w != prev)
+            });
+            if !stale {
+                return None;
+            }
+            // Drop the mismatched state, and invalidate any in-flight fetch
+            // for it even when no replacement request follows (e.g. RDAP
+            // domain tab with no session domain).
+            self.states.remove(key);
+            self.last_req.remove(key);
+            self.bump_fetch_gen(key);
         }
-        // Most lenses need a target; History/Watch are global views.
-        let req = match self.domain.clone() {
-            Some(domain) => self.default_req(key, &domain)?,
-            None => match key {
-                "history" => FetchReq::History,
-                "watch" => FetchReq::Watch,
-                _ => return None,
-            },
-        };
-        self.states.insert(key, LensState::Loading);
-        Some(self.fetch_action(req))
+        want.map(|req| self.fetch_action(req))
     }
 
     /// Default fetch request for a lens at `domain` (used by nav/number-jump).
@@ -275,14 +315,14 @@ impl App {
             "dns" => match self.tab {
                 1 => FetchReq::Dnssec(d),
                 2 => FetchReq::Compare {
-                    domain: d,
+                    domain: self.panes.compare.domain.clone().unwrap_or(d),
                     record_type: RecordType::A,
                     a: self.panes.compare.a.clone(),
                     b: self.panes.compare.b.clone(),
                 },
                 _ => FetchReq::Dns {
                     domain: d,
-                    record_type: RecordType::A,
+                    record_type: self.panes.dns.record_type,
                     nameserver: self.panes.dns.nameserver(),
                 },
             },
@@ -385,11 +425,15 @@ impl App {
                 if ok {
                     self.set_toast("ok", &format!("copied {label}"));
                 } else {
-                    // The failure label carries a caller-specific message (clipboard
-                    // unavailable, bulk file not found, CSV write failed, …), so it
-                    // is shown verbatim rather than assuming a clipboard error.
+                    // The failure label carries the handler's message (e.g.
+                    // clipboard unavailable), so it is shown verbatim. Non-copy
+                    // side effects (CSV writes, bulk file loads) use Msg::Toast.
                     self.set_toast("fail", &label);
                 }
+                vec![]
+            }
+            Msg::Toast { tone, msg } => {
+                self.set_toast(tone, &msg);
                 vec![]
             }
             Msg::FollowStep { gen, it } => {
@@ -441,6 +485,21 @@ impl App {
             InputMode::Command(buf) => return self.on_command_key(key, buf),
             InputMode::Field { target, buf } => return self.on_field_key(key, target, buf),
             InputMode::Normal => {}
+        }
+        // Normal-mode bindings are bare keys, and the pane handlers / keymap
+        // match on `key.code` alone — so Ctrl/Alt chords must stop here. In
+        // raw mode Ctrl-C arrives as `Char('c') + CONTROL`: unfiltered, a
+        // reflexive Ctrl-C on History wiped it (`c`), Ctrl-D removed a watched
+        // domain, Ctrl-R/Ctrl-E started/exported a bulk run. Ctrl-C gets the
+        // same quit hint as `q`; every other chord is ignored. (SHIFT is not
+        // a chord — `G` must still work — and neither is AltGr.)
+        if event::is_chord(&key) {
+            let ctrl_c =
+                key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
+            if ctrl_c {
+                return self.on_normal_action(KeyAction::QuitHint);
+            }
+            return vec![];
         }
         if self.help {
             if matches!(
@@ -535,9 +594,8 @@ impl App {
             }
             EditTarget::DiffB => {
                 self.panes.diff.b = value.to_lowercase();
-                match self.domain.clone() {
+                match self.panes.diff.effective_a(self.domain.as_deref()) {
                     Some(a) if !self.panes.diff.b.is_empty() => {
-                        self.states.remove("diff");
                         let b = self.panes.diff.b.clone();
                         let action = self.fetch_action(FetchReq::Diff { a, b });
                         vec![action]
@@ -560,9 +618,9 @@ impl App {
                 // Commit the filter, then load details for the first match so the
                 // detail panel reflects the new selection without an extra ↵.
                 self.panes.tld.set_filter(value);
-                self.states.remove("tld");
                 let cur = self.panes.tld.current();
                 if cur.is_empty() {
+                    self.states.remove("tld");
                     vec![]
                 } else {
                     vec![self.fetch_action(FetchReq::Tld(cur))]
@@ -664,10 +722,10 @@ impl App {
         let LensState::Loaded(data) = self.state_of(self.lens) else {
             return None;
         };
-        let filtered = crate::tui::filter::apply(data, &self.active_filter());
-        let data = filtered.as_ref().unwrap_or(data);
         if let LensData::History(entries) = data {
-            entries.get(self.sel).map(|e| e.domain.clone())
+            crate::tui::filter::history_rows(entries, &self.active_filter())
+                .nth(self.sel)
+                .map(|e| e.domain.clone())
         } else {
             None
         }
@@ -676,10 +734,8 @@ impl App {
     fn apply_pane_outcome(&mut self, outcome: PaneOutcome) -> Vec<Action> {
         match outcome {
             PaneOutcome::None => vec![],
-            PaneOutcome::Fetch(req) => {
-                self.states.remove(req.lens_key());
-                vec![self.fetch_action(req)]
-            }
+            // `fetch_action` marks the lens Loading (spinner, not idle hint).
+            PaneOutcome::Fetch(req) => vec![self.fetch_action(req)],
             PaneOutcome::Action(a) => vec![a],
             PaneOutcome::EditField(target) => {
                 let cur = self.panes.field_value(target);
@@ -774,8 +830,10 @@ impl App {
                     self.focus = Focus::Nav;
                     self.reset_tab();
                 }
+                // Keep A too: the pane's labels and its ↵ re-run must use the
+                // command's A, not the session domain.
+                self.panes.diff.a = a.clone();
                 self.panes.diff.b = b.clone();
-                self.states.remove("diff");
                 let action = self.fetch_action(FetchReq::Diff { a, b });
                 vec![action]
             }
@@ -786,9 +844,10 @@ impl App {
                     self.sel = 0;
                     self.focus = Focus::Nav;
                 }
-                self.panes.compare.a = a.clone();
-                self.panes.compare.b = b.clone();
-                self.states.remove("dns");
+                // Remember the domain (so `a`/`b` re-runs stay on it) and keep
+                // the cycling indices in sync with the given resolvers.
+                self.panes.compare.domain = Some(domain.clone());
+                self.panes.compare.set_servers(a.clone(), b.clone());
                 let action = self.fetch_action(FetchReq::Compare {
                     domain,
                     record_type: RecordType::A,
@@ -796,6 +855,37 @@ impl App {
                     b,
                 });
                 vec![action]
+            }
+            CmdOutcome::Dig {
+                domain,
+                record_type,
+            } => {
+                if let Some(i) = lenses::find_by_cmd_or_key("dns") {
+                    self.lens = i;
+                    self.sel = 0;
+                    self.focus = Focus::Nav;
+                    self.reset_tab();
+                }
+                // The Records tab's default request reads the type, so the
+                // cache check refetches when only the type changed.
+                self.panes.dns.record_type = record_type;
+                self.fetch_with(&domain)
+            }
+            CmdOutcome::WatchMutate { add, remove } => {
+                if let Some(i) = lenses::find_by_cmd_or_key("watch") {
+                    self.lens = i;
+                    self.sel = 0;
+                    self.focus = Focus::Nav;
+                    self.reset_tab();
+                }
+                // The mutation's refresh lands under this gen (see mod.rs).
+                let gen = self.bump_fetch_gen("watch");
+                self.states.insert("watch", LensState::Loading);
+                vec![Action::WatchMutate { add, remove, gen }]
+            }
+            CmdOutcome::Invalid(msg) => {
+                self.set_toast("fail", &msg);
+                vec![]
             }
             CmdOutcome::Unknown(c) => {
                 self.set_toast("fail", &format!("unknown command: {c}"));
@@ -817,30 +907,17 @@ impl App {
         // IP address?
         if target.parse::<std::net::IpAddr>().is_ok() {
             self.tab = 1;
-            self.states.remove("rdap");
             return vec![self.fetch_action(FetchReq::RdapIp(target.to_string()))];
         }
 
         // ASN? Match AS15169, as15169, or bare 15169.
-        let asn_digits: String = target
-            .trim_start_matches(|c: char| c.is_alphabetic())
-            .to_string();
-        if !asn_digits.is_empty()
-            && asn_digits.chars().all(|c| c.is_ascii_digit())
-            && target
-                .to_uppercase()
-                .starts_with(|c: char| c == 'A' || c.is_ascii_digit())
-        {
-            if let Ok(asn) = asn_digits.parse::<u32>() {
-                self.tab = 2;
-                self.states.remove("rdap");
-                return vec![self.fetch_action(FetchReq::RdapAsn(asn))];
-            }
+        if let Some(asn) = parse_asn(target) {
+            self.tab = 2;
+            return vec![self.fetch_action(FetchReq::RdapAsn(asn))];
         }
 
         // Default: domain lookup on tab 0.
         self.tab = 0;
-        self.states.remove("rdap");
         vec![self.fetch_action(FetchReq::RdapDomain(target.to_string()))]
     }
 
@@ -859,8 +936,7 @@ impl App {
         self.sel = 0;
         self.focus = Focus::Nav;
         self.reset_tab();
-        // Drop any cached TLD state so the newly selected slot is fetched.
-        self.states.remove("tld");
+        // `fetch_action` replaces any cached TLD state with Loading.
         vec![self.fetch_action(FetchReq::Tld(self.panes.tld.current()))]
     }
 
@@ -951,8 +1027,11 @@ impl App {
             KeyAction::EnterPane => {
                 // Allow entering interactive lenses even when row_count is 0 (they have
                 // in-pane controls that work without pre-loaded rows).
-                const INTERACTIVE_LENSES: &[&str] =
-                    &["tld", "diff", "compare", "follow", "bulk", "dns", "rdap"];
+                // "watch": with an empty watchlist there are no rows, yet `a`
+                // (add) is the pane's whole point.
+                const INTERACTIVE_LENSES: &[&str] = &[
+                    "tld", "diff", "compare", "follow", "bulk", "dns", "rdap", "watch",
+                ];
                 let lens_key = self.current_lens().key;
                 if self.row_count() > 0 || INTERACTIVE_LENSES.contains(&lens_key) {
                     self.focus = Focus::Pane;
@@ -1000,6 +1079,16 @@ impl App {
     /// Build a Copy action from the current lens's loaded output.
     fn copy_action(&mut self) -> Vec<Action> {
         let label = self.current_lens().label;
+        // History has no serialized form (the shared payload serializer
+        // yields a placeholder string), so copying would put that placeholder
+        // on the clipboard and still report success.
+        if self.current_lens().key == "history" {
+            self.set_toast(
+                "info",
+                "history can't be copied — ↵ replays an entry, then y copies it",
+            );
+            return vec![];
+        }
         match self.state_of(self.lens) {
             LensState::Loaded(data) => {
                 let fmt = if self.format == OutputFormat::Human {
@@ -1019,6 +1108,20 @@ impl App {
             }
         }
     }
+}
+
+/// Parse an ASN from `AS15169` / `as15169` / bare `15169`. Only a
+/// case-insensitive `AS` prefix is stripped, so domain-ish tokens such as
+/// `ab64496` or `apple123` are not mistaken for ASNs.
+fn parse_asn(target: &str) -> Option<u32> {
+    let digits = match target.get(..2) {
+        Some(prefix) if prefix.eq_ignore_ascii_case("as") => &target[2..],
+        _ => target,
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
 }
 
 #[cfg(test)]
@@ -1894,6 +1997,381 @@ mod tests {
         assert_eq!(app.theme().name, "frappe");
         assert!(!app.set_theme_by_name("nord"));
         assert_eq!(app.theme().name, "frappe", "failed swap keeps old theme");
+    }
+
+    // ---- Review-fix regressions ----
+
+    fn chord(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Vec<Action> {
+        app.update(Msg::Input(Event::Key(KeyEvent::new(code, mods))))
+    }
+
+    fn app_on_lens(domain: Option<&str>, lens: &str) -> App {
+        let mut app = App::new(domain.map(str::to_string));
+        let _ = app.take_startup_actions();
+        app.lens = lenses::find_by_cmd_or_key(lens).unwrap();
+        app
+    }
+
+    #[test]
+    fn ctrl_c_on_history_pane_shows_quit_hint_instead_of_clearing() {
+        let mut app = app_on_lens(None, "history");
+        app.focus = Focus::Pane;
+        app.states.insert("history", make_history_state("old.com"));
+        let actions = chord(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::HistoryClear { .. })),
+            "Ctrl-C must never clear history, got {actions:?}"
+        );
+        assert!(
+            matches!(&app.toast, Some(t) if t.msg.contains(":q")),
+            "Ctrl-C should show the same quit hint as `q`, got {:?}",
+            app.toast
+        );
+    }
+
+    #[test]
+    fn ctrl_and_alt_chords_never_reach_pane_handlers() {
+        // Watch: Ctrl-D must not remove the selected domain.
+        let mut app = app_on_watch_with_domain("example.com");
+        let actions = chord(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+        assert!(actions.is_empty(), "Ctrl-D on watch: {actions:?}");
+
+        // Bulk: Ctrl-R must not start a run, Alt-E must not overwrite the CSV.
+        let mut app = app_on_lens(None, "bulk");
+        app.focus = Focus::Pane;
+        app.panes.bulk.domains = "a.com".into();
+        let actions = chord(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL);
+        assert!(actions.is_empty() && !app.panes.bulk.running, "{actions:?}");
+        app.panes.bulk.rows.push(seer_core::bulk::BulkResult {
+            operation: seer_core::bulk::BulkOperation::Lookup {
+                domain: "a.com".into(),
+            },
+            success: true,
+            data: None,
+            error: None,
+            duration_ms: 1,
+        });
+        let actions = chord(&mut app, KeyCode::Char('e'), KeyModifiers::ALT);
+        assert!(actions.is_empty(), "Alt-E on bulk: {actions:?}");
+
+        // Follow: Ctrl-S must not start a run.
+        let mut app = app_on_lens(Some("example.com"), "follow");
+        app.focus = Focus::Pane;
+        let actions = chord(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+        assert!(
+            actions.is_empty() && !app.panes.follow.running,
+            "{actions:?}"
+        );
+    }
+
+    #[test]
+    fn shift_and_altgr_keys_keep_working_in_normal_mode() {
+        // `G` arrives with SHIFT; it must still jump to the last lens.
+        let mut app = App::new(None);
+        chord(&mut app, KeyCode::Char('G'), KeyModifiers::SHIFT);
+        assert_eq!(app.lens, lenses::lenses().len() - 1);
+        // `]` typed with AltGr (CONTROL|ALT on Windows) still switches tabs.
+        let mut app = app_on_lens(None, "rdap");
+        chord(
+            &mut app,
+            KeyCode::Char(']'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        );
+        assert_eq!(app.tab, 1);
+    }
+
+    #[test]
+    fn dns_revisit_does_not_serve_dnssec_cache_under_records_tab() {
+        let mut app = App::new(Some("example.com".into()));
+        let _ = app.take_startup_actions();
+        let first = key(&mut app, KeyCode::Char('7')); // DNS · Records
+        let gen = first
+            .iter()
+            .find_map(|a| match a {
+                Action::Fetch { gen, .. } => Some(*gen),
+                _ => None,
+            })
+            .expect("records fetch");
+        app.update(Msg::Data {
+            lens: "dns".into(),
+            gen,
+            result: Ok(LensData::Dns(vec![])),
+        });
+        let dnssec = key(&mut app, KeyCode::Char(']')); // DNSSEC tab
+        assert!(dnssec.iter().any(|a| matches!(
+            a,
+            Action::Fetch {
+                req: FetchReq::Dnssec(_),
+                ..
+            }
+        )));
+        // Pressing 7 again resets to tab 0: the cached DNSSEC state must not
+        // be served there (it rendered blank); Records are refetched.
+        let again = key(&mut app, KeyCode::Char('7'));
+        assert_eq!(app.tab, 0);
+        assert!(
+            again.iter().any(|a| matches!(
+                a,
+                Action::Fetch {
+                    req: FetchReq::Dns { .. },
+                    ..
+                }
+            )),
+            "expected a Records refetch, got {again:?}"
+        );
+    }
+
+    #[test]
+    fn rdap_asn_cache_is_not_served_on_the_domain_tab() {
+        let rdap = |app: &mut App, gen| {
+            let r: seer_core::RdapResponse = serde_json::from_str("{}").unwrap();
+            app.update(Msg::Data {
+                lens: "rdap".into(),
+                gen,
+                result: Ok(LensData::Rdap(Box::new(r))),
+            });
+        };
+        let gen_of = |actions: &[Action]| {
+            actions.iter().find_map(|a| match a {
+                Action::Fetch { gen, .. } => Some(*gen),
+                _ => None,
+            })
+        };
+
+        // With a session domain: the revisit refetches the domain object.
+        let mut app = App::new(Some("example.com".into()));
+        let _ = app.take_startup_actions();
+        let asn = app.exec_command("rdap AS15169");
+        rdap(&mut app, gen_of(&asn).unwrap());
+        key(&mut app, KeyCode::Char('j'));
+        let back = key(&mut app, KeyCode::Char('k'));
+        assert_eq!(app.tab, 0);
+        assert!(
+            back.iter().any(|a| matches!(
+                a,
+                Action::Fetch { req: FetchReq::RdapDomain(d), .. } if d == "example.com"
+            )),
+            "expected RdapDomain refetch, got {back:?}"
+        );
+
+        // Without one: nothing to refetch, but the ASN object must not render
+        // as the Domain tab's data.
+        let mut app = App::new(None);
+        let asn = app.exec_command("rdap AS15169");
+        rdap(&mut app, gen_of(&asn).unwrap());
+        key(&mut app, KeyCode::Char('j'));
+        key(&mut app, KeyCode::Char('k'));
+        let idx = lenses::find_by_cmd_or_key("rdap").unwrap();
+        assert!(
+            matches!(app.state_of(idx), LensState::Idle),
+            "stale ASN object served under the Domain tab"
+        );
+    }
+
+    #[test]
+    fn follow_interval_field_opens_empty_so_typing_replaces() {
+        let mut app = app_on_lens(Some("example.com"), "follow");
+        app.focus = Focus::Pane;
+        key(&mut app, KeyCode::Char('i'));
+        assert!(
+            matches!(&app.input_mode, InputMode::Field { target: EditTarget::FollowInterval, buf } if buf.as_str().is_empty()),
+            "got {:?}",
+            app.input_mode
+        );
+        key(&mut app, KeyCode::Char('6'));
+        key(&mut app, KeyCode::Char('0'));
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.panes.follow.interval_secs, 60,
+            "was 3060 when prefilled"
+        );
+    }
+
+    #[test]
+    fn watch_subcommands_do_not_clobber_the_session_domain() {
+        let mut app = App::new(Some("example.com".into()));
+        let _ = app.take_startup_actions();
+        let actions = app.exec_command("watch add example.org");
+        assert_eq!(app.domain.as_deref(), Some("example.com"));
+        assert_eq!(app.lens, watch_lens_idx());
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::WatchMutate { add: Some(d), remove: None, .. } if d == "example.org"
+            )),
+            "got {actions:?}"
+        );
+
+        for line in ["history clear", "bulk file.txt", "watch frob"] {
+            app.toast = None;
+            let actions = app.exec_command(line);
+            assert!(actions.is_empty(), "{line}: {actions:?}");
+            assert_eq!(app.domain.as_deref(), Some("example.com"), "{line}");
+            assert!(matches!(&app.toast, Some(t) if t.tone == "fail"), "{line}");
+        }
+    }
+
+    #[test]
+    fn explicit_requests_mark_the_lens_loading() {
+        let mut app = App::new(None);
+        let _ = app.rdap_command("8.8.8.8");
+        let idx = lenses::find_by_cmd_or_key("rdap").unwrap();
+        assert!(
+            matches!(app.state_of(idx), LensState::Loading),
+            "`:rdap <ip>` must show a spinner, not the idle hint"
+        );
+        assert_eq!(app.pending_target(idx).as_deref(), Some("8.8.8.8"));
+
+        let _ = app.exec_command("diff a.com b.com");
+        let idx = lenses::find_by_cmd_or_key("diff").unwrap();
+        assert!(matches!(app.state_of(idx), LensState::Loading));
+    }
+
+    #[test]
+    fn diff_command_domain_a_drives_the_pane_rerun() {
+        let mut app = App::new(Some("example.com".into()));
+        let _ = app.take_startup_actions();
+        let _ = app.exec_command("diff a.com b.com");
+        assert_eq!(app.panes.diff.a, "a.com");
+        app.focus = Focus::Pane;
+        let actions = key(&mut app, KeyCode::Enter);
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::Fetch { req: FetchReq::Diff { a, b }, .. } if a == "a.com" && b == "b.com"
+            )),
+            "↵ must re-run a.com ⇄ b.com, got {actions:?}"
+        );
+        // A new session target resets A to follow it again.
+        let _ = app.set_domain_and_fetch("new.com");
+        assert!(app.panes.diff.a.is_empty());
+    }
+
+    #[test]
+    fn compare_command_domain_drives_resolver_cycling() {
+        let mut app = App::new(Some("example.com".into()));
+        let _ = app.take_startup_actions();
+        let _ = app.exec_command("compare other.com 9.9.9.9 8.8.4.4");
+        app.focus = Focus::Pane;
+        let actions = key(&mut app, KeyCode::Char('b'));
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::Fetch { req: FetchReq::Compare { domain, a, .. }, .. }
+                    if domain == "other.com" && a == "9.9.9.9"
+            )),
+            "`b` must re-run against other.com, got {actions:?}"
+        );
+    }
+
+    #[test]
+    fn dig_command_carries_the_record_type() {
+        let mut app = App::new(Some("example.com".into()));
+        let _ = app.take_startup_actions();
+        let actions = app.exec_command("dig example.com MX");
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::Fetch {
+                    req: FetchReq::Dns {
+                        record_type: RecordType::MX,
+                        ..
+                    },
+                    ..
+                }
+            )),
+            "got {actions:?}"
+        );
+        let actions = app.exec_command("dig example.com BOGUS");
+        assert!(actions.is_empty());
+        assert!(matches!(&app.toast, Some(t) if t.tone == "fail" && t.msg.contains("BOGUS")));
+    }
+
+    #[test]
+    fn side_effect_toasts_are_shown_verbatim() {
+        let mut app = App::new(None);
+        app.update(Msg::Toast {
+            tone: "ok",
+            msg: "wrote seer-bulk-lookup.csv".into(),
+        });
+        assert!(
+            matches!(&app.toast, Some(t) if t.msg == "wrote seer-bulk-lookup.csv"),
+            "was \"copied wrote …\", got {:?}",
+            app.toast
+        );
+    }
+
+    #[test]
+    fn enter_focuses_an_empty_watchlist_so_add_is_reachable() {
+        let mut app = app_on_lens(None, "watch");
+        app.states.insert(
+            "watch",
+            LensState::Loaded(LensData::Watch(Box::new(seer_core::WatchReport {
+                checked_at: chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0).unwrap(),
+                results: vec![],
+                total: 0,
+                warnings: 0,
+                critical: 0,
+            }))),
+        );
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.focus, Focus::Pane);
+        key(&mut app, KeyCode::Char('a'));
+        assert!(matches!(
+            app.input_mode,
+            InputMode::Field {
+                target: EditTarget::WatchAdd,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn rdap_asn_detection_only_strips_an_as_prefix() {
+        assert_eq!(parse_asn("AS15169"), Some(15169));
+        assert_eq!(parse_asn("as15169"), Some(15169));
+        assert_eq!(parse_asn("15169"), Some(15169));
+        assert_eq!(parse_asn("ab64496"), None);
+        assert_eq!(parse_asn("apple123"), None);
+        assert_eq!(parse_asn("AS"), None);
+        let mut app = App::new(None);
+        let actions = app.rdap_command("apple123");
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::Fetch { req: FetchReq::RdapDomain(d), .. } if d == "apple123"
+            )),
+            "got {actions:?}"
+        );
+    }
+
+    #[test]
+    fn copy_refuses_history_instead_of_copying_a_placeholder() {
+        let mut app = app_on_lens(None, "history");
+        app.states.insert("history", make_history_state("old.com"));
+        let actions = key(&mut app, KeyCode::Char('y'));
+        assert!(
+            !actions.iter().any(|a| matches!(a, Action::Copy { .. })),
+            "got {actions:?}"
+        );
+        assert!(matches!(&app.toast, Some(t) if t.tone != "ok"));
+    }
+
+    #[test]
+    fn history_filter_counts_by_reference() {
+        let mut app = app_on_lens(None, "history");
+        let data = LensData::History(vec![
+            make_history_entry("alpha.com"),
+            make_history_entry("beta.com"),
+        ]);
+        // History is never deep-cloned by the generic filter...
+        assert!(crate::tui::filter::apply(&data, "beta").is_none());
+        app.states.insert("history", LensState::Loaded(data));
+        let _ = app.apply_field(EditTarget::LensFilter, "beta".into());
+        // ...yet the visible-row count still reflects the filter.
+        assert_eq!(app.row_count(), 1);
     }
 
     #[test]

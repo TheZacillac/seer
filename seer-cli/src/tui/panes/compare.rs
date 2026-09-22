@@ -17,6 +17,9 @@ pub struct CompareState {
     pub a: String,
     /// String representation kept in sync with `b_idx`.
     pub b: String,
+    /// Domain set by `:compare <domain> …`; `None` compares the session
+    /// domain. Reset when the session domain changes.
+    pub domain: Option<String>,
 }
 
 impl Default for CompareState {
@@ -26,11 +29,35 @@ impl Default for CompareState {
             b_idx: 1,
             a: RESOLVERS[0].to_string(),
             b: RESOLVERS[1].to_string(),
+            domain: None,
         }
     }
 }
 
+/// Pool index for a resolver string. A custom resolver (not in the pool) maps
+/// to the last slot, so the next `a`/`b` press cycles to the pool's first.
+fn pool_idx(server: &str) -> usize {
+    RESOLVERS
+        .iter()
+        .position(|r| *r == server)
+        .unwrap_or(RESOLVERS.len() - 1)
+}
+
 impl CompareState {
+    /// Set both resolvers (e.g. from `:compare`), keeping the cycling indices
+    /// in sync with the strings.
+    pub fn set_servers(&mut self, a: String, b: String) {
+        self.a_idx = pool_idx(&a);
+        self.b_idx = pool_idx(&b);
+        self.a = a;
+        self.b = b;
+    }
+
+    /// The domain being compared: the `:compare` override, else `session`.
+    pub fn effective_domain(&self, session: Option<&str>) -> Option<String> {
+        self.domain.clone().or_else(|| session.map(str::to_string))
+    }
+
     fn build_fetch(&self, domain: &str) -> PaneOutcome {
         PaneOutcome::Fetch(FetchReq::Compare {
             domain: domain.to_string(),
@@ -43,7 +70,8 @@ impl CompareState {
     /// Handle a key event. Consumes only `a` (cycle resolver A) and `b`
     /// (cycle resolver B). Returns `None` for every other key.
     pub fn handle_key(&mut self, key: KeyEvent, domain: Option<&str>) -> Option<PaneOutcome> {
-        let domain = domain?;
+        let domain = self.effective_domain(domain)?;
+        let domain = domain.as_str();
         match key.code {
             KeyCode::Char('a') => {
                 self.a_idx = (self.a_idx + 1) % RESOLVERS.len();
@@ -126,6 +154,27 @@ mod tests {
         assert!(state
             .handle_key(press(KeyCode::Char('l')), Some("x.com"))
             .is_none());
+    }
+
+    #[test]
+    fn command_domain_and_servers_drive_later_cycling() {
+        let mut state = CompareState {
+            domain: Some("other.com".into()),
+            ..Default::default()
+        };
+        state.set_servers("9.9.9.9".into(), "8.8.4.4".into());
+        assert_eq!(state.a_idx, 2, "pool resolver syncs its index");
+        let outcome = state.handle_key(press(KeyCode::Char('b')), Some("session.com"));
+        // Custom B (not in the pool) cycles to the pool's first entry, and the
+        // re-run stays on the :compare domain, not the session domain.
+        assert!(
+            matches!(
+                outcome,
+                Some(PaneOutcome::Fetch(FetchReq::Compare { ref domain, ref a, ref b, .. }))
+                    if domain == "other.com" && a == "9.9.9.9" && b == RESOLVERS[0]
+            ),
+            "got {outcome:?}"
+        );
     }
 
     #[test]

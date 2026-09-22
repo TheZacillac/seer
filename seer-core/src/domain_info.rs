@@ -124,6 +124,13 @@ pub fn describe_epp_status(code: &str) -> Option<&'static str> {
     Some(desc)
 }
 
+/// Whole days from `now` until `when` — see [`crate::dates::days_until`]:
+/// negative for any instant in the past, so a domain that expired ten hours
+/// ago bands as Expired rather than "expiring soon" (truncation gave `0`).
+fn days_until(when: DateTime<Utc>, now: DateTime<Utc>) -> i64 {
+    crate::dates::days_until(when, now)
+}
+
 /// Derives a coarse [`ExpiryStatus`] band from the days-until-expiration and the
 /// domain's status codes. Status codes take priority: a `pendingDelete` or
 /// `redemptionPeriod` state describes the lifecycle better than the raw date.
@@ -425,7 +432,7 @@ impl DomainInfo {
     /// `domain_age_days`, `expiry_status`, `status_descriptions`) relative to
     /// `now`. Pure given `now`, so it is unit-testable with a fixed clock.
     fn compute_lifecycle(&mut self, now: DateTime<Utc>) {
-        self.days_until_expiration = self.expiration_date.map(|e| (e - now).num_days());
+        self.days_until_expiration = self.expiration_date.map(|e| days_until(e, now));
         self.domain_age_days = self.creation_date.map(|c| (now - c).num_days());
         self.expiry_status = derive_expiry_status(self.days_until_expiration, &self.status);
         self.status_descriptions = self
@@ -461,8 +468,16 @@ impl DomainInfo {
                 rdap_fallback.as_ref().map(|b| b.as_ref()),
                 Some(data),
             ),
-            LookupResult::Available { data, .. } => {
-                let mut info = Self::from_sources(&data.domain, None, None);
+            LookupResult::Available {
+                data, whois_data, ..
+            } => {
+                // When the verdict is "not available" (registered via DNS
+                // presence, inconclusive, ...), whatever WHOIS returned is
+                // real, if partial, registration data — merge it rather than
+                // discarding it. For an available verdict the WHOIS body is
+                // a "no match" banner with nothing worth surfacing.
+                let whois = whois_data.as_ref().filter(|_| !data.available);
+                let mut info = Self::from_sources(&data.domain, None, whois);
                 info.source = DomainInfoSource::Available;
                 info.availability_verdict = Some(data.verdict().to_string());
                 info
@@ -515,7 +530,7 @@ mod tests {
                     "ldhName": "ns1.rdap-example.com"
                 }
             ],
-            "secureDns": {
+            "secureDNS": {
                 "delegationSigned": true,
                 "dsData": [],
                 "keyData": []
@@ -889,5 +904,70 @@ mod tests {
 
         // Verify source serializes as lowercase
         assert!(json.contains("\"source\": \"both\""));
+    }
+
+    #[test]
+    fn days_until_is_negative_for_a_just_expired_domain() {
+        use chrono::TimeZone;
+        let now = Utc.with_ymd_and_hms(2026, 1, 10, 12, 0, 0).unwrap();
+        let hours = |h: i64| now + chrono::TimeDelta::hours(h);
+        assert_eq!(days_until(hours(-10), now), -1);
+        assert_eq!(days_until(hours(10), now), 0);
+        assert_eq!(days_until(hours(-48), now), -2);
+        assert_eq!(days_until(hours(-49), now), -2);
+        assert_eq!(days_until(hours(49), now), 2);
+
+        // Expired ten hours ago: previously truncated to 0 days, which
+        // banded as ExpiringSoon.
+        let mut whois = make_test_whois();
+        whois.expiration_date = Some(hours(-10));
+        let mut info = DomainInfo::from_sources("example.com", None, Some(&whois));
+        info.compute_lifecycle(now);
+        assert_eq!(info.days_until_expiration, Some(-1));
+        assert_eq!(info.expiry_status, Some(ExpiryStatus::Expired));
+
+        // Ten hours still to go is expiring soon, not expired.
+        whois.expiration_date = Some(hours(10));
+        let mut info = DomainInfo::from_sources("example.com", None, Some(&whois));
+        info.compute_lifecycle(now);
+        assert_eq!(info.days_until_expiration, Some(0));
+        assert_eq!(info.expiry_status, Some(ExpiryStatus::ExpiringSoon));
+    }
+
+    fn available_lookup(available: bool, confidence: &str, method: &str) -> LookupResult {
+        LookupResult::Available {
+            data: Box::new(crate::availability::AvailabilityResult {
+                domain: "example.com".to_string(),
+                available,
+                confidence: confidence.to_string(),
+                method: method.to_string(),
+                details: None,
+            }),
+            rdap_error: String::new(),
+            whois_error: String::new(),
+            whois_data: Some(make_test_whois()),
+        }
+    }
+
+    #[test]
+    fn from_lookup_result_merges_whois_data_for_unavailable_verdicts() {
+        // A registered-via-DNS (or inconclusive) verdict still carries real
+        // WHOIS data; `seer info`, bulk CSV, drift and confusables need it.
+        let info = DomainInfo::from_lookup_result(&available_lookup(false, "high", "dns_present"));
+        assert_eq!(info.source, DomainInfoSource::Available);
+        assert_eq!(info.availability_verdict.as_deref(), Some("registered"));
+        assert_eq!(
+            info.nameservers,
+            vec!["ns1.whois-example.com", "ns2.whois-example.com"]
+        );
+        assert_eq!(info.status, vec!["clientTransferProhibited"]);
+        assert_eq!(info.whois_server.as_deref(), Some("whois.example.com"));
+
+        // An available verdict's WHOIS body is a no-match banner: not merged.
+        let info = DomainInfo::from_lookup_result(&available_lookup(true, "high", "whois"));
+        assert_eq!(info.availability_verdict.as_deref(), Some("available"));
+        assert!(info.nameservers.is_empty());
+        assert!(info.registrar.is_none());
+        assert!(info.whois_server.is_none());
     }
 }

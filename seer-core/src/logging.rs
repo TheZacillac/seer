@@ -67,10 +67,34 @@ where
     let json_mode = log_format == "json";
 
     // Build file appender layer if enabled
-    let (file_layer_json, file_layer_text, file_guard) = if file_enabled {
+    // `tracing_appender::rolling::daily` panics ("initializing rolling file
+    // appender failed") when the directory can't be created or written, which
+    // took down every invocation — even `--help` — on a read-only home or an
+    // unwritable ARCANUM_LOG_DIR. The builder reports that as an error
+    // instead: warn once and carry on with console logging only.
+    let file_appender = if file_enabled {
         let dir = log_dir();
         ensure_log_dir(&dir);
-        let file_appender = tracing_appender::rolling::daily(&dir, format!("{app_name}.log"));
+        match tracing_appender::rolling::RollingFileAppender::builder()
+            .rotation(tracing_appender::rolling::Rotation::DAILY)
+            .filename_prefix(format!("{app_name}.log"))
+            .build(&dir)
+        {
+            Ok(appender) => Some(appender),
+            Err(e) => {
+                eprintln!(
+                    "warning: file logging disabled — cannot write to {}: {e}",
+                    dir.display()
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let (file_layer_json, file_layer_text, file_guard) = if let Some(file_appender) = file_appender
+    {
         let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
         if json_mode {

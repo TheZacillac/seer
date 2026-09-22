@@ -87,9 +87,11 @@ impl PropagationChecker {
     pub async fn check(&self, domain: &str, record_type: RecordType) -> Result<PropagationResult> {
         // Normalize once up front so the stored `domain` field agrees with what
         // every per-server query actually resolves, instead of echoing the raw
-        // input and re-normalizing ~29 times lazily inside the resolver. (The
-        // DNSSEC checker already normalizes this way.)
-        let domain = crate::validation::normalize_domain(domain)?;
+        // input and re-normalizing ~29 times lazily inside the resolver. Uses
+        // the resolver's own per-name rule (`prepare_query`): `www.` is kept
+        // (it is a distinct name with its own records) and an IPv6 PTR literal
+        // passes through instead of being mangled as `host:port`.
+        let domain = crate::dns::resolver::prepare_query(domain, record_type)?;
 
         // An SRV query needs a `_service._proto.name` query name. A bare domain
         // is a deterministic input error: without this guard it fails identically
@@ -382,13 +384,27 @@ mod tests {
             .check("HTTPS://WWW.Example.COM/some/path", RecordType::A)
             .await
             .expect("check with empty server list should succeed");
+        // `www.` is kept: it is a distinct DNS name (commonly a CNAME), and
+        // stripping it checked propagation of the apex instead.
         assert_eq!(
-            result.domain, "example.com",
+            result.domain, "www.example.com",
             "stored domain must be the normalized form, not the raw input"
         );
         // Sanity: with no servers, nothing was queried.
         assert_eq!(result.servers_checked, 0);
         assert_eq!(result.servers_responding, 0);
+    }
+
+    /// An IPv6 PTR literal must be accepted (it used to fail
+    /// `normalize_domain`, whose `:port` strip ate the last hextet).
+    #[tokio::test]
+    async fn check_accepts_ipv6_ptr_literal() {
+        let checker = PropagationChecker::empty_for_tests();
+        let result = checker
+            .check("2606:4700:4700::1111", RecordType::PTR)
+            .await
+            .expect("IPv6 PTR literal must pass normalization");
+        assert_eq!(result.domain, "2606:4700:4700::1111");
     }
 
     /// An SRV query against a bare domain is a deterministic input error, not a

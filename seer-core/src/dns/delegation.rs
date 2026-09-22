@@ -45,7 +45,7 @@ use std::collections::BTreeSet;
 use std::net::IpAddr;
 use std::time::Duration;
 
-use hickory_resolver::config::{NameServerConfig, ResolveHosts, ResolverConfig, GOOGLE};
+use hickory_resolver::config::{NameServerConfig, ResolverConfig, ResolverOpts, GOOGLE};
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use hickory_resolver::net::{DnsError, NetError};
 use hickory_resolver::proto::op::ResponseCode;
@@ -54,6 +54,7 @@ use hickory_resolver::TokioResolver;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, instrument};
 
+use crate::dns::apply_standard_opts;
 use crate::error::{Result, SeerError};
 use crate::validation::normalize_domain;
 
@@ -553,15 +554,7 @@ impl DelegationChecker {
 
         let mut builder =
             TokioResolver::builder_with_config(config, TokioRuntimeProvider::default());
-        {
-            let opts = builder.options_mut();
-            opts.timeout = self.timeout;
-            opts.attempts = 2;
-            opts.use_hosts_file = ResolveHosts::Never;
-            // Delegation data must come from the server's own authority, not
-            // from recursion or a forwarder's cache.
-            opts.recursion_desired = false;
-        }
+        apply_direct_opts(builder.options_mut(), self.timeout);
         builder
             .build()
             .map_err(|e| SeerError::DnsError(format!("failed to construct DNS resolver: {}", e)))
@@ -618,6 +611,16 @@ fn outcome_for_direct(direct: DirectNs) -> ProbeOutcome {
     }
 }
 
+/// Options for a direct (RD=0) query to one server: the shared option set
+/// (timeout, attempts, no hosts file, pinned server order — hand-copied here
+/// it had drifted and lacked the ordering) with recursion disabled, since
+/// delegation data must come from the server's own authority, not from
+/// recursion or a forwarder's cache.
+fn apply_direct_opts(opts: &mut ResolverOpts, timeout: Duration) {
+    apply_standard_opts(opts, timeout);
+    opts.recursion_desired = false;
+}
+
 /// Builds the recursive resolver: Google DNS (UDP+TCP) in production, or a
 /// pinned loopback upstream for the `#[cfg(test)]` seam.
 ///
@@ -639,12 +642,10 @@ fn build_recursive_resolver(timeout: Duration, upstream: Option<(IpAddr, u16)>) 
         }
     };
     let mut builder = TokioResolver::builder_with_config(config, TokioRuntimeProvider::default());
-    {
-        let opts = builder.options_mut();
-        opts.timeout = timeout;
-        opts.attempts = 2;
-        opts.use_hosts_file = ResolveHosts::Never;
-    }
+    // Shared with the main resolver so the option sets cannot drift: the
+    // hand-copied version here lacked the pinned `UserProvidedOrder` server
+    // ordering, so parent-NS discovery could draw black-holed IPv6 upstreams.
+    apply_standard_opts(builder.options_mut(), timeout);
     builder
         .build()
         .expect("plain UDP/TCP resolver build cannot fail with the bundled webpki root store")
@@ -744,16 +745,23 @@ fn normalize_ns_name(name: &str) -> String {
 /// Extracts the normalized NS target names owned by `owner` from a record
 /// slice (answer or authority section). Records for other owners — e.g. the
 /// parent zone's own SOA in a NODATA response — are ignored.
+///
+/// Names are rendered with `to_ascii()`, never `to_string()`: hickory's
+/// `Display` decodes `xn--` labels to Unicode, so for every IDN the owner
+/// (`münchen.de.`) never equalled the punycode `owner` from
+/// `normalize_domain` (`xn--mnchen-3ya.de`). Every IDN domain came back with
+/// an empty delegation ("not delegated"), and IDN TLDs hard-errored on an
+/// empty parent NS set.
 fn ns_targets_for(records: &[Record], owner: &str) -> Vec<String> {
     let owner = normalize_ns_name(owner);
     records
         .iter()
         .filter_map(|record| {
-            if normalize_ns_name(&record.name.to_string()) != owner {
+            if normalize_ns_name(&record.name.to_ascii()) != owner {
                 return None;
             }
             match &record.data {
-                HickoryRData::NS(ns) => Some(normalize_ns_name(&ns.0.to_string())),
+                HickoryRData::NS(ns) => Some(normalize_ns_name(&ns.0.to_ascii())),
                 _ => None,
             }
         })
@@ -791,6 +799,62 @@ mod tests {
         assert_eq!(parent_zone_of("example.com"), "com");
         assert_eq!(parent_zone_of("sub.example.co.uk"), "example.co.uk");
         assert_eq!(parent_zone_of("example.co.uk"), "co.uk");
+    }
+
+    #[test]
+    fn direct_opts_share_the_standard_set_and_disable_recursion() {
+        // Regression: the hand-copied option set lacked the pinned
+        // `UserProvidedOrder` server ordering.
+        let mut opts = ResolverOpts::default();
+        apply_direct_opts(&mut opts, Duration::from_secs(7));
+        assert_eq!(
+            opts.server_ordering_strategy,
+            hickory_resolver::config::ServerOrderingStrategy::UserProvidedOrder
+        );
+        assert_eq!(opts.timeout, Duration::from_secs(7));
+        assert!(!opts.recursion_desired);
+    }
+
+    #[test]
+    fn ns_targets_match_idn_owners_in_punycode() {
+        // Regression: owners were compared via `Name`'s Display, which
+        // renders `xn--` labels as Unicode, so this punycode owner (what
+        // `normalize_domain("münchen.de")` produces) matched nothing.
+        let owner = Name::from_ascii("xn--mnchen-3ya.de.").unwrap();
+        let records = vec![
+            Record::from_rdata(
+                owner.clone(),
+                300,
+                HickoryRData::NS(wire::NS(
+                    Name::from_ascii("ns1.xn--mnchen-3ya.de.").unwrap(),
+                )),
+            ),
+            Record::from_rdata(
+                owner,
+                300,
+                HickoryRData::NS(wire::NS(Name::from_ascii("NS2.Example.NET.").unwrap())),
+            ),
+        ];
+        let mut targets = ns_targets_for(&records, "xn--mnchen-3ya.de");
+        targets.sort();
+        assert_eq!(
+            targets,
+            vec![
+                "ns1.xn--mnchen-3ya.de".to_string(),
+                "ns2.example.net".to_string()
+            ]
+        );
+        // An IDN TLD (`рф` = `xn--p1ai`) as the owner, for the parent-zone
+        // NS lookup path.
+        let tld = vec![Record::from_rdata(
+            Name::from_ascii("xn--p1ai.").unwrap(),
+            300,
+            HickoryRData::NS(wire::NS(Name::from_ascii("a.dns.ripn.net.").unwrap())),
+        )];
+        assert_eq!(
+            ns_targets_for(&tld, "xn--p1ai"),
+            vec!["a.dns.ripn.net".to_string()]
+        );
     }
 
     #[test]

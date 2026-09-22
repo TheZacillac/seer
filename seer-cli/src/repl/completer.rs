@@ -227,7 +227,10 @@ impl Hinter for SeerCompleter {
                 Some(" <domain> [type] @<server1> @<server2>".to_string())
             }
             "subdomains" | "subs" if words.len() == 1 && line.ends_with(' ') => {
-                Some(" <domain> [--diff] [--record]".to_string())
+                Some(" <domain> [--resolve | --diff] [--record]".to_string())
+            }
+            "takeover" if words.len() == 1 && line.ends_with(' ') => {
+                Some(" <domain> [--host <host>]...".to_string())
             }
             "diff" if words.len() == 1 && line.ends_with(' ') => {
                 Some(" <domain1> <domain2>".to_string())
@@ -235,7 +238,7 @@ impl Hinter for SeerCompleter {
             "drift" if words.len() == 1 && line.ends_with(' ') => {
                 Some(" <domain> [--record]".to_string())
             }
-            "caa" | "posture" | "confusables" | "headers" | "takeover"
+            "caa" | "posture" | "confusables" | "headers"
                 if words.len() == 1 && line.ends_with(' ') =>
             {
                 Some(" <domain>".to_string())

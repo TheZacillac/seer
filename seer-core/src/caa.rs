@@ -280,9 +280,10 @@ fn ca_value_matches_issuer(caa_value: &str, issuer_lc: &str) -> bool {
     }
     // 2. Curated aliases for well-known CAs — preferred over the generic base
     //    fallback so a precise mapping wins (e.g. "ssl.com" -> "ssl.com",
-    //    never bare "ssl").
+    //    never bare "ssl"). Matched as whole words like everything else here:
+    //    a plain substring test let "entrust" match inside "IdenTrust".
     for (cv, aliases) in CA_ALIASES {
-        if caa_value == *cv && aliases.iter().any(|a| issuer_lc.contains(a)) {
+        if caa_value == *cv && aliases.iter().any(|a| contains_word(issuer_lc, a)) {
             return true;
         }
     }
@@ -308,6 +309,10 @@ const MIN_FALLBACK_BASE_LEN: usize = 6;
 /// by string start/end or a non-alphanumeric character on each side — so a base
 /// like "examplecorp" matches "ExampleCorp Root" but not "NotExamplecorporated".
 /// Both arguments are expected lowercase.
+///
+/// Both strings come from untrusted data (a CAA record and a certificate
+/// issuer), so this must be panic-free on any UTF-8: after a rejected match
+/// the search resumes one whole *character* later, never mid-character.
 fn contains_word(haystack: &str, needle: &str) -> bool {
     if needle.is_empty() {
         return false;
@@ -322,7 +327,11 @@ fn contains_word(haystack: &str, needle: &str) -> bool {
         if before_ok && after_ok {
             return true;
         }
-        from = start + 1;
+        // `start + 1` would split a multi-byte first character (e.g. `é`) and
+        // panic on the next slice. `start` is a char boundary (it begins a
+        // `find` match), so step over exactly that character.
+        let first_len = haystack[start..].chars().next().map_or(1, char::len_utf8);
+        from = start + first_len;
     }
     false
 }
@@ -331,7 +340,7 @@ fn contains_word(haystack: &str, needle: &str) -> bool {
 /// frequently appear in the issuer CN/O of certs from that CA.
 const CA_ALIASES: &[(&str, &[&str])] = &[
     ("letsencrypt.org", &["let's encrypt", "letsencrypt"]),
-    ("pki.goog", &["google trust services", "gts "]),
+    ("pki.goog", &["google trust services", "gts"]),
     ("digicert.com", &["digicert"]),
     ("sectigo.com", &["sectigo", "comodo"]),
     ("globalsign.com", &["globalsign"]),
@@ -508,6 +517,48 @@ mod tests {
             classify_issuer("CN=NotExamplecorporated CA", &policy),
             IssuerCaaMatch::Mismatch,
             "base inside a larger word must not match"
+        );
+    }
+
+    /// Regression: a remote-controlled crash. After a rejected match
+    /// `contains_word` resumed at `start + 1`, which splits a multi-byte
+    /// first character — CAA `issue "éabcdef.com"` plus a (self-signed) cert
+    /// issued by `CN=xéabcdef.com` panicked `seer ssl` / `seer status` with
+    /// "byte index N is not a char boundary".
+    #[test]
+    fn classify_does_not_panic_on_multibyte_rejected_match() {
+        let policy = policy_with(vec![("issue", "éabcdef.com")]);
+        assert_eq!(
+            classify_issuer("CN=xéabcdef.com", &policy),
+            IssuerCaaMatch::Mismatch
+        );
+        // Directly, including a later whole-word hit after the rejected one.
+        assert!(!contains_word("xéabc", "éabc"));
+        assert!(contains_word("xéabc éabc", "éabc"));
+    }
+
+    /// Regression: aliases were substring-matched, so the `entrust` alias of
+    /// CAA `issue "entrust.net"` matched an IdenTrust-issued cert.
+    #[test]
+    fn classify_alias_requires_whole_word() {
+        let policy = policy_with(vec![("issue", "entrust.net")]);
+        assert_eq!(
+            classify_issuer("CN=TrustID Server CA O1, O=IdenTrust", &policy),
+            IssuerCaaMatch::Mismatch,
+            "entrust must not match inside identrust"
+        );
+        assert_eq!(
+            classify_issuer(
+                "CN=Entrust Certification Authority - L1K, O=Entrust, Inc.",
+                &policy
+            ),
+            IssuerCaaMatch::Permitted
+        );
+        // The trimmed `gts` alias still matches Google's intermediates.
+        let google = policy_with(vec![("issue", "pki.goog")]);
+        assert_eq!(
+            classify_issuer("CN=WR2, O=GTS", &google),
+            IssuerCaaMatch::Permitted
         );
     }
 

@@ -69,9 +69,9 @@ const PRIMARY_RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
 /// (100.64/10), IETF 192.0.0.0/24, benchmark (198.18/15), and class-E
 /// (240/4); and for IPv6: loopback, multicast, unspecified, ULA (fc00::/7),
 /// link-local (fe80::/10), site-local (fec0::/10), documentation
-/// (2001:db8::/32), 6to4 (2002::/16),
-/// NAT64 (64:ff9b::/96), and the IPv4-mapped/-compatible forms (re-checking
-/// the embedded IPv4).
+/// (2001:db8::/32), 6to4 (2002::/16), Teredo (2001::/32),
+/// NAT64 (64:ff9b::/96 and 64:ff9b:1::/48), and the IPv4-mapped, SIIT
+/// IPv4-translated, and IPv4-compatible forms (re-checking the embedded IPv4).
 pub fn is_reserved_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
@@ -137,6 +137,27 @@ pub fn is_reserved_ip(ip: IpAddr) -> bool {
             if seg[0] == 0x0064 && seg[1] == 0xff9b && seg[2] == 0x0001 {
                 return true;
             }
+            // Teredo 2001::/32 (RFC 4380) — tunnels to an obfuscated embedded
+            // IPv4 via a relay, the same translation risk as 6to4/NAT64. No
+            // legitimate public service is addressed from this prefix.
+            if seg[0] == 0x2001 && seg[1] == 0 {
+                return true;
+            }
+            // SIIT IPv4-translated ::ffff:0:a.b.c.d (::ffff:0:0:0/96, RFC 2765
+            // / RFC 6052 §2.1) — a stateless translator reaches the embedded
+            // IPv4, so re-check it like the mapped form below.
+            if seg[0] == 0
+                && seg[1] == 0
+                && seg[2] == 0
+                && seg[3] == 0
+                && seg[4] == 0xffff
+                && seg[5] == 0
+            {
+                let embedded = std::net::Ipv4Addr::from(((seg[6] as u32) << 16) | seg[7] as u32);
+                if is_reserved_ip(IpAddr::V4(embedded)) {
+                    return true;
+                }
+            }
             // IPv4-mapped (::ffff:0:0/96) — re-check the embedded IPv4.
             if v6
                 .to_ipv4_mapped()
@@ -173,8 +194,10 @@ pub fn is_reserved_ip(ip: IpAddr) -> bool {
 /// to hickory (Google DNS) only when the OS resolver returns an error —
 /// see [`FALLBACK_RESOLVER`] for the security rationale.
 ///
-/// Returns `Ok(())` when all resolved IPs are public; `Err(SeerError::InvalidInput)`
-/// otherwise. Does NOT follow CNAMEs explicitly — relies on whichever
+/// Returns `Ok(())` when all resolved IPs are public;
+/// `Err(SeerError::InvalidInput)` when the host is (or resolves to) a
+/// reserved address, and `Err(SeerError::DnsError)` when it cannot be
+/// resolved at all. Does NOT follow CNAMEs explicitly — relies on whichever
 /// resolver answered.
 pub async fn validate_public_host(host: &str, port: u16) -> Result<()> {
     resolve_public_host(host, port).await.map(|_| ())
@@ -217,8 +240,11 @@ pub async fn resolve_public_host(host: &str, port: u16) -> Result<Vec<SocketAddr
                 // is transparent by design; NXDOMAIN for a host that genuinely
                 // doesn't exist (e.g. a stale WHOIS server entry) lands here too,
                 // so warn! would cry wolf on benign negative answers. If BOTH
-                // resolvers fail, the InvalidInput error below is the
-                // load-bearing signal.
+                // resolvers fail, the DnsError below is the load-bearing
+                // signal. It is a DNS failure, not invalid caller input: the
+                // host is often an upstream server (a WHOIS referral), and
+                // `DnsError` sanitizes to its category so that hostname and
+                // the raw resolver text never reach an API/MCP client.
                 let os_err = match os_failure {
                     Ok(Err(e)) => e.to_string(),
                     _ => format!(
@@ -232,14 +258,14 @@ pub async fn resolve_public_host(host: &str, port: u16) -> Result<Vec<SocketAddr
                     "OS resolver could not resolve host; trying hickory fallback"
                 );
                 let Some(resolver) = FALLBACK_RESOLVER.as_ref() else {
-                    return Err(SeerError::InvalidInput(format!(
+                    return Err(SeerError::DnsError(format!(
                     "DNS resolution failed for {host}: {os_err} (no fallback resolver available)"
                 )));
                 };
                 match resolver.lookup_ip(host).await {
                     Ok(resp) => resp.iter().map(|ip| SocketAddr::new(ip, port)).collect(),
                     Err(fallback_err) => {
-                        return Err(SeerError::InvalidInput(format!(
+                        return Err(SeerError::DnsError(format!(
                             "DNS resolution failed for {host}: {os_err} (fallback: {fallback_err})"
                         )));
                     }
@@ -248,7 +274,7 @@ pub async fn resolve_public_host(host: &str, port: u16) -> Result<Vec<SocketAddr
         };
 
     if addrs.is_empty() {
-        return Err(SeerError::InvalidInput(format!(
+        return Err(SeerError::DnsError(format!(
             "no addresses resolved for {host}"
         )));
     }
@@ -433,6 +459,21 @@ mod tests {
     }
 
     #[test]
+    fn rejects_teredo_and_siit_translated_forms() {
+        // Teredo 2001::/32 tunnels to an embedded (obfuscated) IPv4.
+        assert!(is_reserved_ip(
+            "2001:0:4136:e378:8000:63bf:3fff:fdd2".parse().unwrap()
+        ));
+        // SIIT ::ffff:0:a.b.c.d embedding the metadata endpoint / RFC 1918.
+        assert!(is_reserved_ip("::ffff:0:a9fe:a9fe".parse().unwrap()));
+        assert!(is_reserved_ip("::ffff:0:a00:1".parse().unwrap()));
+        // SIIT embedding a public IPv4 stays allowed.
+        assert!(!is_reserved_ip("::ffff:0:808:808".parse().unwrap()));
+        // 2001:db8::/32 aside, the rest of 2001::/16 is ordinary global space.
+        assert!(!is_reserved_ip("2001:4860:4860::8888".parse().unwrap()));
+    }
+
+    #[test]
     fn rejects_ipv6_nat64_rfc8215_local_use_prefix() {
         // RFC 8215 local-use NAT64 prefix 64:ff9b:1::/48 — a NAT64 gateway on
         // this prefix translates the embedded IPv4 (incl. metadata), so the
@@ -519,17 +560,20 @@ mod tests {
     /// append a search domain and rewrite an NXDOMAIN into a real hit —
     /// e.g. ISP wildcard captive-portal behavior). `.invalid` is reserved
     /// by RFC 2606 and must NXDOMAIN in upstream DNS, so hickory's Google
-    /// DNS will also fail. When both fail, the guard returns an
-    /// `InvalidInput` error whose text mentions the fallback, which
-    /// proves the fallback actually ran (not just the primary path).
+    /// DNS will also fail. When both fail, the guard returns a `DnsError`
+    /// whose text mentions the fallback, which proves the fallback actually
+    /// ran (not just the primary path).
     #[tokio::test]
     #[ignore = "requires network — hits Google DNS via hickory fallback"]
     async fn validate_rejects_unresolvable_via_fallback() {
         let err = validate_public_host("nonexistent.host.invalid.", 443)
             .await
             .unwrap_err();
+        assert!(matches!(err, SeerError::DnsError(_)), "got: {err:?}");
         let msg = format!("{err}");
         assert!(msg.contains("DNS resolution failed"), "got: {msg}");
         assert!(msg.contains("fallback"), "got: {msg}");
+        // The external projection must not carry the host or resolver text.
+        assert_eq!(err.sanitized_message(), "DNS resolution failed");
     }
 }

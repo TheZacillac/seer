@@ -96,6 +96,16 @@ def _install_seer_stub() -> None:
         return results
 
     stub.bulk_ssl = _stub_bulk_ssl
+
+    # Called at import time by seer_api.mcp.server (to render the record-type
+    # schema description), so it must return a real value, not raise.
+    def _stub_record_types():
+        return [
+            "A", "AAAA", "CNAME", "MX", "NS", "TXT", "SOA", "PTR",
+            "SRV", "CAA", "NAPTR", "DNSKEY", "DS", "TLSA", "SSHFP", "ANY",
+        ]
+
+    stub.record_types = _stub_record_types
     sys.modules["seer"] = stub
 
 
@@ -113,3 +123,17 @@ from seer_api.main import app  # noqa: E402
 @pytest.fixture
 def client():
     return TestClient(app)
+
+
+@pytest.fixture(autouse=True)
+def _reset_rate_limits():
+    """Start every test with empty REST rate-limit counters.
+
+    The slowapi limiter is module-level and buckets per (client, route), and
+    every TestClient reports the same peer ("testclient"), so hits from one
+    test would otherwise count against the next test's budget for that route.
+    """
+    from seer_api.limiting import limiter
+
+    limiter.reset()
+    yield

@@ -25,6 +25,7 @@ import seer
 
 from .. import __version__
 from .._run import run_seer
+from ..ssrf import nameserver_target
 
 
 def _ssrf_guard(host: str, port: int = 443) -> None:
@@ -39,12 +40,24 @@ def _ssrf_guard(host: str, port: int = 443) -> None:
     except ValueError as exc:
         raise ValueError(str(exc)) from exc
 
-# Configure root logging to INFO so operational milestones are visible.
-# Host environments can override via standard Python logging config.
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-)
+
+def _guard_nameserver(spec: str) -> None:
+    """:func:`_ssrf_guard` the host a nameserver spec connects to.
+
+    Mirrors ``seer_api.ssrf.guard_nameserver_async``: the argument is a spec
+    (``8.8.8.8``, ``9.9.9.9:5353``, ``tls://1.1.1.1``,
+    ``https://cloudflare-dns.com/dns-query``), not a hostname. A malformed
+    spec is left for the core to reject with its own ``Invalid input``.
+    """
+    target = nameserver_target(spec)
+    if target is not None:
+        _ssrf_guard(*target)
+
+
+# No logging.basicConfig() here: this module is also imported by the REST app
+# (seer_api.main), where configuring the root logger at import time made
+# main's own SEER_LOG_LEVEL basicConfig a silent no-op. The stdio entry point
+# configures logging in `run()` instead.
 logger = logging.getLogger(__name__)
 
 # `version=` is what the SDK reports as `serverInfo.version` in the initialize
@@ -970,7 +983,7 @@ async def execute_tool(name: str, arguments: dict[str, Any]) -> Any:
             if nameserver is not None and not isinstance(nameserver, str):
                 raise ValueError(f"'nameserver' must be a string (got {type(nameserver).__name__})")
             if nameserver is not None:
-                await run_seer(_ssrf_guard, nameserver, 53)
+                await run_seer(_guard_nameserver, nameserver)
             return await run_seer(
                 seer.dig, domain, record_type, nameserver
             )
@@ -1116,9 +1129,9 @@ async def execute_tool(name: str, arguments: dict[str, Any]) -> Any:
             record_type = _require_record_type(arguments)
             server_a = _require_str(arguments, "server_a")
             server_b = _require_str(arguments, "server_b")
-            # Both servers are actual connect targets (port 53).
-            await run_seer(_ssrf_guard, server_a, 53)
-            await run_seer(_ssrf_guard, server_b, 53)
+            # Both servers are actual connect targets (nameserver specs).
+            await run_seer(_guard_nameserver, server_a)
+            await run_seer(_guard_nameserver, server_b)
             return await run_seer(seer.dns_compare, domain, record_type, server_a, server_b)
 
         case "seer_diff":
@@ -1175,6 +1188,14 @@ async def main():
 
 def run():
     """Entry point for the MCP server."""
+    # Configure root logging to INFO so operational milestones are visible.
+    # Done here, not at import: see the note above `logger`. A host that has
+    # already configured logging keeps its config (basicConfig is a no-op
+    # once the root logger has handlers).
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
     asyncio.run(main())
 
 

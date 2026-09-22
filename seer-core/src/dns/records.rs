@@ -280,6 +280,50 @@ impl fmt::Display for RecordData {
     }
 }
 
+impl RecordData {
+    /// The record's value as an equality key for cross-server / cross-time
+    /// comparison (compare, follow, propagation).
+    ///
+    /// Domain-name fields are ASCII-lowercased — DNS names compare
+    /// case-insensitively (RFC 4343), and resolvers applying 0x20 query-name
+    /// randomization return `NS1.EXAMPLE.COM.` and `ns1.example.com.` for the
+    /// same record. Everything else is kept verbatim because it is
+    /// case-SENSITIVE data: TXT strings, base64 DNSKEY key material, CAA
+    /// values, NAPTR regexps. Folding those (as compare/follow used to) hid
+    /// real changes; folding nothing (as propagation used to) reported
+    /// spurious NS/CNAME inconsistencies. This is the one shared rule.
+    ///
+    /// The key is rendered through `Display` so its shape always matches the
+    /// displayed value.
+    pub(crate) fn comparison_key(&self) -> String {
+        let mut folded = self.clone();
+        match &mut folded {
+            RecordData::CNAME { target }
+            | RecordData::PTR { target }
+            | RecordData::SRV { target, .. } => target.make_ascii_lowercase(),
+            RecordData::NS { nameserver } => nameserver.make_ascii_lowercase(),
+            RecordData::MX { exchange, .. } => exchange.make_ascii_lowercase(),
+            RecordData::SOA { mname, rname, .. } => {
+                mname.make_ascii_lowercase();
+                rname.make_ascii_lowercase();
+            }
+            RecordData::NAPTR { replacement, .. } => replacement.make_ascii_lowercase(),
+            // RFC 8659 §4.1: property tags match case-insensitively; the
+            // value is left alone.
+            RecordData::CAA { tag, .. } => tag.make_ascii_lowercase(),
+            RecordData::A { .. }
+            | RecordData::AAAA { .. }
+            | RecordData::TXT { .. }
+            | RecordData::DNSKEY { .. }
+            | RecordData::DS { .. }
+            | RecordData::TLSA { .. }
+            | RecordData::SSHFP { .. }
+            | RecordData::Unknown { .. } => {}
+        }
+        folded.to_string()
+    }
+}
+
 impl DnsRecord {
     pub fn format_short(&self) -> String {
         format!("{}", self.data)
@@ -407,6 +451,46 @@ mod tests {
         assert_eq!(
             format!("{}", naptr),
             "100 50 \"s\" \"http+N2L+N2C+N2R\" \"\" www.example.com."
+        );
+    }
+
+    #[test]
+    fn comparison_key_folds_only_domain_name_fields() {
+        let ns = |n: &str| RecordData::NS {
+            nameserver: n.to_string(),
+        };
+        assert_eq!(
+            ns("NS1.Example.COM.").comparison_key(),
+            ns("ns1.example.com.").comparison_key()
+        );
+        let mx = RecordData::MX {
+            preference: 10,
+            exchange: "MX.Example.com.".to_string(),
+        };
+        assert_eq!(mx.comparison_key(), "10 mx.example.com.");
+        let cname = RecordData::CNAME {
+            target: "Edge.CDN.test.".to_string(),
+        };
+        assert_eq!(cname.comparison_key(), "edge.cdn.test.");
+
+        // Case-sensitive payloads are compared verbatim: a TXT token or a
+        // base64 key that changes only in case IS a different value.
+        let txt = |t: &str| RecordData::TXT {
+            text: t.to_string(),
+        };
+        assert_ne!(
+            txt("verify=AbC").comparison_key(),
+            txt("verify=abc").comparison_key()
+        );
+        let key = |k: &str| RecordData::DNSKEY {
+            flags: 257,
+            protocol: 3,
+            algorithm: 13,
+            public_key: k.to_string(),
+        };
+        assert_ne!(
+            key("mdsswUyr3DPW").comparison_key(),
+            key("MDSSWUYR3DPW").comparison_key()
         );
     }
 

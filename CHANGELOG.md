@@ -11,6 +11,188 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+A full code-review sweep across every surface — core, CLI, REPL, TUI, Python
+bindings, REST, and MCP. Every item below was verified against the code and
+carries a regression test.
+
+### Fixed
+- **`seer dnssec` exited 1 for every correctly signed zone.** It compared the
+  status against `"secure"`, a word core deliberately never produces
+  (`signed | unsigned | partial | misconfigured`). It now exits 1 unless the
+  zone is `signed`.
+- **`seer watch` reported down or unresolvable domains as healthy.** Status
+  checks record sub-check failures instead of failing, and the watchlist never
+  read them, so a dead domain showed green and `--fail-on` exited 0. A domain
+  that stops resolving (or whose DNS check fails) is now critical, and an
+  unreachable web/TLS endpoint is a warning. `watch` also honors the config
+  file's timeouts and `bulk.concurrency` in the CLI, REPL, and TUI.
+- **`www.` hosts were silently resolved as the apex.** `dig www.example.com
+  CNAME`, propagation/follow/compare, takeover scans, subdomain
+  classification, `ssl`, `status`, and `headers` all stripped `www.` and
+  queried the apex instead. Per-name operations now keep it; registration
+  lookups still reduce `www.example.com` to `example.com`. `www.com`,
+  `www.net`, and similar real domains were rejected outright and now work.
+- **DNS tools:** `seer delegation` no longer reports every IDN domain
+  (`münchen.de`) as undelegated; `seer dnssec` evaluates the enclosing zone
+  of a non-apex name (it reported `api.cloudflare.com` as unsigned), reports a
+  stale DS whose DNSKEY query fails as `misconfigured` instead of the mild
+  `partial`, uses one DNSKEY answer for both display and digest checks, and
+  flags algorithms 7 and 12 as deprecated; `seer follow` no longer reports a
+  fake "all added" change after a failed first check and rounds the interval
+  instead of truncating it; IPv6 PTR lookups work in compare/propagation/
+  follow; record comparison folds case only for domain-name data (TXT and
+  DNSKEY differences are real changes, NS-case variants are not); CAA flags
+  keep their reserved bits; a DoH nameserver given as an IPv6 literal is
+  rejected up front instead of failing every query; the delegation and DNSSEC
+  resolvers share the standard resolver options (IPv4-first server order).
+- **Email posture:** SMTP DANE is read at `_25._tcp.<MX host>` (RFC 7672)
+  rather than at the domain; two SPF records are a permerror and two DMARC
+  records disable DMARC instead of grading the first; `v=spf10` is not SPF; a
+  subdomain inherits its organizational domain's DMARC policy (`sp=`, else
+  `p=`); SPF `redirect=` is followed instead of being graded "spoofable"; and
+  DMARC `pct` below 100 lowers the verdict one band.
+- **CAA issuer matching** no longer treats `entrust.net` as permitting an
+  IdenTrust certificate (alias matches are whole-word).
+- **Takeover detection** now resolves AAAA as well as A, reports a failed
+  lookup as such rather than "does not resolve", falls back to plain HTTP when
+  HTTPS fails (an unclaimed custom domain is served under the provider's own
+  certificate, and S3 website endpoints are HTTP-only), and ignores a
+  claim-page marker reached through a cross-host redirect. Subdomain
+  classification gains an `unknown` status for lookups that failed instead of
+  calling them dead (and a takeover risk).
+- **Header grading:** CSP is graded across every delivered policy (all header
+  lines and comma-separated lists), `'unsafe-inline'` is ignored when a nonce,
+  hash, or `'strict-dynamic'` neutralizes it and when it only reaches styles;
+  CSP `frame-ancestors` supersedes an invalid `X-Frame-Options`;
+  COOP/COEP/CORP parameters (`require-corp; report-to=…`) no longer read as
+  unrecognized; Referrer-Policy fallback lists are graded on the token the
+  browser actually applies; a quoted HSTS `max-age` is accepted and HSTS served
+  over plain HTTP is ignored; a cookie *named* `secure` no longer counts as
+  the Secure flag.
+- **SSL/status:** a certificate that expired hours ago is reported expired, not
+  "expires in 0 days"/"not yet valid"; MD5 and ECDSA/DSA-with-SHA-1 signatures
+  are flagged; `status` ignores the CN when the certificate has dNSName SANs
+  (RFC 6125), matching `seer ssl`. Expiry day counts everywhere share one rule.
+- **Drift false alarms:** an RDAP→WHOIS fallback between runs (different
+  spellings of the same status/DNSSEC state) is no longer drift; a throttled
+  lookup with no registration data is reported as `inconclusive` instead of
+  every field "removed"; a lapsed registration is reported as such; and the
+  baseline is the most recent snapshot that actually carries data.
+- **Subdomains:** wildcard CT names (`*.dev.example.com`) now yield
+  `dev.example.com` instead of being dropped, and `--record` merges into the
+  stored baseline so one truncated CT run can't resurface old names as "new".
+- **RDAP:** DNSSEC data is now read (`secureDNS` was deserialized from the
+  wrong key, so it was always empty); `.pl` responses with array-shaped glue
+  parse; RIR redirects (ARIN → RIPE, LACNIC → registro.br) are followed with
+  the SSRF guard re-applied per hop; "Updated" uses the domain's last-changed
+  event, not the database timestamp; redacted empty vCard values fall back to
+  WHOIS; `tel:` prefixes, nested street lines, and RFC 8605 country codes are
+  handled; `.sn` (406 on a strict `Accept`) works; a partial IANA bootstrap
+  load no longer caches empty data for 24 hours; a failed cold load no longer
+  stalls later callers for 15 seconds.
+- **Lookup/availability:** registered `.de` domains (DENIC returns nameservers
+  but no registrar/dates) are no longer treated as "WHOIS returned no data",
+  so `info`, bulk CSV, drift, and confusables see their data; a subdomain such
+  as `mail.google.com` is no longer reported AVAILABLE; degraded verdicts are
+  cached for 30 seconds instead of 5 minutes; in-flight lookup coalescing no
+  longer duplicates work or stalls a waiter.
+- **Confusables** permute the brand label under multi-label suffixes
+  (`example.co.uk` previously varied `co`), keep every technique under the
+  candidate cap (long names lost all homoglyphs), keep registered look-alikes
+  whose verdict is only "likely registered"/inconclusive, and sort undated
+  entries last.
+- **WHOIS:** an empty field no longer swallows the next line
+  (`Name Server:` → `"dnssec:"`, missing expiry dates); `.uk` no longer lists
+  a trailing "WHOIS lookup made at…" line or glue IPs as nameservers; `.jp`
+  attribute domains (`co.jp`, …) get creation/update dates and DNSSEC; IDN
+  TLDs served by KISA and EURid use their registries' parsers; refusal words
+  inside an echoed domain name (`quotations.pl`) no longer turn "available"
+  into "inconclusive"; a throttled registrar referral no longer replaces good
+  registry data; dotted/slashed dates with a time and DNS Belgium dates parse;
+  registrant country is no longer invented for `.de/.kr/.it/.uk/.nl`; ICANN
+  "please query the RDDS" boilerplate is not taken as an email; Latin-1
+  responses keep their accented characters; IDN ccTLDs are classified as
+  country-code.
+- **Output:** DNS record values in `seer follow` and RDAP/WHOIS error strings in
+  `lookup` are sanitized for terminal escapes; YAML quotes strings a parser
+  would read as numbers/dates/specials (`+1.555…` phone numbers, IDs, `=`, `<<`)
+  and escapes U+2028/U+2029/U+0085; markdown shows a certificate hostname
+  mismatch, puts contact sections after the domain fields, and includes follow
+  changes, takeover notes, and the availability verdict; `MdSafe` neutralizes
+  link, image, and HTML syntax; human `watch` shows the critical count; newlines
+  can't forge rows in the `diff` table.
+- **CLI:** `--format json|yaml` errors are structured on the bulk, watch, and
+  config paths and follow's banner goes to stderr; bulk `-o` writes the CSV
+  even under a structured format; the bulk `prop` CSV reports core's consensus
+  percentage (it reported the response rate); the follow key listener no
+  longer blocks a runtime worker or spins at 100% CPU without a TTY; `bulk -`
+  caps stdin; `--quiet --fields` works on list results; hidden progress bars
+  (non-TTY stderr) no longer swallow `--progress` lines and logs; `follow` and
+  `reverse` honor the configured DNS timeout/nameserver.
+- **REPL:** a mistyped `follow` record type or flag errors instead of silently
+  watching A records; unknown flags are rejected and `subdomains --resolve` /
+  `takeover --host` work; `copy` never returns a stale result; a leading-space
+  line stays out of history; Windows paths keep their backslashes;
+  `seer --format X` with no subcommand starts the REPL in that format.
+- **TUI:** Ctrl/Alt chords no longer trigger pane actions (Ctrl+C in History
+  wiped all history); a lens never shows data fetched for another tab or
+  target; follow/bulk/watch edit fields are drawn; `:watch add x` edits the
+  watchlist instead of changing the session domain; explicit fetches show a
+  loading state; `:diff`/`:compare` keep their own domains; `:dig` takes a
+  record type; AltGr characters can be typed on Windows; the data layer honors
+  `~/.seer/config.toml`; bulk file loads share the CLI's guards and 1000-domain
+  cap instead of silently truncating at 50.
+- **Bulk input** strips a UTF-8 BOM and CSV quotes; bulk DNS honors the
+  configured nameserver.
+- **Stores:** a history/watchlist/baseline file that can't be read (e.g.
+  invalid UTF-8) is backed up instead of overwritten on the next save, and a
+  second corruption no longer destroys the first backup.
+- **Logging:** an unwritable log directory disables file logging with a warning
+  instead of panicking every invocation (even `--help`).
+- **REST/MCP:** DoT (`tls://`), DoH (`https://`), and `host:port` nameserver
+  specs are accepted (the SSRF check applies to the host they connect to);
+  `SEER_MCP_ALLOWED_ORIGINS` alone no longer makes every `/mcp` request 421;
+  `SEER_LOG_LEVEL` is honored; an invalid `UVICORN_WORKERS` no longer aborts
+  startup when `WEB_CONCURRENCY` is set; `::ffff:127.0.0.1` counts as loopback
+  on Python 3.12.0–3.12.3; a non-ASCII `Authorization` header is a 401, not a
+  500.
+
+### Security
+- **REST rate limits were per URL, not per route**, so changing the domain in
+  the path (even its case) got a fresh budget. Limits are now keyed per route.
+  `X-Forwarded-For` is read across all header lines (a second line could spoof
+  the client key), uvicorn's own proxy-header rewriting is disabled so
+  `SEER_TRUST_PROXY`/`SEER_TRUSTED_PROXY_IPS` is the only trust path, and the
+  `/mcp` guards and `/health` auth exemption hold under a `root_path`.
+  `SEER_RATE_LIMIT` governs `/mcp` (every REST route has its own limit), and
+  multi-limit strings are fully enforced.
+- **A hostile CAA record could crash `seer ssl`/`seer status`** (a byte-index
+  slice in issuer matching panicked on non-ASCII input).
+- **Bumped `rustls` to 0.23.45** for RUSTSEC-2026-0285 (TLS 1.3 handshake
+  messages accepted across encryption-level boundaries), with `rustls-webpki`
+  0.103.15 / `aws-lc-rs` 1.18.1, and moved off the yanked `chacha20` 0.10.1.
+- **`SEER_DOMAIN_ALLOWLIST` is enforced on PTR lookups by IP literal** (the
+  reverse name is now checked; an IP bypassed the allowlist).
+- **SSRF:** Teredo (`2001::/32`) and SIIT IPv4-translated addresses are treated
+  as reserved, alongside the existing 6to4/NAT64 handling. DNS resolution
+  failures are now `DnsError` rather than "Invalid input", so an upstream
+  server's hostname and raw resolver text no longer reach API/MCP/bulk output.
+- The Python test hook `_json_to_python_nested_for_test` caps its depth (a huge
+  value overflowed the stack and aborted the interpreter).
+
+### Internal
+- New `validation::normalize_host` (www-preserving) beside `normalize_domain`.
+- New dependency: `psl` (MIT/Apache-2.0) for registrable-domain handling.
+- New `watchlist::check_watchlist_with_config` / `check_watchlist_with`,
+  `DriftReport::inconclusive` / `DriftReport::empty`, `drift::is_comparable` /
+  `drift::baseline_snapshot`, and a `status::StatusError` re-export.
+- Tests that could never fail were fixed: the bulk rate-limiter timing test
+  (now on tokio's paused clock), the HTTP loopback-refusal test, the webhook
+  hostless-URL test, the TUI headers verdict test, the WHOIS registry-selection
+  tests, and the API endpoint-index test.
+- Removed a literal NUL byte from a doc comment in `status/client.rs` that made
+  git and grep treat the file as binary.
+
 ## [0.47.1] - 2026-09-03
 
 Patch release. `.co.il` and the other `.il` second-level domains now report

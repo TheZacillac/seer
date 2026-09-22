@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -77,12 +77,16 @@ impl FollowConfig {
                 "interval_minutes must be at most 60".into(),
             ));
         }
-        // A sub-second interval truncates to 0 seconds. For a multi-iteration
+        // Round to the nearest second rather than truncating: float minutes
+        // rarely land exactly on a second (2.05 min * 60 = 122.999…), and
+        // truncation silently shortened the interval.
+        //
+        // A sub-second interval rounds to 0 seconds. For a multi-iteration
         // follow that means back-to-back live DNS queries with no spacing — a
         // self-inflicted query flood. Floor to 1s whenever more than one
         // iteration will run; a single-shot follow (iterations == 1) does no
         // looping and may keep a 0s interval.
-        let mut interval_secs = (interval_minutes * 60.0) as u64;
+        let mut interval_secs = (interval_minutes * 60.0).round() as u64;
         if iterations > 1 {
             interval_secs = interval_secs.max(1);
         }
@@ -96,6 +100,25 @@ impl FollowConfig {
     pub fn with_changes_only(mut self, changes_only: bool) -> Self {
         self.changes_only = changes_only;
         self
+    }
+
+    /// Re-checks the bounds [`FollowConfig::new`] enforces. The fields are
+    /// public, so a caller can build a config literally; [`DnsFollower::follow`]
+    /// calls this first so an out-of-range literal (e.g. `iterations:
+    /// usize::MAX`, which overflowed `Vec::with_capacity` and panicked) is
+    /// rejected as input instead.
+    fn validate(&self) -> Result<()> {
+        if self.iterations == 0 || self.iterations > MAX_FOLLOW_ITERATIONS {
+            return Err(SeerError::InvalidInput(format!(
+                "iterations must be between 1 and {MAX_FOLLOW_ITERATIONS}"
+            )));
+        }
+        if self.interval_secs > MAX_FOLLOW_INTERVAL_SECS {
+            return Err(SeerError::InvalidInput(format!(
+                "interval must be at most {MAX_FOLLOW_INTERVAL_SECS} seconds"
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -205,10 +228,18 @@ impl DnsFollower {
         callback: Option<FollowProgressCallback>,
         cancel_rx: Option<watch::Receiver<bool>>,
     ) -> Result<FollowResult> {
-        let domain = crate::validation::normalize_domain(domain)?;
+        config.validate()?;
+        // The resolver's own per-name rule: keeps `www.` and passes an IPv6
+        // PTR literal through (normalize_domain did neither).
+        let domain = crate::dns::resolver::prepare_query(domain, record_type)?;
         let started_at = Utc::now();
+        // Bounded by `validate` above.
         let mut iterations: Vec<FollowIteration> = Vec::with_capacity(config.iterations);
-        let mut previous_values: HashSet<String> = HashSet::new();
+        // The last successful observation, if any. `None` until an iteration
+        // succeeds, so a first iteration that errors can't become an empty
+        // baseline that the first success then "changes" (added = every
+        // record).
+        let mut baseline: Option<Observation> = None;
         let mut total_changes = 0;
         let mut interrupted = false;
 
@@ -247,22 +278,21 @@ impl DnsFollower {
                 }
             };
 
-            // Extract record values (original casing) for this iteration.
-            let current_values: Vec<String> = records.iter().map(|r| r.data.to_string()).collect();
+            let current = observe(&records);
 
-            // Compare with previous iteration. The diff is case-insensitive so
-            // a resolver applying 0x20 query-name randomization (returning the
-            // same record with different casing) is not reported as a spurious
-            // change; `added`/`removed` still carry the original casing.
-            let (changed, added, removed) = if i == 0 || error.is_some() {
-                // First iteration - no previous to compare. Also skip the diff
-                // on an errored iteration: a transient resolver failure yields
-                // an empty record set that would otherwise look like every
-                // record was removed (and every record re-added on recovery),
-                // inflating total_changes with phantom events.
-                (false, Vec::new(), Vec::new())
-            } else {
-                diff_record_values(&current_values, &previous_values)
+            // Compare with the last successful iteration. Keys fold case only
+            // for domain-name fields (see `RecordData::comparison_key`), so a
+            // resolver applying 0x20 randomization is not a spurious change
+            // while a real case change in TXT data still is; `added` /
+            // `removed` carry the values as the server returned them.
+            let (changed, added, removed) = match (&baseline, &error) {
+                (Some(previous), None) => diff_observations(&current, previous),
+                // No successful observation yet (nothing to compare), or this
+                // iteration errored: a transient resolver failure yields an
+                // empty record set that would otherwise look like every record
+                // was removed (and re-added on recovery), inflating
+                // total_changes with phantom events.
+                _ => (false, Vec::new(), Vec::new()),
             };
 
             if changed {
@@ -292,16 +322,12 @@ impl DnsFollower {
             }
 
             iterations.push(iteration);
-            // Store case-folded keys for the next iteration's comparison. Skip
-            // on an errored iteration so the last known-good observation is
-            // preserved: the next successful iteration is then compared against
-            // real prior values rather than an empty set (which would fabricate
-            // a full re-addition).
+            // Only a successful iteration becomes the baseline, so the last
+            // known-good observation survives an errored iteration: the next
+            // success is compared against real prior values rather than an
+            // empty set (which would fabricate a full re-addition).
             if error_is_none {
-                previous_values = current_values
-                    .iter()
-                    .map(|v| v.to_ascii_lowercase())
-                    .collect();
+                baseline = Some(current);
             }
 
             // Sleep before next iteration (unless this is the last one)
@@ -357,32 +383,36 @@ impl DnsFollower {
     }
 }
 
-/// Diffs the current iteration's record values against the previous
-/// iteration's case-folded key set. Returns `(changed, added, removed)` where
-/// `added`/`removed` preserve the original casing for display, but membership
-/// is decided on the lowercased key — so a record that reappears with only a
-/// case difference (0x20 query-name randomization) is not flagged as a change.
-fn diff_record_values(
-    current_values: &[String],
-    previous_keys: &HashSet<String>,
-) -> (bool, Vec<String>, Vec<String>) {
-    let current_keys: HashSet<String> = current_values
-        .iter()
-        .map(|v| v.to_ascii_lowercase())
-        .collect();
+/// One iteration's record values: comparison key
+/// ([`RecordData::comparison_key`](super::RecordData::comparison_key)) → the
+/// value as the server returned it.
+type Observation = BTreeMap<String, String>;
 
-    // Added: present now (by key) but absent from the previous key set.
-    let mut added: Vec<String> = current_values
+fn observe(records: &[DnsRecord]) -> Observation {
+    records
         .iter()
-        .filter(|v| !previous_keys.contains(&v.to_ascii_lowercase()))
-        .cloned()
+        .map(|r| (r.data.comparison_key(), r.data.to_string()))
+        .collect()
+}
+
+/// Diffs the current observation against the baseline. Returns `(changed,
+/// added, removed)`: membership is decided on the comparison key — so a record
+/// that reappears with only a case difference in a domain-name field (0x20
+/// query-name randomization) is not a change — while `added` / `removed`
+/// carry the values as the respective servers returned them.
+fn diff_observations(
+    current: &Observation,
+    previous: &Observation,
+) -> (bool, Vec<String>, Vec<String>) {
+    let mut added: Vec<String> = current
+        .iter()
+        .filter(|(key, _)| !previous.contains_key(*key))
+        .map(|(_, value)| value.clone())
         .collect();
-    // Removed: previous keys no longer present. The original casing is not
-    // retained across iterations, so emit the lowercased key.
-    let mut removed: Vec<String> = previous_keys
+    let mut removed: Vec<String> = previous
         .iter()
-        .filter(|k| !current_keys.contains(*k))
-        .cloned()
+        .filter(|(key, _)| !current.contains_key(*key))
+        .map(|(_, value)| value.clone())
         .collect();
     added.sort();
     added.dedup();
@@ -397,10 +427,28 @@ fn diff_record_values(
 mod tests {
     use super::*;
 
-    /// Builds a case-folded key set the same way `follow()` stores
-    /// `previous_values`, for use in the diff helper tests.
-    fn lowercased_set<const N: usize>(values: [&str; N]) -> HashSet<String> {
-        values.iter().map(|v| v.to_ascii_lowercase()).collect()
+    use super::super::records::RecordData;
+
+    fn record(data: RecordData) -> DnsRecord {
+        DnsRecord {
+            name: "example.com".to_string(),
+            record_type: RecordType::NS,
+            ttl: 300,
+            data,
+        }
+    }
+
+    /// An observation of NS records, built the way `follow()` builds one.
+    fn ns_observation<const N: usize>(names: [&str; N]) -> Observation {
+        let records: Vec<DnsRecord> = names
+            .iter()
+            .map(|n| {
+                record(RecordData::NS {
+                    nameserver: n.to_string(),
+                })
+            })
+            .collect();
+        observe(&records)
     }
 
     #[tokio::test]
@@ -416,27 +464,174 @@ mod tests {
     /// as a change. The comparison key is case-folded.
     #[test]
     fn diff_values_ignores_case_only_differences() {
-        let previous = lowercased_set(["NS1.EXAMPLE.COM.", "ns2.example.com."]);
-        let current = vec![
-            "ns1.example.com.".to_string(),
-            "NS2.EXAMPLE.COM.".to_string(),
-        ];
-        let (changed, added, removed) = diff_record_values(&current, &previous);
+        let previous = ns_observation(["NS1.EXAMPLE.COM.", "ns2.example.com."]);
+        let current = ns_observation(["ns1.example.com.", "NS2.EXAMPLE.COM."]);
+        let (changed, added, removed) = diff_observations(&current, &previous);
         assert!(!changed, "case-only differences must not count as a change");
         assert!(added.is_empty(), "no added values: {added:?}");
         assert!(removed.is_empty(), "no removed values: {removed:?}");
     }
 
     /// A genuine value change is still detected, and `added`/`removed` carry the
-    /// original casing for display.
+    /// original casing for display (the removed value now keeps the casing the
+    /// earlier server returned, rather than a lowercased key).
     #[test]
     fn diff_values_detects_real_change_preserving_case() {
-        let previous = lowercased_set(["ns1.example.com."]);
-        let current = vec!["NS2.Example.Com.".to_string()];
-        let (changed, added, removed) = diff_record_values(&current, &previous);
+        let previous = ns_observation(["NS1.Example.com."]);
+        let current = ns_observation(["NS2.Example.Com."]);
+        let (changed, added, removed) = diff_observations(&current, &previous);
         assert!(changed, "a different nameserver is a real change");
         assert_eq!(added, vec!["NS2.Example.Com.".to_string()]);
-        assert_eq!(removed, vec!["ns1.example.com.".to_string()]);
+        assert_eq!(removed, vec!["NS1.Example.com.".to_string()]);
+    }
+
+    /// TXT data is case-sensitive: a token rotated from `AbC` to `abc` is a
+    /// real change (case used to be folded for every record type).
+    #[test]
+    fn diff_values_reports_case_change_in_txt() {
+        let txt = |t: &str| {
+            observe(&[record(RecordData::TXT {
+                text: t.to_string(),
+            })])
+        };
+        let (changed, added, removed) = diff_observations(&txt("token=abc"), &txt("token=AbC"));
+        assert!(changed);
+        assert_eq!(added, vec!["\"token=abc\"".to_string()]);
+        assert_eq!(removed, vec!["\"token=AbC\"".to_string()]);
+    }
+
+    #[test]
+    fn follow_config_rounds_interval_to_nearest_second() {
+        // 2.05 min * 60 = 122.999…; truncation gave 122s.
+        assert_eq!(FollowConfig::new(2, 2.05).unwrap().interval_secs, 123);
+        assert_eq!(FollowConfig::new(2, 0.5).unwrap().interval_secs, 30);
+    }
+
+    /// `FollowConfig`'s fields are public, so `follow` must re-validate:
+    /// `iterations: usize::MAX` used to reach `Vec::with_capacity` and panic
+    /// with a capacity overflow.
+    #[tokio::test]
+    async fn follow_rejects_out_of_range_literal_config() {
+        let follower = DnsFollower::new();
+        for config in [
+            FollowConfig {
+                iterations: usize::MAX,
+                interval_secs: 1,
+                changes_only: false,
+            },
+            FollowConfig {
+                iterations: 0,
+                interval_secs: 1,
+                changes_only: false,
+            },
+            FollowConfig {
+                iterations: 2,
+                interval_secs: MAX_FOLLOW_INTERVAL_SECS + 1,
+                changes_only: false,
+            },
+        ] {
+            let err = follower
+                .follow_simple("example.com", RecordType::A, None, config)
+                .await
+                .expect_err("out-of-range config must be rejected before any query");
+            assert!(matches!(err, SeerError::InvalidInput(_)), "{err:?}");
+        }
+    }
+
+    /// Regression: when iteration 1 errored, the (empty) error result became
+    /// the diff baseline, so the first successful iteration reported every
+    /// record as added and `changed = true`. The baseline must be the first
+    /// SUCCESSFUL observation.
+    #[tokio::test]
+    async fn follow_first_iteration_error_is_not_a_baseline() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        use hickory_resolver::proto::rr::rdata as wire;
+        use hickory_resolver::proto::rr::{RData as HickoryRData, RecordType as WireType};
+
+        use crate::dns::test_support::{mock_dns_resolver, spawn_mock_dns_fn, MockReply};
+
+        // SERVFAIL until the first iteration's callback flips the switch, so
+        // every retry hickory makes inside iteration 1 fails too.
+        let healthy = Arc::new(AtomicBool::new(false));
+        let port = spawn_mock_dns_fn({
+            let healthy = Arc::clone(&healthy);
+            move |_, qtype| {
+                if healthy.load(Ordering::SeqCst) && qtype == WireType::A {
+                    MockReply::Answer(vec![HickoryRData::A(wire::A(std::net::Ipv4Addr::new(
+                        192, 0, 2, 7,
+                    )))])
+                } else {
+                    MockReply::ServFail
+                }
+            }
+        })
+        .await;
+        let callback: FollowProgressCallback = {
+            let healthy = Arc::clone(&healthy);
+            Arc::new(move |_: &FollowIteration| healthy.store(true, Ordering::SeqCst))
+        };
+
+        let config = FollowConfig {
+            iterations: 3,
+            interval_secs: 0,
+            changes_only: false,
+        };
+        let result = DnsFollower::with_resolver(mock_dns_resolver(port))
+            .follow(
+                "seer.test",
+                RecordType::A,
+                Some("127.0.0.1"),
+                config,
+                Some(callback),
+                None,
+            )
+            .await
+            .expect("follow against the mock fixture");
+
+        assert!(!result.iterations[0].success(), "iteration 1 must error");
+        let second = &result.iterations[1];
+        assert!(second.success(), "{second:?}");
+        assert!(
+            !second.changed && second.added.is_empty() && second.removed.is_empty(),
+            "the first success establishes the baseline, it is not a change: {second:?}"
+        );
+        assert!(!result.iterations[2].changed);
+        assert_eq!(result.total_changes, 0);
+    }
+
+    /// `follow` keeps `www.` and accepts IPv6 PTR literals, like `resolve`.
+    #[tokio::test]
+    async fn follow_uses_per_name_normalization() {
+        use crate::dns::test_support::{mock_dns_resolver, spawn_mock_dns, MockMode};
+
+        let port = spawn_mock_dns(MockMode::Zone).await;
+        let follower = DnsFollower::with_resolver(mock_dns_resolver(port));
+        let one_shot = || FollowConfig::new(1, 0.0).expect("valid config");
+
+        let result = follower
+            .follow_simple(
+                "www.seer.test",
+                RecordType::CNAME,
+                Some("127.0.0.1"),
+                one_shot(),
+            )
+            .await
+            .expect("follow www");
+        assert_eq!(result.domain, "www.seer.test");
+        assert_eq!(result.iterations[0].record_count(), 1);
+
+        let result = follower
+            .follow_simple(
+                "2606:4700:4700::1111",
+                RecordType::PTR,
+                Some("127.0.0.1"),
+                one_shot(),
+            )
+            .await
+            .expect("IPv6 PTR literal must be accepted");
+        assert_eq!(result.domain, "2606:4700:4700::1111");
+        assert_eq!(result.iterations[0].record_count(), 1);
     }
 
     #[test]

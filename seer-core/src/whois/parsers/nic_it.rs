@@ -263,7 +263,9 @@ impl RegistryParser for NicItParser {
             registrant_email: None,
             registrant_phone: None,
             registrant_address: None,
-            registrant_country: Some("IT".to_string()),
+            // Not inferred from the TLD: .it accepts EU/EEA holders (e.g. an Irish company), and a
+            // "no match" body must not report a registrant country.
+            registrant_country: None,
             admin_name,
             admin_organization: admin_org,
             admin_email: None,
@@ -420,6 +422,15 @@ Nameservers
         assert_eq!(result.admin_organization, Some("Google LLC".to_string()));
         assert_eq!(result.tech_name, Some("Domain Administrator".to_string()));
         assert_eq!(result.tech_organization, Some("Google LLC".to_string()));
+    }
+
+    /// The registrant's country is not inferred from the TLD: .it accepts
+    /// EU/EEA holders, like the Irish company in the fixture.
+    #[test]
+    fn test_nic_it_registrant_country_not_hardcoded() {
+        let parser = NicItParser::new();
+        let result = parser.parse("google.it", "whois.nic.it", SAMPLE_NIC_IT_RESPONSE);
+        assert_eq!(result.registrant_country, None);
     }
 
     #[test]

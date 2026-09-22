@@ -84,10 +84,10 @@ impl ParserRegistry {
                 Box::new(DenicParser::new()),    // .de
                 Box::new(EducauseParser::new()), // .edu
                 Box::new(EisParser::new()),      // .ee
-                Box::new(EuridParser::new()),    // .eu
+                Box::new(EuridParser::new()),    // .eu, .ею, .ευ
                 Box::new(IsocIlParser::new()),   // .il (co.il, org.il, …), .ישראל
                 Box::new(JprsParser::new()),     // .jp
-                Box::new(KisaParser::new()),     // .kr
+                Box::new(KisaParser::new()),     // .kr, .한국, .삼성
                 Box::new(NicItParser::new()),    // .it
                 Box::new(NicLvParser::new()),    // .lv
                 Box::new(NominetParser::new()),  // .uk, .co.uk
@@ -176,16 +176,20 @@ mod tests {
         assert_eq!(extract_second_level_tld("example.com"), None);
     }
 
+    // Every parser sets `domain`, so the selection tests assert a field only
+    // the expected parser produces from the given body.
+
     #[test]
     fn test_parser_registry_selects_denic_for_de() {
         let registry = ParserRegistry::new();
-        // Just test that it doesn't panic
         let result = registry.parse(
             "example.de",
             "whois.denic.de",
             "Domain: example.de\nStatus: connect",
         );
-        assert_eq!(result.domain, "example.de");
+        // DENIC maps its `connect` vocabulary to `active`; the generic
+        // parser would keep `connect` verbatim.
+        assert_eq!(result.status, vec!["active"]);
     }
 
     #[test]
@@ -194,9 +198,10 @@ mod tests {
         let result = registry.parse(
             "example.co.uk",
             "whois.nic.uk",
-            "Domain name:\n    example.co.uk",
+            "Domain name:\n    example.co.uk\n\nRegistrar:\n    Example Registrar Ltd [Tag = EXAMPLE]\n",
         );
-        assert_eq!(result.domain, "example.co.uk");
+        // Nominet strips the `[Tag = …]` suffix; the generic parser keeps it.
+        assert_eq!(result.registrar.as_deref(), Some("Example Registrar Ltd"));
     }
 
     #[test]
@@ -205,8 +210,61 @@ mod tests {
         let result = registry.parse(
             "example.com",
             "whois.verisign-grs.com",
-            "Domain Name: example.com",
+            "Domain Name: example.com\nRegistrar: Example Registrar, Inc.\nStatus: connect\n",
         );
-        assert_eq!(result.domain, "example.com");
+        assert_eq!(result.registrar.as_deref(), Some("Example Registrar, Inc."));
+        // Not routed through DENIC's status mapping.
+        assert_eq!(result.status, vec!["connect"]);
+    }
+
+    /// whois.kr serves .한국 / .삼성 in the KISA format: those IDN TLDs (which
+    /// reach the parser as A-labels) must use the KISA parser, whose
+    /// `Authorized Agency` / `Host Name` fields the generic parser ignores.
+    #[test]
+    fn test_parser_registry_selects_kisa_for_korean_idn_tlds() {
+        let raw = "# ENGLISH\n\
+                   \n\
+                   Domain Name                 : example.xn--3e0b707e\n\
+                   Authorized Agency           : Whois Corp.(http://whois.co.kr)\n\
+                   \n\
+                   Primary Name Server\n\
+                   \x20  Host Name                : ns1.example.kr\n";
+        let registry = ParserRegistry::new();
+        for domain in ["example.xn--3e0b707e", "example.xn--cg4bki"] {
+            let result = registry.parse(domain, "whois.kr", raw);
+            assert_eq!(
+                result.registrar.as_deref(),
+                Some("Whois Corp."),
+                "{domain} must use the KISA parser"
+            );
+            assert_eq!(result.nameservers, vec!["ns1.example.kr"], "{domain}");
+        }
+    }
+
+    /// whois.eu serves .ею / .ευ in the EURid format.
+    #[test]
+    fn test_parser_registry_selects_eurid_for_eu_idn_tlds() {
+        let raw = "Domain: example.xn--e1a4c\n\
+                   \n\
+                   Name servers:\n\
+                   \x20       ns1.example.eu (192.0.2.1)\n\
+                   \x20       ns2.example.eu\n\
+                   \n\
+                   Keys:\n\
+                   \x20       flags:KSK protocol:3 algorithm:RSA_SHA256 pubKey:AwEAAtest\n";
+        let registry = ParserRegistry::new();
+        for domain in ["example.xn--e1a4c", "example.xn--qxa6a"] {
+            let result = registry.parse(domain, "whois.eu", raw);
+            assert_eq!(
+                result.nameservers,
+                vec!["ns1.example.eu", "ns2.example.eu"],
+                "{domain} must use the EURid parser"
+            );
+            assert_eq!(
+                result.dnssec.as_deref(),
+                Some("signedDelegation"),
+                "{domain}"
+            );
+        }
     }
 }

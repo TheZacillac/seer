@@ -14,9 +14,11 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
         return;
     };
 
+    // Name the compared domain: `:compare` can target a domain other than the
+    // session's, and the title is the only place that says which.
     let title = format!(
-        "compare · A {} vs B {}",
-        c.server_a.nameserver, c.server_b.nameserver
+        "compare · {} · A {} vs B {}",
+        c.domain, c.server_a.nameserver, c.server_b.nameserver
     );
     let block = panel::block(theme, &title, theme.sky, false);
     let inner = block.inner(area);
@@ -230,6 +232,10 @@ mod tests {
         let text = buf_text(terminal.backend().buffer());
         assert!(text.contains("8.8.8.8"), "A resolver IP should appear");
         assert!(text.contains("1.1.1.1"), "B resolver IP should appear");
+        assert!(
+            text.contains("compare · x.com ·"),
+            "title must name the compared domain"
+        );
     }
 
     #[test]

@@ -10,8 +10,9 @@ impl HumanFormatter {
             sanitize_display(&diff.domain_b)
         )));
 
-        let domain_a = sanitize_display(&diff.domain_a);
-        let domain_b = sanitize_display(&diff.domain_b);
+        // Column headers are aligned cells too, so flatten them like the body.
+        let domain_a = flatten_cell(&sanitize_display(&diff.domain_a));
+        let domain_b = flatten_cell(&sanitize_display(&diff.domain_b));
         let sections = build_diff_sections(diff);
         let col_width = compute_column_width(&sections, &domain_a, &domain_b);
 
@@ -157,19 +158,38 @@ fn eq_as_set(a: &[String], b: &[String]) -> bool {
     an == bn
 }
 
+/// Maps the layout characters `sanitize_display` deliberately keeps (`\n`,
+/// `\t`, and `\r` for good measure) to spaces. Inside an aligned table cell
+/// they are not layout: a raw newline would break the row (the pad math
+/// counts it as one column) and let a remote party forge extra, aligned rows.
+fn flatten_cell(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if matches!(c, '\n' | '\r' | '\t') {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
 /// Wraps `text` into lines no wider than `max_width` display chars.
 /// Breaks at the last ASCII whitespace within the window when possible;
 /// otherwise hard-breaks at the cap. Widths are measured in `chars().count()`
 /// which is correct for ASCII and a reasonable fallback for other inputs.
+/// Newlines/tabs/CRs are flattened to spaces first (see [`flatten_cell`]), so
+/// every returned line is a single physical row.
 fn wrap_cell(text: &str, max_width: usize) -> Vec<String> {
     let width = max_width.max(1);
     if text.is_empty() {
         return vec![String::new()];
     }
 
+    let text = flatten_cell(text);
     let chars: Vec<char> = text.chars().collect();
     if chars.len() <= width {
-        return vec![text.to_string()];
+        return vec![text];
     }
 
     let mut out = Vec::new();
@@ -500,6 +520,34 @@ mod tests {
         // we clamp to 1 to be safe.
         let out = wrap_cell("abc", 0);
         assert_eq!(out, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+    }
+
+    #[test]
+    fn wrap_cell_flattens_newline_cr_tab() {
+        // sanitize_display keeps `\n`/`\t`; inside an aligned cell they must
+        // not survive, or a value breaks its row / forges new ones.
+        assert_eq!(wrap_cell("a\nb\tc\rd", 40), vec!["a b c d".to_string()]);
+        for line in wrap_cell("x\ny\nz", 3) {
+            assert!(!line.contains(['\n', '\r', '\t']), "{line:?}");
+        }
+    }
+
+    #[test]
+    fn format_diff_cell_newline_cannot_forge_rows() {
+        // A remote registrar value carrying a newline plus a fake, aligned
+        // row must stay on its own row inside the value column.
+        let mut diff = make_sample_diff();
+        diff.registration.registrar = (
+            Some("IANA\n    Organization  =  Forged".to_string()),
+            Some("MarkMonitor".to_string()),
+        );
+        let out = diff_formatter().format_diff(&diff);
+        let org_rows = out
+            .lines()
+            .filter(|l| l.trim_start().starts_with("Organization"))
+            .count();
+        assert_eq!(org_rows, 1, "forged row appeared:\n{out}");
+        assert!(!out.contains('\t'), "tab leaked:\n{out}");
     }
 
     fn make_sample_diff() -> DomainDiff {

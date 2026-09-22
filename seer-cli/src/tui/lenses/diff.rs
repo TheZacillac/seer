@@ -6,15 +6,19 @@ use ratatui::widgets::{Paragraph, Row, Table};
 use ratatui::Frame;
 
 use crate::tui::action::{LensData, LensState};
+use crate::tui::line_editor::LineEditor;
 use crate::tui::theme::Theme;
 use crate::tui::widgets::panel;
 
 /// Render the Diff lens. Pure function of its inputs (no `App` coupling):
-/// - `domain`  current target = domain A
+/// - `domain`  domain A (the `:diff` override, else the session target)
 /// - `b`       committed second domain (B)
-/// - `editing` `Some(buf)` while the B field is being typed
+/// - `editing` `Some(editor)` while the B field is being typed
 /// - `focused` whether the pane has focus
 /// - `state`   the lens load state (drives the body)
+///
+/// Once a comparison is loaded the input bar names the domains that result
+/// is actually for (`domain_a`/`domain_b`), not whatever is configured now.
 #[allow(clippy::too_many_arguments)]
 pub fn render(
     f: &mut Frame,
@@ -22,7 +26,7 @@ pub fn render(
     theme: &Theme,
     domain: Option<&str>,
     b: &str,
-    editing: Option<&str>,
+    editing: Option<&LineEditor>,
     focused: bool,
     state: &LensState,
 ) {
@@ -40,9 +44,17 @@ pub fn render(
         .split(inner);
 
     // ── input bar: A · <domain>   ⇄   B · <value> ────────────────────────────
-    let a = domain.unwrap_or("(no target)");
+    let loaded = match state {
+        LensState::Loaded(LensData::Diff(d)) => Some(d),
+        _ => None,
+    };
+    let a = loaded
+        .map(|d| d.domain_a.as_str())
+        .or(domain)
+        .unwrap_or("(no target)");
+    let b = loaded.map(|d| d.domain_b.as_str()).unwrap_or(b);
     let (b_text, b_color) = match editing {
-        Some(buf) => (format!("{buf}▏"), theme.text),
+        Some(buf) => (buf.with_caret("▏"), theme.text),
         None if !b.is_empty() => (b.to_string(), theme.text),
         None => ("[ press e ]".to_string(), theme.overlay0),
     };
@@ -296,7 +308,7 @@ mod tests {
                     &theme,
                     Some("acme.io"),
                     "",
-                    Some("typed.io"),
+                    Some(&LineEditor::from("typed.io")),
                     true,
                     &LensState::Idle,
                 );
@@ -306,6 +318,61 @@ mod tests {
             buf_text(terminal.backend().buffer()).contains("typed.io"),
             "live edit buffer should render"
         );
+    }
+
+    #[test]
+    fn editing_caret_follows_the_cursor() {
+        let theme = Theme::frappe();
+        let mut editor = LineEditor::from("typed.io");
+        editor.home();
+        let backend = TestBackend::new(90, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                render(
+                    f,
+                    f.area(),
+                    &theme,
+                    Some("acme.io"),
+                    "",
+                    Some(&editor),
+                    true,
+                    &LensState::Idle,
+                );
+            })
+            .unwrap();
+        assert!(
+            buf_text(terminal.backend().buffer()).contains("B · ▏typed.io"),
+            "caret must render at the cursor (Home), not the end"
+        );
+    }
+
+    #[test]
+    fn loaded_input_bar_names_the_results_domains() {
+        // `:diff a.com b.com` while the session target is something else: the
+        // bar must label the loaded data's domains, not the session domain.
+        let theme = Theme::frappe();
+        let state = LensState::Loaded(LensData::Diff(Box::new(diff_fixture())));
+        let backend = TestBackend::new(90, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                render(
+                    f,
+                    f.area(),
+                    &theme,
+                    Some("session.com"),
+                    "other.com",
+                    None,
+                    false,
+                    &state,
+                );
+            })
+            .unwrap();
+        let text = buf_text(terminal.backend().buffer());
+        assert!(text.contains("A · a.com"), "got: {text}");
+        assert!(text.contains("B · b.com"), "got: {text}");
+        assert!(!text.contains("session.com"), "got: {text}");
     }
 
     #[test]

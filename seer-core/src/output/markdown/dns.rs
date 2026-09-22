@@ -81,7 +81,7 @@ impl MarkdownFormatter {
             format!(" `{}`", MdSafe(&joined))
         };
 
-        format!(
+        let mut output = vec![format!(
             "[{}] Iteration {}/{}: {} record(s){}{}",
             time_str,
             iteration.iteration,
@@ -89,7 +89,23 @@ impl MarkdownFormatter {
             record_count,
             status,
             values_str
-        )
+        )];
+
+        // Per-value change lists, matching the human formatter's +/- lines.
+        for added in &iteration.added {
+            output.push(format!(
+                "- Added: `{}`",
+                MdSafe(added.trim_end_matches('.'))
+            ));
+        }
+        for removed in &iteration.removed {
+            output.push(format!(
+                "- Removed: `{}`",
+                MdSafe(removed.trim_end_matches('.'))
+            ));
+        }
+
+        output.join("\n")
     }
 
     pub(super) fn format_follow(&self, result: &FollowResult) -> String {
@@ -417,5 +433,35 @@ mod tests {
             out.contains(&format!("- **Duration**: {}", expected)),
             "markdown duration must match the shared formatter:\n{out}"
         );
+    }
+
+    #[test]
+    fn markdown_follow_iteration_lists_added_and_removed_values() {
+        // The human formatter prints the per-value +/- change lists; the
+        // markdown iteration line dropped them, so `--format markdown` only
+        // said "CHANGED" without saying what changed.
+        let iteration = FollowIteration {
+            iteration: 2,
+            total_iterations: 3,
+            timestamp: chrono::Utc::now(),
+            records: vec![DnsRecord {
+                name: "example.com".to_string(),
+                record_type: RecordType::A,
+                ttl: 60,
+                data: crate::dns::RecordData::A {
+                    address: "5.6.7.8".to_string(),
+                },
+            }],
+            changed: true,
+            added: vec!["5.6.7.8".to_string()],
+            removed: vec!["1.2.3.4".to_string(), "evil`|x".to_string()],
+            error: None,
+        };
+        let out = MarkdownFormatter::new().format_follow_iteration(&iteration);
+        assert!(out.contains("(**CHANGED**) `5.6.7.8`"), "got:\n{out}");
+        assert!(out.contains("\n- Added: `5.6.7.8`"), "got:\n{out}");
+        assert!(out.contains("\n- Removed: `1.2.3.4`"), "got:\n{out}");
+        // Change values are attacker-controlled record data: MdSafe applies.
+        assert!(out.contains("\n- Removed: `evil'\\|x`"), "got:\n{out}");
     }
 }

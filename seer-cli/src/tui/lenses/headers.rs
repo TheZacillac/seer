@@ -223,13 +223,27 @@ mod tests {
         assert!(s.contains('C'), "grade must be visible: {s}");
     }
 
+    /// The verdict word on `header`'s dot-leader row. Checking the row itself
+    /// matters: a bare `contains("strict")` is always satisfied by the header
+    /// name "strict-transport-security".
+    fn verdict_on_row(s: &str, header: &str) -> String {
+        let row = s
+            .lines()
+            .find(|l| l.contains(&format!("{header} .")))
+            .unwrap_or_else(|| panic!("no verdict row for {header}: {s}"));
+        row.trim_end()
+            .trim_end_matches('│')
+            .split_whitespace()
+            .last()
+            .unwrap_or_default()
+            .to_string()
+    }
+
     #[test]
     fn renders_each_header_with_its_verdict() {
         let s = render_to_text(&LensData::Headers(Box::new(report())), 80, 16);
-        assert!(s.contains("strict-transport-security"), "got: {s}");
-        assert!(s.contains("strict"), "got: {s}");
-        assert!(s.contains("content-security-policy"), "got: {s}");
-        assert!(s.contains("absent"), "got: {s}");
+        assert_eq!(verdict_on_row(&s, "strict-transport-security"), "strict");
+        assert_eq!(verdict_on_row(&s, "content-security-policy"), "absent");
     }
 
     #[test]

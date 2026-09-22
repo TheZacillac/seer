@@ -6,6 +6,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Row, Table};
 use ratatui::Frame;
 
+use crate::tui::line_editor::LineEditor;
 use crate::tui::panes::tld::{filter_catalog, TldState};
 use crate::tui::theme::Theme;
 use crate::tui::widgets::{kv, panel, scroll_to};
@@ -22,7 +23,7 @@ pub fn render(
     state: &TldState,
     loaded: Option<&TldInfo>,
     loading: bool,
-    editing: Option<&str>,
+    editing: Option<&LineEditor>,
 ) {
     let block = panel::block(theme, "TLD Browser", theme.maroon, false);
     let inner = block.inner(area);
@@ -40,7 +41,7 @@ pub fn render(
 
     // The list filters live against the in-progress edit buffer when the filter
     // field is active, otherwise against the committed filter.
-    let effective_filter = editing.unwrap_or(&state.filter);
+    let effective_filter = editing.map_or(state.filter.as_str(), LineEditor::as_str);
     let list = filter_catalog(effective_filter);
     let sel = if list.is_empty() {
         0
@@ -52,7 +53,7 @@ pub fn render(
     let filter_line = if let Some(buf) = editing {
         Line::from(vec![
             Span::styled("filter: ", Style::default().fg(theme.overlay0)),
-            Span::styled(format!("{buf}▏"), Style::default().fg(theme.text)),
+            Span::styled(buf.with_caret("▏"), Style::default().fg(theme.text)),
             Span::styled(
                 format!("   {} match{}", list.len(), plural(list.len())),
                 Style::default().fg(theme.overlay0),
@@ -202,6 +203,15 @@ mod tests {
     }
 
     fn draw(state: &TldState, loaded: Option<&TldInfo>, editing: Option<&str>) -> String {
+        let editor = editing.map(LineEditor::from);
+        draw_editor(state, loaded, editor.as_ref())
+    }
+
+    fn draw_editor(
+        state: &TldState,
+        loaded: Option<&TldInfo>,
+        editing: Option<&LineEditor>,
+    ) -> String {
         let theme = Theme::frappe();
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -209,6 +219,15 @@ mod tests {
             .draw(|f| render(f, f.area(), &theme, state, loaded, false, editing))
             .unwrap();
         buf_text(terminal.backend().buffer())
+    }
+
+    #[test]
+    fn filter_caret_renders_at_the_cursor() {
+        let state = TldState::default();
+        let mut editor = LineEditor::from("shop");
+        editor.left();
+        let text = draw_editor(&state, None, Some(&editor));
+        assert!(text.contains("filter: sho▏p"), "got: {text}");
     }
 
     #[test]

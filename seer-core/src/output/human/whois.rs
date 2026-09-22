@@ -158,7 +158,7 @@ impl HumanFormatter {
         }
 
         if let Some(expires) = response.expiration_date {
-            let days_until = (expires - chrono::Utc::now()).num_days();
+            let days_until = days_until(expires);
             let expiry_str = expires.format("%Y-%m-%d").to_string();
             let status = self.format_expiry_status(&expiry_str, days_until);
             output.push(format!("  {}: {}", self.label("Expires"), status));

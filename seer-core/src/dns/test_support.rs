@@ -1,5 +1,6 @@
-//! Test-only mock DNS fixture shared by the dns module's hermetic tests
-//! (`resolver.rs`, `follow.rs`): a real UDP socket on 127.0.0.1 serving
+//! Test-only mock DNS fixture shared by the crate's hermetic DNS tests
+//! (`resolver.rs`, `follow.rs`, `compare.rs`, `dnssec.rs`, `posture.rs`, …):
+//! a real UDP socket on 127.0.0.1 serving
 //! hickory-proto-encoded canned responses, so the full `resolve()` path
 //! (normalization → custom-resolver construction → hickory transport →
 //! RData conversion) runs without touching the network.
@@ -111,6 +112,16 @@ fn zone_answers(qname: &str, qtype: HickoryRecordType) -> Vec<HickoryRData> {
         ("1.2.0.192.in-addr.arpa", HickoryRecordType::PTR) => {
             vec![HickoryRData::PTR(wire::PTR(name("ptr.seer.test.")))]
         }
+        // `www` carries its own record (the apex has no CNAME), so a query
+        // that silently strips `www.` comes back empty.
+        ("www.seer.test", HickoryRecordType::CNAME) => {
+            vec![HickoryRData::CNAME(wire::CNAME(name("edge.cdn.test.")))]
+        }
+        // Reverse name of 2606:4700:4700::1111.
+        (
+            "1.1.1.1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.7.4.0.0.7.4.6.0.6.2.ip6.arpa",
+            HickoryRecordType::PTR,
+        ) => vec![HickoryRData::PTR(wire::PTR(name("one.one.one.one.")))],
         _ => vec![],
     }
 }
@@ -205,6 +216,88 @@ pub(crate) async fn spawn_mock_dns_sequence(answer_sets: Vec<Vec<HickoryRData>>)
     port
 }
 
+/// A plausible SOA RRdata for `zone` (for scripted apex answers).
+pub(crate) fn soa_rdata(zone: &str) -> HickoryRData {
+    HickoryRData::SOA(wire::SOA::new(
+        name(&format!("ns1.{zone}.")),
+        name(&format!("hostmaster.{zone}.")),
+        2026070101,
+        7200,
+        3600,
+        1209600,
+        300,
+    ))
+}
+
+/// A scripted reply for [`spawn_mock_dns_fn`].
+pub(crate) enum MockReply {
+    /// NOERROR with these answers, each owned by the query name.
+    Answer(Vec<HickoryRData>),
+    /// NOERROR with an empty answer section (NODATA).
+    NoData,
+    /// NODATA whose AUTHORITY section carries the SOA of the named zone — the
+    /// shape a recursive resolver relays for a name inside that zone.
+    NoDataWithSoa(&'static str),
+    /// NXDOMAIN.
+    NxDomain,
+    /// SERVFAIL — e.g. a validating upstream rejecting a broken DNSSEC chain.
+    ServFail,
+}
+
+/// Binds a UDP socket on an ephemeral loopback port and answers every query
+/// with `handler(qname, qtype)`, where `qname` is the lowercased ASCII query
+/// name without the trailing root dot. Lets a test script a whole multi-name
+/// scenario (tree walks, redirects, per-name failures) that the fixed
+/// [`MockMode::Zone`] table cannot express. Returns the bound port.
+pub(crate) async fn spawn_mock_dns_fn<F>(handler: F) -> u16
+where
+    F: Fn(&str, HickoryRecordType) -> MockReply + Send + 'static,
+{
+    let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind mock DNS");
+    let port = socket.local_addr().expect("mock DNS local addr").port();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 4096];
+        loop {
+            let Ok((len, src)) = socket.recv_from(&mut buf).await else {
+                return;
+            };
+            let Ok(request) = Message::from_vec(&buf[..len]) else {
+                continue;
+            };
+            let mut response = response_skeleton(&request);
+            if let Some(query) = request.queries.first() {
+                let qname = query.name.to_ascii().to_ascii_lowercase();
+                match handler(qname.trim_end_matches('.'), query.query_type) {
+                    MockReply::Answer(answers) => {
+                        for rdata in answers {
+                            response.add_answer(Record::from_rdata(query.name.clone(), 300, rdata));
+                        }
+                    }
+                    MockReply::NoData => {}
+                    MockReply::NoDataWithSoa(zone) => {
+                        response.add_authority(Record::from_rdata(
+                            name(&format!("{zone}.")),
+                            300,
+                            soa_rdata(zone),
+                        ));
+                    }
+                    MockReply::NxDomain => {
+                        response.metadata.response_code = ResponseCode::NXDomain;
+                    }
+                    MockReply::ServFail => {
+                        response.metadata.response_code = ResponseCode::ServFail;
+                    }
+                }
+            }
+            let Ok(bytes) = response.to_vec() else {
+                continue;
+            };
+            let _ = socket.send_to(&bytes, src).await;
+        }
+    });
+    port
+}
+
 /// A resolver wired to the loopback fixture through the `#[cfg(test)]`-only
 /// seams, with a short timeout to keep failing tests fast.
 pub(crate) fn mock_dns_resolver(port: u16) -> DnsResolver {
@@ -212,4 +305,11 @@ pub(crate) fn mock_dns_resolver(port: u16) -> DnsResolver {
         .with_timeout(Duration::from_millis(500))
         .allowing_private_hosts()
         .with_port(port)
+}
+
+/// Like [`mock_dns_resolver`], but ALSO routes queries that name no
+/// nameserver (`resolve(.., None)`) to the fixture, so code that always uses
+/// the default upstream (posture, CAA) can be exercised end to end.
+pub(crate) fn mock_dns_resolver_default(port: u16) -> DnsResolver {
+    mock_dns_resolver(port).with_default_nameserver("127.0.0.1")
 }

@@ -34,14 +34,203 @@ pub enum CommandResult {
     Error(String),
 }
 
+const UNBALANCED_QUOTE: &str = "Unbalanced quote in command line (close the \" or ' )";
+
 /// Splits a REPL input line into tokens, honoring shell-style single/double
 /// quotes so arguments containing spaces (e.g. `bulk lookup "Domain
 /// Lists/prod.txt"`) survive intact — the CLI gets this for free from the OS
 /// shell, but the REPL tokenizes its own input. Errors on unbalanced quotes
 /// instead of silently producing garbage tokens.
+///
+/// On Windows, backslash is the path separator, so POSIX shell escaping
+/// (which `shlex` implements) would eat it: `C:\Users\me\d.txt` became
+/// `C:Usersmed.txt`. There the line is split by [`split_quoted_literal`],
+/// which honors quotes but keeps every backslash literally.
 pub fn tokenize_line(line: &str) -> Result<Vec<String>, String> {
-    shlex::split(line)
-        .ok_or_else(|| "Unbalanced quote in command line (close the \" or ' )".to_string())
+    if cfg!(windows) {
+        split_quoted_literal(line)
+    } else {
+        shlex::split(line).ok_or_else(|| UNBALANCED_QUOTE.to_string())
+    }
+}
+
+/// Splits `line` on whitespace, grouping text inside single or double quotes
+/// into one token (quotes removed; adjacent quoted/unquoted runs join, and
+/// `""` yields an empty token). Backslash has no special meaning. This is the
+/// Windows REPL tokenizer; it is a plain function so every platform tests it.
+pub fn split_quoted_literal(line: &str) -> Result<Vec<String>, String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    // True once the current token has started — distinguishes an explicit
+    // empty token (`""`) from no token at all.
+    let mut in_token = false;
+    let mut quote: Option<char> = None;
+
+    for c in line.chars() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => current.push(c),
+            None if c == '"' || c == '\'' => {
+                quote = Some(c);
+                in_token = true;
+            }
+            None if c.is_whitespace() => {
+                if in_token {
+                    tokens.push(std::mem::take(&mut current));
+                    in_token = false;
+                }
+            }
+            None => {
+                current.push(c);
+                in_token = true;
+            }
+        }
+    }
+
+    if quote.is_some() {
+        return Err(UNBALANCED_QUOTE.to_string());
+    }
+    if in_token {
+        tokens.push(current);
+    }
+    Ok(tokens)
+}
+
+/// Returns a usage error for an unrecognized `--flag` / `-f` token, so a typo
+/// like `--recrod` fails loudly instead of being silently ignored.
+fn reject_unknown_flag(token: &str, usage: &str) -> Result<(), String> {
+    if token.starts_with('-') {
+        return Err(format!("Unknown option: {token}\n{usage}"));
+    }
+    Ok(())
+}
+
+/// Parsed arguments for the REPL `subdomains` command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubdomainsArgs {
+    pub domain: String,
+    /// Resolve and classify each discovered name (live/dead, dangling CNAME).
+    pub resolve: bool,
+    /// Diff against the stored baseline.
+    pub diff: bool,
+    /// Record the fresh enumeration as the new baseline.
+    pub record: bool,
+}
+
+const SUBDOMAINS_USAGE: &str = "Usage: subdomains <domain> [--resolve | --diff] [--record]";
+
+/// Parses `subdomains <domain> [--resolve] [--diff] [--record]`, mirroring
+/// the CLI: `--resolve` conflicts with `--diff`/`--record`, and unknown
+/// flags or extra arguments are usage errors.
+pub fn parse_subdomains_args(args: &[&str]) -> Result<SubdomainsArgs, String> {
+    let mut domain: Option<String> = None;
+    let (mut resolve, mut diff, mut record) = (false, false, false);
+    for arg in args {
+        match *arg {
+            "--resolve" => resolve = true,
+            "--diff" => diff = true,
+            "--record" => record = true,
+            other => {
+                reject_unknown_flag(other, SUBDOMAINS_USAGE)?;
+                if domain.is_some() {
+                    return Err(format!("Unexpected argument: {other}\n{SUBDOMAINS_USAGE}"));
+                }
+                domain = Some(other.to_string());
+            }
+        }
+    }
+    let Some(domain) = domain else {
+        return Err(SUBDOMAINS_USAGE.to_string());
+    };
+    if resolve && (diff || record) {
+        return Err(format!(
+            "--resolve cannot be combined with --diff or --record\n{SUBDOMAINS_USAGE}"
+        ));
+    }
+    Ok(SubdomainsArgs {
+        domain,
+        resolve,
+        diff,
+        record,
+    })
+}
+
+/// Parsed arguments for the REPL `takeover` command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TakeoverArgs {
+    pub domain: String,
+    /// Hosts from repeatable `--host <HOST>`; non-empty skips CT enumeration.
+    pub hosts: Vec<String>,
+}
+
+const TAKEOVER_USAGE: &str = "Usage: takeover <domain> [--host <host>]...";
+
+/// Parses `takeover <domain> [--host <HOST>]...` (also `--host=HOST`),
+/// mirroring the CLI's repeatable `--host`.
+pub fn parse_takeover_args(args: &[&str]) -> Result<TakeoverArgs, String> {
+    let mut domain: Option<String> = None;
+    let mut hosts = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i];
+        if arg == "--host" {
+            let Some(host) = args.get(i + 1) else {
+                return Err(format!("Missing value after --host\n{TAKEOVER_USAGE}"));
+            };
+            hosts.push(host.to_string());
+            i += 2;
+            continue;
+        }
+        if let Some(host) = arg.strip_prefix("--host=") {
+            if host.is_empty() {
+                return Err(format!("Missing value after --host\n{TAKEOVER_USAGE}"));
+            }
+            hosts.push(host.to_string());
+        } else {
+            reject_unknown_flag(arg, TAKEOVER_USAGE)?;
+            if domain.is_some() {
+                return Err(format!("Unexpected argument: {arg}\n{TAKEOVER_USAGE}"));
+            }
+            domain = Some(arg.to_string());
+        }
+        i += 1;
+    }
+    let Some(domain) = domain else {
+        return Err(TAKEOVER_USAGE.to_string());
+    };
+    Ok(TakeoverArgs { domain, hosts })
+}
+
+/// Parsed arguments for the REPL `drift` command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DriftArgs {
+    pub domain: String,
+    /// Record the fresh lookup as the new baseline.
+    pub record: bool,
+}
+
+const DRIFT_USAGE: &str = "Usage: drift <domain> [--record]";
+
+/// Parses `drift <domain> [--record]`; unknown flags (e.g. the typo
+/// `--recrod`, which previously silently skipped recording) are errors.
+pub fn parse_drift_args(args: &[&str]) -> Result<DriftArgs, String> {
+    let mut domain: Option<String> = None;
+    let mut record = false;
+    for arg in args {
+        if *arg == "--record" {
+            record = true;
+            continue;
+        }
+        reject_unknown_flag(arg, DRIFT_USAGE)?;
+        if domain.is_some() {
+            return Err(format!("Unexpected argument: {arg}\n{DRIFT_USAGE}"));
+        }
+        domain = Some(arg.to_string());
+    }
+    let Some(domain) = domain else {
+        return Err(DRIFT_USAGE.to_string());
+    };
+    Ok(DriftArgs { domain, record })
 }
 
 /// Parsed arguments for the REPL `bulk` command.
@@ -124,13 +313,14 @@ pub struct FollowArgs {
 ///
 /// Positional numbers are order-sensitive: the first integer is the iteration
 /// count, any later number (integer or float) the interval in minutes. A bare
-/// float is always the interval. Non-numeric tokens are tried as record types.
+/// float is always the interval. Any other token must be a record type — a
+/// typo (`MXX`) or unknown `--flag` is an error, matching the CLI and the
+/// REPL's other DNS commands, rather than silently following A records.
 pub fn parse_follow_args(args: &[&str]) -> Result<FollowArgs, String> {
+    const FOLLOW_USAGE: &str =
+        "Usage: follow <domain> [iterations] [interval_minutes] [type] [@server] [--changes-only]";
     let Some(domain) = args.first() else {
-        return Err(
-            "Usage: follow <domain> [iterations] [interval_minutes] [type] [@server] [--changes-only]"
-                .to_string(),
-        );
+        return Err(FOLLOW_USAGE.to_string());
     };
 
     let mut parsed = FollowArgs {
@@ -152,6 +342,8 @@ pub fn parse_follow_args(args: &[&str]) -> Result<FollowArgs, String> {
             parsed.nameserver = Some(ns.to_string());
         } else if *arg == "--changes-only" {
             parsed.changes_only = true;
+        } else if arg.starts_with("--") {
+            return Err(format!("Unknown option: {arg}\n{FOLLOW_USAGE}"));
         } else if let Ok(n) = arg.parse::<usize>() {
             // First number is iterations, second is interval
             if !iterations_set {
@@ -162,8 +354,8 @@ pub fn parse_follow_args(args: &[&str]) -> Result<FollowArgs, String> {
             }
         } else if let Ok(mins) = arg.parse::<f64>() {
             parsed.interval_minutes = mins;
-        } else if let Ok(rt) = arg.parse() {
-            parsed.record_type = rt;
+        } else {
+            parsed.record_type = crate::try_parse_record_type(arg)?;
         }
     }
 
@@ -293,6 +485,150 @@ mod tests {
         assert_eq!(got.record_type, RecordType::AAAA);
         assert_eq!(got.nameserver.as_deref(), Some("1.1.1.1"));
         assert!(!got.changes_only);
+    }
+
+    #[test]
+    fn follow_rejects_mistyped_record_type() {
+        // `follow example.com 5 MXX` previously ignored the typo and watched
+        // A records.
+        let err = parse_follow_args(&["example.com", "5", "MXX"]).expect_err("must error");
+        assert!(err.contains("MXX"), "error should name the input: {err}");
+        assert!(err.contains("valid types"), "got: {err}");
+    }
+
+    #[test]
+    fn follow_rejects_unknown_long_flag() {
+        let err =
+            parse_follow_args(&["example.com", "--chnages-only"]).expect_err("typo'd flag errors");
+        assert!(err.contains("--chnages-only"), "got: {err}");
+        assert!(err.contains("Usage: follow"), "got: {err}");
+    }
+
+    // ---------------- subdomains / takeover / drift ----------------
+
+    #[test]
+    fn subdomains_parses_flags_in_any_position() {
+        let got = parse_subdomains_args(&["--diff", "example.com", "--record"]).expect("valid");
+        assert_eq!(
+            got,
+            SubdomainsArgs {
+                domain: "example.com".into(),
+                resolve: false,
+                diff: true,
+                record: true,
+            }
+        );
+        let got = parse_subdomains_args(&["example.com", "--resolve"]).expect("valid");
+        assert!(got.resolve && !got.diff && !got.record);
+    }
+
+    #[test]
+    fn subdomains_rejects_unknown_flags_conflicts_and_missing_domain() {
+        assert!(parse_subdomains_args(&[]).is_err());
+        assert!(parse_subdomains_args(&["--diff"]).is_err());
+        let err = parse_subdomains_args(&["example.com", "--reslove"]).expect_err("typo");
+        assert!(err.contains("--reslove"), "got: {err}");
+        let err = parse_subdomains_args(&["example.com", "--resolve", "--diff"])
+            .expect_err("conflict, as in the CLI");
+        assert!(err.contains("--resolve"), "got: {err}");
+        assert!(parse_subdomains_args(&["a.com", "b.com"]).is_err());
+    }
+
+    #[test]
+    fn takeover_collects_repeatable_host_flags() {
+        let got = parse_takeover_args(&[
+            "example.com",
+            "--host",
+            "a.example.com",
+            "--host=b.example.com",
+        ])
+        .expect("valid");
+        assert_eq!(got.domain, "example.com");
+        assert_eq!(got.hosts, vec!["a.example.com", "b.example.com"]);
+        assert!(parse_takeover_args(&["example.com"])
+            .expect("valid")
+            .hosts
+            .is_empty());
+    }
+
+    #[test]
+    fn takeover_rejects_dangling_host_and_unknown_flags() {
+        let err = parse_takeover_args(&["example.com", "--host"]).expect_err("dangling");
+        assert!(err.contains("--host"), "got: {err}");
+        let err = parse_takeover_args(&["example.com", "--hots", "a.x"]).expect_err("typo");
+        assert!(err.contains("--hots"), "got: {err}");
+        assert!(parse_takeover_args(&[]).is_err());
+    }
+
+    #[test]
+    fn drift_accepts_record_and_rejects_typos() {
+        let got = parse_drift_args(&["example.com", "--record"]).expect("valid");
+        assert_eq!(
+            got,
+            DriftArgs {
+                domain: "example.com".into(),
+                record: true,
+            }
+        );
+        // `--recrod` previously ran a non-recording drift check silently.
+        let err = parse_drift_args(&["example.com", "--recrod"]).expect_err("typo");
+        assert!(err.contains("--recrod"), "got: {err}");
+        assert!(parse_drift_args(&[]).is_err());
+    }
+
+    // ---------------- split_quoted_literal (Windows tokenizer) ----------------
+
+    #[test]
+    fn literal_splitter_keeps_windows_backslashes() {
+        let got = split_quoted_literal(r"bulk lookup C:\Users\me\d.txt -o C:\Reports\out.csv")
+            .expect("valid");
+        assert_eq!(
+            got,
+            vec![
+                "bulk",
+                "lookup",
+                r"C:\Users\me\d.txt",
+                "-o",
+                r"C:\Reports\out.csv"
+            ]
+        );
+    }
+
+    #[test]
+    fn literal_splitter_honors_quotes_around_paths_with_spaces() {
+        let got = split_quoted_literal(r#"bulk lookup "C:\My Lists\d.txt" -o 'D:\out dir\r.csv'"#)
+            .expect("valid");
+        assert_eq!(
+            got,
+            vec![
+                "bulk",
+                "lookup",
+                r"C:\My Lists\d.txt",
+                "-o",
+                r"D:\out dir\r.csv"
+            ]
+        );
+        // A trailing backslash inside quotes must not escape the closing quote.
+        let got = split_quoted_literal(r#"bulk lookup "C:\dir\""#).expect("valid");
+        assert_eq!(got, vec!["bulk", "lookup", r"C:\dir\"]);
+    }
+
+    #[test]
+    fn literal_splitter_joins_adjacent_runs_and_keeps_empty_quotes() {
+        assert_eq!(
+            split_quoted_literal(r#"a"b c"d '' e"#).expect("valid"),
+            vec!["ab cd", "", "e"]
+        );
+        assert_eq!(
+            split_quoted_literal("  \t ").expect("valid"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn literal_splitter_rejects_unbalanced_quote() {
+        let err = split_quoted_literal(r#"bulk lookup "C:\unterminated"#).unwrap_err();
+        assert!(err.to_lowercase().contains("quote"), "got: {err}");
     }
 
     // ---------------- tokenize_line ----------------

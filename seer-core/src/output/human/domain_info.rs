@@ -96,13 +96,18 @@ impl HumanFormatter {
             )
         ));
         output.push(format!(
-            "  {}: {} domains, {} warnings",
+            "  {}: {} domains, {} warnings, {} critical",
             self.label("Total"),
             self.value(&report.total.to_string()),
             if report.warnings > 0 {
                 self.warning(&report.warnings.to_string())
             } else {
                 self.value(&report.warnings.to_string())
+            },
+            if report.critical > 0 {
+                self.error(&report.critical.to_string())
+            } else {
+                self.value(&report.critical.to_string())
             }
         ));
 
@@ -466,5 +471,28 @@ impl HumanFormatter {
         }
 
         output.join("\n")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn watch_summary_includes_critical_count() {
+        // Markdown printed "N warnings, M critical"; human omitted the
+        // critical tally, so the same report was less complete by default.
+        let report = crate::watchlist::WatchReport {
+            checked_at: chrono::Utc::now(),
+            results: Vec::new(),
+            total: 3,
+            warnings: 2,
+            critical: 1,
+        };
+        let out = HumanFormatter::new().without_colors().format_watch(&report);
+        assert!(
+            out.contains("Total: 3 domains, 2 warnings, 1 critical"),
+            "got:\n{out}"
+        );
     }
 }

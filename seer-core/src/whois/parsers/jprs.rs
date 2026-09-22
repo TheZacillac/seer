@@ -27,57 +27,72 @@ use crate::whois::parser::WhoisResponse;
 /// (`p. [ネームサーバ]   value`) and the current bracket-only format
 /// (`[Name Server]   value` / `[ネームサーバ]   value`).
 static NS_PATTERN: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?m)^(?:p\.\s+\[ネームサーバ\]|\[(?:Name Server|ネームサーバ)\])\s+(.+)$")
+    Regex::new(r"(?m)^(?:p\.[ \t]+\[ネームサーバ\]|\[(?:Name Server|ネームサーバ)\])[ \t]+(.+)$")
         .expect("Invalid JPRS NS regex")
 });
 
 /// Matches organization (English): `g. [Organization]   value`
 static ORG_PATTERN: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?m)^g\.\s+\[Organization\]\s+(.+)$").expect("Invalid JPRS org regex")
+    Regex::new(r"(?m)^g\.[ \t]+\[Organization\][ \t]+(.+)$").expect("Invalid JPRS org regex")
 });
 
 /// Matches organization (Japanese): `f. [組織名]   value`
-static ORG_JP_PATTERN: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?m)^f\.\s+\[組織名\]\s+(.+)$").expect("Invalid JPRS org JP regex"));
+static ORG_JP_PATTERN: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?m)^f\.[ \t]+\[組織名\][ \t]+(.+)$").expect("Invalid JPRS org JP regex")
+});
 
 /// Matches state: `[状態]   value` / `[Status]   value` / `[State]   value`
 static STATUS_PATTERN: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?m)^\[(?:状態|Status|State)\]\s+(.+)$").expect("Invalid JPRS status regex")
+    Regex::new(r"(?m)^\[(?:状態|Status|State)\][ \t]+(.+)$").expect("Invalid JPRS status regex")
 });
 
-/// Matches last updated: `[最終更新]` / `[Last Updated]`   YYYY/MM/DD HH:MM:SS (JST)
+/// Matches last updated: `[最終更新]` / `[Last Updated]` (general-use .jp) /
+/// `[Last Update]` (attribute-type co.jp, or.jp, ne.jp, ac.jp, go.jp, …)
+///   YYYY/MM/DD HH:MM:SS (JST)
 static UPDATED_PATTERN: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?m)^\[(?:最終更新|Last Updated)\]\s+(.+)$").expect("Invalid JPRS updated regex")
+    Regex::new(r"(?m)^\[(?:最終更新|Last Updated?)\][ \t]+(.+)$")
+        .expect("Invalid JPRS updated regex")
 });
 
-/// Matches creation date: `[登録年月日]` / `[接続年月日]` / `[Created on]`   YYYY/MM/DD
+/// Matches creation date: `[登録年月日]` / `[接続年月日]` / `[Created on]`
+/// (general-use .jp) and `[Registered Date]` / `[Connected Date]`
+/// (attribute-type co.jp etc.)   YYYY/MM/DD
 static CREATED_PATTERN: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?m)^\[(?:登録年月日|接続年月日|Created on)\]\s+(.+)$")
-        .expect("Invalid JPRS created regex")
+    Regex::new(
+        r"(?m)^\[(?:登録年月日|接続年月日|Created on|Registered Date|Connected Date)\][ \t]+(.+)$",
+    )
+    .expect("Invalid JPRS created regex")
 });
 
 /// Matches expiration date: `[有効期限]` / `[Expires on]`   YYYY/MM/DD
 static EXPIRES_PATTERN: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?m)^\[(?:有効期限|Expires on)\]\s+(.+)$").expect("Invalid JPRS expires regex")
+    Regex::new(r"(?m)^\[(?:有効期限|Expires on)\][ \t]+(.+)$").expect("Invalid JPRS expires regex")
 });
 
-/// Matches DNSSEC signing key line, legacy `s. [署名鍵]` or current
+/// Matches DNSSEC signing key line, lettered `s. [署名鍵]` / `s. [Signing Key]`
+/// (the latter is what attribute-type co.jp etc. print under `/e`) or current
 /// `[Signing Key]` / `[署名鍵]`. The value portion is optional — an empty
 /// value means unsigned. Uses `[^\S\n]*` instead of `\s*` to avoid matching
 /// across newlines in multiline mode.
 static SIGNING_KEY_LINE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?m)^(?:s\.\s+\[署名鍵\]|\[(?:Signing Key|署名鍵)\])[^\S\n]*(.+)?$")
+    Regex::new(r"(?m)^(?:s\.[ \t]+)?\[(?:Signing Key|署名鍵)\][^\S\n]*(.+)?$")
         .expect("Invalid JPRS signing key regex")
+});
+
+/// Attribute-type domains (co.jp, or.jp, …) carry their expiry inside the
+/// state value: `[State]   Connected (2027/03/31)`.
+static STATE_EXPIRY_PATTERN: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"\((\d{4}/\d{1,2}/\d{1,2})\)").expect("Invalid JPRS state expiry regex")
 });
 
 /// Matches registrant lines in the current bracket format: prefer the English
 /// `[Registrant]` value; fall back to the Japanese `[登録者名]`.
 static REGISTRANT_EN_PATTERN: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?m)^\[Registrant\]\s+(.+)$").expect("Invalid JPRS registrant regex")
+    Regex::new(r"(?m)^\[Registrant\][ \t]+(.+)$").expect("Invalid JPRS registrant regex")
 });
 
 static REGISTRANT_JP_PATTERN: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?m)^\[登録者名\]\s+(.+)$").expect("Invalid JPRS registrant JP regex")
+    Regex::new(r"(?m)^\[登録者名\][ \t]+(.+)$").expect("Invalid JPRS registrant JP regex")
 });
 
 // Also support the English-appended format (when /e is used)
@@ -86,7 +101,7 @@ static REGISTRANT_JP_PATTERN: Lazy<Regex> = Lazy::new(|| {
 /// not captured, so only the trailing hostname lands in the capture group —
 /// otherwise a `p. [label] host` line yields `[label] host` as the nameserver.
 static NS_EN_PATTERN: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?im)^(?:Name Server\s*:?|p\.\s*(?:\[[^\]]*\])?)\s+(.+)$")
+    Regex::new(r"(?im)^(?:Name Server[ \t]*:?|p\.[ \t]*(?:\[[^\]]*\])?)[ \t]+(.+)$")
         .expect("Invalid JPRS NS EN regex")
 });
 
@@ -104,8 +119,10 @@ impl JprsParser {
 
         // JPRS uses "YYYY/MM/DD HH:MM:SS" or "YYYY/MM/DD"
         if let Ok(dt) = NaiveDateTime::parse_from_str(cleaned, "%Y/%m/%d %H:%M:%S") {
-            // JST is UTC+9
-            return Some(dt.and_utc() - chrono::Duration::hours(9));
+            // JST is UTC+9. Checked: the body is untrusted (port 43 is
+            // plaintext), and a year at chrono's lower bound would make the
+            // plain `-` operator panic on underflow.
+            return dt.and_utc().checked_sub_signed(chrono::Duration::hours(9));
         }
         if let Ok(dt) =
             NaiveDateTime::parse_from_str(&format!("{} 00:00:00", cleaned), "%Y/%m/%d %H:%M:%S")
@@ -126,8 +143,6 @@ impl RegistryParser for JprsParser {
         let mut nameservers = Vec::new();
         let mut organization = None;
         let mut status = Vec::new();
-        let mut updated_date = None;
-        let mut creation_date = None;
         let mut has_signing_key = false;
 
         // Extract nameservers (Japanese format)
@@ -191,23 +206,24 @@ impl RegistryParser for JprsParser {
             }
         }
 
-        // Extract dates
-        if let Some(caps) = UPDATED_PATTERN.captures(raw) {
-            if let Some(m) = caps.get(1) {
-                updated_date = Self::parse_jprs_date(m.as_str());
-            }
-        }
-        if let Some(caps) = CREATED_PATTERN.captures(raw) {
-            if let Some(m) = caps.get(1) {
-                creation_date = Self::parse_jprs_date(m.as_str());
-            }
-        }
-        let mut expiration_date = None;
-        if let Some(caps) = EXPIRES_PATTERN.captures(raw) {
-            if let Some(m) = caps.get(1) {
-                expiration_date = Self::parse_jprs_date(m.as_str());
-            }
-        }
+        // Extract dates (first occurrence of the label that parses, so an
+        // empty `[Registered Date]` falls through to `[Connected Date]`).
+        let first_date = |pattern: &Regex| {
+            pattern
+                .captures_iter(raw)
+                .filter_map(|caps| caps.get(1))
+                .find_map(|m| Self::parse_jprs_date(m.as_str()))
+        };
+        let updated_date = first_date(&UPDATED_PATTERN);
+        let creation_date = first_date(&CREATED_PATTERN);
+        let expiration_date = first_date(&EXPIRES_PATTERN).or_else(|| {
+            status.iter().find_map(|s| {
+                STATE_EXPIRY_PATTERN
+                    .captures(s)
+                    .and_then(|caps| caps.get(1))
+                    .and_then(|m| Self::parse_jprs_date(m.as_str()))
+            })
+        });
 
         // DNSSEC — check if signing key has an actual value
         if let Some(caps) = SIGNING_KEY_LINE.captures(raw) {
@@ -480,5 +496,132 @@ Domain Information: [ドメイン情報]
         assert!(result.expiration_date.is_some(), "expiry from [Expires on]");
         assert!(result.status.contains(&"Active".to_string()));
         assert_eq!(result.dnssec.as_deref(), Some("signedDelegation"));
+    }
+
+    /// An EMPTY bracket field must not capture the next line: `\s+` after
+    /// the label used to match the line break, turning an empty
+    /// `p. [Name Server]` into the nameserver `s. [signing key]`.
+    #[test]
+    fn test_jprs_empty_fields_do_not_capture_next_line() {
+        let raw = "Domain Information:\n\
+                   a. [Domain Name]                EXAMPLE.CO.JP\n\
+                   g. [Organization]               \n\
+                   l. [Organization Type]          Company\n\
+                   p. [Name Server]                \n\
+                   s. [Signing Key]                \n\
+                   [State]                         Connected (2027/03/31)\n";
+        let result = JprsParser::new().parse("example.co.jp", "whois.jprs.jp", raw);
+        assert!(
+            result.nameservers.is_empty(),
+            "empty NS line must not yield the next line: {:?}",
+            result.nameservers
+        );
+        assert_eq!(
+            result.organization, None,
+            "empty [Organization] must not capture [Organization Type]"
+        );
+    }
+
+    /// Attribute-type .jp (co.jp, or.jp, ne.jp, ac.jp, go.jp …) queried with
+    /// `/e`: dates are `[Registered Date]` / `[Connected Date]` /
+    /// `[Last Update]`, the signing key is `s. [Signing Key]`, and the expiry
+    /// is carried in the state value `Connected (YYYY/MM/DD)`.
+    const SAMPLE_JPRS_CO_JP_EN: &str = "\
+[ JPRS database provides information on network administration. Its use is    ]
+[ restricted to network administration purposes. For further information,     ]
+[ use 'whois -h whois.jprs.jp help'. To suppress Japanese output, add'/e'     ]
+[ at the end of command, e.g. 'whois -h whois.jprs.jp xxx/e'.                 ]
+
+Domain Information:
+a. [Domain Name]                GOOGLE.CO.JP
+g. [Organization]               Google Japan G.K.
+l. [Organization Type]          Limited Liability Company
+m. [Administrative Contact]     DL152JP
+n. [Technical Contact]          TW124137JP
+p. [Name Server]                ns1.google.com
+p. [Name Server]                ns2.google.com
+p. [Name Server]                ns3.google.com
+p. [Name Server]                ns4.google.com
+s. [Signing Key]                \n\
+[State]                         Connected (2027/03/31)
+[Lock Status]                   DomainTransferLocked
+[Lock Status]                   AgentChangeLocked
+[Registered Date]               2001/03/22
+[Connected Date]                2001/03/22
+[Last Update]                   2026/04/01 01:05:10 (JST)
+";
+
+    #[test]
+    fn test_jprs_attribute_type_co_jp_labels() {
+        use chrono::{Datelike, Timelike};
+        let result = JprsParser::new().parse("google.co.jp", "whois.jprs.jp", SAMPLE_JPRS_CO_JP_EN);
+
+        assert_eq!(
+            result.nameservers,
+            vec![
+                "ns1.google.com",
+                "ns2.google.com",
+                "ns3.google.com",
+                "ns4.google.com"
+            ]
+        );
+        assert_eq!(result.organization.as_deref(), Some("Google Japan G.K."));
+        let created = result
+            .creation_date
+            .expect("created from [Registered Date]");
+        assert_eq!(
+            (created.year(), created.month(), created.day()),
+            (2001, 3, 22)
+        );
+        let updated = result.updated_date.expect("updated from [Last Update]");
+        // 01:05:10 JST == 16:05:10 UTC the previous day.
+        assert_eq!(
+            (updated.month(), updated.day(), updated.hour()),
+            (3, 31, 16),
+            "JST must be converted to UTC"
+        );
+        let expires = result
+            .expiration_date
+            .expect("expiry from the Connected (YYYY/MM/DD) state");
+        assert_eq!(
+            (expires.year(), expires.month(), expires.day()),
+            (2027, 3, 31)
+        );
+        assert_eq!(
+            result.dnssec, None,
+            "an empty s. [Signing Key] means unsigned"
+        );
+
+        // A populated `s. [Signing Key]` line marks the zone as signed.
+        let signed = SAMPLE_JPRS_CO_JP_EN.replace(
+            "s. [Signing Key]                \n",
+            "s. [Signing Key]                12345 8 2 ABCDEF0123456789\n",
+        );
+        assert_ne!(signed, SAMPLE_JPRS_CO_JP_EN, "fixture replacement applied");
+        let result = JprsParser::new().parse("google.co.jp", "whois.jprs.jp", &signed);
+        assert_eq!(result.dnssec.as_deref(), Some("signedDelegation"));
+    }
+
+    /// A hostile / on-path server (port 43 is plaintext) can send a date at
+    /// chrono's lower bound; subtracting the JST offset must not underflow
+    /// and panic — the date is simply dropped.
+    #[test]
+    fn test_jprs_date_at_chrono_min_does_not_panic() {
+        let min = NaiveDateTime::MIN.format("%Y/%m/%d %H:%M:%S").to_string();
+        assert!(
+            NaiveDateTime::parse_from_str(&min, "%Y/%m/%d %H:%M:%S").is_ok(),
+            "fixture must reach the JST-offset subtraction: {min}"
+        );
+        assert_eq!(JprsParser::parse_jprs_date(&format!("{min} (JST)")), None);
+
+        let raw = format!(
+            "Domain Information:\n\
+             [Domain Name]                   EXAMPLE.JP\n\
+             [Name Server]                   ns1.example.jp\n\
+             [Last Updated]                  {min} (JST)\n"
+        );
+        let result = JprsParser::new().parse("example.jp", "whois.jprs.jp", &raw);
+        assert_eq!(result.updated_date, None);
+        assert_eq!(result.nameservers, vec!["ns1.example.jp"]);
     }
 }

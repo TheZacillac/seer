@@ -1,7 +1,40 @@
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::Value;
 
 use crate::error::{Result, SeerError};
+
+/// Deserializes an optional member leniently: a value that doesn't fit `T`
+/// yields `None` instead of failing the whole RDAP response. Registries are
+/// sloppy with the less-used members (`secureDNS`, nameserver glue, …), and
+/// one malformed sub-object must not cost the registrar/dates/status that
+/// parsed fine.
+fn lenient_option<'de, D, T>(deserializer: D) -> std::result::Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: DeserializeOwned,
+{
+    let value = Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).ok())
+}
+
+/// Deserializes a JSON array element by element, dropping elements that
+/// don't fit `T` (and treating a non-array as empty) rather than failing the
+/// whole response.
+fn lenient_vec<'de, D, T>(deserializer: D) -> std::result::Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: DeserializeOwned,
+{
+    Ok(match Value::deserialize(deserializer)? {
+        Value::Array(items) => items
+            .into_iter()
+            .filter_map(|item| serde_json::from_value(item).ok())
+            .collect(),
+        _ => Vec::new(),
+    })
+}
 
 /// RDAP response for domain, IP, or ASN lookups.
 /// Follows RFC 7483 (JSON Responses for RDAP).
@@ -32,7 +65,17 @@ pub struct RdapResponse {
     #[serde(default)]
     pub nameservers: Vec<RdapNameserver>,
 
-    #[serde(default)]
+    /// DNSSEC delegation data. RFC 9083 spells the member `secureDNS` (all
+    /// caps "DNS"), which the struct-wide camelCase rule would have mapped to
+    /// `secureDns` — a key no real server sends, so DNSSEC state silently
+    /// never parsed. Renamed explicitly; the camelCase spelling is still
+    /// accepted as an alias. Lenient: a malformed object yields `None`.
+    #[serde(
+        rename = "secureDNS",
+        alias = "secureDns",
+        default,
+        deserialize_with = "lenient_option"
+    )]
     pub secure_dns: Option<SecureDns>,
 
     #[serde(default)]
@@ -79,7 +122,7 @@ pub struct RdapResponse {
 
     // Raw JSON for extended data
     #[serde(flatten)]
-    pub extra: serde_json::Map<String, serde_json::Value>,
+    pub extra: serde_json::Map<String, Value>,
 }
 
 /// An event in the lifecycle of an RDAP object (registration, expiration, etc.).
@@ -120,7 +163,7 @@ pub struct RdapEntity {
     pub public_ids: Vec<PublicId>,
 
     #[serde(default)]
-    pub vcard_array: Option<serde_json::Value>,
+    pub vcard_array: Option<Value>,
 
     #[serde(default)]
     pub entities: Vec<RdapEntity>,
@@ -138,160 +181,147 @@ pub struct RdapEntity {
     pub status: Vec<String>,
 }
 
+/// Trims `s`, returning `None` when nothing is left. Redacted jCard values
+/// are commonly empty strings (`["fn", {}, "text", ""]`); treating them as
+/// absent lets callers fall back to the handle or to WHOIS instead of
+/// rendering a blank field.
+fn non_empty_text(s: &str) -> Option<String> {
+    let t = s.trim();
+    (!t.is_empty()).then(|| t.to_string())
+}
+
+/// Strips a leading (case-insensitive) `tel:` URI scheme from a phone value.
+fn strip_tel_scheme(s: &str) -> &str {
+    let t = s.trim();
+    match t.get(..4) {
+        Some(scheme) if scheme.eq_ignore_ascii_case("tel:") => t.get(4..).unwrap_or(""),
+        _ => t,
+    }
+}
+
+/// Collects the non-empty text of one structured jCard component, which is
+/// either a string or (for multi-valued components such as a multi-line
+/// street) an array of strings.
+fn push_component_text(component: &Value, out: &mut Vec<String>) {
+    match component {
+        Value::String(s) => out.extend(non_empty_text(s)),
+        Value::Array(items) => out.extend(
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .filter_map(non_empty_text),
+        ),
+        _ => {}
+    }
+}
+
 impl RdapEntity {
+    /// Iterates this entity's jCard properties named `name`
+    /// (`[name, params, type, value, ...]`), skipping malformed entries.
+    fn vcard_props<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a [Value]> + 'a {
+        self.vcard_array
+            .as_ref()
+            .and_then(Value::as_array)
+            .and_then(|arr| arr.get(1))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_array)
+            .filter(move |prop| prop.len() >= 4 && prop[0].as_str() == Some(name))
+            .map(Vec::as_slice)
+    }
+
+    /// The entity handle, unless it is blank.
+    fn non_empty_handle(&self) -> Option<String> {
+        self.handle.as_deref().and_then(non_empty_text)
+    }
+
+    /// Display name (`fn`). A redacted, empty `fn` reads as absent.
     pub fn get_name(&self) -> Option<String> {
-        if let Some(vcard) = &self.vcard_array {
-            if let Some(arr) = vcard.as_array() {
-                if arr.len() > 1 {
-                    if let Some(props) = arr[1].as_array() {
-                        for prop in props {
-                            if let Some(prop_arr) = prop.as_array() {
-                                if prop_arr.len() >= 4 && prop_arr[0].as_str() == Some("fn") {
-                                    return prop_arr[3].as_str().map(String::from);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        None
+        self.vcard_props("fn")
+            .find_map(|prop| prop[3].as_str().and_then(non_empty_text))
     }
 
     pub fn get_organization(&self) -> Option<String> {
-        if let Some(vcard) = &self.vcard_array {
-            if let Some(arr) = vcard.as_array() {
-                if arr.len() > 1 {
-                    if let Some(props) = arr[1].as_array() {
-                        for prop in props {
-                            if let Some(prop_arr) = prop.as_array() {
-                                if prop_arr.len() >= 4 && prop_arr[0].as_str() == Some("org") {
-                                    // org value can be a string or array
-                                    if let Some(org_str) = prop_arr[3].as_str() {
-                                        return Some(org_str.to_string());
-                                    } else if let Some(org_arr) = prop_arr[3].as_array() {
-                                        // org is often ["Company Name", "Department"]
-                                        if let Some(first) = org_arr.first() {
-                                            if let Some(org_str) = first.as_str() {
-                                                return Some(org_str.to_string());
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        None
+        self.vcard_props("org").find_map(|prop| match &prop[3] {
+            Value::String(s) => non_empty_text(s),
+            // org is often ["Company Name", "Department"]
+            Value::Array(parts) => parts
+                .first()
+                .and_then(Value::as_str)
+                .and_then(non_empty_text),
+            _ => None,
+        })
     }
 
     pub fn get_email(&self) -> Option<String> {
-        if let Some(vcard) = &self.vcard_array {
-            if let Some(arr) = vcard.as_array() {
-                if arr.len() > 1 {
-                    if let Some(props) = arr[1].as_array() {
-                        for prop in props {
-                            if let Some(prop_arr) = prop.as_array() {
-                                if prop_arr.len() >= 4 && prop_arr[0].as_str() == Some("email") {
-                                    return prop_arr[3].as_str().map(String::from);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        None
+        self.vcard_props("email")
+            .find_map(|prop| prop[3].as_str().and_then(non_empty_text))
     }
 
+    /// Phone number, with any `tel:` URI scheme removed — the common
+    /// `["tel", {...}, "uri", "tel:+1.2083895740"]` form must render as the
+    /// bare number, same as the `text` form.
     pub fn get_phone(&self) -> Option<String> {
-        if let Some(vcard) = &self.vcard_array {
-            if let Some(arr) = vcard.as_array() {
-                if arr.len() > 1 {
-                    if let Some(props) = arr[1].as_array() {
-                        for prop in props {
-                            if let Some(prop_arr) = prop.as_array() {
-                                if prop_arr.len() >= 4 && prop_arr[0].as_str() == Some("tel") {
-                                    if let Some(phone) = prop_arr[3].as_str() {
-                                        return Some(phone.to_string());
-                                    } else if let Some(phone_obj) = prop_arr[3].as_object() {
-                                        // Sometimes phone is {"uri": "tel:+1234567890"}
-                                        if let Some(uri) = phone_obj.get("uri") {
-                                            if let Some(uri_str) = uri.as_str() {
-                                                return Some(
-                                                    uri_str.trim_start_matches("tel:").to_string(),
-                                                );
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        None
+        self.vcard_props("tel").find_map(|prop| match &prop[3] {
+            Value::String(s) => non_empty_text(strip_tel_scheme(s)),
+            // Sometimes phone is {"uri": "tel:+1234567890"}
+            Value::Object(obj) => obj
+                .get("uri")
+                .and_then(Value::as_str)
+                .and_then(|uri| non_empty_text(strip_tel_scheme(uri))),
+            _ => None,
+        })
     }
 
+    /// Postal address as one comma-joined line. Components may themselves be
+    /// arrays (a multi-line street:
+    /// `["", "", ["2155 E. GoDaddy Way", "", ""], "Tempe", ...]`), which are
+    /// flattened. Falls back to the `label` parameter (a pre-formatted
+    /// address) when every component is empty.
     pub fn get_address(&self) -> Option<String> {
-        if let Some(vcard) = &self.vcard_array {
-            if let Some(arr) = vcard.as_array() {
-                if arr.len() > 1 {
-                    if let Some(props) = arr[1].as_array() {
-                        for prop in props {
-                            if let Some(prop_arr) = prop.as_array() {
-                                if prop_arr.len() >= 4 && prop_arr[0].as_str() == Some("adr") {
-                                    // adr is usually an array: [pobox, ext, street, city, state, postal, country]
-                                    if let Some(adr_arr) = prop_arr[3].as_array() {
-                                        let parts: Vec<String> = adr_arr
-                                            .iter()
-                                            .filter_map(|v| v.as_str())
-                                            .filter(|s| !s.is_empty())
-                                            .map(String::from)
-                                            .collect();
-                                        if !parts.is_empty() {
-                                            return Some(parts.join(", "));
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
+        self.vcard_props("adr").find_map(|prop| {
+            let mut parts = Vec::new();
+            // adr is [pobox, ext, street, locality, region, postal code, country]
+            if let Some(components) = prop[3].as_array() {
+                for component in components {
+                    push_component_text(component, &mut parts);
                 }
             }
-        }
-        None
+            if parts.is_empty() {
+                prop[1]
+                    .get("label")
+                    .and_then(Value::as_str)
+                    .map(|label| {
+                        label
+                            .lines()
+                            .filter_map(non_empty_text)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .filter(|s| !s.is_empty())
+            } else {
+                Some(parts.join(", "))
+            }
+        })
     }
 
+    /// Country from the address: the country-name component (index 6) when
+    /// present, else the RFC 8605 `cc` parameter (`["adr", {"cc": "US"}, ...]`),
+    /// which RFC 8605 servers often send *instead of* the component.
     pub fn get_country(&self) -> Option<String> {
-        if let Some(vcard) = &self.vcard_array {
-            if let Some(arr) = vcard.as_array() {
-                if arr.len() > 1 {
-                    if let Some(props) = arr[1].as_array() {
-                        for prop in props {
-                            if let Some(prop_arr) = prop.as_array() {
-                                // Check for country in adr field (index 6)
-                                if prop_arr.len() >= 4 && prop_arr[0].as_str() == Some("adr") {
-                                    if let Some(adr_arr) = prop_arr[3].as_array() {
-                                        if let Some(country) = adr_arr.get(6) {
-                                            if let Some(country_str) = country.as_str() {
-                                                if !country_str.is_empty() {
-                                                    return Some(country_str.to_string());
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+        self.vcard_props("adr").find_map(|prop| {
+            let mut country = Vec::new();
+            if let Some(component) = prop[3].as_array().and_then(|c| c.get(6)) {
+                push_component_text(component, &mut country);
             }
-        }
-        None
+            country.into_iter().next().or_else(|| {
+                prop[1]
+                    .get("cc")
+                    .and_then(Value::as_str)
+                    .and_then(non_empty_text)
+            })
+        })
     }
 }
 
@@ -317,7 +347,10 @@ pub struct RdapNameserver {
     #[serde(default)]
     pub unicode_name: Option<String>,
 
-    #[serde(default)]
+    /// Glue addresses. Lenient (see [`lenient_ip_addresses`]): some
+    /// registries (NASK, .pl) send an array of `{"v4": [...]}` objects rather
+    /// than the RFC 9083 object, and that must not fail the whole response.
+    #[serde(default, deserialize_with = "lenient_ip_addresses")]
     pub ip_addresses: Option<IpAddresses>,
 
     #[serde(default)]
@@ -336,15 +369,68 @@ pub struct IpAddresses {
     pub v6: Vec<String>,
 }
 
+impl IpAddresses {
+    /// Appends the string entries of `obj`'s `v4`/`v6` arrays, skipping
+    /// anything that isn't a string.
+    fn extend_from_object(&mut self, obj: &serde_json::Map<String, Value>) {
+        let strings = |key: &str| -> Vec<String> {
+            obj.get(key)
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .map(String::from)
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        self.v4.extend(strings("v4"));
+        self.v6.extend(strings("v6"));
+    }
+}
+
+/// Deserializes `ipAddresses` leniently. RFC 9083 specifies an object
+/// (`{"v4": [...], "v6": [...]}`), but NASK (.pl) sends an *array* of such
+/// objects; those are merged. Any other shape yields `None` — glue addresses
+/// are never worth failing the whole response over.
+fn lenient_ip_addresses<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<IpAddresses>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let mut out = IpAddresses {
+        v4: Vec::new(),
+        v6: Vec::new(),
+    };
+    match Value::deserialize(deserializer)? {
+        Value::Object(obj) => {
+            out.extend_from_object(&obj);
+            Ok(Some(out))
+        }
+        Value::Array(items) => {
+            for obj in items.iter().filter_map(Value::as_object) {
+                out.extend_from_object(obj);
+            }
+            Ok((!out.v4.is_empty() || !out.v6.is_empty()).then_some(out))
+        }
+        _ => Ok(None),
+    }
+}
+
 /// DNSSEC information for a domain.
+///
+/// Every member is lenient: a `delegationSigned` of the wrong type reads as
+/// unknown, and a malformed `dsData`/`keyData` entry is dropped on its own
+/// rather than taking the whole response down with it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SecureDns {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_option")]
     pub delegation_signed: Option<bool>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_vec")]
     pub ds_data: Vec<DsData>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_vec")]
     pub key_data: Vec<KeyData>,
 }
 
@@ -502,7 +588,7 @@ impl RdapResponse {
     pub fn get_registrar(&self) -> Option<String> {
         for entity in &self.entities {
             if entity.roles.iter().any(|r| r == "registrar") {
-                return entity.get_name().or_else(|| entity.handle.clone());
+                return entity.get_name().or_else(|| entity.non_empty_handle());
             }
         }
         None
@@ -565,7 +651,7 @@ impl RdapResponse {
     pub fn get_registrant(&self) -> Option<String> {
         for entity in &self.entities {
             if entity.roles.iter().any(|r| r == "registrant") {
-                return entity.get_name().or_else(|| entity.handle.clone());
+                return entity.get_name().or_else(|| entity.non_empty_handle());
             }
         }
         None
@@ -600,12 +686,20 @@ impl RdapResponse {
             .and_then(|e| e.parsed_date())
     }
 
+    /// When the domain object itself last changed (the RFC 9083
+    /// `last changed` event).
+    ///
+    /// Deliberately ignores `last update of RDAP database`: that is the
+    /// registry's database-snapshot time, not a change to this domain, and it
+    /// is ~now on every response. Several registries (CentralNic, Google)
+    /// list it *before* `last changed`, so matching either event took the DB
+    /// timestamp and every such domain showed "Updated: today". A domain
+    /// without a `last changed` event reports `None`, letting callers fall
+    /// back to WHOIS's updated date instead.
     pub fn last_updated(&self) -> Option<DateTime<Utc>> {
         self.events
             .iter()
-            .find(|e| {
-                e.event_action == "last changed" || e.event_action == "last update of RDAP database"
-            })
+            .find(|e| e.event_action == "last changed")
             .and_then(|e| e.parsed_date())
     }
 
@@ -737,7 +831,6 @@ impl ContactInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::Value;
 
     #[test]
     fn has_info_suppresses_redacted_only_contacts() {
@@ -960,5 +1053,244 @@ mod tests {
         }
         let err = resp.validate().unwrap_err();
         assert!(err.to_string().contains("extra keys"));
+    }
+
+    // ---- secureDNS (RFC 9083 key spelling + leniency) ----------------------
+
+    #[test]
+    fn secure_dns_parses_the_rfc9083_key() {
+        // RFC 9083 and every real server spell it `secureDNS`; the
+        // struct-wide camelCase rule used to expect `secureDns`, so DNSSEC
+        // state never parsed and silently landed in `extra`.
+        let resp: RdapResponse = serde_json::from_value(serde_json::json!({
+            "objectClassName": "domain",
+            "ldhName": "example.com",
+            "secureDNS": {
+                "delegationSigned": true,
+                "dsData": [{"keyTag": 370, "algorithm": 13, "digestType": 2, "digest": "BE74"}]
+            }
+        }))
+        .unwrap();
+        assert!(resp.is_dnssec_signed());
+        let sd = resp.secure_dns.as_ref().expect("secureDNS parsed");
+        assert_eq!(sd.ds_data.len(), 1);
+        assert_eq!(sd.ds_data[0].key_tag, 370);
+        assert!(!resp.extra.contains_key("secureDNS"));
+        // Round-trips under the RFC spelling.
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"secureDNS\""), "{json}");
+    }
+
+    #[test]
+    fn secure_dns_still_accepts_camel_case_alias() {
+        let resp: RdapResponse = serde_json::from_value(serde_json::json!({
+            "secureDns": {"delegationSigned": true}
+        }))
+        .unwrap();
+        assert!(resp.is_dnssec_signed());
+    }
+
+    #[test]
+    fn malformed_secure_dns_members_do_not_fail_the_response() {
+        // A malformed dsData entry is dropped on its own; the good one and
+        // the rest of the response survive.
+        let resp: RdapResponse = serde_json::from_value(serde_json::json!({
+            "ldhName": "example.com",
+            "status": ["active"],
+            "secureDNS": {
+                "delegationSigned": true,
+                "dsData": [
+                    {"keyTag": "not-a-number", "algorithm": 13},
+                    {"keyTag": 1, "algorithm": 8, "digestType": 2, "digest": "AA"}
+                ],
+                "keyData": [{"flags": 257}]
+            }
+        }))
+        .unwrap();
+        let sd = resp.secure_dns.as_ref().expect("secureDNS parsed");
+        assert!(resp.is_dnssec_signed());
+        assert_eq!(sd.ds_data.len(), 1);
+        assert_eq!(sd.ds_data[0].key_tag, 1);
+        assert!(sd.key_data.is_empty());
+
+        // A secureDNS of the wrong type is just "unknown".
+        let resp: RdapResponse = serde_json::from_value(serde_json::json!({
+            "ldhName": "example.com",
+            "secureDNS": "yes"
+        }))
+        .unwrap();
+        assert!(resp.secure_dns.is_none());
+        assert_eq!(resp.ldh_name.as_deref(), Some("example.com"));
+    }
+
+    // ---- nameserver ipAddresses leniency (NASK array form) -----------------
+
+    #[test]
+    fn ip_addresses_array_form_is_merged_not_fatal() {
+        // NASK (.pl) sends an array of {"v4": [...]} objects; this used to
+        // fail the whole RdapResponse (`seer rdap wp.pl`).
+        let resp: RdapResponse = serde_json::from_value(serde_json::json!({
+            "ldhName": "wp.pl",
+            "nameservers": [{
+                "objectClassName": "nameserver",
+                "ldhName": "ns1.wp.pl",
+                "ipAddresses": [{"v4": ["212.77.102.200"]}, {"v6": ["2a02:598::200"]}]
+            }]
+        }))
+        .unwrap();
+        assert_eq!(resp.nameserver_names(), vec!["ns1.wp.pl"]);
+        let ips = resp.nameservers[0]
+            .ip_addresses
+            .as_ref()
+            .expect("merged glue");
+        assert_eq!(ips.v4, vec!["212.77.102.200"]);
+        assert_eq!(ips.v6, vec!["2a02:598::200"]);
+    }
+
+    #[test]
+    fn ip_addresses_object_form_and_garbage() {
+        let resp: RdapResponse = serde_json::from_value(serde_json::json!({
+            "nameservers": [
+                {"ldhName": "ns1.example.com", "ipAddresses": {"v4": ["192.0.2.1"]}},
+                {"ldhName": "ns2.example.com", "ipAddresses": "bogus"}
+            ]
+        }))
+        .unwrap();
+        let first = resp.nameservers[0].ip_addresses.as_ref().expect("object");
+        assert_eq!(first.v4, vec!["192.0.2.1"]);
+        assert!(first.v6.is_empty());
+        assert!(resp.nameservers[1].ip_addresses.is_none());
+    }
+
+    // ---- last_updated ------------------------------------------------------
+
+    #[test]
+    fn last_updated_ignores_the_rdap_database_timestamp() {
+        use chrono::Datelike;
+        // CentralNic/Google list the DB-snapshot event first; it must not
+        // masquerade as the domain's own update date.
+        let resp: RdapResponse = serde_json::from_value(serde_json::json!({
+            "events": [
+                {"eventAction": "last update of RDAP database", "eventDate": "2026-09-22T10:00:00Z"},
+                {"eventAction": "last changed", "eventDate": "2024-03-01T00:00:00Z"}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(resp.last_updated().expect("last changed").year(), 2024);
+
+        let db_only: RdapResponse = serde_json::from_value(serde_json::json!({
+            "events": [
+                {"eventAction": "last update of RDAP database", "eventDate": "2026-09-22T10:00:00Z"}
+            ]
+        }))
+        .unwrap();
+        assert!(db_only.last_updated().is_none());
+    }
+
+    // ---- vCard extraction --------------------------------------------------
+
+    fn entity_with_vcard(roles: &[&str], handle: Option<&str>, props: Value) -> RdapEntity {
+        serde_json::from_value(serde_json::json!({
+            "objectClassName": "entity",
+            "roles": roles,
+            "handle": handle,
+            "vcardArray": ["vcard", props]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn redacted_empty_vcard_values_read_as_absent() {
+        let e = entity_with_vcard(
+            &["registrant"],
+            None,
+            serde_json::json!([
+                ["version", {}, "text", "4.0"],
+                ["fn", {}, "text", ""],
+                ["org", {}, "text", ""],
+                ["email", {}, "text", "  "]
+            ]),
+        );
+        assert_eq!(e.get_name(), None);
+        assert_eq!(e.get_organization(), None);
+        assert_eq!(e.get_email(), None);
+
+        // With no name and no handle, the registrant is absent (so the WHOIS
+        // fallback in DomainInfo can fill it) rather than Some("").
+        let resp = RdapResponse {
+            entities: vec![e],
+            ..Default::default()
+        };
+        assert_eq!(resp.get_registrant(), None);
+
+        // An empty fn falls through to a real handle.
+        let with_handle = entity_with_vcard(
+            &["registrar"],
+            Some("REG-1"),
+            serde_json::json!([["fn", {}, "text", ""]]),
+        );
+        let resp = RdapResponse {
+            entities: vec![with_handle],
+            ..Default::default()
+        };
+        assert_eq!(resp.get_registrar().as_deref(), Some("REG-1"));
+    }
+
+    #[test]
+    fn get_phone_strips_tel_uri_scheme() {
+        let e = entity_with_vcard(
+            &["abuse"],
+            None,
+            serde_json::json!([["tel", {"type": ["voice", "work"]}, "uri", "tel:+1.2083895740"]]),
+        );
+        assert_eq!(e.get_phone().as_deref(), Some("+1.2083895740"));
+
+        let text_form = entity_with_vcard(
+            &["abuse"],
+            None,
+            serde_json::json!([["tel", {}, "text", "+1.5551230000"]]),
+        );
+        assert_eq!(text_form.get_phone().as_deref(), Some("+1.5551230000"));
+    }
+
+    #[test]
+    fn get_address_flattens_nested_street_components() {
+        let e = entity_with_vcard(
+            &["registrant"],
+            None,
+            serde_json::json!([[
+                "adr",
+                {},
+                "text",
+                [
+                    "",
+                    "",
+                    ["2155 E. GoDaddy Way", "", ""],
+                    "Tempe",
+                    "AZ",
+                    "85284",
+                    "US"
+                ]
+            ]]),
+        );
+        assert_eq!(
+            e.get_address().as_deref(),
+            Some("2155 E. GoDaddy Way, Tempe, AZ, 85284, US")
+        );
+        assert_eq!(e.get_country().as_deref(), Some("US"));
+    }
+
+    #[test]
+    fn get_country_uses_rfc8605_cc_parameter() {
+        let e = entity_with_vcard(
+            &["registrant"],
+            None,
+            serde_json::json!([[
+                "adr", {"cc": "DE"}, "text",
+                ["", "", "", "Berlin", "", "", ""]
+            ]]),
+        );
+        assert_eq!(e.get_country().as_deref(), Some("DE"));
+        assert_eq!(e.get_address().as_deref(), Some("Berlin"));
     }
 }

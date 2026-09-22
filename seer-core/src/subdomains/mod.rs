@@ -138,7 +138,8 @@ async fn fetch_paginated(domain: &str, base: &str, spec: &PaginationSpec) -> Res
 }
 
 /// Filter and normalize raw certificate names into the final subdomain list:
-/// keep only names under `domain`, drop wildcards and the apex itself, and
+/// keep only names under `domain`, strip a wildcard's `*.` (a certificate for
+/// `*.dev.example.com` reveals `dev.example.com`), drop the apex itself, and
 /// reject anything that isn't a syntactically valid hostname.
 fn build_result(domain: &str, raw_names: Vec<String>, source: &str) -> SubdomainResult {
     let suffix = format!(".{}", domain);
@@ -146,8 +147,9 @@ fn build_result(domain: &str, raw_names: Vec<String>, source: &str) -> Subdomain
 
     for name in raw_names {
         let name = name.trim().to_lowercase();
-        if (name.ends_with(&suffix) || name == domain) && !name.starts_with('*') {
-            subdomains.insert(name);
+        let name = name.strip_prefix("*.").unwrap_or(&name);
+        if (name.ends_with(&suffix) || name == domain) && !name.contains('*') {
+            subdomains.insert(name.to_string());
         }
     }
 
@@ -157,7 +159,6 @@ fn build_result(domain: &str, raw_names: Vec<String>, source: &str) -> Subdomain
     let subdomains: Vec<String> = subdomains
         .into_iter()
         .filter(|s| {
-            let s = s.strip_prefix("*.").unwrap_or(s);
             !s.is_empty()
                 && s.len() <= 253
                 // Underscores are valid in DNS names (RFC 8552 service labels,
@@ -212,16 +213,22 @@ mod tests {
     #[test]
     fn build_result_filters_and_dedups() {
         let raw = vec![
-            "example.com".to_string(),     // apex — dropped
-            "API.example.com".to_string(), // lowercased
-            "api.example.com".to_string(), // dup
-            "*.example.com".to_string(),   // wildcard — dropped
-            "evil.com".to_string(),        // off-domain — dropped
+            "example.com".to_string(),       // apex — dropped
+            "API.example.com".to_string(),   // lowercased
+            "api.example.com".to_string(),   // dup
+            "*.example.com".to_string(),     // wildcard of the apex — dropped
+            "*.dev.example.com".to_string(), // wildcard — reveals dev
+            "*.evilexample.com".to_string(), // off-domain wildcard — dropped
+            "a.*.example.com".to_string(),   // interior wildcard — dropped
+            "evil.com".to_string(),          // off-domain — dropped
             "ok.example.com".to_string(),
         ];
         let r = build_result("example.com", raw, "test");
-        assert_eq!(r.subdomains, vec!["api.example.com", "ok.example.com"]);
-        assert_eq!(r.count, 2);
+        assert_eq!(
+            r.subdomains,
+            vec!["api.example.com", "dev.example.com", "ok.example.com"]
+        );
+        assert_eq!(r.count, 3);
         assert_eq!(r.source, "test");
     }
 

@@ -142,7 +142,9 @@ The client automatically follows WHOIS referrals:
 **Safeguards:**
 - Maximum referral depth: 3
 - Circular referral detection
-- Graceful fallback to registry response on referral failure
+- Graceful fallback to registry response on referral failure, on a "not
+  found" referral answer, and when the referral carries no registration data
+  (no registrar or dates — e.g. a throttle / refusal body)
 
 ### Server Discovery
 

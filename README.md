@@ -312,7 +312,7 @@ Check commands exit `1` on a negative result even when the command itself ran fi
 |---------|-----------------|
 | `seer status` | HTTP status is missing or non-2xx, the SSL cert is invalid or expires within 30 days, or the domain expires within 30 days |
 | `seer avail` | The domain is **not** available (already registered) |
-| `seer dnssec` | The validation chain is anything other than fully `secure` |
+| `seer dnssec` | The zone's status is anything other than `signed` (i.e. `unsigned`, `partial`, or `misconfigured`) |
 | `seer compare` | The two nameservers return different record sets |
 | `seer delegation` | The parent's delegation NS set and the zone's own NS RRset are out of sync, or any delegated server answers lamely |
 | `seer doctor` | Any check reports **FAIL**. `WARN` (degraded but usable, e.g. a malformed config file running on defaults) still exits `0` |

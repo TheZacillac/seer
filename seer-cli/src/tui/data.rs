@@ -9,15 +9,16 @@ fn e(e: seer_core::SeerError) -> String {
     e.to_string()
 }
 
-/// Concurrent host checks for the takeover scan. The TUI builds its clients
-/// with `::new()` defaults rather than loading `~/.seer/config.toml`, so this
-/// mirrors `SeerConfig`'s own `bulk.concurrency` default instead of reading it.
-const TAKEOVER_CONCURRENCY: usize = 10;
-
-pub async fn fetch(req: FetchReq) -> Result<LensData, String> {
+/// Runs `req`, building every client from `config` (`~/.seer/config.toml`)
+/// so the TUI honors the same timeouts, nameserver, and concurrency as the
+/// CLI subcommands and the REPL.
+pub async fn fetch(req: FetchReq, config: &seer_core::SeerConfig) -> Result<LensData, String> {
     match req {
         FetchReq::Overview(d) => {
-            let r = seer_core::SmartLookup::new().lookup(&d).await.map_err(e)?;
+            let r = seer_core::SmartLookup::from_config(config)
+                .lookup(&d)
+                .await
+                .map_err(e)?;
             // Record to history — best-effort, off the async reactor. Mirrors the
             // CLI lookup handler (main.rs). Detached (not awaited): the Overview
             // result renders immediately; the save lands a beat later.
@@ -29,22 +30,22 @@ pub async fn fetch(req: FetchReq) -> Result<LensData, String> {
             });
             Ok(LensData::Overview(Box::new(r)))
         }
-        FetchReq::Whois(d) => seer_core::WhoisClient::new()
+        FetchReq::Whois(d) => seer_core::WhoisClient::from_config(config)
             .lookup(&d)
             .await
             .map(|r| LensData::Whois(Box::new(r)))
             .map_err(e),
-        FetchReq::RdapDomain(d) => seer_core::RdapClient::new()
+        FetchReq::RdapDomain(d) => seer_core::RdapClient::from_config(config)
             .lookup_domain(&d)
             .await
             .map(|r| LensData::Rdap(Box::new(r)))
             .map_err(e),
-        FetchReq::RdapIp(ip) => seer_core::RdapClient::new()
+        FetchReq::RdapIp(ip) => seer_core::RdapClient::from_config(config)
             .lookup_ip(&ip)
             .await
             .map(|r| LensData::Rdap(Box::new(r)))
             .map_err(e),
-        FetchReq::RdapAsn(asn) => seer_core::RdapClient::new()
+        FetchReq::RdapAsn(asn) => seer_core::RdapClient::from_config(config)
             .lookup_asn(asn)
             .await
             .map(|r| LensData::Rdap(Box::new(r)))
@@ -53,8 +54,13 @@ pub async fn fetch(req: FetchReq) -> Result<LensData, String> {
             domain,
             record_type,
             nameserver,
-        } => seer_core::DnsResolver::new()
-            .resolve(&domain, record_type, nameserver.as_deref())
+        } => seer_core::DnsResolver::from_config(config)
+            // An explicit nameserver wins; otherwise the configured one, like `dig`.
+            .resolve(
+                &domain,
+                record_type,
+                nameserver.as_deref().or(config.nameserver.as_deref()),
+            )
             .await
             .map(LensData::Dns)
             .map_err(e),
@@ -73,12 +79,12 @@ pub async fn fetch(req: FetchReq) -> Result<LensData, String> {
             .await
             .map(|r| LensData::Compare(Box::new(r)))
             .map_err(e),
-        FetchReq::Ssl(d) => seer_core::SslChecker::new()
+        FetchReq::Ssl(d) => seer_core::SslChecker::from_config(config)
             .check(&d)
             .await
             .map(|r| LensData::Ssl(Box::new(r)))
             .map_err(e),
-        FetchReq::Status(d) => seer_core::StatusClient::new()
+        FetchReq::Status(d) => seer_core::StatusClient::from_config(config)
             .check(&d)
             .await
             .map(|r| LensData::Status(Box::new(r)))
@@ -88,12 +94,12 @@ pub async fn fetch(req: FetchReq) -> Result<LensData, String> {
             .await
             .map(|r| LensData::Prop(Box::new(r)))
             .map_err(e),
-        FetchReq::Reverse(ip) => seer_core::DnsResolver::new()
-            .resolve(&ip, RecordType::PTR, None)
+        FetchReq::Reverse(ip) => seer_core::DnsResolver::from_config(config)
+            .resolve(&ip, RecordType::PTR, config.nameserver.as_deref())
             .await
             .map(LensData::Reverse)
             .map_err(e),
-        FetchReq::Avail(d) => seer_core::AvailabilityChecker::new()
+        FetchReq::Avail(d) => seer_core::AvailabilityChecker::from_config(config)
             .check(&d)
             .await
             .map(|r| LensData::Avail(Box::new(r)))
@@ -113,7 +119,7 @@ pub async fn fetch(req: FetchReq) -> Result<LensData, String> {
                 .await
                 .map_err(|err| err.to_string())?;
             Ok(LensData::Watch(Box::new(
-                seer_core::check_watchlist(&wl.domains).await,
+                seer_core::check_watchlist_with_config(&wl.domains, config).await,
             )))
         }
         FetchReq::History => {
@@ -130,7 +136,7 @@ pub async fn fetch(req: FetchReq) -> Result<LensData, String> {
             .await
             .map(|r| LensData::Subdomains(Box::new(r)))
             .map_err(e),
-        FetchReq::Headers(d) => seer_core::audit_headers(&d, seer_core::DEFAULT_HEADER_TIMEOUT)
+        FetchReq::Headers(d) => seer_core::audit_headers(&d, config.http_timeout())
             .await
             .map(|r| LensData::Headers(Box::new(r)))
             .map_err(e),
@@ -143,12 +149,12 @@ pub async fn fetch(req: FetchReq) -> Result<LensData, String> {
                 .enumerate(&d)
                 .await
                 .map_err(e)?;
-            let resolver = seer_core::DnsResolver::new();
+            let resolver = seer_core::DnsResolver::from_config(config);
             seer_core::scan_takeover(
                 &resolver,
                 &enumerated.domain,
                 enumerated.subdomains,
-                TAKEOVER_CONCURRENCY,
+                config.bulk.concurrency,
             )
             .await
             .map(|r| LensData::Takeover(Box::new(r)))

@@ -135,11 +135,21 @@ pub(super) fn analyze_results(
         };
     }
 
-    // Build sorted value sets once per server result
+    // Build sorted value sets once per server result, keyed on
+    // `RecordData::comparison_key`: domain-name fields case-folded (a
+    // 0x20-randomizing resolver answering `NS1.EXAMPLE.COM.` agrees with one
+    // answering `ns1.example.com.`), case-sensitive data (TXT, DNSKEY)
+    // verbatim. The same rule compare and follow use. The folded keys double
+    // as the reported values, so consensus / inconsistency output shows
+    // domain names in canonical lowercase.
     let sorted_value_sets: Vec<Vec<String>> = successful
         .iter()
         .map(|result| {
-            let mut values: Vec<String> = result.records.iter().map(|r| r.format_short()).collect();
+            let mut values: Vec<String> = result
+                .records
+                .iter()
+                .map(|r| r.data.comparison_key())
+                .collect();
             values.sort();
             values
         })
@@ -249,6 +259,54 @@ mod tests {
             outcome.unreachable_servers[0].error.as_deref(),
             Some("timed out")
         );
+    }
+
+    /// Regression: values were compared verbatim, so two resolvers returning
+    /// the same NS record in different case (0x20 randomization) showed up
+    /// as an inconsistency and halved the propagation percentage.
+    /// Case-sensitive TXT data must still differ on case alone.
+    #[test]
+    fn analyze_folds_case_for_names_but_not_txt() {
+        let result = |ip: &str, data: RecordData, record_type: RecordType| ServerResult {
+            server: DnsServer::new(ip, ip, "NA", ip),
+            records: vec![DnsRecord {
+                name: "example.com".to_string(),
+                record_type,
+                ttl: 300,
+                data,
+            }],
+            response_time_ms: 10,
+            success: true,
+            error: None,
+        };
+        let ns = |n: &str| RecordData::NS {
+            nameserver: n.to_string(),
+        };
+        let results = vec![
+            result("1.1.1.1", ns("NS1.Example.COM."), RecordType::NS),
+            result("8.8.8.8", ns("ns1.example.com."), RecordType::NS),
+        ];
+        let outcome = analyze_results(&results, RecordType::NS);
+        assert!(
+            outcome.inconsistencies.is_empty(),
+            "{:?}",
+            outcome.inconsistencies
+        );
+        assert_eq!(outcome.propagation_percentage, 100.0);
+        assert_eq!(
+            outcome.consensus_values,
+            vec![ConsensusValue::new(RecordType::NS, "ns1.example.com.")]
+        );
+
+        let txt = |t: &str| RecordData::TXT {
+            text: t.to_string(),
+        };
+        let results = vec![
+            result("1.1.1.1", txt("token=AbC"), RecordType::TXT),
+            result("8.8.8.8", txt("token=abc"), RecordType::TXT),
+        ];
+        let outcome = analyze_results(&results, RecordType::TXT);
+        assert_eq!(outcome.inconsistencies.len(), 1, "TXT case is significant");
     }
 
     #[test]

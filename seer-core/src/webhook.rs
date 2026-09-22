@@ -381,9 +381,12 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_hostless_url() {
+        // Note `http:///hook` is NOT hostless: WHATWG URL parsing reads it as
+        // host `hook`, so it only failed here via a live DNS miss. `http://`
+        // really has no host and must be refused before any network.
         let client = WebhookClient::new();
         let err = client
-            .post_json("http:///hook", &serde_json::json!({}))
+            .post_json("http://", &serde_json::json!({}))
             .await
             .unwrap_err();
         assert!(matches!(err, SeerError::InvalidInput(_)), "got {err:?}");

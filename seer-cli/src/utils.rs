@@ -20,6 +20,12 @@ impl RawModeGuard {
         let enabled = crossterm::terminal::enable_raw_mode().is_ok();
         Self { enabled }
     }
+
+    /// Whether raw mode was actually enabled (false when there is no usable
+    /// terminal, e.g. stdin/stdout redirected in CI).
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
 }
 
 impl Default for RawModeGuard {
@@ -33,6 +39,108 @@ impl Drop for RawModeGuard {
         if self.enabled {
             let _ = crossterm::terminal::disable_raw_mode();
         }
+    }
+}
+
+/// Poll timeout for the follow key listener; also bounds how long
+/// [`FollowKeyListener::stop`] waits for the thread to notice its stop flag.
+const KEY_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// True for the keys that cancel a live `follow`: Esc, or Ctrl-C (which
+/// arrives as a key event rather than SIGINT while raw mode is on).
+pub fn is_follow_cancel_key(
+    code: crossterm::event::KeyCode,
+    modifiers: crossterm::event::KeyModifiers,
+) -> bool {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    match code {
+        KeyCode::Esc => true,
+        KeyCode::Char('c') => modifiers.contains(KeyModifiers::CONTROL),
+        _ => false,
+    }
+}
+
+/// The follow key listener's loop, generic over the key source so it can be
+/// tested without a terminal. `next_key` blocks for at most one poll interval
+/// and yields `Ok(Some(key))`, `Ok(None)` (nothing pressed), or `Err` (no
+/// usable terminal). The loop ends when a cancel key is pressed (signalling
+/// `cancel_tx`), when `stop` is set, when the follow's receiver is gone, or
+/// on the first poll error — an erroring poll returns immediately, so
+/// retrying it would spin a core at 100%.
+pub fn run_follow_key_loop<F>(
+    mut next_key: F,
+    stop: &std::sync::atomic::AtomicBool,
+    cancel_tx: &tokio::sync::watch::Sender<bool>,
+) where
+    F: FnMut() -> std::io::Result<
+        Option<(crossterm::event::KeyCode, crossterm::event::KeyModifiers)>,
+    >,
+{
+    use std::sync::atomic::Ordering;
+    while !stop.load(Ordering::Relaxed) && !cancel_tx.is_closed() {
+        match next_key() {
+            Ok(Some((code, modifiers))) if is_follow_cancel_key(code, modifiers) => {
+                let _ = cancel_tx.send(true);
+                break;
+            }
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+}
+
+/// Esc / Ctrl-C listener for the `follow` command (CLI and REPL).
+///
+/// crossterm's `event::poll` is a blocking call, so the loop runs on a
+/// blocking-pool thread via `spawn_blocking` — running it inside
+/// `tokio::spawn` pinned a runtime worker for the whole follow (starving DNS
+/// queries and timers on a single-worker runtime), and `abort()` could not
+/// interrupt it. A shared stop flag, checked every poll interval, is what
+/// actually ends it.
+pub struct FollowKeyListener {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl FollowKeyListener {
+    /// Starts the listener, or returns `None` when there is no terminal to
+    /// read keys from: raw mode could not be enabled, or stdin is not a TTY.
+    /// Callers keep their other cancellation paths (the CLI's SIGINT task),
+    /// so a missing listener only loses the Esc shortcut.
+    pub fn spawn(
+        cancel_tx: tokio::sync::watch::Sender<bool>,
+        raw_mode_enabled: bool,
+    ) -> Option<Self> {
+        use std::io::IsTerminal;
+        if !raw_mode_enabled || !std::io::stdin().is_terminal() {
+            return None;
+        }
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_flag = stop.clone();
+        let handle = tokio::task::spawn_blocking(move || {
+            use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+            let next_key = || -> std::io::Result<Option<(KeyCode, KeyModifiers)>> {
+                if event::poll(KEY_POLL_INTERVAL)? {
+                    if let Event::Key(KeyEvent {
+                        code, modifiers, ..
+                    }) = event::read()?
+                    {
+                        return Ok(Some((code, modifiers)));
+                    }
+                }
+                Ok(None)
+            };
+            run_follow_key_loop(next_key, &stop_flag, &cancel_tx);
+        });
+        Some(Self { stop, handle })
+    }
+
+    /// Signals the listener to stop and waits (at most one poll interval) for
+    /// its thread to exit, so it can no longer consume keystrokes meant for
+    /// whatever reads the terminal next (e.g. the REPL prompt).
+    pub async fn stop(self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = self.handle.await;
     }
 }
 
@@ -91,6 +199,25 @@ pub fn read_bulk_input<P: AsRef<Path>>(path: P) -> Result<String, String> {
 
     std::fs::read_to_string(path)
         .map_err(|e| format!("failed to read input file {}: {}", path.display(), e))
+}
+
+/// Reads a bulk domain list from `reader` (stdin for `bulk -`), enforcing the
+/// same [`MAX_BULK_FILE_SIZE`] cap as [`read_bulk_input`]. Reads at most one
+/// byte past the cap, so an endless or huge pipe can't exhaust memory.
+pub fn read_bulk_stdin<R: std::io::Read>(reader: R) -> Result<String, String> {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    reader
+        .take(MAX_BULK_FILE_SIZE + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("reading domains from stdin: {e}"))?;
+    if buf.len() as u64 > MAX_BULK_FILE_SIZE {
+        return Err(format!(
+            "input on stdin exceeds {} byte limit",
+            MAX_BULK_FILE_SIZE
+        ));
+    }
+    String::from_utf8(buf).map_err(|e| format!("reading domains from stdin: {e}"))
 }
 
 /// Expands a leading `~` or `~/...` in a path to the user's home directory.
@@ -425,19 +552,17 @@ pub fn bulk_results_to_csv(results: &[BulkResult], operation: &str) -> String {
                 ));
             }
             "propagation" | "prop" => {
+                // Use core's figures verbatim: `propagation_percentage` is the
+                // share of ALL servers agreeing with the consensus answer — the
+                // number human/markdown output shows. Recomputing it here as
+                // the response rate (responded / total) reported 100% for a
+                // zone whose servers all answered but disagreed.
                 let (pct, total, responded) =
                     if let Some(BulkResultData::Propagation(ref p)) = result.data {
-                        let total = p.results.len();
-                        let responded = p.results.iter().filter(|r| r.success).count();
-                        let pct = if total > 0 {
-                            (responded as f64 / total as f64) * 100.0
-                        } else {
-                            0.0
-                        };
                         (
-                            format!("{:.1}", pct),
-                            total.to_string(),
-                            responded.to_string(),
+                            format!("{:.1}", p.propagation_percentage),
+                            p.servers_checked.to_string(),
+                            p.servers_responding.to_string(),
                         )
                     } else {
                         Default::default()
@@ -805,6 +930,7 @@ mod tests {
     use chrono::TimeZone;
     use seer_core::bulk::BulkOperation;
     use seer_core::ssl::{CertDetail, SslReport};
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     #[test]
     fn raw_mode_guard_constructs_and_drops_without_panic() {
@@ -1198,6 +1324,143 @@ mod tests {
             assert!(row.starts_with("bad.invalid,false,"), "got: {row}");
             assert!(row.ends_with(",7,boom"), "got: {row}");
         }
+    }
+
+    #[test]
+    fn prop_csv_uses_core_consensus_percentage_not_response_rate() {
+        // All 10 servers answered, but only 7 agreed with the consensus.
+        // The CSV previously recomputed responded/total (→ 100.0) instead of
+        // core's consensus-based figure (→ 70.0) that human/markdown show.
+        let prop = seer_core::dns::PropagationResult {
+            domain: "example.com".to_string(),
+            record_type: seer_core::RecordType::A,
+            servers_checked: 10,
+            servers_responding: 10,
+            propagation_percentage: 70.0,
+            results: vec![],
+            consensus_values: vec![],
+            inconsistencies: vec![],
+            unreachable_servers: vec![],
+            dnssec_validated: false,
+            nameserver_details: None,
+        };
+        let result = BulkResult {
+            operation: BulkOperation::Propagation {
+                domain: "example.com".to_string(),
+                record_type: seer_core::RecordType::A,
+            },
+            success: true,
+            data: Some(BulkResultData::Propagation(prop)),
+            error: None,
+            duration_ms: 42,
+        };
+        let csv = bulk_results_to_csv(std::slice::from_ref(&result), "prop");
+        let mut lines = csv.lines();
+        assert_eq!(
+            lines.next().expect("header"),
+            "domain,success,propagation_pct,servers_total,servers_responded,duration_ms,error"
+        );
+        assert_eq!(
+            lines.next().expect("data row"),
+            "example.com,true,70.0,10,10,42,"
+        );
+    }
+
+    #[test]
+    fn read_bulk_stdin_accepts_input_under_the_cap() {
+        let got = read_bulk_stdin(std::io::Cursor::new(b"a.com\nb.com\n".to_vec()))
+            .expect("small input is accepted");
+        assert_eq!(got, "a.com\nb.com\n");
+    }
+
+    #[test]
+    fn read_bulk_stdin_rejects_input_over_the_cap() {
+        // `bulk -` previously read stdin unbounded while the file path was
+        // capped at MAX_BULK_FILE_SIZE; both must enforce the same limit.
+        let at_cap = vec![b'a'; MAX_BULK_FILE_SIZE as usize];
+        assert!(read_bulk_stdin(std::io::Cursor::new(at_cap)).is_ok());
+
+        let over_cap = vec![b'a'; MAX_BULK_FILE_SIZE as usize + 1];
+        let err = read_bulk_stdin(std::io::Cursor::new(over_cap)).expect_err("must reject");
+        assert!(err.contains("byte limit"), "got: {err}");
+    }
+
+    #[test]
+    fn follow_key_listener_is_not_started_without_raw_mode() {
+        // With no usable terminal the listener must not run at all: crossterm
+        // polling then errors immediately, which previously spun a core.
+        let (tx, _rx) = tokio::sync::watch::channel(false);
+        assert!(FollowKeyListener::spawn(tx, false).is_none());
+    }
+
+    #[test]
+    fn follow_cancel_keys_are_esc_and_ctrl_c_only() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        assert!(is_follow_cancel_key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(is_follow_cancel_key(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL
+        ));
+        assert!(!is_follow_cancel_key(
+            KeyCode::Char('c'),
+            KeyModifiers::NONE
+        ));
+        assert!(!is_follow_cancel_key(KeyCode::Enter, KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn follow_key_loop_exits_on_poll_error_without_cancelling() {
+        // No TTY: `event::poll` errors. The loop must stop instead of
+        // spinning, and must not cancel the follow on the user's behalf.
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let stop = AtomicBool::new(false);
+        let mut polls = 0;
+        run_follow_key_loop(
+            || {
+                polls += 1;
+                Err(std::io::Error::other("not a tty"))
+            },
+            &stop,
+            &tx,
+        );
+        assert_eq!(polls, 1, "must stop after the first poll error");
+        assert!(!*rx.borrow());
+    }
+
+    #[test]
+    fn follow_key_loop_cancels_on_esc() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let stop = AtomicBool::new(false);
+        let mut keys = vec![
+            Ok(Some((KeyCode::Esc, KeyModifiers::NONE))),
+            Ok(Some((KeyCode::Char('x'), KeyModifiers::NONE))),
+            Ok(None),
+        ];
+        run_follow_key_loop(|| keys.pop().expect("loop ends at Esc"), &stop, &tx);
+        assert!(*rx.borrow(), "Esc must cancel the follow");
+    }
+
+    #[test]
+    fn follow_key_loop_honors_stop_flag() {
+        // The follow finished: the stop flag must end the loop even though no
+        // key was ever pressed (the old tokio task could not be stopped).
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let stop = AtomicBool::new(false);
+        let mut polls = 0;
+        run_follow_key_loop(
+            || {
+                polls += 1;
+                if polls == 3 {
+                    stop.store(true, Ordering::Relaxed);
+                }
+                Ok(None)
+            },
+            &stop,
+            &tx,
+        );
+        assert_eq!(polls, 3);
+        assert!(!*rx.borrow());
     }
 
     #[test]

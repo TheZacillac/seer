@@ -35,8 +35,9 @@ impl LineEditor {
         &self.text
     }
 
-    /// The cursor's byte offset (used by the renderer to place a caret; always
-    /// on a `char` boundary so slicing `text` at it is safe).
+    /// The cursor's byte offset (always on a `char` boundary). Renderers place
+    /// the caret via [`Self::with_caret`]; this accessor is for tests.
+    #[cfg(test)]
     pub fn cursor(&self) -> usize {
         self.cursor
     }
@@ -112,9 +113,19 @@ impl LineEditor {
         self.cursor = i;
     }
 
+    /// The text with `caret` spliced in at the cursor, for rendering the field.
+    pub fn with_caret(&self, caret: &str) -> String {
+        let (before, after) = self.text.split_at(self.cursor);
+        format!("{before}{caret}{after}")
+    }
+
     /// Applies a key event, returning what it means for the owning mode.
     pub fn handle_key(&mut self, key: KeyEvent) -> EditOutcome {
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        // Windows reports AltGr as CONTROL|ALT, and non-US layouts type
+        // `\ @ { } [ ] | ~` with it — so that combination is a character,
+        // not a Ctrl chord (crossterm already delivers the composed char).
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.contains(KeyModifiers::ALT);
         match key.code {
             KeyCode::Enter => return EditOutcome::Submit,
             KeyCode::Esc => return EditOutcome::Cancel,
@@ -232,6 +243,34 @@ mod tests {
         assert_eq!(e.cursor(), 3); // 1 byte 'h' + 2 bytes 'é'
         e.backspace(); // remove 'é'
         assert_eq!(e.as_str(), "hllo");
+    }
+
+    #[test]
+    fn altgr_characters_are_inserted_but_ctrl_chords_are_not() {
+        let altgr = KeyModifiers::CONTROL | KeyModifiers::ALT;
+        let mut e = LineEditor::new();
+        for c in ['@', '\\', '{', '}', '[', ']', '|', '~'] {
+            e.handle_key(KeyEvent::new(KeyCode::Char(c), altgr));
+        }
+        assert_eq!(
+            e.as_str(),
+            "@\\{}[]|~",
+            "AltGr (CONTROL|ALT) chars must insert"
+        );
+        // A plain Ctrl chord still edits instead of inserting a letter.
+        e.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
+        assert_eq!(e.as_str(), "@\\{}[]|~");
+        e.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        assert_eq!(e.cursor(), 0, "Ctrl-A still moves home");
+    }
+
+    #[test]
+    fn with_caret_splits_at_the_cursor() {
+        let mut e = ed("abc");
+        assert_eq!(e.with_caret("|"), "abc|");
+        e.home();
+        e.right();
+        assert_eq!(e.with_caret("|"), "a|bc");
     }
 
     #[test]

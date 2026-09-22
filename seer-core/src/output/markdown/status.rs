@@ -44,6 +44,17 @@ impl MarkdownFormatter {
                 "- **Status**: {}",
                 if cert.is_valid { "Valid" } else { "Invalid" }
             ));
+            // `is_valid` is date-range only, so a mismatched cert still reads
+            // "Valid" above; surface the hostname check explicitly (the human
+            // formatter prints the same warning).
+            output.push(format!(
+                "- **Hostname Match**: {}",
+                if cert.hostname_verified {
+                    "yes"
+                } else {
+                    "**no** — ⚠ certificate hostname not verified"
+                }
+            ));
             output.push(format!(
                 "- **Valid From**: `{}`",
                 cert.valid_from.format("%Y-%m-%d")
@@ -226,5 +237,34 @@ mod tests {
         assert!(output.contains("## Status: example.com"));
         assert!(output.contains("### SSL Certificate"));
         assert!(output.contains("### DNS Resolution"));
+    }
+
+    #[test]
+    fn status_reports_certificate_hostname_match() {
+        // `is_valid` is date-range only, so a mismatched cert rendered as
+        // "- **Status**: Valid" with no warning in markdown, while the human
+        // formatter flagged it.
+        let mut response = StatusResponse::new("example.com".to_string());
+        response.certificate = Some(crate::status::CertificateInfo {
+            issuer: "CN=Mock CA".to_string(),
+            subject: "CN=other.example".to_string(),
+            valid_from: "2025-01-01T00:00:00Z".parse().unwrap(),
+            valid_until: "2027-01-01T00:00:00Z".parse().unwrap(),
+            days_until_expiry: 180,
+            is_valid: true,
+            hostname_verified: false,
+        });
+        let out = MarkdownFormatter::new().format_status(&response);
+        assert!(
+            out.contains("- **Hostname Match**: **no** — ⚠ certificate hostname not verified"),
+            "mismatch must be flagged:\n{out}"
+        );
+
+        if let Some(cert) = response.certificate.as_mut() {
+            cert.hostname_verified = true;
+        }
+        let out = MarkdownFormatter::new().format_status(&response);
+        assert!(out.contains("- **Hostname Match**: yes"), "got:\n{out}");
+        assert!(!out.contains("not verified"), "got:\n{out}");
     }
 }

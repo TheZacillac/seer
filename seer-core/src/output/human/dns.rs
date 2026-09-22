@@ -60,7 +60,7 @@ impl HumanFormatter {
                 "[{}] {}: {}",
                 self.label(&time_str),
                 iter_str,
-                self.error(error)
+                self.error(&sanitize_display(error))
             ));
             return output.join("\n");
         }
@@ -74,11 +74,13 @@ impl HumanFormatter {
             format!(" ({})", self.success("unchanged"))
         };
 
-        // Collect record values, trimming trailing dots
+        // Collect record values, trimming trailing dots. Record data (TXT/CAA
+        // in particular) is attacker-controlled and re-printed on every
+        // iteration, so sanitize each value before it reaches the terminal.
         let values: Vec<String> = iteration
             .records
             .iter()
-            .map(|r| r.data.to_string().trim_end_matches('.').to_string())
+            .map(|r| sanitize_display(r.data.to_string().trim_end_matches('.')))
             .collect();
 
         output.push(format!(
@@ -95,17 +97,13 @@ impl HumanFormatter {
         }
 
         // Show changes if any
-        if !iteration.added.is_empty() {
-            for added in &iteration.added {
-                let value = added.trim_end_matches('.');
-                output.push(format!("  {} {}", self.success("+"), self.success(value)));
-            }
+        for added in &iteration.added {
+            let value = sanitize_display(added.trim_end_matches('.'));
+            output.push(format!("  {} {}", self.success("+"), self.success(&value)));
         }
-        if !iteration.removed.is_empty() {
-            for removed in &iteration.removed {
-                let value = removed.trim_end_matches('.');
-                output.push(format!("  {} {}", self.error("-"), self.error(value)));
-            }
+        for removed in &iteration.removed {
+            let value = sanitize_display(removed.trim_end_matches('.'));
+            output.push(format!("  {} {}", self.error("-"), self.error(&value)));
         }
 
         output.join("\n")
@@ -397,5 +395,73 @@ impl HumanFormatter {
         ));
 
         output.join("\n")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dns::{RecordData, RecordType};
+
+    /// A TXT value carrying an OSC 52 clipboard write and a CSI screen clear.
+    const EVIL_TXT: &str = "v=spf1\x1b]52;c;AAAA\x07 -all\x1b[2J";
+
+    fn follow_iteration_with_evil_txt() -> FollowIteration {
+        FollowIteration {
+            iteration: 2,
+            total_iterations: 3,
+            timestamp: chrono::Utc::now(),
+            records: vec![DnsRecord {
+                name: "example.com".to_string(),
+                record_type: RecordType::TXT,
+                ttl: 300,
+                data: RecordData::TXT {
+                    text: EVIL_TXT.to_string(),
+                },
+            }],
+            changed: true,
+            added: vec![EVIL_TXT.to_string()],
+            removed: vec![format!("old{EVIL_TXT}")],
+            error: None,
+        }
+    }
+
+    #[test]
+    fn follow_iteration_sanitizes_record_values_and_changes() {
+        // `seer follow` re-prints every record value, plus the added/removed
+        // change lists, on each iteration — the only human DNS path that
+        // skipped sanitize_display, so an OSC 52 clipboard write or a screen
+        // clear in a TXT record reached the terminal verbatim.
+        let out = HumanFormatter::new()
+            .without_colors()
+            .format_follow_iteration(&follow_iteration_with_evil_txt());
+        assert!(
+            !out.contains('\x1b'),
+            "ESC must not reach terminal: {out:?}"
+        );
+        assert!(
+            !out.contains('\x07'),
+            "BEL must not reach terminal: {out:?}"
+        );
+        assert!(!out.contains("52;c;"), "OSC 52 payload leaked: {out:?}");
+        // The legitimate text survives in the values line (TXT data renders
+        // quoted) and both change lines.
+        assert!(out.contains("  \"v=spf1 -all\""), "value line: {out:?}");
+        assert!(out.contains("+ v=spf1 -all"), "added line: {out:?}");
+        assert!(out.contains("- oldv=spf1 -all"), "removed line: {out:?}");
+    }
+
+    #[test]
+    fn follow_iteration_sanitizes_error() {
+        let mut it = follow_iteration_with_evil_txt();
+        it.error = Some(format!("resolver said: {EVIL_TXT}"));
+        let out = HumanFormatter::new()
+            .without_colors()
+            .format_follow_iteration(&it);
+        assert!(
+            !out.contains('\x1b'),
+            "ESC must not reach terminal: {out:?}"
+        );
+        assert!(out.contains("resolver said: v=spf1 -all"), "got: {out:?}");
     }
 }

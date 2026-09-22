@@ -1,0 +1,27 @@
+---
+source: seer-core/tests/format_snapshots.rs
+assertion_line: 298
+expression: markdown().format_status(&fixture_status_hostname_mismatch())
+---
+## Status: example.com
+
+- **HTTP Status**: `200` (OK)
+- **Site Title**: Example Domain
+
+### SSL Certificate
+
+- **Subject**: `CN=other.example`
+- **Issuer**: CN=Mock CA
+- **Status**: Valid
+- **Hostname Match**: **no** — ⚠ certificate hostname not verified
+- **Valid From**: `2025-01-01`
+- **Expires**: `2099-01-01` (expires in [N] days)
+
+### Domain Registration
+
+- **Registrar**: Mock Registrar Inc.
+- **Expires**: `2099-03-15` (expires in [N] days)
+
+### DNS Resolution
+
+*Check failed*

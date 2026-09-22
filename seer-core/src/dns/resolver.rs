@@ -27,7 +27,7 @@ use tracing::{debug, instrument};
 use super::nameserver::{NameserverProtocol, NameserverSpec};
 use super::records::{DnsRecord, RecordData, RecordType};
 use crate::error::{Result, SeerError};
-use crate::validation::normalize_domain;
+use crate::validation::{normalize_domain, normalize_host};
 
 /// Convert a DNS lookup result, treating "no records found" as an empty vec
 /// rather than an error. This is correct DNS behavior — the absence of a
@@ -168,6 +168,11 @@ pub struct DnsResolver {
     /// Not settable outside `#[cfg(test)]` builds — production paths always
     /// validate.
     allow_private_hosts: bool,
+    /// Test-only: nameserver spec used when a caller passes `None`, so code
+    /// that always queries the default upstream (posture, CAA) can be pointed
+    /// at the loopback fixture. Absent from release builds.
+    #[cfg(test)]
+    test_default_nameserver: Option<String>,
 }
 
 impl std::fmt::Debug for DnsResolver {
@@ -192,6 +197,8 @@ impl DnsResolver {
             default_resolver: build_default_resolver(DEFAULT_TIMEOUT),
             port_override: None,
             allow_private_hosts: false,
+            #[cfg(test)]
+            test_default_nameserver: None,
         }
     }
 
@@ -223,6 +230,27 @@ impl DnsResolver {
     pub(crate) fn with_port(mut self, port: u16) -> Self {
         self.port_override = Some(port);
         self
+    }
+
+    /// Test-only: send queries that name no nameserver to `nameserver`
+    /// instead of the cached default (Google) resolver.
+    #[cfg(test)]
+    pub(crate) fn with_default_nameserver(mut self, nameserver: &str) -> Self {
+        self.test_default_nameserver = Some(nameserver.to_string());
+        self
+    }
+
+    /// The nameserver a query actually uses: the caller's choice, or (in test
+    /// builds only) the fixture default installed by
+    /// [`with_default_nameserver`](Self::with_default_nameserver).
+    #[cfg(test)]
+    fn effective_nameserver<'a>(&'a self, nameserver: Option<&'a str>) -> Option<&'a str> {
+        nameserver.or(self.test_default_nameserver.as_deref())
+    }
+
+    #[cfg(not(test))]
+    fn effective_nameserver<'a>(&self, nameserver: Option<&'a str>) -> Option<&'a str> {
+        nameserver
     }
 
     /// Sets the timeout for DNS queries.
@@ -313,7 +341,7 @@ impl DnsResolver {
     ) -> Result<Vec<DnsRecord>> {
         // Reuse the cached default resolver when no custom nameserver is specified
         let custom_resolver;
-        let resolver = if let Some(ns) = nameserver {
+        let resolver = if let Some(ns) = self.effective_nameserver(nameserver) {
             custom_resolver = self.create_custom_resolver(ns).await?;
             &custom_resolver
         } else {
@@ -355,10 +383,12 @@ impl DnsResolver {
         nameserver: Option<&str>,
     ) -> Result<Vec<DnsRecord>> {
         // Same normalization/validation as every other public entry point —
-        // callers may hand us URL-form or unvalidated input.
-        let domain = normalize_domain(domain)?;
+        // callers may hand us URL-form or unvalidated input. `normalize_host`,
+        // not `normalize_domain`: `_sip._tcp.www.example.com` is a different
+        // name from `_sip._tcp.example.com`.
+        let domain = normalize_host(domain)?;
         let custom_resolver;
-        let resolver = if let Some(ns) = nameserver {
+        let resolver = if let Some(ns) = self.effective_nameserver(nameserver) {
             custom_resolver = self.create_custom_resolver(ns).await?;
             &custom_resolver
         } else {
@@ -587,29 +617,60 @@ impl DnsResolver {
     /// also has no NS records, so callers should treat
     /// [`DnsPresence::Absent`] as "likely available" (medium confidence).
     pub async fn presence(&self, domain: &str) -> DnsPresence {
-        classify_ns_presence(&self.resolve(domain, RecordType::NS, None).await)
+        // A registration-level question: `www.example.com` means
+        // `example.com` here (as it does for WHOIS/RDAP), so strip `www.`
+        // explicitly — `resolve` itself now keeps it (see `prepare_query`).
+        let Ok(apex) = normalize_domain(domain) else {
+            return DnsPresence::Unknown;
+        };
+        classify_ns_presence(&self.resolve(&apex, RecordType::NS, None).await)
     }
 }
 
-// Domain normalization is now handled by the shared validation module
-
-/// Prepares the query string for a DNS lookup.
+/// Prepares the query name for a DNS record lookup.
+///
+/// Record queries are about one exact DNS name, so this normalizes with
+/// [`normalize_host`], which — unlike [`normalize_domain`] — keeps a leading
+/// `www.`: `www` routinely carries its own records (typically a CNAME), and
+/// stripping it silently answered `dig www.example.com CNAME` for the apex.
 ///
 /// PTR queries may be given a raw IP literal. IPv6 literals in particular must
-/// NOT pass through [`normalize_domain`]: its trailing-`:port` strip heuristic
+/// NOT pass through the normalizer: its trailing-`:port` strip heuristic
 /// truncates the final hextet (e.g. `::1111` → dropped) and the remaining `:`
 /// separators then fail character validation, so IPv6 reverse lookups errored
 /// out with "Invalid domain name" before ever reaching `resolve_ptr`. For PTR
 /// queries we therefore detect an IP literal up front and pass it through in
 /// canonical form; everything else (domains, and PTR queries given a
 /// reverse-DNS name such as `1.1.1.1.in-addr.arpa`) is normalized as usual.
-fn prepare_query(domain: &str, record_type: RecordType) -> Result<String> {
+///
+/// Shared (crate-internal) with compare / propagation / follow so every entry
+/// point that stores or echoes the queried name agrees with what `resolve`
+/// actually queries — they previously re-normalized with `normalize_domain`,
+/// losing `www.` and mangling IPv6 PTR literals.
+pub(crate) fn prepare_query(domain: &str, record_type: RecordType) -> Result<String> {
+    prepare_query_with(domain, record_type, normalize_host)
+}
+
+/// [`prepare_query`] with the normalizer injected, so the IP-literal PTR path
+/// is testable against a rejecting normalizer (the real one reads the
+/// process-global `SEER_DOMAIN_ALLOWLIST`, which tests cannot set).
+fn prepare_query_with(
+    domain: &str,
+    record_type: RecordType,
+    normalize: impl Fn(&str) -> Result<String>,
+) -> Result<String> {
     if record_type == RecordType::PTR {
         if let Ok(ip) = IpAddr::from_str(domain.trim()) {
+            // `SEER_DOMAIN_ALLOWLIST` is enforced inside the normalizer, which
+            // an IP literal skips. Run the name that will actually be queried
+            // (the reverse-DNS name) through it, so a PTR query for an IP
+            // obeys the allowlist exactly like the equivalent
+            // `x.x.x.x.in-addr.arpa` query does.
+            normalize(&reverse_dns_name(&ip))?;
             return Ok(ip.to_string());
         }
     }
-    normalize_domain(domain)
+    normalize(domain)
 }
 
 /// Parses a `dig`-style SRV query name of the form `_service._proto.name` into
@@ -668,13 +729,16 @@ fn reverse_dns_name(ip: &IpAddr) -> String {
 }
 
 fn parse_caa(caa: &CAA) -> (u8, String, String) {
-    // hickory 0.26: CAA fields are public. `issuer_critical` and `tag` are
-    // plain fields; `value` is a `Vec<u8>` because RFC 8659 permits binary
+    // hickory 0.26: CAA fields are public. `flags()` reassembles the full
+    // wire flags byte — the issuer-critical bit plus the reserved bits hickory
+    // keeps in `reserved_flags` — so the reported value matches what the zone
+    // publishes (rebuilding it from `issuer_critical` alone dropped the
+    // reserved bits). `value` is a `Vec<u8>` because RFC 8659 permits binary
     // values for unknown property types. For seer's reporting purposes the
     // common tags (issue/issuewild/iodef) are always UTF-8, so a lossy
     // conversion preserves prior behavior without panicking on the rare
     // binary case.
-    let flags = if caa.issuer_critical { 128 } else { 0 };
+    let flags = caa.flags();
     let tag = caa.tag.clone();
     let value = String::from_utf8_lossy(&caa.value).to_string();
     (flags, tag, value)
@@ -1134,7 +1198,7 @@ mod tests {
             "tls://[::1]",
             "https://10.0.0.1/dns-query",
             "https://169.254.169.254",
-            "https://[fd00::1]:443/dns-query",
+            "tls://[fd00::1]:853",
         ] {
             let err = r.create_custom_resolver(reserved).await.unwrap_err();
             let msg = err.to_string().to_lowercase();
@@ -1145,6 +1209,13 @@ mod tests {
                 msg
             );
         }
+        // DoH to an IPv6 literal is refused even earlier, at parse time
+        // (it can never work — see `NameserverSpec::parse`).
+        let err = r
+            .create_custom_resolver("https://[fd00::1]:443/dns-query")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SeerError::InvalidInput(_)), "{err:?}");
     }
 
     #[tokio::test]
@@ -1502,9 +1573,68 @@ mod tests {
     }
 
     #[test]
-    fn prepare_query_normalizes_domains_for_non_ptr() {
+    fn prepare_query_keeps_www_for_record_queries() {
+        // Regression: record queries normalized with `normalize_domain`,
+        // which strips `www.` — so `dig www.example.com CNAME` silently
+        // queried the apex. A record query is about the exact name.
         let out = prepare_query("HTTPS://WWW.Example.com/path", RecordType::A).unwrap();
+        assert_eq!(out, "www.example.com");
+        let out = prepare_query("www.example.com", RecordType::CNAME).unwrap();
+        assert_eq!(out, "www.example.com");
+    }
+
+    #[test]
+    fn prepare_query_still_normalizes_scheme_port_path_and_case() {
+        let out = prepare_query("https://API.Example.COM:8443/v1?q=1#frag", RecordType::A).unwrap();
+        assert_eq!(out, "api.example.com");
+        let out = prepare_query("example.com.", RecordType::MX).unwrap();
         assert_eq!(out, "example.com");
+        assert!(prepare_query("not a domain", RecordType::A).is_err());
+    }
+
+    #[test]
+    fn prepare_query_runs_ptr_ip_literal_through_the_normalizer() {
+        // Regression: an IP literal skipped the normalizer entirely, and with
+        // it the `SEER_DOMAIN_ALLOWLIST` check that lives inside — so a PTR
+        // query for an IP bypassed the allowlist that the equivalent
+        // `in-addr.arpa` query obeys. Simulate an allowlist that excludes
+        // the reverse zones with a rejecting normalizer.
+        let deny_arpa = |name: &str| -> Result<String> {
+            if name.ends_with(".arpa") {
+                Err(SeerError::DomainNotAllowed {
+                    domain: name.to_string(),
+                    tld: "arpa".to_string(),
+                })
+            } else {
+                Ok(name.to_string())
+            }
+        };
+        for ip in ["192.0.2.1", "2606:4700:4700::1111"] {
+            let err = prepare_query_with(ip, RecordType::PTR, deny_arpa)
+                .expect_err("PTR for an IP literal must obey the normalizer");
+            assert!(matches!(err, SeerError::DomainNotAllowed { .. }), "{err:?}");
+        }
+        // With the real normalizer (no allowlist in tests) both still pass.
+        assert_eq!(
+            prepare_query_with("192.0.2.1", RecordType::PTR, normalize_host).unwrap(),
+            "192.0.2.1"
+        );
+    }
+
+    #[test]
+    fn parse_caa_keeps_reserved_flag_bits() {
+        // Regression: flags were rebuilt from `issuer_critical` alone, so a
+        // record published with reserved bits set reported flags=128/0.
+        let mut caa = CAA::new_issue(
+            true,
+            Some(hickory_resolver::proto::rr::Name::from_ascii("letsencrypt.org").unwrap()),
+            vec![],
+        );
+        caa.reserved_flags = 0x01;
+        let (flags, tag, value) = parse_caa(&caa);
+        assert_eq!(flags, 0x81);
+        assert_eq!(tag, "issue");
+        assert_eq!(value, "letsencrypt.org");
     }
 
     // --- Hermetic mock-server tests -----------------------------------
@@ -1517,7 +1647,10 @@ mod tests {
     // `allowing_private_hosts` / `with_port` seams, which do not exist in
     // release builds.
 
-    use crate::dns::test_support::{mock_dns_resolver, spawn_mock_dns, MockMode};
+    use crate::dns::test_support::{
+        mock_dns_resolver, mock_dns_resolver_default, spawn_mock_dns, spawn_mock_dns_fn, MockMode,
+        MockReply,
+    };
 
     async fn mock_zone_lookup(record_type: RecordType, domain: &str) -> Vec<DnsRecord> {
         let port = spawn_mock_dns(MockMode::Zone).await;
@@ -1709,6 +1842,70 @@ mod tests {
             &records[0].data,
             RecordData::PTR { target } if target == "ptr.seer.test."
         ));
+    }
+
+    #[tokio::test]
+    async fn mock_resolve_keeps_www_label() {
+        // Regression: `resolve("www.x", CNAME)` queried `x` (normalize_domain
+        // strips `www.`), which has no CNAME — an empty, wrong answer.
+        let records = mock_zone_lookup(RecordType::CNAME, "www.seer.test").await;
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert_eq!(records[0].name, "www.seer.test");
+        assert_eq!(records[0].data.to_string(), "edge.cdn.test.");
+    }
+
+    #[tokio::test]
+    async fn mock_resolve_srv_keeps_www_label() {
+        let port = spawn_mock_dns_fn(|qname, qtype| match (qname, qtype) {
+            ("_sip._tcp.www.seer.test", HickoryRecordType::SRV) => {
+                MockReply::Answer(vec![HickoryRData::SRV(
+                    hickory_resolver::proto::rr::rdata::SRV::new(
+                        10,
+                        5,
+                        5060,
+                        hickory_resolver::proto::rr::Name::from_ascii("sip.seer.test.").unwrap(),
+                    ),
+                )])
+            }
+            _ => MockReply::NoData,
+        })
+        .await;
+        let records = mock_dns_resolver(port)
+            .resolve_srv("sip", "tcp", "www.seer.test", Some("127.0.0.1"))
+            .await
+            .expect("SRV against mock");
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert_eq!(records[0].name, "_sip._tcp.www.seer.test");
+    }
+
+    #[tokio::test]
+    async fn mock_presence_still_probes_the_apex_for_www_input() {
+        // `presence` answers a registration-level question, so it must keep
+        // stripping `www.` even though `resolve` no longer does.
+        let port = spawn_mock_dns_fn(|qname, qtype| match (qname, qtype) {
+            ("seer.test", HickoryRecordType::NS) => MockReply::Answer(vec![HickoryRData::NS(
+                hickory_resolver::proto::rr::rdata::NS(
+                    hickory_resolver::proto::rr::Name::from_ascii("ns1.seer.test.").unwrap(),
+                ),
+            )]),
+            // What a recursive resolver relays for a name inside the zone:
+            // querying `www` itself would read as "no NS" → Absent.
+            ("www.seer.test", HickoryRecordType::NS) => MockReply::NoDataWithSoa("seer.test"),
+            _ => MockReply::NxDomain,
+        })
+        .await;
+        let resolver = mock_dns_resolver_default(port);
+        assert_eq!(
+            resolver.presence("www.seer.test").await,
+            DnsPresence::Present
+        );
+    }
+
+    #[tokio::test]
+    async fn mock_resolve_ptr_transforms_ipv6_literal() {
+        let records = mock_zone_lookup(RecordType::PTR, "2606:4700:4700::1111").await;
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert_eq!(records[0].data.to_string(), "one.one.one.one.");
     }
 
     #[tokio::test]

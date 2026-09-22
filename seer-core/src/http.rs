@@ -394,6 +394,18 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, SeerError::HttpError(_)), "got {err:?}");
         server.verify().await;
+
+        // The fixture listens on a random port, which the port rule already
+        // refuses — so also prove the *loopback* guard itself fires on the
+        // standard ports, where the port rule passes.
+        for url in ["http://127.0.0.1/", "https://127.0.0.1/"] {
+            let err = GuardedFetcher::new().get(url).await.unwrap_err();
+            assert!(matches!(err, SeerError::HttpError(_)), "got {err:?}");
+            assert!(
+                !err.to_string().contains("non-standard port"),
+                "{url} must be refused by the reserved-range check: {err}"
+            );
+        }
     }
 
     #[tokio::test]

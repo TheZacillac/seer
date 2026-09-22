@@ -170,10 +170,16 @@ impl RetryClassifier for NetworkRetryClassifier {
                     || lower.contains("timeout")
             }
 
-            // Bootstrap errors could be transient if IANA is temporarily unavailable
+            // Bootstrap errors could be transient if IANA is temporarily
+            // unavailable. "all IANA bootstrap registries failed" is exactly
+            // that case (every fetch errored), so it must be retryable —
+            // otherwise the bootstrap loader's retry policy never retries.
+            // "no RDAP server for ..." and "throttled and no cache" are not.
             SeerError::RdapBootstrapError(msg) => {
                 let lower = msg.to_lowercase();
-                lower.contains("timeout") || lower.contains("connection")
+                lower.contains("timeout")
+                    || lower.contains("connection")
+                    || lower.contains("registries failed")
             }
 
             // DNS errors can be transient
@@ -584,5 +590,23 @@ mod tests {
             !classifier.is_retryable(&wrapped_non_retryable),
             "RetryExhausted wrapping a non-retryable InvalidDomain must not be retryable",
         );
+    }
+
+    #[test]
+    fn bootstrap_all_registries_failed_is_retryable() {
+        // The RDAP bootstrap loader retries through RetryExecutor; if its
+        // "every IANA registry fetch failed" error isn't classified as
+        // transient, the retry policy never gets a second attempt.
+        let classifier = NetworkRetryClassifier::new();
+        assert!(classifier.is_retryable(&SeerError::RdapBootstrapError(
+            "all IANA bootstrap registries failed".to_string()
+        )));
+        // Permanent bootstrap outcomes stay non-retryable.
+        assert!(!classifier.is_retryable(&SeerError::RdapBootstrapError(
+            "no RDAP server for example.ru".to_string()
+        )));
+        assert!(!classifier.is_retryable(&SeerError::RdapBootstrapError(
+            "bootstrap refresh throttled and no cache available".to_string()
+        )));
     }
 }

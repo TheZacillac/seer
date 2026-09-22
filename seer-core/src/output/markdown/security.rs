@@ -14,6 +14,10 @@ use crate::takeover::{TakeoverReport, TakeoverVerdict};
 impl MarkdownFormatter {
     pub(super) fn format_drift(&self, report: &DriftReport) -> String {
         let mut out = format!("## Drift: {}\n\n", MdSafe(&report.domain));
+        if let Some(reason) = &report.inconclusive {
+            let _ = writeln!(out, "_Not compared: {}._", MdSafe(reason));
+            return out;
+        }
         if report.changes.is_empty() {
             out.push_str("_No changes since the previous snapshot._\n");
             return out;
@@ -203,8 +207,11 @@ impl MarkdownFormatter {
         if report.findings.is_empty() {
             out.push_str("_No takeover signals found._\n");
         } else {
+            // `Note` carries the probe note — why a finding stayed "potential"
+            // (no fingerprint for the provider, probe failed, …).
             out.push_str(
-                "| Host | Verdict | Provider | CNAME | Evidence |\n|---|---|---|---|---|\n",
+                "| Host | Verdict | Provider | CNAME | Evidence | Note |\n\
+                 |---|---|---|---|---|---|\n",
             );
             for f in &report.findings {
                 let verdict = match f.verdict {
@@ -214,12 +221,13 @@ impl MarkdownFormatter {
                 };
                 let _ = writeln!(
                     out,
-                    "| {} | {} | {} | {} | {} |",
+                    "| {} | {} | {} | {} | {} | {} |",
                     MdSafe(&f.host),
                     verdict,
                     MdSafe(f.provider.as_deref().unwrap_or("—")),
                     MdSafe(f.cname.as_deref().unwrap_or("—")),
-                    MdSafe(f.evidence.as_deref().unwrap_or("—"))
+                    MdSafe(f.evidence.as_deref().unwrap_or("—")),
+                    MdSafe(f.probe_note.as_deref().unwrap_or("—"))
                 );
             }
         }
@@ -325,5 +333,47 @@ impl MarkdownFormatter {
             );
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::takeover::TakeoverFinding;
+
+    #[test]
+    fn takeover_table_includes_probe_note() {
+        // The probe note is the reason a finding is only "potential"; the
+        // human formatter prints it, markdown dropped it.
+        let report = TakeoverReport {
+            domain: "example.com".to_string(),
+            hosts_checked: 1,
+            hosts_skipped: 0,
+            vulnerable: 0,
+            potential: 1,
+            findings: vec![TakeoverFinding {
+                host: "docs.example.com".to_string(),
+                verdict: TakeoverVerdict::Potential,
+                provider: Some("GitHub Pages".to_string()),
+                cname: Some("example.github.io".to_string()),
+                addresses: Vec::new(),
+                evidence: None,
+                http_status: None,
+                probe_note: Some("HTTP probe failed: connection|refused".to_string()),
+            }],
+            notes: Vec::new(),
+        };
+        let out = MarkdownFormatter::new().format_takeover(&report);
+        assert!(
+            out.contains("| Host | Verdict | Provider | CNAME | Evidence | Note |"),
+            "got:\n{out}"
+        );
+        assert!(
+            out.contains(
+                "| docs.example.com | potential | GitHub Pages | example.github.io | — \
+                 | HTTP probe failed: connection\\|refused |"
+            ),
+            "probe note must render (MdSafe-escaped):\n{out}"
+        );
     }
 }

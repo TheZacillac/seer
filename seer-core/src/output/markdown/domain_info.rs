@@ -126,6 +126,18 @@ impl MarkdownFormatter {
         output.push(format!("## Domain Info: {}", MdSafe(&info.domain)));
         output.push(String::new());
         output.push(format!("**Source:** {}", source_str));
+        // Same verdict wording as the human formatter and markdown lookup.
+        if let Some(verdict) = &info.availability_verdict {
+            let rendered = match verdict.as_str() {
+                "available" => "AVAILABLE",
+                "likely_available" => "MAY BE AVAILABLE",
+                "registered" => "REGISTERED",
+                "likely_registered" => "LIKELY REGISTERED",
+                _ => "UNKNOWN",
+            };
+            output.push(String::new());
+            output.push(format!("**Verdict:** {}", rendered));
+        }
         output.push(String::new());
 
         // Registration table
@@ -227,8 +239,13 @@ impl MarkdownFormatter {
             output.push(String::new());
             output.push("### Contacts".to_string());
             output.push(String::new());
-            output.push("| Role | Name | Organization | Email | Phone |".to_string());
-            output.push("| --- | --- | --- | --- | --- |".to_string());
+            // Address/Country exist only for the registrant, but a
+            // GDPR-redacted record often carries nothing else (e.g. just
+            // `Registrant Country: US`), so they need their own columns.
+            output.push(
+                "| Role | Name | Organization | Email | Phone | Address | Country |".to_string(),
+            );
+            output.push("| --- | --- | --- | --- | --- | --- | --- |".to_string());
 
             let has_registrant = info.registrant_email.is_some()
                 || info.registrant_phone.is_some()
@@ -236,9 +253,11 @@ impl MarkdownFormatter {
                 || info.registrant_country.is_some();
             if has_registrant {
                 output.push(format!(
-                    "| Registrant | - | - | {} | {} |",
+                    "| Registrant | - | - | {} | {} | {} | {} |",
                     opt_md(&info.registrant_email),
                     opt_md(&info.registrant_phone),
+                    opt_md(&info.registrant_address),
+                    opt_md(&info.registrant_country),
                 ));
             }
 
@@ -248,7 +267,7 @@ impl MarkdownFormatter {
                 || info.admin_phone.is_some();
             if has_admin {
                 output.push(format!(
-                    "| Admin | {} | {} | {} | {} |",
+                    "| Admin | {} | {} | {} | {} | - | - |",
                     opt_md(&info.admin_name),
                     opt_md(&info.admin_organization),
                     opt_md(&info.admin_email),
@@ -262,7 +281,7 @@ impl MarkdownFormatter {
                 || info.tech_phone.is_some();
             if has_tech {
                 output.push(format!(
-                    "| Tech | {} | {} | {} | {} |",
+                    "| Tech | {} | {} | {} | {} | - | - |",
                     opt_md(&info.tech_name),
                     opt_md(&info.tech_organization),
                     opt_md(&info.tech_email),
@@ -309,5 +328,50 @@ impl MarkdownFormatter {
         }
 
         output.join("\n")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn domain_info_renders_availability_verdict() {
+        // Human `seer info` shows the availability verdict; markdown dropped it.
+        let mut info = crate::domain_info::DomainInfo::from_sources("example.com", None, None);
+        info.availability_verdict = Some("likely_available".to_string());
+        let out = MarkdownFormatter::new().format_domain_info(&info);
+        assert!(out.contains("**Verdict:** MAY BE AVAILABLE"), "got:\n{out}");
+    }
+
+    #[test]
+    fn contacts_table_renders_registrant_address_and_country() {
+        // A GDPR-redacted record with only `Registrant Country: US` set
+        // `has_registrant` but rendered `| Registrant | - | - | - | - |`.
+        let whois = WhoisResponse::parse(
+            "example.com",
+            "whois.test",
+            "Registrar: Mock Registrar\nRegistrant Country: US\n",
+        );
+        let mut info =
+            crate::domain_info::DomainInfo::from_sources("example.com", None, Some(&whois));
+        assert_eq!(info.registrant_country.as_deref(), Some("US"), "fixture");
+        info.registrant_address = Some("1 Main St|Springfield".to_string());
+        info.admin_name = Some("Jane Admin".to_string());
+
+        let out = MarkdownFormatter::new().format_domain_info(&info);
+        assert!(
+            out.contains("| Role | Name | Organization | Email | Phone | Address | Country |"),
+            "got:\n{out}"
+        );
+        assert!(
+            out.contains("| Registrant | - | - | - | - | 1 Main St\\|Springfield | US |"),
+            "registrant address/country must render:\n{out}"
+        );
+        // Other rows keep the table rectangular.
+        assert!(
+            out.contains("| Admin | Jane Admin | - | - | - | - | - |"),
+            "got:\n{out}"
+        );
     }
 }

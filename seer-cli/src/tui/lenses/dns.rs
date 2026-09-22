@@ -36,7 +36,8 @@ pub fn render(
 
     // Tab 0: Records
     let LensData::Dns(records) = data else { return };
-    let block = panel::block(theme, "dig · records", theme.sky, focused);
+    let title = format!("dig · {} records", panes.dns.record_type);
+    let block = panel::block(theme, &title, theme.sky, focused);
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -151,6 +152,21 @@ mod tests {
         let text = buf_text(terminal.backend().buffer());
         assert!(text.contains("93.184.215.14"));
         assert!(text.contains("example.com"));
+        assert!(text.contains("dig · A records"), "title names the type");
+    }
+
+    #[test]
+    fn title_names_the_selected_record_type() {
+        let theme = Theme::frappe();
+        let data = LensData::Dns(vec![]);
+        let mut panes = Panes::default();
+        panes.dns.record_type = RecordType::MX;
+        let backend = TestBackend::new(70, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| render(f, f.area(), &theme, 0, &data, false, 0, &panes))
+            .unwrap();
+        assert!(buf_text(terminal.backend().buffer()).contains("dig · MX records"));
     }
 
     #[test]

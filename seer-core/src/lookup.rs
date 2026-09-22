@@ -90,14 +90,56 @@ static LOOKUP_CONCURRENT_CALLS: Lazy<std::sync::atomic::AtomicUsize> =
     Lazy::new(|| std::sync::atomic::AtomicUsize::new(0));
 
 /// Returns true if the parsed WHOIS response lacks all key registration
-/// signals: no registrar, no creation date, and no expiration date.
+/// signals: no registrar, no creation/expiration date, and no nameservers.
 ///
 /// This is a necessary-but-not-sufficient signal for domain availability;
 /// `lookup_concurrent` combines it with an RDAP 404 before routing to the
-/// availability path. Nameservers alone don't disqualify thinness — some
-/// registries return placeholder nameservers for unregistered domains.
+/// availability path. Nameservers count as registration data: DENIC (.de,
+/// no RDAP) publishes only nameservers/status/changed date, and treating
+/// that as thin turned every registered .de domain into a data-less
+/// `dns_present` verdict. Delegates to [`crate::availability::whois_is_thin`]
+/// so this path and the dedicated availability ladder cannot drift.
 fn whois_response_is_thin(w: &WhoisResponse) -> bool {
-    w.registrar.is_none() && w.creation_date.is_none() && w.expiration_date.is_none()
+    crate::availability::whois_is_thin(w)
+}
+
+/// TTL for *degraded* lookup results: verdicts derived from DNS presence or
+/// a registry refusal rather than from registry data (see
+/// [`is_degraded_result`]). Short so a transient rate limit or outage isn't
+/// served back for the full [`LOOKUP_CACHE_TTL`], yet non-zero so coalesced
+/// waiters (which read the owner's result from the cache) and bulk
+/// duplicates still share one network race.
+const DEGRADED_LOOKUP_CACHE_TTL: Duration = Duration::from_secs(30);
+
+/// Whether a lookup result is a stand-in for registry data we failed to get:
+/// an inconclusive verdict, or one inferred from DNS presence (`dns_present`
+/// — "retry shortly for full detail" — and `dns_nxdomain`), or from a WHOIS
+/// error message. Such results are cached only briefly.
+fn is_degraded_result(result: &LookupResult) -> bool {
+    match result {
+        LookupResult::Available { data, .. } => matches!(
+            data.method.as_str(),
+            "inconclusive" | "dns_present" | "dns_nxdomain" | "whois_error"
+        ),
+        LookupResult::Rdap { .. } | LookupResult::Whois { .. } => false,
+    }
+}
+
+/// Builds the `Available` variant for the routes of
+/// [`SmartLookup::lookup_concurrent`] that hold a WHOIS response. Every such
+/// route goes through here so none can forget to sanitize the public RDAP
+/// error string.
+fn available_with_whois(
+    avail: AvailabilityResult,
+    rdap_error: &str,
+    whois_data: WhoisResponse,
+) -> LookupResult {
+    LookupResult::Available {
+        data: Box::new(avail),
+        rdap_error: sanitize_error_for_public(rdap_error),
+        whois_error: String::new(),
+        whois_data: Some(whois_data),
+    }
 }
 
 /// Returns true if an RDAP response carries enough data to serve as the
@@ -606,7 +648,8 @@ impl SmartLookup {
 
     /// Performs a smart lookup for a domain, trying both RDAP and WHOIS concurrently.
     /// Falls back to an availability check if both fail.
-    /// Results are cached for 5 minutes to avoid redundant network calls.
+    /// Results are cached for 5 minutes to avoid redundant network calls
+    /// (30 seconds for degraded, DNS-inferred or inconclusive verdicts).
     #[instrument(skip(self), fields(domain = %domain))]
     pub async fn lookup(&self, domain: &str) -> Result<LookupResult> {
         self.lookup_with_progress(domain, None).await
@@ -614,8 +657,9 @@ impl SmartLookup {
 
     /// Performs a lookup with an optional progress callback.
     /// The callback is called with messages describing the current phase.
-    /// Results are cached for 5 minutes. Concurrent lookups for the same
-    /// domain are coalesced — only one network race runs per domain at a time.
+    /// Results are cached for 5 minutes (30 seconds for degraded verdicts).
+    /// Concurrent lookups for the same domain are coalesced — only one
+    /// network race runs per domain at a time.
     #[instrument(skip(self, progress), fields(domain = %domain))]
     pub async fn lookup_with_progress(
         &self,
@@ -639,78 +683,83 @@ impl SmartLookup {
         //   - Owner: no entry exists; insert a Weak handle, hold the Arc
         //     for the duration of the work, then remove and notify on drop.
         //
-        // A `loop` with a separate lock-scope per iteration keeps the
-        // `MutexGuard` from being held across any `.await`.
+        // Each iteration takes the map lock, then either claims ownership or
+        // subscribes as a waiter *before* releasing it. The `MutexGuard` is
+        // always dropped before any `.await`.
         let _guard = loop {
-            enum Slot {
-                Waiter(Arc<Notify>),
-                Owner(InflightGuard),
-            }
-
-            let slot = {
+            let existing: Arc<Notify>;
+            let notified = {
                 // Recover from poisoning rather than panicking: a prior
                 // owner's panic should not permanently wedge the in-flight
                 // tracker for every future lookup.
                 let mut inflight = LOOKUP_INFLIGHT.lock().unwrap_or_else(|p| p.into_inner());
                 match inflight.get(&normalized).and_then(|w| w.upgrade()) {
-                    Some(existing) => Slot::Waiter(existing),
+                    Some(n) => existing = n,
                     None => {
                         let n = Arc::new(Notify::new());
                         inflight.insert(normalized.clone(), Arc::downgrade(&n));
-                        Slot::Owner(InflightGuard {
+                        break InflightGuard {
                             key: normalized.clone(),
                             notify: n,
-                        })
+                        };
                     }
                 }
+                // Subscribe while still holding the map lock. The owner's
+                // `InflightGuard::drop` takes this same lock to remove the
+                // entry before calling `notify_waiters()`, and a `Notified`
+                // future receives `notify_waiters()` from the moment it is
+                // created — so the notification cannot fire between us
+                // finding the entry and subscribing. Subscribing after the
+                // unlock left a gap in which a cancelled owner's
+                // notification was lost and this waiter slept the full
+                // `DEFAULT_INFLIGHT_WAIT`.
+                existing.notified()
             };
+            tokio::pin!(notified);
+            // Also register eagerly as a waiter (before any await).
+            notified.as_mut().enable();
+            debug!(domain = %normalized, "Waiting for in-flight lookup to complete");
 
-            match slot {
-                Slot::Waiter(n) => {
-                    debug!(domain = %normalized, "Waiting for in-flight lookup to complete");
-                    // Ordering requirement (mirrors rdap::client::ensure_bootstrap):
-                    // construct and pin the `Notified` future BEFORE we re-check
-                    // the cache. `Notify::notified()` reserves the wakeup slot the
-                    // moment it is constructed (only `.await` blocks), so a
-                    // `notify_waiters()` fired by the owner's `InflightGuard::drop`
-                    // after this point cannot be missed. Without this, the owner
-                    // could drop (removing the map entry and firing
-                    // `notify_waiters()`) in the gap between us releasing the lock
-                    // above and subscribing here — `notify_waiters` stores no
-                    // permit for late subscribers, so the waiter would hang.
-                    let notified = n.notified();
-                    tokio::pin!(notified);
-
-                    // Re-check the cache now that we're subscribed: the owner may
-                    // have populated it and notified in the gap between the lock
-                    // release and our subscription.
-                    if let Some(cached) = LOOKUP_CACHE.get(&normalized) {
-                        return Ok(cached);
-                    }
-
-                    // Bounded wait: if the owner's future was cancelled/dropped
-                    // without notifying, or the notification was otherwise lost,
-                    // fall through and re-contend for ownership rather than
-                    // hanging forever. The RDAP timeout is a sensible bound for a
-                    // single domain lookup race.
-                    let _ = tokio_timeout(DEFAULT_INFLIGHT_WAIT, notified.as_mut()).await;
-
-                    if let Some(cached) = LOOKUP_CACHE.get(&normalized) {
-                        return Ok(cached);
-                    }
-                    // Owner finished without populating the cache (failed or
-                    // errored), or the wait timed out. Re-contend for ownership.
-                    continue;
-                }
-                Slot::Owner(guard) => break guard,
+            // Re-check the cache now that we're subscribed: the owner may
+            // already have populated it.
+            if let Some(cached) = LOOKUP_CACHE.get(&normalized) {
+                return Ok(cached);
             }
+
+            // Bounded wait: if the owner's future hangs, or a notification is
+            // otherwise lost, fall through and re-contend for ownership rather
+            // than blocking forever.
+            let _ = tokio_timeout(DEFAULT_INFLIGHT_WAIT, notified.as_mut()).await;
+
+            if let Some(cached) = LOOKUP_CACHE.get(&normalized) {
+                return Ok(cached);
+            }
+            // Owner finished without populating the cache (failed or
+            // errored), or the wait timed out. Re-contend for ownership.
         };
+
+        // Re-check the cache now that we own the slot: a previous owner may
+        // have finished (populated the cache and released the slot) between
+        // our first cache check and taking the lock, and running a second
+        // full lookup for it would be pure waste. Returning drops `_guard`,
+        // which releases any waiters to read the same cached value.
+        if let Some(cached) = LOOKUP_CACHE.get(&normalized) {
+            debug!(domain = %normalized, "Returning result cached by previous owner");
+            return Ok(cached);
+        }
 
         let result = self.lookup_concurrent(&normalized, progress).await?;
 
         // Cache a trimmed copy to limit memory usage before releasing
-        // waiters (via guard drop) so they observe the cached value.
-        LOOKUP_CACHE.insert(normalized.clone(), trim_raw_response(result.clone()));
+        // waiters (via guard drop) so they observe the cached value. A
+        // degraded verdict (no registry data) only gets a short TTL so the
+        // next lookup soon retries the registries.
+        let ttl = if is_degraded_result(&result) {
+            DEGRADED_LOOKUP_CACHE_TTL
+        } else {
+            LOOKUP_CACHE_TTL
+        };
+        LOOKUP_CACHE.insert_with_ttl(normalized.clone(), trim_raw_response(result.clone()), ttl);
 
         Ok(result)
     }
@@ -829,9 +878,6 @@ impl SmartLookup {
                     confidence = %confidence,
                     "Reclassifying WHOIS as availability signal"
                 );
-                if let Some(ref cb) = progress {
-                    cb("Domain appears unregistered");
-                }
                 // Keyed off `method` (not confidence) so the text names the
                 // signal that actually decided the verdict, matching
                 // `availability::decide_fallback`'s wording for the same cases.
@@ -847,12 +893,17 @@ impl SmartLookup {
                     method: method.to_string(),
                     details,
                 };
-                return Ok(LookupResult::Available {
-                    data: Box::new(avail),
-                    rdap_error: sanitize_error_for_public(&rdap_error_str),
-                    whois_error: String::new(),
-                    whois_data: Some(whois_data),
-                });
+                // A registry "no such domain" for a name below its
+                // registrable domain (mail.google.com) is not availability.
+                let avail = self.availability_checker.guard_subdomain_claim(avail).await;
+                if let Some(ref cb) = progress {
+                    cb(if avail.available {
+                        "Domain appears unregistered"
+                    } else {
+                        "Name is below a registrable domain (checked its parent)"
+                    });
+                }
+                return Ok(available_with_whois(avail, &rdap_error_str, whois_data));
             }
 
             // Fix #2 safety net: a thin WHOIS body plus an RDAP failure that was
@@ -895,18 +946,10 @@ impl SmartLookup {
                                     .to_string(),
                             ),
                         };
-                        return Ok(LookupResult::Available {
-                            data: Box::new(avail),
-                            rdap_error: sanitize_error_for_public(&rdap_error_str),
-                            whois_error: String::new(),
-                            whois_data: Some(whois_data),
-                        });
+                        return Ok(available_with_whois(avail, &rdap_error_str, whois_data));
                     }
                     ThinFallback::Available => {
                         debug!(domain = %domain, "Thin WHOIS + NXDOMAIN, reclassifying as available");
-                        if let Some(ref cb) = progress {
-                            cb("Domain appears unregistered (no DNS presence)");
-                        }
                         let avail = AvailabilityResult {
                             domain: domain.to_string(),
                             available: true,
@@ -917,12 +960,15 @@ impl SmartLookup {
                                     .to_string(),
                             ),
                         };
-                        return Ok(LookupResult::Available {
-                            data: Box::new(avail),
-                            rdap_error: sanitize_error_for_public(&rdap_error_str),
-                            whois_error: String::new(),
-                            whois_data: Some(whois_data),
-                        });
+                        let avail = self.availability_checker.guard_subdomain_claim(avail).await;
+                        if let Some(ref cb) = progress {
+                            cb(if avail.available {
+                                "Domain appears unregistered (no DNS presence)"
+                            } else {
+                                "Name is below a registrable domain (checked its parent)"
+                            });
+                        }
+                        return Ok(available_with_whois(avail, &rdap_error_str, whois_data));
                     }
                     ThinFallback::Registered => {
                         debug!(domain = %domain, "Thin/no-service WHOIS + DNS delegation, reporting registered");
@@ -945,12 +991,7 @@ impl SmartLookup {
                             method: "dns_present".to_string(),
                             details: Some(details.to_string()),
                         };
-                        return Ok(LookupResult::Available {
-                            data: Box::new(avail),
-                            rdap_error: sanitize_error_for_public(&rdap_error_str),
-                            whois_error: String::new(),
-                            whois_data: Some(whois_data),
-                        });
+                        return Ok(available_with_whois(avail, &rdap_error_str, whois_data));
                     }
                     ThinFallback::UseWhois => {}
                 }
@@ -1543,42 +1584,127 @@ mod tests {
         format!("{}_{}_{}.example.", prefix, nanos, n)
     }
 
-    // Demonstrates that the `sanitize_error_for_public` helper is applied
-    // to the rdap_error / whois_error fields written into the `Available`
-    // variant. We check the call site indirectly: construct a Available
-    // manually and then verify a raw error with an IP becomes redacted.
-    // (Integration via real clients would require network.)
+    // The public `rdap_error` / `whois_error` strings of every `Available`
+    // result must be sanitized. These exercise the real construction paths
+    // (not the sanitizer in isolation), so a construction site that stops
+    // sanitizing fails here.
+
     #[test]
-    fn test_sanitize_applied_to_available_fields() {
-        let rdap_raw = "RDAP URL resolves to reserved IP 10.0.0.1";
-        let whois_raw = "connection refused at 192.168.0.5";
-        let sanitized_rdap = sanitize_error_for_public(rdap_raw);
-        let sanitized_whois = sanitize_error_for_public(whois_raw);
-        let result = LookupResult::Available {
-            data: Box::new(AvailabilityResult {
-                domain: "unreg.test".to_string(),
-                available: true,
-                confidence: "low".to_string(),
-                method: "heuristic".to_string(),
-                details: None,
-            }),
-            rdap_error: sanitized_rdap,
-            whois_error: sanitized_whois,
-            whois_data: None,
+    fn available_with_whois_sanitizes_rdap_error() {
+        // The constructor every WHOIS-in-hand route of `lookup_concurrent`
+        // returns through.
+        let avail = AvailabilityResult {
+            domain: "unreg.test".to_string(),
+            available: false,
+            confidence: "none".to_string(),
+            method: "inconclusive".to_string(),
+            details: None,
         };
-        if let LookupResult::Available {
+        let result = available_with_whois(
+            avail,
+            "RDAP URL resolves to reserved IP 10.0.0.1",
+            empty_whois("unreg.test"),
+        );
+        let LookupResult::Available {
+            rdap_error,
+            whois_error,
+            whois_data,
+            ..
+        } = result
+        else {
+            panic!("expected Available variant");
+        };
+        assert!(!rdap_error.contains("10.0.0.1"), "{rdap_error}");
+        assert!(rdap_error.contains("[ip-redacted]"));
+        assert!(whois_error.is_empty());
+        assert!(whois_data.is_some());
+    }
+
+    #[tokio::test]
+    async fn availability_fallback_sanitizes_both_error_fields() {
+        // A prior RDAP 200 short-circuits the checker to `decide_from_rdap`,
+        // so this runs the real fallback construction with no network.
+        let lookup = SmartLookup::new();
+        let prior = RdapResponse {
+            ldh_name: Some("example.com".to_string()),
+            status: vec!["active".to_string()],
+            ..Default::default()
+        };
+        let result = lookup
+            .availability_fallback(
+                "example.com",
+                PriorRdap::Response(Box::new(prior)),
+                PriorWhois::Missing,
+                "RDAP URL resolves to reserved IP 10.0.0.1".to_string(),
+                "connection refused at 192.168.0.5 and fe80::1".to_string(),
+                None,
+            )
+            .await
+            .expect("prior-response fallback must not error");
+        let LookupResult::Available {
             rdap_error,
             whois_error,
             ..
         } = result
-        {
-            assert!(!rdap_error.contains("10.0.0.1"));
-            assert!(!whois_error.contains("192.168.0.5"));
-            assert!(rdap_error.contains("[ip-redacted]"));
-            assert!(whois_error.contains("[ip-redacted]"));
-        } else {
+        else {
             panic!("expected Available variant");
+        };
+        assert!(!rdap_error.contains("10.0.0.1"), "{rdap_error}");
+        assert!(!whois_error.contains("192.168.0.5"), "{whois_error}");
+        assert!(!whois_error.contains("fe80::1"), "{whois_error}");
+        assert!(rdap_error.contains("[ip-redacted]"));
+        assert!(whois_error.contains("[ip-redacted]"));
+    }
+
+    // ---------------- degraded-result caching ----------------
+
+    fn available_via(method: &str, available: bool, confidence: &str) -> LookupResult {
+        LookupResult::Available {
+            data: Box::new(AvailabilityResult {
+                domain: "example.test".to_string(),
+                available,
+                confidence: confidence.to_string(),
+                method: method.to_string(),
+                details: None,
+            }),
+            rdap_error: String::new(),
+            whois_error: String::new(),
+            whois_data: None,
         }
+    }
+
+    #[test]
+    fn degraded_results_are_identified_for_short_caching() {
+        // Verdicts standing in for registry data we failed to get.
+        assert!(is_degraded_result(&available_via(
+            "inconclusive",
+            false,
+            "none"
+        )));
+        assert!(is_degraded_result(&available_via(
+            "dns_present",
+            false,
+            "high"
+        )));
+        assert!(is_degraded_result(&available_via(
+            "dns_nxdomain",
+            true,
+            "medium"
+        )));
+        assert!(is_degraded_result(&available_via(
+            "whois_error",
+            true,
+            "medium"
+        )));
+        // Authoritative registry answers keep the full TTL.
+        assert!(!is_degraded_result(&available_via("rdap", true, "high")));
+        assert!(!is_degraded_result(&available_via("whois", true, "high")));
+        assert!(!is_degraded_result(&LookupResult::Whois {
+            data: empty_whois("example.test"),
+            rdap_error: None,
+            rdap_fallback: None,
+        }));
+        const { assert!(DEGRADED_LOOKUP_CACHE_TTL.as_secs() < LOOKUP_CACHE_TTL.as_secs()) };
     }
 
     #[test]
@@ -1674,11 +1800,47 @@ mod tests {
         assert!(!whois_response_is_thin(&w));
     }
 
+    /// DENIC-shaped parsed WHOIS: nameservers, status and a changed date,
+    /// but never a registrar or creation/expiry dates (and .de has no RDAP).
+    fn denic_whois() -> WhoisResponse {
+        let mut w = empty_whois("example.de");
+        w.nameservers = vec!["ns1.example.net".to_string()];
+        w.status = vec!["active".to_string()];
+        w.updated_date = Some(Utc::now());
+        w.raw_response = "Domain: example.de\nNserver: ns1.example.net\nStatus: connect\n".into();
+        w
+    }
+
     #[test]
-    fn whois_response_is_thin_even_with_nameservers_alone() {
+    fn whois_response_with_nameservers_is_not_thin() {
         let mut w = empty_whois("example.com");
         w.nameservers = vec!["ns1.example.net".to_string()];
-        assert!(whois_response_is_thin(&w));
+        assert!(!whois_response_is_thin(&w));
+    }
+
+    #[test]
+    fn denic_whois_stays_on_the_whois_path() {
+        // Regression: every registered .de domain used to become
+        // `Available { method: "dns_present" }` ("WHOIS returned no data;
+        // retry shortly") with its WHOIS data discarded by DomainInfo.
+        let w = denic_whois();
+        let bootstrap_miss =
+            SeerError::RdapBootstrapError("no RDAP server for example.de".to_string());
+        assert!(!whois_response_is_thin(&w));
+        assert!(whois_leg_has_data(&Ok(w.clone())));
+        assert_eq!(
+            should_route_to_availability(false, Some(&bootstrap_miss), &w),
+            None
+        );
+        assert_eq!(
+            classify_thin_fallback(
+                whois_response_is_thin(&w),
+                false,
+                w.indicates_registry_refusal(),
+                DnsPresence::Present,
+            ),
+            ThinFallback::UseWhois
+        );
     }
 
     // ---------------- classify_whois_leg ----------------

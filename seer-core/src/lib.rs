@@ -5,6 +5,7 @@ pub mod cache;
 pub mod colors;
 pub mod config;
 pub mod confusables;
+mod dates;
 pub mod diff;
 pub mod dns;
 pub mod doctor;
@@ -20,6 +21,7 @@ pub mod lookup;
 pub mod net;
 pub mod output;
 pub mod posture;
+mod psl;
 pub mod rdap;
 pub mod retry;
 pub mod ssl;
@@ -78,4 +80,7 @@ pub use subdomains::{
     SubdomainStatus,
 };
 pub use takeover::{scan_takeover, TakeoverFinding, TakeoverReport, TakeoverVerdict};
-pub use watchlist::{check_watchlist, WatchReport, WatchResult, Watchlist};
+pub use watchlist::{
+    check_watchlist, check_watchlist_with, check_watchlist_with_config, WatchReport, WatchResult,
+    Watchlist,
+};

@@ -22,7 +22,12 @@
 //! 3. For a candidate that resolves, issue one SSRF-guarded GET (see
 //!    [`crate::http`]) and match the body against that provider's claim-page
 //!    fingerprints. A match is [`TakeoverVerdict::Vulnerable`], carrying the
-//!    matched marker as evidence.
+//!    matched marker as evidence. HTTPS is tried first; if it fails (an
+//!    unclaimed custom domain is served under the *provider's* certificate,
+//!    and S3 website endpoints speak plain HTTP only), the same GET is
+//!    retried over `http://`. Evidence only counts when the answering URL is
+//!    still on the probed host — a body reached through a cross-host redirect
+//!    describes some other resource.
 //! 4. A candidate that does not resolve at all is [`TakeoverVerdict::Potential`]:
 //!    the classic dangling CNAME, unconfirmable over HTTP because nothing
 //!    answers.
@@ -46,7 +51,7 @@ use tracing::debug;
 use crate::dns::{DnsResolver, RecordData, RecordType};
 use crate::error::Result;
 use crate::http::GuardedFetcher;
-use crate::validation::normalize_domain;
+use crate::validation::{normalize_domain, normalize_host};
 
 /// Upper bound on hosts examined in one scan. Mirrors the cap in
 /// [`crate::subdomains::classify_subdomains`]: CT logs can return tens of
@@ -381,8 +386,9 @@ fn build_notes(vulnerable: usize, potential: usize, hosts_skipped: usize) -> Vec
     }
     if potential > 0 {
         notes.push(format!(
-            "{potential} host(s) have a dangling CNAME to a takeover-prone provider but did not \
-             resolve, so nothing could confirm them. Verify each manually before acting."
+            "{potential} host(s) have a CNAME to a takeover-prone provider that could not be \
+             confirmed either way (the name does not resolve, its lookup failed, or the HTTP \
+             probe failed — see each host's note). Verify each manually before acting."
         ));
     }
     if vulnerable == 0 && potential == 0 {
@@ -400,26 +406,41 @@ fn build_notes(vulnerable: usize, potential: usize, hosts_skipped: usize) -> Vec
 
 // --- Async scanning -----------------------------------------------------
 
+/// DNS facts about one host.
+struct HostResolution {
+    /// A and AAAA addresses (IPv6-only hosts are alive too).
+    addresses: Vec<String>,
+    cname: Option<String>,
+    /// Set when no address was found *and* an address lookup failed outright
+    /// (timeout, SERVFAIL) rather than answering NXDOMAIN/NODATA — "we could
+    /// not tell", which must never be reported as "does not resolve".
+    lookup_error: Option<String>,
+}
+
 /// Resolves the CNAME and addresses for `host`.
-async fn resolve_host(resolver: &DnsResolver, host: &str) -> (Vec<String>, Option<String>) {
-    let (a, cname) = tokio::join!(
+async fn resolve_host(resolver: &DnsResolver, host: &str) -> HostResolution {
+    let (a, aaaa, cname) = tokio::join!(
         Box::pin(resolver.resolve(host, RecordType::A, None)),
+        Box::pin(resolver.resolve(host, RecordType::AAAA, None)),
         Box::pin(resolver.resolve(host, RecordType::CNAME, None)),
     );
 
-    let addresses = a
-        .map(|records| {
-            records
-                .iter()
-                .filter_map(|r| match &r.data {
-                    RecordData::A { address } | RecordData::AAAA { address } => {
-                        Some(address.clone())
-                    }
-                    _ => None,
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    let mut addresses = Vec::new();
+    let mut lookup_error = None;
+    for result in [a, aaaa] {
+        match result {
+            Ok(records) => addresses.extend(records.iter().filter_map(|r| match &r.data {
+                RecordData::A { address } | RecordData::AAAA { address } => Some(address.clone()),
+                _ => None,
+            })),
+            // `resolve` maps NXDOMAIN/NODATA to an empty Ok, so an Err here is
+            // a genuine failure to get an answer.
+            Err(e) => lookup_error = Some(e.sanitized_message()),
+        }
+    }
+    if !addresses.is_empty() {
+        lookup_error = None;
+    }
 
     let cname = cname.ok().and_then(|records| {
         records.iter().find_map(|r| match &r.data {
@@ -428,7 +449,19 @@ async fn resolve_host(resolver: &DnsResolver, host: &str) -> (Vec<String>, Optio
         })
     });
 
-    (addresses, cname)
+    HostResolution {
+        addresses,
+        cname,
+        lookup_error,
+    }
+}
+
+/// Lowercased host of a URL string, without a trailing dot.
+fn url_host(url: &str) -> Option<String> {
+    reqwest::Url::parse(url)
+        .ok()?
+        .host_str()
+        .map(|h| h.trim_end_matches('.').to_ascii_lowercase())
 }
 
 /// Turns a completed probe into a finding.
@@ -444,6 +477,28 @@ fn finding_from_probe(
     addresses: Vec<String>,
     response: &crate::http::FetchedResponse,
 ) -> TakeoverFinding {
+    // The body only speaks for this host if this host served it. After a
+    // cross-host redirect (a live app bouncing visitors to some *other*,
+    // unclaimed resource on the same provider) a claim-page marker describes
+    // that other resource, so it is not evidence here.
+    let final_host = url_host(&response.final_url);
+    let same_host = final_host.as_deref() == Some(host.trim_end_matches('.'));
+    if !same_host {
+        return TakeoverFinding {
+            host,
+            verdict: TakeoverVerdict::Safe,
+            provider: Some(provider.provider.to_string()),
+            cname,
+            addresses,
+            evidence: None,
+            http_status: Some(response.status),
+            probe_note: Some(format!(
+                "redirected to {}; that response is not attributed to this host",
+                final_host.as_deref().unwrap_or("another host")
+            )),
+        };
+    }
+
     let evidence = match_body_marker(provider, &response.body);
     let verdict = if evidence.is_some() {
         TakeoverVerdict::Vulnerable
@@ -476,7 +531,11 @@ async fn check_host(
     fetcher: &GuardedFetcher,
     host: String,
 ) -> TakeoverFinding {
-    let (addresses, cname) = resolve_host(resolver, &host).await;
+    let HostResolution {
+        addresses,
+        cname,
+        lookup_error,
+    } = resolve_host(resolver, &host).await;
 
     // No CNAME, or a CNAME to something we don't recognize: nothing to claim.
     // These hosts are never fetched, which is what keeps the HTTP fan-out
@@ -496,8 +555,17 @@ async fn check_host(
     };
 
     // A provider CNAME that resolves to nothing is the classic dangling
-    // record. Nothing answers, so HTTP cannot confirm it either way.
+    // record. Nothing answers, so HTTP cannot confirm it either way. A lookup
+    // that *failed* is reported as such: it is equally unconfirmed, but it is
+    // not evidence that the name is dangling.
     if addresses.is_empty() {
+        let probe_note = match lookup_error {
+            Some(e) => format!(
+                "CNAME points at a takeover-prone provider, but its address lookup failed \
+                 ({e}); re-run to confirm"
+            ),
+            None => "CNAME points at a takeover-prone provider but does not resolve".to_string(),
+        };
         return TakeoverFinding {
             host,
             verdict: TakeoverVerdict::Potential,
@@ -506,17 +574,23 @@ async fn check_host(
             addresses,
             evidence: None,
             http_status: None,
-            probe_note: Some(
-                "CNAME points at a takeover-prone provider but does not resolve".to_string(),
-            ),
+            probe_note: Some(probe_note),
         };
     }
 
-    // The host resolves — ask the provider's edge what it serves.
-    match fetcher.get(&format!("https://{host}/")).await {
+    // The host resolves — ask the provider's edge what it serves. HTTPS
+    // first; an unclaimed custom domain is typically served under the
+    // provider's own certificate (so validating TLS fails) and S3 website
+    // endpoints have no HTTPS at all, so fall back to plain HTTP, where the
+    // claim page is readable. Body markers do not depend on TLS trust.
+    let https_err = match fetcher.get(&format!("https://{host}/")).await {
+        Ok(response) => return finding_from_probe(host, provider, cname, addresses, &response),
+        Err(e) => e,
+    };
+    match fetcher.get(&format!("http://{host}/")).await {
         Ok(response) => finding_from_probe(host, provider, cname, addresses, &response),
-        Err(e) => {
-            debug!(host = %host, error = %e, "takeover probe failed");
+        Err(http_err) => {
+            debug!(host = %host, https = %https_err, http = %http_err, "takeover probe failed");
             // A failed probe is not evidence of anything. Report the host with
             // the DNS-level signal it does carry and say why it is unconfirmed
             // — never silently upgrade a fetch failure into a finding.
@@ -528,7 +602,11 @@ async fn check_host(
                 addresses,
                 evidence: None,
                 http_status: None,
-                probe_note: Some(format!("HTTP probe failed: {e}")),
+                probe_note: Some(format!(
+                    "HTTP probe failed over HTTPS ({}) and HTTP ({})",
+                    https_err.sanitized_message(),
+                    http_err.sanitized_message()
+                )),
             }
         }
     }
@@ -601,6 +679,16 @@ pub async fn scan_takeover(
     concurrency: usize,
 ) -> Result<TakeoverReport> {
     let domain = normalize_domain(domain)?;
+    // Hosts are probed exactly as named — `www` is the most commonly
+    // CNAME'd host of all, so it must not collapse into the apex. Input that
+    // doesn't normalize is kept verbatim and simply won't resolve.
+    for host in &mut hosts {
+        if let Ok(normalized) = normalize_host(host) {
+            *host = normalized;
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    hosts.retain(|h| seen.insert(h.clone()));
     let hosts_skipped = apply_host_cap(&mut hosts);
     let concurrency = concurrency.max(1);
 
@@ -745,9 +833,9 @@ mod tests {
 
     /// Synthetic probe response, so the confirmation rule is testable without
     /// DNS or HTTP.
-    fn probe(status: u16, body: &str) -> crate::http::FetchedResponse {
+    fn probe(host: &str, status: u16, body: &str) -> crate::http::FetchedResponse {
         crate::http::FetchedResponse {
-            final_url: "https://gone.example.com/".to_string(),
+            final_url: format!("https://{host}/"),
             status,
             headers: vec![],
             body: body.to_string(),
@@ -763,7 +851,11 @@ mod tests {
             gh,
             Some("gone.github.io".to_string()),
             vec!["185.199.108.153".to_string()],
-            &probe(404, "<h1>There isn't a GitHub Pages site here.</h1>"),
+            &probe(
+                "gone.example.com",
+                404,
+                "<h1>There isn't a GitHub Pages site here.</h1>",
+            ),
         );
         assert_eq!(finding.verdict, TakeoverVerdict::Vulnerable);
         // The evidence is what makes the claim auditable.
@@ -784,7 +876,11 @@ mod tests {
             gh,
             Some("user.github.io".to_string()),
             vec!["185.199.108.153".to_string()],
-            &probe(200, "<html><body><h1>My Blog</h1></body></html>"),
+            &probe(
+                "blog.example.com",
+                200,
+                "<html><body><h1>My Blog</h1></body></html>",
+            ),
         );
         assert_eq!(finding.verdict, TakeoverVerdict::Safe);
         assert!(finding.evidence.is_none());
@@ -800,9 +896,44 @@ mod tests {
             gh,
             Some("user.github.io".to_string()),
             vec!["185.199.108.153".to_string()],
-            &probe(404, "<h1>Page not found</h1>"),
+            &probe("blog.example.com", 404, "<h1>Page not found</h1>"),
         );
         assert_eq!(finding.verdict, TakeoverVerdict::Safe);
+    }
+
+    #[test]
+    fn marker_after_a_cross_host_redirect_is_not_evidence() {
+        // A live, claimed app that redirects to a *different* unclaimed app on
+        // the same provider must not make the probed host look claimable.
+        let heroku = match_provider("app.herokuapp.com").expect("heroku provider");
+        let mut response = probe("retired-app.herokuapp.com", 404, "No such app");
+        response.redirects = 1;
+        let finding = finding_from_probe(
+            "app.example.com".to_string(),
+            heroku,
+            Some("app.herokuapp.com".to_string()),
+            vec!["203.0.113.7".to_string()],
+            &response,
+        );
+        assert_eq!(finding.verdict, TakeoverVerdict::Safe);
+        assert!(finding.evidence.is_none());
+        assert!(finding
+            .probe_note
+            .as_deref()
+            .unwrap_or_default()
+            .contains("retired-app.herokuapp.com"));
+
+        // Same host over plain HTTP (the fallback path) still confirms.
+        let mut plain = probe("app.example.com", 404, "No such app");
+        plain.final_url = "http://App.Example.com./".to_string();
+        let finding = finding_from_probe(
+            "app.example.com".to_string(),
+            heroku,
+            Some("app.herokuapp.com".to_string()),
+            vec!["203.0.113.7".to_string()],
+            &plain,
+        );
+        assert_eq!(finding.verdict, TakeoverVerdict::Vulnerable);
     }
 
     #[test]
@@ -815,7 +946,7 @@ mod tests {
             cf,
             Some("d123.cloudfront.net".to_string()),
             vec!["203.0.113.9".to_string()],
-            &probe(403, "Bad request"),
+            &probe("cdn.example.com", 403, "Bad request"),
         );
         assert_eq!(finding.verdict, TakeoverVerdict::Safe);
         assert!(
@@ -897,5 +1028,8 @@ mod tests {
         assert!(notes
             .iter()
             .any(|n| n.contains("3 host(s)") && n.contains("manually")));
+        // Potential covers failed lookups and probes too, so the note must
+        // not claim every such host "did not resolve".
+        assert!(!notes.iter().any(|n| n.contains("did not resolve")));
     }
 }

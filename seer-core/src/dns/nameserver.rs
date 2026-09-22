@@ -11,7 +11,9 @@
 //! - **DoT** (DNS over TLS, port 853): `tls://1.1.1.1`,
 //!   `tls://dns.quad9.net:853`
 //! - **DoH** (DNS over HTTPS, port 443, path `/dns-query`):
-//!   `https://cloudflare-dns.com/dns-query`, `https://dns.google:443`
+//!   `https://cloudflare-dns.com/dns-query`, `https://dns.google:443`,
+//!   `https://1.1.1.1/dns-query` (hostname or IPv4 literal — an IPv6-literal
+//!   host is rejected, see [`NameserverSpec::parse`])
 //!
 //! Bare IPs/hostnames keep their historical UDP behavior byte-for-byte; the
 //! `host:port` and bracketed-IPv6 forms are additive. Unbracketed IPv6
@@ -70,7 +72,11 @@ impl NameserverSpec {
     /// # Errors
     /// Returns [`SeerError::InvalidInput`] for empty input, embedded
     /// whitespace, unknown schemes, malformed brackets, bad ports, a path on
-    /// a `tls://` spec, or credentials in an `https://` spec.
+    /// a `tls://` spec, credentials in an `https://` spec, or an `https://`
+    /// spec whose host is an IPv6 literal (hickory derives both the TLS
+    /// server name and the HTTP `:authority` from the one unbracketed host
+    /// string, and an unbracketed IPv6 address is not a valid authority, so
+    /// such a spec could never complete a query).
     pub fn parse(input: &str) -> Result<Self> {
         let spec = input.trim();
         if spec.is_empty() {
@@ -133,6 +139,18 @@ impl NameserverSpec {
             )));
         }
         let (host, port) = parse_host_port(authority, HTTPS_PORT)?;
+        // hickory builds the DoH request's HTTP authority from the same
+        // (unbracketed) string it uses as the TLS server name, and
+        // `2606:4700:4700::1111` is not a valid authority — every query
+        // would fail with "invalid authority". Reject it here with an
+        // actionable message instead of accepting a spec that cannot work.
+        if host.parse::<Ipv6Addr>().is_ok() {
+            return Err(SeerError::InvalidInput(format!(
+                "DNS over HTTPS to an IPv6 literal ([{host}]) is not supported — use the \
+                 resolver's hostname (e.g. https://cloudflare-dns.com/dns-query), an IPv4 \
+                 literal, or tls://[{host}] for DNS over TLS"
+            )));
+        }
         Ok(Self {
             protocol: NameserverProtocol::Https,
             host,
@@ -413,11 +431,23 @@ mod tests {
     }
 
     #[test]
-    fn https_bracketed_ipv6_with_port_and_path() {
-        let spec = parse("https://[2606:4700:4700::1111]:443/dns-query");
+    fn https_rejects_ipv6_literal_host() {
+        // Regression: this parsed, but hickory derives the DoH `:authority`
+        // from the unbracketed host, which is invalid for IPv6 — every query
+        // failed with "invalid authority". Reject up front, pointing at the
+        // forms that do work.
+        for spec in [
+            "https://[2606:4700:4700::1111]:443/dns-query",
+            "https://[2606:4700:4700::1111]",
+        ] {
+            let msg = parse_err(spec);
+            assert!(msg.contains("IPv6 literal"), "got: {msg}");
+            assert!(msg.contains("tls://"), "got: {msg}");
+        }
+        // DoT to a bracketed IPv6 literal is unaffected.
+        let spec = parse("tls://[2606:4700:4700::1111]");
         assert_eq!(spec.host, "2606:4700:4700::1111");
-        assert_eq!(spec.port, 443);
-        assert_eq!(spec.path.as_deref(), Some("/dns-query"));
+        assert_eq!(spec.protocol, NameserverProtocol::Tls);
     }
 
     #[test]

@@ -235,6 +235,22 @@ impl WhoisClient {
                                 );
                                 return Ok(current_response);
                             }
+                            // Only let the referral replace the registry
+                            // record when it actually carries registration
+                            // data. A registry record that merely lacks
+                            // nameservers (an undelegated domain) still has
+                            // its registrar/dates/status, and a registrar's
+                            // throttle or refusal body ("connection limit
+                            // exceeded") must not swap that for all-None.
+                            if !has_registration_data(&referral_response)
+                                && has_registry_data(&current_response)
+                            {
+                                debug!(
+                                    referral = %referral,
+                                    "Referral response carries no registration data, using registry response"
+                                );
+                                return Ok(current_response);
+                            }
                             return Ok(referral_response);
                         }
                         Err(e) => {
@@ -341,6 +357,21 @@ impl WhoisClient {
             tld
         )))
     }
+}
+
+/// True when a (registrar) response carries registration data worth
+/// preferring over the registry's record: a registrar or a registration date.
+fn has_registration_data(response: &WhoisResponse) -> bool {
+    response.registrar.is_some()
+        || response.creation_date.is_some()
+        || response.expiration_date.is_some()
+}
+
+/// True when a registry response carries any registration field at all.
+fn has_registry_data(response: &WhoisResponse) -> bool {
+    has_registration_data(response)
+        || !response.nameservers.is_empty()
+        || !response.status.is_empty()
 }
 
 /// Formats the wire query for registries whose port-43 servers need more
@@ -474,14 +505,45 @@ async fn query_server_internal_with(
     // Explicitly shutdown the TCP stream to ensure proper FIN handshake
     let _ = stream.shutdown().await;
 
-    // Try UTF-8, fall back to Latin-1
-    // Preserve valid UTF-8 (CJK ccTLD registries — JPRS, KISA, CONAC, TWNIC,
-    // NIC.br — emit UTF-8) and replace only the invalid bytes, rather than
-    // reinterpreting the WHOLE body as Latin-1, which would mojibake every
-    // multi-byte character after a single stray byte and silently drop CJK
-    // nameservers/dates from the parsed result.
-    Ok(String::from_utf8(response)
-        .unwrap_or_else(|e| String::from_utf8_lossy(&e.into_bytes()).into_owned()))
+    Ok(decode_whois_body(response))
+}
+
+/// Decodes a raw port-43 body: UTF-8 where the bytes are valid UTF-8, and
+/// every byte that is NOT part of a valid UTF-8 sequence as windows-1252
+/// (Latin-1 plus printable 0x80–0x9F).
+///
+/// Decoding per invalid byte rather than reinterpreting the WHOLE body keeps
+/// valid UTF-8 intact (CJK ccTLD registries — JPRS, KISA, CONAC, TWNIC,
+/// NIC.br — emit UTF-8, and one stray byte must not mojibake every character
+/// after it), while legacy ISO-8859-1 / windows-1252 bodies (`M\xfcller`)
+/// keep their accents instead of collapsing to U+FFFD as a lossy UTF-8
+/// decode would. The 0x80–0x9F range maps to windows-1252's printable
+/// characters — never to C1 control characters, which a terminal could act
+/// on — and its five undefined bytes to U+FFFD.
+fn decode_whois_body(bytes: Vec<u8>) -> String {
+    /// windows-1252 characters for bytes 0x80–0x9F (U+FFFD where undefined).
+    const CP1252_80_9F: [char; 32] = [
+        '\u{20AC}', '\u{FFFD}', '\u{201A}', '\u{0192}', '\u{201E}', '\u{2026}', '\u{2020}',
+        '\u{2021}', '\u{02C6}', '\u{2030}', '\u{0160}', '\u{2039}', '\u{0152}', '\u{FFFD}',
+        '\u{017D}', '\u{FFFD}', '\u{FFFD}', '\u{2018}', '\u{2019}', '\u{201C}', '\u{201D}',
+        '\u{2022}', '\u{2013}', '\u{2014}', '\u{02DC}', '\u{2122}', '\u{0161}', '\u{203A}',
+        '\u{0153}', '\u{FFFD}', '\u{017E}', '\u{0178}',
+    ];
+    match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(e) => {
+            let bytes = e.into_bytes();
+            let mut text = String::with_capacity(bytes.len() + bytes.len() / 2);
+            for chunk in bytes.utf8_chunks() {
+                text.push_str(chunk.valid());
+                text.extend(chunk.invalid().iter().map(|&b| match b {
+                    0x80..=0x9F => CP1252_80_9F[usize::from(b - 0x80)],
+                    _ => char::from(b),
+                }));
+            }
+            text
+        }
+    }
 }
 
 /// Extracts the WHOIS server from an IANA response.
@@ -611,6 +673,34 @@ mod tests {
             None,
             "empty referral key line must not swallow the next line"
         );
+    }
+
+    #[test]
+    fn decode_whois_body_keeps_utf8_and_decodes_legacy_bytes_as_cp1252() {
+        // Valid UTF-8 is untouched.
+        assert_eq!(
+            decode_whois_body("Registrant: 東京ドメイン\n".as_bytes().to_vec()),
+            "Registrant: 東京ドメイン\n"
+        );
+        // An ISO-8859-1 body keeps its accents (a lossy UTF-8 decode turned
+        // each into U+FFFD).
+        assert_eq!(
+            decode_whois_body(b"Registrant: M\xfcller Stra\xdfe, K\xf8benhavn\n".to_vec()),
+            "Registrant: Müller Straße, København\n"
+        );
+        // A stray byte inside a UTF-8 body only affects that byte.
+        let mut mixed = "Name Server: ns1.例え.jp ".as_bytes().to_vec();
+        mixed.push(0xE9);
+        mixed.extend_from_slice(" 東京\n".as_bytes());
+        assert_eq!(
+            decode_whois_body(mixed),
+            "Name Server: ns1.例え.jp é 東京\n"
+        );
+        // 0x80–0x9F decode as windows-1252 printables, never C1 controls;
+        // its undefined bytes become U+FFFD.
+        let decoded = decode_whois_body(b"\x93quoted\x94 \x80 \x81".to_vec());
+        assert_eq!(decoded, "\u{201C}quoted\u{201D} \u{20AC} \u{FFFD}");
+        assert!(!decoded.chars().any(|c| ('\u{80}'..='\u{9F}').contains(&c)));
     }
 
     #[test]
@@ -840,6 +930,42 @@ mod tests {
             .unwrap();
         assert_eq!(resp.registrar.as_deref(), Some("Mock Registrar Two"));
         assert_eq!(resp.whois_server, "localhost");
+    }
+
+    /// An undelegated domain's registry record (registrar, dates, status,
+    /// but no nameservers) fails `has_core_data`, so the referral is
+    /// followed. When the registrar answers with a throttle / refusal body
+    /// instead of a record, the registry's data must be kept rather than
+    /// replaced by an all-empty response.
+    #[tokio::test]
+    async fn mock_refusing_referral_does_not_replace_registry_data() {
+        let port = spawn_mock_whois(vec![
+            "Domain Name: EXAMPLE.COM\n\
+             Registrar WHOIS Server: localhost\n\
+             Registrar: Registry-Listed Registrar, Inc.\n\
+             Creation Date: 2020-01-01T00:00:00Z\n\
+             Registry Expiry Date: 2030-01-01T00:00:00Z\n\
+             Domain Status: serverHold https://icann.org/epp#serverHold\n",
+            "Your connection limit exceeded. Please slow down and try again later.\n",
+        ])
+        .await;
+        let client = mock_client(port);
+        let mut visited = HashSet::new();
+        let resp = client
+            .lookup_with_referrals("example.com", "127.0.0.1", 0, &mut visited)
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.registrar.as_deref(),
+            Some("Registry-Listed Registrar, Inc.")
+        );
+        assert!(resp.creation_date.is_some() && resp.expiration_date.is_some());
+        assert_eq!(resp.status, vec!["serverHold"]);
+        assert_eq!(resp.whois_server, "127.0.0.1", "registry response kept");
+        assert!(
+            visited.contains("localhost"),
+            "the referral was still consulted"
+        );
     }
 
     #[tokio::test]

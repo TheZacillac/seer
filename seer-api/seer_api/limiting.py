@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import ipaddress
 import logging
 import os
@@ -13,7 +14,7 @@ from slowapi.util import get_remote_address
 log = logging.getLogger("seer_api")
 
 
-def _trusted_proxies() -> set[str]:
+def _trusted_proxies() -> frozenset[str]:
     """Parse ``SEER_TRUSTED_PROXY_IPS`` into a set of trusted peer IPs.
 
     Only literal IPv4/IPv6 addresses are accepted — CIDR-style entries
@@ -21,11 +22,19 @@ def _trusted_proxies() -> set[str]:
     bare IP) and would fail open. Reject them at parse time with a log
     warning rather than silently disabling proxy trust.
 
-    Evaluated on every request (not cached at import time) so that tests
-    can set the env var via monkeypatch without reloading the module.
+    The env var is read on every request (not cached at import time) so that
+    tests can set it via monkeypatch without reloading the module, but the
+    parse is memoized per raw value: re-parsing per request logged the CIDR
+    warning once per request, flooding a misconfigured deployment's log. A
+    changed value is parsed (and warned about) once.
     """
+    return _parse_trusted_proxies(os.environ.get("SEER_TRUSTED_PROXY_IPS", ""))
+
+
+@functools.lru_cache(maxsize=8)
+def _parse_trusted_proxies(raw_value: str) -> frozenset[str]:
     out: set[str] = set()
-    for raw in os.environ.get("SEER_TRUSTED_PROXY_IPS", "").split(","):
+    for raw in raw_value.split(","):
         entry = raw.strip()
         if not entry:
             continue
@@ -39,7 +48,7 @@ def _trusted_proxies() -> set[str]:
             )
             continue
         out.add(entry)
-    return out
+    return frozenset(out)
 
 
 def _proxy_trust_enabled() -> bool:
@@ -66,7 +75,14 @@ def get_client_ip(request: Request) -> str:
     if _proxy_trust_enabled():
         trusted = _trusted_proxies()
         if peer and peer in trusted:
-            forwarded = request.headers.get("x-forwarded-for", "")
+            # Join EVERY X-Forwarded-For header line, in order. A proxy may
+            # add its hop as a separate header line instead of extending the
+            # existing one (HAProxy `option forwardfor` does), and
+            # `headers.get()` returns only the FIRST line — the one the
+            # client sent — which would let the spoofable value win the
+            # right-to-left walk below. Multiple lines are equivalent to one
+            # comma-joined line (RFC 9110 §5.3).
+            forwarded = ",".join(request.headers.getlist("x-forwarded-for"))
             if forwarded:
                 # Standard reverse proxies (e.g. nginx
                 # `$proxy_add_x_forwarded_for`) APPEND the real client IP to
@@ -92,9 +108,21 @@ def get_client_ip(request: Request) -> str:
 # store; for multi-worker deployments set SEER_RATE_LIMIT_STORAGE to a Redis URL:
 #   export SEER_RATE_LIMIT_STORAGE="redis://localhost:6379"
 _storage_uri = os.environ.get("SEER_RATE_LIMIT_STORAGE", "memory://")
+# SEER_RATE_LIMIT governs the raw POST /mcp route (enforced by main.py's
+# `_mcp_rate_ok`); it does NOT change any REST limit. Every REST route declares
+# its own `@limiter.limit(...)`, which overrides slowapi's `default_limits`,
+# and no SlowAPIMiddleware is installed to apply defaults to undecorated
+# routes. It is still passed here so that a future undecorated route served
+# through a SlowAPIMiddleware would inherit it rather than go unlimited.
 _default_rate_limit = os.environ.get("SEER_RATE_LIMIT", "30/minute")
 limiter = Limiter(
     key_func=get_client_ip,
     default_limits=[_default_rate_limit],
     storage_uri=_storage_uri,
+    # Bucket per (client, route), not slowapi's default per (client, concrete
+    # URL). With key_style="url" every distinct path parameter got a fresh
+    # budget — `/takeover/a1.com`, `/takeover/a2.com`, … (or case / trailing-
+    # dot spellings of one domain) each passed a "5/minute" limit — so the
+    # limit bounded nothing on any path-parameter route.
+    key_style="endpoint",
 )

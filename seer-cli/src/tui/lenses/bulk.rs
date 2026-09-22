@@ -6,6 +6,7 @@ use ratatui::widgets::{Paragraph, Row, Table};
 use ratatui::Frame;
 
 use crate::tui::app::SPIN;
+use crate::tui::line_editor::LineEditor;
 use crate::tui::panes::bulk::{BulkState, OPS};
 use crate::tui::theme::Theme;
 use crate::tui::widgets::{dot, gauge, panel, scroll_to};
@@ -15,7 +16,7 @@ pub fn render(
     area: Rect,
     theme: &Theme,
     bulk: &BulkState,
-    editing: Option<&str>,
+    editing: Option<&LineEditor>,
     spin: usize,
 ) {
     let rows = Layout::default()
@@ -53,7 +54,7 @@ pub fn render(
     let domains_line = if let Some(buf) = editing {
         Line::from(vec![
             Span::styled("domains: ", Style::default().fg(theme.overlay0)),
-            Span::styled(format!("{buf}▏"), Style::default().fg(theme.text)),
+            Span::styled(buf.with_caret("▏"), Style::default().fg(theme.text)),
         ])
     } else {
         let parsed = crate::tui::panes::bulk::parse_domains_input(&bulk.domains);
@@ -153,7 +154,8 @@ pub fn render(
         (rows[1], None)
     };
 
-    let results_title = format!("Results  ·  seer bulk {}", bulk.op());
+    // The op the rows were produced with — `o` only selects the NEXT run's op.
+    let results_title = format!("Results  ·  seer bulk {}", bulk.results_op());
     let results_block = panel::block(theme, &results_title, theme.mauve, false);
     let results_inner = results_block.inner(table_area);
     f.render_widget(results_block, table_area);
@@ -438,6 +440,39 @@ mod tests {
         let text = buf_text(&terminal);
         assert!(text.contains("1 ok"), "summary should report ok count");
         assert!(text.contains("1 failed"), "summary should report failures");
+    }
+
+    #[test]
+    fn results_title_names_the_runs_op_after_o_changes_selection() {
+        let theme = Theme::frappe();
+        let mut bulk = BulkState {
+            run_op_idx: Some(0), // rows came from `lookup`
+            op_idx: 1,           // `o` since selected `status`
+            ..Default::default()
+        };
+        bulk.rows.push(make_result("a.com", true));
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| render(f, f.area(), &theme, &bulk, None, 0))
+            .unwrap();
+        let text = buf_text(&terminal);
+        assert!(text.contains("seer bulk lookup"), "got: {text}");
+        assert!(!text.contains("seer bulk status"), "got: {text}");
+    }
+
+    #[test]
+    fn domains_caret_renders_at_the_cursor() {
+        let theme = Theme::frappe();
+        let bulk = BulkState::default();
+        let mut editor = LineEditor::from("a.com");
+        editor.home();
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| render(f, f.area(), &theme, &bulk, Some(&editor), 0))
+            .unwrap();
+        assert!(buf_text(&terminal).contains("domains: ▏a.com"));
     }
 
     #[test]

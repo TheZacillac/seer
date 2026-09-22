@@ -9,11 +9,14 @@ use crate::tui::action::LensData;
 use crate::tui::theme::Theme;
 use crate::tui::widgets::{panel, scroll_to};
 
+/// `filter` is the active in-lens `/`-filter; rows are filtered by reference
+/// (see `filter::history_rows`) so no entry is cloned per frame.
 pub fn render(
     f: &mut Frame,
     area: Rect,
     theme: &Theme,
     data: &LensData,
+    filter: &str,
     focused: bool,
     sel: usize,
 ) {
@@ -33,25 +36,27 @@ pub fn render(
     let header = Row::new(["WHEN", "DOMAIN", "SOURCE", "REGISTRAR"])
         .style(Style::default().fg(theme.overlay0));
 
-    let rows = entries.iter().enumerate().map(|(i, e)| {
-        let when = e.timestamp.format("%Y-%m-%d %H:%M").to_string();
-        let source = if e.result.is_rdap() {
-            "RDAP"
-        } else if e.result.is_whois() {
-            "WHOIS"
-        } else {
-            "—"
-        };
-        let registrar = e.result.registrar().unwrap_or_else(|| "—".to_string());
+    let rows = crate::tui::filter::history_rows(entries, filter)
+        .enumerate()
+        .map(|(i, e)| {
+            let when = e.timestamp.format("%Y-%m-%d %H:%M").to_string();
+            let source = if e.result.is_rdap() {
+                "RDAP"
+            } else if e.result.is_whois() {
+                "WHOIS"
+            } else {
+                "—"
+            };
+            let registrar = e.result.registrar().unwrap_or_else(|| "—".to_string());
 
-        let style = if focused && i == sel {
-            Style::default().fg(theme.text).bg(theme.surface0)
-        } else {
-            Style::default().fg(theme.text)
-        };
+            let style = if focused && i == sel {
+                Style::default().fg(theme.text).bg(theme.surface0)
+            } else {
+                Style::default().fg(theme.text)
+            };
 
-        Row::new(vec![when, e.domain.clone(), source.to_string(), registrar]).style(style)
-    });
+            Row::new(vec![when, e.domain.clone(), source.to_string(), registrar]).style(style)
+        });
 
     let table = Table::new(
         rows,
@@ -101,7 +106,7 @@ mod tests {
         let backend = TestBackend::new(80, 12);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|f| render(f, f.area(), &theme, &data, false, 0))
+            .draw(|f| render(f, f.area(), &theme, &data, "", false, 0))
             .unwrap();
         // Should not panic, and the empty state still renders the panel
         // title and the hint line.

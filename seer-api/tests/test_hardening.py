@@ -111,6 +111,59 @@ def test_preflight_options_bypasses_auth(monkeypatch):
     importlib.reload(main)
 
 
+def test_non_ascii_bearer_token_is_401_not_500(monkeypatch):
+    """`hmac.compare_digest(str, str)` raises TypeError on non-ASCII input, so
+    an unauthenticated `Authorization: Bearer été` used to crash into a 500."""
+    monkeypatch.setenv("SEER_API_KEY", "s3cret")
+    import seer_api.main as main
+
+    importlib.reload(main)
+    c = TestClient(main.app)
+    # httpx only sends str header values as ASCII; send raw bytes the way a
+    # hostile client can (latin-1 and UTF-8 spellings).
+    for raw in ("Bearer été".encode("latin-1"), "Bearer été".encode()):
+        resp = c.get("/", headers={"Authorization": raw})
+        assert resp.status_code == 401, (raw, resp.status_code)
+
+    monkeypatch.delenv("SEER_API_KEY")
+    importlib.reload(main)
+
+
+def test_non_ascii_api_key_is_usable(monkeypatch):
+    """A non-ASCII SEER_API_KEY must not break every request: the token a
+    client sends (UTF-8 on the wire) authenticates, anything else is 401."""
+    monkeypatch.setenv("SEER_API_KEY", "clé")
+    import seer_api.main as main
+
+    importlib.reload(main)
+    c = TestClient(main.app)
+    assert c.get("/").status_code == 401
+    assert c.get("/", headers={"Authorization": b"Bearer cl"}).status_code == 401
+    ok = c.get("/", headers={"Authorization": "Bearer clé".encode()})  # UTF-8 on the wire
+    assert ok.status_code == 200
+
+    monkeypatch.delenv("SEER_API_KEY")
+    importlib.reload(main)
+
+
+def test_auth_exemption_honors_root_path(monkeypatch):
+    """Under `--root-path /api` the request path carries the prefix while the
+    router strips it; the /health exemption must still match."""
+    monkeypatch.setenv("SEER_API_KEY", "s3cret")
+    import seer_api.main as main
+
+    importlib.reload(main)
+    c = TestClient(main.app, root_path="/api")
+    assert c.get("/api/health").status_code == 200
+    # Everything else is still authenticated under the prefix.
+    assert c.get("/api/").status_code == 401
+    ok = c.get("/api/", headers={"Authorization": "Bearer s3cret"})
+    assert ok.status_code == 200
+
+    monkeypatch.delenv("SEER_API_KEY")
+    importlib.reload(main)
+
+
 # ---------------------------------------------------------------------------
 # M6: path param length caps
 # ---------------------------------------------------------------------------
@@ -278,6 +331,200 @@ def test_ssrf_guard_rejects_reserved(client, path):
     assert resp.status_code == 400, (path, resp.status_code, resp.text)
     detail = resp.json().get("detail", "").lower()
     assert "reserved" in detail or "invalid" in detail, (path, detail)
+
+
+# Nameserver *specs* the core accepts (seer-core dns/nameserver.rs) and the
+# (host, port) each one connects to — the address the SSRF guard must check.
+NAMESERVER_SPECS = [
+    ("8.8.8.8", ("8.8.8.8", 53)),
+    ("dns.google", ("dns.google", 53)),
+    ("9.9.9.9:5353", ("9.9.9.9", 5353)),
+    ("2606:4700:4700::1111", ("2606:4700:4700::1111", 53)),
+    ("[2606:4700:4700::1111]", ("2606:4700:4700::1111", 53)),
+    ("[2606:4700:4700::1111]:5353", ("2606:4700:4700::1111", 5353)),
+    ("tls://1.1.1.1", ("1.1.1.1", 853)),
+    ("TLS://dns.quad9.net:8853", ("dns.quad9.net", 8853)),
+    ("https://cloudflare-dns.com/dns-query", ("cloudflare-dns.com", 443)),
+    ("https://dns.google:8443", ("dns.google", 8443)),
+    ("https://[2606:4700:4700::1111]/dns-query", ("2606:4700:4700::1111", 443)),
+]
+
+
+@pytest.mark.parametrize("spec,target", NAMESERVER_SPECS)
+def test_nameserver_target_parses_core_spec_forms(spec, target):
+    from seer_api.ssrf import nameserver_target
+
+    assert nameserver_target(spec) == target
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [
+        "",
+        "   ",
+        "8.8.8.8 extra",
+        "ftp://1.1.1.1",
+        "tls://1.1.1.1/dns-query",
+        "https://user:pw@dns.google/dns-query",
+        "[::1",
+        "[not-v6]",
+        "[::1]53",
+        "dns.google:0",
+        "dns.google:99999",
+        "dns.google:+53",
+        "a:b:c",
+        ":53",
+    ],
+)
+def test_nameserver_target_returns_none_for_malformed_specs(spec):
+    """Malformed specs are left for the core to reject (Invalid input -> 400)."""
+    from seer_api.ssrf import nameserver_target
+
+    assert nameserver_target(spec) is None
+
+
+def _record_validator(monkeypatch):
+    """Replace the SSRF validator with one that records (host, port) and
+    accepts — keeps hostname specs hermetic (no DNS resolution)."""
+    import seer as seer_mod
+
+    checked: list[tuple[str, int]] = []
+    monkeypatch.setattr(
+        seer_mod,
+        "validate_public_host",
+        lambda host, port: checked.append((host, port)),
+        raising=False,
+    )
+    return checked
+
+
+@pytest.mark.parametrize("spec,target", NAMESERVER_SPECS)
+def test_dns_route_accepts_every_nameserver_spec_form(monkeypatch, client, spec, target):
+    """Regression: the API guard treated the whole spec as a hostname, so
+    `tls://`, `https://`, `host:port` and bracketed-IPv6 nameservers — all
+    supported by the core — were refused with 400 before reaching it."""
+    import seer as seer_mod
+
+    checked = _record_validator(monkeypatch)
+    seen: dict = {}
+
+    def _dig(domain, record_type, nameserver):
+        seen["nameserver"] = nameserver
+        return []
+
+    monkeypatch.setattr(seer_mod, "dig", _dig, raising=False)
+    resp = client.get("/dns/example.com/A", params={"nameserver": spec})
+    assert resp.status_code == 200, (spec, resp.text)
+    assert checked == [target]
+    # The core still receives the original spec (it parses it itself).
+    assert seen["nameserver"] == spec
+
+
+def test_dns_compare_accepts_nameserver_spec_forms(monkeypatch, client):
+    import seer as seer_mod
+
+    checked = _record_validator(monkeypatch)
+    seen: dict = {}
+
+    def _compare(domain, record_type, server_a, server_b):
+        seen["servers"] = (server_a, server_b)
+        return {"ok": True}
+
+    monkeypatch.setattr(seer_mod, "dns_compare", _compare, raising=False)
+    resp = client.get(
+        "/dns/compare/example.com",
+        params={"server_a": "tls://1.1.1.1", "server_b": "https://dns.google/dns-query"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert checked == [("1.1.1.1", 853), ("dns.google", 443)]
+    assert seen["servers"] == ("tls://1.1.1.1", "https://dns.google/dns-query")
+
+
+RESERVED_NAMESERVER_SPECS = [
+    "tls://127.0.0.1",
+    "127.0.0.1:5353",
+    "[::1]",
+    "[::1]:53",
+    "https://169.254.169.254/dns-query",
+    "https://10.0.0.1:8443/dns-query",
+]
+
+
+@pytest.mark.parametrize("spec", RESERVED_NAMESERVER_SPECS)
+def test_dns_route_refuses_reserved_nameserver_in_any_spec_form(monkeypatch, client, spec):
+    """Parsing the spec must not open a hole: a reserved address behind any
+    transport prefix / port / brackets is still a sanitized 400."""
+    import seer as seer_mod
+
+    def _never(*_a, **_kw):
+        raise AssertionError("seer.dig reached with a reserved nameserver")
+
+    monkeypatch.setattr(seer_mod, "dig", _never, raising=False)
+    resp = client.get("/dns/example.com/A", params={"nameserver": spec})
+    assert resp.status_code == 400, (spec, resp.status_code, resp.text)
+    assert "reserved" in resp.json()["detail"].lower()
+
+    monkeypatch.setattr(seer_mod, "dns_compare", _never, raising=False)
+    resp = client.get(
+        "/dns/compare/example.com", params={"server_a": "1.1.1.1", "server_b": spec}
+    )
+    assert resp.status_code == 400, (spec, resp.status_code, resp.text)
+    assert "reserved" in resp.json()["detail"].lower()
+
+
+def test_malformed_nameserver_spec_rejected_by_core_with_400(client):
+    """A spec the API layer can't parse is passed through; the core's own
+    parser rejects it as Invalid input -> 400 (needs the real binding)."""
+    pytest.importorskip("seer._seer")
+    resp = client.get("/dns/example.com/A", params={"nameserver": "ftp://1.1.1.1"})
+    assert resp.status_code == 400, resp.text
+    assert "invalid input" in resp.json()["detail"].lower()
+
+
+def test_mcp_nameserver_spec_forms(monkeypatch):
+    """seer_dig / seer_dns_compare share the spec-aware guard."""
+    import asyncio
+
+    import seer as seer_mod
+    from seer_api.mcp.server import execute_tool
+
+    checked = _record_validator(monkeypatch)
+    monkeypatch.setattr(seer_mod, "dig", lambda *a: {"ok": True}, raising=False)
+    monkeypatch.setattr(seer_mod, "dns_compare", lambda *a: {"ok": True}, raising=False)
+
+    asyncio.run(
+        execute_tool("seer_dig", {"domain": "example.com", "nameserver": "tls://1.1.1.1"})
+    )
+    asyncio.run(
+        execute_tool(
+            "seer_dns_compare",
+            {
+                "domain": "example.com",
+                "server_a": "9.9.9.9:5353",
+                "server_b": "https://cloudflare-dns.com/dns-query",
+            },
+        )
+    )
+    assert checked == [("1.1.1.1", 853), ("9.9.9.9", 5353), ("cloudflare-dns.com", 443)]
+
+
+@pytest.mark.parametrize("spec", RESERVED_NAMESERVER_SPECS)
+def test_mcp_refuses_reserved_nameserver_in_any_spec_form(spec):
+    import asyncio
+
+    from seer_api.mcp.server import execute_tool
+
+    with pytest.raises(ValueError, match="reserved"):
+        asyncio.run(
+            execute_tool("seer_dig", {"domain": "example.com", "nameserver": spec})
+        )
+    with pytest.raises(ValueError, match="reserved"):
+        asyncio.run(
+            execute_tool(
+                "seer_dns_compare",
+                {"domain": "example.com", "server_a": spec, "server_b": "1.1.1.1"},
+            )
+        )
 
 
 @pytest.mark.parametrize(
@@ -631,6 +878,32 @@ def test_other_loopback_forms_start_without_auth(monkeypatch, host):
     importlib.reload(main)
 
 
+@pytest.mark.parametrize("buggy_stdlib", [False, True])
+def test_ipv4_mapped_loopback_bind_does_not_depend_on_python_version(monkeypatch, buggy_stdlib):
+    """`IPv6Address("::ffff:127.0.0.1").is_loopback` is False on CPython
+    3.12.0-3.12.3 (later releases consult the mapped IPv4 address), so the
+    bind check must unwrap `ipv4_mapped` itself. `buggy_stdlib` simulates the
+    old stdlib behavior on whatever Python runs the suite."""
+    import ipaddress
+
+    from seer_api.main import _is_loopback_bind
+
+    if buggy_stdlib:
+        monkeypatch.setattr(
+            ipaddress.IPv6Address,
+            "is_loopback",
+            property(lambda self: self._ip == 1),
+        )
+        assert not ipaddress.IPv6Address("::ffff:127.0.0.1").is_loopback
+
+    assert _is_loopback_bind("::ffff:127.0.0.1")
+    assert _is_loopback_bind("[::ffff:127.0.0.2]")
+    assert _is_loopback_bind("::1")
+    # Mapped non-loopback addresses stay non-loopback (fail closed).
+    assert not _is_loopback_bind("::ffff:10.0.0.1")
+    assert not _is_loopback_bind("::ffff:0.0.0.0")
+
+
 @pytest.mark.parametrize("host", ["0.0.0.0", "::", "example.com", "10.0.0.5", "not-an-ip!"])
 def test_non_loopback_binds_still_refused_without_auth(monkeypatch, host):
     """The widened check must not become permissive.
@@ -690,8 +963,19 @@ def test_root_index_lists_every_registered_route(client):
 
     assert len(index) > 30, f"index looks truncated: {sorted(index.values())}"
     # Every route must get its OWN key: a derived name that collides would
-    # silently displace another entry instead of failing.
-    assert len(index) == len(set(index.values())), "derived endpoint names collided"
+    # silently displace another entry instead of failing. Compare against the
+    # distinct route paths recomputed here — `len(index) ==
+    # len(set(index.values()))` could never fail, because a collision drops
+    # the displaced path from the keys AND the values alike.
+    app = client.app
+    route_paths = set(app.openapi().get("paths", {})) | {
+        path for route in app.routes if (path := getattr(route, "path", None))
+    }
+    route_paths.discard("/")
+    assert len(index) == len(route_paths), (
+        "derived endpoint names collided: "
+        f"{sorted(route_paths - set(index.values()))} missing from the index"
+    )
     # Key scheme preserved from the hand-written index it replaces.
     assert index["lookup"] == "/lookup/{domain}"
     assert index["rdap_domain"] == "/rdap/domain/{domain}"
@@ -779,6 +1063,45 @@ def test_refuses_multi_worker_without_shared_store(monkeypatch):
         pass
 
     monkeypatch.delenv("WEB_CONCURRENCY")
+    importlib.reload(main)
+
+
+def test_web_concurrency_shadows_unparseable_uvicorn_workers(monkeypatch):
+    """UVICORN_WORKERS is only a fallback; when WEB_CONCURRENCY is set, a junk
+    UVICORN_WORKERS (e.g. `auto`) must not abort startup. It used to, because
+    the fallback was evaluated eagerly as WEB_CONCURRENCY's default."""
+    monkeypatch.setenv("WEB_CONCURRENCY", "1")
+    monkeypatch.setenv("UVICORN_WORKERS", "auto")
+    monkeypatch.delenv("SEER_RATE_LIMIT_STORAGE", raising=False)
+    import seer_api.main as main
+
+    importlib.reload(main)
+    with TestClient(main.app) as c:
+        assert c.get("/health").status_code == 200
+
+    monkeypatch.delenv("WEB_CONCURRENCY")
+    monkeypatch.delenv("UVICORN_WORKERS")
+    importlib.reload(main)
+
+
+@pytest.mark.parametrize("web_concurrency", [None, "", "  "])
+def test_unparseable_uvicorn_workers_rejected_when_it_is_the_fallback(
+    monkeypatch, web_concurrency
+):
+    """With WEB_CONCURRENCY unset/blank, UVICORN_WORKERS is the value in force
+    and a non-integer is still the clear startup error (issue #50)."""
+    if web_concurrency is None:
+        monkeypatch.delenv("WEB_CONCURRENCY", raising=False)
+    else:
+        monkeypatch.setenv("WEB_CONCURRENCY", web_concurrency)
+    monkeypatch.setenv("UVICORN_WORKERS", "auto")
+    import seer_api.main as main
+
+    importlib.reload(main)
+    with pytest.raises(RuntimeError, match="UVICORN_WORKERS"), TestClient(main.app):
+        pass
+
+    monkeypatch.delenv("UVICORN_WORKERS")
     importlib.reload(main)
 
 
@@ -990,6 +1313,68 @@ def test_xff_uses_rightmost_untrusted_entry(monkeypatch):
     assert get_client_ip(req) == "203.0.113.9"
 
 
+def test_xff_multiple_header_lines_are_joined(monkeypatch):
+    """A proxy that adds its hop as a SEPARATE X-Forwarded-For line (HAProxy
+    `option forwardfor`) must not let the client's own first line win:
+    `headers.get()` only returned that first, client-controlled line."""
+    from fastapi import Request
+
+    from seer_api.limiting import get_client_ip
+
+    monkeypatch.setenv("SEER_TRUST_PROXY", "true")
+    monkeypatch.setenv("SEER_TRUSTED_PROXY_IPS", "10.0.0.1")
+    scope = {
+        "type": "http",
+        "client": ("10.0.0.1", 1234),
+        "headers": [
+            # Sent by the client (spoofed).
+            (b"x-forwarded-for", b"1.1.1.1"),
+            # Added by the trusted proxy: the real client.
+            (b"x-forwarded-for", b"203.0.113.9"),
+        ],
+    }
+    assert get_client_ip(Request(scope)) == "203.0.113.9"
+
+
+def test_trusted_proxy_cidr_warning_logged_once(monkeypatch, caplog):
+    """The CIDR-entry warning must not be re-logged on every request."""
+    import logging
+
+    from fastapi import Request
+
+    from seer_api import limiting
+
+    monkeypatch.setenv("SEER_TRUST_PROXY", "true")
+    monkeypatch.setenv("SEER_TRUSTED_PROXY_IPS", "10.0.0.1,10.0.0.0/8")
+    limiting._parse_trusted_proxies.cache_clear()
+    scope = {
+        "type": "http",
+        "client": ("10.0.0.1", 1234),
+        "headers": [(b"x-forwarded-for", b"203.0.113.9")],
+    }
+    with caplog.at_level(logging.WARNING, logger="seer_api"):
+        for _ in range(5):
+            assert limiting.get_client_ip(Request(scope)) == "203.0.113.9"
+    cidr_warnings = [r for r in caplog.records if "10.0.0.0/8" in r.getMessage()]
+    assert len(cidr_warnings) == 1, [r.getMessage() for r in cidr_warnings]
+    # The CIDR entry is still ignored, not trusted.
+    assert limiting._trusted_proxies() == frozenset({"10.0.0.1"})
+
+
+def test_run_disables_uvicorn_proxy_headers(monkeypatch):
+    """uvicorn's default proxy_headers=True rewrites the client address from
+    X-Forwarded-For (for FORWARDED_ALLOW_IPS peers) before the app runs, a
+    second XFF trust path around SEER_TRUST_PROXY/SEER_TRUSTED_PROXY_IPS."""
+    import uvicorn
+
+    import seer_api.main as main
+
+    captured: dict = {}
+    monkeypatch.setattr(uvicorn, "run", lambda *a, **kw: captured.update(kw))
+    main.run()
+    assert captured.get("proxy_headers") is False
+
+
 def test_xff_all_trusted_falls_back_to_peer(monkeypatch):
     """If every XFF entry is a trusted proxy, fall back to the socket peer
     rather than attributing the request to a proxy IP."""
@@ -1105,6 +1490,29 @@ def test_metrics_rate_limited(reset_limiter, monkeypatch):
     # Send > 10 requests in a burst; at least one must be 429.
     statuses = [c.get("/metrics").status_code for _ in range(15)]
     assert 429 in statuses, f"expected rate-limit in {statuses}"
+
+
+def test_rate_limit_is_per_route_not_per_url(reset_limiter, monkeypatch, client):
+    """Distinct path parameters on one route share its budget.
+
+    slowapi's default key_style="url" keyed buckets on the concrete path, so
+    `/takeover/a0.com`, `/takeover/a1.com`, … — or case / trailing-dot
+    spellings of one domain — each got a fresh "5/minute" and the limit
+    bounded nothing.
+    """
+    import seer as seer_mod
+
+    monkeypatch.setattr(seer_mod, "takeover", lambda *a: {"ok": True}, raising=False)
+    paths = [f"/takeover/a{i}.com" for i in range(4)] + [
+        "/takeover/EXAMPLE.com",
+        "/takeover/example.com.",
+        "/takeover/example.com",
+    ]
+    statuses = [client.get(p).status_code for p in paths]
+    assert statuses == [200] * 5 + [429] * 2, statuses
+    # A different route keeps its own budget.
+    monkeypatch.setattr(seer_mod, "confusables", lambda *a: {"ok": True}, raising=False)
+    assert client.get("/confusables/example.com").status_code == 200
 
 
 # ---------------------------------------------------------------------------

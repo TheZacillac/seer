@@ -1,6 +1,8 @@
 //! Parser for the `:` command line. Pure — returns a `CmdOutcome` the App
 //! interprets. Mirrors the CLI/REPL command surface.
 
+use seer_core::RecordType;
+
 use crate::tui::lenses;
 use crate::tui::theme::Theme;
 
@@ -34,6 +36,18 @@ pub enum CmdOutcome {
         a: String,
         b: String,
     },
+    /// `dig <domain> [type]` — DNS records of one type (default `A`).
+    Dig {
+        domain: String,
+        record_type: RecordType,
+    },
+    /// `watch add <domain>` / `watch remove <domain>` — edit the watchlist.
+    WatchMutate {
+        add: Option<String>,
+        remove: Option<String>,
+    },
+    /// A recognized command with bad arguments; the message is shown as-is.
+    Invalid(String),
     Unknown(String),
 }
 
@@ -95,8 +109,64 @@ pub fn parse(raw: &str) -> CmdOutcome {
             _ => CmdOutcome::Unknown(line.to_string()),
         };
     }
+    if head == "dig" || head == "dns" {
+        return match parts.as_slice() {
+            [_] => CmdOutcome::Lens {
+                lens: head,
+                target: None,
+            },
+            [_, domain] => CmdOutcome::Dig {
+                domain: domain.to_string(),
+                record_type: RecordType::A,
+            },
+            [_, domain, rt] => match rt.parse::<RecordType>() {
+                Ok(record_type) => CmdOutcome::Dig {
+                    domain: domain.to_string(),
+                    record_type,
+                },
+                Err(_) => CmdOutcome::Invalid(format!("unknown record type: {rt}")),
+            },
+            _ => CmdOutcome::Invalid("usage: dig <domain> [type]".to_string()),
+        };
+    }
 
-    // A known lens command (whois, dig, ssl, status, prop, rdap, ...).
+    // Global lenses (no target domain): their arguments are subcommands, and
+    // must never be mistaken for a domain — that would clobber the session
+    // target with e.g. "add".
+    if head == "watch" {
+        let sub = parts.get(1).map(|s| s.to_lowercase());
+        return match (sub.as_deref(), parts.get(2), parts.len()) {
+            (None, _, _) | (Some("list"), None, 2) => CmdOutcome::Lens {
+                lens: head,
+                target: None,
+            },
+            (Some("add"), Some(d), 3) => CmdOutcome::WatchMutate {
+                add: Some(d.to_string()),
+                remove: None,
+            },
+            (Some("remove" | "rm"), Some(d), 3) => CmdOutcome::WatchMutate {
+                add: None,
+                remove: Some(d.to_string()),
+            },
+            _ => CmdOutcome::Invalid("usage: watch [list] · watch add|remove <domain>".to_string()),
+        };
+    }
+    if head == "history" || head == "bulk" {
+        if parts.len() > 1 {
+            let usage = if head == "history" {
+                "usage: history (in the pane: ↵ replay · c clear)"
+            } else {
+                "usage: bulk (in the pane: d domains · f file · r run)"
+            };
+            return CmdOutcome::Invalid(usage.to_string());
+        }
+        return CmdOutcome::Lens {
+            lens: head,
+            target: None,
+        };
+    }
+
+    // A known lens command (whois, ssl, status, prop, rdap, ...).
     if lenses::find_by_cmd_or_key(&head).is_some() {
         return CmdOutcome::Lens {
             lens: head,
@@ -166,10 +236,89 @@ mod tests {
             }
         );
         assert_eq!(
-            parse("dig example.com"),
+            parse("ssl example.com"),
+            CmdOutcome::Lens {
+                lens: "ssl".into(),
+                target: Some("example.com".into())
+            }
+        );
+    }
+
+    #[test]
+    fn dig_parses_an_optional_record_type() {
+        assert_eq!(
+            parse("dig"),
             CmdOutcome::Lens {
                 lens: "dig".into(),
-                target: Some("example.com".into())
+                target: None
+            }
+        );
+        assert_eq!(
+            parse("dig example.com"),
+            CmdOutcome::Dig {
+                domain: "example.com".into(),
+                record_type: RecordType::A
+            }
+        );
+        // The type was previously dropped silently (always A).
+        assert_eq!(
+            parse("dig example.com mx"),
+            CmdOutcome::Dig {
+                domain: "example.com".into(),
+                record_type: RecordType::MX
+            }
+        );
+        assert!(
+            matches!(parse("dig example.com BOGUS"), CmdOutcome::Invalid(m) if m.contains("BOGUS"))
+        );
+        assert!(matches!(
+            parse("dig example.com MX extra"),
+            CmdOutcome::Invalid(_)
+        ));
+    }
+
+    #[test]
+    fn global_lens_arguments_are_subcommands_not_domains() {
+        assert_eq!(
+            parse("watch add example.org"),
+            CmdOutcome::WatchMutate {
+                add: Some("example.org".into()),
+                remove: None
+            }
+        );
+        assert_eq!(
+            parse("watch remove example.org"),
+            CmdOutcome::WatchMutate {
+                add: None,
+                remove: Some("example.org".into())
+            }
+        );
+        for line in ["watch", "watch list"] {
+            assert_eq!(
+                parse(line),
+                CmdOutcome::Lens {
+                    lens: "watch".into(),
+                    target: None
+                },
+                "{line}"
+            );
+        }
+        for line in [
+            "watch add",
+            "watch frob x.com",
+            "history clear",
+            "bulk file.txt",
+        ] {
+            assert!(
+                matches!(parse(line), CmdOutcome::Invalid(_)),
+                "{line} must be rejected, not treated as a domain"
+            );
+        }
+        assert_eq!(
+            parse("history"),
+            CmdOutcome::Lens {
+                lens: "history".into(),
+                target: None
             }
         );
     }
