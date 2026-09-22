@@ -39,3 +39,11 @@ def test_depth_just_over_limit_raises():
     """MAX_JSON_DEPTH + 1 is the boundary that must trip the guard."""
     with pytest.raises(ValueError):
         _json_to_python_nested_for_test(MAX_JSON_DEPTH + 1)
+
+
+def test_hook_rejects_huge_depth_instead_of_aborting():
+    """The hook ships in the release module; dropping a deeply nested
+    `serde_json::Value` recurses, so an uncapped `depth=10**6` overflowed the
+    stack and aborted the interpreter. It must refuse with ValueError."""
+    with pytest.raises(ValueError, match="cap"):
+        _json_to_python_nested_for_test(10**6)

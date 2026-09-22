@@ -1120,6 +1120,12 @@ fn json_to_python_inner<'py>(
     }
 }
 
+/// Largest `depth` [`_json_to_python_nested_for_test`] will build: far past
+/// [`MAX_JSON_DEPTH`] (so over-limit inputs still exercise the guard) yet
+/// shallow enough that building and recursively dropping the value is safe
+/// on any thread's stack.
+const MAX_TEST_NESTING: usize = 1024;
+
 /// Test hook: constructs a `serde_json::Value` with `depth` levels of
 /// nested arrays and runs it through [`json_to_python`].
 ///
@@ -1132,11 +1138,22 @@ fn json_to_python_inner<'py>(
 /// to link against `libpython`. The function is prefixed with `_` to
 /// signal that it is not part of the public API and is undocumented in
 /// `__all__`.
+///
+/// `depth` is capped at [`MAX_TEST_NESTING`]: the hook ships in the release
+/// module, and dropping a `serde_json::Value` is itself recursive, so an
+/// uncapped `depth=10**6` overflowed the stack while freeing the value and
+/// aborted the interpreter — the exact failure mode the depth guard exists
+/// to prevent.
 #[pyfunction]
 fn _json_to_python_nested_for_test<'py>(
     py: Python<'py>,
     depth: usize,
 ) -> PyResult<Bound<'py, PyAny>> {
+    if depth > MAX_TEST_NESTING {
+        return Err(PyValueError::new_err(format!(
+            "test nesting depth {depth} exceeds the hook's cap of {MAX_TEST_NESTING}"
+        )));
+    }
     let mut v = serde_json::Value::Null;
     for _ in 0..depth {
         v = serde_json::Value::Array(vec![v]);
