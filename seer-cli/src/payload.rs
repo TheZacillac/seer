@@ -29,6 +29,9 @@ pub enum Payload {
     Takeover(Box<seer_core::TakeoverReport>),
     Caa(Box<seer_core::CaaPolicy>),
     Confusables(Box<seer_core::ConfusableReport>),
+    Delegation(Box<seer_core::dns::DelegationReport>),
+    /// `subdomains --resolve` output (live/dead + dangling-CNAME classes).
+    SubdomainClassification(Box<seer_core::SubdomainClassification>),
     /// Unlike the others this has no `OutputFormatter` method — doctor reports
     /// render through `crate::render_doctor_report`, the same helper the CLI
     /// and REPL print with. Carried here anyway so `copy` after `doctor`
@@ -64,6 +67,8 @@ impl Payload {
             Payload::Takeover(_) => "takeover",
             Payload::Caa(_) => "caa",
             Payload::Confusables(_) => "confusables",
+            Payload::Delegation(_) => "delegation",
+            Payload::SubdomainClassification(_) => "subdomain classification",
             Payload::Doctor(_) => "doctor",
         }
     }
@@ -95,6 +100,8 @@ pub fn serialize(data: &Payload, format: OutputFormat) -> String {
         Payload::Takeover(t) => fmt.format_takeover(t),
         Payload::Caa(c) => fmt.format_caa(c),
         Payload::Confusables(c) => fmt.format_confusables(c),
+        Payload::Delegation(d) => fmt.format_delegation(d),
+        Payload::SubdomainClassification(c) => fmt.format_subdomain_classification(c),
         // No formatter method exists for doctor reports; reuse the shared
         // renderer so copied text matches what `seer doctor --format …` prints.
         Payload::Doctor(r) => crate::render_doctor_report(r, format),

@@ -36,6 +36,41 @@ pub fn get_bulk_progress_bar() -> Option<ProgressBar> {
     guard.clone()
 }
 
+/// Prints `line` above `pb`, or straight to stderr when the bar is hidden.
+///
+/// indicatif hides a bar whose draw target is not a terminal (stderr piped or
+/// redirected — e.g. `--progress verbose 2> log`), and `ProgressBar::println`
+/// is a silent no-op on a hidden bar, so per-item progress lines and tracing
+/// output routed through the bar were dropped whenever stderr wasn't a TTY.
+pub fn bar_println(pb: &ProgressBar, line: &str) -> std::io::Result<()> {
+    bar_println_or(pb, line, &mut std::io::stderr().lock())
+}
+
+/// [`bar_println`] with an injectable fallback sink (stderr in production).
+fn bar_println_or<W: Write>(pb: &ProgressBar, line: &str, fallback: &mut W) -> std::io::Result<()> {
+    if pb.is_hidden() {
+        fallback.write_all(line.as_bytes())?;
+        fallback.write_all(b"\n")
+    } else {
+        pb.println(line);
+        Ok(())
+    }
+}
+
+/// Writes one complete line of tracing output: through the active bulk
+/// progress bar when there is one (so the bar redraws cleanly below it),
+/// otherwise directly to stderr.
+fn write_line(line: &str) -> std::io::Result<()> {
+    match get_bulk_progress_bar() {
+        Some(pb) => bar_println(&pb, line),
+        None => {
+            let mut stderr = std::io::stderr().lock();
+            stderr.write_all(line.as_bytes())?;
+            stderr.write_all(b"\n")
+        }
+    }
+}
+
 /// A writer that routes output through the bulk progress bar when active.
 /// This prevents tracing logs from interfering with progress bar display.
 pub struct ProgressWriter {
@@ -63,16 +98,7 @@ impl Write for ProgressWriter {
             let line: Vec<u8> = self.buffer.drain(..=newline_pos).collect();
             let line_str = String::from_utf8_lossy(&line);
             let trimmed = line_str.trim_end_matches('\n');
-
-            if let Some(pb) = get_bulk_progress_bar() {
-                // Route through progress bar to maintain display
-                pb.println(trimmed);
-            } else {
-                // No progress bar active, write directly to stderr
-                let mut stderr = std::io::stderr();
-                stderr.write_all(trimmed.as_bytes())?;
-                stderr.write_all(b"\n")?;
-            }
+            write_line(trimmed)?;
         }
 
         Ok(buf.len())
@@ -85,13 +111,7 @@ impl Write for ProgressWriter {
             let trimmed = line_str.trim_end();
 
             if !trimmed.is_empty() {
-                if let Some(pb) = get_bulk_progress_bar() {
-                    pb.println(trimmed);
-                } else {
-                    let mut stderr = std::io::stderr();
-                    stderr.write_all(trimmed.as_bytes())?;
-                    stderr.write_all(b"\n")?;
-                }
+                write_line(trimmed)?;
             }
             self.buffer.clear();
         }
@@ -125,5 +145,23 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for ProgressWriterFactory {
 
     fn make_writer(&'a self) -> Self::Writer {
         ProgressWriter::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hidden_bar_falls_back_to_the_stderr_sink() {
+        // A hidden bar (what indicatif gives you when stderr is not a TTY)
+        // swallows `println`; the line must reach the fallback sink instead.
+        let pb = ProgressBar::hidden();
+        let mut sink = Vec::new();
+        bar_println_or(&pb, "\u{2717} bad.example (timeout)", &mut sink).expect("write");
+        assert_eq!(
+            String::from_utf8(sink).expect("utf8"),
+            "\u{2717} bad.example (timeout)\n"
+        );
     }
 }

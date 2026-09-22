@@ -50,7 +50,6 @@ fn resolve_progress_mode(
     }
     ProgressMode::Bar
 }
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use seer_core::colors::CatppuccinExt;
 
 /// Severity threshold for `seer watch`'s non-zero exit (`--fail-on`).
@@ -147,7 +146,10 @@ struct Cli {
     #[arg(short, long)]
     quiet: bool,
 
-    /// Comma-separated list of fields to extract (use with --quiet)
+    /// Comma-separated list of fields to extract (use with --quiet). Dotted
+    /// paths reach nested values (certificate.issuer), numeric segments index
+    /// arrays (0.name), and a name applied to a list extracts it from every
+    /// element (e.g. `-q --fields name dig example.com`)
     #[arg(long, value_delimiter = ',')]
     fields: Option<Vec<String>>,
 }
@@ -476,8 +478,13 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Some(cmd) => execute_command(cmd, output_format, cli.quiet, cli.fields, &config).await,
         None => {
-            // Start interactive REPL
+            // Start interactive REPL. An explicit `--format` becomes its
+            // initial output format (as if `set output <fmt>` was typed);
+            // without one the REPL keeps the config file's default.
             let mut repl = repl::Repl::new()?;
+            if cli.format.is_some() {
+                repl.set_output_format(output_format);
+            }
             repl.run().await
         }
     }
@@ -497,25 +504,79 @@ fn resolve_output_format(
     }
 }
 
-/// Extract specific fields from a JSON value and print them.
-/// Supports nested field access via dot notation (e.g., "certificate.issuer").
-fn extract_fields(value: &serde_json::Value, fields: &[String]) {
+/// Where `seer bulk` writes its CSV, or `None` when no CSV is written.
+///
+/// An explicit `-o/--output` always yields a CSV — including under a
+/// structured `--format json|yaml` (flag or config file), which previously
+/// ignored `-o` and silently wrote nothing. Without `-o`, structured formats
+/// stream to stdout only, and human/markdown default to `<input>_results.csv`.
+fn bulk_csv_path(explicit: Option<&str>, structured_output: bool, input: &str) -> Option<String> {
+    match explicit {
+        Some(path) => Some(utils::expand_tilde(path)),
+        None if structured_output => None,
+        None => Some(ops::default_bulk_output_path(input)),
+    }
+}
+
+/// Resolves a dotted field path (`certificate.issuer`) against `value`,
+/// collecting every match into `out`. A numeric segment indexes an array
+/// (`records.0.name`); any other segment applied to an array fans out over
+/// its elements, so `--fields name` on a record list yields one value per
+/// record. A path that does not resolve contributes a single `Null`.
+fn resolve_field_path<'a>(
+    value: &'a serde_json::Value,
+    parts: &[&str],
+    out: &mut Vec<&'a serde_json::Value>,
+) {
+    use serde_json::Value;
+    let Some((part, rest)) = parts.split_first() else {
+        out.push(value);
+        return;
+    };
+    match value {
+        Value::Object(map) => match map.get(*part) {
+            Some(next) => resolve_field_path(next, rest, out),
+            None => out.push(&Value::Null),
+        },
+        Value::Array(items) => match part.parse::<usize>() {
+            Ok(index) => match items.get(index) {
+                Some(next) => resolve_field_path(next, rest, out),
+                None => out.push(&Value::Null),
+            },
+            Err(_) => {
+                for item in items {
+                    resolve_field_path(item, parts, out);
+                }
+            }
+        },
+        _ => out.push(&Value::Null),
+    }
+}
+
+/// Renders the requested fields of a JSON value as output lines, one per
+/// resolved value (see [`resolve_field_path`] for the path syntax). Strings
+/// print bare, a missing field prints an empty line, anything else as JSON.
+fn extract_field_lines(value: &serde_json::Value, fields: &[String]) -> Vec<String> {
+    let mut lines = Vec::new();
     for field in fields {
         let parts: Vec<&str> = field.split('.').collect();
-        let mut current = value;
-        for part in &parts {
-            current = match current {
-                serde_json::Value::Object(map) => {
-                    map.get(*part).unwrap_or(&serde_json::Value::Null)
-                }
-                _ => &serde_json::Value::Null,
-            };
-        }
-        match current {
-            serde_json::Value::String(s) => println!("{}", s),
-            serde_json::Value::Null => println!(),
-            other => println!("{}", other),
-        }
+        let mut matches = Vec::new();
+        resolve_field_path(value, &parts, &mut matches);
+        lines.extend(matches.into_iter().map(|v| match v {
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Null => String::new(),
+            other => other.to_string(),
+        }));
+    }
+    lines
+}
+
+/// Extract specific fields from a JSON value and print them.
+/// Supports nested field access via dot notation (e.g., "certificate.issuer"),
+/// numeric array indices, and fan-out over arrays.
+fn extract_fields(value: &serde_json::Value, fields: &[String]) {
+    for line in extract_field_lines(value, fields) {
+        println!("{}", line);
     }
 }
 
@@ -546,6 +607,22 @@ fn emit_error<E: std::fmt::Display>(output_format: seer_core::output::OutputForm
         None => eprintln!("{} {}", "Error:".ctp_red(), msg),
     }
     std::process::exit(1);
+}
+
+/// Whether `follow`'s prose (the "Following …" banner and the interrupted
+/// note) belongs on stderr: yes for every non-human format, so stdout carries
+/// only the formatted iterations and summary and stays machine-parseable.
+fn follow_notes_to_stderr(output_format: seer_core::output::OutputFormat) -> bool {
+    output_format != seer_core::output::OutputFormat::Human
+}
+
+/// Check-style verdict for `seer dnssec`: only a `"signed"` zone passes.
+///
+/// Core's status vocabulary is `signed | unsigned | partial | misconfigured`
+/// (see `DnssecReport::status`); it deliberately never says "secure", so
+/// comparing against that word made every correctly signed zone exit 1.
+fn dnssec_check_passed(report: &seer_core::DnssecReport) -> bool {
+    report.status == "signed"
 }
 
 /// Every name `RecordType::from_str` accepts, for error messages —
@@ -755,49 +832,36 @@ async fn execute_command(
 
             // `read_bulk_input` rejects FIFOs, sockets, devices, directories,
             // and oversized files via a pre-read metadata check, so malicious
-            // `mkfifo`'d paths can't hang the process.
+            // `mkfifo`'d paths can't hang the process. stdin gets the same
+            // size cap via a bounded read. Errors go through `emit_error` so
+            // `--format json|yaml` stays machine-readable on this path too.
             let content = if from_stdin {
-                use std::io::Read;
-                let mut buf = String::new();
-                std::io::stdin()
-                    .read_to_string(&mut buf)
-                    .map_err(|e| anyhow::anyhow!("reading domains from stdin: {e}"))?;
-                buf
+                utils::read_bulk_stdin(std::io::stdin().lock())
             } else {
-                utils::read_bulk_input(&file).map_err(|e| anyhow::anyhow!(e))?
-            };
+                utils::read_bulk_input(&file)
+            }
+            .unwrap_or_else(|e| emit_error(output_format, &e));
 
             // When a structured global format is requested, bulk streams results
-            // to stdout instead of writing a CSV — pipeline-friendly and free of
-            // the spreadsheet-safety escaping CSV requires.
+            // to stdout — pipeline-friendly and free of the spreadsheet-safety
+            // escaping CSV requires. An explicit `-o` still writes the CSV too.
             let structured_output = matches!(
                 output_format,
                 seer_core::output::OutputFormat::Json | seer_core::output::OutputFormat::Yaml
             );
 
-            let domains = match ops::parse_bulk_domains(&content) {
-                Ok(d) => d,
-                Err(e) => {
-                    eprintln!("{} {}", "Error:".ctp_red(), e);
-                    std::process::exit(1);
-                }
-            };
+            let domains =
+                ops::parse_bulk_domains(&content).unwrap_or_else(|e| emit_error(output_format, &e));
 
-            // Determine output path (also tilde-expanded when supplied)
-            let output_path = output
-                .map(|s| utils::expand_tilde(&s))
-                .unwrap_or_else(|| ops::default_bulk_output_path(&file));
+            // Determine the CSV path (tilde-expanded when supplied), or None
+            // when a structured stream to stdout replaces the default CSV.
+            let csv_path = bulk_csv_path(output.as_deref(), structured_output, &file);
 
             let rt = parse_record_type(&record_type, output_format);
             let executor = seer_core::BulkExecutor::from_config(config);
 
-            let operations = match ops::build_bulk_operations(&operation, &domains, rt) {
-                Ok(operations) => operations,
-                Err(e) => {
-                    eprintln!("{} {}", "Error:".ctp_red(), e);
-                    std::process::exit(1);
-                }
-            };
+            let operations = ops::build_bulk_operations(&operation, &domains, rt)
+                .unwrap_or_else(|e| emit_error(output_format, &e));
 
             // Status goes to stderr so it never pollutes a structured stdout stream.
             eprintln!(
@@ -832,23 +896,26 @@ async fn execute_command(
             let results = executor.execute(operations, callback).await;
 
             // Emit per-item lines according to mode, then clear the bar.
+            // `bar_println` falls back to plain stderr when indicatif hid the
+            // bar (non-TTY stderr), where `println` would silently drop them.
             if let Some(bar) = pb.as_ref() {
                 for r in &results {
                     let domain = r.operation.domain();
-                    match (progress_mode, r.success) {
-                        (ProgressMode::Verbose, true) => {
-                            bar.println(format!(
-                                "{} {} ({}ms)",
-                                "\u{2713}".ctp_green(),
-                                domain,
-                                r.duration_ms
-                            ));
-                        }
+                    let line = match (progress_mode, r.success) {
+                        (ProgressMode::Verbose, true) => Some(format!(
+                            "{} {} ({}ms)",
+                            "\u{2713}".ctp_green(),
+                            domain,
+                            r.duration_ms
+                        )),
                         (ProgressMode::Verbose, false) | (ProgressMode::Failures, false) => {
                             let err = r.error.as_deref().unwrap_or("unknown error");
-                            bar.println(format!("{} {} ({})", "\u{2717}".ctp_red(), domain, err));
+                            Some(format!("{} {} ({})", "\u{2717}".ctp_red(), domain, err))
                         }
-                        _ => {}
+                        _ => None,
+                    };
+                    if let Some(line) = line {
+                        let _ = display::bar_println(bar, &line);
                     }
                 }
                 bar.finish_and_clear();
@@ -868,28 +935,41 @@ async fn execute_command(
                         .unwrap_or_else(|e| format!("{{\"error\":\"{}\"}}", e)),
                 };
                 println!("{}", rendered);
-                eprintln!(
-                    "  {} successful, {} failed",
-                    success_count.to_string().ctp_green(),
-                    fail_count
-                );
-            } else {
+            }
+
+            if let Some(csv_path) = &csv_path {
                 // Convert results to CSV. Write atomically so a crash mid-write
                 // cannot leave a truncated CSV that downstream pipelines treat
                 // as authoritative.
                 let csv_content = utils::bulk_results_to_csv(&results, &operation);
-                utils::atomic_write(&output_path, &csv_content)?;
+                if let Err(e) = utils::atomic_write(csv_path, &csv_content) {
+                    emit_error(
+                        output_format,
+                        &format!("Failed to write output file {}: {}", csv_path, e),
+                    );
+                }
+                let written = format!("Results written to: {}", csv_path.ctp_green());
+                // Keep stdout a clean JSON/YAML document in structured mode.
+                if structured_output {
+                    eprintln!("{}", written);
+                } else {
+                    println!("{}", written);
+                }
+            }
 
-                println!("Results written to: {}", output_path.ctp_green());
-                println!(
-                    "  {} successful, {} failed",
-                    success_count.to_string().ctp_green(),
-                    if fail_count > 0 {
-                        fail_count.to_string().ctp_red()
-                    } else {
-                        fail_count.to_string().ctp_green()
-                    }
-                );
+            let summary = format!(
+                "  {} successful, {} failed",
+                success_count.to_string().ctp_green(),
+                if fail_count > 0 {
+                    fail_count.to_string().ctp_red()
+                } else {
+                    fail_count.to_string().ctp_green()
+                }
+            );
+            if structured_output {
+                eprintln!("{}", summary);
+            } else {
+                println!("{}", summary);
             }
 
             // A run with zero successes is a total failure (network down,
@@ -931,8 +1011,13 @@ async fn execute_command(
         }
         Commands::Reverse { ip } => {
             let resolver = seer_core::DnsResolver::from_config(config);
+            // Honor the configured nameserver, like `dig`.
             match resolver
-                .resolve(&ip, seer_core::RecordType::PTR, None)
+                .resolve(
+                    &ip,
+                    seer_core::RecordType::PTR,
+                    config.nameserver.as_deref(),
+                )
                 .await
             {
                 Ok(records) => {
@@ -974,7 +1059,7 @@ async fn execute_command(
                     } else {
                         println!("{}", formatter.format_dnssec(&report));
                     }
-                    if report.status != "secure" {
+                    if !dnssec_check_passed(&report) {
                         std::process::exit(1);
                     }
                 }
@@ -1012,26 +1097,37 @@ async fn execute_command(
         Commands::Config { init } => {
             if init {
                 let config_path = seer_core::SeerConfig::config_path();
+                // Every failure goes through `emit_error` (non-zero exit) so
+                // `--format json|yaml` gets a structured error here as well.
                 match config_path {
                     Some(path) => {
                         if let Some(parent) = path.parent() {
-                            std::fs::create_dir_all(parent)?;
+                            if let Err(e) = std::fs::create_dir_all(parent) {
+                                emit_error(
+                                    output_format,
+                                    &format!("Could not create {}: {}", parent.display(), e),
+                                );
+                            }
                         }
                         if path.exists() {
-                            eprintln!("Config file already exists at: {}", path.display());
-                            std::process::exit(1);
+                            emit_error(
+                                output_format,
+                                &format!("Config file already exists at: {}", path.display()),
+                            );
                         }
                         let content = seer_core::SeerConfig::default_toml();
-                        std::fs::write(&path, content)?;
+                        if let Err(e) = std::fs::write(&path, content) {
+                            emit_error(
+                                output_format,
+                                &format!("Could not write {}: {}", path.display(), e),
+                            );
+                        }
                         println!(
                             "Created config file at: {}",
                             path.display().to_string().ctp_green()
                         );
                     }
-                    None => {
-                        eprintln!("{} Could not determine home directory", "Error:".ctp_red());
-                        std::process::exit(1);
-                    }
+                    None => emit_error(output_format, &"Could not determine home directory"),
                 }
             } else {
                 let config = seer_core::SeerConfig::load();
@@ -1055,19 +1151,24 @@ async fn execute_command(
                 .map(|s| s.trim_start_matches('@'))
                 .or(config.nameserver.as_deref());
 
-            let config = match seer_core::FollowConfig::new(iterations, interval_minutes) {
+            let follow_config = match seer_core::FollowConfig::new(iterations, interval_minutes) {
                 Ok(cfg) => cfg.with_changes_only(changes_only),
                 Err(e) => {
                     emit_error(output_format, &e);
                 }
             };
 
-            let follower = seer_core::DnsFollower::new();
+            // Honor the config file's DNS timeout like `dig` does.
+            let follower =
+                seer_core::DnsFollower::with_resolver(seer_core::DnsResolver::from_config(config));
 
-            // Set up cancellation channel
+            // Set up cancellation channel. `cancel_tx` must stay alive until
+            // the follow returns: once every sender is dropped, the follow's
+            // interruptible sleep wakes immediately.
             let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
 
-            // Set up Ctrl+C handler
+            // Set up Ctrl+C handler (the only interrupt path when there is no
+            // terminal for the Esc listener below).
             let cancel_tx_ctrlc = cancel_tx.clone();
             tokio::spawn(async move {
                 tokio::signal::ctrl_c().await.ok();
@@ -1079,33 +1180,10 @@ async fn execute_command(
             // panic unwinds through the follow loop (issue #60).
             let raw_guard = utils::RawModeGuard::new();
 
-            // Spawn a task to listen for Escape key
-            let cancel_tx_esc = cancel_tx.clone();
-            let key_listener = tokio::spawn(async move {
-                loop {
-                    if event::poll(std::time::Duration::from_millis(100)).unwrap_or(false) {
-                        if let Ok(Event::Key(KeyEvent {
-                            code, modifiers, ..
-                        })) = event::read()
-                        {
-                            match code {
-                                KeyCode::Esc => {
-                                    let _ = cancel_tx_esc.send(true);
-                                    break;
-                                }
-                                KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
-                                    let _ = cancel_tx_esc.send(true);
-                                    break;
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                    if cancel_tx_esc.is_closed() {
-                        break;
-                    }
-                }
-            });
+            // Listen for Esc / Ctrl+C on a blocking thread — only when there
+            // is a terminal to read from.
+            let key_listener =
+                utils::FollowKeyListener::spawn(cancel_tx.clone(), raw_guard.is_enabled());
 
             // Create progress callback for real-time output
             // Note: raw mode is enabled for key detection, so we need \r\n for proper line breaks
@@ -1121,34 +1199,54 @@ async fn execute_command(
                 let _ = stdout.flush();
             });
 
-            // In raw mode, use \r\n for proper line breaks
-            print!(
-                "Following {} {} records ({} iterations, {} interval)\r\n",
+            // In raw mode, use \r\n for proper line breaks. The banner is
+            // prose, so under a machine format it goes to stderr and stdout
+            // stays a parseable stream (`seer --format json follow … | jq`).
+            let notes_to_stderr = follow_notes_to_stderr(output_format);
+            let banner = format!(
+                "Following {} {} records ({} iterations, {} interval)\r\nPress {} or {} to stop early\r\n\r\n",
                 domain.ctp_green(),
                 record_type.ctp_yellow(),
                 iterations.to_string().ctp_yellow(),
-                utils::format_interval(interval_minutes)
-            );
-            print!(
-                "Press {} or {} to stop early\r\n\r\n",
+                utils::format_interval(interval_minutes),
                 "Esc".ctp_yellow(),
                 "Ctrl+C".ctp_yellow()
             );
-            let _ = std::io::stdout().flush();
+            if notes_to_stderr {
+                eprint!("{}", banner);
+                let _ = std::io::stderr().flush();
+            } else {
+                print!("{}", banner);
+                let _ = std::io::stdout().flush();
+            }
 
             let result = follower
-                .follow(&domain, rt, ns, config, Some(callback), Some(cancel_rx))
+                .follow(
+                    &domain,
+                    rt,
+                    ns,
+                    follow_config,
+                    Some(callback),
+                    Some(cancel_rx),
+                )
                 .await;
 
             // Clean up: stop the key listener and restore cooked mode before
             // printing results. The guard's Drop also restores on a panic above.
-            key_listener.abort();
+            if let Some(listener) = key_listener {
+                listener.stop().await;
+            }
             drop(raw_guard);
 
             match result {
                 Ok(result) => {
                     if result.interrupted {
-                        println!("\n{}", "Follow interrupted by user".ctp_yellow());
+                        let note = "Follow interrupted by user".ctp_yellow();
+                        if notes_to_stderr {
+                            eprintln!("{}", note);
+                        } else {
+                            println!("\n{}", note);
+                        }
                     }
                     println!("\n{}", formatter.format_follow(&result));
                 }
@@ -1465,11 +1563,13 @@ async fn execute_command(
             let mut watchlist = tokio::task::spawn_blocking(seer_core::Watchlist::load)
                 .await
                 .unwrap_or_default();
+            // Usage/validation failures go through `emit_error` (non-zero
+            // exit) so `--format json|yaml` gets a structured error.
             match action.as_deref() {
                 Some("add") => {
-                    let domain = domain
-                        .as_deref()
-                        .ok_or_else(|| anyhow::anyhow!("Usage: seer watch add <domain>"))?;
+                    let Some(domain) = domain.as_deref() else {
+                        emit_error(output_format, &"Usage: seer watch add <domain>");
+                    };
                     match watchlist.add(domain) {
                         Ok(true) => {
                             let save_result =
@@ -1485,15 +1585,14 @@ async fn execute_command(
                             println!("{} is already in the watchlist", domain);
                         }
                         Err(e) => {
-                            eprintln!("{} Invalid domain: {}", "Error:".ctp_red(), e);
-                            std::process::exit(1);
+                            emit_error(output_format, &format!("Invalid domain: {}", e));
                         }
                     }
                 }
                 Some("remove") => {
-                    let domain = domain
-                        .as_deref()
-                        .ok_or_else(|| anyhow::anyhow!("Usage: seer watch remove <domain>"))?;
+                    let Some(domain) = domain.as_deref() else {
+                        emit_error(output_format, &"Usage: seer watch remove <domain>");
+                    };
                     if watchlist.remove(domain) {
                         let save_result =
                             tokio::task::spawn_blocking(move || watchlist.save()).await;
@@ -1566,12 +1665,10 @@ async fn execute_command(
                     }
                 }
                 Some(other) => {
-                    eprintln!(
-                        "{} Unknown watch action: {}. Use: add, remove, list",
-                        "Error:".ctp_red(),
-                        other
+                    emit_error(
+                        output_format,
+                        &format!("Unknown watch action: {}. Use: add, remove, list", other),
                     );
-                    std::process::exit(1);
                 }
             }
         }
@@ -2028,6 +2125,142 @@ mod record_type_parse_tests {
                 try_parse_record_type(name).is_ok(),
                 "VALID_RECORD_TYPES lists {name}, which no longer parses"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod dnssec_exit_tests {
+    use super::dnssec_check_passed;
+
+    fn report_with_status(status: &str) -> seer_core::DnssecReport {
+        seer_core::DnssecReport {
+            domain: "example.com".into(),
+            enabled: status != "unsigned",
+            has_ds_records: false,
+            has_dnskey_records: false,
+            ds_records: vec![],
+            dnskey_records: vec![],
+            issues: vec![],
+            status: status.into(),
+            chain_valid: status == "signed",
+            authentication_tier: seer_core::dns::AuthenticationTier::DigestOnly,
+            rrsig_records: vec![],
+        }
+    }
+
+    /// Core never reports "secure" — the CLI compared against it, so a
+    /// correctly signed zone always exited 1.
+    #[test]
+    fn only_a_signed_zone_passes() {
+        assert!(dnssec_check_passed(&report_with_status("signed")));
+        for status in ["unsigned", "partial", "misconfigured"] {
+            assert!(
+                !dnssec_check_passed(&report_with_status(status)),
+                "{status} must fail the check"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod bulk_output_tests {
+    use super::bulk_csv_path;
+
+    /// `-o` under a structured format (flag or config-file default) was
+    /// computed but ignored: no CSV, exit 0.
+    #[test]
+    fn explicit_output_writes_csv_even_for_structured_formats() {
+        assert_eq!(
+            bulk_csv_path(Some("out.csv"), true, "domains.txt").as_deref(),
+            Some("out.csv")
+        );
+        assert_eq!(
+            bulk_csv_path(Some("out.csv"), false, "domains.txt").as_deref(),
+            Some("out.csv")
+        );
+    }
+
+    #[test]
+    fn default_csv_only_for_human_style_formats() {
+        assert_eq!(bulk_csv_path(None, true, "domains.txt"), None);
+        assert_eq!(
+            bulk_csv_path(None, false, "domains.txt").as_deref(),
+            Some("domains_results.csv")
+        );
+    }
+}
+
+#[cfg(test)]
+mod quiet_fields_tests {
+    use super::extract_field_lines;
+    use serde_json::json;
+
+    fn fields(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// `-q --fields name dig example.com` printed blank lines because the
+    /// record-list root (an array) resolved every path to Null.
+    #[test]
+    fn field_path_applies_to_each_array_element() {
+        let records = json!([
+            {"name": "example.com", "ttl": 300},
+            {"name": "www.example.com", "ttl": 60}
+        ]);
+        assert_eq!(
+            extract_field_lines(&records, &fields(&["name"])),
+            vec!["example.com", "www.example.com"]
+        );
+    }
+
+    #[test]
+    fn numeric_segments_index_arrays() {
+        let value = json!({"records": [{"data": {"address": "1.2.3.4"}}, {"data": {"address": "5.6.7.8"}}]});
+        assert_eq!(
+            extract_field_lines(&value, &fields(&["records.1.data.address"])),
+            vec!["5.6.7.8"]
+        );
+        assert_eq!(
+            extract_field_lines(&json!(["a", "b"]), &fields(&["0"])),
+            vec!["a"]
+        );
+        // Out-of-range index behaves like a missing field: one empty line.
+        assert_eq!(
+            extract_field_lines(&json!(["a"]), &fields(&["5"])),
+            vec![""]
+        );
+    }
+
+    #[test]
+    fn object_paths_and_missing_fields_are_unchanged() {
+        let value = json!({"certificate": {"issuer": "Test CA", "days": 30}});
+        assert_eq!(
+            extract_field_lines(
+                &value,
+                &fields(&["certificate.issuer", "certificate.days", "nope"])
+            ),
+            vec!["Test CA", "30", ""]
+        );
+    }
+}
+
+#[cfg(test)]
+mod follow_output_tests {
+    use super::follow_notes_to_stderr;
+    use seer_core::output::OutputFormat;
+
+    /// `seer --format json follow … | jq` broke on the prose banner and the
+    /// "interrupted" note written to stdout.
+    #[test]
+    fn prose_notes_leave_stdout_for_machine_formats() {
+        assert!(!follow_notes_to_stderr(OutputFormat::Human));
+        for format in [
+            OutputFormat::Json,
+            OutputFormat::Yaml,
+            OutputFormat::Markdown,
+        ] {
+            assert!(follow_notes_to_stderr(format), "{format:?}");
         }
     }
 }

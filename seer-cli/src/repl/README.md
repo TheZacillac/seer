@@ -61,6 +61,8 @@ impl Repl {
 - History saved to `~/.seer_history`
 - Arrow keys navigate history
 - Persistent across sessions
+- A line typed with a leading space is not saved (rustyline's
+  `history_ignore_space`)
 
 ### Tab Completion
 
@@ -70,9 +72,10 @@ impl Repl {
 ### Session State
 
 - Output format persists across commands
-- Can be changed with `set output`
+- Can be changed with `set output`, or preset with `seer --format <fmt>`
 - The last shown result (`last_result`) is cached so `copy` can serialize and
-  clipboard-copy it via OSC52
+  clipboard-copy it via OSC52; a failed command clears it, so `copy` never
+  hands out a previous command's result
 
 ### Error Handling
 
@@ -140,9 +143,14 @@ Goodbye!
 
 ### Command Parsing
 
-Commands are parsed as whitespace-separated tokens:
+Commands are parsed as whitespace-separated tokens, with single/double quotes
+grouping arguments that contain spaces (`commands::tokenize_line`: POSIX
+shell rules via `shlex`, except on Windows, where backslashes stay literal so
+paths like `C:\Users\me\d.txt` survive):
 - First token: command name
 - Remaining tokens: arguments
+- `follow`, `subdomains`, `takeover`, and `drift` reject unrecognized
+  `--flags` with a usage error instead of silently ignoring them
 
 ### Spinner
 
