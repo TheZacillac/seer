@@ -27,7 +27,7 @@ use seer_core::posture::{
 };
 use seer_core::rdap::RdapResponse;
 use seer_core::ssl::{CertDetail, CertWarning, CertWarningSeverity, SslReport};
-use seer_core::status::{DomainExpiration, StatusResponse};
+use seer_core::status::{CertificateInfo, DomainExpiration, StatusResponse};
 use seer_core::subdomains::{ClassifiedSubdomain, SubdomainClassification, SubdomainStatus};
 use seer_core::whois::WhoisResponse;
 
@@ -166,6 +166,23 @@ fn fixture_status_expired() -> StatusResponse {
     }
 }
 
+/// A date-valid certificate that does not match the queried hostname
+/// (`is_valid` is date-range only, so it still reads "Valid").
+fn fixture_status_hostname_mismatch() -> StatusResponse {
+    StatusResponse {
+        certificate: Some(CertificateInfo {
+            issuer: "CN=Mock CA".into(),
+            subject: "CN=other.example".into(),
+            valid_from: "2025-01-01T00:00:00Z".parse().unwrap(),
+            valid_until: "2099-01-01T00:00:00Z".parse().unwrap(),
+            days_until_expiry: 26_000,
+            is_valid: true,
+            hostname_verified: false,
+        }),
+        ..fixture_status()
+    }
+}
+
 #[test]
 fn human_status_expired_domain_says_expired() {
     let out = human().format_status(&fixture_status_expired());
@@ -272,6 +289,13 @@ fn human_status_snapshot() {
 #[test]
 fn markdown_status_snapshot() {
     snap!(markdown().format_status(&fixture_status()));
+}
+
+#[test]
+fn markdown_status_hostname_mismatch_snapshot() {
+    // Markdown used to show only "- **Status**: Valid" for a mismatched cert,
+    // while the human formatter warned; the hostname check must be visible.
+    snap!(markdown().format_status(&fixture_status_hostname_mismatch()));
 }
 
 /// A subdomain baseline diff with additions, removals, and unchanged names.

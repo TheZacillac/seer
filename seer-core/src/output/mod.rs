@@ -7,7 +7,23 @@ pub use human::HumanFormatter;
 pub use json::JsonFormatter;
 pub use markdown::MarkdownFormatter;
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+
+/// Whole days from now until `when`, rounded toward negative infinity.
+///
+/// `TimeDelta::num_days` truncates toward zero, so an expiry anywhere from
+/// 1s to 23.9h in the past yielded `0` and rendered as "expires in 0 days!"
+/// instead of expired. Flooring makes any instant in the past negative (at
+/// least one day ago) while a later-today expiry stays `0`.
+fn days_until(when: DateTime<Utc>) -> i64 {
+    days_between(Utc::now(), when)
+}
+
+/// Floored whole days from `now` to `when` (see [`days_until`]).
+fn days_between(now: DateTime<Utc>, when: DateTime<Utc>) -> i64 {
+    (when - now).num_seconds().div_euclid(86_400)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -185,35 +201,52 @@ impl OutputFormatter for YamlFormatter {
 /// Returns true when a string cannot be emitted as a YAML *plain* scalar and
 /// must be double-quoted. Covers the cases the old `contains('\n'|':'|'#')`
 /// predicate missed (issue #54): empty strings, leading/trailing whitespace,
-/// any control character, a leading YAML indicator character, an interior
-/// `": "` / trailing `:` / `" #"` (which break a plain scalar), and the YAML
-/// 1.1 bool/null tokens (`null`, `~`, `true`, `false`, `yes`, `no`, `on`,
-/// `off`) which would otherwise round-trip as the wrong type.
+/// any control character or YAML line break (U+0085/U+2028/U+2029 — a raw one
+/// makes the whole document unparseable), a leading YAML indicator character,
+/// an interior `": "` / trailing `:` / `" #"` (which break a plain scalar),
+/// and the YAML 1.1 bool/null tokens (`null`, `~`, `true`, `false`, `yes`,
+/// `no`, `y`, `n`, `on`, `off`) and special keys (`=` value, `<<` merge)
+/// which would otherwise round-trip as the wrong type or fail to load.
+///
+/// Anything starting with an ASCII digit, `+`, or `.` is quoted too: that is
+/// how a YAML 1.1/1.2 resolver comes to read a plain scalar as a number or
+/// timestamp (`+1.5555550100` → float, `292` → int, `0123` → octal, `1:20` →
+/// sexagesimal, `2024-01-15` → date, `.inf`/`.nan` → float). Only JSON
+/// *strings* reach this function (numbers are emitted unquoted by
+/// `format_as_yaml`), so such a value must stay a string. The rule
+/// over-quotes some harmless values (e.g. IPv4 addresses), which is cheap and
+/// keeps it auditable.
 fn yaml_needs_quoting(s: &str) -> bool {
     if s.is_empty() || s != s.trim() {
         return true;
     }
-    if s.chars().any(|c| c.is_control()) {
+    if s.chars()
+        .any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}'))
+    {
         return true;
     }
     if matches!(
         s.to_ascii_lowercase().as_str(),
-        "null" | "~" | "true" | "false" | "yes" | "no" | "on" | "off"
+        "null" | "~" | "true" | "false" | "yes" | "no" | "y" | "n" | "on" | "off" | "=" | "<<"
     ) {
         return true;
     }
-    // A leading YAML indicator char makes the whole scalar non-plain.
     if let Some(first) = s.chars().next() {
+        // A leading YAML indicator char makes the whole scalar non-plain.
         if "-?:,[]{}#&*!|>'\"%@`".contains(first) {
+            return true;
+        }
+        // Possible number / timestamp / special float (see doc comment).
+        if first.is_ascii_digit() || first == '+' || first == '.' {
             return true;
         }
     }
     s.contains(": ") || s.ends_with(':') || s.contains(" #")
 }
 
-/// Emits `s` as a YAML double-quoted scalar, escaping `"`, `\`, and control
-/// characters (so attacker ANSI/control bytes can't reach the terminal or
-/// break the document).
+/// Emits `s` as a YAML double-quoted scalar, escaping `"`, `\`, control
+/// characters, and the YAML line-break characters (so attacker ANSI/control
+/// bytes can't reach the terminal or break the document).
 fn yaml_quote(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
@@ -225,6 +258,11 @@ fn yaml_quote(s: &str) -> String {
             '\t' => out.push_str("\\t"),
             '\r' => out.push_str("\\r"),
             '\0' => out.push_str("\\0"),
+            // YAML line breaks: next line (a C1 control, so it must precede
+            // the generic arm below), line separator, paragraph separator.
+            '\u{0085}' => out.push_str("\\N"),
+            '\u{2028}' => out.push_str("\\L"),
+            '\u{2029}' => out.push_str("\\P"),
             // C0/C1 controls + DEL → YAML \xXX escape (all <= 0x9F, two digits).
             c if c.is_control() => out.push_str(&format!("\\x{:02x}", c as u32)),
             c => out.push(c),
@@ -326,6 +364,21 @@ mod tests {
     }
 
     #[test]
+    fn days_between_floors_instead_of_truncating() {
+        let now: DateTime<Utc> = "2026-01-10T12:00:00Z".parse().unwrap();
+        let h = chrono::Duration::hours;
+        // 5h in the past is already expired (-1), not "0 days" left.
+        assert_eq!(days_between(now, now - h(5)), -1);
+        // 5h in the future is still today.
+        assert_eq!(days_between(now, now + h(5)), 0);
+        assert_eq!(days_between(now, now), 0);
+        assert_eq!(days_between(now, now - chrono::Duration::seconds(1)), -1);
+        assert_eq!(days_between(now, now + h(24)), 1);
+        assert_eq!(days_between(now, now - h(24)), -1);
+        assert_eq!(days_between(now, now - h(25)), -2);
+    }
+
+    #[test]
     fn test_output_format_default() {
         assert_eq!(OutputFormat::default(), OutputFormat::Human);
     }
@@ -411,6 +464,52 @@ mod tests {
         assert_eq!(y("plain-value"), "plain-value");
         assert_eq!(y("has internal spaces"), "has internal spaces");
         assert_eq!(y("ns1.example.com"), "ns1.example.com");
+    }
+
+    #[test]
+    fn yaml_quotes_strings_a_resolver_would_read_as_non_strings() {
+        use serde_json::json;
+        let y = |s: &str| format_as_yaml(&json!(s), 0);
+
+        for s in [
+            "+1.5555550100",        // WHOIS phone → float 1.55555501
+            "292",                  // registrar IANA id string → int
+            "0123",                 // YAML 1.1 octal → 83
+            "1:20",                 // YAML 1.1 sexagesimal → 80
+            "2024-01-15",           // date
+            "2024-01-15T04:00:00Z", // RFC 3339 timestamp → datetime
+            ".inf",
+            ".NaN",
+            "=",  // YAML 1.1 value key: PyYAML raises ConstructorError
+            "<<", // merge key: PyYAML raises ConstructorError
+            "y",  // YAML 1.1 single-letter bools, any case
+            "N",
+        ] {
+            assert_eq!(y(s), format!("\"{s}\""), "must quote {s:?}");
+        }
+
+        // Hostnames and words stay plain; real JSON numbers are never quoted.
+        assert_eq!(y("ns1.example.com"), "ns1.example.com");
+        assert_eq!(y("yes-but-longer"), "yes-but-longer");
+        assert_eq!(y("a=b"), "a=b");
+        assert_eq!(format_as_yaml(&json!(292), 0), "292");
+        assert_eq!(format_as_yaml(&json!(1.5), 0), "1.5");
+    }
+
+    #[test]
+    fn yaml_escapes_unicode_line_breaks() {
+        use serde_json::json;
+        // U+2028/U+2029 aren't `char::is_control`, so they used to be emitted
+        // raw — and a raw one (or U+0085) makes the whole document fail to
+        // parse. They must be quoted and escaped with YAML's \L / \P / \N, in
+        // values and in keys alike.
+        let y = |s: &str| format_as_yaml(&json!(s), 0);
+        assert_eq!(y("a\u{2028}b"), "\"a\\Lb\"");
+        assert_eq!(y("a\u{2029}b"), "\"a\\Pb\"");
+        assert_eq!(y("a\u{0085}b"), "\"a\\Nb\"");
+
+        let doc = format_as_yaml(&json!({ "k\u{2028}ey": "v" }), 0);
+        assert_eq!(doc, "\"k\\Ley\": v");
     }
 
     #[test]

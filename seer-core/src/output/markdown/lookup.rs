@@ -32,22 +32,11 @@ impl MarkdownFormatter {
                     output.push(format!("- **Organization**: {}", MdSafe(&organization)));
                 }
 
-                // Contact sections from RDAP
-                if let Some(contact) = data.get_registrant_contact() {
-                    self.format_rdap_contact(&mut output, "Registrant Contact", &contact);
-                }
-                if let Some(contact) = data.get_admin_contact() {
-                    self.format_rdap_contact(&mut output, "Admin Contact", &contact);
-                }
-                if let Some(contact) = data.get_tech_contact() {
-                    self.format_rdap_contact(&mut output, "Tech Contact", &contact);
-                }
-
                 if let Some(created) = data.creation_date() {
                     output.push(format!("- **Created**: `{}`", created.format("%Y-%m-%d")));
                 }
                 if let Some(expires) = data.expiration_date() {
-                    let days_until = (expires - chrono::Utc::now()).num_days();
+                    let days_until = days_until(expires);
                     output.push(format!(
                         "- **Expires**: `{}` ({} days)",
                         expires.format("%Y-%m-%d"),
@@ -82,9 +71,23 @@ impl MarkdownFormatter {
                     output.push("- **DNSSEC**: signed".to_string());
                 }
 
-                // WHOIS fallback data
+                // Contact sections from RDAP — after every domain-level
+                // bullet, since a `###` heading scopes everything below it.
+                if let Some(contact) = data.get_registrant_contact() {
+                    self.format_rdap_contact(&mut output, "Registrant Contact", &contact);
+                }
+                if let Some(contact) = data.get_admin_contact() {
+                    self.format_rdap_contact(&mut output, "Admin Contact", &contact);
+                }
+                if let Some(contact) = data.get_tech_contact() {
+                    self.format_rdap_contact(&mut output, "Tech Contact", &contact);
+                }
+
+                // WHOIS fallback data: bullets first, then any fallback
+                // contact sections (same heading-scope rule as above).
                 if let Some(whois) = whois_fallback {
                     let mut extra = Vec::new();
+                    let mut contacts = Vec::new();
 
                     if data.get_registrant().is_none() {
                         if let Some(ref registrant) = whois.registrant {
@@ -108,20 +111,20 @@ impl MarkdownFormatter {
                             || whois.registrant_address.is_some()
                             || whois.registrant_country.is_some();
                         if has_whois_contact {
-                            extra.push(String::new());
-                            extra.push("### Registrant Contact".to_string());
-                            extra.push(String::new());
+                            contacts.push(String::new());
+                            contacts.push("### Registrant Contact".to_string());
+                            contacts.push(String::new());
                             if let Some(ref email) = whois.registrant_email {
-                                extra.push(format!("- **Email**: `{}`", MdSafe(email)));
+                                contacts.push(format!("- **Email**: `{}`", MdSafe(email)));
                             }
                             if let Some(ref phone) = whois.registrant_phone {
-                                extra.push(format!("- **Phone**: {}", MdSafe(phone)));
+                                contacts.push(format!("- **Phone**: {}", MdSafe(phone)));
                             }
                             if let Some(ref address) = whois.registrant_address {
-                                extra.push(format!("- **Address**: {}", MdSafe(address)));
+                                contacts.push(format!("- **Address**: {}", MdSafe(address)));
                             }
                             if let Some(ref country) = whois.registrant_country {
-                                extra.push(format!("- **Country**: {}", MdSafe(country)));
+                                contacts.push(format!("- **Country**: {}", MdSafe(country)));
                             }
                         }
                     }
@@ -133,20 +136,20 @@ impl MarkdownFormatter {
                             || whois.admin_email.is_some()
                             || whois.admin_phone.is_some();
                         if has_whois_admin {
-                            extra.push(String::new());
-                            extra.push("### Admin Contact".to_string());
-                            extra.push(String::new());
+                            contacts.push(String::new());
+                            contacts.push("### Admin Contact".to_string());
+                            contacts.push(String::new());
                             if let Some(ref name) = whois.admin_name {
-                                extra.push(format!("- **Name**: {}", MdSafe(name)));
+                                contacts.push(format!("- **Name**: {}", MdSafe(name)));
                             }
                             if let Some(ref org) = whois.admin_organization {
-                                extra.push(format!("- **Organization**: {}", MdSafe(org)));
+                                contacts.push(format!("- **Organization**: {}", MdSafe(org)));
                             }
                             if let Some(ref email) = whois.admin_email {
-                                extra.push(format!("- **Email**: `{}`", MdSafe(email)));
+                                contacts.push(format!("- **Email**: `{}`", MdSafe(email)));
                             }
                             if let Some(ref phone) = whois.admin_phone {
-                                extra.push(format!("- **Phone**: {}", MdSafe(phone)));
+                                contacts.push(format!("- **Phone**: {}", MdSafe(phone)));
                             }
                         }
                     }
@@ -158,20 +161,20 @@ impl MarkdownFormatter {
                             || whois.tech_email.is_some()
                             || whois.tech_phone.is_some();
                         if has_whois_tech {
-                            extra.push(String::new());
-                            extra.push("### Tech Contact".to_string());
-                            extra.push(String::new());
+                            contacts.push(String::new());
+                            contacts.push("### Tech Contact".to_string());
+                            contacts.push(String::new());
                             if let Some(ref name) = whois.tech_name {
-                                extra.push(format!("- **Name**: {}", MdSafe(name)));
+                                contacts.push(format!("- **Name**: {}", MdSafe(name)));
                             }
                             if let Some(ref org) = whois.tech_organization {
-                                extra.push(format!("- **Organization**: {}", MdSafe(org)));
+                                contacts.push(format!("- **Organization**: {}", MdSafe(org)));
                             }
                             if let Some(ref email) = whois.tech_email {
-                                extra.push(format!("- **Email**: `{}`", MdSafe(email)));
+                                contacts.push(format!("- **Email**: `{}`", MdSafe(email)));
                             }
                             if let Some(ref phone) = whois.tech_phone {
-                                extra.push(format!("- **Phone**: {}", MdSafe(phone)));
+                                contacts.push(format!("- **Phone**: {}", MdSafe(phone)));
                             }
                         }
                     }
@@ -193,11 +196,12 @@ impl MarkdownFormatter {
                         ));
                     }
 
-                    if !extra.is_empty() {
+                    if !extra.is_empty() || !contacts.is_empty() {
                         output.push(String::new());
                         output.push("### Additional WHOIS Data".to_string());
                         output.push(String::new());
                         output.extend(extra);
+                        output.extend(contacts);
                     }
                 }
             }
@@ -218,55 +222,11 @@ impl MarkdownFormatter {
                     output.push(format!("- **Organization**: {}", MdSafe(organization)));
                 }
 
-                // Registrant contact details
-                let has_registrant_details = data.registrant_email.is_some()
-                    || data.registrant_phone.is_some()
-                    || data.registrant_address.is_some()
-                    || data.registrant_country.is_some();
-
-                if has_registrant_details {
-                    output.push(String::new());
-                    output.push("### Registrant Contact".to_string());
-                    output.push(String::new());
-                    if let Some(ref email) = data.registrant_email {
-                        output.push(format!("- **Email**: `{}`", MdSafe(email)));
-                    }
-                    if let Some(ref phone) = data.registrant_phone {
-                        output.push(format!("- **Phone**: {}", MdSafe(phone)));
-                    }
-                    if let Some(ref address) = data.registrant_address {
-                        output.push(format!("- **Address**: {}", MdSafe(address)));
-                    }
-                    if let Some(ref country) = data.registrant_country {
-                        output.push(format!("- **Country**: {}", MdSafe(country)));
-                    }
-                }
-
-                // Admin contact
-                self.format_whois_contact(
-                    &mut output,
-                    "Admin Contact",
-                    &data.admin_name,
-                    &data.admin_organization,
-                    &data.admin_email,
-                    &data.admin_phone,
-                );
-
-                // Tech contact
-                self.format_whois_contact(
-                    &mut output,
-                    "Tech Contact",
-                    &data.tech_name,
-                    &data.tech_organization,
-                    &data.tech_email,
-                    &data.tech_phone,
-                );
-
                 if let Some(created) = data.creation_date {
                     output.push(format!("- **Created**: `{}`", created.format("%Y-%m-%d")));
                 }
                 if let Some(expires) = data.expiration_date {
-                    let days_until = (expires - chrono::Utc::now()).num_days();
+                    let days_until = days_until(expires);
                     output.push(format!(
                         "- **Expires**: `{}` ({} days)",
                         expires.format("%Y-%m-%d"),
@@ -299,6 +259,9 @@ impl MarkdownFormatter {
                 if let Some(ref dnssec) = data.dnssec {
                     output.push(format!("- **DNSSEC**: {}", MdSafe(dnssec)));
                 }
+
+                // Contact subsections last, after every domain-level bullet.
+                self.format_whois_contacts(&mut output, data);
             }
             LookupResult::Available {
                 data,
@@ -447,5 +410,98 @@ mod tests {
             "must not render AVAILABLE for a registered domain:\n{}",
             out
         );
+    }
+
+    /// Asserts every `fields` bullet appears in `out` before `heading`.
+    fn assert_fields_before(out: &str, heading: &str, fields: &[&str]) {
+        let heading_at = out
+            .find(heading)
+            .unwrap_or_else(|| panic!("{heading:?} missing:\n{out}"));
+        for field in fields {
+            let at = out
+                .find(field)
+                .unwrap_or_else(|| panic!("{field:?} missing:\n{out}"));
+            assert!(
+                at < heading_at,
+                "{field:?} rendered under {heading:?}:\n{out}"
+            );
+        }
+    }
+
+    fn whois_with_contacts() -> WhoisResponse {
+        WhoisResponse::parse(
+            "example.com",
+            "whois.test",
+            "Registrar: Mock Registrar\n\
+             Creation Date: 2010-03-15T04:00:00Z\n\
+             Updated Date: 2024-02-01T09:30:00Z\n\
+             Registry Expiry Date: 2099-03-15T04:00:00Z\n\
+             Registrant Country: US\n\
+             Admin Name: Jane Admin\n\
+             Name Server: ns1.example.com\n\
+             Domain Status: ok\n\
+             DNSSEC: unsigned\n",
+        )
+    }
+
+    #[test]
+    fn format_lookup_whois_domain_fields_precede_contact_sections() {
+        // Contact `###` subsections were emitted before the domain-level
+        // bullets, which then rendered as part of the last contact section.
+        let result = LookupResult::Whois {
+            data: whois_with_contacts(),
+            rdap_error: None,
+            rdap_fallback: None,
+        };
+        let out = MarkdownFormatter::new().format_lookup(&result);
+        assert_fields_before(
+            &out,
+            "\n###",
+            &[
+                "- **Created**",
+                "- **Expires**",
+                "- **Status**",
+                "- **Nameservers**",
+                "- **DNSSEC**",
+            ],
+        );
+        assert!(out.contains("### Registrant Contact"), "got:\n{out}");
+        assert!(out.contains("### Admin Contact"), "got:\n{out}");
+    }
+
+    #[test]
+    fn format_lookup_rdap_fallback_bullets_precede_contact_sections() {
+        let rdap: RdapResponse = serde_json::from_value(serde_json::json!({
+            "ldhName": "example.com",
+            "status": ["active"],
+            "events": [
+                {"eventAction": "registration", "eventDate": "2010-03-15T04:00:00Z"}
+            ],
+            "entities": [{
+                "objectClassName": "entity",
+                "handle": "TECH-1",
+                "roles": ["technical"],
+                "vcardArray": ["vcard", [["email", {}, "text", "tech@example.com"]]]
+            }]
+        }))
+        .unwrap();
+        let result = LookupResult::Rdap {
+            data: Box::new(rdap),
+            whois_fallback: Some(whois_with_contacts()),
+        };
+        let out = MarkdownFormatter::new().format_lookup(&result);
+        // RDAP domain bullets precede the RDAP contact section...
+        assert_fields_before(&out, "### Tech Contact", &["- **Created**", "- **Status**"]);
+        // ...and the WHOIS fallback bullets precede the fallback contacts.
+        assert_fields_before(
+            &out,
+            "### Registrant Contact",
+            &[
+                "### Additional WHOIS Data",
+                "- **Updated**",
+                "- **WHOIS Server**",
+            ],
+        );
+        assert!(out.contains("### Admin Contact"), "fallback admin:\n{out}");
     }
 }

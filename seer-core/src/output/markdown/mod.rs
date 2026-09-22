@@ -3,6 +3,7 @@ use std::fmt::{self, Write as _};
 use super::OutputFormatter;
 
 // Shared with the per-concern submodules below (each does `use super::*`).
+pub(super) use super::days_until;
 pub(super) use super::grouping::render_grouped;
 pub(super) use crate::caa::{CaaPolicy, IssuerCaaMatch};
 pub(super) use crate::dns::{DnsRecord, FollowIteration, FollowResult, PropagationResult};
@@ -28,8 +29,12 @@ mod whois;
 /// characters, collapses newlines/CR/tabs to spaces (so attacker text
 /// cannot break out of a table row or look like a new heading), neutralizes
 /// backticks (so an attacker can't terminate a code span and inject Markdown
-/// structure), and escapes the table-cell delimiter `|` (so a value can't add
-/// columns or break out of a cell).
+/// structure), escapes the table-cell delimiter `|` (so a value can't add
+/// columns or break out of a cell), and backslash-escapes `[`, `]`, `<`, `>`
+/// (so a value can't render as a live link, image, autolink, or raw HTML —
+/// e.g. a registrar of `![x](https://attacker.example/p.png)`). `(`/`)` are
+/// left alone: without a `]` before them they carry no link syntax, and
+/// escaping them would add noise to ordinary text.
 pub(super) struct MdSafe<'a>(pub &'a str);
 
 impl fmt::Display for MdSafe<'_> {
@@ -45,6 +50,12 @@ impl fmt::Display for MdSafe<'_> {
                 // backtick, escape the code-span defense). Backslash-pipe is the
                 // spec escape and renders as a literal `|` in and out of tables.
                 '|' => f.write_str("\\|")?,
+                // Link/image brackets and HTML/autolink angle brackets. A
+                // backslash-escaped ASCII punctuation char renders literally.
+                '[' | ']' | '<' | '>' => {
+                    f.write_char('\\')?;
+                    f.write_char(c)?;
+                }
                 c if c.is_control() => {}
                 c => f.write_char(c)?,
             }
@@ -247,6 +258,54 @@ impl MarkdownFormatter {
             output.push(format!("- **Phone**: {}", MdSafe(v)));
         }
     }
+
+    /// Emits the registrant/admin/tech contact subsections of a WHOIS
+    /// response.
+    ///
+    /// Callers must push these (like the RDAP contact sections) only *after*
+    /// every domain-level bullet: a `###` heading scopes everything below it,
+    /// so a Created/Expires/Nameservers bullet emitted after a contact section
+    /// renders as part of that contact.
+    fn format_whois_contacts(&self, output: &mut Vec<String>, w: &WhoisResponse) {
+        let has_registrant_details = w.registrant_email.is_some()
+            || w.registrant_phone.is_some()
+            || w.registrant_address.is_some()
+            || w.registrant_country.is_some();
+        if has_registrant_details {
+            output.push(String::new());
+            output.push("### Registrant Contact".to_string());
+            output.push(String::new());
+            if let Some(ref email) = w.registrant_email {
+                output.push(format!("- **Email**: `{}`", MdSafe(email)));
+            }
+            if let Some(ref phone) = w.registrant_phone {
+                output.push(format!("- **Phone**: {}", MdSafe(phone)));
+            }
+            if let Some(ref address) = w.registrant_address {
+                output.push(format!("- **Address**: {}", MdSafe(address)));
+            }
+            if let Some(ref country) = w.registrant_country {
+                output.push(format!("- **Country**: {}", MdSafe(country)));
+            }
+        }
+
+        self.format_whois_contact(
+            output,
+            "Admin Contact",
+            &w.admin_name,
+            &w.admin_organization,
+            &w.admin_email,
+            &w.admin_phone,
+        );
+        self.format_whois_contact(
+            output,
+            "Tech Contact",
+            &w.tech_name,
+            &w.tech_organization,
+            &w.tech_email,
+            &w.tech_phone,
+        );
+    }
 }
 
 // Thin dispatch layer: each trait method forwards to the inherent
@@ -420,6 +479,28 @@ mod tests {
         // After dropping a lone ESC, a following structural `|` must still be
         // escaped — the ANSI handling must not bypass the table-cell defense.
         assert_eq!(md("\x1b|col"), "\\|col");
+    }
+
+    #[test]
+    fn test_mdsafe_neutralizes_links_images_and_html() {
+        // Attacker-controlled WHOIS/RDAP text must not render as a live image
+        // (tracking pixel), link (phishing), autolink, or raw HTML in markdown
+        // forwarded to an LLM via MCP.
+        assert_eq!(
+            md("![x](https://attacker.example/p.png)"),
+            "!\\[x\\](https://attacker.example/p.png)"
+        );
+        assert_eq!(
+            md("[Verify](https://phish.example)"),
+            "\\[Verify\\](https://phish.example)"
+        );
+        assert_eq!(
+            md("<img src=https://attacker.example/p.png>"),
+            "\\<img src=https://attacker.example/p.png\\>"
+        );
+        assert_eq!(md("<https://phish.example>"), "\\<https://phish.example\\>");
+        // Parentheses alone carry no link syntax and stay unescaped.
+        assert_eq!(md("Example (Holdings) LLC"), "Example (Holdings) LLC");
     }
 
     #[test]

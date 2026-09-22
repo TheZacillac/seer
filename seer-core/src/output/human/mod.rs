@@ -5,6 +5,7 @@ use regex::Regex;
 use super::OutputFormatter;
 
 // Shared with the per-concern submodules below (each does `use super::*`).
+pub(super) use super::days_until;
 pub(super) use super::grouping::render_grouped;
 pub(super) use crate::caa::{CaaPolicy, IssuerCaaMatch};
 pub(super) use crate::colors::CatppuccinExt;

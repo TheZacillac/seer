@@ -1,16 +1,12 @@
 ---
 source: seer-core/tests/format_snapshots.rs
-assertion_line: 143
+assertion_line: 219
 expression: markdown().format_whois(&fixture_whois())
 ---
 ## WHOIS: example.com
 
 - **Registrar**: Mock Registrar Inc.
 - **Organization**: Example Holdings LLC
-
-### Registrant Contact
-
-- **Country**: US
 - **Created**: `2010-03-15`
 - **Expires**: `2099-03-15` ([N] days)
 - **Updated**: `2024-02-01`
@@ -18,3 +14,7 @@ expression: markdown().format_whois(&fixture_whois())
 - **Status**: `clientTransferProhibited`
 - **DNSSEC**: signedDelegation
 - **WHOIS Server**: `whois.verisign-grs.com`
+
+### Registrant Contact
+
+- **Country**: US

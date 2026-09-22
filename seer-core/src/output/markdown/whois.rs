@@ -22,55 +22,11 @@ impl MarkdownFormatter {
             output.push(format!("- **Organization**: {}", MdSafe(organization)));
         }
 
-        // Registrant contact details
-        let has_registrant_details = response.registrant_email.is_some()
-            || response.registrant_phone.is_some()
-            || response.registrant_address.is_some()
-            || response.registrant_country.is_some();
-
-        if has_registrant_details {
-            output.push(String::new());
-            output.push("### Registrant Contact".to_string());
-            output.push(String::new());
-            if let Some(ref email) = response.registrant_email {
-                output.push(format!("- **Email**: `{}`", MdSafe(email)));
-            }
-            if let Some(ref phone) = response.registrant_phone {
-                output.push(format!("- **Phone**: {}", MdSafe(phone)));
-            }
-            if let Some(ref address) = response.registrant_address {
-                output.push(format!("- **Address**: {}", MdSafe(address)));
-            }
-            if let Some(ref country) = response.registrant_country {
-                output.push(format!("- **Country**: {}", MdSafe(country)));
-            }
-        }
-
-        // Admin contact
-        self.format_whois_contact(
-            &mut output,
-            "Admin Contact",
-            &response.admin_name,
-            &response.admin_organization,
-            &response.admin_email,
-            &response.admin_phone,
-        );
-
-        // Tech contact
-        self.format_whois_contact(
-            &mut output,
-            "Tech Contact",
-            &response.tech_name,
-            &response.tech_organization,
-            &response.tech_email,
-            &response.tech_phone,
-        );
-
         if let Some(created) = response.creation_date {
             output.push(format!("- **Created**: `{}`", created.format("%Y-%m-%d")));
         }
         if let Some(expires) = response.expiration_date {
-            let days_until = (expires - chrono::Utc::now()).num_days();
+            let days_until = days_until(expires);
             output.push(format!(
                 "- **Expires**: `{}` ({} days)",
                 expires.format("%Y-%m-%d"),
@@ -113,6 +69,10 @@ impl MarkdownFormatter {
             "- **WHOIS Server**: `{}`",
             MdSafe(&response.whois_server)
         ));
+
+        // Contact subsections last, so no domain-level field lands under a
+        // contact heading.
+        self.format_whois_contacts(&mut output, response);
 
         output.join("\n")
     }
@@ -173,5 +133,55 @@ mod tests {
                 output
             );
         }
+    }
+
+    #[test]
+    fn test_markdown_whois_domain_fields_precede_contact_sections() {
+        // Contact `###` subsections were emitted before Created/Expires/
+        // Nameservers/Status/DNSSEC/WHOIS Server with no heading in between,
+        // so those domain-level fields rendered as part of the last contact.
+        let w = WhoisResponse::parse(
+            "example.com",
+            "whois.test",
+            "Registrar: Mock Registrar\n\
+             Creation Date: 2010-03-15T04:00:00Z\n\
+             Registry Expiry Date: 2099-03-15T04:00:00Z\n\
+             Registrant Country: US\n\
+             Admin Name: Jane Admin\n\
+             Tech Email: tech@example.com\n\
+             Name Server: ns1.example.com\n\
+             Domain Status: ok\n\
+             DNSSEC: unsigned\n",
+        );
+        let out = MarkdownFormatter::new().format_whois(&w);
+        let first_heading = out.find("\n###").expect("contact sections rendered");
+        for field in [
+            "- **Registrar**",
+            "- **Created**",
+            "- **Expires**",
+            "- **Nameservers**",
+            "- **Status**",
+            "- **DNSSEC**",
+            "- **WHOIS Server**",
+        ] {
+            let at = out
+                .find(field)
+                .unwrap_or_else(|| panic!("{field} missing:\n{out}"));
+            assert!(
+                at < first_heading,
+                "{field} rendered under a contact heading:\n{out}"
+            );
+        }
+        for heading in [
+            "### Registrant Contact",
+            "### Admin Contact",
+            "### Tech Contact",
+        ] {
+            assert!(out.contains(heading), "{heading} missing:\n{out}");
+        }
+        assert!(
+            out.contains("- **Country**: US"),
+            "contact field kept:\n{out}"
+        );
     }
 }

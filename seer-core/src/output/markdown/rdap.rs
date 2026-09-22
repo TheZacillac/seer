@@ -24,25 +24,11 @@ impl MarkdownFormatter {
             output.push(format!("- **Organization**: {}", MdSafe(&organization)));
         }
 
-        // Contact sections
-        if let Some(contact) = response.get_registrant_contact() {
-            self.format_rdap_contact(&mut output, "Registrant Contact", &contact);
-        }
-        if let Some(contact) = response.get_admin_contact() {
-            self.format_rdap_contact(&mut output, "Admin Contact", &contact);
-        }
-        if let Some(contact) = response.get_tech_contact() {
-            self.format_rdap_contact(&mut output, "Tech Contact", &contact);
-        }
-        if let Some(contact) = response.get_billing_contact() {
-            self.format_rdap_contact(&mut output, "Billing Contact", &contact);
-        }
-
         if let Some(created) = response.creation_date() {
             output.push(format!("- **Created**: `{}`", created.format("%Y-%m-%d")));
         }
         if let Some(expires) = response.expiration_date() {
-            let days_until = (expires - chrono::Utc::now()).num_days();
+            let days_until = days_until(expires);
             output.push(format!(
                 "- **Expires**: `{}` ({} days)",
                 expires.format("%Y-%m-%d"),
@@ -101,6 +87,21 @@ impl MarkdownFormatter {
             ));
         }
 
+        // Contact sections last: each `###` heading scopes everything below
+        // it, so no domain-level field may follow one.
+        if let Some(contact) = response.get_registrant_contact() {
+            self.format_rdap_contact(&mut output, "Registrant Contact", &contact);
+        }
+        if let Some(contact) = response.get_admin_contact() {
+            self.format_rdap_contact(&mut output, "Admin Contact", &contact);
+        }
+        if let Some(contact) = response.get_tech_contact() {
+            self.format_rdap_contact(&mut output, "Tech Contact", &contact);
+        }
+        if let Some(contact) = response.get_billing_contact() {
+            self.format_rdap_contact(&mut output, "Billing Contact", &contact);
+        }
+
         output.join("\n")
     }
 }
@@ -142,5 +143,46 @@ mod tests {
             "raw backticks survived into output:\n{}",
             output
         );
+    }
+
+    #[test]
+    fn test_markdown_rdap_domain_fields_precede_contact_sections() {
+        // Contact `###` subsections used to precede Created/Expires/Status/
+        // Nameservers, so those rendered as part of the last contact section.
+        let json = serde_json::json!({
+            "ldhName": "example.com",
+            "status": ["active"],
+            "events": [
+                {"eventAction": "registration", "eventDate": "2010-03-15T04:00:00Z"},
+                {"eventAction": "expiration", "eventDate": "2099-03-15T04:00:00Z"}
+            ],
+            "nameservers": [{"objectClassName": "nameserver", "ldhName": "ns1.example.com"}],
+            "entities": [{
+                "objectClassName": "entity",
+                "handle": "TECH-1",
+                "roles": ["technical"],
+                "vcardArray": ["vcard", [
+                    ["fn", {}, "text", "Tech Person"],
+                    ["email", {}, "text", "tech@example.com"]
+                ]]
+            }]
+        });
+        let response: RdapResponse = serde_json::from_value(json).unwrap();
+        let out = MarkdownFormatter::new().format_rdap(&response);
+        let heading = out
+            .find("### Tech Contact")
+            .unwrap_or_else(|| panic!("tech contact missing:\n{out}"));
+        for field in [
+            "- **Created**",
+            "- **Expires**",
+            "- **Status**",
+            "- **Nameservers**",
+        ] {
+            let at = out
+                .find(field)
+                .unwrap_or_else(|| panic!("{field} missing:\n{out}"));
+            assert!(at < heading, "{field} rendered under a contact:\n{out}");
+        }
+        assert!(out.contains("tech@example.com"), "contact kept:\n{out}");
     }
 }
