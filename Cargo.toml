@@ -99,6 +99,10 @@ toml = "1.1"
 # IDN support
 idna = "1"
 
+# Public Suffix List (registrable-domain detection for confusables and
+# availability). The list is compiled into the crate, so no runtime fetch.
+psl = "2"
+
 # Test-only: deterministic HTTP mocking and snapshot assertions
 wiremock = "0.6"
 insta = { version = "1", features = ["filters"] }

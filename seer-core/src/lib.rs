@@ -21,6 +21,7 @@ pub mod lookup;
 pub mod net;
 pub mod output;
 pub mod posture;
+mod psl;
 pub mod rdap;
 pub mod retry;
 pub mod ssl;
