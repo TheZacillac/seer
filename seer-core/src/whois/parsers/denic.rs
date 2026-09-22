@@ -35,6 +35,10 @@ static HOLDER_PATTERN: Lazy<Regex> =
 static HOLDER_NAME_PATTERN: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?i)^Name:\s*(.+)$").expect("Invalid DENIC holder name regex"));
 
+static HOLDER_COUNTRY_PATTERN: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)^CountryCode:\s*([A-Za-z]{2})$").expect("Invalid DENIC holder country regex")
+});
+
 static DNSKEY_PATTERN: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?i)^Dnskey:\s*(.+)$").expect("Invalid DENIC dnskey regex"));
 
@@ -81,6 +85,7 @@ impl RegistryParser for DenicParser {
         let mut status = Vec::new();
         let mut updated_date = None;
         let mut holder_name = None;
+        let mut holder_country = None;
         let mut in_holder_section = false;
         let mut dnssec = None;
 
@@ -93,17 +98,19 @@ impl RegistryParser for DenicParser {
                 continue;
             }
 
-            // Parse holder name within holder section
+            // Parse holder name / country within the holder section, which
+            // ends at an empty line or the next `[Section]` header.
             if in_holder_section {
-                if let Some(caps) = HOLDER_NAME_PATTERN.captures(line) {
-                    if let Some(m) = caps.get(1) {
-                        holder_name = Some(m.as_str().trim().to_string());
-                        in_holder_section = false;
-                    }
-                }
-                // Empty line ends the section
-                if line.is_empty() {
+                if line.is_empty() || line.starts_with('[') {
                     in_holder_section = false;
+                } else if let Some(caps) = HOLDER_NAME_PATTERN.captures(line) {
+                    if holder_name.is_none() {
+                        holder_name = caps.get(1).map(|m| m.as_str().trim().to_string());
+                    }
+                } else if let Some(caps) = HOLDER_COUNTRY_PATTERN.captures(line) {
+                    if holder_country.is_none() {
+                        holder_country = caps.get(1).map(|m| m.as_str().to_ascii_uppercase());
+                    }
                 }
             }
 
@@ -164,7 +171,9 @@ impl RegistryParser for DenicParser {
             registrant_email: None,
             registrant_phone: None,
             registrant_address: None,
-            registrant_country: Some("DE".to_string()),
+            // Only what the [Holder] block states: .de accepts holders outside
+            // Germany, and a "free" body must not report a registrant country.
+            registrant_country: holder_country,
             admin_name: None,
             admin_organization: None,
             admin_email: None,
@@ -279,6 +288,36 @@ Changed: 2023-01-15T10:30:00+01:00
             "expected a delegation-failure label, got {:?}",
             result.status
         );
+    }
+
+    /// The registrant country comes from the `[Holder]` block's
+    /// `CountryCode:` — never from the TLD: .de accepts holders outside
+    /// Germany, and an unregistered domain must not report `DE`.
+    #[test]
+    fn test_denic_registrant_country_not_hardcoded() {
+        let parser = DenicParser::new();
+        let result = parser.parse("example.de", "whois.denic.de", SAMPLE_DENIC_RESPONSE);
+        assert_eq!(result.registrant_country.as_deref(), Some("DE"));
+        assert_eq!(result.registrant.as_deref(), Some("Max Mustermann"));
+
+        let austrian = SAMPLE_DENIC_RESPONSE.replace("CountryCode: DE", "CountryCode: AT");
+        let result = parser.parse("example.de", "whois.denic.de", &austrian);
+        assert_eq!(result.registrant_country.as_deref(), Some("AT"));
+
+        // Current DENIC output publishes no [Holder] block at all.
+        let result = parser.parse(
+            "example.de",
+            "whois.denic.de",
+            "Domain: example.de\nNserver: ns1.example.de\nStatus: connect\n",
+        );
+        assert_eq!(result.registrant_country, None);
+
+        let result = parser.parse(
+            "nosuch-xyz.de",
+            "whois.denic.de",
+            "Domain: nosuch-xyz.de\nStatus: free\n",
+        );
+        assert_eq!(result.registrant_country, None);
     }
 
     #[test]

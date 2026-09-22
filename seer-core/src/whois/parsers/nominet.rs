@@ -273,7 +273,9 @@ impl RegistryParser for NominetParser {
             registrant_email: None,
             registrant_phone: None,
             registrant_address: None,
-            registrant_country: Some("GB".to_string()),
+            // Not inferred from the TLD: .uk accepts holders worldwide, and a
+            // "no match" body must not report a registrant country.
+            registrant_country: None,
             admin_name: None,
             admin_organization: None,
             admin_email: None,
@@ -437,12 +439,20 @@ DNSSEC:
         assert!(!is_redacted("Example Ltd"));
     }
 
+    /// .uk accepts holders worldwide, so the country is not inferred from the
+    /// TLD — and an unregistered domain must not print `Registrant Country: GB`.
     #[test]
     fn test_country_code() {
         let parser = NominetParser::new();
         let result = parser.parse("example.co.uk", "whois.nic.uk", SAMPLE_NOMINET_RESPONSE_2);
+        assert_eq!(result.registrant_country, None);
 
-        assert_eq!(result.registrant_country, Some("GB".to_string()));
+        let raw = "No match for \"nosuch-xyz.co.uk\".\n\n\
+                   This domain name has not been registered.\n\n\
+                   WHOIS lookup made at 10:04:07 22-Sep-2026\n";
+        let result = parser.parse("nosuch-xyz.co.uk", "whois.nic.uk", raw);
+        assert_eq!(result.registrant_country, None);
+        assert!(result.is_available());
     }
 
     #[test]

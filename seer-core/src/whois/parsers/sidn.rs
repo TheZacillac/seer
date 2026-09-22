@@ -187,7 +187,9 @@ impl RegistryParser for SidnParser {
             registrant_email: None,
             registrant_phone: None,
             registrant_address: None,
-            registrant_country: Some("NL".to_string()),
+            // Not inferred from the TLD: .nl accepts holders worldwide, and a
+            // "no match" body must not report a registrant country.
+            registrant_country: None,
             admin_name: None,
             admin_organization: None,
             admin_email: None,
@@ -297,12 +299,17 @@ Record maintained by: SIDN BV"#;
         assert_eq!(updated.day(), 7);
     }
 
+    /// .nl accepts holders worldwide and SIDN does not publish the
+    /// registrant, so no country is reported (not even for a free name).
     #[test]
     fn test_sidn_country() {
         let parser = SidnParser::new();
         let result = parser.parse("example.nl", "whois.sidn.nl", SAMPLE_SIDN_RESPONSE);
+        assert_eq!(result.registrant_country, None);
 
-        assert_eq!(result.registrant_country, Some("NL".to_string()));
+        let result = parser.parse("nosuch-xyz.nl", "whois.sidn.nl", "nosuch-xyz.nl is free\n");
+        assert_eq!(result.registrant_country, None);
+        assert!(result.is_available());
     }
 
     #[test]

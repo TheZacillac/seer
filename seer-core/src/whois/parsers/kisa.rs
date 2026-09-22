@@ -230,7 +230,9 @@ impl RegistryParser for KisaParser {
             registrant_email: None,
             registrant_phone: None,
             registrant_address: None,
-            registrant_country: Some("KR".to_string()),
+            // Not inferred from the TLD: KISA does not print the holder country, and a
+            // "no match" body must not report a registrant country.
+            registrant_country: None,
             admin_name,
             admin_organization: None,
             admin_email,
@@ -377,12 +379,19 @@ Secondary Name Server
         assert_eq!(result.dnssec, Some("unsigned".to_string()));
     }
 
+    /// KISA does not print the holder's country, so none is reported — in
+    /// particular not for an unregistered domain.
     #[test]
     fn test_kisa_country() {
         let parser = KisaParser::new();
         let result = parser.parse("google.kr", "whois.kr", SAMPLE_KISA_RESPONSE);
+        assert_eq!(result.registrant_country, None);
 
-        assert_eq!(result.registrant_country, Some("KR".to_string()));
+        let raw = "query : nosuch-xyz.kr\n\n\
+                   The requested domain was not found in the Registry or Registrar\u{2019}s WHOIS Server.\n";
+        let result = parser.parse("nosuch-xyz.kr", "whois.kr", raw);
+        assert_eq!(result.registrant_country, None);
+        assert!(result.is_available());
     }
 
     #[test]
