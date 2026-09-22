@@ -1,5 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -40,6 +41,25 @@ const BOOTSTRAP_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// expired-but-present or empty. Prevents a thundering herd of concurrent
 /// callers from all hammering IANA simultaneously during an outage.
 const BOOTSTRAP_REFRESH_MIN_INTERVAL: Duration = Duration::from_secs(60);
+
+/// TTL for a *partial* bootstrap load — one where some IANA registry file
+/// (say dns.json) failed while the others loaded. The failed section is
+/// carried over from the previous dataset (or left empty on a cold start),
+/// and the short TTL makes the next caller retry the gap within minutes
+/// instead of pinning it for [`BOOTSTRAP_TTL`]. Kept above
+/// [`BOOTSTRAP_REFRESH_MIN_INTERVAL`] so the throttle stays meaningful.
+const BOOTSTRAP_PARTIAL_TTL: Duration = Duration::from_secs(5 * 60);
+
+/// `Accept` header for RDAP queries. RFC 7480 §4.2 asks for
+/// `application/rdap+json`, but a few servers (rdap.nic.sn) answer 406 unless
+/// plain JSON is also acceptable, so it is offered at a lower preference.
+const RDAP_ACCEPT: &str = "application/rdap+json, application/json;q=0.9";
+
+/// Maximum HTTP redirect hops followed for one RDAP query. RFC 7480 §5.2
+/// uses redirects for cross-registry referral (ARIN → RIPE for an IP it
+/// doesn't hold, LACNIC → registro.br, a TLD's moved base URL); real chains
+/// are one hop, so three is ample while bounding a hostile server.
+const MAX_RDAP_REDIRECTS: usize = 3;
 
 /// Shared HTTP client for bootstrap fetches against IANA.
 /// The bootstrap targets are hardcoded data.iana.org URLs, so this client
@@ -90,22 +110,57 @@ static BOOTSTRAP_LAST_ATTEMPT: Lazy<RwLock<Option<Instant>>> = Lazy::new(|| RwLo
 /// bounded timeout, then re-check the cache.
 static BOOTSTRAP_LOAD_NOTIFY: Lazy<Notify> = Lazy::new(Notify::new);
 
+/// True while some task is running a bootstrap load. Lets a throttled
+/// cold-cache caller tell "a load is in flight — wait for its notify" apart
+/// from "the last load already finished (and failed) — nobody will notify",
+/// so it only blocks in the former case instead of sleeping the full bounded
+/// timeout for the rest of the throttle window.
+static BOOTSTRAP_LOAD_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+/// Marks a bootstrap load in flight for its lifetime. Dropping it — on
+/// completion *or* cancellation of the loading future — clears the flag and
+/// wakes every waiter, so a dropped winner can't leave losers hanging.
+struct BootstrapLoadGuard;
+
+impl BootstrapLoadGuard {
+    fn start() -> Self {
+        BOOTSTRAP_LOAD_IN_FLIGHT.store(true, Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for BootstrapLoadGuard {
+    fn drop(&mut self) {
+        BOOTSTRAP_LOAD_IN_FLIGHT.store(false, Ordering::SeqCst);
+        BOOTSTRAP_LOAD_NOTIFY.notify_waiters();
+    }
+}
+
 /// Cached bootstrap data with timestamp for TTL tracking
 struct CachedBootstrap {
     data: BootstrapData,
     loaded_at: Instant,
+    /// [`BOOTSTRAP_TTL`] for a complete load; [`BOOTSTRAP_PARTIAL_TTL`] when
+    /// some registry section failed to load this time.
+    ttl: Duration,
 }
 
 impl CachedBootstrap {
+    #[cfg(test)]
     fn new(data: BootstrapData) -> Self {
+        Self::with_ttl(data, BOOTSTRAP_TTL)
+    }
+
+    fn with_ttl(data: BootstrapData, ttl: Duration) -> Self {
         Self {
             data,
             loaded_at: Instant::now(),
+            ttl,
         }
     }
 
     fn is_expired(&self) -> bool {
-        self.loaded_at.elapsed() > BOOTSTRAP_TTL
+        self.loaded_at.elapsed() > self.ttl
     }
 
     fn age(&self) -> Duration {
@@ -140,6 +195,71 @@ struct BootstrapResponse {
     services: Vec<Vec<serde_json::Value>>,
 }
 
+/// One bootstrap fetch. Each registry section is `None` when that IANA file
+/// failed to fetch or parse (or parsed to nothing), so a partial failure can
+/// be merged over the previous dataset instead of replacing it.
+struct BootstrapLoad {
+    dns: Option<HashMap<String, Arc<Vec<url::Url>>>>,
+    ipv4: Option<Vec<(IpRange, Arc<Vec<url::Url>>)>>,
+    ipv6: Option<Vec<(IpRange, Arc<Vec<url::Url>>)>>,
+    asn: Option<Vec<(AsnRange, Arc<Vec<url::Url>>)>>,
+}
+
+impl BootstrapLoad {
+    /// True when every registry section loaded.
+    fn is_complete(&self) -> bool {
+        self.dns.is_some() && self.ipv4.is_some() && self.ipv6.is_some() && self.asn.is_some()
+    }
+
+    /// Cache TTL for this load: the full day when complete, the short
+    /// [`BOOTSTRAP_PARTIAL_TTL`] when a section is missing.
+    fn ttl(&self) -> Duration {
+        if self.is_complete() {
+            BOOTSTRAP_TTL
+        } else {
+            BOOTSTRAP_PARTIAL_TTL
+        }
+    }
+
+    /// Builds the dataset to cache, keeping `previous`'s section for every
+    /// registry that failed this time — a refresh where only dns.json timed
+    /// out must not wipe good (if stale) TLD data.
+    fn merge_over(self, previous: Option<BootstrapData>) -> BootstrapData {
+        let (dns, ipv4, ipv6, asn) = match previous {
+            Some(p) => (Some(p.dns), Some(p.ipv4), Some(p.ipv6), Some(p.asn)),
+            None => (None, None, None, None),
+        };
+        BootstrapData {
+            dns: self.dns.or(dns).unwrap_or_default(),
+            ipv4: self.ipv4.or(ipv4).unwrap_or_default(),
+            ipv6: self.ipv6.or(ipv6).unwrap_or_default(),
+            asn: self.asn.or(asn).unwrap_or_default(),
+        }
+    }
+}
+
+/// Stores a finished load into `cache` (the contents of [`BOOTSTRAP_CACHE`])
+/// by merging it over the previous dataset, unless another task already
+/// stored a still-fresh dataset while this load ran.
+fn store_bootstrap_load(cache: &mut Option<CachedBootstrap>, load: BootstrapLoad) {
+    if cache.as_ref().is_some_and(|c| !c.is_expired()) {
+        return;
+    }
+    let ttl = load.ttl();
+    if !load.is_complete() {
+        warn!(
+            dns = load.dns.is_some(),
+            ipv4 = load.ipv4.is_some(),
+            ipv6 = load.ipv6.is_some(),
+            asn = load.asn.is_some(),
+            retry_in_secs = ttl.as_secs(),
+            "RDAP bootstrap partially loaded; keeping previous data for failed registries"
+        );
+    }
+    let previous = cache.take().map(|c| c.data);
+    *cache = Some(CachedBootstrap::with_ttl(load.merge_over(previous), ttl));
+}
+
 /// Waits (bounded) for an in-flight bootstrap load to complete, then
 /// re-checks the cache. Used by losers of the throttle race so a concurrent
 /// cold-cache caller doesn't spuriously error with "throttled and no cache
@@ -152,9 +272,15 @@ struct BootstrapResponse {
 async fn wait_for_in_flight_load(
     notified: std::pin::Pin<&mut tokio::sync::futures::Notified<'_>>,
 ) -> Result<()> {
-    // Bounded wait so we don't block forever if the winner's future was
-    // cancelled/dropped before it could notify.
-    let _ = tokio::time::timeout(DEFAULT_TIMEOUT, notified).await;
+    // Only block while a load is actually running. Once the last load has
+    // finished (a cold load that failed leaves the cache empty), nobody will
+    // notify again, and waiting would stall every caller for the full timeout
+    // until the throttle window passes. The winner writes the cache before
+    // clearing the flag, so observing `false` here means the cache check
+    // below already sees its result. Still bounded, in case the winner hangs.
+    if BOOTSTRAP_LOAD_IN_FLIGHT.load(Ordering::SeqCst) {
+        let _ = tokio::time::timeout(DEFAULT_TIMEOUT, notified).await;
+    }
     let cache = BOOTSTRAP_CACHE.read().await;
     if cache.is_some() {
         Ok(())
@@ -170,9 +296,11 @@ pub struct RdapClient {
     retry_policy: RetryPolicy,
     /// Per-request timeout for RDAP queries (default [`DEFAULT_TIMEOUT`]).
     timeout: Duration,
-    /// When true, skips the reserved-IP SSRF validation so tests can target a
-    /// 127.0.0.1 wiremock fixture. Not settable outside `#[cfg(test)]` builds
-    /// — production requests always validate and pin resolved IPs.
+    /// When true, skips the reserved-IP SSRF validation for loopback URLs so
+    /// tests can target a 127.0.0.1 wiremock fixture (any other URL, such as
+    /// a scripted redirect target, still gets the full guard). Not settable
+    /// outside `#[cfg(test)]` builds — production requests always validate
+    /// and pin resolved IPs.
     allow_reserved: bool,
 }
 
@@ -285,7 +413,9 @@ impl RdapClient {
                         return Ok(());
                     }
                     // Cache is empty AND another task is mid-load (or just
-                    // failed). Wait for them instead of returning an error.
+                    // failed). Wait for an in-flight load instead of
+                    // returning an error; a load that already failed yields
+                    // the throttle error without waiting.
                     drop(cache);
                     drop(last);
                     return wait_for_in_flight_load(notified).await;
@@ -293,9 +423,11 @@ impl RdapClient {
             }
         }
 
-        // Record the attempt timestamp before we begin the network load.
-        // Holding this lock is cheap (no await in between read+write here).
-        {
+        // Record the attempt timestamp before we begin the network load, and
+        // mark the load in flight inside the same critical section: a loser
+        // that observes the fresh timestamp is then guaranteed to observe the
+        // in-flight flag too (see `wait_for_in_flight_load`).
+        let load_guard = {
             let mut last = BOOTSTRAP_LAST_ATTEMPT.write().await;
             // Double-check in case another task just updated it.
             if let Some(ts) = *last {
@@ -310,23 +442,23 @@ impl RdapClient {
                 }
             }
             *last = Some(Instant::now());
-        }
+            BootstrapLoadGuard::start()
+        };
 
         // Perform the actual load WITHOUT holding any cache lock. Whichever
-        // branch exits, we must notify waiters so losers don't hang for the
-        // full bounded timeout.
+        // branch exits (or if this future is dropped mid-load), dropping
+        // `load_guard` clears the in-flight flag and notifies waiters so
+        // losers don't hang for the full bounded timeout.
         debug!("Loading/refreshing RDAP bootstrap data");
         let load_result = load_bootstrap_data_with_retry(&self.retry_policy).await;
 
         let outcome = match load_result {
-            Ok(data) => {
+            Ok(load) => {
+                // Merges per registry over any previous (stale) data, and
+                // skips the store if another task loaded fresh data while we
+                // ran.
                 let mut cache = BOOTSTRAP_CACHE.write().await;
-                // Double-check: another task may have loaded while we ran.
-                // Only overwrite if the current cache is missing or expired.
-                let should_store = cache.as_ref().map(|c| c.is_expired()).unwrap_or(true);
-                if should_store {
-                    *cache = Some(CachedBootstrap::new(data));
-                }
+                store_bootstrap_load(&mut cache, load);
                 Ok(())
             }
             Err(e) => {
@@ -346,8 +478,9 @@ impl RdapClient {
             }
         };
 
-        // Wake any losers waiting on our load. Safe to call in both branches.
-        BOOTSTRAP_LOAD_NOTIFY.notify_waiters();
+        // Clear the in-flight flag and wake any losers waiting on our load
+        // (after the cache write above, so they observe its result).
+        drop(load_guard);
         outcome
     }
 
@@ -683,8 +816,9 @@ type PinnedClientKey = (String, u16, Duration);
 /// Pinned per-host RDAP clients. `reqwest::Client` is Arc-backed, so cloning
 /// out of the cache shares the underlying connection pool. Entries are only
 /// ever inserted after full SSRF validation ([`validate_url_not_reserved`]);
-/// the `#[cfg(test)]` allow-reserved mode bypasses this cache entirely in
-/// both directions (never inserts, never reads). Capacity-bounded: evicting
+/// the loopback requests the `#[cfg(test)]` allow-reserved mode exempts
+/// bypass this cache in both directions (never insert, never read).
+/// Capacity-bounded: evicting
 /// a live entry merely forces a re-validate + rebuild on next use.
 static PINNED_CLIENT_CACHE: Lazy<crate::cache::TtlCache<PinnedClientKey, Client>> =
     Lazy::new(|| crate::cache::TtlCache::with_max_capacity(PINNED_CLIENT_TTL, 64));
@@ -700,8 +834,10 @@ static PINNED_CLIENT_CACHE: Lazy<crate::cache::TtlCache<PinnedClientKey, Client>
 /// URL aimed at the same port.
 ///
 /// `allow_reserved` (test seam, see [`RdapClient::allow_reserved`]) skips the
-/// validation and IP pinning so `#[cfg(test)]` mock servers on loopback are
-/// reachable; it is always false on production paths.
+/// validation and IP pinning for **loopback** URLs only, so `#[cfg(test)]`
+/// mock servers are reachable; any other URL (e.g. a redirect target a test
+/// scripts) still runs the full production guard. Always false on
+/// production paths.
 async fn send_rdap_request(
     url: &str,
     timeout: Duration,
@@ -710,7 +846,7 @@ async fn send_rdap_request(
     // Keep the connect timeout no larger than the overall request timeout so a
     // sub-5s configured timeout stays internally consistent.
     let connect_timeout = CONNECT_TIMEOUT.min(timeout);
-    if allow_reserved {
+    if allow_reserved && is_loopback_url(url) {
         // Test seam: build a one-off unpinned client and never touch the
         // shared pinned-client cache — a test-mode client reaching loopback
         // must not be servable to a production request (nor vice versa).
@@ -723,7 +859,7 @@ async fn send_rdap_request(
             .map_err(|e| SeerError::RdapError(format!("failed to build HTTP client: {}", e)))?;
         return client
             .get(url)
-            .header("Accept", "application/rdap+json")
+            .header(reqwest::header::ACCEPT, RDAP_ACCEPT)
             .send()
             .await
             .map_err(Into::into);
@@ -747,13 +883,12 @@ async fn send_rdap_request(
                 .user_agent("Seer/1.0 (RDAP Client)")
                 .resolve_to_addrs(&host, &resolved)
                 // SSRF defense: `resolve_to_addrs` pins only THIS host's validated IPs.
-                // reqwest's default policy would follow up to 10 redirects, re-resolving
-                // each new host with its own resolver — so a 3xx to http://169.254.169.254
-                // (or any internal host) would bypass the reserved-IP guard entirely.
-                // RDAP base URLs come from the IANA bootstrap as terminal https endpoints
-                // and cross-server references are JSON `links`, not HTTP redirects, so we
-                // fail closed: a redirecting RDAP server makes the lookup fall through to
-                // WHOIS/availability rather than chasing an unvalidated hop.
+                // reqwest's own policy would follow redirects re-resolving each new
+                // host with its own resolver — so a 3xx to http://169.254.169.254 (or
+                // any internal host) would bypass the reserved-IP guard entirely.
+                // Redirects are instead followed manually by `query_rdap_attempt`,
+                // one hop at a time, each hop re-entering this function and so
+                // re-running the https check, SSRF validation, and pinning.
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .map_err(|e| SeerError::RdapError(format!("failed to build HTTP client: {}", e)))?;
@@ -764,7 +899,7 @@ async fn send_rdap_request(
 
     match client
         .get(url)
-        .header("Accept", "application/rdap+json")
+        .header(reqwest::header::ACCEPT, RDAP_ACCEPT)
         .send()
         .await
     {
@@ -834,19 +969,86 @@ async fn read_and_parse_rdap_body(
     Ok(rdap)
 }
 
+/// Whether `url` targets a loopback IP literal — the only hosts the
+/// `#[cfg(test)]` allow-reserved seam may reach unvalidated.
+fn is_loopback_url(url: &str) -> bool {
+    match url::Url::parse(url).ok().as_ref().and_then(url::Url::host) {
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        _ => false,
+    }
+}
+
+/// Returns the `Location` of a redirect response RDAP clients follow
+/// (301/302/303/307/308), or `None` for any other status (including a
+/// redirect status without a usable `Location`, which then fails as an
+/// ordinary non-success status).
+fn redirect_location(response: &reqwest::Response) -> Option<&str> {
+    match response.status().as_u16() {
+        301 | 302 | 303 | 307 | 308 => response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok()),
+        _ => None,
+    }
+}
+
+/// Resolves a redirect `Location` (absolute or relative) against the URL
+/// that returned it. The target is NOT trusted here: the next hop goes back
+/// through [`send_rdap_request`], which enforces https and runs the SSRF
+/// validation + pinning for the new host.
+fn resolve_redirect_target(current: &str, location: &str) -> Result<String> {
+    url::Url::parse(current)
+        .and_then(|base| base.join(location))
+        .map(String::from)
+        .map_err(|e| SeerError::RdapError(format!("invalid RDAP redirect target: {}", e)))
+}
+
 /// One RDAP attempt. On failure, returns the error together with an optional
 /// server-suggested retry delay parsed from a 429 `Retry-After` header so the
 /// caller's backoff can honor it. Uses a cached per-host HTTP client that pins
 /// the validated resolved IPs to prevent DNS rebinding (TOCTOU between
 /// validation and connect); see [`send_rdap_request`].
+///
+/// Redirects (RFC 7480 §5.2 — e.g. ARIN 303 → RIPE for an address it doesn't
+/// hold) are followed manually for up to [`MAX_RDAP_REDIRECTS`] hops. Each
+/// hop re-enters `send_rdap_request`, so an http:// (downgrade) or
+/// reserved/internal target is refused exactly like a bootstrap URL would
+/// be; a URL seen twice aborts the chain as a loop.
 async fn query_rdap_attempt(
     url: &str,
     timeout: Duration,
     allow_reserved: bool,
 ) -> std::result::Result<RdapResponse, (SeerError, Option<Duration>)> {
-    let response = send_rdap_request(url, timeout, allow_reserved)
-        .await
-        .map_err(|e| (e, None))?;
+    let mut current = url.to_string();
+    let mut visited: HashSet<String> = HashSet::new();
+    let response = loop {
+        visited.insert(current.clone());
+        let response = send_rdap_request(&current, timeout, allow_reserved)
+            .await
+            .map_err(|e| (e, None))?;
+        let Some(location) = redirect_location(&response) else {
+            break response;
+        };
+        if visited.len() > MAX_RDAP_REDIRECTS {
+            return Err((
+                SeerError::RdapError(format!(
+                    "RDAP query exceeded {} redirects",
+                    MAX_RDAP_REDIRECTS
+                )),
+                None,
+            ));
+        }
+        let next = resolve_redirect_target(&current, location).map_err(|e| (e, None))?;
+        if visited.contains(&next) {
+            return Err((
+                SeerError::RdapError("RDAP redirect loop detected".to_string()),
+                None,
+            ));
+        }
+        debug!(from = %current, to = %next, "Following RDAP redirect");
+        current = next;
+    };
 
     if !response.status().is_success() {
         let status = response.status();
@@ -867,19 +1069,22 @@ async fn query_rdap_attempt(
         ));
     }
 
-    read_and_parse_rdap_body(response, url, timeout)
+    read_and_parse_rdap_body(response, &current, timeout)
         .await
         .map_err(|e| (e, None))
 }
 
-/// Loads IANA RDAP bootstrap data from all registries with retry.
-async fn load_bootstrap_data_with_retry(policy: &RetryPolicy) -> Result<BootstrapData> {
+/// Loads IANA RDAP bootstrap data from all registries with retry. Only a
+/// load where *every* registry failed is an error (and is retryable); a
+/// partial load succeeds and is merged by [`store_bootstrap_load`].
+async fn load_bootstrap_data_with_retry(policy: &RetryPolicy) -> Result<BootstrapLoad> {
     let executor = RetryExecutor::new(policy.clone());
     executor.execute(load_bootstrap_data).await
 }
 
-/// Loads IANA RDAP bootstrap data from all registries.
-async fn load_bootstrap_data() -> Result<BootstrapData> {
+/// Loads IANA RDAP bootstrap data from all registries. Each section of the
+/// returned [`BootstrapLoad`] is `None` when that registry failed.
+async fn load_bootstrap_data() -> Result<BootstrapLoad> {
     debug!("Loading RDAP bootstrap data from IANA");
 
     // SSRF validation is skipped here — these are hardcoded IANA URLs, not user input.
@@ -994,18 +1199,6 @@ async fn load_bootstrap_data() -> Result<BootstrapData> {
         }
     };
 
-    // If ALL four registries failed, that's a real error
-    if dns_data.is_none() && ipv4_data.is_none() && ipv6_data.is_none() && asn_data.is_none() {
-        return Err(SeerError::RdapBootstrapError(
-            "all IANA bootstrap registries failed".to_string(),
-        ));
-    }
-
-    let mut dns = HashMap::new();
-    let mut ipv4 = Vec::new();
-    let mut ipv6 = Vec::new();
-    let mut asn = Vec::new();
-
     // Helper: extract and validate all URLs in order, preserving IANA-listed
     // ordering. Invalid URLs are logged and skipped rather than rejecting the
     // entire service entry. Returns None when no valid URLs remain.
@@ -1028,97 +1221,108 @@ async fn load_bootstrap_data() -> Result<BootstrapData> {
         }
     }
 
+    // Helper: parse an IPv4/IPv6 prefix registry into (prefix, urls) pairs.
+    fn parse_prefix_services(data: BootstrapResponse) -> Vec<(IpRange, Arc<Vec<url::Url>>)> {
+        let mut out = Vec::new();
+        for service in data.services {
+            if service.len() >= 2 {
+                if let (Some(prefixes), Some(urls)) = (service[0].as_array(), service[1].as_array())
+                {
+                    if let Some(urls_arc) = collect_valid_urls(urls) {
+                        for prefix in prefixes {
+                            if let Some(prefix_str) = prefix.as_str() {
+                                out.push((
+                                    IpRange {
+                                        prefix: prefix_str.to_string(),
+                                    },
+                                    Arc::clone(&urls_arc),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    // Each section below is `None` when its registry failed. A section that
+    // fetched but parsed to nothing is treated the same way, so a truncated
+    // or empty file is retried rather than cached over good data.
+
     // Parse DNS bootstrap
-    if let Some(dns_data) = dns_data {
-        for service in dns_data.services {
-            if service.len() >= 2 {
-                if let (Some(tlds), Some(urls)) = (service[0].as_array(), service[1].as_array()) {
-                    if let Some(urls_arc) = collect_valid_urls(urls) {
-                        for tld in tlds {
-                            if let Some(tld_str) = tld.as_str() {
-                                dns.insert(tld_str.to_lowercase(), Arc::clone(&urls_arc));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Parse IPv4 bootstrap
-    if let Some(ipv4_data) = ipv4_data {
-        for service in ipv4_data.services {
-            if service.len() >= 2 {
-                if let (Some(prefixes), Some(urls)) = (service[0].as_array(), service[1].as_array())
-                {
-                    if let Some(urls_arc) = collect_valid_urls(urls) {
-                        for prefix in prefixes {
-                            if let Some(prefix_str) = prefix.as_str() {
-                                ipv4.push((
-                                    IpRange {
-                                        prefix: prefix_str.to_string(),
-                                    },
-                                    Arc::clone(&urls_arc),
-                                ));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Parse IPv6 bootstrap
-    if let Some(ipv6_data) = ipv6_data {
-        for service in ipv6_data.services {
-            if service.len() >= 2 {
-                if let (Some(prefixes), Some(urls)) = (service[0].as_array(), service[1].as_array())
-                {
-                    if let Some(urls_arc) = collect_valid_urls(urls) {
-                        for prefix in prefixes {
-                            if let Some(prefix_str) = prefix.as_str() {
-                                ipv6.push((
-                                    IpRange {
-                                        prefix: prefix_str.to_string(),
-                                    },
-                                    Arc::clone(&urls_arc),
-                                ));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Parse ASN bootstrap
-    if let Some(asn_data) = asn_data {
-        for service in asn_data.services {
-            if service.len() >= 2 {
-                if let (Some(ranges), Some(urls)) = (service[0].as_array(), service[1].as_array()) {
-                    if let Some(urls_arc) = collect_valid_urls(urls) {
-                        for range in ranges {
-                            if let Some(range_str) = range.as_str() {
-                                if let Some((start, end)) = parse_asn_range(range_str) {
-                                    asn.push((AsnRange { start, end }, Arc::clone(&urls_arc)));
+    let dns = dns_data
+        .map(|data| {
+            let mut dns = HashMap::new();
+            for service in data.services {
+                if service.len() >= 2 {
+                    if let (Some(tlds), Some(urls)) = (service[0].as_array(), service[1].as_array())
+                    {
+                        if let Some(urls_arc) = collect_valid_urls(urls) {
+                            for tld in tlds {
+                                if let Some(tld_str) = tld.as_str() {
+                                    dns.insert(tld_str.to_lowercase(), Arc::clone(&urls_arc));
                                 }
                             }
                         }
                     }
                 }
             }
-        }
+            dns
+        })
+        .filter(|dns| !dns.is_empty());
+
+    // Parse IPv4 / IPv6 bootstrap
+    let ipv4 = ipv4_data
+        .map(parse_prefix_services)
+        .filter(|v| !v.is_empty());
+    let ipv6 = ipv6_data
+        .map(parse_prefix_services)
+        .filter(|v| !v.is_empty());
+
+    // Parse ASN bootstrap
+    let asn = asn_data
+        .map(|data| {
+            let mut asn = Vec::new();
+            for service in data.services {
+                if service.len() >= 2 {
+                    if let (Some(ranges), Some(urls)) =
+                        (service[0].as_array(), service[1].as_array())
+                    {
+                        if let Some(urls_arc) = collect_valid_urls(urls) {
+                            for range in ranges {
+                                if let Some(range_str) = range.as_str() {
+                                    if let Some((start, end)) = parse_asn_range(range_str) {
+                                        asn.push((AsnRange { start, end }, Arc::clone(&urls_arc)));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            asn
+        })
+        .filter(|v| !v.is_empty());
+
+    // If ALL four registries failed, that's a real error. The message is
+    // matched by `NetworkRetryClassifier` as transient, so the retry policy
+    // gets another go at IANA.
+    if dns.is_none() && ipv4.is_none() && ipv6.is_none() && asn.is_none() {
+        return Err(SeerError::RdapBootstrapError(
+            "all IANA bootstrap registries failed".to_string(),
+        ));
     }
 
     info!(
-        dns_entries = dns.len(),
-        ipv4_ranges = ipv4.len(),
-        ipv6_ranges = ipv6.len(),
-        asn_ranges = asn.len(),
+        dns_entries = dns.as_ref().map_or(0, HashMap::len),
+        ipv4_ranges = ipv4.as_ref().map_or(0, Vec::len),
+        ipv6_ranges = ipv6.as_ref().map_or(0, Vec::len),
+        asn_ranges = asn.as_ref().map_or(0, Vec::len),
         "RDAP bootstrap loaded"
     );
 
-    Ok(BootstrapData {
+    Ok(BootstrapLoad {
         dns,
         ipv4,
         ipv6,
@@ -1735,5 +1939,345 @@ mod tests {
                 .is_none(),
             "test-mode request must not populate the shared pinned-client cache"
         );
+    }
+
+    // ---- RDAP redirect following (RFC 7480 §5.2) -------------------------
+
+    use wiremock::matchers::path;
+
+    const MOCK_OK_BODY: &str = r#"{"objectClassName":"domain","handle":"MOCK-REDIRECT"}"#;
+
+    #[test]
+    fn is_loopback_url_only_matches_loopback_literals() {
+        assert!(is_loopback_url("http://127.0.0.1:8080/domain/x"));
+        assert!(is_loopback_url("http://[::1]:8080/domain/x"));
+        assert!(!is_loopback_url("https://10.0.0.1/domain/x"));
+        assert!(!is_loopback_url("https://rdap.example.com/domain/x"));
+        assert!(!is_loopback_url("not a url"));
+    }
+
+    #[tokio::test]
+    async fn mock_rdap_303_redirect_is_followed() {
+        // ARIN answers 303 → RIPE for an address it doesn't hold; this used
+        // to surface as "query failed with status 303".
+        let target = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/ip/192.36.148.17"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(MOCK_OK_BODY, "application/rdap+json"),
+            )
+            .expect(1)
+            .mount(&target)
+            .await;
+        let origin = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(303)
+                    .insert_header("Location", format!("{}/ip/192.36.148.17", target.uri())),
+            )
+            .mount(&origin)
+            .await;
+
+        let client = RdapClient::new()
+            .without_retries()
+            .allowing_reserved_for_tests();
+        let resp = client
+            .query_rdap_with_retry(&format!("{}/ip/192.36.148.17", origin.uri()))
+            .await
+            .unwrap();
+        assert_eq!(resp.handle.as_deref(), Some("MOCK-REDIRECT"));
+    }
+
+    #[tokio::test]
+    async fn mock_rdap_relative_redirect_is_resolved_against_current_url() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/old/domain/example.com"))
+            .respond_with(
+                ResponseTemplate::new(301).insert_header("Location", "/new/domain/example.com"),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/new/domain/example.com"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(MOCK_OK_BODY, "application/rdap+json"),
+            )
+            .mount(&server)
+            .await;
+
+        let client = RdapClient::new()
+            .without_retries()
+            .allowing_reserved_for_tests();
+        let resp = client
+            .query_rdap_with_retry(&format!("{}/old/domain/example.com", server.uri()))
+            .await
+            .unwrap();
+        assert_eq!(resp.handle.as_deref(), Some("MOCK-REDIRECT"));
+    }
+
+    /// Scripts a redirect to `location` and returns the error the client
+    /// reports. The test seam only exempts loopback, so the redirect target
+    /// runs through the full production guard.
+    async fn redirect_error(location: &str) -> SeerError {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(302).insert_header("Location", location))
+            .mount(&server)
+            .await;
+        let client = RdapClient::new()
+            .without_retries()
+            .allowing_reserved_for_tests();
+        client
+            .query_rdap_with_retry(&format!("{}/domain/example.com", server.uri()))
+            .await
+            .unwrap_err()
+    }
+
+    #[tokio::test]
+    async fn mock_rdap_redirect_to_plain_http_is_refused() {
+        // Downgrade: a public IP literal keeps this hermetic (the https check
+        // fires before any resolution or connect).
+        let err = redirect_error("http://93.184.216.34/domain/example.com").await;
+        assert!(
+            matches!(err, SeerError::RdapError(ref m) if m.contains("not https")),
+            "got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mock_rdap_redirect_to_reserved_address_is_refused() {
+        for location in [
+            "https://10.0.0.1/domain/example.com",
+            "https://169.254.169.254/latest/meta-data/",
+        ] {
+            let err = redirect_error(location).await;
+            assert!(
+                matches!(err, SeerError::RdapError(ref m) if m.contains("reserved")),
+                "{location}: got {err:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mock_rdap_redirect_loop_is_detected() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/a"))
+            .respond_with(ResponseTemplate::new(307).insert_header("Location", "/b"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/b"))
+            .respond_with(ResponseTemplate::new(307).insert_header("Location", "/a"))
+            .mount(&server)
+            .await;
+        let client = RdapClient::new()
+            .without_retries()
+            .allowing_reserved_for_tests();
+        let err = client
+            .query_rdap_with_retry(&format!("{}/a", server.uri()))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, SeerError::RdapError(ref m) if m.contains("loop")),
+            "got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mock_rdap_redirect_chain_is_capped() {
+        let server = MockServer::start().await;
+        for hop in 0..=MAX_RDAP_REDIRECTS {
+            Mock::given(method("GET"))
+                .and(path(format!("/hop{hop}")))
+                .respond_with(
+                    ResponseTemplate::new(308)
+                        .insert_header("Location", format!("/hop{}", hop + 1)),
+                )
+                .mount(&server)
+                .await;
+        }
+        let client = RdapClient::new()
+            .without_retries()
+            .allowing_reserved_for_tests();
+        let err = client
+            .query_rdap_with_retry(&format!("{}/hop0", server.uri()))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, SeerError::RdapError(ref m) if m.contains("exceeded")),
+            "got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mock_rdap_sends_accept_header_with_json_fallback() {
+        // rdap.nic.sn answers 406 to `application/rdap+json` alone.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            // Compare the raw header: wiremock's `header` matcher splits on
+            // commas, so it could never equal the whole list.
+            .and(|req: &wiremock::Request| {
+                req.headers.get("accept").and_then(|v| v.to_str().ok()) == Some(RDAP_ACCEPT)
+            })
+            .respond_with(ResponseTemplate::new(200).set_body_raw(MOCK_OK_BODY, "application/json"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(406))
+            .mount(&server)
+            .await;
+        let client = RdapClient::new()
+            .without_retries()
+            .allowing_reserved_for_tests();
+        let resp = client
+            .query_rdap_with_retry(&format!("{}/domain/example.sn", server.uri()))
+            .await
+            .unwrap();
+        assert_eq!(resp.handle.as_deref(), Some("MOCK-REDIRECT"));
+        assert!(RDAP_ACCEPT.contains("application/json"));
+    }
+
+    // ---- bootstrap partial loads (per-registry merge) --------------------
+
+    fn url_arc(u: &str) -> Arc<Vec<url::Url>> {
+        Arc::new(vec![url::Url::parse(u).expect("valid url")])
+    }
+
+    fn full_load() -> BootstrapLoad {
+        let mut dns = HashMap::new();
+        dns.insert("com".to_string(), url_arc("https://rdap.verisign.example/"));
+        BootstrapLoad {
+            dns: Some(dns),
+            ipv4: Some(vec![(
+                IpRange {
+                    prefix: "8.0.0.0/8".to_string(),
+                },
+                url_arc("https://rdap.arin.example/"),
+            )]),
+            ipv6: Some(Vec::new()),
+            asn: Some(vec![(
+                AsnRange { start: 1, end: 10 },
+                url_arc("https://rdap.arin.example/"),
+            )]),
+        }
+    }
+
+    #[test]
+    fn complete_bootstrap_load_gets_full_ttl() {
+        let load = full_load();
+        assert!(load.is_complete());
+        assert_eq!(load.ttl(), BOOTSTRAP_TTL);
+    }
+
+    #[test]
+    fn partial_bootstrap_load_keeps_previous_section_and_short_ttl() {
+        // Previous (expired) dataset with good DNS data.
+        let mut previous = Some(CachedBootstrap::with_ttl(
+            full_load().merge_over(None),
+            Duration::ZERO,
+        ));
+        std::thread::sleep(Duration::from_millis(2));
+        assert!(previous.as_ref().is_some_and(CachedBootstrap::is_expired));
+
+        // Refresh where dns.json failed but the others loaded.
+        let mut partial = full_load();
+        partial.dns = None;
+        assert!(!partial.is_complete());
+        store_bootstrap_load(&mut previous, partial);
+
+        let cached = previous.expect("cache populated");
+        assert_eq!(cached.ttl, BOOTSTRAP_PARTIAL_TTL);
+        assert!(
+            RdapClient::get_rdap_urls_for_domain(&cached.data, "example.com").is_some(),
+            "the failed dns section must be carried over, not wiped"
+        );
+        assert!(RdapClient::get_rdap_urls_for_asn(&cached.data, 5).is_some());
+    }
+
+    #[test]
+    fn partial_cold_bootstrap_load_leaves_failed_section_empty() {
+        let mut cache = None;
+        let mut partial = full_load();
+        partial.dns = None;
+        store_bootstrap_load(&mut cache, partial);
+        let cached = cache.expect("cache populated");
+        assert_eq!(cached.ttl, BOOTSTRAP_PARTIAL_TTL);
+        assert!(RdapClient::get_rdap_urls_for_domain(&cached.data, "example.com").is_none());
+    }
+
+    #[test]
+    fn bootstrap_store_does_not_overwrite_fresh_data() {
+        let mut fresh = full_load();
+        fresh.dns = Some(HashMap::from([(
+            "org".to_string(),
+            url_arc("https://rdap.pir.example/"),
+        )]));
+        let mut cache = Some(CachedBootstrap::new(fresh.merge_over(None)));
+        store_bootstrap_load(&mut cache, full_load());
+        let cached = cache.expect("cache populated");
+        assert!(RdapClient::get_rdap_urls_for_domain(&cached.data, "example.org").is_some());
+        assert!(RdapClient::get_rdap_urls_for_domain(&cached.data, "example.com").is_none());
+    }
+
+    // ---- in-flight tracking for throttled cold-cache callers -------------
+
+    #[tokio::test]
+    async fn wait_returns_immediately_when_no_load_is_in_flight() {
+        let _guard = BOOTSTRAP_TEST_LOCK.lock().await;
+        {
+            let mut cache = BOOTSTRAP_CACHE.write().await;
+            *cache = None;
+        }
+        assert!(!BOOTSTRAP_LOAD_IN_FLIGHT.load(Ordering::SeqCst));
+
+        // A failed cold load already finished: nobody will notify. The
+        // caller must get the throttle error right away, not after the full
+        // DEFAULT_TIMEOUT wait.
+        let notified = BOOTSTRAP_LOAD_NOTIFY.notified();
+        tokio::pin!(notified);
+        let result =
+            tokio::time::timeout(Duration::from_secs(2), wait_for_in_flight_load(notified))
+                .await
+                .expect("must not block when no load is in flight");
+        assert!(
+            matches!(result, Err(SeerError::RdapBootstrapError(ref s)) if s.contains("throttled")),
+            "got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_blocks_until_in_flight_load_finishes() {
+        let _guard = BOOTSTRAP_TEST_LOCK.lock().await;
+        {
+            let mut cache = BOOTSTRAP_CACHE.write().await;
+            *cache = None;
+        }
+
+        let load = BootstrapLoadGuard::start();
+        let notified = BOOTSTRAP_LOAD_NOTIFY.notified();
+        tokio::pin!(notified);
+
+        let loader = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            {
+                let mut cache = BOOTSTRAP_CACHE.write().await;
+                *cache = Some(CachedBootstrap::new(full_load().merge_over(None)));
+            }
+            // Clears the flag and notifies, like the end of ensure_bootstrap.
+            drop(load);
+        });
+
+        let result =
+            tokio::time::timeout(Duration::from_secs(5), wait_for_in_flight_load(notified))
+                .await
+                .expect("waiter must wake via the loader's notify");
+        assert!(result.is_ok(), "got: {result:?}");
+        loader.await.expect("loader joined");
+        assert!(!BOOTSTRAP_LOAD_IN_FLIGHT.load(Ordering::SeqCst));
+
+        let mut cache = BOOTSTRAP_CACHE.write().await;
+        *cache = None;
     }
 }
