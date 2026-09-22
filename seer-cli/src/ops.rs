@@ -173,11 +173,13 @@ pub async fn drift_check(
     // Compare the fresh lookup against the most recent stored snapshot
     // before (optionally) recording the new one. History I/O is blocking.
     let domain_key = domain.to_string();
+    // The baseline is the most recent snapshot that carries registration
+    // data, so one throttled run recorded with --record does not become the
+    // point every later run is compared against.
     let previous = tokio::task::spawn_blocking(move || {
-        seer_core::LookupHistory::load()
-            .get(&domain_key)
-            .last()
-            .map(|e| e.result.clone())
+        let history = seer_core::LookupHistory::load();
+        seer_core::drift::baseline_snapshot(history.get(&domain_key).iter().map(|e| &e.result))
+            .cloned()
     })
     .await
     .ok()
@@ -185,10 +187,7 @@ pub async fn drift_check(
 
     let report = match &previous {
         Some(prev) => seer_core::DriftReport::from_lookups(domain, prev, &result),
-        None => seer_core::DriftReport {
-            domain: domain.to_string(),
-            changes: Vec::new(),
-        },
+        None => seer_core::DriftReport::empty(domain),
     };
 
     if record {

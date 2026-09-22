@@ -1535,7 +1535,11 @@ impl Repl {
                 }
                 let spinner =
                     Spinner::new(&format!("Checking {} domains", watchlist.domains.len()));
-                let report = seer_core::check_watchlist(&watchlist.domains).await;
+                let report = seer_core::check_watchlist_with_config(
+                    &watchlist.domains,
+                    &self.context.config,
+                )
+                .await;
                 spinner.finish();
                 let formatter = seer_core::output::get_formatter(self.context.output_format);
                 println!("{}", formatter.format_watch(&report));

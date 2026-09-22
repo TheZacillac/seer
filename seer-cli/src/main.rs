@@ -1628,7 +1628,9 @@ async fn execute_command(
                             "Checking {} domains",
                             watchlist.domains.len()
                         )));
-                        let report = seer_core::check_watchlist(&watchlist.domains).await;
+                        let report =
+                            seer_core::check_watchlist_with_config(&watchlist.domains, config)
+                                .await;
                         spinner.finish();
                         if quiet && handle_quiet_output(&report, &fields) {
                         } else {

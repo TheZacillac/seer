@@ -245,8 +245,9 @@ fn handle_action(
         Action::Fetch { req, gen } => {
             let tx = tx.clone();
             let lens = req.lens_key().to_string();
+            let config = config.clone();
             tokio::spawn(async move {
-                let result = data::fetch(req).await;
+                let result = data::fetch(req, &config).await;
                 let _ = tx.send(Msg::Data { lens, gen, result });
             });
         }
@@ -264,6 +265,7 @@ fn handle_action(
         }
         Action::WatchMutate { add, remove, gen } => {
             let tx = tx.clone();
+            let config = config.clone();
             tokio::spawn(async move {
                 // File I/O is blocking — run in spawn_blocking to keep the async loop free.
                 let notice = tokio::task::spawn_blocking(move || {
@@ -284,7 +286,7 @@ fn handle_action(
                 // Refresh the watchlist lens after mutation. `gen` is the watch
                 // lens's current fetch generation (bumped by App when emitting
                 // this action), so the refresh survives the staleness guard.
-                let result = data::fetch(action::FetchReq::Watch).await;
+                let result = data::fetch(action::FetchReq::Watch, &config).await;
                 let _ = tx.send(Msg::Data {
                     lens: "watch".into(),
                     gen,
@@ -294,6 +296,7 @@ fn handle_action(
         }
         Action::HistoryClear { gen } => {
             let tx = tx.clone();
+            let config = config.clone();
             tokio::spawn(async move {
                 tokio::task::spawn_blocking(|| {
                     let mut h = LookupHistory::load();
@@ -304,7 +307,7 @@ fn handle_action(
                 .ok();
                 // Refresh the history lens after clearing. `gen` is the history
                 // lens's current fetch generation (see WatchMutate above).
-                let result = data::fetch(action::FetchReq::History).await;
+                let result = data::fetch(action::FetchReq::History, &config).await;
                 let _ = tx.send(Msg::Data {
                     lens: "history".into(),
                     gen,
