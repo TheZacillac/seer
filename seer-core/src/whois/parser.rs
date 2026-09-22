@@ -454,10 +454,7 @@ impl WhoisResponse {
             // rate-limit banner). Skip it BEFORE the positive match so the
             // unanchored contains() cannot invert a refused/reserved name into
             // "available" (issue #45).
-            if NON_AVAILABILITY_PATTERNS
-                .iter()
-                .any(|p| normalized.contains(p))
-            {
+            if is_non_availability_line(&normalized) {
                 continue;
             }
             // Sentence-form verdicts (KISA, EDUCAUSE, NASK) run past the word
@@ -526,10 +523,7 @@ impl WhoisResponse {
             }
             let lower = trimmed.to_lowercase();
             let normalized = lower.split_whitespace().collect::<Vec<_>>().join(" ");
-            if NON_AVAILABILITY_PATTERNS
-                .iter()
-                .any(|p| normalized.contains(p))
-            {
+            if is_non_availability_line(&normalized) {
                 return true;
             }
         }
@@ -607,6 +601,10 @@ const AVAILABILITY_SENTENCE_PATTERNS: &[&str] = &[
 /// "available, high confidence" (issue #45). Also backs
 /// [`WhoisResponse::indicates_registry_refusal`] for routing such bodies to an
 /// inconclusive availability verdict.
+///
+/// Every entry here contains a space, so it can never occur inside a domain
+/// name and is safely matched with `contains()`. Single-token markers live in
+/// [`NON_AVAILABILITY_WORDS`].
 const NON_AVAILABILITY_PATTERNS: &[&str] = &[
     "not available", // "...is not available for registration."
     // Reserved-status phrasings. Deliberately NOT the bare word "reserved":
@@ -622,18 +620,63 @@ const NON_AVAILABILITY_PATTERNS: &[&str] = &[
     "reserved domain", // "Reserved Domain Name" (ICANN reserved names)
     "reserved name",
     "rate limit", // "rate limited" / "Access rate limited; ..."
-    "rate-limit", // hyphenated variant
     "rate exceeded",
-    "quota",
     "too many requests",
     "access denied",
-    "denied",
     "not permitted", // SWITCH .ch "Requests of this client are not permitted."
-    "refused",
-    "try again", // throttle hint ("please try again later")
+    "try again",     // throttle hint ("please try again later")
     "temporarily unavailable",
+];
+
+/// Single-token refusal / throttle markers. Unlike the phrases above these
+/// can occur INSIDE the domain name a "no match" line echoes back
+/// (`quotations.pl`, `UNBLOCKED-GAMES.COM`, `refused.ls`), which would turn a
+/// conclusive "available" into "inconclusive". They are therefore matched as
+/// whole words only — see [`contains_word`].
+const NON_AVAILABILITY_WORDS: &[&str] = &[
+    "rate-limit",   // hyphenated variant of "rate limit"
+    "rate-limited", // "Your IP has been rate-limited."
+    "quota",
+    "denied",
+    "refused",
     "blocked",
 ];
+
+/// True when a normalized (lowercased, single-spaced) line negates, refuses
+/// or throttles availability.
+fn is_non_availability_line(normalized: &str) -> bool {
+    NON_AVAILABILITY_PATTERNS
+        .iter()
+        .any(|p| normalized.contains(p))
+        || NON_AVAILABILITY_WORDS
+            .iter()
+            .any(|w| contains_word(normalized, w))
+}
+
+/// Characters that can be part of a domain-name label.
+fn is_label_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '-' || c == '_'
+}
+
+/// True when `word` occurs in `haystack` as a whole word rather than as part
+/// of a domain name: it may not touch a label character on either side, nor a
+/// `.` that joins it to another label (`refused.ls`, `www.blocked`). A `.`
+/// that merely ends the sentence (`Query refused.`) is still a boundary.
+fn contains_word(haystack: &str, word: &str) -> bool {
+    haystack.match_indices(word).any(|(start, _)| {
+        let before_ok = haystack[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !is_label_char(c) && c != '.');
+        let mut after = haystack[start + word.len()..].chars();
+        let after_ok = match after.next() {
+            None => true,
+            Some('.') => after.next().is_none_or(|c| !is_label_char(c)),
+            Some(c) => !is_label_char(c),
+        };
+        before_ok && after_ok
+    })
+}
 
 /// Patterns indicating the registrar didn't have data for this domain.
 /// Matched at the start of a trimmed line (not inside TOS footers).
@@ -1356,6 +1399,60 @@ Name Server: ns1.example.com
                 "should flag refusal/throttle/negation: {raw:?}"
             );
         }
+    }
+
+    /// Single-token refusal markers ("quota", "blocked", "refused", …) used
+    /// to match inside the domain name echoed by a "no match" line, turning a
+    /// conclusive "available" into "inconclusive".
+    #[test]
+    fn refusal_words_inside_the_echoed_domain_do_not_veto_availability() {
+        for (domain, raw) in [
+            (
+                "quotations.pl",
+                "No information available about domain name quotations.pl in the Registry NASK database.\n",
+            ),
+            ("unblocked-games.com", "No match for \"UNBLOCKED-GAMES.COM\".\n"),
+            ("refused.ls", "No record found for 'refused.ls'.\n"),
+            ("denied-access.com", "No match for \"DENIED-ACCESS.COM\".\n"),
+            ("rate-limiter.com", "No match for \"RATE-LIMITER.COM\".\n"),
+        ] {
+            let r = WhoisResponse::parse(domain, "whois.example", raw);
+            assert!(
+                !r.indicates_registry_refusal(),
+                "{domain}: echoed domain is not a refusal: {raw:?}"
+            );
+            assert!(r.is_available(), "{domain}: must read as available: {raw:?}");
+        }
+    }
+
+    #[test]
+    fn refusal_words_are_still_detected_as_whole_words() {
+        for raw in [
+            "Query refused.\n",
+            "Your request has been blocked\n",
+            "Request denied: too many queries from your IP\n",
+            "Query quota exceeded for this client\n",
+            "Rate-limit exceeded, no data found\n",
+            "Your IP has been rate-limited.\n",
+        ] {
+            let r = make_response(raw);
+            assert!(r.indicates_registry_refusal(), "must flag: {raw:?}");
+            assert!(!r.is_available(), "must not read as available: {raw:?}");
+        }
+    }
+
+    #[test]
+    fn contains_word_respects_domain_label_boundaries() {
+        assert!(contains_word("query refused.", "refused"));
+        assert!(contains_word("refused", "refused"));
+        assert!(contains_word("(blocked)", "blocked"));
+        assert!(!contains_word(
+            "no record found for 'refused.ls'.",
+            "refused"
+        ));
+        assert!(!contains_word("www.blocked.example", "blocked"));
+        assert!(!contains_word("unblocked-games.com", "blocked"));
+        assert!(!contains_word("quotations.pl", "quota"));
     }
 
     #[test]
