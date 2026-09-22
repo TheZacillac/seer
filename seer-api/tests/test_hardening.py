@@ -878,6 +878,32 @@ def test_other_loopback_forms_start_without_auth(monkeypatch, host):
     importlib.reload(main)
 
 
+@pytest.mark.parametrize("buggy_stdlib", [False, True])
+def test_ipv4_mapped_loopback_bind_does_not_depend_on_python_version(monkeypatch, buggy_stdlib):
+    """`IPv6Address("::ffff:127.0.0.1").is_loopback` is False on CPython
+    3.12.0-3.12.3 (later releases consult the mapped IPv4 address), so the
+    bind check must unwrap `ipv4_mapped` itself. `buggy_stdlib` simulates the
+    old stdlib behavior on whatever Python runs the suite."""
+    import ipaddress
+
+    from seer_api.main import _is_loopback_bind
+
+    if buggy_stdlib:
+        monkeypatch.setattr(
+            ipaddress.IPv6Address,
+            "is_loopback",
+            property(lambda self: self._ip == 1),
+        )
+        assert not ipaddress.IPv6Address("::ffff:127.0.0.1").is_loopback
+
+    assert _is_loopback_bind("::ffff:127.0.0.1")
+    assert _is_loopback_bind("[::ffff:127.0.0.2]")
+    assert _is_loopback_bind("::1")
+    # Mapped non-loopback addresses stay non-loopback (fail closed).
+    assert not _is_loopback_bind("::ffff:10.0.0.1")
+    assert not _is_loopback_bind("::ffff:0.0.0.0")
+
+
 @pytest.mark.parametrize("host", ["0.0.0.0", "::", "example.com", "10.0.0.5", "not-an-ip!"])
 def test_non_loopback_binds_still_refused_without_auth(monkeypatch, host):
     """The widened check must not become permissive.
@@ -1026,6 +1052,45 @@ def test_refuses_multi_worker_without_shared_store(monkeypatch):
         pass
 
     monkeypatch.delenv("WEB_CONCURRENCY")
+    importlib.reload(main)
+
+
+def test_web_concurrency_shadows_unparseable_uvicorn_workers(monkeypatch):
+    """UVICORN_WORKERS is only a fallback; when WEB_CONCURRENCY is set, a junk
+    UVICORN_WORKERS (e.g. `auto`) must not abort startup. It used to, because
+    the fallback was evaluated eagerly as WEB_CONCURRENCY's default."""
+    monkeypatch.setenv("WEB_CONCURRENCY", "1")
+    monkeypatch.setenv("UVICORN_WORKERS", "auto")
+    monkeypatch.delenv("SEER_RATE_LIMIT_STORAGE", raising=False)
+    import seer_api.main as main
+
+    importlib.reload(main)
+    with TestClient(main.app) as c:
+        assert c.get("/health").status_code == 200
+
+    monkeypatch.delenv("WEB_CONCURRENCY")
+    monkeypatch.delenv("UVICORN_WORKERS")
+    importlib.reload(main)
+
+
+@pytest.mark.parametrize("web_concurrency", [None, "", "  "])
+def test_unparseable_uvicorn_workers_rejected_when_it_is_the_fallback(
+    monkeypatch, web_concurrency
+):
+    """With WEB_CONCURRENCY unset/blank, UVICORN_WORKERS is the value in force
+    and a non-integer is still the clear startup error (issue #50)."""
+    if web_concurrency is None:
+        monkeypatch.delenv("WEB_CONCURRENCY", raising=False)
+    else:
+        monkeypatch.setenv("WEB_CONCURRENCY", web_concurrency)
+    monkeypatch.setenv("UVICORN_WORKERS", "auto")
+    import seer_api.main as main
+
+    importlib.reload(main)
+    with pytest.raises(RuntimeError, match="UVICORN_WORKERS"), TestClient(main.app):
+        pass
+
+    monkeypatch.delenv("UVICORN_WORKERS")
     importlib.reload(main)
 
 

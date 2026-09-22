@@ -54,12 +54,10 @@ def _guard_nameserver(spec: str) -> None:
         _ssrf_guard(*target)
 
 
-# Configure root logging to INFO so operational milestones are visible.
-# Host environments can override via standard Python logging config.
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-)
+# No logging.basicConfig() here: this module is also imported by the REST app
+# (seer_api.main), where configuring the root logger at import time made
+# main's own SEER_LOG_LEVEL basicConfig a silent no-op. The stdio entry point
+# configures logging in `run()` instead.
 logger = logging.getLogger(__name__)
 
 # `version=` is what the SDK reports as `serverInfo.version` in the initialize
@@ -1190,6 +1188,14 @@ async def main():
 
 def run():
     """Entry point for the MCP server."""
+    # Configure root logging to INFO so operational milestones are visible.
+    # Done here, not at import: see the note above `logger`. A host that has
+    # already configured logging keeps its config (basicConfig is a no-op
+    # once the root logger has handlers).
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
     asyncio.run(main())
 
 

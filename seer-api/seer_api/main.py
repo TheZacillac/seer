@@ -184,10 +184,17 @@ def _is_loopback_bind(host: str) -> bool:
     if candidate == "localhost":
         return True
     try:
-        return ipaddress.ip_address(candidate).is_loopback
+        ip = ipaddress.ip_address(candidate)
     except ValueError:
         # A hostname we can't resolve to a literal — treat as public.
         return False
+    # Unwrap IPv4-mapped IPv6 (``::ffff:127.0.0.1``) explicitly:
+    # `IPv6Address.is_loopback` only learned to consult the mapped IPv4
+    # address in later CPython releases (it is False on 3.12.0-3.12.3), so
+    # relying on it made startup depend on the patch version.
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    return ip.is_loopback
 
 
 def _header_host(value: str) -> str:
@@ -282,11 +289,14 @@ async def lifespan(_app: FastAPI):
     # WEB_CONCURRENCY wins; UVICORN_WORKERS is the fallback; default 1. A
     # non-integer (e.g. the PaaS convention WEB_CONCURRENCY=auto) raises a clear
     # RuntimeError here instead of an opaque ValueError traceback (issue #50).
-    workers = env_int(
-        "WEB_CONCURRENCY",
-        env_int("UVICORN_WORKERS", 1, min_value=1),
-        min_value=1,
-    )
+    # UVICORN_WORKERS is parsed only when it is actually the fallback: passing
+    # `env_int("UVICORN_WORKERS", ...)` as WEB_CONCURRENCY's default evaluated
+    # it eagerly, so `WEB_CONCURRENCY=1 UVICORN_WORKERS=auto` refused to start
+    # over a variable that was being overridden anyway.
+    if (os.environ.get("WEB_CONCURRENCY") or "").strip():
+        workers = env_int("WEB_CONCURRENCY", 1, min_value=1)
+    else:
+        workers = env_int("UVICORN_WORKERS", 1, min_value=1)
     if workers > 1 and storage_uri == "memory://":
         log.error(
             "Multi-worker deployment (WEB_CONCURRENCY=%d) requires "
