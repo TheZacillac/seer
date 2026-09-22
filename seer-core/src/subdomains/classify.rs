@@ -66,6 +66,9 @@ pub enum SubdomainStatus {
     /// Only resolves via a zone wildcard (its addresses match the wildcard
     /// probe), so it is probably not a distinct real host.
     Wildcard,
+    /// The address lookup failed (timeout, SERVFAIL) rather than answering,
+    /// so whether the name is live is unknown. Never treated as dangling.
+    Unknown,
 }
 
 /// A subdomain annotated with resolution and takeover signal.
@@ -133,9 +136,14 @@ fn classify_one(
     name: String,
     addresses: Vec<String>,
     cname: Option<String>,
+    lookup_failed: bool,
     wildcard_addrs: &[String],
 ) -> ClassifiedSubdomain {
-    let status = if addresses.is_empty() {
+    let status = if addresses.is_empty() && lookup_failed {
+        // No answer is not the same as "no records": a timed-out lookup must
+        // not be reported dead, nor flagged as a dangling takeover risk.
+        SubdomainStatus::Unknown
+    } else if addresses.is_empty() {
         SubdomainStatus::Dead
     } else if !wildcard_addrs.is_empty() && addresses.iter().all(|a| wildcard_addrs.contains(a)) {
         SubdomainStatus::Wildcard
@@ -160,14 +168,22 @@ fn classify_one(
 }
 
 /// Resolves A/AAAA and CNAME for `name`.
-async fn resolve_name(resolver: &DnsResolver, name: &str) -> (Vec<String>, Option<String>) {
-    let (a, cname) = tokio::join!(
+///
+/// Returns the addresses, the CNAME target, and whether an address lookup
+/// failed outright. `resolve` maps NXDOMAIN/NODATA to an empty `Ok`, so an
+/// `Err` is a genuine failure to get an answer, which callers must not read
+/// as "does not resolve".
+async fn resolve_name(resolver: &DnsResolver, name: &str) -> (Vec<String>, Option<String>, bool) {
+    let (a, aaaa, cname) = tokio::join!(
         Box::pin(resolver.resolve(name, RecordType::A, None)),
+        Box::pin(resolver.resolve(name, RecordType::AAAA, None)),
         Box::pin(resolver.resolve(name, RecordType::CNAME, None)),
     );
-    let addresses = a.map(|r| extract_addresses(&r)).unwrap_or_default();
+    let lookup_failed = a.is_err() || aaaa.is_err();
+    let mut addresses = a.map(|r| extract_addresses(&r)).unwrap_or_default();
+    addresses.extend(aaaa.map(|r| extract_addresses(&r)).unwrap_or_default());
     let cname = cname.ok().and_then(|r| extract_cname(&r));
-    (addresses, cname)
+    (addresses, cname, lookup_failed)
 }
 
 /// Truncates `names` to at most [`MAX_CLASSIFY_NAMES`] in place and returns how
@@ -201,7 +217,7 @@ pub async fn classify_subdomains(
 
     // Probe for wildcard DNS once.
     let probe = format!("{WILDCARD_PROBE_LABEL}.{domain}");
-    let (wildcard_addrs, _) = resolve_name(resolver, &probe).await;
+    let (wildcard_addrs, _, _) = resolve_name(resolver, &probe).await;
     let wildcard_detected = !wildcard_addrs.is_empty();
 
     let concurrency = concurrency.max(1);
@@ -211,8 +227,8 @@ pub async fn classify_subdomains(
         .map(|name| {
             let wildcard_addrs = wildcard_addrs.clone();
             async move {
-                let (addresses, cname) = resolve_name(resolver, &name).await;
-                classify_one(name, addresses, cname, &wildcard_addrs)
+                let (addresses, cname, lookup_failed) = resolve_name(resolver, &name).await;
+                classify_one(name, addresses, cname, lookup_failed, &wildcard_addrs)
             }
         })
         .buffer_unordered(concurrency)
@@ -266,10 +282,35 @@ mod tests {
             "gone.example.com".to_string(),
             vec![], // does not resolve
             Some("gone.herokuapp.com".to_string()),
+            false,
             &[],
         );
         assert_eq!(c.status, SubdomainStatus::Dead);
         assert_eq!(c.takeover_risk.as_deref(), Some("Heroku"));
+    }
+
+    #[test]
+    fn classify_failed_lookup_is_unknown_not_dangling() {
+        // A timed-out lookup with a provider CNAME used to read as Dead + a
+        // takeover risk; an unanswered query proves nothing.
+        let c = classify_one(
+            "slow.example.com".to_string(),
+            vec![],
+            Some("slow.herokuapp.com".to_string()),
+            true,
+            &[],
+        );
+        assert_eq!(c.status, SubdomainStatus::Unknown);
+        assert!(c.takeover_risk.is_none());
+        // If the other family answered, the host is simply live.
+        let c = classify_one(
+            "v6.example.com".to_string(),
+            vec!["2001:db8::1".to_string()],
+            None,
+            true,
+            &[],
+        );
+        assert_eq!(c.status, SubdomainStatus::Live);
     }
 
     #[test]
@@ -279,6 +320,7 @@ mod tests {
             "live.example.com".to_string(),
             vec!["203.0.113.5".to_string()],
             Some("live.herokuapp.com".to_string()),
+            false,
             &[],
         );
         assert_eq!(c.status, SubdomainStatus::Live);
@@ -292,6 +334,7 @@ mod tests {
             "anything.example.com".to_string(),
             vec!["198.51.100.9".to_string()],
             None,
+            false,
             &wildcard,
         );
         assert_eq!(c.status, SubdomainStatus::Wildcard);
@@ -304,6 +347,7 @@ mod tests {
             "real.example.com".to_string(),
             vec!["203.0.113.7".to_string()],
             None,
+            false,
             &wildcard,
         );
         assert_eq!(c.status, SubdomainStatus::Live);

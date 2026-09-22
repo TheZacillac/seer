@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
 use crate::http::{FetchedResponse, GuardedFetcher};
-use crate::validation::normalize_domain;
+use crate::validation::normalize_host;
 
 /// A coarse enforcement verdict for one header or cookie.
 ///
@@ -196,15 +196,25 @@ fn attr<'a>(attrs: &'a [(String, String)], key: &str) -> Option<&'a str> {
         .map(|(_, v)| v.as_str())
 }
 
-fn grade_hsts(value: Option<&str>) -> (HeaderVerdict, Option<String>) {
+fn grade_hsts(value: Option<&str>, over_https: bool) -> (HeaderVerdict, Option<String>) {
     let Some(value) = value else {
         return (
             HeaderVerdict::Absent,
             Some("Add Strict-Transport-Security to stop protocol-downgrade and cookie-stripping attacks.".into()),
         );
     };
+    // RFC 6797 §8.1: a UA must ignore STS received over non-secure transport,
+    // so a header on a page that redirected down to http:// protects nothing.
+    if !over_https {
+        return (
+            HeaderVerdict::Absent,
+            Some("Strict-Transport-Security was served over plain HTTP, where browsers ignore it; serve the final page over HTTPS.".into()),
+        );
+    }
     let attrs = parse_attributes(value);
-    let max_age: Option<u64> = attr(&attrs, "max-age").and_then(|v| v.trim().parse().ok());
+    // RFC 6797 allows the value as a token or a quoted-string.
+    let max_age: Option<u64> =
+        attr(&attrs, "max-age").and_then(|v| v.trim().trim_matches('"').parse().ok());
     let include_subdomains = attr(&attrs, "includesubdomains").is_some();
 
     match max_age {
@@ -234,8 +244,85 @@ fn grade_hsts(value: Option<&str>) -> (HeaderVerdict, Option<String>) {
     }
 }
 
-fn grade_csp(value: Option<&str>, report_only: bool) -> (HeaderVerdict, Option<String>) {
-    let Some(value) = value else {
+/// One parsed CSP policy: lowercase directive name → lowercase source tokens.
+type CspPolicy = Vec<(String, Vec<String>)>;
+
+/// Parses every enforced `Content-Security-Policy` value into its policies.
+///
+/// Browsers enforce *every* policy delivered — across repeated header lines
+/// and comma-separated lists within one line — and a resource must satisfy
+/// all of them, so grading only the first header misjudges sites that split
+/// their policy (e.g. `frame-ancestors` in one header, `default-src` in the
+/// next).
+fn parse_csp_policies<'a>(values: impl IntoIterator<Item = &'a str>) -> Vec<CspPolicy> {
+    values
+        .into_iter()
+        .flat_map(|v| v.split(','))
+        .map(|policy| {
+            policy
+                .split(';')
+                .filter_map(|directive| {
+                    let mut tokens = directive.split_ascii_whitespace();
+                    let name = tokens.next()?.to_ascii_lowercase();
+                    Some((name, tokens.map(str::to_ascii_lowercase).collect()))
+                })
+                .collect::<CspPolicy>()
+        })
+        .filter(|p| !p.is_empty())
+        .collect()
+}
+
+fn csp_directive<'a>(policy: &'a CspPolicy, name: &str) -> Option<&'a [String]> {
+    policy
+        .iter()
+        .find(|(n, _)| n == name)
+        .map(|(_, sources)| sources.as_slice())
+}
+
+/// How one policy constrains script execution.
+enum ScriptControl {
+    /// Neither `script-src` nor `default-src`: scripts are unrestricted.
+    None,
+    /// Restricted, but through the named unsafe keywords.
+    Unsafe(Vec<&'static str>),
+    /// Restricted with no effective unsafe keyword.
+    Safe,
+}
+
+fn script_control(policy: &CspPolicy) -> ScriptControl {
+    // `script-src` governs scripts; `default-src` is only its fallback.
+    let Some(sources) =
+        csp_directive(policy, "script-src").or_else(|| csp_directive(policy, "default-src"))
+    else {
+        return ScriptControl::None;
+    };
+    let has = |t: &str| sources.iter().any(|s| s == t);
+    // CSP2+: a nonce or hash makes browsers ignore 'unsafe-inline' (it is
+    // kept only as a fallback for CSP1 browsers), and CSP3 'strict-dynamic'
+    // does the same — Google's recommended strict policy relies on this.
+    let inline_neutralized = has("'strict-dynamic'")
+        || sources.iter().any(|s| {
+            s.starts_with("'nonce-")
+                || s.starts_with("'sha256-")
+                || s.starts_with("'sha384-")
+                || s.starts_with("'sha512-")
+        });
+    let mut unsafe_kw = Vec::new();
+    if has("'unsafe-inline'") && !inline_neutralized {
+        unsafe_kw.push("'unsafe-inline'");
+    }
+    if has("'unsafe-eval'") {
+        unsafe_kw.push("'unsafe-eval'");
+    }
+    if unsafe_kw.is_empty() {
+        ScriptControl::Safe
+    } else {
+        ScriptControl::Unsafe(unsafe_kw)
+    }
+}
+
+fn grade_csp(policies: &[CspPolicy], report_only: bool) -> (HeaderVerdict, Option<String>) {
+    if policies.is_empty() {
         if report_only {
             return (
                 HeaderVerdict::Weak,
@@ -251,44 +338,52 @@ fn grade_csp(value: Option<&str>, report_only: bool) -> (HeaderVerdict, Option<S
         );
     };
 
-    let lower = value.to_ascii_lowercase();
-    let unsafe_inline = lower.contains("'unsafe-inline'");
-    let unsafe_eval = lower.contains("'unsafe-eval'");
-    let has_baseline = lower.contains("default-src") || lower.contains("script-src");
+    // Every policy must allow a script for it to run, so one policy that
+    // restricts scripts safely protects the page regardless of the others.
+    let controls: Vec<ScriptControl> = policies.iter().map(script_control).collect();
+    if controls.iter().any(|c| matches!(c, ScriptControl::Safe)) {
+        return (HeaderVerdict::Strict, None);
+    }
 
-    if unsafe_inline || unsafe_eval {
-        let mut which = Vec::new();
-        if unsafe_inline {
-            which.push("'unsafe-inline'");
+    let mut which: Vec<&str> = Vec::new();
+    for control in &controls {
+        if let ScriptControl::Unsafe(kw) = control {
+            for k in kw {
+                if !which.contains(k) {
+                    which.push(k);
+                }
+            }
         }
-        if unsafe_eval {
-            which.push("'unsafe-eval'");
-        }
+    }
+    if !which.is_empty() {
         return (
             HeaderVerdict::Weak,
             Some(format!(
-                "Policy allows {} — this reopens the injection hole CSP exists to close.",
+                "Script policy allows {} — this reopens the injection hole CSP exists to close.",
                 which.join(" and ")
             )),
         );
     }
 
-    if !has_baseline {
-        return (
-            HeaderVerdict::Moderate,
-            Some("Policy sets neither default-src nor script-src, so script loading is unrestricted.".into()),
-        );
-    }
-
-    (HeaderVerdict::Strict, None)
+    (
+        HeaderVerdict::Moderate,
+        Some(
+            "Policy sets neither default-src nor script-src, so script loading is unrestricted."
+                .into(),
+        ),
+    )
 }
 
-fn grade_frame_options(value: Option<&str>, csp: Option<&str>) -> (HeaderVerdict, Option<String>) {
+fn grade_frame_options(
+    value: Option<&str>,
+    csp_policies: &[CspPolicy],
+) -> (HeaderVerdict, Option<String>) {
     // CSP frame-ancestors supersedes X-Frame-Options in every current browser;
-    // a site that sets it is protected even with no XFO header at all.
-    let csp_frame_ancestors = csp
-        .map(|c| c.to_ascii_lowercase().contains("frame-ancestors"))
-        .unwrap_or(false);
+    // a site that sets it is protected even with no XFO header at all — and
+    // browsers ignore XFO entirely when frame-ancestors is present.
+    let csp_frame_ancestors = csp_policies
+        .iter()
+        .any(|p| csp_directive(p, "frame-ancestors").is_some());
 
     let Some(value) = value else {
         if csp_frame_ancestors {
@@ -311,6 +406,14 @@ fn grade_frame_options(value: Option<&str>, csp: Option<&str>) -> (HeaderVerdict
 
     match value.trim().to_ascii_uppercase().as_str() {
         "DENY" | "SAMEORIGIN" => (HeaderVerdict::Strict, None),
+        // An obsolete or invalid XFO is harmless once frame-ancestors is set:
+        // that is exactly the migration the ALLOW-FROM advice recommends.
+        other if csp_frame_ancestors => (
+            HeaderVerdict::Present,
+            Some(format!(
+                "X-Frame-Options '{other}' is not a valid value, but CSP frame-ancestors is set and supersedes it."
+            )),
+        ),
         v if v.starts_with("ALLOW-FROM") => (
             HeaderVerdict::Weak,
             Some(
@@ -356,13 +459,6 @@ fn grade_referrer_policy(value: Option<&str>) -> (HeaderVerdict, Option<String>)
             ),
         );
     };
-    // A list picks the last token the browser understands; grading the
-    // strongest present token is a close, simpler approximation.
-    let tokens: Vec<String> = value
-        .split(',')
-        .map(|t| t.trim().to_ascii_lowercase())
-        .collect();
-
     let strict = [
         "no-referrer",
         "same-origin",
@@ -375,14 +471,25 @@ fn grade_referrer_policy(value: Option<&str>) -> (HeaderVerdict, Option<String>)
         "no-referrer-when-downgrade",
     ];
 
-    if tokens.iter().any(|t| strict.contains(&t.as_str())) {
+    // A list is a fallback chain: the browser applies the LAST token it
+    // understands (Referrer Policy §8.1), so `no-referrer, unsafe-url` is
+    // enforced as unsafe-url. Grading the strongest token would overstate it.
+    let effective = value
+        .split(',')
+        .map(|t| t.trim().to_ascii_lowercase())
+        .rev()
+        .find(|t| {
+            strict.contains(&t.as_str()) || moderate.contains(&t.as_str()) || t == "unsafe-url"
+        });
+
+    if effective.as_deref().is_some_and(|t| strict.contains(&t)) {
         (HeaderVerdict::Strict, None)
-    } else if tokens.iter().any(|t| moderate.contains(&t.as_str())) {
+    } else if effective.as_deref().is_some_and(|t| moderate.contains(&t)) {
         (
             HeaderVerdict::Moderate,
             Some("Policy still sends the origin cross-site; strict-origin-when-cross-origin is tighter.".into()),
         )
-    } else if tokens.iter().any(|t| t == "unsafe-url") {
+    } else if effective.as_deref() == Some("unsafe-url") {
         (
             HeaderVerdict::Weak,
             Some(
@@ -415,7 +522,14 @@ fn grade_enum(
     let Some(value) = value else {
         return (HeaderVerdict::Absent, Some(absent_advice.to_string()));
     };
-    let v = value.trim().to_ascii_lowercase();
+    // COOP/COEP/CORP are structured headers: the token may carry parameters
+    // (`require-corp; report-to="default"`), which do not change the policy.
+    let v = value
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
     match table.iter().find(|(k, _)| *k == v) {
         Some((_, verdict)) => (*verdict, None),
         None => (
@@ -430,8 +544,10 @@ fn grade_cookies(cookies: &[String]) -> Vec<CookieFinding> {
     cookies
         .iter()
         .map(|raw| {
-            let attrs = parse_attributes(raw);
-            // The first pair is `name=value`; everything after is attributes.
+            // The first pair is `name=value`; only what follows it are
+            // attributes. Parsing the whole string would let a cookie named
+            // `secure` (or `HttpOnly`, `SameSite`) masquerade as the flag.
+            let attrs = parse_attributes(raw.split_once(';').map_or("", |(_, rest)| rest));
             // Take the name from the raw header rather than the parsed attrs:
             // cookie names are case-sensitive, and `parse_attributes`
             // lowercases keys so attribute lookups can be case-insensitive.
@@ -600,20 +716,27 @@ fn build_notes(
 /// Grades an already-fetched response. Pure, so the whole ruleset is
 /// unit-testable without any network.
 fn build_report(domain: String, response: &FetchedResponse) -> HeaderReport {
-    let csp = response.header("content-security-policy");
+    let csp_policies = parse_csp_policies(response.header_all("content-security-policy"));
     let csp_report_only = response
         .header("content-security-policy-report-only")
         .is_some();
+    let over_https = response
+        .final_url
+        .get(..8)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"));
 
     let graded: Vec<(&str, (HeaderVerdict, Option<String>))> = vec![
         (
             "strict-transport-security",
-            grade_hsts(response.header("strict-transport-security")),
+            grade_hsts(response.header("strict-transport-security"), over_https),
         ),
-        ("content-security-policy", grade_csp(csp, csp_report_only)),
+        (
+            "content-security-policy",
+            grade_csp(&csp_policies, csp_report_only),
+        ),
         (
             "x-frame-options",
-            grade_frame_options(response.header("x-frame-options"), csp),
+            grade_frame_options(response.header("x-frame-options"), &csp_policies),
         ),
         (
             "x-content-type-options",
@@ -673,7 +796,11 @@ fn build_report(domain: String, response: &FetchedResponse) -> HeaderReport {
         .iter()
         .filter_map(|(name, _)| {
             let (_, (verdict, note)) = graded.iter().find(|(n, _)| n == name)?;
-            let value = response.header(name).map(|v| v.to_string());
+            // Show every delivered value (repeated header lines are one
+            // comma-joined field per RFC 9110), not just the first — CSP in
+            // particular is graded across all of them.
+            let values: Vec<&str> = response.header_all(name).collect();
+            let value = (!values.is_empty()).then(|| values.join(", "));
             Some(HeaderFinding {
                 header: (*name).to_string(),
                 present: value.is_some(),
@@ -732,7 +859,9 @@ fn build_report(domain: String, response: &FetchedResponse) -> HeaderReport {
 /// # }
 /// ```
 pub async fn audit_headers(domain: &str, timeout: Duration) -> Result<HeaderReport> {
-    let domain = normalize_domain(domain)?;
+    // The exact host: `www.example.com` is often a different origin (with
+    // different headers) than the apex, so `www.` is kept.
+    let domain = normalize_host(domain)?;
     let fetcher = GuardedFetcher::new().with_timeout(timeout);
     let response = fetcher.get(&format!("https://{domain}/")).await?;
     Ok(build_report(domain, &response))
@@ -757,50 +886,58 @@ mod tests {
         }
     }
 
+    /// Parses CSP header values the way `build_report` does.
+    fn csp(values: &[&str]) -> Vec<CspPolicy> {
+        parse_csp_policies(values.iter().copied())
+    }
+
     #[test]
     fn hsts_grading_bands() {
-        assert_eq!(grade_hsts(None).0, HeaderVerdict::Absent);
+        assert_eq!(grade_hsts(None, true).0, HeaderVerdict::Absent);
         assert_eq!(
-            grade_hsts(Some("max-age=31536000; includeSubDomains")).0,
+            grade_hsts(Some("max-age=31536000; includeSubDomains"), true).0,
             HeaderVerdict::Strict
         );
         // Strong max-age but no includeSubDomains leaves subdomains exposed.
         assert_eq!(
-            grade_hsts(Some("max-age=31536000")).0,
+            grade_hsts(Some("max-age=31536000"), true).0,
             HeaderVerdict::Moderate
         );
         assert_eq!(
-            grade_hsts(Some("max-age=15552000; includeSubDomains")).0,
+            grade_hsts(Some("max-age=15552000; includeSubDomains"), true).0,
             HeaderVerdict::Moderate
         );
-        assert_eq!(grade_hsts(Some("max-age=300")).0, HeaderVerdict::Weak);
+        assert_eq!(grade_hsts(Some("max-age=300"), true).0, HeaderVerdict::Weak);
         // max-age=0 actively disables HSTS.
-        assert_eq!(grade_hsts(Some("max-age=0")).0, HeaderVerdict::Weak);
-        assert_eq!(grade_hsts(Some("includeSubDomains")).0, HeaderVerdict::Weak);
+        assert_eq!(grade_hsts(Some("max-age=0"), true).0, HeaderVerdict::Weak);
+        assert_eq!(
+            grade_hsts(Some("includeSubDomains"), true).0,
+            HeaderVerdict::Weak
+        );
     }
 
     #[test]
     fn csp_unsafe_directives_are_weak() {
         assert_eq!(
-            grade_csp(Some("default-src 'self' 'unsafe-inline'"), false).0,
+            grade_csp(&csp(&["default-src 'self' 'unsafe-inline'"]), false).0,
             HeaderVerdict::Weak
         );
         assert_eq!(
-            grade_csp(Some("script-src 'unsafe-eval'"), false).0,
+            grade_csp(&csp(&["script-src 'unsafe-eval'"]), false).0,
             HeaderVerdict::Weak
         );
         assert_eq!(
-            grade_csp(Some("default-src 'self'"), false).0,
+            grade_csp(&csp(&["default-src 'self'"]), false).0,
             HeaderVerdict::Strict
         );
         // A policy with no script-governing directive restricts nothing.
         assert_eq!(
-            grade_csp(Some("img-src 'self'"), false).0,
+            grade_csp(&csp(&["img-src 'self'"]), false).0,
             HeaderVerdict::Moderate
         );
-        assert_eq!(grade_csp(None, false).0, HeaderVerdict::Absent);
+        assert_eq!(grade_csp(&[], false).0, HeaderVerdict::Absent);
         // Report-Only alone blocks nothing, but is better than silence.
-        assert_eq!(grade_csp(None, true).0, HeaderVerdict::Weak);
+        assert_eq!(grade_csp(&[], true).0, HeaderVerdict::Weak);
     }
 
     #[test]
@@ -808,28 +945,188 @@ mod tests {
         // Modern browsers honor frame-ancestors over XFO, so a site using it
         // must not be marked as missing clickjacking protection.
         let (verdict, note) =
-            grade_frame_options(None, Some("default-src 'self'; frame-ancestors 'none'"));
+            grade_frame_options(None, &csp(&["default-src 'self'; frame-ancestors 'none'"]));
         assert_eq!(verdict, HeaderVerdict::Present);
         assert!(note.unwrap_or_default().contains("frame-ancestors"));
 
         // Without either, it is a real gap.
         assert_eq!(
-            grade_frame_options(None, Some("default-src 'self'")).0,
+            grade_frame_options(None, &csp(&["default-src 'self'"])).0,
             HeaderVerdict::Absent
         );
         assert_eq!(
-            grade_frame_options(Some("DENY"), None).0,
+            grade_frame_options(Some("DENY"), &[]).0,
             HeaderVerdict::Strict
         );
         assert_eq!(
-            grade_frame_options(Some("SAMEORIGIN"), None).0,
+            grade_frame_options(Some("SAMEORIGIN"), &[]).0,
             HeaderVerdict::Strict
         );
         // ALLOW-FROM is obsolete and silently ignored.
         assert_eq!(
-            grade_frame_options(Some("ALLOW-FROM https://x.com"), None).0,
+            grade_frame_options(Some("ALLOW-FROM https://x.com"), &[]).0,
             HeaderVerdict::Weak
         );
+    }
+
+    #[test]
+    fn hsts_quoted_max_age_and_insecure_transport() {
+        // RFC 6797 permits a quoted-string value.
+        assert_eq!(
+            grade_hsts(Some("max-age=\"31536000\"; includeSubDomains"), true).0,
+            HeaderVerdict::Strict
+        );
+        // Browsers ignore STS received over plain HTTP.
+        assert_eq!(
+            grade_hsts(Some("max-age=31536000; includeSubDomains"), false).0,
+            HeaderVerdict::Absent
+        );
+        let mut response = response_with(&[(
+            "Strict-Transport-Security",
+            "max-age=31536000; includeSubDomains",
+        )]);
+        response.final_url = "http://example.com/".to_string();
+        let report = build_report("example.com".into(), &response);
+        let hsts = report
+            .headers
+            .iter()
+            .find(|h| h.header == "strict-transport-security")
+            .unwrap();
+        assert_eq!(hsts.verdict, HeaderVerdict::Absent);
+    }
+
+    #[test]
+    fn csp_nonce_hash_and_strict_dynamic_neutralize_unsafe_inline() {
+        // Google's recommended strict CSP keeps 'unsafe-inline' only as a
+        // CSP1 fallback; nonce/strict-dynamic make browsers ignore it.
+        assert_eq!(
+            grade_csp(
+                &csp(&["script-src 'nonce-r4nd' 'unsafe-inline' 'strict-dynamic' https:; object-src 'none'; base-uri 'none'"]),
+                false
+            )
+            .0,
+            HeaderVerdict::Strict
+        );
+        assert_eq!(
+            grade_csp(&csp(&["script-src 'sha256-abc=' 'unsafe-inline'"]), false).0,
+            HeaderVerdict::Strict
+        );
+        // 'unsafe-eval' is not neutralized by a nonce.
+        assert_eq!(
+            grade_csp(&csp(&["script-src 'nonce-x' 'unsafe-eval'"]), false).0,
+            HeaderVerdict::Weak
+        );
+        // 'unsafe-inline' that only reaches styles does not reopen script
+        // injection.
+        assert_eq!(
+            grade_csp(
+                &csp(&["default-src 'self'; style-src 'self' 'unsafe-inline'"]),
+                false
+            )
+            .0,
+            HeaderVerdict::Strict
+        );
+        // script-src overrides a safe default-src.
+        assert_eq!(
+            grade_csp(
+                &csp(&["default-src 'self'; script-src 'self' 'unsafe-inline'"]),
+                false
+            )
+            .0,
+            HeaderVerdict::Weak
+        );
+    }
+
+    #[test]
+    fn csp_is_graded_across_every_delivered_policy() {
+        // Policy split over two header lines: scripts are still restricted.
+        let response = response_with(&[
+            ("Content-Security-Policy", "frame-ancestors 'self'"),
+            ("Content-Security-Policy", "default-src 'self'"),
+        ]);
+        let report = build_report("example.com".into(), &response);
+        let find = |name: &str| {
+            report
+                .headers
+                .iter()
+                .find(|h| h.header == name)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(
+            find("content-security-policy").verdict,
+            HeaderVerdict::Strict
+        );
+        // frame-ancestors in the first header still supersedes a missing XFO.
+        assert_eq!(find("x-frame-options").verdict, HeaderVerdict::Present);
+        // Both values are shown.
+        assert_eq!(
+            find("content-security-policy").value.as_deref(),
+            Some("frame-ancestors 'self', default-src 'self'")
+        );
+        // A comma-separated list in one line is also several policies, and
+        // one safe policy is enough because every policy must pass.
+        assert_eq!(
+            grade_csp(
+                &csp(&["script-src 'unsafe-inline', script-src 'self'"]),
+                false
+            )
+            .0,
+            HeaderVerdict::Strict
+        );
+    }
+
+    #[test]
+    fn invalid_xfo_is_superseded_by_frame_ancestors() {
+        // Exactly the migration the ALLOW-FROM advice recommends.
+        let (verdict, note) = grade_frame_options(
+            Some("ALLOW-FROM https://x.example"),
+            &csp(&["frame-ancestors 'self'"]),
+        );
+        assert_eq!(verdict, HeaderVerdict::Present);
+        assert!(note.unwrap_or_default().contains("frame-ancestors"));
+        // Still Weak without frame-ancestors.
+        assert_eq!(
+            grade_frame_options(Some("ALLOW-FROM https://x.example"), &[]).0,
+            HeaderVerdict::Weak
+        );
+    }
+
+    #[test]
+    fn cross_origin_policies_ignore_structured_header_parameters() {
+        let coep = [
+            ("require-corp", HeaderVerdict::Strict),
+            ("unsafe-none", HeaderVerdict::Weak),
+        ];
+        assert_eq!(
+            grade_enum(Some("require-corp; report-to=\"default\""), &coep, "x").0,
+            HeaderVerdict::Strict
+        );
+        let coop = [
+            ("same-origin", HeaderVerdict::Strict),
+            ("same-origin-allow-popups", HeaderVerdict::Moderate),
+        ];
+        assert_eq!(
+            grade_enum(
+                Some("same-origin-allow-popups; report-to=\"gws\""),
+                &coop,
+                "x"
+            )
+            .0,
+            HeaderVerdict::Moderate
+        );
+    }
+
+    #[test]
+    fn cookie_name_is_not_mistaken_for_an_attribute() {
+        let findings = grade_cookies(&[
+            "secure=1; Path=/".to_string(),
+            "HttpOnly=yes; SameSite=Lax".to_string(),
+        ]);
+        assert_eq!(findings[0].name, "secure");
+        assert!(!findings[0].secure, "a cookie NAMED secure is not Secure");
+        assert!(!findings[1].http_only);
+        assert_eq!(findings[1].same_site.as_deref(), Some("Lax"));
     }
 
     #[test]
@@ -850,9 +1147,23 @@ mod tests {
             grade_referrer_policy(Some("unsafe-url")).0,
             HeaderVerdict::Weak
         );
-        // A fallback list is graded on its strongest understood token.
+        // A fallback list is graded on the LAST understood token — the one
+        // the browser actually applies.
         assert_eq!(
             grade_referrer_policy(Some("no-referrer, strict-origin-when-cross-origin")).0,
+            HeaderVerdict::Strict
+        );
+        assert_eq!(
+            grade_referrer_policy(Some("no-referrer, unsafe-url")).0,
+            HeaderVerdict::Weak
+        );
+        assert_eq!(
+            grade_referrer_policy(Some("strict-origin, origin")).0,
+            HeaderVerdict::Moderate
+        );
+        // An unknown trailing token falls back to the last known one.
+        assert_eq!(
+            grade_referrer_policy(Some("no-referrer, some-future-policy")).0,
             HeaderVerdict::Strict
         );
         assert_eq!(grade_referrer_policy(None).0, HeaderVerdict::Absent);

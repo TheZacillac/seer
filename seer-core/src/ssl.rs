@@ -22,7 +22,7 @@ use crate::caa::{self, CaaPolicy};
 use crate::dns::DnsResolver;
 use crate::error::{Result, SeerError};
 use crate::net::resolve_public_host;
-use crate::validation::normalize_domain;
+use crate::validation::normalize_host;
 
 /// Default timeout for SSL operations (10 seconds).
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -33,6 +33,15 @@ const RSA_MIN_KEY_BITS: u32 = 2048;
 const EC_MIN_KEY_BITS: u32 = 256;
 /// Days-until-expiry threshold below which a still-valid cert is flagged.
 const CERT_EXPIRING_SOON_DAYS: i64 = 30;
+
+/// Whole days from `now` until `when`, rounded toward negative infinity.
+///
+/// `TimeDelta::num_days` truncates toward zero, so a certificate that expired
+/// five hours ago would read as `0` ("expires in 0 days") and slip past every
+/// `< 0` expired check. Flooring makes any instant in the past negative.
+pub(crate) fn days_until(when: DateTime<Utc>, now: DateTime<Utc>) -> i64 {
+    (when - now).num_seconds().div_euclid(86_400)
+}
 
 /// Derives security-posture [`CertWarning`]s from an already-parsed leaf
 /// certificate plus the computed validity/hostname signals. Pure — no network
@@ -272,7 +281,9 @@ impl SslChecker {
     /// * `Err(SeerError)` - If connection or certificate parsing fails
     #[instrument(skip(self), fields(domain = %domain))]
     pub async fn check(&self, domain: &str) -> Result<SslReport> {
-        let domain = normalize_domain(domain)?;
+        // The exact host: `www.example.com` can serve a different
+        // certificate than the apex, so `www.` must not be stripped here.
+        let domain = normalize_host(domain)?;
 
         debug!(domain = %domain, "Checking SSL certificate chain");
 
@@ -340,7 +351,7 @@ impl SslChecker {
         let leaf_detail = parse_cert_detail(&x509)?;
 
         let now = Utc::now();
-        let days_until_expiry = (leaf_detail.valid_until - now).num_days();
+        let days_until_expiry = days_until(leaf_detail.valid_until, now);
         let is_valid = now >= leaf_detail.valid_from && now <= leaf_detail.valid_until;
 
         // Hostname verification: does the leaf cert's SAN (or CN fallback)
@@ -505,6 +516,11 @@ fn oid_to_name(oid: &Oid) -> Option<String> {
         "1.2.840.113549.1.1.12" => Some("SHA-384 with RSA".to_string()),
         "1.2.840.113549.1.1.13" => Some("SHA-512 with RSA".to_string()),
         "1.2.840.113549.1.1.5" => Some("SHA-1 with RSA".to_string()),
+        // Deprecated algorithms are named (rather than left as raw OIDs) so
+        // the "sha1"/"md5" signature warning can recognize them.
+        "1.2.840.113549.1.1.4" => Some("MD5 with RSA".to_string()),
+        "1.2.840.10045.4.1" => Some("ECDSA with SHA-1".to_string()),
+        "1.2.840.10040.4.3" => Some("DSA with SHA-1".to_string()),
         "1.2.840.113549.1.1.14" => Some("SHA-224 with RSA".to_string()),
         "1.2.840.10045.4.3.2" => Some("ECDSA with SHA-256".to_string()),
         "1.2.840.10045.4.3.3" => Some("ECDSA with SHA-384".to_string()),
@@ -685,6 +701,49 @@ mod tests {
         assert_eq!(w.len(), 1);
         assert_eq!(w[0].severity, CertWarningSeverity::Warning);
         assert!(w[0].message.contains("expires in 10 day(s)"));
+    }
+
+    #[test]
+    fn days_until_floors_so_recent_expiry_is_negative() {
+        let now = Utc::now();
+        // Expired five hours ago: truncation used to report 0 ("expires in 0
+        // days") and the expired branch never fired.
+        assert_eq!(days_until(now - chrono::Duration::hours(5), now), -1);
+        assert_eq!(days_until(now + chrono::Duration::hours(5), now), 0);
+        assert_eq!(days_until(now, now), 0);
+        assert_eq!(days_until(now + chrono::Duration::days(3), now), 3);
+        assert_eq!(days_until(now - chrono::Duration::days(3), now), -3);
+
+        let w = derive_cert_warnings(
+            &sample_leaf(),
+            false,
+            true,
+            days_until(now - chrono::Duration::hours(5), now),
+        );
+        assert!(
+            w.iter().any(|x| x.message.contains("expired 1 day(s) ago")),
+            "a just-expired cert must not be reported as not-yet-valid: {w:?}"
+        );
+        assert!(!w.iter().any(|x| x.message.contains("not yet valid")));
+    }
+
+    #[test]
+    fn deprecated_signature_oids_are_named_and_flagged() {
+        for (arcs, name) in [
+            (&[1u64, 2, 840, 113549, 1, 1, 4][..], "MD5 with RSA"),
+            (&[1u64, 2, 840, 10045, 4, 1][..], "ECDSA with SHA-1"),
+            (&[1u64, 2, 840, 10040, 4, 3][..], "DSA with SHA-1"),
+        ] {
+            let oid = Oid::from(arcs).unwrap();
+            assert_eq!(oid_to_name(&oid).as_deref(), Some(name));
+            let mut leaf = sample_leaf();
+            leaf.signature_algorithm = oid_to_name(&oid);
+            let w = derive_cert_warnings(&leaf, true, true, 90);
+            assert!(
+                w.iter().any(|x| x.message.contains("deprecated signature")),
+                "{name} must be flagged: {w:?}"
+            );
+        }
     }
 
     #[test]

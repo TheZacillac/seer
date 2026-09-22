@@ -23,7 +23,7 @@ use crate::caa::{self, CaaPolicy};
 use crate::dns::{DnsResolver, RecordData, RecordType};
 use crate::error::{Result, SeerError};
 use crate::lookup::SmartLookup;
-use crate::validation::normalize_domain;
+use crate::validation::normalize_host;
 
 /// Default timeout for HTTP and TLS operations (10 seconds).
 /// Balances responsiveness with allowing slow servers to respond.
@@ -86,8 +86,11 @@ impl StatusClient {
     /// Checks the status of a domain (HTTP, SSL, expiration, DNS).
     #[instrument(skip(self), fields(domain = %domain))]
     pub async fn check(&self, domain: &str) -> Result<StatusResponse> {
-        // Normalize domain format (doesn't require DNS resolution)
-        let domain = normalize_domain(domain)?;
+        // Normalize domain format (doesn't require DNS resolution). The exact
+        // host is kept — `www.example.com` can serve a different site and
+        // certificate than the apex; the expiration lookup reduces it to the
+        // registration on its own.
+        let domain = normalize_host(domain)?;
         debug!("Checking status for domain: {}", domain);
 
         let mut response = StatusResponse::new(domain.clone());
@@ -324,7 +327,7 @@ impl StatusClient {
                 let (expiration_date, registrar) = result.expiration_info();
 
                 if let Some(exp_date) = expiration_date {
-                    let days_until_expiry = (exp_date - Utc::now()).num_days();
+                    let days_until_expiry = crate::ssl::days_until(exp_date, Utc::now());
                     Ok(Some(DomainExpiration {
                         expiration_date: exp_date,
                         days_until_expiry,
@@ -418,7 +421,7 @@ impl StatusClient {
 ///
 /// Strips ASCII control characters (NUL, ESC, etc.) at extraction time so
 /// the value is safe for every downstream sink — JSON (which would happily
-/// encode ` ` and pass it to an LLM via the MCP server), the human
+/// encode `\u0000` and pass it to an LLM via the MCP server), the human
 /// formatter (which sanitises again at render time), and the bulk-CSV
 /// writer. Without the strip, a crafted `<title>Foo\x00Bar</title>` reaches
 /// the LLM context window.
@@ -487,7 +490,7 @@ fn parse_certificate_der(der: &[u8], domain: &str) -> Result<CertificateInfo> {
     let valid_until = asn1_time_to_chrono(cert.validity().not_after)?;
 
     let now = Utc::now();
-    let days_until_expiry = (valid_until - now).num_days();
+    let days_until_expiry = crate::ssl::days_until(valid_until, now);
     let is_valid = now >= valid_from && now <= valid_until;
 
     // Hostname verification is performed manually because the TLS connector
@@ -530,23 +533,31 @@ fn hostname_matches_pattern(host: &str, pattern: &str) -> bool {
 /// Checks whether a certificate's SAN dNSName entries (or CN as fallback)
 /// match the queried hostname.
 ///
-/// Per RFC 6125, SAN dNSName is the authoritative source; CN is only checked
-/// as a legacy fallback.
+/// Per RFC 6125 §6.4.4, SAN dNSName is the authoritative source and the CN
+/// is consulted ONLY when the certificate carries no dNSName SAN at all —
+/// otherwise a cert whose SANs cover other hosts but whose CN happens to
+/// name this one would falsely verify. Mirrors `ssl.rs`, so `seer status`
+/// and `seer ssl` cannot disagree about the same certificate.
 fn cert_matches_hostname(cert: &x509_parser::certificate::X509Certificate<'_>, host: &str) -> bool {
     use x509_parser::prelude::*;
 
     // SAN dNSName entries (preferred per RFC 6125)
+    let mut has_dns_san = false;
     if let Ok(Some(san_ext)) = cert.tbs_certificate.subject_alternative_name() {
         for name in &san_ext.value.general_names {
             if let GeneralName::DNSName(n) = name {
+                has_dns_san = true;
                 if hostname_matches_pattern(host, n) {
                     return true;
                 }
             }
         }
     }
+    if has_dns_san {
+        return false;
+    }
 
-    // CN fallback (legacy)
+    // CN fallback (legacy) — only for certificates without dNSName SANs.
     for cn in cert.subject().iter_common_name() {
         if let Ok(s) = cn.as_str() {
             if hostname_matches_pattern(host, s) {
@@ -685,6 +696,28 @@ mod tests {
     fn hostname_matches_pattern_wildcard_requires_dot() {
         // A bare host with no dot cannot match a wildcard pattern
         assert!(!hostname_matches_pattern("localhost", "*.example.com"));
+    }
+
+    /// Self-signed P-256 cert: CN=victim.example, SAN=DNS:other.example.
+    const CERT_CN_VICTIM_SAN_OTHER: &str = "MIIBoDCCAUegAwIBAgIUdStRrtt0ycIGUV74700+xRrFcJ0wCgYIKoZIzj0EAwIwGTEXMBUGA1UEAwwOdmljdGltLmV4YW1wbGUwHhcNMjYwOTIyMTcwMzA4WhcNMzYwOTE5MTcwMzA4WjAZMRcwFQYDVQQDDA52aWN0aW0uZXhhbXBsZTBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABJPCvcjh/aeA2qb1taFaBCxI/ue4srU8jUNjjvQW9IKMqdsUluEGjW7fcYSa8w/79MWZ/naVmgZKQs/eSXCU/AWjbTBrMB0GA1UdDgQWBBSG5So71BSr3DZri66kQaPKzWbjNDAfBgNVHSMEGDAWgBSG5So71BSr3DZri66kQaPKzWbjNDAPBgNVHRMBAf8EBTADAQH/MBgGA1UdEQQRMA+CDW90aGVyLmV4YW1wbGUwCgYIKoZIzj0EAwIDRwAwRAIgEnAMNQMytsawL+CuV7N9z/ftwHVzdFunp+oG7QjIou4CIHsf9vyIXQUPs5iBrhprcRiwyuZQWy0mZyRdavp4Kgbh";
+    /// Self-signed P-256 cert: CN=victim.example, no SAN extension.
+    const CERT_CN_VICTIM_NO_SAN: &str = "MIIBhzCCAS2gAwIBAgIUeGkzmcc68l5FOH5NOBgS3Ybcg4gwCgYIKoZIzj0EAwIwGTEXMBUGA1UEAwwOdmljdGltLmV4YW1wbGUwHhcNMjYwOTIyMTcwMzA4WhcNMzYwOTE5MTcwMzA4WjAZMRcwFQYDVQQDDA52aWN0aW0uZXhhbXBsZTBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABC6rgHiHBhd3vxpcRHm7VH2YgCybc0Bl4ewS1lMjdtM5+R+pX/STje36olq5IDx9AEJfxtdRMvtiWp9jfb5vdB6jUzBRMB0GA1UdDgQWBBS5JfZqENT0bfsAazBNLiAVb77UdzAfBgNVHSMEGDAWgBS5JfZqENT0bfsAazBNLiAVb77UdzAPBgNVHRMBAf8EBTADAQH/MAoGCCqGSM49BAMCA0gAMEUCIQD5zMnpSHSVr3vSmZM0vh0R345Rg3wc+OgeZwmsDxDJQQIgBNJ0CS0bpChCAQls0oFZUPD6u7iX7uBOD/QRPZ2Ub1k=";
+
+    fn cert_info(b64: &str, host: &str) -> CertificateInfo {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let der = STANDARD.decode(b64).unwrap();
+        parse_certificate_der(&der, host).unwrap()
+    }
+
+    #[test]
+    fn cn_is_ignored_when_the_cert_has_dns_sans() {
+        // RFC 6125 §6.4.4: a matching CN must not rescue a cert whose SANs
+        // name other hosts. `seer ssl` already applied this; status did not.
+        assert!(!cert_info(CERT_CN_VICTIM_SAN_OTHER, "victim.example").hostname_verified);
+        assert!(cert_info(CERT_CN_VICTIM_SAN_OTHER, "other.example").hostname_verified);
+        // Legacy cert with no SAN at all still falls back to the CN.
+        assert!(cert_info(CERT_CN_VICTIM_NO_SAN, "victim.example").hostname_verified);
+        assert!(!cert_info(CERT_CN_VICTIM_NO_SAN, "other.example").hostname_verified);
     }
 
     // --- validate_url_target tests (hermetic: IP literals, no DNS) -------
