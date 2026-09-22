@@ -5,7 +5,8 @@
 //! are registered, ranking freshly-registered squats first. This is a
 //! brand-protection / phishing-defense capability built entirely on primitives
 //! seer already has (normalization, smart lookup, availability inference) — no
-//! new protocol code.
+//! new protocol code. The brand label is found with the Public Suffix List, so
+//! `example.co.uk` permutes `example`, not `co`.
 //!
 //! Candidate generation is pure and unit-tested; only the registration scoring
 //! is async.
@@ -27,13 +28,15 @@
 //! a negligible miss rate for a large reduction in registry queries (a
 //! rate-limit-ban risk against port-43 WHOIS).
 
+use std::collections::HashSet;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::dns::DnsPresence;
-use crate::domain_info::{DomainInfo, DomainInfoSource};
+use crate::domain_info::DomainInfo;
 use crate::error::Result;
-use crate::lookup::SmartLookup;
+use crate::lookup::{LookupResult, SmartLookup};
 use crate::validation::normalize_domain;
 
 /// Upper bound on generated candidates, to keep the subsequent network scoring
@@ -139,105 +142,179 @@ fn is_ldh(c: char) -> bool {
     c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'
 }
 
+/// Records `candidate` under `technique` unless it is the original name or
+/// was already produced (by this or an earlier technique).
+fn push_unique(
+    seen: &mut HashSet<String>,
+    bucket: &mut Vec<ConfusableCandidate>,
+    original: &str,
+    candidate: String,
+    technique: &str,
+) {
+    if candidate != original && seen.insert(candidate.clone()) {
+        bucket.push(ConfusableCandidate {
+            domain: candidate,
+            technique: technique.to_string(),
+        });
+    }
+}
+
+/// Splits `cap` across buckets of the given `sizes` by water-filling: every
+/// bucket is offered an equal share of what is left, and a bucket smaller
+/// than its share hands the remainder on to the larger ones. Only buckets
+/// larger than an equal split are truncated, so every non-empty technique
+/// keeps at least `cap / buckets` candidates (or all of them).
+fn fair_shares(sizes: &[usize], cap: usize) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..sizes.len()).collect();
+    order.sort_by_key(|&i| sizes[i]);
+    let mut shares = vec![0; sizes.len()];
+    let mut remaining = cap;
+    for (k, &i) in order.iter().enumerate() {
+        let take = sizes[i].min(remaining / (sizes.len() - k));
+        shares[i] = take;
+        remaining -= take;
+    }
+    shares
+}
+
 /// Generates typo/homoglyph look-alike candidates for `domain`.
 ///
-/// The final DNS label (the registrable label preceding the TLD) is permuted;
-/// the rest of the name (any subdomains) and the TLD are preserved, except for
-/// the dedicated `tld-swap` technique. Output is deduplicated, excludes the
-/// input itself, and capped at [`MAX_CANDIDATES`].
+/// The name is split at its registrable boundary using the Public Suffix
+/// List: the brand label is the one immediately left of the ICANN public
+/// suffix (`example` in `mail.example.co.uk`). That label is permuted; any
+/// deeper subdomain labels and the suffix are preserved, except for the
+/// dedicated `tld-swap` technique, which swaps the whole suffix
+/// (`example.co.uk` → `example.com`). Output is deduplicated, excludes the
+/// input itself, and capped at [`MAX_CANDIDATES`] with the budget shared
+/// fairly across techniques (see [`fair_shares`]). A bare public suffix has
+/// no brand label and yields nothing.
 pub fn generate_candidates(domain: &str) -> Vec<ConfusableCandidate> {
     let Ok(normalized) = normalize_domain(domain) else {
         return Vec::new();
     };
-    let Some((prefix, tld)) = normalized.rsplit_once('.') else {
+    let Some(tld) = crate::psl::public_suffix(&normalized) else {
         return Vec::new();
     };
-    // Permute only the leftmost label of the prefix (the registrable label),
-    // keeping any deeper subdomain labels fixed.
+    let Some(prefix) = normalized
+        .strip_suffix(tld)
+        .and_then(|p| p.strip_suffix('.'))
+        .filter(|p| !p.is_empty())
+    else {
+        return Vec::new();
+    };
+    // Permute only the registrable label, keeping any deeper subdomain
+    // labels fixed.
     let (sub, label) = match prefix.rsplit_once('.') {
         Some((sub, label)) => (Some(sub), label),
         None => (None, prefix),
     };
 
-    let mut seen = std::collections::HashSet::new();
-    let mut out = Vec::new();
-    let mut push = |label_variant: String, technique: &str, out: &mut Vec<ConfusableCandidate>| {
-        if label_variant.is_empty()
-            || label_variant.starts_with('-')
-            || label_variant.ends_with('-')
-        {
-            return;
+    // Rebuilds the full candidate name around a permuted label, rejecting
+    // labels that are empty or start/end with a hyphen.
+    let with_label = |variant: &str| -> Option<String> {
+        if variant.is_empty() || variant.starts_with('-') || variant.ends_with('-') {
+            return None;
         }
-        let candidate = match sub {
-            Some(sub) => format!("{sub}.{label_variant}.{tld}"),
-            None => format!("{label_variant}.{tld}"),
-        };
-        if candidate != normalized && seen.insert(candidate.clone()) {
-            out.push(ConfusableCandidate {
-                domain: candidate,
-                technique: technique.to_string(),
-            });
+        Some(match sub {
+            Some(sub) => format!("{sub}.{variant}.{tld}"),
+            None => format!("{variant}.{tld}"),
+        })
+    };
+
+    let mut seen = HashSet::new();
+    // One bucket per technique, in generation order (which also decides
+    // attribution when two techniques produce the same name).
+    let mut buckets: Vec<Vec<ConfusableCandidate>> = Vec::new();
+    let mut emit = |technique: &str, variants: Vec<String>| {
+        let mut bucket = Vec::new();
+        for variant in variants {
+            if let Some(candidate) = with_label(&variant) {
+                push_unique(&mut seen, &mut bucket, &normalized, candidate, technique);
+            }
         }
+        buckets.push(bucket);
     };
 
     let chars: Vec<char> = label.chars().collect();
+    let join_chars = |v: Vec<char>| v.into_iter().collect::<String>();
 
     // Omission: drop each character.
-    for i in 0..chars.len() {
-        let mut v = chars.clone();
-        v.remove(i);
-        push(v.into_iter().collect(), "omission", &mut out);
-    }
+    emit(
+        "omission",
+        (0..chars.len())
+            .map(|i| {
+                let mut v = chars.clone();
+                v.remove(i);
+                join_chars(v)
+            })
+            .collect(),
+    );
 
     // Transposition: swap adjacent characters.
-    for i in 0..chars.len().saturating_sub(1) {
-        let mut v = chars.clone();
-        v.swap(i, i + 1);
-        push(v.into_iter().collect(), "transposition", &mut out);
-    }
+    emit(
+        "transposition",
+        (0..chars.len().saturating_sub(1))
+            .map(|i| {
+                let mut v = chars.clone();
+                v.swap(i, i + 1);
+                join_chars(v)
+            })
+            .collect(),
+    );
 
     // Repetition: double each character.
-    for i in 0..chars.len() {
-        let mut v = chars.clone();
-        v.insert(i, chars[i]);
-        push(v.into_iter().collect(), "repetition", &mut out);
-    }
+    emit(
+        "repetition",
+        (0..chars.len())
+            .map(|i| {
+                let mut v = chars.clone();
+                v.insert(i, chars[i]);
+                join_chars(v)
+            })
+            .collect(),
+    );
 
     // Adjacent-key replacement.
+    let mut replacements = Vec::new();
     for (i, &c) in chars.iter().enumerate() {
         for &n in keyboard_neighbors(c) {
             let mut v = chars.clone();
             v[i] = n;
-            push(v.into_iter().collect(), "replacement", &mut out);
+            replacements.push(join_chars(v));
         }
     }
+    emit("replacement", replacements);
 
     // Insertion: insert each lowercase letter at every gap.
+    let mut insertions = Vec::new();
     for i in 0..=chars.len() {
         for n in b'a'..=b'z' {
             let mut v = chars.clone();
             v.insert(i, n as char);
-            push(v.into_iter().collect(), "insertion", &mut out);
+            insertions.push(join_chars(v));
         }
     }
+    emit("insertion", insertions);
 
     // Bitsquatting: flip each bit of each byte; keep valid LDH results.
+    let mut bitsquats = Vec::new();
     for (i, &c) in chars.iter().enumerate() {
         if !c.is_ascii() {
             continue;
         }
         for bit in 0..7 {
-            let flipped = (c as u8) ^ (1 << bit);
-            let fc = flipped as char;
+            let fc = ((c as u8) ^ (1 << bit)) as char;
             if is_ldh(fc) && fc != c {
                 let mut v = chars.clone();
                 v[i] = fc;
-                push(v.into_iter().collect(), "bitsquat", &mut out);
+                bitsquats.push(join_chars(v));
             }
         }
     }
+    emit("bitsquat", bitsquats);
 
     // Homoglyph substitution.
+    let mut glyphs = Vec::new();
     for (i, &c) in chars.iter().enumerate() {
         for &sub_str in homoglyphs(c) {
             let mut variant = String::new();
@@ -248,14 +325,12 @@ pub fn generate_candidates(domain: &str) -> Vec<ConfusableCandidate> {
                     variant.push(cc);
                 }
             }
-            push(variant, "homoglyph", &mut out);
+            glyphs.push(variant);
         }
     }
+    emit("homoglyph", glyphs);
 
-    // TLD swap: keep the label, swap the TLD. Collected separately so the
-    // cap below cannot drop them: label permutations grow with label length
-    // (insertion alone is 26×(L+1)), and a plain tail truncation silently
-    // discarded every tld-swap for ~16+ char labels.
+    // TLD swap: keep the label, swap the whole public suffix.
     let mut swaps = Vec::new();
     for &swap in SWAP_TLDS {
         if swap != tld {
@@ -263,20 +338,27 @@ pub fn generate_candidates(domain: &str) -> Vec<ConfusableCandidate> {
                 Some(sub) => format!("{sub}.{label}.{swap}"),
                 None => format!("{label}.{swap}"),
             };
-            if candidate != normalized && seen.insert(candidate.clone()) {
-                swaps.push(ConfusableCandidate {
-                    domain: candidate,
-                    technique: "tld-swap".to_string(),
-                });
-            }
+            push_unique(&mut seen, &mut swaps, &normalized, candidate, "tld-swap");
         }
     }
+    buckets.push(swaps);
 
-    // Budget the cap: tld-swaps (a dozen at most) always fit; the label
-    // permutations absorb the truncation.
-    out.truncate(MAX_CANDIDATES.saturating_sub(swaps.len()));
-    out.extend(swaps);
-    out
+    // Share the cap across techniques. Label permutations grow with label
+    // length (insertion alone is 26×(L+1)), and a plain tail truncation
+    // silently dropped whole techniques — every tld-swap for ~16+ char
+    // labels, and bitsquat + homoglyph (the namesake technique) for
+    // `paypalsecurelogin.com`. Water-filling only trims the techniques that
+    // exceed an equal split, in practice insertion.
+    let sizes: Vec<usize> = buckets.iter().map(Vec::len).collect();
+    let shares = fair_shares(&sizes, MAX_CANDIDATES);
+    buckets
+        .into_iter()
+        .zip(shares)
+        .flat_map(|(mut bucket, share)| {
+            bucket.truncate(share);
+            bucket
+        })
+        .collect()
 }
 
 /// Whether a candidate survives the DNS presence pre-filter and warrants a
@@ -287,12 +369,52 @@ fn survives_prefilter(presence: DnsPresence) -> bool {
     !matches!(presence, DnsPresence::Absent)
 }
 
+/// Turns a candidate's lookup into a registered look-alike, or `None` when
+/// the lookup says the name appears available.
+///
+/// Only an availability claim drops a candidate. `LookupResult::Available`
+/// (and so `DomainInfoSource::Available`) also carries *registered* verdicts
+/// — a delegated apex behind a failed registry leg (`dns_present`), a
+/// throttled registry (`inconclusive`) — and dropping those silently hid
+/// registered look-alikes, exactly the ones a brand-protection scan exists
+/// to surface.
+fn lookalike_from_result(
+    cand: ConfusableCandidate,
+    result: &LookupResult,
+) -> Option<RegisteredLookalike> {
+    if let LookupResult::Available { data, .. } = result {
+        if data.available {
+            return None;
+        }
+    }
+    let info = DomainInfo::from_lookup_result(result);
+    Some(RegisteredLookalike {
+        domain: cand.domain,
+        technique: cand.technique,
+        registrar: info.registrar,
+        creation_date: info.creation_date,
+        nameservers: info.nameservers,
+    })
+}
+
+/// Orders registered look-alikes newest registration first, undated entries
+/// last; ties (and undated entries) by domain name for a stable report.
+fn rank_lookalikes(registered: &mut [RegisteredLookalike]) {
+    registered.sort_by(|a, b| match (a.creation_date, b.creation_date) {
+        (Some(ad), Some(bd)) => bd.cmp(&ad).then_with(|| a.domain.cmp(&b.domain)),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => a.domain.cmp(&b.domain),
+    });
+}
+
 /// Scores which `candidates` are registered.
 ///
 /// Candidates are first pre-filtered by a cheap DNS presence probe: those that
 /// return `NXDOMAIN` are unregistered and dropped without a registry lookup
 /// (see the module docs). The survivors get a full smart lookup and are kept
-/// when the merged [`DomainInfo`] reports a non-`Available` source.
+/// unless the lookup says the name appears available (see
+/// [`lookalike_from_result`]).
 ///
 /// Returns the ranked registered look-alikes together with the number of
 /// candidates that passed the pre-filter and received a full lookup — the
@@ -327,31 +449,16 @@ pub async fn score_candidates(
     let mut registered: Vec<RegisteredLookalike> = stream::iter(survivors)
         .map(|cand| async move {
             let result = lookup.lookup(&cand.domain).await.ok()?;
-            let info = DomainInfo::from_lookup_result(&result);
-            if info.source == DomainInfoSource::Available {
-                return None;
-            }
-            Some(RegisteredLookalike {
-                domain: cand.domain,
-                technique: cand.technique,
-                registrar: info.registrar,
-                creation_date: info.creation_date,
-                nameservers: info.nameservers,
-            })
+            lookalike_from_result(cand, &result)
         })
         .buffer_unordered(concurrency)
         .filter_map(|r| async move { r })
         .collect()
         .await;
 
-    // Freshly-registered squats are the most actionable — sort newest first,
+    // Freshly-registered squats are the most actionable — newest first,
     // undated entries last.
-    registered.sort_by(|a, b| match (b.creation_date, a.creation_date) {
-        (Some(bd), Some(ad)) => bd.cmp(&ad),
-        (Some(_), None) => std::cmp::Ordering::Less,
-        (None, Some(_)) => std::cmp::Ordering::Greater,
-        (None, None) => a.domain.cmp(&b.domain),
-    });
+    rank_lookalikes(&mut registered);
     (registered, candidates_checked)
 }
 
@@ -400,7 +507,7 @@ mod tests {
     fn never_includes_the_original_and_is_deduped() {
         let cands = generate_candidates("example.com");
         assert!(!cands.iter().any(|c| c.domain == "example.com"));
-        let mut uniq = std::collections::HashSet::new();
+        let mut uniq = HashSet::new();
         for c in &cands {
             assert!(uniq.insert(&c.domain), "duplicate candidate: {}", c.domain);
         }
@@ -468,5 +575,157 @@ mod tests {
         assert!(!survives_prefilter(DnsPresence::Absent));
         assert!(survives_prefilter(DnsPresence::Present));
         assert!(survives_prefilter(DnsPresence::Unknown));
+    }
+
+    // ---- multi-label public suffixes (PSL) --------------------------------
+
+    #[test]
+    fn multi_label_suffix_permutes_the_brand_not_the_suffix() {
+        // `example.co.uk` used to permute `co` (example.o.uk, example.oc.uk)
+        // and never vary `example`.
+        let cands = generate_candidates("example.co.uk");
+        let d = domains(&cands);
+        assert!(d.contains(&"xample.co.uk"), "omission of the brand label");
+        assert!(d.contains(&"3xample.co.uk"), "homoglyph of the brand label");
+        assert!(
+            d.contains(&"example.com"),
+            "tld-swap replaces the whole suffix"
+        );
+        assert!(!d
+            .iter()
+            .any(|c| c.ends_with(".o.uk") || c.ends_with(".oc.uk")));
+        assert!(cands
+            .iter()
+            .all(|c| c.domain.ends_with(".co.uk") || c.technique == "tld-swap"));
+
+        // Subdomains under a multi-label suffix stay fixed too.
+        let cands = generate_candidates("shop.example.com.au");
+        assert!(cands
+            .iter()
+            .any(|c| c.domain == "shop.xample.com.au" && c.technique == "omission"));
+        assert!(cands
+            .iter()
+            .all(|c| c.domain.starts_with("shop.") || c.technique == "tld-swap"));
+    }
+
+    #[test]
+    fn bare_public_suffix_yields_nothing() {
+        assert!(generate_candidates("co.uk").is_empty());
+    }
+
+    // ---- per-technique budget ----------------------------------------------
+
+    #[test]
+    fn fair_shares_only_trims_buckets_above_an_equal_split() {
+        // Small buckets keep everything; the big one absorbs the cut.
+        assert_eq!(fair_shares(&[5, 500, 10], 100), vec![5, 85, 10]);
+        // Under the cap, nothing is trimmed.
+        assert_eq!(fair_shares(&[3, 4], 100), vec![3, 4]);
+        // Two oversized buckets split what is left evenly.
+        assert_eq!(fair_shares(&[2, 300, 300], 102), vec![2, 50, 50]);
+        assert_eq!(fair_shares(&[], 10), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn every_technique_survives_the_cap() {
+        // `paypalsecurelogin.com` used to keep 0 of its 13 homoglyphs (and no
+        // bitsquats): they were generated after ~590 insertions and cut first.
+        let cands = generate_candidates("paypalsecurelogin.com");
+        assert_eq!(
+            cands.len(),
+            MAX_CANDIDATES,
+            "long label still fills the cap"
+        );
+        for technique in [
+            "omission",
+            "transposition",
+            "repetition",
+            "replacement",
+            "insertion",
+            "bitsquat",
+            "homoglyph",
+            "tld-swap",
+        ] {
+            assert!(
+                cands.iter().any(|c| c.technique == technique),
+                "{technique} missing after the cap"
+            );
+        }
+        let homoglyph_count = cands.iter().filter(|c| c.technique == "homoglyph").count();
+        assert_eq!(homoglyph_count, 13, "all homoglyph variants are kept");
+        // Only insertion (the bulk technique) is trimmed.
+        let insertions = cands.iter().filter(|c| c.technique == "insertion").count();
+        assert!(insertions < 26 * ("paypalsecurelogin".len() + 1));
+    }
+
+    // ---- ranking -------------------------------------------------------------
+
+    fn lookalike(domain: &str, created: Option<&str>) -> RegisteredLookalike {
+        RegisteredLookalike {
+            domain: domain.to_string(),
+            technique: "omission".to_string(),
+            registrar: None,
+            creation_date: created.map(|d| d.parse().expect("valid RFC 3339 date")),
+            nameservers: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn ranking_is_newest_first_with_undated_last() {
+        let mut v = vec![
+            lookalike("undated-b.com", None),
+            lookalike("old.com", Some("2015-01-01T00:00:00Z")),
+            lookalike("undated-a.com", None),
+            lookalike("new.com", Some("2026-01-01T00:00:00Z")),
+        ];
+        rank_lookalikes(&mut v);
+        let order: Vec<&str> = v.iter().map(|l| l.domain.as_str()).collect();
+        assert_eq!(
+            order,
+            vec!["new.com", "old.com", "undated-a.com", "undated-b.com"]
+        );
+    }
+
+    // ---- which lookups count as registered -----------------------------
+
+    fn available_result(available: bool, confidence: &str, method: &str) -> LookupResult {
+        LookupResult::Available {
+            data: Box::new(crate::availability::AvailabilityResult {
+                domain: "exmple.com".to_string(),
+                available,
+                confidence: confidence.to_string(),
+                method: method.to_string(),
+                details: None,
+            }),
+            rdap_error: String::new(),
+            whois_error: String::new(),
+            whois_data: None,
+        }
+    }
+
+    fn cand() -> ConfusableCandidate {
+        ConfusableCandidate {
+            domain: "exmple.com".to_string(),
+            technique: "omission".to_string(),
+        }
+    }
+
+    #[test]
+    fn registered_verdicts_from_the_availability_path_are_kept() {
+        // A delegated apex behind a failed registry leg is registered; it
+        // used to be dropped because its DomainInfo source is `Available`.
+        let kept = lookalike_from_result(cand(), &available_result(false, "high", "dns_present"));
+        assert_eq!(kept.map(|l| l.domain).as_deref(), Some("exmple.com"));
+        assert!(
+            lookalike_from_result(cand(), &available_result(false, "none", "inconclusive"))
+                .is_some()
+        );
+
+        // Only an availability claim drops the candidate.
+        assert!(lookalike_from_result(cand(), &available_result(true, "high", "rdap")).is_none());
+        assert!(
+            lookalike_from_result(cand(), &available_result(true, "medium", "dns_nxdomain"))
+                .is_none()
+        );
     }
 }
