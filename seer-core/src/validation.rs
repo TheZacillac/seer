@@ -45,7 +45,8 @@ fn normalize_allowlist_entry(entry: &str) -> String {
 ///
 /// This function:
 /// - Removes http:// and https:// prefixes
-/// - Removes www. prefix
+/// - Removes www. prefix (only when a registrable name remains — `www.com`
+///   is itself a domain and is kept whole)
 /// - Removes trailing slashes and paths
 /// - Converts to lowercase
 /// - Converts internationalized domain names (IDN) to Punycode (ASCII)
@@ -54,7 +55,28 @@ fn normalize_allowlist_entry(entry: &str) -> String {
 ///   validate via `crate::net::resolve_public_host` (or `validate_public_host`),
 ///   which returns the vetted `SocketAddr`s to connect to — closing the
 ///   resolve-then-connect (DNS-rebinding) window.
+///
+/// The `www.` strip is right for registration-level questions (WHOIS, RDAP,
+/// availability, history keys), where `www.example.com` means
+/// `example.com`. It is wrong wherever the exact name matters — a DNS record
+/// query or a per-host probe — because `www` routinely carries its own
+/// records (typically a CNAME). Use [`normalize_host`] there.
 pub fn normalize_domain(domain: &str) -> Result<String> {
+    normalize(domain, true)
+}
+
+/// Normalizes and validates a hostname exactly like [`normalize_domain`], but
+/// keeps a leading `www.` label.
+///
+/// For operations about one specific DNS name rather than its registration:
+/// record lookups (`dig www.example.com CNAME` must query `www`, not the
+/// apex), propagation/follow/compare, and per-host probes such as takeover
+/// detection, where `www` is the single most commonly CNAME'd host.
+pub fn normalize_host(host: &str) -> Result<String> {
+    normalize(host, false)
+}
+
+fn normalize(domain: &str, strip_www: bool) -> Result<String> {
     let domain = domain.trim().to_lowercase();
 
     // Remove protocol
@@ -81,14 +103,20 @@ pub fn normalize_domain(domain: &str) -> Result<String> {
         _ => domain,
     };
 
-    // Remove www. prefix
-    let domain = domain.strip_prefix("www.").unwrap_or(domain);
-
     // Strip a single trailing dot (FQDN form: `example.com.` → `example.com`).
     // DNS libraries and copy-paste from `dig` output routinely include the
     // root-label dot; rejecting it would force callers to pre-clean inputs
-    // that are otherwise valid.
+    // that are otherwise valid. Done before the `www.` strip so `www.com.`
+    // is judged on its real label count.
     let domain = domain.strip_suffix('.').unwrap_or(domain);
+
+    // Remove www. prefix — but only when what remains still has a dot.
+    // `www.com`, `www.net`, … are registered domains in their own right;
+    // stripping them would leave a bare TLD and reject a valid query.
+    let domain = match domain.strip_prefix("www.") {
+        Some(rest) if strip_www && rest.contains('.') => rest,
+        _ => domain,
+    };
 
     // Validate domain format
     if domain.is_empty() || !domain.contains('.') {
@@ -212,14 +240,14 @@ pub fn describe_reserved_ip(ip: &IpAddr) -> Option<&'static str> {
             if v4.is_private() {
                 return Some("private network (RFC 1918)");
             }
-            if v4.is_link_local() {
-                return Some("link-local address (169.254.0.0/16)");
-            }
+            // The metadata endpoint sits inside 169.254.0.0/16, so it must be
+            // checked before the generic link-local branch or it is never
+            // reported by name.
             let o = v4.octets();
             if o[0] == 169 && o[1] == 254 && o[2] == 169 && o[3] == 254 {
                 return Some("cloud metadata endpoint (169.254.169.254)");
             }
-            if o[0] == 169 && o[1] == 254 {
+            if v4.is_link_local() {
                 return Some("link-local address (169.254.0.0/16)");
             }
             if (o[0] == 192 && o[1] == 0 && o[2] == 2)
@@ -379,6 +407,49 @@ mod tests {
         // Double trailing dot is still invalid (would leave a trailing dot
         // after stripping just one).
         assert!(normalize_domain("example.com..").is_err());
+    }
+
+    #[test]
+    fn www_is_not_stripped_when_it_would_leave_a_bare_tld() {
+        // `www.com` / `www.net` are real registered domains; stripping `www.`
+        // used to leave `com` and reject the query outright.
+        assert_eq!(normalize_domain("www.com").unwrap(), "www.com");
+        assert_eq!(normalize_domain("WWW.NET.").unwrap(), "www.net");
+        assert_eq!(normalize_domain("https://www.io/x").unwrap(), "www.io");
+        // A registrable name after the strip still normalizes to the apex.
+        assert_eq!(normalize_domain("www.example.com.").unwrap(), "example.com");
+    }
+
+    #[test]
+    fn normalize_host_keeps_www() {
+        // Per-name operations (DNS record queries, takeover probes) must see
+        // `www` itself — it usually has its own CNAME.
+        assert_eq!(
+            normalize_host("HTTPS://WWW.Example.com:443/path").unwrap(),
+            "www.example.com"
+        );
+        assert_eq!(normalize_host("www.com").unwrap(), "www.com");
+        // Everything else matches normalize_domain.
+        assert_eq!(
+            normalize_host("sub.example.com.").unwrap(),
+            "sub.example.com"
+        );
+        assert_eq!(normalize_host("münchen.de").unwrap(), "xn--mnchen-3ya.de");
+        assert!(normalize_host("nodots").is_err());
+        assert!(normalize_host("bad_label-.com").is_err());
+    }
+
+    #[test]
+    fn describe_reserved_ip_names_the_metadata_endpoint() {
+        // 169.254.169.254 is link-local too; the specific wording must win.
+        assert_eq!(
+            describe_reserved_ip(&"169.254.169.254".parse().unwrap()),
+            Some("cloud metadata endpoint (169.254.169.254)")
+        );
+        assert_eq!(
+            describe_reserved_ip(&"169.254.1.1".parse().unwrap()),
+            Some("link-local address (169.254.0.0/16)")
+        );
     }
 
     #[test]
