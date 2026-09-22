@@ -124,20 +124,11 @@ pub fn describe_epp_status(code: &str) -> Option<&'static str> {
     Some(desc)
 }
 
-/// Whole days from `now` until `when`, rounded toward negative infinity.
-///
-/// `Duration::num_days` truncates toward zero, so a domain that expired ten
-/// hours ago came out as `0` days — "expiring soon" rather than expired.
-/// Flooring makes the count negative for any instant in the past, so
-/// `days < 0` is exactly `when < now`.
+/// Whole days from `now` until `when` — see [`crate::dates::days_until`]:
+/// negative for any instant in the past, so a domain that expired ten hours
+/// ago bands as Expired rather than "expiring soon" (truncation gave `0`).
 fn days_until(when: DateTime<Utc>, now: DateTime<Utc>) -> i64 {
-    let delta = when - now;
-    let days = delta.num_days();
-    if delta < chrono::TimeDelta::days(days) {
-        days - 1
-    } else {
-        days
-    }
+    crate::dates::days_until(when, now)
 }
 
 /// Derives a coarse [`ExpiryStatus`] band from the days-until-expiration and the
@@ -916,14 +907,14 @@ mod tests {
     }
 
     #[test]
-    fn days_until_floors_so_a_just_expired_domain_is_expired() {
+    fn days_until_is_negative_for_a_just_expired_domain() {
         use chrono::TimeZone;
         let now = Utc.with_ymd_and_hms(2026, 1, 10, 12, 0, 0).unwrap();
         let hours = |h: i64| now + chrono::TimeDelta::hours(h);
         assert_eq!(days_until(hours(-10), now), -1);
         assert_eq!(days_until(hours(10), now), 0);
         assert_eq!(days_until(hours(-48), now), -2);
-        assert_eq!(days_until(hours(-49), now), -3);
+        assert_eq!(days_until(hours(-49), now), -2);
         assert_eq!(days_until(hours(49), now), 2);
 
         // Expired ten hours ago: previously truncated to 0 days, which
