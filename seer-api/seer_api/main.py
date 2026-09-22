@@ -57,6 +57,11 @@ _AUTH_EXEMPT_PATHS: frozenset[str] = (
 )
 
 
+def _csv_env(name: str) -> list[str]:
+    """Non-empty, stripped entries of comma-separated env var ``name``."""
+    return [v.strip() for v in os.environ.get(name, "").split(",") if v.strip()]
+
+
 def _build_mcp_session_manager() -> StreamableHTTPSessionManager:
     """Construct the Streamable HTTP MCP session manager.
 
@@ -65,18 +70,20 @@ def _build_mcp_session_manager() -> StreamableHTTPSessionManager:
     singleton would break uvicorn restarts and TestClient re-use.
 
     Runs in stateless mode so it can scale across uvicorn workers without a
-    shared session store. DNS-rebinding protection is opt-in via
-    ``SEER_MCP_ALLOWED_HOSTS`` / ``SEER_MCP_ALLOWED_ORIGINS`` (the SDK
-    middleware blocks all requests unless at least one host pattern is
-    configured, so we only enable it when the operator provides one).
+    shared session store. The SDK's DNS-rebinding protection is enabled only
+    when ``SEER_MCP_ALLOWED_HOSTS`` names at least one host: with it on, the
+    SDK rejects every ``Host`` not in ``allowed_hosts`` — so enabling it with
+    an empty host list (``SEER_MCP_ALLOWED_ORIGINS`` alone) answered every
+    /mcp request with 421. ``SEER_MCP_ALLOWED_ORIGINS`` is passed along when
+    hosts are set; when it is set on its own, ``auth_middleware`` enforces it
+    as the Origin allowlist instead (see ``_mcp_origin_blocked``).
     """
-    allowed_hosts_env = os.environ.get("SEER_MCP_ALLOWED_HOSTS", "")
-    allowed_origins_env = os.environ.get("SEER_MCP_ALLOWED_ORIGINS", "")
-    if allowed_hosts_env or allowed_origins_env:
+    allowed_hosts = _csv_env("SEER_MCP_ALLOWED_HOSTS")
+    if allowed_hosts:
         security = TransportSecuritySettings(
             enable_dns_rebinding_protection=True,
-            allowed_hosts=[h.strip() for h in allowed_hosts_env.split(",") if h.strip()],
-            allowed_origins=[o.strip() for o in allowed_origins_env.split(",") if o.strip()],
+            allowed_hosts=allowed_hosts,
+            allowed_origins=_csv_env("SEER_MCP_ALLOWED_ORIGINS"),
         )
     else:
         security = None
@@ -191,23 +198,71 @@ def _header_host(value: str) -> str:
     return (parsed.hostname or "").lower()
 
 
-def _mcp_browser_guard_active() -> bool:
-    """Whether the default localhost-Origin guard for /mcp applies.
+def _origin_allowed(origin: str, allowed: list[str]) -> bool:
+    """Whether ``origin`` matches an ``allowed`` entry.
 
-    Only in the unauthenticated dev posture with no explicit MCP allowlist: when
-    SEER_API_KEY is set, auth already blocks a drive-by (no bearer token); when
-    SEER_MCP_ALLOWED_HOSTS/_ORIGINS is set, the SDK's DNS-rebinding protection
-    covers it.
+    Same matching rules as the MCP SDK's DNS-rebinding check, so an
+    ``SEER_MCP_ALLOWED_ORIGINS`` value means the same thing whichever layer
+    enforces it: an exact match, or a ``scheme://host:*`` entry matching any
+    port on that origin.
     """
-    api_key = (os.environ.get("SEER_API_KEY") or "").strip()
-    allowlist = (
-        os.environ.get("SEER_MCP_ALLOWED_HOSTS", "")
-        or os.environ.get("SEER_MCP_ALLOWED_ORIGINS", "")
-    ).strip()
-    return not api_key and not allowlist
+    if origin in allowed:
+        return True
+    return any(
+        entry.endswith(":*") and origin.startswith(entry[:-2] + ":")
+        for entry in allowed
+    )
 
-# Rate limiter configuration is handled in limiting.py at construction time
-# via SEER_RATE_LIMIT env var (default: "30/minute")
+
+def _mcp_origin_blocked(origin: str) -> bool:
+    """Whether the local browser-origin guard refuses this /mcp request.
+
+    Non-browser MCP clients (curl, stdio bridges) send no Origin and always
+    pass. Otherwise, in precedence order:
+
+    * ``SEER_MCP_ALLOWED_HOSTS`` set → the SDK's DNS-rebinding protection is
+      on and validates Host and Origin itself; nothing to do here.
+    * ``SEER_MCP_ALLOWED_ORIGINS`` set on its own → enforce it here as the
+      Origin allowlist. The SDK protection can't be enabled without a host
+      list (it would 421 every request), and this keeps an explicitly
+      configured origin policy in force even when ``SEER_API_KEY`` is set.
+    * ``SEER_API_KEY`` set → auth already blocks a drive-by (no bearer token).
+    * Otherwise (unauthenticated dev posture) → only localhost origins.
+    """
+    if not origin:
+        return False
+    if _csv_env("SEER_MCP_ALLOWED_HOSTS"):
+        return False
+    allowed_origins = _csv_env("SEER_MCP_ALLOWED_ORIGINS")
+    if allowed_origins:
+        return not _origin_allowed(origin, allowed_origins)
+    if (os.environ.get("SEER_API_KEY") or "").strip():
+        return False
+    return _header_host(origin) not in _LOCALHOST_HOSTS
+
+
+def _route_path(request: Request) -> str:
+    """The request path as the router matches it: ``root_path`` stripped.
+
+    Under ``--root-path /api`` (ASGI ``root_path``) ``scope["path"]`` — and so
+    ``request.url.path`` — carries the ``/api`` prefix, while Starlette routes
+    on the path with the prefix removed. Comparing ``request.url.path``
+    against route paths therefore missed: the /mcp guards were skipped for
+    ``/api/mcp`` and ``/api/health`` lost its auth exemption. Mirrors
+    Starlette's own (private) ``get_route_path``.
+    """
+    path: str = request.scope.get("path", "")
+    root_path: str = request.scope.get("root_path", "")
+    if root_path and path.startswith(root_path):
+        rest = path[len(root_path):]
+        if rest == "" or rest.startswith("/"):
+            return rest
+    return path
+
+
+# REST rate limits are the per-route `@limiter.limit(...)` decorators (limiter
+# built in limiting.py); SEER_RATE_LIMIT (default "30/minute") applies to the
+# raw /mcp route only, via `_mcp_rate_ok` above.
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
@@ -310,21 +365,24 @@ async def auth_middleware(request: Request, call_next):
     constant, so tests and rotating-secret deployments don't need an import
     reload to pick up the current key.
     """
+    # Match paths the way the router does (root_path stripped); comparing
+    # `request.url.path` skipped every check below under `--root-path`.
+    route_path = _route_path(request)
+
     # POST /mcp hardening (issue #55), applied before auth so an unauthenticated
     # flood is throttled and a drive-by is refused regardless of credentials.
-    if request.url.path == "/mcp":
-        # Browser drive-by guard: a malicious page's fetch() carries a non-local
-        # Origin; non-browser MCP clients (curl, stdio bridges) send none.
-        if _mcp_browser_guard_active():
-            origin = request.headers.get("origin", "")
-            if origin and _header_host(origin) not in _LOCALHOST_HOSTS:
-                return JSONResponse(
-                    {
-                        "detail": "cross-origin /mcp blocked; set "
-                        "SEER_MCP_ALLOWED_ORIGINS or SEER_API_KEY to allow"
-                    },
-                    status_code=403,
-                )
+    if route_path == "/mcp":
+        # Browser drive-by guard: a malicious page's fetch() carries a
+        # disallowed Origin; non-browser MCP clients (curl, stdio bridges) send
+        # none. See `_mcp_origin_blocked` for which policy applies when.
+        if _mcp_origin_blocked(request.headers.get("origin", "")):
+            return JSONResponse(
+                {
+                    "detail": "cross-origin /mcp blocked; set "
+                    "SEER_MCP_ALLOWED_ORIGINS or SEER_API_KEY to allow"
+                },
+                status_code=403,
+            )
         # Rate-limit the raw /mcp route that the @limiter.limit decorators miss.
         if not _mcp_rate_ok(get_client_ip(request)):
             return JSONResponse(
@@ -340,10 +398,17 @@ async def auth_middleware(request: Request, call_next):
         # outer CORSMiddleware and never reaches here, but we still short
         # the rare OPTIONS that falls through (non-preflight) so it isn't
         # spuriously rejected.
-        if request.method == "OPTIONS" or request.url.path in _AUTH_EXEMPT_PATHS:
+        if request.method == "OPTIONS" or route_path in _AUTH_EXEMPT_PATHS:
             return await call_next(request)
-        provided = request.headers.get("Authorization", "")
-        expected = f"Bearer {api_key}"
+        # Compare BYTES: `hmac.compare_digest` raises TypeError for str
+        # operands containing non-ASCII characters, so an unauthenticated
+        # `Authorization: Bearer été` was a 500 (and a non-ASCII key broke
+        # every request). Starlette decodes header values as latin-1, so
+        # re-encoding latin-1 recovers the exact wire bytes; the key is
+        # encoded UTF-8 — what an HTTP client sends for a non-ASCII token —
+        # with surrogateescape so an undecodable env value round-trips.
+        provided = request.headers.get("Authorization", "").encode("latin-1")
+        expected = f"Bearer {api_key}".encode("utf-8", "surrogateescape")
         if not hmac.compare_digest(provided, expected):
             return JSONResponse({"detail": "unauthorized"}, status_code=401)
     return await call_next(request)

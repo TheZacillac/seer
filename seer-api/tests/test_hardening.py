@@ -111,6 +111,59 @@ def test_preflight_options_bypasses_auth(monkeypatch):
     importlib.reload(main)
 
 
+def test_non_ascii_bearer_token_is_401_not_500(monkeypatch):
+    """`hmac.compare_digest(str, str)` raises TypeError on non-ASCII input, so
+    an unauthenticated `Authorization: Bearer été` used to crash into a 500."""
+    monkeypatch.setenv("SEER_API_KEY", "s3cret")
+    import seer_api.main as main
+
+    importlib.reload(main)
+    c = TestClient(main.app)
+    # httpx only sends str header values as ASCII; send raw bytes the way a
+    # hostile client can (latin-1 and UTF-8 spellings).
+    for raw in ("Bearer été".encode("latin-1"), "Bearer été".encode()):
+        resp = c.get("/", headers={"Authorization": raw})
+        assert resp.status_code == 401, (raw, resp.status_code)
+
+    monkeypatch.delenv("SEER_API_KEY")
+    importlib.reload(main)
+
+
+def test_non_ascii_api_key_is_usable(monkeypatch):
+    """A non-ASCII SEER_API_KEY must not break every request: the token a
+    client sends (UTF-8 on the wire) authenticates, anything else is 401."""
+    monkeypatch.setenv("SEER_API_KEY", "clé")
+    import seer_api.main as main
+
+    importlib.reload(main)
+    c = TestClient(main.app)
+    assert c.get("/").status_code == 401
+    assert c.get("/", headers={"Authorization": b"Bearer cl"}).status_code == 401
+    ok = c.get("/", headers={"Authorization": "Bearer clé".encode()})  # UTF-8 on the wire
+    assert ok.status_code == 200
+
+    monkeypatch.delenv("SEER_API_KEY")
+    importlib.reload(main)
+
+
+def test_auth_exemption_honors_root_path(monkeypatch):
+    """Under `--root-path /api` the request path carries the prefix while the
+    router strips it; the /health exemption must still match."""
+    monkeypatch.setenv("SEER_API_KEY", "s3cret")
+    import seer_api.main as main
+
+    importlib.reload(main)
+    c = TestClient(main.app, root_path="/api")
+    assert c.get("/api/health").status_code == 200
+    # Everything else is still authenticated under the prefix.
+    assert c.get("/api/").status_code == 401
+    ok = c.get("/api/", headers={"Authorization": "Bearer s3cret"})
+    assert ok.status_code == 200
+
+    monkeypatch.delenv("SEER_API_KEY")
+    importlib.reload(main)
+
+
 # ---------------------------------------------------------------------------
 # M6: path param length caps
 # ---------------------------------------------------------------------------

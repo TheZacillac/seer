@@ -205,8 +205,8 @@ Optional env vars:
 
 | Variable | Description |
 |----------|-------------|
-| `SEER_MCP_ALLOWED_HOSTS` | Comma-separated `Host:` values to allow. Enabling this turns on DNS-rebinding protection. |
-| `SEER_MCP_ALLOWED_ORIGINS` | Comma-separated `Origin:` values to allow (browser hosts). |
+| `SEER_MCP_ALLOWED_HOSTS` | Comma-separated `Host:` values to allow (`host:*` matches any port). Setting this turns on the MCP SDK's DNS-rebinding protection, which then also checks `SEER_MCP_ALLOWED_ORIGINS`. |
+| `SEER_MCP_ALLOWED_ORIGINS` | Comma-separated `Origin:` values to allow (browser hosts; `scheme://host:*` matches any port). Enforced even on its own and with `SEER_API_KEY` set; requests without an `Origin` (non-browser clients) are unaffected. |
 
 ### Available Tools
 
