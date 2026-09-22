@@ -11,9 +11,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-A full code-review sweep across every surface — core, CLI, REPL, TUI, Python
-bindings, REST, and MCP. Every item below was verified against the code and
-carries a regression test.
+## [0.48.0] - 2026-09-22
+
+A correctness and security release from a full code-review sweep across every
+surface — core, CLI, REPL, TUI, Python bindings, REST, and MCP. Every item
+below was verified against the code and carries a regression test. Highlights:
+`seer dnssec` no longer fails every signed zone, `seer watch` flags domains
+that are down or no longer resolve, per-host commands check `www.` hosts
+instead of silently checking the apex, REST rate limits can no longer be
+dodged by varying the URL, a hostile CAA record can no longer crash
+`ssl`/`status`, and RDAP DNSSEC data, `.de` WHOIS data, and multi-label
+suffixes (`.co.uk`) are finally handled. Dependencies pick up the rustls
+RUSTSEC-2026-0285 fix and hickory's 0.26.2 DNSSEC/DoS security release. (A
+`0.47.1` version number existed in-tree but was never tagged or released; its
+changes — `.il` WHOIS dates and a hardened CI audit job — are folded in here.)
+
+### Changed
+- **Per-host commands keep `www.`.** `ssl`, `status`, `headers`, `takeover`,
+  subdomain classification, and the DNS record tools (`dig`, propagation,
+  follow, compare) now act on the exact host given; registration lookups
+  (WHOIS, RDAP, availability, drift/history) still reduce `www.example.com`
+  to `example.com`. New `seer_core::validation::normalize_host`.
+- **`seer watch`** treats a domain that stops resolving as critical and an
+  unreachable web/TLS endpoint as a warning (previously both were silently
+  green).
+- **`subdomains --record`** merges into the stored baseline instead of
+  replacing it.
+- **Subdomain classification** has a new `unknown` status for a name whose
+  lookup failed (it was reported `dead`).
+- **DNS resolution failures** are reported as a DNS error ("DNS resolution
+  failed") rather than "Invalid input"; in the Python bindings that is a
+  `RuntimeError`, not a `ValueError`.
+- **`SEER_RATE_LIMIT`** governs `POST /mcp`; every REST route has its own
+  limit (it never applied to REST), and multi-limit strings are fully enforced.
+- **Registrant country is no longer invented** for `.de`, `.kr`, `.it`,
+  `.uk`, and `.nl` WHOIS responses.
+- **Dependency updates:** `reqwest` 0.13.5 (fixes wrong proxy credentials when
+  several proxies match), `hickory-resolver` 0.26.3, `clap` 4.6.7 /
+  `clap_complete` 4.6.11, `futures` 0.3.34, `toml` 1.1.6, and `dirs` 7.0.0 (its
+  only change is Windows `preference_dir`, which Seer does not use). New
+  dependency `psl` (MIT/Apache-2.0) for registrable-domain handling.
 
 ### Fixed
 - **`seer dnssec` exited 1 for every correctly signed zone.** It compared the
@@ -156,8 +193,27 @@ carries a regression test.
   startup when `WEB_CONCURRENCY` is set; `::ffff:127.0.0.1` counts as loopback
   on Python 3.12.0–3.12.3; a non-ASCII `Authorization` header is a 401, not a
   500.
+- **`.il` domains (`.co.il`, `.org.il`, `.ac.il`, …, `.ישראל`) now report
+  registration and expiration dates.** `.il` has no RDAP service, so
+  `whois.isoc.org.il` is the only registration source — and ISOC-IL labels the
+  expiry `validity:` in `DD-MM-YYYY` form and buries the creation date in a
+  `changed: … YYYYMMDD (Assigned)` audit line, neither of which the generic
+  parser recognised, so `lookup`/`whois`/`info` showed no dates at all. A
+  dedicated ISOC-IL parser now extracts creation, expiration (`N/A` on legacy
+  names correctly yields none), and last-changed dates, the full
+  `Transfer Locked`/`Transfer Allowed` status (previously truncated to
+  `Transfer`), holder/admin/tech contacts (with the registry's `user AT host`
+  e-mail obfuscation undone), DNSSEC state, and glue-stripped nameservers.
+  ISOC-IL's `No data was found to match the request criteria.` reply is also
+  recognised as "available" — the interposed *was* had defeated the generic
+  `no data found` pattern.
 
 ### Security
+- **Bumped `hickory-resolver` to 0.26.3**, picking up hickory's 0.26.2
+  security release (DNSSEC validation bypasses and nonexistence-proof
+  forgeries, resolver DoS and resource-exhaustion issues, and parser panics)
+  plus its 0.26.3 regression fixes. Seer uses hickory for all DNS and DNSSEC
+  work.
 - **REST rate limits were per URL, not per route**, so changing the domain in
   the path (even its case) got a fresh budget. Limits are now keyed per route.
   `X-Forwarded-For` is read across all header lines (a second line could spoof
@@ -182,7 +238,6 @@ carries a regression test.
 
 ### Internal
 - New `validation::normalize_host` (www-preserving) beside `normalize_domain`.
-- New dependency: `psl` (MIT/Apache-2.0) for registrable-domain handling.
 - New `watchlist::check_watchlist_with_config` / `check_watchlist_with`,
   `DriftReport::inconclusive` / `DriftReport::empty`, `drift::is_comparable` /
   `drift::baseline_snapshot`, and a `status::StatusError` re-export.
@@ -192,31 +247,6 @@ carries a regression test.
   tests, and the API endpoint-index test.
 - Removed a literal NUL byte from a doc comment in `status/client.rs` that made
   git and grep treat the file as binary.
-
-## [0.47.1] - 2026-09-03
-
-Patch release. `.co.il` and the other `.il` second-level domains now report
-their registration and expiration dates — ISOC-IL's WHOIS was the only
-source for them (there is no `.il` RDAP) and its format was not understood.
-Also hardens the CI security-audit job against upstream build breaks.
-
-### Fixed
-- **`.il` domains (`.co.il`, `.org.il`, `.ac.il`, …, `.ישראל`) now report
-  registration and expiration dates.** `.il` has no RDAP service, so
-  `whois.isoc.org.il` is the only registration source — and ISOC-IL labels the
-  expiry `validity:` in `DD-MM-YYYY` form and buries the creation date in a
-  `changed: … YYYYMMDD (Assigned)` audit line, neither of which the generic
-  parser recognised, so `lookup`/`whois`/`info` showed no dates at all. A
-  dedicated ISOC-IL parser now extracts creation, expiration (`N/A` on legacy
-  names correctly yields none), and last-changed dates, the full
-  `Transfer Locked`/`Transfer Allowed` status (previously truncated to
-  `Transfer`), holder/admin/tech contacts (with the registry's `user AT host`
-  e-mail obfuscation undone), DNSSEC state, and glue-stripped nameservers.
-  ISOC-IL's `No data was found to match the request criteria.` reply is also
-  recognised as "available" — the interposed *was* had defeated the generic
-  `no data found` pattern.
-
-### Internal
 - **CI: the Security Audit job installs a prebuilt `cargo-audit`** instead of
   compiling it from source on every run. The previous action resolved
   cargo-audit's dependencies unlocked, so a broken upstream release (tinyvec
@@ -1167,8 +1197,8 @@ Two notable breaking changes landed in this period (see `CLAUDE.md` for details)
   `inconsistencies` became typed (`ConsensusValue` / `Inconsistency`) instead of
   pre-formatted strings.
 
-[Unreleased]: https://github.com/TheZacillac/seer/compare/v0.47.1...HEAD
-[0.47.1]: https://github.com/TheZacillac/seer/compare/v0.47.0...v0.47.1
+[Unreleased]: https://github.com/TheZacillac/seer/compare/v0.48.0...HEAD
+[0.48.0]: https://github.com/TheZacillac/seer/compare/v0.47.0...v0.48.0
 [0.47.0]: https://github.com/TheZacillac/seer/compare/v0.46.0...v0.47.0
 [0.46.0]: https://github.com/TheZacillac/seer/compare/v0.45.0...v0.46.0
 [0.45.0]: https://github.com/TheZacillac/seer/compare/v0.44.2...v0.45.0
