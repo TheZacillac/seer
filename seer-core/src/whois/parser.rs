@@ -6,183 +6,196 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 /// Pre-compiled regexes for WHOIS field extraction.
+///
+/// Every pattern separates the label from its value with `[ \t]*`
+/// (horizontal whitespace only), never `\s*`: `\s` also matches `\r`/`\n`, so
+/// an EMPTY field (`Name Server: \r\n`, `DNSSEC:\n`) would swallow the line
+/// break and capture the NEXT line as its value (`DNSSEC: URL of the ICANN
+/// Whois Inaccuracy Complaint Form: …`). Registries that genuinely put the
+/// value on the following line (NASK `REGISTRAR:\n<name>`, DNS Belgium
+/// `Registrar:\n\tName: <name>`) are handled explicitly by
+/// [`extract_section_value`] instead.
 static REGISTRAR_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
     vec![
-        Regex::new(r"(?i)Registrar:\s*(.+)").expect("Invalid regex for Registrar"),
-        Regex::new(r"(?i)Registrar Name:\s*(.+)").expect("Invalid regex for Registrar Name"),
-        Regex::new(r"(?i)Sponsoring Registrar:\s*(.+)")
+        Regex::new(r"(?i)Registrar:[ \t]*(.+)").expect("Invalid regex for Registrar"),
+        Regex::new(r"(?i)Registrar Name:[ \t]*(.+)").expect("Invalid regex for Registrar Name"),
+        Regex::new(r"(?i)Sponsoring Registrar:[ \t]*(.+)")
             .expect("Invalid regex for Sponsoring Registrar"),
     ]
 });
 
 static REGISTRANT_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
     vec![
-        Regex::new(r"(?i)Registrant Name:\s*(.+)").expect("Invalid regex for Registrant Name"),
-        Regex::new(r"(?i)Registrant:\s*(.+)").expect("Invalid regex for Registrant"),
+        Regex::new(r"(?i)Registrant Name:[ \t]*(.+)").expect("Invalid regex for Registrant Name"),
+        Regex::new(r"(?i)Registrant:[ \t]*(.+)").expect("Invalid regex for Registrant"),
     ]
 });
 
 static ORGANIZATION_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
     vec![
-        Regex::new(r"(?i)Registrant Organization:\s*(.+)")
+        Regex::new(r"(?i)Registrant Organization:[ \t]*(.+)")
             .expect("Invalid regex for Registrant Organization"),
         // Anchor the bare/ambiguous org labels to the start of a line (allowing
         // indentation) so they cannot match the "Organization:" substring
         // inside "Admin Organization:" / "Tech Organization:" lines and thereby
         // attribute another contact's org to the registrant.
-        Regex::new(r"(?im)^[ \t]*Organization:\s*(.+)").expect("Invalid regex for Organization"),
-        Regex::new(r"(?im)^[ \t]*org-name:\s*(.+)").expect("Invalid regex for org-name"),
-        Regex::new(r"(?im)^[ \t]*Org Name:\s*(.+)").expect("Invalid regex for Org Name"),
+        Regex::new(r"(?im)^[ \t]*Organization:[ \t]*(.+)").expect("Invalid regex for Organization"),
+        Regex::new(r"(?im)^[ \t]*org-name:[ \t]*(.+)").expect("Invalid regex for org-name"),
+        Regex::new(r"(?im)^[ \t]*Org Name:[ \t]*(.+)").expect("Invalid regex for Org Name"),
     ]
 });
 
 static CREATION_DATE_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
     vec![
-        Regex::new(r"(?i)Creation Date:\s*(.+)").expect("Invalid regex for Creation Date"),
-        Regex::new(r"(?i)Created Date:\s*(.+)").expect("Invalid regex for Created Date"),
-        Regex::new(r"(?i)Created On:\s*(.+)").expect("Invalid regex for Created On"),
-        Regex::new(r"(?i)Created:\s*(.+)").expect("Invalid regex for Created"),
-        Regex::new(r"(?i)Registration Date:\s*(.+)").expect("Invalid regex for Registration Date"),
-        Regex::new(r"(?i)Domain Registration Date:\s*(.+)")
+        Regex::new(r"(?i)Creation Date:[ \t]*(.+)").expect("Invalid regex for Creation Date"),
+        Regex::new(r"(?i)Created Date:[ \t]*(.+)").expect("Invalid regex for Created Date"),
+        Regex::new(r"(?i)Created On:[ \t]*(.+)").expect("Invalid regex for Created On"),
+        Regex::new(r"(?i)Created:[ \t]*(.+)").expect("Invalid regex for Created"),
+        Regex::new(r"(?i)Registration Date:[ \t]*(.+)")
+            .expect("Invalid regex for Registration Date"),
+        Regex::new(r"(?i)Domain Registration Date:[ \t]*(.+)")
             .expect("Invalid regex for Domain Registration Date"),
         // Punktum (.dk) style: `Registered:           2018-01-25`
-        Regex::new(r"(?im)^\s*Registered:\s*(.+)$").expect("Invalid regex for Registered"),
+        Regex::new(r"(?im)^[ \t]*Registered:[ \t]*(.+)$").expect("Invalid regex for Registered"),
         // French registries (ANINF .ga): `Date de création:`
-        Regex::new(r"(?im)^\s*Date de création:\s*(.+)$")
+        Regex::new(r"(?im)^[ \t]*Date de création:[ \t]*(.+)$")
             .expect("Invalid regex for Date de création"),
     ]
 });
 
 static EXPIRATION_DATE_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
     vec![
-        Regex::new(r"(?i)(?:Registry )?Expir(?:y|ation) Date:\s*(.+)")
+        Regex::new(r"(?i)(?:Registry )?Expir(?:y|ation) Date:[ \t]*(.+)")
             .expect("Invalid regex for Expiry/Expiration Date"),
-        Regex::new(r"(?i)Expiration Date:\s*(.+)").expect("Invalid regex for Expiration Date"),
-        Regex::new(r"(?i)Expires On:\s*(.+)").expect("Invalid regex for Expires On"),
-        Regex::new(r"(?i)Expires:\s*(.+)").expect("Invalid regex for Expires"),
-        Regex::new(r"(?i)Expiry Date:\s*(.+)").expect("Invalid regex for Expiry Date"),
-        Regex::new(r"(?i)paid-till:\s*(.+)").expect("Invalid regex for paid-till"),
+        Regex::new(r"(?i)Expiration Date:[ \t]*(.+)").expect("Invalid regex for Expiration Date"),
+        Regex::new(r"(?i)Expires On:[ \t]*(.+)").expect("Invalid regex for Expires On"),
+        Regex::new(r"(?i)Expires:[ \t]*(.+)").expect("Invalid regex for Expires"),
+        Regex::new(r"(?i)Expiry Date:[ \t]*(.+)").expect("Invalid regex for Expiry Date"),
+        Regex::new(r"(?i)paid-till:[ \t]*(.+)").expect("Invalid regex for paid-till"),
         // French registries (ANINF .ga): `Date d'expiration:`
-        Regex::new(r"(?im)^\s*Date d'expiration:\s*(.+)$")
+        Regex::new(r"(?im)^[ \t]*Date d'expiration:[ \t]*(.+)$")
             .expect("Invalid regex for Date d'expiration"),
     ]
 });
 
 static UPDATED_DATE_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
     vec![
-        Regex::new(r"(?i)Updated Date:\s*(.+)").expect("Invalid regex for Updated Date"),
-        Regex::new(r"(?i)Last Updated On:\s*(.+)").expect("Invalid regex for Last Updated On"),
-        Regex::new(r"(?i)Last Modified:\s*(.+)").expect("Invalid regex for Last Modified"),
-        Regex::new(r"(?i)Last Update:\s*(.+)").expect("Invalid regex for Last Update"),
-        Regex::new(r"(?i)Modified:\s*(.+)").expect("Invalid regex for Modified"),
+        Regex::new(r"(?i)Updated Date:[ \t]*(.+)").expect("Invalid regex for Updated Date"),
+        Regex::new(r"(?i)Last Updated On:[ \t]*(.+)").expect("Invalid regex for Last Updated On"),
+        Regex::new(r"(?i)Last Modified:[ \t]*(.+)").expect("Invalid regex for Last Modified"),
+        Regex::new(r"(?i)Last Update:[ \t]*(.+)").expect("Invalid regex for Last Update"),
+        Regex::new(r"(?i)Modified:[ \t]*(.+)").expect("Invalid regex for Modified"),
         // French registries (ANINF .ga): `Dernière modification:` — contact
         // blocks repeat this label; extract_field_with_patterns takes the
         // first match, which is the domain-level line.
-        Regex::new(r"(?im)^\s*Dernière modification:\s*(.+)$")
+        Regex::new(r"(?im)^[ \t]*Dernière modification:[ \t]*(.+)$")
             .expect("Invalid regex for Dernière modification"),
     ]
 });
 
 static DNSSEC_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
     vec![
-        Regex::new(r"(?i)DNSSEC:\s*(.+)").expect("Invalid regex for DNSSEC"),
-        Regex::new(r"(?i)DNSSEC Status:\s*(.+)").expect("Invalid regex for DNSSEC Status"),
+        Regex::new(r"(?i)DNSSEC:[ \t]*(.+)").expect("Invalid regex for DNSSEC"),
+        Regex::new(r"(?i)DNSSEC Status:[ \t]*(.+)").expect("Invalid regex for DNSSEC Status"),
     ]
 });
 
 static NAMESERVER_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
     vec![
-        Regex::new(r"(?i)Name Server:\s*(.+)").expect("Invalid regex for Name Server"),
-        Regex::new(r"(?i)Nameserver:\s*(.+)").expect("Invalid regex for Nameserver"),
-        Regex::new(r"(?i)nserver:\s*(.+)").expect("Invalid regex for nserver"),
-        Regex::new(r"(?im)^NS:\s+(.+)$").expect("Invalid regex for NS"),
+        Regex::new(r"(?i)Name Server:[ \t]*(.+)").expect("Invalid regex for Name Server"),
+        Regex::new(r"(?i)Nameserver:[ \t]*(.+)").expect("Invalid regex for Nameserver"),
+        Regex::new(r"(?i)nserver:[ \t]*(.+)").expect("Invalid regex for nserver"),
+        Regex::new(r"(?im)^NS:[ \t]+(.+)$").expect("Invalid regex for NS"),
         // Punktum (.dk) lists nameservers as `Hostname:` lines under a
         // `Nameservers` heading. Anchored to line start to avoid matching
         // hostname mentions inside prose.
-        Regex::new(r"(?im)^\s*Hostname:\s*(.+)$").expect("Invalid regex for Hostname"),
+        Regex::new(r"(?im)^[ \t]*Hostname:[ \t]*(.+)$").expect("Invalid regex for Hostname"),
         // French registries (ANINF .ga): `Serveur de noms:` lines.
-        Regex::new(r"(?im)^\s*Serveur de noms:\s*(.+)$")
+        Regex::new(r"(?im)^[ \t]*Serveur de noms:[ \t]*(.+)$")
             .expect("Invalid regex for Serveur de noms"),
     ]
 });
 
 static REGISTRANT_EMAIL_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
     vec![
-        Regex::new(r"(?i)Registrant Email:\s*(.+)").expect("Invalid regex for Registrant Email"),
-        Regex::new(r"(?i)Registrant E-mail:\s*(.+)").expect("Invalid regex for Registrant E-mail"),
+        Regex::new(r"(?i)Registrant Email:[ \t]*(.+)").expect("Invalid regex for Registrant Email"),
+        Regex::new(r"(?i)Registrant E-mail:[ \t]*(.+)")
+            .expect("Invalid regex for Registrant E-mail"),
     ]
 });
 
 static REGISTRANT_PHONE_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
     vec![
-        Regex::new(r"(?i)Registrant Phone:\s*(.+)").expect("Invalid regex for Registrant Phone"),
-        Regex::new(r"(?i)Registrant Tel:\s*(.+)").expect("Invalid regex for Registrant Tel"),
+        Regex::new(r"(?i)Registrant Phone:[ \t]*(.+)").expect("Invalid regex for Registrant Phone"),
+        Regex::new(r"(?i)Registrant Tel:[ \t]*(.+)").expect("Invalid regex for Registrant Tel"),
     ]
 });
 
 static REGISTRANT_ADDRESS_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
     vec![
-        Regex::new(r"(?i)Registrant Street:\s*(.+)").expect("Invalid regex for Registrant Street"),
-        Regex::new(r"(?i)Registrant Address:\s*(.+)")
+        Regex::new(r"(?i)Registrant Street:[ \t]*(.+)")
+            .expect("Invalid regex for Registrant Street"),
+        Regex::new(r"(?i)Registrant Address:[ \t]*(.+)")
             .expect("Invalid regex for Registrant Address"),
     ]
 });
 
 static REGISTRANT_COUNTRY_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
-    vec![Regex::new(r"(?i)Registrant Country:\s*(.+)")
+    vec![Regex::new(r"(?i)Registrant Country:[ \t]*(.+)")
         .expect("Invalid regex for Registrant Country")]
 });
 
 static ADMIN_NAME_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
     vec![
-        Regex::new(r"(?i)Admin Name:\s*(.+)").expect("Invalid regex for Admin Name"),
-        Regex::new(r"(?i)Administrative Contact Name:\s*(.+)")
+        Regex::new(r"(?i)Admin Name:[ \t]*(.+)").expect("Invalid regex for Admin Name"),
+        Regex::new(r"(?i)Administrative Contact Name:[ \t]*(.+)")
             .expect("Invalid regex for Administrative Contact Name"),
     ]
 });
 
 static ADMIN_ORG_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
-    vec![Regex::new(r"(?i)Admin Organization:\s*(.+)")
+    vec![Regex::new(r"(?i)Admin Organization:[ \t]*(.+)")
         .expect("Invalid regex for Admin Organization")]
 });
 
 static ADMIN_EMAIL_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
     vec![
-        Regex::new(r"(?i)Admin Email:\s*(.+)").expect("Invalid regex for Admin Email"),
-        Regex::new(r"(?i)Admin E-mail:\s*(.+)").expect("Invalid regex for Admin E-mail"),
+        Regex::new(r"(?i)Admin Email:[ \t]*(.+)").expect("Invalid regex for Admin Email"),
+        Regex::new(r"(?i)Admin E-mail:[ \t]*(.+)").expect("Invalid regex for Admin E-mail"),
     ]
 });
 
 static ADMIN_PHONE_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
     vec![
-        Regex::new(r"(?i)Admin Phone:\s*(.+)").expect("Invalid regex for Admin Phone"),
-        Regex::new(r"(?i)Admin Tel:\s*(.+)").expect("Invalid regex for Admin Tel"),
+        Regex::new(r"(?i)Admin Phone:[ \t]*(.+)").expect("Invalid regex for Admin Phone"),
+        Regex::new(r"(?i)Admin Tel:[ \t]*(.+)").expect("Invalid regex for Admin Tel"),
     ]
 });
 
 static TECH_NAME_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
     vec![
-        Regex::new(r"(?i)Tech Name:\s*(.+)").expect("Invalid regex for Tech Name"),
-        Regex::new(r"(?i)Technical Contact Name:\s*(.+)")
+        Regex::new(r"(?i)Tech Name:[ \t]*(.+)").expect("Invalid regex for Tech Name"),
+        Regex::new(r"(?i)Technical Contact Name:[ \t]*(.+)")
             .expect("Invalid regex for Technical Contact Name"),
     ]
 });
 
 static TECH_ORG_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
-    vec![Regex::new(r"(?i)Tech Organization:\s*(.+)").expect("Invalid regex for Tech Organization")]
+    vec![Regex::new(r"(?i)Tech Organization:[ \t]*(.+)")
+        .expect("Invalid regex for Tech Organization")]
 });
 
 static TECH_EMAIL_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
     vec![
-        Regex::new(r"(?i)Tech Email:\s*(.+)").expect("Invalid regex for Tech Email"),
-        Regex::new(r"(?i)Tech E-mail:\s*(.+)").expect("Invalid regex for Tech E-mail"),
+        Regex::new(r"(?i)Tech Email:[ \t]*(.+)").expect("Invalid regex for Tech Email"),
+        Regex::new(r"(?i)Tech E-mail:[ \t]*(.+)").expect("Invalid regex for Tech E-mail"),
     ]
 });
 
 static TECH_PHONE_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
     vec![
-        Regex::new(r"(?i)Tech Phone:\s*(.+)").expect("Invalid regex for Tech Phone"),
-        Regex::new(r"(?i)Tech Tel:\s*(.+)").expect("Invalid regex for Tech Tel"),
+        Regex::new(r"(?i)Tech Phone:[ \t]*(.+)").expect("Invalid regex for Tech Phone"),
+        Regex::new(r"(?i)Tech Tel:[ \t]*(.+)").expect("Invalid regex for Tech Tel"),
     ]
 });
 
@@ -254,8 +267,10 @@ impl WhoisResponse {
     /// This is called by the GenericParser and can be overridden
     /// by specialized parsers for specific TLDs.
     pub fn parse_internal(domain: &str, whois_server: &str, raw: &str) -> Self {
-        let registrar = extract_field_with_patterns(raw, &REGISTRAR_PATTERNS);
-        let registrant = extract_field_with_patterns(raw, &REGISTRANT_PATTERNS);
+        let registrar = extract_field_with_patterns(raw, &REGISTRAR_PATTERNS)
+            .or_else(|| extract_section_value(raw, &["registrar"]));
+        let registrant = extract_field_with_patterns(raw, &REGISTRANT_PATTERNS)
+            .or_else(|| extract_section_value(raw, &["registrant"]));
         let organization = extract_field_with_patterns(raw, &ORGANIZATION_PATTERNS);
         let registrant_email = extract_field_with_patterns(raw, &REGISTRANT_EMAIL_PATTERNS);
         let registrant_phone = extract_field_with_patterns(raw, &REGISTRANT_PHONE_PATTERNS);
@@ -635,27 +650,67 @@ const NOT_FOUND_PATTERNS: &[&str] = &[
 
 fn extract_field_with_patterns(text: &str, patterns: &[Regex]) -> Option<String> {
     for re in patterns {
-        if let Some(caps) = re.captures(text) {
-            if let Some(m) = caps.get(1) {
-                let value = m.as_str().trim();
-                if value.is_empty() {
-                    continue;
-                }
-                let lower = value.to_lowercase();
-
-                // Filter out redacted/privacy-protected values
-                let is_redacted = lower.contains("redacted")
-                    || lower.contains("data protected")
-                    || lower.contains("privacy")
-                    || lower.contains("not disclosed")
-                    || lower.contains("withheld")
-                    || lower == "n/a"
-                    || lower == "none";
-
-                if !is_redacted {
-                    return Some(value.to_string());
-                }
+        // The first occurrence of this label that carries a value. An empty
+        // occurrence (`Label: \r\n` — the `(.+)` captures just the `\r`) is
+        // skipped so CRLF and LF bodies behave alike: under LF the regex
+        // engine already steps past an empty `Label:\n` line on its own.
+        let first_value = re
+            .captures_iter(text)
+            .filter_map(|caps| caps.get(1))
+            .map(|m| m.as_str().trim())
+            .find(|v| !v.is_empty());
+        if let Some(value) = first_value {
+            if !is_placeholder_value(value) {
+                return Some(value.to_string());
             }
+        }
+    }
+    None
+}
+
+/// True for values that are privacy/redaction placeholders rather than real
+/// data ("REDACTED FOR PRIVACY", "Not disclosed", DNS Belgium's "Not shown,
+/// please visit www.dnsbelgium.be for webbased whois.", "N/A").
+fn is_placeholder_value(value: &str) -> bool {
+    let lower = value.to_lowercase();
+    lower.contains("redacted")
+        || lower.contains("data protected")
+        || lower.contains("privacy")
+        || lower.contains("not disclosed")
+        || lower.contains("not shown")
+        || lower.contains("withheld")
+        || lower == "n/a"
+        || lower == "none"
+}
+
+/// Section-style fallback for registries that print a label alone on its own
+/// line and the value on the NEXT line — NASK (`REGISTRAR:` / `MarkMonitor,
+/// Inc.`), DNS Belgium (`Registrar:` / `\tName:\t MarkMonitor Inc.`) and
+/// TWNIC (`Registrant:` / `      Google LLC`).
+///
+/// Only the line immediately after a header whose whole content is one of
+/// `labels` + `:` (case-insensitive) is considered, and only when it is a bare
+/// value (no `:` at all) or a `Name: <value>` sub-field. Anything else — most
+/// importantly another `Key: value` field (`Registrar IANA ID: 376`) — is not
+/// a value for this header, which is exactly the misattribution the
+/// horizontal-whitespace field patterns exist to prevent.
+fn extract_section_value(text: &str, labels: &[&str]) -> Option<String> {
+    let mut lines = text.lines();
+    while let Some(line) = lines.next() {
+        let Some(label) = line.trim().strip_suffix(':') else {
+            continue;
+        };
+        if !labels.iter().any(|l| label.trim().eq_ignore_ascii_case(l)) {
+            continue;
+        }
+        let next = lines.next()?.trim();
+        let value = match next.split_once(':') {
+            None => next,
+            Some((key, value)) if key.trim().eq_ignore_ascii_case("name") => value.trim(),
+            Some(_) => continue,
+        };
+        if !value.is_empty() && !is_placeholder_value(value) {
+            return Some(value.to_string());
         }
     }
     None
@@ -909,6 +964,157 @@ mod tests {
             extract_field_with_patterns(raw2, &ORGANIZATION_PATTERNS).as_deref(),
             Some("Real Registrant LLC")
         );
+    }
+
+    // --- empty fields must not capture the following line ---------------
+
+    #[test]
+    fn empty_fields_do_not_capture_the_next_line() {
+        // `\s*` between label and value used to match the CR/LF of an EMPTY
+        // field and capture the following line as its value.
+        let raw = concat!(
+            "Domain Name: EXAMPLE.COM\r\n",
+            "Registrar WHOIS Server: whois.tucows.com\r\n",
+            "Creation Date: 2010-01-01T00:00:00Z\r\n",
+            "Registrar Registration Expiration Date: \r\n",
+            "Registrar: TUCOWS, INC.\r\n",
+            "Registrant Organization: \r\n",
+            "Registrant Street: 123 Main\r\n",
+            "Name Server: \r\n",
+            "DNSSEC: \r\n",
+            "URL of the ICANN Whois Inaccuracy Complaint Form: https://www.icann.org/wicf/\r\n",
+        );
+        let r = WhoisResponse::parse("example.com", "whois.tucows.com", raw);
+        assert!(
+            r.nameservers.is_empty(),
+            "empty Name Server must not yield the next label: {:?}",
+            r.nameservers
+        );
+        assert_eq!(r.dnssec, None, "empty DNSSEC must not capture the URL line");
+        assert_eq!(
+            r.organization, None,
+            "empty Registrant Organization must not capture the street line"
+        );
+        assert_eq!(r.registrant_address.as_deref(), Some("123 Main"));
+        assert_eq!(r.registrar.as_deref(), Some("TUCOWS, INC."));
+        assert_eq!(
+            r.expiration_date, None,
+            "empty expiry must stay None, not the registrar line"
+        );
+
+        // LF-only variant with trailing whitespace, plus a later populated
+        // expiry label: the empty occurrence is skipped and the real one wins.
+        let raw = "Registrar Registration Expiration Date: \n\
+                   Registrar: TUCOWS, INC.\n\
+                   Name Server: \n\
+                   DNSSEC: unsigned\n\
+                   Registry Expiry Date: 2027-03-01T00:00:00Z\n";
+        let r = WhoisResponse::parse("example.com", "whois.tucows.com", raw);
+        assert!(r.nameservers.is_empty(), "got {:?}", r.nameservers);
+        assert_eq!(r.dnssec.as_deref(), Some("unsigned"));
+        assert_eq!(
+            r.expiration_date.map(|d| d.format("%Y-%m-%d").to_string()),
+            Some("2027-03-01".to_string())
+        );
+    }
+
+    /// DNS Belgium (.be) prints section headers with the value on the next
+    /// (tab-indented) line: `Registrar:` / `\tName:\t MarkMonitor Inc.`.
+    #[test]
+    fn dns_belgium_section_registrar_is_extracted() {
+        let raw = "% .be Whois Server 6.1\n\
+                   %\n\
+                   Domain:\tgoogle.be\n\
+                   Status:\tNOT AVAILABLE\n\
+                   Registered:\tTue Dec 12 2000\n\
+                   \n\
+                   Registrant:\n\
+                   \tNot shown, please visit www.dnsbelgium.be for webbased whois.\n\
+                   \n\
+                   Registrar Technical Contacts:\n\
+                   \tOrganisation:\tMarkMonitor Inc.\n\
+                   \tLanguage:\ten\n\
+                   \tPhone:\t+1.2083895740\n\
+                   \tEmail:\tccops@markmonitor.com\n\
+                   \n\
+                   \n\
+                   Registrar:\n\
+                   \tName:\t MarkMonitor Inc.\n\
+                   \tWebsite: http://www.markmonitor.com\n\
+                   \n\
+                   Nameservers:\n\
+                   \tns2.google.com\n\
+                   \tns1.google.com\n\
+                   \n\
+                   Keys:\n\
+                   \n\
+                   Flags:\n\
+                   \tclientTransferProhibited\n\
+                   \n\
+                   Please visit www.dnsbelgium.be for more info.\n";
+        let r = WhoisResponse::parse("google.be", "whois.dns.be", raw);
+        assert_eq!(r.registrar.as_deref(), Some("MarkMonitor Inc."));
+        assert_eq!(
+            r.registrant, None,
+            "the 'Not shown' notice is not a registrant"
+        );
+    }
+
+    /// NASK (.pl) prints `REGISTRAR:` alone, then the registrar's name on
+    /// the next line.
+    #[test]
+    fn nask_section_registrar_is_extracted() {
+        let raw = "DOMAIN NAME:           google.pl\n\
+                   registrant type:       organization\n\
+                   nameservers:           ns1.google.com.\n\
+                   \x20                      ns2.google.com.\n\
+                   created:               2002.09.19 13:00:00\n\
+                   last modified:         2025.08.19 13:47:36\n\
+                   renewal date:          2026.09.18 14:00:00\n\
+                   \n\
+                   no option\n\
+                   \n\
+                   dnssec:                Unsigned\n\
+                   \n\
+                   \n\
+                   REGISTRAR:\n\
+                   MarkMonitor, Inc.\n\
+                   3540 East Longwing Lane, Suite 300\n\
+                   Meridian, Idaho 83646\n\
+                   United States\n\
+                   +1.2083895740\n\
+                   ccops@markmonitor.com\n\
+                   www.markmonitor.com\n\
+                   \n\
+                   WHOIS database responses: https://dns.pl/en/whois\n";
+        let r = WhoisResponse::parse("google.pl", "whois.dns.pl", raw);
+        assert_eq!(r.registrar.as_deref(), Some("MarkMonitor, Inc."));
+        assert_eq!(r.dnssec.as_deref(), Some("Unsigned"));
+    }
+
+    /// TWNIC (.tw) lists the registrant name on the line after `Registrant:`.
+    #[test]
+    fn twnic_section_registrant_is_extracted() {
+        let raw = "Domain Name: google.com.tw\n\
+                   \x20  Domain Status: clientUpdateProhibited\n\
+                   \x20  Registrant:\n\
+                   \x20     Google LLC\n\
+                   \x20     DNS Admin  dns-admin@google.com\n\
+                   \n\
+                   \x20  Record expires on 2026-11-09 00:00:00 (UTC+8)\n\
+                   \n\
+                   Registration Service Provider: Markmonitor, Inc.\n";
+        let r = WhoisResponse::parse("google.com.tw", "whois.twnic.net.tw", raw);
+        assert_eq!(r.registrant.as_deref(), Some("Google LLC"));
+    }
+
+    #[test]
+    fn section_fallback_ignores_a_following_key_value_field() {
+        // An empty `Registrar:` followed by another field is NOT a section
+        // header: the next field's text must not become the registrar.
+        let raw = "Domain Name: EXAMPLE.COM\nRegistrar:\nRegistrar IANA ID: 376\n";
+        let r = WhoisResponse::parse("example.com", "whois.example", raw);
+        assert_eq!(r.registrar, None);
     }
 
     // --- H10: is_available() scans the full response --------------------

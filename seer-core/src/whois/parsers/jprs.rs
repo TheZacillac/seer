@@ -27,38 +27,40 @@ use crate::whois::parser::WhoisResponse;
 /// (`p. [ネームサーバ]   value`) and the current bracket-only format
 /// (`[Name Server]   value` / `[ネームサーバ]   value`).
 static NS_PATTERN: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?m)^(?:p\.\s+\[ネームサーバ\]|\[(?:Name Server|ネームサーバ)\])\s+(.+)$")
+    Regex::new(r"(?m)^(?:p\.[ \t]+\[ネームサーバ\]|\[(?:Name Server|ネームサーバ)\])[ \t]+(.+)$")
         .expect("Invalid JPRS NS regex")
 });
 
 /// Matches organization (English): `g. [Organization]   value`
 static ORG_PATTERN: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?m)^g\.\s+\[Organization\]\s+(.+)$").expect("Invalid JPRS org regex")
+    Regex::new(r"(?m)^g\.[ \t]+\[Organization\][ \t]+(.+)$").expect("Invalid JPRS org regex")
 });
 
 /// Matches organization (Japanese): `f. [組織名]   value`
-static ORG_JP_PATTERN: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?m)^f\.\s+\[組織名\]\s+(.+)$").expect("Invalid JPRS org JP regex"));
+static ORG_JP_PATTERN: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?m)^f\.[ \t]+\[組織名\][ \t]+(.+)$").expect("Invalid JPRS org JP regex")
+});
 
 /// Matches state: `[状態]   value` / `[Status]   value` / `[State]   value`
 static STATUS_PATTERN: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?m)^\[(?:状態|Status|State)\]\s+(.+)$").expect("Invalid JPRS status regex")
+    Regex::new(r"(?m)^\[(?:状態|Status|State)\][ \t]+(.+)$").expect("Invalid JPRS status regex")
 });
 
 /// Matches last updated: `[最終更新]` / `[Last Updated]`   YYYY/MM/DD HH:MM:SS (JST)
 static UPDATED_PATTERN: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?m)^\[(?:最終更新|Last Updated)\]\s+(.+)$").expect("Invalid JPRS updated regex")
+    Regex::new(r"(?m)^\[(?:最終更新|Last Updated)\][ \t]+(.+)$")
+        .expect("Invalid JPRS updated regex")
 });
 
 /// Matches creation date: `[登録年月日]` / `[接続年月日]` / `[Created on]`   YYYY/MM/DD
 static CREATED_PATTERN: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?m)^\[(?:登録年月日|接続年月日|Created on)\]\s+(.+)$")
+    Regex::new(r"(?m)^\[(?:登録年月日|接続年月日|Created on)\][ \t]+(.+)$")
         .expect("Invalid JPRS created regex")
 });
 
 /// Matches expiration date: `[有効期限]` / `[Expires on]`   YYYY/MM/DD
 static EXPIRES_PATTERN: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?m)^\[(?:有効期限|Expires on)\]\s+(.+)$").expect("Invalid JPRS expires regex")
+    Regex::new(r"(?m)^\[(?:有効期限|Expires on)\][ \t]+(.+)$").expect("Invalid JPRS expires regex")
 });
 
 /// Matches DNSSEC signing key line, legacy `s. [署名鍵]` or current
@@ -66,18 +68,18 @@ static EXPIRES_PATTERN: Lazy<Regex> = Lazy::new(|| {
 /// value means unsigned. Uses `[^\S\n]*` instead of `\s*` to avoid matching
 /// across newlines in multiline mode.
 static SIGNING_KEY_LINE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?m)^(?:s\.\s+\[署名鍵\]|\[(?:Signing Key|署名鍵)\])[^\S\n]*(.+)?$")
+    Regex::new(r"(?m)^(?:s\.[ \t]+\[署名鍵\]|\[(?:Signing Key|署名鍵)\])[^\S\n]*(.+)?$")
         .expect("Invalid JPRS signing key regex")
 });
 
 /// Matches registrant lines in the current bracket format: prefer the English
 /// `[Registrant]` value; fall back to the Japanese `[登録者名]`.
 static REGISTRANT_EN_PATTERN: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?m)^\[Registrant\]\s+(.+)$").expect("Invalid JPRS registrant regex")
+    Regex::new(r"(?m)^\[Registrant\][ \t]+(.+)$").expect("Invalid JPRS registrant regex")
 });
 
 static REGISTRANT_JP_PATTERN: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?m)^\[登録者名\]\s+(.+)$").expect("Invalid JPRS registrant JP regex")
+    Regex::new(r"(?m)^\[登録者名\][ \t]+(.+)$").expect("Invalid JPRS registrant JP regex")
 });
 
 // Also support the English-appended format (when /e is used)
@@ -86,7 +88,7 @@ static REGISTRANT_JP_PATTERN: Lazy<Regex> = Lazy::new(|| {
 /// not captured, so only the trailing hostname lands in the capture group —
 /// otherwise a `p. [label] host` line yields `[label] host` as the nameserver.
 static NS_EN_PATTERN: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?im)^(?:Name Server\s*:?|p\.\s*(?:\[[^\]]*\])?)\s+(.+)$")
+    Regex::new(r"(?im)^(?:Name Server[ \t]*:?|p\.[ \t]*(?:\[[^\]]*\])?)[ \t]+(.+)$")
         .expect("Invalid JPRS NS EN regex")
 });
 
@@ -480,5 +482,29 @@ Domain Information: [ドメイン情報]
         assert!(result.expiration_date.is_some(), "expiry from [Expires on]");
         assert!(result.status.contains(&"Active".to_string()));
         assert_eq!(result.dnssec.as_deref(), Some("signedDelegation"));
+    }
+
+    /// An EMPTY bracket field must not capture the next line: `\s+` after
+    /// the label used to match the line break, turning an empty
+    /// `p. [Name Server]` into the nameserver `s. [signing key]`.
+    #[test]
+    fn test_jprs_empty_fields_do_not_capture_next_line() {
+        let raw = "Domain Information:\n\
+                   a. [Domain Name]                EXAMPLE.CO.JP\n\
+                   g. [Organization]               \n\
+                   l. [Organization Type]          Company\n\
+                   p. [Name Server]                \n\
+                   s. [Signing Key]                \n\
+                   [State]                         Connected (2027/03/31)\n";
+        let result = JprsParser::new().parse("example.co.jp", "whois.jprs.jp", raw);
+        assert!(
+            result.nameservers.is_empty(),
+            "empty NS line must not yield the next line: {:?}",
+            result.nameservers
+        );
+        assert_eq!(
+            result.organization, None,
+            "empty [Organization] must not capture [Organization Type]"
+        );
     }
 }

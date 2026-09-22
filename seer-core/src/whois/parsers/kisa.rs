@@ -24,46 +24,50 @@ use crate::whois::parser::WhoisResponse;
 /// Korean: `   호스트이름               : ns1.google.com`
 /// English: `   Host Name                : ns1.google.com`
 static HOST_NAME_PATTERN: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?im)^\s+(?:Host Name|호스트이름)\s*:\s*(.+)$")
+    Regex::new(r"(?im)^[ \t]+(?:Host Name|호스트이름)[ \t]*:[ \t]*(.+)$")
         .expect("Invalid KISA hostname regex")
 });
 
 /// Inline fields in the English section
 static REGISTRANT_PATTERN: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?im)^Registrant\s*:\s*(.+)$").expect("Invalid KISA registrant regex")
+    Regex::new(r"(?im)^Registrant[ \t]*:[ \t]*(.+)$").expect("Invalid KISA registrant regex")
 });
 
 static ADMIN_PATTERN: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?im)^Administrative Contact\(AC\)\s*:\s*(.+)$").expect("Invalid KISA admin regex")
+    Regex::new(r"(?im)^Administrative Contact\(AC\)[ \t]*:[ \t]*(.+)$")
+        .expect("Invalid KISA admin regex")
 });
 
-static AC_EMAIL_PATTERN: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?im)^AC E-Mail\s*:\s*(.+)$").expect("Invalid KISA AC email regex"));
+static AC_EMAIL_PATTERN: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?im)^AC E-Mail[ \t]*:[ \t]*(.+)$").expect("Invalid KISA AC email regex")
+});
 
 static AC_PHONE_PATTERN: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?im)^AC Phone Number\s*:\s*(.+)$").expect("Invalid KISA AC phone regex")
+    Regex::new(r"(?im)^AC Phone Number[ \t]*:[ \t]*(.+)$").expect("Invalid KISA AC phone regex")
 });
 
 static REGISTERED_DATE_PATTERN: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?im)^Registered Date\s*:\s*(.+)$").expect("Invalid KISA registered date regex")
+    Regex::new(r"(?im)^Registered Date[ \t]*:[ \t]*(.+)$")
+        .expect("Invalid KISA registered date regex")
 });
 
 static EXPIRATION_DATE_PATTERN: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?im)^Expiration Date\s*:\s*(.+)$").expect("Invalid KISA expiration date regex")
+    Regex::new(r"(?im)^Expiration Date[ \t]*:[ \t]*(.+)$")
+        .expect("Invalid KISA expiration date regex")
 });
 
 static LAST_UPDATED_PATTERN: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?im)^Last Updated Date\s*:\s*(.+)$")
+    Regex::new(r"(?im)^Last Updated Date[ \t]*:[ \t]*(.+)$")
         .expect("Invalid KISA last updated date regex")
 });
 
 static AUTHORIZED_AGENCY_PATTERN: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?im)^Authorized Agency\s*:\s*(.+)$")
+    Regex::new(r"(?im)^Authorized Agency[ \t]*:[ \t]*(.+)$")
         .expect("Invalid KISA authorized agency regex")
 });
 
 static DNSSEC_PATTERN: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?im)^DNSSEC\s*:\s*(.+)$").expect("Invalid KISA DNSSEC regex"));
+    Lazy::new(|| Regex::new(r"(?im)^DNSSEC[ \t]*:[ \t]*(.+)$").expect("Invalid KISA DNSSEC regex"));
 
 /// Parser for .kr domains using the KISA/KRNIC format.
 #[derive(Debug, Clone, Default)]
@@ -388,5 +392,22 @@ Secondary Name Server
     fn test_supported_tlds() {
         let parser = KisaParser::new();
         assert_eq!(parser.supported_tlds(), &["kr"]);
+    }
+
+    /// An EMPTY `Registrant :` field must not capture the following line
+    /// (`\s*` after the colon used to match the line break).
+    #[test]
+    fn test_kisa_empty_field_does_not_capture_next_line() {
+        let raw = "# ENGLISH\n\
+                   \n\
+                   Domain Name                 : example.kr\n\
+                   Registrant                  : \n\
+                   Registrant Address          : 22nd Floor, Seoul\n\
+                   Authorized Agency           : \n\
+                   DNSSEC                      : unsigned\n";
+        let result = KisaParser::new().parse("example.kr", "whois.kr", raw);
+        assert_eq!(result.registrant, None);
+        assert_eq!(result.registrar, None);
+        assert_eq!(result.dnssec.as_deref(), Some("unsigned"));
     }
 }
