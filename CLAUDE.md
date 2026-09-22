@@ -179,6 +179,9 @@ seer-cli/src/
   `pub(crate) render_doctor_report` (main.rs), used by both the CLI and the
   REPL `doctor` command since no `OutputFormatter` method exists for doctor
   reports.
+- `seer dnssec <domain>` is check-style: exits 1 unless `report.status ==
+  "signed"` (core's vocabulary is `signed | unsigned | partial |
+  misconfigured` — it never says "secure").
 - `seer delegation <domain>` is check-style: exits 1 when `!report.in_sync ||
   !report.lame.is_empty()`, 0 when healthy. Output goes through
   `get_formatter(format).format_delegation()`.
@@ -771,6 +774,15 @@ fn normalize_domain(domain: &str) -> String {
 
 Apply this in all public-facing functions that accept domain input.
 
+**Registration vs. exact host:** `validation::normalize_domain` strips a
+leading `www.` (only when a registrable name remains — `www.com` is kept
+whole), which is right for registration-level operations (WHOIS, RDAP,
+availability, history/watchlist keys). Anything about one specific DNS name
+or host — DNS record queries (`dig`, propagation, follow, compare), per-host
+probes (`ssl`, `status`, `headers`, `takeover`, subdomain classification) —
+must use `validation::normalize_host`, which is identical but keeps `www.`
+(`www` usually has its own CNAME and can serve a different site/cert).
+
 ### 2. Timeout Protection
 
 **All network operations must have timeouts:**
@@ -1299,7 +1311,7 @@ keys off the distribution name.
 | `SEER_METRICS_ENABLED` | Expose `/metrics` to non-loopback clients | `false` |
 | `SEER_TRUST_PROXY` | Trust `X-Forwarded-For` when peer is in `SEER_TRUSTED_PROXY_IPS` | `false` |
 | `SEER_TRUSTED_PROXY_IPS` | Comma-separated list of IPs allowed to set XFF | — |
-| `SEER_RATE_LIMIT` | Default slowapi rate limit | `30/minute` |
+| `SEER_RATE_LIMIT` | Rate limit for `POST /mcp` (every REST route has its own explicit limit); `;`-separated multi-limits are all enforced | `30/minute` |
 | `SEER_RATE_LIMIT_STORAGE` | Rate-limit storage URI (e.g. `redis://host:6379`) | `memory://` |
 | `SEER_REQUEST_TIMEOUT` | Per-request deadline (seconds) for dispatched core calls; on expiry the client gets a 504. `0` disables | `0` |
 | `SEER_DISPATCH_THREADS` | Max threads in the bounded pool that runs blocking PyO3 calls (REST + `/mcp`) | `50` |
