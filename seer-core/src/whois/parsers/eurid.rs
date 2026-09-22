@@ -56,7 +56,9 @@ impl EuridParser {
 
 impl RegistryParser for EuridParser {
     fn supported_tlds(&self) -> &[&str] {
-        &["eu"]
+        // whois.eu also serves the IDN ccTLDs .ею (Cyrillic) and .ευ
+        // (Greek), which reach this dispatch as A-labels.
+        &["eu", "xn--e1a4c", "xn--qxa6a"]
     }
 
     fn parse(&self, domain: &str, server: &str, raw: &str) -> WhoisResponse {
@@ -327,7 +329,7 @@ Please visit www.eurid.eu for more info."#;
     #[test]
     fn test_supported_tlds() {
         let parser = EuridParser::new();
-        assert_eq!(parser.supported_tlds(), &["eu"]);
+        assert_eq!(parser.supported_tlds(), &["eu", "xn--e1a4c", "xn--qxa6a"]);
     }
 
     #[test]

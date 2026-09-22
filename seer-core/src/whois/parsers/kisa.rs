@@ -99,7 +99,10 @@ impl KisaParser {
 
 impl RegistryParser for KisaParser {
     fn supported_tlds(&self) -> &[&str] {
-        &["kr"]
+        // whois.kr also serves the IDN TLDs .한국 (ccTLD) and .삼성; the
+        // client sends IDN domains to the wire as A-labels, so they reach
+        // the registry (and this dispatch) as `xn--3e0b707e` / `xn--cg4bki`.
+        &["kr", "xn--3e0b707e", "xn--cg4bki"]
     }
 
     fn parse(&self, domain: &str, server: &str, raw: &str) -> WhoisResponse {
@@ -391,7 +394,10 @@ Secondary Name Server
     #[test]
     fn test_supported_tlds() {
         let parser = KisaParser::new();
-        assert_eq!(parser.supported_tlds(), &["kr"]);
+        assert_eq!(
+            parser.supported_tlds(),
+            &["kr", "xn--3e0b707e", "xn--cg4bki"]
+        );
     }
 
     /// An EMPTY `Registrant :` field must not capture the following line
