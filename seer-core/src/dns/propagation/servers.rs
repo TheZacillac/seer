@@ -1,11 +1,11 @@
-use once_cell::sync::Lazy;
+use std::sync::LazyLock;
 
 use super::types::DnsServer;
 
 /// Built-in list of global DNS servers for propagation checking.
 /// Constructed once on first access; callers that need ownership call
 /// `default_dns_servers().to_vec()`.
-static DEFAULT_DNS_SERVERS: Lazy<Vec<DnsServer>> = Lazy::new(|| {
+static DEFAULT_DNS_SERVERS: LazyLock<Vec<DnsServer>> = LazyLock::new(|| {
     vec![
         // North America
         DnsServer::new("Google", "8.8.8.8", "North America", "Google"),

@@ -18,7 +18,7 @@ mod nic_lv;
 mod nominet;
 mod sidn;
 
-use once_cell::sync::Lazy;
+use std::sync::LazyLock;
 
 use super::parser::WhoisResponse;
 pub use denic::DenicParser;
@@ -135,7 +135,7 @@ impl Default for ParserRegistry {
 }
 
 /// Global parser registry instance.
-pub static PARSER_REGISTRY: Lazy<ParserRegistry> = Lazy::new(ParserRegistry::new);
+pub static PARSER_REGISTRY: LazyLock<ParserRegistry> = LazyLock::new(ParserRegistry::new);
 
 /// Extracts the TLD from a domain name.
 fn extract_tld(domain: &str) -> Option<String> {

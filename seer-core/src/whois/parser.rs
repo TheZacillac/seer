@@ -1,9 +1,9 @@
 use std::collections::HashSet;
 
 use chrono::{DateTime, FixedOffset, Utc};
-use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::sync::LazyLock;
 
 /// Pre-compiled regexes for WHOIS field extraction.
 ///
@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 /// value on the following line (NASK `REGISTRAR:\n<name>`, DNS Belgium
 /// `Registrar:\n\tName: <name>`) are handled explicitly by
 /// [`extract_section_value`] instead.
-static REGISTRAR_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
+static REGISTRAR_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     vec![
         Regex::new(r"(?i)Registrar:[ \t]*(.+)").expect("Invalid regex for Registrar"),
         Regex::new(r"(?i)Registrar Name:[ \t]*(.+)").expect("Invalid regex for Registrar Name"),
@@ -24,14 +24,14 @@ static REGISTRAR_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
     ]
 });
 
-static REGISTRANT_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
+static REGISTRANT_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     vec![
         Regex::new(r"(?i)Registrant Name:[ \t]*(.+)").expect("Invalid regex for Registrant Name"),
         Regex::new(r"(?i)Registrant:[ \t]*(.+)").expect("Invalid regex for Registrant"),
     ]
 });
 
-static ORGANIZATION_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
+static ORGANIZATION_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     vec![
         Regex::new(r"(?i)Registrant Organization:[ \t]*(.+)")
             .expect("Invalid regex for Registrant Organization"),
@@ -45,7 +45,7 @@ static ORGANIZATION_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
     ]
 });
 
-static CREATION_DATE_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
+static CREATION_DATE_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     vec![
         Regex::new(r"(?i)Creation Date:[ \t]*(.+)").expect("Invalid regex for Creation Date"),
         Regex::new(r"(?i)Created Date:[ \t]*(.+)").expect("Invalid regex for Created Date"),
@@ -63,7 +63,7 @@ static CREATION_DATE_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
     ]
 });
 
-static EXPIRATION_DATE_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
+static EXPIRATION_DATE_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     vec![
         Regex::new(r"(?i)(?:Registry )?Expir(?:y|ation) Date:[ \t]*(.+)")
             .expect("Invalid regex for Expiry/Expiration Date"),
@@ -78,7 +78,7 @@ static EXPIRATION_DATE_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
     ]
 });
 
-static UPDATED_DATE_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
+static UPDATED_DATE_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     vec![
         Regex::new(r"(?i)Updated Date:[ \t]*(.+)").expect("Invalid regex for Updated Date"),
         Regex::new(r"(?i)Last Updated On:[ \t]*(.+)").expect("Invalid regex for Last Updated On"),
@@ -93,14 +93,14 @@ static UPDATED_DATE_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
     ]
 });
 
-static DNSSEC_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
+static DNSSEC_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     vec![
         Regex::new(r"(?i)DNSSEC:[ \t]*(.+)").expect("Invalid regex for DNSSEC"),
         Regex::new(r"(?i)DNSSEC Status:[ \t]*(.+)").expect("Invalid regex for DNSSEC Status"),
     ]
 });
 
-static NAMESERVER_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
+static NAMESERVER_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     vec![
         Regex::new(r"(?i)Name Server:[ \t]*(.+)").expect("Invalid regex for Name Server"),
         Regex::new(r"(?i)Nameserver:[ \t]*(.+)").expect("Invalid regex for Nameserver"),
@@ -116,7 +116,7 @@ static NAMESERVER_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
     ]
 });
 
-static REGISTRANT_EMAIL_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
+static REGISTRANT_EMAIL_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     vec![
         Regex::new(r"(?i)Registrant Email:[ \t]*(.+)").expect("Invalid regex for Registrant Email"),
         Regex::new(r"(?i)Registrant E-mail:[ \t]*(.+)")
@@ -124,14 +124,14 @@ static REGISTRANT_EMAIL_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
     ]
 });
 
-static REGISTRANT_PHONE_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
+static REGISTRANT_PHONE_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     vec![
         Regex::new(r"(?i)Registrant Phone:[ \t]*(.+)").expect("Invalid regex for Registrant Phone"),
         Regex::new(r"(?i)Registrant Tel:[ \t]*(.+)").expect("Invalid regex for Registrant Tel"),
     ]
 });
 
-static REGISTRANT_ADDRESS_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
+static REGISTRANT_ADDRESS_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     vec![
         Regex::new(r"(?i)Registrant Street:[ \t]*(.+)")
             .expect("Invalid regex for Registrant Street"),
@@ -140,12 +140,12 @@ static REGISTRANT_ADDRESS_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
     ]
 });
 
-static REGISTRANT_COUNTRY_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
+static REGISTRANT_COUNTRY_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     vec![Regex::new(r"(?i)Registrant Country:[ \t]*(.+)")
         .expect("Invalid regex for Registrant Country")]
 });
 
-static ADMIN_NAME_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
+static ADMIN_NAME_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     vec![
         Regex::new(r"(?i)Admin Name:[ \t]*(.+)").expect("Invalid regex for Admin Name"),
         Regex::new(r"(?i)Administrative Contact Name:[ \t]*(.+)")
@@ -153,26 +153,26 @@ static ADMIN_NAME_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
     ]
 });
 
-static ADMIN_ORG_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
+static ADMIN_ORG_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     vec![Regex::new(r"(?i)Admin Organization:[ \t]*(.+)")
         .expect("Invalid regex for Admin Organization")]
 });
 
-static ADMIN_EMAIL_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
+static ADMIN_EMAIL_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     vec![
         Regex::new(r"(?i)Admin Email:[ \t]*(.+)").expect("Invalid regex for Admin Email"),
         Regex::new(r"(?i)Admin E-mail:[ \t]*(.+)").expect("Invalid regex for Admin E-mail"),
     ]
 });
 
-static ADMIN_PHONE_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
+static ADMIN_PHONE_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     vec![
         Regex::new(r"(?i)Admin Phone:[ \t]*(.+)").expect("Invalid regex for Admin Phone"),
         Regex::new(r"(?i)Admin Tel:[ \t]*(.+)").expect("Invalid regex for Admin Tel"),
     ]
 });
 
-static TECH_NAME_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
+static TECH_NAME_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     vec![
         Regex::new(r"(?i)Tech Name:[ \t]*(.+)").expect("Invalid regex for Tech Name"),
         Regex::new(r"(?i)Technical Contact Name:[ \t]*(.+)")
@@ -180,19 +180,19 @@ static TECH_NAME_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
     ]
 });
 
-static TECH_ORG_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
+static TECH_ORG_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     vec![Regex::new(r"(?i)Tech Organization:[ \t]*(.+)")
         .expect("Invalid regex for Tech Organization")]
 });
 
-static TECH_EMAIL_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
+static TECH_EMAIL_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     vec![
         Regex::new(r"(?i)Tech Email:[ \t]*(.+)").expect("Invalid regex for Tech Email"),
         Regex::new(r"(?i)Tech E-mail:[ \t]*(.+)").expect("Invalid regex for Tech E-mail"),
     ]
 });
 
-static TECH_PHONE_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
+static TECH_PHONE_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     vec![
         Regex::new(r"(?i)Tech Phone:[ \t]*(.+)").expect("Invalid regex for Tech Phone"),
         Regex::new(r"(?i)Tech Tel:[ \t]*(.+)").expect("Invalid regex for Tech Tel"),
@@ -799,8 +799,9 @@ pub(crate) enum DateOrder {
 /// per-registry) evidence, fixing US `MM/DD/YYYY` registries without a fragile
 /// server table (issue #47).
 fn infer_date_order<'a>(candidates: impl IntoIterator<Item = &'a str>) -> Option<DateOrder> {
-    static NUMERIC_DATE: Lazy<Regex> =
-        Lazy::new(|| Regex::new(r"^\s*(\d{1,2})[/.](\d{1,2})[/.]\d{4}\b").expect("numeric date"));
+    static NUMERIC_DATE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"^\s*(\d{1,2})[/.](\d{1,2})[/.]\d{4}\b").expect("numeric date")
+    });
     for s in candidates {
         if let Some(c) = NUMERIC_DATE.captures(s) {
             if let (Ok(a), Ok(b)) = (c[1].parse::<u32>(), c[2].parse::<u32>()) {

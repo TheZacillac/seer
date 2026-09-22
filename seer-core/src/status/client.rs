@@ -12,9 +12,9 @@ use std::time::Duration;
 
 use chrono::Utc;
 use native_tls::TlsConnector;
-use once_cell::sync::Lazy;
 use regex::Regex;
 use reqwest::{Client, Url};
+use std::sync::LazyLock;
 use tokio::net::TcpStream;
 use tracing::{debug, instrument};
 
@@ -31,7 +31,7 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_REDIRECTS: usize = 5;
 
 /// Pre-compiled regex for extracting HTML title.
-static TITLE_REGEX: Lazy<Regex> = Lazy::new(|| {
+static TITLE_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)<title[^>]*>([^<]+)</title>").expect("Invalid regex for HTML title extraction")
 });
 

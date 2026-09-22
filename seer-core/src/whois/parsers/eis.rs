@@ -37,13 +37,13 @@
 //! generic `AVAILABILITY_PATTERNS`, so this parser does not special-case them.
 
 use chrono::{DateTime, Utc};
-use once_cell::sync::Lazy;
 use regex::Regex;
+use std::sync::LazyLock;
 
 use super::{push_bounded, RegistryParser, MAX_NAMESERVERS, MAX_STATUSES};
 use crate::whois::parser::WhoisResponse;
 
-static KEY_VALUE: Lazy<Regex> = Lazy::new(|| {
+static KEY_VALUE: LazyLock<Regex> = LazyLock::new(|| {
     // `key:   value` lines. EIS fields are flush-left, with multiple spaces
     // padding before the value. Keys may contain spaces (e.g. `org id`).
     Regex::new(r"^([a-z][a-z0-9 ]*):\s*(.+?)\s*$").expect("Invalid EIS key/value regex")

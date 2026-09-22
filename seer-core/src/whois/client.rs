@@ -1,8 +1,8 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
-use once_cell::sync::Lazy;
 use regex::Regex;
+use std::sync::LazyLock;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
@@ -16,7 +16,7 @@ use crate::retry::{RetryExecutor, RetryPolicy};
 use crate::validation::normalize_domain;
 
 /// Pre-compiled regexes for extracting WHOIS referral servers.
-static REFERRAL_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
+static REFERRAL_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     // The value MUST be on the SAME line as the key. Use `[ \t]*` (horizontal
     // whitespace only) rather than `\s*` between the key and the capture
     // group: `\s*` matches newlines, so an EMPTY `Registrar WHOIS Server:`
@@ -43,8 +43,8 @@ const IANA_WHOIS_SERVER: &str = "whois.iana.org";
 const SERVER_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Cache for dynamically discovered WHOIS servers with TTL expiration
-static DISCOVERED_SERVERS: Lazy<TtlCache<String, String>> =
-    Lazy::new(|| TtlCache::new(SERVER_CACHE_TTL));
+static DISCOVERED_SERVERS: LazyLock<TtlCache<String, String>> =
+    LazyLock::new(|| TtlCache::new(SERVER_CACHE_TTL));
 
 #[derive(Debug, Clone)]
 pub struct WhoisClient {

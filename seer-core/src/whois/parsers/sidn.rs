@@ -23,33 +23,33 @@
 //! ```
 
 use chrono::{DateTime, NaiveDate, Utc};
-use once_cell::sync::Lazy;
 use regex::Regex;
+use std::sync::LazyLock;
 
 use super::{push_bounded, RegistryParser, MAX_NAMESERVERS, MAX_STATUSES};
 use crate::whois::parser::WhoisResponse;
 
-static STATUS_PATTERN: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?i)^Status:\s*(.+)$").expect("Invalid SIDN status regex"));
+static STATUS_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)^Status:\s*(.+)$").expect("Invalid SIDN status regex"));
 
-static DNSSEC_PATTERN: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?i)^DNSSEC:\s*(.+)$").expect("Invalid SIDN DNSSEC regex"));
+static DNSSEC_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)^DNSSEC:\s*(.+)$").expect("Invalid SIDN DNSSEC regex"));
 
-static CREATION_PATTERN: Lazy<Regex> = Lazy::new(|| {
+static CREATION_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)^Creation Date:\s*(.+)$").expect("Invalid SIDN creation date regex")
 });
 
-static UPDATED_PATTERN: Lazy<Regex> = Lazy::new(|| {
+static UPDATED_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)^Updated Date:\s*(.+)$").expect("Invalid SIDN updated date regex")
 });
 
-static REGISTRAR_SECTION: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?i)^Registrar:\s*$").expect("Invalid SIDN registrar regex"));
+static REGISTRAR_SECTION: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)^Registrar:\s*$").expect("Invalid SIDN registrar regex"));
 
-static ABUSE_SECTION: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?i)^Abuse Contact:\s*$").expect("Invalid SIDN abuse regex"));
+static ABUSE_SECTION: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)^Abuse Contact:\s*$").expect("Invalid SIDN abuse regex"));
 
-static NAMESERVERS_SECTION: Lazy<Regex> = Lazy::new(|| {
+static NAMESERVERS_SECTION: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)^Domain nameservers:\s*$").expect("Invalid SIDN nameservers regex")
 });
 

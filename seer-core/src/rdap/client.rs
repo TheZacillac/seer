@@ -5,9 +5,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
-use once_cell::sync::Lazy;
 use reqwest::Client;
 use serde::Deserialize;
+use std::sync::LazyLock;
 use tokio::sync::{Notify, RwLock};
 use tracing::{debug, info, instrument, warn};
 
@@ -70,7 +70,7 @@ const MAX_RDAP_REDIRECTS: usize = 3;
 /// Wrapped in `Option` so a reqwest builder failure surfaces as a typed
 /// `SeerError::HttpError` via `rdap_http_client()` instead of a process
 /// panic at first use (library code must not `.expect()` on shared state).
-static RDAP_HTTP_CLIENT: Lazy<Option<Client>> = Lazy::new(|| {
+static RDAP_HTTP_CLIENT: LazyLock<Option<Client>> = LazyLock::new(|| {
     Client::builder()
         .timeout(DEFAULT_TIMEOUT)
         .connect_timeout(CONNECT_TIMEOUT)
@@ -94,12 +94,14 @@ fn rdap_http_client() -> Result<&'static Client> {
 }
 
 /// Bootstrap cache with TTL support
-static BOOTSTRAP_CACHE: Lazy<RwLock<Option<CachedBootstrap>>> = Lazy::new(|| RwLock::new(None));
+static BOOTSTRAP_CACHE: LazyLock<RwLock<Option<CachedBootstrap>>> =
+    LazyLock::new(|| RwLock::new(None));
 
 /// Timestamp of the most recent bootstrap refresh attempt (success or failure).
 /// Used together with `BOOTSTRAP_REFRESH_MIN_INTERVAL` to throttle retry
 /// storms when IANA is unreachable.
-static BOOTSTRAP_LAST_ATTEMPT: Lazy<RwLock<Option<Instant>>> = Lazy::new(|| RwLock::new(None));
+static BOOTSTRAP_LAST_ATTEMPT: LazyLock<RwLock<Option<Instant>>> =
+    LazyLock::new(|| RwLock::new(None));
 
 /// Notifies waiters when an in-flight bootstrap load completes (success or
 /// failure). Solves the first-boot thundering-herd race where two concurrent
@@ -108,7 +110,7 @@ static BOOTSTRAP_LAST_ATTEMPT: Lazy<RwLock<Option<Instant>>> = Lazy::new(|| RwLo
 /// and returns a spurious `throttled and no cache available` error while A
 /// is still actively loading. Losers instead wait on this notify with a
 /// bounded timeout, then re-check the cache.
-static BOOTSTRAP_LOAD_NOTIFY: Lazy<Notify> = Lazy::new(Notify::new);
+static BOOTSTRAP_LOAD_NOTIFY: LazyLock<Notify> = LazyLock::new(Notify::new);
 
 /// True while some task is running a bootstrap load. Lets a throttled
 /// cold-cache caller tell "a load is in flight — wait for its notify" apart
@@ -820,8 +822,8 @@ type PinnedClientKey = (String, u16, Duration);
 /// bypass this cache in both directions (never insert, never read).
 /// Capacity-bounded: evicting
 /// a live entry merely forces a re-validate + rebuild on next use.
-static PINNED_CLIENT_CACHE: Lazy<crate::cache::TtlCache<PinnedClientKey, Client>> =
-    Lazy::new(|| crate::cache::TtlCache::with_max_capacity(PINNED_CLIENT_TTL, 64));
+static PINNED_CLIENT_CACHE: LazyLock<crate::cache::TtlCache<PinnedClientKey, Client>> =
+    LazyLock::new(|| crate::cache::TtlCache::with_max_capacity(PINNED_CLIENT_TTL, 64));
 
 /// Sends one RDAP request: SSRF-validates the URL and pins the resolved IPs on
 /// a cached per-host client (DNS-rebinding defense), returning the raw response.

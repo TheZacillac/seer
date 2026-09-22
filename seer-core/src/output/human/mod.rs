@@ -1,6 +1,6 @@
 use chrono::TimeDelta;
-use once_cell::sync::Lazy;
 use regex::Regex;
+use std::sync::LazyLock;
 
 use super::OutputFormatter;
 
@@ -31,7 +31,7 @@ mod whois;
 /// terminal injection via malicious WHOIS/RDAP response data. The OSC branch
 /// accepts both BEL (`\x07`) and ST (`\x1b\\`) terminators (and excludes ESC
 /// from the payload run so it can't over-consume across sequences).
-static ANSI_ESCAPE_RE: Lazy<Regex> = Lazy::new(|| {
+static ANSI_ESCAPE_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\x1b\[[0-9;]*[a-zA-Z]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[A-Z@-_]")
         .expect("Invalid ANSI escape regex")
 });

@@ -11,8 +11,8 @@ use std::time::Duration;
 use hickory_resolver::config::{ResolverConfig, GOOGLE};
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use hickory_resolver::TokioResolver;
-use once_cell::sync::Lazy;
 use reqwest::Url;
+use std::sync::LazyLock;
 use tokio::net::lookup_host;
 use tracing::debug;
 
@@ -32,7 +32,7 @@ use crate::error::{Result, SeerError};
 /// returns a reserved IP — is still trusted and still blocked by the
 /// reserved-IP check. The pre-existing time-of-check/time-of-use window
 /// between validation and the actual outbound connect is unchanged.
-static FALLBACK_RESOLVER: Lazy<Option<TokioResolver>> = Lazy::new(|| {
+static FALLBACK_RESOLVER: LazyLock<Option<TokioResolver>> = LazyLock::new(|| {
     let mut builder = TokioResolver::builder_with_config(
         ResolverConfig::udp_and_tcp(&GOOGLE),
         TokioRuntimeProvider::default(),
@@ -46,7 +46,7 @@ static FALLBACK_RESOLVER: Lazy<Option<TokioResolver>> = Lazy::new(|| {
         // already failed.
         crate::dns::apply_standard_opts(builder.options_mut(), Duration::from_secs(5));
     }
-    // Mirror the `Lazy<Option<…>>` pattern used for the shared HTTP clients
+    // Mirror the `LazyLock<Option<…>>` pattern used for the shared HTTP clients
     // rather than `.expect()` in a library initializer: the build is infallible
     // today (no TLS features), but a `None` here degrades to a typed DNS error
     // at the call site instead of a process panic if that ever changes.

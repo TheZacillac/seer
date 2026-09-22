@@ -6,14 +6,14 @@ build-backend = "maturin"
 # Distribution name on PyPI ("seer" is taken there); the import name is
 # still `seer` — set by [tool.maturin] python-source/module-name below.
 name = "domain-seer"
-version = "0.48.0"
+dynamic = ["version"]  # taken from the Cargo workspace version
 description = "Domain name helper - WHOIS, RDAP, DIG, and propagation checking"
 readme = "README.md"
 license = { text = "MIT" }
 # Floor is 3.10: seer-api (and its mcp SDK dependency) requires >=3.10, so
-# advertising 3.9 here would fail at pip resolution time. The pyo3
-# abi3-py39 feature flag below stays — abi3 wheels built for 3.9 remain
-# forward-compatible with every newer CPython.
+# advertising 3.9 here would fail at pip resolution time. The workspace pyo3
+# dependency still builds abi3-py39 wheels, which stay forward-compatible
+# with every newer CPython.
 requires-python = ">=3.10"
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -35,7 +35,6 @@ dev = [
 ]
 
 [tool.maturin]
-features = ["pyo3/extension-module", "pyo3/abi3-py39"]
 python-source = "python"
 module-name = "seer._seer"
 

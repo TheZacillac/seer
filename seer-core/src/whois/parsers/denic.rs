@@ -13,34 +13,34 @@
 //! ```
 
 use chrono::{DateTime, Utc};
-use once_cell::sync::Lazy;
 use regex::Regex;
+use std::sync::LazyLock;
 
 use super::{push_bounded, RegistryParser, MAX_NAMESERVERS, MAX_STATUSES};
 use crate::whois::parser::WhoisResponse;
 
 /// Regex patterns for DENIC-specific fields.
-static NSERVER_PATTERN: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?i)^Nserver:\s*(.+)$").expect("Invalid DENIC nserver regex"));
+static NSERVER_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)^Nserver:\s*(.+)$").expect("Invalid DENIC nserver regex"));
 
-static STATUS_PATTERN: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?i)^Status:\s*(.+)$").expect("Invalid DENIC status regex"));
+static STATUS_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)^Status:\s*(.+)$").expect("Invalid DENIC status regex"));
 
-static CHANGED_PATTERN: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?i)^Changed:\s*(.+)$").expect("Invalid DENIC changed regex"));
+static CHANGED_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)^Changed:\s*(.+)$").expect("Invalid DENIC changed regex"));
 
-static HOLDER_PATTERN: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?i)^\[Holder\]").expect("Invalid DENIC holder regex"));
+static HOLDER_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)^\[Holder\]").expect("Invalid DENIC holder regex"));
 
-static HOLDER_NAME_PATTERN: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?i)^Name:\s*(.+)$").expect("Invalid DENIC holder name regex"));
+static HOLDER_NAME_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)^Name:\s*(.+)$").expect("Invalid DENIC holder name regex"));
 
-static HOLDER_COUNTRY_PATTERN: Lazy<Regex> = Lazy::new(|| {
+static HOLDER_COUNTRY_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)^CountryCode:\s*([A-Za-z]{2})$").expect("Invalid DENIC holder country regex")
 });
 
-static DNSKEY_PATTERN: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?i)^Dnskey:\s*(.+)$").expect("Invalid DENIC dnskey regex"));
+static DNSKEY_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)^Dnskey:\s*(.+)$").expect("Invalid DENIC dnskey regex"));
 
 /// Parser for .de domains using the DENIC format.
 #[derive(Debug, Clone, Default)]

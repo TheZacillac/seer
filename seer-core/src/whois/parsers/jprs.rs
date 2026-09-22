@@ -17,8 +17,8 @@
 //! ```
 
 use chrono::{DateTime, NaiveDateTime, Utc};
-use once_cell::sync::Lazy;
 use regex::Regex;
+use std::sync::LazyLock;
 
 use super::{push_bounded, RegistryParser, MAX_NAMESERVERS, MAX_STATUSES};
 use crate::whois::parser::WhoisResponse;
@@ -26,30 +26,30 @@ use crate::whois::parser::WhoisResponse;
 /// Matches nameserver lines in both the legacy lettered format
 /// (`p. [ネームサーバ]   value`) and the current bracket-only format
 /// (`[Name Server]   value` / `[ネームサーバ]   value`).
-static NS_PATTERN: Lazy<Regex> = Lazy::new(|| {
+static NS_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?m)^(?:p\.[ \t]+\[ネームサーバ\]|\[(?:Name Server|ネームサーバ)\])[ \t]+(.+)$")
         .expect("Invalid JPRS NS regex")
 });
 
 /// Matches organization (English): `g. [Organization]   value`
-static ORG_PATTERN: Lazy<Regex> = Lazy::new(|| {
+static ORG_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?m)^g\.[ \t]+\[Organization\][ \t]+(.+)$").expect("Invalid JPRS org regex")
 });
 
 /// Matches organization (Japanese): `f. [組織名]   value`
-static ORG_JP_PATTERN: Lazy<Regex> = Lazy::new(|| {
+static ORG_JP_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?m)^f\.[ \t]+\[組織名\][ \t]+(.+)$").expect("Invalid JPRS org JP regex")
 });
 
 /// Matches state: `[状態]   value` / `[Status]   value` / `[State]   value`
-static STATUS_PATTERN: Lazy<Regex> = Lazy::new(|| {
+static STATUS_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?m)^\[(?:状態|Status|State)\][ \t]+(.+)$").expect("Invalid JPRS status regex")
 });
 
 /// Matches last updated: `[最終更新]` / `[Last Updated]` (general-use .jp) /
 /// `[Last Update]` (attribute-type co.jp, or.jp, ne.jp, ac.jp, go.jp, …)
 ///   YYYY/MM/DD HH:MM:SS (JST)
-static UPDATED_PATTERN: Lazy<Regex> = Lazy::new(|| {
+static UPDATED_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?m)^\[(?:最終更新|Last Updated?)\][ \t]+(.+)$")
         .expect("Invalid JPRS updated regex")
 });
@@ -57,7 +57,7 @@ static UPDATED_PATTERN: Lazy<Regex> = Lazy::new(|| {
 /// Matches creation date: `[登録年月日]` / `[接続年月日]` / `[Created on]`
 /// (general-use .jp) and `[Registered Date]` / `[Connected Date]`
 /// (attribute-type co.jp etc.)   YYYY/MM/DD
-static CREATED_PATTERN: Lazy<Regex> = Lazy::new(|| {
+static CREATED_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"(?m)^\[(?:登録年月日|接続年月日|Created on|Registered Date|Connected Date)\][ \t]+(.+)$",
     )
@@ -65,7 +65,7 @@ static CREATED_PATTERN: Lazy<Regex> = Lazy::new(|| {
 });
 
 /// Matches expiration date: `[有効期限]` / `[Expires on]`   YYYY/MM/DD
-static EXPIRES_PATTERN: Lazy<Regex> = Lazy::new(|| {
+static EXPIRES_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?m)^\[(?:有効期限|Expires on)\][ \t]+(.+)$").expect("Invalid JPRS expires regex")
 });
 
@@ -74,24 +74,24 @@ static EXPIRES_PATTERN: Lazy<Regex> = Lazy::new(|| {
 /// `[Signing Key]` / `[署名鍵]`. The value portion is optional — an empty
 /// value means unsigned. Uses `[^\S\n]*` instead of `\s*` to avoid matching
 /// across newlines in multiline mode.
-static SIGNING_KEY_LINE: Lazy<Regex> = Lazy::new(|| {
+static SIGNING_KEY_LINE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?m)^(?:s\.[ \t]+)?\[(?:Signing Key|署名鍵)\][^\S\n]*(.+)?$")
         .expect("Invalid JPRS signing key regex")
 });
 
 /// Attribute-type domains (co.jp, or.jp, …) carry their expiry inside the
 /// state value: `[State]   Connected (2027/03/31)`.
-static STATE_EXPIRY_PATTERN: Lazy<Regex> = Lazy::new(|| {
+static STATE_EXPIRY_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\((\d{4}/\d{1,2}/\d{1,2})\)").expect("Invalid JPRS state expiry regex")
 });
 
 /// Matches registrant lines in the current bracket format: prefer the English
 /// `[Registrant]` value; fall back to the Japanese `[登録者名]`.
-static REGISTRANT_EN_PATTERN: Lazy<Regex> = Lazy::new(|| {
+static REGISTRANT_EN_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?m)^\[Registrant\][ \t]+(.+)$").expect("Invalid JPRS registrant regex")
 });
 
-static REGISTRANT_JP_PATTERN: Lazy<Regex> = Lazy::new(|| {
+static REGISTRANT_JP_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?m)^\[登録者名\][ \t]+(.+)$").expect("Invalid JPRS registrant JP regex")
 });
 
@@ -100,7 +100,7 @@ static REGISTRANT_JP_PATTERN: Lazy<Regex> = Lazy::new(|| {
 /// branch an optional bracketed label (e.g. `[Name Server]`) is consumed but
 /// not captured, so only the trailing hostname lands in the capture group —
 /// otherwise a `p. [label] host` line yields `[label] host` as the nameserver.
-static NS_EN_PATTERN: Lazy<Regex> = Lazy::new(|| {
+static NS_EN_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?im)^(?:Name Server[ \t]*:?|p\.[ \t]*(?:\[[^\]]*\])?)[ \t]+(.+)$")
         .expect("Invalid JPRS NS EN regex")
 });

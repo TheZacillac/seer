@@ -41,17 +41,18 @@
 //! `crate::whois::parser`, so this parser does not need to special-case it.
 
 use chrono::{DateTime, Utc};
-use once_cell::sync::Lazy;
 use regex::Regex;
+use std::sync::LazyLock;
 
 use super::{push_bounded, RegistryParser, MAX_NAMESERVERS, MAX_STATUSES};
 use crate::whois::parser::WhoisResponse;
 
-static SECTION_HEADER: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"^\[([A-Za-z]+)\]\s*$").expect("Invalid NIC.LV section regex"));
+static SECTION_HEADER: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\[([A-Za-z]+)\]\s*$").expect("Invalid NIC.LV section regex"));
 
-static KEY_VALUE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"^([A-Za-z]+):\s*(.+?)\s*$").expect("Invalid NIC.LV key/value regex"));
+static KEY_VALUE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^([A-Za-z]+):\s*(.+?)\s*$").expect("Invalid NIC.LV key/value regex")
+});
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Section {

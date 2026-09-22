@@ -21,8 +21,8 @@ path = "src/main.rs"
 formula = "seer"
 
 [dependencies]
-seer-core = { version = "0.48.0", path = "../seer-core" }
-tokio = { workspace = true }
+seer-core = { workspace = true }
+tokio = { workspace = true, features = ["signal"] }
 rustyline = { workspace = true }
 shlex = { workspace = true }
 colored = { workspace = true }
@@ -30,13 +30,12 @@ indicatif = { workspace = true }
 clap = { workspace = true }
 clap_complete = { workspace = true }
 clap_mangen = { workspace = true }
-tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 crossterm = { workspace = true, features = ["event-stream"] }
-ratatui = "0.30"
+ratatui = { version = "0.30", default-features = false, features = ["crossterm", "layout-cache"] }
 futures = { workspace = true }
 base64 = { workspace = true }
 dirs = { workspace = true }

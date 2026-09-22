@@ -23,50 +23,52 @@
 //! ```
 
 use chrono::{DateTime, NaiveDate, Utc};
-use once_cell::sync::Lazy;
 use regex::Regex;
+use std::sync::LazyLock;
 
 use super::{push_bounded, RegistryParser, MAX_NAMESERVERS, MAX_STATUSES};
 use crate::whois::parser::WhoisResponse;
 
 /// Regex patterns for Nominet-specific fields.
-static DOMAIN_SECTION: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?i)^Domain name:\s*$").expect("Invalid Nominet domain regex"));
+static DOMAIN_SECTION: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)^Domain name:\s*$").expect("Invalid Nominet domain regex"));
 
-static REGISTRANT_SECTION: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?i)^Registrant:\s*$").expect("Invalid Nominet registrant regex"));
+static REGISTRANT_SECTION: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)^Registrant:\s*$").expect("Invalid Nominet registrant regex")
+});
 
-static REGISTRAR_SECTION: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?i)^Registrar:\s*$").expect("Invalid Nominet registrar regex"));
+static REGISTRAR_SECTION: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)^Registrar:\s*$").expect("Invalid Nominet registrar regex"));
 
-static REGISTRATION_DATE: Lazy<Regex> = Lazy::new(|| {
+static REGISTRATION_DATE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)^Registration date:\s*$").expect("Invalid Nominet registration date regex")
 });
 
-static EXPIRY_DATE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?i)^Expiry date:\s*$").expect("Invalid Nominet expiry date regex"));
+static EXPIRY_DATE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)^Expiry date:\s*$").expect("Invalid Nominet expiry date regex")
+});
 
-static LAST_UPDATED: Lazy<Regex> = Lazy::new(|| {
+static LAST_UPDATED: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)^Last updated:\s*$").expect("Invalid Nominet last updated regex")
 });
 
 /// `.uk` output groups dates under a single `Relevant dates:` header with
 /// indented inline `Registered on:` / `Expiry date:` / `Last updated:`
 /// sub-fields, rather than as standalone per-date section headers.
-static RELEVANT_DATES_SECTION: Lazy<Regex> = Lazy::new(|| {
+static RELEVANT_DATES_SECTION: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)^Relevant dates:\s*$").expect("Invalid Nominet relevant dates regex")
 });
 
-static NAME_SERVERS_SECTION: Lazy<Regex> = Lazy::new(|| {
+static NAME_SERVERS_SECTION: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)^Name servers:\s*$").expect("Invalid Nominet name servers regex")
 });
 
-static STATUS_SECTION: Lazy<Regex> = Lazy::new(|| {
+static STATUS_SECTION: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)^Registration status:\s*$").expect("Invalid Nominet status regex")
 });
 
-static DNSSEC_SECTION: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?i)^DNSSEC:\s*$").expect("Invalid Nominet DNSSEC regex"));
+static DNSSEC_SECTION: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)^DNSSEC:\s*$").expect("Invalid Nominet DNSSEC regex"));
 
 /// Parser for .uk domains using the Nominet format.
 #[derive(Debug, Clone, Default)]

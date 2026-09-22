@@ -59,22 +59,22 @@
 //! `crate::whois::parser`.
 
 use chrono::{DateTime, NaiveDate, Utc};
-use once_cell::sync::Lazy;
 use regex::Regex;
+use std::sync::LazyLock;
 
 use super::{push_bounded, RegistryParser, MAX_NAMESERVERS, MAX_STATUSES};
 use crate::whois::parser::{parse_date, WhoisResponse};
 
 /// `key:   value` lines. Keys may contain hyphens and spaces
 /// (`reg-name`, `e-mail`, `nic-hdl`, `registrar name`).
-static KEY_VALUE: Lazy<Regex> = Lazy::new(|| {
+static KEY_VALUE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^([A-Za-z][A-Za-z0-9 -]*?):\s*(.*?)\s*$").expect("Invalid ISOC-IL key/value regex")
 });
 
 /// Domain-level audit line: `changed: <who> YYYYMMDD (Assigned|Changed)`.
 /// Contact objects also carry `changed:` lines, but without the parenthesised
 /// marker — and they are excluded by section anyway.
-static CHANGED_LINE: Lazy<Regex> = Lazy::new(|| {
+static CHANGED_LINE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)(\d{8})\s*\((assigned|changed)\)\s*$")
         .expect("Invalid ISOC-IL changed-line regex")
 });

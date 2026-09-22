@@ -23,26 +23,27 @@
 //!         ns2bru.europa.eu (147.67.250.3)
 //! ```
 
-use once_cell::sync::Lazy;
 use regex::Regex;
+use std::sync::LazyLock;
 
 use super::{push_bounded, RegistryParser, MAX_NAMESERVERS};
 use crate::whois::parser::WhoisResponse;
 
-static REGISTRANT_SECTION: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?i)^Registrant:\s*$").expect("Invalid EURid registrant regex"));
+static REGISTRANT_SECTION: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)^Registrant:\s*$").expect("Invalid EURid registrant regex"));
 
-static TECHNICAL_SECTION: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?i)^Technical:\s*$").expect("Invalid EURid technical regex"));
+static TECHNICAL_SECTION: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)^Technical:\s*$").expect("Invalid EURid technical regex"));
 
-static REGISTRAR_SECTION: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?i)^Registrar:\s*$").expect("Invalid EURid registrar regex"));
+static REGISTRAR_SECTION: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)^Registrar:\s*$").expect("Invalid EURid registrar regex"));
 
-static NAME_SERVERS_SECTION: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?i)^Name servers:\s*$").expect("Invalid EURid name servers regex"));
+static NAME_SERVERS_SECTION: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)^Name servers:\s*$").expect("Invalid EURid name servers regex")
+});
 
-static KEYS_SECTION: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?i)^Keys:\s*$").expect("Invalid EURid keys regex"));
+static KEYS_SECTION: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)^Keys:\s*$").expect("Invalid EURid keys regex"));
 
 /// Parser for .eu domains using the EURid format.
 #[derive(Debug, Clone, Default)]

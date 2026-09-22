@@ -10,8 +10,8 @@
 use std::time::Duration;
 
 use futures::StreamExt;
-use once_cell::sync::Lazy;
 use reqwest::StatusCode;
+use std::sync::LazyLock;
 use tracing::debug;
 
 use crate::error::{Result, SeerError};
@@ -44,7 +44,7 @@ const MAX_CT_RESPONSE_SIZE: usize = 10 * 1024 * 1024;
 /// Wrapped in `Option` so a reqwest builder failure surfaces as a typed
 /// `SeerError::HttpError` via `client()` instead of a process panic at first
 /// use (library code must not `.expect()` on shared state).
-static HTTP_CLIENT: Lazy<Option<reqwest::Client>> = Lazy::new(|| {
+static HTTP_CLIENT: LazyLock<Option<reqwest::Client>> = LazyLock::new(|| {
     reqwest::Client::builder()
         .timeout(DEFAULT_TIMEOUT)
         .user_agent("seer-domain-tool")

@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr};
 
-use once_cell::sync::Lazy;
+use std::sync::LazyLock;
 
 use crate::error::{Result, SeerError};
 
@@ -12,7 +12,7 @@ use crate::error::{Result, SeerError};
 /// [`domain_matches_allowlist`]): `com` permits all `*.com`, and `example.com`
 /// permits `example.com` and its subdomains. When unset, all domains are
 /// allowed.
-static DOMAIN_ALLOWLIST: Lazy<Option<HashSet<String>>> = Lazy::new(|| {
+static DOMAIN_ALLOWLIST: LazyLock<Option<HashSet<String>>> = LazyLock::new(|| {
     let set: HashSet<String> = std::env::var("SEER_DOMAIN_ALLOWLIST")
         .ok()?
         .split(',')

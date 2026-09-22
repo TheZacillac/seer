@@ -34,52 +34,54 @@
 //! ```
 
 use chrono::{DateTime, NaiveDate, Utc};
-use once_cell::sync::Lazy;
 use regex::Regex;
+use std::sync::LazyLock;
 
 use super::{push_bounded, RegistryParser, MAX_NAMESERVERS};
 use crate::whois::parser::WhoisResponse;
 
 /// Regex patterns for EDUCAUSE-specific fields.
-static DOMAIN_NAME: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?i)^Domain Name:\s*(.+)$").expect("Invalid EDUCAUSE domain regex"));
+static DOMAIN_NAME: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)^Domain Name:\s*(.+)$").expect("Invalid EDUCAUSE domain regex")
+});
 
-static REGISTRANT_SECTION: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?i)^Registrant:\s*$").expect("Invalid EDUCAUSE registrant regex"));
+static REGISTRANT_SECTION: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)^Registrant:\s*$").expect("Invalid EDUCAUSE registrant regex")
+});
 
-static ADMIN_SECTION: Lazy<Regex> = Lazy::new(|| {
+static ADMIN_SECTION: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)^Administrative Contact:\s*$").expect("Invalid EDUCAUSE admin contact regex")
 });
 
-static TECH_SECTION: Lazy<Regex> = Lazy::new(|| {
+static TECH_SECTION: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)^Technical Contact:\s*$").expect("Invalid EDUCAUSE tech contact regex")
 });
 
-static NAME_SERVERS_SECTION: Lazy<Regex> = Lazy::new(|| {
+static NAME_SERVERS_SECTION: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)^Name Servers:\s*$").expect("Invalid EDUCAUSE name servers regex")
 });
 
-static ACTIVATED_DATE: Lazy<Regex> = Lazy::new(|| {
+static ACTIVATED_DATE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)^Domain record activated:\s*(.+)$")
         .expect("Invalid EDUCAUSE activated date regex")
 });
 
-static UPDATED_DATE: Lazy<Regex> = Lazy::new(|| {
+static UPDATED_DATE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)^Domain record last updated:\s*(.+)$")
         .expect("Invalid EDUCAUSE updated date regex")
 });
 
-static EXPIRES_DATE: Lazy<Regex> = Lazy::new(|| {
+static EXPIRES_DATE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)^Domain expires:\s*(.+)$").expect("Invalid EDUCAUSE expires date regex")
 });
 
 /// Regex to match an email address in a line.
-static EMAIL_PATTERN: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"[\w.+-]+@[\w.-]+\.\w+").expect("Invalid email regex"));
+static EMAIL_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"[\w.+-]+@[\w.-]+\.\w+").expect("Invalid email regex"));
 
 /// Regex to match a phone number in a line.
-static PHONE_PATTERN: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"^\+[\d.]+$").expect("Invalid phone regex"));
+static PHONE_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\+[\d.]+$").expect("Invalid phone regex"));
 
 /// Parser for .edu domains using the EDUCAUSE format.
 #[derive(Debug, Clone, Default)]

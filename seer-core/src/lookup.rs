@@ -5,9 +5,9 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::sync::LazyLock;
 use tokio::sync::Notify;
 use tracing::{debug, instrument, warn};
 
@@ -44,25 +44,25 @@ const MAX_PUBLIC_ERROR_LEN: usize = 256;
 const DEFAULT_INFLIGHT_WAIT: Duration = Duration::from_secs(30);
 
 /// Global cache for lookup results to avoid redundant network calls.
-static LOOKUP_CACHE: Lazy<TtlCache<String, LookupResult>> =
-    Lazy::new(|| TtlCache::new(LOOKUP_CACHE_TTL));
+static LOOKUP_CACHE: LazyLock<TtlCache<String, LookupResult>> =
+    LazyLock::new(|| TtlCache::new(LOOKUP_CACHE_TTL));
 
 /// In-flight lookup coalescing map: normalized-domain -> Weak<Notify>.
 /// Only one network race runs per unique domain at a time; concurrent callers
 /// wait on the shared Notify and then read the result from LOOKUP_CACHE.
-static LOOKUP_INFLIGHT: Lazy<Mutex<HashMap<String, Weak<Notify>>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
+static LOOKUP_INFLIGHT: LazyLock<Mutex<HashMap<String, Weak<Notify>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Regex patterns for stripping IP literals from public error messages.
-static IPV4_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"\b(?:\d{1,3}\.){3}\d{1,3}\b").expect("IPV4_RE is a valid regex"));
+static IPV4_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b(?:\d{1,3}\.){3}\d{1,3}\b").expect("IPV4_RE is a valid regex"));
 
 /// Candidate pattern for IPv6 literals: a hex/colon token containing either
 /// a `::` compression or at least three colons. This catches plausible IPv6
 /// addresses cheaply; each match is then validated by `Ipv6Addr::from_str`
 /// before redaction, so MAC fragments, hex hashes, and similar colon-laden
 /// tokens are left alone.
-static IPV6_CANDIDATE_RE: Lazy<Regex> = Lazy::new(|| {
+static IPV6_CANDIDATE_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\b[0-9a-fA-F:]*(?:::|(?:[0-9a-fA-F]{1,4}:){3,})[0-9a-fA-F:]*\b")
         .expect("IPV6_CANDIDATE_RE is a valid regex")
 });
@@ -86,8 +86,8 @@ fn strip_ipv6(msg: &str) -> String {
 /// invoked (i.e., the underlying network race runs). Used to verify request
 /// coalescing. Not exposed outside the crate.
 #[cfg(test)]
-static LOOKUP_CONCURRENT_CALLS: Lazy<std::sync::atomic::AtomicUsize> =
-    Lazy::new(|| std::sync::atomic::AtomicUsize::new(0));
+static LOOKUP_CONCURRENT_CALLS: LazyLock<std::sync::atomic::AtomicUsize> =
+    LazyLock::new(|| std::sync::atomic::AtomicUsize::new(0));
 
 /// Returns true if the parsed WHOIS response lacks all key registration
 /// signals: no registrar, no creation/expiration date, and no nameservers.

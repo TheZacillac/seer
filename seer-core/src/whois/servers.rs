@@ -1,5 +1,5 @@
-use once_cell::sync::Lazy;
 use std::collections::HashMap;
+use std::sync::LazyLock;
 
 /// Comprehensive WHOIS server list.
 /// Data sourced from https://github.com/WooMai/whois-servers (auto-synced with IANA Root Zone Database).
@@ -41,7 +41,7 @@ use std::collections::HashMap;
 /// Second-level registry zones (e.g. ZACR's `co.za`) live in
 /// [`SLD_WHOIS_SERVERS`] below, resolved domain-first via
 /// [`get_whois_server_for_domain`].
-pub static WHOIS_SERVERS: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(|| {
+pub static WHOIS_SERVERS: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| {
     let mut m = HashMap::new();
 
     // ============================================================
@@ -1440,7 +1440,7 @@ pub static WHOIS_SERVERS: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(
 /// while registrations live under SLD zones with a working registry server.
 /// Kept separate from [`WHOIS_SERVERS`] so the TLD catalog ([`all_tlds`])
 /// and TLD-keyed lookups stay pure-TLD.
-static SLD_WHOIS_SERVERS: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(|| {
+static SLD_WHOIS_SERVERS: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| {
     let mut m = HashMap::new();
     // ZACR (ZA Central Registry) — .za has no top-level WHOIS.
     m.insert("co.za", "whois.registry.net.za");
@@ -1811,7 +1811,7 @@ pub const NO_WHOIS_TLDS: &[&str] = &[
 /// Backs the TUI TLD browser so it can list the full ~1,570-entry catalog
 /// instead of a hardcoded handful.
 pub fn all_tlds() -> &'static [&'static str] {
-    static ALL: Lazy<Vec<&'static str>> = Lazy::new(|| {
+    static ALL: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
         let mut v: Vec<&'static str> = WHOIS_SERVERS.keys().copied().collect();
         v.extend_from_slice(RDAP_ONLY_TLDS);
         v.extend_from_slice(WHOIS_RETIRED_TLDS);
