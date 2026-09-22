@@ -648,7 +648,8 @@ impl SmartLookup {
 
     /// Performs a smart lookup for a domain, trying both RDAP and WHOIS concurrently.
     /// Falls back to an availability check if both fail.
-    /// Results are cached for 5 minutes to avoid redundant network calls.
+    /// Results are cached for 5 minutes to avoid redundant network calls
+    /// (30 seconds for degraded, DNS-inferred or inconclusive verdicts).
     #[instrument(skip(self), fields(domain = %domain))]
     pub async fn lookup(&self, domain: &str) -> Result<LookupResult> {
         self.lookup_with_progress(domain, None).await
@@ -656,8 +657,9 @@ impl SmartLookup {
 
     /// Performs a lookup with an optional progress callback.
     /// The callback is called with messages describing the current phase.
-    /// Results are cached for 5 minutes. Concurrent lookups for the same
-    /// domain are coalesced — only one network race runs per domain at a time.
+    /// Results are cached for 5 minutes (30 seconds for degraded verdicts).
+    /// Concurrent lookups for the same domain are coalesced — only one
+    /// network race runs per domain at a time.
     #[instrument(skip(self, progress), fields(domain = %domain))]
     pub async fn lookup_with_progress(
         &self,
