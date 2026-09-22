@@ -169,9 +169,13 @@ impl RegistryParser for NominetParser {
                 continue;
             }
 
-            // Empty line ends the current section (except for nameservers which may have multiple)
+            // An empty line ends the current section. The one exception is a
+            // blank line directly after `Name servers:` (before any host):
+            // real .uk output indents EVERY line by 4 spaces, so a section
+            // left open past its blank terminator would swallow the trailing
+            // `    WHOIS lookup made at …` line as a nameserver.
             if trimmed.is_empty() {
-                if !matches!(current_section, Section::NameServers) {
+                if !matches!(current_section, Section::NameServers) || !nameservers.is_empty() {
                     current_section = Section::None;
                 }
                 continue;
@@ -225,8 +229,12 @@ impl RegistryParser for NominetParser {
                         }
                     }
                     Section::NameServers => {
-                        let ns = value.to_lowercase();
-                        push_bounded(&mut nameservers, ns, MAX_NAMESERVERS);
+                        // Hosts in the zone carry glue after the name
+                        // (`ns1.example.co.uk   192.0.2.1  2001:db8::1`);
+                        // keep only the hostname.
+                        if let Some(host) = value.split_whitespace().next() {
+                            push_bounded(&mut nameservers, host.to_lowercase(), MAX_NAMESERVERS);
+                        }
                     }
                     Section::Status => {
                         push_bounded(&mut status, value, MAX_STATUSES);
@@ -466,6 +474,41 @@ DNSSEC:
         assert_eq!(updated.year(), 2023);
         assert_eq!(updated.month(), 6);
         assert_eq!(updated.day(), 15);
+    }
+
+    /// Real .uk output indents every line (headers by 4 spaces, values by
+    /// 8), so the blank line after the host list is the only thing ending the
+    /// `Name servers:` section: the trailing `    WHOIS lookup made at …` line
+    /// must not become a nameserver.
+    #[test]
+    fn test_nominet_nameservers_end_at_blank_line() {
+        let parser = NominetParser::new();
+        let result = parser.parse("example.co.uk", "whois.nic.uk", SAMPLE_NOMINET_RESPONSE);
+        assert_eq!(
+            result.nameservers,
+            vec!["ns1.example.co.uk", "ns2.example.co.uk"],
+            "the WHOIS-lookup-made-at footer is not a nameserver"
+        );
+    }
+
+    #[test]
+    fn test_nominet_nameserver_glue_is_stripped() {
+        let raw = "\
+    Domain name:
+        example.co.uk
+
+    Name servers:
+        ns1.example.co.uk         192.0.2.1  2001:db8::1
+        ns2.example.co.uk         192.0.2.2
+        ns1.example.net
+
+    WHOIS lookup made at 10:04:07 22-Sep-2026
+";
+        let result = NominetParser::new().parse("example.co.uk", "whois.nic.uk", raw);
+        assert_eq!(
+            result.nameservers,
+            vec!["ns1.example.co.uk", "ns2.example.co.uk", "ns1.example.net"]
+        );
     }
 
     #[test]
