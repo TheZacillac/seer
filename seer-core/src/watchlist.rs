@@ -62,33 +62,9 @@ impl Watchlist {
     /// tests can exercise the corrupt-file handling without depending on
     /// the real `~/.seer/watchlist.toml` location.
     pub(crate) fn load_from_path(path: &std::path::Path) -> Self {
-        if !path.exists() {
-            return Self::default();
-        }
-        match std::fs::read_to_string(path) {
-            Ok(content) => match toml::from_str::<Watchlist>(&content) {
-                Ok(w) => w,
-                Err(e) => {
-                    let backup = path.with_extension("corrupt");
-                    if let Err(rename_err) = std::fs::rename(path, &backup) {
-                        tracing::error!(
-                            path = %path.display(),
-                            error = %rename_err,
-                            "failed to back up corrupt watchlist",
-                        );
-                    } else {
-                        tracing::warn!(
-                            path = %path.display(),
-                            backup = %backup.display(),
-                            error = %e,
-                            "watchlist file corrupt; moved to backup",
-                        );
-                    }
-                    Watchlist::default()
-                }
-            },
-            Err(_) => Self::default(),
-        }
+        crate::fsutil::load_or_back_up(path, "watchlist", |content| {
+            toml::from_str::<Watchlist>(content).map_err(|e| e.to_string())
+        })
     }
 
     /// Persists the watchlist to disk via write-and-rename so a crash mid-write

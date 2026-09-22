@@ -146,6 +146,9 @@ pub struct BulkExecutor {
     status_client: StatusClient,
     availability_checker: AvailabilityChecker,
     ssl_checker: SslChecker,
+    /// Upstream nameserver for DNS operations (`None` = the resolver
+    /// default), so `bulk dns` honors the config's `nameserver` like `dig`.
+    nameserver: Option<String>,
 }
 
 impl Default for BulkExecutor {
@@ -167,6 +170,7 @@ impl BulkExecutor {
             status_client: StatusClient::new(),
             availability_checker: AvailabilityChecker::new(),
             ssl_checker: SslChecker::new(),
+            nameserver: None,
         }
     }
 
@@ -189,6 +193,7 @@ impl BulkExecutor {
         executor.status_client = StatusClient::from_config(config);
         executor.availability_checker = AvailabilityChecker::from_config(config);
         executor.ssl_checker = SslChecker::from_config(config);
+        executor.nameserver = config.nameserver.clone();
         executor
     }
 
@@ -254,9 +259,8 @@ impl BulkExecutor {
         let limiter = if self.rate_limit_delay.is_zero() {
             None
         } else {
-            Some(Arc::new(Mutex::new(None::<TokioInstant>)))
+            Some(Arc::new(SlotLimiter::new(self.rate_limit_delay)))
         };
-        let rate_limit_delay = self.rate_limit_delay;
 
         let results: Vec<BulkResult> = stream::iter(operations)
             .map(|op| {
@@ -272,6 +276,7 @@ impl BulkExecutor {
                 let status_client = &self.status_client;
                 let availability_checker = &self.availability_checker;
                 let ssl_checker = &self.ssl_checker;
+                let nameserver = self.nameserver.as_deref();
                 let confusables_concurrency = self.concurrency;
 
                 async move {
@@ -279,17 +284,7 @@ impl BulkExecutor {
                     // lock, then `sleep_until` outside the lock so multiple
                     // tasks can be sleeping in parallel on their own slots.
                     if let Some(limiter) = &limiter {
-                        let my_slot = {
-                            let mut next = limiter.lock().await;
-                            let now = TokioInstant::now();
-                            let slot = match *next {
-                                Some(prev) if prev > now => prev,
-                                _ => now,
-                            };
-                            *next = Some(slot + rate_limit_delay);
-                            slot
-                        };
-                        sleep_until(my_slot).await;
+                        limiter.wait().await;
                     }
 
                     let start = std::time::Instant::now();
@@ -304,6 +299,7 @@ impl BulkExecutor {
                             status: status_client,
                             avail: availability_checker,
                             ssl: ssl_checker,
+                            nameserver,
                             confusables_concurrency,
                         },
                     )
@@ -500,6 +496,42 @@ fn trim_result_data(data: BulkResultData) -> BulkResultData {
     }
 }
 
+/// Spaces dispatches `delay` apart without serializing them.
+///
+/// Each caller locks only long enough to *claim* the next free slot (a
+/// monotonically increasing deadline), then sleeps until that slot with the
+/// lock released — so many callers can wait on distinct slots at once, and
+/// work that starts at a slot overlaps with later callers. Holding the lock
+/// across the wait (the v0.26.7 regression) would serialize everything.
+struct SlotLimiter {
+    delay: Duration,
+    next: Mutex<Option<TokioInstant>>,
+}
+
+impl SlotLimiter {
+    fn new(delay: Duration) -> Self {
+        Self {
+            delay,
+            next: Mutex::new(None),
+        }
+    }
+
+    /// Waits for this caller's dispatch slot.
+    async fn wait(&self) {
+        let my_slot = {
+            let mut next = self.next.lock().await;
+            let now = TokioInstant::now();
+            let slot = match *next {
+                Some(prev) if prev > now => prev,
+                _ => now,
+            };
+            *next = Some(slot + self.delay);
+            slot
+        };
+        sleep_until(my_slot).await;
+    }
+}
+
 struct Clients<'a> {
     whois: &'a WhoisClient,
     rdap: &'a RdapClient,
@@ -509,6 +541,8 @@ struct Clients<'a> {
     status: &'a StatusClient,
     avail: &'a AvailabilityChecker,
     ssl: &'a SslChecker,
+    /// Configured upstream nameserver for plain DNS operations.
+    nameserver: Option<&'a str>,
     /// Per-domain fan-out width for the confusables candidate scan
     /// (mirrors the executor's own concurrency, like the CLI's single-domain
     /// command uses `bulk.concurrency`).
@@ -529,7 +563,10 @@ async fn execute_operation(op: &BulkOperation, clients: &Clients<'_>) -> Result<
             domain,
             record_type,
         } => {
-            let result = clients.dns.resolve(domain, *record_type, None).await?;
+            let result = clients
+                .dns
+                .resolve(domain, *record_type, clients.nameserver)
+                .await?;
             Ok(BulkResultData::Dns(result))
         }
         BulkOperation::Propagation {
@@ -606,13 +643,25 @@ fn is_csv_header_row(first: &str) -> bool {
 }
 
 pub fn parse_domains_from_file(content: &str) -> Vec<String> {
+    // A UTF-8 BOM (Excel's "CSV UTF-8" export) is not whitespace to
+    // `str::trim`: it would hide a first-line `#` comment and leak invisibly
+    // into the first domain.
+    let content = content.strip_prefix('\u{FEFF}').unwrap_or(content);
     let mut domains: Vec<String> = content
         .lines()
         .map(|line| line.trim())
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
         .map(|line| {
-            // Handle CSV format (take first column)
-            line.split(',').next().unwrap_or(line).trim().to_string()
+            // Handle CSV format (take first column). Spreadsheet exports
+            // quote fields (`"example.com","Alice"`); the quotes are CSV
+            // syntax, not part of the domain.
+            line.split(',')
+                .next()
+                .unwrap_or(line)
+                .trim()
+                .trim_matches('"')
+                .trim()
+                .to_string()
         })
         .filter(|domain| domain.contains('.'))
         .collect();
@@ -656,6 +705,35 @@ csv,format,example.org
         assert!(domains.contains(&"google2.com".to_string()));
         assert!(domains.contains(&"whitespace3.com".to_string()));
         // "invalid" and "csv" are filtered out because they don't contain a dot
+    }
+
+    #[test]
+    fn parse_domains_handles_bom_and_quoted_csv_fields() {
+        // Excel "CSV UTF-8" export: BOM, quoted fields, a comment first line.
+        let content =
+            "\u{FEFF}# domains for example.com\n\"example.com\",\"Alice\"\n\"test.org\"\n";
+        assert_eq!(
+            parse_domains_from_file(content),
+            vec!["example.com", "test.org"]
+        );
+        // A BOM directly before the first domain must not leak into it.
+        assert_eq!(
+            parse_domains_from_file("\u{FEFF}example.com\n"),
+            vec!["example.com"]
+        );
+    }
+
+    #[test]
+    fn from_config_carries_the_configured_nameserver() {
+        let config = crate::config::SeerConfig {
+            nameserver: Some("9.9.9.9".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            BulkExecutor::from_config(&config).nameserver.as_deref(),
+            Some("9.9.9.9")
+        );
+        assert!(BulkExecutor::new().nameserver.is_none());
     }
 
     #[test]
@@ -862,52 +940,44 @@ csv,format,example.org
         assert!(data.raw_response.ends_with("[truncated]"));
     }
 
-    /// Regression test for the v0.26.7 rate-limiter regression. The
-    /// previous implementation held a `tokio::sync::Mutex` guard across
-    /// `Interval::tick().await`, fully serializing dispatch through the
-    /// lock. We need a behavioural assertion (not just code review) that
-    /// catches that pattern if it ever returns.
+    /// Regression test for the v0.26.7 rate-limiter regression, which held
+    /// the lock across the wait and so serialized dispatch behind it.
     ///
-    /// With concurrency 5, rate_limit 50ms, and 4 hermetic-failure tasks:
-    /// - Dispatch should be spaced ~50ms apart (slot-claim semantics).
-    /// - All 4 tasks should *finish* in well under 4 * (per-op cost),
-    ///   i.e. they overlap on the execution side.
-    /// - Total wall time should be approximately the longest single op
-    ///   plus the cumulative slot delays (~150ms).
-    ///
-    /// The previous (broken) implementation would have produced wall
-    /// time = sum-of-per-op-cost because dispatch was serialized.
-    #[tokio::test]
+    /// Runs on tokio's paused clock with a controlled 500ms "operation" after
+    /// each slot, so the timing is exact rather than depending on how fast a
+    /// real lookup happens to fail: 4 callers at 50ms spacing must finish at
+    /// 150ms (last slot) + 500ms (its op) = 650ms. Any serialization of the
+    /// callers pushes that to at least 4 × 500ms.
+    #[tokio::test(start_paused = true)]
     async fn rate_limiter_dispatches_in_parallel_not_serialized() {
-        use std::time::Instant;
-        let executor = BulkExecutor::new()
-            .with_concurrency(5)
-            .with_rate_limit(Duration::from_millis(50));
-
-        // Use unresolvable `.invalid` hosts — they fail fast at DNS, well
-        // under the limiter's slot spacing. If dispatch IS rate-limited
-        // in parallel, all 4 finish in close to 3 * 50ms = 150ms (plus
-        // per-op DNS-fail cost, typically tens of ms). If dispatch was
-        // serialized through a lock, each task waits for the previous
-        // to FINISH before starting — total would be much higher.
-        let start = Instant::now();
-        let domains = vec![
-            "seer-rl-1.invalid".to_string(),
-            "seer-rl-2.invalid".to_string(),
-            "seer-rl-3.invalid".to_string(),
-            "seer-rl-4.invalid".to_string(),
-        ];
-        let results = executor.execute_ssl(domains).await;
+        let limiter = Arc::new(SlotLimiter::new(Duration::from_millis(50)));
+        let start = TokioInstant::now();
+        let slots: Vec<Duration> = stream::iter(0..4)
+            .map(|_| {
+                let limiter = limiter.clone();
+                async move {
+                    limiter.wait().await;
+                    let slot = start.elapsed();
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    slot
+                }
+            })
+            .buffer_unordered(4)
+            .collect()
+            .await;
         let elapsed = start.elapsed();
 
-        assert_eq!(results.len(), 4);
-        // Generous upper bound — 2s is far above the worst legitimate
-        // wall time (4*50ms slots + 4*100ms DNS-fail = ~600ms) but well
-        // below the serialised path (would be 4 * per-op-cost minimum).
-        assert!(
-            elapsed < Duration::from_secs(2),
-            "rate-limited dispatch should run in parallel; took {:?}",
-            elapsed
+        let mut slots = slots;
+        slots.sort();
+        assert_eq!(
+            slots,
+            [0, 50, 100, 150].map(Duration::from_millis),
+            "dispatches must be spaced exactly one delay apart"
+        );
+        assert_eq!(
+            elapsed,
+            Duration::from_millis(650),
+            "slow operations must overlap, not run one after another"
         );
     }
 

@@ -53,7 +53,7 @@ pub struct SubdomainBaseline {
 /// On-disk store of subdomain baselines, keyed by (lowercased) domain.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SubdomainBaselines {
-    /// One baseline per domain — recording replaces the previous baseline.
+    /// One baseline per domain — recording merges into the previous one.
     #[serde(default)]
     pub domains: BTreeMap<String, SubdomainBaseline>,
 }
@@ -154,33 +154,9 @@ impl SubdomainBaselines {
     /// tests can exercise corrupt-file handling without touching the real
     /// `~/.seer/subdomain_baselines.json`.
     pub(crate) fn load_from_path(path: &std::path::Path) -> Self {
-        if !path.exists() {
-            return Self::default();
-        }
-        match std::fs::read_to_string(path) {
-            Ok(content) => match serde_json::from_str::<SubdomainBaselines>(&content) {
-                Ok(b) => b,
-                Err(e) => {
-                    let backup = path.with_extension("corrupt");
-                    if let Err(rename_err) = std::fs::rename(path, &backup) {
-                        tracing::error!(
-                            path = %path.display(),
-                            error = %rename_err,
-                            "failed to back up corrupt subdomain baselines",
-                        );
-                    } else {
-                        tracing::warn!(
-                            path = %path.display(),
-                            backup = %backup.display(),
-                            error = %e,
-                            "subdomain baselines file corrupt; moved to backup",
-                        );
-                    }
-                    SubdomainBaselines::default()
-                }
-            },
-            Err(_) => Self::default(),
-        }
+        crate::fsutil::load_or_back_up(path, "subdomain baselines", |content| {
+            serde_json::from_str::<SubdomainBaselines>(content).map_err(|e| e.to_string())
+        })
     }
 
     /// Persists baselines to `~/.seer/subdomain_baselines.json`.
@@ -206,16 +182,30 @@ impl SubdomainBaselines {
         crate::fsutil::write_atomic_owner_only(path, &content, "json")
     }
 
-    /// Records `names` as the new baseline for `domain`, replacing any
-    /// previous baseline. Evicts the oldest-recorded domain when the store
-    /// exceeds [`MAX_DOMAINS`].
+    /// Records `names` into the baseline for `domain`, merging them with any
+    /// previously recorded names. Evicts the oldest-recorded domain when the
+    /// store exceeds [`MAX_DOMAINS`].
+    ///
+    /// Merging rather than replacing follows from the module's premise: a
+    /// name missing from a run is almost always aggregator truncation, not a
+    /// real removal. Replacing would let one flaky run (crt.sh throttled, a
+    /// capped certspotter fallback) shrink the baseline, and every
+    /// long-standing name it dropped would then resurface as "new" — a false
+    /// alert — on the next healthy run.
     pub fn record(&mut self, domain: &str, names: &[String], source: &str) {
+        let key = domain.to_lowercase();
+        let mut merged: BTreeSet<String> = self
+            .domains
+            .remove(&key)
+            .map(|previous| previous.names)
+            .unwrap_or_default();
+        merged.extend(names.iter().map(|n| normalize_name(n)));
         self.domains.insert(
-            domain.to_lowercase(),
+            key,
             SubdomainBaseline {
                 recorded_at: Utc::now(),
                 source: source.to_string(),
-                names: names.iter().map(|n| normalize_name(n)).collect(),
+                names: merged,
             },
         );
         while self.domains.len() > MAX_DOMAINS {
@@ -337,14 +327,22 @@ mod tests {
     }
 
     #[test]
-    fn record_replaces_previous_baseline() {
+    fn record_merges_into_previous_baseline() {
         let mut store = SubdomainBaselines::default();
-        store.record("example.com", &names(&["a.example.com"]), "crt.sh");
+        store.record(
+            "example.com",
+            &names(&["a.example.com", "b.example.com"]),
+            "crt.sh",
+        );
+        // A truncated fallback run must not shrink the baseline...
         store.record("example.com", &names(&["b.example.com"]), "certspotter");
         let baseline = store.get("example.com").expect("baseline");
         assert_eq!(baseline.source, "certspotter");
+        assert!(baseline.names.contains("a.example.com"));
         assert!(baseline.names.contains("b.example.com"));
-        assert!(!baseline.names.contains("a.example.com"));
+        // ...or the next healthy run would re-report `a` as a new name.
+        let diff = store.diff("example.com", &names(&["a.example.com", "b.example.com"]));
+        assert!(!diff.has_new_names(), "{diff:?}");
     }
 
     #[test]

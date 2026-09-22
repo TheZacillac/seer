@@ -38,7 +38,9 @@ impl HumanFormatter {
 
     pub(super) fn format_drift(&self, report: &DriftReport) -> String {
         let mut out = vec![self.header(&format!("Drift: {}", sanitize_display(&report.domain)))];
-        if report.changes.is_empty() {
+        if let Some(reason) = &report.inconclusive {
+            out.push(self.warning(&format!("Not compared: {}", sanitize_display(reason))));
+        } else if report.changes.is_empty() {
             out.push(self.success("No changes since the previous snapshot"));
         } else {
             for c in &report.changes {

@@ -10,7 +10,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::domain_info::DomainInfo;
+use crate::domain_info::{DomainInfo, DomainInfoSource};
 use crate::history::LookupHistory;
 use crate::lookup::LookupResult;
 
@@ -32,6 +32,12 @@ pub struct DriftReport {
     pub domain: String,
     /// The set of changed fields (empty when nothing material changed).
     pub changes: Vec<FieldChange>,
+    /// Why the snapshots could not be compared, when one of them carries no
+    /// registration data (a throttled or inconclusive lookup). An absent
+    /// answer is not a changed answer, so nothing is diffed and
+    /// [`DriftReport::has_drift`] stays false.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inconclusive: Option<String>,
 }
 
 impl DriftReport {
@@ -41,9 +47,60 @@ impl DriftReport {
         !self.changes.is_empty()
     }
 
+    /// A report with nothing compared yet (no previous snapshot).
+    pub fn empty(domain: &str) -> Self {
+        DriftReport {
+            domain: domain.to_string(),
+            changes: Vec::new(),
+            inconclusive: None,
+        }
+    }
+
     /// Diffs two already-merged [`DomainInfo`] snapshots, comparing only the
     /// fields that matter for change monitoring.
+    ///
+    /// Values are compared in a source-independent form: RDAP and WHOIS spell
+    /// the same EPP status (`client transfer prohibited` vs
+    /// `clientTransferProhibited`) and DNSSEC state (`signed` vs
+    /// `signedDelegation`) differently, and smart lookup legitimately flips
+    /// between the two when RDAP is throttled — that must not read as a
+    /// hijack indicator.
     pub fn between(domain: &str, old: &DomainInfo, new: &DomainInfo) -> Self {
+        // A domain that is now genuinely available has lapsed or been
+        // deleted: that is the one change worth reporting on its own.
+        let lapsed = |info: &DomainInfo| {
+            matches!(
+                info.availability_verdict.as_deref(),
+                Some("available" | "likely_available")
+            )
+        };
+        if has_registration_data(old) && !has_registration_data(new) && lapsed(new) {
+            return DriftReport {
+                domain: domain.to_string(),
+                changes: vec![FieldChange {
+                    field: "registration".to_string(),
+                    old: Some("registered".to_string()),
+                    new: new.availability_verdict.clone(),
+                }],
+                inconclusive: None,
+            };
+        }
+        for (label, info) in [("previous", old), ("current", new)] {
+            if !has_registration_data(info) {
+                return DriftReport {
+                    domain: domain.to_string(),
+                    changes: Vec::new(),
+                    inconclusive: Some(format!(
+                        "the {label} lookup returned no registration data ({}), so the \
+                         snapshots were not compared",
+                        info.availability_verdict
+                            .as_deref()
+                            .unwrap_or("no RDAP/WHOIS data")
+                    )),
+                };
+            }
+        }
+
         let mut changes = Vec::new();
 
         let mut push = |field: &str, old: Option<String>, new: Option<String>| {
@@ -68,17 +125,28 @@ impl DriftReport {
             joined_set(&old.nameservers),
             joined_set(&new.nameservers),
         );
-        push("status", joined_set(&old.status), joined_set(&new.status));
+        push(
+            "status",
+            joined_keys(&old.status, status_key),
+            joined_keys(&new.status, status_key),
+        );
         push(
             "expiration_date",
             old.expiration_date.map(|d| d.to_rfc3339()),
             new.expiration_date.map(|d| d.to_rfc3339()),
         );
-        push("dnssec", old.dnssec.clone(), new.dnssec.clone());
+        // Only a definite signed/unsigned on BOTH sides is comparable: one
+        // side simply not reporting DNSSEC (thin WHOIS) is not a toggle.
+        if let (Some(o), Some(n)) = (dnssec_state(old), dnssec_state(new)) {
+            if o != n {
+                push("dnssec", old.dnssec.clone(), new.dnssec.clone());
+            }
+        }
 
         DriftReport {
             domain: domain.to_string(),
             changes,
+            inconclusive: None,
         }
     }
 
@@ -90,14 +158,54 @@ impl DriftReport {
     }
 }
 
+/// True when a snapshot carries any registration data at all. A lookup that
+/// was throttled or inconclusive produces a snapshot with none of these, and
+/// diffing it would report every field as "removed".
+fn has_registration_data(info: &DomainInfo) -> bool {
+    info.source != DomainInfoSource::Available
+        || info.registrar.is_some()
+        || !info.nameservers.is_empty()
+        || !info.status.is_empty()
+        || info.expiration_date.is_some()
+}
+
+/// Canonical EPP status key, independent of RDAP (`client transfer
+/// prohibited`) vs WHOIS (`clientTransferProhibited`) spelling. Mirrors
+/// `domain_info`'s status normalization (a trailing ` (URL)` is dropped).
+fn status_key(code: &str) -> String {
+    code.chars()
+        .take_while(|c| *c != '(')
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+/// DNSSEC state reduced to signed (`true`) / unsigned (`false`), or `None`
+/// when the value is absent or unrecognized.
+fn dnssec_state(info: &DomainInfo) -> Option<bool> {
+    let v = info.dnssec.as_deref()?.trim().to_ascii_lowercase();
+    if v.starts_with("unsigned") || v == "no" || v == "false" || v == "inactive" {
+        Some(false)
+    } else if v.starts_with("signed") || v == "yes" || v == "true" || v == "active" {
+        Some(true)
+    } else {
+        None
+    }
+}
+
 /// Normalizes a list field (nameservers/status) to a case-insensitive, sorted,
 /// deduplicated, comma-joined string so ordering churn isn't reported as drift.
 /// Returns `None` for an empty list so an absent field compares equal across
 /// snapshots.
 fn joined_set(values: &[String]) -> Option<String> {
+    joined_keys(values, |v| v.trim().trim_end_matches('.').to_lowercase())
+}
+
+/// [`joined_set`] with a caller-supplied normalization.
+fn joined_keys(values: &[String], key: impl Fn(&str) -> String) -> Option<String> {
     let mut normalized: Vec<String> = values
         .iter()
-        .map(|v| v.trim().to_lowercase())
+        .map(|v| key(v))
         .filter(|v| !v.is_empty())
         .collect();
     normalized.sort();
@@ -109,18 +217,35 @@ fn joined_set(values: &[String]) -> Option<String> {
     }
 }
 
-/// Computes drift between the two most recent history entries for a domain.
+/// True when a stored lookup carries registration data, i.e. is usable as a
+/// drift baseline. A throttled or inconclusive lookup recorded into history
+/// must not become the snapshot the next run is compared against.
+pub fn is_comparable(result: &LookupResult) -> bool {
+    has_registration_data(&DomainInfo::from_lookup_result(result))
+}
+
+/// Picks the baseline for a drift check: the most recent comparable stored
+/// snapshot, falling back to the most recent one of any kind.
+pub fn baseline_snapshot<'a>(
+    entries: impl DoubleEndedIterator<Item = &'a LookupResult> + Clone,
+) -> Option<&'a LookupResult> {
+    entries
+        .clone()
+        .rev()
+        .find(|r| is_comparable(r))
+        .or_else(|| entries.clone().next_back())
+}
+
+/// Computes drift between the latest history entry for a domain and the most
+/// recent earlier snapshot that carries registration data.
 ///
 /// Returns `None` when the domain has fewer than two stored snapshots (nothing
 /// to compare against yet).
 pub fn drift_from_history(history: &LookupHistory, domain: &str) -> Option<DriftReport> {
     let entries = history.get(domain);
-    if entries.len() < 2 {
-        return None;
-    }
-    let previous = &entries[entries.len() - 2].result;
-    let current = &entries[entries.len() - 1].result;
-    Some(DriftReport::from_lookups(domain, previous, current))
+    let (current, earlier) = entries.split_last()?;
+    let previous = baseline_snapshot(earlier.iter().map(|e| &e.result))?;
+    Some(DriftReport::from_lookups(domain, previous, &current.result))
 }
 
 #[cfg(test)]
@@ -194,6 +319,55 @@ mod tests {
             "reordering/case must not count as drift: {:?}",
             report.changes
         );
+    }
+
+    #[test]
+    fn rdap_whois_source_flip_is_not_drift() {
+        // RDAP throttled on the second run, so smart lookup fell back to
+        // WHOIS: same facts, different spelling. Must not look like a hijack.
+        let mut old = snapshot("R", &["ns1.example.com."], "signed");
+        old.status = vec!["client transfer prohibited".to_string()];
+        let mut new = snapshot("R", &["NS1.EXAMPLE.COM"], "signedDelegation");
+        new.status = vec!["clientTransferProhibited".to_string()];
+        let report = DriftReport::between("example.com", &old, &new);
+        assert!(!report.has_drift(), "{:?}", report.changes);
+
+        // A real DNSSEC removal in either spelling is still caught.
+        let new = snapshot("R", &["ns1.example.com"], "Unsigned");
+        let report = DriftReport::between("example.com", &old, &new);
+        assert!(report.changes.iter().any(|c| c.field == "dnssec"));
+    }
+
+    #[test]
+    fn a_snapshot_without_registration_data_is_inconclusive_not_drift() {
+        let old = snapshot("R", &["ns1.example.com"], "signed");
+        // What a throttled/inconclusive lookup produces.
+        let mut empty = DomainInfo::from_sources("example.com", None, None);
+        empty.source = DomainInfoSource::Available;
+        empty.availability_verdict = Some("unknown".to_string());
+
+        let report = DriftReport::between("example.com", &old, &empty);
+        assert!(!report.has_drift(), "{:?}", report.changes);
+        assert!(report
+            .inconclusive
+            .as_deref()
+            .unwrap_or_default()
+            .contains("current lookup"));
+        let report = DriftReport::between("example.com", &empty, &old);
+        assert!(!report.has_drift());
+        assert!(report.inconclusive.is_some());
+    }
+
+    #[test]
+    fn a_lapsed_registration_is_drift() {
+        let old = snapshot("R", &["ns1.example.com"], "signed");
+        let mut gone = DomainInfo::from_sources("example.com", None, None);
+        gone.source = DomainInfoSource::Available;
+        gone.availability_verdict = Some("available".to_string());
+        let report = DriftReport::between("example.com", &old, &gone);
+        assert!(report.has_drift());
+        assert_eq!(report.changes[0].field, "registration");
+        assert_eq!(report.changes[0].new.as_deref(), Some("available"));
     }
 
     #[test]

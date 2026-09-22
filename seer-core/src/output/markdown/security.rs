@@ -14,6 +14,10 @@ use crate::takeover::{TakeoverReport, TakeoverVerdict};
 impl MarkdownFormatter {
     pub(super) fn format_drift(&self, report: &DriftReport) -> String {
         let mut out = format!("## Drift: {}\n\n", MdSafe(&report.domain));
+        if let Some(reason) = &report.inconclusive {
+            let _ = writeln!(out, "_Not compared: {}._", MdSafe(reason));
+            return out;
+        }
         if report.changes.is_empty() {
             out.push_str("_No changes since the previous snapshot._\n");
             return out;

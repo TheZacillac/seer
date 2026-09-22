@@ -194,8 +194,10 @@ pub fn is_reserved_ip(ip: IpAddr) -> bool {
 /// to hickory (Google DNS) only when the OS resolver returns an error —
 /// see [`FALLBACK_RESOLVER`] for the security rationale.
 ///
-/// Returns `Ok(())` when all resolved IPs are public; `Err(SeerError::InvalidInput)`
-/// otherwise. Does NOT follow CNAMEs explicitly — relies on whichever
+/// Returns `Ok(())` when all resolved IPs are public;
+/// `Err(SeerError::InvalidInput)` when the host is (or resolves to) a
+/// reserved address, and `Err(SeerError::DnsError)` when it cannot be
+/// resolved at all. Does NOT follow CNAMEs explicitly — relies on whichever
 /// resolver answered.
 pub async fn validate_public_host(host: &str, port: u16) -> Result<()> {
     resolve_public_host(host, port).await.map(|_| ())
@@ -228,48 +230,55 @@ pub async fn resolve_public_host(host: &str, port: u16) -> Result<Vec<SocketAddr
     // server, which would pin a worker/dispatch thread forever (a cheap DoS).
     // On timeout we treat it like an OS-resolver error and fall through to the
     // hickory fallback, which is itself bounded (opts.timeout / attempts).
-    let addrs: Vec<SocketAddr> =
-        match tokio::time::timeout(PRIMARY_RESOLVE_TIMEOUT, lookup_host((host, port))).await {
-            Ok(Ok(iter)) => iter.collect(),
-            os_failure => {
-                // OS resolver could not answer (error or timeout) — fall back to
-                // hickory (Google DNS) so a broken/hung system resolver doesn't
-                // take the whole tool down. Logged at debug! because the fallback
-                // is transparent by design; NXDOMAIN for a host that genuinely
-                // doesn't exist (e.g. a stale WHOIS server entry) lands here too,
-                // so warn! would cry wolf on benign negative answers. If BOTH
-                // resolvers fail, the InvalidInput error below is the
-                // load-bearing signal.
-                let os_err = match os_failure {
-                    Ok(Err(e)) => e.to_string(),
-                    _ => format!(
-                        "OS resolver timed out after {}s",
-                        PRIMARY_RESOLVE_TIMEOUT.as_secs()
-                    ),
-                };
-                debug!(
-                    host = %host,
-                    error = %os_err,
-                    "OS resolver could not resolve host; trying hickory fallback"
-                );
-                let Some(resolver) = FALLBACK_RESOLVER.as_ref() else {
-                    return Err(SeerError::InvalidInput(format!(
+    let addrs: Vec<SocketAddr> = match tokio::time::timeout(
+        PRIMARY_RESOLVE_TIMEOUT,
+        lookup_host((host, port)),
+    )
+    .await
+    {
+        Ok(Ok(iter)) => iter.collect(),
+        os_failure => {
+            // OS resolver could not answer (error or timeout) — fall back to
+            // hickory (Google DNS) so a broken/hung system resolver doesn't
+            // take the whole tool down. Logged at debug! because the fallback
+            // is transparent by design; NXDOMAIN for a host that genuinely
+            // doesn't exist (e.g. a stale WHOIS server entry) lands here too,
+            // so warn! would cry wolf on benign negative answers. If BOTH
+            // resolvers fail, the DnsError below is the load-bearing
+            // signal. It is a DNS failure, not invalid caller input: the
+            // host is often an upstream server (a WHOIS referral), and
+            // `DnsError` sanitizes to its category so that hostname and
+            // the raw resolver text never reach an API/MCP client.
+            let os_err = match os_failure {
+                Ok(Err(e)) => e.to_string(),
+                _ => format!(
+                    "OS resolver timed out after {}s",
+                    PRIMARY_RESOLVE_TIMEOUT.as_secs()
+                ),
+            };
+            debug!(
+                host = %host,
+                error = %os_err,
+                "OS resolver could not resolve host; trying hickory fallback"
+            );
+            let Some(resolver) = FALLBACK_RESOLVER.as_ref() else {
+                return Err(SeerError::DnsError(format!(
                     "DNS resolution failed for {host}: {os_err} (no fallback resolver available)"
                 )));
-                };
-                match resolver.lookup_ip(host).await {
-                    Ok(resp) => resp.iter().map(|ip| SocketAddr::new(ip, port)).collect(),
-                    Err(fallback_err) => {
-                        return Err(SeerError::InvalidInput(format!(
-                            "DNS resolution failed for {host}: {os_err} (fallback: {fallback_err})"
-                        )));
-                    }
+            };
+            match resolver.lookup_ip(host).await {
+                Ok(resp) => resp.iter().map(|ip| SocketAddr::new(ip, port)).collect(),
+                Err(fallback_err) => {
+                    return Err(SeerError::DnsError(format!(
+                        "DNS resolution failed for {host}: {os_err} (fallback: {fallback_err})"
+                    )));
                 }
             }
-        };
+        }
+    };
 
     if addrs.is_empty() {
-        return Err(SeerError::InvalidInput(format!(
+        return Err(SeerError::DnsError(format!(
             "no addresses resolved for {host}"
         )));
     }
@@ -555,17 +564,20 @@ mod tests {
     /// append a search domain and rewrite an NXDOMAIN into a real hit —
     /// e.g. ISP wildcard captive-portal behavior). `.invalid` is reserved
     /// by RFC 2606 and must NXDOMAIN in upstream DNS, so hickory's Google
-    /// DNS will also fail. When both fail, the guard returns an
-    /// `InvalidInput` error whose text mentions the fallback, which
-    /// proves the fallback actually ran (not just the primary path).
+    /// DNS will also fail. When both fail, the guard returns a `DnsError`
+    /// whose text mentions the fallback, which proves the fallback actually
+    /// ran (not just the primary path).
     #[tokio::test]
     #[ignore = "requires network — hits Google DNS via hickory fallback"]
     async fn validate_rejects_unresolvable_via_fallback() {
         let err = validate_public_host("nonexistent.host.invalid.", 443)
             .await
             .unwrap_err();
+        assert!(matches!(err, SeerError::DnsError(_)), "got: {err:?}");
         let msg = format!("{err}");
         assert!(msg.contains("DNS resolution failed"), "got: {msg}");
         assert!(msg.contains("fallback"), "got: {msg}");
+        // The external projection must not carry the host or resolver text.
+        assert_eq!(err.sanitized_message(), "DNS resolution failed");
     }
 }
