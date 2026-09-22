@@ -78,4 +78,7 @@ pub use subdomains::{
     SubdomainStatus,
 };
 pub use takeover::{scan_takeover, TakeoverFinding, TakeoverReport, TakeoverVerdict};
-pub use watchlist::{check_watchlist, WatchReport, WatchResult, Watchlist};
+pub use watchlist::{
+    check_watchlist, check_watchlist_with, check_watchlist_with_config, WatchReport, WatchResult,
+    Watchlist,
+};

@@ -34,13 +34,21 @@ const EC_MIN_KEY_BITS: u32 = 256;
 /// Days-until-expiry threshold below which a still-valid cert is flagged.
 const CERT_EXPIRING_SOON_DAYS: i64 = 30;
 
-/// Whole days from `now` until `when`, rounded toward negative infinity.
+/// Whole days from `now` until `when`, where any instant already in the past
+/// is at least `-1`.
 ///
 /// `TimeDelta::num_days` truncates toward zero, so a certificate that expired
 /// five hours ago would read as `0` ("expires in 0 days") and slip past every
-/// `< 0` expired check. Flooring makes any instant in the past negative.
+/// `< 0` expired check. Plain flooring fixes the sign but overstates the age
+/// ("expired 2 days ago" at 25 hours), so whole elapsed days are kept and only
+/// the sub-day case is pushed to `-1`.
 pub(crate) fn days_until(when: DateTime<Utc>, now: DateTime<Utc>) -> i64 {
-    (when - now).num_seconds().div_euclid(86_400)
+    let days = (when - now).num_days();
+    if days == 0 && when < now {
+        -1
+    } else {
+        days
+    }
 }
 
 /// Derives security-posture [`CertWarning`]s from an already-parsed leaf
@@ -713,6 +721,9 @@ mod tests {
         assert_eq!(days_until(now, now), 0);
         assert_eq!(days_until(now + chrono::Duration::days(3), now), 3);
         assert_eq!(days_until(now - chrono::Duration::days(3), now), -3);
+        // 25 hours ago is one whole day ago, not two.
+        assert_eq!(days_until(now - chrono::Duration::hours(25), now), -1);
+        assert_eq!(days_until(now - chrono::Duration::hours(49), now), -2);
 
         let w = derive_cert_warnings(
             &sample_leaf(),

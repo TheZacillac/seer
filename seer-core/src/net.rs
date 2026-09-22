@@ -137,6 +137,27 @@ pub fn is_reserved_ip(ip: IpAddr) -> bool {
             if seg[0] == 0x0064 && seg[1] == 0xff9b && seg[2] == 0x0001 {
                 return true;
             }
+            // Teredo 2001::/32 (RFC 4380) — tunnels to an obfuscated embedded
+            // IPv4 via a relay, the same translation risk as 6to4/NAT64. No
+            // legitimate public service is addressed from this prefix.
+            if seg[0] == 0x2001 && seg[1] == 0 {
+                return true;
+            }
+            // SIIT IPv4-translated ::ffff:0:a.b.c.d (::ffff:0:0:0/96, RFC 2765
+            // / RFC 6052 §2.1) — a stateless translator reaches the embedded
+            // IPv4, so re-check it like the mapped form below.
+            if seg[0] == 0
+                && seg[1] == 0
+                && seg[2] == 0
+                && seg[3] == 0
+                && seg[4] == 0xffff
+                && seg[5] == 0
+            {
+                let embedded = std::net::Ipv4Addr::from(((seg[6] as u32) << 16) | seg[7] as u32);
+                if is_reserved_ip(IpAddr::V4(embedded)) {
+                    return true;
+                }
+            }
             // IPv4-mapped (::ffff:0:0/96) — re-check the embedded IPv4.
             if v6
                 .to_ipv4_mapped()
@@ -430,6 +451,21 @@ mod tests {
     fn rejects_ipv6_6to4() {
         // 2002:a9fe:a9fe:: — 6to4 encoding of 169.254.169.254.
         assert!(is_reserved_ip("2002:a9fe:a9fe::".parse().unwrap()));
+    }
+
+    #[test]
+    fn rejects_teredo_and_siit_translated_forms() {
+        // Teredo 2001::/32 tunnels to an embedded (obfuscated) IPv4.
+        assert!(is_reserved_ip(
+            "2001:0:4136:e378:8000:63bf:3fff:fdd2".parse().unwrap()
+        ));
+        // SIIT ::ffff:0:a.b.c.d embedding the metadata endpoint / RFC 1918.
+        assert!(is_reserved_ip("::ffff:0:a9fe:a9fe".parse().unwrap()));
+        assert!(is_reserved_ip("::ffff:0:a00:1".parse().unwrap()));
+        // SIIT embedding a public IPv4 stays allowed.
+        assert!(!is_reserved_ip("::ffff:0:808:808".parse().unwrap()));
+        // 2001:db8::/32 aside, the rest of 2001::/16 is ordinary global space.
+        assert!(!is_reserved_ip("2001:4860:4860::8888".parse().unwrap()));
     }
 
     #[test]

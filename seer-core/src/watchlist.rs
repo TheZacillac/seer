@@ -177,8 +177,125 @@ fn result_is_critical(r: &WatchResult) -> bool {
     bad_ssl || bad_domain || bad_issue
 }
 
-/// Checks all given domains concurrently and produces a [`WatchReport`].
+/// Default number of domains checked at once by [`check_watchlist`].
+const DEFAULT_WATCH_CONCURRENCY: usize = 10;
+
+/// Turns one domain's status check into a [`WatchResult`]. Pure, so every
+/// issue rule is unit-testable without the network.
+///
+/// `StatusClient::check` only returns `Err` for an invalid domain: a site that
+/// is down or no longer resolves comes back `Ok` with its failures recorded in
+/// `StatusResponse::errors`. Those must surface here, or a dead domain reads
+/// as healthy and `watch --fail-on` exits 0.
+fn assess(domain: String, outcome: Result<crate::status::StatusResponse>) -> WatchResult {
+    let mut watch_result = WatchResult {
+        domain,
+        ssl_days_remaining: None,
+        domain_days_remaining: None,
+        registrar: None,
+        http_status: None,
+        issues: vec![],
+    };
+
+    let status = match outcome {
+        Ok(status) => status,
+        Err(e) => {
+            watch_result
+                .issues
+                .push(format!("{} {}", CHECK_FAILED_PREFIX, e));
+            return watch_result;
+        }
+    };
+
+    watch_result.http_status = status.http_status;
+
+    // A domain that no longer resolves (lapsed delegation, hijack, deleted
+    // records) is the most severe thing a watch can see.
+    if status.dns_resolution.as_ref().is_some_and(|d| !d.resolves) {
+        watch_result.issues.push(format!(
+            "{} dns: domain does not resolve",
+            CHECK_FAILED_PREFIX
+        ));
+    }
+    for err in &status.errors {
+        match err.check.as_str() {
+            "dns" => watch_result
+                .issues
+                .push(format!("{} dns: {}", CHECK_FAILED_PREFIX, err.message)),
+            // Unreachable web/TLS endpoints are reported, but as warnings:
+            // a watched domain may legitimately serve no website (mail-only).
+            "http" => watch_result
+                .issues
+                .push(format!("HTTP check failed: {}", err.message)),
+            "ssl" => watch_result
+                .issues
+                .push(format!("SSL check failed: {}", err.message)),
+            _ => {}
+        }
+    }
+
+    if let Some(ref cert) = status.certificate {
+        watch_result.ssl_days_remaining = Some(cert.days_until_expiry);
+        if cert.days_until_expiry < EXPIRY_CRITICAL_DAYS {
+            watch_result
+                .issues
+                .push(format!("SSL expires in {} days", cert.days_until_expiry));
+        }
+        if !cert.is_valid {
+            watch_result.issues.push(SSL_INVALID_ISSUE.to_string());
+        }
+    }
+
+    if let Some(ref exp) = status.domain_expiration {
+        watch_result.domain_days_remaining = Some(exp.days_until_expiry);
+        watch_result.registrar = exp.registrar.clone();
+        if exp.days_until_expiry < DOMAIN_EXPIRY_WARN_DAYS {
+            watch_result
+                .issues
+                .push(format!("Domain expires in {} days", exp.days_until_expiry));
+        }
+    }
+
+    if let Some(status_code) = status.http_status {
+        if !(200..300).contains(&status_code) {
+            watch_result
+                .issues
+                .push(format!("HTTP status {}", status_code));
+        }
+    }
+
+    watch_result
+}
+
+/// Checks all given domains concurrently and produces a [`WatchReport`],
+/// using default timeouts and concurrency.
+///
+/// Prefer [`check_watchlist_with_config`] from a front-end, so the user's
+/// `~/.seer/config.toml` timeouts and bulk concurrency apply.
 pub async fn check_watchlist(domains: &[String]) -> WatchReport {
+    check_watchlist_with(domains, StatusClient::new(), DEFAULT_WATCH_CONCURRENCY).await
+}
+
+/// Like [`check_watchlist`], honoring the config file's per-protocol
+/// timeouts (via [`StatusClient::from_config`]) and `bulk.concurrency`.
+pub async fn check_watchlist_with_config(
+    domains: &[String],
+    config: &crate::config::SeerConfig,
+) -> WatchReport {
+    check_watchlist_with(
+        domains,
+        StatusClient::from_config(config),
+        config.bulk.concurrency,
+    )
+    .await
+}
+
+/// Checks all given domains with `client`, at most `concurrency` at a time.
+pub async fn check_watchlist_with(
+    domains: &[String],
+    client: StatusClient,
+    concurrency: usize,
+) -> WatchReport {
     use futures::stream::{self, StreamExt};
 
     // Each per-domain future owns its `client` (via `Arc`) and `domain`
@@ -186,68 +303,17 @@ pub async fn check_watchlist(domains: &[String]) -> WatchReport {
     // and the whole `check_watchlist` future can be used from `tokio::spawn`
     // (e.g. the TUI). Borrowing `&client`/`&String` here makes the closure fail
     // the higher-ranked `FnOnce` bound `tokio::spawn` requires.
-    let client = std::sync::Arc::new(StatusClient::new());
+    let client = std::sync::Arc::new(client);
 
     let results: Vec<WatchResult> = stream::iter(domains.iter().cloned())
         .map(|domain| {
             let client = client.clone();
             async move {
-                let mut watch_result = WatchResult {
-                    domain: domain.clone(),
-                    ssl_days_remaining: None,
-                    domain_days_remaining: None,
-                    registrar: None,
-                    http_status: None,
-                    issues: vec![],
-                };
-
-                match client.check(&domain).await {
-                    Ok(status) => {
-                        watch_result.http_status = status.http_status;
-
-                        if let Some(ref cert) = status.certificate {
-                            watch_result.ssl_days_remaining = Some(cert.days_until_expiry);
-                            if cert.days_until_expiry < EXPIRY_CRITICAL_DAYS {
-                                watch_result.issues.push(format!(
-                                    "SSL expires in {} days",
-                                    cert.days_until_expiry
-                                ));
-                            }
-                            if !cert.is_valid {
-                                watch_result.issues.push(SSL_INVALID_ISSUE.to_string());
-                            }
-                        }
-
-                        if let Some(ref exp) = status.domain_expiration {
-                            watch_result.domain_days_remaining = Some(exp.days_until_expiry);
-                            watch_result.registrar = exp.registrar.clone();
-                            if exp.days_until_expiry < DOMAIN_EXPIRY_WARN_DAYS {
-                                watch_result.issues.push(format!(
-                                    "Domain expires in {} days",
-                                    exp.days_until_expiry
-                                ));
-                            }
-                        }
-
-                        if let Some(status_code) = status.http_status {
-                            if !(200..300).contains(&status_code) {
-                                watch_result
-                                    .issues
-                                    .push(format!("HTTP status {}", status_code));
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        watch_result
-                            .issues
-                            .push(format!("{} {}", CHECK_FAILED_PREFIX, e));
-                    }
-                }
-
-                watch_result
+                let outcome = client.check(&domain).await;
+                assess(domain, outcome)
             }
         })
-        .buffer_unordered(10)
+        .buffer_unordered(concurrency.max(1))
         .collect()
         .await;
 
@@ -271,6 +337,72 @@ pub async fn check_watchlist(domains: &[String]) -> WatchReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn status_with(
+        dns: Option<crate::status::DnsResolution>,
+        errors: &[(&str, &str)],
+    ) -> crate::status::StatusResponse {
+        let mut status = crate::status::StatusResponse::new("example.com".to_string());
+        status.dns_resolution = dns;
+        status.errors = errors
+            .iter()
+            .map(|(check, message)| crate::status::StatusError {
+                check: check.to_string(),
+                message: message.to_string(),
+            })
+            .collect();
+        status
+    }
+
+    fn resolution(resolves: bool) -> crate::status::DnsResolution {
+        crate::status::DnsResolution {
+            a_records: vec![],
+            aaaa_records: vec![],
+            cname_target: None,
+            nameservers: vec![],
+            resolves,
+        }
+    }
+
+    #[test]
+    fn a_domain_that_stopped_resolving_is_critical() {
+        // Previously every sub-check failure was swallowed into
+        // `StatusResponse::errors`, so this read as a healthy green domain.
+        let r = assess(
+            "example.com".to_string(),
+            Ok(status_with(Some(resolution(false)), &[])),
+        );
+        assert!(result_is_critical(&r), "issues: {:?}", r.issues);
+        let r = assess(
+            "example.com".to_string(),
+            Ok(status_with(None, &[("dns", "DNS lookup timed out")])),
+        );
+        assert!(result_is_critical(&r), "issues: {:?}", r.issues);
+    }
+
+    #[test]
+    fn unreachable_web_endpoints_are_warnings() {
+        let r = assess(
+            "example.com".to_string(),
+            Ok(status_with(
+                Some(resolution(true)),
+                &[("http", "connection refused"), ("ssl", "handshake failed")],
+            )),
+        );
+        assert_eq!(r.issues.len(), 2, "issues: {:?}", r.issues);
+        assert!(!r.issues.is_empty());
+        // Mail-only domains legitimately serve no website: warn, not critical.
+        assert!(!result_is_critical(&r));
+    }
+
+    #[test]
+    fn a_healthy_domain_has_no_issues() {
+        let r = assess(
+            "example.com".to_string(),
+            Ok(status_with(Some(resolution(true)), &[])),
+        );
+        assert!(r.issues.is_empty(), "issues: {:?}", r.issues);
+    }
 
     #[test]
     fn test_watchlist_default() {
