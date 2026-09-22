@@ -96,6 +96,16 @@ def _install_seer_stub() -> None:
         return results
 
     stub.bulk_ssl = _stub_bulk_ssl
+
+    # Called at import time by seer_api.mcp.server (to render the record-type
+    # schema description), so it must return a real value, not raise.
+    def _stub_record_types():
+        return [
+            "A", "AAAA", "CNAME", "MX", "NS", "TXT", "SOA", "PTR",
+            "SRV", "CAA", "NAPTR", "DNSKEY", "DS", "TLSA", "SSHFP", "ANY",
+        ]
+
+    stub.record_types = _stub_record_types
     sys.modules["seer"] = stub
 
 

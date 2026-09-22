@@ -963,8 +963,19 @@ def test_root_index_lists_every_registered_route(client):
 
     assert len(index) > 30, f"index looks truncated: {sorted(index.values())}"
     # Every route must get its OWN key: a derived name that collides would
-    # silently displace another entry instead of failing.
-    assert len(index) == len(set(index.values())), "derived endpoint names collided"
+    # silently displace another entry instead of failing. Compare against the
+    # distinct route paths recomputed here — `len(index) ==
+    # len(set(index.values()))` could never fail, because a collision drops
+    # the displaced path from the keys AND the values alike.
+    app = client.app
+    route_paths = set(app.openapi().get("paths", {})) | {
+        path for route in app.routes if (path := getattr(route, "path", None))
+    }
+    route_paths.discard("/")
+    assert len(index) == len(route_paths), (
+        "derived endpoint names collided: "
+        f"{sorted(route_paths - set(index.values()))} missing from the index"
+    )
     # Key scheme preserved from the hand-written index it replaces.
     assert index["lookup"] == "/lookup/{domain}"
     assert index["rdap_domain"] == "/rdap/domain/{domain}"
