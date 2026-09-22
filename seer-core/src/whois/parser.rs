@@ -288,7 +288,9 @@ impl WhoisResponse {
         // be inferred from any unambiguous one before parsing the ambiguous
         // ones (issue #47). A registry is internally consistent, so the order
         // revealed by one date applies to all dates in the response.
-        let creation_str = extract_field_with_patterns(raw, &CREATION_DATE_PATTERNS);
+        // SWITCH (.ch/.li) puts the value on the line after the header.
+        let creation_str = extract_field_with_patterns(raw, &CREATION_DATE_PATTERNS)
+            .or_else(|| extract_section_value(raw, &["first registration date"]));
         let expiration_str = extract_field_with_patterns(raw, &EXPIRATION_DATE_PATTERNS);
         let updated_str = extract_field_with_patterns(raw, &UPDATED_DATE_PATTERNS);
         let date_order = infer_date_order(
@@ -2037,5 +2039,21 @@ Domain Status: clientTransferProhibited
             "retirement notice must be registry_unavailable"
         );
         assert!(!r.is_available(), "retirement notice is not 'available'");
+    }
+    #[test]
+    fn switch_first_registration_date_on_the_next_line_is_parsed() {
+        // SWITCH prints the value on the line after its header; the generic
+        // `Key: value` patterns deliberately no longer reach across lines.
+        let raw = "Domain name:\nexample.ch\n\nHolder of domain name:\nRedacted\n\n\
+                   First registration date:\n01.12.2003\n";
+        let r = WhoisResponse::parse_internal("example.ch", "whois.nic.ch", raw);
+        assert_eq!(
+            r.creation_date.map(|d| d.format("%Y-%m-%d").to_string()),
+            Some("2003-12-01".to_string())
+        );
+        // SWITCH's legacy free-text value is not a date and is not guessed at.
+        let raw = "First registration date:\nregistered before 1st January 1996\n";
+        let r = WhoisResponse::parse_internal("old.ch", "whois.nic.ch", raw);
+        assert!(r.creation_date.is_none());
     }
 }
