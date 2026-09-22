@@ -1,22 +1,28 @@
 //! DNSSEC validation reporting.
 //!
 //! Checks the DNSSEC chain for a domain by querying DS and DNSKEY records
-//! and reporting on the validation status.
+//! and reporting on the validation status. The records are read at the apex
+//! of the zone that holds the name (found by an SOA walk), so a host inside
+//! a signed zone — `api.cloudflare.com` — reports on `cloudflare.com` rather
+//! than as "unsigned".
 
 use std::collections::HashMap;
+use std::net::IpAddr;
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use hickory_resolver::config::{ResolveHosts, ResolverConfig, GOOGLE};
+use hickory_resolver::config::{NameServerConfig, ResolverConfig, ResolverOpts, GOOGLE};
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
-use hickory_resolver::proto::dnssec::rdata::{DNSSECRData, DNSKEY};
+use hickory_resolver::net::{DnsError, NetError};
+use hickory_resolver::proto::dnssec::rdata::{DNSSECRData, DNSKEY, DS};
 use hickory_resolver::proto::dnssec::{DigestType, PublicKey};
-use hickory_resolver::proto::rr::{Name, RData, RecordType as HickoryRecordType};
+use hickory_resolver::proto::op::ResponseCode;
+use hickory_resolver::proto::rr::{Name, RData, Record, RecordType as HickoryRecordType};
 use hickory_resolver::TokioResolver;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, instrument};
 
-use super::records::{RecordData, RecordType};
-use super::resolver::DnsResolver;
+use super::resolver::apply_standard_opts;
 use crate::error::Result;
 
 /// DNSSEC validation report for a domain.
@@ -37,6 +43,11 @@ pub struct DnssecReport {
     /// Validation issues found.
     pub issues: Vec<String>,
     /// Overall status: "signed", "unsigned", "partial", or "misconfigured".
+    ///
+    /// "misconfigured" covers a DS↔DNSKEY mismatch and a DS at the parent
+    /// with no (or an unobtainable) DNSKEY behind it — validating resolvers
+    /// fail such a zone. "partial" is a DNSKEY with no DS (an island of
+    /// security), or a DS set validators would ignore entirely.
     ///
     /// IMPORTANT: this reflects DS↔DNSKEY *digest consistency* (RFC 4509)
     /// observed over plain, unauthenticated DNS. It does NOT verify any RRSIG
@@ -151,13 +162,37 @@ pub struct DnskeyInfo {
     pub algorithm_name: String,
 }
 
+/// Upper bound on names probed while walking up to the enclosing zone apex.
+/// A negative answer usually names the apex directly (the SOA in its
+/// AUTHORITY section), so the walk rarely takes more than one step.
+const MAX_ZONE_WALK: usize = 8;
+
+/// Per-query timeout, matching the resolver default.
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Where [`DnssecChecker::find_zone_apex`] landed.
+#[derive(Debug, PartialEq, Eq)]
+enum ZoneApex {
+    /// The zone apex that owns (or encloses) the name.
+    Found(String),
+    /// The name does not exist (NXDOMAIN) — there is no zone to walk to.
+    NxDomain,
+    /// The apex could not be determined; the reason, when a query failed.
+    Unknown(Option<String>),
+}
+
 /// Checks DNSSEC configuration for a domain.
 pub struct DnssecChecker {
-    resolver: DnsResolver,
-    raw_resolver: TokioResolver,
+    /// Plain (non-validating) resolver for the SOA / DS / DNSKEY reads. A
+    /// single resolver and a single DNSKEY query feed both the displayed key
+    /// list and the digest verification, so the two can never disagree.
+    resolver: TokioResolver,
     /// When true, `check` additionally fetches RRSIG signatures and inspects
     /// their validity windows (opt-in; adds a network round-trip).
     check_rrsig: bool,
+    /// Test-only: pin every resolver this checker builds to a loopback mock.
+    #[cfg(test)]
+    upstream: Option<(IpAddr, u16)>,
 }
 
 impl Default for DnssecChecker {
@@ -168,12 +203,11 @@ impl Default for DnssecChecker {
 
 impl DnssecChecker {
     pub fn new() -> Self {
-        let raw_resolver = Self::build_resolver(false);
-
         Self {
-            resolver: DnsResolver::new(),
-            raw_resolver,
+            resolver: Self::build_resolver(false, None),
             check_rrsig: false,
+            #[cfg(test)]
+            upstream: None,
         }
     }
 
@@ -186,28 +220,45 @@ impl DnssecChecker {
         self
     }
 
-    /// Builds a hickory resolver against Google DNS. When `validating` is true
-    /// the DNSSEC-OK (DO) bit is set (`opts.validate`), which is required for
-    /// upstream resolvers to return RRSIG records.
-    fn build_resolver(validating: bool) -> TokioResolver {
-        let mut builder = TokioResolver::builder_with_config(
-            ResolverConfig::udp_and_tcp(&GOOGLE),
-            TokioRuntimeProvider::default(),
-        );
-        {
-            let opts = builder.options_mut();
-            opts.timeout = std::time::Duration::from_secs(5);
-            opts.attempts = 2;
-            opts.use_hosts_file = ResolveHosts::Never;
-            if validating {
-                // Sets the DO bit so RRSIGs are returned (and asks hickory to
-                // validate). A validation failure surfaces as a lookup error,
-                // which the RRSIG path treats as "no data" and degrades to the
-                // digest-only tier — never a false "validated" claim.
-                opts.validate = true;
-                opts.edns0 = true;
+    /// Test-only: point the checker at a loopback mock server.
+    #[cfg(test)]
+    fn with_upstream(mut self, ip: IpAddr, port: u16) -> Self {
+        self.upstream = Some((ip, port));
+        self.resolver = Self::build_resolver(false, self.upstream);
+        self
+    }
+
+    #[cfg(test)]
+    fn upstream(&self) -> Option<(IpAddr, u16)> {
+        self.upstream
+    }
+
+    #[cfg(not(test))]
+    fn upstream(&self) -> Option<(IpAddr, u16)> {
+        None
+    }
+
+    /// Builds a hickory resolver against Google DNS (or, in tests only, the
+    /// pinned loopback `upstream`) with the shared option set from
+    /// [`apply_standard_opts`]. When `validating` is true the DNSSEC-OK (DO)
+    /// bit is set (`opts.validate`), which is required for upstream
+    /// resolvers to return RRSIG records.
+    fn build_resolver(validating: bool, upstream: Option<(IpAddr, u16)>) -> TokioResolver {
+        let config = match upstream {
+            None => ResolverConfig::udp_and_tcp(&GOOGLE),
+            Some((ip, port)) => {
+                let mut config = ResolverConfig::from_parts(None, vec![], vec![]);
+                let mut ns = NameServerConfig::udp(ip);
+                for connection in &mut ns.connections {
+                    connection.port = port;
+                }
+                config.add_name_server(ns);
+                config
             }
-        }
+        };
+        let mut builder =
+            TokioResolver::builder_with_config(config, TokioRuntimeProvider::default());
+        apply_dnssec_opts(builder.options_mut(), validating);
         builder
             .build()
             .expect("hickory resolver build is infallible without TLS features")
@@ -217,9 +268,9 @@ impl DnssecChecker {
     /// coverage and validity window. Best-effort: returns an empty vec if the
     /// resolver path does not surface RRSIGs (e.g. DO stripped upstream), so
     /// the caller never over-claims validation.
-    async fn resolve_rrsigs(&self, domain: &str) -> Vec<RrsigInfo> {
-        let resolver = Self::build_resolver(true);
-        let Ok(lookup) = resolver.lookup(domain, HickoryRecordType::RRSIG).await else {
+    async fn resolve_rrsigs(&self, zone: &str) -> Vec<RrsigInfo> {
+        let resolver = Self::build_resolver(true, self.upstream());
+        let Ok(lookup) = resolver.lookup(fqdn(zone), HickoryRecordType::RRSIG).await else {
             return vec![];
         };
         let now = Utc::now().timestamp();
@@ -250,274 +301,280 @@ impl DnssecChecker {
             .collect()
     }
 
-    /// Resolves raw hickory DNSKEY records for crypto operations.
-    /// Returns a vec of (DNSKEY, computed_key_tag) pairs.
-    async fn resolve_raw_dnskeys(&self, domain: &str) -> Vec<(DNSKEY, u16)> {
-        let Ok(lookup) = self
-            .raw_resolver
-            .lookup(domain, HickoryRecordType::DNSKEY)
+    /// Queries the DS RRset for `zone` (served by the parent zone).
+    /// NXDOMAIN/NODATA fold to an empty set; a failed query is an `Err` with
+    /// a human-readable reason.
+    async fn lookup_ds(&self, zone: &str) -> std::result::Result<Vec<DS>, String> {
+        match self
+            .resolver
+            .lookup(fqdn(zone), HickoryRecordType::DS)
             .await
-        else {
-            return vec![];
-        };
-
-        lookup
-            .answers()
-            .iter()
-            .filter_map(|record| {
-                if let RData::DNSSEC(DNSSECRData::DNSKEY(dnskey)) = &record.data {
-                    match dnskey.calculate_key_tag() {
-                        Ok(tag) => Some((dnskey.clone(), tag)),
-                        Err(_) => None,
-                    }
-                } else {
-                    None
-                }
-            })
-            .collect()
-    }
-
-    /// Converts a DS digest type number to hickory's DigestType.
-    ///
-    /// hickory 0.26 made `DigestType` `non_exhaustive` and removed the
-    /// fallible `from_u8` constructor in favour of `From<u8>`, which
-    /// returns `DigestType::Unknown(_)` for unsupported types. We
-    /// preserve the original 0.24 behaviour of refusing to attempt
-    /// digest computation for unsupported types.
-    fn to_hickory_digest_type(digest_type: u8) -> Option<DigestType> {
-        let dt = DigestType::from(digest_type);
-        if dt.is_supported() {
-            Some(dt)
-        } else {
-            None
+        {
+            Ok(lookup) => Ok(lookup
+                .answers()
+                .iter()
+                .filter_map(|record| match &record.data {
+                    RData::DNSSEC(DNSSECRData::DS(ds)) => Some(ds.clone()),
+                    _ => None,
+                })
+                .collect()),
+            Err(e) if e.is_no_records_found() => Ok(Vec::new()),
+            Err(e) => Err(e.to_string()),
         }
     }
 
+    /// Queries the DNSKEY RRset for `zone`, pairing each key with its
+    /// RFC 4034 key tag (`None` when the tag cannot be computed). This one
+    /// answer feeds both the report's key list and the DS digest checks —
+    /// they used to come from two independent queries, so a failure of only
+    /// the second silently turned every DS into "no matching DNSKEY".
+    async fn lookup_dnskeys(
+        &self,
+        zone: &str,
+    ) -> std::result::Result<Vec<(DNSKEY, Option<u16>)>, String> {
+        match self
+            .resolver
+            .lookup(fqdn(zone), HickoryRecordType::DNSKEY)
+            .await
+        {
+            Ok(lookup) => Ok(lookup
+                .answers()
+                .iter()
+                .filter_map(|record| match &record.data {
+                    RData::DNSSEC(DNSSECRData::DNSKEY(key)) => {
+                        Some((key.clone(), key.calculate_key_tag().ok()))
+                    }
+                    _ => None,
+                })
+                .collect()),
+            Err(e) if e.is_no_records_found() => Ok(Vec::new()),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    /// Finds the apex of the zone that holds `name`.
+    ///
+    /// DS lives at a zone cut and DNSKEY at a zone apex, so querying them at
+    /// a name inside a zone (`api.cloudflare.com`) finds neither and used to
+    /// report a signed zone as "unsigned". Each step asks for the SOA:
+    /// an SOA owned by the candidate makes it the apex, and a negative
+    /// answer's AUTHORITY-section SOA names the enclosing apex directly.
+    /// Otherwise the walk moves up one label (bounded by [`MAX_ZONE_WALK`],
+    /// never above two labels).
+    ///
+    /// A failed SOA query is not trusted blindly: a validating upstream
+    /// SERVFAILs every name in a zone with a broken chain, apex included —
+    /// but the DS RRset is served by the healthy parent, so a DS answer still
+    /// identifies the (broken) zone cut. Without one the walk stops rather
+    /// than guess past the failure.
+    async fn find_zone_apex(&self, name: &str) -> ZoneApex {
+        let mut candidate = name;
+        for step in 0..MAX_ZONE_WALK {
+            match self
+                .resolver
+                .lookup(fqdn(candidate), HickoryRecordType::SOA)
+                .await
+            {
+                Ok(lookup) => {
+                    if let Some(apex) = soa_apex(
+                        candidate,
+                        lookup.answers().iter().chain(lookup.authorities()),
+                    ) {
+                        return ZoneApex::Found(apex);
+                    }
+                }
+                Err(NetError::Dns(DnsError::NoRecordsFound(no_records))) => {
+                    if no_records.response_code == ResponseCode::NXDomain && step == 0 {
+                        return ZoneApex::NxDomain;
+                    }
+                    let soa_owner = no_records.soa.as_ref().map(|soa| &soa.name);
+                    if let Some(apex) = soa_owner.and_then(|owner| {
+                        let owner = normalize_owner(owner);
+                        is_self_or_ancestor(&owner, candidate).then_some(owner)
+                    }) {
+                        return ZoneApex::Found(apex);
+                    }
+                }
+                Err(e) => {
+                    return match self.lookup_ds(candidate).await {
+                        Ok(ds) if !ds.is_empty() => ZoneApex::Found(candidate.to_string()),
+                        _ => ZoneApex::Unknown(Some(format!(
+                            "SOA query for {candidate} failed: {e}"
+                        ))),
+                    };
+                }
+            }
+            match candidate.split_once('.') {
+                Some((_, parent)) if parent.contains('.') => candidate = parent,
+                _ => break,
+            }
+        }
+        ZoneApex::Unknown(None)
+    }
+
     /// Generate a DNSSEC validation report for a domain.
+    ///
+    /// The DS/DNSKEY checks run at the apex of the zone enclosing `domain`
+    /// (see [`find_zone_apex`](Self::find_zone_apex)); when that is not
+    /// `domain` itself, the first entry of `issues` names the zone that was
+    /// evaluated. `DnssecReport::domain` is always the (normalized) name that
+    /// was asked about.
     #[instrument(skip(self), fields(domain = %domain))]
     pub async fn check(&self, domain: &str) -> Result<DnssecReport> {
-        let domain = crate::validation::normalize_domain(domain)?;
+        // `normalize_host`, not `normalize_domain`: the zone walk below
+        // decides where the records live, so `www.` must not be pre-stripped
+        // (a `www` zone cut, however rare, would otherwise be skipped).
+        let domain = crate::validation::normalize_host(domain)?;
         debug!(domain = %domain, "Checking DNSSEC");
 
         let mut issues = Vec::new();
-
-        // Query DS records (at parent zone)
-        let ds_records: Vec<crate::dns::DnsRecord> =
-            match self.resolver.resolve(&domain, RecordType::DS, None).await {
-                Ok(records) => records,
-                Err(e) => {
-                    issues.push(format!("DS query failed: {}", e));
-                    vec![]
+        let zone = match self.find_zone_apex(&domain).await {
+            ZoneApex::Found(zone) => {
+                if zone != domain {
+                    issues.push(format!(
+                        "{domain} is not a zone apex \u{2014} DS/DNSKEY were evaluated at its \
+                         enclosing zone {zone}"
+                    ));
                 }
-            };
-
-        // Query DNSKEY records (at the domain itself)
-        let dnskey_records: Vec<crate::dns::DnsRecord> = match self
-            .resolver
-            .resolve(&domain, RecordType::DNSKEY, None)
-            .await
-        {
-            Ok(records) => records,
-            Err(e) => {
-                issues.push(format!("DNSKEY query failed: {}", e));
-                vec![]
+                zone
+            }
+            ZoneApex::NxDomain => {
+                issues.push(format!("{domain} does not exist (NXDOMAIN)"));
+                domain.clone()
+            }
+            ZoneApex::Unknown(reason) => {
+                // Fall back to the pre-walk behaviour: the name with `www.`
+                // stripped (`www` is virtually never a zone cut).
+                let fallback = crate::validation::normalize_domain(&domain)?;
+                if let Some(reason) = reason {
+                    issues.push(format!(
+                        "could not determine the zone enclosing {domain} ({reason}); \
+                         evaluated {fallback}"
+                    ));
+                }
+                fallback
             }
         };
+
+        // DS (at the parent) and DNSKEY (at the apex), concurrently.
+        let (ds_result, dnskey_result) =
+            tokio::join!(self.lookup_ds(&zone), self.lookup_dnskeys(&zone));
+        let ds_records = ds_result.unwrap_or_else(|e| {
+            issues.push(format!("DS query failed: {e}"));
+            Vec::new()
+        });
+        let dnskey_query_failed = dnskey_result.is_err();
+        let dnskeys = dnskey_result.unwrap_or_else(|e| {
+            issues.push(format!("DNSKEY query failed: {e}"));
+            Vec::new()
+        });
 
         let has_ds = !ds_records.is_empty();
-        let has_dnskey = !dnskey_records.is_empty();
+        let has_dnskey = !dnskeys.is_empty();
 
-        // Resolve raw hickory DNSKEYs for crypto operations
-        let raw_dnskeys = self.resolve_raw_dnskeys(&domain).await;
-
-        // Build lookup map: (key_tag, algorithm) -> vec of raw DNSKEYs
-        // Multiple DNSKEYs can share the same key tag (RFC 4034 Section 5.1).
-        let dnskey_map: HashMap<(u16, u8), Vec<&DNSKEY>> = {
-            let mut map: HashMap<(u16, u8), Vec<&DNSKEY>> = HashMap::new();
-            for (dnskey, tag) in &raw_dnskeys {
-                map.entry((*tag, u8::from(dnskey.public_key().algorithm())))
+        // (key_tag, algorithm) -> candidate DNSKEYs. Multiple DNSKEYs can
+        // share a key tag (RFC 4034 §5.1). Keys whose tag cannot be computed
+        // cannot be matched.
+        let mut dnskey_map: HashMap<(u16, u8), Vec<&DNSKEY>> = HashMap::new();
+        for (key, tag) in &dnskeys {
+            if let Some(tag) = tag {
+                dnskey_map
+                    .entry((*tag, u8::from(key.public_key().algorithm())))
                     .or_default()
-                    .push(dnskey);
+                    .push(key);
             }
-            map
-        };
+        }
 
-        // Build set of DS key_tags for KSK orphan detection
-        let ds_key_tags: std::collections::HashSet<u16> = ds_records
+        let dnskey_info: Vec<DnskeyInfo> = dnskeys
             .iter()
-            .filter_map(|r| {
-                if let RecordData::DS { key_tag, .. } = r.data {
-                    Some(key_tag)
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        // Build a map from (flags, algorithm) -> computed key_tags to attach a
-        // key tag to each RecordData DNSKEY. NOTE: this correlates two
-        // independent DNSKEY queries (dnskey_records vs raw_dnskeys) by
-        // position within each (flags, algorithm) group. That is correct when a
-        // group has a single key (the common case) but can mis-assign tags if a
-        // zone has >= 2 keys sharing identical flags+algorithm AND the two
-        // queries returned them in different orders. Removing this assumption
-        // requires a single DNSKEY query that carries both the display fields
-        // and the computed tag; deferred to keep this crypto path stable.
-        let key_tag_by_algo_flags: HashMap<(u16, u8), Vec<u16>> = {
-            let mut map: HashMap<(u16, u8), Vec<u16>> = HashMap::new();
-            for (dnskey, tag) in &raw_dnskeys {
-                map.entry((dnskey.flags(), u8::from(dnskey.public_key().algorithm())))
-                    .or_default()
-                    .push(*tag);
-            }
-            map
-        };
-
-        // Parse DNSKEY record info with computed key tags.
-        //
-        // NOTE (#61): the per-DNSKEY key_tag is attached by position-correlating
-        // two separate query result sets (DNSKEY records vs the computed-tag
-        // list). When ≥2 keys share the same (flags, algorithm), an ordering
-        // difference between those result sets can mislabel which tag belongs to
-        // which key. This affects only the DISPLAY tag and the KSK-orphan
-        // heuristic — `chain_valid` is computed from DS↔DNSKEY digest matching
-        // (below) and is unaffected.
-        let mut dnskey_tag_indices: HashMap<(u16, u8), usize> = HashMap::new();
-        let dnskey_info: Vec<DnskeyInfo> = dnskey_records
-            .iter()
-            .filter_map(|r| {
-                if let RecordData::DNSKEY {
+            .map(|(key, tag)| {
+                let flags = key.flags();
+                let algorithm = u8::from(key.public_key().algorithm());
+                let is_sep = flags & 0x0001 != 0;
+                let is_zone = flags & 0x0100 != 0;
+                DnskeyInfo {
                     flags,
-                    protocol,
+                    // Protocol is always 3 for DNSSEC (RFC 4034)
+                    protocol: 3,
                     algorithm,
-                    ..
-                } = r.data
-                {
-                    let is_sep = flags & 0x0001 != 0;
-                    let is_zone = flags & 0x0100 != 0;
-                    let is_ksk = is_sep && is_zone;
-                    let is_zsk = is_zone && !is_sep;
-
-                    // Find the computed key tag for this DNSKEY
-                    let idx = dnskey_tag_indices.entry((flags, algorithm)).or_insert(0);
-                    let key_tag = key_tag_by_algo_flags
-                        .get(&(flags, algorithm))
-                        .and_then(|tags| tags.get(*idx))
-                        .copied()
-                        .unwrap_or(0);
-                    *idx += 1;
-
-                    Some(DnskeyInfo {
-                        flags,
-                        protocol,
-                        algorithm,
-                        key_tag,
-                        is_ksk,
-                        is_zsk,
-                        algorithm_name: algorithm_name(algorithm),
-                    })
-                } else {
-                    None
+                    key_tag: tag.unwrap_or(0),
+                    is_ksk: is_sep && is_zone,
+                    is_zsk: is_zone && !is_sep,
+                    algorithm_name: algorithm_name(algorithm),
                 }
             })
             .collect();
 
-        // Build Name for digest computation
-        let domain_name = Name::from_ascii(&domain).unwrap_or_else(|_| {
+        // Build Name for digest computation (the DNSKEY owner = the apex).
+        let zone_name = Name::from_ascii(&zone).unwrap_or_else(|_| {
             Name::from_ascii("invalid.").expect("hardcoded fallback name is valid")
         });
 
         // Parse DS record info with cross-validation
         let ds_info: Vec<DsInfo> = ds_records
             .iter()
-            .map(|r| {
-                if let RecordData::DS {
-                    key_tag,
-                    algorithm,
-                    digest_type,
-                    ref digest,
-                } = r.data
-                {
-                    let mut matched_key = false;
-                    let mut digest_verified = false;
+            .map(|ds| {
+                let key_tag = ds.key_tag();
+                let algorithm = u8::from(ds.algorithm());
+                let digest_type = u8::from(ds.digest_type());
+                let mut matched_key = false;
+                let mut digest_verified = false;
 
-                    // Try to match this DS to a DNSKEY (multiple candidates possible
-                    // due to key tag collisions per RFC 4034 Section 5.1)
-                    if let Some(candidates) = dnskey_map.get(&(key_tag, algorithm)) {
-                        matched_key = true;
+                // Try to match this DS to a DNSKEY (multiple candidates possible
+                // due to key tag collisions per RFC 4034 Section 5.1)
+                if let Some(candidates) = dnskey_map.get(&(key_tag, algorithm)) {
+                    matched_key = true;
 
-                        // Try each candidate DNSKEY until one verifies. Only a
-                        // digest type our crypto backend can compute yields a
-                        // meaningful verified/mismatch verdict; an unsupported
-                        // type (e.g. GOST) is "not evaluated", NOT a mismatch —
-                        // flagging it as a mismatch would mark an otherwise-valid
-                        // signed zone as misconfigured.
-                        match Self::to_hickory_digest_type(digest_type) {
-                            Some(hickory_dt) => {
-                                for candidate in candidates {
-                                    if let Ok(computed) =
-                                        candidate.to_digest(&domain_name, hickory_dt)
-                                    {
-                                        let computed_hex: String = computed
-                                            .as_ref()
-                                            .iter()
-                                            .map(|b| format!("{:02X}", b))
-                                            .collect();
-                                        if computed_hex.eq_ignore_ascii_case(digest) {
-                                            digest_verified = true;
-                                            break;
-                                        }
-                                    }
-                                }
-
-                                if !digest_verified {
-                                    issues.push(format!(
-                                        "DS record (key_tag={}) digest mismatch \u{2014} registry and DNS keys do not match",
-                                        key_tag
-                                    ));
-                                }
-                            }
-                            None => {
+                    // Try each candidate DNSKEY until one verifies. Only a
+                    // digest type our crypto backend can compute yields a
+                    // meaningful verified/mismatch verdict; an unsupported
+                    // type (e.g. GOST) is "not evaluated", NOT a mismatch —
+                    // flagging it as a mismatch would mark an otherwise-valid
+                    // signed zone as misconfigured.
+                    match Self::to_hickory_digest_type(digest_type) {
+                        Some(hickory_dt) => {
+                            digest_verified = candidates.iter().any(|candidate| {
+                                candidate
+                                    .to_digest(&zone_name, hickory_dt)
+                                    .is_ok_and(|computed| computed.as_ref() == ds.digest())
+                            });
+                            if !digest_verified {
                                 issues.push(format!(
-                                    "DS record (key_tag={}) uses unsupported digest type {} \u{2014} cannot verify",
-                                    key_tag, digest_type
+                                    "DS record (key_tag={}) digest mismatch \u{2014} registry and DNS keys do not match",
+                                    key_tag
                                 ));
                             }
                         }
-                    } else if has_dnskey {
-                        issues.push(format!(
-                            "DS record (key_tag={}) has no matching DNSKEY",
-                            key_tag
-                        ));
+                        None => {
+                            issues.push(format!(
+                                "DS record (key_tag={}) uses unsupported digest type {} \u{2014} cannot verify",
+                                key_tag, digest_type
+                            ));
+                        }
                     }
+                } else if has_dnskey {
+                    issues.push(format!(
+                        "DS record (key_tag={}) has no matching DNSKEY",
+                        key_tag
+                    ));
+                }
 
-                    DsInfo {
-                        key_tag,
-                        algorithm,
-                        digest_type,
-                        digest: digest.clone(),
-                        algorithm_name: algorithm_name(algorithm),
-                        digest_type_name: digest_type_name(digest_type),
-                        matched_key,
-                        digest_verified,
-                    }
-                } else {
-                    // Should not happen — we only have DS records here
-                    DsInfo {
-                        key_tag: 0,
-                        algorithm: 0,
-                        digest_type: 0,
-                        digest: String::new(),
-                        algorithm_name: String::new(),
-                        digest_type_name: String::new(),
-                        matched_key: false,
-                        digest_verified: false,
-                    }
+                DsInfo {
+                    key_tag,
+                    algorithm,
+                    digest_type,
+                    digest: ds.digest().iter().map(|b| format!("{:02X}", b)).collect(),
+                    algorithm_name: algorithm_name(algorithm),
+                    digest_type_name: digest_type_name(digest_type),
+                    matched_key,
+                    digest_verified,
                 }
             })
             .collect();
 
         // Check for KSK orphans (DNSKEY KSKs with no corresponding DS)
+        let ds_key_tags: std::collections::HashSet<u16> =
+            ds_info.iter().map(|ds| ds.key_tag).collect();
         for key in &dnskey_info {
             if key.is_ksk && !ds_key_tags.contains(&key.key_tag) {
                 issues.push(format!(
@@ -527,73 +584,26 @@ impl DnssecChecker {
             }
         }
 
-        // Check for deprecated algorithms in DS records
-        for ds in &ds_info {
-            if ds.algorithm == 1 || ds.algorithm == 3 || ds.algorithm == 5 || ds.algorithm == 6 {
-                issues.push(format!(
-                    "DS record uses deprecated algorithm {} ({})",
-                    ds.algorithm, ds.algorithm_name
-                ));
-            }
-            if ds.digest_type == 1 {
-                issues.push(
-                    "DS record uses SHA-1 digest (type 1) - consider upgrading to SHA-256 (type 2)"
-                        .to_string(),
-                );
-            }
-        }
+        issues.extend(deprecation_issues(&ds_info, &dnskey_info));
 
-        // Check for deprecated algorithms in DNSKEY records
-        for key in &dnskey_info {
-            if key.algorithm == 1 || key.algorithm == 3 || key.algorithm == 5 || key.algorithm == 6
-            {
-                issues.push(format!(
-                    "DNSKEY record uses deprecated algorithm {} ({})",
-                    key.algorithm, key.algorithm_name
-                ));
-            }
-        }
+        let (chain_valid, status) = derive_chain_status(&ds_info, has_dnskey);
 
-        // Derive chain_valid. A DS whose digest type we cannot compute is
-        // excluded from the "all must verify" check (we can't judge it), but we
-        // still require at least one computable DS to have actually verified —
-        // otherwise a zone we can't evaluate at all would be reported as valid.
-        let chain_valid = has_ds
-            && has_dnskey
-            && !ds_info.is_empty()
-            && ds_info
-                .iter()
-                .any(|ds| ds.matched_key && ds.digest_verified)
-            && ds_info
-                .iter()
-                .filter(|ds| Self::to_hickory_digest_type(ds.digest_type).is_some())
-                .all(|ds| ds.matched_key && ds.digest_verified);
-
-        // Derive status from chain validity (not from issues list).
-        //
-        // Vocabulary deliberately avoids "secure"/"insecure": we verify only
-        // DS<->DNSKEY digest consistency, NOT RRSIG signatures, so we report
-        // the observable FACT (the zone is signed / unsigned) rather than a
-        // validated security state. See the `status` field doc on
-        // DnssecReport.
-        let enabled = has_ds || has_dnskey;
-        let status = if has_ds && has_dnskey {
-            if chain_valid {
-                "signed".to_string()
-            } else {
-                "misconfigured".to_string()
-            }
-        } else if !has_ds && !has_dnskey {
-            "unsigned".to_string()
-        } else {
-            "partial".to_string()
-        };
-
-        // Also flag the old structural issues
+        // Structural explanations for the non-"signed" verdicts.
         if has_ds && !has_dnskey {
-            issues.push(
-                "DS records exist but no DNSKEY records found - DNSSEC may be broken".to_string(),
-            );
+            issues.push(if status == "partial" {
+                "DS records exist at the parent, but every one uses an algorithm or digest \
+                 type validating resolvers do not support \u{2014} the zone is treated as unsigned"
+                    .to_string()
+            } else if dnskey_query_failed {
+                "DS records exist at the parent but the DNSKEY query failed \u{2014} a \
+                 validating upstream returns SERVFAIL when the chain is broken, so validating \
+                 resolvers are likely failing this zone"
+                    .to_string()
+            } else {
+                "DS records exist at the parent but the zone publishes no DNSKEY \u{2014} \
+                 validating resolvers will fail (SERVFAIL) this zone"
+                    .to_string()
+            });
         }
         if !has_ds && has_dnskey {
             issues.push(
@@ -604,9 +614,10 @@ impl DnssecChecker {
 
         // Opt-in RRSIG validity inspection (the default check is blind to
         // expired signatures — the most common real-world DNSSEC outage).
+        let enabled = has_ds || has_dnskey;
         let mut rrsig_records = Vec::new();
         if self.check_rrsig && enabled {
-            rrsig_records = self.resolve_rrsigs(&domain).await;
+            rrsig_records = self.resolve_rrsigs(&zone).await;
             for r in &rrsig_records {
                 if r.expired {
                     issues.push(format!(
@@ -640,11 +651,166 @@ impl DnssecChecker {
             ds_records: ds_info,
             dnskey_records: dnskey_info,
             issues,
-            status,
+            status: status.to_string(),
             chain_valid,
             authentication_tier,
             rrsig_records,
         })
+    }
+
+    /// Converts a DS digest type number to hickory's DigestType.
+    ///
+    /// hickory 0.26 made `DigestType` `non_exhaustive` and removed the
+    /// fallible `from_u8` constructor in favour of `From<u8>`, which
+    /// returns `DigestType::Unknown(_)` for unsupported types. We
+    /// preserve the original 0.24 behaviour of refusing to attempt
+    /// digest computation for unsupported types.
+    fn to_hickory_digest_type(digest_type: u8) -> Option<DigestType> {
+        let dt = DigestType::from(digest_type);
+        if dt.is_supported() {
+            Some(dt)
+        } else {
+            None
+        }
+    }
+}
+
+/// The checker's resolver options: the shared set from
+/// [`apply_standard_opts`] (hand-copied here it had drifted and lacked the
+/// pinned server ordering), plus — when `validating` — the DNSSEC-OK bit.
+fn apply_dnssec_opts(opts: &mut ResolverOpts, validating: bool) {
+    apply_standard_opts(opts, DEFAULT_TIMEOUT);
+    if validating {
+        // Sets the DO bit so RRSIGs are returned (and asks hickory to
+        // validate). A validation failure surfaces as a lookup error, which
+        // the RRSIG path treats as "no data" and degrades to the digest-only
+        // tier — never a false "validated" claim.
+        opts.validate = true;
+        opts.edns0 = true;
+    }
+}
+
+/// Derives `(chain_valid, status)` from the DS cross-validation results and
+/// whether the zone publishes a DNSKEY RRset. Pure, so the verdict policy is
+/// unit-testable without DNS.
+///
+/// Vocabulary deliberately avoids "secure"/"insecure": we verify only
+/// DS<->DNSKEY digest consistency, NOT RRSIG signatures, so we report the
+/// observable FACT (the zone is signed / unsigned) rather than a validated
+/// security state. See the `status` field doc on [`DnssecReport`].
+fn derive_chain_status(ds_info: &[DsInfo], has_dnskey: bool) -> (bool, &'static str) {
+    let has_ds = !ds_info.is_empty();
+
+    // A DS whose digest type we cannot compute is excluded from the "all
+    // must verify" check (we can't judge it), but at least one computable DS
+    // must actually verify — otherwise a zone we can't evaluate at all would
+    // be reported as valid.
+    let chain_valid = has_ds
+        && has_dnskey
+        && ds_info
+            .iter()
+            .any(|ds| ds.matched_key && ds.digest_verified)
+        && ds_info
+            .iter()
+            .filter(|ds| DnssecChecker::to_hickory_digest_type(ds.digest_type).is_some())
+            .all(|ds| ds.matched_key && ds.digest_verified);
+
+    let status = match (has_ds, has_dnskey) {
+        (true, true) if chain_valid => "signed",
+        (true, true) => "misconfigured",
+        // A DS the parent publishes tells validating resolvers to expect a
+        // signed zone; with no DNSKEY behind it (absent, or its query failed
+        // — a validating upstream SERVFAILs a broken chain) they fail the
+        // zone outright. That is a broken zone, not a "partial" one — unless
+        // no DS is usable by validators, in which case they treat the zone
+        // as unsigned (RFC 4035 §5.2).
+        (true, false) if ds_info.iter().any(ds_is_validatable) => "misconfigured",
+        (true, false) => "partial",
+        // An island of security: signed, but no chain from the parent.
+        (false, true) => "partial",
+        (false, false) => "unsigned",
+    };
+    (chain_valid, status)
+}
+
+/// Whether a validating resolver would act on this DS: its DNSKEY algorithm
+/// is one validators implement (RFC 8624 §3.1 MUST/RECOMMENDED/commonly
+/// deployed: RSASHA1, RSASHA1-NSEC3-SHA1, RSASHA256, RSASHA512, ECDSA
+/// P-256/P-384, Ed25519, Ed448) and its digest type is SHA-1/256/384. A DS
+/// failing either is ignored by validators (RFC 4035 §5.2, RFC 6840 §5.2).
+fn ds_is_validatable(ds: &DsInfo) -> bool {
+    matches!(ds.algorithm, 5 | 7 | 8 | 10 | 13 | 14 | 15 | 16)
+        && matches!(ds.digest_type, 1 | 2 | 4)
+}
+
+/// DNSSEC algorithms that must not (1, 3, 6) or should no longer (5, 7, 12)
+/// be used for signing (RFC 8624 §3.1), matching the "(deprecated)" labels
+/// from [`algorithm_name`].
+fn is_deprecated_algorithm(algorithm: u8) -> bool {
+    matches!(algorithm, 1 | 3 | 5 | 6 | 7 | 12)
+}
+
+/// Deprecated-algorithm and SHA-1-digest advisories for the published DS and
+/// DNSKEY records. Pure.
+fn deprecation_issues(ds_info: &[DsInfo], dnskey_info: &[DnskeyInfo]) -> Vec<String> {
+    let mut issues = Vec::new();
+    for ds in ds_info {
+        if is_deprecated_algorithm(ds.algorithm) {
+            issues.push(format!(
+                "DS record uses deprecated algorithm {} ({})",
+                ds.algorithm, ds.algorithm_name
+            ));
+        }
+        if ds.digest_type == 1 {
+            issues.push(
+                "DS record uses SHA-1 digest (type 1) - consider upgrading to SHA-256 (type 2)"
+                    .to_string(),
+            );
+        }
+    }
+    for key in dnskey_info {
+        if is_deprecated_algorithm(key.algorithm) {
+            issues.push(format!(
+                "DNSKEY record uses deprecated algorithm {} ({})",
+                key.algorithm, key.algorithm_name
+            ));
+        }
+    }
+    issues
+}
+
+/// The ASCII owner name of a DNS record: lowercase, no trailing root dot.
+/// `to_ascii`, not `to_string` — `Display` decodes `xn--` labels to Unicode.
+fn normalize_owner(name: &Name) -> String {
+    name.to_ascii().trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// True when `owner` is `name` itself or one of its ancestors (label-wise).
+/// Both are lowercase ASCII without a trailing dot.
+fn is_self_or_ancestor(owner: &str, name: &str) -> bool {
+    !owner.is_empty()
+        && (owner == name
+            || name
+                .strip_suffix(owner)
+                .is_some_and(|prefix| prefix.ends_with('.')))
+}
+
+/// The zone apex named by an SOA among `records`: an SOA owned by `name`
+/// itself, or (in a negative answer's AUTHORITY section) by an ancestor of
+/// `name`. Anything else — e.g. the SOA of a CNAME target's zone — is ignored.
+fn soa_apex<'a>(name: &str, records: impl Iterator<Item = &'a Record>) -> Option<String> {
+    records
+        .filter(|record| matches!(record.data, RData::SOA(_)))
+        .map(|record| normalize_owner(&record.name))
+        .find(|owner| is_self_or_ancestor(owner, name))
+}
+
+/// Appends the root dot so hickory treats the name as fully qualified.
+fn fqdn(name: &str) -> String {
+    if name.ends_with('.') {
+        name.to_string()
+    } else {
+        format!("{name}.")
     }
 }
 
@@ -770,125 +936,315 @@ mod tests {
         assert!(json.contains("\"key_tag\":12345"));
     }
 
+    fn ds(key_tag: u16, algorithm: u8, digest_type: u8, matched: bool, verified: bool) -> DsInfo {
+        DsInfo {
+            key_tag,
+            algorithm,
+            digest_type,
+            digest: "ABCDEF".to_string(),
+            algorithm_name: algorithm_name(algorithm),
+            digest_type_name: digest_type_name(digest_type),
+            matched_key: matched,
+            digest_verified: verified,
+        }
+    }
+
+    // --- derive_chain_status: the verdict policy, pure --------------------
+    //
+    // These replace three tests that built a `DnssecReport` with
+    // `chain_valid`/`status` already filled in and asserted them back (they
+    // could not fail). The derivation is now a pure function under test.
+
     #[test]
-    fn test_chain_valid_all_verified() {
-        let report = DnssecReport {
-            domain: "example.com".to_string(),
-            enabled: true,
-            has_ds_records: true,
-            has_dnskey_records: true,
-            ds_records: vec![
-                DsInfo {
-                    key_tag: 12345,
-                    algorithm: 13,
-                    digest_type: 2,
-                    digest: "ABCDEF".to_string(),
-                    algorithm_name: "ECDSA P-256/SHA-256".to_string(),
-                    digest_type_name: "SHA-256".to_string(),
-                    matched_key: true,
-                    digest_verified: true,
-                },
-                DsInfo {
-                    key_tag: 12345,
-                    algorithm: 13,
-                    digest_type: 4,
-                    digest: "FEDCBA".to_string(),
-                    algorithm_name: "ECDSA P-256/SHA-256".to_string(),
-                    digest_type_name: "SHA-384".to_string(),
-                    matched_key: true,
-                    digest_verified: true,
-                },
+    fn chain_status_signed_when_every_computable_ds_verifies() {
+        let all = [ds(12345, 13, 2, true, true), ds(12345, 13, 4, true, true)];
+        assert_eq!(derive_chain_status(&all, true), (true, "signed"));
+    }
+
+    #[test]
+    fn chain_status_misconfigured_when_ds_unmatched() {
+        let unmatched = [ds(65000, 13, 2, false, false)];
+        assert_eq!(
+            derive_chain_status(&unmatched, true),
+            (false, "misconfigured")
+        );
+    }
+
+    #[test]
+    fn chain_status_misconfigured_on_digest_mismatch() {
+        let mismatch = [ds(12345, 13, 2, true, false)];
+        assert_eq!(
+            derive_chain_status(&mismatch, true),
+            (false, "misconfigured")
+        );
+        // One good DS does not excuse a computable one that fails.
+        let mixed = [ds(1, 13, 2, true, true), ds(2, 13, 2, true, false)];
+        assert_eq!(derive_chain_status(&mixed, true), (false, "misconfigured"));
+    }
+
+    #[test]
+    fn chain_status_uncomputable_digest_is_excluded_but_not_sufficient() {
+        // A GOST (type 3) DS can't be computed: it is skipped by the
+        // all-verify rule, but alone it cannot make the chain valid.
+        let gost_only = [ds(1, 13, 3, true, false)];
+        assert_eq!(
+            derive_chain_status(&gost_only, true),
+            (false, "misconfigured")
+        );
+        let with_sha256 = [ds(1, 13, 3, true, false), ds(1, 13, 2, true, true)];
+        assert_eq!(derive_chain_status(&with_sha256, true), (true, "signed"));
+    }
+
+    #[test]
+    fn chain_status_ds_without_dnskey_is_misconfigured() {
+        // Regression: this was "partial" (yellow), yet validating resolvers
+        // SERVFAIL a zone whose parent publishes a DS with no DNSKEY behind
+        // it — including when a validating upstream SERVFAILs the DNSKEY
+        // query itself, which folds to "no DNSKEY" here.
+        let stale = [ds(12345, 13, 2, false, false)];
+        assert_eq!(derive_chain_status(&stale, false), (false, "misconfigured"));
+    }
+
+    #[test]
+    fn chain_status_ds_validators_ignore_stays_partial() {
+        // Every DS uses an algorithm (RSAMD5, ECC-GOST, private) or digest
+        // type validators don't implement → they treat the zone as unsigned.
+        let unusable = [ds(1, 1, 2, false, false), ds(2, 12, 3, false, false)];
+        assert_eq!(derive_chain_status(&unusable, false), (false, "partial"));
+        let unknown_digest = [ds(3, 13, 99, false, false)];
+        assert_eq!(
+            derive_chain_status(&unknown_digest, false),
+            (false, "partial")
+        );
+    }
+
+    #[test]
+    fn chain_status_island_and_unsigned() {
+        assert_eq!(derive_chain_status(&[], true), (false, "partial"));
+        assert_eq!(derive_chain_status(&[], false), (false, "unsigned"));
+    }
+
+    #[test]
+    fn resolver_opts_share_the_standard_set() {
+        // Regression: the hand-copied option set lacked the pinned
+        // `UserProvidedOrder` server ordering.
+        for validating in [false, true] {
+            let mut opts = ResolverOpts::default();
+            apply_dnssec_opts(&mut opts, validating);
+            assert_eq!(
+                opts.server_ordering_strategy,
+                hickory_resolver::config::ServerOrderingStrategy::UserProvidedOrder
+            );
+            assert_eq!(opts.validate, validating);
+        }
+    }
+
+    #[test]
+    fn deprecated_algorithms_include_7_and_12() {
+        // Regression: the check was `1|3|5|6` although algorithm_name already
+        // labelled 7 (RSASHA1-NSEC3-SHA1) and 12 (ECC-GOST) deprecated.
+        let key = |algorithm: u8| DnskeyInfo {
+            flags: 257,
+            protocol: 3,
+            algorithm,
+            key_tag: 1,
+            is_ksk: true,
+            is_zsk: false,
+            algorithm_name: algorithm_name(algorithm),
+        };
+        let issues = deprecation_issues(
+            &[
+                ds(1, 7, 2, true, true),
+                ds(2, 12, 2, true, true),
+                ds(3, 13, 2, true, true),
             ],
-            dnskey_records: vec![DnskeyInfo {
-                flags: 257,
-                protocol: 3,
-                algorithm: 13,
-                key_tag: 12345,
-                is_ksk: true,
-                is_zsk: false,
-                algorithm_name: "ECDSA P-256/SHA-256".to_string(),
-            }],
-            issues: vec![],
-            status: "signed".to_string(),
-            chain_valid: true,
-            authentication_tier: AuthenticationTier::DigestOnly,
-            rrsig_records: vec![],
+            &[key(7), key(12), key(8)],
+        );
+        assert_eq!(
+            issues
+                .iter()
+                .filter(|i| i.contains("deprecated algorithm"))
+                .count(),
+            4,
+            "{issues:?}"
+        );
+        assert!(issues
+            .iter()
+            .any(|i| i.starts_with("DS") && i.contains("algorithm 7")));
+        assert!(issues
+            .iter()
+            .any(|i| i.starts_with("DS") && i.contains("algorithm 12")));
+        assert!(!issues.iter().any(|i| i.contains("algorithm 13")));
+        assert!(!issues.iter().any(|i| i.contains("algorithm 8 ")));
+    }
+
+    #[test]
+    fn soa_apex_matches_self_or_ancestor_only() {
+        assert!(is_self_or_ancestor("example.com", "example.com"));
+        assert!(is_self_or_ancestor("example.com", "api.example.com"));
+        assert!(!is_self_or_ancestor("ample.com", "api.example.com"));
+        assert!(!is_self_or_ancestor("api.example.com", "example.com"));
+
+        let soa = |owner: &str| {
+            Record::from_rdata(
+                Name::from_ascii(owner).unwrap(),
+                300,
+                soa_rdata(owner.trim_end_matches('.')),
+            )
         };
+        let records = [soa("cdn-target.test."), soa("Example.COM.")];
+        assert_eq!(
+            soa_apex("api.example.com", records.iter()),
+            Some("example.com".to_string()),
+            "a CNAME target's SOA must be skipped; the enclosing one is found"
+        );
+        assert_eq!(soa_apex("api.other.test", records.iter()), None);
+    }
+
+    // --- Hermetic end-to-end checks against the scripted mock fixture -----
+
+    use hickory_resolver::proto::dnssec::{Algorithm, PublicKeyBuf};
+    use hickory_resolver::proto::rr::RecordType as WireType;
+
+    use crate::dns::test_support::{soa_rdata, spawn_mock_dns_fn, MockReply};
+
+    /// A KSK for the tests. Any 32 bytes serve: key tags and DS digests are
+    /// computed over the wire form and never checked as a curve point.
+    fn test_key() -> DNSKEY {
+        DNSKEY::new(
+            true,
+            true,
+            false,
+            PublicKeyBuf::new(vec![7u8; 32], Algorithm::ED25519),
+        )
+    }
+
+    /// The DS the parent of `zone` would publish for `key` (SHA-256).
+    fn ds_for(zone: &str, key: &DNSKEY) -> DS {
+        let digest = key
+            .to_digest(&Name::from_ascii(zone).unwrap(), DigestType::SHA256)
+            .unwrap();
+        DS::new(
+            key.calculate_key_tag().unwrap(),
+            Algorithm::ED25519,
+            DigestType::SHA256,
+            digest.as_ref().to_vec(),
+        )
+    }
+
+    fn dnskey_rdata(key: DNSKEY) -> RData {
+        RData::DNSSEC(DNSSECRData::DNSKEY(key))
+    }
+
+    fn ds_rdata(ds: DS) -> RData {
+        RData::DNSSEC(DNSSECRData::DS(ds))
+    }
+
+    fn mock_checker(port: u16) -> DnssecChecker {
+        DnssecChecker::new().with_upstream("127.0.0.1".parse().unwrap(), port)
+    }
+
+    /// Regression: DS/DNSKEY were queried at the name itself, so a host
+    /// inside a signed zone (api.cloudflare.com) reported "unsigned". The
+    /// walk climbs to the SOA owner and reports on that zone.
+    #[tokio::test]
+    async fn check_evaluates_the_enclosing_zone_of_a_non_apex_name() {
+        let port = spawn_mock_dns_fn(|qname, qtype| match (qname, qtype) {
+            ("signed.test", WireType::SOA) => MockReply::Answer(vec![soa_rdata("signed.test")]),
+            ("signed.test", WireType::DS) => {
+                MockReply::Answer(vec![ds_rdata(ds_for("signed.test", &test_key()))])
+            }
+            ("signed.test", WireType::DNSKEY) => MockReply::Answer(vec![dnskey_rdata(test_key())]),
+            // Nothing lives at the name itself.
+            _ => MockReply::NoData,
+        })
+        .await;
+
+        let report = mock_checker(port).check("api.signed.test").await.unwrap();
+        assert_eq!(report.domain, "api.signed.test");
+        assert_eq!(report.status, "signed", "{report:?}");
         assert!(report.chain_valid);
-        assert_eq!(report.status, "signed");
+        assert!(
+            report.issues[0].contains("enclosing zone signed.test"),
+            "the evaluated zone must be named: {:?}",
+            report.issues
+        );
+        assert_eq!(report.issues.len(), 1, "{:?}", report.issues);
+        // One DNSKEY query feeds both the listing and the verification.
+        let tag = test_key().calculate_key_tag().unwrap();
+        assert_eq!(report.dnskey_records[0].key_tag, tag);
+        assert!(report.ds_records[0].matched_key && report.ds_records[0].digest_verified);
     }
 
-    #[test]
-    fn test_chain_valid_ds_unmatched() {
-        let report = DnssecReport {
-            domain: "broken.com".to_string(),
-            enabled: true,
-            has_ds_records: true,
-            has_dnskey_records: true,
-            ds_records: vec![DsInfo {
-                key_tag: 65000,
-                algorithm: 13,
-                digest_type: 2,
-                digest: "ABCDEF".to_string(),
-                algorithm_name: "ECDSA P-256/SHA-256".to_string(),
-                digest_type_name: "SHA-256".to_string(),
-                matched_key: false,
-                digest_verified: false,
-            }],
-            dnskey_records: vec![DnskeyInfo {
-                flags: 257,
-                protocol: 3,
-                algorithm: 13,
-                key_tag: 12345,
-                is_ksk: true,
-                is_zsk: false,
-                algorithm_name: "ECDSA P-256/SHA-256".to_string(),
-            }],
-            issues: vec!["DS record (key_tag=65000) has no matching DNSKEY".to_string()],
-            status: "misconfigured".to_string(),
-            chain_valid: false,
-            authentication_tier: AuthenticationTier::DigestOnly,
-            rrsig_records: vec![],
-        };
-        assert!(!report.chain_valid);
-        assert_eq!(report.status, "misconfigured");
+    /// A negative answer's AUTHORITY-section SOA names the apex in one step.
+    /// SERVFAIL on the intermediate name proves the walk never needed it.
+    #[tokio::test]
+    async fn check_uses_the_negative_answer_soa_to_find_the_apex() {
+        let port = spawn_mock_dns_fn(|qname, qtype| match (qname, qtype) {
+            ("deep.api.signed.test", WireType::SOA) => MockReply::NoDataWithSoa("signed.test"),
+            ("api.signed.test", _) => MockReply::ServFail,
+            ("signed.test", WireType::DS) => {
+                MockReply::Answer(vec![ds_rdata(ds_for("signed.test", &test_key()))])
+            }
+            ("signed.test", WireType::DNSKEY) => MockReply::Answer(vec![dnskey_rdata(test_key())]),
+            _ => MockReply::NoData,
+        })
+        .await;
+
+        let report = mock_checker(port)
+            .check("deep.api.signed.test")
+            .await
+            .unwrap();
+        assert_eq!(report.status, "signed", "{report:?}");
+        assert!(report.issues[0].contains("enclosing zone signed.test"));
     }
 
-    #[test]
-    fn test_chain_valid_digest_mismatch() {
-        let report = DnssecReport {
-            domain: "mismatch.com".to_string(),
-            enabled: true,
-            has_ds_records: true,
-            has_dnskey_records: true,
-            ds_records: vec![DsInfo {
-                key_tag: 12345,
-                algorithm: 13,
-                digest_type: 2,
-                digest: "WRONG".to_string(),
-                algorithm_name: "ECDSA P-256/SHA-256".to_string(),
-                digest_type_name: "SHA-256".to_string(),
-                matched_key: true,
-                digest_verified: false,
-            }],
-            dnskey_records: vec![DnskeyInfo {
-                flags: 257,
-                protocol: 3,
-                algorithm: 13,
-                key_tag: 12345,
-                is_ksk: true,
-                is_zsk: false,
-                algorithm_name: "ECDSA P-256/SHA-256".to_string(),
-            }],
-            issues: vec![],
-            status: "misconfigured".to_string(),
-            chain_valid: false,
-            authentication_tier: AuthenticationTier::DigestOnly,
-            rrsig_records: vec![],
-        };
+    /// Regression (finding: stale DS behind a validating upstream): Google
+    /// SERVFAILs every query into a zone whose DS matches no key, DNSKEY
+    /// included. That used to read as "partial"; it is "misconfigured". The
+    /// SOA SERVFAIL must not derail zone discovery either — the parent still
+    /// serves the DS, which identifies the zone cut.
+    #[tokio::test]
+    async fn check_reports_stale_ds_with_servfailing_dnskey_as_misconfigured() {
+        let port = spawn_mock_dns_fn(|qname, qtype| match (qname, qtype) {
+            ("broken.test", WireType::DS) => {
+                MockReply::Answer(vec![ds_rdata(ds_for("broken.test", &test_key()))])
+            }
+            ("broken.test", _) => MockReply::ServFail,
+            _ => MockReply::NoData,
+        })
+        .await;
+
+        let report = mock_checker(port).check("broken.test").await.unwrap();
+        assert!(report.has_ds_records);
+        assert!(!report.has_dnskey_records);
+        assert_eq!(report.status, "misconfigured", "{report:?}");
         assert!(!report.chain_valid);
-        assert!(report.ds_records[0].matched_key);
-        assert!(!report.ds_records[0].digest_verified);
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|i| i.contains("DNSKEY query failed")),
+            "{:?}",
+            report.issues
+        );
+        assert!(
+            !report.issues.iter().any(|i| i.contains("not a zone apex")),
+            "{:?}",
+            report.issues
+        );
+    }
+
+    #[tokio::test]
+    async fn check_reports_nxdomain_names_as_unsigned_without_walking() {
+        let port = spawn_mock_dns_fn(|_, _| MockReply::NxDomain).await;
+        let report = mock_checker(port).check("nope.signed.test").await.unwrap();
+        assert_eq!(report.status, "unsigned");
+        assert!(
+            report.issues.iter().any(|i| i.contains("does not exist")),
+            "{:?}",
+            report.issues
+        );
     }
 
     #[tokio::test]
