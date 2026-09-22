@@ -233,6 +233,8 @@ use crate::tui::theme::Theme;
 /// Dispatch human-view rendering to the lens's renderer.
 /// `panes` carries interactive component state; Phase-2 renderers may ignore it
 /// (param prefixed `_panes` in those signatures to suppress clippy).
+/// `filter` is the active `/`-filter, for renderers that filter by reference
+/// (History); other row lenses receive already-filtered `data`.
 #[allow(clippy::too_many_arguments)]
 pub fn render(
     f: &mut Frame,
@@ -241,6 +243,7 @@ pub fn render(
     key: &str,
     tab: usize,
     data: &LensData,
+    filter: &str,
     focused: bool,
     sel: usize,
     panes: &Panes,
@@ -257,7 +260,7 @@ pub fn render(
         "reverse" => reverse::render(f, area, theme, data),
         "avail" => avail::render(f, area, theme, data),
         "watch" => watch::render(f, area, theme, data, focused, sel),
-        "history" => history::render(f, area, theme, data, focused, sel),
+        "history" => history::render(f, area, theme, data, filter, focused, sel),
         "subdomains" => subdomains::render(f, area, theme, data, focused, sel),
         "headers" => headers::render(f, area, theme, data),
         "takeover" => takeover::render(f, area, theme, data, focused, sel),

@@ -8,12 +8,23 @@ use crate::tui::panes::PaneOutcome;
 /// The three nameserver slots: system (None), Google (8.8.8.8), Cloudflare (1.1.1.1).
 const NAMESERVERS: [Option<&str>; 3] = [None, Some("8.8.8.8"), Some("1.1.1.1")];
 
-#[derive(Default)]
 pub struct DnsState {
     /// Index into `NAMESERVERS`.
     pub ns_idx: usize,
     /// Cached resolved IP for the current domain (used by RDAP IP tab).
     pub resolved_ip: Option<String>,
+    /// Record type the Records tab queries (`:dig <domain> <type>`; default A).
+    pub record_type: RecordType,
+}
+
+impl Default for DnsState {
+    fn default() -> Self {
+        Self {
+            ns_idx: 0,
+            resolved_ip: None,
+            record_type: RecordType::A,
+        }
+    }
 }
 
 impl DnsState {
@@ -31,7 +42,7 @@ impl DnsState {
                 self.ns_idx = (self.ns_idx + 1) % NAMESERVERS.len();
                 Some(PaneOutcome::Fetch(FetchReq::Dns {
                     domain: domain.to_string(),
-                    record_type: RecordType::A,
+                    record_type: self.record_type,
                     nameserver: self.nameserver(),
                 }))
             }
@@ -56,13 +67,13 @@ mod tests {
 
         let s1 = DnsState {
             ns_idx: 1,
-            resolved_ip: None,
+            ..Default::default()
         };
         assert_eq!(s1.nameserver(), Some("8.8.8.8".into()));
 
         let s2 = DnsState {
             ns_idx: 2,
-            resolved_ip: None,
+            ..Default::default()
         };
         assert_eq!(s2.nameserver(), Some("1.1.1.1".into()));
     }
@@ -88,10 +99,26 @@ mod tests {
     fn s_wraps_around() {
         let mut state = DnsState {
             ns_idx: 2,
-            resolved_ip: None,
+            ..Default::default()
         };
         state.handle_key(press(KeyCode::Char('s')), Some("x.com"));
         assert_eq!(state.ns_idx, 0);
+    }
+
+    #[test]
+    fn s_keeps_the_selected_record_type() {
+        let mut state = DnsState {
+            record_type: RecordType::MX,
+            ..Default::default()
+        };
+        let outcome = state.handle_key(press(KeyCode::Char('s')), Some("x.com"));
+        assert!(matches!(
+            outcome,
+            Some(PaneOutcome::Fetch(FetchReq::Dns {
+                record_type: RecordType::MX,
+                ..
+            }))
+        ));
     }
 
     #[test]

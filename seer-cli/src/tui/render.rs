@@ -10,14 +10,36 @@ use ratatui::Frame;
 use crate::tui::action::{EditTarget, Focus, InputMode, LensData, LensState};
 use crate::tui::app::{App, SPIN};
 use crate::tui::lenses::{self};
+use crate::tui::line_editor::LineEditor;
 use crate::tui::theme::Theme;
 use crate::tui::widgets::panel;
 
-/// The in-progress edit buffer for `target`, if a matching field is active.
-fn field_buf(mode: &InputMode, target: EditTarget) -> Option<&str> {
+/// The in-progress editor for `target`, if a matching field is active (the
+/// editor, not just its text, so renderers can place the caret at the cursor).
+fn field_buf(mode: &InputMode, target: EditTarget) -> Option<&LineEditor> {
     match mode {
-        InputMode::Field { target: t, buf } if *t == target => Some(buf.as_str()),
+        InputMode::Field { target: t, buf } if *t == target => Some(buf),
         _ => None,
+    }
+}
+
+/// Status-bar prompt for edit fields that no pane draws inline. `None` means
+/// the field is rendered elsewhere (top bar, its lens, or the filter line) —
+/// the match is exhaustive so a new field can't silently go undrawn again.
+fn status_prompt(app: &App, target: EditTarget) -> Option<String> {
+    let follow = &app.panes.follow;
+    match target {
+        EditTarget::FollowInterval => {
+            Some(format!("interval seconds (now {})> ", follow.interval_secs))
+        }
+        EditTarget::FollowCount => Some(format!("check count (now {})> ", follow.count)),
+        EditTarget::BulkPath => Some("domains file> ".to_string()),
+        EditTarget::WatchAdd => Some("watch add> ".to_string()),
+        EditTarget::Target
+        | EditTarget::DiffB
+        | EditTarget::BulkDomains
+        | EditTarget::TldFilter
+        | EditTarget::LensFilter => None,
     }
 }
 
@@ -63,12 +85,7 @@ fn top_bar(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         InputMode::Field {
             target: EditTarget::Target,
             buf,
-        } => {
-            // Caret at the cursor position (byte offset is on a char boundary).
-            let s = buf.as_str();
-            let cur = buf.cursor();
-            format!("⌕ {}▏{}", &s[..cur], &s[cur..])
-        }
+        } => format!("⌕ {}", buf.with_caret("▏")),
         // Other field targets are rendered inside their panes; top-bar shows current domain.
         _ => format!("⌕ {domain}"),
     };
@@ -188,11 +205,12 @@ fn main_pane(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             return;
         }
         "diff" => {
+            let domain_a = app.panes.diff.effective_a(app.domain.as_deref());
             lenses::diff::render(
                 f,
                 content,
                 theme,
-                app.domain.as_deref(),
+                domain_a.as_deref(),
                 &app.panes.diff.b,
                 field_buf(&app.input_mode, EditTarget::DiffB),
                 app.focus == Focus::Pane,
@@ -233,12 +251,15 @@ fn main_pane(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
 
     match app.state_of(app.lens) {
         LensState::Loading => {
+            // Name what is actually being queried: an explicit request
+            // (`:rdap 8.8.8.8`, `:rdap AS15169`) targets something other
+            // than the session domain.
+            let target = app
+                .pending_target(app.lens)
+                .or_else(|| app.domain.clone())
+                .unwrap_or_default();
             let line = Line::from(Span::styled(
-                format!(
-                    "{} querying {}…",
-                    SPIN[app.spin],
-                    app.domain.as_deref().unwrap_or("")
-                ),
+                format!("{} querying {target}…", SPIN[app.spin]),
                 Style::default().fg(theme.overlay),
             ));
             f.render_widget(Paragraph::new(line), content);
@@ -300,7 +321,8 @@ fn main_pane(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     // renderer, selection, and scroll all see the same visible subset.
     if let LensState::Loaded(data) = app.state_of(app.lens) {
         let focused = app.focus == Focus::Pane;
-        let filtered = crate::tui::filter::apply(data, &app.active_filter());
+        let filter = app.active_filter();
+        let filtered = crate::tui::filter::apply(data, &filter);
         let render_data = filtered.as_ref().unwrap_or(data);
         lenses::render(
             f,
@@ -309,6 +331,7 @@ fn main_pane(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             lens.key,
             app.tab,
             render_data,
+            &filter,
             focused,
             app.sel,
             &app.panes,
@@ -340,8 +363,6 @@ fn status_or_command(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         buf,
     } = &app.input_mode
     {
-        let s = buf.as_str();
-        let cur = buf.cursor();
         let matches = app.row_count();
         let line = Line::from(vec![
             Span::styled(
@@ -350,10 +371,7 @@ fn status_or_command(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
                     .fg(theme.mauve)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(
-                format!("{}█{}", &s[..cur], &s[cur..]),
-                Style::default().fg(theme.text),
-            ),
+            Span::styled(buf.with_caret("█"), Style::default().fg(theme.text)),
             Span::styled(
                 format!("   {matches} match(es)  [enter apply · esc cancel]"),
                 Style::default().fg(theme.overlay0),
@@ -373,20 +391,38 @@ fn status_or_command(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
                     .fg(theme.mauve)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(
-                {
-                    let s = buf.as_str();
-                    let cur = buf.cursor();
-                    format!("{}█{}", &s[..cur], &s[cur..])
-                },
-                Style::default().fg(theme.text),
-            ),
+            Span::styled(buf.with_caret("█"), Style::default().fg(theme.text)),
         ]);
         f.render_widget(
             Paragraph::new(line).style(Style::default().bg(theme.mantle)),
             area,
         );
         return;
+    }
+    // Generic fallback for edit fields no pane draws inline (Follow
+    // interval/count, bulk file path, watch add): without it the typed text
+    // is invisible.
+    if let InputMode::Field { target, buf } = &app.input_mode {
+        if let Some(prompt) = status_prompt(app, *target) {
+            let line = Line::from(vec![
+                Span::styled(
+                    prompt,
+                    Style::default()
+                        .fg(theme.mauve)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(buf.with_caret("█"), Style::default().fg(theme.text)),
+                Span::styled(
+                    "   [enter apply · esc cancel]",
+                    Style::default().fg(theme.overlay0),
+                ),
+            ]);
+            f.render_widget(
+                Paragraph::new(line).style(Style::default().bg(theme.mantle)),
+                area,
+            );
+            return;
+        }
     }
     let lens = app.current_lens();
     let mut spans = vec![Span::styled(
@@ -510,6 +546,60 @@ mod tests {
             !s.contains("press / to look up a domain"),
             "Follow must not fall back to the generic idle hint"
         );
+    }
+
+    #[test]
+    fn fields_without_an_inline_editor_are_echoed_in_the_status_bar() {
+        let theme = Theme::frappe();
+        let mut app = App::new(None);
+        app.lens = lenses::find_by_cmd_or_key("follow").unwrap();
+        let mut buf: LineEditor = "60".into();
+        buf.left();
+        app.input_mode = InputMode::Field {
+            target: EditTarget::FollowInterval,
+            buf,
+        };
+        let s = full_buf(&app, &theme);
+        assert!(
+            s.contains("interval seconds (now 30)> 6█0"),
+            "typed interval (with caret at the cursor) must be visible"
+        );
+
+        for (target, prompt) in [
+            (EditTarget::FollowCount, "check count (now 20)> "),
+            (EditTarget::BulkPath, "domains file> "),
+            (EditTarget::WatchAdd, "watch add> "),
+        ] {
+            app.input_mode = InputMode::Field {
+                target,
+                buf: "abc".into(),
+            };
+            let s = full_buf(&app, &theme);
+            assert!(s.contains(&format!("{prompt}abc█")), "{target:?}");
+        }
+    }
+
+    #[test]
+    fn loading_indicator_names_the_requested_target() {
+        use crate::tui::action::Msg;
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+
+        let theme = Theme::frappe();
+        let mut app = App::new(Some("example.com".into()));
+        let _ = app.take_startup_actions();
+        let press = |app: &mut App, code: KeyCode| {
+            let _ = app.update(Msg::Input(Event::Key(KeyEvent::new(
+                code,
+                KeyModifiers::NONE,
+            ))));
+        };
+        press(&mut app, KeyCode::Char(':'));
+        for c in "rdap 8.8.8.8".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Enter);
+        let s = full_buf(&app, &theme);
+        assert!(s.contains("querying 8.8.8.8"), "not the session domain");
     }
 
     #[test]

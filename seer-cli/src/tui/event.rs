@@ -1,6 +1,19 @@
 //! Normal-mode key → `KeyAction` mapping. Pure.
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+/// True when `key` is a Ctrl or Alt chord. Normal-mode bindings are bare keys
+/// (SHIFT only selects case, e.g. `G`), so chords must never reach them: in
+/// raw mode Ctrl-C arrives as `Char('c') + CONTROL` and would otherwise fire
+/// `c` (clear history). Windows reports AltGr as CONTROL|ALT, and non-US
+/// layouts type `[ ] { } \ | ~ @` with it, so a CONTROL|ALT character is a
+/// plain character, not a chord.
+pub fn is_chord(key: &KeyEvent) -> bool {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    let altgr_char = ctrl && alt && matches!(key.code, KeyCode::Char(_));
+    (ctrl || alt) && !altgr_char
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyAction {
@@ -87,5 +100,19 @@ mod tests {
     #[test]
     fn unmapped_key_is_none() {
         assert_eq!(map(k(KeyCode::Char('z'))), None);
+    }
+
+    #[test]
+    fn chords_are_classified_but_shift_and_altgr_are_not() {
+        let with = |code, m| KeyEvent::new(code, m);
+        assert!(is_chord(&with(KeyCode::Char('c'), KeyModifiers::CONTROL)));
+        assert!(is_chord(&with(KeyCode::Char('d'), KeyModifiers::ALT)));
+        assert!(!is_chord(&k(KeyCode::Char('c'))));
+        assert!(!is_chord(&with(KeyCode::Char('G'), KeyModifiers::SHIFT)));
+        // AltGr on Windows = CONTROL|ALT + the composed character.
+        assert!(!is_chord(&with(
+            KeyCode::Char(']'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT
+        )));
     }
 }

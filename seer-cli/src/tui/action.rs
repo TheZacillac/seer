@@ -105,6 +105,42 @@ impl FetchReq {
             FetchReq::Takeover(_) => "takeover",
         }
     }
+
+    /// The sub-tab of its lens this request's result renders under. Lens
+    /// state is cached per lens (not per tab), so `App` compares this against
+    /// the active tab to tell whether a cached result still belongs on screen.
+    pub fn tab(&self) -> usize {
+        match self {
+            FetchReq::RdapIp(_) | FetchReq::Dnssec(_) => 1,
+            FetchReq::RdapAsn(_) | FetchReq::Compare { .. } => 2,
+            _ => 0,
+        }
+    }
+
+    /// Human label for what this request queries (loading indicator text).
+    pub fn target(&self) -> String {
+        match self {
+            FetchReq::Overview(d)
+            | FetchReq::Whois(d)
+            | FetchReq::RdapDomain(d)
+            | FetchReq::RdapIp(d)
+            | FetchReq::Dnssec(d)
+            | FetchReq::Ssl(d)
+            | FetchReq::Status(d)
+            | FetchReq::Prop(d)
+            | FetchReq::Reverse(d)
+            | FetchReq::Avail(d)
+            | FetchReq::Tld(d)
+            | FetchReq::Subdomains(d)
+            | FetchReq::Headers(d)
+            | FetchReq::Takeover(d) => d.clone(),
+            FetchReq::RdapAsn(n) => format!("AS{n}"),
+            FetchReq::Dns { domain, .. } | FetchReq::Compare { domain, .. } => domain.clone(),
+            FetchReq::Diff { a, b } => format!("{a} ⇄ {b}"),
+            FetchReq::Watch => "watchlist".to_string(),
+            FetchReq::History => "history".to_string(),
+        }
+    }
 }
 
 /// Parameters for a streaming Follow run.
@@ -195,6 +231,13 @@ pub enum Msg {
         ok: bool,
         label: String,
     },
+    /// A status-bar notice from a side effect that is not a clipboard copy
+    /// (CSV export, bulk file load, watchlist edit). `tone` uses the shared
+    /// `Theme::tone` vocabulary ("ok" | "info" | "warn" | "fail").
+    Toast {
+        tone: &'static str,
+        msg: String,
+    },
     FollowStep {
         gen: u64,
         it: Box<seer_core::dns::FollowIteration>,
@@ -232,6 +275,16 @@ mod tests {
         assert_eq!(FetchReq::Tld(".com".into()).lens_key(), "tld");
         assert_eq!(FetchReq::Headers("x".into()).lens_key(), "headers");
         assert_eq!(FetchReq::Takeover("x".into()).lens_key(), "takeover");
+    }
+
+    #[test]
+    fn fetch_req_tabs_match_the_lens_sub_tabs() {
+        assert_eq!(FetchReq::RdapDomain("x".into()).tab(), 0);
+        assert_eq!(FetchReq::RdapIp("1.2.3.4".into()).tab(), 1);
+        assert_eq!(FetchReq::RdapAsn(15169).tab(), 2);
+        assert_eq!(FetchReq::Dnssec("x".into()).tab(), 1);
+        assert_eq!(FetchReq::Whois("x".into()).tab(), 0);
+        assert_eq!(FetchReq::RdapAsn(15169).target(), "AS15169");
     }
 
     #[test]

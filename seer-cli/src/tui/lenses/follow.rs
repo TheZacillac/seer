@@ -17,20 +17,25 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, follow: &FollowState, sp
         .split(area);
 
     // ── top panel: progress gauge + status ──────────────────────────────────
-    let top_title = format!(
-        "Follow  ·  {}s interval  ·  {} checks",
-        follow.interval_secs, follow.count
-    );
+    // Title and gauge describe the run on screen; the editable settings (which
+    // only apply to the next run) are shown on the hints line instead, so
+    // editing `n` after a run can't produce e.g. "20/5 done".
+    let total = follow.run_total();
+    let interval = follow
+        .last_run
+        .map(|(_, secs)| secs)
+        .unwrap_or(follow.interval_secs);
+    let top_title = format!("Follow  ·  {interval}s interval  ·  {total} checks");
     let top_block = panel::block(theme, &top_title, theme.teal, false);
     let top_inner = top_block.inner(rows[0]);
     f.render_widget(top_block, rows[0]);
 
-    let ratio = if follow.count > 0 {
-        follow.log.len() as f64 / follow.count as f64
+    let ratio = if total > 0 {
+        (follow.log.len() as f64 / total as f64).min(1.0)
     } else {
         0.0
     };
-    let gauge_label = format!("{}/{} done", follow.log.len(), follow.count);
+    let gauge_label = format!("{}/{} done", follow.log.len(), total);
     let gauge_line = gauge::line(theme, ratio, 30, theme.teal, Some(&gauge_label));
 
     let spin_text = if follow.running {
@@ -48,7 +53,10 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, follow: &FollowState, sp
     )]);
 
     let hints_line = Line::from(vec![Span::styled(
-        "s start  ·  i interval  ·  n count  ·  x stop",
+        format!(
+            "s start  ·  i interval ({}s)  ·  n count ({})  ·  x stop",
+            follow.interval_secs, follow.count
+        ),
         Style::default().fg(theme.overlay0),
     )]);
 
@@ -247,6 +255,37 @@ mod tests {
         assert!(
             text.contains(SPIN[3]),
             "spinner should render the current animation frame"
+        );
+    }
+
+    #[test]
+    fn gauge_uses_the_runs_total_not_the_edited_count() {
+        // After a 20-check run, editing `n` to 5 must not turn the finished
+        // run's gauge into "20/5 done".
+        let theme = Theme::frappe();
+        let mut follow = FollowState {
+            last_run: Some((20, 30)),
+            ..Default::default()
+        };
+        for i in 1..=20 {
+            let mut it = make_iteration(i, "1.2.3.4", false);
+            it.total_iterations = 20;
+            follow.push(it);
+        }
+        follow.count = 5;
+
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| render(f, f.area(), &theme, &follow, 0))
+            .unwrap();
+        let text = buf_text(&terminal);
+        assert!(text.contains("20/20 done"), "got: {text}");
+        assert!(!text.contains("20/5"), "got: {text}");
+        assert!(text.contains("20 checks"), "title shows the run's count");
+        assert!(
+            text.contains("n count (5)"),
+            "hints show the next-run setting"
         );
     }
 

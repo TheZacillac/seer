@@ -123,7 +123,7 @@ async fn run_loop(terminal: &mut Term, domain: Option<String>) -> Result<()> {
     let mut tick = tokio::time::interval(Duration::from_millis(100));
 
     for action in app.take_startup_actions() {
-        handle_action(action, &tx, &mut follow_cancel, &mut bulk_cancel);
+        handle_action(action, &tx, &config, &mut follow_cancel, &mut bulk_cancel);
     }
 
     terminal.draw(|f| render::view(f, &app, app.theme()))?;
@@ -140,7 +140,7 @@ async fn run_loop(terminal: &mut Term, domain: Option<String>) -> Result<()> {
 
         let actions = app.update(msg);
         for action in actions {
-            handle_action(action, &tx, &mut follow_cancel, &mut bulk_cancel);
+            handle_action(action, &tx, &config, &mut follow_cancel, &mut bulk_cancel);
         }
 
         if app.should_quit {
@@ -169,35 +169,74 @@ fn build_bulk_operations(op: &str, domains: Vec<String>) -> Vec<seer_core::bulk:
         .collect()
 }
 
-/// Run a bulk batch, streaming each result over `tx` as it completes and a
-/// terminal `BulkDone`. Returns the spawned task's abort handle so the run can
-/// be cancelled.
+/// Stream a bulk batch's results over `tx`, then a terminal `BulkDone`.
+async fn run_bulk(
+    tx: tokio::sync::mpsc::UnboundedSender<Msg>,
+    executor: seer_core::BulkExecutor,
+    operations: Vec<seer_core::bulk::BulkOperation>,
+    gen: u64,
+) {
+    let cb_tx = tx.clone();
+    let cb: seer_core::bulk::ResultCallback = Box::new(move |r: &seer_core::bulk::BulkResult| {
+        let _ = cb_tx.send(Msg::BulkStep {
+            gen,
+            result: Box::new(r.clone()),
+        });
+    });
+    let _ = executor.execute_streaming(operations, cb).await;
+    let _ = tx.send(Msg::BulkDone { gen });
+}
+
+/// Run a bulk batch in the background. Returns the spawned task's abort handle
+/// so the run can be cancelled.
 fn spawn_bulk_run(
     tx: &tokio::sync::mpsc::UnboundedSender<Msg>,
+    executor: seer_core::BulkExecutor,
     operations: Vec<seer_core::bulk::BulkOperation>,
     gen: u64,
 ) -> tokio::task::AbortHandle {
-    let tx = tx.clone();
-    let handle = tokio::spawn(async move {
-        let ex = seer_core::BulkExecutor::new();
-        let cb_tx = tx.clone();
-        let cb: seer_core::bulk::ResultCallback =
-            Box::new(move |r: &seer_core::bulk::BulkResult| {
-                let _ = cb_tx.send(Msg::BulkStep {
-                    gen,
-                    result: Box::new(r.clone()),
-                });
-            });
-        let _ = ex.execute_streaming(operations, cb).await;
-        let _ = tx.send(Msg::BulkDone { gen });
-    });
-    handle.abort_handle()
+    tokio::spawn(run_bulk(tx.clone(), executor, operations, gen)).abort_handle()
+}
+
+/// Read and validate a bulk domains file with the CLI's guards: tilde
+/// expansion, regular files only (a FIFO would block the read forever) under
+/// the size cap, and the same non-empty / `MAX_BULK_DOMAINS` domain-count
+/// limits — an over-long list is rejected rather than silently truncated.
+fn load_bulk_file(path: &str) -> Result<Vec<String>, String> {
+    let path = crate::utils::expand_tilde(path);
+    let content = crate::utils::read_bulk_input(&path)?;
+    crate::ops::parse_bulk_domains(&content)
+}
+
+/// Apply a watchlist edit, returning the toast to show for anything the user
+/// would otherwise not notice (an invalid domain, a duplicate). `None` means
+/// the refreshed lens speaks for itself.
+fn mutate_watchlist(
+    wl: &mut Watchlist,
+    add: Option<&str>,
+    remove: Option<&str>,
+) -> Option<(&'static str, String)> {
+    let mut notice = None;
+    if let Some(a) = add {
+        notice = match wl.add(a) {
+            Ok(true) => None,
+            Ok(false) => Some(("info", format!("{a} is already on the watchlist"))),
+            Err(e) => Some(("fail", format!("cannot watch {a}: {e}"))),
+        };
+    }
+    if let Some(r) = remove {
+        if !wl.remove(r) {
+            notice = Some(("info", format!("{r} is not on the watchlist")));
+        }
+    }
+    notice
 }
 
 /// Execute a side-effecting Action returned by `App::update`.
 fn handle_action(
     action: Action,
     tx: &tokio::sync::mpsc::UnboundedSender<Msg>,
+    config: &seer_core::SeerConfig,
     follow_cancel: &mut Option<tokio::sync::watch::Sender<bool>>,
     bulk_cancel: &mut Option<tokio::task::AbortHandle>,
 ) {
@@ -227,18 +266,21 @@ fn handle_action(
             let tx = tx.clone();
             tokio::spawn(async move {
                 // File I/O is blocking — run in spawn_blocking to keep the async loop free.
-                tokio::task::spawn_blocking(move || {
+                let notice = tokio::task::spawn_blocking(move || {
                     let mut wl = Watchlist::load();
-                    if let Some(a) = add {
-                        let _ = wl.add(&a);
+                    let notice = mutate_watchlist(&mut wl, add.as_deref(), remove.as_deref());
+                    match wl.save() {
+                        Ok(()) => notice,
+                        Err(e) => Some(("fail", format!("failed to save watchlist: {e}"))),
                     }
-                    if let Some(r) = remove {
-                        wl.remove(&r);
-                    }
-                    let _ = wl.save();
                 })
                 .await
-                .ok();
+                .ok()
+                .flatten();
+                // An invalid domain was previously dropped without a word.
+                if let Some((tone, msg)) = notice {
+                    let _ = tx.send(Msg::Toast { tone, msg });
+                }
                 // Refresh the watchlist lens after mutation. `gen` is the watch
                 // lens's current fetch generation (bumped by App when emitting
                 // this action), so the refresh survives the staleness guard.
@@ -319,7 +361,10 @@ fn handle_action(
                 prev.abort();
             }
             let operations = build_bulk_operations(&p.op, p.domains);
-            *bulk_cancel = Some(spawn_bulk_run(tx, operations, p.gen));
+            // from_config: honor ~/.seer/config.toml (concurrency, rate
+            // limit, timeouts) like `seer bulk` does.
+            let executor = seer_core::BulkExecutor::from_config(config);
+            *bulk_cancel = Some(spawn_bulk_run(tx, executor, operations, p.gen));
         }
         Action::StopBulk => {
             if let Some(prev) = bulk_cancel.take() {
@@ -332,34 +377,23 @@ fn handle_action(
                 prev.abort();
             }
             let tx = tx.clone();
+            let executor = seer_core::BulkExecutor::from_config(config);
             // The file read is blocking and the run must own the abort handle,
             // so the whole load+run lives in one task; we store its handle.
             let handle = tokio::spawn(async move {
-                let read_result =
-                    tokio::task::spawn_blocking(move || std::fs::read_to_string(&path)).await;
-                let Ok(Ok(content)) = read_result else {
-                    let _ = tx.send(Msg::CopyResult {
-                        ok: false,
-                        label: "bulk file not found".into(),
-                    });
-                    let _ = tx.send(Msg::BulkDone { gen });
-                    return;
+                let loaded = tokio::task::spawn_blocking(move || load_bulk_file(&path))
+                    .await
+                    .unwrap_or_else(|e| Err(format!("failed to read bulk file: {e}")));
+                let domains = match loaded {
+                    Ok(domains) => domains,
+                    Err(msg) => {
+                        let _ = tx.send(Msg::Toast { tone: "fail", msg });
+                        let _ = tx.send(Msg::BulkDone { gen });
+                        return;
+                    }
                 };
-                let mut domains = seer_core::bulk::parse_domains_from_file(&content);
-                // Cap to 50 to match CLI bulk limit
-                domains.truncate(50);
                 let operations = build_bulk_operations(&op, domains);
-                let ex = seer_core::BulkExecutor::new();
-                let cb_tx = tx.clone();
-                let cb: seer_core::bulk::ResultCallback =
-                    Box::new(move |r: &seer_core::bulk::BulkResult| {
-                        let _ = cb_tx.send(Msg::BulkStep {
-                            gen,
-                            result: Box::new(r.clone()),
-                        });
-                    });
-                let _ = ex.execute_streaming(operations, cb).await;
-                let _ = tx.send(Msg::BulkDone { gen });
+                run_bulk(tx, executor, operations, gen).await;
             });
             *bulk_cancel = Some(handle.abort_handle());
         }
@@ -371,13 +405,83 @@ fn handle_action(
                     .await
                     .map(|r| r.is_ok())
                     .unwrap_or(false);
-                let label = if ok {
-                    format!("wrote {path}")
+                // A Toast, not a CopyResult: the copy handler prefixes
+                // "copied ", which read as "copied wrote seer-bulk-….csv".
+                let (tone, msg) = if ok {
+                    ("ok", format!("wrote {path}"))
                 } else {
-                    format!("failed to write {path}")
+                    ("fail", format!("failed to write {path}"))
                 };
-                let _ = tx.send(Msg::CopyResult { ok, label });
+                let _ = tx.send(Msg::Toast { tone, msg });
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn watchlist_add_of_an_invalid_domain_reports_why() {
+        let mut wl = Watchlist::default();
+        let notice = mutate_watchlist(&mut wl, Some("not a domain!"), None);
+        assert!(
+            matches!(notice, Some(("fail", ref m)) if m.contains("not a domain!")),
+            "invalid add must surface an error toast, got {notice:?}"
+        );
+        assert!(wl.domains.is_empty());
+    }
+
+    #[test]
+    fn watchlist_add_and_duplicate_add() {
+        let mut wl = Watchlist::default();
+        assert_eq!(mutate_watchlist(&mut wl, Some("example.com"), None), None);
+        assert_eq!(wl.domains, vec!["example.com".to_string()]);
+        assert!(matches!(
+            mutate_watchlist(&mut wl, Some("example.com"), None),
+            Some(("info", _))
+        ));
+    }
+
+    #[test]
+    fn bulk_file_load_rejects_missing_and_non_regular_paths() {
+        // A missing path errors with a reason (was: silent "not found").
+        let missing = std::env::temp_dir().join("seer-tui-no-such-bulk-file.txt");
+        assert!(load_bulk_file(missing.to_str().unwrap()).is_err());
+        // A directory is not a regular file — read_bulk_input's guard
+        // (the same one that stops a FIFO from blocking the read forever).
+        let dir = std::env::temp_dir();
+        let err = load_bulk_file(dir.to_str().unwrap()).unwrap_err();
+        assert!(err.contains("not a regular file"), "got: {err}");
+    }
+
+    #[test]
+    fn bulk_file_load_enforces_the_cli_domain_cap_instead_of_truncating() {
+        let dir = std::env::temp_dir().join(format!("seer-tui-bulk-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("domains.txt");
+
+        std::fs::write(&path, "a.com\nb.com\n").unwrap();
+        assert_eq!(
+            load_bulk_file(path.to_str().unwrap()).unwrap(),
+            vec!["a.com".to_string(), "b.com".to_string()],
+        );
+
+        // More than 50 (the old silent truncation point) but within the CLI's
+        // MAX_BULK_DOMAINS is accepted in full.
+        let many: String = (0..60).map(|i| format!("d{i}.com\n")).collect();
+        std::fs::write(&path, many).unwrap();
+        assert_eq!(load_bulk_file(path.to_str().unwrap()).unwrap().len(), 60);
+
+        // Over the cap is rejected with a message, not truncated.
+        let too_many: String = (0..=crate::ops::MAX_BULK_DOMAINS)
+            .map(|i| format!("d{i}.com\n"))
+            .collect();
+        std::fs::write(&path, too_many).unwrap();
+        let err = load_bulk_file(path.to_str().unwrap()).unwrap_err();
+        assert!(err.contains("maximum"), "got: {err}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

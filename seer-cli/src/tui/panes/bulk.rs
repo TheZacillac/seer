@@ -43,6 +43,10 @@ pub struct BulkState {
     pub selected: Option<usize>,
     /// Whether the detail panel for the selected row is expanded.
     pub detail: bool,
+    /// `OPS` index the current `rows` were produced with, captured when the
+    /// run starts. `o` changes `op_idx` for the NEXT run, so the results title
+    /// and CSV export must not follow it.
+    pub run_op_idx: Option<usize>,
 }
 
 /// Parse a free-form domains blob (typed or pasted) into a capped list. Same
@@ -66,6 +70,28 @@ impl BulkState {
     /// Current operation name.
     pub fn op(&self) -> &str {
         OPS[self.op_idx]
+    }
+
+    /// Operation the current results were produced with (falls back to the
+    /// selected op before any run).
+    pub fn results_op(&self) -> &str {
+        OPS[self.run_op_idx.unwrap_or(self.op_idx)]
+    }
+
+    /// Start a file-driven run (`f`). An empty path is ignored rather than
+    /// clearing the current results for a load that cannot succeed. The total
+    /// is unknown until the file is read, so the gauge falls back to rows.
+    pub fn start_file_run(&mut self, path: String) -> Option<Action> {
+        if path.is_empty() {
+            return None;
+        }
+        self.begin_run();
+        self.total = 0;
+        Some(Action::StartBulkFromFile {
+            op: self.op().to_string(),
+            path,
+            gen: self.gen,
+        })
     }
 
     /// Append a result row (called from `App::update` on `Msg::BulkStep`).
@@ -101,6 +127,7 @@ impl BulkState {
         self.gen += 1;
         self.selected = None;
         self.detail = false;
+        self.run_op_idx = Some(self.op_idx);
     }
 
     /// Move the selection by `delta` rows, pinning it (leaving tail-follow).
@@ -163,7 +190,7 @@ impl BulkState {
                 if self.rows.is_empty() {
                     Some(PaneOutcome::None)
                 } else {
-                    let path = format!("seer-bulk-{}.csv", self.op());
+                    let path = format!("seer-bulk-{}.csv", self.results_op());
                     let contents = self.to_csv();
                     Some(PaneOutcome::Action(Action::WriteCsv { path, contents }))
                 }
@@ -334,6 +361,40 @@ mod tests {
             out,
             Some(PaneOutcome::Action(Action::WriteCsv { .. }))
         ));
+    }
+
+    #[test]
+    fn export_names_the_runs_op_not_the_newly_selected_one() {
+        let mut s = BulkState {
+            domains: "a.com".into(),
+            ..Default::default()
+        };
+        s.handle_key(key(KeyCode::Char('r'))); // run `lookup`
+        s.push(make_lookup_result("a.com"));
+        s.handle_key(key(KeyCode::Char('o'))); // select `status` for the next run
+        assert_eq!(s.op(), "status");
+        assert_eq!(s.results_op(), "lookup");
+        match s.handle_key(key(KeyCode::Char('e'))) {
+            Some(PaneOutcome::Action(Action::WriteCsv { path, .. })) => {
+                assert_eq!(path, "seer-bulk-lookup.csv");
+            }
+            other => panic!("expected WriteCsv, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_file_path_does_not_start_a_run_or_clear_rows() {
+        let mut s = BulkState::default();
+        s.rows.push(make_lookup_result("kept.com"));
+        assert!(s.start_file_run(String::new()).is_none());
+        assert!(!s.running);
+        assert_eq!(s.gen, 0);
+        assert_eq!(s.rows.len(), 1, "existing results must survive");
+        assert!(matches!(
+            s.start_file_run("domains.txt".into()),
+            Some(Action::StartBulkFromFile { ref path, gen: 1, .. }) if path == "domains.txt"
+        ));
+        assert!(s.running && s.rows.is_empty());
     }
 
     #[test]

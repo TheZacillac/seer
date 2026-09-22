@@ -4,6 +4,12 @@
 //! [`apply`] returns a filtered clone of the lens data; it is used by BOTH the
 //! renderer and `App::row_count`, so the displayed rows, the selection index
 //! space, and scrolling always agree on the same visible subset.
+//!
+//! History is the exception: its entries carry full lookup results (raw WHOIS
+//! included) and can number in the tens of thousands, so deep-cloning the
+//! matches every 100ms frame is prohibitive. It is filtered by reference with
+//! [`history_rows`], which the renderer, `row_count`, and the selection
+//! lookup all share instead.
 
 use crate::tui::action::LensData;
 
@@ -39,8 +45,21 @@ fn history_label(e: &seer_core::HistoryEntry) -> String {
     )
 }
 
+/// The history entries visible under `filter` (all of them when it is empty),
+/// borrowed in display order — no entry is cloned.
+pub fn history_rows<'a>(
+    entries: &'a [seer_core::HistoryEntry],
+    filter: &str,
+) -> impl Iterator<Item = &'a seer_core::HistoryEntry> + 'a {
+    let needle = filter.to_lowercase();
+    entries
+        .iter()
+        .filter(move |e| needle.is_empty() || history_label(e).to_lowercase().contains(&needle))
+}
+
 /// Returns a filtered clone of `data` for a filterable lens with a non-empty
 /// filter, or `None` (the caller renders/counts the original unchanged).
+/// History always returns `None`; it is filtered via [`history_rows`].
 pub fn apply(data: &LensData, filter: &str) -> Option<LensData> {
     if filter.is_empty() {
         return None;
@@ -51,14 +70,6 @@ pub fn apply(data: &LensData, filter: &str) -> Option<LensData> {
             r.subdomains.retain(|host| matches(host, filter));
             r.count = r.subdomains.len();
             Some(LensData::Subdomains(Box::new(r)))
-        }
-        LensData::History(entries) => {
-            let filtered: Vec<_> = entries
-                .iter()
-                .filter(|e| matches(&history_label(e), filter))
-                .cloned()
-                .collect();
-            Some(LensData::History(filtered))
         }
         LensData::Takeover(t) => {
             let mut r = (**t).clone();

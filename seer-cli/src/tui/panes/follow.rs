@@ -16,6 +16,10 @@ pub struct FollowState {
     pub log: Vec<seer_core::dns::FollowIteration>,
     /// Generation counter — callbacks from superseded runs are dropped.
     pub gen: u64,
+    /// `(count, interval_secs)` the current/last run was started with. The
+    /// editable settings above apply to the NEXT run, so the progress view
+    /// reads the run's own parameters instead.
+    pub last_run: Option<(usize, u64)>,
 }
 
 impl Default for FollowState {
@@ -26,6 +30,7 @@ impl Default for FollowState {
             running: false,
             log: vec![],
             gen: 0,
+            last_run: None,
         }
     }
 }
@@ -44,6 +49,18 @@ impl FollowState {
         self.gen += 1;
         self.running = false;
         self.log.clear();
+        self.last_run = None;
+    }
+
+    /// Total checks of the current/last run: the core-reported
+    /// `total_iterations` once a check has landed, else the parameters the
+    /// run was started with, else the settings for the next run.
+    pub fn run_total(&self) -> usize {
+        self.log
+            .first()
+            .map(|it| it.total_iterations)
+            .or(self.last_run.map(|(n, _)| n))
+            .unwrap_or(self.count)
     }
 
     /// Handle a key event for the Follow pane.
@@ -61,6 +78,7 @@ impl FollowState {
                 self.log.clear();
                 self.running = true;
                 self.gen += 1;
+                self.last_run = Some((self.count, self.interval_secs));
                 Some(PaneOutcome::Action(Action::StartFollow(FollowParams {
                     domain: d.to_string(),
                     iterations: self.count,

@@ -87,21 +87,7 @@ impl Panes {
                 }
                 vec![]
             }
-            EditTarget::BulkPath => {
-                self.bulk.running = true;
-                self.bulk.rows.clear();
-                self.bulk.note = None;
-                self.bulk.gen += 1;
-                self.bulk.selected = None;
-                self.bulk.detail = false;
-                // total is unknown for file loads; 0 means the gauge falls back to rows.
-                self.bulk.total = 0;
-                vec![Action::StartBulkFromFile {
-                    op: self.bulk.op().to_string(),
-                    path: v,
-                    gen: self.bulk.gen,
-                }]
-            }
+            EditTarget::BulkPath => self.bulk.start_file_run(v).into_iter().collect(),
             EditTarget::BulkDomains => {
                 self.bulk.domains = v;
                 vec![]
@@ -110,12 +96,15 @@ impl Panes {
         }
     }
 
+    /// Initial buffer when a field opens. The numeric Follow fields open EMPTY
+    /// (the current value is shown in the prompt label): prefilling "30" with
+    /// the caret at the end turned typing "60" into 3060.
     pub fn field_value(&self, t: EditTarget) -> String {
         match t {
             EditTarget::DiffB => self.diff.b.clone(),
-            EditTarget::FollowInterval => self.follow.interval_secs.to_string(),
-            EditTarget::FollowCount => self.follow.count.to_string(),
-            EditTarget::BulkPath => String::new(),
+            EditTarget::FollowInterval | EditTarget::FollowCount | EditTarget::BulkPath => {
+                String::new()
+            }
             EditTarget::BulkDomains => self.bulk.domains.clone(),
             EditTarget::TldFilter => self.tld.filter.clone(),
             _ => String::new(),
@@ -151,6 +140,26 @@ mod tests {
             seer_core::MAX_FOLLOW_ITERATIONS,
             "over-range count must be clamped to the core maximum"
         );
+    }
+
+    #[test]
+    fn follow_fields_open_empty_so_typing_replaces_the_value() {
+        let panes = Panes::default();
+        assert_eq!(panes.field_value(EditTarget::FollowInterval), "");
+        assert_eq!(panes.field_value(EditTarget::FollowCount), "");
+        // Submitting the empty buffer leaves the setting unchanged.
+        let mut panes = Panes::default();
+        panes.apply_field(EditTarget::FollowInterval, String::new(), None);
+        assert_eq!(panes.follow.interval_secs, 30);
+    }
+
+    #[test]
+    fn empty_bulk_path_is_ignored() {
+        let mut panes = Panes::default();
+        let actions = panes.apply_field(EditTarget::BulkPath, String::new(), None);
+        assert!(actions.is_empty(), "no StartBulkFromFile for an empty path");
+        assert!(!panes.bulk.running);
+        assert_eq!(panes.bulk.gen, 0, "run counter must not advance");
     }
 
     #[test]
