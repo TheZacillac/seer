@@ -711,9 +711,24 @@ fn extract_field_with_patterns(text: &str, patterns: &[Regex]) -> Option<String>
     None
 }
 
-/// True for values that are privacy/redaction placeholders rather than real
-/// data ("REDACTED FOR PRIVACY", "Not disclosed", DNS Belgium's "Not shown,
-/// please visit www.dnsbelgium.be for webbased whois.", "N/A").
+/// Registry/registrar boilerplate printed in place of contact data — most
+/// often in the `Registrant Email:` slot of post-GDPR gTLD output — that is
+/// NOT a value ("Please query the RDDS service of the Registrar of Record
+/// identified in this output for information on how to contact the
+/// Registrant, …").
+const PLACEHOLDER_PHRASES: &[&str] = &[
+    "please query the rdds",
+    "please query the whois",
+    "please ask the registrar",
+    "how to contact the registrant",
+    "select request email form",    // MarkMonitor
+    "select contact domain holder", // GoDaddy
+];
+
+/// True for values that are privacy/redaction placeholders or boilerplate
+/// rather than real data ("REDACTED FOR PRIVACY", "Not disclosed", DNS
+/// Belgium's "Not shown, please visit www.dnsbelgium.be for webbased whois.",
+/// [`PLACEHOLDER_PHRASES`], "N/A").
 fn is_placeholder_value(value: &str) -> bool {
     let lower = value.to_lowercase();
     lower.contains("redacted")
@@ -722,6 +737,7 @@ fn is_placeholder_value(value: &str) -> bool {
         || lower.contains("not disclosed")
         || lower.contains("not shown")
         || lower.contains("withheld")
+        || PLACEHOLDER_PHRASES.iter().any(|p| lower.contains(p))
         || lower == "n/a"
         || lower == "none"
 }
@@ -1191,6 +1207,24 @@ mod tests {
         let raw = "Domain Name: EXAMPLE.COM\nRegistrar:\nRegistrar IANA ID: 376\n";
         let r = WhoisResponse::parse("example.com", "whois.example", raw);
         assert_eq!(r.registrar, None);
+    }
+
+    #[test]
+    fn contact_boilerplate_is_not_stored_as_a_value() {
+        let raw = "Domain Name: EXAMPLE.COM\r\n\
+                   Registrant Email: Please query the RDDS service of the Registrar of Record identified in this output for information on how to contact the Registrant, Admin, or Tech contact of the queried domain name.\r\n\
+                   Admin Email: Please ask the Registrar of Record identified in this output for information on how to contact the Registrant, Admin, or Tech contact of the queried domain name.\r\n\
+                   Tech Email: Select Request Email Form at https://domains.markmonitor.com/whois/example.com\r\n\
+                   Registrant Phone: +1.5555550100\r\n";
+        let r = WhoisResponse::parse("example.com", "whois.example", raw);
+        assert_eq!(r.registrant_email, None);
+        assert_eq!(r.admin_email, None);
+        assert_eq!(r.tech_email, None);
+        assert_eq!(
+            r.registrant_phone.as_deref(),
+            Some("+1.5555550100"),
+            "real values are kept"
+        );
     }
 
     // --- H10: is_available() scans the full response --------------------

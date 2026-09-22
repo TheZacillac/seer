@@ -218,10 +218,10 @@ Name Server: ns2.example.com
             "tech_name must be None for redacted response"
         );
         assert!(
-            result.registrant_email.is_none()
-                || !result.registrant_email.as_deref().unwrap().is_empty(),
-            "registrant_email should be None or non-empty; never the \
-             redaction sentinel"
+            result.registrant_email.is_none(),
+            "the 'Please query the RDDS service…' notice is not an email \
+             (got: {:?})",
+            result.registrant_email
         );
 
         // has_core_data should still be true — we have registrar, dates,
