@@ -99,14 +99,24 @@ impl AvailabilityChecker {
     }
 
     /// Check if a domain is available for registration.
+    ///
+    /// A name below its registrable domain (`mail.google.com`) is never
+    /// reported available on the strength of the registry having no object
+    /// for it; see [`AvailabilityChecker::guard_subdomain_claim`].
     #[instrument(skip(self), fields(domain = %domain))]
     pub async fn check(&self, domain: &str) -> Result<AvailabilityResult> {
         let domain = crate::validation::normalize_domain(domain)?;
         debug!(domain = %domain, "Checking domain availability");
+        let result = self.check_registry(&domain).await;
+        Ok(self.guard_subdomain_claim(result).await)
+    }
 
+    /// The RDAP → WHOIS + DNS ladder for an already-normalized name, without
+    /// the subdomain guard.
+    async fn check_registry(&self, domain: &str) -> AvailabilityResult {
         // Try RDAP first - it gives structured error responses.
-        match self.rdap_client.lookup_domain(&domain).await {
-            Ok(response) => Ok(decide_from_rdap(&domain, response)),
+        match self.rdap_client.lookup_domain(domain).await {
+            Ok(response) => decide_from_rdap(domain, response),
             Err(rdap_err) => {
                 debug!(error = %rdap_err, "RDAP lookup failed, falling back to WHOIS + DNS");
                 // Probe WHOIS and the apex DNS presence concurrently. DNS is
@@ -115,17 +125,41 @@ impl AvailabilityChecker {
                 // alongside WHOIS (rather than on demand) adds no extra
                 // wall-clock time.
                 let (whois_result, dns_presence) = tokio::join!(
-                    self.whois_client.lookup(&domain),
-                    self.dns_resolver.presence(&domain),
+                    self.whois_client.lookup(domain),
+                    self.dns_resolver.presence(domain),
                 );
-                Ok(decide_fallback(
-                    &domain,
-                    &rdap_err,
-                    whois_result,
-                    dns_presence,
-                ))
+                decide_fallback(domain, &rdap_err, whois_result, dns_presence)
             }
         }
+    }
+
+    /// Re-derives an "available" claim for a name that sits *below* its
+    /// registrable domain.
+    ///
+    /// Registries hold objects only for registrable names, so for
+    /// `mail.google.com` both RDAP (404) and WHOIS ("No match") answer "no
+    /// such domain" — which used to be reported as AVAILABLE with high
+    /// confidence. Only the registrable parent (`google.com`) can be
+    /// registered, so the verdict is taken from a check of the parent (see
+    /// [`subdomain_verdict`]). Results for registrable names, and every
+    /// not-available result, pass through untouched with no extra queries.
+    pub(crate) async fn guard_subdomain_claim(
+        &self,
+        result: AvailabilityResult,
+    ) -> AvailabilityResult {
+        if !result.available {
+            return result;
+        }
+        let Some(parent) = crate::psl::registrable_parent(&result.domain) else {
+            return result;
+        };
+        debug!(
+            domain = %result.domain,
+            parent = %parent,
+            "No registry object for a subdomain; checking its registrable parent"
+        );
+        let parent_result = self.check_registry(parent).await;
+        subdomain_verdict(&result.domain, &parent_result)
     }
 
     /// Like [`check`](Self::check), but reuses protocol outcomes already
@@ -155,8 +189,8 @@ impl AvailabilityChecker {
             PriorRdap::Missing => self.rdap_client.lookup_domain(&domain).await,
         };
 
-        match rdap {
-            Ok(response) => Ok(decide_from_rdap(&domain, response)),
+        let result = match rdap {
+            Ok(response) => decide_from_rdap(&domain, response),
             Err(rdap_err) => {
                 // Reuse the prior WHOIS result; only re-query when absent. The
                 // DNS presence probe always runs (it is the tie-breaker
@@ -169,14 +203,65 @@ impl AvailabilityChecker {
                         self.dns_resolver.presence(&domain),
                     ),
                 };
-                Ok(decide_fallback(
-                    &domain,
-                    &rdap_err,
-                    whois_result,
-                    dns_presence,
-                ))
+                decide_fallback(&domain, &rdap_err, whois_result, dns_presence)
             }
+        };
+        Ok(self.guard_subdomain_claim(result).await)
+    }
+}
+
+/// "Thin" WHOIS = no positive registration signal at all: no registrar, no
+/// creation/expiry date, and no delegated nameservers. A thin body is what
+/// blocked or RDAP-first registries return for an unregistered domain.
+///
+/// Nameservers count as registration data because some registries never
+/// publish a registrar or dates over port 43: DENIC (.de, which has no RDAP)
+/// returns only `Nserver`/`Status`/`Changed`, so without them every
+/// registered .de domain read as thin and was reported as "registry detail
+/// unavailable, retry shortly" with its WHOIS data discarded. This matches
+/// [`crate::whois::WhoisResponse::is_available`], which already treats
+/// nameservers as registration data. Shared by this module's fallback ladder
+/// and the smart-lookup routes so the two cannot drift.
+pub(crate) fn whois_is_thin(w: &crate::whois::WhoisResponse) -> bool {
+    w.registrar.is_none()
+        && w.creation_date.is_none()
+        && w.expiration_date.is_none()
+        && w.nameservers.is_empty()
+}
+
+/// Verdict for a name below its registrable domain, derived from the check
+/// of that registrable `parent` (see
+/// [`AvailabilityChecker::guard_subdomain_claim`]).
+///
+/// The name itself is never "available": it cannot be registered on its
+/// own. Under a (likely) registered parent it inherits the parent's
+/// registered verdict and confidence; under an available or undetermined
+/// parent the verdict is unknown (confidence `none`) and the details say
+/// which name to register instead.
+fn subdomain_verdict(domain: &str, parent: &AvailabilityResult) -> AvailabilityResult {
+    let p = &parent.domain;
+    let (confidence, status) = match parent.verdict() {
+        "registered" | "likely_registered" => {
+            (parent.confidence.clone(), format!("{p} is registered"))
         }
+        "available" | "likely_available" => (
+            "none".to_string(),
+            format!("{p} appears available; register {p} to obtain {domain}"),
+        ),
+        _ => (
+            "none".to_string(),
+            format!("the registration status of {p} could not be determined"),
+        ),
+    };
+    AvailabilityResult {
+        domain: domain.to_string(),
+        available: false,
+        confidence,
+        method: "registrable_parent".to_string(),
+        details: Some(format!(
+            "{domain} is not itself registrable: it is a name under the registrable domain {p}, \
+             and registries hold no object for subdomains. {status}."
+        )),
     }
 }
 
@@ -238,12 +323,9 @@ fn decide_fallback(
 ) -> AvailabilityResult {
     match whois_result {
         Ok(whois_response) => {
-            // "Thin" = no positive registration signal at all (no registrar,
-            // no creation/expiry dates). A thin body is what blocked or
-            // RDAP-first registries return for an unregistered domain.
-            let thin = whois_response.registrar.is_none()
-                && whois_response.creation_date.is_none()
-                && whois_response.expiration_date.is_none();
+            // "Thin" = no positive registration signal at all (see
+            // `whois_is_thin`).
+            let thin = whois_is_thin(&whois_response);
 
             if whois_response.is_available() {
                 AvailabilityResult {
@@ -254,8 +336,8 @@ fn decide_fallback(
                     details: Some("WHOIS indicates domain is not registered".to_string()),
                 }
             } else if !thin {
-                // A concrete registration signal (registrar / dates) is
-                // present → the domain is registered.
+                // A concrete registration signal (registrar / dates /
+                // nameservers) is present → the domain is registered.
                 AvailabilityResult {
                     domain: domain.to_string(),
                     available: false,
@@ -983,6 +1065,97 @@ mod tests {
             .expect("prior-response path must not error");
         assert!(!r.available);
         assert_eq!(r.confidence, "medium");
+        assert_eq!(r.method, "rdap");
+    }
+
+    // --- nameservers count as registration data (DENIC, .de) ----------
+
+    /// A DENIC-shaped parsed body: nameservers + status + changed date, but
+    /// DENIC never publishes a registrar or creation/expiry dates.
+    fn denic_whois() -> WhoisResponse {
+        let mut w = whois_with(
+            "Domain: example.de\nNserver: ns1.example.net\nStatus: connect\n",
+            None,
+        );
+        w.nameservers = vec!["ns1.example.net".to_string()];
+        w.status = vec!["active".to_string()];
+        w
+    }
+
+    #[test]
+    fn whois_with_nameservers_is_not_thin() {
+        assert!(whois_is_thin(&whois_with("", None)));
+        assert!(!whois_is_thin(&denic_whois()));
+    }
+
+    #[test]
+    fn denic_style_whois_without_registrar_or_dates_is_registered() {
+        // .de has no RDAP (a non-404 bootstrap miss). Before nameservers
+        // counted, this body was "thin" and an NXDOMAIN apex flipped a
+        // registered .de domain to likely-available.
+        let rdap_err = SeerError::RdapBootstrapError("no RDAP server for example.de".to_string());
+        let r = decide_fallback(
+            "example.de",
+            &rdap_err,
+            Ok(denic_whois()),
+            DnsPresence::Absent,
+        );
+        assert!(!r.available, "a delegated DENIC record is registered");
+        assert_eq!(r.confidence, "high");
+        assert_eq!(r.method, "whois");
+    }
+
+    // --- subdomain guard (names below the registrable domain) ---------
+
+    fn avail(domain: &str, available: bool, confidence: &str) -> AvailabilityResult {
+        AvailabilityResult {
+            domain: domain.to_string(),
+            available,
+            confidence: confidence.to_string(),
+            method: "rdap".to_string(),
+            details: None,
+        }
+    }
+
+    #[test]
+    fn subdomain_under_registered_parent_is_registered_not_available() {
+        let r = subdomain_verdict("mail.google.com", &avail("google.com", false, "high"));
+        assert!(!r.available);
+        assert_eq!(r.domain, "mail.google.com");
+        assert_eq!(r.verdict(), "registered");
+        assert_eq!(r.method, "registrable_parent");
+        let details = r.details.unwrap();
+        assert!(details.contains("google.com is registered"), "{details}");
+    }
+
+    #[test]
+    fn subdomain_under_available_parent_is_never_claimed_available() {
+        let r = subdomain_verdict("mail.freebrand.com", &avail("freebrand.com", true, "high"));
+        assert!(!r.available, "a subdomain itself is never registrable");
+        assert_eq!(r.verdict(), "unknown");
+        assert!(r.details.unwrap().contains("register freebrand.com"));
+
+        let r = subdomain_verdict("a.b.co.uk", &avail("b.co.uk", false, "none"));
+        assert!(!r.available);
+        assert_eq!(r.verdict(), "unknown");
+        assert!(r.details.unwrap().contains("could not be determined"));
+    }
+
+    #[tokio::test]
+    async fn subdomain_guard_leaves_registrable_names_and_negative_results_alone() {
+        // Both cases return before any network: a registrable name has no
+        // parent to consult, and a not-available verdict is never rewritten.
+        let checker = AvailabilityChecker::new();
+        let r = checker
+            .guard_subdomain_claim(avail("example.co.uk", true, "high"))
+            .await;
+        assert!(r.available);
+        assert_eq!(r.method, "rdap");
+
+        let r = checker
+            .guard_subdomain_claim(avail("mail.example.com", false, "high"))
+            .await;
+        assert!(!r.available);
         assert_eq!(r.method, "rdap");
     }
 }
