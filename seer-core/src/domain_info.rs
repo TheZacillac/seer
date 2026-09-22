@@ -515,7 +515,7 @@ mod tests {
                     "ldhName": "ns1.rdap-example.com"
                 }
             ],
-            "secureDns": {
+            "secureDNS": {
                 "delegationSigned": true,
                 "dsData": [],
                 "keyData": []
