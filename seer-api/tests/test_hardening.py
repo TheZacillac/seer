@@ -1184,6 +1184,68 @@ def test_xff_uses_rightmost_untrusted_entry(monkeypatch):
     assert get_client_ip(req) == "203.0.113.9"
 
 
+def test_xff_multiple_header_lines_are_joined(monkeypatch):
+    """A proxy that adds its hop as a SEPARATE X-Forwarded-For line (HAProxy
+    `option forwardfor`) must not let the client's own first line win:
+    `headers.get()` only returned that first, client-controlled line."""
+    from fastapi import Request
+
+    from seer_api.limiting import get_client_ip
+
+    monkeypatch.setenv("SEER_TRUST_PROXY", "true")
+    monkeypatch.setenv("SEER_TRUSTED_PROXY_IPS", "10.0.0.1")
+    scope = {
+        "type": "http",
+        "client": ("10.0.0.1", 1234),
+        "headers": [
+            # Sent by the client (spoofed).
+            (b"x-forwarded-for", b"1.1.1.1"),
+            # Added by the trusted proxy: the real client.
+            (b"x-forwarded-for", b"203.0.113.9"),
+        ],
+    }
+    assert get_client_ip(Request(scope)) == "203.0.113.9"
+
+
+def test_trusted_proxy_cidr_warning_logged_once(monkeypatch, caplog):
+    """The CIDR-entry warning must not be re-logged on every request."""
+    import logging
+
+    from fastapi import Request
+
+    from seer_api import limiting
+
+    monkeypatch.setenv("SEER_TRUST_PROXY", "true")
+    monkeypatch.setenv("SEER_TRUSTED_PROXY_IPS", "10.0.0.1,10.0.0.0/8")
+    limiting._parse_trusted_proxies.cache_clear()
+    scope = {
+        "type": "http",
+        "client": ("10.0.0.1", 1234),
+        "headers": [(b"x-forwarded-for", b"203.0.113.9")],
+    }
+    with caplog.at_level(logging.WARNING, logger="seer_api"):
+        for _ in range(5):
+            assert limiting.get_client_ip(Request(scope)) == "203.0.113.9"
+    cidr_warnings = [r for r in caplog.records if "10.0.0.0/8" in r.getMessage()]
+    assert len(cidr_warnings) == 1, [r.getMessage() for r in cidr_warnings]
+    # The CIDR entry is still ignored, not trusted.
+    assert limiting._trusted_proxies() == frozenset({"10.0.0.1"})
+
+
+def test_run_disables_uvicorn_proxy_headers(monkeypatch):
+    """uvicorn's default proxy_headers=True rewrites the client address from
+    X-Forwarded-For (for FORWARDED_ALLOW_IPS peers) before the app runs, a
+    second XFF trust path around SEER_TRUST_PROXY/SEER_TRUSTED_PROXY_IPS."""
+    import uvicorn
+
+    import seer_api.main as main
+
+    captured: dict = {}
+    monkeypatch.setattr(uvicorn, "run", lambda *a, **kw: captured.update(kw))
+    main.run()
+    assert captured.get("proxy_headers") is False
+
+
 def test_xff_all_trusted_falls_back_to_peer(monkeypatch):
     """If every XFF entry is a trusted proxy, fall back to the socket peer
     rather than attributing the request to a proxy IP."""
@@ -1299,6 +1361,29 @@ def test_metrics_rate_limited(reset_limiter, monkeypatch):
     # Send > 10 requests in a burst; at least one must be 429.
     statuses = [c.get("/metrics").status_code for _ in range(15)]
     assert 429 in statuses, f"expected rate-limit in {statuses}"
+
+
+def test_rate_limit_is_per_route_not_per_url(reset_limiter, monkeypatch, client):
+    """Distinct path parameters on one route share its budget.
+
+    slowapi's default key_style="url" keyed buckets on the concrete path, so
+    `/takeover/a0.com`, `/takeover/a1.com`, … — or case / trailing-dot
+    spellings of one domain — each got a fresh "5/minute" and the limit
+    bounded nothing.
+    """
+    import seer as seer_mod
+
+    monkeypatch.setattr(seer_mod, "takeover", lambda *a: {"ok": True}, raising=False)
+    paths = [f"/takeover/a{i}.com" for i in range(4)] + [
+        "/takeover/EXAMPLE.com",
+        "/takeover/example.com.",
+        "/takeover/example.com",
+    ]
+    statuses = [client.get(p).status_code for p in paths]
+    assert statuses == [200] * 5 + [429] * 2, statuses
+    # A different route keeps its own budget.
+    monkeypatch.setattr(seer_mod, "confusables", lambda *a: {"ok": True}, raising=False)
+    assert client.get("/confusables/example.com").status_code == 200
 
 
 # ---------------------------------------------------------------------------

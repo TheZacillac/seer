@@ -113,3 +113,17 @@ from seer_api.main import app  # noqa: E402
 @pytest.fixture
 def client():
     return TestClient(app)
+
+
+@pytest.fixture(autouse=True)
+def _reset_rate_limits():
+    """Start every test with empty REST rate-limit counters.
+
+    The slowapi limiter is module-level and buckets per (client, route), and
+    every TestClient reports the same peer ("testclient"), so hits from one
+    test would otherwise count against the next test's budget for that route.
+    """
+    from seer_api.limiting import limiter
+
+    limiter.reset()
+    yield

@@ -73,3 +73,23 @@ def test_mcp_is_rate_limited(monkeypatch):
             r = c.post("/mcp", json={"jsonrpc": "2.0", "method": "ping", "id": 1})
             statuses.append(r.status_code)
     assert 429 in statuses, f"/mcp must be rate-limited; saw {statuses}"
+
+
+def test_mcp_multi_limit_rate_string_enforces_every_limit(monkeypatch):
+    """SEER_RATE_LIMIT may carry several limits; `limits.parse` kept only the
+    first, so the tighter `2/hour` here was silently dropped."""
+    monkeypatch.delenv("SEER_API_KEY", raising=False)
+    monkeypatch.delenv("SEER_MCP_ALLOWED_HOSTS", raising=False)
+    monkeypatch.delenv("SEER_MCP_ALLOWED_ORIGINS", raising=False)
+    monkeypatch.setenv("SEER_RATE_LIMIT", "100/minute;2/hour")
+    import seer_api.main as main
+
+    importlib.reload(main)
+    with TestClient(main.app) as c:
+        statuses = [
+            c.post("/mcp", json={"jsonrpc": "2.0", "method": "ping", "id": 1}).status_code
+            for _ in range(4)
+        ]
+    assert statuses[2:] == [429, 429], statuses
+    monkeypatch.delenv("SEER_RATE_LIMIT")
+    importlib.reload(main)

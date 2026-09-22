@@ -10,7 +10,7 @@ from urllib.parse import urlsplit
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, ORJSONResponse
-from limits import parse as _parse_rate_limit
+from limits import parse_many as _parse_rate_limits
 from limits.storage import storage_from_string as _rate_storage_from_string
 from limits.strategies import MovingWindowRateLimiter
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
@@ -116,22 +116,31 @@ _mcp_asgi_app = _McpAsgiApp()
 # /mcp is a raw Starlette Route, so the per-route `@limiter.limit` decorators do
 # not cover it, and slowapi has no SlowAPIMiddleware registered (decorator mode).
 # Rate-limit the highest-fan-out surface (it can drive seer_bulk_* = up to 100
-# domains x concurrency) explicitly here, using the same env config as the REST
-# limiter so an operator's SEER_RATE_LIMIT / SEER_RATE_LIMIT_STORAGE applies.
+# domains x concurrency) explicitly here with SEER_RATE_LIMIT, stored in
+# SEER_RATE_LIMIT_STORAGE. SEER_RATE_LIMIT applies to /mcp ONLY: the REST
+# routes each carry an explicit `@limiter.limit(...)`, which overrides the
+# limiter's default (see limiting.py).
 #
 # Built lazily on first /mcp request (not at import) so that configuring a
 # backend whose driver isn't installed — e.g. SEER_RATE_LIMIT_STORAGE=redis://
 # without the redis package — doesn't crash module import; it surfaces only if
 # /mcp is actually used, mirroring slowapi's own lazy storage behavior.
 _mcp_rate_limiter: MovingWindowRateLimiter | None = None
-_mcp_rate_value = None
+_mcp_rate_values: list = []
 
 
 def _mcp_rate_ok(client_ip: str) -> bool:
-    """Record a hit for ``client_ip`` against the /mcp limit; False if over."""
-    global _mcp_rate_limiter, _mcp_rate_value
+    """Record a hit for ``client_ip`` against the /mcp limits; False if over.
+
+    ``SEER_RATE_LIMIT`` may hold several limits (``"30/minute;500/day"``, the
+    same multi-limit syntax slowapi accepts); every one is enforced. Parsing
+    with ``limits.parse`` kept only the first and silently dropped the rest.
+    Evaluated in order, stopping at the first exhausted limit — slowapi's own
+    semantics for a multi-limit string.
+    """
+    global _mcp_rate_limiter, _mcp_rate_values
     if _mcp_rate_limiter is None:
-        _mcp_rate_value = _parse_rate_limit(
+        _mcp_rate_values = _parse_rate_limits(
             os.environ.get("SEER_RATE_LIMIT", "30/minute")
         )
         _mcp_rate_limiter = MovingWindowRateLimiter(
@@ -139,7 +148,9 @@ def _mcp_rate_ok(client_ip: str) -> bool:
                 os.environ.get("SEER_RATE_LIMIT_STORAGE", "memory://")
             )
         )
-    return _mcp_rate_limiter.hit(_mcp_rate_value, "mcp", client_ip)
+    return all(
+        _mcp_rate_limiter.hit(item, "mcp", client_ip) for item in _mcp_rate_values
+    )
 
 
 _LOCALHOST_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
@@ -553,6 +564,12 @@ def run():
         host=host,
         port=port,
         reload=reload,
+        # Uvicorn's default (proxy_headers=True, FORWARDED_ALLOW_IPS=127.0.0.1)
+        # rewrites scope["client"] from X-Forwarded-For before the app sees
+        # the request, bypassing SEER_TRUST_PROXY / SEER_TRUSTED_PROXY_IPS.
+        # Keep the socket peer so `limiting.get_client_ip` is the only place
+        # XFF is trusted.
+        proxy_headers=False,
     )
 
 
