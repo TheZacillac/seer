@@ -108,7 +108,7 @@ wiremock = "0.6"
 insta = { version = "1", features = ["filters"] }
 
 # Directory paths
-dirs = "6"
+dirs = "7"
 
 # TLS/SSL certificate handling
 native-tls = "0.2"
