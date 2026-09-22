@@ -32,6 +32,27 @@ carries a regression test.
   queried the apex instead. Per-name operations now keep it; registration
   lookups still reduce `www.example.com` to `example.com`. `www.com`,
   `www.net`, and similar real domains were rejected outright and now work.
+- **DNS tools:** `seer delegation` no longer reports every IDN domain
+  (`münchen.de`) as undelegated; `seer dnssec` evaluates the enclosing zone
+  of a non-apex name (it reported `api.cloudflare.com` as unsigned), reports a
+  stale DS whose DNSKEY query fails as `misconfigured` instead of the mild
+  `partial`, uses one DNSKEY answer for both display and digest checks, and
+  flags algorithms 7 and 12 as deprecated; `seer follow` no longer reports a
+  fake "all added" change after a failed first check and rounds the interval
+  instead of truncating it; IPv6 PTR lookups work in compare/propagation/
+  follow; record comparison folds case only for domain-name data (TXT and
+  DNSKEY differences are real changes, NS-case variants are not); CAA flags
+  keep their reserved bits; a DoH nameserver given as an IPv6 literal is
+  rejected up front instead of failing every query; the delegation and DNSSEC
+  resolvers share the standard resolver options (IPv4-first server order).
+- **Email posture:** SMTP DANE is read at `_25._tcp.<MX host>` (RFC 7672)
+  rather than at the domain; two SPF records are a permerror and two DMARC
+  records disable DMARC instead of grading the first; `v=spf10` is not SPF; a
+  subdomain inherits its organizational domain's DMARC policy (`sp=`, else
+  `p=`); SPF `redirect=` is followed instead of being graded "spoofable"; and
+  DMARC `pct` below 100 lowers the verdict one band.
+- **CAA issuer matching** no longer treats `entrust.net` as permitting an
+  IdenTrust certificate (alias matches are whole-word).
 - **Takeover detection** now resolves AAAA as well as A, reports a failed
   lookup as such rather than "does not resolve", falls back to plain HTTP when
   HTTPS fails (an unclaimed custom domain is served under the provider's own
@@ -147,6 +168,11 @@ carries a regression test.
   multi-limit strings are fully enforced.
 - **A hostile CAA record could crash `seer ssl`/`seer status`** (a byte-index
   slice in issuer matching panicked on non-ASCII input).
+- **Bumped `rustls` to 0.23.45** for RUSTSEC-2026-0285 (TLS 1.3 handshake
+  messages accepted across encryption-level boundaries), with `rustls-webpki`
+  0.103.15 / `aws-lc-rs` 1.18.1, and moved off the yanked `chacha20` 0.10.1.
+- **`SEER_DOMAIN_ALLOWLIST` is enforced on PTR lookups by IP literal** (the
+  reverse name is now checked; an IP bypassed the allowlist).
 - **SSRF:** Teredo (`2001::/32`) and SIIT IPv4-translated addresses are treated
   as reserved, alongside the existing 6to4/NAT64 handling. DNS resolution
   failures are now `DnsError` rather than "Invalid input", so an upstream
