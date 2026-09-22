@@ -81,3 +81,6 @@ logs/
 
 # Claude Code worktrees (local, ephemeral)
 .claude/worktrees/
+
+# AI planning scratch (superpowers skill); archived outside the repo
+docs/superpowers/
