@@ -235,6 +235,22 @@ impl WhoisClient {
                                 );
                                 return Ok(current_response);
                             }
+                            // Only let the referral replace the registry
+                            // record when it actually carries registration
+                            // data. A registry record that merely lacks
+                            // nameservers (an undelegated domain) still has
+                            // its registrar/dates/status, and a registrar's
+                            // throttle or refusal body ("connection limit
+                            // exceeded") must not swap that for all-None.
+                            if !has_registration_data(&referral_response)
+                                && has_registry_data(&current_response)
+                            {
+                                debug!(
+                                    referral = %referral,
+                                    "Referral response carries no registration data, using registry response"
+                                );
+                                return Ok(current_response);
+                            }
                             return Ok(referral_response);
                         }
                         Err(e) => {
@@ -341,6 +357,21 @@ impl WhoisClient {
             tld
         )))
     }
+}
+
+/// True when a (registrar) response carries registration data worth
+/// preferring over the registry's record: a registrar or a registration date.
+fn has_registration_data(response: &WhoisResponse) -> bool {
+    response.registrar.is_some()
+        || response.creation_date.is_some()
+        || response.expiration_date.is_some()
+}
+
+/// True when a registry response carries any registration field at all.
+fn has_registry_data(response: &WhoisResponse) -> bool {
+    has_registration_data(response)
+        || !response.nameservers.is_empty()
+        || !response.status.is_empty()
 }
 
 /// Formats the wire query for registries whose port-43 servers need more
@@ -840,6 +871,42 @@ mod tests {
             .unwrap();
         assert_eq!(resp.registrar.as_deref(), Some("Mock Registrar Two"));
         assert_eq!(resp.whois_server, "localhost");
+    }
+
+    /// An undelegated domain's registry record (registrar, dates, status,
+    /// but no nameservers) fails `has_core_data`, so the referral is
+    /// followed. When the registrar answers with a throttle / refusal body
+    /// instead of a record, the registry's data must be kept rather than
+    /// replaced by an all-empty response.
+    #[tokio::test]
+    async fn mock_refusing_referral_does_not_replace_registry_data() {
+        let port = spawn_mock_whois(vec![
+            "Domain Name: EXAMPLE.COM\n\
+             Registrar WHOIS Server: localhost\n\
+             Registrar: Registry-Listed Registrar, Inc.\n\
+             Creation Date: 2020-01-01T00:00:00Z\n\
+             Registry Expiry Date: 2030-01-01T00:00:00Z\n\
+             Domain Status: serverHold https://icann.org/epp#serverHold\n",
+            "Your connection limit exceeded. Please slow down and try again later.\n",
+        ])
+        .await;
+        let client = mock_client(port);
+        let mut visited = HashSet::new();
+        let resp = client
+            .lookup_with_referrals("example.com", "127.0.0.1", 0, &mut visited)
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.registrar.as_deref(),
+            Some("Registry-Listed Registrar, Inc.")
+        );
+        assert!(resp.creation_date.is_some() && resp.expiration_date.is_some());
+        assert_eq!(resp.status, vec!["serverHold"]);
+        assert_eq!(resp.whois_server, "127.0.0.1", "registry response kept");
+        assert!(
+            visited.contains("localhost"),
+            "the referral was still consulted"
+        );
     }
 
     #[tokio::test]
