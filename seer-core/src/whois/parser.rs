@@ -848,16 +848,33 @@ pub(crate) fn parse_date_with_order(date_str: &str, order: DateOrder) -> Option<
         "%Y-%m-%d",
         "%d-%b-%Y",
         "%d-%B-%Y",
+        // NASK (.pl): `created: 2002.09.19 13:00:00`
+        "%Y.%m.%d %H:%M:%S",
         "%Y.%m.%d",
+        "%Y/%m/%d %H:%M:%S",
         "%Y/%m/%d",
         "%b %d %Y",
+        // DNS Belgium (.be): `Registered: Tue Dec 12 2000`
+        "%a %b %d %Y",
     ];
-    // Ambiguous all-numeric pairs, tried in the hinted order first. The other
-    // order is still tried second so an unambiguous date (a field > 12) is
-    // recovered rather than dropped — the second pass can only succeed for an
-    // input the first rejected, so it never reinterprets an accepted date.
-    const DAY_FIRST: &[&str] = &["%d.%m.%Y", "%d/%m/%Y"];
-    const MONTH_FIRST: &[&str] = &["%m.%d.%Y", "%m/%d/%Y"];
+    // Ambiguous all-numeric formats, tried in the hinted order first. The
+    // other order is still tried second so an unambiguous date (a field > 12)
+    // is recovered rather than dropped — the second pass can only succeed for
+    // an input the first rejected, so it never reinterprets an accepted date.
+    // Each has a time-of-day variant (CZ.NIC: `registered: 18.09.2000
+    // 13:05:00`); the date part obeys the same order rules.
+    const DAY_FIRST: &[&str] = &[
+        "%d.%m.%Y %H:%M:%S",
+        "%d.%m.%Y",
+        "%d/%m/%Y %H:%M:%S",
+        "%d/%m/%Y",
+    ];
+    const MONTH_FIRST: &[&str] = &[
+        "%m.%d.%Y %H:%M:%S",
+        "%m.%d.%Y",
+        "%m/%d/%Y %H:%M:%S",
+        "%m/%d/%Y",
+    ];
     let (first_pair, second_pair) = match order {
         DateOrder::DayFirst => (DAY_FIRST, MONTH_FIRST),
         DateOrder::MonthFirst => (MONTH_FIRST, DAY_FIRST),
@@ -1101,6 +1118,11 @@ mod tests {
             r.registrant, None,
             "the 'Not shown' notice is not a registrant"
         );
+        assert_eq!(
+            r.creation_date.map(|d| d.format("%Y-%m-%d").to_string()),
+            Some("2000-12-12".to_string()),
+            "created from 'Registered: Tue Dec 12 2000'"
+        );
     }
 
     /// NASK (.pl) prints `REGISTRAR:` alone, then the registrar's name on
@@ -1133,6 +1155,17 @@ mod tests {
         let r = WhoisResponse::parse("google.pl", "whois.dns.pl", raw);
         assert_eq!(r.registrar.as_deref(), Some("MarkMonitor, Inc."));
         assert_eq!(r.dnssec.as_deref(), Some("Unsigned"));
+        let fmt = |d: Option<DateTime<Utc>>| d.map(|d| d.format("%Y-%m-%d %H:%M:%S").to_string());
+        assert_eq!(
+            fmt(r.creation_date).as_deref(),
+            Some("2002-09-19 13:00:00"),
+            "created from 'created: 2002.09.19 13:00:00'"
+        );
+        assert_eq!(
+            fmt(r.updated_date).as_deref(),
+            Some("2025-08-19 13:47:36"),
+            "updated from 'last modified: 2025.08.19 13:47:36'"
+        );
     }
 
     /// TWNIC (.tw) lists the registrant name on the line after `Registrant:`.
@@ -1681,6 +1714,67 @@ Domain Status: clientTransferProhibited
             (7, 6),
             "no disambiguating sibling keeps the day-first default"
         );
+    }
+
+    #[test]
+    fn parse_date_handles_numeric_dates_with_time_of_day() {
+        let fmt = |s: &str, order| {
+            parse_date_with_order(s, order).map(|d| d.format("%Y-%m-%d %H:%M:%S").to_string())
+        };
+        let day_first = DateOrder::DayFirst;
+        // Year-first (unambiguous).
+        assert_eq!(
+            fmt("2002.09.19 13:00:00", day_first).as_deref(),
+            Some("2002-09-19 13:00:00")
+        );
+        assert_eq!(
+            fmt("2002/09/19 13:00:00", day_first).as_deref(),
+            Some("2002-09-19 13:00:00")
+        );
+        // CZ.NIC day-first with time.
+        assert_eq!(
+            fmt("18.09.2000 13:05:00", day_first).as_deref(),
+            Some("2000-09-18 13:05:00")
+        );
+        // Ambiguous numeric dates with a time keep obeying the order hint...
+        assert_eq!(
+            fmt("03/04/2024 10:00:00", DateOrder::DayFirst).as_deref(),
+            Some("2024-04-03 10:00:00")
+        );
+        assert_eq!(
+            fmt("03/04/2024 10:00:00", DateOrder::MonthFirst).as_deref(),
+            Some("2024-03-04 10:00:00")
+        );
+        // ...and unambiguous ones parse the same under either hint (#47).
+        for order in [DateOrder::DayFirst, DateOrder::MonthFirst] {
+            assert_eq!(
+                fmt("04/13/2024 08:30:00", order).as_deref(),
+                Some("2024-04-13 08:30:00")
+            );
+            assert_eq!(
+                fmt("13.04.2024 08:30:00", order).as_deref(),
+                Some("2024-04-13 08:30:00")
+            );
+        }
+        // DNS Belgium weekday-prefixed dates.
+        assert_eq!(
+            fmt("Tue Dec 12 2000", day_first).as_deref(),
+            Some("2000-12-12 00:00:00")
+        );
+    }
+
+    #[test]
+    fn parse_internal_infers_order_from_sibling_with_time_of_day() {
+        // A US-format registry that prints times: the unambiguous expiry
+        // (day 15) still reveals month-first for the ambiguous creation date.
+        use chrono::Datelike;
+        let raw = "Creation Date: 03/04/2024 10:00:00\n\
+                   Registry Expiry Date: 04/15/2034 10:00:00\n";
+        let r = make_response(raw);
+        let creation = r.creation_date.expect("creation parsed");
+        assert_eq!((creation.month(), creation.day()), (3, 4));
+        let expiry = r.expiration_date.expect("expiry parsed");
+        assert_eq!((expiry.month(), expiry.day()), (4, 15));
     }
 
     // --- H3: raw_response is not serialized -----------------------------
