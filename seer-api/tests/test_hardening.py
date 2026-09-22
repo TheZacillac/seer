@@ -280,6 +280,200 @@ def test_ssrf_guard_rejects_reserved(client, path):
     assert "reserved" in detail or "invalid" in detail, (path, detail)
 
 
+# Nameserver *specs* the core accepts (seer-core dns/nameserver.rs) and the
+# (host, port) each one connects to — the address the SSRF guard must check.
+NAMESERVER_SPECS = [
+    ("8.8.8.8", ("8.8.8.8", 53)),
+    ("dns.google", ("dns.google", 53)),
+    ("9.9.9.9:5353", ("9.9.9.9", 5353)),
+    ("2606:4700:4700::1111", ("2606:4700:4700::1111", 53)),
+    ("[2606:4700:4700::1111]", ("2606:4700:4700::1111", 53)),
+    ("[2606:4700:4700::1111]:5353", ("2606:4700:4700::1111", 5353)),
+    ("tls://1.1.1.1", ("1.1.1.1", 853)),
+    ("TLS://dns.quad9.net:8853", ("dns.quad9.net", 8853)),
+    ("https://cloudflare-dns.com/dns-query", ("cloudflare-dns.com", 443)),
+    ("https://dns.google:8443", ("dns.google", 8443)),
+    ("https://[2606:4700:4700::1111]/dns-query", ("2606:4700:4700::1111", 443)),
+]
+
+
+@pytest.mark.parametrize("spec,target", NAMESERVER_SPECS)
+def test_nameserver_target_parses_core_spec_forms(spec, target):
+    from seer_api.ssrf import nameserver_target
+
+    assert nameserver_target(spec) == target
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [
+        "",
+        "   ",
+        "8.8.8.8 extra",
+        "ftp://1.1.1.1",
+        "tls://1.1.1.1/dns-query",
+        "https://user:pw@dns.google/dns-query",
+        "[::1",
+        "[not-v6]",
+        "[::1]53",
+        "dns.google:0",
+        "dns.google:99999",
+        "dns.google:+53",
+        "a:b:c",
+        ":53",
+    ],
+)
+def test_nameserver_target_returns_none_for_malformed_specs(spec):
+    """Malformed specs are left for the core to reject (Invalid input -> 400)."""
+    from seer_api.ssrf import nameserver_target
+
+    assert nameserver_target(spec) is None
+
+
+def _record_validator(monkeypatch):
+    """Replace the SSRF validator with one that records (host, port) and
+    accepts — keeps hostname specs hermetic (no DNS resolution)."""
+    import seer as seer_mod
+
+    checked: list[tuple[str, int]] = []
+    monkeypatch.setattr(
+        seer_mod,
+        "validate_public_host",
+        lambda host, port: checked.append((host, port)),
+        raising=False,
+    )
+    return checked
+
+
+@pytest.mark.parametrize("spec,target", NAMESERVER_SPECS)
+def test_dns_route_accepts_every_nameserver_spec_form(monkeypatch, client, spec, target):
+    """Regression: the API guard treated the whole spec as a hostname, so
+    `tls://`, `https://`, `host:port` and bracketed-IPv6 nameservers — all
+    supported by the core — were refused with 400 before reaching it."""
+    import seer as seer_mod
+
+    checked = _record_validator(monkeypatch)
+    seen: dict = {}
+
+    def _dig(domain, record_type, nameserver):
+        seen["nameserver"] = nameserver
+        return []
+
+    monkeypatch.setattr(seer_mod, "dig", _dig, raising=False)
+    resp = client.get("/dns/example.com/A", params={"nameserver": spec})
+    assert resp.status_code == 200, (spec, resp.text)
+    assert checked == [target]
+    # The core still receives the original spec (it parses it itself).
+    assert seen["nameserver"] == spec
+
+
+def test_dns_compare_accepts_nameserver_spec_forms(monkeypatch, client):
+    import seer as seer_mod
+
+    checked = _record_validator(monkeypatch)
+    seen: dict = {}
+
+    def _compare(domain, record_type, server_a, server_b):
+        seen["servers"] = (server_a, server_b)
+        return {"ok": True}
+
+    monkeypatch.setattr(seer_mod, "dns_compare", _compare, raising=False)
+    resp = client.get(
+        "/dns/compare/example.com",
+        params={"server_a": "tls://1.1.1.1", "server_b": "https://dns.google/dns-query"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert checked == [("1.1.1.1", 853), ("dns.google", 443)]
+    assert seen["servers"] == ("tls://1.1.1.1", "https://dns.google/dns-query")
+
+
+RESERVED_NAMESERVER_SPECS = [
+    "tls://127.0.0.1",
+    "127.0.0.1:5353",
+    "[::1]",
+    "[::1]:53",
+    "https://169.254.169.254/dns-query",
+    "https://10.0.0.1:8443/dns-query",
+]
+
+
+@pytest.mark.parametrize("spec", RESERVED_NAMESERVER_SPECS)
+def test_dns_route_refuses_reserved_nameserver_in_any_spec_form(monkeypatch, client, spec):
+    """Parsing the spec must not open a hole: a reserved address behind any
+    transport prefix / port / brackets is still a sanitized 400."""
+    import seer as seer_mod
+
+    def _never(*_a, **_kw):
+        raise AssertionError("seer.dig reached with a reserved nameserver")
+
+    monkeypatch.setattr(seer_mod, "dig", _never, raising=False)
+    resp = client.get("/dns/example.com/A", params={"nameserver": spec})
+    assert resp.status_code == 400, (spec, resp.status_code, resp.text)
+    assert "reserved" in resp.json()["detail"].lower()
+
+    monkeypatch.setattr(seer_mod, "dns_compare", _never, raising=False)
+    resp = client.get(
+        "/dns/compare/example.com", params={"server_a": "1.1.1.1", "server_b": spec}
+    )
+    assert resp.status_code == 400, (spec, resp.status_code, resp.text)
+    assert "reserved" in resp.json()["detail"].lower()
+
+
+def test_malformed_nameserver_spec_rejected_by_core_with_400(client):
+    """A spec the API layer can't parse is passed through; the core's own
+    parser rejects it as Invalid input -> 400 (needs the real binding)."""
+    pytest.importorskip("seer._seer")
+    resp = client.get("/dns/example.com/A", params={"nameserver": "ftp://1.1.1.1"})
+    assert resp.status_code == 400, resp.text
+    assert "invalid input" in resp.json()["detail"].lower()
+
+
+def test_mcp_nameserver_spec_forms(monkeypatch):
+    """seer_dig / seer_dns_compare share the spec-aware guard."""
+    import asyncio
+
+    import seer as seer_mod
+    from seer_api.mcp.server import execute_tool
+
+    checked = _record_validator(monkeypatch)
+    monkeypatch.setattr(seer_mod, "dig", lambda *a: {"ok": True}, raising=False)
+    monkeypatch.setattr(seer_mod, "dns_compare", lambda *a: {"ok": True}, raising=False)
+
+    asyncio.run(
+        execute_tool("seer_dig", {"domain": "example.com", "nameserver": "tls://1.1.1.1"})
+    )
+    asyncio.run(
+        execute_tool(
+            "seer_dns_compare",
+            {
+                "domain": "example.com",
+                "server_a": "9.9.9.9:5353",
+                "server_b": "https://cloudflare-dns.com/dns-query",
+            },
+        )
+    )
+    assert checked == [("1.1.1.1", 853), ("9.9.9.9", 5353), ("cloudflare-dns.com", 443)]
+
+
+@pytest.mark.parametrize("spec", RESERVED_NAMESERVER_SPECS)
+def test_mcp_refuses_reserved_nameserver_in_any_spec_form(spec):
+    import asyncio
+
+    from seer_api.mcp.server import execute_tool
+
+    with pytest.raises(ValueError, match="reserved"):
+        asyncio.run(
+            execute_tool("seer_dig", {"domain": "example.com", "nameserver": spec})
+        )
+    with pytest.raises(ValueError, match="reserved"):
+        asyncio.run(
+            execute_tool(
+                "seer_dns_compare",
+                {"domain": "example.com", "server_a": spec, "server_b": "1.1.1.1"},
+            )
+        )
+
+
 @pytest.mark.parametrize(
     "path,body",
     [

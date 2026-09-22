@@ -25,6 +25,7 @@ import seer
 
 from .. import __version__
 from .._run import run_seer
+from ..ssrf import nameserver_target
 
 
 def _ssrf_guard(host: str, port: int = 443) -> None:
@@ -38,6 +39,20 @@ def _ssrf_guard(host: str, port: int = 443) -> None:
         seer.validate_public_host(host, port)
     except ValueError as exc:
         raise ValueError(str(exc)) from exc
+
+
+def _guard_nameserver(spec: str) -> None:
+    """:func:`_ssrf_guard` the host a nameserver spec connects to.
+
+    Mirrors ``seer_api.ssrf.guard_nameserver_async``: the argument is a spec
+    (``8.8.8.8``, ``9.9.9.9:5353``, ``tls://1.1.1.1``,
+    ``https://cloudflare-dns.com/dns-query``), not a hostname. A malformed
+    spec is left for the core to reject with its own ``Invalid input``.
+    """
+    target = nameserver_target(spec)
+    if target is not None:
+        _ssrf_guard(*target)
+
 
 # Configure root logging to INFO so operational milestones are visible.
 # Host environments can override via standard Python logging config.
@@ -970,7 +985,7 @@ async def execute_tool(name: str, arguments: dict[str, Any]) -> Any:
             if nameserver is not None and not isinstance(nameserver, str):
                 raise ValueError(f"'nameserver' must be a string (got {type(nameserver).__name__})")
             if nameserver is not None:
-                await run_seer(_ssrf_guard, nameserver, 53)
+                await run_seer(_guard_nameserver, nameserver)
             return await run_seer(
                 seer.dig, domain, record_type, nameserver
             )
@@ -1116,9 +1131,9 @@ async def execute_tool(name: str, arguments: dict[str, Any]) -> Any:
             record_type = _require_record_type(arguments)
             server_a = _require_str(arguments, "server_a")
             server_b = _require_str(arguments, "server_b")
-            # Both servers are actual connect targets (port 53).
-            await run_seer(_ssrf_guard, server_a, 53)
-            await run_seer(_ssrf_guard, server_b, 53)
+            # Both servers are actual connect targets (nameserver specs).
+            await run_seer(_guard_nameserver, server_a)
+            await run_seer(_guard_nameserver, server_b)
             return await run_seer(seer.dns_compare, domain, record_type, server_a, server_b)
 
         case "seer_diff":

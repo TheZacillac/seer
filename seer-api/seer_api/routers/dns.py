@@ -9,7 +9,7 @@ import seer
 from seer_api._run import run_seer
 from seer_api.errors import http_error
 from seer_api.limiting import limiter
-from seer_api.ssrf import guard_async as ssrf_guard_async
+from seer_api.ssrf import guard_nameserver_async
 from seer_api.streaming import stream_bulk
 
 router = APIRouter()
@@ -41,9 +41,10 @@ async def dns_compare(
     record_type: str = Query("A", max_length=10, pattern=r"^[A-Z0-9]+$"),
 ):
     """Compare DNS records for a domain across two nameservers."""
-    # Both servers are actual connect targets (port 53), so guard them.
-    await ssrf_guard_async(server_a, 53)
-    await ssrf_guard_async(server_b, 53)
+    # Both servers are actual connect targets, so guard them. Each is a
+    # nameserver spec (UDP / tls:// / https://), not a bare hostname.
+    await guard_nameserver_async(server_a)
+    await guard_nameserver_async(server_b)
     try:
         return await run_seer(seer.dns_compare, domain, record_type, server_a, server_b)
     except Exception as e:
@@ -70,9 +71,10 @@ async def dns_lookup(
         List of DNS records
     """
     # Guard the nameserver (it's the actual connect target) but NOT the
-    # queried domain — the domain is a DNS question, not a destination.
+    # queried domain — the domain is a DNS question, not a destination. The
+    # nameserver is a spec (UDP / tls:// / https://), not a bare hostname.
     if nameserver is not None:
-        await ssrf_guard_async(nameserver, 53)
+        await guard_nameserver_async(nameserver)
     try:
         return await run_seer(seer.dig, domain, record_type, nameserver)
     except Exception as e:
