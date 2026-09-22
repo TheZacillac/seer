@@ -69,9 +69,9 @@ const PRIMARY_RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
 /// (100.64/10), IETF 192.0.0.0/24, benchmark (198.18/15), and class-E
 /// (240/4); and for IPv6: loopback, multicast, unspecified, ULA (fc00::/7),
 /// link-local (fe80::/10), site-local (fec0::/10), documentation
-/// (2001:db8::/32), 6to4 (2002::/16),
-/// NAT64 (64:ff9b::/96), and the IPv4-mapped/-compatible forms (re-checking
-/// the embedded IPv4).
+/// (2001:db8::/32), 6to4 (2002::/16), Teredo (2001::/32),
+/// NAT64 (64:ff9b::/96 and 64:ff9b:1::/48), and the IPv4-mapped, SIIT
+/// IPv4-translated, and IPv4-compatible forms (re-checking the embedded IPv4).
 pub fn is_reserved_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {

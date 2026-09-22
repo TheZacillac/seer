@@ -34,23 +34,6 @@ const EC_MIN_KEY_BITS: u32 = 256;
 /// Days-until-expiry threshold below which a still-valid cert is flagged.
 const CERT_EXPIRING_SOON_DAYS: i64 = 30;
 
-/// Whole days from `now` until `when`, where any instant already in the past
-/// is at least `-1`.
-///
-/// `TimeDelta::num_days` truncates toward zero, so a certificate that expired
-/// five hours ago would read as `0` ("expires in 0 days") and slip past every
-/// `< 0` expired check. Plain flooring fixes the sign but overstates the age
-/// ("expired 2 days ago" at 25 hours), so whole elapsed days are kept and only
-/// the sub-day case is pushed to `-1`.
-pub(crate) fn days_until(when: DateTime<Utc>, now: DateTime<Utc>) -> i64 {
-    let days = (when - now).num_days();
-    if days == 0 && when < now {
-        -1
-    } else {
-        days
-    }
-}
-
 /// Derives security-posture [`CertWarning`]s from an already-parsed leaf
 /// certificate plus the computed validity/hostname signals. Pure — no network
 /// calls — so it is unit-testable in isolation.
@@ -359,7 +342,7 @@ impl SslChecker {
         let leaf_detail = parse_cert_detail(&x509)?;
 
         let now = Utc::now();
-        let days_until_expiry = days_until(leaf_detail.valid_until, now);
+        let days_until_expiry = crate::dates::days_until(leaf_detail.valid_until, now);
         let is_valid = now >= leaf_detail.valid_from && now <= leaf_detail.valid_until;
 
         // Hostname verification: does the leaf cert's SAN (or CN fallback)
@@ -712,28 +695,13 @@ mod tests {
     }
 
     #[test]
-    fn days_until_floors_so_recent_expiry_is_negative() {
+    fn a_just_expired_cert_is_reported_expired_not_not_yet_valid() {
         let now = Utc::now();
-        // Expired five hours ago: truncation used to report 0 ("expires in 0
-        // days") and the expired branch never fired.
-        assert_eq!(days_until(now - chrono::Duration::hours(5), now), -1);
-        assert_eq!(days_until(now + chrono::Duration::hours(5), now), 0);
-        assert_eq!(days_until(now, now), 0);
-        assert_eq!(days_until(now + chrono::Duration::days(3), now), 3);
-        assert_eq!(days_until(now - chrono::Duration::days(3), now), -3);
-        // 25 hours ago is one whole day ago, not two.
-        assert_eq!(days_until(now - chrono::Duration::hours(25), now), -1);
-        assert_eq!(days_until(now - chrono::Duration::hours(49), now), -2);
-
-        let w = derive_cert_warnings(
-            &sample_leaf(),
-            false,
-            true,
-            days_until(now - chrono::Duration::hours(5), now),
-        );
+        let days = crate::dates::days_until(now - chrono::Duration::hours(5), now);
+        let w = derive_cert_warnings(&sample_leaf(), false, true, days);
         assert!(
             w.iter().any(|x| x.message.contains("expired 1 day(s) ago")),
-            "a just-expired cert must not be reported as not-yet-valid: {w:?}"
+            "a just-expired cert must be reported expired: {w:?}"
         );
         assert!(!w.iter().any(|x| x.message.contains("not yet valid")));
     }

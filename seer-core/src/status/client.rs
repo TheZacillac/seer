@@ -327,7 +327,7 @@ impl StatusClient {
                 let (expiration_date, registrar) = result.expiration_info();
 
                 if let Some(exp_date) = expiration_date {
-                    let days_until_expiry = crate::ssl::days_until(exp_date, Utc::now());
+                    let days_until_expiry = crate::dates::days_until(exp_date, Utc::now());
                     Ok(Some(DomainExpiration {
                         expiration_date: exp_date,
                         days_until_expiry,
@@ -490,7 +490,7 @@ fn parse_certificate_der(der: &[u8], domain: &str) -> Result<CertificateInfo> {
     let valid_until = asn1_time_to_chrono(cert.validity().not_after)?;
 
     let now = Utc::now();
-    let days_until_expiry = crate::ssl::days_until(valid_until, now);
+    let days_until_expiry = crate::dates::days_until(valid_until, now);
     let is_valid = now >= valid_from && now <= valid_until;
 
     // Hostname verification is performed manually because the TLS connector

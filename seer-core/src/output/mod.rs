@@ -10,19 +10,11 @@ pub use markdown::MarkdownFormatter;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-/// Whole days from now until `when`, rounded toward negative infinity.
-///
-/// `TimeDelta::num_days` truncates toward zero, so an expiry anywhere from
-/// 1s to 23.9h in the past yielded `0` and rendered as "expires in 0 days!"
-/// instead of expired. Flooring makes any instant in the past negative (at
-/// least one day ago) while a later-today expiry stays `0`.
+/// Whole days from now until `when` — see [`crate::dates::days_until`]: an
+/// expiry any time in the past is negative, so it never renders as
+/// "expires in 0 days!".
 fn days_until(when: DateTime<Utc>) -> i64 {
-    days_between(Utc::now(), when)
-}
-
-/// Floored whole days from `now` to `when` (see [`days_until`]).
-fn days_between(now: DateTime<Utc>, when: DateTime<Utc>) -> i64 {
-    (when - now).num_seconds().div_euclid(86_400)
+    crate::dates::days_until(when, Utc::now())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -361,21 +353,6 @@ mod tests {
             OutputFormat::Human
         );
         assert!("invalid".parse::<OutputFormat>().is_err());
-    }
-
-    #[test]
-    fn days_between_floors_instead_of_truncating() {
-        let now: DateTime<Utc> = "2026-01-10T12:00:00Z".parse().unwrap();
-        let h = chrono::Duration::hours;
-        // 5h in the past is already expired (-1), not "0 days" left.
-        assert_eq!(days_between(now, now - h(5)), -1);
-        // 5h in the future is still today.
-        assert_eq!(days_between(now, now + h(5)), 0);
-        assert_eq!(days_between(now, now), 0);
-        assert_eq!(days_between(now, now - chrono::Duration::seconds(1)), -1);
-        assert_eq!(days_between(now, now + h(24)), 1);
-        assert_eq!(days_between(now, now - h(24)), -1);
-        assert_eq!(days_between(now, now - h(25)), -2);
     }
 
     #[test]

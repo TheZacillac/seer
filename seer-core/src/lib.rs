@@ -5,6 +5,7 @@ pub mod cache;
 pub mod colors;
 pub mod config;
 pub mod confusables;
+mod dates;
 pub mod diff;
 pub mod dns;
 pub mod doctor;
