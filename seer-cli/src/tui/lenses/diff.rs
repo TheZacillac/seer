@@ -30,9 +30,7 @@ pub fn render(
     focused: bool,
     state: &LensState,
 ) {
-    let block = panel::block(theme, "Diff", theme.yellow, focused);
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let inner = panel::render(f, area, theme, "Diff", theme.yellow, focused);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)

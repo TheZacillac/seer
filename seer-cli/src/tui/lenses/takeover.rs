@@ -13,7 +13,7 @@ use seer_core::TakeoverVerdict;
 
 use crate::tui::action::LensData;
 use crate::tui::theme::Theme;
-use crate::tui::widgets::{panel, scroll_to};
+use crate::tui::widgets::{panel, row_style, scroll_to};
 
 fn verdict_tone(v: TakeoverVerdict) -> &'static str {
     match v {
@@ -56,9 +56,7 @@ pub fn render(
         "Takeover · {} checked · {} vulnerable · {} potential",
         t.hosts_checked, t.vulnerable, t.potential
     );
-    let block = panel::block(theme, &title, accent, focused);
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let inner = panel::render(f, area, theme, &title, accent, focused);
 
     if t.findings.is_empty() {
         let msg = if t.hosts_checked == 0 {
@@ -90,11 +88,7 @@ pub fn render(
         .style(Style::default().fg(theme.overlay0));
 
     let rows = t.findings.iter().enumerate().map(|(i, finding)| {
-        let base = if focused && i == sel {
-            Style::default().fg(theme.text).bg(theme.surface0)
-        } else {
-            Style::default().fg(theme.text)
-        };
+        let base = row_style(theme, focused && i == sel);
         Row::new(vec![
             Span::styled(finding.host.clone(), base),
             Span::styled(

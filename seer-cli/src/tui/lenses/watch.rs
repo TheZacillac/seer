@@ -7,7 +7,7 @@ use ratatui::Frame;
 
 use crate::tui::action::LensData;
 use crate::tui::theme::Theme;
-use crate::tui::widgets::{panel, scroll_to};
+use crate::tui::widgets::{panel, row_style, scroll_to};
 
 pub fn render(
     f: &mut Frame,
@@ -31,9 +31,7 @@ pub fn render(
         .split(area);
 
     // Summary bar
-    let summary_block = panel::block(theme, "Watchlist", theme.yellow, false);
-    let summary_inner = summary_block.inner(chunks[0]);
-    f.render_widget(summary_block, chunks[0]);
+    let summary_inner = panel::render(f, chunks[0], theme, "Watchlist", theme.yellow, false);
     f.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(
@@ -49,9 +47,7 @@ pub fn render(
     );
 
     // Results table
-    let block = panel::block(theme, "Domains", theme.yellow, focused);
-    let inner = block.inner(chunks[1]);
-    f.render_widget(block, chunks[1]);
+    let inner = panel::render(f, chunks[1], theme, "Domains", theme.yellow, focused);
 
     let header = Row::new(["DOMAIN", "EXPIRES(d)", "SSL(d)", "HTTP", "⚑"])
         .style(Style::default().fg(theme.overlay0));
@@ -82,12 +78,7 @@ pub fn render(
             _ => theme.text,
         };
 
-        let base_style = if focused && i == sel {
-            Style::default().fg(theme.text).bg(theme.surface0)
-        } else {
-            Style::default().fg(theme.text)
-        };
-
+        let base_style = row_style(theme, focused && i == sel);
         Row::new(vec![
             ratatui::text::Text::from(Span::styled(r.domain.clone(), base_style)),
             ratatui::text::Text::from(Span::styled(expires, Style::default().fg(expires_color))),

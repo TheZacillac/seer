@@ -1,6 +1,6 @@
 //! DNS Records lens — Records tab (tab 0), DNSSEC tab (tab 1), Compare tab (tab 2).
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Row, Table};
 use ratatui::Frame;
@@ -9,7 +9,7 @@ use crate::tui::action::LensData;
 use crate::tui::lenses::{compare, dnssec};
 use crate::tui::panes::Panes;
 use crate::tui::theme::Theme;
-use crate::tui::widgets::{panel, scroll_to};
+use crate::tui::widgets::{panel, row_style, scroll_to};
 
 /// Nameserver labels matching `panes/dns.rs` NAMESERVERS order.
 const NS_LABELS: &[&str] = &["system", "8.8.8.8", "1.1.1.1"];
@@ -37,9 +37,7 @@ pub fn render(
     // Tab 0: Records
     let LensData::Dns(records) = data else { return };
     let title = format!("dig · {} records", panes.dns.record_type);
-    let block = panel::block(theme, &title, theme.sky, focused);
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let inner = panel::render(f, area, theme, &title, theme.sky, focused);
 
     // Layout: nameserver chips (1 line) + hint (1 line) + table
     let chunks = Layout::default()
@@ -80,18 +78,13 @@ pub fn render(
     let header =
         Row::new(["TYPE", "NAME", "DATA", "TTL"]).style(Style::default().fg(theme.overlay0));
     let rows = records.iter().enumerate().map(|(i, r)| {
-        let style = if focused && i == sel {
-            Style::default().fg(theme.text).bg(theme.surface0)
-        } else {
-            Style::default().fg(theme.text)
-        };
         Row::new(vec![
             r.record_type.to_string(),
             r.name.clone(),
             r.format_short(),
             r.ttl.to_string(),
         ])
-        .style(style)
+        .style(row_style(theme, focused && i == sel))
     });
     let table = Table::new(
         rows,
@@ -103,8 +96,7 @@ pub fn render(
         ],
     )
     .header(header)
-    .column_spacing(1)
-    .style(Style::default().add_modifier(Modifier::empty()));
+    .column_spacing(1);
     let mut state = scroll_to(focused.then_some(sel));
     f.render_stateful_widget(table, chunks[2], &mut state);
 }

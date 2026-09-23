@@ -11,9 +11,7 @@ use ratatui::widgets::Paragraph;
 
 pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
     let LensData::Ssl(s) = data else { return };
-    let block = panel::block(theme, "Certificate", theme.green, false);
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let inner = panel::render(f, area, theme, "Certificate", theme.green, false);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)

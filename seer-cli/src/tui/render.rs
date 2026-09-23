@@ -260,9 +260,7 @@ fn main_pane(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             return;
         }
         LensState::Error(e) => {
-            let block = panel::block(theme, lens.label, theme.red, false);
-            let inner = block.inner(content);
-            f.render_widget(block, content);
+            let inner = panel::render(f, content, theme, lens.label, theme.red, false);
             f.render_widget(
                 Paragraph::new(Line::from(Span::styled(
                     e.clone(),
@@ -295,9 +293,7 @@ fn main_pane(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         if let LensState::Loaded(data) = app.state_of(app.lens) {
             let text = crate::payload::serialize(data, app.format);
             let raw_title = format!("{} · raw", lens.label);
-            let block = panel::block(theme, &raw_title, theme.green, false);
-            let inner = block.inner(content);
-            f.render_widget(block, content);
+            let inner = panel::render(f, content, theme, &raw_title, theme.green, false);
             f.render_widget(
                 Paragraph::new(text).style(Style::default().fg(theme.subtext)),
                 inner,
@@ -489,9 +485,7 @@ fn help_overlay(f: &mut Frame, area: Rect, theme: &Theme) {
         Block::default().style(Style::default().bg(theme.base).fg(theme.text)),
         popup,
     );
-    let block = panel::block(theme, "keybindings", theme.lavender, true);
-    let inner = block.inner(popup);
-    f.render_widget(block, popup);
+    let inner = panel::render(f, popup, theme, "keybindings", theme.lavender, true);
     let lines: Vec<Line> = rows
         .iter()
         .map(|(k, t)| {

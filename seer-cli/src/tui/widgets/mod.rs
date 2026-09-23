@@ -4,7 +4,26 @@ pub mod gauge;
 pub mod kv;
 pub mod panel;
 
+use ratatui::style::Style;
 use ratatui::widgets::TableState;
+
+use crate::tui::theme::Theme;
+
+/// Style for one row of a selectable list: body text, on the `surface0`
+/// selection band when `selected`.
+///
+/// Applied per row rather than via `Table::row_highlight_style`: ratatui clamps
+/// an out-of-range selection to the last row, so a stale `sel` (e.g. after a
+/// refresh shrank the list) would highlight a row the App doesn't consider
+/// selected.
+pub fn row_style(theme: &Theme, selected: bool) -> Style {
+    let style = Style::default().fg(theme.text);
+    if selected {
+        style.bg(theme.surface0)
+    } else {
+        style
+    }
+}
 
 /// Build a `TableState` that keeps `selected` in view.
 ///

@@ -13,9 +13,7 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
     let LensData::Reverse(records) = data else {
         return;
     };
-    let block = panel::block(theme, "Reverse DNS · PTR", theme.sapphire, false);
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let inner = panel::render(f, area, theme, "Reverse DNS · PTR", theme.sapphire, false);
 
     if records.is_empty() {
         f.render_widget(

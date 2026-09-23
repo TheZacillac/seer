@@ -9,7 +9,7 @@ use crate::tui::app::SPIN;
 use crate::tui::line_editor::LineEditor;
 use crate::tui::panes::bulk::{BulkState, OPS};
 use crate::tui::theme::Theme;
-use crate::tui::widgets::{dot, gauge, panel, scroll_to};
+use crate::tui::widgets::{dot, gauge, panel, row_style, scroll_to};
 
 pub fn render(
     f: &mut Frame,
@@ -26,9 +26,7 @@ pub fn render(
 
     // ── top panel: op chips + domains + gauge + hints ────────────────────────
     let top_title = format!("Bulk  ·  {}", bulk.op());
-    let top_block = panel::block(theme, &top_title, theme.mauve, false);
-    let top_inner = top_block.inner(rows[0]);
-    f.render_widget(top_block, rows[0]);
+    let top_inner = panel::render(f, rows[0], theme, &top_title, theme.mauve, false);
 
     // Op chip row — highlight the selected op
     let op_chips: Line = {
@@ -156,9 +154,7 @@ pub fn render(
 
     // The op the rows were produced with — `o` only selects the NEXT run's op.
     let results_title = format!("Results  ·  seer bulk {}", bulk.results_op());
-    let results_block = panel::block(theme, &results_title, theme.mauve, false);
-    let results_inner = results_block.inner(table_area);
-    f.render_widget(results_block, table_area);
+    let results_inner = panel::render(f, table_area, theme, &results_title, theme.mauve, false);
 
     if bulk.rows.is_empty() {
         f.render_widget(
@@ -187,12 +183,6 @@ pub fn render(
         } else {
             dot::line(theme, "fail", "●")
         };
-        // Highlight the selected row so j/k navigation is visible.
-        let row_style = if Some(i) == selected {
-            Style::default().fg(theme.text).bg(theme.surface0)
-        } else {
-            Style::default().fg(theme.text)
-        };
         Row::new(vec![
             Line::from(domain),
             Line::from(Span::styled(
@@ -201,7 +191,8 @@ pub fn render(
             )),
             flag,
         ])
-        .style(row_style)
+        // Highlight the selected row so j/k navigation is visible.
+        .style(row_style(theme, Some(i) == selected))
     });
 
     let table = Table::new(
@@ -224,9 +215,7 @@ pub fn render(
     // ── detail panel for the selected row ────────────────────────────────────
     if let (Some(area), Some(idx)) = (detail_area, selected) {
         if let Some(row) = bulk.rows.get(idx) {
-            let detail_block = panel::block(theme, "Detail", theme.sky, false);
-            let detail_inner = detail_block.inner(area);
-            f.render_widget(detail_block, area);
+            let detail_inner = panel::render(f, area, theme, "Detail", theme.sky, false);
             f.render_widget(
                 Paragraph::new(detail_lines(theme, row))
                     .wrap(ratatui::widgets::Wrap { trim: false }),

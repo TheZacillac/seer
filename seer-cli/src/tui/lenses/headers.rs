@@ -40,9 +40,7 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
     let LensData::Headers(h) = data else { return };
 
     let title = format!("HTTP Headers · {} · {}/100", h.grade, h.score);
-    let block = panel::block(theme, &title, theme.mauve, false);
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let inner = panel::render(f, area, theme, &title, theme.mauve, false);
 
     let cookie_rows = if h.cookies.is_empty() { 0 } else { 1 };
     // Advisories get whatever vertical space is left, so a long list scrolls

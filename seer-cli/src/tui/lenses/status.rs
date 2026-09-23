@@ -11,9 +11,7 @@ use crate::tui::widgets::{kv, panel};
 
 pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
     let LensData::Status(s) = data else { return };
-    let block = panel::block(theme, "HTTP Health", theme.green, false);
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let inner = panel::render(f, area, theme, "HTTP Health", theme.green, false);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)

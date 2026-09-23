@@ -35,9 +35,7 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, tab: usize, data: &LensD
         1 => theme.blue,
         _ => theme.mauve,
     };
-    let block = panel::block(theme, title, accent, false);
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let inner = panel::render(f, area, theme, title, accent, false);
     f.render_widget(
         Paragraph::new(Line::from(vec![Span::styled(
             hint_text,
@@ -48,9 +46,7 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, tab: usize, data: &LensD
 }
 
 fn render_domain(f: &mut Frame, area: Rect, theme: &Theme, r: &seer_core::RdapResponse) {
-    let block = panel::block(theme, "RDAP Object · domain", theme.mauve, false);
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let inner = panel::render(f, area, theme, "RDAP Object · domain", theme.mauve, false);
 
     let dash = || "—".to_string();
     let delegation = r
@@ -72,9 +68,7 @@ fn render_domain(f: &mut Frame, area: Rect, theme: &Theme, r: &seer_core::RdapRe
 }
 
 fn render_ip(f: &mut Frame, area: Rect, theme: &Theme, r: &seer_core::RdapResponse) {
-    let block = panel::block(theme, "RDAP Object · IP", theme.blue, false);
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let inner = panel::render(f, area, theme, "RDAP Object · IP", theme.blue, false);
 
     let dash = || "—".to_string();
     let rows: Vec<(String, String)> = vec![
@@ -103,9 +97,7 @@ fn render_ip(f: &mut Frame, area: Rect, theme: &Theme, r: &seer_core::RdapRespon
 }
 
 fn render_asn(f: &mut Frame, area: Rect, theme: &Theme, r: &seer_core::RdapResponse) {
-    let block = panel::block(theme, "RDAP Object · ASN", theme.lavender, false);
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let inner = panel::render(f, area, theme, "RDAP Object · ASN", theme.lavender, false);
 
     let dash = || "—".to_string();
     let rows: Vec<(String, String)> = vec![

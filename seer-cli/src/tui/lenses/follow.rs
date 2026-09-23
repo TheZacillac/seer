@@ -26,9 +26,7 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, follow: &FollowState, sp
         .map(|(_, secs)| secs)
         .unwrap_or(follow.interval_secs);
     let top_title = format!("Follow  ·  {interval}s interval  ·  {total} checks");
-    let top_block = panel::block(theme, &top_title, theme.teal, false);
-    let top_inner = top_block.inner(rows[0]);
-    f.render_widget(top_block, rows[0]);
+    let top_inner = panel::render(f, rows[0], theme, &top_title, theme.teal, false);
 
     let ratio = if total > 0 {
         (follow.log.len() as f64 / total as f64).min(1.0)
@@ -64,9 +62,7 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, follow: &FollowState, sp
     f.render_widget(top_para, top_inner);
 
     // ── bottom panel: change log table ──────────────────────────────────────
-    let log_block = panel::block(theme, "Change Log", theme.teal, false);
-    let log_inner = log_block.inner(rows[1]);
-    f.render_widget(log_block, rows[1]);
+    let log_inner = panel::render(f, rows[1], theme, "Change Log", theme.teal, false);
 
     if follow.log.is_empty() {
         f.render_widget(

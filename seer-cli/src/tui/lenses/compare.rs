@@ -20,9 +20,7 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
         "compare · {} · A {} vs B {}",
         c.domain, c.server_a.nameserver, c.server_b.nameserver
     );
-    let block = panel::block(theme, &title, theme.sky, false);
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let inner = panel::render(f, area, theme, &title, theme.sky, false);
 
     // Layout: summary line + hint + table
     let chunks = Layout::default()

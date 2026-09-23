@@ -9,9 +9,7 @@ use crate::tui::widgets::{kv, panel};
 pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
     let LensData::Whois(w) = data else { return };
     let title = format!("WHOIS · {}", w.whois_server);
-    let block = panel::block(theme, &title, theme.peach, false);
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let inner = panel::render(f, area, theme, &title, theme.peach, false);
 
     let dash = || "—".to_string();
     let rows: Vec<(String, String)> = vec![

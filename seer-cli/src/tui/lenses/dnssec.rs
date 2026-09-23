@@ -22,9 +22,7 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
         theme.red
     };
 
-    let block = panel::block(theme, "DNSSEC", status_color, false);
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let inner = panel::render(f, area, theme, "DNSSEC", status_color, false);
 
     // Split: status header + kv + issues + DS table
     let has_ds = !r.ds_records.is_empty();
@@ -82,9 +80,7 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
     // DS records table
     if has_ds {
         let ds_area = chunks[chunks.len() - 1];
-        let block2 = panel::block(theme, "DS Records", theme.overlay0, false);
-        let inner2 = block2.inner(ds_area);
-        f.render_widget(block2, ds_area);
+        let inner2 = panel::render(f, ds_area, theme, "DS Records", theme.overlay0, false);
 
         let header = Row::new(["KEY TAG", "ALGORITHM", "DIGEST TYPE", "MATCHED"])
             .style(Style::default().fg(theme.overlay0));

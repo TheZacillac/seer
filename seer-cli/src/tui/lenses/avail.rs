@@ -13,9 +13,7 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
     let LensData::Avail(a) = data else {
         return;
     };
-    let block = panel::block(theme, "Availability", theme.peach, false);
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let inner = panel::render(f, area, theme, "Availability", theme.peach, false);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)

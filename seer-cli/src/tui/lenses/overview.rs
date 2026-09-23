@@ -50,9 +50,7 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
         chunks[0],
     );
 
-    let block = panel::block(theme, "Registration", theme.blue, false);
-    let inner = block.inner(chunks[1]);
-    f.render_widget(block, chunks[1]);
+    let inner = panel::render(f, chunks[1], theme, "Registration", theme.blue, false);
 
     let dash = || "—".to_string();
     let (expiry, registrar) = result.expiration_info();

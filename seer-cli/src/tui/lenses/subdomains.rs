@@ -7,7 +7,7 @@ use ratatui::Frame;
 
 use crate::tui::action::LensData;
 use crate::tui::theme::Theme;
-use crate::tui::widgets::{panel, scroll_to};
+use crate::tui::widgets::{panel, row_style, scroll_to};
 
 pub fn render(
     f: &mut Frame,
@@ -22,9 +22,7 @@ pub fn render(
     };
 
     let title = format!("Subdomains · {} via {}", s.count, s.source);
-    let block = panel::block(theme, &title, theme.pink, focused);
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let inner = panel::render(f, area, theme, &title, theme.pink, focused);
 
     if s.subdomains.is_empty() {
         f.render_widget(
@@ -41,14 +39,10 @@ pub fn render(
 
     let header = Row::new(["HOST"]).style(Style::default().fg(theme.overlay0));
 
-    let rows = s.subdomains.iter().enumerate().map(|(i, host)| {
-        let style = if focused && i == sel {
-            Style::default().fg(theme.text).bg(theme.surface0)
-        } else {
-            Style::default().fg(theme.text)
-        };
-        Row::new(vec![host.clone()]).style(style)
-    });
+    let rows =
+        s.subdomains.iter().enumerate().map(|(i, host)| {
+            Row::new(vec![host.clone()]).style(row_style(theme, focused && i == sel))
+        });
 
     let table = Table::new(rows, [Constraint::Percentage(100)])
         .header(header)

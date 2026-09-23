@@ -7,7 +7,7 @@ use ratatui::Frame;
 
 use crate::tui::action::LensData;
 use crate::tui::theme::Theme;
-use crate::tui::widgets::{panel, scroll_to};
+use crate::tui::widgets::{panel, row_style, scroll_to};
 
 /// `filter` is the active in-lens `/`-filter; rows are filtered by reference
 /// (see `filter::history_rows`) so no entry is cloned per frame.
@@ -29,9 +29,7 @@ pub fn render(
         .constraints([Constraint::Min(0), Constraint::Length(1)])
         .split(area);
 
-    let block = panel::block(theme, "Lookup History", theme.teal, focused);
-    let inner = block.inner(chunks[0]);
-    f.render_widget(block, chunks[0]);
+    let inner = panel::render(f, chunks[0], theme, "Lookup History", theme.teal, focused);
 
     let header = Row::new(["WHEN", "DOMAIN", "SOURCE", "REGISTRAR"])
         .style(Style::default().fg(theme.overlay0));
@@ -48,14 +46,8 @@ pub fn render(
                 "—"
             };
             let registrar = e.result.registrar().unwrap_or_else(|| "—".to_string());
-
-            let style = if focused && i == sel {
-                Style::default().fg(theme.text).bg(theme.surface0)
-            } else {
-                Style::default().fg(theme.text)
-            };
-
-            Row::new(vec![when, e.domain.clone(), source.to_string(), registrar]).style(style)
+            Row::new(vec![when, e.domain.clone(), source.to_string(), registrar])
+                .style(row_style(theme, focused && i == sel))
         });
 
     let table = Table::new(

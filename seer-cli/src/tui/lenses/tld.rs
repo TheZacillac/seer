@@ -25,9 +25,7 @@ pub fn render(
     loading: bool,
     editing: Option<&LineEditor>,
 ) {
-    let block = panel::block(theme, "TLD Browser", theme.maroon, false);
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let inner = panel::render(f, area, theme, "TLD Browser", theme.maroon, false);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -112,9 +110,7 @@ pub fn render(
     }
 
     // ── detail ─────────────────────────────────────────────────────────────
-    let detail_block = panel::block(theme, "Registry", theme.maroon, false);
-    let detail_inner = detail_block.inner(chunks[3]);
-    f.render_widget(detail_block, chunks[3]);
+    let detail_inner = panel::render(f, chunks[3], theme, "Registry", theme.maroon, false);
 
     let selected_dotted = list.get(sel).map(|t| format!(".{t}")).unwrap_or_default();
 
