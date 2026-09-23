@@ -394,6 +394,9 @@ results = seer.bulk_availability(["example.com", "google.com"])
 results = seer.bulk_whois(["example.com", "google.com"])
 results = seer.bulk_propagation(["example.com"], record_type="A", concurrency=5)
 
+# bulk_* calls return one dict per domain:
+#   {"operation": {"type": ..., "domain": ...}, "success": bool,
+#    "data": ... or None, "error": str or None, "duration_ms": int}
 # Every bulk_* call takes an optional keyword-only progress callback
 results = seer.bulk_lookup(domains, progress=lambda done, total, domain: print(f"{done}/{total} {domain}"))
 

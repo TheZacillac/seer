@@ -125,15 +125,19 @@ lto = "fat"
 codegen-units = 1
 strip = "symbols"
 
-# The profile that 'dist' will build with (CLI release artifacts only).
+# The profile that 'dist' will build with (release artifacts).
 #
 # LTO is OFF here (unlike [profile.release]): LTO intermediate objects
 # deterministically trip Windows Defender's realtime scan on GitHub's
 # windows-latest runners ("could not write output ... permission denied",
 # identical on two consecutive v0.33.0 attempts), killing the build. The
 # dev/test profiles never trip it. Different codegen → different bytes →
-# no false positive. `cargo install seer-cli` still uses [profile.release].
-# panic = "abort" is safe only here: this profile never builds seer-py.
+# no false positive. `cargo install --path seer-cli` uses [profile.release]
+# (a crates.io `cargo install seer-cli` gets Cargo's default profile).
+# panic = "abort": dist builds the whole workspace but ships only the CLI;
+# the published Python extension comes from maturin with [profile.release],
+# which keeps unwinding. seer-cli's main() installs a panic hook that
+# restores the terminal, since abort skips RawModeGuard's Drop.
 [profile.dist]
 inherits = "release"
 lto = false

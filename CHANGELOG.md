@@ -20,39 +20,54 @@ the way are fixed. Sizes below are measured on Linux (aarch64) against 0.48.0.
 
 ### Changed
 - **Smaller binaries.** The `seer` release binary went from 16.7 MB to
-  10.3 MB (−38%), the prebuilt release artifact from 20.6 MB to 12.3 MB
-  (−40%), and the seer-py extension from 13.1 MB to 8.0 MB (−39%). The
-  release profile is size-optimized (`opt-level = "s"`, fat LTO), prebuilt CLI
-  artifacts abort on panic (the Python extension keeps unwinding), unused
-  dependencies and features were trimmed (the CLI's dependency tree went from
-  257 to 244 crates), and TLS and crypto use one stack: rustls on aws-lc-rs.
+  10.3 MB (−38%), the prebuilt release artifact (as cargo-dist builds it) from
+  21.1 MB to 12.7 MB (−40%), and the seer-py extension from 13.1 MB to 7.8 MB
+  (−40%). The release profile is size-optimized (`opt-level = "s"`, fat LTO),
+  prebuilt CLI artifacts abort on panic (a panic hook still restores the
+  terminal; the Python extension keeps unwinding), unused dependencies and
+  features were trimmed (the CLI's dependency tree went from 257 to 237
+  crates), and TLS and crypto use one stack: rustls on aws-lc-rs.
 - **No OpenSSL.** `seer ssl` and the `status` certificate check use rustls
   instead of OpenSSL/native-tls. Building no longer needs `libssl-dev` or
   `pkg-config`, and on Linux the binary and the Python extension no longer
   link `libssl.so` or `libcrypto.so`. TLS error messages in `ssl`/`status` are
   worded by seer rather than taken from OpenSSL.
 - **Certificate inspection trade-off.** Servers that offer only protocol
-  versions or cipher suites older than TLS 1.2 with AEAD (for example
-  CBC-only servers), or whose certificate key cannot be verified (for example
-  RSA below 2048 bits, or DSA), can no longer be inspected by `seer ssl` or the
-  `status` certificate check. They fail fast with an error that says so.
-- **WHOIS dates:** naive ISO timestamps such as `2023-01-15T10:30:00` now parse
-  as UTC. The `.edu`, `.it`, `.nl` and `.de` parsers use the shared date
-  parser, so some unusual date formats that used to come back empty now parse.
+  versions older than TLS 1.2, or no ECDHE+AEAD cipher suite (for example
+  CBC-only, static-RSA or DHE-only servers, which includes DSA certificates),
+  can no longer be inspected by `seer ssl` or the `status` certificate check.
+  They fail fast with an error that says so. Everything OpenSSL could inspect
+  otherwise still works — X.509 v1 certificates, certificates with unknown
+  critical extensions, RSA keys under 2048 bits (the weak-key warning still
+  fires) — and servers that sign only with Ed448 or SHA-1 are inspected too.
+- **WHOIS and RDAP dates:** naive ISO timestamps such as
+  `2023-01-15T10:30:00` (no UTC offset) now parse as UTC, so RDAP events in
+  that form now show creation/expiry dates in `lookup`, `rdap`, `info`,
+  `status`, `watch` and `diff`. The `.edu`, `.it`, `.nl` and `.de` parsers use
+  the shared date parser, so some unusual date formats that used to come back
+  empty now parse.
 - **MCP** tool results are compact JSON (about 40% fewer characters).
 - **REPL:** completion is case-insensitive and includes `propagation`; `help`
   lists every command (including `lookup` and `help`) and all 16 record types;
   typing hints match the help usage; `copy` after `subdomains --diff` copies
   the diff that was shown; `bulk -h` lists operations from the same catalog as
   `seer bulk --help`. Bulk operation lists now appear in one order everywhere,
-  with aliases noted in the descriptions.
+  with aliases noted in the descriptions. REPL error and usage text now
+  matches the CLI: no `Info failed:` prefix, `set` shows
+  `Usage: set output <human|json|yaml|markdown>`, watchlist/history save
+  errors and output-file errors name the path; an empty `history` suggests
+  running `lookup`; watch/history confirmations color the domain; REPL bulk
+  runs use the CLI's progress bar; and `bulk -h` points to `seer bulk --help`
+  for the CSV columns.
 - **CLI:** `watch`/`history` save failures are reported through the normal
   error path (structured under `--format json`, still exit 1).
 - **Python:** `seer.rdap` is now the same function as `seer.rdap_auto`, and
   the Rust log bridge is installed when the module is imported.
 - **seer-api dependencies:** `orjson` and the `uvicorn[standard]` extras
   (`python-dotenv`, `pyyaml`, `watchfiles`, `websockets`) are dropped; `uvloop`
-  and `httptools` are declared directly. OpenAPI request models are now named
+  and `httptools` are declared directly. seer-api now needs seer bindings built
+  from the same checkout (for `seer.nameserver_target`); with older bindings,
+  nameserver requests return 503 and log why. OpenAPI request models are now named
   `BulkRequest`, `BulkRecordRequest` and `BulkPropagationRequest`.
 - **Packaging and docs:** crates.io now shows the root README for `seer-core`
   and `seer-cli` (the stale per-package READMEs are gone), the `seer-core`
@@ -67,7 +82,10 @@ the way are fixed. Sizes below are measured on Linux (aarch64) against 0.48.0.
   `tracing-subscriber`, `tracing-appender` or `colored`. The Python extension
   is built this way.
 - The `dirs` dependency is replaced by `std::env::home_dir()`, and rustyline
-  is built with file history only (4 fewer crates).
+  is built with file history only (7 fewer crates together).
+- **`seer doctor`:** the RDAP-bootstrap check now fetches exactly like the real
+  bootstrap load — it no longer follows redirects (a 3xx now reports FAIL) and
+  caps the response at 10 MB.
 
 ### Added
 - `seer.nameserver_target(spec)` in the Python bindings: the `(host, port)` a
@@ -98,9 +116,10 @@ the way are fixed. Sizes below are measured on Linux (aarch64) against 0.48.0.
   This affects `dig`, `compare`, `follow`, the config-file nameserver, the
   REPL, and the Python/REST/MCP interfaces.
 - **`seer lookup` contact output:** a WHOIS-fallback admin or tech contact
-  that has only an organization is no longer dropped; an RDAP registrant with
-  only a name or organization no longer prints an empty "Registrant Contact"
-  heading, and the WHOIS registrant details now fill in for it; human output
+  that has only an organization is no longer dropped; in human output, an RDAP
+  registrant with only a name or organization no longer prints an empty
+  "Registrant Contact" heading, and the WHOIS registrant details now fill in
+  for it; human output
   now shows the RDAP admin/tech address and country, as `seer rdap` and
   markdown already did.
 - **TUI Follow lens** now honors the configured DNS timeout and nameserver,
@@ -129,7 +148,7 @@ server are unaffected):
 - `watchlist::check_watchlist` (use `check_watchlist_with_config`) and
   `drift::drift_from_history`.
 - `SmartLookup::{prefer_rdap, include_fallback, clear_cache}`.
-- `RetryExecutor::{with_classifier, execute_once}`.
+- `RetryExecutor::execute_once`.
 - `logging::init_logging` (use `init_logging_with_writer`).
 - `JsonFormatter::compact()`; `JsonFormatter` is now a unit struct.
 - `BulkExecutor::execute_{whois, rdap, dns, propagation, lookup, status,
