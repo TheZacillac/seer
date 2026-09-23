@@ -1,0 +1,9 @@
+---
+source: seer-core/tests/format_snapshots.rs
+expression: human ().format_drift (& fixture_drift())
+---
+
+[1;95mDrift: example.com[0m
+[37m──────────────────[0m
+[1;96mregistrar[0m: [90mOld Registrar[0m [1;93m→[0m [97mNew Registrar[0m
+[1;96mnameservers[0m: [90m(none)[0m [1;93m→[0m [97mns1.example.com[0m

@@ -1,0 +1,9 @@
+---
+source: seer-core/tests/format_snapshots.rs
+expression: human ().format_rdap (& fixture_rdap_autnum())
+---
+
+[1;95mRDAP: EXAMPLE-AS[0m
+[37m────────────────[0m
+  [1;96mHandle[0m: [97mAS64496[0m
+  [1;96mAS Number[0m: [97mAS64496 - AS64511[0m

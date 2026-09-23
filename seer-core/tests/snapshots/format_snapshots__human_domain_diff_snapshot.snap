@@ -1,0 +1,28 @@
+---
+source: seer-core/tests/format_snapshots.rs
+expression: human ().format_diff (& fixture_domain_diff())
+---
+
+[1;95mDiff: example.com vs example.net[0m
+[37m────────────────────────────────[0m
+
+                      [1;96mexample.com        [0m   [1;96mexample.net[0m
+                      [1;96m───────────        [0m   [1;96m───────────[0m
+
+  [1;96mRegistration[0m
+[1;96m    Registrar     [0m  [1;91m≠[0m [1;91mMock Registrar Inc.[0m   [1;91mOther Registrar[0m
+[1;96m    Organization  [0m  [1;91m≠[0m [90m—                  [0m   [1;91mExample Org[0m
+[1;96m    Created       [0m  [1;92m=[0m [1;92m2010-03-15         [0m   [1;92m2010-03-15[0m
+[1;96m    Expires       [0m  [1;91m≠[0m [1;91m2099-03-15         [0m   [90m—[0m
+
+  [1;96mDNS[0m
+[1;96m    Resolves      [0m  [1;92m=[0m [1;92myes                [0m   [1;92myes[0m
+[1;96m    A Records     [0m  [1;91m≠[0m [1;91m192.0.2.1          [0m   [1;91m192.0.2.2[0m
+[1;96m    Nameservers   [0m  [1;92m=[0m [1;92mns1.example.com    [0m   [1;92mns2.example.com[0m
+[1;96m                  [0m    [1;92mns2.example.com    [0m   [1;92mns1.example.com[0m
+
+  [1;96mSSL[0m
+[1;96m    Issuer        [0m  [1;92m=[0m [1;92mMock CA            [0m   [1;92mMock CA[0m
+[1;96m    Valid Until   [0m  [1;91m≠[0m [1;91m2099-01-01         [0m   [1;91m2098-01-01[0m
+[1;96m    Days Remaining[0m  [1;91m≠[0m [1;91m26000              [0m   [90m—[0m
+[1;96m    Valid         [0m  [1;91m≠[0m [1;91myes                [0m   [90m—[0m

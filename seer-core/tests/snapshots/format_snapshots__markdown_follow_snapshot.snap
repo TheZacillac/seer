@@ -1,0 +1,17 @@
+---
+source: seer-core/tests/format_snapshots.rs
+expression: markdown ().format_follow (& fixture_follow())
+---
+## DNS Follow: example.com A
+
+- **Iterations**: 2/3
+- **Status**: Interrupted
+- **Total changes**: 1
+- **Duration**: 1m 5s
+
+### Iteration Details
+
+| # | Time | Records | Status |
+| --- | --- | --- | --- |
+| 1 | 12:00:00 | 1 | initial |
+| 2 | 12:00:30 | 1 | CHANGED |

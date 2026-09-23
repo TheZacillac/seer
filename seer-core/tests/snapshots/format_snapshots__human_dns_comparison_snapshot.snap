@@ -1,0 +1,17 @@
+---
+source: seer-core/tests/format_snapshots.rs
+expression: human ().format_dns_comparison (& fixture_dns_comparison())
+---
+
+[1;95mDNS Comparison: example.com A[0m
+[37m─────────────────────────────[0m
+  [1;91m✗[0m Records differ
+
+  [1;96mServer A[0m ([97m8.8.8.8[0m): [97m1[0m records
+    - [97m192.0.2.1[0m
+
+  [1;96mServer B[0m ([97m1.1.1.1[0m): [1;91mquery timed out[0m
+
+  [1;96mCommon[0m: [1;93m(none)[0m
+  [1;96mOnly in 8.8.8.8[0m: [1;91m192.0.2.1[0m
+  [1;96mOnly in 1.1.1.1[0m: [1;93m(none)[0m

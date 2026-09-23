@@ -1,0 +1,48 @@
+---
+source: seer-core/tests/format_snapshots.rs
+expression: markdown ().format_domain_info (& fixture_domain_info())
+---
+## Domain Info: example.com
+
+**Source:** both
+
+### Registration
+
+| Field | Value |
+| --- | --- |
+| Registrar | Mock Registrar Inc. |
+| Registrant | Jane Registrant |
+| Organization | Example Holdings LLC |
+| Created | 2010-03-15 |
+| Expires | 2099-03-15 |
+| Updated | 2024-02-01 |
+| Nameservers | `NS1.EXAMPLE.COM` |
+| Status | `client transfer prohibited` |
+| DNSSEC | signed |
+| Days Until Expiry | 26660 |
+| Domain Age (days) | 5800 |
+| Expiry Status | active |
+
+### Status Codes
+
+- `client transfer prohibited` — transfer locked (by registrar)
+
+### Contacts
+
+| Role | Name | Organization | Email | Phone | Address | Country |
+| --- | --- | --- | --- | --- | --- | --- |
+| Registrant | - | - | owner@example.com | +1.5555550100 | 1 Main St, Springfield, US | US |
+| Admin | Alex Admin | Example Holdings LLC | admin@example.com | +1.5555550101 | - | - |
+| Tech | Terry Tech | - | tech@example.com | - | - | - |
+
+### Registrar Detail
+
+- **IANA ID**: 9999
+- **URL**: https://registrar.example
+- **Abuse Email**: abuse@registrar.example
+- **Abuse Phone**: +1.5555550199
+
+### Protocol Metadata
+
+- **WHOIS Server**: `whois.verisign-grs.com`
+- **RDAP URL**: `https://rdap.example/domain/EXAMPLE.COM`

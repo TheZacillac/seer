@@ -1,0 +1,24 @@
+---
+source: seer-core/tests/format_snapshots.rs
+expression: human ().format_dnssec (& fixture_dnssec())
+---
+DNSSEC Report for [1;92mexample.com[0m
+
+  [1;96mStatus[0m: [1;91mmisconfigured[0m
+  [1;96mChain Valid[0m: [1;91minvalid[0m
+  [1;96mVerification depth[0m: [97mdigest-only (DS↔DNSKEY consistency)[0m
+[1;93m  Note: reflects DS/DNSKEY digest consistency only — RRSIG signatures, validity periods, and the chain to the root are NOT cryptographically verified.[0m
+  [1;96mEnabled[0m: [97mtrue[0m
+  [1;96mDS Records[0m: [97m2[0m
+  [1;96mDNSKEY Records[0m: [97m2[0m
+
+  [1;96mDS Records[0m:
+    Key Tag: 370, Algorithm: 13 (ECDSAP256SHA256), Digest: 2 (SHA-256) [[1;92m✓ verified[0m]
+    Key Tag: 999, Algorithm: 8 (RSASHA256), Digest: 2 (SHA-256) [[1;91m✗ no matching key[0m]
+
+  [1;96mDNSKEY Records[0m:
+    Key Tag: 370, Flags: 257, Role: KSK, Algorithm: 13 (ECDSAP256SHA256)
+    Key Tag: 12345, Flags: 256, Role: ZSK, Algorithm: 13 (ECDSAP256SHA256)
+
+  [1;96mIssues[0m:
+    - DS key tag 999 matches no published DNSKEY

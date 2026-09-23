@@ -1,0 +1,11 @@
+---
+source: seer-core/tests/format_snapshots.rs
+expression: markdown ().format_subdomains (& fixture_subdomains())
+---
+## Subdomains: example.com
+
+- **Source**: crt.sh
+- **Count**: 2
+
+- `api.example.com`
+- `www.example.com`

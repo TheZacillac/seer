@@ -17,9 +17,18 @@
 // here as in unit tests.
 #![allow(clippy::unwrap_used)]
 
+use seer_core::availability::AvailabilityResult;
 use seer_core::caa::{CaaPolicy, CaaRecord, ISSUANCE_TIME_NOTE};
 use seer_core::confusables::{ConfusableReport, RegisteredLookalike};
-use seer_core::dns::{DelegationReport, DnsRecord, LameNs, RecordData, RecordType};
+use seer_core::diff::{DnsDiff, DomainDiff, RegistrationDiff, SslDiff};
+use seer_core::dns::{
+    DelegationReport, DnsComparison, DnsRecord, DnssecReport, FollowIteration, FollowResult,
+    LameNs, PropagationResult, RecordData, RecordType, ServerResult,
+};
+use seer_core::domain_info::DomainInfo;
+use seer_core::drift::{DriftReport, FieldChange};
+use seer_core::headers::{CookieFinding, Disclosure, HeaderFinding, HeaderReport, HeaderVerdict};
+use seer_core::lookup::LookupResult;
 use seer_core::output::{get_formatter, OutputFormat, OutputFormatter};
 use seer_core::posture::{
     BimiPolicy, DanePolicy, DmarcPolicy, EmailPosture, MtaStsPolicy, PostureVerdict, SpfPolicy,
@@ -27,8 +36,13 @@ use seer_core::posture::{
 };
 use seer_core::rdap::RdapResponse;
 use seer_core::ssl::{CertDetail, CertWarning, CertWarningSeverity, SslReport};
-use seer_core::status::{CertificateInfo, DomainExpiration, StatusResponse};
-use seer_core::subdomains::{ClassifiedSubdomain, SubdomainClassification, SubdomainStatus};
+use seer_core::status::{CertificateInfo, DnsResolution, DomainExpiration, StatusResponse};
+use seer_core::subdomains::{
+    ClassifiedSubdomain, SubdomainClassification, SubdomainResult, SubdomainStatus,
+};
+use seer_core::takeover::{TakeoverFinding, TakeoverReport, TakeoverVerdict};
+use seer_core::tld::TldInfo;
+use seer_core::watchlist::{WatchReport, WatchResult};
 use seer_core::whois::WhoisResponse;
 
 fn human() -> Box<dyn OutputFormatter> {
@@ -39,6 +53,14 @@ fn human() -> Box<dyn OutputFormatter> {
 fn markdown() -> Box<dyn OutputFormatter> {
     colored::control::set_override(true);
     get_formatter(OutputFormat::Markdown)
+}
+
+fn json() -> Box<dyn OutputFormatter> {
+    get_formatter(OutputFormat::Json)
+}
+
+fn yaml() -> Box<dyn OutputFormatter> {
+    get_formatter(OutputFormat::Yaml)
 }
 
 /// Redact now()-relative day counts so snapshots don't expire.
@@ -577,4 +599,581 @@ snapshot_tests! {
         human.format_subdomain_baseline_diff(fixture_subdomain_baseline_diff_missing());
     markdown_subdomain_baseline_diff_missing_snapshot =>
         markdown.format_subdomain_baseline_diff(fixture_subdomain_baseline_diff_missing());
+}
+
+// --- Registration contacts, lookup, and merged domain info -----------------
+
+/// WHOIS with every contact block populated (registrant details, admin,
+/// tech) on top of [`fixture_whois`].
+fn fixture_whois_with_contacts() -> WhoisResponse {
+    let mut w = fixture_whois();
+    w.registrant = Some("Jane Registrant".into());
+    w.organization = Some("Example Holdings LLC".into());
+    w.registrant_email = Some("owner@example.com".into());
+    w.registrant_phone = Some("+1.5555550100".into());
+    w.registrant_address = Some("1 Main St, Springfield".into());
+    w.admin_name = Some("Alex Admin".into());
+    w.admin_organization = Some("Example Holdings LLC".into());
+    w.admin_email = Some("admin@example.com".into());
+    w.admin_phone = Some("+1.5555550101".into());
+    w.tech_name = Some("Terry Tech".into());
+    w.tech_email = Some("tech@example.com".into());
+    w
+}
+
+/// RDAP with registrant/admin/tech/billing entities and a registrar carrying
+/// the IANA ID, URL, and abuse contact. Admin and tech carry no postal
+/// address, so every formatter renders the same field set for them.
+fn fixture_rdap_with_contacts() -> RdapResponse {
+    serde_json::from_value(serde_json::json!({
+        "objectClassName": "domain",
+        "handle": "2336799_DOMAIN_COM-VRSN",
+        "ldhName": "EXAMPLE.COM",
+        "status": ["client transfer prohibited"],
+        "events": [
+            {"eventAction": "registration", "eventDate": "2010-03-15T04:00:00Z"},
+            {"eventAction": "last changed", "eventDate": "2024-02-01T09:30:00Z"},
+            {"eventAction": "expiration", "eventDate": "2099-03-15T04:00:00Z"}
+        ],
+        "nameservers": [{"objectClassName": "nameserver", "ldhName": "NS1.EXAMPLE.COM"}],
+        "secureDNS": {"delegationSigned": true},
+        "links": [{"rel": "self", "href": "https://rdap.example/domain/EXAMPLE.COM"}],
+        "entities": [
+            {
+                "objectClassName": "entity",
+                "roles": ["registrar"],
+                "publicIds": [{"type": "IANA Registrar ID", "identifier": "9999"}],
+                "links": [{"rel": "about", "href": "https://registrar.example"}],
+                "vcardArray": ["vcard", [["fn", {}, "text", "Mock Registrar Inc."]]],
+                "entities": [{
+                    "objectClassName": "entity",
+                    "roles": ["abuse"],
+                    "vcardArray": ["vcard", [
+                        ["email", {}, "text", "abuse@registrar.example"],
+                        ["tel", {}, "uri", "tel:+1.5555550199"]
+                    ]]
+                }]
+            },
+            {
+                "objectClassName": "entity",
+                "roles": ["registrant"],
+                "vcardArray": ["vcard", [
+                    ["fn", {}, "text", "Jane Registrant"],
+                    ["org", {}, "text", "Example Holdings LLC"],
+                    ["email", {}, "text", "owner@example.com"],
+                    ["adr", {}, "text", ["", "", "1 Main St", "Springfield", "", "", "US"]]
+                ]]
+            },
+            {
+                "objectClassName": "entity",
+                "roles": ["administrative"],
+                "vcardArray": ["vcard", [
+                    ["fn", {}, "text", "Alex Admin"],
+                    ["org", {}, "text", "Example Holdings LLC"],
+                    ["email", {}, "text", "admin@example.com"],
+                    ["tel", {}, "text", "+1.5555550101"]
+                ]]
+            },
+            {
+                "objectClassName": "entity",
+                "roles": ["technical"],
+                "vcardArray": ["vcard", [
+                    ["fn", {}, "text", "Terry Tech"],
+                    ["email", {}, "text", "tech@example.com"]
+                ]]
+            },
+            {
+                "objectClassName": "entity",
+                "roles": ["billing"],
+                "vcardArray": ["vcard", [
+                    ["fn", {}, "text", "Bill Billing"],
+                    ["adr", {}, "text", ["", "", "2 Side St", "Shelbyville", "", "", "US"]]
+                ]]
+            }
+        ]
+    }))
+    .expect("fixture RDAP JSON must deserialize")
+}
+
+/// An IP-network RDAP object (start/end address, country).
+fn fixture_rdap_ip_network() -> RdapResponse {
+    serde_json::from_value(serde_json::json!({
+        "objectClassName": "ip network",
+        "handle": "NET-192-0-2-0-1",
+        "name": "TEST-NET-1",
+        "startAddress": "192.0.2.0",
+        "endAddress": "192.0.2.255",
+        "country": "US"
+    }))
+    .expect("fixture RDAP JSON must deserialize")
+}
+
+/// An autnum RDAP object.
+fn fixture_rdap_autnum() -> RdapResponse {
+    serde_json::from_value(serde_json::json!({
+        "objectClassName": "autnum",
+        "handle": "AS64496",
+        "name": "EXAMPLE-AS",
+        "startAutnum": 64496,
+        "endAutnum": 64511
+    }))
+    .expect("fixture RDAP JSON must deserialize")
+}
+
+/// RDAP answered but carried only the registrar, so every contact comes
+/// from the WHOIS fallback.
+fn fixture_lookup_rdap_with_whois_fallback() -> LookupResult {
+    LookupResult::Rdap {
+        data: Box::new(fixture_rdap()),
+        whois_fallback: Some(fixture_whois_with_contacts()),
+    }
+}
+
+fn fixture_lookup_rdap_with_contacts() -> LookupResult {
+    LookupResult::Rdap {
+        data: Box::new(fixture_rdap_with_contacts()),
+        whois_fallback: None,
+    }
+}
+
+fn fixture_lookup_whois() -> LookupResult {
+    LookupResult::Whois {
+        data: fixture_whois_with_contacts(),
+        rdap_error: Some("RDAP bootstrap has no entry for this TLD".into()),
+        rdap_fallback: None,
+    }
+}
+
+fn fixture_availability() -> AvailabilityResult {
+    AvailabilityResult {
+        domain: "example.com".into(),
+        available: false,
+        confidence: "medium".into(),
+        method: "whois".into(),
+        details: Some("WHOIS returned registration data".into()),
+    }
+}
+
+fn fixture_lookup_available() -> LookupResult {
+    LookupResult::Available {
+        data: Box::new(fixture_availability()),
+        rdap_error: "RDAP server returned 503".into(),
+        whois_error: String::new(),
+        whois_data: Some(fixture_whois()),
+    }
+}
+
+/// Merged RDAP + WHOIS view. The now()-relative lifecycle counts are pinned
+/// (markdown renders them without a "days" suffix the filter could redact).
+fn fixture_domain_info() -> DomainInfo {
+    let mut info = DomainInfo::from_sources(
+        "example.com",
+        Some(&fixture_rdap_with_contacts()),
+        Some(&fixture_whois_with_contacts()),
+    );
+    info.days_until_expiration = Some(26_660);
+    info.domain_age_days = Some(5_800);
+    info
+}
+
+snapshot_tests! {
+    human_whois_contacts_snapshot => human.format_whois(fixture_whois_with_contacts());
+    markdown_whois_contacts_snapshot => markdown.format_whois(fixture_whois_with_contacts());
+    human_rdap_contacts_snapshot => human.format_rdap(fixture_rdap_with_contacts());
+    markdown_rdap_contacts_snapshot => markdown.format_rdap(fixture_rdap_with_contacts());
+    human_rdap_ip_network_snapshot => human.format_rdap(fixture_rdap_ip_network());
+    markdown_rdap_ip_network_snapshot => markdown.format_rdap(fixture_rdap_ip_network());
+    human_rdap_autnum_snapshot => human.format_rdap(fixture_rdap_autnum());
+    markdown_rdap_autnum_snapshot => markdown.format_rdap(fixture_rdap_autnum());
+    human_lookup_rdap_fallback_snapshot =>
+        human.format_lookup(fixture_lookup_rdap_with_whois_fallback());
+    markdown_lookup_rdap_fallback_snapshot =>
+        markdown.format_lookup(fixture_lookup_rdap_with_whois_fallback());
+    human_lookup_rdap_contacts_snapshot => human.format_lookup(fixture_lookup_rdap_with_contacts());
+    markdown_lookup_rdap_contacts_snapshot =>
+        markdown.format_lookup(fixture_lookup_rdap_with_contacts());
+    human_lookup_whois_snapshot => human.format_lookup(fixture_lookup_whois());
+    markdown_lookup_whois_snapshot => markdown.format_lookup(fixture_lookup_whois());
+    human_lookup_available_snapshot => human.format_lookup(fixture_lookup_available());
+    markdown_lookup_available_snapshot => markdown.format_lookup(fixture_lookup_available());
+    human_availability_snapshot => human.format_availability(fixture_availability());
+    markdown_availability_snapshot => markdown.format_availability(fixture_availability());
+    human_domain_info_snapshot => human.format_domain_info(fixture_domain_info());
+    markdown_domain_info_snapshot => markdown.format_domain_info(fixture_domain_info());
+    json_lookup_rdap_fallback_snapshot =>
+        json.format_lookup(fixture_lookup_rdap_with_whois_fallback());
+    yaml_lookup_rdap_fallback_snapshot =>
+        yaml.format_lookup(fixture_lookup_rdap_with_whois_fallback());
+}
+
+// --- DNS, TLD, and watch reports ----------------------------------------
+
+fn a_record(name: &str, address: &str) -> DnsRecord {
+    DnsRecord {
+        name: name.into(),
+        record_type: RecordType::A,
+        ttl: 300,
+        data: RecordData::A {
+            address: address.into(),
+        },
+    }
+}
+
+fn fixture_tld() -> TldInfo {
+    TldInfo {
+        tld: "com".into(),
+        whois_server: Some("whois.verisign-grs.com".into()),
+        rdap_url: Some("https://rdap.verisign.com/com/v1/".into()),
+        registry_url: Some("https://www.verisign.com".into()),
+        tld_type: "generic".into(),
+    }
+}
+
+/// A TLD with no known servers (the "not available" branches).
+fn fixture_tld_sparse() -> TldInfo {
+    TldInfo {
+        tld: "example".into(),
+        whois_server: None,
+        rdap_url: None,
+        registry_url: None,
+        tld_type: "reserved".into(),
+    }
+}
+
+fn fixture_subdomains() -> SubdomainResult {
+    SubdomainResult {
+        domain: "example.com".into(),
+        subdomains: vec!["api.example.com".into(), "www.example.com".into()],
+        source: "crt.sh".into(),
+        count: 2,
+    }
+}
+
+fn fixture_watch() -> WatchReport {
+    WatchReport {
+        checked_at: "2026-06-01T12:00:00Z".parse().unwrap(),
+        results: vec![
+            WatchResult {
+                domain: "example.com".into(),
+                ssl_days_remaining: Some(80),
+                domain_days_remaining: Some(400),
+                registrar: Some("Mock Registrar Inc.".into()),
+                http_status: Some(200),
+                issues: Vec::new(),
+            },
+            WatchResult {
+                domain: "expiring.example".into(),
+                ssl_days_remaining: Some(5),
+                domain_days_remaining: None,
+                registrar: None,
+                http_status: None,
+                issues: vec!["SSL certificate expires in 5 days".into()],
+            },
+        ],
+        total: 2,
+        warnings: 1,
+        critical: 0,
+    }
+}
+
+fn fixture_dnssec() -> DnssecReport {
+    serde_json::from_value(serde_json::json!({
+        "domain": "example.com",
+        "enabled": true,
+        "has_ds_records": true,
+        "has_dnskey_records": true,
+        "ds_records": [
+            {"key_tag": 370, "algorithm": 13, "digest_type": 2, "digest": "ABCD",
+             "algorithm_name": "ECDSAP256SHA256", "digest_type_name": "SHA-256",
+             "matched_key": true, "digest_verified": true},
+            {"key_tag": 999, "algorithm": 8, "digest_type": 2, "digest": "EF01",
+             "algorithm_name": "RSASHA256", "digest_type_name": "SHA-256",
+             "matched_key": false, "digest_verified": false}
+        ],
+        "dnskey_records": [
+            {"flags": 257, "protocol": 3, "algorithm": 13, "key_tag": 370,
+             "is_ksk": true, "is_zsk": false, "algorithm_name": "ECDSAP256SHA256"},
+            {"flags": 256, "protocol": 3, "algorithm": 13, "key_tag": 12345,
+             "is_ksk": false, "is_zsk": true, "algorithm_name": "ECDSAP256SHA256"}
+        ],
+        "issues": ["DS key tag 999 matches no published DNSKEY"],
+        "status": "misconfigured",
+        "chain_valid": false,
+        "authentication_tier": "digest-only"
+    }))
+    .expect("fixture DNSSEC JSON must deserialize")
+}
+
+fn fixture_dns_comparison() -> DnsComparison {
+    DnsComparison {
+        domain: "example.com".into(),
+        record_type: RecordType::A,
+        server_a: ServerResult {
+            nameserver: "8.8.8.8".into(),
+            records: vec![a_record("example.com", "192.0.2.1")],
+            error: None,
+        },
+        server_b: ServerResult {
+            nameserver: "1.1.1.1".into(),
+            records: Vec::new(),
+            error: Some("query timed out".into()),
+        },
+        matches: false,
+        only_in_a: vec!["192.0.2.1".into()],
+        only_in_b: Vec::new(),
+        common: Vec::new(),
+    }
+}
+
+fn fixture_follow_iteration() -> FollowIteration {
+    FollowIteration {
+        iteration: 2,
+        total_iterations: 3,
+        timestamp: "2026-06-01T12:00:30Z".parse().unwrap(),
+        records: vec![a_record("example.com", "192.0.2.2")],
+        changed: true,
+        added: vec!["192.0.2.2".into()],
+        removed: vec!["192.0.2.1".into()],
+        error: None,
+    }
+}
+
+fn fixture_follow() -> FollowResult {
+    let first = FollowIteration {
+        iteration: 1,
+        timestamp: "2026-06-01T12:00:00Z".parse().unwrap(),
+        records: vec![a_record("example.com", "192.0.2.1")],
+        changed: false,
+        added: Vec::new(),
+        removed: Vec::new(),
+        ..fixture_follow_iteration()
+    };
+    FollowResult {
+        domain: "example.com".into(),
+        record_type: RecordType::A,
+        nameserver: None,
+        iterations_requested: 3,
+        interval_secs: 30,
+        iterations: vec![first, fixture_follow_iteration()],
+        interrupted: true,
+        total_changes: 1,
+        started_at: "2026-06-01T12:00:00Z".parse().unwrap(),
+        ended_at: "2026-06-01T12:01:05Z".parse().unwrap(),
+    }
+}
+
+/// Two regions, one unreachable server, and one divergent answer.
+fn fixture_propagation() -> PropagationResult {
+    let record = |ip: &str| serde_json::to_value(a_record("example.com", ip)).unwrap();
+    serde_json::from_value(serde_json::json!({
+        "domain": "example.com",
+        "record_type": "A",
+        "servers_checked": 3,
+        "servers_responding": 2,
+        "propagation_percentage": 50.0,
+        "results": [
+            {"server": {"name": "Google", "ip": "8.8.8.8", "location": "North America",
+                        "provider": "Google"},
+             "records": [record("192.0.2.1")], "response_time_ms": 12, "success": true,
+             "error": null},
+            {"server": {"name": "Quad9", "ip": "9.9.9.9", "location": "Europe",
+                        "provider": "Quad9"},
+             "records": [record("192.0.2.9")], "response_time_ms": 30, "success": true,
+             "error": null},
+            {"server": {"name": "Yandex", "ip": "77.88.8.8", "location": "Europe",
+                        "provider": "Yandex"},
+             "records": [], "response_time_ms": 5000, "success": false,
+             "error": "timeout"}
+        ],
+        "consensus_values": [{"type": "A", "value": "192.0.2.1"}],
+        "inconsistencies": [{"type": "A", "server_name": "Quad9", "server_ip": "9.9.9.9",
+                             "values": ["192.0.2.9"], "consensus": ["192.0.2.1"]}],
+        "unreachable_servers": [{"name": "Yandex", "ip": "77.88.8.8", "error": "timeout"}],
+        "dnssec_validated": false
+    }))
+    .expect("fixture propagation JSON must deserialize")
+}
+
+snapshot_tests! {
+    human_tld_snapshot => human.format_tld(fixture_tld());
+    markdown_tld_snapshot => markdown.format_tld(fixture_tld());
+    human_tld_sparse_snapshot => human.format_tld(fixture_tld_sparse());
+    markdown_tld_sparse_snapshot => markdown.format_tld(fixture_tld_sparse());
+    human_subdomains_snapshot => human.format_subdomains(fixture_subdomains());
+    markdown_subdomains_snapshot => markdown.format_subdomains(fixture_subdomains());
+    human_watch_snapshot => human.format_watch(fixture_watch());
+    markdown_watch_snapshot => markdown.format_watch(fixture_watch());
+    human_dnssec_snapshot => human.format_dnssec(fixture_dnssec());
+    markdown_dnssec_snapshot => markdown.format_dnssec(fixture_dnssec());
+    human_dns_comparison_snapshot => human.format_dns_comparison(fixture_dns_comparison());
+    markdown_dns_comparison_snapshot => markdown.format_dns_comparison(fixture_dns_comparison());
+    human_follow_iteration_snapshot => human.format_follow_iteration(fixture_follow_iteration());
+    markdown_follow_iteration_snapshot =>
+        markdown.format_follow_iteration(fixture_follow_iteration());
+    human_follow_snapshot => human.format_follow(fixture_follow());
+    markdown_follow_snapshot => markdown.format_follow(fixture_follow());
+    human_propagation_snapshot => human.format_propagation(fixture_propagation());
+    markdown_propagation_snapshot => markdown.format_propagation(fixture_propagation());
+}
+
+// --- Status, security, and comparison reports ---------------------------
+
+/// Every status section populated: certificate, CAA, registration, DNS.
+fn fixture_status_full() -> StatusResponse {
+    StatusResponse {
+        certificate: Some(CertificateInfo {
+            issuer: "CN=Mock CA".into(),
+            subject: "CN=example.com".into(),
+            valid_from: "2025-01-01T00:00:00Z".parse().unwrap(),
+            valid_until: "2099-01-01T00:00:00Z".parse().unwrap(),
+            days_until_expiry: 26_000,
+            is_valid: true,
+            hostname_verified: true,
+        }),
+        dns_resolution: Some(DnsResolution {
+            a_records: vec!["192.0.2.1".into()],
+            aaaa_records: vec!["2001:db8::1".into()],
+            cname_target: Some("edge.example.net".into()),
+            nameservers: vec!["ns1.example.com".into()],
+            resolves: true,
+        }),
+        caa: Some(fixture_caa_policy()),
+        ..fixture_status()
+    }
+}
+
+fn fixture_headers() -> HeaderReport {
+    HeaderReport {
+        domain: "example.com".into(),
+        url: "https://www.example.com/".into(),
+        status: 200,
+        redirects: 1,
+        grade: "C".into(),
+        score: 55,
+        headers: vec![
+            HeaderFinding {
+                header: "strict-transport-security".into(),
+                present: true,
+                value: Some("max-age=31536000".into()),
+                verdict: HeaderVerdict::Moderate,
+                note: None,
+            },
+            HeaderFinding {
+                header: "content-security-policy".into(),
+                present: false,
+                value: None,
+                verdict: HeaderVerdict::Absent,
+                note: Some("add a CSP".into()),
+            },
+        ],
+        cookies: vec![CookieFinding {
+            name: "session".into(),
+            secure: true,
+            http_only: false,
+            same_site: None,
+            verdict: HeaderVerdict::Weak,
+            issues: vec!["missing HttpOnly".into(), "missing SameSite".into()],
+        }],
+        disclosures: vec![Disclosure {
+            header: "server".into(),
+            value: "nginx/1.25.3".into(),
+            versioned: true,
+        }],
+        notes: vec!["Content-Security-Policy is missing".into()],
+    }
+}
+
+fn fixture_takeover() -> TakeoverReport {
+    TakeoverReport {
+        domain: "example.com".into(),
+        hosts_checked: 12,
+        hosts_skipped: 3,
+        vulnerable: 1,
+        potential: 1,
+        findings: vec![
+            TakeoverFinding {
+                host: "docs.example.com".into(),
+                verdict: TakeoverVerdict::Vulnerable,
+                provider: Some("GitHub Pages".into()),
+                cname: Some("example.github.io".into()),
+                addresses: Vec::new(),
+                evidence: Some("There isn't a GitHub Pages site here.".into()),
+                http_status: Some(404),
+                probe_note: None,
+            },
+            TakeoverFinding {
+                host: "shop.example.com".into(),
+                verdict: TakeoverVerdict::Potential,
+                provider: Some("Shopify".into()),
+                cname: Some("shops.myshopify.com".into()),
+                addresses: Vec::new(),
+                evidence: None,
+                http_status: None,
+                probe_note: Some("HTTP probe failed: connection refused".into()),
+            },
+        ],
+        notes: vec!["3 hosts exceeded the scan cap".into()],
+    }
+}
+
+fn fixture_drift() -> DriftReport {
+    DriftReport {
+        domain: "example.com".into(),
+        changes: vec![
+            FieldChange {
+                field: "registrar".into(),
+                old: Some("Old Registrar".into()),
+                new: Some("New Registrar".into()),
+            },
+            FieldChange {
+                field: "nameservers".into(),
+                old: None,
+                new: Some("ns1.example.com".into()),
+            },
+        ],
+        inconclusive: None,
+    }
+}
+
+fn fixture_domain_diff() -> DomainDiff {
+    DomainDiff {
+        domain_a: "example.com".into(),
+        domain_b: "example.net".into(),
+        registration: RegistrationDiff {
+            registrar: (
+                Some("Mock Registrar Inc.".into()),
+                Some("Other Registrar".into()),
+            ),
+            organization: (None, Some("Example Org".into())),
+            created: (Some("2010-03-15".into()), Some("2010-03-15".into())),
+            expires: (Some("2099-03-15".into()), None),
+        },
+        dns: DnsDiff {
+            a_records: (vec!["192.0.2.1".into()], vec!["192.0.2.2".into()]),
+            nameservers: (
+                vec!["ns1.example.com".into(), "ns2.example.com".into()],
+                vec!["ns2.example.com".into(), "ns1.example.com".into()],
+            ),
+            resolves: (true, true),
+        },
+        ssl: SslDiff {
+            issuer: (Some("Mock CA".into()), Some("Mock CA".into())),
+            valid_until: (Some("2099-01-01".into()), Some("2098-01-01".into())),
+            days_remaining: (Some(26_000), None),
+            is_valid: (Some(true), None),
+        },
+    }
+}
+
+snapshot_tests! {
+    human_status_full_snapshot => human.format_status(fixture_status_full());
+    markdown_status_full_snapshot => markdown.format_status(fixture_status_full());
+    human_headers_snapshot => human.format_headers(fixture_headers());
+    markdown_headers_snapshot => markdown.format_headers(fixture_headers());
+    human_takeover_snapshot => human.format_takeover(fixture_takeover());
+    markdown_takeover_snapshot => markdown.format_takeover(fixture_takeover());
+    human_drift_snapshot => human.format_drift(fixture_drift());
+    markdown_drift_snapshot => markdown.format_drift(fixture_drift());
+    human_domain_diff_snapshot => human.format_diff(fixture_domain_diff());
+    markdown_domain_diff_snapshot => markdown.format_diff(fixture_domain_diff());
 }

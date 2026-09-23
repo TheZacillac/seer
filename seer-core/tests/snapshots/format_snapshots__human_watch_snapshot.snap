@@ -1,0 +1,17 @@
+---
+source: seer-core/tests/format_snapshots.rs
+expression: human ().format_watch (& fixture_watch())
+---
+
+[1;95mDomain Watch Report[0m
+[37m───────────────────[0m
+  [1;96mChecked[0m: [97m2026-06-01 12:00:00 UTC[0m
+  [1;96mTotal[0m: [97m2[0m domains, [1;93m1[0m warnings, [97m0[0m critical
+
+  [1;92mv[0m [97mexample.com[0m
+      [1;96mSSL[0m: [97m80 days[0m | [1;96mDomain[0m: [97m400 days[0m | [1;96mHTTP[0m: [97m200[0m
+
+  [1;93m![0m [97mexpiring.example[0m
+      [1;96mSSL[0m: [97m5 days[0m | [1;96mDomain[0m: [97mN/A[0m | [1;96mHTTP[0m: [97mN/A[0m
+      [1;96mIssues[0m:
+        - [1;93mSSL certificate expires in [N] days[0m

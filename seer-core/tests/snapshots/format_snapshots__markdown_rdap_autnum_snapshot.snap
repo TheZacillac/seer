@@ -1,0 +1,8 @@
+---
+source: seer-core/tests/format_snapshots.rs
+expression: markdown ().format_rdap (& fixture_rdap_autnum())
+---
+## RDAP: EXAMPLE-AS
+
+- **Handle**: `AS64496`
+- **AS Number**: `AS64496` - `AS64511`

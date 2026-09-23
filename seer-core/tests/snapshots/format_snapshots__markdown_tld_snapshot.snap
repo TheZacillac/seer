@@ -1,0 +1,10 @@
+---
+source: seer-core/tests/format_snapshots.rs
+expression: markdown ().format_tld (& fixture_tld())
+---
+## TLD Info: .com
+
+- **Type**: generic
+- **WHOIS Server**: `whois.verisign-grs.com`
+- **RDAP URL**: `https://rdap.verisign.com/com/v1/`
+- **Registry URL**: https://www.verisign.com

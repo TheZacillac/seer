@@ -1,0 +1,12 @@
+---
+source: seer-core/tests/format_snapshots.rs
+expression: human ().format_subdomains (& fixture_subdomains())
+---
+
+[1;95mSubdomains: example.com[0m
+[37m───────────────────────[0m
+  [1;96mSource[0m: [97mcrt.sh[0m
+  [1;96mCount[0m: [97m2[0m
+
+    - [97mapi.example.com[0m
+    - [97mwww.example.com[0m

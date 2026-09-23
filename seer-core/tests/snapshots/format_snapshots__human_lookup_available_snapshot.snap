@@ -1,0 +1,18 @@
+---
+source: seer-core/tests/format_snapshots.rs
+expression: human ().format_lookup (& fixture_lookup_available())
+---
+
+[1;95mLookup: example.com (likely registered)[0m
+[37m───────────────────────────────────────[0m
+  [1;96mSource[0m: [1;93mWHOIS (RDAP unavailable)[0m
+  [1;96mVerdict[0m: [1;93mLIKELY REGISTERED[0m
+  [1;96mConfidence[0m: [1;93mmedium[0m
+  [1;96mMethod[0m: [97mwhois[0m
+  [1;96mDetails[0m: [97mWHOIS returned registration data[0m
+  [1;96mRDAP Error[0m: [1;91mRDAP server returned 503[0m
+  [1;96mAdditional WHOIS data:[0m
+    [1;96mNameservers[0m: [97mns1.example.com, ns2.example.com[0m
+    [1;96mStatus[0m: [97mclientTransferProhibited[0m
+    [1;96mDNSSEC[0m: [97msignedDelegation[0m
+    [1;96mWHOIS Server[0m: [97mwhois.verisign-grs.com[0m

@@ -1,0 +1,23 @@
+---
+source: seer-core/tests/format_snapshots.rs
+expression: markdown ().format_dns_comparison (& fixture_dns_comparison())
+---
+## DNS Comparison: example.com A
+
+**Result**: Records differ
+
+### Server A (8.8.8.8)
+
+| Record |
+| --- |
+| `192.0.2.1` |
+
+### Server B (1.1.1.1)
+
+**Error**: query timed out
+
+### Comparison
+
+- **Common**: *(none)*
+- **Only in 8.8.8.8**: `192.0.2.1`
+- **Only in 1.1.1.1**: *(none)*

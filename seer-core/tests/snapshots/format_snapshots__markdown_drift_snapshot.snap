@@ -1,0 +1,10 @@
+---
+source: seer-core/tests/format_snapshots.rs
+expression: markdown ().format_drift (& fixture_drift())
+---
+## Drift: example.com
+
+| Field | Old | New |
+|---|---|---|
+| registrar | Old Registrar | New Registrar |
+| nameservers | — | ns1.example.com |

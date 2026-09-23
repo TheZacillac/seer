@@ -1,0 +1,30 @@
+---
+source: seer-core/tests/format_snapshots.rs
+expression: markdown ().format_dnssec (& fixture_dnssec())
+---
+## DNSSEC: example.com
+
+- **Status**: `misconfigured`
+- **Chain Valid**: no
+> Note: reflects DS/DNSKEY digest consistency only — RRSIG signatures, validity periods, and the chain to the root are NOT cryptographically verified.
+- **Enabled**: true
+- **DS Records**: 2
+- **DNSKEY Records**: 2
+
+### DS Records
+
+| Key Tag | Algorithm | Digest Type | Matched | Verified |
+| --- | --- | --- | --- | --- |
+| 370 | 13 (ECDSAP256SHA256) | 2 (SHA-256) | yes | yes |
+| 999 | 8 (RSASHA256) | 2 (SHA-256) | no | no |
+
+### DNSKEY Records
+
+| Key Tag | Flags | Role | Algorithm |
+| --- | --- | --- | --- |
+| 370 | 257 | KSK | 13 (ECDSAP256SHA256) |
+| 12345 | 256 | ZSK | 13 (ECDSAP256SHA256) |
+
+### Issues
+
+- DS key tag 999 matches no published DNSKEY
