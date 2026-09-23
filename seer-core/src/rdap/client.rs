@@ -4,7 +4,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use futures::StreamExt;
 use reqwest::Client;
 use serde::Deserialize;
 use std::sync::LazyLock;
@@ -14,6 +13,7 @@ use tracing::{debug, info, instrument, warn};
 use super::bootstrap::{ip_matches_prefix, parse_asn_range, validate_bootstrap_url};
 use super::types::RdapResponse;
 use crate::error::{Result, SeerError};
+use crate::http::{read_body_capped, BodyReadError, Overflow};
 use crate::retry::{NetworkRetryClassifier, RetryClassifier, RetryExecutor, RetryPolicy};
 use crate::validation::normalize_domain;
 
@@ -908,37 +908,24 @@ async fn read_and_parse_rdap_body(
     timeout: Duration,
 ) -> Result<RdapResponse> {
     // Stream body with incremental size check to prevent memory exhaustion.
-    // Wrap the chunk loop in a timeout so a server that opens the connection
-    // but trickles bytes forever is classified as a timeout (not a generic
-    // RdapError) and retries can be driven appropriately.
-    let mut body = Vec::new();
-    let mut stream = response.bytes_stream();
-    let streamed = tokio::time::timeout(timeout, async {
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk
-                .map_err(|e| SeerError::RdapError(format!("failed to read response: {}", e)))?;
-            body.extend_from_slice(&chunk);
-            if body.len() > MAX_RDAP_RESPONSE_SIZE {
-                return Err(SeerError::RdapError(format!(
-                    "RDAP response exceeds {} byte limit",
-                    MAX_RDAP_RESPONSE_SIZE
-                )));
+    // A server that opens the connection but trickles bytes forever is
+    // classified as a timeout (not a generic RdapError) so retries can be
+    // driven appropriately.
+    let body = read_body_capped(response, MAX_RDAP_RESPONSE_SIZE, timeout, Overflow::Reject)
+        .await
+        .map_err(|e| match e {
+            BodyReadError::Chunk(e) => {
+                SeerError::RdapError(format!("failed to read response: {}", e))
             }
-        }
-        Ok::<(), SeerError>(())
-    })
-    .await;
-
-    match streamed {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => return Err(e),
-        Err(_) => {
-            return Err(SeerError::Timeout(format!(
+            BodyReadError::TooLarge => SeerError::RdapError(format!(
+                "RDAP response exceeds {} byte limit",
+                MAX_RDAP_RESPONSE_SIZE
+            )),
+            BodyReadError::TimedOut => SeerError::Timeout(format!(
                 "timed out reading RDAP response body from {} after {:?}",
                 url, timeout
-            )));
-        }
-    }
+            )),
+        })?;
 
     let rdap: RdapResponse = serde_json::from_slice(&body)?;
     // Bound attacker-controlled payload post-deserialization. The 10MB
@@ -1088,40 +1075,25 @@ async fn load_bootstrap_data() -> Result<BootstrapLoad> {
     const MAX_BOOTSTRAP_SIZE: usize = 10 * 1024 * 1024; // 10 MB
 
     async fn read_bootstrap(resp: reqwest::Response) -> Result<BootstrapResponse> {
-        // Bound the streaming-read loop with the same timeout used for RDAP
+        // Bound the streaming read with the same timeout used for RDAP
         // queries. Without this, a slow or stalled IANA response (open TCP
         // but no bytes arriving) could hang all RDAP lookups indefinitely
-        // because `ensure_bootstrap` awaits this future. Mirrors the pattern
-        // in `read_and_parse_rdap_body`.
-        let mut body = Vec::new();
-        let mut stream = resp.bytes_stream();
-        let streamed = tokio::time::timeout(DEFAULT_TIMEOUT, async {
-            while let Some(chunk) = stream.next().await {
-                let chunk = chunk.map_err(|e| {
+        // because `ensure_bootstrap` awaits this future.
+        let body = read_body_capped(resp, MAX_BOOTSTRAP_SIZE, DEFAULT_TIMEOUT, Overflow::Reject)
+            .await
+            .map_err(|e| match e {
+                BodyReadError::Chunk(e) => {
                     SeerError::RdapBootstrapError(format!("failed to read body: {}", e))
-                })?;
-                body.extend_from_slice(&chunk);
-                if body.len() > MAX_BOOTSTRAP_SIZE {
-                    return Err(SeerError::RdapBootstrapError(format!(
-                        "bootstrap response too large (exceeds {} bytes)",
-                        MAX_BOOTSTRAP_SIZE
-                    )));
                 }
-            }
-            Ok::<(), SeerError>(())
-        })
-        .await;
-
-        match streamed {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => return Err(e),
-            Err(_) => {
-                return Err(SeerError::Timeout(format!(
+                BodyReadError::TooLarge => SeerError::RdapBootstrapError(format!(
+                    "bootstrap response too large (exceeds {} bytes)",
+                    MAX_BOOTSTRAP_SIZE
+                )),
+                BodyReadError::TimedOut => SeerError::Timeout(format!(
                     "RDAP bootstrap body read timed out after {:?}",
                     DEFAULT_TIMEOUT
-                )));
-            }
-        }
+                )),
+            })?;
 
         serde_json::from_slice(&body).map_err(Into::into)
     }

@@ -221,38 +221,81 @@ impl GuardedFetcher {
     /// Streams at most `self.max_body` bytes of the response body, bounded by
     /// an overall read timeout, and decodes them lossily as UTF-8.
     pub async fn read_body(&self, response: reqwest::Response) -> Result<String> {
-        let mut buf: Vec<u8> = Vec::with_capacity(8 * 1024);
-        let mut stream = response.bytes_stream();
+        let body = read_body_capped(response, self.max_body, self.timeout, Overflow::Truncate)
+            .await
+            .map_err(|e| match e {
+                // A truncated body is still usable for fingerprinting, but a
+                // read that never terminates is a failure.
+                BodyReadError::TimedOut => {
+                    SeerError::Timeout(format!("HTTP body read timed out after {:?}", self.timeout))
+                }
+                other => SeerError::HttpError(format!("body chunk: {other}")),
+            })?;
+        Ok(String::from_utf8_lossy(&body).into_owned())
+    }
+}
 
-        let read = tokio::time::timeout(self.timeout, async {
-            while buf.len() < self.max_body {
-                let Some(chunk) = stream.next().await else {
-                    break;
-                };
-                let chunk =
-                    chunk.map_err(|e| SeerError::HttpError(format!("body chunk: {}", e)))?;
-                let remaining = self.max_body - buf.len();
-                let take = remaining.min(chunk.len());
-                buf.extend_from_slice(&chunk[..take]);
-            }
-            Ok::<(), SeerError>(())
-        })
-        .await;
+/// What [`read_body_capped`] does once a body outgrows its cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Overflow {
+    /// Keep the first `cap` bytes and stop reading (inspection probes).
+    Truncate,
+    /// Fail with [`BodyReadError::TooLarge`] (parsers need the whole document).
+    Reject,
+}
 
-        match read {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => return Err(e),
-            // A truncated body is still usable for fingerprinting, but a read
-            // that never terminates is a failure — surface it as a timeout.
-            Err(_) => {
-                return Err(SeerError::Timeout(format!(
-                    "HTTP body read timed out after {:?}",
-                    self.timeout
-                )))
+/// Why a capped body read failed; each caller maps it into its own error
+/// domain (and, for retrying callers, its own transient/terminal split).
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum BodyReadError {
+    /// A chunk failed to arrive (connection reset, reqwest's own deadline).
+    #[error("{0}")]
+    Chunk(reqwest::Error),
+    /// The body outgrew the cap under [`Overflow::Reject`].
+    #[error("body exceeds the size cap")]
+    TooLarge,
+    /// The whole read outlasted its deadline.
+    #[error("body read timed out")]
+    TimedOut,
+}
+
+/// Streams `response`'s body under a byte `cap` and one overall `timeout`.
+///
+/// Streaming (rather than `bytes()`) means a server that omits or lies about
+/// `Content-Length` cannot force an unbounded buffer, and the deadline stops a
+/// server that trickles bytes forever from hanging the caller. A truncating
+/// read stops as soon as the cap is reached, without waiting on more data.
+pub(crate) async fn read_body_capped(
+    response: reqwest::Response,
+    cap: usize,
+    timeout: Duration,
+    overflow: Overflow,
+) -> std::result::Result<Vec<u8>, BodyReadError> {
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    let read = tokio::time::timeout(timeout, async {
+        while overflow == Overflow::Reject || body.len() < cap {
+            let Some(chunk) = stream.next().await else {
+                break;
+            };
+            let chunk = chunk.map_err(BodyReadError::Chunk)?;
+            let room = cap.saturating_sub(body.len());
+            if chunk.len() <= room {
+                body.extend_from_slice(&chunk);
+            } else if overflow == Overflow::Truncate {
+                body.extend_from_slice(&chunk[..room]);
+            } else {
+                return Err(BodyReadError::TooLarge);
             }
         }
+        Ok(())
+    })
+    .await;
 
-        Ok(String::from_utf8_lossy(&buf).into_owned())
+    match read {
+        Ok(Ok(())) => Ok(body),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(BodyReadError::TimedOut),
     }
 }
 
@@ -378,6 +421,26 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.body.len(), 128, "body must be truncated at the cap");
+    }
+
+    #[tokio::test]
+    async fn rejecting_read_accepts_the_cap_and_refuses_one_byte_more() {
+        let server = MockServer::start().await;
+        Mock::given(path("/body"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("x".repeat(100)))
+            .mount(&server)
+            .await;
+        let url = format!("{}/body", server.uri());
+        let read = |cap| {
+            let url = url.clone();
+            async move {
+                let resp = reqwest::get(url).await.unwrap();
+                read_body_capped(resp, cap, DEFAULT_TIMEOUT, Overflow::Reject).await
+            }
+        };
+
+        assert_eq!(read(100).await.unwrap().len(), 100);
+        assert!(matches!(read(99).await, Err(BodyReadError::TooLarge)));
     }
 
     #[tokio::test]
