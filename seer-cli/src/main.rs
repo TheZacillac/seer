@@ -1464,175 +1464,66 @@ async fn execute_command(
             fail_on,
             webhook,
         } => {
-            // Watchlist file I/O is blocking — run it on a blocking thread so it
-            // doesn't stall the async runtime (mirrors the History handler).
-            let mut watchlist = tokio::task::spawn_blocking(seer_core::Watchlist::load)
+            // add/remove/list share their pipeline with the REPL; failures go
+            // through `emit_error` so `--format json|yaml` stays structured.
+            if let Some(action) = action.as_deref() {
+                match ops::watch_edit(action, domain.as_deref(), "seer watch").await {
+                    Ok(message) => println!("{}", message),
+                    Err(e) => emit_error(output_format, &e),
+                }
+                return Ok(());
+            }
+            let watchlist = ops::load_watchlist()
                 .await
-                .unwrap_or_default();
-            // Usage/validation failures go through `emit_error` (non-zero
-            // exit) so `--format json|yaml` gets a structured error.
-            match action.as_deref() {
-                Some("add") => {
-                    let Some(domain) = domain.as_deref() else {
-                        emit_error(output_format, &"Usage: seer watch add <domain>");
-                    };
-                    match watchlist.add(domain) {
-                        Ok(true) => {
-                            let save_result =
-                                tokio::task::spawn_blocking(move || watchlist.save()).await;
-                            match save_result {
-                                Ok(Ok(())) => {}
-                                Ok(Err(e)) => return Err(e.into()),
-                                Err(e) => return Err(e.into()),
-                            }
-                            println!("Added {} to watchlist", domain.ctp_green());
-                        }
-                        Ok(false) => {
-                            println!("{} is already in the watchlist", domain);
-                        }
-                        Err(e) => {
-                            emit_error(output_format, &format!("Invalid domain: {}", e));
-                        }
-                    }
+                .unwrap_or_else(|e| emit_error(output_format, &e));
+            if watchlist.domains.is_empty() {
+                println!("{}", ops::watchlist_listing(&watchlist, "seer watch"));
+                return Ok(());
+            }
+            let spinner =
+                display::Spinner::new(&format!("Checking {} domains", watchlist.domains.len()));
+            let report = seer_core::check_watchlist_with_config(&watchlist.domains, config).await;
+            spinner.finish();
+            if quiet && handle_quiet_output(&report, &fields) {
+            } else {
+                println!("{}", formatter.format_watch(&report));
+            }
+            // Best-effort webhook delivery of the report: the --webhook flag
+            // overrides the config file's watch.webhook_url. A failed POST
+            // warns on stderr but never alters the check's exit code below.
+            let webhook_url = webhook.as_deref().or(config.watch.webhook_url.as_deref());
+            if let Some(url) = webhook_url {
+                let client = seer_core::webhook::WebhookClient::from_config(config);
+                if let Err(e) = client.post_json(url, &report).await {
+                    eprintln!("{} webhook delivery failed: {}", "Warning:".ctp_yellow(), e);
                 }
-                Some("remove") => {
-                    let Some(domain) = domain.as_deref() else {
-                        emit_error(output_format, &"Usage: seer watch remove <domain>");
-                    };
-                    if watchlist.remove(domain) {
-                        let save_result =
-                            tokio::task::spawn_blocking(move || watchlist.save()).await;
-                        match save_result {
-                            Ok(Ok(())) => {}
-                            Ok(Err(e)) => return Err(e.into()),
-                            Err(e) => return Err(e.into()),
-                        }
-                        println!("Removed {} from watchlist", domain.ctp_green());
-                    } else {
-                        println!("{} was not in the watchlist", domain);
-                    }
-                }
-                Some("list") => {
-                    if watchlist.domains.is_empty() {
-                        println!(
-                            "Watchlist is empty. Use 'seer watch add <domain>' to add domains."
-                        );
-                    } else {
-                        println!("Watchlist ({} domains):", watchlist.domains.len());
-                        for d in &watchlist.domains {
-                            println!("  - {}", d);
-                        }
-                    }
-                }
-                None => {
-                    if watchlist.domains.is_empty() {
-                        println!(
-                            "Watchlist is empty. Use 'seer watch add <domain>' to add domains."
-                        );
-                    } else {
-                        let spinner = Arc::new(display::Spinner::new(&format!(
-                            "Checking {} domains",
-                            watchlist.domains.len()
-                        )));
-                        let report =
-                            seer_core::check_watchlist_with_config(&watchlist.domains, config)
-                                .await;
-                        spinner.finish();
-                        if quiet && handle_quiet_output(&report, &fields) {
-                        } else {
-                            println!("{}", formatter.format_watch(&report));
-                        }
-                        // Best-effort webhook delivery of the report: the
-                        // --webhook flag overrides the config file's
-                        // watch.webhook_url. A failed POST warns on stderr
-                        // but never alters the check's exit code below.
-                        let webhook_url =
-                            webhook.as_deref().or(config.watch.webhook_url.as_deref());
-                        if let Some(url) = webhook_url {
-                            let client = seer_core::webhook::WebhookClient::from_config(config);
-                            if let Err(e) = client.post_json(url, &report).await {
-                                eprintln!(
-                                    "{} webhook delivery failed: {}",
-                                    "Warning:".ctp_yellow(),
-                                    e
-                                );
-                            }
-                        }
-                        // Exit 1 when issues at or above the --fail-on
-                        // threshold exist (mirrors drift/avail/dnssec).
-                        // `warnings` counts every result with issues, so it
-                        // already subsumes the critical ones; the `||` keeps
-                        // the check robust if that tally ever changes.
-                        let should_fail = match fail_on {
-                            FailOn::Critical => report.critical > 0,
-                            FailOn::Warning => report.warnings > 0 || report.critical > 0,
-                        };
-                        if should_fail {
-                            std::process::exit(1);
-                        }
-                    }
-                }
-                Some(other) => {
-                    emit_error(
-                        output_format,
-                        &format!("Unknown watch action: {}. Use: add, remove, list", other),
-                    );
-                }
+            }
+            // Exit 1 when issues at or above the --fail-on threshold exist
+            // (mirrors drift/avail/dnssec). `warnings` counts every result
+            // with issues, so it already subsumes the critical ones; the `||`
+            // keeps the check robust if that tally ever changes.
+            let should_fail = match fail_on {
+                FailOn::Critical => report.critical > 0,
+                FailOn::Warning => report.warnings > 0 || report.critical > 0,
+            };
+            if should_fail {
+                std::process::exit(1);
             }
         }
         Commands::History { domain, clear } => {
-            let mut history = tokio::task::spawn_blocking(seer_core::LookupHistory::load)
-                .await
-                .unwrap_or_default();
             if clear {
-                history.clear();
-                let save_result = tokio::task::spawn_blocking(move || history.save()).await;
-                match save_result {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => return Err(e.into()),
-                    Err(e) => return Err(e.into()),
+                if let Err(e) = ops::clear_history().await {
+                    emit_error(output_format, &e);
                 }
                 println!("Lookup history cleared");
-            } else if let Some(domain) = domain {
-                let entries = history.get(&domain);
-                if entries.is_empty() {
-                    println!("No history for {}", domain);
-                } else {
-                    println!(
-                        "History for {} ({} entries):",
-                        domain.ctp_green(),
-                        entries.len()
-                    );
-                    for entry in entries {
-                        let source = if entry.result.is_rdap() {
-                            "RDAP"
-                        } else if entry.result.is_whois() {
-                            "WHOIS"
-                        } else {
-                            "availability"
-                        };
-                        println!(
-                            "  [{}] via {} - registrar: {}",
-                            entry.timestamp.format("%Y-%m-%d %H:%M"),
-                            source,
-                            entry.result.registrar().unwrap_or_else(|| "—".to_string())
-                        );
-                    }
-                }
             } else {
-                let total: usize = history.entries.values().map(Vec::len).sum();
-                if total == 0 {
-                    println!("No lookup history. Run 'seer lookup <domain>' to build history.");
-                } else {
-                    println!(
-                        "Lookup history ({} entries across {} domains):",
-                        total,
-                        history.entries.len()
-                    );
-                    for (domain, entries) in &history.entries {
-                        println!("  {} ({} entries)", domain, entries.len());
-                    }
-                }
+                let history = ops::load_history()
+                    .await
+                    .unwrap_or_else(|e| emit_error(output_format, &e));
+                println!(
+                    "{}",
+                    ops::history_listing(&history, domain.as_deref(), "seer lookup")
+                );
             }
         }
         Commands::Doctor => {

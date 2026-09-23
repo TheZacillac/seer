@@ -35,7 +35,7 @@ use ratatui::Terminal;
 
 use action::{Action, Msg};
 use app::App;
-use seer_core::{LookupHistory, Watchlist};
+use seer_core::Watchlist;
 
 use crate::clipboard;
 
@@ -300,13 +300,8 @@ fn handle_action(
             let tx = tx.clone();
             let config = config.clone();
             tokio::spawn(async move {
-                tokio::task::spawn_blocking(|| {
-                    let mut h = LookupHistory::load();
-                    h.clear();
-                    let _ = h.save();
-                })
-                .await
-                .ok();
+                // Best-effort: the refreshed lens shows whatever remains.
+                let _ = crate::ops::clear_history().await;
                 // Refresh the history lens after clearing. `gen` is the history
                 // lens's current fetch generation (see WatchMutate above).
                 let result = data::fetch(action::FetchReq::History, &config).await;

@@ -283,6 +283,147 @@ pub async fn record_lookup_history(domain: &str, result: seer_core::LookupResult
     .ok();
 }
 
+/// Runs blocking `~/.seer` state-file I/O off the async executor, folding a
+/// failed task into the same `Failed to <what>: …` error as the I/O itself.
+async fn state_io<T, F>(what: &str, io: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> seer_core::Result<T> + Send + 'static,
+{
+    match tokio::task::spawn_blocking(io).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(e)) => Err(format!("Failed to {}: {}", what, e)),
+        Err(e) => Err(format!("Failed to {}: {}", what, e)),
+    }
+}
+
+pub async fn load_watchlist() -> Result<seer_core::Watchlist, String> {
+    state_io("load watchlist", || Ok(seer_core::Watchlist::load())).await
+}
+
+/// Runs `watch add|remove|list` and returns the confirmation to print.
+/// `cmd` is how the user invokes watch on this surface (`seer watch` in the
+/// CLI, `watch` in the REPL), for the usage error and the empty-list hint.
+pub async fn watch_edit(action: &str, domain: Option<&str>, cmd: &str) -> Result<String, String> {
+    let adding = match action {
+        "list" => return Ok(watchlist_listing(&load_watchlist().await?, cmd)),
+        "add" => true,
+        "remove" => false,
+        other => {
+            return Err(format!(
+                "Unknown watch action: {}. Use: add, remove, list",
+                other
+            ))
+        }
+    };
+    let domain = domain.ok_or_else(|| format!("Usage: {} {} <domain>", cmd, action))?;
+
+    let mut watchlist = load_watchlist().await?;
+    let changed = if adding {
+        watchlist
+            .add(domain)
+            .map_err(|e| format!("Invalid domain: {}", e))?
+    } else {
+        watchlist.remove(domain)
+    };
+    if changed {
+        state_io("save watchlist", move || watchlist.save()).await?;
+    }
+    Ok(match (adding, changed) {
+        (true, true) => format!("Added {} to watchlist", domain.ctp_green()),
+        (true, false) => format!("{} is already in the watchlist", domain),
+        (false, true) => format!("Removed {} from watchlist", domain.ctp_green()),
+        (false, false) => format!("{} was not in the watchlist", domain),
+    })
+}
+
+/// The `watch list` text, or the empty-watchlist hint (see [`watch_edit`]
+/// for `cmd`).
+pub fn watchlist_listing(watchlist: &seer_core::Watchlist, cmd: &str) -> String {
+    if watchlist.domains.is_empty() {
+        return format!(
+            "Watchlist is empty. Use '{} add <domain>' to add domains.",
+            cmd
+        );
+    }
+    let mut out = format!("Watchlist ({} domains):", watchlist.domains.len());
+    for domain in &watchlist.domains {
+        out.push_str(&format!("\n  - {}", domain));
+    }
+    out
+}
+
+pub async fn load_history() -> Result<seer_core::LookupHistory, String> {
+    state_io("load history", || Ok(seer_core::LookupHistory::load())).await
+}
+
+/// Empties `~/.seer/history.toml`.
+pub async fn clear_history() -> Result<(), String> {
+    state_io("clear history", || {
+        let mut history = seer_core::LookupHistory::load();
+        history.clear();
+        history.save()
+    })
+    .await
+}
+
+/// The `history` listing: one domain's lookups, or a per-domain summary.
+/// `lookup_cmd` (`seer lookup` / `lookup`) names the command in the
+/// empty-history hint.
+pub fn history_listing(
+    history: &seer_core::LookupHistory,
+    domain: Option<&str>,
+    lookup_cmd: &str,
+) -> String {
+    let Some(domain) = domain else {
+        let total: usize = history.entries.values().map(Vec::len).sum();
+        if total == 0 {
+            return format!(
+                "No lookup history. Run '{} <domain>' to build history.",
+                lookup_cmd
+            );
+        }
+        let mut out = format!(
+            "Lookup history ({} entries across {} domains):",
+            total,
+            history.entries.len()
+        );
+        for (domain, entries) in &history.entries {
+            out.push_str(&format!("\n  {} ({} entries)", domain, entries.len()));
+        }
+        return out;
+    };
+
+    let entries = history.get(domain);
+    if entries.is_empty() {
+        return format!("No history for {}", domain);
+    }
+    let mut out = format!(
+        "History for {} ({} entries):",
+        domain.ctp_green(),
+        entries.len()
+    );
+    for entry in entries {
+        out.push_str(&format!(
+            "\n  [{}] via {} - registrar: {}",
+            entry.timestamp.format("%Y-%m-%d %H:%M"),
+            lookup_source(&entry.result).unwrap_or("availability"),
+            entry.result.registrar().unwrap_or_else(|| "—".to_string())
+        ));
+    }
+    out
+}
+
+/// Which protocol answered a lookup, or `None` for an availability verdict
+/// (neither registry had the domain). Callers pick their own fallback text.
+pub fn lookup_source(result: &seer_core::LookupResult) -> Option<&'static str> {
+    match result {
+        seer_core::LookupResult::Rdap { .. } => Some("RDAP"),
+        seer_core::LookupResult::Whois { .. } => Some("WHOIS"),
+        seer_core::LookupResult::Available { .. } => None,
+    }
+}
+
 /// Outcome of a [`drift_check`]: the computed report plus whether a previous
 /// snapshot existed to compare against (drives the "no baseline" note).
 pub struct DriftOutcome {
@@ -517,6 +658,69 @@ mod tests {
     fn no_baseline_note_reflects_record_flag() {
         assert!(no_baseline_note("a.com", true).contains("recorded a baseline"));
         assert!(no_baseline_note("a.com", false).contains("--record"));
+    }
+
+    #[tokio::test]
+    async fn watch_edit_rejects_bad_actions_and_missing_domains_before_io() {
+        let err = watch_edit("bogus", Some("a.com"), "watch")
+            .await
+            .unwrap_err();
+        assert!(err.starts_with("Unknown watch action: bogus"), "got: {err}");
+        let err = watch_edit("add", None, "seer watch").await.unwrap_err();
+        assert_eq!(err, "Usage: seer watch add <domain>");
+        let err = watch_edit("remove", None, "watch").await.unwrap_err();
+        assert_eq!(err, "Usage: watch remove <domain>");
+    }
+
+    #[test]
+    fn watchlist_listing_names_the_surface_command_when_empty() {
+        let mut watchlist = seer_core::Watchlist::default();
+        assert_eq!(
+            watchlist_listing(&watchlist, "seer watch"),
+            "Watchlist is empty. Use 'seer watch add <domain>' to add domains."
+        );
+        watchlist.domains = vec!["a.com".into(), "b.com".into()];
+        assert_eq!(
+            watchlist_listing(&watchlist, "watch"),
+            "Watchlist (2 domains):\n  - a.com\n  - b.com"
+        );
+    }
+
+    #[test]
+    fn history_listing_covers_empty_summary_and_per_domain_views() {
+        let mut history = seer_core::LookupHistory::default();
+        assert_eq!(
+            history_listing(&history, None, "lookup"),
+            "No lookup history. Run 'lookup <domain>' to build history."
+        );
+        assert_eq!(
+            history_listing(&history, Some("a.com"), "lookup"),
+            "No history for a.com"
+        );
+
+        let available = seer_core::LookupResult::Available {
+            data: Box::new(seer_core::AvailabilityResult {
+                domain: "a.com".into(),
+                available: true,
+                confidence: "high".into(),
+                method: "rdap".into(),
+                details: None,
+            }),
+            rdap_error: "404".into(),
+            whois_error: "no match".into(),
+            whois_data: None,
+        };
+        history.record("a.com", available);
+        assert_eq!(
+            history_listing(&history, None, "seer lookup"),
+            "Lookup history (1 entries across 1 domains):\n  a.com (1 entries)"
+        );
+        let listing = history_listing(&history, Some("a.com"), "lookup");
+        assert!(listing.contains("(1 entries):"), "got: {listing}");
+        assert!(
+            listing.ends_with("via availability - registrar: —"),
+            "got: {listing}"
+        );
     }
 
     #[test]

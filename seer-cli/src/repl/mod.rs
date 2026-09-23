@@ -1344,151 +1344,51 @@ impl Repl {
     }
 
     async fn execute_watch(&mut self, args: &[&str]) -> CommandResult {
-        match args.first().copied() {
-            Some("add") => {
-                let Some(domain) = args.get(1) else {
-                    return CommandResult::Error("Usage: watch add <domain>".to_string());
-                };
-                let mut watchlist = match load_watchlist_async().await {
-                    Ok(w) => w,
-                    Err(e) => return CommandResult::Error(e),
-                };
-                match watchlist.add(domain) {
-                    Ok(true) => {
-                        if let Err(e) = save_watchlist_async(watchlist).await {
-                            return CommandResult::Error(format!("Failed to save: {}", e));
-                        }
-                        println!("Added {} to watchlist", domain);
-                    }
-                    Ok(false) => {
-                        println!("{} is already in the watchlist", domain);
-                    }
-                    Err(e) => {
-                        return CommandResult::Error(format!("Invalid domain: {}", e));
-                    }
+        if let Some(action) = args.first() {
+            return match crate::ops::watch_edit(action, args.get(1).copied(), "watch").await {
+                Ok(message) => {
+                    println!("{}", message);
+                    CommandResult::Continue
                 }
-                CommandResult::Continue
-            }
-            Some("remove") => {
-                let Some(domain) = args.get(1) else {
-                    return CommandResult::Error("Usage: watch remove <domain>".to_string());
-                };
-                let mut watchlist = match load_watchlist_async().await {
-                    Ok(w) => w,
-                    Err(e) => return CommandResult::Error(e),
-                };
-                if watchlist.remove(domain) {
-                    if let Err(e) = save_watchlist_async(watchlist).await {
-                        return CommandResult::Error(format!("Failed to save: {}", e));
-                    }
-                    println!("Removed {} from watchlist", domain);
-                } else {
-                    println!("{} was not in the watchlist", domain);
-                }
-                CommandResult::Continue
-            }
-            Some("list") => {
-                let watchlist = match load_watchlist_async().await {
-                    Ok(w) => w,
-                    Err(e) => return CommandResult::Error(e),
-                };
-                if watchlist.domains.is_empty() {
-                    println!("Watchlist is empty. Use 'watch add <domain>' to add domains.");
-                } else {
-                    println!("Watchlist ({} domains):", watchlist.domains.len());
-                    for d in &watchlist.domains {
-                        println!("  - {}", d);
-                    }
-                }
-                CommandResult::Continue
-            }
-            None => {
-                let watchlist = match load_watchlist_async().await {
-                    Ok(w) => w,
-                    Err(e) => return CommandResult::Error(e),
-                };
-                if watchlist.domains.is_empty() {
-                    println!("Watchlist is empty. Use 'watch add <domain>' to add domains.");
-                    return CommandResult::Continue;
-                }
-                let spinner =
-                    Spinner::new(&format!("Checking {} domains", watchlist.domains.len()));
-                let report = seer_core::check_watchlist_with_config(
-                    &watchlist.domains,
-                    &self.context.config,
-                )
-                .await;
-                spinner.finish();
-                let formatter = seer_core::output::get_formatter(self.context.output_format);
-                println!("{}", formatter.format_watch(&report));
-                self.last_result = Some(crate::payload::Payload::Watch(Box::new(report.clone())));
-                CommandResult::Continue
-            }
-            Some(other) => CommandResult::Error(format!(
-                "Unknown watch action: {}. Use: add, remove, list",
-                other
-            )),
+                Err(e) => CommandResult::Error(e),
+            };
         }
-    }
-
-    async fn execute_history(&self, args: &[&str]) -> CommandResult {
-        // History I/O is blocking file work; offload off the Tokio worker so
-        // the REPL stays responsive to other in-flight tasks.
-        let mut history = match tokio::task::spawn_blocking(seer_core::LookupHistory::load).await {
-            Ok(h) => h,
-            Err(e) => return CommandResult::Error(format!("Failed to load history: {}", e)),
+        let watchlist = match crate::ops::load_watchlist().await {
+            Ok(w) => w,
+            Err(e) => return CommandResult::Error(e),
         };
-        if args.contains(&"--clear") {
-            history.clear();
-            let save_result = tokio::task::spawn_blocking(move || history.save()).await;
-            match save_result {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => return CommandResult::Error(format!("Failed to clear: {}", e)),
-                Err(e) => return CommandResult::Error(format!("Failed to clear: {}", e)),
-            }
-            println!("Lookup history cleared");
+        if watchlist.domains.is_empty() {
+            println!("{}", crate::ops::watchlist_listing(&watchlist, "watch"));
             return CommandResult::Continue;
         }
-        if let Some(domain) = args.first() {
-            let entries = history.get(domain);
-            if entries.is_empty() {
-                println!("No history for {}", domain);
-            } else {
-                println!("History for {} ({} entries):", domain, entries.len());
-                for entry in entries {
-                    let source = if entry.result.is_rdap() {
-                        "RDAP"
-                    } else if entry.result.is_whois() {
-                        "WHOIS"
-                    } else {
-                        "availability"
-                    };
-                    println!(
-                        "  [{}] via {} - registrar: {}",
-                        entry.timestamp.format("%Y-%m-%d %H:%M"),
-                        source,
-                        entry.result.registrar().unwrap_or_else(|| "—".to_string())
-                    );
-                }
-            }
-        } else {
-            let total: usize = history.entries.values().map(Vec::len).sum();
-            if total == 0 {
-                println!("No lookup history.");
-            } else {
-                println!(
-                    "Lookup history ({} entries across {} domains):",
-                    total,
-                    history.entries.len()
-                );
-                for (domain, entries) in &history.entries {
-                    println!("  {} ({} entries)", domain, entries.len());
-                }
-            }
-        }
+        let spinner = Spinner::new(&format!("Checking {} domains", watchlist.domains.len()));
+        let report =
+            seer_core::check_watchlist_with_config(&watchlist.domains, &self.context.config).await;
+        spinner.finish();
+        let formatter = seer_core::output::get_formatter(self.context.output_format);
+        println!("{}", formatter.format_watch(&report));
+        self.last_result = Some(crate::payload::Payload::Watch(Box::new(report)));
         CommandResult::Continue
     }
 
+    async fn execute_history(&self, args: &[&str]) -> CommandResult {
+        let result = if args.contains(&"--clear") {
+            crate::ops::clear_history()
+                .await
+                .map(|()| "Lookup history cleared".to_string())
+        } else {
+            crate::ops::load_history().await.map(|history| {
+                crate::ops::history_listing(&history, args.first().copied(), "lookup")
+            })
+        };
+        match result {
+            Ok(text) => {
+                println!("{}", text);
+                CommandResult::Continue
+            }
+            Err(e) => CommandResult::Error(e),
+        }
+    }
     /// Pure part of `copy`: pick the format, serialize the last result.
     /// Returns (text to place on the clipboard, confirmation message).
     fn render_copy(&self, args: &[&str]) -> Result<(String, String), String> {
@@ -1556,25 +1456,6 @@ impl Repl {
             },
             _ => CommandResult::Error(format!("Unknown setting: {}", args[0])),
         }
-    }
-}
-
-/// Load the watchlist off the Tokio worker. The file read + TOML parse are
-/// blocking; offloading keeps the REPL responsive to other in-flight tasks
-/// (mirrors the history I/O handling in `execute_history`).
-async fn load_watchlist_async() -> Result<seer_core::Watchlist, String> {
-    tokio::task::spawn_blocking(seer_core::Watchlist::load)
-        .await
-        .map_err(|e| format!("Failed to load watchlist: {}", e))
-}
-
-/// Save the watchlist off the Tokio worker. Flattens the `spawn_blocking` join
-/// error and the inner save error into a single message.
-async fn save_watchlist_async(watchlist: seer_core::Watchlist) -> Result<(), String> {
-    match tokio::task::spawn_blocking(move || watchlist.save()).await {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(e)) => Err(e.to_string()),
-        Err(e) => Err(e.to_string()),
     }
 }
 
