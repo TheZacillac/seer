@@ -41,7 +41,10 @@ dependencies = [
     # routers and MCP server call. 0.44 is required for `delegation` and
     # `all_tlds` (added in v0.44.0) and `record_types` (v0.45.0) — a lower
     # resolution installs cleanly and then AttributeErrors at request time,
-    # so bump this whenever a new binding is called.
+    # so bump this whenever a new binding is called. PENDING: the SSRF guard
+    # now calls `nameserver_target` (added after v0.48.0); raise this to the
+    # next release at its version bump (the in-repo seer-py is still 0.48.0,
+    # so a higher floor cannot resolve yet).
     "domain-seer>=0.48.0",
     "slowapi>=0.1.9",
     # Imported directly (the /mcp and per-tool MCP rate limiters; the raw
