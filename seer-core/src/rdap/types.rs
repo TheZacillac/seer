@@ -586,12 +586,7 @@ impl RdapResponse {
     }
 
     pub fn get_registrar(&self) -> Option<String> {
-        for entity in &self.entities {
-            if entity.roles.iter().any(|r| r == "registrar") {
-                return entity.get_name().or_else(|| entity.non_empty_handle());
-            }
-        }
-        None
+        self.entity_name("registrar")
     }
 
     /// Extracts structured registrar object detail — ICANN abuse contact, IANA
@@ -649,12 +644,13 @@ impl RdapResponse {
     }
 
     pub fn get_registrant(&self) -> Option<String> {
-        for entity in &self.entities {
-            if entity.roles.iter().any(|r| r == "registrant") {
-                return entity.get_name().or_else(|| entity.non_empty_handle());
-            }
-        }
-        None
+        self.entity_name("registrant")
+    }
+
+    /// Name (else handle) of the first entity holding `role`.
+    fn entity_name(&self, role: &str) -> Option<String> {
+        let entity = self.get_entity_by_role(role)?;
+        entity.get_name().or_else(|| entity.non_empty_handle())
     }
 
     pub fn get_registrant_organization(&self) -> Option<String> {
@@ -672,18 +668,20 @@ impl RdapResponse {
         None
     }
 
-    pub fn creation_date(&self) -> Option<DateTime<Utc>> {
+    /// Date of the first event with the given RFC 9083 `eventAction`.
+    fn event_date(&self, action: &str) -> Option<DateTime<Utc>> {
         self.events
             .iter()
-            .find(|e| e.event_action == "registration")
+            .find(|e| e.event_action == action)
             .and_then(|e| e.parsed_date())
     }
 
+    pub fn creation_date(&self) -> Option<DateTime<Utc>> {
+        self.event_date("registration")
+    }
+
     pub fn expiration_date(&self) -> Option<DateTime<Utc>> {
-        self.events
-            .iter()
-            .find(|e| e.event_action == "expiration")
-            .and_then(|e| e.parsed_date())
+        self.event_date("expiration")
     }
 
     /// When the domain object itself last changed (the RFC 9083
@@ -697,10 +695,7 @@ impl RdapResponse {
     /// without a `last changed` event reports `None`, letting callers fall
     /// back to WHOIS's updated date instead.
     pub fn last_updated(&self) -> Option<DateTime<Utc>> {
-        self.events
-            .iter()
-            .find(|e| e.event_action == "last changed")
-            .and_then(|e| e.parsed_date())
+        self.event_date("last changed")
     }
 
     pub fn nameserver_names(&self) -> Vec<String> {

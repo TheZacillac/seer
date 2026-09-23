@@ -11,9 +11,7 @@ use std::sync::LazyLock;
 use tokio::sync::{Notify, RwLock};
 use tracing::{debug, info, instrument, warn};
 
-use super::bootstrap::{
-    ipv4_matches_prefix, ipv6_matches_prefix, parse_asn_range, validate_bootstrap_url,
-};
+use super::bootstrap::{ip_matches_prefix, parse_asn_range, validate_bootstrap_url};
 use super::types::RdapResponse;
 use crate::error::{Result, SeerError};
 use crate::retry::{NetworkRetryClassifier, RetryClassifier, RetryExecutor, RetryPolicy};
@@ -493,36 +491,42 @@ impl RdapClient {
     }
 
     /// Looks up the candidate RDAP base URLs for an IP address.
-    fn get_rdap_urls_for_ip(cache: &BootstrapData, ip: &IpAddr) -> Option<Arc<Vec<url::Url>>> {
-        match ip {
-            IpAddr::V4(addr) => {
-                for (range, urls) in &cache.ipv4 {
-                    if ipv4_matches_prefix(&range.prefix, addr) {
-                        return Some(Arc::clone(urls));
-                    }
-                }
-            }
-            IpAddr::V6(addr) => {
-                for (range, urls) in &cache.ipv6 {
-                    if ipv6_matches_prefix(&range.prefix, addr) {
-                        return Some(Arc::clone(urls));
-                    }
-                }
-            }
-        }
-
-        None
+    fn get_rdap_urls_for_ip(cache: &BootstrapData, ip: IpAddr) -> Option<Arc<Vec<url::Url>>> {
+        let ranges = match ip {
+            IpAddr::V4(_) => &cache.ipv4,
+            IpAddr::V6(_) => &cache.ipv6,
+        };
+        ranges
+            .iter()
+            .find(|(range, _)| ip_matches_prefix(&range.prefix, ip))
+            .map(|(_, urls)| Arc::clone(urls))
     }
 
     /// Looks up the candidate RDAP base URLs for an ASN.
     fn get_rdap_urls_for_asn(cache: &BootstrapData, asn: u32) -> Option<Arc<Vec<url::Url>>> {
-        for (range, urls) in &cache.asn {
-            if asn >= range.start && asn <= range.end {
-                return Some(Arc::clone(urls));
-            }
-        }
+        cache
+            .asn
+            .iter()
+            .find(|(range, _)| (range.start..=range.end).contains(&asn))
+            .map(|(_, urls)| Arc::clone(urls))
+    }
 
-        None
+    /// Resolves the candidate query URLs for one lookup: `pick` selects the
+    /// base URLs from the loaded bootstrap (`what` names the query in the
+    /// "no RDAP server" error) and each is joined with `path`. The cache lock
+    /// is released on return, before any HTTP request.
+    async fn candidate_urls(
+        pick: impl FnOnce(&BootstrapData) -> Option<Arc<Vec<url::Url>>>,
+        what: &str,
+        path: &str,
+    ) -> Result<Vec<url::Url>> {
+        let cache_guard = BOOTSTRAP_CACHE.read().await;
+        let cache = cache_guard.as_ref().ok_or_else(|| {
+            SeerError::RdapBootstrapError("bootstrap data not loaded".to_string())
+        })?;
+        let bases = pick(&cache.data)
+            .ok_or_else(|| SeerError::RdapBootstrapError(format!("no RDAP server for {}", what)))?;
+        Ok(build_rdap_urls(&bases, path))
     }
 
     /// Looks up RDAP registration data for a domain.
@@ -533,21 +537,12 @@ impl RdapClient {
         self.ensure_bootstrap().await?;
 
         let domain = normalize_domain(domain)?;
-
-        // Extract candidate URLs while holding the lock, then release before HTTP requests.
-        let urls = {
-            let cache_guard = BOOTSTRAP_CACHE.read().await;
-            let cache = cache_guard.as_ref().ok_or_else(|| {
-                SeerError::RdapBootstrapError("bootstrap data not loaded".to_string())
-            })?;
-
-            let bases = Self::get_rdap_urls_for_domain(&cache.data, &domain).ok_or_else(|| {
-                SeerError::RdapBootstrapError(format!("no RDAP server for {}", domain))
-            })?;
-
-            build_rdap_urls(&bases, &format!("domain/{}", domain))
-        }; // Lock released here
-
+        let urls = Self::candidate_urls(
+            |data| Self::get_rdap_urls_for_domain(data, &domain),
+            &domain,
+            &format!("domain/{}", domain),
+        )
+        .await?;
         self.query_rdap_urls(&urls).await
     }
 
@@ -561,20 +556,12 @@ impl RdapClient {
         let ip_addr: IpAddr = ip
             .parse()
             .map_err(|_| SeerError::InvalidIpAddress(ip.to_string()))?;
-
-        let urls = {
-            let cache_guard = BOOTSTRAP_CACHE.read().await;
-            let cache = cache_guard.as_ref().ok_or_else(|| {
-                SeerError::RdapBootstrapError("bootstrap data not loaded".to_string())
-            })?;
-
-            let bases = Self::get_rdap_urls_for_ip(&cache.data, &ip_addr).ok_or_else(|| {
-                SeerError::RdapBootstrapError(format!("no RDAP server for {}", ip))
-            })?;
-
-            build_rdap_urls(&bases, &format!("ip/{}", ip))
-        };
-
+        let urls = Self::candidate_urls(
+            |data| Self::get_rdap_urls_for_ip(data, ip_addr),
+            ip,
+            &format!("ip/{}", ip),
+        )
+        .await?;
         self.query_rdap_urls(&urls).await
     }
 
@@ -584,20 +571,12 @@ impl RdapClient {
     #[instrument(skip(self), fields(asn = %asn))]
     pub async fn lookup_asn(&self, asn: u32) -> Result<RdapResponse> {
         self.ensure_bootstrap().await?;
-
-        let urls = {
-            let cache_guard = BOOTSTRAP_CACHE.read().await;
-            let cache = cache_guard.as_ref().ok_or_else(|| {
-                SeerError::RdapBootstrapError("bootstrap data not loaded".to_string())
-            })?;
-
-            let bases = Self::get_rdap_urls_for_asn(&cache.data, asn).ok_or_else(|| {
-                SeerError::RdapBootstrapError(format!("no RDAP server for AS{}", asn))
-            })?;
-
-            build_rdap_urls(&bases, &format!("autnum/{}", asn))
-        };
-
+        let urls = Self::candidate_urls(
+            |data| Self::get_rdap_urls_for_asn(data, asn),
+            &format!("AS{}", asn),
+            &format!("autnum/{}", asn),
+        )
+        .await?;
         self.query_rdap_urls(&urls).await
     }
 
