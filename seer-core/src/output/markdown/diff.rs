@@ -12,17 +12,12 @@ impl MarkdownFormatter {
                 None => dash.to_string(),
             }
         };
-        // Sanitize and wrap each item in its own code span BEFORE joining, so
-        // the `, ` separator's backticks aren't fed through MdSafe (which would
-        // mangle them into apostrophes). Mirrors every other markdown formatter.
+        // Each item is its own code span (see `code_list`), or a dash.
         let list_or_dash = |v: &Vec<String>| -> String {
             if v.is_empty() {
                 dash.to_string()
             } else {
-                v.iter()
-                    .map(|s| format!("`{}`", MdSafe(s)))
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                code_list(v)
             }
         };
 

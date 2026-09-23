@@ -1,5 +1,7 @@
 use std::fmt::{self, Write as _};
 
+use chrono::{DateTime, Utc};
+
 use super::OutputFormatter;
 
 // Shared with the per-concern submodules below (each does `use super::*`).
@@ -158,9 +160,7 @@ impl MarkdownFormatter {
         if !caa.has_policy {
             out.push("*No CAA records (any CA may issue)*".to_string());
         } else {
-            if let Some(ref eff) = caa.effective_domain {
-                out.push(format!("- **Found at**: `{}`", MdSafe(eff)));
-            }
+            Bullets(&mut out).code_opt("Found at", &caa.effective_domain);
             out.push(String::new());
             out.push("| Flags | Tag | Value |".to_string());
             out.push("| --- | --- | --- |".to_string());
@@ -191,43 +191,107 @@ impl MarkdownFormatter {
     }
 }
 
-/// Renders one `### <role> Contact` subsection with a bullet per populated
-/// field; nothing for an empty contact.
-///
-/// Callers push these only *after* every domain-level bullet: a `###`
-/// heading scopes everything below it, so a Created/Expires/Nameservers
-/// bullet emitted after a contact section renders as part of that contact.
-fn push_contact(output: &mut Vec<String>, role: &str, c: Contact<'_>) {
-    if c.is_empty() {
-        return;
-    }
-    output.push(String::new());
-    output.push(format!("### {} Contact", role));
-    output.push(String::new());
-    if let Some(ref v) = *c.name {
-        output.push(format!("- **Name**: {}", MdSafe(v)));
-    }
-    if let Some(ref v) = *c.organization {
-        output.push(format!("- **Organization**: {}", MdSafe(v)));
-    }
-    if let Some(ref v) = *c.email {
-        output.push(format!("- **Email**: `{}`", MdSafe(v)));
-    }
-    if let Some(ref v) = *c.phone {
-        output.push(format!("- **Phone**: {}", MdSafe(v)));
-    }
-    if let Some(ref v) = *c.address {
-        output.push(format!("- **Address**: {}", MdSafe(v)));
-    }
-    if let Some(ref v) = *c.country {
-        output.push(format!("- **Country**: {}", MdSafe(v)));
-    }
+/// `` `a`, `b` ``: each item in its own [`MdSafe`] code span, joined by a
+/// plain `, ` (the separator's backticks must never pass through `MdSafe`,
+/// which would turn them into apostrophes).
+fn code_list<S: AsRef<str>>(items: &[S]) -> String {
+    items
+        .iter()
+        .map(|item| format!("`{}`", MdSafe(item.as_ref())))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
-/// [`push_contact`] for each of [`contact::ROLES`].
-fn push_contacts(output: &mut Vec<String>, contacts: [Contact<'_>; 3]) {
-    for (role, c) in contact::ROLES.into_iter().zip(contacts) {
-        push_contact(output, role, c);
+/// Appends `- **Label**: value` bullets. Remote values go through [`MdSafe`]
+/// here, so no bullet can skip the Markdown-injection guard.
+struct Bullets<'a>(&'a mut Vec<String>);
+
+impl Bullets<'_> {
+    /// Appends a pre-built line as-is.
+    fn push(&mut self, line: String) {
+        self.0.push(line);
+    }
+
+    /// `- **label**: value` for a value the caller already rendered safely.
+    fn raw(&mut self, label: &str, value: impl fmt::Display) {
+        self.0.push(format!("- **{label}**: {value}"));
+    }
+
+    /// `- **label**: value` for remote text.
+    fn text(&mut self, label: &str, value: &str) {
+        self.raw(label, MdSafe(value));
+    }
+
+    /// [`Self::text`], skipped when the field is absent.
+    fn opt(&mut self, label: &str, value: &Option<String>) {
+        if let Some(value) = value {
+            self.text(label, value);
+        }
+    }
+
+    /// `` - **label**: `value` `` for remote text shown as a code span.
+    fn code(&mut self, label: &str, value: &str) {
+        self.0.push(format!("- **{label}**: `{}`", MdSafe(value)));
+    }
+
+    /// [`Self::code`], skipped when the field is absent.
+    fn code_opt(&mut self, label: &str, value: &Option<String>) {
+        if let Some(value) = value {
+            self.code(label, value);
+        }
+    }
+
+    /// `` - **label**: `a`, `b` `` (see [`code_list`]); nothing when empty.
+    fn code_list(&mut self, label: &str, items: &[String]) {
+        if !items.is_empty() {
+            self.raw(label, code_list(items));
+        }
+    }
+
+    /// `` - **label**: `YYYY-MM-DD` ``, skipped when absent.
+    fn date(&mut self, label: &str, date: Option<DateTime<Utc>>) {
+        if let Some(date) = date {
+            self.0
+                .push(format!("- **{label}**: `{}`", date.format("%Y-%m-%d")));
+        }
+    }
+
+    /// `` - **Expires**: `YYYY-MM-DD` (N days) ``, skipped when absent.
+    fn expires(&mut self, date: Option<DateTime<Utc>>) {
+        if let Some(date) = date {
+            self.0.push(format!(
+                "- **Expires**: `{}` ({} days)",
+                date.format("%Y-%m-%d"),
+                days_until(date)
+            ));
+        }
+    }
+
+    /// One `### <role> Contact` subsection with a bullet per populated
+    /// field; nothing for an empty contact.
+    ///
+    /// Push these only *after* every domain-level bullet: a `###` heading
+    /// scopes everything below it, so a Created/Expires/Nameservers bullet
+    /// emitted after a contact section renders as part of that contact.
+    fn contact(&mut self, role: &str, c: Contact<'_>) {
+        if c.is_empty() {
+            return;
+        }
+        self.0
+            .extend([String::new(), format!("### {role} Contact"), String::new()]);
+        self.opt("Name", c.name);
+        self.opt("Organization", c.organization);
+        self.code_opt("Email", c.email);
+        self.opt("Phone", c.phone);
+        self.opt("Address", c.address);
+        self.opt("Country", c.country);
+    }
+
+    /// [`Self::contact`] for each of [`contact::ROLES`].
+    fn contacts(&mut self, contacts: [Contact<'_>; 3]) {
+        for (role, c) in contact::ROLES.into_iter().zip(contacts) {
+            self.contact(role, c);
+        }
     }
 }
 

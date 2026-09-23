@@ -256,114 +256,60 @@ impl MarkdownFormatter {
     }
 
     pub(super) fn format_dns_comparison(&self, comparison: &crate::dns::DnsComparison) -> String {
-        let mut output = Vec::new();
-
-        output.push(format!(
-            "## DNS Comparison: {} {}",
-            MdSafe(&comparison.domain),
-            comparison.record_type
-        ));
-        output.push(String::new());
-
-        if comparison.matches {
-            output.push("**Result**: Records match".to_string());
+        let result = if comparison.matches {
+            "**Result**: Records match"
         } else {
-            output.push("**Result**: Records differ".to_string());
-        }
-        output.push(String::new());
+            "**Result**: Records differ"
+        };
+        let mut output = vec![
+            format!(
+                "## DNS Comparison: {} {}",
+                MdSafe(&comparison.domain),
+                comparison.record_type
+            ),
+            String::new(),
+            result.to_string(),
+            String::new(),
+        ];
 
-        // Server A
-        output.push(format!(
-            "### Server A ({})",
-            MdSafe(&comparison.server_a.nameserver)
-        ));
-        output.push(String::new());
-        if let Some(ref err) = comparison.server_a.error {
-            output.push(format!("**Error**: {}", MdSafe(err)));
-        } else if comparison.server_a.records.is_empty() {
-            output.push("*No records found*".to_string());
-        } else {
-            output.push("| Record |".to_string());
-            output.push("| --- |".to_string());
-            for record in &comparison.server_a.records {
-                let s = record.format_short();
-                output.push(format!("| `{}` |", MdSafe(&s)));
+        for (label, server) in [
+            ("Server A", &comparison.server_a),
+            ("Server B", &comparison.server_b),
+        ] {
+            output.push(format!("### {} ({})", label, MdSafe(&server.nameserver)));
+            output.push(String::new());
+            if let Some(ref err) = server.error {
+                output.push(format!("**Error**: {}", MdSafe(err)));
+            } else if server.records.is_empty() {
+                output.push("*No records found*".to_string());
+            } else {
+                output.push("| Record |".to_string());
+                output.push("| --- |".to_string());
+                for record in &server.records {
+                    output.push(format!("| `{}` |", MdSafe(&record.format_short())));
+                }
             }
+            output.push(String::new());
         }
-        output.push(String::new());
-
-        // Server B
-        output.push(format!(
-            "### Server B ({})",
-            MdSafe(&comparison.server_b.nameserver)
-        ));
-        output.push(String::new());
-        if let Some(ref err) = comparison.server_b.error {
-            output.push(format!("**Error**: {}", MdSafe(err)));
-        } else if comparison.server_b.records.is_empty() {
-            output.push("*No records found*".to_string());
-        } else {
-            output.push("| Record |".to_string());
-            output.push("| --- |".to_string());
-            for record in &comparison.server_b.records {
-                let s = record.format_short();
-                output.push(format!("| `{}` |", MdSafe(&s)));
-            }
-        }
-        output.push(String::new());
 
         // Differences
         output.push("### Comparison".to_string());
         output.push(String::new());
-
-        if comparison.common.is_empty() {
-            output.push("- **Common**: *(none)*".to_string());
-        } else {
-            output.push(format!(
-                "- **Common**: {}",
-                comparison
-                    .common
-                    .iter()
-                    .map(|r| format!("`{}`", MdSafe(r)))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
-        }
-
-        if comparison.only_in_a.is_empty() {
-            output.push(format!(
-                "- **Only in {}**: *(none)*",
-                MdSafe(&comparison.server_a.nameserver)
-            ));
-        } else {
-            output.push(format!(
-                "- **Only in {}**: {}",
-                MdSafe(&comparison.server_a.nameserver),
-                comparison
-                    .only_in_a
-                    .iter()
-                    .map(|r| format!("`{}`", MdSafe(r)))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
-        }
-
-        if comparison.only_in_b.is_empty() {
-            output.push(format!(
-                "- **Only in {}**: *(none)*",
-                MdSafe(&comparison.server_b.nameserver)
-            ));
-        } else {
-            output.push(format!(
-                "- **Only in {}**: {}",
-                MdSafe(&comparison.server_b.nameserver),
-                comparison
-                    .only_in_b
-                    .iter()
-                    .map(|r| format!("`{}`", MdSafe(r)))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
+        let listed = |values: &[String]| {
+            if values.is_empty() {
+                "*(none)*".to_string()
+            } else {
+                code_list(values)
+            }
+        };
+        let mut b = Bullets(&mut output);
+        b.raw("Common", listed(&comparison.common));
+        for (server, only) in [
+            (&comparison.server_a, &comparison.only_in_a),
+            (&comparison.server_b, &comparison.only_in_b),
+        ] {
+            let label = format!("Only in {}", MdSafe(&server.nameserver));
+            b.raw(&label, listed(only));
         }
 
         output.join("\n")
@@ -443,7 +389,7 @@ mod tests {
         let iteration = FollowIteration {
             iteration: 2,
             total_iterations: 3,
-            timestamp: chrono::Utc::now(),
+            timestamp: Utc::now(),
             records: vec![DnsRecord {
                 name: "example.com".to_string(),
                 record_type: RecordType::A,
