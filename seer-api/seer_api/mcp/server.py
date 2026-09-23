@@ -676,7 +676,9 @@ async def call_tool(
         )
     try:
         result = await execute_tool(name, arguments)
-        payload = UNTRUSTED_PREAMBLE + json.dumps(result, indent=2, default=str)
+        # Compact separators: indentation is pure token overhead in the host
+        # LLM's context (~40% of a lookup payload).
+        payload = UNTRUSTED_PREAMBLE + json.dumps(result, separators=(",", ":"), default=str)
         return [TextContent(type="text", text=payload)]
     except ValueError as e:
         return _error_result(_invalid_input_message(e))
