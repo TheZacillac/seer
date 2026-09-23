@@ -347,14 +347,18 @@ result = seer.lookup("example.com")
 
 # WHOIS / RDAP
 whois = seer.whois("example.com")
+rdap  = seer.rdap("8.8.8.8")                     # Auto-routes IP / ASN / domain (alias: rdap_auto)
 rdap  = seer.rdap_domain("example.com")
 rdap  = seer.rdap_ip("8.8.8.8")
 rdap  = seer.rdap_asn(15169)
 
 # DNS
-records     = seer.dig("example.com", record_type="MX")
+records     = seer.dig("example.com", record_type="MX", nameserver="tls://1.1.1.1")
 propagation = seer.propagation("example.com", record_type="A")
 delegation  = seer.delegation("example.com")     # Parent vs. zone NS + lameness
+follow      = seer.dns_follow("example.com", "A", iterations=3, interval_minutes=1.0)
+seer.cancel_follow()                             # Stop a running dns_follow from another thread
+types       = seer.record_types()                # The 16 supported record types
 
 # Domain health & SSL
 status = seer.status("example.com")
@@ -387,6 +391,15 @@ results = seer.bulk_dig(["example.com", "google.com"], record_type="A")
 results = seer.bulk_info(["example.com", "google.com"])
 results = seer.bulk_ssl(["example.com", "google.com"])
 results = seer.bulk_availability(["example.com", "google.com"])
+results = seer.bulk_whois(["example.com", "google.com"])
+results = seer.bulk_propagation(["example.com"], record_type="A", concurrency=5)
+
+# Every bulk_* call takes an optional keyword-only progress callback
+results = seer.bulk_lookup(domains, progress=lambda done, total, domain: print(f"{done}/{total} {domain}"))
+
+# SSRF helpers (used by seer-api before any user-supplied connect target)
+seer.validate_public_host("example.com", 443)   # ValueError on reserved/private addresses
+seer.nameserver_target("tls://1.1.1.1")          # ("1.1.1.1", 853); None if the spec is invalid
 ```
 
 <details>

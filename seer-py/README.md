@@ -32,5 +32,6 @@ Every call is synchronous and returns plain Python data. Errors raise
 built-in exceptions: `ValueError` for invalid input, `TimeoutError` and
 `ConnectionError` for transient network failures, `RuntimeError` otherwise.
 
-The full function list is in the
-[Python Library section of the main README](https://github.com/TheZacillac/seer#-python-library).
+Every exported function is shown in the
+[Python Library section of the main README](https://github.com/TheZacillac/seer#-python-library);
+`seer.__all__` lists them and `help(seer.<name>)` shows each one's docstring.
