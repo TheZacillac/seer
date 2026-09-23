@@ -1,3 +1,11 @@
+//! Interactive REPL, launched when `seer` runs without a subcommand.
+//!
+//! A rustyline loop with tab completion ([`SeerCompleter`]) and history in
+//! `~/.seer_history` (a line typed with a leading space is not recorded).
+//! [`CommandContext`] holds the session state: the output format (`set
+//! output`) and the user config the clients are built from. `copy` puts the
+//! last result on the clipboard.
+
 mod commands;
 mod completer;
 
