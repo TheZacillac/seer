@@ -32,155 +32,62 @@ pub struct Lens {
     pub tabs: &'static [&'static str],
 }
 
-const NO_TABS: &[&str] = &[];
+/// A tab-less lens whose `:` command is its key; `.cmd()` / `.tabs()` override.
+const fn lens(
+    key: &'static str,
+    label: &'static str,
+    glyph: &'static str,
+    group: &'static str,
+) -> Lens {
+    Lens {
+        key,
+        label,
+        glyph,
+        cmd: key,
+        group,
+        tabs: &[],
+    }
+}
+
+impl Lens {
+    /// `:` command alias, for lenses whose command differs from their key.
+    const fn cmd(self, cmd: &'static str) -> Self {
+        Self { cmd, ..self }
+    }
+
+    /// Sub-tabs, cycled with `[` / `]`.
+    const fn tabs(self, tabs: &'static [&'static str]) -> Self {
+        Self { tabs, ..self }
+    }
+}
+
+/// Nav order; lenses sharing a group must be contiguous (the nav prints a
+/// group header whenever the group changes).
+static LENSES: &[Lens] = &[
+    lens("overview", "Overview", "◈", "LOOKUP").cmd("lookup"),
+    lens("whois", "WHOIS", "▤", "LOOKUP"),
+    lens("rdap", "RDAP", "▦", "LOOKUP").tabs(&["Domain", "IP", "ASN"]),
+    lens("reverse", "Reverse DNS", "↩", "LOOKUP"),
+    lens("avail", "Availability", "◎", "LOOKUP"),
+    lens("tld", "TLD Info", "⊞", "LOOKUP"),
+    lens("dns", "DNS Records", "≣", "DNS")
+        .cmd("dig")
+        .tabs(&["Records", "DNSSEC", "Compare"]),
+    lens("propagation", "Propagation", "◐", "DNS").cmd("prop"),
+    lens("follow", "Follow", "⟳", "DNS"),
+    lens("ssl", "SSL / Cert", "⛨", "SECURITY"),
+    lens("status", "Status", "♥", "SECURITY"),
+    lens("subdomains", "Subdomains", "⋔", "SECURITY"),
+    lens("headers", "HTTP Headers", "☰", "SECURITY"),
+    lens("takeover", "Takeover", "⚑", "SECURITY"),
+    lens("diff", "Diff", "⇄", "POWER"),
+    lens("bulk", "Bulk", "⧉", "POWER"),
+    lens("watch", "Watchlist", "★", "POWER"),
+    lens("history", "History", "↺", "POWER"),
+];
 
 pub fn lenses() -> &'static [Lens] {
-    &[
-        Lens {
-            key: "overview",
-            label: "Overview",
-            glyph: "◈",
-            cmd: "lookup",
-            group: "LOOKUP",
-            tabs: NO_TABS,
-        },
-        Lens {
-            key: "whois",
-            label: "WHOIS",
-            glyph: "▤",
-            cmd: "whois",
-            group: "LOOKUP",
-            tabs: NO_TABS,
-        },
-        Lens {
-            key: "rdap",
-            label: "RDAP",
-            glyph: "▦",
-            cmd: "rdap",
-            group: "LOOKUP",
-            tabs: &["Domain", "IP", "ASN"],
-        },
-        Lens {
-            key: "reverse",
-            label: "Reverse DNS",
-            glyph: "↩",
-            cmd: "reverse",
-            group: "LOOKUP",
-            tabs: NO_TABS,
-        },
-        Lens {
-            key: "avail",
-            label: "Availability",
-            glyph: "◎",
-            cmd: "avail",
-            group: "LOOKUP",
-            tabs: NO_TABS,
-        },
-        Lens {
-            key: "tld",
-            label: "TLD Info",
-            glyph: "⊞",
-            cmd: "tld",
-            group: "LOOKUP",
-            tabs: NO_TABS,
-        },
-        Lens {
-            key: "dns",
-            label: "DNS Records",
-            glyph: "≣",
-            cmd: "dig",
-            group: "DNS",
-            tabs: &["Records", "DNSSEC", "Compare"],
-        },
-        Lens {
-            key: "propagation",
-            label: "Propagation",
-            glyph: "◐",
-            cmd: "prop",
-            group: "DNS",
-            tabs: NO_TABS,
-        },
-        Lens {
-            key: "follow",
-            label: "Follow",
-            glyph: "⟳",
-            cmd: "follow",
-            group: "DNS",
-            tabs: NO_TABS,
-        },
-        Lens {
-            key: "ssl",
-            label: "SSL / Cert",
-            glyph: "⛨",
-            cmd: "ssl",
-            group: "SECURITY",
-            tabs: NO_TABS,
-        },
-        Lens {
-            key: "status",
-            label: "Status",
-            glyph: "♥",
-            cmd: "status",
-            group: "SECURITY",
-            tabs: NO_TABS,
-        },
-        Lens {
-            key: "subdomains",
-            label: "Subdomains",
-            glyph: "⋔",
-            cmd: "subdomains",
-            group: "SECURITY",
-            tabs: NO_TABS,
-        },
-        Lens {
-            key: "headers",
-            label: "HTTP Headers",
-            glyph: "☰",
-            cmd: "headers",
-            group: "SECURITY",
-            tabs: NO_TABS,
-        },
-        Lens {
-            key: "takeover",
-            label: "Takeover",
-            glyph: "⚑",
-            cmd: "takeover",
-            group: "SECURITY",
-            tabs: NO_TABS,
-        },
-        Lens {
-            key: "diff",
-            label: "Diff",
-            glyph: "⇄",
-            cmd: "diff",
-            group: "POWER",
-            tabs: NO_TABS,
-        },
-        Lens {
-            key: "bulk",
-            label: "Bulk",
-            glyph: "⧉",
-            cmd: "bulk",
-            group: "POWER",
-            tabs: NO_TABS,
-        },
-        Lens {
-            key: "watch",
-            label: "Watchlist",
-            glyph: "★",
-            cmd: "watch",
-            group: "POWER",
-            tabs: NO_TABS,
-        },
-        Lens {
-            key: "history",
-            label: "History",
-            glyph: "↺",
-            cmd: "history",
-            group: "POWER",
-            tabs: NO_TABS,
-        },
-    ]
+    LENSES
 }
 
 /// Find a lens index by its `cmd` alias or `key`.
@@ -302,26 +209,35 @@ mod tests {
     }
 
     #[test]
-    fn lens_keys_and_glyphs_are_unique() {
+    fn lens_keys_labels_glyphs_and_cmds_are_unique() {
         // The nav renders glyph + label; a shared glyph makes two rows look
         // like the same lens at a glance (headers originally reused WHOIS's ▤).
-        let mut keys: Vec<&str> = lenses().iter().map(|l| l.key).collect();
-        keys.sort_unstable();
-        let before = keys.len();
-        keys.dedup();
-        assert_eq!(keys.len(), before, "duplicate lens key");
+        let assert_unique = |what: &str, field: fn(&Lens) -> &'static str| {
+            let mut values: Vec<&str> = lenses().iter().map(field).collect();
+            values.sort_unstable();
+            let before = values.len();
+            values.dedup();
+            assert_eq!(values.len(), before, "duplicate lens {what}");
+        };
+        assert_unique("key", |l| l.key);
+        assert_unique("label", |l| l.label);
+        assert_unique("glyph", |l| l.glyph);
+        assert_unique("cmd alias", |l| l.cmd);
+    }
 
-        let mut glyphs: Vec<&str> = lenses().iter().map(|l| l.glyph).collect();
-        glyphs.sort_unstable();
-        let before = glyphs.len();
-        glyphs.dedup();
-        assert_eq!(glyphs.len(), before, "duplicate lens glyph");
-
-        let mut cmds: Vec<&str> = lenses().iter().map(|l| l.cmd).collect();
-        cmds.sort_unstable();
-        let before = cmds.len();
-        cmds.dedup();
-        assert_eq!(cmds.len(), before, "duplicate lens cmd alias");
+    #[test]
+    fn lens_fields_have_the_expected_shape() {
+        // `lens()` takes its strings positionally; these shapes catch a
+        // transposed argument (e.g. key ⇄ label) that uniqueness would miss.
+        for l in lenses() {
+            assert!(l.key.bytes().all(|b| b.is_ascii_lowercase()), "{l:?}");
+            assert!(l.cmd.bytes().all(|b| b.is_ascii_lowercase()), "{l:?}");
+            assert!(
+                l.label.starts_with(|c: char| c.is_ascii_uppercase()),
+                "{l:?}"
+            );
+            assert_eq!(l.glyph.chars().count(), 1, "{l:?}");
+        }
     }
 
     #[test]
