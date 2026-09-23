@@ -220,30 +220,12 @@ pub struct PropagationResult {
 }
 
 impl PropagationResult {
-    pub fn is_fully_propagated(&self) -> bool {
-        self.propagation_percentage >= 100.0
-    }
-
     /// Returns true only when one or more servers returned an answer that
     /// disagrees with the consensus. Servers that timed out or otherwise
     /// failed to respond do NOT flip this to true — they are reported via
-    /// `unreachable_servers` / `has_unreachable_servers()` instead.
+    /// `unreachable_servers` instead.
     pub fn has_inconsistencies(&self) -> bool {
         !self.inconsistencies.is_empty()
-    }
-
-    /// Returns true when one or more servers failed to respond.
-    pub fn has_unreachable_servers(&self) -> bool {
-        !self.unreachable_servers.is_empty()
-    }
-
-    /// Returns true when one or more propagation resolvers reported A/AAAA
-    /// for a nameserver hostname that differs from the cross-server consensus.
-    /// Only meaningful for NS-record checks.
-    pub fn has_nameserver_inconsistencies(&self) -> bool {
-        self.nameserver_details
-            .as_ref()
-            .is_some_and(NameserverDetails::has_inconsistencies)
     }
 }
 
@@ -277,33 +259,6 @@ mod tests {
     }
 
     #[test]
-    fn test_propagation_result_methods() {
-        let mut result = empty_result("example.com", 100.0);
-        result.servers_checked = 10;
-        result.servers_responding = 10;
-        assert!(result.is_fully_propagated());
-        assert!(!result.has_inconsistencies());
-        assert!(!result.has_unreachable_servers());
-        assert!(!result.has_nameserver_inconsistencies());
-    }
-
-    #[test]
-    fn test_propagation_result_with_inconsistencies() {
-        let mut result = empty_result("example.com", 75.0);
-        result.servers_checked = 10;
-        result.servers_responding = 8;
-        result.inconsistencies = vec![Inconsistency {
-            record_type: RecordType::A,
-            server_name: "Server X".to_string(),
-            server_ip: "203.0.113.99".to_string(),
-            values: vec!["9.9.9.9".to_string()],
-            consensus: vec!["1.2.3.4".to_string()],
-        }];
-        assert!(!result.is_fully_propagated());
-        assert!(result.has_inconsistencies());
-    }
-
-    #[test]
     fn has_inconsistencies_is_false_when_only_timeouts() {
         // 28 agreeing servers + 1 unreachable server should NOT report an
         // inconsistency — the unreachable server is a missing data point, not
@@ -317,7 +272,6 @@ mod tests {
             error: Some("timed out".to_string()),
         }];
         assert!(!result.has_inconsistencies());
-        assert!(result.has_unreachable_servers());
     }
 
     #[test]
@@ -333,35 +287,27 @@ mod tests {
             consensus: vec!["1.2.3.4".to_string()],
         }];
         assert!(result.has_inconsistencies());
-        assert!(!result.has_unreachable_servers());
     }
 
     #[test]
-    fn has_nameserver_inconsistencies_reflects_details_field() {
-        let mut result = empty_result("example.com", 100.0);
-        assert!(!result.has_nameserver_inconsistencies());
-
-        // NS lookup with no glue-lag → some details, no inconsistencies.
-        result.nameserver_details = Some(NameserverDetails {
+    fn nameserver_details_has_inconsistencies_reflects_field() {
+        // NS lookup with no glue-lag → details, no inconsistencies.
+        let mut details = NameserverDetails {
             consensus: HashMap::new(),
             per_vantage: HashMap::new(),
             inconsistencies: vec![],
-        });
-        assert!(!result.has_nameserver_inconsistencies());
+        };
+        assert!(!details.has_inconsistencies());
 
-        // NS lookup with glue-lag → details with at least one inconsistency.
-        result.nameserver_details = Some(NameserverDetails {
-            consensus: HashMap::new(),
-            per_vantage: HashMap::new(),
-            inconsistencies: vec![NameserverIpInconsistency {
-                server_name: "Stale".to_string(),
-                server_ip: "9.9.9.9".to_string(),
-                nameserver: "ns1.example.com.".to_string(),
-                values: vec!["9.9.9.9".to_string()],
-                consensus: vec!["1.2.3.4".to_string()],
-            }],
+        // NS lookup with glue-lag → at least one inconsistency.
+        details.inconsistencies.push(NameserverIpInconsistency {
+            server_name: "Stale".to_string(),
+            server_ip: "9.9.9.9".to_string(),
+            nameserver: "ns1.example.com.".to_string(),
+            values: vec!["9.9.9.9".to_string()],
+            consensus: vec!["1.2.3.4".to_string()],
         });
-        assert!(result.has_nameserver_inconsistencies());
+        assert!(details.has_inconsistencies());
     }
 
     #[test]

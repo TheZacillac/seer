@@ -63,11 +63,6 @@ impl PropagationChecker {
         self
     }
 
-    pub fn add_server(mut self, server: DnsServer) -> Self {
-        self.servers.push(server);
-        self
-    }
-
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.resolver = DnsResolver::new().with_timeout(timeout);
         self.query_timeout = timeout;

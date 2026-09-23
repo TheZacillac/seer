@@ -367,43 +367,12 @@ impl DnsResolver {
         }
     }
 
-    /// Resolves SRV records for a service.
-    ///
-    /// # Arguments
-    /// * `service` - The service name (e.g., "http", "ldap")
-    /// * `protocol` - The protocol (e.g., "tcp", "udp")
-    /// * `domain` - The domain name
-    /// * `nameserver` - Optional custom nameserver IP
-    #[instrument(skip(self), fields(domain = %domain, service = %service, protocol = %protocol))]
-    pub async fn resolve_srv(
-        &self,
-        service: &str,
-        protocol: &str,
-        domain: &str,
-        nameserver: Option<&str>,
-    ) -> Result<Vec<DnsRecord>> {
-        // Same normalization/validation as every other public entry point —
-        // callers may hand us URL-form or unvalidated input. `normalize_host`,
-        // not `normalize_domain`: `_sip._tcp.www.example.com` is a different
-        // name from `_sip._tcp.example.com`.
-        let domain = normalize_host(domain)?;
-        let custom_resolver;
-        let resolver = if let Some(ns) = self.effective_nameserver(nameserver) {
-            custom_resolver = self.create_custom_resolver(ns).await?;
-            &custom_resolver
-        } else {
-            &self.default_resolver
-        };
-        self.resolve_srv_core(resolver, service, protocol, &domain)
-            .await
-    }
-
-    /// Core SRV resolution against an already-built resolver. Validates the
-    /// service/protocol labels (DNS query-injection guard) then queries
-    /// `_service._proto.domain`. Shared by the public [`resolve_srv`] entry
-    /// point and the `dig`-style SRV path in [`resolve`]. Label-validation
-    /// failures are [`SeerError::InvalidInput`] — they are caller mistakes, not
-    /// transient DNS failures, so they must not be advertised as retryable.
+    /// Core SRV resolution against an already-built resolver, behind the
+    /// `dig`-style `_service._proto.name` path in [`resolve`](Self::resolve).
+    /// Validates the service/protocol labels (DNS query-injection guard) then
+    /// queries `_service._proto.domain`. Label-validation failures are
+    /// [`SeerError::InvalidInput`] — they are caller mistakes, not transient
+    /// DNS failures, so they must not be advertised as retryable.
     async fn resolve_srv_core(
         &self,
         resolver: &TokioResolver,
@@ -1403,7 +1372,9 @@ mod tests {
     async fn resolve_srv_rejects_invalid_service_label() {
         let r = DnsResolver::new();
         // With_dot service name would construct a malformed DNS query.
-        let result = r.resolve_srv("http.evil", "tcp", "example.com", None).await;
+        let result = r
+            .resolve_srv_core(&r.default_resolver, "http.evil", "tcp", "example.com")
+            .await;
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string().to_lowercase();
         assert!(
@@ -1416,7 +1387,9 @@ mod tests {
     #[tokio::test]
     async fn resolve_srv_rejects_invalid_protocol_label() {
         let r = DnsResolver::new();
-        let result = r.resolve_srv("http", "tcp.evil", "example.com", None).await;
+        let result = r
+            .resolve_srv_core(&r.default_resolver, "http", "tcp.evil", "example.com")
+            .await;
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string().to_lowercase();
         assert!(
@@ -1428,14 +1401,12 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_srv_normalizes_and_validates_domain_input() {
-        // resolve_srv was the one public entry point that skipped
-        // normalize_domain, so garbage input reached query construction as a
-        // (misclassified) DNS failure instead of an input error, and URL-form
-        // input built a literal `_http._tcp.HTTPS://…` query name
-        // (2026-07-11 review).
+        // SRV names must be normalized/validated like every other query, or
+        // garbage input reaches query construction as a (misclassified) DNS
+        // failure instead of an input error (2026-07-11 review).
         let r = DnsResolver::new();
         let result = r
-            .resolve_srv("http", "tcp", "not a valid domain", None)
+            .resolve("_http._tcp.not a valid domain", RecordType::SRV, None)
             .await;
         assert!(
             matches!(result, Err(SeerError::InvalidDomain(_))),
@@ -1871,7 +1842,11 @@ mod tests {
         })
         .await;
         let records = mock_dns_resolver(port)
-            .resolve_srv("sip", "tcp", "www.seer.test", Some("127.0.0.1"))
+            .resolve(
+                "_sip._tcp.www.seer.test",
+                RecordType::SRV,
+                Some("127.0.0.1"),
+            )
             .await
             .expect("SRV against mock");
         assert_eq!(records.len(), 1, "{records:?}");
