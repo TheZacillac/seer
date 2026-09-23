@@ -128,30 +128,15 @@ jobs:
           path: target/llvm-cov/html/
           if-no-files-found: error
 
-  audit:
-    name: Security Audit
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      # Install a prebuilt cargo-audit binary rather than compiling it from
-      # source on every run. rustsec/audit-check did `cargo install
-      # cargo-audit` with an unlocked resolution, so a broken release of any
-      # transitive dependency (tinyvec 1.13.0 on 2026-09-03, which fails to
-      # build) turned the job red with no change on our side. The prebuilt
-      # binary is built against a locked tree, so only cargo-audit's own
-      # releases can move it.
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-audit
-      - run: cargo audit
-
   deny:
     name: Supply Chain (cargo-deny)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      # Gates the dependency tree against deny.toml: RUSTSEC advisories,
-      # the explicit license allow-list, wildcard/duplicate version bans,
-      # and crates.io-only sources. Complements the rustsec `audit` job
-      # (which only covers advisories) with license + provenance policy.
+      # Gates the dependency tree against deny.toml: RUSTSEC advisories
+      # (vulnerable, unsound and unmaintained are all errors, across every
+      # feature), the explicit license allow-list, wildcard/duplicate version
+      # bans, and crates.io-only sources. This is the only advisory gate:
+      # cargo-audit reads the same RustSec DB with weaker defaults (it only
+      # warns on unsound/unmaintained), so a separate audit job adds nothing.
       - uses: EmbarkStudios/cargo-deny-action@v2

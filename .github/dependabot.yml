@@ -3,8 +3,8 @@
 # grouped into a single PR per ecosystem to cut review noise; major bumps still
 # open individually so breaking changes get scrutinized on their own.
 #
-# The CI `audit` job (rustsec/audit-check) is the safety net for the Rust side —
-# prefer keeping these green so advisories don't pile up.
+# The CI `deny` job (cargo-deny, RustSec advisories) is the safety net for the
+# Rust side — prefer keeping these green so advisories don't pile up.
 version: 2
 updates:
   # Rust workspace: seer-core, seer-cli, and the seer-py crate (resolved via the
