@@ -117,10 +117,8 @@ jobs:
         run: cargo llvm-cov --workspace --no-report
       - name: Print summary
         run: cargo llvm-cov report --summary-only
-      - name: Generate HTML + lcov reports
-        run: |
-          cargo llvm-cov report --html
-          cargo llvm-cov report --lcov --output-path lcov.info
+      - name: Generate HTML report
+        run: cargo llvm-cov report --html
       - name: Upload HTML report
         uses: actions/upload-artifact@v7
         with:
