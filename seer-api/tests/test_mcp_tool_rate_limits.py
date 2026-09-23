@@ -16,11 +16,6 @@ import seer
 from seer_api.mcp import server
 
 
-def _reset_limiter(monkeypatch):
-    # Fresh in-memory window per test so counts don't leak between tests.
-    monkeypatch.setattr(server, "_tool_rate_limiter", None)
-
-
 def _text(out) -> str:
     """Text body from either call_tool result shape.
 
@@ -32,7 +27,6 @@ def _text(out) -> str:
 
 
 def test_bulk_ssl_is_limited_to_five_per_minute(monkeypatch):
-    _reset_limiter(monkeypatch)
     calls = {"n": 0}
 
     def fake_bulk_ssl(domains, concurrency):
@@ -56,7 +50,6 @@ def test_bulk_ssl_is_limited_to_five_per_minute(monkeypatch):
 
 
 def test_confusables_is_limited_to_five_per_minute(monkeypatch):
-    _reset_limiter(monkeypatch)
     calls = {"n": 0}
 
     def fake_confusables(*args, **kwargs):
@@ -76,7 +69,6 @@ def test_confusables_is_limited_to_five_per_minute(monkeypatch):
 
 
 def test_bulk_availability_is_limited_to_ten_per_minute(monkeypatch):
-    _reset_limiter(monkeypatch)
     calls = {"n": 0}
 
     def fake_bulk_availability(domains, concurrency):
@@ -96,7 +88,6 @@ def test_bulk_availability_is_limited_to_ten_per_minute(monkeypatch):
 
 
 def test_unlimited_tools_are_not_throttled_per_tool(monkeypatch):
-    _reset_limiter(monkeypatch)
 
     def fake_lookup(domain):
         return {"domain": domain}

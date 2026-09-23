@@ -632,10 +632,25 @@ _TOOL_RATE_LIMITS: dict[str, str] = {
     name: tool.rate_limit for name, tool in _TOOLS.items() if tool.rate_limit
 }
 
-# Built lazily on first limited call (not at import) so a configured storage
-# backend whose driver isn't installed only surfaces if a limited tool is
-# actually used — mirroring main.py's /mcp limiter.
-_tool_rate_limiter: MovingWindowRateLimiter | None = None
+# One moving-window limiter on SEER_RATE_LIMIT_STORAGE, shared by the per-tool
+# limits here and the flat /mcp gate in main.py (keys are namespaced
+# "mcp-tool" / "mcp"), so the storage backend is connected once. Built on
+# first use, not at import, so a backend whose driver isn't installed (e.g.
+# redis:// without the redis package) only surfaces once a limited call is
+# actually made.
+_rate_limiter: MovingWindowRateLimiter | None = None
+
+
+def rate_limiter() -> MovingWindowRateLimiter:
+    """The shared MCP moving-window limiter (see above)."""
+    global _rate_limiter
+    if _rate_limiter is None:
+        _rate_limiter = MovingWindowRateLimiter(
+            _rate_storage_from_string(
+                os.environ.get("SEER_RATE_LIMIT_STORAGE", "memory://")
+            )
+        )
+    return _rate_limiter
 
 
 def _tool_rate_ok(name: str) -> bool:
@@ -644,17 +659,10 @@ def _tool_rate_ok(name: str) -> bool:
     Tools without an entry in ``_TOOL_RATE_LIMITS`` are always allowed here —
     the flat /mcp limit (HTTP transport) is their only throttle.
     """
-    global _tool_rate_limiter
     limit = _TOOL_RATE_LIMITS.get(name)
     if limit is None:
         return True
-    if _tool_rate_limiter is None:
-        _tool_rate_limiter = MovingWindowRateLimiter(
-            _rate_storage_from_string(
-                os.environ.get("SEER_RATE_LIMIT_STORAGE", "memory://")
-            )
-        )
-    return _tool_rate_limiter.hit(_parse_rate_limit(limit), "mcp-tool", name)
+    return rate_limiter().hit(_parse_rate_limit(limit), "mcp-tool", name)
 
 
 async def call_tool(

@@ -11,8 +11,6 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, ORJSONResponse
 from limits import parse_many as _parse_rate_limits
-from limits.storage import storage_from_string as _rate_storage_from_string
-from limits.strategies import MovingWindowRateLimiter
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from mcp.server.transport_security import TransportSecuritySettings
 from slowapi import _rate_limit_exceeded_handler
@@ -23,6 +21,7 @@ from . import __version__
 from ._env import env_int
 from .limiting import get_client_ip, limiter
 from .mcp.server import mcp as mcp_server
+from .mcp.server import rate_limiter as mcp_rate_limiter
 from .middleware import MaxBodySizeMiddleware, RequestLoggingMiddleware, metrics
 from .routers import dns, intel, lookup, propagation, rdap, ssl, status, tld, whois
 
@@ -137,12 +136,9 @@ _mcp_asgi_app = _McpAsgiApp()
 # routes each carry an explicit `@limiter.limit(...)`, which overrides the
 # limiter's default (see limiting.py).
 #
-# Built lazily on first /mcp request (not at import) so that configuring a
-# backend whose driver isn't installed — e.g. SEER_RATE_LIMIT_STORAGE=redis://
-# without the redis package — doesn't crash module import; it surfaces only if
-# /mcp is actually used, mirroring slowapi's own lazy storage behavior.
-_mcp_rate_limiter: MovingWindowRateLimiter | None = None
-_mcp_rate_values: list = []
+# The limiter is the MCP server's shared one (built lazily on first use); the
+# limits themselves are parsed on the first /mcp request.
+_mcp_rate_values: list | None = None
 
 
 def _mcp_rate_ok(client_ip: str) -> bool:
@@ -154,19 +150,13 @@ def _mcp_rate_ok(client_ip: str) -> bool:
     Evaluated in order, stopping at the first exhausted limit — slowapi's own
     semantics for a multi-limit string.
     """
-    global _mcp_rate_limiter, _mcp_rate_values
-    if _mcp_rate_limiter is None:
+    global _mcp_rate_values
+    if _mcp_rate_values is None:
         _mcp_rate_values = _parse_rate_limits(
             os.environ.get("SEER_RATE_LIMIT", "30/minute")
         )
-        _mcp_rate_limiter = MovingWindowRateLimiter(
-            _rate_storage_from_string(
-                os.environ.get("SEER_RATE_LIMIT_STORAGE", "memory://")
-            )
-        )
-    return all(
-        _mcp_rate_limiter.hit(item, "mcp", client_ip) for item in _mcp_rate_values
-    )
+    window = mcp_rate_limiter()
+    return all(window.hit(item, "mcp", client_ip) for item in _mcp_rate_values)
 
 
 _LOCALHOST_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})

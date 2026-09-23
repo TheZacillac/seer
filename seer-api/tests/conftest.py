@@ -129,13 +129,16 @@ def client():
 
 @pytest.fixture(autouse=True)
 def _reset_rate_limits():
-    """Start every test with empty REST rate-limit counters.
+    """Start every test with empty rate-limit counters.
 
-    The slowapi limiter is module-level and buckets per (client, route), and
-    every TestClient reports the same peer ("testclient"), so hits from one
-    test would otherwise count against the next test's budget for that route.
+    The slowapi limiter (REST routes) and the MCP moving-window limiter (the
+    /mcp gate and per-tool limits) are module-level, and every TestClient
+    reports the same peer ("testclient"), so hits from one test would
+    otherwise count against the next test's budget.
     """
     from seer_api.limiting import limiter
+    from seer_api.mcp import server
 
     limiter.reset()
+    server._rate_limiter = None  # rebuilt, empty, on first use
     yield
