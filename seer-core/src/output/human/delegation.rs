@@ -14,27 +14,20 @@ impl HumanFormatter {
         ));
         out.push(String::new());
 
-        out.push(format!(
-            "  {}: {}",
-            self.label("Parent zone"),
-            self.value(&sanitize_display(&report.parent_zone))
-        ));
         let servers = if report.parent_server_queried.is_empty() {
             self.warning("(none)")
         } else {
             self.value(&sanitize_display(&report.parent_server_queried.join(", ")))
         };
-        out.push(format!(
-            "  {}: {}",
-            self.label("Parent servers queried"),
-            servers
-        ));
         let verdict = if report.in_sync {
             self.success("in sync")
         } else {
             self.error("out of sync")
         };
-        out.push(format!("  {}: {}", self.label("Delegation"), verdict));
+        let mut rows = self.rows(&mut out, "  ");
+        rows.text("Parent zone", &report.parent_zone);
+        rows.kv("Parent servers queried", servers);
+        rows.kv("Delegation", verdict);
 
         // Marks derive from the report's own diff fields so the lists always
         // agree with missing_from_zone / missing_from_parent.

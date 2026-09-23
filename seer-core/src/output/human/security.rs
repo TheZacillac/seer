@@ -61,11 +61,8 @@ impl HumanFormatter {
         }
 
         if let Some(at) = report.baseline_recorded_at {
-            out.push(format!(
-                "{}: {}",
-                self.label("Baseline recorded"),
-                self.value(&at.format("%Y-%m-%d %H:%M UTC").to_string()),
-            ));
+            let at = self.value(&at.format("%Y-%m-%d %H:%M UTC").to_string());
+            self.rows(&mut out, "").kv("Baseline recorded", at);
         }
         out.push(format!(
             "{} added, {} removed, {} unchanged",
@@ -175,24 +172,17 @@ impl HumanFormatter {
             "B" | "C" => self.warning(&report.grade),
             _ => self.error(&report.grade),
         };
-        out.push(format!(
-            "{}: {} ({}/100)",
-            self.label("Grade"),
-            grade,
-            self.value(&report.score.to_string()),
-        ));
-        out.push(format!(
-            "{}: {} {}",
-            self.label("URL"),
-            self.value(&sanitize_display(&report.url)),
-            self.dim(&format!("[HTTP {}]", report.status)),
-        ));
+        let score = self.value(&report.score.to_string());
+        let url = self.value(&sanitize_display(&report.url));
+        let status = self.dim(&format!("[HTTP {}]", report.status));
+        let mut rows = self.rows(&mut out, "");
+        rows.kv("Grade", format!("{grade} ({score}/100)"));
+        rows.kv("URL", format!("{url} {status}"));
         if report.redirects > 0 {
-            out.push(format!(
-                "{}: {}",
-                self.label("Redirects followed"),
+            rows.kv(
+                "Redirects followed",
                 self.value(&report.redirects.to_string()),
-            ));
+            );
         }
 
         out.push(String::new());
@@ -341,19 +331,12 @@ impl HumanFormatter {
     pub(super) fn format_caa(&self, policy: &CaaPolicy) -> String {
         let mut out = vec![self.header("CAA Policy")];
         out.extend(self.render_caa_block(policy, ""));
+        let mut rows = self.rows(&mut out, "  ");
         if !policy.iodef.is_empty() {
-            out.push(format!(
-                "  {}: {}",
-                self.label("iodef (incident reporting)"),
-                self.value(&sanitize_display(&policy.iodef.join(", ")))
-            ));
+            rows.text("iodef (incident reporting)", &policy.iodef.join(", "));
         }
         if let Some(note) = &policy.wildcard_note {
-            out.push(format!(
-                "  {}: {}",
-                self.label("Wildcard"),
-                self.warning(&sanitize_display(note))
-            ));
+            rows.kv("Wildcard", self.warning(&sanitize_display(note)));
         }
         self.push_caa_note_footer(&mut out, policy);
         out.join("\n")

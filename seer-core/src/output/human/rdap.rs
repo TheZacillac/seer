@@ -2,138 +2,41 @@ use super::*;
 
 impl HumanFormatter {
     pub(super) fn format_rdap(&self, response: &RdapResponse) -> String {
-        let mut output = Vec::new();
-
         let name = response
             .domain_name()
             .or(response.name.as_deref())
             .unwrap_or("Unknown");
-        output.push(self.header(&format!("RDAP: {}", sanitize_display(name))));
+        let mut output = vec![self.header(&format!("RDAP: {}", sanitize_display(name)))];
 
-        if let Some(handle) = &response.handle {
-            output.push(format!(
-                "  {}: {}",
-                self.label("Handle"),
-                self.value(&sanitize_display(handle))
-            ));
-        }
-
-        if let Some(registrar) = response.get_registrar() {
-            output.push(format!(
-                "  {}: {}",
-                self.label("Registrar"),
-                self.value(&sanitize_display(&registrar))
-            ));
-        }
-
-        if let Some(registrant) = response.get_registrant() {
-            output.push(format!(
-                "  {}: {}",
-                self.label("Registrant"),
-                self.value(&sanitize_display(&registrant))
-            ));
-        }
-
-        if let Some(organization) = response.get_registrant_organization() {
-            output.push(format!(
-                "  {}: {}",
-                self.label("Organization"),
-                self.value(&sanitize_display(&organization))
-            ));
-        }
+        let mut rows = self.rows(&mut output, "  ");
+        rows.opt("Handle", &response.handle);
+        rows.opt("Registrar", &response.get_registrar());
+        rows.opt("Registrant", &response.get_registrant());
+        rows.opt("Organization", &response.get_registrant_organization());
 
         let infos = contact::rdap_contacts(response);
-        self.push_contacts(&mut output, "  ", detail_views(&infos));
+        rows.contacts(detail_views(&infos));
         let billing = response.get_billing_contact();
-        self.push_contact(
-            &mut output,
-            "  ",
-            "Billing",
-            Contact::rdap(billing.as_ref()),
-        );
+        rows.contact("Billing", Contact::rdap(billing.as_ref()));
 
-        if let Some(created) = response.creation_date() {
-            output.push(format!(
-                "  {}: {}",
-                self.label("Created"),
-                self.value(&created.format("%Y-%m-%d").to_string())
-            ));
-        }
-
-        if let Some(expires) = response.expiration_date() {
-            let days_until = days_until(expires);
-            let expiry_str = expires.format("%Y-%m-%d").to_string();
-            let status = self.format_expiry_status(&expiry_str, days_until);
-            output.push(format!("  {}: {}", self.label("Expires"), status));
-        }
-
-        if let Some(updated) = response.last_updated() {
-            output.push(format!(
-                "  {}: {}",
-                self.label("Updated"),
-                self.value(&updated.format("%Y-%m-%d").to_string())
-            ));
-        }
-
-        if !response.status.is_empty() {
-            output.push(format!("  {}:", self.label("Status")));
-            for status in &response.status {
-                output.push(format!("    - {}", self.value(&sanitize_display(status))));
-            }
-        }
-
-        let nameservers = response.nameserver_names();
-        if !nameservers.is_empty() {
-            output.push(format!("  {}:", self.label("Nameservers")));
-            for ns in &nameservers {
-                output.push(format!("    - {}", self.value(&sanitize_display(ns))));
-            }
-        }
-
+        rows.date("Created", response.creation_date());
+        rows.expires(response.expiration_date());
+        rows.date("Updated", response.last_updated());
+        rows.list("Status", &response.status);
+        rows.list("Nameservers", &response.nameserver_names());
         if response.is_dnssec_signed() {
-            output.push(format!(
-                "  {}: {}",
-                self.label("DNSSEC"),
-                self.success("signed")
-            ));
+            rows.kv("DNSSEC", self.success("signed"));
         }
 
         // IP-specific fields
-        if let Some(ref start) = response.start_address {
-            output.push(format!(
-                "  {}: {}",
-                self.label("Start Address"),
-                self.value(&sanitize_display(start))
-            ));
-        }
-
-        if let Some(ref end) = response.end_address {
-            output.push(format!(
-                "  {}: {}",
-                self.label("End Address"),
-                self.value(&sanitize_display(end))
-            ));
-        }
-
-        if let Some(ref country) = response.country {
-            output.push(format!(
-                "  {}: {}",
-                self.label("Country"),
-                self.value(&sanitize_display(country))
-            ));
-        }
+        rows.opt("Start Address", &response.start_address);
+        rows.opt("End Address", &response.end_address);
+        rows.opt("Country", &response.country);
 
         // ASN-specific fields
         if let Some(start) = response.start_autnum {
-            output.push(format!(
-                "  {}: {}",
-                self.label("AS Number"),
-                self.value(&format!(
-                    "AS{} - AS{}",
-                    start,
-                    response.end_autnum.unwrap_or(start)
-                ))
-            ));
+            let end = response.end_autnum.unwrap_or(start);
+            rows.kv("AS Number", self.value(&format!("AS{start} - AS{end}")));
         }
 
         output.join("\n")

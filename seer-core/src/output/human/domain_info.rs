@@ -1,76 +1,38 @@
 use super::*;
+use crate::domain_info::{DomainInfo, DomainInfoSource, ExpiryStatus};
 
 impl HumanFormatter {
     pub(super) fn format_tld(&self, info: &crate::tld::TldInfo) -> String {
-        let mut output = Vec::new();
-
-        output.push(self.header(&format!("TLD Info: .{}", info.tld)));
-
-        output.push(format!(
-            "  {}: {}",
-            self.label("Type"),
-            self.value(&info.tld_type)
-        ));
-
-        if let Some(ref server) = info.whois_server {
-            output.push(format!(
-                "  {}: {}",
-                self.label("WHOIS Server"),
-                self.value(server)
-            ));
-        } else {
-            output.push(format!(
-                "  {}: {}",
-                self.label("WHOIS Server"),
-                self.warning("not available")
-            ));
-        }
-
-        if let Some(ref url) = info.rdap_url {
-            output.push(format!("  {}: {}", self.label("RDAP URL"), self.value(url)));
-        } else {
-            output.push(format!(
-                "  {}: {}",
-                self.label("RDAP URL"),
-                self.warning("not available")
-            ));
-        }
-
-        if let Some(ref url) = info.registry_url {
-            output.push(format!("  {}: {}", self.label("Registry"), self.value(url)));
-        } else {
-            output.push(format!(
-                "  {}: {}",
-                self.label("Registry"),
-                self.warning("not available")
-            ));
+        let mut output = vec![self.header(&format!("TLD Info: .{}", info.tld))];
+        let mut rows = self.rows(&mut output, "  ");
+        rows.text("Type", &info.tld_type);
+        for (label, value) in [
+            ("WHOIS Server", &info.whois_server),
+            ("RDAP URL", &info.rdap_url),
+            ("Registry", &info.registry_url),
+        ] {
+            match value {
+                Some(value) => rows.text(label, value),
+                None => rows.kv(label, self.warning("not available")),
+            }
         }
 
         output.join("\n")
     }
 
     pub(super) fn format_subdomains(&self, result: &crate::subdomains::SubdomainResult) -> String {
-        let mut output = Vec::new();
-
-        output.push(self.header(&format!("Subdomains: {}", sanitize_display(&result.domain))));
-
-        output.push(format!(
-            "  {}: {}",
-            self.label("Source"),
-            self.value(&sanitize_display(&result.source))
-        ));
-        output.push(format!(
-            "  {}: {}",
-            self.label("Count"),
-            self.value(&result.count.to_string())
-        ));
+        let mut output =
+            vec![self.header(&format!("Subdomains: {}", sanitize_display(&result.domain)))];
+        let mut rows = self.rows(&mut output, "  ");
+        rows.text("Source", &result.source);
+        rows.kv("Count", self.value(&result.count.to_string()));
 
         if result.subdomains.is_empty() {
-            output.push(format!("  {}", self.warning("No subdomains found")));
+            rows.push(format!("  {}", self.warning("No subdomains found")));
         } else {
-            output.push(String::new());
+            rows.blank();
             for subdomain in &result.subdomains {
-                output.push(format!(
+                rows.push(format!(
                     "    - {}",
                     self.value(&sanitize_display(subdomain))
                 ));
@@ -81,78 +43,62 @@ impl HumanFormatter {
     }
 
     pub(super) fn format_watch(&self, report: &crate::watchlist::WatchReport) -> String {
-        let mut output = Vec::new();
+        let mut output = vec![self.header("Domain Watch Report")];
+        let mut rows = self.rows(&mut output, "  ");
+        let checked = report.checked_at.format("%Y-%m-%d %H:%M:%S UTC");
+        rows.kv("Checked", self.value(&checked.to_string()));
+        let warnings = report.warnings.to_string();
+        let critical = report.critical.to_string();
+        rows.kv(
+            "Total",
+            format!(
+                "{} domains, {} warnings, {} critical",
+                self.value(&report.total.to_string()),
+                if report.warnings > 0 {
+                    self.warning(&warnings)
+                } else {
+                    self.value(&warnings)
+                },
+                if report.critical > 0 {
+                    self.error(&critical)
+                } else {
+                    self.value(&critical)
+                }
+            ),
+        );
 
-        output.push(self.header("Domain Watch Report"));
-
-        output.push(format!(
-            "  {}: {}",
-            self.label("Checked"),
-            self.value(
-                &report
-                    .checked_at
-                    .format("%Y-%m-%d %H:%M:%S UTC")
-                    .to_string()
-            )
-        ));
-        output.push(format!(
-            "  {}: {} domains, {} warnings, {} critical",
-            self.label("Total"),
-            self.value(&report.total.to_string()),
-            if report.warnings > 0 {
-                self.warning(&report.warnings.to_string())
-            } else {
-                self.value(&report.warnings.to_string())
-            },
-            if report.critical > 0 {
-                self.error(&report.critical.to_string())
-            } else {
-                self.value(&report.critical.to_string())
-            }
-        ));
-
+        let days = |d: Option<i64>| d.map_or_else(|| "N/A".to_string(), |d| format!("{d} days"));
         for r in &report.results {
-            output.push(String::new());
-
+            rows.blank();
             let icon = if r.issues.is_empty() {
                 self.success("v")
             } else {
                 self.warning("!")
             };
-            output.push(format!(
+            rows.push(format!(
                 "  {} {}",
                 icon,
                 self.value(&sanitize_display(&r.domain))
             ));
 
             // Condensed status line: SSL | Domain | HTTP
-            let ssl_str = r
-                .ssl_days_remaining
-                .map(|d| format!("{} days", d))
-                .unwrap_or_else(|| "N/A".to_string());
-            let dom_str = r
-                .domain_days_remaining
-                .map(|d| format!("{} days", d))
-                .unwrap_or_else(|| "N/A".to_string());
-            let http_str = r
+            let http = r
                 .http_status
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| "N/A".to_string());
-
-            output.push(format!(
+                .map_or_else(|| "N/A".to_string(), |s| s.to_string());
+            rows.push(format!(
                 "      {}: {} | {}: {} | {}: {}",
                 self.label("SSL"),
-                self.value(&ssl_str),
+                self.value(&days(r.ssl_days_remaining)),
                 self.label("Domain"),
-                self.value(&dom_str),
+                self.value(&days(r.domain_days_remaining)),
                 self.label("HTTP"),
-                self.value(&http_str)
+                self.value(&http)
             ));
 
             if !r.issues.is_empty() {
-                output.push(format!("      {}:", self.label("Issues")));
+                rows.push(format!("      {}:", self.label("Issues")));
                 for issue in &r.issues {
-                    output.push(format!(
+                    rows.push(format!(
                         "        - {}",
                         self.warning(&sanitize_display(issue))
                     ));
@@ -163,21 +109,19 @@ impl HumanFormatter {
         output.join("\n")
     }
 
-    pub(super) fn format_domain_info(&self, info: &crate::domain_info::DomainInfo) -> String {
-        let mut output = Vec::new();
-
-        let source_str = match info.source {
-            crate::domain_info::DomainInfoSource::Both => "both",
-            crate::domain_info::DomainInfoSource::Rdap => "rdap",
-            crate::domain_info::DomainInfoSource::Whois => "whois",
-            crate::domain_info::DomainInfoSource::Available => "available",
+    pub(super) fn format_domain_info(&self, info: &DomainInfo) -> String {
+        let source = match info.source {
+            DomainInfoSource::Both => "both",
+            DomainInfoSource::Rdap => "rdap",
+            DomainInfoSource::Whois => "whois",
+            DomainInfoSource::Available => "available",
         };
-
-        output.push(self.header(&format!(
+        let mut output = vec![self.header(&format!(
             "Domain Info: {} (source: {})",
             sanitize_display(&info.domain),
-            source_str
-        )));
+            source
+        ))];
+        let mut rows = self.rows(&mut output, "  ");
 
         if let Some(verdict) = &info.availability_verdict {
             let colored = match verdict.as_str() {
@@ -187,178 +131,81 @@ impl HumanFormatter {
                 "likely_registered" => self.warning("LIKELY REGISTERED"),
                 _ => self.error("UNKNOWN"),
             };
-            output.push(format!("  {}: {}", self.label("Status"), colored));
+            rows.kv("Status", colored);
         }
 
         // Registration
-        if let Some(ref registrar) = info.registrar {
-            output.push(format!(
-                "  {}: {}",
-                self.label("Registrar"),
-                self.value(&sanitize_display(registrar))
-            ));
-        }
-        if let Some(ref registrant) = info.registrant {
-            output.push(format!(
-                "  {}: {}",
-                self.label("Registrant"),
-                self.value(&sanitize_display(registrant))
-            ));
-        }
-        if let Some(ref organization) = info.organization {
-            output.push(format!(
-                "  {}: {}",
-                self.label("Organization"),
-                self.value(&sanitize_display(organization))
-            ));
-        }
+        rows.opt("Registrar", &info.registrar);
+        rows.opt("Registrant", &info.registrant);
+        rows.opt("Organization", &info.organization);
 
         // Dates
-        if let Some(ref created) = info.creation_date {
-            output.push(format!(
-                "  {}: {}",
-                self.label("Created"),
-                self.value(&created.format("%Y-%m-%d").to_string())
-            ));
-        }
-        if let Some(ref expires) = info.expiration_date {
-            output.push(format!(
-                "  {}: {}",
-                self.label("Expires"),
-                self.value(&expires.format("%Y-%m-%d").to_string())
-            ));
-        }
-        if let Some(ref updated) = info.updated_date {
-            output.push(format!(
-                "  {}: {}",
-                self.label("Updated"),
-                self.value(&updated.format("%Y-%m-%d").to_string())
-            ));
-        }
+        rows.date("Created", info.creation_date);
+        rows.date("Expires", info.expiration_date);
+        rows.date("Updated", info.updated_date);
 
         // Derived lifecycle (computed at construction from the dates above).
         if let Some(days) = info.days_until_expiration {
             let rendered = format!("{} days", days);
-            output.push(format!(
-                "  {}: {}",
-                self.label("Days Until Expiry"),
-                if days <= 30 {
-                    self.warning(&rendered)
-                } else {
-                    self.value(&rendered)
-                }
-            ));
+            let styled = if days <= 30 {
+                self.warning(&rendered)
+            } else {
+                self.value(&rendered)
+            };
+            rows.kv("Days Until Expiry", styled);
         }
         if let Some(age) = info.domain_age_days {
-            output.push(format!(
-                "  {}: {}",
-                self.label("Domain Age"),
-                self.value(&format!("{} days", age))
-            ));
+            rows.kv("Domain Age", self.value(&format!("{} days", age)));
         }
         if let Some(expiry_status) = info.expiry_status {
             let rendered = expiry_status.to_string();
             let colored = match expiry_status {
-                crate::domain_info::ExpiryStatus::Active => self.value(&rendered),
-                crate::domain_info::ExpiryStatus::ExpiringSoon => self.warning(&rendered),
+                ExpiryStatus::Active => self.value(&rendered),
+                ExpiryStatus::ExpiringSoon => self.warning(&rendered),
                 _ => self.error(&rendered),
             };
-            output.push(format!("  {}: {}", self.label("Expiry Status"), colored));
+            rows.kv("Expiry Status", colored);
         }
 
         // DNS. Nameservers/status originate from attacker-controlled WHOIS/RDAP
-        // parsing, so sanitize them like the adjacent DNSSEC field (issue #53).
+        // parsing, so they are sanitized like every other remote value (#53).
         if !info.nameservers.is_empty() {
-            output.push(format!(
-                "  {}: {}",
-                self.label("Nameservers"),
-                self.value(&sanitize_display(&info.nameservers.join(", ")))
-            ));
+            rows.text("Nameservers", &info.nameservers.join(", "));
         }
         if !info.status.is_empty() {
-            output.push(format!(
-                "  {}: {}",
-                self.label("Status"),
-                self.value(&sanitize_display(&info.status.join(", ")))
-            ));
+            rows.text("Status", &info.status.join(", "));
         }
-        if let Some(ref dnssec) = info.dnssec {
-            output.push(format!(
-                "  {}: {}",
-                self.label("DNSSEC"),
-                self.value(&sanitize_display(dnssec))
-            ));
-        }
+        rows.opt("DNSSEC", &info.dnssec);
 
         // Plain-English decodings of recognized EPP status codes.
         if !info.status_descriptions.is_empty() {
-            output.push(format!("\n  {}:", self.label("Status Codes")));
+            let mut codes = rows.section("Status Codes");
             for sd in &info.status_descriptions {
-                output.push(format!(
-                    "    {}: {}",
-                    self.label(&sanitize_display(&sd.code)),
-                    self.value(&sanitize_display(&sd.description))
-                ));
+                codes.text(&sanitize_display(&sd.code), &sd.description);
             }
         }
 
-        self.push_contacts(&mut output, "  ", info.contacts());
+        rows.contacts(info.contacts());
 
         // Registrar Detail (RDAP registrar entity: abuse contact, IANA ID, URL)
-        let has_registrar_detail = info.registrar_iana_id.is_some()
-            || info.registrar_url.is_some()
-            || info.registrar_abuse_email.is_some()
-            || info.registrar_abuse_phone.is_some();
-        if has_registrar_detail {
-            output.push(format!("\n  {}:", self.label("Registrar Detail")));
-            if let Some(ref iana_id) = info.registrar_iana_id {
-                output.push(format!(
-                    "    {}: {}",
-                    self.label("IANA ID"),
-                    self.value(&sanitize_display(iana_id))
-                ));
-            }
-            if let Some(ref url) = info.registrar_url {
-                output.push(format!(
-                    "    {}: {}",
-                    self.label("URL"),
-                    self.value(&sanitize_display(url))
-                ));
-            }
-            if let Some(ref email) = info.registrar_abuse_email {
-                output.push(format!(
-                    "    {}: {}",
-                    self.label("Abuse Email"),
-                    self.value(&sanitize_display(email))
-                ));
-            }
-            if let Some(ref phone) = info.registrar_abuse_phone {
-                output.push(format!(
-                    "    {}: {}",
-                    self.label("Abuse Phone"),
-                    self.value(&sanitize_display(phone))
-                ));
+        let detail = [
+            ("IANA ID", &info.registrar_iana_id),
+            ("URL", &info.registrar_url),
+            ("Abuse Email", &info.registrar_abuse_email),
+            ("Abuse Phone", &info.registrar_abuse_phone),
+        ];
+        if detail.iter().any(|(_, v)| v.is_some()) {
+            let mut section = rows.section("Registrar Detail");
+            for (label, value) in detail {
+                section.opt(label, value);
             }
         }
 
         // Protocol Metadata
-        let has_metadata = info.whois_server.is_some() || info.rdap_url.is_some();
-        if has_metadata {
-            output.push(format!("\n  {}:", self.label("Protocol Metadata")));
-            if let Some(ref whois_server) = info.whois_server {
-                output.push(format!(
-                    "    {}: {}",
-                    self.label("WHOIS Server"),
-                    self.value(&sanitize_display(whois_server))
-                ));
-            }
-            if let Some(ref rdap_url) = info.rdap_url {
-                output.push(format!(
-                    "    {}: {}",
-                    self.label("RDAP URL"),
-                    self.value(&sanitize_display(rdap_url))
-                ));
-            }
+        if info.whois_server.is_some() || info.rdap_url.is_some() {
+            let mut section = rows.section("Protocol Metadata");
+            section.opt("WHOIS Server", &info.whois_server);
+            section.opt("RDAP URL", &info.rdap_url);
         }
 
         output.join("\n")
@@ -374,7 +221,7 @@ mod tests {
         // Markdown printed "N warnings, M critical"; human omitted the
         // critical tally, so the same report was less complete by default.
         let report = crate::watchlist::WatchReport {
-            checked_at: chrono::Utc::now(),
+            checked_at: Utc::now(),
             results: Vec::new(),
             total: 3,
             warnings: 2,

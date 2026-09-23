@@ -1,4 +1,5 @@
-use chrono::TimeDelta;
+use chrono::{DateTime, TimeDelta, Utc};
+use colored::ColoredString;
 use regex::Regex;
 use std::sync::LazyLock;
 
@@ -99,51 +100,45 @@ impl HumanFormatter {
         self
     }
 
-    fn label(&self, text: &str) -> String {
+    /// Applies `style` to `text`, or returns it plain when colors are off.
+    fn paint(&self, text: &str, style: impl FnOnce(&str) -> ColoredString) -> String {
         if self.use_colors {
-            text.sky().bold().to_string()
+            style(text).to_string()
         } else {
             text.to_string()
         }
+    }
+
+    fn label(&self, text: &str) -> String {
+        self.paint(text, |t| t.sky().bold())
     }
 
     fn value(&self, text: &str) -> String {
-        if self.use_colors {
-            text.ctp_white().to_string()
-        } else {
-            text.to_string()
-        }
+        self.paint(text, |t| t.ctp_white())
     }
 
     fn success(&self, text: &str) -> String {
-        if self.use_colors {
-            text.ctp_green().bold().to_string()
-        } else {
-            text.to_string()
-        }
+        self.paint(text, |t| t.ctp_green().bold())
     }
 
     fn warning(&self, text: &str) -> String {
-        if self.use_colors {
-            text.ctp_yellow().bold().to_string()
-        } else {
-            text.to_string()
-        }
+        self.paint(text, |t| t.ctp_yellow().bold())
     }
 
     fn error(&self, text: &str) -> String {
-        if self.use_colors {
-            text.ctp_red().bold().to_string()
-        } else {
-            text.to_string()
-        }
+        self.paint(text, |t| t.ctp_red().bold())
     }
 
     fn dim(&self, text: &str) -> String {
-        if self.use_colors {
-            text.overlay1().to_string()
-        } else {
-            text.to_string()
+        self.paint(text, |t| t.overlay1())
+    }
+
+    /// A [`Rows`] writer appending `label: value` lines to `out` at `indent`.
+    fn rows<'a>(&'a self, out: &'a mut Vec<String>, indent: &str) -> Rows<'a> {
+        Rows {
+            f: self,
+            out,
+            indent: indent.to_string(),
         }
     }
 
@@ -169,31 +164,27 @@ impl HumanFormatter {
     /// whitespace per line — typically `"  "`.
     fn render_caa_block(&self, caa: &CaaPolicy, indent: &str) -> Vec<String> {
         let mut out = Vec::new();
-        out.push(format!("\n{}{}:", indent, self.label("CAA Policy")));
+        let mut block = self.rows(&mut out, indent);
+        let mut rows = block.section("CAA Policy");
 
         if !caa.has_policy {
-            out.push(format!(
-                "{}  {}",
-                indent,
+            let line = format!(
+                "{}{}",
+                rows.indent,
                 self.value("No CAA records (any CA may issue)")
-            ));
+            );
+            rows.push(line);
         } else {
-            if let Some(ref eff) = caa.effective_domain {
-                out.push(format!(
-                    "{}  {}: {}",
-                    indent,
-                    self.label("Found at"),
-                    self.value(&sanitize_display(eff))
-                ));
-            }
+            rows.opt("Found at", &caa.effective_domain);
             for r in &caa.records {
-                out.push(format!(
-                    "{}  {} {} \"{}\"",
-                    indent,
+                let line = format!(
+                    "{}{} {} \"{}\"",
+                    rows.indent,
                     self.value(&r.flags.to_string()),
                     self.label(&r.tag),
                     sanitize_display(&r.value)
-                ));
+                );
+                rows.push(line);
             }
         }
 
@@ -207,12 +198,7 @@ impl HumanFormatter {
                     self.warning("CAA present but no issue/issuewild tags")
                 }
             };
-            out.push(format!(
-                "{}  {}: {}",
-                indent,
-                self.label("Issuer vs CAA"),
-                rendered
-            ));
+            rows.kv("Issuer vs CAA", rendered);
         }
 
         // Note is appended separately by the caller so it can sit at the
@@ -227,35 +213,6 @@ impl HumanFormatter {
     fn push_caa_note_footer(&self, out: &mut Vec<String>, caa: &CaaPolicy) {
         out.push(String::new());
         out.push(format!("note: {}", caa.note));
-    }
-
-    /// Renders one contact block: a blank-line-led `<role> Contact:` heading
-    /// at `indent`, then a row per populated field one level deeper. An empty
-    /// contact renders nothing.
-    fn push_contact(&self, out: &mut Vec<String>, indent: &str, role: &str, c: Contact<'_>) {
-        if c.is_empty() {
-            return;
-        }
-        out.push(format!(
-            "\n{indent}{}:",
-            self.label(&format!("{role} Contact"))
-        ));
-        for (label, field) in c.fields() {
-            if let Some(v) = field {
-                out.push(format!(
-                    "{indent}  {}: {}",
-                    self.label(label),
-                    self.value(&sanitize_display(v))
-                ));
-            }
-        }
-    }
-
-    /// [`Self::push_contact`] for each of [`contact::ROLES`].
-    fn push_contacts(&self, out: &mut Vec<String>, indent: &str, contacts: [Contact<'_>; 3]) {
-        for (role, c) in contact::ROLES.into_iter().zip(contacts) {
-            self.push_contact(out, indent, role, c);
-        }
     }
 
     /// Formats an expiration date with a human-readable status suffix.
@@ -277,6 +234,117 @@ impl HumanFormatter {
             self.warning(&format!("{} (expires in {} days)", expiry_str, days_until))
         } else {
             self.success(&format!("{} (expires in {} days)", expiry_str, days_until))
+        }
+    }
+}
+
+/// Appends `label: value` rows at one indent. Remote text goes through
+/// [`sanitize_display`] here, so no row can skip the terminal-injection guard.
+struct Rows<'a> {
+    f: &'a HumanFormatter,
+    out: &'a mut Vec<String>,
+    indent: String,
+}
+
+impl Rows<'_> {
+    /// Appends a pre-built line as-is.
+    fn push(&mut self, line: String) {
+        self.out.push(line);
+    }
+
+    /// Appends pre-built lines as-is.
+    fn extend(&mut self, lines: Vec<String>) {
+        self.out.extend(lines);
+    }
+
+    /// Appends an empty separator line.
+    fn blank(&mut self) {
+        self.out.push(String::new());
+    }
+
+    /// `label: <styled>` for a value the caller already styled (and, if it is
+    /// remote text, sanitized).
+    fn kv(&mut self, label: &str, styled: String) {
+        let label = self.f.label(label);
+        self.out.push(format!("{}{label}: {styled}", self.indent));
+    }
+
+    /// `label: value` for remote text: sanitized, then value-styled.
+    fn text(&mut self, label: &str, text: &str) {
+        let value = self.f.value(&sanitize_display(text));
+        self.kv(label, value);
+    }
+
+    /// [`Self::text`], skipped when the field is absent.
+    fn opt(&mut self, label: &str, text: &Option<String>) {
+        if let Some(text) = text {
+            self.text(label, text);
+        }
+    }
+
+    /// `label: YYYY-MM-DD`, skipped when absent.
+    fn date(&mut self, label: &str, date: Option<DateTime<Utc>>) {
+        if let Some(date) = date {
+            let value = self.f.value(&date.format("%Y-%m-%d").to_string());
+            self.kv(label, value);
+        }
+    }
+
+    /// `Expires: <date> (expires in N days)`, colored by urgency (see
+    /// [`HumanFormatter::format_expiry_status`]); skipped when absent.
+    fn expires(&mut self, date: Option<DateTime<Utc>>) {
+        if let Some(date) = date {
+            let status = self
+                .f
+                .format_expiry_status(&date.format("%Y-%m-%d").to_string(), days_until(date));
+            self.kv("Expires", status);
+        }
+    }
+
+    /// `label:` then one `- item` row per entry, one level deeper; nothing
+    /// for an empty list.
+    fn list(&mut self, label: &str, items: &[String]) {
+        if items.is_empty() {
+            return;
+        }
+        let label = self.f.label(label);
+        self.out.push(format!("{}{label}:", self.indent));
+        for item in items {
+            let item = self.f.value(&sanitize_display(item));
+            self.out.push(format!("{}  - {item}", self.indent));
+        }
+    }
+
+    /// A writer into the same output at another indent.
+    fn at(&mut self, indent: &str) -> Rows<'_> {
+        self.f.rows(self.out, indent)
+    }
+
+    /// A blank-line-led `label:` heading; returns the writer for its rows,
+    /// one level deeper.
+    fn section(&mut self, label: &str) -> Rows<'_> {
+        let heading = self.f.label(label);
+        self.out.push(format!("\n{}{heading}:", self.indent));
+        let indent = format!("{}  ", self.indent);
+        self.at(&indent)
+    }
+
+    /// One contact block: a `<role> Contact` section with a row per populated
+    /// field. An empty contact renders nothing, never a bare heading.
+    fn contact(&mut self, role: &str, contact: Contact<'_>) {
+        if contact.is_empty() {
+            return;
+        }
+        let mut rows = self.section(&format!("{role} Contact"));
+        for (label, field) in contact.fields() {
+            rows.opt(label, field);
+        }
+    }
+
+    /// [`Self::contact`] for each of [`contact::ROLES`].
+    fn contacts(&mut self, contacts: [Contact<'_>; 3]) {
+        for (role, c) in contact::ROLES.into_iter().zip(contacts) {
+            self.contact(role, c);
         }
     }
 }
