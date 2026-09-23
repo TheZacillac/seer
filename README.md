@@ -443,7 +443,7 @@ async fn main() -> seer_core::Result<()> {
 }
 ```
 
-See [seer-core/README.md](seer-core/README.md) for the full API reference.
+See [docs.rs/seer-core](https://docs.rs/seer-core) for the full API reference.
 
 ---
 
