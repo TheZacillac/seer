@@ -209,6 +209,13 @@ impl DnsFollower {
         Self { resolver }
     }
 
+    /// Builds a follower whose resolver honors `~/.seer/config.toml`
+    /// (`timeouts.dns_secs`), like [`DnsResolver::from_config`]. As there, the
+    /// configured nameserver is passed per call to [`DnsFollower::follow`].
+    pub fn from_config(config: &crate::config::SeerConfig) -> Self {
+        Self::with_resolver(DnsResolver::from_config(config))
+    }
+
     /// Follow DNS records over time
     #[instrument(skip(self, config, callback, cancel_rx))]
     pub async fn follow(
@@ -407,6 +414,17 @@ mod tests {
     use super::*;
 
     use super::super::records::RecordData;
+
+    /// Regression: the TUI's live follow used `DnsFollower::new()` and so
+    /// ignored the configured DNS timeout that `dig`, the CLI and the REPL
+    /// honor. Every surface now builds its follower through `from_config`.
+    #[test]
+    fn from_config_applies_dns_timeout() {
+        let mut config = crate::config::SeerConfig::default();
+        config.timeouts.dns_secs = 9;
+        let follower = DnsFollower::from_config(&config);
+        assert_eq!(follower.resolver.timeout(), Duration::from_secs(9));
+    }
 
     fn record(data: RecordData) -> DnsRecord {
         DnsRecord {

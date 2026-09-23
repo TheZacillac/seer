@@ -266,6 +266,12 @@ impl DnsResolver {
         Self::new().with_timeout(config.dns_timeout())
     }
 
+    /// Test-only: the per-query timeout, for asserting config plumbing.
+    #[cfg(test)]
+    pub(crate) fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
     /// Test-only: allow custom nameservers on loopback/private hosts (mock servers).
     #[cfg(test)]
     pub(crate) fn allowing_private_hosts(mut self) -> Self {

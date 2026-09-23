@@ -76,9 +76,7 @@ impl Repl {
             editor,
             clients: Clients::from_config(cfg),
             // Honor the config file's DNS timeout like `dig` does.
-            dns_follower: seer_core::DnsFollower::with_resolver(
-                seer_core::DnsResolver::from_config(cfg),
-            ),
+            dns_follower: seer_core::DnsFollower::from_config(cfg),
             last_result: None,
             context,
         })

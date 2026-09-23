@@ -320,6 +320,10 @@ fn handle_action(
             *follow_cancel = Some(cancel_tx);
             let tx = tx.clone();
             let gen = p.gen;
+            // Honor the config's DNS timeout and nameserver, like the CLI and
+            // REPL `follow` (and the TUI's own DNS lens) do.
+            let follower = seer_core::DnsFollower::from_config(config);
+            let nameserver = config.nameserver.clone();
             tokio::spawn(async move {
                 let interval_minutes = p.interval_secs as f64 / 60.0;
                 if let Ok(config) = seer_core::FollowConfig::new(p.iterations, interval_minutes) {
@@ -332,11 +336,11 @@ fn handle_action(
                                 it: Box::new(it.clone()),
                             });
                         });
-                    let _ = seer_core::DnsFollower::new()
+                    let _ = follower
                         .follow(
                             &p.domain,
                             seer_core::RecordType::A,
-                            None,
+                            nameserver.as_deref(),
                             config,
                             Some(cb),
                             Some(cancel_rx),

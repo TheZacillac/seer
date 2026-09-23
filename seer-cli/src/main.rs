@@ -869,8 +869,7 @@ async fn execute_command(
             };
 
             // Honor the config file's DNS timeout like `dig` does.
-            let follower =
-                seer_core::DnsFollower::with_resolver(seer_core::DnsResolver::from_config(config));
+            let follower = seer_core::DnsFollower::from_config(config);
 
             // The banner is prose, so under a machine format it goes to stderr
             // and stdout stays a parseable stream (`seer --format json follow
