@@ -59,6 +59,9 @@ const RDAP_ACCEPT: &str = "application/rdap+json, application/json;q=0.9";
 /// are one hop, so three is ample while bounding a hostile server.
 const MAX_RDAP_REDIRECTS: usize = 3;
 
+/// User agent for every RDAP request (bootstrap and queries).
+const RDAP_USER_AGENT: &str = "Seer/1.0 (RDAP Client)";
+
 /// Shared HTTP client for bootstrap fetches against IANA.
 /// The bootstrap targets are hardcoded data.iana.org URLs, so this client
 /// does not need DNS-rebinding protection. Per-query RDAP requests use
@@ -69,15 +72,11 @@ const MAX_RDAP_REDIRECTS: usize = 3;
 /// `SeerError::HttpError` via `rdap_http_client()` instead of a process
 /// panic at first use (library code must not `.expect()` on shared state).
 static RDAP_HTTP_CLIENT: LazyLock<Option<Client>> = LazyLock::new(|| {
-    Client::builder()
-        .timeout(DEFAULT_TIMEOUT)
-        .connect_timeout(CONNECT_TIMEOUT)
-        .user_agent("Seer/1.0 (RDAP Client)")
+    // Bootstrap targets are hardcoded https://data.iana.org URLs that return
+    // terminal JSON; the builder's no-redirect policy is defense in depth so a
+    // compromised/MITM'd hop can't bounce the fetch to an internal address.
+    rdap_client_builder(DEFAULT_TIMEOUT)
         .pool_max_idle_per_host(10)
-        // Bootstrap targets are hardcoded https://data.iana.org URLs that return
-        // terminal JSON; disable redirect-following for defense in depth so a
-        // compromised/MITM'd hop can't bounce the fetch to an internal address.
-        .redirect(reqwest::redirect::Policy::none())
         .build()
         .ok()
 });
@@ -723,14 +722,8 @@ fn parse_rdap_url(url: &str) -> Result<(String, u16)> {
             url
         )));
     }
-    // Use `host()` (not `host_str()`) so an IPv6 literal comes back
-    // unbracketed and hits the shared guard's IP-literal short-circuit.
-    let host = match parsed.host() {
-        Some(url::Host::Domain(d)) => d.to_string(),
-        Some(url::Host::Ipv4(ip)) => ip.to_string(),
-        Some(url::Host::Ipv6(ip)) => ip.to_string(),
-        None => return Err(SeerError::RdapError(format!("URL '{}' has no host", url))),
-    };
+    let host = crate::net::url_host(&parsed)
+        .ok_or_else(|| SeerError::RdapError(format!("URL '{}' has no host", url)))?;
     let port = parsed.port_or_known_default().unwrap_or(443);
     Ok((host, port))
 }
@@ -804,6 +797,19 @@ type PinnedClientKey = (String, u16, Duration);
 static PINNED_CLIENT_CACHE: LazyLock<crate::cache::TtlCache<PinnedClientKey, Client>> =
     LazyLock::new(|| crate::cache::TtlCache::with_max_capacity(PINNED_CLIENT_TTL, 64));
 
+/// Client settings shared by every RDAP request. The connect timeout is kept
+/// no larger than the overall one so a sub-5s configured timeout stays
+/// consistent. Redirects are never auto-followed: `resolve_to_addrs` pins only
+/// the first host, so reqwest's policy would re-resolve a 3xx target itself
+/// and bypass the reserved-IP guard. `query_rdap_attempt` follows them one hop
+/// at a time instead, each hop re-entering [`send_rdap_request`] and so
+/// re-running the https check, SSRF validation, and pinning.
+fn rdap_client_builder(timeout: Duration) -> reqwest::ClientBuilder {
+    crate::net::client_builder(timeout)
+        .connect_timeout(CONNECT_TIMEOUT.min(timeout))
+        .user_agent(RDAP_USER_AGENT)
+}
+
 /// Sends one RDAP request: SSRF-validates the URL and pins the resolved IPs on
 /// a cached per-host client (DNS-rebinding defense), returning the raw response.
 ///
@@ -824,18 +830,11 @@ async fn send_rdap_request(
     timeout: Duration,
     allow_reserved: bool,
 ) -> Result<reqwest::Response> {
-    // Keep the connect timeout no larger than the overall request timeout so a
-    // sub-5s configured timeout stays internally consistent.
-    let connect_timeout = CONNECT_TIMEOUT.min(timeout);
     if allow_reserved && is_loopback_url(url) {
         // Test seam: build a one-off unpinned client and never touch the
         // shared pinned-client cache — a test-mode client reaching loopback
         // must not be servable to a production request (nor vice versa).
-        let client = Client::builder()
-            .timeout(timeout)
-            .connect_timeout(connect_timeout)
-            .user_agent("Seer/1.0 (RDAP Client)")
-            .redirect(reqwest::redirect::Policy::none())
+        let client = rdap_client_builder(timeout)
             .build()
             .map_err(|e| SeerError::RdapError(format!("failed to build HTTP client: {}", e)))?;
         return client
@@ -858,19 +857,8 @@ async fn send_rdap_request(
             // the HTTP client. If the host is an IP literal the resolved vec
             // already holds it, so `resolve_to_addrs` is still correct.
             let resolved = resolve_rdap_host(&host, port).await?;
-            let client = Client::builder()
-                .timeout(timeout)
-                .connect_timeout(connect_timeout)
-                .user_agent("Seer/1.0 (RDAP Client)")
+            let client = rdap_client_builder(timeout)
                 .resolve_to_addrs(&host, &resolved)
-                // SSRF defense: `resolve_to_addrs` pins only THIS host's validated IPs.
-                // reqwest's own policy would follow redirects re-resolving each new
-                // host with its own resolver — so a 3xx to http://169.254.169.254 (or
-                // any internal host) would bypass the reserved-IP guard entirely.
-                // Redirects are instead followed manually by `query_rdap_attempt`,
-                // one hop at a time, each hop re-entering this function and so
-                // re-running the https check, SSRF validation, and pinning.
-                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .map_err(|e| SeerError::RdapError(format!("failed to build HTTP client: {}", e)))?;
             PINNED_CLIENT_CACHE.insert(key.clone(), client.clone());

@@ -45,10 +45,8 @@ const MAX_CT_RESPONSE_SIZE: usize = 10 * 1024 * 1024;
 /// `SeerError::HttpError` via `client()` instead of a process panic at first
 /// use (library code must not `.expect()` on shared state).
 static HTTP_CLIENT: LazyLock<Option<reqwest::Client>> = LazyLock::new(|| {
-    reqwest::Client::builder()
-        .timeout(DEFAULT_TIMEOUT)
+    crate::net::client_builder(DEFAULT_TIMEOUT)
         .user_agent("seer-domain-tool")
-        .redirect(reqwest::redirect::Policy::none())
         .build()
         .ok()
 });

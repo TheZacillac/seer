@@ -33,7 +33,7 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use futures::StreamExt;
-use reqwest::{Client, Url};
+use reqwest::Url;
 
 use crate::error::{Result, SeerError};
 
@@ -169,12 +169,9 @@ impl GuardedFetcher {
                 return Err(SeerError::HttpError("redirect loop detected".to_string()));
             }
 
-            let mut builder = Client::builder()
-                // Manual redirect handling: see the module docs. Letting
-                // reqwest follow would skip the per-hop guard.
-                .redirect(reqwest::redirect::Policy::none())
-                .timeout(self.timeout)
-                .user_agent(concat!("Seer/", env!("CARGO_PKG_VERSION")));
+            // No auto-redirects (see the module docs): each hop is re-guarded.
+            let mut builder =
+                crate::net::client_builder(self.timeout).user_agent(crate::net::USER_AGENT);
 
             if !self.allow_private {
                 let addrs = crate::net::validate_http_url(&url).await?;

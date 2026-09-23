@@ -299,6 +299,31 @@ pub async fn resolve_public_host(host: &str, port: u16) -> Result<Vec<SocketAddr
     Ok(addrs)
 }
 
+/// User agent for seer's own HTTP probes (status, headers, takeover, webhook).
+pub(crate) const USER_AGENT: &str = concat!("Seer/", env!("CARGO_PKG_VERSION"));
+
+/// Starts a reqwest client for an outbound leg: an overall `timeout`, and
+/// redirects never followed automatically. reqwest's own policy would resolve
+/// each `Location` host itself, skipping the SSRF guard and any
+/// `resolve_to_addrs` pin (redirect-based SSRF); legs that need redirects
+/// follow them by hand and re-validate every hop.
+pub(crate) fn client_builder(timeout: Duration) -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none())
+}
+
+/// A URL's host as the SSRF guard wants it. Uses `host()` rather than
+/// `host_str()` so an IPv6 literal comes back unbracketed and hits
+/// [`resolve_public_host`]'s IP-literal short-circuit.
+pub(crate) fn url_host(url: &Url) -> Option<String> {
+    Some(match url.host()? {
+        url::Host::Domain(d) => d.to_string(),
+        url::Host::Ipv4(ip) => ip.to_string(),
+        url::Host::Ipv6(ip) => ip.to_string(),
+    })
+}
+
 /// Validates an HTTP(S) URL as an outbound target and returns the public
 /// socket addresses to pin the connection to.
 ///
@@ -332,14 +357,7 @@ pub(crate) async fn validate_http_url(url: &Url) -> Result<Vec<SocketAddr>> {
         ));
     }
 
-    // Use `host()` (not `host_str()`) so an IPv6 literal comes back
-    // unbracketed and hits the guard's IP-literal short-circuit.
-    let host = match url.host() {
-        Some(url::Host::Domain(d)) => d.to_string(),
-        Some(url::Host::Ipv4(ip)) => ip.to_string(),
-        Some(url::Host::Ipv6(ip)) => ip.to_string(),
-        None => return Err(SeerError::HttpError("missing URL host".to_string())),
-    };
+    let host = url_host(url).ok_or_else(|| SeerError::HttpError("missing URL host".to_string()))?;
     let port = url.port_or_known_default().unwrap_or(443);
 
     // Only allow standard HTTP/HTTPS ports to prevent port scanning via redirects
