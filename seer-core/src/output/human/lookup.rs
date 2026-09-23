@@ -62,7 +62,7 @@ impl HumanFormatter {
 
                 // Registrant contact details
                 if let Some(contact) = data.get_registrant_contact() {
-                    if contact.has_info() {
+                    if has_registrant_details(&contact) {
                         output.push(format!("\n  {}:", self.label("Registrant Contact")));
                         if let Some(ref email) = contact.email {
                             output.push(format!(
@@ -229,9 +229,10 @@ impl HumanFormatter {
                     }
 
                     // Registrant contact details (if RDAP didn't have them)
-                    let rdap_registrant = data.get_registrant_contact();
-                    let rdap_has_registrant =
-                        rdap_registrant.as_ref().is_some_and(|c| c.has_info());
+                    let rdap_has_registrant = data
+                        .get_registrant_contact()
+                        .as_ref()
+                        .is_some_and(has_registrant_details);
                     if !rdap_has_registrant {
                         let has_whois_contact = whois.registrant_email.is_some()
                             || whois.registrant_phone.is_some()
@@ -868,6 +869,50 @@ mod tests {
         ] {
             assert!(out.contains(needle), "missing {needle:?}:\n{out}");
         }
+    }
+
+    /// RDAP whose registrant entity carries only a name and organization.
+    fn rdap_registrant_identity_only() -> RdapResponse {
+        serde_json::from_value(serde_json::json!({
+            "ldhName": "example.com",
+            "entities": [{
+                "objectClassName": "entity",
+                "roles": ["registrant"],
+                "vcardArray": ["vcard", [
+                    ["fn", {}, "text", "Jane Registrant"],
+                    ["org", {}, "text", "Example LLC"]
+                ]]
+            }]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn rdap_registrant_identity_only_opens_no_empty_contact_heading() {
+        // has_info() counts name/organization, but the Registrant Contact
+        // block renders only email/phone/address/country (name and org are
+        // the top-level lines), so this printed a bare heading.
+        let out = formatter().format_rdap(&rdap_registrant_identity_only());
+        assert!(out.contains("Registrant: Jane Registrant"), "got:\n{out}");
+        assert!(
+            !out.contains("Registrant Contact"),
+            "empty heading rendered:\n{out}"
+        );
+    }
+
+    #[test]
+    fn format_lookup_falls_back_to_whois_registrant_details() {
+        // The same identity-only RDAP registrant also counted as "RDAP has
+        // registrant details", suppressing the WHOIS fallback's email.
+        let mut whois = WhoisResponse::parse("example.com", "whois.test", "Registrar: R\n");
+        whois.registrant_email = Some("owner@example.com".to_string());
+        let result = LookupResult::Rdap {
+            data: Box::new(rdap_registrant_identity_only()),
+            whois_fallback: Some(whois),
+        };
+        let out = formatter().format_lookup(&result);
+        assert_eq!(out.matches("Registrant Contact").count(), 1, "got:\n{out}");
+        assert!(out.contains("Email: owner@example.com"), "got:\n{out}");
     }
 
     #[test]

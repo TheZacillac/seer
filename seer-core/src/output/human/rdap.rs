@@ -44,7 +44,7 @@ impl HumanFormatter {
 
         // Registrant contact details
         if let Some(contact) = response.get_registrant_contact() {
-            if contact.has_info() {
+            if has_registrant_details(&contact) {
                 output.push(format!("\n  {}:", self.label("Registrant Contact")));
                 if let Some(ref email) = contact.email {
                     output.push(format!(

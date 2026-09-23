@@ -69,6 +69,18 @@ pub(crate) fn format_duration(duration: TimeDelta) -> String {
     }
 }
 
+/// Whether an RDAP registrant contact has anything for the "Registrant
+/// Contact" block. The block omits name/organization, which print as the
+/// top-level Registrant/Organization lines, so a contact holding only those
+/// must not open an empty heading.
+pub(super) fn has_registrant_details(contact: &crate::rdap::ContactInfo) -> bool {
+    contact.has_info()
+        && (contact.email.is_some()
+            || contact.phone.is_some()
+            || contact.address.is_some()
+            || contact.country.is_some())
+}
+
 pub struct HumanFormatter {
     use_colors: bool,
 }
