@@ -206,6 +206,69 @@ pub fn bulk_summary(results: &[BulkResult]) -> String {
     )
 }
 
+/// Runs a live `follow` for the CLI and the REPL: raw mode so Esc / Ctrl-C
+/// cancel (restored on drop, even if a panic unwinds — issue #60), and each
+/// iteration streamed to stdout as it lands. The key listener is stopped
+/// before returning so it cannot swallow keystrokes meant for whatever reads
+/// the terminal next. `handle_sigint` also cancels on SIGINT, the only
+/// interrupt path when there is no terminal for the key listener.
+pub async fn run_live_follow(
+    follower: &seer_core::DnsFollower,
+    domain: &str,
+    record_type: RecordType,
+    nameserver: Option<&str>,
+    config: seer_core::FollowConfig,
+    format: seer_core::output::OutputFormat,
+    handle_sigint: bool,
+) -> seer_core::Result<seer_core::FollowResult> {
+    use std::io::Write;
+
+    // `cancel_tx` must stay alive until the follow returns: once every sender
+    // is dropped, the follow's interruptible sleep wakes immediately.
+    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    if handle_sigint {
+        let cancel_tx = cancel_tx.clone();
+        tokio::spawn(async move {
+            tokio::signal::ctrl_c().await.ok();
+            let _ = cancel_tx.send(true);
+        });
+    }
+
+    let raw_guard = crate::utils::RawModeGuard::new();
+    let key_listener =
+        crate::utils::FollowKeyListener::spawn(cancel_tx.clone(), raw_guard.is_enabled());
+
+    // In raw mode `\n` alone doesn't return to column 0, so use `\r\n`.
+    let callback: seer_core::dns::FollowProgressCallback = std::sync::Arc::new(move |iteration| {
+        let formatter = seer_core::output::get_formatter(format);
+        let output = formatter
+            .format_follow_iteration(iteration)
+            .replace('\n', "\r\n");
+        let mut stdout = std::io::stdout().lock();
+        let _ = stdout.write_all(output.as_bytes());
+        let _ = stdout.write_all(b"\r\n");
+        let _ = stdout.flush();
+    });
+
+    let result = follower
+        .follow(
+            domain,
+            record_type,
+            nameserver,
+            config,
+            Some(callback),
+            Some(cancel_rx),
+        )
+        .await;
+
+    // Stop the listener, then restore cooked mode, before the caller prints.
+    if let Some(listener) = key_listener {
+        listener.stop().await;
+    }
+    drop(raw_guard);
+    result
+}
+
 /// Records a lookup result to `~/.seer/history.toml` off the async executor
 /// (the file I/O is blocking). Errors are deliberately swallowed — history is
 /// best-effort and must never fail the lookup that produced it.

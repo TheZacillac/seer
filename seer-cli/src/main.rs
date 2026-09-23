@@ -1112,46 +1112,9 @@ async fn execute_command(
             let follower =
                 seer_core::DnsFollower::with_resolver(seer_core::DnsResolver::from_config(config));
 
-            // Set up cancellation channel. `cancel_tx` must stay alive until
-            // the follow returns: once every sender is dropped, the follow's
-            // interruptible sleep wakes immediately.
-            let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-
-            // Set up Ctrl+C handler (the only interrupt path when there is no
-            // terminal for the Esc listener below).
-            let cancel_tx_ctrlc = cancel_tx.clone();
-            tokio::spawn(async move {
-                tokio::signal::ctrl_c().await.ok();
-                let _ = cancel_tx_ctrlc.send(true);
-            });
-
-            // Enable raw mode for Escape key detection
-            // RAII guard: restores cooked mode on scope exit, including if a
-            // panic unwinds through the follow loop (issue #60).
-            let raw_guard = utils::RawModeGuard::new();
-
-            // Listen for Esc / Ctrl+C on a blocking thread — only when there
-            // is a terminal to read from.
-            let key_listener =
-                utils::FollowKeyListener::spawn(cancel_tx.clone(), raw_guard.is_enabled());
-
-            // Create progress callback for real-time output
-            // Note: raw mode is enabled for key detection, so we need \r\n for proper line breaks
-            let follow_format = output_format;
-            let callback: seer_core::dns::FollowProgressCallback = Arc::new(move |iteration| {
-                let formatter = seer_core::output::get_formatter(follow_format);
-                let output = formatter.format_follow_iteration(iteration);
-                // In raw mode, \n alone doesn't return to column 0, so use \r\n
-                let output = output.replace('\n', "\r\n");
-                let mut stdout = std::io::stdout().lock();
-                let _ = stdout.write_all(output.as_bytes());
-                let _ = stdout.write_all(b"\r\n");
-                let _ = stdout.flush();
-            });
-
-            // In raw mode, use \r\n for proper line breaks. The banner is
-            // prose, so under a machine format it goes to stderr and stdout
-            // stays a parseable stream (`seer --format json follow … | jq`).
+            // The banner is prose, so under a machine format it goes to stderr
+            // and stdout stays a parseable stream (`seer --format json follow
+            // … | jq`). `\r\n` matches the raw-mode iteration lines that follow.
             let notes_to_stderr = follow_notes_to_stderr(output_format);
             let banner = format!(
                 "Following {} {} records ({} iterations, {} interval)\r\nPress {} or {} to stop early\r\n\r\n",
@@ -1170,23 +1133,16 @@ async fn execute_command(
                 let _ = std::io::stdout().flush();
             }
 
-            let result = follower
-                .follow(
-                    &domain,
-                    rt,
-                    ns,
-                    follow_config,
-                    Some(callback),
-                    Some(cancel_rx),
-                )
-                .await;
-
-            // Clean up: stop the key listener and restore cooked mode before
-            // printing results. The guard's Drop also restores on a panic above.
-            if let Some(listener) = key_listener {
-                listener.stop().await;
-            }
-            drop(raw_guard);
+            let result = ops::run_live_follow(
+                &follower,
+                &domain,
+                rt,
+                ns,
+                follow_config,
+                output_format,
+                true,
+            )
+            .await;
 
             match result {
                 Ok(result) => {

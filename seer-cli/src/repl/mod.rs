@@ -20,7 +20,6 @@ use rustyline::error::ReadlineError;
 use rustyline::history::DefaultHistory;
 use rustyline::{CompletionType, Editor};
 use seer_core::colors::CatppuccinExt;
-use tokio::sync::watch;
 
 use crate::display::Spinner;
 
@@ -942,54 +941,17 @@ impl Repl {
             "Ctrl+C".ctp_yellow()
         );
 
-        // Set up cancellation channel. `cancel_tx` must stay alive until the
-        // follow returns even when no key listener runs: once every sender is
-        // dropped, the follow's interruptible sleep wakes immediately.
-        let (cancel_tx, cancel_rx) = watch::channel(false);
-
-        // Create progress callback for real-time output
-        // Note: raw mode is enabled for key detection, so we need \r\n for proper line breaks
-        let follow_format = self.context.output_format;
-        let callback: seer_core::dns::FollowProgressCallback = Arc::new(move |iteration| {
-            let formatter = seer_core::output::get_formatter(follow_format);
-            let output = formatter.format_follow_iteration(iteration);
-            let output = output.replace('\n', "\r\n");
-            let mut stdout = std::io::stdout().lock();
-            let _ = stdout.write_all(output.as_bytes());
-            let _ = stdout.write_all(b"\r\n");
-            let _ = stdout.flush();
-        });
-
-        // Enable raw mode to capture key presses. The RAII guard restores
-        // cooked mode on scope exit, including if a panic unwinds through the
-        // follow loop (issue #60).
-        let raw_guard = crate::utils::RawModeGuard::new();
-
-        // Listen for Esc / Ctrl+C on a blocking thread — only when there is a
-        // terminal to read from (see `FollowKeyListener`).
-        let key_listener =
-            crate::utils::FollowKeyListener::spawn(cancel_tx.clone(), raw_guard.is_enabled());
-
-        let result = self
-            .dns_follower
-            .follow(
-                &domain,
-                record_type,
-                nameserver.as_deref(),
-                config,
-                Some(callback),
-                Some(cancel_rx),
-            )
-            .await;
-
-        // Clean up: stop the key listener (waiting for its thread, so it can't
-        // swallow keystrokes meant for the next prompt) and restore cooked
-        // mode before printing results. The guard's Drop also restores on a
-        // panic above.
-        if let Some(listener) = key_listener {
-            listener.stop().await;
-        }
-        drop(raw_guard);
+        // In raw mode Ctrl+C arrives as a key, so no SIGINT handler here.
+        let result = crate::ops::run_live_follow(
+            &self.dns_follower,
+            &domain,
+            record_type,
+            nameserver.as_deref(),
+            config,
+            self.context.output_format,
+            false,
+        )
+        .await;
 
         match result {
             Ok(result) => {
