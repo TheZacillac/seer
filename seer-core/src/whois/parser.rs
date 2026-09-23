@@ -199,7 +199,7 @@ static TECH_PHONE_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     ]
 });
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WhoisResponse {
     pub domain: String,
     pub registrar: Option<String>,

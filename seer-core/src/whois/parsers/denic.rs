@@ -165,31 +165,19 @@ impl RegistryParser for DenicParser {
 
         WhoisResponse {
             domain: domain.to_string(),
-            registrar: None, // DENIC doesn't expose registrar in WHOIS
             registrant: holder_name.clone(),
             organization: holder_name,
-            registrant_email: None,
-            registrant_phone: None,
-            registrant_address: None,
             // Only what the [Holder] block states: .de accepts holders outside
             // Germany, and a "free" body must not report a registrant country.
             registrant_country: holder_country,
-            admin_name: None,
-            admin_organization: None,
-            admin_email: None,
-            admin_phone: None,
-            tech_name: None,
-            tech_organization: None,
-            tech_email: None,
-            tech_phone: None,
-            creation_date: None,   // DENIC doesn't expose creation date
-            expiration_date: None, // DENIC doesn't expose expiration date
             updated_date,
             nameservers,
             status: mapped_status,
             dnssec,
             whois_server: server.to_string(),
             raw_response: raw.to_string(),
+            // DENIC's WHOIS exposes no registrar, creation or expiration date.
+            ..Default::default()
         }
     }
 }

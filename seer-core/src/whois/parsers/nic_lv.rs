@@ -171,27 +171,15 @@ impl RegistryParser for NicLvParser {
             domain: domain.to_string(),
             registrar,
             registrant,
-            organization: None,
-            registrant_email: None,
-            registrant_phone: None,
             registrant_address,
             registrant_country,
-            admin_name: None,
-            admin_organization: None,
-            admin_email: None,
-            admin_phone: None,
-            tech_name: None,
-            tech_organization: None,
-            tech_email: None,
-            tech_phone: None,
-            creation_date: None, // NIC.LV does not publish creation date in WHOIS
-            expiration_date: None, // NIC.LV does not publish expiry in WHOIS
             updated_date,
             nameservers,
             status,
-            dnssec: None, // not exposed via NIC.LV WHOIS
             whois_server: server.to_string(),
             raw_response: raw.to_string(),
+            // NIC.LV's WHOIS publishes no creation/expiry date or DNSSEC state.
+            ..Default::default()
         }
     }
 }

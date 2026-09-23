@@ -164,25 +164,9 @@ impl RegistryParser for EuridParser {
         WhoisResponse {
             domain: domain.to_string(),
             registrar,
-            registrant: None, // EURid redacts registrant info on port 43
-            organization: None,
-            registrant_email: None,
-            registrant_phone: None,
-            registrant_address: None,
-            registrant_country: None,
-            admin_name: None,
-            admin_organization: None,
-            admin_email: None,
-            admin_phone: None,
-            tech_name: None,
             tech_organization: tech_org,
             tech_email,
-            tech_phone: None,
-            creation_date: None, // EURid doesn't include dates on port 43
-            expiration_date: None,
-            updated_date: None,
             nameservers,
-            status: Vec::new(),
             dnssec: if has_keys {
                 Some("signedDelegation".to_string())
             } else {
@@ -190,6 +174,8 @@ impl RegistryParser for EuridParser {
             },
             whois_server: server.to_string(),
             raw_response: raw.to_string(),
+            // EURid redacts registrant info and omits dates on port 43.
+            ..Default::default()
         }
     }
 }

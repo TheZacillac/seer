@@ -249,18 +249,7 @@ impl RegistryParser for JprsParser {
             registrar: has_data.then(|| "JPRS".to_string()),
             registrant: organization.clone(),
             organization,
-            registrant_email: None,
-            registrant_phone: None,
-            registrant_address: None,
             registrant_country: has_data.then(|| "JP".to_string()),
-            admin_name: None,
-            admin_organization: None,
-            admin_email: None,
-            admin_phone: None,
-            tech_name: None,
-            tech_organization: None,
-            tech_email: None,
-            tech_phone: None,
             creation_date,
             expiration_date,
             updated_date,
@@ -273,6 +262,7 @@ impl RegistryParser for JprsParser {
             },
             whois_server: server.to_string(),
             raw_response: raw.to_string(),
+            ..Default::default()
         }
     }
 }

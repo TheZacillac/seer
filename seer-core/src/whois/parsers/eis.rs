@@ -240,16 +240,11 @@ impl RegistryParser for EisParser {
             organization,
             registrant_email,
             registrant_phone,
-            registrant_address: None,
             registrant_country,
             admin_name,
-            admin_organization: None,
             admin_email,
-            admin_phone: None,
             tech_name,
-            tech_organization: None,
             tech_email,
-            tech_phone: None,
             creation_date,
             expiration_date,
             updated_date,
@@ -258,6 +253,7 @@ impl RegistryParser for EisParser {
             dnssec,
             whois_server: server.to_string(),
             raw_response: raw.to_string(),
+            ..Default::default()
         }
     }
 }

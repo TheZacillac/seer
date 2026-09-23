@@ -86,29 +86,9 @@ mod tests {
     fn empty_whois(domain: &str) -> WhoisResponse {
         WhoisResponse {
             domain: domain.to_string(),
-            registrar: None,
-            registrant: None,
-            organization: None,
-            registrant_email: None,
-            registrant_phone: None,
-            registrant_address: None,
-            registrant_country: None,
-            admin_name: None,
-            admin_organization: None,
-            admin_email: None,
-            admin_phone: None,
-            tech_name: None,
-            tech_organization: None,
-            tech_email: None,
-            tech_phone: None,
-            creation_date: None,
-            expiration_date: None,
-            updated_date: None,
-            nameservers: vec![],
             status: vec!["clientTransferProhibited".to_string()],
-            dnssec: None,
             whois_server: "whois.example.invalid".to_string(),
-            raw_response: String::new(),
+            ..Default::default()
         }
     }
 

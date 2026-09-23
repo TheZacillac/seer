@@ -278,26 +278,20 @@ impl RegistryParser for EducauseParser {
             registrar: has_data.then(|| "EDUCAUSE".to_string()),
             registrant: registrant.clone(),
             organization: registrant,
-            registrant_email: None,
-            registrant_phone: None,
-            registrant_address: None,
             registrant_country: has_data.then(|| "US".to_string()),
             admin_name,
-            admin_organization: None,
             admin_email,
             admin_phone,
             tech_name,
-            tech_organization: None,
             tech_email,
             tech_phone,
             creation_date,
             expiration_date,
             updated_date,
             nameservers,
-            status: Vec::new(),
-            dnssec: None,
             whois_server: server.to_string(),
             raw_response: raw.to_string(),
+            ..Default::default()
         }
     }
 }

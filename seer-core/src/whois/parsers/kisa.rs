@@ -228,28 +228,19 @@ impl RegistryParser for KisaParser {
             registrar,
             registrant: registrant.clone(),
             organization: registrant,
-            registrant_email: None,
-            registrant_phone: None,
-            registrant_address: None,
-            // Not inferred from the TLD: KISA does not print the holder country, and a
-            // "no match" body must not report a registrant country.
-            registrant_country: None,
             admin_name,
-            admin_organization: None,
             admin_email,
             admin_phone,
-            tech_name: None,
-            tech_organization: None,
-            tech_email: None,
-            tech_phone: None,
             creation_date,
             expiration_date,
             updated_date,
             nameservers,
-            status: Vec::new(),
             dnssec,
             whois_server: server.to_string(),
             raw_response: raw.to_string(),
+            // registrant_country is not inferred from the TLD: KISA does not print
+            // the holder country, and a "no match" body must not report one.
+            ..Default::default()
         }
     }
 }

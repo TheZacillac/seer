@@ -259,28 +259,12 @@ mod tests {
         let whois = crate::whois::WhoisResponse {
             domain: "example.com".to_string(),
             registrar: Some(registrar.to_string()),
-            registrant: None,
-            organization: None,
-            registrant_email: None,
-            registrant_phone: None,
-            registrant_address: None,
-            registrant_country: None,
-            admin_name: None,
-            admin_organization: None,
-            admin_email: None,
-            admin_phone: None,
-            tech_name: None,
-            tech_organization: None,
-            tech_email: None,
-            tech_phone: None,
             creation_date: Some(Utc.with_ymd_and_hms(2019, 6, 1, 0, 0, 0).unwrap()),
             expiration_date: Some(Utc.with_ymd_and_hms(2025, 6, 1, 0, 0, 0).unwrap()),
-            updated_date: None,
             nameservers: nameservers.iter().map(|s| s.to_string()).collect(),
-            status: vec![],
             dnssec: Some(dnssec.to_string()),
             whois_server: "whois.example.com".to_string(),
-            raw_response: String::new(),
+            ..Default::default()
         };
         DomainInfo::from_sources("example.com", None, Some(&whois))
     }

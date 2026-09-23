@@ -263,20 +263,10 @@ impl RegistryParser for NicItParser {
             registrar,
             registrant: registrant_org.clone(),
             organization: registrant_org,
-            registrant_email: None,
-            registrant_phone: None,
-            registrant_address: None,
-            // Not inferred from the TLD: .it accepts EU/EEA holders (e.g. an Irish company), and a
-            // "no match" body must not report a registrant country.
-            registrant_country: None,
             admin_name,
             admin_organization: admin_org,
-            admin_email: None,
-            admin_phone: None,
             tech_name,
             tech_organization: tech_org,
-            tech_email: None,
-            tech_phone: None,
             creation_date,
             expiration_date,
             updated_date,
@@ -285,6 +275,10 @@ impl RegistryParser for NicItParser {
             dnssec,
             whois_server: server.to_string(),
             raw_response: raw.to_string(),
+            // registrant_country is not inferred from the TLD: .it accepts EU/EEA
+            // holders (e.g. an Irish company), and a "no match" body must not
+            // report one.
+            ..Default::default()
         }
     }
 }

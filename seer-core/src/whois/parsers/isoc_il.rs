@@ -298,17 +298,13 @@ impl RegistryParser for IsocIlParser {
             domain: domain.to_string(),
             registrar,
             registrant,
-            organization: None,
             registrant_email,
             registrant_phone,
             registrant_address,
-            registrant_country: None,
             admin_name: admin.and_then(|c| c.name.clone()),
-            admin_organization: None,
             admin_email: admin.and_then(|c| c.email.clone()),
             admin_phone: admin.and_then(|c| c.phone.clone()),
             tech_name: tech.and_then(|c| c.name.clone()),
-            tech_organization: None,
             tech_email: tech.and_then(|c| c.email.clone()),
             tech_phone: tech.and_then(|c| c.phone.clone()),
             creation_date,
@@ -319,6 +315,7 @@ impl RegistryParser for IsocIlParser {
             dnssec,
             whois_server: server.to_string(),
             raw_response: raw.to_string(),
+            ..Default::default()
         }
     }
 }
