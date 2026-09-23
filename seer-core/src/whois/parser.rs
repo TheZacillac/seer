@@ -212,7 +212,7 @@ impl WhoisResponse {
     }
 
     /// The generic regex-based parser: the fallback for every TLD without a
-    /// registry-specific parser in [`super::parsers`].
+    /// registry-specific parser (see [`parse`](Self::parse)).
     pub fn parse_internal(domain: &str, whois_server: &str, raw: &str) -> Self {
         let registrar = extract_field_with_patterns(raw, &REGISTRAR_PATTERNS)
             .or_else(|| extract_section_value(raw, &["registrar"]));
