@@ -72,7 +72,7 @@ impl MarkdownFormatter {
 
         // Contact subsections last, so no domain-level field lands under a
         // contact heading.
-        self.format_whois_contacts(&mut output, response);
+        push_contacts(&mut output, response.contacts());
 
         output.join("\n")
     }

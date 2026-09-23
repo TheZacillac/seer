@@ -89,18 +89,10 @@ impl MarkdownFormatter {
 
         // Contact sections last: each `###` heading scopes everything below
         // it, so no domain-level field may follow one.
-        if let Some(contact) = response.get_registrant_contact() {
-            self.format_rdap_contact(&mut output, "Registrant Contact", &contact);
-        }
-        if let Some(contact) = response.get_admin_contact() {
-            self.format_rdap_contact(&mut output, "Admin Contact", &contact);
-        }
-        if let Some(contact) = response.get_tech_contact() {
-            self.format_rdap_contact(&mut output, "Tech Contact", &contact);
-        }
-        if let Some(contact) = response.get_billing_contact() {
-            self.format_rdap_contact(&mut output, "Billing Contact", &contact);
-        }
+        let infos = contact::rdap_contacts(response);
+        push_contacts(&mut output, contact::rdap_views(&infos));
+        let billing = response.get_billing_contact();
+        push_contact(&mut output, "Billing", Contact::rdap(billing.as_ref()));
 
         output.join("\n")
     }

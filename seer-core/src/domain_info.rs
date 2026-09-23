@@ -301,62 +301,30 @@ impl DomainInfo {
             })
             .or_else(|| whois.and_then(|w| w.dnssec.clone()));
 
-        // --- Registrant contact ---
-        let rdap_registrant_contact = rdap.and_then(|r| r.get_registrant_contact());
-        let registrant_email = rdap_registrant_contact
-            .as_ref()
-            .and_then(|c| c.email.clone())
-            .or_else(|| whois.and_then(|w| w.registrant_email.clone()));
-        let registrant_phone = rdap_registrant_contact
-            .as_ref()
-            .and_then(|c| c.phone.clone())
-            .or_else(|| whois.and_then(|w| w.registrant_phone.clone()));
-        let registrant_address = rdap_registrant_contact
-            .as_ref()
-            .and_then(|c| c.address.clone())
-            .or_else(|| whois.and_then(|w| w.registrant_address.clone()));
-        let registrant_country = rdap_registrant_contact
-            .as_ref()
-            .and_then(|c| c.country.clone())
-            .or_else(|| whois.and_then(|w| w.registrant_country.clone()));
-
-        // --- Admin contact ---
-        let rdap_admin_contact = rdap.and_then(|r| r.get_admin_contact());
-        let admin_name = rdap_admin_contact
-            .as_ref()
-            .and_then(|c| c.name.clone())
-            .or_else(|| whois.and_then(|w| w.admin_name.clone()));
-        let admin_organization = rdap_admin_contact
-            .as_ref()
-            .and_then(|c| c.organization.clone())
-            .or_else(|| whois.and_then(|w| w.admin_organization.clone()));
-        let admin_email = rdap_admin_contact
-            .as_ref()
-            .and_then(|c| c.email.clone())
-            .or_else(|| whois.and_then(|w| w.admin_email.clone()));
-        let admin_phone = rdap_admin_contact
-            .as_ref()
-            .and_then(|c| c.phone.clone())
-            .or_else(|| whois.and_then(|w| w.admin_phone.clone()));
-
-        // --- Tech contact ---
-        let rdap_tech_contact = rdap.and_then(|r| r.get_tech_contact());
-        let tech_name = rdap_tech_contact
-            .as_ref()
-            .and_then(|c| c.name.clone())
-            .or_else(|| whois.and_then(|w| w.tech_name.clone()));
-        let tech_organization = rdap_tech_contact
-            .as_ref()
-            .and_then(|c| c.organization.clone())
-            .or_else(|| whois.and_then(|w| w.tech_organization.clone()));
-        let tech_email = rdap_tech_contact
-            .as_ref()
-            .and_then(|c| c.email.clone())
-            .or_else(|| whois.and_then(|w| w.tech_email.clone()));
-        let tech_phone = rdap_tech_contact
-            .as_ref()
-            .and_then(|c| c.phone.clone())
-            .or_else(|| whois.and_then(|w| w.tech_phone.clone()));
+        // --- Contacts: each field from the RDAP entity, else WHOIS ---
+        let rdap_registrant = rdap.and_then(|r| r.get_registrant_contact());
+        let rdap_admin = rdap.and_then(|r| r.get_admin_contact());
+        let rdap_tech = rdap.and_then(|r| r.get_tech_contact());
+        macro_rules! contact_or_whois {
+            ($contact:ident.$field:ident, $whois_field:ident) => {
+                rdap_or_whois!(
+                    $contact.as_ref().and_then(|c| c.$field.clone()),
+                    $whois_field
+                )
+            };
+        }
+        let registrant_email = contact_or_whois!(rdap_registrant.email, registrant_email);
+        let registrant_phone = contact_or_whois!(rdap_registrant.phone, registrant_phone);
+        let registrant_address = contact_or_whois!(rdap_registrant.address, registrant_address);
+        let registrant_country = contact_or_whois!(rdap_registrant.country, registrant_country);
+        let admin_name = contact_or_whois!(rdap_admin.name, admin_name);
+        let admin_organization = contact_or_whois!(rdap_admin.organization, admin_organization);
+        let admin_email = contact_or_whois!(rdap_admin.email, admin_email);
+        let admin_phone = contact_or_whois!(rdap_admin.phone, admin_phone);
+        let tech_name = contact_or_whois!(rdap_tech.name, tech_name);
+        let tech_organization = contact_or_whois!(rdap_tech.organization, tech_organization);
+        let tech_email = contact_or_whois!(rdap_tech.email, tech_email);
+        let tech_phone = contact_or_whois!(rdap_tech.phone, tech_phone);
 
         // --- Protocol metadata ---
         let rdap_url = rdap.and_then(|r| {

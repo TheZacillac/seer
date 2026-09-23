@@ -3,6 +3,7 @@ use std::fmt::{self, Write as _};
 use super::OutputFormatter;
 
 // Shared with the per-concern submodules below (each does `use super::*`).
+pub(super) use super::contact::{self, Contact, FlatContacts};
 pub(super) use super::days_until;
 pub(super) use super::grouping::render_grouped;
 pub(super) use crate::caa::{CaaPolicy, IssuerCaaMatch};
@@ -188,118 +189,45 @@ impl MarkdownFormatter {
         out.push(format!("> **Note:** {}", caa.note));
         out
     }
+}
 
-    /// Formats a contact section for RDAP entities.
-    fn format_rdap_contact(
-        &self,
-        output: &mut Vec<String>,
-        label: &str,
-        contact: &crate::rdap::ContactInfo,
-    ) {
-        if !contact.has_info() {
-            return;
-        }
-        output.push(String::new());
-        output.push(format!("### {}", label));
-        output.push(String::new());
-        if let Some(ref name) = contact.name {
-            output.push(format!("- **Name**: {}", MdSafe(name)));
-        }
-        if let Some(ref org) = contact.organization {
-            output.push(format!("- **Organization**: {}", MdSafe(org)));
-        }
-        if let Some(ref email) = contact.email {
-            output.push(format!("- **Email**: `{}`", MdSafe(email)));
-        }
-        if let Some(ref phone) = contact.phone {
-            output.push(format!("- **Phone**: {}", MdSafe(phone)));
-        }
-        if let Some(ref address) = contact.address {
-            output.push(format!("- **Address**: {}", MdSafe(address)));
-        }
-        if let Some(ref country) = contact.country {
-            output.push(format!("- **Country**: {}", MdSafe(country)));
-        }
+/// Renders one `### <role> Contact` subsection with a bullet per populated
+/// field; nothing for an empty contact.
+///
+/// Callers push these only *after* every domain-level bullet: a `###`
+/// heading scopes everything below it, so a Created/Expires/Nameservers
+/// bullet emitted after a contact section renders as part of that contact.
+fn push_contact(output: &mut Vec<String>, role: &str, c: Contact<'_>) {
+    if c.is_empty() {
+        return;
     }
-
-    /// Formats WHOIS contact fields as a markdown subsection.
-    fn format_whois_contact(
-        &self,
-        output: &mut Vec<String>,
-        label: &str,
-        name: &Option<String>,
-        organization: &Option<String>,
-        email: &Option<String>,
-        phone: &Option<String>,
-    ) {
-        let has_info =
-            name.is_some() || organization.is_some() || email.is_some() || phone.is_some();
-        if !has_info {
-            return;
-        }
-        output.push(String::new());
-        output.push(format!("### {}", label));
-        output.push(String::new());
-        if let Some(ref v) = *name {
-            output.push(format!("- **Name**: {}", MdSafe(v)));
-        }
-        if let Some(ref v) = *organization {
-            output.push(format!("- **Organization**: {}", MdSafe(v)));
-        }
-        if let Some(ref v) = *email {
-            output.push(format!("- **Email**: `{}`", MdSafe(v)));
-        }
-        if let Some(ref v) = *phone {
-            output.push(format!("- **Phone**: {}", MdSafe(v)));
-        }
+    output.push(String::new());
+    output.push(format!("### {} Contact", role));
+    output.push(String::new());
+    if let Some(ref v) = *c.name {
+        output.push(format!("- **Name**: {}", MdSafe(v)));
     }
+    if let Some(ref v) = *c.organization {
+        output.push(format!("- **Organization**: {}", MdSafe(v)));
+    }
+    if let Some(ref v) = *c.email {
+        output.push(format!("- **Email**: `{}`", MdSafe(v)));
+    }
+    if let Some(ref v) = *c.phone {
+        output.push(format!("- **Phone**: {}", MdSafe(v)));
+    }
+    if let Some(ref v) = *c.address {
+        output.push(format!("- **Address**: {}", MdSafe(v)));
+    }
+    if let Some(ref v) = *c.country {
+        output.push(format!("- **Country**: {}", MdSafe(v)));
+    }
+}
 
-    /// Emits the registrant/admin/tech contact subsections of a WHOIS
-    /// response.
-    ///
-    /// Callers must push these (like the RDAP contact sections) only *after*
-    /// every domain-level bullet: a `###` heading scopes everything below it,
-    /// so a Created/Expires/Nameservers bullet emitted after a contact section
-    /// renders as part of that contact.
-    fn format_whois_contacts(&self, output: &mut Vec<String>, w: &WhoisResponse) {
-        let has_registrant_details = w.registrant_email.is_some()
-            || w.registrant_phone.is_some()
-            || w.registrant_address.is_some()
-            || w.registrant_country.is_some();
-        if has_registrant_details {
-            output.push(String::new());
-            output.push("### Registrant Contact".to_string());
-            output.push(String::new());
-            if let Some(ref email) = w.registrant_email {
-                output.push(format!("- **Email**: `{}`", MdSafe(email)));
-            }
-            if let Some(ref phone) = w.registrant_phone {
-                output.push(format!("- **Phone**: {}", MdSafe(phone)));
-            }
-            if let Some(ref address) = w.registrant_address {
-                output.push(format!("- **Address**: {}", MdSafe(address)));
-            }
-            if let Some(ref country) = w.registrant_country {
-                output.push(format!("- **Country**: {}", MdSafe(country)));
-            }
-        }
-
-        self.format_whois_contact(
-            output,
-            "Admin Contact",
-            &w.admin_name,
-            &w.admin_organization,
-            &w.admin_email,
-            &w.admin_phone,
-        );
-        self.format_whois_contact(
-            output,
-            "Tech Contact",
-            &w.tech_name,
-            &w.tech_organization,
-            &w.tech_email,
-            &w.tech_phone,
-        );
+/// [`push_contact`] for each of [`contact::ROLES`].
+fn push_contacts(output: &mut Vec<String>, contacts: [Contact<'_>; 3]) {
+    for (role, c) in contact::ROLES.into_iter().zip(contacts) {
+        push_contact(output, role, c);
     }
 }
 

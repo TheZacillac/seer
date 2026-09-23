@@ -222,20 +222,8 @@ impl MarkdownFormatter {
         }
 
         // Contacts table
-        let has_any_contact = info.registrant_email.is_some()
-            || info.registrant_phone.is_some()
-            || info.registrant_address.is_some()
-            || info.registrant_country.is_some()
-            || info.admin_name.is_some()
-            || info.admin_organization.is_some()
-            || info.admin_email.is_some()
-            || info.admin_phone.is_some()
-            || info.tech_name.is_some()
-            || info.tech_organization.is_some()
-            || info.tech_email.is_some()
-            || info.tech_phone.is_some();
-
-        if has_any_contact {
+        let contacts = info.contacts();
+        if contacts.iter().any(|c| !c.is_empty()) {
             output.push(String::new());
             output.push("### Contacts".to_string());
             output.push(String::new());
@@ -246,47 +234,11 @@ impl MarkdownFormatter {
                 "| Role | Name | Organization | Email | Phone | Address | Country |".to_string(),
             );
             output.push("| --- | --- | --- | --- | --- | --- | --- |".to_string());
-
-            let has_registrant = info.registrant_email.is_some()
-                || info.registrant_phone.is_some()
-                || info.registrant_address.is_some()
-                || info.registrant_country.is_some();
-            if has_registrant {
-                output.push(format!(
-                    "| Registrant | - | - | {} | {} | {} | {} |",
-                    opt_md(&info.registrant_email),
-                    opt_md(&info.registrant_phone),
-                    opt_md(&info.registrant_address),
-                    opt_md(&info.registrant_country),
-                ));
-            }
-
-            let has_admin = info.admin_name.is_some()
-                || info.admin_organization.is_some()
-                || info.admin_email.is_some()
-                || info.admin_phone.is_some();
-            if has_admin {
-                output.push(format!(
-                    "| Admin | {} | {} | {} | {} | - | - |",
-                    opt_md(&info.admin_name),
-                    opt_md(&info.admin_organization),
-                    opt_md(&info.admin_email),
-                    opt_md(&info.admin_phone),
-                ));
-            }
-
-            let has_tech = info.tech_name.is_some()
-                || info.tech_organization.is_some()
-                || info.tech_email.is_some()
-                || info.tech_phone.is_some();
-            if has_tech {
-                output.push(format!(
-                    "| Tech | {} | {} | {} | {} | - | - |",
-                    opt_md(&info.tech_name),
-                    opt_md(&info.tech_organization),
-                    opt_md(&info.tech_email),
-                    opt_md(&info.tech_phone),
-                ));
+            for (role, c) in contact::ROLES.into_iter().zip(contacts) {
+                if !c.is_empty() {
+                    let cells: Vec<String> = c.fields().iter().map(|(_, f)| opt_md(f)).collect();
+                    output.push(format!("| {} | {} |", role, cells.join(" | ")));
+                }
             }
         }
 

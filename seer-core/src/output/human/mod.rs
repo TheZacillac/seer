@@ -5,13 +5,14 @@ use std::sync::LazyLock;
 use super::OutputFormatter;
 
 // Shared with the per-concern submodules below (each does `use super::*`).
+pub(super) use super::contact::{self, Contact, FlatContacts};
 pub(super) use super::days_until;
 pub(super) use super::grouping::render_grouped;
 pub(super) use crate::caa::{CaaPolicy, IssuerCaaMatch};
 pub(super) use crate::colors::CatppuccinExt;
 pub(super) use crate::dns::{DnsRecord, FollowIteration, FollowResult, PropagationResult};
 pub(super) use crate::lookup::LookupResult;
-pub(super) use crate::rdap::RdapResponse;
+pub(super) use crate::rdap::{ContactInfo, RdapResponse};
 pub(super) use crate::status::StatusResponse;
 pub(super) use crate::whois::WhoisResponse;
 pub(super) use colored::Colorize;
@@ -69,16 +70,13 @@ pub(crate) fn format_duration(duration: TimeDelta) -> String {
     }
 }
 
-/// Whether an RDAP registrant contact has anything for the "Registrant
-/// Contact" block. The block omits name/organization, which print as the
-/// top-level Registrant/Organization lines, so a contact holding only those
-/// must not open an empty heading.
-pub(super) fn has_registrant_details(contact: &crate::rdap::ContactInfo) -> bool {
-    contact.has_info()
-        && (contact.email.is_some()
-            || contact.phone.is_some()
-            || contact.address.is_some()
-            || contact.country.is_some())
+/// [`contact::rdap_views`] as this formatter renders them: the registrant
+/// block drops name/organization, which print as the top-level
+/// Registrant/Organization lines, so an identity-only registrant opens no
+/// empty heading.
+pub(super) fn detail_views(contacts: &[Option<ContactInfo>; 3]) -> [Contact<'_>; 3] {
+    let [registrant, admin, tech] = contact::rdap_views(contacts);
+    [registrant.without_identity(), admin, tech]
 }
 
 pub struct HumanFormatter {
@@ -229,6 +227,35 @@ impl HumanFormatter {
     fn push_caa_note_footer(&self, out: &mut Vec<String>, caa: &CaaPolicy) {
         out.push(String::new());
         out.push(format!("note: {}", caa.note));
+    }
+
+    /// Renders one contact block: a blank-line-led `<role> Contact:` heading
+    /// at `indent`, then a row per populated field one level deeper. An empty
+    /// contact renders nothing.
+    fn push_contact(&self, out: &mut Vec<String>, indent: &str, role: &str, c: Contact<'_>) {
+        if c.is_empty() {
+            return;
+        }
+        out.push(format!(
+            "\n{indent}{}:",
+            self.label(&format!("{role} Contact"))
+        ));
+        for (label, field) in c.fields() {
+            if let Some(v) = field {
+                out.push(format!(
+                    "{indent}  {}: {}",
+                    self.label(label),
+                    self.value(&sanitize_display(v))
+                ));
+            }
+        }
+    }
+
+    /// [`Self::push_contact`] for each of [`contact::ROLES`].
+    fn push_contacts(&self, out: &mut Vec<String>, indent: &str, contacts: [Contact<'_>; 3]) {
+        for (role, c) in contact::ROLES.into_iter().zip(contacts) {
+            self.push_contact(out, indent, role, c);
+        }
     }
 
     /// Formats an expiration date with a human-readable status suffix.

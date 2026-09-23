@@ -86,6 +86,7 @@ macro_rules! impl_forwarding {
     };
 }
 
+mod contact;
 mod grouping;
 mod human;
 mod json;

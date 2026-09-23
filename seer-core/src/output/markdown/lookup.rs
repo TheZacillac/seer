@@ -73,15 +73,9 @@ impl MarkdownFormatter {
 
                 // Contact sections from RDAP — after every domain-level
                 // bullet, since a `###` heading scopes everything below it.
-                if let Some(contact) = data.get_registrant_contact() {
-                    self.format_rdap_contact(&mut output, "Registrant Contact", &contact);
-                }
-                if let Some(contact) = data.get_admin_contact() {
-                    self.format_rdap_contact(&mut output, "Admin Contact", &contact);
-                }
-                if let Some(contact) = data.get_tech_contact() {
-                    self.format_rdap_contact(&mut output, "Tech Contact", &contact);
-                }
+                let infos = contact::rdap_contacts(data);
+                let rdap_contacts = contact::rdap_views(&infos);
+                push_contacts(&mut output, rdap_contacts);
 
                 // WHOIS fallback data: bullets first, then any fallback
                 // contact sections (same heading-scope rule as above).
@@ -100,84 +94,14 @@ impl MarkdownFormatter {
                         }
                     }
 
-                    // Registrant contact from WHOIS fallback
-                    let rdap_has_registrant = data
-                        .get_registrant_contact()
-                        .as_ref()
-                        .is_some_and(|c| c.has_info());
-                    if !rdap_has_registrant {
-                        let has_whois_contact = whois.registrant_email.is_some()
-                            || whois.registrant_phone.is_some()
-                            || whois.registrant_address.is_some()
-                            || whois.registrant_country.is_some();
-                        if has_whois_contact {
-                            contacts.push(String::new());
-                            contacts.push("### Registrant Contact".to_string());
-                            contacts.push(String::new());
-                            if let Some(ref email) = whois.registrant_email {
-                                contacts.push(format!("- **Email**: `{}`", MdSafe(email)));
-                            }
-                            if let Some(ref phone) = whois.registrant_phone {
-                                contacts.push(format!("- **Phone**: {}", MdSafe(phone)));
-                            }
-                            if let Some(ref address) = whois.registrant_address {
-                                contacts.push(format!("- **Address**: {}", MdSafe(address)));
-                            }
-                            if let Some(ref country) = whois.registrant_country {
-                                contacts.push(format!("- **Country**: {}", MdSafe(country)));
-                            }
-                        }
-                    }
-
-                    // Admin contact from WHOIS fallback
-                    let rdap_has_admin = data.get_admin_contact().is_some_and(|c| c.has_info());
-                    if !rdap_has_admin {
-                        let has_whois_admin = whois.admin_name.is_some()
-                            || whois.admin_organization.is_some()
-                            || whois.admin_email.is_some()
-                            || whois.admin_phone.is_some();
-                        if has_whois_admin {
-                            contacts.push(String::new());
-                            contacts.push("### Admin Contact".to_string());
-                            contacts.push(String::new());
-                            if let Some(ref name) = whois.admin_name {
-                                contacts.push(format!("- **Name**: {}", MdSafe(name)));
-                            }
-                            if let Some(ref org) = whois.admin_organization {
-                                contacts.push(format!("- **Organization**: {}", MdSafe(org)));
-                            }
-                            if let Some(ref email) = whois.admin_email {
-                                contacts.push(format!("- **Email**: `{}`", MdSafe(email)));
-                            }
-                            if let Some(ref phone) = whois.admin_phone {
-                                contacts.push(format!("- **Phone**: {}", MdSafe(phone)));
-                            }
-                        }
-                    }
-
-                    // Tech contact from WHOIS fallback
-                    let rdap_has_tech = data.get_tech_contact().is_some_and(|c| c.has_info());
-                    if !rdap_has_tech {
-                        let has_whois_tech = whois.tech_name.is_some()
-                            || whois.tech_organization.is_some()
-                            || whois.tech_email.is_some()
-                            || whois.tech_phone.is_some();
-                        if has_whois_tech {
-                            contacts.push(String::new());
-                            contacts.push("### Tech Contact".to_string());
-                            contacts.push(String::new());
-                            if let Some(ref name) = whois.tech_name {
-                                contacts.push(format!("- **Name**: {}", MdSafe(name)));
-                            }
-                            if let Some(ref org) = whois.tech_organization {
-                                contacts.push(format!("- **Organization**: {}", MdSafe(org)));
-                            }
-                            if let Some(ref email) = whois.tech_email {
-                                contacts.push(format!("- **Email**: `{}`", MdSafe(email)));
-                            }
-                            if let Some(ref phone) = whois.tech_phone {
-                                contacts.push(format!("- **Phone**: {}", MdSafe(phone)));
-                            }
+                    // Contact sections RDAP didn't render.
+                    let fallback = contact::ROLES
+                        .into_iter()
+                        .zip(rdap_contacts)
+                        .zip(whois.contacts());
+                    for ((role, rdap), whois_contact) in fallback {
+                        if rdap.is_empty() {
+                            push_contact(&mut contacts, role, whois_contact);
                         }
                     }
 
@@ -263,7 +187,7 @@ impl MarkdownFormatter {
                 }
 
                 // Contact subsections last, after every domain-level bullet.
-                self.format_whois_contacts(&mut output, data);
+                push_contacts(&mut output, data.contacts());
             }
             LookupResult::Available {
                 data,
