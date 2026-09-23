@@ -18,20 +18,6 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  check:
-    name: Check
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo check --workspace
-      # The `otel` feature is optional and off by default, so the line above
-      # never compiles it. Check it explicitly so the OpenTelemetry integration
-      # (and its dependency bumps) can't silently break.
-      - name: Check optional features (otel)
-        run: cargo check -p seer-core --features otel
-
   fmt:
     name: Format
     runs-on: ubuntu-latest
@@ -51,9 +37,16 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      # --all-targets lints tests/benches too (clippy.toml allows unwrap in
-      # tests, so this stays signal-rich rather than noisy).
+      # Clippy type-checks everything `cargo check --workspace` would, so there
+      # is no separate check job. --all-targets lints tests/benches too
+      # (clippy.toml allows unwrap in tests, so this stays signal-rich rather
+      # than noisy).
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      # The `otel` feature is optional and off by default, so the line above
+      # never compiles it. Lint it explicitly so the OpenTelemetry integration
+      # (and its dependency bumps) can't silently break.
+      - name: Clippy (otel feature)
+        run: cargo clippy -p seer-core --features otel --all-targets -- -D warnings
 
   test:
     name: Test
