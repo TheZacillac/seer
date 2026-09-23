@@ -133,8 +133,8 @@ pub struct SslReport {
     /// This reflects ONLY the date-range check (`notBefore <= now <=
     /// notAfter`) of the leaf certificate. It does NOT verify the certificate
     /// chain's trust (the inspection handshake accepts any presented chain so
-    /// broken/self-signed certs can be inspected) nor that the certificate matches the
-    /// requested hostname — see [`SslReport::hostname_verified`]. A
+    /// broken/self-signed certs can be inspected) nor that the certificate
+    /// matches the requested hostname — see [`SslReport::hostname_verified`]. A
     /// date-valid cert may still be self-signed, issued by an untrusted CA, or
     /// presented for the wrong host.
     pub is_valid: bool,

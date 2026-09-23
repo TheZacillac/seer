@@ -226,6 +226,7 @@ impl GuardedFetcher {
                 BodyReadError::TimedOut => {
                     SeerError::Timeout(format!("HTTP body read timed out after {:?}", self.timeout))
                 }
+                // A chunk error (a truncating read never reports TooLarge).
                 other => SeerError::HttpError(format!("body chunk: {other}")),
             })?;
         Ok(String::from_utf8_lossy(&body).into_owned())
