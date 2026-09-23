@@ -22,9 +22,8 @@
 //! Updated Date: 2025-02-07
 //! ```
 
-use chrono::{DateTime, NaiveDate, Utc};
-
 use super::{push_bounded, MAX_NAMESERVERS, MAX_STATUSES};
+use crate::whois::parse_date;
 use crate::whois::parser::WhoisResponse;
 
 static_regex! {
@@ -159,14 +158,6 @@ pub(super) fn parse(domain: &str, server: &str, raw: &str) -> WhoisResponse {
         // "no match" body must not report one.
         ..Default::default()
     }
-}
-
-fn parse_date(date_str: &str) -> Option<DateTime<Utc>> {
-    let cleaned = date_str.trim();
-    if let Ok(d) = NaiveDate::parse_from_str(cleaned, "%Y-%m-%d") {
-        return Some(d.and_hms_opt(0, 0, 0)?.and_utc());
-    }
-    None
 }
 
 #[cfg(test)]

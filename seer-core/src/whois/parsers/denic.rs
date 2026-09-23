@@ -12,9 +12,8 @@
 //! Changed: 2023-01-15T10:30:00+01:00
 //! ```
 
-use chrono::{DateTime, Utc};
-
 use super::{push_bounded, MAX_NAMESERVERS, MAX_STATUSES};
+use crate::whois::parse_date;
 use crate::whois::parser::WhoisResponse;
 
 // Regex patterns for DENIC-specific fields.
@@ -87,7 +86,7 @@ pub(super) fn parse(domain: &str, server: &str, raw: &str) -> WhoisResponse {
         // Parse changed date (this is the updated date)
         if let Some(caps) = CHANGED_PATTERN.captures(line) {
             if let Some(m) = caps.get(1) {
-                updated_date = parse_denic_date(m.as_str());
+                updated_date = parse_date(m.as_str());
             }
         }
 
@@ -131,29 +130,6 @@ pub(super) fn parse(domain: &str, server: &str, raw: &str) -> WhoisResponse {
         // DENIC's WHOIS exposes no registrar, creation or expiration date.
         ..Default::default()
     }
-}
-
-fn parse_denic_date(date_str: &str) -> Option<DateTime<Utc>> {
-    // DENIC uses ISO 8601 format with timezone
-    // Example: 2023-01-15T10:30:00+01:00
-    let cleaned = date_str.trim();
-
-    // Try parsing as ISO 8601 with timezone
-    if let Ok(dt) = DateTime::parse_from_rfc3339(cleaned) {
-        return Some(dt.with_timezone(&Utc));
-    }
-
-    // Try without timezone
-    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(cleaned, "%Y-%m-%dT%H:%M:%S") {
-        return Some(dt.and_utc());
-    }
-
-    // Try date only
-    if let Ok(d) = chrono::NaiveDate::parse_from_str(cleaned, "%Y-%m-%d") {
-        return Some(d.and_hms_opt(0, 0, 0)?.and_utc());
-    }
-
-    None
 }
 
 #[cfg(test)]
@@ -279,8 +255,13 @@ Changed: 2023-01-15T10:30:00+01:00
     #[test]
     fn test_denic_date_parsing() {
         // Test various DENIC date formats
-        assert!(parse_denic_date("2023-01-15T10:30:00+01:00").is_some());
-        assert!(parse_denic_date("2023-01-15T10:30:00Z").is_some());
-        assert!(parse_denic_date("2023-01-15").is_some());
+        assert!(parse_date("2023-01-15T10:30:00+01:00").is_some());
+        assert!(parse_date("2023-01-15T10:30:00Z").is_some());
+        // DENIC also emits naive ISO datetimes; they read as UTC.
+        assert_eq!(
+            parse_date("2023-01-15T10:30:00").map(|d| d.to_rfc3339()),
+            Some("2023-01-15T10:30:00+00:00".to_string())
+        );
+        assert!(parse_date("2023-01-15").is_some());
     }
 }

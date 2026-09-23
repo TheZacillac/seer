@@ -33,9 +33,8 @@
 //! Domain expires:             31-Jul-2027
 //! ```
 
-use chrono::{DateTime, NaiveDate, Utc};
-
 use super::{push_bounded, MAX_NAMESERVERS};
+use crate::whois::parse_date;
 use crate::whois::parser::WhoisResponse;
 
 // Regex patterns for EDUCAUSE-specific fields.
@@ -96,7 +95,7 @@ pub(super) fn parse(domain: &str, server: &str, raw: &str) -> WhoisResponse {
         if let Some(caps) = ACTIVATED_DATE.captures(trimmed) {
             if creation_date.is_none() {
                 if let Some(m) = caps.get(1) {
-                    creation_date = parse_educause_date(m.as_str());
+                    creation_date = parse_date(m.as_str());
                 }
             }
             current_section = Section::None;
@@ -105,7 +104,7 @@ pub(super) fn parse(domain: &str, server: &str, raw: &str) -> WhoisResponse {
         if let Some(caps) = UPDATED_DATE.captures(trimmed) {
             if updated_date.is_none() {
                 if let Some(m) = caps.get(1) {
-                    updated_date = parse_educause_date(m.as_str());
+                    updated_date = parse_date(m.as_str());
                 }
             }
             current_section = Section::None;
@@ -114,7 +113,7 @@ pub(super) fn parse(domain: &str, server: &str, raw: &str) -> WhoisResponse {
         if let Some(caps) = EXPIRES_DATE.captures(trimmed) {
             if expiration_date.is_none() {
                 if let Some(m) = caps.get(1) {
-                    expiration_date = parse_educause_date(m.as_str());
+                    expiration_date = parse_date(m.as_str());
                 }
             }
             current_section = Section::None;
@@ -236,25 +235,6 @@ pub(super) fn parse(domain: &str, server: &str, raw: &str) -> WhoisResponse {
         raw_response: raw.to_string(),
         ..Default::default()
     }
-}
-
-/// Parses EDUCAUSE date format: DD-Mon-YYYY (e.g., "31-Jul-2027")
-fn parse_educause_date(date_str: &str) -> Option<DateTime<Utc>> {
-    let cleaned = date_str.trim();
-
-    let formats = [
-        "%d-%b-%Y", // 31-Jul-2027
-        "%d-%B-%Y", // 31-July-2027
-        "%Y-%m-%d", // 2027-07-31 (fallback)
-    ];
-
-    for fmt in &formats {
-        if let Ok(date) = NaiveDate::parse_from_str(cleaned, fmt) {
-            return Some(date.and_hms_opt(0, 0, 0)?.and_utc());
-        }
-    }
-
-    None
 }
 
 #[cfg(test)]
@@ -393,9 +373,9 @@ Domain expires:             31-Jul-2027"#;
 
     #[test]
     fn test_educause_date_parsing() {
-        assert!(parse_educause_date("05-Mar-1999").is_some());
-        assert!(parse_educause_date("31-Jul-2027").is_some());
-        assert!(parse_educause_date("31-July-2027").is_some());
+        assert!(parse_date("05-Mar-1999").is_some());
+        assert!(parse_date("31-Jul-2027").is_some());
+        assert!(parse_date("31-July-2027").is_some());
     }
 
     /// A contact block whose first indented line is an email (not a name).

@@ -805,6 +805,8 @@ pub(crate) fn parse_date_with_order(date_str: &str, order: DateOrder) -> Option<
     const UNAMBIGUOUS_FORMATS: &[&str] = &[
         "%Y-%m-%dT%H:%M:%SZ",
         "%Y-%m-%dT%H:%M:%S%.fZ",
+        // Naive ISO datetime, read as UTC (DENIC `Changed:`).
+        "%Y-%m-%dT%H:%M:%S",
         "%Y-%m-%d %H:%M:%S",
         "%d-%b-%Y %H:%M:%S",
         "%d-%b-%Y %H:%M:%S%.f",

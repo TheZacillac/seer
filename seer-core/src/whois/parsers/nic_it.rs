@@ -26,9 +26,8 @@
 //!   ns2.google.com
 //! ```
 
-use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
-
 use super::{push_bounded, MAX_NAMESERVERS, MAX_STATUSES};
+use crate::whois::parse_date;
 use crate::whois::parser::WhoisResponse;
 
 static_regex! {
@@ -231,20 +230,6 @@ pub(super) fn parse(domain: &str, server: &str, raw: &str) -> WhoisResponse {
         // report one.
         ..Default::default()
     }
-}
-
-fn parse_date(date_str: &str) -> Option<DateTime<Utc>> {
-    let cleaned = date_str.trim();
-
-    // NIC.it uses "YYYY-MM-DD HH:MM:SS" or "YYYY-MM-DD"
-    if let Ok(dt) = NaiveDateTime::parse_from_str(cleaned, "%Y-%m-%d %H:%M:%S") {
-        return Some(dt.and_utc());
-    }
-    if let Ok(d) = NaiveDate::parse_from_str(cleaned, "%Y-%m-%d") {
-        return Some(d.and_hms_opt(0, 0, 0)?.and_utc());
-    }
-
-    None
 }
 
 /// Extract a value from an indented "Key: Value" line.
