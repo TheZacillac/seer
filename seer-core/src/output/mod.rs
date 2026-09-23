@@ -78,8 +78,11 @@ macro_rules! impl_serializing {
 /// method of the same name, defined in the formatter's per-concern
 /// submodules. Rust resolves the inherent method first, so this does not
 /// recurse; it must be invoked where those inherent methods are visible.
+/// A missing inherent method would make the forwarder call itself, so
+/// `unconditional_recursion` is denied: a compile error, not a stack overflow.
 macro_rules! impl_forwarding {
     ($formatter:ty; $($method:ident($arg:ident: $ty:ty);)+) => {
+        #[deny(unconditional_recursion)]
         impl OutputFormatter for $formatter {
             $(fn $method(&self, $arg: &$ty) -> String {
                 self.$method($arg)
