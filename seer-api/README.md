@@ -34,14 +34,6 @@ pip install -e .
 | `seer-api` | Start REST API server |
 | `seer-mcp` | Start MCP server |
 
-## Modules
-
-| Directory | Description |
-|-----------|-------------|
-| [`seer_api/main.py`](seer_api/main.py) | FastAPI application setup |
-| [`seer_api/routers/`](seer_api/routers/) | API endpoint implementations |
-| [`seer_api/mcp/`](seer_api/mcp/) | MCP server implementation |
-
 ## REST API
 
 ### Starting the Server
@@ -245,55 +237,8 @@ All 30 tools, on both transports:
 | `seer_bulk_info` | Bulk domain info |
 | `seer_bulk_availability` | Bulk availability checks |
 
-### Tool Schemas
-
-#### seer_lookup
-
-```json
-{
-  "name": "seer_lookup",
-  "inputSchema": {
-    "type": "object",
-    "properties": {
-      "domain": {"type": "string"}
-    },
-    "required": ["domain"]
-  }
-}
-```
-
-#### seer_dig
-
-```json
-{
-  "name": "seer_dig",
-  "inputSchema": {
-    "type": "object",
-    "properties": {
-      "domain": {"type": "string"},
-      "record_type": {"type": "string", "default": "A"},
-      "nameserver": {"type": "string"}
-    },
-    "required": ["domain"]
-  }
-}
-```
-
-#### seer_bulk_lookup
-
-```json
-{
-  "name": "seer_bulk_lookup",
-  "inputSchema": {
-    "type": "object",
-    "properties": {
-      "domains": {"type": "array", "items": {"type": "string"}},
-      "concurrency": {"type": "integer", "default": 10}
-    },
-    "required": ["domains"]
-  }
-}
-```
+Each tool's input schema is served by `tools/list` (defined in
+`seer_api/mcp/server.py`).
 
 ### Claude Desktop Integration
 
