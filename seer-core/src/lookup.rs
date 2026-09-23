@@ -561,10 +561,6 @@ pub struct SmartLookup {
     whois_client: WhoisClient,
     availability_checker: AvailabilityChecker,
     dns_resolver: DnsResolver,
-    /// Deprecated: both protocols are now always attempted concurrently.
-    prefer_rdap: bool,
-    /// Deprecated: WHOIS data is now always attached when available.
-    include_fallback: bool,
 }
 
 impl Default for SmartLookup {
@@ -582,8 +578,6 @@ impl SmartLookup {
             whois_client: WhoisClient::new(),
             availability_checker: AvailabilityChecker::new(),
             dns_resolver: DnsResolver::new(),
-            prefer_rdap: true,
-            include_fallback: false,
         }
     }
 
@@ -595,25 +589,7 @@ impl SmartLookup {
             whois_client: WhoisClient::new().with_timeout(config.whois_timeout()),
             availability_checker: AvailabilityChecker::from_config(config),
             dns_resolver: DnsResolver::new().with_timeout(config.dns_timeout()),
-            prefer_rdap: true,
-            include_fallback: false,
         }
-    }
-
-    /// Deprecated: both protocols are now always attempted concurrently.
-    /// This method is kept for API compatibility but has no effect.
-    #[deprecated(note = "This field has no effect. RDAP is always tried concurrently with WHOIS.")]
-    pub fn prefer_rdap(mut self, prefer: bool) -> Self {
-        self.prefer_rdap = prefer;
-        self
-    }
-
-    /// Deprecated: WHOIS data is now always attached when available.
-    /// This method is kept for API compatibility but has no effect.
-    #[deprecated(note = "This field has no effect. RDAP is always tried concurrently with WHOIS.")]
-    pub fn include_fallback(mut self, include: bool) -> Self {
-        self.include_fallback = include;
-        self
     }
 
     /// Performs a smart lookup for a domain, trying both RDAP and WHOIS concurrently.
@@ -732,11 +708,6 @@ impl SmartLookup {
         LOOKUP_CACHE.insert_with_ttl(normalized.clone(), trim_raw_response(result.clone()), ttl);
 
         Ok(result)
-    }
-
-    /// Clears the lookup result cache.
-    pub fn clear_cache() {
-        LOOKUP_CACHE.clear();
     }
 
     #[instrument(skip(self, progress), fields(domain = %domain))]
@@ -1135,26 +1106,6 @@ mod tests {
         assert!(!result.is_whois());
         assert!(result.registrar().is_none());
         assert_eq!(result.expiration_info(), (None, None));
-    }
-
-    #[test]
-    #[allow(deprecated)]
-    fn test_smart_lookup_builder() {
-        let lookup = SmartLookup::new().prefer_rdap(false).include_fallback(true);
-        assert!(!lookup.prefer_rdap);
-        assert!(lookup.include_fallback);
-    }
-
-    #[test]
-    fn test_lookup_cache_clear() {
-        // Serialized: the waiter-coalescing test inserts into LOOKUP_CACHE,
-        // and an unsynchronized clear here would race both its insert (this
-        // assert) and its waiters' cache read (that test's counter assert).
-        let _serial = INFLIGHT_TEST_SERIAL
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        SmartLookup::clear_cache();
-        assert!(LOOKUP_CACHE.is_empty());
     }
 
     // ---------------- trim_raw_response char-boundary safety ----------------

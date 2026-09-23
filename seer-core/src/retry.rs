@@ -239,11 +239,6 @@ impl RetryExecutor<NetworkRetryClassifier> {
 }
 
 impl<C: RetryClassifier> RetryExecutor<C> {
-    /// Creates a new executor with a custom classifier.
-    pub fn with_classifier(policy: RetryPolicy, classifier: C) -> Self {
-        Self { policy, classifier }
-    }
-
     /// Executes an async operation with retry logic.
     ///
     /// The operation will be retried up to `max_attempts` times if it fails
@@ -301,16 +296,6 @@ impl<C: RetryClassifier> RetryExecutor<C> {
 
         // Should not reach here, but handle it gracefully
         Err(last_error.unwrap_or_else(|| SeerError::Other("retry loop exited unexpectedly".into())))
-    }
-
-    /// Executes an async operation once without retries.
-    /// Useful for operations that should not be retried.
-    pub async fn execute_once<F, Fut, T>(&self, operation: F) -> Result<T>
-    where
-        F: FnOnce() -> Fut,
-        Fut: Future<Output = Result<T>>,
-    {
-        operation().await
     }
 }
 

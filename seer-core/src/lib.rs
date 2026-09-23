@@ -77,7 +77,7 @@ pub use diff::{DomainDiff, DomainDiffer};
 pub use domain_info::{
     describe_epp_status, DomainInfo, DomainInfoSource, ExpiryStatus, StatusDescription,
 };
-pub use drift::{drift_from_history, DriftReport, FieldChange};
+pub use drift::{DriftReport, FieldChange};
 pub use headers::{
     audit_headers, CookieFinding, Disclosure, HeaderFinding, HeaderReport, HeaderVerdict,
     DEFAULT_HEADER_TIMEOUT,
@@ -96,6 +96,5 @@ pub use subdomains::{
 };
 pub use takeover::{scan_takeover, TakeoverFinding, TakeoverReport, TakeoverVerdict};
 pub use watchlist::{
-    check_watchlist, check_watchlist_with, check_watchlist_with_config, WatchReport, WatchResult,
-    Watchlist,
+    check_watchlist_with, check_watchlist_with_config, WatchReport, WatchResult, Watchlist,
 };

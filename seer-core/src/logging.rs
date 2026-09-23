@@ -7,7 +7,7 @@
 //! # Usage
 //!
 //! ```rust,no_run
-//! let _guard = seer_core::logging::init_logging("seer", "error");
+//! let _guard = seer_core::logging::init_logging_with_writer("seer", "error", std::io::stderr);
 //! ```
 //!
 //! The returned guard **must** be kept alive for the lifetime of the process
@@ -25,7 +25,7 @@ use tracing_subscriber::{
 
 static INITIALIZED: OnceLock<()> = OnceLock::new();
 
-/// Guard returned by [`init_logging`] / [`init_logging_with_writer`].
+/// Guard returned by [`init_logging_with_writer`].
 ///
 /// Holds the file appender worker guard (if file logging is enabled).
 /// Drop this only when the process is about to exit.
@@ -33,21 +33,11 @@ pub struct LogGuard {
     _file_guard: Option<tracing_appender::non_blocking::WorkerGuard>,
 }
 
-/// Initialise the global tracing subscriber for a CLI / standalone process.
-///
-/// Uses `stderr` as the console output destination. For a custom writer (e.g.
-/// progress-bar aware), use [`init_logging_with_writer`].
+/// Initialise the global tracing subscriber with a console writer
+/// (`std::io::stderr`, or a progress-bar-aware writer as `seer-cli` uses).
 ///
 /// `default_level` is used when neither `ARCANUM_LOG_LEVEL` nor `RUST_LOG`
 /// is set. Typical values: `"error"` for CLIs, `"info"` for servers.
-pub fn init_logging(app_name: &str, default_level: &str) -> LogGuard {
-    init_logging_with_writer(app_name, default_level, std::io::stderr)
-}
-
-/// Initialise the global tracing subscriber with a custom console writer.
-///
-/// This is used by `seer-cli` to route log output through the progress bar.
-/// See [`init_logging`] for the meaning of `default_level`.
 pub fn init_logging_with_writer<W>(app_name: &str, default_level: &str, writer: W) -> LogGuard
 where
     W: for<'a> MakeWriter<'a> + Send + Sync + 'static,

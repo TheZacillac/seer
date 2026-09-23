@@ -153,9 +153,6 @@ fn result_is_critical(r: &WatchResult) -> bool {
     bad_ssl || bad_domain || bad_issue
 }
 
-/// Default number of domains checked at once by [`check_watchlist`].
-const DEFAULT_WATCH_CONCURRENCY: usize = 10;
-
 /// Turns one domain's status check into a [`WatchResult`]. Pure, so every
 /// issue rule is unit-testable without the network.
 ///
@@ -244,16 +241,8 @@ fn assess(domain: String, outcome: Result<crate::status::StatusResponse>) -> Wat
 }
 
 /// Checks all given domains concurrently and produces a [`WatchReport`],
-/// using default timeouts and concurrency.
-///
-/// Prefer [`check_watchlist_with_config`] from a front-end, so the user's
-/// `~/.seer/config.toml` timeouts and bulk concurrency apply.
-pub async fn check_watchlist(domains: &[String]) -> WatchReport {
-    check_watchlist_with(domains, StatusClient::new(), DEFAULT_WATCH_CONCURRENCY).await
-}
-
-/// Like [`check_watchlist`], honoring the config file's per-protocol
-/// timeouts (via [`StatusClient::from_config`]) and `bulk.concurrency`.
+/// honoring the config file's per-protocol timeouts (via
+/// [`StatusClient::from_config`]) and `bulk.concurrency`.
 pub async fn check_watchlist_with_config(
     domains: &[String],
     config: &crate::config::SeerConfig,
@@ -276,7 +265,7 @@ pub async fn check_watchlist_with(
 
     // Each per-domain future owns its `client` (via `Arc`) and `domain`
     // (owned `String`) so the `buffer_unordered` futures are `Send + 'static`
-    // and the whole `check_watchlist` future can be used from `tokio::spawn`
+    // and the whole `check_watchlist_with` future can be used from `tokio::spawn`
     // (e.g. the TUI). Borrowing `&client`/`&String` here makes the closure fail
     // the higher-ranked `FnOnce` bound `tokio::spawn` requires.
     let client = std::sync::Arc::new(client);
