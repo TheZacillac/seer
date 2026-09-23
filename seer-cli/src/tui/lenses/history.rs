@@ -38,13 +38,7 @@ pub fn render(
         .enumerate()
         .map(|(i, e)| {
             let when = e.timestamp.format("%Y-%m-%d %H:%M").to_string();
-            let source = if e.result.is_rdap() {
-                "RDAP"
-            } else if e.result.is_whois() {
-                "WHOIS"
-            } else {
-                "—"
-            };
+            let source = crate::ops::lookup_source(&e.result).unwrap_or("—");
             let registrar = or_dash(e.result.registrar());
             Row::new(vec![when, e.domain.clone(), source.to_string(), registrar])
                 .style(row_style(theme, focused && i == sel))

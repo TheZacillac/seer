@@ -19,15 +19,11 @@ pub async fn fetch(req: FetchReq, config: &seer_core::SeerConfig) -> Result<Lens
                 .lookup(&d)
                 .await
                 .map_err(e)?;
-            // Record to history — best-effort, off the async reactor. Mirrors the
-            // CLI lookup handler (main.rs). Detached (not awaited): the Overview
-            // result renders immediately; the save lands a beat later.
+            // Record to history like the CLI/REPL lookup, but detached (not
+            // awaited): the Overview renders immediately; the save lands a
+            // beat later.
             let result = r.clone();
-            tokio::task::spawn_blocking(move || {
-                let mut h = seer_core::LookupHistory::load();
-                h.record(&d, result);
-                let _ = h.save();
-            });
+            tokio::spawn(async move { crate::ops::record_lookup_history(&d, result).await });
             Ok(LensData::Overview(Box::new(r)))
         }
         FetchReq::Whois(d) => seer_core::WhoisClient::from_config(config)
