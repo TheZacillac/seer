@@ -930,13 +930,12 @@ mod tests {
 
     fn available_lookup(available: bool, confidence: &str, method: &str) -> LookupResult {
         LookupResult::Available {
-            data: Box::new(crate::availability::AvailabilityResult {
-                domain: "example.com".to_string(),
+            data: Box::new(crate::availability::AvailabilityResult::new(
+                "example.com",
                 available,
-                confidence: confidence.to_string(),
-                method: method.to_string(),
-                details: None,
-            }),
+                confidence,
+                method,
+            )),
             rdap_error: String::new(),
             whois_error: String::new(),
             whois_data: Some(make_test_whois()),

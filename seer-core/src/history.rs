@@ -119,13 +119,7 @@ mod tests {
 
     fn make_lookup_result(domain: &str) -> LookupResult {
         LookupResult::Available {
-            data: Box::new(AvailabilityResult {
-                domain: domain.to_string(),
-                available: true,
-                confidence: "high".to_string(),
-                method: "test".to_string(),
-                details: None,
-            }),
+            data: Box::new(AvailabilityResult::new(domain, true, "high", "test")),
             rdap_error: "test".to_string(),
             whois_error: "test".to_string(),
             whois_data: None,
