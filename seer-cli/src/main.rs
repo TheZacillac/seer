@@ -11,7 +11,6 @@ use std::sync::Arc;
 
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{generate, Shell};
-use indicatif::{ProgressBar, ProgressStyle};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 #[clap(rename_all = "lowercase")]
@@ -37,12 +36,12 @@ enum ProgressMode {
 fn resolve_progress_mode(
     flag: Option<ProgressMode>,
     stderr_is_tty: bool,
-    format: &str,
+    format: seer_core::output::OutputFormat,
 ) -> ProgressMode {
     if let Some(mode) = flag {
         return mode;
     }
-    if format.eq_ignore_ascii_case("json") {
+    if format == seer_core::output::OutputFormat::Json {
         return ProgressMode::None;
     }
     if !stderr_is_tty {
@@ -62,21 +61,17 @@ enum FailOn {
     Critical,
 }
 
-const BULK_EXAMPLES: &str = r#"
-Input File Formats:
-  Plain text (one domain per line, # for comments):
-    # My domains to check
-    example.com
-    google.com
-    github.com
+/// `seer bulk --help` epilogue: the input formats (shared with the REPL's
+/// `bulk -h`), then [`BULK_EXAMPLES`].
+fn bulk_long_help() -> String {
+    format!(
+        "\nInput File Formats:\n{}\n{}",
+        ops::BULK_INPUT_FORMATS,
+        BULK_EXAMPLES
+    )
+}
 
-  CSV (uses first column, skips header if present):
-    domain,owner,notes
-    example.com,Alice,Main site
-    google.com,Bob,Search
-    github.com,Carol,Code hosting
-
-Example Usage:
+const BULK_EXAMPLES: &str = r#"Example Usage:
   seer bulk status domains.txt              # Output: domains_results.csv
   seer bulk lookup domains.csv              # Output: domains_results.csv
   seer bulk dig domains.txt MX              # Output: domains_results.csv
@@ -200,9 +195,12 @@ enum Commands {
     /// Execute bulk operations from a file, output results to CSV.
     /// CSV output includes anti-formula protection for spreadsheets; use `--format json`
     /// for programmatic consumption without spreadsheet escaping.
-    #[command(after_long_help = BULK_EXAMPLES)]
+    #[command(after_long_help = bulk_long_help())]
     Bulk {
-        #[arg(value_name = "OPERATION", help = ops::BULK_OP_HELP)]
+        #[arg(
+            value_name = "OPERATION",
+            help = format!("Operation type: {}", *ops::BULK_OPS_SUMMARY)
+        )]
         operation: String,
 
         /// Input file path (text or CSV format), or `-` to read the domain
@@ -810,13 +808,7 @@ async fn execute_command(
             progress,
         } => {
             let stderr_is_tty = std::io::IsTerminal::is_terminal(&std::io::stderr());
-            let format_str = match output_format {
-                seer_core::output::OutputFormat::Json => "json",
-                seer_core::output::OutputFormat::Human => "human",
-                seer_core::output::OutputFormat::Yaml => "yaml",
-                seer_core::output::OutputFormat::Markdown => "markdown",
-            };
-            let progress_mode = resolve_progress_mode(progress, stderr_is_tty, format_str);
+            let progress_mode = resolve_progress_mode(progress, stderr_is_tty, output_format);
 
             // `-` reads a newline/CSV-delimited domain list from stdin so bulk
             // composes with shell pipelines (`grep … | seer bulk status -`).
@@ -864,41 +856,17 @@ async fn execute_command(
                 .unwrap_or_else(|e| emit_error(output_format, &e));
 
             // Status goes to stderr so it never pollutes a structured stdout stream.
-            eprintln!(
-                "Processing {} domains with {} operation...",
-                domains.len().to_string().ctp_green(),
-                operation.ctp_yellow()
-            );
+            eprintln!("{}", ops::bulk_banner(domains.len(), &operation));
 
-            let total = operations.len();
-
-            // Construct the progress bar (when applicable) and activate it for
-            // tracing integration so log lines route through pb.println().
-            let pb: Option<Arc<ProgressBar>> = match progress_mode {
-                ProgressMode::None => None,
-                ProgressMode::Bar | ProgressMode::Verbose | ProgressMode::Failures => {
-                    let bar = ProgressBar::new(total as u64);
-                    bar.set_style(
-                        ProgressStyle::default_bar()
-                            .template("{bar:40.cyan/blue} {pos}/{len} ({percent}%) eta {eta} {msg}")
-                            .expect("valid progress bar template")
-                            .progress_chars("=>-"),
-                    );
-                    display::set_bulk_progress_bar(bar.clone());
-                    Some(Arc::new(bar))
-                }
-            };
-
-            let callback: Option<seer_core::bulk::ProgressCallback> = pb
-                .as_ref()
-                .map(|bar| ops::bar_progress_callback(bar.as_ref()));
-
+            let bar =
+                (progress_mode != ProgressMode::None).then(|| ops::bulk_bar(operations.len()));
+            let callback = bar.as_ref().map(ops::bar_progress_callback);
             let results = executor.execute(operations, callback).await;
 
             // Emit per-item lines according to mode, then clear the bar.
             // `bar_println` falls back to plain stderr when indicatif hid the
             // bar (non-TTY stderr), where `println` would silently drop them.
-            if let Some(bar) = pb.as_ref() {
+            if let Some(bar) = &bar {
                 for r in &results {
                     let domain = r.operation.domain();
                     let line = match (progress_mode, r.success) {
@@ -918,12 +886,8 @@ async fn execute_command(
                         let _ = display::bar_println(bar, &line);
                     }
                 }
-                bar.finish_and_clear();
-                display::clear_bulk_progress_bar();
+                ops::finish_bulk_bar(bar);
             }
-
-            let success_count = results.iter().filter(|r| r.success).count();
-            let fail_count = results.len() - success_count;
 
             if structured_output {
                 // Serialize the full result set to stdout (JSON array / YAML).
@@ -938,15 +902,8 @@ async fn execute_command(
             }
 
             if let Some(csv_path) = &csv_path {
-                // Convert results to CSV. Write atomically so a crash mid-write
-                // cannot leave a truncated CSV that downstream pipelines treat
-                // as authoritative.
-                let csv_content = utils::bulk_results_to_csv(&results, &operation);
-                if let Err(e) = utils::atomic_write(csv_path, &csv_content) {
-                    emit_error(
-                        output_format,
-                        &format!("Failed to write output file {}: {}", csv_path, e),
-                    );
+                if let Err(e) = ops::write_bulk_csv(&results, &operation, csv_path) {
+                    emit_error(output_format, &e);
                 }
                 let written = format!("Results written to: {}", csv_path.ctp_green());
                 // Keep stdout a clean JSON/YAML document in structured mode.
@@ -957,15 +914,7 @@ async fn execute_command(
                 }
             }
 
-            let summary = format!(
-                "  {} successful, {} failed",
-                success_count.to_string().ctp_green(),
-                if fail_count > 0 {
-                    fail_count.to_string().ctp_red()
-                } else {
-                    fail_count.to_string().ctp_green()
-                }
-            );
+            let summary = ops::bulk_summary(&results);
             if structured_output {
                 eprintln!("{}", summary);
             } else {
@@ -974,6 +923,7 @@ async fn execute_command(
 
             // A run with zero successes is a total failure (network down,
             // every domain malformed) — scripted callers gate on $?.
+            let success_count = results.iter().filter(|r| r.success).count();
             let exit_code = utils::bulk_exit_code(success_count, results.len());
             if exit_code != 0 {
                 std::process::exit(exit_code);
@@ -2270,15 +2220,16 @@ mod follow_output_tests {
 #[cfg(test)]
 mod progress_mode_tests {
     use super::{resolve_progress_mode, ProgressMode};
+    use seer_core::output::OutputFormat;
 
     #[test]
     fn explicit_mode_is_honored_on_tty() {
         assert_eq!(
-            resolve_progress_mode(Some(ProgressMode::Verbose), true, "human"),
+            resolve_progress_mode(Some(ProgressMode::Verbose), true, OutputFormat::Human),
             ProgressMode::Verbose
         );
         assert_eq!(
-            resolve_progress_mode(Some(ProgressMode::None), true, "human"),
+            resolve_progress_mode(Some(ProgressMode::None), true, OutputFormat::Human),
             ProgressMode::None
         );
     }
@@ -2286,7 +2237,7 @@ mod progress_mode_tests {
     #[test]
     fn explicit_mode_is_honored_on_non_tty() {
         assert_eq!(
-            resolve_progress_mode(Some(ProgressMode::Bar), false, "human"),
+            resolve_progress_mode(Some(ProgressMode::Bar), false, OutputFormat::Human),
             ProgressMode::Bar
         );
     }
@@ -2294,7 +2245,7 @@ mod progress_mode_tests {
     #[test]
     fn explicit_mode_overrides_json_format() {
         assert_eq!(
-            resolve_progress_mode(Some(ProgressMode::Bar), true, "json"),
+            resolve_progress_mode(Some(ProgressMode::Bar), true, OutputFormat::Json),
             ProgressMode::Bar
         );
     }
@@ -2302,7 +2253,7 @@ mod progress_mode_tests {
     #[test]
     fn default_is_bar_on_tty_with_human_format() {
         assert_eq!(
-            resolve_progress_mode(None, true, "human"),
+            resolve_progress_mode(None, true, OutputFormat::Human),
             ProgressMode::Bar
         );
     }
@@ -2310,7 +2261,7 @@ mod progress_mode_tests {
     #[test]
     fn default_is_none_on_non_tty() {
         assert_eq!(
-            resolve_progress_mode(None, false, "human"),
+            resolve_progress_mode(None, false, OutputFormat::Human),
             ProgressMode::None
         );
     }
@@ -2318,14 +2269,13 @@ mod progress_mode_tests {
     #[test]
     fn default_is_none_with_json_format() {
         assert_eq!(
-            resolve_progress_mode(None, true, "json"),
+            resolve_progress_mode(None, true, OutputFormat::Json),
             ProgressMode::None
         );
     }
 
     #[test]
     fn explicit_format_flag_overrides_config_default() {
-        use seer_core::output::OutputFormat;
         // An explicit `--format human` must win even when the config default
         // is non-human — the previous code re-read config in that case and
         // silently ignored the flag.
@@ -2341,7 +2291,6 @@ mod progress_mode_tests {
 
     #[test]
     fn format_falls_back_to_config_when_flag_absent() {
-        use seer_core::output::OutputFormat;
         assert_eq!(
             super::resolve_output_format(None, "yaml"),
             OutputFormat::Yaml
@@ -2354,7 +2303,6 @@ mod progress_mode_tests {
 
     #[test]
     fn format_defaults_when_unset_or_invalid() {
-        use seer_core::output::OutputFormat;
         assert_eq!(
             super::resolve_output_format(None, ""),
             OutputFormat::default()

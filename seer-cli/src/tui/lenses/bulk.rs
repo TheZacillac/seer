@@ -5,9 +5,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Row, Table};
 use ratatui::Frame;
 
+use crate::ops::BULK_OPS;
 use crate::tui::app::SPIN;
 use crate::tui::line_editor::LineEditor;
-use crate::tui::panes::bulk::{BulkState, OPS};
+use crate::tui::panes::bulk::BulkState;
 use crate::tui::theme::Theme;
 use crate::tui::widgets::{dot, gauge, panel, row_style, scroll_to};
 
@@ -31,7 +32,7 @@ pub fn render(
     // Op chip row — highlight the selected op
     let op_chips: Line = {
         let mut spans = Vec::new();
-        for (i, &op) in OPS.iter().enumerate() {
+        for (i, &(op, _)) in BULK_OPS.iter().enumerate() {
             if i > 0 {
                 spans.push(Span::raw(" "));
             }

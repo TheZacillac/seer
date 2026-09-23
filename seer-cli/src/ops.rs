@@ -7,36 +7,54 @@
 //! here means a new bulk operation or a semantics fix lands in one place and
 //! every surface (CLI, REPL, and the TUI's op mapping) picks it up.
 
-use seer_core::bulk::BulkOperation;
+use std::sync::LazyLock;
+
+use seer_core::bulk::{BulkOperation, BulkResult};
+use seer_core::colors::CatppuccinExt;
 use seer_core::RecordType;
 
 /// Maximum number of domains accepted for a single CLI/REPL bulk run.
 pub const MAX_BULK_DOMAINS: usize = 1000;
 
-/// Canonical bulk operation names, as shown in help text and offered by the
-/// REPL tab-completer. `dig`/`dns` and `prop`/`propagation` are accepted as
-/// aliases by [`bulk_operation_for`].
-pub const BULK_OPS: &[&str] = &[
-    "lookup",
-    "whois",
-    "rdap",
-    "dig",
-    "prop",
-    "status",
-    "avail",
-    "info",
-    "ssl",
-    "posture",
-    "confusables",
-    "caa",
+/// Bulk operations with one-line descriptions, in the TUI's `o` cycling
+/// order: the single list behind help text, error messages, the REPL
+/// completer, and the TUI presets. [`bulk_operation_for`] also accepts the
+/// `dns`/`propagation` aliases.
+pub const BULK_OPS: &[(&str, &str)] = &[
+    ("lookup", "Smart lookup (RDAP first, WHOIS fallback)"),
+    ("status", "Check HTTP, SSL, and domain expiration"),
+    ("dig", "Query DNS records (alias: dns)"),
+    ("avail", "Check domain registration availability"),
+    ("info", "Comprehensive domain info (RDAP + WHOIS merged)"),
+    ("whois", "Query WHOIS information"),
+    ("rdap", "Query RDAP registry data"),
+    ("ssl", "Inspect SSL certificate chain (deep)"),
+    ("prop", "Check DNS propagation (alias: propagation)"),
+    ("posture", "SPF, DMARC, MTA-STS, BIMI, DANE posture"),
+    ("confusables", "Look-alike scan (costly per domain)"),
+    ("caa", "Look up CAA (cert authority) policy"),
 ];
 
-/// Human-readable list of valid bulk operations for error messages and help.
-pub const BULK_OPS_SUMMARY: &str =
-    "lookup, whois, rdap, dig/dns, prop, status, avail, info, ssl, posture, confusables, caa";
+/// Comma-separated bulk operation names, for error messages and help.
+pub static BULK_OPS_SUMMARY: LazyLock<String> = LazyLock::new(|| {
+    let names: Vec<&str> = BULK_OPS.iter().map(|(name, _)| *name).collect();
+    names.join(", ")
+});
 
-/// Help text for the `bulk` subcommand's OPERATION argument (clap `help =`).
-pub const BULK_OP_HELP: &str = "Operation type: lookup, whois, rdap, dig/dns, prop, status, avail, info, ssl, posture, confusables, caa";
+/// The accepted bulk input formats, shared by `seer bulk --help` and the
+/// REPL's `bulk -h`.
+pub const BULK_INPUT_FORMATS: &str = "  Plain text (one domain per line, # for comments):
+    # My domains to check
+    example.com
+    google.com
+    github.com
+
+  CSV (uses first column, skips header if present):
+    domain,owner,notes
+    example.com,Alice,Main site
+    google.com,Bob,Search
+    github.com,Carol,Code hosting
+";
 
 /// Maps an operation name (including the `dns`/`propagation` aliases) and a
 /// target domain to a [`BulkOperation`]. Returns `None` for unknown names.
@@ -83,7 +101,7 @@ pub fn build_bulk_operations(
     if bulk_operation_for(op, String::new(), record_type).is_none() {
         return Err(format!(
             "Unknown operation: {}. Use: {}",
-            op, BULK_OPS_SUMMARY
+            op, *BULK_OPS_SUMMARY
         ));
     }
     Ok(domains
@@ -125,6 +143,26 @@ pub fn default_bulk_output_path(input_file: &str) -> String {
         .to_string()
 }
 
+/// Progress bar for a bulk run, registered with the tracing writer so log
+/// lines print above it instead of tearing it. Pair with [`finish_bulk_bar`].
+pub fn bulk_bar(total: usize) -> indicatif::ProgressBar {
+    let bar = indicatif::ProgressBar::new(total as u64);
+    bar.set_style(
+        indicatif::ProgressStyle::default_bar()
+            .template("{bar:40.cyan/blue} {pos}/{len} ({percent}%) eta {eta} {msg}")
+            .expect("valid progress bar template")
+            .progress_chars("=>-"),
+    );
+    crate::display::set_bulk_progress_bar(bar.clone());
+    bar
+}
+
+/// Unregisters and clears a [`bulk_bar`].
+pub fn finish_bulk_bar(bar: &indicatif::ProgressBar) {
+    crate::display::clear_bulk_progress_bar();
+    bar.finish_and_clear();
+}
+
 /// Progress callback that drives an indicatif bar: advances the position and
 /// shows the most recently completed domain as the bar message.
 pub fn bar_progress_callback(bar: &indicatif::ProgressBar) -> seer_core::bulk::ProgressCallback {
@@ -133,6 +171,39 @@ pub fn bar_progress_callback(bar: &indicatif::ProgressBar) -> seer_core::bulk::P
         bar.set_position(completed as u64);
         bar.set_message(domain.to_string());
     })
+}
+
+/// The "Processing N domains with OP operation..." line printed before a run.
+pub fn bulk_banner(domain_count: usize, op: &str) -> String {
+    format!(
+        "Processing {} domains with {} operation...",
+        domain_count.to_string().ctp_green(),
+        op.ctp_yellow()
+    )
+}
+
+/// Writes a run's CSV atomically, so a crash or full disk mid-write cannot
+/// leave a truncated file that downstream pipelines treat as authoritative.
+pub fn write_bulk_csv(results: &[BulkResult], op: &str, path: &str) -> Result<(), String> {
+    let csv = crate::utils::bulk_results_to_csv(results, op);
+    crate::utils::atomic_write(path, &csv)
+        .map_err(|e| format!("Failed to write output file {}: {}", path, e))
+}
+
+/// The "  N successful, M failed" line after a run.
+pub fn bulk_summary(results: &[BulkResult]) -> String {
+    let ok = results.iter().filter(|r| r.success).count();
+    let failed = results.len() - ok;
+    let failed = if failed > 0 {
+        failed.to_string().ctp_red()
+    } else {
+        failed.to_string().ctp_green()
+    };
+    format!(
+        "  {} successful, {} failed",
+        ok.to_string().ctp_green(),
+        failed
+    )
 }
 
 /// Records a lookup result to `~/.seer/history.toml` off the async executor
@@ -279,7 +350,7 @@ mod tests {
 
     #[test]
     fn every_canonical_op_maps_to_an_operation() {
-        for op in BULK_OPS {
+        for (op, _) in BULK_OPS {
             assert!(
                 bulk_operation_for(op, "example.com".to_string(), RecordType::A).is_some(),
                 "canonical op {op} must be accepted"

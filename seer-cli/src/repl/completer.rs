@@ -50,10 +50,6 @@ const COMMANDS: &[&str] = &[
 /// distinct from the lowercase `caa` policy-lookup command in COMMANDS above.
 const RECORD_TYPES: &[&str] = seer_core::RecordType::ALL_NAMES;
 
-/// Bulk operation names come from the shared ops module so the completer can
-/// never drift from what `bulk` actually accepts.
-const BULK_OPERATIONS: &[&str] = crate::ops::BULK_OPS;
-
 const SET_OPTIONS: &[&str] = &["output"];
 
 const OUTPUT_FORMATS: &[&str] = &["human", "json", "yaml", "markdown"];
@@ -120,9 +116,11 @@ impl Completer for SeerCompleter {
                 return Ok((start, matches));
             }
             "bulk" if words.len() == 1 || (words.len() == 2 && !line_to_cursor.ends_with(' ')) => {
-                // Complete bulk operation type
-                let matches: Vec<Pair> = BULK_OPERATIONS
+                // Complete bulk operation type (from the shared ops table, so
+                // completion can never drift from what `bulk` accepts)
+                let matches: Vec<Pair> = crate::ops::BULK_OPS
                     .iter()
+                    .map(|(op, _)| op)
                     .filter(|op| op.starts_with(current_word))
                     .map(|op| Pair {
                         display: op.to_string(),

@@ -22,7 +22,7 @@ use rustyline::{CompletionType, Editor};
 use seer_core::colors::CatppuccinExt;
 use tokio::sync::watch;
 
-use crate::display::{clear_bulk_progress_bar, set_bulk_progress_bar, Spinner};
+use crate::display::Spinner;
 
 const HISTORY_FILE: &str = ".seer_history";
 
@@ -437,7 +437,7 @@ impl Repl {
         );
         println!(
             "  {}",
-            format!("Operations: {}", crate::ops::BULK_OPS_SUMMARY).dimmed()
+            format!("Operations: {}", *crate::ops::BULK_OPS_SUMMARY).dimmed()
         );
         println!();
         println!("{}", "SETTINGS".bright_purple().bold());
@@ -462,81 +462,21 @@ impl Repl {
         println!("  bulk <operation> <file> [type] [-o output.csv]");
         println!();
         println!("{}", "Operations:".bright_cyan());
-        println!(
-            "  {}      Smart lookup (RDAP first, WHOIS fallback)",
-            "lookup".bright_green()
-        );
-        println!("  {}       Query WHOIS information", "whois".bright_green());
-        println!(
-            "  {}        Query RDAP registry data",
-            "rdap".bright_green()
-        );
-        println!("  {}         Query DNS records", "dig".bright_green());
-        println!(
-            "  {}        Check DNS propagation globally",
-            "prop".bright_green()
-        );
-        println!(
-            "  {}      Check HTTP, SSL, and domain expiration",
-            "status".bright_green()
-        );
-        println!(
-            "  {}       Check domain registration availability",
-            "avail".bright_green()
-        );
-        println!(
-            "  {}        Comprehensive domain info (RDAP + WHOIS merged)",
-            "info".bright_green()
-        );
-        println!(
-            "  {}         Inspect SSL certificate chain (deep)",
-            "ssl".bright_green()
-        );
-        println!(
-            "  {}     Email/DNS posture (SPF, DMARC, MTA-STS, BIMI, DANE)",
-            "posture".bright_green()
-        );
-        println!(
-            "  {} Registered look-alike scan (expensive per domain)",
-            "confusables".bright_green()
-        );
-        println!(
-            "  {}         Look up CAA (cert authority) policy",
-            "caa".bright_green()
-        );
+        for (op, about) in crate::ops::BULK_OPS {
+            println!("  {:<12} {}", op.bright_green(), about);
+        }
         println!();
         println!("{}", "Input File Formats:".bright_cyan());
-        println!("  Plain text (one domain per line, # for comments):");
-        println!("    {}  # My domains", "#".dimmed());
-        println!("    example.com");
-        println!("    google.com");
-        println!();
-        println!("  CSV (uses first column, skips header if present):");
-        println!("    domain,owner,notes");
-        println!("    example.com,Alice,Main site");
-        println!();
+        println!("{}", crate::ops::BULK_INPUT_FORMATS);
         println!("{}", "Output:".bright_cyan());
         println!("  Results are written to CSV file (default: <input>_results.csv)");
         println!("  Use -o to specify custom output path");
+        println!("  Each operation's CSV columns: see `seer bulk --help`");
         println!();
         println!("{}", "Examples:".bright_cyan());
         println!("  bulk status domains.txt");
         println!("  bulk lookup domains.csv -o results.csv");
         println!("  bulk dig domains.txt MX");
-        println!();
-        println!("{}", "CSV Output Columns by Operation:".bright_cyan());
-        println!(
-            "  {}: domain, http_status, ssl_days_remaining, domain_expires, ...",
-            "status".bright_green()
-        );
-        println!(
-            "  {}: domain, registrar, created, expires, updated, ...",
-            "lookup".bright_green()
-        );
-        println!(
-            "  {}: domain, record_type, records, ...",
-            "dig".bright_green()
-        );
         println!();
     }
 
@@ -910,57 +850,25 @@ impl Repl {
         };
 
         println!(
-            "Processing {} domains with {} operation...",
-            domains.len().to_string().bright_green(),
-            parsed.operation.bright_yellow()
+            "{}",
+            crate::ops::bulk_banner(domains.len(), &parsed.operation)
         );
 
-        let progress = indicatif::ProgressBar::new(domains.len() as u64);
-        progress.set_style(
-            indicatif::ProgressStyle::default_bar()
-                .template("{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} {msg}")
-                .expect("Progress bar template is hardcoded and should be valid")
-                .progress_chars("█▓░"),
-        );
-
-        // Register progress bar for tracing integration
-        set_bulk_progress_bar(progress.clone());
-
+        let bar = crate::ops::bulk_bar(operations.len());
         let executor = seer_core::BulkExecutor::from_config(&self.context.config);
-        let callback = crate::ops::bar_progress_callback(&progress);
-
+        let callback = crate::ops::bar_progress_callback(&bar);
         let results = executor.execute(operations, Some(callback)).await;
+        crate::ops::finish_bulk_bar(&bar);
 
-        // Clear progress bar registration before printing results
-        clear_bulk_progress_bar();
-        progress.finish_and_clear();
-
-        // Write results to CSV atomically — a crash or disk-full mid-write
-        // must not leave a truncated CSV that downstream pipelines treat as
-        // authoritative.
-        let csv_content = crate::utils::bulk_results_to_csv(&results, &parsed.operation);
-        if let Err(e) = crate::utils::atomic_write(&output_path, &csv_content) {
-            return CommandResult::Error(format!("Failed to write output file: {}", e));
+        if let Err(e) = crate::ops::write_bulk_csv(&results, &parsed.operation, &output_path) {
+            return CommandResult::Error(e);
         }
 
-        // Print results summary
-        let successful = results.iter().filter(|r| r.success).count();
-        let failed = results.len() - successful;
-
         println!("\n");
-        println!("Results written to: {}", output_path.bright_green());
-        println!(
-            "  {} successful, {} failed",
-            successful.to_string().bright_green(),
-            if failed > 0 {
-                failed.to_string().bright_red()
-            } else {
-                failed.to_string().bright_green()
-            }
-        );
+        println!("Results written to: {}", output_path.ctp_green());
+        println!("{}", crate::ops::bulk_summary(&results));
 
-        // Print failures
-        if failed > 0 {
+        if results.iter().any(|r| !r.success) {
             println!("\n{}", "Failures:".bright_red().bold());
             for result in results.iter().filter(|r| !r.success) {
                 let domain = result.operation.domain();
