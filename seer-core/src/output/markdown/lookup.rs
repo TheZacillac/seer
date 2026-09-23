@@ -133,6 +133,7 @@ impl MarkdownFormatter {
                     let rdap_has_admin = data.get_admin_contact().is_some_and(|c| c.has_info());
                     if !rdap_has_admin {
                         let has_whois_admin = whois.admin_name.is_some()
+                            || whois.admin_organization.is_some()
                             || whois.admin_email.is_some()
                             || whois.admin_phone.is_some();
                         if has_whois_admin {
@@ -158,6 +159,7 @@ impl MarkdownFormatter {
                     let rdap_has_tech = data.get_tech_contact().is_some_and(|c| c.has_info());
                     if !rdap_has_tech {
                         let has_whois_tech = whois.tech_name.is_some()
+                            || whois.tech_organization.is_some()
                             || whois.tech_email.is_some()
                             || whois.tech_phone.is_some();
                         if has_whois_tech {
@@ -410,6 +412,30 @@ mod tests {
             "must not render AVAILABLE for a registered domain:\n{}",
             out
         );
+    }
+
+    #[test]
+    fn format_lookup_whois_fallback_keeps_organization_only_contacts() {
+        // Mirror of the human regression: an organization-only WHOIS
+        // admin/tech contact was dropped from the RDAP-with-fallback view.
+        let mut whois = WhoisResponse::parse("example.com", "whois.test", "Registrar: R\n");
+        whois.admin_organization = Some("Admin Org LLC".to_string());
+        whois.tech_organization = Some("Tech Org LLC".to_string());
+        let rdap: RdapResponse =
+            serde_json::from_value(serde_json::json!({"ldhName": "example.com"})).unwrap();
+        let result = LookupResult::Rdap {
+            data: Box::new(rdap),
+            whois_fallback: Some(whois),
+        };
+        let out = MarkdownFormatter::new().format_lookup(&result);
+        for needle in [
+            "### Admin Contact",
+            "- **Organization**: Admin Org LLC",
+            "### Tech Contact",
+            "- **Organization**: Tech Org LLC",
+        ] {
+            assert!(out.contains(needle), "missing {needle:?}:\n{out}");
+        }
     }
 
     /// Asserts every `fields` bullet appears in `out` before `heading`.

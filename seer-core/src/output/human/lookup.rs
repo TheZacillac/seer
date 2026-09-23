@@ -274,6 +274,7 @@ impl HumanFormatter {
                     let rdap_has_admin = data.get_admin_contact().is_some_and(|c| c.has_info());
                     if !rdap_has_admin {
                         let has_whois_admin = whois.admin_name.is_some()
+                            || whois.admin_organization.is_some()
                             || whois.admin_email.is_some()
                             || whois.admin_phone.is_some();
                         if has_whois_admin {
@@ -313,6 +314,7 @@ impl HumanFormatter {
                     let rdap_has_tech = data.get_tech_contact().is_some_and(|c| c.has_info());
                     if !rdap_has_tech {
                         let has_whois_tech = whois.tech_name.is_some()
+                            || whois.tech_organization.is_some()
                             || whois.tech_email.is_some()
                             || whois.tech_phone.is_some();
                         if has_whois_tech {
@@ -839,6 +841,32 @@ mod tests {
                 out.contains("connect to whois.evil failed"),
                 "error text kept: {out:?}"
             );
+        }
+    }
+
+    #[test]
+    fn format_lookup_whois_fallback_keeps_organization_only_contacts() {
+        // The WHOIS-fallback admin/tech gate ignored the organization field,
+        // so a contact carrying only an organization (common once a registry
+        // redacts the personal fields) vanished from `seer lookup` while
+        // `seer whois` showed it.
+        let mut whois = WhoisResponse::parse("example.com", "whois.test", "Registrar: R\n");
+        whois.admin_organization = Some("Admin Org LLC".to_string());
+        whois.tech_organization = Some("Tech Org LLC".to_string());
+        let rdap: RdapResponse =
+            serde_json::from_value(serde_json::json!({"ldhName": "example.com"})).unwrap();
+        let result = LookupResult::Rdap {
+            data: Box::new(rdap),
+            whois_fallback: Some(whois),
+        };
+        let out = formatter().format_lookup(&result);
+        for needle in [
+            "Admin Contact",
+            "Admin Org LLC",
+            "Tech Contact",
+            "Tech Org LLC",
+        ] {
+            assert!(out.contains(needle), "missing {needle:?}:\n{out}");
         }
     }
 
