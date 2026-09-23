@@ -71,35 +71,38 @@ const PROBE_BODY_LIMIT: usize = 32 * 1024;
 
 /// A takeover-prone provider, its CNAME shapes, and the body markers its
 /// "unclaimed resource" page returns.
-struct ProviderFingerprint {
-    provider: &'static str,
+pub(crate) struct ProviderFingerprint {
+    pub(crate) provider: &'static str,
     /// CNAME suffixes, each with a leading dot so the provider's own apex
     /// (e.g. `github.io`) does not match — only a name *under* it. Matched
     /// with `ends_with`, which is deliberately strict: a `contains` match
     /// would also fire on an attacker-chosen target like
     /// `x.github.io.attacker.example`.
-    cname_suffixes: &'static [&'static str],
+    pub(crate) cname_suffixes: &'static [&'static str],
     /// Interior fragments matched with `contains`, for providers whose
     /// endpoint embeds a variable component the suffix cannot cover — S3
     /// website endpoints carry the region in the middle
     /// (`bucket.s3-website-us-east-1.amazonaws.com`). Kept separate from
     /// `cname_suffixes` so the loose match is opt-in per provider rather than
     /// the default for all of them.
-    cname_infixes: &'static [&'static str],
+    pub(crate) cname_infixes: &'static [&'static str],
     /// Literal markers that appear in the provider's unclaimed-resource page.
     /// Matched case-insensitively. Empty means the provider has no body
     /// fingerprint stable enough to assert on, so only the DNS signal applies.
     body_markers: &'static [&'static str],
 }
 
-/// Curated provider fingerprints.
+/// Curated provider fingerprints — the single source of truth for both this
+/// module and the DNS-only takeover flag in
+/// [`crate::subdomains::classify_subdomains`], so the two can never disagree
+/// about a CNAME.
 ///
 /// Every marker here is a string the provider itself serves for an unclaimed
 /// or deprovisioned resource. Markers are chosen to be specific: a generic
 /// `404 Not Found` would fire on any misconfigured host and turn this feature
 /// into a false-positive generator, so providers whose error page is generic
 /// carry no marker and rely on the DNS signal alone.
-const PROVIDERS: &[ProviderFingerprint] = &[
+pub(crate) const PROVIDERS: &[ProviderFingerprint] = &[
     ProviderFingerprint {
         provider: "GitHub Pages",
         cname_suffixes: &[".github.io"],
@@ -343,7 +346,7 @@ impl TakeoverReport {
 // --- Pure fingerprinting ------------------------------------------------
 
 /// Returns the provider whose CNAME suffix matches `cname`, or `None`.
-fn match_provider(cname: &str) -> Option<&'static ProviderFingerprint> {
+pub(crate) fn match_provider(cname: &str) -> Option<&'static ProviderFingerprint> {
     let c = cname.trim_end_matches('.').to_ascii_lowercase();
     PROVIDERS.iter().find(|p| {
         p.cname_suffixes.iter().any(|suffix| c.ends_with(suffix))
@@ -364,12 +367,12 @@ fn match_body_marker(provider: &ProviderFingerprint, body: &str) -> Option<&'sta
         .copied()
 }
 
-/// Truncates `hosts` to the cap in place, returning how many were dropped.
-fn apply_host_cap(hosts: &mut Vec<String>) -> usize {
-    let skipped = hosts.len().saturating_sub(MAX_TAKEOVER_HOSTS);
-    if skipped > 0 {
-        hosts.truncate(MAX_TAKEOVER_HOSTS);
-    }
+/// Truncates `hosts` to `cap` in place, returning how many were dropped. Pure
+/// so a scan cap is unit-testable without a resolver; shared with the
+/// subdomain classifier's cap.
+pub(crate) fn truncate_to_cap(hosts: &mut Vec<String>, cap: usize) -> usize {
+    let skipped = hosts.len().saturating_sub(cap);
+    hosts.truncate(cap);
     skipped
 }
 
@@ -407,18 +410,18 @@ fn build_notes(vulnerable: usize, potential: usize, hosts_skipped: usize) -> Vec
 // --- Async scanning -----------------------------------------------------
 
 /// DNS facts about one host.
-struct HostResolution {
+pub(crate) struct HostResolution {
     /// A and AAAA addresses (IPv6-only hosts are alive too).
-    addresses: Vec<String>,
-    cname: Option<String>,
+    pub(crate) addresses: Vec<String>,
+    pub(crate) cname: Option<String>,
     /// Set when no address was found *and* an address lookup failed outright
     /// (timeout, SERVFAIL) rather than answering NXDOMAIN/NODATA — "we could
     /// not tell", which must never be reported as "does not resolve".
-    lookup_error: Option<String>,
+    pub(crate) lookup_error: Option<String>,
 }
 
 /// Resolves the CNAME and addresses for `host`.
-async fn resolve_host(resolver: &DnsResolver, host: &str) -> HostResolution {
+pub(crate) async fn resolve_host(resolver: &DnsResolver, host: &str) -> HostResolution {
     let (a, aaaa, cname) = tokio::join!(
         Box::pin(resolver.resolve(host, RecordType::A, None)),
         Box::pin(resolver.resolve(host, RecordType::AAAA, None)),
@@ -689,7 +692,7 @@ pub async fn scan_takeover(
     }
     let mut seen = std::collections::HashSet::new();
     hosts.retain(|h| seen.insert(h.clone()));
-    let hosts_skipped = apply_host_cap(&mut hosts);
+    let hosts_skipped = truncate_to_cap(&mut hosts, MAX_TAKEOVER_HOSTS);
     let concurrency = concurrency.max(1);
 
     let fetcher = GuardedFetcher::new()
@@ -1002,7 +1005,7 @@ mod tests {
     fn host_cap_truncates_and_reports_the_remainder() {
         let over = MAX_TAKEOVER_HOSTS + 15;
         let mut hosts: Vec<String> = (0..over).map(|i| format!("h{i}.example.com")).collect();
-        let skipped = apply_host_cap(&mut hosts);
+        let skipped = truncate_to_cap(&mut hosts, MAX_TAKEOVER_HOSTS);
         assert_eq!(hosts.len(), MAX_TAKEOVER_HOSTS);
         assert_eq!(skipped, 15);
 
@@ -1015,7 +1018,7 @@ mod tests {
     #[test]
     fn host_cap_is_a_noop_under_the_limit() {
         let mut hosts: Vec<String> = (0..5).map(|i| format!("h{i}.example.com")).collect();
-        assert_eq!(apply_host_cap(&mut hosts), 0);
+        assert_eq!(truncate_to_cap(&mut hosts, MAX_TAKEOVER_HOSTS), 0);
         assert_eq!(hosts.len(), 5);
     }
 
