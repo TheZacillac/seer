@@ -41,7 +41,6 @@ from .._contract import (
     TLD_TOKEN_RE,
 )
 from .._run import run_seer
-from ..ssrf import nameserver_target
 
 # No logging.basicConfig() here: this module is also imported by the REST app
 # (seer_api.main), where configuring the root logger at import time made
@@ -184,10 +183,11 @@ def _guard_nameserver(spec: str) -> None:
 
     Mirrors ``seer_api.ssrf.guard_nameserver_async``: the argument is a spec
     (``8.8.8.8``, ``9.9.9.9:5353``, ``tls://1.1.1.1``,
-    ``https://cloudflare-dns.com/dns-query``), not a hostname. A malformed
-    spec is left for the core to reject with its own ``Invalid input``.
+    ``https://cloudflare-dns.com/dns-query``), not a hostname, parsed by
+    seer-core. A malformed spec is left for the core to reject with its own
+    ``Invalid input``.
     """
-    target = nameserver_target(spec)
+    target = seer.nameserver_target(spec)
     if target is not None:
         seer.validate_public_host(*target)
 

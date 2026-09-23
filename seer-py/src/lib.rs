@@ -11,7 +11,7 @@ use seer_core::{
     bulk::{BulkExecutor, BulkOperation},
     dns::{
         DelegationChecker, DnsComparator, DnsFollower, DnsResolver, DnssecChecker, FollowConfig,
-        PropagationChecker, RecordType,
+        NameserverSpec, PropagationChecker, RecordType,
     },
     lookup::SmartLookup,
     rdap::RdapClient,
@@ -213,6 +213,16 @@ fn validate_public_host(py: Python<'_>, host: String, port: u16) -> PyResult<()>
     run_async(py, async move {
         seer_core::net::validate_public_host(&host, port).await
     })
+}
+
+/// The `(host, port)` a nameserver spec (`8.8.8.8`, `9.9.9.9:5353`,
+/// `tls://host[:port]`, `https://host[:port][/path]`) makes the resolver
+/// contact, or `None` for a spec seer-core rejects. Lets `seer-api` SSRF-check
+/// the address actually connected to with the core's own parser rather than
+/// a hand-synced copy. Pure parsing; no network I/O.
+#[pyfunction]
+fn nameserver_target(spec: &str) -> Option<(String, u16)> {
+    NameserverSpec::parse(spec).ok().map(|s| (s.host, s.port))
 }
 
 /// Generates the single-argument bindings that make one core call and return
@@ -964,9 +974,9 @@ mod _seer {
         _json_to_python_nested_for_test, _raise_retry_exhausted_for_test, all_tlds, availability,
         bulk_availability, bulk_dig, bulk_info, bulk_lookup, bulk_propagation, bulk_ssl,
         bulk_status, bulk_whois, caa, cancel_follow, confusables, delegation, diff, dig,
-        dns_compare, dns_follow, dnssec, headers, info, lookup, posture, propagation, rdap_asn,
-        rdap_auto, rdap_domain, rdap_ip, record_types, ssl, status, subdomains,
-        subdomains_classify, takeover, tld_info, validate_public_host, whois,
+        dns_compare, dns_follow, dnssec, headers, info, lookup, nameserver_target, posture,
+        propagation, rdap_asn, rdap_auto, rdap_domain, rdap_ip, record_types, ssl, status,
+        subdomains, subdomains_classify, takeover, tld_info, validate_public_host, whois,
     };
 
     /// Forwards Rust `log` records into Python's `logging` — and `tracing`

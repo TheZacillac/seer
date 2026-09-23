@@ -8,10 +8,11 @@ look-alikes). Each router is mounted under its own prefix in ``main.py``.
 For most routes here the queried domain is a DNS/RDAP/WHOIS *question*, not a
 connect target, so — like ``dns.dns_lookup`` — they apply no API-layer SSRF
 guard. ``headers`` and ``takeover`` are the exceptions: they do connect to the
-queried host over HTTPS. They still apply no API-layer guard, for the same
-reason ``ssl`` does not — seer-core resolves and vets every target itself and
-pins the validated addresses, so a second check here would add nothing but its
-own TOCTOU window.
+queried host over HTTPS. They still apply no API-layer guard — seer-core
+resolves and vets every target itself and pins the validated addresses, so a
+second check here would add nothing but its own TOCTOU window. (``ssl`` and
+``status`` do guard at the API layer, to keep their 400 contract for reserved
+targets.)
 """
 
 from fastapi import APIRouter, Query, Request
@@ -174,11 +175,10 @@ async def headers(request: Request, domain: Domain):
     """Audit HTTP security headers, cookie flags, and version disclosure.
 
     Unlike its sibling routes, this one *connects* to the queried domain over
-    HTTPS. No API-layer SSRF guard is applied here for the same reason it is
-    not applied to ``ssl``: seer-core resolves and vets the target itself
-    (refusing reserved/private addresses and pinning the validated addresses
-    per redirect hop), so duplicating the check here would only add a second
-    resolution with its own TOCTOU window.
+    HTTPS. No API-layer SSRF guard is applied here: seer-core resolves and
+    vets the target itself (refusing reserved/private addresses and pinning
+    the validated addresses per redirect hop), so duplicating the check here
+    would only add a second resolution with its own TOCTOU window.
     """
     return await as_http(run_seer(seer.headers, domain), "Header audit failed")
 
