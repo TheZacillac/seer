@@ -83,32 +83,24 @@ where
         None
     };
 
-    let (file_layer_json, file_layer_text, file_guard) = if let Some(file_appender) = file_appender
-    {
-        let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
-
-        if json_mode {
-            (
-                Some(fmt::layer().json().with_writer(non_blocking).boxed()),
-                None,
-                Some(guard),
-            )
-        } else {
-            (
-                None,
-                Some(fmt::layer().with_writer(non_blocking).boxed()),
-                Some(guard),
-            )
+    // One boxed layer per sink, in JSON or text as configured.
+    let (file_layer, file_guard) = match file_appender {
+        Some(file_appender) => {
+            let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+            let layer = if json_mode {
+                fmt::layer().json().with_writer(non_blocking).boxed()
+            } else {
+                fmt::layer().with_writer(non_blocking).boxed()
+            };
+            (Some(layer), Some(guard))
         }
-    } else {
-        (None, None, None)
+        None => (None, None),
     };
 
-    // Build console layer
-    let (console_json, console_text) = if json_mode {
-        (Some(fmt::layer().json().with_writer(writer).boxed()), None)
+    let console_layer = if json_mode {
+        fmt::layer().json().with_writer(writer).boxed()
     } else {
-        (None, Some(fmt::layer().with_writer(writer).boxed()))
+        fmt::layer().with_writer(writer).boxed()
     };
 
     // Build optional OpenTelemetry OTLP layer (boxed for type erasure).
@@ -121,10 +113,8 @@ where
     // this silently succeeds without panicking.
     let registry = tracing_subscriber::registry()
         .with(env_filter)
-        .with(console_json)
-        .with(console_text)
-        .with(file_layer_json)
-        .with(file_layer_text);
+        .with(console_layer)
+        .with(file_layer);
 
     #[cfg(feature = "otel")]
     let registry = registry.with(otel_layer);
