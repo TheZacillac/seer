@@ -31,6 +31,20 @@ pub struct CaaRecord {
     pub value: String,
 }
 
+impl CaaRecord {
+    /// The lowercased CA-domain part of an `issue`/`issuewild` value — RFC 8659
+    /// §4.2 values are "<CA domain> [; <parameters>]". Empty for a bare `";"`,
+    /// which means "forbid all".
+    fn ca_domain(&self) -> String {
+        self.value
+            .split(';')
+            .next()
+            .unwrap_or(&self.value)
+            .trim()
+            .to_ascii_lowercase()
+    }
+}
+
 /// Result of how a presented cert's issuer relates to the CAA policy.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -122,14 +136,7 @@ fn permitted_cas(records: &[CaaRecord], tag: &str) -> Vec<String> {
     records
         .iter()
         .filter(|r| r.tag == tag)
-        .map(|r| {
-            r.value
-                .split(';')
-                .next()
-                .unwrap_or(&r.value)
-                .trim()
-                .to_ascii_lowercase()
-        })
+        .map(CaaRecord::ca_domain)
         .filter(|v| !v.is_empty())
         .collect()
 }
@@ -228,36 +235,24 @@ pub fn classify_issuer(issuer: &str, policy: &CaaPolicy) -> IssuerCaaMatch {
         .records
         .iter()
         .filter(|r| r.tag == "issue" || r.tag == "issuewild")
-        .map(|r| {
-            // RFC 8659 §4.2: value is "<CA domain> [; <parameters>]". We
-            // only need the domain portion for matching.
-            r.value
-                .split(';')
-                .next()
-                .unwrap_or(&r.value)
-                .trim()
-                .to_ascii_lowercase()
-        })
+        .map(CaaRecord::ca_domain)
         .collect();
 
+    // Empty values are kept up to here: a policy of only `";"` entries has
+    // issuance tags (so it is not Indeterminate) yet forbids every CA.
     if issue_values.is_empty() {
         return IssuerCaaMatch::Indeterminate;
     }
 
     let issuer_lc = issuer.to_ascii_lowercase();
-    let allowed_any = issue_values.iter().any(|v| !v.is_empty());
-
-    let matched = issue_values
+    if issue_values
         .iter()
-        .any(|v| !v.is_empty() && ca_value_matches_issuer(v, &issuer_lc));
-
-    if matched {
+        .any(|v| !v.is_empty() && ca_value_matches_issuer(v, &issuer_lc))
+    {
         IssuerCaaMatch::Permitted
-    } else if allowed_any {
-        IssuerCaaMatch::Mismatch
     } else {
-        // Only entries are empty-value (";") — issuance is explicitly forbidden,
-        // yet a cert exists. Report as mismatch with the informational note.
+        // Includes the forbid-all case: issuance is explicitly forbidden, yet a
+        // cert exists. Either way it is informational, not a validation failure.
         IssuerCaaMatch::Mismatch
     }
 }
