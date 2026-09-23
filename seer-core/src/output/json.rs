@@ -1,9 +1,4 @@
 use super::OutputFormatter;
-use crate::dns::{DnsRecord, FollowIteration, FollowResult, PropagationResult};
-use crate::lookup::LookupResult;
-use crate::rdap::RdapResponse;
-use crate::status::StatusResponse;
-use crate::whois::WhoisResponse;
 
 /// Pretty-printed JSON output formatter.
 #[derive(Default)]
@@ -19,117 +14,12 @@ impl JsonFormatter {
     }
 }
 
-impl OutputFormatter for JsonFormatter {
-    fn format_whois(&self, response: &WhoisResponse) -> String {
-        self.to_json(response)
-    }
-
-    fn format_rdap(&self, response: &RdapResponse) -> String {
-        self.to_json(response)
-    }
-
-    fn format_dns(&self, records: &[DnsRecord]) -> String {
-        self.to_json(records)
-    }
-
-    fn format_propagation(&self, result: &PropagationResult) -> String {
-        self.to_json(result)
-    }
-
-    fn format_lookup(&self, result: &LookupResult) -> String {
-        self.to_json(result)
-    }
-
-    fn format_status(&self, response: &StatusResponse) -> String {
-        self.to_json(response)
-    }
-
-    fn format_follow_iteration(&self, iteration: &FollowIteration) -> String {
-        self.to_json(iteration)
-    }
-
-    fn format_follow(&self, result: &FollowResult) -> String {
-        self.to_json(result)
-    }
-
-    fn format_availability(&self, result: &crate::availability::AvailabilityResult) -> String {
-        self.to_json(result)
-    }
-
-    fn format_dnssec(&self, report: &crate::dns::DnssecReport) -> String {
-        self.to_json(report)
-    }
-
-    fn format_delegation(&self, report: &crate::dns::DelegationReport) -> String {
-        self.to_json(report)
-    }
-
-    fn format_tld(&self, info: &crate::tld::TldInfo) -> String {
-        self.to_json(info)
-    }
-
-    fn format_dns_comparison(&self, comparison: &crate::dns::DnsComparison) -> String {
-        self.to_json(comparison)
-    }
-
-    fn format_subdomains(&self, result: &crate::subdomains::SubdomainResult) -> String {
-        self.to_json(result)
-    }
-
-    fn format_diff(&self, diff: &crate::diff::DomainDiff) -> String {
-        self.to_json(diff)
-    }
-
-    fn format_ssl(&self, report: &crate::ssl::SslReport) -> String {
-        self.to_json(report)
-    }
-
-    fn format_watch(&self, report: &crate::watchlist::WatchReport) -> String {
-        self.to_json(report)
-    }
-
-    fn format_domain_info(&self, info: &crate::domain_info::DomainInfo) -> String {
-        self.to_json(info)
-    }
-    fn format_drift(&self, report: &crate::drift::DriftReport) -> String {
-        self.to_json(report)
-    }
-    fn format_posture(&self, posture: &crate::posture::EmailPosture) -> String {
-        self.to_json(posture)
-    }
-
-    fn format_headers(&self, report: &crate::headers::HeaderReport) -> String {
-        self.to_json(report)
-    }
-
-    fn format_takeover(&self, report: &crate::takeover::TakeoverReport) -> String {
-        self.to_json(report)
-    }
-    fn format_caa(&self, policy: &crate::caa::CaaPolicy) -> String {
-        self.to_json(policy)
-    }
-    fn format_confusables(&self, report: &crate::confusables::ConfusableReport) -> String {
-        self.to_json(report)
-    }
-    fn format_subdomain_classification(
-        &self,
-        result: &crate::subdomains::SubdomainClassification,
-    ) -> String {
-        self.to_json(result)
-    }
-
-    fn format_subdomain_baseline_diff(
-        &self,
-        report: &crate::subdomains::SubdomainBaselineDiff,
-    ) -> String {
-        self.to_json(report)
-    }
-}
+with_report_methods!(impl_serializing!(JsonFormatter, to_json;));
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dns::RecordType;
+    use crate::dns::{DnsRecord, RecordType};
     use crate::status::StatusResponse;
 
     #[test]
