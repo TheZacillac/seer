@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.49.0] - 2026-09-23
+
 A footprint and maintainability release. The `seer` binary and the Python
 extension are about 40% smaller and no longer depend on OpenSSL, roughly
 6,000 lines of Rust were removed by consolidating duplicated code, and every
@@ -65,9 +67,9 @@ the way are fixed. Sizes below are measured on Linux (aarch64) against 0.48.0.
   the Rust log bridge is installed when the module is imported.
 - **seer-api dependencies:** `orjson` and the `uvicorn[standard]` extras
   (`python-dotenv`, `pyyaml`, `watchfiles`, `websockets`) are dropped; `uvloop`
-  and `httptools` are declared directly. seer-api now needs seer bindings built
-  from the same checkout (for `seer.nameserver_target`); with older bindings,
-  nameserver requests return 503 and log why. OpenAPI request models are now named
+  and `httptools` are declared directly. seer-api now requires
+  `domain-seer>=0.49.0` (for `seer.nameserver_target`); if older bindings are
+  present anyway, nameserver requests return 503 and log why. OpenAPI request models are now named
   `BulkRequest`, `BulkRecordRequest` and `BulkPropagationRequest`.
 - **Packaging and docs:** crates.io now shows the root README for `seer-core`
   and `seer-cli` (the stale per-package READMEs are gone), the `seer-core`
@@ -1368,7 +1370,8 @@ Two notable breaking changes landed in this period:
   The human and markdown formatters group both fields by record type and
   omit the per-type subheader when only one type is present.
 
-[Unreleased]: https://github.com/TheZacillac/seer/compare/v0.48.0...HEAD
+[Unreleased]: https://github.com/TheZacillac/seer/compare/v0.49.0...HEAD
+[0.49.0]: https://github.com/TheZacillac/seer/compare/v0.48.0...v0.49.0
 [0.48.0]: https://github.com/TheZacillac/seer/compare/v0.47.0...v0.48.0
 [0.47.0]: https://github.com/TheZacillac/seer/compare/v0.46.0...v0.47.0
 [0.46.0]: https://github.com/TheZacillac/seer/compare/v0.45.0...v0.46.0

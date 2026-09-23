@@ -34,10 +34,10 @@ logger = logging.getLogger(__name__)
 def nameserver_target(spec: str) -> tuple[str, int] | None:
     """``seer.nameserver_target``, failing clearly on bindings that predate it.
 
-    Bindings built before the release after 0.48.0 lack the function yet still
-    satisfy seer-api's ``domain-seer>=0.48.0`` floor (see the PENDING note in
-    pyproject.toml), so without this check every nameserver request would die
-    on a bare ``AttributeError``.
+    Bindings older than 0.49.0 lack the function. The ``domain-seer>=0.49.0``
+    floor keeps them out of normal installs, but a stale local build (e.g. a
+    dev venv from before the release) can still be present; without this check
+    every nameserver request would then die on a bare ``AttributeError``.
     """
     parse = getattr(seer, "nameserver_target", None)
     if parse is None:

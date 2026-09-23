@@ -684,9 +684,8 @@ Releases are tag-driven; pushing a version tag is the entire entry point:
 # 1. Bump version in Cargo.toml [workspace.package], the seer-core version in
 #    [workspace.dependencies], and seer-api/pyproject.toml
 #    (seer-py/pyproject.toml takes its version from the Cargo workspace via
-#    dynamic = ["version"]). Also resolve the PENDING note on seer-api's
-#    `domain-seer>=` floor (it must reach the first release with
-#    `seer.nameserver_target`, i.e. the one after 0.48.0).
+#    dynamic = ["version"]). If the release adds a binding that seer-api
+#    calls, raise seer-api's `domain-seer>=` floor to it.
 # 2. Sync the README's `seer-core = "x.y"` dependency snippet (Rust Library section)
 # 3. Move CHANGELOG.md [Unreleased] entries into a new version section and add
 #    its compare link at the bottom (cargo-dist uses that section verbatim as
