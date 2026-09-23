@@ -26,6 +26,8 @@ use tokio::time::timeout;
 
 use crate::config::SeerConfig;
 use crate::dns::{DnsResolver, RecordType};
+use crate::http::{read_body_capped, BodyReadError, Overflow};
+use crate::rdap::MAX_BOOTSTRAP_SIZE;
 
 /// IANA RDAP bootstrap registry for DNS. Mirrors the private
 /// `IANA_BOOTSTRAP_DNS` const in `rdap/client.rs` — keep the two in sync.
@@ -469,7 +471,7 @@ impl Doctor {
     }
 
     /// HTTPS-fetches the IANA RDAP DNS bootstrap registry, requiring an
-    /// HTTP 200 with a non-empty body.
+    /// HTTP 200 with a non-empty body within the bootstrap's size cap.
     async fn check_rdap_bootstrap(&self) -> DoctorCheck {
         let start = Instant::now();
         let outcome = timeout(self.probe_timeout, self.rdap_bootstrap_probe()).await;
@@ -497,10 +499,11 @@ impl Doctor {
     /// failure detail. The URL is the hardcoded IANA HTTPS endpoint in
     /// production (only injectable under `#[cfg(test)]`).
     async fn rdap_bootstrap_probe(&self) -> Result<String, String> {
-        // reqwest's client-level timeout spans connect through body read; the
-        // caller's outer `timeout()` is defense in depth.
-        let client = reqwest::Client::builder()
-            .timeout(self.probe_timeout)
+        // Built like the real bootstrap fetch: redirects off (a 3xx fails here
+        // as it would there) and the body read under its cap. The client
+        // timeout and the capped read's deadline both hold the probe to
+        // `probe_timeout`; the caller's outer `timeout()` is defense in depth.
+        let client = crate::net::client_builder(self.probe_timeout)
             .build()
             .map_err(|e| format!("could not build HTTP client: {}", e))?;
         let response = client
@@ -515,10 +518,24 @@ impl Doctor {
                 self.bootstrap_url, status
             ));
         }
-        let body = response
-            .bytes()
-            .await
-            .map_err(|e| format!("reading {} body failed: {}", self.bootstrap_url, e))?;
+        let body = read_body_capped(
+            response,
+            MAX_BOOTSTRAP_SIZE,
+            self.probe_timeout,
+            Overflow::Reject,
+        )
+        .await
+        .map_err(|e| match e {
+            BodyReadError::Chunk(e) => format!("reading {} body failed: {}", self.bootstrap_url, e),
+            BodyReadError::TooLarge => format!(
+                "GET {} returned a body over the {} byte cap",
+                self.bootstrap_url, MAX_BOOTSTRAP_SIZE
+            ),
+            BodyReadError::TimedOut => format!(
+                "reading {} body timed out after {:?}",
+                self.bootstrap_url, self.probe_timeout
+            ),
+        })?;
         if body.is_empty() {
             return Err(format!("GET {} returned an empty body", self.bootstrap_url));
         }
@@ -556,7 +573,7 @@ mod tests {
 
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    use wiremock::matchers::method;
+    use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use crate::dns::test_support::{mock_dns_resolver, spawn_mock_dns, MockMode};
@@ -865,6 +882,43 @@ mod tests {
         let check = doctor.check_rdap_bootstrap().await;
         assert_eq!(check.status, CheckStatus::Fail);
         assert!(check.detail.contains("empty body"), "got: {}", check.detail);
+    }
+
+    /// Regression: the probe followed redirects that the real bootstrap
+    /// fetch (redirects off) never does, so it could pass while RDAP failed.
+    #[tokio::test]
+    async fn rdap_check_does_not_follow_redirects() {
+        let server = MockServer::start().await;
+        Mock::given(path("/rdap/dns.json"))
+            .respond_with(ResponseTemplate::new(302).insert_header("location", "/moved.json"))
+            .mount(&server)
+            .await;
+        Mock::given(path("/moved.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"services":[]}"#))
+            .mount(&server)
+            .await;
+        let doctor = base_doctor(&SeerConfig::default())
+            .with_bootstrap_url(format!("{}/rdap/dns.json", server.uri()));
+        let check = doctor.check_rdap_bootstrap().await;
+        assert_eq!(check.status, CheckStatus::Fail, "got: {}", check.detail);
+        assert!(check.detail.contains("302"), "got: {}", check.detail);
+    }
+
+    /// Regression: the body was read with an unbounded `bytes()`.
+    #[tokio::test]
+    async fn rdap_check_fails_on_body_over_the_bootstrap_cap() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_bytes(vec![b' '; MAX_BOOTSTRAP_SIZE + 1]),
+            )
+            .mount(&server)
+            .await;
+        let doctor = base_doctor(&SeerConfig::default())
+            .with_bootstrap_url(format!("{}/rdap/dns.json", server.uri()));
+        let check = doctor.check_rdap_bootstrap().await;
+        assert_eq!(check.status, CheckStatus::Fail, "got: {}", check.detail);
+        assert!(check.detail.contains("byte cap"), "got: {}", check.detail);
     }
 
     #[tokio::test]

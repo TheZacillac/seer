@@ -22,6 +22,10 @@ const IANA_BOOTSTRAP_IPV4: &str = "https://data.iana.org/rdap/ipv4.json";
 const IANA_BOOTSTRAP_IPV6: &str = "https://data.iana.org/rdap/ipv6.json";
 const IANA_BOOTSTRAP_ASN: &str = "https://data.iana.org/rdap/asn.json";
 
+/// Cap on one bootstrap registry body (10 MB), streamed incrementally to
+/// prevent memory exhaustion. `seer doctor`'s bootstrap probe reads under it too.
+pub(crate) const MAX_BOOTSTRAP_SIZE: usize = 10 * 1024 * 1024;
+
 /// Default timeout for RDAP queries (15 seconds).
 /// With the 5s connect_timeout, this gives 10s for the server to respond.
 /// Most RDAP servers respond within 2-5 seconds; slow ccTLD registries
@@ -1058,9 +1062,6 @@ async fn load_bootstrap_data() -> Result<BootstrapLoad> {
     // block the others. We load whatever data is available.
     let (dns_resp, ipv4_resp, ipv6_resp, asn_resp) =
         tokio::join!(dns_future, ipv4_future, ipv6_future, asn_future);
-
-    // Stream body with incremental size check to prevent memory exhaustion
-    const MAX_BOOTSTRAP_SIZE: usize = 10 * 1024 * 1024; // 10 MB
 
     async fn read_bootstrap(resp: reqwest::Response) -> Result<BootstrapResponse> {
         // Bound the streaming read with the same timeout used for RDAP
