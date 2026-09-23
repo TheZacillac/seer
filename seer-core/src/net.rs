@@ -534,6 +534,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn validate_http_url_unbrackets_ipv6_literals() {
+        // `Url::host_str()` keeps the brackets on an IPv6 literal; the
+        // `Url::host()` extraction must unbracket it so the guard's IP-literal
+        // short-circuit catches it (no DNS involved).
+        let url = Url::parse("https://[::1]/").unwrap();
+        let err = validate_http_url(&url).await.unwrap_err();
+        assert!(
+            matches!(err, SeerError::HttpError(ref s) if s.contains("reserved")),
+            "got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_http_url_returns_pinnable_addrs_for_public_literal() {
+        let url = Url::parse("https://8.8.8.8/").unwrap();
+        let addrs = validate_http_url(&url).await.unwrap();
+        assert_eq!(addrs, vec!["8.8.8.8:443".parse().unwrap()]);
+    }
+
+    #[tokio::test]
     async fn reserved_resolution_error_does_not_leak_resolved_ip() {
         // A hostname that resolves to a reserved address must be refused
         // WITHOUT echoing the resolved internal IP to the caller — that turned

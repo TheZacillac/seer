@@ -6,14 +6,11 @@
 //! health probe exists to surface. Callers that want tolerance to transient
 //! failures (e.g. watch mode) own that policy at their layer.
 
-use std::collections::HashSet;
-use std::net::SocketAddr;
 use std::time::Duration;
 
 use chrono::Utc;
 use native_tls::TlsConnector;
 use regex::Regex;
-use reqwest::{Client, Url};
 use std::sync::LazyLock;
 use tokio::net::TcpStream;
 use tracing::{debug, instrument};
@@ -22,13 +19,13 @@ use super::types::{CertificateInfo, DnsResolution, DomainExpiration, StatusRespo
 use crate::caa::{self, CaaPolicy};
 use crate::dns::{DnsResolver, RecordData, RecordType};
 use crate::error::{Result, SeerError};
+use crate::http::GuardedFetcher;
 use crate::lookup::SmartLookup;
 use crate::validation::normalize_host;
 
 /// Default timeout for HTTP and TLS operations (10 seconds).
 /// Balances responsiveness with allowing slow servers to respond.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
-const MAX_REDIRECTS: usize = 5;
 
 /// Pre-compiled regex for extracting HTML title.
 static TITLE_REGEX: LazyLock<Regex> = LazyLock::new(|| {
@@ -157,11 +154,12 @@ impl StatusClient {
         Ok(response)
     }
 
-    /// Fetches the HTTP status code and page title.
+    /// Fetches the HTTP status code and page title of `https://{domain}/`.
     ///
-    /// Redirects are followed manually with IP validation at each hop.
-    /// Resolved IPs are pinned on the HTTP client via `resolve_to_addrs` to
-    /// prevent DNS rebinding attacks (TOCTOU between validation and connect).
+    /// Goes through [`GuardedFetcher`], the SSRF-guarded GET shared with
+    /// `headers`/`takeover`: redirects are followed manually with the guard
+    /// re-run and the validated IPs pinned at every hop (DNS-rebinding
+    /// defense), and the body read is capped and timeout-bounded.
     ///
     /// # Security Note
     /// This path uses reqwest's default (validating) TLS configuration — a
@@ -172,101 +170,10 @@ impl StatusClient {
     /// below) intentionally relaxes verification because inspecting an
     /// invalid cert is the whole point of that code; this path MUST NOT.
     ///
-    /// Redirect targets are validated for SSRF but the HTTP response body
-    /// (page title) comes from an unauthenticated connection and should be
-    /// treated as untrusted.
+    /// The page title is remote content and should be treated as untrusted.
     async fn fetch_http_info(&self, domain: &str) -> Result<(u16, String, Option<String>)> {
-        let mut url = Url::parse(&format!("https://{}", domain))
-            .map_err(|e| SeerError::HttpError(format!("invalid URL: {}", e)))?;
-        let mut visited = HashSet::new();
-
-        for _ in 0..=MAX_REDIRECTS {
-            let validated_addrs = validate_url_target(&url).await?;
-
-            if !visited.insert(url.clone()) {
-                return Err(SeerError::HttpError("redirect loop detected".to_string()));
-            }
-
-            // Build a per-hop client that pins the validated IPs so reqwest
-            // cannot re-resolve the hostname to a different (potentially
-            // private) address (DNS rebinding protection).
-            let host = url
-                .host_str()
-                .ok_or_else(|| SeerError::HttpError("missing URL host".to_string()))?;
-            let client = Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .user_agent(concat!("Seer/", env!("CARGO_PKG_VERSION")))
-                .resolve_to_addrs(host, &validated_addrs)
-                .build()
-                .map_err(|e| SeerError::HttpError(format!("failed to build HTTP client: {}", e)))?;
-
-            let response = client
-                .get(url.clone())
-                .timeout(self.timeout)
-                .send()
-                .await
-                .map_err(|e| SeerError::HttpError(e.to_string()))?;
-
-            if response.status().is_redirection() {
-                let location = response.headers().get(reqwest::header::LOCATION);
-                let location = location.and_then(|v| v.to_str().ok()).ok_or_else(|| {
-                    SeerError::HttpError("redirect missing location header".to_string())
-                })?;
-                let next_url = url
-                    .join(location)
-                    .or_else(|_| Url::parse(location))
-                    .map_err(|e| SeerError::HttpError(format!("invalid redirect URL: {}", e)))?;
-                url = next_url;
-                continue;
-            }
-
-            let status = response.status();
-            let status_code = status.as_u16();
-            let status_text = status.canonical_reason().unwrap_or("Unknown").to_string();
-
-            // Only try to get title for successful HTML responses
-            let title = if status.is_success() {
-                let content_type = response
-                    .headers()
-                    .get("content-type")
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("");
-
-                if content_type.contains("text/html") {
-                    // Stream at most 64 KB for title extraction. Streaming
-                    // (rather than `response.bytes().await`) prevents a
-                    // malicious server from forcing us to buffer a huge
-                    // body before the cap is applied.
-                    const MAX_TITLE_BODY: usize = 64 * 1024;
-                    use futures::StreamExt;
-                    let mut buf: Vec<u8> = Vec::with_capacity(8 * 1024);
-                    let mut stream = response.bytes_stream();
-                    while let Some(chunk) = stream.next().await {
-                        let chunk = chunk
-                            .map_err(|e| SeerError::HttpError(format!("body chunk: {}", e)))?;
-                        let remaining = MAX_TITLE_BODY.saturating_sub(buf.len());
-                        if remaining == 0 {
-                            break;
-                        }
-                        let take = remaining.min(chunk.len());
-                        buf.extend_from_slice(&chunk[..take]);
-                        if buf.len() >= MAX_TITLE_BODY {
-                            break;
-                        }
-                    }
-                    let body = String::from_utf8_lossy(&buf);
-                    extract_title(&body)
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-
-            return Ok((status_code, status_text, title));
-        }
-
-        Err(SeerError::HttpError("too many redirects".to_string()))
+        let fetcher = GuardedFetcher::new().with_timeout(self.timeout);
+        http_info(&fetcher, &format!("https://{domain}/")).await
     }
 
     /// Fetches SSL certificate information using native-tls.
@@ -415,7 +322,27 @@ impl StatusClient {
     }
 }
 
-// Domain normalization and validation is now handled by the validation module
+/// GETs `url` and returns `(status code, reason phrase, page title)`.
+///
+/// The body is read only for a 2xx `text/html` response, where it feeds the
+/// title; any other final response reports its status straight from the
+/// headers, so a body that stalls or errors cannot fail the sub-check.
+async fn http_info(fetcher: &GuardedFetcher, url: &str) -> Result<(u16, String, Option<String>)> {
+    let (response, _) = fetcher.send(url).await?;
+    let status = response.status();
+    let is_html = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.contains("text/html"));
+    let title = if status.is_success() && is_html {
+        extract_title(&fetcher.read_body(response).await?)
+    } else {
+        None
+    };
+    let reason = status.canonical_reason().unwrap_or("Unknown").to_string();
+    Ok((status.as_u16(), reason, title))
+}
 
 /// Extracts the title from HTML content.
 ///
@@ -443,29 +370,6 @@ fn extract_title(html: &str) -> Option<String> {
                 .to_string()
         })
         .filter(|s| !s.is_empty())
-}
-
-/// Validates that a URL target is safe (no private/reserved IPs, no credentials,
-/// supported scheme) and returns the resolved socket addresses.
-///
-/// The caller should pin these addresses on the HTTP client to prevent DNS
-/// rebinding between validation and the actual connection.
-///
-/// Resolution goes through [`crate::net::resolve_public_host`] — the shared
-/// SSRF guard used by every other outbound leg — which bounds the OS-resolver
-/// lookup (`getaddrinfo` has no deadline, and redirect targets are
-/// attacker-influenceable, so a black-holed hostname could otherwise pin this
-/// task indefinitely) and falls back to hickory when the system resolver is
-/// broken. The reserved-range policy is unchanged (the previous local check
-/// delegated to the same `net::is_reserved_ip`), and the guard's error already
-/// omits the resolved IP (internal-DNS-oracle hardening, issue #49).
-///
-/// The policy itself lives in [`crate::net::validate_http_url`], shared with
-/// the other HTTP fetch paths (`headers`, `takeover`) so the scheme,
-/// credential, port, and reserved-range rules cannot drift between them. This
-/// wrapper is kept as the status module's named entry point.
-async fn validate_url_target(url: &Url) -> Result<Vec<SocketAddr>> {
-    crate::net::validate_http_url(url).await
 }
 
 /// Parses certificate information from DER-encoded certificate using x509-parser.
@@ -720,66 +624,45 @@ mod tests {
         assert!(!cert_info(CERT_CN_VICTIM_NO_SAN, "other.example").hostname_verified);
     }
 
-    // --- validate_url_target tests (hermetic: IP literals, no DNS) -------
+    // --- http_info (hermetic: wiremock on 127.0.0.1 via the test seam) ----
 
     #[tokio::test]
-    async fn validate_url_target_rejects_unsupported_scheme() {
-        let url = Url::parse("ftp://example.com/").unwrap();
-        let err = validate_url_target(&url).await.unwrap_err();
-        assert!(
-            matches!(err, SeerError::HttpError(ref s) if s.contains("unsupported URL scheme")),
-            "got: {err:?}"
-        );
-    }
+    async fn http_info_reads_title_only_for_html_success() {
+        use wiremock::matchers::path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    #[tokio::test]
-    async fn validate_url_target_rejects_credentials() {
-        let url = Url::parse("https://user:pass@example.com/").unwrap();
-        let err = validate_url_target(&url).await.unwrap_err();
-        assert!(
-            matches!(err, SeerError::HttpError(ref s) if s.contains("credentials")),
-            "got: {err:?}"
-        );
-    }
+        let server = MockServer::start().await;
+        Mock::given(path("/"))
+            .respond_with(ResponseTemplate::new(301).insert_header("location", "/home"))
+            .mount(&server)
+            .await;
+        Mock::given(path("/home"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                "<html><title> Home\u{0}Page </title></html>",
+                "text/html; charset=utf-8",
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(path("/json"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw("<title>x</title>", "text/plain"))
+            .mount(&server)
+            .await;
 
-    #[tokio::test]
-    async fn validate_url_target_rejects_non_standard_port() {
-        let url = Url::parse("https://8.8.8.8:8443/").unwrap();
-        let err = validate_url_target(&url).await.unwrap_err();
-        assert!(
-            matches!(err, SeerError::HttpError(ref s) if s.contains("non-standard port")),
-            "got: {err:?}"
-        );
-    }
+        let fetcher = GuardedFetcher::new().allowing_private_hosts();
+        let info = http_info(&fetcher, &format!("{}/", server.uri()))
+            .await
+            .unwrap();
+        assert_eq!(info, (200, "OK".to_string(), Some("HomePage".to_string())));
 
-    #[tokio::test]
-    async fn validate_url_target_rejects_loopback_literal() {
-        let url = Url::parse("https://127.0.0.1/").unwrap();
-        let err = validate_url_target(&url).await.unwrap_err();
-        assert!(
-            matches!(err, SeerError::HttpError(ref s) if s.contains("reserved")),
-            "got: {err:?}"
-        );
-    }
+        let info = http_info(&fetcher, &format!("{}/json", server.uri()))
+            .await
+            .unwrap();
+        assert_eq!(info, (200, "OK".to_string(), None));
 
-    #[tokio::test]
-    async fn validate_url_target_rejects_bracketed_ipv6_loopback_literal() {
-        // `Url::host_str()` keeps the brackets on an IPv6 literal; the
-        // `Url::host()` extraction must unbracket it so the shared guard's
-        // IP-literal short-circuit catches it (no DNS involved).
-        let url = Url::parse("https://[::1]/").unwrap();
-        let err = validate_url_target(&url).await.unwrap_err();
-        assert!(
-            matches!(err, SeerError::HttpError(ref s) if s.contains("reserved")),
-            "got: {err:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn validate_url_target_allows_public_ip_literal() {
-        let url = Url::parse("https://8.8.8.8/").unwrap();
-        let addrs = validate_url_target(&url).await.unwrap();
-        assert_eq!(addrs.len(), 1);
-        assert_eq!(addrs[0].port(), 443);
+        // Non-2xx reports the status without a title.
+        let info = http_info(&fetcher, &format!("{}/missing", server.uri()))
+            .await
+            .unwrap();
+        assert_eq!(info, (404, "Not Found".to_string(), None));
     }
 }

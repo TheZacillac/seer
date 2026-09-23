@@ -1,11 +1,11 @@
 //! SSRF-guarded HTTP GET with manual redirect following.
 //!
-//! Two of seer's security probes need to *read* an HTTP response rather than
-//! merely observe its status: the header audit ([`crate::headers`]) grades the
-//! response headers, and takeover detection ([`crate::takeover`]) matches the
-//! response body against provider fingerprints. Both fetch a host derived from
-//! user input, which makes this an outbound-request primitive and puts it under
-//! the same envelope as every other outbound leg of seer:
+//! seer's HTTP probes share this fetch: the header audit ([`crate::headers`])
+//! grades the response headers, takeover detection ([`crate::takeover`])
+//! matches the response body against provider fingerprints, and
+//! [`crate::status`] reports the status code and page title. All fetch a host
+//! derived from user input, which makes this an outbound-request primitive and
+//! puts it under the same envelope as every other outbound leg of seer:
 //!
 //! - Redirects are followed **manually**, one hop at a time, and every hop is
 //!   re-validated through [`crate::net::validate_http_url`]. reqwest's built-in
@@ -94,12 +94,6 @@ pub(crate) struct GuardedFetcher {
     allow_private: bool,
 }
 
-impl Default for GuardedFetcher {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl GuardedFetcher {
     pub fn new() -> Self {
         Self {
@@ -129,12 +123,43 @@ impl GuardedFetcher {
     }
 
     /// GETs `url`, following up to [`MAX_REDIRECTS`] hops with the guard
-    /// re-applied at each one.
+    /// re-applied at each one, and reads the final body under the cap.
     ///
     /// # Errors
     /// * [`SeerError::HttpError`] — bad URL shape, SSRF-blocked host, redirect
     ///   loop, too many hops, or a transport failure.
     pub async fn get(&self, url: &str) -> Result<FetchedResponse> {
+        let (response, redirects) = self.send(url).await?;
+        let status = response.status().as_u16();
+        let final_url = response.url().to_string();
+        let headers = response
+            .headers()
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.as_str().to_ascii_lowercase(),
+                    // A header value that isn't valid UTF-8 is still worth
+                    // reporting as present; lossy-decode rather than drop.
+                    String::from_utf8_lossy(value.as_bytes()).into_owned(),
+                )
+            })
+            .collect();
+        let body = self.read_body(response).await?;
+
+        Ok(FetchedResponse {
+            final_url,
+            status,
+            headers,
+            body,
+            redirects,
+        })
+    }
+
+    /// The guarded request half of [`GuardedFetcher::get`]: returns the final
+    /// (non-redirect) response with its body still unread, plus the number of
+    /// hops followed. For callers that want the body only for some responses —
+    /// read it through [`GuardedFetcher::read_body`] so the cap still applies.
+    pub async fn send(&self, url: &str) -> Result<(reqwest::Response, usize)> {
         let mut url = Url::parse(url)
             .map_err(|e| SeerError::HttpError(format!("invalid URL '{}': {}", url, e)))?;
         let mut visited: HashSet<String> = HashSet::new();
@@ -187,38 +212,15 @@ impl GuardedFetcher {
                 continue;
             }
 
-            let status = response.status().as_u16();
-            let final_url = response.url().to_string();
-            let headers = response
-                .headers()
-                .iter()
-                .map(|(name, value)| {
-                    (
-                        name.as_str().to_ascii_lowercase(),
-                        // A header value that isn't valid UTF-8 is still worth
-                        // reporting as present; lossy-decode rather than drop.
-                        String::from_utf8_lossy(value.as_bytes()).into_owned(),
-                    )
-                })
-                .collect();
-
-            let body = self.read_capped_body(response).await?;
-
-            return Ok(FetchedResponse {
-                final_url,
-                status,
-                headers,
-                body,
-                redirects: hop,
-            });
+            return Ok((response, hop));
         }
 
         Err(SeerError::HttpError("too many redirects".to_string()))
     }
 
     /// Streams at most `self.max_body` bytes of the response body, bounded by
-    /// an overall read timeout.
-    async fn read_capped_body(&self, response: reqwest::Response) -> Result<String> {
+    /// an overall read timeout, and decodes them lossily as UTF-8.
+    pub async fn read_body(&self, response: reqwest::Response) -> Result<String> {
         let mut buf: Vec<u8> = Vec::with_capacity(8 * 1024);
         let mut stream = response.bytes_stream();
 
