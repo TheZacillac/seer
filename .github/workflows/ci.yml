@@ -54,6 +54,17 @@ jobs:
       # that slim build too — otherwise the feature gate could silently rot.
       - name: Clippy (seer-core without the cli feature)
         run: cargo clippy -p seer-core --no-default-features --all-targets -- -D warnings
+      # docs.rs renders seer-core's public API docs, and rustdoc lints (broken
+      # or private intra-doc links, stray HTML) only warn by default. Deny them
+      # with and without `cli`, since that feature gates whole public modules.
+      - name: Rustdoc (seer-core)
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc -p seer-core --no-deps
+      - name: Rustdoc (seer-core without the cli feature)
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc -p seer-core --no-deps --no-default-features
 
   test:
     name: Test
