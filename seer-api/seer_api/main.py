@@ -9,7 +9,7 @@ from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, ORJSONResponse
+from fastapi.responses import JSONResponse
 from limits import parse_many as _parse_rate_limits
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from mcp.server.transport_security import TransportSecuritySettings
@@ -344,7 +344,6 @@ app = FastAPI(
     redoc_url="/redoc" if DOCS_ENABLED else None,
     openapi_url="/openapi.json" if DOCS_ENABLED else None,
     lifespan=lifespan,
-    default_response_class=ORJSONResponse,
 )
 
 # Add rate limiter to app state and exception handler

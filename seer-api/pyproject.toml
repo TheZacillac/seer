@@ -37,7 +37,6 @@ dependencies = [
     # so bump this whenever a new binding is called.
     "domain-seer>=0.48.0",
     "slowapi>=0.1.9",
-    "orjson>=3.9",
 ]
 
 [project.optional-dependencies]
