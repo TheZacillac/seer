@@ -50,6 +50,21 @@ macro_rules! snap {
     };
 }
 
+/// Declares one snapshot test per `name => formatter.method(fixture);` row.
+/// insta names each baseline after the test fn
+/// (`snapshots/format_snapshots__<name>.snap`), so a row must never be
+/// renamed without renaming its `.snap` file too.
+macro_rules! snapshot_tests {
+    ($($name:ident => $fmt:ident.$method:ident($fixture:expr);)+) => {
+        $(
+            #[test]
+            fn $name() {
+                snap!($fmt().$method(&$fixture));
+            }
+        )+
+    };
+}
+
 fn fixture_whois() -> WhoisResponse {
     WhoisResponse::parse(
         "example.com",
@@ -209,34 +224,13 @@ fn markdown_status_expired_domain_says_expired() {
     );
 }
 
-#[test]
-fn human_whois_snapshot() {
-    snap!(human().format_whois(&fixture_whois()));
-}
-
-#[test]
-fn markdown_whois_snapshot() {
-    snap!(markdown().format_whois(&fixture_whois()));
-}
-
-#[test]
-fn human_rdap_snapshot() {
-    snap!(human().format_rdap(&fixture_rdap()));
-}
-
-#[test]
-fn markdown_rdap_snapshot() {
-    snap!(markdown().format_rdap(&fixture_rdap()));
-}
-
-#[test]
-fn human_dns_snapshot() {
-    snap!(human().format_dns(&fixture_dns_records()));
-}
-
-#[test]
-fn markdown_dns_snapshot() {
-    snap!(markdown().format_dns(&fixture_dns_records()));
+snapshot_tests! {
+    human_whois_snapshot => human.format_whois(fixture_whois());
+    markdown_whois_snapshot => markdown.format_whois(fixture_whois());
+    human_rdap_snapshot => human.format_rdap(fixture_rdap());
+    markdown_rdap_snapshot => markdown.format_rdap(fixture_rdap());
+    human_dns_snapshot => human.format_dns(fixture_dns_records());
+    markdown_dns_snapshot => markdown.format_dns(fixture_dns_records());
 }
 
 /// A single A record. Used to assert the uniform-type header path.
@@ -281,21 +275,13 @@ fn markdown_dns_header_labels_mixed_record_types_as_any() {
     assert!(!out.contains("DNS A Records"), "got:\n{out}");
 }
 
-#[test]
-fn human_status_snapshot() {
-    snap!(human().format_status(&fixture_status()));
-}
-
-#[test]
-fn markdown_status_snapshot() {
-    snap!(markdown().format_status(&fixture_status()));
-}
-
-#[test]
-fn markdown_status_hostname_mismatch_snapshot() {
+snapshot_tests! {
+    human_status_snapshot => human.format_status(fixture_status());
+    markdown_status_snapshot => markdown.format_status(fixture_status());
     // Markdown used to show only "- **Status**: Valid" for a mismatched cert,
     // while the human formatter warned; the hostname check must be visible.
-    snap!(markdown().format_status(&fixture_status_hostname_mismatch()));
+    markdown_status_hostname_mismatch_snapshot =>
+        markdown.format_status(fixture_status_hostname_mismatch());
 }
 
 /// A subdomain baseline diff with additions, removals, and unchanged names.
@@ -375,14 +361,9 @@ fn fixture_posture() -> EmailPosture {
     }
 }
 
-#[test]
-fn human_posture_snapshot() {
-    snap!(human().format_posture(&fixture_posture()));
-}
-
-#[test]
-fn markdown_posture_snapshot() {
-    snap!(markdown().format_posture(&fixture_posture()));
+snapshot_tests! {
+    human_posture_snapshot => human.format_posture(fixture_posture());
+    markdown_posture_snapshot => markdown.format_posture(fixture_posture());
 }
 
 /// Registered look-alikes with both fully-populated and sparse (no
@@ -411,14 +392,9 @@ fn fixture_confusables() -> ConfusableReport {
     }
 }
 
-#[test]
-fn human_confusables_snapshot() {
-    snap!(human().format_confusables(&fixture_confusables()));
-}
-
-#[test]
-fn markdown_confusables_snapshot() {
-    snap!(markdown().format_confusables(&fixture_confusables()));
+snapshot_tests! {
+    human_confusables_snapshot => human.format_confusables(fixture_confusables());
+    markdown_confusables_snapshot => markdown.format_confusables(fixture_confusables());
 }
 
 /// Classified subdomains covering all three statuses, a dangling-CNAME
@@ -454,14 +430,11 @@ fn fixture_subdomain_classification() -> SubdomainClassification {
     }
 }
 
-#[test]
-fn human_subdomain_classification_snapshot() {
-    snap!(human().format_subdomain_classification(&fixture_subdomain_classification()));
-}
-
-#[test]
-fn markdown_subdomain_classification_snapshot() {
-    snap!(markdown().format_subdomain_classification(&fixture_subdomain_classification()));
+snapshot_tests! {
+    human_subdomain_classification_snapshot =>
+        human.format_subdomain_classification(fixture_subdomain_classification());
+    markdown_subdomain_classification_snapshot =>
+        markdown.format_subdomain_classification(fixture_subdomain_classification());
 }
 
 /// A CAA policy exercising the PR #101 extensions: iodef incident-reporting
@@ -499,14 +472,9 @@ fn fixture_caa_policy() -> CaaPolicy {
     }
 }
 
-#[test]
-fn human_caa_snapshot() {
-    snap!(human().format_caa(&fixture_caa_policy()));
-}
-
-#[test]
-fn markdown_caa_snapshot() {
-    snap!(markdown().format_caa(&fixture_caa_policy()));
+snapshot_tests! {
+    human_caa_snapshot => human.format_caa(fixture_caa_policy());
+    markdown_caa_snapshot => markdown.format_caa(fixture_caa_policy());
 }
 
 /// A date-valid but troubled leaf certificate whose warnings mirror what
@@ -554,14 +522,9 @@ fn fixture_ssl_report_with_warnings() -> SslReport {
     }
 }
 
-#[test]
-fn human_ssl_warnings_snapshot() {
-    snap!(human().format_ssl(&fixture_ssl_report_with_warnings()));
-}
-
-#[test]
-fn markdown_ssl_snapshot() {
-    snap!(markdown().format_ssl(&fixture_ssl_report_with_warnings()));
+snapshot_tests! {
+    human_ssl_warnings_snapshot => human.format_ssl(fixture_ssl_report_with_warnings());
+    markdown_ssl_snapshot => markdown.format_ssl(fixture_ssl_report_with_warnings());
 }
 
 /// A healthy delegation: parent and zone agree on the NS set, nothing lame.
@@ -600,42 +563,18 @@ fn fixture_delegation_broken() -> DelegationReport {
     }
 }
 
-#[test]
-fn human_delegation_healthy_snapshot() {
-    snap!(human().format_delegation(&fixture_delegation_healthy()));
-}
-
-#[test]
-fn markdown_delegation_healthy_snapshot() {
-    snap!(markdown().format_delegation(&fixture_delegation_healthy()));
-}
-
-#[test]
-fn human_delegation_broken_snapshot() {
-    snap!(human().format_delegation(&fixture_delegation_broken()));
-}
-
-#[test]
-fn markdown_delegation_broken_snapshot() {
-    snap!(markdown().format_delegation(&fixture_delegation_broken()));
-}
-
-#[test]
-fn human_subdomain_baseline_diff_snapshot() {
-    snap!(human().format_subdomain_baseline_diff(&fixture_subdomain_baseline_diff()));
-}
-
-#[test]
-fn markdown_subdomain_baseline_diff_snapshot() {
-    snap!(markdown().format_subdomain_baseline_diff(&fixture_subdomain_baseline_diff()));
-}
-
-#[test]
-fn human_subdomain_baseline_diff_missing_snapshot() {
-    snap!(human().format_subdomain_baseline_diff(&fixture_subdomain_baseline_diff_missing()));
-}
-
-#[test]
-fn markdown_subdomain_baseline_diff_missing_snapshot() {
-    snap!(markdown().format_subdomain_baseline_diff(&fixture_subdomain_baseline_diff_missing()));
+snapshot_tests! {
+    human_delegation_healthy_snapshot => human.format_delegation(fixture_delegation_healthy());
+    markdown_delegation_healthy_snapshot =>
+        markdown.format_delegation(fixture_delegation_healthy());
+    human_delegation_broken_snapshot => human.format_delegation(fixture_delegation_broken());
+    markdown_delegation_broken_snapshot => markdown.format_delegation(fixture_delegation_broken());
+    human_subdomain_baseline_diff_snapshot =>
+        human.format_subdomain_baseline_diff(fixture_subdomain_baseline_diff());
+    markdown_subdomain_baseline_diff_snapshot =>
+        markdown.format_subdomain_baseline_diff(fixture_subdomain_baseline_diff());
+    human_subdomain_baseline_diff_missing_snapshot =>
+        human.format_subdomain_baseline_diff(fixture_subdomain_baseline_diff_missing());
+    markdown_subdomain_baseline_diff_missing_snapshot =>
+        markdown.format_subdomain_baseline_diff(fixture_subdomain_baseline_diff_missing());
 }
