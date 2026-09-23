@@ -508,21 +508,10 @@ fn help_overlay(f: &mut Frame, area: Rect, theme: &Theme) {
 mod tests {
     use super::*;
     use crate::tui::app::App;
-    use ratatui::backend::TestBackend;
-    use ratatui::Terminal;
+    use crate::tui::test_util::{render_buffer, render_text};
 
     fn full_buf(app: &App, theme: &Theme) -> String {
-        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
-        terminal.draw(|f| view(f, app, theme)).unwrap();
-        let buf = terminal.backend().buffer();
-        let area = buf.area();
-        let mut s = String::new();
-        for y in 0..area.height {
-            for x in 0..area.width {
-                s.push_str(buf[(x, y)].symbol());
-            }
-        }
-        s
+        render_text(100, 30, |f| view(f, app, theme))
     }
 
     #[test]
@@ -596,16 +585,7 @@ mod tests {
     fn shell_renders_without_panicking() {
         let theme = Theme::frappe();
         let app = App::new(None);
-        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
-        terminal.draw(|f| view(f, &app, &theme)).unwrap();
-        let buf = terminal.backend().buffer();
-        let area = buf.area();
-        let mut s = String::new();
-        for y in 0..area.height {
-            for x in 0..area.width {
-                s.push_str(buf[(x, y)].symbol());
-            }
-        }
+        let s = full_buf(&app, &theme);
         assert!(s.contains("seer"), "top-bar brand missing");
         assert!(s.contains("Overview"), "first lens label missing");
         assert!(s.contains("LOOKUP"), "group header missing");
@@ -619,9 +599,7 @@ mod tests {
     fn frame_canvas_is_painted_with_theme_base() {
         let mut app = App::new(None);
         assert!(app.set_theme_by_name("latte"));
-        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
-        terminal.draw(|f| view(f, &app, app.theme())).unwrap();
-        let buffer = terminal.backend().buffer();
+        let buffer = render_buffer(100, 30, |f| view(f, &app, app.theme()));
         let latte = Theme::latte();
         // Main-pane interior and nav-column cells that no widget backfills.
         for (x, y) in [(60u16, 15u16), (2, 20)] {
@@ -637,9 +615,7 @@ mod tests {
         let mut app = App::new(None);
         assert!(app.set_theme_by_name("latte"));
         app.help = true;
-        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
-        terminal.draw(|f| view(f, &app, app.theme())).unwrap();
-        let buffer = terminal.backend().buffer();
+        let buffer = render_buffer(100, 30, |f| view(f, &app, app.theme()));
         // Popup interior on a 100x30 frame (popup is 60x16 centered).
         assert_eq!(buffer[(50, 15)].bg, Theme::latte().base);
     }
@@ -648,11 +624,8 @@ mod tests {
     /// verify a live `:theme latte` swap actually recolors the frame.
     #[test]
     fn live_theme_swap_recolors_the_frame() {
-        let top_bar_bg = |app: &App| {
-            let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
-            terminal.draw(|f| view(f, app, app.theme())).unwrap();
-            terminal.backend().buffer()[(0, 0)].bg
-        };
+        let top_bar_bg =
+            |app: &App| render_buffer(100, 30, |f| view(f, app, app.theme()))[(0, 0)].bg;
 
         let mut app = App::new(None);
         assert_eq!(top_bar_bg(&app), Theme::frappe().mantle);

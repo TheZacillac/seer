@@ -86,8 +86,7 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::backend::TestBackend;
-    use ratatui::Terminal;
+    use crate::tui::test_util::render_lines;
     use seer_core::AvailabilityResult;
 
     fn avail_data(available: bool, confidence: &str, method: &str) -> LensData {
@@ -107,20 +106,7 @@ mod tests {
 
     fn render_to_text(data: &LensData) -> String {
         let theme = Theme::frappe();
-        let backend = TestBackend::new(70, 14);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| render(f, f.area(), &theme, data))
-            .unwrap();
-        let a = terminal.backend().buffer().area();
-        let mut s = String::new();
-        for y in 0..a.height {
-            for x in 0..a.width {
-                s.push_str(terminal.backend().buffer()[(x, y)].symbol());
-            }
-            s.push('\n');
-        }
-        s
+        render_lines(70, 14, |f| render(f, f.area(), &theme, data))
     }
 
     #[test]

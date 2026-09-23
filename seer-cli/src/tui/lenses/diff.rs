@@ -230,20 +230,8 @@ fn comparison_table(f: &mut Frame, area: Rect, theme: &Theme, d: &seer_core::dif
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::backend::TestBackend;
-    use ratatui::Terminal;
+    use crate::tui::test_util::render_text;
     use seer_core::diff::{DnsDiff, DomainDiff, RegistrationDiff, SslDiff};
-
-    fn buf_text(buf: &ratatui::buffer::Buffer) -> String {
-        let a = buf.area();
-        let mut s = String::new();
-        for y in 0..a.height {
-            for x in 0..a.width {
-                s.push_str(buf[(x, y)].symbol());
-            }
-        }
-        s
-    }
 
     fn diff_fixture() -> DomainDiff {
         DomainDiff {
@@ -272,23 +260,18 @@ mod tests {
     #[test]
     fn idle_shows_input_bar_with_domain_a() {
         let theme = Theme::frappe();
-        let backend = TestBackend::new(90, 20);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| {
-                render(
-                    f,
-                    f.area(),
-                    &theme,
-                    Some("acme.io"),
-                    "",
-                    None,
-                    false,
-                    &LensState::Idle,
-                );
-            })
-            .unwrap();
-        let text = buf_text(terminal.backend().buffer());
+        let text = render_text(90, 20, |f| {
+            render(
+                f,
+                f.area(),
+                &theme,
+                Some("acme.io"),
+                "",
+                None,
+                false,
+                &LensState::Idle,
+            );
+        });
         assert!(text.contains("A ·"), "input bar shows A");
         assert!(text.contains("B ·"), "input bar shows B");
         assert!(text.contains("acme.io"), "shows current domain as A");
@@ -298,26 +281,19 @@ mod tests {
     #[test]
     fn editing_shows_live_buffer() {
         let theme = Theme::frappe();
-        let backend = TestBackend::new(90, 20);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| {
-                render(
-                    f,
-                    f.area(),
-                    &theme,
-                    Some("acme.io"),
-                    "",
-                    Some(&LineEditor::from("typed.io")),
-                    true,
-                    &LensState::Idle,
-                );
-            })
-            .unwrap();
-        assert!(
-            buf_text(terminal.backend().buffer()).contains("typed.io"),
-            "live edit buffer should render"
-        );
+        let text = render_text(90, 20, |f| {
+            render(
+                f,
+                f.area(),
+                &theme,
+                Some("acme.io"),
+                "",
+                Some(&LineEditor::from("typed.io")),
+                true,
+                &LensState::Idle,
+            );
+        });
+        assert!(text.contains("typed.io"), "live edit buffer should render");
     }
 
     #[test]
@@ -325,24 +301,20 @@ mod tests {
         let theme = Theme::frappe();
         let mut editor = LineEditor::from("typed.io");
         editor.home();
-        let backend = TestBackend::new(90, 20);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| {
-                render(
-                    f,
-                    f.area(),
-                    &theme,
-                    Some("acme.io"),
-                    "",
-                    Some(&editor),
-                    true,
-                    &LensState::Idle,
-                );
-            })
-            .unwrap();
+        let text = render_text(90, 20, |f| {
+            render(
+                f,
+                f.area(),
+                &theme,
+                Some("acme.io"),
+                "",
+                Some(&editor),
+                true,
+                &LensState::Idle,
+            );
+        });
         assert!(
-            buf_text(terminal.backend().buffer()).contains("B · ▏typed.io"),
+            text.contains("B · ▏typed.io"),
             "caret must render at the cursor (Home), not the end"
         );
     }
@@ -353,23 +325,18 @@ mod tests {
         // bar must label the loaded data's domains, not the session domain.
         let theme = Theme::frappe();
         let state = LensState::Loaded(LensData::Diff(Box::new(diff_fixture())));
-        let backend = TestBackend::new(90, 20);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| {
-                render(
-                    f,
-                    f.area(),
-                    &theme,
-                    Some("session.com"),
-                    "other.com",
-                    None,
-                    false,
-                    &state,
-                );
-            })
-            .unwrap();
-        let text = buf_text(terminal.backend().buffer());
+        let text = render_text(90, 20, |f| {
+            render(
+                f,
+                f.area(),
+                &theme,
+                Some("session.com"),
+                "other.com",
+                None,
+                false,
+                &state,
+            );
+        });
         assert!(text.contains("A · a.com"), "got: {text}");
         assert!(text.contains("B · b.com"), "got: {text}");
         assert!(!text.contains("session.com"), "got: {text}");
@@ -379,23 +346,18 @@ mod tests {
     fn loaded_shows_comparison_table() {
         let theme = Theme::frappe();
         let state = LensState::Loaded(LensData::Diff(Box::new(diff_fixture())));
-        let backend = TestBackend::new(90, 20);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| {
-                render(
-                    f,
-                    f.area(),
-                    &theme,
-                    Some("a.com"),
-                    "b.com",
-                    None,
-                    false,
-                    &state,
-                );
-            })
-            .unwrap();
-        let text = buf_text(terminal.backend().buffer());
+        let text = render_text(90, 20, |f| {
+            render(
+                f,
+                f.area(),
+                &theme,
+                Some("a.com"),
+                "b.com",
+                None,
+                false,
+                &state,
+            );
+        });
         assert!(text.contains("NameCheap"), "table renders registrar A");
         assert!(text.contains("GoDaddy"), "table renders registrar B");
     }

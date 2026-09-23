@@ -112,21 +112,9 @@ pub fn render(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::backend::TestBackend;
-    use ratatui::Terminal;
+    use crate::tui::test_util::render_text;
     use seer_core::dns::{RecordData, RecordType};
     use seer_core::DnsRecord;
-
-    fn buf_text(buf: &ratatui::buffer::Buffer) -> String {
-        let a = buf.area();
-        let mut s = String::new();
-        for y in 0..a.height {
-            for x in 0..a.width {
-                s.push_str(buf[(x, y)].symbol());
-            }
-        }
-        s
-    }
 
     fn a_record() -> DnsRecord {
         DnsRecord {
@@ -144,12 +132,9 @@ mod tests {
         let theme = Theme::frappe();
         let data = LensData::Dns(vec![a_record()]);
         let panes = Panes::default();
-        let backend = TestBackend::new(70, 10);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| render(f, f.area(), &theme, 0, &data, false, 0, &panes))
-            .unwrap();
-        let text = buf_text(terminal.backend().buffer());
+        let text = render_text(70, 10, |f| {
+            render(f, f.area(), &theme, 0, &data, false, 0, &panes);
+        });
         assert!(text.contains("93.184.215.14"));
         assert!(text.contains("example.com"));
         assert!(text.contains("dig · A records"), "title names the type");
@@ -161,12 +146,10 @@ mod tests {
         let data = LensData::Dns(vec![]);
         let mut panes = Panes::default();
         panes.dns.record_type = RecordType::MX;
-        let backend = TestBackend::new(70, 10);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| render(f, f.area(), &theme, 0, &data, false, 0, &panes))
-            .unwrap();
-        assert!(buf_text(terminal.backend().buffer()).contains("dig · MX records"));
+        let text = render_text(70, 10, |f| {
+            render(f, f.area(), &theme, 0, &data, false, 0, &panes);
+        });
+        assert!(text.contains("dig · MX records"));
     }
 
     #[test]
@@ -174,12 +157,9 @@ mod tests {
         let theme = Theme::frappe();
         let data = LensData::Dns(vec![a_record()]);
         let panes = Panes::default();
-        let backend = TestBackend::new(70, 10);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| render(f, f.area(), &theme, 0, &data, false, 0, &panes))
-            .unwrap();
-        let text = buf_text(terminal.backend().buffer());
+        let text = render_text(70, 10, |f| {
+            render(f, f.area(), &theme, 0, &data, false, 0, &panes);
+        });
         assert!(text.contains("system"), "chip row should show 'system'");
         assert!(text.contains("8.8.8.8"), "chip row should show '8.8.8.8'");
         assert!(text.contains("1.1.1.1"), "chip row should show '1.1.1.1'");

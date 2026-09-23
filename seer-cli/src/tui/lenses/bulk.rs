@@ -288,20 +288,8 @@ fn detail_lines<'a>(theme: &Theme, r: &seer_core::bulk::BulkResult) -> Vec<Line<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::backend::TestBackend;
-    use ratatui::Terminal;
+    use crate::tui::test_util::render_text;
     use seer_core::bulk::{BulkOperation, BulkResult};
-
-    fn buf_text(terminal: &Terminal<TestBackend>) -> String {
-        let area = terminal.backend().buffer().area();
-        let mut s = String::new();
-        for y in 0..area.height {
-            for x in 0..area.width {
-                s.push_str(terminal.backend().buffer()[(x, y)].symbol());
-            }
-        }
-        s
-    }
 
     fn make_result(domain: &str, success: bool) -> BulkResult {
         BulkResult {
@@ -325,12 +313,7 @@ mod tests {
         let mut bulk = BulkState::default();
         bulk.rows.push(make_result("rust-lang.org", true));
 
-        let backend = TestBackend::new(80, 24);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| render(f, f.area(), &theme, &bulk, None, 0))
-            .unwrap();
-        let text = buf_text(&terminal);
+        let text = render_text(80, 24, |f| render(f, f.area(), &theme, &bulk, None, 0));
         assert!(
             text.contains("rust-lang.org"),
             "rendered buffer should contain the domain"
@@ -346,12 +329,7 @@ mod tests {
         for i in 0..50 {
             bulk.rows.push(make_result(&format!("d{i}.com"), true));
         }
-        let backend = TestBackend::new(80, 14);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| render(f, f.area(), &theme, &bulk, None, 0))
-            .unwrap();
-        let text = buf_text(&terminal);
+        let text = render_text(80, 14, |f| render(f, f.area(), &theme, &bulk, None, 0));
         assert!(
             text.contains("d49.com"),
             "the newest streamed row should be pinned in view"
@@ -368,12 +346,7 @@ mod tests {
             ..Default::default()
         };
 
-        let backend = TestBackend::new(80, 24);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| render(f, f.area(), &theme, &bulk, None, 3))
-            .unwrap();
-        let text = buf_text(&terminal);
+        let text = render_text(80, 24, |f| render(f, f.area(), &theme, &bulk, None, 3));
         assert!(
             text.contains(SPIN[3]),
             "spinner should render the current animation frame"
@@ -385,12 +358,7 @@ mod tests {
         let theme = Theme::frappe();
         let bulk = BulkState::default();
 
-        let backend = TestBackend::new(80, 24);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| render(f, f.area(), &theme, &bulk, None, 0))
-            .unwrap();
-        let text = buf_text(&terminal);
+        let text = render_text(80, 24, |f| render(f, f.area(), &theme, &bulk, None, 0));
         assert!(
             text.contains("enter domains"),
             "empty state should show 'enter domains' placeholder"
@@ -402,12 +370,7 @@ mod tests {
         let theme = Theme::frappe();
         let bulk = BulkState::default();
 
-        let backend = TestBackend::new(80, 24);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| render(f, f.area(), &theme, &bulk, None, 0))
-            .unwrap();
-        let text = buf_text(&terminal);
+        let text = render_text(80, 24, |f| render(f, f.area(), &theme, &bulk, None, 0));
         assert!(text.contains("lookup"), "op chips should show 'lookup'");
         assert!(text.contains("status"), "op chips should show 'status'");
     }
@@ -416,12 +379,7 @@ mod tests {
     fn empty_state_prompts_for_domains() {
         let theme = Theme::frappe();
         let bulk = BulkState::default();
-        let backend = TestBackend::new(80, 24);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| render(f, f.area(), &theme, &bulk, None, 0))
-            .unwrap();
-        let text = buf_text(&terminal);
+        let text = render_text(80, 24, |f| render(f, f.area(), &theme, &bulk, None, 0));
         assert!(text.contains("press d to enter"), "prompts for domains");
         assert!(text.contains("d domains"), "shows the new hint row");
     }
@@ -432,12 +390,7 @@ mod tests {
         let mut bulk = BulkState::default();
         bulk.rows.push(make_result("ok.com", true));
         bulk.rows.push(make_result("bad.com", false));
-        let backend = TestBackend::new(80, 24);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| render(f, f.area(), &theme, &bulk, None, 0))
-            .unwrap();
-        let text = buf_text(&terminal);
+        let text = render_text(80, 24, |f| render(f, f.area(), &theme, &bulk, None, 0));
         assert!(text.contains("1 ok"), "summary should report ok count");
         assert!(text.contains("1 failed"), "summary should report failures");
     }
@@ -451,12 +404,7 @@ mod tests {
             ..Default::default()
         };
         bulk.rows.push(make_result("a.com", true));
-        let backend = TestBackend::new(80, 24);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| render(f, f.area(), &theme, &bulk, None, 0))
-            .unwrap();
-        let text = buf_text(&terminal);
+        let text = render_text(80, 24, |f| render(f, f.area(), &theme, &bulk, None, 0));
         assert!(text.contains("seer bulk lookup"), "got: {text}");
         assert!(!text.contains("seer bulk status"), "got: {text}");
     }
@@ -467,12 +415,10 @@ mod tests {
         let bulk = BulkState::default();
         let mut editor = LineEditor::from("a.com");
         editor.home();
-        let backend = TestBackend::new(80, 24);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| render(f, f.area(), &theme, &bulk, Some(&editor), 0))
-            .unwrap();
-        assert!(buf_text(&terminal).contains("domains: ▏a.com"));
+        let text = render_text(80, 24, |f| {
+            render(f, f.area(), &theme, &bulk, Some(&editor), 0);
+        });
+        assert!(text.contains("domains: ▏a.com"));
     }
 
     #[test]
@@ -482,12 +428,7 @@ mod tests {
         bulk.rows.push(make_result("bad.com", false)); // error: "timeout"
         bulk.selected = Some(0);
         bulk.detail = true;
-        let backend = TestBackend::new(80, 24);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| render(f, f.area(), &theme, &bulk, None, 0))
-            .unwrap();
-        let text = buf_text(&terminal);
+        let text = render_text(80, 24, |f| render(f, f.area(), &theme, &bulk, None, 0));
         assert!(text.contains("Detail"), "detail panel header should render");
         assert!(
             text.contains("timeout"),

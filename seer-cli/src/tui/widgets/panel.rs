@@ -28,33 +28,16 @@ pub fn block<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::backend::TestBackend;
+    use crate::tui::test_util::render_text;
     use ratatui::widgets::Paragraph;
-    use ratatui::Terminal;
-
-    fn buf_text(buf: &ratatui::buffer::Buffer) -> String {
-        let area = buf.area();
-        let mut s = String::new();
-        for y in 0..area.height {
-            for x in 0..area.width {
-                s.push_str(buf[(x, y)].symbol());
-            }
-        }
-        s
-    }
 
     #[test]
     fn panel_renders_title_in_border() {
         let theme = Theme::frappe();
-        let backend = TestBackend::new(24, 4);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| {
-                let b = block(&theme, "Registration", theme.blue, true);
-                f.render_widget(Paragraph::new("body").block(b), f.area());
-            })
-            .unwrap();
-        let text = buf_text(terminal.backend().buffer());
+        let text = render_text(24, 4, |f| {
+            let b = block(&theme, "Registration", theme.blue, true);
+            f.render_widget(Paragraph::new("body").block(b), f.area());
+        });
         assert!(text.contains("Registration"));
         assert!(text.contains('╭') || text.contains('┌'));
     }

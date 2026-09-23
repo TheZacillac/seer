@@ -66,20 +66,8 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::backend::TestBackend;
-    use ratatui::Terminal;
+    use crate::tui::test_util::render_text;
     use seer_core::StatusResponse;
-
-    fn buf_text(buf: &ratatui::buffer::Buffer) -> String {
-        let a = buf.area();
-        let mut s = String::new();
-        for y in 0..a.height {
-            for x in 0..a.width {
-                s.push_str(buf[(x, y)].symbol());
-            }
-        }
-        s
-    }
 
     #[test]
     fn renders_http_code() {
@@ -88,11 +76,7 @@ mod tests {
         sr.http_status = Some(200);
         sr.http_status_text = Some("OK".into());
         let data = LensData::Status(Box::new(sr));
-        let backend = TestBackend::new(60, 8);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| render(f, f.area(), &theme, &data))
-            .unwrap();
-        assert!(buf_text(terminal.backend().buffer()).contains("200"));
+        let text = render_text(60, 8, |f| render(f, f.area(), &theme, &data));
+        assert!(text.contains("200"));
     }
 }

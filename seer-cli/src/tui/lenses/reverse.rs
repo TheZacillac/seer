@@ -46,21 +46,9 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::backend::TestBackend;
-    use ratatui::Terminal;
+    use crate::tui::test_util::render_text;
     use seer_core::dns::{RecordData, RecordType};
     use seer_core::DnsRecord;
-
-    fn buf_text(buf: &ratatui::buffer::Buffer) -> String {
-        let a = buf.area();
-        let mut s = String::new();
-        for y in 0..a.height {
-            for x in 0..a.width {
-                s.push_str(buf[(x, y)].symbol());
-            }
-        }
-        s
-    }
 
     #[test]
     fn renders_ptr_target() {
@@ -73,24 +61,15 @@ mod tests {
                 target: "dns.google".into(),
             },
         }]);
-        let backend = TestBackend::new(70, 8);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| render(f, f.area(), &theme, &data))
-            .unwrap();
-        assert!(buf_text(terminal.backend().buffer()).contains("dns.google"));
+        let text = render_text(70, 8, |f| render(f, f.area(), &theme, &data));
+        assert!(text.contains("dns.google"));
     }
 
     #[test]
     fn renders_empty_gracefully() {
         let theme = Theme::frappe();
         let data = LensData::Reverse(vec![]);
-        let backend = TestBackend::new(60, 6);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| render(f, f.area(), &theme, &data))
-            .unwrap();
-        let text = buf_text(terminal.backend().buffer());
+        let text = render_text(60, 6, |f| render(f, f.area(), &theme, &data));
         assert!(text.contains("no PTR records"));
     }
 }

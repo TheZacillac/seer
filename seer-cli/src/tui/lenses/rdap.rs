@@ -128,19 +128,7 @@ fn render_asn(f: &mut Frame, area: Rect, theme: &Theme, r: &seer_core::RdapRespo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::backend::TestBackend;
-    use ratatui::Terminal;
-
-    fn buf_text(buf: &ratatui::buffer::Buffer) -> String {
-        let a = buf.area();
-        let mut s = String::new();
-        for y in 0..a.height {
-            for x in 0..a.width {
-                s.push_str(buf[(x, y)].symbol());
-            }
-        }
-        s
-    }
+    use crate::tui::test_util::render_text;
 
     fn rdap_fixture(handle: &str, name: &str) -> seer_core::RdapResponse {
         serde_json::from_value(serde_json::json!({
@@ -154,12 +142,8 @@ mod tests {
     fn renders_asn_tab_with_name() {
         let theme = Theme::frappe();
         let data = LensData::Rdap(Box::new(rdap_fixture("AS15169", "GOOGLE")));
-        let backend = TestBackend::new(70, 10);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| render(f, f.area(), &theme, 2, &data))
-            .unwrap();
-        assert!(buf_text(terminal.backend().buffer()).contains("GOOGLE"));
+        let text = render_text(70, 10, |f| render(f, f.area(), &theme, 2, &data));
+        assert!(text.contains("GOOGLE"));
     }
 
     #[test]
@@ -173,11 +157,7 @@ mod tests {
         }))
         .unwrap();
         let data = LensData::Rdap(Box::new(r));
-        let backend = TestBackend::new(70, 10);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| render(f, f.area(), &theme, 1, &data))
-            .unwrap();
-        assert!(buf_text(terminal.backend().buffer()).contains("8.8.8.0"));
+        let text = render_text(70, 10, |f| render(f, f.area(), &theme, 1, &data));
+        assert!(text.contains("8.8.8.0"));
     }
 }

@@ -134,9 +134,8 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, follow: &FollowState, sp
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::test_util::render_text;
     use chrono::Utc;
-    use ratatui::backend::TestBackend;
-    use ratatui::Terminal;
     use seer_core::dns::FollowIteration;
 
     fn make_iteration(iteration: usize, record_value: &str, changed: bool) -> FollowIteration {
@@ -172,17 +171,6 @@ mod tests {
         }
     }
 
-    fn buf_text(terminal: &Terminal<TestBackend>) -> String {
-        let area = terminal.backend().buffer().area();
-        let mut s = String::new();
-        for y in 0..area.height {
-            for x in 0..area.width {
-                s.push_str(terminal.backend().buffer()[(x, y)].symbol());
-            }
-        }
-        s
-    }
-
     #[test]
     fn renders_a_record_in_log() {
         let theme = Theme::frappe();
@@ -190,12 +178,7 @@ mod tests {
         follow.push(make_iteration(1, "1.2.3.4", false));
         follow.push(make_iteration(2, "1.2.3.4", true));
 
-        let backend = TestBackend::new(80, 20);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| render(f, f.area(), &theme, &follow, 0))
-            .unwrap();
-        let text = buf_text(&terminal);
+        let text = render_text(80, 20, |f| render(f, f.area(), &theme, &follow, 0));
         assert!(
             text.contains("1.2.3.4"),
             "rendered buffer should contain A record IP"
@@ -219,12 +202,7 @@ mod tests {
             error: Some("NXDOMAIN".into()),
         });
 
-        let backend = TestBackend::new(80, 20);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| render(f, f.area(), &theme, &follow, 0))
-            .unwrap();
-        let text = buf_text(&terminal);
+        let text = render_text(80, 20, |f| render(f, f.area(), &theme, &follow, 0));
         assert!(
             text.contains("ERROR"),
             "errored iteration should render an ERROR marker"
@@ -246,12 +224,7 @@ mod tests {
             ..Default::default()
         };
 
-        let backend = TestBackend::new(80, 20);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| render(f, f.area(), &theme, &follow, 3))
-            .unwrap();
-        let text = buf_text(&terminal);
+        let text = render_text(80, 20, |f| render(f, f.area(), &theme, &follow, 3));
         assert!(
             text.contains(SPIN[3]),
             "spinner should render the current animation frame"
@@ -274,12 +247,7 @@ mod tests {
         }
         follow.count = 5;
 
-        let backend = TestBackend::new(80, 20);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| render(f, f.area(), &theme, &follow, 0))
-            .unwrap();
-        let text = buf_text(&terminal);
+        let text = render_text(80, 20, |f| render(f, f.area(), &theme, &follow, 0));
         assert!(text.contains("20/20 done"), "got: {text}");
         assert!(!text.contains("20/5"), "got: {text}");
         assert!(text.contains("20 checks"), "title shows the run's count");
@@ -294,12 +262,7 @@ mod tests {
         let theme = Theme::frappe();
         let follow = FollowState::default();
 
-        let backend = TestBackend::new(80, 20);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| render(f, f.area(), &theme, &follow, 0))
-            .unwrap();
-        let text = buf_text(&terminal);
+        let text = render_text(80, 20, |f| render(f, f.area(), &theme, &follow, 0));
         assert!(
             text.contains("waiting"),
             "empty log should show 'waiting' placeholder"

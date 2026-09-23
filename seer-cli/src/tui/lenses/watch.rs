@@ -125,21 +125,9 @@ pub fn render(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::test_util::render_text;
     use chrono::Utc;
-    use ratatui::backend::TestBackend;
-    use ratatui::Terminal;
     use seer_core::{WatchReport, WatchResult};
-
-    fn buf_text(buf: &ratatui::buffer::Buffer) -> String {
-        let a = buf.area();
-        let mut s = String::new();
-        for y in 0..a.height {
-            for x in 0..a.width {
-                s.push_str(buf[(x, y)].symbol());
-            }
-        }
-        s
-    }
 
     #[test]
     fn renders_watched_domain() {
@@ -158,11 +146,7 @@ mod tests {
             warnings: 0,
             critical: 0,
         }));
-        let backend = TestBackend::new(80, 14);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| render(f, f.area(), &theme, &data, false, 0))
-            .unwrap();
-        assert!(buf_text(terminal.backend().buffer()).contains("x.com"));
+        let text = render_text(80, 14, |f| render(f, f.area(), &theme, &data, false, 0));
+        assert!(text.contains("x.com"));
     }
 }

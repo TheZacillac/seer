@@ -116,20 +116,8 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::backend::TestBackend;
-    use ratatui::Terminal;
+    use crate::tui::test_util::render_text;
     use seer_core::DnssecReport;
-
-    fn buf_text(buf: &ratatui::buffer::Buffer) -> String {
-        let a = buf.area();
-        let mut s = String::new();
-        for y in 0..a.height {
-            for x in 0..a.width {
-                s.push_str(buf[(x, y)].symbol());
-            }
-        }
-        s
-    }
 
     #[test]
     fn renders_status_field() {
@@ -147,11 +135,7 @@ mod tests {
             authentication_tier: seer_core::AuthenticationTier::DigestOnly,
             rrsig_records: vec![],
         }));
-        let backend = TestBackend::new(70, 14);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| render(f, f.area(), &theme, &data))
-            .unwrap();
-        assert!(buf_text(terminal.backend().buffer()).contains("signed"));
+        let text = render_text(70, 14, |f| render(f, f.area(), &theme, &data));
+        assert!(text.contains("signed"));
     }
 }

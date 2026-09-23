@@ -15,6 +15,8 @@ mod lenses;
 mod line_editor;
 mod panes;
 mod render;
+#[cfg(test)]
+mod test_util;
 mod theme;
 mod widgets;
 

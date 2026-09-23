@@ -85,32 +85,15 @@ pub fn render(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::backend::TestBackend;
-    use ratatui::Terminal;
-
-    fn buf_text(buf: &ratatui::buffer::Buffer) -> String {
-        let a = buf.area();
-        let mut s = String::new();
-        for y in 0..a.height {
-            for x in 0..a.width {
-                s.push_str(buf[(x, y)].symbol());
-            }
-        }
-        s
-    }
+    use crate::tui::test_util::render_text;
 
     #[test]
     fn renders_empty_history_without_panic() {
         let theme = Theme::frappe();
         let data = LensData::History(vec![]);
-        let backend = TestBackend::new(80, 12);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| render(f, f.area(), &theme, &data, "", false, 0))
-            .unwrap();
+        let text = render_text(80, 12, |f| render(f, f.area(), &theme, &data, "", false, 0));
         // Should not panic, and the empty state still renders the panel
         // title and the hint line.
-        let text = buf_text(terminal.backend().buffer());
         assert!(text.contains("History"), "panel title missing: {text:?}");
         assert!(text.contains("replay"), "hint line missing: {text:?}");
     }

@@ -144,8 +144,7 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::backend::TestBackend;
-    use ratatui::Terminal;
+    use crate::tui::test_util::{render_buffer, render_lines};
     use seer_core::{CookieFinding, Disclosure, HeaderFinding, HeaderReport};
 
     fn finding(header: &str, verdict: HeaderVerdict) -> HeaderFinding {
@@ -189,21 +188,7 @@ mod tests {
 
     fn render_to_text(data: &LensData, width: u16, height: u16) -> String {
         let theme = Theme::frappe();
-        let backend = TestBackend::new(width, height);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| render(f, f.area(), &theme, data))
-            .unwrap();
-        let buf = terminal.backend().buffer();
-        let a = buf.area();
-        let mut s = String::new();
-        for y in 0..a.height {
-            for x in 0..a.width {
-                s.push_str(buf[(x, y)].symbol());
-            }
-            s.push('\n');
-        }
-        s
+        render_lines(width, height, |f| render(f, f.area(), &theme, data))
     }
 
     #[test]
@@ -258,12 +243,8 @@ mod tests {
         // The dispatch in lenses::render is keyed by lens, not by payload, so
         // a mismatched variant must be a no-op rather than a panic.
         let theme = Theme::frappe();
-        let backend = TestBackend::new(40, 6);
-        let mut terminal = Terminal::new(backend).unwrap();
         let data = LensData::History(vec![]);
-        terminal
-            .draw(|f| render(f, f.area(), &theme, &data))
-            .unwrap();
+        render_buffer(40, 6, |f| render(f, f.area(), &theme, &data));
     }
 
     #[test]

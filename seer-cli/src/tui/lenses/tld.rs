@@ -177,20 +177,8 @@ fn plural(n: usize) -> &'static str {
 mod tests {
     use super::*;
     use crate::tui::panes::tld::TldState;
-    use ratatui::backend::TestBackend;
-    use ratatui::Terminal;
+    use crate::tui::test_util::render_text;
     use seer_core::TldInfo;
-
-    fn buf_text(buf: &ratatui::buffer::Buffer) -> String {
-        let a = buf.area();
-        let mut s = String::new();
-        for y in 0..a.height {
-            for x in 0..a.width {
-                s.push_str(buf[(x, y)].symbol());
-            }
-        }
-        s
-    }
 
     fn com_info() -> TldInfo {
         TldInfo {
@@ -213,12 +201,9 @@ mod tests {
         editing: Option<&LineEditor>,
     ) -> String {
         let theme = Theme::frappe();
-        let backend = TestBackend::new(80, 24);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| render(f, f.area(), &theme, state, loaded, false, editing))
-            .unwrap();
-        buf_text(terminal.backend().buffer())
+        render_text(80, 24, |f| {
+            render(f, f.area(), &theme, state, loaded, false, editing);
+        })
     }
 
     #[test]

@@ -60,20 +60,8 @@ pub fn render(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::backend::TestBackend;
-    use ratatui::Terminal;
+    use crate::tui::test_util::render_text;
     use seer_core::SubdomainResult;
-
-    fn buf_text(buf: &ratatui::buffer::Buffer) -> String {
-        let a = buf.area();
-        let mut s = String::new();
-        for y in 0..a.height {
-            for x in 0..a.width {
-                s.push_str(buf[(x, y)].symbol());
-            }
-        }
-        s
-    }
 
     #[test]
     fn renders_subdomain_rows() {
@@ -84,12 +72,7 @@ mod tests {
             source: "crt.sh".into(),
             count: 2,
         }));
-        let backend = TestBackend::new(70, 10);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| render(f, f.area(), &theme, &data, false, 0))
-            .unwrap();
-        let text = buf_text(terminal.backend().buffer());
+        let text = render_text(70, 10, |f| render(f, f.area(), &theme, &data, false, 0));
         assert!(text.contains("www.example.com"));
     }
 
@@ -105,12 +88,7 @@ mod tests {
         }));
         // Short terminal can't fit 60 rows; without scrolling the last host
         // would never render even when selected.
-        let backend = TestBackend::new(60, 10);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| render(f, f.area(), &theme, &data, true, 59))
-            .unwrap();
-        let text = buf_text(terminal.backend().buffer());
+        let text = render_text(60, 10, |f| render(f, f.area(), &theme, &data, true, 59));
         assert!(
             text.contains("h59.example.com"),
             "selecting the last row must scroll it into view"
@@ -126,12 +104,7 @@ mod tests {
             source: "crt.sh".into(),
             count: 0,
         }));
-        let backend = TestBackend::new(60, 6);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| render(f, f.area(), &theme, &data, false, 0))
-            .unwrap();
-        let text = buf_text(terminal.backend().buffer());
+        let text = render_text(60, 6, |f| render(f, f.area(), &theme, &data, false, 0));
         assert!(text.contains("no subdomains found"));
     }
 }
