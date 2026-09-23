@@ -18,9 +18,9 @@ pub fn or_dash<T: ToString>(value: Option<T>) -> String {
 /// selection band when `selected`.
 ///
 /// Applied per row rather than via `Table::row_highlight_style`: ratatui clamps
-/// an out-of-range selection to the last row, so a stale `sel` (e.g. after a
-/// refresh shrank the list) would highlight a row the App doesn't consider
-/// selected.
+/// an out-of-range selection to the last row, so a stale `sel` (e.g. while a
+/// live `/` filter narrows the list) would highlight a row the App doesn't
+/// consider selected.
 pub fn row_style(theme: &Theme, selected: bool) -> Style {
     let style = Style::default().fg(theme.text);
     if selected {
