@@ -57,7 +57,9 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=7.0",
+    # 8.4+ fails an `async def` test that no plugin runs (older releases warn
+    # and skip it), and seer-api has no async test plugin.
+    "pytest>=8.4",
     "httpx>=0.26",
 ]
 
