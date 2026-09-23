@@ -6,6 +6,7 @@
 //! output`) and the user config the clients are built from. `copy` puts the
 //! last result on the clipboard.
 
+mod catalog;
 mod commands;
 mod completer;
 
@@ -299,160 +300,22 @@ impl Repl {
 
     fn print_help(&self) {
         println!();
-        println!("{}", "LOOKUP COMMANDS".bright_purple().bold());
-        println!(
-            "  {:<34} Smart lookup (just type a domain directly)",
-            "<domain>".bright_cyan()
-        );
-        println!(
-            "  {:<34} Comprehensive domain info (RDAP + WHOIS merged)",
-            "info <domain>".bright_cyan()
-        );
-        println!(
-            "  {:<34} Query WHOIS information",
-            "whois <domain>".bright_cyan()
-        );
-        println!(
-            "  {:<34} Query RDAP registry data",
-            "rdap <domain|ip|asn>".bright_cyan()
-        );
-        println!();
-        println!("{}", "DNS COMMANDS".bright_purple().bold());
-        println!(
-            "  {:<34} Query DNS records",
-            "dig <domain> [type] [@server]".bright_cyan()
-        );
-        println!(
-            "  {:<34} Check DNS propagation globally",
-            "prop <domain> [type]".bright_cyan()
-        );
-        println!(
-            "  {:<34} Monitor DNS records over time",
-            "follow <domain> [n] [mins] [type] [@server] [--changes-only]".bright_cyan()
-        );
-        println!(
-            "  {}",
-            "Record types: A, AAAA, CNAME, MX, NS, TXT, SOA, PTR, SRV, CAA".dimmed()
-        );
-        println!(
-            "  {:<34} Compare DNS records across nameservers",
-            "compare <domain> [type] @ns1 @ns2".bright_cyan()
-        );
-        println!(
-            "  {:<34} Check NS delegation health (parent vs zone, lameness)",
-            "delegation <domain>".bright_cyan()
-        );
-        println!();
-        println!("{}", "UTILITY COMMANDS".bright_purple().bold());
-        println!(
-            "  {:<34} Reverse DNS lookup for an IP",
-            "reverse <ip>".bright_cyan()
-        );
-        println!(
-            "  {:<34} Check domain registration availability",
-            "avail <domain>".bright_cyan()
-        );
-        println!(
-            "  {:<34} Check DNSSEC configuration",
-            "dnssec <domain>".bright_cyan()
-        );
-        println!(
-            "  {:<34} Look up TLD info (WHOIS server, RDAP, registry)",
-            "tld <tld>".bright_cyan()
-        );
-        println!(
-            "  {:<34} Enumerate subdomains via CT logs",
-            "subdomains <domain>".bright_cyan()
-        );
-        println!(
-            "  {:<34} ...and classify live/dead + dangling CNAMEs",
-            "subdomains <domain> --resolve".bright_cyan()
-        );
-        println!(
-            "  {:<34} Diff subdomains vs the stored baseline",
-            "subdomains <domain> --diff [--record]".bright_cyan()
-        );
-        println!(
-            "  {:<34} Diagnose seer environment (config, DNS, WHOIS, RDAP)",
-            "doctor".bright_cyan()
-        );
-        println!();
-        println!("{}", "STATUS & SSL".bright_purple().bold());
-        println!(
-            "  {:<34} Check HTTP, SSL, and domain expiration",
-            "status <domain>".bright_cyan()
-        );
-        println!(
-            "  {:<34} Inspect SSL certificate chain and SANs",
-            "ssl <domain>".bright_cyan()
-        );
-        println!();
-        println!("{}", "SECURITY".bright_purple().bold());
-        println!(
-            "  {:<34} Look up CAA (cert authority) policy",
-            "caa <domain>".bright_cyan()
-        );
-        println!(
-            "  {:<34} Email/DNS posture (SPF, DMARC, MTA-STS, BIMI, DANE)",
-            "posture <domain>".bright_cyan()
-        );
-        println!(
-            "  {:<34} Audit HTTP security headers + cookie flags",
-            "headers <domain>".bright_cyan()
-        );
-        println!(
-            "  {:<34} Scan subdomains for takeover exposure",
-            "takeover <domain> [--host <h>]...".bright_cyan()
-        );
-        println!(
-            "  {:<34} Find registered look-alike domains",
-            "confusables <domain>".bright_cyan()
-        );
-        println!();
-        println!("{}", "COMPARISON".bright_purple().bold());
-        println!(
-            "  {:<34} Compare two domains side-by-side",
-            "diff <domain1> <domain2>".bright_cyan()
-        );
-        println!();
-        println!("{}", "MONITORING".bright_purple().bold());
-        println!(
-            "  {:<34} Check watchlist / add / remove / list",
-            "watch [add|remove|list] [domain]".bright_cyan()
-        );
-        println!(
-            "  {:<34} View lookup history",
-            "history [domain] [--clear]".bright_cyan()
-        );
-        println!(
-            "  {:<34} Detect drift vs the last stored lookup",
-            "drift <domain> [--record]".bright_cyan()
-        );
-        println!();
-        println!("{}", "BULK OPERATIONS".bright_purple().bold());
-        println!(
-            "  {:<34} Run bulk operations from file",
-            "bulk <op> <file>".bright_cyan()
-        );
-        println!(
-            "  {}",
-            format!("Operations: {}", *crate::ops::BULK_OPS_SUMMARY).dimmed()
-        );
-        println!();
-        println!("{}", "SETTINGS".bright_purple().bold());
-        println!(
-            "  {:<34} Change output format",
-            "set output <human|json|yaml|markdown>".bright_cyan()
-        );
-        println!(
-            "  {:<34} Copy last result to clipboard (default: markdown)",
-            "copy [markdown|json|yaml]".bright_cyan()
-        );
-        println!("  {:<34} Clear screen", "clear".bright_cyan());
-        println!("  {:<34} Exit the program", "exit".bright_cyan());
-        println!();
+        for section in catalog::SECTIONS {
+            println!("{}", section.title.bright_purple().bold());
+            for command in section.commands {
+                let invocation = format!("{} {}", command.name, command.usage);
+                println!(
+                    "  {:<34} {}",
+                    invocation.trim_end().bright_cyan(),
+                    command.about
+                );
+            }
+            if let Some(note) = section.note {
+                println!("  {}", note().dimmed());
+            }
+            println!();
+        }
     }
-
     fn print_bulk_help(&self) {
         println!();
         println!("{}", "BULK OPERATIONS".bright_purple().bold());
@@ -1440,7 +1303,7 @@ impl Repl {
 
     fn execute_set(&mut self, args: &[&str]) -> CommandResult {
         if args.len() < 2 {
-            return CommandResult::Error("Usage: set <setting> <value>".to_string());
+            return CommandResult::Error(catalog::usage("set"));
         }
 
         match args[0] {

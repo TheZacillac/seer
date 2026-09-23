@@ -4,53 +4,12 @@ use rustyline::hint::Hinter;
 use rustyline::validate::Validator;
 use rustyline::Helper;
 
-const COMMANDS: &[&str] = &[
-    "help",
-    "exit",
-    "quit",
-    "lookup",
-    "info",
-    "whois",
-    "rdap",
-    "dig",
-    "dns",
-    "prop",
-    "delegation",
-    "doctor",
-    "follow",
-    "reverse",
-    "avail",
-    "dnssec",
-    "bulk",
-    "status",
-    "ssl",
-    "tld",
-    "compare",
-    "subdomains",
-    "subs",
-    "diff",
-    "drift",
-    "caa",
-    "posture",
-    "headers",
-    "takeover",
-    "confusables",
-    "watch",
-    "history",
-    "set",
-    "clear",
-    "copy",
-];
+use super::catalog;
 
 /// Record types come from core so completion can never drift from what
 /// `RecordType::from_str` accepts — the hand-mirrored list this replaces had
 /// silently lost NAPTR, TLSA, and SSHFP.
-///
-/// Note: "CAA" here is the DNS record type completed after `dig`/`prop`/etc.,
-/// distinct from the lowercase `caa` policy-lookup command in COMMANDS above.
 const RECORD_TYPES: &[&str] = seer_core::RecordType::ALL_NAMES;
-
-const SET_OPTIONS: &[&str] = &["output"];
 
 const OUTPUT_FORMATS: &[&str] = &["human", "json", "yaml", "markdown"];
 
@@ -62,6 +21,25 @@ impl SeerCompleter {
     pub fn new() -> Self {
         Self
     }
+}
+
+/// The `options` that start with `prefix` (case-insensitively, as commands
+/// are), each replacing the prefix that ends `line_to_cursor`.
+fn complete_from<'a>(
+    options: impl IntoIterator<Item = &'a str>,
+    prefix: &str,
+    line_to_cursor: &str,
+) -> (usize, Vec<Pair>) {
+    let prefix_lower = prefix.to_lowercase();
+    let matches = options
+        .into_iter()
+        .filter(|option| option.to_lowercase().starts_with(&prefix_lower))
+        .map(|option| Pair {
+            display: option.to_string(),
+            replacement: option.to_string(),
+        })
+        .collect();
+    (line_to_cursor.len() - prefix.len(), matches)
 }
 
 impl Completer for SeerCompleter {
@@ -78,183 +56,47 @@ impl Completer for SeerCompleter {
         // None on a non-char-boundary, so fall back to the whole line.
         let line_to_cursor = line.get(..pos).unwrap_or(line);
         let words: Vec<&str> = line_to_cursor.split_whitespace().collect();
-
-        if words.is_empty() || (words.len() == 1 && !line_to_cursor.ends_with(' ')) {
-            // Complete command
-            let prefix = words.first().copied().unwrap_or("");
-            let matches: Vec<Pair> = COMMANDS
-                .iter()
-                .filter(|cmd| cmd.starts_with(prefix))
-                .map(|cmd| Pair {
-                    display: cmd.to_string(),
-                    replacement: cmd.to_string(),
-                })
-                .collect();
-            let start = line_to_cursor.len() - prefix.len();
-            return Ok((start, matches));
-        }
-
-        let command = words[0].to_lowercase();
-        let current_word = if line_to_cursor.ends_with(' ') {
-            ""
-        } else {
-            words.last().copied().unwrap_or("")
+        // The word under the cursor (empty after a space) and its position.
+        let (current, index) = match words.last() {
+            Some(last) if !line_to_cursor.ends_with(' ') => (*last, words.len() - 1),
+            _ => ("", words.len()),
         };
+        let command = words.first().map(|w| w.to_lowercase());
 
-        match command.as_str() {
-            "dig" | "dns" | "propagation" | "prop" | "follow" | "compare" if words.len() >= 2 => {
-                // Complete record types
-                let matches: Vec<Pair> = RECORD_TYPES
-                    .iter()
-                    .filter(|rt| rt.to_lowercase().starts_with(&current_word.to_lowercase()))
-                    .map(|rt| Pair {
-                        display: rt.to_string(),
-                        replacement: rt.to_string(),
-                    })
-                    .collect();
-                let start = line_to_cursor.len() - current_word.len();
-                return Ok((start, matches));
-            }
-            "bulk" if words.len() == 1 || (words.len() == 2 && !line_to_cursor.ends_with(' ')) => {
-                // Complete bulk operation type (from the shared ops table, so
-                // completion can never drift from what `bulk` accepts)
-                let matches: Vec<Pair> = crate::ops::BULK_OPS
-                    .iter()
-                    .map(|(op, _)| op)
-                    .filter(|op| op.starts_with(current_word))
-                    .map(|op| Pair {
-                        display: op.to_string(),
-                        replacement: op.to_string(),
-                    })
-                    .collect();
-                let start = line_to_cursor.len() - current_word.len();
-                return Ok((start, matches));
-            }
-            "set" => {
-                if words.len() == 1 || (words.len() == 2 && !line_to_cursor.ends_with(' ')) {
-                    // Complete setting name
-                    let matches: Vec<Pair> = SET_OPTIONS
-                        .iter()
-                        .filter(|opt| opt.starts_with(current_word))
-                        .map(|opt| Pair {
-                            display: opt.to_string(),
-                            replacement: opt.to_string(),
-                        })
-                        .collect();
-                    let start = line_to_cursor.len() - current_word.len();
-                    return Ok((start, matches));
-                } else if words.len() >= 2 && words[1] == "output" {
-                    // Complete output format
-                    let matches: Vec<Pair> = OUTPUT_FORMATS
-                        .iter()
-                        .filter(|fmt| fmt.starts_with(current_word))
-                        .map(|fmt| Pair {
-                            display: fmt.to_string(),
-                            replacement: fmt.to_string(),
-                        })
-                        .collect();
-                    let start = line_to_cursor.len() - current_word.len();
-                    return Ok((start, matches));
-                }
-            }
-            "watch" if words.len() == 1 || (words.len() == 2 && !line_to_cursor.ends_with(' ')) => {
-                let matches: Vec<Pair> = WATCH_ACTIONS
-                    .iter()
-                    .filter(|a| a.starts_with(current_word))
-                    .map(|a| Pair {
-                        display: a.to_string(),
-                        replacement: a.to_string(),
-                    })
-                    .collect();
-                let start = line_to_cursor.len() - current_word.len();
-                return Ok((start, matches));
-            }
-            _ => {}
-        }
-
-        Ok((pos, vec![]))
+        let options: Vec<&str> = match (index, command.as_deref().map(catalog::canonical)) {
+            (0, _) => catalog::commands()
+                .map(|c| c.name)
+                .chain(catalog::ALIASES.iter().map(|(alias, _)| *alias))
+                .collect(),
+            (1, Some("bulk")) => crate::ops::BULK_OPS.iter().map(|(op, _)| *op).collect(),
+            (1, Some("set")) => vec!["output"],
+            (1, Some("watch")) => WATCH_ACTIONS.to_vec(),
+            (_, Some("set")) if words.get(1) == Some(&"output") => OUTPUT_FORMATS.to_vec(),
+            // Record types follow the domain.
+            (2.., Some("dig" | "prop" | "follow" | "compare")) => RECORD_TYPES.to_vec(),
+            _ => return Ok((pos, Vec::new())),
+        };
+        Ok(complete_from(options, current, line_to_cursor))
     }
 }
 
 impl Hinter for SeerCompleter {
     type Hint = String;
 
+    /// After `<command> `, hints the command's arguments.
     fn hint(&self, line: &str, pos: usize, _ctx: &rustyline::Context<'_>) -> Option<String> {
-        if line.is_empty() || pos < line.len() {
+        if pos < line.len() || !line.ends_with(' ') {
             return None;
         }
-
-        let words: Vec<&str> = line.split_whitespace().collect();
-        if words.is_empty() {
+        let mut words = line.split_whitespace();
+        let (Some(command), None) = (words.next(), words.next()) else {
             return None;
-        }
-
-        // Provide usage hints for commands
-        match words[0].to_lowercase().as_str() {
-            "lookup" if words.len() == 1 && line.ends_with(' ') => Some(" <domain>".to_string()),
-            "info" if words.len() == 1 && line.ends_with(' ') => Some(" <domain>".to_string()),
-            "whois" if words.len() == 1 && line.ends_with(' ') => Some(" <domain>".to_string()),
-            "rdap" if words.len() == 1 && line.ends_with(' ') => {
-                Some(" <domain|ip|asn>".to_string())
-            }
-            "dig" | "dns" if words.len() == 1 && line.ends_with(' ') => {
-                Some(" <domain> [type] [@server]".to_string())
-            }
-            "propagation" | "prop" if words.len() == 1 && line.ends_with(' ') => {
-                Some(" <domain> [type]".to_string())
-            }
-            "delegation" if words.len() == 1 && line.ends_with(' ') => {
-                Some(" <domain>".to_string())
-            }
-            "bulk" if words.len() == 1 && line.ends_with(' ') => {
-                Some(" <operation> <file.txt>".to_string())
-            }
-            "set" if words.len() == 1 && line.ends_with(' ') => {
-                Some(" output <human|json|yaml|markdown>".to_string())
-            }
-            "reverse" if words.len() == 1 && line.ends_with(' ') => Some(" <ip>".to_string()),
-            "avail" if words.len() == 1 && line.ends_with(' ') => Some(" <domain>".to_string()),
-            "dnssec" if words.len() == 1 && line.ends_with(' ') => Some(" <domain>".to_string()),
-            "status" if words.len() == 1 && line.ends_with(' ') => Some(" <domain>".to_string()),
-            "follow" if words.len() == 1 && line.ends_with(' ') => {
-                Some(" <domain> [iterations] [interval_minutes] [type] [@server]".to_string())
-            }
-            "ssl" if words.len() == 1 && line.ends_with(' ') => Some(" <domain>".to_string()),
-            "tld" if words.len() == 1 && line.ends_with(' ') => Some(" <tld>".to_string()),
-            "compare" if words.len() == 1 && line.ends_with(' ') => {
-                Some(" <domain> [type] @<server1> @<server2>".to_string())
-            }
-            "subdomains" | "subs" if words.len() == 1 && line.ends_with(' ') => {
-                Some(" <domain> [--resolve | --diff] [--record]".to_string())
-            }
-            "takeover" if words.len() == 1 && line.ends_with(' ') => {
-                Some(" <domain> [--host <host>]...".to_string())
-            }
-            "diff" if words.len() == 1 && line.ends_with(' ') => {
-                Some(" <domain1> <domain2>".to_string())
-            }
-            "drift" if words.len() == 1 && line.ends_with(' ') => {
-                Some(" <domain> [--record]".to_string())
-            }
-            "caa" | "posture" | "confusables" | "headers"
-                if words.len() == 1 && line.ends_with(' ') =>
-            {
-                Some(" <domain>".to_string())
-            }
-            "watch" if words.len() == 1 && line.ends_with(' ') => {
-                Some(" [add|remove|list] [domain]".to_string())
-            }
-            "history" if words.len() == 1 && line.ends_with(' ') => {
-                Some(" [domain] [--clear]".to_string())
-            }
-            "copy" if words.len() == 1 && line.ends_with(' ') => {
-                Some(" [markdown|json|yaml]".to_string())
-            }
-            _ => None,
-        }
+        };
+        catalog::find(&command.to_lowercase())
+            .filter(|c| !c.usage.is_empty())
+            .map(|c| format!(" {}", c.usage))
     }
 }
-
 impl Highlighter for SeerCompleter {}
 impl Validator for SeerCompleter {}
 impl Helper for SeerCompleter {}
@@ -280,33 +122,56 @@ mod tests {
         );
     }
 
+    fn candidates(line: &str) -> Vec<String> {
+        let history = DefaultHistory::new();
+        let ctx = rustyline::Context::new(&history);
+        let (_, pairs) = SeerCompleter::new()
+            .complete(line, line.len(), &ctx)
+            .expect("ok");
+        pairs.into_iter().map(|p| p.replacement).collect()
+    }
+
+    fn hint(line: &str) -> Option<String> {
+        let history = DefaultHistory::new();
+        let ctx = rustyline::Context::new(&history);
+        SeerCompleter::new().hint(line, line.len(), &ctx)
+    }
+
+    /// `propagation` was dispatched but missing from the hand-kept list.
     #[test]
-    fn new_commands_are_completable() {
-        for cmd in [
-            "drift",
-            "caa",
-            "posture",
-            "confusables",
-            "copy",
-            "delegation",
-            "doctor",
-        ] {
-            assert!(COMMANDS.contains(&cmd), "{cmd} should be a known command");
+    fn every_command_and_alias_is_completable() {
+        let all = candidates("");
+        for word in catalog::commands()
+            .map(|c| c.name)
+            .chain(catalog::ALIASES.iter().map(|(alias, _)| *alias))
+        {
+            assert!(all.iter().any(|c| c == word), "{word} is not completable");
         }
-        // The lowercase `caa` command must not displace the CAA record type.
-        assert!(RECORD_TYPES.contains(&"CAA"));
+        assert_eq!(candidates("propag"), vec!["propagation"]);
     }
 
     #[test]
-    fn bulk_completion_offers_new_operations() {
-        let completer = SeerCompleter::new();
-        let history = DefaultHistory::new();
-        let ctx = rustyline::Context::new(&history);
-        let line = "bulk po";
-        let (_, candidates) = completer.complete(line, line.len(), &ctx).expect("ok");
+    fn arguments_complete_by_position() {
+        assert!(candidates("bulk po").contains(&"posture".to_string()));
+        assert_eq!(candidates("set o"), vec!["output"]);
+        assert_eq!(candidates("set output j"), vec!["json"]);
+        assert_eq!(candidates("watch r"), vec!["remove"]);
+        // Record types follow the domain, for aliases too; the lowercase
+        // `caa` command must not displace the CAA record type.
+        assert!(candidates("dns example.com ca").contains(&"CAA".to_string()));
         assert!(
-            candidates.iter().any(|c| c.replacement == "posture"),
-            "bulk completion should offer posture"
+            candidates("dig a").is_empty(),
+            "the domain slot has no types"
         );
+    }
+
+    /// The follow hint used to omit `--changes-only`, which help showed.
+    #[test]
+    fn hints_show_the_catalog_usage() {
+        assert_eq!(hint("whois "), Some(" <domain>".to_string()));
+        assert!(hint("follow ").is_some_and(|h| h.contains("--changes-only")));
+        assert_eq!(hint("prop "), hint("propagation "));
+        assert_eq!(hint("doctor "), None);
+        assert_eq!(hint("whois example.com "), None);
     }
 }
