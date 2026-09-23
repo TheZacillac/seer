@@ -88,6 +88,7 @@ _RECORD_TYPE_DESC = (
     f"DNS record type — one of: {', '.join(seer.record_types())} (default: A)"
 )
 
+
 def _require_tld(arguments: dict[str, Any]) -> str:
     """Extract and validate a required TLD argument."""
     tld = _require_str(arguments, "tld")
