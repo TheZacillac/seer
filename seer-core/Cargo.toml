@@ -8,6 +8,9 @@ repository.workspace = true
 homepage.workspace = true
 description = "Core library for Seer domain name utilities"
 readme = "../README.md"
+# The insta snapshot suite (tests/ + its .snap baselines) isn't needed to build
+# the crate; the in-file unit tests under src/ still ship.
+exclude = ["tests/"]
 keywords = ["whois", "rdap", "dns", "domain", "networking"]
 categories = ["network-programming", "command-line-utilities"]
 
