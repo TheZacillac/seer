@@ -413,6 +413,12 @@ impl App {
                             Err(e) => LensState::Error(e),
                         };
                         self.states.insert(reg.key, new_state);
+                        // A refresh can return fewer rows (e.g. after `watch
+                        // remove` of the last row); keep the selection on a
+                        // real row so the highlight and row actions agree.
+                        if reg.key == self.current_lens().key {
+                            self.sel = self.sel.min(self.row_count().saturating_sub(1));
+                        }
                     }
                 }
                 vec![]
@@ -1718,6 +1724,34 @@ mod tests {
             matches!(app.state_of(watch_lens_idx()), LensState::Loaded(LensData::Watch(w)) if w.results[0].domain == "kept.com"),
             "gen-correct watch refresh must replace the cached view",
         );
+    }
+
+    #[test]
+    fn refresh_with_fewer_rows_clamps_the_selection() {
+        let mut app = app_on_watch_with_domain("a.com");
+        let LensState::Loaded(LensData::Watch(mut report)) = make_watch_state("a.com") else {
+            unreachable!()
+        };
+        let row = report.results[0].clone();
+        report.results = ["a.com", "b.com", "c.com"]
+            .iter()
+            .map(|d| seer_core::WatchResult {
+                domain: d.to_string(),
+                ..row.clone()
+            })
+            .collect();
+        app.states
+            .insert("watch", LensState::Loaded(LensData::Watch(report)));
+        app.sel = 2; // "c.com", the last row
+        app.fetch_gen.insert("watch", 1);
+        // The refresh after removing "c.com" returns one row.
+        app.update(Msg::Data {
+            lens: "watch".into(),
+            gen: 1,
+            result: Ok(make_watch_state_data("a.com")),
+        });
+        assert_eq!(app.sel, 0, "selection must move onto the remaining row");
+        assert_eq!(app.selected_watch_domain().as_deref(), Some("a.com"));
     }
 
     #[test]
