@@ -64,11 +64,8 @@ from seer._seer import (
     whois,
 )
 
-# Forward Rust tracing events into Python logging.
-# Must be called before any seer function so that the subscriber is installed.
-from seer._seer import init_rust_logging as _init_rust_logging
-
-_init_rust_logging()
+# Importing seer._seer also installs the Rust -> Python `logging` bridge
+# (see the #[pymodule_init] hook in seer-py/src/lib.rs).
 
 try:
     from importlib.metadata import version

@@ -1,5 +1,3 @@
-mod bridge;
-
 use std::future::Future;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
@@ -957,55 +955,27 @@ fn _raise_retry_exhausted_for_test(kind: &str) -> PyResult<()> {
     }))
 }
 
-/// Install a tracing subscriber that forwards Rust log events into Python's
-/// ``logging`` module.  Safe to call multiple times — only the first call
-/// takes effect.
-#[pyfunction]
-fn init_rust_logging() {
-    bridge::install_bridge();
-}
-
+/// The `seer._seer` extension module; `python/seer/__init__.py` re-exports
+/// its public functions.
 #[pymodule]
-fn _seer(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(init_rust_logging, m)?)?;
-    m.add_function(wrap_pyfunction!(_json_to_python_nested_for_test, m)?)?;
-    m.add_function(wrap_pyfunction!(_raise_retry_exhausted_for_test, m)?)?;
-    m.add_function(wrap_pyfunction!(validate_public_host, m)?)?;
-    m.add_function(wrap_pyfunction!(lookup, m)?)?;
-    m.add_function(wrap_pyfunction!(whois, m)?)?;
-    m.add_function(wrap_pyfunction!(rdap_domain, m)?)?;
-    m.add_function(wrap_pyfunction!(rdap_ip, m)?)?;
-    m.add_function(wrap_pyfunction!(rdap_asn, m)?)?;
-    m.add_function(wrap_pyfunction!(rdap_auto, m)?)?;
-    m.add_function(wrap_pyfunction!(dig, m)?)?;
-    m.add_function(wrap_pyfunction!(propagation, m)?)?;
-    m.add_function(wrap_pyfunction!(status, m)?)?;
-    m.add_function(wrap_pyfunction!(bulk_lookup, m)?)?;
-    m.add_function(wrap_pyfunction!(bulk_whois, m)?)?;
-    m.add_function(wrap_pyfunction!(bulk_dig, m)?)?;
-    m.add_function(wrap_pyfunction!(bulk_propagation, m)?)?;
-    m.add_function(wrap_pyfunction!(bulk_status, m)?)?;
-    m.add_function(wrap_pyfunction!(bulk_ssl, m)?)?;
-    m.add_function(wrap_pyfunction!(bulk_availability, m)?)?;
-    m.add_function(wrap_pyfunction!(availability, m)?)?;
-    m.add_function(wrap_pyfunction!(subdomains, m)?)?;
-    m.add_function(wrap_pyfunction!(ssl, m)?)?;
-    m.add_function(wrap_pyfunction!(dnssec, m)?)?;
-    m.add_function(wrap_pyfunction!(delegation, m)?)?;
-    m.add_function(wrap_pyfunction!(caa, m)?)?;
-    m.add_function(wrap_pyfunction!(posture, m)?)?;
-    m.add_function(wrap_pyfunction!(headers, m)?)?;
-    m.add_function(wrap_pyfunction!(takeover, m)?)?;
-    m.add_function(wrap_pyfunction!(confusables, m)?)?;
-    m.add_function(wrap_pyfunction!(subdomains_classify, m)?)?;
-    m.add_function(wrap_pyfunction!(dns_compare, m)?)?;
-    m.add_function(wrap_pyfunction!(dns_follow, m)?)?;
-    m.add_function(wrap_pyfunction!(cancel_follow, m)?)?;
-    m.add_function(wrap_pyfunction!(diff, m)?)?;
-    m.add_function(wrap_pyfunction!(info, m)?)?;
-    m.add_function(wrap_pyfunction!(bulk_info, m)?)?;
-    m.add_function(wrap_pyfunction!(tld_info, m)?)?;
-    m.add_function(wrap_pyfunction!(all_tlds, m)?)?;
-    m.add_function(wrap_pyfunction!(record_types, m)?)?;
-    Ok(())
+mod _seer {
+    #[pymodule_export]
+    use super::{
+        _json_to_python_nested_for_test, _raise_retry_exhausted_for_test, all_tlds, availability,
+        bulk_availability, bulk_dig, bulk_info, bulk_lookup, bulk_propagation, bulk_ssl,
+        bulk_status, bulk_whois, caa, cancel_follow, confusables, delegation, diff, dig,
+        dns_compare, dns_follow, dnssec, headers, info, lookup, posture, propagation, rdap_asn,
+        rdap_auto, rdap_domain, rdap_ip, record_types, ssl, status, subdomains,
+        subdomains_classify, takeover, tld_info, validate_public_host, whois,
+    };
+
+    /// Forwards Rust `log` records into Python's `logging` — and `tracing`
+    /// events too, via tracing's `log` feature, since no tracing subscriber
+    /// is installed inside a Python process. Runs once, at import;
+    /// `try_init` leaves an already-installed logger alone.
+    #[pymodule_init]
+    fn init(_m: &pyo3::Bound<'_, pyo3::types::PyModule>) -> pyo3::PyResult<()> {
+        let _ = pyo3_log::try_init();
+        Ok(())
+    }
 }
