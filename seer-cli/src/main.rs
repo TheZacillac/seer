@@ -841,9 +841,9 @@ async fn execute_command(
             // A run with zero successes is a total failure (network down,
             // every domain malformed) — scripted callers gate on $?.
             let success_count = results.iter().filter(|r| r.success).count();
-            let exit_code = utils::bulk_exit_code(success_count, results.len());
-            if exit_code != 0 {
-                std::process::exit(exit_code);
+            let code = utils::bulk_exit_code(success_count, results.len());
+            if code != 0 {
+                std::process::exit(code);
             }
             return Ok(());
         }
