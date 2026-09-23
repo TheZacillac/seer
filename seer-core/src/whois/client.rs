@@ -237,8 +237,8 @@ impl WhoisClient {
                             // its registrar/dates/status, and a registrar's
                             // throttle or refusal body ("connection limit
                             // exceeded") must not swap that for all-None.
-                            if !has_registration_data(&referral_response)
-                                && has_registry_data(&current_response)
+                            if !referral_response.has_registration_fields()
+                                && current_response.has_any_registry_field()
                             {
                                 debug!(
                                     referral = %referral,
@@ -352,21 +352,6 @@ impl WhoisClient {
             tld
         )))
     }
-}
-
-/// True when a (registrar) response carries registration data worth
-/// preferring over the registry's record: a registrar or a registration date.
-fn has_registration_data(response: &WhoisResponse) -> bool {
-    response.registrar.is_some()
-        || response.creation_date.is_some()
-        || response.expiration_date.is_some()
-}
-
-/// True when a registry response carries any registration field at all.
-fn has_registry_data(response: &WhoisResponse) -> bool {
-    has_registration_data(response)
-        || !response.nameservers.is_empty()
-        || !response.status.is_empty()
 }
 
 /// Formats the wire query for registries whose port-43 servers need more
@@ -589,7 +574,7 @@ fn is_safe_whois_server(server: &str) -> bool {
     }
     // Reject IP address literals that resolve to private/reserved ranges
     if let Ok(ip) = server.parse::<std::net::IpAddr>() {
-        return !crate::validation::is_private_or_reserved_ip(&ip);
+        return !crate::net::is_reserved_ip(ip);
     }
     true
 }

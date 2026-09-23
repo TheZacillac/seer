@@ -1,7 +1,7 @@
 //! Domain validation and SSRF protection utilities
 
 use std::collections::HashSet;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::IpAddr;
 
 use std::sync::LazyLock;
 
@@ -204,30 +204,10 @@ pub(crate) fn domain_to_ascii(domain: &str) -> Result<String> {
     })
 }
 
-/// Checks if an IP address is in a private or reserved range.
-///
-/// Delegates to [`crate::net::is_reserved_ip`] — the single source of truth for
-/// SSRF range checks across every outbound leg (RDAP, WHOIS, status, DNS) — so
-/// the policy can never drift between call sites. See that function for the full
-/// range list (RFC1918, loopback, link-local + metadata, CGNAT, IETF
-/// 192.0.0.0/24, benchmark, documentation, 0.0.0.0/8, class-E, and the IPv6
-/// ULA / link-local / documentation / 6to4 / NAT64 / IPv4-mapped & -compatible
-/// forms).
-pub fn is_private_or_reserved_ip(ip: &IpAddr) -> bool {
-    crate::net::is_reserved_ip(*ip)
-}
-
-/// Checks if an IPv4 address is private or reserved.
-///
-/// Thin wrapper over [`crate::net::is_reserved_ip`] (kept for the
-/// `describe_reserved_ip` reason logic); the canonical range list lives there.
-fn is_private_or_reserved_ipv4(ip: &Ipv4Addr) -> bool {
-    crate::net::is_reserved_ip(IpAddr::V4(*ip))
-}
-
 /// Returns a human-readable reason why an IP is blocked, or `None` if it is
 /// safe.  Intended for error messages — callers should still use
-/// [`is_private_or_reserved_ip`] for the fast boolean check.
+/// [`crate::net::is_reserved_ip`], the single source of truth for SSRF range
+/// checks, for the fast boolean check.
 pub fn describe_reserved_ip(ip: &IpAddr) -> Option<&'static str> {
     match ip {
         IpAddr::V4(v4) => {
@@ -295,7 +275,7 @@ pub fn describe_reserved_ip(ip: &IpAddr) -> Option<&'static str> {
                 return Some("IPv6 multicast (ff00::/8)");
             }
             if let Some(v4) = v6.to_ipv4_mapped() {
-                if is_private_or_reserved_ipv4(&v4) {
+                if crate::net::is_reserved_ip(IpAddr::V4(v4)) {
                     return Some("IPv4-mapped IPv6 address in private/reserved range");
                 }
             }
@@ -312,7 +292,6 @@ pub fn describe_reserved_ip(ip: &IpAddr) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::Ipv6Addr;
 
     #[test]
     fn allowlist_entry_idn_is_punycoded() {
@@ -525,63 +504,23 @@ mod tests {
     }
 
     #[test]
-    fn test_is_private_or_reserved_ipv4() {
-        // Private networks
-        assert!(is_private_or_reserved_ip(&IpAddr::V4(Ipv4Addr::new(
-            10, 0, 0, 1
-        ))));
-        assert!(is_private_or_reserved_ip(&IpAddr::V4(Ipv4Addr::new(
-            172, 16, 0, 1
-        ))));
-        assert!(is_private_or_reserved_ip(&IpAddr::V4(Ipv4Addr::new(
-            192, 168, 1, 1
-        ))));
-
-        // Loopback
-        assert!(is_private_or_reserved_ip(&IpAddr::V4(Ipv4Addr::new(
-            127, 0, 0, 1
-        ))));
-
-        // Link-local
-        assert!(is_private_or_reserved_ip(&IpAddr::V4(Ipv4Addr::new(
-            169, 254, 1, 1
-        ))));
-
-        // Cloud metadata
-        assert!(is_private_or_reserved_ip(&IpAddr::V4(Ipv4Addr::new(
-            169, 254, 169, 254
-        ))));
-
-        // Public IP (should not be blocked)
-        assert!(!is_private_or_reserved_ip(&IpAddr::V4(Ipv4Addr::new(
-            8, 8, 8, 8
-        ))));
-        assert!(!is_private_or_reserved_ip(&IpAddr::V4(Ipv4Addr::new(
-            1, 1, 1, 1
-        ))));
-    }
-
-    #[test]
-    fn test_is_private_or_reserved_ipv6() {
-        // Loopback
-        assert!(is_private_or_reserved_ip(&IpAddr::V6(Ipv6Addr::new(
-            0, 0, 0, 0, 0, 0, 0, 1
-        ))));
-
-        // Unique local
-        assert!(is_private_or_reserved_ip(&IpAddr::V6(Ipv6Addr::new(
-            0xfc00, 0, 0, 0, 0, 0, 0, 1
-        ))));
-
-        // Link-local
-        assert!(is_private_or_reserved_ip(&IpAddr::V6(Ipv6Addr::new(
-            0xfe80, 0, 0, 0, 0, 0, 0, 1
-        ))));
-
-        // Public IPv6 (should not be blocked)
-        assert!(!is_private_or_reserved_ip(&IpAddr::V6(Ipv6Addr::new(
-            0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888
-        ))));
+    fn reserved_ip_check_blocks_private_ranges_only() {
+        for ip in [
+            "10.0.0.1",
+            "172.16.0.1",
+            "192.168.1.1",
+            "127.0.0.1",
+            "169.254.1.1",
+            "169.254.169.254",
+            "::1",
+            "fc00::1",
+            "fe80::1",
+        ] {
+            assert!(crate::net::is_reserved_ip(ip.parse().unwrap()), "{ip}");
+        }
+        for ip in ["8.8.8.8", "1.1.1.1", "2001:4860:4860::8888"] {
+            assert!(!crate::net::is_reserved_ip(ip.parse().unwrap()), "{ip}");
+        }
     }
 
     #[test]
@@ -600,7 +539,7 @@ mod tests {
                 describe_reserved_ip(&addr).is_some(),
                 "{ip} must be reported reserved"
             );
-            assert!(is_private_or_reserved_ip(&addr), "{ip} bool check");
+            assert!(crate::net::is_reserved_ip(addr), "{ip} bool check");
         }
         // IPv6 transition forms embedding the metadata IP (169.254.169.254).
         for ip in ["64:ff9b::a9fe:a9fe", "2002:a9fe:a9fe::", "::a9fe:a9fe"] {

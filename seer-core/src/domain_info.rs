@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::dates::days_until;
 use crate::lookup::LookupResult;
 use crate::rdap::RdapResponse;
 use crate::whois::WhoisResponse;
@@ -122,13 +123,6 @@ pub fn describe_epp_status(code: &str) -> Option<&'static str> {
         _ => return None,
     };
     Some(desc)
-}
-
-/// Whole days from `now` until `when` — see [`crate::dates::days_until`]:
-/// negative for any instant in the past, so a domain that expired ten hours
-/// ago bands as Expired rather than "expiring soon" (truncation gave `0`).
-fn days_until(when: DateTime<Utc>, now: DateTime<Utc>) -> i64 {
-    crate::dates::days_until(when, now)
 }
 
 /// Derives a coarse [`ExpiryStatus`] band from the days-until-expiration and the

@@ -1,9 +1,9 @@
-use std::collections::HashSet;
-
 use chrono::{DateTime, FixedOffset, Utc};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
+
+use super::parsers::{push_bounded, MAX_NAMESERVERS, MAX_STATUSES};
 
 /// Compiles one `Label: value` pattern per label, matching anywhere on a
 /// line: `(?i)<label>:[ \t]*(.+)`. Labels are regex fragments; a list's order
@@ -288,6 +288,33 @@ impl WhoisResponse {
         }
     }
 
+    /// True when a registrar or a registration date was extracted — what a
+    /// registrar referral must carry to replace the registry's record.
+    pub(crate) fn has_registration_fields(&self) -> bool {
+        self.registrar.is_some() || self.creation_date.is_some() || self.expiration_date.is_some()
+    }
+
+    /// "Thin" = no positive registration signal at all: no registrar, no
+    /// creation/expiry date, and no delegated nameservers. A thin body is what
+    /// blocked or RDAP-first registries return for an unregistered domain.
+    ///
+    /// Nameservers count as registration data because some registries never
+    /// publish a registrar or dates over port 43: DENIC (.de, which has no
+    /// RDAP) returns only `Nserver`/`Status`/`Changed`, so without them every
+    /// registered .de domain read as thin and was reported as "registry detail
+    /// unavailable, retry shortly" with its WHOIS data discarded. Shared by
+    /// [`is_available`](Self::is_available), the availability fallback ladder
+    /// and the smart-lookup routes so they cannot drift.
+    pub(crate) fn is_thin(&self) -> bool {
+        !self.has_registration_fields() && self.nameservers.is_empty()
+    }
+
+    /// True when any registration field at all was extracted: the
+    /// [`is_thin`](Self::is_thin) fields or a status.
+    pub(crate) fn has_any_registry_field(&self) -> bool {
+        !self.is_thin() || !self.status.is_empty()
+    }
+
     /// Returns true if the response contains the core registration fields
     /// that registries typically provide (registrar, dates, nameservers).
     /// When true, following the registrar referral can be skipped since the
@@ -319,12 +346,7 @@ impl WhoisResponse {
         // Only meaningful when we extracted no registration data at all — a
         // record with a registrar / dates / nameservers / status is real data,
         // never a service error.
-        if self.registrar.is_some()
-            || self.creation_date.is_some()
-            || self.expiration_date.is_some()
-            || !self.nameservers.is_empty()
-            || !self.status.is_empty()
-        {
+        if self.has_any_registry_field() {
             return false;
         }
         // Match known service-error sentinels at the start of a (trimmed) line,
@@ -360,11 +382,7 @@ impl WhoisResponse {
         // guards the H6 false-positive class without having to anchor every
         // pattern (which would regress legitimate mid-line phrasings like
         // TWNIC "Domain not found." or HKIRC "...has not been registered.").
-        if self.registrar.is_some()
-            || self.creation_date.is_some()
-            || self.expiration_date.is_some()
-            || !self.nameservers.is_empty()
-        {
+        if !self.is_thin() {
             return false;
         }
 
@@ -869,14 +887,7 @@ pub(crate) fn parse_date_with_order(date_str: &str, order: DateOrder) -> Option<
     None
 }
 
-/// Maximum number of nameservers extracted from a single WHOIS response.
-/// Real domains have ≤ 13 NS records (DNS protocol limit). Cap defensively
-/// to prevent a malicious / malformed registry response from driving
-/// unbounded allocation.
-const MAX_NAMESERVERS: usize = 32;
-
 fn extract_nameservers(text: &str) -> Vec<String> {
-    let mut seen = HashSet::new();
     let mut nameservers = Vec::new();
 
     for re in NAMESERVER_PATTERNS.iter() {
@@ -889,9 +900,7 @@ fn extract_nameservers(text: &str) -> Vec<String> {
                 // e.g., "ns1.example.br 200.1.2.3 2001:db8::1" → "ns1.example.br"
                 let raw = m.as_str().trim();
                 let ns = raw.split_whitespace().next().unwrap_or(raw).to_lowercase();
-                if !ns.is_empty() && seen.insert(ns.clone()) {
-                    nameservers.push(ns);
-                }
+                push_bounded(&mut nameservers, ns, MAX_NAMESERVERS);
             }
         }
     }
@@ -899,18 +908,11 @@ fn extract_nameservers(text: &str) -> Vec<String> {
     nameservers
 }
 
-/// Maximum number of domain-level status codes we extract. EPP defines
-/// ~16 status values; a real domain rarely has more than 5-6. Cap to
-/// prevent a malicious registry response from driving unbounded
-/// allocation.
-const MAX_STATUSES: usize = 32;
-
 /// Extracts Status values only from the top-level domain block of a WHOIS
 /// response. Stops scanning as soon as a RIPE-style `[Section-Header]` line is
 /// encountered, which prevents contact-object `Status:` lines (e.g., inside
 /// `[Tech-C]` blocks) from polluting the domain status list.
 fn extract_status_top_level(raw: &str) -> Vec<String> {
-    let mut seen = HashSet::new();
     let mut statuses = Vec::new();
 
     for line in raw.lines() {
@@ -951,9 +953,7 @@ fn extract_status_top_level(raw: &str) -> Vec<String> {
         if let Some(rest) = value_opt {
             let raw_val = rest.trim();
             if let Some(first) = raw_val.split_whitespace().next() {
-                if !first.is_empty() && seen.insert(first.to_string()) {
-                    statuses.push(first.to_string());
-                }
+                push_bounded(&mut statuses, first.to_string(), MAX_STATUSES);
             }
         }
     }

@@ -86,20 +86,6 @@ fn strip_ipv6(msg: &str) -> String {
 static LOOKUP_CONCURRENT_CALLS: LazyLock<std::sync::atomic::AtomicUsize> =
     LazyLock::new(|| std::sync::atomic::AtomicUsize::new(0));
 
-/// Returns true if the parsed WHOIS response lacks all key registration
-/// signals: no registrar, no creation/expiration date, and no nameservers.
-///
-/// This is a necessary-but-not-sufficient signal for domain availability;
-/// `lookup_concurrent` combines it with an RDAP 404 before routing to the
-/// availability path. Nameservers count as registration data: DENIC (.de,
-/// no RDAP) publishes only nameservers/status/changed date, and treating
-/// that as thin turned every registered .de domain into a data-less
-/// `dns_present` verdict. Delegates to [`crate::availability::whois_is_thin`]
-/// so this path and the dedicated availability ladder cannot drift.
-fn whois_response_is_thin(w: &WhoisResponse) -> bool {
-    crate::availability::whois_is_thin(w)
-}
-
 /// TTL for *degraded* lookup results: verdicts derived from DNS presence or
 /// a registry refusal rather than from registry data (see
 /// [`is_degraded_result`]). Short so a transient rate limit or outage isn't
@@ -163,9 +149,9 @@ fn rdap_response_is_useful(response: &RdapResponse) -> bool {
 /// only possible source of registry data, and for "no match" bodies a late
 /// RDAP 200 must remain able to veto the availability claim (v0.26.6 rule).
 /// Mirrors the RDAP-side [`rdap_response_is_useful`] gate; thinness is
-/// [`whois_response_is_thin`], the same signal the fallback ladders use.
+/// [`WhoisResponse::is_thin`], the same signal the fallback ladders use.
 fn whois_leg_has_data(w: &Result<WhoisResponse>) -> bool {
-    matches!(w, Ok(data) if !whois_response_is_thin(data))
+    matches!(w, Ok(data) if !data.is_thin())
 }
 
 /// Decides whether a WHOIS response + RDAP error combination should route
@@ -181,7 +167,7 @@ fn classify_whois_leg(
     if w.is_available() {
         return Some(("high", "whois"));
     }
-    if whois_response_is_thin(w) && rdap_error_is_404(rdap_err) {
+    if w.is_thin() && rdap_error_is_404(rdap_err) {
         // Must stay in lockstep with `availability::decide_fallback`'s
         // RDAP-404 branch: the registry's own 404 is authoritative, so the
         // verdict is high-confidence via RDAP — not a hedged WHOIS signal.
@@ -913,7 +899,7 @@ impl SmartLookup {
             // reads as registered. The cheap thin / not-200 preconditions gate the
             // DNS probe so we don't pay for it on the common paths, and a refusal
             // short-circuits before the probe entirely.
-            let whois_is_thin = whois_response_is_thin(&whois_data);
+            let whois_is_thin = whois_data.is_thin();
             if whois_is_thin && !rdap_returned_200 {
                 let whois_refuses = whois_data.indicates_registry_refusal();
                 let dns_presence = if whois_refuses {
@@ -1697,7 +1683,7 @@ mod tests {
         assert!(!rdap_error_is_404(&e));
     }
 
-    // ---------------- whois_response_is_thin ----------------
+    // ---------------- WhoisResponse::is_thin ----------------
 
     fn empty_whois(domain: &str) -> WhoisResponse {
         WhoisResponse {
@@ -1709,28 +1695,28 @@ mod tests {
     #[test]
     fn whois_response_is_thin_when_all_key_fields_missing() {
         let w = empty_whois("example.com");
-        assert!(whois_response_is_thin(&w));
+        assert!(w.is_thin());
     }
 
     #[test]
     fn whois_response_is_not_thin_when_registrar_present() {
         let mut w = empty_whois("example.com");
         w.registrar = Some("Test Registrar".to_string());
-        assert!(!whois_response_is_thin(&w));
+        assert!(!w.is_thin());
     }
 
     #[test]
     fn whois_response_is_not_thin_when_creation_date_present() {
         let mut w = empty_whois("example.com");
         w.creation_date = Some(Utc::now());
-        assert!(!whois_response_is_thin(&w));
+        assert!(!w.is_thin());
     }
 
     #[test]
     fn whois_response_is_not_thin_when_expiration_date_present() {
         let mut w = empty_whois("example.com");
         w.expiration_date = Some(Utc::now());
-        assert!(!whois_response_is_thin(&w));
+        assert!(!w.is_thin());
     }
 
     /// DENIC-shaped parsed WHOIS: nameservers, status and a changed date,
@@ -1748,7 +1734,7 @@ mod tests {
     fn whois_response_with_nameservers_is_not_thin() {
         let mut w = empty_whois("example.com");
         w.nameservers = vec!["ns1.example.net".to_string()];
-        assert!(!whois_response_is_thin(&w));
+        assert!(!w.is_thin());
     }
 
     #[test]
@@ -1759,7 +1745,7 @@ mod tests {
         let w = denic_whois();
         let bootstrap_miss =
             SeerError::RdapBootstrapError("no RDAP server for example.de".to_string());
-        assert!(!whois_response_is_thin(&w));
+        assert!(!w.is_thin());
         assert!(whois_leg_has_data(&Ok(w.clone())));
         assert_eq!(
             should_route_to_availability(false, Some(&bootstrap_miss), &w),
@@ -1767,7 +1753,7 @@ mod tests {
         );
         assert_eq!(
             classify_thin_fallback(
-                whois_response_is_thin(&w),
+                w.is_thin(),
                 false,
                 w.indicates_registry_refusal(),
                 DnsPresence::Present,
@@ -2122,7 +2108,7 @@ mod tests {
 
     #[test]
     fn whois_leg_has_data_accepts_registration_data() {
-        // Stays in lockstep with `whois_response_is_thin`: any of the three
+        // Stays in lockstep with `WhoisResponse::is_thin`: any of the three
         // key registration signals makes the leg a data-bearing winner.
         let mut w = empty_whois("example.com");
         w.registrar = Some("Mock Registrar".to_string());

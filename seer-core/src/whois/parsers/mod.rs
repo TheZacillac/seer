@@ -20,15 +20,15 @@ mod sidn;
 
 use super::parser::WhoisResponse;
 
-/// Maximum number of nameservers extracted from a single WHOIS response.
-/// Shared with the generic parser. Real domains have ≤ 13 NS records (DNS
+/// Maximum number of nameservers extracted from a single WHOIS response,
+/// by every parser including the generic one. Real domains have ≤ 13 NS records (DNS
 /// protocol limit); cap defensively so a hostile/malformed registry body of
 /// distinct `nserver:` lines can't drive the O(n) `Vec::contains` dedup into
 /// O(n²) CPU.
 pub(crate) const MAX_NAMESERVERS: usize = 32;
 
-/// Maximum number of domain-level status codes we extract. Shared with the
-/// generic parser. EPP defines ~16 status values; a real domain rarely has
+/// Maximum number of domain-level status codes extracted by every parser,
+/// including the generic one. EPP defines ~16 status values; a real domain rarely has
 /// more than 5-6. Cap to bound CPU/memory against a hostile body.
 pub(crate) const MAX_STATUSES: usize = 32;
 

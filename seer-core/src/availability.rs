@@ -210,25 +210,6 @@ impl AvailabilityChecker {
     }
 }
 
-/// "Thin" WHOIS = no positive registration signal at all: no registrar, no
-/// creation/expiry date, and no delegated nameservers. A thin body is what
-/// blocked or RDAP-first registries return for an unregistered domain.
-///
-/// Nameservers count as registration data because some registries never
-/// publish a registrar or dates over port 43: DENIC (.de, which has no RDAP)
-/// returns only `Nserver`/`Status`/`Changed`, so without them every
-/// registered .de domain read as thin and was reported as "registry detail
-/// unavailable, retry shortly" with its WHOIS data discarded. This matches
-/// [`crate::whois::WhoisResponse::is_available`], which already treats
-/// nameservers as registration data. Shared by this module's fallback ladder
-/// and the smart-lookup routes so the two cannot drift.
-pub(crate) fn whois_is_thin(w: &crate::whois::WhoisResponse) -> bool {
-    w.registrar.is_none()
-        && w.creation_date.is_none()
-        && w.expiration_date.is_none()
-        && w.nameservers.is_empty()
-}
-
 /// Verdict for a name below its registrable domain, derived from the check
 /// of that registrable `parent` (see
 /// [`AvailabilityChecker::guard_subdomain_claim`]).
@@ -324,8 +305,8 @@ fn decide_fallback(
     match whois_result {
         Ok(whois_response) => {
             // "Thin" = no positive registration signal at all (see
-            // `whois_is_thin`).
-            let thin = whois_is_thin(&whois_response);
+            // `WhoisResponse::is_thin`).
+            let thin = whois_response.is_thin();
 
             if whois_response.is_available() {
                 AvailabilityResult {
@@ -1065,8 +1046,8 @@ mod tests {
 
     #[test]
     fn whois_with_nameservers_is_not_thin() {
-        assert!(whois_is_thin(&whois_with("", None)));
-        assert!(!whois_is_thin(&denic_whois()));
+        assert!(whois_with("", None).is_thin());
+        assert!(!denic_whois().is_thin());
     }
 
     #[test]
