@@ -5,33 +5,17 @@ use crate::rdap::RdapResponse;
 use crate::status::StatusResponse;
 use crate::whois::WhoisResponse;
 
-pub struct JsonFormatter {
-    pretty: bool,
-}
-
-impl Default for JsonFormatter {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+/// Pretty-printed JSON output formatter.
+#[derive(Default)]
+pub struct JsonFormatter;
 
 impl JsonFormatter {
     pub fn new() -> Self {
-        Self { pretty: true }
-    }
-
-    pub fn compact(mut self) -> Self {
-        self.pretty = false;
-        self
+        Self
     }
 
     fn to_json<T: serde::Serialize + ?Sized>(&self, value: &T) -> String {
-        if self.pretty {
-            serde_json::to_string_pretty(value)
-                .unwrap_or_else(|e| format!("{{\"error\": \"{}\"}}", e))
-        } else {
-            serde_json::to_string(value).unwrap_or_else(|e| format!("{{\"error\": \"{}\"}}", e))
-        }
+        serde_json::to_string_pretty(value).unwrap_or_else(|e| format!("{{\"error\": \"{}\"}}", e))
     }
 }
 
@@ -155,15 +139,6 @@ mod tests {
         let output = formatter.format_status(&response);
         assert!(output.contains("example.com"));
         assert!(output.contains("domain"));
-    }
-
-    #[test]
-    fn test_json_compact() {
-        let response = StatusResponse::new("example.com".to_string());
-        let formatter = JsonFormatter::new().compact();
-        let output = formatter.format_status(&response);
-        // Compact format should not have newlines within the JSON
-        assert!(!output.contains("\n  "));
     }
 
     #[test]
