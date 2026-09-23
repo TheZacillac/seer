@@ -272,4 +272,19 @@ mod tests {
         assert_eq!(cycle_tab(&lenses()[rdap], 2, true), 0);
         assert_eq!(cycle_tab(&lenses()[rdap], 0, false), 2);
     }
+
+    #[test]
+    fn every_registered_lens_has_a_render_arm() {
+        // Handed another lens's payload, a renderer skips it or draws its
+        // empty state, so only a key missing from `render`'s match can panic
+        // here, via its debug_assert.
+        let theme = Theme::frappe();
+        let data = LensData::History(vec![]);
+        let panes = Panes::default();
+        for l in lenses() {
+            crate::tui::test_util::render_buffer(80, 24, |f| {
+                render(f, f.area(), &theme, l.key, 0, &data, "", false, 0, &panes);
+            });
+        }
+    }
 }
