@@ -5,8 +5,8 @@
 //! and its registration layer ([`crate::whois`], [`crate::rdap`]). This module
 //! covers the remaining one: what the origin actually sends back over HTTP.
 //!
-//! A single SSRF-guarded GET (see [`crate::http`]) is issued against
-//! `https://<domain>`, and the response is graded on three axes:
+//! A single SSRF-guarded GET (every redirect hop re-validated) is issued
+//! against `https://<domain>`, and the response is graded on three axes:
 //!
 //! - **Security headers** — HSTS, CSP, X-Frame-Options, X-Content-Type-Options,
 //!   Referrer-Policy, Permissions-Policy, and the cross-origin isolation trio

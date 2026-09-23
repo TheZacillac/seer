@@ -191,8 +191,9 @@ pub fn is_reserved_ip(ip: IpAddr) -> bool {
 /// `lookup_host`, which resolves services by `(host, port)`.
 ///
 /// Uses the OS resolver (`getaddrinfo`) as the primary path and falls back
-/// to hickory (Google DNS) only when the OS resolver returns an error —
-/// see [`FALLBACK_RESOLVER`] for the security rationale.
+/// to hickory (Google DNS) only when the OS resolver returns an error. A
+/// successful OS answer is never second-guessed: one naming a reserved
+/// address is still refused, not re-resolved through the fallback.
 ///
 /// Returns `Ok(())` when all resolved IPs are public;
 /// `Err(SeerError::InvalidInput)` when the host is (or resolves to) a

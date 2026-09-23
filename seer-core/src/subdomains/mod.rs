@@ -2,8 +2,8 @@
 //!
 //! CT aggregators are operationally flaky, so enumeration is resilient on two
 //! axes: per-source retries that understand crt.sh's transient 404/429/HTML
-//! responses (see [`http`]), and an ordered chain of independent sources (see
-//! [`sources`]) so a downed primary falls through to a fallback provider.
+//! responses, and an ordered chain of independent sources (crt.sh, then
+//! certspotter) so a downed primary falls through to a fallback provider.
 
 #[cfg(feature = "cli")]
 mod baseline;

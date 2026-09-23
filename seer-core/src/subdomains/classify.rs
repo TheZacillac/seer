@@ -24,7 +24,9 @@ const WILDCARD_PROBE_LABEL: &str = "zzzz-seer-wildcard-probe-does-not-exist";
 /// the `concurrency` limit caps parallelism but not total work. 2000 names
 /// (up to ~4000 queries) is a defensible ceiling that covers essentially every
 /// real zone while bounding the DNS fan-out. Names beyond the cap are reported
-/// as skipped rather than silently dropped.
+/// as skipped rather than silently dropped. The public docs of
+/// [`classify_subdomains`] and [`SubdomainClassification::names_skipped`]
+/// state the value; keep them in step.
 const MAX_CLASSIFY_NAMES: usize = 2000;
 
 /// Liveness classification of a single subdomain.
@@ -66,7 +68,7 @@ pub struct SubdomainClassification {
     pub wildcard_detected: bool,
     pub subdomains: Vec<ClassifiedSubdomain>,
     /// Number of enumerated names dropped before classification because the
-    /// input exceeded [`MAX_CLASSIFY_NAMES`]. Zero when nothing was capped.
+    /// input exceeded the 2000-name cap. Zero when nothing was capped.
     /// `#[serde(default)]` keeps older history files (without this field)
     /// deserializable.
     #[serde(default)]
@@ -113,8 +115,8 @@ fn classify_one(
 
 /// Resolves and classifies each name in `names` for `domain`, detecting
 /// wildcard DNS to suppress false-positive "live" verdicts and flagging
-/// dangling CNAMEs to takeover-prone providers. At most [`MAX_CLASSIFY_NAMES`]
-/// names are resolved; any beyond that are reported in
+/// dangling CNAMEs to takeover-prone providers. At most 2000 names are
+/// resolved; any beyond that are reported in
 /// [`SubdomainClassification::names_skipped`]. Runs up to `concurrency`
 /// resolutions at a time.
 pub async fn classify_subdomains(

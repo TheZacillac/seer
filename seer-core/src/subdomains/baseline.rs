@@ -30,7 +30,8 @@ use serde::{Deserialize, Serialize};
 
 /// Maximum number of distinct domains retained. When exceeded, the domain
 /// with the oldest baseline is evicted (same bounded-growth rationale as
-/// `history.rs` — issue #59).
+/// `history.rs` — issue #59). The public docs of
+/// [`SubdomainBaselines::record`] state the value; keep them in step.
 const MAX_DOMAINS: usize = 1000;
 
 /// A stored subdomain baseline for one domain: the name set from a single
@@ -137,7 +138,7 @@ crate::fsutil::persisted_store!(
 impl SubdomainBaselines {
     /// Records `names` into the baseline for `domain`, merging them with any
     /// previously recorded names. Evicts the oldest-recorded domain when the
-    /// store exceeds [`MAX_DOMAINS`].
+    /// store exceeds 1000 domains.
     ///
     /// Merging rather than replacing follows from the module's premise: a
     /// name missing from a run is almost always aggregator truncation, not a

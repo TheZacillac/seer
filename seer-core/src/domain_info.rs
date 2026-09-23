@@ -36,7 +36,8 @@ impl std::fmt::Display for DomainInfoSource {
 
 /// Number of days before expiration at which a domain is flagged as
 /// "expiring soon" by [`ExpiryStatus`]. Mirrors common registrar grace
-/// windows and the watchlist's near-expiry alerting.
+/// windows and the watchlist's near-expiry alerting. The public docs of
+/// [`ExpiryStatus::ExpiringSoon`] state the value; keep them in step.
 const EXPIRING_SOON_DAYS: i64 = 30;
 
 /// A coarse lifecycle band for a domain's registration, derived from its
@@ -46,7 +47,7 @@ const EXPIRING_SOON_DAYS: i64 = 30;
 pub enum ExpiryStatus {
     /// Registered and not near expiry.
     Active,
-    /// Within [`EXPIRING_SOON_DAYS`] of the expiration date.
+    /// Within 30 days of the expiration date.
     ExpiringSoon,
     /// Past the expiration date (may still be recoverable — see `Redemption`).
     Expired,
