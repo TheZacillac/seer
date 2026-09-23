@@ -1,7 +1,5 @@
 use chrono::{DateTime, TimeDelta, Utc};
 use colored::ColoredString;
-use regex::Regex;
-use std::sync::LazyLock;
 
 use super::OutputFormatter;
 
@@ -29,14 +27,13 @@ mod security;
 mod status;
 mod whois;
 
-/// Strips ANSI escape sequences from untrusted external strings to prevent
-/// terminal injection via malicious WHOIS/RDAP response data. The OSC branch
-/// accepts both BEL (`\x07`) and ST (`\x1b\\`) terminators (and excludes ESC
-/// from the payload run so it can't over-consume across sequences).
-static ANSI_ESCAPE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\x1b\[[0-9;]*[a-zA-Z]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[A-Z@-_]")
-        .expect("Invalid ANSI escape regex")
-});
+static_regex! {
+    /// Strips ANSI escape sequences from untrusted external strings to prevent
+    /// terminal injection via malicious WHOIS/RDAP response data. The OSC branch
+    /// accepts both BEL (`\x07`) and ST (`\x1b\\`) terminators (and excludes ESC
+    /// from the payload run so it can't over-consume across sequences).
+    ANSI_ESCAPE_RE = r"\x1b\[[0-9;]*[a-zA-Z]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[A-Z@-_]";
+}
 
 /// Sanitizes untrusted external text (WHOIS/RDAP field values) for safe display
 /// on a terminal. First removes well-formed ANSI escape sequences, then drops
