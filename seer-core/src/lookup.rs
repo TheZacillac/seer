@@ -555,7 +555,7 @@ pub(crate) fn trim_raw_response(mut result: LookupResult) -> LookupResult {
     result
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SmartLookup {
     rdap_client: RdapClient,
     whois_client: WhoisClient,
@@ -563,22 +563,11 @@ pub struct SmartLookup {
     dns_resolver: DnsResolver,
 }
 
-impl Default for SmartLookup {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl SmartLookup {
     /// Creates a new SmartLookup that runs RDAP and WHOIS concurrently,
     /// falling back to an availability check if both fail.
     pub fn new() -> Self {
-        Self {
-            rdap_client: RdapClient::new(),
-            whois_client: WhoisClient::new(),
-            availability_checker: AvailabilityChecker::new(),
-            dns_resolver: DnsResolver::new(),
-        }
+        Self::default()
     }
 
     /// Builds a SmartLookup whose RDAP/WHOIS/DNS sub-clients honor the

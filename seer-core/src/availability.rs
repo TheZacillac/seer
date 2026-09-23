@@ -84,26 +84,16 @@ pub(crate) enum PriorWhois {
 }
 
 /// Checks domain availability by attempting lookups and interpreting failures.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct AvailabilityChecker {
     rdap_client: RdapClient,
     whois_client: WhoisClient,
     dns_resolver: DnsResolver,
 }
 
-impl Default for AvailabilityChecker {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl AvailabilityChecker {
     pub fn new() -> Self {
-        Self {
-            rdap_client: RdapClient::new(),
-            whois_client: WhoisClient::new(),
-            dns_resolver: DnsResolver::new(),
-        }
+        Self::default()
     }
 
     /// Builds a checker whose sub-clients honor the timeouts in `config`.

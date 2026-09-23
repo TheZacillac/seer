@@ -43,23 +43,15 @@ pub struct SslDiff {
 }
 
 /// Compares two domains by running lookups and status checks concurrently.
+#[derive(Default)]
 pub struct DomainDiffer {
     lookup: SmartLookup,
     status_client: StatusClient,
 }
 
-impl Default for DomainDiffer {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl DomainDiffer {
     pub fn new() -> Self {
-        Self {
-            lookup: SmartLookup::new(),
-            status_client: StatusClient::new(),
-        }
+        Self::default()
     }
 
     /// Compares two domains, returning their registration, DNS, and SSL differences.
