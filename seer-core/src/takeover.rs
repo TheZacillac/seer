@@ -432,10 +432,11 @@ pub(crate) async fn resolve_host(resolver: &DnsResolver, host: &str) -> HostReso
     let mut lookup_error = None;
     for result in [a, aaaa] {
         match result {
-            Ok(records) => addresses.extend(records.iter().filter_map(|r| match &r.data {
-                RecordData::A { address } | RecordData::AAAA { address } => Some(address.clone()),
-                _ => None,
-            })),
+            Ok(records) => addresses.extend(
+                records
+                    .iter()
+                    .filter_map(|r| r.data.address().map(str::to_string)),
+            ),
             // `resolve` maps NXDOMAIN/NODATA to an empty Ok, so an Err here is
             // a genuine failure to get an answer.
             Err(e) => lookup_error = Some(e.sanitized_message()),

@@ -281,6 +281,14 @@ impl fmt::Display for RecordData {
 }
 
 impl RecordData {
+    /// The address of an A or AAAA record; `None` for any other type.
+    pub(crate) fn address(&self) -> Option<&str> {
+        match self {
+            RecordData::A { address } | RecordData::AAAA { address } => Some(address),
+            _ => None,
+        }
+    }
+
     /// The record's value as an equality key for cross-server / cross-time
     /// comparison (compare, follow, propagation).
     ///

@@ -229,21 +229,13 @@ impl PropagationChecker {
                         resolver.resolve(&ns, RecordType::A, Some(&server_ip)),
                         resolver.resolve(&ns, RecordType::AAAA, Some(&server_ip)),
                     );
-                    let mut ips: Vec<String> = Vec::new();
-                    if let Ok(records) = a_res {
-                        for r in &records {
-                            if let RecordData::A { address } = &r.data {
-                                ips.push(address.clone());
-                            }
-                        }
-                    }
-                    if let Ok(records) = aaaa_res {
-                        for r in &records {
-                            if let RecordData::AAAA { address } = &r.data {
-                                ips.push(address.clone());
-                            }
-                        }
-                    }
+                    // A failed lookup contributes no addresses.
+                    let mut ips: Vec<String> = [a_res, aaaa_res]
+                        .into_iter()
+                        .flatten()
+                        .flatten()
+                        .filter_map(|r| r.data.address().map(str::to_string))
+                        .collect();
                     ips.sort();
                     ips.dedup();
                     (server_ip, ns, ips)
