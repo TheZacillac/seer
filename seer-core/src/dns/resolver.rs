@@ -149,12 +149,12 @@ pub(crate) fn fqdn(name: &str) -> String {
 /// Build the hickory upstream config for a parsed nameserver spec and its
 /// resolved (and already SSRF-validated) addresses.
 ///
-/// One `NameServerConfig` is added per IP, all speaking the spec's protocol
-/// on the spec's port. For DoT/DoH the TLS server name is the spec's host —
-/// the hostname when one was given, or the IP literal itself (verified
-/// against the certificate's IP SANs, which the major public resolvers
-/// carry). `port_override` is the `#[cfg(test)]` mock-server seam and is
-/// always `None` in production.
+/// One `NameServerConfig` is added per IP (IPv4 first, see below), all
+/// speaking the spec's protocol on the spec's port. For DoT/DoH the TLS
+/// server name is the spec's host — the hostname when one was given, or the
+/// IP literal itself (verified against the certificate's IP SANs, which the
+/// major public resolvers carry). `port_override` is the `#[cfg(test)]`
+/// mock-server seam and is always `None` in production.
 fn build_upstream_config(
     spec: &NameserverSpec,
     ips: &[IpAddr],
@@ -162,7 +162,21 @@ fn build_upstream_config(
 ) -> ResolverConfig {
     let mut config = ResolverConfig::from_parts(None, vec![], vec![]);
     let port = port_override.unwrap_or(spec.port);
-    for ip in ips {
+    // IPv4 before IPv6, each family keeping its resolved order — the same
+    // shape as the default `GOOGLE` group. The pool is pinned to
+    // `UserProvidedOrder` (see `apply_standard_opts`) and races its first
+    // `num_concurrent_reqs` (2) entries under one deadline equal to the
+    // per-query timeout, so list order decides which addresses get tried.
+    // hickory's `lookup_ip` returns AAAA before A, so a dual-stack hostname
+    // (`dns.google`, `https://cloudflare-dns.com/dns-query`) led with two
+    // IPv6 entries; with black-holed IPv6 transit they spent the whole
+    // deadline and the IPv4 entries were never reached. IPv6 stays as
+    // fallback: on an IPv6-only host IPv4 sends fail fast (ENETUNREACH).
+    let ordered = ips
+        .iter()
+        .filter(|ip| ip.is_ipv4())
+        .chain(ips.iter().filter(|ip| ip.is_ipv6()));
+    for ip in ordered {
         let mut ns = match spec.protocol {
             NameserverProtocol::Udp => NameServerConfig::udp(*ip),
             NameserverProtocol::Tls => NameServerConfig::tls(*ip, Arc::from(spec.tls_name())),
@@ -1363,6 +1377,40 @@ mod tests {
                 ProtocolConfig::Tls { server_name } if &**server_name == "dns.quad9.net"
             ));
         }
+    }
+
+    /// Regression: every dual-stack hostname nameserver (`dns.google`,
+    /// `tls://one.one.one.one`, `https://cloudflare-dns.com/dns-query`) timed
+    /// out on hosts with an IPv6 default route but no IPv6 transit, while IP
+    /// literals worked. The bootstrap `lookup_ip` returns AAAA before A, the
+    /// upstream list kept that order, and the pool's first parallel pair was
+    /// both IPv6 — which spent the whole per-query deadline before any IPv4
+    /// entry was tried.
+    #[test]
+    fn upstream_config_orders_ipv4_before_ipv6() {
+        // As hickory's `lookup_ip` returns them: AAAA records first.
+        let ips: Vec<IpAddr> = [
+            "2606:4700::6810:f8f9",
+            "2606:4700::6810:f9f9",
+            "104.16.248.249",
+            "104.16.249.249",
+        ]
+        .iter()
+        .map(|s| s.parse().unwrap())
+        .collect();
+        let config =
+            build_upstream_config(&spec("https://cloudflare-dns.com/dns-query"), &ips, None);
+        let order: Vec<IpAddr> = config.name_servers().iter().map(|ns| ns.ip).collect();
+        assert_eq!(
+            order,
+            [ips[2], ips[3], ips[0], ips[1]],
+            "IPv4 first, each family in resolved order, nothing dropped"
+        );
+        let concurrent = ResolverOpts::default().num_concurrent_reqs.max(1);
+        assert!(
+            order.iter().take(concurrent).all(IpAddr::is_ipv4),
+            "the parallel window must be all IPv4: {order:?}"
+        );
     }
 
     #[test]
