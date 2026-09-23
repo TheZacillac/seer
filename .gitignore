@@ -3,29 +3,13 @@
 **/*.rs.bk
 *.pdb
 
-# Python
+# Python (hatchling/maturin build output, compiled extension, bytecode)
 __pycache__/
 *.py[cod]
-*$py.class
 *.so
-.Python
 build/
-develop-eggs/
 dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-share/python-wheels/
 *.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
 
 # Virtual environments
 .venv/
@@ -44,9 +28,6 @@ seer-py/target/
 *.swp
 *.swo
 *~
-.project
-.pydevproject
-.settings/
 
 # OS
 .DS_Store
@@ -61,12 +42,7 @@ Thumbs.db
 .pytest_cache/
 .coverage
 htmlcov/
-.tox/
-.nox/
 coverage.xml
-*.cover
-*.py,cover
-.hypothesis/
 
 # Logs
 *.log
@@ -79,8 +55,9 @@ logs/
 .envrc
 *.local
 
-# Claude Code worktrees (local, ephemeral)
+# Claude Code local state: worktrees and runtime lock files
 .claude/worktrees/
+.claude/*.lock
 
 # AI planning scratch (superpowers skill); archived outside the repo
 docs/superpowers/
