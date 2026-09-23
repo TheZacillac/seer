@@ -37,17 +37,15 @@
 //! generic `AVAILABILITY_PATTERNS`, so this parser does not special-case them.
 
 use chrono::{DateTime, Utc};
-use regex::Regex;
-use std::sync::LazyLock;
 
 use super::{push_bounded, MAX_NAMESERVERS, MAX_STATUSES};
 use crate::whois::parser::WhoisResponse;
 
-static KEY_VALUE: LazyLock<Regex> = LazyLock::new(|| {
+static_regex! {
     // `key:   value` lines. EIS fields are flush-left, with multiple spaces
     // padding before the value. Keys may contain spaces (e.g. `org id`).
-    Regex::new(r"^([a-z][a-z0-9 ]*):\s*(.+?)\s*$").expect("Invalid EIS key/value regex")
-});
+    KEY_VALUE = r"^([a-z][a-z0-9 ]*):\s*(.+?)\s*$";
+}
 
 /// Known section headers. We can't generically match `Foo:` as a section
 /// because empty-value fields like `outzone:` would be ambiguous. Whitelist

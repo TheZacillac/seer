@@ -1,3 +1,18 @@
+/// Declares lazily compiled `static` regexes, one `NAME = r"pattern";` per
+/// entry (doc comments and a visibility may precede each). Patterns are
+/// literals, so an invalid one panics on first use — which every parser's
+/// tests exercise.
+macro_rules! static_regex {
+    ($($(#[$meta:meta])* $vis:vis $name:ident = $re:literal;)+) => {
+        $(
+            $(#[$meta])*
+            $vis static $name: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+                regex::Regex::new($re).expect(concat!("invalid regex ", stringify!($name)))
+            });
+        )+
+    };
+}
+
 pub mod availability;
 pub mod bulk;
 pub mod caa;

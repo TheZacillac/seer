@@ -795,9 +795,9 @@ pub(crate) enum DateOrder {
 /// per-registry) evidence, fixing US `MM/DD/YYYY` registries without a fragile
 /// server table (issue #47).
 fn infer_date_order<'a>(candidates: impl IntoIterator<Item = &'a str>) -> Option<DateOrder> {
-    static NUMERIC_DATE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"^\s*(\d{1,2})[/.](\d{1,2})[/.]\d{4}\b").expect("numeric date")
-    });
+    static_regex! {
+        NUMERIC_DATE = r"^\s*(\d{1,2})[/.](\d{1,2})[/.]\d{4}\b";
+    }
     for s in candidates {
         if let Some(c) = NUMERIC_DATE.captures(s) {
             if let (Ok(a), Ok(b)) = (c[1].parse::<u32>(), c[2].parse::<u32>()) {

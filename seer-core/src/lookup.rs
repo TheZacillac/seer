@@ -5,7 +5,6 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
 use tokio::sync::Notify;
@@ -53,19 +52,17 @@ static LOOKUP_CACHE: LazyLock<TtlCache<String, LookupResult>> =
 static LOOKUP_INFLIGHT: LazyLock<Mutex<HashMap<String, Weak<Notify>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// Regex patterns for stripping IP literals from public error messages.
-static IPV4_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\b(?:\d{1,3}\.){3}\d{1,3}\b").expect("IPV4_RE is a valid regex"));
+// Regex patterns for stripping IP literals from public error messages.
+static_regex! {
+    IPV4_RE = r"\b(?:\d{1,3}\.){3}\d{1,3}\b";
 
-/// Candidate pattern for IPv6 literals: a hex/colon token containing either
-/// a `::` compression or at least three colons. This catches plausible IPv6
-/// addresses cheaply; each match is then validated by `Ipv6Addr::from_str`
-/// before redaction, so MAC fragments, hex hashes, and similar colon-laden
-/// tokens are left alone.
-static IPV6_CANDIDATE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\b[0-9a-fA-F:]*(?:::|(?:[0-9a-fA-F]{1,4}:){3,})[0-9a-fA-F:]*\b")
-        .expect("IPV6_CANDIDATE_RE is a valid regex")
-});
+    /// Candidate pattern for IPv6 literals: a hex/colon token containing either
+    /// a `::` compression or at least three colons. This catches plausible IPv6
+    /// addresses cheaply; each match is then validated by `Ipv6Addr::from_str`
+    /// before redaction, so MAC fragments, hex hashes, and similar colon-laden
+    /// tokens are left alone.
+    IPV6_CANDIDATE_RE = r"\b[0-9a-fA-F:]*(?:::|(?:[0-9a-fA-F]{1,4}:){3,})[0-9a-fA-F:]*\b";
+}
 
 /// Redact substrings that parse as valid IPv6 addresses, leaving non-IPv6
 /// tokens (e.g. `af:ba:12`) untouched.

@@ -27,49 +27,25 @@
 //! ```
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
-use regex::Regex;
-use std::sync::LazyLock;
 
 use super::{push_bounded, MAX_NAMESERVERS, MAX_STATUSES};
 use crate::whois::parser::WhoisResponse;
 
-static DOMAIN_PATTERN: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)^Domain:\s*(.+)$").expect("Invalid NIC.it domain regex"));
+static_regex! {
+    DOMAIN_PATTERN = r"(?i)^Domain:\s*(.+)$";
+    STATUS_PATTERN = r"(?i)^Status:\s*(.+)$";
+    CREATED_PATTERN = r"(?i)^Created:\s*(.+)$";
+    EXPIRE_PATTERN = r"(?i)^Expire Date:\s*(.+)$";
+    LAST_UPDATE_PATTERN = r"(?i)^Last Update:\s*(.+)$";
+    SIGNED_PATTERN = r"(?i)^Signed:\s*(.+)$";
 
-static STATUS_PATTERN: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)^Status:\s*(.+)$").expect("Invalid NIC.it status regex"));
-
-static CREATED_PATTERN: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)^Created:\s*(.+)$").expect("Invalid NIC.it created regex"));
-
-static EXPIRE_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)^Expire Date:\s*(.+)$").expect("Invalid NIC.it expire regex")
-});
-
-static LAST_UPDATE_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)^Last Update:\s*(.+)$").expect("Invalid NIC.it last update regex")
-});
-
-static SIGNED_PATTERN: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)^Signed:\s*(.+)$").expect("Invalid NIC.it signed regex"));
-
-/// Section headers (no colon)
-static REGISTRANT_SECTION: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)^Registrant\s*$").expect("Invalid NIC.it registrant regex"));
-
-static ADMIN_SECTION: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)^Admin Contact\s*$").expect("Invalid NIC.it admin regex"));
-
-static TECH_SECTION: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)^Technical Contacts\s*$").expect("Invalid NIC.it tech regex")
-});
-
-static REGISTRAR_SECTION: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)^Registrar\s*$").expect("Invalid NIC.it registrar regex"));
-
-static NAMESERVERS_SECTION: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)^Nameservers\s*$").expect("Invalid NIC.it nameservers regex")
-});
+    /// Section headers (no colon)
+    REGISTRANT_SECTION = r"(?i)^Registrant\s*$";
+    ADMIN_SECTION = r"(?i)^Admin Contact\s*$";
+    TECH_SECTION = r"(?i)^Technical Contacts\s*$";
+    REGISTRAR_SECTION = r"(?i)^Registrar\s*$";
+    NAMESERVERS_SECTION = r"(?i)^Nameservers\s*$";
+}
 
 /// TLDs this parser handles.
 pub(super) const TLDS: &[&str] = &["it"];

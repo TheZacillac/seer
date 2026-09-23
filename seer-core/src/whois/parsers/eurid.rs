@@ -23,27 +23,16 @@
 //!         ns2bru.europa.eu (147.67.250.3)
 //! ```
 
-use regex::Regex;
-use std::sync::LazyLock;
-
 use super::{push_bounded, MAX_NAMESERVERS};
 use crate::whois::parser::WhoisResponse;
 
-static REGISTRANT_SECTION: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)^Registrant:\s*$").expect("Invalid EURid registrant regex"));
-
-static TECHNICAL_SECTION: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)^Technical:\s*$").expect("Invalid EURid technical regex"));
-
-static REGISTRAR_SECTION: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)^Registrar:\s*$").expect("Invalid EURid registrar regex"));
-
-static NAME_SERVERS_SECTION: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)^Name servers:\s*$").expect("Invalid EURid name servers regex")
-});
-
-static KEYS_SECTION: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)^Keys:\s*$").expect("Invalid EURid keys regex"));
+static_regex! {
+    REGISTRANT_SECTION = r"(?i)^Registrant:\s*$";
+    TECHNICAL_SECTION = r"(?i)^Technical:\s*$";
+    REGISTRAR_SECTION = r"(?i)^Registrar:\s*$";
+    NAME_SERVERS_SECTION = r"(?i)^Name servers:\s*$";
+    KEYS_SECTION = r"(?i)^Keys:\s*$";
+}
 
 /// TLDs this parser handles.
 /// whois.eu also serves the IDN ccTLDs .ею (Cyrillic) and .ευ

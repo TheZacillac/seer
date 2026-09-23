@@ -23,35 +23,19 @@
 //! ```
 
 use chrono::{DateTime, NaiveDate, Utc};
-use regex::Regex;
-use std::sync::LazyLock;
 
 use super::{push_bounded, MAX_NAMESERVERS, MAX_STATUSES};
 use crate::whois::parser::WhoisResponse;
 
-static STATUS_PATTERN: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)^Status:\s*(.+)$").expect("Invalid SIDN status regex"));
-
-static DNSSEC_PATTERN: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)^DNSSEC:\s*(.+)$").expect("Invalid SIDN DNSSEC regex"));
-
-static CREATION_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)^Creation Date:\s*(.+)$").expect("Invalid SIDN creation date regex")
-});
-
-static UPDATED_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)^Updated Date:\s*(.+)$").expect("Invalid SIDN updated date regex")
-});
-
-static REGISTRAR_SECTION: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)^Registrar:\s*$").expect("Invalid SIDN registrar regex"));
-
-static ABUSE_SECTION: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)^Abuse Contact:\s*$").expect("Invalid SIDN abuse regex"));
-
-static NAMESERVERS_SECTION: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)^Domain nameservers:\s*$").expect("Invalid SIDN nameservers regex")
-});
+static_regex! {
+    STATUS_PATTERN = r"(?i)^Status:\s*(.+)$";
+    DNSSEC_PATTERN = r"(?i)^DNSSEC:\s*(.+)$";
+    CREATION_PATTERN = r"(?i)^Creation Date:\s*(.+)$";
+    UPDATED_PATTERN = r"(?i)^Updated Date:\s*(.+)$";
+    REGISTRAR_SECTION = r"(?i)^Registrar:\s*$";
+    ABUSE_SECTION = r"(?i)^Abuse Contact:\s*$";
+    NAMESERVERS_SECTION = r"(?i)^Domain nameservers:\s*$";
+}
 
 /// TLDs this parser handles.
 pub(super) const TLDS: &[&str] = &["nl"];
