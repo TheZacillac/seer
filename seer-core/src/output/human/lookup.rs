@@ -127,6 +127,20 @@ impl HumanFormatter {
                                 self.value(&sanitize_display(phone))
                             ));
                         }
+                        if let Some(ref address) = contact.address {
+                            output.push(format!(
+                                "    {}: {}",
+                                self.label("Address"),
+                                self.value(&sanitize_display(address))
+                            ));
+                        }
+                        if let Some(ref country) = contact.country {
+                            output.push(format!(
+                                "    {}: {}",
+                                self.label("Country"),
+                                self.value(&sanitize_display(country))
+                            ));
+                        }
                     }
                 }
 
@@ -160,6 +174,20 @@ impl HumanFormatter {
                                 "    {}: {}",
                                 self.label("Phone"),
                                 self.value(&sanitize_display(phone))
+                            ));
+                        }
+                        if let Some(ref address) = contact.address {
+                            output.push(format!(
+                                "    {}: {}",
+                                self.label("Address"),
+                                self.value(&sanitize_display(address))
+                            ));
+                        }
+                        if let Some(ref country) = contact.country {
+                            output.push(format!(
+                                "    {}: {}",
+                                self.label("Country"),
+                                self.value(&sanitize_display(country))
                             ));
                         }
                     }
@@ -913,6 +941,39 @@ mod tests {
         let out = formatter().format_lookup(&result);
         assert_eq!(out.matches("Registrant Contact").count(), 1, "got:\n{out}");
         assert!(out.contains("Email: owner@example.com"), "got:\n{out}");
+    }
+
+    #[test]
+    fn format_lookup_rdap_admin_and_tech_show_postal_details() {
+        // The lookup view rendered RDAP admin/tech contacts with the WHOIS
+        // field set (name/org/email/phone) and dropped the address and
+        // country that `seer rdap` and markdown lookup both show.
+        let entities = ["administrative", "technical"].map(|role| {
+            serde_json::json!({
+                "objectClassName": "entity",
+                "roles": [role],
+                "vcardArray": ["vcard", [
+                    ["fn", {}, "text", format!("{role} person")],
+                    ["adr", {}, "text", ["", "", "1 Main St", "Springfield", "", "", "US"]]
+                ]]
+            })
+        });
+        let rdap: RdapResponse = serde_json::from_value(serde_json::json!({
+            "ldhName": "example.com",
+            "entities": entities,
+        }))
+        .unwrap();
+        let result = LookupResult::Rdap {
+            data: Box::new(rdap),
+            whois_fallback: None,
+        };
+        let out = formatter().format_lookup(&result);
+        assert_eq!(
+            out.matches("Address: 1 Main St, Springfield, US").count(),
+            2,
+            "got:\n{out}"
+        );
+        assert_eq!(out.matches("Country: US").count(), 2, "got:\n{out}");
     }
 
     #[test]
