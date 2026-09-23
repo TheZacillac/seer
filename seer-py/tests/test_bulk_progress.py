@@ -5,16 +5,11 @@ gated behind SEER_LIVE_TESTS=1. Running ``pytest`` without that env var will
 skip them cleanly. To run them: ``SEER_LIVE_TESTS=1 pytest``.
 """
 
-import os
-
 import pytest
 
 import seer
 
-pytestmark = pytest.mark.skipif(
-    os.environ.get("SEER_LIVE_TESTS") != "1",
-    reason="live network test; set SEER_LIVE_TESTS=1 to run",
-)
+pytestmark = pytest.mark.live
 
 
 def test_progress_callback_invoked_once_per_item():
