@@ -20,6 +20,7 @@ use crate::caa::{self, CaaPolicy};
 use crate::dns::DnsResolver;
 use crate::error::{Result, SeerError};
 use crate::net::resolve_public_host;
+use crate::tls::PresentedChain;
 use crate::validation::normalize_host;
 
 /// Default timeout for SSL operations (10 seconds).
@@ -120,9 +121,10 @@ fn derive_cert_warnings(
 pub struct SslReport {
     /// The domain that was inspected
     pub domain: String,
-    /// Certificate chain from leaf to root (as many as the server provides)
+    /// Certificate chain as the server presented it, leaf first (servers
+    /// usually omit the root)
     pub chain: Vec<CertDetail>,
-    /// TLS protocol version (best-effort detection)
+    /// Negotiated TLS protocol version (`"TLSv1.3"` or `"TLSv1.2"`)
     pub protocol_version: Option<String>,
     /// Subject Alternative Names from the leaf certificate
     pub san_names: Vec<String>,
@@ -301,54 +303,75 @@ impl SslChecker {
         let presented =
             crate::tls::inspect(&domain, &socket_addrs, self.timeout, SeerError::SslError).await?;
 
-        // Parse leaf certificate with x509-parser
-        let (_, x509) = X509Certificate::from_der(&presented.leaf)
-            .map_err(|e| SeerError::SslError(format!("Failed to parse certificate: {}", e)))?;
-
-        // Extract SANs from the leaf certificate
-        let san_names = extract_sans(&x509);
-
-        // Build the certificate chain (leaf only, as native-tls exposed)
-        let leaf_detail = parse_cert_detail(&x509)?;
-
-        let now = Utc::now();
-        let days_until_expiry = crate::dates::days_until(leaf_detail.valid_until, now);
-        let is_valid = now >= leaf_detail.valid_from && now <= leaf_detail.valid_until;
-
-        // Hostname verification: does the leaf cert's SAN (or CN fallback)
-        // match the requested domain? This is independent of `is_valid` and of
-        // chain trust (which is not verified here — see the field docs). Lets
-        // consumers tell a date-valid-but-wrong-host cert apart from a real
-        // match. Per RFC 6125 §6.4.4 the CN is consulted ONLY when the cert
-        // presents no identifier SANs at all; if any dNSName/IPAddress SAN is
-        // present the CN must be ignored, otherwise a cert whose SANs cover
-        // other hosts but whose CN happens to match would falsely verify.
-        let hostname_verified = san_names
-            .iter()
-            .any(|san| hostname_matches_pattern(&domain, san))
-            || (san_names.is_empty() && subject_cn_matches_host(&x509, &domain));
-
-        // Annotate the CAA policy with the issuer comparison before
-        // attaching it to the report.
-        let mut caa_policy = caa_policy;
-        caa_policy.issuer_match = Some(caa::classify_issuer(&leaf_detail.issuer, &caa_policy));
-
-        // Derive posture warnings from the parsed leaf (pure post-processing).
-        let warnings =
-            derive_cert_warnings(&leaf_detail, is_valid, hostname_verified, days_until_expiry);
-
-        Ok(SslReport {
-            domain,
-            chain: vec![leaf_detail],
-            protocol_version: None,
-            san_names,
-            is_valid,
-            hostname_verified,
-            days_until_expiry,
-            caa: Some(caa_policy),
-            warnings,
-        })
+        build_report(domain, presented, caa_policy)
     }
+}
+
+/// Builds the report from what the server presented. Pure (no network), so
+/// the projection is unit-testable against a loopback handshake.
+fn build_report(
+    domain: String,
+    presented: PresentedChain,
+    mut caa_policy: CaaPolicy,
+) -> Result<SslReport> {
+    // Parse leaf certificate with x509-parser
+    let (_, x509) = X509Certificate::from_der(&presented.leaf)
+        .map_err(|e| SeerError::SslError(format!("Failed to parse certificate: {}", e)))?;
+
+    // Extract SANs from the leaf certificate
+    let san_names = extract_sans(&x509);
+    let leaf_detail = parse_cert_detail(&x509)?;
+
+    let now = Utc::now();
+    let days_until_expiry = crate::dates::days_until(leaf_detail.valid_until, now);
+    let is_valid = now >= leaf_detail.valid_from && now <= leaf_detail.valid_until;
+
+    // Hostname verification: does the leaf cert's SAN (or CN fallback)
+    // match the requested domain? This is independent of `is_valid` and of
+    // chain trust (which is not verified here — see the field docs). Lets
+    // consumers tell a date-valid-but-wrong-host cert apart from a real
+    // match. Per RFC 6125 §6.4.4 the CN is consulted ONLY when the cert
+    // presents no identifier SANs at all; if any dNSName/IPAddress SAN is
+    // present the CN must be ignored, otherwise a cert whose SANs cover
+    // other hosts but whose CN happens to match would falsely verify.
+    let hostname_verified = san_names
+        .iter()
+        .any(|san| hostname_matches_pattern(&domain, san))
+        || (san_names.is_empty() && subject_cn_matches_host(&x509, &domain));
+
+    // Annotate the CAA policy with the issuer comparison before
+    // attaching it to the report.
+    caa_policy.issuer_match = Some(caa::classify_issuer(&leaf_detail.issuer, &caa_policy));
+
+    // Derive posture warnings from the parsed leaf (pure post-processing).
+    let warnings =
+        derive_cert_warnings(&leaf_detail, is_valid, hostname_verified, days_until_expiry);
+
+    // The chain as the server sent it, leaf first. Every verdict above comes
+    // from the leaf, so an extra certificate that fails to parse is skipped
+    // rather than failing the whole report.
+    let mut chain = vec![leaf_detail];
+    chain.extend(presented.intermediates.iter().filter_map(|der| {
+        let detail = X509Certificate::from_der(der)
+            .ok()
+            .and_then(|(_, cert)| parse_cert_detail(&cert).ok());
+        if detail.is_none() {
+            debug!("skipping unparseable certificate in the presented chain");
+        }
+        detail
+    }));
+
+    Ok(SslReport {
+        domain,
+        chain,
+        protocol_version: presented.protocol,
+        san_names,
+        is_valid,
+        hostname_verified,
+        days_until_expiry,
+        caa: Some(caa_policy),
+        warnings,
+    })
 }
 
 /// Returns true if `host` matches the certificate name `pattern`, supporting
@@ -556,6 +579,30 @@ mod tests {
             report.is_valid,
             "example.com's leaf cert should be currently valid"
         );
+    }
+
+    /// Regression: native-tls exposed only the leaf, so `chain` always held
+    /// one entry and `protocol_version` was always `None`.
+    #[tokio::test]
+    async fn report_carries_the_presented_chain_and_protocol() {
+        use crate::tls::test_support::{serve_once, CA_DER, LEAF_DER};
+
+        let addr = serve_once(&[LEAF_DER, CA_DER], &[&rustls::version::TLS12]).await;
+        let presented = crate::tls::inspect(
+            "chain.test",
+            &[addr],
+            Duration::from_secs(5),
+            SeerError::SslError,
+        )
+        .await
+        .unwrap();
+        let report = build_report("chain.test".to_string(), presented, CaaPolicy::empty()).unwrap();
+
+        let subjects: Vec<&str> = report.chain.iter().map(|c| c.subject.as_str()).collect();
+        assert_eq!(subjects, ["CN=chain.test", "CN=Seer Test CA"]);
+        assert!(report.chain[1].is_ca);
+        assert_eq!(report.protocol_version.as_deref(), Some("TLSv1.2"));
+        assert!(report.hostname_verified);
     }
 
     #[test]

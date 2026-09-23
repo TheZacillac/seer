@@ -26,7 +26,8 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls::crypto::{aws_lc_rs, verify_tls12_signature, verify_tls13_signature, CryptoProvider};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{
-    AlertDescription, CertificateError, ClientConfig, DigitallySignedStruct, SignatureScheme,
+    AlertDescription, CertificateError, ClientConfig, DigitallySignedStruct, ProtocolVersion,
+    SignatureScheme,
 };
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
@@ -38,6 +39,10 @@ use crate::error::{Result, SeerError};
 pub(crate) struct PresentedChain {
     /// The end-entity certificate (DER).
     pub leaf: CertificateDer<'static>,
+    /// The rest of the chain (DER), in the order the server sent it.
+    pub intermediates: Vec<CertificateDer<'static>>,
+    /// Negotiated protocol version, e.g. `"TLSv1.3"`.
+    pub protocol: Option<String>,
 }
 
 /// Handshakes with `host` (the SNI name) and returns what it presented.
@@ -76,11 +81,23 @@ pub(crate) async fn inspect(
     })?;
 
     let (_, conn) = tls.get_ref();
-    let leaf = conn
-        .peer_certificates()
-        .and_then(|certs| certs.first().cloned())
+    let mut certs = conn.peer_certificates().unwrap_or_default().iter().cloned();
+    let leaf = certs
+        .next()
         .ok_or_else(|| err(format!("{host} presented no certificate")))?;
-    Ok(PresentedChain { leaf })
+    Ok(PresentedChain {
+        leaf,
+        intermediates: certs.collect(),
+        protocol: conn.protocol_version().map(protocol_name),
+    })
+}
+
+fn protocol_name(version: ProtocolVersion) -> String {
+    match version {
+        ProtocolVersion::TLSv1_3 => "TLSv1.3".to_string(),
+        ProtocolVersion::TLSv1_2 => "TLSv1.2".to_string(),
+        other => format!("{other:?}"),
+    }
 }
 
 /// A fresh config per probe, so there is no session resumption and every
@@ -169,35 +186,33 @@ fn describe_failure(e: &std::io::Error) -> String {
     format!("{e}{hint}")
 }
 
+/// Loopback TLS fixture shared with the `ssl`/`status` tests. Each server
+/// handles one handshake on 127.0.0.1; tests hand its address straight to
+/// [`inspect`], standing in for the SSRF-vetted addresses production callers
+/// pass (the guard itself refuses loopback).
 #[cfg(test)]
-mod tests {
-    //! Hermetic: each test serves one handshake on 127.0.0.1 and hands its
-    //! address to `inspect` directly, standing in for the SSRF-vetted
-    //! addresses callers pass (the guard itself refuses loopback).
-
+pub(crate) mod test_support {
     use super::*;
     use base64::{engine::general_purpose::STANDARD, Engine};
     use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
     use rustls::server::{ClientHello, ResolvesServerCert};
     use rustls::sign::CertifiedKey;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
     // Test-only P-256 fixture generated with openssl (valid until 2126).
     /// Leaf `CN=chain.test` (SAN `DNS:chain.test`) issued by [`CA_DER`].
-    const LEAF_DER: &str = "MIIBlTCCATqgAwIBAgIUKCxCli0Q1PLwYxTyhtrD7HdFRA4wCgYIKoZIzj0EAwIwFzEVMBMGA1UEAwwMU2VlciBUZXN0IENBMCAXDTI2MDkyMzAwMTY1OVoYDzIxMjYwODMwMDAxNjU5WjAVMRMwEQYDVQQDDApjaGFpbi50ZXN0MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEe38KVS2JShSXb/EYFoJil5p0+heKLvI+tGWwhPoCryt3V7qbkTJ7bC1yIHREfe98PReO/qk6aDNAANp1rFRhUqNkMGIwFQYDVR0RBA4wDIIKY2hhaW4udGVzdDAJBgNVHRMEAjAAMB0GA1UdDgQWBBScBoa2qgkylsi8p9t6KzPWkAiCSDAfBgNVHSMEGDAWgBS5XFcFWtxJoNW7VNP1rNYWHSPidjAKBggqhkjOPQQDAgNJADBGAiEA36loQCn3xzgYDPwuvBqM3D+JbCj8/hhidrslPRkPe+kCIQDc8ON6Yd3LaofqIyhdtOwDL3IYuwznsV/80HEvL0wTmw==";
+    pub const LEAF_DER: &str = "MIIBlTCCATqgAwIBAgIUKCxCli0Q1PLwYxTyhtrD7HdFRA4wCgYIKoZIzj0EAwIwFzEVMBMGA1UEAwwMU2VlciBUZXN0IENBMCAXDTI2MDkyMzAwMTY1OVoYDzIxMjYwODMwMDAxNjU5WjAVMRMwEQYDVQQDDApjaGFpbi50ZXN0MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEe38KVS2JShSXb/EYFoJil5p0+heKLvI+tGWwhPoCryt3V7qbkTJ7bC1yIHREfe98PReO/qk6aDNAANp1rFRhUqNkMGIwFQYDVR0RBA4wDIIKY2hhaW4udGVzdDAJBgNVHRMEAjAAMB0GA1UdDgQWBBScBoa2qgkylsi8p9t6KzPWkAiCSDAfBgNVHSMEGDAWgBS5XFcFWtxJoNW7VNP1rNYWHSPidjAKBggqhkjOPQQDAgNJADBGAiEA36loQCn3xzgYDPwuvBqM3D+JbCj8/hhidrslPRkPe+kCIQDc8ON6Yd3LaofqIyhdtOwDL3IYuwznsV/80HEvL0wTmw==";
     /// Self-signed `CN=Seer Test CA`.
-    const CA_DER: &str = "MIIBlTCCATugAwIBAgIUXHqMG+rB4YKf5efSu60kFPZBDuIwCgYIKoZIzj0EAwIwFzEVMBMGA1UEAwwMU2VlciBUZXN0IENBMCAXDTI2MDkyMzAwMTY1OVoYDzIxMjYwODMwMDAxNjU5WjAXMRUwEwYDVQQDDAxTZWVyIFRlc3QgQ0EwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAARUFxG40M198DPG4bIfgcLvUPcQzKGd/w/o4GHlMDFUPIBto1POKq1YNKqLxR58ZtChPUJdrXHBTMhxqtAsohlKo2MwYTAdBgNVHQ4EFgQUuVxXBVrcSaDVu1TT9azWFh0j4nYwHwYDVR0jBBgwFoAUuVxXBVrcSaDVu1TT9azWFh0j4nYwDwYDVR0TAQH/BAUwAwEB/zAOBgNVHQ8BAf8EBAMCAgQwCgYIKoZIzj0EAwIDSAAwRQIgIJP7q0DrLeCFafAIv7nsFlryvsUJiP90VJtGG7oJADUCIQD8hLibiUqPk8HkJAyZIeVKx7kcijpb2Xc9TEW2HE90NQ==";
+    pub const CA_DER: &str = "MIIBlTCCATugAwIBAgIUXHqMG+rB4YKf5efSu60kFPZBDuIwCgYIKoZIzj0EAwIwFzEVMBMGA1UEAwwMU2VlciBUZXN0IENBMCAXDTI2MDkyMzAwMTY1OVoYDzIxMjYwODMwMDAxNjU5WjAXMRUwEwYDVQQDDAxTZWVyIFRlc3QgQ0EwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAARUFxG40M198DPG4bIfgcLvUPcQzKGd/w/o4GHlMDFUPIBto1POKq1YNKqLxR58ZtChPUJdrXHBTMhxqtAsohlKo2MwYTAdBgNVHQ4EFgQUuVxXBVrcSaDVu1TT9azWFh0j4nYwHwYDVR0jBBgwFoAUuVxXBVrcSaDVu1TT9azWFh0j4nYwDwYDVR0TAQH/BAUwAwEB/zAOBgNVHQ8BAf8EBAMCAgQwCgYIKoZIzj0EAwIDSAAwRQIgIJP7q0DrLeCFafAIv7nsFlryvsUJiP90VJtGG7oJADUCIQD8hLibiUqPk8HkJAyZIeVKx7kcijpb2Xc9TEW2HE90NQ==";
     /// PKCS#8 key of [`LEAF_DER`] — a throwaway that exists only for these tests.
     const LEAF_KEY_DER: &str = "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgHNpHBJ98pEtKA4x23Lzt4GnSrLJuQ2ViB0QAUGcID3GhRANCAAR7fwpVLYlKFJdv8RgWgmKXmnT6F4ou8j60ZbCE+gKvK3dXupuRMntsLXIgdER973w9F47+qTpoM0AA2nWsVGFS";
 
-    const TIMEOUT: Duration = Duration::from_secs(5);
-
-    fn cert(b64: &str) -> CertificateDer<'static> {
+    pub fn cert(b64: &str) -> CertificateDer<'static> {
         CertificateDer::from(STANDARD.decode(b64).unwrap())
     }
 
-    /// Presents `chain`, signing with the leaf key whether or not it matches.
+    /// Presents a fixed chain, signing with the leaf key whether or not it
+    /// matches (so tests can also present a certificate the server can't prove).
     #[derive(Debug)]
     struct Presents(Arc<CertifiedKey>);
 
@@ -208,7 +223,7 @@ mod tests {
     }
 
     /// Serves one handshake presenting `chain`, limited to `versions`.
-    async fn serve_once(
+    pub async fn serve_once(
         chain: &[&str],
         versions: &[&'static rustls::SupportedProtocolVersion],
     ) -> SocketAddr {
@@ -233,15 +248,32 @@ mod tests {
         });
         addr
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::{cert, serve_once, CA_DER, LEAF_DER};
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    const TIMEOUT: Duration = Duration::from_secs(5);
 
     #[tokio::test]
-    async fn reads_the_presented_leaf_from_the_given_address() {
-        let addr = serve_once(&[LEAF_DER, CA_DER], rustls::DEFAULT_VERSIONS).await;
-        // The SNI name never resolves: the connection goes to `addr` only.
-        let presented = inspect("chain.test", &[addr], TIMEOUT, SeerError::SslError)
-            .await
-            .unwrap();
-        assert_eq!(presented.leaf, cert(LEAF_DER));
+    async fn returns_the_chain_as_presented_and_the_negotiated_protocol() {
+        for (version, name) in [
+            (&rustls::version::TLS13, "TLSv1.3"),
+            (&rustls::version::TLS12, "TLSv1.2"),
+        ] {
+            let addr = serve_once(&[LEAF_DER, CA_DER], &[version]).await;
+            // The SNI name never resolves: the connection goes to `addr` only.
+            let presented = inspect("chain.test", &[addr], TIMEOUT, SeerError::SslError)
+                .await
+                .unwrap();
+            assert_eq!(presented.leaf, cert(LEAF_DER));
+            assert_eq!(presented.intermediates, vec![cert(CA_DER)]);
+            assert_eq!(presented.protocol.as_deref(), Some(name));
+        }
     }
 
     #[tokio::test]
