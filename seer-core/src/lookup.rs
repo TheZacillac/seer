@@ -440,32 +440,43 @@ impl LookupResult {
         }
     }
 
-    /// Returns the registrar name, preferring RDAP data with WHOIS fallback.
-    pub fn registrar(&self) -> Option<String> {
+    /// Reads one registration field: from RDAP with the attached WHOIS record
+    /// as fallback, from WHOIS alone, or `None` for an availability verdict.
+    fn rdap_or_whois<T>(
+        &self,
+        rdap: impl FnOnce(&RdapResponse) -> Option<T>,
+        whois: impl FnOnce(&WhoisResponse) -> Option<T>,
+    ) -> Option<T> {
         match self {
             LookupResult::Rdap {
                 data,
                 whois_fallback,
-            } => data
-                .get_registrar()
-                .or_else(|| whois_fallback.as_ref().and_then(|w| w.registrar.clone())),
-            LookupResult::Whois { data, .. } => data.registrar.clone(),
+            } => rdap(data).or_else(|| whois_fallback.as_ref().and_then(whois)),
+            LookupResult::Whois { data, .. } => whois(data),
             LookupResult::Available { .. } => None,
         }
     }
 
+    /// Returns the registrar name, preferring RDAP data with WHOIS fallback.
+    pub fn registrar(&self) -> Option<String> {
+        self.rdap_or_whois(RdapResponse::get_registrar, |w| w.registrar.clone())
+    }
+
     /// Returns the registrant organization, preferring RDAP data with WHOIS fallback.
     pub fn organization(&self) -> Option<String> {
-        match self {
-            LookupResult::Rdap {
-                data,
-                whois_fallback,
-            } => data
-                .get_registrant_organization()
-                .or_else(|| whois_fallback.as_ref().and_then(|w| w.organization.clone())),
-            LookupResult::Whois { data, .. } => data.organization.clone(),
-            LookupResult::Available { .. } => None,
-        }
+        self.rdap_or_whois(RdapResponse::get_registrant_organization, |w| {
+            w.organization.clone()
+        })
+    }
+
+    /// Returns the creation date, preferring RDAP data with WHOIS fallback.
+    pub fn creation_date(&self) -> Option<DateTime<Utc>> {
+        self.rdap_or_whois(RdapResponse::creation_date, |w| w.creation_date)
+    }
+
+    /// Returns the expiration date, preferring RDAP data with WHOIS fallback.
+    pub fn expiration_date(&self) -> Option<DateTime<Utc>> {
+        self.rdap_or_whois(RdapResponse::expiration_date, |w| w.expiration_date)
     }
 
     /// Returns true if the result came from RDAP.
@@ -485,31 +496,7 @@ impl LookupResult {
 
     /// Returns the expiration date and registrar info from the lookup result.
     pub fn expiration_info(&self) -> (Option<DateTime<Utc>>, Option<String>) {
-        match self {
-            LookupResult::Rdap {
-                data,
-                whois_fallback,
-            } => {
-                // Try to get expiration from RDAP events
-                let expiration_date = data
-                    .events
-                    .iter()
-                    .find(|e| e.event_action == "expiration")
-                    .and_then(|e| e.parsed_date())
-                    .or_else(|| {
-                        // Fallback to WHOIS if available
-                        whois_fallback.as_ref().and_then(|w| w.expiration_date)
-                    });
-
-                let registrar = data
-                    .get_registrar()
-                    .or_else(|| whois_fallback.as_ref().and_then(|w| w.registrar.clone()));
-
-                (expiration_date, registrar)
-            }
-            LookupResult::Whois { data, .. } => (data.expiration_date, data.registrar.clone()),
-            LookupResult::Available { .. } => (None, None),
-        }
+        (self.expiration_date(), self.registrar())
     }
 }
 

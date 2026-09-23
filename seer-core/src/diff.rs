@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, instrument};
 
@@ -97,14 +98,24 @@ impl DomainDiffer {
     }
 }
 
-fn build_registration_diff(a: Option<&LookupResult>, b: Option<&LookupResult>) -> RegistrationDiff {
-    let registrar_a = a.and_then(|r| r.registrar());
-    let registrar_b = b.and_then(|r| r.registrar());
-    let org_a = a.and_then(|r| r.organization());
-    let org_b = b.and_then(|r| r.organization());
+/// `YYYY-MM-DD`, the date form every diff field uses.
+fn ymd(date: DateTime<Utc>) -> String {
+    date.format("%Y-%m-%d").to_string()
+}
 
-    let (expires_a, created_a) = extract_dates(a);
-    let (expires_b, created_b) = extract_dates(b);
+fn build_registration_diff(a: Option<&LookupResult>, b: Option<&LookupResult>) -> RegistrationDiff {
+    // Both dates share LookupResult's RDAP-then-WHOIS fallback, so a diff is
+    // never internally inconsistent about where its dates came from.
+    let side = |r: Option<&LookupResult>| {
+        (
+            r.and_then(LookupResult::registrar),
+            r.and_then(LookupResult::organization),
+            r.and_then(LookupResult::creation_date).map(ymd),
+            r.and_then(LookupResult::expiration_date).map(ymd),
+        )
+    };
+    let ((registrar_a, org_a, created_a, expires_a), (registrar_b, org_b, created_b, expires_b)) =
+        (side(a), side(b));
 
     RegistrationDiff {
         registrar: (registrar_a, registrar_b),
@@ -114,43 +125,13 @@ fn build_registration_diff(a: Option<&LookupResult>, b: Option<&LookupResult>) -
     }
 }
 
-/// Extracts (expiration, creation) date strings from a lookup result.
-fn extract_dates(result: Option<&LookupResult>) -> (Option<String>, Option<String>) {
-    result
-        .map(|r| {
-            let (exp, _) = r.expiration_info();
-            let created = match r {
-                // Mirror the expiration ladder in `LookupResult::expiration_info`:
-                // fall back to the WHOIS creation date when the RDAP response has
-                // no `registration` event, so both date fields use the same
-                // fallback and a diff isn't left internally inconsistent.
-                LookupResult::Rdap {
-                    data,
-                    whois_fallback,
-                } => data
-                    .creation_date()
-                    .or_else(|| whois_fallback.as_ref().and_then(|w| w.creation_date))
-                    .map(|d| d.format("%Y-%m-%d").to_string()),
-                LookupResult::Whois { data, .. } => {
-                    data.creation_date.map(|d| d.format("%Y-%m-%d").to_string())
-                }
-                _ => None,
-            };
-            (exp.map(|d| d.format("%Y-%m-%d").to_string()), created)
-        })
-        .unwrap_or((None, None))
-}
-
 fn build_dns_diff(a: Option<&StatusResponse>, b: Option<&StatusResponse>) -> DnsDiff {
-    let (a_records_a, ns_a, resolves_a) = a
-        .and_then(|s| s.dns_resolution.as_ref())
-        .map(|d| (d.a_records.clone(), d.nameservers.clone(), d.resolves))
-        .unwrap_or((vec![], vec![], false));
-
-    let (a_records_b, ns_b, resolves_b) = b
-        .and_then(|s| s.dns_resolution.as_ref())
-        .map(|d| (d.a_records.clone(), d.nameservers.clone(), d.resolves))
-        .unwrap_or((vec![], vec![], false));
+    let side = |s: Option<&StatusResponse>| {
+        s.and_then(|s| s.dns_resolution.as_ref())
+            .map(|d| (d.a_records.clone(), d.nameservers.clone(), d.resolves))
+            .unwrap_or_default()
+    };
+    let ((a_records_a, ns_a, resolves_a), (a_records_b, ns_b, resolves_b)) = (side(a), side(b));
 
     DnsDiff {
         a_records: (a_records_a, a_records_b),
@@ -160,29 +141,19 @@ fn build_dns_diff(a: Option<&StatusResponse>, b: Option<&StatusResponse>) -> Dns
 }
 
 fn build_ssl_diff(a: Option<&StatusResponse>, b: Option<&StatusResponse>) -> SslDiff {
-    let (issuer_a, valid_until_a, days_a, is_valid_a) = a
-        .and_then(|s| s.certificate.as_ref())
-        .map(|c| {
-            (
-                Some(c.issuer.clone()),
-                Some(c.valid_until.format("%Y-%m-%d").to_string()),
-                Some(c.days_until_expiry),
-                Some(c.is_valid),
-            )
-        })
-        .unwrap_or((None, None, None, None));
-
-    let (issuer_b, valid_until_b, days_b, is_valid_b) = b
-        .and_then(|s| s.certificate.as_ref())
-        .map(|c| {
-            (
-                Some(c.issuer.clone()),
-                Some(c.valid_until.format("%Y-%m-%d").to_string()),
-                Some(c.days_until_expiry),
-                Some(c.is_valid),
-            )
-        })
-        .unwrap_or((None, None, None, None));
+    let side = |s: Option<&StatusResponse>| {
+        let cert = s.and_then(|s| s.certificate.as_ref());
+        (
+            cert.map(|c| c.issuer.clone()),
+            cert.map(|c| ymd(c.valid_until)),
+            cert.map(|c| c.days_until_expiry),
+            cert.map(|c| c.is_valid),
+        )
+    };
+    let (
+        (issuer_a, valid_until_a, days_a, is_valid_a),
+        (issuer_b, valid_until_b, days_b, is_valid_b),
+    ) = (side(a), side(b));
 
     SslDiff {
         issuer: (issuer_a, issuer_b),
@@ -271,8 +242,8 @@ mod tests {
         };
         // created must use the WHOIS fallback, matching the expiration ladder,
         // rather than being left None.
-        let (_, created) = extract_dates(Some(&result));
-        assert_eq!(created.as_deref(), Some("1995-08-14"));
+        let diff = build_registration_diff(Some(&result), None);
+        assert_eq!(diff.created.0.as_deref(), Some("1995-08-14"));
     }
 
     #[test]
@@ -317,13 +288,6 @@ mod tests {
         let differ = DomainDiffer::default();
         // Just verify construction works
         let _ = differ;
-    }
-
-    #[test]
-    fn test_extract_dates_none() {
-        let (exp, created) = extract_dates(None);
-        assert!(exp.is_none());
-        assert!(created.is_none());
     }
 
     /// Regression guard for a debug-build stack overflow (TUI `:diff a b`).
