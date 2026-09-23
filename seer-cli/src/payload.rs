@@ -1,10 +1,14 @@
 //! Interface-agnostic result payload: one enum over every formatter-backed
-//! seer-core result type, shared by the TUI (raw view / `y` copy) and the
-//! REPL (`copy` command). Serialization reuses seer-core's formatters so
-//! copied text matches `seer --format …` exactly.
+//! seer-core result type, shared by the CLI and REPL (every single-shot
+//! command's result, and `copy`) and the TUI (raw view / `y` copy).
+//! Serialization reuses seer-core's formatters so copied text matches
+//! `seer --format …` exactly.
 use seer_core::output::{get_formatter, OutputFormat};
 
-#[derive(Debug, Clone)]
+/// Serializes as the wrapped result itself (untagged), so `--quiet` JSON is
+/// exactly the core type's.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(untagged)]
 pub enum Payload {
     Overview(Box<seer_core::LookupResult>),
     Whois(Box<seer_core::WhoisResponse>),
@@ -22,6 +26,8 @@ pub enum Payload {
     Watch(Box<seer_core::WatchReport>),
     History(Vec<seer_core::HistoryEntry>),
     Subdomains(Box<seer_core::SubdomainResult>),
+    /// `subdomains --diff`: the fresh enumeration against the stored baseline.
+    SubdomainBaselineDiff(Box<seer_core::SubdomainBaselineDiff>),
     Info(Box<seer_core::DomainInfo>),
     Drift(Box<seer_core::DriftReport>),
     Posture(Box<seer_core::EmailPosture>),
@@ -60,6 +66,7 @@ impl Payload {
             Payload::Watch(_) => "watch",
             Payload::History(_) => "history",
             Payload::Subdomains(_) => "subdomains",
+            Payload::SubdomainBaselineDiff(_) => "subdomain diff",
             Payload::Info(_) => "info",
             Payload::Drift(_) => "drift",
             Payload::Posture(_) => "posture",
@@ -93,6 +100,7 @@ pub fn serialize(data: &Payload, format: OutputFormat) -> String {
         Payload::Watch(w) => fmt.format_watch(w),
         Payload::History(_) => "history (raw view not applicable)".to_string(),
         Payload::Subdomains(s) => fmt.format_subdomains(s),
+        Payload::SubdomainBaselineDiff(d) => fmt.format_subdomain_baseline_diff(d),
         Payload::Info(i) => fmt.format_domain_info(i),
         Payload::Drift(d) => fmt.format_drift(d),
         Payload::Posture(p) => fmt.format_posture(p),
@@ -161,6 +169,29 @@ mod tests {
         let data = Payload::Caa(Box::new(policy));
         let out = serialize(&data, OutputFormat::Markdown);
         assert!(!out.is_empty());
+    }
+
+    /// `-q` prints the payload's JSON, which must be exactly the wrapped
+    /// result's — no enum tag, no Box wrapper.
+    #[test]
+    fn serde_form_is_the_wrapped_result() {
+        let records = vec![DnsRecord {
+            name: "example.com".into(),
+            record_type: RecordType::A,
+            ttl: 300,
+            data: RecordData::A {
+                address: "1.2.3.4".into(),
+            },
+        }];
+        let drift = seer_core::DriftReport::empty("example.com");
+        assert_eq!(
+            serde_json::to_string(&Payload::Dns(records.clone())).unwrap(),
+            serde_json::to_string(&records).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_string(&Payload::Drift(Box::new(drift.clone()))).unwrap(),
+            serde_json::to_string(&drift).unwrap()
+        );
     }
 
     #[test]

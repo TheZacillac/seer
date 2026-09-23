@@ -20,6 +20,18 @@ impl Spinner {
         Self { progress }
     }
 
+    /// A spinner that only draws when `visible`; otherwise a no-op handle, so
+    /// callers can report progress unconditionally.
+    pub fn maybe(visible: bool, message: &str) -> Self {
+        if visible {
+            Self::new(message)
+        } else {
+            Self {
+                progress: ProgressBar::hidden(),
+            }
+        }
+    }
+
     pub fn set_message(&self, message: &str) {
         self.progress.set_message(message.to_string());
     }

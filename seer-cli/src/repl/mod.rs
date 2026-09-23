@@ -14,7 +14,6 @@ pub use commands::{CommandContext, CommandResult};
 pub use completer::SeerCompleter;
 
 use std::io::Write;
-use std::sync::Arc;
 
 use colored::Colorize;
 use rustyline::error::ReadlineError;
@@ -23,20 +22,15 @@ use rustyline::{CompletionType, Editor};
 use seer_core::colors::CatppuccinExt;
 
 use crate::display::Spinner;
+use crate::query::{Clients, Query};
 
 const HISTORY_FILE: &str = ".seer_history";
 
 pub struct Repl {
     editor: Editor<SeerCompleter, DefaultHistory>,
     context: CommandContext,
-    whois_client: seer_core::WhoisClient,
-    rdap_client: seer_core::RdapClient,
-    dns_resolver: seer_core::DnsResolver,
-    propagation_checker: seer_core::dns::PropagationChecker,
-    status_client: seer_core::StatusClient,
-    dnssec_checker: seer_core::DnssecChecker,
-    availability_checker: seer_core::AvailabilityChecker,
-    ssl_checker: seer_core::SslChecker,
+    /// Built once from the user config and kept for the session.
+    clients: Clients,
     dns_follower: seer_core::DnsFollower,
     /// Last single-result command output, for the `copy` command.
     last_result: Option<crate::payload::Payload>,
@@ -74,21 +68,13 @@ impl Repl {
         let _ = editor.load_history(&history_path);
 
         // Build clients from the user config so the REPL honors per-protocol
-        // timeouts / nameserver / bulk concurrency (propagation + DNSSEC keep
-        // their own tuned timeouts by design — see the config wiring note).
+        // timeouts / nameserver / bulk concurrency.
         let context = CommandContext::new();
         let cfg = &context.config;
 
         Ok(Self {
             editor,
-            whois_client: seer_core::WhoisClient::from_config(cfg),
-            rdap_client: seer_core::RdapClient::from_config(cfg),
-            dns_resolver: seer_core::DnsResolver::from_config(cfg),
-            propagation_checker: seer_core::dns::PropagationChecker::new(),
-            status_client: seer_core::StatusClient::from_config(cfg),
-            dnssec_checker: seer_core::DnssecChecker::new(),
-            availability_checker: seer_core::AvailabilityChecker::from_config(cfg),
-            ssl_checker: seer_core::SslChecker::from_config(cfg),
+            clients: Clients::from_config(cfg),
             // Honor the config file's DNS timeout like `dig` does.
             dns_follower: seer_core::DnsFollower::with_resolver(
                 seer_core::DnsResolver::from_config(cfg),
@@ -239,41 +225,19 @@ impl Repl {
     }
 
     /// Routes a tokenized line (`parts[0]` is the command as typed, `command`
-    /// its lowercased form) to its handler.
+    /// its lowercased form) to its handler. Everything that is not a session
+    /// or multi-step command is a single-shot query (see `crate::query`).
     async fn dispatch(&mut self, command: &str, parts: &[&str]) -> CommandResult {
         let args = &parts[1..];
 
-        match command {
-            "help" | "?" => {
+        match catalog::canonical(command) {
+            "help" => {
                 self.print_help();
                 CommandResult::Continue
             }
-            "exit" | "quit" | "q" => CommandResult::Exit,
-            "lookup" => self.execute_lookup(args).await,
-            "info" => self.execute_info(args).await,
-            "whois" => self.execute_whois(args).await,
-            "rdap" => self.execute_rdap(args).await,
-            "dig" | "dns" => self.execute_dig(args).await,
-            "propagation" | "prop" => self.execute_propagation(args).await,
-            "delegation" => self.execute_delegation(args).await,
-            "doctor" => self.execute_doctor().await,
-            "reverse" => self.execute_reverse(args).await,
-            "avail" => self.execute_avail(args).await,
-            "dnssec" => self.execute_dnssec(args).await,
+            "exit" => CommandResult::Exit,
             "bulk" => self.execute_bulk(args).await,
-            "status" => self.execute_status(args).await,
             "follow" => self.execute_follow(args).await,
-            "ssl" => self.execute_ssl(args).await,
-            "tld" => self.execute_tld(args).await,
-            "compare" => self.execute_compare(args).await,
-            "subdomains" | "subs" => self.execute_subdomains(args).await,
-            "diff" => self.execute_diff(args).await,
-            "drift" => self.execute_drift(args).await,
-            "caa" => self.execute_caa(args).await,
-            "posture" => self.execute_posture(args).await,
-            "headers" => self.execute_headers(args).await,
-            "takeover" => self.execute_takeover(args).await,
-            "confusables" => self.execute_confusables(args).await,
             "watch" => self.execute_watch(args).await,
             "history" => self.execute_history(args).await,
             "set" => self.execute_set(args),
@@ -283,18 +247,10 @@ impl Repl {
                 let _ = std::io::stdout().flush();
                 CommandResult::Continue
             }
-            // Default: treat as domain lookup if it looks like a domain
-            _ => {
-                // If the input contains a dot, assume it's a domain and run lookup
-                if command.contains('.') {
-                    self.execute_lookup(parts).await
-                } else {
-                    CommandResult::Error(format!(
-                        "Unknown command: {}. Type 'help' for available commands.",
-                        command
-                    ))
-                }
-            }
+            _ => match commands::parse_query(command, parts) {
+                Ok(query) => self.execute_query(query).await,
+                Err(e) => CommandResult::Error(e),
+            },
         }
     }
 
@@ -342,325 +298,20 @@ impl Repl {
         println!();
     }
 
-    async fn execute_lookup(&mut self, args: &[&str]) -> CommandResult {
-        if args.is_empty() {
-            return CommandResult::Error("Usage: lookup <domain>".to_string());
-        }
-
-        let domain = args[0];
-        let spinner = Arc::new(Spinner::new(&format!(
-            "Smart lookup for {} (trying RDAP first)",
-            domain
-        )));
-
-        // Create progress callback that updates the spinner
-        let spinner_clone = spinner.clone();
-        let progress: seer_core::LookupProgressCallback = Arc::new(move |message| {
-            spinner_clone.set_message(message);
-        });
-
-        let lookup = seer_core::SmartLookup::from_config(&self.context.config);
-        match lookup.lookup_with_progress(domain, Some(progress)).await {
-            Ok(result) => {
-                spinner.finish();
-                // Record to history (file I/O off the async executor),
-                // matching the non-REPL `Commands::Lookup` path. Without this
-                // the `history` REPL command always reports an empty file.
-                crate::ops::record_lookup_history(domain, result.clone()).await;
-
-                let formatter = seer_core::output::get_formatter(self.context.output_format);
-                println!("{}", formatter.format_lookup(&result));
-                self.last_result =
-                    Some(crate::payload::Payload::Overview(Box::new(result.clone())));
+    /// Runs a single-shot query, prints it in the session's output format
+    /// (advisory notes on stderr, as in the CLI), and keeps it for `copy`.
+    async fn execute_query(&mut self, query: Query) -> CommandResult {
+        match crate::query::run(query, &self.clients, &self.context.config, true).await {
+            Ok(outcome) => {
+                let format = self.context.output_format;
+                outcome
+                    .present(|payload| println!("{}", crate::payload::serialize(payload, format)));
+                self.last_result = Some(outcome.payload);
                 CommandResult::Continue
             }
-            Err(e) => {
-                spinner.finish();
-                CommandResult::Error(e.to_string())
-            }
+            Err(e) => CommandResult::Error(e.to_string()),
         }
     }
-
-    async fn execute_info(&mut self, args: &[&str]) -> CommandResult {
-        if args.is_empty() {
-            return CommandResult::Error("Usage: info <domain>".to_string());
-        }
-
-        let domain = args[0];
-        let spinner = Arc::new(Spinner::new(&format!(
-            "Getting comprehensive info for {}",
-            domain
-        )));
-
-        let lookup = seer_core::SmartLookup::from_config(&self.context.config);
-        match lookup.lookup(domain).await {
-            Ok(result) => {
-                spinner.finish();
-                let info = seer_core::DomainInfo::from_lookup_result(&result);
-                let formatter = seer_core::output::get_formatter(self.context.output_format);
-                println!("{}", formatter.format_domain_info(&info));
-                self.last_result = Some(crate::payload::Payload::Info(Box::new(info.clone())));
-                CommandResult::Continue
-            }
-            Err(e) => {
-                spinner.finish();
-                CommandResult::Error(format!("Info failed: {}", e))
-            }
-        }
-    }
-
-    async fn execute_whois(&mut self, args: &[&str]) -> CommandResult {
-        if args.is_empty() {
-            return CommandResult::Error("Usage: whois <domain>".to_string());
-        }
-
-        let domain = args[0];
-        let spinner = Spinner::new(&format!("Looking up WHOIS for {}", domain));
-
-        match self.whois_client.lookup(domain).await {
-            Ok(response) => {
-                spinner.finish();
-                let formatter = seer_core::output::get_formatter(self.context.output_format);
-                println!("{}", formatter.format_whois(&response));
-                self.last_result = Some(crate::payload::Payload::Whois(Box::new(response.clone())));
-                CommandResult::Continue
-            }
-            Err(e) => {
-                spinner.finish();
-                CommandResult::Error(e.to_string())
-            }
-        }
-    }
-
-    async fn execute_rdap(&mut self, args: &[&str]) -> CommandResult {
-        if args.is_empty() {
-            return CommandResult::Error("Usage: rdap <domain|ip|asn>".to_string());
-        }
-
-        let query = args[0];
-        let spinner = Spinner::new(&format!("Looking up RDAP for {}", query));
-
-        // Mirror the non-REPL CLI path: seer_core::rdap::auto_lookup classifies
-        // the query so the `AS<digits>` route only fires when the remainder is
-        // all digits AND there's no `.` — otherwise `asana.com` / `as1234.io`
-        // would misroute to ASN and surface a parse error.
-        let result = seer_core::rdap::auto_lookup(&self.rdap_client, query).await;
-
-        match result {
-            Ok(response) => {
-                spinner.finish();
-                let formatter = seer_core::output::get_formatter(self.context.output_format);
-                println!("{}", formatter.format_rdap(&response));
-                self.last_result = Some(crate::payload::Payload::Rdap(Box::new(response.clone())));
-                CommandResult::Continue
-            }
-            Err(e) => {
-                spinner.finish();
-                CommandResult::Error(e.to_string())
-            }
-        }
-    }
-
-    async fn execute_dig(&mut self, args: &[&str]) -> CommandResult {
-        if args.is_empty() {
-            return CommandResult::Error("Usage: dig <domain> [type] [@server]".to_string());
-        }
-
-        let domain = args[0];
-        let mut record_type = seer_core::RecordType::A;
-        let mut nameserver: Option<&str> = None;
-
-        for arg in &args[1..] {
-            if let Some(ns) = arg.strip_prefix('@') {
-                nameserver = Some(ns);
-            } else {
-                // A typo'd type must error, not silently query A records.
-                match crate::try_parse_record_type(arg) {
-                    Ok(rt) => record_type = rt,
-                    Err(e) => return CommandResult::Error(e),
-                }
-            }
-        }
-
-        // Fall back to the configured nameserver when none is given inline.
-        let nameserver = nameserver.or(self.context.config.nameserver.as_deref());
-
-        let spinner = Spinner::new(&format!("Querying {} {} records", domain, record_type));
-
-        match self
-            .dns_resolver
-            .resolve(domain, record_type, nameserver)
-            .await
-        {
-            Ok(records) => {
-                spinner.finish();
-                let formatter = seer_core::output::get_formatter(self.context.output_format);
-                println!("{}", formatter.format_dns(&records));
-                self.last_result = Some(crate::payload::Payload::Dns(records.clone()));
-                CommandResult::Continue
-            }
-            Err(e) => {
-                spinner.finish();
-                CommandResult::Error(e.to_string())
-            }
-        }
-    }
-
-    async fn execute_propagation(&mut self, args: &[&str]) -> CommandResult {
-        if args.is_empty() {
-            return CommandResult::Error("Usage: prop <domain> [type]".to_string());
-        }
-
-        let domain = args[0];
-        // A typo'd type must error, not silently check A-record propagation.
-        let record_type = match args.get(1) {
-            Some(arg) => match crate::try_parse_record_type(arg) {
-                Ok(rt) => rt,
-                Err(e) => return CommandResult::Error(e),
-            },
-            None => seer_core::RecordType::A,
-        };
-
-        let spinner = Spinner::new(&format!(
-            "Checking {} {} propagation across DNS servers",
-            domain, record_type
-        ));
-
-        match self.propagation_checker.check(domain, record_type).await {
-            Ok(result) => {
-                spinner.finish();
-                let formatter = seer_core::output::get_formatter(self.context.output_format);
-                println!("{}", formatter.format_propagation(&result));
-                self.last_result = Some(crate::payload::Payload::Prop(Box::new(result.clone())));
-                CommandResult::Continue
-            }
-            Err(e) => {
-                spinner.finish();
-                CommandResult::Error(e.to_string())
-            }
-        }
-    }
-
-    async fn execute_delegation(&mut self, args: &[&str]) -> CommandResult {
-        if args.is_empty() {
-            return CommandResult::Error("Usage: delegation <domain>".to_string());
-        }
-
-        let domain = args[0];
-        let spinner = Spinner::new(&format!("Checking NS delegation for {}", domain));
-
-        // check() normalizes/validates the domain before any network I/O, so
-        // an invalid input errors immediately (keeps the tests hermetic).
-        let checker = seer_core::dns::DelegationChecker::from_config(&self.context.config);
-        match checker.check(domain).await {
-            Ok(report) => {
-                spinner.finish();
-                let formatter = seer_core::output::get_formatter(self.context.output_format);
-                println!("{}", formatter.format_delegation(&report));
-                self.last_result = Some(crate::payload::Payload::Delegation(Box::new(report)));
-                CommandResult::Continue
-            }
-            Err(e) => {
-                spinner.finish();
-                CommandResult::Error(e.to_string())
-            }
-        }
-    }
-
-    async fn execute_doctor(&mut self) -> CommandResult {
-        let spinner = Spinner::new("Running environment diagnostics");
-
-        // Infallible by design: probe failures become Fail checks in the
-        // report rather than an Err, so there is no error branch here.
-        let doctor = seer_core::doctor::Doctor::from_config(&self.context.config);
-        let report = doctor.run().await;
-        spinner.finish();
-        println!(
-            "{}",
-            crate::render_doctor_report(&report, self.context.output_format)
-        );
-        self.last_result = Some(crate::payload::Payload::Doctor(Box::new(report)));
-        CommandResult::Continue
-    }
-
-    async fn execute_reverse(&mut self, args: &[&str]) -> CommandResult {
-        if args.is_empty() {
-            return CommandResult::Error("Usage: reverse <ip>".to_string());
-        }
-
-        let ip = args[0];
-        let spinner = Spinner::new(&format!("Looking up PTR for {}", ip));
-
-        // Honor the configured nameserver, like `dig`.
-        match self
-            .dns_resolver
-            .resolve(
-                ip,
-                seer_core::RecordType::PTR,
-                self.context.config.nameserver.as_deref(),
-            )
-            .await
-        {
-            Ok(records) => {
-                spinner.finish();
-                let formatter = seer_core::output::get_formatter(self.context.output_format);
-                println!("{}", formatter.format_dns(&records));
-                self.last_result = Some(crate::payload::Payload::Reverse(records.clone()));
-                CommandResult::Continue
-            }
-            Err(e) => {
-                spinner.finish();
-                CommandResult::Error(e.to_string())
-            }
-        }
-    }
-
-    async fn execute_avail(&mut self, args: &[&str]) -> CommandResult {
-        if args.is_empty() {
-            return CommandResult::Error("Usage: avail <domain>".to_string());
-        }
-
-        let domain = args[0];
-        let spinner = Spinner::new(&format!("Checking availability of {}", domain));
-
-        match self.availability_checker.check(domain).await {
-            Ok(result) => {
-                spinner.finish();
-                let formatter = seer_core::output::get_formatter(self.context.output_format);
-                println!("{}", formatter.format_availability(&result));
-                self.last_result = Some(crate::payload::Payload::Avail(Box::new(result.clone())));
-                CommandResult::Continue
-            }
-            Err(e) => {
-                spinner.finish();
-                CommandResult::Error(e.to_string())
-            }
-        }
-    }
-
-    async fn execute_dnssec(&mut self, args: &[&str]) -> CommandResult {
-        if args.is_empty() {
-            return CommandResult::Error("Usage: dnssec <domain>".to_string());
-        }
-
-        let domain = args[0];
-        let spinner = Spinner::new(&format!("Checking DNSSEC for {}", domain));
-
-        match self.dnssec_checker.check(domain).await {
-            Ok(report) => {
-                spinner.finish();
-                let formatter = seer_core::output::get_formatter(self.context.output_format);
-                println!("{}", formatter.format_dnssec(&report));
-                self.last_result = Some(crate::payload::Payload::Dnssec(Box::new(report.clone())));
-                CommandResult::Continue
-            }
-            Err(e) => {
-                spinner.finish();
-                CommandResult::Error(e.to_string())
-            }
-        }
-    }
-
     async fn execute_bulk(&mut self, args: &[&str]) -> CommandResult {
         // Handle help flags
         if args.is_empty()
@@ -745,30 +396,6 @@ impl Repl {
         CommandResult::Continue
     }
 
-    async fn execute_status(&mut self, args: &[&str]) -> CommandResult {
-        if args.is_empty() {
-            return CommandResult::Error("Usage: status <domain>".to_string());
-        }
-
-        let domain = args[0];
-        let spinner = Spinner::new(&format!("Checking status for {}", domain));
-
-        match self.status_client.check(domain).await {
-            Ok(response) => {
-                spinner.finish();
-                let formatter = seer_core::output::get_formatter(self.context.output_format);
-                println!("{}", formatter.format_status(&response));
-                self.last_result =
-                    Some(crate::payload::Payload::Status(Box::new(response.clone())));
-                CommandResult::Continue
-            }
-            Err(e) => {
-                spinner.finish();
-                CommandResult::Error(e.to_string())
-            }
-        }
-    }
-
     async fn execute_follow(&self, args: &[&str]) -> CommandResult {
         let commands::FollowArgs {
             domain,
@@ -826,383 +453,6 @@ impl Repl {
                 CommandResult::Continue
             }
             Err(e) => CommandResult::Error(e.to_string()),
-        }
-    }
-
-    async fn execute_ssl(&mut self, args: &[&str]) -> CommandResult {
-        if args.is_empty() {
-            return CommandResult::Error("Usage: ssl <domain>".to_string());
-        }
-        let domain = args[0];
-        let spinner = Spinner::new(&format!("Checking SSL for {}", domain));
-        match self.ssl_checker.check(domain).await {
-            Ok(report) => {
-                spinner.finish();
-                let formatter = seer_core::output::get_formatter(self.context.output_format);
-                println!("{}", formatter.format_ssl(&report));
-                self.last_result = Some(crate::payload::Payload::Ssl(Box::new(report.clone())));
-                CommandResult::Continue
-            }
-            Err(e) => {
-                spinner.finish();
-                CommandResult::Error(e.to_string())
-            }
-        }
-    }
-
-    async fn execute_tld(&mut self, args: &[&str]) -> CommandResult {
-        if args.is_empty() {
-            return CommandResult::Error("Usage: tld <tld>".to_string());
-        }
-        let info = seer_core::lookup_tld(args[0]).await;
-        let formatter = seer_core::output::get_formatter(self.context.output_format);
-        println!("{}", formatter.format_tld(&info));
-        self.last_result = Some(crate::payload::Payload::Tld(Box::new(info.clone())));
-        CommandResult::Continue
-    }
-
-    async fn execute_compare(&mut self, args: &[&str]) -> CommandResult {
-        if args.len() < 3 {
-            return CommandResult::Error(
-                "Usage: compare <domain> [type] <@server1> <@server2>".to_string(),
-            );
-        }
-        let domain = args[0];
-        let mut record_type = seer_core::RecordType::A;
-        let mut servers: Vec<&str> = Vec::new();
-
-        for arg in &args[1..] {
-            if let Some(ns) = arg.strip_prefix('@') {
-                servers.push(ns);
-            } else {
-                // A typo'd type must error, not silently compare A records.
-                match crate::try_parse_record_type(arg) {
-                    Ok(rt) => record_type = rt,
-                    Err(e) => return CommandResult::Error(e),
-                }
-            }
-        }
-
-        if servers.len() < 2 {
-            return CommandResult::Error(
-                "Need two nameservers (e.g., @8.8.8.8 @1.1.1.1)".to_string(),
-            );
-        }
-
-        let spinner = Spinner::new(&format!(
-            "Comparing {} records from {} servers",
-            domain,
-            servers.len()
-        ));
-        let comparator = seer_core::dns::DnsComparator::new();
-        match comparator
-            .compare(domain, record_type, servers[0], servers[1])
-            .await
-        {
-            Ok(comparison) => {
-                spinner.finish();
-                let formatter = seer_core::output::get_formatter(self.context.output_format);
-                println!("{}", formatter.format_dns_comparison(&comparison));
-                self.last_result = Some(crate::payload::Payload::Compare(Box::new(
-                    comparison.clone(),
-                )));
-                CommandResult::Continue
-            }
-            Err(e) => {
-                spinner.finish();
-                CommandResult::Error(e.to_string())
-            }
-        }
-    }
-
-    async fn execute_subdomains(&mut self, args: &[&str]) -> CommandResult {
-        let commands::SubdomainsArgs {
-            domain,
-            resolve,
-            diff,
-            record,
-        } = match commands::parse_subdomains_args(args) {
-            Ok(p) => p,
-            Err(e) => return CommandResult::Error(e),
-        };
-        let domain = domain.as_str();
-        let spinner = Spinner::new(&format!("Enumerating subdomains for {}", domain));
-
-        if diff || record {
-            // Same baseline semantics as the CLI `subdomains --diff/--record`
-            // — shared via ops::subdomain_baseline_check so the two surfaces
-            // cannot diverge (mirrors execute_drift below).
-            match crate::ops::subdomain_baseline_check(domain, record).await {
-                Ok(outcome) => {
-                    spinner.finish();
-                    let formatter = seer_core::output::get_formatter(self.context.output_format);
-                    // Advisory notes go to stderr, as in the CLI, so stdout
-                    // carries only the formatted result.
-                    if diff {
-                        if outcome.report.baseline_missing {
-                            eprintln!(
-                                "{} {}",
-                                "note:".ctp_yellow(),
-                                crate::ops::no_subdomain_baseline_note(
-                                    &outcome.result.domain,
-                                    record
-                                )
-                            );
-                        }
-                        println!(
-                            "{}",
-                            formatter.format_subdomain_baseline_diff(&outcome.report)
-                        );
-                    } else {
-                        // --record alone: plain listing plus a confirmation.
-                        println!("{}", formatter.format_subdomains(&outcome.result));
-                        eprintln!(
-                            "{} recorded subdomain baseline for {} ({} names)",
-                            "note:".ctp_yellow(),
-                            outcome.result.domain,
-                            outcome.result.count
-                        );
-                    }
-                    self.last_result = Some(crate::payload::Payload::Subdomains(Box::new(
-                        outcome.result.clone(),
-                    )));
-                    return CommandResult::Continue;
-                }
-                Err(e) => {
-                    spinner.finish();
-                    return CommandResult::Error(e.to_string());
-                }
-            }
-        }
-
-        let enumerator = seer_core::SubdomainEnumerator::new();
-        match enumerator.enumerate(domain).await {
-            Ok(result) if resolve => {
-                // Same pipeline as the CLI's `subdomains --resolve`.
-                spinner.set_message("Resolving and classifying discovered names");
-                let classification = seer_core::classify_subdomains(
-                    &self.dns_resolver,
-                    &result.domain,
-                    result.subdomains.clone(),
-                    self.context.config.bulk.concurrency,
-                )
-                .await;
-                spinner.finish();
-                let formatter = seer_core::output::get_formatter(self.context.output_format);
-                println!(
-                    "{}",
-                    formatter.format_subdomain_classification(&classification)
-                );
-                self.last_result = Some(crate::payload::Payload::SubdomainClassification(
-                    Box::new(classification),
-                ));
-                CommandResult::Continue
-            }
-            Ok(result) => {
-                spinner.finish();
-                let formatter = seer_core::output::get_formatter(self.context.output_format);
-                println!("{}", formatter.format_subdomains(&result));
-                self.last_result = Some(crate::payload::Payload::Subdomains(Box::new(
-                    result.clone(),
-                )));
-                CommandResult::Continue
-            }
-            Err(e) => {
-                spinner.finish();
-                CommandResult::Error(e.to_string())
-            }
-        }
-    }
-
-    async fn execute_diff(&mut self, args: &[&str]) -> CommandResult {
-        if args.len() < 2 {
-            return CommandResult::Error("Usage: diff <domain1> <domain2>".to_string());
-        }
-        let spinner = Spinner::new(&format!("Comparing {} vs {}", args[0], args[1]));
-        let differ = seer_core::DomainDiffer::new();
-        match differ.diff(args[0], args[1]).await {
-            Ok(diff) => {
-                spinner.finish();
-                let formatter = seer_core::output::get_formatter(self.context.output_format);
-                println!("{}", formatter.format_diff(&diff));
-                self.last_result = Some(crate::payload::Payload::Diff(Box::new(diff.clone())));
-                CommandResult::Continue
-            }
-            Err(e) => {
-                spinner.finish();
-                CommandResult::Error(e.to_string())
-            }
-        }
-    }
-
-    async fn execute_drift(&mut self, args: &[&str]) -> CommandResult {
-        let commands::DriftArgs { domain, record } = match commands::parse_drift_args(args) {
-            Ok(p) => p,
-            Err(e) => return CommandResult::Error(e),
-        };
-        let domain = domain.as_str();
-        let spinner = Spinner::new(&format!("Looking up {}", domain));
-        // Same history-snapshot semantics as the CLI `drift` subcommand —
-        // shared via ops::drift_check so the two surfaces cannot diverge.
-        let lookup = seer_core::SmartLookup::from_config(&self.context.config);
-        match crate::ops::drift_check(&lookup, domain, record).await {
-            Ok(outcome) => {
-                spinner.finish();
-                if !outcome.had_previous {
-                    // Advisory note on stderr, as in the CLI.
-                    eprintln!(
-                        "{} {}",
-                        "note:".ctp_yellow(),
-                        crate::ops::no_baseline_note(domain, record)
-                    );
-                }
-                let formatter = seer_core::output::get_formatter(self.context.output_format);
-                println!("{}", formatter.format_drift(&outcome.report));
-                self.last_result = Some(crate::payload::Payload::Drift(Box::new(
-                    outcome.report.clone(),
-                )));
-                CommandResult::Continue
-            }
-            Err(e) => {
-                spinner.finish();
-                CommandResult::Error(e.to_string())
-            }
-        }
-    }
-
-    async fn execute_caa(&mut self, args: &[&str]) -> CommandResult {
-        if args.is_empty() {
-            return CommandResult::Error("Usage: caa <domain>".to_string());
-        }
-        // Normalize first so `caa HTTPS://WWW.EXAMPLE.COM` behaves like the
-        // CLI subcommand and an invalid domain surfaces a clean error.
-        match seer_core::normalize_domain(args[0]) {
-            Ok(domain) => {
-                let spinner = Spinner::new(&format!("Looking up CAA policy for {}", domain));
-                let policy = seer_core::caa::lookup_caa(&self.dns_resolver, &domain).await;
-                spinner.finish();
-                let formatter = seer_core::output::get_formatter(self.context.output_format);
-                println!("{}", formatter.format_caa(&policy));
-                self.last_result = Some(crate::payload::Payload::Caa(Box::new(policy.clone())));
-                CommandResult::Continue
-            }
-            Err(e) => CommandResult::Error(e.to_string()),
-        }
-    }
-
-    async fn execute_posture(&mut self, args: &[&str]) -> CommandResult {
-        if args.is_empty() {
-            return CommandResult::Error("Usage: posture <domain>".to_string());
-        }
-        let domain = args[0];
-        let spinner = Spinner::new(&format!("Inspecting email posture for {}", domain));
-        match seer_core::lookup_email_posture(&self.dns_resolver, domain).await {
-            Ok(posture) => {
-                spinner.finish();
-                let formatter = seer_core::output::get_formatter(self.context.output_format);
-                println!("{}", formatter.format_posture(&posture));
-                self.last_result =
-                    Some(crate::payload::Payload::Posture(Box::new(posture.clone())));
-                CommandResult::Continue
-            }
-            Err(e) => {
-                spinner.finish();
-                CommandResult::Error(e.to_string())
-            }
-        }
-    }
-
-    async fn execute_headers(&mut self, args: &[&str]) -> CommandResult {
-        if args.is_empty() {
-            return CommandResult::Error("Usage: headers <domain>".to_string());
-        }
-        let domain = args[0];
-        let spinner = Spinner::new(&format!("Auditing HTTP security headers for {}", domain));
-        match seer_core::audit_headers(domain, self.context.config.http_timeout()).await {
-            Ok(report) => {
-                spinner.finish();
-                let formatter = seer_core::output::get_formatter(self.context.output_format);
-                println!("{}", formatter.format_headers(&report));
-                self.last_result = Some(crate::payload::Payload::Headers(Box::new(report)));
-                CommandResult::Continue
-            }
-            Err(e) => {
-                spinner.finish();
-                CommandResult::Error(e.to_string())
-            }
-        }
-    }
-
-    async fn execute_takeover(&mut self, args: &[&str]) -> CommandResult {
-        let commands::TakeoverArgs { domain, hosts } = match commands::parse_takeover_args(args) {
-            Ok(p) => p,
-            Err(e) => return CommandResult::Error(e),
-        };
-        let domain = domain.as_str();
-        let spinner = Spinner::new(&format!("Scanning {} for takeover exposure", domain));
-        // `--host` skips CT enumeration entirely, as in the CLI.
-        let hosts = if hosts.is_empty() {
-            spinner.set_message(&format!("Enumerating subdomains for {}", domain));
-            match seer_core::SubdomainEnumerator::new()
-                .enumerate(domain)
-                .await
-            {
-                Ok(result) => result.subdomains,
-                Err(e) => {
-                    spinner.finish();
-                    return CommandResult::Error(e.to_string());
-                }
-            }
-        } else {
-            hosts
-        };
-
-        spinner.set_message(&format!("Checking {} host(s) for takeover", hosts.len()));
-        match seer_core::scan_takeover(
-            &self.dns_resolver,
-            domain,
-            hosts,
-            self.context.config.bulk.concurrency,
-        )
-        .await
-        {
-            Ok(report) => {
-                spinner.finish();
-                let formatter = seer_core::output::get_formatter(self.context.output_format);
-                println!("{}", formatter.format_takeover(&report));
-                self.last_result = Some(crate::payload::Payload::Takeover(Box::new(report)));
-                CommandResult::Continue
-            }
-            Err(e) => {
-                spinner.finish();
-                CommandResult::Error(e.to_string())
-            }
-        }
-    }
-
-    async fn execute_confusables(&mut self, args: &[&str]) -> CommandResult {
-        if args.is_empty() {
-            return CommandResult::Error("Usage: confusables <domain>".to_string());
-        }
-        let domain = args[0];
-        let spinner = Spinner::new(&format!("Scanning look-alikes for {}", domain));
-        let lookup = seer_core::SmartLookup::from_config(&self.context.config);
-        match seer_core::find_confusables(&lookup, domain, self.context.config.bulk.concurrency)
-            .await
-        {
-            Ok(report) => {
-                spinner.finish();
-                let formatter = seer_core::output::get_formatter(self.context.output_format);
-                println!("{}", formatter.format_confusables(&report));
-                self.last_result = Some(crate::payload::Payload::Confusables(Box::new(
-                    report.clone(),
-                )));
-                CommandResult::Continue
-            }
-            Err(e) => {
-                spinner.finish();
-                CommandResult::Error(e.to_string())
-            }
         }
     }
 
@@ -1530,7 +780,7 @@ mod delegation_repl_tests {
     #[tokio::test]
     async fn delegation_requires_a_domain() {
         let mut repl = Repl::new().expect("repl construction is offline");
-        let result = repl.execute_delegation(&[]).await;
+        let result = repl.execute_line("delegation").await;
         let CommandResult::Error(msg) = result else {
             panic!("expected usage error, got {result:?}");
         };
@@ -1542,7 +792,7 @@ mod delegation_repl_tests {
         let mut repl = Repl::new().expect("repl construction is offline");
         // Consecutive dots fail normalize_domain inside check() before any
         // network I/O, so this stays hermetic.
-        let result = repl.execute_delegation(&["bad..domain"]).await;
+        let result = repl.execute_line("delegation bad..domain").await;
         let CommandResult::Error(msg) = result else {
             panic!("expected invalid-domain error, got {result:?}");
         };
@@ -1634,14 +884,14 @@ mod record_type_tests {
     #[tokio::test]
     async fn dig_rejects_invalid_record_type() {
         let mut repl = Repl::new().expect("repl construction is offline");
-        let result = repl.execute_dig(&["example.com", "BOGUS"]).await;
+        let result = repl.execute_line("dig example.com BOGUS").await;
         assert_rejects(&result);
     }
 
     #[tokio::test]
     async fn propagation_rejects_invalid_record_type() {
         let mut repl = Repl::new().expect("repl construction is offline");
-        let result = repl.execute_propagation(&["example.com", "BOGUS"]).await;
+        let result = repl.execute_line("propagation example.com BOGUS").await;
         assert_rejects(&result);
     }
 
@@ -1649,7 +899,7 @@ mod record_type_tests {
     async fn compare_rejects_invalid_record_type() {
         let mut repl = Repl::new().expect("repl construction is offline");
         let result = repl
-            .execute_compare(&["example.com", "BOGUS", "@8.8.8.8", "@1.1.1.1"])
+            .execute_line("compare example.com BOGUS @8.8.8.8 @1.1.1.1")
             .await;
         assert_rejects(&result);
     }

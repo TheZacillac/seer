@@ -1,7 +1,8 @@
 use seer_core::output::OutputFormat;
-use seer_core::SeerConfig;
+use seer_core::{RecordType, SeerConfig};
 
 use super::catalog;
+use crate::query::Query;
 
 #[derive(Debug, Clone)]
 pub struct CommandContext {
@@ -96,6 +97,116 @@ pub fn split_quoted_literal(line: &str) -> Result<Vec<String>, String> {
         tokens.push(current);
     }
     Ok(tokens)
+}
+
+/// Parses a tokenized REPL line into a single-shot [`Query`]. `command` is
+/// the lowercased first token and `parts` the whole line; a first token with
+/// a dot is a bare domain (`example.com` means `lookup example.com`).
+/// Everything is validated here, before any network I/O.
+pub fn parse_query(command: &str, parts: &[&str]) -> Result<Query, String> {
+    let args = &parts[1..];
+    // The first argument, or the command's usage line.
+    let arg = || {
+        args.first()
+            .map(|a| a.to_string())
+            .ok_or_else(|| catalog::usage(command))
+    };
+    Ok(match catalog::canonical(command) {
+        "lookup" => Query::Lookup(arg()?),
+        "info" => Query::Info(arg()?),
+        "whois" => Query::Whois(arg()?),
+        "rdap" => Query::Rdap(arg()?),
+        "dig" => {
+            let domain = arg()?;
+            let (mut servers, record_type) = servers_and_type(&args[1..])?;
+            Query::Dig {
+                domain,
+                record_type,
+                server: servers.pop(),
+            }
+        }
+        "prop" => Query::Prop {
+            domain: arg()?,
+            record_type: match args.get(1) {
+                Some(name) => crate::try_parse_record_type(name)?,
+                None => RecordType::A,
+            },
+        },
+        "status" => Query::Status(arg()?),
+        "reverse" => Query::Reverse(arg()?),
+        "avail" => Query::Avail(arg()?),
+        "dnssec" => Query::Dnssec(arg()?),
+        "ssl" => Query::Ssl(arg()?),
+        "tld" => Query::Tld(arg()?),
+        "compare" => {
+            if args.len() < 3 {
+                return Err(catalog::usage(command));
+            }
+            let (servers, record_type) = servers_and_type(&args[1..])?;
+            let [server_a, server_b, ..] = servers.as_slice() else {
+                return Err("Need two nameservers (e.g., @8.8.8.8 @1.1.1.1)".to_string());
+            };
+            Query::Compare {
+                domain: args[0].to_string(),
+                record_type,
+                server_a: server_a.clone(),
+                server_b: server_b.clone(),
+            }
+        }
+        "subdomains" => {
+            let SubdomainsArgs {
+                domain,
+                resolve,
+                diff,
+                record,
+            } = parse_subdomains_args(args)?;
+            Query::Subdomains {
+                domain,
+                resolve,
+                diff,
+                record,
+            }
+        }
+        "diff" => match args {
+            [a, b, ..] => Query::Diff(a.to_string(), b.to_string()),
+            _ => return Err(catalog::usage(command)),
+        },
+        "drift" => {
+            let DriftArgs { domain, record } = parse_drift_args(args)?;
+            Query::Drift { domain, record }
+        }
+        "caa" => Query::Caa(arg()?),
+        "posture" => Query::Posture(arg()?),
+        "headers" => Query::Headers(arg()?),
+        "takeover" => {
+            let TakeoverArgs { domain, hosts } = parse_takeover_args(args)?;
+            Query::Takeover { domain, hosts }
+        }
+        "confusables" => Query::Confusables(arg()?),
+        "doctor" => Query::Doctor,
+        "delegation" => Query::Delegation(arg()?),
+        _ if command.contains('.') => Query::Lookup(parts[0].to_string()),
+        _ => {
+            return Err(format!(
+                "Unknown command: {}. Type 'help' for available commands.",
+                command
+            ))
+        }
+    })
+}
+
+/// Splits DNS command arguments into `@server`s and a record type (default
+/// A). A typo'd type must error, not silently query A records.
+fn servers_and_type(args: &[&str]) -> Result<(Vec<String>, RecordType), String> {
+    let mut servers = Vec::new();
+    let mut record_type = RecordType::A;
+    for arg in args {
+        match arg.strip_prefix('@') {
+            Some(server) => servers.push(server.to_string()),
+            None => record_type = crate::try_parse_record_type(arg)?,
+        }
+    }
+    Ok((servers, record_type))
 }
 
 /// Returns a usage error for an unrecognized `--flag` / `-f` token, so a typo
@@ -243,7 +354,7 @@ pub struct BulkArgs {
     /// Input file path as typed.
     pub file: String,
     /// Record type for dig/prop operations (defaults to A).
-    pub record_type: seer_core::RecordType,
+    pub record_type: RecordType,
     /// Output CSV path from `-o`/`--output`, if given.
     pub output: Option<String>,
 }
@@ -263,7 +374,7 @@ pub fn parse_bulk_args(args: &[&str]) -> Result<BulkArgs, String> {
 
     let operation = args[0].to_string();
     let file = args[1].to_string();
-    let mut record_type = seer_core::RecordType::A;
+    let mut record_type = RecordType::A;
     let mut output: Option<String> = None;
 
     let mut i = 2;
@@ -300,7 +411,7 @@ pub struct FollowArgs {
     /// Minutes between checks; may be fractional (defaults to 1.0).
     pub interval_minutes: f64,
     /// Record type to monitor (defaults to A).
-    pub record_type: seer_core::RecordType,
+    pub record_type: RecordType,
     /// Nameserver from an inline `@server` argument.
     pub nameserver: Option<String>,
     /// Only print iterations whose records changed.
@@ -325,7 +436,7 @@ pub fn parse_follow_args(args: &[&str]) -> Result<FollowArgs, String> {
         domain: domain.to_string(),
         iterations: 10,
         interval_minutes: 1.0,
-        record_type: seer_core::RecordType::A,
+        record_type: RecordType::A,
         nameserver: None,
         changes_only: false,
     };
@@ -363,7 +474,6 @@ pub fn parse_follow_args(args: &[&str]) -> Result<FollowArgs, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use seer_core::RecordType;
 
     #[test]
     fn bulk_requires_operation_and_file() {
@@ -500,6 +610,54 @@ mod tests {
             parse_follow_args(&["example.com", "--chnages-only"]).expect_err("typo'd flag errors");
         assert!(err.contains("--chnages-only"), "got: {err}");
         assert!(err.contains("Usage: follow"), "got: {err}");
+    }
+
+    // ---------------- parse_query ----------------
+
+    /// Every catalog command that is not a session/multi-step built-in must
+    /// be a query: with no arguments it parses (doctor) or reports exactly
+    /// its catalog usage — never "Unknown command".
+    #[test]
+    fn every_query_command_parses_or_reports_its_usage() {
+        let builtins = [
+            "help", "exit", "bulk", "follow", "watch", "history", "set", "copy", "clear",
+        ];
+        for command in catalog::commands().filter(|c| !builtins.contains(&c.name)) {
+            if let Err(e) = parse_query(command.name, &[command.name]) {
+                assert!(
+                    e.starts_with(&catalog::usage(command.name)),
+                    "{}: {e}",
+                    command.name
+                );
+            }
+        }
+        assert!(matches!(
+            parse_query("doctor", &["doctor"]),
+            Ok(Query::Doctor)
+        ));
+    }
+
+    #[test]
+    fn parse_query_handles_aliases_servers_and_bare_domains() {
+        assert!(matches!(
+            parse_query("dns", &["DNS", "example.com", "MX", "@1.1.1.1"]),
+            Ok(Query::Dig { record_type: RecordType::MX, server: Some(ref s), .. }) if s == "1.1.1.1"
+        ));
+        assert!(matches!(
+            parse_query("compare", &["compare", "example.com", "@8.8.8.8", "@1.1.1.1"]),
+            Ok(Query::Compare { ref server_a, ref server_b, .. })
+                if server_a == "8.8.8.8" && server_b == "1.1.1.1"
+        ));
+        let err = parse_query("compare", &["compare", "example.com", "MX", "@8.8.8.8"])
+            .err()
+            .expect("one server");
+        assert!(err.starts_with("Need two nameservers"), "got: {err}");
+        assert!(matches!(
+            parse_query("example.com", &["Example.COM"]),
+            Ok(Query::Lookup(ref d)) if d == "Example.COM"
+        ));
+        let err = parse_query("bogus", &["bogus"]).err().expect("unknown");
+        assert!(err.starts_with("Unknown command: bogus"), "got: {err}");
     }
 
     // ---------------- subdomains / takeover / drift ----------------
