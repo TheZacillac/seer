@@ -360,8 +360,8 @@ NAMESERVER_SPECS = [
 
 
 def test_stale_bindings_without_nameserver_target_fail_clearly(client, monkeypatch):
-    """Bindings older than the SSRF guard still satisfy the domain-seer floor;
-    a nameserver request must then get a clear 503, not an AttributeError 500."""
+    """Bindings older than the SSRF guard (e.g. a stale local build) must get a
+    clear 503 on a nameserver request, not an AttributeError 500."""
     from seer_api import ssrf
 
     monkeypatch.delattr(seer, "nameserver_target", raising=False)
