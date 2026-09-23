@@ -50,7 +50,7 @@ pub mod webhook;
 pub mod whois;
 
 pub use availability::{AvailabilityChecker, AvailabilityResult};
-pub use cache::{SingleValueCache, TtlCache};
+pub use cache::TtlCache;
 pub use config::SeerConfig;
 pub use error::{Result, SeerError};
 pub use retry::{NetworkRetryClassifier, RetryClassifier, RetryExecutor, RetryPolicy};
