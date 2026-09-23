@@ -207,11 +207,13 @@ pub fn bulk_summary(results: &[BulkResult]) -> String {
 }
 
 /// Runs a live `follow` for the CLI and the REPL: raw mode so Esc / Ctrl-C
-/// cancel (restored on drop, even if a panic unwinds — issue #60), and each
-/// iteration streamed to stdout as it lands. The key listener is stopped
-/// before returning so it cannot swallow keystrokes meant for whatever reads
-/// the terminal next. `handle_sigint` also cancels on SIGINT, the only
-/// interrupt path when there is no terminal for the key listener.
+/// cancel, and each iteration streamed to stdout as it lands. Raw mode is
+/// left by [`RawModeGuard`](crate::utils::RawModeGuard) on return or unwind,
+/// and by `main`'s panic hook when `panic = "abort"` skips Drop (issue #60).
+/// The key listener is stopped before returning so it cannot swallow
+/// keystrokes meant for whatever reads the terminal next. `handle_sigint`
+/// also cancels on SIGINT, the only interrupt path when there is no terminal
+/// for the key listener.
 pub async fn run_live_follow(
     follower: &seer_core::DnsFollower,
     domain: &str,

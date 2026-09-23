@@ -4,10 +4,12 @@ use chrono::{DateTime, Utc};
 use seer_core::bulk::{BulkResult, BulkResultData};
 
 /// RAII guard that enables crossterm raw mode on creation and disables it on
-/// drop — including when a panic unwinds through the guarded region. The
-/// `follow` command (CLI and REPL) enables raw mode to capture an Esc/Ctrl-C
-/// keypress; without a Drop guard, a panic during a live follow left the
-/// terminal stuck in raw mode and the user needed `reset` (issue #60).
+/// drop. The `follow` command (CLI and REPL) enables raw mode to capture an
+/// Esc/Ctrl-C keypress; a panic during a live follow used to leave the
+/// terminal stuck in raw mode, needing `reset` (issue #60). Drop covers a
+/// panic that unwinds; shipped binaries build with `panic = "abort"`
+/// (`[profile.dist]`), which skips Drop, so there the panic hook from
+/// [`install_raw_mode_panic_hook`] restores the terminal instead.
 ///
 /// If enabling raw mode fails (e.g. stdin is not a TTY), the guard is inert and
 /// its drop is a no-op, so we never disable a mode we did not enable.
@@ -41,6 +43,19 @@ impl Drop for RawModeGuard {
             let _ = crossterm::terminal::disable_raw_mode();
         }
     }
+}
+
+/// Installs a process-wide panic hook that leaves raw mode, then chains to
+/// the previous hook (so the panic message prints on a cooked terminal).
+/// Unlike [`RawModeGuard`]'s Drop, a hook also runs under `panic = "abort"`.
+/// Leaving raw mode is harmless when it is off (a no-op on Unix), so `main`
+/// installs this once, first thing; the TUI's own hook chains on top of it.
+pub fn install_raw_mode_panic_hook() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = crossterm::terminal::disable_raw_mode();
+        previous(info);
+    }));
 }
 
 /// Poll timeout for the follow key listener; also bounds how long
@@ -699,6 +714,34 @@ mod tests {
         // Drop must never disable a mode that was never enabled (issue #60).
         let guard = RawModeGuard::new();
         drop(guard); // must not panic
+    }
+
+    #[test]
+    fn raw_mode_panic_hook_chains_to_previous_hook() {
+        // The marker payload tells this panic apart from any other test's
+        // panicking concurrently; those still reach the harness's hook.
+        struct Marker;
+        static CHAINED: AtomicBool = AtomicBool::new(false);
+
+        let original = std::sync::Arc::new(std::panic::take_hook());
+        let forward = std::sync::Arc::clone(&original);
+        std::panic::set_hook(Box::new(move |info| {
+            if info.payload().is::<Marker>() {
+                CHAINED.store(true, Ordering::SeqCst);
+            } else {
+                forward(info);
+            }
+        }));
+        install_raw_mode_panic_hook();
+        let caught = std::panic::catch_unwind(|| std::panic::panic_any(Marker));
+        // Restore the harness's hook before asserting.
+        std::panic::set_hook(Box::new(move |info| original(info)));
+
+        assert!(caught.is_err());
+        assert!(
+            CHAINED.load(Ordering::SeqCst),
+            "the raw-mode hook must chain to the hook installed before it"
+        );
     }
 
     #[test]

@@ -457,6 +457,10 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // First, so no panic leaves crossterm's raw mode on, even under the dist
+    // profile's panic = "abort", which skips RawModeGuard's Drop.
+    utils::install_raw_mode_panic_hook();
+
     // Initialize tracing with progress-aware writer.
     // Routes log output through the progress bar when one is active,
     // preventing logs from interfering with progress bar display.

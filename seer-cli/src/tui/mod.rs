@@ -84,7 +84,8 @@ fn restore_terminal(terminal: &mut Term) -> Result<()> {
     Ok(())
 }
 
-/// Restore the terminal even if a panic unwinds through the draw loop.
+/// Restore the terminal on a panic in the draw loop, unwinding or not (a hook
+/// also runs under `panic = "abort"`); chains to `main`'s raw-mode hook.
 ///
 /// Mirrors [`restore_terminal`], including re-showing the cursor: ratatui hides
 /// the cursor on every `draw`, so without `cursor::Show` a panic after the first
