@@ -479,48 +479,61 @@ fn build_progress_callback(
     }
 }
 
-#[pyfunction]
-#[pyo3(signature = (domains, concurrency = 10, *, progress = None))]
-fn bulk_lookup<'py>(
+/// Runs a prepared batch on a fresh executor and returns its serialized
+/// results. Deliberately non-generic, so the executor future is instantiated
+/// once rather than per binding.
+fn execute_bulk<'py>(
     py: Python<'py>,
-    domains: Vec<String>,
+    operations: Vec<BulkOperation>,
     concurrency: usize,
     progress: Option<Py<PyAny>>,
 ) -> PyResult<Bound<'py, PyAny>> {
-    validate_domains(&domains)?;
-    let executor = BulkExecutor::new().with_concurrency(validate_concurrency(concurrency)?);
-
-    let operations: Vec<BulkOperation> = domains
-        .into_iter()
-        .map(|domain| BulkOperation::Lookup { domain })
-        .collect();
-
+    let executor = BulkExecutor::new().with_concurrency(concurrency);
     let cb = build_progress_callback(progress)?;
     let result = run_async_infallible(py, async move { executor.execute(operations, cb).await })?;
-
     to_py(py, &result)
 }
 
-#[pyfunction]
-#[pyo3(signature = (domains, concurrency = 10, *, progress = None))]
-fn bulk_whois<'py>(
+/// Validates a bulk call's domain count and concurrency, then runs one
+/// operation per domain.
+fn run_bulk<'py>(
     py: Python<'py>,
     domains: Vec<String>,
     concurrency: usize,
     progress: Option<Py<PyAny>>,
+    op: impl Fn(String) -> BulkOperation,
 ) -> PyResult<Bound<'py, PyAny>> {
     validate_domains(&domains)?;
-    let executor = BulkExecutor::new().with_concurrency(validate_concurrency(concurrency)?);
+    let concurrency = validate_concurrency(concurrency)?;
+    let operations = domains.into_iter().map(op).collect();
+    execute_bulk(py, operations, concurrency, progress)
+}
 
-    let operations: Vec<BulkOperation> = domains
-        .into_iter()
-        .map(|domain| BulkOperation::Whois { domain })
-        .collect();
+/// Generates the `bulk_*` bindings whose operation needs only the domain.
+macro_rules! bulk_fn {
+    ($($name:ident => $variant:ident;)*) => {$(
+        #[pyfunction]
+        #[pyo3(signature = (domains, concurrency = 10, *, progress = None))]
+        fn $name<'py>(
+            py: Python<'py>,
+            domains: Vec<String>,
+            concurrency: usize,
+            progress: Option<Py<PyAny>>,
+        ) -> PyResult<Bound<'py, PyAny>> {
+            run_bulk(py, domains, concurrency, progress, |domain| {
+                BulkOperation::$variant { domain }
+            })
+        }
+    )*};
+}
 
-    let cb = build_progress_callback(progress)?;
-    let result = run_async_infallible(py, async move { executor.execute(operations, cb).await })?;
-
-    to_py(py, &result)
+bulk_fn! {
+    bulk_lookup => Lookup;
+    bulk_whois => Whois;
+    bulk_status => Status;
+    bulk_ssl => Ssl;
+    bulk_availability => Avail;
+    bulk_info => Info;
 }
 
 #[pyfunction]
@@ -533,22 +546,16 @@ fn bulk_dig<'py>(
     progress: Option<Py<PyAny>>,
 ) -> PyResult<Bound<'py, PyAny>> {
     validate_domains(&domains)?;
-    let executor = BulkExecutor::new().with_concurrency(validate_concurrency(concurrency)?);
-
-    let rt_parsed = parse_record_type(record_type)?;
-
-    let operations: Vec<BulkOperation> = domains
+    let concurrency = validate_concurrency(concurrency)?;
+    let record_type = parse_record_type(record_type)?;
+    let operations = domains
         .into_iter()
         .map(|domain| BulkOperation::Dns {
             domain,
-            record_type: rt_parsed,
+            record_type,
         })
         .collect();
-
-    let cb = build_progress_callback(progress)?;
-    let result = run_async_infallible(py, async move { executor.execute(operations, cb).await })?;
-
-    to_py(py, &result)
+    execute_bulk(py, operations, concurrency, progress)
 }
 
 #[pyfunction]
@@ -561,88 +568,16 @@ fn bulk_propagation<'py>(
     progress: Option<Py<PyAny>>,
 ) -> PyResult<Bound<'py, PyAny>> {
     validate_domains(&domains)?;
-    let executor = BulkExecutor::new().with_concurrency(validate_concurrency(concurrency)?);
-
-    let rt_parsed = parse_record_type(record_type)?;
-
-    let operations: Vec<BulkOperation> = domains
+    let concurrency = validate_concurrency(concurrency)?;
+    let record_type = parse_record_type(record_type)?;
+    let operations = domains
         .into_iter()
         .map(|domain| BulkOperation::Propagation {
             domain,
-            record_type: rt_parsed,
+            record_type,
         })
         .collect();
-
-    let cb = build_progress_callback(progress)?;
-    let result = run_async_infallible(py, async move { executor.execute(operations, cb).await })?;
-
-    to_py(py, &result)
-}
-
-#[pyfunction]
-#[pyo3(signature = (domains, concurrency = 10, *, progress = None))]
-fn bulk_status<'py>(
-    py: Python<'py>,
-    domains: Vec<String>,
-    concurrency: usize,
-    progress: Option<Py<PyAny>>,
-) -> PyResult<Bound<'py, PyAny>> {
-    validate_domains(&domains)?;
-    let executor = BulkExecutor::new().with_concurrency(validate_concurrency(concurrency)?);
-
-    let operations: Vec<BulkOperation> = domains
-        .into_iter()
-        .map(|domain| BulkOperation::Status { domain })
-        .collect();
-
-    let cb = build_progress_callback(progress)?;
-    let result = run_async_infallible(py, async move { executor.execute(operations, cb).await })?;
-
-    to_py(py, &result)
-}
-
-#[pyfunction]
-#[pyo3(signature = (domains, concurrency = 10, *, progress = None))]
-fn bulk_ssl<'py>(
-    py: Python<'py>,
-    domains: Vec<String>,
-    concurrency: usize,
-    progress: Option<Py<PyAny>>,
-) -> PyResult<Bound<'py, PyAny>> {
-    validate_domains(&domains)?;
-    let executor = BulkExecutor::new().with_concurrency(validate_concurrency(concurrency)?);
-
-    let operations: Vec<BulkOperation> = domains
-        .into_iter()
-        .map(|domain| BulkOperation::Ssl { domain })
-        .collect();
-
-    let cb = build_progress_callback(progress)?;
-    let result = run_async_infallible(py, async move { executor.execute(operations, cb).await })?;
-
-    to_py(py, &result)
-}
-
-#[pyfunction]
-#[pyo3(signature = (domains, concurrency = 10, *, progress = None))]
-fn bulk_availability<'py>(
-    py: Python<'py>,
-    domains: Vec<String>,
-    concurrency: usize,
-    progress: Option<Py<PyAny>>,
-) -> PyResult<Bound<'py, PyAny>> {
-    validate_domains(&domains)?;
-    let executor = BulkExecutor::new().with_concurrency(validate_concurrency(concurrency)?);
-
-    let operations: Vec<BulkOperation> = domains
-        .into_iter()
-        .map(|domain| BulkOperation::Avail { domain })
-        .collect();
-
-    let cb = build_progress_callback(progress)?;
-    let result = run_async_infallible(py, async move { executor.execute(operations, cb).await })?;
-
-    to_py(py, &result)
+    execute_bulk(py, operations, concurrency, progress)
 }
 
 #[pyfunction]
@@ -843,28 +778,6 @@ fn info<'py>(py: Python<'py>, domain: String) -> PyResult<Bound<'py, PyAny>> {
     let lookup_result = run_async(py, async move { smart_lookup.lookup(&domain).await })?;
     let domain_info = seer_core::domain_info::DomainInfo::from_lookup_result(&lookup_result);
     to_py(py, &domain_info)
-}
-
-#[pyfunction]
-#[pyo3(signature = (domains, concurrency = 10, *, progress = None))]
-fn bulk_info<'py>(
-    py: Python<'py>,
-    domains: Vec<String>,
-    concurrency: usize,
-    progress: Option<Py<PyAny>>,
-) -> PyResult<Bound<'py, PyAny>> {
-    validate_domains(&domains)?;
-    let executor = BulkExecutor::new().with_concurrency(validate_concurrency(concurrency)?);
-
-    let operations: Vec<BulkOperation> = domains
-        .into_iter()
-        .map(|domain| BulkOperation::Info { domain })
-        .collect();
-
-    let cb = build_progress_callback(progress)?;
-    let result = run_async_infallible(py, async move { executor.execute(operations, cb).await })?;
-
-    to_py(py, &result)
 }
 
 /// Look up information about a TLD: WHOIS server, RDAP endpoint, registry
