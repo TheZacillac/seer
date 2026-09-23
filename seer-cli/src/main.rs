@@ -111,7 +111,7 @@ Example Output (info operation):
 
 Example Output (ssl operation):
   domain,success,subject,issuer,valid_from,valid_until,days_remaining,signature_algorithm,key_type,key_bits,chain_length,san_count,sans,protocol_version,is_valid,duration_ms,error
-  example.com,true,CN=*.example.com,"C=US, O=DigiCert Inc, CN=DigiCert Global G2 TLS RSA SHA256 2020 CA1",2024-01-30,2025-03-01,89,sha256WithRSAEncryption,RSA,2048,3,2,*.example.com;example.com,TLS 1.3,true,612,
+  example.com,true,CN=*.example.com,"C=US, O=DigiCert Inc, CN=DigiCert Global G2 TLS RSA SHA256 2020 CA1",2024-01-30,2025-03-01,89,sha256WithRSAEncryption,RSA,2048,3,2,*.example.com;example.com,TLSv1.3,true,612,
 
 Example Output (posture operation):
   domain,success,spf_verdict,spf_all_qualifier,dmarc_verdict,dmarc_policy,mta_sts_verdict,bimi_verdict,dane_verdict,notes,duration_ms,error

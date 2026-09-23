@@ -786,7 +786,7 @@ mod tests {
                     ..sample_cert_detail()
                 },
             ],
-            protocol_version: Some("TLS 1.3".to_string()),
+            protocol_version: Some("TLSv1.3".to_string()),
             san_names: vec!["example.com".to_string(), "www.example.com".to_string()],
             is_valid: true,
             hostname_verified: true,
@@ -821,7 +821,7 @@ mod tests {
         assert!(row.contains(",sha256WithRSAEncryption,RSA,2048,"));
         // chain_length=2, san_count=2, sans joined
         assert!(row.contains(",2,2,example.com;www.example.com,"));
-        assert!(row.contains(",TLS 1.3,true,612,"));
+        assert!(row.contains(",TLSv1.3,true,612,"));
         assert!(
             row.contains("\"C=US, O=Test Org, CN=Test Root CA\""),
             "issuer should be RFC-4180 quoted when it contains commas; got row: {row}"
@@ -1731,7 +1731,7 @@ mod tests {
                 csv("ssl", &ssl),
                 concat!(
                     "domain,success,subject,issuer,valid_from,valid_until,days_remaining,signature_algorithm,key_type,key_bits,chain_length,san_count,sans,protocol_version,is_valid,duration_ms,error\n",
-                    "example.com,true,CN=example.com,\"C=US, O=Test Org, CN=Test Root CA\",2024-01-30,2025-03-01,89,sha256WithRSAEncryption,RSA,2048,2,2,example.com;www.example.com,TLS 1.3,true,42,\n",
+                    "example.com,true,CN=example.com,\"C=US, O=Test Org, CN=Test Root CA\",2024-01-30,2025-03-01,89,sha256WithRSAEncryption,RSA,2048,2,2,example.com;www.example.com,TLSv1.3,true,42,\n",
                     "bad.invalid,false,,,,,,,,,,,,,,7,\"timed out, giving up\"\n",
                 )
             );
