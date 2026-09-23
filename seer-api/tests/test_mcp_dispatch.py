@@ -12,6 +12,7 @@ import asyncio
 import threading
 
 import seer
+from seer_api.mcp import server
 from seer_api.mcp.server import execute_tool
 
 
@@ -102,3 +103,12 @@ def test_mcp_tld_info_dispatches_on_bounded_pool(monkeypatch):
     # normalizes it.
     assert captured["tld"] == ".com"
     assert captured["thread"].startswith("seer-dispatch")
+
+
+def test_mcp_success_payload_is_compact_json(monkeypatch):
+    """Indentation is pure token overhead in the host LLM's context."""
+    monkeypatch.setattr(seer, "lookup", lambda d: {"domain": d, "ns": ["a", "b"]}, raising=False)
+
+    out = asyncio.run(server.call_tool("seer_lookup", {"domain": "example.com"}))
+
+    assert out[0].text == server.UNTRUSTED_PREAMBLE + '{"domain":"example.com","ns":["a","b"]}'

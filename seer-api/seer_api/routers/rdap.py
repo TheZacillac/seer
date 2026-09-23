@@ -4,7 +4,7 @@ from fastapi import APIRouter, Path, Request
 
 import seer
 from seer_api._run import run_seer
-from seer_api.errors import http_error
+from seer_api.errors import as_http
 from seer_api.limiting import limiter
 from seer_api.ssrf import guard_async as ssrf_guard_async
 
@@ -26,10 +26,7 @@ async def rdap_domain_lookup(
     Returns:
         RDAP response with registration information
     """
-    try:
-        return await run_seer(seer.rdap_domain, domain)
-    except Exception as e:
-        raise http_error(e, "RDAP domain lookup failed") from e
+    return await as_http(run_seer(seer.rdap_domain, domain), "RDAP domain lookup failed")
 
 
 @router.get("/ip/{ip}")
@@ -48,10 +45,7 @@ async def rdap_ip_lookup(
         RDAP response with network registration information
     """
     await ssrf_guard_async(ip, 443)
-    try:
-        return await run_seer(seer.rdap_ip, ip)
-    except Exception as e:
-        raise http_error(e, "RDAP IP lookup failed") from e
+    return await as_http(run_seer(seer.rdap_ip, ip), "RDAP IP lookup failed")
 
 
 @router.get("/asn/{asn}")
@@ -69,7 +63,4 @@ async def rdap_asn_lookup(
     Returns:
         RDAP response with ASN registration information
     """
-    try:
-        return await run_seer(seer.rdap_asn, asn)
-    except Exception as e:
-        raise http_error(e, "RDAP ASN lookup failed") from e
+    return await as_http(run_seer(seer.rdap_asn, asn), "RDAP ASN lookup failed")

@@ -2,77 +2,30 @@ use super::*;
 
 impl MarkdownFormatter {
     pub(super) fn format_whois(&self, response: &WhoisResponse) -> String {
-        let mut output = Vec::new();
-
-        output.push(format!("## WHOIS: {}", MdSafe(&response.domain)));
-        output.push(String::new());
+        let mut output = vec![
+            format!("## WHOIS: {}", MdSafe(&response.domain)),
+            String::new(),
+        ];
 
         if response.is_available() {
             output.push("Domain is **available** for registration.".to_string());
             return output.join("\n");
         }
 
-        if let Some(ref registrar) = response.registrar {
-            output.push(format!("- **Registrar**: {}", MdSafe(registrar)));
-        }
-        if let Some(ref registrant) = response.registrant {
-            output.push(format!("- **Registrant**: {}", MdSafe(registrant)));
-        }
-        if let Some(ref organization) = response.organization {
-            output.push(format!("- **Organization**: {}", MdSafe(organization)));
-        }
-
-        if let Some(created) = response.creation_date {
-            output.push(format!("- **Created**: `{}`", created.format("%Y-%m-%d")));
-        }
-        if let Some(expires) = response.expiration_date {
-            let days_until = days_until(expires);
-            output.push(format!(
-                "- **Expires**: `{}` ({} days)",
-                expires.format("%Y-%m-%d"),
-                days_until
-            ));
-        }
-        if let Some(updated) = response.updated_date {
-            output.push(format!("- **Updated**: `{}`", updated.format("%Y-%m-%d")));
-        }
-
-        if !response.nameservers.is_empty() {
-            output.push(format!(
-                "- **Nameservers**: {}",
-                response
-                    .nameservers
-                    .iter()
-                    .map(|ns| format!("`{}`", MdSafe(ns)))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
-        }
-
-        if !response.status.is_empty() {
-            output.push(format!(
-                "- **Status**: {}",
-                response
-                    .status
-                    .iter()
-                    .map(|s| format!("`{}`", MdSafe(s)))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
-        }
-
-        if let Some(ref dnssec) = response.dnssec {
-            output.push(format!("- **DNSSEC**: {}", MdSafe(dnssec)));
-        }
-
-        output.push(format!(
-            "- **WHOIS Server**: `{}`",
-            MdSafe(&response.whois_server)
-        ));
-
+        let mut b = Bullets(&mut output);
+        b.opt("Registrar", &response.registrar);
+        b.opt("Registrant", &response.registrant);
+        b.opt("Organization", &response.organization);
+        b.date("Created", response.creation_date);
+        b.expires(response.expiration_date);
+        b.date("Updated", response.updated_date);
+        b.code_list("Nameservers", &response.nameservers);
+        b.code_list("Status", &response.status);
+        b.opt("DNSSEC", &response.dnssec);
+        b.code("WHOIS Server", &response.whois_server);
         // Contact subsections last, so no domain-level field lands under a
         // contact heading.
-        self.format_whois_contacts(&mut output, response);
+        b.contacts(response.contacts());
 
         output.join("\n")
     }
@@ -86,29 +39,9 @@ mod tests {
     fn empty_whois(domain: &str) -> WhoisResponse {
         WhoisResponse {
             domain: domain.to_string(),
-            registrar: None,
-            registrant: None,
-            organization: None,
-            registrant_email: None,
-            registrant_phone: None,
-            registrant_address: None,
-            registrant_country: None,
-            admin_name: None,
-            admin_organization: None,
-            admin_email: None,
-            admin_phone: None,
-            tech_name: None,
-            tech_organization: None,
-            tech_email: None,
-            tech_phone: None,
-            creation_date: None,
-            expiration_date: None,
-            updated_date: None,
-            nameservers: vec![],
             status: vec!["clientTransferProhibited".to_string()],
-            dnssec: None,
             whois_server: "whois.example.invalid".to_string(),
-            raw_response: String::new(),
+            ..Default::default()
         }
     }
 

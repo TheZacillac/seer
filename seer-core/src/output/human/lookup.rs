@@ -2,384 +2,79 @@ use super::*;
 
 impl HumanFormatter {
     pub(super) fn format_lookup(&self, result: &LookupResult) -> String {
-        let mut output = Vec::new();
-
         let domain = result
             .domain_name()
             .unwrap_or_else(|| "Unknown".to_string());
         let header_suffix = match result {
-            LookupResult::Rdap { .. } => "via RDAP".to_string(),
-            LookupResult::Whois { .. } => "via WHOIS".to_string(),
+            LookupResult::Rdap { .. } => "via RDAP",
+            LookupResult::Whois { .. } => "via WHOIS",
             LookupResult::Available { data, .. } => match data.verdict() {
-                "available" => "available".to_string(),
-                "likely_available" => "likely available".to_string(),
-                "registered" => "registered".to_string(),
-                "likely_registered" => "likely registered".to_string(),
-                _ => "status unknown".to_string(),
+                "available" => "available",
+                "likely_available" => "likely available",
+                "registered" => "registered",
+                "likely_registered" => "likely registered",
+                _ => "status unknown",
             },
         };
 
-        output.push(self.header(&format!(
+        let mut output = vec![self.header(&format!(
             "Lookup: {} ({})",
             sanitize_display(&domain),
             header_suffix
-        )));
+        ))];
+        let mut rows = self.rows(&mut output, "  ");
 
         match result {
             LookupResult::Rdap {
                 data,
                 whois_fallback,
             } => {
-                output.push(format!(
-                    "  {}: {}",
-                    self.label("Source"),
-                    self.success("RDAP (modern protocol)")
-                ));
-
-                if let Some(registrar) = data.get_registrar() {
-                    output.push(format!(
-                        "  {}: {}",
-                        self.label("Registrar"),
-                        self.value(&sanitize_display(&registrar))
-                    ));
-                }
-
-                if let Some(registrant) = data.get_registrant() {
-                    output.push(format!(
-                        "  {}: {}",
-                        self.label("Registrant"),
-                        self.value(&sanitize_display(&registrant))
-                    ));
-                }
-
-                if let Some(organization) = data.get_registrant_organization() {
-                    output.push(format!(
-                        "  {}: {}",
-                        self.label("Organization"),
-                        self.value(&sanitize_display(&organization))
-                    ));
-                }
-
-                // Registrant contact details
-                if let Some(contact) = data.get_registrant_contact() {
-                    if contact.has_info() {
-                        output.push(format!("\n  {}:", self.label("Registrant Contact")));
-                        if let Some(ref email) = contact.email {
-                            output.push(format!(
-                                "    {}: {}",
-                                self.label("Email"),
-                                self.value(&sanitize_display(email))
-                            ));
-                        }
-                        if let Some(ref phone) = contact.phone {
-                            output.push(format!(
-                                "    {}: {}",
-                                self.label("Phone"),
-                                self.value(&sanitize_display(phone))
-                            ));
-                        }
-                        if let Some(ref address) = contact.address {
-                            output.push(format!(
-                                "    {}: {}",
-                                self.label("Address"),
-                                self.value(&sanitize_display(address))
-                            ));
-                        }
-                        if let Some(ref country) = contact.country {
-                            output.push(format!(
-                                "    {}: {}",
-                                self.label("Country"),
-                                self.value(&sanitize_display(country))
-                            ));
-                        }
-                    }
-                }
-
-                // Admin contact
-                if let Some(contact) = data.get_admin_contact() {
-                    if contact.has_info() {
-                        output.push(format!("\n  {}:", self.label("Admin Contact")));
-                        if let Some(ref name) = contact.name {
-                            output.push(format!(
-                                "    {}: {}",
-                                self.label("Name"),
-                                self.value(&sanitize_display(name))
-                            ));
-                        }
-                        if let Some(ref org) = contact.organization {
-                            output.push(format!(
-                                "    {}: {}",
-                                self.label("Organization"),
-                                self.value(&sanitize_display(org))
-                            ));
-                        }
-                        if let Some(ref email) = contact.email {
-                            output.push(format!(
-                                "    {}: {}",
-                                self.label("Email"),
-                                self.value(&sanitize_display(email))
-                            ));
-                        }
-                        if let Some(ref phone) = contact.phone {
-                            output.push(format!(
-                                "    {}: {}",
-                                self.label("Phone"),
-                                self.value(&sanitize_display(phone))
-                            ));
-                        }
-                    }
-                }
-
-                // Tech contact
-                if let Some(contact) = data.get_tech_contact() {
-                    if contact.has_info() {
-                        output.push(format!("\n  {}:", self.label("Tech Contact")));
-                        if let Some(ref name) = contact.name {
-                            output.push(format!(
-                                "    {}: {}",
-                                self.label("Name"),
-                                self.value(&sanitize_display(name))
-                            ));
-                        }
-                        if let Some(ref org) = contact.organization {
-                            output.push(format!(
-                                "    {}: {}",
-                                self.label("Organization"),
-                                self.value(&sanitize_display(org))
-                            ));
-                        }
-                        if let Some(ref email) = contact.email {
-                            output.push(format!(
-                                "    {}: {}",
-                                self.label("Email"),
-                                self.value(&sanitize_display(email))
-                            ));
-                        }
-                        if let Some(ref phone) = contact.phone {
-                            output.push(format!(
-                                "    {}: {}",
-                                self.label("Phone"),
-                                self.value(&sanitize_display(phone))
-                            ));
-                        }
-                    }
-                }
-
-                if let Some(created) = data.creation_date() {
-                    output.push(format!(
-                        "  {}: {}",
-                        self.label("Created"),
-                        self.value(&created.format("%Y-%m-%d").to_string())
-                    ));
-                }
-
-                if let Some(expires) = data.expiration_date() {
-                    let days_until = days_until(expires);
-                    let expiry_str = expires.format("%Y-%m-%d").to_string();
-                    let status = self.format_expiry_status(&expiry_str, days_until);
-                    output.push(format!("  {}: {}", self.label("Expires"), status));
-                }
-
-                if !data.status.is_empty() {
-                    output.push(format!("  {}:", self.label("Status")));
-                    for status in &data.status {
-                        output.push(format!("    - {}", self.value(&sanitize_display(status))));
-                    }
-                }
-
-                let nameservers = data.nameserver_names();
-                if !nameservers.is_empty() {
-                    output.push(format!("  {}:", self.label("Nameservers")));
-                    for ns in &nameservers {
-                        output.push(format!("    - {}", self.value(&sanitize_display(ns))));
-                    }
-                }
-
+                rows.kv("Source", self.success("RDAP (modern protocol)"));
+                rows.opt("Registrar", &data.get_registrar());
+                rows.opt("Registrant", &data.get_registrant());
+                rows.opt("Organization", &data.get_registrant_organization());
+                let infos = contact::rdap_contacts(data);
+                let rdap_contacts = detail_views(&infos);
+                rows.contacts(rdap_contacts);
+                rows.date("Created", data.creation_date());
+                rows.expires(data.expiration_date());
+                rows.list("Status", &data.status);
+                rows.list("Nameservers", &data.nameserver_names());
                 if data.is_dnssec_signed() {
-                    output.push(format!(
-                        "  {}: {}",
-                        self.label("DNSSEC"),
-                        self.success("signed")
-                    ));
+                    rows.kv("DNSSEC", self.success("signed"));
                 }
 
                 if let Some(whois) = whois_fallback {
+                    // Only what RDAP didn't already show.
                     let mut extra = Vec::new();
-
-                    // Registrant (if RDAP didn't have it)
+                    let mut fill = self.rows(&mut extra, "    ");
                     if data.get_registrant().is_none() {
-                        if let Some(ref registrant) = whois.registrant {
-                            extra.push(format!(
-                                "    {}: {}",
-                                self.label("Registrant"),
-                                self.value(&sanitize_display(registrant))
-                            ));
-                        }
+                        fill.opt("Registrant", &whois.registrant);
                     }
-
-                    // Organization (if RDAP didn't have it)
                     if data.get_registrant_organization().is_none() {
-                        if let Some(ref org) = whois.organization {
-                            extra.push(format!(
-                                "    {}: {}",
-                                self.label("Organization"),
-                                self.value(&sanitize_display(org))
-                            ));
+                        fill.opt("Organization", &whois.organization);
+                    }
+                    let fallback = contact::ROLES
+                        .into_iter()
+                        .zip(rdap_contacts)
+                        .zip(whois.contacts());
+                    for ((role, rdap), whois_contact) in fallback {
+                        if rdap.is_empty() {
+                            fill.contact(role, whois_contact);
                         }
                     }
-
-                    // Registrant contact details (if RDAP didn't have them)
-                    let rdap_registrant = data.get_registrant_contact();
-                    let rdap_has_registrant =
-                        rdap_registrant.as_ref().is_some_and(|c| c.has_info());
-                    if !rdap_has_registrant {
-                        let has_whois_contact = whois.registrant_email.is_some()
-                            || whois.registrant_phone.is_some()
-                            || whois.registrant_address.is_some()
-                            || whois.registrant_country.is_some();
-                        if has_whois_contact {
-                            extra.push(format!("\n    {}:", self.label("Registrant Contact")));
-                            if let Some(ref email) = whois.registrant_email {
-                                extra.push(format!(
-                                    "      {}: {}",
-                                    self.label("Email"),
-                                    self.value(&sanitize_display(email))
-                                ));
-                            }
-                            if let Some(ref phone) = whois.registrant_phone {
-                                extra.push(format!(
-                                    "      {}: {}",
-                                    self.label("Phone"),
-                                    self.value(&sanitize_display(phone))
-                                ));
-                            }
-                            if let Some(ref address) = whois.registrant_address {
-                                extra.push(format!(
-                                    "      {}: {}",
-                                    self.label("Address"),
-                                    self.value(&sanitize_display(address))
-                                ));
-                            }
-                            if let Some(ref country) = whois.registrant_country {
-                                extra.push(format!(
-                                    "      {}: {}",
-                                    self.label("Country"),
-                                    self.value(&sanitize_display(country))
-                                ));
-                            }
-                        }
-                    }
-
-                    // Admin contact (if RDAP didn't have it)
-                    let rdap_has_admin = data.get_admin_contact().is_some_and(|c| c.has_info());
-                    if !rdap_has_admin {
-                        let has_whois_admin = whois.admin_name.is_some()
-                            || whois.admin_email.is_some()
-                            || whois.admin_phone.is_some();
-                        if has_whois_admin {
-                            extra.push(format!("\n    {}:", self.label("Admin Contact")));
-                            if let Some(ref name) = whois.admin_name {
-                                extra.push(format!(
-                                    "      {}: {}",
-                                    self.label("Name"),
-                                    self.value(&sanitize_display(name))
-                                ));
-                            }
-                            if let Some(ref org) = whois.admin_organization {
-                                extra.push(format!(
-                                    "      {}: {}",
-                                    self.label("Organization"),
-                                    self.value(&sanitize_display(org))
-                                ));
-                            }
-                            if let Some(ref email) = whois.admin_email {
-                                extra.push(format!(
-                                    "      {}: {}",
-                                    self.label("Email"),
-                                    self.value(&sanitize_display(email))
-                                ));
-                            }
-                            if let Some(ref phone) = whois.admin_phone {
-                                extra.push(format!(
-                                    "      {}: {}",
-                                    self.label("Phone"),
-                                    self.value(&sanitize_display(phone))
-                                ));
-                            }
-                        }
-                    }
-
-                    // Tech contact (if RDAP didn't have it)
-                    let rdap_has_tech = data.get_tech_contact().is_some_and(|c| c.has_info());
-                    if !rdap_has_tech {
-                        let has_whois_tech = whois.tech_name.is_some()
-                            || whois.tech_email.is_some()
-                            || whois.tech_phone.is_some();
-                        if has_whois_tech {
-                            extra.push(format!("\n    {}:", self.label("Tech Contact")));
-                            if let Some(ref name) = whois.tech_name {
-                                extra.push(format!(
-                                    "      {}: {}",
-                                    self.label("Name"),
-                                    self.value(&sanitize_display(name))
-                                ));
-                            }
-                            if let Some(ref org) = whois.tech_organization {
-                                extra.push(format!(
-                                    "      {}: {}",
-                                    self.label("Organization"),
-                                    self.value(&sanitize_display(org))
-                                ));
-                            }
-                            if let Some(ref email) = whois.tech_email {
-                                extra.push(format!(
-                                    "      {}: {}",
-                                    self.label("Email"),
-                                    self.value(&sanitize_display(email))
-                                ));
-                            }
-                            if let Some(ref phone) = whois.tech_phone {
-                                extra.push(format!(
-                                    "      {}: {}",
-                                    self.label("Phone"),
-                                    self.value(&sanitize_display(phone))
-                                ));
-                            }
-                        }
-                    }
-
-                    // Updated date (RDAP doesn't typically expose this)
-                    if let Some(updated) = whois.updated_date {
-                        extra.push(format!(
-                            "    {}: {}",
-                            self.label("Updated"),
-                            self.value(&updated.format("%Y-%m-%d").to_string())
-                        ));
-                    }
-
-                    // DNSSEC (if RDAP didn't show it)
+                    // RDAP doesn't typically expose an updated date.
+                    fill.date("Updated", whois.updated_date);
                     if !data.is_dnssec_signed() {
-                        if let Some(ref dnssec) = whois.dnssec {
-                            extra.push(format!(
-                                "    {}: {}",
-                                self.label("DNSSEC"),
-                                self.value(&sanitize_display(dnssec))
-                            ));
-                        }
+                        fill.opt("DNSSEC", &whois.dnssec);
                     }
-
-                    // WHOIS server
                     if !whois.whois_server.is_empty() {
-                        extra.push(format!(
-                            "    {}: {}",
-                            self.label("WHOIS Server"),
-                            self.value(&sanitize_display(&whois.whois_server))
-                        ));
+                        fill.text("WHOIS Server", &whois.whois_server);
                     }
 
                     if !extra.is_empty() {
-                        output.push(format!("\n  {}", self.label("Additional WHOIS data:")));
-                        output.extend(extra);
+                        rows.push(format!("\n  {}", self.label("Additional WHOIS data:")));
+                        rows.extend(extra);
                     }
                 }
             }
@@ -391,197 +86,22 @@ impl HumanFormatter {
                 } else {
                     "WHOIS"
                 };
-                output.push(format!(
-                    "  {}: {}",
-                    self.label("Source"),
-                    self.warning(source_note)
-                ));
-
+                rows.kv("Source", self.warning(source_note));
                 // Error strings can carry upstream server text (e.g. an
                 // IANA-returned WHOIS server name), so sanitize like any
                 // other remote-sourced value.
-                if let Some(ref error) = rdap_error {
-                    output.push(format!(
-                        "  {}: {}",
-                        self.label("RDAP Error"),
-                        self.error(&sanitize_display(error))
-                    ));
+                if let Some(error) = rdap_error {
+                    rows.kv("RDAP Error", self.error(&sanitize_display(error)));
                 }
-
-                if let Some(ref registrar) = data.registrar {
-                    output.push(format!(
-                        "  {}: {}",
-                        self.label("Registrar"),
-                        self.value(&sanitize_display(registrar))
-                    ));
-                }
-
-                if let Some(ref registrant) = data.registrant {
-                    output.push(format!(
-                        "  {}: {}",
-                        self.label("Registrant"),
-                        self.value(&sanitize_display(registrant))
-                    ));
-                }
-
-                if let Some(ref organization) = data.organization {
-                    output.push(format!(
-                        "  {}: {}",
-                        self.label("Organization"),
-                        self.value(&sanitize_display(organization))
-                    ));
-                }
-
-                // Registrant contact details
-                let has_registrant_details = data.registrant_email.is_some()
-                    || data.registrant_phone.is_some()
-                    || data.registrant_address.is_some()
-                    || data.registrant_country.is_some();
-
-                if has_registrant_details {
-                    output.push(format!("\n  {}:", self.label("Registrant Contact")));
-                    if let Some(ref email) = data.registrant_email {
-                        output.push(format!(
-                            "    {}: {}",
-                            self.label("Email"),
-                            self.value(&sanitize_display(email))
-                        ));
-                    }
-                    if let Some(ref phone) = data.registrant_phone {
-                        output.push(format!(
-                            "    {}: {}",
-                            self.label("Phone"),
-                            self.value(&sanitize_display(phone))
-                        ));
-                    }
-                    if let Some(ref address) = data.registrant_address {
-                        output.push(format!(
-                            "    {}: {}",
-                            self.label("Address"),
-                            self.value(&sanitize_display(address))
-                        ));
-                    }
-                    if let Some(ref country) = data.registrant_country {
-                        output.push(format!(
-                            "    {}: {}",
-                            self.label("Country"),
-                            self.value(&sanitize_display(country))
-                        ));
-                    }
-                }
-
-                // Admin contact
-                let has_admin_contact = data.admin_name.is_some()
-                    || data.admin_organization.is_some()
-                    || data.admin_email.is_some()
-                    || data.admin_phone.is_some();
-
-                if has_admin_contact {
-                    output.push(format!("\n  {}:", self.label("Admin Contact")));
-                    if let Some(ref name) = data.admin_name {
-                        output.push(format!(
-                            "    {}: {}",
-                            self.label("Name"),
-                            self.value(&sanitize_display(name))
-                        ));
-                    }
-                    if let Some(ref org) = data.admin_organization {
-                        output.push(format!(
-                            "    {}: {}",
-                            self.label("Organization"),
-                            self.value(&sanitize_display(org))
-                        ));
-                    }
-                    if let Some(ref email) = data.admin_email {
-                        output.push(format!(
-                            "    {}: {}",
-                            self.label("Email"),
-                            self.value(&sanitize_display(email))
-                        ));
-                    }
-                    if let Some(ref phone) = data.admin_phone {
-                        output.push(format!(
-                            "    {}: {}",
-                            self.label("Phone"),
-                            self.value(&sanitize_display(phone))
-                        ));
-                    }
-                }
-
-                // Tech contact
-                let has_tech_contact = data.tech_name.is_some()
-                    || data.tech_organization.is_some()
-                    || data.tech_email.is_some()
-                    || data.tech_phone.is_some();
-
-                if has_tech_contact {
-                    output.push(format!("\n  {}:", self.label("Tech Contact")));
-                    if let Some(ref name) = data.tech_name {
-                        output.push(format!(
-                            "    {}: {}",
-                            self.label("Name"),
-                            self.value(&sanitize_display(name))
-                        ));
-                    }
-                    if let Some(ref org) = data.tech_organization {
-                        output.push(format!(
-                            "    {}: {}",
-                            self.label("Organization"),
-                            self.value(&sanitize_display(org))
-                        ));
-                    }
-                    if let Some(ref email) = data.tech_email {
-                        output.push(format!(
-                            "    {}: {}",
-                            self.label("Email"),
-                            self.value(&sanitize_display(email))
-                        ));
-                    }
-                    if let Some(ref phone) = data.tech_phone {
-                        output.push(format!(
-                            "    {}: {}",
-                            self.label("Phone"),
-                            self.value(&sanitize_display(phone))
-                        ));
-                    }
-                }
-
-                if let Some(created) = data.creation_date {
-                    output.push(format!(
-                        "  {}: {}",
-                        self.label("Created"),
-                        self.value(&created.format("%Y-%m-%d").to_string())
-                    ));
-                }
-
-                if let Some(expires) = data.expiration_date {
-                    let days_until = days_until(expires);
-                    let expiry_str = expires.format("%Y-%m-%d").to_string();
-                    let status = self.format_expiry_status(&expiry_str, days_until);
-                    output.push(format!("  {}: {}", self.label("Expires"), status));
-                }
-
-                if !data.status.is_empty() {
-                    output.push(format!("  {}:", self.label("Status")));
-                    for status in &data.status {
-                        output.push(format!("    - {}", self.value(&sanitize_display(status))));
-                    }
-                }
-
-                if !data.nameservers.is_empty() {
-                    output.push(format!("  {}:", self.label("Nameservers")));
-                    for ns in &data.nameservers {
-                        output.push(format!("    - {}", self.value(&sanitize_display(ns))));
-                    }
-                }
-
-                if let Some(ref dnssec) = data.dnssec {
-                    output.push(format!(
-                        "  {}: {}",
-                        self.label("DNSSEC"),
-                        self.value(&sanitize_display(dnssec))
-                    ));
-                }
+                rows.opt("Registrar", &data.registrar);
+                rows.opt("Registrant", &data.registrant);
+                rows.opt("Organization", &data.organization);
+                rows.contacts(data.contacts());
+                rows.date("Created", data.creation_date);
+                rows.expires(data.expiration_date);
+                rows.list("Status", &data.status);
+                rows.list("Nameservers", &data.nameservers);
+                rows.opt("DNSSEC", &data.dnssec);
             }
             LookupResult::Available {
                 data,
@@ -594,96 +114,42 @@ impl HumanFormatter {
                 } else {
                     "availability check (RDAP and WHOIS failed)"
                 };
-                output.push(format!(
-                    "  {}: {}",
-                    self.label("Source"),
-                    self.warning(source_note)
-                ));
+                rows.kv("Source", self.warning(source_note));
 
-                let verdict_colored = match data.verdict() {
+                let verdict = match data.verdict() {
                     "available" => self.success("AVAILABLE"),
                     "likely_available" => self.warning("MAY BE AVAILABLE"),
                     "registered" => self.value("REGISTERED"),
                     "likely_registered" => self.warning("LIKELY REGISTERED"),
                     _ => self.error("UNKNOWN"),
                 };
-                output.push(format!("  {}: {}", self.label("Verdict"), verdict_colored));
-
-                // Confidence colouring is purely about certainty, independent of
-                // the registered/available answer.
-                let confidence_colored = match data.confidence.as_str() {
-                    "high" => self.success(&data.confidence),
-                    "medium" => self.warning(&data.confidence),
-                    _ => self.error(&data.confidence),
-                };
-                output.push(format!(
-                    "  {}: {}",
-                    self.label("Confidence"),
-                    confidence_colored
-                ));
-
-                output.push(format!(
-                    "  {}: {}",
-                    self.label("Method"),
-                    self.value(&sanitize_display(&data.method))
-                ));
-
-                if let Some(details) = &data.details {
-                    output.push(format!(
-                        "  {}: {}",
-                        self.label("Details"),
-                        self.value(&sanitize_display(details))
-                    ));
-                }
-
+                rows.kv("Verdict", verdict);
+                rows.kv("Confidence", self.confidence(&data.confidence));
+                rows.text("Method", &data.method);
+                rows.opt("Details", &data.details);
                 if !rdap_error.is_empty() {
-                    output.push(format!(
-                        "  {}: {}",
-                        self.label("RDAP Error"),
-                        self.error(&sanitize_display(rdap_error))
-                    ));
+                    rows.kv("RDAP Error", self.error(&sanitize_display(rdap_error)));
                 }
                 if !whois_error.is_empty() {
-                    output.push(format!(
-                        "  {}: {}",
-                        self.label("WHOIS Error"),
-                        self.error(&sanitize_display(whois_error))
-                    ));
+                    rows.kv("WHOIS Error", self.error(&sanitize_display(whois_error)));
                 }
 
                 if let Some(w) = whois_data {
                     let mut extra = Vec::new();
+                    let mut fill = self.rows(&mut extra, "    ");
                     if !w.nameservers.is_empty() {
-                        extra.push(format!(
-                            "    {}: {}",
-                            self.label("Nameservers"),
-                            self.value(&sanitize_display(&w.nameservers.join(", ")))
-                        ));
+                        fill.text("Nameservers", &w.nameservers.join(", "));
                     }
                     if !w.status.is_empty() {
-                        extra.push(format!(
-                            "    {}: {}",
-                            self.label("Status"),
-                            self.value(&sanitize_display(&w.status.join(", ")))
-                        ));
+                        fill.text("Status", &w.status.join(", "));
                     }
-                    if let Some(ref dnssec) = w.dnssec {
-                        extra.push(format!(
-                            "    {}: {}",
-                            self.label("DNSSEC"),
-                            self.value(&sanitize_display(dnssec))
-                        ));
-                    }
+                    fill.opt("DNSSEC", &w.dnssec);
                     if !w.whois_server.is_empty() {
-                        extra.push(format!(
-                            "    {}: {}",
-                            self.label("WHOIS Server"),
-                            self.value(&sanitize_display(&w.whois_server))
-                        ));
+                        fill.text("WHOIS Server", &w.whois_server);
                     }
                     if !extra.is_empty() {
-                        output.push(format!("  {}", self.label("Additional WHOIS data:")));
-                        output.extend(extra);
+                        rows.push(format!("  {}", self.label("Additional WHOIS data:")));
+                        rows.extend(extra);
                     }
                 }
             }
@@ -696,42 +162,31 @@ impl HumanFormatter {
         &self,
         result: &crate::availability::AvailabilityResult,
     ) -> String {
-        let mut output = Vec::new();
-
         let status = if result.available {
             self.success("AVAILABLE")
         } else {
             self.error("TAKEN")
         };
-        output.push(format!("{}: {}", sanitize_display(&result.domain), status));
-        let confidence_colored = match result.confidence.as_str() {
-            "high" => self.success(&result.confidence),
-            "medium" => self.warning(&result.confidence),
-            _ => self.error(&result.confidence),
-        };
-        output.push(format!(
-            "  {}: {}",
-            self.label("Confidence"),
-            confidence_colored
-        ));
-        output.push(format!(
-            "  {}: {}",
-            self.label("Method"),
-            self.value(&sanitize_display(&result.method))
-        ));
-        if let Some(ref details) = result.details {
-            // `details` in `decide_fallback` can interpolate raw `rdap_err`
-            // / `whois_err` strings — those originate from third-party
-            // servers and may contain ANSI escapes. Strip before display
-            // matching every other value-rendering site in this formatter.
-            output.push(format!(
-                "  {}: {}",
-                self.label("Details"),
-                self.value(&sanitize_display(details))
-            ));
-        }
+        let mut output = vec![format!("{}: {}", sanitize_display(&result.domain), status)];
+        let mut rows = self.rows(&mut output, "  ");
+        rows.kv("Confidence", self.confidence(&result.confidence));
+        rows.text("Method", &result.method);
+        // `details` in `decide_fallback` can interpolate raw `rdap_err` /
+        // `whois_err` strings from third-party servers, so it is sanitized
+        // like every other remote value.
+        rows.opt("Details", &result.details);
 
         output.join("\n")
+    }
+
+    /// Colors an availability confidence purely by certainty, independent of
+    /// the registered/available answer.
+    fn confidence(&self, confidence: &str) -> String {
+        match confidence {
+            "high" => self.success(confidence),
+            "medium" => self.warning(confidence),
+            _ => self.error(confidence),
+        }
     }
 }
 
@@ -840,6 +295,109 @@ mod tests {
                 "error text kept: {out:?}"
             );
         }
+    }
+
+    #[test]
+    fn format_lookup_whois_fallback_keeps_organization_only_contacts() {
+        // The WHOIS-fallback admin/tech gate ignored the organization field,
+        // so a contact carrying only an organization (common once a registry
+        // redacts the personal fields) vanished from `seer lookup` while
+        // `seer whois` showed it.
+        let mut whois = WhoisResponse::parse("example.com", "whois.test", "Registrar: R\n");
+        whois.admin_organization = Some("Admin Org LLC".to_string());
+        whois.tech_organization = Some("Tech Org LLC".to_string());
+        let rdap: RdapResponse =
+            serde_json::from_value(serde_json::json!({"ldhName": "example.com"})).unwrap();
+        let result = LookupResult::Rdap {
+            data: Box::new(rdap),
+            whois_fallback: Some(whois),
+        };
+        let out = formatter().format_lookup(&result);
+        for needle in [
+            "Admin Contact",
+            "Admin Org LLC",
+            "Tech Contact",
+            "Tech Org LLC",
+        ] {
+            assert!(out.contains(needle), "missing {needle:?}:\n{out}");
+        }
+    }
+
+    /// RDAP whose registrant entity carries only a name and organization.
+    fn rdap_registrant_identity_only() -> RdapResponse {
+        serde_json::from_value(serde_json::json!({
+            "ldhName": "example.com",
+            "entities": [{
+                "objectClassName": "entity",
+                "roles": ["registrant"],
+                "vcardArray": ["vcard", [
+                    ["fn", {}, "text", "Jane Registrant"],
+                    ["org", {}, "text", "Example LLC"]
+                ]]
+            }]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn rdap_registrant_identity_only_opens_no_empty_contact_heading() {
+        // has_info() counts name/organization, but the Registrant Contact
+        // block renders only email/phone/address/country (name and org are
+        // the top-level lines), so this printed a bare heading.
+        let out = formatter().format_rdap(&rdap_registrant_identity_only());
+        assert!(out.contains("Registrant: Jane Registrant"), "got:\n{out}");
+        assert!(
+            !out.contains("Registrant Contact"),
+            "empty heading rendered:\n{out}"
+        );
+    }
+
+    #[test]
+    fn format_lookup_falls_back_to_whois_registrant_details() {
+        // The same identity-only RDAP registrant also counted as "RDAP has
+        // registrant details", suppressing the WHOIS fallback's email.
+        let mut whois = WhoisResponse::parse("example.com", "whois.test", "Registrar: R\n");
+        whois.registrant_email = Some("owner@example.com".to_string());
+        let result = LookupResult::Rdap {
+            data: Box::new(rdap_registrant_identity_only()),
+            whois_fallback: Some(whois),
+        };
+        let out = formatter().format_lookup(&result);
+        assert_eq!(out.matches("Registrant Contact").count(), 1, "got:\n{out}");
+        assert!(out.contains("Email: owner@example.com"), "got:\n{out}");
+    }
+
+    #[test]
+    fn format_lookup_rdap_admin_and_tech_show_postal_details() {
+        // The lookup view rendered RDAP admin/tech contacts with the WHOIS
+        // field set (name/org/email/phone) and dropped the address and
+        // country that `seer rdap` and markdown lookup both show.
+        let entities = ["administrative", "technical"].map(|role| {
+            serde_json::json!({
+                "objectClassName": "entity",
+                "roles": [role],
+                "vcardArray": ["vcard", [
+                    ["fn", {}, "text", format!("{role} person")],
+                    ["adr", {}, "text", ["", "", "1 Main St", "Springfield", "", "", "US"]]
+                ]]
+            })
+        });
+        let rdap: RdapResponse = serde_json::from_value(serde_json::json!({
+            "ldhName": "example.com",
+            "entities": entities,
+        }))
+        .unwrap();
+        let result = LookupResult::Rdap {
+            data: Box::new(rdap),
+            whois_fallback: None,
+        };
+        let out = formatter().format_lookup(&result);
+        assert_eq!(
+            out.matches("Address: 1 Main St, Springfield, US").count(),
+            2,
+            "got:\n{out}"
+        );
+        assert_eq!(out.matches("Country: US").count(), 2, "got:\n{out}");
     }
 
     #[test]

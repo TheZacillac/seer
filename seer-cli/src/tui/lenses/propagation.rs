@@ -6,7 +6,7 @@ use ratatui::Frame;
 
 use crate::tui::action::LensData;
 use crate::tui::theme::Theme;
-use crate::tui::widgets::{gauge, panel, scroll_to};
+use crate::tui::widgets::{gauge, or_dash, panel, row_style, scroll_to};
 
 pub fn render(
     f: &mut Frame,
@@ -22,9 +22,7 @@ pub fn render(
         .constraints([Constraint::Length(3), Constraint::Min(0)])
         .split(area);
 
-    let top = panel::block(theme, "Propagation", theme.teal, false);
-    let top_inner = top.inner(rows[0]);
-    f.render_widget(top, rows[0]);
+    let top_inner = panel::render(f, rows[0], theme, "Propagation", theme.teal, false);
     let ratio = if p.servers_checked > 0 {
         p.servers_responding as f64 / p.servers_checked as f64
     } else {
@@ -36,26 +34,15 @@ pub fn render(
         top_inner,
     );
 
-    let block = panel::block(theme, "Resolvers", theme.teal, focused);
-    let inner = block.inner(rows[1]);
-    f.render_widget(block, rows[1]);
+    let inner = panel::render(f, rows[1], theme, "Resolvers", theme.teal, focused);
     let header = Row::new(["RESOLVER", "PROVIDER", "REGION", "ANSWER", ""])
         .style(Style::default().fg(theme.overlay0));
     let body = p.results.iter().enumerate().map(|(i, sr)| {
-        let answer = sr
-            .records
-            .first()
-            .map(|r| r.format_short())
-            .unwrap_or_else(|| "—".into());
+        let answer = or_dash(sr.records.first().map(|r| r.format_short()));
         let state = if sr.success {
             format!("{}ms", sr.response_time_ms)
         } else {
             "fail".into()
-        };
-        let style = if focused && i == sel {
-            Style::default().fg(theme.text).bg(theme.surface0)
-        } else {
-            Style::default().fg(theme.text)
         };
         Row::new(vec![
             sr.server.ip.clone(),
@@ -64,7 +51,7 @@ pub fn render(
             answer,
             state,
         ])
-        .style(style)
+        .style(row_style(theme, focused && i == sel))
     });
     let table = Table::new(
         body,

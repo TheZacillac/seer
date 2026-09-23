@@ -25,14 +25,18 @@ def _install_seer_stub() -> None:
     except ImportError:
         pass
     stub = types.ModuleType("seer")
+    # Lets a test skip only here, never for a compiled binding that is stale.
+    stub._IS_STUB = True
 
     def _unused(*_args, **_kwargs):  # pragma: no cover - never hit in unit tests
         raise RuntimeError("seer stub should not be called in these tests")
 
-    # Keep in sync with the #[pymodule] registrations in seer-py/src/lib.rs.
+    # Keep in sync with the #[pymodule] exports in seer-py/src/lib.rs.
     # `validate_public_host` is intentionally NOT stubbed: test_hardening's
     # autouse `_real_seer_validator` fixture keys off the attribute being
-    # absent to install a Python fallback validator for SSRF tests.
+    # absent to install a Python fallback validator for SSRF tests. Nor is
+    # `nameserver_target` (seer-core's spec parser): tests that need it skip
+    # on this stub (`_IS_STUB`).
     for name in (
         "lookup",
         "whois",
@@ -127,13 +131,16 @@ def client():
 
 @pytest.fixture(autouse=True)
 def _reset_rate_limits():
-    """Start every test with empty REST rate-limit counters.
+    """Start every test with empty rate-limit counters.
 
-    The slowapi limiter is module-level and buckets per (client, route), and
-    every TestClient reports the same peer ("testclient"), so hits from one
-    test would otherwise count against the next test's budget for that route.
+    The slowapi limiter (REST routes) and the MCP moving-window limiter (the
+    /mcp gate and per-tool limits) are module-level, and every TestClient
+    reports the same peer ("testclient"), so hits from one test would
+    otherwise count against the next test's budget.
     """
     from seer_api.limiting import limiter
+    from seer_api.mcp import server
 
     limiter.reset()
+    server._rate_limiter = None  # rebuilt, empty, on first use
     yield

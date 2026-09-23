@@ -7,23 +7,19 @@ impl MarkdownFormatter {
         output.push(format!("## TLD Info: .{}", MdSafe(&info.tld)));
         output.push(String::new());
 
-        output.push(format!("- **Type**: {}", MdSafe(&info.tld_type)));
-
-        match info.whois_server {
-            Some(ref server) => {
-                output.push(format!("- **WHOIS Server**: `{}`", MdSafe(server)));
+        let mut b = Bullets(&mut output);
+        b.text("Type", &info.tld_type);
+        // Server endpoints render as code spans, the registry site as text.
+        for (label, value, code) in [
+            ("WHOIS Server", &info.whois_server, true),
+            ("RDAP URL", &info.rdap_url, true),
+            ("Registry URL", &info.registry_url, false),
+        ] {
+            match value {
+                Some(value) if code => b.code(label, value),
+                Some(value) => b.text(label, value),
+                None => b.raw(label, "*not available*"),
             }
-            None => output.push("- **WHOIS Server**: *not available*".to_string()),
-        }
-
-        match info.rdap_url {
-            Some(ref url) => output.push(format!("- **RDAP URL**: `{}`", MdSafe(url))),
-            None => output.push("- **RDAP URL**: *not available*".to_string()),
-        }
-
-        match info.registry_url {
-            Some(ref url) => output.push(format!("- **Registry URL**: {}", MdSafe(url))),
-            None => output.push("- **Registry URL**: *not available*".to_string()),
         }
 
         output.join("\n")
@@ -34,8 +30,9 @@ impl MarkdownFormatter {
 
         output.push(format!("## Subdomains: {}", MdSafe(&result.domain)));
         output.push(String::new());
-        output.push(format!("- **Source**: {}", MdSafe(&result.source)));
-        output.push(format!("- **Count**: {}", result.count));
+        let mut b = Bullets(&mut output);
+        b.text("Source", &result.source);
+        b.raw("Count", result.count);
         output.push(String::new());
 
         if result.subdomains.is_empty() {
@@ -148,51 +145,21 @@ impl MarkdownFormatter {
         output.push(format!("| Registrar | {} |", opt_md(&info.registrar)));
         output.push(format!("| Registrant | {} |", opt_md(&info.registrant)));
         output.push(format!("| Organization | {} |", opt_md(&info.organization)));
-        output.push(format!(
-            "| Created | {} |",
-            info.creation_date
-                .map(|d| d.format("%Y-%m-%d").to_string())
-                .as_deref()
-                .unwrap_or("-")
-        ));
-        output.push(format!(
-            "| Expires | {} |",
-            info.expiration_date
-                .map(|d| d.format("%Y-%m-%d").to_string())
-                .as_deref()
-                .unwrap_or("-")
-        ));
-        output.push(format!(
-            "| Updated | {} |",
-            info.updated_date
-                .map(|d| d.format("%Y-%m-%d").to_string())
-                .as_deref()
-                .unwrap_or("-")
-        ));
-        output.push(format!(
-            "| Nameservers | {} |",
-            if info.nameservers.is_empty() {
+        let date_md = |d: Option<DateTime<Utc>>| {
+            d.map_or_else(|| "-".to_string(), |d| d.format("%Y-%m-%d").to_string())
+        };
+        let list_md = |items: &[String]| {
+            if items.is_empty() {
                 "-".to_string()
             } else {
-                info.nameservers
-                    .iter()
-                    .map(|ns| format!("`{}`", MdSafe(ns)))
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                code_list(items)
             }
-        ));
-        output.push(format!(
-            "| Status | {} |",
-            if info.status.is_empty() {
-                "-".to_string()
-            } else {
-                info.status
-                    .iter()
-                    .map(|s| format!("`{}`", MdSafe(s)))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            }
-        ));
+        };
+        output.push(format!("| Created | {} |", date_md(info.creation_date)));
+        output.push(format!("| Expires | {} |", date_md(info.expiration_date)));
+        output.push(format!("| Updated | {} |", date_md(info.updated_date)));
+        output.push(format!("| Nameservers | {} |", list_md(&info.nameservers)));
+        output.push(format!("| Status | {} |", list_md(&info.status)));
         output.push(format!("| DNSSEC | {} |", opt_md(&info.dnssec)));
 
         // Derived lifecycle rows — only when computed, to keep sparse
@@ -222,20 +189,8 @@ impl MarkdownFormatter {
         }
 
         // Contacts table
-        let has_any_contact = info.registrant_email.is_some()
-            || info.registrant_phone.is_some()
-            || info.registrant_address.is_some()
-            || info.registrant_country.is_some()
-            || info.admin_name.is_some()
-            || info.admin_organization.is_some()
-            || info.admin_email.is_some()
-            || info.admin_phone.is_some()
-            || info.tech_name.is_some()
-            || info.tech_organization.is_some()
-            || info.tech_email.is_some()
-            || info.tech_phone.is_some();
-
-        if has_any_contact {
+        let contacts = info.contacts();
+        if contacts.iter().any(|c| !c.is_empty()) {
             output.push(String::new());
             output.push("### Contacts".to_string());
             output.push(String::new());
@@ -246,85 +201,43 @@ impl MarkdownFormatter {
                 "| Role | Name | Organization | Email | Phone | Address | Country |".to_string(),
             );
             output.push("| --- | --- | --- | --- | --- | --- | --- |".to_string());
-
-            let has_registrant = info.registrant_email.is_some()
-                || info.registrant_phone.is_some()
-                || info.registrant_address.is_some()
-                || info.registrant_country.is_some();
-            if has_registrant {
-                output.push(format!(
-                    "| Registrant | - | - | {} | {} | {} | {} |",
-                    opt_md(&info.registrant_email),
-                    opt_md(&info.registrant_phone),
-                    opt_md(&info.registrant_address),
-                    opt_md(&info.registrant_country),
-                ));
-            }
-
-            let has_admin = info.admin_name.is_some()
-                || info.admin_organization.is_some()
-                || info.admin_email.is_some()
-                || info.admin_phone.is_some();
-            if has_admin {
-                output.push(format!(
-                    "| Admin | {} | {} | {} | {} | - | - |",
-                    opt_md(&info.admin_name),
-                    opt_md(&info.admin_organization),
-                    opt_md(&info.admin_email),
-                    opt_md(&info.admin_phone),
-                ));
-            }
-
-            let has_tech = info.tech_name.is_some()
-                || info.tech_organization.is_some()
-                || info.tech_email.is_some()
-                || info.tech_phone.is_some();
-            if has_tech {
-                output.push(format!(
-                    "| Tech | {} | {} | {} | {} | - | - |",
-                    opt_md(&info.tech_name),
-                    opt_md(&info.tech_organization),
-                    opt_md(&info.tech_email),
-                    opt_md(&info.tech_phone),
-                ));
+            for (role, c) in contact::ROLES.into_iter().zip(contacts) {
+                if !c.is_empty() {
+                    let cells: Vec<String> = c.fields().iter().map(|(_, f)| opt_md(f)).collect();
+                    output.push(format!("| {} | {} |", role, cells.join(" | ")));
+                }
             }
         }
 
         // Registrar Detail (RDAP registrar entity: abuse contact, IANA ID, URL)
-        let has_registrar_detail = info.registrar_iana_id.is_some()
-            || info.registrar_url.is_some()
-            || info.registrar_abuse_email.is_some()
-            || info.registrar_abuse_phone.is_some();
-        if has_registrar_detail {
-            output.push(String::new());
-            output.push("### Registrar Detail".to_string());
-            output.push(String::new());
-            if let Some(ref iana_id) = info.registrar_iana_id {
-                output.push(format!("- **IANA ID**: {}", MdSafe(iana_id)));
-            }
-            if let Some(ref url) = info.registrar_url {
-                output.push(format!("- **URL**: {}", MdSafe(url)));
-            }
-            if let Some(ref email) = info.registrar_abuse_email {
-                output.push(format!("- **Abuse Email**: {}", MdSafe(email)));
-            }
-            if let Some(ref phone) = info.registrar_abuse_phone {
-                output.push(format!("- **Abuse Phone**: {}", MdSafe(phone)));
+        let detail = [
+            ("IANA ID", &info.registrar_iana_id),
+            ("URL", &info.registrar_url),
+            ("Abuse Email", &info.registrar_abuse_email),
+            ("Abuse Phone", &info.registrar_abuse_phone),
+        ];
+        if detail.iter().any(|(_, v)| v.is_some()) {
+            output.extend([
+                String::new(),
+                "### Registrar Detail".to_string(),
+                String::new(),
+            ]);
+            let mut b = Bullets(&mut output);
+            for (label, value) in detail {
+                b.opt(label, value);
             }
         }
 
         // Protocol Metadata
-        let has_metadata = info.whois_server.is_some() || info.rdap_url.is_some();
-        if has_metadata {
-            output.push(String::new());
-            output.push("### Protocol Metadata".to_string());
-            output.push(String::new());
-            if let Some(ref whois_server) = info.whois_server {
-                output.push(format!("- **WHOIS Server**: `{}`", MdSafe(whois_server)));
-            }
-            if let Some(ref rdap_url) = info.rdap_url {
-                output.push(format!("- **RDAP URL**: `{}`", MdSafe(rdap_url)));
-            }
+        if info.whois_server.is_some() || info.rdap_url.is_some() {
+            output.extend([
+                String::new(),
+                "### Protocol Metadata".to_string(),
+                String::new(),
+            ]);
+            let mut b = Bullets(&mut output);
+            b.code_opt("WHOIS Server", &info.whois_server);
+            b.code_opt("RDAP URL", &info.rdap_url);
         }
 
         output.join("\n")

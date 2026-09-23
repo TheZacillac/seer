@@ -4,7 +4,7 @@
 //! global statics. Extracted from `client.rs` to keep that file focused on
 //! the per-query client and the bootstrap-cache coordination logic.
 
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::IpAddr;
 
 use crate::error::{Result, SeerError};
 
@@ -60,93 +60,70 @@ pub(super) fn parse_asn_range(range: &str) -> Option<(u32, u32)> {
     }
 }
 
-/// Returns `true` when the IPv4 address falls inside the CIDR prefix spec.
-pub(super) fn ipv4_matches_prefix(prefix: &str, ip: &Ipv4Addr) -> bool {
+/// Returns `true` when `ip` falls inside the CIDR prefix spec. A prefix of
+/// the other address family never matches; a missing or unparsable mask means
+/// a full-length (single-address) match, and an over-long mask never matches.
+pub(super) fn ip_matches_prefix(prefix: &str, ip: IpAddr) -> bool {
     let (addr_part, mask_part) = match prefix.split_once('/') {
         Some((a, m)) => (a, Some(m)),
         None => (prefix, None),
     };
 
-    let prefix_ip: Ipv4Addr = match addr_part.parse() {
-        Ok(ip) => ip,
-        Err(_) => return false,
+    // Both families compared as u128; IPv4 occupies the low 32 bits.
+    let (ip_value, prefix_value, width) = match (ip, addr_part.parse::<IpAddr>()) {
+        (IpAddr::V4(ip), Ok(IpAddr::V4(p))) => (u32::from(ip).into(), u32::from(p).into(), 32),
+        (IpAddr::V6(ip), Ok(IpAddr::V6(p))) => (u128::from(ip), u128::from(p), 128),
+        _ => return false,
     };
 
     let mask_bits: u32 = match mask_part.and_then(|s| s.parse().ok()) {
-        Some(bits) if bits <= 32 => bits,
+        Some(bits) if bits <= width => bits,
         Some(_) => return false,
-        None => 32,
+        None => width,
     };
 
-    let mask = if mask_bits == 0 {
-        0
-    } else {
-        u32::MAX << (32 - mask_bits)
-    };
-
-    let ip_value = u32::from(*ip);
-    let prefix_value = u32::from(prefix_ip);
-
+    // Clears the host bits; a /0 shifts everything out and matches all.
+    let mask = u128::MAX.checked_shl(width - mask_bits).unwrap_or(0);
     (ip_value & mask) == (prefix_value & mask)
-}
-
-/// Returns `true` when the IPv6 address falls inside the CIDR prefix spec.
-pub(super) fn ipv6_matches_prefix(prefix: &str, ip: &Ipv6Addr) -> bool {
-    let (addr_part, mask_part) = match prefix.split_once('/') {
-        Some((a, m)) => (a, Some(m)),
-        None => (prefix, None),
-    };
-
-    let prefix_ip: Ipv6Addr = match addr_part.parse() {
-        Ok(ip) => ip,
-        Err(_) => return false,
-    };
-
-    let mask_bits: u32 = match mask_part.and_then(|s| s.parse().ok()) {
-        Some(bits) if bits <= 128 => bits,
-        Some(_) => return false,
-        None => 128,
-    };
-
-    let mask = if mask_bits == 0 {
-        0u128
-    } else {
-        u128::MAX << (128 - mask_bits)
-    };
-
-    let ip_value = ipv6_to_u128(ip);
-    let prefix_value = ipv6_to_u128(&prefix_ip);
-
-    (ip_value & mask) == (prefix_value & mask)
-}
-
-fn ipv6_to_u128(ip: &Ipv6Addr) -> u128 {
-    let segments = ip.segments();
-    let mut value = 0u128;
-    for segment in segments {
-        value = (value << 16) | segment as u128;
-    }
-    value
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn matches(prefix: &str, ip: &str) -> bool {
+        ip_matches_prefix(prefix, ip.parse().unwrap())
+    }
+
     #[test]
     fn test_ipv4_prefix_matching_partial_mask() {
-        let ip_in = Ipv4Addr::new(203, 0, 114, 1);
-        let ip_out = Ipv4Addr::new(203, 0, 120, 1);
-        assert!(ipv4_matches_prefix("203.0.112.0/21", &ip_in));
-        assert!(!ipv4_matches_prefix("203.0.112.0/21", &ip_out));
+        assert!(matches("203.0.112.0/21", "203.0.114.1"));
+        assert!(!matches("203.0.112.0/21", "203.0.120.1"));
     }
 
     #[test]
     fn test_ipv6_prefix_matching_partial_mask() {
-        let ip_in: Ipv6Addr = "2001:db8::1".parse().unwrap();
-        let ip_out: Ipv6Addr = "2001:db9::1".parse().unwrap();
-        assert!(ipv6_matches_prefix("2001:db8::/33", &ip_in));
-        assert!(!ipv6_matches_prefix("2001:db8::/33", &ip_out));
+        assert!(matches("2001:db8::/33", "2001:db8::1"));
+        assert!(!matches("2001:db8::/33", "2001:db9::1"));
+    }
+
+    #[test]
+    fn test_prefix_matching_edge_masks_and_families() {
+        // /0 matches every address of its family, and only its family.
+        assert!(matches("0.0.0.0/0", "198.51.100.7"));
+        assert!(matches("::/0", "2001:db8::1"));
+        assert!(!matches("0.0.0.0/0", "2001:db8::1"));
+        assert!(!matches("::/0", "198.51.100.7"));
+        // Full-length masks, including a missing or unparsable one.
+        assert!(matches("198.51.100.7/32", "198.51.100.7"));
+        assert!(!matches("198.51.100.7", "198.51.100.8"));
+        assert!(matches("198.51.100.7/x", "198.51.100.7"));
+        assert!(!matches("198.51.100.7/x", "198.51.100.8"));
+        // A mask wider than the family never matches.
+        assert!(!matches("198.51.100.0/33", "198.51.100.7"));
+        assert!(!matches("2001:db8::/129", "2001:db8::1"));
+        // An unparsable prefix address never matches.
+        assert!(!matches("not-an-ip/8", "10.0.0.1"));
     }
 
     #[test]

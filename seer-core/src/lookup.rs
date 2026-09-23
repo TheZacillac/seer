@@ -5,9 +5,8 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use once_cell::sync::Lazy;
-use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::sync::LazyLock;
 use tokio::sync::Notify;
 use tracing::{debug, instrument, warn};
 
@@ -44,28 +43,26 @@ const MAX_PUBLIC_ERROR_LEN: usize = 256;
 const DEFAULT_INFLIGHT_WAIT: Duration = Duration::from_secs(30);
 
 /// Global cache for lookup results to avoid redundant network calls.
-static LOOKUP_CACHE: Lazy<TtlCache<String, LookupResult>> =
-    Lazy::new(|| TtlCache::new(LOOKUP_CACHE_TTL));
+static LOOKUP_CACHE: LazyLock<TtlCache<String, LookupResult>> =
+    LazyLock::new(|| TtlCache::new(LOOKUP_CACHE_TTL));
 
 /// In-flight lookup coalescing map: normalized-domain -> Weak<Notify>.
 /// Only one network race runs per unique domain at a time; concurrent callers
 /// wait on the shared Notify and then read the result from LOOKUP_CACHE.
-static LOOKUP_INFLIGHT: Lazy<Mutex<HashMap<String, Weak<Notify>>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
+static LOOKUP_INFLIGHT: LazyLock<Mutex<HashMap<String, Weak<Notify>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// Regex patterns for stripping IP literals from public error messages.
-static IPV4_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"\b(?:\d{1,3}\.){3}\d{1,3}\b").expect("IPV4_RE is a valid regex"));
+// Regex patterns for stripping IP literals from public error messages.
+static_regex! {
+    IPV4_RE = r"\b(?:\d{1,3}\.){3}\d{1,3}\b";
 
-/// Candidate pattern for IPv6 literals: a hex/colon token containing either
-/// a `::` compression or at least three colons. This catches plausible IPv6
-/// addresses cheaply; each match is then validated by `Ipv6Addr::from_str`
-/// before redaction, so MAC fragments, hex hashes, and similar colon-laden
-/// tokens are left alone.
-static IPV6_CANDIDATE_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"\b[0-9a-fA-F:]*(?:::|(?:[0-9a-fA-F]{1,4}:){3,})[0-9a-fA-F:]*\b")
-        .expect("IPV6_CANDIDATE_RE is a valid regex")
-});
+    /// Candidate pattern for IPv6 literals: a hex/colon token containing either
+    /// a `::` compression or at least three colons. This catches plausible IPv6
+    /// addresses cheaply; each match is then validated by `Ipv6Addr::from_str`
+    /// before redaction, so MAC fragments, hex hashes, and similar colon-laden
+    /// tokens are left alone.
+    IPV6_CANDIDATE_RE = r"\b[0-9a-fA-F:]*(?:::|(?:[0-9a-fA-F]{1,4}:){3,})[0-9a-fA-F:]*\b";
+}
 
 /// Redact substrings that parse as valid IPv6 addresses, leaving non-IPv6
 /// tokens (e.g. `af:ba:12`) untouched.
@@ -86,22 +83,8 @@ fn strip_ipv6(msg: &str) -> String {
 /// invoked (i.e., the underlying network race runs). Used to verify request
 /// coalescing. Not exposed outside the crate.
 #[cfg(test)]
-static LOOKUP_CONCURRENT_CALLS: Lazy<std::sync::atomic::AtomicUsize> =
-    Lazy::new(|| std::sync::atomic::AtomicUsize::new(0));
-
-/// Returns true if the parsed WHOIS response lacks all key registration
-/// signals: no registrar, no creation/expiration date, and no nameservers.
-///
-/// This is a necessary-but-not-sufficient signal for domain availability;
-/// `lookup_concurrent` combines it with an RDAP 404 before routing to the
-/// availability path. Nameservers count as registration data: DENIC (.de,
-/// no RDAP) publishes only nameservers/status/changed date, and treating
-/// that as thin turned every registered .de domain into a data-less
-/// `dns_present` verdict. Delegates to [`crate::availability::whois_is_thin`]
-/// so this path and the dedicated availability ladder cannot drift.
-fn whois_response_is_thin(w: &WhoisResponse) -> bool {
-    crate::availability::whois_is_thin(w)
-}
+static LOOKUP_CONCURRENT_CALLS: LazyLock<std::sync::atomic::AtomicUsize> =
+    LazyLock::new(|| std::sync::atomic::AtomicUsize::new(0));
 
 /// TTL for *degraded* lookup results: verdicts derived from DNS presence or
 /// a registry refusal rather than from registry data (see
@@ -166,9 +149,9 @@ fn rdap_response_is_useful(response: &RdapResponse) -> bool {
 /// only possible source of registry data, and for "no match" bodies a late
 /// RDAP 200 must remain able to veto the availability claim (v0.26.6 rule).
 /// Mirrors the RDAP-side [`rdap_response_is_useful`] gate; thinness is
-/// [`whois_response_is_thin`], the same signal the fallback ladders use.
+/// [`WhoisResponse::is_thin`], the same signal the fallback ladders use.
 fn whois_leg_has_data(w: &Result<WhoisResponse>) -> bool {
-    matches!(w, Ok(data) if !whois_response_is_thin(data))
+    matches!(w, Ok(data) if !data.is_thin())
 }
 
 /// Decides whether a WHOIS response + RDAP error combination should route
@@ -184,7 +167,7 @@ fn classify_whois_leg(
     if w.is_available() {
         return Some(("high", "whois"));
     }
-    if whois_response_is_thin(w) && rdap_error_is_404(rdap_err) {
+    if w.is_thin() && rdap_error_is_404(rdap_err) {
         // Must stay in lockstep with `availability::decide_fallback`'s
         // RDAP-404 branch: the registry's own 404 is authoritative, so the
         // verdict is high-confidence via RDAP — not a hedged WHOIS signal.
@@ -457,32 +440,43 @@ impl LookupResult {
         }
     }
 
-    /// Returns the registrar name, preferring RDAP data with WHOIS fallback.
-    pub fn registrar(&self) -> Option<String> {
+    /// Reads one registration field: from RDAP with the attached WHOIS record
+    /// as fallback, from WHOIS alone, or `None` for an availability verdict.
+    fn rdap_or_whois<T>(
+        &self,
+        rdap: impl FnOnce(&RdapResponse) -> Option<T>,
+        whois: impl FnOnce(&WhoisResponse) -> Option<T>,
+    ) -> Option<T> {
         match self {
             LookupResult::Rdap {
                 data,
                 whois_fallback,
-            } => data
-                .get_registrar()
-                .or_else(|| whois_fallback.as_ref().and_then(|w| w.registrar.clone())),
-            LookupResult::Whois { data, .. } => data.registrar.clone(),
+            } => rdap(data).or_else(|| whois_fallback.as_ref().and_then(whois)),
+            LookupResult::Whois { data, .. } => whois(data),
             LookupResult::Available { .. } => None,
         }
     }
 
+    /// Returns the registrar name, preferring RDAP data with WHOIS fallback.
+    pub fn registrar(&self) -> Option<String> {
+        self.rdap_or_whois(RdapResponse::get_registrar, |w| w.registrar.clone())
+    }
+
     /// Returns the registrant organization, preferring RDAP data with WHOIS fallback.
     pub fn organization(&self) -> Option<String> {
-        match self {
-            LookupResult::Rdap {
-                data,
-                whois_fallback,
-            } => data
-                .get_registrant_organization()
-                .or_else(|| whois_fallback.as_ref().and_then(|w| w.organization.clone())),
-            LookupResult::Whois { data, .. } => data.organization.clone(),
-            LookupResult::Available { .. } => None,
-        }
+        self.rdap_or_whois(RdapResponse::get_registrant_organization, |w| {
+            w.organization.clone()
+        })
+    }
+
+    /// Returns the creation date, preferring RDAP data with WHOIS fallback.
+    pub fn creation_date(&self) -> Option<DateTime<Utc>> {
+        self.rdap_or_whois(RdapResponse::creation_date, |w| w.creation_date)
+    }
+
+    /// Returns the expiration date, preferring RDAP data with WHOIS fallback.
+    pub fn expiration_date(&self) -> Option<DateTime<Utc>> {
+        self.rdap_or_whois(RdapResponse::expiration_date, |w| w.expiration_date)
     }
 
     /// Returns true if the result came from RDAP.
@@ -502,31 +496,7 @@ impl LookupResult {
 
     /// Returns the expiration date and registrar info from the lookup result.
     pub fn expiration_info(&self) -> (Option<DateTime<Utc>>, Option<String>) {
-        match self {
-            LookupResult::Rdap {
-                data,
-                whois_fallback,
-            } => {
-                // Try to get expiration from RDAP events
-                let expiration_date = data
-                    .events
-                    .iter()
-                    .find(|e| e.event_action == "expiration")
-                    .and_then(|e| e.parsed_date())
-                    .or_else(|| {
-                        // Fallback to WHOIS if available
-                        whois_fallback.as_ref().and_then(|w| w.expiration_date)
-                    });
-
-                let registrar = data
-                    .get_registrar()
-                    .or_else(|| whois_fallback.as_ref().and_then(|w| w.registrar.clone()));
-
-                (expiration_date, registrar)
-            }
-            LookupResult::Whois { data, .. } => (data.expiration_date, data.registrar.clone()),
-            LookupResult::Available { .. } => (None, None),
-        }
+        (self.expiration_date(), self.registrar())
     }
 }
 
@@ -585,36 +555,19 @@ pub(crate) fn trim_raw_response(mut result: LookupResult) -> LookupResult {
     result
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SmartLookup {
     rdap_client: RdapClient,
     whois_client: WhoisClient,
     availability_checker: AvailabilityChecker,
     dns_resolver: DnsResolver,
-    /// Deprecated: both protocols are now always attempted concurrently.
-    prefer_rdap: bool,
-    /// Deprecated: WHOIS data is now always attached when available.
-    include_fallback: bool,
-}
-
-impl Default for SmartLookup {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 impl SmartLookup {
     /// Creates a new SmartLookup that runs RDAP and WHOIS concurrently,
     /// falling back to an availability check if both fail.
     pub fn new() -> Self {
-        Self {
-            rdap_client: RdapClient::new(),
-            whois_client: WhoisClient::new(),
-            availability_checker: AvailabilityChecker::new(),
-            dns_resolver: DnsResolver::new(),
-            prefer_rdap: true,
-            include_fallback: false,
-        }
+        Self::default()
     }
 
     /// Builds a SmartLookup whose RDAP/WHOIS/DNS sub-clients honor the
@@ -625,25 +578,7 @@ impl SmartLookup {
             whois_client: WhoisClient::new().with_timeout(config.whois_timeout()),
             availability_checker: AvailabilityChecker::from_config(config),
             dns_resolver: DnsResolver::new().with_timeout(config.dns_timeout()),
-            prefer_rdap: true,
-            include_fallback: false,
         }
-    }
-
-    /// Deprecated: both protocols are now always attempted concurrently.
-    /// This method is kept for API compatibility but has no effect.
-    #[deprecated(note = "This field has no effect. RDAP is always tried concurrently with WHOIS.")]
-    pub fn prefer_rdap(mut self, prefer: bool) -> Self {
-        self.prefer_rdap = prefer;
-        self
-    }
-
-    /// Deprecated: WHOIS data is now always attached when available.
-    /// This method is kept for API compatibility but has no effect.
-    #[deprecated(note = "This field has no effect. RDAP is always tried concurrently with WHOIS.")]
-    pub fn include_fallback(mut self, include: bool) -> Self {
-        self.include_fallback = include;
-        self
     }
 
     /// Performs a smart lookup for a domain, trying both RDAP and WHOIS concurrently.
@@ -764,11 +699,6 @@ impl SmartLookup {
         Ok(result)
     }
 
-    /// Clears the lookup result cache.
-    pub fn clear_cache() {
-        LOOKUP_CACHE.clear();
-    }
-
     #[instrument(skip(self, progress), fields(domain = %domain))]
     async fn lookup_concurrent(
         &self,
@@ -887,11 +817,8 @@ impl SmartLookup {
                     _ => None,
                 };
                 let avail = AvailabilityResult {
-                    domain: domain.to_string(),
-                    available: true,
-                    confidence: confidence.to_string(),
-                    method: method.to_string(),
                     details,
+                    ..AvailabilityResult::new(domain, true, confidence, method)
                 };
                 // A registry "no such domain" for a name below its
                 // registrable domain (mail.google.com) is not availability.
@@ -916,7 +843,7 @@ impl SmartLookup {
             // reads as registered. The cheap thin / not-200 preconditions gate the
             // DNS probe so we don't pay for it on the common paths, and a refusal
             // short-circuits before the probe entirely.
-            let whois_is_thin = whois_response_is_thin(&whois_data);
+            let whois_is_thin = whois_data.is_thin();
             if whois_is_thin && !rdap_returned_200 {
                 let whois_refuses = whois_data.indicates_registry_refusal();
                 let dns_presence = if whois_refuses {
@@ -936,30 +863,14 @@ impl SmartLookup {
                         if let Some(ref cb) = progress {
                             cb("Registry refused or throttled the query (availability inconclusive)");
                         }
-                        let avail = AvailabilityResult {
-                            domain: domain.to_string(),
-                            available: false,
-                            confidence: "none".to_string(),
-                            method: "inconclusive".to_string(),
-                            details: Some(
-                                "Registry refused or throttled the query; availability is inconclusive"
-                                    .to_string(),
-                            ),
-                        };
+                        let avail = AvailabilityResult::new(domain, false, "none", "inconclusive")
+                            .with_details(crate::availability::REFUSED_DETAILS);
                         return Ok(available_with_whois(avail, &rdap_error_str, whois_data));
                     }
                     ThinFallback::Available => {
                         debug!(domain = %domain, "Thin WHOIS + NXDOMAIN, reclassifying as available");
-                        let avail = AvailabilityResult {
-                            domain: domain.to_string(),
-                            available: true,
-                            confidence: "medium".to_string(),
-                            method: "dns_nxdomain".to_string(),
-                            details: Some(
-                                "No registry data available; domain has no DNS presence (NXDOMAIN)"
-                                    .to_string(),
-                            ),
-                        };
+                        let avail = AvailabilityResult::new(domain, true, "medium", "dns_nxdomain")
+                            .with_details(crate::availability::THIN_NXDOMAIN_DETAILS);
                         let avail = self.availability_checker.guard_subdomain_claim(avail).await;
                         if let Some(ref cb) = progress {
                             cb(if avail.available {
@@ -984,13 +895,8 @@ impl SmartLookup {
                              was unavailable (RDAP rate-limited or unreachable and WHOIS returned \
                              no data); retry shortly for full detail."
                         };
-                        let avail = AvailabilityResult {
-                            domain: domain.to_string(),
-                            available: false,
-                            confidence: "high".to_string(),
-                            method: "dns_present".to_string(),
-                            details: Some(details.to_string()),
-                        };
+                        let avail = AvailabilityResult::new(domain, false, "high", "dns_present")
+                            .with_details(details);
                         return Ok(available_with_whois(avail, &rdap_error_str, whois_data));
                     }
                     ThinFallback::UseWhois => {}
@@ -1136,28 +1042,8 @@ mod tests {
             data: WhoisResponse {
                 domain: "example.com".to_string(),
                 registrar: Some("Test Registrar".to_string()),
-                registrant: None,
-                organization: None,
-                registrant_email: None,
-                registrant_phone: None,
-                registrant_address: None,
-                registrant_country: None,
-                admin_name: None,
-                admin_organization: None,
-                admin_email: None,
-                admin_phone: None,
-                tech_name: None,
-                tech_organization: None,
-                tech_email: None,
-                tech_phone: None,
-                creation_date: None,
-                expiration_date: None,
-                updated_date: None,
-                status: vec![],
-                nameservers: vec![],
-                dnssec: None,
                 whois_server: "whois.example.com".to_string(),
-                raw_response: String::new(),
+                ..Default::default()
             },
             rdap_error: None,
             rdap_fallback: None,
@@ -1175,29 +1061,7 @@ mod tests {
         let result = LookupResult::Whois {
             data: WhoisResponse {
                 domain: "test.com".to_string(),
-                registrar: None,
-                registrant: None,
-                organization: None,
-                registrant_email: None,
-                registrant_phone: None,
-                registrant_address: None,
-                registrant_country: None,
-                admin_name: None,
-                admin_organization: None,
-                admin_email: None,
-                admin_phone: None,
-                tech_name: None,
-                tech_organization: None,
-                tech_email: None,
-                tech_phone: None,
-                creation_date: None,
-                expiration_date: None,
-                updated_date: None,
-                status: vec![],
-                nameservers: vec![],
-                dnssec: None,
-                whois_server: String::new(),
-                raw_response: String::new(),
+                ..Default::default()
             },
             rdap_error: Some("RDAP failed".to_string()),
             rdap_fallback: None,
@@ -1211,13 +1075,10 @@ mod tests {
     #[test]
     fn test_lookup_result_available_serialization() {
         let result = LookupResult::Available {
-            data: Box::new(AvailabilityResult {
-                domain: "test123.xyz".to_string(),
-                available: true,
-                confidence: "medium".to_string(),
-                method: "whois_error".to_string(),
-                details: Some("WHOIS server indicates no matching records".to_string()),
-            }),
+            data: Box::new(
+                AvailabilityResult::new("test123.xyz", true, "medium", "whois_error")
+                    .with_details("WHOIS server indicates no matching records"),
+            ),
             rdap_error: "RDAP failed".to_string(),
             whois_error: "WHOIS failed".to_string(),
             whois_data: None,
@@ -1234,26 +1095,6 @@ mod tests {
         assert!(!result.is_whois());
         assert!(result.registrar().is_none());
         assert_eq!(result.expiration_info(), (None, None));
-    }
-
-    #[test]
-    #[allow(deprecated)]
-    fn test_smart_lookup_builder() {
-        let lookup = SmartLookup::new().prefer_rdap(false).include_fallback(true);
-        assert!(!lookup.prefer_rdap);
-        assert!(lookup.include_fallback);
-    }
-
-    #[test]
-    fn test_lookup_cache_clear() {
-        // Serialized: the waiter-coalescing test inserts into LOOKUP_CACHE,
-        // and an unsynchronized clear here would race both its insert (this
-        // assert) and its waiters' cache read (that test's counter assert).
-        let _serial = INFLIGHT_TEST_SERIAL
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        SmartLookup::clear_cache();
-        assert!(LOOKUP_CACHE.is_empty());
     }
 
     // ---------------- trim_raw_response char-boundary safety ----------------
@@ -1593,13 +1434,7 @@ mod tests {
     fn available_with_whois_sanitizes_rdap_error() {
         // The constructor every WHOIS-in-hand route of `lookup_concurrent`
         // returns through.
-        let avail = AvailabilityResult {
-            domain: "unreg.test".to_string(),
-            available: false,
-            confidence: "none".to_string(),
-            method: "inconclusive".to_string(),
-            details: None,
-        };
+        let avail = AvailabilityResult::new("unreg.test", false, "none", "inconclusive");
         let result = available_with_whois(
             avail,
             "RDAP URL resolves to reserved IP 10.0.0.1",
@@ -1660,13 +1495,12 @@ mod tests {
 
     fn available_via(method: &str, available: bool, confidence: &str) -> LookupResult {
         LookupResult::Available {
-            data: Box::new(AvailabilityResult {
-                domain: "example.test".to_string(),
+            data: Box::new(AvailabilityResult::new(
+                "example.test",
                 available,
-                confidence: confidence.to_string(),
-                method: method.to_string(),
-                details: None,
-            }),
+                confidence,
+                method,
+            )),
             rdap_error: String::new(),
             whois_error: String::new(),
             whois_data: None,
@@ -1742,62 +1576,40 @@ mod tests {
         assert!(!rdap_error_is_404(&e));
     }
 
-    // ---------------- whois_response_is_thin ----------------
+    // ---------------- WhoisResponse::is_thin ----------------
 
     fn empty_whois(domain: &str) -> WhoisResponse {
         WhoisResponse {
             domain: domain.to_string(),
-            registrar: None,
-            registrant: None,
-            organization: None,
-            registrant_email: None,
-            registrant_phone: None,
-            registrant_address: None,
-            registrant_country: None,
-            admin_name: None,
-            admin_organization: None,
-            admin_email: None,
-            admin_phone: None,
-            tech_name: None,
-            tech_organization: None,
-            tech_email: None,
-            tech_phone: None,
-            creation_date: None,
-            expiration_date: None,
-            updated_date: None,
-            nameservers: vec![],
-            status: vec![],
-            dnssec: None,
-            whois_server: String::new(),
-            raw_response: String::new(),
+            ..Default::default()
         }
     }
 
     #[test]
     fn whois_response_is_thin_when_all_key_fields_missing() {
         let w = empty_whois("example.com");
-        assert!(whois_response_is_thin(&w));
+        assert!(w.is_thin());
     }
 
     #[test]
     fn whois_response_is_not_thin_when_registrar_present() {
         let mut w = empty_whois("example.com");
         w.registrar = Some("Test Registrar".to_string());
-        assert!(!whois_response_is_thin(&w));
+        assert!(!w.is_thin());
     }
 
     #[test]
     fn whois_response_is_not_thin_when_creation_date_present() {
         let mut w = empty_whois("example.com");
         w.creation_date = Some(Utc::now());
-        assert!(!whois_response_is_thin(&w));
+        assert!(!w.is_thin());
     }
 
     #[test]
     fn whois_response_is_not_thin_when_expiration_date_present() {
         let mut w = empty_whois("example.com");
         w.expiration_date = Some(Utc::now());
-        assert!(!whois_response_is_thin(&w));
+        assert!(!w.is_thin());
     }
 
     /// DENIC-shaped parsed WHOIS: nameservers, status and a changed date,
@@ -1815,7 +1627,7 @@ mod tests {
     fn whois_response_with_nameservers_is_not_thin() {
         let mut w = empty_whois("example.com");
         w.nameservers = vec!["ns1.example.net".to_string()];
-        assert!(!whois_response_is_thin(&w));
+        assert!(!w.is_thin());
     }
 
     #[test]
@@ -1826,7 +1638,7 @@ mod tests {
         let w = denic_whois();
         let bootstrap_miss =
             SeerError::RdapBootstrapError("no RDAP server for example.de".to_string());
-        assert!(!whois_response_is_thin(&w));
+        assert!(!w.is_thin());
         assert!(whois_leg_has_data(&Ok(w.clone())));
         assert_eq!(
             should_route_to_availability(false, Some(&bootstrap_miss), &w),
@@ -1834,7 +1646,7 @@ mod tests {
         );
         assert_eq!(
             classify_thin_fallback(
-                whois_response_is_thin(&w),
+                w.is_thin(),
                 false,
                 w.indicates_registry_refusal(),
                 DnsPresence::Present,
@@ -2189,7 +2001,7 @@ mod tests {
 
     #[test]
     fn whois_leg_has_data_accepts_registration_data() {
-        // Stays in lockstep with `whois_response_is_thin`: any of the three
+        // Stays in lockstep with `WhoisResponse::is_thin`: any of the three
         // key registration signals makes the leg a data-bearing winner.
         let mut w = empty_whois("example.com");
         w.registrar = Some("Mock Registrar".to_string());

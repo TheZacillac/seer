@@ -41,17 +41,14 @@
 //! `crate::whois::parser`, so this parser does not need to special-case it.
 
 use chrono::{DateTime, Utc};
-use once_cell::sync::Lazy;
-use regex::Regex;
 
-use super::{push_bounded, RegistryParser, MAX_NAMESERVERS, MAX_STATUSES};
+use super::{push_bounded, MAX_NAMESERVERS, MAX_STATUSES};
 use crate::whois::parser::WhoisResponse;
 
-static SECTION_HEADER: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"^\[([A-Za-z]+)\]\s*$").expect("Invalid NIC.LV section regex"));
-
-static KEY_VALUE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"^([A-Za-z]+):\s*(.+?)\s*$").expect("Invalid NIC.LV key/value regex"));
+static_regex! {
+    SECTION_HEADER = r"^\[([A-Za-z]+)\]\s*$";
+    KEY_VALUE = r"^([A-Za-z]+):\s*(.+?)\s*$";
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Section {
@@ -79,120 +76,96 @@ impl Section {
     }
 }
 
-/// Parser for .lv domains using the NIC.LV section-based format.
-#[derive(Debug, Clone, Default)]
-pub struct NicLvParser;
+/// TLDs this parser handles.
+pub(super) const TLDS: &[&str] = &["lv"];
 
-impl NicLvParser {
-    pub fn new() -> Self {
-        Self
+/// Parses .lv domains using the NIC.LV section-based format.
+pub(super) fn parse(domain: &str, server: &str, raw: &str) -> WhoisResponse {
+    let mut current = Section::None;
+
+    let mut status: Vec<String> = Vec::new();
+    let mut nameservers: Vec<String> = Vec::new();
+    let mut registrar: Option<String> = None;
+    let mut registrant: Option<String> = None;
+    let mut registrant_address: Option<String> = None;
+    let mut registrant_country: Option<String> = None;
+    let mut updated_date: Option<DateTime<Utc>> = None;
+
+    for line in raw.lines() {
+        let trimmed = line.trim();
+
+        // Skip blanks and disclaimer comment lines.
+        if trimmed.is_empty() || trimmed.starts_with('%') || trimmed.starts_with('#') {
+            continue;
+        }
+
+        if let Some(caps) = SECTION_HEADER.captures(trimmed) {
+            current = Section::from_header(&caps[1]);
+            continue;
+        }
+
+        let Some(caps) = KEY_VALUE.captures(trimmed) else {
+            continue;
+        };
+        let key = caps[1].to_ascii_lowercase();
+        let value = caps[2].trim();
+        if value.is_empty() {
+            continue;
+        }
+
+        match (current, key.as_str()) {
+            (Section::Domain, "status") => {
+                push_bounded(&mut status, value.to_string(), MAX_STATUSES);
+            }
+            (Section::Holder, "name") if registrant.is_none() => {
+                registrant = Some(value.to_string());
+            }
+            (Section::Holder, "address") if registrant_address.is_none() => {
+                registrant_address = Some(value.to_string());
+            }
+            (Section::Holder, "country") if registrant_country.is_none() => {
+                registrant_country = Some(value.to_string());
+            }
+            (Section::Registrar, "name") if registrar.is_none() => {
+                registrar = Some(value.to_string());
+            }
+            // NIC.LV emits `Nserver: -` for domains with no delegation;
+            // the dash is a placeholder, not a nameserver.
+            (Section::Nservers, "nserver") if value != "-" => {
+                push_bounded(
+                    &mut nameservers,
+                    value.to_ascii_lowercase(),
+                    MAX_NAMESERVERS,
+                );
+            }
+            (Section::Whois, "updated") if updated_date.is_none() => {
+                updated_date = parse_iso8601(value);
+            }
+            _ => {}
+        }
     }
 
-    fn parse_iso8601(value: &str) -> Option<DateTime<Utc>> {
-        // NIC.LV uses fractional-second ISO8601 like `2026-05-26T11:12:34.874386+00:00`.
-        DateTime::parse_from_rfc3339(value.trim())
-            .ok()
-            .map(|dt| dt.with_timezone(&Utc))
+    WhoisResponse {
+        domain: domain.to_string(),
+        registrar,
+        registrant,
+        registrant_address,
+        registrant_country,
+        updated_date,
+        nameservers,
+        status,
+        whois_server: server.to_string(),
+        raw_response: raw.to_string(),
+        // NIC.LV's WHOIS publishes no creation/expiry date or DNSSEC state.
+        ..Default::default()
     }
 }
 
-impl RegistryParser for NicLvParser {
-    fn supported_tlds(&self) -> &[&str] {
-        &["lv"]
-    }
-
-    fn parse(&self, domain: &str, server: &str, raw: &str) -> WhoisResponse {
-        let mut current = Section::None;
-
-        let mut status: Vec<String> = Vec::new();
-        let mut nameservers: Vec<String> = Vec::new();
-        let mut registrar: Option<String> = None;
-        let mut registrant: Option<String> = None;
-        let mut registrant_address: Option<String> = None;
-        let mut registrant_country: Option<String> = None;
-        let mut updated_date: Option<DateTime<Utc>> = None;
-
-        for line in raw.lines() {
-            let trimmed = line.trim();
-
-            // Skip blanks and disclaimer comment lines.
-            if trimmed.is_empty() || trimmed.starts_with('%') || trimmed.starts_with('#') {
-                continue;
-            }
-
-            if let Some(caps) = SECTION_HEADER.captures(trimmed) {
-                current = Section::from_header(&caps[1]);
-                continue;
-            }
-
-            let Some(caps) = KEY_VALUE.captures(trimmed) else {
-                continue;
-            };
-            let key = caps[1].to_ascii_lowercase();
-            let value = caps[2].trim();
-            if value.is_empty() {
-                continue;
-            }
-
-            match (current, key.as_str()) {
-                (Section::Domain, "status") => {
-                    push_bounded(&mut status, value.to_string(), MAX_STATUSES);
-                }
-                (Section::Holder, "name") if registrant.is_none() => {
-                    registrant = Some(value.to_string());
-                }
-                (Section::Holder, "address") if registrant_address.is_none() => {
-                    registrant_address = Some(value.to_string());
-                }
-                (Section::Holder, "country") if registrant_country.is_none() => {
-                    registrant_country = Some(value.to_string());
-                }
-                (Section::Registrar, "name") if registrar.is_none() => {
-                    registrar = Some(value.to_string());
-                }
-                // NIC.LV emits `Nserver: -` for domains with no delegation;
-                // the dash is a placeholder, not a nameserver.
-                (Section::Nservers, "nserver") if value != "-" => {
-                    push_bounded(
-                        &mut nameservers,
-                        value.to_ascii_lowercase(),
-                        MAX_NAMESERVERS,
-                    );
-                }
-                (Section::Whois, "updated") if updated_date.is_none() => {
-                    updated_date = Self::parse_iso8601(value);
-                }
-                _ => {}
-            }
-        }
-
-        WhoisResponse {
-            domain: domain.to_string(),
-            registrar,
-            registrant,
-            organization: None,
-            registrant_email: None,
-            registrant_phone: None,
-            registrant_address,
-            registrant_country,
-            admin_name: None,
-            admin_organization: None,
-            admin_email: None,
-            admin_phone: None,
-            tech_name: None,
-            tech_organization: None,
-            tech_email: None,
-            tech_phone: None,
-            creation_date: None, // NIC.LV does not publish creation date in WHOIS
-            expiration_date: None, // NIC.LV does not publish expiry in WHOIS
-            updated_date,
-            nameservers,
-            status,
-            dnssec: None, // not exposed via NIC.LV WHOIS
-            whois_server: server.to_string(),
-            raw_response: raw.to_string(),
-        }
-    }
+fn parse_iso8601(value: &str) -> Option<DateTime<Utc>> {
+    // NIC.LV uses fractional-second ISO8601 like `2026-05-26T11:12:34.874386+00:00`.
+    DateTime::parse_from_rfc3339(value.trim())
+        .ok()
+        .map(|dt| dt.with_timezone(&Utc))
 }
 
 #[cfg(test)]
@@ -243,7 +216,7 @@ Status: free\n\
 Updated: 2026-05-26T11:12:34.874386+00:00\n";
 
     fn parse(raw: &str) -> WhoisResponse {
-        NicLvParser::new().parse("myroyalcanin.lv", "whois.nic.lv", raw)
+        super::parse("myroyalcanin.lv", "whois.nic.lv", raw)
     }
 
     #[test]
@@ -309,11 +282,6 @@ Updated: 2026-05-26T11:12:34.874386+00:00\n";
             r.is_available(),
             "Status: free should mark .lv as available"
         );
-    }
-
-    #[test]
-    fn supported_tlds() {
-        assert_eq!(NicLvParser::new().supported_tlds(), &["lv"]);
     }
 
     #[test]

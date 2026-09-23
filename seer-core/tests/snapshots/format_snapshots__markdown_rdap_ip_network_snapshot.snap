@@ -1,0 +1,10 @@
+---
+source: seer-core/tests/format_snapshots.rs
+expression: markdown ().format_rdap (& fixture_rdap_ip_network())
+---
+## RDAP: TEST-NET-1
+
+- **Handle**: `NET-192-0-2-0-1`
+- **Start Address**: `192.0.2.0`
+- **End Address**: `192.0.2.255`
+- **Country**: US

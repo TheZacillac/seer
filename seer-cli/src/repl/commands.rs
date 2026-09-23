@@ -1,5 +1,8 @@
 use seer_core::output::OutputFormat;
-use seer_core::SeerConfig;
+use seer_core::{RecordType, SeerConfig};
+
+use super::catalog;
+use crate::query::Query;
 
 #[derive(Debug, Clone)]
 pub struct CommandContext {
@@ -96,6 +99,116 @@ pub fn split_quoted_literal(line: &str) -> Result<Vec<String>, String> {
     Ok(tokens)
 }
 
+/// Parses a tokenized REPL line into a single-shot [`Query`]. `command` is
+/// the lowercased first token and `parts` the whole line; a first token with
+/// a dot is a bare domain (`example.com` means `lookup example.com`).
+/// Everything is validated here, before any network I/O.
+pub fn parse_query(command: &str, parts: &[&str]) -> Result<Query, String> {
+    let args = &parts[1..];
+    // The first argument, or the command's usage line.
+    let arg = || {
+        args.first()
+            .map(|a| a.to_string())
+            .ok_or_else(|| catalog::usage(command))
+    };
+    Ok(match catalog::canonical(command) {
+        "lookup" => Query::Lookup(arg()?),
+        "info" => Query::Info(arg()?),
+        "whois" => Query::Whois(arg()?),
+        "rdap" => Query::Rdap(arg()?),
+        "dig" => {
+            let domain = arg()?;
+            let (mut servers, record_type) = servers_and_type(&args[1..])?;
+            Query::Dig {
+                domain,
+                record_type,
+                server: servers.pop(),
+            }
+        }
+        "prop" => Query::Prop {
+            domain: arg()?,
+            record_type: match args.get(1) {
+                Some(name) => crate::try_parse_record_type(name)?,
+                None => RecordType::A,
+            },
+        },
+        "status" => Query::Status(arg()?),
+        "reverse" => Query::Reverse(arg()?),
+        "avail" => Query::Avail(arg()?),
+        "dnssec" => Query::Dnssec(arg()?),
+        "ssl" => Query::Ssl(arg()?),
+        "tld" => Query::Tld(arg()?),
+        "compare" => {
+            if args.len() < 3 {
+                return Err(catalog::usage(command));
+            }
+            let (servers, record_type) = servers_and_type(&args[1..])?;
+            let [server_a, server_b, ..] = servers.as_slice() else {
+                return Err("Need two nameservers (e.g., @8.8.8.8 @1.1.1.1)".to_string());
+            };
+            Query::Compare {
+                domain: args[0].to_string(),
+                record_type,
+                server_a: server_a.clone(),
+                server_b: server_b.clone(),
+            }
+        }
+        "subdomains" => {
+            let SubdomainsArgs {
+                domain,
+                resolve,
+                diff,
+                record,
+            } = parse_subdomains_args(args)?;
+            Query::Subdomains {
+                domain,
+                resolve,
+                diff,
+                record,
+            }
+        }
+        "diff" => match args {
+            [a, b, ..] => Query::Diff(a.to_string(), b.to_string()),
+            _ => return Err(catalog::usage(command)),
+        },
+        "drift" => {
+            let DriftArgs { domain, record } = parse_drift_args(args)?;
+            Query::Drift { domain, record }
+        }
+        "caa" => Query::Caa(arg()?),
+        "posture" => Query::Posture(arg()?),
+        "headers" => Query::Headers(arg()?),
+        "takeover" => {
+            let TakeoverArgs { domain, hosts } = parse_takeover_args(args)?;
+            Query::Takeover { domain, hosts }
+        }
+        "confusables" => Query::Confusables(arg()?),
+        "doctor" => Query::Doctor,
+        "delegation" => Query::Delegation(arg()?),
+        _ if command.contains('.') => Query::Lookup(parts[0].to_string()),
+        _ => {
+            return Err(format!(
+                "Unknown command: {}. Type 'help' for available commands.",
+                command
+            ))
+        }
+    })
+}
+
+/// Splits DNS command arguments into `@server`s and a record type (default
+/// A). A typo'd type must error, not silently query A records.
+fn servers_and_type(args: &[&str]) -> Result<(Vec<String>, RecordType), String> {
+    let mut servers = Vec::new();
+    let mut record_type = RecordType::A;
+    for arg in args {
+        match arg.strip_prefix('@') {
+            Some(server) => servers.push(server.to_string()),
+            None => record_type = crate::try_parse_record_type(arg)?,
+        }
+    }
+    Ok((servers, record_type))
+}
+
 /// Returns a usage error for an unrecognized `--flag` / `-f` token, so a typo
 /// like `--recrod` fails loudly instead of being silently ignored.
 fn reject_unknown_flag(token: &str, usage: &str) -> Result<(), String> {
@@ -117,12 +230,11 @@ pub struct SubdomainsArgs {
     pub record: bool,
 }
 
-const SUBDOMAINS_USAGE: &str = "Usage: subdomains <domain> [--resolve | --diff] [--record]";
-
 /// Parses `subdomains <domain> [--resolve] [--diff] [--record]`, mirroring
 /// the CLI: `--resolve` conflicts with `--diff`/`--record`, and unknown
 /// flags or extra arguments are usage errors.
 pub fn parse_subdomains_args(args: &[&str]) -> Result<SubdomainsArgs, String> {
+    let usage = catalog::usage("subdomains");
     let mut domain: Option<String> = None;
     let (mut resolve, mut diff, mut record) = (false, false, false);
     for arg in args {
@@ -131,20 +243,20 @@ pub fn parse_subdomains_args(args: &[&str]) -> Result<SubdomainsArgs, String> {
             "--diff" => diff = true,
             "--record" => record = true,
             other => {
-                reject_unknown_flag(other, SUBDOMAINS_USAGE)?;
+                reject_unknown_flag(other, &usage)?;
                 if domain.is_some() {
-                    return Err(format!("Unexpected argument: {other}\n{SUBDOMAINS_USAGE}"));
+                    return Err(format!("Unexpected argument: {other}\n{usage}"));
                 }
                 domain = Some(other.to_string());
             }
         }
     }
     let Some(domain) = domain else {
-        return Err(SUBDOMAINS_USAGE.to_string());
+        return Err(usage);
     };
     if resolve && (diff || record) {
         return Err(format!(
-            "--resolve cannot be combined with --diff or --record\n{SUBDOMAINS_USAGE}"
+            "--resolve cannot be combined with --diff or --record\n{usage}"
         ));
     }
     Ok(SubdomainsArgs {
@@ -163,11 +275,10 @@ pub struct TakeoverArgs {
     pub hosts: Vec<String>,
 }
 
-const TAKEOVER_USAGE: &str = "Usage: takeover <domain> [--host <host>]...";
-
 /// Parses `takeover <domain> [--host <HOST>]...` (also `--host=HOST`),
 /// mirroring the CLI's repeatable `--host`.
 pub fn parse_takeover_args(args: &[&str]) -> Result<TakeoverArgs, String> {
+    let usage = catalog::usage("takeover");
     let mut domain: Option<String> = None;
     let mut hosts = Vec::new();
     let mut i = 0;
@@ -175,7 +286,7 @@ pub fn parse_takeover_args(args: &[&str]) -> Result<TakeoverArgs, String> {
         let arg = args[i];
         if arg == "--host" {
             let Some(host) = args.get(i + 1) else {
-                return Err(format!("Missing value after --host\n{TAKEOVER_USAGE}"));
+                return Err(format!("Missing value after --host\n{usage}"));
             };
             hosts.push(host.to_string());
             i += 2;
@@ -183,20 +294,20 @@ pub fn parse_takeover_args(args: &[&str]) -> Result<TakeoverArgs, String> {
         }
         if let Some(host) = arg.strip_prefix("--host=") {
             if host.is_empty() {
-                return Err(format!("Missing value after --host\n{TAKEOVER_USAGE}"));
+                return Err(format!("Missing value after --host\n{usage}"));
             }
             hosts.push(host.to_string());
         } else {
-            reject_unknown_flag(arg, TAKEOVER_USAGE)?;
+            reject_unknown_flag(arg, &usage)?;
             if domain.is_some() {
-                return Err(format!("Unexpected argument: {arg}\n{TAKEOVER_USAGE}"));
+                return Err(format!("Unexpected argument: {arg}\n{usage}"));
             }
             domain = Some(arg.to_string());
         }
         i += 1;
     }
     let Some(domain) = domain else {
-        return Err(TAKEOVER_USAGE.to_string());
+        return Err(usage);
     };
     Ok(TakeoverArgs { domain, hosts })
 }
@@ -209,11 +320,10 @@ pub struct DriftArgs {
     pub record: bool,
 }
 
-const DRIFT_USAGE: &str = "Usage: drift <domain> [--record]";
-
 /// Parses `drift <domain> [--record]`; unknown flags (e.g. the typo
 /// `--recrod`, which previously silently skipped recording) are errors.
 pub fn parse_drift_args(args: &[&str]) -> Result<DriftArgs, String> {
+    let usage = catalog::usage("drift");
     let mut domain: Option<String> = None;
     let mut record = false;
     for arg in args {
@@ -221,14 +331,14 @@ pub fn parse_drift_args(args: &[&str]) -> Result<DriftArgs, String> {
             record = true;
             continue;
         }
-        reject_unknown_flag(arg, DRIFT_USAGE)?;
+        reject_unknown_flag(arg, &usage)?;
         if domain.is_some() {
-            return Err(format!("Unexpected argument: {arg}\n{DRIFT_USAGE}"));
+            return Err(format!("Unexpected argument: {arg}\n{usage}"));
         }
         domain = Some(arg.to_string());
     }
     let Some(domain) = domain else {
-        return Err(DRIFT_USAGE.to_string());
+        return Err(usage);
     };
     Ok(DriftArgs { domain, record })
 }
@@ -244,7 +354,7 @@ pub struct BulkArgs {
     /// Input file path as typed.
     pub file: String,
     /// Record type for dig/prop operations (defaults to A).
-    pub record_type: seer_core::RecordType,
+    pub record_type: RecordType,
     /// Output CSV path from `-o`/`--output`, if given.
     pub output: Option<String>,
 }
@@ -256,15 +366,15 @@ pub struct BulkArgs {
 /// silently ignored, quietly overwriting the default output path).
 pub fn parse_bulk_args(args: &[&str]) -> Result<BulkArgs, String> {
     if args.len() < 2 {
-        return Err(
-            "Usage: bulk <operation> <file> [type] [-o output.csv]\nType 'bulk -h' for detailed help."
-                .to_string(),
-        );
+        return Err(format!(
+            "{}\nType 'bulk -h' for detailed help.",
+            catalog::usage("bulk")
+        ));
     }
 
     let operation = args[0].to_string();
     let file = args[1].to_string();
-    let mut record_type = seer_core::RecordType::A;
+    let mut record_type = RecordType::A;
     let mut output: Option<String> = None;
 
     let mut i = 2;
@@ -301,7 +411,7 @@ pub struct FollowArgs {
     /// Minutes between checks; may be fractional (defaults to 1.0).
     pub interval_minutes: f64,
     /// Record type to monitor (defaults to A).
-    pub record_type: seer_core::RecordType,
+    pub record_type: RecordType,
     /// Nameserver from an inline `@server` argument.
     pub nameserver: Option<String>,
     /// Only print iterations whose records changed.
@@ -317,17 +427,16 @@ pub struct FollowArgs {
 /// typo (`MXX`) or unknown `--flag` is an error, matching the CLI and the
 /// REPL's other DNS commands, rather than silently following A records.
 pub fn parse_follow_args(args: &[&str]) -> Result<FollowArgs, String> {
-    const FOLLOW_USAGE: &str =
-        "Usage: follow <domain> [iterations] [interval_minutes] [type] [@server] [--changes-only]";
+    let usage = catalog::usage("follow");
     let Some(domain) = args.first() else {
-        return Err(FOLLOW_USAGE.to_string());
+        return Err(usage);
     };
 
     let mut parsed = FollowArgs {
         domain: domain.to_string(),
         iterations: 10,
         interval_minutes: 1.0,
-        record_type: seer_core::RecordType::A,
+        record_type: RecordType::A,
         nameserver: None,
         changes_only: false,
     };
@@ -343,7 +452,7 @@ pub fn parse_follow_args(args: &[&str]) -> Result<FollowArgs, String> {
         } else if *arg == "--changes-only" {
             parsed.changes_only = true;
         } else if arg.starts_with("--") {
-            return Err(format!("Unknown option: {arg}\n{FOLLOW_USAGE}"));
+            return Err(format!("Unknown option: {arg}\n{usage}"));
         } else if let Ok(n) = arg.parse::<usize>() {
             // First number is iterations, second is interval
             if !iterations_set {
@@ -365,7 +474,6 @@ pub fn parse_follow_args(args: &[&str]) -> Result<FollowArgs, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use seer_core::RecordType;
 
     #[test]
     fn bulk_requires_operation_and_file() {
@@ -502,6 +610,54 @@ mod tests {
             parse_follow_args(&["example.com", "--chnages-only"]).expect_err("typo'd flag errors");
         assert!(err.contains("--chnages-only"), "got: {err}");
         assert!(err.contains("Usage: follow"), "got: {err}");
+    }
+
+    // ---------------- parse_query ----------------
+
+    /// Every catalog command that is not a session/multi-step built-in must
+    /// be a query: with no arguments it parses (doctor) or reports exactly
+    /// its catalog usage — never "Unknown command".
+    #[test]
+    fn every_query_command_parses_or_reports_its_usage() {
+        let builtins = [
+            "help", "exit", "bulk", "follow", "watch", "history", "set", "copy", "clear",
+        ];
+        for command in catalog::commands().filter(|c| !builtins.contains(&c.name)) {
+            if let Err(e) = parse_query(command.name, &[command.name]) {
+                assert!(
+                    e.starts_with(&catalog::usage(command.name)),
+                    "{}: {e}",
+                    command.name
+                );
+            }
+        }
+        assert!(matches!(
+            parse_query("doctor", &["doctor"]),
+            Ok(Query::Doctor)
+        ));
+    }
+
+    #[test]
+    fn parse_query_handles_aliases_servers_and_bare_domains() {
+        assert!(matches!(
+            parse_query("dns", &["DNS", "example.com", "MX", "@1.1.1.1"]),
+            Ok(Query::Dig { record_type: RecordType::MX, server: Some(ref s), .. }) if s == "1.1.1.1"
+        ));
+        assert!(matches!(
+            parse_query("compare", &["compare", "example.com", "@8.8.8.8", "@1.1.1.1"]),
+            Ok(Query::Compare { ref server_a, ref server_b, .. })
+                if server_a == "8.8.8.8" && server_b == "1.1.1.1"
+        ));
+        let err = parse_query("compare", &["compare", "example.com", "MX", "@8.8.8.8"])
+            .err()
+            .expect("one server");
+        assert!(err.starts_with("Need two nameservers"), "got: {err}");
+        assert!(matches!(
+            parse_query("example.com", &["Example.COM"]),
+            Ok(Query::Lookup(ref d)) if d == "Example.COM"
+        ));
+        let err = parse_query("bogus", &["bogus"]).err().expect("unknown");
+        assert!(err.starts_with("Unknown command: bogus"), "got: {err}");
     }
 
     // ---------------- subdomains / takeover / drift ----------------

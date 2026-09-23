@@ -1,0 +1,11 @@
+---
+source: seer-core/tests/format_snapshots.rs
+expression: human ().format_rdap (& fixture_rdap_ip_network())
+---
+
+[1;95mRDAP: TEST-NET-1[0m
+[37m────────────────[0m
+  [1;96mHandle[0m: [97mNET-192-0-2-0-1[0m
+  [1;96mStart Address[0m: [97m192.0.2.0[0m
+  [1;96mEnd Address[0m: [97m192.0.2.255[0m
+  [1;96mCountry[0m: [97mUS[0m

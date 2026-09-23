@@ -1,18 +1,15 @@
 //! Bordered block with the title embedded in the top border (┤ title ├), an
 //! accent color, and a focus highlight — emulating ratatui's titled Block.
-use ratatui::style::Style;
+use ratatui::layout::Rect;
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders};
+use ratatui::Frame;
 
 use crate::tui::theme::Theme;
 
 /// Build a titled, accent-bordered Block. `focused` brightens the border.
-pub fn block<'a>(
-    theme: &Theme,
-    title: &'a str,
-    accent: ratatui::style::Color,
-    focused: bool,
-) -> Block<'a> {
+fn block<'a>(theme: &Theme, title: &'a str, accent: Color, focused: bool) -> Block<'a> {
     let border_color = if focused { accent } else { theme.surface1 };
     Block::default()
         .borders(Borders::ALL)
@@ -25,36 +22,34 @@ pub fn block<'a>(
         ]))
 }
 
+/// Draw a [`block`] over `area` and return the inner area for its content.
+pub fn render(
+    f: &mut Frame,
+    area: Rect,
+    theme: &Theme,
+    title: &str,
+    accent: Color,
+    focused: bool,
+) -> Rect {
+    let block = block(theme, title, accent, focused);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    inner
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::backend::TestBackend;
+    use crate::tui::test_util::render_text;
     use ratatui::widgets::Paragraph;
-    use ratatui::Terminal;
-
-    fn buf_text(buf: &ratatui::buffer::Buffer) -> String {
-        let area = buf.area();
-        let mut s = String::new();
-        for y in 0..area.height {
-            for x in 0..area.width {
-                s.push_str(buf[(x, y)].symbol());
-            }
-        }
-        s
-    }
 
     #[test]
     fn panel_renders_title_in_border() {
         let theme = Theme::frappe();
-        let backend = TestBackend::new(24, 4);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| {
-                let b = block(&theme, "Registration", theme.blue, true);
-                f.render_widget(Paragraph::new("body").block(b), f.area());
-            })
-            .unwrap();
-        let text = buf_text(terminal.backend().buffer());
+        let text = render_text(24, 4, |f| {
+            let b = block(&theme, "Registration", theme.blue, true);
+            f.render_widget(Paragraph::new("body").block(b), f.area());
+        });
         assert!(text.contains("Registration"));
         assert!(text.contains('╭') || text.contains('┌'));
     }

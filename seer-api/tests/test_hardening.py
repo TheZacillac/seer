@@ -8,6 +8,16 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+import seer
+
+# Nameserver specs are parsed by seer-core through `seer.nameserver_target`,
+# which the conftest stub cannot supply. Skip only for that stub: a compiled
+# binding without the function is stale, and these SSRF tests must fail on it.
+needs_ns_parser = pytest.mark.skipif(
+    getattr(seer, "_IS_STUB", False),
+    reason="nameserver specs are parsed by the compiled seer binding",
+)
+
 
 @pytest.fixture
 def app_module():
@@ -315,8 +325,8 @@ def _real_seer_validator(monkeypatch):
         # SSL inspection TLS-connects to the target (port 443) → guard it.
         "/ssl/127.0.0.1",
         # dig's nameserver parameter is the actual connect target.
-        "/dns/example.com/A?nameserver=169.254.169.254",
-        "/dns/example.com/A?nameserver=127.0.0.1",
+        pytest.param("/dns/example.com/A?nameserver=169.254.169.254", marks=needs_ns_parser),
+        pytest.param("/dns/example.com/A?nameserver=127.0.0.1", marks=needs_ns_parser),
         # rdap/ip rejects reserved IP literals as input validation (the
         # looked-up IP is not a connect target, but asking RDAP about a
         # private IP is nonsensical).
@@ -346,15 +356,26 @@ NAMESERVER_SPECS = [
     ("TLS://dns.quad9.net:8853", ("dns.quad9.net", 8853)),
     ("https://cloudflare-dns.com/dns-query", ("cloudflare-dns.com", 443)),
     ("https://dns.google:8443", ("dns.google", 8443)),
-    ("https://[2606:4700:4700::1111]/dns-query", ("2606:4700:4700::1111", 443)),
 ]
 
 
+def test_stale_bindings_without_nameserver_target_fail_clearly(client, monkeypatch):
+    """Bindings older than the SSRF guard still satisfy the domain-seer floor;
+    a nameserver request must then get a clear 503, not an AttributeError 500."""
+    from seer_api import ssrf
+
+    monkeypatch.delattr(seer, "nameserver_target", raising=False)
+    with pytest.raises(RuntimeError, match="rebuild seer-py"):
+        ssrf.nameserver_target("8.8.8.8")
+    resp = client.get("/dns/example.com/A?nameserver=8.8.8.8")
+    assert resp.status_code == 503, resp.text
+    assert resp.json()["detail"] == "Nameserver validation is unavailable"
+
+
+@needs_ns_parser
 @pytest.mark.parametrize("spec,target", NAMESERVER_SPECS)
 def test_nameserver_target_parses_core_spec_forms(spec, target):
-    from seer_api.ssrf import nameserver_target
-
-    assert nameserver_target(spec) == target
+    assert seer.nameserver_target(spec) == target
 
 
 @pytest.mark.parametrize(
@@ -374,13 +395,18 @@ def test_nameserver_target_parses_core_spec_forms(spec, target):
         "dns.google:+53",
         "a:b:c",
         ":53",
+        # Forms the old Python mirror of the parser accepted but the core
+        # rejects: DoH to an IPv6 literal (bracketed or not) and a scoped
+        # IPv6 address.
+        "https://[2606:4700:4700::1111]/dns-query",
+        "https://2606:4700:4700::1111/dns-query",
+        "fe80::1%eth0",
     ],
 )
+@needs_ns_parser
 def test_nameserver_target_returns_none_for_malformed_specs(spec):
     """Malformed specs are left for the core to reject (Invalid input -> 400)."""
-    from seer_api.ssrf import nameserver_target
-
-    assert nameserver_target(spec) is None
+    assert seer.nameserver_target(spec) is None
 
 
 def _record_validator(monkeypatch):
@@ -398,6 +424,7 @@ def _record_validator(monkeypatch):
     return checked
 
 
+@needs_ns_parser
 @pytest.mark.parametrize("spec,target", NAMESERVER_SPECS)
 def test_dns_route_accepts_every_nameserver_spec_form(monkeypatch, client, spec, target):
     """Regression: the API guard treated the whole spec as a hostname, so
@@ -420,6 +447,7 @@ def test_dns_route_accepts_every_nameserver_spec_form(monkeypatch, client, spec,
     assert seen["nameserver"] == spec
 
 
+@needs_ns_parser
 def test_dns_compare_accepts_nameserver_spec_forms(monkeypatch, client):
     import seer as seer_mod
 
@@ -441,6 +469,7 @@ def test_dns_compare_accepts_nameserver_spec_forms(monkeypatch, client):
 
 
 RESERVED_NAMESERVER_SPECS = [
+    "127.0.0.1",
     "tls://127.0.0.1",
     "127.0.0.1:5353",
     "[::1]",
@@ -450,6 +479,7 @@ RESERVED_NAMESERVER_SPECS = [
 ]
 
 
+@needs_ns_parser
 @pytest.mark.parametrize("spec", RESERVED_NAMESERVER_SPECS)
 def test_dns_route_refuses_reserved_nameserver_in_any_spec_form(monkeypatch, client, spec):
     """Parsing the spec must not open a hole: a reserved address behind any
@@ -481,6 +511,7 @@ def test_malformed_nameserver_spec_rejected_by_core_with_400(client):
     assert "invalid input" in resp.json()["detail"].lower()
 
 
+@needs_ns_parser
 def test_mcp_nameserver_spec_forms(monkeypatch):
     """seer_dig / seer_dns_compare share the spec-aware guard."""
     import asyncio
@@ -508,6 +539,7 @@ def test_mcp_nameserver_spec_forms(monkeypatch):
     assert checked == [("1.1.1.1", 853), ("9.9.9.9", 5353), ("cloudflare-dns.com", 443)]
 
 
+@needs_ns_parser
 @pytest.mark.parametrize("spec", RESERVED_NAMESERVER_SPECS)
 def test_mcp_refuses_reserved_nameserver_in_any_spec_form(spec):
     import asyncio
@@ -635,19 +667,11 @@ def test_mcp_ssrf_guard_rejects_reserved():
 
     from seer_api.mcp.server import execute_tool
 
-    # seer_status HTTP-connects to the target — must guard.
+    # seer_status HTTP-connects to the target — must guard. (A reserved
+    # seer_dig nameserver is covered by
+    # test_mcp_refuses_reserved_nameserver_in_any_spec_form.)
     with pytest.raises(ValueError, match="reserved"):
         asyncio.run(execute_tool("seer_status", {"domain": "127.0.0.1"}))
-
-    # seer_dig with a reserved nameserver — the nameserver is the actual
-    # UDP/TCP connect target.
-    with pytest.raises(ValueError, match="reserved"):
-        asyncio.run(
-            execute_tool(
-                "seer_dig",
-                {"domain": "example.com", "nameserver": "127.0.0.1"},
-            )
-        )
 
     # seer_rdap_ip with a private IP — input validation for IP literals.
     with pytest.raises(ValueError, match="reserved"):
@@ -694,10 +718,11 @@ def test_mcp_ssrf_guard_rejects_reserved():
         ("seer_rdap_ip", {"ip": "1.1.1.1"}, "rdap_ip"),
         ("seer_bulk_status", {"domains": ["1.1.1.1"]}, "bulk_status"),
         ("seer_bulk_ssl", {"domains": ["1.1.1.1"]}, "bulk_ssl"),
-        (
+        pytest.param(
             "seer_dns_compare",
             {"domain": "example.com", "server_a": "8.8.8.8", "server_b": "1.1.1.1"},
             "dns_compare",
+            marks=needs_ns_parser,
         ),
     ],
 )

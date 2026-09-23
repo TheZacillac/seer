@@ -1,36 +1,31 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
-use once_cell::sync::Lazy;
 use regex::Regex;
+use std::sync::LazyLock;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tracing::{debug, instrument, warn};
 
-use super::parser::WhoisResponse;
+use super::parser::{field_patterns, WhoisResponse};
 use super::servers::{get_tld, get_whois_server_for_domain};
 use crate::cache::TtlCache;
 use crate::error::{Result, SeerError};
 use crate::retry::{RetryExecutor, RetryPolicy};
 use crate::validation::normalize_domain;
 
-/// Pre-compiled regexes for extracting WHOIS referral servers.
-static REFERRAL_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
-    // The value MUST be on the SAME line as the key. Use `[ \t]*` (horizontal
-    // whitespace only) rather than `\s*` between the key and the capture
-    // group: `\s*` matches newlines, so an EMPTY `Registrar WHOIS Server:`
-    // line would otherwise swallow the line break and capture the following
-    // line's content as the referral server. `[ \t]*` keeps the match anchored
-    // to the key's own line, and the `(.+)` capture (where `.` excludes `\n`)
-    // yields no match for an empty value.
-    vec![
-        Regex::new(r"(?i)Registrar WHOIS Server:[ \t]*(.+)")
-            .expect("Invalid regex pattern for Registrar WHOIS Server"),
-        Regex::new(r"(?i)Whois Server:[ \t]*(.+)").expect("Invalid regex pattern for Whois Server"),
+/// Pre-compiled regexes for extracting WHOIS referral servers. The value
+/// MUST be on the key's own line, so an EMPTY `Registrar WHOIS Server:` line
+/// yields no match rather than capturing the following line (see
+/// [`field_patterns`]).
+static REFERRAL_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
+    let mut patterns = field_patterns(&["Registrar WHOIS Server", "Whois Server"]);
+    patterns.push(
         Regex::new(r"(?i)ReferralServer:[ \t]*whois://(.+)")
             .expect("Invalid regex pattern for ReferralServer"),
-    ]
+    );
+    patterns
 });
 
 const WHOIS_PORT: u16 = 43;
@@ -43,8 +38,8 @@ const IANA_WHOIS_SERVER: &str = "whois.iana.org";
 const SERVER_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Cache for dynamically discovered WHOIS servers with TTL expiration
-static DISCOVERED_SERVERS: Lazy<TtlCache<String, String>> =
-    Lazy::new(|| TtlCache::new(SERVER_CACHE_TTL));
+static DISCOVERED_SERVERS: LazyLock<TtlCache<String, String>> =
+    LazyLock::new(|| TtlCache::new(SERVER_CACHE_TTL));
 
 #[derive(Debug, Clone)]
 pub struct WhoisClient {
@@ -242,8 +237,8 @@ impl WhoisClient {
                             // its registrar/dates/status, and a registrar's
                             // throttle or refusal body ("connection limit
                             // exceeded") must not swap that for all-None.
-                            if !has_registration_data(&referral_response)
-                                && has_registry_data(&current_response)
+                            if !referral_response.has_registration_fields()
+                                && current_response.has_any_registry_field()
                             {
                                 debug!(
                                     referral = %referral,
@@ -357,21 +352,6 @@ impl WhoisClient {
             tld
         )))
     }
-}
-
-/// True when a (registrar) response carries registration data worth
-/// preferring over the registry's record: a registrar or a registration date.
-fn has_registration_data(response: &WhoisResponse) -> bool {
-    response.registrar.is_some()
-        || response.creation_date.is_some()
-        || response.expiration_date.is_some()
-}
-
-/// True when a registry response carries any registration field at all.
-fn has_registry_data(response: &WhoisResponse) -> bool {
-    has_registration_data(response)
-        || !response.nameservers.is_empty()
-        || !response.status.is_empty()
 }
 
 /// Formats the wire query for registries whose port-43 servers need more
@@ -594,7 +574,7 @@ fn is_safe_whois_server(server: &str) -> bool {
     }
     // Reject IP address literals that resolve to private/reserved ranges
     if let Ok(ip) = server.parse::<std::net::IpAddr>() {
-        return !crate::validation::is_private_or_reserved_ip(&ip);
+        return !crate::net::is_reserved_ip(ip);
     }
     true
 }

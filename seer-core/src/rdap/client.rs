@@ -4,18 +4,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use futures::StreamExt;
-use once_cell::sync::Lazy;
 use reqwest::Client;
 use serde::Deserialize;
+use std::sync::LazyLock;
 use tokio::sync::{Notify, RwLock};
 use tracing::{debug, info, instrument, warn};
 
-use super::bootstrap::{
-    ipv4_matches_prefix, ipv6_matches_prefix, parse_asn_range, validate_bootstrap_url,
-};
+use super::bootstrap::{ip_matches_prefix, parse_asn_range, validate_bootstrap_url};
 use super::types::RdapResponse;
 use crate::error::{Result, SeerError};
+use crate::http::{read_body_capped, BodyReadError, Overflow};
 use crate::retry::{NetworkRetryClassifier, RetryClassifier, RetryExecutor, RetryPolicy};
 use crate::validation::normalize_domain;
 
@@ -23,6 +21,10 @@ const IANA_BOOTSTRAP_DNS: &str = "https://data.iana.org/rdap/dns.json";
 const IANA_BOOTSTRAP_IPV4: &str = "https://data.iana.org/rdap/ipv4.json";
 const IANA_BOOTSTRAP_IPV6: &str = "https://data.iana.org/rdap/ipv6.json";
 const IANA_BOOTSTRAP_ASN: &str = "https://data.iana.org/rdap/asn.json";
+
+/// Cap on one bootstrap registry body (10 MB), streamed incrementally to
+/// prevent memory exhaustion. `seer doctor`'s bootstrap probe reads under it too.
+pub(crate) const MAX_BOOTSTRAP_SIZE: usize = 10 * 1024 * 1024;
 
 /// Default timeout for RDAP queries (15 seconds).
 /// With the 5s connect_timeout, this gives 10s for the server to respond.
@@ -61,6 +63,9 @@ const RDAP_ACCEPT: &str = "application/rdap+json, application/json;q=0.9";
 /// are one hop, so three is ample while bounding a hostile server.
 const MAX_RDAP_REDIRECTS: usize = 3;
 
+/// User agent for every RDAP request (bootstrap and queries).
+const RDAP_USER_AGENT: &str = "Seer/1.0 (RDAP Client)";
+
 /// Shared HTTP client for bootstrap fetches against IANA.
 /// The bootstrap targets are hardcoded data.iana.org URLs, so this client
 /// does not need DNS-rebinding protection. Per-query RDAP requests use
@@ -70,16 +75,12 @@ const MAX_RDAP_REDIRECTS: usize = 3;
 /// Wrapped in `Option` so a reqwest builder failure surfaces as a typed
 /// `SeerError::HttpError` via `rdap_http_client()` instead of a process
 /// panic at first use (library code must not `.expect()` on shared state).
-static RDAP_HTTP_CLIENT: Lazy<Option<Client>> = Lazy::new(|| {
-    Client::builder()
-        .timeout(DEFAULT_TIMEOUT)
-        .connect_timeout(CONNECT_TIMEOUT)
-        .user_agent("Seer/1.0 (RDAP Client)")
+static RDAP_HTTP_CLIENT: LazyLock<Option<Client>> = LazyLock::new(|| {
+    // Bootstrap targets are hardcoded https://data.iana.org URLs that return
+    // terminal JSON; the builder's no-redirect policy is defense in depth so a
+    // compromised/MITM'd hop can't bounce the fetch to an internal address.
+    rdap_client_builder(DEFAULT_TIMEOUT)
         .pool_max_idle_per_host(10)
-        // Bootstrap targets are hardcoded https://data.iana.org URLs that return
-        // terminal JSON; disable redirect-following for defense in depth so a
-        // compromised/MITM'd hop can't bounce the fetch to an internal address.
-        .redirect(reqwest::redirect::Policy::none())
         .build()
         .ok()
 });
@@ -94,12 +95,14 @@ fn rdap_http_client() -> Result<&'static Client> {
 }
 
 /// Bootstrap cache with TTL support
-static BOOTSTRAP_CACHE: Lazy<RwLock<Option<CachedBootstrap>>> = Lazy::new(|| RwLock::new(None));
+static BOOTSTRAP_CACHE: LazyLock<RwLock<Option<CachedBootstrap>>> =
+    LazyLock::new(|| RwLock::new(None));
 
 /// Timestamp of the most recent bootstrap refresh attempt (success or failure).
 /// Used together with `BOOTSTRAP_REFRESH_MIN_INTERVAL` to throttle retry
 /// storms when IANA is unreachable.
-static BOOTSTRAP_LAST_ATTEMPT: Lazy<RwLock<Option<Instant>>> = Lazy::new(|| RwLock::new(None));
+static BOOTSTRAP_LAST_ATTEMPT: LazyLock<RwLock<Option<Instant>>> =
+    LazyLock::new(|| RwLock::new(None));
 
 /// Notifies waiters when an in-flight bootstrap load completes (success or
 /// failure). Solves the first-boot thundering-herd race where two concurrent
@@ -108,7 +111,7 @@ static BOOTSTRAP_LAST_ATTEMPT: Lazy<RwLock<Option<Instant>>> = Lazy::new(|| RwLo
 /// and returns a spurious `throttled and no cache available` error while A
 /// is still actively loading. Losers instead wait on this notify with a
 /// bounded timeout, then re-check the cache.
-static BOOTSTRAP_LOAD_NOTIFY: Lazy<Notify> = Lazy::new(Notify::new);
+static BOOTSTRAP_LOAD_NOTIFY: LazyLock<Notify> = LazyLock::new(Notify::new);
 
 /// True while some task is running a bootstrap load. Lets a throttled
 /// cold-cache caller tell "a load is in flight — wait for its notify" apart
@@ -491,36 +494,42 @@ impl RdapClient {
     }
 
     /// Looks up the candidate RDAP base URLs for an IP address.
-    fn get_rdap_urls_for_ip(cache: &BootstrapData, ip: &IpAddr) -> Option<Arc<Vec<url::Url>>> {
-        match ip {
-            IpAddr::V4(addr) => {
-                for (range, urls) in &cache.ipv4 {
-                    if ipv4_matches_prefix(&range.prefix, addr) {
-                        return Some(Arc::clone(urls));
-                    }
-                }
-            }
-            IpAddr::V6(addr) => {
-                for (range, urls) in &cache.ipv6 {
-                    if ipv6_matches_prefix(&range.prefix, addr) {
-                        return Some(Arc::clone(urls));
-                    }
-                }
-            }
-        }
-
-        None
+    fn get_rdap_urls_for_ip(cache: &BootstrapData, ip: IpAddr) -> Option<Arc<Vec<url::Url>>> {
+        let ranges = match ip {
+            IpAddr::V4(_) => &cache.ipv4,
+            IpAddr::V6(_) => &cache.ipv6,
+        };
+        ranges
+            .iter()
+            .find(|(range, _)| ip_matches_prefix(&range.prefix, ip))
+            .map(|(_, urls)| Arc::clone(urls))
     }
 
     /// Looks up the candidate RDAP base URLs for an ASN.
     fn get_rdap_urls_for_asn(cache: &BootstrapData, asn: u32) -> Option<Arc<Vec<url::Url>>> {
-        for (range, urls) in &cache.asn {
-            if asn >= range.start && asn <= range.end {
-                return Some(Arc::clone(urls));
-            }
-        }
+        cache
+            .asn
+            .iter()
+            .find(|(range, _)| (range.start..=range.end).contains(&asn))
+            .map(|(_, urls)| Arc::clone(urls))
+    }
 
-        None
+    /// Resolves the candidate query URLs for one lookup: `pick` selects the
+    /// base URLs from the loaded bootstrap (`what` names the query in the
+    /// "no RDAP server" error) and each is joined with `path`. The cache lock
+    /// is released on return, before any HTTP request.
+    async fn candidate_urls(
+        pick: impl FnOnce(&BootstrapData) -> Option<Arc<Vec<url::Url>>>,
+        what: &str,
+        path: &str,
+    ) -> Result<Vec<url::Url>> {
+        let cache_guard = BOOTSTRAP_CACHE.read().await;
+        let cache = cache_guard.as_ref().ok_or_else(|| {
+            SeerError::RdapBootstrapError("bootstrap data not loaded".to_string())
+        })?;
+        let bases = pick(&cache.data)
+            .ok_or_else(|| SeerError::RdapBootstrapError(format!("no RDAP server for {}", what)))?;
+        Ok(build_rdap_urls(&bases, path))
     }
 
     /// Looks up RDAP registration data for a domain.
@@ -531,21 +540,12 @@ impl RdapClient {
         self.ensure_bootstrap().await?;
 
         let domain = normalize_domain(domain)?;
-
-        // Extract candidate URLs while holding the lock, then release before HTTP requests.
-        let urls = {
-            let cache_guard = BOOTSTRAP_CACHE.read().await;
-            let cache = cache_guard.as_ref().ok_or_else(|| {
-                SeerError::RdapBootstrapError("bootstrap data not loaded".to_string())
-            })?;
-
-            let bases = Self::get_rdap_urls_for_domain(&cache.data, &domain).ok_or_else(|| {
-                SeerError::RdapBootstrapError(format!("no RDAP server for {}", domain))
-            })?;
-
-            build_rdap_urls(&bases, &format!("domain/{}", domain))
-        }; // Lock released here
-
+        let urls = Self::candidate_urls(
+            |data| Self::get_rdap_urls_for_domain(data, &domain),
+            &domain,
+            &format!("domain/{}", domain),
+        )
+        .await?;
         self.query_rdap_urls(&urls).await
     }
 
@@ -559,20 +559,12 @@ impl RdapClient {
         let ip_addr: IpAddr = ip
             .parse()
             .map_err(|_| SeerError::InvalidIpAddress(ip.to_string()))?;
-
-        let urls = {
-            let cache_guard = BOOTSTRAP_CACHE.read().await;
-            let cache = cache_guard.as_ref().ok_or_else(|| {
-                SeerError::RdapBootstrapError("bootstrap data not loaded".to_string())
-            })?;
-
-            let bases = Self::get_rdap_urls_for_ip(&cache.data, &ip_addr).ok_or_else(|| {
-                SeerError::RdapBootstrapError(format!("no RDAP server for {}", ip))
-            })?;
-
-            build_rdap_urls(&bases, &format!("ip/{}", ip))
-        };
-
+        let urls = Self::candidate_urls(
+            |data| Self::get_rdap_urls_for_ip(data, ip_addr),
+            ip,
+            &format!("ip/{}", ip),
+        )
+        .await?;
         self.query_rdap_urls(&urls).await
     }
 
@@ -582,20 +574,12 @@ impl RdapClient {
     #[instrument(skip(self), fields(asn = %asn))]
     pub async fn lookup_asn(&self, asn: u32) -> Result<RdapResponse> {
         self.ensure_bootstrap().await?;
-
-        let urls = {
-            let cache_guard = BOOTSTRAP_CACHE.read().await;
-            let cache = cache_guard.as_ref().ok_or_else(|| {
-                SeerError::RdapBootstrapError("bootstrap data not loaded".to_string())
-            })?;
-
-            let bases = Self::get_rdap_urls_for_asn(&cache.data, asn).ok_or_else(|| {
-                SeerError::RdapBootstrapError(format!("no RDAP server for AS{}", asn))
-            })?;
-
-            build_rdap_urls(&bases, &format!("autnum/{}", asn))
-        };
-
+        let urls = Self::candidate_urls(
+            |data| Self::get_rdap_urls_for_asn(data, asn),
+            &format!("AS{}", asn),
+            &format!("autnum/{}", asn),
+        )
+        .await?;
         self.query_rdap_urls(&urls).await
     }
 
@@ -742,14 +726,8 @@ fn parse_rdap_url(url: &str) -> Result<(String, u16)> {
             url
         )));
     }
-    // Use `host()` (not `host_str()`) so an IPv6 literal comes back
-    // unbracketed and hits the shared guard's IP-literal short-circuit.
-    let host = match parsed.host() {
-        Some(url::Host::Domain(d)) => d.to_string(),
-        Some(url::Host::Ipv4(ip)) => ip.to_string(),
-        Some(url::Host::Ipv6(ip)) => ip.to_string(),
-        None => return Err(SeerError::RdapError(format!("URL '{}' has no host", url))),
-    };
+    let host = crate::net::url_host(&parsed)
+        .ok_or_else(|| SeerError::RdapError(format!("URL '{}' has no host", url)))?;
     let port = parsed.port_or_known_default().unwrap_or(443);
     Ok((host, port))
 }
@@ -820,8 +798,21 @@ type PinnedClientKey = (String, u16, Duration);
 /// bypass this cache in both directions (never insert, never read).
 /// Capacity-bounded: evicting
 /// a live entry merely forces a re-validate + rebuild on next use.
-static PINNED_CLIENT_CACHE: Lazy<crate::cache::TtlCache<PinnedClientKey, Client>> =
-    Lazy::new(|| crate::cache::TtlCache::with_max_capacity(PINNED_CLIENT_TTL, 64));
+static PINNED_CLIENT_CACHE: LazyLock<crate::cache::TtlCache<PinnedClientKey, Client>> =
+    LazyLock::new(|| crate::cache::TtlCache::with_max_capacity(PINNED_CLIENT_TTL, 64));
+
+/// Client settings shared by every RDAP request. The connect timeout is kept
+/// no larger than the overall one so a sub-5s configured timeout stays
+/// consistent. Redirects are never auto-followed: `resolve_to_addrs` pins only
+/// the first host, so reqwest's policy would re-resolve a 3xx target itself
+/// and bypass the reserved-IP guard. `query_rdap_attempt` follows them one hop
+/// at a time instead, each hop re-entering [`send_rdap_request`] and so
+/// re-running the https check, SSRF validation, and pinning.
+fn rdap_client_builder(timeout: Duration) -> reqwest::ClientBuilder {
+    crate::net::client_builder(timeout)
+        .connect_timeout(CONNECT_TIMEOUT.min(timeout))
+        .user_agent(RDAP_USER_AGENT)
+}
 
 /// Sends one RDAP request: SSRF-validates the URL and pins the resolved IPs on
 /// a cached per-host client (DNS-rebinding defense), returning the raw response.
@@ -843,18 +834,11 @@ async fn send_rdap_request(
     timeout: Duration,
     allow_reserved: bool,
 ) -> Result<reqwest::Response> {
-    // Keep the connect timeout no larger than the overall request timeout so a
-    // sub-5s configured timeout stays internally consistent.
-    let connect_timeout = CONNECT_TIMEOUT.min(timeout);
     if allow_reserved && is_loopback_url(url) {
         // Test seam: build a one-off unpinned client and never touch the
         // shared pinned-client cache — a test-mode client reaching loopback
         // must not be servable to a production request (nor vice versa).
-        let client = Client::builder()
-            .timeout(timeout)
-            .connect_timeout(connect_timeout)
-            .user_agent("Seer/1.0 (RDAP Client)")
-            .redirect(reqwest::redirect::Policy::none())
+        let client = rdap_client_builder(timeout)
             .build()
             .map_err(|e| SeerError::RdapError(format!("failed to build HTTP client: {}", e)))?;
         return client
@@ -877,19 +861,8 @@ async fn send_rdap_request(
             // the HTTP client. If the host is an IP literal the resolved vec
             // already holds it, so `resolve_to_addrs` is still correct.
             let resolved = resolve_rdap_host(&host, port).await?;
-            let client = Client::builder()
-                .timeout(timeout)
-                .connect_timeout(connect_timeout)
-                .user_agent("Seer/1.0 (RDAP Client)")
+            let client = rdap_client_builder(timeout)
                 .resolve_to_addrs(&host, &resolved)
-                // SSRF defense: `resolve_to_addrs` pins only THIS host's validated IPs.
-                // reqwest's own policy would follow redirects re-resolving each new
-                // host with its own resolver — so a 3xx to http://169.254.169.254 (or
-                // any internal host) would bypass the reserved-IP guard entirely.
-                // Redirects are instead followed manually by `query_rdap_attempt`,
-                // one hop at a time, each hop re-entering this function and so
-                // re-running the https check, SSRF validation, and pinning.
-                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .map_err(|e| SeerError::RdapError(format!("failed to build HTTP client: {}", e)))?;
             PINNED_CLIENT_CACHE.insert(key.clone(), client.clone());
@@ -927,37 +900,24 @@ async fn read_and_parse_rdap_body(
     timeout: Duration,
 ) -> Result<RdapResponse> {
     // Stream body with incremental size check to prevent memory exhaustion.
-    // Wrap the chunk loop in a timeout so a server that opens the connection
-    // but trickles bytes forever is classified as a timeout (not a generic
-    // RdapError) and retries can be driven appropriately.
-    let mut body = Vec::new();
-    let mut stream = response.bytes_stream();
-    let streamed = tokio::time::timeout(timeout, async {
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk
-                .map_err(|e| SeerError::RdapError(format!("failed to read response: {}", e)))?;
-            body.extend_from_slice(&chunk);
-            if body.len() > MAX_RDAP_RESPONSE_SIZE {
-                return Err(SeerError::RdapError(format!(
-                    "RDAP response exceeds {} byte limit",
-                    MAX_RDAP_RESPONSE_SIZE
-                )));
+    // A server that opens the connection but trickles bytes forever is
+    // classified as a timeout (not a generic RdapError) so retries can be
+    // driven appropriately.
+    let body = read_body_capped(response, MAX_RDAP_RESPONSE_SIZE, timeout, Overflow::Reject)
+        .await
+        .map_err(|e| match e {
+            BodyReadError::Chunk(e) => {
+                SeerError::RdapError(format!("failed to read response: {}", e))
             }
-        }
-        Ok::<(), SeerError>(())
-    })
-    .await;
-
-    match streamed {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => return Err(e),
-        Err(_) => {
-            return Err(SeerError::Timeout(format!(
+            BodyReadError::TooLarge => SeerError::RdapError(format!(
+                "RDAP response exceeds {} byte limit",
+                MAX_RDAP_RESPONSE_SIZE
+            )),
+            BodyReadError::TimedOut => SeerError::Timeout(format!(
                 "timed out reading RDAP response body from {} after {:?}",
                 url, timeout
-            )));
-        }
-    }
+            )),
+        })?;
 
     let rdap: RdapResponse = serde_json::from_slice(&body)?;
     // Bound attacker-controlled payload post-deserialization. The 10MB
@@ -1103,44 +1063,26 @@ async fn load_bootstrap_data() -> Result<BootstrapLoad> {
     let (dns_resp, ipv4_resp, ipv6_resp, asn_resp) =
         tokio::join!(dns_future, ipv4_future, ipv6_future, asn_future);
 
-    // Stream body with incremental size check to prevent memory exhaustion
-    const MAX_BOOTSTRAP_SIZE: usize = 10 * 1024 * 1024; // 10 MB
-
     async fn read_bootstrap(resp: reqwest::Response) -> Result<BootstrapResponse> {
-        // Bound the streaming-read loop with the same timeout used for RDAP
+        // Bound the streaming read with the same timeout used for RDAP
         // queries. Without this, a slow or stalled IANA response (open TCP
         // but no bytes arriving) could hang all RDAP lookups indefinitely
-        // because `ensure_bootstrap` awaits this future. Mirrors the pattern
-        // in `read_and_parse_rdap_body`.
-        let mut body = Vec::new();
-        let mut stream = resp.bytes_stream();
-        let streamed = tokio::time::timeout(DEFAULT_TIMEOUT, async {
-            while let Some(chunk) = stream.next().await {
-                let chunk = chunk.map_err(|e| {
+        // because `ensure_bootstrap` awaits this future.
+        let body = read_body_capped(resp, MAX_BOOTSTRAP_SIZE, DEFAULT_TIMEOUT, Overflow::Reject)
+            .await
+            .map_err(|e| match e {
+                BodyReadError::Chunk(e) => {
                     SeerError::RdapBootstrapError(format!("failed to read body: {}", e))
-                })?;
-                body.extend_from_slice(&chunk);
-                if body.len() > MAX_BOOTSTRAP_SIZE {
-                    return Err(SeerError::RdapBootstrapError(format!(
-                        "bootstrap response too large (exceeds {} bytes)",
-                        MAX_BOOTSTRAP_SIZE
-                    )));
                 }
-            }
-            Ok::<(), SeerError>(())
-        })
-        .await;
-
-        match streamed {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => return Err(e),
-            Err(_) => {
-                return Err(SeerError::Timeout(format!(
+                BodyReadError::TooLarge => SeerError::RdapBootstrapError(format!(
+                    "bootstrap response too large (exceeds {} bytes)",
+                    MAX_BOOTSTRAP_SIZE
+                )),
+                BodyReadError::TimedOut => SeerError::Timeout(format!(
                     "RDAP bootstrap body read timed out after {:?}",
                     DEFAULT_TIMEOUT
-                )));
-            }
-        }
+                )),
+            })?;
 
         serde_json::from_slice(&body).map_err(Into::into)
     }

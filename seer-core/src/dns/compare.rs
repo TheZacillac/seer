@@ -12,6 +12,25 @@ pub struct ServerResult {
     pub error: Option<String>,
 }
 
+impl ServerResult {
+    /// Folds one server's query outcome into a result.
+    fn from_query(nameserver: &str, result: Result<Vec<DnsRecord>>) -> Self {
+        let (records, error) = match result {
+            Ok(records) => (records, None),
+            Err(e) => {
+                debug!(server = %nameserver, error = %e, "DNS compare query failed");
+                // Sanitized for external return; full detail logged above.
+                (vec![], Some(e.sanitized_message()))
+            }
+        };
+        Self {
+            nameserver: nameserver.to_string(),
+            records,
+            error,
+        }
+    }
+}
+
 /// Comparison of DNS records between two nameservers.
 ///
 /// Contains the records from each server, whether they match,
@@ -80,39 +99,8 @@ impl DnsComparator {
             self.resolver.resolve(&domain, record_type, Some(server_b))
         );
 
-        let server_a_result = match result_a {
-            Ok(records) => ServerResult {
-                nameserver: server_a.to_string(),
-                records,
-                error: None,
-            },
-            Err(e) => {
-                debug!(server = %server_a, error = %e, "DNS compare query failed");
-                ServerResult {
-                    nameserver: server_a.to_string(),
-                    records: vec![],
-                    // Sanitized for external return; full detail logged above.
-                    error: Some(e.sanitized_message()),
-                }
-            }
-        };
-
-        let server_b_result = match result_b {
-            Ok(records) => ServerResult {
-                nameserver: server_b.to_string(),
-                records,
-                error: None,
-            },
-            Err(e) => {
-                debug!(server = %server_b, error = %e, "DNS compare query failed");
-                ServerResult {
-                    nameserver: server_b.to_string(),
-                    records: vec![],
-                    // Sanitized for external return; full detail logged above.
-                    error: Some(e.sanitized_message()),
-                }
-            }
-        };
+        let server_a_result = ServerResult::from_query(server_a, result_a);
+        let server_b_result = ServerResult::from_query(server_b, result_b);
 
         // Compare record values on their comparison key: domain-name fields
         // case-insensitively (two servers returning `NS1.EXAMPLE.COM.` vs

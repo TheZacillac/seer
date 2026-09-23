@@ -1,10 +1,17 @@
-"""MCP server implementation for Seer domain utilities."""
+"""MCP server implementation for Seer domain utilities.
+
+Each tool is one entry in the ``_TOOLS`` registry: the description and input
+schema ``tools/list`` serves, the handler ``tools/call`` dispatches to, and
+its optional per-tool rate limit.
+"""
 
 import asyncio
 import json
 import logging
 import os
 import re
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Any
 
 from limits import parse as _parse_rate_limit
@@ -24,35 +31,17 @@ from mcp.types import (
 import seer
 
 from .. import __version__
+from .._contract import (
+    BULK_LIMIT,
+    HEAVY_LIMIT,
+    MAX_BULK_DOMAINS,
+    MAX_CONCURRENCY,
+    RECORD_TYPE_MAX_LENGTH,
+    RECORD_TYPE_PATTERN,
+    TLD_TOKEN_RE,
+)
 from .._run import run_seer
 from ..ssrf import nameserver_target
-
-
-def _ssrf_guard(host: str, port: int = 443) -> None:
-    """Raise ValueError if the host resolves to a reserved/internal address.
-
-    Mirrors the HTTP ``seer_api.ssrf.guard`` helper but raises ValueError
-    instead of HTTPException, since MCP surfaces ValueError as ``Invalid
-    input:`` in ``call_tool`` below.
-    """
-    try:
-        seer.validate_public_host(host, port)
-    except ValueError as exc:
-        raise ValueError(str(exc)) from exc
-
-
-def _guard_nameserver(spec: str) -> None:
-    """:func:`_ssrf_guard` the host a nameserver spec connects to.
-
-    Mirrors ``seer_api.ssrf.guard_nameserver_async``: the argument is a spec
-    (``8.8.8.8``, ``9.9.9.9:5353``, ``tls://1.1.1.1``,
-    ``https://cloudflare-dns.com/dns-query``), not a hostname. A malformed
-    spec is left for the core to reject with its own ``Invalid input``.
-    """
-    target = nameserver_target(spec)
-    if target is not None:
-        _ssrf_guard(*target)
-
 
 # No logging.basicConfig() here: this module is also imported by the REST app
 # (seer_api.main), where configuring the root logger at import time made
@@ -65,21 +54,6 @@ logger = logging.getLogger(__name__)
 # hosts see an empty version over both transports (stdio and POST /mcp, which
 # share this Server instance).
 mcp = Server("seer", version=__version__)
-
-MAX_BULK_DOMAINS = 100
-MAX_CONCURRENCY = 50
-
-# Shared input schema for the single-domain tools.
-_DOMAIN_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "domain": {
-            "type": "string",
-            "description": "Domain name (e.g., 'example.com')",
-        },
-    },
-    "required": ["domain"],
-}
 
 # Prompt-injection hardening: every tool result contains data fetched from
 # third-party registries/registrars/DNS responses, which we do not control.
@@ -105,7 +79,7 @@ def _error_result(text: str) -> CallToolResult:
     )
 
 
-_RECORD_TYPE_PATTERN = re.compile(r"[A-Z0-9]{1,10}")
+_RECORD_TYPE_RE = re.compile(RECORD_TYPE_PATTERN)
 
 # Rendered from the core enum via the bindings rather than re-typed: the
 # hand-written list this replaces advertised 13 of 16 types, so NAPTR, TLSA,
@@ -115,19 +89,11 @@ _RECORD_TYPE_DESC = (
     f"DNS record type — one of: {', '.join(seer.record_types())} (default: A)"
 )
 
-# Plausible TLD token: optional leading dot, then 1-63 ASCII
-# letters/digits/hyphens without a leading or trailing hyphen (covers
-# punycode A-labels like "xn--p1ai"). Never a URL/connect target — this only
-# rejects junk with a clear error instead of an all-null payload. Keep in
-# sync with the copy in seer_api/routers/tld.py (REST returns 400 for the
-# same inputs this rejects).
-_TLD_TOKEN_RE = re.compile(r"^\.?[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$", re.IGNORECASE)
-
 
 def _require_tld(arguments: dict[str, Any]) -> str:
     """Extract and validate a required TLD argument."""
     tld = _require_str(arguments, "tld")
-    if not _TLD_TOKEN_RE.fullmatch(tld):
+    if not TLD_TOKEN_RE.fullmatch(tld):
         raise ValueError(
             "'tld' must be ASCII letters/digits/hyphens (punycode allowed), "
             "optionally with a leading dot (e.g., 'com' or '.com')"
@@ -138,7 +104,11 @@ def _require_tld(arguments: dict[str, Any]) -> str:
 def _require_record_type(arguments: dict[str, Any], default: str = "A") -> str:
     """Extract and validate an optional DNS record type argument."""
     value = arguments.get("record_type", default)
-    if not isinstance(value, str) or not _RECORD_TYPE_PATTERN.fullmatch(value):
+    if (
+        not isinstance(value, str)
+        or len(value) > RECORD_TYPE_MAX_LENGTH
+        or not _RECORD_TYPE_RE.fullmatch(value)
+    ):
         raise ValueError(
             "'record_type' must be 1-10 uppercase alphanumerics (e.g., A, AAAA, MX, TXT)"
         )
@@ -196,649 +166,493 @@ def _invalid_input_message(exc: Exception) -> str:
     return _INVALID_INPUT_PREFIX + msg
 
 
+# --- SSRF guards --------------------------------------------------------------
+# Only hosts that are an actual outbound connect target are guarded (see
+# seer_api/ssrf.py). `seer.validate_public_host` raises ValueError, which
+# `call_tool` surfaces as "Invalid input:". It enters PyO3 and `block_on`s a
+# DNS resolution, so handlers call these through `run_seer` to keep it off the
+# event loop.
+
+
+def _guard_hosts(*hosts: str) -> None:
+    """SSRF-check each host as an HTTPS (port 443) connect target."""
+    for host in hosts:
+        seer.validate_public_host(host, 443)
+
+
+def _guard_nameserver(spec: str) -> None:
+    """SSRF-check the host a nameserver spec connects to.
+
+    Mirrors ``seer_api.ssrf.guard_nameserver_async``: the argument is a spec
+    (``8.8.8.8``, ``9.9.9.9:5353``, ``tls://1.1.1.1``,
+    ``https://cloudflare-dns.com/dns-query``), not a hostname, parsed by
+    seer-core. A malformed spec is left for the core to reject with its own
+    ``Invalid input``.
+    """
+    target = nameserver_target(spec)
+    if target is not None:
+        seer.validate_public_host(*target)
+
+
+# --- Tool handlers ------------------------------------------------------------
+# Each handler validates its arguments, then dispatches the blocking PyO3 call
+# through `run_seer` (the bounded `_DISPATCH_EXECUTOR`) so the MCP-over-HTTP
+# transport honors SEER_DISPATCH_THREADS exactly like the REST routes (issue
+# #48). Bindings are looked up on `seer` at call time, never captured at
+# import.
+
+Handler = Callable[[dict[str, Any]], Awaitable[Any]]
+
+
+def _single(binding: str, arg: str = "domain", *, guard: bool = False) -> Handler:
+    """``seer.<binding>(<arg>)``. With ``guard``, the argument is the HTTPS
+    connect target and is SSRF-checked first."""
+
+    async def run(arguments: dict[str, Any]) -> Any:
+        value = _require_str(arguments, arg)
+        if guard:
+            await run_seer(_guard_hosts, value)
+        return await run_seer(getattr(seer, binding), value)
+
+    return run
+
+
+def _scan(binding: str) -> Handler:
+    """``seer.<binding>(domain, concurrency)``: a single-domain fan-out scan."""
+
+    async def run(arguments: dict[str, Any]) -> Any:
+        domain = _require_str(arguments, "domain")
+        concurrency = _get_concurrency(arguments, default=10)
+        return await run_seer(getattr(seer, binding), domain, concurrency)
+
+    return run
+
+
+def _bulk(
+    binding: str,
+    *,
+    record_type: bool = False,
+    default_concurrency: int = 10,
+    guard: bool = False,
+) -> Handler:
+    """``seer.<binding>(domains, [record_type,] concurrency)``. With ``guard``,
+    every domain is an HTTPS connect target and is SSRF-checked first."""
+
+    async def run(arguments: dict[str, Any]) -> Any:
+        domains = _require_domains(arguments)
+        extra = (_require_record_type(arguments),) if record_type else ()
+        concurrency = _get_concurrency(arguments, default=default_concurrency)
+        if guard:
+            await run_seer(_guard_hosts, *domains)
+        return await run_seer(getattr(seer, binding), domains, *extra, concurrency)
+
+    return run
+
+
+async def _rdap_asn(arguments: dict[str, Any]) -> Any:
+    asn = arguments.get("asn")
+    if isinstance(asn, bool) or not isinstance(asn, int) or asn < 0 or asn > 4294967295:
+        raise ValueError(f"'asn' must be an integer between 0 and 4294967295 (got {asn!r})")
+    return await run_seer(seer.rdap_asn, asn)
+
+
+async def _dig(arguments: dict[str, Any]) -> Any:
+    domain = _require_str(arguments, "domain")
+    record_type = _require_record_type(arguments)
+    nameserver = arguments.get("nameserver")
+    if nameserver is not None:
+        if not isinstance(nameserver, str):
+            raise ValueError(f"'nameserver' must be a string (got {type(nameserver).__name__})")
+        await run_seer(_guard_nameserver, nameserver)
+    return await run_seer(seer.dig, domain, record_type, nameserver)
+
+
+async def _propagation(arguments: dict[str, Any]) -> Any:
+    domain = _require_str(arguments, "domain")
+    record_type = _require_record_type(arguments)
+    return await run_seer(seer.propagation, domain, record_type)
+
+
+async def _tld_info(arguments: dict[str, Any]) -> Any:
+    return await run_seer(seer.tld_info, _require_tld(arguments))
+
+
+async def _subdomains(arguments: dict[str, Any]) -> Any:
+    domain = _require_str(arguments, "domain")
+    resolve = arguments.get("resolve", False)
+    if not isinstance(resolve, bool):
+        raise ValueError(f"'resolve' must be a boolean (got {type(resolve).__name__})")
+    if resolve:
+        concurrency = _get_concurrency(arguments, default=10)
+        return await run_seer(seer.subdomains_classify, domain, concurrency)
+    return await run_seer(seer.subdomains, domain)
+
+
+async def _dns_compare(arguments: dict[str, Any]) -> Any:
+    domain = _require_str(arguments, "domain")
+    record_type = _require_record_type(arguments)
+    server_a = _require_str(arguments, "server_a")
+    server_b = _require_str(arguments, "server_b")
+    # Both servers are actual connect targets (nameserver specs).
+    await run_seer(_guard_nameserver, server_a)
+    await run_seer(_guard_nameserver, server_b)
+    return await run_seer(seer.dns_compare, domain, record_type, server_a, server_b)
+
+
+async def _diff(arguments: dict[str, Any]) -> Any:
+    domain_a = _require_str(arguments, "domain_a")
+    domain_b = _require_str(arguments, "domain_b")
+    return await run_seer(seer.diff, domain_a, domain_b)
+
+
+# --- Input-schema builders ----------------------------------------------------
+
+
+def _object(*required: str, **properties: dict[str, Any]) -> dict[str, Any]:
+    """A tool input schema with ``properties``, of which ``required`` are mandatory."""
+    return {"type": "object", "properties": properties, "required": list(required)}
+
+
+def _string(description: str) -> dict[str, Any]:
+    return {"type": "string", "description": description}
+
+
+def _domains(verb: str) -> dict[str, Any]:
+    return {
+        "type": "array",
+        "items": {"type": "string"},
+        "description": f"List of domain names to {verb}",
+        "maxItems": MAX_BULK_DOMAINS,
+    }
+
+
+def _concurrency(what: str = "Number of concurrent requests", default: int = 10) -> dict[str, Any]:
+    return {
+        "type": "integer",
+        "description": f"{what} (default: {default}, max: {MAX_CONCURRENCY})",
+        "default": default,
+        "minimum": 1,
+        "maximum": MAX_CONCURRENCY,
+    }
+
+
+_RECORD_TYPE = {"type": "string", "description": _RECORD_TYPE_DESC, "default": "A"}
+
+# Shared input schema for the single-domain tools.
+_DOMAIN_SCHEMA = _object("domain", domain=_string("Domain name (e.g., 'example.com')"))
+
+
+# --- Registry -----------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _Tool:
+    description: str
+    input_schema: dict[str, Any]
+    run: Handler
+    # Per-tool limit (see `_TOOL_RATE_LIMITS`); None = only the flat /mcp gate.
+    rate_limit: str | None = None
+
+
+_TOOLS: dict[str, _Tool] = {
+    "seer_lookup": _Tool(
+        "Smart domain lookup that tries RDAP first (modern protocol with structured data) "
+        "and falls back to WHOIS if RDAP is unavailable. Returns registration data with "
+        "source indicator.",
+        _object("domain", domain=_string("Domain name to look up (e.g., 'example.com')")),
+        _single("lookup"),
+    ),
+    "seer_whois": _Tool(
+        "Look up WHOIS information for a domain name. Returns registrar, creation date, "
+        "expiration date, nameservers, and status information.",
+        _object("domain", domain=_string("Domain name to look up (e.g., 'example.com')")),
+        _single("whois"),
+    ),
+    "seer_rdap_domain": _Tool(
+        "Look up RDAP (Registration Data Access Protocol) information for a domain. "
+        "Returns structured registration data including registrar, dates, nameservers, "
+        "and DNSSEC status.",
+        _object("domain", domain=_string("Domain name to look up")),
+        _single("rdap_domain"),
+    ),
+    "seer_rdap_ip": _Tool(
+        "Look up RDAP information for an IP address. Returns network registration "
+        "information including the network range, country, and responsible organization.",
+        _object("ip", ip=_string("IP address (IPv4 or IPv6) to look up")),
+        # Rejects reserved IP literals as input validation.
+        _single("rdap_ip", "ip", guard=True),
+    ),
+    "seer_rdap_asn": _Tool(
+        "Look up RDAP information for an Autonomous System Number (ASN). Returns "
+        "organization and network range information.",
+        _object(
+            "asn",
+            asn={
+                "type": "integer",
+                "description": "AS number (e.g., 15169 for Google)",
+                "minimum": 0,
+                "maximum": 4294967295,
+            },
+        ),
+        _rdap_asn,
+    ),
+    "seer_dig": _Tool(
+        "Query DNS records for a domain, similar to the 'dig' command. Supports all major "
+        "record types.",
+        _object(
+            "domain",
+            domain=_string("Domain name to query"),
+            record_type=_RECORD_TYPE,
+            nameserver=_string("Optional nameserver IP to query (e.g., '8.8.8.8')"),
+        ),
+        _dig,
+    ),
+    "seer_propagation": _Tool(
+        "Check DNS propagation for a domain across multiple global DNS servers. Shows "
+        "which servers have the record and identifies inconsistencies.",
+        _object("domain", domain=_string("Domain name to check"), record_type=_RECORD_TYPE),
+        _propagation,
+    ),
+    "seer_status": _Tool(
+        "Check the health status of a domain including HTTP accessibility, SSL "
+        "certificate validity, and domain expiration.",
+        _object("domain", domain=_string("Domain name to check (e.g., 'example.com')")),
+        _single("status", guard=True),
+    ),
+    "seer_bulk_lookup": _Tool(
+        "Smart lookup for multiple domains at once (tries RDAP first, falls back to "
+        "WHOIS). Efficient for checking many domains.",
+        _object("domains", domains=_domains("look up"), concurrency=_concurrency()),
+        _bulk("bulk_lookup"),
+        BULK_LIMIT,
+    ),
+    "seer_bulk_whois": _Tool(
+        "Look up WHOIS information for multiple domains at once. Efficient for checking "
+        "many domains.",
+        _object("domains", domains=_domains("look up"), concurrency=_concurrency()),
+        _bulk("bulk_whois"),
+        BULK_LIMIT,
+    ),
+    "seer_bulk_dig": _Tool(
+        "Query DNS records for multiple domains at once.",
+        _object(
+            "domains",
+            domains=_domains("query"),
+            record_type=_RECORD_TYPE,
+            concurrency=_concurrency(),
+        ),
+        _bulk("bulk_dig", record_type=True),
+        BULK_LIMIT,
+    ),
+    "seer_bulk_status": _Tool(
+        "Check health status for multiple domains at once. Returns HTTP, SSL, and "
+        "expiration status for each domain.",
+        _object("domains", domains=_domains("check"), concurrency=_concurrency()),
+        _bulk("bulk_status", guard=True),
+        HEAVY_LIMIT,
+    ),
+    "seer_bulk_propagation": _Tool(
+        "Check DNS propagation for multiple domains at once across global DNS servers.",
+        _object(
+            "domains",
+            domains=_domains("check"),
+            record_type=_RECORD_TYPE,
+            concurrency=_concurrency(default=5),
+        ),
+        _bulk("bulk_propagation", record_type=True, default_concurrency=5),
+        HEAVY_LIMIT,
+    ),
+    "seer_info": _Tool(
+        "Get comprehensive domain registration info with all available fields merged from "
+        "RDAP and WHOIS. Returns a flat structure with every field as a top-level key.",
+        _object("domain", domain=_string("Domain name to look up (e.g., 'example.com')")),
+        _single("info"),
+    ),
+    "seer_bulk_info": _Tool(
+        "Get comprehensive domain registration info for multiple domains. Merges RDAP and "
+        "WHOIS data into flat, column-per-field results for each domain.",
+        _object("domains", domains=_domains("look up"), concurrency=_concurrency()),
+        _bulk("bulk_info"),
+        BULK_LIMIT,
+    ),
+    "seer_bulk_ssl": _Tool(
+        "Inspect SSL certificate chains for multiple domains. Returns the full chain, "
+        "SANs, key details, and signature algorithm for each domain.",
+        _object("domains", domains=_domains("inspect"), concurrency=_concurrency()),
+        _bulk("bulk_ssl", guard=True),
+        HEAVY_LIMIT,
+    ),
+    "seer_ssl": _Tool(
+        "Inspect the SSL/TLS certificate chain for a domain. Returns the chain, SANs, key "
+        "details, and derived security-posture warnings (weak key, deprecated signature, "
+        "self-signed, expiry, hostname mismatch).",
+        _DOMAIN_SCHEMA,
+        _single("ssl", guard=True),
+    ),
+    "seer_availability": _Tool(
+        "Check whether a domain appears to be available for registration (RDAP-404 + DNS "
+        "+ WHOIS signals).",
+        _DOMAIN_SCHEMA,
+        _single("availability"),
+    ),
+    "seer_bulk_availability": _Tool(
+        "Check registration availability for multiple domains at once (RDAP-404 + DNS + "
+        "WHOIS signals per domain). Efficient for scanning candidate names.",
+        _object("domains", domains=_domains("check"), concurrency=_concurrency()),
+        _bulk("bulk_availability"),
+        BULK_LIMIT,
+    ),
+    "seer_tld_info": _Tool(
+        "Look up information about a top-level domain (TLD): WHOIS server, RDAP "
+        "endpoint, registry URL, and classification (generic, country-code, sponsored, "
+        "or infrastructure).",
+        _object("tld", tld=_string("TLD with or without leading dot (e.g., 'com' or '.com')")),
+        _tld_info,
+    ),
+    "seer_dnssec": _Tool(
+        "DNSSEC validation report for a domain: DS/DNSKEY digest consistency, chain "
+        "validity, and the verification-depth tier.",
+        _DOMAIN_SCHEMA,
+        _single("dnssec"),
+    ),
+    "seer_delegation": _Tool(
+        "NS delegation health check: compares the parent zone's delegation NS set "
+        "against the zone's own authoritative NS RRset (missing/extra entries, in-sync "
+        "verdict) and probes each delegated nameserver for lameness (refused, timeout, "
+        "non-authoritative, referral, empty answer, NXDOMAIN).",
+        _DOMAIN_SCHEMA,
+        _single("delegation"),
+    ),
+    "seer_caa": _Tool(
+        "Look up the CAA (Certification Authority Authorization) policy for a domain, "
+        "including iodef incident contacts and a wildcard-vs-base consistency analysis.",
+        _DOMAIN_SCHEMA,
+        _single("caa"),
+    ),
+    "seer_posture": _Tool(
+        "Inspect a domain's email/DNS security posture: SPF, DMARC, MTA-STS, BIMI, and "
+        "DANE (TLSA), with per-mechanism verdicts and advisories. A lax/absent DMARC "
+        "means the domain is spoofable.",
+        _DOMAIN_SCHEMA,
+        _single("posture"),
+    ),
+    "seer_headers": _Tool(
+        "Audit a domain's HTTP security headers with one non-intrusive GET. Grades HSTS, "
+        "CSP, X-Frame-Options, X-Content-Type-Options, Referrer-Policy, "
+        "Permissions-Policy, and COOP/COEP/CORP, plus Set-Cookie flags (Secure/HttpOnly/"
+        "SameSite) and version-disclosing banners, as a 0-100 score and a letter grade.",
+        _DOMAIN_SCHEMA,
+        _single("headers"),
+    ),
+    "seer_takeover": _Tool(
+        "Scan a domain's subdomains for takeover exposure. Enumerates via Certificate "
+        "Transparency logs, then checks each host whose CNAME points at a takeover-prone "
+        "provider. A host serving that provider's unclaimed-resource page is reported "
+        "vulnerable with the matched fingerprint as evidence; a dangling CNAME that does "
+        "not resolve is reported as potential (unconfirmed).",
+        _object(
+            "domain",
+            domain=_string("Domain to scan for subdomain takeover"),
+            concurrency=_concurrency("Concurrent host checks"),
+        ),
+        _scan("takeover"),
+        HEAVY_LIMIT,
+    ),
+    "seer_subdomains": _Tool(
+        "Enumerate subdomains via Certificate Transparency logs. With resolve=true, each "
+        "name is resolved and classified (live/dead/wildcard) and dangling CNAMEs to "
+        "takeover-prone providers are flagged.",
+        _object(
+            "domain",
+            domain=_string("Domain to enumerate subdomains for"),
+            resolve={
+                "type": "boolean",
+                "description": "Resolve and classify each name (default: false)",
+                "default": False,
+            },
+            concurrency=_concurrency("Concurrency for the resolve pass"),
+        ),
+        _subdomains,
+    ),
+    "seer_confusables": _Tool(
+        "Generate typosquat / homoglyph look-alike domains for a domain and report which "
+        "are registered, ranking freshly-registered squats first. A brand-protection / "
+        "phishing-defense scan.",
+        _object(
+            "domain",
+            domain=_string("Domain to generate and score look-alikes for"),
+            concurrency=_concurrency("Concurrency for the registration scan"),
+        ),
+        _scan("confusables"),
+        HEAVY_LIMIT,
+    ),
+    "seer_dns_compare": _Tool(
+        "Compare DNS records for a domain across two nameservers, reporting whether they "
+        "agree.",
+        _object(
+            "domain",
+            "server_a",
+            "server_b",
+            domain=_string("Domain to query"),
+            record_type=_RECORD_TYPE,
+            server_a=_string("First nameserver (e.g. 8.8.8.8)"),
+            server_b=_string("Second nameserver (e.g. 1.1.1.1)"),
+        ),
+        _dns_compare,
+    ),
+    "seer_diff": _Tool(
+        "Compare two domains side-by-side (registration, DNS, SSL).",
+        _object(
+            "domain_a",
+            "domain_b",
+            domain_a=_string("First domain"),
+            domain_b=_string("Second domain"),
+        ),
+        _diff,
+    ),
+}
+
+
 async def list_tools() -> list[Tool]:
     """List available Seer tools."""
     return [
-        Tool(
-            name="seer_lookup",
-            description=(
-                "Smart domain lookup that tries RDAP first (modern protocol with structured data) "
-                "and falls back to WHOIS if RDAP is unavailable. Returns registration data with "
-                "source indicator."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "domain": {
-                        "type": "string",
-                        "description": "Domain name to look up (e.g., 'example.com')",
-                    },
-                },
-                "required": ["domain"],
-            },
-        ),
-        Tool(
-            name="seer_whois",
-            description=(
-                "Look up WHOIS information for a domain name. Returns registrar, creation date, "
-                "expiration date, nameservers, and status information."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "domain": {
-                        "type": "string",
-                        "description": "Domain name to look up (e.g., 'example.com')",
-                    },
-                },
-                "required": ["domain"],
-            },
-        ),
-        Tool(
-            name="seer_rdap_domain",
-            description=(
-                "Look up RDAP (Registration Data Access Protocol) information for a domain. "
-                "Returns structured registration data including registrar, dates, nameservers, "
-                "and DNSSEC status."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "domain": {
-                        "type": "string",
-                        "description": "Domain name to look up",
-                    },
-                },
-                "required": ["domain"],
-            },
-        ),
-        Tool(
-            name="seer_rdap_ip",
-            description=(
-                "Look up RDAP information for an IP address. Returns network registration "
-                "information including the network range, country, and responsible organization."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "ip": {
-                        "type": "string",
-                        "description": "IP address (IPv4 or IPv6) to look up",
-                    },
-                },
-                "required": ["ip"],
-            },
-        ),
-        Tool(
-            name="seer_rdap_asn",
-            description=(
-                "Look up RDAP information for an Autonomous System Number (ASN). Returns "
-                "organization and network range information."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "asn": {
-                        "type": "integer",
-                        "description": "AS number (e.g., 15169 for Google)",
-                        "minimum": 0,
-                        "maximum": 4294967295,
-                    },
-                },
-                "required": ["asn"],
-            },
-        ),
-        Tool(
-            name="seer_dig",
-            description=(
-                "Query DNS records for a domain, similar to the 'dig' command. Supports all major "
-                "record types."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "domain": {
-                        "type": "string",
-                        "description": "Domain name to query",
-                    },
-                    "record_type": {
-                        "type": "string",
-                        "description": _RECORD_TYPE_DESC,
-                        "default": "A",
-                    },
-                    "nameserver": {
-                        "type": "string",
-                        "description": "Optional nameserver IP to query (e.g., '8.8.8.8')",
-                    },
-                },
-                "required": ["domain"],
-            },
-        ),
-        Tool(
-            name="seer_propagation",
-            description=(
-                "Check DNS propagation for a domain across multiple global DNS servers. Shows "
-                "which servers have the record and identifies inconsistencies."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "domain": {
-                        "type": "string",
-                        "description": "Domain name to check",
-                    },
-                    "record_type": {
-                        "type": "string",
-                        "description": _RECORD_TYPE_DESC,
-                        "default": "A",
-                    },
-                },
-                "required": ["domain"],
-            },
-        ),
-        Tool(
-            name="seer_status",
-            description=(
-                "Check the health status of a domain including HTTP accessibility, SSL "
-                "certificate validity, and domain expiration."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "domain": {
-                        "type": "string",
-                        "description": "Domain name to check (e.g., 'example.com')",
-                    },
-                },
-                "required": ["domain"],
-            },
-        ),
-        Tool(
-            name="seer_bulk_lookup",
-            description=(
-                "Smart lookup for multiple domains at once (tries RDAP first, falls back to "
-                "WHOIS). Efficient for checking many domains."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "domains": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "List of domain names to look up",
-                        "maxItems": MAX_BULK_DOMAINS,
-                    },
-                    "concurrency": {
-                        "type": "integer",
-                        "description": (
-                            f"Number of concurrent requests (default: 10, max: {MAX_CONCURRENCY})"
-                        ),
-                        "default": 10,
-                        "minimum": 1,
-                        "maximum": MAX_CONCURRENCY,
-                    },
-                },
-                "required": ["domains"],
-            },
-        ),
-        Tool(
-            name="seer_bulk_whois",
-            description=(
-                "Look up WHOIS information for multiple domains at once. Efficient for checking "
-                "many domains."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "domains": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "List of domain names to look up",
-                        "maxItems": MAX_BULK_DOMAINS,
-                    },
-                    "concurrency": {
-                        "type": "integer",
-                        "description": (
-                            f"Number of concurrent requests (default: 10, max: {MAX_CONCURRENCY})"
-                        ),
-                        "default": 10,
-                        "minimum": 1,
-                        "maximum": MAX_CONCURRENCY,
-                    },
-                },
-                "required": ["domains"],
-            },
-        ),
-        Tool(
-            name="seer_bulk_dig",
-            description="Query DNS records for multiple domains at once.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "domains": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "List of domain names to query",
-                        "maxItems": MAX_BULK_DOMAINS,
-                    },
-                    "record_type": {
-                        "type": "string",
-                        "description": _RECORD_TYPE_DESC,
-                        "default": "A",
-                    },
-                    "concurrency": {
-                        "type": "integer",
-                        "description": (
-                            f"Number of concurrent requests (default: 10, max: {MAX_CONCURRENCY})"
-                        ),
-                        "default": 10,
-                        "minimum": 1,
-                        "maximum": MAX_CONCURRENCY,
-                    },
-                },
-                "required": ["domains"],
-            },
-        ),
-        Tool(
-            name="seer_bulk_status",
-            description=(
-                "Check health status for multiple domains at once. Returns HTTP, SSL, and "
-                "expiration status for each domain."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "domains": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "List of domain names to check",
-                        "maxItems": MAX_BULK_DOMAINS,
-                    },
-                    "concurrency": {
-                        "type": "integer",
-                        "description": (
-                            f"Number of concurrent requests (default: 10, max: {MAX_CONCURRENCY})"
-                        ),
-                        "default": 10,
-                        "minimum": 1,
-                        "maximum": MAX_CONCURRENCY,
-                    },
-                },
-                "required": ["domains"],
-            },
-        ),
-        Tool(
-            name="seer_bulk_propagation",
-            description=(
-                "Check DNS propagation for multiple domains at once across global DNS servers."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "domains": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "List of domain names to check",
-                        "maxItems": MAX_BULK_DOMAINS,
-                    },
-                    "record_type": {
-                        "type": "string",
-                        "description": _RECORD_TYPE_DESC,
-                        "default": "A",
-                    },
-                    "concurrency": {
-                        "type": "integer",
-                        "description": (
-                            f"Number of concurrent requests (default: 5, max: {MAX_CONCURRENCY})"
-                        ),
-                        "default": 5,
-                        "minimum": 1,
-                        "maximum": MAX_CONCURRENCY,
-                    },
-                },
-                "required": ["domains"],
-            },
-        ),
-        Tool(
-            name="seer_info",
-            description=(
-                "Get comprehensive domain registration info with all available fields merged from "
-                "RDAP and WHOIS. Returns a flat structure with every field as a top-level key."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "domain": {
-                        "type": "string",
-                        "description": "Domain name to look up (e.g., 'example.com')",
-                    },
-                },
-                "required": ["domain"],
-            },
-        ),
-        Tool(
-            name="seer_bulk_info",
-            description=(
-                "Get comprehensive domain registration info for multiple domains. Merges RDAP and "
-                "WHOIS data into flat, column-per-field results for each domain."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "domains": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "List of domain names to look up",
-                        "maxItems": MAX_BULK_DOMAINS,
-                    },
-                    "concurrency": {
-                        "type": "integer",
-                        "description": (
-                            f"Number of concurrent requests (default: 10, max: {MAX_CONCURRENCY})"
-                        ),
-                        "default": 10,
-                        "minimum": 1,
-                        "maximum": MAX_CONCURRENCY,
-                    },
-                },
-                "required": ["domains"],
-            },
-        ),
-        Tool(
-            name="seer_bulk_ssl",
-            description=(
-                "Inspect SSL certificate chains for multiple domains. Returns the full chain, "
-                "SANs, key details, and signature algorithm for each domain."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "domains": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "List of domain names to inspect",
-                        "maxItems": MAX_BULK_DOMAINS,
-                    },
-                    "concurrency": {
-                        "type": "integer",
-                        "description": (
-                            f"Number of concurrent requests (default: 10, max: {MAX_CONCURRENCY})"
-                        ),
-                        "default": 10,
-                        "minimum": 1,
-                        "maximum": MAX_CONCURRENCY,
-                    },
-                },
-                "required": ["domains"],
-            },
-        ),
-        Tool(
-            name="seer_ssl",
-            description=(
-                "Inspect the SSL/TLS certificate chain for a domain. Returns the chain, SANs, key "
-                "details, and derived security-posture warnings (weak key, deprecated signature, "
-                "self-signed, expiry, hostname mismatch)."
-            ),
-            inputSchema=_DOMAIN_SCHEMA,
-        ),
-        Tool(
-            name="seer_availability",
-            description=(
-                "Check whether a domain appears to be available for registration (RDAP-404 + DNS "
-                "+ WHOIS signals)."
-            ),
-            inputSchema=_DOMAIN_SCHEMA,
-        ),
-        Tool(
-            name="seer_bulk_availability",
-            description=(
-                "Check registration availability for multiple domains at once (RDAP-404 + DNS + "
-                "WHOIS signals per domain). Efficient for scanning candidate names."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "domains": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "List of domain names to check",
-                        "maxItems": MAX_BULK_DOMAINS,
-                    },
-                    "concurrency": {
-                        "type": "integer",
-                        "description": (
-                            f"Number of concurrent requests (default: 10, max: {MAX_CONCURRENCY})"
-                        ),
-                        "default": 10,
-                        "minimum": 1,
-                        "maximum": MAX_CONCURRENCY,
-                    },
-                },
-                "required": ["domains"],
-            },
-        ),
-        Tool(
-            name="seer_tld_info",
-            description=(
-                "Look up information about a top-level domain (TLD): WHOIS server, RDAP "
-                "endpoint, registry URL, and classification (generic, country-code, sponsored, "
-                "or infrastructure)."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "tld": {
-                        "type": "string",
-                        "description": "TLD with or without leading dot (e.g., 'com' or '.com')",
-                    },
-                },
-                "required": ["tld"],
-            },
-        ),
-        Tool(
-            name="seer_dnssec",
-            description=(
-                "DNSSEC validation report for a domain: DS/DNSKEY digest consistency, chain "
-                "validity, and the verification-depth tier."
-            ),
-            inputSchema=_DOMAIN_SCHEMA,
-        ),
-        Tool(
-            name="seer_delegation",
-            description=(
-                "NS delegation health check: compares the parent zone's delegation NS set "
-                "against the zone's own authoritative NS RRset (missing/extra entries, in-sync "
-                "verdict) and probes each delegated nameserver for lameness (refused, timeout, "
-                "non-authoritative, referral, empty answer, NXDOMAIN)."
-            ),
-            inputSchema=_DOMAIN_SCHEMA,
-        ),
-        Tool(
-            name="seer_caa",
-            description=(
-                "Look up the CAA (Certification Authority Authorization) policy for a domain, "
-                "including iodef incident contacts and a wildcard-vs-base consistency analysis."
-            ),
-            inputSchema=_DOMAIN_SCHEMA,
-        ),
-        Tool(
-            name="seer_posture",
-            description=(
-                "Inspect a domain's email/DNS security posture: SPF, DMARC, MTA-STS, BIMI, and "
-                "DANE (TLSA), with per-mechanism verdicts and advisories. A lax/absent DMARC "
-                "means the domain is spoofable."
-            ),
-            inputSchema=_DOMAIN_SCHEMA,
-        ),
-        Tool(
-            name="seer_headers",
-            description=(
-                "Audit a domain's HTTP security headers with one non-intrusive GET. Grades HSTS, "
-                "CSP, X-Frame-Options, X-Content-Type-Options, Referrer-Policy, "
-                "Permissions-Policy, and COOP/COEP/CORP, plus Set-Cookie flags (Secure/HttpOnly/"
-                "SameSite) and version-disclosing banners, as a 0-100 score and a letter grade."
-            ),
-            inputSchema=_DOMAIN_SCHEMA,
-        ),
-        Tool(
-            name="seer_takeover",
-            description=(
-                "Scan a domain's subdomains for takeover exposure. Enumerates via Certificate "
-                "Transparency logs, then checks each host whose CNAME points at a takeover-prone "
-                "provider. A host serving that provider's unclaimed-resource page is reported "
-                "vulnerable with the matched fingerprint as evidence; a dangling CNAME that does "
-                "not resolve is reported as potential (unconfirmed)."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "domain": {
-                        "type": "string",
-                        "description": "Domain to scan for subdomain takeover",
-                    },
-                    "concurrency": {
-                        "type": "integer",
-                        "description": (
-                            f"Concurrent host checks (default: 10, max: {MAX_CONCURRENCY})"
-                        ),
-                        "default": 10,
-                        "minimum": 1,
-                        "maximum": MAX_CONCURRENCY,
-                    },
-                },
-                "required": ["domain"],
-            },
-        ),
-        Tool(
-            name="seer_subdomains",
-            description=(
-                "Enumerate subdomains via Certificate Transparency logs. With resolve=true, each "
-                "name is resolved and classified (live/dead/wildcard) and dangling CNAMEs to "
-                "takeover-prone providers are flagged."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "domain": {
-                        "type": "string",
-                        "description": "Domain to enumerate subdomains for",
-                    },
-                    "resolve": {
-                        "type": "boolean",
-                        "description": "Resolve and classify each name (default: false)",
-                        "default": False,
-                    },
-                    "concurrency": {
-                        "type": "integer",
-                        "description": (
-                            "Concurrency for the resolve pass (default: 10, max: "
-                            f"{MAX_CONCURRENCY})"
-                        ),
-                        "default": 10,
-                        "minimum": 1,
-                        "maximum": MAX_CONCURRENCY,
-                    },
-                },
-                "required": ["domain"],
-            },
-        ),
-        Tool(
-            name="seer_confusables",
-            description=(
-                "Generate typosquat / homoglyph look-alike domains for a domain and report which "
-                "are registered, ranking freshly-registered squats first. A brand-protection / "
-                "phishing-defense scan."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "domain": {
-                        "type": "string",
-                        "description": "Domain to generate and score look-alikes for",
-                    },
-                    "concurrency": {
-                        "type": "integer",
-                        "description": (
-                            "Concurrency for the registration scan (default: 10, max: "
-                            f"{MAX_CONCURRENCY})"
-                        ),
-                        "default": 10,
-                        "minimum": 1,
-                        "maximum": MAX_CONCURRENCY,
-                    },
-                },
-                "required": ["domain"],
-            },
-        ),
-        Tool(
-            name="seer_dns_compare",
-            description=(
-                "Compare DNS records for a domain across two nameservers, reporting whether they "
-                "agree."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "domain": {"type": "string", "description": "Domain to query"},
-                    "record_type": {
-                        "type": "string",
-                        "description": _RECORD_TYPE_DESC,
-                        "default": "A",
-                    },
-                    "server_a": {
-                        "type": "string",
-                        "description": "First nameserver (e.g. 8.8.8.8)",
-                    },
-                    "server_b": {
-                        "type": "string",
-                        "description": "Second nameserver (e.g. 1.1.1.1)",
-                    },
-                },
-                "required": ["domain", "server_a", "server_b"],
-            },
-        ),
-        Tool(
-            name="seer_diff",
-            description="Compare two domains side-by-side (registration, DNS, SSL).",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "domain_a": {"type": "string", "description": "First domain"},
-                    "domain_b": {"type": "string", "description": "Second domain"},
-                },
-                "required": ["domain_a", "domain_b"],
-            },
-        ),
+        Tool(name=name, description=tool.description, inputSchema=tool.input_schema)
+        for name, tool in _TOOLS.items()
     ]
 
 
-# Per-tool rate limits for the expensive fan-out tools, mirroring the REST
-# routers' per-route ``@limiter.limit`` decorators (bulk_ssl / bulk_status /
-# bulk_propagation / confusables are 5/minute there; the remaining bulk
-# endpoints 10/minute). The flat /mcp gate in main.py applies SEER_RATE_LIMIT
-# to every call equally, so without this an MCP client could drive e.g.
-# seer_bulk_ssl 6x more often than REST permits for the identical operation.
-# Keyed per-process, not per-client: no request identity reaches tool handlers
-# through the MCP session, and these limits exist to protect upstream
-# registries and outbound IP reputation, which are per-process concerns. The
-# same table covers stdio, where the flat /mcp gate doesn't apply at all.
+# Per-tool rate limits for the expensive fan-out tools — the same limits the
+# REST routers apply per route (see `_contract`). The flat /mcp gate in
+# main.py applies SEER_RATE_LIMIT to every call equally, so without this an
+# MCP client could drive e.g. seer_bulk_ssl 6x more often than REST permits
+# for the identical operation. Keyed per-process, not per-client: no request
+# identity reaches tool handlers through the MCP session, and these limits
+# exist to protect upstream registries and outbound IP reputation, which are
+# per-process concerns. The same table covers stdio, where the flat /mcp gate
+# doesn't apply at all.
 _TOOL_RATE_LIMITS: dict[str, str] = {
-    "seer_bulk_ssl": "5/minute",
-    "seer_bulk_status": "5/minute",
-    "seer_bulk_propagation": "5/minute",
-    "seer_confusables": "5/minute",
-    "seer_takeover": "5/minute",
-    "seer_bulk_lookup": "10/minute",
-    "seer_bulk_whois": "10/minute",
-    "seer_bulk_dig": "10/minute",
-    "seer_bulk_info": "10/minute",
-    "seer_bulk_availability": "10/minute",
+    name: tool.rate_limit for name, tool in _TOOLS.items() if tool.rate_limit
 }
 
-# Built lazily on first limited call (not at import) so a configured storage
-# backend whose driver isn't installed only surfaces if a limited tool is
-# actually used — mirroring main.py's /mcp limiter.
-_tool_rate_limiter: MovingWindowRateLimiter | None = None
+# One moving-window limiter on SEER_RATE_LIMIT_STORAGE, shared by the per-tool
+# limits here and the flat /mcp gate in main.py (keys are namespaced
+# "mcp-tool" / "mcp"), so the storage backend is connected once. Built on
+# first use, not at import, so a backend whose driver isn't installed (e.g.
+# redis:// without the redis package) only surfaces once a limited call is
+# actually made.
+_rate_limiter: MovingWindowRateLimiter | None = None
+
+
+def rate_limiter() -> MovingWindowRateLimiter:
+    """The shared MCP moving-window limiter (see above)."""
+    global _rate_limiter
+    if _rate_limiter is None:
+        _rate_limiter = MovingWindowRateLimiter(
+            _rate_storage_from_string(
+                os.environ.get("SEER_RATE_LIMIT_STORAGE", "memory://")
+            )
+        )
+    return _rate_limiter
 
 
 def _tool_rate_ok(name: str) -> bool:
@@ -847,17 +661,10 @@ def _tool_rate_ok(name: str) -> bool:
     Tools without an entry in ``_TOOL_RATE_LIMITS`` are always allowed here —
     the flat /mcp limit (HTTP transport) is their only throttle.
     """
-    global _tool_rate_limiter
     limit = _TOOL_RATE_LIMITS.get(name)
     if limit is None:
         return True
-    if _tool_rate_limiter is None:
-        _tool_rate_limiter = MovingWindowRateLimiter(
-            _rate_storage_from_string(
-                os.environ.get("SEER_RATE_LIMIT_STORAGE", "memory://")
-            )
-        )
-    return _tool_rate_limiter.hit(_parse_rate_limit(limit), "mcp-tool", name)
+    return rate_limiter().hit(_parse_rate_limit(limit), "mcp-tool", name)
 
 
 async def call_tool(
@@ -879,7 +686,9 @@ async def call_tool(
         )
     try:
         result = await execute_tool(name, arguments)
-        payload = UNTRUSTED_PREAMBLE + json.dumps(result, indent=2, default=str)
+        # Compact separators: indentation is pure token overhead in the host
+        # LLM's context (~40% of a lookup payload).
+        payload = UNTRUSTED_PREAMBLE + json.dumps(result, separators=(",", ":"), default=str)
         return [TextContent(type="text", text=payload)]
     except ValueError as e:
         return _error_result(_invalid_input_message(e))
@@ -941,206 +750,11 @@ async def call_tool(
 
 
 async def execute_tool(name: str, arguments: dict[str, Any]) -> Any:
-    """Execute the appropriate Seer function based on tool name.
-
-    All blocking PyO3 calls are dispatched through ``run_seer`` (the bounded
-    ``_DISPATCH_EXECUTOR``) so the MCP-over-HTTP transport honors
-    ``SEER_DISPATCH_THREADS`` exactly like the REST routes, instead of spilling
-    onto asyncio's unbounded default executor (issue #48).
-    """
-    match name:
-        case "seer_lookup":
-            domain = _require_str(arguments, "domain")
-            return await run_seer(seer.lookup, domain)
-
-        case "seer_whois":
-            domain = _require_str(arguments, "domain")
-            return await run_seer(seer.whois, domain)
-
-        case "seer_rdap_domain":
-            domain = _require_str(arguments, "domain")
-            return await run_seer(seer.rdap_domain, domain)
-
-        case "seer_rdap_ip":
-            ip = _require_str(arguments, "ip")
-            # Move the SSRF guard off the event loop — `_ssrf_guard` enters
-            # PyO3 and `block_on`s a DNS resolution, which would pin the
-            # event loop for the resolver timeout. Mirrors the
-            # `seer_bulk_status` / `seer_bulk_ssl` pattern.
-            await run_seer(_ssrf_guard, ip, 443)
-            return await run_seer(seer.rdap_ip, ip)
-
-        case "seer_rdap_asn":
-            asn = arguments.get("asn")
-            if isinstance(asn, bool) or not isinstance(asn, int) or asn < 0 or asn > 4294967295:
-                raise ValueError(f"'asn' must be an integer between 0 and 4294967295 (got {asn!r})")
-            return await run_seer(seer.rdap_asn, asn)
-
-        case "seer_dig":
-            domain = _require_str(arguments, "domain")
-            record_type = _require_record_type(arguments)
-            nameserver = arguments.get("nameserver")
-            if nameserver is not None and not isinstance(nameserver, str):
-                raise ValueError(f"'nameserver' must be a string (got {type(nameserver).__name__})")
-            if nameserver is not None:
-                await run_seer(_guard_nameserver, nameserver)
-            return await run_seer(
-                seer.dig, domain, record_type, nameserver
-            )
-
-        case "seer_propagation":
-            domain = _require_str(arguments, "domain")
-            record_type = _require_record_type(arguments)
-            return await run_seer(
-                seer.propagation, domain, record_type
-            )
-
-        case "seer_status":
-            domain = _require_str(arguments, "domain")
-            await run_seer(_ssrf_guard, domain, 443)
-            return await run_seer(seer.status, domain)
-
-        case "seer_bulk_lookup":
-            domains = _require_domains(arguments)
-            concurrency = _get_concurrency(arguments, default=10)
-            return await run_seer(
-                seer.bulk_lookup, domains, concurrency
-            )
-
-        case "seer_bulk_whois":
-            domains = _require_domains(arguments)
-            concurrency = _get_concurrency(arguments, default=10)
-            return await run_seer(
-                seer.bulk_whois, domains, concurrency
-            )
-
-        case "seer_bulk_dig":
-            domains = _require_domains(arguments)
-            record_type = _require_record_type(arguments)
-            concurrency = _get_concurrency(arguments, default=10)
-            return await run_seer(
-                seer.bulk_dig, domains, record_type, concurrency
-            )
-
-        case "seer_bulk_status":
-            domains = _require_domains(arguments)
-            concurrency = _get_concurrency(arguments, default=10)
-            # Move the per-domain SSRF guard off the event-loop thread.
-            # Each `_ssrf_guard` call enters PyO3 and `block_on`s a DNS
-            # resolution; doing that serially on the event loop pins it
-            # for up to (N * resolver_timeout) for a 100-domain payload.
-            await run_seer(
-                lambda: [_ssrf_guard(d, 443) for d in domains]
-            )
-            return await run_seer(
-                seer.bulk_status, domains, concurrency
-            )
-
-        case "seer_bulk_propagation":
-            domains = _require_domains(arguments)
-            record_type = _require_record_type(arguments)
-            concurrency = _get_concurrency(arguments, default=5)
-            return await run_seer(
-                seer.bulk_propagation, domains, record_type, concurrency
-            )
-
-        case "seer_info":
-            domain = _require_str(arguments, "domain")
-            return await run_seer(seer.info, domain)
-
-        case "seer_bulk_info":
-            domains = _require_domains(arguments)
-            concurrency = _get_concurrency(arguments, default=10)
-            return await run_seer(
-                seer.bulk_info, domains, concurrency
-            )
-
-        case "seer_bulk_ssl":
-            domains = _require_domains(arguments)
-            concurrency = _get_concurrency(arguments, default=10)
-            await run_seer(
-                lambda: [_ssrf_guard(d, 443) for d in domains]
-            )
-            return await run_seer(
-                seer.bulk_ssl, domains, concurrency
-            )
-
-        case "seer_ssl":
-            domain = _require_str(arguments, "domain")
-            # The domain is the connect target (port 443) here.
-            await run_seer(_ssrf_guard, domain, 443)
-            return await run_seer(seer.ssl, domain)
-
-        case "seer_availability":
-            domain = _require_str(arguments, "domain")
-            return await run_seer(seer.availability, domain)
-
-        case "seer_bulk_availability":
-            domains = _require_domains(arguments)
-            concurrency = _get_concurrency(arguments, default=10)
-            return await run_seer(seer.bulk_availability, domains, concurrency)
-
-        case "seer_tld_info":
-            tld = _require_tld(arguments)
-            return await run_seer(seer.tld_info, tld)
-
-        case "seer_dnssec":
-            domain = _require_str(arguments, "domain")
-            return await run_seer(seer.dnssec, domain)
-
-        case "seer_delegation":
-            domain = _require_str(arguments, "domain")
-            return await run_seer(seer.delegation, domain)
-
-        case "seer_caa":
-            domain = _require_str(arguments, "domain")
-            return await run_seer(seer.caa, domain)
-
-        case "seer_posture":
-            domain = _require_str(arguments, "domain")
-            return await run_seer(seer.posture, domain)
-
-        case "seer_headers":
-            domain = _require_str(arguments, "domain")
-            return await run_seer(seer.headers, domain)
-
-        case "seer_takeover":
-            domain = _require_str(arguments, "domain")
-            concurrency = _get_concurrency(arguments, default=10)
-            return await run_seer(seer.takeover, domain, concurrency)
-
-        case "seer_subdomains":
-            domain = _require_str(arguments, "domain")
-            resolve = arguments.get("resolve", False)
-            if not isinstance(resolve, bool):
-                raise ValueError(f"'resolve' must be a boolean (got {type(resolve).__name__})")
-            if resolve:
-                concurrency = _get_concurrency(arguments, default=10)
-                return await run_seer(seer.subdomains_classify, domain, concurrency)
-            return await run_seer(seer.subdomains, domain)
-
-        case "seer_confusables":
-            domain = _require_str(arguments, "domain")
-            concurrency = _get_concurrency(arguments, default=10)
-            return await run_seer(seer.confusables, domain, concurrency)
-
-        case "seer_dns_compare":
-            domain = _require_str(arguments, "domain")
-            record_type = _require_record_type(arguments)
-            server_a = _require_str(arguments, "server_a")
-            server_b = _require_str(arguments, "server_b")
-            # Both servers are actual connect targets (nameserver specs).
-            await run_seer(_guard_nameserver, server_a)
-            await run_seer(_guard_nameserver, server_b)
-            return await run_seer(seer.dns_compare, domain, record_type, server_a, server_b)
-
-        case "seer_diff":
-            domain_a = _require_str(arguments, "domain_a")
-            domain_b = _require_str(arguments, "domain_b")
-            return await run_seer(seer.diff, domain_a, domain_b)
-
-        case _:
-            raise ValueError(f"Unknown tool: {name}")
+    """Validate ``arguments`` and run the named tool's handler."""
+    tool = _TOOLS.get(name)
+    if tool is None:
+        raise ValueError(f"Unknown tool: {name}")
+    return await tool.run(arguments)
 
 
 # --- MCP 2.x handler registration -------------------------------------------

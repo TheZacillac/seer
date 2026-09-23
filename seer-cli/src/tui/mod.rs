@@ -15,6 +15,8 @@ mod lenses;
 mod line_editor;
 mod panes;
 mod render;
+#[cfg(test)]
+mod test_util;
 mod theme;
 mod widgets;
 
@@ -33,7 +35,7 @@ use ratatui::Terminal;
 
 use action::{Action, Msg};
 use app::App;
-use seer_core::{LookupHistory, Watchlist};
+use seer_core::Watchlist;
 
 use crate::clipboard;
 
@@ -82,7 +84,8 @@ fn restore_terminal(terminal: &mut Term) -> Result<()> {
     Ok(())
 }
 
-/// Restore the terminal even if a panic unwinds through the draw loop.
+/// Restore the terminal on a panic in the draw loop, unwinding or not (a hook
+/// also runs under `panic = "abort"`); chains to `main`'s raw-mode hook.
 ///
 /// Mirrors [`restore_terminal`], including re-showing the cursor: ratatui hides
 /// the cursor on every `draw`, so without `cursor::Show` a panic after the first
@@ -151,22 +154,20 @@ async fn run_loop(terminal: &mut Term, domain: Option<String>) -> Result<()> {
     Ok(())
 }
 
-/// Build the bulk operation list for a TUI op preset via the shared
-/// `ops::bulk_operation_for` mapping (so new operations land here for free).
-/// `dig`/`prop` default to an `A` record (matching the previous behaviour);
-/// unknown presets fall back to the smart lookup.
-fn build_bulk_operations(op: &str, domains: Vec<String>) -> Vec<seer_core::bulk::BulkOperation> {
-    use seer_core::RecordType;
-    // Resolve the preset once (with a throwaway domain); unknown → "lookup".
-    let op = if crate::ops::bulk_operation_for(op, String::new(), RecordType::A).is_some() {
-        op
-    } else {
-        "lookup"
-    };
-    domains
-        .into_iter()
-        .filter_map(|domain| crate::ops::bulk_operation_for(op, domain, RecordType::A))
-        .collect()
+/// The operation list for a TUI bulk run, through the CLI's own mapping. The
+/// presets are `ops::BULK_OPS`, so this only fails on a programming error;
+/// `dig`/`prop` query `A` records (the lens has no record-type input).
+fn bulk_operations(
+    op: &str,
+    domains: &[String],
+) -> Result<Vec<seer_core::bulk::BulkOperation>, String> {
+    crate::ops::build_bulk_operations(op, domains, seer_core::RecordType::A)
+}
+
+/// Ends a bulk run that could not start, telling the user why.
+fn bulk_not_started(tx: &tokio::sync::mpsc::UnboundedSender<Msg>, msg: String, gen: u64) {
+    let _ = tx.send(Msg::Toast { tone: "fail", msg });
+    let _ = tx.send(Msg::BulkDone { gen });
 }
 
 /// Stream a bulk batch's results over `tx`, then a terminal `BulkDone`.
@@ -298,13 +299,8 @@ fn handle_action(
             let tx = tx.clone();
             let config = config.clone();
             tokio::spawn(async move {
-                tokio::task::spawn_blocking(|| {
-                    let mut h = LookupHistory::load();
-                    h.clear();
-                    let _ = h.save();
-                })
-                .await
-                .ok();
+                // Best-effort: the refreshed lens shows whatever remains.
+                let _ = crate::ops::clear_history().await;
                 // Refresh the history lens after clearing. `gen` is the history
                 // lens's current fetch generation (see WatchMutate above).
                 let result = data::fetch(action::FetchReq::History, &config).await;
@@ -325,6 +321,10 @@ fn handle_action(
             *follow_cancel = Some(cancel_tx);
             let tx = tx.clone();
             let gen = p.gen;
+            // Honor the config's DNS timeout and nameserver, like the CLI and
+            // REPL `follow` (and the TUI's own DNS lens) do.
+            let follower = seer_core::DnsFollower::from_config(config);
+            let nameserver = config.nameserver.clone();
             tokio::spawn(async move {
                 let interval_minutes = p.interval_secs as f64 / 60.0;
                 if let Ok(config) = seer_core::FollowConfig::new(p.iterations, interval_minutes) {
@@ -337,11 +337,11 @@ fn handle_action(
                                 it: Box::new(it.clone()),
                             });
                         });
-                    let _ = seer_core::DnsFollower::new()
+                    let _ = follower
                         .follow(
                             &p.domain,
                             seer_core::RecordType::A,
-                            None,
+                            nameserver.as_deref(),
                             config,
                             Some(cb),
                             Some(cancel_rx),
@@ -363,11 +363,15 @@ fn handle_action(
             if let Some(prev) = bulk_cancel.take() {
                 prev.abort();
             }
-            let operations = build_bulk_operations(&p.op, p.domains);
-            // from_config: honor ~/.seer/config.toml (concurrency, rate
-            // limit, timeouts) like `seer bulk` does.
-            let executor = seer_core::BulkExecutor::from_config(config);
-            *bulk_cancel = Some(spawn_bulk_run(tx, executor, operations, p.gen));
+            match bulk_operations(&p.op, &p.domains) {
+                Ok(operations) => {
+                    // from_config: honor ~/.seer/config.toml (concurrency,
+                    // rate limit, timeouts) like `seer bulk` does.
+                    let executor = seer_core::BulkExecutor::from_config(config);
+                    *bulk_cancel = Some(spawn_bulk_run(tx, executor, operations, p.gen));
+                }
+                Err(msg) => bulk_not_started(tx, msg, p.gen),
+            }
         }
         Action::StopBulk => {
             if let Some(prev) = bulk_cancel.take() {
@@ -387,16 +391,10 @@ fn handle_action(
                 let loaded = tokio::task::spawn_blocking(move || load_bulk_file(&path))
                     .await
                     .unwrap_or_else(|e| Err(format!("failed to read bulk file: {e}")));
-                let domains = match loaded {
-                    Ok(domains) => domains,
-                    Err(msg) => {
-                        let _ = tx.send(Msg::Toast { tone: "fail", msg });
-                        let _ = tx.send(Msg::BulkDone { gen });
-                        return;
-                    }
-                };
-                let operations = build_bulk_operations(&op, domains);
-                run_bulk(tx, executor, operations, gen).await;
+                match loaded.and_then(|domains| bulk_operations(&op, &domains)) {
+                    Ok(operations) => run_bulk(tx, executor, operations, gen).await,
+                    Err(msg) => bulk_not_started(&tx, msg, gen),
+                }
             });
             *bulk_cancel = Some(handle.abort_handle());
         }

@@ -6,14 +6,12 @@ use seer_core::CertWarningSeverity;
 
 use crate::tui::action::LensData;
 use crate::tui::theme::Theme;
-use crate::tui::widgets::{chips, dot, kv, panel};
+use crate::tui::widgets::{chips, dot, kv, or_dash, panel};
 use ratatui::widgets::Paragraph;
 
 pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
     let LensData::Ssl(s) = data else { return };
-    let block = panel::block(theme, "Certificate", theme.green, false);
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let inner = panel::render(f, area, theme, "Certificate", theme.green, false);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -26,38 +24,20 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
         .split(inner);
 
     let leaf = s.chain.first();
-    let dash = || "—".to_string();
-    let rows: Vec<(String, String)> = vec![
-        ("domain".into(), s.domain.clone()),
-        (
-            "subject".into(),
-            leaf.map(|c| c.subject.clone()).unwrap_or_else(dash),
-        ),
-        (
-            "issuer".into(),
-            leaf.map(|c| c.issuer.clone()).unwrap_or_else(dash),
-        ),
-        (
-            "key".into(),
-            leaf.and_then(|c| c.key_type.clone()).unwrap_or_else(dash),
-        ),
-        (
-            "valid".into(),
-            if s.is_valid {
-                "yes".into()
-            } else {
-                "no".into()
-            },
-        ),
-        (
-            "hostname".into(),
-            if s.hostname_verified {
-                "verified".into()
-            } else {
-                "MISMATCH".into()
-            },
-        ),
-        ("expires in".into(), format!("{}d", s.days_until_expiry)),
+    let valid = if s.is_valid { "yes" } else { "no" };
+    let hostname = if s.hostname_verified {
+        "verified"
+    } else {
+        "MISMATCH"
+    };
+    let rows = [
+        ("domain", s.domain.clone()),
+        ("subject", or_dash(leaf.map(|c| &c.subject))),
+        ("issuer", or_dash(leaf.map(|c| &c.issuer))),
+        ("key", or_dash(leaf.and_then(|c| c.key_type.as_deref()))),
+        ("valid", valid.to_string()),
+        ("hostname", hostname.to_string()),
+        ("expires in", format!("{}d", s.days_until_expiry)),
     ];
     kv::render(f, chunks[0], theme, theme.green, &rows);
     if !s.warnings.is_empty() {
@@ -80,8 +60,7 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::backend::TestBackend;
-    use ratatui::Terminal;
+    use crate::tui::test_util::render_lines;
     use seer_core::SslReport;
 
     fn ssl_fixture() -> SslReport {
@@ -100,20 +79,7 @@ mod tests {
 
     fn render_to_text(data: &LensData, width: u16, height: u16) -> String {
         let theme = Theme::frappe();
-        let backend = TestBackend::new(width, height);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| render(f, f.area(), &theme, data))
-            .unwrap();
-        let a = terminal.backend().buffer().area();
-        let mut s = String::new();
-        for y in 0..a.height {
-            for x in 0..a.width {
-                s.push_str(terminal.backend().buffer()[(x, y)].symbol());
-            }
-            s.push('\n');
-        }
-        s
+        render_lines(width, height, |f| render(f, f.area(), &theme, data))
     }
 
     #[test]

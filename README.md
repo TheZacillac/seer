@@ -132,13 +132,7 @@ seer                           # Launch interactive REPL
 seer tui example.com           # Launch the full-screen TUI
 ```
 
-### Use as a Rust library
-
-```toml
-[dependencies]
-seer-core = "0.48"
-tokio = { version = "1", features = ["full"] }
-```
+Using Seer from Rust code instead? See [Rust Library](#-rust-library).
 
 > **Requirements:** Rust 1.89+ · Python 3.10+ (for Python bindings/API)
 
@@ -353,14 +347,18 @@ result = seer.lookup("example.com")
 
 # WHOIS / RDAP
 whois = seer.whois("example.com")
+rdap  = seer.rdap("8.8.8.8")                     # Auto-routes IP / ASN / domain (alias: rdap_auto)
 rdap  = seer.rdap_domain("example.com")
 rdap  = seer.rdap_ip("8.8.8.8")
 rdap  = seer.rdap_asn(15169)
 
 # DNS
-records     = seer.dig("example.com", record_type="MX")
+records     = seer.dig("example.com", record_type="MX", nameserver="tls://1.1.1.1")
 propagation = seer.propagation("example.com", record_type="A")
 delegation  = seer.delegation("example.com")     # Parent vs. zone NS + lameness
+follow      = seer.dns_follow("example.com", "A", iterations=3, interval_minutes=1.0)
+seer.cancel_follow()                             # Stop a running dns_follow from another thread
+types       = seer.record_types()                # The 16 supported record types
 
 # Domain health & SSL
 status = seer.status("example.com")
@@ -393,6 +391,18 @@ results = seer.bulk_dig(["example.com", "google.com"], record_type="A")
 results = seer.bulk_info(["example.com", "google.com"])
 results = seer.bulk_ssl(["example.com", "google.com"])
 results = seer.bulk_availability(["example.com", "google.com"])
+results = seer.bulk_whois(["example.com", "google.com"])
+results = seer.bulk_propagation(["example.com"], record_type="A", concurrency=5)
+
+# bulk_* calls return one dict per domain:
+#   {"operation": {"type": ..., "domain": ...}, "success": bool,
+#    "data": ... or None, "error": str or None, "duration_ms": int}
+# Every bulk_* call takes an optional keyword-only progress callback
+results = seer.bulk_lookup(domains, progress=lambda done, total, domain: print(f"{done}/{total} {domain}"))
+
+# SSRF helpers (used by seer-api before any user-supplied connect target)
+seer.validate_public_host("example.com", 443)   # ValueError on reserved/private addresses
+seer.nameserver_target("tls://1.1.1.1")          # ("1.1.1.1", 853); None if the spec is invalid
 ```
 
 <details>
@@ -443,7 +453,7 @@ async fn main() -> seer_core::Result<()> {
 }
 ```
 
-See [seer-core/README.md](seer-core/README.md) for the full API reference.
+See [docs.rs/seer-core](https://docs.rs/seer-core) for the full API reference.
 
 ---
 
@@ -453,52 +463,18 @@ See [seer-core/README.md](seer-core/README.md) for the full API reference.
 seer-api   # Starts on http://127.0.0.1:8000 (loopback-only by default)
 ```
 
-### Deployment notes (breaking change)
+Each lookup is a `GET` endpoint (`/lookup/{domain}`, `/dns/{domain}/{record_type}`,
+`/ssl/{domain}`, `/takeover/{domain}`, …). `lookup`, `whois`, `dns`,
+`propagation`, `status`, `ssl`, `availability`, and `info` also accept a
+`POST …/bulk` domain list, and all but `availability` and `info` can stream
+bulk results as Server-Sent Events from `…/bulk/stream`. The full endpoint
+table is in [seer-api/README.md](seer-api/README.md#endpoints).
 
-- **Default bind is `127.0.0.1`** (was `0.0.0.0` in previous versions).
-  To bind publicly, set both `SEER_HOST=0.0.0.0` and `SEER_API_KEY` —
-  the server refuses to start on a non-loopback host without an auth
-  key.
-- **`/docs`, `/redoc`, `/openapi.json` are disabled by default.** Set
-  `SEER_DOCS_ENABLED=true` to re-enable.
-- **Multi-worker deployments require `SEER_RATE_LIMIT_STORAGE`.** With
-  `WEB_CONCURRENCY>1` and the default in-memory limiter, the server
-  refuses to start — the per-worker limiter would be trivially
-  bypassable. Use `redis://host:6379` or another shared store.
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/lookup/{domain}` | GET | Smart lookup (RDAP + WHOIS) |
-| `/info/{domain}` | GET | Merged RDAP + WHOIS domain info |
-| `/whois/{domain}` | GET | WHOIS lookup |
-| `/rdap/domain/{domain}` | GET | RDAP domain lookup |
-| `/rdap/ip/{ip}` | GET | RDAP IP lookup |
-| `/rdap/asn/{asn}` | GET | RDAP ASN lookup |
-| `/dns/{domain}/{record_type}` | GET | DNS query |
-| `/dns/compare/{domain}` | GET | Compare records across two nameservers |
-| `/dnssec/{domain}` | GET | DNSSEC validation |
-| `/delegation/{domain}` | GET | NS delegation health (parent vs. zone, lameness) |
-| `/propagation/{domain}/{record_type}` | GET | DNS propagation check |
-| `/status/{domain}` | GET | Domain status check |
-| `/ssl/{domain}` | GET | SSL chain inspection |
-| `/caa/{domain}` | GET | CAA policy + issuer comparison |
-| `/posture/{domain}` | GET | Email security posture (SPF/DMARC/MTA-STS) |
-| `/headers/{domain}` | GET | HTTP security headers + cookie audit (graded) |
-| `/takeover/{domain}` | GET | Subdomain takeover scan (HTTP-confirmed) |
-| `/confusables/{domain}` | GET | Look-alike domain detection |
-| `/availability/{domain}` | GET | Domain availability |
-| `/subdomains/{domain}` | GET | Subdomain enumeration |
-| `/diff/{domain_a}/{domain_b}` | GET | Side-by-side domain comparison |
-| `/tld/{tld}` | GET | TLD info (WHOIS server, RDAP endpoint, registry) |
-| `/tld/` | GET | Full catalog of known TLDs |
-| `/health` | GET | Health check |
-| `/metrics` | GET | Prometheus metrics (when `SEER_METRICS_ENABLED=true`) |
-
-**Bulk variants:** `lookup`, `whois`, `dns`, `propagation`, `status`, `ssl`,
-`availability`, and `info` accept a `POST …/bulk` with a domain list. All of
-those except `availability` and `info` also have a streaming sibling at
-`…/bulk/stream` that emits results incrementally as Server-Sent Events
-(`text/event-stream`) instead of buffering the full response.
+**Secure by default:** the server binds loopback only, refuses a non-loopback
+`SEER_HOST` without `SEER_API_KEY`, serves `/docs` only when
+`SEER_DOCS_ENABLED=true`, and refuses multi-worker runs on the in-memory
+rate-limit store. See
+[Deployment defaults](seer-api/README.md#deployment-defaults).
 
 ```bash
 # Examples
@@ -543,42 +519,10 @@ eval "$(seer generate-key --export)"
 SEER_API_KEY=$KEY SEER_HOST=0.0.0.0 seer-api
 ```
 
-**30 tools available:**
-
-| Tool | Description | | Tool | Description |
-|------|-------------|---|------|-------------|
-| `seer_lookup` | Smart domain lookup | | `seer_dnssec` | DNSSEC validation |
-| `seer_info` | Comprehensive domain info | | `seer_caa` | CAA policy + issuer comparison |
-| `seer_whois` | WHOIS lookup | | `seer_posture` | Email security posture |
-| `seer_rdap_domain` | RDAP domain lookup | | `seer_confusables` | Look-alike domain detection |
-| `seer_rdap_ip` | RDAP IP lookup | | `seer_availability` | Domain availability |
-| `seer_rdap_asn` | RDAP ASN lookup | | `seer_subdomains` | Subdomain enumeration |
-| `seer_dig` | DNS query | | `seer_diff` | Side-by-side domain comparison |
-| `seer_dns_compare` | Compare two nameservers | | `seer_bulk_lookup` | Bulk smart lookups |
-| `seer_propagation` | DNS propagation check | | `seer_bulk_whois` | Bulk WHOIS lookups |
-| `seer_status` | Domain status check | | `seer_bulk_dig` | Bulk DNS queries |
-| `seer_ssl` | SSL chain inspection | | `seer_bulk_status` | Bulk status checks |
-| `seer_bulk_propagation` | Bulk propagation checks | | `seer_bulk_info` | Bulk domain info |
-| `seer_bulk_ssl` | Bulk SSL certificate checks | | `seer_bulk_availability` | Bulk availability checks |
-| `seer_delegation` | NS delegation health check | | `seer_tld_info` | TLD info (WHOIS/RDAP/registry) |
-| `seer_headers` | HTTP security header audit (A+–F) | | `seer_takeover` | Subdomain takeover exposure scan |
-
-<details>
-<summary><b>Claude Desktop configuration</b></summary>
-
-Add to `claude_desktop_config.json`:
-
-```json
-{
-  "mcpServers": {
-    "seer": {
-      "command": "seer-mcp"
-    }
-  }
-}
-```
-
-</details>
+**30 tools:** one per lookup (`seer_lookup`, `seer_dig`, `seer_ssl`,
+`seer_takeover`, …) plus bulk variants (`seer_bulk_status`, …). The full tool
+list and the Claude Desktop configuration are in
+[seer-api/README.md](seer-api/README.md#available-tools).
 
 ---
 
@@ -627,9 +571,9 @@ Propagation checks query **30 nameservers** across **6 regions**:
 | `SEER_CORS_ORIGINS` | Comma-separated CORS origins for REST API | `*` |
 | `SEER_DOCS_ENABLED` | Expose `/docs`, `/redoc`, `/openapi.json` | `false` |
 | `SEER_METRICS_ENABLED` | Expose `/metrics` to non-loopback clients | `false` |
-| `SEER_RATE_LIMIT` | Default REST API rate limit (`<count>/<period>`) | `30/minute` |
+| `SEER_RATE_LIMIT` | Per-client limit for the MCP endpoint (`POST /mcp`) as `<count>/<period>`; `;`-separated limits are all enforced. REST routes keep their own fixed limits | `30/minute` |
 | `SEER_RATE_LIMIT_STORAGE` | Rate-limit storage URI (e.g. `redis://host:6379`) | `memory://` |
-| `SEER_REQUEST_TIMEOUT` | Per-request deadline (seconds) for dispatched core calls; `0` disables | `0` |
+| `SEER_REQUEST_TIMEOUT` | Per-request deadline (seconds) for dispatched core calls; on expiry the client gets a 504. `0` disables | `0` |
 | `SEER_DISPATCH_THREADS` | Max threads in the pool running blocking core calls (REST + `/mcp`) | `50` |
 | `SEER_MAX_CONCURRENT_STREAMS` | Max in-flight bulk SSE stream jobs per worker process | `8` |
 | `SEER_TRUST_PROXY` | Trust `X-Forwarded-For` from `SEER_TRUSTED_PROXY_IPS` | `false` |
@@ -701,69 +645,17 @@ RUST_LOG=debug cargo test     # With debug logging
 ### Linting
 
 ```bash
-cargo fmt --all -- --check    # Format check
-cargo clippy -- -D warnings   # Lint
-cargo deny check              # Supply-chain policy (advisories, licenses, sources)
+cargo fmt --all -- --check                             # Format check
+cargo clippy --workspace --all-targets -- -D warnings  # Lint
+cargo deny check                                       # Supply-chain policy (advisories, licenses, sources)
 ```
 
 ### Project Structure
 
-```
-seer/
-├── Cargo.toml                # Workspace root
-├── seer-core/                # Core Rust library (all business logic)
-│   └── src/
-│       ├── lib.rs            # Module exports
-│       ├── error.rs          # Centralized error types
-│       ├── lookup.rs         # Smart lookup (RDAP + WHOIS)
-│       ├── validation.rs     # Domain validation & SSRF protection
-│       ├── config.rs         # Configuration management
-│       ├── whois/            # WHOIS client, parser, server mapping
-│       ├── rdap/             # RDAP client with IANA bootstrap
-│       ├── dns/              # Resolver (UDP/DoT/DoH), propagation, DNSSEC, follow, delegation
-│       ├── ssl.rs            # SSL certificate chain inspection
-│       ├── caa.rs            # CAA policy lookup + issuer comparison
-│       ├── posture.rs        # Email security posture (SPF/DMARC/MTA-STS)
-│       ├── headers.rs        # HTTP security header + cookie audit (graded A+–F)
-│       ├── takeover.rs       # Subdomain takeover scan (HTTP-confirmed)
-│       ├── http.rs           # SSRF-guarded HTTP GET (per-hop redirect validation)
-│       ├── confusables.rs    # Look-alike / homoglyph domain detection
-│       ├── drift.rs          # Registration drift vs. baseline
-│       ├── status/           # HTTP, SSL, and expiration checking
-│       ├── bulk/             # Concurrent bulk executor
-│       ├── diff.rs           # Domain comparison
-│       ├── availability.rs   # Domain availability checking
-│       ├── subdomains/       # CT log enumeration + classification/baselines
-│       ├── tld/              # TLD information
-│       ├── watchlist.rs      # Domain monitoring
-│       ├── webhook.rs        # SSRF-guarded webhook delivery (watch --webhook)
-│       ├── doctor.rs         # Environment self-diagnosis (seer doctor)
-│       ├── history.rs        # Lookup history tracking
-│       ├── domain_info.rs    # Flat domain info structure
-│       ├── cache.rs          # TTL caching (stale-while-revalidate)
-│       ├── retry.rs          # Network retry with classification
-│       ├── net.rs            # SSRF guards (public-host validation)
-│       ├── logging.rs        # Structured logging + OpenTelemetry
-│       ├── output/           # Formatters (human/JSON/YAML/markdown)
-│       └── colors.rs         # Catppuccin color palette
-│
-├── seer-cli/                 # CLI application
-│   └── src/
-│       ├── main.rs           # Clap commands & dispatch
-│       ├── display/          # Spinner and progress utilities
-│       ├── repl/             # Interactive REPL
-│       └── tui/              # Full-screen ratatui TUI (18 lenses)
-│
-├── seer-py/                  # Python bindings (PyO3)
-│   ├── src/lib.rs            # Rust → Python bridge
-│   └── python/seer/          # Python package wrapper
-│
-└── seer-api/                 # FastAPI REST server + MCP
-    └── seer_api/
-        ├── main.py           # FastAPI app
-        ├── routers/          # API endpoint modules
-        └── mcp/              # MCP server (30 tools)
-```
+The four packages are listed under [Packages](#-packages); all business
+logic lives in `seer-core`, and the other three are thin interfaces over it.
+The annotated per-module map is in
+[CLAUDE.md → Codebase Structure](CLAUDE.md#codebase-structure).
 
 ---
 

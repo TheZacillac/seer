@@ -1,11 +1,11 @@
 //! SSRF-guarded HTTP GET with manual redirect following.
 //!
-//! Two of seer's security probes need to *read* an HTTP response rather than
-//! merely observe its status: the header audit ([`crate::headers`]) grades the
-//! response headers, and takeover detection ([`crate::takeover`]) matches the
-//! response body against provider fingerprints. Both fetch a host derived from
-//! user input, which makes this an outbound-request primitive and puts it under
-//! the same envelope as every other outbound leg of seer:
+//! seer's HTTP probes share this fetch: the header audit ([`crate::headers`])
+//! grades the response headers, takeover detection ([`crate::takeover`])
+//! matches the response body against provider fingerprints, and
+//! [`crate::status`] reports the status code and page title. All fetch a host
+//! derived from user input, which makes this an outbound-request primitive and
+//! puts it under the same envelope as every other outbound leg of seer:
 //!
 //! - Redirects are followed **manually**, one hop at a time, and every hop is
 //!   re-validated through [`crate::net::validate_http_url`]. reqwest's built-in
@@ -33,7 +33,7 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use futures::StreamExt;
-use reqwest::{Client, Url};
+use reqwest::Url;
 
 use crate::error::{Result, SeerError};
 
@@ -94,12 +94,6 @@ pub(crate) struct GuardedFetcher {
     allow_private: bool,
 }
 
-impl Default for GuardedFetcher {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl GuardedFetcher {
     pub fn new() -> Self {
         Self {
@@ -129,12 +123,43 @@ impl GuardedFetcher {
     }
 
     /// GETs `url`, following up to [`MAX_REDIRECTS`] hops with the guard
-    /// re-applied at each one.
+    /// re-applied at each one, and reads the final body under the cap.
     ///
     /// # Errors
     /// * [`SeerError::HttpError`] — bad URL shape, SSRF-blocked host, redirect
     ///   loop, too many hops, or a transport failure.
     pub async fn get(&self, url: &str) -> Result<FetchedResponse> {
+        let (response, redirects) = self.send(url).await?;
+        let status = response.status().as_u16();
+        let final_url = response.url().to_string();
+        let headers = response
+            .headers()
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.as_str().to_ascii_lowercase(),
+                    // A header value that isn't valid UTF-8 is still worth
+                    // reporting as present; lossy-decode rather than drop.
+                    String::from_utf8_lossy(value.as_bytes()).into_owned(),
+                )
+            })
+            .collect();
+        let body = self.read_body(response).await?;
+
+        Ok(FetchedResponse {
+            final_url,
+            status,
+            headers,
+            body,
+            redirects,
+        })
+    }
+
+    /// The guarded request half of [`GuardedFetcher::get`]: returns the final
+    /// (non-redirect) response with its body still unread, plus the number of
+    /// hops followed. For callers that want the body only for some responses —
+    /// read it through [`GuardedFetcher::read_body`] so the cap still applies.
+    pub async fn send(&self, url: &str) -> Result<(reqwest::Response, usize)> {
         let mut url = Url::parse(url)
             .map_err(|e| SeerError::HttpError(format!("invalid URL '{}': {}", url, e)))?;
         let mut visited: HashSet<String> = HashSet::new();
@@ -144,12 +169,9 @@ impl GuardedFetcher {
                 return Err(SeerError::HttpError("redirect loop detected".to_string()));
             }
 
-            let mut builder = Client::builder()
-                // Manual redirect handling: see the module docs. Letting
-                // reqwest follow would skip the per-hop guard.
-                .redirect(reqwest::redirect::Policy::none())
-                .timeout(self.timeout)
-                .user_agent(concat!("Seer/", env!("CARGO_PKG_VERSION")));
+            // No auto-redirects (see the module docs): each hop is re-guarded.
+            let mut builder =
+                crate::net::client_builder(self.timeout).user_agent(crate::net::USER_AGENT);
 
             if !self.allow_private {
                 let addrs = crate::net::validate_http_url(&url).await?;
@@ -187,70 +209,91 @@ impl GuardedFetcher {
                 continue;
             }
 
-            let status = response.status().as_u16();
-            let final_url = response.url().to_string();
-            let headers = response
-                .headers()
-                .iter()
-                .map(|(name, value)| {
-                    (
-                        name.as_str().to_ascii_lowercase(),
-                        // A header value that isn't valid UTF-8 is still worth
-                        // reporting as present; lossy-decode rather than drop.
-                        String::from_utf8_lossy(value.as_bytes()).into_owned(),
-                    )
-                })
-                .collect();
-
-            let body = self.read_capped_body(response).await?;
-
-            return Ok(FetchedResponse {
-                final_url,
-                status,
-                headers,
-                body,
-                redirects: hop,
-            });
+            return Ok((response, hop));
         }
 
         Err(SeerError::HttpError("too many redirects".to_string()))
     }
 
     /// Streams at most `self.max_body` bytes of the response body, bounded by
-    /// an overall read timeout.
-    async fn read_capped_body(&self, response: reqwest::Response) -> Result<String> {
-        let mut buf: Vec<u8> = Vec::with_capacity(8 * 1024);
-        let mut stream = response.bytes_stream();
+    /// an overall read timeout, and decodes them lossily as UTF-8.
+    pub async fn read_body(&self, response: reqwest::Response) -> Result<String> {
+        let body = read_body_capped(response, self.max_body, self.timeout, Overflow::Truncate)
+            .await
+            .map_err(|e| match e {
+                // A truncated body is still usable for fingerprinting, but a
+                // read that never terminates is a failure.
+                BodyReadError::TimedOut => {
+                    SeerError::Timeout(format!("HTTP body read timed out after {:?}", self.timeout))
+                }
+                // A chunk error (a truncating read never reports TooLarge).
+                other => SeerError::HttpError(format!("body chunk: {other}")),
+            })?;
+        Ok(String::from_utf8_lossy(&body).into_owned())
+    }
+}
 
-        let read = tokio::time::timeout(self.timeout, async {
-            while buf.len() < self.max_body {
-                let Some(chunk) = stream.next().await else {
-                    break;
-                };
-                let chunk =
-                    chunk.map_err(|e| SeerError::HttpError(format!("body chunk: {}", e)))?;
-                let remaining = self.max_body - buf.len();
-                let take = remaining.min(chunk.len());
-                buf.extend_from_slice(&chunk[..take]);
-            }
-            Ok::<(), SeerError>(())
-        })
-        .await;
+/// What [`read_body_capped`] does once a body outgrows its cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Overflow {
+    /// Keep the first `cap` bytes and stop reading (inspection probes).
+    Truncate,
+    /// Fail with [`BodyReadError::TooLarge`] (parsers need the whole document).
+    Reject,
+}
 
-        match read {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => return Err(e),
-            // A truncated body is still usable for fingerprinting, but a read
-            // that never terminates is a failure — surface it as a timeout.
-            Err(_) => {
-                return Err(SeerError::Timeout(format!(
-                    "HTTP body read timed out after {:?}",
-                    self.timeout
-                )))
+/// Why a capped body read failed; each caller maps it into its own error
+/// domain (and, for retrying callers, its own transient/terminal split).
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum BodyReadError {
+    /// A chunk failed to arrive (connection reset, reqwest's own deadline).
+    #[error("{0}")]
+    Chunk(reqwest::Error),
+    /// The body outgrew the cap under [`Overflow::Reject`].
+    #[error("body exceeds the size cap")]
+    TooLarge,
+    /// The whole read outlasted its deadline.
+    #[error("body read timed out")]
+    TimedOut,
+}
+
+/// Streams `response`'s body under a byte `cap` and one overall `timeout`.
+///
+/// Streaming (rather than `bytes()`) means a server that omits or lies about
+/// `Content-Length` cannot force an unbounded buffer, and the deadline stops a
+/// server that trickles bytes forever from hanging the caller. A truncating
+/// read stops as soon as the cap is reached, without waiting on more data.
+pub(crate) async fn read_body_capped(
+    response: reqwest::Response,
+    cap: usize,
+    timeout: Duration,
+    overflow: Overflow,
+) -> std::result::Result<Vec<u8>, BodyReadError> {
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    let read = tokio::time::timeout(timeout, async {
+        while overflow == Overflow::Reject || body.len() < cap {
+            let Some(chunk) = stream.next().await else {
+                break;
+            };
+            let chunk = chunk.map_err(BodyReadError::Chunk)?;
+            let room = cap.saturating_sub(body.len());
+            if chunk.len() <= room {
+                body.extend_from_slice(&chunk);
+            } else if overflow == Overflow::Truncate {
+                body.extend_from_slice(&chunk[..room]);
+            } else {
+                return Err(BodyReadError::TooLarge);
             }
         }
+        Ok(())
+    })
+    .await;
 
-        Ok(String::from_utf8_lossy(&buf).into_owned())
+    match read {
+        Ok(Ok(())) => Ok(body),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(BodyReadError::TimedOut),
     }
 }
 
@@ -376,6 +419,26 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.body.len(), 128, "body must be truncated at the cap");
+    }
+
+    #[tokio::test]
+    async fn rejecting_read_accepts_the_cap_and_refuses_one_byte_more() {
+        let server = MockServer::start().await;
+        Mock::given(path("/body"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("x".repeat(100)))
+            .mount(&server)
+            .await;
+        let url = format!("{}/body", server.uri());
+        let read = |cap| {
+            let url = url.clone();
+            async move {
+                let resp = reqwest::get(url).await.unwrap();
+                read_body_capped(resp, cap, DEFAULT_TIMEOUT, Overflow::Reject).await
+            }
+        };
+
+        assert_eq!(read(100).await.unwrap().len(), 100);
+        assert!(matches!(read(99).await, Err(BodyReadError::TooLarge)));
     }
 
     #[tokio::test]

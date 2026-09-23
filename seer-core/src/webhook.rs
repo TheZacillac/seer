@@ -28,7 +28,7 @@
 
 use std::time::Duration;
 
-use reqwest::{Client, Url};
+use reqwest::Url;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, SeerError};
@@ -123,15 +123,11 @@ impl WebhookClient {
         // (no DNS lookup, no connect) with a typed JsonError.
         let body = serde_json::to_vec(payload)?;
 
-        let connect_timeout = CONNECT_TIMEOUT.min(self.timeout);
-        let mut builder = Client::builder()
-            .timeout(self.timeout)
-            .connect_timeout(connect_timeout)
-            .user_agent(concat!("Seer/", env!("CARGO_PKG_VERSION")))
-            // SSRF defense: a redirect target is an unvalidated URL — never
-            // follow it (see module docs). Applies to the test seam too, so
-            // tests exercise the same no-redirect behavior as production.
-            .redirect(reqwest::redirect::Policy::none());
+        // Never follows redirects (see module docs) — the test seam included,
+        // so tests exercise the same no-redirect behavior as production.
+        let mut builder = crate::net::client_builder(self.timeout)
+            .connect_timeout(CONNECT_TIMEOUT.min(self.timeout))
+            .user_agent(crate::net::USER_AGENT);
 
         if !self.allow_private {
             // SSRF protection: refuse reserved/private hosts and pin the
@@ -171,11 +167,8 @@ impl WebhookClient {
 }
 
 /// Validates webhook URL shape (scheme + host presence) and extracts
-/// `(host, port)` for the SSRF guard.
-///
-/// Uses `host()` (not `host_str()`) so an IPv6 literal comes back
-/// unbracketed and hits the shared guard's IP-literal short-circuit —
-/// same approach as the RDAP client's URL parsing.
+/// `(host, port)` for the SSRF guard. Any port is allowed: the endpoint is
+/// operator configuration, not a server-supplied redirect.
 fn parse_webhook_url(url: &str) -> Result<(String, u16)> {
     let parsed = Url::parse(url)
         .map_err(|e| SeerError::InvalidInput(format!("invalid webhook URL '{}': {}", url, e)))?;
@@ -188,17 +181,8 @@ fn parse_webhook_url(url: &str) -> Result<(String, u16)> {
         )));
     }
 
-    let host = match parsed.host() {
-        Some(url::Host::Domain(d)) => d.to_string(),
-        Some(url::Host::Ipv4(ip)) => ip.to_string(),
-        Some(url::Host::Ipv6(ip)) => ip.to_string(),
-        None => {
-            return Err(SeerError::InvalidInput(format!(
-                "webhook URL '{}' has no host",
-                url
-            )))
-        }
-    };
+    let host = crate::net::url_host(&parsed)
+        .ok_or_else(|| SeerError::InvalidInput(format!("webhook URL '{}' has no host", url)))?;
 
     // `port_or_known_default` always answers for http/https; the fallback
     // arm is unreachable but keeps the expression total.

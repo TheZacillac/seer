@@ -7,7 +7,7 @@
 //! # Usage
 //!
 //! ```rust,no_run
-//! let _guard = seer_core::logging::init_logging("seer", "error");
+//! let _guard = seer_core::logging::init_logging_with_writer("seer", "error", std::io::stderr);
 //! ```
 //!
 //! The returned guard **must** be kept alive for the lifetime of the process
@@ -25,7 +25,7 @@ use tracing_subscriber::{
 
 static INITIALIZED: OnceLock<()> = OnceLock::new();
 
-/// Guard returned by [`init_logging`] / [`init_logging_with_writer`].
+/// Guard returned by [`init_logging_with_writer`].
 ///
 /// Holds the file appender worker guard (if file logging is enabled).
 /// Drop this only when the process is about to exit.
@@ -33,21 +33,11 @@ pub struct LogGuard {
     _file_guard: Option<tracing_appender::non_blocking::WorkerGuard>,
 }
 
-/// Initialise the global tracing subscriber for a CLI / standalone process.
-///
-/// Uses `stderr` as the console output destination. For a custom writer (e.g.
-/// progress-bar aware), use [`init_logging_with_writer`].
+/// Initialise the global tracing subscriber with a console writer
+/// (`std::io::stderr`, or a progress-bar-aware writer as `seer-cli` uses).
 ///
 /// `default_level` is used when neither `ARCANUM_LOG_LEVEL` nor `RUST_LOG`
 /// is set. Typical values: `"error"` for CLIs, `"info"` for servers.
-pub fn init_logging(app_name: &str, default_level: &str) -> LogGuard {
-    init_logging_with_writer(app_name, default_level, std::io::stderr)
-}
-
-/// Initialise the global tracing subscriber with a custom console writer.
-///
-/// This is used by `seer-cli` to route log output through the progress bar.
-/// See [`init_logging`] for the meaning of `default_level`.
 pub fn init_logging_with_writer<W>(app_name: &str, default_level: &str, writer: W) -> LogGuard
 where
     W: for<'a> MakeWriter<'a> + Send + Sync + 'static,
@@ -93,32 +83,24 @@ where
         None
     };
 
-    let (file_layer_json, file_layer_text, file_guard) = if let Some(file_appender) = file_appender
-    {
-        let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
-
-        if json_mode {
-            (
-                Some(fmt::layer().json().with_writer(non_blocking).boxed()),
-                None,
-                Some(guard),
-            )
-        } else {
-            (
-                None,
-                Some(fmt::layer().with_writer(non_blocking).boxed()),
-                Some(guard),
-            )
+    // One boxed layer per sink, in JSON or text as configured.
+    let (file_layer, file_guard) = match file_appender {
+        Some(file_appender) => {
+            let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+            let layer = if json_mode {
+                fmt::layer().json().with_writer(non_blocking).boxed()
+            } else {
+                fmt::layer().with_writer(non_blocking).boxed()
+            };
+            (Some(layer), Some(guard))
         }
-    } else {
-        (None, None, None)
+        None => (None, None),
     };
 
-    // Build console layer
-    let (console_json, console_text) = if json_mode {
-        (Some(fmt::layer().json().with_writer(writer).boxed()), None)
+    let console_layer = if json_mode {
+        fmt::layer().json().with_writer(writer).boxed()
     } else {
-        (None, Some(fmt::layer().with_writer(writer).boxed()))
+        fmt::layer().with_writer(writer).boxed()
     };
 
     // Build optional OpenTelemetry OTLP layer (boxed for type erasure).
@@ -131,10 +113,8 @@ where
     // this silently succeeds without panicking.
     let registry = tracing_subscriber::registry()
         .with(env_filter)
-        .with(console_json)
-        .with(console_text)
-        .with(file_layer_json)
-        .with(file_layer_text);
+        .with(console_layer)
+        .with(file_layer);
 
     #[cfg(feature = "otel")]
     let registry = registry.with(otel_layer);
@@ -158,7 +138,7 @@ pub fn log_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("ARCANUM_LOG_DIR") {
         return PathBuf::from(dir);
     }
-    dirs::home_dir()
+    std::env::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".arcanum")
         .join("logs")

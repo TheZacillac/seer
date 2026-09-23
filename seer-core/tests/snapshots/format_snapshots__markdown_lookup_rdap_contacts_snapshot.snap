@@ -1,0 +1,35 @@
+---
+source: seer-core/tests/format_snapshots.rs
+expression: markdown ().format_lookup (& fixture_lookup_rdap_with_contacts())
+---
+## Lookup: EXAMPLE.COM
+
+- **Source**: RDAP
+- **Registrar**: Mock Registrar Inc.
+- **Registrant**: Jane Registrant
+- **Organization**: Example Holdings LLC
+- **Created**: `2010-03-15`
+- **Expires**: `2099-03-15` ([N] days)
+- **Status**: `client transfer prohibited`
+- **Nameservers**: `NS1.EXAMPLE.COM`
+- **DNSSEC**: signed
+
+### Registrant Contact
+
+- **Name**: Jane Registrant
+- **Organization**: Example Holdings LLC
+- **Email**: `owner@example.com`
+- **Address**: 1 Main St, Springfield, US
+- **Country**: US
+
+### Admin Contact
+
+- **Name**: Alex Admin
+- **Organization**: Example Holdings LLC
+- **Email**: `admin@example.com`
+- **Phone**: +1.5555550101
+
+### Tech Contact
+
+- **Name**: Terry Tech
+- **Email**: `tech@example.com`

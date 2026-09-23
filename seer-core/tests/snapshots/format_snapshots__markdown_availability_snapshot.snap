@@ -1,0 +1,10 @@
+---
+source: seer-core/tests/format_snapshots.rs
+expression: markdown ().format_availability (& fixture_availability())
+---
+## Availability: example.com
+
+- **Result**: **TAKEN**
+- **Confidence**: medium
+- **Method**: whois
+- **Details**: WHOIS returned registration data

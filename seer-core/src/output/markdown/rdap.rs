@@ -2,105 +2,43 @@ use super::*;
 
 impl MarkdownFormatter {
     pub(super) fn format_rdap(&self, response: &RdapResponse) -> String {
-        let mut output = Vec::new();
-
         let name = response
             .domain_name()
             .or(response.name.as_deref())
             .unwrap_or("Unknown");
-        output.push(format!("## RDAP: {}", MdSafe(name)));
-        output.push(String::new());
+        let mut output = vec![format!("## RDAP: {}", MdSafe(name)), String::new()];
 
-        if let Some(ref handle) = response.handle {
-            output.push(format!("- **Handle**: `{}`", MdSafe(handle)));
-        }
-        if let Some(registrar) = response.get_registrar() {
-            output.push(format!("- **Registrar**: {}", MdSafe(&registrar)));
-        }
-        if let Some(registrant) = response.get_registrant() {
-            output.push(format!("- **Registrant**: {}", MdSafe(&registrant)));
-        }
-        if let Some(organization) = response.get_registrant_organization() {
-            output.push(format!("- **Organization**: {}", MdSafe(&organization)));
-        }
-
-        if let Some(created) = response.creation_date() {
-            output.push(format!("- **Created**: `{}`", created.format("%Y-%m-%d")));
-        }
-        if let Some(expires) = response.expiration_date() {
-            let days_until = days_until(expires);
-            output.push(format!(
-                "- **Expires**: `{}` ({} days)",
-                expires.format("%Y-%m-%d"),
-                days_until
-            ));
-        }
-        if let Some(updated) = response.last_updated() {
-            output.push(format!("- **Updated**: `{}`", updated.format("%Y-%m-%d")));
-        }
-
-        if !response.status.is_empty() {
-            output.push(format!(
-                "- **Status**: {}",
-                response
-                    .status
-                    .iter()
-                    .map(|s| format!("`{}`", MdSafe(s)))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
-        }
-
-        let nameservers = response.nameserver_names();
-        if !nameservers.is_empty() {
-            output.push(format!(
-                "- **Nameservers**: {}",
-                nameservers
-                    .iter()
-                    .map(|ns| format!("`{}`", MdSafe(ns)))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
-        }
-
+        let mut b = Bullets(&mut output);
+        b.code_opt("Handle", &response.handle);
+        b.opt("Registrar", &response.get_registrar());
+        b.opt("Registrant", &response.get_registrant());
+        b.opt("Organization", &response.get_registrant_organization());
+        b.date("Created", response.creation_date());
+        b.expires(response.expiration_date());
+        b.date("Updated", response.last_updated());
+        b.code_list("Status", &response.status);
+        b.code_list("Nameservers", &response.nameserver_names());
         if response.is_dnssec_signed() {
-            output.push("- **DNSSEC**: signed".to_string());
+            b.raw("DNSSEC", "signed");
         }
 
         // IP-specific fields
-        if let Some(ref start) = response.start_address {
-            output.push(format!("- **Start Address**: `{}`", MdSafe(start)));
-        }
-        if let Some(ref end) = response.end_address {
-            output.push(format!("- **End Address**: `{}`", MdSafe(end)));
-        }
-        if let Some(ref country) = response.country {
-            output.push(format!("- **Country**: {}", MdSafe(country)));
-        }
+        b.code_opt("Start Address", &response.start_address);
+        b.code_opt("End Address", &response.end_address);
+        b.opt("Country", &response.country);
 
         // ASN-specific fields
         if let Some(start) = response.start_autnum {
-            output.push(format!(
-                "- **AS Number**: `AS{}` - `AS{}`",
-                start,
-                response.end_autnum.unwrap_or(start)
-            ));
+            let end = response.end_autnum.unwrap_or(start);
+            b.raw("AS Number", format!("`AS{start}` - `AS{end}`"));
         }
 
         // Contact sections last: each `###` heading scopes everything below
         // it, so no domain-level field may follow one.
-        if let Some(contact) = response.get_registrant_contact() {
-            self.format_rdap_contact(&mut output, "Registrant Contact", &contact);
-        }
-        if let Some(contact) = response.get_admin_contact() {
-            self.format_rdap_contact(&mut output, "Admin Contact", &contact);
-        }
-        if let Some(contact) = response.get_tech_contact() {
-            self.format_rdap_contact(&mut output, "Tech Contact", &contact);
-        }
-        if let Some(contact) = response.get_billing_contact() {
-            self.format_rdap_contact(&mut output, "Billing Contact", &contact);
-        }
+        let infos = contact::rdap_contacts(response);
+        b.contacts(contact::rdap_views(&infos));
+        let billing = response.get_billing_contact();
+        b.contact("Billing", Contact::rdap(billing.as_ref()));
 
         output.join("\n")
     }

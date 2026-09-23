@@ -1,0 +1,100 @@
+---
+source: seer-core/tests/format_snapshots.rs
+expression: yaml ().format_lookup (& fixture_lookup_rdap_with_whois_fallback())
+---
+data: 
+  country: null
+  endAddress: null
+  endAutnum: null
+  entities: 
+    - 
+      entities: []
+      events: []
+      handle: MOCK-REGISTRAR
+      links: []
+      objectClassName: entity
+      publicIds: []
+      remarks: []
+      roles: 
+        - registrar
+      status: []
+      vcardArray: 
+        - vcard
+        - 
+          - 
+            - fn
+            - {}
+            - text
+            - Mock Registrar Inc.
+  events: 
+    - 
+      eventAction: registration
+      eventActor: null
+      eventDate: "2010-03-15T04:00:00Z"
+    - 
+      eventAction: last changed
+      eventActor: null
+      eventDate: "2024-02-01T09:30:00Z"
+    - 
+      eventAction: expiration
+      eventActor: null
+      eventDate: "2099-03-15T04:00:00Z"
+  handle: "2336799_DOMAIN_COM-VRSN"
+  ipVersion: null
+  ldhName: EXAMPLE.COM
+  links: []
+  name: null
+  nameservers: 
+    - 
+      ipAddresses: null
+      ldhName: NS1.EXAMPLE.COM
+      links: []
+      objectClassName: nameserver
+      status: []
+      unicodeName: null
+    - 
+      ipAddresses: null
+      ldhName: NS2.EXAMPLE.COM
+      links: []
+      objectClassName: nameserver
+      status: []
+      unicodeName: null
+  notices: []
+  objectClassName: domain
+  parentHandle: null
+  port43: null
+  remarks: []
+  secureDNS: null
+  startAddress: null
+  startAutnum: null
+  status: 
+    - client transfer prohibited
+    - server delete prohibited
+  type: null
+  unicodeName: null
+source: rdap
+whois_fallback: 
+  admin_email: admin@example.com
+  admin_name: Alex Admin
+  admin_organization: Example Holdings LLC
+  admin_phone: "+1.5555550101"
+  creation_date: "2010-03-15T04:00:00Z"
+  dnssec: signedDelegation
+  domain: example.com
+  expiration_date: "2099-03-15T04:00:00Z"
+  nameservers: 
+    - ns1.example.com
+    - ns2.example.com
+  organization: Example Holdings LLC
+  registrant: Jane Registrant
+  registrant_address: "1 Main St, Springfield"
+  registrant_country: US
+  registrant_email: owner@example.com
+  registrant_phone: "+1.5555550100"
+  registrar: Mock Registrar Inc.
+  status: 
+    - clientTransferProhibited
+  tech_email: tech@example.com
+  tech_name: Terry Tech
+  updated_date: "2024-02-01T09:30:00Z"
+  whois_server: whois.verisign-grs.com

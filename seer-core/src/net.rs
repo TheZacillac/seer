@@ -11,8 +11,8 @@ use std::time::Duration;
 use hickory_resolver::config::{ResolverConfig, GOOGLE};
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use hickory_resolver::TokioResolver;
-use once_cell::sync::Lazy;
 use reqwest::Url;
+use std::sync::LazyLock;
 use tokio::net::lookup_host;
 use tracing::debug;
 
@@ -32,7 +32,7 @@ use crate::error::{Result, SeerError};
 /// returns a reserved IP — is still trusted and still blocked by the
 /// reserved-IP check. The pre-existing time-of-check/time-of-use window
 /// between validation and the actual outbound connect is unchanged.
-static FALLBACK_RESOLVER: Lazy<Option<TokioResolver>> = Lazy::new(|| {
+static FALLBACK_RESOLVER: LazyLock<Option<TokioResolver>> = LazyLock::new(|| {
     let mut builder = TokioResolver::builder_with_config(
         ResolverConfig::udp_and_tcp(&GOOGLE),
         TokioRuntimeProvider::default(),
@@ -46,7 +46,7 @@ static FALLBACK_RESOLVER: Lazy<Option<TokioResolver>> = Lazy::new(|| {
         // already failed.
         crate::dns::apply_standard_opts(builder.options_mut(), Duration::from_secs(5));
     }
-    // Mirror the `Lazy<Option<…>>` pattern used for the shared HTTP clients
+    // Mirror the `LazyLock<Option<…>>` pattern used for the shared HTTP clients
     // rather than `.expect()` in a library initializer: the build is infallible
     // today (no TLS features), but a `None` here degrades to a typed DNS error
     // at the call site instead of a process panic if that ever changes.
@@ -299,6 +299,31 @@ pub async fn resolve_public_host(host: &str, port: u16) -> Result<Vec<SocketAddr
     Ok(addrs)
 }
 
+/// User agent for seer's own HTTP probes (status, headers, takeover, webhook).
+pub(crate) const USER_AGENT: &str = concat!("Seer/", env!("CARGO_PKG_VERSION"));
+
+/// Starts a reqwest client for an outbound leg: an overall `timeout`, and
+/// redirects never followed automatically. reqwest's own policy would resolve
+/// each `Location` host itself, skipping the SSRF guard and any
+/// `resolve_to_addrs` pin (redirect-based SSRF); legs that need redirects
+/// follow them by hand and re-validate every hop.
+pub(crate) fn client_builder(timeout: Duration) -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none())
+}
+
+/// A URL's host as the SSRF guard wants it. Uses `host()` rather than
+/// `host_str()` so an IPv6 literal comes back unbracketed and hits
+/// [`resolve_public_host`]'s IP-literal short-circuit.
+pub(crate) fn url_host(url: &Url) -> Option<String> {
+    Some(match url.host()? {
+        url::Host::Domain(d) => d.to_string(),
+        url::Host::Ipv4(ip) => ip.to_string(),
+        url::Host::Ipv6(ip) => ip.to_string(),
+    })
+}
+
 /// Validates an HTTP(S) URL as an outbound target and returns the public
 /// socket addresses to pin the connection to.
 ///
@@ -332,14 +357,7 @@ pub(crate) async fn validate_http_url(url: &Url) -> Result<Vec<SocketAddr>> {
         ));
     }
 
-    // Use `host()` (not `host_str()`) so an IPv6 literal comes back
-    // unbracketed and hits the guard's IP-literal short-circuit.
-    let host = match url.host() {
-        Some(url::Host::Domain(d)) => d.to_string(),
-        Some(url::Host::Ipv4(ip)) => ip.to_string(),
-        Some(url::Host::Ipv6(ip)) => ip.to_string(),
-        None => return Err(SeerError::HttpError("missing URL host".to_string())),
-    };
+    let host = url_host(url).ok_or_else(|| SeerError::HttpError("missing URL host".to_string()))?;
     let port = url.port_or_known_default().unwrap_or(443);
 
     // Only allow standard HTTP/HTTPS ports to prevent port scanning via redirects
@@ -531,6 +549,26 @@ mod tests {
     #[tokio::test]
     async fn validate_allows_public_ip_literal() {
         validate_public_host("8.8.8.8", 53).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn validate_http_url_unbrackets_ipv6_literals() {
+        // `Url::host_str()` keeps the brackets on an IPv6 literal; the
+        // `Url::host()` extraction must unbracket it so the guard's IP-literal
+        // short-circuit catches it (no DNS involved).
+        let url = Url::parse("https://[::1]/").unwrap();
+        let err = validate_http_url(&url).await.unwrap_err();
+        assert!(
+            matches!(err, SeerError::HttpError(ref s) if s.contains("reserved")),
+            "got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_http_url_returns_pinnable_addrs_for_public_literal() {
+        let url = Url::parse("https://8.8.8.8/").unwrap();
+        let addrs = validate_http_url(&url).await.unwrap();
+        assert_eq!(addrs, vec!["8.8.8.8:443".parse().unwrap()]);
     }
 
     #[tokio::test]

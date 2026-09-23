@@ -13,61 +13,47 @@ fn expiry_phrase(days_until: i64) -> String {
 
 impl MarkdownFormatter {
     pub(super) fn format_status(&self, response: &StatusResponse) -> String {
-        let mut output = Vec::new();
+        let mut output = vec![
+            format!("## Status: {}", MdSafe(&response.domain)),
+            String::new(),
+        ];
+        let mut b = Bullets(&mut output);
 
-        output.push(format!("## Status: {}", MdSafe(&response.domain)));
-        output.push(String::new());
-
-        // HTTP Status
         if let Some(status) = response.http_status {
             let status_text = response.http_status_text.as_deref().unwrap_or("Unknown");
-            output.push(format!(
-                "- **HTTP Status**: `{}` ({})",
-                status,
-                MdSafe(status_text)
-            ));
+            b.raw(
+                "HTTP Status",
+                format!("`{}` ({})", status, MdSafe(status_text)),
+            );
         }
-
-        // Site Title
-        if let Some(ref title) = response.title {
-            output.push(format!("- **Site Title**: {}", MdSafe(title)));
-        }
+        b.opt("Site Title", &response.title);
 
         // SSL Certificate
-        output.push(String::new());
+        b.push(String::new());
+        b.push("### SSL Certificate".to_string());
+        b.push(String::new());
         if let Some(ref cert) = response.certificate {
-            output.push("### SSL Certificate".to_string());
-            output.push(String::new());
-            output.push(format!("- **Subject**: `{}`", MdSafe(&cert.subject)));
-            output.push(format!("- **Issuer**: {}", MdSafe(&cert.issuer)));
-            output.push(format!(
-                "- **Status**: {}",
-                if cert.is_valid { "Valid" } else { "Invalid" }
-            ));
+            b.code("Subject", &cert.subject);
+            b.text("Issuer", &cert.issuer);
+            b.raw("Status", if cert.is_valid { "Valid" } else { "Invalid" });
             // `is_valid` is date-range only, so a mismatched cert still reads
             // "Valid" above; surface the hostname check explicitly (the human
             // formatter prints the same warning).
-            output.push(format!(
-                "- **Hostname Match**: {}",
-                if cert.hostname_verified {
-                    "yes"
-                } else {
-                    "**no** — ⚠ certificate hostname not verified"
-                }
-            ));
-            output.push(format!(
-                "- **Valid From**: `{}`",
-                cert.valid_from.format("%Y-%m-%d")
-            ));
-            output.push(format!(
-                "- **Expires**: `{}` ({})",
+            let hostname = if cert.hostname_verified {
+                "yes"
+            } else {
+                "**no** — ⚠ certificate hostname not verified"
+            };
+            b.raw("Hostname Match", hostname);
+            b.date("Valid From", Some(cert.valid_from));
+            let expires = format!(
+                "`{}` ({})",
                 cert.valid_until.format("%Y-%m-%d"),
                 expiry_phrase(cert.days_until_expiry)
-            ));
+            );
+            b.raw("Expires", expires);
         } else {
-            output.push("### SSL Certificate".to_string());
-            output.push(String::new());
-            output.push("*Not available (HTTPS may not be configured)*".to_string());
+            b.push("*Not available (HTTPS may not be configured)*".to_string());
         }
 
         if let Some(ref caa) = response.caa {
@@ -75,115 +61,52 @@ impl MarkdownFormatter {
         }
 
         // Domain Expiration
+        let mut b = Bullets(&mut output);
         if let Some(ref expiry) = response.domain_expiration {
-            output.push(String::new());
-            output.push("### Domain Registration".to_string());
-            output.push(String::new());
-            if let Some(ref registrar) = expiry.registrar {
-                output.push(format!("- **Registrar**: {}", MdSafe(registrar)));
-            }
-            output.push(format!(
-                "- **Expires**: `{}` ({})",
+            b.push(String::new());
+            b.push("### Domain Registration".to_string());
+            b.push(String::new());
+            b.opt("Registrar", &expiry.registrar);
+            let expires = format!(
+                "`{}` ({})",
                 expiry.expiration_date.format("%Y-%m-%d"),
                 expiry_phrase(expiry.days_until_expiry)
-            ));
+            );
+            b.raw("Expires", expires);
         }
 
         // DNS Resolution
-        output.push(String::new());
+        b.push(String::new());
+        b.push("### DNS Resolution".to_string());
+        b.push(String::new());
         if let Some(ref dns) = response.dns_resolution {
-            output.push("### DNS Resolution".to_string());
-            output.push(String::new());
-            output.push(format!(
-                "- **Resolves**: {}",
-                if dns.resolves { "Yes" } else { "No" }
-            ));
-
-            if let Some(ref cname) = dns.cname_target {
-                output.push(format!("- **CNAME**: `{}`", MdSafe(cname)));
-            }
-            if !dns.a_records.is_empty() {
-                output.push(format!(
-                    "- **IPv4 (A)**: {}",
-                    dns.a_records
-                        .iter()
-                        .map(|ip| format!("`{}`", MdSafe(ip)))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ));
-            }
-            if !dns.aaaa_records.is_empty() {
-                output.push(format!(
-                    "- **IPv6 (AAAA)**: {}",
-                    dns.aaaa_records
-                        .iter()
-                        .map(|ip| format!("`{}`", MdSafe(ip)))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ));
-            }
-            if !dns.nameservers.is_empty() {
-                output.push(format!(
-                    "- **Nameservers**: {}",
-                    dns.nameservers
-                        .iter()
-                        .map(|ns| format!("`{}`", MdSafe(ns)))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ));
-            }
+            b.raw("Resolves", if dns.resolves { "Yes" } else { "No" });
+            b.code_opt("CNAME", &dns.cname_target);
+            b.code_list("IPv4 (A)", &dns.a_records);
+            b.code_list("IPv6 (AAAA)", &dns.aaaa_records);
+            b.code_list("Nameservers", &dns.nameservers);
         } else {
-            output.push("### DNS Resolution".to_string());
-            output.push(String::new());
-            output.push("*Check failed*".to_string());
+            b.push("*Check failed*".to_string());
         }
 
         output.join("\n")
     }
 
     pub(super) fn format_ssl(&self, report: &crate::ssl::SslReport) -> String {
-        let mut output = Vec::new();
-
-        output.push(format!("## SSL Report: {}", MdSafe(&report.domain)));
-        output.push(String::new());
-
-        output.push(format!(
-            "- **Valid**: {}",
-            if report.is_valid { "yes" } else { "no" }
-        ));
-        output.push(format!(
-            "- **Hostname Match**: {}",
-            if report.hostname_verified {
-                "yes"
-            } else {
-                "no"
-            }
-        ));
-        output.push(format!(
-            "- **Days Until Expiry**: {}",
-            report.days_until_expiry
-        ));
-
-        if let Some(ref proto) = report.protocol_version {
-            output.push(format!("- **Protocol**: {}", MdSafe(proto)));
-        }
-
-        if !report.san_names.is_empty() {
-            output.push(format!(
-                "- **SANs**: {}",
-                report
-                    .san_names
-                    .iter()
-                    .map(|s| format!("`{}`", MdSafe(s)))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
-        }
+        let mut output = vec![
+            format!("## SSL Report: {}", MdSafe(&report.domain)),
+            String::new(),
+        ];
+        let mut b = Bullets(&mut output);
+        let yes_no = |ok: bool| if ok { "yes" } else { "no" };
+        b.raw("Valid", yes_no(report.is_valid));
+        b.raw("Hostname Match", yes_no(report.hostname_verified));
+        b.raw("Days Until Expiry", report.days_until_expiry);
+        b.opt("Protocol", &report.protocol_version);
+        b.code_list("SANs", &report.san_names);
 
         if !report.warnings.is_empty() {
-            output.push(String::new());
-            output.push("### Warnings".to_string());
-            output.push(String::new());
+            output.extend([String::new(), "### Warnings".to_string(), String::new()]);
             for w in &report.warnings {
                 let tag = match w.severity {
                     crate::ssl::CertWarningSeverity::Critical => "**Critical**",
@@ -194,11 +117,13 @@ impl MarkdownFormatter {
         }
 
         if !report.chain.is_empty() {
-            output.push(String::new());
-            output.push("### Certificate Chain".to_string());
-            output.push(String::new());
-            output.push("| # | Subject | Issuer | Valid Until | Key |".to_string());
-            output.push("| --- | --- | --- | --- | --- |".to_string());
+            output.extend([
+                String::new(),
+                "### Certificate Chain".to_string(),
+                String::new(),
+                "| # | Subject | Issuer | Valid Until | Key |".to_string(),
+                "| --- | --- | --- | --- | --- |".to_string(),
+            ]);
             for (i, cert) in report.chain.iter().enumerate() {
                 let key_info = match (&cert.key_type, cert.key_bits) {
                     (Some(kt), Some(bits)) => format!("{} ({} bits)", MdSafe(kt), bits),

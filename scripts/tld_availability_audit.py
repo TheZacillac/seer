@@ -74,9 +74,18 @@ def parse_availability_patterns(parser_rs: Path) -> list[str]:
 
 
 def parse_whois_servers(servers_rs: Path) -> dict[str, str]:
-    """Extract the tld -> whois-server map from servers.rs."""
+    """Rebuild the tld -> whois-server map from servers.rs's tables:
+    NIC_TLDS (served at whois.nic.<tld>) and HOSTED_TLDS ((host, tlds) rows).
+    IDN U-label aliases are skipped; they share their A-label's server."""
     text = servers_rs.read_text(encoding="utf-8")
-    return dict(re.findall(r'm\.insert\("([^"]+)",\s*"([^"]+)"\)', text))
+    nic = re.search(r'const NIC_TLDS: &str = "(.*?)";', text, re.DOTALL)
+    hosted = re.search(r"const HOSTED_TLDS: [^=]*= &\[(.*?)\];", text, re.DOTALL)
+    if not nic or not hosted:
+        sys.exit(f"could not find the WHOIS server tables in {servers_rs}")
+    servers = {tld: f"whois.nic.{tld}" for tld in nic.group(1).split()}
+    for host, tlds in re.findall(r'\(\s*"([^"]+)",\s*"([^"]*)"', hosted.group(1)):
+        servers.update(dict.fromkeys(tlds.split(), host))
+    return servers
 
 
 def load_rdap_tlds() -> set[str] | None:

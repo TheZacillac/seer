@@ -7,16 +7,9 @@ surface: the callable is exported, and invalid input raises ValueError
 (seer-core's ``normalize_domain`` rejects it before any network I/O).
 """
 
-import os
-
 import pytest
 
 import seer
-
-_LIVE = pytest.mark.skipif(
-    os.environ.get("SEER_LIVE_TESTS") != "1",
-    reason="live network test; set SEER_LIVE_TESTS=1 to enable",
-)
 
 
 def test_delegation_is_exported():
@@ -32,7 +25,7 @@ def test_delegation_invalid_domain_raises_value_error(bad):
         seer.delegation(bad)
 
 
-@_LIVE
+@pytest.mark.live
 def test_delegation_live_report_shape():
     # NOTE: requires outbound IPv6 OR a resolver returning IPv4 for the
     # gtld-servers: seer-core's resolve_host_ip may pick an AAAA address

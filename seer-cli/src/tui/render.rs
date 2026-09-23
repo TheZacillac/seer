@@ -155,13 +155,7 @@ fn nav(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         } else {
             '·'
         };
-        let label_color = if !l.implemented {
-            theme.overlay0
-        } else if active {
-            theme.text
-        } else {
-            theme.subtext
-        };
+        let label_color = if active { theme.text } else { theme.subtext };
         let glyph_color = if active { theme.blue } else { theme.lavender };
         let prefix = if active { "▸ " } else { "  " };
         lines.push(Line::from(vec![
@@ -266,9 +260,7 @@ fn main_pane(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             return;
         }
         LensState::Error(e) => {
-            let block = panel::block(theme, lens.label, theme.red, false);
-            let inner = block.inner(content);
-            f.render_widget(block, content);
+            let inner = panel::render(f, content, theme, lens.label, theme.red, false);
             f.render_widget(
                 Paragraph::new(Line::from(Span::styled(
                     e.clone(),
@@ -279,22 +271,18 @@ fn main_pane(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             return;
         }
         LensState::Idle => {
-            if !lens.implemented {
-                lenses::placeholder::render(f, content, theme, lens.label);
+            // Tab-specific idle hints for the RDAP lens.
+            let hint_text = if lens.key == "rdap" {
+                match app.tab {
+                    2 => "use :rdap AS<number>  (e.g. :rdap AS15169)",
+                    1 => "use :rdap <ip>  or navigate to a domain first",
+                    _ => "press / to look up a domain",
+                }
             } else {
-                // Tab-specific idle hints for the RDAP lens.
-                let hint_text = if lens.key == "rdap" {
-                    match app.tab {
-                        2 => "use :rdap AS<number>  (e.g. :rdap AS15169)",
-                        1 => "use :rdap <ip>  or navigate to a domain first",
-                        _ => "press / to look up a domain",
-                    }
-                } else {
-                    "press / to look up a domain"
-                };
-                let hint = Line::from(Span::styled(hint_text, Style::default().fg(theme.overlay0)));
-                f.render_widget(Paragraph::new(hint), content);
-            }
+                "press / to look up a domain"
+            };
+            let hint = Line::from(Span::styled(hint_text, Style::default().fg(theme.overlay0)));
+            f.render_widget(Paragraph::new(hint), content);
             return;
         }
         LensState::Loaded(_) => {}
@@ -305,9 +293,7 @@ fn main_pane(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         if let LensState::Loaded(data) = app.state_of(app.lens) {
             let text = crate::payload::serialize(data, app.format);
             let raw_title = format!("{} · raw", lens.label);
-            let block = panel::block(theme, &raw_title, theme.green, false);
-            let inner = block.inner(content);
-            f.render_widget(block, content);
+            let inner = panel::render(f, content, theme, &raw_title, theme.green, false);
             f.render_widget(
                 Paragraph::new(text).style(Style::default().fg(theme.subtext)),
                 inner,
@@ -499,9 +485,7 @@ fn help_overlay(f: &mut Frame, area: Rect, theme: &Theme) {
         Block::default().style(Style::default().bg(theme.base).fg(theme.text)),
         popup,
     );
-    let block = panel::block(theme, "keybindings", theme.lavender, true);
-    let inner = block.inner(popup);
-    f.render_widget(block, popup);
+    let inner = panel::render(f, popup, theme, "keybindings", theme.lavender, true);
     let lines: Vec<Line> = rows
         .iter()
         .map(|(k, t)| {
@@ -518,21 +502,10 @@ fn help_overlay(f: &mut Frame, area: Rect, theme: &Theme) {
 mod tests {
     use super::*;
     use crate::tui::app::App;
-    use ratatui::backend::TestBackend;
-    use ratatui::Terminal;
+    use crate::tui::test_util::{render_buffer, render_text};
 
     fn full_buf(app: &App, theme: &Theme) -> String {
-        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
-        terminal.draw(|f| view(f, app, theme)).unwrap();
-        let buf = terminal.backend().buffer();
-        let area = buf.area();
-        let mut s = String::new();
-        for y in 0..area.height {
-            for x in 0..area.width {
-                s.push_str(buf[(x, y)].symbol());
-            }
-        }
-        s
+        render_text(100, 30, |f| view(f, app, theme))
     }
 
     #[test]
@@ -606,16 +579,7 @@ mod tests {
     fn shell_renders_without_panicking() {
         let theme = Theme::frappe();
         let app = App::new(None);
-        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
-        terminal.draw(|f| view(f, &app, &theme)).unwrap();
-        let buf = terminal.backend().buffer();
-        let area = buf.area();
-        let mut s = String::new();
-        for y in 0..area.height {
-            for x in 0..area.width {
-                s.push_str(buf[(x, y)].symbol());
-            }
-        }
+        let s = full_buf(&app, &theme);
         assert!(s.contains("seer"), "top-bar brand missing");
         assert!(s.contains("Overview"), "first lens label missing");
         assert!(s.contains("LOOKUP"), "group header missing");
@@ -629,9 +593,7 @@ mod tests {
     fn frame_canvas_is_painted_with_theme_base() {
         let mut app = App::new(None);
         assert!(app.set_theme_by_name("latte"));
-        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
-        terminal.draw(|f| view(f, &app, app.theme())).unwrap();
-        let buffer = terminal.backend().buffer();
+        let buffer = render_buffer(100, 30, |f| view(f, &app, app.theme()));
         let latte = Theme::latte();
         // Main-pane interior and nav-column cells that no widget backfills.
         for (x, y) in [(60u16, 15u16), (2, 20)] {
@@ -647,9 +609,7 @@ mod tests {
         let mut app = App::new(None);
         assert!(app.set_theme_by_name("latte"));
         app.help = true;
-        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
-        terminal.draw(|f| view(f, &app, app.theme())).unwrap();
-        let buffer = terminal.backend().buffer();
+        let buffer = render_buffer(100, 30, |f| view(f, &app, app.theme()));
         // Popup interior on a 100x30 frame (popup is 60x16 centered).
         assert_eq!(buffer[(50, 15)].bg, Theme::latte().base);
     }
@@ -658,11 +618,8 @@ mod tests {
     /// verify a live `:theme latte` swap actually recolors the frame.
     #[test]
     fn live_theme_swap_recolors_the_frame() {
-        let top_bar_bg = |app: &App| {
-            let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
-            terminal.draw(|f| view(f, app, app.theme())).unwrap();
-            terminal.backend().buffer()[(0, 0)].bg
-        };
+        let top_bar_bg =
+            |app: &App| render_buffer(100, 30, |f| view(f, app, app.theme()))[(0, 0)].bg;
 
         let mut app = App::new(None);
         assert_eq!(top_bar_bg(&app), Theme::frappe().mantle);

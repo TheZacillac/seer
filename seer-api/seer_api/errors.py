@@ -11,14 +11,19 @@ Two responsibilities:
    the exception and pick the right HTTP status code. Callers that
    previously hardcoded 500 should use ``http_error`` so upstream
    transients (timeout, connection) surface as 504/502 rather than 500.
+   Route handlers wrap their core call in ``as_http``, which applies it.
 """
 
 from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Awaitable
+from typing import TypeVar
 
 from fastapi import HTTPException
+
+T = TypeVar("T")
 
 logger = logging.getLogger("seer_api")
 
@@ -87,3 +92,16 @@ def http_error(exc: Exception, message: str = "Request failed") -> HTTPException
         status_code=http_status_for(exc),
         detail=safe_error_message(exc, message),
     )
+
+
+async def as_http(call: Awaitable[T], message: str) -> T:
+    """Await a handler's core call, re-raising any failure via :func:`http_error`.
+
+    Pass the un-awaited ``run_seer(...)`` / ``stream_bulk(...)`` coroutine.
+    Keep SSRF guards outside the call: their ``HTTPException(400)`` must not
+    be remapped to a 500 here.
+    """
+    try:
+        return await call
+    except Exception as e:
+        raise http_error(e, message) from e

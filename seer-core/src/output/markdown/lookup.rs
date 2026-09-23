@@ -2,8 +2,6 @@ use super::*;
 
 impl MarkdownFormatter {
     pub(super) fn format_lookup(&self, result: &LookupResult) -> String {
-        let mut output = Vec::new();
-
         let domain = result
             .domain_name()
             .unwrap_or_else(|| "Unknown".to_string());
@@ -13,255 +11,85 @@ impl MarkdownFormatter {
             LookupResult::Available { .. } => "availability",
         };
 
-        output.push(format!("## Lookup: {}", MdSafe(&domain)));
-        output.push(String::new());
-        output.push(format!("- **Source**: {}", source));
+        let mut output = vec![format!("## Lookup: {}", MdSafe(&domain)), String::new()];
+        let mut b = Bullets(&mut output);
+        b.raw("Source", source);
 
         match result {
             LookupResult::Rdap {
                 data,
                 whois_fallback,
             } => {
-                if let Some(registrar) = data.get_registrar() {
-                    output.push(format!("- **Registrar**: {}", MdSafe(&registrar)));
-                }
-                if let Some(registrant) = data.get_registrant() {
-                    output.push(format!("- **Registrant**: {}", MdSafe(&registrant)));
-                }
-                if let Some(organization) = data.get_registrant_organization() {
-                    output.push(format!("- **Organization**: {}", MdSafe(&organization)));
-                }
-
-                if let Some(created) = data.creation_date() {
-                    output.push(format!("- **Created**: `{}`", created.format("%Y-%m-%d")));
-                }
-                if let Some(expires) = data.expiration_date() {
-                    let days_until = days_until(expires);
-                    output.push(format!(
-                        "- **Expires**: `{}` ({} days)",
-                        expires.format("%Y-%m-%d"),
-                        days_until
-                    ));
-                }
-
-                if !data.status.is_empty() {
-                    output.push(format!(
-                        "- **Status**: {}",
-                        data.status
-                            .iter()
-                            .map(|s| format!("`{}`", MdSafe(s)))
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ));
-                }
-
-                let nameservers = data.nameserver_names();
-                if !nameservers.is_empty() {
-                    output.push(format!(
-                        "- **Nameservers**: {}",
-                        nameservers
-                            .iter()
-                            .map(|ns| format!("`{}`", MdSafe(ns)))
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ));
-                }
-
+                b.opt("Registrar", &data.get_registrar());
+                b.opt("Registrant", &data.get_registrant());
+                b.opt("Organization", &data.get_registrant_organization());
+                b.date("Created", data.creation_date());
+                b.expires(data.expiration_date());
+                b.code_list("Status", &data.status);
+                b.code_list("Nameservers", &data.nameserver_names());
                 if data.is_dnssec_signed() {
-                    output.push("- **DNSSEC**: signed".to_string());
+                    b.raw("DNSSEC", "signed");
                 }
 
                 // Contact sections from RDAP — after every domain-level
                 // bullet, since a `###` heading scopes everything below it.
-                if let Some(contact) = data.get_registrant_contact() {
-                    self.format_rdap_contact(&mut output, "Registrant Contact", &contact);
-                }
-                if let Some(contact) = data.get_admin_contact() {
-                    self.format_rdap_contact(&mut output, "Admin Contact", &contact);
-                }
-                if let Some(contact) = data.get_tech_contact() {
-                    self.format_rdap_contact(&mut output, "Tech Contact", &contact);
-                }
+                let infos = contact::rdap_contacts(data);
+                let rdap_contacts = contact::rdap_views(&infos);
+                b.contacts(rdap_contacts);
 
-                // WHOIS fallback data: bullets first, then any fallback
-                // contact sections (same heading-scope rule as above).
+                // WHOIS fallback data, limited to what RDAP didn't show:
+                // bullets first, then any fallback contact sections (same
+                // heading-scope rule as above).
                 if let Some(whois) = whois_fallback {
                     let mut extra = Vec::new();
-                    let mut contacts = Vec::new();
-
+                    let mut fill = Bullets(&mut extra);
                     if data.get_registrant().is_none() {
-                        if let Some(ref registrant) = whois.registrant {
-                            extra.push(format!("- **Registrant**: {}", MdSafe(registrant)));
-                        }
+                        fill.opt("Registrant", &whois.registrant);
                     }
                     if data.get_registrant_organization().is_none() {
-                        if let Some(ref org) = whois.organization {
-                            extra.push(format!("- **Organization**: {}", MdSafe(org)));
-                        }
+                        fill.opt("Organization", &whois.organization);
                     }
-
-                    // Registrant contact from WHOIS fallback
-                    let rdap_has_registrant = data
-                        .get_registrant_contact()
-                        .as_ref()
-                        .is_some_and(|c| c.has_info());
-                    if !rdap_has_registrant {
-                        let has_whois_contact = whois.registrant_email.is_some()
-                            || whois.registrant_phone.is_some()
-                            || whois.registrant_address.is_some()
-                            || whois.registrant_country.is_some();
-                        if has_whois_contact {
-                            contacts.push(String::new());
-                            contacts.push("### Registrant Contact".to_string());
-                            contacts.push(String::new());
-                            if let Some(ref email) = whois.registrant_email {
-                                contacts.push(format!("- **Email**: `{}`", MdSafe(email)));
-                            }
-                            if let Some(ref phone) = whois.registrant_phone {
-                                contacts.push(format!("- **Phone**: {}", MdSafe(phone)));
-                            }
-                            if let Some(ref address) = whois.registrant_address {
-                                contacts.push(format!("- **Address**: {}", MdSafe(address)));
-                            }
-                            if let Some(ref country) = whois.registrant_country {
-                                contacts.push(format!("- **Country**: {}", MdSafe(country)));
-                            }
-                        }
-                    }
-
-                    // Admin contact from WHOIS fallback
-                    let rdap_has_admin = data.get_admin_contact().is_some_and(|c| c.has_info());
-                    if !rdap_has_admin {
-                        let has_whois_admin = whois.admin_name.is_some()
-                            || whois.admin_email.is_some()
-                            || whois.admin_phone.is_some();
-                        if has_whois_admin {
-                            contacts.push(String::new());
-                            contacts.push("### Admin Contact".to_string());
-                            contacts.push(String::new());
-                            if let Some(ref name) = whois.admin_name {
-                                contacts.push(format!("- **Name**: {}", MdSafe(name)));
-                            }
-                            if let Some(ref org) = whois.admin_organization {
-                                contacts.push(format!("- **Organization**: {}", MdSafe(org)));
-                            }
-                            if let Some(ref email) = whois.admin_email {
-                                contacts.push(format!("- **Email**: `{}`", MdSafe(email)));
-                            }
-                            if let Some(ref phone) = whois.admin_phone {
-                                contacts.push(format!("- **Phone**: {}", MdSafe(phone)));
-                            }
-                        }
-                    }
-
-                    // Tech contact from WHOIS fallback
-                    let rdap_has_tech = data.get_tech_contact().is_some_and(|c| c.has_info());
-                    if !rdap_has_tech {
-                        let has_whois_tech = whois.tech_name.is_some()
-                            || whois.tech_email.is_some()
-                            || whois.tech_phone.is_some();
-                        if has_whois_tech {
-                            contacts.push(String::new());
-                            contacts.push("### Tech Contact".to_string());
-                            contacts.push(String::new());
-                            if let Some(ref name) = whois.tech_name {
-                                contacts.push(format!("- **Name**: {}", MdSafe(name)));
-                            }
-                            if let Some(ref org) = whois.tech_organization {
-                                contacts.push(format!("- **Organization**: {}", MdSafe(org)));
-                            }
-                            if let Some(ref email) = whois.tech_email {
-                                contacts.push(format!("- **Email**: `{}`", MdSafe(email)));
-                            }
-                            if let Some(ref phone) = whois.tech_phone {
-                                contacts.push(format!("- **Phone**: {}", MdSafe(phone)));
-                            }
-                        }
-                    }
-
-                    if let Some(updated) = whois.updated_date {
-                        extra.push(format!("- **Updated**: `{}`", updated.format("%Y-%m-%d")));
-                    }
-
+                    fill.date("Updated", whois.updated_date);
                     if !data.is_dnssec_signed() {
-                        if let Some(ref dnssec) = whois.dnssec {
-                            extra.push(format!("- **DNSSEC**: {}", MdSafe(dnssec)));
+                        fill.opt("DNSSEC", &whois.dnssec);
+                    }
+                    if !whois.whois_server.is_empty() {
+                        fill.code("WHOIS Server", &whois.whois_server);
+                    }
+                    let fallback = contact::ROLES
+                        .into_iter()
+                        .zip(rdap_contacts)
+                        .zip(whois.contacts());
+                    for ((role, rdap), whois_contact) in fallback {
+                        if rdap.is_empty() {
+                            fill.contact(role, whois_contact);
                         }
                     }
 
-                    if !whois.whois_server.is_empty() {
-                        extra.push(format!(
-                            "- **WHOIS Server**: `{}`",
-                            MdSafe(&whois.whois_server)
-                        ));
-                    }
-
-                    if !extra.is_empty() || !contacts.is_empty() {
-                        output.push(String::new());
-                        output.push("### Additional WHOIS Data".to_string());
-                        output.push(String::new());
+                    if !extra.is_empty() {
+                        output.extend([
+                            String::new(),
+                            "### Additional WHOIS Data".to_string(),
+                            String::new(),
+                        ]);
                         output.extend(extra);
-                        output.extend(contacts);
                     }
                 }
             }
             LookupResult::Whois {
                 data, rdap_error, ..
             } => {
-                if let Some(ref error) = rdap_error {
-                    output.push(format!("- **RDAP Error**: {}", MdSafe(error)));
-                }
-
-                if let Some(ref registrar) = data.registrar {
-                    output.push(format!("- **Registrar**: {}", MdSafe(registrar)));
-                }
-                if let Some(ref registrant) = data.registrant {
-                    output.push(format!("- **Registrant**: {}", MdSafe(registrant)));
-                }
-                if let Some(ref organization) = data.organization {
-                    output.push(format!("- **Organization**: {}", MdSafe(organization)));
-                }
-
-                if let Some(created) = data.creation_date {
-                    output.push(format!("- **Created**: `{}`", created.format("%Y-%m-%d")));
-                }
-                if let Some(expires) = data.expiration_date {
-                    let days_until = days_until(expires);
-                    output.push(format!(
-                        "- **Expires**: `{}` ({} days)",
-                        expires.format("%Y-%m-%d"),
-                        days_until
-                    ));
-                }
-
-                if !data.status.is_empty() {
-                    output.push(format!(
-                        "- **Status**: {}",
-                        data.status
-                            .iter()
-                            .map(|s| format!("`{}`", MdSafe(s)))
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ));
-                }
-
-                if !data.nameservers.is_empty() {
-                    output.push(format!(
-                        "- **Nameservers**: {}",
-                        data.nameservers
-                            .iter()
-                            .map(|ns| format!("`{}`", MdSafe(ns)))
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ));
-                }
-
-                if let Some(ref dnssec) = data.dnssec {
-                    output.push(format!("- **DNSSEC**: {}", MdSafe(dnssec)));
-                }
-
+                b.opt("RDAP Error", rdap_error);
+                b.opt("Registrar", &data.registrar);
+                b.opt("Registrant", &data.registrant);
+                b.opt("Organization", &data.organization);
+                b.date("Created", data.creation_date);
+                b.expires(data.expiration_date);
+                b.code_list("Status", &data.status);
+                b.code_list("Nameservers", &data.nameservers);
+                b.opt("DNSSEC", &data.dnssec);
                 // Contact subsections last, after every domain-level bullet.
-                self.format_whois_contacts(&mut output, data);
+                b.contacts(data.contacts());
             }
             LookupResult::Available {
                 data,
@@ -281,52 +109,33 @@ impl MarkdownFormatter {
                     "likely_registered" => "LIKELY REGISTERED",
                     _ => "UNKNOWN",
                 };
-                output.push(format!("- **Verdict**: {}", verdict));
-                output.push(format!("- **Confidence**: {}", data.confidence));
-                output.push(format!("- **Method**: {}", data.method));
-                if let Some(ref details) = data.details {
-                    output.push(format!("- **Details**: {}", MdSafe(details)));
-                }
+                b.raw("Verdict", verdict);
+                b.raw("Confidence", &data.confidence);
+                b.raw("Method", &data.method);
+                b.opt("Details", &data.details);
                 if !rdap_error.is_empty() {
-                    output.push(format!("- **RDAP Error**: {}", MdSafe(rdap_error)));
+                    b.text("RDAP Error", rdap_error);
                 }
                 if !whois_error.is_empty() {
-                    output.push(format!("- **WHOIS Error**: {}", MdSafe(whois_error)));
+                    b.text("WHOIS Error", whois_error);
                 }
 
                 if let Some(w) = whois_data {
-                    let mut bullets = Vec::new();
-                    if !w.nameservers.is_empty() {
-                        bullets.push(format!(
-                            "- **Nameservers**: {}",
-                            w.nameservers
-                                .iter()
-                                .map(|ns| format!("`{}`", MdSafe(ns)))
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        ));
-                    }
-                    if !w.status.is_empty() {
-                        bullets.push(format!(
-                            "- **Status**: {}",
-                            w.status
-                                .iter()
-                                .map(|s| format!("`{}`", MdSafe(s)))
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        ));
-                    }
-                    if let Some(ref dnssec) = w.dnssec {
-                        bullets.push(format!("- **DNSSEC**: {}", MdSafe(dnssec)));
-                    }
+                    let mut extra = Vec::new();
+                    let mut fill = Bullets(&mut extra);
+                    fill.code_list("Nameservers", &w.nameservers);
+                    fill.code_list("Status", &w.status);
+                    fill.opt("DNSSEC", &w.dnssec);
                     if !w.whois_server.is_empty() {
-                        bullets.push(format!("- **WHOIS Server**: `{}`", MdSafe(&w.whois_server)));
+                        fill.code("WHOIS Server", &w.whois_server);
                     }
-                    if !bullets.is_empty() {
-                        output.push(String::new());
-                        output.push("### Additional WHOIS data".to_string());
-                        output.push(String::new());
-                        output.extend(bullets);
+                    if !extra.is_empty() {
+                        output.extend([
+                            String::new(),
+                            "### Additional WHOIS data".to_string(),
+                            String::new(),
+                        ]);
+                        output.extend(extra);
                     }
                 }
             }
@@ -339,22 +148,20 @@ impl MarkdownFormatter {
         &self,
         result: &crate::availability::AvailabilityResult,
     ) -> String {
-        let mut output = Vec::new();
-
-        output.push(format!("## Availability: {}", MdSafe(&result.domain)));
-        output.push(String::new());
-
-        let avail_str = if result.available {
+        let mut output = vec![
+            format!("## Availability: {}", MdSafe(&result.domain)),
+            String::new(),
+        ];
+        let mut b = Bullets(&mut output);
+        let verdict = if result.available {
             "**AVAILABLE**"
         } else {
             "**TAKEN**"
         };
-        output.push(format!("- **Result**: {}", avail_str));
-        output.push(format!("- **Confidence**: {}", result.confidence));
-        output.push(format!("- **Method**: {}", result.method));
-        if let Some(ref details) = result.details {
-            output.push(format!("- **Details**: {}", MdSafe(details)));
-        }
+        b.raw("Result", verdict);
+        b.raw("Confidence", &result.confidence);
+        b.raw("Method", &result.method);
+        b.opt("Details", &result.details);
 
         output.join("\n")
     }
@@ -410,6 +217,30 @@ mod tests {
             "must not render AVAILABLE for a registered domain:\n{}",
             out
         );
+    }
+
+    #[test]
+    fn format_lookup_whois_fallback_keeps_organization_only_contacts() {
+        // Mirror of the human regression: an organization-only WHOIS
+        // admin/tech contact was dropped from the RDAP-with-fallback view.
+        let mut whois = WhoisResponse::parse("example.com", "whois.test", "Registrar: R\n");
+        whois.admin_organization = Some("Admin Org LLC".to_string());
+        whois.tech_organization = Some("Tech Org LLC".to_string());
+        let rdap: RdapResponse =
+            serde_json::from_value(serde_json::json!({"ldhName": "example.com"})).unwrap();
+        let result = LookupResult::Rdap {
+            data: Box::new(rdap),
+            whois_fallback: Some(whois),
+        };
+        let out = MarkdownFormatter::new().format_lookup(&result);
+        for needle in [
+            "### Admin Contact",
+            "- **Organization**: Admin Org LLC",
+            "### Tech Contact",
+            "- **Organization**: Tech Org LLC",
+        ] {
+            assert!(out.contains(needle), "missing {needle:?}:\n{out}");
+        }
     }
 
     /// Asserts every `fields` bullet appears in `out` before `heading`.

@@ -1,0 +1,120 @@
+---
+source: seer-core/tests/format_snapshots.rs
+expression: json ().format_lookup (& fixture_lookup_rdap_with_whois_fallback())
+---
+{
+  "source": "rdap",
+  "data": {
+    "objectClassName": "domain",
+    "handle": "2336799_DOMAIN_COM-VRSN",
+    "ldhName": "EXAMPLE.COM",
+    "unicodeName": null,
+    "status": [
+      "client transfer prohibited",
+      "server delete prohibited"
+    ],
+    "events": [
+      {
+        "eventAction": "registration",
+        "eventDate": "2010-03-15T04:00:00Z",
+        "eventActor": null
+      },
+      {
+        "eventAction": "last changed",
+        "eventDate": "2024-02-01T09:30:00Z",
+        "eventActor": null
+      },
+      {
+        "eventAction": "expiration",
+        "eventDate": "2099-03-15T04:00:00Z",
+        "eventActor": null
+      }
+    ],
+    "entities": [
+      {
+        "objectClassName": "entity",
+        "handle": "MOCK-REGISTRAR",
+        "roles": [
+          "registrar"
+        ],
+        "publicIds": [],
+        "vcardArray": [
+          "vcard",
+          [
+            [
+              "fn",
+              {},
+              "text",
+              "Mock Registrar Inc."
+            ]
+          ]
+        ],
+        "entities": [],
+        "remarks": [],
+        "links": [],
+        "events": [],
+        "status": []
+      }
+    ],
+    "nameservers": [
+      {
+        "objectClassName": "nameserver",
+        "ldhName": "NS1.EXAMPLE.COM",
+        "unicodeName": null,
+        "ipAddresses": null,
+        "status": [],
+        "links": []
+      },
+      {
+        "objectClassName": "nameserver",
+        "ldhName": "NS2.EXAMPLE.COM",
+        "unicodeName": null,
+        "ipAddresses": null,
+        "status": [],
+        "links": []
+      }
+    ],
+    "secureDNS": null,
+    "links": [],
+    "remarks": [],
+    "notices": [],
+    "port43": null,
+    "startAddress": null,
+    "endAddress": null,
+    "ipVersion": null,
+    "name": null,
+    "type": null,
+    "country": null,
+    "parentHandle": null,
+    "startAutnum": null,
+    "endAutnum": null
+  },
+  "whois_fallback": {
+    "domain": "example.com",
+    "registrar": "Mock Registrar Inc.",
+    "registrant": "Jane Registrant",
+    "organization": "Example Holdings LLC",
+    "registrant_email": "owner@example.com",
+    "registrant_phone": "+1.5555550100",
+    "registrant_address": "1 Main St, Springfield",
+    "registrant_country": "US",
+    "admin_name": "Alex Admin",
+    "admin_organization": "Example Holdings LLC",
+    "admin_email": "admin@example.com",
+    "admin_phone": "+1.5555550101",
+    "tech_name": "Terry Tech",
+    "tech_email": "tech@example.com",
+    "creation_date": "2010-03-15T04:00:00Z",
+    "expiration_date": "2099-03-15T04:00:00Z",
+    "updated_date": "2024-02-01T09:30:00Z",
+    "nameservers": [
+      "ns1.example.com",
+      "ns2.example.com"
+    ],
+    "status": [
+      "clientTransferProhibited"
+    ],
+    "dnssec": "signedDelegation",
+    "whois_server": "whois.verisign-grs.com"
+  }
+}

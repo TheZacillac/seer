@@ -6,16 +6,9 @@
 map), so its end-to-end test is live-gated per repo convention.
 """
 
-import os
-
 import pytest
 
 import seer
-
-_LIVE = pytest.mark.skipif(
-    os.environ.get("SEER_LIVE_TESTS") != "1",
-    reason="live network test; set SEER_LIVE_TESTS=1 to enable",
-)
 
 
 def test_all_tlds_returns_embedded_catalog():
@@ -31,7 +24,7 @@ def test_all_tlds_returns_embedded_catalog():
     assert len(tlds) == len(set(tlds))
 
 
-@_LIVE
+@pytest.mark.live
 def test_tld_info_com_has_embedded_and_bootstrap_data():
     info = seer.tld_info("com")
     assert info["tld"] == "com"
@@ -42,7 +35,7 @@ def test_tld_info_com_has_embedded_and_bootstrap_data():
     assert info["rdap_url"] and info["rdap_url"].startswith("https://")
 
 
-@_LIVE
+@pytest.mark.live
 def test_tld_info_normalizes_dot_and_case():
     info = seer.tld_info(".COM")
     assert info["tld"] == "com"

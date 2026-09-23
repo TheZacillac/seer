@@ -8,17 +8,14 @@ every additional worker would pile up behind the GIL. These tests run
 the operation still completes in bounded time.
 """
 
-import os
 import time
 
 import pytest
 
 import seer
 
-LIVE = os.environ.get("SEER_LIVE_TESTS") == "1"
 
-
-@pytest.mark.skipif(not LIVE, reason="live network test (set SEER_LIVE_TESTS=1)")
+@pytest.mark.live
 def test_bulk_with_slow_callback_completes():
     """A slow progress callback must not deadlock the bulk run."""
     progress = []

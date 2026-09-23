@@ -13,7 +13,7 @@ use seer_core::TakeoverVerdict;
 
 use crate::tui::action::LensData;
 use crate::tui::theme::Theme;
-use crate::tui::widgets::{panel, scroll_to};
+use crate::tui::widgets::{or_dash, panel, row_style, scroll_to};
 
 fn verdict_tone(v: TakeoverVerdict) -> &'static str {
     match v {
@@ -56,9 +56,7 @@ pub fn render(
         "Takeover · {} checked · {} vulnerable · {} potential",
         t.hosts_checked, t.vulnerable, t.potential
     );
-    let block = panel::block(theme, &title, accent, focused);
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let inner = panel::render(f, area, theme, &title, accent, focused);
 
     if t.findings.is_empty() {
         let msg = if t.hosts_checked == 0 {
@@ -90,26 +88,18 @@ pub fn render(
         .style(Style::default().fg(theme.overlay0));
 
     let rows = t.findings.iter().enumerate().map(|(i, finding)| {
-        let base = if focused && i == sel {
-            Style::default().fg(theme.text).bg(theme.surface0)
-        } else {
-            Style::default().fg(theme.text)
-        };
+        let base = row_style(theme, focused && i == sel);
         Row::new(vec![
             Span::styled(finding.host.clone(), base),
             Span::styled(
                 verdict_label(finding.verdict).to_string(),
                 base.fg(theme.tone(verdict_tone(finding.verdict))),
             ),
-            Span::styled(finding.provider.clone().unwrap_or_else(|| "—".into()), base),
+            Span::styled(or_dash(finding.provider.as_deref()), base),
             // Evidence is the matched fingerprint on a confirmed finding; the
             // probe note explains why an unconfirmed one could not be settled.
             Span::styled(
-                finding
-                    .evidence
-                    .clone()
-                    .or_else(|| finding.probe_note.clone())
-                    .unwrap_or_else(|| "—".into()),
+                or_dash(finding.evidence.as_ref().or(finding.probe_note.as_ref())),
                 base.fg(theme.subtext),
             ),
         ])
@@ -147,8 +137,7 @@ pub fn render(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::backend::TestBackend;
-    use ratatui::Terminal;
+    use crate::tui::test_util::{render_buffer, render_lines};
     use seer_core::{TakeoverFinding, TakeoverReport};
 
     fn finding(host: &str, verdict: TakeoverVerdict) -> TakeoverFinding {
@@ -185,23 +174,9 @@ mod tests {
         }
     }
 
-    fn buf_text(data: &LensData, w: u16, h: u16, focused: bool, sel: usize) -> String {
+    fn render_to_text(data: &LensData, w: u16, h: u16, focused: bool, sel: usize) -> String {
         let theme = Theme::frappe();
-        let backend = TestBackend::new(w, h);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| render(f, f.area(), &theme, data, focused, sel))
-            .unwrap();
-        let buf = terminal.backend().buffer();
-        let a = buf.area();
-        let mut s = String::new();
-        for y in 0..a.height {
-            for x in 0..a.width {
-                s.push_str(buf[(x, y)].symbol());
-            }
-            s.push('\n');
-        }
-        s
+        render_lines(w, h, |f| render(f, f.area(), &theme, data, focused, sel))
     }
 
     #[test]
@@ -210,7 +185,7 @@ mod tests {
             "gone.example.com",
             TakeoverVerdict::Vulnerable,
         )])));
-        let s = buf_text(&data, 110, 10, false, 0);
+        let s = render_to_text(&data, 110, 10, false, 0);
         assert!(s.contains("gone.example.com"), "got: {s}");
         assert!(s.contains("VULNERABLE"), "got: {s}");
         // The evidence is what makes the claim auditable — it must reach the UI.
@@ -223,7 +198,7 @@ mod tests {
             finding("a.example.com", TakeoverVerdict::Vulnerable),
             finding("b.example.com", TakeoverVerdict::Potential),
         ])));
-        let s = buf_text(&data, 110, 10, false, 0);
+        let s = render_to_text(&data, 110, 10, false, 0);
         assert!(s.contains("12 checked"), "got: {s}");
         assert!(s.contains("1 vulnerable"), "got: {s}");
         assert!(s.contains("1 potential"), "got: {s}");
@@ -232,7 +207,7 @@ mod tests {
     #[test]
     fn clean_scan_reports_hosts_checked_not_an_empty_table() {
         let data = LensData::Takeover(Box::new(report(vec![])));
-        let s = buf_text(&data, 80, 8, false, 0);
+        let s = render_to_text(&data, 80, 8, false, 0);
         assert!(
             s.contains("no takeover signals across 12 host(s)"),
             "got: {s}"
@@ -243,7 +218,7 @@ mod tests {
     fn skipped_hosts_are_surfaced() {
         let mut r = report(vec![finding("a.example.com", TakeoverVerdict::Potential)]);
         r.hosts_skipped = 37;
-        let s = buf_text(&LensData::Takeover(Box::new(r)), 100, 10, false, 0);
+        let s = render_to_text(&LensData::Takeover(Box::new(r)), 100, 10, false, 0);
         assert!(s.contains("37 host(s) exceeded the scan cap"), "got: {s}");
     }
 
@@ -253,7 +228,7 @@ mod tests {
             .map(|i| finding(&format!("h{i}.example.com"), TakeoverVerdict::Potential))
             .collect();
         let data = LensData::Takeover(Box::new(report(findings)));
-        let s = buf_text(&data, 100, 10, true, 59);
+        let s = render_to_text(&data, 100, 10, true, 59);
         assert!(
             s.contains("h59.example.com"),
             "selecting the last row must scroll it into view: {s}"
@@ -272,11 +247,7 @@ mod tests {
     #[test]
     fn wrong_payload_variant_renders_nothing() {
         let theme = Theme::frappe();
-        let backend = TestBackend::new(40, 6);
-        let mut terminal = Terminal::new(backend).unwrap();
         let data = LensData::History(vec![]);
-        terminal
-            .draw(|f| render(f, f.area(), &theme, &data, false, 0))
-            .unwrap();
+        render_buffer(40, 6, |f| render(f, f.area(), &theme, &data, false, 0));
     }
 }

@@ -18,14 +18,11 @@ would make the test flaky.
 
 from __future__ import annotations
 
-import os
 import threading
 
 import pytest
 
 import seer
-
-LIVE = os.environ.get("SEER_LIVE_TESTS") == "1"
 
 
 def test_cancel_follow_is_safe_on_fresh_process():
@@ -36,7 +33,7 @@ def test_cancel_follow_is_safe_on_fresh_process():
     seer.cancel_follow()
 
 
-@pytest.mark.skipif(not LIVE, reason="live network test (set SEER_LIVE_TESTS=1)")
+@pytest.mark.live
 def test_concurrent_dns_follow_is_rejected():
     """A second `dns_follow` started while one is running must be rejected
     with a RuntimeError mentioning 'already running', rather than silently

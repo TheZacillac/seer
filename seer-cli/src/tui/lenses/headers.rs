@@ -27,16 +27,6 @@ fn verdict_tone(v: HeaderVerdict) -> &'static str {
     }
 }
 
-fn verdict_label(v: HeaderVerdict) -> &'static str {
-    match v {
-        HeaderVerdict::Strict => "strict",
-        HeaderVerdict::Moderate => "moderate",
-        HeaderVerdict::Weak => "weak",
-        HeaderVerdict::Present => "present",
-        HeaderVerdict::Absent => "absent",
-    }
-}
-
 /// Grade band → tone. A/A+ pass, B/C partial, D and below fail.
 fn grade_tone(grade: &str) -> &'static str {
     match grade {
@@ -50,9 +40,7 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
     let LensData::Headers(h) = data else { return };
 
     let title = format!("HTTP Headers · {} · {}/100", h.grade, h.score);
-    let block = panel::block(theme, &title, theme.mauve, false);
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let inner = panel::render(f, area, theme, &title, theme.mauve, false);
 
     let cookie_rows = if h.cookies.is_empty() { 0 } else { 1 };
     // Advisories get whatever vertical space is left, so a long list scrolls
@@ -100,7 +88,7 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
         .headers
         .iter()
         .map(|finding| {
-            let label = verdict_label(finding.verdict);
+            let label = finding.verdict.as_str();
             let used = finding.header.chars().count() + label.chars().count() + 2;
             let dots = width.saturating_sub(used).max(1);
             Line::from(vec![
@@ -154,8 +142,7 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::backend::TestBackend;
-    use ratatui::Terminal;
+    use crate::tui::test_util::{render_buffer, render_lines};
     use seer_core::{CookieFinding, Disclosure, HeaderFinding, HeaderReport};
 
     fn finding(header: &str, verdict: HeaderVerdict) -> HeaderFinding {
@@ -199,21 +186,7 @@ mod tests {
 
     fn render_to_text(data: &LensData, width: u16, height: u16) -> String {
         let theme = Theme::frappe();
-        let backend = TestBackend::new(width, height);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| render(f, f.area(), &theme, data))
-            .unwrap();
-        let buf = terminal.backend().buffer();
-        let a = buf.area();
-        let mut s = String::new();
-        for y in 0..a.height {
-            for x in 0..a.width {
-                s.push_str(buf[(x, y)].symbol());
-            }
-            s.push('\n');
-        }
-        s
+        render_lines(width, height, |f| render(f, f.area(), &theme, data))
     }
 
     #[test]
@@ -268,12 +241,8 @@ mod tests {
         // The dispatch in lenses::render is keyed by lens, not by payload, so
         // a mismatched variant must be a no-op rather than a panic.
         let theme = Theme::frappe();
-        let backend = TestBackend::new(40, 6);
-        let mut terminal = Terminal::new(backend).unwrap();
         let data = LensData::History(vec![]);
-        terminal
-            .draw(|f| render(f, f.area(), &theme, &data))
-            .unwrap();
+        render_buffer(40, 6, |f| render(f, f.area(), &theme, &data));
     }
 
     #[test]

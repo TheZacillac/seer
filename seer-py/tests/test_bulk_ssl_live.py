@@ -1,16 +1,11 @@
 """Live-network test for seer.bulk_ssl. Opt-in via SEER_LIVE_TESTS=1."""
 
-import os
-
 import pytest
 
 import seer
 
 
-@pytest.mark.skipif(
-    os.environ.get("SEER_LIVE_TESTS") != "1",
-    reason="live network test; set SEER_LIVE_TESTS=1 to enable",
-)
+@pytest.mark.live
 def test_bulk_ssl_cloudflare_chain_non_empty():
     results = seer.bulk_ssl(["cloudflare.com"])
     assert len(results) == 1

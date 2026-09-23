@@ -16,22 +16,11 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Line tables keep file:line in backtraces but skip full DWARF: ~15% less
+  # test-build CPU and a ~40% smaller target/ (local debug builds unaffected).
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 jobs:
-  check:
-    name: Check
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo check --workspace
-      # The `otel` feature is optional and off by default, so the line above
-      # never compiles it. Check it explicitly so the OpenTelemetry integration
-      # (and its dependency bumps) can't silently break.
-      - name: Check optional features (otel)
-        run: cargo check -p seer-core --features otel
-
   fmt:
     name: Format
     runs-on: ubuntu-latest
@@ -51,9 +40,20 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      # --all-targets lints tests/benches too (clippy.toml allows unwrap in
-      # tests, so this stays signal-rich rather than noisy).
+      # Clippy type-checks everything `cargo check --workspace` would, so there
+      # is no separate check job. --all-targets lints tests/benches too
+      # (clippy.toml allows unwrap in tests, so this stays signal-rich rather
+      # than noisy).
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      # The `otel` feature is optional and off by default, so the line above
+      # never compiles it. Lint it explicitly so the OpenTelemetry integration
+      # (and its dependency bumps) can't silently break.
+      - name: Clippy (otel feature)
+        run: cargo clippy -p seer-core --features otel --all-targets -- -D warnings
+      # seer-py depends on seer-core without the default `cli` feature, so lint
+      # that slim build too — otherwise the feature gate could silently rot.
+      - name: Clippy (seer-core without the cli feature)
+        run: cargo clippy -p seer-core --no-default-features --all-targets -- -D warnings
 
   test:
     name: Test
@@ -84,7 +84,12 @@ jobs:
         run: |
           pip install ruff
           ruff check seer-py/python seer-py/tests seer-api
+      # Dev profile: the release profile's fat LTO + codegen-units=1 roughly
+      # triples this build, and the pytest suite doesn't need optimized code.
+      # Published wheels are still built with the release profile.
       - name: Build and install seer-py (PEP 517 via maturin)
+        env:
+          MATURIN_PEP517_ARGS: --profile dev
         run: pip install './seer-py[dev]'
       - name: Install seer-api
         run: pip install -e './seer-api[dev]'
@@ -124,10 +129,8 @@ jobs:
         run: cargo llvm-cov --workspace --no-report
       - name: Print summary
         run: cargo llvm-cov report --summary-only
-      - name: Generate HTML + lcov reports
-        run: |
-          cargo llvm-cov report --html
-          cargo llvm-cov report --lcov --output-path lcov.info
+      - name: Generate HTML report
+        run: cargo llvm-cov report --html
       - name: Upload HTML report
         uses: actions/upload-artifact@v7
         with:
@@ -135,30 +138,15 @@ jobs:
           path: target/llvm-cov/html/
           if-no-files-found: error
 
-  audit:
-    name: Security Audit
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      # Install a prebuilt cargo-audit binary rather than compiling it from
-      # source on every run. rustsec/audit-check did `cargo install
-      # cargo-audit` with an unlocked resolution, so a broken release of any
-      # transitive dependency (tinyvec 1.13.0 on 2026-09-03, which fails to
-      # build) turned the job red with no change on our side. The prebuilt
-      # binary is built against a locked tree, so only cargo-audit's own
-      # releases can move it.
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-audit
-      - run: cargo audit
-
   deny:
     name: Supply Chain (cargo-deny)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      # Gates the dependency tree against deny.toml: RUSTSEC advisories,
-      # the explicit license allow-list, wildcard/duplicate version bans,
-      # and crates.io-only sources. Complements the rustsec `audit` job
-      # (which only covers advisories) with license + provenance policy.
+      # Gates the dependency tree against deny.toml: RUSTSEC advisories
+      # (vulnerable, unsound and unmaintained are all errors, across every
+      # feature), the explicit license allow-list, wildcard/duplicate version
+      # bans, and crates.io-only sources. This is the only advisory gate:
+      # cargo-audit reads the same RustSec DB with weaker defaults (it only
+      # warns on unsound/unmaintained), so a separate audit job adds nothing.
       - uses: EmbarkStudios/cargo-deny-action@v2

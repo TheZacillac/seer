@@ -1,6 +1,6 @@
 //! DNS Records lens — Records tab (tab 0), DNSSEC tab (tab 1), Compare tab (tab 2).
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Row, Table};
 use ratatui::Frame;
@@ -9,7 +9,7 @@ use crate::tui::action::LensData;
 use crate::tui::lenses::{compare, dnssec};
 use crate::tui::panes::Panes;
 use crate::tui::theme::Theme;
-use crate::tui::widgets::{panel, scroll_to};
+use crate::tui::widgets::{panel, row_style, scroll_to};
 
 /// Nameserver labels matching `panes/dns.rs` NAMESERVERS order.
 const NS_LABELS: &[&str] = &["system", "8.8.8.8", "1.1.1.1"];
@@ -37,9 +37,7 @@ pub fn render(
     // Tab 0: Records
     let LensData::Dns(records) = data else { return };
     let title = format!("dig · {} records", panes.dns.record_type);
-    let block = panel::block(theme, &title, theme.sky, focused);
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let inner = panel::render(f, area, theme, &title, theme.sky, focused);
 
     // Layout: nameserver chips (1 line) + hint (1 line) + table
     let chunks = Layout::default()
@@ -80,18 +78,13 @@ pub fn render(
     let header =
         Row::new(["TYPE", "NAME", "DATA", "TTL"]).style(Style::default().fg(theme.overlay0));
     let rows = records.iter().enumerate().map(|(i, r)| {
-        let style = if focused && i == sel {
-            Style::default().fg(theme.text).bg(theme.surface0)
-        } else {
-            Style::default().fg(theme.text)
-        };
         Row::new(vec![
             r.record_type.to_string(),
             r.name.clone(),
             r.format_short(),
             r.ttl.to_string(),
         ])
-        .style(style)
+        .style(row_style(theme, focused && i == sel))
     });
     let table = Table::new(
         rows,
@@ -103,8 +96,7 @@ pub fn render(
         ],
     )
     .header(header)
-    .column_spacing(1)
-    .style(Style::default().add_modifier(Modifier::empty()));
+    .column_spacing(1);
     let mut state = scroll_to(focused.then_some(sel));
     f.render_stateful_widget(table, chunks[2], &mut state);
 }
@@ -112,21 +104,9 @@ pub fn render(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::backend::TestBackend;
-    use ratatui::Terminal;
+    use crate::tui::test_util::render_text;
     use seer_core::dns::{RecordData, RecordType};
     use seer_core::DnsRecord;
-
-    fn buf_text(buf: &ratatui::buffer::Buffer) -> String {
-        let a = buf.area();
-        let mut s = String::new();
-        for y in 0..a.height {
-            for x in 0..a.width {
-                s.push_str(buf[(x, y)].symbol());
-            }
-        }
-        s
-    }
 
     fn a_record() -> DnsRecord {
         DnsRecord {
@@ -144,12 +124,9 @@ mod tests {
         let theme = Theme::frappe();
         let data = LensData::Dns(vec![a_record()]);
         let panes = Panes::default();
-        let backend = TestBackend::new(70, 10);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| render(f, f.area(), &theme, 0, &data, false, 0, &panes))
-            .unwrap();
-        let text = buf_text(terminal.backend().buffer());
+        let text = render_text(70, 10, |f| {
+            render(f, f.area(), &theme, 0, &data, false, 0, &panes);
+        });
         assert!(text.contains("93.184.215.14"));
         assert!(text.contains("example.com"));
         assert!(text.contains("dig · A records"), "title names the type");
@@ -161,12 +138,10 @@ mod tests {
         let data = LensData::Dns(vec![]);
         let mut panes = Panes::default();
         panes.dns.record_type = RecordType::MX;
-        let backend = TestBackend::new(70, 10);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| render(f, f.area(), &theme, 0, &data, false, 0, &panes))
-            .unwrap();
-        assert!(buf_text(terminal.backend().buffer()).contains("dig · MX records"));
+        let text = render_text(70, 10, |f| {
+            render(f, f.area(), &theme, 0, &data, false, 0, &panes);
+        });
+        assert!(text.contains("dig · MX records"));
     }
 
     #[test]
@@ -174,12 +149,9 @@ mod tests {
         let theme = Theme::frappe();
         let data = LensData::Dns(vec![a_record()]);
         let panes = Panes::default();
-        let backend = TestBackend::new(70, 10);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| render(f, f.area(), &theme, 0, &data, false, 0, &panes))
-            .unwrap();
-        let text = buf_text(terminal.backend().buffer());
+        let text = render_text(70, 10, |f| {
+            render(f, f.area(), &theme, 0, &data, false, 0, &panes);
+        });
         assert!(text.contains("system"), "chip row should show 'system'");
         assert!(text.contains("8.8.8.8"), "chip row should show '8.8.8.8'");
         assert!(text.contains("1.1.1.1"), "chip row should show '1.1.1.1'");

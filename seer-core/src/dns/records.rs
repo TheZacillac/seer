@@ -281,6 +281,14 @@ impl fmt::Display for RecordData {
 }
 
 impl RecordData {
+    /// The address of an A or AAAA record; `None` for any other type.
+    pub(crate) fn address(&self) -> Option<&str> {
+        match self {
+            RecordData::A { address } | RecordData::AAAA { address } => Some(address),
+            _ => None,
+        }
+    }
+
     /// The record's value as an equality key for cross-server / cross-time
     /// comparison (compare, follow, propagation).
     ///
@@ -328,13 +336,6 @@ impl DnsRecord {
     pub fn format_short(&self) -> String {
         format!("{}", self.data)
     }
-
-    pub fn format_full(&self) -> String {
-        format!(
-            "{}\t{}\tIN\t{}\t{}",
-            self.name, self.ttl, self.record_type, self.data
-        )
-    }
 }
 
 #[cfg(test)]
@@ -369,19 +370,6 @@ mod tests {
             },
         };
         assert_eq!(record.format_short(), "1.2.3.4");
-    }
-
-    #[test]
-    fn test_dns_record_format_full() {
-        let record = DnsRecord {
-            name: "example.com".to_string(),
-            record_type: RecordType::A,
-            ttl: 300,
-            data: RecordData::A {
-                address: "1.2.3.4".to_string(),
-            },
-        };
-        assert_eq!(record.format_full(), "example.com\t300\tIN\tA\t1.2.3.4");
     }
 
     #[test]

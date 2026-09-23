@@ -2,155 +2,106 @@ use super::*;
 
 impl HumanFormatter {
     pub(super) fn format_status(&self, response: &StatusResponse) -> String {
-        let mut output = Vec::new();
-
-        output.push(self.header(&format!("Status: {}", sanitize_display(&response.domain))));
+        let mut output =
+            vec![self.header(&format!("Status: {}", sanitize_display(&response.domain)))];
+        let mut rows = self.rows(&mut output, "  ");
 
         // HTTP Status
         if let Some(status) = response.http_status {
             let status_text =
                 sanitize_display(response.http_status_text.as_deref().unwrap_or("Unknown"));
-            let status_display = if (200..300).contains(&status) {
-                self.success(&format!("{} ({})", status, status_text))
+            let text = format!("{} ({})", status, status_text);
+            let styled = if (200..300).contains(&status) {
+                self.success(&text)
             } else if (300..400).contains(&status) {
-                self.warning(&format!("{} ({})", status, status_text))
+                self.warning(&text)
             } else {
-                self.error(&format!("{} ({})", status, status_text))
+                self.error(&text)
             };
-            output.push(format!(
-                "  {}: {}",
-                self.label("HTTP Status"),
-                status_display
-            ));
+            rows.kv("HTTP Status", styled);
         }
 
-        // Site Title
-        if let Some(ref title) = response.title {
-            output.push(format!(
-                "  {}: {}",
-                self.label("Site Title"),
-                self.value(&sanitize_display(title))
-            ));
-        }
+        rows.opt("Site Title", &response.title);
 
         // SSL Certificate
         if let Some(ref cert) = response.certificate {
-            output.push(format!("\n  {}:", self.label("SSL Certificate")));
-            output.push(format!(
-                "    {}: {}",
-                self.label("Subject"),
-                self.value(&sanitize_display(&cert.subject))
-            ));
-            output.push(format!(
-                "    {}: {}",
-                self.label("Issuer"),
-                self.value(&sanitize_display(&cert.issuer))
-            ));
-
-            let valid_status = if cert.is_valid {
+            let mut ssl = rows.section("SSL Certificate");
+            ssl.text("Subject", &cert.subject);
+            ssl.text("Issuer", &cert.issuer);
+            let valid = if cert.is_valid {
                 self.success("Valid")
             } else {
                 self.error("Invalid")
             };
-            output.push(format!("    {}: {}", self.label("Status"), valid_status));
-
+            ssl.kv("Status", valid);
             if !cert.hostname_verified {
-                output.push(format!(
-                    "    {}",
-                    self.error("WARNING: certificate hostname not verified")
-                ));
+                let warning = self.error("WARNING: certificate hostname not verified");
+                ssl.push(format!("    {warning}"));
             }
-
-            output.push(format!(
-                "    {}: {}",
-                self.label("Valid From"),
-                self.value(&cert.valid_from.format("%Y-%m-%d").to_string())
-            ));
-
-            let expiry_str = cert.valid_until.format("%Y-%m-%d").to_string();
+            ssl.date("Valid From", Some(cert.valid_from));
             // Shared helper renders the already-expired (negative) case as
             // "expired N days ago" instead of a confusing "(-N days!)".
-            let expiry_display = self.format_expiry_status(&expiry_str, cert.days_until_expiry);
-            output.push(format!("    {}: {}", self.label("Expires"), expiry_display));
+            let expiry = cert.valid_until.format("%Y-%m-%d").to_string();
+            ssl.kv(
+                "Expires",
+                self.format_expiry_status(&expiry, cert.days_until_expiry),
+            );
         } else {
-            output.push(format!(
-                "\n  {}: {}",
-                self.label("SSL Certificate"),
-                self.warning("Not available (HTTPS may not be configured)")
-            ));
+            rows.blank();
+            rows.kv(
+                "SSL Certificate",
+                self.warning("Not available (HTTPS may not be configured)"),
+            );
         }
 
         // CAA policy (issuance-time authorization for certificate authorities)
         if let Some(ref caa) = response.caa {
-            output.extend(self.render_caa_block(caa, "  "));
+            rows.extend(self.render_caa_block(caa, "  "));
         }
 
         // Domain Expiration
         if let Some(ref expiry) = response.domain_expiration {
-            output.push(format!("\n  {}:", self.label("Domain Registration")));
-
-            if let Some(ref registrar) = expiry.registrar {
-                output.push(format!(
-                    "    {}: {}",
-                    self.label("Registrar"),
-                    self.value(&sanitize_display(registrar))
-                ));
-            }
-
-            let expiry_str = expiry.expiration_date.format("%Y-%m-%d").to_string();
-            let expiry_display = self.format_expiry_status(&expiry_str, expiry.days_until_expiry);
-            output.push(format!("    {}: {}", self.label("Expires"), expiry_display));
+            let mut registration = rows.section("Domain Registration");
+            registration.opt("Registrar", &expiry.registrar);
+            let date = expiry.expiration_date.format("%Y-%m-%d").to_string();
+            registration.kv(
+                "Expires",
+                self.format_expiry_status(&date, expiry.days_until_expiry),
+            );
         }
 
         // DNS Resolution
         if let Some(ref dns) = response.dns_resolution {
-            output.push(format!("\n  {}:", self.label("DNS Resolution")));
-
-            // Status line
+            let mut resolution = rows.section("DNS Resolution");
             if dns.resolves {
-                output.push(format!("    {}", self.success("✓ Resolving")));
+                resolution.push(format!("    {}", self.success("✓ Resolving")));
             } else {
-                output.push(format!("    {}", self.error("✗ Domain does not resolve")));
+                resolution.push(format!("    {}", self.error("✗ Domain does not resolve")));
             }
-
-            // CNAME if present
             if let Some(ref cname) = dns.cname_target {
-                output.push(format!(
+                let target = self.success(&sanitize_display(cname));
+                resolution.push(format!(
                     "    {}: Aliases to {}",
                     self.label("CNAME"),
-                    self.success(&sanitize_display(cname))
+                    target
                 ));
             }
-
-            // IPv4 addresses (A records)
-            if !dns.a_records.is_empty() {
-                output.push(format!("    {}:", self.label("IPv4 (A)")));
-                for ip in &dns.a_records {
-                    output.push(format!("      • {}", self.value(&sanitize_display(ip))));
-                }
-            }
-
-            // IPv6 addresses (AAAA records)
-            if !dns.aaaa_records.is_empty() {
-                output.push(format!("    {}:", self.label("IPv6 (AAAA)")));
-                for ip in &dns.aaaa_records {
-                    output.push(format!("      • {}", self.value(&sanitize_display(ip))));
-                }
-            }
-
-            // Nameservers
-            if !dns.nameservers.is_empty() {
-                output.push(format!("    {}:", self.label("Nameservers")));
-                for ns in &dns.nameservers {
-                    output.push(format!("      • {}", self.value(&sanitize_display(ns))));
+            for (label, values) in [
+                ("IPv4 (A)", &dns.a_records),
+                ("IPv6 (AAAA)", &dns.aaaa_records),
+                ("Nameservers", &dns.nameservers),
+            ] {
+                if !values.is_empty() {
+                    resolution.push(format!("    {}:", self.label(label)));
+                    for value in values {
+                        resolution
+                            .push(format!("      • {}", self.value(&sanitize_display(value))));
+                    }
                 }
             }
         } else {
-            output.push(format!(
-                "\n  {}: {}",
-                self.label("DNS Resolution"),
-                self.warning("Check failed")
-            ));
+            rows.blank();
+            rows.kv("DNS Resolution", self.warning("Check failed"));
         }
 
         // CAA note sits at the very bottom of the whole status output,
@@ -163,110 +114,77 @@ impl HumanFormatter {
     }
 
     pub(super) fn format_ssl(&self, report: &crate::ssl::SslReport) -> String {
-        let mut output = Vec::new();
-
-        output.push(self.header(&format!("SSL Report: {}", sanitize_display(&report.domain))));
-
-        output.push(format!(
-            "  {}: {}",
-            self.label("Valid"),
-            if report.is_valid {
+        let mut output =
+            vec![self.header(&format!("SSL Report: {}", sanitize_display(&report.domain)))];
+        let mut rows = self.rows(&mut output, "  ");
+        let yes_no = |ok: bool| {
+            if ok {
                 self.success("yes")
             } else {
                 self.error("no")
             }
-        ));
-        output.push(format!(
-            "  {}: {}",
-            self.label("Hostname Match"),
-            if report.hostname_verified {
-                self.success("yes")
-            } else {
-                self.error("no")
-            }
-        ));
-        output.push(format!(
-            "  {}: {}",
-            self.label("Days Until Expiry"),
-            self.value(&report.days_until_expiry.to_string())
-        ));
+        };
+        rows.kv("Valid", yes_no(report.is_valid));
+        rows.kv("Hostname Match", yes_no(report.hostname_verified));
+        rows.kv(
+            "Days Until Expiry",
+            self.value(&report.days_until_expiry.to_string()),
+        );
 
         if !report.warnings.is_empty() {
-            output.push(format!("  {}:", self.label("Warnings")));
+            rows.push(format!("  {}:", self.label("Warnings")));
             for w in &report.warnings {
                 let rendered = match w.severity {
                     crate::ssl::CertWarningSeverity::Critical => self.error(&w.message),
                     crate::ssl::CertWarningSeverity::Warning => self.warning(&w.message),
                 };
-                output.push(format!("    {} {}", self.error("⚠"), rendered));
+                rows.push(format!("    {} {}", self.error("⚠"), rendered));
             }
         }
 
-        if let Some(ref proto) = report.protocol_version {
-            output.push(format!(
-                "  {}: {}",
-                self.label("Protocol"),
-                self.value(&sanitize_display(proto))
-            ));
-        }
-
+        rows.opt("Protocol", &report.protocol_version);
         if !report.san_names.is_empty() {
-            let sanitized_sans: Vec<String> = report
+            let sans: Vec<String> = report
                 .san_names
                 .iter()
                 .map(|s| sanitize_display(s))
                 .collect();
-            output.push(format!(
-                "  {}: {}",
-                self.label("SANs"),
-                self.value(&sanitized_sans.join(", "))
-            ));
+            rows.kv("SANs", self.value(&sans.join(", ")));
         }
 
         if !report.chain.is_empty() {
-            output.push(String::new());
-            output.push(format!("  {}:", self.label("Certificate Chain")));
+            rows.blank();
+            rows.push(format!("  {}:", self.label("Certificate Chain")));
             for (i, cert) in report.chain.iter().enumerate() {
-                output.push(format!(
+                rows.push(format!(
                     "    [{}] {}",
                     i,
                     self.value(&sanitize_display(&cert.subject))
                 ));
-                output.push(format!(
-                    "        {}: {}",
-                    self.label("Issuer"),
-                    self.value(&sanitize_display(&cert.issuer))
-                ));
-                if let Some(ref alg) = cert.signature_algorithm {
-                    output.push(format!(
-                        "        {}: {}",
-                        self.label("Algorithm"),
-                        self.value(&sanitize_display(alg))
-                    ));
-                }
+                let mut detail = rows.at("        ");
+                detail.text("Issuer", &cert.issuer);
+                detail.opt("Algorithm", &cert.signature_algorithm);
                 if let Some(ref key_type) = cert.key_type {
-                    let key_info = if let Some(bits) = cert.key_bits {
-                        format!("{} ({} bits)", sanitize_display(key_type), bits)
-                    } else {
-                        sanitize_display(key_type)
+                    let key_type = sanitize_display(key_type);
+                    let key = match cert.key_bits {
+                        Some(bits) => format!("{key_type} ({bits} bits)"),
+                        None => key_type,
                     };
-                    output.push(format!(
-                        "        {}: {}",
-                        self.label("Key"),
-                        self.value(&key_info)
-                    ));
+                    detail.kv("Key", self.value(&key));
                 }
-                output.push(format!(
-                    "        {}: {} to {}",
-                    self.label("Validity"),
-                    self.value(&cert.valid_from.format("%Y-%m-%d").to_string()),
-                    self.value(&cert.valid_until.format("%Y-%m-%d").to_string())
-                ));
+                detail.kv(
+                    "Validity",
+                    format!(
+                        "{} to {}",
+                        self.value(&cert.valid_from.format("%Y-%m-%d").to_string()),
+                        self.value(&cert.valid_until.format("%Y-%m-%d").to_string())
+                    ),
+                );
             }
         }
 
         if let Some(ref caa) = report.caa {
-            output.extend(self.render_caa_block(caa, "  "));
+            rows.extend(self.render_caa_block(caa, "  "));
             self.push_caa_note_footer(&mut output, caa);
         }
 

@@ -1,0 +1,8 @@
+---
+source: seer-core/tests/format_snapshots.rs
+expression: human ().format_availability (& fixture_availability())
+---
+example.com: [1;91mTAKEN[0m
+  [1;96mConfidence[0m: [1;93mmedium[0m
+  [1;96mMethod[0m: [97mwhois[0m
+  [1;96mDetails[0m: [97mWHOIS returned registration data[0m

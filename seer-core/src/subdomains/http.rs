@@ -9,12 +9,12 @@
 
 use std::time::Duration;
 
-use futures::StreamExt;
-use once_cell::sync::Lazy;
 use reqwest::StatusCode;
+use std::sync::LazyLock;
 use tracing::debug;
 
 use crate::error::{Result, SeerError};
+use crate::http::{read_body_capped, BodyReadError, Overflow};
 
 /// Default timeout for a single CT-log request (connect + full streaming read).
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -44,11 +44,9 @@ const MAX_CT_RESPONSE_SIZE: usize = 10 * 1024 * 1024;
 /// Wrapped in `Option` so a reqwest builder failure surfaces as a typed
 /// `SeerError::HttpError` via `client()` instead of a process panic at first
 /// use (library code must not `.expect()` on shared state).
-static HTTP_CLIENT: Lazy<Option<reqwest::Client>> = Lazy::new(|| {
-    reqwest::Client::builder()
-        .timeout(DEFAULT_TIMEOUT)
+static HTTP_CLIENT: LazyLock<Option<reqwest::Client>> = LazyLock::new(|| {
+    crate::net::client_builder(DEFAULT_TIMEOUT)
         .user_agent("seer-domain-tool")
-        .redirect(reqwest::redirect::Policy::none())
         .build()
         .ok()
 });
@@ -185,43 +183,33 @@ async fn fetch_once(url: &str) -> std::result::Result<Vec<u8>, FetchOutcome> {
         }
     }
 
-    // Stream the body with an incremental size check so a server that omits
-    // (or lies about) Content-Length cannot force us to buffer an unbounded
-    // payload. Wrapped in a total-duration timeout so a server that trickles
-    // bytes forever cannot hang the caller.
-    let mut body: Vec<u8> = Vec::new();
-    let mut stream = response.bytes_stream();
-    let streamed = tokio::time::timeout(DEFAULT_TIMEOUT, async {
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| FetchOutcome::Retryable {
-                err: SeerError::HttpError(format!("Failed to read CT log response: {}", e)),
-                retry_after: None,
-            })?;
-            if body.len() + chunk.len() > MAX_CT_RESPONSE_SIZE {
-                return Err(FetchOutcome::Terminal(SeerError::HttpError(format!(
-                    "CT log response too large (exceeds {} bytes)",
-                    MAX_CT_RESPONSE_SIZE
-                ))));
-            }
-            body.extend_from_slice(&chunk);
-        }
-        Ok(body)
-    })
-    .await;
-
-    let body = match streamed {
-        Ok(Ok(body)) => body,
-        Ok(Err(e)) => return Err(e),
-        Err(_) => {
-            return Err(FetchOutcome::Retryable {
-                err: SeerError::Timeout(format!(
-                    "CT log body read timed out after {:?}",
-                    DEFAULT_TIMEOUT
-                )),
-                retry_after: None,
-            })
-        }
-    };
+    // Stream the body under the size cap and a total-duration timeout (a
+    // lying Content-Length or a trickling server can't force an unbounded
+    // buffer or hang the caller). Only an oversized body is terminal.
+    let body = read_body_capped(
+        response,
+        MAX_CT_RESPONSE_SIZE,
+        DEFAULT_TIMEOUT,
+        Overflow::Reject,
+    )
+    .await
+    .map_err(|e| match e {
+        BodyReadError::TooLarge => FetchOutcome::Terminal(SeerError::HttpError(format!(
+            "CT log response too large (exceeds {} bytes)",
+            MAX_CT_RESPONSE_SIZE
+        ))),
+        BodyReadError::Chunk(e) => FetchOutcome::Retryable {
+            err: SeerError::HttpError(format!("Failed to read CT log response: {}", e)),
+            retry_after: None,
+        },
+        BodyReadError::TimedOut => FetchOutcome::Retryable {
+            err: SeerError::Timeout(format!(
+                "CT log body read timed out after {:?}",
+                DEFAULT_TIMEOUT
+            )),
+            retry_after: None,
+        },
+    })?;
 
     // A 200 carrying an HTML error page (crt.sh does this under load) is a
     // transient failure, not valid-but-unparseable data — retry rather than

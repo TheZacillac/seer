@@ -20,7 +20,14 @@ dependencies = [
     # bad version defensively keeps any future user-driven resolution
     # safe.
     "fastapi>=0.109,!=0.136.3",
-    "uvicorn[standard]>=0.27",
+    # Plain uvicorn (floor matches the mcp SDK's): its [standard] extra also
+    # pulls python-dotenv, pyyaml, watchfiles and websockets, none of which
+    # seer-api uses (no websocket routes; SEER_RELOAD falls back to polling).
+    # uvloop and httptools stay, so uvicorn's "auto" loop/HTTP selection
+    # still picks the fast implementations; markers/floors mirror [standard].
+    "uvicorn>=0.31.1",
+    "uvloop>=0.15.1; sys_platform != 'win32' and sys_platform != 'cygwin' and platform_python_implementation != 'PyPy'",
+    "httptools>=0.8.0",
     "pydantic>=2.0",
     # Floored at 2.0: the server registers handlers through the 2.x API
     # (`add_request_handler` by protocol method name). SDK 1.x has no such
@@ -34,16 +41,25 @@ dependencies = [
     # routers and MCP server call. 0.44 is required for `delegation` and
     # `all_tlds` (added in v0.44.0) and `record_types` (v0.45.0) — a lower
     # resolution installs cleanly and then AttributeErrors at request time,
-    # so bump this whenever a new binding is called.
+    # so bump this whenever a new binding is called. PENDING: the SSRF guard
+    # now calls `nameserver_target` (added after v0.48.0); raise this to the
+    # next release at its version bump (the in-repo seer-py is still 0.48.0,
+    # so a higher floor cannot resolve yet).
     "domain-seer>=0.48.0",
     "slowapi>=0.1.9",
-    "orjson>=3.9",
+    # Imported directly (the /mcp and per-tool MCP rate limiters; the raw
+    # /mcp route, middleware and SSE responses), so declared rather than left
+    # to arrive through slowapi / fastapi. Floors are the ones those already
+    # guarantee.
+    "limits>=2.3",
+    "starlette>=0.35",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=7.0",
-    "pytest-asyncio>=0.21",
+    # 8.4+ fails an `async def` test that no plugin runs (older releases warn
+    # and skip it), and seer-api has no async test plugin.
+    "pytest>=8.4",
     "httpx>=0.26",
 ]
 
@@ -77,5 +93,4 @@ ignore = [
 known-first-party = ["seer_api", "seer"]
 
 [tool.pytest.ini_options]
-asyncio_mode = "auto"
 testpaths = ["tests"]

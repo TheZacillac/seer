@@ -1,3 +1,18 @@
+//! DNS resolution and analysis over hickory-resolver.
+//!
+//! - [`DnsResolver`]: the 16 [`RecordType`]s, against Google Public DNS by
+//!   default or a custom nameserver over UDP, DoT (`tls://`) or DoH
+//!   (`https://`) — see [`NameserverSpec`]. A hostname nameserver's resolved
+//!   addresses are tried IPv4 first.
+//! - [`PropagationChecker`]: fans one query out to 30 public resolvers across
+//!   6 regions and reports consensus and inconsistencies.
+//! - [`DnsComparator`] (two nameservers side by side), [`DnsFollower`] (live
+//!   monitor), [`DnssecChecker`] and [`DelegationChecker`] (parent NS set vs.
+//!   the zone's own NS RRset, plus lameness probes).
+//!
+//! No outer retry loop at this layer: hickory's own retransmission is the
+//! only retry (see `resolver.rs`).
+
 mod compare;
 mod delegation;
 mod dnssec;

@@ -1,0 +1,8 @@
+---
+source: seer-core/tests/format_snapshots.rs
+expression: human ().format_follow_iteration (& fixture_follow_iteration())
+---
+[[1;96m12:00:30[0m] Iteration 2/3: 1 record(s) ([1;93mCHANGED[0m)
+  [97m192.0.2.2[0m
+  [1;92m+[0m [1;92m192.0.2.2[0m
+  [1;91m-[0m [1;91m192.0.2.1[0m

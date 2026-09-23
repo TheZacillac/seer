@@ -89,23 +89,6 @@ def test_status_bulk_stream_emits_expected_event_sequence(client):
 # ---------------------------------------------------------------------------
 
 
-def _parse_sse_text(body: str):
-    """Lightweight SSE parser used only by the error-sanitization test."""
-    events = []
-    for block in body.strip().split("\n\n"):
-        event = None
-        data = None
-        for line in block.splitlines():
-            if line.startswith("event: "):
-                event = line[len("event: "):]
-            elif line.startswith("data: "):
-                data = line[len("data: "):]
-        if event is None or data is None:
-            continue
-        events.append({"event": event, "data": json.loads(data)})
-    return events
-
-
 def test_sse_error_is_sanitized(client):
     """A RuntimeError raised inside the bulk executor must not leak
     its message verbatim through the SSE error event. The event body
@@ -132,7 +115,7 @@ def test_sse_error_is_sanitized(client):
             json={"domains": ["example.com"], "concurrency": 1},
         )
         assert resp.status_code == 200
-        events = _parse_sse_text(resp.text)
+        events = _parse_sse(resp.text)
 
     error_events = [e for e in events if e["event"] == "error"]
     assert len(error_events) == 1
@@ -164,7 +147,7 @@ def test_sse_error_value_error_surfaces_message(client):
             json={"domains": ["example.com"], "concurrency": 1},
         )
         assert resp.status_code == 200
-        events = _parse_sse_text(resp.text)
+        events = _parse_sse(resp.text)
 
     error_events = [e for e in events if e["event"] == "error"]
     assert len(error_events) == 1

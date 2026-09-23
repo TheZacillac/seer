@@ -59,25 +59,20 @@
 //! `crate::whois::parser`.
 
 use chrono::{DateTime, NaiveDate, Utc};
-use once_cell::sync::Lazy;
-use regex::Regex;
 
-use super::{push_bounded, RegistryParser, MAX_NAMESERVERS, MAX_STATUSES};
+use super::{push_bounded, MAX_NAMESERVERS, MAX_STATUSES};
 use crate::whois::parser::{parse_date, WhoisResponse};
 
-/// `key:   value` lines. Keys may contain hyphens and spaces
-/// (`reg-name`, `e-mail`, `nic-hdl`, `registrar name`).
-static KEY_VALUE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"^([A-Za-z][A-Za-z0-9 -]*?):\s*(.*?)\s*$").expect("Invalid ISOC-IL key/value regex")
-});
+static_regex! {
+    /// `key:   value` lines. Keys may contain hyphens and spaces
+    /// (`reg-name`, `e-mail`, `nic-hdl`, `registrar name`).
+    KEY_VALUE = r"^([A-Za-z][A-Za-z0-9 -]*?):\s*(.*?)\s*$";
 
-/// Domain-level audit line: `changed: <who> YYYYMMDD (Assigned|Changed)`.
-/// Contact objects also carry `changed:` lines, but without the parenthesised
-/// marker — and they are excluded by section anyway.
-static CHANGED_LINE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)(\d{8})\s*\((assigned|changed)\)\s*$")
-        .expect("Invalid ISOC-IL changed-line regex")
-});
+    /// Domain-level audit line: `changed: <who> YYYYMMDD (Assigned|Changed)`.
+    /// Contact objects also carry `changed:` lines, but without the parenthesised
+    /// marker — and they are excluded by section anyway.
+    CHANGED_LINE = r"(?i)(\d{8})\s*\((assigned|changed)\)\s*$";
+}
 
 /// Maximum number of contact (`person:`) objects retained. A real response
 /// carries at most a handful (admin/tech/zone, usually shared); cap so a
@@ -105,228 +100,209 @@ struct Contact {
     handle: Option<String>,
 }
 
-/// Parser for .il domains using the ISOC-IL format.
-#[derive(Debug, Clone, Default)]
-pub struct IsocIlParser;
+/// TLDs this parser handles.
+/// The client sends IDN domains to the wire as A-labels, so the IDN
+/// ccTLD `.ישראל` reaches the registry as `xn--4dbrk0ce`.
+pub(super) const TLDS: &[&str] = &["il", "xn--4dbrk0ce"];
 
-impl IsocIlParser {
-    pub fn new() -> Self {
-        Self
-    }
+/// Parses .il domains using the ISOC-IL format.
+pub(super) fn parse(domain: &str, server: &str, raw: &str) -> WhoisResponse {
+    let mut section = Section::Preamble;
 
-    /// `validity:` is `DD-MM-YYYY` (e.g. `14-06-2027`). Legacy names with no
-    /// paid term show `N/A`, which yields `None`. Falls back to the shared
-    /// tolerant parser in case the registry ever switches to ISO dates.
-    fn parse_validity(value: &str) -> Option<DateTime<Utc>> {
-        let v = value.trim();
-        if v.is_empty() || v.eq_ignore_ascii_case("n/a") {
-            return None;
+    let mut registrar: Option<String> = None;
+    let mut descr: Vec<String> = Vec::new();
+    let mut registrant_email: Option<String> = None;
+    let mut registrant_phone: Option<String> = None;
+    let mut admin_handle: Option<String> = None;
+    let mut tech_handle: Option<String> = None;
+    let mut nameservers: Vec<String> = Vec::new();
+    let mut status: Vec<String> = Vec::new();
+    let mut dnssec: Option<String> = None;
+    let mut creation_date: Option<DateTime<Utc>> = None;
+    let mut expiration_date: Option<DateTime<Utc>> = None;
+    let mut updated_date: Option<DateTime<Utc>> = None;
+    let mut contacts: Vec<Contact> = Vec::new();
+
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('%') || trimmed.starts_with('#') {
+            continue;
         }
-        NaiveDate::parse_from_str(v, "%d-%m-%Y")
-            .ok()
-            .and_then(|d| d.and_hms_opt(0, 0, 0))
-            .map(|dt| dt.and_utc())
-            .or_else(|| parse_date(v))
+        let Some(caps) = KEY_VALUE.captures(trimmed) else {
+            continue;
+        };
+        let key = caps[1].to_ascii_lowercase();
+        let value = caps[2].trim();
+        if value.is_empty() {
+            continue;
+        }
+
+        // Section transitions. `domain:` opens the domain object; each
+        // `person:` opens a new contact object.
+        match key.as_str() {
+            "domain" => {
+                section = Section::Domain;
+                continue;
+            }
+            "person" => {
+                if contacts.len() < MAX_CONTACTS {
+                    section = Section::Person;
+                    contacts.push(Contact {
+                        name: Some(value.to_string()),
+                        ..Contact::default()
+                    });
+                } else {
+                    section = Section::Ignored;
+                }
+                continue;
+            }
+            // The registrar pair trails the contact objects but is
+            // domain-level data; accept it from any section.
+            "registrar name" if registrar.is_none() => {
+                registrar = Some(value.to_string());
+                continue;
+            }
+            _ => {}
+        }
+
+        match section {
+            Section::Preamble | Section::Ignored => {}
+            Section::Domain => match key.as_str() {
+                // First `descr:` is the holder name; the rest is the
+                // postal address, one line each.
+                "descr" if descr.len() < 16 => descr.push(value.to_string()),
+                "e-mail" if registrant_email.is_none() => {
+                    registrant_email = Some(normalize_email(value));
+                }
+                "phone" if registrant_phone.is_none() => {
+                    registrant_phone = Some(value.to_string());
+                }
+                "admin-c" if admin_handle.is_none() => admin_handle = Some(value.to_string()),
+                "tech-c" if tech_handle.is_none() => tech_handle = Some(value.to_string()),
+                // Some entries append glue IPs after the hostname.
+                "nserver" => {
+                    if let Some(host) = value.split_whitespace().next() {
+                        push_bounded(&mut nameservers, host.to_ascii_lowercase(), MAX_NAMESERVERS);
+                    }
+                }
+                "validity" if expiration_date.is_none() => {
+                    expiration_date = parse_validity(value);
+                }
+                "dnssec" if dnssec.is_none() => dnssec = Some(value.to_string()),
+                "status" => push_bounded(&mut status, value.to_string(), MAX_STATUSES),
+                "changed" => {
+                    if let Some(c) = CHANGED_LINE.captures(value) {
+                        let date = parse_compact_date(&c[1]);
+                        if c[2].eq_ignore_ascii_case("assigned") {
+                            if creation_date.is_none() {
+                                creation_date = date;
+                            }
+                        } else if let Some(d) = date {
+                            // `(Changed)` lines are chronological; keep
+                            // the latest regardless of ordering.
+                            updated_date = Some(updated_date.map_or(d, |cur| cur.max(d)));
+                        }
+                    }
+                }
+                _ => {}
+            },
+            Section::Person => {
+                let Some(contact) = contacts.last_mut() else {
+                    continue;
+                };
+                match key.as_str() {
+                    "e-mail" if contact.email.is_none() => {
+                        contact.email = Some(normalize_email(value));
+                    }
+                    "phone" if contact.phone.is_none() => {
+                        contact.phone = Some(value.to_string());
+                    }
+                    "nic-hdl" if contact.handle.is_none() => {
+                        contact.handle = Some(value.to_string());
+                    }
+                    _ => {}
+                }
+            }
+        }
     }
 
-    /// `changed:` audit lines carry a compact `YYYYMMDD` date.
-    fn parse_compact_date(value: &str) -> Option<DateTime<Utc>> {
-        NaiveDate::parse_from_str(value, "%Y%m%d")
-            .ok()
-            .and_then(|d| d.and_hms_opt(0, 0, 0))
-            .map(|dt| dt.and_utc())
-    }
+    let find_contact = |handle: &Option<String>| -> Option<&Contact> {
+        let h = handle.as_deref()?;
+        contacts.iter().find(|c| {
+            c.handle
+                .as_deref()
+                .is_some_and(|ch| ch.eq_ignore_ascii_case(h))
+        })
+    };
+    let admin = find_contact(&admin_handle);
+    let tech = find_contact(&tech_handle);
 
-    /// ISOC-IL obfuscates addresses as `user AT example.co.il`.
-    fn normalize_email(value: &str) -> String {
-        value.replace(" AT ", "@")
+    let mut descr_iter = descr.into_iter();
+    let registrant = descr_iter.next();
+    let address: Vec<String> = descr_iter.collect();
+    let registrant_address = if address.is_empty() {
+        None
+    } else {
+        Some(address.join(", "))
+    };
+
+    WhoisResponse {
+        domain: domain.to_string(),
+        registrar,
+        registrant,
+        registrant_email,
+        registrant_phone,
+        registrant_address,
+        admin_name: admin.and_then(|c| c.name.clone()),
+        admin_email: admin.and_then(|c| c.email.clone()),
+        admin_phone: admin.and_then(|c| c.phone.clone()),
+        tech_name: tech.and_then(|c| c.name.clone()),
+        tech_email: tech.and_then(|c| c.email.clone()),
+        tech_phone: tech.and_then(|c| c.phone.clone()),
+        creation_date,
+        expiration_date,
+        updated_date,
+        nameservers,
+        status,
+        dnssec,
+        whois_server: server.to_string(),
+        raw_response: raw.to_string(),
+        ..Default::default()
     }
 }
 
-impl RegistryParser for IsocIlParser {
-    fn supported_tlds(&self) -> &[&str] {
-        // The client sends IDN domains to the wire as A-labels, so the IDN
-        // ccTLD `.ישראל` reaches the registry as `xn--4dbrk0ce`.
-        &["il", "xn--4dbrk0ce"]
+/// `validity:` is `DD-MM-YYYY` (e.g. `14-06-2027`). Legacy names with no
+/// paid term show `N/A`, which yields `None`. Falls back to the shared
+/// tolerant parser in case the registry ever switches to ISO dates.
+fn parse_validity(value: &str) -> Option<DateTime<Utc>> {
+    let v = value.trim();
+    if v.is_empty() || v.eq_ignore_ascii_case("n/a") {
+        return None;
     }
+    NaiveDate::parse_from_str(v, "%d-%m-%Y")
+        .ok()
+        .and_then(|d| d.and_hms_opt(0, 0, 0))
+        .map(|dt| dt.and_utc())
+        .or_else(|| parse_date(v))
+}
 
-    fn parse(&self, domain: &str, server: &str, raw: &str) -> WhoisResponse {
-        let mut section = Section::Preamble;
+/// `changed:` audit lines carry a compact `YYYYMMDD` date.
+fn parse_compact_date(value: &str) -> Option<DateTime<Utc>> {
+    NaiveDate::parse_from_str(value, "%Y%m%d")
+        .ok()
+        .and_then(|d| d.and_hms_opt(0, 0, 0))
+        .map(|dt| dt.and_utc())
+}
 
-        let mut registrar: Option<String> = None;
-        let mut descr: Vec<String> = Vec::new();
-        let mut registrant_email: Option<String> = None;
-        let mut registrant_phone: Option<String> = None;
-        let mut admin_handle: Option<String> = None;
-        let mut tech_handle: Option<String> = None;
-        let mut nameservers: Vec<String> = Vec::new();
-        let mut status: Vec<String> = Vec::new();
-        let mut dnssec: Option<String> = None;
-        let mut creation_date: Option<DateTime<Utc>> = None;
-        let mut expiration_date: Option<DateTime<Utc>> = None;
-        let mut updated_date: Option<DateTime<Utc>> = None;
-        let mut contacts: Vec<Contact> = Vec::new();
-
-        for line in raw.lines() {
-            let trimmed = line.trim();
-            if trimmed.is_empty() || trimmed.starts_with('%') || trimmed.starts_with('#') {
-                continue;
-            }
-            let Some(caps) = KEY_VALUE.captures(trimmed) else {
-                continue;
-            };
-            let key = caps[1].to_ascii_lowercase();
-            let value = caps[2].trim();
-            if value.is_empty() {
-                continue;
-            }
-
-            // Section transitions. `domain:` opens the domain object; each
-            // `person:` opens a new contact object.
-            match key.as_str() {
-                "domain" => {
-                    section = Section::Domain;
-                    continue;
-                }
-                "person" => {
-                    if contacts.len() < MAX_CONTACTS {
-                        section = Section::Person;
-                        contacts.push(Contact {
-                            name: Some(value.to_string()),
-                            ..Contact::default()
-                        });
-                    } else {
-                        section = Section::Ignored;
-                    }
-                    continue;
-                }
-                // The registrar pair trails the contact objects but is
-                // domain-level data; accept it from any section.
-                "registrar name" if registrar.is_none() => {
-                    registrar = Some(value.to_string());
-                    continue;
-                }
-                _ => {}
-            }
-
-            match section {
-                Section::Preamble | Section::Ignored => {}
-                Section::Domain => match key.as_str() {
-                    // First `descr:` is the holder name; the rest is the
-                    // postal address, one line each.
-                    "descr" if descr.len() < 16 => descr.push(value.to_string()),
-                    "e-mail" if registrant_email.is_none() => {
-                        registrant_email = Some(Self::normalize_email(value));
-                    }
-                    "phone" if registrant_phone.is_none() => {
-                        registrant_phone = Some(value.to_string());
-                    }
-                    "admin-c" if admin_handle.is_none() => admin_handle = Some(value.to_string()),
-                    "tech-c" if tech_handle.is_none() => tech_handle = Some(value.to_string()),
-                    // Some entries append glue IPs after the hostname.
-                    "nserver" => {
-                        if let Some(host) = value.split_whitespace().next() {
-                            push_bounded(
-                                &mut nameservers,
-                                host.to_ascii_lowercase(),
-                                MAX_NAMESERVERS,
-                            );
-                        }
-                    }
-                    "validity" if expiration_date.is_none() => {
-                        expiration_date = Self::parse_validity(value);
-                    }
-                    "dnssec" if dnssec.is_none() => dnssec = Some(value.to_string()),
-                    "status" => push_bounded(&mut status, value.to_string(), MAX_STATUSES),
-                    "changed" => {
-                        if let Some(c) = CHANGED_LINE.captures(value) {
-                            let date = Self::parse_compact_date(&c[1]);
-                            if c[2].eq_ignore_ascii_case("assigned") {
-                                if creation_date.is_none() {
-                                    creation_date = date;
-                                }
-                            } else if let Some(d) = date {
-                                // `(Changed)` lines are chronological; keep
-                                // the latest regardless of ordering.
-                                updated_date = Some(updated_date.map_or(d, |cur| cur.max(d)));
-                            }
-                        }
-                    }
-                    _ => {}
-                },
-                Section::Person => {
-                    let Some(contact) = contacts.last_mut() else {
-                        continue;
-                    };
-                    match key.as_str() {
-                        "e-mail" if contact.email.is_none() => {
-                            contact.email = Some(Self::normalize_email(value));
-                        }
-                        "phone" if contact.phone.is_none() => {
-                            contact.phone = Some(value.to_string());
-                        }
-                        "nic-hdl" if contact.handle.is_none() => {
-                            contact.handle = Some(value.to_string());
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-
-        let find_contact = |handle: &Option<String>| -> Option<&Contact> {
-            let h = handle.as_deref()?;
-            contacts.iter().find(|c| {
-                c.handle
-                    .as_deref()
-                    .is_some_and(|ch| ch.eq_ignore_ascii_case(h))
-            })
-        };
-        let admin = find_contact(&admin_handle);
-        let tech = find_contact(&tech_handle);
-
-        let mut descr_iter = descr.into_iter();
-        let registrant = descr_iter.next();
-        let address: Vec<String> = descr_iter.collect();
-        let registrant_address = if address.is_empty() {
-            None
-        } else {
-            Some(address.join(", "))
-        };
-
-        WhoisResponse {
-            domain: domain.to_string(),
-            registrar,
-            registrant,
-            organization: None,
-            registrant_email,
-            registrant_phone,
-            registrant_address,
-            registrant_country: None,
-            admin_name: admin.and_then(|c| c.name.clone()),
-            admin_organization: None,
-            admin_email: admin.and_then(|c| c.email.clone()),
-            admin_phone: admin.and_then(|c| c.phone.clone()),
-            tech_name: tech.and_then(|c| c.name.clone()),
-            tech_organization: None,
-            tech_email: tech.and_then(|c| c.email.clone()),
-            tech_phone: tech.and_then(|c| c.phone.clone()),
-            creation_date,
-            expiration_date,
-            updated_date,
-            nameservers,
-            status,
-            dnssec,
-            whois_server: server.to_string(),
-            raw_response: raw.to_string(),
-        }
-    }
+/// ISOC-IL obfuscates addresses as `user AT example.co.il`.
+fn normalize_email(value: &str) -> String {
+    value.replace(" AT ", "@")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::whois::parsers::ParserRegistry;
+    use crate::whois::parsers;
     use chrono::Datelike;
 
     const DISCLAIMER: &str = "\
@@ -444,7 +420,7 @@ registrar name: Israel Internet Association ISOC-IL
 ";
 
     fn parse(domain: &str, raw: &str) -> WhoisResponse {
-        IsocIlParser::new().parse(domain, "whois.isoc.org.il", raw)
+        super::parse(domain, "whois.isoc.org.il", raw)
     }
 
     fn ymd(dt: DateTime<Utc>) -> (i32, u32, u32) {
@@ -558,16 +534,15 @@ registrar name: Israel Internet Association ISOC-IL
 
     #[test]
     fn registry_routes_il_second_level_domains_here() {
-        let registry = ParserRegistry::new();
         for domain in ["example.co.il", "example.org.il", "example.ac.il"] {
-            let r = registry.parse(domain, "whois.isoc.org.il", &registered());
+            let r = parsers::parse(domain, "whois.isoc.org.il", &registered());
             assert!(
                 r.expiration_date.is_some(),
                 "{domain} should be parsed by the ISOC-IL parser"
             );
         }
         // The IDN ccTLD reaches the parser as its A-label.
-        let r = registry.parse(
+        let r = parsers::parse(
             "xn--4dbqfv.xn--4dbrk0ce",
             "whois.isoc.org.il",
             &registered(),
@@ -598,26 +573,12 @@ registrar name: Israel Internet Association ISOC-IL
     }
 
     #[test]
-    fn supported_tlds() {
-        assert_eq!(
-            IsocIlParser::new().supported_tlds(),
-            &["il", "xn--4dbrk0ce"]
-        );
-    }
-
-    #[test]
     fn parse_validity_formats() {
-        assert!(IsocIlParser::parse_validity("N/A").is_none());
-        assert!(IsocIlParser::parse_validity("n/a").is_none());
-        assert!(IsocIlParser::parse_validity("").is_none());
-        assert_eq!(
-            IsocIlParser::parse_validity("01-12-2030").map(ymd),
-            Some((2030, 12, 1))
-        );
+        assert!(parse_validity("N/A").is_none());
+        assert!(parse_validity("n/a").is_none());
+        assert!(parse_validity("").is_none());
+        assert_eq!(parse_validity("01-12-2030").map(ymd), Some((2030, 12, 1)));
         // Tolerates an ISO date should the registry ever change format.
-        assert_eq!(
-            IsocIlParser::parse_validity("2030-12-01").map(ymd),
-            Some((2030, 12, 1))
-        );
+        assert_eq!(parse_validity("2030-12-01").map(ymd), Some((2030, 12, 1)));
     }
 }

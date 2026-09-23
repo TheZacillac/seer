@@ -7,7 +7,7 @@ use ratatui::Frame;
 
 use crate::tui::action::LensData;
 use crate::tui::theme::Theme;
-use crate::tui::widgets::{panel, scroll_to};
+use crate::tui::widgets::{panel, row_style, scroll_to};
 
 pub fn render(
     f: &mut Frame,
@@ -22,9 +22,7 @@ pub fn render(
     };
 
     let title = format!("Subdomains · {} via {}", s.count, s.source);
-    let block = panel::block(theme, &title, theme.pink, focused);
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let inner = panel::render(f, area, theme, &title, theme.pink, focused);
 
     if s.subdomains.is_empty() {
         f.render_widget(
@@ -41,14 +39,10 @@ pub fn render(
 
     let header = Row::new(["HOST"]).style(Style::default().fg(theme.overlay0));
 
-    let rows = s.subdomains.iter().enumerate().map(|(i, host)| {
-        let style = if focused && i == sel {
-            Style::default().fg(theme.text).bg(theme.surface0)
-        } else {
-            Style::default().fg(theme.text)
-        };
-        Row::new(vec![host.clone()]).style(style)
-    });
+    let rows =
+        s.subdomains.iter().enumerate().map(|(i, host)| {
+            Row::new(vec![host.clone()]).style(row_style(theme, focused && i == sel))
+        });
 
     let table = Table::new(rows, [Constraint::Percentage(100)])
         .header(header)
@@ -60,20 +54,8 @@ pub fn render(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::backend::TestBackend;
-    use ratatui::Terminal;
+    use crate::tui::test_util::render_text;
     use seer_core::SubdomainResult;
-
-    fn buf_text(buf: &ratatui::buffer::Buffer) -> String {
-        let a = buf.area();
-        let mut s = String::new();
-        for y in 0..a.height {
-            for x in 0..a.width {
-                s.push_str(buf[(x, y)].symbol());
-            }
-        }
-        s
-    }
 
     #[test]
     fn renders_subdomain_rows() {
@@ -84,12 +66,7 @@ mod tests {
             source: "crt.sh".into(),
             count: 2,
         }));
-        let backend = TestBackend::new(70, 10);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| render(f, f.area(), &theme, &data, false, 0))
-            .unwrap();
-        let text = buf_text(terminal.backend().buffer());
+        let text = render_text(70, 10, |f| render(f, f.area(), &theme, &data, false, 0));
         assert!(text.contains("www.example.com"));
     }
 
@@ -105,12 +82,7 @@ mod tests {
         }));
         // Short terminal can't fit 60 rows; without scrolling the last host
         // would never render even when selected.
-        let backend = TestBackend::new(60, 10);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| render(f, f.area(), &theme, &data, true, 59))
-            .unwrap();
-        let text = buf_text(terminal.backend().buffer());
+        let text = render_text(60, 10, |f| render(f, f.area(), &theme, &data, true, 59));
         assert!(
             text.contains("h59.example.com"),
             "selecting the last row must scroll it into view"
@@ -126,12 +98,7 @@ mod tests {
             source: "crt.sh".into(),
             count: 0,
         }));
-        let backend = TestBackend::new(60, 6);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| render(f, f.area(), &theme, &data, false, 0))
-            .unwrap();
-        let text = buf_text(terminal.backend().buffer());
+        let text = render_text(60, 6, |f| render(f, f.area(), &theme, &data, false, 0));
         assert!(text.contains("no subdomains found"));
     }
 }

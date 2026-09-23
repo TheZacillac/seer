@@ -7,16 +7,9 @@ the callable is exported, invalid input raises ValueError, and an
 out-of-range concurrency is rejected before any network I/O.
 """
 
-import os
-
 import pytest
 
 import seer
-
-_LIVE = pytest.mark.skipif(
-    os.environ.get("SEER_LIVE_TESTS") != "1",
-    reason="live network test; set SEER_LIVE_TESTS=1 to enable",
-)
 
 
 def test_takeover_is_exported():
@@ -39,7 +32,7 @@ def test_takeover_rejects_out_of_range_concurrency(bad_concurrency):
         seer.takeover("example.com", bad_concurrency)
 
 
-@_LIVE
+@pytest.mark.live
 def test_takeover_live_report_shape():
     report = seer.takeover("example.com")
     assert report["domain"] == "example.com"

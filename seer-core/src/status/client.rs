@@ -6,34 +6,27 @@
 //! health probe exists to surface. Callers that want tolerance to transient
 //! failures (e.g. watch mode) own that policy at their layer.
 
-use std::collections::HashSet;
-use std::net::SocketAddr;
 use std::time::Duration;
 
 use chrono::Utc;
-use native_tls::TlsConnector;
-use once_cell::sync::Lazy;
-use regex::Regex;
-use reqwest::{Client, Url};
-use tokio::net::TcpStream;
 use tracing::{debug, instrument};
 
 use super::types::{CertificateInfo, DnsResolution, DomainExpiration, StatusResponse};
 use crate::caa::{self, CaaPolicy};
 use crate::dns::{DnsResolver, RecordData, RecordType};
 use crate::error::{Result, SeerError};
+use crate::http::GuardedFetcher;
 use crate::lookup::SmartLookup;
 use crate::validation::normalize_host;
 
 /// Default timeout for HTTP and TLS operations (10 seconds).
 /// Balances responsiveness with allowing slow servers to respond.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
-const MAX_REDIRECTS: usize = 5;
 
-/// Pre-compiled regex for extracting HTML title.
-static TITLE_REGEX: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)<title[^>]*>([^<]+)</title>").expect("Invalid regex for HTML title extraction")
-});
+static_regex! {
+    /// Pre-compiled regex for extracting HTML title.
+    TITLE_REGEX = r"(?i)<title[^>]*>([^<]+)</title>";
+}
 
 /// Client for checking domain status (HTTP, SSL, expiration)
 #[derive(Debug, Clone)]
@@ -136,32 +129,20 @@ impl StatusClient {
         }
         response.caa = Some(caa_policy);
 
-        // Apply domain expiration info
-        match expiry_result {
-            Ok(expiry_info) => response.domain_expiration = expiry_info,
-            Err(e) => response.errors.push(super::types::StatusError {
-                check: "expiration".to_string(),
-                message: e.to_string(),
-            }),
-        }
-
-        // Apply DNS resolution info
-        match dns_result {
-            Ok(dns_info) => response.dns_resolution = Some(dns_info),
-            Err(e) => response.errors.push(super::types::StatusError {
-                check: "dns".to_string(),
-                message: e.to_string(),
-            }),
-        }
+        // Expiration and DNS never add a sub-check error: a failed lookup
+        // folds into "unknown" (no expiration / no records).
+        response.domain_expiration = expiry_result;
+        response.dns_resolution = Some(dns_result);
 
         Ok(response)
     }
 
-    /// Fetches the HTTP status code and page title.
+    /// Fetches the HTTP status code and page title of `https://{domain}/`.
     ///
-    /// Redirects are followed manually with IP validation at each hop.
-    /// Resolved IPs are pinned on the HTTP client via `resolve_to_addrs` to
-    /// prevent DNS rebinding attacks (TOCTOU between validation and connect).
+    /// Goes through [`GuardedFetcher`], the SSRF-guarded GET shared with
+    /// `headers`/`takeover`: redirects are followed manually with the guard
+    /// re-run and the validated IPs pinned at every hop (DNS-rebinding
+    /// defense), and the body read is capped and timeout-bounded.
     ///
     /// # Security Note
     /// This path uses reqwest's default (validating) TLS configuration — a
@@ -172,177 +153,55 @@ impl StatusClient {
     /// below) intentionally relaxes verification because inspecting an
     /// invalid cert is the whole point of that code; this path MUST NOT.
     ///
-    /// Redirect targets are validated for SSRF but the HTTP response body
-    /// (page title) comes from an unauthenticated connection and should be
-    /// treated as untrusted.
+    /// The page title is remote content and should be treated as untrusted.
     async fn fetch_http_info(&self, domain: &str) -> Result<(u16, String, Option<String>)> {
-        let mut url = Url::parse(&format!("https://{}", domain))
-            .map_err(|e| SeerError::HttpError(format!("invalid URL: {}", e)))?;
-        let mut visited = HashSet::new();
-
-        for _ in 0..=MAX_REDIRECTS {
-            let validated_addrs = validate_url_target(&url).await?;
-
-            if !visited.insert(url.clone()) {
-                return Err(SeerError::HttpError("redirect loop detected".to_string()));
-            }
-
-            // Build a per-hop client that pins the validated IPs so reqwest
-            // cannot re-resolve the hostname to a different (potentially
-            // private) address (DNS rebinding protection).
-            let host = url
-                .host_str()
-                .ok_or_else(|| SeerError::HttpError("missing URL host".to_string()))?;
-            let client = Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .user_agent(concat!("Seer/", env!("CARGO_PKG_VERSION")))
-                .resolve_to_addrs(host, &validated_addrs)
-                .build()
-                .map_err(|e| SeerError::HttpError(format!("failed to build HTTP client: {}", e)))?;
-
-            let response = client
-                .get(url.clone())
-                .timeout(self.timeout)
-                .send()
-                .await
-                .map_err(|e| SeerError::HttpError(e.to_string()))?;
-
-            if response.status().is_redirection() {
-                let location = response.headers().get(reqwest::header::LOCATION);
-                let location = location.and_then(|v| v.to_str().ok()).ok_or_else(|| {
-                    SeerError::HttpError("redirect missing location header".to_string())
-                })?;
-                let next_url = url
-                    .join(location)
-                    .or_else(|_| Url::parse(location))
-                    .map_err(|e| SeerError::HttpError(format!("invalid redirect URL: {}", e)))?;
-                url = next_url;
-                continue;
-            }
-
-            let status = response.status();
-            let status_code = status.as_u16();
-            let status_text = status.canonical_reason().unwrap_or("Unknown").to_string();
-
-            // Only try to get title for successful HTML responses
-            let title = if status.is_success() {
-                let content_type = response
-                    .headers()
-                    .get("content-type")
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("");
-
-                if content_type.contains("text/html") {
-                    // Stream at most 64 KB for title extraction. Streaming
-                    // (rather than `response.bytes().await`) prevents a
-                    // malicious server from forcing us to buffer a huge
-                    // body before the cap is applied.
-                    const MAX_TITLE_BODY: usize = 64 * 1024;
-                    use futures::StreamExt;
-                    let mut buf: Vec<u8> = Vec::with_capacity(8 * 1024);
-                    let mut stream = response.bytes_stream();
-                    while let Some(chunk) = stream.next().await {
-                        let chunk = chunk
-                            .map_err(|e| SeerError::HttpError(format!("body chunk: {}", e)))?;
-                        let remaining = MAX_TITLE_BODY.saturating_sub(buf.len());
-                        if remaining == 0 {
-                            break;
-                        }
-                        let take = remaining.min(chunk.len());
-                        buf.extend_from_slice(&chunk[..take]);
-                        if buf.len() >= MAX_TITLE_BODY {
-                            break;
-                        }
-                    }
-                    let body = String::from_utf8_lossy(&buf);
-                    extract_title(&body)
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-
-            return Ok((status_code, status_text, title));
-        }
-
-        Err(SeerError::HttpError("too many redirects".to_string()))
+        let fetcher = GuardedFetcher::new().with_timeout(self.timeout);
+        http_info(&fetcher, &format!("https://{domain}/")).await
     }
 
-    /// Fetches SSL certificate information using native-tls.
+    /// Fetches the leaf certificate's details via the inspection handshake
+    /// ([`crate::tls::inspect`]).
     ///
     /// # Security Note
-    /// This connection uses `danger_accept_invalid_certs(true)` to inspect certificates
-    /// even when invalid. Data retrieved (issuer, subject, dates) comes from an
-    /// unauthenticated TLS connection and may have been tampered with by a MITM.
+    /// The handshake accepts any presented chain so invalid certificates can
+    /// be inspected. Chain trust is not verified, so the data retrieved
+    /// (issuer, subject, dates) may come from a MITM's own certificate.
     async fn fetch_certificate_info(&self, domain: &str) -> Result<CertificateInfo> {
         // SSRF protection: resolve and reject reserved IPs before connecting.
         // Use crate::net::resolve_public_host so we get the Hickory fallback
         // when the OS resolver is broken (corporate Macs, Tailscale split-DNS,
-        // etc.) — the same path every other outbound-connect uses.
+        // etc.) — the same path every other outbound-connect uses. The
+        // handshake connects to exactly these addresses (no DNS rebinding).
         let socket_addrs = crate::net::resolve_public_host(domain, 443)
             .await
             .map_err(|e| SeerError::CertificateError(e.to_string()))?;
 
-        let connector = TlsConnector::builder()
-            .danger_accept_invalid_certs(true) // We want to see the cert even if invalid
-            .build()
-            .map_err(|e| SeerError::CertificateError(e.to_string()))?;
-
-        let connector = tokio_native_tls::TlsConnector::from(connector);
-
-        // Connect directly to the validated socket address to prevent DNS
-        // rebinding (TOCTOU) between validation and connect.
-        let stream =
-            tokio::time::timeout(self.timeout, TcpStream::connect(socket_addrs.as_slice()))
-                .await
-                .map_err(|_| SeerError::Timeout(format!("connection to {} timed out", domain)))?
-                .map_err(|e| SeerError::CertificateError(e.to_string()))?;
-
-        // Use the domain as SNI hostname for the TLS handshake.
-        let tls_stream = tokio::time::timeout(self.timeout, connector.connect(domain, stream))
-            .await
-            .map_err(|_| SeerError::Timeout(format!("TLS handshake with {} timed out", domain)))?
-            .map_err(|e| SeerError::CertificateError(e.to_string()))?;
-
-        // Get the peer certificate
-        let cert = tls_stream
-            .get_ref()
-            .peer_certificate()
-            .map_err(|e| SeerError::CertificateError(e.to_string()))?
-            .ok_or_else(|| SeerError::CertificateError("no certificate found".to_string()))?;
-
-        // Parse certificate info
-        let der = cert
-            .to_der()
-            .map_err(|e| SeerError::CertificateError(e.to_string()))?;
-
-        parse_certificate_der(&der, domain)
+        let presented = crate::tls::inspect(
+            domain,
+            &socket_addrs,
+            self.timeout,
+            SeerError::CertificateError,
+        )
+        .await?;
+        parse_certificate_der(&presented.leaf, domain)
     }
 
-    /// Fetches domain expiration info using WHOIS/RDAP.
-    async fn fetch_domain_expiration(&self, domain: &str) -> Result<Option<DomainExpiration>> {
-        match self.smart_lookup.lookup(domain).await {
-            Ok(result) => {
-                let (expiration_date, registrar) = result.expiration_info();
-
-                if let Some(exp_date) = expiration_date {
-                    let days_until_expiry = crate::dates::days_until(exp_date, Utc::now());
-                    Ok(Some(DomainExpiration {
-                        expiration_date: exp_date,
-                        days_until_expiry,
-                        registrar,
-                    }))
-                } else {
-                    Ok(None)
-                }
-            }
-            Err(_) => Ok(None), // Don't fail the whole status check if WHOIS fails
-        }
+    /// Fetches domain expiration info using WHOIS/RDAP; `None` when the lookup
+    /// fails (which must not fail the whole status check) or has no date.
+    async fn fetch_domain_expiration(&self, domain: &str) -> Option<DomainExpiration> {
+        let result = self.smart_lookup.lookup(domain).await.ok()?;
+        let (expiration_date, registrar) = result.expiration_info();
+        let expiration_date = expiration_date?;
+        Some(DomainExpiration {
+            expiration_date,
+            days_until_expiry: crate::dates::days_until(expiration_date, Utc::now()),
+            registrar,
+        })
     }
 
-    /// Fetches DNS root record resolution (A, AAAA, CNAME, NS).
-    async fn fetch_dns_resolution(&self, domain: &str) -> Result<DnsResolution> {
+    /// Fetches DNS root record resolution (A, AAAA, CNAME, NS). A failed
+    /// query contributes no records rather than an error.
+    async fn fetch_dns_resolution(&self, domain: &str) -> DnsResolution {
         let resolver = &self.dns_resolver;
 
         // Query all record types concurrently
@@ -353,31 +212,17 @@ impl StatusClient {
             resolver.resolve(domain, RecordType::NS, None)
         );
 
-        // Extract A records
-        let a_records: Vec<String> = a_result
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|r| {
-                if let RecordData::A { address } = r.data {
-                    Some(address)
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        // Extract AAAA records
-        let aaaa_records: Vec<String> = aaaa_result
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|r| {
-                if let RecordData::AAAA { address } = r.data {
-                    Some(address)
-                } else {
-                    None
-                }
-            })
-            .collect();
+        // Each query answers only its own type, so the A|AAAA accessor splits
+        // the two lists exactly.
+        let addresses = |result: Result<Vec<crate::dns::DnsRecord>>| -> Vec<String> {
+            result
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|r| r.data.address().map(str::to_string))
+                .collect()
+        };
+        let a_records = addresses(a_result);
+        let aaaa_records = addresses(aaaa_result);
 
         // Extract CNAME target (trim trailing dot)
         let cname_target: Option<String> =
@@ -405,17 +250,37 @@ impl StatusClient {
         // Domain resolves if it has A/AAAA records or a CNAME
         let resolves = !a_records.is_empty() || !aaaa_records.is_empty() || cname_target.is_some();
 
-        Ok(DnsResolution {
+        DnsResolution {
             a_records,
             aaaa_records,
             cname_target,
             nameservers,
             resolves,
-        })
+        }
     }
 }
 
-// Domain normalization and validation is now handled by the validation module
+/// GETs `url` and returns `(status code, reason phrase, page title)`.
+///
+/// The body is read only for a 2xx `text/html` response, where it feeds the
+/// title; any other final response reports its status straight from the
+/// headers, so a body that stalls or errors cannot fail the sub-check.
+async fn http_info(fetcher: &GuardedFetcher, url: &str) -> Result<(u16, String, Option<String>)> {
+    let (response, _) = fetcher.send(url).await?;
+    let status = response.status();
+    let is_html = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.contains("text/html"));
+    let title = if status.is_success() && is_html {
+        extract_title(&fetcher.read_body(response).await?)
+    } else {
+        None
+    };
+    let reason = status.canonical_reason().unwrap_or("Unknown").to_string();
+    Ok((status.as_u16(), reason, title))
+}
 
 /// Extracts the title from HTML content.
 ///
@@ -445,29 +310,6 @@ fn extract_title(html: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// Validates that a URL target is safe (no private/reserved IPs, no credentials,
-/// supported scheme) and returns the resolved socket addresses.
-///
-/// The caller should pin these addresses on the HTTP client to prevent DNS
-/// rebinding between validation and the actual connection.
-///
-/// Resolution goes through [`crate::net::resolve_public_host`] — the shared
-/// SSRF guard used by every other outbound leg — which bounds the OS-resolver
-/// lookup (`getaddrinfo` has no deadline, and redirect targets are
-/// attacker-influenceable, so a black-holed hostname could otherwise pin this
-/// task indefinitely) and falls back to hickory when the system resolver is
-/// broken. The reserved-range policy is unchanged (the previous local check
-/// delegated to the same `net::is_reserved_ip`), and the guard's error already
-/// omits the resolved IP (internal-DNS-oracle hardening, issue #49).
-///
-/// The policy itself lives in [`crate::net::validate_http_url`], shared with
-/// the other HTTP fetch paths (`headers`, `takeover`) so the scheme,
-/// credential, port, and reserved-range rules cannot drift between them. This
-/// wrapper is kept as the status module's named entry point.
-async fn validate_url_target(url: &Url) -> Result<Vec<SocketAddr>> {
-    crate::net::validate_http_url(url).await
-}
-
 /// Parses certificate information from DER-encoded certificate using x509-parser.
 fn parse_certificate_der(der: &[u8], domain: &str) -> Result<CertificateInfo> {
     use x509_parser::prelude::*;
@@ -485,19 +327,19 @@ fn parse_certificate_der(der: &[u8], domain: &str) -> Result<CertificateInfo> {
     let subject =
         extract_name_from_x509(cert.subject()).unwrap_or_else(|| "Unknown Subject".to_string());
 
-    // Extract validity dates
-    let valid_from = asn1_time_to_chrono(cert.validity().not_before)?;
-    let valid_until = asn1_time_to_chrono(cert.validity().not_after)?;
+    let (valid_from, valid_until) = crate::tls::validity_window(&cert)
+        .ok_or_else(|| SeerError::CertificateError("invalid certificate timestamp".to_string()))?;
 
     let now = Utc::now();
     let days_until_expiry = crate::dates::days_until(valid_until, now);
     let is_valid = now >= valid_from && now <= valid_until;
 
-    // Hostname verification is performed manually because the TLS connector
-    // was configured with danger_accept_invalid_certs(true) to allow cert
-    // inspection on mildly-broken sites. Without this check any cert — even
-    // one issued for an unrelated domain — would be accepted.
-    let hostname_verified = cert_matches_hostname(&cert, domain);
+    // Hostname verification is performed manually because the inspection
+    // handshake accepts any presented chain to allow cert inspection on
+    // mildly-broken sites. Without this check any cert — even one issued for
+    // an unrelated domain — would be accepted. The rule is shared with
+    // `ssl.rs`, so `seer status` and `seer ssl` cannot disagree.
+    let hostname_verified = crate::tls::cert_matches_host(&cert, domain);
 
     Ok(CertificateInfo {
         issuer,
@@ -508,65 +350,6 @@ fn parse_certificate_der(der: &[u8], domain: &str) -> Result<CertificateInfo> {
         is_valid,
         hostname_verified,
     })
-}
-
-/// Matches a hostname against a certificate name pattern.
-///
-/// Supports exact matches (case-insensitive) and single-label wildcards
-/// per RFC 6125 — `*.example.com` matches `a.example.com` but not
-/// `example.com` or `a.b.example.com`.
-fn hostname_matches_pattern(host: &str, pattern: &str) -> bool {
-    let host = host.to_ascii_lowercase();
-    let pattern = pattern.to_ascii_lowercase();
-    if let Some(rest) = pattern.strip_prefix("*.") {
-        // Wildcard: must match exactly one label, and must contain a dot
-        let Some(dot) = host.find('.') else {
-            return false;
-        };
-        let host_rest = &host[dot + 1..];
-        host_rest == rest
-    } else {
-        host == pattern
-    }
-}
-
-/// Checks whether a certificate's SAN dNSName entries (or CN as fallback)
-/// match the queried hostname.
-///
-/// Per RFC 6125 §6.4.4, SAN dNSName is the authoritative source and the CN
-/// is consulted ONLY when the certificate carries no dNSName SAN at all —
-/// otherwise a cert whose SANs cover other hosts but whose CN happens to
-/// name this one would falsely verify. Mirrors `ssl.rs`, so `seer status`
-/// and `seer ssl` cannot disagree about the same certificate.
-fn cert_matches_hostname(cert: &x509_parser::certificate::X509Certificate<'_>, host: &str) -> bool {
-    use x509_parser::prelude::*;
-
-    // SAN dNSName entries (preferred per RFC 6125)
-    let mut has_dns_san = false;
-    if let Ok(Some(san_ext)) = cert.tbs_certificate.subject_alternative_name() {
-        for name in &san_ext.value.general_names {
-            if let GeneralName::DNSName(n) = name {
-                has_dns_san = true;
-                if hostname_matches_pattern(host, n) {
-                    return true;
-                }
-            }
-        }
-    }
-    if has_dns_san {
-        return false;
-    }
-
-    // CN fallback (legacy) — only for certificates without dNSName SANs.
-    for cn in cert.subject().iter_common_name() {
-        if let Ok(s) = cn.as_str() {
-            if hostname_matches_pattern(host, s) {
-                return true;
-            }
-        }
-    }
-
-    false
 }
 
 /// Builds a human-readable issuer label, combining Organization and Common
@@ -601,33 +384,11 @@ fn extract_oid_value(
     None
 }
 
-/// Extracts the Common Name or Organization from an X.509 name.
+/// Extracts the Common Name, falling back to the Organization.
 fn extract_name_from_x509(name: &x509_parser::prelude::X509Name) -> Option<String> {
-    use x509_parser::prelude::*;
-
-    // Try Common Name first (OID 2.5.4.3)
-    for rdn in name.iter() {
-        for attr in rdn.iter() {
-            if attr.attr_type() == &oid_registry::OID_X509_COMMON_NAME {
-                if let Some(s) = extract_attr_string(attr.attr_value()) {
-                    return Some(s);
-                }
-            }
-        }
-    }
-
-    // Fall back to Organization (OID 2.5.4.10)
-    for rdn in name.iter() {
-        for attr in rdn.iter() {
-            if attr.attr_type() == &oid_registry::OID_X509_ORGANIZATION_NAME {
-                if let Some(s) = extract_attr_string(attr.attr_value()) {
-                    return Some(s);
-                }
-            }
-        }
-    }
-
-    None
+    use x509_parser::oid_registry;
+    extract_oid_value(name, &oid_registry::OID_X509_COMMON_NAME)
+        .or_else(|| extract_oid_value(name, &oid_registry::OID_X509_ORGANIZATION_NAME))
 }
 
 /// Extracts a string from an ASN.1 attribute value, handling different encodings.
@@ -650,13 +411,6 @@ fn extract_attr_string(value: &x509_parser::der_parser::asn1_rs::Any) -> Option<
     None
 }
 
-/// Converts an x509-parser ASN1Time to a chrono DateTime.
-fn asn1_time_to_chrono(time: x509_parser::time::ASN1Time) -> Result<chrono::DateTime<Utc>> {
-    let timestamp = time.timestamp();
-    chrono::DateTime::from_timestamp(timestamp, 0)
-        .ok_or_else(|| SeerError::CertificateError("invalid certificate timestamp".to_string()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -669,117 +423,81 @@ mod tests {
         assert_eq!(client.timeout, Duration::from_secs(55));
     }
 
+    /// A/AAAA/CNAME/NS extraction over the full resolve path, against the
+    /// loopback DNS fixture.
+    #[tokio::test]
+    async fn dns_resolution_splits_address_families() {
+        use crate::dns::test_support::{mock_dns_resolver_default, spawn_mock_dns, MockMode};
+
+        let port = spawn_mock_dns(MockMode::Zone).await;
+        let client = StatusClient {
+            dns_resolver: mock_dns_resolver_default(port),
+            ..StatusClient::new()
+        };
+        let dns = client.fetch_dns_resolution("seer.test").await;
+        assert_eq!(dns.a_records, ["192.0.2.1", "192.0.2.2"]);
+        assert_eq!(dns.aaaa_records, ["2001:db8::1"]);
+        assert_eq!(dns.cname_target, None);
+        assert_eq!(dns.nameservers, ["ns1.seer.test"]);
+        assert!(dns.resolves);
+    }
+
+    /// The hostname verdict comes from the rule shared with `ssl.rs`
+    /// (`tls::cert_matches_host`, which carries the RFC 6125 cases).
     #[test]
-    fn hostname_matches_pattern_exact() {
-        assert!(hostname_matches_pattern("example.com", "example.com"));
-        assert!(hostname_matches_pattern("EXAMPLE.COM", "example.com"));
-        assert!(hostname_matches_pattern("example.com", "EXAMPLE.COM"));
-        assert!(!hostname_matches_pattern("evil.com", "example.com"));
-        assert!(!hostname_matches_pattern("example.com", "evil.com"));
+    fn certificate_hostname_uses_the_shared_rule() {
+        use crate::tls::test_support::{cert, CN_VICTIM_SAN_IP, CN_VICTIM_SAN_OTHER};
+
+        let verified = |b64, host| {
+            parse_certificate_der(&cert(b64), host)
+                .unwrap()
+                .hostname_verified
+        };
+        assert!(!verified(CN_VICTIM_SAN_OTHER, "victim.example"));
+        assert!(verified(CN_VICTIM_SAN_IP, "victim.example"));
+        // An IP-literal host now matches an iPAddress SAN, as in `seer ssl`.
+        assert!(verified(CN_VICTIM_SAN_IP, "203.0.113.7"));
     }
 
-    #[test]
-    fn hostname_matches_pattern_wildcard() {
-        assert!(hostname_matches_pattern("a.example.com", "*.example.com"));
-        assert!(hostname_matches_pattern("A.EXAMPLE.COM", "*.example.com"));
-        // Apex must not match wildcard (RFC 6125)
-        assert!(!hostname_matches_pattern("example.com", "*.example.com"));
-        // Wildcard only covers a single label
-        assert!(!hostname_matches_pattern(
-            "a.b.example.com",
-            "*.example.com"
-        ));
-        assert!(!hostname_matches_pattern("b.other.com", "*.example.com"));
-    }
-
-    #[test]
-    fn hostname_matches_pattern_wildcard_requires_dot() {
-        // A bare host with no dot cannot match a wildcard pattern
-        assert!(!hostname_matches_pattern("localhost", "*.example.com"));
-    }
-
-    /// Self-signed P-256 cert: CN=victim.example, SAN=DNS:other.example.
-    const CERT_CN_VICTIM_SAN_OTHER: &str = "MIIBoDCCAUegAwIBAgIUdStRrtt0ycIGUV74700+xRrFcJ0wCgYIKoZIzj0EAwIwGTEXMBUGA1UEAwwOdmljdGltLmV4YW1wbGUwHhcNMjYwOTIyMTcwMzA4WhcNMzYwOTE5MTcwMzA4WjAZMRcwFQYDVQQDDA52aWN0aW0uZXhhbXBsZTBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABJPCvcjh/aeA2qb1taFaBCxI/ue4srU8jUNjjvQW9IKMqdsUluEGjW7fcYSa8w/79MWZ/naVmgZKQs/eSXCU/AWjbTBrMB0GA1UdDgQWBBSG5So71BSr3DZri66kQaPKzWbjNDAfBgNVHSMEGDAWgBSG5So71BSr3DZri66kQaPKzWbjNDAPBgNVHRMBAf8EBTADAQH/MBgGA1UdEQQRMA+CDW90aGVyLmV4YW1wbGUwCgYIKoZIzj0EAwIDRwAwRAIgEnAMNQMytsawL+CuV7N9z/ftwHVzdFunp+oG7QjIou4CIHsf9vyIXQUPs5iBrhprcRiwyuZQWy0mZyRdavp4Kgbh";
-    /// Self-signed P-256 cert: CN=victim.example, no SAN extension.
-    const CERT_CN_VICTIM_NO_SAN: &str = "MIIBhzCCAS2gAwIBAgIUeGkzmcc68l5FOH5NOBgS3Ybcg4gwCgYIKoZIzj0EAwIwGTEXMBUGA1UEAwwOdmljdGltLmV4YW1wbGUwHhcNMjYwOTIyMTcwMzA4WhcNMzYwOTE5MTcwMzA4WjAZMRcwFQYDVQQDDA52aWN0aW0uZXhhbXBsZTBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABC6rgHiHBhd3vxpcRHm7VH2YgCybc0Bl4ewS1lMjdtM5+R+pX/STje36olq5IDx9AEJfxtdRMvtiWp9jfb5vdB6jUzBRMB0GA1UdDgQWBBS5JfZqENT0bfsAazBNLiAVb77UdzAfBgNVHSMEGDAWgBS5JfZqENT0bfsAazBNLiAVb77UdzAPBgNVHRMBAf8EBTADAQH/MAoGCCqGSM49BAMCA0gAMEUCIQD5zMnpSHSVr3vSmZM0vh0R345Rg3wc+OgeZwmsDxDJQQIgBNJ0CS0bpChCAQls0oFZUPD6u7iX7uBOD/QRPZ2Ub1k=";
-
-    fn cert_info(b64: &str, host: &str) -> CertificateInfo {
-        use base64::{engine::general_purpose::STANDARD, Engine};
-        let der = STANDARD.decode(b64).unwrap();
-        parse_certificate_der(&der, host).unwrap()
-    }
-
-    #[test]
-    fn cn_is_ignored_when_the_cert_has_dns_sans() {
-        // RFC 6125 §6.4.4: a matching CN must not rescue a cert whose SANs
-        // name other hosts. `seer ssl` already applied this; status did not.
-        assert!(!cert_info(CERT_CN_VICTIM_SAN_OTHER, "victim.example").hostname_verified);
-        assert!(cert_info(CERT_CN_VICTIM_SAN_OTHER, "other.example").hostname_verified);
-        // Legacy cert with no SAN at all still falls back to the CN.
-        assert!(cert_info(CERT_CN_VICTIM_NO_SAN, "victim.example").hostname_verified);
-        assert!(!cert_info(CERT_CN_VICTIM_NO_SAN, "other.example").hostname_verified);
-    }
-
-    // --- validate_url_target tests (hermetic: IP literals, no DNS) -------
+    // --- http_info (hermetic: wiremock on 127.0.0.1 via the test seam) ----
 
     #[tokio::test]
-    async fn validate_url_target_rejects_unsupported_scheme() {
-        let url = Url::parse("ftp://example.com/").unwrap();
-        let err = validate_url_target(&url).await.unwrap_err();
-        assert!(
-            matches!(err, SeerError::HttpError(ref s) if s.contains("unsupported URL scheme")),
-            "got: {err:?}"
-        );
-    }
+    async fn http_info_reads_title_only_for_html_success() {
+        use wiremock::matchers::path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    #[tokio::test]
-    async fn validate_url_target_rejects_credentials() {
-        let url = Url::parse("https://user:pass@example.com/").unwrap();
-        let err = validate_url_target(&url).await.unwrap_err();
-        assert!(
-            matches!(err, SeerError::HttpError(ref s) if s.contains("credentials")),
-            "got: {err:?}"
-        );
-    }
+        let server = MockServer::start().await;
+        Mock::given(path("/"))
+            .respond_with(ResponseTemplate::new(301).insert_header("location", "/home"))
+            .mount(&server)
+            .await;
+        Mock::given(path("/home"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                "<html><title> Home\u{0}Page </title></html>",
+                "text/html; charset=utf-8",
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(path("/json"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw("<title>x</title>", "text/plain"))
+            .mount(&server)
+            .await;
 
-    #[tokio::test]
-    async fn validate_url_target_rejects_non_standard_port() {
-        let url = Url::parse("https://8.8.8.8:8443/").unwrap();
-        let err = validate_url_target(&url).await.unwrap_err();
-        assert!(
-            matches!(err, SeerError::HttpError(ref s) if s.contains("non-standard port")),
-            "got: {err:?}"
-        );
-    }
+        let fetcher = GuardedFetcher::new().allowing_private_hosts();
+        let info = http_info(&fetcher, &format!("{}/", server.uri()))
+            .await
+            .unwrap();
+        assert_eq!(info, (200, "OK".to_string(), Some("HomePage".to_string())));
 
-    #[tokio::test]
-    async fn validate_url_target_rejects_loopback_literal() {
-        let url = Url::parse("https://127.0.0.1/").unwrap();
-        let err = validate_url_target(&url).await.unwrap_err();
-        assert!(
-            matches!(err, SeerError::HttpError(ref s) if s.contains("reserved")),
-            "got: {err:?}"
-        );
-    }
+        let info = http_info(&fetcher, &format!("{}/json", server.uri()))
+            .await
+            .unwrap();
+        assert_eq!(info, (200, "OK".to_string(), None));
 
-    #[tokio::test]
-    async fn validate_url_target_rejects_bracketed_ipv6_loopback_literal() {
-        // `Url::host_str()` keeps the brackets on an IPv6 literal; the
-        // `Url::host()` extraction must unbracket it so the shared guard's
-        // IP-literal short-circuit catches it (no DNS involved).
-        let url = Url::parse("https://[::1]/").unwrap();
-        let err = validate_url_target(&url).await.unwrap_err();
-        assert!(
-            matches!(err, SeerError::HttpError(ref s) if s.contains("reserved")),
-            "got: {err:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn validate_url_target_allows_public_ip_literal() {
-        let url = Url::parse("https://8.8.8.8/").unwrap();
-        let addrs = validate_url_target(&url).await.unwrap();
-        assert_eq!(addrs.len(), 1);
-        assert_eq!(addrs[0].port(), 443);
+        // Non-2xx reports the status without a title.
+        let info = http_info(&fetcher, &format!("{}/missing", server.uri()))
+            .await
+            .unwrap();
+        assert_eq!(info, (404, "Not Found".to_string(), None));
     }
 }

@@ -2,16 +2,17 @@ mod clipboard;
 mod display;
 mod ops;
 mod payload;
+mod query;
 mod repl;
 mod tui;
 mod utils;
 
 use std::io::Write;
-use std::sync::Arc;
 
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{generate, Shell};
-use indicatif::{ProgressBar, ProgressStyle};
+use payload::Payload;
+use query::Query;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 #[clap(rename_all = "lowercase")]
@@ -37,12 +38,12 @@ enum ProgressMode {
 fn resolve_progress_mode(
     flag: Option<ProgressMode>,
     stderr_is_tty: bool,
-    format: &str,
+    format: seer_core::output::OutputFormat,
 ) -> ProgressMode {
     if let Some(mode) = flag {
         return mode;
     }
-    if format.eq_ignore_ascii_case("json") {
+    if format == seer_core::output::OutputFormat::Json {
         return ProgressMode::None;
     }
     if !stderr_is_tty {
@@ -62,21 +63,17 @@ enum FailOn {
     Critical,
 }
 
-const BULK_EXAMPLES: &str = r#"
-Input File Formats:
-  Plain text (one domain per line, # for comments):
-    # My domains to check
-    example.com
-    google.com
-    github.com
+/// `seer bulk --help` epilogue: the input formats (shared with the REPL's
+/// `bulk -h`), then [`BULK_EXAMPLES`].
+fn bulk_long_help() -> String {
+    format!(
+        "\nInput File Formats:\n{}\n{}",
+        ops::BULK_INPUT_FORMATS,
+        BULK_EXAMPLES
+    )
+}
 
-  CSV (uses first column, skips header if present):
-    domain,owner,notes
-    example.com,Alice,Main site
-    google.com,Bob,Search
-    github.com,Carol,Code hosting
-
-Example Usage:
+const BULK_EXAMPLES: &str = r#"Example Usage:
   seer bulk status domains.txt              # Output: domains_results.csv
   seer bulk lookup domains.csv              # Output: domains_results.csv
   seer bulk dig domains.txt MX              # Output: domains_results.csv
@@ -114,7 +111,7 @@ Example Output (info operation):
 
 Example Output (ssl operation):
   domain,success,subject,issuer,valid_from,valid_until,days_remaining,signature_algorithm,key_type,key_bits,chain_length,san_count,sans,protocol_version,is_valid,duration_ms,error
-  example.com,true,CN=*.example.com,"C=US, O=DigiCert Inc, CN=DigiCert Global G2 TLS RSA SHA256 2020 CA1",2024-01-30,2025-03-01,89,sha256WithRSAEncryption,RSA,2048,3,2,*.example.com;example.com,TLS 1.3,true,612,
+  example.com,true,CN=*.example.com,"C=US, O=DigiCert Inc, CN=DigiCert Global G2 TLS RSA SHA256 2020 CA1",2024-01-30,2025-03-01,89,sha256WithRSAEncryption,RSA,2048,3,2,*.example.com;example.com,TLSv1.3,true,612,
 
 Example Output (posture operation):
   domain,success,spf_verdict,spf_all_qualifier,dmarc_verdict,dmarc_policy,mta_sts_verdict,bimi_verdict,dane_verdict,notes,duration_ms,error
@@ -200,9 +197,12 @@ enum Commands {
     /// Execute bulk operations from a file, output results to CSV.
     /// CSV output includes anti-formula protection for spreadsheets; use `--format json`
     /// for programmatic consumption without spreadsheet escaping.
-    #[command(after_long_help = BULK_EXAMPLES)]
+    #[command(after_long_help = bulk_long_help())]
     Bulk {
-        #[arg(value_name = "OPERATION", help = ops::BULK_OP_HELP)]
+        #[arg(
+            value_name = "OPERATION",
+            help = format!("Operation type: {}", *ops::BULK_OPS_SUMMARY)
+        )]
         operation: String,
 
         /// Input file path (text or CSV format), or `-` to read the domain
@@ -457,6 +457,10 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // First, so no panic leaves crossterm's raw mode on, even under the dist
+    // profile's panic = "abort", which skips RawModeGuard's Drop.
+    utils::install_raw_mode_panic_hook();
+
     // Initialize tracing with progress-aware writer.
     // Routes log output through the progress bar when one is active,
     // preventing logs from interfering with progress bar display.
@@ -580,18 +584,15 @@ fn extract_fields(value: &serde_json::Value, fields: &[String]) {
     }
 }
 
-/// Handle quiet output for a serializable result.
-/// If `fields` is Some, extracts and prints the requested fields and returns true.
-/// If `fields` is None, prints compact JSON and returns true.
-fn handle_quiet_output<T: serde::Serialize>(value: &T, fields: &Option<Vec<String>>) -> bool {
+/// Quiet (`-q`) output: the requested `--fields` one per line, or the whole
+/// result as compact JSON.
+fn handle_quiet_output<T: serde::Serialize>(value: &T, fields: &Option<Vec<String>>) {
     if let Some(ref fields) = fields {
         let json_value = serde_json::to_value(value).unwrap_or_default();
         extract_fields(&json_value, fields);
-        true
     } else {
         let json = serde_json::to_string(value).unwrap_or_default();
         println!("{}", json);
-        true
     }
 }
 
@@ -614,15 +615,6 @@ fn emit_error<E: std::fmt::Display>(output_format: seer_core::output::OutputForm
 /// only the formatted iterations and summary and stays machine-parseable.
 fn follow_notes_to_stderr(output_format: seer_core::output::OutputFormat) -> bool {
     output_format != seer_core::output::OutputFormat::Human
-}
-
-/// Check-style verdict for `seer dnssec`: only a `"signed"` zone passes.
-///
-/// Core's status vocabulary is `signed | unsigned | partial | misconfigured`
-/// (see `DnssecReport::status`); it deliberately never says "secure", so
-/// comparing against that word made every correctly signed zone exit 1.
-fn dnssec_check_passed(report: &seer_core::DnssecReport) -> bool {
-    report.status == "signed"
 }
 
 /// Every name `RecordType::from_str` accepts, for error messages —
@@ -657,6 +649,9 @@ fn parse_record_type(
     }
 }
 
+/// Runs a subcommand. Single-shot queries share [`query::run`] with the REPL
+/// and render through the one path at the end; the other subcommands (bulk,
+/// follow, watchlist/history management, local utilities) run inline.
 async fn execute_command(
     command: Commands,
     output_format: seer_core::output::OutputFormat,
@@ -665,143 +660,67 @@ async fn execute_command(
     config: &seer_core::SeerConfig,
 ) -> anyhow::Result<()> {
     let formatter = seer_core::output::get_formatter(output_format);
-
-    match command {
-        Commands::Lookup { domain } => {
-            let spinner = Arc::new(display::Spinner::new(&format!(
-                "Smart lookup for {} (trying RDAP first)",
-                domain
-            )));
-
-            // Create progress callback that updates the spinner
-            let spinner_clone = spinner.clone();
-            let progress: seer_core::LookupProgressCallback = Arc::new(move |message| {
-                spinner_clone.set_message(message);
-            });
-
-            let lookup = seer_core::SmartLookup::from_config(config);
-            match lookup.lookup_with_progress(&domain, Some(progress)).await {
-                Ok(result) => {
-                    spinner.finish();
-                    // Record to history (file I/O off the async executor)
-                    ops::record_lookup_history(&domain, result.clone()).await;
-
-                    if quiet {
-                        handle_quiet_output(&result, &fields);
-                    } else {
-                        println!("{}", formatter.format_lookup(&result));
-                    }
-                }
-                Err(e) => {
-                    spinner.finish();
-                    emit_error(output_format, &e);
-                }
-            }
-        }
-        Commands::Info { domain } => {
-            let spinner = Arc::new(display::Spinner::new(&format!(
-                "Getting comprehensive info for {}",
-                domain
-            )));
-
-            let lookup = seer_core::SmartLookup::from_config(config);
-            match lookup.lookup(&domain).await {
-                Ok(result) => {
-                    spinner.finish();
-                    let info = seer_core::DomainInfo::from_lookup_result(&result);
-                    if quiet {
-                        handle_quiet_output(&info, &fields);
-                    } else {
-                        println!("{}", formatter.format_domain_info(&info));
-                    }
-                }
-                Err(e) => {
-                    spinner.finish();
-                    emit_error(output_format, &e);
-                }
-            }
-        }
-        Commands::Whois { domain } => {
-            let client = seer_core::WhoisClient::from_config(config);
-            match client.lookup(&domain).await {
-                Ok(response) => {
-                    if quiet {
-                        handle_quiet_output(&response, &fields);
-                    } else {
-                        println!("{}", formatter.format_whois(&response));
-                    }
-                }
-                Err(e) => {
-                    emit_error(output_format, &e);
-                }
-            }
-        }
-        Commands::Rdap { query } => {
-            let client = seer_core::RdapClient::from_config(config);
-            // Use seer_core::rdap::auto_lookup so the `AS<digits>` route only
-            // fires when the remainder is all digits AND the query contains no
-            // `.` — otherwise `as1234.io` / `asset.io` would misroute to ASN
-            // and surface a "parse" error instead of a domain lookup.
-            let result = seer_core::rdap::auto_lookup(&client, &query).await;
-
-            match result {
-                Ok(response) => {
-                    if quiet {
-                        handle_quiet_output(&response, &fields);
-                    } else {
-                        println!("{}", formatter.format_rdap(&response));
-                    }
-                }
-                Err(e) => {
-                    emit_error(output_format, &e);
-                }
-            }
-        }
+    // Record types are validated before any network I/O, through
+    // `emit_error` so a typo honors `--format json|yaml` too.
+    let parse_type = |name: &str| parse_record_type(name, output_format);
+    let query = match command {
+        Commands::Lookup { domain } => Query::Lookup(domain),
+        Commands::Info { domain } => Query::Info(domain),
+        Commands::Whois { domain } => Query::Whois(domain),
+        Commands::Rdap { query } => Query::Rdap(query),
         Commands::Dig {
             domain,
-            record_type,
+            record_type: rt,
             server,
-        } => {
-            let resolver = seer_core::DnsResolver::from_config(config);
-            let rt = parse_record_type(&record_type, output_format);
-            let ns = server
-                .as_ref()
-                .map(|s| s.trim_start_matches('@'))
-                .or(config.nameserver.as_deref());
-
-            match resolver.resolve(&domain, rt, ns).await {
-                Ok(records) => {
-                    if quiet {
-                        handle_quiet_output(&records, &fields);
-                    } else {
-                        println!("{}", formatter.format_dns(&records));
-                    }
-                }
-                Err(e) => {
-                    emit_error(output_format, &e);
-                }
-            }
-        }
+        } => Query::Dig {
+            domain,
+            record_type: parse_type(&rt),
+            server: server.map(|s| s.trim_start_matches('@').to_string()),
+        },
         Commands::Prop {
             domain,
-            record_type,
-        } => {
-            let checker = seer_core::dns::PropagationChecker::new();
-            let rt = parse_record_type(&record_type, output_format);
-
-            match checker.check(&domain, rt).await {
-                Ok(result) => {
-                    if quiet {
-                        handle_quiet_output(&result, &fields);
-                    } else {
-                        println!("{}", formatter.format_propagation(&result));
-                    }
-                }
-                Err(e) => {
-                    emit_error(output_format, &e);
-                }
-            }
-        }
+            record_type: rt,
+        } => Query::Prop {
+            domain,
+            record_type: parse_type(&rt),
+        },
+        Commands::Status { domain } => Query::Status(domain),
+        Commands::Reverse { ip } => Query::Reverse(ip),
+        Commands::Avail { domain } => Query::Avail(domain),
+        Commands::Dnssec { domain } => Query::Dnssec(domain),
+        Commands::Ssl { domain } => Query::Ssl(domain),
+        Commands::Tld { tld } => Query::Tld(tld),
+        Commands::Compare {
+            domain,
+            server_a,
+            server_b,
+            record_type: rt,
+        } => Query::Compare {
+            domain,
+            record_type: parse_type(&rt),
+            server_a: server_a.trim_start_matches('@').to_string(),
+            server_b: server_b.trim_start_matches('@').to_string(),
+        },
+        Commands::Subdomains {
+            domain,
+            resolve,
+            diff,
+            record,
+        } => Query::Subdomains {
+            domain,
+            resolve,
+            diff,
+            record,
+        },
+        Commands::Diff { domain_a, domain_b } => Query::Diff(domain_a, domain_b),
+        Commands::Drift { domain, record } => Query::Drift { domain, record },
+        Commands::Caa { domain } => Query::Caa(domain),
+        Commands::Posture { domain } => Query::Posture(domain),
+        Commands::Headers { domain } => Query::Headers(domain),
+        Commands::Takeover { domain, hosts } => Query::Takeover { domain, hosts },
+        Commands::Confusables { domain } => Query::Confusables(domain),
+        Commands::Doctor => Query::Doctor,
+        Commands::Delegation { domain } => Query::Delegation(domain),
         Commands::Bulk {
             operation,
             file,
@@ -810,13 +729,7 @@ async fn execute_command(
             progress,
         } => {
             let stderr_is_tty = std::io::IsTerminal::is_terminal(&std::io::stderr());
-            let format_str = match output_format {
-                seer_core::output::OutputFormat::Json => "json",
-                seer_core::output::OutputFormat::Human => "human",
-                seer_core::output::OutputFormat::Yaml => "yaml",
-                seer_core::output::OutputFormat::Markdown => "markdown",
-            };
-            let progress_mode = resolve_progress_mode(progress, stderr_is_tty, format_str);
+            let progress_mode = resolve_progress_mode(progress, stderr_is_tty, output_format);
 
             // `-` reads a newline/CSV-delimited domain list from stdin so bulk
             // composes with shell pipelines (`grep … | seer bulk status -`).
@@ -864,41 +777,17 @@ async fn execute_command(
                 .unwrap_or_else(|e| emit_error(output_format, &e));
 
             // Status goes to stderr so it never pollutes a structured stdout stream.
-            eprintln!(
-                "Processing {} domains with {} operation...",
-                domains.len().to_string().ctp_green(),
-                operation.ctp_yellow()
-            );
+            eprintln!("{}", ops::bulk_banner(domains.len(), &operation));
 
-            let total = operations.len();
-
-            // Construct the progress bar (when applicable) and activate it for
-            // tracing integration so log lines route through pb.println().
-            let pb: Option<Arc<ProgressBar>> = match progress_mode {
-                ProgressMode::None => None,
-                ProgressMode::Bar | ProgressMode::Verbose | ProgressMode::Failures => {
-                    let bar = ProgressBar::new(total as u64);
-                    bar.set_style(
-                        ProgressStyle::default_bar()
-                            .template("{bar:40.cyan/blue} {pos}/{len} ({percent}%) eta {eta} {msg}")
-                            .expect("valid progress bar template")
-                            .progress_chars("=>-"),
-                    );
-                    display::set_bulk_progress_bar(bar.clone());
-                    Some(Arc::new(bar))
-                }
-            };
-
-            let callback: Option<seer_core::bulk::ProgressCallback> = pb
-                .as_ref()
-                .map(|bar| ops::bar_progress_callback(bar.as_ref()));
-
+            let bar =
+                (progress_mode != ProgressMode::None).then(|| ops::bulk_bar(operations.len()));
+            let callback = bar.as_ref().map(ops::bar_progress_callback);
             let results = executor.execute(operations, callback).await;
 
             // Emit per-item lines according to mode, then clear the bar.
             // `bar_println` falls back to plain stderr when indicatif hid the
             // bar (non-TTY stderr), where `println` would silently drop them.
-            if let Some(bar) = pb.as_ref() {
+            if let Some(bar) = &bar {
                 for r in &results {
                     let domain = r.operation.domain();
                     let line = match (progress_mode, r.success) {
@@ -918,12 +807,8 @@ async fn execute_command(
                         let _ = display::bar_println(bar, &line);
                     }
                 }
-                bar.finish_and_clear();
-                display::clear_bulk_progress_bar();
+                ops::finish_bulk_bar(bar);
             }
-
-            let success_count = results.iter().filter(|r| r.success).count();
-            let fail_count = results.len() - success_count;
 
             if structured_output {
                 // Serialize the full result set to stdout (JSON array / YAML).
@@ -938,15 +823,8 @@ async fn execute_command(
             }
 
             if let Some(csv_path) = &csv_path {
-                // Convert results to CSV. Write atomically so a crash mid-write
-                // cannot leave a truncated CSV that downstream pipelines treat
-                // as authoritative.
-                let csv_content = utils::bulk_results_to_csv(&results, &operation);
-                if let Err(e) = utils::atomic_write(csv_path, &csv_content) {
-                    emit_error(
-                        output_format,
-                        &format!("Failed to write output file {}: {}", csv_path, e),
-                    );
+                if let Err(e) = ops::write_bulk_csv(&results, &operation, csv_path) {
+                    emit_error(output_format, &e);
                 }
                 let written = format!("Results written to: {}", csv_path.ctp_green());
                 // Keep stdout a clean JSON/YAML document in structured mode.
@@ -957,15 +835,7 @@ async fn execute_command(
                 }
             }
 
-            let summary = format!(
-                "  {} successful, {} failed",
-                success_count.to_string().ctp_green(),
-                if fail_count > 0 {
-                    fail_count.to_string().ctp_red()
-                } else {
-                    fail_count.to_string().ctp_green()
-                }
-            );
+            let summary = ops::bulk_summary(&results);
             if structured_output {
                 eprintln!("{}", summary);
             } else {
@@ -974,125 +844,157 @@ async fn execute_command(
 
             // A run with zero successes is a total failure (network down,
             // every domain malformed) — scripted callers gate on $?.
-            let exit_code = utils::bulk_exit_code(success_count, results.len());
-            if exit_code != 0 {
-                std::process::exit(exit_code);
+            let success_count = results.iter().filter(|r| r.success).count();
+            let code = utils::bulk_exit_code(success_count, results.len());
+            if code != 0 {
+                std::process::exit(code);
             }
+            return Ok(());
         }
-        Commands::Status { domain } => {
-            let client = seer_core::StatusClient::from_config(config);
-            match client.check(&domain).await {
-                Ok(response) => {
-                    if quiet {
-                        handle_quiet_output(&response, &fields);
-                    } else {
-                        println!("{}", formatter.format_status(&response));
-                    }
-                    // Exit with 1 if any health issues detected
-                    let has_issues = response
-                        .http_status
-                        .is_none_or(|s| !(200..300).contains(&s))
-                        || response
-                            .certificate
-                            .as_ref()
-                            .is_some_and(|c| !c.is_valid || c.days_until_expiry < 30)
-                        || response
-                            .domain_expiration
-                            .as_ref()
-                            .is_some_and(|d| d.days_until_expiry < 30);
-                    if has_issues {
-                        std::process::exit(1);
-                    }
-                }
-                Err(e) => {
-                    emit_error(output_format, &e);
-                }
-            }
-        }
-        Commands::Reverse { ip } => {
-            let resolver = seer_core::DnsResolver::from_config(config);
-            // Honor the configured nameserver, like `dig`.
-            match resolver
-                .resolve(
-                    &ip,
-                    seer_core::RecordType::PTR,
-                    config.nameserver.as_deref(),
-                )
-                .await
-            {
-                Ok(records) => {
-                    if quiet {
-                        handle_quiet_output(&records, &fields);
-                    } else {
-                        println!("{}", formatter.format_dns(&records));
-                    }
-                }
-                Err(e) => {
-                    emit_error(output_format, &e);
-                }
-            }
-        }
-        Commands::Avail { domain } => {
-            let checker = seer_core::AvailabilityChecker::from_config(config);
-            match checker.check(&domain).await {
-                Ok(result) => {
-                    if quiet {
-                        handle_quiet_output(&result, &fields);
-                    } else {
-                        println!("{}", formatter.format_availability(&result));
-                    }
-                    if !result.available {
-                        std::process::exit(1);
-                    }
-                }
-                Err(e) => {
-                    emit_error(output_format, &e);
-                }
-            }
-        }
-        Commands::Dnssec { domain } => {
-            let checker = seer_core::DnssecChecker::new();
-            match checker.check(&domain).await {
-                Ok(report) => {
-                    if quiet {
-                        handle_quiet_output(&report, &fields);
-                    } else {
-                        println!("{}", formatter.format_dnssec(&report));
-                    }
-                    if !dnssec_check_passed(&report) {
-                        std::process::exit(1);
-                    }
-                }
-                Err(e) => {
-                    emit_error(output_format, &e);
-                }
-            }
-        }
-        Commands::Completions { shell } => {
-            let mut cmd = Cli::command();
-            generate(shell, &mut cmd, "seer", &mut std::io::stdout());
-        }
-        Commands::GenerateKey { export, bytes } => {
-            use base64::Engine;
+        Commands::Follow {
+            domain,
+            iterations,
+            interval_minutes,
+            record_type,
+            server,
+            changes_only,
+        } => {
+            let rt = parse_record_type(&record_type, output_format);
+            let ns = server
+                .as_ref()
+                .map(|s| s.trim_start_matches('@'))
+                .or(config.nameserver.as_deref());
 
-            if bytes == 0 || bytes > 4096 {
-                eprintln!("{} --bytes must be between 1 and 4096", "Error:".ctp_red());
-                std::process::exit(2);
+            let follow_config = match seer_core::FollowConfig::new(iterations, interval_minutes) {
+                Ok(cfg) => cfg.with_changes_only(changes_only),
+                Err(e) => {
+                    emit_error(output_format, &e);
+                }
+            };
+
+            // Honor the config file's DNS timeout like `dig` does.
+            let follower = seer_core::DnsFollower::from_config(config);
+
+            // The banner is prose, so under a machine format it goes to stderr
+            // and stdout stays a parseable stream (`seer --format json follow
+            // … | jq`). `\r\n` matches the raw-mode iteration lines that follow.
+            let notes_to_stderr = follow_notes_to_stderr(output_format);
+            let banner = format!(
+                "Following {} {} records ({} iterations, {} interval)\r\nPress {} or {} to stop early\r\n\r\n",
+                domain.ctp_green(),
+                record_type.ctp_yellow(),
+                iterations.to_string().ctp_yellow(),
+                utils::format_interval(interval_minutes),
+                "Esc".ctp_yellow(),
+                "Ctrl+C".ctp_yellow()
+            );
+            if notes_to_stderr {
+                eprint!("{}", banner);
+                let _ = std::io::stderr().flush();
+            } else {
+                print!("{}", banner);
+                let _ = std::io::stdout().flush();
             }
-            let mut buf = vec![0u8; bytes];
-            // Fill with OS entropy directly via getrandom — the CSPRNG source
-            // that rand's OsRng merely wraps. It's the right primitive for key
-            // material and immune to rand's RNG-trait churn across versions.
-            if let Err(e) = getrandom::fill(&mut buf) {
-                eprintln!("{} OS RNG unavailable: {}", "Error:".ctp_red(), e);
+
+            let result = ops::run_live_follow(
+                &follower,
+                &domain,
+                rt,
+                ns,
+                follow_config,
+                output_format,
+                true,
+            )
+            .await;
+
+            match result {
+                Ok(result) => {
+                    if result.interrupted {
+                        let note = "Follow interrupted by user".ctp_yellow();
+                        if notes_to_stderr {
+                            eprintln!("{}", note);
+                        } else {
+                            println!("\n{}", note);
+                        }
+                    }
+                    println!("\n{}", formatter.format_follow(&result));
+                }
+                Err(e) => {
+                    emit_error(output_format, &e);
+                }
+            }
+            return Ok(());
+        }
+        Commands::Watch {
+            action,
+            domain,
+            fail_on,
+            webhook,
+        } => {
+            // add/remove/list share their pipeline with the REPL; failures go
+            // through `emit_error` so `--format json|yaml` stays structured.
+            if let Some(action) = action.as_deref() {
+                match ops::watch_edit(action, domain.as_deref(), "seer watch").await {
+                    Ok(message) => println!("{}", message),
+                    Err(e) => emit_error(output_format, &e),
+                }
+                return Ok(());
+            }
+            let watchlist = ops::load_watchlist()
+                .await
+                .unwrap_or_else(|e| emit_error(output_format, &e));
+            if watchlist.domains.is_empty() {
+                println!("{}", ops::watchlist_listing(&watchlist, "seer watch"));
+                return Ok(());
+            }
+            let spinner =
+                display::Spinner::new(&format!("Checking {} domains", watchlist.domains.len()));
+            let report = seer_core::check_watchlist_with_config(&watchlist.domains, config).await;
+            spinner.finish();
+            if quiet {
+                handle_quiet_output(&report, &fields);
+            } else {
+                println!("{}", formatter.format_watch(&report));
+            }
+            // Best-effort webhook delivery of the report: the --webhook flag
+            // overrides the config file's watch.webhook_url. A failed POST
+            // warns on stderr but never alters the check's exit code below.
+            let webhook_url = webhook.as_deref().or(config.watch.webhook_url.as_deref());
+            if let Some(url) = webhook_url {
+                let client = seer_core::webhook::WebhookClient::from_config(config);
+                if let Err(e) = client.post_json(url, &report).await {
+                    eprintln!("{} webhook delivery failed: {}", "Warning:".ctp_yellow(), e);
+                }
+            }
+            // Exit 1 when issues at or above the --fail-on threshold exist
+            // (mirrors drift/avail/dnssec). `warnings` counts every result
+            // with issues, so it already subsumes the critical ones; the `||`
+            // keeps the check robust if that tally ever changes.
+            let should_fail = match fail_on {
+                FailOn::Critical => report.critical > 0,
+                FailOn::Warning => report.warnings > 0 || report.critical > 0,
+            };
+            if should_fail {
                 std::process::exit(1);
             }
-            let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&buf);
-            if export {
-                println!("export SEER_API_KEY={}", token);
+            return Ok(());
+        }
+        Commands::History { domain, clear } => {
+            if clear {
+                if let Err(e) = ops::clear_history().await {
+                    emit_error(output_format, &e);
+                }
+                println!("Lookup history cleared");
             } else {
-                println!("{}", token);
+                let history = ops::load_history()
+                    .await
+                    .unwrap_or_else(|e| emit_error(output_format, &e));
+                println!(
+                    "{}",
+                    ops::history_listing(&history, domain.as_deref(), "seer lookup")
+                );
             }
+            return Ok(());
         }
         Commands::Config { init } => {
             if init {
@@ -1136,639 +1038,35 @@ async fn execute_command(
                     serde_json::to_string_pretty(&config).unwrap_or_default()
                 );
             }
+            return Ok(());
         }
-        Commands::Follow {
-            domain,
-            iterations,
-            interval_minutes,
-            record_type,
-            server,
-            changes_only,
-        } => {
-            let rt = parse_record_type(&record_type, output_format);
-            let ns = server
-                .as_ref()
-                .map(|s| s.trim_start_matches('@'))
-                .or(config.nameserver.as_deref());
+        Commands::Completions { shell } => {
+            let mut cmd = Cli::command();
+            generate(shell, &mut cmd, "seer", &mut std::io::stdout());
+            return Ok(());
+        }
+        Commands::GenerateKey { export, bytes } => {
+            use base64::Engine;
 
-            let follow_config = match seer_core::FollowConfig::new(iterations, interval_minutes) {
-                Ok(cfg) => cfg.with_changes_only(changes_only),
-                Err(e) => {
-                    emit_error(output_format, &e);
-                }
-            };
-
-            // Honor the config file's DNS timeout like `dig` does.
-            let follower =
-                seer_core::DnsFollower::with_resolver(seer_core::DnsResolver::from_config(config));
-
-            // Set up cancellation channel. `cancel_tx` must stay alive until
-            // the follow returns: once every sender is dropped, the follow's
-            // interruptible sleep wakes immediately.
-            let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-
-            // Set up Ctrl+C handler (the only interrupt path when there is no
-            // terminal for the Esc listener below).
-            let cancel_tx_ctrlc = cancel_tx.clone();
-            tokio::spawn(async move {
-                tokio::signal::ctrl_c().await.ok();
-                let _ = cancel_tx_ctrlc.send(true);
-            });
-
-            // Enable raw mode for Escape key detection
-            // RAII guard: restores cooked mode on scope exit, including if a
-            // panic unwinds through the follow loop (issue #60).
-            let raw_guard = utils::RawModeGuard::new();
-
-            // Listen for Esc / Ctrl+C on a blocking thread — only when there
-            // is a terminal to read from.
-            let key_listener =
-                utils::FollowKeyListener::spawn(cancel_tx.clone(), raw_guard.is_enabled());
-
-            // Create progress callback for real-time output
-            // Note: raw mode is enabled for key detection, so we need \r\n for proper line breaks
-            let follow_format = output_format;
-            let callback: seer_core::dns::FollowProgressCallback = Arc::new(move |iteration| {
-                let formatter = seer_core::output::get_formatter(follow_format);
-                let output = formatter.format_follow_iteration(iteration);
-                // In raw mode, \n alone doesn't return to column 0, so use \r\n
-                let output = output.replace('\n', "\r\n");
-                let mut stdout = std::io::stdout().lock();
-                let _ = stdout.write_all(output.as_bytes());
-                let _ = stdout.write_all(b"\r\n");
-                let _ = stdout.flush();
-            });
-
-            // In raw mode, use \r\n for proper line breaks. The banner is
-            // prose, so under a machine format it goes to stderr and stdout
-            // stays a parseable stream (`seer --format json follow … | jq`).
-            let notes_to_stderr = follow_notes_to_stderr(output_format);
-            let banner = format!(
-                "Following {} {} records ({} iterations, {} interval)\r\nPress {} or {} to stop early\r\n\r\n",
-                domain.ctp_green(),
-                record_type.ctp_yellow(),
-                iterations.to_string().ctp_yellow(),
-                utils::format_interval(interval_minutes),
-                "Esc".ctp_yellow(),
-                "Ctrl+C".ctp_yellow()
-            );
-            if notes_to_stderr {
-                eprint!("{}", banner);
-                let _ = std::io::stderr().flush();
-            } else {
-                print!("{}", banner);
-                let _ = std::io::stdout().flush();
+            if bytes == 0 || bytes > 4096 {
+                eprintln!("{} --bytes must be between 1 and 4096", "Error:".ctp_red());
+                std::process::exit(2);
             }
-
-            let result = follower
-                .follow(
-                    &domain,
-                    rt,
-                    ns,
-                    follow_config,
-                    Some(callback),
-                    Some(cancel_rx),
-                )
-                .await;
-
-            // Clean up: stop the key listener and restore cooked mode before
-            // printing results. The guard's Drop also restores on a panic above.
-            if let Some(listener) = key_listener {
-                listener.stop().await;
-            }
-            drop(raw_guard);
-
-            match result {
-                Ok(result) => {
-                    if result.interrupted {
-                        let note = "Follow interrupted by user".ctp_yellow();
-                        if notes_to_stderr {
-                            eprintln!("{}", note);
-                        } else {
-                            println!("\n{}", note);
-                        }
-                    }
-                    println!("\n{}", formatter.format_follow(&result));
-                }
-                Err(e) => {
-                    emit_error(output_format, &e);
-                }
-            }
-        }
-        Commands::Ssl { domain } => {
-            let checker = seer_core::SslChecker::from_config(config);
-            match checker.check(&domain).await {
-                Ok(report) => {
-                    if quiet && handle_quiet_output(&report, &fields) {
-                    } else {
-                        println!("{}", formatter.format_ssl(&report));
-                    }
-                }
-                Err(e) => {
-                    emit_error(output_format, &e);
-                }
-            }
-        }
-        Commands::Tld { tld } => {
-            let info = seer_core::lookup_tld(&tld).await;
-            if quiet && handle_quiet_output(&info, &fields) {
-            } else {
-                println!("{}", formatter.format_tld(&info));
-            }
-        }
-        Commands::Compare {
-            domain,
-            record_type,
-            server_a,
-            server_b,
-        } => {
-            let comparator = seer_core::dns::DnsComparator::new();
-            let rt = parse_record_type(&record_type, output_format);
-            let ns_a = server_a.trim_start_matches('@');
-            let ns_b = server_b.trim_start_matches('@');
-            match comparator.compare(&domain, rt, ns_a, ns_b).await {
-                Ok(comparison) => {
-                    if quiet && handle_quiet_output(&comparison, &fields) {
-                    } else {
-                        println!("{}", formatter.format_dns_comparison(&comparison));
-                    }
-                    if !comparison.matches {
-                        std::process::exit(1);
-                    }
-                }
-                Err(e) => {
-                    emit_error(output_format, &e);
-                }
-            }
-        }
-        Commands::Subdomains {
-            domain,
-            resolve,
-            diff,
-            record,
-        } => {
-            let spinner = Arc::new(display::Spinner::new(&format!(
-                "Enumerating subdomains for {}",
-                domain
-            )));
-            if diff || record {
-                // Baseline diff/record pipeline — shared with the REPL via
-                // ops::subdomain_baseline_check so the two surfaces cannot
-                // diverge (mirrors the drift arm above).
-                match ops::subdomain_baseline_check(&domain, record).await {
-                    Ok(outcome) => {
-                        spinner.finish();
-                        if diff {
-                            if outcome.report.baseline_missing {
-                                eprintln!(
-                                    "{} {}",
-                                    "note:".ctp_yellow(),
-                                    ops::no_subdomain_baseline_note(&outcome.result.domain, record)
-                                );
-                            }
-                            if quiet && handle_quiet_output(&outcome.report, &fields) {
-                            } else {
-                                println!(
-                                    "{}",
-                                    formatter.format_subdomain_baseline_diff(&outcome.report)
-                                );
-                            }
-                            // Only ADDED names are material; removals and a
-                            // missing baseline (first run) exit 0.
-                            if outcome.report.has_new_names() {
-                                std::process::exit(1);
-                            }
-                        } else {
-                            // --record alone: plain listing, then confirm the
-                            // baseline write on stderr.
-                            if quiet && handle_quiet_output(&outcome.result, &fields) {
-                            } else {
-                                println!("{}", formatter.format_subdomains(&outcome.result));
-                            }
-                            eprintln!(
-                                "{} recorded subdomain baseline for {} ({} names)",
-                                "note:".ctp_yellow(),
-                                outcome.result.domain,
-                                outcome.result.count
-                            );
-                        }
-                        return Ok(());
-                    }
-                    Err(e) => {
-                        spinner.finish();
-                        emit_error(output_format, &e);
-                    }
-                }
-            }
-            let enumerator = seer_core::SubdomainEnumerator::new();
-            match enumerator.enumerate(&domain).await {
-                Ok(result) => {
-                    if resolve {
-                        spinner.set_message("Resolving and classifying discovered names");
-                        let resolver = seer_core::DnsResolver::from_config(config);
-                        let classification = seer_core::classify_subdomains(
-                            &resolver,
-                            &result.domain,
-                            result.subdomains.clone(),
-                            config.bulk.concurrency,
-                        )
-                        .await;
-                        spinner.finish();
-                        if quiet && handle_quiet_output(&classification, &fields) {
-                        } else {
-                            println!(
-                                "{}",
-                                formatter.format_subdomain_classification(&classification)
-                            );
-                        }
-                    } else {
-                        spinner.finish();
-                        if quiet && handle_quiet_output(&result, &fields) {
-                        } else {
-                            println!("{}", formatter.format_subdomains(&result));
-                        }
-                    }
-                }
-                Err(e) => {
-                    spinner.finish();
-                    emit_error(output_format, &e);
-                }
-            }
-        }
-        Commands::Drift { domain, record } => {
-            let spinner = Arc::new(display::Spinner::new(&format!("Looking up {}", domain)));
-            let lookup = seer_core::SmartLookup::from_config(config);
-            match ops::drift_check(&lookup, &domain, record).await {
-                Ok(outcome) => {
-                    spinner.finish();
-                    if !outcome.had_previous {
-                        eprintln!(
-                            "{} {}",
-                            "note:".ctp_yellow(),
-                            ops::no_baseline_note(&domain, record)
-                        );
-                    }
-
-                    if quiet && handle_quiet_output(&outcome.report, &fields) {
-                    } else {
-                        println!("{}", formatter.format_drift(&outcome.report));
-                    }
-                    if outcome.report.has_drift() {
-                        std::process::exit(1);
-                    }
-                }
-                Err(e) => {
-                    spinner.finish();
-                    emit_error(output_format, &e);
-                }
-            }
-        }
-        Commands::Caa { domain } => {
-            let resolver = seer_core::DnsResolver::from_config(config);
-            match seer_core::normalize_domain(&domain) {
-                Ok(normalized) => {
-                    let policy = seer_core::caa::lookup_caa(&resolver, &normalized).await;
-                    if quiet && handle_quiet_output(&policy, &fields) {
-                    } else {
-                        println!("{}", formatter.format_caa(&policy));
-                    }
-                }
-                Err(e) => emit_error(output_format, &e),
-            }
-        }
-        Commands::Posture { domain } => {
-            let resolver = seer_core::DnsResolver::from_config(config);
-            match seer_core::lookup_email_posture(&resolver, &domain).await {
-                Ok(posture) => {
-                    if quiet && handle_quiet_output(&posture, &fields) {
-                    } else {
-                        println!("{}", formatter.format_posture(&posture));
-                    }
-                }
-                Err(e) => emit_error(output_format, &e),
-            }
-        }
-        Commands::Headers { domain } => {
-            let spinner = Arc::new(display::Spinner::new(&format!(
-                "Auditing HTTP security headers for {}",
-                domain
-            )));
-            match seer_core::audit_headers(&domain, config.http_timeout()).await {
-                Ok(report) => {
-                    spinner.finish();
-                    if quiet && handle_quiet_output(&report, &fields) {
-                    } else {
-                        println!("{}", formatter.format_headers(&report));
-                    }
-                }
-                Err(e) => {
-                    spinner.finish();
-                    emit_error(output_format, &e);
-                }
-            }
-        }
-        Commands::Takeover { domain, hosts } => {
-            let spinner = Arc::new(display::Spinner::new(&format!(
-                "Scanning {} for takeover exposure",
-                domain
-            )));
-            // --host skips CT enumeration entirely, which keeps a targeted
-            // re-check of known hosts fast and offline-of-CT.
-            let hosts = if hosts.is_empty() {
-                spinner.set_message("Enumerating subdomains via CT logs");
-                match seer_core::SubdomainEnumerator::new()
-                    .enumerate(&domain)
-                    .await
-                {
-                    Ok(result) => result.subdomains,
-                    Err(e) => {
-                        spinner.finish();
-                        emit_error(output_format, &e);
-                    }
-                }
-            } else {
-                hosts
-            };
-
-            spinner.set_message(&format!("Checking {} host(s) for takeover", hosts.len()));
-            let resolver = seer_core::DnsResolver::from_config(config);
-            match seer_core::scan_takeover(&resolver, &domain, hosts, config.bulk.concurrency).await
-            {
-                Ok(report) => {
-                    spinner.finish();
-                    if quiet && handle_quiet_output(&report, &fields) {
-                    } else {
-                        println!("{}", formatter.format_takeover(&report));
-                    }
-                    // Check-style exit: any confirmed or potential takeover is
-                    // actionable, so both fail a CI run.
-                    if report.has_findings() {
-                        std::process::exit(1);
-                    }
-                }
-                Err(e) => {
-                    spinner.finish();
-                    emit_error(output_format, &e);
-                }
-            }
-        }
-        Commands::Confusables { domain } => {
-            let spinner = Arc::new(display::Spinner::new(&format!(
-                "Scanning look-alikes for {}",
-                domain
-            )));
-            let lookup = seer_core::SmartLookup::from_config(config);
-            match seer_core::find_confusables(&lookup, &domain, config.bulk.concurrency).await {
-                Ok(report) => {
-                    spinner.finish();
-                    if quiet && handle_quiet_output(&report, &fields) {
-                    } else {
-                        println!("{}", formatter.format_confusables(&report));
-                    }
-                }
-                Err(e) => {
-                    spinner.finish();
-                    emit_error(output_format, &e);
-                }
-            }
-        }
-        Commands::Diff { domain_a, domain_b } => {
-            let spinner = Arc::new(display::Spinner::new(&format!(
-                "Comparing {} vs {}",
-                domain_a, domain_b
-            )));
-            let differ = seer_core::DomainDiffer::new();
-            match differ.diff(&domain_a, &domain_b).await {
-                Ok(diff) => {
-                    spinner.finish();
-                    if quiet && handle_quiet_output(&diff, &fields) {
-                    } else {
-                        println!("{}", formatter.format_diff(&diff));
-                    }
-                }
-                Err(e) => {
-                    spinner.finish();
-                    emit_error(output_format, &e);
-                }
-            }
-        }
-        Commands::Watch {
-            action,
-            domain,
-            fail_on,
-            webhook,
-        } => {
-            // Watchlist file I/O is blocking — run it on a blocking thread so it
-            // doesn't stall the async runtime (mirrors the History handler).
-            let mut watchlist = tokio::task::spawn_blocking(seer_core::Watchlist::load)
-                .await
-                .unwrap_or_default();
-            // Usage/validation failures go through `emit_error` (non-zero
-            // exit) so `--format json|yaml` gets a structured error.
-            match action.as_deref() {
-                Some("add") => {
-                    let Some(domain) = domain.as_deref() else {
-                        emit_error(output_format, &"Usage: seer watch add <domain>");
-                    };
-                    match watchlist.add(domain) {
-                        Ok(true) => {
-                            let save_result =
-                                tokio::task::spawn_blocking(move || watchlist.save()).await;
-                            match save_result {
-                                Ok(Ok(())) => {}
-                                Ok(Err(e)) => return Err(e.into()),
-                                Err(e) => return Err(e.into()),
-                            }
-                            println!("Added {} to watchlist", domain.ctp_green());
-                        }
-                        Ok(false) => {
-                            println!("{} is already in the watchlist", domain);
-                        }
-                        Err(e) => {
-                            emit_error(output_format, &format!("Invalid domain: {}", e));
-                        }
-                    }
-                }
-                Some("remove") => {
-                    let Some(domain) = domain.as_deref() else {
-                        emit_error(output_format, &"Usage: seer watch remove <domain>");
-                    };
-                    if watchlist.remove(domain) {
-                        let save_result =
-                            tokio::task::spawn_blocking(move || watchlist.save()).await;
-                        match save_result {
-                            Ok(Ok(())) => {}
-                            Ok(Err(e)) => return Err(e.into()),
-                            Err(e) => return Err(e.into()),
-                        }
-                        println!("Removed {} from watchlist", domain.ctp_green());
-                    } else {
-                        println!("{} was not in the watchlist", domain);
-                    }
-                }
-                Some("list") => {
-                    if watchlist.domains.is_empty() {
-                        println!(
-                            "Watchlist is empty. Use 'seer watch add <domain>' to add domains."
-                        );
-                    } else {
-                        println!("Watchlist ({} domains):", watchlist.domains.len());
-                        for d in &watchlist.domains {
-                            println!("  - {}", d);
-                        }
-                    }
-                }
-                None => {
-                    if watchlist.domains.is_empty() {
-                        println!(
-                            "Watchlist is empty. Use 'seer watch add <domain>' to add domains."
-                        );
-                    } else {
-                        let spinner = Arc::new(display::Spinner::new(&format!(
-                            "Checking {} domains",
-                            watchlist.domains.len()
-                        )));
-                        let report =
-                            seer_core::check_watchlist_with_config(&watchlist.domains, config)
-                                .await;
-                        spinner.finish();
-                        if quiet && handle_quiet_output(&report, &fields) {
-                        } else {
-                            println!("{}", formatter.format_watch(&report));
-                        }
-                        // Best-effort webhook delivery of the report: the
-                        // --webhook flag overrides the config file's
-                        // watch.webhook_url. A failed POST warns on stderr
-                        // but never alters the check's exit code below.
-                        let webhook_url =
-                            webhook.as_deref().or(config.watch.webhook_url.as_deref());
-                        if let Some(url) = webhook_url {
-                            let client = seer_core::webhook::WebhookClient::from_config(config);
-                            if let Err(e) = client.post_json(url, &report).await {
-                                eprintln!(
-                                    "{} webhook delivery failed: {}",
-                                    "Warning:".ctp_yellow(),
-                                    e
-                                );
-                            }
-                        }
-                        // Exit 1 when issues at or above the --fail-on
-                        // threshold exist (mirrors drift/avail/dnssec).
-                        // `warnings` counts every result with issues, so it
-                        // already subsumes the critical ones; the `||` keeps
-                        // the check robust if that tally ever changes.
-                        let should_fail = match fail_on {
-                            FailOn::Critical => report.critical > 0,
-                            FailOn::Warning => report.warnings > 0 || report.critical > 0,
-                        };
-                        if should_fail {
-                            std::process::exit(1);
-                        }
-                    }
-                }
-                Some(other) => {
-                    emit_error(
-                        output_format,
-                        &format!("Unknown watch action: {}. Use: add, remove, list", other),
-                    );
-                }
-            }
-        }
-        Commands::History { domain, clear } => {
-            let mut history = tokio::task::spawn_blocking(seer_core::LookupHistory::load)
-                .await
-                .unwrap_or_default();
-            if clear {
-                history.clear();
-                let save_result = tokio::task::spawn_blocking(move || history.save()).await;
-                match save_result {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => return Err(e.into()),
-                    Err(e) => return Err(e.into()),
-                }
-                println!("Lookup history cleared");
-            } else if let Some(domain) = domain {
-                let entries = history.get(&domain);
-                if entries.is_empty() {
-                    println!("No history for {}", domain);
-                } else {
-                    println!(
-                        "History for {} ({} entries):",
-                        domain.ctp_green(),
-                        entries.len()
-                    );
-                    for entry in entries {
-                        let source = if entry.result.is_rdap() {
-                            "RDAP"
-                        } else if entry.result.is_whois() {
-                            "WHOIS"
-                        } else {
-                            "availability"
-                        };
-                        println!(
-                            "  [{}] via {} - registrar: {}",
-                            entry.timestamp.format("%Y-%m-%d %H:%M"),
-                            source,
-                            entry.result.registrar().unwrap_or_else(|| "—".to_string())
-                        );
-                    }
-                }
-            } else {
-                let total: usize = history.entries.values().map(Vec::len).sum();
-                if total == 0 {
-                    println!("No lookup history. Run 'seer lookup <domain>' to build history.");
-                } else {
-                    println!(
-                        "Lookup history ({} entries across {} domains):",
-                        total,
-                        history.entries.len()
-                    );
-                    for (domain, entries) in &history.entries {
-                        println!("  {} ({} entries)", domain, entries.len());
-                    }
-                }
-            }
-        }
-        Commands::Doctor => {
-            let spinner = Arc::new(display::Spinner::new("Running environment diagnostics"));
-            let doctor = seer_core::doctor::Doctor::from_config(config);
-            // Infallible by design: probe failures become Fail checks.
-            let report = doctor.run().await;
-            spinner.finish();
-            if quiet && handle_quiet_output(&report, &fields) {
-            } else {
-                println!("{}", render_doctor_report(&report, output_format));
-            }
-            // Exit contract (see help text): only FAIL is fatal; WARN exits 0.
-            if report.overall == seer_core::doctor::CheckStatus::Fail {
+            let mut buf = vec![0u8; bytes];
+            // Fill with OS entropy directly via getrandom — the CSPRNG source
+            // that rand's OsRng merely wraps. It's the right primitive for key
+            // material and immune to rand's RNG-trait churn across versions.
+            if let Err(e) = getrandom::fill(&mut buf) {
+                eprintln!("{} OS RNG unavailable: {}", "Error:".ctp_red(), e);
                 std::process::exit(1);
             }
-        }
-        Commands::Delegation { domain } => {
-            let spinner = Arc::new(display::Spinner::new(&format!(
-                "Checking NS delegation for {}",
-                domain
-            )));
-            let checker = seer_core::dns::DelegationChecker::from_config(config);
-            match checker.check(&domain).await {
-                Ok(report) => {
-                    spinner.finish();
-                    if quiet && handle_quiet_output(&report, &fields) {
-                    } else {
-                        println!("{}", formatter.format_delegation(&report));
-                    }
-                    // Check-style exit: lame servers already veto in_sync,
-                    // but keep the explicit || so the exit contract survives
-                    // if that coupling ever changes in the report type.
-                    if !report.in_sync || !report.lame.is_empty() {
-                        std::process::exit(1);
-                    }
-                }
-                Err(e) => {
-                    spinner.finish();
-                    emit_error(output_format, &e);
-                }
+            let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&buf);
+            if export {
+                println!("export SEER_API_KEY={}", token);
+            } else {
+                println!("{}", token);
             }
+            return Ok(());
         }
         Commands::Mangen { dir } => {
             std::fs::create_dir_all(&dir)?;
@@ -1779,13 +1077,88 @@ async fn execute_command(
                 "Man pages written to: {}",
                 dir.display().to_string().ctp_green()
             );
+            return Ok(());
         }
         Commands::Tui { domain } => {
             tui::run(domain).await?;
+            return Ok(());
         }
-    }
+    };
 
+    let spin = cli_spinner(&query);
+    let clients = query::Clients::from_config(config);
+    match query::run(query, &clients, config, spin).await {
+        Ok(outcome) => {
+            outcome.present(|payload| {
+                if quiet {
+                    handle_quiet_output(payload, &fields);
+                } else {
+                    println!("{}", payload::serialize(payload, output_format));
+                }
+            });
+            let code = exit_code(&outcome.payload);
+            if code != 0 {
+                std::process::exit(code);
+            }
+        }
+        Err(e) => emit_error(output_format, &e),
+    }
     Ok(())
+}
+
+/// Whether one-shot mode shows a progress spinner for `query`. The REPL spins
+/// for every networked query; one-shot mode only ever has for these slower,
+/// multi-stage ones, and keeps stderr quiet for the rest.
+fn cli_spinner(query: &Query) -> bool {
+    matches!(
+        query,
+        Query::Lookup(_)
+            | Query::Info(_)
+            | Query::Subdomains { .. }
+            | Query::Drift { .. }
+            | Query::Headers(_)
+            | Query::Takeover { .. }
+            | Query::Confusables(_)
+            | Query::Diff(..)
+            | Query::Doctor
+            | Query::Delegation(_)
+    )
+}
+
+/// Process exit code for a query's result: check-style commands exit 1 when
+/// the check fails, everything else 0. This is a scripting contract (cron
+/// jobs and CI gate on `$?`), so every rule is pinned by a test.
+fn exit_code(payload: &Payload) -> i32 {
+    let failed = match payload {
+        // Unhealthy: no 2xx answer, an invalid or <30-day certificate, or a
+        // registration expiring within 30 days.
+        Payload::Status(s) => {
+            s.http_status.is_none_or(|code| !(200..300).contains(&code))
+                || s.certificate
+                    .as_ref()
+                    .is_some_and(|c| !c.is_valid || c.days_until_expiry < 30)
+                || s.domain_expiration
+                    .as_ref()
+                    .is_some_and(|d| d.days_until_expiry < 30)
+        }
+        Payload::Avail(a) => !a.available,
+        // Core's vocabulary is signed | unsigned | partial | misconfigured —
+        // it never says "secure", so only "signed" passes.
+        Payload::Dnssec(r) => r.status != "signed",
+        Payload::Compare(c) => !c.matches,
+        Payload::Drift(d) => d.has_drift(),
+        // Any confirmed or potential takeover is actionable.
+        Payload::Takeover(t) => t.has_findings(),
+        // Only ADDED names are material; removals and a first run pass.
+        Payload::SubdomainBaselineDiff(d) => d.has_new_names(),
+        // Only FAIL is fatal; WARN (degraded but usable) exits 0.
+        Payload::Doctor(r) => r.overall == seer_core::doctor::CheckStatus::Fail,
+        // Lame servers already veto in_sync; the explicit check keeps the
+        // contract if that coupling ever changes.
+        Payload::Delegation(d) => !d.in_sync || !d.lame.is_empty(),
+        _ => false,
+    };
+    i32::from(failed)
 }
 
 /// Renders a doctor report in the requested output format. Shared with the
@@ -2132,11 +1505,14 @@ mod record_type_parse_tests {
 }
 
 #[cfg(test)]
-mod dnssec_exit_tests {
-    use super::dnssec_check_passed;
+mod exit_code_tests {
+    //! The check-style exit contract, one rule per payload. Every check
+    //! pairs a passing and a failing result so a flipped condition fails.
+    use super::{exit_code, Payload};
+    use chrono::TimeZone;
 
-    fn report_with_status(status: &str) -> seer_core::DnssecReport {
-        seer_core::DnssecReport {
+    fn dnssec(status: &str) -> Payload {
+        Payload::Dnssec(Box::new(seer_core::DnssecReport {
             domain: "example.com".into(),
             enabled: status != "unsigned",
             has_ds_records: false,
@@ -2148,23 +1524,173 @@ mod dnssec_exit_tests {
             chain_valid: status == "signed",
             authentication_tier: seer_core::dns::AuthenticationTier::DigestOnly,
             rrsig_records: vec![],
-        }
+        }))
     }
 
-    /// Core never reports "secure" — the CLI compared against it, so a
+    /// Core never reports "secure" — the CLI once compared against it, so a
     /// correctly signed zone always exited 1.
     #[test]
-    fn only_a_signed_zone_passes() {
-        assert!(dnssec_check_passed(&report_with_status("signed")));
-        for status in ["unsigned", "partial", "misconfigured"] {
-            assert!(
-                !dnssec_check_passed(&report_with_status(status)),
-                "{status} must fail the check"
-            );
+    fn only_a_signed_zone_passes_dnssec() {
+        assert_eq!(exit_code(&dnssec("signed")), 0);
+        for status in ["unsigned", "partial", "misconfigured", "secure"] {
+            assert_eq!(exit_code(&dnssec(status)), 1, "{status} must fail");
         }
     }
-}
 
+    fn status(http: Option<u16>, cert_days: Option<i64>, expiry_days: Option<i64>) -> Payload {
+        let at = chrono::Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let mut s = seer_core::StatusResponse::new("example.com".into());
+        s.http_status = http;
+        s.certificate = cert_days.map(|days| seer_core::CertificateInfo {
+            issuer: "CA".into(),
+            subject: "example.com".into(),
+            valid_from: at,
+            valid_until: at,
+            days_until_expiry: days,
+            is_valid: days > 0,
+            hostname_verified: true,
+        });
+        s.domain_expiration = expiry_days.map(|days| seer_core::DomainExpiration {
+            expiration_date: at,
+            days_until_expiry: days,
+            registrar: None,
+        });
+        Payload::Status(Box::new(s))
+    }
+
+    #[test]
+    fn status_fails_on_non_2xx_or_expiry_within_30_days() {
+        assert_eq!(exit_code(&status(Some(200), Some(90), Some(365))), 0);
+        assert_eq!(exit_code(&status(Some(204), None, None)), 0);
+        assert_eq!(exit_code(&status(None, Some(90), Some(365))), 1);
+        assert_eq!(exit_code(&status(Some(503), Some(90), Some(365))), 1);
+        assert_eq!(exit_code(&status(Some(200), Some(29), Some(365))), 1);
+        assert_eq!(exit_code(&status(Some(200), Some(-1), Some(365))), 1);
+        assert_eq!(exit_code(&status(Some(200), Some(90), Some(29))), 1);
+    }
+
+    #[test]
+    fn avail_compare_drift_and_takeover_fail_on_their_finding() {
+        let avail = |available| {
+            Payload::Avail(Box::new(seer_core::AvailabilityResult {
+                domain: "example.com".into(),
+                available,
+                confidence: "high".into(),
+                method: "rdap".into(),
+                details: None,
+            }))
+        };
+        assert_eq!(exit_code(&avail(true)), 0);
+        assert_eq!(exit_code(&avail(false)), 1);
+
+        let compare = |matches| {
+            let side = |ns: &str| seer_core::dns::ServerResult {
+                nameserver: ns.into(),
+                records: vec![],
+                error: None,
+            };
+            Payload::Compare(Box::new(seer_core::DnsComparison {
+                domain: "example.com".into(),
+                record_type: seer_core::RecordType::A,
+                server_a: side("8.8.8.8"),
+                server_b: side("1.1.1.1"),
+                matches,
+                only_in_a: vec![],
+                only_in_b: vec![],
+                common: vec![],
+            }))
+        };
+        assert_eq!(exit_code(&compare(true)), 0);
+        assert_eq!(exit_code(&compare(false)), 1);
+
+        let mut drift = seer_core::DriftReport::empty("example.com");
+        assert_eq!(exit_code(&Payload::Drift(Box::new(drift.clone()))), 0);
+        drift.changes.push(seer_core::FieldChange {
+            field: "registrar".into(),
+            old: Some("A".into()),
+            new: Some("B".into()),
+        });
+        assert_eq!(exit_code(&Payload::Drift(Box::new(drift))), 1);
+
+        let takeover = |vulnerable, potential| {
+            Payload::Takeover(Box::new(seer_core::TakeoverReport {
+                domain: "example.com".into(),
+                hosts_checked: 3,
+                hosts_skipped: 0,
+                vulnerable,
+                potential,
+                findings: vec![],
+                notes: vec![],
+            }))
+        };
+        assert_eq!(exit_code(&takeover(0, 0)), 0);
+        assert_eq!(exit_code(&takeover(1, 0)), 1);
+        assert_eq!(exit_code(&takeover(0, 1)), 1);
+    }
+
+    #[test]
+    fn subdomain_diff_fails_only_on_added_names() {
+        let diff = |added: &[&str], removed: &[&str], baseline_missing| {
+            Payload::SubdomainBaselineDiff(Box::new(seer_core::SubdomainBaselineDiff {
+                domain: "example.com".into(),
+                baseline_recorded_at: None,
+                added: added.iter().map(|s| s.to_string()).collect(),
+                removed: removed.iter().map(|s| s.to_string()).collect(),
+                unchanged_count: 1,
+                baseline_missing,
+            }))
+        };
+        assert_eq!(exit_code(&diff(&[], &[], true)), 0, "first run");
+        assert_eq!(exit_code(&diff(&[], &["old.example.com"], false)), 0);
+        assert_eq!(exit_code(&diff(&["new.example.com"], &[], false)), 1);
+    }
+
+    #[test]
+    fn doctor_fails_only_on_fail_and_delegation_on_drift_or_lameness() {
+        use seer_core::doctor::{CheckStatus, DoctorCheck, DoctorReport};
+        let doctor = |status| {
+            Payload::Doctor(Box::new(DoctorReport::from_checks(vec![DoctorCheck {
+                name: "dns".into(),
+                status,
+                detail: String::new(),
+                latency_ms: None,
+            }])))
+        };
+        assert_eq!(exit_code(&doctor(CheckStatus::Pass)), 0);
+        assert_eq!(exit_code(&doctor(CheckStatus::Warn)), 0);
+        assert_eq!(exit_code(&doctor(CheckStatus::Fail)), 1);
+
+        let delegation = |in_sync, lame: Vec<seer_core::dns::LameNs>| {
+            Payload::Delegation(Box::new(seer_core::dns::DelegationReport {
+                domain: "example.com".into(),
+                parent_zone: "com".into(),
+                parent_server_queried: vec![],
+                delegated_ns: vec![],
+                zone_ns: vec![],
+                in_sync,
+                missing_from_zone: vec![],
+                missing_from_parent: vec![],
+                lame,
+                warnings: vec![],
+            }))
+        };
+        let lame = || {
+            vec![seer_core::dns::LameNs {
+                host: "ns1.example.com".into(),
+                reason: "REFUSED".into(),
+            }]
+        };
+        assert_eq!(exit_code(&delegation(true, vec![])), 0);
+        assert_eq!(exit_code(&delegation(false, vec![])), 1);
+        assert_eq!(exit_code(&delegation(true, lame())), 1);
+    }
+
+    #[test]
+    fn informational_results_exit_zero() {
+        assert_eq!(exit_code(&Payload::Dns(vec![])), 0);
+        assert_eq!(exit_code(&Payload::Reverse(vec![])), 0);
+    }
+}
 #[cfg(test)]
 mod bulk_output_tests {
     use super::bulk_csv_path;
@@ -2270,15 +1796,16 @@ mod follow_output_tests {
 #[cfg(test)]
 mod progress_mode_tests {
     use super::{resolve_progress_mode, ProgressMode};
+    use seer_core::output::OutputFormat;
 
     #[test]
     fn explicit_mode_is_honored_on_tty() {
         assert_eq!(
-            resolve_progress_mode(Some(ProgressMode::Verbose), true, "human"),
+            resolve_progress_mode(Some(ProgressMode::Verbose), true, OutputFormat::Human),
             ProgressMode::Verbose
         );
         assert_eq!(
-            resolve_progress_mode(Some(ProgressMode::None), true, "human"),
+            resolve_progress_mode(Some(ProgressMode::None), true, OutputFormat::Human),
             ProgressMode::None
         );
     }
@@ -2286,7 +1813,7 @@ mod progress_mode_tests {
     #[test]
     fn explicit_mode_is_honored_on_non_tty() {
         assert_eq!(
-            resolve_progress_mode(Some(ProgressMode::Bar), false, "human"),
+            resolve_progress_mode(Some(ProgressMode::Bar), false, OutputFormat::Human),
             ProgressMode::Bar
         );
     }
@@ -2294,7 +1821,7 @@ mod progress_mode_tests {
     #[test]
     fn explicit_mode_overrides_json_format() {
         assert_eq!(
-            resolve_progress_mode(Some(ProgressMode::Bar), true, "json"),
+            resolve_progress_mode(Some(ProgressMode::Bar), true, OutputFormat::Json),
             ProgressMode::Bar
         );
     }
@@ -2302,7 +1829,7 @@ mod progress_mode_tests {
     #[test]
     fn default_is_bar_on_tty_with_human_format() {
         assert_eq!(
-            resolve_progress_mode(None, true, "human"),
+            resolve_progress_mode(None, true, OutputFormat::Human),
             ProgressMode::Bar
         );
     }
@@ -2310,7 +1837,7 @@ mod progress_mode_tests {
     #[test]
     fn default_is_none_on_non_tty() {
         assert_eq!(
-            resolve_progress_mode(None, false, "human"),
+            resolve_progress_mode(None, false, OutputFormat::Human),
             ProgressMode::None
         );
     }
@@ -2318,14 +1845,13 @@ mod progress_mode_tests {
     #[test]
     fn default_is_none_with_json_format() {
         assert_eq!(
-            resolve_progress_mode(None, true, "json"),
+            resolve_progress_mode(None, true, OutputFormat::Json),
             ProgressMode::None
         );
     }
 
     #[test]
     fn explicit_format_flag_overrides_config_default() {
-        use seer_core::output::OutputFormat;
         // An explicit `--format human` must win even when the config default
         // is non-human — the previous code re-read config in that case and
         // silently ignored the flag.
@@ -2341,7 +1867,6 @@ mod progress_mode_tests {
 
     #[test]
     fn format_falls_back_to_config_when_flag_absent() {
-        use seer_core::output::OutputFormat;
         assert_eq!(
             super::resolve_output_format(None, "yaml"),
             OutputFormat::Yaml
@@ -2354,7 +1879,6 @@ mod progress_mode_tests {
 
     #[test]
     fn format_defaults_when_unset_or_invalid() {
-        use seer_core::output::OutputFormat;
         assert_eq!(
             super::resolve_output_format(None, ""),
             OutputFormat::default()

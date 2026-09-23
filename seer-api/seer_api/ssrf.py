@@ -9,11 +9,11 @@ no-op (no SSRF vector) and a footgun (rejects legitimate lookups of parked
 or unresolvable domains).
 
 Call the guard on:
-- ``status`` endpoints (directly HTTP-connect to the target)
+- ``status`` and ``ssl`` endpoints (directly HTTP/TLS-connect to the target)
 - ``rdap/ip`` input (reject reserved IP literals as input validation)
 - user-supplied DNS nameservers (the resolver we actually send packets to) —
   via :func:`guard_nameserver_async`, which first extracts the host from the
-  nameserver *spec* (see :func:`nameserver_target`)
+  nameserver *spec*
 
 Do NOT call the guard on the queried domain for WHOIS/RDAP-domain/DNS-lookup
 target/propagation target — those paths don't connect to that host.
@@ -22,92 +22,30 @@ target/propagation target — those paths don't connect to that host.
 from __future__ import annotations
 
 import asyncio
-import ipaddress
+import logging
 
 from fastapi import HTTPException
 
 import seer
 
-# Default ports per nameserver transport — mirror seer-core's NameserverSpec.
-_NS_UDP_PORT = 53
-_NS_TLS_PORT = 853
-_NS_HTTPS_PORT = 443
-
-
-def _parse_ns_port(value: str) -> int | None:
-    if not value.isascii() or not value.isdigit():
-        return None
-    port = int(value)
-    return port if 0 < port <= 65535 else None
-
-
-def _split_ns_host_port(authority: str, default_port: int) -> tuple[str, int] | None:
-    if not authority:
-        return None
-    # Bracketed IPv6: [addr] or [addr]:port
-    if authority.startswith("["):
-        addr, closed, after = authority[1:].partition("]")
-        if not closed:
-            return None
-        try:
-            ipaddress.IPv6Address(addr)
-        except ValueError:
-            return None
-        if not after:
-            return addr, default_port
-        if not after.startswith(":"):
-            return None
-        port = _parse_ns_port(after[1:])
-        return (addr, port) if port else None
-    # A full IP literal (IPv4, or unbracketed IPv6) never carries a port.
-    try:
-        ipaddress.ip_address(authority)
-        return authority, default_port
-    except ValueError:
-        pass
-    host, sep, port_str = authority.rpartition(":")
-    if sep:
-        if not host or ":" in host:
-            return None
-        port = _parse_ns_port(port_str)
-        return (host, port) if port else None
-    return authority, default_port
+logger = logging.getLogger(__name__)
 
 
 def nameserver_target(spec: str) -> tuple[str, int] | None:
-    """The ``(host, port)`` a nameserver spec makes the core resolver contact.
+    """``seer.nameserver_target``, failing clearly on bindings that predate it.
 
-    A user-supplied nameserver is a *spec*, not a hostname: seer-core accepts a
-    bare IP/hostname with an optional port (UDP, ``9.9.9.9:5353``,
-    ``[2606:4700:4700::1111]``), ``tls://host[:port]`` (DoT) and
-    ``https://host[:port][/path]`` (DoH). Guarding the raw string as a
-    hostname rejected every form but the bare one. This mirrors the host/port
-    extraction of seer-core's ``NameserverSpec::parse`` so the guard checks
-    the address actually connected to.
-
-    Returns ``None`` for a spec the core parser would reject: the caller then
-    leaves it to the core, which fails it with its own ``Invalid input``
-    (ValueError → 400). The core also refuses reserved nameserver addresses on
-    its own, so this pre-check is defense in depth that turns a reserved
-    target into a clear 400 — never the only SSRF gate.
+    Bindings built before the release after 0.48.0 lack the function yet still
+    satisfy seer-api's ``domain-seer>=0.48.0`` floor (see the PENDING note in
+    pyproject.toml), so without this check every nameserver request would die
+    on a bare ``AttributeError``.
     """
-    s = spec.strip()
-    if not s or any(c.isspace() or c < " " or "\x7f" <= c <= "\x9f" for c in s):
-        return None
-    scheme, sep, rest = s.partition("://")
-    if not sep:
-        return _split_ns_host_port(s, _NS_UDP_PORT)
-    scheme = scheme.lower()
-    if scheme == "tls":
-        if "/" in rest:
-            return None
-        return _split_ns_host_port(rest, _NS_TLS_PORT)
-    if scheme == "https":
-        authority = rest.split("/", 1)[0]
-        if "@" in authority:
-            return None
-        return _split_ns_host_port(authority, _NS_HTTPS_PORT)
-    return None
+    parse = getattr(seer, "nameserver_target", None)
+    if parse is None:
+        raise RuntimeError(
+            "installed domain-seer bindings lack nameserver_target; "
+            "rebuild seer-py from the same checkout as seer-api"
+        )
+    return parse(spec)
 
 
 def guard(host: str, port: int = 443) -> None:
@@ -121,8 +59,7 @@ def guard(host: str, port: int = 443) -> None:
     Blocking. The underlying ``seer.validate_public_host`` performs a DNS
     resolution inside a Tokio ``block_on``; calling this directly from an
     ``async def`` FastAPI handler pins the event loop thread. Use
-    :func:`guard_async` from async contexts. This sync entry point remains
-    for sync callers such as the MCP server.
+    :func:`guard_async` from async contexts.
     """
     try:
         seer.validate_public_host(host, port)
@@ -146,10 +83,27 @@ async def guard_async(host: str, port: int = 443) -> None:
 async def guard_nameserver_async(spec: str) -> None:
     """:func:`guard_async` the host a nameserver spec connects to.
 
-    See :func:`nameserver_target`: a malformed spec is passed through for the
-    core to reject rather than guessed at here.
+    A user-supplied nameserver is a *spec*, not a hostname: a bare
+    IP/hostname with an optional port (UDP, ``9.9.9.9:5353``,
+    ``[2606:4700:4700::1111]``), ``tls://host[:port]`` (DoT) or
+    ``https://host[:port][/path]`` (DoH). ``seer.nameserver_target`` extracts
+    the ``(host, port)`` with seer-core's own ``NameserverSpec::parse``, so the
+    guard checks exactly the address the resolver would contact.
+
+    A spec the core rejects yields ``None`` and is passed through: the core
+    then fails it with its own ``Invalid input`` (ValueError -> 400). The core
+    also refuses reserved nameserver addresses on its own, so this pre-check
+    is defense in depth that turns a reserved target into a clear 400 — never
+    the only SSRF gate.
     """
-    target = nameserver_target(spec)
+    try:
+        target = nameserver_target(spec)
+    except RuntimeError:
+        # A deployment fault, not a bad request: log why, don't leak it.
+        logger.exception("nameserver SSRF guard unavailable")
+        raise HTTPException(
+            status_code=503, detail="Nameserver validation is unavailable"
+        ) from None
     if target is not None:
         await guard_async(*target)
 

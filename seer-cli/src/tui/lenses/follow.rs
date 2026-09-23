@@ -8,7 +8,7 @@ use ratatui::Frame;
 use crate::tui::app::SPIN;
 use crate::tui::panes::FollowState;
 use crate::tui::theme::Theme;
-use crate::tui::widgets::{dot, gauge, panel};
+use crate::tui::widgets::{dot, gauge, or_dash, panel};
 
 pub fn render(f: &mut Frame, area: Rect, theme: &Theme, follow: &FollowState, spin: usize) {
     let rows = Layout::default()
@@ -26,9 +26,7 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, follow: &FollowState, sp
         .map(|(_, secs)| secs)
         .unwrap_or(follow.interval_secs);
     let top_title = format!("Follow  ·  {interval}s interval  ·  {total} checks");
-    let top_block = panel::block(theme, &top_title, theme.teal, false);
-    let top_inner = top_block.inner(rows[0]);
-    f.render_widget(top_block, rows[0]);
+    let top_inner = panel::render(f, rows[0], theme, &top_title, theme.teal, false);
 
     let ratio = if total > 0 {
         (follow.log.len() as f64 / total as f64).min(1.0)
@@ -64,9 +62,7 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, follow: &FollowState, sp
     f.render_widget(top_para, top_inner);
 
     // ── bottom panel: change log table ──────────────────────────────────────
-    let log_block = panel::block(theme, "Change Log", theme.teal, false);
-    let log_inner = log_block.inner(rows[1]);
-    f.render_widget(log_block, rows[1]);
+    let log_inner = panel::render(f, rows[1], theme, "Change Log", theme.teal, false);
 
     if follow.log.is_empty() {
         f.render_widget(
@@ -95,11 +91,7 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, follow: &FollowState, sp
                 dot::line(theme, "fail", "ERROR"),
             )
         } else {
-            let a = it
-                .records
-                .first()
-                .map(|r| r.format_short())
-                .unwrap_or_else(|| "—".into());
+            let a = or_dash(it.records.first().map(|r| r.format_short()));
             let d = if it.changed {
                 dot::line(theme, "warn", "CHANGED")
             } else {
@@ -134,9 +126,8 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, follow: &FollowState, sp
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::test_util::render_text;
     use chrono::Utc;
-    use ratatui::backend::TestBackend;
-    use ratatui::Terminal;
     use seer_core::dns::FollowIteration;
 
     fn make_iteration(iteration: usize, record_value: &str, changed: bool) -> FollowIteration {
@@ -172,17 +163,6 @@ mod tests {
         }
     }
 
-    fn buf_text(terminal: &Terminal<TestBackend>) -> String {
-        let area = terminal.backend().buffer().area();
-        let mut s = String::new();
-        for y in 0..area.height {
-            for x in 0..area.width {
-                s.push_str(terminal.backend().buffer()[(x, y)].symbol());
-            }
-        }
-        s
-    }
-
     #[test]
     fn renders_a_record_in_log() {
         let theme = Theme::frappe();
@@ -190,12 +170,7 @@ mod tests {
         follow.push(make_iteration(1, "1.2.3.4", false));
         follow.push(make_iteration(2, "1.2.3.4", true));
 
-        let backend = TestBackend::new(80, 20);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| render(f, f.area(), &theme, &follow, 0))
-            .unwrap();
-        let text = buf_text(&terminal);
+        let text = render_text(80, 20, |f| render(f, f.area(), &theme, &follow, 0));
         assert!(
             text.contains("1.2.3.4"),
             "rendered buffer should contain A record IP"
@@ -219,12 +194,7 @@ mod tests {
             error: Some("NXDOMAIN".into()),
         });
 
-        let backend = TestBackend::new(80, 20);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| render(f, f.area(), &theme, &follow, 0))
-            .unwrap();
-        let text = buf_text(&terminal);
+        let text = render_text(80, 20, |f| render(f, f.area(), &theme, &follow, 0));
         assert!(
             text.contains("ERROR"),
             "errored iteration should render an ERROR marker"
@@ -246,12 +216,7 @@ mod tests {
             ..Default::default()
         };
 
-        let backend = TestBackend::new(80, 20);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| render(f, f.area(), &theme, &follow, 3))
-            .unwrap();
-        let text = buf_text(&terminal);
+        let text = render_text(80, 20, |f| render(f, f.area(), &theme, &follow, 3));
         assert!(
             text.contains(SPIN[3]),
             "spinner should render the current animation frame"
@@ -274,12 +239,7 @@ mod tests {
         }
         follow.count = 5;
 
-        let backend = TestBackend::new(80, 20);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| render(f, f.area(), &theme, &follow, 0))
-            .unwrap();
-        let text = buf_text(&terminal);
+        let text = render_text(80, 20, |f| render(f, f.area(), &theme, &follow, 0));
         assert!(text.contains("20/20 done"), "got: {text}");
         assert!(!text.contains("20/5"), "got: {text}");
         assert!(text.contains("20 checks"), "title shows the run's count");
@@ -294,12 +254,7 @@ mod tests {
         let theme = Theme::frappe();
         let follow = FollowState::default();
 
-        let backend = TestBackend::new(80, 20);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| render(f, f.area(), &theme, &follow, 0))
-            .unwrap();
-        let text = buf_text(&terminal);
+        let text = render_text(80, 20, |f| render(f, f.area(), &theme, &follow, 0));
         assert!(
             text.contains("waiting"),
             "empty log should show 'waiting' placeholder"

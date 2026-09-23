@@ -181,14 +181,6 @@ impl FollowResult {
     pub fn completed_iterations(&self) -> usize {
         self.iterations.len()
     }
-
-    pub fn successful_iterations(&self) -> usize {
-        self.iterations.iter().filter(|i| i.success()).count()
-    }
-
-    pub fn failed_iterations(&self) -> usize {
-        self.iterations.iter().filter(|i| !i.success()).count()
-    }
 }
 
 /// Callback type for real-time progress updates
@@ -215,6 +207,13 @@ impl DnsFollower {
 
     pub fn with_resolver(resolver: DnsResolver) -> Self {
         Self { resolver }
+    }
+
+    /// Builds a follower whose resolver honors `~/.seer/config.toml`
+    /// (`timeouts.dns_secs`), like [`DnsResolver::from_config`]. As there, the
+    /// configured nameserver is passed per call to [`DnsFollower::follow`].
+    pub fn from_config(config: &crate::config::SeerConfig) -> Self {
+        Self::with_resolver(DnsResolver::from_config(config))
     }
 
     /// Follow DNS records over time
@@ -368,19 +367,6 @@ impl DnsFollower {
             ended_at,
         })
     }
-
-    /// Simple follow without callback or cancellation
-    #[instrument(skip(self, config), fields(domain = %domain, record_type = ?record_type))]
-    pub async fn follow_simple(
-        &self,
-        domain: &str,
-        record_type: RecordType,
-        nameserver: Option<&str>,
-        config: FollowConfig,
-    ) -> Result<FollowResult> {
-        self.follow(domain, record_type, nameserver, config, None, None)
-            .await
-    }
 }
 
 /// One iteration's record values: comparison key
@@ -428,6 +414,17 @@ mod tests {
     use super::*;
 
     use super::super::records::RecordData;
+
+    /// Regression: the TUI's live follow used `DnsFollower::new()` and so
+    /// ignored the configured DNS timeout that `dig`, the CLI and the REPL
+    /// honor. Every surface now builds its follower through `from_config`.
+    #[test]
+    fn from_config_applies_dns_timeout() {
+        let mut config = crate::config::SeerConfig::default();
+        config.timeouts.dns_secs = 9;
+        let follower = DnsFollower::from_config(&config);
+        assert_eq!(follower.resolver.timeout(), Duration::from_secs(9));
+    }
 
     fn record(data: RecordData) -> DnsRecord {
         DnsRecord {
@@ -531,7 +528,7 @@ mod tests {
             },
         ] {
             let err = follower
-                .follow_simple("example.com", RecordType::A, None, config)
+                .follow("example.com", RecordType::A, None, config, None, None)
                 .await
                 .expect_err("out-of-range config must be rejected before any query");
             assert!(matches!(err, SeerError::InvalidInput(_)), "{err:?}");
@@ -610,11 +607,13 @@ mod tests {
         let one_shot = || FollowConfig::new(1, 0.0).expect("valid config");
 
         let result = follower
-            .follow_simple(
+            .follow(
                 "www.seer.test",
                 RecordType::CNAME,
                 Some("127.0.0.1"),
                 one_shot(),
+                None,
+                None,
             )
             .await
             .expect("follow www");
@@ -622,11 +621,13 @@ mod tests {
         assert_eq!(result.iterations[0].record_count(), 1);
 
         let result = follower
-            .follow_simple(
+            .follow(
                 "2606:4700:4700::1111",
                 RecordType::PTR,
                 Some("127.0.0.1"),
                 one_shot(),
+                None,
+                None,
             )
             .await
             .expect("IPv6 PTR literal must be accepted");
@@ -704,7 +705,7 @@ mod tests {
 
         // Clean loop exit: every iteration ran, none errored, no interrupt.
         assert_eq!(result.completed_iterations(), 3);
-        assert_eq!(result.successful_iterations(), 3);
+        assert!(result.iterations.iter().all(|i| i.success()));
         assert!(!result.interrupted);
         assert_eq!(result.domain, "seer.test");
         assert_eq!(result.record_type, RecordType::A);
@@ -741,7 +742,7 @@ mod tests {
         let config = FollowConfig::new(1, 0.0).unwrap();
 
         let result = follower
-            .follow_simple("example.com", RecordType::A, None, config)
+            .follow("example.com", RecordType::A, None, config, None, None)
             .await;
 
         assert!(result.is_ok());

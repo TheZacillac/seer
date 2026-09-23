@@ -3,12 +3,10 @@
 //! Loads a list of domains from `~/.seer/watchlist.toml` and checks their
 //! SSL certificates, domain expiration, and HTTP status.
 
-use std::path::PathBuf;
-
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::error::{Result, SeerError};
+use crate::error::Result;
 use crate::status::StatusClient;
 
 /// Persistent list of domains to monitor.
@@ -39,65 +37,9 @@ pub struct WatchReport {
     pub critical: usize,
 }
 
+crate::fsutil::persisted_store!(Watchlist, "watchlist.toml", toml, "watchlist");
+
 impl Watchlist {
-    /// Returns the path to the watchlist file (`~/.seer/watchlist.toml`).
-    pub fn path() -> Option<PathBuf> {
-        dirs::home_dir().map(|h| h.join(".seer").join("watchlist.toml"))
-    }
-
-    /// Loads the watchlist from disk, returning an empty list on any failure.
-    ///
-    /// When the file exists but fails to parse, it is renamed to
-    /// `<path>.corrupt` (preserving the user's data for recovery/forensics)
-    /// and a warning is logged — previously the file was silently
-    /// overwritten on the next save, dropping the user's watchlist.
-    pub fn load() -> Self {
-        let Some(path) = Self::path() else {
-            return Self::default();
-        };
-        Self::load_from_path(&path)
-    }
-
-    /// Like [`Self::load`] but reads from an explicit path. Split out so
-    /// tests can exercise the corrupt-file handling without depending on
-    /// the real `~/.seer/watchlist.toml` location.
-    pub(crate) fn load_from_path(path: &std::path::Path) -> Self {
-        crate::fsutil::load_or_back_up(path, "watchlist", |content| {
-            toml::from_str::<Watchlist>(content).map_err(|e| e.to_string())
-        })
-    }
-
-    /// Persists the watchlist to disk via write-and-rename so a crash mid-write
-    /// cannot leave the file truncated (the next `load()` would see corrupt
-    /// TOML and silently fall back to the default empty watchlist, losing
-    /// the user's domains). Mirrors `LookupHistory::save`.
-    ///
-    /// The temp filename is unique per call (PID + process-wide counter, see
-    /// `crate::fsutil`) so concurrent saves — whether from two `seer`
-    /// processes or two tasks in one process — never write to the same
-    /// intermediate path and race each other's `rename`s.
-    ///
-    /// # Concurrency
-    ///
-    /// As with [`crate::history::LookupHistory::save`], the write is atomic but
-    /// the load → add/remove → save cycle is not cross-process locked: two
-    /// concurrent writers can lose one side's add/remove (last-writer-wins). No
-    /// corruption occurs. A cross-process advisory lock would close the window;
-    /// it is omitted to avoid a new dependency for a low-frequency edge case.
-    pub fn save(&self) -> Result<()> {
-        let path = Self::path()
-            .ok_or_else(|| SeerError::ConfigError("Cannot determine home directory".to_string()))?;
-        self.save_to_path(&path)
-    }
-
-    /// Like [`Self::save`] but writes to an explicit path. Split out so tests
-    /// can exercise the atomic-save path without touching `~/.seer`.
-    pub(crate) fn save_to_path(&self, path: &std::path::Path) -> Result<()> {
-        let content =
-            toml::to_string_pretty(self).map_err(|e| SeerError::ConfigError(e.to_string()))?;
-        crate::fsutil::write_atomic_owner_only(path, &content, "toml")
-    }
-
     /// Adds a domain to the watchlist. Returns `Ok(true)` if the domain was newly added.
     pub fn add(&mut self, domain: &str) -> Result<bool> {
         let domain = crate::validation::normalize_domain(domain)?;
@@ -152,9 +94,6 @@ fn result_is_critical(r: &WatchResult) -> bool {
         .any(|i| i == SSL_INVALID_ISSUE || i.starts_with(CHECK_FAILED_PREFIX));
     bad_ssl || bad_domain || bad_issue
 }
-
-/// Default number of domains checked at once by [`check_watchlist`].
-const DEFAULT_WATCH_CONCURRENCY: usize = 10;
 
 /// Turns one domain's status check into a [`WatchResult`]. Pure, so every
 /// issue rule is unit-testable without the network.
@@ -244,16 +183,8 @@ fn assess(domain: String, outcome: Result<crate::status::StatusResponse>) -> Wat
 }
 
 /// Checks all given domains concurrently and produces a [`WatchReport`],
-/// using default timeouts and concurrency.
-///
-/// Prefer [`check_watchlist_with_config`] from a front-end, so the user's
-/// `~/.seer/config.toml` timeouts and bulk concurrency apply.
-pub async fn check_watchlist(domains: &[String]) -> WatchReport {
-    check_watchlist_with(domains, StatusClient::new(), DEFAULT_WATCH_CONCURRENCY).await
-}
-
-/// Like [`check_watchlist`], honoring the config file's per-protocol
-/// timeouts (via [`StatusClient::from_config`]) and `bulk.concurrency`.
+/// honoring the config file's per-protocol timeouts (via
+/// [`StatusClient::from_config`]) and `bulk.concurrency`.
 pub async fn check_watchlist_with_config(
     domains: &[String],
     config: &crate::config::SeerConfig,
@@ -276,7 +207,7 @@ pub async fn check_watchlist_with(
 
     // Each per-domain future owns its `client` (via `Arc`) and `domain`
     // (owned `String`) so the `buffer_unordered` futures are `Send + 'static`
-    // and the whole `check_watchlist` future can be used from `tokio::spawn`
+    // and the whole `check_watchlist_with` future can be used from `tokio::spawn`
     // (e.g. the TUI). Borrowing `&client`/`&String` here makes the closure fail
     // the higher-ranked `FnOnce` bound `tokio::spawn` requires.
     let client = std::sync::Arc::new(client);
@@ -313,6 +244,7 @@ pub async fn check_watchlist_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn status_with(
         dns: Option<crate::status::DnsResolution>,

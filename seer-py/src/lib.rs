@@ -1,9 +1,7 @@
-mod bridge;
-
 use std::future::Future;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{LazyLock, Mutex, MutexGuard, OnceLock};
 
 use pyo3::exceptions::{PyConnectionError, PyRuntimeError, PyTimeoutError, PyValueError};
 use pyo3::prelude::*;
@@ -13,7 +11,7 @@ use seer_core::{
     bulk::{BulkExecutor, BulkOperation},
     dns::{
         DelegationChecker, DnsComparator, DnsFollower, DnsResolver, DnssecChecker, FollowConfig,
-        PropagationChecker, RecordType,
+        NameserverSpec, PropagationChecker, RecordType,
     },
     lookup::SmartLookup,
     rdap::RdapClient,
@@ -119,28 +117,15 @@ fn seer_err_to_py(e: &SeerError) -> PyErr {
 /// Run an async `SeerError`-returning future on the shared Tokio runtime and
 /// marshal the outcome into a `PyResult`.
 ///
-/// Wraps the `block_on` in `std::panic::catch_unwind`: a panic that unwinds
-/// through the FFI boundary is UB and would abort the Python process. Common
-/// causes include calling a blocking runtime from inside another async runtime
-/// (e.g. from `asyncio`) which tokio explicitly panics on. We surface that as
-/// a `RuntimeError` instead.
-///
 /// Errors are routed through `seer_err_to_py` so that sanitized, typed
-/// messages reach the caller.
+/// messages reach the caller. Panic safety comes from
+/// [`run_async_infallible`].
 fn run_async<F, T>(py: Python<'_>, fut: F) -> PyResult<T>
 where
     F: Future<Output = seer_core::Result<T>> + Send,
     T: Send,
 {
-    py.detach(
-        || match catch_unwind(AssertUnwindSafe(|| get_runtime().block_on(fut))) {
-            Ok(Ok(v)) => Ok(v),
-            Ok(Err(e)) => Err(seer_err_to_py(&e)),
-            Err(_) => Err(PyRuntimeError::new_err(
-                "panic in seer runtime (likely nested async context or internal bug)",
-            )),
-        },
-    )
+    run_async_infallible(py, fut)?.map_err(|e| seer_err_to_py(&e))
 }
 
 /// Serialize a Rust response to `serde_json::Value`, mapping any error to a
@@ -152,11 +137,28 @@ fn serialize_response<T: serde::Serialize>(value: &T) -> PyResult<serde_json::Va
         .map_err(|_| PyRuntimeError::new_err("internal error: failed to serialize response"))
 }
 
-/// Infallible variant of `run_async` for futures that do not return a
-/// `SeerError` (e.g. `BulkExecutor::execute` which reports per-item failures
-/// in the returned `Vec<BulkResult>`). Still wraps `block_on` in
-/// `catch_unwind` so that a panic in the runtime surfaces as a Python
-/// exception rather than aborting the process.
+/// Serialize a core response and convert it into a Python object.
+fn to_py<'py, T: serde::Serialize>(py: Python<'py>, value: &T) -> PyResult<Bound<'py, PyAny>> {
+    json_to_python(py, &serialize_response(value)?)
+}
+
+/// Parse a DNS record-type name; an unknown one raises `ValueError`.
+fn parse_record_type(record_type: &str) -> PyResult<RecordType> {
+    record_type
+        .parse()
+        .map_err(|e: SeerError| seer_err_to_py(&e))
+}
+
+/// Run a future on the shared Tokio runtime with the GIL released. Used
+/// directly for futures that do not return a `SeerError` (e.g.
+/// `BulkExecutor::execute`, which reports per-item failures in the returned
+/// `Vec<BulkResult>`).
+///
+/// Wraps the `block_on` in `std::panic::catch_unwind`: a panic that unwinds
+/// through the FFI boundary is UB and would abort the Python process. Common
+/// causes include calling a blocking runtime from inside another async runtime
+/// (e.g. from `asyncio`) which tokio explicitly panics on. We surface that as
+/// a `RuntimeError` instead.
 fn run_async_infallible<F, T>(py: Python<'_>, fut: F) -> PyResult<T>
 where
     F: Future<Output = T> + Send,
@@ -172,75 +174,23 @@ where
     )
 }
 
-fn get_smart_lookup() -> &'static SmartLookup {
-    static INSTANCE: OnceLock<SmartLookup> = OnceLock::new();
-    INSTANCE.get_or_init(SmartLookup::new)
-}
-
-fn get_whois_client() -> &'static WhoisClient {
-    static INSTANCE: OnceLock<WhoisClient> = OnceLock::new();
-    INSTANCE.get_or_init(WhoisClient::new)
-}
-
-fn get_rdap_client() -> &'static RdapClient {
-    static INSTANCE: OnceLock<RdapClient> = OnceLock::new();
-    INSTANCE.get_or_init(RdapClient::new)
-}
-
-fn get_dns_resolver() -> &'static DnsResolver {
-    static INSTANCE: OnceLock<DnsResolver> = OnceLock::new();
-    INSTANCE.get_or_init(DnsResolver::new)
-}
-
-fn get_propagation_checker() -> &'static PropagationChecker {
-    static INSTANCE: OnceLock<PropagationChecker> = OnceLock::new();
-    INSTANCE.get_or_init(PropagationChecker::new)
-}
-
-fn get_status_client() -> &'static StatusClient {
-    static INSTANCE: OnceLock<StatusClient> = OnceLock::new();
-    INSTANCE.get_or_init(StatusClient::new)
-}
-
-fn get_availability_checker() -> &'static AvailabilityChecker {
-    static INSTANCE: OnceLock<AvailabilityChecker> = OnceLock::new();
-    INSTANCE.get_or_init(AvailabilityChecker::new)
-}
-
-fn get_subdomain_enumerator() -> &'static SubdomainEnumerator {
-    static INSTANCE: OnceLock<SubdomainEnumerator> = OnceLock::new();
-    INSTANCE.get_or_init(SubdomainEnumerator::new)
-}
-
-fn get_ssl_checker() -> &'static SslChecker {
-    static INSTANCE: OnceLock<SslChecker> = OnceLock::new();
-    INSTANCE.get_or_init(SslChecker::new)
-}
-
-fn get_dnssec_checker() -> &'static DnssecChecker {
-    static INSTANCE: OnceLock<DnssecChecker> = OnceLock::new();
-    INSTANCE.get_or_init(DnssecChecker::new)
-}
-
-fn get_delegation_checker() -> &'static DelegationChecker {
-    static INSTANCE: OnceLock<DelegationChecker> = OnceLock::new();
-    INSTANCE.get_or_init(DelegationChecker::new)
-}
-
-fn get_dns_comparator() -> &'static DnsComparator {
-    static INSTANCE: OnceLock<DnsComparator> = OnceLock::new();
-    INSTANCE.get_or_init(DnsComparator::new)
-}
-
-fn get_dns_follower() -> &'static DnsFollower {
-    static INSTANCE: OnceLock<DnsFollower> = OnceLock::new();
-    INSTANCE.get_or_init(DnsFollower::new)
-}
-
-fn get_domain_differ() -> &'static DomainDiffer {
-    static INSTANCE: OnceLock<DomainDiffer> = OnceLock::new();
-    INSTANCE.get_or_init(DomainDiffer::new)
-}
+// Process-wide core clients, each built on first use and shared by every call.
+static SMART_LOOKUP: LazyLock<SmartLookup> = LazyLock::new(SmartLookup::new);
+static WHOIS_CLIENT: LazyLock<WhoisClient> = LazyLock::new(WhoisClient::new);
+static RDAP_CLIENT: LazyLock<RdapClient> = LazyLock::new(RdapClient::new);
+static DNS_RESOLVER: LazyLock<DnsResolver> = LazyLock::new(DnsResolver::new);
+static PROPAGATION_CHECKER: LazyLock<PropagationChecker> = LazyLock::new(PropagationChecker::new);
+static STATUS_CLIENT: LazyLock<StatusClient> = LazyLock::new(StatusClient::new);
+static AVAILABILITY_CHECKER: LazyLock<AvailabilityChecker> =
+    LazyLock::new(AvailabilityChecker::new);
+static SUBDOMAIN_ENUMERATOR: LazyLock<SubdomainEnumerator> =
+    LazyLock::new(SubdomainEnumerator::new);
+static SSL_CHECKER: LazyLock<SslChecker> = LazyLock::new(SslChecker::new);
+static DNSSEC_CHECKER: LazyLock<DnssecChecker> = LazyLock::new(DnssecChecker::new);
+static DELEGATION_CHECKER: LazyLock<DelegationChecker> = LazyLock::new(DelegationChecker::new);
+static DNS_COMPARATOR: LazyLock<DnsComparator> = LazyLock::new(DnsComparator::new);
+static DNS_FOLLOWER: LazyLock<DnsFollower> = LazyLock::new(DnsFollower::new);
+static DOMAIN_DIFFER: LazyLock<DomainDiffer> = LazyLock::new(DomainDiffer::new);
 
 /// Validate that a host is safe to connect to (not a reserved/loopback/private IP).
 ///
@@ -254,58 +204,57 @@ fn validate_public_host(py: Python<'_>, host: String, port: u16) -> PyResult<()>
     })
 }
 
+/// The `(host, port)` a nameserver spec (`8.8.8.8`, `9.9.9.9:5353`,
+/// `tls://host[:port]`, `https://host[:port][/path]`) makes the resolver
+/// contact, or `None` for a spec seer-core rejects. Lets `seer-api` SSRF-check
+/// the address actually connected to with the core's own parser rather than
+/// a hand-synced copy. Pure parsing; no network I/O.
 #[pyfunction]
-fn lookup<'py>(py: Python<'py>, domain: String) -> PyResult<Bound<'py, PyAny>> {
-    let smart_lookup = get_smart_lookup();
-    let response = run_async(py, async move { smart_lookup.lookup(&domain).await })?;
-    let json = serialize_response(&response)?;
-    json_to_python(py, &json)
+fn nameserver_target(spec: &str) -> Option<(String, u16)> {
+    NameserverSpec::parse(spec).ok().map(|s| (s.host, s.port))
 }
 
-#[pyfunction]
-fn whois<'py>(py: Python<'py>, domain: String) -> PyResult<Bound<'py, PyAny>> {
-    let client = get_whois_client();
-    let response = run_async(py, async move { client.lookup(&domain).await })?;
-    let json = serialize_response(&response)?;
-    json_to_python(py, &json)
+/// Generates the single-argument bindings that make one core call and return
+/// its serialized result. `$call` runs inside the runtime, so a client static
+/// it names is built there on first use, with the GIL released.
+macro_rules! call_fn {
+    ($(
+        $(#[$meta:meta])*
+        $name:ident($arg:ident: $ty:ty) => $call:expr;
+    )*) => {$(
+        $(#[$meta])*
+        #[pyfunction]
+        fn $name<'py>(py: Python<'py>, $arg: $ty) -> PyResult<Bound<'py, PyAny>> {
+            let response = run_async(py, async move { $call.await })?;
+            to_py(py, &response)
+        }
+    )*};
 }
 
-#[pyfunction]
-fn rdap_domain<'py>(py: Python<'py>, domain: String) -> PyResult<Bound<'py, PyAny>> {
-    let client = get_rdap_client();
-    let response = run_async(py, async move { client.lookup_domain(&domain).await })?;
-    let json = serialize_response(&response)?;
-    json_to_python(py, &json)
-}
-
-#[pyfunction]
-fn rdap_ip<'py>(py: Python<'py>, ip: String) -> PyResult<Bound<'py, PyAny>> {
-    let client = get_rdap_client();
-    let response = run_async(py, async move { client.lookup_ip(&ip).await })?;
-    let json = serialize_response(&response)?;
-    json_to_python(py, &json)
-}
-
-#[pyfunction]
-fn rdap_asn<'py>(py: Python<'py>, asn: u32) -> PyResult<Bound<'py, PyAny>> {
-    let client = get_rdap_client();
-    let response = run_async(py, async move { client.lookup_asn(asn).await })?;
-    let json = serialize_response(&response)?;
-    json_to_python(py, &json)
-}
-
-/// Auto-routing RDAP lookup: classifies `query` as IP / ASN / domain in
-/// Rust and dispatches to the correct endpoint. Replaces the former
-/// Python-side dispatcher, which silently misrouted `AS`-prefixed domains
-/// like `as1234.io` to the ASN endpoint.
-#[pyfunction]
-fn rdap_auto<'py>(py: Python<'py>, query: String) -> PyResult<Bound<'py, PyAny>> {
-    let client = get_rdap_client();
-    let response = run_async(py, async move {
-        seer_core::rdap::auto_lookup(client, &query).await
-    })?;
-    let json = serialize_response(&response)?;
-    json_to_python(py, &json)
+call_fn! {
+    lookup(domain: String) => SMART_LOOKUP.lookup(&domain);
+    whois(domain: String) => WHOIS_CLIENT.lookup(&domain);
+    rdap_domain(domain: String) => RDAP_CLIENT.lookup_domain(&domain);
+    rdap_ip(ip: String) => RDAP_CLIENT.lookup_ip(&ip);
+    rdap_asn(asn: u32) => RDAP_CLIENT.lookup_asn(asn);
+    /// Look up RDAP data for a domain, IP address or ASN. The shape of
+    /// `query` picks the lookup:
+    ///
+    /// - an IPv4 or IPv6 address (8.8.8.8, 2606:4700:4700::1111): IP lookup
+    /// - AS15169 or as15169, with no dots: ASN lookup
+    /// - anything else: domain lookup (so as1234.io stays a domain)
+    ///
+    /// Returns the RDAP response as a dict. seer.rdap is the same function.
+    rdap_auto(query: String) => seer_core::rdap::auto_lookup(&RDAP_CLIENT, &query);
+    status(domain: String) => STATUS_CLIENT.check(&domain);
+    availability(domain: String) => AVAILABILITY_CHECKER.check(&domain);
+    subdomains(domain: String) => SUBDOMAIN_ENUMERATOR.enumerate(&domain);
+    ssl(domain: String) => SSL_CHECKER.check(&domain);
+    dnssec(domain: String) => DNSSEC_CHECKER.check(&domain);
+    delegation(domain: String) => DELEGATION_CHECKER.check(&domain);
+    posture(domain: String) => seer_core::lookup_email_posture(&DNS_RESOLVER, &domain);
+    headers(domain: String)
+        => seer_core::audit_headers(&domain, seer_core::DEFAULT_HEADER_TIMEOUT);
 }
 
 #[pyfunction]
@@ -316,20 +265,15 @@ fn dig<'py>(
     record_type: &str,
     nameserver: Option<String>,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let resolver = get_dns_resolver();
-
-    let rt_parsed: RecordType = record_type
-        .parse()
-        .map_err(|e: SeerError| seer_err_to_py(&e))?;
+    let rt_parsed = parse_record_type(record_type)?;
 
     let records = run_async(py, async move {
-        resolver
+        DNS_RESOLVER
             .resolve(&domain, rt_parsed, nameserver.as_deref())
             .await
     })?;
 
-    let json = serialize_response(&records)?;
-    json_to_python(py, &json)
+    to_py(py, &records)
 }
 
 #[pyfunction]
@@ -339,15 +283,12 @@ fn propagation<'py>(
     domain: String,
     record_type: &str,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let checker = get_propagation_checker();
+    let rt_parsed = parse_record_type(record_type)?;
 
-    let rt_parsed: RecordType = record_type
-        .parse()
-        .map_err(|e: SeerError| seer_err_to_py(&e))?;
-
-    let response = run_async(py, async move { checker.check(&domain, rt_parsed).await })?;
-    let json = serialize_response(&response)?;
-    json_to_python(py, &json)
+    let response = run_async(py, async move {
+        PROPAGATION_CHECKER.check(&domain, rt_parsed).await
+    })?;
+    to_py(py, &response)
 }
 
 const MAX_CONCURRENCY: usize = 50;
@@ -534,50 +475,61 @@ fn build_progress_callback(
     }
 }
 
-#[pyfunction]
-#[pyo3(signature = (domains, concurrency = 10, *, progress = None))]
-fn bulk_lookup<'py>(
+/// Runs a prepared batch on a fresh executor and returns its serialized
+/// results. Deliberately non-generic, so the executor future is instantiated
+/// once rather than per binding.
+fn execute_bulk<'py>(
     py: Python<'py>,
-    domains: Vec<String>,
+    operations: Vec<BulkOperation>,
     concurrency: usize,
     progress: Option<Py<PyAny>>,
 ) -> PyResult<Bound<'py, PyAny>> {
-    validate_domains(&domains)?;
-    let executor = BulkExecutor::new().with_concurrency(validate_concurrency(concurrency)?);
-
-    let operations: Vec<BulkOperation> = domains
-        .into_iter()
-        .map(|domain| BulkOperation::Lookup { domain })
-        .collect();
-
+    let executor = BulkExecutor::new().with_concurrency(concurrency);
     let cb = build_progress_callback(progress)?;
     let result = run_async_infallible(py, async move { executor.execute(operations, cb).await })?;
-
-    let json = serialize_response(&result)?;
-    json_to_python(py, &json)
+    to_py(py, &result)
 }
 
-#[pyfunction]
-#[pyo3(signature = (domains, concurrency = 10, *, progress = None))]
-fn bulk_whois<'py>(
+/// Validates a bulk call's domain count and concurrency, then runs one
+/// operation per domain.
+fn run_bulk<'py>(
     py: Python<'py>,
     domains: Vec<String>,
     concurrency: usize,
     progress: Option<Py<PyAny>>,
+    op: impl Fn(String) -> BulkOperation,
 ) -> PyResult<Bound<'py, PyAny>> {
     validate_domains(&domains)?;
-    let executor = BulkExecutor::new().with_concurrency(validate_concurrency(concurrency)?);
+    let concurrency = validate_concurrency(concurrency)?;
+    let operations = domains.into_iter().map(op).collect();
+    execute_bulk(py, operations, concurrency, progress)
+}
 
-    let operations: Vec<BulkOperation> = domains
-        .into_iter()
-        .map(|domain| BulkOperation::Whois { domain })
-        .collect();
+/// Generates the `bulk_*` bindings whose operation needs only the domain.
+macro_rules! bulk_fn {
+    ($($name:ident => $variant:ident;)*) => {$(
+        #[pyfunction]
+        #[pyo3(signature = (domains, concurrency = 10, *, progress = None))]
+        fn $name<'py>(
+            py: Python<'py>,
+            domains: Vec<String>,
+            concurrency: usize,
+            progress: Option<Py<PyAny>>,
+        ) -> PyResult<Bound<'py, PyAny>> {
+            run_bulk(py, domains, concurrency, progress, |domain| {
+                BulkOperation::$variant { domain }
+            })
+        }
+    )*};
+}
 
-    let cb = build_progress_callback(progress)?;
-    let result = run_async_infallible(py, async move { executor.execute(operations, cb).await })?;
-
-    let json = serialize_response(&result)?;
-    json_to_python(py, &json)
+bulk_fn! {
+    bulk_lookup => Lookup;
+    bulk_whois => Whois;
+    bulk_status => Status;
+    bulk_ssl => Ssl;
+    bulk_availability => Avail;
+    bulk_info => Info;
 }
 
 #[pyfunction]
@@ -590,25 +542,16 @@ fn bulk_dig<'py>(
     progress: Option<Py<PyAny>>,
 ) -> PyResult<Bound<'py, PyAny>> {
     validate_domains(&domains)?;
-    let executor = BulkExecutor::new().with_concurrency(validate_concurrency(concurrency)?);
-
-    let rt_parsed: RecordType = record_type
-        .parse()
-        .map_err(|e: SeerError| seer_err_to_py(&e))?;
-
-    let operations: Vec<BulkOperation> = domains
+    let concurrency = validate_concurrency(concurrency)?;
+    let record_type = parse_record_type(record_type)?;
+    let operations = domains
         .into_iter()
         .map(|domain| BulkOperation::Dns {
             domain,
-            record_type: rt_parsed,
+            record_type,
         })
         .collect();
-
-    let cb = build_progress_callback(progress)?;
-    let result = run_async_infallible(py, async move { executor.execute(operations, cb).await })?;
-
-    let json = serialize_response(&result)?;
-    json_to_python(py, &json)
+    execute_bulk(py, operations, concurrency, progress)
 }
 
 #[pyfunction]
@@ -621,172 +564,25 @@ fn bulk_propagation<'py>(
     progress: Option<Py<PyAny>>,
 ) -> PyResult<Bound<'py, PyAny>> {
     validate_domains(&domains)?;
-    let executor = BulkExecutor::new().with_concurrency(validate_concurrency(concurrency)?);
-
-    let rt_parsed: RecordType = record_type
-        .parse()
-        .map_err(|e: SeerError| seer_err_to_py(&e))?;
-
-    let operations: Vec<BulkOperation> = domains
+    let concurrency = validate_concurrency(concurrency)?;
+    let record_type = parse_record_type(record_type)?;
+    let operations = domains
         .into_iter()
         .map(|domain| BulkOperation::Propagation {
             domain,
-            record_type: rt_parsed,
+            record_type,
         })
         .collect();
-
-    let cb = build_progress_callback(progress)?;
-    let result = run_async_infallible(py, async move { executor.execute(operations, cb).await })?;
-
-    let json = serialize_response(&result)?;
-    json_to_python(py, &json)
-}
-
-#[pyfunction]
-fn status<'py>(py: Python<'py>, domain: String) -> PyResult<Bound<'py, PyAny>> {
-    let client = get_status_client();
-    let response = run_async(py, async move { client.check(&domain).await })?;
-    let json = serialize_response(&response)?;
-    json_to_python(py, &json)
-}
-
-#[pyfunction]
-#[pyo3(signature = (domains, concurrency = 10, *, progress = None))]
-fn bulk_status<'py>(
-    py: Python<'py>,
-    domains: Vec<String>,
-    concurrency: usize,
-    progress: Option<Py<PyAny>>,
-) -> PyResult<Bound<'py, PyAny>> {
-    validate_domains(&domains)?;
-    let executor = BulkExecutor::new().with_concurrency(validate_concurrency(concurrency)?);
-
-    let operations: Vec<BulkOperation> = domains
-        .into_iter()
-        .map(|domain| BulkOperation::Status { domain })
-        .collect();
-
-    let cb = build_progress_callback(progress)?;
-    let result = run_async_infallible(py, async move { executor.execute(operations, cb).await })?;
-
-    let json = serialize_response(&result)?;
-    json_to_python(py, &json)
-}
-
-#[pyfunction]
-#[pyo3(signature = (domains, concurrency = 10, *, progress = None))]
-fn bulk_ssl<'py>(
-    py: Python<'py>,
-    domains: Vec<String>,
-    concurrency: usize,
-    progress: Option<Py<PyAny>>,
-) -> PyResult<Bound<'py, PyAny>> {
-    validate_domains(&domains)?;
-    let executor = BulkExecutor::new().with_concurrency(validate_concurrency(concurrency)?);
-
-    let operations: Vec<BulkOperation> = domains
-        .into_iter()
-        .map(|domain| BulkOperation::Ssl { domain })
-        .collect();
-
-    let cb = build_progress_callback(progress)?;
-    let result = run_async_infallible(py, async move { executor.execute(operations, cb).await })?;
-
-    let json = serialize_response(&result)?;
-    json_to_python(py, &json)
-}
-
-#[pyfunction]
-#[pyo3(signature = (domains, concurrency = 10, *, progress = None))]
-fn bulk_availability<'py>(
-    py: Python<'py>,
-    domains: Vec<String>,
-    concurrency: usize,
-    progress: Option<Py<PyAny>>,
-) -> PyResult<Bound<'py, PyAny>> {
-    validate_domains(&domains)?;
-    let executor = BulkExecutor::new().with_concurrency(validate_concurrency(concurrency)?);
-
-    let operations: Vec<BulkOperation> = domains
-        .into_iter()
-        .map(|domain| BulkOperation::Avail { domain })
-        .collect();
-
-    let cb = build_progress_callback(progress)?;
-    let result = run_async_infallible(py, async move { executor.execute(operations, cb).await })?;
-
-    let json = serialize_response(&result)?;
-    json_to_python(py, &json)
-}
-
-#[pyfunction]
-fn availability<'py>(py: Python<'py>, domain: String) -> PyResult<Bound<'py, PyAny>> {
-    let checker = get_availability_checker();
-    let response = run_async(py, async move { checker.check(&domain).await })?;
-    let json = serialize_response(&response)?;
-    json_to_python(py, &json)
-}
-
-#[pyfunction]
-fn subdomains<'py>(py: Python<'py>, domain: String) -> PyResult<Bound<'py, PyAny>> {
-    let enumerator = get_subdomain_enumerator();
-    let response = run_async(py, async move { enumerator.enumerate(&domain).await })?;
-    let json = serialize_response(&response)?;
-    json_to_python(py, &json)
-}
-
-#[pyfunction]
-fn ssl<'py>(py: Python<'py>, domain: String) -> PyResult<Bound<'py, PyAny>> {
-    let checker = get_ssl_checker();
-    let response = run_async(py, async move { checker.check(&domain).await })?;
-    let json = serialize_response(&response)?;
-    json_to_python(py, &json)
-}
-
-#[pyfunction]
-fn dnssec<'py>(py: Python<'py>, domain: String) -> PyResult<Bound<'py, PyAny>> {
-    let checker = get_dnssec_checker();
-    let response = run_async(py, async move { checker.check(&domain).await })?;
-    let json = serialize_response(&response)?;
-    json_to_python(py, &json)
-}
-
-#[pyfunction]
-fn delegation<'py>(py: Python<'py>, domain: String) -> PyResult<Bound<'py, PyAny>> {
-    let checker = get_delegation_checker();
-    let response = run_async(py, async move { checker.check(&domain).await })?;
-    let json = serialize_response(&response)?;
-    json_to_python(py, &json)
+    execute_bulk(py, operations, concurrency, progress)
 }
 
 #[pyfunction]
 fn caa<'py>(py: Python<'py>, domain: String) -> PyResult<Bound<'py, PyAny>> {
-    let resolver = get_dns_resolver();
     let normalized = seer_core::normalize_domain(&domain).map_err(|e| seer_err_to_py(&e))?;
     let policy = run_async_infallible(py, async move {
-        seer_core::caa::lookup_caa(resolver, &normalized).await
+        seer_core::caa::lookup_caa(&DNS_RESOLVER, &normalized).await
     })?;
-    let json = serialize_response(&policy)?;
-    json_to_python(py, &json)
-}
-
-#[pyfunction]
-fn posture<'py>(py: Python<'py>, domain: String) -> PyResult<Bound<'py, PyAny>> {
-    let resolver = get_dns_resolver();
-    let response = run_async(py, async move {
-        seer_core::lookup_email_posture(resolver, &domain).await
-    })?;
-    let json = serialize_response(&response)?;
-    json_to_python(py, &json)
-}
-
-#[pyfunction]
-fn headers<'py>(py: Python<'py>, domain: String) -> PyResult<Bound<'py, PyAny>> {
-    let response = run_async(py, async move {
-        seer_core::audit_headers(&domain, seer_core::DEFAULT_HEADER_TIMEOUT).await
-    })?;
-    let json = serialize_response(&response)?;
-    json_to_python(py, &json)
+    to_py(py, &policy)
 }
 
 #[pyfunction]
@@ -796,15 +592,18 @@ fn takeover<'py>(
     domain: String,
     concurrency: usize,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let enumerator = get_subdomain_enumerator();
-    let resolver = get_dns_resolver();
     let concurrency = validate_concurrency(concurrency)?;
     let response = run_async(py, async move {
-        let result = enumerator.enumerate(&domain).await?;
-        seer_core::scan_takeover(resolver, &result.domain, result.subdomains, concurrency).await
+        let result = SUBDOMAIN_ENUMERATOR.enumerate(&domain).await?;
+        seer_core::scan_takeover(
+            &DNS_RESOLVER,
+            &result.domain,
+            result.subdomains,
+            concurrency,
+        )
+        .await
     })?;
-    let json = serialize_response(&response)?;
-    json_to_python(py, &json)
+    to_py(py, &response)
 }
 
 #[pyfunction]
@@ -814,13 +613,11 @@ fn confusables<'py>(
     domain: String,
     concurrency: usize,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let lookup = get_smart_lookup();
     let concurrency = validate_concurrency(concurrency)?;
     let response = run_async(py, async move {
-        seer_core::find_confusables(lookup, &domain, concurrency).await
+        seer_core::find_confusables(&SMART_LOOKUP, &domain, concurrency).await
     })?;
-    let json = serialize_response(&response)?;
-    json_to_python(py, &json)
+    to_py(py, &response)
 }
 
 #[pyfunction]
@@ -830,14 +627,12 @@ fn subdomains_classify<'py>(
     domain: String,
     concurrency: usize,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let enumerator = get_subdomain_enumerator();
-    let resolver = get_dns_resolver();
     let concurrency = validate_concurrency(concurrency)?;
     let response = run_async(py, async move {
-        let result = enumerator.enumerate(&domain).await?;
+        let result = SUBDOMAIN_ENUMERATOR.enumerate(&domain).await?;
         Ok::<_, SeerError>(
             seer_core::classify_subdomains(
-                resolver,
+                &DNS_RESOLVER,
                 &result.domain,
                 result.subdomains,
                 concurrency,
@@ -845,8 +640,7 @@ fn subdomains_classify<'py>(
             .await,
         )
     })?;
-    let json = serialize_response(&response)?;
-    json_to_python(py, &json)
+    to_py(py, &response)
 }
 
 #[pyfunction]
@@ -857,20 +651,15 @@ fn dns_compare<'py>(
     server_a: String,
     server_b: String,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let comparator = get_dns_comparator();
-
-    let rt_parsed: RecordType = record_type
-        .parse()
-        .map_err(|e: SeerError| seer_err_to_py(&e))?;
+    let rt_parsed = parse_record_type(record_type)?;
 
     let response = run_async(py, async move {
-        comparator
+        DNS_COMPARATOR
             .compare(&domain, rt_parsed, &server_a, &server_b)
             .await
     })?;
 
-    let json = serialize_response(&response)?;
-    json_to_python(py, &json)
+    to_py(py, &response)
 }
 
 #[pyfunction]
@@ -888,11 +677,7 @@ fn dns_follow<'py>(
     // first call's ability to be cancelled. The guard releases on return.
     let _active = FollowActiveGuard::acquire()?;
 
-    let follower = get_dns_follower();
-
-    let rt_parsed: RecordType = record_type
-        .parse()
-        .map_err(|e: SeerError| seer_err_to_py(&e))?;
+    let rt_parsed = parse_record_type(record_type)?;
 
     // Validate iteration/interval via core; this rejects NaN/inf/negative and
     // enforces the per-interval cap (<= 60 minutes).
@@ -931,7 +716,7 @@ fn dns_follow<'py>(
     };
 
     let response = run_async(py, async move {
-        follower
+        DNS_FOLLOWER
             .follow(
                 &domain,
                 rt_parsed,
@@ -953,8 +738,7 @@ fn dns_follow<'py>(
     }
 
     let response = response?;
-    let json = serialize_response(&response)?;
-    json_to_python(py, &json)
+    to_py(py, &response)
 }
 
 /// Signal the currently-running `dns_follow` call (if any) to cancel.
@@ -975,42 +759,18 @@ fn cancel_follow() -> PyResult<()> {
 
 #[pyfunction]
 fn diff<'py>(py: Python<'py>, domain_a: String, domain_b: String) -> PyResult<Bound<'py, PyAny>> {
-    let differ = get_domain_differ();
-    let response = run_async(py, async move { differ.diff(&domain_a, &domain_b).await })?;
-    let json = serialize_response(&response)?;
-    json_to_python(py, &json)
+    let response = run_async(
+        py,
+        async move { DOMAIN_DIFFER.diff(&domain_a, &domain_b).await },
+    )?;
+    to_py(py, &response)
 }
 
 #[pyfunction]
 fn info<'py>(py: Python<'py>, domain: String) -> PyResult<Bound<'py, PyAny>> {
-    let smart_lookup = get_smart_lookup();
-    let lookup_result = run_async(py, async move { smart_lookup.lookup(&domain).await })?;
+    let lookup_result = run_async(py, async move { SMART_LOOKUP.lookup(&domain).await })?;
     let domain_info = seer_core::domain_info::DomainInfo::from_lookup_result(&lookup_result);
-    let json = serialize_response(&domain_info)?;
-    json_to_python(py, &json)
-}
-
-#[pyfunction]
-#[pyo3(signature = (domains, concurrency = 10, *, progress = None))]
-fn bulk_info<'py>(
-    py: Python<'py>,
-    domains: Vec<String>,
-    concurrency: usize,
-    progress: Option<Py<PyAny>>,
-) -> PyResult<Bound<'py, PyAny>> {
-    validate_domains(&domains)?;
-    let executor = BulkExecutor::new().with_concurrency(validate_concurrency(concurrency)?);
-
-    let operations: Vec<BulkOperation> = domains
-        .into_iter()
-        .map(|domain| BulkOperation::Info { domain })
-        .collect();
-
-    let cb = build_progress_callback(progress)?;
-    let result = run_async_infallible(py, async move { executor.execute(operations, cb).await })?;
-
-    let json = serialize_response(&result)?;
-    json_to_python(py, &json)
+    to_py(py, &domain_info)
 }
 
 /// Look up information about a TLD: WHOIS server, RDAP endpoint, registry
@@ -1025,8 +785,7 @@ fn tld_info<'py>(py: Python<'py>, tld: String) -> PyResult<Bound<'py, PyAny>> {
     // `lookup_tld` is infallible: unknown TLDs yield a TldInfo with None
     // fields rather than an error.
     let info = run_async_infallible(py, async move { seer_core::lookup_tld(&tld).await })?;
-    let json = serialize_response(&info)?;
-    json_to_python(py, &json)
+    to_py(py, &info)
 }
 
 /// Return the full catalog of TLDs seer knows about (sorted, deduplicated).
@@ -1191,55 +950,27 @@ fn _raise_retry_exhausted_for_test(kind: &str) -> PyResult<()> {
     }))
 }
 
-/// Install a tracing subscriber that forwards Rust log events into Python's
-/// ``logging`` module.  Safe to call multiple times — only the first call
-/// takes effect.
-#[pyfunction]
-fn init_rust_logging() {
-    bridge::install_bridge();
-}
-
+/// The `seer._seer` extension module; `python/seer/__init__.py` re-exports
+/// its public functions.
 #[pymodule]
-fn _seer(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(init_rust_logging, m)?)?;
-    m.add_function(wrap_pyfunction!(_json_to_python_nested_for_test, m)?)?;
-    m.add_function(wrap_pyfunction!(_raise_retry_exhausted_for_test, m)?)?;
-    m.add_function(wrap_pyfunction!(validate_public_host, m)?)?;
-    m.add_function(wrap_pyfunction!(lookup, m)?)?;
-    m.add_function(wrap_pyfunction!(whois, m)?)?;
-    m.add_function(wrap_pyfunction!(rdap_domain, m)?)?;
-    m.add_function(wrap_pyfunction!(rdap_ip, m)?)?;
-    m.add_function(wrap_pyfunction!(rdap_asn, m)?)?;
-    m.add_function(wrap_pyfunction!(rdap_auto, m)?)?;
-    m.add_function(wrap_pyfunction!(dig, m)?)?;
-    m.add_function(wrap_pyfunction!(propagation, m)?)?;
-    m.add_function(wrap_pyfunction!(status, m)?)?;
-    m.add_function(wrap_pyfunction!(bulk_lookup, m)?)?;
-    m.add_function(wrap_pyfunction!(bulk_whois, m)?)?;
-    m.add_function(wrap_pyfunction!(bulk_dig, m)?)?;
-    m.add_function(wrap_pyfunction!(bulk_propagation, m)?)?;
-    m.add_function(wrap_pyfunction!(bulk_status, m)?)?;
-    m.add_function(wrap_pyfunction!(bulk_ssl, m)?)?;
-    m.add_function(wrap_pyfunction!(bulk_availability, m)?)?;
-    m.add_function(wrap_pyfunction!(availability, m)?)?;
-    m.add_function(wrap_pyfunction!(subdomains, m)?)?;
-    m.add_function(wrap_pyfunction!(ssl, m)?)?;
-    m.add_function(wrap_pyfunction!(dnssec, m)?)?;
-    m.add_function(wrap_pyfunction!(delegation, m)?)?;
-    m.add_function(wrap_pyfunction!(caa, m)?)?;
-    m.add_function(wrap_pyfunction!(posture, m)?)?;
-    m.add_function(wrap_pyfunction!(headers, m)?)?;
-    m.add_function(wrap_pyfunction!(takeover, m)?)?;
-    m.add_function(wrap_pyfunction!(confusables, m)?)?;
-    m.add_function(wrap_pyfunction!(subdomains_classify, m)?)?;
-    m.add_function(wrap_pyfunction!(dns_compare, m)?)?;
-    m.add_function(wrap_pyfunction!(dns_follow, m)?)?;
-    m.add_function(wrap_pyfunction!(cancel_follow, m)?)?;
-    m.add_function(wrap_pyfunction!(diff, m)?)?;
-    m.add_function(wrap_pyfunction!(info, m)?)?;
-    m.add_function(wrap_pyfunction!(bulk_info, m)?)?;
-    m.add_function(wrap_pyfunction!(tld_info, m)?)?;
-    m.add_function(wrap_pyfunction!(all_tlds, m)?)?;
-    m.add_function(wrap_pyfunction!(record_types, m)?)?;
-    Ok(())
+mod _seer {
+    #[pymodule_export]
+    use super::{
+        _json_to_python_nested_for_test, _raise_retry_exhausted_for_test, all_tlds, availability,
+        bulk_availability, bulk_dig, bulk_info, bulk_lookup, bulk_propagation, bulk_ssl,
+        bulk_status, bulk_whois, caa, cancel_follow, confusables, delegation, diff, dig,
+        dns_compare, dns_follow, dnssec, headers, info, lookup, nameserver_target, posture,
+        propagation, rdap_asn, rdap_auto, rdap_domain, rdap_ip, record_types, ssl, status,
+        subdomains, subdomains_classify, takeover, tld_info, validate_public_host, whois,
+    };
+
+    /// Forwards Rust `log` records into Python's `logging` — and `tracing`
+    /// events too, via tracing's `log` feature, since no tracing subscriber
+    /// is installed inside a Python process. Runs once, at import;
+    /// `try_init` leaves an already-installed logger alone.
+    #[pymodule_init]
+    fn init(_m: &pyo3::Bound<'_, pyo3::types::PyModule>) -> pyo3::PyResult<()> {
+        let _ = pyo3_log::try_init();
+        Ok(())
+    }
 }

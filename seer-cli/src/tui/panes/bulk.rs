@@ -2,29 +2,14 @@
 use crossterm::event::{KeyCode, KeyEvent};
 use seer_core::bulk::BulkResult;
 
+use crate::ops::BULK_OPS;
 use crate::tui::action::{Action, BulkParams, EditTarget};
 use crate::tui::panes::PaneOutcome;
-
-/// Operation presets selectable with `o`.
-pub const OPS: &[&str] = &[
-    "lookup",
-    "status",
-    "dig",
-    "avail",
-    "info",
-    "whois",
-    "rdap",
-    "ssl",
-    "prop",
-    "posture",
-    "confusables",
-    "caa",
-];
 
 /// State for the Bulk lens — op selection, entered domains, rows, run status.
 #[derive(Default)]
 pub struct BulkState {
-    /// Index into `OPS`.
+    /// Index into [`BULK_OPS`] (the presets cycled with `o`).
     pub op_idx: usize,
     /// Raw domains text entered/pasted by the user (space/comma/newline separated).
     pub domains: String,
@@ -43,7 +28,7 @@ pub struct BulkState {
     pub selected: Option<usize>,
     /// Whether the detail panel for the selected row is expanded.
     pub detail: bool,
-    /// `OPS` index the current `rows` were produced with, captured when the
+    /// `BULK_OPS` index the current `rows` were produced with, captured when the
     /// run starts. `o` changes `op_idx` for the NEXT run, so the results title
     /// and CSV export must not follow it.
     pub run_op_idx: Option<usize>,
@@ -69,13 +54,13 @@ pub fn parse_domains_input(s: &str) -> Vec<String> {
 impl BulkState {
     /// Current operation name.
     pub fn op(&self) -> &str {
-        OPS[self.op_idx]
+        BULK_OPS[self.op_idx].0
     }
 
     /// Operation the current results were produced with (falls back to the
     /// selected op before any run).
     pub fn results_op(&self) -> &str {
-        OPS[self.run_op_idx.unwrap_or(self.op_idx)]
+        BULK_OPS[self.run_op_idx.unwrap_or(self.op_idx)].0
     }
 
     /// Start a file-driven run (`f`). An empty path is ignored rather than
@@ -146,7 +131,7 @@ impl BulkState {
         match key.code {
             // Cycle operation
             KeyCode::Char('o') => {
-                self.op_idx = (self.op_idx + 1) % OPS.len();
+                self.op_idx = (self.op_idx + 1) % BULK_OPS.len();
                 Some(PaneOutcome::None)
             }
             // Edit the domains list
@@ -276,7 +261,7 @@ mod tests {
         assert!(matches!(out, Some(PaneOutcome::None)));
         assert_eq!(s.op(), "status");
         // Cycle through all remaining ops and wrap
-        for _ in 0..OPS.len() - 1 {
+        for _ in 0..BULK_OPS.len() - 1 {
             s.handle_key(key(KeyCode::Char('o')));
         }
         assert_eq!(s.op(), "lookup");
@@ -537,7 +522,10 @@ mod tests {
             "confusables",
             "caa",
         ] {
-            assert!(OPS.contains(&op), "op preset {op} should be selectable");
+            assert!(
+                BULK_OPS.iter().any(|(name, _)| *name == op),
+                "op preset {op} should be selectable"
+            );
         }
     }
 
@@ -545,7 +533,7 @@ mod tests {
     fn every_op_preset_is_a_valid_bulk_operation() {
         // The pane's presets must all map through the shared ops-module
         // mapping (no preset may silently fall back to `lookup`).
-        for op in OPS {
+        for (op, _) in BULK_OPS {
             assert!(
                 crate::ops::bulk_operation_for(op, "a.com".into(), seer_core::RecordType::A)
                     .is_some(),

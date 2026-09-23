@@ -1,0 +1,26 @@
+---
+source: seer-core/tests/format_snapshots.rs
+expression: markdown ().format_headers (& fixture_headers())
+---
+## HTTP security headers: example.com
+
+**Grade: C (55/100)** — `https://www.example.com/` (HTTP 200)
+
+| Header | Verdict | Value |
+|---|---|---|
+| strict-transport-security | Moderate | max-age=31536000 |
+| content-security-policy | Absent |  |
+
+### Cookies
+
+| Cookie | Verdict | Secure | HttpOnly | SameSite |
+|---|---|---|---|---|
+| session | Weak | true | false | — |
+
+### Disclosed software
+
+- `server`: nginx/1.25.3 (versioned)
+
+### Advisories
+
+- Content-Security-Policy is missing

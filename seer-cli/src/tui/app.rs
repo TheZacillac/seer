@@ -208,7 +208,7 @@ impl App {
     }
 
     /// Normalize + record the domain and produce a Fetch for the current lens
-    /// if it is implemented. Returns None for unimplemented lenses.
+    /// (if it has anything to fetch).
     fn set_domain_and_fetch(&mut self, raw: &str) -> Vec<Action> {
         let normalized = seer_core::normalize_domain(raw).unwrap_or_else(|_| raw.to_lowercase());
         let mut actions = Vec::new();
@@ -251,14 +251,10 @@ impl App {
     }
 
     /// Queue a fetch for the current lens at the current domain, marking it
-    /// Loading. Returns None if the lens isn't implemented or there's nothing
-    /// to fetch. History and Watch do not require a target domain.
+    /// Loading. Returns None if there's nothing to fetch. History and Watch do
+    /// not require a target domain.
     fn fetch_current(&mut self) -> Option<Action> {
-        let lens = self.current_lens();
-        let (key, implemented) = (lens.key, lens.implemented);
-        if !implemented {
-            return None;
-        }
+        let key = self.current_lens().key;
         // History reflects on-disk state that lookups mutate behind its back;
         // always re-read it rather than serving a cached (possibly empty) view.
         if key == "history" {
@@ -417,6 +413,12 @@ impl App {
                             Err(e) => LensState::Error(e),
                         };
                         self.states.insert(reg.key, new_state);
+                        // A refresh can return fewer rows (e.g. after `watch
+                        // remove` of the last row); keep the selection on a
+                        // real row so the highlight and row actions agree.
+                        if reg.key == self.current_lens().key {
+                            self.sel = self.sel.min(self.row_count().saturating_sub(1));
+                        }
                     }
                 }
                 vec![]
@@ -1259,29 +1261,7 @@ mod tests {
         let timestamp = DateTime::<chrono::Utc>::from_timestamp(0, 0).unwrap();
         let whois = WhoisResponse {
             domain: domain.to_string(),
-            registrar: None,
-            registrant: None,
-            organization: None,
-            registrant_email: None,
-            registrant_phone: None,
-            registrant_address: None,
-            registrant_country: None,
-            admin_name: None,
-            admin_organization: None,
-            admin_email: None,
-            admin_phone: None,
-            tech_name: None,
-            tech_organization: None,
-            tech_email: None,
-            tech_phone: None,
-            creation_date: None,
-            expiration_date: None,
-            updated_date: None,
-            nameservers: vec![],
-            status: vec![],
-            dnssec: None,
-            whois_server: String::new(),
-            raw_response: String::new(),
+            ..Default::default()
         };
         HistoryEntry {
             domain: domain.to_string(),
@@ -1744,6 +1724,34 @@ mod tests {
             matches!(app.state_of(watch_lens_idx()), LensState::Loaded(LensData::Watch(w)) if w.results[0].domain == "kept.com"),
             "gen-correct watch refresh must replace the cached view",
         );
+    }
+
+    #[test]
+    fn refresh_with_fewer_rows_clamps_the_selection() {
+        let mut app = app_on_watch_with_domain("a.com");
+        let LensState::Loaded(LensData::Watch(mut report)) = make_watch_state("a.com") else {
+            unreachable!()
+        };
+        let row = report.results[0].clone();
+        report.results = ["a.com", "b.com", "c.com"]
+            .iter()
+            .map(|d| seer_core::WatchResult {
+                domain: d.to_string(),
+                ..row.clone()
+            })
+            .collect();
+        app.states
+            .insert("watch", LensState::Loaded(LensData::Watch(report)));
+        app.sel = 2; // "c.com", the last row
+        app.fetch_gen.insert("watch", 1);
+        // The refresh after removing "c.com" returns one row.
+        app.update(Msg::Data {
+            lens: "watch".into(),
+            gen: 1,
+            result: Ok(make_watch_state_data("a.com")),
+        });
+        assert_eq!(app.sel, 0, "selection must move onto the remaining row");
+        assert_eq!(app.selected_watch_domain().as_deref(), Some("a.com"));
     }
 
     #[test]

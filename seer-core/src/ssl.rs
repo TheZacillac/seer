@@ -12,8 +12,6 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use tokio::net::TcpStream;
-use tokio_native_tls::TlsConnector;
 use tracing::{debug, instrument};
 use x509_parser::oid_registry::Oid;
 use x509_parser::prelude::*;
@@ -22,6 +20,7 @@ use crate::caa::{self, CaaPolicy};
 use crate::dns::DnsResolver;
 use crate::error::{Result, SeerError};
 use crate::net::resolve_public_host;
+use crate::tls::PresentedChain;
 use crate::validation::normalize_host;
 
 /// Default timeout for SSL operations (10 seconds).
@@ -122,9 +121,10 @@ fn derive_cert_warnings(
 pub struct SslReport {
     /// The domain that was inspected
     pub domain: String,
-    /// Certificate chain from leaf to root (as many as the server provides)
+    /// Certificate chain as the server presented it, leaf first (servers
+    /// usually omit the root)
     pub chain: Vec<CertDetail>,
-    /// TLS protocol version (best-effort detection)
+    /// Negotiated TLS protocol version (`"TLSv1.3"` or `"TLSv1.2"`)
     pub protocol_version: Option<String>,
     /// Subject Alternative Names from the leaf certificate
     pub san_names: Vec<String>,
@@ -132,9 +132,9 @@ pub struct SslReport {
     ///
     /// This reflects ONLY the date-range check (`notBefore <= now <=
     /// notAfter`) of the leaf certificate. It does NOT verify the certificate
-    /// chain's trust (this checker uses `danger_accept_invalid_certs(true)` to
-    /// inspect broken/self-signed certs) nor that the certificate matches the
-    /// requested hostname — see [`SslReport::hostname_verified`]. A
+    /// chain's trust (the inspection handshake accepts any presented chain so
+    /// broken/self-signed certs can be inspected) nor that the certificate
+    /// matches the requested hostname — see [`SslReport::hostname_verified`]. A
     /// date-valid cert may still be self-signed, issued by an untrusted CA, or
     /// presented for the wrong host.
     pub is_valid: bool,
@@ -297,121 +297,73 @@ impl SslChecker {
             ))
         })?;
 
-        // Build TLS connector - accept invalid certs so we can inspect them
-        let connector = native_tls::TlsConnector::builder()
-            .danger_accept_invalid_certs(true)
-            .build()
-            .map_err(|e| SeerError::SslError(format!("Failed to create TLS connector: {}", e)))?;
-        let connector = TlsConnector::from(connector);
+        // Handshake against the pre-resolved (SSRF-vetted) addresses so DNS
+        // cannot rebind between validation and connect. Any presented chain
+        // is accepted so broken certificates can still be inspected.
+        let presented =
+            crate::tls::inspect(&domain, &socket_addrs, self.timeout, SeerError::SslError).await?;
 
-        // TCP connect with timeout — connect to pre-resolved address to prevent DNS rebinding
-        let stream =
-            tokio::time::timeout(self.timeout, TcpStream::connect(socket_addrs.as_slice()))
-                .await
-                .map_err(|_| SeerError::Timeout("SSL connection timed out".to_string()))?
-                .map_err(|e| {
-                    SeerError::SslError(format!("Failed to connect to {}:443: {}", domain, e))
-                })?;
-
-        // TLS handshake with timeout
-        let tls_stream = tokio::time::timeout(self.timeout, connector.connect(&domain, stream))
-            .await
-            .map_err(|_| SeerError::Timeout("TLS handshake timed out".to_string()))?
-            .map_err(|e| SeerError::SslError(format!("TLS handshake failed: {}", e)))?;
-
-        // Get the peer certificate (leaf)
-        let cert = tls_stream
-            .get_ref()
-            .peer_certificate()
-            .map_err(|e| SeerError::SslError(format!("Failed to get certificate: {}", e)))?
-            .ok_or_else(|| SeerError::SslError("No certificate presented".to_string()))?;
-
-        let der = cert
-            .to_der()
-            .map_err(|e| SeerError::SslError(format!("Failed to encode certificate: {}", e)))?;
-
-        // Parse leaf certificate with x509-parser
-        let (_, x509) = X509Certificate::from_der(&der)
-            .map_err(|e| SeerError::SslError(format!("Failed to parse certificate: {}", e)))?;
-
-        // Extract SANs from the leaf certificate
-        let san_names = extract_sans(&x509);
-
-        // Build the certificate chain
-        // native-tls only exposes the leaf cert directly; we parse what we have
-        let leaf_detail = parse_cert_detail(&x509)?;
-
-        let now = Utc::now();
-        let days_until_expiry = crate::dates::days_until(leaf_detail.valid_until, now);
-        let is_valid = now >= leaf_detail.valid_from && now <= leaf_detail.valid_until;
-
-        // Hostname verification: does the leaf cert's SAN (or CN fallback)
-        // match the requested domain? This is independent of `is_valid` and of
-        // chain trust (which is not verified here — see the field docs). Lets
-        // consumers tell a date-valid-but-wrong-host cert apart from a real
-        // match. Per RFC 6125 §6.4.4 the CN is consulted ONLY when the cert
-        // presents no identifier SANs at all; if any dNSName/IPAddress SAN is
-        // present the CN must be ignored, otherwise a cert whose SANs cover
-        // other hosts but whose CN happens to match would falsely verify.
-        let hostname_verified = san_names
-            .iter()
-            .any(|san| hostname_matches_pattern(&domain, san))
-            || (san_names.is_empty() && subject_cn_matches_host(&x509, &domain));
-
-        // Annotate the CAA policy with the issuer comparison before
-        // attaching it to the report.
-        let mut caa_policy = caa_policy;
-        caa_policy.issuer_match = Some(caa::classify_issuer(&leaf_detail.issuer, &caa_policy));
-
-        // Derive posture warnings from the parsed leaf (pure post-processing).
-        let warnings =
-            derive_cert_warnings(&leaf_detail, is_valid, hostname_verified, days_until_expiry);
-
-        Ok(SslReport {
-            domain,
-            chain: vec![leaf_detail],
-            protocol_version: None,
-            san_names,
-            is_valid,
-            hostname_verified,
-            days_until_expiry,
-            caa: Some(caa_policy),
-            warnings,
-        })
+        build_report(domain, presented, caa_policy)
     }
 }
 
-/// Returns true if `host` matches the certificate name `pattern`, supporting
-/// exact (case-insensitive) matches and single-label wildcards per RFC 6125
-/// (`*.example.com` matches `a.example.com` but not `example.com` or
-/// `a.b.example.com`).
-fn hostname_matches_pattern(host: &str, pattern: &str) -> bool {
-    let host = host.to_ascii_lowercase();
-    let pattern = pattern.to_ascii_lowercase();
-    if let Some(rest) = pattern.strip_prefix("*.") {
-        let Some(dot) = host.find('.') else {
-            return false;
-        };
-        let host_rest = &host[dot + 1..];
-        host_rest == rest
-    } else {
-        host == pattern
-    }
-}
+/// Builds the report from what the server presented. Pure (no network), so
+/// the projection is unit-testable against a loopback handshake.
+fn build_report(
+    domain: String,
+    presented: PresentedChain,
+    mut caa_policy: CaaPolicy,
+) -> Result<SslReport> {
+    // Parse leaf certificate with x509-parser
+    let (_, x509) = X509Certificate::from_der(&presented.leaf)
+        .map_err(|e| SeerError::SslError(format!("Failed to parse certificate: {}", e)))?;
 
-/// Legacy CN fallback for hostname verification: checks the leaf certificate's
-/// subject Common Name(s) against `host`. SAN dNSNames are authoritative per
-/// RFC 6125; CN is only consulted when the certificate presents no identifier
-/// SANs at all (the caller gates this on `san_names.is_empty()`).
-fn subject_cn_matches_host(cert: &X509Certificate, host: &str) -> bool {
-    for cn in cert.subject().iter_common_name() {
-        if let Ok(s) = cn.as_str() {
-            if hostname_matches_pattern(host, s) {
-                return true;
-            }
+    // Extract SANs from the leaf certificate
+    let san_names = extract_sans(&x509);
+    let leaf_detail = parse_cert_detail(&x509)?;
+
+    let now = Utc::now();
+    let days_until_expiry = crate::dates::days_until(leaf_detail.valid_until, now);
+    let is_valid = now >= leaf_detail.valid_from && now <= leaf_detail.valid_until;
+
+    // Hostname verification (RFC 6125, shared with `status`): independent of
+    // `is_valid` and of chain trust (not verified here — see the field docs),
+    // so consumers can tell a date-valid-but-wrong-host cert from a match.
+    let hostname_verified = crate::tls::cert_matches_host(&x509, &domain);
+
+    // Annotate the CAA policy with the issuer comparison before
+    // attaching it to the report.
+    caa_policy.issuer_match = Some(caa::classify_issuer(&leaf_detail.issuer, &caa_policy));
+
+    // Derive posture warnings from the parsed leaf (pure post-processing).
+    let warnings =
+        derive_cert_warnings(&leaf_detail, is_valid, hostname_verified, days_until_expiry);
+
+    // The chain as the server sent it, leaf first. Every verdict above comes
+    // from the leaf, so an extra certificate that fails to parse is skipped
+    // rather than failing the whole report.
+    let mut chain = vec![leaf_detail];
+    chain.extend(presented.intermediates.iter().filter_map(|der| {
+        let detail = X509Certificate::from_der(der)
+            .ok()
+            .and_then(|(_, cert)| parse_cert_detail(&cert).ok());
+        if detail.is_none() {
+            debug!("skipping unparseable certificate in the presented chain");
         }
-    }
-    false
+        detail
+    }));
+
+    Ok(SslReport {
+        domain,
+        chain,
+        protocol_version: presented.protocol,
+        san_names,
+        is_valid,
+        hostname_verified,
+        days_until_expiry,
+        caa: Some(caa_policy),
+        warnings,
+    })
 }
 
 /// Extracts Subject Alternative Names from a certificate.
@@ -433,26 +385,13 @@ fn extract_sans(cert: &X509Certificate) -> Vec<String> {
     sans
 }
 
-/// Renders an IPAddress SAN from its raw bytes into canonical text form.
-///
-/// A 4-byte value becomes dotted-quad IPv4; a 16-byte value becomes a
-/// zero-compressed IPv6 address (e.g. `::1`, not `0000:0000:...:0001`) by going
-/// through `std::net::Ipv6Addr`'s `Display`. Any other length is unexpected for
-/// an IPAddress general name, so it falls back to a debug rendering of the bytes
-/// rather than guessing.
+/// Renders an IPAddress SAN from its raw bytes into canonical text form:
+/// dotted-quad IPv4, or zero-compressed IPv6 (e.g. `::1`, not
+/// `0000:0000:...:0001`). Any other length is unexpected for an IPAddress
+/// general name, so it falls back to a debug rendering of the bytes rather
+/// than guessing.
 fn format_ip_san(ip_bytes: &[u8]) -> String {
-    match ip_bytes.len() {
-        4 => {
-            let octets: [u8; 4] = [ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3]];
-            std::net::Ipv4Addr::from(octets).to_string()
-        }
-        16 => {
-            let mut octets = [0u8; 16];
-            octets.copy_from_slice(ip_bytes);
-            std::net::Ipv6Addr::from(octets).to_string()
-        }
-        _ => format!("{:?}", ip_bytes),
-    }
+    crate::tls::san_ip(ip_bytes).map_or_else(|| format!("{:?}", ip_bytes), |ip| ip.to_string())
 }
 
 /// Parses detailed information from an X.509 certificate.
@@ -460,8 +399,8 @@ fn parse_cert_detail(cert: &X509Certificate) -> Result<CertDetail> {
     let subject = cert.subject().to_string();
     let issuer = cert.issuer().to_string();
 
-    let valid_from = asn1_time_to_chrono(cert.validity().not_before)?;
-    let valid_until = asn1_time_to_chrono(cert.validity().not_after)?;
+    let (valid_from, valid_until) = crate::tls::validity_window(cert)
+        .ok_or_else(|| SeerError::SslError("invalid certificate timestamp".to_string()))?;
 
     let serial_number = cert.serial.to_str_radix(16);
 
@@ -534,13 +473,6 @@ fn oid_to_key_type(oid: &Oid) -> Option<String> {
     }
 }
 
-/// Converts an x509-parser ASN1Time to a chrono DateTime.
-fn asn1_time_to_chrono(time: ASN1Time) -> Result<DateTime<Utc>> {
-    let timestamp = time.timestamp();
-    DateTime::from_timestamp(timestamp, 0)
-        .ok_or_else(|| SeerError::SslError("invalid certificate timestamp".to_string()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -585,6 +517,61 @@ mod tests {
         assert!(
             report.is_valid,
             "example.com's leaf cert should be currently valid"
+        );
+    }
+
+    /// Regression: native-tls exposed only the leaf, so `chain` always held
+    /// one entry and `protocol_version` was always `None`.
+    #[tokio::test]
+    async fn report_carries_the_presented_chain_and_protocol() {
+        use crate::tls::test_support::{serve_once, CA_DER, LEAF_DER};
+
+        let addr = serve_once(&[LEAF_DER, CA_DER], &[&rustls::version::TLS12]).await;
+        let presented = crate::tls::inspect(
+            "chain.test",
+            &[addr],
+            Duration::from_secs(5),
+            SeerError::SslError,
+        )
+        .await
+        .unwrap();
+        let report = build_report("chain.test".to_string(), presented, CaaPolicy::empty()).unwrap();
+
+        let subjects: Vec<&str> = report.chain.iter().map(|c| c.subject.as_str()).collect();
+        assert_eq!(subjects, ["CN=chain.test", "CN=Seer Test CA"]);
+        assert!(report.chain[1].is_ca);
+        assert_eq!(report.protocol_version.as_deref(), Some("TLSv1.2"));
+        assert!(report.hostname_verified);
+    }
+
+    /// Regression: an RSA-1024 leaf failed the inspection handshake, so the
+    /// weak-key warning could never fire for a live certificate.
+    #[tokio::test]
+    async fn an_rsa_1024_leaf_is_inspected_and_flagged() {
+        use crate::tls::test_support::{serve_once, RSA_1024_LEAF};
+
+        let addr = serve_once(&[RSA_1024_LEAF], rustls::DEFAULT_VERSIONS).await;
+        let presented = crate::tls::inspect(
+            "weak-rsa.test",
+            &[addr],
+            Duration::from_secs(5),
+            SeerError::SslError,
+        )
+        .await
+        .unwrap();
+        let report =
+            build_report("weak-rsa.test".to_string(), presented, CaaPolicy::empty()).unwrap();
+
+        assert_eq!(report.chain[0].key_type.as_deref(), Some("RSA"));
+        assert_eq!(report.chain[0].key_bits, Some(1024));
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.severity == CertWarningSeverity::Critical
+                    && w.message == "RSA key size 1024 is below the 2048-bit minimum"),
+            "got {:?}",
+            report.warnings
         );
     }
 
@@ -733,20 +720,21 @@ mod tests {
         assert!(w.iter().any(|x| x.message.contains("marked as a CA")));
     }
 
+    /// Regression: `seer ssl` switched the CN fallback off for any SAN, so an
+    /// IP-SAN-only cert failed here while `seer status` verified it. Both now
+    /// share `tls::cert_matches_host`.
     #[test]
-    fn hostname_matches_pattern_exact_and_wildcard() {
-        assert!(hostname_matches_pattern("example.com", "example.com"));
-        assert!(hostname_matches_pattern("EXAMPLE.COM", "example.com"));
-        // Single-label wildcard.
-        assert!(hostname_matches_pattern("a.example.com", "*.example.com"));
-        // Apex must not match a wildcard (RFC 6125).
-        assert!(!hostname_matches_pattern("example.com", "*.example.com"));
-        // Wildcard matches only one label.
-        assert!(!hostname_matches_pattern(
-            "a.b.example.com",
-            "*.example.com"
-        ));
-        // Mismatched host.
-        assert!(!hostname_matches_pattern("evil.test", "example.com"));
+    fn ip_only_san_still_falls_back_to_the_cn() {
+        use crate::tls::test_support::{cert, CN_VICTIM_SAN_IP};
+
+        let presented = PresentedChain {
+            leaf: cert(CN_VICTIM_SAN_IP),
+            intermediates: vec![],
+            protocol: None,
+        };
+        let report =
+            build_report("victim.example".to_string(), presented, CaaPolicy::empty()).unwrap();
+        assert!(report.hostname_verified);
+        assert_eq!(report.san_names, ["203.0.113.7"]);
     }
 }

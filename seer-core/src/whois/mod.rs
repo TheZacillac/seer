@@ -1,6 +1,16 @@
+//! WHOIS client (TCP port 43) and response parsing.
+//!
+//! [`WhoisClient`] picks the server from the built-in TLD map (`servers.rs`),
+//! falling back to IANA discovery for unmapped TLDs (cached 24h), follows
+//! registrar referrals up to 3 levels with cycle detection, caps responses at
+//! 1 MB and retries transient failures through [`crate::retry`]. Responses are
+//! parsed into [`WhoisResponse`] by a registry-specific parser from the
+//! `parsers` table (keyed by TLD or second-level zone) or, failing a match,
+//! the generic parser.
+
 mod client;
 mod parser;
-pub mod parsers;
+mod parsers;
 mod servers;
 
 pub use client::WhoisClient;

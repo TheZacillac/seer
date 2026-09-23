@@ -1,17 +1,22 @@
-use chrono::TimeDelta;
-use once_cell::sync::Lazy;
-use regex::Regex;
+//! Colored terminal output (`--format human`). One inherent `format_*` method
+//! per report type, split into per-concern submodules; label/value rows go
+//! through the private `Rows` writer, which sanitizes every value against
+//! terminal escape injection. Colors can be disabled (`without_colors`).
+
+use chrono::{DateTime, TimeDelta, Utc};
+use colored::ColoredString;
 
 use super::OutputFormatter;
 
 // Shared with the per-concern submodules below (each does `use super::*`).
+pub(super) use super::contact::{self, Contact, FlatContacts};
 pub(super) use super::days_until;
 pub(super) use super::grouping::render_grouped;
 pub(super) use crate::caa::{CaaPolicy, IssuerCaaMatch};
 pub(super) use crate::colors::CatppuccinExt;
 pub(super) use crate::dns::{DnsRecord, FollowIteration, FollowResult, PropagationResult};
 pub(super) use crate::lookup::LookupResult;
-pub(super) use crate::rdap::RdapResponse;
+pub(super) use crate::rdap::{ContactInfo, RdapResponse};
 pub(super) use crate::status::StatusResponse;
 pub(super) use crate::whois::WhoisResponse;
 pub(super) use colored::Colorize;
@@ -27,14 +32,13 @@ mod security;
 mod status;
 mod whois;
 
-/// Strips ANSI escape sequences from untrusted external strings to prevent
-/// terminal injection via malicious WHOIS/RDAP response data. The OSC branch
-/// accepts both BEL (`\x07`) and ST (`\x1b\\`) terminators (and excludes ESC
-/// from the payload run so it can't over-consume across sequences).
-static ANSI_ESCAPE_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"\x1b\[[0-9;]*[a-zA-Z]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[A-Z@-_]")
-        .expect("Invalid ANSI escape regex")
-});
+static_regex! {
+    /// Strips ANSI escape sequences from untrusted external strings to prevent
+    /// terminal injection via malicious WHOIS/RDAP response data. The OSC branch
+    /// accepts both BEL (`\x07`) and ST (`\x1b\\`) terminators (and excludes ESC
+    /// from the payload run so it can't over-consume across sequences).
+    ANSI_ESCAPE_RE = r"\x1b\[[0-9;]*[a-zA-Z]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[A-Z@-_]";
+}
 
 /// Sanitizes untrusted external text (WHOIS/RDAP field values) for safe display
 /// on a terminal. First removes well-formed ANSI escape sequences, then drops
@@ -69,6 +73,15 @@ pub(crate) fn format_duration(duration: TimeDelta) -> String {
     }
 }
 
+/// [`contact::rdap_views`] as this formatter renders them: the registrant
+/// block drops name/organization, which print as the top-level
+/// Registrant/Organization lines, so an identity-only registrant opens no
+/// empty heading.
+pub(super) fn detail_views(contacts: &[Option<ContactInfo>; 3]) -> [Contact<'_>; 3] {
+    let [registrant, admin, tech] = contact::rdap_views(contacts);
+    [registrant.without_identity(), admin, tech]
+}
+
 pub struct HumanFormatter {
     use_colors: bool,
 }
@@ -89,51 +102,45 @@ impl HumanFormatter {
         self
     }
 
-    fn label(&self, text: &str) -> String {
+    /// Applies `style` to `text`, or returns it plain when colors are off.
+    fn paint(&self, text: &str, style: impl FnOnce(&str) -> ColoredString) -> String {
         if self.use_colors {
-            text.sky().bold().to_string()
+            style(text).to_string()
         } else {
             text.to_string()
         }
+    }
+
+    fn label(&self, text: &str) -> String {
+        self.paint(text, |t| t.sky().bold())
     }
 
     fn value(&self, text: &str) -> String {
-        if self.use_colors {
-            text.ctp_white().to_string()
-        } else {
-            text.to_string()
-        }
+        self.paint(text, |t| t.ctp_white())
     }
 
     fn success(&self, text: &str) -> String {
-        if self.use_colors {
-            text.ctp_green().bold().to_string()
-        } else {
-            text.to_string()
-        }
+        self.paint(text, |t| t.ctp_green().bold())
     }
 
     fn warning(&self, text: &str) -> String {
-        if self.use_colors {
-            text.ctp_yellow().bold().to_string()
-        } else {
-            text.to_string()
-        }
+        self.paint(text, |t| t.ctp_yellow().bold())
     }
 
     fn error(&self, text: &str) -> String {
-        if self.use_colors {
-            text.ctp_red().bold().to_string()
-        } else {
-            text.to_string()
-        }
+        self.paint(text, |t| t.ctp_red().bold())
     }
 
     fn dim(&self, text: &str) -> String {
-        if self.use_colors {
-            text.overlay1().to_string()
-        } else {
-            text.to_string()
+        self.paint(text, |t| t.overlay1())
+    }
+
+    /// A [`Rows`] writer appending `label: value` lines to `out` at `indent`.
+    fn rows<'a>(&'a self, out: &'a mut Vec<String>, indent: &str) -> Rows<'a> {
+        Rows {
+            f: self,
+            out,
+            indent: indent.to_string(),
         }
     }
 
@@ -159,31 +166,27 @@ impl HumanFormatter {
     /// whitespace per line — typically `"  "`.
     fn render_caa_block(&self, caa: &CaaPolicy, indent: &str) -> Vec<String> {
         let mut out = Vec::new();
-        out.push(format!("\n{}{}:", indent, self.label("CAA Policy")));
+        let mut block = self.rows(&mut out, indent);
+        let mut rows = block.section("CAA Policy");
 
         if !caa.has_policy {
-            out.push(format!(
-                "{}  {}",
-                indent,
+            let line = format!(
+                "{}{}",
+                rows.indent,
                 self.value("No CAA records (any CA may issue)")
-            ));
+            );
+            rows.push(line);
         } else {
-            if let Some(ref eff) = caa.effective_domain {
-                out.push(format!(
-                    "{}  {}: {}",
-                    indent,
-                    self.label("Found at"),
-                    self.value(&sanitize_display(eff))
-                ));
-            }
+            rows.opt("Found at", &caa.effective_domain);
             for r in &caa.records {
-                out.push(format!(
-                    "{}  {} {} \"{}\"",
-                    indent,
+                let line = format!(
+                    "{}{} {} \"{}\"",
+                    rows.indent,
                     self.value(&r.flags.to_string()),
                     self.label(&r.tag),
                     sanitize_display(&r.value)
-                ));
+                );
+                rows.push(line);
             }
         }
 
@@ -197,12 +200,7 @@ impl HumanFormatter {
                     self.warning("CAA present but no issue/issuewild tags")
                 }
             };
-            out.push(format!(
-                "{}  {}: {}",
-                indent,
-                self.label("Issuer vs CAA"),
-                rendered
-            ));
+            rows.kv("Issuer vs CAA", rendered);
         }
 
         // Note is appended separately by the caller so it can sit at the
@@ -242,95 +240,118 @@ impl HumanFormatter {
     }
 }
 
-// Thin dispatch layer: each trait method forwards to the inherent
-// method of the same name defined in the per-concern submodule. Rust
-// resolves the inherent method first, so this does not recurse.
-impl OutputFormatter for HumanFormatter {
-    fn format_whois(&self, response: &WhoisResponse) -> String {
-        self.format_whois(response)
+/// Appends `label: value` rows at one indent. Remote text goes through
+/// [`sanitize_display`] here, so no row can skip the terminal-injection guard.
+struct Rows<'a> {
+    f: &'a HumanFormatter,
+    out: &'a mut Vec<String>,
+    indent: String,
+}
+
+impl Rows<'_> {
+    /// Appends a pre-built line as-is.
+    fn push(&mut self, line: String) {
+        self.out.push(line);
     }
-    fn format_rdap(&self, response: &RdapResponse) -> String {
-        self.format_rdap(response)
+
+    /// Appends pre-built lines as-is.
+    fn extend(&mut self, lines: Vec<String>) {
+        self.out.extend(lines);
     }
-    fn format_dns(&self, records: &[DnsRecord]) -> String {
-        self.format_dns(records)
+
+    /// Appends an empty separator line.
+    fn blank(&mut self) {
+        self.out.push(String::new());
     }
-    fn format_propagation(&self, result: &PropagationResult) -> String {
-        self.format_propagation(result)
+
+    /// `label: <styled>` for a value the caller already styled (and, if it is
+    /// remote text, sanitized).
+    fn kv(&mut self, label: &str, styled: String) {
+        let label = self.f.label(label);
+        self.out.push(format!("{}{label}: {styled}", self.indent));
     }
-    fn format_lookup(&self, result: &LookupResult) -> String {
-        self.format_lookup(result)
+
+    /// `label: value` for remote text: sanitized, then value-styled.
+    fn text(&mut self, label: &str, text: &str) {
+        let value = self.f.value(&sanitize_display(text));
+        self.kv(label, value);
     }
-    fn format_status(&self, response: &StatusResponse) -> String {
-        self.format_status(response)
+
+    /// [`Self::text`], skipped when the field is absent.
+    fn opt(&mut self, label: &str, text: &Option<String>) {
+        if let Some(text) = text {
+            self.text(label, text);
+        }
     }
-    fn format_follow_iteration(&self, iteration: &FollowIteration) -> String {
-        self.format_follow_iteration(iteration)
+
+    /// `label: YYYY-MM-DD`, skipped when absent.
+    fn date(&mut self, label: &str, date: Option<DateTime<Utc>>) {
+        if let Some(date) = date {
+            let value = self.f.value(&date.format("%Y-%m-%d").to_string());
+            self.kv(label, value);
+        }
     }
-    fn format_follow(&self, result: &FollowResult) -> String {
-        self.format_follow(result)
+
+    /// `Expires: <date> (expires in N days)`, colored by urgency (see
+    /// [`HumanFormatter::format_expiry_status`]); skipped when absent.
+    fn expires(&mut self, date: Option<DateTime<Utc>>) {
+        if let Some(date) = date {
+            let status = self
+                .f
+                .format_expiry_status(&date.format("%Y-%m-%d").to_string(), days_until(date));
+            self.kv("Expires", status);
+        }
     }
-    fn format_availability(&self, result: &crate::availability::AvailabilityResult) -> String {
-        self.format_availability(result)
+
+    /// `label:` then one `- item` row per entry, one level deeper; nothing
+    /// for an empty list.
+    fn list(&mut self, label: &str, items: &[String]) {
+        if items.is_empty() {
+            return;
+        }
+        let label = self.f.label(label);
+        self.out.push(format!("{}{label}:", self.indent));
+        for item in items {
+            let item = self.f.value(&sanitize_display(item));
+            self.out.push(format!("{}  - {item}", self.indent));
+        }
     }
-    fn format_dnssec(&self, report: &crate::dns::DnssecReport) -> String {
-        self.format_dnssec(report)
+
+    /// A writer into the same output at another indent.
+    fn at(&mut self, indent: &str) -> Rows<'_> {
+        self.f.rows(self.out, indent)
     }
-    fn format_delegation(&self, report: &crate::dns::DelegationReport) -> String {
-        self.format_delegation(report)
+
+    /// A blank-line-led `label:` heading; returns the writer for its rows,
+    /// one level deeper.
+    fn section(&mut self, label: &str) -> Rows<'_> {
+        let heading = self.f.label(label);
+        self.out.push(format!("\n{}{heading}:", self.indent));
+        let indent = format!("{}  ", self.indent);
+        self.at(&indent)
     }
-    fn format_tld(&self, info: &crate::tld::TldInfo) -> String {
-        self.format_tld(info)
+
+    /// One contact block: a `<role> Contact` section with a row per populated
+    /// field. An empty contact renders nothing, never a bare heading.
+    fn contact(&mut self, role: &str, contact: Contact<'_>) {
+        if contact.is_empty() {
+            return;
+        }
+        let mut rows = self.section(&format!("{role} Contact"));
+        for (label, field) in contact.fields() {
+            rows.opt(label, field);
+        }
     }
-    fn format_dns_comparison(&self, comparison: &crate::dns::DnsComparison) -> String {
-        self.format_dns_comparison(comparison)
-    }
-    fn format_subdomains(&self, result: &crate::subdomains::SubdomainResult) -> String {
-        self.format_subdomains(result)
-    }
-    fn format_diff(&self, diff: &crate::diff::DomainDiff) -> String {
-        self.format_diff(diff)
-    }
-    fn format_ssl(&self, report: &crate::ssl::SslReport) -> String {
-        self.format_ssl(report)
-    }
-    fn format_watch(&self, report: &crate::watchlist::WatchReport) -> String {
-        self.format_watch(report)
-    }
-    fn format_domain_info(&self, info: &crate::domain_info::DomainInfo) -> String {
-        self.format_domain_info(info)
-    }
-    fn format_drift(&self, report: &crate::drift::DriftReport) -> String {
-        self.format_drift(report)
-    }
-    fn format_posture(&self, posture: &crate::posture::EmailPosture) -> String {
-        self.format_posture(posture)
-    }
-    fn format_headers(&self, report: &crate::headers::HeaderReport) -> String {
-        self.format_headers(report)
-    }
-    fn format_takeover(&self, report: &crate::takeover::TakeoverReport) -> String {
-        self.format_takeover(report)
-    }
-    fn format_caa(&self, policy: &CaaPolicy) -> String {
-        self.format_caa(policy)
-    }
-    fn format_confusables(&self, report: &crate::confusables::ConfusableReport) -> String {
-        self.format_confusables(report)
-    }
-    fn format_subdomain_classification(
-        &self,
-        result: &crate::subdomains::SubdomainClassification,
-    ) -> String {
-        self.format_subdomain_classification(result)
-    }
-    fn format_subdomain_baseline_diff(
-        &self,
-        report: &crate::subdomains::SubdomainBaselineDiff,
-    ) -> String {
-        self.format_subdomain_baseline_diff(report)
+
+    /// [`Self::contact`] for each of [`contact::ROLES`].
+    fn contacts(&mut self, contacts: [Contact<'_>; 3]) {
+        for (role, c) in contact::ROLES.into_iter().zip(contacts) {
+            self.contact(role, c);
+        }
     }
 }
+
+with_report_methods!(impl_forwarding!(HumanFormatter;));
 
 #[cfg(test)]
 mod tests {

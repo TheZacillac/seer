@@ -9,7 +9,7 @@ use seer_core::LookupResult;
 
 use crate::tui::action::LensData;
 use crate::tui::theme::Theme;
-use crate::tui::widgets::{kv, panel};
+use crate::tui::widgets::{kv, or_dash, panel};
 
 pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
     let LensData::Overview(result) = data else {
@@ -50,11 +50,8 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
         chunks[0],
     );
 
-    let block = panel::block(theme, "Registration", theme.blue, false);
-    let inner = block.inner(chunks[1]);
-    f.render_widget(block, chunks[1]);
+    let inner = panel::render(f, chunks[1], theme, "Registration", theme.blue, false);
 
-    let dash = || "—".to_string();
     let (expiry, registrar) = result.expiration_info();
     // The header chip shows the verdict for Available results; the source row
     // names where that verdict came from instead of repeating it.
@@ -62,23 +59,15 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
         LookupResult::Available { .. } => "availability check".to_string(),
         _ => source.0.to_string(),
     };
-    let mut rows: Vec<(String, String)> = vec![
-        ("registrar".into(), registrar.unwrap_or_else(dash)),
-        (
-            "organization".into(),
-            result.organization().unwrap_or_else(dash),
-        ),
-        (
-            "expires".into(),
-            expiry
-                .map(|d| d.date_naive().to_string())
-                .unwrap_or_else(dash),
-        ),
-        ("source".into(), source_row),
+    let mut rows = vec![
+        ("registrar", or_dash(registrar)),
+        ("organization", or_dash(result.organization())),
+        ("expires", or_dash(expiry.map(|d| d.date_naive()))),
+        ("source", source_row),
     ];
     if let LookupResult::Available { data, .. } = result.as_ref() {
-        rows.push(("method".into(), data.method.clone()));
-        rows.push(("confidence".into(), data.confidence.clone()));
+        rows.push(("method", data.method.clone()));
+        rows.push(("confidence", data.confidence.clone()));
     }
     kv::render(f, inner, theme, theme.blue, &rows);
 }
@@ -86,8 +75,7 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::backend::TestBackend;
-    use ratatui::Terminal;
+    use crate::tui::test_util::render_lines;
     use seer_core::AvailabilityResult;
 
     fn avail_data(available: bool, confidence: &str, method: &str) -> LensData {
@@ -107,20 +95,7 @@ mod tests {
 
     fn render_to_text(data: &LensData) -> String {
         let theme = Theme::frappe();
-        let backend = TestBackend::new(70, 14);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| render(f, f.area(), &theme, data))
-            .unwrap();
-        let a = terminal.backend().buffer().area();
-        let mut s = String::new();
-        for y in 0..a.height {
-            for x in 0..a.width {
-                s.push_str(terminal.backend().buffer()[(x, y)].symbol());
-            }
-            s.push('\n');
-        }
-        s
+        render_lines(70, 14, |f| render(f, f.area(), &theme, data))
     }
 
     #[test]

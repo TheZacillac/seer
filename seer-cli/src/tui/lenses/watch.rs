@@ -7,7 +7,7 @@ use ratatui::Frame;
 
 use crate::tui::action::LensData;
 use crate::tui::theme::Theme;
-use crate::tui::widgets::{panel, scroll_to};
+use crate::tui::widgets::{or_dash, panel, row_style, scroll_to};
 
 pub fn render(
     f: &mut Frame,
@@ -31,9 +31,7 @@ pub fn render(
         .split(area);
 
     // Summary bar
-    let summary_block = panel::block(theme, "Watchlist", theme.yellow, false);
-    let summary_inner = summary_block.inner(chunks[0]);
-    f.render_widget(summary_block, chunks[0]);
+    let summary_inner = panel::render(f, chunks[0], theme, "Watchlist", theme.yellow, false);
     f.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(
@@ -49,26 +47,15 @@ pub fn render(
     );
 
     // Results table
-    let block = panel::block(theme, "Domains", theme.yellow, focused);
-    let inner = block.inner(chunks[1]);
-    f.render_widget(block, chunks[1]);
+    let inner = panel::render(f, chunks[1], theme, "Domains", theme.yellow, focused);
 
     let header = Row::new(["DOMAIN", "EXPIRES(d)", "SSL(d)", "HTTP", "⚑"])
         .style(Style::default().fg(theme.overlay0));
 
     let rows = w.results.iter().enumerate().map(|(i, r)| {
-        let expires = r
-            .domain_days_remaining
-            .map(|d| d.to_string())
-            .unwrap_or_else(|| "—".into());
-        let ssl = r
-            .ssl_days_remaining
-            .map(|d| d.to_string())
-            .unwrap_or_else(|| "—".into());
-        let http = r
-            .http_status
-            .map(|c| c.to_string())
-            .unwrap_or_else(|| "—".into());
+        let expires = or_dash(r.domain_days_remaining);
+        let ssl = or_dash(r.ssl_days_remaining);
+        let http = or_dash(r.http_status);
         let issues_flag = if r.issues.is_empty() { "" } else { "!" };
 
         let expires_color = match r.domain_days_remaining {
@@ -82,12 +69,7 @@ pub fn render(
             _ => theme.text,
         };
 
-        let base_style = if focused && i == sel {
-            Style::default().fg(theme.text).bg(theme.surface0)
-        } else {
-            Style::default().fg(theme.text)
-        };
-
+        let base_style = row_style(theme, focused && i == sel);
         Row::new(vec![
             ratatui::text::Text::from(Span::styled(r.domain.clone(), base_style)),
             ratatui::text::Text::from(Span::styled(expires, Style::default().fg(expires_color))),
@@ -125,21 +107,9 @@ pub fn render(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::test_util::render_text;
     use chrono::Utc;
-    use ratatui::backend::TestBackend;
-    use ratatui::Terminal;
     use seer_core::{WatchReport, WatchResult};
-
-    fn buf_text(buf: &ratatui::buffer::Buffer) -> String {
-        let a = buf.area();
-        let mut s = String::new();
-        for y in 0..a.height {
-            for x in 0..a.width {
-                s.push_str(buf[(x, y)].symbol());
-            }
-        }
-        s
-    }
 
     #[test]
     fn renders_watched_domain() {
@@ -158,11 +128,7 @@ mod tests {
             warnings: 0,
             critical: 0,
         }));
-        let backend = TestBackend::new(80, 14);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| render(f, f.area(), &theme, &data, false, 0))
-            .unwrap();
-        assert!(buf_text(terminal.backend().buffer()).contains("x.com"));
+        let text = render_text(80, 14, |f| render(f, f.area(), &theme, &data, false, 0));
+        assert!(text.contains("x.com"));
     }
 }

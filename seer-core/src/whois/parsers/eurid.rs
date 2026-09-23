@@ -23,173 +23,137 @@
 //!         ns2bru.europa.eu (147.67.250.3)
 //! ```
 
-use once_cell::sync::Lazy;
-use regex::Regex;
-
-use super::{push_bounded, RegistryParser, MAX_NAMESERVERS};
+use super::{push_bounded, MAX_NAMESERVERS};
 use crate::whois::parser::WhoisResponse;
 
-static REGISTRANT_SECTION: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?i)^Registrant:\s*$").expect("Invalid EURid registrant regex"));
-
-static TECHNICAL_SECTION: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?i)^Technical:\s*$").expect("Invalid EURid technical regex"));
-
-static REGISTRAR_SECTION: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?i)^Registrar:\s*$").expect("Invalid EURid registrar regex"));
-
-static NAME_SERVERS_SECTION: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?i)^Name servers:\s*$").expect("Invalid EURid name servers regex"));
-
-static KEYS_SECTION: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?i)^Keys:\s*$").expect("Invalid EURid keys regex"));
-
-/// Parser for .eu domains using the EURid format.
-#[derive(Debug, Clone, Default)]
-pub struct EuridParser;
-
-impl EuridParser {
-    pub fn new() -> Self {
-        Self
-    }
+static_regex! {
+    REGISTRANT_SECTION = r"(?i)^Registrant:\s*$";
+    TECHNICAL_SECTION = r"(?i)^Technical:\s*$";
+    REGISTRAR_SECTION = r"(?i)^Registrar:\s*$";
+    NAME_SERVERS_SECTION = r"(?i)^Name servers:\s*$";
+    KEYS_SECTION = r"(?i)^Keys:\s*$";
 }
 
-impl RegistryParser for EuridParser {
-    fn supported_tlds(&self) -> &[&str] {
-        // whois.eu also serves the IDN ccTLDs .ею (Cyrillic) and .ευ
-        // (Greek), which reach this dispatch as A-labels.
-        &["eu", "xn--e1a4c", "xn--qxa6a"]
+/// TLDs this parser handles.
+/// whois.eu also serves the IDN ccTLDs .ею (Cyrillic) and .ευ
+/// (Greek), which reach this dispatch as A-labels.
+pub(super) const TLDS: &[&str] = &["eu", "xn--e1a4c", "xn--qxa6a"];
+
+/// Parses .eu domains using the EURid format.
+pub(super) fn parse(domain: &str, server: &str, raw: &str) -> WhoisResponse {
+    let mut registrar = None;
+    let mut registrar_url = None;
+    let mut nameservers = Vec::new();
+    let mut tech_org = None;
+    let mut tech_email = None;
+    let mut has_keys = false;
+
+    #[derive(Clone, Copy)]
+    enum Section {
+        None,
+        Registrant,
+        Technical,
+        Registrar,
+        NameServers,
+        Keys,
     }
 
-    fn parse(&self, domain: &str, server: &str, raw: &str) -> WhoisResponse {
-        let mut registrar = None;
-        let mut registrar_url = None;
-        let mut nameservers = Vec::new();
-        let mut tech_org = None;
-        let mut tech_email = None;
-        let mut has_keys = false;
+    let mut current_section = Section::None;
 
-        #[derive(Clone, Copy)]
-        enum Section {
-            None,
-            Registrant,
-            Technical,
-            Registrar,
-            NameServers,
-            Keys,
+    for line in raw.lines() {
+        let trimmed = line.trim();
+
+        // Skip comment lines
+        if trimmed.starts_with('%') {
+            continue;
         }
 
-        let mut current_section = Section::None;
+        // Check section headers
+        if REGISTRANT_SECTION.is_match(trimmed) {
+            current_section = Section::Registrant;
+            continue;
+        } else if TECHNICAL_SECTION.is_match(trimmed) {
+            current_section = Section::Technical;
+            continue;
+        } else if REGISTRAR_SECTION.is_match(trimmed) {
+            current_section = Section::Registrar;
+            continue;
+        } else if NAME_SERVERS_SECTION.is_match(trimmed) {
+            current_section = Section::NameServers;
+            continue;
+        } else if KEYS_SECTION.is_match(trimmed) {
+            current_section = Section::Keys;
+            has_keys = true;
+            continue;
+        }
 
-        for line in raw.lines() {
-            let trimmed = line.trim();
-
-            // Skip comment lines
-            if trimmed.starts_with('%') {
-                continue;
+        // Empty line ends current section (except nameservers which can span blanks)
+        if trimmed.is_empty() {
+            match current_section {
+                Section::NameServers if nameservers.is_empty() => {}
+                Section::NameServers => current_section = Section::None,
+                _ => current_section = Section::None,
             }
+            continue;
+        }
 
-            // Check section headers
-            if REGISTRANT_SECTION.is_match(trimmed) {
-                current_section = Section::Registrant;
-                continue;
-            } else if TECHNICAL_SECTION.is_match(trimmed) {
-                current_section = Section::Technical;
-                continue;
-            } else if REGISTRAR_SECTION.is_match(trimmed) {
-                current_section = Section::Registrar;
-                continue;
-            } else if NAME_SERVERS_SECTION.is_match(trimmed) {
-                current_section = Section::NameServers;
-                continue;
-            } else if KEYS_SECTION.is_match(trimmed) {
-                current_section = Section::Keys;
-                has_keys = true;
-                continue;
-            }
-
-            // Empty line ends current section (except nameservers which can span blanks)
-            if trimmed.is_empty() {
-                match current_section {
-                    Section::NameServers if nameservers.is_empty() => {}
-                    Section::NameServers => current_section = Section::None,
-                    _ => current_section = Section::None,
+        // Parse indented content
+        if line.starts_with(' ') || line.starts_with('\t') {
+            match current_section {
+                Section::NameServers => {
+                    // Strip trailing IP in parens: "ns1.example.eu (1.2.3.4)" → "ns1.example.eu"
+                    let ns = trimmed
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or(trimmed)
+                        .to_lowercase();
+                    push_bounded(&mut nameservers, ns, MAX_NAMESERVERS);
                 }
-                continue;
-            }
-
-            // Parse indented content
-            if line.starts_with(' ') || line.starts_with('\t') {
-                match current_section {
-                    Section::NameServers => {
-                        // Strip trailing IP in parens: "ns1.example.eu (1.2.3.4)" → "ns1.example.eu"
-                        let ns = trimmed
-                            .split_whitespace()
-                            .next()
-                            .unwrap_or(trimmed)
-                            .to_lowercase();
-                        push_bounded(&mut nameservers, ns, MAX_NAMESERVERS);
-                    }
-                    Section::Registrar => {
-                        if let Some(val) = extract_field(trimmed, "Name") {
-                            if registrar.is_none() {
-                                registrar = Some(val);
-                            }
-                        } else if let Some(val) = extract_field(trimmed, "Website") {
-                            if registrar_url.is_none() {
-                                registrar_url = Some(val);
-                            }
+                Section::Registrar => {
+                    if let Some(val) = extract_field(trimmed, "Name") {
+                        if registrar.is_none() {
+                            registrar = Some(val);
+                        }
+                    } else if let Some(val) = extract_field(trimmed, "Website") {
+                        if registrar_url.is_none() {
+                            registrar_url = Some(val);
                         }
                     }
-                    Section::Technical => {
-                        if let Some(val) = extract_field(trimmed, "Organisation") {
-                            if tech_org.is_none() {
-                                tech_org = Some(val);
-                            }
-                        } else if let Some(val) = extract_field(trimmed, "Email") {
-                            if tech_email.is_none() {
-                                tech_email = Some(val);
-                            }
+                }
+                Section::Technical => {
+                    if let Some(val) = extract_field(trimmed, "Organisation") {
+                        if tech_org.is_none() {
+                            tech_org = Some(val);
+                        }
+                    } else if let Some(val) = extract_field(trimmed, "Email") {
+                        if tech_email.is_none() {
+                            tech_email = Some(val);
                         }
                     }
-                    _ => {}
                 }
-            } else {
-                // Non-indented, non-section-header line
-                current_section = Section::None;
+                _ => {}
             }
+        } else {
+            // Non-indented, non-section-header line
+            current_section = Section::None;
         }
+    }
 
-        WhoisResponse {
-            domain: domain.to_string(),
-            registrar,
-            registrant: None, // EURid redacts registrant info on port 43
-            organization: None,
-            registrant_email: None,
-            registrant_phone: None,
-            registrant_address: None,
-            registrant_country: None,
-            admin_name: None,
-            admin_organization: None,
-            admin_email: None,
-            admin_phone: None,
-            tech_name: None,
-            tech_organization: tech_org,
-            tech_email,
-            tech_phone: None,
-            creation_date: None, // EURid doesn't include dates on port 43
-            expiration_date: None,
-            updated_date: None,
-            nameservers,
-            status: Vec::new(),
-            dnssec: if has_keys {
-                Some("signedDelegation".to_string())
-            } else {
-                None
-            },
-            whois_server: server.to_string(),
-            raw_response: raw.to_string(),
-        }
+    WhoisResponse {
+        domain: domain.to_string(),
+        registrar,
+        tech_organization: tech_org,
+        tech_email,
+        nameservers,
+        dnssec: if has_keys {
+            Some("signedDelegation".to_string())
+        } else {
+            None
+        },
+        whois_server: server.to_string(),
+        raw_response: raw.to_string(),
+        // EURid redacts registrant info and omits dates on port 43.
+        ..Default::default()
     }
 }
 
@@ -264,8 +228,7 @@ Please visit www.eurid.eu for more info."#;
 
     #[test]
     fn test_eurid_nameservers() {
-        let parser = EuridParser::new();
-        let result = parser.parse("europa.eu", "whois.eu", SAMPLE_EURID_RESPONSE);
+        let result = parse("europa.eu", "whois.eu", SAMPLE_EURID_RESPONSE);
 
         // 16 lines but some duplicates (same host with different IPs)
         assert_eq!(result.nameservers.len(), 12);
@@ -280,8 +243,7 @@ Please visit www.eurid.eu for more info."#;
 
     #[test]
     fn test_eurid_nameserver_dedup() {
-        let parser = EuridParser::new();
-        let result = parser.parse("europa.eu", "whois.eu", SAMPLE_EURID_RESPONSE);
+        let result = parse("europa.eu", "whois.eu", SAMPLE_EURID_RESPONSE);
 
         // ns3bru.europa.eu appears twice (IPv4 and IPv6) but should only be listed once
         let count = result
@@ -294,16 +256,14 @@ Please visit www.eurid.eu for more info."#;
 
     #[test]
     fn test_eurid_registrar() {
-        let parser = EuridParser::new();
-        let result = parser.parse("europa.eu", "whois.eu", SAMPLE_EURID_RESPONSE);
+        let result = parse("europa.eu", "whois.eu", SAMPLE_EURID_RESPONSE);
 
         assert_eq!(result.registrar, Some("ClearMedia NV".to_string()));
     }
 
     #[test]
     fn test_eurid_tech_contact() {
-        let parser = EuridParser::new();
-        let result = parser.parse("europa.eu", "whois.eu", SAMPLE_EURID_RESPONSE);
+        let result = parse("europa.eu", "whois.eu", SAMPLE_EURID_RESPONSE);
 
         assert_eq!(result.tech_organization, Some("ClearMedia NV".to_string()));
         assert_eq!(result.tech_email, Some("support@clearmedia.be".to_string()));
@@ -311,25 +271,17 @@ Please visit www.eurid.eu for more info."#;
 
     #[test]
     fn test_eurid_dnssec() {
-        let parser = EuridParser::new();
-        let result = parser.parse("europa.eu", "whois.eu", SAMPLE_EURID_RESPONSE);
+        let result = parse("europa.eu", "whois.eu", SAMPLE_EURID_RESPONSE);
 
         assert_eq!(result.dnssec, Some("signedDelegation".to_string()));
     }
 
     #[test]
     fn test_eurid_redacted_registrant() {
-        let parser = EuridParser::new();
-        let result = parser.parse("europa.eu", "whois.eu", SAMPLE_EURID_RESPONSE);
+        let result = parse("europa.eu", "whois.eu", SAMPLE_EURID_RESPONSE);
 
         // EURid redacts registrant on port 43
         assert!(result.registrant.is_none());
-    }
-
-    #[test]
-    fn test_supported_tlds() {
-        let parser = EuridParser::new();
-        assert_eq!(parser.supported_tlds(), &["eu", "xn--e1a4c", "xn--qxa6a"]);
     }
 
     #[test]

@@ -1,0 +1,33 @@
+---
+source: seer-core/tests/format_snapshots.rs
+expression: human ().format_lookup (& fixture_lookup_rdap_with_contacts())
+---
+
+[1;95mLookup: EXAMPLE.COM (via RDAP)[0m
+[37m──────────────────────────────[0m
+  [1;96mSource[0m: [1;92mRDAP (modern protocol)[0m
+  [1;96mRegistrar[0m: [97mMock Registrar Inc.[0m
+  [1;96mRegistrant[0m: [97mJane Registrant[0m
+  [1;96mOrganization[0m: [97mExample Holdings LLC[0m
+
+  [1;96mRegistrant Contact[0m:
+    [1;96mEmail[0m: [97mowner@example.com[0m
+    [1;96mAddress[0m: [97m1 Main St, Springfield, US[0m
+    [1;96mCountry[0m: [97mUS[0m
+
+  [1;96mAdmin Contact[0m:
+    [1;96mName[0m: [97mAlex Admin[0m
+    [1;96mOrganization[0m: [97mExample Holdings LLC[0m
+    [1;96mEmail[0m: [97madmin@example.com[0m
+    [1;96mPhone[0m: [97m+1.5555550101[0m
+
+  [1;96mTech Contact[0m:
+    [1;96mName[0m: [97mTerry Tech[0m
+    [1;96mEmail[0m: [97mtech@example.com[0m
+  [1;96mCreated[0m: [97m2010-03-15[0m
+  [1;96mExpires[0m: [1;92m2099-03-15 (expires in [N] days)[0m
+  [1;96mStatus[0m:
+    - [97mclient transfer prohibited[0m
+  [1;96mNameservers[0m:
+    - [97mNS1.EXAMPLE.COM[0m
+  [1;96mDNSSEC[0m: [1;92msigned[0m

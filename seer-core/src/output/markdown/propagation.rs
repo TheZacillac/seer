@@ -44,24 +44,16 @@ impl MarkdownFormatter {
                     .push(v.value.as_str());
             }
 
-            let render_values = |values: &[&str]| -> String {
-                values
-                    .iter()
-                    .map(|v| format!("`{}`", MdSafe(v)))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            };
-
             if grouped.len() == 1 {
                 let (_, values) = grouped.iter().next().expect("non-empty by check above");
-                output.push(format!("- **Consensus values**: {}", render_values(values)));
+                output.push(format!("- **Consensus values**: {}", code_list(values)));
             } else {
                 output.push("- **Consensus values**:".to_string());
                 for (record_type, values) in &grouped {
                     output.push(format!(
                         "    - **{}**: {}",
                         MdSafe(record_type),
-                        render_values(values)
+                        code_list(values)
                     ));
                 }
             }

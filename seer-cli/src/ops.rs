@@ -7,36 +7,54 @@
 //! here means a new bulk operation or a semantics fix lands in one place and
 //! every surface (CLI, REPL, and the TUI's op mapping) picks it up.
 
-use seer_core::bulk::BulkOperation;
+use std::sync::LazyLock;
+
+use seer_core::bulk::{BulkOperation, BulkResult};
+use seer_core::colors::CatppuccinExt;
 use seer_core::RecordType;
 
 /// Maximum number of domains accepted for a single CLI/REPL bulk run.
 pub const MAX_BULK_DOMAINS: usize = 1000;
 
-/// Canonical bulk operation names, as shown in help text and offered by the
-/// REPL tab-completer. `dig`/`dns` and `prop`/`propagation` are accepted as
-/// aliases by [`bulk_operation_for`].
-pub const BULK_OPS: &[&str] = &[
-    "lookup",
-    "whois",
-    "rdap",
-    "dig",
-    "prop",
-    "status",
-    "avail",
-    "info",
-    "ssl",
-    "posture",
-    "confusables",
-    "caa",
+/// Bulk operations with one-line descriptions, in the TUI's `o` cycling
+/// order: the single list behind help text, error messages, the REPL
+/// completer, and the TUI presets. [`bulk_operation_for`] also accepts the
+/// `dns`/`propagation` aliases.
+pub const BULK_OPS: &[(&str, &str)] = &[
+    ("lookup", "Smart lookup (RDAP first, WHOIS fallback)"),
+    ("status", "Check HTTP, SSL, and domain expiration"),
+    ("dig", "Query DNS records (alias: dns)"),
+    ("avail", "Check domain registration availability"),
+    ("info", "Comprehensive domain info (RDAP + WHOIS merged)"),
+    ("whois", "Query WHOIS information"),
+    ("rdap", "Query RDAP registry data"),
+    ("ssl", "Inspect SSL certificate chain (deep)"),
+    ("prop", "Check DNS propagation (alias: propagation)"),
+    ("posture", "SPF, DMARC, MTA-STS, BIMI, DANE posture"),
+    ("confusables", "Look-alike scan (costly per domain)"),
+    ("caa", "Look up CAA (cert authority) policy"),
 ];
 
-/// Human-readable list of valid bulk operations for error messages and help.
-pub const BULK_OPS_SUMMARY: &str =
-    "lookup, whois, rdap, dig/dns, prop, status, avail, info, ssl, posture, confusables, caa";
+/// Comma-separated bulk operation names, for error messages and help.
+pub static BULK_OPS_SUMMARY: LazyLock<String> = LazyLock::new(|| {
+    let names: Vec<&str> = BULK_OPS.iter().map(|(name, _)| *name).collect();
+    names.join(", ")
+});
 
-/// Help text for the `bulk` subcommand's OPERATION argument (clap `help =`).
-pub const BULK_OP_HELP: &str = "Operation type: lookup, whois, rdap, dig/dns, prop, status, avail, info, ssl, posture, confusables, caa";
+/// The accepted bulk input formats, shared by `seer bulk --help` and the
+/// REPL's `bulk -h`.
+pub const BULK_INPUT_FORMATS: &str = "  Plain text (one domain per line, # for comments):
+    # My domains to check
+    example.com
+    google.com
+    github.com
+
+  CSV (uses first column, skips header if present):
+    domain,owner,notes
+    example.com,Alice,Main site
+    google.com,Bob,Search
+    github.com,Carol,Code hosting
+";
 
 /// Maps an operation name (including the `dns`/`propagation` aliases) and a
 /// target domain to a [`BulkOperation`]. Returns `None` for unknown names.
@@ -83,7 +101,7 @@ pub fn build_bulk_operations(
     if bulk_operation_for(op, String::new(), record_type).is_none() {
         return Err(format!(
             "Unknown operation: {}. Use: {}",
-            op, BULK_OPS_SUMMARY
+            op, *BULK_OPS_SUMMARY
         ));
     }
     Ok(domains
@@ -125,6 +143,26 @@ pub fn default_bulk_output_path(input_file: &str) -> String {
         .to_string()
 }
 
+/// Progress bar for a bulk run, registered with the tracing writer so log
+/// lines print above it instead of tearing it. Pair with [`finish_bulk_bar`].
+pub fn bulk_bar(total: usize) -> indicatif::ProgressBar {
+    let bar = indicatif::ProgressBar::new(total as u64);
+    bar.set_style(
+        indicatif::ProgressStyle::default_bar()
+            .template("{bar:40.cyan/blue} {pos}/{len} ({percent}%) eta {eta} {msg}")
+            .expect("valid progress bar template")
+            .progress_chars("=>-"),
+    );
+    crate::display::set_bulk_progress_bar(bar.clone());
+    bar
+}
+
+/// Unregisters and clears a [`bulk_bar`].
+pub fn finish_bulk_bar(bar: &indicatif::ProgressBar) {
+    crate::display::clear_bulk_progress_bar();
+    bar.finish_and_clear();
+}
+
 /// Progress callback that drives an indicatif bar: advances the position and
 /// shows the most recently completed domain as the bar message.
 pub fn bar_progress_callback(bar: &indicatif::ProgressBar) -> seer_core::bulk::ProgressCallback {
@@ -133,6 +171,104 @@ pub fn bar_progress_callback(bar: &indicatif::ProgressBar) -> seer_core::bulk::P
         bar.set_position(completed as u64);
         bar.set_message(domain.to_string());
     })
+}
+
+/// The "Processing N domains with OP operation..." line printed before a run.
+pub fn bulk_banner(domain_count: usize, op: &str) -> String {
+    format!(
+        "Processing {} domains with {} operation...",
+        domain_count.to_string().ctp_green(),
+        op.ctp_yellow()
+    )
+}
+
+/// Writes a run's CSV atomically, so a crash or full disk mid-write cannot
+/// leave a truncated file that downstream pipelines treat as authoritative.
+pub fn write_bulk_csv(results: &[BulkResult], op: &str, path: &str) -> Result<(), String> {
+    let csv = crate::utils::bulk_results_to_csv(results, op);
+    crate::utils::atomic_write(path, &csv)
+        .map_err(|e| format!("Failed to write output file {}: {}", path, e))
+}
+
+/// The "  N successful, M failed" line after a run.
+pub fn bulk_summary(results: &[BulkResult]) -> String {
+    let ok = results.iter().filter(|r| r.success).count();
+    let failed = results.len() - ok;
+    let failed = if failed > 0 {
+        failed.to_string().ctp_red()
+    } else {
+        failed.to_string().ctp_green()
+    };
+    format!(
+        "  {} successful, {} failed",
+        ok.to_string().ctp_green(),
+        failed
+    )
+}
+
+/// Runs a live `follow` for the CLI and the REPL: raw mode so Esc / Ctrl-C
+/// cancel, and each iteration streamed to stdout as it lands. Raw mode is
+/// left by [`RawModeGuard`](crate::utils::RawModeGuard) on return or unwind,
+/// and by `main`'s panic hook when `panic = "abort"` skips Drop (issue #60).
+/// The key listener is stopped before returning so it cannot swallow
+/// keystrokes meant for whatever reads the terminal next. `handle_sigint`
+/// also cancels on SIGINT, the only interrupt path when there is no terminal
+/// for the key listener.
+pub async fn run_live_follow(
+    follower: &seer_core::DnsFollower,
+    domain: &str,
+    record_type: RecordType,
+    nameserver: Option<&str>,
+    config: seer_core::FollowConfig,
+    format: seer_core::output::OutputFormat,
+    handle_sigint: bool,
+) -> seer_core::Result<seer_core::FollowResult> {
+    use std::io::Write;
+
+    // `cancel_tx` must stay alive until the follow returns: once every sender
+    // is dropped, the follow's interruptible sleep wakes immediately.
+    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    if handle_sigint {
+        let cancel_tx = cancel_tx.clone();
+        tokio::spawn(async move {
+            tokio::signal::ctrl_c().await.ok();
+            let _ = cancel_tx.send(true);
+        });
+    }
+
+    let raw_guard = crate::utils::RawModeGuard::new();
+    let key_listener =
+        crate::utils::FollowKeyListener::spawn(cancel_tx.clone(), raw_guard.is_enabled());
+
+    // In raw mode `\n` alone doesn't return to column 0, so use `\r\n`.
+    let callback: seer_core::dns::FollowProgressCallback = std::sync::Arc::new(move |iteration| {
+        let formatter = seer_core::output::get_formatter(format);
+        let output = formatter
+            .format_follow_iteration(iteration)
+            .replace('\n', "\r\n");
+        let mut stdout = std::io::stdout().lock();
+        let _ = stdout.write_all(output.as_bytes());
+        let _ = stdout.write_all(b"\r\n");
+        let _ = stdout.flush();
+    });
+
+    let result = follower
+        .follow(
+            domain,
+            record_type,
+            nameserver,
+            config,
+            Some(callback),
+            Some(cancel_rx),
+        )
+        .await;
+
+    // Stop the listener, then restore cooked mode, before the caller prints.
+    if let Some(listener) = key_listener {
+        listener.stop().await;
+    }
+    drop(raw_guard);
+    result
 }
 
 /// Records a lookup result to `~/.seer/history.toml` off the async executor
@@ -147,6 +283,147 @@ pub async fn record_lookup_history(domain: &str, result: seer_core::LookupResult
     })
     .await
     .ok();
+}
+
+/// Runs blocking `~/.seer` state-file I/O off the async executor, folding a
+/// failed task into the same `Failed to <what>: …` error as the I/O itself.
+async fn state_io<T, F>(what: &str, io: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> seer_core::Result<T> + Send + 'static,
+{
+    match tokio::task::spawn_blocking(io).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(e)) => Err(format!("Failed to {}: {}", what, e)),
+        Err(e) => Err(format!("Failed to {}: {}", what, e)),
+    }
+}
+
+pub async fn load_watchlist() -> Result<seer_core::Watchlist, String> {
+    state_io("load watchlist", || Ok(seer_core::Watchlist::load())).await
+}
+
+/// Runs `watch add|remove|list` and returns the confirmation to print.
+/// `cmd` is how the user invokes watch on this surface (`seer watch` in the
+/// CLI, `watch` in the REPL), for the usage error and the empty-list hint.
+pub async fn watch_edit(action: &str, domain: Option<&str>, cmd: &str) -> Result<String, String> {
+    let adding = match action {
+        "list" => return Ok(watchlist_listing(&load_watchlist().await?, cmd)),
+        "add" => true,
+        "remove" => false,
+        other => {
+            return Err(format!(
+                "Unknown watch action: {}. Use: add, remove, list",
+                other
+            ))
+        }
+    };
+    let domain = domain.ok_or_else(|| format!("Usage: {} {} <domain>", cmd, action))?;
+
+    let mut watchlist = load_watchlist().await?;
+    let changed = if adding {
+        watchlist
+            .add(domain)
+            .map_err(|e| format!("Invalid domain: {}", e))?
+    } else {
+        watchlist.remove(domain)
+    };
+    if changed {
+        state_io("save watchlist", move || watchlist.save()).await?;
+    }
+    Ok(match (adding, changed) {
+        (true, true) => format!("Added {} to watchlist", domain.ctp_green()),
+        (true, false) => format!("{} is already in the watchlist", domain),
+        (false, true) => format!("Removed {} from watchlist", domain.ctp_green()),
+        (false, false) => format!("{} was not in the watchlist", domain),
+    })
+}
+
+/// The `watch list` text, or the empty-watchlist hint (see [`watch_edit`]
+/// for `cmd`).
+pub fn watchlist_listing(watchlist: &seer_core::Watchlist, cmd: &str) -> String {
+    if watchlist.domains.is_empty() {
+        return format!(
+            "Watchlist is empty. Use '{} add <domain>' to add domains.",
+            cmd
+        );
+    }
+    let mut out = format!("Watchlist ({} domains):", watchlist.domains.len());
+    for domain in &watchlist.domains {
+        out.push_str(&format!("\n  - {}", domain));
+    }
+    out
+}
+
+pub async fn load_history() -> Result<seer_core::LookupHistory, String> {
+    state_io("load history", || Ok(seer_core::LookupHistory::load())).await
+}
+
+/// Empties `~/.seer/history.toml`.
+pub async fn clear_history() -> Result<(), String> {
+    state_io("clear history", || {
+        let mut history = seer_core::LookupHistory::load();
+        history.clear();
+        history.save()
+    })
+    .await
+}
+
+/// The `history` listing: one domain's lookups, or a per-domain summary.
+/// `lookup_cmd` (`seer lookup` / `lookup`) names the command in the
+/// empty-history hint.
+pub fn history_listing(
+    history: &seer_core::LookupHistory,
+    domain: Option<&str>,
+    lookup_cmd: &str,
+) -> String {
+    let Some(domain) = domain else {
+        let total: usize = history.entries.values().map(Vec::len).sum();
+        if total == 0 {
+            return format!(
+                "No lookup history. Run '{} <domain>' to build history.",
+                lookup_cmd
+            );
+        }
+        let mut out = format!(
+            "Lookup history ({} entries across {} domains):",
+            total,
+            history.entries.len()
+        );
+        for (domain, entries) in &history.entries {
+            out.push_str(&format!("\n  {} ({} entries)", domain, entries.len()));
+        }
+        return out;
+    };
+
+    let entries = history.get(domain);
+    if entries.is_empty() {
+        return format!("No history for {}", domain);
+    }
+    let mut out = format!(
+        "History for {} ({} entries):",
+        domain.ctp_green(),
+        entries.len()
+    );
+    for entry in entries {
+        out.push_str(&format!(
+            "\n  [{}] via {} - registrar: {}",
+            entry.timestamp.format("%Y-%m-%d %H:%M"),
+            lookup_source(&entry.result).unwrap_or("availability"),
+            entry.result.registrar().unwrap_or_else(|| "—".to_string())
+        ));
+    }
+    out
+}
+
+/// Which protocol answered a lookup, or `None` for an availability verdict
+/// (neither registry had the domain). Callers pick their own fallback text.
+pub fn lookup_source(result: &seer_core::LookupResult) -> Option<&'static str> {
+    match result {
+        seer_core::LookupResult::Rdap { .. } => Some("RDAP"),
+        seer_core::LookupResult::Whois { .. } => Some("WHOIS"),
+        seer_core::LookupResult::Available { .. } => None,
+    }
 }
 
 /// Outcome of a [`drift_check`]: the computed report plus whether a previous
@@ -279,7 +556,7 @@ mod tests {
 
     #[test]
     fn every_canonical_op_maps_to_an_operation() {
-        for op in BULK_OPS {
+        for (op, _) in BULK_OPS {
             assert!(
                 bulk_operation_for(op, "example.com".to_string(), RecordType::A).is_some(),
                 "canonical op {op} must be accepted"
@@ -383,6 +660,69 @@ mod tests {
     fn no_baseline_note_reflects_record_flag() {
         assert!(no_baseline_note("a.com", true).contains("recorded a baseline"));
         assert!(no_baseline_note("a.com", false).contains("--record"));
+    }
+
+    #[tokio::test]
+    async fn watch_edit_rejects_bad_actions_and_missing_domains_before_io() {
+        let err = watch_edit("bogus", Some("a.com"), "watch")
+            .await
+            .unwrap_err();
+        assert!(err.starts_with("Unknown watch action: bogus"), "got: {err}");
+        let err = watch_edit("add", None, "seer watch").await.unwrap_err();
+        assert_eq!(err, "Usage: seer watch add <domain>");
+        let err = watch_edit("remove", None, "watch").await.unwrap_err();
+        assert_eq!(err, "Usage: watch remove <domain>");
+    }
+
+    #[test]
+    fn watchlist_listing_names_the_surface_command_when_empty() {
+        let mut watchlist = seer_core::Watchlist::default();
+        assert_eq!(
+            watchlist_listing(&watchlist, "seer watch"),
+            "Watchlist is empty. Use 'seer watch add <domain>' to add domains."
+        );
+        watchlist.domains = vec!["a.com".into(), "b.com".into()];
+        assert_eq!(
+            watchlist_listing(&watchlist, "watch"),
+            "Watchlist (2 domains):\n  - a.com\n  - b.com"
+        );
+    }
+
+    #[test]
+    fn history_listing_covers_empty_summary_and_per_domain_views() {
+        let mut history = seer_core::LookupHistory::default();
+        assert_eq!(
+            history_listing(&history, None, "lookup"),
+            "No lookup history. Run 'lookup <domain>' to build history."
+        );
+        assert_eq!(
+            history_listing(&history, Some("a.com"), "lookup"),
+            "No history for a.com"
+        );
+
+        let available = seer_core::LookupResult::Available {
+            data: Box::new(seer_core::AvailabilityResult {
+                domain: "a.com".into(),
+                available: true,
+                confidence: "high".into(),
+                method: "rdap".into(),
+                details: None,
+            }),
+            rdap_error: "404".into(),
+            whois_error: "no match".into(),
+            whois_data: None,
+        };
+        history.record("a.com", available);
+        assert_eq!(
+            history_listing(&history, None, "seer lookup"),
+            "Lookup history (1 entries across 1 domains):\n  a.com (1 entries)"
+        );
+        let listing = history_listing(&history, Some("a.com"), "lookup");
+        assert!(listing.contains("(1 entries):"), "got: {listing}");
+        assert!(
+            listing.ends_with("via availability - registrar: —"),
+            "got: {listing}"
+        );
     }
 
     #[test]

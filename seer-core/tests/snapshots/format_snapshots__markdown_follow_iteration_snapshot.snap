@@ -1,0 +1,7 @@
+---
+source: seer-core/tests/format_snapshots.rs
+expression: markdown ().format_follow_iteration (& fixture_follow_iteration())
+---
+[12:00:30] Iteration 2/3: 1 record(s) (**CHANGED**) `192.0.2.2`
+- Added: `192.0.2.2`
+- Removed: `192.0.2.1`

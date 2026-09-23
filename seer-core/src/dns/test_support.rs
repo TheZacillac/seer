@@ -143,41 +143,13 @@ fn response_skeleton(request: &Message) -> Message {
 /// queries per `mode` until the test runtime shuts down. Returns the
 /// bound port.
 pub(crate) async fn spawn_mock_dns(mode: MockMode) -> u16 {
-    let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind mock DNS");
-    let port = socket.local_addr().expect("mock DNS local addr").port();
-    tokio::spawn(async move {
-        let mut buf = [0u8; 4096];
-        loop {
-            let Ok((len, src)) = socket.recv_from(&mut buf).await else {
-                return;
-            };
-            if matches!(mode, MockMode::Ignore) {
-                continue;
-            }
-            let Ok(request) = Message::from_vec(&buf[..len]) else {
-                continue;
-            };
-            let mut response = response_skeleton(&request);
-            match mode {
-                MockMode::Zone => {
-                    if let Some(query) = request.queries.first() {
-                        for rdata in zone_answers(&query.name.to_string(), query.query_type) {
-                            response.add_answer(Record::from_rdata(query.name.clone(), 300, rdata));
-                        }
-                    }
-                }
-                MockMode::Nxdomain => {
-                    response.metadata.response_code = ResponseCode::NXDomain;
-                }
-                MockMode::NoData | MockMode::Ignore => {}
-            }
-            let Ok(bytes) = response.to_vec() else {
-                continue;
-            };
-            let _ = socket.send_to(&bytes, src).await;
-        }
-    });
-    port
+    spawn_mock_dns_fn(move |qname, qtype| match mode {
+        MockMode::Zone => MockReply::Answer(zone_answers(qname, qtype)),
+        MockMode::Nxdomain => MockReply::NxDomain,
+        MockMode::NoData => MockReply::NoData,
+        MockMode::Ignore => MockReply::NoReply,
+    })
+    .await
 }
 
 /// Binds a UDP socket on an ephemeral loopback port and answers the n-th
@@ -187,33 +159,13 @@ pub(crate) async fn spawn_mock_dns(mode: MockMode) -> u16 {
 /// tests observe record sets that change between iterations. Returns the
 /// bound port.
 pub(crate) async fn spawn_mock_dns_sequence(answer_sets: Vec<Vec<HickoryRData>>) -> u16 {
-    let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind mock DNS");
-    let port = socket.local_addr().expect("mock DNS local addr").port();
-    tokio::spawn(async move {
-        let mut buf = [0u8; 4096];
-        let mut served = 0usize;
-        loop {
-            let Ok((len, src)) = socket.recv_from(&mut buf).await else {
-                return;
-            };
-            let Ok(request) = Message::from_vec(&buf[..len]) else {
-                continue;
-            };
-            let mut response = response_skeleton(&request);
-            let idx = served.min(answer_sets.len().saturating_sub(1));
-            if let (Some(query), Some(answers)) = (request.queries.first(), answer_sets.get(idx)) {
-                for rdata in answers {
-                    response.add_answer(Record::from_rdata(query.name.clone(), 300, rdata.clone()));
-                }
-            }
-            served += 1;
-            let Ok(bytes) = response.to_vec() else {
-                continue;
-            };
-            let _ = socket.send_to(&bytes, src).await;
-        }
-    });
-    port
+    let mut served = 0usize;
+    spawn_mock_dns_fn(move |_, _| {
+        let idx = served.min(answer_sets.len().saturating_sub(1));
+        served += 1;
+        MockReply::Answer(answer_sets.get(idx).cloned().unwrap_or_default())
+    })
+    .await
 }
 
 /// A plausible SOA RRdata for `zone` (for scripted apex answers).
@@ -233,6 +185,11 @@ pub(crate) fn soa_rdata(zone: &str) -> HickoryRData {
 pub(crate) enum MockReply {
     /// NOERROR with these answers, each owned by the query name.
     Answer(Vec<HickoryRData>),
+    /// Like [`MockReply::Answer`], with the AA (authoritative) bit set.
+    AuthoritativeAnswer(Vec<HickoryRData>),
+    /// NOERROR, empty ANSWER, these (NS) records for the query name in
+    /// AUTHORITY — a classic parent-side referral.
+    Referral(Vec<HickoryRData>),
     /// NOERROR with an empty answer section (NODATA).
     NoData,
     /// NODATA whose AUTHORITY section carries the SOA of the named zone — the
@@ -242,16 +199,21 @@ pub(crate) enum MockReply {
     NxDomain,
     /// SERVFAIL — e.g. a validating upstream rejecting a broken DNSSEC chain.
     ServFail,
+    /// REFUSED.
+    Refused,
+    /// Send nothing, forcing the client's timeout path.
+    NoReply,
 }
 
 /// Binds a UDP socket on an ephemeral loopback port and answers every query
 /// with `handler(qname, qtype)`, where `qname` is the lowercased ASCII query
 /// name without the trailing root dot. Lets a test script a whole multi-name
 /// scenario (tree walks, redirects, per-name failures) that the fixed
-/// [`MockMode::Zone`] table cannot express. Returns the bound port.
-pub(crate) async fn spawn_mock_dns_fn<F>(handler: F) -> u16
+/// [`MockMode::Zone`] table cannot express. The one server loop behind every
+/// spawner here. Returns the bound port.
+pub(crate) async fn spawn_mock_dns_fn<F>(mut handler: F) -> u16
 where
-    F: Fn(&str, HickoryRecordType) -> MockReply + Send + 'static,
+    F: FnMut(&str, HickoryRecordType) -> MockReply + Send + 'static,
 {
     let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind mock DNS");
     let port = socket.local_addr().expect("mock DNS local addr").port();
@@ -267,11 +229,17 @@ where
             let mut response = response_skeleton(&request);
             if let Some(query) = request.queries.first() {
                 let qname = query.name.to_ascii().to_ascii_lowercase();
+                let owned = |rdata| Record::from_rdata(query.name.clone(), 300, rdata);
                 match handler(qname.trim_end_matches('.'), query.query_type) {
                     MockReply::Answer(answers) => {
-                        for rdata in answers {
-                            response.add_answer(Record::from_rdata(query.name.clone(), 300, rdata));
-                        }
+                        response.add_answers(answers.into_iter().map(owned));
+                    }
+                    MockReply::AuthoritativeAnswer(answers) => {
+                        response.metadata.authoritative = true;
+                        response.add_answers(answers.into_iter().map(owned));
+                    }
+                    MockReply::Referral(records) => {
+                        response.add_authorities(records.into_iter().map(owned));
                     }
                     MockReply::NoData => {}
                     MockReply::NoDataWithSoa(zone) => {
@@ -287,6 +255,10 @@ where
                     MockReply::ServFail => {
                         response.metadata.response_code = ResponseCode::ServFail;
                     }
+                    MockReply::Refused => {
+                        response.metadata.response_code = ResponseCode::Refused;
+                    }
+                    MockReply::NoReply => continue,
                 }
             }
             let Ok(bytes) = response.to_vec() else {

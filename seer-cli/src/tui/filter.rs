@@ -29,18 +29,11 @@ pub fn is_filterable(lens_key: &str) -> bool {
 
 /// The filterable text for a history row (mirrors the columns the lens shows).
 fn history_label(e: &seer_core::HistoryEntry) -> String {
-    let source = if e.result.is_rdap() {
-        "RDAP"
-    } else if e.result.is_whois() {
-        "WHOIS"
-    } else {
-        "-"
-    };
     format!(
         "{} {} {} {}",
         e.timestamp.format("%Y-%m-%d %H:%M"),
         e.domain,
-        source,
+        crate::ops::lookup_source(&e.result).unwrap_or("-"),
         e.result.registrar().unwrap_or_default(),
     )
 }

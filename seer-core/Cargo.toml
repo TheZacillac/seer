@@ -8,6 +8,9 @@ repository.workspace = true
 homepage.workspace = true
 description = "Core library for Seer domain name utilities"
 readme = "../README.md"
+# The insta snapshot suite (tests/ + its .snap baselines) isn't needed to build
+# the crate; the in-file unit tests under src/ still ship.
+exclude = ["tests/"]
 keywords = ["whois", "rdap", "dns", "domain", "networking"]
 categories = ["network-programming", "command-line-utilities"]
 
@@ -18,34 +21,36 @@ hickory-resolver = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-anyhow = { workspace = true }
 chrono = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
-tracing-appender = { workspace = true }
+tracing-subscriber = { workspace = true, optional = true }
+tracing-appender = { workspace = true, optional = true }
 tracing-opentelemetry = { workspace = true, optional = true }
 opentelemetry = { workspace = true, optional = true }
 opentelemetry_sdk = { workspace = true, optional = true }
 opentelemetry-otlp = { workspace = true, optional = true }
 futures = { workspace = true }
-async-trait = { workspace = true }
-once_cell = { workspace = true }
 regex = { workspace = true }
 url = { workspace = true }
-colored = { workspace = true }
+colored = { workspace = true, optional = true }
 base64 = { workspace = true }
-native-tls = { workspace = true }
-tokio-native-tls = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
 x509-parser = { workspace = true }
 rand = { workspace = true }
 toml = { workspace = true }
 idna = { workspace = true }
 psl = { workspace = true }
-dirs = { workspace = true }
 
 [features]
-default = []
+# `cli` carries the presentation/persistence layer only the CLI needs
+# (formatters, colors, history/watchlist/drift, doctor, webhook, logging
+# setup). It is on by default so crates.io users see the full API; seer-py
+# turns it off and skips those modules and their dependencies.
+default = ["cli"]
+cli = ["dep:tracing-subscriber", "dep:tracing-appender", "dep:colored"]
 otel = [
+    "cli",
     "dep:tracing-opentelemetry",
     "dep:opentelemetry",
     "dep:opentelemetry_sdk",
@@ -55,9 +60,11 @@ otel = [
 [lints]
 workspace = true
 
+[[test]]
+name = "format_snapshots"
+required-features = ["cli"]
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
-tokio-test = "0.4"
 wiremock = { workspace = true }
 insta = { workspace = true }
-colored = { workspace = true }

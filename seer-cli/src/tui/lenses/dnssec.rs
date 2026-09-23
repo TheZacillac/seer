@@ -22,9 +22,7 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
         theme.red
     };
 
-    let block = panel::block(theme, "DNSSEC", status_color, false);
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let inner = panel::render(f, area, theme, "DNSSEC", status_color, false);
 
     // Split: status header + kv + issues + DS table
     let has_ds = !r.ds_records.is_empty();
@@ -59,12 +57,12 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
     );
 
     // KV summary
-    let rows: Vec<(String, String)> = vec![
-        ("enabled".into(), r.enabled.to_string()),
-        ("status".into(), r.status.clone()),
-        ("chain valid".into(), r.chain_valid.to_string()),
-        ("DS records".into(), r.ds_records.len().to_string()),
-        ("DNSKEY records".into(), r.dnskey_records.len().to_string()),
+    let rows = [
+        ("enabled", r.enabled.to_string()),
+        ("status", r.status.clone()),
+        ("chain valid", r.chain_valid.to_string()),
+        ("DS records", r.ds_records.len().to_string()),
+        ("DNSKEY records", r.dnskey_records.len().to_string()),
     ];
     kv::render(f, chunks[1], theme, status_color, &rows);
 
@@ -82,9 +80,7 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
     // DS records table
     if has_ds {
         let ds_area = chunks[chunks.len() - 1];
-        let block2 = panel::block(theme, "DS Records", theme.overlay0, false);
-        let inner2 = block2.inner(ds_area);
-        f.render_widget(block2, ds_area);
+        let inner2 = panel::render(f, ds_area, theme, "DS Records", theme.overlay0, false);
 
         let header = Row::new(["KEY TAG", "ALGORITHM", "DIGEST TYPE", "MATCHED"])
             .style(Style::default().fg(theme.overlay0));
@@ -116,20 +112,8 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::backend::TestBackend;
-    use ratatui::Terminal;
+    use crate::tui::test_util::render_text;
     use seer_core::DnssecReport;
-
-    fn buf_text(buf: &ratatui::buffer::Buffer) -> String {
-        let a = buf.area();
-        let mut s = String::new();
-        for y in 0..a.height {
-            for x in 0..a.width {
-                s.push_str(buf[(x, y)].symbol());
-            }
-        }
-        s
-    }
 
     #[test]
     fn renders_status_field() {
@@ -147,11 +131,7 @@ mod tests {
             authentication_tier: seer_core::AuthenticationTier::DigestOnly,
             rrsig_records: vec![],
         }));
-        let backend = TestBackend::new(70, 14);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| render(f, f.area(), &theme, &data))
-            .unwrap();
-        assert!(buf_text(terminal.backend().buffer()).contains("signed"));
+        let text = render_text(70, 14, |f| render(f, f.area(), &theme, &data));
+        assert!(text.contains("signed"));
     }
 }

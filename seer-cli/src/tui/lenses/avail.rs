@@ -7,15 +7,13 @@ use ratatui::Frame;
 
 use crate::tui::action::LensData;
 use crate::tui::theme::Theme;
-use crate::tui::widgets::{kv, panel};
+use crate::tui::widgets::{kv, or_dash, panel};
 
 pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
     let LensData::Avail(a) = data else {
         return;
     };
-    let block = panel::block(theme, "Availability", theme.peach, false);
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let inner = panel::render(f, area, theme, "Availability", theme.peach, false);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -39,15 +37,12 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
         chunks[0],
     );
 
-    let rows: Vec<(String, String)> = vec![
-        ("domain".into(), a.domain.clone()),
-        ("available".into(), a.available.to_string()),
-        ("confidence".into(), a.confidence.clone()),
-        ("method".into(), a.method.clone()),
-        (
-            "details".into(),
-            a.details.clone().unwrap_or_else(|| "—".to_string()),
-        ),
+    let rows = [
+        ("domain", a.domain.clone()),
+        ("available", a.available.to_string()),
+        ("confidence", a.confidence.clone()),
+        ("method", a.method.clone()),
+        ("details", or_dash(a.details.as_deref())),
     ];
     kv::render(f, chunks[1], theme, theme.peach, &rows);
 }
@@ -55,20 +50,8 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::backend::TestBackend;
-    use ratatui::Terminal;
+    use crate::tui::test_util::render_text;
     use seer_core::AvailabilityResult;
-
-    fn buf_text(buf: &ratatui::buffer::Buffer) -> String {
-        let a = buf.area();
-        let mut s = String::new();
-        for y in 0..a.height {
-            for x in 0..a.width {
-                s.push_str(buf[(x, y)].symbol());
-            }
-        }
-        s
-    }
 
     #[test]
     fn renders_availability_fields() {
@@ -80,12 +63,7 @@ mod tests {
             method: "rdap".into(),
             details: None,
         }));
-        let backend = TestBackend::new(70, 10);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| render(f, f.area(), &theme, &data))
-            .unwrap();
-        let text = buf_text(terminal.backend().buffer());
+        let text = render_text(70, 10, |f| render(f, f.area(), &theme, &data));
         assert!(text.contains("available"));
     }
 }

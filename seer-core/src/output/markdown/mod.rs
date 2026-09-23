@@ -1,8 +1,16 @@
+//! Markdown output (`--format markdown`). One inherent `format_*` method per
+//! report type, split into per-concern submodules; bullets go through the
+//! private `Bullets` writer and `code_list`, which escape every value
+//! (`MdSafe`) so domain data can't inject markdown.
+
 use std::fmt::{self, Write as _};
+
+use chrono::{DateTime, Utc};
 
 use super::OutputFormatter;
 
 // Shared with the per-concern submodules below (each does `use super::*`).
+pub(super) use super::contact::{self, Contact, FlatContacts};
 pub(super) use super::days_until;
 pub(super) use super::grouping::render_grouped;
 pub(super) use crate::caa::{CaaPolicy, IssuerCaaMatch};
@@ -138,13 +146,8 @@ fn consume_escape(iter: &mut std::iter::Peekable<std::str::Chars<'_>>) {
 }
 
 /// Markdown output formatter that produces clean, readable Markdown.
+#[derive(Default)]
 pub struct MarkdownFormatter;
-
-impl Default for MarkdownFormatter {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 
 impl MarkdownFormatter {
     pub fn new() -> Self {
@@ -162,9 +165,7 @@ impl MarkdownFormatter {
         if !caa.has_policy {
             out.push("*No CAA records (any CA may issue)*".to_string());
         } else {
-            if let Some(ref eff) = caa.effective_domain {
-                out.push(format!("- **Found at**: `{}`", MdSafe(eff)));
-            }
+            Bullets(&mut out).code_opt("Found at", &caa.effective_domain);
             out.push(String::new());
             out.push("| Flags | Tag | Value |".to_string());
             out.push("| --- | --- | --- |".to_string());
@@ -193,210 +194,113 @@ impl MarkdownFormatter {
         out.push(format!("> **Note:** {}", caa.note));
         out
     }
+}
 
-    /// Formats a contact section for RDAP entities.
-    fn format_rdap_contact(
-        &self,
-        output: &mut Vec<String>,
-        label: &str,
-        contact: &crate::rdap::ContactInfo,
-    ) {
-        if !contact.has_info() {
-            return;
-        }
-        output.push(String::new());
-        output.push(format!("### {}", label));
-        output.push(String::new());
-        if let Some(ref name) = contact.name {
-            output.push(format!("- **Name**: {}", MdSafe(name)));
-        }
-        if let Some(ref org) = contact.organization {
-            output.push(format!("- **Organization**: {}", MdSafe(org)));
-        }
-        if let Some(ref email) = contact.email {
-            output.push(format!("- **Email**: `{}`", MdSafe(email)));
-        }
-        if let Some(ref phone) = contact.phone {
-            output.push(format!("- **Phone**: {}", MdSafe(phone)));
-        }
-        if let Some(ref address) = contact.address {
-            output.push(format!("- **Address**: {}", MdSafe(address)));
-        }
-        if let Some(ref country) = contact.country {
-            output.push(format!("- **Country**: {}", MdSafe(country)));
+/// `` `a`, `b` ``: each item in its own [`MdSafe`] code span, joined by a
+/// plain `, ` (the separator's backticks must never pass through `MdSafe`,
+/// which would turn them into apostrophes).
+fn code_list<S: AsRef<str>>(items: &[S]) -> String {
+    items
+        .iter()
+        .map(|item| format!("`{}`", MdSafe(item.as_ref())))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Appends `- **Label**: value` bullets. Remote values go through [`MdSafe`]
+/// here, so no bullet can skip the Markdown-injection guard.
+struct Bullets<'a>(&'a mut Vec<String>);
+
+impl Bullets<'_> {
+    /// Appends a pre-built line as-is.
+    fn push(&mut self, line: String) {
+        self.0.push(line);
+    }
+
+    /// `- **label**: value` for a value the caller already rendered safely.
+    fn raw(&mut self, label: &str, value: impl fmt::Display) {
+        self.0.push(format!("- **{label}**: {value}"));
+    }
+
+    /// `- **label**: value` for remote text.
+    fn text(&mut self, label: &str, value: &str) {
+        self.raw(label, MdSafe(value));
+    }
+
+    /// [`Self::text`], skipped when the field is absent.
+    fn opt(&mut self, label: &str, value: &Option<String>) {
+        if let Some(value) = value {
+            self.text(label, value);
         }
     }
 
-    /// Formats WHOIS contact fields as a markdown subsection.
-    fn format_whois_contact(
-        &self,
-        output: &mut Vec<String>,
-        label: &str,
-        name: &Option<String>,
-        organization: &Option<String>,
-        email: &Option<String>,
-        phone: &Option<String>,
-    ) {
-        let has_info =
-            name.is_some() || organization.is_some() || email.is_some() || phone.is_some();
-        if !has_info {
-            return;
-        }
-        output.push(String::new());
-        output.push(format!("### {}", label));
-        output.push(String::new());
-        if let Some(ref v) = *name {
-            output.push(format!("- **Name**: {}", MdSafe(v)));
-        }
-        if let Some(ref v) = *organization {
-            output.push(format!("- **Organization**: {}", MdSafe(v)));
-        }
-        if let Some(ref v) = *email {
-            output.push(format!("- **Email**: `{}`", MdSafe(v)));
-        }
-        if let Some(ref v) = *phone {
-            output.push(format!("- **Phone**: {}", MdSafe(v)));
+    /// `` - **label**: `value` `` for remote text shown as a code span.
+    fn code(&mut self, label: &str, value: &str) {
+        self.0.push(format!("- **{label}**: `{}`", MdSafe(value)));
+    }
+
+    /// [`Self::code`], skipped when the field is absent.
+    fn code_opt(&mut self, label: &str, value: &Option<String>) {
+        if let Some(value) = value {
+            self.code(label, value);
         }
     }
 
-    /// Emits the registrant/admin/tech contact subsections of a WHOIS
-    /// response.
+    /// `` - **label**: `a`, `b` `` (see [`code_list`]); nothing when empty.
+    fn code_list(&mut self, label: &str, items: &[String]) {
+        if !items.is_empty() {
+            self.raw(label, code_list(items));
+        }
+    }
+
+    /// `` - **label**: `YYYY-MM-DD` ``, skipped when absent.
+    fn date(&mut self, label: &str, date: Option<DateTime<Utc>>) {
+        if let Some(date) = date {
+            self.0
+                .push(format!("- **{label}**: `{}`", date.format("%Y-%m-%d")));
+        }
+    }
+
+    /// `` - **Expires**: `YYYY-MM-DD` (N days) ``, skipped when absent.
+    fn expires(&mut self, date: Option<DateTime<Utc>>) {
+        if let Some(date) = date {
+            self.0.push(format!(
+                "- **Expires**: `{}` ({} days)",
+                date.format("%Y-%m-%d"),
+                days_until(date)
+            ));
+        }
+    }
+
+    /// One `### <role> Contact` subsection with a bullet per populated
+    /// field; nothing for an empty contact.
     ///
-    /// Callers must push these (like the RDAP contact sections) only *after*
-    /// every domain-level bullet: a `###` heading scopes everything below it,
-    /// so a Created/Expires/Nameservers bullet emitted after a contact section
-    /// renders as part of that contact.
-    fn format_whois_contacts(&self, output: &mut Vec<String>, w: &WhoisResponse) {
-        let has_registrant_details = w.registrant_email.is_some()
-            || w.registrant_phone.is_some()
-            || w.registrant_address.is_some()
-            || w.registrant_country.is_some();
-        if has_registrant_details {
-            output.push(String::new());
-            output.push("### Registrant Contact".to_string());
-            output.push(String::new());
-            if let Some(ref email) = w.registrant_email {
-                output.push(format!("- **Email**: `{}`", MdSafe(email)));
-            }
-            if let Some(ref phone) = w.registrant_phone {
-                output.push(format!("- **Phone**: {}", MdSafe(phone)));
-            }
-            if let Some(ref address) = w.registrant_address {
-                output.push(format!("- **Address**: {}", MdSafe(address)));
-            }
-            if let Some(ref country) = w.registrant_country {
-                output.push(format!("- **Country**: {}", MdSafe(country)));
-            }
+    /// Push these only *after* every domain-level bullet: a `###` heading
+    /// scopes everything below it, so a Created/Expires/Nameservers bullet
+    /// emitted after a contact section renders as part of that contact.
+    fn contact(&mut self, role: &str, c: Contact<'_>) {
+        if c.is_empty() {
+            return;
         }
+        self.0
+            .extend([String::new(), format!("### {role} Contact"), String::new()]);
+        self.opt("Name", c.name);
+        self.opt("Organization", c.organization);
+        self.code_opt("Email", c.email);
+        self.opt("Phone", c.phone);
+        self.opt("Address", c.address);
+        self.opt("Country", c.country);
+    }
 
-        self.format_whois_contact(
-            output,
-            "Admin Contact",
-            &w.admin_name,
-            &w.admin_organization,
-            &w.admin_email,
-            &w.admin_phone,
-        );
-        self.format_whois_contact(
-            output,
-            "Tech Contact",
-            &w.tech_name,
-            &w.tech_organization,
-            &w.tech_email,
-            &w.tech_phone,
-        );
+    /// [`Self::contact`] for each of [`contact::ROLES`].
+    fn contacts(&mut self, contacts: [Contact<'_>; 3]) {
+        for (role, c) in contact::ROLES.into_iter().zip(contacts) {
+            self.contact(role, c);
+        }
     }
 }
 
-// Thin dispatch layer: each trait method forwards to the inherent
-// method of the same name defined in the per-concern submodule. Rust
-// resolves the inherent method first, so this does not recurse.
-impl OutputFormatter for MarkdownFormatter {
-    fn format_whois(&self, response: &WhoisResponse) -> String {
-        self.format_whois(response)
-    }
-    fn format_rdap(&self, response: &RdapResponse) -> String {
-        self.format_rdap(response)
-    }
-    fn format_dns(&self, records: &[DnsRecord]) -> String {
-        self.format_dns(records)
-    }
-    fn format_propagation(&self, result: &PropagationResult) -> String {
-        self.format_propagation(result)
-    }
-    fn format_lookup(&self, result: &LookupResult) -> String {
-        self.format_lookup(result)
-    }
-    fn format_status(&self, response: &StatusResponse) -> String {
-        self.format_status(response)
-    }
-    fn format_follow_iteration(&self, iteration: &FollowIteration) -> String {
-        self.format_follow_iteration(iteration)
-    }
-    fn format_follow(&self, result: &FollowResult) -> String {
-        self.format_follow(result)
-    }
-    fn format_availability(&self, result: &crate::availability::AvailabilityResult) -> String {
-        self.format_availability(result)
-    }
-    fn format_tld(&self, info: &crate::tld::TldInfo) -> String {
-        self.format_tld(info)
-    }
-    fn format_dnssec(&self, report: &crate::dns::DnssecReport) -> String {
-        self.format_dnssec(report)
-    }
-    fn format_delegation(&self, report: &crate::dns::DelegationReport) -> String {
-        self.format_delegation(report)
-    }
-    fn format_dns_comparison(&self, comparison: &crate::dns::DnsComparison) -> String {
-        self.format_dns_comparison(comparison)
-    }
-    fn format_subdomains(&self, result: &crate::subdomains::SubdomainResult) -> String {
-        self.format_subdomains(result)
-    }
-    fn format_diff(&self, diff: &crate::diff::DomainDiff) -> String {
-        self.format_diff(diff)
-    }
-    fn format_ssl(&self, report: &crate::ssl::SslReport) -> String {
-        self.format_ssl(report)
-    }
-    fn format_watch(&self, report: &crate::watchlist::WatchReport) -> String {
-        self.format_watch(report)
-    }
-    fn format_domain_info(&self, info: &crate::domain_info::DomainInfo) -> String {
-        self.format_domain_info(info)
-    }
-    fn format_drift(&self, report: &crate::drift::DriftReport) -> String {
-        self.format_drift(report)
-    }
-    fn format_posture(&self, posture: &crate::posture::EmailPosture) -> String {
-        self.format_posture(posture)
-    }
-    fn format_headers(&self, report: &crate::headers::HeaderReport) -> String {
-        self.format_headers(report)
-    }
-    fn format_takeover(&self, report: &crate::takeover::TakeoverReport) -> String {
-        self.format_takeover(report)
-    }
-    fn format_caa(&self, policy: &CaaPolicy) -> String {
-        self.format_caa(policy)
-    }
-    fn format_confusables(&self, report: &crate::confusables::ConfusableReport) -> String {
-        self.format_confusables(report)
-    }
-    fn format_subdomain_classification(
-        &self,
-        result: &crate::subdomains::SubdomainClassification,
-    ) -> String {
-        self.format_subdomain_classification(result)
-    }
-    fn format_subdomain_baseline_diff(
-        &self,
-        report: &crate::subdomains::SubdomainBaselineDiff,
-    ) -> String {
-        self.format_subdomain_baseline_diff(report)
-    }
-}
+with_report_methods!(impl_forwarding!(MarkdownFormatter;));
 
 #[cfg(test)]
 mod tests {

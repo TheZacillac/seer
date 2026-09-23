@@ -1,0 +1,18 @@
+---
+source: seer-core/tests/format_snapshots.rs
+expression: markdown ().format_takeover (& fixture_takeover())
+---
+## Takeover scan: example.com
+
+12 host(s) checked — **1 vulnerable**, 1 potential
+
+_3 host(s) exceeded the scan cap and were not examined._
+
+| Host | Verdict | Provider | CNAME | Evidence | Note |
+|---|---|---|---|---|---|
+| docs.example.com | **VULNERABLE** | GitHub Pages | example.github.io | There isn't a GitHub Pages site here. | — |
+| shop.example.com | potential | Shopify | shops.myshopify.com | — | HTTP probe failed: connection refused |
+
+### Advisories
+
+- 3 hosts exceeded the scan cap

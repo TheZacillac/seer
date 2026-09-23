@@ -23,277 +23,229 @@
 //! ```
 
 use chrono::{DateTime, NaiveDate, Utc};
-use once_cell::sync::Lazy;
-use regex::Regex;
 
-use super::{push_bounded, RegistryParser, MAX_NAMESERVERS, MAX_STATUSES};
+use super::{push_bounded, MAX_NAMESERVERS, MAX_STATUSES};
 use crate::whois::parser::WhoisResponse;
 
-/// Regex patterns for Nominet-specific fields.
-static DOMAIN_SECTION: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?i)^Domain name:\s*$").expect("Invalid Nominet domain regex"));
+// Regex patterns for Nominet-specific fields.
+static_regex! {
+    DOMAIN_SECTION = r"(?i)^Domain name:\s*$";
+    REGISTRANT_SECTION = r"(?i)^Registrant:\s*$";
+    REGISTRAR_SECTION = r"(?i)^Registrar:\s*$";
+    REGISTRATION_DATE = r"(?i)^Registration date:\s*$";
+    EXPIRY_DATE = r"(?i)^Expiry date:\s*$";
+    LAST_UPDATED = r"(?i)^Last updated:\s*$";
 
-static REGISTRANT_SECTION: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?i)^Registrant:\s*$").expect("Invalid Nominet registrant regex"));
+    /// `.uk` output groups dates under a single `Relevant dates:` header with
+    /// indented inline `Registered on:` / `Expiry date:` / `Last updated:`
+    /// sub-fields, rather than as standalone per-date section headers.
+    RELEVANT_DATES_SECTION = r"(?i)^Relevant dates:\s*$";
+    NAME_SERVERS_SECTION = r"(?i)^Name servers:\s*$";
+    STATUS_SECTION = r"(?i)^Registration status:\s*$";
+    DNSSEC_SECTION = r"(?i)^DNSSEC:\s*$";
+}
 
-static REGISTRAR_SECTION: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?i)^Registrar:\s*$").expect("Invalid Nominet registrar regex"));
+/// The .uk TLD and the second-level zones Nominet serves.
+pub(super) const TLDS: &[&str] = &[
+    "uk", "co.uk", "org.uk", "me.uk", "ltd.uk", "plc.uk", "net.uk", "sch.uk",
+];
 
-static REGISTRATION_DATE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)^Registration date:\s*$").expect("Invalid Nominet registration date regex")
-});
+/// Parses .uk domains using the Nominet format.
+pub(super) fn parse(domain: &str, server: &str, raw: &str) -> WhoisResponse {
+    let mut registrant = None;
+    let mut registrar = None;
+    let mut creation_date = None;
+    let mut expiration_date = None;
+    let mut updated_date = None;
+    let mut nameservers = Vec::new();
+    let mut status = Vec::new();
+    let mut dnssec = None;
 
-static EXPIRY_DATE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?i)^Expiry date:\s*$").expect("Invalid Nominet expiry date regex"));
-
-static LAST_UPDATED: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)^Last updated:\s*$").expect("Invalid Nominet last updated regex")
-});
-
-/// `.uk` output groups dates under a single `Relevant dates:` header with
-/// indented inline `Registered on:` / `Expiry date:` / `Last updated:`
-/// sub-fields, rather than as standalone per-date section headers.
-static RELEVANT_DATES_SECTION: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)^Relevant dates:\s*$").expect("Invalid Nominet relevant dates regex")
-});
-
-static NAME_SERVERS_SECTION: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)^Name servers:\s*$").expect("Invalid Nominet name servers regex")
-});
-
-static STATUS_SECTION: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)^Registration status:\s*$").expect("Invalid Nominet status regex")
-});
-
-static DNSSEC_SECTION: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?i)^DNSSEC:\s*$").expect("Invalid Nominet DNSSEC regex"));
-
-/// Parser for .uk domains using the Nominet format.
-#[derive(Debug, Clone, Default)]
-pub struct NominetParser;
-
-impl NominetParser {
-    pub fn new() -> Self {
-        Self
+    #[derive(Clone, Copy)]
+    enum Section {
+        None,
+        Registrant,
+        Registrar,
+        RegistrationDate,
+        ExpiryDate,
+        LastUpdated,
+        RelevantDates,
+        NameServers,
+        Status,
+        Dnssec,
     }
 
-    /// Parses Nominet's date format: DD-Month-YYYY or DD Month YYYY
-    fn parse_nominet_date(date_str: &str) -> Option<DateTime<Utc>> {
-        let cleaned = date_str.trim();
+    let mut current_section = Section::None;
 
-        // Nominet uses formats like "01-January-2020" or "01 January 2020"
-        let formats = [
-            "%d-%B-%Y", // 01-January-2020
-            "%d %B %Y", // 01 January 2020
-            "%d-%b-%Y", // 01-Jan-2020
-            "%d %b %Y", // 01 Jan 2020
-            "%Y-%m-%d", // 2020-01-01 (fallback)
-        ];
+    for line in raw.lines() {
+        let trimmed = line.trim();
 
-        for fmt in &formats {
-            if let Ok(date) = NaiveDate::parse_from_str(cleaned, fmt) {
-                return Some(date.and_hms_opt(0, 0, 0)?.and_utc());
-            }
+        // Check for section headers
+        if REGISTRANT_SECTION.is_match(trimmed) {
+            current_section = Section::Registrant;
+            continue;
+        } else if REGISTRAR_SECTION.is_match(trimmed) {
+            current_section = Section::Registrar;
+            continue;
+        } else if REGISTRATION_DATE.is_match(trimmed) {
+            current_section = Section::RegistrationDate;
+            continue;
+        } else if EXPIRY_DATE.is_match(trimmed) {
+            current_section = Section::ExpiryDate;
+            continue;
+        } else if LAST_UPDATED.is_match(trimmed) {
+            current_section = Section::LastUpdated;
+            continue;
+        } else if RELEVANT_DATES_SECTION.is_match(trimmed) {
+            current_section = Section::RelevantDates;
+            continue;
+        } else if NAME_SERVERS_SECTION.is_match(trimmed) {
+            current_section = Section::NameServers;
+            continue;
+        } else if STATUS_SECTION.is_match(trimmed) {
+            current_section = Section::Status;
+            continue;
+        } else if DNSSEC_SECTION.is_match(trimmed) {
+            current_section = Section::Dnssec;
+            continue;
+        } else if DOMAIN_SECTION.is_match(trimmed) {
+            current_section = Section::None;
+            continue;
         }
 
-        None
+        // An empty line ends the current section. The one exception is a
+        // blank line directly after `Name servers:` (before any host):
+        // real .uk output indents EVERY line by 4 spaces, so a section
+        // left open past its blank terminator would swallow the trailing
+        // `    WHOIS lookup made at …` line as a nameserver.
+        if trimmed.is_empty() {
+            if !matches!(current_section, Section::NameServers) || !nameservers.is_empty() {
+                current_section = Section::None;
+            }
+            continue;
+        }
+
+        // Parse section content (indented values)
+        if line.starts_with("    ") || line.starts_with('\t') {
+            let value = trimmed.to_string();
+
+            match current_section {
+                Section::Registrant if registrant.is_none() && !is_redacted(&value) => {
+                    registrant = Some(value);
+                }
+                Section::Registrar if registrar.is_none() => {
+                    // Extract registrar name from format like "Example Ltd [Tag = EXAMPLE]"
+                    let name = value.split('[').next().unwrap_or(&value).trim().to_string();
+                    if !is_redacted(&name) {
+                        registrar = Some(name);
+                    }
+                }
+                Section::RegistrationDate if creation_date.is_none() => {
+                    creation_date = parse_nominet_date(&value);
+                }
+                Section::ExpiryDate if expiration_date.is_none() => {
+                    expiration_date = parse_nominet_date(&value);
+                }
+                Section::LastUpdated if updated_date.is_none() => {
+                    updated_date = parse_nominet_date(&value);
+                }
+                Section::RelevantDates => {
+                    // Indented inline `Sub-field: value` lines. Match the
+                    // sub-field name case-insensitively and slice the value
+                    // at the actual `:` (char-boundary safe).
+                    if let Some((field, raw_date)) = value.split_once(':') {
+                        let date = raw_date.trim();
+                        let field = field.trim();
+                        if field.eq_ignore_ascii_case("Registered on") && creation_date.is_none() {
+                            creation_date = parse_nominet_date(date);
+                        } else if (field.eq_ignore_ascii_case("Expiry date")
+                            || field.eq_ignore_ascii_case("Renewal date"))
+                            && expiration_date.is_none()
+                        {
+                            expiration_date = parse_nominet_date(date);
+                        } else if field.eq_ignore_ascii_case("Last updated")
+                            && updated_date.is_none()
+                        {
+                            updated_date = parse_nominet_date(date);
+                        }
+                    }
+                }
+                Section::NameServers => {
+                    // Hosts in the zone carry glue after the name
+                    // (`ns1.example.co.uk   192.0.2.1  2001:db8::1`);
+                    // keep only the hostname.
+                    if let Some(host) = value.split_whitespace().next() {
+                        push_bounded(&mut nameservers, host.to_lowercase(), MAX_NAMESERVERS);
+                    }
+                }
+                Section::Status => {
+                    push_bounded(&mut status, value, MAX_STATUSES);
+                }
+                Section::Dnssec if dnssec.is_none() => {
+                    dnssec = Some(value);
+                }
+                _ => {}
+            }
+        } else {
+            // Non-indented line might start a new section or be a different header
+            // Check for inline headers like "Registrar: Example Ltd"
+            if let Some(pos) = trimmed.find(':') {
+                let key = &trimmed[..pos].to_lowercase();
+                let value = trimmed[pos + 1..].trim();
+
+                if !value.is_empty() && !is_redacted(value) {
+                    match key.as_str() {
+                        "registrant" => registrant = Some(value.to_string()),
+                        "registrar" => registrar = Some(value.to_string()),
+                        _ => {}
+                    }
+                }
+            }
+
+            // End current section if we hit a non-indented, non-empty line
+            current_section = Section::None;
+        }
+    }
+
+    WhoisResponse {
+        domain: domain.to_string(),
+        registrar,
+        registrant: registrant.clone(),
+        organization: registrant,
+        creation_date,
+        expiration_date,
+        updated_date,
+        nameservers,
+        status,
+        dnssec,
+        whois_server: server.to_string(),
+        raw_response: raw.to_string(),
+        // registrant_country is not inferred from the TLD: .uk accepts holders
+        // worldwide, and a "no match" body must not report one.
+        ..Default::default()
     }
 }
 
-impl RegistryParser for NominetParser {
-    fn supported_tlds(&self) -> &[&str] {
-        &[
-            "uk", "co.uk", "org.uk", "me.uk", "ltd.uk", "plc.uk", "net.uk", "sch.uk",
-        ]
-    }
+/// Parses Nominet's date format: DD-Month-YYYY or DD Month YYYY
+fn parse_nominet_date(date_str: &str) -> Option<DateTime<Utc>> {
+    let cleaned = date_str.trim();
 
-    fn parse(&self, domain: &str, server: &str, raw: &str) -> WhoisResponse {
-        let mut registrant = None;
-        let mut registrar = None;
-        let mut creation_date = None;
-        let mut expiration_date = None;
-        let mut updated_date = None;
-        let mut nameservers = Vec::new();
-        let mut status = Vec::new();
-        let mut dnssec = None;
+    // Nominet uses formats like "01-January-2020" or "01 January 2020"
+    let formats = [
+        "%d-%B-%Y", // 01-January-2020
+        "%d %B %Y", // 01 January 2020
+        "%d-%b-%Y", // 01-Jan-2020
+        "%d %b %Y", // 01 Jan 2020
+        "%Y-%m-%d", // 2020-01-01 (fallback)
+    ];
 
-        #[derive(Clone, Copy)]
-        enum Section {
-            None,
-            Registrant,
-            Registrar,
-            RegistrationDate,
-            ExpiryDate,
-            LastUpdated,
-            RelevantDates,
-            NameServers,
-            Status,
-            Dnssec,
-        }
-
-        let mut current_section = Section::None;
-
-        for line in raw.lines() {
-            let trimmed = line.trim();
-
-            // Check for section headers
-            if REGISTRANT_SECTION.is_match(trimmed) {
-                current_section = Section::Registrant;
-                continue;
-            } else if REGISTRAR_SECTION.is_match(trimmed) {
-                current_section = Section::Registrar;
-                continue;
-            } else if REGISTRATION_DATE.is_match(trimmed) {
-                current_section = Section::RegistrationDate;
-                continue;
-            } else if EXPIRY_DATE.is_match(trimmed) {
-                current_section = Section::ExpiryDate;
-                continue;
-            } else if LAST_UPDATED.is_match(trimmed) {
-                current_section = Section::LastUpdated;
-                continue;
-            } else if RELEVANT_DATES_SECTION.is_match(trimmed) {
-                current_section = Section::RelevantDates;
-                continue;
-            } else if NAME_SERVERS_SECTION.is_match(trimmed) {
-                current_section = Section::NameServers;
-                continue;
-            } else if STATUS_SECTION.is_match(trimmed) {
-                current_section = Section::Status;
-                continue;
-            } else if DNSSEC_SECTION.is_match(trimmed) {
-                current_section = Section::Dnssec;
-                continue;
-            } else if DOMAIN_SECTION.is_match(trimmed) {
-                current_section = Section::None;
-                continue;
-            }
-
-            // An empty line ends the current section. The one exception is a
-            // blank line directly after `Name servers:` (before any host):
-            // real .uk output indents EVERY line by 4 spaces, so a section
-            // left open past its blank terminator would swallow the trailing
-            // `    WHOIS lookup made at …` line as a nameserver.
-            if trimmed.is_empty() {
-                if !matches!(current_section, Section::NameServers) || !nameservers.is_empty() {
-                    current_section = Section::None;
-                }
-                continue;
-            }
-
-            // Parse section content (indented values)
-            if line.starts_with("    ") || line.starts_with('\t') {
-                let value = trimmed.to_string();
-
-                match current_section {
-                    Section::Registrant if registrant.is_none() && !is_redacted(&value) => {
-                        registrant = Some(value);
-                    }
-                    Section::Registrar if registrar.is_none() => {
-                        // Extract registrar name from format like "Example Ltd [Tag = EXAMPLE]"
-                        let name = value.split('[').next().unwrap_or(&value).trim().to_string();
-                        if !is_redacted(&name) {
-                            registrar = Some(name);
-                        }
-                    }
-                    Section::RegistrationDate if creation_date.is_none() => {
-                        creation_date = Self::parse_nominet_date(&value);
-                    }
-                    Section::ExpiryDate if expiration_date.is_none() => {
-                        expiration_date = Self::parse_nominet_date(&value);
-                    }
-                    Section::LastUpdated if updated_date.is_none() => {
-                        updated_date = Self::parse_nominet_date(&value);
-                    }
-                    Section::RelevantDates => {
-                        // Indented inline `Sub-field: value` lines. Match the
-                        // sub-field name case-insensitively and slice the value
-                        // at the actual `:` (char-boundary safe).
-                        if let Some((field, raw_date)) = value.split_once(':') {
-                            let date = raw_date.trim();
-                            let field = field.trim();
-                            if field.eq_ignore_ascii_case("Registered on")
-                                && creation_date.is_none()
-                            {
-                                creation_date = Self::parse_nominet_date(date);
-                            } else if (field.eq_ignore_ascii_case("Expiry date")
-                                || field.eq_ignore_ascii_case("Renewal date"))
-                                && expiration_date.is_none()
-                            {
-                                expiration_date = Self::parse_nominet_date(date);
-                            } else if field.eq_ignore_ascii_case("Last updated")
-                                && updated_date.is_none()
-                            {
-                                updated_date = Self::parse_nominet_date(date);
-                            }
-                        }
-                    }
-                    Section::NameServers => {
-                        // Hosts in the zone carry glue after the name
-                        // (`ns1.example.co.uk   192.0.2.1  2001:db8::1`);
-                        // keep only the hostname.
-                        if let Some(host) = value.split_whitespace().next() {
-                            push_bounded(&mut nameservers, host.to_lowercase(), MAX_NAMESERVERS);
-                        }
-                    }
-                    Section::Status => {
-                        push_bounded(&mut status, value, MAX_STATUSES);
-                    }
-                    Section::Dnssec if dnssec.is_none() => {
-                        dnssec = Some(value);
-                    }
-                    _ => {}
-                }
-            } else {
-                // Non-indented line might start a new section or be a different header
-                // Check for inline headers like "Registrar: Example Ltd"
-                if let Some(pos) = trimmed.find(':') {
-                    let key = &trimmed[..pos].to_lowercase();
-                    let value = trimmed[pos + 1..].trim();
-
-                    if !value.is_empty() && !is_redacted(value) {
-                        match key.as_str() {
-                            "registrant" => registrant = Some(value.to_string()),
-                            "registrar" => registrar = Some(value.to_string()),
-                            _ => {}
-                        }
-                    }
-                }
-
-                // End current section if we hit a non-indented, non-empty line
-                current_section = Section::None;
-            }
-        }
-
-        WhoisResponse {
-            domain: domain.to_string(),
-            registrar,
-            registrant: registrant.clone(),
-            organization: registrant,
-            registrant_email: None,
-            registrant_phone: None,
-            registrant_address: None,
-            // Not inferred from the TLD: .uk accepts holders worldwide, and a
-            // "no match" body must not report a registrant country.
-            registrant_country: None,
-            admin_name: None,
-            admin_organization: None,
-            admin_email: None,
-            admin_phone: None,
-            tech_name: None,
-            tech_organization: None,
-            tech_email: None,
-            tech_phone: None,
-            creation_date,
-            expiration_date,
-            updated_date,
-            nameservers,
-            status,
-            dnssec,
-            whois_server: server.to_string(),
-            raw_response: raw.to_string(),
+    for fmt in &formats {
+        if let Ok(date) = NaiveDate::parse_from_str(cleaned, fmt) {
+            return Some(date.and_hms_opt(0, 0, 0)?.and_utc());
         }
     }
+
+    None
 }
 
 /// Checks if a value is a privacy/redaction placeholder.
@@ -370,8 +322,7 @@ DNSSEC:
 
     #[test]
     fn test_nominet_parser_basic() {
-        let parser = NominetParser::new();
-        let result = parser.parse("example.co.uk", "whois.nic.uk", SAMPLE_NOMINET_RESPONSE_2);
+        let result = parse("example.co.uk", "whois.nic.uk", SAMPLE_NOMINET_RESPONSE_2);
 
         assert_eq!(result.domain, "example.co.uk");
         assert_eq!(result.registrant, Some("Test Company".to_string()));
@@ -380,8 +331,7 @@ DNSSEC:
 
     #[test]
     fn test_nominet_parser_dates() {
-        let parser = NominetParser::new();
-        let result = parser.parse("example.co.uk", "whois.nic.uk", SAMPLE_NOMINET_RESPONSE_2);
+        let result = parse("example.co.uk", "whois.nic.uk", SAMPLE_NOMINET_RESPONSE_2);
 
         assert!(result.creation_date.is_some());
         let creation = result.creation_date.unwrap();
@@ -398,8 +348,7 @@ DNSSEC:
 
     #[test]
     fn test_nominet_parser_nameservers() {
-        let parser = NominetParser::new();
-        let result = parser.parse("example.co.uk", "whois.nic.uk", SAMPLE_NOMINET_RESPONSE_2);
+        let result = parse("example.co.uk", "whois.nic.uk", SAMPLE_NOMINET_RESPONSE_2);
 
         assert_eq!(result.nameservers.len(), 3);
         assert!(result.nameservers.contains(&"ns1.test.co.uk".to_string()));
@@ -409,26 +358,16 @@ DNSSEC:
 
     #[test]
     fn test_nominet_parser_dnssec() {
-        let parser = NominetParser::new();
-        let result = parser.parse("example.co.uk", "whois.nic.uk", SAMPLE_NOMINET_RESPONSE_2);
+        let result = parse("example.co.uk", "whois.nic.uk", SAMPLE_NOMINET_RESPONSE_2);
 
         assert_eq!(result.dnssec, Some("Signed".to_string()));
     }
 
     #[test]
     fn test_nominet_date_parsing() {
-        assert!(NominetParser::parse_nominet_date("01-January-2020").is_some());
-        assert!(NominetParser::parse_nominet_date("15 March 2019").is_some());
-        assert!(NominetParser::parse_nominet_date("01-Jan-2020").is_some());
-    }
-
-    #[test]
-    fn test_supported_tlds() {
-        let parser = NominetParser::new();
-        let tlds = parser.supported_tlds();
-        assert!(tlds.contains(&"uk"));
-        assert!(tlds.contains(&"co.uk"));
-        assert!(tlds.contains(&"org.uk"));
+        assert!(parse_nominet_date("01-January-2020").is_some());
+        assert!(parse_nominet_date("15 March 2019").is_some());
+        assert!(parse_nominet_date("01-Jan-2020").is_some());
     }
 
     #[test]
@@ -443,14 +382,13 @@ DNSSEC:
     /// TLD — and an unregistered domain must not print `Registrant Country: GB`.
     #[test]
     fn test_country_code() {
-        let parser = NominetParser::new();
-        let result = parser.parse("example.co.uk", "whois.nic.uk", SAMPLE_NOMINET_RESPONSE_2);
+        let result = parse("example.co.uk", "whois.nic.uk", SAMPLE_NOMINET_RESPONSE_2);
         assert_eq!(result.registrant_country, None);
 
         let raw = "No match for \"nosuch-xyz.co.uk\".\n\n\
                    This domain name has not been registered.\n\n\
                    WHOIS lookup made at 10:04:07 22-Sep-2026\n";
-        let result = parser.parse("nosuch-xyz.co.uk", "whois.nic.uk", raw);
+        let result = parse("nosuch-xyz.co.uk", "whois.nic.uk", raw);
         assert_eq!(result.registrant_country, None);
         assert!(result.is_available());
     }
@@ -461,8 +399,7 @@ DNSSEC:
         // `Relevant dates:` header with indented inline sub-fields, not as
         // standalone `Registration date:` / `Expiry date:` headers. All three
         // dates must be parsed from that block.
-        let parser = NominetParser::new();
-        let result = parser.parse("example.co.uk", "whois.nic.uk", SAMPLE_NOMINET_RESPONSE);
+        let result = parse("example.co.uk", "whois.nic.uk", SAMPLE_NOMINET_RESPONSE);
 
         let creation = result
             .creation_date
@@ -492,8 +429,7 @@ DNSSEC:
     /// must not become a nameserver.
     #[test]
     fn test_nominet_nameservers_end_at_blank_line() {
-        let parser = NominetParser::new();
-        let result = parser.parse("example.co.uk", "whois.nic.uk", SAMPLE_NOMINET_RESPONSE);
+        let result = parse("example.co.uk", "whois.nic.uk", SAMPLE_NOMINET_RESPONSE);
         assert_eq!(
             result.nameservers,
             vec!["ns1.example.co.uk", "ns2.example.co.uk"],
@@ -514,7 +450,7 @@ DNSSEC:
 
     WHOIS lookup made at 10:04:07 22-Sep-2026
 ";
-        let result = NominetParser::new().parse("example.co.uk", "whois.nic.uk", raw);
+        let result = parse("example.co.uk", "whois.nic.uk", raw);
         assert_eq!(
             result.nameservers,
             vec!["ns1.example.co.uk", "ns2.example.co.uk", "ns1.example.net"]
@@ -534,8 +470,7 @@ Relevant dates:
     Renewal date: 03-March-2026
     Last updated: 10-October-2023
 ";
-        let parser = NominetParser::new();
-        let result = parser.parse("example.co.uk", "whois.nic.uk", raw);
+        let result = parse("example.co.uk", "whois.nic.uk", raw);
 
         let expiry = result
             .expiration_date

@@ -7,7 +7,7 @@ use ratatui::Frame;
 
 use crate::tui::action::LensData;
 use crate::tui::theme::Theme;
-use crate::tui::widgets::panel;
+use crate::tui::widgets::{or_dash, panel};
 
 pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
     let LensData::Compare(c) = data else {
@@ -20,9 +20,7 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
         "compare · {} · A {} vs B {}",
         c.domain, c.server_a.nameserver, c.server_b.nameserver
     );
-    let block = panel::block(theme, &title, theme.sky, false);
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let inner = panel::render(f, area, theme, &title, theme.sky, false);
 
     // Layout: summary line + hint + table
     let chunks = Layout::default()
@@ -113,8 +111,8 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
             Row::new(vec![
                 dot.to_string(),
                 c.record_type.to_string(),
-                if in_a { val.clone() } else { "—".to_string() },
-                if in_b { val.clone() } else { "—".to_string() },
+                or_dash(in_a.then_some(val)),
+                or_dash(in_b.then_some(val)),
             ])
             .style(Style::default().fg(row_color))
         })
@@ -165,21 +163,9 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::backend::TestBackend;
-    use ratatui::Terminal;
+    use crate::tui::test_util::render_text;
     use seer_core::dns::{DnsComparison, RecordData, RecordType, ServerResult};
     use seer_core::DnsRecord;
-
-    fn buf_text(buf: &ratatui::buffer::Buffer) -> String {
-        let a = buf.area();
-        let mut s = String::new();
-        for y in 0..a.height {
-            for x in 0..a.width {
-                s.push_str(buf[(x, y)].symbol());
-            }
-        }
-        s
-    }
 
     fn make_record(ip: &str) -> DnsRecord {
         DnsRecord {
@@ -224,12 +210,7 @@ mod tests {
     fn renders_resolver_ips() {
         let theme = Theme::frappe();
         let data = LensData::Compare(Box::new(comparison_fixture(true)));
-        let backend = TestBackend::new(90, 14);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| render(f, f.area(), &theme, &data))
-            .unwrap();
-        let text = buf_text(terminal.backend().buffer());
+        let text = render_text(90, 14, |f| render(f, f.area(), &theme, &data));
         assert!(text.contains("8.8.8.8"), "A resolver IP should appear");
         assert!(text.contains("1.1.1.1"), "B resolver IP should appear");
         assert!(
@@ -242,12 +223,7 @@ mod tests {
     fn renders_identical_summary_for_matching() {
         let theme = Theme::frappe();
         let data = LensData::Compare(Box::new(comparison_fixture(true)));
-        let backend = TestBackend::new(90, 14);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| render(f, f.area(), &theme, &data))
-            .unwrap();
-        let text = buf_text(terminal.backend().buffer());
+        let text = render_text(90, 14, |f| render(f, f.area(), &theme, &data));
         assert!(
             text.contains("identical"),
             "matching result should show 'identical'"
@@ -258,12 +234,7 @@ mod tests {
     fn renders_record_ip_in_table() {
         let theme = Theme::frappe();
         let data = LensData::Compare(Box::new(comparison_fixture(true)));
-        let backend = TestBackend::new(90, 14);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| render(f, f.area(), &theme, &data))
-            .unwrap();
-        let text = buf_text(terminal.backend().buffer());
+        let text = render_text(90, 14, |f| render(f, f.area(), &theme, &data));
         assert!(text.contains("1.2.3.4"), "record IP should appear in table");
     }
 
@@ -271,12 +242,7 @@ mod tests {
     fn renders_difference_summary() {
         let theme = Theme::frappe();
         let data = LensData::Compare(Box::new(comparison_fixture(false)));
-        let backend = TestBackend::new(90, 14);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| render(f, f.area(), &theme, &data))
-            .unwrap();
-        let text = buf_text(terminal.backend().buffer());
+        let text = render_text(90, 14, |f| render(f, f.area(), &theme, &data));
         assert!(
             text.contains("difference"),
             "non-matching should show 'difference(s)'"

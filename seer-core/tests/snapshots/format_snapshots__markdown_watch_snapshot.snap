@@ -1,0 +1,13 @@
+---
+source: seer-core/tests/format_snapshots.rs
+expression: markdown ().format_watch (& fixture_watch())
+---
+## Domain Watch Report
+
+- **Checked**: 2026-06-01 12:00:00 UTC
+- **Total**: 2 domains, 1 warnings, 0 critical
+
+| Status | Domain | SSL Days | Domain Days | HTTP | Issues |
+| --- | --- | --- | --- | --- | --- |
+| ok | example.com | 80 | 400 | 200 | - |
+| warn | expiring.example | 5 | N/A | N/A | SSL certificate expires in [N] days |

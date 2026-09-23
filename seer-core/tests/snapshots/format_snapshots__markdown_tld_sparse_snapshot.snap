@@ -1,0 +1,10 @@
+---
+source: seer-core/tests/format_snapshots.rs
+expression: markdown ().format_tld (& fixture_tld_sparse())
+---
+## TLD Info: .example
+
+- **Type**: reserved
+- **WHOIS Server**: *not available*
+- **RDAP URL**: *not available*
+- **Registry URL**: *not available*

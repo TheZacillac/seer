@@ -1,0 +1,11 @@
+---
+source: seer-core/tests/format_snapshots.rs
+expression: human ().format_tld (& fixture_tld_sparse())
+---
+
+[1;95mTLD Info: .example[0m
+[37m──────────────────[0m
+  [1;96mType[0m: [97mreserved[0m
+  [1;96mWHOIS Server[0m: [1;93mnot available[0m
+  [1;96mRDAP URL[0m: [1;93mnot available[0m
+  [1;96mRegistry[0m: [1;93mnot available[0m

@@ -302,16 +302,6 @@ impl<C: RetryClassifier> RetryExecutor<C> {
         // Should not reach here, but handle it gracefully
         Err(last_error.unwrap_or_else(|| SeerError::Other("retry loop exited unexpectedly".into())))
     }
-
-    /// Executes an async operation once without retries.
-    /// Useful for operations that should not be retried.
-    pub async fn execute_once<F, Fut, T>(&self, operation: F) -> Result<T>
-    where
-        F: FnOnce() -> Fut,
-        Fut: Future<Output = Result<T>>,
-    {
-        operation().await
-    }
 }
 
 #[cfg(test)]
@@ -536,6 +526,42 @@ mod tests {
             }
             other => panic!("Expected RetryExhausted, got {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn test_executor_with_custom_classifier() {
+        // Retries what NetworkRetryClassifier never would (InvalidDomain), so
+        // three attempts prove the supplied classifier is the one consulted.
+        struct RetryEverything;
+        impl RetryClassifier for RetryEverything {
+            fn is_retryable(&self, _: &SeerError) -> bool {
+                true
+            }
+        }
+
+        let policy = RetryPolicy::new()
+            .with_max_attempts(3)
+            .with_initial_delay(Duration::from_millis(1))
+            .with_jitter(false);
+        let executor = RetryExecutor::with_classifier(policy, RetryEverything);
+        let attempts = Arc::new(AtomicUsize::new(0));
+
+        let attempts_clone = attempts.clone();
+        let result: Result<&str> = executor
+            .execute(|| {
+                let a = attempts_clone.clone();
+                async move {
+                    a.fetch_add(1, Ordering::SeqCst);
+                    Err(SeerError::InvalidDomain("bad.".to_string()))
+                }
+            })
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(SeerError::RetryExhausted { attempts: 3, .. })
+        ));
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
     }
 
     #[test]

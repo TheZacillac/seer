@@ -1,16 +1,86 @@
 //! Shared atomic-save plumbing for the `~/.seer` data stores (history,
 //! watchlist, subdomain baselines).
 //!
-//! One envelope, three callers: create the parent dir owner-only, write the
-//! serialized content to a per-call-unique sibling temp file, restrict the
-//! temp file to owner-only, then `rename` over the target (atomic on POSIX,
-//! so a reader never sees a torn file). Extracted after the per-call-unique
-//! temp-name fix had to be applied to multiple hand-copied versions of this
-//! routine — the serializers stay with the callers, the envelope lives here.
+//! One envelope, three callers (each wired up by [`persisted_store!`]):
+//! create the parent dir owner-only, write the serialized content to a
+//! per-call-unique sibling temp file, restrict the temp file to owner-only,
+//! then `rename` over the target (atomic on POSIX, so a reader never sees a
+//! torn file). Extracted after the per-call-unique temp-name fix had to be
+//! applied to multiple hand-copied versions of this routine — each store
+//! picks its file and codec, the envelope lives here.
 
 use std::path::{Path, PathBuf};
 
 use crate::error::{Result, SeerError};
+
+/// Implements the `~/.seer/<file>` persistence methods — `path`, `load`,
+/// `load_from_path`, `save`, `save_to_path` — on a store type, as inherent
+/// methods so front ends need no trait import. The store must be
+/// `Default + Serialize + Deserialize`; the codec is `json` or `toml`:
+///
+/// ```text
+/// crate::fsutil::persisted_store!(LookupHistory, "history.json", json, "history");
+/// ```
+///
+/// `load` returns the default store when the file is missing or unreadable,
+/// moving an unreadable file to a backup first ([`load_or_back_up`]) so the
+/// next `save` cannot destroy the user's data. `save` publishes through
+/// [`write_atomic_owner_only`], so a crash mid-write can never leave the store
+/// truncated. The load → mutate → save cycle is *not* cross-process locked:
+/// two concurrent writers are last-writer-wins (one side's change can be
+/// lost, never corrupted). A cross-process advisory lock would close that
+/// window; it is omitted to avoid a new dependency for a low-frequency case.
+macro_rules! persisted_store {
+    ($store:ty, $file:literal, json, $what:literal) => {
+        $crate::fsutil::persisted_store!(@impl $store, $file, $what, serde_json, "json");
+    };
+    ($store:ty, $file:literal, toml, $what:literal) => {
+        $crate::fsutil::persisted_store!(@impl $store, $file, $what, toml, "toml");
+    };
+    (@impl $store:ty, $file:literal, $what:literal, $codec:ident, $ext:literal) => {
+        impl $store {
+            #[doc = concat!("Returns the path to the store file (`~/.seer/", $file, "`).")]
+            pub fn path() -> Option<std::path::PathBuf> {
+                std::env::home_dir().map(|h| h.join(".seer").join($file))
+            }
+
+            /// Loads the store from disk, returning an empty store when the file
+            /// is missing or unreadable (an unreadable file is backed up first).
+            pub fn load() -> Self {
+                match Self::path() {
+                    Some(path) => Self::load_from_path(&path),
+                    None => Self::default(),
+                }
+            }
+
+            /// [`Self::load`] from an explicit path — a test seam that avoids
+            /// touching the real `~/.seer`.
+            pub(crate) fn load_from_path(path: &std::path::Path) -> Self {
+                $crate::fsutil::load_or_back_up(path, $what, |content| {
+                    $codec::from_str(content).map_err(|e| e.to_string())
+                })
+            }
+
+            /// Persists the store atomically (temp file + rename, owner-only).
+            pub fn save(&self) -> $crate::error::Result<()> {
+                let path = Self::path().ok_or_else(|| {
+                    $crate::error::SeerError::ConfigError(
+                        "Cannot determine home directory".to_string(),
+                    )
+                })?;
+                self.save_to_path(&path)
+            }
+
+            /// [`Self::save`] to an explicit path (test seam, as `load_from_path`).
+            pub(crate) fn save_to_path(&self, path: &std::path::Path) -> $crate::error::Result<()> {
+                let content = $codec::to_string_pretty(self)
+                    .map_err(|e| $crate::error::SeerError::ConfigError(e.to_string()))?;
+                $crate::fsutil::write_atomic_owner_only(path, &content, $ext)
+            }
+        }
+    };
+}
+pub(crate) use persisted_store;
 
 /// Atomically publishes `content` at `path` with owner-only permissions.
 ///

@@ -1,3 +1,97 @@
+//! Output formatting for every seer-core result type.
+//!
+//! [`OutputFormatter`] has one `format_*` method per result type, implemented
+//! by the human (colored terminal), JSON, YAML and Markdown formatters. The
+//! method list is written once, in `with_report_methods!`, which generates the
+//! trait and all four impls.
+//! Callers pick one through [`get_formatter`] from an [`OutputFormat`], so the
+//! CLI, REPL, TUI raw view and clipboard copy all render identically. Human
+//! and Markdown output are pinned by `insta` snapshots in
+//! `seer-core/tests/format_snapshots.rs`.
+
+// The report-method list and the impl generators below must precede the
+// `mod` declarations: `macro_rules!` is textually scoped, and the human and
+// markdown modules invoke `impl_forwarding!` where their inherent methods
+// are visible.
+
+/// Calls `$mac!` with every report type a formatter renders, one
+/// `method(arg: Type);` row each. This list is the single source of truth for
+/// [`OutputFormatter`] and all four of its impls: adding a report type is one
+/// row here plus the human and markdown inherent methods of the same name.
+macro_rules! with_report_methods {
+    ($mac:ident!($($prefix:tt)*)) => {
+        $mac! {
+            $($prefix)*
+            format_whois(response: crate::whois::WhoisResponse);
+            format_rdap(response: crate::rdap::RdapResponse);
+            format_dns(records: [crate::dns::DnsRecord]);
+            format_propagation(result: crate::dns::PropagationResult);
+            format_lookup(result: crate::lookup::LookupResult);
+            format_status(response: crate::status::StatusResponse);
+            format_follow_iteration(iteration: crate::dns::FollowIteration);
+            format_follow(result: crate::dns::FollowResult);
+            format_availability(result: crate::availability::AvailabilityResult);
+            format_dnssec(report: crate::dns::DnssecReport);
+            format_delegation(report: crate::dns::DelegationReport);
+            format_tld(info: crate::tld::TldInfo);
+            format_dns_comparison(comparison: crate::dns::DnsComparison);
+            format_subdomains(result: crate::subdomains::SubdomainResult);
+            format_diff(diff: crate::diff::DomainDiff);
+            format_ssl(report: crate::ssl::SslReport);
+            format_watch(report: crate::watchlist::WatchReport);
+            format_domain_info(info: crate::domain_info::DomainInfo);
+            format_drift(report: crate::drift::DriftReport);
+            format_posture(posture: crate::posture::EmailPosture);
+            format_headers(report: crate::headers::HeaderReport);
+            format_takeover(report: crate::takeover::TakeoverReport);
+            format_caa(policy: crate::caa::CaaPolicy);
+            format_confusables(report: crate::confusables::ConfusableReport);
+            format_subdomain_classification(result: crate::subdomains::SubdomainClassification);
+            format_subdomain_baseline_diff(report: crate::subdomains::SubdomainBaselineDiff);
+        }
+    };
+}
+
+macro_rules! declare_output_formatter {
+    ($($method:ident($arg:ident: $ty:ty);)+) => {
+        /// Renders every report type in one output format; pick an
+        /// implementation with [`get_formatter`].
+        pub trait OutputFormatter {
+            $(fn $method(&self, $arg: &$ty) -> String;)+
+        }
+    };
+}
+
+/// Implements [`OutputFormatter`] for a data-format formatter by passing every
+/// report to one serializing method (`to_json`, `to_yaml_value`).
+macro_rules! impl_serializing {
+    ($formatter:ty, $render:ident; $($method:ident($arg:ident: $ty:ty);)+) => {
+        impl OutputFormatter for $formatter {
+            $(fn $method(&self, $arg: &$ty) -> String {
+                self.$render($arg)
+            })+
+        }
+    };
+}
+
+/// Implements [`OutputFormatter`] by forwarding each method to the inherent
+/// method of the same name, defined in the formatter's per-concern
+/// submodules. Rust resolves the inherent method first, so this does not
+/// recurse; it must be invoked where those inherent methods are visible.
+/// A missing inherent method would make the forwarder call itself, so
+/// `unconditional_recursion` is denied: a compile error, not a stack overflow.
+macro_rules! impl_forwarding {
+    ($formatter:ty; $($method:ident($arg:ident: $ty:ty);)+) => {
+        #[deny(unconditional_recursion)]
+        impl OutputFormatter for $formatter {
+            $(fn $method(&self, $arg: &$ty) -> String {
+                self.$method($arg)
+            })+
+        }
+    };
+}
+
+mod contact;
 mod grouping;
 mod human;
 mod json;
@@ -44,42 +138,10 @@ impl std::str::FromStr for OutputFormat {
     }
 }
 
-pub trait OutputFormatter {
-    fn format_whois(&self, response: &crate::whois::WhoisResponse) -> String;
-    fn format_rdap(&self, response: &crate::rdap::RdapResponse) -> String;
-    fn format_dns(&self, records: &[crate::dns::DnsRecord]) -> String;
-    fn format_propagation(&self, result: &crate::dns::PropagationResult) -> String;
-    fn format_lookup(&self, result: &crate::lookup::LookupResult) -> String;
-    fn format_status(&self, response: &crate::status::StatusResponse) -> String;
-    fn format_follow_iteration(&self, iteration: &crate::dns::FollowIteration) -> String;
-    fn format_follow(&self, result: &crate::dns::FollowResult) -> String;
-    fn format_availability(&self, result: &crate::availability::AvailabilityResult) -> String;
-    fn format_dnssec(&self, report: &crate::dns::DnssecReport) -> String;
-    fn format_delegation(&self, report: &crate::dns::DelegationReport) -> String;
-    fn format_tld(&self, info: &crate::tld::TldInfo) -> String;
-    fn format_dns_comparison(&self, comparison: &crate::dns::DnsComparison) -> String;
-    fn format_subdomains(&self, result: &crate::subdomains::SubdomainResult) -> String;
-    fn format_diff(&self, diff: &crate::diff::DomainDiff) -> String;
-    fn format_ssl(&self, report: &crate::ssl::SslReport) -> String;
-    fn format_watch(&self, report: &crate::watchlist::WatchReport) -> String;
-    fn format_domain_info(&self, info: &crate::domain_info::DomainInfo) -> String;
-    fn format_drift(&self, report: &crate::drift::DriftReport) -> String;
-    fn format_posture(&self, posture: &crate::posture::EmailPosture) -> String;
-    fn format_headers(&self, report: &crate::headers::HeaderReport) -> String;
-    fn format_takeover(&self, report: &crate::takeover::TakeoverReport) -> String;
-    fn format_caa(&self, policy: &crate::caa::CaaPolicy) -> String;
-    fn format_confusables(&self, report: &crate::confusables::ConfusableReport) -> String;
-    fn format_subdomain_classification(
-        &self,
-        result: &crate::subdomains::SubdomainClassification,
-    ) -> String;
-    fn format_subdomain_baseline_diff(
-        &self,
-        report: &crate::subdomains::SubdomainBaselineDiff,
-    ) -> String;
-}
+with_report_methods!(declare_output_formatter!());
 
 /// YAML output formatter that converts data structures to YAML format.
+#[derive(Default)]
 pub struct YamlFormatter;
 
 impl YamlFormatter {
@@ -97,98 +159,7 @@ impl YamlFormatter {
     }
 }
 
-impl Default for YamlFormatter {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl OutputFormatter for YamlFormatter {
-    fn format_whois(&self, response: &crate::whois::WhoisResponse) -> String {
-        self.to_yaml_value(response)
-    }
-    fn format_rdap(&self, response: &crate::rdap::RdapResponse) -> String {
-        self.to_yaml_value(response)
-    }
-    fn format_dns(&self, records: &[crate::dns::DnsRecord]) -> String {
-        self.to_yaml_value(records)
-    }
-    fn format_propagation(&self, result: &crate::dns::PropagationResult) -> String {
-        self.to_yaml_value(result)
-    }
-    fn format_lookup(&self, result: &crate::lookup::LookupResult) -> String {
-        self.to_yaml_value(result)
-    }
-    fn format_status(&self, response: &crate::status::StatusResponse) -> String {
-        self.to_yaml_value(response)
-    }
-    fn format_follow_iteration(&self, iteration: &crate::dns::FollowIteration) -> String {
-        self.to_yaml_value(iteration)
-    }
-    fn format_follow(&self, result: &crate::dns::FollowResult) -> String {
-        self.to_yaml_value(result)
-    }
-    fn format_availability(&self, result: &crate::availability::AvailabilityResult) -> String {
-        self.to_yaml_value(result)
-    }
-    fn format_dnssec(&self, report: &crate::dns::DnssecReport) -> String {
-        self.to_yaml_value(report)
-    }
-    fn format_delegation(&self, report: &crate::dns::DelegationReport) -> String {
-        self.to_yaml_value(report)
-    }
-    fn format_tld(&self, info: &crate::tld::TldInfo) -> String {
-        self.to_yaml_value(info)
-    }
-    fn format_dns_comparison(&self, comparison: &crate::dns::DnsComparison) -> String {
-        self.to_yaml_value(comparison)
-    }
-    fn format_subdomains(&self, result: &crate::subdomains::SubdomainResult) -> String {
-        self.to_yaml_value(result)
-    }
-    fn format_diff(&self, diff: &crate::diff::DomainDiff) -> String {
-        self.to_yaml_value(diff)
-    }
-    fn format_ssl(&self, report: &crate::ssl::SslReport) -> String {
-        self.to_yaml_value(report)
-    }
-    fn format_watch(&self, report: &crate::watchlist::WatchReport) -> String {
-        self.to_yaml_value(report)
-    }
-    fn format_domain_info(&self, info: &crate::domain_info::DomainInfo) -> String {
-        self.to_yaml_value(info)
-    }
-    fn format_drift(&self, report: &crate::drift::DriftReport) -> String {
-        self.to_yaml_value(report)
-    }
-    fn format_posture(&self, posture: &crate::posture::EmailPosture) -> String {
-        self.to_yaml_value(posture)
-    }
-    fn format_headers(&self, report: &crate::headers::HeaderReport) -> String {
-        self.to_yaml_value(report)
-    }
-    fn format_takeover(&self, report: &crate::takeover::TakeoverReport) -> String {
-        self.to_yaml_value(report)
-    }
-    fn format_caa(&self, policy: &crate::caa::CaaPolicy) -> String {
-        self.to_yaml_value(policy)
-    }
-    fn format_confusables(&self, report: &crate::confusables::ConfusableReport) -> String {
-        self.to_yaml_value(report)
-    }
-    fn format_subdomain_classification(
-        &self,
-        result: &crate::subdomains::SubdomainClassification,
-    ) -> String {
-        self.to_yaml_value(result)
-    }
-    fn format_subdomain_baseline_diff(
-        &self,
-        report: &crate::subdomains::SubdomainBaselineDiff,
-    ) -> String {
-        self.to_yaml_value(report)
-    }
-}
+with_report_methods!(impl_serializing!(YamlFormatter, to_yaml_value;));
 
 /// Returns true when a string cannot be emitted as a YAML *plain* scalar and
 /// must be double-quoted. Covers the cases the old `contains('\n'|':'|'#')`

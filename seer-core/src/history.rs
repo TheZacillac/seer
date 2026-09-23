@@ -4,12 +4,10 @@
 //! per domain to prevent unbounded growth.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::error::{Result, SeerError};
 use crate::lookup::LookupResult;
 
 /// A single cached lookup entry with timestamp.
@@ -40,67 +38,9 @@ const MAX_DOMAINS: usize = 1000;
 /// cost under long-lived use. (issue #59)
 const MAX_ENTRY_AGE_DAYS: i64 = 365;
 
+crate::fsutil::persisted_store!(LookupHistory, "history.json", json, "history");
+
 impl LookupHistory {
-    /// Returns the path to the history file (`~/.seer/history.json`).
-    pub fn path() -> Option<PathBuf> {
-        dirs::home_dir().map(|h| h.join(".seer").join("history.json"))
-    }
-
-    /// Loads history from disk, returning an empty history on any failure.
-    ///
-    /// When the file exists but fails to parse, it is renamed to
-    /// `<path>.corrupt` (preserving the user's data for recovery/forensics)
-    /// and a warning is logged — previously the file was silently
-    /// overwritten on the next save, dropping the user's history.
-    pub fn load() -> Self {
-        let Some(path) = Self::path() else {
-            return Self::default();
-        };
-        Self::load_from_path(&path)
-    }
-
-    /// Like [`Self::load`] but reads from an explicit path. Split out so
-    /// tests can exercise the corrupt-file handling without depending on
-    /// the real `~/.seer/history.json` location.
-    pub(crate) fn load_from_path(path: &std::path::Path) -> Self {
-        crate::fsutil::load_or_back_up(path, "history", |content| {
-            serde_json::from_str::<LookupHistory>(content).map_err(|e| e.to_string())
-        })
-    }
-
-    /// Persists history to disk via a write-and-rename so a kill mid-write
-    /// can't leave the file truncated. `std::fs::write` is open(O_TRUNC)
-    /// followed by write — if the process dies between the two, the next
-    /// `load()` finds an empty/partial file, the corrupt-file branch fires,
-    /// and the user's history is silently moved to `.corrupt`. Writing to
-    /// a sibling temp file and `rename`-ing over the target is atomic on
-    /// POSIX and survives that crash.
-    ///
-    /// # Concurrency
-    ///
-    /// The save itself is atomic (temp + rename) so a reader never sees a
-    /// torn file. However the load → mutate → save cycle is **not** guarded by
-    /// a cross-process lock: if two `seer` processes load, each appends, and
-    /// each saves, the later `rename` wins and the earlier process's new entry
-    /// is lost (last-writer-wins). This is data loss of at most a single
-    /// concurrent entry — never corruption — and is bounded further by the
-    /// growth caps above. A future cross-process advisory lock (or an
-    /// append-only log) would close the remaining window; it is intentionally
-    /// omitted here to avoid a new dependency for a low-frequency edge case.
-    pub fn save(&self) -> Result<()> {
-        let path = Self::path()
-            .ok_or_else(|| SeerError::ConfigError("Cannot determine home directory".to_string()))?;
-        self.save_to_path(&path)
-    }
-
-    /// Like [`Self::save`] but writes to an explicit path. Split out so tests
-    /// can exercise the atomic-save path without touching `~/.seer`.
-    pub(crate) fn save_to_path(&self, path: &std::path::Path) -> Result<()> {
-        let content = serde_json::to_string_pretty(self)
-            .map_err(|e| SeerError::ConfigError(e.to_string()))?;
-        crate::fsutil::write_atomic_owner_only(path, &content, "json")
-    }
-
     /// Records a lookup result for the given domain, trimming old entries if needed.
     pub fn record(&mut self, domain: &str, result: LookupResult) {
         let key = history_key(domain);
@@ -175,16 +115,11 @@ fn history_key(domain: &str) -> String {
 mod tests {
     use super::*;
     use crate::availability::AvailabilityResult;
+    use std::path::PathBuf;
 
     fn make_lookup_result(domain: &str) -> LookupResult {
         LookupResult::Available {
-            data: Box::new(AvailabilityResult {
-                domain: domain.to_string(),
-                available: true,
-                confidence: "high".to_string(),
-                method: "test".to_string(),
-                details: None,
-            }),
+            data: Box::new(AvailabilityResult::new(domain, true, "high", "test")),
             rdap_error: "test".to_string(),
             whois_error: "test".to_string(),
             whois_data: None,

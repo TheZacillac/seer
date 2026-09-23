@@ -7,16 +7,9 @@ ValueError (seer-core's ``normalize_domain`` rejects it before any network
 I/O).
 """
 
-import os
-
 import pytest
 
 import seer
-
-_LIVE = pytest.mark.skipif(
-    os.environ.get("SEER_LIVE_TESTS") != "1",
-    reason="live network test; set SEER_LIVE_TESTS=1 to enable",
-)
 
 
 def test_headers_is_exported():
@@ -32,7 +25,7 @@ def test_headers_invalid_domain_raises_value_error(bad):
         seer.headers(bad)
 
 
-@_LIVE
+@pytest.mark.live
 def test_headers_live_report_shape():
     report = seer.headers("example.com")
     assert report["domain"] == "example.com"

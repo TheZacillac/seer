@@ -7,23 +7,18 @@ use ratatui::Frame;
 
 use crate::tui::action::LensData;
 use crate::tui::theme::Theme;
-use crate::tui::widgets::{kv, panel};
+use crate::tui::widgets::{kv, or_dash, panel};
 
 pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
     let LensData::Status(s) = data else { return };
-    let block = panel::block(theme, "HTTP Health", theme.green, false);
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let inner = panel::render(f, area, theme, "HTTP Health", theme.green, false);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(2), Constraint::Min(0)])
         .split(inner);
 
-    let code = s
-        .http_status
-        .map(|c| c.to_string())
-        .unwrap_or_else(|| "—".into());
+    let code = or_dash(s.http_status);
     let text = s.http_status_text.clone().unwrap_or_default();
     f.render_widget(
         Paragraph::new(Line::from(vec![
@@ -38,27 +33,17 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
         chunks[0],
     );
 
-    let mut rows: Vec<(String, String)> = Vec::new();
-    rows.push((
-        "title".into(),
-        s.title.clone().unwrap_or_else(|| "—".into()),
-    ));
+    let mut rows = vec![("title", or_dash(s.title.as_deref()))];
     if let Some(c) = &s.certificate {
-        rows.push(("ssl issuer".into(), c.issuer.clone()));
-        rows.push(("ssl valid".into(), format!("{}d", c.days_until_expiry)));
+        rows.push(("ssl issuer", c.issuer.clone()));
+        rows.push(("ssl valid", format!("{}d", c.days_until_expiry)));
     }
     if let Some(e) = &s.domain_expiration {
-        rows.push(("expires in".into(), format!("{}d", e.days_until_expiry)));
+        rows.push(("expires in", format!("{}d", e.days_until_expiry)));
     }
     if let Some(dns) = &s.dns_resolution {
-        rows.push((
-            "resolves".into(),
-            if dns.resolves {
-                "yes".into()
-            } else {
-                "no".into()
-            },
-        ));
+        let resolves = if dns.resolves { "yes" } else { "no" };
+        rows.push(("resolves", resolves.to_string()));
     }
     kv::render(f, chunks[1], theme, theme.green, &rows);
 }
@@ -66,20 +51,8 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::backend::TestBackend;
-    use ratatui::Terminal;
+    use crate::tui::test_util::render_text;
     use seer_core::StatusResponse;
-
-    fn buf_text(buf: &ratatui::buffer::Buffer) -> String {
-        let a = buf.area();
-        let mut s = String::new();
-        for y in 0..a.height {
-            for x in 0..a.width {
-                s.push_str(buf[(x, y)].symbol());
-            }
-        }
-        s
-    }
 
     #[test]
     fn renders_http_code() {
@@ -88,11 +61,7 @@ mod tests {
         sr.http_status = Some(200);
         sr.http_status_text = Some("OK".into());
         let data = LensData::Status(Box::new(sr));
-        let backend = TestBackend::new(60, 8);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| render(f, f.area(), &theme, &data))
-            .unwrap();
-        assert!(buf_text(terminal.backend().buffer()).contains("200"));
+        let text = render_text(60, 8, |f| render(f, f.area(), &theme, &data));
+        assert!(text.contains("200"));
     }
 }

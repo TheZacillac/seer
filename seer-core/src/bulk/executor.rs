@@ -268,16 +268,6 @@ impl BulkExecutor {
                 let progress = progress.as_ref();
                 let on_result = on_result.as_ref();
                 let limiter = limiter.clone();
-                let whois_client = &self.whois_client;
-                let rdap_client = &self.rdap_client;
-                let dns_resolver = &self.dns_resolver;
-                let propagation_checker = &self.propagation_checker;
-                let smart_lookup = &self.smart_lookup;
-                let status_client = &self.status_client;
-                let availability_checker = &self.availability_checker;
-                let ssl_checker = &self.ssl_checker;
-                let nameserver = self.nameserver.as_deref();
-                let confusables_concurrency = self.concurrency;
 
                 async move {
                     // Rate-limited dispatch: claim our slot quickly under the
@@ -288,22 +278,7 @@ impl BulkExecutor {
                     }
 
                     let start = std::time::Instant::now();
-                    let result = execute_operation(
-                        &op,
-                        &Clients {
-                            whois: whois_client,
-                            rdap: rdap_client,
-                            dns: dns_resolver,
-                            propagation: propagation_checker,
-                            lookup: smart_lookup,
-                            status: status_client,
-                            avail: availability_checker,
-                            ssl: ssl_checker,
-                            nameserver,
-                            confusables_concurrency,
-                        },
-                    )
-                    .await;
+                    let result = self.run_op(&op).await;
                     let duration_ms = start.elapsed().as_millis() as u64;
 
                     let count = completed.fetch_add(1, Ordering::Relaxed) + 1;
@@ -363,116 +338,110 @@ impl BulkExecutor {
         results
     }
 
-    pub async fn execute_whois(&self, domains: Vec<String>) -> Vec<BulkResult> {
-        let operations = domains
-            .into_iter()
-            .map(|domain| BulkOperation::Whois { domain })
-            .collect();
-        self.execute(operations, None).await
-    }
-
-    pub async fn execute_rdap(&self, domains: Vec<String>) -> Vec<BulkResult> {
-        let operations = domains
-            .into_iter()
-            .map(|domain| BulkOperation::Rdap { domain })
-            .collect();
-        self.execute(operations, None).await
-    }
-
-    pub async fn execute_dns(
-        &self,
-        domains: Vec<String>,
-        record_type: RecordType,
-    ) -> Vec<BulkResult> {
-        let operations = domains
-            .into_iter()
-            .map(|domain| BulkOperation::Dns {
+    /// Dispatches one operation to the matching sub-client.
+    async fn run_op(&self, op: &BulkOperation) -> Result<BulkResultData> {
+        match op {
+            BulkOperation::Whois { domain } => {
+                let result = self.whois_client.lookup(domain).await?;
+                Ok(BulkResultData::Whois(result))
+            }
+            BulkOperation::Rdap { domain } => {
+                let result = self.rdap_client.lookup_domain(domain).await?;
+                Ok(BulkResultData::Rdap(Box::new(result)))
+            }
+            BulkOperation::Dns {
                 domain,
                 record_type,
-            })
-            .collect();
-        self.execute(operations, None).await
-    }
-
-    pub async fn execute_propagation(
-        &self,
-        domains: Vec<String>,
-        record_type: RecordType,
-    ) -> Vec<BulkResult> {
-        let operations = domains
-            .into_iter()
-            .map(|domain| BulkOperation::Propagation {
+            } => {
+                let result = self
+                    .dns_resolver
+                    .resolve(domain, *record_type, self.nameserver.as_deref())
+                    .await?;
+                Ok(BulkResultData::Dns(result))
+            }
+            BulkOperation::Propagation {
                 domain,
                 record_type,
-            })
-            .collect();
-        self.execute(operations, None).await
+            } => {
+                let result = self.propagation_checker.check(domain, *record_type).await?;
+                Ok(BulkResultData::Propagation(result))
+            }
+            BulkOperation::Lookup { domain } => {
+                let result = self.smart_lookup.lookup(domain).await?;
+                Ok(BulkResultData::Lookup(result))
+            }
+            BulkOperation::Status { domain } => {
+                let result = self.status_client.check(domain).await?;
+                Ok(BulkResultData::Status(result))
+            }
+            BulkOperation::Avail { domain } => {
+                let result = self.availability_checker.check(domain).await?;
+                Ok(BulkResultData::Avail(result))
+            }
+            BulkOperation::Info { domain } => {
+                let result = self.smart_lookup.lookup(domain).await?;
+                Ok(BulkResultData::Info(
+                    crate::domain_info::DomainInfo::from_lookup_result(&result),
+                ))
+            }
+            BulkOperation::Ssl { domain } => {
+                let result = self.ssl_checker.check(domain).await?;
+                Ok(BulkResultData::Ssl(result))
+            }
+            BulkOperation::Posture { domain } => {
+                let result =
+                    crate::posture::lookup_email_posture(&self.dns_resolver, domain).await?;
+                Ok(BulkResultData::Posture(result))
+            }
+            BulkOperation::Confusables { domain } => {
+                // The per-domain candidate fan-out mirrors the executor's own
+                // concurrency, as the single-domain CLI command uses
+                // `bulk.concurrency`.
+                let result = crate::confusables::find_confusables(
+                    &self.smart_lookup,
+                    domain,
+                    self.concurrency,
+                )
+                .await?;
+                Ok(BulkResultData::Confusables(result))
+            }
+            BulkOperation::Caa { domain } => {
+                // lookup_caa itself never fails (CAA is advisory; resolver errors
+                // yield an empty policy) but expects a normalized domain — the
+                // same normalize-then-query shape the CLI's single-domain command
+                // uses, so an invalid domain still surfaces as a per-row error.
+                let domain = crate::validation::normalize_domain(domain)?;
+                let policy = crate::caa::lookup_caa(&self.dns_resolver, &domain).await;
+                Ok(BulkResultData::Caa(policy))
+            }
+        }
     }
 
-    pub async fn execute_lookup(&self, domains: Vec<String>) -> Vec<BulkResult> {
-        let operations = domains
-            .into_iter()
-            .map(|domain| BulkOperation::Lookup { domain })
-            .collect();
-        self.execute(operations, None).await
-    }
-
-    pub async fn execute_status(&self, domains: Vec<String>) -> Vec<BulkResult> {
-        let operations = domains
-            .into_iter()
-            .map(|domain| BulkOperation::Status { domain })
-            .collect();
-        self.execute(operations, None).await
-    }
-
-    pub async fn execute_avail(&self, domains: Vec<String>) -> Vec<BulkResult> {
-        let operations = domains
-            .into_iter()
-            .map(|domain| BulkOperation::Avail { domain })
-            .collect();
-        self.execute(operations, None).await
-    }
-
-    pub async fn execute_info(&self, domains: Vec<String>) -> Vec<BulkResult> {
-        let operations = domains
-            .into_iter()
-            .map(|domain| BulkOperation::Info { domain })
-            .collect();
-        self.execute(operations, None).await
-    }
-
-    pub async fn execute_ssl(&self, domains: Vec<String>) -> Vec<BulkResult> {
-        let operations = domains
-            .into_iter()
-            .map(|domain| BulkOperation::Ssl { domain })
-            .collect();
-        self.execute(operations, None).await
-    }
-
-    pub async fn execute_posture(&self, domains: Vec<String>) -> Vec<BulkResult> {
-        let operations = domains
-            .into_iter()
-            .map(|domain| BulkOperation::Posture { domain })
-            .collect();
-        self.execute(operations, None).await
-    }
-
-    /// Bulk look-alike scan. See [`BulkOperation::Confusables`] for the cost
-    /// caveat — each domain fans out its own candidate scan.
-    pub async fn execute_confusables(&self, domains: Vec<String>) -> Vec<BulkResult> {
-        let operations = domains
-            .into_iter()
-            .map(|domain| BulkOperation::Confusables { domain })
-            .collect();
-        self.execute(operations, None).await
-    }
-
-    pub async fn execute_caa(&self, domains: Vec<String>) -> Vec<BulkResult> {
-        let operations = domains
-            .into_iter()
-            .map(|domain| BulkOperation::Caa { domain })
-            .collect();
-        self.execute(operations, None).await
+    /// Runs one operation per domain, built by `op` — shorthand for mapping a
+    /// domain list into [`BulkOperation`]s and calling
+    /// [`execute`](Self::execute) without a progress callback:
+    ///
+    /// ```no_run
+    /// # async fn demo(executor: &seer_core::bulk::BulkExecutor) {
+    /// use seer_core::bulk::BulkOperation;
+    /// use seer_core::dns::RecordType;
+    ///
+    /// let domains = vec!["example.com".to_string()];
+    /// let results = executor
+    ///     .execute_each(domains, |domain| BulkOperation::Dns {
+    ///         domain,
+    ///         record_type: RecordType::MX,
+    ///     })
+    ///     .await;
+    /// # }
+    /// ```
+    pub async fn execute_each(
+        &self,
+        domains: Vec<String>,
+        op: impl FnMut(String) -> BulkOperation,
+    ) -> Vec<BulkResult> {
+        self.execute(domains.into_iter().map(op).collect(), None)
+            .await
     }
 }
 
@@ -529,97 +498,6 @@ impl SlotLimiter {
             slot
         };
         sleep_until(my_slot).await;
-    }
-}
-
-struct Clients<'a> {
-    whois: &'a WhoisClient,
-    rdap: &'a RdapClient,
-    dns: &'a DnsResolver,
-    propagation: &'a PropagationChecker,
-    lookup: &'a SmartLookup,
-    status: &'a StatusClient,
-    avail: &'a AvailabilityChecker,
-    ssl: &'a SslChecker,
-    /// Configured upstream nameserver for plain DNS operations.
-    nameserver: Option<&'a str>,
-    /// Per-domain fan-out width for the confusables candidate scan
-    /// (mirrors the executor's own concurrency, like the CLI's single-domain
-    /// command uses `bulk.concurrency`).
-    confusables_concurrency: usize,
-}
-
-async fn execute_operation(op: &BulkOperation, clients: &Clients<'_>) -> Result<BulkResultData> {
-    match op {
-        BulkOperation::Whois { domain } => {
-            let result = clients.whois.lookup(domain).await?;
-            Ok(BulkResultData::Whois(result))
-        }
-        BulkOperation::Rdap { domain } => {
-            let result = clients.rdap.lookup_domain(domain).await?;
-            Ok(BulkResultData::Rdap(Box::new(result)))
-        }
-        BulkOperation::Dns {
-            domain,
-            record_type,
-        } => {
-            let result = clients
-                .dns
-                .resolve(domain, *record_type, clients.nameserver)
-                .await?;
-            Ok(BulkResultData::Dns(result))
-        }
-        BulkOperation::Propagation {
-            domain,
-            record_type,
-        } => {
-            let result = clients.propagation.check(domain, *record_type).await?;
-            Ok(BulkResultData::Propagation(result))
-        }
-        BulkOperation::Lookup { domain } => {
-            let result = clients.lookup.lookup(domain).await?;
-            Ok(BulkResultData::Lookup(result))
-        }
-        BulkOperation::Status { domain } => {
-            let result = clients.status.check(domain).await?;
-            Ok(BulkResultData::Status(result))
-        }
-        BulkOperation::Avail { domain } => {
-            let result = clients.avail.check(domain).await?;
-            Ok(BulkResultData::Avail(result))
-        }
-        BulkOperation::Info { domain } => {
-            let result = clients.lookup.lookup(domain).await?;
-            Ok(BulkResultData::Info(
-                crate::domain_info::DomainInfo::from_lookup_result(&result),
-            ))
-        }
-        BulkOperation::Ssl { domain } => {
-            let result = clients.ssl.check(domain).await?;
-            Ok(BulkResultData::Ssl(result))
-        }
-        BulkOperation::Posture { domain } => {
-            let result = crate::posture::lookup_email_posture(clients.dns, domain).await?;
-            Ok(BulkResultData::Posture(result))
-        }
-        BulkOperation::Confusables { domain } => {
-            let result = crate::confusables::find_confusables(
-                clients.lookup,
-                domain,
-                clients.confusables_concurrency,
-            )
-            .await?;
-            Ok(BulkResultData::Confusables(result))
-        }
-        BulkOperation::Caa { domain } => {
-            // lookup_caa itself never fails (CAA is advisory; resolver errors
-            // yield an empty policy) but expects a normalized domain — the
-            // same normalize-then-query shape the CLI's single-domain command
-            // uses, so an invalid domain still surfaces as a per-row error.
-            let domain = crate::validation::normalize_domain(domain)?;
-            let policy = crate::caa::lookup_caa(clients.dns, &domain).await;
-            Ok(BulkResultData::Caa(policy))
-        }
     }
 }
 
@@ -861,16 +739,14 @@ csv,format,example.org
     #[tokio::test]
     async fn new_bulk_arms_fail_cleanly_on_invalid_domain() {
         let executor = BulkExecutor::new().with_rate_limit(Duration::ZERO);
-        let bad = "not a domain".to_string();
+        let bad = || "not a domain".to_string();
 
-        for (name, results) in [
-            ("posture", executor.execute_posture(vec![bad.clone()]).await),
-            (
-                "confusables",
-                executor.execute_confusables(vec![bad.clone()]).await,
-            ),
-            ("caa", executor.execute_caa(vec![bad.clone()]).await),
+        for (name, op) in [
+            ("posture", BulkOperation::Posture { domain: bad() }),
+            ("confusables", BulkOperation::Confusables { domain: bad() }),
+            ("caa", BulkOperation::Caa { domain: bad() }),
         ] {
+            let results = executor.execute(vec![op], None).await;
             assert_eq!(results.len(), 1, "{name}: expected one result");
             let r = &results[0];
             assert!(!r.success, "{name}: expected failure for invalid domain");
@@ -988,7 +864,9 @@ csv,format,example.org
         // the IETF-reserved `.invalid` TLD so this is hermetic.
         let executor = BulkExecutor::new().with_rate_limit(Duration::ZERO);
         let results = executor
-            .execute_ssl(vec!["seer-bulk-ssl-test.invalid".to_string()])
+            .execute_each(vec!["seer-bulk-ssl-test.invalid".to_string()], |domain| {
+                BulkOperation::Ssl { domain }
+            })
             .await;
         assert_eq!(results.len(), 1);
         let r = &results[0];
@@ -1040,7 +918,9 @@ csv,format,example.org
     async fn execute_ssl_live_cloudflare_has_non_empty_chain() {
         let executor = BulkExecutor::new();
         let results = executor
-            .execute_ssl(vec!["cloudflare.com".to_string()])
+            .execute_each(vec!["cloudflare.com".to_string()], |domain| {
+                BulkOperation::Ssl { domain }
+            })
             .await;
         assert_eq!(results.len(), 1);
         let r = &results[0];
