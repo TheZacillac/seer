@@ -66,8 +66,9 @@ updates:
         patterns: ["*"]
         update-types: ["minor", "patch"]
 
-  # seer-py (PyO3 bindings): uv-managed dev environment (uv.lock).
-  - package-ecosystem: "uv"
+  # seer-py (PyO3 bindings): PEP 621 pyproject.toml (dev extra + maturin
+  # build requirement). No lockfile — CI installs './seer-py[dev]' with pip.
+  - package-ecosystem: "pip"
     directory: "/seer-py"
     schedule:
       interval: "weekly"
