@@ -575,7 +575,9 @@ seer-mcp                                   # MCP server on stdio
 - **Own types in public APIs.** Convert hickory/reqwest/x509 types into
   seer-core structs before returning them.
 - **Document public APIs** with `///` and keep each module's `//!` overview
-  current.
+  current. An intra-doc link resolves only if the item is visible from where
+  the link is written, in a non-test build: name a `#[cfg(test)]` helper or
+  another module's private item in plain backticks instead of linking it.
 - **No hacks or workarounds.** Fix the root cause; if something can only be
   done fragilely, stop and raise it.
 - **Naming:** standard Rust (PascalCase types, snake_case functions and
@@ -658,15 +660,17 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 RUSTDOCFLAGS="-D warnings" cargo doc -p seer-core --no-deps   # when docs change
+RUSTDOCFLAGS="-D warnings" cargo doc -p seer-core --no-deps --document-private-items
 cargo deny check                          # when dependencies change
 cd seer-py && maturin develop && pytest   # when the bindings change
 cd seer-api && pytest                     # when the API changes
 ```
 
 CI runs fmt, clippy on all targets (plus `seer-core --features otel` and
-`seer-core --no-default-features`), a rustdoc gate on seer-core's public docs
+`seer-core --no-default-features`), a rustdoc gate on seer-core's docs
 (`RUSTDOCFLAGS="-D warnings" cargo doc -p seer-core --no-deps`, with and
-without `cli`: public docs must not link private items), tests
+without `cli`: public docs must not link private items; plus a
+`--document-private-items` build so private items' links resolve too), tests
 on 3 OSes, an MSRV `cargo check --locked`, informational llvm-cov coverage, a
 cargo-deny supply-chain gate (`deny` job via EmbarkStudios/cargo-deny-action,
 policy in root `deny.toml`: RUSTSEC advisories, explicit license allow-list,

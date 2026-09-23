@@ -33,7 +33,7 @@ pub struct CaaRecord {
 
 impl CaaRecord {
     /// The lowercased CA-domain part of an `issue`/`issuewild` value — RFC 8659
-    /// §4.2 values are "<CA domain> [; <parameters>]". Empty for a bare `";"`,
+    /// §4.2 values are `<CA domain> [; <parameters>]`. Empty for a bare `";"`,
     /// which means "forbid all".
     fn ca_domain(&self) -> String {
         self.value

@@ -46,7 +46,7 @@ const DEFAULT_INFLIGHT_WAIT: Duration = Duration::from_secs(30);
 static LOOKUP_CACHE: LazyLock<TtlCache<String, LookupResult>> =
     LazyLock::new(|| TtlCache::new(LOOKUP_CACHE_TTL));
 
-/// In-flight lookup coalescing map: normalized-domain -> Weak<Notify>.
+/// In-flight lookup coalescing map: normalized-domain -> `Weak<Notify>`.
 /// Only one network race runs per unique domain at a time; concurrent callers
 /// wait on the shared Notify and then read the result from LOOKUP_CACHE.
 static LOOKUP_INFLIGHT: LazyLock<Mutex<HashMap<String, Weak<Notify>>>> =
@@ -223,7 +223,7 @@ enum ThinFallback {
 }
 
 /// Pure decision for the thin-WHOIS fallback block. Encodes the same issue-#45
-/// precedence as [`crate::availability::decide_fallback`] so the smart-lookup
+/// precedence as `availability::decide_fallback` so the smart-lookup
 /// hot path and the dedicated availability path cannot diverge: a registry that
 /// *refused/throttled* the query (rather than authoritatively answering) is
 /// inconclusive and must NOT be inverted into "available" or fail-safed to
