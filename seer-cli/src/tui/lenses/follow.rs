@@ -8,7 +8,7 @@ use ratatui::Frame;
 use crate::tui::app::SPIN;
 use crate::tui::panes::FollowState;
 use crate::tui::theme::Theme;
-use crate::tui::widgets::{dot, gauge, panel};
+use crate::tui::widgets::{dot, gauge, or_dash, panel};
 
 pub fn render(f: &mut Frame, area: Rect, theme: &Theme, follow: &FollowState, spin: usize) {
     let rows = Layout::default()
@@ -91,11 +91,7 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, follow: &FollowState, sp
                 dot::line(theme, "fail", "ERROR"),
             )
         } else {
-            let a = it
-                .records
-                .first()
-                .map(|r| r.format_short())
-                .unwrap_or_else(|| "—".into());
+            let a = or_dash(it.records.first().map(|r| r.format_short()));
             let d = if it.changed {
                 dot::line(theme, "warn", "CHANGED")
             } else {

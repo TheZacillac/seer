@@ -57,12 +57,12 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
     );
 
     // KV summary
-    let rows: Vec<(String, String)> = vec![
-        ("enabled".into(), r.enabled.to_string()),
-        ("status".into(), r.status.clone()),
-        ("chain valid".into(), r.chain_valid.to_string()),
-        ("DS records".into(), r.ds_records.len().to_string()),
-        ("DNSKEY records".into(), r.dnskey_records.len().to_string()),
+    let rows = [
+        ("enabled", r.enabled.to_string()),
+        ("status", r.status.clone()),
+        ("chain valid", r.chain_valid.to_string()),
+        ("DS records", r.ds_records.len().to_string()),
+        ("DNSKEY records", r.dnskey_records.len().to_string()),
     ];
     kv::render(f, chunks[1], theme, status_color, &rows);
 

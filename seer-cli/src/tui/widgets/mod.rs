@@ -9,6 +9,11 @@ use ratatui::widgets::TableState;
 
 use crate::tui::theme::Theme;
 
+/// `value` as text, or an em dash (the TUI's missing-value mark) when absent.
+pub fn or_dash<T: ToString>(value: Option<T>) -> String {
+    value.map_or_else(|| "—".to_string(), |v| v.to_string())
+}
+
 /// Style for one row of a selectable list: body text, on the `surface0`
 /// selection band when `selected`.
 ///

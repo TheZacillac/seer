@@ -7,7 +7,7 @@ use ratatui::Frame;
 
 use crate::tui::action::LensData;
 use crate::tui::theme::Theme;
-use crate::tui::widgets::{kv, panel};
+use crate::tui::widgets::{kv, or_dash, panel};
 
 pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
     let LensData::Avail(a) = data else {
@@ -37,15 +37,12 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
         chunks[0],
     );
 
-    let rows: Vec<(String, String)> = vec![
-        ("domain".into(), a.domain.clone()),
-        ("available".into(), a.available.to_string()),
-        ("confidence".into(), a.confidence.clone()),
-        ("method".into(), a.method.clone()),
-        (
-            "details".into(),
-            a.details.clone().unwrap_or_else(|| "—".to_string()),
-        ),
+    let rows = [
+        ("domain", a.domain.clone()),
+        ("available", a.available.to_string()),
+        ("confidence", a.confidence.clone()),
+        ("method", a.method.clone()),
+        ("details", or_dash(a.details.as_deref())),
     ];
     kv::render(f, chunks[1], theme, theme.peach, &rows);
 }

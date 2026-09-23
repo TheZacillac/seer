@@ -13,7 +13,7 @@ pub fn render(
     area: Rect,
     theme: &Theme,
     key_color: ratatui::style::Color,
-    rows: &[(String, String)],
+    rows: &[(&str, String)],
 ) {
     let width = area.width as usize;
     let lines: Vec<Line> = rows
@@ -22,12 +22,12 @@ pub fn render(
             let used = k.chars().count() + v.chars().count() + 2;
             let dots = width.saturating_sub(used).max(1);
             Line::from(vec![
-                Span::styled(k.clone(), Style::default().fg(key_color)),
+                Span::styled(*k, Style::default().fg(key_color)),
                 Span::styled(
                     format!(" {} ", ".".repeat(dots)),
                     Style::default().fg(theme.surface1),
                 ),
-                Span::styled(v.clone(), Style::default().fg(theme.text)),
+                Span::styled(v.as_str(), Style::default().fg(theme.text)),
             ])
         })
         .collect();

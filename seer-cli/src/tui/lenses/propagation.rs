@@ -6,7 +6,7 @@ use ratatui::Frame;
 
 use crate::tui::action::LensData;
 use crate::tui::theme::Theme;
-use crate::tui::widgets::{gauge, panel, row_style, scroll_to};
+use crate::tui::widgets::{gauge, or_dash, panel, row_style, scroll_to};
 
 pub fn render(
     f: &mut Frame,
@@ -38,11 +38,7 @@ pub fn render(
     let header = Row::new(["RESOLVER", "PROVIDER", "REGION", "ANSWER", ""])
         .style(Style::default().fg(theme.overlay0));
     let body = p.results.iter().enumerate().map(|(i, sr)| {
-        let answer = sr
-            .records
-            .first()
-            .map(|r| r.format_short())
-            .unwrap_or_else(|| "—".into());
+        let answer = or_dash(sr.records.first().map(|r| r.format_short()));
         let state = if sr.success {
             format!("{}ms", sr.response_time_ms)
         } else {

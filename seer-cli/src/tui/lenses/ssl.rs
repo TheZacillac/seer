@@ -6,7 +6,7 @@ use seer_core::CertWarningSeverity;
 
 use crate::tui::action::LensData;
 use crate::tui::theme::Theme;
-use crate::tui::widgets::{chips, dot, kv, panel};
+use crate::tui::widgets::{chips, dot, kv, or_dash, panel};
 use ratatui::widgets::Paragraph;
 
 pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
@@ -24,38 +24,20 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
         .split(inner);
 
     let leaf = s.chain.first();
-    let dash = || "—".to_string();
-    let rows: Vec<(String, String)> = vec![
-        ("domain".into(), s.domain.clone()),
-        (
-            "subject".into(),
-            leaf.map(|c| c.subject.clone()).unwrap_or_else(dash),
-        ),
-        (
-            "issuer".into(),
-            leaf.map(|c| c.issuer.clone()).unwrap_or_else(dash),
-        ),
-        (
-            "key".into(),
-            leaf.and_then(|c| c.key_type.clone()).unwrap_or_else(dash),
-        ),
-        (
-            "valid".into(),
-            if s.is_valid {
-                "yes".into()
-            } else {
-                "no".into()
-            },
-        ),
-        (
-            "hostname".into(),
-            if s.hostname_verified {
-                "verified".into()
-            } else {
-                "MISMATCH".into()
-            },
-        ),
-        ("expires in".into(), format!("{}d", s.days_until_expiry)),
+    let valid = if s.is_valid { "yes" } else { "no" };
+    let hostname = if s.hostname_verified {
+        "verified"
+    } else {
+        "MISMATCH"
+    };
+    let rows = [
+        ("domain", s.domain.clone()),
+        ("subject", or_dash(leaf.map(|c| &c.subject))),
+        ("issuer", or_dash(leaf.map(|c| &c.issuer))),
+        ("key", or_dash(leaf.and_then(|c| c.key_type.as_deref()))),
+        ("valid", valid.to_string()),
+        ("hostname", hostname.to_string()),
+        ("expires in", format!("{}d", s.days_until_expiry)),
     ];
     kv::render(f, chunks[0], theme, theme.green, &rows);
     if !s.warnings.is_empty() {

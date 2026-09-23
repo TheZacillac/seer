@@ -7,7 +7,7 @@ use ratatui::Frame;
 
 use crate::tui::action::LensData;
 use crate::tui::theme::Theme;
-use crate::tui::widgets::{kv, panel};
+use crate::tui::widgets::{kv, or_dash, panel};
 
 pub fn render(f: &mut Frame, area: Rect, theme: &Theme, tab: usize, data: &LensData) {
     // When there's no loaded RDAP data yet, show a tab-appropriate hint.
@@ -48,21 +48,15 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, tab: usize, data: &LensD
 fn render_domain(f: &mut Frame, area: Rect, theme: &Theme, r: &seer_core::RdapResponse) {
     let inner = panel::render(f, area, theme, "RDAP Object · domain", theme.mauve, false);
 
-    let dash = || "—".to_string();
-    let delegation = r
-        .secure_dns
-        .as_ref()
-        .and_then(|s| s.delegation_signed)
-        .map(|b| b.to_string())
-        .unwrap_or_else(dash);
-    let rows: Vec<(String, String)> = vec![
-        ("handle".into(), r.handle.clone().unwrap_or_else(dash)),
-        ("ldhName".into(), r.ldh_name.clone().unwrap_or_else(dash)),
-        ("port43".into(), r.port43.clone().unwrap_or_else(dash)),
-        ("registrar".into(), r.get_registrar().unwrap_or_else(dash)),
-        ("delegationSigned".into(), delegation),
-        ("nameservers".into(), r.nameserver_names().join("  ")),
-        ("status".into(), r.status.join(", ")),
+    let delegation = r.secure_dns.as_ref().and_then(|s| s.delegation_signed);
+    let rows = [
+        ("handle", or_dash(r.handle.as_deref())),
+        ("ldhName", or_dash(r.ldh_name.as_deref())),
+        ("port43", or_dash(r.port43.as_deref())),
+        ("registrar", or_dash(r.get_registrar())),
+        ("delegationSigned", or_dash(delegation)),
+        ("nameservers", r.nameserver_names().join("  ")),
+        ("status", r.status.join(", ")),
     ];
     kv::render(f, inner, theme, theme.mauve, &rows);
 }
@@ -70,28 +64,15 @@ fn render_domain(f: &mut Frame, area: Rect, theme: &Theme, r: &seer_core::RdapRe
 fn render_ip(f: &mut Frame, area: Rect, theme: &Theme, r: &seer_core::RdapResponse) {
     let inner = panel::render(f, area, theme, "RDAP Object · IP", theme.blue, false);
 
-    let dash = || "—".to_string();
-    let rows: Vec<(String, String)> = vec![
-        ("handle".into(), r.handle.clone().unwrap_or_else(dash)),
-        ("name".into(), r.name.clone().unwrap_or_else(dash)),
-        (
-            "startAddress".into(),
-            r.start_address.clone().unwrap_or_else(dash),
-        ),
-        (
-            "endAddress".into(),
-            r.end_address.clone().unwrap_or_else(dash),
-        ),
-        (
-            "ipVersion".into(),
-            r.ip_version.clone().unwrap_or_else(dash),
-        ),
-        ("country".into(), r.country.clone().unwrap_or_else(dash)),
-        (
-            "parentHandle".into(),
-            r.parent_handle.clone().unwrap_or_else(dash),
-        ),
-        ("status".into(), r.status.join(", ")),
+    let rows = [
+        ("handle", or_dash(r.handle.as_deref())),
+        ("name", or_dash(r.name.as_deref())),
+        ("startAddress", or_dash(r.start_address.as_deref())),
+        ("endAddress", or_dash(r.end_address.as_deref())),
+        ("ipVersion", or_dash(r.ip_version.as_deref())),
+        ("country", or_dash(r.country.as_deref())),
+        ("parentHandle", or_dash(r.parent_handle.as_deref())),
+        ("status", r.status.join(", ")),
     ];
     kv::render(f, inner, theme, theme.blue, &rows);
 }
@@ -99,20 +80,13 @@ fn render_ip(f: &mut Frame, area: Rect, theme: &Theme, r: &seer_core::RdapRespon
 fn render_asn(f: &mut Frame, area: Rect, theme: &Theme, r: &seer_core::RdapResponse) {
     let inner = panel::render(f, area, theme, "RDAP Object · ASN", theme.lavender, false);
 
-    let dash = || "—".to_string();
-    let rows: Vec<(String, String)> = vec![
-        ("handle".into(), r.handle.clone().unwrap_or_else(dash)),
-        ("name".into(), r.name.clone().unwrap_or_else(dash)),
-        (
-            "startAutnum".into(),
-            r.start_autnum.map(|n| n.to_string()).unwrap_or_else(dash),
-        ),
-        (
-            "endAutnum".into(),
-            r.end_autnum.map(|n| n.to_string()).unwrap_or_else(dash),
-        ),
-        ("country".into(), r.country.clone().unwrap_or_else(dash)),
-        ("status".into(), r.status.join(", ")),
+    let rows = [
+        ("handle", or_dash(r.handle.as_deref())),
+        ("name", or_dash(r.name.as_deref())),
+        ("startAutnum", or_dash(r.start_autnum)),
+        ("endAutnum", or_dash(r.end_autnum)),
+        ("country", or_dash(r.country.as_deref())),
+        ("status", r.status.join(", ")),
     ];
     kv::render(f, inner, theme, theme.lavender, &rows);
 }

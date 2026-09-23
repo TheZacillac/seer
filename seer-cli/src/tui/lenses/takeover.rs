@@ -13,7 +13,7 @@ use seer_core::TakeoverVerdict;
 
 use crate::tui::action::LensData;
 use crate::tui::theme::Theme;
-use crate::tui::widgets::{panel, row_style, scroll_to};
+use crate::tui::widgets::{or_dash, panel, row_style, scroll_to};
 
 fn verdict_tone(v: TakeoverVerdict) -> &'static str {
     match v {
@@ -95,15 +95,11 @@ pub fn render(
                 verdict_label(finding.verdict).to_string(),
                 base.fg(theme.tone(verdict_tone(finding.verdict))),
             ),
-            Span::styled(finding.provider.clone().unwrap_or_else(|| "—".into()), base),
+            Span::styled(or_dash(finding.provider.as_deref()), base),
             // Evidence is the matched fingerprint on a confirmed finding; the
             // probe note explains why an unconfirmed one could not be settled.
             Span::styled(
-                finding
-                    .evidence
-                    .clone()
-                    .or_else(|| finding.probe_note.clone())
-                    .unwrap_or_else(|| "—".into()),
+                or_dash(finding.evidence.as_ref().or(finding.probe_note.as_ref())),
                 base.fg(theme.subtext),
             ),
         ])

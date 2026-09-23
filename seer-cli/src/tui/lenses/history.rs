@@ -7,7 +7,7 @@ use ratatui::Frame;
 
 use crate::tui::action::LensData;
 use crate::tui::theme::Theme;
-use crate::tui::widgets::{panel, row_style, scroll_to};
+use crate::tui::widgets::{or_dash, panel, row_style, scroll_to};
 
 /// `filter` is the active in-lens `/`-filter; rows are filtered by reference
 /// (see `filter::history_rows`) so no entry is cloned per frame.
@@ -45,7 +45,7 @@ pub fn render(
             } else {
                 "—"
             };
-            let registrar = e.result.registrar().unwrap_or_else(|| "—".to_string());
+            let registrar = or_dash(e.result.registrar());
             Row::new(vec![when, e.domain.clone(), source.to_string(), registrar])
                 .style(row_style(theme, focused && i == sel))
         });

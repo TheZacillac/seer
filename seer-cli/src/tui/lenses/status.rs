@@ -7,7 +7,7 @@ use ratatui::Frame;
 
 use crate::tui::action::LensData;
 use crate::tui::theme::Theme;
-use crate::tui::widgets::{kv, panel};
+use crate::tui::widgets::{kv, or_dash, panel};
 
 pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
     let LensData::Status(s) = data else { return };
@@ -18,10 +18,7 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
         .constraints([Constraint::Length(2), Constraint::Min(0)])
         .split(inner);
 
-    let code = s
-        .http_status
-        .map(|c| c.to_string())
-        .unwrap_or_else(|| "—".into());
+    let code = or_dash(s.http_status);
     let text = s.http_status_text.clone().unwrap_or_default();
     f.render_widget(
         Paragraph::new(Line::from(vec![
@@ -36,27 +33,17 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
         chunks[0],
     );
 
-    let mut rows: Vec<(String, String)> = Vec::new();
-    rows.push((
-        "title".into(),
-        s.title.clone().unwrap_or_else(|| "—".into()),
-    ));
+    let mut rows = vec![("title", or_dash(s.title.as_deref()))];
     if let Some(c) = &s.certificate {
-        rows.push(("ssl issuer".into(), c.issuer.clone()));
-        rows.push(("ssl valid".into(), format!("{}d", c.days_until_expiry)));
+        rows.push(("ssl issuer", c.issuer.clone()));
+        rows.push(("ssl valid", format!("{}d", c.days_until_expiry)));
     }
     if let Some(e) = &s.domain_expiration {
-        rows.push(("expires in".into(), format!("{}d", e.days_until_expiry)));
+        rows.push(("expires in", format!("{}d", e.days_until_expiry)));
     }
     if let Some(dns) = &s.dns_resolution {
-        rows.push((
-            "resolves".into(),
-            if dns.resolves {
-                "yes".into()
-            } else {
-                "no".into()
-            },
-        ));
+        let resolves = if dns.resolves { "yes" } else { "no" };
+        rows.push(("resolves", resolves.to_string()));
     }
     kv::render(f, chunks[1], theme, theme.green, &rows);
 }

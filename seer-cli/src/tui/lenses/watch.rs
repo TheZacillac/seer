@@ -7,7 +7,7 @@ use ratatui::Frame;
 
 use crate::tui::action::LensData;
 use crate::tui::theme::Theme;
-use crate::tui::widgets::{panel, row_style, scroll_to};
+use crate::tui::widgets::{or_dash, panel, row_style, scroll_to};
 
 pub fn render(
     f: &mut Frame,
@@ -53,18 +53,9 @@ pub fn render(
         .style(Style::default().fg(theme.overlay0));
 
     let rows = w.results.iter().enumerate().map(|(i, r)| {
-        let expires = r
-            .domain_days_remaining
-            .map(|d| d.to_string())
-            .unwrap_or_else(|| "—".into());
-        let ssl = r
-            .ssl_days_remaining
-            .map(|d| d.to_string())
-            .unwrap_or_else(|| "—".into());
-        let http = r
-            .http_status
-            .map(|c| c.to_string())
-            .unwrap_or_else(|| "—".into());
+        let expires = or_dash(r.domain_days_remaining);
+        let ssl = or_dash(r.ssl_days_remaining);
+        let http = or_dash(r.http_status);
         let issues_flag = if r.issues.is_empty() { "" } else { "!" };
 
         let expires_color = match r.domain_days_remaining {

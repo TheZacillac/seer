@@ -7,7 +7,7 @@ use ratatui::Frame;
 
 use crate::tui::action::LensData;
 use crate::tui::theme::Theme;
-use crate::tui::widgets::panel;
+use crate::tui::widgets::{or_dash, panel};
 
 pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
     let LensData::Compare(c) = data else {
@@ -111,8 +111,8 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
             Row::new(vec![
                 dot.to_string(),
                 c.record_type.to_string(),
-                if in_a { val.clone() } else { "—".to_string() },
-                if in_b { val.clone() } else { "—".to_string() },
+                or_dash(in_a.then_some(val)),
+                or_dash(in_b.then_some(val)),
             ])
             .style(Style::default().fg(row_color))
         })
