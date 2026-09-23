@@ -11,7 +11,7 @@ from seer_api._contract import (
     Domain,
 )
 from seer_api._run import run_seer
-from seer_api.errors import http_error
+from seer_api.errors import as_http
 from seer_api.limiting import limiter
 from seer_api.streaming import stream_bulk
 
@@ -37,10 +37,10 @@ async def propagation_check(
     Returns:
         Propagation result with percentage and per-server results
     """
-    try:
-        return await run_seer(seer.propagation, domain, record_type)
-    except Exception as e:
-        raise http_error(e, "Propagation check failed") from e
+    return await as_http(
+        run_seer(seer.propagation, domain, record_type),
+        "Propagation check failed",
+    )
 
 
 @router.post("/bulk")
@@ -55,21 +55,17 @@ async def bulk_propagation_check(request: Request, body: BulkPropagationRequest)
     Returns:
         List of propagation results for each domain
     """
-    try:
-        return await run_seer(
-            seer.bulk_propagation, body.domains, body.record_type, body.concurrency
-        )
-    except Exception as e:
-        raise http_error(e, "Bulk propagation check failed") from e
+    return await as_http(
+        run_seer(seer.bulk_propagation, body.domains, body.record_type, body.concurrency),
+        "Bulk propagation check failed",
+    )
 
 
 @router.post("/bulk/stream")
 @limiter.limit(HEAVY_LIMIT)
 async def bulk_propagation_stream(request: Request, body: BulkPropagationRequest):
     """Stream bulk DNS-propagation checks as Server-Sent Events."""
-    try:
-        return await stream_bulk(
-            seer.bulk_propagation, body.domains, body.record_type, body.concurrency
-        )
-    except Exception as e:
-        raise http_error(e, "Bulk propagation stream failed") from e
+    return await as_http(
+        stream_bulk(seer.bulk_propagation, body.domains, body.record_type, body.concurrency),
+        "Bulk propagation stream failed",
+    )

@@ -5,7 +5,7 @@ from fastapi import APIRouter, Request
 import seer
 from seer_api._contract import BULK_LIMIT, BulkRequest, Domain
 from seer_api._run import run_seer
-from seer_api.errors import http_error
+from seer_api.errors import as_http
 from seer_api.limiting import limiter
 from seer_api.streaming import stream_bulk
 
@@ -24,10 +24,7 @@ async def smart_lookup(request: Request, domain: Domain):
     Returns:
         Lookup result with source indicator (rdap or whois) and registration data
     """
-    try:
-        return await run_seer(seer.lookup, domain)
-    except Exception as e:
-        raise http_error(e, "Lookup failed") from e
+    return await as_http(run_seer(seer.lookup, domain), "Lookup failed")
 
 
 @router.post("/bulk")
@@ -42,10 +39,10 @@ async def bulk_smart_lookup(request: Request, body: BulkRequest):
     Returns:
         List of lookup results for each domain
     """
-    try:
-        return await run_seer(seer.bulk_lookup, body.domains, body.concurrency)
-    except Exception as e:
-        raise http_error(e, "Bulk lookup failed") from e
+    return await as_http(
+        run_seer(seer.bulk_lookup, body.domains, body.concurrency),
+        "Bulk lookup failed",
+    )
 
 
 @router.post("/bulk/stream")
@@ -56,7 +53,7 @@ async def bulk_smart_lookup_stream(request: Request, body: BulkRequest):
     Emits `progress`, `item`, and `done` events. Matches the sync /bulk
     semantics — see that handler for request/response body shape.
     """
-    try:
-        return await stream_bulk(seer.bulk_lookup, body.domains, body.concurrency)
-    except Exception as e:
-        raise http_error(e, "Bulk lookup stream failed") from e
+    return await as_http(
+        stream_bulk(seer.bulk_lookup, body.domains, body.concurrency),
+        "Bulk lookup stream failed",
+    )

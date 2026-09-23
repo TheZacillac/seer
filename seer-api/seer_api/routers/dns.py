@@ -11,7 +11,7 @@ from seer_api._contract import (
     Domain,
 )
 from seer_api._run import run_seer
-from seer_api.errors import http_error
+from seer_api.errors import as_http
 from seer_api.limiting import limiter
 from seer_api.ssrf import guard_nameserver_async
 from seer_api.streaming import stream_bulk
@@ -37,10 +37,10 @@ async def dns_compare(
     # nameserver spec (UDP / tls:// / https://), not a bare hostname.
     await guard_nameserver_async(server_a)
     await guard_nameserver_async(server_b)
-    try:
-        return await run_seer(seer.dns_compare, domain, record_type, server_a, server_b)
-    except Exception as e:
-        raise http_error(e, "DNS comparison failed") from e
+    return await as_http(
+        run_seer(seer.dns_compare, domain, record_type, server_a, server_b),
+        "DNS comparison failed",
+    )
 
 
 @router.get("/{domain}/{record_type}")
@@ -69,10 +69,7 @@ async def dns_lookup(
     # nameserver is a spec (UDP / tls:// / https://), not a bare hostname.
     if nameserver is not None:
         await guard_nameserver_async(nameserver)
-    try:
-        return await run_seer(seer.dig, domain, record_type, nameserver)
-    except Exception as e:
-        raise http_error(e, "DNS lookup failed") from e
+    return await as_http(run_seer(seer.dig, domain, record_type, nameserver), "DNS lookup failed")
 
 
 @router.post("/bulk")
@@ -87,19 +84,17 @@ async def bulk_dns_lookup(request: Request, body: BulkRecordRequest):
     Returns:
         List of DNS results for each domain
     """
-    try:
-        return await run_seer(seer.bulk_dig, body.domains, body.record_type, body.concurrency)
-    except Exception as e:
-        raise http_error(e, "Bulk DNS lookup failed") from e
+    return await as_http(
+        run_seer(seer.bulk_dig, body.domains, body.record_type, body.concurrency),
+        "Bulk DNS lookup failed",
+    )
 
 
 @router.post("/bulk/stream")
 @limiter.limit(BULK_LIMIT)
 async def bulk_dns_stream(request: Request, body: BulkRecordRequest):
     """Stream bulk DNS queries as Server-Sent Events."""
-    try:
-        return await stream_bulk(
-            seer.bulk_dig, body.domains, body.record_type, body.concurrency
-        )
-    except Exception as e:
-        raise http_error(e, "Bulk DNS stream failed") from e
+    return await as_http(
+        stream_bulk(seer.bulk_dig, body.domains, body.record_type, body.concurrency),
+        "Bulk DNS stream failed",
+    )

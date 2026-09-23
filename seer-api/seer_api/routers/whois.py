@@ -5,7 +5,7 @@ from fastapi import APIRouter, Request
 import seer
 from seer_api._contract import BULK_LIMIT, BulkRequest, Domain
 from seer_api._run import run_seer
-from seer_api.errors import http_error
+from seer_api.errors import as_http
 from seer_api.limiting import limiter
 from seer_api.streaming import stream_bulk
 
@@ -24,10 +24,7 @@ async def whois_lookup(request: Request, domain: Domain):
     Returns:
         WHOIS response with registrar, dates, nameservers, and status information
     """
-    try:
-        return await run_seer(seer.whois, domain)
-    except Exception as e:
-        raise http_error(e, "WHOIS lookup failed") from e
+    return await as_http(run_seer(seer.whois, domain), "WHOIS lookup failed")
 
 
 @router.post("/bulk")
@@ -42,17 +39,17 @@ async def bulk_whois_lookup(request: Request, body: BulkRequest):
     Returns:
         List of WHOIS results for each domain
     """
-    try:
-        return await run_seer(seer.bulk_whois, body.domains, body.concurrency)
-    except Exception as e:
-        raise http_error(e, "Bulk WHOIS lookup failed") from e
+    return await as_http(
+        run_seer(seer.bulk_whois, body.domains, body.concurrency),
+        "Bulk WHOIS lookup failed",
+    )
 
 
 @router.post("/bulk/stream")
 @limiter.limit(BULK_LIMIT)
 async def bulk_whois_stream(request: Request, body: BulkRequest):
     """Stream bulk WHOIS lookups as Server-Sent Events."""
-    try:
-        return await stream_bulk(seer.bulk_whois, body.domains, body.concurrency)
-    except Exception as e:
-        raise http_error(e, "Bulk WHOIS stream failed") from e
+    return await as_http(
+        stream_bulk(seer.bulk_whois, body.domains, body.concurrency),
+        "Bulk WHOIS stream failed",
+    )

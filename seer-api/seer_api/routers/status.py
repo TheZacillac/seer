@@ -5,7 +5,7 @@ from fastapi import APIRouter, Request
 import seer
 from seer_api._contract import HEAVY_LIMIT, BulkRequest, Domain
 from seer_api._run import run_seer
-from seer_api.errors import http_error
+from seer_api.errors import as_http
 from seer_api.limiting import limiter
 from seer_api.ssrf import guard_async as ssrf_guard_async
 from seer_api.ssrf import guard_hosts_async
@@ -33,10 +33,7 @@ async def check_status(request: Request, domain: Domain):
         - Domain registration expiration (days until expiry, registrar)
     """
     await ssrf_guard_async(domain, 443)
-    try:
-        return await run_seer(seer.status, domain)
-    except Exception as e:
-        raise http_error(e, "Status check failed") from e
+    return await as_http(run_seer(seer.status, domain), "Status check failed")
 
 
 @router.post("/bulk")
@@ -52,10 +49,10 @@ async def bulk_status(request: Request, body: BulkRequest):
         List of status results for each domain
     """
     await guard_hosts_async([(d, 443) for d in body.domains])
-    try:
-        return await run_seer(seer.bulk_status, body.domains, body.concurrency)
-    except Exception as e:
-        raise http_error(e, "Bulk status check failed") from e
+    return await as_http(
+        run_seer(seer.bulk_status, body.domains, body.concurrency),
+        "Bulk status check failed",
+    )
 
 
 @router.post("/bulk/stream")
@@ -63,7 +60,7 @@ async def bulk_status(request: Request, body: BulkRequest):
 async def bulk_status_stream(request: Request, body: BulkRequest):
     """Stream bulk status checks as Server-Sent Events."""
     await guard_hosts_async([(d, 443) for d in body.domains])
-    try:
-        return await stream_bulk(seer.bulk_status, body.domains, body.concurrency)
-    except Exception as e:
-        raise http_error(e, "Bulk status stream failed") from e
+    return await as_http(
+        stream_bulk(seer.bulk_status, body.domains, body.concurrency),
+        "Bulk status stream failed",
+    )
