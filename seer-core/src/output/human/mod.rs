@@ -1,3 +1,8 @@
+//! Colored terminal output (`--format human`). One inherent `format_*` method
+//! per report type, split into per-concern submodules; label/value rows go
+//! through the private `Rows` writer, which sanitizes every value against
+//! terminal escape injection. Colors can be disabled (`without_colors`).
+
 use chrono::{DateTime, TimeDelta, Utc};
 use colored::ColoredString;
 

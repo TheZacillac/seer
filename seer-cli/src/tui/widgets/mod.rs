@@ -1,3 +1,7 @@
+//! Small reusable TUI building blocks: `panel` (bordered block → inner
+//! `Rect`), `kv` rows, `gauge`, status `dot` and `chips`, plus the shared
+//! `or_dash` missing-value mark and `row_style` selection styling.
+
 pub mod chips;
 pub mod dot;
 pub mod gauge;

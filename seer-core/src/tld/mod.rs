@@ -1,3 +1,7 @@
+//! TLD information: [`lookup_tld`] combines the static WHOIS server table,
+//! the IANA RDAP bootstrap and the registry URL into a [`TldInfo`];
+//! [`all_tlds`] is the full catalog seer knows about.
+
 use serde::{Deserialize, Serialize};
 
 use crate::rdap::RdapClient;

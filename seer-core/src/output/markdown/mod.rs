@@ -1,3 +1,8 @@
+//! Markdown output (`--format markdown`). One inherent `format_*` method per
+//! report type, split into per-concern submodules; bullets go through the
+//! private `Bullets` writer and `code_list`, which escape every value
+//! (`MdSafe`) so domain data can't inject markdown.
+
 use std::fmt::{self, Write as _};
 
 use chrono::{DateTime, Utc};
