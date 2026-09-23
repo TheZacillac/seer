@@ -37,7 +37,7 @@ use chrono::{DateTime, NaiveDate, Utc};
 use regex::Regex;
 use std::sync::LazyLock;
 
-use super::{push_bounded, RegistryParser, MAX_NAMESERVERS};
+use super::{push_bounded, MAX_NAMESERVERS};
 use crate::whois::parser::WhoisResponse;
 
 /// Regex patterns for EDUCAUSE-specific fields.
@@ -83,217 +83,205 @@ static EMAIL_PATTERN: LazyLock<Regex> =
 static PHONE_PATTERN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\+[\d.]+$").expect("Invalid phone regex"));
 
-/// Parser for .edu domains using the EDUCAUSE format.
-#[derive(Debug, Clone, Default)]
-pub struct EducauseParser;
+/// TLDs this parser handles.
+pub(super) const TLDS: &[&str] = &["edu"];
 
-impl EducauseParser {
-    pub fn new() -> Self {
-        Self
+/// Parses .edu domains using the EDUCAUSE format.
+pub(super) fn parse(domain: &str, server: &str, raw: &str) -> WhoisResponse {
+    let mut registrant = None;
+    let mut nameservers = Vec::new();
+    let mut creation_date = None;
+    let mut expiration_date = None;
+    let mut updated_date = None;
+    let mut admin_name = None;
+    let mut admin_email = None;
+    let mut admin_phone = None;
+    let mut tech_name = None;
+    let mut tech_email = None;
+    let mut tech_phone = None;
+
+    #[derive(Clone, Copy)]
+    enum Section {
+        None,
+        Registrant,
+        AdminContact,
+        TechContact,
+        NameServers,
     }
 
-    /// Parses EDUCAUSE date format: DD-Mon-YYYY (e.g., "31-Jul-2027")
-    fn parse_educause_date(date_str: &str) -> Option<DateTime<Utc>> {
-        let cleaned = date_str.trim();
+    let mut current_section = Section::None;
+    // Tracks whether the body actually contained a registration record. A
+    // not-found response ("No match for ...") has no `Domain Name:` line, so
+    // we must not stamp it with a registrar — that would make
+    // WhoisResponse::is_available() short-circuit to "registered".
+    let mut domain_found = false;
 
-        let formats = [
-            "%d-%b-%Y", // 31-Jul-2027
-            "%d-%B-%Y", // 31-July-2027
-            "%Y-%m-%d", // 2027-07-31 (fallback)
-        ];
+    for line in raw.lines() {
+        let trimmed = line.trim();
 
-        for fmt in &formats {
-            if let Ok(date) = NaiveDate::parse_from_str(cleaned, fmt) {
-                return Some(date.and_hms_opt(0, 0, 0)?.and_utc());
+        // Check for inline date fields (not indented, appear at end of response)
+        if let Some(caps) = ACTIVATED_DATE.captures(trimmed) {
+            if creation_date.is_none() {
+                if let Some(m) = caps.get(1) {
+                    creation_date = parse_educause_date(m.as_str());
+                }
             }
+            current_section = Section::None;
+            continue;
+        }
+        if let Some(caps) = UPDATED_DATE.captures(trimmed) {
+            if updated_date.is_none() {
+                if let Some(m) = caps.get(1) {
+                    updated_date = parse_educause_date(m.as_str());
+                }
+            }
+            current_section = Section::None;
+            continue;
+        }
+        if let Some(caps) = EXPIRES_DATE.captures(trimmed) {
+            if expiration_date.is_none() {
+                if let Some(m) = caps.get(1) {
+                    expiration_date = parse_educause_date(m.as_str());
+                }
+            }
+            current_section = Section::None;
+            continue;
         }
 
-        None
-    }
-}
-
-impl RegistryParser for EducauseParser {
-    fn supported_tlds(&self) -> &[&str] {
-        &["edu"]
-    }
-
-    fn parse(&self, domain: &str, server: &str, raw: &str) -> WhoisResponse {
-        let mut registrant = None;
-        let mut nameservers = Vec::new();
-        let mut creation_date = None;
-        let mut expiration_date = None;
-        let mut updated_date = None;
-        let mut admin_name = None;
-        let mut admin_email = None;
-        let mut admin_phone = None;
-        let mut tech_name = None;
-        let mut tech_email = None;
-        let mut tech_phone = None;
-
-        #[derive(Clone, Copy)]
-        enum Section {
-            None,
-            Registrant,
-            AdminContact,
-            TechContact,
-            NameServers,
+        // Check for section headers
+        if REGISTRANT_SECTION.is_match(trimmed) {
+            current_section = Section::Registrant;
+            continue;
+        } else if ADMIN_SECTION.is_match(trimmed) {
+            current_section = Section::AdminContact;
+            continue;
+        } else if TECH_SECTION.is_match(trimmed) {
+            current_section = Section::TechContact;
+            continue;
+        } else if NAME_SERVERS_SECTION.is_match(trimmed) {
+            current_section = Section::NameServers;
+            continue;
+        } else if DOMAIN_NAME.is_match(trimmed) {
+            domain_found = true;
+            current_section = Section::None;
+            continue;
         }
 
-        let mut current_section = Section::None;
-        // Tracks whether the body actually contained a registration record. A
-        // not-found response ("No match for ...") has no `Domain Name:` line, so
-        // we must not stamp it with a registrar — that would make
-        // WhoisResponse::is_available() short-circuit to "registered".
-        let mut domain_found = false;
-
-        for line in raw.lines() {
-            let trimmed = line.trim();
-
-            // Check for inline date fields (not indented, appear at end of response)
-            if let Some(caps) = ACTIVATED_DATE.captures(trimmed) {
-                if creation_date.is_none() {
-                    if let Some(m) = caps.get(1) {
-                        creation_date = Self::parse_educause_date(m.as_str());
-                    }
-                }
-                current_section = Section::None;
-                continue;
-            }
-            if let Some(caps) = UPDATED_DATE.captures(trimmed) {
-                if updated_date.is_none() {
-                    if let Some(m) = caps.get(1) {
-                        updated_date = Self::parse_educause_date(m.as_str());
-                    }
-                }
-                current_section = Section::None;
-                continue;
-            }
-            if let Some(caps) = EXPIRES_DATE.captures(trimmed) {
-                if expiration_date.is_none() {
-                    if let Some(m) = caps.get(1) {
-                        expiration_date = Self::parse_educause_date(m.as_str());
-                    }
-                }
-                current_section = Section::None;
-                continue;
-            }
-
-            // Check for section headers
-            if REGISTRANT_SECTION.is_match(trimmed) {
-                current_section = Section::Registrant;
-                continue;
-            } else if ADMIN_SECTION.is_match(trimmed) {
-                current_section = Section::AdminContact;
-                continue;
-            } else if TECH_SECTION.is_match(trimmed) {
-                current_section = Section::TechContact;
-                continue;
-            } else if NAME_SERVERS_SECTION.is_match(trimmed) {
-                current_section = Section::NameServers;
-                continue;
-            } else if DOMAIN_NAME.is_match(trimmed) {
-                domain_found = true;
-                current_section = Section::None;
-                continue;
-            }
-
-            // Empty line ends registrant section but not nameservers (they may span blank lines)
-            if trimmed.is_empty() {
-                match current_section {
-                    Section::NameServers => {
-                        // Only end nameservers section if we already have some
-                        if !nameservers.is_empty() {
-                            current_section = Section::None;
-                        }
-                    }
-                    _ => {
+        // Empty line ends registrant section but not nameservers (they may span blank lines)
+        if trimmed.is_empty() {
+            match current_section {
+                Section::NameServers => {
+                    // Only end nameservers section if we already have some
+                    if !nameservers.is_empty() {
                         current_section = Section::None;
                     }
                 }
-                continue;
-            }
-
-            // Parse section content (indented values with tabs or spaces)
-            if line.starts_with('\t') || line.starts_with("    ") {
-                let value = trimmed.to_string();
-
-                match current_section {
-                    Section::Registrant if registrant.is_none() => {
-                        registrant = Some(value);
-                    }
-                    Section::AdminContact => {
-                        // Check email/phone first so a contact block that leads
-                        // with an email or phone (no name line) doesn't have it
-                        // mis-stored as the name.
-                        if EMAIL_PATTERN.is_match(trimmed) && admin_email.is_none() {
-                            admin_email = Some(trimmed.to_string());
-                        } else if PHONE_PATTERN.is_match(trimmed) && admin_phone.is_none() {
-                            admin_phone = Some(trimmed.to_string());
-                        } else if admin_name.is_none()
-                            && !EMAIL_PATTERN.is_match(trimmed)
-                            && !PHONE_PATTERN.is_match(trimmed)
-                        {
-                            admin_name = Some(value);
-                        }
-                    }
-                    Section::TechContact => {
-                        if EMAIL_PATTERN.is_match(trimmed) && tech_email.is_none() {
-                            tech_email = Some(trimmed.to_string());
-                        } else if PHONE_PATTERN.is_match(trimmed) && tech_phone.is_none() {
-                            tech_phone = Some(trimmed.to_string());
-                        } else if tech_name.is_none()
-                            && !EMAIL_PATTERN.is_match(trimmed)
-                            && !PHONE_PATTERN.is_match(trimmed)
-                        {
-                            tech_name = Some(value);
-                        }
-                    }
-                    Section::NameServers => {
-                        let ns = value.to_lowercase();
-                        push_bounded(&mut nameservers, ns, MAX_NAMESERVERS);
-                    }
-                    _ => {}
+                _ => {
+                    current_section = Section::None;
                 }
-            } else {
-                // Non-indented, non-empty line that isn't a section header ends the section
-                current_section = Section::None;
             }
+            continue;
         }
 
-        // Only attribute the record to EDUCAUSE when the response actually
-        // carried registration DATA; a not-found body must stay registrar-less
-        // so availability detection works. The current not-found format echoes
-        // the query as a `Domain Name:` line, so `domain_found` alone is not
-        // sufficient evidence of a registration record.
-        let has_data = domain_found
-            && (registrant.is_some()
-                || !nameservers.is_empty()
-                || creation_date.is_some()
-                || expiration_date.is_some()
-                || admin_name.is_some()
-                || tech_name.is_some());
+        // Parse section content (indented values with tabs or spaces)
+        if line.starts_with('\t') || line.starts_with("    ") {
+            let value = trimmed.to_string();
 
-        WhoisResponse {
-            domain: domain.to_string(),
-            registrar: has_data.then(|| "EDUCAUSE".to_string()),
-            registrant: registrant.clone(),
-            organization: registrant,
-            registrant_country: has_data.then(|| "US".to_string()),
-            admin_name,
-            admin_email,
-            admin_phone,
-            tech_name,
-            tech_email,
-            tech_phone,
-            creation_date,
-            expiration_date,
-            updated_date,
-            nameservers,
-            whois_server: server.to_string(),
-            raw_response: raw.to_string(),
-            ..Default::default()
+            match current_section {
+                Section::Registrant if registrant.is_none() => {
+                    registrant = Some(value);
+                }
+                Section::AdminContact => {
+                    // Check email/phone first so a contact block that leads
+                    // with an email or phone (no name line) doesn't have it
+                    // mis-stored as the name.
+                    if EMAIL_PATTERN.is_match(trimmed) && admin_email.is_none() {
+                        admin_email = Some(trimmed.to_string());
+                    } else if PHONE_PATTERN.is_match(trimmed) && admin_phone.is_none() {
+                        admin_phone = Some(trimmed.to_string());
+                    } else if admin_name.is_none()
+                        && !EMAIL_PATTERN.is_match(trimmed)
+                        && !PHONE_PATTERN.is_match(trimmed)
+                    {
+                        admin_name = Some(value);
+                    }
+                }
+                Section::TechContact => {
+                    if EMAIL_PATTERN.is_match(trimmed) && tech_email.is_none() {
+                        tech_email = Some(trimmed.to_string());
+                    } else if PHONE_PATTERN.is_match(trimmed) && tech_phone.is_none() {
+                        tech_phone = Some(trimmed.to_string());
+                    } else if tech_name.is_none()
+                        && !EMAIL_PATTERN.is_match(trimmed)
+                        && !PHONE_PATTERN.is_match(trimmed)
+                    {
+                        tech_name = Some(value);
+                    }
+                }
+                Section::NameServers => {
+                    let ns = value.to_lowercase();
+                    push_bounded(&mut nameservers, ns, MAX_NAMESERVERS);
+                }
+                _ => {}
+            }
+        } else {
+            // Non-indented, non-empty line that isn't a section header ends the section
+            current_section = Section::None;
         }
     }
+
+    // Only attribute the record to EDUCAUSE when the response actually
+    // carried registration DATA; a not-found body must stay registrar-less
+    // so availability detection works. The current not-found format echoes
+    // the query as a `Domain Name:` line, so `domain_found` alone is not
+    // sufficient evidence of a registration record.
+    let has_data = domain_found
+        && (registrant.is_some()
+            || !nameservers.is_empty()
+            || creation_date.is_some()
+            || expiration_date.is_some()
+            || admin_name.is_some()
+            || tech_name.is_some());
+
+    WhoisResponse {
+        domain: domain.to_string(),
+        registrar: has_data.then(|| "EDUCAUSE".to_string()),
+        registrant: registrant.clone(),
+        organization: registrant,
+        registrant_country: has_data.then(|| "US".to_string()),
+        admin_name,
+        admin_email,
+        admin_phone,
+        tech_name,
+        tech_email,
+        tech_phone,
+        creation_date,
+        expiration_date,
+        updated_date,
+        nameservers,
+        whois_server: server.to_string(),
+        raw_response: raw.to_string(),
+        ..Default::default()
+    }
+}
+
+/// Parses EDUCAUSE date format: DD-Mon-YYYY (e.g., "31-Jul-2027")
+fn parse_educause_date(date_str: &str) -> Option<DateTime<Utc>> {
+    let cleaned = date_str.trim();
+
+    let formats = [
+        "%d-%b-%Y", // 31-Jul-2027
+        "%d-%B-%Y", // 31-July-2027
+        "%Y-%m-%d", // 2027-07-31 (fallback)
+    ];
+
+    for fmt in &formats {
+        if let Ok(date) = NaiveDate::parse_from_str(cleaned, fmt) {
+            return Some(date.and_hms_opt(0, 0, 0)?.and_utc());
+        }
+    }
+
+    None
 }
 
 #[cfg(test)]
@@ -363,8 +351,7 @@ Domain expires:             31-Jul-2027"#;
 
     #[test]
     fn test_educause_parser_registrant() {
-        let parser = EducauseParser::new();
-        let result = parser.parse("uw.edu", "whois.educause.edu", SAMPLE_EDUCAUSE_RESPONSE);
+        let result = parse("uw.edu", "whois.educause.edu", SAMPLE_EDUCAUSE_RESPONSE);
 
         assert_eq!(result.domain, "uw.edu");
         assert_eq!(
@@ -376,8 +363,7 @@ Domain expires:             31-Jul-2027"#;
 
     #[test]
     fn test_educause_parser_nameservers() {
-        let parser = EducauseParser::new();
-        let result = parser.parse("uw.edu", "whois.educause.edu", SAMPLE_EDUCAUSE_RESPONSE);
+        let result = parse("uw.edu", "whois.educause.edu", SAMPLE_EDUCAUSE_RESPONSE);
 
         assert_eq!(result.nameservers.len(), 3);
         assert!(result.nameservers.contains(&"holly.s.uw.edu".to_string()));
@@ -391,8 +377,7 @@ Domain expires:             31-Jul-2027"#;
 
     #[test]
     fn test_educause_parser_dates() {
-        let parser = EducauseParser::new();
-        let result = parser.parse("uw.edu", "whois.educause.edu", SAMPLE_EDUCAUSE_RESPONSE);
+        let result = parse("uw.edu", "whois.educause.edu", SAMPLE_EDUCAUSE_RESPONSE);
 
         assert!(result.creation_date.is_some());
         let creation = result.creation_date.unwrap();
@@ -415,8 +400,7 @@ Domain expires:             31-Jul-2027"#;
 
     #[test]
     fn test_educause_parser_contacts() {
-        let parser = EducauseParser::new();
-        let result = parser.parse("uw.edu", "whois.educause.edu", SAMPLE_EDUCAUSE_RESPONSE);
+        let result = parse("uw.edu", "whois.educause.edu", SAMPLE_EDUCAUSE_RESPONSE);
 
         assert_eq!(result.admin_name, Some("Domain Admin".to_string()));
         assert_eq!(result.admin_email, Some("domain-admin@uw.edu".to_string()));
@@ -429,25 +413,16 @@ Domain expires:             31-Jul-2027"#;
 
     #[test]
     fn test_educause_parser_country() {
-        let parser = EducauseParser::new();
-        let result = parser.parse("uw.edu", "whois.educause.edu", SAMPLE_EDUCAUSE_RESPONSE);
+        let result = parse("uw.edu", "whois.educause.edu", SAMPLE_EDUCAUSE_RESPONSE);
 
         assert_eq!(result.registrant_country, Some("US".to_string()));
     }
 
     #[test]
     fn test_educause_date_parsing() {
-        assert!(EducauseParser::parse_educause_date("05-Mar-1999").is_some());
-        assert!(EducauseParser::parse_educause_date("31-Jul-2027").is_some());
-        assert!(EducauseParser::parse_educause_date("31-July-2027").is_some());
-    }
-
-    #[test]
-    fn test_supported_tlds() {
-        let parser = EducauseParser::new();
-        let tlds = parser.supported_tlds();
-        assert!(tlds.contains(&"edu"));
-        assert_eq!(tlds.len(), 1);
+        assert!(parse_educause_date("05-Mar-1999").is_some());
+        assert!(parse_educause_date("31-Jul-2027").is_some());
+        assert!(parse_educause_date("31-July-2027").is_some());
     }
 
     /// A contact block whose first indented line is an email (not a name).
@@ -496,8 +471,7 @@ The domain name you requested was not found in our database.
 
     #[test]
     fn test_educause_current_not_found_reports_available() {
-        let parser = EducauseParser::new();
-        let result = parser.parse(
+        let result = parse(
             "seer-sweep-zk8qv3xw.edu",
             "whois.educause.edu",
             SAMPLE_NO_MATCH_CURRENT,
@@ -514,8 +488,7 @@ The domain name you requested was not found in our database.
 
     #[test]
     fn test_educause_no_match_reports_available() {
-        let parser = EducauseParser::new();
-        let result = parser.parse(
+        let result = parse(
             "notarealdomain123xyz.edu",
             "whois.educause.edu",
             SAMPLE_NO_MATCH,
@@ -537,8 +510,7 @@ The domain name you requested was not found in our database.
 
     #[test]
     fn test_educause_contact_leading_email_not_stored_as_name() {
-        let parser = EducauseParser::new();
-        let result = parser.parse("ex.edu", "whois.educause.edu", SAMPLE_LEADING_EMAIL);
+        let result = parse("ex.edu", "whois.educause.edu", SAMPLE_LEADING_EMAIL);
 
         // The leading email must NOT be captured as the contact name.
         assert_ne!(result.admin_name.as_deref(), Some("admin@ex.edu"));

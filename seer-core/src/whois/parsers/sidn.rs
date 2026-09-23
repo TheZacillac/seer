@@ -26,7 +26,7 @@ use chrono::{DateTime, NaiveDate, Utc};
 use regex::Regex;
 use std::sync::LazyLock;
 
-use super::{push_bounded, RegistryParser, MAX_NAMESERVERS, MAX_STATUSES};
+use super::{push_bounded, MAX_NAMESERVERS, MAX_STATUSES};
 use crate::whois::parser::WhoisResponse;
 
 static STATUS_PATTERN: LazyLock<Regex> =
@@ -53,148 +53,136 @@ static NAMESERVERS_SECTION: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)^Domain nameservers:\s*$").expect("Invalid SIDN nameservers regex")
 });
 
-/// Parser for .nl domains using the SIDN format.
-#[derive(Debug, Clone, Default)]
-pub struct SidnParser;
+/// TLDs this parser handles.
+pub(super) const TLDS: &[&str] = &["nl"];
 
-impl SidnParser {
-    pub fn new() -> Self {
-        Self
+/// Parses .nl domains using the SIDN format.
+pub(super) fn parse(domain: &str, server: &str, raw: &str) -> WhoisResponse {
+    let mut registrar = None;
+    let mut creation_date = None;
+    let mut updated_date = None;
+    let mut nameservers = Vec::new();
+    let mut status = Vec::new();
+    let mut dnssec = None;
+
+    #[derive(Clone, Copy)]
+    enum Section {
+        None,
+        Registrar,
+        Abuse,
+        Nameservers,
     }
 
-    fn parse_date(date_str: &str) -> Option<DateTime<Utc>> {
-        let cleaned = date_str.trim();
-        if let Ok(d) = NaiveDate::parse_from_str(cleaned, "%Y-%m-%d") {
-            return Some(d.and_hms_opt(0, 0, 0)?.and_utc());
+    let mut current_section = Section::None;
+
+    for line in raw.lines() {
+        let trimmed = line.trim();
+
+        // Non-indented inline fields
+        if !line.starts_with(' ') && !line.starts_with('\t') {
+            if let Some(caps) = STATUS_PATTERN.captures(trimmed) {
+                if let Some(m) = caps.get(1) {
+                    let s = m.as_str().trim().to_string();
+                    push_bounded(&mut status, s, MAX_STATUSES);
+                }
+                current_section = Section::None;
+                continue;
+            }
+            if let Some(caps) = DNSSEC_PATTERN.captures(trimmed) {
+                if let Some(m) = caps.get(1) {
+                    let val = m.as_str().trim();
+                    dnssec = Some(if val.eq_ignore_ascii_case("yes") {
+                        "signedDelegation".to_string()
+                    } else {
+                        "unsigned".to_string()
+                    });
+                }
+                current_section = Section::None;
+                continue;
+            }
+            if let Some(caps) = CREATION_PATTERN.captures(trimmed) {
+                if creation_date.is_none() {
+                    if let Some(m) = caps.get(1) {
+                        creation_date = parse_date(m.as_str());
+                    }
+                }
+                current_section = Section::None;
+                continue;
+            }
+            if let Some(caps) = UPDATED_PATTERN.captures(trimmed) {
+                if updated_date.is_none() {
+                    if let Some(m) = caps.get(1) {
+                        updated_date = parse_date(m.as_str());
+                    }
+                }
+                current_section = Section::None;
+                continue;
+            }
+
+            // Section headers
+            if REGISTRAR_SECTION.is_match(trimmed) {
+                current_section = Section::Registrar;
+                continue;
+            } else if ABUSE_SECTION.is_match(trimmed) {
+                current_section = Section::Abuse;
+                continue;
+            } else if NAMESERVERS_SECTION.is_match(trimmed) {
+                current_section = Section::Nameservers;
+                continue;
+            }
+
+            // Non-indented, non-empty, non-header line
+            if !trimmed.is_empty() {
+                current_section = Section::None;
+            }
+            continue;
         }
-        None
+
+        // Indented content
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        match current_section {
+            Section::Nameservers => {
+                // Strip glue IPs if present
+                let ns = trimmed
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or(trimmed)
+                    .to_lowercase();
+                push_bounded(&mut nameservers, ns, MAX_NAMESERVERS);
+            }
+            Section::Registrar if registrar.is_none() => {
+                registrar = Some(trimmed.to_string());
+            }
+            _ => {}
+        }
+    }
+
+    WhoisResponse {
+        domain: domain.to_string(),
+        registrar,
+        creation_date,
+        updated_date,
+        nameservers,
+        status,
+        dnssec,
+        whois_server: server.to_string(),
+        raw_response: raw.to_string(),
+        // SIDN's public WHOIS omits the registrant and expiry. registrant_country
+        // is not inferred from the TLD: .nl accepts holders worldwide, and a
+        // "no match" body must not report one.
+        ..Default::default()
     }
 }
 
-impl RegistryParser for SidnParser {
-    fn supported_tlds(&self) -> &[&str] {
-        &["nl"]
+fn parse_date(date_str: &str) -> Option<DateTime<Utc>> {
+    let cleaned = date_str.trim();
+    if let Ok(d) = NaiveDate::parse_from_str(cleaned, "%Y-%m-%d") {
+        return Some(d.and_hms_opt(0, 0, 0)?.and_utc());
     }
-
-    fn parse(&self, domain: &str, server: &str, raw: &str) -> WhoisResponse {
-        let mut registrar = None;
-        let mut creation_date = None;
-        let mut updated_date = None;
-        let mut nameservers = Vec::new();
-        let mut status = Vec::new();
-        let mut dnssec = None;
-
-        #[derive(Clone, Copy)]
-        enum Section {
-            None,
-            Registrar,
-            Abuse,
-            Nameservers,
-        }
-
-        let mut current_section = Section::None;
-
-        for line in raw.lines() {
-            let trimmed = line.trim();
-
-            // Non-indented inline fields
-            if !line.starts_with(' ') && !line.starts_with('\t') {
-                if let Some(caps) = STATUS_PATTERN.captures(trimmed) {
-                    if let Some(m) = caps.get(1) {
-                        let s = m.as_str().trim().to_string();
-                        push_bounded(&mut status, s, MAX_STATUSES);
-                    }
-                    current_section = Section::None;
-                    continue;
-                }
-                if let Some(caps) = DNSSEC_PATTERN.captures(trimmed) {
-                    if let Some(m) = caps.get(1) {
-                        let val = m.as_str().trim();
-                        dnssec = Some(if val.eq_ignore_ascii_case("yes") {
-                            "signedDelegation".to_string()
-                        } else {
-                            "unsigned".to_string()
-                        });
-                    }
-                    current_section = Section::None;
-                    continue;
-                }
-                if let Some(caps) = CREATION_PATTERN.captures(trimmed) {
-                    if creation_date.is_none() {
-                        if let Some(m) = caps.get(1) {
-                            creation_date = Self::parse_date(m.as_str());
-                        }
-                    }
-                    current_section = Section::None;
-                    continue;
-                }
-                if let Some(caps) = UPDATED_PATTERN.captures(trimmed) {
-                    if updated_date.is_none() {
-                        if let Some(m) = caps.get(1) {
-                            updated_date = Self::parse_date(m.as_str());
-                        }
-                    }
-                    current_section = Section::None;
-                    continue;
-                }
-
-                // Section headers
-                if REGISTRAR_SECTION.is_match(trimmed) {
-                    current_section = Section::Registrar;
-                    continue;
-                } else if ABUSE_SECTION.is_match(trimmed) {
-                    current_section = Section::Abuse;
-                    continue;
-                } else if NAMESERVERS_SECTION.is_match(trimmed) {
-                    current_section = Section::Nameservers;
-                    continue;
-                }
-
-                // Non-indented, non-empty, non-header line
-                if !trimmed.is_empty() {
-                    current_section = Section::None;
-                }
-                continue;
-            }
-
-            // Indented content
-            if trimmed.is_empty() {
-                continue;
-            }
-
-            match current_section {
-                Section::Nameservers => {
-                    // Strip glue IPs if present
-                    let ns = trimmed
-                        .split_whitespace()
-                        .next()
-                        .unwrap_or(trimmed)
-                        .to_lowercase();
-                    push_bounded(&mut nameservers, ns, MAX_NAMESERVERS);
-                }
-                Section::Registrar if registrar.is_none() => {
-                    registrar = Some(trimmed.to_string());
-                }
-                _ => {}
-            }
-        }
-
-        WhoisResponse {
-            domain: domain.to_string(),
-            registrar,
-            creation_date,
-            updated_date,
-            nameservers,
-            status,
-            dnssec,
-            whois_server: server.to_string(),
-            raw_response: raw.to_string(),
-            // SIDN's public WHOIS omits the registrant and expiry. registrant_country
-            // is not inferred from the TLD: .nl accepts holders worldwide, and a
-            // "no match" body must not report one.
-            ..Default::default()
-        }
-    }
+    None
 }
 
 #[cfg(test)]
@@ -230,8 +218,7 @@ Record maintained by: SIDN BV"#;
 
     #[test]
     fn test_sidn_nameservers() {
-        let parser = SidnParser::new();
-        let result = parser.parse("example.nl", "whois.sidn.nl", SAMPLE_SIDN_RESPONSE);
+        let result = parse("example.nl", "whois.sidn.nl", SAMPLE_SIDN_RESPONSE);
 
         assert_eq!(result.nameservers.len(), 3);
         assert!(result
@@ -243,8 +230,7 @@ Record maintained by: SIDN BV"#;
 
     #[test]
     fn test_sidn_registrar() {
-        let parser = SidnParser::new();
-        let result = parser.parse("example.nl", "whois.sidn.nl", SAMPLE_SIDN_RESPONSE);
+        let result = parse("example.nl", "whois.sidn.nl", SAMPLE_SIDN_RESPONSE);
 
         assert_eq!(
             result.registrar,
@@ -254,24 +240,21 @@ Record maintained by: SIDN BV"#;
 
     #[test]
     fn test_sidn_status() {
-        let parser = SidnParser::new();
-        let result = parser.parse("example.nl", "whois.sidn.nl", SAMPLE_SIDN_RESPONSE);
+        let result = parse("example.nl", "whois.sidn.nl", SAMPLE_SIDN_RESPONSE);
 
         assert!(result.status.contains(&"active".to_string()));
     }
 
     #[test]
     fn test_sidn_dnssec() {
-        let parser = SidnParser::new();
-        let result = parser.parse("example.nl", "whois.sidn.nl", SAMPLE_SIDN_RESPONSE);
+        let result = parse("example.nl", "whois.sidn.nl", SAMPLE_SIDN_RESPONSE);
 
         assert_eq!(result.dnssec, Some("signedDelegation".to_string()));
     }
 
     #[test]
     fn test_sidn_dates() {
-        let parser = SidnParser::new();
-        let result = parser.parse("example.nl", "whois.sidn.nl", SAMPLE_SIDN_RESPONSE);
+        let result = parse("example.nl", "whois.sidn.nl", SAMPLE_SIDN_RESPONSE);
 
         assert!(result.creation_date.is_some());
         let creation = result.creation_date.unwrap();
@@ -290,18 +273,11 @@ Record maintained by: SIDN BV"#;
     /// registrant, so no country is reported (not even for a free name).
     #[test]
     fn test_sidn_country() {
-        let parser = SidnParser::new();
-        let result = parser.parse("example.nl", "whois.sidn.nl", SAMPLE_SIDN_RESPONSE);
+        let result = parse("example.nl", "whois.sidn.nl", SAMPLE_SIDN_RESPONSE);
         assert_eq!(result.registrant_country, None);
 
-        let result = parser.parse("nosuch-xyz.nl", "whois.sidn.nl", "nosuch-xyz.nl is free\n");
+        let result = parse("nosuch-xyz.nl", "whois.sidn.nl", "nosuch-xyz.nl is free\n");
         assert_eq!(result.registrant_country, None);
         assert!(result.is_available());
-    }
-
-    #[test]
-    fn test_supported_tlds() {
-        let parser = SidnParser::new();
-        assert_eq!(parser.supported_tlds(), &["nl"]);
     }
 }

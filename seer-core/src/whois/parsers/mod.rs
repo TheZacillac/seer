@@ -1,15 +1,15 @@
 //! Registry-specific WHOIS response parsers.
 //!
-//! This module provides a parser registry system that allows for TLD-specific
-//! parsing of WHOIS responses. Different registries use different formats,
-//! field names, and date formats, so having specialized parsers improves
-//! data extraction reliability.
+//! Registries use different formats, field names and date formats, so TLDs
+//! with a known registry format get a dedicated parser. Each parser module
+//! exposes its `TLDS` and a `parse` fn; [`parse`] dispatches on the domain's
+//! second-level zone or TLD and falls back to the generic regex parser
+//! ([`WhoisResponse::parse_internal`]) for everything else.
 
 mod denic;
 mod educause;
 mod eis;
 mod eurid;
-mod generic;
 mod isoc_il;
 mod jprs;
 mod kisa;
@@ -18,21 +18,7 @@ mod nic_lv;
 mod nominet;
 mod sidn;
 
-use std::sync::LazyLock;
-
 use super::parser::WhoisResponse;
-pub use denic::DenicParser;
-pub use educause::EducauseParser;
-pub use eis::EisParser;
-pub use eurid::EuridParser;
-pub use generic::GenericParser;
-pub use isoc_il::IsocIlParser;
-pub use jprs::JprsParser;
-pub use kisa::KisaParser;
-pub use nic_it::NicItParser;
-pub use nic_lv::NicLvParser;
-pub use nominet::NominetParser;
-pub use sidn::SidnParser;
 
 /// Maximum number of nameservers extracted from a single WHOIS response.
 /// Shared with the generic parser. Real domains have ≤ 13 NS records (DNS
@@ -55,91 +41,41 @@ pub(crate) fn push_bounded(vec: &mut Vec<String>, value: String, cap: usize) {
     }
 }
 
-/// Trait for registry-specific WHOIS parsers.
-///
-/// Implementors of this trait can provide specialized parsing logic for
-/// specific TLDs that don't follow the standard WHOIS format.
-pub trait RegistryParser: Send + Sync {
-    /// Returns the TLDs this parser handles.
-    fn supported_tlds(&self) -> &[&str];
+/// A registry parser: `(domain, whois_server, raw) -> WhoisResponse`.
+type ParseFn = fn(&str, &str, &str) -> WhoisResponse;
 
-    /// Parses a raw WHOIS response into a structured response.
-    fn parse(&self, domain: &str, server: &str, raw: &str) -> WhoisResponse;
-}
+/// Every registry parser with the TLDs (or second-level zones) it handles.
+const PARSERS: &[(&[&str], ParseFn)] = &[
+    (denic::TLDS, denic::parse),       // .de
+    (educause::TLDS, educause::parse), // .edu
+    (eis::TLDS, eis::parse),           // .ee
+    (eurid::TLDS, eurid::parse),       // .eu, .ею, .ευ
+    (isoc_il::TLDS, isoc_il::parse),   // .il (co.il, org.il, …), .ישראל
+    (jprs::TLDS, jprs::parse),         // .jp
+    (kisa::TLDS, kisa::parse),         // .kr, .한국, .삼성
+    (nic_it::TLDS, nic_it::parse),     // .it
+    (nic_lv::TLDS, nic_lv::parse),     // .lv
+    (nominet::TLDS, nominet::parse),   // .uk, .co.uk
+    (sidn::TLDS, sidn::parse),         // .nl
+];
 
-/// Registry of all available parsers.
-///
-/// The registry maintains a list of specialized parsers and falls back
-/// to the generic parser when no specialized parser is available.
-pub struct ParserRegistry {
-    parsers: Vec<Box<dyn RegistryParser>>,
-    fallback: GenericParser,
-}
-
-impl ParserRegistry {
-    /// Creates a new parser registry with all known parsers.
-    pub fn new() -> Self {
-        Self {
-            parsers: vec![
-                Box::new(DenicParser::new()),    // .de
-                Box::new(EducauseParser::new()), // .edu
-                Box::new(EisParser::new()),      // .ee
-                Box::new(EuridParser::new()),    // .eu, .ею, .ευ
-                Box::new(IsocIlParser::new()),   // .il (co.il, org.il, …), .ישראל
-                Box::new(JprsParser::new()),     // .jp
-                Box::new(KisaParser::new()),     // .kr, .한국, .삼성
-                Box::new(NicItParser::new()),    // .it
-                Box::new(NicLvParser::new()),    // .lv
-                Box::new(NominetParser::new()),  // .uk, .co.uk
-                Box::new(SidnParser::new()),     // .nl
-            ],
-            fallback: GenericParser::new(),
+/// Parses a WHOIS response with the registry parser for the domain's
+/// second-level zone (e.g. `co.uk`) or TLD, falling back to the generic
+/// parser when no registry parser claims it.
+pub(crate) fn parse(domain: &str, server: &str, raw: &str) -> WhoisResponse {
+    let zones: Vec<String> = [
+        extract_second_level_tld(domain),
+        super::get_tld(domain).map(str::to_lowercase),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    for (tlds, parse) in PARSERS {
+        if zones.iter().any(|zone| tlds.contains(&zone.as_str())) {
+            return parse(domain, server, raw);
         }
     }
-
-    /// Parses a WHOIS response using the appropriate parser for the TLD.
-    ///
-    /// This method first checks if any specialized parser handles the TLD,
-    /// and falls back to the generic parser if not.
-    pub fn parse(&self, domain: &str, server: &str, raw: &str) -> WhoisResponse {
-        // Extract TLD (and second-level TLD for ccSLDs like .co.uk)
-        let tld = extract_tld(domain);
-        let sld_tld = extract_second_level_tld(domain);
-
-        // Try to find a specialized parser
-        for parser in &self.parsers {
-            let supported = parser.supported_tlds();
-            // Check for exact second-level TLD match first (e.g., "co.uk")
-            if let Some(sld) = &sld_tld {
-                if supported.contains(&sld.as_str()) {
-                    return parser.parse(domain, server, raw);
-                }
-            }
-            // Then check for TLD match (e.g., "uk")
-            if let Some(tld) = &tld {
-                if supported.contains(&tld.as_str()) {
-                    return parser.parse(domain, server, raw);
-                }
-            }
-        }
-
-        // Fall back to generic parser
-        self.fallback.parse(domain, server, raw)
-    }
-}
-
-impl Default for ParserRegistry {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Global parser registry instance.
-pub static PARSER_REGISTRY: LazyLock<ParserRegistry> = LazyLock::new(ParserRegistry::new);
-
-/// Extracts the TLD from a domain name.
-fn extract_tld(domain: &str) -> Option<String> {
-    domain.rsplit('.').next().map(|s| s.to_lowercase())
+    WhoisResponse::parse_internal(domain, server, raw)
 }
 
 /// Extracts the second-level TLD from a domain name (e.g., "co.uk" from "example.co.uk").
@@ -161,13 +97,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_extract_tld() {
-        assert_eq!(extract_tld("example.com"), Some("com".to_string()));
-        assert_eq!(extract_tld("example.co.uk"), Some("uk".to_string()));
-        assert_eq!(extract_tld("example.de"), Some("de".to_string()));
-    }
-
-    #[test]
     fn test_extract_second_level_tld() {
         assert_eq!(
             extract_second_level_tld("example.co.uk"),
@@ -181,8 +110,7 @@ mod tests {
 
     #[test]
     fn test_parser_registry_selects_denic_for_de() {
-        let registry = ParserRegistry::new();
-        let result = registry.parse(
+        let result = parse(
             "example.de",
             "whois.denic.de",
             "Domain: example.de\nStatus: connect",
@@ -194,8 +122,7 @@ mod tests {
 
     #[test]
     fn test_parser_registry_selects_nominet_for_uk() {
-        let registry = ParserRegistry::new();
-        let result = registry.parse(
+        let result = parse(
             "example.co.uk",
             "whois.nic.uk",
             "Domain name:\n    example.co.uk\n\nRegistrar:\n    Example Registrar Ltd [Tag = EXAMPLE]\n",
@@ -206,8 +133,7 @@ mod tests {
 
     #[test]
     fn test_parser_registry_uses_generic_for_unknown() {
-        let registry = ParserRegistry::new();
-        let result = registry.parse(
+        let result = parse(
             "example.com",
             "whois.verisign-grs.com",
             "Domain Name: example.com\nRegistrar: Example Registrar, Inc.\nStatus: connect\n",
@@ -229,9 +155,8 @@ mod tests {
                    \n\
                    Primary Name Server\n\
                    \x20  Host Name                : ns1.example.kr\n";
-        let registry = ParserRegistry::new();
         for domain in ["example.xn--3e0b707e", "example.xn--cg4bki"] {
-            let result = registry.parse(domain, "whois.kr", raw);
+            let result = parse(domain, "whois.kr", raw);
             assert_eq!(
                 result.registrar.as_deref(),
                 Some("Whois Corp."),
@@ -252,9 +177,8 @@ mod tests {
                    \n\
                    Keys:\n\
                    \x20       flags:KSK protocol:3 algorithm:RSA_SHA256 pubKey:AwEAAtest\n";
-        let registry = ParserRegistry::new();
         for domain in ["example.xn--e1a4c", "example.xn--qxa6a"] {
-            let result = registry.parse(domain, "whois.eu", raw);
+            let result = parse(domain, "whois.eu", raw);
             assert_eq!(
                 result.nameservers,
                 vec!["ns1.example.eu", "ns2.example.eu"],

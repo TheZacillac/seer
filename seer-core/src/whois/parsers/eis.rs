@@ -40,7 +40,7 @@ use chrono::{DateTime, Utc};
 use regex::Regex;
 use std::sync::LazyLock;
 
-use super::{push_bounded, RegistryParser, MAX_NAMESERVERS, MAX_STATUSES};
+use super::{push_bounded, MAX_NAMESERVERS, MAX_STATUSES};
 use crate::whois::parser::WhoisResponse;
 
 static KEY_VALUE: LazyLock<Regex> = LazyLock::new(|| {
@@ -94,168 +94,156 @@ impl Section {
     }
 }
 
-/// Parser for .ee domains using the EIS section-based format.
-#[derive(Debug, Clone, Default)]
-pub struct EisParser;
+/// TLDs this parser handles.
+pub(super) const TLDS: &[&str] = &["ee"];
 
-impl EisParser {
-    pub fn new() -> Self {
-        Self
+/// Parses .ee domains using the EIS section-based format.
+pub(super) fn parse(domain: &str, server: &str, raw: &str) -> WhoisResponse {
+    let mut current = Section::None;
+
+    let mut status: Vec<String> = Vec::new();
+    let mut nameservers: Vec<String> = Vec::new();
+    let mut registrar: Option<String> = None;
+    let mut registrant: Option<String> = None;
+    let mut organization: Option<String> = None;
+    let mut registrant_country: Option<String> = None;
+    let mut registrant_email: Option<String> = None;
+    let mut registrant_phone: Option<String> = None;
+    let mut admin_name: Option<String> = None;
+    let mut admin_email: Option<String> = None;
+    let mut tech_name: Option<String> = None;
+    let mut tech_email: Option<String> = None;
+    let mut creation_date: Option<DateTime<Utc>> = None;
+    let mut expiration_date: Option<DateTime<Utc>> = None;
+    let mut updated_date: Option<DateTime<Utc>> = None;
+    let mut dnssec: Option<String> = None;
+
+    for line in raw.lines() {
+        // Skip preamble/footer chatter lines that don't match either shape.
+        if let Some(section) = parse_section_header(line) {
+            current = section;
+            continue;
+        }
+
+        let Some(caps) = KEY_VALUE.captures(line) else {
+            continue;
+        };
+        let key = caps[1].to_ascii_lowercase();
+        let value = caps[2].trim().to_string();
+        if value.is_empty() || !is_real_value(&value) {
+            continue;
+        }
+
+        match (current, key.as_str()) {
+            (Section::Domain, "status") => {
+                // EIS statuses look like `ok (paid and in zone)`; keep the
+                // short form for downstream comparisons but preserve raw
+                // in the list too if it adds info.
+                let short = value
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or(&value)
+                    .to_string();
+                push_bounded(&mut status, short, MAX_STATUSES);
+            }
+            (Section::Domain, "registered") if creation_date.is_none() => {
+                creation_date = parse_date(&value);
+            }
+            (Section::Domain, "changed") if updated_date.is_none() => {
+                updated_date = parse_date(&value);
+            }
+            (Section::Domain, "expire") if expiration_date.is_none() => {
+                expiration_date = parse_date(&value);
+            }
+            (Section::Registrant, "name") if registrant.is_none() => {
+                registrant = Some(value);
+            }
+            (Section::Registrant, "org id") if organization.is_none() => {
+                organization = Some(value);
+            }
+            (Section::Registrant, "country") if registrant_country.is_none() => {
+                registrant_country = Some(value);
+            }
+            (Section::Registrant, "email") if registrant_email.is_none() => {
+                registrant_email = Some(value);
+            }
+            (Section::Registrant, "phone") if registrant_phone.is_none() => {
+                registrant_phone = Some(value);
+            }
+            (Section::Admin, "name") if admin_name.is_none() => {
+                admin_name = Some(value);
+            }
+            (Section::Admin, "email") if admin_email.is_none() => {
+                admin_email = Some(value);
+            }
+            (Section::Tech, "name") if tech_name.is_none() => {
+                tech_name = Some(value);
+            }
+            (Section::Tech, "email") if tech_email.is_none() => {
+                tech_email = Some(value);
+            }
+            (Section::Registrar, "name") if registrar.is_none() => {
+                registrar = Some(value);
+            }
+            (Section::Nameservers, "nserver") => {
+                // EIS sometimes appends a glue IP after the host.
+                let ns = value
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or(&value)
+                    .to_ascii_lowercase();
+                push_bounded(&mut nameservers, ns, MAX_NAMESERVERS);
+            }
+            (Section::Dnssec, "dnskey") if dnssec.is_none() => {
+                dnssec = Some("signedDelegation".to_string());
+            }
+            _ => {}
+        }
     }
 
-    /// EIS dates appear in two shapes: `YYYY-MM-DD HH:MM:SS ±HH:MM` (full
-    /// timestamps for `registered:` and `changed:`) and bare `YYYY-MM-DD`
-    /// (for `expire:`). Try both.
-    fn parse_date(raw: &str) -> Option<DateTime<Utc>> {
-        let s = raw.trim();
-        if let Ok(dt) = DateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S %:z") {
-            return Some(dt.with_timezone(&Utc));
-        }
-        if let Ok(d) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
-            return Some(d.and_hms_opt(0, 0, 0)?.and_utc());
-        }
-        None
-    }
-
-    /// `email:` lines in EIS may carry a redaction placeholder; preserve only
-    /// real-looking email values.
-    fn is_real_value(value: &str) -> bool {
-        let lower = value.to_ascii_lowercase();
-        !lower.contains("not disclosed") && !lower.contains("redacted")
+    WhoisResponse {
+        domain: domain.to_string(),
+        registrar,
+        registrant,
+        organization,
+        registrant_email,
+        registrant_phone,
+        registrant_country,
+        admin_name,
+        admin_email,
+        tech_name,
+        tech_email,
+        creation_date,
+        expiration_date,
+        updated_date,
+        nameservers,
+        status,
+        dnssec,
+        whois_server: server.to_string(),
+        raw_response: raw.to_string(),
+        ..Default::default()
     }
 }
 
-impl RegistryParser for EisParser {
-    fn supported_tlds(&self) -> &[&str] {
-        &["ee"]
+/// EIS dates appear in two shapes: `YYYY-MM-DD HH:MM:SS ±HH:MM` (full
+/// timestamps for `registered:` and `changed:`) and bare `YYYY-MM-DD`
+/// (for `expire:`). Try both.
+fn parse_date(raw: &str) -> Option<DateTime<Utc>> {
+    let s = raw.trim();
+    if let Ok(dt) = DateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S %:z") {
+        return Some(dt.with_timezone(&Utc));
     }
-
-    fn parse(&self, domain: &str, server: &str, raw: &str) -> WhoisResponse {
-        let mut current = Section::None;
-
-        let mut status: Vec<String> = Vec::new();
-        let mut nameservers: Vec<String> = Vec::new();
-        let mut registrar: Option<String> = None;
-        let mut registrant: Option<String> = None;
-        let mut organization: Option<String> = None;
-        let mut registrant_country: Option<String> = None;
-        let mut registrant_email: Option<String> = None;
-        let mut registrant_phone: Option<String> = None;
-        let mut admin_name: Option<String> = None;
-        let mut admin_email: Option<String> = None;
-        let mut tech_name: Option<String> = None;
-        let mut tech_email: Option<String> = None;
-        let mut creation_date: Option<DateTime<Utc>> = None;
-        let mut expiration_date: Option<DateTime<Utc>> = None;
-        let mut updated_date: Option<DateTime<Utc>> = None;
-        let mut dnssec: Option<String> = None;
-
-        for line in raw.lines() {
-            // Skip preamble/footer chatter lines that don't match either shape.
-            if let Some(section) = parse_section_header(line) {
-                current = section;
-                continue;
-            }
-
-            let Some(caps) = KEY_VALUE.captures(line) else {
-                continue;
-            };
-            let key = caps[1].to_ascii_lowercase();
-            let value = caps[2].trim().to_string();
-            if value.is_empty() || !Self::is_real_value(&value) {
-                continue;
-            }
-
-            match (current, key.as_str()) {
-                (Section::Domain, "status") => {
-                    // EIS statuses look like `ok (paid and in zone)`; keep the
-                    // short form for downstream comparisons but preserve raw
-                    // in the list too if it adds info.
-                    let short = value
-                        .split_whitespace()
-                        .next()
-                        .unwrap_or(&value)
-                        .to_string();
-                    push_bounded(&mut status, short, MAX_STATUSES);
-                }
-                (Section::Domain, "registered") if creation_date.is_none() => {
-                    creation_date = Self::parse_date(&value);
-                }
-                (Section::Domain, "changed") if updated_date.is_none() => {
-                    updated_date = Self::parse_date(&value);
-                }
-                (Section::Domain, "expire") if expiration_date.is_none() => {
-                    expiration_date = Self::parse_date(&value);
-                }
-                (Section::Registrant, "name") if registrant.is_none() => {
-                    registrant = Some(value);
-                }
-                (Section::Registrant, "org id") if organization.is_none() => {
-                    organization = Some(value);
-                }
-                (Section::Registrant, "country") if registrant_country.is_none() => {
-                    registrant_country = Some(value);
-                }
-                (Section::Registrant, "email") if registrant_email.is_none() => {
-                    registrant_email = Some(value);
-                }
-                (Section::Registrant, "phone") if registrant_phone.is_none() => {
-                    registrant_phone = Some(value);
-                }
-                (Section::Admin, "name") if admin_name.is_none() => {
-                    admin_name = Some(value);
-                }
-                (Section::Admin, "email") if admin_email.is_none() => {
-                    admin_email = Some(value);
-                }
-                (Section::Tech, "name") if tech_name.is_none() => {
-                    tech_name = Some(value);
-                }
-                (Section::Tech, "email") if tech_email.is_none() => {
-                    tech_email = Some(value);
-                }
-                (Section::Registrar, "name") if registrar.is_none() => {
-                    registrar = Some(value);
-                }
-                (Section::Nameservers, "nserver") => {
-                    // EIS sometimes appends a glue IP after the host.
-                    let ns = value
-                        .split_whitespace()
-                        .next()
-                        .unwrap_or(&value)
-                        .to_ascii_lowercase();
-                    push_bounded(&mut nameservers, ns, MAX_NAMESERVERS);
-                }
-                (Section::Dnssec, "dnskey") if dnssec.is_none() => {
-                    dnssec = Some("signedDelegation".to_string());
-                }
-                _ => {}
-            }
-        }
-
-        WhoisResponse {
-            domain: domain.to_string(),
-            registrar,
-            registrant,
-            organization,
-            registrant_email,
-            registrant_phone,
-            registrant_country,
-            admin_name,
-            admin_email,
-            tech_name,
-            tech_email,
-            creation_date,
-            expiration_date,
-            updated_date,
-            nameservers,
-            status,
-            dnssec,
-            whois_server: server.to_string(),
-            raw_response: raw.to_string(),
-            ..Default::default()
-        }
+    if let Ok(d) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+        return Some(d.and_hms_opt(0, 0, 0)?.and_utc());
     }
+    None
+}
+
+/// `email:` lines in EIS may carry a redaction placeholder; preserve only
+/// real-looking email values.
+fn is_real_value(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    !lower.contains("not disclosed") && !lower.contains("redacted")
 }
 
 #[cfg(test)]
@@ -304,7 +292,7 @@ dnskey:    257 3 13 mdsswUyr3DPW132mOi8V9xESWE8jTo0dxCjjnopKl\n\
 changed:   2023-05-08 09:20:15 +03:00\n";
 
     fn parse(raw: &str) -> WhoisResponse {
-        EisParser::new().parse("eestienergia.ee", "whois.tld.ee", raw)
+        super::parse("eestienergia.ee", "whois.tld.ee", raw)
     }
 
     #[test]
@@ -376,11 +364,6 @@ changed:   2023-05-08 09:20:15 +03:00\n";
     fn has_core_data_for_registered() {
         let r = parse(SAMPLE);
         assert!(r.has_core_data(), "registrar+dates+ns means core present");
-    }
-
-    #[test]
-    fn supported_tlds() {
-        assert_eq!(EisParser::new().supported_tlds(), &["ee"]);
     }
 
     #[test]

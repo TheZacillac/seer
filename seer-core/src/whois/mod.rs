@@ -9,7 +9,7 @@
 
 mod client;
 mod parser;
-pub mod parsers;
+mod parsers;
 mod servers;
 
 pub use client::WhoisClient;

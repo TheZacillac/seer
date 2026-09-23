@@ -17,7 +17,7 @@ use chrono::{DateTime, NaiveDate, Utc};
 use regex::Regex;
 use std::sync::LazyLock;
 
-use super::{push_bounded, RegistryParser, MAX_NAMESERVERS};
+use super::{push_bounded, MAX_NAMESERVERS};
 use crate::whois::parser::WhoisResponse;
 
 /// Matches nameserver host lines in both Korean and English sections.
@@ -70,179 +70,166 @@ static DNSSEC_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?im)^DNSSEC[ \t]*:[ \t]*(.+)$").expect("Invalid KISA DNSSEC regex")
 });
 
-/// Parser for .kr domains using the KISA/KRNIC format.
-#[derive(Debug, Clone, Default)]
-pub struct KisaParser;
+/// TLDs this parser handles.
+/// whois.kr also serves the IDN TLDs .한국 (ccTLD) and .삼성; the
+/// client sends IDN domains to the wire as A-labels, so they reach
+/// the registry (and this dispatch) as `xn--3e0b707e` / `xn--cg4bki`.
+pub(super) const TLDS: &[&str] = &["kr", "xn--3e0b707e", "xn--cg4bki"];
 
-impl KisaParser {
-    pub fn new() -> Self {
-        Self
-    }
+/// Parses .kr domains using the KISA/KRNIC format.
+pub(super) fn parse(domain: &str, server: &str, raw: &str) -> WhoisResponse {
+    let mut nameservers = Vec::new();
+    let mut registrant = None;
+    let mut registrar = None;
+    let mut admin_name = None;
+    let mut admin_email = None;
+    let mut admin_phone = None;
+    let mut creation_date = None;
+    let mut expiration_date = None;
+    let mut updated_date = None;
+    let mut dnssec = None;
 
-    /// Parses KISA date format: "YYYY. MM. DD." (with dots and spaces)
-    fn parse_kisa_date(date_str: &str) -> Option<DateTime<Utc>> {
-        let cleaned = date_str.trim().trim_end_matches('.');
+    // Extract all nameservers from Host Name fields
+    // Use only the English section to avoid duplicates
+    let english_section = if let Some(pos) = raw.find("# ENGLISH") {
+        &raw[pos..]
+    } else {
+        raw
+    };
 
-        // KISA uses "YYYY. MM. DD." format
-        let normalized = cleaned.replace(". ", "-").replace('.', "");
-        if let Ok(d) = NaiveDate::parse_from_str(&normalized, "%Y-%m-%d") {
-            return Some(d.and_hms_opt(0, 0, 0)?.and_utc());
+    for caps in HOST_NAME_PATTERN.captures_iter(english_section) {
+        if let Some(m) = caps.get(1) {
+            let ns = m.as_str().trim().to_lowercase();
+            push_bounded(&mut nameservers, ns, MAX_NAMESERVERS);
         }
-
-        // Also try standard format
-        if let Ok(d) = NaiveDate::parse_from_str(cleaned, "%Y-%m-%d") {
-            return Some(d.and_hms_opt(0, 0, 0)?.and_utc());
-        }
-
-        None
-    }
-}
-
-impl RegistryParser for KisaParser {
-    fn supported_tlds(&self) -> &[&str] {
-        // whois.kr also serves the IDN TLDs .한국 (ccTLD) and .삼성; the
-        // client sends IDN domains to the wire as A-labels, so they reach
-        // the registry (and this dispatch) as `xn--3e0b707e` / `xn--cg4bki`.
-        &["kr", "xn--3e0b707e", "xn--cg4bki"]
     }
 
-    fn parse(&self, domain: &str, server: &str, raw: &str) -> WhoisResponse {
-        let mut nameservers = Vec::new();
-        let mut registrant = None;
-        let mut registrar = None;
-        let mut admin_name = None;
-        let mut admin_email = None;
-        let mut admin_phone = None;
-        let mut creation_date = None;
-        let mut expiration_date = None;
-        let mut updated_date = None;
-        let mut dnssec = None;
-
-        // Extract all nameservers from Host Name fields
-        // Use only the English section to avoid duplicates
-        let english_section = if let Some(pos) = raw.find("# ENGLISH") {
-            &raw[pos..]
-        } else {
-            raw
-        };
-
-        for caps in HOST_NAME_PATTERN.captures_iter(english_section) {
+    // If no English section, try the full text
+    if nameservers.is_empty() {
+        for caps in HOST_NAME_PATTERN.captures_iter(raw) {
             if let Some(m) = caps.get(1) {
                 let ns = m.as_str().trim().to_lowercase();
                 push_bounded(&mut nameservers, ns, MAX_NAMESERVERS);
             }
         }
+    }
 
-        // If no English section, try the full text
-        if nameservers.is_empty() {
-            for caps in HOST_NAME_PATTERN.captures_iter(raw) {
-                if let Some(m) = caps.get(1) {
-                    let ns = m.as_str().trim().to_lowercase();
-                    push_bounded(&mut nameservers, ns, MAX_NAMESERVERS);
-                }
+    // Extract inline fields from English section
+    if let Some(caps) = REGISTRANT_PATTERN.captures(raw) {
+        if let Some(m) = caps.get(1) {
+            let val = m.as_str().trim().to_string();
+            if !val.is_empty() {
+                registrant = Some(val);
             }
-        }
-
-        // Extract inline fields from English section
-        if let Some(caps) = REGISTRANT_PATTERN.captures(raw) {
-            if let Some(m) = caps.get(1) {
-                let val = m.as_str().trim().to_string();
-                if !val.is_empty() {
-                    registrant = Some(val);
-                }
-            }
-        }
-
-        if let Some(caps) = ADMIN_PATTERN.captures(raw) {
-            if let Some(m) = caps.get(1) {
-                let val = m.as_str().trim().to_string();
-                if !val.is_empty() {
-                    admin_name = Some(val);
-                }
-            }
-        }
-
-        if let Some(caps) = AC_EMAIL_PATTERN.captures(raw) {
-            if let Some(m) = caps.get(1) {
-                let val = m.as_str().trim().to_string();
-                if !val.is_empty() {
-                    admin_email = Some(val);
-                }
-            }
-        }
-
-        if let Some(caps) = AC_PHONE_PATTERN.captures(raw) {
-            if let Some(m) = caps.get(1) {
-                let val = m.as_str().trim().to_string();
-                if !val.is_empty() {
-                    admin_phone = Some(val);
-                }
-            }
-        }
-
-        if let Some(caps) = REGISTERED_DATE_PATTERN.captures(raw) {
-            if let Some(m) = caps.get(1) {
-                creation_date = Self::parse_kisa_date(m.as_str());
-            }
-        }
-
-        if let Some(caps) = EXPIRATION_DATE_PATTERN.captures(raw) {
-            if let Some(m) = caps.get(1) {
-                expiration_date = Self::parse_kisa_date(m.as_str());
-            }
-        }
-
-        if let Some(caps) = LAST_UPDATED_PATTERN.captures(raw) {
-            if let Some(m) = caps.get(1) {
-                updated_date = Self::parse_kisa_date(m.as_str());
-            }
-        }
-
-        if let Some(caps) = AUTHORIZED_AGENCY_PATTERN.captures(raw) {
-            if let Some(m) = caps.get(1) {
-                let val = m.as_str().trim().to_string();
-                // Strip URL in parens: "Whois Corp.(http://whois.co.kr)" → "Whois Corp."
-                let name = val.split('(').next().unwrap_or(&val).trim().to_string();
-                if !name.is_empty() {
-                    registrar = Some(name);
-                }
-            }
-        }
-
-        if let Some(caps) = DNSSEC_PATTERN.captures(raw) {
-            if let Some(m) = caps.get(1) {
-                let val = m.as_str().trim();
-                dnssec = Some(
-                    if val.eq_ignore_ascii_case("unsigned") || val.eq_ignore_ascii_case("미서명")
-                    {
-                        "unsigned".to_string()
-                    } else {
-                        "signedDelegation".to_string()
-                    },
-                );
-            }
-        }
-
-        WhoisResponse {
-            domain: domain.to_string(),
-            registrar,
-            registrant: registrant.clone(),
-            organization: registrant,
-            admin_name,
-            admin_email,
-            admin_phone,
-            creation_date,
-            expiration_date,
-            updated_date,
-            nameservers,
-            dnssec,
-            whois_server: server.to_string(),
-            raw_response: raw.to_string(),
-            // registrant_country is not inferred from the TLD: KISA does not print
-            // the holder country, and a "no match" body must not report one.
-            ..Default::default()
         }
     }
+
+    if let Some(caps) = ADMIN_PATTERN.captures(raw) {
+        if let Some(m) = caps.get(1) {
+            let val = m.as_str().trim().to_string();
+            if !val.is_empty() {
+                admin_name = Some(val);
+            }
+        }
+    }
+
+    if let Some(caps) = AC_EMAIL_PATTERN.captures(raw) {
+        if let Some(m) = caps.get(1) {
+            let val = m.as_str().trim().to_string();
+            if !val.is_empty() {
+                admin_email = Some(val);
+            }
+        }
+    }
+
+    if let Some(caps) = AC_PHONE_PATTERN.captures(raw) {
+        if let Some(m) = caps.get(1) {
+            let val = m.as_str().trim().to_string();
+            if !val.is_empty() {
+                admin_phone = Some(val);
+            }
+        }
+    }
+
+    if let Some(caps) = REGISTERED_DATE_PATTERN.captures(raw) {
+        if let Some(m) = caps.get(1) {
+            creation_date = parse_kisa_date(m.as_str());
+        }
+    }
+
+    if let Some(caps) = EXPIRATION_DATE_PATTERN.captures(raw) {
+        if let Some(m) = caps.get(1) {
+            expiration_date = parse_kisa_date(m.as_str());
+        }
+    }
+
+    if let Some(caps) = LAST_UPDATED_PATTERN.captures(raw) {
+        if let Some(m) = caps.get(1) {
+            updated_date = parse_kisa_date(m.as_str());
+        }
+    }
+
+    if let Some(caps) = AUTHORIZED_AGENCY_PATTERN.captures(raw) {
+        if let Some(m) = caps.get(1) {
+            let val = m.as_str().trim().to_string();
+            // Strip URL in parens: "Whois Corp.(http://whois.co.kr)" → "Whois Corp."
+            let name = val.split('(').next().unwrap_or(&val).trim().to_string();
+            if !name.is_empty() {
+                registrar = Some(name);
+            }
+        }
+    }
+
+    if let Some(caps) = DNSSEC_PATTERN.captures(raw) {
+        if let Some(m) = caps.get(1) {
+            let val = m.as_str().trim();
+            dnssec = Some(
+                if val.eq_ignore_ascii_case("unsigned") || val.eq_ignore_ascii_case("미서명") {
+                    "unsigned".to_string()
+                } else {
+                    "signedDelegation".to_string()
+                },
+            );
+        }
+    }
+
+    WhoisResponse {
+        domain: domain.to_string(),
+        registrar,
+        registrant: registrant.clone(),
+        organization: registrant,
+        admin_name,
+        admin_email,
+        admin_phone,
+        creation_date,
+        expiration_date,
+        updated_date,
+        nameservers,
+        dnssec,
+        whois_server: server.to_string(),
+        raw_response: raw.to_string(),
+        // registrant_country is not inferred from the TLD: KISA does not print
+        // the holder country, and a "no match" body must not report one.
+        ..Default::default()
+    }
+}
+
+/// Parses KISA date format: "YYYY. MM. DD." (with dots and spaces)
+fn parse_kisa_date(date_str: &str) -> Option<DateTime<Utc>> {
+    let cleaned = date_str.trim().trim_end_matches('.');
+
+    // KISA uses "YYYY. MM. DD." format
+    let normalized = cleaned.replace(". ", "-").replace('.', "");
+    if let Ok(d) = NaiveDate::parse_from_str(&normalized, "%Y-%m-%d") {
+        return Some(d.and_hms_opt(0, 0, 0)?.and_utc());
+    }
+
+    // Also try standard format
+    if let Ok(d) = NaiveDate::parse_from_str(cleaned, "%Y-%m-%d") {
+        return Some(d.and_hms_opt(0, 0, 0)?.and_utc());
+    }
+
+    None
 }
 
 #[cfg(test)]
@@ -305,8 +292,7 @@ Secondary Name Server
 
     #[test]
     fn test_kisa_nameservers() {
-        let parser = KisaParser::new();
-        let result = parser.parse("google.kr", "whois.kr", SAMPLE_KISA_RESPONSE);
+        let result = parse("google.kr", "whois.kr", SAMPLE_KISA_RESPONSE);
 
         assert_eq!(result.nameservers.len(), 2);
         assert!(result.nameservers.contains(&"ns1.google.com".to_string()));
@@ -315,24 +301,21 @@ Secondary Name Server
 
     #[test]
     fn test_kisa_registrant() {
-        let parser = KisaParser::new();
-        let result = parser.parse("google.kr", "whois.kr", SAMPLE_KISA_RESPONSE);
+        let result = parse("google.kr", "whois.kr", SAMPLE_KISA_RESPONSE);
 
         assert_eq!(result.registrant, Some("Google Korea, LLC".to_string()));
     }
 
     #[test]
     fn test_kisa_registrar() {
-        let parser = KisaParser::new();
-        let result = parser.parse("google.kr", "whois.kr", SAMPLE_KISA_RESPONSE);
+        let result = parse("google.kr", "whois.kr", SAMPLE_KISA_RESPONSE);
 
         assert_eq!(result.registrar, Some("Whois Corp.".to_string()));
     }
 
     #[test]
     fn test_kisa_admin_contact() {
-        let parser = KisaParser::new();
-        let result = parser.parse("google.kr", "whois.kr", SAMPLE_KISA_RESPONSE);
+        let result = parse("google.kr", "whois.kr", SAMPLE_KISA_RESPONSE);
 
         assert_eq!(result.admin_name, Some("Domain Administrator".to_string()));
         assert_eq!(result.admin_email, Some("dns-admin@google.com".to_string()));
@@ -341,8 +324,7 @@ Secondary Name Server
 
     #[test]
     fn test_kisa_dates() {
-        let parser = KisaParser::new();
-        let result = parser.parse("google.kr", "whois.kr", SAMPLE_KISA_RESPONSE);
+        let result = parse("google.kr", "whois.kr", SAMPLE_KISA_RESPONSE);
 
         assert!(result.creation_date.is_some());
         let creation = result.creation_date.unwrap();
@@ -365,8 +347,7 @@ Secondary Name Server
 
     #[test]
     fn test_kisa_dnssec() {
-        let parser = KisaParser::new();
-        let result = parser.parse("google.kr", "whois.kr", SAMPLE_KISA_RESPONSE);
+        let result = parse("google.kr", "whois.kr", SAMPLE_KISA_RESPONSE);
 
         assert_eq!(result.dnssec, Some("unsigned".to_string()));
     }
@@ -375,30 +356,20 @@ Secondary Name Server
     /// particular not for an unregistered domain.
     #[test]
     fn test_kisa_country() {
-        let parser = KisaParser::new();
-        let result = parser.parse("google.kr", "whois.kr", SAMPLE_KISA_RESPONSE);
+        let result = parse("google.kr", "whois.kr", SAMPLE_KISA_RESPONSE);
         assert_eq!(result.registrant_country, None);
 
         let raw = "query : nosuch-xyz.kr\n\n\
                    The requested domain was not found in the Registry or Registrar\u{2019}s WHOIS Server.\n";
-        let result = parser.parse("nosuch-xyz.kr", "whois.kr", raw);
+        let result = parse("nosuch-xyz.kr", "whois.kr", raw);
         assert_eq!(result.registrant_country, None);
         assert!(result.is_available());
     }
 
     #[test]
     fn test_kisa_date_parsing() {
-        assert!(KisaParser::parse_kisa_date("2007. 03. 02.").is_some());
-        assert!(KisaParser::parse_kisa_date("2010. 10. 04.").is_some());
-    }
-
-    #[test]
-    fn test_supported_tlds() {
-        let parser = KisaParser::new();
-        assert_eq!(
-            parser.supported_tlds(),
-            &["kr", "xn--3e0b707e", "xn--cg4bki"]
-        );
+        assert!(parse_kisa_date("2007. 03. 02.").is_some());
+        assert!(parse_kisa_date("2010. 10. 04.").is_some());
     }
 
     /// An EMPTY `Registrant :` field must not capture the following line
@@ -412,7 +383,7 @@ Secondary Name Server
                    Registrant Address          : 22nd Floor, Seoul\n\
                    Authorized Agency           : \n\
                    DNSSEC                      : unsigned\n";
-        let result = KisaParser::new().parse("example.kr", "whois.kr", raw);
+        let result = parse("example.kr", "whois.kr", raw);
         assert_eq!(result.registrant, None);
         assert_eq!(result.registrar, None);
         assert_eq!(result.dnssec.as_deref(), Some("unsigned"));
