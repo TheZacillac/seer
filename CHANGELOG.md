@@ -1187,15 +1187,30 @@ The project's foundational period, summarized — see the
   concurrent operations, watchlist, history, diff, a user config file
   (`~/.seer/config.toml`), and human/JSON/YAML/Markdown output formatters.
 
-Two notable breaking changes landed in this period (see `CLAUDE.md` for details):
+Two notable breaking changes landed in this period:
 
-- **2026-04-20** — the API default bind moved from `0.0.0.0` to `127.0.0.1`, a
-  public bind without `SEER_API_KEY` now hard-fails startup, multi-worker setups
-  on a `memory://` rate-limit store are refused, and `/docs` is disabled by
-  default (set `SEER_DOCS_ENABLED=true`).
-- **2026-05-27** — the propagation result shape changed: `consensus_values` and
-  `inconsistencies` became typed (`ConsensusValue` / `Inconsistency`) instead of
-  pre-formatted strings.
+- **2026-04-20 — secure-by-default API deployment.** The default bind moved
+  from `0.0.0.0` to `127.0.0.1`, and the lifespan hook now hard-fails startup
+  (it previously only logged a warning) in two cases: `SEER_HOST` is not
+  loopback and `SEER_API_KEY` is unset, or `WEB_CONCURRENCY > 1` runs on the
+  `memory://` rate-limit store (per-worker limiters would be bypassable, so
+  multi-worker deployments must configure a shared store such as Redis).
+  `/docs`, `/redoc` and `/openapi.json` are disabled by default; set
+  `SEER_DOCS_ENABLED=true` to re-enable them.
+- **2026-05-27 — typed propagation results.** `PropagationResult.consensus_values`
+  and `PropagationResult.inconsistencies` on `/propagation/*` (and the
+  equivalent MCP tool) changed shape:
+  - `consensus_values` was `Vec<String>` (e.g. `["1.2.3.4"]`). It is now
+    `Vec<ConsensusValue>`, each entry `{"type": "A", "value": "1.2.3.4"}`, so
+    consumers no longer have to cross-reference `record_type`.
+  - `inconsistencies` was `Vec<String>` of pre-formatted lines
+    (`"Quad9 (9.9.9.9): 5.6.7.8 vs consensus: 1.2.3.4"`). It is now
+    `Vec<Inconsistency>`, each entry `{"type": "A", "server_name": "Quad9",
+    "server_ip": "9.9.9.9", "values": ["5.6.7.8"], "consensus": ["1.2.3.4"]}`.
+    The `Display` impl reproduces the old line (now `[A]`-tagged) for logs.
+
+  The human and markdown formatters group both fields by record type and
+  omit the per-type subheader when only one type is present.
 
 [Unreleased]: https://github.com/TheZacillac/seer/compare/v0.48.0...HEAD
 [0.48.0]: https://github.com/TheZacillac/seer/compare/v0.47.0...v0.48.0
