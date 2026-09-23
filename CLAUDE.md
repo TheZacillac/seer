@@ -19,7 +19,8 @@ workflows, and the rules the code follows.
 **Rust Core:**
 - Tokio (async runtime)
 - Reqwest (HTTP client)
-- Hickory-resolver (DNS resolution)
+- Hickory-resolver (DNS resolution, incl. DoT/DoH)
+- Rustls on aws-lc-rs (the only TLS/crypto stack — no OpenSSL, no ring)
 - Serde (serialization)
 - Thiserror (error handling)
 
@@ -83,7 +84,7 @@ All business logic and domain operations live here:
 
 ```
 seer-core/src/
-├── lib.rs              # Module exports and re-exports
+├── lib.rs              # Module exports and re-exports; crate-internal static_regex! macro
 ├── error.rs            # Centralized error types (SeerError enum)
 ├── colors.rs           # Catppuccin color palette for terminal output
 ├── config.rs           # User config file (~/.seer/config.toml), clamped ranges; [watch]/[tui] tables
@@ -92,18 +93,19 @@ seer-core/src/
 ├── availability.rs     # Domain availability detection (RDAP 404 + DNS + patterns)
 ├── domain_info.rs      # Merged RDAP + WHOIS flat structure
 ├── retry.rs            # RetryPolicy/RetryExecutor: exponential backoff + jitter
-├── cache.rs            # Generic TtlCache (stale-while-revalidate, capacity-bounded)
+├── cache.rs            # Generic capacity-bounded TtlCache (plain TTL expiry)
 ├── net.rs              # SSRF guards: resolve/validate public hosts (refuses loopback/private)
-├── validation.rs       # Domain normalization, reserved-IP checks, SEER_DOMAIN_ALLOWLIST
+├── validation.rs       # Domain normalization, reserved-IP descriptions, SEER_DOMAIN_ALLOWLIST
 ├── psl.rs              # (private) Public Suffix List: registrable-domain boundary (example.co.uk)
 ├── dates.rs            # (private) shared "days until expiry" arithmetic
-├── fsutil.rs           # (private) atomic owner-only saves for the ~/.seer stores
-├── ssl.rs              # SSL chain inspection (single-attempt by design)
+├── fsutil.rs           # (private) atomic owner-only saves + persisted_store! for the ~/.seer stores
+├── ssl.rs              # SSL inspection: full presented chain + negotiated TLS version (single-attempt)
+├── tls.rs              # (private) inspection-only rustls handshake + RFC 6125 host matching (ssl + status)
 ├── caa.rs              # CAA policy lookup + issuer comparison
 ├── posture.rs          # Email/DNS security posture: SPF/DMARC/MTA-STS/BIMI/DANE verdicts
 ├── headers.rs          # HTTP security-header + cookie audit, weighted 0-100 score -> A+-F grade
 ├── takeover.rs         # Subdomain takeover: provider CNAME match + HTTP body fingerprint confirmation
-├── http.rs             # (private) SSRF-guarded HTTP GET: manual per-hop redirect validation, pinned addrs, capped body
+├── http.rs             # (private) SSRF-guarded HTTP GET (status/headers/takeover) + shared capped body reader
 ├── confusables.rs      # Typosquat/homoglyph look-alike generation + registration scoring
 ├── subdomains/         # Subdomain enumeration via CT logs: ordered source chain (crt.sh→certspotter) + per-source retry treating crt.sh 404/429/HTML-body as transient
 ├── diff.rs             # Side-by-side domain comparison
@@ -113,13 +115,13 @@ seer-core/src/
 ├── history.rs          # Lookup history
 ├── logging.rs          # tracing setup (+ optional OTel via `otel` feature)
 │
-├── whois/              # WHOIS: TCP client w/ referral following, parsers/ registry, TLD map
+├── whois/              # WHOIS: TCP client w/ referral following, parsers/ fn table, servers.rs TLD tables
 ├── rdap/               # RDAP: HTTP client, IANA bootstrap (+bootstrap.rs), types
 ├── dns/                # DNS: resolver, records, propagation/, compare, follow, DNSSEC, delegation
 ├── status/             # Domain health: HTTP/SSL/expiration/DNS (single-attempt by design)
 ├── tld/                # TLD info (WHOIS server, RDAP endpoint, registry URL)
 ├── bulk/               # Concurrent bulk executor + domain-list parsing
-└── output/             # OutputFormat enum + human/ (colored), markdown/, json, yaml
+└── output/             # OutputFormatter (macro-generated) + human/, markdown/, json, yaml, contact.rs
 ```
 
 Each directory module's `mod.rs` opens with a `//!` overview (rendered on
@@ -129,35 +131,41 @@ docs.rs); there are no per-module README files.
 
 - **error.rs**: All error types in one place, uses thiserror
 - **config.rs**: Loads `~/.seer/config.toml` (timeouts, concurrency, output format, nameserver, `[watch] webhook_url`, `[tui] theme`); values clamped to safe ranges; `seer config --init` scaffolds it
-- **whois/**: WHOIS protocol, parsing (per-registry `parsers/` registry), referral following (max depth: 3), IANA discovery fallback for unmapped TLDs (24h TTL cache)
+- **whois/**: WHOIS protocol, referral following (max depth: 3), IANA discovery fallback for unmapped TLDs (24h TTL cache). Registry parsers are a private static table in `parsers/mod.rs`: each module exposes `const TLDS` + `fn parse`, matched by second-level zone or TLD in table order, falling back to `WhoisResponse::parse_internal`. Field regexes are built from label lists (`field_patterns` / `line_field_patterns`), and registry dates go through the shared `whois::parse_date`. `servers.rs` keeps its map as whitespace-separated data: `NIC_TLDS` (served at `whois.nic.<tld>`), `HOSTED_TLDS` (host → TLD rows) and `IDN_ALIASES` (U-labels resolved to their A-label's server). Keep the lists sorted; `server_tables_list_each_tld_once` guards duplicates
 - **rdap/**: RDAP protocol, IANA bootstrap caching (24h TTL, stale-while-revalidate), domain/IP/ASN lookups, multi-candidate base-URL fallback, 429 Retry-After honoring
-- **dns/**: DNS resolution (16 record types), propagation checking (30 servers), compare, follow (live monitor), DNSSEC validation, NS delegation health (delegation.rs: parent NS set vs zone NS RRset + per-server RD=0 lameness probes, SSRF-vetted)
-- **status/**: HTTP status, SSL certificates, domain expiration checking — deliberately single-attempt (see module docs: health probes must not retry-mask flakiness)
+- **dns/**: DNS resolution (16 record types; default upstream Google Public DNS, or a custom UDP/`tls://`/`https://` nameserver), propagation checking (30 servers), compare, follow (live monitor), DNSSEC validation, NS delegation health (delegation.rs: parent NS set vs zone NS RRset + per-server RD=0 lameness probes, SSRF-vetted). A hostname nameserver's resolved upstreams are ordered **IPv4 first**: hickory's `lookup_ip` returns AAAA first, and the pool races only the first 2 servers under one per-query deadline, so on a host with an IPv6 route but no IPv6 transit an AAAA-first list timed out. Pinned-server configs share `single_server_config` / `google_or_pinned` / `fqdn` in `resolver.rs`
+- **status/**: HTTP status, SSL certificates, domain expiration, DNS — deliberately single-attempt (see module docs: health probes must not retry-mask flakiness). The HTTP sub-check goes through `http::GuardedFetcher::send` and reads the body only for a 2xx `text/html` response; the TLS sub-check shares `tls::inspect` with `ssl.rs`
+- **ssl.rs / tls.rs**: certificate inspection over rustls on aws-lc-rs, selected per config with `ClientConfig::builder_with_provider` (no process-global provider). The `InspectOnly` verifier accepts any chain — trust is reported, never enforced — but still verifies the TLS 1.2/1.3 handshake signature. Consequence: servers offering only pre-TLS-1.2 or non-AEAD suites, or whose leaf key aws-lc-rs cannot verify (e.g. RSA < 2048 bits), fail with an explanatory error instead of being inspected. `ssl` reports the full chain as presented (leaf first) and the negotiated `TLSv1.3`/`TLSv1.2`. `tls::cert_matches_host` is the one RFC 6125 §6.4.4 hostname rule for both `ssl` and `status`: dNSName SANs decide alone, the CN counts only when there is no dNSName SAN, and an IP-literal host matches an equal iPAddress SAN
 - **lookup.rs**: Smart lookup orchestration (RDAP → WHOIS fallback)
 - **doctor.rs**: `seer doctor` diagnosis — 4 concurrent probes (config parse, DNS resolve, WHOIS port-43, RDAP bootstrap HTTPS), each stage-bounded (exchange legs 5s; the WHOIS probe's resolution stage runs through `net::resolve_public_host`, separately capped there, for parity with how production WHOIS connects); `overall` = worst check (malformed config = Warn since defaults still work; unreachable network = Fail); probe endpoints injectable via `#[cfg(test)]`-only seams
 - **webhook.rs**: SSRF-guarded JSON webhook delivery for `seer watch --webhook` — resolved addresses vetted then pinned on the client (rebinding defense), redirects disabled, single-attempt, 10s timeout, non-2xx surfaces status only (never the body)
 - **headers.rs**: `seer headers` — one non-intrusive GET graded across the security headers (HSTS, CSP, XFO, nosniff, Referrer-Policy, Permissions-Policy, COOP/COEP/CORP), every `Set-Cookie`'s Secure/HttpOnly/SameSite flags, and version-disclosing banners. Weighted 0–100 score (weights sum to 100, asserted by a test) minus bounded cookie/disclosure penalties → A+–F. Verdicts reuse posture's Absent/Weak/Moderate/Strict/Present scale; CSP `frame-ancestors` counts as superseding `X-Frame-Options`. All grading is pure and unit-tested; only the fetch is async
-- **takeover.rs**: `seer takeover` — the HTTP half of subdomain-takeover detection. `subdomains/classify.rs` already flags a dangling CNAME whose name stops resolving; this catches the commoner case where the provider still answers for a deprovisioned resource and only the response *body* says otherwise. 27 provider fingerprints; `Vulnerable` requires a matched body marker and always records it as evidence, `Potential` is an unconfirmable dangling CNAME — never promote one to the other without evidence. Hosts whose CNAME matches no provider are never fetched, bounding the HTTP fan-out
-- **http.rs** (private): SSRF-guarded HTTP GET shared by headers/takeover. Redirects are followed **manually** with `net::validate_http_url` re-run at every hop — reqwest's own redirect policy would skip the guard (redirect-SSRF bypass) — validated addresses are pinned per hop against rebinding, and the body streams under an incremental cap. Single-attempt, like status/ssl
-- **bulk/**: `BulkExecutor` — bounded concurrent fan-out (`buffer_unordered`) paced by a slot-based rate limiter; per-row results never abort the batch; plain-text/CSV domain-list parsing
+- **takeover.rs**: `seer takeover` — the HTTP half of subdomain-takeover detection. `subdomains/classify.rs` already flags a dangling CNAME whose name stops resolving; this catches the commoner case where the provider still answers for a deprovisioned resource and only the response *body* says otherwise. 27 provider fingerprints in `takeover::PROVIDERS`, the single table `classify.rs` also matches against (via `match_provider`) — never add a second copy; `Vulnerable` requires a matched body marker and always records it as evidence, `Potential` is an unconfirmable dangling CNAME — never promote one to the other without evidence. Hosts whose CNAME matches no provider are never fetched, bounding the HTTP fan-out
+- **http.rs** (private): SSRF-guarded HTTP GET shared by status/headers/takeover (`GuardedFetcher::send` returns the unread response, `read_body` applies the cap). Redirects are followed **manually** with `net::validate_http_url` re-run at every hop — reqwest's own redirect policy would skip the guard (redirect-SSRF bypass) — and validated addresses are pinned per hop against rebinding. `read_body_capped(.., Overflow::{Truncate, Reject})` is the one incremental body reader, also used by the RDAP and CT-log clients. Single-attempt, like status/ssl
+- **bulk/**: `BulkExecutor` — bounded concurrent fan-out (`buffer_unordered`) paced by a slot-based rate limiter; per-row results never abort the batch; plain-text/CSV domain-list parsing. Build a batch with `execute_each(domains, |d| BulkOperation::…)` (or `execute`/`execute_streaming` on prepared operations); dispatch lives in the private `run_op`
+- **cache.rs**: `TtlCache`, a plain capacity-bounded TTL cache (no stale-while-revalidate API). The RDAP bootstrap keeps its own stale-while-revalidate logic
+- **fsutil.rs** (private): `persisted_store!(Type, "file", json|toml, "label")` generates `path`/`load`/`load_from_path`/`save`/`save_to_path` for the `~/.seer` stores (history, watchlist, subdomain baselines) with atomic owner-only writes and corrupt-file backup
 - **retry.rs**: Shared retry framework — used by WHOIS/RDAP clients; dns/status/ssl intentionally don't (documented at their module level)
-- **net.rs / validation.rs**: SSRF protection — all outbound hosts resolved and checked against reserved/private ranges before connect. `net::validate_http_url` is the single URL-shaped entry point (scheme, no credentials, ports 80/443 only, reserved-range check) shared by every HTTP fetch path — status, headers, takeover — so the policy cannot drift between them
-- **output/**: Human (colored), JSON, YAML, and Markdown formatters behind `get_formatter(OutputFormat)`
-- **colors.rs**: Catppuccin Frappe color palette
+- **net.rs / validation.rs**: SSRF protection — all outbound hosts resolved and checked against reserved/private ranges (`net::is_reserved_ip`) before connect. `net::validate_http_url` is the single URL-shaped entry point (scheme, no credentials, ports 80/443 only, reserved-range check) shared by every HTTP fetch path — status, headers, takeover — so the policy cannot drift between them. `net::client_builder(timeout)` is the base reqwest builder for every leg and always disables automatic redirects; `net::url_host` unbrackets IPv6 hosts; `net::USER_AGENT` identifies seer's own probes
+- **output/**: Human (colored), JSON, YAML, and Markdown formatters behind `get_formatter(OutputFormat)`. `with_report_methods!` in `output/mod.rs` is the single list of `OutputFormatter` methods — it generates the trait, the JSON/YAML impls and the forwarding impls — so a new report type is one row there plus human and markdown inherent methods. `output/contact.rs` is the one contact view (`Contact`, `FlatContacts`, `ROLES`) every formatter renders registrant/admin/tech/billing through. Human label/value rows go through the private `Rows` writer and markdown through `Bullets`/`code_list`; both sanitize internally, so a row written through them cannot skip the terminal-injection / markdown escaping (bespoke layouts — tables, glyph lists — still sanitize by hand)
+- **colors.rs**: Catppuccin Frappe color palette; the `CatppuccinExt` trait is generated from one `palette!` table
+- **lib.rs**: `static_regex! { NAME = r"…"; }` declares `LazyLock<Regex>` statics crate-wide (whois parsers, lookup)
 
 ### seer-cli/ (CLI Application)
 
 ```
 seer-cli/src/
-├── main.rs             # Entry point, clap commands, subcommand dispatch
-├── ops.rs              # Shared CLI/REPL pipelines (bulk op mapping, domain-list validation, drift/history snapshots)
-├── payload.rs          # Payload enum over formatter-backed results (TUI raw view + `y` copy, REPL `copy`)
-├── utils.rs            # Shared helpers: bulk CSV export, raw-mode guard, follow key loop, bulk input readers
+├── main.rs             # Entry point, clap commands, execute_command dispatch, exit_code(&Payload)
+├── query.rs            # Query enum + Clients + run() -> Outcome: the single-shot pipeline shared by CLI and REPL
+├── ops.rs              # Shared CLI/REPL/TUI pieces: BULK_OPS catalog, bulk bar/banner/CSV/summary, run_live_follow, watch/history bodies, lookup_source
+├── payload.rs          # Payload enum (serde untagged) over every single-shot result: -q JSON, TUI raw view + `y` copy, REPL `copy`
+├── utils.rs            # Shared helpers: table-driven bulk CSV export, raw-mode guard, follow key loop, bulk input readers
 ├── clipboard.rs        # OSC52 terminal clipboard copy
 ├── repl/               # Interactive REPL
 │   ├── mod.rs          # REPL main loop, session state
-│   ├── commands.rs     # Command parsing and context
-│   └── completer.rs    # Tab completion
+│   ├── catalog.rs      # Command table: names, aliases, usage, help — drives completion/hints/help/usage errors
+│   ├── commands.rs     # CommandContext + parse_query (REPL syntax -> Query)
+│   └── completer.rs    # Tab completion + hints (reads catalog.rs)
 ├── display/            # Terminal progress UI
 │   ├── spinner.rs      # Loading spinner for async operations
 │   └── progress.rs     # Bulk progress bar that keeps tracing output from tearing it
@@ -167,26 +175,45 @@ seer-cli/src/
     ├── action.rs       # FetchReq / Action / Msg / LensData / InputMode types
     ├── command.rs      # `:` command-line parser
     ├── event.rs        # normal-mode key → action mapping
-    ├── data.rs         # async seer-core dispatch (the only core-coupled module)
+    ├── data.rs         # async seer-core dispatch for lens fetches (mod.rs runs the follow/bulk streams)
     ├── filter.rs       # in-lens row filtering for the table lenses
     ├── line_editor.rs  # cursor-aware single-line editor for every input field
     ├── theme.rs        # Catppuccin Frappé + Latte palettes → ratatui Color (Theme::from_name)
     ├── render.rs       # frame rendering (shell + lens dispatch)
-    ├── widgets/        # panel, kv, gauge, dot, chips
+    ├── test_util.rs    # (cfg(test)) render_text / render_lines / render_buffer over a TestBackend
+    ├── widgets/        # panel (panel::render → inner Rect), kv, gauge, dot, chips; or_dash, row_style
     ├── panes/          # interactive lens components (tld/dns/compare/diff/follow/bulk): state + handle_key
-    └── lenses/         # registry + all 18 lens renderers
+    └── lenses/         # static LENSES registry (lens(key, label, glyph, group) + .cmd()/.tabs()) + 18 renderers
 ```
 
 **Key Points:**
 - Uses Clap v4 with derive macros
 - Defaults to REPL when no command provided
 - Supports global `--format` flag (human/json/yaml/markdown) — must be placed before the subcommand
+- **One single-shot pipeline.** Every single-shot command (lookup, whois,
+  dig, status, ssl, … 23 in all) is a `query::Query`. The CLI's
+  `execute_command` converts its clap subcommand into one, the REPL's
+  `commands::parse_query` converts its own syntax, and both call
+  `query::run(query, clients, config, spin)`, which returns an `Outcome`
+  (`payload` + stderr `note`/`footnote`). The CLI renders it through
+  `-q`/`--fields` or `payload::serialize`; the REPL prints it and keeps the
+  payload for `copy`. Bulk, follow, watch, history and tui are handled
+  outside the pipeline, over shared `ops.rs` helpers.
+- **Check-style exit codes** all live in `main.rs` `exit_code(&Payload)`,
+  pinned by a table test (a scripting contract): `status`, `avail`, `dnssec`,
+  `compare`, `drift`, `takeover`, `subdomains --diff`, `doctor` and
+  `delegation` exit 1 when their check fails. `cli_spinner()` lists the
+  commands that show a spinner in one-shot mode.
+- **Catalogs.** `ops::BULK_OPS` (name, description) drives the clap
+  `OPERATION` help, the REPL completer and `bulk -h`, and the TUI's bulk
+  presets; `repl/catalog.rs` drives REPL completion, hints, `help` and every
+  usage error. Add a command or bulk op there, not in each consumer.
 - `seer generate-key` mints a random API key (OsRng, 256-bit, URL-safe base64) for `SEER_API_KEY`
 - `seer doctor` runs `seer_core::doctor` and exits 1 only when `overall` is
-  FAIL (WARN exits 0 — documented in its help). Rendering lives in the shared
-  `pub(crate) render_doctor_report` (main.rs), used by both the CLI and the
-  REPL `doctor` command since no `OutputFormatter` method exists for doctor
-  reports.
+  FAIL (WARN exits 0 — documented in its help). Rendering lives in
+  `pub(crate) render_doctor_report` (main.rs), reached through
+  `payload::serialize` by both the CLI and the REPL, since no
+  `OutputFormatter` method exists for doctor reports.
 - `seer dnssec <domain>` is check-style: exits 1 unless `report.status ==
   "signed"` (core's vocabulary is `signed | unsigned | partial |
   misconfigured` — it never says "secure").
@@ -219,10 +246,14 @@ seer-cli/src/
   lenses are wired with live data + full in-pane inputs, including the streaming
   Follow (live monitor) and Bulk (concurrent + CSV export) lenses. A per-lens /
   per-stream generation guard drops stale async results (on domain/tab change or
-  run restart). Two themes: Catppuccin Frappé (default) and Latte (light) —
-  startup theme from `[tui] theme` in the config (`SeerConfig::tui_theme()`
-  clamps unknown names to "frappe"), switchable live with `:theme <name>`
-  through `App::set_theme_by_name`.
+  run restart), and a list lens's selection is clamped whenever its data
+  lands, so a shorter refresh never leaves it past the last row. Every core
+  call honors the user config (clients via `*::from_config`), including the
+  live follow (`DnsFollower::from_config` + `config.nameserver`). Two themes:
+  Catppuccin Frappé (default) and Latte (light) — startup theme from
+  `[tui] theme` in the config (`SeerConfig::tui_theme()` clamps unknown names
+  to "frappe"), switchable live with `:theme <name>` through
+  `App::set_theme_by_name`.
 
 ### seer-py/ (Python Bindings)
 
@@ -230,14 +261,27 @@ seer-cli/src/
 seer-py/
 ├── Cargo.toml          # Library config with crate-type = ["cdylib"]
 ├── pyproject.toml      # Maturin build config, ABI3 (Python 3.10+); version from the Cargo workspace
-├── src/lib.rs          # PyO3 bindings, async→sync conversion
+├── src/lib.rs          # PyO3 bindings, async→sync conversion, declarative #[pymodule] mod _seer
+├── tests/              # pytest; conftest.py gates @pytest.mark.live tests on SEER_LIVE_TESTS=1
 └── python/seer/        # Python wrapper package
-    └── __init__.py     # Re-exports and convenience functions
+    └── __init__.py     # Explicit re-exports + __all__; `rdap = rdap_auto` alias
 ```
 
 **Key Points:**
-- Single Tokio runtime via `OnceLock` (thread-safe singleton)
+- Single Tokio runtime via `OnceLock` (thread-safe singleton); `run_async`
+  wraps every call in one `catch_unwind`
 - All async Rust functions exposed synchronously to Python
+- Bindings are table-driven: `singletons!` defines the per-client `OnceLock`
+  getters, `call_fn!` the single-argument bindings (doc comments become
+  `__doc__`), and `bulk_fn!` the domain-only bulk bindings over one
+  non-generic `execute_bulk`. `bulk_dig`/`bulk_propagation` stay hand-written
+  to keep their validation order. A new binding is also added to the
+  `#[pymodule_export]` list
+- `#[pymodule_init]` installs the `pyo3_log` bridge at import, so `log` and
+  `tracing` records reach Python `logging` (there is no init function to call)
+- `nameserver_target(spec)` exposes `seer_core::dns::NameserverSpec::parse`
+  (pure parsing) so seer-api's SSRF guard checks exactly the address the
+  resolver would contact
 - Custom `json_to_python()` converter for serde_json → Python objects
 - `SeerError` maps to `ValueError` (invalid input), `TimeoutError`,
   `ConnectionError` (WHOIS connect failures) or `RuntimeError`, always with the
@@ -250,12 +294,13 @@ seer-api/
 ├── pyproject.toml          # Entry points: seer-api, seer-mcp
 └── seer_api/
     ├── main.py             # FastAPI app: bearer-token auth, middleware stack, lifespan startup checks
+    ├── _contract.py        # shared bulk limits/models, record-type + TLD validators, BULK/HEAVY rate limits
     ├── _env.py             # strict integer env-var parsing
     ├── _run.py             # run_seer: bounded dispatch pool + SEER_REQUEST_TIMEOUT deadline
-    ├── errors.py           # http_error: exception → sanitized HTTP status mapping
+    ├── errors.py           # http_error (exception → sanitized status) + as_http (await a core call under it)
     ├── limiting.py         # rate limiter + proxy-aware client-IP keying
     ├── middleware.py       # body-size cap, request logging + /metrics counters
-    ├── ssrf.py             # SSRF guard for user-supplied connect targets (status hosts, nameservers)
+    ├── ssrf.py             # SSRF guard for user-supplied connect targets (hosts; nameservers via seer.nameserver_target)
     ├── streaming.py        # SSE bulk-stream plumbing
     ├── routers/            # API endpoints by feature
     │   ├── lookup.py       # Smart lookup (single + bulk)
@@ -268,7 +313,7 @@ seer-api/
     │   ├── intel.py        # availability/info/subdomains/dnssec/delegation/diff/caa/posture/headers/takeover/confusables routers
     │   └── tld.py          # TLD info (/tld/{tld}) + full catalog (/tld/)
     └── mcp/
-        └── server.py       # MCP server (30 tools)
+        └── server.py       # MCP server: the _TOOLS registry (30 tools) + dispatch + rate_limiter()
 ```
 
 **Key Points:**
@@ -278,7 +323,25 @@ seer-api/
 - OpenAPI docs at `/docs` and `/redoc` (off unless `SEER_DOCS_ENABLED`)
 - CORS configured via `SEER_CORS_ORIGINS` env var
 - Every REST route declares its own rate limit; `SEER_RATE_LIMIT` governs only `POST /mcp`
-- Bulk endpoints have limits (max 100 domains, max 50 concurrency)
+- Bulk endpoints have limits (max 100 domains, max 50 concurrency), defined
+  once in `_contract.py` and shared by REST and MCP
+- Route handlers await core calls through `errors.as_http(call, message)`;
+  SSRF guards run before it, so their 400s are not remapped
+- **MCP tool registry.** Each tool is one `_TOOLS` entry in `mcp/server.py`:
+  `_Tool(description, input_schema, handler, rate_limit)`, built from schema
+  helpers (`_object`, `_string`, `_domains`, `_concurrency`) and handler
+  factories (`_single`, `_scan`, `_bulk`). `tools/list`, dispatch and the
+  per-tool limits all derive from it. `tools/list` is pinned by
+  `tests/test_mcp_tool_snapshot.py` + `tests/fixtures/mcp_tools.json`;
+  regenerate after an intentional change with
+  `cd seer-api && python -m tests.test_mcp_tool_snapshot`. Tool results are
+  compact JSON. `rate_limiter()` is the one moving-window limiter shared by
+  the `/mcp` gate and the per-tool limits (it lives in the MCP module so the
+  stdio server never builds slowapi's storage)
+- Dependencies: plain `uvicorn` plus explicit `uvloop`/`httptools` (not the
+  `[standard]` extra), FastAPI's default JSON response (no orjson), and
+  `limits`/`starlette` declared because they are imported directly —
+  `tests/test_declared_dependencies.py` fails on any undeclared import
 - MCP server exposes all operations as tools for AI assistants over TWO
   transports: stdio (`seer-mcp`) and Streamable HTTP at `POST /mcp` on the
   FastAPI app (same tool registry; session manager rebuilt per lifespan;
@@ -329,6 +392,27 @@ cd seer-py && maturin develop --release
 cd seer-py && maturin build --release
 ```
 
+Building needs only a Rust toolchain and a C compiler (aws-lc-sys builds
+through the `cc` crate). There is no OpenSSL anywhere in the tree, so no
+`libssl-dev`/`pkg-config`, and the binaries and the Python extension link only
+libc/libm/libgcc_s on Linux.
+
+#### Build profiles
+
+- **`[profile.release]`** (`cargo install`, `cargo build --release`, and
+  maturin's seer-py builds): `opt-level = "s"`, fat LTO, `codegen-units = 1`,
+  `strip = "symbols"`. Seer is network-bound, so size-optimizing costs nothing
+  noticeable. Unwinding stays **on**: PyO3 relies on `catch_unwind` to turn a
+  Rust panic into a Python exception.
+- **`[profile.dist]`** (cargo-dist release artifacts, CLI only): inherits
+  release but turns LTO off (`codegen-units = 16`) — LTO intermediate objects
+  deterministically tripped Windows Defender on GitHub's windows runners — and
+  sets `panic = "abort"`. Abort is safe **only** here because this profile
+  never builds seer-py; don't copy it into `[profile.release]`.
+- One TLS/crypto stack: reqwest, hickory (DNSSEC/DoT/DoH) and `tls.rs` all use
+  rustls on aws-lc-rs. Every rustls config names its provider explicitly;
+  don't add a dependency that pulls in ring, native-tls or OpenSSL.
+
 ### Running Tests
 
 ```bash
@@ -353,9 +437,10 @@ with a hermetic regression test.
 #### Running live-network tests
 
 Tests that hit real DNS/HTTP/WHOIS servers (cloudflare.com, wikipedia.org,
-example.com, iana.org, etc.) are marked `#[ignore]` in Rust and
-`@pytest.mark.skipif` in Python. They are opt-in so `cargo test` and
-`pytest` stay hermetic by default:
+example.com, iana.org, etc.) are marked `#[ignore]` in Rust,
+`@pytest.mark.live` in seer-py (gated in `tests/conftest.py`) and with a
+`skipif` on `SEER_LIVE_TESTS` for seer-api's single live test. They are
+opt-in so `cargo test` and `pytest` stay hermetic by default:
 
 ```bash
 # Run only the live-network Rust tests
@@ -378,16 +463,32 @@ The protocol clients also have hermetic mock-server tests that DO run in CI:
 - **RDAP** (`rdap/client.rs` tests): `wiremock` scripts 404/429/malformed
   responses against `query_rdap_with_retry` directly — no IANA bootstrap, so
   the global bootstrap cache stays untouched.
+- **DNS** (`dns/test_support.rs`): one loopback UDP server loop
+  (`spawn_mock_dns_fn`, scripted per query with `MockReply`, or the canned
+  `MockMode::Zone`) behind every resolver, follow, compare, DNSSEC,
+  delegation, posture and status test; `mock_dns_resolver[_default]` wires a
+  resolver to it.
+- **TLS** (`tls::test_support`): loopback rustls servers with throwaway
+  P-256 certificates (valid until 2126) for the inspection handshake, chain
+  order, TLS 1.2/1.3 and hostname-rule tests.
 - **Formatters** (`seer-core/tests/format_snapshots.rs`): `insta` snapshots of
-  human + markdown output. After an intentional formatting change, run the
-  test, inspect the generated `.snap.new` files, and rename them over the
-  `.snap` baselines (or use `cargo insta review`).
+  every human + markdown formatter path (plus JSON/YAML lookup), one
+  `snapshot_tests!` row per snapshot — the row's fn name is the `.snap` name.
+  After an intentional formatting change, run the test, inspect the generated
+  `.snap.new` files, and rename them over the `.snap` baselines (or use
+  `cargo insta review`).
+- **Bulk CSV** (`seer-cli/src/utils.rs` `csv_golden`): byte-exact header,
+  populated and failure rows for every bulk operation.
+- **MCP surface** (`seer-api/tests/test_mcp_tool_snapshot.py`): `tools/list`
+  and per-tool limits against `tests/fixtures/mcp_tools.json`.
 
 The SSRF guards deliberately refuse loopback, so the clients expose
 `#[cfg(test)]`-only seams (`allowing_private_hosts`/`with_port` on
-`WhoisClient`, `allowing_reserved_for_tests` on `RdapClient`). These do not
-exist in release builds — never weaken the production validation path to make
-a test reachable; thread the test flag instead.
+`WhoisClient` and `DnsResolver`, `with_default_nameserver` on `DnsResolver`,
+`allowing_private_hosts` on `GuardedFetcher` and `WebhookClient`,
+`allowing_reserved_for_tests` on `RdapClient`). These do not exist in release
+builds — never weaken the production validation path to make a test
+reachable; thread the test flag instead.
 
 ### Running the Applications
 
@@ -419,15 +520,24 @@ seer-mcp                                   # MCP server on stdio
   the config file. New tunables go through `SeerConfig`, not a new env var or
   a hardcoded const.
 - **Never weaken the SSRF guards.** Outbound hosts go through
-  `net::resolve_public_host` / `net::validate_http_url`, redirects are
+  `net::resolve_public_host` / `net::validate_http_url`, reqwest clients start
+  from `net::client_builder` (automatic redirects off), redirects are
   followed manually with per-hop validation, and vetted addresses are pinned
-  against DNS rebinding (`http.rs`, `webhook.rs`, RDAP client).
+  against DNS rebinding (`http.rs`, `webhook.rs`, RDAP client, `tls.rs`).
 - **Retry boundary.** WHOIS and RDAP retry through `retry.rs`; `dns/`,
-  `status/`, `ssl.rs` and `http.rs` are single-attempt by design — don't add
-  retry loops there.
+  `status/`, `ssl.rs`/`tls.rs` and `http.rs` are single-attempt by design —
+  don't add retry loops there.
 - **Bounded resources.** WHOIS responses cap at 1 MB and RDAP at 10 MB, HTTP
-  bodies stream under a size cap, bulk concurrency defaults to 10 (max 50),
-  and propagation queries its 30 servers concurrently.
+  bodies stream under a size cap (`http::read_body_capped`), bulk concurrency
+  defaults to 10 (max 50), and propagation queries its 30 servers
+  concurrently.
+- **One copy of every table.** Provider fingerprints (`takeover::PROVIDERS`),
+  formatter methods (`with_report_methods!`), bulk ops (`ops::BULK_OPS`), REPL
+  commands (`repl/catalog.rs`), TUI lenses (`LENSES`), MCP tools (`_TOOLS`)
+  and the nameserver-spec parser (`NameserverSpec::parse`, exposed to Python)
+  each live in one place. Extend the table; never fork a copy — hand-synced
+  copies are how `subdomains --classify` and the API's nameserver SSRF check
+  drifted out of step with `takeover` and the core parser.
 - **Async hygiene.** Never block inside async code (`tokio::time::sleep`,
   `spawn_blocking` for file I/O). seer-py shares one process-wide Tokio
   runtime; never build a runtime per call.
@@ -455,8 +565,10 @@ must use `validation::normalize_host`, which is identical but keeps `www.`
 
 ### Lazy Statics
 
-Process-wide caches, clients and compiled regexes are `std::sync::LazyLock`
-statics (use `OnceLock` when a call site supplies the initializer):
+Process-wide caches and clients are `std::sync::LazyLock` statics (use
+`OnceLock` when a call site supplies the initializer); compiled regexes are
+declared through the crate's `static_regex!` macro, which expands to the same
+`LazyLock<Regex>`:
 
 ```rust
 use std::sync::LazyLock;
@@ -465,8 +577,9 @@ use std::sync::LazyLock;
 static LOOKUP_CACHE: LazyLock<TtlCache<String, LookupResult>> =
     LazyLock::new(|| TtlCache::new(LOOKUP_CACHE_TTL));
 
-static IPV4_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\b(?:\d{1,3}\.){3}\d{1,3}\b").expect("IPV4_RE is a valid regex"));
+static_regex! {
+    IPV4_RE = r"\b(?:\d{1,3}\.){3}\d{1,3}\b";
+}
 ```
 
 ### Adding a Capability End to End
@@ -474,16 +587,21 @@ static IPV4_RE: LazyLock<Regex> =
 A new lookup usually touches every surface:
 
 1. **seer-core**: the logic and a `Serialize` result type, re-exported from
-   `lib.rs`; a `format_*` method on `OutputFormatter` implemented for all four
-   formats, with human + markdown `insta` snapshots.
-2. **seer-cli**: the clap subcommand in `main.rs`, the REPL command (+
-   completer entry), and a TUI lens where it fits.
-3. **seer-py**: a binding in `src/lib.rs`, re-exported from
-   `python/seer/__init__.py`.
+   `lib.rs`, with a `from_config` constructor if it is a client; one
+   `format_*` row in `with_report_methods!` plus the human and markdown
+   inherent methods, with `snapshot_tests!` rows for both.
+2. **seer-cli**: a `Query` variant and its `query::run` arm (plus a `Payload`
+   variant), the clap subcommand in `main.rs` (and an `exit_code` rule if it
+   is check-style), the REPL `parse_query` arm and `repl/catalog.rs` row, and
+   a TUI lens where it fits.
+3. **seer-py**: a binding in `src/lib.rs` (a `call_fn!` row when it is one
+   core call) added to the `#[pymodule_export]` list, re-exported from
+   `python/seer/__init__.py` and its `__all__`.
 4. **seer-api**: a router endpoint that dispatches through `run_seer`
-   (`_run.py`), maps failures with `errors.http_error` and declares its rate
-   limit, plus an MCP tool in `mcp/server.py`. Raise seer-api's
-   `domain-seer>=` floor to the release that adds the binding.
+   (`_run.py`), awaits it with `errors.as_http` and declares its rate limit,
+   plus a `_TOOLS` entry in `mcp/server.py` (then regenerate the tool
+   snapshot). Raise seer-api's `domain-seer>=` floor to the release that adds
+   the binding.
 5. **Docs**: README (CLI usage, Python list), seer-api/README (endpoint and
    tool tables), and a CHANGELOG `[Unreleased]` entry.
 
@@ -529,7 +647,9 @@ Releases are tag-driven; pushing a version tag is the entire entry point:
 ```bash
 # 1. Bump version in Cargo.toml [workspace.package] and seer-api/pyproject.toml
 #    (seer-py/pyproject.toml takes its version from the Cargo workspace via
-#    dynamic = ["version"])
+#    dynamic = ["version"]). Also resolve the PENDING note on seer-api's
+#    `domain-seer>=` floor (it must reach the first release with
+#    `seer.nameserver_target`, i.e. the one after 0.48.0).
 # 2. Sync the README's `seer-core = "x.y"` dependency snippet (Rust Library section)
 # 3. Move CHANGELOG.md [Unreleased] entries into a new version section and add
 #    its compare link at the bottom (cargo-dist uses that section verbatim as

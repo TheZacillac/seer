@@ -11,6 +11,135 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+A footprint and maintainability release. The `seer` binary and the Python
+extension are about 40% smaller and no longer depend on OpenSSL, roughly
+6,000 lines of Rust were removed by consolidating duplicated code, and every
+duplicated table that had drifted (takeover providers, the API's nameserver
+parser, hostname matching) now has a single source. Several bugs found along
+the way are fixed. Sizes below are measured on Linux (aarch64) against 0.48.0.
+
+### Changed
+- **Smaller binaries.** The `seer` release binary went from 16.7 MB to
+  10.3 MB (−38%), the prebuilt release artifact from 20.6 MB to 12.3 MB
+  (−40%), and the seer-py extension from 13.1 MB to 8.0 MB (−39%). The
+  release profile is size-optimized (`opt-level = "s"`, fat LTO), prebuilt CLI
+  artifacts abort on panic (the Python extension keeps unwinding), unused
+  dependencies and features were trimmed (the CLI's dependency tree went from
+  257 to 244 crates), and TLS and crypto use one stack: rustls on aws-lc-rs.
+- **No OpenSSL.** `seer ssl` and the `status` certificate check use rustls
+  instead of OpenSSL/native-tls. Building no longer needs `libssl-dev` or
+  `pkg-config`, and on Linux the binary and the Python extension no longer
+  link `libssl.so` or `libcrypto.so`. TLS error messages in `ssl`/`status` are
+  worded by seer rather than taken from OpenSSL.
+- **Certificate inspection trade-off.** Servers that offer only protocol
+  versions or cipher suites older than TLS 1.2 with AEAD (for example
+  CBC-only servers), or whose certificate key cannot be verified (for example
+  RSA below 2048 bits, or DSA), can no longer be inspected by `seer ssl` or the
+  `status` certificate check. They fail fast with an error that says so.
+- **WHOIS dates:** naive ISO timestamps such as `2023-01-15T10:30:00` now parse
+  as UTC. The `.edu`, `.it`, `.nl` and `.de` parsers use the shared date
+  parser, so some unusual date formats that used to come back empty now parse.
+- **MCP** tool results are compact JSON (about 40% fewer characters).
+- **REPL:** completion is case-insensitive and includes `propagation`; `help`
+  lists every command (including `lookup` and `help`) and all 16 record types;
+  typing hints match the help usage; `copy` after `subdomains --diff` copies
+  the diff that was shown; `bulk -h` lists operations from the same catalog as
+  `seer bulk --help`. Bulk operation lists now appear in one order everywhere,
+  with aliases noted in the descriptions.
+- **CLI:** `watch`/`history` save failures are reported through the normal
+  error path (structured under `--format json`, still exit 1).
+- **Python:** `seer.rdap` is now the same function as `seer.rdap_auto`, and
+  the Rust log bridge is installed when the module is imported.
+- **seer-api dependencies:** `orjson` and the `uvicorn[standard]` extras
+  (`python-dotenv`, `pyyaml`, `watchfiles`, `websockets`) are dropped; `uvloop`
+  and `httptools` are declared directly. OpenAPI request models are now named
+  `BulkRequest`, `BulkRecordRequest` and `BulkPropagationRequest`.
+- **Packaging and docs:** crates.io now shows the root README for `seer-core`
+  and `seer-cli` (the stale per-package READMEs are gone), the `seer-core`
+  crate no longer ships its snapshot test suite, and in-source module READMEs
+  are replaced by rustdoc module docs. CI folds the `check` job into `clippy`
+  (still covering the `otel` feature) and relies on cargo-deny as the single
+  advisory gate.
+
+### Added
+- `seer.nameserver_target(spec)` in the Python bindings: the `(host, port)` a
+  nameserver spec connects to, parsed by seer-core.
+- seer-core: `BulkExecutor::execute_each`, `DnsFollower::from_config`,
+  `LookupResult::{creation_date, expiration_date}`, `PostureVerdict::as_str`,
+  and `Default` for `WhoisResponse`.
+
+### Fixed
+- **`seer ssl` showed one certificate and no protocol version.** The chain now
+  lists every certificate the server presented (leaf first), and
+  `protocol_version` reports the negotiated `TLSv1.3`/`TLSv1.2`. This applies
+  to human, markdown and JSON output, the API and MCP, and the bulk CSV
+  `chain_length`/`protocol_version` columns.
+- **`seer ssl` and `seer status` disagreed on hostname matching.** Both now
+  follow one RFC 6125 rule: a certificate with only IP-address SANs falls back
+  to its CN in both, and `status` matches an IP-address host against IP SANs.
+- **`seer subdomains --classify` missed takeover-prone CNAMEs** that
+  `seer takeover` knows about, because it kept its own outdated provider list.
+  It now uses takeover's table, which adds `herokussl.com`, S3 website
+  endpoints, `cloudapp.azure.com`, `azureedge.net`, Tumblr, Webflow (two
+  forms), Intercom, UserVoice, Wufoo and FeedPress. `.cloudapp.net` is labeled
+  "Azure App Service" in both commands.
+- **Custom nameservers given as a hostname timed out** (`-s dns.google`,
+  `tls://one.one.one.one`, `https://cloudflare-dns.com/dns-query`) on hosts
+  with an IPv6 default route but no working IPv6 connectivity: every query
+  failed after 15 seconds. Their resolved addresses are now tried IPv4 first.
+  This affects `dig`, `compare`, `follow`, the config-file nameserver, the
+  REPL, and the Python/REST/MCP interfaces.
+- **`seer lookup` contact output:** a WHOIS-fallback admin or tech contact
+  that has only an organization is no longer dropped; an RDAP registrant with
+  only a name or organization no longer prints an empty "Registrant Contact"
+  heading, and the WHOIS registrant details now fill in for it; human output
+  now shows the RDAP admin/tech address and country, as `seer rdap` and
+  markdown already did.
+- **TUI Follow lens** now honors the configured DNS timeout and nameserver,
+  like the CLI and REPL `follow`.
+- **TUI list selection** no longer points past the end after a refresh
+  returns fewer rows (for example after removing the last watchlist entry),
+  which left nothing highlighted and row actions unusable.
+- **`seer watch add`** could save an empty watchlist over the real one when
+  the background load task failed unexpectedly (it fell back to an empty
+  list). That failure is now reported as an error instead.
+- **seer-api nameserver SSRF check** used a hand-copied parser that accepted
+  specs the core rejects (DoH to an IPv6 literal, scoped IPv6 such as
+  `fe80::1%eth0`). It now uses seer-core's parser; those specs get the core's
+  "Invalid input" error.
+- **seer-api** now declares `limits` and `starlette`, which it imports directly
+  but previously received only through other packages.
+
+### Removed
+Unused public items were removed from **seer-core** (breaking only for code
+that depends on the crate directly; the CLI, Python bindings, REST API and MCP
+server are unaffected):
+- `whois::parsers` is now private (`DenicParser` … `SidnParser`,
+  `GenericParser`, `RegistryParser`, `ParserRegistry`, `PARSER_REGISTRY`).
+- `cache::SingleValueCache` and `TtlCache::{get_stale, needs_refresh, cleanup}`.
+- `validation::is_private_or_reserved_ip` (use `net::is_reserved_ip`).
+- `watchlist::check_watchlist` (use `check_watchlist_with_config`) and
+  `drift::drift_from_history`.
+- `SmartLookup::{prefer_rdap, include_fallback, clear_cache}`.
+- `RetryExecutor::{with_classifier, execute_once}`.
+- `logging::init_logging` (use `init_logging_with_writer`).
+- `JsonFormatter::compact()`; `JsonFormatter` is now a unit struct.
+- `BulkExecutor::execute_{whois, rdap, dns, propagation, lookup, status,
+  avail, info, ssl, posture, confusables, caa}` (use `execute_each`).
+- `DnsResolver::resolve_srv` (resolve `_service._proto.name` with
+  `RecordType::SRV`), `DnsFollower::follow_simple`,
+  `FollowResult::{successful_iterations, failed_iterations}`,
+  `PropagationResult::{is_fully_propagated, has_unreachable_servers,
+  has_nameserver_inconsistencies}`, `PropagationChecker::add_server` and
+  `DnsRecord::format_full`.
+- `headers::HeaderVerdict` is now an alias of `posture::PostureVerdict` (same
+  name and JSON form).
+
+Also removed: the private Python function `seer._seer.init_rust_logging`,
+`seer_api.ssrf.nameserver_target` (use `seer.nameserver_target`), the stale
+`seer-py/uv.lock`, the `pytest-asyncio` dev dependency, and 24 completed
+planning documents under `docs/superpowers/`.
+
 ## [0.48.0] - 2026-09-22
 
 A correctness and security release from a full code-review sweep across every
