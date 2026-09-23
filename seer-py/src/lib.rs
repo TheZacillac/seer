@@ -237,10 +237,14 @@ call_fn! {
     rdap_domain(domain: String) => RDAP_CLIENT.lookup_domain(&domain);
     rdap_ip(ip: String) => RDAP_CLIENT.lookup_ip(&ip);
     rdap_asn(asn: u32) => RDAP_CLIENT.lookup_asn(asn);
-    /// Auto-routing RDAP lookup: classifies `query` as IP / ASN / domain in
-    /// Rust and dispatches to the correct endpoint. Replaces the former
-    /// Python-side dispatcher, which silently misrouted `AS`-prefixed domains
-    /// like `as1234.io` to the ASN endpoint.
+    /// Look up RDAP data for a domain, IP address or ASN. The shape of
+    /// `query` picks the lookup:
+    ///
+    /// - an IPv4 or IPv6 address (8.8.8.8, 2606:4700:4700::1111): IP lookup
+    /// - AS15169 or as15169, with no dots: ASN lookup
+    /// - anything else: domain lookup (so as1234.io stays a domain)
+    ///
+    /// Returns the RDAP response as a dict. seer.rdap is the same function.
     rdap_auto(query: String) => seer_core::rdap::auto_lookup(&RDAP_CLIENT, &query);
     status(domain: String) => STATUS_CLIENT.check(&domain);
     availability(domain: String) => AVAILABILITY_CHECKER.check(&domain);
