@@ -14,30 +14,13 @@ pins the validated addresses, so a second check here would add nothing but its
 own TOCTOU window.
 """
 
-from typing import Annotated
-
-from fastapi import APIRouter, Path, Query, Request
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, Query, Request
 
 import seer
+from seer_api._contract import BULK_LIMIT, HEAVY_LIMIT, MAX_CONCURRENCY, BulkRequest, Domain
 from seer_api._run import run_seer
 from seer_api.errors import http_error
 from seer_api.limiting import limiter
-
-MAX_BULK_DOMAINS = 100
-MAX_CONCURRENCY = 50
-
-_Domain = Annotated[str, Path(min_length=1, max_length=253)]
-
-
-class _BulkRequest(BaseModel):
-    """Shared request model for the bulk intelligence endpoints."""
-
-    domains: list[Annotated[str, Field(max_length=253)]] = Field(
-        ..., min_length=1, max_length=MAX_BULK_DOMAINS
-    )
-    concurrency: int = Field(default=10, ge=1, le=MAX_CONCURRENCY)
-
 
 # --- availability --------------------------------------------------------
 
@@ -46,7 +29,7 @@ availability_router = APIRouter()
 
 @availability_router.get("/{domain}")
 @limiter.limit("60/minute")
-async def availability(request: Request, domain: _Domain):
+async def availability(request: Request, domain: Domain):
     """Check whether a domain appears to be available for registration."""
     try:
         return await run_seer(seer.availability, domain)
@@ -55,8 +38,8 @@ async def availability(request: Request, domain: _Domain):
 
 
 @availability_router.post("/bulk")
-@limiter.limit("10/minute")
-async def bulk_availability(request: Request, body: _BulkRequest):
+@limiter.limit(BULK_LIMIT)
+async def bulk_availability(request: Request, body: BulkRequest):
     """Check availability for multiple domains at once."""
     try:
         return await run_seer(seer.bulk_availability, body.domains, body.concurrency)
@@ -71,7 +54,7 @@ info_router = APIRouter()
 
 @info_router.get("/{domain}")
 @limiter.limit("60/minute")
-async def info(request: Request, domain: _Domain):
+async def info(request: Request, domain: Domain):
     """Merged RDAP + WHOIS domain info as flat fields."""
     try:
         return await run_seer(seer.info, domain)
@@ -80,8 +63,8 @@ async def info(request: Request, domain: _Domain):
 
 
 @info_router.post("/bulk")
-@limiter.limit("10/minute")
-async def bulk_info(request: Request, body: _BulkRequest):
+@limiter.limit(BULK_LIMIT)
+async def bulk_info(request: Request, body: BulkRequest):
     """Merged domain info for multiple domains at once."""
     try:
         return await run_seer(seer.bulk_info, body.domains, body.concurrency)
@@ -98,7 +81,7 @@ subdomains_router = APIRouter()
 @limiter.limit("20/minute")
 async def subdomains(
     request: Request,
-    domain: _Domain,
+    domain: Domain,
     resolve: bool = Query(
         False, description="Resolve and classify each name (live/dead + takeover risk)"
     ),
@@ -125,7 +108,7 @@ dnssec_router = APIRouter()
 
 @dnssec_router.get("/{domain}")
 @limiter.limit("60/minute")
-async def dnssec(request: Request, domain: _Domain):
+async def dnssec(request: Request, domain: Domain):
     """DNSSEC validation report (DS/DNSKEY digest consistency)."""
     try:
         return await run_seer(seer.dnssec, domain)
@@ -142,7 +125,7 @@ delegation_router = APIRouter()
 # 30/minute (matching /posture, not /dnssec's 60): each check fans out to
 # parent-zone NS queries plus a lameness probe per delegated nameserver.
 @limiter.limit("30/minute")
-async def delegation(request: Request, domain: _Domain):
+async def delegation(request: Request, domain: Domain):
     """NS delegation health: parent delegation vs zone NS RRset, plus a
     lameness probe of each delegated nameserver."""
     try:
@@ -160,8 +143,8 @@ diff_router = APIRouter()
 @limiter.limit("30/minute")
 async def diff(
     request: Request,
-    domain_a: Annotated[str, Path(min_length=1, max_length=253)],
-    domain_b: Annotated[str, Path(min_length=1, max_length=253)],
+    domain_a: Domain,
+    domain_b: Domain,
 ):
     """Compare two domains side-by-side (registration, DNS, SSL)."""
     try:
@@ -177,7 +160,7 @@ caa_router = APIRouter()
 
 @caa_router.get("/{domain}")
 @limiter.limit("60/minute")
-async def caa(request: Request, domain: _Domain):
+async def caa(request: Request, domain: Domain):
     """CAA (Certification Authority Authorization) policy, incl. iodef and
     wildcard-vs-base consistency analysis."""
     try:
@@ -193,7 +176,7 @@ posture_router = APIRouter()
 
 @posture_router.get("/{domain}")
 @limiter.limit("30/minute")
-async def posture(request: Request, domain: _Domain):
+async def posture(request: Request, domain: Domain):
     """Email/DNS security posture (SPF, DMARC, MTA-STS, BIMI, DANE)."""
     try:
         return await run_seer(seer.posture, domain)
@@ -208,7 +191,7 @@ headers_router = APIRouter()
 
 @headers_router.get("/{domain}")
 @limiter.limit("20/minute")
-async def headers(request: Request, domain: _Domain):
+async def headers(request: Request, domain: Domain):
     """Audit HTTP security headers, cookie flags, and version disclosure.
 
     Unlike its sibling routes, this one *connects* to the queried domain over
@@ -230,10 +213,10 @@ takeover_router = APIRouter()
 
 
 @takeover_router.get("/{domain}")
-@limiter.limit("5/minute")
+@limiter.limit(HEAVY_LIMIT)
 async def takeover(
     request: Request,
-    domain: _Domain,
+    domain: Domain,
     concurrency: int = Query(10, ge=1, le=MAX_CONCURRENCY),
 ):
     """Scan a domain's subdomains for takeover exposure.
@@ -257,10 +240,10 @@ confusables_router = APIRouter()
 
 
 @confusables_router.get("/{domain}")
-@limiter.limit("5/minute")
+@limiter.limit(HEAVY_LIMIT)
 async def confusables(
     request: Request,
-    domain: _Domain,
+    domain: Domain,
     concurrency: int = Query(10, ge=1, le=MAX_CONCURRENCY),
 ):
     """Find registered typosquat / look-alike domains for a domain."""

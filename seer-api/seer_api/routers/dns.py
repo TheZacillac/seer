@@ -1,11 +1,15 @@
 """DNS API endpoints."""
 
-from typing import Annotated
-
 from fastapi import APIRouter, Path, Query, Request
-from pydantic import BaseModel, Field
 
 import seer
+from seer_api._contract import (
+    BULK_LIMIT,
+    RECORD_TYPE_MAX_LENGTH,
+    RECORD_TYPE_PATTERN,
+    BulkRecordRequest,
+    Domain,
+)
 from seer_api._run import run_seer
 from seer_api.errors import http_error
 from seer_api.limiting import limiter
@@ -14,20 +18,6 @@ from seer_api.streaming import stream_bulk
 
 router = APIRouter()
 
-# Bulk operation limits
-MAX_BULK_DOMAINS = 100
-MAX_CONCURRENCY = 50
-
-
-class BulkDnsRequest(BaseModel):
-    """Request model for bulk DNS lookup."""
-
-    domains: list[Annotated[str, Field(max_length=253)]] = Field(
-        ..., min_length=1, max_length=MAX_BULK_DOMAINS
-    )
-    record_type: str = Field("A", max_length=10, pattern=r"^[A-Z0-9]+$")
-    concurrency: int = Field(default=10, ge=1, le=MAX_CONCURRENCY)
-
 
 # NOTE: registered before `/{domain}/{record_type}` so `/compare/...` is not
 # swallowed by the two-segment record-lookup route.
@@ -35,10 +25,12 @@ class BulkDnsRequest(BaseModel):
 @limiter.limit("30/minute")
 async def dns_compare(
     request: Request,
-    domain: str = Path(..., min_length=1, max_length=253),
+    domain: Domain,
     server_a: str = Query(..., description="First nameserver (e.g. 8.8.8.8)"),
     server_b: str = Query(..., description="Second nameserver (e.g. 1.1.1.1)"),
-    record_type: str = Query("A", max_length=10, pattern=r"^[A-Z0-9]+$"),
+    record_type: str = Query(
+        "A", max_length=RECORD_TYPE_MAX_LENGTH, pattern=RECORD_TYPE_PATTERN
+    ),
 ):
     """Compare DNS records for a domain across two nameservers."""
     # Both servers are actual connect targets, so guard them. Each is a
@@ -55,8 +47,10 @@ async def dns_compare(
 @limiter.limit("60/minute")
 async def dns_lookup(
     request: Request,
-    domain: str = Path(..., min_length=1, max_length=253),
-    record_type: str = Path(..., max_length=10, pattern=r"^[A-Z0-9]+$"),
+    domain: Domain,
+    record_type: str = Path(
+        ..., max_length=RECORD_TYPE_MAX_LENGTH, pattern=RECORD_TYPE_PATTERN
+    ),
     nameserver: str | None = Query(None, description="Nameserver to query"),
 ):
     """
@@ -82,13 +76,13 @@ async def dns_lookup(
 
 
 @router.post("/bulk")
-@limiter.limit("10/minute")
-async def bulk_dns_lookup(request: Request, body: BulkDnsRequest):
+@limiter.limit(BULK_LIMIT)
+async def bulk_dns_lookup(request: Request, body: BulkRecordRequest):
     """
     Query DNS records for multiple domains.
 
     Args:
-        body: BulkDnsRequest with list of domains, record type, and concurrency
+        body: BulkRecordRequest with list of domains, record type, and concurrency
 
     Returns:
         List of DNS results for each domain
@@ -100,8 +94,8 @@ async def bulk_dns_lookup(request: Request, body: BulkDnsRequest):
 
 
 @router.post("/bulk/stream")
-@limiter.limit("10/minute")
-async def bulk_dns_stream(request: Request, body: BulkDnsRequest):
+@limiter.limit(BULK_LIMIT)
+async def bulk_dns_stream(request: Request, body: BulkRecordRequest):
     """Stream bulk DNS queries as Server-Sent Events."""
     try:
         return await stream_bulk(

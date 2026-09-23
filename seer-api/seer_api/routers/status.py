@@ -1,11 +1,9 @@
 """Domain status API endpoints."""
 
-from typing import Annotated
-
-from fastapi import APIRouter, Path, Request
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, Request
 
 import seer
+from seer_api._contract import HEAVY_LIMIT, BulkRequest, Domain
 from seer_api._run import run_seer
 from seer_api.errors import http_error
 from seer_api.limiting import limiter
@@ -15,26 +13,10 @@ from seer_api.streaming import stream_bulk
 
 router = APIRouter()
 
-# Bulk operation limits
-MAX_BULK_DOMAINS = 100
-MAX_CONCURRENCY = 50
-
-
-class BulkStatusRequest(BaseModel):
-    """Request model for bulk status check."""
-
-    domains: list[Annotated[str, Field(max_length=253)]] = Field(
-        ..., min_length=1, max_length=MAX_BULK_DOMAINS
-    )
-    concurrency: int = Field(default=10, ge=1, le=MAX_CONCURRENCY)
-
 
 @router.get("/{domain}")
 @limiter.limit("20/minute")
-async def check_status(
-    request: Request,
-    domain: str = Path(..., min_length=1, max_length=253),
-):
+async def check_status(request: Request, domain: Domain):
     """
     Check the status of a domain.
 
@@ -58,13 +40,13 @@ async def check_status(
 
 
 @router.post("/bulk")
-@limiter.limit("5/minute")
-async def bulk_status(request: Request, body: BulkStatusRequest):
+@limiter.limit(HEAVY_LIMIT)
+async def bulk_status(request: Request, body: BulkRequest):
     """
     Check status for multiple domains.
 
     Args:
-        body: BulkStatusRequest with list of domains and optional concurrency
+        body: BulkRequest with list of domains and optional concurrency
 
     Returns:
         List of status results for each domain
@@ -77,8 +59,8 @@ async def bulk_status(request: Request, body: BulkStatusRequest):
 
 
 @router.post("/bulk/stream")
-@limiter.limit("5/minute")
-async def bulk_status_stream(request: Request, body: BulkStatusRequest):
+@limiter.limit(HEAVY_LIMIT)
+async def bulk_status_stream(request: Request, body: BulkRequest):
     """Stream bulk status checks as Server-Sent Events."""
     await guard_hosts_async([(d, 443) for d in body.domains])
     try:

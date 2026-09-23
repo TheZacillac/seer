@@ -24,6 +24,15 @@ from mcp.types import (
 import seer
 
 from .. import __version__
+from .._contract import (
+    BULK_LIMIT,
+    HEAVY_LIMIT,
+    MAX_BULK_DOMAINS,
+    MAX_CONCURRENCY,
+    RECORD_TYPE_MAX_LENGTH,
+    RECORD_TYPE_PATTERN,
+    TLD_TOKEN_RE,
+)
 from .._run import run_seer
 from ..ssrf import nameserver_target
 
@@ -66,9 +75,6 @@ logger = logging.getLogger(__name__)
 # share this Server instance).
 mcp = Server("seer", version=__version__)
 
-MAX_BULK_DOMAINS = 100
-MAX_CONCURRENCY = 50
-
 # Shared input schema for the single-domain tools.
 _DOMAIN_SCHEMA = {
     "type": "object",
@@ -105,7 +111,7 @@ def _error_result(text: str) -> CallToolResult:
     )
 
 
-_RECORD_TYPE_PATTERN = re.compile(r"[A-Z0-9]{1,10}")
+_RECORD_TYPE_RE = re.compile(RECORD_TYPE_PATTERN)
 
 # Rendered from the core enum via the bindings rather than re-typed: the
 # hand-written list this replaces advertised 13 of 16 types, so NAPTR, TLSA,
@@ -115,19 +121,10 @@ _RECORD_TYPE_DESC = (
     f"DNS record type — one of: {', '.join(seer.record_types())} (default: A)"
 )
 
-# Plausible TLD token: optional leading dot, then 1-63 ASCII
-# letters/digits/hyphens without a leading or trailing hyphen (covers
-# punycode A-labels like "xn--p1ai"). Never a URL/connect target — this only
-# rejects junk with a clear error instead of an all-null payload. Keep in
-# sync with the copy in seer_api/routers/tld.py (REST returns 400 for the
-# same inputs this rejects).
-_TLD_TOKEN_RE = re.compile(r"^\.?[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$", re.IGNORECASE)
-
-
 def _require_tld(arguments: dict[str, Any]) -> str:
     """Extract and validate a required TLD argument."""
     tld = _require_str(arguments, "tld")
-    if not _TLD_TOKEN_RE.fullmatch(tld):
+    if not TLD_TOKEN_RE.fullmatch(tld):
         raise ValueError(
             "'tld' must be ASCII letters/digits/hyphens (punycode allowed), "
             "optionally with a leading dot (e.g., 'com' or '.com')"
@@ -138,7 +135,11 @@ def _require_tld(arguments: dict[str, Any]) -> str:
 def _require_record_type(arguments: dict[str, Any], default: str = "A") -> str:
     """Extract and validate an optional DNS record type argument."""
     value = arguments.get("record_type", default)
-    if not isinstance(value, str) or not _RECORD_TYPE_PATTERN.fullmatch(value):
+    if (
+        not isinstance(value, str)
+        or len(value) > RECORD_TYPE_MAX_LENGTH
+        or not _RECORD_TYPE_RE.fullmatch(value)
+    ):
         raise ValueError(
             "'record_type' must be 1-10 uppercase alphanumerics (e.g., A, AAAA, MX, TXT)"
         )
@@ -823,16 +824,16 @@ async def list_tools() -> list[Tool]:
 # registries and outbound IP reputation, which are per-process concerns. The
 # same table covers stdio, where the flat /mcp gate doesn't apply at all.
 _TOOL_RATE_LIMITS: dict[str, str] = {
-    "seer_bulk_ssl": "5/minute",
-    "seer_bulk_status": "5/minute",
-    "seer_bulk_propagation": "5/minute",
-    "seer_confusables": "5/minute",
-    "seer_takeover": "5/minute",
-    "seer_bulk_lookup": "10/minute",
-    "seer_bulk_whois": "10/minute",
-    "seer_bulk_dig": "10/minute",
-    "seer_bulk_info": "10/minute",
-    "seer_bulk_availability": "10/minute",
+    "seer_bulk_ssl": HEAVY_LIMIT,
+    "seer_bulk_status": HEAVY_LIMIT,
+    "seer_bulk_propagation": HEAVY_LIMIT,
+    "seer_confusables": HEAVY_LIMIT,
+    "seer_takeover": HEAVY_LIMIT,
+    "seer_bulk_lookup": BULK_LIMIT,
+    "seer_bulk_whois": BULK_LIMIT,
+    "seer_bulk_dig": BULK_LIMIT,
+    "seer_bulk_info": BULK_LIMIT,
+    "seer_bulk_availability": BULK_LIMIT,
 }
 
 # Built lazily on first limited call (not at import) so a configured storage
