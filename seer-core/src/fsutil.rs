@@ -41,7 +41,7 @@ macro_rules! persisted_store {
         impl $store {
             #[doc = concat!("Returns the path to the store file (`~/.seer/", $file, "`).")]
             pub fn path() -> Option<std::path::PathBuf> {
-                dirs::home_dir().map(|h| h.join(".seer").join($file))
+                std::env::home_dir().map(|h| h.join(".seer").join($file))
             }
 
             /// Loads the store from disk, returning an empty store when the file

@@ -24,7 +24,8 @@ repository = "https://github.com/TheZacillac/seer"
 homepage = "https://github.com/TheZacillac/seer"
 
 [workspace.dependencies]
-seer-core = { version = "0.48.0", path = "seer-core" }
+# default-features off so seer-py gets the slim library; seer-cli enables `cli`.
+seer-core = { version = "0.48.0", path = "seer-core", default-features = false }
 
 # Async runtime
 # `signal` is enabled only by seer-cli (Ctrl-C handling), not the library.
@@ -62,7 +63,8 @@ anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["std", "now", "serde"] }
 
 # CLI
-rustyline = "18"
+# Only file history is used — no custom key bindings or filename completion.
+rustyline = { version = "18", default-features = false, features = ["with-file-history"] }
 shlex = "2"
 colored = "3"
 indicatif = "0.18"
@@ -106,9 +108,6 @@ psl = "2"
 # Test-only: deterministic HTTP mocking and snapshot assertions
 wiremock = "0.6"
 insta = { version = "1", features = ["filters"] }
-
-# Directory paths
-dirs = "7"
 
 # TLS/SSL certificate handling. rustls/tokio-rustls are already in the tree via
 # reqwest and hickory; seer-core's inspection handshake (tls.rs) uses them

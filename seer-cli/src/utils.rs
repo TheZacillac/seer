@@ -225,17 +225,17 @@ pub fn read_bulk_stdin<R: std::io::Read>(reader: R) -> Result<String, String> {
 ///
 /// Plain CWD-relative paths (`./foo`, `../foo`, `foo.txt`) and absolute paths
 /// are returned unchanged. If `~` appears anywhere other than the start, or
-/// `dirs::home_dir()` cannot determine a home, the input is returned as-is
+/// `std::env::home_dir()` cannot determine a home, the input is returned as-is
 /// and the filesystem call will surface the resulting error.
 pub fn expand_tilde(s: &str) -> String {
     if s == "~" {
-        if let Some(home) = dirs::home_dir() {
+        if let Some(home) = std::env::home_dir() {
             return home.to_string_lossy().into_owned();
         }
         return s.to_string();
     }
     if let Some(rest) = s.strip_prefix("~/") {
-        if let Some(mut home) = dirs::home_dir() {
+        if let Some(mut home) = std::env::home_dir() {
             home.push(rest);
             return home.to_string_lossy().into_owned();
         }
@@ -703,13 +703,13 @@ mod tests {
 
     #[test]
     fn expand_tilde_returns_home_for_lone_tilde() {
-        let home = dirs::home_dir().expect("home dir for test");
+        let home = std::env::home_dir().expect("home dir for test");
         assert_eq!(expand_tilde("~"), home.to_string_lossy());
     }
 
     #[test]
     fn expand_tilde_joins_relative_under_home() {
-        let home = dirs::home_dir().expect("home dir for test");
+        let home = std::env::home_dir().expect("home dir for test");
         let got = expand_tilde("~/Projects/foo/bar.txt");
         let want = home
             .join("Projects/foo/bar.txt")

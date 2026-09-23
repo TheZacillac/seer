@@ -138,7 +138,7 @@ pub fn log_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("ARCANUM_LOG_DIR") {
         return PathBuf::from(dir);
     }
-    dirs::home_dir()
+    std::env::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".arcanum")
         .join("logs")

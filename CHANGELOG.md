@@ -60,6 +60,14 @@ the way are fixed. Sizes below are measured on Linux (aarch64) against 0.48.0.
   are replaced by rustdoc module docs. CI folds the `check` job into `clippy`
   (still covering the `otel` feature) and relies on cargo-deny as the single
   advisory gate.
+- **seer-core `cli` feature (on by default):** the formatters, colors,
+  history/watchlist/drift, doctor, webhook and logging setup now sit behind a
+  default `cli` feature. Depending on seer-core with default features is
+  unchanged; `default-features = false` gives a slimmer library without
+  `tracing-subscriber`, `tracing-appender` or `colored`. The Python extension
+  is built this way.
+- The `dirs` dependency is replaced by `std::env::home_dir()`, and rustyline
+  is built with file history only (4 fewer crates).
 
 ### Added
 - `seer.nameserver_target(spec)` in the Python bindings: the `(host, port)` a

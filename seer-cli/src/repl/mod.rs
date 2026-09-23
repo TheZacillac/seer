@@ -61,7 +61,7 @@ impl Repl {
         editor.set_helper(Some(completer));
 
         // Load history
-        let history_path = dirs::home_dir()
+        let history_path = std::env::home_dir()
             .map(|p| p.join(HISTORY_FILE))
             .unwrap_or_else(|| HISTORY_FILE.into());
 
@@ -146,7 +146,7 @@ impl Repl {
         }
 
         // Save history
-        let history_path = dirs::home_dir()
+        let history_path = std::env::home_dir()
             .map(|p| p.join(HISTORY_FILE))
             .unwrap_or_else(|| HISTORY_FILE.into());
 

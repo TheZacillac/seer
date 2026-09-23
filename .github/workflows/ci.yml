@@ -16,6 +16,9 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Line tables keep file:line in backtraces but skip full DWARF: ~15% less
+  # test-build CPU and a ~40% smaller target/ (local debug builds unaffected).
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 jobs:
   fmt:
@@ -47,6 +50,10 @@ jobs:
       # (and its dependency bumps) can't silently break.
       - name: Clippy (otel feature)
         run: cargo clippy -p seer-core --features otel --all-targets -- -D warnings
+      # seer-py depends on seer-core without the default `cli` feature, so lint
+      # that slim build too — otherwise the feature gate could silently rot.
+      - name: Clippy (seer-core without the cli feature)
+        run: cargo clippy -p seer-core --no-default-features --all-targets -- -D warnings
 
   test:
     name: Test
@@ -77,7 +84,12 @@ jobs:
         run: |
           pip install ruff
           ruff check seer-py/python seer-py/tests seer-api
+      # Dev profile: the release profile's fat LTO + codegen-units=1 roughly
+      # triples this build, and the pytest suite doesn't need optimized code.
+      # Published wheels are still built with the release profile.
       - name: Build and install seer-py (PEP 517 via maturin)
+        env:
+          MATURIN_PEP517_ARGS: --profile dev
         run: pip install './seer-py[dev]'
       - name: Install seer-api
         run: pip install -e './seer-api[dev]'

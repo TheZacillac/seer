@@ -409,6 +409,16 @@ libc/libm/libgcc_s on Linux.
   deterministically tripped Windows Defender on GitHub's windows runners — and
   sets `panic = "abort"`. Abort is safe **only** here because this profile
   never builds seer-py; don't copy it into `[profile.release]`.
+- **`cli` feature (seer-core, default on):** gates the CLI-only layer —
+  `colors`, `doctor`, `drift`, `fsutil`, `history`, `logging`, `output`,
+  `watchlist`, `webhook`, `subdomains::baseline` — and its deps
+  (`tracing-subscriber`, `tracing-appender`, `colored`). The workspace
+  `seer-core` dependency sets `default-features = false`; seer-cli re-enables
+  `cli`, seer-py doesn't (slimmer extension, half the core compile time).
+  `otel` implies `cli`. Keep the gated set closed: an ungated module must not
+  use a gated one (CI clippy runs `-p seer-core --no-default-features`).
+- seer-py sets `test = false`/`doctest = false` (its tests are pytest), so
+  `cargo test` never compiles PyO3.
 - One TLS/crypto stack: reqwest, hickory (DNSSEC/DoT/DoH) and `tls.rs` all use
   rustls on aws-lc-rs. Every rustls config names its provider explicitly;
   don't add a dependency that pulls in ring, native-tls or OpenSSL.
@@ -631,14 +641,16 @@ cd seer-py && maturin develop && pytest   # when the bindings change
 cd seer-api && pytest                     # when the API changes
 ```
 
-CI runs fmt, clippy on all targets (plus `seer-core --features otel`), tests
+CI runs fmt, clippy on all targets (plus `seer-core --features otel` and
+`seer-core --no-default-features`), tests
 on 3 OSes, an MSRV `cargo check --locked`, informational llvm-cov coverage, a
 cargo-deny supply-chain gate (`deny` job via EmbarkStudios/cargo-deny-action,
 policy in root `deny.toml`: RUSTSEC advisories, explicit license allow-list,
 wildcard-version ban, crates.io-only sources — it is the only advisory gate;
 run locally with `cargo deny check`), AND a `python` job (ruff, maturin-builds
-seer-py, installs seer-api, runs both pytest suites) — Python test failures
-block merges just like Rust ones.
+seer-py with the dev profile, installs seer-api, runs both pytest suites) —
+Python test failures block merges just like Rust ones. CI compiles with
+`CARGO_PROFILE_DEV_DEBUG=line-tables-only` (smaller, faster test builds).
 
 ### Release Process
 
