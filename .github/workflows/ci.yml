@@ -65,6 +65,12 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc -p seer-core --no-deps --no-default-features
+      # The public builds never render private items' docs, so a broken link
+      # there passes both steps above. Gate the contributor view as well.
+      - name: Rustdoc (seer-core private items)
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc -p seer-core --no-deps --document-private-items
 
   test:
     name: Test
