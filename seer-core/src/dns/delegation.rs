@@ -45,7 +45,7 @@ use std::collections::BTreeSet;
 use std::net::IpAddr;
 use std::time::Duration;
 
-use hickory_resolver::config::{NameServerConfig, ResolverConfig, ResolverOpts, GOOGLE};
+use hickory_resolver::config::ResolverOpts;
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use hickory_resolver::net::{DnsError, NetError};
 use hickory_resolver::proto::op::ResponseCode;
@@ -54,7 +54,7 @@ use hickory_resolver::TokioResolver;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, instrument};
 
-use crate::dns::apply_standard_opts;
+use super::resolver::{apply_standard_opts, fqdn, google_or_pinned, single_server_config};
 use crate::error::{Result, SeerError};
 use crate::validation::normalize_domain;
 
@@ -544,14 +544,7 @@ impl DelegationChecker {
     /// [`crate::dns::resolver`]. UDP with TCP fallback, so truncated NS sets
     /// retry over TCP.
     fn build_direct_resolver(&self, host: &str, ip: IpAddr) -> Result<TokioResolver> {
-        let mut config = ResolverConfig::from_parts(None, vec![], vec![]);
-        let mut ns = NameServerConfig::udp_and_tcp(ip);
-        let port = self.direct_port(host);
-        for connection in &mut ns.connections {
-            connection.port = port;
-        }
-        config.add_name_server(ns);
-
+        let config = single_server_config(ip, self.direct_port(host), true);
         let mut builder =
             TokioResolver::builder_with_config(config, TokioRuntimeProvider::default());
         apply_direct_opts(builder.options_mut(), self.timeout);
@@ -629,19 +622,10 @@ fn apply_direct_opts(opts: &mut ResolverOpts, timeout: Duration) {
 /// only fallible step (rustls TLS-context construction for DoT/DoH) never
 /// runs, so construction cannot fail.
 fn build_recursive_resolver(timeout: Duration, upstream: Option<(IpAddr, u16)>) -> TokioResolver {
-    let config = match upstream {
-        None => ResolverConfig::udp_and_tcp(&GOOGLE),
-        Some((ip, port)) => {
-            let mut config = ResolverConfig::from_parts(None, vec![], vec![]);
-            let mut ns = NameServerConfig::udp(ip);
-            for connection in &mut ns.connections {
-                connection.port = port;
-            }
-            config.add_name_server(ns);
-            config
-        }
-    };
-    let mut builder = TokioResolver::builder_with_config(config, TokioRuntimeProvider::default());
+    let mut builder = TokioResolver::builder_with_config(
+        google_or_pinned(upstream),
+        TokioRuntimeProvider::default(),
+    );
     // Shared with the main resolver so the option sets cannot drift: the
     // hand-copied version here lacked the pinned `UserProvidedOrder` server
     // ordering, so parent-NS discovery could draw black-holed IPv6 upstreams.
@@ -724,16 +708,6 @@ fn prefer_ipv4(vetted: &[IpAddr]) -> Option<IpAddr> {
         .find(|ip| ip.is_ipv4())
         .or_else(|| vetted.first())
         .copied()
-}
-
-/// Appends the root dot so hickory treats the name as fully qualified (no
-/// search-list expansion).
-fn fqdn(name: &str) -> String {
-    if name.ends_with('.') {
-        name.to_string()
-    } else {
-        format!("{}.", name)
-    }
 }
 
 /// Normalizes an NS host name for set comparison: lowercase, trailing dot
@@ -874,12 +848,6 @@ mod tests {
         // IPv6-only deployments still get the v6 address.
         assert_eq!(prefer_ipv4(&[v6]), Some(v6));
         assert_eq!(prefer_ipv4(&[]), None);
-    }
-
-    #[test]
-    fn fqdn_appends_root_dot_once() {
-        assert_eq!(fqdn("example.com"), "example.com.");
-        assert_eq!(fqdn("example.com."), "example.com.");
     }
 
     #[test]

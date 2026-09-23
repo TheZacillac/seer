@@ -111,6 +111,41 @@ fn build_default_resolver(timeout: Duration) -> TokioResolver {
         .expect("default resolver build cannot fail with the bundled webpki root store")
 }
 
+/// Upstream config pinned to the single server `ip:port` — UDP only, or UDP
+/// with TCP fallback (for answers that may truncate).
+pub(crate) fn single_server_config(ip: IpAddr, port: u16, tcp_fallback: bool) -> ResolverConfig {
+    let mut ns = if tcp_fallback {
+        NameServerConfig::udp_and_tcp(ip)
+    } else {
+        NameServerConfig::udp(ip)
+    };
+    for connection in &mut ns.connections {
+        connection.port = port;
+    }
+    let mut config = ResolverConfig::from_parts(None, vec![], vec![]);
+    config.add_name_server(ns);
+    config
+}
+
+/// Google DNS (UDP+TCP), or the pinned UDP `upstream` that the DNSSEC and
+/// delegation checkers' `#[cfg(test)]` seams point at a loopback mock.
+pub(crate) fn google_or_pinned(upstream: Option<(IpAddr, u16)>) -> ResolverConfig {
+    match upstream {
+        None => ResolverConfig::udp_and_tcp(&GOOGLE),
+        Some((ip, port)) => single_server_config(ip, port, false),
+    }
+}
+
+/// Appends the root dot so hickory treats `name` as fully qualified (no
+/// search-list expansion).
+pub(crate) fn fqdn(name: &str) -> String {
+    if name.ends_with('.') {
+        name.to_string()
+    } else {
+        format!("{name}.")
+    }
+}
+
 /// Build the hickory upstream config for a parsed nameserver spec and its
 /// resolved (and already SSRF-validated) addresses.
 ///
@@ -1453,6 +1488,12 @@ mod tests {
                 "sip.voice.google.com".to_string()
             ))
         );
+    }
+
+    #[test]
+    fn fqdn_appends_root_dot_once() {
+        assert_eq!(fqdn("example.com"), "example.com.");
+        assert_eq!(fqdn("example.com."), "example.com.");
     }
 
     #[test]

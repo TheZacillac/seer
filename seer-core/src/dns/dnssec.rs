@@ -11,7 +11,7 @@ use std::net::IpAddr;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use hickory_resolver::config::{NameServerConfig, ResolverConfig, ResolverOpts, GOOGLE};
+use hickory_resolver::config::ResolverOpts;
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use hickory_resolver::net::{DnsError, NetError};
 use hickory_resolver::proto::dnssec::rdata::{DNSSECRData, DNSKEY, DS};
@@ -22,7 +22,7 @@ use hickory_resolver::TokioResolver;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, instrument};
 
-use super::resolver::apply_standard_opts;
+use super::resolver::{apply_standard_opts, fqdn, google_or_pinned};
 use crate::error::Result;
 
 /// DNSSEC validation report for a domain.
@@ -244,20 +244,10 @@ impl DnssecChecker {
     /// bit is set (`opts.validate`), which is required for upstream
     /// resolvers to return RRSIG records.
     fn build_resolver(validating: bool, upstream: Option<(IpAddr, u16)>) -> TokioResolver {
-        let config = match upstream {
-            None => ResolverConfig::udp_and_tcp(&GOOGLE),
-            Some((ip, port)) => {
-                let mut config = ResolverConfig::from_parts(None, vec![], vec![]);
-                let mut ns = NameServerConfig::udp(ip);
-                for connection in &mut ns.connections {
-                    connection.port = port;
-                }
-                config.add_name_server(ns);
-                config
-            }
-        };
-        let mut builder =
-            TokioResolver::builder_with_config(config, TokioRuntimeProvider::default());
+        let mut builder = TokioResolver::builder_with_config(
+            google_or_pinned(upstream),
+            TokioRuntimeProvider::default(),
+        );
         apply_dnssec_opts(builder.options_mut(), validating);
         builder
             .build()
@@ -803,15 +793,6 @@ fn soa_apex<'a>(name: &str, records: impl Iterator<Item = &'a Record>) -> Option
         .filter(|record| matches!(record.data, RData::SOA(_)))
         .map(|record| normalize_owner(&record.name))
         .find(|owner| is_self_or_ancestor(owner, name))
-}
-
-/// Appends the root dot so hickory treats the name as fully qualified.
-fn fqdn(name: &str) -> String {
-    if name.ends_with('.') {
-        name.to_string()
-    } else {
-        format!("{name}.")
-    }
 }
 
 /// Maps a DNSSEC algorithm number to a human-readable name. Numbers come
