@@ -27,6 +27,23 @@ pub struct AvailabilityResult {
 }
 
 impl AvailabilityResult {
+    /// A verdict with no details; chain [`with_details`](Self::with_details)
+    /// to explain it.
+    pub(crate) fn new(domain: &str, available: bool, confidence: &str, method: &str) -> Self {
+        Self {
+            domain: domain.to_string(),
+            available,
+            confidence: confidence.to_string(),
+            method: method.to_string(),
+            details: None,
+        }
+    }
+
+    pub(crate) fn with_details(mut self, details: impl Into<String>) -> Self {
+        self.details = Some(details.into());
+        self
+    }
+
     /// Stable verdict string derived from `(available, confidence)`. Use this
     /// instead of branching on `confidence` alone — a `confidence: "high"`
     /// result can still mean "registered" when `available == false`.
@@ -210,6 +227,15 @@ impl AvailabilityChecker {
     }
 }
 
+/// Details for a thin WHOIS body the registry refused or throttled. Shared
+/// with the smart-lookup thin fallback so both paths word it the same.
+pub(crate) const REFUSED_DETAILS: &str =
+    "Registry refused or throttled the query; availability is inconclusive";
+
+/// Details for a thin WHOIS body with an NXDOMAIN apex (shared as above).
+pub(crate) const THIN_NXDOMAIN_DETAILS: &str =
+    "No registry data available; domain has no DNS presence (NXDOMAIN)";
+
 /// Verdict for a name below its registrable domain, derived from the check
 /// of that registrable `parent` (see
 /// [`AvailabilityChecker::guard_subdomain_claim`]).
@@ -234,16 +260,10 @@ fn subdomain_verdict(domain: &str, parent: &AvailabilityResult) -> AvailabilityR
             format!("the registration status of {p} could not be determined"),
         ),
     };
-    AvailabilityResult {
-        domain: domain.to_string(),
-        available: false,
-        confidence,
-        method: "registrable_parent".to_string(),
-        details: Some(format!(
-            "{domain} is not itself registrable: it is a name under the registrable domain {p}, \
-             and registries hold no object for subdomains. {status}."
-        )),
-    }
+    AvailabilityResult::new(domain, false, &confidence, "registrable_parent").with_details(format!(
+        "{domain} is not itself registrable: it is a name under the registrable domain {p}, \
+         and registries hold no object for subdomains. {status}."
+    ))
 }
 
 /// Pure decision function: build an `AvailabilityResult` from a successful
@@ -267,25 +287,14 @@ fn decide_from_rdap(domain: &str, response: crate::rdap::RdapResponse) -> Availa
     });
 
     if is_redemption {
-        return AvailabilityResult {
-            domain: domain.to_string(),
-            available: false,
-            confidence: "medium".to_string(),
-            method: "rdap".to_string(),
-            details: Some("Domain is in redemption/pending delete period".to_string()),
-        };
+        return AvailabilityResult::new(domain, false, "medium", "rdap")
+            .with_details("Domain is in redemption/pending delete period");
     }
 
-    AvailabilityResult {
-        domain: domain.to_string(),
-        available: false,
-        confidence: "high".to_string(),
-        method: "rdap".to_string(),
-        details: Some(format!(
-            "Domain is registered (status: {})",
-            statuses.join(", ")
-        )),
-    }
+    AvailabilityResult::new(domain, false, "high", "rdap").with_details(format!(
+        "Domain is registered (status: {})",
+        statuses.join(", ")
+    ))
 }
 
 /// Pure decision function: build an `AvailabilityResult` when RDAP failed
@@ -309,35 +318,22 @@ fn decide_fallback(
             let thin = whois_response.is_thin();
 
             if whois_response.is_available() {
-                AvailabilityResult {
-                    domain: domain.to_string(),
-                    available: true,
-                    confidence: "high".to_string(),
-                    method: "whois".to_string(),
-                    details: Some("WHOIS indicates domain is not registered".to_string()),
-                }
+                AvailabilityResult::new(domain, true, "high", "whois")
+                    .with_details("WHOIS indicates domain is not registered")
             } else if !thin {
                 // A concrete registration signal (registrar / dates /
                 // nameservers) is present → the domain is registered.
                 AvailabilityResult {
-                    domain: domain.to_string(),
-                    available: false,
-                    confidence: "high".to_string(),
-                    method: "whois".to_string(),
                     details: whois_response
                         .registrar
                         .map(|r| format!("Registered with {}", r)),
+                    ..AvailabilityResult::new(domain, false, "high", "whois")
                 }
             } else if rdap_error_is_404(rdap_err) {
                 // Thin WHOIS — often an access-blocked refusal like SWITCH's
                 // ".ch" — but the registry's own RDAP authoritatively 404'd.
-                AvailabilityResult {
-                    domain: domain.to_string(),
-                    available: true,
-                    confidence: "high".to_string(),
-                    method: "rdap".to_string(),
-                    details: Some("Registry RDAP reports no such domain (HTTP 404)".to_string()),
-                }
+                AvailabilityResult::new(domain, true, "high", "rdap")
+                    .with_details("Registry RDAP reports no such domain (HTTP 404)")
             } else if whois_response.indicates_registry_refusal() {
                 // Thin WHOIS that explicitly refused / throttled / negated the
                 // query (rate limit, access denied, reserved, "not available
@@ -345,39 +341,17 @@ fn decide_fallback(
                 // There is no usable registration signal — report inconclusive
                 // rather than inverting the refusal into "available" or guessing
                 // from DNS presence / fail-safing to "registered" (issue #45).
-                AvailabilityResult {
-                    domain: domain.to_string(),
-                    available: false,
-                    confidence: "none".to_string(),
-                    method: "inconclusive".to_string(),
-                    details: Some(
-                        "Registry refused or throttled the query; availability is inconclusive"
-                            .to_string(),
-                    ),
-                }
+                AvailabilityResult::new(domain, false, "none", "inconclusive")
+                    .with_details(REFUSED_DETAILS)
             } else if dns_presence == DnsPresence::Absent {
                 // Thin WHOIS, RDAP did not 404, and the apex is NXDOMAIN —
                 // corroborating evidence the domain is unregistered.
-                AvailabilityResult {
-                    domain: domain.to_string(),
-                    available: true,
-                    confidence: "medium".to_string(),
-                    method: "dns_nxdomain".to_string(),
-                    details: Some(
-                        "No registry data available; domain has no DNS presence (NXDOMAIN)"
-                            .to_string(),
-                    ),
-                }
+                AvailabilityResult::new(domain, true, "medium", "dns_nxdomain")
+                    .with_details(THIN_NXDOMAIN_DETAILS)
             } else {
                 // Thin WHOIS we could not interpret and no corroborating
                 // NXDOMAIN — fail safe toward "registered".
-                AvailabilityResult {
-                    domain: domain.to_string(),
-                    available: false,
-                    confidence: "high".to_string(),
-                    method: "whois".to_string(),
-                    details: None,
-                }
+                AvailabilityResult::new(domain, false, "high", "whois")
             }
         }
         Err(whois_err) => {
@@ -385,13 +359,8 @@ fn decide_fallback(
             // registry's RDAP server reports no such object, so the domain is
             // unregistered regardless of why WHOIS failed.
             if rdap_error_is_404(rdap_err) {
-                return AvailabilityResult {
-                    domain: domain.to_string(),
-                    available: true,
-                    confidence: "high".to_string(),
-                    method: "rdap".to_string(),
-                    details: Some("Registry RDAP reports no such domain (HTTP 404)".to_string()),
-                };
+                return AvailabilityResult::new(domain, true, "high", "rdap")
+                    .with_details("Registry RDAP reports no such domain (HTTP 404)");
             }
             // Both registry legs failed. Only a WHOIS-*protocol* error can
             // carry a registry "no match" signal; a transport failure
@@ -407,26 +376,13 @@ fn decide_fallback(
             };
 
             if likely_available {
-                AvailabilityResult {
-                    domain: domain.to_string(),
-                    available: true,
-                    confidence: "medium".to_string(),
-                    method: "whois_error".to_string(),
-                    details: Some("WHOIS server indicates no matching records".to_string()),
-                }
+                AvailabilityResult::new(domain, true, "medium", "whois_error")
+                    .with_details("WHOIS server indicates no matching records")
             } else if dns_presence == DnsPresence::Absent {
                 // Both registry legs failed, but the apex is NXDOMAIN — the
                 // domain has no DNS presence, so it is likely unregistered.
-                AvailabilityResult {
-                    domain: domain.to_string(),
-                    available: true,
-                    confidence: "medium".to_string(),
-                    method: "dns_nxdomain".to_string(),
-                    details: Some(
-                        "Registry lookups failed; domain has no DNS presence (NXDOMAIN)"
-                            .to_string(),
-                    ),
-                }
+                AvailabilityResult::new(domain, true, "medium", "dns_nxdomain")
+                    .with_details("Registry lookups failed; domain has no DNS presence (NXDOMAIN)")
             } else if dns_presence == DnsPresence::Present {
                 // Both registry legs failed with transport errors, but the
                 // apex IS delegated in DNS. Delegation in the TLD zone is
@@ -437,37 +393,26 @@ fn decide_fallback(
                 // domain free. Note this arm is a transport failure, not a
                 // registry refusal — refusals arrive as an Ok body and are
                 // kept inconclusive above (issue #45).
-                AvailabilityResult {
-                    domain: domain.to_string(),
-                    available: false,
-                    confidence: "medium".to_string(),
-                    method: "dns_present".to_string(),
-                    details: Some(
-                        "Registry lookups failed, but the apex is delegated in DNS \
-                         (NS records present) — the domain is almost certainly registered"
-                            .to_string(),
-                    ),
-                }
+                AvailabilityResult::new(domain, false, "medium", "dns_present").with_details(
+                    "Registry lookups failed, but the apex is delegated in DNS \
+                     (NS records present) — the domain is almost certainly registered",
+                )
             } else {
                 // Both queries failed with non-"not found" errors and DNS was
                 // unknown. We genuinely don't know — could be registered,
                 // blocked, or servers down. Default to available=false so we
-                // never tell the user a taken domain is free.
-                AvailabilityResult {
-                    domain: domain.to_string(),
-                    available: false,
-                    confidence: "none".to_string(),
-                    method: "inconclusive".to_string(),
-                    // Use the sanitized error projection so this string —
-                    // which flows into JSON / CSV / MCP output paths —
-                    // never carries raw ANSI escapes or internal IPs from
-                    // a third-party WHOIS/RDAP server's error message.
-                    details: Some(format!(
+                // never tell the user a taken domain is free. The details use
+                // the sanitized error projection so this string — which flows
+                // into JSON / CSV / MCP output paths — never carries raw ANSI
+                // escapes or internal IPs from a third-party WHOIS/RDAP
+                // server's error message.
+                AvailabilityResult::new(domain, false, "none", "inconclusive").with_details(
+                    format!(
                         "Could not determine availability. RDAP: {}. WHOIS: {}",
                         rdap_err.sanitized_message(),
                         whois_err.sanitized_message()
-                    )),
-                }
+                    ),
+                )
             }
         }
     }
@@ -482,12 +427,8 @@ mod tests {
 
     #[test]
     fn verdict_matrix() {
-        let make = |available, confidence: &str| AvailabilityResult {
-            domain: "example.test".to_string(),
-            available,
-            confidence: confidence.to_string(),
-            method: "whois".to_string(),
-            details: None,
+        let make = |available, confidence: &str| {
+            AvailabilityResult::new("example.test", available, confidence, "whois")
         };
         assert_eq!(make(true, "high").verdict(), "available");
         assert_eq!(make(true, "medium").verdict(), "likely_available");
@@ -499,13 +440,8 @@ mod tests {
 
     #[test]
     fn test_availability_result_serialization() {
-        let result = AvailabilityResult {
-            domain: "example.com".to_string(),
-            available: false,
-            confidence: "high".to_string(),
-            method: "rdap".to_string(),
-            details: Some("Domain is registered".to_string()),
-        };
+        let result = AvailabilityResult::new("example.com", false, "high", "rdap")
+            .with_details("Domain is registered");
         let json = serde_json::to_string(&result).unwrap();
         assert!(json.contains("\"available\":false"));
         assert!(json.contains("\"confidence\":\"high\""));
@@ -1070,13 +1006,7 @@ mod tests {
     // --- subdomain guard (names below the registrable domain) ---------
 
     fn avail(domain: &str, available: bool, confidence: &str) -> AvailabilityResult {
-        AvailabilityResult {
-            domain: domain.to_string(),
-            available,
-            confidence: confidence.to_string(),
-            method: "rdap".to_string(),
-            details: None,
-        }
+        AvailabilityResult::new(domain, available, confidence, "rdap")
     }
 
     #[test]

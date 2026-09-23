@@ -857,11 +857,8 @@ impl SmartLookup {
                     _ => None,
                 };
                 let avail = AvailabilityResult {
-                    domain: domain.to_string(),
-                    available: true,
-                    confidence: confidence.to_string(),
-                    method: method.to_string(),
                     details,
+                    ..AvailabilityResult::new(domain, true, confidence, method)
                 };
                 // A registry "no such domain" for a name below its
                 // registrable domain (mail.google.com) is not availability.
@@ -906,30 +903,14 @@ impl SmartLookup {
                         if let Some(ref cb) = progress {
                             cb("Registry refused or throttled the query (availability inconclusive)");
                         }
-                        let avail = AvailabilityResult {
-                            domain: domain.to_string(),
-                            available: false,
-                            confidence: "none".to_string(),
-                            method: "inconclusive".to_string(),
-                            details: Some(
-                                "Registry refused or throttled the query; availability is inconclusive"
-                                    .to_string(),
-                            ),
-                        };
+                        let avail = AvailabilityResult::new(domain, false, "none", "inconclusive")
+                            .with_details(crate::availability::REFUSED_DETAILS);
                         return Ok(available_with_whois(avail, &rdap_error_str, whois_data));
                     }
                     ThinFallback::Available => {
                         debug!(domain = %domain, "Thin WHOIS + NXDOMAIN, reclassifying as available");
-                        let avail = AvailabilityResult {
-                            domain: domain.to_string(),
-                            available: true,
-                            confidence: "medium".to_string(),
-                            method: "dns_nxdomain".to_string(),
-                            details: Some(
-                                "No registry data available; domain has no DNS presence (NXDOMAIN)"
-                                    .to_string(),
-                            ),
-                        };
+                        let avail = AvailabilityResult::new(domain, true, "medium", "dns_nxdomain")
+                            .with_details(crate::availability::THIN_NXDOMAIN_DETAILS);
                         let avail = self.availability_checker.guard_subdomain_claim(avail).await;
                         if let Some(ref cb) = progress {
                             cb(if avail.available {
@@ -954,13 +935,8 @@ impl SmartLookup {
                              was unavailable (RDAP rate-limited or unreachable and WHOIS returned \
                              no data); retry shortly for full detail."
                         };
-                        let avail = AvailabilityResult {
-                            domain: domain.to_string(),
-                            available: false,
-                            confidence: "high".to_string(),
-                            method: "dns_present".to_string(),
-                            details: Some(details.to_string()),
-                        };
+                        let avail = AvailabilityResult::new(domain, false, "high", "dns_present")
+                            .with_details(details);
                         return Ok(available_with_whois(avail, &rdap_error_str, whois_data));
                     }
                     ThinFallback::UseWhois => {}
@@ -1139,13 +1115,10 @@ mod tests {
     #[test]
     fn test_lookup_result_available_serialization() {
         let result = LookupResult::Available {
-            data: Box::new(AvailabilityResult {
-                domain: "test123.xyz".to_string(),
-                available: true,
-                confidence: "medium".to_string(),
-                method: "whois_error".to_string(),
-                details: Some("WHOIS server indicates no matching records".to_string()),
-            }),
+            data: Box::new(
+                AvailabilityResult::new("test123.xyz", true, "medium", "whois_error")
+                    .with_details("WHOIS server indicates no matching records"),
+            ),
             rdap_error: "RDAP failed".to_string(),
             whois_error: "WHOIS failed".to_string(),
             whois_data: None,
@@ -1521,13 +1494,7 @@ mod tests {
     fn available_with_whois_sanitizes_rdap_error() {
         // The constructor every WHOIS-in-hand route of `lookup_concurrent`
         // returns through.
-        let avail = AvailabilityResult {
-            domain: "unreg.test".to_string(),
-            available: false,
-            confidence: "none".to_string(),
-            method: "inconclusive".to_string(),
-            details: None,
-        };
+        let avail = AvailabilityResult::new("unreg.test", false, "none", "inconclusive");
         let result = available_with_whois(
             avail,
             "RDAP URL resolves to reserved IP 10.0.0.1",
@@ -1588,13 +1555,12 @@ mod tests {
 
     fn available_via(method: &str, available: bool, confidence: &str) -> LookupResult {
         LookupResult::Available {
-            data: Box::new(AvailabilityResult {
-                domain: "example.test".to_string(),
+            data: Box::new(AvailabilityResult::new(
+                "example.test",
                 available,
-                confidence: confidence.to_string(),
-                method: method.to_string(),
-                details: None,
-            }),
+                confidence,
+                method,
+            )),
             rdap_error: String::new(),
             whois_error: String::new(),
             whois_data: None,
