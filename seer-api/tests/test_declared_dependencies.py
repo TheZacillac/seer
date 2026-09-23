@@ -21,6 +21,10 @@ import seer_api
 
 PACKAGE_DIR = Path(seer_api.__file__).parent
 _OPTIONAL_IMPORT_ERRORS = {"ImportError", "ModuleNotFoundError"}
+# Editable installs (`maturin develop`, `pip install -e`) record only a .pth
+# file, so packages_distributions() can't map these import names back to their
+# distribution. Only first-party packages go here; third-party stay strict.
+_FIRST_PARTY = {"seer": "domain-seer"}
 
 
 def _canonical(name: str) -> str:
@@ -83,6 +87,37 @@ def test_every_imported_package_is_declared() -> None:
     undeclared = {
         module: where
         for module, where in imports.items()
-        if not any(_canonical(d) in declared for d in providers.get(module, []))
+        if not any(_canonical(d) in declared for d in _distributions(module, providers))
     }
     assert not undeclared, f"imported but not declared in pyproject.toml: {undeclared}"
+
+
+def _distributions(module: str, providers: dict[str, list[str]]) -> list[str]:
+    """Distributions providing `module`, falling back to _FIRST_PARTY when the
+    installed distribution is editable and so absent from `providers`."""
+    found = providers.get(module)
+    if found:
+        return found
+    dist = _FIRST_PARTY.get(module)
+    if dist is None:
+        return []
+    try:
+        metadata.distribution(dist)
+    except metadata.PackageNotFoundError:
+        return []
+    return [dist]
+
+
+def test_first_party_fallback_covers_editable_installs(monkeypatch) -> None:
+    # An editable domain-seer install leaves "seer" out of
+    # packages_distributions(); the fallback must still resolve it, and only
+    # when the distribution is actually installed.
+    monkeypatch.setattr(metadata, "distribution", lambda name: object())
+    assert _distributions("seer", {}) == ["domain-seer"]
+    assert _distributions("fastapi", {}) == []
+
+    def missing(name):
+        raise metadata.PackageNotFoundError(name)
+
+    monkeypatch.setattr(metadata, "distribution", missing)
+    assert _distributions("seer", {}) == []
