@@ -748,23 +748,19 @@ mod tests {
     //! resolver, the parent server, and each delegated NS) is a loopback UDP
     //! mock on its own ephemeral port, reached through the `#[cfg(test)]`
     //! seams (`with_recursive_upstream` / `with_port_map` /
-    //! `allowing_private_hosts`). The mock encoder mirrors
-    //! [`crate::dns::test_support`] but adds control over the AA bit,
-    //! AUTHORITY-section referrals, and error RCODEs, which the shared
-    //! fixture deliberately does not model. The shared fixture's
-    //! `MockMode::Ignore` is reused for the timeout case.
+    //! `allowing_private_hosts`). Scenarios script the shared
+    //! [`crate::dns::test_support`] fixture, whose replies cover the AA bit,
+    //! AUTHORITY-section referrals and error RCODEs; its `MockMode::Ignore`
+    //! serves the timeout case.
 
     use std::collections::HashMap;
     use std::net::Ipv4Addr;
-    use std::sync::Arc;
 
-    use hickory_resolver::proto::op::{Message, OpCode};
     use hickory_resolver::proto::rr::rdata as wire;
     use hickory_resolver::proto::rr::Name;
-    use tokio::net::UdpSocket;
 
     use super::*;
-    use crate::dns::test_support::{spawn_mock_dns, MockMode};
+    use crate::dns::test_support::{spawn_mock_dns, spawn_mock_dns_fn, MockMode, MockReply};
 
     // --- pure helpers --------------------------------------------------
 
@@ -907,82 +903,6 @@ mod tests {
         assert_eq!(checker.timeout, Duration::from_secs(9));
     }
 
-    // --- mock DNS server with AA / AUTHORITY / RCODE control ------------
-
-    /// How a mock server answers one query.
-    #[derive(Clone)]
-    enum MockReply {
-        /// NOERROR with answer records; `authoritative` sets the AA bit.
-        Answers {
-            records: Vec<HickoryRData>,
-            authoritative: bool,
-        },
-        /// NOERROR, empty ANSWER, NS records for the queried name in
-        /// AUTHORITY — a classic parent-side referral.
-        Referral(Vec<HickoryRData>),
-        /// NOERROR with all sections empty (NODATA).
-        NoData,
-        Refused,
-    }
-
-    type Handler = Arc<dyn Fn(&str, HickoryRecordType) -> MockReply + Send + Sync>;
-
-    /// Binds a UDP socket on an ephemeral loopback port and answers each
-    /// query via `handler` (qname is passed lowercased without the trailing
-    /// dot). Returns the bound port.
-    async fn spawn_mock(handler: Handler) -> u16 {
-        let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind mock DNS");
-        let port = socket.local_addr().expect("mock DNS local addr").port();
-        tokio::spawn(async move {
-            let mut buf = [0u8; 4096];
-            loop {
-                let Ok((len, src)) = socket.recv_from(&mut buf).await else {
-                    return;
-                };
-                let Ok(request) = Message::from_vec(&buf[..len]) else {
-                    continue;
-                };
-                let Some(query) = request.queries.first().cloned() else {
-                    continue;
-                };
-                let mut response = Message::response(request.metadata.id, OpCode::Query);
-                response.metadata.recursion_desired = request.metadata.recursion_desired;
-                response.metadata.recursion_available = true;
-                response.add_query(query.clone());
-                let qname = query.name.to_string().to_ascii_lowercase();
-                match handler(qname.trim_end_matches('.'), query.query_type) {
-                    MockReply::Answers {
-                        records,
-                        authoritative,
-                    } => {
-                        response.metadata.authoritative = authoritative;
-                        for rdata in records {
-                            response.add_answer(Record::from_rdata(query.name.clone(), 300, rdata));
-                        }
-                    }
-                    MockReply::Referral(records) => {
-                        for rdata in records {
-                            response.add_authority(Record::from_rdata(
-                                query.name.clone(),
-                                300,
-                                rdata,
-                            ));
-                        }
-                    }
-                    MockReply::NoData => {}
-                    MockReply::Refused => {
-                        response.metadata.response_code = ResponseCode::Refused;
-                    }
-                }
-                let Ok(bytes) = response.to_vec() else {
-                    continue;
-                };
-                let _ = socket.send_to(&bytes, src).await;
-            }
-        });
-        port
-    }
-
     fn ns_rdata(target: &str) -> HickoryRData {
         HickoryRData::NS(wire::NS(
             Name::from_ascii(target).expect("valid test NS name"),
@@ -998,53 +918,46 @@ mod tests {
     /// in `resolvable`.
     async fn spawn_recursive_mock(resolvable: &[&str]) -> u16 {
         let resolvable: Vec<String> = resolvable.iter().map(|s| s.to_string()).collect();
-        spawn_mock(Arc::new(move |qname, qtype| {
+        spawn_mock_dns_fn(move |qname, qtype| {
             match (qname, qtype) {
-                ("test", HickoryRecordType::NS) => MockReply::Answers {
-                    records: vec![ns_rdata("a.parent.test.")],
-                    authoritative: false,
-                },
+                ("test", HickoryRecordType::NS) => {
+                    MockReply::Answer(vec![ns_rdata("a.parent.test.")])
+                }
                 (host, HickoryRecordType::A)
                     if host == "a.parent.test" || resolvable.iter().any(|r| r == host) =>
                 {
-                    MockReply::Answers {
-                        records: vec![loopback_a()],
-                        authoritative: false,
-                    }
+                    MockReply::Answer(vec![loopback_a()])
                 }
                 // AAAA and unknown hosts: NODATA (lookup_ip falls back / fails).
                 _ => MockReply::NoData,
             }
-        }))
+        })
         .await
     }
 
     /// An authoritative zone server answering `domain NS` with `rrset`.
     async fn spawn_zone_server(rrset: &[&str]) -> u16 {
         let records: Vec<HickoryRData> = rrset.iter().map(|ns| ns_rdata(ns)).collect();
-        spawn_mock(Arc::new(move |_qname, qtype| {
+        spawn_mock_dns_fn(move |_qname, qtype| {
             if qtype == HickoryRecordType::NS {
-                MockReply::Answers {
-                    records: records.clone(),
-                    authoritative: true,
-                }
+                MockReply::AuthoritativeAnswer(records.clone())
             } else {
                 MockReply::NoData
             }
-        }))
+        })
         .await
     }
 
     /// A parent server that refers `seer.test` to `referral`.
     async fn spawn_parent_server(referral: &[&str]) -> u16 {
         let records: Vec<HickoryRData> = referral.iter().map(|ns| ns_rdata(ns)).collect();
-        spawn_mock(Arc::new(move |qname, qtype| {
+        spawn_mock_dns_fn(move |qname, qtype| {
             if qname == "seer.test" && qtype == HickoryRecordType::NS {
                 MockReply::Referral(records.clone())
             } else {
                 MockReply::NoData
             }
-        }))
+        })
         .await
     }
 
@@ -1148,7 +1061,7 @@ mod tests {
         let recursive = spawn_recursive_mock(&["ns1.seer.test", "ns2.seer.test"]).await;
         let parent = spawn_parent_server(&["ns1.seer.test.", "ns2.seer.test."]).await;
         let ns1 = spawn_zone_server(&["ns1.seer.test.", "ns2.seer.test."]).await;
-        let ns2 = spawn_mock(Arc::new(|_, _| MockReply::Refused)).await;
+        let ns2 = spawn_mock_dns_fn(|_, _| MockReply::Refused).await;
 
         let report = checker(
             recursive,
@@ -1183,16 +1096,13 @@ mod tests {
         let ns1 = spawn_zone_server(&["ns1.seer.test.", "ns2.seer.test."]).await;
         // ns2 answers the right RRset but without the AA bit — a cache, not
         // an authority.
-        let ns2 = spawn_mock(Arc::new(|_, qtype| {
+        let ns2 = spawn_mock_dns_fn(|_, qtype| {
             if qtype == HickoryRecordType::NS {
-                MockReply::Answers {
-                    records: vec![ns_rdata("ns1.seer.test."), ns_rdata("ns2.seer.test.")],
-                    authoritative: false,
-                }
+                MockReply::Answer(vec![ns_rdata("ns1.seer.test."), ns_rdata("ns2.seer.test.")])
             } else {
                 MockReply::NoData
             }
-        }))
+        })
         .await;
 
         let report = checker(
