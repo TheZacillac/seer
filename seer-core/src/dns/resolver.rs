@@ -198,7 +198,7 @@ fn build_upstream_config(
 ///
 /// Uses Google DNS (8.8.8.8) by default, but supports custom nameservers
 /// over plain UDP, DNS over TLS (`tls://`), and DNS over HTTPS (`https://`)
-/// — see [`NameserverSpec`](super::NameserverSpec) for the accepted forms.
+/// — see [`NameserverSpec`] for the accepted forms.
 /// The default resolver is cached and reused across queries to avoid
 /// repeated initialization overhead.
 #[derive(Clone)]
@@ -386,7 +386,7 @@ impl DnsResolver {
     /// * `nameserver` - Optional custom nameserver spec; uses Google DNS if
     ///   None. Accepts a bare IP/hostname with optional port (UDP),
     ///   `tls://host[:port]` (DNS over TLS), or `https://host[:port][/path]`
-    ///   (DNS over HTTPS) — see [`NameserverSpec`](super::NameserverSpec)
+    ///   (DNS over HTTPS) — see [`NameserverSpec`]
     #[instrument(skip(self), fields(domain = %domain, record_type = %record_type))]
     pub async fn resolve(
         &self,
@@ -484,7 +484,7 @@ impl DnsResolver {
     }
 
     /// Single-type dispatch shared by [`resolve`](Self::resolve) and
-    /// [`resolve_any`] — the one place a seer [`RecordType`] is routed to a
+    /// [`resolve_any`](Self::resolve_any) — the one place a seer [`RecordType`] is routed to a
     /// lookup, so the two entry points cannot diverge.
     ///
     /// `SRV` and `ANY` are composite queries owned by `resolve` (label

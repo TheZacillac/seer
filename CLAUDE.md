@@ -575,7 +575,9 @@ seer-mcp                                   # MCP server on stdio
 - **Own types in public APIs.** Convert hickory/reqwest/x509 types into
   seer-core structs before returning them.
 - **Document public APIs** with `///` and keep each module's `//!` overview
-  current.
+  current. An intra-doc link resolves only if the item is visible from where
+  the link is written, in a non-test build: name a `#[cfg(test)]` helper or
+  another module's private item in plain backticks instead of linking it.
 - **No hacks or workarounds.** Fix the root cause; if something can only be
   done fragilely, stop and raise it.
 - **Naming:** standard Rust (PascalCase types, snake_case functions and

@@ -379,11 +379,11 @@ async fn query_server_internal(
     query_server_internal_with(server, query, timeout_duration, WHOIS_PORT, false).await
 }
 
-/// Like [`query_server_internal`], parameterized over port and host
-/// validation so `#[cfg(test)]` mock-server tests can target 127.0.0.1 on an
-/// ephemeral port. Every production call site goes through the validating
-/// wrapper above or a `WhoisClient` constructed with `allow_private_hosts:
-/// false` (the only kind constructible outside test builds).
+/// Sends one WHOIS query over TCP to `server:port` and returns the response.
+/// `port` and `allow_private_hosts` (which skips the SSRF host validation)
+/// exist so `#[cfg(test)]` mock-server tests can target 127.0.0.1 on an
+/// ephemeral port. The only production caller is `WhoisClient`, which
+/// passes [`WHOIS_PORT`] and `allow_private_hosts: false` outside test builds.
 async fn query_server_internal_with(
     server: &str,
     query: &str,
@@ -586,10 +586,11 @@ fn extract_referral(response: &str) -> Option<String> {
     extract_referral_with(response, false)
 }
 
-/// Like [`extract_referral`], but `allow_private_hosts` skips the
-/// safe-hostname filter so `#[cfg(test)]` mock servers (loopback, no dots)
-/// can act as referral targets. Production callers pass the client's
-/// `allow_private_hosts`, which is always false outside test builds.
+/// Returns the first referral server named in `response`, kept only if it
+/// passes [`is_safe_whois_server`]. `allow_private_hosts` skips that filter
+/// so `#[cfg(test)]` mock servers (loopback, no dots) can act as referral
+/// targets. Production callers pass the client's `allow_private_hosts`,
+/// which is always false outside test builds.
 fn extract_referral_with(response: &str, allow_private_hosts: bool) -> Option<String> {
     for re in REFERRAL_PATTERNS.iter() {
         if let Some(caps) = re.captures(response) {

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::LazyLock;
 
 /// Comprehensive WHOIS server list.
-/// Data sourced from https://github.com/WooMai/whois-servers (auto-synced with IANA Root Zone Database).
+/// Data sourced from <https://github.com/WooMai/whois-servers> (auto-synced with IANA Root Zone Database).
 ///
 /// Intentional omissions
 /// ---------------------

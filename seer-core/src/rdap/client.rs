@@ -793,7 +793,8 @@ type PinnedClientKey = (String, u16, Duration);
 
 /// Pinned per-host RDAP clients. `reqwest::Client` is Arc-backed, so cloning
 /// out of the cache shares the underlying connection pool. Entries are only
-/// ever inserted after full SSRF validation ([`validate_url_not_reserved`]);
+/// ever inserted after full SSRF validation ([`parse_rdap_url`] +
+/// [`resolve_rdap_host`] in [`send_rdap_request`]);
 /// the loopback requests the `#[cfg(test)]` allow-reserved mode exempts
 /// bypass this cache in both directions (never insert, never read).
 /// Capacity-bounded: evicting
