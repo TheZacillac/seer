@@ -62,6 +62,15 @@ def _csv_env(name: str) -> list[str]:
     return [v.strip() for v in os.environ.get(name, "").split(",") if v.strip()]
 
 
+def _api_key() -> str:
+    """The configured ``SEER_API_KEY``, read per call; '' means auth is off.
+
+    Stripped, so a blank value (e.g. ``SEER_API_KEY=""`` from a
+    secrets-manager placeholder) counts as unset rather than as a key.
+    """
+    return (os.environ.get("SEER_API_KEY") or "").strip()
+
+
 def _build_mcp_session_manager() -> StreamableHTTPSessionManager:
     """Construct the Streamable HTTP MCP session manager.
 
@@ -243,7 +252,7 @@ def _mcp_origin_blocked(origin: str) -> bool:
     allowed_origins = _csv_env("SEER_MCP_ALLOWED_ORIGINS")
     if allowed_origins:
         return not _origin_allowed(origin, allowed_origins)
-    if (os.environ.get("SEER_API_KEY") or "").strip():
+    if _api_key():
         return False
     return _header_host(origin) not in _LOCALHOST_HOSTS
 
@@ -311,14 +320,11 @@ async def lifespan(_app: FastAPI):
         )
 
     # C6: bound to a non-loopback interface without any API key is an open
-    # proxy. Hard-fail rather than warn. Read SEER_API_KEY directly from
-    # the environment here (not from a module-level constant) so a deploy
-    # that sets the key just before startup is honoured. Use `.strip()`
-    # so a blank value from a secrets-manager placeholder
-    # (`SEER_API_KEY=""`) still trips the guard instead of silently
-    # disabling auth.
+    # proxy. Hard-fail rather than warn. The key is read from the environment
+    # here (not a module-level constant) so a deploy that sets it just before
+    # startup is honoured, and a blank placeholder still trips the guard.
     host = os.environ.get("SEER_HOST", "127.0.0.1")
-    if not _is_loopback_bind(host) and not (os.environ.get("SEER_API_KEY") or "").strip():
+    if not _is_loopback_bind(host) and not _api_key():
         log.error(
             "seer-api is bound to %s with no SEER_API_KEY set. Refusing to "
             "start. Set SEER_API_KEY or SEER_HOST=127.0.0.1.",
@@ -399,10 +405,7 @@ async def auth_middleware(request: Request, call_next):
                 {"detail": "rate limit exceeded"}, status_code=429
             )
 
-    # Treat a blank value (e.g. `SEER_API_KEY=""` from a misconfigured
-    # secrets-manager placeholder) as "no key set" rather than letting
-    # it silently disable auth via Python's empty-string falsy check.
-    api_key = (os.environ.get("SEER_API_KEY") or "").strip()
+    api_key = _api_key()
     if api_key:
         # Public endpoints are exempt. OPTIONS preflight is handled by the
         # outer CORSMiddleware and never reaches here, but we still short
@@ -437,13 +440,11 @@ async def auth_middleware(request: Request, call_next):
 # still runs before any route handler — CORS only adds response headers and
 # answers preflight; it does not bypass downstream middleware for real
 # requests.
-cors_origins_env = os.environ.get("SEER_CORS_ORIGINS", "")
-# Filter empty entries first so `SEER_CORS_ORIGINS=",,"` and trailing
-# commas land in the dev-mode branch instead of producing a list of
-# empty strings that CORSMiddleware silently never matches.
-_cors_parsed = [o for o in (s.strip() for s in cors_origins_env.split(",")) if o]
-if _cors_parsed:
-    allowed_origins = _cors_parsed
+# Empty entries are dropped, so `SEER_CORS_ORIGINS=",,"` and trailing commas
+# land in the dev-mode branch instead of producing a list of empty strings
+# that CORSMiddleware silently never matches.
+allowed_origins = _csv_env("SEER_CORS_ORIGINS")
+if allowed_origins:
     allow_credentials = True
     # `Access-Control-Allow-Origin: *` with `allow_credentials=True` is a
     # CORS spec violation — browsers reject it and Starlette raises a
