@@ -24,12 +24,9 @@
 //! domain, oldest-evicted domain cap).
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-
-use crate::error::{Result, SeerError};
 
 /// Maximum number of distinct domains retained. When exceeded, the domain
 /// with the oldest baseline is evicted (same bounded-growth rationale as
@@ -130,58 +127,14 @@ fn normalize_name(name: &str) -> String {
     name.trim().to_lowercase()
 }
 
+crate::fsutil::persisted_store!(
+    SubdomainBaselines,
+    "subdomain_baselines.json",
+    json,
+    "subdomain baselines"
+);
+
 impl SubdomainBaselines {
-    /// Returns the path to the baselines file
-    /// (`~/.seer/subdomain_baselines.json`).
-    pub fn path() -> Option<PathBuf> {
-        dirs::home_dir().map(|h| h.join(".seer").join("subdomain_baselines.json"))
-    }
-
-    /// Loads baselines from disk, returning an empty store on any failure.
-    ///
-    /// When the file exists but fails to parse, it is renamed to
-    /// `<path>.corrupt` (preserving the user's data for recovery) and a
-    /// warning is logged — matching the corrupt-file convention in
-    /// [`crate::history`].
-    pub fn load() -> Self {
-        let Some(path) = Self::path() else {
-            return Self::default();
-        };
-        Self::load_from_path(&path)
-    }
-
-    /// Like [`Self::load`] but reads from an explicit path. Split out so
-    /// tests can exercise corrupt-file handling without touching the real
-    /// `~/.seer/subdomain_baselines.json`.
-    pub(crate) fn load_from_path(path: &std::path::Path) -> Self {
-        crate::fsutil::load_or_back_up(path, "subdomain baselines", |content| {
-            serde_json::from_str::<SubdomainBaselines>(content).map_err(|e| e.to_string())
-        })
-    }
-
-    /// Persists baselines to `~/.seer/subdomain_baselines.json`.
-    ///
-    /// Same durability properties as [`crate::history::LookupHistory::save`]:
-    /// write to a per-PID sibling temp file, then `rename` over the target
-    /// (atomic on POSIX), with owner-only permissions applied before the
-    /// rename so the published file is never briefly world-readable. The
-    /// load → mutate → save cycle is last-writer-wins across processes, which
-    /// for a single-baseline-per-domain store means at worst one concurrent
-    /// recording is superseded — never corruption.
-    pub fn save(&self) -> Result<()> {
-        let path = Self::path()
-            .ok_or_else(|| SeerError::ConfigError("Cannot determine home directory".to_string()))?;
-        self.save_to_path(&path)
-    }
-
-    /// Like [`Self::save`] but writes to an explicit path (test seam — same
-    /// split as `load_from_path`).
-    pub(crate) fn save_to_path(&self, path: &std::path::Path) -> Result<()> {
-        let content = serde_json::to_string_pretty(self)
-            .map_err(|e| SeerError::ConfigError(e.to_string()))?;
-        crate::fsutil::write_atomic_owner_only(path, &content, "json")
-    }
-
     /// Records `names` into the baseline for `domain`, merging them with any
     /// previously recorded names. Evicts the oldest-recorded domain when the
     /// store exceeds [`MAX_DOMAINS`].
@@ -236,6 +189,7 @@ impl SubdomainBaselines {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn names(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| s.to_string()).collect()
