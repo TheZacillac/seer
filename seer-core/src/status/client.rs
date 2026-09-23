@@ -9,8 +9,6 @@
 use std::time::Duration;
 
 use chrono::Utc;
-use regex::Regex;
-use std::sync::LazyLock;
 use tracing::{debug, instrument};
 
 use super::types::{CertificateInfo, DnsResolution, DomainExpiration, StatusResponse};
@@ -25,10 +23,10 @@ use crate::validation::normalize_host;
 /// Balances responsiveness with allowing slow servers to respond.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Pre-compiled regex for extracting HTML title.
-static TITLE_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)<title[^>]*>([^<]+)</title>").expect("Invalid regex for HTML title extraction")
-});
+static_regex! {
+    /// Pre-compiled regex for extracting HTML title.
+    TITLE_REGEX = r"(?i)<title[^>]*>([^<]+)</title>";
+}
 
 /// Client for checking domain status (HTTP, SSL, expiration)
 #[derive(Debug, Clone)]
