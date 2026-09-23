@@ -44,6 +44,12 @@ dependencies = [
     # so bump this whenever a new binding is called.
     "domain-seer>=0.48.0",
     "slowapi>=0.1.9",
+    # Imported directly (the /mcp and per-tool MCP rate limiters; the raw
+    # /mcp route, middleware and SSE responses), so declared rather than left
+    # to arrive through slowapi / fastapi. Floors are the ones those already
+    # guarantee.
+    "limits>=2.3",
+    "starlette>=0.35",
 ]
 
 [project.optional-dependencies]
