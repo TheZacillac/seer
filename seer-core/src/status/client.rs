@@ -133,23 +133,10 @@ impl StatusClient {
         }
         response.caa = Some(caa_policy);
 
-        // Apply domain expiration info
-        match expiry_result {
-            Ok(expiry_info) => response.domain_expiration = expiry_info,
-            Err(e) => response.errors.push(super::types::StatusError {
-                check: "expiration".to_string(),
-                message: e.to_string(),
-            }),
-        }
-
-        // Apply DNS resolution info
-        match dns_result {
-            Ok(dns_info) => response.dns_resolution = Some(dns_info),
-            Err(e) => response.errors.push(super::types::StatusError {
-                check: "dns".to_string(),
-                message: e.to_string(),
-            }),
-        }
+        // Expiration and DNS never add a sub-check error: a failed lookup
+        // folds into "unknown" (no expiration / no records).
+        response.domain_expiration = expiry_result;
+        response.dns_resolution = Some(dns_result);
 
         Ok(response)
     }
@@ -227,29 +214,22 @@ impl StatusClient {
         parse_certificate_der(&der, domain)
     }
 
-    /// Fetches domain expiration info using WHOIS/RDAP.
-    async fn fetch_domain_expiration(&self, domain: &str) -> Result<Option<DomainExpiration>> {
-        match self.smart_lookup.lookup(domain).await {
-            Ok(result) => {
-                let (expiration_date, registrar) = result.expiration_info();
-
-                if let Some(exp_date) = expiration_date {
-                    let days_until_expiry = crate::dates::days_until(exp_date, Utc::now());
-                    Ok(Some(DomainExpiration {
-                        expiration_date: exp_date,
-                        days_until_expiry,
-                        registrar,
-                    }))
-                } else {
-                    Ok(None)
-                }
-            }
-            Err(_) => Ok(None), // Don't fail the whole status check if WHOIS fails
-        }
+    /// Fetches domain expiration info using WHOIS/RDAP; `None` when the lookup
+    /// fails (which must not fail the whole status check) or has no date.
+    async fn fetch_domain_expiration(&self, domain: &str) -> Option<DomainExpiration> {
+        let result = self.smart_lookup.lookup(domain).await.ok()?;
+        let (expiration_date, registrar) = result.expiration_info();
+        let expiration_date = expiration_date?;
+        Some(DomainExpiration {
+            expiration_date,
+            days_until_expiry: crate::dates::days_until(expiration_date, Utc::now()),
+            registrar,
+        })
     }
 
-    /// Fetches DNS root record resolution (A, AAAA, CNAME, NS).
-    async fn fetch_dns_resolution(&self, domain: &str) -> Result<DnsResolution> {
+    /// Fetches DNS root record resolution (A, AAAA, CNAME, NS). A failed
+    /// query contributes no records rather than an error.
+    async fn fetch_dns_resolution(&self, domain: &str) -> DnsResolution {
         let resolver = &self.dns_resolver;
 
         // Query all record types concurrently
@@ -312,13 +292,13 @@ impl StatusClient {
         // Domain resolves if it has A/AAAA records or a CNAME
         let resolves = !a_records.is_empty() || !aaaa_records.is_empty() || cname_target.is_some();
 
-        Ok(DnsResolution {
+        DnsResolution {
             a_records,
             aaaa_records,
             cname_target,
             nameservers,
             resolves,
-        })
+        }
     }
 }
 
