@@ -1,7 +1,7 @@
 use std::future::Future;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{LazyLock, Mutex, MutexGuard, OnceLock};
 
 use pyo3::exceptions::{PyConnectionError, PyRuntimeError, PyTimeoutError, PyValueError};
 use pyo3::prelude::*;
@@ -174,34 +174,23 @@ where
     )
 }
 
-/// Defines one lazily constructed, process-wide core client per entry. A
-/// macro rather than a generic fn because Rust has no generic statics: each
-/// getter needs its own `static`.
-macro_rules! singletons {
-    ($($getter:ident: $ty:ty),* $(,)?) => {$(
-        fn $getter() -> &'static $ty {
-            static INSTANCE: OnceLock<$ty> = OnceLock::new();
-            INSTANCE.get_or_init(<$ty>::new)
-        }
-    )*};
-}
-
-singletons! {
-    get_smart_lookup: SmartLookup,
-    get_whois_client: WhoisClient,
-    get_rdap_client: RdapClient,
-    get_dns_resolver: DnsResolver,
-    get_propagation_checker: PropagationChecker,
-    get_status_client: StatusClient,
-    get_availability_checker: AvailabilityChecker,
-    get_subdomain_enumerator: SubdomainEnumerator,
-    get_ssl_checker: SslChecker,
-    get_dnssec_checker: DnssecChecker,
-    get_delegation_checker: DelegationChecker,
-    get_dns_comparator: DnsComparator,
-    get_dns_follower: DnsFollower,
-    get_domain_differ: DomainDiffer,
-}
+// Process-wide core clients, each built on first use and shared by every call.
+static SMART_LOOKUP: LazyLock<SmartLookup> = LazyLock::new(SmartLookup::new);
+static WHOIS_CLIENT: LazyLock<WhoisClient> = LazyLock::new(WhoisClient::new);
+static RDAP_CLIENT: LazyLock<RdapClient> = LazyLock::new(RdapClient::new);
+static DNS_RESOLVER: LazyLock<DnsResolver> = LazyLock::new(DnsResolver::new);
+static PROPAGATION_CHECKER: LazyLock<PropagationChecker> = LazyLock::new(PropagationChecker::new);
+static STATUS_CLIENT: LazyLock<StatusClient> = LazyLock::new(StatusClient::new);
+static AVAILABILITY_CHECKER: LazyLock<AvailabilityChecker> =
+    LazyLock::new(AvailabilityChecker::new);
+static SUBDOMAIN_ENUMERATOR: LazyLock<SubdomainEnumerator> =
+    LazyLock::new(SubdomainEnumerator::new);
+static SSL_CHECKER: LazyLock<SslChecker> = LazyLock::new(SslChecker::new);
+static DNSSEC_CHECKER: LazyLock<DnssecChecker> = LazyLock::new(DnssecChecker::new);
+static DELEGATION_CHECKER: LazyLock<DelegationChecker> = LazyLock::new(DelegationChecker::new);
+static DNS_COMPARATOR: LazyLock<DnsComparator> = LazyLock::new(DnsComparator::new);
+static DNS_FOLLOWER: LazyLock<DnsFollower> = LazyLock::new(DnsFollower::new);
+static DOMAIN_DIFFER: LazyLock<DomainDiffer> = LazyLock::new(DomainDiffer::new);
 
 /// Validate that a host is safe to connect to (not a reserved/loopback/private IP).
 ///
@@ -226,17 +215,16 @@ fn nameserver_target(spec: &str) -> Option<(String, u16)> {
 }
 
 /// Generates the single-argument bindings that make one core call and return
-/// its serialized result. `with <client> = <getter>` fetches the core client
-/// before entering the runtime, exactly as a hand-written binding would.
+/// its serialized result. `$call` runs inside the runtime, so a client static
+/// it names is built there on first use, with the GIL released.
 macro_rules! call_fn {
     ($(
         $(#[$meta:meta])*
-        $name:ident($arg:ident: $ty:ty) $(with $client:ident = $get:expr)? => $call:expr;
+        $name:ident($arg:ident: $ty:ty) => $call:expr;
     )*) => {$(
         $(#[$meta])*
         #[pyfunction]
         fn $name<'py>(py: Python<'py>, $arg: $ty) -> PyResult<Bound<'py, PyAny>> {
-            $(let $client = $get;)?
             let response = run_async(py, async move { $call.await })?;
             to_py(py, &response)
         }
@@ -244,25 +232,23 @@ macro_rules! call_fn {
 }
 
 call_fn! {
-    lookup(domain: String) with c = get_smart_lookup() => c.lookup(&domain);
-    whois(domain: String) with c = get_whois_client() => c.lookup(&domain);
-    rdap_domain(domain: String) with c = get_rdap_client() => c.lookup_domain(&domain);
-    rdap_ip(ip: String) with c = get_rdap_client() => c.lookup_ip(&ip);
-    rdap_asn(asn: u32) with c = get_rdap_client() => c.lookup_asn(asn);
+    lookup(domain: String) => SMART_LOOKUP.lookup(&domain);
+    whois(domain: String) => WHOIS_CLIENT.lookup(&domain);
+    rdap_domain(domain: String) => RDAP_CLIENT.lookup_domain(&domain);
+    rdap_ip(ip: String) => RDAP_CLIENT.lookup_ip(&ip);
+    rdap_asn(asn: u32) => RDAP_CLIENT.lookup_asn(asn);
     /// Auto-routing RDAP lookup: classifies `query` as IP / ASN / domain in
     /// Rust and dispatches to the correct endpoint. Replaces the former
     /// Python-side dispatcher, which silently misrouted `AS`-prefixed domains
     /// like `as1234.io` to the ASN endpoint.
-    rdap_auto(query: String) with c = get_rdap_client()
-        => seer_core::rdap::auto_lookup(c, &query);
-    status(domain: String) with c = get_status_client() => c.check(&domain);
-    availability(domain: String) with c = get_availability_checker() => c.check(&domain);
-    subdomains(domain: String) with c = get_subdomain_enumerator() => c.enumerate(&domain);
-    ssl(domain: String) with c = get_ssl_checker() => c.check(&domain);
-    dnssec(domain: String) with c = get_dnssec_checker() => c.check(&domain);
-    delegation(domain: String) with c = get_delegation_checker() => c.check(&domain);
-    posture(domain: String) with c = get_dns_resolver()
-        => seer_core::lookup_email_posture(c, &domain);
+    rdap_auto(query: String) => seer_core::rdap::auto_lookup(&RDAP_CLIENT, &query);
+    status(domain: String) => STATUS_CLIENT.check(&domain);
+    availability(domain: String) => AVAILABILITY_CHECKER.check(&domain);
+    subdomains(domain: String) => SUBDOMAIN_ENUMERATOR.enumerate(&domain);
+    ssl(domain: String) => SSL_CHECKER.check(&domain);
+    dnssec(domain: String) => DNSSEC_CHECKER.check(&domain);
+    delegation(domain: String) => DELEGATION_CHECKER.check(&domain);
+    posture(domain: String) => seer_core::lookup_email_posture(&DNS_RESOLVER, &domain);
     headers(domain: String)
         => seer_core::audit_headers(&domain, seer_core::DEFAULT_HEADER_TIMEOUT);
 }
@@ -275,12 +261,10 @@ fn dig<'py>(
     record_type: &str,
     nameserver: Option<String>,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let resolver = get_dns_resolver();
-
     let rt_parsed = parse_record_type(record_type)?;
 
     let records = run_async(py, async move {
-        resolver
+        DNS_RESOLVER
             .resolve(&domain, rt_parsed, nameserver.as_deref())
             .await
     })?;
@@ -295,11 +279,11 @@ fn propagation<'py>(
     domain: String,
     record_type: &str,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let checker = get_propagation_checker();
-
     let rt_parsed = parse_record_type(record_type)?;
 
-    let response = run_async(py, async move { checker.check(&domain, rt_parsed).await })?;
+    let response = run_async(py, async move {
+        PROPAGATION_CHECKER.check(&domain, rt_parsed).await
+    })?;
     to_py(py, &response)
 }
 
@@ -590,10 +574,9 @@ fn bulk_propagation<'py>(
 
 #[pyfunction]
 fn caa<'py>(py: Python<'py>, domain: String) -> PyResult<Bound<'py, PyAny>> {
-    let resolver = get_dns_resolver();
     let normalized = seer_core::normalize_domain(&domain).map_err(|e| seer_err_to_py(&e))?;
     let policy = run_async_infallible(py, async move {
-        seer_core::caa::lookup_caa(resolver, &normalized).await
+        seer_core::caa::lookup_caa(&DNS_RESOLVER, &normalized).await
     })?;
     to_py(py, &policy)
 }
@@ -605,12 +588,16 @@ fn takeover<'py>(
     domain: String,
     concurrency: usize,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let enumerator = get_subdomain_enumerator();
-    let resolver = get_dns_resolver();
     let concurrency = validate_concurrency(concurrency)?;
     let response = run_async(py, async move {
-        let result = enumerator.enumerate(&domain).await?;
-        seer_core::scan_takeover(resolver, &result.domain, result.subdomains, concurrency).await
+        let result = SUBDOMAIN_ENUMERATOR.enumerate(&domain).await?;
+        seer_core::scan_takeover(
+            &DNS_RESOLVER,
+            &result.domain,
+            result.subdomains,
+            concurrency,
+        )
+        .await
     })?;
     to_py(py, &response)
 }
@@ -622,10 +609,9 @@ fn confusables<'py>(
     domain: String,
     concurrency: usize,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let lookup = get_smart_lookup();
     let concurrency = validate_concurrency(concurrency)?;
     let response = run_async(py, async move {
-        seer_core::find_confusables(lookup, &domain, concurrency).await
+        seer_core::find_confusables(&SMART_LOOKUP, &domain, concurrency).await
     })?;
     to_py(py, &response)
 }
@@ -637,14 +623,12 @@ fn subdomains_classify<'py>(
     domain: String,
     concurrency: usize,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let enumerator = get_subdomain_enumerator();
-    let resolver = get_dns_resolver();
     let concurrency = validate_concurrency(concurrency)?;
     let response = run_async(py, async move {
-        let result = enumerator.enumerate(&domain).await?;
+        let result = SUBDOMAIN_ENUMERATOR.enumerate(&domain).await?;
         Ok::<_, SeerError>(
             seer_core::classify_subdomains(
-                resolver,
+                &DNS_RESOLVER,
                 &result.domain,
                 result.subdomains,
                 concurrency,
@@ -663,12 +647,10 @@ fn dns_compare<'py>(
     server_a: String,
     server_b: String,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let comparator = get_dns_comparator();
-
     let rt_parsed = parse_record_type(record_type)?;
 
     let response = run_async(py, async move {
-        comparator
+        DNS_COMPARATOR
             .compare(&domain, rt_parsed, &server_a, &server_b)
             .await
     })?;
@@ -690,8 +672,6 @@ fn dns_follow<'py>(
     // call would overwrite the global cancel sender, silently orphaning the
     // first call's ability to be cancelled. The guard releases on return.
     let _active = FollowActiveGuard::acquire()?;
-
-    let follower = get_dns_follower();
 
     let rt_parsed = parse_record_type(record_type)?;
 
@@ -732,7 +712,7 @@ fn dns_follow<'py>(
     };
 
     let response = run_async(py, async move {
-        follower
+        DNS_FOLLOWER
             .follow(
                 &domain,
                 rt_parsed,
@@ -775,15 +755,16 @@ fn cancel_follow() -> PyResult<()> {
 
 #[pyfunction]
 fn diff<'py>(py: Python<'py>, domain_a: String, domain_b: String) -> PyResult<Bound<'py, PyAny>> {
-    let differ = get_domain_differ();
-    let response = run_async(py, async move { differ.diff(&domain_a, &domain_b).await })?;
+    let response = run_async(
+        py,
+        async move { DOMAIN_DIFFER.diff(&domain_a, &domain_b).await },
+    )?;
     to_py(py, &response)
 }
 
 #[pyfunction]
 fn info<'py>(py: Python<'py>, domain: String) -> PyResult<Bound<'py, PyAny>> {
-    let smart_lookup = get_smart_lookup();
-    let lookup_result = run_async(py, async move { smart_lookup.lookup(&domain).await })?;
+    let lookup_result = run_async(py, async move { SMART_LOOKUP.lookup(&domain).await })?;
     let domain_info = seer_core::domain_info::DomainInfo::from_lookup_result(&lookup_result);
     to_py(py, &domain_info)
 }
