@@ -119,28 +119,15 @@ fn seer_err_to_py(e: &SeerError) -> PyErr {
 /// Run an async `SeerError`-returning future on the shared Tokio runtime and
 /// marshal the outcome into a `PyResult`.
 ///
-/// Wraps the `block_on` in `std::panic::catch_unwind`: a panic that unwinds
-/// through the FFI boundary is UB and would abort the Python process. Common
-/// causes include calling a blocking runtime from inside another async runtime
-/// (e.g. from `asyncio`) which tokio explicitly panics on. We surface that as
-/// a `RuntimeError` instead.
-///
 /// Errors are routed through `seer_err_to_py` so that sanitized, typed
-/// messages reach the caller.
+/// messages reach the caller. Panic safety comes from
+/// [`run_async_infallible`].
 fn run_async<F, T>(py: Python<'_>, fut: F) -> PyResult<T>
 where
     F: Future<Output = seer_core::Result<T>> + Send,
     T: Send,
 {
-    py.detach(
-        || match catch_unwind(AssertUnwindSafe(|| get_runtime().block_on(fut))) {
-            Ok(Ok(v)) => Ok(v),
-            Ok(Err(e)) => Err(seer_err_to_py(&e)),
-            Err(_) => Err(PyRuntimeError::new_err(
-                "panic in seer runtime (likely nested async context or internal bug)",
-            )),
-        },
-    )
+    run_async_infallible(py, fut)?.map_err(|e| seer_err_to_py(&e))
 }
 
 /// Serialize a Rust response to `serde_json::Value`, mapping any error to a
@@ -152,11 +139,28 @@ fn serialize_response<T: serde::Serialize>(value: &T) -> PyResult<serde_json::Va
         .map_err(|_| PyRuntimeError::new_err("internal error: failed to serialize response"))
 }
 
-/// Infallible variant of `run_async` for futures that do not return a
-/// `SeerError` (e.g. `BulkExecutor::execute` which reports per-item failures
-/// in the returned `Vec<BulkResult>`). Still wraps `block_on` in
-/// `catch_unwind` so that a panic in the runtime surfaces as a Python
-/// exception rather than aborting the process.
+/// Serialize a core response and convert it into a Python object.
+fn to_py<'py, T: serde::Serialize>(py: Python<'py>, value: &T) -> PyResult<Bound<'py, PyAny>> {
+    json_to_python(py, &serialize_response(value)?)
+}
+
+/// Parse a DNS record-type name; an unknown one raises `ValueError`.
+fn parse_record_type(record_type: &str) -> PyResult<RecordType> {
+    record_type
+        .parse()
+        .map_err(|e: SeerError| seer_err_to_py(&e))
+}
+
+/// Run a future on the shared Tokio runtime with the GIL released. Used
+/// directly for futures that do not return a `SeerError` (e.g.
+/// `BulkExecutor::execute`, which reports per-item failures in the returned
+/// `Vec<BulkResult>`).
+///
+/// Wraps the `block_on` in `std::panic::catch_unwind`: a panic that unwinds
+/// through the FFI boundary is UB and would abort the Python process. Common
+/// causes include calling a blocking runtime from inside another async runtime
+/// (e.g. from `asyncio`) which tokio explicitly panics on. We surface that as
+/// a `RuntimeError` instead.
 fn run_async_infallible<F, T>(py: Python<'_>, fut: F) -> PyResult<T>
 where
     F: Future<Output = T> + Send,
@@ -172,74 +176,33 @@ where
     )
 }
 
-fn get_smart_lookup() -> &'static SmartLookup {
-    static INSTANCE: OnceLock<SmartLookup> = OnceLock::new();
-    INSTANCE.get_or_init(SmartLookup::new)
+/// Defines one lazily constructed, process-wide core client per entry. A
+/// macro rather than a generic fn because Rust has no generic statics: each
+/// getter needs its own `static`.
+macro_rules! singletons {
+    ($($getter:ident: $ty:ty),* $(,)?) => {$(
+        fn $getter() -> &'static $ty {
+            static INSTANCE: OnceLock<$ty> = OnceLock::new();
+            INSTANCE.get_or_init(<$ty>::new)
+        }
+    )*};
 }
 
-fn get_whois_client() -> &'static WhoisClient {
-    static INSTANCE: OnceLock<WhoisClient> = OnceLock::new();
-    INSTANCE.get_or_init(WhoisClient::new)
-}
-
-fn get_rdap_client() -> &'static RdapClient {
-    static INSTANCE: OnceLock<RdapClient> = OnceLock::new();
-    INSTANCE.get_or_init(RdapClient::new)
-}
-
-fn get_dns_resolver() -> &'static DnsResolver {
-    static INSTANCE: OnceLock<DnsResolver> = OnceLock::new();
-    INSTANCE.get_or_init(DnsResolver::new)
-}
-
-fn get_propagation_checker() -> &'static PropagationChecker {
-    static INSTANCE: OnceLock<PropagationChecker> = OnceLock::new();
-    INSTANCE.get_or_init(PropagationChecker::new)
-}
-
-fn get_status_client() -> &'static StatusClient {
-    static INSTANCE: OnceLock<StatusClient> = OnceLock::new();
-    INSTANCE.get_or_init(StatusClient::new)
-}
-
-fn get_availability_checker() -> &'static AvailabilityChecker {
-    static INSTANCE: OnceLock<AvailabilityChecker> = OnceLock::new();
-    INSTANCE.get_or_init(AvailabilityChecker::new)
-}
-
-fn get_subdomain_enumerator() -> &'static SubdomainEnumerator {
-    static INSTANCE: OnceLock<SubdomainEnumerator> = OnceLock::new();
-    INSTANCE.get_or_init(SubdomainEnumerator::new)
-}
-
-fn get_ssl_checker() -> &'static SslChecker {
-    static INSTANCE: OnceLock<SslChecker> = OnceLock::new();
-    INSTANCE.get_or_init(SslChecker::new)
-}
-
-fn get_dnssec_checker() -> &'static DnssecChecker {
-    static INSTANCE: OnceLock<DnssecChecker> = OnceLock::new();
-    INSTANCE.get_or_init(DnssecChecker::new)
-}
-
-fn get_delegation_checker() -> &'static DelegationChecker {
-    static INSTANCE: OnceLock<DelegationChecker> = OnceLock::new();
-    INSTANCE.get_or_init(DelegationChecker::new)
-}
-
-fn get_dns_comparator() -> &'static DnsComparator {
-    static INSTANCE: OnceLock<DnsComparator> = OnceLock::new();
-    INSTANCE.get_or_init(DnsComparator::new)
-}
-
-fn get_dns_follower() -> &'static DnsFollower {
-    static INSTANCE: OnceLock<DnsFollower> = OnceLock::new();
-    INSTANCE.get_or_init(DnsFollower::new)
-}
-
-fn get_domain_differ() -> &'static DomainDiffer {
-    static INSTANCE: OnceLock<DomainDiffer> = OnceLock::new();
-    INSTANCE.get_or_init(DomainDiffer::new)
+singletons! {
+    get_smart_lookup: SmartLookup,
+    get_whois_client: WhoisClient,
+    get_rdap_client: RdapClient,
+    get_dns_resolver: DnsResolver,
+    get_propagation_checker: PropagationChecker,
+    get_status_client: StatusClient,
+    get_availability_checker: AvailabilityChecker,
+    get_subdomain_enumerator: SubdomainEnumerator,
+    get_ssl_checker: SslChecker,
+    get_dnssec_checker: DnssecChecker,
+    get_delegation_checker: DelegationChecker,
+    get_dns_comparator: DnsComparator,
+    get_dns_follower: DnsFollower,
+    get_domain_differ: DomainDiffer,
 }
 
 /// Validate that a host is safe to connect to (not a reserved/loopback/private IP).
@@ -254,58 +217,46 @@ fn validate_public_host(py: Python<'_>, host: String, port: u16) -> PyResult<()>
     })
 }
 
-#[pyfunction]
-fn lookup<'py>(py: Python<'py>, domain: String) -> PyResult<Bound<'py, PyAny>> {
-    let smart_lookup = get_smart_lookup();
-    let response = run_async(py, async move { smart_lookup.lookup(&domain).await })?;
-    let json = serialize_response(&response)?;
-    json_to_python(py, &json)
+/// Generates the single-argument bindings that make one core call and return
+/// its serialized result. `with <client> = <getter>` fetches the core client
+/// before entering the runtime, exactly as a hand-written binding would.
+macro_rules! call_fn {
+    ($(
+        $(#[$meta:meta])*
+        $name:ident($arg:ident: $ty:ty) $(with $client:ident = $get:expr)? => $call:expr;
+    )*) => {$(
+        $(#[$meta])*
+        #[pyfunction]
+        fn $name<'py>(py: Python<'py>, $arg: $ty) -> PyResult<Bound<'py, PyAny>> {
+            $(let $client = $get;)?
+            let response = run_async(py, async move { $call.await })?;
+            to_py(py, &response)
+        }
+    )*};
 }
 
-#[pyfunction]
-fn whois<'py>(py: Python<'py>, domain: String) -> PyResult<Bound<'py, PyAny>> {
-    let client = get_whois_client();
-    let response = run_async(py, async move { client.lookup(&domain).await })?;
-    let json = serialize_response(&response)?;
-    json_to_python(py, &json)
-}
-
-#[pyfunction]
-fn rdap_domain<'py>(py: Python<'py>, domain: String) -> PyResult<Bound<'py, PyAny>> {
-    let client = get_rdap_client();
-    let response = run_async(py, async move { client.lookup_domain(&domain).await })?;
-    let json = serialize_response(&response)?;
-    json_to_python(py, &json)
-}
-
-#[pyfunction]
-fn rdap_ip<'py>(py: Python<'py>, ip: String) -> PyResult<Bound<'py, PyAny>> {
-    let client = get_rdap_client();
-    let response = run_async(py, async move { client.lookup_ip(&ip).await })?;
-    let json = serialize_response(&response)?;
-    json_to_python(py, &json)
-}
-
-#[pyfunction]
-fn rdap_asn<'py>(py: Python<'py>, asn: u32) -> PyResult<Bound<'py, PyAny>> {
-    let client = get_rdap_client();
-    let response = run_async(py, async move { client.lookup_asn(asn).await })?;
-    let json = serialize_response(&response)?;
-    json_to_python(py, &json)
-}
-
-/// Auto-routing RDAP lookup: classifies `query` as IP / ASN / domain in
-/// Rust and dispatches to the correct endpoint. Replaces the former
-/// Python-side dispatcher, which silently misrouted `AS`-prefixed domains
-/// like `as1234.io` to the ASN endpoint.
-#[pyfunction]
-fn rdap_auto<'py>(py: Python<'py>, query: String) -> PyResult<Bound<'py, PyAny>> {
-    let client = get_rdap_client();
-    let response = run_async(py, async move {
-        seer_core::rdap::auto_lookup(client, &query).await
-    })?;
-    let json = serialize_response(&response)?;
-    json_to_python(py, &json)
+call_fn! {
+    lookup(domain: String) with c = get_smart_lookup() => c.lookup(&domain);
+    whois(domain: String) with c = get_whois_client() => c.lookup(&domain);
+    rdap_domain(domain: String) with c = get_rdap_client() => c.lookup_domain(&domain);
+    rdap_ip(ip: String) with c = get_rdap_client() => c.lookup_ip(&ip);
+    rdap_asn(asn: u32) with c = get_rdap_client() => c.lookup_asn(asn);
+    /// Auto-routing RDAP lookup: classifies `query` as IP / ASN / domain in
+    /// Rust and dispatches to the correct endpoint. Replaces the former
+    /// Python-side dispatcher, which silently misrouted `AS`-prefixed domains
+    /// like `as1234.io` to the ASN endpoint.
+    rdap_auto(query: String) with c = get_rdap_client()
+        => seer_core::rdap::auto_lookup(c, &query);
+    status(domain: String) with c = get_status_client() => c.check(&domain);
+    availability(domain: String) with c = get_availability_checker() => c.check(&domain);
+    subdomains(domain: String) with c = get_subdomain_enumerator() => c.enumerate(&domain);
+    ssl(domain: String) with c = get_ssl_checker() => c.check(&domain);
+    dnssec(domain: String) with c = get_dnssec_checker() => c.check(&domain);
+    delegation(domain: String) with c = get_delegation_checker() => c.check(&domain);
+    posture(domain: String) with c = get_dns_resolver()
+        => seer_core::lookup_email_posture(c, &domain);
+    headers(domain: String)
+        => seer_core::audit_headers(&domain, seer_core::DEFAULT_HEADER_TIMEOUT);
 }
 
 #[pyfunction]
@@ -318,9 +269,7 @@ fn dig<'py>(
 ) -> PyResult<Bound<'py, PyAny>> {
     let resolver = get_dns_resolver();
 
-    let rt_parsed: RecordType = record_type
-        .parse()
-        .map_err(|e: SeerError| seer_err_to_py(&e))?;
+    let rt_parsed = parse_record_type(record_type)?;
 
     let records = run_async(py, async move {
         resolver
@@ -328,8 +277,7 @@ fn dig<'py>(
             .await
     })?;
 
-    let json = serialize_response(&records)?;
-    json_to_python(py, &json)
+    to_py(py, &records)
 }
 
 #[pyfunction]
@@ -341,13 +289,10 @@ fn propagation<'py>(
 ) -> PyResult<Bound<'py, PyAny>> {
     let checker = get_propagation_checker();
 
-    let rt_parsed: RecordType = record_type
-        .parse()
-        .map_err(|e: SeerError| seer_err_to_py(&e))?;
+    let rt_parsed = parse_record_type(record_type)?;
 
     let response = run_async(py, async move { checker.check(&domain, rt_parsed).await })?;
-    let json = serialize_response(&response)?;
-    json_to_python(py, &json)
+    to_py(py, &response)
 }
 
 const MAX_CONCURRENCY: usize = 50;
@@ -553,8 +498,7 @@ fn bulk_lookup<'py>(
     let cb = build_progress_callback(progress)?;
     let result = run_async_infallible(py, async move { executor.execute(operations, cb).await })?;
 
-    let json = serialize_response(&result)?;
-    json_to_python(py, &json)
+    to_py(py, &result)
 }
 
 #[pyfunction]
@@ -576,8 +520,7 @@ fn bulk_whois<'py>(
     let cb = build_progress_callback(progress)?;
     let result = run_async_infallible(py, async move { executor.execute(operations, cb).await })?;
 
-    let json = serialize_response(&result)?;
-    json_to_python(py, &json)
+    to_py(py, &result)
 }
 
 #[pyfunction]
@@ -592,9 +535,7 @@ fn bulk_dig<'py>(
     validate_domains(&domains)?;
     let executor = BulkExecutor::new().with_concurrency(validate_concurrency(concurrency)?);
 
-    let rt_parsed: RecordType = record_type
-        .parse()
-        .map_err(|e: SeerError| seer_err_to_py(&e))?;
+    let rt_parsed = parse_record_type(record_type)?;
 
     let operations: Vec<BulkOperation> = domains
         .into_iter()
@@ -607,8 +548,7 @@ fn bulk_dig<'py>(
     let cb = build_progress_callback(progress)?;
     let result = run_async_infallible(py, async move { executor.execute(operations, cb).await })?;
 
-    let json = serialize_response(&result)?;
-    json_to_python(py, &json)
+    to_py(py, &result)
 }
 
 #[pyfunction]
@@ -623,9 +563,7 @@ fn bulk_propagation<'py>(
     validate_domains(&domains)?;
     let executor = BulkExecutor::new().with_concurrency(validate_concurrency(concurrency)?);
 
-    let rt_parsed: RecordType = record_type
-        .parse()
-        .map_err(|e: SeerError| seer_err_to_py(&e))?;
+    let rt_parsed = parse_record_type(record_type)?;
 
     let operations: Vec<BulkOperation> = domains
         .into_iter()
@@ -638,16 +576,7 @@ fn bulk_propagation<'py>(
     let cb = build_progress_callback(progress)?;
     let result = run_async_infallible(py, async move { executor.execute(operations, cb).await })?;
 
-    let json = serialize_response(&result)?;
-    json_to_python(py, &json)
-}
-
-#[pyfunction]
-fn status<'py>(py: Python<'py>, domain: String) -> PyResult<Bound<'py, PyAny>> {
-    let client = get_status_client();
-    let response = run_async(py, async move { client.check(&domain).await })?;
-    let json = serialize_response(&response)?;
-    json_to_python(py, &json)
+    to_py(py, &result)
 }
 
 #[pyfunction]
@@ -669,8 +598,7 @@ fn bulk_status<'py>(
     let cb = build_progress_callback(progress)?;
     let result = run_async_infallible(py, async move { executor.execute(operations, cb).await })?;
 
-    let json = serialize_response(&result)?;
-    json_to_python(py, &json)
+    to_py(py, &result)
 }
 
 #[pyfunction]
@@ -692,8 +620,7 @@ fn bulk_ssl<'py>(
     let cb = build_progress_callback(progress)?;
     let result = run_async_infallible(py, async move { executor.execute(operations, cb).await })?;
 
-    let json = serialize_response(&result)?;
-    json_to_python(py, &json)
+    to_py(py, &result)
 }
 
 #[pyfunction]
@@ -715,48 +642,7 @@ fn bulk_availability<'py>(
     let cb = build_progress_callback(progress)?;
     let result = run_async_infallible(py, async move { executor.execute(operations, cb).await })?;
 
-    let json = serialize_response(&result)?;
-    json_to_python(py, &json)
-}
-
-#[pyfunction]
-fn availability<'py>(py: Python<'py>, domain: String) -> PyResult<Bound<'py, PyAny>> {
-    let checker = get_availability_checker();
-    let response = run_async(py, async move { checker.check(&domain).await })?;
-    let json = serialize_response(&response)?;
-    json_to_python(py, &json)
-}
-
-#[pyfunction]
-fn subdomains<'py>(py: Python<'py>, domain: String) -> PyResult<Bound<'py, PyAny>> {
-    let enumerator = get_subdomain_enumerator();
-    let response = run_async(py, async move { enumerator.enumerate(&domain).await })?;
-    let json = serialize_response(&response)?;
-    json_to_python(py, &json)
-}
-
-#[pyfunction]
-fn ssl<'py>(py: Python<'py>, domain: String) -> PyResult<Bound<'py, PyAny>> {
-    let checker = get_ssl_checker();
-    let response = run_async(py, async move { checker.check(&domain).await })?;
-    let json = serialize_response(&response)?;
-    json_to_python(py, &json)
-}
-
-#[pyfunction]
-fn dnssec<'py>(py: Python<'py>, domain: String) -> PyResult<Bound<'py, PyAny>> {
-    let checker = get_dnssec_checker();
-    let response = run_async(py, async move { checker.check(&domain).await })?;
-    let json = serialize_response(&response)?;
-    json_to_python(py, &json)
-}
-
-#[pyfunction]
-fn delegation<'py>(py: Python<'py>, domain: String) -> PyResult<Bound<'py, PyAny>> {
-    let checker = get_delegation_checker();
-    let response = run_async(py, async move { checker.check(&domain).await })?;
-    let json = serialize_response(&response)?;
-    json_to_python(py, &json)
+    to_py(py, &result)
 }
 
 #[pyfunction]
@@ -766,27 +652,7 @@ fn caa<'py>(py: Python<'py>, domain: String) -> PyResult<Bound<'py, PyAny>> {
     let policy = run_async_infallible(py, async move {
         seer_core::caa::lookup_caa(resolver, &normalized).await
     })?;
-    let json = serialize_response(&policy)?;
-    json_to_python(py, &json)
-}
-
-#[pyfunction]
-fn posture<'py>(py: Python<'py>, domain: String) -> PyResult<Bound<'py, PyAny>> {
-    let resolver = get_dns_resolver();
-    let response = run_async(py, async move {
-        seer_core::lookup_email_posture(resolver, &domain).await
-    })?;
-    let json = serialize_response(&response)?;
-    json_to_python(py, &json)
-}
-
-#[pyfunction]
-fn headers<'py>(py: Python<'py>, domain: String) -> PyResult<Bound<'py, PyAny>> {
-    let response = run_async(py, async move {
-        seer_core::audit_headers(&domain, seer_core::DEFAULT_HEADER_TIMEOUT).await
-    })?;
-    let json = serialize_response(&response)?;
-    json_to_python(py, &json)
+    to_py(py, &policy)
 }
 
 #[pyfunction]
@@ -803,8 +669,7 @@ fn takeover<'py>(
         let result = enumerator.enumerate(&domain).await?;
         seer_core::scan_takeover(resolver, &result.domain, result.subdomains, concurrency).await
     })?;
-    let json = serialize_response(&response)?;
-    json_to_python(py, &json)
+    to_py(py, &response)
 }
 
 #[pyfunction]
@@ -819,8 +684,7 @@ fn confusables<'py>(
     let response = run_async(py, async move {
         seer_core::find_confusables(lookup, &domain, concurrency).await
     })?;
-    let json = serialize_response(&response)?;
-    json_to_python(py, &json)
+    to_py(py, &response)
 }
 
 #[pyfunction]
@@ -845,8 +709,7 @@ fn subdomains_classify<'py>(
             .await,
         )
     })?;
-    let json = serialize_response(&response)?;
-    json_to_python(py, &json)
+    to_py(py, &response)
 }
 
 #[pyfunction]
@@ -859,9 +722,7 @@ fn dns_compare<'py>(
 ) -> PyResult<Bound<'py, PyAny>> {
     let comparator = get_dns_comparator();
 
-    let rt_parsed: RecordType = record_type
-        .parse()
-        .map_err(|e: SeerError| seer_err_to_py(&e))?;
+    let rt_parsed = parse_record_type(record_type)?;
 
     let response = run_async(py, async move {
         comparator
@@ -869,8 +730,7 @@ fn dns_compare<'py>(
             .await
     })?;
 
-    let json = serialize_response(&response)?;
-    json_to_python(py, &json)
+    to_py(py, &response)
 }
 
 #[pyfunction]
@@ -890,9 +750,7 @@ fn dns_follow<'py>(
 
     let follower = get_dns_follower();
 
-    let rt_parsed: RecordType = record_type
-        .parse()
-        .map_err(|e: SeerError| seer_err_to_py(&e))?;
+    let rt_parsed = parse_record_type(record_type)?;
 
     // Validate iteration/interval via core; this rejects NaN/inf/negative and
     // enforces the per-interval cap (<= 60 minutes).
@@ -953,8 +811,7 @@ fn dns_follow<'py>(
     }
 
     let response = response?;
-    let json = serialize_response(&response)?;
-    json_to_python(py, &json)
+    to_py(py, &response)
 }
 
 /// Signal the currently-running `dns_follow` call (if any) to cancel.
@@ -977,8 +834,7 @@ fn cancel_follow() -> PyResult<()> {
 fn diff<'py>(py: Python<'py>, domain_a: String, domain_b: String) -> PyResult<Bound<'py, PyAny>> {
     let differ = get_domain_differ();
     let response = run_async(py, async move { differ.diff(&domain_a, &domain_b).await })?;
-    let json = serialize_response(&response)?;
-    json_to_python(py, &json)
+    to_py(py, &response)
 }
 
 #[pyfunction]
@@ -986,8 +842,7 @@ fn info<'py>(py: Python<'py>, domain: String) -> PyResult<Bound<'py, PyAny>> {
     let smart_lookup = get_smart_lookup();
     let lookup_result = run_async(py, async move { smart_lookup.lookup(&domain).await })?;
     let domain_info = seer_core::domain_info::DomainInfo::from_lookup_result(&lookup_result);
-    let json = serialize_response(&domain_info)?;
-    json_to_python(py, &json)
+    to_py(py, &domain_info)
 }
 
 #[pyfunction]
@@ -1009,8 +864,7 @@ fn bulk_info<'py>(
     let cb = build_progress_callback(progress)?;
     let result = run_async_infallible(py, async move { executor.execute(operations, cb).await })?;
 
-    let json = serialize_response(&result)?;
-    json_to_python(py, &json)
+    to_py(py, &result)
 }
 
 /// Look up information about a TLD: WHOIS server, RDAP endpoint, registry
@@ -1025,8 +879,7 @@ fn tld_info<'py>(py: Python<'py>, tld: String) -> PyResult<Bound<'py, PyAny>> {
     // `lookup_tld` is infallible: unknown TLDs yield a TldInfo with None
     // fields rather than an error.
     let info = run_async_infallible(py, async move { seer_core::lookup_tld(&tld).await })?;
-    let json = serialize_response(&info)?;
-    json_to_python(py, &json)
+    to_py(py, &info)
 }
 
 /// Return the full catalog of TLDs seer knows about (sorted, deduplicated).
