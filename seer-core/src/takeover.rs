@@ -19,15 +19,15 @@
 //! 2. Match the CNAME against the provider table below. Hosts with no
 //!    provider CNAME are [`TakeoverVerdict::Safe`] and are never fetched — the
 //!    HTTP fan-out is bounded to plausible candidates only.
-//! 3. For a candidate that resolves, issue one SSRF-guarded GET (see
-//!    [`crate::http`]) and match the body against that provider's claim-page
-//!    fingerprints. A match is [`TakeoverVerdict::Vulnerable`], carrying the
-//!    matched marker as evidence. HTTPS is tried first; if it fails (an
-//!    unclaimed custom domain is served under the *provider's* certificate,
-//!    and S3 website endpoints speak plain HTTP only), the same GET is
-//!    retried over `http://`. Evidence only counts when the answering URL is
-//!    still on the probed host — a body reached through a cross-host redirect
-//!    describes some other resource.
+//! 3. For a candidate that resolves, issue one SSRF-guarded GET (every
+//!    redirect hop re-validated) and match the body against that provider's
+//!    claim-page fingerprints. A match is [`TakeoverVerdict::Vulnerable`],
+//!    carrying the matched marker as evidence. HTTPS is tried first; if it
+//!    fails (an unclaimed custom domain is served under the *provider's*
+//!    certificate, and S3 website endpoints speak plain HTTP only), the same
+//!    GET is retried over `http://`. Evidence only counts when the answering
+//!    URL is still on the probed host — a body reached through a cross-host
+//!    redirect describes some other resource.
 //! 4. A candidate that does not resolve at all is [`TakeoverVerdict::Potential`]:
 //!    the classic dangling CNAME, unconfirmable over HTTP because nothing
 //!    answers.
@@ -57,7 +57,8 @@ use crate::validation::{normalize_domain, normalize_host};
 /// [`crate::subdomains::classify_subdomains`]: CT logs can return tens of
 /// thousands of names, and while `concurrency` bounds parallelism it does not
 /// bound total work. Names beyond the cap are reported as skipped, never
-/// silently dropped.
+/// silently dropped. The public docs of [`scan_takeover`] and
+/// [`TakeoverReport::hosts_skipped`] state the value; keep them in step.
 const MAX_TAKEOVER_HOSTS: usize = 2000;
 
 /// Per-request HTTP timeout for a fingerprint probe.
@@ -323,7 +324,7 @@ pub struct TakeoverReport {
     pub domain: String,
     /// How many hosts were examined (after the cap).
     pub hosts_checked: usize,
-    /// Hosts dropped because the input exceeded [`MAX_TAKEOVER_HOSTS`].
+    /// Hosts dropped because the input exceeded the 2000-host cap.
     #[serde(default)]
     pub hosts_skipped: usize,
     pub vulnerable: usize,
@@ -665,7 +666,7 @@ fn build_report(
 /// Each host is resolved and, when its CNAME points at a recognized provider
 /// and the host answers, probed once over HTTPS to confirm against that
 /// provider's unclaimed-resource fingerprint. Hosts with no provider CNAME are
-/// never fetched. At most [`MAX_TAKEOVER_HOSTS`] hosts are examined.
+/// never fetched. At most 2000 hosts are examined.
 ///
 /// # Arguments
 /// * `resolver` - DNS resolver for the CNAME/address lookups

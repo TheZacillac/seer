@@ -109,7 +109,8 @@ impl AvailabilityChecker {
     ///
     /// A name below its registrable domain (`mail.google.com`) is never
     /// reported available on the strength of the registry having no object
-    /// for it; see [`AvailabilityChecker::guard_subdomain_claim`].
+    /// for it: its verdict comes from a check of the registrable parent
+    /// (`google.com`) instead, since only the parent can be registered.
     #[instrument(skip(self), fields(domain = %domain))]
     pub async fn check(&self, domain: &str) -> Result<AvailabilityResult> {
         let domain = crate::validation::normalize_domain(domain)?;

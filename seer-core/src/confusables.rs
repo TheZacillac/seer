@@ -40,12 +40,14 @@ use crate::lookup::{LookupResult, SmartLookup};
 use crate::validation::normalize_domain;
 
 /// Upper bound on generated candidates, to keep the subsequent network scoring
-/// bounded regardless of label length.
+/// bounded regardless of label length. The public docs of
+/// [`generate_candidates`] state the value; keep them in step.
 const MAX_CANDIDATES: usize = 600;
 
 /// Concurrency for the cheap DNS presence pre-filter. DNS probes are far
 /// lighter than a full RDAP+WHOIS race, so we fan them out wider than the
 /// (registry-facing) full-lookup concurrency to keep the pre-filter fast.
+/// The public docs of [`score_candidates`] state the value; keep them in step.
 const PREFILTER_CONCURRENCY: usize = 50;
 
 /// Common alternate TLDs used for TLD-swap squats.
@@ -185,9 +187,10 @@ fn fair_shares(sizes: &[usize], cap: usize) -> Vec<usize> {
 /// deeper subdomain labels and the suffix are preserved, except for the
 /// dedicated `tld-swap` technique, which swaps the whole suffix
 /// (`example.co.uk` → `example.com`). Output is deduplicated, excludes the
-/// input itself, and capped at [`MAX_CANDIDATES`] with the budget shared
-/// fairly across techniques (see [`fair_shares`]). A bare public suffix has
-/// no brand label and yields nothing.
+/// input itself, and capped at 600 candidates with the budget shared fairly
+/// across techniques: each keeps an equal share (or all of its candidates, if
+/// it has fewer), and a small technique's unused share passes to the larger
+/// ones. A bare public suffix has no brand label and yields nothing.
 pub fn generate_candidates(domain: &str) -> Vec<ConfusableCandidate> {
     let Ok(normalized) = normalize_domain(domain) else {
         return Vec::new();
@@ -413,15 +416,16 @@ fn rank_lookalikes(registered: &mut [RegisteredLookalike]) {
 /// Candidates are first pre-filtered by a cheap DNS presence probe: those that
 /// return `NXDOMAIN` are unregistered and dropped without a registry lookup
 /// (see the module docs). The survivors get a full smart lookup and are kept
-/// unless the lookup says the name appears available (see
-/// [`lookalike_from_result`]).
+/// unless the lookup says the name appears available. Only that claim drops
+/// one: an inconclusive lookup (a throttled registry) or a DNS-only
+/// registration signal keeps it.
 ///
 /// Returns the ranked registered look-alikes together with the number of
 /// candidates that passed the pre-filter and received a full lookup — the
 /// accurate `candidates_checked` figure for the report.
 ///
 /// The full lookups run up to `concurrency` at a time; the pre-filter probes
-/// run at [`PREFILTER_CONCURRENCY`].
+/// run up to 50 at a time, independent of `concurrency`.
 pub async fn score_candidates(
     lookup: &SmartLookup,
     candidates: Vec<ConfusableCandidate>,

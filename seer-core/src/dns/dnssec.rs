@@ -404,8 +404,8 @@ impl DnssecChecker {
 
     /// Generate a DNSSEC validation report for a domain.
     ///
-    /// The DS/DNSKEY checks run at the apex of the zone enclosing `domain`
-    /// (see [`find_zone_apex`](Self::find_zone_apex)); when that is not
+    /// The DS/DNSKEY checks run at the apex of the zone enclosing `domain`,
+    /// found by walking up its labels with SOA queries; when that is not
     /// `domain` itself, the first entry of `issues` names the zone that was
     /// evaluated. `DnssecReport::domain` is always the (normalized) name that
     /// was asked about.
