@@ -4,8 +4,9 @@
 //! falling back to IANA discovery for unmapped TLDs (cached 24h), follows
 //! registrar referrals up to 3 levels with cycle detection, caps responses at
 //! 1 MB and retries transient failures through [`crate::retry`]. Responses are
-//! parsed into [`WhoisResponse`] by the generic parser or a registry-specific
-//! one from [`parsers`].
+//! parsed into [`WhoisResponse`] by a registry-specific parser from the
+//! `parsers` table (keyed by TLD or second-level zone) or, failing a match,
+//! the generic parser.
 
 mod client;
 mod parser;

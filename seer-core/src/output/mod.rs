@@ -1,7 +1,9 @@
 //! Output formatting for every seer-core result type.
 //!
 //! [`OutputFormatter`] has one `format_*` method per result type, implemented
-//! by the human (colored terminal), JSON, YAML and Markdown formatters.
+//! by the human (colored terminal), JSON, YAML and Markdown formatters. The
+//! method list is written once, in `with_report_methods!`, which generates the
+//! trait and all four impls.
 //! Callers pick one through [`get_formatter`] from an [`OutputFormat`], so the
 //! CLI, REPL, TUI raw view and clipboard copy all render identically. Human
 //! and Markdown output are pinned by `insta` snapshots in

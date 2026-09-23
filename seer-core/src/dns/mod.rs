@@ -1,8 +1,9 @@
 //! DNS resolution and analysis over hickory-resolver.
 //!
-//! - [`DnsResolver`]: the 16 [`RecordType`]s, against the system/configured
-//!   resolver or a custom nameserver over UDP, DoT (`tls://`) or DoH
-//!   (`https://`) — see [`NameserverSpec`].
+//! - [`DnsResolver`]: the 16 [`RecordType`]s, against Google Public DNS by
+//!   default or a custom nameserver over UDP, DoT (`tls://`) or DoH
+//!   (`https://`) — see [`NameserverSpec`]. A hostname nameserver's resolved
+//!   addresses are tried IPv4 first.
 //! - [`PropagationChecker`]: fans one query out to 30 public resolvers across
 //!   6 regions and reports consensus and inconsistencies.
 //! - [`DnsComparator`] (two nameservers side by side), [`DnsFollower`] (live
