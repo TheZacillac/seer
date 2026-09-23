@@ -27,16 +27,6 @@ fn verdict_tone(v: HeaderVerdict) -> &'static str {
     }
 }
 
-fn verdict_label(v: HeaderVerdict) -> &'static str {
-    match v {
-        HeaderVerdict::Strict => "strict",
-        HeaderVerdict::Moderate => "moderate",
-        HeaderVerdict::Weak => "weak",
-        HeaderVerdict::Present => "present",
-        HeaderVerdict::Absent => "absent",
-    }
-}
-
 /// Grade band → tone. A/A+ pass, B/C partial, D and below fail.
 fn grade_tone(grade: &str) -> &'static str {
     match grade {
@@ -100,7 +90,7 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
         .headers
         .iter()
         .map(|finding| {
-            let label = verdict_label(finding.verdict);
+            let label = finding.verdict.as_str();
             let used = finding.header.chars().count() + label.chars().count() + 2;
             let dots = width.saturating_sub(used).max(1);
             Line::from(vec![

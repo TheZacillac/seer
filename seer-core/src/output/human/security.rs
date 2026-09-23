@@ -7,32 +7,21 @@ use super::HumanFormatter;
 use crate::caa::CaaPolicy;
 use crate::confusables::ConfusableReport;
 use crate::drift::DriftReport;
-use crate::headers::{HeaderReport, HeaderVerdict};
+use crate::headers::HeaderReport;
 use crate::posture::{EmailPosture, PostureVerdict};
 use crate::subdomains::{SubdomainBaselineDiff, SubdomainClassification, SubdomainStatus};
 use crate::takeover::{TakeoverReport, TakeoverVerdict};
 
 impl HumanFormatter {
-    /// Colors a posture verdict token.
-    fn posture_verdict(&self, verdict: PostureVerdict) -> String {
+    /// Colors a posture/header verdict token by strength, so both security
+    /// reports read identically.
+    fn verdict(&self, verdict: PostureVerdict) -> String {
+        let label = verdict.as_str();
         match verdict {
-            PostureVerdict::Strict => self.success("strict"),
-            PostureVerdict::Moderate => self.warning("moderate"),
-            PostureVerdict::Weak => self.warning("weak"),
-            PostureVerdict::Present => self.value("present"),
-            PostureVerdict::Absent => self.error("absent"),
-        }
-    }
-
-    /// Colors a header verdict token. Mirrors [`Self::posture_verdict`] so the
-    /// two security reports read identically.
-    fn header_verdict(&self, verdict: HeaderVerdict) -> String {
-        match verdict {
-            HeaderVerdict::Strict => self.success("strict"),
-            HeaderVerdict::Moderate => self.warning("moderate"),
-            HeaderVerdict::Weak => self.warning("weak"),
-            HeaderVerdict::Present => self.value("present"),
-            HeaderVerdict::Absent => self.error("absent"),
+            PostureVerdict::Strict => self.success(label),
+            PostureVerdict::Moderate | PostureVerdict::Weak => self.warning(label),
+            PostureVerdict::Present => self.value(label),
+            PostureVerdict::Absent => self.error(label),
         }
     }
 
@@ -124,7 +113,7 @@ impl HumanFormatter {
         ))];
 
         let line = |name: &str, verdict: PostureVerdict, detail: Option<&str>| {
-            let base = format!("{}: {}", self.label(name), self.posture_verdict(verdict));
+            let base = format!("{}: {}", self.label(name), self.verdict(verdict));
             match detail {
                 Some(d) if !d.is_empty() => format!("{base} {}", self.dim(&sanitize_display(d))),
                 _ => base,
@@ -211,7 +200,7 @@ impl HumanFormatter {
             let mut line = format!(
                 "{}: {}",
                 self.label(&finding.header),
-                self.header_verdict(finding.verdict),
+                self.verdict(finding.verdict),
             );
             if let Some(value) = &finding.value {
                 line.push_str(&format!(" {}", self.dim(&sanitize_display(value))));
@@ -241,7 +230,7 @@ impl HumanFormatter {
                 out.push(format!(
                     "  {} [{}] {}",
                     self.value(&sanitize_display(&cookie.name)),
-                    self.header_verdict(cookie.verdict),
+                    self.verdict(cookie.verdict),
                     self.dim(&flags),
                 ));
             }

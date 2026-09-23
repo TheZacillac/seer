@@ -20,11 +20,13 @@ use crate::dns::{DnsResolver, RecordData, RecordType};
 use crate::error::Result;
 use crate::validation::{normalize_domain, normalize_host};
 
-/// A coarse enforcement verdict for one posture mechanism.
+/// A coarse enforcement verdict for one posture mechanism, HTTP security
+/// header, or cookie. `seer headers` grades on this same scale (exported
+/// there as [`crate::headers::HeaderVerdict`]) so both reports read alike.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PostureVerdict {
-    /// The mechanism is not configured at all.
+    /// Not configured / not sent at all.
     Absent,
     /// Configured, but permissive / monitoring-only (offers little protection).
     Weak,
@@ -34,6 +36,19 @@ pub enum PostureVerdict {
     Strict,
     /// Configured; the mechanism has no weak/strict axis (presence is the signal).
     Present,
+}
+
+impl PostureVerdict {
+    /// The kebab-case label serde emits, for text renderers and CSV cells.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PostureVerdict::Absent => "absent",
+            PostureVerdict::Weak => "weak",
+            PostureVerdict::Moderate => "moderate",
+            PostureVerdict::Strict => "strict",
+            PostureVerdict::Present => "present",
+        }
+    }
 }
 
 /// SPF (Sender Policy Framework) posture.
@@ -890,6 +905,20 @@ mod tests {
         assert_eq!(spf_verdict(Some("?")), PostureVerdict::Weak);
         assert_eq!(spf_verdict(Some("+")), PostureVerdict::Weak);
         assert_eq!(spf_verdict(None), PostureVerdict::Weak);
+    }
+
+    #[test]
+    fn verdict_as_str_matches_serde_label() {
+        // Text/CSV renderers use as_str(); it must never disagree with JSON.
+        for v in [
+            PostureVerdict::Absent,
+            PostureVerdict::Weak,
+            PostureVerdict::Moderate,
+            PostureVerdict::Strict,
+            PostureVerdict::Present,
+        ] {
+            assert_eq!(serde_json::to_value(v).unwrap(), v.as_str());
+        }
     }
 
     #[test]

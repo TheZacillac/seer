@@ -18,7 +18,7 @@
 //! - **Disclosure** — `Server`/`X-Powered-By`-style banners that hand an
 //!   attacker a version number to match against a CVE list.
 //!
-//! The verdict scale mirrors [`crate::posture::PostureVerdict`] so the two
+//! The verdict scale is [`crate::posture::PostureVerdict`], so the two
 //! security reports read the same way. Scoring is a weighted sum over the
 //! headers plus bounded penalties for cookie and disclosure findings, mapped to
 //! a letter grade.
@@ -37,24 +37,10 @@ use crate::error::Result;
 use crate::http::{FetchedResponse, GuardedFetcher};
 use crate::validation::normalize_host;
 
-/// A coarse enforcement verdict for one header or cookie.
-///
-/// Mirrors [`crate::posture::PostureVerdict`] so `seer headers` and
-/// `seer posture` grade on the same scale.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum HeaderVerdict {
-    /// Not sent at all.
-    Absent,
-    /// Sent, but configured so permissively it offers little protection.
-    Weak,
-    /// Sent with partial protection.
-    Moderate,
-    /// Sent with full protection.
-    Strict,
-    /// Sent; the mechanism has no weak/strict axis (presence is the signal).
-    Present,
-}
+/// A coarse enforcement verdict for one header or cookie. This is
+/// [`crate::posture::PostureVerdict`] itself, so `seer headers` and
+/// `seer posture` grade on the same scale and serialize identically.
+pub use crate::posture::PostureVerdict as HeaderVerdict;
 
 impl HeaderVerdict {
     /// Fraction of a header's weight this verdict earns, in percent. Integer

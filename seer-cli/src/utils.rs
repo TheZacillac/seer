@@ -732,13 +732,13 @@ pub fn bulk_results_to_csv(results: &[BulkResult], operation: &str) -> String {
                 let (spf_verdict, spf_all, dmarc_verdict, dmarc_policy, mta_sts, bimi, dane, notes) =
                     if let Some(BulkResultData::Posture(ref p)) = result.data {
                         (
-                            posture_verdict_str(p.spf.verdict).to_string(),
+                            p.spf.verdict.as_str().to_string(),
                             p.spf.all_qualifier.clone().unwrap_or_default(),
-                            posture_verdict_str(p.dmarc.verdict).to_string(),
+                            p.dmarc.verdict.as_str().to_string(),
                             p.dmarc.policy.clone().unwrap_or_default(),
-                            posture_verdict_str(p.mta_sts.verdict).to_string(),
-                            posture_verdict_str(p.bimi.verdict).to_string(),
-                            posture_verdict_str(p.dane.verdict).to_string(),
+                            p.mta_sts.verdict.as_str().to_string(),
+                            p.bimi.verdict.as_str().to_string(),
+                            p.dane.verdict.as_str().to_string(),
                             p.notes.join(";"),
                         )
                     } else {
@@ -836,19 +836,6 @@ pub fn bulk_results_to_csv(results: &[BulkResult], operation: &str) -> String {
     }
 
     csv
-}
-
-/// CSV cell rendering for a [`seer_core::PostureVerdict`] — matches the
-/// kebab-case serde form used in JSON output.
-fn posture_verdict_str(v: seer_core::PostureVerdict) -> &'static str {
-    use seer_core::PostureVerdict;
-    match v {
-        PostureVerdict::Absent => "absent",
-        PostureVerdict::Weak => "weak",
-        PostureVerdict::Moderate => "moderate",
-        PostureVerdict::Strict => "strict",
-        PostureVerdict::Present => "present",
-    }
 }
 
 /// Escapes a CSV field for safe output, following RFC 4180 with Excel formula
