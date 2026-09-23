@@ -208,7 +208,7 @@ impl App {
     }
 
     /// Normalize + record the domain and produce a Fetch for the current lens
-    /// if it is implemented. Returns None for unimplemented lenses.
+    /// (if it has anything to fetch).
     fn set_domain_and_fetch(&mut self, raw: &str) -> Vec<Action> {
         let normalized = seer_core::normalize_domain(raw).unwrap_or_else(|_| raw.to_lowercase());
         let mut actions = Vec::new();
@@ -251,14 +251,10 @@ impl App {
     }
 
     /// Queue a fetch for the current lens at the current domain, marking it
-    /// Loading. Returns None if the lens isn't implemented or there's nothing
-    /// to fetch. History and Watch do not require a target domain.
+    /// Loading. Returns None if there's nothing to fetch. History and Watch do
+    /// not require a target domain.
     fn fetch_current(&mut self) -> Option<Action> {
-        let lens = self.current_lens();
-        let (key, implemented) = (lens.key, lens.implemented);
-        if !implemented {
-            return None;
-        }
+        let key = self.current_lens().key;
         // History reflects on-disk state that lookups mutate behind its back;
         // always re-read it rather than serving a cached (possibly empty) view.
         if key == "history" {

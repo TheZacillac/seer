@@ -11,7 +11,6 @@ pub mod follow;
 pub mod headers;
 pub mod history;
 pub mod overview;
-pub mod placeholder;
 pub mod propagation;
 pub mod rdap;
 pub mod reverse;
@@ -31,7 +30,6 @@ pub struct Lens {
     pub cmd: &'static str,
     pub group: &'static str,
     pub tabs: &'static [&'static str],
-    pub implemented: bool,
 }
 
 const NO_TABS: &[&str] = &[];
@@ -45,7 +43,6 @@ pub fn lenses() -> &'static [Lens] {
             cmd: "lookup",
             group: "LOOKUP",
             tabs: NO_TABS,
-            implemented: true,
         },
         Lens {
             key: "whois",
@@ -54,7 +51,6 @@ pub fn lenses() -> &'static [Lens] {
             cmd: "whois",
             group: "LOOKUP",
             tabs: NO_TABS,
-            implemented: true,
         },
         Lens {
             key: "rdap",
@@ -63,7 +59,6 @@ pub fn lenses() -> &'static [Lens] {
             cmd: "rdap",
             group: "LOOKUP",
             tabs: &["Domain", "IP", "ASN"],
-            implemented: true,
         },
         Lens {
             key: "reverse",
@@ -72,7 +67,6 @@ pub fn lenses() -> &'static [Lens] {
             cmd: "reverse",
             group: "LOOKUP",
             tabs: NO_TABS,
-            implemented: true,
         },
         Lens {
             key: "avail",
@@ -81,7 +75,6 @@ pub fn lenses() -> &'static [Lens] {
             cmd: "avail",
             group: "LOOKUP",
             tabs: NO_TABS,
-            implemented: true,
         },
         Lens {
             key: "tld",
@@ -90,7 +83,6 @@ pub fn lenses() -> &'static [Lens] {
             cmd: "tld",
             group: "LOOKUP",
             tabs: NO_TABS,
-            implemented: true,
         },
         Lens {
             key: "dns",
@@ -99,7 +91,6 @@ pub fn lenses() -> &'static [Lens] {
             cmd: "dig",
             group: "DNS",
             tabs: &["Records", "DNSSEC", "Compare"],
-            implemented: true,
         },
         Lens {
             key: "propagation",
@@ -108,7 +99,6 @@ pub fn lenses() -> &'static [Lens] {
             cmd: "prop",
             group: "DNS",
             tabs: NO_TABS,
-            implemented: true,
         },
         Lens {
             key: "follow",
@@ -117,7 +107,6 @@ pub fn lenses() -> &'static [Lens] {
             cmd: "follow",
             group: "DNS",
             tabs: NO_TABS,
-            implemented: true,
         },
         Lens {
             key: "ssl",
@@ -126,7 +115,6 @@ pub fn lenses() -> &'static [Lens] {
             cmd: "ssl",
             group: "SECURITY",
             tabs: NO_TABS,
-            implemented: true,
         },
         Lens {
             key: "status",
@@ -135,7 +123,6 @@ pub fn lenses() -> &'static [Lens] {
             cmd: "status",
             group: "SECURITY",
             tabs: NO_TABS,
-            implemented: true,
         },
         Lens {
             key: "subdomains",
@@ -144,7 +131,6 @@ pub fn lenses() -> &'static [Lens] {
             cmd: "subdomains",
             group: "SECURITY",
             tabs: NO_TABS,
-            implemented: true,
         },
         Lens {
             key: "headers",
@@ -153,7 +139,6 @@ pub fn lenses() -> &'static [Lens] {
             cmd: "headers",
             group: "SECURITY",
             tabs: NO_TABS,
-            implemented: true,
         },
         Lens {
             key: "takeover",
@@ -162,7 +147,6 @@ pub fn lenses() -> &'static [Lens] {
             cmd: "takeover",
             group: "SECURITY",
             tabs: NO_TABS,
-            implemented: true,
         },
         Lens {
             key: "diff",
@@ -171,7 +155,6 @@ pub fn lenses() -> &'static [Lens] {
             cmd: "diff",
             group: "POWER",
             tabs: NO_TABS,
-            implemented: true,
         },
         Lens {
             key: "bulk",
@@ -180,7 +163,6 @@ pub fn lenses() -> &'static [Lens] {
             cmd: "bulk",
             group: "POWER",
             tabs: NO_TABS,
-            implemented: true,
         },
         Lens {
             key: "watch",
@@ -189,7 +171,6 @@ pub fn lenses() -> &'static [Lens] {
             cmd: "watch",
             group: "POWER",
             tabs: NO_TABS,
-            implemented: true,
         },
         Lens {
             key: "history",
@@ -198,7 +179,6 @@ pub fn lenses() -> &'static [Lens] {
             cmd: "history",
             group: "POWER",
             tabs: NO_TABS,
-            implemented: true,
         },
     ]
 }
@@ -264,10 +244,11 @@ pub fn render(
         "subdomains" => subdomains::render(f, area, theme, data, focused, sel),
         "headers" => headers::render(f, area, theme, data),
         "takeover" => takeover::render(f, area, theme, data, focused, sel),
-        // Pane-driven lenses ("follow", "bulk", "tld") are handled in
-        // render.rs::main_pane before the state match — they render from
-        // `app.panes` state and never reach this generic dispatch.
-        other => placeholder::render(f, area, theme, other),
+        // Pane-driven lenses render from `app.panes` state in
+        // render.rs::main_pane, before the state match, so they never reach
+        // this generic dispatch.
+        "follow" | "diff" | "bulk" | "tld" => {}
+        other => debug_assert!(false, "lens {other:?} has no renderer"),
     }
 }
 
@@ -293,15 +274,10 @@ mod tests {
     }
 
     #[test]
-    fn all_lenses_are_implemented() {
-        let implemented: Vec<&str> = lenses()
-            .iter()
-            .filter(|l| l.implemented)
-            .map(|l| l.key)
-            .collect();
-        // All 18 lenses — Phase 1+2+3+4a+4b, plus headers/takeover.
+    fn registry_lists_lenses_in_nav_order() {
+        let keys: Vec<&str> = lenses().iter().map(|l| l.key).collect();
         assert_eq!(
-            implemented,
+            keys,
             vec![
                 "overview",
                 "whois",

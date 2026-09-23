@@ -155,13 +155,7 @@ fn nav(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         } else {
             '·'
         };
-        let label_color = if !l.implemented {
-            theme.overlay0
-        } else if active {
-            theme.text
-        } else {
-            theme.subtext
-        };
+        let label_color = if active { theme.text } else { theme.subtext };
         let glyph_color = if active { theme.blue } else { theme.lavender };
         let prefix = if active { "▸ " } else { "  " };
         lines.push(Line::from(vec![
@@ -279,22 +273,18 @@ fn main_pane(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             return;
         }
         LensState::Idle => {
-            if !lens.implemented {
-                lenses::placeholder::render(f, content, theme, lens.label);
+            // Tab-specific idle hints for the RDAP lens.
+            let hint_text = if lens.key == "rdap" {
+                match app.tab {
+                    2 => "use :rdap AS<number>  (e.g. :rdap AS15169)",
+                    1 => "use :rdap <ip>  or navigate to a domain first",
+                    _ => "press / to look up a domain",
+                }
             } else {
-                // Tab-specific idle hints for the RDAP lens.
-                let hint_text = if lens.key == "rdap" {
-                    match app.tab {
-                        2 => "use :rdap AS<number>  (e.g. :rdap AS15169)",
-                        1 => "use :rdap <ip>  or navigate to a domain first",
-                        _ => "press / to look up a domain",
-                    }
-                } else {
-                    "press / to look up a domain"
-                };
-                let hint = Line::from(Span::styled(hint_text, Style::default().fg(theme.overlay0)));
-                f.render_widget(Paragraph::new(hint), content);
-            }
+                "press / to look up a domain"
+            };
+            let hint = Line::from(Span::styled(hint_text, Style::default().fg(theme.overlay0)));
+            f.render_widget(Paragraph::new(hint), content);
             return;
         }
         LensState::Loaded(_) => {}
