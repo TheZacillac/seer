@@ -1,4 +1,6 @@
-//! Inspection-only TLS handshake shared by [`crate::ssl`] and [`crate::status`].
+//! Inspection-only TLS handshake and certificate checks shared by
+//! [`crate::ssl`] and [`crate::status`], so the two cannot disagree about the
+//! same certificate.
 //!
 //! Both probes handshake with a server to *read* the certificate chain it
 //! presents — expired, self-signed and wrong-host chains included, since
@@ -18,10 +20,11 @@
 //! handshake separately — like the rest of `ssl`/`status`, a probe must not
 //! retry-mask flakiness.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{aws_lc_rs, verify_tls12_signature, verify_tls13_signature, CryptoProvider};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -31,6 +34,7 @@ use rustls::{
 };
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
+use x509_parser::prelude::{GeneralName, X509Certificate};
 
 use crate::error::{Result, SeerError};
 
@@ -186,6 +190,77 @@ fn describe_failure(e: &std::io::Error) -> String {
     format!("{e}{hint}")
 }
 
+/// Whether `cert` identifies `host`, per RFC 6125 §6.4.4.
+///
+/// dNSName SANs are the DNS-IDs: when a certificate carries any, they alone
+/// decide, so a CN that happens to name `host` cannot rescue a cert issued for
+/// other hosts. The subject CN is a legacy fallback consulted only when there
+/// is no DNS-ID — an iPAddress SAN is not one. An IP-literal `host` also
+/// matches an equal iPAddress SAN.
+pub(crate) fn cert_matches_host(cert: &X509Certificate<'_>, host: &str) -> bool {
+    let host_ip = host.parse::<IpAddr>().ok();
+    let mut has_dns_id = false;
+    if let Ok(Some(san)) = cert.subject_alternative_name() {
+        for name in &san.value.general_names {
+            match name {
+                GeneralName::DNSName(pattern) => {
+                    has_dns_id = true;
+                    if hostname_matches_pattern(host, pattern) {
+                        return true;
+                    }
+                }
+                GeneralName::IPAddress(bytes)
+                    if san_ip(bytes).is_some_and(|ip| Some(ip) == host_ip) =>
+                {
+                    return true;
+                }
+                _ => {}
+            }
+        }
+    }
+    !has_dns_id
+        && cert
+            .subject()
+            .iter_common_name()
+            .filter_map(|cn| cn.as_str().ok())
+            .any(|cn| hostname_matches_pattern(host, cn))
+}
+
+/// Exact (case-insensitive) or single-label wildcard match per RFC 6125:
+/// `*.example.com` matches `a.example.com` but not `example.com` or
+/// `a.b.example.com`.
+fn hostname_matches_pattern(host: &str, pattern: &str) -> bool {
+    let host = host.to_ascii_lowercase();
+    let pattern = pattern.to_ascii_lowercase();
+    match pattern.strip_prefix("*.") {
+        Some(rest) => host
+            .split_once('.')
+            .is_some_and(|(_, host_rest)| host_rest == rest),
+        None => host == pattern,
+    }
+}
+
+/// Decodes an iPAddress SAN: 4 bytes are IPv4, 16 are IPv6, anything else is
+/// malformed.
+pub(crate) fn san_ip(bytes: &[u8]) -> Option<IpAddr> {
+    match <[u8; 4]>::try_from(bytes) {
+        Ok(v4) => Some(IpAddr::from(v4)),
+        Err(_) => <[u8; 16]>::try_from(bytes).ok().map(IpAddr::from),
+    }
+}
+
+/// The certificate's `notBefore`/`notAfter` in UTC, or `None` when either is
+/// outside chrono's range.
+pub(crate) fn validity_window(
+    cert: &X509Certificate<'_>,
+) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+    let validity = cert.validity();
+    Some((
+        DateTime::from_timestamp(validity.not_before.timestamp(), 0)?,
+        DateTime::from_timestamp(validity.not_after.timestamp(), 0)?,
+    ))
+}
+
 /// Loopback TLS fixture shared with the `ssl`/`status` tests. Each server
 /// handles one handshake on 127.0.0.1; tests hand its address straight to
 /// [`inspect`], standing in for the SSRF-vetted addresses production callers
@@ -204,6 +279,12 @@ pub(crate) mod test_support {
     pub const LEAF_DER: &str = "MIIBlTCCATqgAwIBAgIUKCxCli0Q1PLwYxTyhtrD7HdFRA4wCgYIKoZIzj0EAwIwFzEVMBMGA1UEAwwMU2VlciBUZXN0IENBMCAXDTI2MDkyMzAwMTY1OVoYDzIxMjYwODMwMDAxNjU5WjAVMRMwEQYDVQQDDApjaGFpbi50ZXN0MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEe38KVS2JShSXb/EYFoJil5p0+heKLvI+tGWwhPoCryt3V7qbkTJ7bC1yIHREfe98PReO/qk6aDNAANp1rFRhUqNkMGIwFQYDVR0RBA4wDIIKY2hhaW4udGVzdDAJBgNVHRMEAjAAMB0GA1UdDgQWBBScBoa2qgkylsi8p9t6KzPWkAiCSDAfBgNVHSMEGDAWgBS5XFcFWtxJoNW7VNP1rNYWHSPidjAKBggqhkjOPQQDAgNJADBGAiEA36loQCn3xzgYDPwuvBqM3D+JbCj8/hhidrslPRkPe+kCIQDc8ON6Yd3LaofqIyhdtOwDL3IYuwznsV/80HEvL0wTmw==";
     /// Self-signed `CN=Seer Test CA`.
     pub const CA_DER: &str = "MIIBlTCCATugAwIBAgIUXHqMG+rB4YKf5efSu60kFPZBDuIwCgYIKoZIzj0EAwIwFzEVMBMGA1UEAwwMU2VlciBUZXN0IENBMCAXDTI2MDkyMzAwMTY1OVoYDzIxMjYwODMwMDAxNjU5WjAXMRUwEwYDVQQDDAxTZWVyIFRlc3QgQ0EwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAARUFxG40M198DPG4bIfgcLvUPcQzKGd/w/o4GHlMDFUPIBto1POKq1YNKqLxR58ZtChPUJdrXHBTMhxqtAsohlKo2MwYTAdBgNVHQ4EFgQUuVxXBVrcSaDVu1TT9azWFh0j4nYwHwYDVR0jBBgwFoAUuVxXBVrcSaDVu1TT9azWFh0j4nYwDwYDVR0TAQH/BAUwAwEB/zAOBgNVHQ8BAf8EBAMCAgQwCgYIKoZIzj0EAwIDSAAwRQIgIJP7q0DrLeCFafAIv7nsFlryvsUJiP90VJtGG7oJADUCIQD8hLibiUqPk8HkJAyZIeVKx7kcijpb2Xc9TEW2HE90NQ==";
+    /// Self-signed `CN=victim.example`, SAN `DNS:other.example`.
+    pub const CN_VICTIM_SAN_OTHER: &str = "MIIBoDCCAUegAwIBAgIUdStRrtt0ycIGUV74700+xRrFcJ0wCgYIKoZIzj0EAwIwGTEXMBUGA1UEAwwOdmljdGltLmV4YW1wbGUwHhcNMjYwOTIyMTcwMzA4WhcNMzYwOTE5MTcwMzA4WjAZMRcwFQYDVQQDDA52aWN0aW0uZXhhbXBsZTBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABJPCvcjh/aeA2qb1taFaBCxI/ue4srU8jUNjjvQW9IKMqdsUluEGjW7fcYSa8w/79MWZ/naVmgZKQs/eSXCU/AWjbTBrMB0GA1UdDgQWBBSG5So71BSr3DZri66kQaPKzWbjNDAfBgNVHSMEGDAWgBSG5So71BSr3DZri66kQaPKzWbjNDAPBgNVHRMBAf8EBTADAQH/MBgGA1UdEQQRMA+CDW90aGVyLmV4YW1wbGUwCgYIKoZIzj0EAwIDRwAwRAIgEnAMNQMytsawL+CuV7N9z/ftwHVzdFunp+oG7QjIou4CIHsf9vyIXQUPs5iBrhprcRiwyuZQWy0mZyRdavp4Kgbh";
+    /// Self-signed `CN=victim.example`, no SAN extension.
+    pub const CN_VICTIM_NO_SAN: &str = "MIIBhzCCAS2gAwIBAgIUeGkzmcc68l5FOH5NOBgS3Ybcg4gwCgYIKoZIzj0EAwIwGTEXMBUGA1UEAwwOdmljdGltLmV4YW1wbGUwHhcNMjYwOTIyMTcwMzA4WhcNMzYwOTE5MTcwMzA4WjAZMRcwFQYDVQQDDA52aWN0aW0uZXhhbXBsZTBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABC6rgHiHBhd3vxpcRHm7VH2YgCybc0Bl4ewS1lMjdtM5+R+pX/STje36olq5IDx9AEJfxtdRMvtiWp9jfb5vdB6jUzBRMB0GA1UdDgQWBBS5JfZqENT0bfsAazBNLiAVb77UdzAfBgNVHSMEGDAWgBS5JfZqENT0bfsAazBNLiAVb77UdzAPBgNVHRMBAf8EBTADAQH/MAoGCCqGSM49BAMCA0gAMEUCIQD5zMnpSHSVr3vSmZM0vh0R345Rg3wc+OgeZwmsDxDJQQIgBNJ0CS0bpChCAQls0oFZUPD6u7iX7uBOD/QRPZ2Ub1k=";
+    /// Self-signed `CN=victim.example`, SAN `IP:203.0.113.7` only.
+    pub const CN_VICTIM_SAN_IP: &str = "MIIBmTCCAUCgAwIBAgIUNLKX5hfp150WybxH1TK4/buhJpkwCgYIKoZIzj0EAwIwGTEXMBUGA1UEAwwOdmljdGltLmV4YW1wbGUwIBcNMjYwOTIzMDAxNzA0WhgPMjEyNjA4MzAwMDE3MDRaMBkxFzAVBgNVBAMMDnZpY3RpbS5leGFtcGxlMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE34KvRRWyPfrfW30NuPRHBL/o0xYniAlVPTcjaEbsksvvSTPk0uPM2FA9GSrD8YQa+BqxdfCjZ3vMARvA95A9e6NkMGIwHQYDVR0OBBYEFCUaB8nqqyd/yXM9pZGqBITswjqTMB8GA1UdIwQYMBaAFCUaB8nqqyd/yXM9pZGqBITswjqTMA8GA1UdEwEB/wQFMAMBAf8wDwYDVR0RBAgwBocEywBxBzAKBggqhkjOPQQDAgNHADBEAiBpAbhxdLJCQWa6M9mMTKL+iXYo1FMxb0BZYOTngYts5wIgIDTiVbjBH69Uozws5X7IxMhoeF7dNXNaSzo+Fnd2zEM=";
     /// PKCS#8 key of [`LEAF_DER`] — a throwaway that exists only for these tests.
     const LEAF_KEY_DER: &str = "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgHNpHBJ98pEtKA4x23Lzt4GnSrLJuQ2ViB0QAUGcID3GhRANCAAR7fwpVLYlKFJdv8RgWgmKXmnT6F4ou8j60ZbCE+gKvK3dXupuRMntsLXIgdER973w9F47+qTpoM0AA2nWsVGFS";
 
@@ -252,12 +333,53 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::{cert, serve_once, CA_DER, LEAF_DER};
+    use super::test_support::*;
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+    use x509_parser::prelude::FromDer;
 
     const TIMEOUT: Duration = Duration::from_secs(5);
+
+    #[test]
+    fn host_identity_follows_rfc_6125() {
+        let matches = |b64: &str, host: &str| {
+            let der = cert(b64);
+            let (_, x509) = X509Certificate::from_der(&der).unwrap();
+            cert_matches_host(&x509, host)
+        };
+        // DNS-ID SANs decide alone: a matching CN can't rescue a cert whose
+        // SANs name other hosts.
+        assert!(!matches(CN_VICTIM_SAN_OTHER, "victim.example"));
+        assert!(matches(CN_VICTIM_SAN_OTHER, "other.example"));
+        // No SAN at all: the legacy CN fallback applies.
+        assert!(matches(CN_VICTIM_NO_SAN, "victim.example"));
+        assert!(!matches(CN_VICTIM_NO_SAN, "other.example"));
+        // Regression: an iPAddress SAN is not a DNS-ID, so it must not switch
+        // the CN fallback off (`seer ssl` did, `seer status` didn't) — and it
+        // does match an IP-literal host.
+        assert!(matches(CN_VICTIM_SAN_IP, "victim.example"));
+        assert!(matches(CN_VICTIM_SAN_IP, "203.0.113.7"));
+        assert!(!matches(CN_VICTIM_SAN_IP, "203.0.113.8"));
+    }
+
+    #[test]
+    fn hostname_patterns_match_exactly_or_one_wildcard_label() {
+        assert!(hostname_matches_pattern("example.com", "example.com"));
+        assert!(hostname_matches_pattern("EXAMPLE.COM", "example.com"));
+        assert!(hostname_matches_pattern("example.com", "EXAMPLE.COM"));
+        assert!(!hostname_matches_pattern("evil.com", "example.com"));
+        assert!(hostname_matches_pattern("a.example.com", "*.example.com"));
+        assert!(hostname_matches_pattern("A.EXAMPLE.COM", "*.example.com"));
+        // The apex doesn't match its wildcard, which covers exactly one label.
+        assert!(!hostname_matches_pattern("example.com", "*.example.com"));
+        assert!(!hostname_matches_pattern(
+            "a.b.example.com",
+            "*.example.com"
+        ));
+        assert!(!hostname_matches_pattern("b.other.com", "*.example.com"));
+        assert!(!hostname_matches_pattern("localhost", "*.example.com"));
+    }
 
     #[tokio::test]
     async fn returns_the_chain_as_presented_and_the_negotiated_protocol() {

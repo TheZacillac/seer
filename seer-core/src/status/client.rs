@@ -343,9 +343,8 @@ fn parse_certificate_der(der: &[u8], domain: &str) -> Result<CertificateInfo> {
     let subject =
         extract_name_from_x509(cert.subject()).unwrap_or_else(|| "Unknown Subject".to_string());
 
-    // Extract validity dates
-    let valid_from = asn1_time_to_chrono(cert.validity().not_before)?;
-    let valid_until = asn1_time_to_chrono(cert.validity().not_after)?;
+    let (valid_from, valid_until) = crate::tls::validity_window(&cert)
+        .ok_or_else(|| SeerError::CertificateError("invalid certificate timestamp".to_string()))?;
 
     let now = Utc::now();
     let days_until_expiry = crate::dates::days_until(valid_until, now);
@@ -354,8 +353,9 @@ fn parse_certificate_der(der: &[u8], domain: &str) -> Result<CertificateInfo> {
     // Hostname verification is performed manually because the inspection
     // handshake accepts any presented chain to allow cert inspection on
     // mildly-broken sites. Without this check any cert — even one issued for
-    // an unrelated domain — would be accepted.
-    let hostname_verified = cert_matches_hostname(&cert, domain);
+    // an unrelated domain — would be accepted. The rule is shared with
+    // `ssl.rs`, so `seer status` and `seer ssl` cannot disagree.
+    let hostname_verified = crate::tls::cert_matches_host(&cert, domain);
 
     Ok(CertificateInfo {
         issuer,
@@ -366,65 +366,6 @@ fn parse_certificate_der(der: &[u8], domain: &str) -> Result<CertificateInfo> {
         is_valid,
         hostname_verified,
     })
-}
-
-/// Matches a hostname against a certificate name pattern.
-///
-/// Supports exact matches (case-insensitive) and single-label wildcards
-/// per RFC 6125 — `*.example.com` matches `a.example.com` but not
-/// `example.com` or `a.b.example.com`.
-fn hostname_matches_pattern(host: &str, pattern: &str) -> bool {
-    let host = host.to_ascii_lowercase();
-    let pattern = pattern.to_ascii_lowercase();
-    if let Some(rest) = pattern.strip_prefix("*.") {
-        // Wildcard: must match exactly one label, and must contain a dot
-        let Some(dot) = host.find('.') else {
-            return false;
-        };
-        let host_rest = &host[dot + 1..];
-        host_rest == rest
-    } else {
-        host == pattern
-    }
-}
-
-/// Checks whether a certificate's SAN dNSName entries (or CN as fallback)
-/// match the queried hostname.
-///
-/// Per RFC 6125 §6.4.4, SAN dNSName is the authoritative source and the CN
-/// is consulted ONLY when the certificate carries no dNSName SAN at all —
-/// otherwise a cert whose SANs cover other hosts but whose CN happens to
-/// name this one would falsely verify. Mirrors `ssl.rs`, so `seer status`
-/// and `seer ssl` cannot disagree about the same certificate.
-fn cert_matches_hostname(cert: &x509_parser::certificate::X509Certificate<'_>, host: &str) -> bool {
-    use x509_parser::prelude::*;
-
-    // SAN dNSName entries (preferred per RFC 6125)
-    let mut has_dns_san = false;
-    if let Ok(Some(san_ext)) = cert.tbs_certificate.subject_alternative_name() {
-        for name in &san_ext.value.general_names {
-            if let GeneralName::DNSName(n) = name {
-                has_dns_san = true;
-                if hostname_matches_pattern(host, n) {
-                    return true;
-                }
-            }
-        }
-    }
-    if has_dns_san {
-        return false;
-    }
-
-    // CN fallback (legacy) — only for certificates without dNSName SANs.
-    for cn in cert.subject().iter_common_name() {
-        if let Ok(s) = cn.as_str() {
-            if hostname_matches_pattern(host, s) {
-                return true;
-            }
-        }
-    }
-
-    false
 }
 
 /// Builds a human-readable issuer label, combining Organization and Common
@@ -459,33 +400,11 @@ fn extract_oid_value(
     None
 }
 
-/// Extracts the Common Name or Organization from an X.509 name.
+/// Extracts the Common Name, falling back to the Organization.
 fn extract_name_from_x509(name: &x509_parser::prelude::X509Name) -> Option<String> {
-    use x509_parser::prelude::*;
-
-    // Try Common Name first (OID 2.5.4.3)
-    for rdn in name.iter() {
-        for attr in rdn.iter() {
-            if attr.attr_type() == &oid_registry::OID_X509_COMMON_NAME {
-                if let Some(s) = extract_attr_string(attr.attr_value()) {
-                    return Some(s);
-                }
-            }
-        }
-    }
-
-    // Fall back to Organization (OID 2.5.4.10)
-    for rdn in name.iter() {
-        for attr in rdn.iter() {
-            if attr.attr_type() == &oid_registry::OID_X509_ORGANIZATION_NAME {
-                if let Some(s) = extract_attr_string(attr.attr_value()) {
-                    return Some(s);
-                }
-            }
-        }
-    }
-
-    None
+    use x509_parser::oid_registry;
+    extract_oid_value(name, &oid_registry::OID_X509_COMMON_NAME)
+        .or_else(|| extract_oid_value(name, &oid_registry::OID_X509_ORGANIZATION_NAME))
 }
 
 /// Extracts a string from an ASN.1 attribute value, handling different encodings.
@@ -508,13 +427,6 @@ fn extract_attr_string(value: &x509_parser::der_parser::asn1_rs::Any) -> Option<
     None
 }
 
-/// Converts an x509-parser ASN1Time to a chrono DateTime.
-fn asn1_time_to_chrono(time: x509_parser::time::ASN1Time) -> Result<chrono::DateTime<Utc>> {
-    let timestamp = time.timestamp();
-    chrono::DateTime::from_timestamp(timestamp, 0)
-        .ok_or_else(|| SeerError::CertificateError("invalid certificate timestamp".to_string()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -527,55 +439,21 @@ mod tests {
         assert_eq!(client.timeout, Duration::from_secs(55));
     }
 
+    /// The hostname verdict comes from the rule shared with `ssl.rs`
+    /// (`tls::cert_matches_host`, which carries the RFC 6125 cases).
     #[test]
-    fn hostname_matches_pattern_exact() {
-        assert!(hostname_matches_pattern("example.com", "example.com"));
-        assert!(hostname_matches_pattern("EXAMPLE.COM", "example.com"));
-        assert!(hostname_matches_pattern("example.com", "EXAMPLE.COM"));
-        assert!(!hostname_matches_pattern("evil.com", "example.com"));
-        assert!(!hostname_matches_pattern("example.com", "evil.com"));
-    }
+    fn certificate_hostname_uses_the_shared_rule() {
+        use crate::tls::test_support::{cert, CN_VICTIM_SAN_IP, CN_VICTIM_SAN_OTHER};
 
-    #[test]
-    fn hostname_matches_pattern_wildcard() {
-        assert!(hostname_matches_pattern("a.example.com", "*.example.com"));
-        assert!(hostname_matches_pattern("A.EXAMPLE.COM", "*.example.com"));
-        // Apex must not match wildcard (RFC 6125)
-        assert!(!hostname_matches_pattern("example.com", "*.example.com"));
-        // Wildcard only covers a single label
-        assert!(!hostname_matches_pattern(
-            "a.b.example.com",
-            "*.example.com"
-        ));
-        assert!(!hostname_matches_pattern("b.other.com", "*.example.com"));
-    }
-
-    #[test]
-    fn hostname_matches_pattern_wildcard_requires_dot() {
-        // A bare host with no dot cannot match a wildcard pattern
-        assert!(!hostname_matches_pattern("localhost", "*.example.com"));
-    }
-
-    /// Self-signed P-256 cert: CN=victim.example, SAN=DNS:other.example.
-    const CERT_CN_VICTIM_SAN_OTHER: &str = "MIIBoDCCAUegAwIBAgIUdStRrtt0ycIGUV74700+xRrFcJ0wCgYIKoZIzj0EAwIwGTEXMBUGA1UEAwwOdmljdGltLmV4YW1wbGUwHhcNMjYwOTIyMTcwMzA4WhcNMzYwOTE5MTcwMzA4WjAZMRcwFQYDVQQDDA52aWN0aW0uZXhhbXBsZTBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABJPCvcjh/aeA2qb1taFaBCxI/ue4srU8jUNjjvQW9IKMqdsUluEGjW7fcYSa8w/79MWZ/naVmgZKQs/eSXCU/AWjbTBrMB0GA1UdDgQWBBSG5So71BSr3DZri66kQaPKzWbjNDAfBgNVHSMEGDAWgBSG5So71BSr3DZri66kQaPKzWbjNDAPBgNVHRMBAf8EBTADAQH/MBgGA1UdEQQRMA+CDW90aGVyLmV4YW1wbGUwCgYIKoZIzj0EAwIDRwAwRAIgEnAMNQMytsawL+CuV7N9z/ftwHVzdFunp+oG7QjIou4CIHsf9vyIXQUPs5iBrhprcRiwyuZQWy0mZyRdavp4Kgbh";
-    /// Self-signed P-256 cert: CN=victim.example, no SAN extension.
-    const CERT_CN_VICTIM_NO_SAN: &str = "MIIBhzCCAS2gAwIBAgIUeGkzmcc68l5FOH5NOBgS3Ybcg4gwCgYIKoZIzj0EAwIwGTEXMBUGA1UEAwwOdmljdGltLmV4YW1wbGUwHhcNMjYwOTIyMTcwMzA4WhcNMzYwOTE5MTcwMzA4WjAZMRcwFQYDVQQDDA52aWN0aW0uZXhhbXBsZTBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABC6rgHiHBhd3vxpcRHm7VH2YgCybc0Bl4ewS1lMjdtM5+R+pX/STje36olq5IDx9AEJfxtdRMvtiWp9jfb5vdB6jUzBRMB0GA1UdDgQWBBS5JfZqENT0bfsAazBNLiAVb77UdzAfBgNVHSMEGDAWgBS5JfZqENT0bfsAazBNLiAVb77UdzAPBgNVHRMBAf8EBTADAQH/MAoGCCqGSM49BAMCA0gAMEUCIQD5zMnpSHSVr3vSmZM0vh0R345Rg3wc+OgeZwmsDxDJQQIgBNJ0CS0bpChCAQls0oFZUPD6u7iX7uBOD/QRPZ2Ub1k=";
-
-    fn cert_info(b64: &str, host: &str) -> CertificateInfo {
-        use base64::{engine::general_purpose::STANDARD, Engine};
-        let der = STANDARD.decode(b64).unwrap();
-        parse_certificate_der(&der, host).unwrap()
-    }
-
-    #[test]
-    fn cn_is_ignored_when_the_cert_has_dns_sans() {
-        // RFC 6125 §6.4.4: a matching CN must not rescue a cert whose SANs
-        // name other hosts. `seer ssl` already applied this; status did not.
-        assert!(!cert_info(CERT_CN_VICTIM_SAN_OTHER, "victim.example").hostname_verified);
-        assert!(cert_info(CERT_CN_VICTIM_SAN_OTHER, "other.example").hostname_verified);
-        // Legacy cert with no SAN at all still falls back to the CN.
-        assert!(cert_info(CERT_CN_VICTIM_NO_SAN, "victim.example").hostname_verified);
-        assert!(!cert_info(CERT_CN_VICTIM_NO_SAN, "other.example").hostname_verified);
+        let verified = |b64, host| {
+            parse_certificate_der(&cert(b64), host)
+                .unwrap()
+                .hostname_verified
+        };
+        assert!(!verified(CN_VICTIM_SAN_OTHER, "victim.example"));
+        assert!(verified(CN_VICTIM_SAN_IP, "victim.example"));
+        // An IP-literal host now matches an iPAddress SAN, as in `seer ssl`.
+        assert!(verified(CN_VICTIM_SAN_IP, "203.0.113.7"));
     }
 
     // --- http_info (hermetic: wiremock on 127.0.0.1 via the test seam) ----

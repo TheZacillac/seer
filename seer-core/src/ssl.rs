@@ -326,18 +326,10 @@ fn build_report(
     let days_until_expiry = crate::dates::days_until(leaf_detail.valid_until, now);
     let is_valid = now >= leaf_detail.valid_from && now <= leaf_detail.valid_until;
 
-    // Hostname verification: does the leaf cert's SAN (or CN fallback)
-    // match the requested domain? This is independent of `is_valid` and of
-    // chain trust (which is not verified here — see the field docs). Lets
-    // consumers tell a date-valid-but-wrong-host cert apart from a real
-    // match. Per RFC 6125 §6.4.4 the CN is consulted ONLY when the cert
-    // presents no identifier SANs at all; if any dNSName/IPAddress SAN is
-    // present the CN must be ignored, otherwise a cert whose SANs cover
-    // other hosts but whose CN happens to match would falsely verify.
-    let hostname_verified = san_names
-        .iter()
-        .any(|san| hostname_matches_pattern(&domain, san))
-        || (san_names.is_empty() && subject_cn_matches_host(&x509, &domain));
+    // Hostname verification (RFC 6125, shared with `status`): independent of
+    // `is_valid` and of chain trust (not verified here — see the field docs),
+    // so consumers can tell a date-valid-but-wrong-host cert from a match.
+    let hostname_verified = crate::tls::cert_matches_host(&x509, &domain);
 
     // Annotate the CAA policy with the issuer comparison before
     // attaching it to the report.
@@ -374,39 +366,6 @@ fn build_report(
     })
 }
 
-/// Returns true if `host` matches the certificate name `pattern`, supporting
-/// exact (case-insensitive) matches and single-label wildcards per RFC 6125
-/// (`*.example.com` matches `a.example.com` but not `example.com` or
-/// `a.b.example.com`).
-fn hostname_matches_pattern(host: &str, pattern: &str) -> bool {
-    let host = host.to_ascii_lowercase();
-    let pattern = pattern.to_ascii_lowercase();
-    if let Some(rest) = pattern.strip_prefix("*.") {
-        let Some(dot) = host.find('.') else {
-            return false;
-        };
-        let host_rest = &host[dot + 1..];
-        host_rest == rest
-    } else {
-        host == pattern
-    }
-}
-
-/// Legacy CN fallback for hostname verification: checks the leaf certificate's
-/// subject Common Name(s) against `host`. SAN dNSNames are authoritative per
-/// RFC 6125; CN is only consulted when the certificate presents no identifier
-/// SANs at all (the caller gates this on `san_names.is_empty()`).
-fn subject_cn_matches_host(cert: &X509Certificate, host: &str) -> bool {
-    for cn in cert.subject().iter_common_name() {
-        if let Ok(s) = cn.as_str() {
-            if hostname_matches_pattern(host, s) {
-                return true;
-            }
-        }
-    }
-    false
-}
-
 /// Extracts Subject Alternative Names from a certificate.
 fn extract_sans(cert: &X509Certificate) -> Vec<String> {
     let mut sans = Vec::new();
@@ -426,26 +385,13 @@ fn extract_sans(cert: &X509Certificate) -> Vec<String> {
     sans
 }
 
-/// Renders an IPAddress SAN from its raw bytes into canonical text form.
-///
-/// A 4-byte value becomes dotted-quad IPv4; a 16-byte value becomes a
-/// zero-compressed IPv6 address (e.g. `::1`, not `0000:0000:...:0001`) by going
-/// through `std::net::Ipv6Addr`'s `Display`. Any other length is unexpected for
-/// an IPAddress general name, so it falls back to a debug rendering of the bytes
-/// rather than guessing.
+/// Renders an IPAddress SAN from its raw bytes into canonical text form:
+/// dotted-quad IPv4, or zero-compressed IPv6 (e.g. `::1`, not
+/// `0000:0000:...:0001`). Any other length is unexpected for an IPAddress
+/// general name, so it falls back to a debug rendering of the bytes rather
+/// than guessing.
 fn format_ip_san(ip_bytes: &[u8]) -> String {
-    match ip_bytes.len() {
-        4 => {
-            let octets: [u8; 4] = [ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3]];
-            std::net::Ipv4Addr::from(octets).to_string()
-        }
-        16 => {
-            let mut octets = [0u8; 16];
-            octets.copy_from_slice(ip_bytes);
-            std::net::Ipv6Addr::from(octets).to_string()
-        }
-        _ => format!("{:?}", ip_bytes),
-    }
+    crate::tls::san_ip(ip_bytes).map_or_else(|| format!("{:?}", ip_bytes), |ip| ip.to_string())
 }
 
 /// Parses detailed information from an X.509 certificate.
@@ -453,8 +399,8 @@ fn parse_cert_detail(cert: &X509Certificate) -> Result<CertDetail> {
     let subject = cert.subject().to_string();
     let issuer = cert.issuer().to_string();
 
-    let valid_from = asn1_time_to_chrono(cert.validity().not_before)?;
-    let valid_until = asn1_time_to_chrono(cert.validity().not_after)?;
+    let (valid_from, valid_until) = crate::tls::validity_window(cert)
+        .ok_or_else(|| SeerError::SslError("invalid certificate timestamp".to_string()))?;
 
     let serial_number = cert.serial.to_str_radix(16);
 
@@ -525,13 +471,6 @@ fn oid_to_key_type(oid: &Oid) -> Option<String> {
         "1.3.101.113" => Some("Ed448".to_string()),
         _ => Some(oid_str),
     }
-}
-
-/// Converts an x509-parser ASN1Time to a chrono DateTime.
-fn asn1_time_to_chrono(time: ASN1Time) -> Result<DateTime<Utc>> {
-    let timestamp = time.timestamp();
-    DateTime::from_timestamp(timestamp, 0)
-        .ok_or_else(|| SeerError::SslError("invalid certificate timestamp".to_string()))
 }
 
 #[cfg(test)]
@@ -750,20 +689,21 @@ mod tests {
         assert!(w.iter().any(|x| x.message.contains("marked as a CA")));
     }
 
+    /// Regression: `seer ssl` switched the CN fallback off for any SAN, so an
+    /// IP-SAN-only cert failed here while `seer status` verified it. Both now
+    /// share `tls::cert_matches_host`.
     #[test]
-    fn hostname_matches_pattern_exact_and_wildcard() {
-        assert!(hostname_matches_pattern("example.com", "example.com"));
-        assert!(hostname_matches_pattern("EXAMPLE.COM", "example.com"));
-        // Single-label wildcard.
-        assert!(hostname_matches_pattern("a.example.com", "*.example.com"));
-        // Apex must not match a wildcard (RFC 6125).
-        assert!(!hostname_matches_pattern("example.com", "*.example.com"));
-        // Wildcard matches only one label.
-        assert!(!hostname_matches_pattern(
-            "a.b.example.com",
-            "*.example.com"
-        ));
-        // Mismatched host.
-        assert!(!hostname_matches_pattern("evil.test", "example.com"));
+    fn ip_only_san_still_falls_back_to_the_cn() {
+        use crate::tls::test_support::{cert, CN_VICTIM_SAN_IP};
+
+        let presented = PresentedChain {
+            leaf: cert(CN_VICTIM_SAN_IP),
+            intermediates: vec![],
+            protocol: None,
+        };
+        let report =
+            build_report("victim.example".to_string(), presented, CaaPolicy::empty()).unwrap();
+        assert!(report.hostname_verified);
+        assert_eq!(report.san_names, ["203.0.113.7"]);
     }
 }
