@@ -214,31 +214,17 @@ impl StatusClient {
             resolver.resolve(domain, RecordType::NS, None)
         );
 
-        // Extract A records
-        let a_records: Vec<String> = a_result
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|r| {
-                if let RecordData::A { address } = r.data {
-                    Some(address)
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        // Extract AAAA records
-        let aaaa_records: Vec<String> = aaaa_result
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|r| {
-                if let RecordData::AAAA { address } = r.data {
-                    Some(address)
-                } else {
-                    None
-                }
-            })
-            .collect();
+        // Each query answers only its own type, so the A|AAAA accessor splits
+        // the two lists exactly.
+        let addresses = |result: Result<Vec<crate::dns::DnsRecord>>| -> Vec<String> {
+            result
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|r| r.data.address().map(str::to_string))
+                .collect()
+        };
+        let a_records = addresses(a_result);
+        let aaaa_records = addresses(aaaa_result);
 
         // Extract CNAME target (trim trailing dot)
         let cname_target: Option<String> =
@@ -437,6 +423,25 @@ mod tests {
         config.timeouts.http_secs = 55;
         let client = StatusClient::from_config(&config);
         assert_eq!(client.timeout, Duration::from_secs(55));
+    }
+
+    /// A/AAAA/CNAME/NS extraction over the full resolve path, against the
+    /// loopback DNS fixture.
+    #[tokio::test]
+    async fn dns_resolution_splits_address_families() {
+        use crate::dns::test_support::{mock_dns_resolver_default, spawn_mock_dns, MockMode};
+
+        let port = spawn_mock_dns(MockMode::Zone).await;
+        let client = StatusClient {
+            dns_resolver: mock_dns_resolver_default(port),
+            ..StatusClient::new()
+        };
+        let dns = client.fetch_dns_resolution("seer.test").await;
+        assert_eq!(dns.a_records, ["192.0.2.1", "192.0.2.2"]);
+        assert_eq!(dns.aaaa_records, ["2001:db8::1"]);
+        assert_eq!(dns.cname_target, None);
+        assert_eq!(dns.nameservers, ["ns1.seer.test"]);
+        assert!(dns.resolves);
     }
 
     /// The hostname verdict comes from the rule shared with `ssl.rs`
