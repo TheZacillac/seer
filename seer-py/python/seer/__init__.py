@@ -67,6 +67,10 @@ from seer._seer import (
 # Importing seer._seer also installs the Rust -> Python `logging` bridge
 # (see the #[pymodule_init] hook in seer-py/src/lib.rs).
 
+# Auto-routing RDAP lookup for a domain, IP address, or ASN; routing happens
+# in Rust (seer_core::rdap::classify), so `as1234.io` stays a domain lookup.
+rdap = rdap_auto
+
 try:
     from importlib.metadata import version
     # Distribution name on PyPI (the import name stays `seer`).
@@ -113,25 +117,3 @@ __all__ = [
     "validate_public_host",
     "whois",
 ]
-
-
-def rdap(query: str) -> dict:
-    """
-    Look up RDAP information for a domain, IP address, or ASN.
-
-    Automatically detects the query type based on the format:
-    - IP addresses (v4 or v6) -> IP lookup
-    - ASN format (AS12345 or as12345, no embedded dots) -> ASN lookup
-    - Everything else -> Domain lookup
-
-    Routing is performed in Rust by ``seer_core::rdap::classify`` so that
-    domains starting with ``AS`` (e.g. ``as1234.io``) are handled correctly
-    instead of being misrouted to the ASN endpoint.
-
-    Args:
-        query: Domain name, IP address, or ASN (e.g., "example.com", "8.8.8.8", "AS15169")
-
-    Returns:
-        dict: RDAP response data
-    """
-    return rdap_auto(query)
