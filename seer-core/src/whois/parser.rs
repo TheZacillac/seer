@@ -5,199 +5,150 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
 
-/// Pre-compiled regexes for WHOIS field extraction.
+/// Compiles one `Label: value` pattern per label, matching anywhere on a
+/// line: `(?i)<label>:[ \t]*(.+)`. Labels are regex fragments; a list's order
+/// is its priority ([`extract_field_with_patterns`] takes the first match).
 ///
-/// Every pattern separates the label from its value with `[ \t]*`
-/// (horizontal whitespace only), never `\s*`: `\s` also matches `\r`/`\n`, so
-/// an EMPTY field (`Name Server: \r\n`, `DNSSEC:\n`) would swallow the line
-/// break and capture the NEXT line as its value (`DNSSEC: URL of the ICANN
-/// Whois Inaccuracy Complaint Form: …`). Registries that genuinely put the
-/// value on the following line (NASK `REGISTRAR:\n<name>`, DNS Belgium
+/// The label is separated from its value by `[ \t]*` (horizontal whitespace
+/// only), never `\s*`: `\s` also matches `\r`/`\n`, so an EMPTY field
+/// (`Name Server: \r\n`, `DNSSEC:\n`) would swallow the line break and capture
+/// the NEXT line as its value (`DNSSEC: URL of the ICANN Whois Inaccuracy
+/// Complaint Form: …`). Registries that genuinely put the value on the
+/// following line (NASK `REGISTRAR:\n<name>`, DNS Belgium
 /// `Registrar:\n\tName: <name>`) are handled explicitly by
 /// [`extract_section_value`] instead.
-static REGISTRAR_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
-    vec![
-        Regex::new(r"(?i)Registrar:[ \t]*(.+)").expect("Invalid regex for Registrar"),
-        Regex::new(r"(?i)Registrar Name:[ \t]*(.+)").expect("Invalid regex for Registrar Name"),
-        Regex::new(r"(?i)Sponsoring Registrar:[ \t]*(.+)")
-            .expect("Invalid regex for Sponsoring Registrar"),
-    ]
-});
+pub(super) fn field_patterns(labels: &[&str]) -> Vec<Regex> {
+    labels
+        .iter()
+        .map(|label| compile(&format!(r"(?i){label}:[ \t]*(.+)")))
+        .collect()
+}
 
-static REGISTRANT_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
-    vec![
-        Regex::new(r"(?i)Registrant Name:[ \t]*(.+)").expect("Invalid regex for Registrant Name"),
-        Regex::new(r"(?i)Registrant:[ \t]*(.+)").expect("Invalid regex for Registrant"),
-    ]
-});
+/// Like [`field_patterns`], but anchored to the start of a line (indentation
+/// allowed), for labels that also end a longer one (`Organization:` inside
+/// `Admin Organization:`) or would otherwise match inside prose.
+fn line_field_patterns(labels: &[&str]) -> Vec<Regex> {
+    labels
+        .iter()
+        .map(|label| compile(&format!(r"(?im)^[ \t]*{label}:[ \t]*(.+)$")))
+        .collect()
+}
+
+fn compile(pattern: &str) -> Regex {
+    Regex::new(pattern).expect("valid WHOIS field regex")
+}
+
+static REGISTRAR_PATTERNS: LazyLock<Vec<Regex>> =
+    LazyLock::new(|| field_patterns(&["Registrar", "Registrar Name", "Sponsoring Registrar"]));
+
+static REGISTRANT_PATTERNS: LazyLock<Vec<Regex>> =
+    LazyLock::new(|| field_patterns(&["Registrant Name", "Registrant"]));
 
 static ORGANIZATION_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
-    vec![
-        Regex::new(r"(?i)Registrant Organization:[ \t]*(.+)")
-            .expect("Invalid regex for Registrant Organization"),
-        // Anchor the bare/ambiguous org labels to the start of a line (allowing
-        // indentation) so they cannot match the "Organization:" substring
-        // inside "Admin Organization:" / "Tech Organization:" lines and thereby
-        // attribute another contact's org to the registrant.
-        Regex::new(r"(?im)^[ \t]*Organization:[ \t]*(.+)").expect("Invalid regex for Organization"),
-        Regex::new(r"(?im)^[ \t]*org-name:[ \t]*(.+)").expect("Invalid regex for org-name"),
-        Regex::new(r"(?im)^[ \t]*Org Name:[ \t]*(.+)").expect("Invalid regex for Org Name"),
-    ]
+    let mut patterns = field_patterns(&["Registrant Organization"]);
+    // The bare/ambiguous org labels are line-anchored so they cannot match the
+    // "Organization:" inside "Admin Organization:" / "Tech Organization:" and
+    // thereby attribute another contact's org to the registrant.
+    patterns.extend(line_field_patterns(&[
+        "Organization",
+        "org-name",
+        "Org Name",
+    ]));
+    patterns
 });
 
 static CREATION_DATE_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
-    vec![
-        Regex::new(r"(?i)Creation Date:[ \t]*(.+)").expect("Invalid regex for Creation Date"),
-        Regex::new(r"(?i)Created Date:[ \t]*(.+)").expect("Invalid regex for Created Date"),
-        Regex::new(r"(?i)Created On:[ \t]*(.+)").expect("Invalid regex for Created On"),
-        Regex::new(r"(?i)Created:[ \t]*(.+)").expect("Invalid regex for Created"),
-        Regex::new(r"(?i)Registration Date:[ \t]*(.+)")
-            .expect("Invalid regex for Registration Date"),
-        Regex::new(r"(?i)Domain Registration Date:[ \t]*(.+)")
-            .expect("Invalid regex for Domain Registration Date"),
-        // Punktum (.dk) style: `Registered:           2018-01-25`
-        Regex::new(r"(?im)^[ \t]*Registered:[ \t]*(.+)$").expect("Invalid regex for Registered"),
-        // French registries (ANINF .ga): `Date de création:`
-        Regex::new(r"(?im)^[ \t]*Date de création:[ \t]*(.+)$")
-            .expect("Invalid regex for Date de création"),
-    ]
+    let mut patterns = field_patterns(&[
+        "Creation Date",
+        "Created Date",
+        "Created On",
+        "Created",
+        "Registration Date",
+        "Domain Registration Date",
+    ]);
+    // Punktum (.dk) style `Registered:           2018-01-25`, and French
+    // registries (ANINF .ga) `Date de création:`.
+    patterns.extend(line_field_patterns(&["Registered", "Date de création"]));
+    patterns
 });
 
 static EXPIRATION_DATE_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
-    vec![
-        Regex::new(r"(?i)(?:Registry )?Expir(?:y|ation) Date:[ \t]*(.+)")
-            .expect("Invalid regex for Expiry/Expiration Date"),
-        Regex::new(r"(?i)Expiration Date:[ \t]*(.+)").expect("Invalid regex for Expiration Date"),
-        Regex::new(r"(?i)Expires On:[ \t]*(.+)").expect("Invalid regex for Expires On"),
-        Regex::new(r"(?i)Expires:[ \t]*(.+)").expect("Invalid regex for Expires"),
-        Regex::new(r"(?i)Expiry Date:[ \t]*(.+)").expect("Invalid regex for Expiry Date"),
-        Regex::new(r"(?i)paid-till:[ \t]*(.+)").expect("Invalid regex for paid-till"),
-        // French registries (ANINF .ga): `Date d'expiration:`
-        Regex::new(r"(?im)^[ \t]*Date d'expiration:[ \t]*(.+)$")
-            .expect("Invalid regex for Date d'expiration"),
-    ]
+    let mut patterns = field_patterns(&[
+        "(?:Registry )?Expir(?:y|ation) Date",
+        "Expiration Date",
+        "Expires On",
+        "Expires",
+        "Expiry Date",
+        "paid-till",
+    ]);
+    // French registries (ANINF .ga): `Date d'expiration:`
+    patterns.extend(line_field_patterns(&["Date d'expiration"]));
+    patterns
 });
 
 static UPDATED_DATE_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
-    vec![
-        Regex::new(r"(?i)Updated Date:[ \t]*(.+)").expect("Invalid regex for Updated Date"),
-        Regex::new(r"(?i)Last Updated On:[ \t]*(.+)").expect("Invalid regex for Last Updated On"),
-        Regex::new(r"(?i)Last Modified:[ \t]*(.+)").expect("Invalid regex for Last Modified"),
-        Regex::new(r"(?i)Last Update:[ \t]*(.+)").expect("Invalid regex for Last Update"),
-        Regex::new(r"(?i)Modified:[ \t]*(.+)").expect("Invalid regex for Modified"),
-        // French registries (ANINF .ga): `Dernière modification:` — contact
-        // blocks repeat this label; extract_field_with_patterns takes the
-        // first match, which is the domain-level line.
-        Regex::new(r"(?im)^[ \t]*Dernière modification:[ \t]*(.+)$")
-            .expect("Invalid regex for Dernière modification"),
-    ]
+    let mut patterns = field_patterns(&[
+        "Updated Date",
+        "Last Updated On",
+        "Last Modified",
+        "Last Update",
+        "Modified",
+    ]);
+    // French registries (ANINF .ga): `Dernière modification:` — contact
+    // blocks repeat this label; extract_field_with_patterns takes the first
+    // match, which is the domain-level line.
+    patterns.extend(line_field_patterns(&["Dernière modification"]));
+    patterns
 });
 
-static DNSSEC_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
-    vec![
-        Regex::new(r"(?i)DNSSEC:[ \t]*(.+)").expect("Invalid regex for DNSSEC"),
-        Regex::new(r"(?i)DNSSEC Status:[ \t]*(.+)").expect("Invalid regex for DNSSEC Status"),
-    ]
-});
+static DNSSEC_PATTERNS: LazyLock<Vec<Regex>> =
+    LazyLock::new(|| field_patterns(&["DNSSEC", "DNSSEC Status"]));
 
 static NAMESERVER_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
-    vec![
-        Regex::new(r"(?i)Name Server:[ \t]*(.+)").expect("Invalid regex for Name Server"),
-        Regex::new(r"(?i)Nameserver:[ \t]*(.+)").expect("Invalid regex for Nameserver"),
-        Regex::new(r"(?i)nserver:[ \t]*(.+)").expect("Invalid regex for nserver"),
-        Regex::new(r"(?im)^NS:[ \t]+(.+)$").expect("Invalid regex for NS"),
-        // Punktum (.dk) lists nameservers as `Hostname:` lines under a
-        // `Nameservers` heading. Anchored to line start to avoid matching
-        // hostname mentions inside prose.
-        Regex::new(r"(?im)^[ \t]*Hostname:[ \t]*(.+)$").expect("Invalid regex for Hostname"),
-        // French registries (ANINF .ga): `Serveur de noms:` lines.
-        Regex::new(r"(?im)^[ \t]*Serveur de noms:[ \t]*(.+)$")
-            .expect("Invalid regex for Serveur de noms"),
-    ]
+    let mut patterns = field_patterns(&["Name Server", "Nameserver", "nserver"]);
+    patterns.push(compile(r"(?im)^NS:[ \t]+(.+)$"));
+    // Punktum (.dk) lists nameservers as `Hostname:` lines under a
+    // `Nameservers` heading (line-anchored to avoid hostname mentions inside
+    // prose); French registries (ANINF .ga) use `Serveur de noms:` lines.
+    patterns.extend(line_field_patterns(&["Hostname", "Serveur de noms"]));
+    patterns
 });
 
-static REGISTRANT_EMAIL_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
-    vec![
-        Regex::new(r"(?i)Registrant Email:[ \t]*(.+)").expect("Invalid regex for Registrant Email"),
-        Regex::new(r"(?i)Registrant E-mail:[ \t]*(.+)")
-            .expect("Invalid regex for Registrant E-mail"),
-    ]
-});
+static REGISTRANT_EMAIL_PATTERNS: LazyLock<Vec<Regex>> =
+    LazyLock::new(|| field_patterns(&["Registrant Email", "Registrant E-mail"]));
 
-static REGISTRANT_PHONE_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
-    vec![
-        Regex::new(r"(?i)Registrant Phone:[ \t]*(.+)").expect("Invalid regex for Registrant Phone"),
-        Regex::new(r"(?i)Registrant Tel:[ \t]*(.+)").expect("Invalid regex for Registrant Tel"),
-    ]
-});
+static REGISTRANT_PHONE_PATTERNS: LazyLock<Vec<Regex>> =
+    LazyLock::new(|| field_patterns(&["Registrant Phone", "Registrant Tel"]));
 
-static REGISTRANT_ADDRESS_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
-    vec![
-        Regex::new(r"(?i)Registrant Street:[ \t]*(.+)")
-            .expect("Invalid regex for Registrant Street"),
-        Regex::new(r"(?i)Registrant Address:[ \t]*(.+)")
-            .expect("Invalid regex for Registrant Address"),
-    ]
-});
+static REGISTRANT_ADDRESS_PATTERNS: LazyLock<Vec<Regex>> =
+    LazyLock::new(|| field_patterns(&["Registrant Street", "Registrant Address"]));
 
-static REGISTRANT_COUNTRY_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
-    vec![Regex::new(r"(?i)Registrant Country:[ \t]*(.+)")
-        .expect("Invalid regex for Registrant Country")]
-});
+static REGISTRANT_COUNTRY_PATTERNS: LazyLock<Vec<Regex>> =
+    LazyLock::new(|| field_patterns(&["Registrant Country"]));
 
-static ADMIN_NAME_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
-    vec![
-        Regex::new(r"(?i)Admin Name:[ \t]*(.+)").expect("Invalid regex for Admin Name"),
-        Regex::new(r"(?i)Administrative Contact Name:[ \t]*(.+)")
-            .expect("Invalid regex for Administrative Contact Name"),
-    ]
-});
+static ADMIN_NAME_PATTERNS: LazyLock<Vec<Regex>> =
+    LazyLock::new(|| field_patterns(&["Admin Name", "Administrative Contact Name"]));
 
-static ADMIN_ORG_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
-    vec![Regex::new(r"(?i)Admin Organization:[ \t]*(.+)")
-        .expect("Invalid regex for Admin Organization")]
-});
+static ADMIN_ORG_PATTERNS: LazyLock<Vec<Regex>> =
+    LazyLock::new(|| field_patterns(&["Admin Organization"]));
 
-static ADMIN_EMAIL_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
-    vec![
-        Regex::new(r"(?i)Admin Email:[ \t]*(.+)").expect("Invalid regex for Admin Email"),
-        Regex::new(r"(?i)Admin E-mail:[ \t]*(.+)").expect("Invalid regex for Admin E-mail"),
-    ]
-});
+static ADMIN_EMAIL_PATTERNS: LazyLock<Vec<Regex>> =
+    LazyLock::new(|| field_patterns(&["Admin Email", "Admin E-mail"]));
 
-static ADMIN_PHONE_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
-    vec![
-        Regex::new(r"(?i)Admin Phone:[ \t]*(.+)").expect("Invalid regex for Admin Phone"),
-        Regex::new(r"(?i)Admin Tel:[ \t]*(.+)").expect("Invalid regex for Admin Tel"),
-    ]
-});
+static ADMIN_PHONE_PATTERNS: LazyLock<Vec<Regex>> =
+    LazyLock::new(|| field_patterns(&["Admin Phone", "Admin Tel"]));
 
-static TECH_NAME_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
-    vec![
-        Regex::new(r"(?i)Tech Name:[ \t]*(.+)").expect("Invalid regex for Tech Name"),
-        Regex::new(r"(?i)Technical Contact Name:[ \t]*(.+)")
-            .expect("Invalid regex for Technical Contact Name"),
-    ]
-});
+static TECH_NAME_PATTERNS: LazyLock<Vec<Regex>> =
+    LazyLock::new(|| field_patterns(&["Tech Name", "Technical Contact Name"]));
 
-static TECH_ORG_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
-    vec![Regex::new(r"(?i)Tech Organization:[ \t]*(.+)")
-        .expect("Invalid regex for Tech Organization")]
-});
+static TECH_ORG_PATTERNS: LazyLock<Vec<Regex>> =
+    LazyLock::new(|| field_patterns(&["Tech Organization"]));
 
-static TECH_EMAIL_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
-    vec![
-        Regex::new(r"(?i)Tech Email:[ \t]*(.+)").expect("Invalid regex for Tech Email"),
-        Regex::new(r"(?i)Tech E-mail:[ \t]*(.+)").expect("Invalid regex for Tech E-mail"),
-    ]
-});
+static TECH_EMAIL_PATTERNS: LazyLock<Vec<Regex>> =
+    LazyLock::new(|| field_patterns(&["Tech Email", "Tech E-mail"]));
 
-static TECH_PHONE_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
-    vec![
-        Regex::new(r"(?i)Tech Phone:[ \t]*(.+)").expect("Invalid regex for Tech Phone"),
-        Regex::new(r"(?i)Tech Tel:[ \t]*(.+)").expect("Invalid regex for Tech Tel"),
-    ]
-});
+static TECH_PHONE_PATTERNS: LazyLock<Vec<Regex>> =
+    LazyLock::new(|| field_patterns(&["Tech Phone", "Tech Tel"]));
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WhoisResponse {

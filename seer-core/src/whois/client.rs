@@ -8,29 +8,24 @@ use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tracing::{debug, instrument, warn};
 
-use super::parser::WhoisResponse;
+use super::parser::{field_patterns, WhoisResponse};
 use super::servers::{get_tld, get_whois_server_for_domain};
 use crate::cache::TtlCache;
 use crate::error::{Result, SeerError};
 use crate::retry::{RetryExecutor, RetryPolicy};
 use crate::validation::normalize_domain;
 
-/// Pre-compiled regexes for extracting WHOIS referral servers.
+/// Pre-compiled regexes for extracting WHOIS referral servers. The value
+/// MUST be on the key's own line, so an EMPTY `Registrar WHOIS Server:` line
+/// yields no match rather than capturing the following line (see
+/// [`field_patterns`]).
 static REFERRAL_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
-    // The value MUST be on the SAME line as the key. Use `[ \t]*` (horizontal
-    // whitespace only) rather than `\s*` between the key and the capture
-    // group: `\s*` matches newlines, so an EMPTY `Registrar WHOIS Server:`
-    // line would otherwise swallow the line break and capture the following
-    // line's content as the referral server. `[ \t]*` keeps the match anchored
-    // to the key's own line, and the `(.+)` capture (where `.` excludes `\n`)
-    // yields no match for an empty value.
-    vec![
-        Regex::new(r"(?i)Registrar WHOIS Server:[ \t]*(.+)")
-            .expect("Invalid regex pattern for Registrar WHOIS Server"),
-        Regex::new(r"(?i)Whois Server:[ \t]*(.+)").expect("Invalid regex pattern for Whois Server"),
+    let mut patterns = field_patterns(&["Registrar WHOIS Server", "Whois Server"]);
+    patterns.push(
         Regex::new(r"(?i)ReferralServer:[ \t]*whois://(.+)")
             .expect("Invalid regex pattern for ReferralServer"),
-    ]
+    );
+    patterns
 });
 
 const WHOIS_PORT: u16 = 43;
