@@ -22,10 +22,30 @@ target/propagation target — those paths don't connect to that host.
 from __future__ import annotations
 
 import asyncio
+import logging
 
 from fastapi import HTTPException
 
 import seer
+
+logger = logging.getLogger(__name__)
+
+
+def nameserver_target(spec: str) -> tuple[str, int] | None:
+    """``seer.nameserver_target``, failing clearly on bindings that predate it.
+
+    Bindings built before the release after 0.48.0 lack the function yet still
+    satisfy seer-api's ``domain-seer>=0.48.0`` floor (see the PENDING note in
+    pyproject.toml), so without this check every nameserver request would die
+    on a bare ``AttributeError``.
+    """
+    parse = getattr(seer, "nameserver_target", None)
+    if parse is None:
+        raise RuntimeError(
+            "installed domain-seer bindings lack nameserver_target; "
+            "rebuild seer-py from the same checkout as seer-api"
+        )
+    return parse(spec)
 
 
 def guard(host: str, port: int = 443) -> None:
@@ -76,7 +96,14 @@ async def guard_nameserver_async(spec: str) -> None:
     is defense in depth that turns a reserved target into a clear 400 — never
     the only SSRF gate.
     """
-    target = seer.nameserver_target(spec)
+    try:
+        target = nameserver_target(spec)
+    except RuntimeError:
+        # A deployment fault, not a bad request: log why, don't leak it.
+        logger.exception("nameserver SSRF guard unavailable")
+        raise HTTPException(
+            status_code=503, detail="Nameserver validation is unavailable"
+        ) from None
     if target is not None:
         await guard_async(*target)
 

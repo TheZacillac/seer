@@ -358,6 +358,19 @@ NAMESERVER_SPECS = [
 ]
 
 
+def test_stale_bindings_without_nameserver_target_fail_clearly(client, monkeypatch):
+    """Bindings older than the SSRF guard still satisfy the domain-seer floor;
+    a nameserver request must then get a clear 503, not an AttributeError 500."""
+    from seer_api import ssrf
+
+    monkeypatch.delattr(seer, "nameserver_target", raising=False)
+    with pytest.raises(RuntimeError, match="rebuild seer-py"):
+        ssrf.nameserver_target("8.8.8.8")
+    resp = client.get("/dns/example.com/A?nameserver=8.8.8.8")
+    assert resp.status_code == 503, resp.text
+    assert resp.json()["detail"] == "Nameserver validation is unavailable"
+
+
 @needs_ns_parser
 @pytest.mark.parametrize("spec,target", NAMESERVER_SPECS)
 def test_nameserver_target_parses_core_spec_forms(spec, target):

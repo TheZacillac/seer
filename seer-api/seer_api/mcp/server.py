@@ -41,6 +41,7 @@ from .._contract import (
     TLD_TOKEN_RE,
 )
 from .._run import run_seer
+from ..ssrf import nameserver_target
 
 # No logging.basicConfig() here: this module is also imported by the REST app
 # (seer_api.main), where configuring the root logger at import time made
@@ -188,7 +189,7 @@ def _guard_nameserver(spec: str) -> None:
     seer-core. A malformed spec is left for the core to reject with its own
     ``Invalid input``.
     """
-    target = seer.nameserver_target(spec)
+    target = nameserver_target(spec)
     if target is not None:
         seer.validate_public_host(*target)
 
