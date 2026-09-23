@@ -1599,4 +1599,488 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
     }
+
+    /// Byte-exact CSV goldens for every bulk operation (populated + failure rows),
+    /// so any change to `bulk_results_to_csv` that moves a column, drops an
+    /// escape, or adds one to a numeric cell fails loudly.
+    mod csv_golden {
+        use crate::utils::bulk_results_to_csv;
+        use chrono::TimeZone;
+        use seer_core::bulk::{BulkOperation, BulkResult, BulkResultData};
+        use seer_core::dns::{RecordData, RecordType};
+
+        fn ymd(y: i32, m: u32, d: u32) -> chrono::DateTime<chrono::Utc> {
+            chrono::Utc.with_ymd_and_hms(y, m, d, 0, 0, 0).unwrap()
+        }
+
+        fn ok(operation: BulkOperation, data: BulkResultData) -> BulkResult {
+            BulkResult {
+                operation,
+                success: true,
+                data: Some(data),
+                error: None,
+                duration_ms: 42,
+            }
+        }
+
+        fn failed(operation: BulkOperation) -> BulkResult {
+            BulkResult {
+                operation,
+                success: false,
+                data: None,
+                error: Some("timed out, giving up".to_string()),
+                duration_ms: 7,
+            }
+        }
+
+        fn whois() -> seer_core::WhoisResponse {
+            seer_core::WhoisResponse::parse(
+                "example.com",
+                "whois.test",
+                "Registrar: Example Registrar, LLC\n\
+             Creation Date: 1995-08-14T04:00:00Z\n\
+             Registry Expiry Date: 2025-08-13T04:00:00Z\n\
+             Updated Date: 2024-08-14T07:01:34Z\n",
+            )
+        }
+
+        fn rdap() -> seer_core::RdapResponse {
+            serde_json::from_value(serde_json::json!({
+                "ldhName": "example.com",
+                "events": [
+                    {"eventAction": "registration", "eventDate": "1995-08-14T04:00:00Z"},
+                    {"eventAction": "expiration", "eventDate": "2025-08-13T04:00:00Z"},
+                    {"eventAction": "last changed", "eventDate": "2024-08-14T07:01:34Z"}
+                ],
+                "entities": [{
+                    "objectClassName": "entity",
+                    "handle": "376",
+                    "roles": ["registrar"],
+                    "vcardArray": ["vcard", [["fn", {}, "text", "=Formula Registrar"]]]
+                }]
+            }))
+            .unwrap()
+        }
+
+        fn avail() -> seer_core::AvailabilityResult {
+            seer_core::AvailabilityResult {
+                domain: "free.example".to_string(),
+                available: true,
+                confidence: "high".to_string(),
+                method: "rdap".to_string(),
+                details: Some("No RDAP object, domain unregistered".to_string()),
+            }
+        }
+
+        fn csv(op: &str, results: &[BulkResult]) -> String {
+            bulk_results_to_csv(results, op)
+        }
+
+        #[test]
+        fn status_golden() {
+            let status = seer_core::StatusResponse {
+                domain: "example.com".to_string(),
+                http_status: Some(200),
+                http_status_text: Some("OK".to_string()),
+                title: Some("Example, Inc.".to_string()),
+                certificate: Some(seer_core::status::CertificateInfo {
+                    issuer: "DigiCert Inc".to_string(),
+                    subject: "example.com".to_string(),
+                    valid_from: ymd(2024, 1, 30),
+                    valid_until: ymd(2025, 3, 1),
+                    // Negative: numeric cells are never formula-guarded.
+                    days_until_expiry: -3,
+                    is_valid: false,
+                    hostname_verified: true,
+                }),
+                domain_expiration: Some(seer_core::status::DomainExpiration {
+                    expiration_date: ymd(2025, 8, 13),
+                    days_until_expiry: 204,
+                    registrar: Some("RESERVED-IANA".to_string()),
+                }),
+                dns_resolution: Some(seer_core::status::DnsResolution {
+                    a_records: vec!["93.184.216.34".to_string()],
+                    aaaa_records: vec!["2606:2800::1".to_string(), "2606:2800::2".to_string()],
+                    cname_target: None,
+                    nameservers: vec!["a.iana-servers.net".to_string()],
+                    resolves: true,
+                }),
+                caa: None,
+                errors: vec![],
+            };
+            let results = [
+                ok(
+                    BulkOperation::Status {
+                        domain: "example.com".into(),
+                    },
+                    BulkResultData::Status(status),
+                ),
+                failed(BulkOperation::Status {
+                    domain: "bad.invalid".into(),
+                }),
+            ];
+            assert_eq!(
+                csv("status", &results),
+                concat!(
+                    "domain,success,http_status,http_status_text,title,ssl_issuer,ssl_valid_until,ssl_days_remaining,domain_expires,domain_days_remaining,registrar,dns_resolves,dns_a_records,dns_aaaa_records,dns_cname,dns_nameservers,duration_ms,error\n",
+                    "example.com,true,200,OK,\"Example, Inc.\",DigiCert Inc,2025-03-01,-3,2025-08-13,204,RESERVED-IANA,true,93.184.216.34,2606:2800::1;2606:2800::2,,a.iana-servers.net,42,\n",
+                    "bad.invalid,false,,,,,,,,,,,,,,,7,\"timed out, giving up\"\n",
+                )
+            );
+        }
+
+        fn lookup_results() -> Vec<BulkResult> {
+            let op = |d: &str| BulkOperation::Lookup { domain: d.into() };
+            vec![
+                ok(
+                    op("rdap.example"),
+                    BulkResultData::Lookup(seer_core::LookupResult::Rdap {
+                        data: Box::new(rdap()),
+                        whois_fallback: None,
+                    }),
+                ),
+                ok(
+                    op("whois.example"),
+                    BulkResultData::Lookup(seer_core::LookupResult::Whois {
+                        data: whois(),
+                        rdap_error: None,
+                        rdap_fallback: None,
+                    }),
+                ),
+                ok(
+                    op("free.example"),
+                    BulkResultData::Lookup(seer_core::LookupResult::Available {
+                        data: Box::new(avail()),
+                        rdap_error: "404".to_string(),
+                        whois_error: "no match".to_string(),
+                        whois_data: None,
+                    }),
+                ),
+                failed(op("bad.invalid")),
+            ]
+        }
+
+        #[test]
+        fn lookup_golden() {
+            assert_eq!(
+                csv("lookup", &lookup_results()),
+                concat!(
+                    "domain,success,registrar,created,expires,updated,duration_ms,availability_verdict,error\n",
+                    "rdap.example,true,'=Formula Registrar,1995-08-14,2025-08-13,2024-08-14,42,,\n",
+                    "whois.example,true,\"Example Registrar, LLC\",1995-08-14,2025-08-13,2024-08-14,42,,\n",
+                    "free.example,true,,,,,42,available,\n",
+                    "bad.invalid,false,,,,,7,,\"timed out, giving up\"\n",
+                )
+            );
+        }
+
+        #[test]
+        fn whois_and_rdap_golden() {
+            let whois_results = [
+                ok(
+                    BulkOperation::Whois {
+                        domain: "example.com".into(),
+                    },
+                    BulkResultData::Whois(whois()),
+                ),
+                failed(BulkOperation::Whois {
+                    domain: "bad.invalid".into(),
+                }),
+            ];
+            assert_eq!(
+                csv("whois", &whois_results),
+                concat!(
+                    "domain,success,registrar,created,expires,updated,duration_ms,availability_verdict,error\n",
+                    "example.com,true,\"Example Registrar, LLC\",1995-08-14,2025-08-13,2024-08-14,42,,\n",
+                    "bad.invalid,false,,,,,7,,\"timed out, giving up\"\n",
+                )
+            );
+            let rdap_results = [
+                ok(
+                    BulkOperation::Rdap {
+                        domain: "example.com".into(),
+                    },
+                    BulkResultData::Rdap(Box::new(rdap())),
+                ),
+                failed(BulkOperation::Rdap {
+                    domain: "bad.invalid".into(),
+                }),
+            ];
+            assert_eq!(
+                csv("rdap", &rdap_results),
+                concat!(
+                    "domain,success,registrar,created,expires,updated,duration_ms,availability_verdict,error\n",
+                    "example.com,true,'=Formula Registrar,1995-08-14,2025-08-13,2024-08-14,42,,\n",
+                    "bad.invalid,false,,,,,7,,\"timed out, giving up\"\n",
+                )
+            );
+        }
+
+        #[test]
+        fn dig_golden_including_alias() {
+            let op = |d: &str| BulkOperation::Dns {
+                domain: d.to_string(),
+                record_type: RecordType::MX,
+            };
+            let record = |preference, exchange: &str| seer_core::DnsRecord {
+                name: "example.com".to_string(),
+                record_type: RecordType::MX,
+                ttl: 300,
+                data: RecordData::MX {
+                    preference,
+                    exchange: exchange.to_string(),
+                },
+            };
+            let results = [
+                ok(
+                    op("example.com"),
+                    BulkResultData::Dns(vec![
+                        record(10, "mail.example.com."),
+                        record(20, "backup.example.com."),
+                    ]),
+                ),
+                ok(op("empty.example"), BulkResultData::Dns(vec![])),
+                failed(op("bad.invalid")),
+            ];
+            let expected = concat!(
+                "domain,success,record_type,records,duration_ms,error\n",
+                "example.com,true,MX,10 mail.example.com.; 20 backup.example.com.,42,\n",
+                "empty.example,true,,,42,\n",
+                "bad.invalid,false,,,7,\"timed out, giving up\"\n"
+            );
+            assert_eq!(csv("dig", &results), expected);
+            assert_eq!(csv("dns", &results), expected);
+        }
+
+        #[test]
+        fn avail_golden() {
+            let results = [
+                ok(
+                    BulkOperation::Avail {
+                        domain: "free.example".into(),
+                    },
+                    BulkResultData::Avail(avail()),
+                ),
+                failed(BulkOperation::Avail {
+                    domain: "bad.invalid".into(),
+                }),
+            ];
+            assert_eq!(
+                csv("avail", &results),
+                concat!(
+                    "domain,success,available,confidence,method,details,duration_ms,error\n",
+                    "free.example,true,true,high,rdap,\"No RDAP object, domain unregistered\",42,\n",
+                    "bad.invalid,false,,,,,7,\"timed out, giving up\"\n",
+                )
+            );
+        }
+
+        #[test]
+        fn prop_golden_including_alias() {
+            let op = |d: &str| BulkOperation::Propagation {
+                domain: d.to_string(),
+                record_type: RecordType::A,
+            };
+            let prop = seer_core::dns::PropagationResult {
+                domain: "example.com".to_string(),
+                record_type: RecordType::A,
+                servers_checked: 30,
+                servers_responding: 29,
+                propagation_percentage: 96.666,
+                results: vec![],
+                consensus_values: vec![],
+                inconsistencies: vec![],
+                unreachable_servers: vec![],
+                dnssec_validated: false,
+                nameserver_details: None,
+            };
+            let results = [
+                ok(op("example.com"), BulkResultData::Propagation(prop)),
+                failed(op("bad.invalid")),
+            ];
+            let expected = concat!(
+                "domain,success,propagation_pct,servers_total,servers_responded,duration_ms,error\n",
+                "example.com,true,96.7,30,29,42,\n",
+                "bad.invalid,false,,,,7,\"timed out, giving up\"\n",
+            );
+            assert_eq!(csv("prop", &results), expected);
+            assert_eq!(csv("propagation", &results), expected);
+        }
+
+        #[test]
+        fn info_golden() {
+            let mut info = seer_core::domain_info::DomainInfo::from_sources(
+                "example.com",
+                Some(&rdap()),
+                Some(&whois()),
+            );
+            info.availability_verdict = Some("registered".to_string());
+            info.registrant_phone = Some("+1.5555550100".to_string());
+            // Pin the clock-derived lifecycle fields so the golden is stable.
+            info.days_until_expiration = Some(-405);
+            info.domain_age_days = Some(11362);
+            info.expiry_status = Some(seer_core::domain_info::ExpiryStatus::Expired);
+            let results = [
+                ok(
+                    BulkOperation::Info {
+                        domain: "example.com".into(),
+                    },
+                    BulkResultData::Info(info),
+                ),
+                failed(BulkOperation::Info {
+                    domain: "bad.invalid".into(),
+                }),
+            ];
+            assert_eq!(
+                csv("info", &results),
+                concat!(
+                    "domain,success,source,registrar,registrant,organization,created,expires,updated,nameservers,status,dnssec,registrant_email,registrant_phone,registrant_address,registrant_country,admin_name,admin_organization,admin_email,admin_phone,tech_name,tech_organization,tech_email,tech_phone,whois_server,rdap_url,registrar_abuse_email,registrar_abuse_phone,registrar_iana_id,registrar_url,days_until_expiration,domain_age_days,expiry_status,availability_verdict,duration_ms,error\n",
+                    "example.com,true,both,'=Formula Registrar,,,1995-08-14,2025-08-13,2024-08-14,,,,,'+1.5555550100,,,,,,,,,,,whois.test,,,,,,-405,11362,expired,registered,42,\n",
+                    "bad.invalid,false,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,7,\"timed out, giving up\"\n",
+                )
+            );
+        }
+
+        #[test]
+        fn ssl_posture_confusables_caa_golden() {
+            let ssl = [
+                ok(
+                    BulkOperation::Ssl {
+                        domain: "example.com".into(),
+                    },
+                    BulkResultData::Ssl(super::sample_report()),
+                ),
+                failed(BulkOperation::Ssl {
+                    domain: "bad.invalid".into(),
+                }),
+            ];
+            assert_eq!(
+                csv("ssl", &ssl),
+                concat!(
+                    "domain,success,subject,issuer,valid_from,valid_until,days_remaining,signature_algorithm,key_type,key_bits,chain_length,san_count,sans,protocol_version,is_valid,duration_ms,error\n",
+                    "example.com,true,CN=example.com,\"C=US, O=Test Org, CN=Test Root CA\",2024-01-30,2025-03-01,89,sha256WithRSAEncryption,RSA,2048,2,2,example.com;www.example.com,TLS 1.3,true,42,\n",
+                    "bad.invalid,false,,,,,,,,,,,,,,7,\"timed out, giving up\"\n",
+                )
+            );
+            let posture = [
+                ok(
+                    BulkOperation::Posture {
+                        domain: "example.com".into(),
+                    },
+                    BulkResultData::Posture(super::sample_posture()),
+                ),
+                failed(BulkOperation::Posture {
+                    domain: "bad.invalid".into(),
+                }),
+            ];
+            assert_eq!(
+                csv("posture", &posture),
+                concat!(
+                    "domain,success,spf_verdict,spf_all_qualifier,dmarc_verdict,dmarc_policy,mta_sts_verdict,bimi_verdict,dane_verdict,notes,duration_ms,error\n",
+                    "example.com,true,strict,'-,strict,reject,present,absent,absent,strong posture,42,\n",
+                    "bad.invalid,false,,,,,,,,,7,\"timed out, giving up\"\n",
+                )
+            );
+            let report = seer_core::ConfusableReport {
+                domain: "example.com".to_string(),
+                candidates_generated: 214,
+                candidates_checked: 180,
+                registered: vec![
+                    seer_core::RegisteredLookalike {
+                        domain: "examp1e.com".to_string(),
+                        technique: "homoglyph".to_string(),
+                        registrar: None,
+                        creation_date: None,
+                        nameservers: vec![],
+                    },
+                    seer_core::RegisteredLookalike {
+                        domain: "exampel.com".to_string(),
+                        technique: "transposition".to_string(),
+                        registrar: None,
+                        creation_date: None,
+                        nameservers: vec![],
+                    },
+                ],
+            };
+            let confusables = [
+                ok(
+                    BulkOperation::Confusables {
+                        domain: "example.com".into(),
+                    },
+                    BulkResultData::Confusables(report),
+                ),
+                failed(BulkOperation::Confusables {
+                    domain: "bad.invalid".into(),
+                }),
+            ];
+            assert_eq!(
+                csv("confusables", &confusables),
+                concat!(
+                    "domain,success,candidates_generated,candidates_checked,registered_count,registered,duration_ms,error\n",
+                    "example.com,true,214,180,2,examp1e.com(homoglyph);exampel.com(transposition),42,\n",
+                    "bad.invalid,false,,,,,7,\"timed out, giving up\"\n",
+                )
+            );
+            let caa_record = |tag: &str, value: &str| seer_core::CaaRecord {
+                flags: 0,
+                tag: tag.to_string(),
+                value: value.to_string(),
+            };
+            let policy = seer_core::CaaPolicy {
+                records: vec![
+                    caa_record("issue", "letsencrypt.org"),
+                    caa_record("issuewild", "digicert.com"),
+                    caa_record("iodef", "mailto:security@example.com"),
+                ],
+                effective_domain: Some("example.com".to_string()),
+                has_policy: true,
+                issuer_match: None,
+                iodef: vec!["mailto:security@example.com".to_string()],
+                wildcard_note: Some("wildcards restricted, see issuewild".to_string()),
+                note: "CAA restricts which CAs may issue".to_string(),
+            };
+            let caa = [
+                ok(
+                    BulkOperation::Caa {
+                        domain: "example.com".into(),
+                    },
+                    BulkResultData::Caa(policy),
+                ),
+                failed(BulkOperation::Caa {
+                    domain: "bad.invalid".into(),
+                }),
+            ];
+            assert_eq!(
+                csv("caa", &caa),
+                concat!(
+                    "domain,success,has_policy,effective_domain,issue,issuewild,iodef,wildcard_note,duration_ms,error\n",
+                    "example.com,true,true,example.com,letsencrypt.org,digicert.com,mailto:security@example.com,\"wildcards restricted, see issuewild\",42,\n",
+                    "bad.invalid,false,,,,,,,7,\"timed out, giving up\"\n",
+                )
+            );
+        }
+
+        #[test]
+        fn unknown_op_golden() {
+            let results = [
+                ok(
+                    BulkOperation::Avail {
+                        domain: "free.example".into(),
+                    },
+                    BulkResultData::Avail(avail()),
+                ),
+                failed(BulkOperation::Avail {
+                    domain: "bad.invalid".into(),
+                }),
+            ];
+            assert_eq!(
+                csv("bogus", &results),
+                concat!(
+                    "domain,success,duration_ms,error\n",
+                    "free.example,true,42,\n",
+                    "bad.invalid,false,7,\"timed out, giving up\"\n"
+                )
+            );
+        }
+    }
 }
