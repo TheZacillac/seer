@@ -6,15 +6,25 @@
 //! presents — expired, self-signed and wrong-host chains included, since
 //! reporting on those is the point. Chain trust is therefore never judged
 //! here: [`InspectOnly`] accepts any presented chain and callers draw their
-//! own date/hostname conclusions from the parsed certificates. The handshake
-//! signature is still verified against the leaf's key, so the peer must hold
-//! the key of the certificate it presents.
+//! own date/hostname conclusions from the parsed certificates.
+//!
+//! The handshake signature is not verified either. Proof that the peer holds
+//! the leaf's key would guard nothing: [`inspect`] sends and trusts no
+//! application data, and no field seer reports (subject, issuer, dates,
+//! serial, algorithms, key type and size, SANs; there is no fingerprint)
+//! depends on it, since a MITM could mint a certificate with identical values
+//! under its own key. Checking it did cost coverage: rustls' signature
+//! helpers parse the leaf with webpki's strict parser and verify only keys
+//! aws-lc-rs accepts, so X.509 v1 leaves, leaves with an unknown critical
+//! extension and RSA keys under 2048 bits failed the handshake — certificates
+//! OpenSSL-based inspectors read, and exactly what `ssl` exists to flag. For
+//! the same reason the verifier also offers schemes aws-lc-rs cannot verify
+//! (Ed448, SHA-1), so a server that signs only with those is inspected too.
 //!
 //! rustls runs on the aws-lc-rs provider reqwest and hickory already use,
 //! selected explicitly (never rustls' process-wide default). It speaks only
-//! TLS 1.2/1.3 with AEAD suites and verifies signatures only from keys that
-//! provider supports (e.g. RSA 2048–8192 bits); a server outside that set
-//! cannot be inspected and fails with a descriptive error.
+//! TLS 1.2/1.3 with ECDHE key exchange and AEAD suites; a server with none in
+//! common cannot be inspected and fails with a descriptive error.
 //!
 //! Single attempt, with the caller's timeout bounding the TCP connect and the
 //! handshake separately — like the rest of `ssl`/`status`, a probe must not
@@ -26,11 +36,10 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::crypto::{aws_lc_rs, verify_tls12_signature, verify_tls13_signature, CryptoProvider};
+use rustls::crypto::{aws_lc_rs, CryptoProvider};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{
-    AlertDescription, CertificateError, ClientConfig, DigitallySignedStruct, ProtocolVersion,
-    SignatureScheme,
+    AlertDescription, ClientConfig, DigitallySignedStruct, ProtocolVersion, SignatureScheme,
 };
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
@@ -115,8 +124,19 @@ fn inspect_config() -> std::result::Result<ClientConfig, rustls::Error> {
         .with_no_client_auth())
 }
 
-/// Accepts any presented chain (see the module docs) while still verifying
-/// the handshake signature with the provider's algorithms.
+/// Schemes the provider cannot verify, offered after its own so a server
+/// that signs only with one of them (an Ed448 key, a SHA-1-only TLS 1.2
+/// stack) still completes the handshake — nothing verifies the signature.
+/// SHA-1 goes last, as RFC 8446 §4.2.3 requires of a client offering it.
+const EXTRA_SCHEMES: [SignatureScheme; 3] = [
+    SignatureScheme::ED448,
+    SignatureScheme::RSA_PKCS1_SHA1,
+    SignatureScheme::ECDSA_SHA1_Legacy,
+];
+
+/// Accepts any presented chain and any handshake signature: the peer need
+/// not prove it holds the leaf's key, because nothing seer reports depends
+/// on that proof (see the module docs).
 #[derive(Debug)]
 struct InspectOnly(Arc<CryptoProvider>);
 
@@ -134,39 +154,31 @@ impl ServerCertVerifier for InspectOnly {
 
     fn verify_tls12_signature(
         &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
     ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
-        verify_tls12_signature(
-            message,
-            cert,
-            dss,
-            &self.0.signature_verification_algorithms,
-        )
+        Ok(HandshakeSignatureValid::assertion())
     }
 
     fn verify_tls13_signature(
         &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
     ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
-        verify_tls13_signature(
-            message,
-            cert,
-            dss,
-            &self.0.signature_verification_algorithms,
-        )
+        Ok(HandshakeSignatureValid::assertion())
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        self.0.signature_verification_algorithms.supported_schemes()
+        let mut schemes = self.0.signature_verification_algorithms.supported_schemes();
+        schemes.extend(EXTRA_SCHEMES);
+        schemes
     }
 }
 
-/// Renders a failed handshake, naming the two can't-inspect cases (see the
-/// module docs) instead of leaving a bare alert or verifier code.
+/// Renders a failed handshake, naming the can't-inspect case (see the module
+/// docs) instead of leaving a bare alert code.
 fn describe_failure(e: &std::io::Error) -> String {
     let tls = e
         .get_ref()
@@ -179,12 +191,7 @@ fn describe_failure(e: &std::io::Error) -> String {
                 | AlertDescription::ProtocolVersion
                 | AlertDescription::InsufficientSecurity,
             ),
-        ) => "; the server may offer only protocol versions or cipher suites older than TLS 1.2 with AEAD, which cannot be inspected",
-        Some(rustls::Error::InvalidCertificate(
-            CertificateError::BadSignature
-            | CertificateError::UnsupportedSignatureAlgorithmContext { .. }
-            | CertificateError::UnsupportedSignatureAlgorithmForPublicKeyContext { .. },
-        )) => "; its handshake signature could not be verified with the certificate's key (e.g. an RSA key below 2048 bits), so the certificate cannot be inspected",
+        ) => "; the server may offer only protocol versions older than TLS 1.2 or no ECDHE+AEAD cipher suite, which cannot be inspected",
         _ => "",
     };
     format!("{e}{hint}")
@@ -271,7 +278,7 @@ pub(crate) mod test_support {
     use base64::{engine::general_purpose::STANDARD, Engine};
     use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
     use rustls::server::{ClientHello, ResolvesServerCert};
-    use rustls::sign::CertifiedKey;
+    use rustls::sign::{CertifiedKey, SigningKey};
     use tokio::net::TcpListener;
 
     // Test-only P-256 fixture generated with openssl (valid until 2126).
@@ -285,6 +292,21 @@ pub(crate) mod test_support {
     pub const CN_VICTIM_NO_SAN: &str = "MIIBhzCCAS2gAwIBAgIUeGkzmcc68l5FOH5NOBgS3Ybcg4gwCgYIKoZIzj0EAwIwGTEXMBUGA1UEAwwOdmljdGltLmV4YW1wbGUwHhcNMjYwOTIyMTcwMzA4WhcNMzYwOTE5MTcwMzA4WjAZMRcwFQYDVQQDDA52aWN0aW0uZXhhbXBsZTBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABC6rgHiHBhd3vxpcRHm7VH2YgCybc0Bl4ewS1lMjdtM5+R+pX/STje36olq5IDx9AEJfxtdRMvtiWp9jfb5vdB6jUzBRMB0GA1UdDgQWBBS5JfZqENT0bfsAazBNLiAVb77UdzAfBgNVHSMEGDAWgBS5JfZqENT0bfsAazBNLiAVb77UdzAPBgNVHRMBAf8EBTADAQH/MAoGCCqGSM49BAMCA0gAMEUCIQD5zMnpSHSVr3vSmZM0vh0R345Rg3wc+OgeZwmsDxDJQQIgBNJ0CS0bpChCAQls0oFZUPD6u7iX7uBOD/QRPZ2Ub1k=";
     /// Self-signed `CN=victim.example`, SAN `IP:203.0.113.7` only.
     pub const CN_VICTIM_SAN_IP: &str = "MIIBmTCCAUCgAwIBAgIUNLKX5hfp150WybxH1TK4/buhJpkwCgYIKoZIzj0EAwIwGTEXMBUGA1UEAwwOdmljdGltLmV4YW1wbGUwIBcNMjYwOTIzMDAxNzA0WhgPMjEyNjA4MzAwMDE3MDRaMBkxFzAVBgNVBAMMDnZpY3RpbS5leGFtcGxlMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE34KvRRWyPfrfW30NuPRHBL/o0xYniAlVPTcjaEbsksvvSTPk0uPM2FA9GSrD8YQa+BqxdfCjZ3vMARvA95A9e6NkMGIwHQYDVR0OBBYEFCUaB8nqqyd/yXM9pZGqBITswjqTMB8GA1UdIwQYMBaAFCUaB8nqqyd/yXM9pZGqBITswjqTMA8GA1UdEwEB/wQFMAMBAf8wDwYDVR0RBAgwBocEywBxBzAKBggqhkjOPQQDAgNHADBEAiBpAbhxdLJCQWa6M9mMTKL+iXYo1FMxb0BZYOTngYts5wIgIDTiVbjBH69Uozws5X7IxMhoeF7dNXNaSzo+Fnd2zEM=";
+    // Legacy leaves webpki's strict parser or aws-lc-rs' RSA floor refuse,
+    // which inspection must still read. Self-signed, valid until 2126, made
+    // with the openssl 3 CLI under an empty `-config` (no default v3_ca
+    // extensions): `openssl req -config empty.cnf -x509 -days 36500 -sha256
+    // -outform DER -key KEY -subj /CN=NAME`, plus the flag noted on each.
+    /// X.509 v1 `CN=v1.test` over [`LEAF_KEY_DER`] (`-x509v1`).
+    pub const V1_LEAF: &str = "MIIBITCBxwIUAXExcNzpgF8vnZRRlWqnrQVFWvYwCgYIKoZIzj0EAwIwEjEQMA4GA1UEAwwHdjEudGVzdDAgFw0yNjA5MjMxODMwMjJaGA8yMTI2MDgzMDE4MzAyMlowEjEQMA4GA1UEAwwHdjEudGVzdDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABHt/ClUtiUoUl2/xGBaCYpeadPoXii7yPrRlsIT6Aq8rd1e6m5Eye2wtciB0RH3vfD0Xjv6pOmgzQADadaxUYVIwCgYIKoZIzj0EAwIDSQAwRgIhAKRPzWD6tHCLH96qMOM/3iHAlBPuAfxBiz2L40vaydJuAiEA+Mt7cGKUvJ55midBWHLFiQwuM3Piw4P7sxcf5cVzP7w=";
+    /// `CN=critical.test` over [`LEAF_KEY_DER`] with an unknown critical
+    /// extension (`-addext "1.2.3.4.5.6=critical,ASN1:NULL"`).
+    pub const CRITICAL_EXT_LEAF: &str = "MIIBfzCCASWgAwIBAgIUEnRDU416Zuow/HM5FMgjn4bhvHYwCgYIKoZIzj0EAwIwGDEWMBQGA1UEAwwNY3JpdGljYWwudGVzdDAgFw0yNjA5MjMxODMwMjJaGA8yMTI2MDgzMDE4MzAyMlowGDEWMBQGA1UEAwwNY3JpdGljYWwudGVzdDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABHt/ClUtiUoUl2/xGBaCYpeadPoXii7yPrRlsIT6Aq8rd1e6m5Eye2wtciB0RH3vfD0Xjv6pOmgzQADadaxUYVKjSzBJMBgGA1UdEQQRMA+CDWNyaXRpY2FsLnRlc3QwDgYFKgMEBQYBAf8EAgUAMB0GA1UdDgQWBBScBoa2qgkylsi8p9t6KzPWkAiCSDAKBggqhkjOPQQDAgNIADBFAiEAt01kfNnskWU2YvGtU69DBWaNjYIeaI/HLXr1kaIRMZ4CIChV+FXQ55M4vYTdda2ajGwpW0oLR9R3JaO7ftN9CGUk";
+    /// `CN=weak-rsa.test` (SAN `DNS:weak-rsa.test`) over a discarded
+    /// `genpkey -pkeyopt rsa_keygen_bits:1024` key. aws-lc-rs refuses to load
+    /// an RSA key under 2048 bits, so [`serve_once`] presents it while
+    /// signing with [`LEAF_KEY_DER`].
+    pub const RSA_1024_LEAF: &str = "MIIB9jCCAV+gAwIBAgIUe4sm17VY8+IQGLhAaxAZ1k2XYlQwDQYJKoZIhvcNAQELBQAwGDEWMBQGA1UEAwwNd2Vhay1yc2EudGVzdDAgFw0yNjA5MjMxODMwMjJaGA8yMTI2MDgzMDE4MzAyMlowGDEWMBQGA1UEAwwNd2Vhay1yc2EudGVzdDCBnzANBgkqhkiG9w0BAQEFAAOBjQAwgYkCgYEA1FNOkAr7OJsNuw2ulQPu4/86ZRvsnjqGevNwEFbFwmO2QU1b7HNnp7rUOJgNRRErQ7aDYq1h6FCZrxdwbQ4EBjBBJEt0RJSKSQmEgyNLkaQIInWl2NW1e1iV5BlF+3+7QmxcePmxeKRN0rmh8nZZKz8vAe4I4PvwVqOyUGDC74MCAwEAAaM7MDkwGAYDVR0RBBEwD4INd2Vhay1yc2EudGVzdDAdBgNVHQ4EFgQUNdCgNwcJIOGOZQGz9raAo24UFxAwDQYJKoZIhvcNAQELBQADgYEAVuwKs8kyCCvQ+6VVM77SMtuEbegd/W48fyQJSwNk3ueLlNGgq+tsFI6an3vjmBudugKSeVYBDX5GYUYZQi40dcirlpOh2KcILgm/aSkn9onpWUnGwt4oEUQervyUIcAXryhId334X36fcTzf4rOktnFJlkzWRiTuuBYAy1h7uzU=";
     /// PKCS#8 key of [`LEAF_DER`] — a throwaway that exists only for these tests.
     const LEAF_KEY_DER: &str = "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgHNpHBJ98pEtKA4x23Lzt4GnSrLJuQ2ViB0QAUGcID3GhRANCAAR7fwpVLYlKFJdv8RgWgmKXmnT6F4ou8j60ZbCE+gKvK3dXupuRMntsLXIgdER973w9F47+qTpoM0AA2nWsVGFS";
 
@@ -292,7 +314,7 @@ pub(crate) mod test_support {
         CertificateDer::from(STANDARD.decode(b64).unwrap())
     }
 
-    /// Presents a fixed chain, signing with the leaf key whether or not it
+    /// Presents a fixed chain, signing with a fixed key whether or not it
     /// matches (so tests can also present a certificate the server can't prove).
     #[derive(Debug)]
     struct Presents(Arc<CertifiedKey>);
@@ -303,16 +325,29 @@ pub(crate) mod test_support {
         }
     }
 
-    /// Serves one handshake presenting `chain`, limited to `versions`.
+    /// Serves one handshake presenting `chain`, limited to `versions`,
+    /// signing with [`LEAF_KEY_DER`].
     pub async fn serve_once(
         chain: &[&str],
         versions: &[&'static rustls::SupportedProtocolVersion],
     ) -> SocketAddr {
-        let provider = Arc::new(aws_lc_rs::default_provider());
         let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
             STANDARD.decode(LEAF_KEY_DER).unwrap(),
         ));
-        let key = provider.key_provider.load_private_key(key).unwrap();
+        let key = aws_lc_rs::default_provider()
+            .key_provider
+            .load_private_key(key)
+            .unwrap();
+        serve_once_signing_with(chain, versions, key).await
+    }
+
+    /// [`serve_once`] with the handshake signed by `key`.
+    pub async fn serve_once_signing_with(
+        chain: &[&str],
+        versions: &[&'static rustls::SupportedProtocolVersion],
+        key: Arc<dyn SigningKey>,
+    ) -> SocketAddr {
+        let provider = Arc::new(aws_lc_rs::default_provider());
         let chain = chain.iter().map(|c| cert(c)).collect();
         let config = rustls::ServerConfig::builder_with_provider(provider)
             .with_protocol_versions(versions)
@@ -335,6 +370,8 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::*;
     use super::*;
+    use rustls::sign::{Signer, SigningKey};
+    use rustls::SignatureAlgorithm;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use x509_parser::prelude::FromDer;
@@ -398,16 +435,68 @@ mod tests {
         }
     }
 
+    /// Regression: verifying the handshake signature ran the leaf through
+    /// webpki's strict parser and aws-lc-rs' RSA floor, so these leaves
+    /// failed the handshake instead of being inspected.
     #[tokio::test]
-    async fn handshake_signature_is_still_verified() {
-        // The CA certificate presented with the leaf's key: any chain is
-        // accepted, but the peer must hold the key of the cert it presents.
-        let addr = serve_once(&[CA_DER], rustls::DEFAULT_VERSIONS).await;
-        let err = inspect("chain.test", &[addr], TIMEOUT, SeerError::CertificateError)
+    async fn legacy_leaves_are_inspected() {
+        for (leaf, host) in [
+            // webpki: UnsupportedCertVersion.
+            (V1_LEAF, "v1.test"),
+            // webpki: UnsupportedCriticalExtension.
+            (CRITICAL_EXT_LEAF, "critical.test"),
+            // A real server signs with the 1024-bit key, which aws-lc-rs won't
+            // verify; this one signs with another key, equally unchecked.
+            (RSA_1024_LEAF, "weak-rsa.test"),
+        ] {
+            for version in [&rustls::version::TLS13, &rustls::version::TLS12] {
+                let addr = serve_once(&[leaf], &[version]).await;
+                let presented = inspect(host, &[addr], TIMEOUT, SeerError::SslError)
+                    .await
+                    .unwrap_or_else(|e| panic!("{host} over {:?}: {e}", version.version));
+                assert_eq!(presented.leaf, cert(leaf));
+            }
+        }
+    }
+
+    /// Stands in for an Ed448 key, which aws-lc-rs cannot sign with: it
+    /// accepts only an `ed448` offer and signs with zeros.
+    #[derive(Debug)]
+    struct Ed448Only;
+
+    impl SigningKey for Ed448Only {
+        fn choose_scheme(&self, offered: &[SignatureScheme]) -> Option<Box<dyn Signer>> {
+            offered
+                .contains(&SignatureScheme::ED448)
+                .then(|| Box::new(Ed448Only) as Box<dyn Signer>)
+        }
+
+        fn algorithm(&self) -> SignatureAlgorithm {
+            SignatureAlgorithm::ED448
+        }
+    }
+
+    impl Signer for Ed448Only {
+        fn sign(&self, _message: &[u8]) -> std::result::Result<Vec<u8>, rustls::Error> {
+            Ok(vec![0; 114])
+        }
+
+        fn scheme(&self) -> SignatureScheme {
+            SignatureScheme::ED448
+        }
+    }
+
+    #[tokio::test]
+    async fn a_server_signing_only_with_an_unverifiable_scheme_is_inspected() {
+        // Without `ed448` in the offer the server finds no scheme to sign
+        // with and aborts the handshake.
+        let addr =
+            serve_once_signing_with(&[LEAF_DER], &[&rustls::version::TLS13], Arc::new(Ed448Only))
+                .await;
+        let presented = inspect("chain.test", &[addr], TIMEOUT, SeerError::SslError)
             .await
-            .unwrap_err();
-        assert!(matches!(err, SeerError::CertificateError(_)), "got {err:?}");
-        assert!(err.to_string().contains("signature could not be verified"));
+            .unwrap();
+        assert_eq!(presented.leaf, cert(LEAF_DER));
     }
 
     #[tokio::test]

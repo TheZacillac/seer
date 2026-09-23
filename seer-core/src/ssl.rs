@@ -544,6 +544,37 @@ mod tests {
         assert!(report.hostname_verified);
     }
 
+    /// Regression: an RSA-1024 leaf failed the inspection handshake, so the
+    /// weak-key warning could never fire for a live certificate.
+    #[tokio::test]
+    async fn an_rsa_1024_leaf_is_inspected_and_flagged() {
+        use crate::tls::test_support::{serve_once, RSA_1024_LEAF};
+
+        let addr = serve_once(&[RSA_1024_LEAF], rustls::DEFAULT_VERSIONS).await;
+        let presented = crate::tls::inspect(
+            "weak-rsa.test",
+            &[addr],
+            Duration::from_secs(5),
+            SeerError::SslError,
+        )
+        .await
+        .unwrap();
+        let report =
+            build_report("weak-rsa.test".to_string(), presented, CaaPolicy::empty()).unwrap();
+
+        assert_eq!(report.chain[0].key_type.as_deref(), Some("RSA"));
+        assert_eq!(report.chain[0].key_bits, Some(1024));
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.severity == CertWarningSeverity::Critical
+                    && w.message == "RSA key size 1024 is below the 2048-bit minimum"),
+            "got {:?}",
+            report.warnings
+        );
+    }
+
     #[test]
     fn test_ssl_report_serialization() {
         let report = SslReport {
