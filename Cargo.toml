@@ -110,9 +110,11 @@ insta = { version = "1", features = ["filters"] }
 # Directory paths
 dirs = "7"
 
-# TLS/SSL certificate handling
-native-tls = "0.2"
-tokio-native-tls = "0.3"
+# TLS/SSL certificate handling. rustls/tokio-rustls are already in the tree via
+# reqwest and hickory; seer-core's inspection handshake (tls.rs) uses them
+# directly on the same aws-lc-rs provider.
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs", "tls12"] }
 x509-parser = "0.18"
 
 [profile.release]

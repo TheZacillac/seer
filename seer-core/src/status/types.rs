@@ -57,9 +57,9 @@ pub struct CertificateInfo {
     /// Whether the certificate's SAN/CN matches the queried hostname.
     ///
     /// This is an additive signal independent of `is_valid` (which reflects
-    /// only date-range validity). Because cert inspection uses
-    /// `danger_accept_invalid_certs(true)` to see certs on mildly-broken
-    /// sites, hostname verification is performed manually after extraction.
+    /// only date-range validity). Because cert inspection accepts any
+    /// presented chain to see certs on mildly-broken sites, hostname
+    /// verification is performed manually after extraction.
     #[serde(default)]
     pub hostname_verified: bool,
 }

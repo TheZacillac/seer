@@ -9,10 +9,8 @@
 use std::time::Duration;
 
 use chrono::Utc;
-use native_tls::TlsConnector;
 use regex::Regex;
 use std::sync::LazyLock;
-use tokio::net::TcpStream;
 use tracing::{debug, instrument};
 
 use super::types::{CertificateInfo, DnsResolution, DomainExpiration, StatusResponse};
@@ -163,55 +161,31 @@ impl StatusClient {
         http_info(&fetcher, &format!("https://{domain}/")).await
     }
 
-    /// Fetches SSL certificate information using native-tls.
+    /// Fetches the leaf certificate's details via the inspection handshake
+    /// ([`crate::tls::inspect`]).
     ///
     /// # Security Note
-    /// This connection uses `danger_accept_invalid_certs(true)` to inspect certificates
-    /// even when invalid. Data retrieved (issuer, subject, dates) comes from an
-    /// unauthenticated TLS connection and may have been tampered with by a MITM.
+    /// The handshake accepts any presented chain so invalid certificates can
+    /// be inspected. Chain trust is not verified, so the data retrieved
+    /// (issuer, subject, dates) may come from a MITM's own certificate.
     async fn fetch_certificate_info(&self, domain: &str) -> Result<CertificateInfo> {
         // SSRF protection: resolve and reject reserved IPs before connecting.
         // Use crate::net::resolve_public_host so we get the Hickory fallback
         // when the OS resolver is broken (corporate Macs, Tailscale split-DNS,
-        // etc.) — the same path every other outbound-connect uses.
+        // etc.) — the same path every other outbound-connect uses. The
+        // handshake connects to exactly these addresses (no DNS rebinding).
         let socket_addrs = crate::net::resolve_public_host(domain, 443)
             .await
             .map_err(|e| SeerError::CertificateError(e.to_string()))?;
 
-        let connector = TlsConnector::builder()
-            .danger_accept_invalid_certs(true) // We want to see the cert even if invalid
-            .build()
-            .map_err(|e| SeerError::CertificateError(e.to_string()))?;
-
-        let connector = tokio_native_tls::TlsConnector::from(connector);
-
-        // Connect directly to the validated socket address to prevent DNS
-        // rebinding (TOCTOU) between validation and connect.
-        let stream =
-            tokio::time::timeout(self.timeout, TcpStream::connect(socket_addrs.as_slice()))
-                .await
-                .map_err(|_| SeerError::Timeout(format!("connection to {} timed out", domain)))?
-                .map_err(|e| SeerError::CertificateError(e.to_string()))?;
-
-        // Use the domain as SNI hostname for the TLS handshake.
-        let tls_stream = tokio::time::timeout(self.timeout, connector.connect(domain, stream))
-            .await
-            .map_err(|_| SeerError::Timeout(format!("TLS handshake with {} timed out", domain)))?
-            .map_err(|e| SeerError::CertificateError(e.to_string()))?;
-
-        // Get the peer certificate
-        let cert = tls_stream
-            .get_ref()
-            .peer_certificate()
-            .map_err(|e| SeerError::CertificateError(e.to_string()))?
-            .ok_or_else(|| SeerError::CertificateError("no certificate found".to_string()))?;
-
-        // Parse certificate info
-        let der = cert
-            .to_der()
-            .map_err(|e| SeerError::CertificateError(e.to_string()))?;
-
-        parse_certificate_der(&der, domain)
+        let presented = crate::tls::inspect(
+            domain,
+            &socket_addrs,
+            self.timeout,
+            SeerError::CertificateError,
+        )
+        .await?;
+        parse_certificate_der(&presented.leaf, domain)
     }
 
     /// Fetches domain expiration info using WHOIS/RDAP; `None` when the lookup
@@ -377,10 +351,10 @@ fn parse_certificate_der(der: &[u8], domain: &str) -> Result<CertificateInfo> {
     let days_until_expiry = crate::dates::days_until(valid_until, now);
     let is_valid = now >= valid_from && now <= valid_until;
 
-    // Hostname verification is performed manually because the TLS connector
-    // was configured with danger_accept_invalid_certs(true) to allow cert
-    // inspection on mildly-broken sites. Without this check any cert — even
-    // one issued for an unrelated domain — would be accepted.
+    // Hostname verification is performed manually because the inspection
+    // handshake accepts any presented chain to allow cert inspection on
+    // mildly-broken sites. Without this check any cert — even one issued for
+    // an unrelated domain — would be accepted.
     let hostname_verified = cert_matches_hostname(&cert, domain);
 
     Ok(CertificateInfo {

@@ -12,8 +12,6 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use tokio::net::TcpStream;
-use tokio_native_tls::TlsConnector;
 use tracing::{debug, instrument};
 use x509_parser::oid_registry::Oid;
 use x509_parser::prelude::*;
@@ -132,8 +130,8 @@ pub struct SslReport {
     ///
     /// This reflects ONLY the date-range check (`notBefore <= now <=
     /// notAfter`) of the leaf certificate. It does NOT verify the certificate
-    /// chain's trust (this checker uses `danger_accept_invalid_certs(true)` to
-    /// inspect broken/self-signed certs) nor that the certificate matches the
+    /// chain's trust (the inspection handshake accepts any presented chain so
+    /// broken/self-signed certs can be inspected) nor that the certificate matches the
     /// requested hostname — see [`SslReport::hostname_verified`]. A
     /// date-valid cert may still be self-signed, issued by an untrusted CA, or
     /// presented for the wrong host.
@@ -297,48 +295,20 @@ impl SslChecker {
             ))
         })?;
 
-        // Build TLS connector - accept invalid certs so we can inspect them
-        let connector = native_tls::TlsConnector::builder()
-            .danger_accept_invalid_certs(true)
-            .build()
-            .map_err(|e| SeerError::SslError(format!("Failed to create TLS connector: {}", e)))?;
-        let connector = TlsConnector::from(connector);
-
-        // TCP connect with timeout — connect to pre-resolved address to prevent DNS rebinding
-        let stream =
-            tokio::time::timeout(self.timeout, TcpStream::connect(socket_addrs.as_slice()))
-                .await
-                .map_err(|_| SeerError::Timeout("SSL connection timed out".to_string()))?
-                .map_err(|e| {
-                    SeerError::SslError(format!("Failed to connect to {}:443: {}", domain, e))
-                })?;
-
-        // TLS handshake with timeout
-        let tls_stream = tokio::time::timeout(self.timeout, connector.connect(&domain, stream))
-            .await
-            .map_err(|_| SeerError::Timeout("TLS handshake timed out".to_string()))?
-            .map_err(|e| SeerError::SslError(format!("TLS handshake failed: {}", e)))?;
-
-        // Get the peer certificate (leaf)
-        let cert = tls_stream
-            .get_ref()
-            .peer_certificate()
-            .map_err(|e| SeerError::SslError(format!("Failed to get certificate: {}", e)))?
-            .ok_or_else(|| SeerError::SslError("No certificate presented".to_string()))?;
-
-        let der = cert
-            .to_der()
-            .map_err(|e| SeerError::SslError(format!("Failed to encode certificate: {}", e)))?;
+        // Handshake against the pre-resolved (SSRF-vetted) addresses so DNS
+        // cannot rebind between validation and connect. Any presented chain
+        // is accepted so broken certificates can still be inspected.
+        let presented =
+            crate::tls::inspect(&domain, &socket_addrs, self.timeout, SeerError::SslError).await?;
 
         // Parse leaf certificate with x509-parser
-        let (_, x509) = X509Certificate::from_der(&der)
+        let (_, x509) = X509Certificate::from_der(&presented.leaf)
             .map_err(|e| SeerError::SslError(format!("Failed to parse certificate: {}", e)))?;
 
         // Extract SANs from the leaf certificate
         let san_names = extract_sans(&x509);
 
-        // Build the certificate chain
-        // native-tls only exposes the leaf cert directly; we parse what we have
+        // Build the certificate chain (leaf only, as native-tls exposed)
         let leaf_detail = parse_cert_detail(&x509)?;
 
         let now = Utc::now();

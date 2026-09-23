@@ -44,6 +44,7 @@ pub mod status;
 pub mod subdomains;
 pub mod takeover;
 pub mod tld;
+mod tls;
 pub mod validation;
 pub mod watchlist;
 pub mod webhook;
