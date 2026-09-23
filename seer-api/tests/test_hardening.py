@@ -10,10 +10,11 @@ from fastapi.testclient import TestClient
 
 import seer
 
-# Nameserver specs are parsed by seer-core through `seer.nameserver_target`;
-# the conftest stub (no compiled binding) cannot supply that parser.
+# Nameserver specs are parsed by seer-core through `seer.nameserver_target`,
+# which the conftest stub cannot supply. Skip only for that stub: a compiled
+# binding without the function is stale, and these SSRF tests must fail on it.
 needs_ns_parser = pytest.mark.skipif(
-    not hasattr(seer, "nameserver_target"),
+    getattr(seer, "_IS_STUB", False),
     reason="nameserver specs are parsed by the compiled seer binding",
 )
 

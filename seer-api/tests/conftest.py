@@ -25,6 +25,8 @@ def _install_seer_stub() -> None:
     except ImportError:
         pass
     stub = types.ModuleType("seer")
+    # Lets a test skip only here, never for a compiled binding that is stale.
+    stub._IS_STUB = True
 
     def _unused(*_args, **_kwargs):  # pragma: no cover - never hit in unit tests
         raise RuntimeError("seer stub should not be called in these tests")
@@ -34,7 +36,7 @@ def _install_seer_stub() -> None:
     # autouse `_real_seer_validator` fixture keys off the attribute being
     # absent to install a Python fallback validator for SSRF tests. Nor is
     # `nameserver_target` (seer-core's spec parser): tests that need it skip
-    # without the compiled binding.
+    # on this stub (`_IS_STUB`).
     for name in (
         "lookup",
         "whois",
