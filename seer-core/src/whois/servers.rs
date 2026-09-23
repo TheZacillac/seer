@@ -147,7 +147,7 @@ const NIC_TLDS: &str = "
 ";
 
 /// Every other TLD, grouped by the WHOIS host that serves it:
-/// `(host, whitespace-separated TLDs)`. Sorted by host.
+/// `(host, whitespace-separated TLDs)`. Sorted by host, each row's TLDs sorted.
 const HOSTED_TLDS: &[(&str, &str)] = &[
     ("ccwhois.verisign-grs.com", "cc"),
     ("kero.yachay.pe", "pe"),
@@ -302,6 +302,7 @@ const HOSTED_TLDS: &[(&str, &str)] = &[
 
 /// Unicode U-labels of the IDN TLDs above. Each is keyed under the same
 /// server as its punycode A-label, so the catalog lists both forms.
+/// Whitespace-separated, sorted.
 const IDN_ALIASES: &str = "
     vermögensberater vermögensberatung ευ бг бел дети ею католик ком мкд мон москва онлайн орг рф
     сайт срб укр қаз հայ ישראל קום ابوظبي الجزائر السعودية العليان امارات ایران بارت بازار بيتك
@@ -657,6 +658,33 @@ mod all_tlds_tests {
                 .sum::<usize>()
             + IDN_ALIASES.split_ascii_whitespace().count();
         assert_eq!(listed, WHOIS_SERVERS.len());
+    }
+
+    /// The tables are hand-edited word paragraphs, where one misplaced entry
+    /// is easy to miss in review: every list, including each host row's
+    /// TLDs, stays strictly sorted.
+    #[test]
+    fn server_tables_are_sorted() {
+        fn assert_sorted<'a>(list: &str, items: impl IntoIterator<Item = &'a str>) {
+            let items: Vec<&str> = items.into_iter().collect();
+            for pair in items.windows(2) {
+                assert!(
+                    pair[0] < pair[1],
+                    "{list}: {:?} is listed after {:?}",
+                    pair[1],
+                    pair[0]
+                );
+            }
+        }
+        assert_sorted("NIC_TLDS", NIC_TLDS.split_ascii_whitespace());
+        assert_sorted(
+            "HOSTED_TLDS hosts",
+            HOSTED_TLDS.iter().map(|(host, _)| *host),
+        );
+        for (host, tlds) in HOSTED_TLDS {
+            assert_sorted(host, tlds.split_ascii_whitespace());
+        }
+        assert_sorted("IDN_ALIASES", IDN_ALIASES.split_ascii_whitespace());
     }
 
     /// `get_whois_server` accepts either form of an IDN TLD (and any casing);
