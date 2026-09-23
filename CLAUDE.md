@@ -239,7 +239,14 @@ seer-py/
 seer-api/
 ├── pyproject.toml          # Entry points: seer-api, seer-mcp
 └── seer_api/
-    ├── main.py             # FastAPI app, CORS config
+    ├── main.py             # FastAPI app: bearer-token auth, middleware stack, lifespan startup checks
+    ├── _env.py             # strict integer env-var parsing
+    ├── _run.py             # run_seer: bounded dispatch pool + SEER_REQUEST_TIMEOUT deadline
+    ├── errors.py           # http_error: exception → sanitized HTTP status mapping
+    ├── limiting.py         # rate limiter + proxy-aware client-IP keying
+    ├── middleware.py       # body-size cap, request logging + /metrics counters
+    ├── ssrf.py             # SSRF guard for user-supplied connect targets (status hosts, nameservers)
+    ├── streaming.py        # SSE bulk-stream plumbing
     ├── routers/            # API endpoints by feature
     │   ├── lookup.py       # Smart lookup (single + bulk)
     │   ├── whois.py        # WHOIS lookups

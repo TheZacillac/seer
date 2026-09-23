@@ -44,17 +44,20 @@ seer-api
 
 Server runs on `http://127.0.0.1:8000` (loopback-only by default).
 
-### Breaking change: deployment defaults
+### Deployment defaults
 
-- **Default bind is `127.0.0.1`** (was `0.0.0.0`). To bind publicly,
-  set both `SEER_HOST=0.0.0.0` **and** `SEER_API_KEY=<token>`. The
-  server refuses to start on a non-loopback host without an auth key.
-- **API documentation endpoints are off by default.** Set
-  `SEER_DOCS_ENABLED=true` to re-enable `/docs`, `/redoc`, and
-  `/openapi.json`.
-- **Multi-worker deployments require a shared rate-limit store.**
-  With `WEB_CONCURRENCY>1`, set `SEER_RATE_LIMIT_STORAGE=redis://...`
-  or the server will refuse to start.
+- **Loopback-only bind.** The default host is `127.0.0.1`. To bind
+  publicly, set both `SEER_HOST=0.0.0.0` **and** `SEER_API_KEY=<token>`;
+  the server refuses to start on a non-loopback host without an auth key.
+- **API documentation endpoints are off.** Set `SEER_DOCS_ENABLED=true`
+  to serve `/docs`, `/redoc`, and `/openapi.json`.
+- **Multi-worker deployments need a shared rate-limit store.** With
+  `WEB_CONCURRENCY>1` (or `UVICORN_WORKERS>1`), set
+  `SEER_RATE_LIMIT_STORAGE=redis://...`; on the default in-memory store
+  each worker would keep its own budget, so the server refuses to start.
+
+These became the defaults on 2026-04-20 (previously `0.0.0.0` with docs
+on); see the CHANGELOG.
 
 ### API Documentation
 
@@ -266,44 +269,9 @@ uvicorn seer_api.main:app --reload --host 127.0.0.1 --port 8000
 python -m seer_api.mcp.server
 ```
 
-### Project Structure
-
-```
-seer-api/
-├── pyproject.toml          # Package configuration
-└── seer_api/
-    ├── __init__.py         # Package init
-    ├── main.py             # FastAPI app, middleware, lifespan checks
-    ├── _env.py             # strict integer env-var parsing
-    ├── _run.py             # bounded dispatch pool + request deadlines
-    ├── errors.py           # error → HTTP status mapping
-    ├── limiting.py         # slowapi rate limiting
-    ├── middleware.py       # auth, body-size cap, request logging
-    ├── ssrf.py             # API-layer SSRF guards
-    ├── streaming.py        # SSE bulk-stream plumbing
-    ├── routers/            # API endpoints
-    │   ├── __init__.py
-    │   ├── lookup.py
-    │   ├── whois.py
-    │   ├── rdap.py
-    │   ├── dns.py
-    │   ├── propagation.py
-    │   ├── status.py
-    │   ├── ssl.py
-    │   ├── intel.py        # availability/info/subdomains/dnssec/delegation/diff/caa/posture/headers/takeover/confusables
-    │   └── tld.py
-    └── mcp/                # MCP server (stdio + Streamable HTTP)
-        ├── __init__.py
-        └── server.py
-```
-
-## Dependencies
-
-- **seer** - Python bindings for seer-core
-- **fastapi** - Web framework
-- **uvicorn** - ASGI server
-- **pydantic** - Data validation
-- **mcp** - Model Context Protocol
+The package's module layout (routers, MCP server, dispatch pool, rate
+limiting, SSRF guards) is mapped in the repository's
+[CLAUDE.md](https://github.com/TheZacillac/seer/blob/main/CLAUDE.md#seer-api-fastapi--mcp).
 
 ## Bulk Operation Limits
 
