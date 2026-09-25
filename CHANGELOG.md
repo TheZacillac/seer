@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.49.1] - 2026-09-25
+
+A patch release fixing WHOIS status parsing for `.ru`, `.su` and `.рф`.
+
 ### Fixed
 - **WHOIS: every comma-separated status is kept.** TCI's `.ru`/`.su`/`.рф`
   responses list all states on one line (`state: REGISTERED, DELEGATED,
@@ -1376,7 +1380,8 @@ Two notable breaking changes landed in this period:
   The human and markdown formatters group both fields by record type and
   omit the per-type subheader when only one type is present.
 
-[Unreleased]: https://github.com/TheZacillac/seer/compare/v0.49.0...HEAD
+[Unreleased]: https://github.com/TheZacillac/seer/compare/v0.49.1...HEAD
+[0.49.1]: https://github.com/TheZacillac/seer/compare/v0.49.0...v0.49.1
 [0.49.0]: https://github.com/TheZacillac/seer/compare/v0.48.0...v0.49.0
 [0.48.0]: https://github.com/TheZacillac/seer/compare/v0.47.0...v0.48.0
 [0.47.0]: https://github.com/TheZacillac/seer/compare/v0.46.0...v0.47.0
