@@ -950,10 +950,15 @@ fn extract_status_top_level(raw: &str) -> Vec<String> {
             None
         };
 
+        // A value may list several comma-separated statuses (TCI's .ru/.su/.рф
+        // `state: REGISTERED, DELEGATED, VERIFIED`); keep each one. Within an
+        // entry only the first word is the status — ICANN-style lines append
+        // an explanatory URL (`clientHold https://icann.org/epp#clientHold`).
         if let Some(rest) = value_opt {
-            let raw_val = rest.trim();
-            if let Some(first) = raw_val.split_whitespace().next() {
-                push_bounded(&mut statuses, first.to_string(), MAX_STATUSES);
+            for entry in rest.split(',') {
+                if let Some(first) = entry.split_whitespace().next() {
+                    push_bounded(&mut statuses, first.to_string(), MAX_STATUSES);
+                }
             }
         }
     }
@@ -992,6 +997,23 @@ mod tests {
             extract_field_with_patterns(raw2, &ORGANIZATION_PATTERNS).as_deref(),
             Some("Real Registrant LLC")
         );
+    }
+
+    #[test]
+    fn comma_separated_state_keeps_every_status() {
+        // TCI (.ru/.su/.рф) lists all states on one line; only the first was
+        // kept before, with its trailing comma ("REGISTERED,").
+        let raw = "domain:        MICROSOFT.RU\n\
+                   state:         REGISTERED, DELEGATED, VERIFIED\n\
+                   registrar:     RU-CENTER-RU\n";
+        assert_eq!(
+            extract_status_top_level(raw),
+            vec!["REGISTERED", "DELEGATED", "VERIFIED"]
+        );
+
+        // ICANN-style trailing URL is still dropped.
+        let raw = "Domain Status: clientHold https://icann.org/epp#clientHold\n";
+        assert_eq!(extract_status_top_level(raw), vec!["clientHold"]);
     }
 
     // --- empty fields must not capture the following line ---------------
