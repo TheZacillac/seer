@@ -11,6 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **WHOIS: every comma-separated status is kept.** TCI's `.ru`/`.su`/`.рф`
+  responses list all states on one line (`state: REGISTERED, DELEGATED,
+  VERIFIED`); only the first was reported, with a trailing comma
+  (`REGISTERED,`). Each status is now its own entry.
+
 ## [0.49.0] - 2026-09-23
 
 A footprint and maintainability release. The `seer` binary and the Python
