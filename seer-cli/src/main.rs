@@ -1,4 +1,5 @@
 mod clipboard;
+mod dig_args;
 mod display;
 mod ops;
 mod payload;
@@ -126,6 +127,33 @@ Example Output (caa operation):
   example.com,true,true,example.com,letsencrypt.org;digicert.com,,mailto:security@example.com,,133,
 "#;
 
+/// `seer dig`'s usage lines: the dig-style form, shared with the REPL, and
+/// the `-x` reverse form.
+fn dig_usage() -> String {
+    format!(
+        "seer dig [OPTIONS] {}\n       seer dig [OPTIONS] -x <IP>",
+        dig_args::USAGE
+    )
+}
+
+/// `seer dig --help` epilogue: [`DIG_EXAMPLES`], then the record types.
+fn dig_long_help() -> String {
+    format!("{}\nRecord types: {}\n", DIG_EXAMPLES, *VALID_RECORD_TYPES)
+}
+
+const DIG_EXAMPLES: &str = r#"Examples:
+  seer dig example.com                    # A records (the default type)
+  seer dig example.com A AAAA MX          # several types, queried concurrently
+  seer dig @1.1.1.1 example.com MX        # ask one nameserver (also -s 1.1.1.1)
+  seer dig example.com HTTPS +short       # values only, one per line
+  seer dig -x 8.8.8.8                     # reverse lookup (PTR)
+  seer dig www.example.com +trace         # walk down from the root servers
+  seer dig _sip._tcp.example.com SRV      # SRV names take _service._proto.name
+  seer dig example.com '*'                # ANY: the common types, fanned out
+  seer --format json dig example.com      # the result object (an array for several types)
+  seer -q --fields status,answers.name dig example.com
+"#;
+
 #[derive(Parser)]
 #[command(name = "seer")]
 #[command(about = "Domain name helper - WHOIS, RDAP, DIG, and propagation checking")]
@@ -145,8 +173,10 @@ struct Cli {
 
     /// Comma-separated list of fields to extract (use with --quiet). Dotted
     /// paths reach nested values (certificate.issuer), numeric segments index
-    /// arrays (0.name), and a name applied to a list extracts it from every
-    /// element (e.g. `-q --fields name dig example.com`)
+    /// arrays (answers.0.name), and a name applied to a list extracts it from
+    /// every element (e.g. `-q --fields status,answers.name dig example.com`).
+    /// On a list result (`dig` with several types) the fields print element
+    /// by element, unless a path starts with an index (1.status)
     #[arg(long, value_delimiter = ',')]
     fields: Option<Vec<String>>,
 }
@@ -174,17 +204,45 @@ enum Commands {
         query: String,
     },
     /// Query DNS records (like dig)
+    ///
+    /// Takes dig-style arguments in any order: the name, one or more record
+    /// types, `@server`, and `+short` / `+trace`. Reports the response
+    /// status (NOERROR, NXDOMAIN, SERVFAIL, …) and header flags, the CNAME
+    /// chain with every record under its real owner name, and whether a
+    /// wildcard answers for the name's siblings. NXDOMAIN (the name does not
+    /// exist) is told apart from NODATA (it exists, but has no records of
+    /// the type).
+    ///
+    /// Not check-style: like dig, it exits 0 whenever a server answered —
+    /// NXDOMAIN, NODATA and SERVFAIL are results — and 1 on invalid input,
+    /// a timeout or other transport failure, or when any of several types
+    /// failed (the others are still printed).
+    #[command(override_usage = dig_usage(), after_long_help = dig_long_help())]
     Dig {
-        /// Domain name to query
-        domain: String,
-        /// Record type (A, AAAA, MX, TXT, NS, SOA, etc.)
-        #[arg(default_value = "A")]
-        record_type: String,
-        /// Nameserver to query: IP/host[:port] (UDP), tls://host[:port] (DoT),
-        /// or https://host[/path] (DoH) — e.g. 8.8.8.8, tls://1.1.1.1,
-        /// https://cloudflare-dns.com/dns-query
+        /// The name to query, record types, `@server`, `+short` and
+        /// `+trace`, in any order (e.g. `@1.1.1.1 example.com A AAAA
+        /// +short`). A token without a dot that names a type is a type (`*`
+        /// is ANY); the default is A
+        #[arg(value_name = "ARGS")]
+        args: Vec<String>,
+        /// Nameserver to query (same as `@server`): IP/host[:port] (UDP),
+        /// tls://host[:port] (DoT), or https://host[/path] (DoH) — e.g.
+        /// 8.8.8.8, tls://1.1.1.1, https://cloudflare-dns.com/dns-query
         #[arg(short, long)]
         server: Option<String>,
+        /// Print only the record values, one per line (same as `+short`).
+        /// A plain-text mode: it ignores --format and cannot be combined
+        /// with -q/--fields
+        #[arg(long)]
+        short: bool,
+        /// Walk the delegation from the root servers down to the
+        /// authoritative server, one hop per zone (same as `+trace`). Takes
+        /// one record type and no nameserver
+        #[arg(long)]
+        trace: bool,
+        /// Reverse lookup: the PTR record of this IP address (like dig -x)
+        #[arg(short = 'x', long, value_name = "IP")]
+        reverse: Option<String>,
     },
     /// Check DNS propagation across global servers
     Prop {
@@ -560,7 +618,25 @@ fn resolve_field_path<'a>(
 /// Renders the requested fields of a JSON value as output lines, one per
 /// resolved value (see [`resolve_field_path`] for the path syntax). Strings
 /// print bare, a missing field prints an empty line, anything else as JSON.
+///
+/// On a list root (a multi-type `dig`), the fields are extracted element by
+/// element, so each element's values stay together — unless a path starts
+/// with an index (`1.status`), which picks elements itself.
 fn extract_field_lines(value: &serde_json::Value, fields: &[String]) -> Vec<String> {
+    if let serde_json::Value::Array(items) = value {
+        let indexes_the_list = fields.iter().any(|field| {
+            field
+                .split('.')
+                .next()
+                .is_some_and(|first| first.parse::<usize>().is_ok())
+        });
+        if !indexes_the_list {
+            return items
+                .iter()
+                .flat_map(|item| extract_field_lines(item, fields))
+                .collect();
+        }
+    }
     let mut lines = Vec::new();
     for field in fields {
         let parts: Vec<&str> = field.split('.').collect();
@@ -669,14 +745,22 @@ async fn execute_command(
         Commands::Whois { domain } => Query::Whois(domain),
         Commands::Rdap { query } => Query::Rdap(query),
         Commands::Dig {
-            domain,
-            record_type: rt,
+            args,
             server,
-        } => Query::Dig {
-            domain,
-            record_type: parse_type(&rt),
-            server: server.map(|s| s.trim_start_matches('@').to_string()),
-        },
+            short,
+            trace,
+            reverse,
+        } => {
+            let flags = dig_args::DigFlags {
+                server,
+                short,
+                trace,
+                reverse,
+            };
+            // Usage errors go through `emit_error`, before any network I/O.
+            dig_query(&args, flags, quiet, fields.is_some())
+                .unwrap_or_else(|e| emit_error(output_format, &e))
+        }
         Commands::Prop {
             domain,
             record_type: rt,
@@ -1089,14 +1173,14 @@ async fn execute_command(
     let clients = query::Clients::from_config(config);
     match query::run(query, &clients, config, spin).await {
         Ok(outcome) => {
-            outcome.present(|payload| {
+            outcome.present(output_format, |payload| {
                 if quiet {
                     handle_quiet_output(payload, &fields);
                 } else {
                     println!("{}", payload::serialize(payload, output_format));
                 }
             });
-            let code = exit_code(&outcome.payload);
+            let code = outcome_exit_code(&outcome);
             if code != 0 {
                 std::process::exit(code);
             }
@@ -1122,7 +1206,45 @@ fn cli_spinner(query: &Query) -> bool {
             | Query::Diff(..)
             | Query::Doctor
             | Query::Delegation(_)
+            | Query::Trace { .. }
     )
+}
+
+/// `seer dig`'s query: its dig-style arguments merged with the flags clap
+/// parsed (see [`dig_args`]), and `--short` checked against `-q`/`--fields`.
+fn dig_query(
+    args: &[String],
+    flags: dig_args::DigFlags,
+    quiet: bool,
+    fields: bool,
+) -> Result<Query, String> {
+    let dig = dig_args::parse(args, flags)?;
+    check_short_output(dig.short, quiet, fields)?;
+    Ok(dig.into_query())
+}
+
+/// `--short` is a plain-text output mode of its own (bare values, whatever
+/// `--format` says), while `-q`/`--fields` select from the JSON result — so
+/// asking for both is a usage error rather than one silently winning.
+fn check_short_output(short: bool, quiet: bool, fields: bool) -> Result<(), String> {
+    if short && (quiet || fields) {
+        return Err(
+            "+short/--short prints bare values, so it cannot be combined with -q/--fields \
+             (which select from the JSON result)"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// The process exit code for a finished query: 1 when part of it failed
+/// (a type of a multi-type `dig`), otherwise [`exit_code`] of its result.
+fn outcome_exit_code(outcome: &query::Outcome) -> i32 {
+    if outcome.failed() {
+        1
+    } else {
+        exit_code(&outcome.payload)
+    }
 }
 
 /// Process exit code for a query's result: check-style commands exit 1 when
@@ -1156,6 +1278,10 @@ fn exit_code(payload: &Payload) -> i32 {
         // Lame servers already veto in_sync; the explicit check keeps the
         // contract if that coupling ever changes.
         Payload::Delegation(d) => !d.in_sync || !d.lame.is_empty(),
+        // Not check-style, like dig: an answered query is a result whatever
+        // its status (NXDOMAIN, SERVFAIL), and a trace reports where it
+        // stopped. Failed queries are errors, which exit 1 on their own.
+        Payload::Dig(_) | Payload::DigMany(_) | Payload::Trace(_) => false,
         _ => false,
     };
     i32::from(failed)
@@ -1260,6 +1386,151 @@ mod compare_cli_tests {
             panic!("expected Compare command");
         };
         assert_eq!(record_type, "MX");
+    }
+}
+
+#[cfg(test)]
+mod dig_cli_tests {
+    //! `seer dig` argv → [`Query`]: clap's flags merged with the dig-style
+    //! tokens by the parser the REPL shares (tested in full in `dig_args`).
+    use super::{dig_query, Cli, Commands, Query};
+    use clap::Parser;
+    use seer_core::RecordType;
+
+    /// Parses `seer <argv…>` down to the dig query, as `execute_command`
+    /// does, with the global `-q`/`--fields`.
+    fn query(argv: &[&str]) -> Result<Query, String> {
+        let cli = Cli::try_parse_from(std::iter::once("seer").chain(argv.iter().copied()))
+            .map_err(|e| e.to_string())?;
+        let Some(Commands::Dig {
+            args,
+            server,
+            short,
+            trace,
+            reverse,
+        }) = cli.command
+        else {
+            panic!("expected Dig command");
+        };
+        let flags = super::dig_args::DigFlags {
+            server,
+            short,
+            trace,
+            reverse,
+        };
+        dig_query(&args, flags, cli.quiet, cli.fields.is_some())
+    }
+
+    #[test]
+    fn positional_tokens_and_flags_interleave() {
+        for argv in [
+            &["dig", "@1.1.1.1", "example.com", "A", "MX", "+short"][..],
+            &["dig", "example.com", "--short", "A", "-s", "1.1.1.1", "MX"],
+            &[
+                "dig",
+                "-s",
+                "@1.1.1.1",
+                "A",
+                "example.com",
+                "MX",
+                "A",
+                "--short",
+            ],
+        ] {
+            let Ok(Query::Dig {
+                name,
+                types,
+                server,
+                short,
+            }) = query(argv)
+            else {
+                panic!("{argv:?} should be a dig query");
+            };
+            assert_eq!(name, "example.com", "{argv:?}");
+            assert_eq!(types, vec![RecordType::A, RecordType::MX], "{argv:?}");
+            assert_eq!(server.as_deref(), Some("1.1.1.1"), "{argv:?}");
+            assert!(short, "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn defaults_reverse_and_trace() {
+        assert!(matches!(
+            query(&["dig", "example.com"]),
+            Ok(Query::Dig { ref name, ref types, server: None, short: false })
+                if name == "example.com" && types == &[RecordType::A]
+        ));
+        assert!(matches!(
+            query(&["dig", "-x", "2001:db8::1"]),
+            Ok(Query::Dig { ref name, ref types, .. })
+                if name == "2001:db8::1" && types == &[RecordType::PTR]
+        ));
+        assert!(matches!(
+            query(&["dig", "--reverse", "192.0.2.1", "+short"]),
+            Ok(Query::Dig { short: true, .. })
+        ));
+        for argv in [
+            &["dig", "--trace", "www.example.com", "AAAA"][..],
+            &["dig", "www.example.com", "AAAA", "+trace"],
+        ] {
+            assert!(
+                matches!(
+                    query(argv),
+                    Ok(Query::Trace { ref name, record_type: RecordType::AAAA, short: false })
+                        if name == "www.example.com"
+                ),
+                "{argv:?}"
+            );
+        }
+        assert!(matches!(
+            query(&["dig", "example.com", "--trace", "--short"]),
+            Ok(Query::Trace {
+                record_type: RecordType::A,
+                short: true,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn flag_conflicts_are_usage_errors() {
+        for (argv, problem) in [
+            (&["dig"][..], "no name to query"),
+            (
+                &["dig", "--trace", "-s", "8.8.8.8", "example.com"],
+                "root servers",
+            ),
+            (
+                &["dig", "--trace", "example.com", "A", "MX"],
+                "one record type",
+            ),
+            (
+                &["dig", "-s", "8.8.8.8", "@1.1.1.1", "example.com"],
+                "one nameserver",
+            ),
+            (&["dig", "-x", "8.8.8.8", "example.com"], "one name"),
+            (&["dig", "-x", "not-an-ip"], "-x needs an IP address"),
+            (&["dig", "example.com", "+tcp"], "unknown dig option '+tcp'"),
+        ] {
+            let err = query(argv).err().expect("must be rejected");
+            assert!(err.contains(problem), "{argv:?}: {err}");
+        }
+    }
+
+    /// `--short` prints bare values whatever `--format` says, but `-q` and
+    /// `--fields` select from the JSON result: asking for both is an error.
+    #[test]
+    fn short_conflicts_with_quiet_and_fields_but_not_format() {
+        for argv in [
+            &["-q", "dig", "example.com", "+short"][..],
+            &["--fields", "status", "dig", "example.com", "--short"],
+            &["-q", "--fields", "status", "dig", "example.com", "+short"],
+        ] {
+            let err = query(argv).err().expect("must be rejected");
+            assert!(err.contains("-q/--fields"), "{argv:?}: {err}");
+        }
+        assert!(query(&["--format", "json", "dig", "example.com", "+short"]).is_ok());
+        assert!(query(&["-q", "--fields", "status", "dig", "example.com"]).is_ok());
     }
 }
 
@@ -1690,6 +1961,55 @@ mod exit_code_tests {
         assert_eq!(exit_code(&Payload::Dns(vec![])), 0);
         assert_eq!(exit_code(&Payload::Reverse(vec![])), 0);
     }
+
+    /// Like dig, an answered query exits 0 whatever its status: NXDOMAIN,
+    /// NODATA and SERVFAIL are results. So does a trace that stopped early.
+    #[test]
+    fn dig_and_trace_are_not_check_style() {
+        use crate::payload::fixtures;
+        use seer_core::{DnsStatus, RecordType};
+        for status in [
+            DnsStatus::NoError,
+            DnsStatus::NxDomain,
+            DnsStatus::ServFail,
+            DnsStatus::Refused,
+        ] {
+            let result = fixtures::dig_status(RecordType::A, status);
+            assert_eq!(exit_code(&Payload::Dig(Box::new(result.clone()))), 0);
+            assert_eq!(exit_code(&Payload::DigMany(vec![result])), 0);
+        }
+        let stopped = fixtures::trace(vec![], Some("every server of seer.test. failed"));
+        assert_eq!(exit_code(&Payload::Trace(Box::new(stopped))), 0);
+        let answered = fixtures::trace(vec![fixtures::a("www.seer.test", "192.0.2.7")], None);
+        assert_eq!(exit_code(&Payload::Trace(Box::new(answered))), 0);
+    }
+
+    /// A multi-type dig with a failed type still prints the rest, but the
+    /// command failed: exit 1. A clean run keeps the payload's code.
+    #[test]
+    fn a_partly_failed_dig_exits_one() {
+        use crate::payload::fixtures;
+        use seer_core::{DnsStatus, RecordType, SeerError};
+        let outcome = crate::query::dig_outcome(vec![
+            (
+                RecordType::A,
+                Ok(fixtures::dig_status(RecordType::A, DnsStatus::NxDomain)),
+            ),
+            (
+                RecordType::MX,
+                Err(SeerError::DnsError("MX lookup failed: timed out".into())),
+            ),
+        ])
+        .expect("one type answered");
+        assert_eq!(super::outcome_exit_code(&outcome), 1);
+
+        let outcome = crate::query::dig_outcome(vec![(
+            RecordType::A,
+            Ok(fixtures::dig_status(RecordType::A, DnsStatus::ServFail)),
+        )])
+        .expect("answered");
+        assert_eq!(super::outcome_exit_code(&outcome), 0);
+    }
 }
 #[cfg(test)]
 mod bulk_output_tests {
@@ -1728,8 +2048,8 @@ mod quiet_fields_tests {
         names.iter().map(|s| s.to_string()).collect()
     }
 
-    /// `-q --fields name dig example.com` printed blank lines because the
-    /// record-list root (an array) resolved every path to Null.
+    /// `-q --fields name reverse …` (then also `dig`) printed blank lines
+    /// because the record-list root (an array) resolved every path to Null.
     #[test]
     fn field_path_applies_to_each_array_element() {
         let records = json!([
@@ -1757,6 +2077,72 @@ mod quiet_fields_tests {
         assert_eq!(
             extract_field_lines(&json!(["a"]), &fields(&["5"])),
             vec![""]
+        );
+    }
+
+    /// `seer dig` is one result object: its fields and a fan-out over the
+    /// answers (the CNAME chain first, every record under its owner name).
+    #[test]
+    fn dig_fields_select_from_the_result_object() {
+        use crate::payload::{fixtures, Payload};
+        let result = fixtures::dig(
+            seer_core::RecordType::A,
+            vec![
+                fixtures::cname("www.seer.test", "edge.cdn.test."),
+                fixtures::a("edge.cdn.test", "192.0.2.7"),
+            ],
+        );
+        let value = serde_json::to_value(Payload::Dig(Box::new(result))).unwrap();
+        assert_eq!(
+            extract_field_lines(
+                &value,
+                &fields(&["status", "flags", "answers.name", "wildcard"])
+            ),
+            vec![
+                "NOERROR",
+                r#"["qr","rd","ra"]"#,
+                "www.seer.test",
+                "edge.cdn.test",
+                ""
+            ]
+        );
+        assert_eq!(
+            extract_field_lines(&value, &fields(&["answers.1.data.value.address"])),
+            vec!["192.0.2.7"]
+        );
+    }
+
+    /// Several dig types are an array of results: each result's fields
+    /// print together, in the order the types were asked for, so a script
+    /// can read them as rows. A leading index still picks one result.
+    #[test]
+    fn list_roots_extract_fields_element_by_element() {
+        use crate::payload::{fixtures, Payload};
+        use seer_core::{DnsStatus, RecordType};
+        let many = Payload::DigMany(vec![
+            fixtures::dig(
+                RecordType::A,
+                vec![fixtures::a("www.seer.test", "192.0.2.7")],
+            ),
+            fixtures::dig_status(RecordType::AAAA, DnsStatus::NoError),
+            fixtures::dig(
+                RecordType::MX,
+                vec![fixtures::mx("www.seer.test", "mail.seer.test.")],
+            ),
+        ]);
+        let value = serde_json::to_value(many).unwrap();
+        assert_eq!(
+            extract_field_lines(&value, &fields(&["record_type", "status"])),
+            vec!["A", "NOERROR", "AAAA", "NOERROR", "MX", "NOERROR"]
+        );
+        assert_eq!(
+            extract_field_lines(&value, &fields(&["2.record_type", "0.status"])),
+            vec!["MX", "NOERROR"]
+        );
+        // A single field reads the same either way.
+        assert_eq!(
+            extract_field_lines(&value, &fields(&["record_type"])),
+            vec!["A", "AAAA", "MX"]
         );
     }
 

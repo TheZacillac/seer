@@ -72,21 +72,66 @@ impl Completer for SeerCompleter {
             (1, Some("set")) => vec!["output"],
             (1, Some("watch")) => WATCH_ACTIONS.to_vec(),
             (_, Some("set")) if words.get(1) == Some(&"output") => OUTPUT_FORMATS.to_vec(),
+            (1.., Some("dig")) => dig_candidates(&words[1..index], current),
             // Record types follow the domain.
-            (2.., Some("dig" | "prop" | "follow" | "compare")) => RECORD_TYPES.to_vec(),
+            (2.., Some("prop" | "follow" | "compare")) => RECORD_TYPES.to_vec(),
             _ => return Ok((pos, Vec::new())),
         };
         Ok(complete_from(options, current, line_to_cursor))
     }
 }
 
+/// `dig` arguments come in any order (see [`crate::dig_args`]): a `+` word
+/// is one of its options wherever it sits, and record types complete once
+/// the name has been given — before that, a word is more likely the name.
+fn dig_candidates(before: &[&str], current: &str) -> Vec<&'static str> {
+    if current.starts_with('+') {
+        crate::dig_args::PLUS_OPTIONS.to_vec()
+    } else if current.starts_with(['@', '-']) || !crate::dig_args::has_name(before) {
+        Vec::new()
+    } else {
+        RECORD_TYPES.to_vec()
+    }
+}
+
+impl SeerCompleter {
+    /// For a partly typed argument with exactly one completion, the rest of
+    /// it (`ort` after `dig example.com +sh`), in the case of the typed part
+    /// — record types complete uppercase but parse in any case, so `cnam`
+    /// hints `e` and `CNAM` hints `E`.
+    fn completion_hint(&self, line: &str, ctx: &rustyline::Context<'_>) -> Option<String> {
+        // Only arguments: the word under the cursor is not the command.
+        line.split_whitespace().nth(1)?;
+        let (start, candidates) = self.complete(line, line.len(), ctx).ok()?;
+        let [only] = candidates.as_slice() else {
+            return None;
+        };
+        let typed = line.get(start..)?;
+        let rest = only
+            .replacement
+            .get(typed.len()..)
+            .filter(|r| !r.is_empty())?;
+        let shouting = typed.chars().any(|c| c.is_ascii_uppercase())
+            && !typed.chars().any(|c| c.is_ascii_lowercase());
+        Some(if shouting {
+            rest.to_ascii_uppercase()
+        } else {
+            rest.to_ascii_lowercase()
+        })
+    }
+}
+
 impl Hinter for SeerCompleter {
     type Hint = String;
 
-    /// After `<command> `, hints the command's arguments.
-    fn hint(&self, line: &str, pos: usize, _ctx: &rustyline::Context<'_>) -> Option<String> {
-        if pos < line.len() || !line.ends_with(' ') {
+    /// After `<command> `, hints the command's arguments; inside a partly
+    /// typed argument with a single completion, hints the rest of it.
+    fn hint(&self, line: &str, pos: usize, ctx: &rustyline::Context<'_>) -> Option<String> {
+        if pos < line.len() {
             return None;
+        }
+        if !line.ends_with(' ') {
+            return self.completion_hint(line, ctx);
         }
         let mut words = line.split_whitespace();
         let (Some(command), None) = (words.next(), words.next()) else {
@@ -165,11 +210,50 @@ mod tests {
         );
     }
 
+    /// dig takes its arguments in any order, so completion goes by what a
+    /// word looks like and whether the name has been given yet.
+    #[test]
+    fn dig_completes_options_anywhere_and_types_after_the_name() {
+        assert_eq!(candidates("dig +"), vec!["+short", "+trace"]);
+        assert_eq!(candidates("dig example.com MX +t"), vec!["+trace"]);
+        assert!(candidates("dig @1.1.1.1 a").is_empty(), "no name yet");
+        assert!(candidates("dig A a").is_empty(), "a type is not the name");
+        assert!(candidates("dig -s 8.8.8.8 a").is_empty(), "nor a server");
+        assert!(candidates("dig @1.1.1.1 example.com ht").contains(&"HTTPS".to_string()));
+        assert_eq!(candidates("dig -x 8.8.8.8 pt"), vec!["PTR"]);
+        assert!(candidates("dig example.com @").is_empty());
+        // Every core type completes, the new ones included.
+        let all = candidates("dig example.com MX ");
+        for name in seer_core::RecordType::ALL_NAMES {
+            assert!(all.iter().any(|c| c == name), "{name} is not completable");
+        }
+    }
+
+    #[test]
+    fn a_unique_argument_completion_is_hinted() {
+        assert_eq!(hint("dig example.com +sh"), Some("ort".to_string()));
+        assert_eq!(hint("dig +TR"), Some("ACE".to_string()));
+        assert_eq!(hint("dig example.com cnam"), Some("e".to_string()));
+        assert_eq!(hint("dig example.com CNAM"), Some("E".to_string()));
+        assert_eq!(hint("dig example.com CDNS"), Some("KEY".to_string()));
+        assert_eq!(hint("set output ya"), Some("ml".to_string()));
+        // Ambiguous, complete already, or nothing to complete: no hint.
+        assert_eq!(hint("dig example.com a"), None);
+        assert_eq!(hint("dig example.com +short"), None);
+        assert_eq!(hint("dig exa"), None);
+        // Command names are not hinted, only arguments.
+        assert_eq!(hint("delega"), None);
+    }
+
     /// The follow hint used to omit `--changes-only`, which help showed.
     #[test]
     fn hints_show_the_catalog_usage() {
         assert_eq!(hint("whois "), Some(" <domain>".to_string()));
         assert!(hint("follow ").is_some_and(|h| h.contains("--changes-only")));
+        assert_eq!(
+            hint("dig "),
+            Some(" [@server] <name> [type...] [+short] [+trace]".to_string())
+        );
         assert_eq!(hint("prop "), hint("propagation "));
         assert_eq!(hint("doctor "), None);
         assert_eq!(hint("whois example.com "), None);

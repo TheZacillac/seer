@@ -117,13 +117,14 @@ pub fn parse_query(command: &str, parts: &[&str]) -> Result<Query, String> {
         "whois" => Query::Whois(arg()?),
         "rdap" => Query::Rdap(arg()?),
         "dig" => {
-            let domain = arg()?;
-            let (mut servers, record_type) = servers_and_type(&args[1..])?;
-            Query::Dig {
-                domain,
-                record_type,
-                server: servers.pop(),
+            if args.is_empty() {
+                return Err(catalog::usage(command));
             }
+            // `-x`/`-s`/`--short`/`--trace` stay in the tokens: the shared
+            // parser reads the REPL's flag spellings itself.
+            crate::dig_args::parse(args, crate::dig_args::DigFlags::default())
+                .map_err(|e| format!("{e}\n{}", catalog::usage(command)))?
+                .into_query()
         }
         "prop" => Query::Prop {
             domain: arg()?,
@@ -641,7 +642,8 @@ mod tests {
     fn parse_query_handles_aliases_servers_and_bare_domains() {
         assert!(matches!(
             parse_query("dns", &["DNS", "example.com", "MX", "@1.1.1.1"]),
-            Ok(Query::Dig { record_type: RecordType::MX, server: Some(ref s), .. }) if s == "1.1.1.1"
+            Ok(Query::Dig { ref types, server: Some(ref s), .. })
+                if types == &[RecordType::MX] && s == "1.1.1.1"
         ));
         assert!(matches!(
             parse_query("compare", &["compare", "example.com", "@8.8.8.8", "@1.1.1.1"]),
@@ -658,6 +660,70 @@ mod tests {
         ));
         let err = parse_query("bogus", &["bogus"]).err().expect("unknown");
         assert!(err.starts_with("Unknown command: bogus"), "got: {err}");
+    }
+
+    /// The REPL `dig` takes the same dig-style arguments as `seer dig`,
+    /// through the shared parser, including the flag spellings clap would
+    /// parse on the command line.
+    #[test]
+    fn dig_parses_dig_style_arguments() {
+        let Ok(Query::Dig {
+            name,
+            types,
+            server,
+            short,
+        }) = parse_query(
+            "dig",
+            &["dig", "@1.1.1.1", "example.com", "A", "AAAA", "a", "+short"],
+        )
+        else {
+            panic!("expected a dig query");
+        };
+        assert_eq!(name, "example.com");
+        assert_eq!(types, vec![RecordType::A, RecordType::AAAA]);
+        assert_eq!(server.as_deref(), Some("1.1.1.1"));
+        assert!(short);
+
+        assert!(matches!(
+            parse_query("dig", &["dig", "-x", "8.8.8.8"]),
+            Ok(Query::Dig { ref name, ref types, short: false, .. })
+                if name == "8.8.8.8" && types == &[RecordType::PTR]
+        ));
+        assert!(matches!(
+            parse_query("dig", &["dig", "example.com", "--short", "-s", "9.9.9.9"]),
+            Ok(Query::Dig { server: Some(ref s), short: true, .. }) if s == "9.9.9.9"
+        ));
+        assert!(matches!(
+            parse_query("dig", &["dig", "example.com", "NS", "+trace"]),
+            Ok(Query::Trace { ref name, record_type: RecordType::NS, short: false })
+                if name == "example.com"
+        ));
+    }
+
+    /// Parser errors keep the REPL convention: the problem, then the usage.
+    #[test]
+    fn dig_errors_end_with_the_usage_line() {
+        for (line, problem) in [
+            (&["dig", "@8.8.8.8"][..], "no name to query"),
+            (
+                &["dig", "example.com", "+nocmd"],
+                "unknown dig option '+nocmd'",
+            ),
+            (
+                &["dig", "example.com", "--shrot"],
+                "unknown option '--shrot'",
+            ),
+            (
+                &["dig", "example.com", "@8.8.8.8", "+trace"],
+                "root servers",
+            ),
+            (&["dig", "-x", "8.8.8.8", "MX"], "-x looks up PTR"),
+            (&["dig", "a.example", "b.example"], "one name"),
+        ] {
+            let err = parse_query("dig", line).err().expect("must be rejected");
+            assert!(err.contains(problem), "{line:?}: {err}");
+            assert!(err.ends_with(&catalog::usage("dig")), "{line:?}: {err}");
+        }
     }
 
     // ---------------- subdomains / takeover / drift ----------------

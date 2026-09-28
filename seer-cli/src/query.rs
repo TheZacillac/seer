@@ -1,15 +1,18 @@
 //! Single-shot commands shared by the CLI subcommands and the REPL.
 //!
 //! Each surface parses its own syntax into a [`Query`]; [`run`] performs it
-//! and hands back a [`Payload`] plus any advisory notes. Each surface then
+//! and hands back a [`Payload`] plus any advisory notes (and, for a `dig`
+//! over several record types, the types that failed). Each surface then
 //! renders every command the same way — the CLI through `--quiet`/`--format`
 //! and its check-style exit codes, the REPL by printing and keeping the
-//! result for `copy` — so the two cannot drift apart command by command.
+//! result for `copy`; a `+short` dig prints its bare values in both — so the
+//! two cannot drift apart command by command.
 
 use std::sync::Arc;
 
 use seer_core::colors::CatppuccinExt;
-use seer_core::{RecordType, SeerConfig};
+use seer_core::output::OutputFormat;
+use seer_core::{DnsQueryResult, RecordType, SeerConfig};
 
 use crate::display::Spinner;
 use crate::payload::Payload;
@@ -21,11 +24,26 @@ pub enum Query {
     Whois(String),
     /// A domain, IP address, or ASN.
     Rdap(String),
+    /// One query per record type, run concurrently (see
+    /// [`crate::dig_args`] for the syntax both surfaces parse into this).
     Dig {
-        domain: String,
-        record_type: RecordType,
+        name: String,
+        /// Never empty; one type yields [`Payload::Dig`], several
+        /// [`Payload::DigMany`].
+        types: Vec<RecordType>,
         /// Falls back to the config file's nameserver.
         server: Option<String>,
+        /// Present the result as its `+short` lines.
+        short: bool,
+    },
+    /// `dig +trace`: the delegation walk from the root servers. It asks
+    /// each zone's servers directly, so no nameserver (not even the config
+    /// file's) applies.
+    Trace {
+        name: String,
+        record_type: RecordType,
+        /// Present the result as its `+short` lines.
+        short: bool,
     },
     Prop {
         domain: String,
@@ -76,6 +94,13 @@ pub struct Outcome {
     note: Option<String>,
     /// Shown after the result (`subdomains --record`'s confirmation).
     footnote: Option<String>,
+    /// The parts of a partial result that failed (one record type of a
+    /// multi-type `dig`), shown on stderr after it. Any failure fails the
+    /// command: see [`Outcome::failed`].
+    errors: Vec<String>,
+    /// `+short`: print the payload's bare values ([`Payload::short`])
+    /// instead of formatting it.
+    short: bool,
 }
 
 impl Outcome {
@@ -84,19 +109,46 @@ impl Outcome {
             payload,
             note: None,
             footnote: None,
+            errors: Vec::new(),
+            short: false,
         }
     }
 
-    /// Prints the notes to stderr around `show`, which prints the result.
-    pub fn present(&self, show: impl FnOnce(&Payload)) {
+    /// Whether part of the query failed, although the rest produced a
+    /// result. The CLI exits 1 for it.
+    pub fn failed(&self) -> bool {
+        !self.errors.is_empty()
+    }
+
+    /// The `+short` lines printed in place of the formatted result, when
+    /// the query asked for them.
+    fn short_text(&self) -> Option<String> {
+        self.payload.short().filter(|_| self.short)
+    }
+
+    /// Prints the notes to stderr around `show`, which prints the result,
+    /// then the failed parts to stderr in `format`'s error form (as a failed
+    /// command's error). A `+short` result prints its bare values instead,
+    /// whatever the format — and nothing at all when it has none, like dig.
+    pub fn present(&self, format: OutputFormat, show: impl FnOnce(&Payload)) {
         let print = |note: &Option<String>| {
             if let Some(note) = note {
                 eprintln!("{} {}", "note:".ctp_yellow(), note);
             }
         };
         print(&self.note);
-        show(&self.payload);
+        match self.short_text() {
+            Some(lines) if lines.is_empty() => {}
+            Some(lines) => println!("{lines}"),
+            None => show(&self.payload),
+        }
         print(&self.footnote);
+        for error in &self.errors {
+            match crate::utils::machine_error(format, error) {
+                Some(structured) => eprintln!("{structured}"),
+                None => eprintln!("{} {}", "Error:".ctp_red(), error),
+            }
+        }
     }
 }
 
@@ -177,18 +229,43 @@ pub async fn run(
             Payload::Rdap(Box::new(response))
         }
         Query::Dig {
-            domain,
-            record_type,
+            name,
+            types,
             server,
+            short,
         } => {
-            let _spinner = spinner(format!("Querying {} {} records", domain, record_type));
+            let type_names: Vec<String> = types.iter().map(ToString::to_string).collect();
+            let _spinner = spinner(format!(
+                "Querying {} {} records",
+                name,
+                type_names.join(" ")
+            ));
             let nameserver = server.as_deref().or(config.nameserver.as_deref());
-            Payload::Dns(
-                clients
-                    .dns
-                    .resolve(&domain, record_type, nameserver)
-                    .await?,
+            let results = futures::future::join_all(
+                types
+                    .iter()
+                    .map(|&record_type| clients.dns.query(&name, record_type, nameserver)),
             )
+            .await;
+            let mut outcome = dig_outcome(types.into_iter().zip(results).collect())?;
+            outcome.short = short;
+            return Ok(outcome);
+        }
+        Query::Trace {
+            name,
+            record_type,
+            short,
+        } => {
+            let _spinner = spinner(format!(
+                "Tracing {} {} from the root servers",
+                name, record_type
+            ));
+            let trace = seer_core::DnsTracer::from_config(config)
+                .trace(&name, record_type)
+                .await?;
+            let mut outcome = Outcome::new(Payload::Trace(Box::new(trace)));
+            outcome.short = short;
+            return Ok(outcome);
         }
         Query::Prop {
             domain,
@@ -282,11 +359,11 @@ pub async fn run(
             let _spinner = spinner(format!("Looking up {}", domain));
             let lookup = seer_core::SmartLookup::from_config(config);
             let outcome = crate::ops::drift_check(&lookup, &domain, record).await?;
+            let report = Payload::Drift(Box::new(outcome.report));
             return Ok(Outcome {
                 note: (!outcome.had_previous)
                     .then(|| crate::ops::no_baseline_note(&domain, record)),
-                footnote: None,
-                payload: Payload::Drift(Box::new(outcome.report)),
+                ..Outcome::new(report)
             });
         }
         Query::Caa(domain) => {
@@ -351,6 +428,41 @@ pub async fn run(
     Ok(Outcome::new(payload))
 }
 
+/// Assembles a `dig` outcome from its per-type results, in the requested
+/// order. One type is its result or its error. Several are a
+/// [`Payload::DigMany`] of the types that answered, with each failed type
+/// reported (and failing the command) — unless every type failed, which is
+/// the first type's error, as for the core's `ANY` fan-out.
+pub fn dig_outcome(
+    results: Vec<(RecordType, seer_core::Result<DnsQueryResult>)>,
+) -> seer_core::Result<Outcome> {
+    let requested = results.len();
+    let mut answered = Vec::with_capacity(requested);
+    let mut errors = Vec::new();
+    let mut first_error = None;
+    for (record_type, result) in results {
+        match result {
+            Ok(result) => answered.push(result),
+            Err(e) => {
+                errors.push(format!("{record_type}: {e}"));
+                first_error.get_or_insert(e);
+            }
+        }
+    }
+    if answered.is_empty() {
+        if let Some(e) = first_error {
+            return Err(e);
+        }
+    }
+    let payload = match answered.len() {
+        1 if requested == 1 => Payload::Dig(Box::new(answered.remove(0))),
+        _ => Payload::DigMany(answered),
+    };
+    let mut outcome = Outcome::new(payload);
+    outcome.errors = errors;
+    Ok(outcome)
+}
+
 /// `subdomains --diff/--record`: the fresh enumeration against the stored
 /// baseline (see [`crate::ops::subdomain_baseline_check`]). With `diff` the
 /// result is the diff; `--record` alone shows the listing and confirms the
@@ -364,17 +476,149 @@ async fn subdomain_baseline(domain: &str, diff: bool, record: bool) -> seer_core
                 .report
                 .baseline_missing
                 .then(|| crate::ops::no_subdomain_baseline_note(&name, record)),
-            footnote: None,
-            payload: Payload::SubdomainBaselineDiff(Box::new(outcome.report)),
+            ..Outcome::new(Payload::SubdomainBaselineDiff(Box::new(outcome.report)))
         }
     } else {
         Outcome {
-            note: None,
             footnote: Some(format!(
                 "recorded subdomain baseline for {} ({} names)",
                 name, outcome.result.count
             )),
-            payload: Payload::Subdomains(Box::new(outcome.result)),
+            ..Outcome::new(Payload::Subdomains(Box::new(outcome.result)))
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::payload::fixtures;
+    use seer_core::{DnsStatus, SeerError};
+
+    fn timeout(record_type: RecordType) -> seer_core::Result<DnsQueryResult> {
+        Err(SeerError::DnsError(format!(
+            "{record_type} lookup failed: timed out"
+        )))
+    }
+
+    fn answered(record_type: RecordType) -> seer_core::Result<DnsQueryResult> {
+        Ok(fixtures::dig_status(record_type, DnsStatus::NoError))
+    }
+
+    #[test]
+    fn one_type_is_its_result_or_its_error() {
+        let outcome = dig_outcome(vec![(RecordType::MX, answered(RecordType::MX))]).expect("ok");
+        assert!(matches!(outcome.payload, Payload::Dig(ref r) if r.record_type == RecordType::MX));
+        assert!(!outcome.failed());
+
+        let err = dig_outcome(vec![(RecordType::MX, timeout(RecordType::MX))])
+            .err()
+            .expect("the query's error");
+        assert!(err.to_string().contains("MX lookup failed"), "{err}");
+    }
+
+    #[test]
+    fn several_types_keep_the_requested_order() {
+        let types = [RecordType::TXT, RecordType::A, RecordType::MX];
+        let outcome = dig_outcome(types.iter().map(|&t| (t, answered(t))).collect()).expect("ok");
+        let Payload::DigMany(results) = &outcome.payload else {
+            panic!("several types are a DigMany");
+        };
+        let got: Vec<RecordType> = results.iter().map(|r| r.record_type).collect();
+        assert_eq!(got, types);
+        assert!(!outcome.failed());
+    }
+
+    /// The types that answered are still shown; each failed one is reported
+    /// under its type and fails the command. The shape stays an array even
+    /// when only one type is left, so a script sees what it asked for.
+    #[test]
+    fn a_failed_type_is_reported_beside_the_others() {
+        let outcome = dig_outcome(vec![
+            (RecordType::A, answered(RecordType::A)),
+            (RecordType::AAAA, timeout(RecordType::AAAA)),
+        ])
+        .expect("A answered");
+        let Payload::DigMany(results) = &outcome.payload else {
+            panic!("several types are a DigMany");
+        };
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].record_type, RecordType::A);
+        assert!(outcome.failed());
+        assert_eq!(outcome.errors.len(), 1);
+        assert!(
+            outcome.errors[0].starts_with("AAAA: ") && outcome.errors[0].contains("timed out"),
+            "{:?}",
+            outcome.errors
+        );
+    }
+
+    /// Every type failing is the first failure, like the core's ANY rule.
+    #[test]
+    fn every_type_failing_is_the_first_error() {
+        let err = dig_outcome(vec![
+            (
+                RecordType::SRV,
+                Err(SeerError::InvalidInput(
+                    "SRV needs _service._proto.name".into(),
+                )),
+            ),
+            (RecordType::MX, timeout(RecordType::MX)),
+        ])
+        .err()
+        .expect("nothing answered");
+        assert!(matches!(err, SeerError::InvalidInput(_)), "{err:?}");
+    }
+
+    /// `+short` replaces the formatted result with its bare values — an
+    /// empty string for a negative answer, which prints nothing.
+    #[test]
+    fn short_mode_prints_bare_values_in_place_of_the_result() {
+        let chained = fixtures::dig(
+            RecordType::A,
+            vec![
+                fixtures::cname("www.seer.test", "edge.cdn.test."),
+                fixtures::a("edge.cdn.test", "192.0.2.7"),
+            ],
+        );
+        let mut outcome = dig_outcome(vec![(RecordType::A, Ok(chained))]).expect("ok");
+        assert_eq!(outcome.short_text(), None, "formatted unless asked");
+        outcome.short = true;
+        assert_eq!(
+            outcome.short_text().as_deref(),
+            Some("edge.cdn.test.\n192.0.2.7")
+        );
+
+        let mut outcome = dig_outcome(vec![(
+            RecordType::A,
+            Ok(fixtures::dig_status(RecordType::A, DnsStatus::NxDomain)),
+        )])
+        .expect("ok");
+        outcome.short = true;
+        assert_eq!(outcome.short_text().as_deref(), Some(""));
+
+        // No other payload has a short form, so it formats as usual.
+        let mut outcome = Outcome::new(Payload::Reverse(vec![]));
+        outcome.short = true;
+        assert_eq!(outcome.short_text(), None);
+    }
+
+    /// Only a trace is slow enough for one-shot mode's spinner; a dig,
+    /// even for several types, runs its queries concurrently.
+    #[test]
+    fn trace_spins_in_one_shot_mode() {
+        let trace = Query::Trace {
+            name: "example.com".into(),
+            record_type: RecordType::A,
+            short: false,
+        };
+        assert!(crate::cli_spinner(&trace));
+        let dig = Query::Dig {
+            name: "example.com".into(),
+            types: vec![RecordType::A, RecordType::MX],
+            server: None,
+            short: false,
+        };
+        assert!(!crate::cli_spinner(&dig));
+    }
 }

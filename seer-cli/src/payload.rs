@@ -3,7 +3,7 @@
 //! command's result, and `copy`) and the TUI (raw view / `y` copy).
 //! Serialization reuses seer-core's formatters so copied text matches
 //! `seer --format …` exactly.
-use seer_core::output::{get_formatter, OutputFormat};
+use seer_core::output::{get_formatter, OutputFormat, YamlFormatter};
 
 /// Serializes as the wrapped result itself (untagged), so `--quiet` JSON is
 /// exactly the core type's.
@@ -13,7 +13,17 @@ pub enum Payload {
     Overview(Box<seer_core::LookupResult>),
     Whois(Box<seer_core::WhoisResponse>),
     Rdap(Box<seer_core::RdapResponse>),
+    /// A record list from `DnsResolver::resolve` (the TUI's DNS lens); the
+    /// CLI and REPL `dig` produce [`Payload::Dig`] / [`Payload::DigMany`].
     Dns(Vec<seer_core::DnsRecord>),
+    /// `dig` for one record type: the whole response (status, flags, CNAME
+    /// chain, authority, wildcard probe).
+    Dig(Box<seer_core::DnsQueryResult>),
+    /// `dig` for several record types, one result per type in the order
+    /// asked — a JSON array where [`Payload::Dig`] is an object.
+    DigMany(Vec<seer_core::DnsQueryResult>),
+    /// `dig +trace`: the delegation walk from the root servers.
+    Trace(Box<seer_core::DnsTrace>),
     Ssl(Box<seer_core::SslReport>),
     Status(Box<seer_core::StatusResponse>),
     Prop(Box<seer_core::PropagationResult>),
@@ -54,6 +64,8 @@ impl Payload {
             Payload::Whois(_) => "whois",
             Payload::Rdap(_) => "rdap",
             Payload::Dns(_) => "dns",
+            Payload::Dig(_) | Payload::DigMany(_) => "dig",
+            Payload::Trace(_) => "trace",
             Payload::Ssl(_) => "ssl",
             Payload::Status(_) => "status",
             Payload::Prop(_) => "propagation",
@@ -79,6 +91,25 @@ impl Payload {
             Payload::Doctor(_) => "doctor",
         }
     }
+
+    /// The `+short` form of a dig result — bare values, one per line (see
+    /// [`seer_core::output::dig_short`]), empty when there are none — or
+    /// `None` for a payload that has no short form. Several types print
+    /// their values one after another, as dig does for several queries.
+    pub fn short(&self) -> Option<String> {
+        use seer_core::output::{dig_short, dig_trace_short};
+        Some(match self {
+            Payload::Dig(result) => dig_short(result),
+            Payload::DigMany(results) => results
+                .iter()
+                .map(dig_short)
+                .filter(|lines| !lines.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n"),
+            Payload::Trace(trace) => dig_trace_short(trace),
+            _ => return None,
+        })
+    }
 }
 
 pub fn serialize(data: &Payload, format: OutputFormat) -> String {
@@ -88,6 +119,26 @@ pub fn serialize(data: &Payload, format: OutputFormat) -> String {
         Payload::Whois(w) => fmt.format_whois(w),
         Payload::Rdap(r) => fmt.format_rdap(r),
         Payload::Dns(records) => fmt.format_dns(records),
+        Payload::Dig(result) => fmt.format_dig(result),
+        Payload::DigMany(results) => match format {
+            // One document: the array of results, as `-q` prints it.
+            OutputFormat::Json => serde_json::to_string_pretty(results)
+                .unwrap_or_else(|e| format!("{{\"error\":\"{}\"}}", e)),
+            OutputFormat::Yaml => YamlFormatter::new().to_yaml_value(results),
+            // One block per type, each with its own header. A human block
+            // opens with a blank line of its own; Markdown needs one between
+            // a block's closing note and the next heading.
+            OutputFormat::Human | OutputFormat::Markdown => results
+                .iter()
+                .map(|result| fmt.format_dig(result))
+                .collect::<Vec<_>>()
+                .join(if format == OutputFormat::Markdown {
+                    "\n\n"
+                } else {
+                    "\n"
+                }),
+        },
+        Payload::Trace(trace) => fmt.format_dns_trace(trace),
         Payload::Ssl(s) => fmt.format_ssl(s),
         Payload::Status(s) => fmt.format_status(s),
         Payload::Prop(p) => fmt.format_propagation(p),
@@ -116,11 +167,224 @@ pub fn serialize(data: &Payload, format: OutputFormat) -> String {
     }
 }
 
+/// dig and trace results for the CLI's tests.
+#[cfg(test)]
+pub(crate) mod fixtures {
+    use seer_core::dns::{RecordData, RecordType, TraceHop};
+    use seer_core::{DnsQueryResult, DnsRecord, DnsStatus, DnsTrace};
+
+    pub fn a(name: &str, address: &str) -> DnsRecord {
+        DnsRecord {
+            name: name.into(),
+            record_type: RecordType::A,
+            ttl: 300,
+            data: RecordData::A {
+                address: address.into(),
+            },
+        }
+    }
+
+    pub fn cname(name: &str, target: &str) -> DnsRecord {
+        DnsRecord {
+            name: name.into(),
+            record_type: RecordType::CNAME,
+            ttl: 300,
+            data: RecordData::CNAME {
+                target: target.into(),
+            },
+        }
+    }
+
+    pub fn mx(name: &str, exchange: &str) -> DnsRecord {
+        DnsRecord {
+            name: name.into(),
+            record_type: RecordType::MX,
+            ttl: 300,
+            data: RecordData::MX {
+                preference: 10,
+                exchange: exchange.into(),
+            },
+        }
+    }
+
+    /// A NOERROR answer from the default upstream.
+    pub fn dig(record_type: RecordType, answers: Vec<DnsRecord>) -> DnsQueryResult {
+        DnsQueryResult {
+            name: "www.seer.test".into(),
+            record_type,
+            server: None,
+            status: DnsStatus::NoError,
+            flags: vec!["qr".into(), "rd".into(), "ra".into()],
+            answers,
+            authority: vec![],
+            wildcard: None,
+            query_time_ms: 12,
+        }
+    }
+
+    /// A negative or failed answer: `status` and no records.
+    pub fn dig_status(record_type: RecordType, status: DnsStatus) -> DnsQueryResult {
+        DnsQueryResult {
+            status,
+            flags: vec![],
+            ..dig(record_type, vec![])
+        }
+    }
+
+    /// A two-hop trace ending at the authoritative answer, or at `error`.
+    pub fn trace(answers: Vec<DnsRecord>, error: Option<&str>) -> DnsTrace {
+        let hop = |zone: &str, server: &str, answers: Vec<DnsRecord>| TraceHop {
+            zone: zone.into(),
+            server: server.into(),
+            address: "192.0.2.53".into(),
+            query_time_ms: 20,
+            status: DnsStatus::NoError,
+            authoritative: zone != ".",
+            referral_zone: (zone == ".").then(|| "seer.test.".into()),
+            referral: if zone == "." {
+                vec!["ns1.seer.test.".into()]
+            } else {
+                vec![]
+            },
+            answers,
+            failed_servers: vec![],
+        };
+        DnsTrace {
+            name: "www.seer.test".into(),
+            record_type: RecordType::A,
+            hops: vec![
+                hop(".", "a.root-servers.net.", vec![]),
+                hop("seer.test.", "ns1.seer.test.", answers.clone()),
+            ],
+            status: DnsStatus::NoError,
+            answers,
+            error: error.map(Into::into),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::fixtures;
     use super::*;
     use seer_core::dns::{RecordData, RecordType};
-    use seer_core::DnsRecord;
+    use seer_core::{DnsRecord, DnsStatus};
+
+    fn chained() -> seer_core::DnsQueryResult {
+        fixtures::dig(
+            RecordType::A,
+            vec![
+                fixtures::cname("www.seer.test", "edge.cdn.test."),
+                fixtures::a("edge.cdn.test", "192.0.2.7"),
+            ],
+        )
+    }
+
+    fn mx() -> seer_core::DnsQueryResult {
+        fixtures::dig(
+            RecordType::MX,
+            vec![fixtures::mx("www.seer.test", "mail.seer.test.")],
+        )
+    }
+
+    /// One type is the result object itself, several an array of them —
+    /// the shape `-q` and `--format json` print.
+    #[test]
+    fn dig_payloads_serialize_as_an_object_or_an_array() {
+        let one = Payload::Dig(Box::new(chained()));
+        let value = serde_json::to_value(&one).unwrap();
+        assert_eq!(value, serde_json::to_value(chained()).unwrap());
+        assert_eq!(value["status"], "NOERROR");
+        assert_eq!(value["answers"][1]["name"], "edge.cdn.test");
+
+        let many = Payload::DigMany(vec![chained(), mx()]);
+        let value = serde_json::to_value(&many).unwrap();
+        assert_eq!(value, serde_json::to_value([chained(), mx()]).unwrap());
+
+        let json = serialize(&many, OutputFormat::Json);
+        let parsed: Vec<seer_core::DnsQueryResult> =
+            serde_json::from_str(&json).expect("--format json is one array document");
+        assert_eq!(parsed, vec![chained(), mx()]);
+        let json = serialize(&one, OutputFormat::Json);
+        let parsed: seer_core::DnsQueryResult =
+            serde_json::from_str(&json).expect("one type is one object");
+        assert_eq!(parsed, chained());
+
+        let yaml = serialize(&many, OutputFormat::Yaml);
+        assert!(
+            yaml.trim_start().starts_with("- "),
+            "a YAML sequence: {yaml}"
+        );
+        assert!(yaml.contains("mail.seer.test."), "{yaml}");
+
+        let trace = fixtures::trace(vec![fixtures::a("www.seer.test", "192.0.2.7")], None);
+        let value = serde_json::to_value(Payload::Trace(Box::new(trace.clone()))).unwrap();
+        assert_eq!(value, serde_json::to_value(&trace).unwrap());
+    }
+
+    /// Human and Markdown render one block per type, in the order asked.
+    #[test]
+    fn dig_many_renders_a_block_per_type() {
+        let many = Payload::DigMany(vec![chained(), mx()]);
+        let human = serialize(&many, OutputFormat::Human);
+        let (a, mx_block) = (
+            human.find("DNS A Records: www.seer.test").expect("A block"),
+            human
+                .find("DNS MX Records: www.seer.test")
+                .expect("MX block"),
+        );
+        assert!(a < mx_block, "{human}");
+        assert!(human.contains("edge.cdn.test") && human.contains("mail.seer.test."));
+
+        let markdown = serialize(&many, OutputFormat::Markdown);
+        assert_eq!(markdown.matches("## DNS ").count(), 2, "{markdown}");
+        assert!(
+            markdown.starts_with("## DNS A Records: www.seer.test"),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains(".\n\n## DNS MX Records: www.seer.test"),
+            "a blank line before each later block's heading: {markdown}"
+        );
+
+        let trace = fixtures::trace(vec![fixtures::a("www.seer.test", "192.0.2.7")], None);
+        let human = serialize(&Payload::Trace(Box::new(trace)), OutputFormat::Human);
+        assert!(human.contains("DNS Trace: www.seer.test A"), "{human}");
+        assert!(human.contains("a.root-servers.net."), "{human}");
+    }
+
+    /// `+short`: CNAME targets then values, per type in order; types
+    /// without answers add nothing; non-dig payloads have no short form.
+    #[test]
+    fn short_form_covers_the_dig_payloads_only() {
+        assert_eq!(
+            Payload::Dig(Box::new(chained())).short().as_deref(),
+            Some("edge.cdn.test.\n192.0.2.7")
+        );
+        let nxdomain = fixtures::dig_status(RecordType::AAAA, DnsStatus::NxDomain);
+        assert_eq!(
+            Payload::Dig(Box::new(nxdomain.clone())).short().as_deref(),
+            Some("")
+        );
+        assert_eq!(
+            Payload::DigMany(vec![chained(), nxdomain, mx()])
+                .short()
+                .as_deref(),
+            Some("edge.cdn.test.\n192.0.2.7\n10 mail.seer.test.")
+        );
+        let trace = fixtures::trace(vec![fixtures::a("www.seer.test", "192.0.2.7")], None);
+        assert_eq!(
+            Payload::Trace(Box::new(trace)).short().as_deref(),
+            Some("192.0.2.7")
+        );
+        let stopped = fixtures::trace(vec![], Some("every server failed"));
+        assert_eq!(
+            Payload::Trace(Box::new(stopped)).short().as_deref(),
+            Some("")
+        );
+        assert_eq!(Payload::Reverse(vec![]).short(), None);
+        assert_eq!(Payload::Dns(vec![]).short(), None);
+    }
 
     #[test]
     fn serializes_dns_as_json() {
@@ -198,5 +462,9 @@ mod tests {
     fn kind_labels_are_lowercase() {
         let data = Payload::Dns(vec![]);
         assert_eq!(data.kind(), "dns");
+        assert_eq!(Payload::Dig(Box::new(chained())).kind(), "dig");
+        assert_eq!(Payload::DigMany(vec![]).kind(), "dig");
+        let trace = fixtures::trace(vec![], None);
+        assert_eq!(Payload::Trace(Box::new(trace)).kind(), "trace");
     }
 }

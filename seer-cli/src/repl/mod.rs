@@ -302,8 +302,9 @@ impl Repl {
         match crate::query::run(query, &self.clients, &self.context.config, true).await {
             Ok(outcome) => {
                 let format = self.context.output_format;
-                outcome
-                    .present(|payload| println!("{}", crate::payload::serialize(payload, format)));
+                outcome.present(format, |payload| {
+                    println!("{}", crate::payload::serialize(payload, format));
+                });
                 self.last_result = Some(outcome.payload);
                 CommandResult::Continue
             }
@@ -720,6 +721,49 @@ mod copy_tests {
         assert!(!text.contains("1.2.3.4"), "must not copy the stale result");
     }
 
+    /// `copy` after `dig`: one type copies the result object, several the
+    /// array, and a trace its hops — in every copy format.
+    #[test]
+    fn dig_and_trace_payloads_are_copyable() {
+        use crate::payload::{fixtures, Payload};
+        let mut repl = repl_with_result();
+        let chained = fixtures::dig(
+            RecordType::A,
+            vec![
+                fixtures::cname("www.seer.test", "edge.cdn.test."),
+                fixtures::a("edge.cdn.test", "192.0.2.7"),
+            ],
+        );
+        let mx = fixtures::dig(
+            RecordType::MX,
+            vec![fixtures::mx("www.seer.test", "mail.seer.test.")],
+        );
+
+        repl.last_result = Some(Payload::Dig(Box::new(chained.clone())));
+        let (json, msg) = repl.render_copy(&["json"]).expect("copyable");
+        assert!(msg.contains("dig"), "got: {msg}");
+        assert!(json.trim_start().starts_with('{'), "an object: {json}");
+        assert!(json.contains("edge.cdn.test") && !json.contains("1.2.3.4"));
+        let (md, _) = repl.render_copy(&[]).expect("markdown");
+        assert!(md.contains("## DNS A Records: www.seer.test"), "{md}");
+
+        repl.last_result = Some(Payload::DigMany(vec![chained, mx]));
+        let (json, _) = repl.render_copy(&["json"]).expect("copyable");
+        assert!(json.trim_start().starts_with('['), "an array: {json}");
+        let (md, _) = repl.render_copy(&["markdown"]).expect("markdown");
+        assert!(md.contains("## DNS MX Records"), "{md}");
+        let (yaml, _) = repl.render_copy(&["yaml"]).expect("yaml");
+        assert!(yaml.contains("mail.seer.test."), "{yaml}");
+
+        repl.last_result = Some(Payload::Trace(Box::new(fixtures::trace(
+            vec![fixtures::a("www.seer.test", "192.0.2.7")],
+            None,
+        ))));
+        let (md, msg) = repl.render_copy(&[]).expect("copyable");
+        assert!(msg.contains("trace"), "got: {msg}");
+        assert!(md.contains("a.root-servers.net."), "{md}");
+    }
+
     /// A failed command must not leave the previous result for `copy` to
     /// hand out as if it were this command's output. The usage error fires
     /// before any network I/O, so this stays hermetic.
@@ -884,6 +928,28 @@ mod record_type_tests {
         let mut repl = Repl::new().expect("repl construction is offline");
         let result = repl.execute_line("dig example.com BOGUS").await;
         assert_rejects(&result);
+        // In any position: dig-style arguments come in any order.
+        let result = repl.execute_line("dig BOGUS @8.8.8.8 example.com").await;
+        assert_rejects(&result);
+    }
+
+    /// dig's other usage errors surface before any network I/O too.
+    #[tokio::test]
+    async fn dig_rejects_bad_arguments_before_network() {
+        let mut repl = Repl::new().expect("repl construction is offline");
+        for (line, problem) in [
+            ("dig", "Usage: dig [@server] <name>"),
+            ("dns +short", "no name to query"),
+            ("dig example.com +bogus", "+bogus"),
+            ("dig example.com @8.8.8.8 +trace", "root servers"),
+            ("dig -x example.com", "-x needs an IP address"),
+        ] {
+            let result = repl.execute_line(line).await;
+            let CommandResult::Error(msg) = result else {
+                panic!("{line:?} should be rejected, got {result:?}");
+            };
+            assert!(msg.contains(problem), "{line:?}: {msg}");
+        }
     }
 
     #[tokio::test]
