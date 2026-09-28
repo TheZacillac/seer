@@ -1,0 +1,16 @@
+---
+source: seer-core/tests/format_snapshots.rs
+expression: human ().format_dig (& fixture_dig_cname_chain())
+---
+
+[1;95mDNS A Records: www.seer.test[0m
+[37m────────────────────────────[0m
+  [1;96mstatus[0m: [1;92mNOERROR[0m  [1;96mflags[0m: [97mqr rd ra[0m  [1;96mserver[0m: [97m1.1.1.1[0m  [1;96mtime[0m: [97m12 ms[0m
+
+  [1;96mAnswer[0m:
+    [97mwww.seer.test[0m   [1;96m3600[0m  [1;96mCNAME[0m  [97mshop.seer.test.[0m
+    [97mshop.seer.test[0m   [1;96m300[0m  [1;96mCNAME[0m  [97medge.cdn.test.[0m
+    [97medge.cdn.test[0m    [1;96m300[0m  [1;96mA[0m      [1;92m192.0.2.7[0m
+    [97medge.cdn.test[0m    [1;96m300[0m  [1;96mA[0m      [1;92m192.0.2.8[0m
+
+[1;93mNote: DNS responses are not DNSSEC-validated[0m

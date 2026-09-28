@@ -193,7 +193,7 @@ impl HumanFormatter {
         // users don't treat the results as authenticated.
         if !result.dnssec_validated {
             output.push(String::new());
-            output.push(self.warning("Note: DNS responses are not DNSSEC-validated"));
+            output.push(self.warning(DNSSEC_NOTE));
         }
 
         output.join("\n")

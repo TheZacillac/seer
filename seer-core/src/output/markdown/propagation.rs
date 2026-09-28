@@ -161,7 +161,7 @@ impl MarkdownFormatter {
 
         if !result.dnssec_validated {
             output.push(String::new());
-            output.push("> Note: DNS responses are not DNSSEC-validated.".to_string());
+            output.push(format!("> {DNSSEC_NOTE}."));
         }
 
         output.join("\n")
