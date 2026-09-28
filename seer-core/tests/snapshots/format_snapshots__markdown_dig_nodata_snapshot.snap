@@ -1,10 +1,12 @@
 ---
 source: seer-core/tests/format_snapshots.rs
+assertion_line: 1374
 expression: markdown ().format_dig (& fixture_dig_nodata())
 ---
 ## DNS AAAA Records: www.seer.test
 
 - **Status**: `NOERROR`
+- **Flags**: `qr rd ra`
 - **Server**: default
 - **Query time**: 12 ms
 

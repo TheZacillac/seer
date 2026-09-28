@@ -92,23 +92,68 @@ pub fn verdict(status: DnsStatus, record_type: RecordType, nodata: bool) -> Opti
     Some(text)
 }
 
-/// The sentence printed under a query result without an answer: for a
-/// referral ([`DnsQueryResult::referral_zone`]) the zone it refers to, else
-/// the [`verdict`] for its status. `None` for a positive answer. `escape`
-/// renders the referral's zone — a remote string — for the caller's format.
+/// The sentence printed under a query result without an answer. `None` for
+/// a positive answer. `escape` renders the remote name it quotes — a
+/// referral's zone, a CNAME target — for the caller's format.
+///
+/// - A referral ([`DnsQueryResult::referral_zone`]) names the zone it
+///   refers to, and the missing `aa` flag when the header is known.
+/// - A negative answer behind a CNAME chain is about the chain's last
+///   target, not the queried name, which exists — it owns the first CNAME:
+///   NXDOMAIN says the target does not exist (RFC 6604 §2), NODATA that it
+///   has no records of the type. A chain that ends in a bare CNAME, with no
+///   SOA and no `ra` flag, is one the server did not follow (it does not
+///   recurse, and the target is outside its zones), which says nothing about
+///   the target.
+/// - Anything else reads as the [`verdict`] for its status.
 pub fn query_verdict<D: fmt::Display>(
     result: &DnsQueryResult,
     escape: impl FnOnce(&str) -> D,
 ) -> Option<String> {
-    match result.referral_zone() {
-        Some(zone) => Some(format!(
-            "No answer: referral to {}{} — the server is not authoritative for the name and \
-             does not recurse",
+    if let Some(zone) = result.referral_zone() {
+        let header = if result.flags.is_empty() {
+            ""
+        } else {
+            " (no aa flag)"
+        };
+        return Some(format!(
+            "No answer: referral to {}{} — the server is not authoritative for the \
+             name{header} and does not recurse",
             escape(zone),
             zone_suffix(zone)
-        )),
-        None => verdict(result.status, result.record_type, result.is_nodata()),
+        ));
     }
+    let record_type = result.record_type;
+    match (result.status, last_cname_target(result.cname_chain())) {
+        (DnsStatus::NxDomain, Some(target)) => Some(missing_target(escape(target))),
+        (DnsStatus::NoError, Some(target)) if result.is_nodata() => {
+            let followed = result.flags.iter().any(|flag| flag == "ra")
+                || result
+                    .authority
+                    .iter()
+                    .any(|r| r.record_type == RecordType::SOA);
+            Some(if followed {
+                format!(
+                    "The CNAME target {} has no {record_type} records (NODATA)",
+                    escape(target)
+                )
+            } else {
+                format!(
+                    "No {record_type} records here: the server returned the CNAME to {} \
+                     without following it (it does not recurse)",
+                    escape(target)
+                )
+            })
+        }
+        _ => verdict(result.status, record_type, result.is_nodata()),
+    }
+}
+
+/// The verdict for NXDOMAIN beside a CNAME chain: the name that does not
+/// exist is the chain's last target (`target`, escaped by the caller). One
+/// sentence for a query result and a trace.
+fn missing_target(target: impl fmt::Display) -> String {
+    format!("The CNAME target {target} does not exist (NXDOMAIN)")
 }
 
 /// The note under a result the resolver answered itself
@@ -167,10 +212,7 @@ pub fn trace_verdict<D: fmt::Display>(
 ) -> Option<String> {
     if trace.status == DnsStatus::NxDomain {
         if let Some(target) = last_cname_target(&trace.answers) {
-            return Some(format!(
-                "The CNAME target {} does not exist (NXDOMAIN)",
-                escape(target)
-            ));
+            return Some(missing_target(escape(target)));
         }
     }
     verdict(trace.status, trace.record_type, trace.answers.is_empty())
@@ -194,13 +236,16 @@ pub fn unfollowed_cname(trace: &DnsTrace) -> Option<&str> {
     last_cname_target(&trace.answers)
 }
 
-/// The target of the last CNAME in `answers` (server order): the end of the
-/// chain the answer holds.
-fn last_cname_target(answers: &[DnsRecord]) -> Option<&str> {
-    answers.iter().rev().find_map(|r| match &r.data {
-        RecordData::CNAME { target } => Some(target.as_str()),
-        _ => None,
-    })
+/// The target of the last CNAME in `answers` (in the order given): the end
+/// of the chain the answer holds.
+fn last_cname_target<'r>(answers: impl IntoIterator<Item = &'r DnsRecord>) -> Option<&'r str> {
+    answers
+        .into_iter()
+        .filter_map(|r| match &r.data {
+            RecordData::CNAME { target } => Some(target.as_str()),
+            _ => None,
+        })
+        .last()
 }
 
 /// The note under a trace that stopped at a CNAME (see
@@ -450,6 +495,23 @@ mod tests {
             "{upward}"
         );
 
+        // With the header known, the verdict cites the missing `aa` flag.
+        referral.flags = vec!["qr".into(), "rd".into()];
+        referral.authority = vec![ns("child.seer.test", "ns1.child.seer.test.")];
+        assert_eq!(
+            query_verdict(&referral, str::to_string).as_deref(),
+            Some(
+                "No answer: referral to child.seer.test — the server is not authoritative \
+                 for the name (no aa flag) and does not recurse"
+            )
+        );
+        // An authoritative response is no referral.
+        referral.flags.push("aa".into());
+        assert_eq!(
+            query_verdict(&referral, str::to_string).as_deref(),
+            Some("No A records (NODATA — the name exists)")
+        );
+
         // Anything else reads as its status's verdict.
         let nodata = result(RecordType::AAAA, DnsStatus::NoError, Vec::new());
         assert_eq!(
@@ -462,6 +524,107 @@ mod tests {
             vec![a("www.seer.test", "192.0.2.1")],
         );
         assert_eq!(query_verdict(&answered, str::to_string), None);
+    }
+
+    fn soa(zone: &str) -> DnsRecord {
+        DnsRecord {
+            name: zone.to_string(),
+            record_type: RecordType::SOA,
+            ttl: 900,
+            data: RecordData::SOA {
+                mname: format!("ns1.{zone}."),
+                rname: format!("hostmaster.{zone}."),
+                serial: 1,
+                refresh: 7200,
+                retry: 3600,
+                expire: 1209600,
+                minimum: 900,
+            },
+        }
+    }
+
+    #[test]
+    fn query_verdict_names_the_chains_last_target_for_a_negative_answer() {
+        // Regression: a dangling CNAME read "Name does not exist (NXDOMAIN)",
+        // though the queried name exists — it owns the CNAME. The code is
+        // about the chain's last target (RFC 6604 §2).
+        let chain = vec![
+            cname("www.seer.test", "shop.seer.test."),
+            cname("shop.seer.test", "gone.cdn.test."),
+        ];
+        let mut dangling = result(RecordType::A, DnsStatus::NxDomain, chain.clone());
+        dangling.authority = vec![soa("cdn.test")];
+        assert_eq!(
+            query_verdict(&dangling, |target| format!("`{target}`")).as_deref(),
+            Some("The CNAME target `gone.cdn.test.` does not exist (NXDOMAIN)")
+        );
+        // The sentence a trace prints for the same response.
+        let mut traced = trace(RecordType::A, chain.clone());
+        traced.status = DnsStatus::NxDomain;
+        assert_eq!(
+            trace_verdict(&traced, |target| format!("`{target}`")),
+            query_verdict(&dangling, |target| format!("`{target}`"))
+        );
+
+        // NODATA behind a chain: the target lacks the type.
+        let mut nodata = result(RecordType::AAAA, DnsStatus::NoError, chain.clone());
+        nodata.authority = vec![soa("cdn.test")];
+        assert!(nodata.is_nodata());
+        assert_eq!(
+            query_verdict(&nodata, str::to_string).as_deref(),
+            Some("The CNAME target gone.cdn.test. has no AAAA records (NODATA)")
+        );
+        // A recursive server followed it even when it sent no SOA.
+        nodata.authority.clear();
+        assert_eq!(
+            query_verdict(&nodata, str::to_string).as_deref(),
+            Some("The CNAME target gone.cdn.test. has no AAAA records (NODATA)")
+        );
+
+        // A server that does not recurse returns an out-of-zone CNAME as is
+        // (AA set, no SOA, no `ra`): nothing is known about the target, so
+        // no NODATA is claimed for it.
+        let mut unfollowed = result(
+            RecordType::A,
+            DnsStatus::NoError,
+            vec![cname("www.seer.test", "edge.cdn.test.")],
+        );
+        unfollowed.flags = vec!["qr".into(), "aa".into(), "rd".into()];
+        unfollowed.authority = vec![ns("seer.test", "ns1.seer.test.")];
+        assert_eq!(
+            query_verdict(&unfollowed, |target| format!("`{target}`")).as_deref(),
+            Some(
+                "No A records here: the server returned the CNAME to `edge.cdn.test.` \
+                 without following it (it does not recurse)"
+            )
+        );
+
+        // A chain that reached records has no verdict; without a chain the
+        // queried name itself is meant.
+        let answered = result(
+            RecordType::A,
+            DnsStatus::NoError,
+            vec![
+                cname("www.seer.test", "edge.cdn.test."),
+                a("edge.cdn.test", "192.0.2.7"),
+            ],
+        );
+        assert_eq!(query_verdict(&answered, str::to_string), None);
+        assert_eq!(
+            query_verdict(
+                &result(RecordType::A, DnsStatus::NxDomain, vec![]),
+                str::to_string
+            )
+            .as_deref(),
+            Some("Name does not exist (NXDOMAIN)")
+        );
+        // A CNAME query's CNAME is its answer, not a chain.
+        let asked = result(
+            RecordType::CNAME,
+            DnsStatus::NoError,
+            vec![cname("www.seer.test", "edge.cdn.test.")],
+        );
+        assert_eq!(query_verdict(&asked, str::to_string), None);
     }
 
     #[test]

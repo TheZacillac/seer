@@ -174,10 +174,9 @@ fn records(
 }
 
 /// dig's header line: `● NOERROR  flags qr rd ra  server 1.1.1.1  time 12 ms`.
-/// A negative or error answer surfaces no header flags (see
-/// `DnsQueryResult::flags`), so the field is left out rather than shown
-/// empty; `server default` is the default upstream, `server none` a name the
-/// resolver answered itself.
+/// An answer no server gave has no header flags (see `DnsQueryResult::flags`),
+/// so the field is left out rather than shown empty; `server default` is the
+/// default upstream, `server none` a name the resolver answered itself.
 fn status_line(theme: &Theme, result: &DnsQueryResult) -> Line<'static> {
     let label = |text: &'static str| Span::styled(text, Style::default().fg(theme.overlay0));
     let value = |text: String| Span::styled(text, Style::default().fg(theme.text));
@@ -457,11 +456,11 @@ mod tests {
             ..fixtures::dig_status(RecordType::A, DnsStatus::NxDomain)
         };
         let text = draw(&dig_data(result), &Panes::default(), "", None);
+        // A negative answer carries its header like any response.
         assert!(
-            text.contains("● NXDOMAIN  server default  time 12 ms"),
+            text.contains("● NXDOMAIN  flags qr rd ra  server default  time 12 ms"),
             "{text}"
         );
-        assert!(!text.contains("flags"), "no header flags surfaced: {text}");
         assert!(text.contains("Name does not exist (NXDOMAIN)"), "{text}");
         assert!(!text.contains("NODATA"), "{text}");
         assert!(!text.contains("ANSWER"), "no empty answer table: {text}");
@@ -485,6 +484,28 @@ mod tests {
         );
         assert!(!text.contains("NXDOMAIN"), "{text}");
         assert!(text.contains("AUTHORITY"), "{text}");
+    }
+
+    #[test]
+    fn a_dangling_cname_shows_its_chain_and_names_the_missing_target() {
+        // Regression: the chain was lost and the verdict blamed the queried
+        // name, which exists — it owns the CNAME.
+        let result = DnsQueryResult {
+            answers: vec![fixtures::cname("www.seer.test", "gone.cdn.test.")],
+            authority: vec![soa("cdn.test")],
+            ..fixtures::dig_status(RecordType::A, DnsStatus::NxDomain)
+        };
+        let text = draw(&dig_data(result), &Panes::default(), "", None);
+        assert!(text.contains("ANSWER"), "{text}");
+        assert!(
+            row_with(&text, "gone.cdn.test.").contains("CNAME"),
+            "{text}"
+        );
+        assert!(
+            flat(&text).contains("The CNAME target gone.cdn.test. does not exist (NXDOMAIN)"),
+            "{text}"
+        );
+        assert!(!text.contains("Name does not exist"), "{text}");
     }
 
     #[test]
@@ -535,15 +556,18 @@ mod tests {
                 nameserver: host.into(),
             },
         };
+        // A parent-side server's header: no `aa`, no `ra`.
         let result = DnsQueryResult {
+            flags: vec!["qr".into(), "rd".into()],
             authority: vec![ns("ns1.child.seer.test."), ns("ns2.child.seer.test.")],
             ..fixtures::dig_status(RecordType::A, DnsStatus::NoError)
         };
         let text = draw(&dig_data(result), &Panes::default(), "", None);
+        assert!(text.contains("● NOERROR  flags qr rd  server"), "{text}");
         assert!(
             flat(&text).contains(
                 "No answer: referral to child.seer.test — the server is not authoritative for \
-                 the name and does not recurse"
+                 the name (no aa flag) and does not recurse"
             ),
             "{text}"
         );

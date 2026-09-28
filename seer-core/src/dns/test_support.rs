@@ -1,10 +1,10 @@
 //! Test-only mock DNS fixture shared by the crate's hermetic DNS tests
-//! (`resolver.rs`, `follow.rs`, `compare.rs`, `dnssec.rs`, `trace.rs`,
-//! `posture.rs`, …): a real UDP socket on 127.0.0.1 (optionally with a TCP
-//! relay on the same port) serving
-//! hickory-proto-encoded canned responses, so the full `resolve()` path
-//! (normalization → custom-resolver construction → hickory transport →
-//! RData conversion) runs without touching the network.
+//! (`resolver.rs`, `transport.rs`, `follow.rs`, `compare.rs`, `dnssec.rs`,
+//! `trace.rs`, `posture.rs`, …): a real UDP socket on 127.0.0.1 (optionally
+//! with a TCP relay on the same port) serving
+//! hickory-proto-encoded canned responses, so the full `resolve()` and
+//! `query()` paths (normalization → nameserver vetting → hickory transport →
+//! RData conversion) run without touching the network.
 //!
 //! Compiled only under `cfg(test)` — production builds never include this
 //! module. The SSRF guards deliberately refuse loopback, so tests reach the
@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use hickory_resolver::proto::dnssec::rdata::{DNSSECRData, CDNSKEY, CDS, DNSKEY};
 use hickory_resolver::proto::dnssec::{Algorithm, DigestType, PublicKeyBuf};
-use hickory_resolver::proto::op::{Message, OpCode, ResponseCode};
+use hickory_resolver::proto::op::{Edns, Message, OpCode, ResponseCode};
 use hickory_resolver::proto::rr::rdata::svcb::{
     Alpn, EchConfigList, IpHint, Mandatory, SvcParamKey, SvcParamValue, Unknown, SVCB,
 };
@@ -347,7 +347,7 @@ pub(crate) enum MockReply {
     /// Send nothing, forcing the client's timeout path.
     NoReply,
     /// A referral to a child zone, as a parent-side server sends it:
-    /// NOERROR, AA clear, empty ANSWER, an NS record for `zone` (`"."` for
+    /// NOERROR, AA and RA clear, empty ANSWER, an NS record for `zone` (`"."` for
     /// the root) per listed server in AUTHORITY, and in ADDITIONAL an A/AAAA
     /// glue record for each address listed with a server (none: a glueless
     /// server).
@@ -358,6 +358,16 @@ pub(crate) enum MockReply {
     /// NOERROR with the TC (truncated) bit set and no records: the reply did
     /// not fit, so the client must retry over TCP.
     Truncated,
+    /// A negative answer behind a CNAME chain, as a recursive resolver
+    /// relays it (RFC 6604 §2): response code `code` (NXDOMAIN when the
+    /// chain's last target does not exist, NOERROR when it has no records of
+    /// the type), the `chain` records in ANSWER under their own owners (see
+    /// [`record`]), and the SOA of `soa` — the target's zone — in AUTHORITY.
+    Negative {
+        code: ResponseCode,
+        chain: Vec<Record>,
+        soa: &'static str,
+    },
 }
 
 /// Binds a UDP socket on an ephemeral loopback port and answers every query
@@ -489,6 +499,11 @@ where
                     }
                     MockReply::Rcode(code) => {
                         response.metadata.response_code = code;
+                        // A code above 15 is extended: its high bits travel
+                        // in the OPT record (RFC 6891 §6.1.3).
+                        if code.high() > 0 {
+                            response.edns = Some(Edns::new());
+                        }
                     }
                     MockReply::ServFail => {
                         response.metadata.response_code = ResponseCode::ServFail;
@@ -498,6 +513,9 @@ where
                     }
                     MockReply::NoReply => continue,
                     MockReply::Delegation { zone, servers } => {
+                        // A parent-side server answers from its own zone
+                        // data and does not recurse.
+                        response.metadata.recursion_available = false;
                         let zone = fq_name(&zone);
                         for (server, addrs) in servers {
                             let server = fq_name(&server);
@@ -517,6 +535,11 @@ where
                     }
                     MockReply::Truncated => {
                         response.metadata.truncation = true;
+                    }
+                    MockReply::Negative { code, chain, soa } => {
+                        response.metadata.response_code = code;
+                        response.add_answers(chain);
+                        response.add_authority(zone_soa(soa));
                     }
                 }
             }

@@ -1,11 +1,12 @@
 ---
 source: seer-core/tests/format_snapshots.rs
+assertion_line: 1374
 expression: human ().format_dig (& fixture_dig_servfail())
 ---
 
 [1;95mDNS A Records: broken.seer.test[0m
 [37m───────────────────────────────[0m
-  [1;96mstatus[0m: [1;91mSERVFAIL[0m  [1;96mserver[0m: [97mtls://dns.quad9.net[0m  [1;96mtime[0m: [97m48 ms[0m
+  [1;96mstatus[0m: [1;91mSERVFAIL[0m  [1;96mflags[0m: [97mqr rd ra[0m  [1;96mserver[0m: [97mtls://dns.quad9.net[0m  [1;96mtime[0m: [97m48 ms[0m
 
   [1;91mNo answer: the server failed to resolve the name (SERVFAIL)[0m
 

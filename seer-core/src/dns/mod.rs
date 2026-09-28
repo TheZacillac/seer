@@ -30,6 +30,7 @@ mod resolver;
 #[cfg(test)]
 pub(crate) mod test_support;
 mod trace;
+mod transport;
 
 pub use compare::{DnsComparator, DnsComparison, ServerResult};
 pub use delegation::{DelegationChecker, DelegationReport, LameNs};

@@ -29,14 +29,18 @@
 //!    (authoritative, or carrying the zone's SOA), or on an error, which
 //!    [`DnsTrace::error`] reports with the hops so far.
 //!
-//! **One raw exchange per hop.** Each query is a hickory-net UDP exchange
-//! (repeated over TCP when the reply is truncated), not a resolver lookup,
-//! because the resolver cannot report a hop as the server sent it (verified
-//! against hickory 0.26): its name-server layer (`DnsError::from_response`)
-//! turns every referral, NXDOMAIN and NODATA into a `NoRecordsFound` error,
-//! which drops the response header (the AA bit) and all of ADDITIONAL but
-//! the glue it matched itself, and its caching layer chases a CNAME by
-//! sending a follow-up query to the same server.
+//! **One raw exchange per hop.** Each query goes to one server address over
+//! UDP (repeated over TCP when the reply is truncated) through the same
+//! transport as [`DnsResolver::query`](crate::dns::DnsResolver::query)
+//! (`dns::transport`), not through a resolver lookup, because the resolver
+//! cannot report a hop as the server sent it (verified against hickory
+//! 0.26): its name-server layer (`DnsError::from_response`) turns every
+//! referral, NXDOMAIN and NODATA into a `NoRecordsFound` error, which drops
+//! the response header (the AA bit) and all of ADDITIONAL but the glue it
+//! matched itself, and its caching layer chases a CNAME by sending a
+//! follow-up query to the same server. Unlike `query`, a hop asks with
+//! recursion off, of the one vetted address the walk chose — the walk, not
+//! the transport, decides which server and address to ask next.
 //! ([`crate::dns::DelegationChecker`] reads only NS sets, so the resolver
 //! serves it.)
 //!
@@ -70,15 +74,12 @@
 //! referral must descend toward the query name, so the walk cannot loop.
 
 use std::collections::BTreeMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
-use hickory_resolver::net::runtime::TokioRuntimeProvider;
-use hickory_resolver::net::tcp::TcpClientStream;
-use hickory_resolver::net::udp::UdpClientStream;
-use hickory_resolver::net::xfer::{DnsHandle, FirstAnswer};
+use hickory_resolver::config::ConnectionConfig;
 use hickory_resolver::net::NetError;
-use hickory_resolver::proto::op::{DnsRequest, DnsRequestOptions, Message, Query, ResponseCode};
+use hickory_resolver::proto::op::{Message, ResponseCode};
 use hickory_resolver::proto::rr::{Name, RData as HickoryRData, RecordType as HickoryRecordType};
 use hickory_resolver::TokioResolver;
 use serde::{Deserialize, Serialize};
@@ -88,6 +89,7 @@ use super::delegation::{build_recursive_resolver, is_local_no_route, partition_r
 use super::query::{duration_ms, DnsStatus};
 use super::records::{DnsRecord, RecordType};
 use super::resolver::{fqdn, prepare_query, to_dns_record, wire_query_name, wire_type};
+use super::transport::{transport_reason, Transport};
 use crate::error::{Result, SeerError};
 
 /// Default per-query timeout, matching the DNS resolver default.
@@ -224,6 +226,8 @@ pub struct DnsTrace {
 pub struct DnsTracer {
     /// Per-query timeout, for direct queries and glueless lookups alike.
     timeout: Duration,
+    /// The direct queries' transport, under the same timeout.
+    transport: Transport,
     /// Recursive resolver for glueless nameserver names.
     recursive: TokioResolver,
     /// Test-only: pin the recursive resolver to a loopback mock.
@@ -266,6 +270,7 @@ impl DnsTracer {
     pub fn new() -> Self {
         Self {
             timeout: DEFAULT_TIMEOUT,
+            transport: Transport::new(DEFAULT_TIMEOUT),
             recursive: build_recursive_resolver(DEFAULT_TIMEOUT, None),
             #[cfg(test)]
             recursive_upstream: None,
@@ -293,6 +298,7 @@ impl DnsTracer {
     /// of a truncated reply, and each glueless nameserver lookup).
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        self.transport = Transport::new(timeout);
         self.recursive = build_recursive_resolver(timeout, self.recursive_upstream());
         self
     }
@@ -685,8 +691,9 @@ impl DnsTracer {
     }
 
     /// Sends one non-recursive query to `ip` and returns the response as the
-    /// server sent it: over UDP, then once more over TCP when the UDP reply
-    /// is truncated. The whole exchange shares one per-query deadline.
+    /// server sent it (see [`Transport::exchange`]): over UDP, then once more
+    /// over TCP when the UDP reply is truncated, the whole exchange under one
+    /// per-query deadline.
     async fn exchange(
         &self,
         host: &Name,
@@ -697,35 +704,12 @@ impl DnsTracer {
         if let Some(no_route) = self.simulated_no_route(ip) {
             return Err(no_route);
         }
-        let server = SocketAddr::new(ip, self.direct_port(host));
-        let mut options = DnsRequestOptions::default();
+        let mut udp = ConnectionConfig::udp();
+        udp.port = self.direct_port(host);
         // Delegation data must come from each server's own authority, not
         // from recursion or a forwarder's cache.
-        options.recursion_desired = false;
-        let request = DnsRequest::from_query(Query::query(qname.clone(), qtype), options);
-        let timeout = self.timeout;
-        // Each exchange's I/O runs as a background task in the provider's
-        // task set, which aborts its tasks once the last provider clone is
-        // dropped. The UDP stream keeps a clone, but the TCP exchange does
-        // not, so this one outlives the whole exchange — and ends it after.
-        let provider = TokioRuntimeProvider::default();
-
-        let exchange = async {
-            let udp = UdpClientStream::builder(server, provider.clone())
-                .with_timeout(Some(timeout))
-                .exchange();
-            let response = udp.send(request.clone()).first_answer().await?;
-            if !response.metadata.truncation {
-                return Ok::<_, NetError>(response.into_message());
-            }
-            debug!(%server, "trace: truncated UDP reply, retrying over TCP");
-            let tcp =
-                TcpClientStream::exchange(server, None, timeout, None, provider.clone()).await?;
-            Ok(tcp.send(request).first_answer().await?.into_message())
-        };
-        tokio::time::timeout(timeout, exchange)
-            .await
-            .unwrap_or(Err(NetError::Timeout))
+        let request = self.transport.request(qname.clone(), qtype, false);
+        self.transport.exchange(ip, &udp, &request).await
     }
 }
 
@@ -1003,15 +987,6 @@ fn ipv4_first(mut addrs: Vec<IpAddr>) -> Vec<IpAddr> {
 /// (see `delegation::is_local_no_route`).
 fn is_no_route(err: &NetError) -> bool {
     matches!(err, NetError::Io(io) if is_local_no_route(io))
-}
-
-/// A short reason for a failed exchange.
-fn transport_reason(err: &NetError) -> String {
-    match err {
-        NetError::Timeout => "timed out".to_string(),
-        NetError::Io(io) if is_local_no_route(io) => format!("no route from this host ({io})"),
-        other => other.to_string(),
-    }
 }
 
 /// A name as the trace reports zones and servers: fully qualified,

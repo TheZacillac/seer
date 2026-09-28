@@ -1048,8 +1048,8 @@ fn soa_record(zone: &str) -> DnsRecord {
     }
 }
 
-/// A query result for `name`/`record_type` with no answers; each fixture
-/// fills in what its case needs.
+/// A query result for `name`/`record_type` with no answers and a recursive
+/// server's header flags; each fixture fills in what its case needs.
 fn dig_result(name: &str, record_type: RecordType, status: DnsStatus) -> DnsQueryResult {
     DnsQueryResult {
         name: name.into(),
@@ -1057,7 +1057,7 @@ fn dig_result(name: &str, record_type: RecordType, status: DnsStatus) -> DnsQuer
         server: None,
         answered_locally: false,
         status,
-        flags: Vec::new(),
+        flags: dig_flags(),
         answers: Vec::new(),
         authority: Vec::new(),
         wildcard: None,
@@ -1075,7 +1075,6 @@ fn dig_flags() -> Vec<String> {
 fn fixture_dig_cname_chain() -> DnsQueryResult {
     DnsQueryResult {
         server: Some("1.1.1.1".into()),
-        flags: dig_flags(),
         answers: vec![
             cname_record("www.seer.test", 3600, "shop.seer.test."),
             cname_record("shop.seer.test", 300, "edge.cdn.test."),
@@ -1091,8 +1090,7 @@ fn fixture_dig_cname_chain() -> DnsQueryResult {
     }
 }
 
-/// The name does not exist; the zone's SOA came back in AUTHORITY, and a
-/// negative answer surfaces no header flags.
+/// The name does not exist; the zone's SOA came back in AUTHORITY.
 fn fixture_dig_nxdomain() -> DnsQueryResult {
     DnsQueryResult {
         authority: vec![soa_record("seer.test")],
@@ -1109,11 +1107,34 @@ fn fixture_dig_nodata() -> DnsQueryResult {
     }
 }
 
+/// A dangling CNAME: the recursive server followed `www → shop → gone` and
+/// answered NXDOMAIN beside the chain, with the target zone's SOA (RFC 6604
+/// §2), so the missing name is the last target, not the queried one.
+fn fixture_dig_dangling_cname() -> DnsQueryResult {
+    DnsQueryResult {
+        answers: vec![
+            cname_record("www.seer.test", 3600, "shop.seer.test."),
+            cname_record("shop.seer.test", 300, "gone.cdn.test."),
+        ],
+        authority: vec![soa_record("cdn.test")],
+        query_time_ms: 27,
+        ..dig_result("www.seer.test", RecordType::A, DnsStatus::NxDomain)
+    }
+}
+
+/// NODATA behind a CNAME: the target exists but has no AAAA records.
+fn fixture_dig_nodata_behind_cname() -> DnsQueryResult {
+    DnsQueryResult {
+        answers: vec![cname_record("www.seer.test", 300, "edge.cdn.test.")],
+        authority: vec![soa_record("cdn.test")],
+        ..dig_result("www.seer.test", RecordType::AAAA, DnsStatus::NoError)
+    }
+}
+
 /// An answer equal to the one a random sibling gets: likely synthesized
 /// from `*.seer.test`.
 fn fixture_dig_wildcard_matched() -> DnsQueryResult {
     DnsQueryResult {
-        flags: dig_flags(),
         answers: vec![a_record("promo.seer.test", "192.0.2.80")],
         wildcard: Some(WildcardProbe {
             probe_name: "seer-probe-3f9a1c2e7b.seer.test".into(),
@@ -1135,8 +1156,8 @@ fn fixture_dig_servfail() -> DnsQueryResult {
 }
 
 /// A referral from a server that serves only the parent zone: no answer,
-/// the child zone's NS records in AUTHORITY and no SOA — which does not say
-/// whether the name exists.
+/// the AA and RA flags clear, the child zone's NS records in AUTHORITY and
+/// no SOA — which does not say whether the name exists.
 fn fixture_dig_referral() -> DnsQueryResult {
     let ns = |host: &str| DnsRecord {
         name: "child.seer.test".into(),
@@ -1148,6 +1169,7 @@ fn fixture_dig_referral() -> DnsQueryResult {
     };
     DnsQueryResult {
         server: Some("ns1.seer.test".into()),
+        flags: vec!["qr".into(), "rd".into()],
         authority: vec![ns("ns1.child.seer.test."), ns("ns2.child.seer.test.")],
         query_time_ms: 14,
         ..dig_result("www.child.seer.test", RecordType::A, DnsStatus::NoError)
@@ -1158,6 +1180,7 @@ fn fixture_dig_referral() -> DnsQueryResult {
 fn fixture_dig_local() -> DnsQueryResult {
     DnsQueryResult {
         answered_locally: true,
+        flags: Vec::new(),
         answers: vec![DnsRecord {
             name: "1.0.0.127.in-addr.arpa".into(),
             record_type: RecordType::PTR,
@@ -1183,7 +1206,6 @@ fn fixture_dig_https() -> DnsQueryResult {
         value: value.into(),
     };
     DnsQueryResult {
-        flags: dig_flags(),
         answers: vec![DnsRecord {
             name: "www.seer.test".into(),
             record_type: RecordType::HTTPS,
@@ -1356,6 +1378,12 @@ snapshot_tests! {
     markdown_dig_nxdomain_snapshot => markdown.format_dig(fixture_dig_nxdomain());
     human_dig_nodata_snapshot => human.format_dig(fixture_dig_nodata());
     markdown_dig_nodata_snapshot => markdown.format_dig(fixture_dig_nodata());
+    human_dig_dangling_cname_snapshot => human.format_dig(fixture_dig_dangling_cname());
+    markdown_dig_dangling_cname_snapshot => markdown.format_dig(fixture_dig_dangling_cname());
+    human_dig_nodata_behind_cname_snapshot =>
+        human.format_dig(fixture_dig_nodata_behind_cname());
+    markdown_dig_nodata_behind_cname_snapshot =>
+        markdown.format_dig(fixture_dig_nodata_behind_cname());
     human_dig_wildcard_matched_snapshot => human.format_dig(fixture_dig_wildcard_matched());
     markdown_dig_wildcard_matched_snapshot =>
         markdown.format_dig(fixture_dig_wildcard_matched());

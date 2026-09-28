@@ -271,15 +271,18 @@ call_fn! {
 ///   itself, without asking any server
 /// - status: the response code: "NOERROR", "NXDOMAIN" (the name does not
 ///   exist), "SERVFAIL", "REFUSED", ...
-/// - flags: the header flags that were set, e.g. ["qr", "rd", "ra"]; empty
-///   for a negative or error answer
+/// - flags: the header flags the response set, e.g. ["qr", "rd", "ra"],
+///   whatever its status; empty only when answered_locally
 /// - answers: the CNAME chain first, then the records, each under its own
-///   owner name. NOERROR with no records of the type is NODATA: the name
-///   exists but has none — unless authority holds only NS records (no
-///   SOA): that is a referral from a server that is not authoritative for
-///   the name and does not recurse, which says nothing about existence
-/// - authority: the SOA of a negative answer, when the server sent one, or
-///   the NS records a referral points to
+///   owner name, exactly as the server sent them. NOERROR with no records
+///   of the type is NODATA: the name exists but has none — unless "aa" is
+///   not among the flags and authority holds only NS records (no SOA):
+///   that is a referral from a server that is not authoritative for the
+///   name and does not recurse, which says nothing about existence. Behind
+///   a CNAME chain, NXDOMAIN or NODATA is about the chain's last target: a
+///   dangling CNAME is NXDOMAIN with the chain in answers
+/// - authority: the AUTHORITY section: the SOA of a negative answer, when
+///   the server sent one, or the NS records a referral points to
 /// - wildcard: for a name below its registrable domain (www.example.com,
 ///   not example.com), whether a random sibling name also resolves
 ///   (present) and to the same records (matches_answer); otherwise None

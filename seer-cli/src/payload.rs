@@ -218,11 +218,11 @@ pub(crate) mod fixtures {
         }
     }
 
-    /// A negative or failed answer: `status` and no records.
+    /// A negative or failed answer: `status`, the response header, and no
+    /// records.
     pub fn dig_status(record_type: RecordType, status: DnsStatus) -> DnsQueryResult {
         DnsQueryResult {
             status,
-            flags: vec![],
             ..dig(record_type, vec![])
         }
     }

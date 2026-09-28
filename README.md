@@ -293,7 +293,12 @@ seer mangen ./man                 # Write seer.1 + one page per subcommand
 
 `seer dig` reports a query the way dig does: the response status, the header
 flags, and the answer with any CNAME chain first, every record under its real
-owner name.
+owner name. Like dig, it sends one query per record type straight to the
+nameserver (the default upstream, Google Public DNS, unless `@server`/`-s`
+names one) and shows the response exactly as the server sent it, header
+flags included; the servers are asked in order, IPv4 first, over UDP and
+again over TCP when the reply is truncated, and one that does not respond
+passes the query to the next, within two DNS timeouts.
 
 ```
 $ seer dig www.github.com
@@ -311,15 +316,19 @@ Note: DNS responses are not DNSSEC-validated
 
 - **NXDOMAIN vs NODATA.** "Name does not exist (NXDOMAIN)" and "No AAAA
   records (NODATA — the name exists)" are told apart, each shown with the
-  zone's SOA when the server sends it. SERVFAIL, REFUSED and other response
-  codes are reported as the status, not as errors. A referral — an
-  `@server` that serves only a parent zone pointing at the child zone's
-  nameservers — reads "No answer: referral to <zone>", which says nothing
-  about whether the name exists.
+  zone's SOA when the server sends it. Behind a CNAME chain the chain is
+  shown and the verdict is about its last target — "The CNAME target
+  gone.example.net. does not exist (NXDOMAIN)" for a dangling CNAME — or,
+  from a server that does not recurse, says it returned the CNAME without
+  following it. SERVFAIL, REFUSED and other response codes (EDNS extended
+  ones such as BADVERS included) are reported as the status, not as errors.
+  A referral — an `@server` that serves only a parent zone pointing at the
+  child zone's nameservers, with the `aa` flag clear — reads "No answer:
+  referral to <zone>", which says nothing about whether the name exists.
 - **Special-use names.** `localhost`, `127.in-addr.arpa` (`-x 127.0.0.1`),
   `invalid`, `onion` and the other RFC 6761 names are answered by seer's
-  resolver itself, without a query; the result says so (`server: none` and
-  a note; `answered_locally: true` in JSON).
+  resolver itself and never sent to a server; the result says so (`server:
+  none`, no flags and a note; `answered_locally: true` in JSON).
 - **Wildcards.** For a name below its registrable domain (`www.example.com`,
   not `example.com`), a random sibling (`seer-probe-….example.com`) is queried
   alongside (never for a special-use name). When it resolves too, a note says

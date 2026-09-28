@@ -1,11 +1,12 @@
 ---
 source: seer-core/tests/format_snapshots.rs
+assertion_line: 1374
 expression: human ().format_dig (& fixture_dig_nxdomain())
 ---
 
 [1;95mDNS A Records: gone.seer.test[0m
 [37m─────────────────────────────[0m
-  [1;96mstatus[0m: [1;93mNXDOMAIN[0m  [1;96mserver[0m: [97mdefault[0m  [1;96mtime[0m: [97m31 ms[0m
+  [1;96mstatus[0m: [1;93mNXDOMAIN[0m  [1;96mflags[0m: [97mqr rd ra[0m  [1;96mserver[0m: [97mdefault[0m  [1;96mtime[0m: [97m31 ms[0m
 
   [1;93mName does not exist (NXDOMAIN)[0m
 

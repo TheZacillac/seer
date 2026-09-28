@@ -31,9 +31,9 @@ impl HumanFormatter {
             sanitize_line(&result.name)
         ))];
 
-        // dig's header line. A negative or error answer surfaces no header
-        // (see `DnsQueryResult::flags`), so the flags field is left out
-        // rather than shown empty.
+        // dig's header line. An answer no server gave has no header (see
+        // `DnsQueryResult::flags`), so the flags field is left out rather
+        // than shown empty.
         let mut fields = vec![self.field("status", self.dns_status(result.status))];
         if !result.flags.is_empty() {
             let flags = sanitize_line(&result.flags.join(" "));
@@ -319,15 +319,19 @@ mod tests {
     }
 
     #[test]
-    fn dig_leaves_out_flags_the_response_did_not_carry() {
+    fn dig_leaves_out_flags_of_an_answer_no_server_gave() {
+        // Only the resolver's own answer for a special-use name has no
+        // header to show; the field is left out rather than shown empty.
         let mut result = chained();
+        result.name = "x.onion".to_string();
         result.status = DnsStatus::NxDomain;
+        result.answered_locally = true;
         result.flags.clear();
         result.answers.clear();
         result.server = None;
         let out = formatter().format_dig(&result);
         assert!(
-            out.contains("  status: NXDOMAIN  server: default  time: 12 ms\n"),
+            out.contains("  status: NXDOMAIN  server: none  time: 12 ms\n"),
             "{out}"
         );
         assert!(!out.contains("flags"), "{out}");

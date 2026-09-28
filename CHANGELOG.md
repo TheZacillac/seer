@@ -97,14 +97,26 @@ The dig result shape changes on the CLI, Python, REST and MCP surfaces — see
 - **The whole answer in `seer dig`:** the response status (NOERROR,
   NXDOMAIN, SERVFAIL, REFUSED, …), the header flags, the server and the
   query time, then the CNAME chain before the records, each record under its
-  real owner name. `dig` is not a check command: every answer the server gave
-  exits 0.
+  real owner name. Like dig, `seer dig` sends one query per record type
+  straight to the nameserver (or the default upstream) and reports the
+  response exactly as the server sent it — the header flags on every
+  response, negative and error answers included, and the status with any
+  EDNS extended response code (BADVERS, …). Its servers are asked in order,
+  IPv4 first, over UDP and again over TCP when the reply is truncated (a
+  plain `@server` included); one that does not respond passes the query to
+  the next, all within two DNS timeouts. `dig` is not a check command:
+  every answer the server gave exits 0.
 - **NXDOMAIN vs NODATA:** `seer dig` says "Name does not exist (NXDOMAIN)" or
   "No AAAA records (NODATA — the name exists)" instead of showing an empty
   result, with the zone's SOA from the authority section when the server
-  sends it. A referral from an `@server` that serves only a parent zone
-  (no answer, the child zone's NS records in the authority section) is
-  neither: it reads "No answer: referral to <zone>", with those NS records.
+  sends it. Behind a CNAME chain, the chain is shown and the verdict names
+  its last target: "The CNAME target gone.example.net. does not exist
+  (NXDOMAIN)" for a dangling CNAME, "The CNAME target … has no AAAA records
+  (NODATA)", or, from a server that does not recurse, that it returned the
+  CNAME without following it. A referral from an `@server` that serves only
+  a parent zone (no answer, the `aa` flag clear, the child zone's NS records
+  in the authority section) is neither: it reads "No answer: referral to
+  <zone>", with those NS records.
 - **Special-use names are marked as answered locally:** `localhost`,
   `127.in-addr.arpa` (`seer dig -x 127.0.0.1`), `invalid`, `onion` and the
   other RFC 6761 names seer's resolver answers itself are reported with

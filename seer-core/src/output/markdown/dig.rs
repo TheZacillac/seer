@@ -19,8 +19,8 @@ impl MarkdownFormatter {
 
         let mut b = Bullets(&mut out);
         b.code("Status", &result.status.to_string());
-        // Left out, not shown empty, when the response surfaced no header
-        // (a negative or error answer — see `DnsQueryResult::flags`).
+        // Left out, not shown empty, for an answer no server gave (see
+        // `DnsQueryResult::flags`).
         if !result.flags.is_empty() {
             b.code("Flags", &result.flags.join(" "));
         }

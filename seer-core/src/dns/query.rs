@@ -16,16 +16,20 @@
 //! referral (NOERROR with no answer, only the NS records of a zone below)
 //! is neither: see [`DnsQueryResult::referral_zone`].
 //!
-//! hickory's resolver answers the special-use names of RFC 6761
-//! (`localhost`, `127.in-addr.arpa`, `invalid`, `onion`, …) itself, without
-//! sending a query; such a result says so
-//! ([`DnsQueryResult::answered_locally`]) rather than passing off the
-//! resolver's answer as a server's.
+//! The result is the response a server sent, section by section: the query
+//! goes straight to the upstream servers (`dns::transport`), not through a
+//! resolver lookup, so a CNAME chain that ends in NXDOMAIN or NODATA keeps
+//! its chain and every response keeps its header. The special-use names of
+//! RFC 6761 (`localhost`, `127.in-addr.arpa`, `invalid`, `onion`, …) are
+//! the exception: hickory's resolver answers them itself, without sending a
+//! query, and such a result says so ([`DnsQueryResult::answered_locally`])
+//! rather than passing off the resolver's answer as a server's.
 //!
-//! The pure steps of assembling a result — mapping a hickory outcome to an
-//! `Exchange`, ordering a CNAME chain first, merging the ANY fan-out,
-//! choosing and judging the wildcard probe — live here so they are
-//! unit-testable without a server; the resolver only runs the lookups.
+//! The pure steps of assembling a result — mapping a response (or the
+//! resolver's local answer) to an `Exchange`, ordering a CNAME chain first,
+//! merging the ANY fan-out, choosing and judging the wildcard probe — live
+//! here so they are unit-testable without a server; the resolver only runs
+//! the queries.
 
 use std::collections::HashSet;
 use std::fmt;
@@ -33,7 +37,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use hickory_resolver::lookup::Lookup;
-use hickory_resolver::net::{DnsError, NetError, NoRecords};
+use hickory_resolver::net::{DnsError, NetError};
 use hickory_resolver::proto::op::{Message, MessageType, Metadata, ResponseCode};
 use hickory_resolver::proto::rr::domain::usage::{
     ResolverUsage, INVALID, IN_ADDR_ARPA_127, IP6_ARPA_1, LOCAL, LOCALHOST, ONION,
@@ -205,14 +209,11 @@ pub struct DnsQueryResult {
     pub answered_locally: bool,
     pub status: DnsStatus,
     /// Header flags as dig prints them, lowercase, in dig's order: qr aa tc
-    /// rd ra ad cd.
+    /// rd ra ad cd — the ones the response header set, whatever its status.
     ///
-    /// Empty when the resolver did not surface a response header: hickory
-    /// reports a negative answer (NXDOMAIN, NODATA, a referral) and an error
-    /// response code (SERVFAIL, REFUSED, …) as an error that carries the
-    /// code but not the header, and seer never invents flags — nor passes
-    /// on the header hickory makes up for an answer it gave itself
-    /// ([`answered_locally`](Self::answered_locally)).
+    /// Empty only for an answer no server gave
+    /// ([`answered_locally`](Self::answered_locally)): seer never invents
+    /// flags, nor passes on the header hickory makes up for its own answer.
     pub flags: Vec<String>,
     /// The ANSWER section in order: the CNAME chain first, then the records
     /// of the requested type — every record under its real owner name.
@@ -221,14 +222,15 @@ pub struct DnsQueryResult {
     /// all sub-query answers merged in the ANY type order, identical records
     /// deduplicated.
     ///
-    /// When a CNAME chain ends in a negative answer (its target does not
-    /// exist, or has no records of the type), hickory surfaces only that
-    /// negative answer, so the chain is not listed.
+    /// A negative answer lists its chain too: NXDOMAIN beside a CNAME chain
+    /// means the chain's last target does not exist (RFC 6604 §2), and
+    /// NODATA that the target has no records of the type — the queried name
+    /// exists, since it owns the first CNAME.
     pub answers: Vec<DnsRecord>,
-    /// AUTHORITY records returned: for a negative answer the zone's SOA,
-    /// when the server sent one; for a referral the NS records of the zone
-    /// it refers to ([`referral_zone`](Self::referral_zone)). An ANY answer
-    /// with records carries none (see [`answers`](Self::answers)).
+    /// The AUTHORITY section: for a negative answer the SOA of the zone that
+    /// gave it, when the server sent one; for a referral the NS records of
+    /// the zone it refers to ([`referral_zone`](Self::referral_zone)). An
+    /// ANY answer with records carries none (see [`answers`](Self::answers)).
     pub authority: Vec<DnsRecord>,
     /// Wildcard probe outcome; None when the probe was not run or did not
     /// complete.
@@ -247,16 +249,19 @@ impl DnsQueryResult {
 
     /// The zone this response refers the query to, when it is a referral
     /// rather than an answer: NOERROR with no answer of the requested type,
-    /// NS records in AUTHORITY and no SOA there (RFC 2308 §2.2) — the zone
-    /// is the NS records' owner.
+    /// the AA (authoritative) flag clear, NS records in AUTHORITY and no SOA
+    /// there (RFC 2308 §2.2) — the zone is the NS records' owner.
     ///
     /// A server that is neither authoritative for the name nor recursive (an
     /// `@server` serving only a parent zone) answers this way, pointing at
     /// the servers of the zone below it. Unlike NODATA, a referral says
-    /// nothing about whether the name exists.
+    /// nothing about whether the name exists. An authoritative response is
+    /// never a referral, even with its own zone's NS records in AUTHORITY
+    /// beside an unfollowed CNAME.
     pub fn referral_zone(&self) -> Option<&str> {
         if self.status != DnsStatus::NoError
             || !self.lacks_answer()
+            || self.flags.iter().any(|flag| flag == "aa")
             || self
                 .authority
                 .iter()
@@ -337,53 +342,13 @@ pub(crate) struct Exchange {
 }
 
 impl Exchange {
-    /// An answerless outcome with `status` and no surfaced header.
-    fn negative(status: DnsStatus, authority: Vec<DnsRecord>) -> Self {
-        Self {
-            status,
-            flags: Vec::new(),
-            answers: Vec::new(),
-            authority,
-        }
-    }
-
-    /// Maps a hickory lookup outcome to an exchange.
-    ///
-    /// - A lookup: the status and flags from its message header (hickory
-    ///   keeps the upstream header), its ANSWER and AUTHORITY sections.
-    /// - `NoRecordsFound`: the negative answer's own response code —
-    ///   NXDOMAIN, or NOERROR for NODATA or a referral — and its AUTHORITY
-    ///   records (at least the SOA, when the server sent one; a referral's
-    ///   NS records, which [`DnsQueryResult::referral_zone`] reads).
-    /// - An error response code (SERVFAIL, REFUSED, NOTIMP, …): that status
-    ///   with no records, as dig shows it.
-    /// - Anything else is a transport failure (timeout, no connection,
-    ///   malformed response) and stays an error.
-    pub(crate) fn from_lookup(
-        result: std::result::Result<Lookup, NetError>,
-        record_type: RecordType,
-    ) -> Result<Self> {
-        match result {
-            Ok(lookup) => Ok(Self::from_message(lookup.message())),
-            Err(NetError::Dns(DnsError::NoRecordsFound(no_records))) => Ok(Self::negative(
-                no_records.response_code.into(),
-                negative_authority(&no_records),
-            )),
-            Err(NetError::Dns(DnsError::ResponseCode(code))) => {
-                Ok(Self::negative(code.into(), Vec::new()))
-            }
-            Err(e) => Err(SeerError::DnsError(format!(
-                "{record_type} lookup failed: {e}"
-            ))),
-        }
-    }
-
-    /// The message is the upstream response as hickory received it — or, when
-    /// hickory followed a CNAME chain itself, the last hop's response with
-    /// the chain's records merged into its ANSWER section. (A repeat of such
-    /// a chased lookup, served from hickory's cache, carries the header
-    /// hickory synthesized for the cache entry, which sets only `qr`.)
-    fn from_message(message: &Message) -> Self {
+    /// Maps a response, exactly as the server sent it, to an exchange: the
+    /// status from the header's response code — extended by EDNS, which
+    /// hickory merges in as it decodes (BADVERS, BADCOOKIE, …) — the flags
+    /// from the header, and the converted ANSWER and AUTHORITY sections.
+    /// Whatever the response code, NXDOMAIN, SERVFAIL and REFUSED included,
+    /// a response is an outcome to report.
+    pub(crate) fn from_message(message: &Message) -> Self {
         Self {
             status: message.metadata.response_code.into(),
             flags: header_flags(&message.metadata),
@@ -393,6 +358,29 @@ impl Exchange {
                 .iter()
                 .filter_map(to_dns_record)
                 .collect(),
+        }
+    }
+
+    /// Maps the answer hickory's resolver gives itself for a special-use
+    /// name ([`answered_locally`]): its loopback records (A, AAAA, PTR), or
+    /// a negative answer — NODATA for other types, NXDOMAIN for `invalid`
+    /// and `onion` — that it reports as an error carrying the code. Its
+    /// header is its own; [`into_result`](Self::into_result) drops it.
+    pub(crate) fn from_local(
+        result: std::result::Result<Lookup, NetError>,
+        record_type: RecordType,
+    ) -> Result<Self> {
+        match result {
+            Ok(lookup) => Ok(Self::from_message(lookup.message())),
+            Err(NetError::Dns(DnsError::NoRecordsFound(no_records))) => Ok(Self {
+                status: no_records.response_code.into(),
+                flags: Vec::new(),
+                answers: Vec::new(),
+                authority: Vec::new(),
+            }),
+            Err(e) => Err(SeerError::DnsError(format!(
+                "{record_type} lookup failed: {e}"
+            ))),
         }
     }
 
@@ -445,21 +433,6 @@ impl Exchange {
 /// `query_time_ms` of a query result and of a trace hop.
 pub(crate) fn duration_ms(elapsed: Duration) -> u64 {
     u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
-}
-
-/// The AUTHORITY records of a negative answer: the whole section when hickory
-/// kept it (a negative answer straight from the server), else the SOA it
-/// extracted (a negative answer at the end of a CNAME chain it followed).
-fn negative_authority(no_records: &NoRecords) -> Vec<DnsRecord> {
-    match &no_records.authorities {
-        Some(records) => records.iter().filter_map(to_dns_record).collect(),
-        None => no_records
-            .soa
-            .as_ref()
-            .and_then(|soa| to_dns_record(&(**soa).clone().into_record_of_rdata()))
-            .into_iter()
-            .collect(),
-    }
 }
 
 /// Renders the header flags as dig prints them: lowercase, in dig's order
@@ -547,7 +520,7 @@ pub(crate) fn dedupe_records(records: impl IntoIterator<Item = DnsRecord>) -> Ve
 ///
 /// - status: NOERROR if any sub-query got NOERROR, NXDOMAIN if all got
 ///   NXDOMAIN, else the first sub-query's status;
-/// - flags: from the first sub-query that surfaced a response header;
+/// - flags: the first sub-query's that got a response;
 /// - answers: concatenated in order, repeats removed ([`dedupe_records`]) —
 ///   a CNAME'd name returns its CNAME to every sub-query;
 /// - authority: only for a negative merge (no answers), and only from the
@@ -579,11 +552,7 @@ pub(crate) fn merge_any(results: Vec<Result<Exchange>>) -> Result<Exchange> {
     } else {
         first.status
     };
-    let flags = exchanges
-        .iter()
-        .find(|e| !e.flags.is_empty())
-        .map(|e| e.flags.clone())
-        .unwrap_or_default();
+    let flags = first.flags.clone();
     let answers = dedupe_records(exchanges.iter().flat_map(|e| e.answers.iter().cloned()));
     let authority = if answers.is_empty() {
         dedupe_records(
@@ -770,6 +739,7 @@ mod tests {
 
     // --- Pure result-assembly pieces -----------------------------------
 
+    use hickory_resolver::net::NoRecords;
     use hickory_resolver::proto::op::{OpCode, Query};
     use hickory_resolver::proto::rr::rdata::SOA;
     use hickory_resolver::proto::rr::{Name, RData, Record, RecordType as WireType};
@@ -826,6 +796,14 @@ mod tests {
         }
     }
 
+    /// An answerless response with `status` and `authority`.
+    fn negative(status: DnsStatus, authority: Vec<DnsRecord>) -> Exchange {
+        Exchange {
+            authority,
+            ..exchange(status, vec![])
+        }
+    }
+
     fn soa_record(zone: &str) -> Record<SOA> {
         Record::from_rdata(
             Name::from_ascii(format!("{zone}.")).unwrap(),
@@ -867,62 +845,101 @@ mod tests {
         assert!(header_flags(&query).is_empty());
     }
 
+    /// A response to `name`/A as a server sends it, with `code` and the
+    /// header flags qr rd ra.
+    fn response(name: &str, code: ResponseCode) -> Message {
+        let mut message = Message::response(7, OpCode::Query);
+        message.metadata.response_code = code;
+        message.metadata.recursion_desired = true;
+        message.metadata.recursion_available = true;
+        message.add_query(query_for(name));
+        message
+    }
+
+    fn wire_record(owner: &str, data: RData) -> Record {
+        Record::from_rdata(Name::from_ascii(owner).unwrap(), 300, data)
+    }
+
+    fn wire_cname(owner: &str, target: &str) -> Record {
+        wire_record(
+            owner,
+            RData::CNAME(hickory_resolver::proto::rr::rdata::CNAME(
+                Name::from_ascii(target).unwrap(),
+            )),
+        )
+    }
+
     #[test]
-    fn from_lookup_reads_status_and_sections_from_the_message() {
-        let answer = Record::from_rdata(
-            Name::from_ascii("www.seer.test.").unwrap(),
-            300,
+    fn from_message_reads_status_flags_and_sections_as_sent() {
+        let mut message = response("www.seer.test.", ResponseCode::NoError);
+        message.add_answer(wire_record(
+            "www.seer.test.",
             RData::A(hickory_resolver::proto::rr::rdata::A::new(192, 0, 2, 1)),
-        );
-        let lookup = Lookup::new_with_max_ttl(query_for("www.seer.test."), [answer]);
-        let exchange = Exchange::from_lookup(Ok(lookup), RecordType::A).unwrap();
+        ));
+        let exchange = Exchange::from_message(&message);
         assert_eq!(exchange.status, DnsStatus::NoError);
+        assert_eq!(exchange.flags, ["qr", "rd", "ra"]);
         assert_eq!(exchange.answers, [a("www.seer.test", "192.0.2.1")]);
         assert!(exchange.authority.is_empty());
-        // (Header flags from a real upstream response are covered by the
-        // resolver's mock-server tests; this lookup's header is synthetic.)
     }
 
     #[test]
-    fn from_lookup_maps_negative_answers_to_their_status() {
-        // NXDOMAIN whose AUTHORITY hickory kept whole.
-        let mut nx = NoRecords::new(query_for("nx.seer.test."), ResponseCode::NXDomain);
-        nx.authorities = Some(vec![soa_record("seer.test").into_record_of_rdata()].into());
-        let exchange = Exchange::from_lookup(Err(NetError::from(nx)), RecordType::A).unwrap();
+    fn from_message_keeps_the_chain_and_header_of_a_negative_answer() {
+        // Regression: a CNAME whose target does not exist came back as a
+        // bare NXDOMAIN — no chain, no flags — because hickory's resolver
+        // chased the target itself and turned its negative answer into an
+        // error. The response as sent keeps all three sections.
+        let mut dangling = response("www.seer.test.", ResponseCode::NXDomain);
+        dangling.add_answer(wire_cname("www.seer.test.", "gone.cdn.test."));
+        dangling.add_authority(soa_record("cdn.test").into_record_of_rdata());
+        let exchange = Exchange::from_message(&dangling);
         assert_eq!(exchange.status, DnsStatus::NxDomain);
-        assert!(exchange.flags.is_empty(), "no header was surfaced");
-        assert!(exchange.answers.is_empty());
+        assert_eq!(exchange.flags, ["qr", "rd", "ra"]);
+        assert_eq!(exchange.answers, [cname("www.seer.test", "gone.cdn.test.")]);
         assert_eq!(exchange.authority.len(), 1);
-        assert_eq!(exchange.authority[0].name, "seer.test");
+        assert_eq!(exchange.authority[0].name, "cdn.test");
         assert_eq!(exchange.authority[0].record_type, RecordType::SOA);
 
-        // NODATA at the end of a chain hickory followed: only the SOA.
-        let mut nodata = NoRecords::new(query_for("edge.seer.test."), ResponseCode::NoError);
-        nodata.soa = Some(Box::new(soa_record("seer.test")));
-        let exchange = Exchange::from_lookup(Err(NetError::from(nodata)), RecordType::A).unwrap();
-        assert_eq!(exchange.status, DnsStatus::NoError);
-        assert_eq!(exchange.authority.len(), 1);
-        assert_eq!(exchange.authority[0].ttl, 900);
-
-        // No SOA at all: still a result, just without authority.
-        let bare = NoRecords::new(query_for("edge.seer.test."), ResponseCode::NXDomain);
-        let exchange = Exchange::from_lookup(Err(NetError::from(bare)), RecordType::A).unwrap();
-        assert!(exchange.authority.is_empty());
-    }
-
-    #[test]
-    fn from_lookup_maps_error_codes_to_results_and_transport_failures_to_errors() {
+        // An error code is a response too, header and all.
         for (code, status) in [
             (ResponseCode::ServFail, DnsStatus::ServFail),
             (ResponseCode::Refused, DnsStatus::Refused),
             (ResponseCode::NotImp, DnsStatus::Other(4)),
+            (ResponseCode::BADVERS, DnsStatus::Other(16)),
         ] {
-            let error = NetError::Dns(DnsError::ResponseCode(code));
-            let exchange = Exchange::from_lookup(Err(error), RecordType::MX).unwrap();
-            assert_eq!(exchange, Exchange::negative(status, vec![]));
+            let exchange = Exchange::from_message(&response("www.seer.test.", code));
+            assert_eq!(exchange, negative(status, vec![]), "{code}");
         }
+    }
+
+    #[test]
+    fn from_local_maps_the_resolvers_own_answers() {
+        // Loopback records for an address or PTR query.
+        let answer = wire_record(
+            "localhost.",
+            RData::A(hickory_resolver::proto::rr::rdata::A::new(127, 0, 0, 1)),
+        );
+        let lookup = Lookup::new_with_max_ttl(query_for("localhost."), [answer]);
+        let exchange = Exchange::from_local(Ok(lookup), RecordType::A).unwrap();
+        assert_eq!(exchange.status, DnsStatus::NoError);
+        assert_eq!(exchange.answers, [a("localhost", "127.0.0.1")]);
+
+        // NODATA for other types, NXDOMAIN for `invalid` and `onion`: the
+        // code alone, with no header and no records.
+        for (code, status) in [
+            (ResponseCode::NoError, DnsStatus::NoError),
+            (ResponseCode::NXDomain, DnsStatus::NxDomain),
+        ] {
+            let no_records = NoRecords::new(query_for("x.onion."), code);
+            let exchange =
+                Exchange::from_local(Err(NetError::from(no_records)), RecordType::MX).unwrap();
+            assert_eq!(exchange.status, status);
+            assert!(exchange.flags.is_empty() && exchange.answers.is_empty());
+            assert!(exchange.authority.is_empty());
+        }
+
         for transport in [NetError::Timeout, NetError::NoConnections] {
-            let err = Exchange::from_lookup(Err(transport), RecordType::MX).unwrap_err();
+            let err = Exchange::from_local(Err(transport), RecordType::MX).unwrap_err();
             assert!(matches!(&err, SeerError::DnsError(m) if m.starts_with("MX lookup failed")));
         }
     }
@@ -1028,9 +1045,12 @@ mod tests {
     #[test]
     fn merge_any_status_flags_and_answers() {
         let chain = cname("www.seer.test", "edge.cdn.test.");
-        let nodata = Exchange::negative(DnsStatus::NoError, vec![soa("seer.test")]);
+        let nodata = negative(DnsStatus::NoError, vec![soa("seer.test")]);
+        let mut authoritative = nodata.clone();
+        authoritative.flags = vec!["qr".to_string(), "aa".to_string()];
         let merged = merge_any(vec![
-            Ok(nodata.clone()),
+            Err(SeerError::DnsError("A lookup failed: timeout".to_string())),
+            Ok(authoritative),
             Ok(exchange(
                 DnsStatus::NoError,
                 vec![chain.clone(), a("edge.cdn.test", "192.0.2.7")],
@@ -1038,12 +1058,12 @@ mod tests {
             Err(SeerError::DnsError("MX lookup failed: timeout".to_string())),
             Ok(exchange(DnsStatus::NoError, vec![chain.clone()])),
             // The DS sub-query, answered NODATA by the parent zone.
-            Ok(Exchange::negative(DnsStatus::NoError, vec![soa("test")])),
+            Ok(negative(DnsStatus::NoError, vec![soa("test")])),
         ])
         .unwrap();
         assert_eq!(merged.status, DnsStatus::NoError);
-        // The first sub-query surfaced no header; the second did.
-        assert_eq!(merged.flags, ["qr", "rd", "ra"]);
+        // The flags of the first sub-query that got a response.
+        assert_eq!(merged.flags, ["qr", "aa"]);
         assert_eq!(merged.answers, vec![chain, a("edge.cdn.test", "192.0.2.7")]);
         // Regression: the NODATA sub-queries' SOAs — the parent's among
         // them — were merged into a positive answer's AUTHORITY.
@@ -1053,7 +1073,7 @@ mod tests {
         // returned the merged status.
         let all_nodata = merge_any(vec![
             Ok(nodata.clone()),
-            Ok(Exchange::negative(DnsStatus::ServFail, vec![soa("other")])),
+            Ok(negative(DnsStatus::ServFail, vec![soa("other")])),
             Ok(nodata),
         ])
         .unwrap();
@@ -1061,24 +1081,22 @@ mod tests {
         assert_eq!(all_nodata.authority, [soa("seer.test")]);
 
         let all_nx = merge_any(vec![
-            Ok(Exchange::negative(
-                DnsStatus::NxDomain,
-                vec![soa("seer.test")],
-            )),
-            Ok(Exchange::negative(
-                DnsStatus::NxDomain,
-                vec![soa("seer.test")],
-            )),
+            Ok(negative(DnsStatus::NxDomain, vec![soa("seer.test")])),
+            Ok(negative(DnsStatus::NxDomain, vec![soa("seer.test")])),
         ])
         .unwrap();
         assert_eq!(all_nx.status, DnsStatus::NxDomain);
-        assert!(all_nx.flags.is_empty());
+        assert_eq!(
+            all_nx.flags,
+            ["qr", "rd", "ra"],
+            "a negative answer has a header"
+        );
         assert_eq!(all_nx.authority, [soa("seer.test")]);
 
         // Mixed failures: the first sub-query's status.
         let mixed = merge_any(vec![
-            Ok(Exchange::negative(DnsStatus::ServFail, vec![])),
-            Ok(Exchange::negative(DnsStatus::NxDomain, vec![])),
+            Ok(negative(DnsStatus::ServFail, vec![])),
+            Ok(negative(DnsStatus::NxDomain, vec![])),
         ])
         .unwrap();
         assert_eq!(mixed.status, DnsStatus::ServFail);
@@ -1194,14 +1212,14 @@ mod tests {
         let different = judge(&answer, probe_answer("192.0.2.99")).unwrap();
         assert!(different.present && !different.matches_answer);
 
-        let absent = judge(&answer, Ok(Exchange::negative(DnsStatus::NxDomain, vec![]))).unwrap();
+        let absent = judge(&answer, Ok(negative(DnsStatus::NxDomain, vec![]))).unwrap();
         assert!(!absent.present && !absent.matches_answer);
-        let nodata = judge(&answer, Ok(Exchange::negative(DnsStatus::NoError, vec![]))).unwrap();
+        let nodata = judge(&answer, Ok(negative(DnsStatus::NoError, vec![]))).unwrap();
         assert!(!nodata.present);
 
         // The probe did not complete: nothing to say.
         assert_eq!(
-            judge(&answer, Ok(Exchange::negative(DnsStatus::ServFail, vec![]))),
+            judge(&answer, Ok(negative(DnsStatus::ServFail, vec![]))),
             None
         );
         assert_eq!(
@@ -1210,7 +1228,7 @@ mod tests {
         );
 
         // Nothing to judge against: a negative main answer, or a bare chain.
-        let nx = Exchange::negative(DnsStatus::NxDomain, vec![]);
+        let nx = negative(DnsStatus::NxDomain, vec![]);
         assert_eq!(judge(&nx, probe_answer("192.0.2.1")), None);
         let chain_only = exchange(
             DnsStatus::NoError,
@@ -1335,6 +1353,20 @@ mod tests {
         any.record_type = RecordType::ANY;
         assert_eq!(any.referral_zone(), Some("child.seer.test"));
         assert!(!any.is_nodata());
+
+        // An authoritative server's answer is never a referral: here its own
+        // zone's NS records sit beside a CNAME it did not follow out of the
+        // zone, with no SOA. The AA flag tells the two apart.
+        let mut unfollowed = result(
+            RecordType::A,
+            DnsStatus::NoError,
+            vec![cname("www.seer.test", "edge.cdn.test.")],
+        );
+        unfollowed.flags = vec!["qr".to_string(), "aa".to_string(), "rd".to_string()];
+        unfollowed.authority = vec![ns("seer.test", "ns1.seer.test.")];
+        assert_eq!(unfollowed.referral_zone(), None);
+        unfollowed.flags.retain(|flag| flag != "aa");
+        assert_eq!(unfollowed.referral_zone(), Some("seer.test"));
     }
 
     #[test]

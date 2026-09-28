@@ -1,10 +1,12 @@
 ---
 source: seer-core/tests/format_snapshots.rs
+assertion_line: 1374
 expression: markdown ().format_dig (& fixture_dig_nxdomain())
 ---
 ## DNS A Records: gone.seer.test
 
 - **Status**: `NXDOMAIN`
+- **Flags**: `qr rd ra`
 - **Server**: default
 - **Query time**: 31 ms
 
