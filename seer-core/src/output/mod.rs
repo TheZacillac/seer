@@ -11,7 +11,10 @@
 //!
 //! [`dig_short`] and [`dig_trace_short`] are the `dig +short` rendering of a
 //! query result and a trace: bare values, one per line, sanitized for a
-//! terminal — a plain-text mode outside the four formats.
+//! terminal — a plain-text mode outside the four formats. [`dig`] also holds
+//! the wording of a query's outcome (NXDOMAIN vs NODATA, the wildcard note),
+//! shared by the formatters and the TUI's DNS lens, and [`sanitize_line`] is
+//! the terminal-safety guard the human formatter applies to remote strings.
 
 // The report-method list and the impl generators below must precede the
 // `mod` declarations: `macro_rules!` is textually scoped, and the human and
@@ -98,14 +101,14 @@ macro_rules! impl_forwarding {
 }
 
 mod contact;
-mod dig;
+pub mod dig;
 mod grouping;
 mod human;
 mod json;
 mod markdown;
 
 pub use dig::{dig_short, dig_trace_short};
-pub use human::HumanFormatter;
+pub use human::{sanitize_line, HumanFormatter};
 pub use json::JsonFormatter;
 pub use markdown::MarkdownFormatter;
 

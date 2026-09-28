@@ -1,8 +1,11 @@
 //! dig-style rendering shared across formats: the `+short` lines
 //! ([`dig_short`], [`dig_trace_short`]) and the wording of a query's
 //! outcome — the negative-answer verdict, the wildcard note, the unfollowed
-//! CNAME of a trace — so the human and Markdown formatters say the same
-//! thing and differ only in styling and escaping.
+//! CNAME of a trace — so the human and Markdown formatters and the TUI's DNS
+//! lens say the same thing and differ only in styling and escaping.
+//!
+//! The wording takes remote strings (a probe name, a CNAME target) already
+//! escaped for the caller's format and returns them embedded as given.
 
 use std::fmt;
 
@@ -41,7 +44,7 @@ fn short_lines<'r>(records: impl IntoIterator<Item = &'r DnsRecord>) -> String {
 /// How a response code reads, for styling: an answer, a negative answer
 /// (the name or the type does not exist), or no answer at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Tone {
+pub enum Tone {
     /// NOERROR, with or without records.
     Answered,
     /// NXDOMAIN.
@@ -51,7 +54,7 @@ pub(super) enum Tone {
 }
 
 /// The [`Tone`] of a response code.
-pub(super) fn tone(status: DnsStatus) -> Tone {
+pub fn tone(status: DnsStatus) -> Tone {
     match status {
         DnsStatus::NoError => Tone::Answered,
         DnsStatus::NxDomain => Tone::Negative,
@@ -66,7 +69,7 @@ pub(super) fn tone(status: DnsStatus) -> Tone {
 ///
 /// `nodata` is whether a NOERROR response lacks records of `record_type`
 /// ([`DnsQueryResult::is_nodata`] for a query).
-pub(super) fn verdict(status: DnsStatus, record_type: RecordType, nodata: bool) -> Option<String> {
+pub fn verdict(status: DnsStatus, record_type: RecordType, nodata: bool) -> Option<String> {
     let text = match status {
         DnsStatus::NoError if !nodata => return None,
         DnsStatus::NoError if record_type == RecordType::ANY => {
@@ -86,10 +89,7 @@ pub(super) fn verdict(status: DnsStatus, record_type: RecordType, nodata: bool) 
 /// The wildcard note for a probe that found a wildcard, `None` when the
 /// probe name got no answer. `probe_name` is the probe's name as the caller
 /// escaped it for its format.
-pub(super) fn wildcard_note(
-    probe: &WildcardProbe,
-    probe_name: impl fmt::Display,
-) -> Option<String> {
+pub fn wildcard_note(probe: &WildcardProbe, probe_name: impl fmt::Display) -> Option<String> {
     if !probe.present {
         return None;
     }
@@ -104,7 +104,7 @@ pub(super) fn wildcard_note(
 }
 
 /// The suffix that marks the root zone (`.`) in a trace hop's heading.
-pub(super) fn zone_suffix(zone: &str) -> &'static str {
+pub fn zone_suffix(zone: &str) -> &'static str {
     if zone == "." {
         " (root)"
     } else {
@@ -115,7 +115,7 @@ pub(super) fn zone_suffix(zone: &str) -> &'static str {
 /// The CNAME a trace ended at without following it: the final answer holds
 /// a CNAME but no record of the queried type (`dig +trace` stops there
 /// too). Returns the CNAME's target — the last one, for a partial chain.
-pub(super) fn unfollowed_cname(trace: &DnsTrace) -> Option<&str> {
+pub fn unfollowed_cname(trace: &DnsTrace) -> Option<&str> {
     let wanted = trace.record_type;
     if wanted == RecordType::CNAME || trace.answers.iter().any(|r| r.record_type == wanted) {
         return None;
@@ -128,7 +128,7 @@ pub(super) fn unfollowed_cname(trace: &DnsTrace) -> Option<&str> {
 
 /// The note under a trace that stopped at a CNAME (see
 /// [`unfollowed_cname`]); `target` is escaped by the caller.
-pub(super) fn cname_note(target: impl fmt::Display) -> String {
+pub fn cname_note(target: impl fmt::Display) -> String {
     format!(
         "The answer is a CNAME to {target}, which a trace does not follow: trace that name next"
     )

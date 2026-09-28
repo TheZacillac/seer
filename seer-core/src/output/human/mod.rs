@@ -58,10 +58,13 @@ pub(super) fn sanitize_display(s: &str) -> String {
         .collect()
 }
 
-/// [`sanitize_display`] for text that must stay on one line — a record
-/// row, a `+short` value: the newlines and tabs it keeps are folded to
-/// spaces too, so remote data cannot forge an extra row.
-pub(super) fn sanitize_line(s: &str) -> String {
+/// Sanitizes untrusted remote text (a record's owner or data, a WHOIS value)
+/// for one line of a terminal: escape sequences and control characters are
+/// removed as for every human-formatted value (`sanitize_display`), and the
+/// newlines and tabs that keeps are folded to spaces too, so remote data can
+/// neither inject terminal escapes nor forge an extra row. Used for record
+/// rows and `+short` values, and by other terminal renderers (the TUI).
+pub fn sanitize_line(s: &str) -> String {
     sanitize_display(s)
         .chars()
         .map(|c| if c == '\n' || c == '\t' { ' ' } else { c })
