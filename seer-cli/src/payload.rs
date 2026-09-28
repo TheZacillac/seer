@@ -13,11 +13,8 @@ pub enum Payload {
     Overview(Box<seer_core::LookupResult>),
     Whois(Box<seer_core::WhoisResponse>),
     Rdap(Box<seer_core::RdapResponse>),
-    /// A record list from `DnsResolver::resolve` (the TUI's DNS lens); the
-    /// CLI and REPL `dig` produce [`Payload::Dig`] / [`Payload::DigMany`].
-    Dns(Vec<seer_core::DnsRecord>),
-    /// `dig` for one record type: the whole response (status, flags, CNAME
-    /// chain, authority, wildcard probe).
+    /// `dig` for one record type — and the TUI's DNS lens: the whole
+    /// response (status, flags, CNAME chain, authority, wildcard probe).
     Dig(Box<seer_core::DnsQueryResult>),
     /// `dig` for several record types, one result per type in the order
     /// asked — a JSON array where [`Payload::Dig`] is an object.
@@ -63,7 +60,6 @@ impl Payload {
             Payload::Overview(_) => "lookup",
             Payload::Whois(_) => "whois",
             Payload::Rdap(_) => "rdap",
-            Payload::Dns(_) => "dns",
             Payload::Dig(_) | Payload::DigMany(_) => "dig",
             Payload::Trace(_) => "trace",
             Payload::Ssl(_) => "ssl",
@@ -118,7 +114,6 @@ pub fn serialize(data: &Payload, format: OutputFormat) -> String {
         Payload::Overview(r) => fmt.format_lookup(r),
         Payload::Whois(w) => fmt.format_whois(w),
         Payload::Rdap(r) => fmt.format_rdap(r),
-        Payload::Dns(records) => fmt.format_dns(records),
         Payload::Dig(result) => fmt.format_dig(result),
         Payload::DigMany(results) => match format {
             // One document: the array of results, as `-q` prints it.
@@ -383,36 +378,31 @@ mod tests {
             Some("")
         );
         assert_eq!(Payload::Reverse(vec![]).short(), None);
-        assert_eq!(Payload::Dns(vec![]).short(), None);
     }
 
-    #[test]
-    fn serializes_dns_as_json() {
-        let data = Payload::Dns(vec![DnsRecord {
-            name: "example.com".into(),
-            record_type: RecordType::A,
+    fn ptr_records() -> Vec<DnsRecord> {
+        vec![DnsRecord {
+            name: "7.2.0.192.in-addr.arpa".into(),
+            record_type: RecordType::PTR,
             ttl: 300,
-            data: RecordData::A {
-                address: "1.2.3.4".into(),
+            data: RecordData::PTR {
+                target: "host.seer.test.".into(),
             },
-        }]);
-        let out = serialize(&data, OutputFormat::Json);
-        assert!(out.contains("1.2.3.4"));
+        }]
+    }
+
+    /// `reverse` stays a record list: `resolve` output through `format_dns`.
+    #[test]
+    fn serializes_reverse_as_a_json_list() {
+        let out = serialize(&Payload::Reverse(ptr_records()), OutputFormat::Json);
+        assert!(out.contains("host.seer.test."));
         assert!(out.trim_start().starts_with('['));
     }
 
     #[test]
-    fn serializes_dns_as_markdown() {
-        let data = Payload::Dns(vec![DnsRecord {
-            name: "example.com".into(),
-            record_type: RecordType::A,
-            ttl: 300,
-            data: RecordData::A {
-                address: "1.2.3.4".into(),
-            },
-        }]);
-        let out = serialize(&data, OutputFormat::Markdown);
-        assert!(out.contains("1.2.3.4"));
+    fn serializes_reverse_as_markdown() {
+        let out = serialize(&Payload::Reverse(ptr_records()), OutputFormat::Markdown);
+        assert!(out.contains("host.seer.test."));
         assert!(
             out.contains('#') || out.contains('|'),
             "expected markdown structure"
@@ -439,17 +429,10 @@ mod tests {
     /// result's — no enum tag, no Box wrapper.
     #[test]
     fn serde_form_is_the_wrapped_result() {
-        let records = vec![DnsRecord {
-            name: "example.com".into(),
-            record_type: RecordType::A,
-            ttl: 300,
-            data: RecordData::A {
-                address: "1.2.3.4".into(),
-            },
-        }];
+        let records = ptr_records();
         let drift = seer_core::DriftReport::empty("example.com");
         assert_eq!(
-            serde_json::to_string(&Payload::Dns(records.clone())).unwrap(),
+            serde_json::to_string(&Payload::Reverse(records.clone())).unwrap(),
             serde_json::to_string(&records).unwrap()
         );
         assert_eq!(
@@ -460,8 +443,7 @@ mod tests {
 
     #[test]
     fn kind_labels_are_lowercase() {
-        let data = Payload::Dns(vec![]);
-        assert_eq!(data.kind(), "dns");
+        assert_eq!(Payload::Reverse(vec![]).kind(), "reverse");
         assert_eq!(Payload::Dig(Box::new(chained())).kind(), "dig");
         assert_eq!(Payload::DigMany(vec![]).kind(), "dig");
         let trace = fixtures::trace(vec![], None);

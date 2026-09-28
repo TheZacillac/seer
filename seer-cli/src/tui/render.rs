@@ -575,6 +575,33 @@ mod tests {
         assert!(s.contains("querying 8.8.8.8"), "not the session domain");
     }
 
+    /// `r` swaps the DNS lens for the raw dig result: the JSON object the
+    /// CLI's `seer dig --format json` prints.
+    #[test]
+    fn raw_view_shows_the_dig_result_object() {
+        use crate::payload::fixtures;
+        use seer_core::RecordType;
+
+        let theme = Theme::frappe();
+        let mut app = App::new(None);
+        app.lens = lenses::find_by_cmd_or_key("dns").unwrap();
+        app.update(crate::tui::action::Msg::Data {
+            lens: "dns".into(),
+            gen: 0,
+            result: Ok(LensData::Dig(Box::new(fixtures::dig(
+                RecordType::A,
+                vec![fixtures::a("www.seer.test", "192.0.2.7")],
+            )))),
+        });
+        let human = full_buf(&app, &theme);
+        assert!(human.contains("● NOERROR"), "{human}");
+        app.format = seer_core::output::OutputFormat::Json;
+        let raw = full_buf(&app, &theme);
+        assert!(raw.contains("DNS Records · raw"), "{raw}");
+        assert!(raw.contains("\"status\": \"NOERROR\""), "{raw}");
+        assert!(raw.contains("\"address\": \"192.0.2.7\""), "{raw}");
+    }
+
     #[test]
     fn shell_renders_without_panicking() {
         let theme = Theme::frappe();

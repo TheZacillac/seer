@@ -52,13 +52,15 @@ pub async fn fetch(req: FetchReq, config: &seer_core::SeerConfig) -> Result<Lens
             nameserver,
         } => seer_core::DnsResolver::from_config(config)
             // An explicit nameserver wins; otherwise the configured one, like `dig`.
-            .resolve(
+            // NXDOMAIN, NODATA and SERVFAIL are results the lens renders;
+            // only a transport failure or invalid input is an error.
+            .query(
                 &domain,
                 record_type,
                 nameserver.as_deref().or(config.nameserver.as_deref()),
             )
             .await
-            .map(LensData::Dns)
+            .map(|r| LensData::Dig(Box::new(r)))
             .map_err(e),
         FetchReq::Dnssec(d) => seer_core::DnssecChecker::new()
             .check(&d)
@@ -74,6 +76,16 @@ pub async fn fetch(req: FetchReq, config: &seer_core::SeerConfig) -> Result<Lens
             .compare(&domain, record_type, &a, &b)
             .await
             .map(|r| LensData::Compare(Box::new(r)))
+            .map_err(e),
+        // The walk starts at the root servers, so no nameserver applies —
+        // not even the configured one (`seer dig +trace` ignores it too).
+        FetchReq::Trace {
+            domain,
+            record_type,
+        } => seer_core::DnsTracer::from_config(config)
+            .trace(&domain, record_type)
+            .await
+            .map(|t| LensData::Trace(Box::new(t)))
             .map_err(e),
         FetchReq::Ssl(d) => seer_core::SslChecker::from_config(config)
             .check(&d)

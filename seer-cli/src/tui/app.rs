@@ -90,8 +90,9 @@ impl App {
     ///
     /// Pure: the caller (`mod.rs`) performs the file I/O and passes the loaded
     /// config in, keeping this `App` layer free of I/O. Currently seeds the
-    /// output format used by the raw-output view; the DNS pane's nameserver is
-    /// a fixed system/Google/Cloudflare picker and is intentionally left alone.
+    /// output format used by the raw-output view; the DNS pane's nameserver
+    /// picker is left alone — its "system" slot queries the configured
+    /// nameserver when the fetch runs (`data::fetch`).
     pub fn apply_config(&mut self, config: &seer_core::SeerConfig) {
         self.format = config.output_format.parse().unwrap_or(OutputFormat::Human);
     }
@@ -193,7 +194,10 @@ impl App {
         let filtered = crate::tui::filter::apply(data, &filter);
         let data = filtered.as_ref().unwrap_or(data);
         match data {
-            LensData::Dns(r) => r.len(),
+            // Filtered by reference, so the verdict still sees every answer.
+            LensData::Dig(r) => crate::tui::filter::dig_rows(r, &filter).count(),
+            // One selectable row per delegation hop.
+            LensData::Trace(t) => t.hops.len(),
             LensData::Prop(p) => p.results.len(),
             LensData::Reverse(r) => r.len(),
             LensData::Watch(w) => w.results.len(),
@@ -316,6 +320,10 @@ impl App {
                     a: self.panes.compare.a.clone(),
                     b: self.panes.compare.b.clone(),
                 },
+                3 => FetchReq::Trace {
+                    domain: d,
+                    record_type: self.panes.dns.record_type,
+                },
                 _ => FetchReq::Dns {
                     domain: d,
                     record_type: self.panes.dns.record_type,
@@ -349,6 +357,9 @@ impl App {
         }
         let key = lens.key;
         self.states.remove(key);
+        // A `/`-filter narrowed the previous tab's rows (DNS Records); the
+        // new tab lists other data, or none.
+        self.lens_filter.remove(key);
         // Invalidate any in-flight fetch for the previous tab even when the
         // new tab has no default request (RDAP IP tab without a resolved IP,
         // ASN tab): no fetch_action follows to bump the gen there, and the
@@ -358,11 +369,12 @@ impl App {
     }
 
     /// Populate `panes.dns.resolved_ip` from DNS or Status results so the RDAP
-    /// IP tab can auto-fetch without an explicit `:rdap <ip>` command.
+    /// IP tab can auto-fetch without an explicit `:rdap <ip>` command. A dig
+    /// answer's A records sit past any CNAME chain, under the chain's end.
     fn extract_resolved_ip_if_needed(&mut self, data: &LensData) {
         match data {
-            LensData::Dns(records) => {
-                let ip = records.iter().find_map(|r| {
+            LensData::Dig(result) => {
+                let ip = result.records().find_map(|r| {
                     if let seer_core::dns::RecordData::A { address } = &r.data {
                         Some(address.clone())
                     } else {
@@ -520,7 +532,7 @@ impl App {
         // pane-focused; when nav-focused it stays the domain-edit shortcut.
         if key.code == KeyCode::Char('/')
             && self.focus == Focus::Pane
-            && crate::tui::filter::is_filterable(self.current_lens().key)
+            && crate::tui::filter::is_filterable(self.current_lens().key, self.tab)
             && matches!(self.state_of(self.lens), LensState::Loaded(_))
         {
             let cur = self
@@ -861,16 +873,23 @@ impl App {
             CmdOutcome::Dig {
                 domain,
                 record_type,
+                server,
+                trace,
             } => {
                 if let Some(i) = lenses::find_by_cmd_or_key("dns") {
                     self.lens = i;
                     self.sel = 0;
                     self.focus = Focus::Nav;
-                    self.reset_tab();
+                    // `+trace` opens the Trace tab, anything else Records.
+                    self.tab = if trace { 3 } else { 0 };
                 }
-                // The Records tab's default request reads the type, so the
-                // cache check refetches when only the type changed.
+                // The Records and Trace tabs' default requests read the type
+                // and nameserver, so the cache check refetches when only
+                // those changed.
                 self.panes.dns.record_type = record_type;
+                if let Some(server) = server {
+                    self.panes.dns.select_server(server);
+                }
                 self.fetch_with(&domain)
             }
             CmdOutcome::WatchMutate { add, remove } => {
@@ -1138,6 +1157,14 @@ mod tests {
         ))))
     }
 
+    /// A NOERROR dig result with no answers.
+    fn empty_dig() -> LensData {
+        LensData::Dig(Box::new(crate::payload::fixtures::dig(
+            RecordType::A,
+            vec![],
+        )))
+    }
+
     #[test]
     fn new_starts_on_overview_nav_focus() {
         let app = App::new(None);
@@ -1206,7 +1233,7 @@ mod tests {
         app.update(Msg::Data {
             lens: "dns".into(),
             gen: 0,
-            result: Ok(LensData::Dns(vec![])),
+            result: Ok(empty_dig()),
         });
         let dns_idx = lenses::find_by_cmd_or_key("dns").unwrap();
         assert!(matches!(app.state_of(dns_idx), LensState::Loaded(_)));
@@ -1405,7 +1432,7 @@ mod tests {
         app.update(Msg::Data {
             lens: "dns".into(),
             gen: 0,
-            result: Ok(LensData::Dns(vec![])),
+            result: Ok(empty_dig()),
         });
         // Lens should remain Idle — stale result was dropped.
         assert!(
@@ -1422,7 +1449,7 @@ mod tests {
         app.update(Msg::Data {
             lens: "dns".into(),
             gen: 2,
-            result: Ok(LensData::Dns(vec![])),
+            result: Ok(empty_dig()),
         });
         assert!(
             matches!(app.state_of(dns_idx), LensState::Loaded(_)),
@@ -1872,7 +1899,7 @@ mod tests {
         app.update(Msg::Data {
             lens: "dns".into(),
             gen: 1,
-            result: Ok(LensData::Dns(vec![])),
+            result: Ok(empty_dig()),
         });
         assert!(
             !matches!(app.state_of(dns_idx), LensState::Loaded(_)),
@@ -2105,7 +2132,7 @@ mod tests {
         app.update(Msg::Data {
             lens: "dns".into(),
             gen,
-            result: Ok(LensData::Dns(vec![])),
+            result: Ok(empty_dig()),
         });
         let dnssec = key(&mut app, KeyCode::Char(']')); // DNSSEC tab
         assert!(dnssec.iter().any(|a| matches!(
@@ -2392,5 +2419,227 @@ mod tests {
             "paste should append to the command buffer, got {:?}",
             app.input_mode
         );
+    }
+
+    // ---- DNS lens: dig results, filter, trace ----
+
+    /// A dig result for `www.seer.test` A: one CNAME hop, then `n` addresses.
+    fn chained_dig(n: u8) -> LensData {
+        use crate::payload::fixtures;
+        let mut answers = vec![fixtures::cname("www.seer.test", "edge.cdn.test.")];
+        answers.extend((1..=n).map(|i| fixtures::a("edge.cdn.test", &format!("192.0.2.{i}"))));
+        LensData::Dig(Box::new(fixtures::dig(RecordType::A, answers)))
+    }
+
+    /// The DNS lens on `example.com`, its Records fetch answered with `data`.
+    fn dns_app_with(data: LensData) -> App {
+        let mut app = app_on_lens(Some("example.com"), "dns");
+        let actions = app.fetch_with_current();
+        let Some(Action::Fetch { gen, .. }) = actions.first() else {
+            panic!("expected a Records fetch, got {actions:?}");
+        };
+        app.update(Msg::Data {
+            lens: "dns".into(),
+            gen: *gen,
+            result: Ok(data),
+        });
+        app
+    }
+
+    fn fetch_gen_of(actions: &[Action]) -> u64 {
+        actions
+            .iter()
+            .find_map(|a| match a {
+                Action::Fetch { gen, .. } => Some(*gen),
+                _ => None,
+            })
+            .expect("a fetch")
+    }
+
+    #[test]
+    fn dig_rows_are_the_selectable_answers_chain_included() {
+        let app = dns_app_with(chained_dig(2));
+        assert!(matches!(
+            app.state_of(app.lens),
+            LensState::Loaded(LensData::Dig(_))
+        ));
+        assert_eq!(app.row_count(), 3, "the CNAME hop and both addresses");
+    }
+
+    #[test]
+    fn a_dig_answer_resolves_the_ip_past_the_cname_chain() {
+        let app = dns_app_with(chained_dig(2));
+        assert_eq!(app.panes.dns.resolved_ip.as_deref(), Some("192.0.2.1"));
+        // A negative answer has none to offer.
+        let app = dns_app_with(LensData::Dig(Box::new(
+            crate::payload::fixtures::dig_status(RecordType::A, seer_core::DnsStatus::NxDomain),
+        )));
+        assert_eq!(app.panes.dns.resolved_ip, None);
+    }
+
+    #[test]
+    fn selection_is_clamped_when_a_refetch_returns_fewer_answers() {
+        let mut app = dns_app_with(chained_dig(4));
+        app.focus = Focus::Pane;
+        key(&mut app, KeyCode::Char('G'));
+        assert_eq!(app.sel, 4);
+        // `s` re-queries through another nameserver; its answer is shorter.
+        let actions = key(&mut app, KeyCode::Char('s'));
+        let gen = fetch_gen_of(&actions);
+        app.update(Msg::Data {
+            lens: "dns".into(),
+            gen,
+            result: Ok(chained_dig(1)),
+        });
+        assert_eq!(app.row_count(), 2);
+        assert_eq!(app.sel, 1, "back on the last real row");
+    }
+
+    #[test]
+    fn slash_filters_the_dns_records_rows() {
+        let mut app = dns_app_with(chained_dig(3));
+        app.focus = Focus::Pane;
+        key(&mut app, KeyCode::Char('/'));
+        assert!(matches!(
+            app.input_mode,
+            InputMode::Field {
+                target: EditTarget::LensFilter,
+                ..
+            }
+        ));
+        for c in "192.0.2.3".chars() {
+            key(&mut app, KeyCode::Char(c));
+        }
+        assert_eq!(app.row_count(), 1, "the live buffer filters as you type");
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.active_filter(), "192.0.2.3");
+        assert_eq!(app.row_count(), 1);
+        assert_eq!(app.sel, 0);
+        // Another sub-tab lists other data: the filter does not follow.
+        key(&mut app, KeyCode::Char(']'));
+        assert_eq!(app.tab, 1);
+        assert_eq!(app.active_filter(), "");
+        // `/` there is the domain editor again, as on any unfiltered tab.
+        key(&mut app, KeyCode::Char('/'));
+        assert!(matches!(
+            app.input_mode,
+            InputMode::Field {
+                target: EditTarget::Target,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn the_trace_tab_fetches_a_trace_and_drops_a_late_records_result() {
+        let mut app = app_on_lens(Some("example.com"), "dns");
+        app.panes.dns.record_type = RecordType::MX;
+        let records_gen = fetch_gen_of(&app.fetch_with_current());
+        // `[` from Records wraps round to the last tab.
+        let actions = key(&mut app, KeyCode::Char('['));
+        assert_eq!(app.tab, 3);
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::Fetch {
+                    req: FetchReq::Trace {
+                        domain,
+                        record_type: RecordType::MX,
+                    },
+                    ..
+                } if domain == "example.com"
+            )),
+            "got {actions:?}"
+        );
+        let trace_gen = fetch_gen_of(&actions);
+        // The Records query started before the tab switch lands late.
+        app.update(Msg::Data {
+            lens: "dns".into(),
+            gen: records_gen,
+            result: Ok(chained_dig(1)),
+        });
+        assert!(matches!(app.state_of(app.lens), LensState::Loading));
+        let trace = crate::payload::fixtures::trace(vec![], None);
+        app.update(Msg::Data {
+            lens: "dns".into(),
+            gen: trace_gen,
+            result: Ok(LensData::Trace(Box::new(trace))),
+        });
+        assert!(matches!(
+            app.state_of(app.lens),
+            LensState::Loaded(LensData::Trace(_))
+        ));
+        assert_eq!(app.row_count(), 2, "one row per hop");
+    }
+
+    #[test]
+    fn dig_command_selects_the_nameserver_and_the_trace_tab() {
+        let mut app = App::new(Some("example.com".into()));
+        let _ = app.take_startup_actions();
+        let actions = app.exec_command("dig @9.9.9.9 AAAA example.org");
+        assert_eq!(app.tab, 0);
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::Fetch {
+                    req: FetchReq::Dns {
+                        domain,
+                        record_type: RecordType::AAAA,
+                        nameserver: Some(ns),
+                    },
+                    ..
+                } if domain == "example.org" && ns == "9.9.9.9"
+            )),
+            "got {actions:?}"
+        );
+        assert_eq!(
+            app.panes.dns.slot_labels(),
+            ["system", "8.8.8.8", "1.1.1.1", "9.9.9.9"]
+        );
+
+        let actions = app.exec_command("dig example.org https +trace");
+        assert_eq!(app.tab, 3, "Trace tab");
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::Fetch {
+                    req: FetchReq::Trace {
+                        record_type: RecordType::HTTPS,
+                        ..
+                    },
+                    ..
+                }
+            )),
+            "got {actions:?}"
+        );
+
+        let actions = app.exec_command("dig example.org A MX");
+        assert!(actions.is_empty());
+        assert!(
+            matches!(&app.toast, Some(t) if t.tone == "fail" && t.msg.contains("one record type"))
+        );
+    }
+
+    #[test]
+    fn copy_and_raw_view_serialize_the_dig_result() {
+        let mut app = dns_app_with(chained_dig(1));
+        let actions = key(&mut app, KeyCode::Char('y'));
+        let Some(Action::Copy { text, label }) = actions.first() else {
+            panic!("expected a copy, got {actions:?}");
+        };
+        assert!(
+            text.starts_with("## DNS A Records: www.seer.test"),
+            "{text}"
+        );
+        assert!(label.contains("markdown"), "{label}");
+
+        app.format = OutputFormat::Json;
+        let actions = key(&mut app, KeyCode::Char('y'));
+        let Some(Action::Copy { text, .. }) = actions.first() else {
+            panic!("expected a copy, got {actions:?}");
+        };
+        let value: serde_json::Value = serde_json::from_str(text).expect("one JSON object");
+        assert_eq!(value["status"], "NOERROR");
+        assert_eq!(value["answers"][1]["name"], "edge.cdn.test");
     }
 }

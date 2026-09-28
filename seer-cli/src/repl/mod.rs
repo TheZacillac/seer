@@ -574,18 +574,13 @@ impl Repl {
 #[cfg(test)]
 mod copy_tests {
     use super::*;
-    use seer_core::dns::{RecordData, RecordType};
+    use crate::payload::fixtures;
+    use seer_core::dns::RecordType;
 
     fn repl_with_result() -> Repl {
         let mut repl = Repl::new().expect("repl construction is offline");
-        repl.last_result = Some(crate::payload::Payload::Dns(vec![seer_core::DnsRecord {
-            name: "example.com".into(),
-            record_type: RecordType::A,
-            ttl: 300,
-            data: RecordData::A {
-                address: "1.2.3.4".into(),
-            },
-        }]));
+        let dig = fixtures::dig(RecordType::A, vec![fixtures::a("example.com", "1.2.3.4")]);
+        repl.last_result = Some(crate::payload::Payload::Dig(Box::new(dig)));
         repl
     }
 
@@ -601,20 +596,20 @@ mod copy_tests {
         let repl = repl_with_result();
         let (text, msg) = repl.render_copy(&[]).expect("copyable");
         assert!(text.contains("1.2.3.4"));
-        assert!(msg.contains("dns") && msg.contains("markdown"));
+        assert!(msg.contains("dig") && msg.contains("markdown"));
     }
 
     #[test]
     fn copy_accepts_explicit_formats() {
         let repl = repl_with_result();
         let (json, _) = repl.render_copy(&["json"]).expect("json");
-        assert!(json.trim_start().starts_with('['));
+        assert!(json.trim_start().starts_with('{'));
         let (yaml, _) = repl.render_copy(&["yaml"]).expect("yaml");
         assert!(!yaml.is_empty());
         let (md, _) = repl.render_copy(&["markdown"]).expect("markdown");
         assert!(md.contains("1.2.3.4"));
         let (json_upper, _) = repl.render_copy(&["JSON"]).expect("JSON");
-        assert!(json_upper.trim_start().starts_with('['));
+        assert!(json_upper.trim_start().starts_with('{'));
         let (yml, _) = repl.render_copy(&["yml"]).expect("yml");
         assert!(!yml.is_empty());
     }
@@ -641,7 +636,7 @@ mod copy_tests {
 
         let mut repl = repl_with_result();
         // Pre-condition: the stale payload the bug would have copied.
-        assert_eq!(repl.last_result.as_ref().expect("seeded").kind(), "dns");
+        assert_eq!(repl.last_result.as_ref().expect("seeded").kind(), "dig");
 
         repl.last_result = Some(crate::payload::Payload::Doctor(Box::new(
             DoctorReport::from_checks(vec![DoctorCheck {
@@ -725,7 +720,7 @@ mod copy_tests {
     /// array, and a trace its hops — in every copy format.
     #[test]
     fn dig_and_trace_payloads_are_copyable() {
-        use crate::payload::{fixtures, Payload};
+        use crate::payload::Payload;
         let mut repl = repl_with_result();
         let chained = fixtures::dig(
             RecordType::A,

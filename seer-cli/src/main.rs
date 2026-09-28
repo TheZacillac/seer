@@ -1958,7 +1958,6 @@ mod exit_code_tests {
 
     #[test]
     fn informational_results_exit_zero() {
-        assert_eq!(exit_code(&Payload::Dns(vec![])), 0);
         assert_eq!(exit_code(&Payload::Reverse(vec![])), 0);
     }
 

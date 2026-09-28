@@ -53,6 +53,7 @@ pub enum FetchReq {
     RdapDomain(String),
     RdapIp(String),
     RdapAsn(u32),
+    /// A dig-style query (the DNS lens's Records tab).
     Dns {
         domain: String,
         record_type: RecordType,
@@ -64,6 +65,12 @@ pub enum FetchReq {
         record_type: RecordType,
         a: String,
         b: String,
+    },
+    /// An iterative trace from the root servers (the DNS lens's Trace tab).
+    /// It takes no nameserver: the walk asks each zone's own servers.
+    Trace {
+        domain: String,
+        record_type: RecordType,
     },
     Ssl(String),
     Status(String),
@@ -90,7 +97,7 @@ impl FetchReq {
             FetchReq::Whois(_) => "whois",
             FetchReq::RdapDomain(_) | FetchReq::RdapIp(_) | FetchReq::RdapAsn(_) => "rdap",
             FetchReq::Dns { .. } => "dns",
-            FetchReq::Dnssec(_) | FetchReq::Compare { .. } => "dns",
+            FetchReq::Dnssec(_) | FetchReq::Compare { .. } | FetchReq::Trace { .. } => "dns",
             FetchReq::Ssl(_) => "ssl",
             FetchReq::Status(_) => "status",
             FetchReq::Prop(_) => "propagation",
@@ -113,6 +120,7 @@ impl FetchReq {
         match self {
             FetchReq::RdapIp(_) | FetchReq::Dnssec(_) => 1,
             FetchReq::RdapAsn(_) | FetchReq::Compare { .. } => 2,
+            FetchReq::Trace { .. } => 3,
             _ => 0,
         }
     }
@@ -135,7 +143,9 @@ impl FetchReq {
             | FetchReq::Headers(d)
             | FetchReq::Takeover(d) => d.clone(),
             FetchReq::RdapAsn(n) => format!("AS{n}"),
-            FetchReq::Dns { domain, .. } | FetchReq::Compare { domain, .. } => domain.clone(),
+            FetchReq::Dns { domain, .. }
+            | FetchReq::Compare { domain, .. }
+            | FetchReq::Trace { domain, .. } => domain.clone(),
             FetchReq::Diff { a, b } => format!("{a} ⇄ {b}"),
             FetchReq::Watch => "watchlist".to_string(),
             FetchReq::History => "history".to_string(),
@@ -272,6 +282,13 @@ mod tests {
             .lens_key(),
             "dns"
         );
+        let trace = FetchReq::Trace {
+            domain: "x".into(),
+            record_type: RecordType::A,
+        };
+        assert_eq!(trace.lens_key(), "dns");
+        assert_eq!(trace.tab(), 3, "the DNS lens's Trace tab");
+        assert_eq!(trace.target(), "x");
         assert_eq!(FetchReq::Tld(".com".into()).lens_key(), "tld");
         assert_eq!(FetchReq::Headers("x".into()).lens_key(), "headers");
         assert_eq!(FetchReq::Takeover("x".into()).lens_key(), "takeover");
