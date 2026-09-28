@@ -1,0 +1,21 @@
+---
+source: seer-core/tests/format_snapshots.rs
+expression: markdown ().format_dig (& fixture_dig_cname_chain())
+---
+## DNS A Records: www.seer.test
+
+- **Status**: `NOERROR`
+- **Flags**: `qr rd ra`
+- **Server**: `1.1.1.1`
+- **Query time**: 12 ms
+
+### Answer
+
+| Name | TTL | Type | Data |
+| --- | --- | --- | --- |
+| `www.seer.test` | 3600 | CNAME | `shop.seer.test.` |
+| `shop.seer.test` | 300 | CNAME | `edge.cdn.test.` |
+| `edge.cdn.test` | 300 | A | `192.0.2.7` |
+| `edge.cdn.test` | 300 | A | `192.0.2.8` |
+
+> Note: DNS responses are not DNSSEC-validated.

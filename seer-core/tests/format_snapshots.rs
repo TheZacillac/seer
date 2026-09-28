@@ -22,8 +22,9 @@ use seer_core::caa::{CaaPolicy, CaaRecord, ISSUANCE_TIME_NOTE};
 use seer_core::confusables::{ConfusableReport, RegisteredLookalike};
 use seer_core::diff::{DnsDiff, DomainDiff, RegistrationDiff, SslDiff};
 use seer_core::dns::{
-    DelegationReport, DnsComparison, DnsRecord, DnssecReport, FollowIteration, FollowResult,
-    LameNs, PropagationResult, RecordData, RecordType, ServerResult,
+    DelegationReport, DnsComparison, DnsQueryResult, DnsRecord, DnsStatus, DnsTrace, DnssecReport,
+    FollowIteration, FollowResult, LameNs, PropagationResult, RecordData, RecordType, ServerResult,
+    SvcParam, TraceHop, WildcardProbe,
 };
 use seer_core::domain_info::DomainInfo;
 use seer_core::drift::{DriftReport, FieldChange};
@@ -1014,6 +1015,281 @@ snapshot_tests! {
     markdown_follow_snapshot => markdown.format_follow(fixture_follow());
     human_propagation_snapshot => human.format_propagation(fixture_propagation());
     markdown_propagation_snapshot => markdown.format_propagation(fixture_propagation());
+}
+
+// --- dig-style query results and traces ---------------------------------
+
+fn cname_record(name: &str, ttl: u32, target: &str) -> DnsRecord {
+    DnsRecord {
+        name: name.into(),
+        record_type: RecordType::CNAME,
+        ttl,
+        data: RecordData::CNAME {
+            target: target.into(),
+        },
+    }
+}
+
+/// The SOA a negative answer carries in AUTHORITY, owned by the zone apex.
+fn soa_record(zone: &str) -> DnsRecord {
+    DnsRecord {
+        name: zone.into(),
+        record_type: RecordType::SOA,
+        ttl: 900,
+        data: RecordData::SOA {
+            mname: format!("ns1.{zone}."),
+            rname: format!("hostmaster.{zone}."),
+            serial: 2026092801,
+            refresh: 7200,
+            retry: 3600,
+            expire: 1209600,
+            minimum: 900,
+        },
+    }
+}
+
+/// A query result for `name`/`record_type` with no answers; each fixture
+/// fills in what its case needs.
+fn dig_result(name: &str, record_type: RecordType, status: DnsStatus) -> DnsQueryResult {
+    DnsQueryResult {
+        name: name.into(),
+        record_type,
+        server: None,
+        status,
+        flags: Vec::new(),
+        answers: Vec::new(),
+        authority: Vec::new(),
+        wildcard: None,
+        query_time_ms: 12,
+    }
+}
+
+fn dig_flags() -> Vec<String> {
+    vec!["qr".into(), "rd".into(), "ra".into()]
+}
+
+/// A two-hop CNAME chain ending in two A records, each under its real owner
+/// (TTLs of different widths exercise the column alignment), from a custom
+/// server; the wildcard probe ran and found no wildcard, so no note.
+fn fixture_dig_cname_chain() -> DnsQueryResult {
+    DnsQueryResult {
+        server: Some("1.1.1.1".into()),
+        flags: dig_flags(),
+        answers: vec![
+            cname_record("www.seer.test", 3600, "shop.seer.test."),
+            cname_record("shop.seer.test", 300, "edge.cdn.test."),
+            a_record("edge.cdn.test", "192.0.2.7"),
+            a_record("edge.cdn.test", "192.0.2.8"),
+        ],
+        wildcard: Some(WildcardProbe {
+            probe_name: "seer-probe-3f9a1c2e7b.seer.test".into(),
+            present: false,
+            matches_answer: false,
+        }),
+        ..dig_result("www.seer.test", RecordType::A, DnsStatus::NoError)
+    }
+}
+
+/// The name does not exist; the zone's SOA came back in AUTHORITY, and a
+/// negative answer surfaces no header flags.
+fn fixture_dig_nxdomain() -> DnsQueryResult {
+    DnsQueryResult {
+        authority: vec![soa_record("seer.test")],
+        query_time_ms: 31,
+        ..dig_result("gone.seer.test", RecordType::A, DnsStatus::NxDomain)
+    }
+}
+
+/// The name exists but has no AAAA records (NOERROR, empty answer).
+fn fixture_dig_nodata() -> DnsQueryResult {
+    DnsQueryResult {
+        authority: vec![soa_record("seer.test")],
+        ..dig_result("www.seer.test", RecordType::AAAA, DnsStatus::NoError)
+    }
+}
+
+/// An answer equal to the one a random sibling gets: likely synthesized
+/// from `*.seer.test`.
+fn fixture_dig_wildcard_matched() -> DnsQueryResult {
+    DnsQueryResult {
+        flags: dig_flags(),
+        answers: vec![a_record("promo.seer.test", "192.0.2.80")],
+        wildcard: Some(WildcardProbe {
+            probe_name: "seer-probe-3f9a1c2e7b.seer.test".into(),
+            present: true,
+            matches_answer: true,
+        }),
+        query_time_ms: 9,
+        ..dig_result("promo.seer.test", RecordType::A, DnsStatus::NoError)
+    }
+}
+
+/// The server failed to answer at all.
+fn fixture_dig_servfail() -> DnsQueryResult {
+    DnsQueryResult {
+        server: Some("tls://dns.quad9.net".into()),
+        query_time_ms: 48,
+        ..dig_result("broken.seer.test", RecordType::A, DnsStatus::ServFail)
+    }
+}
+
+/// A ServiceMode HTTPS record with every common SvcParam; a wildcard answers
+/// the sibling too, but with different data.
+fn fixture_dig_https() -> DnsQueryResult {
+    let param = |key: &str, value: &str| SvcParam {
+        key: key.into(),
+        value: value.into(),
+    };
+    DnsQueryResult {
+        flags: dig_flags(),
+        answers: vec![DnsRecord {
+            name: "www.seer.test".into(),
+            record_type: RecordType::HTTPS,
+            ttl: 300,
+            data: RecordData::HTTPS {
+                priority: 1,
+                target: ".".into(),
+                params: vec![
+                    param("alpn", "h3,h2"),
+                    param("port", "8443"),
+                    param("ipv4hint", "192.0.2.1,192.0.2.2"),
+                    param("ech", "AAH+"),
+                    param("ipv6hint", "2001:db8::1"),
+                ],
+            },
+        }],
+        wildcard: Some(WildcardProbe {
+            probe_name: "seer-probe-3f9a1c2e7b.seer.test".into(),
+            present: true,
+            matches_answer: false,
+        }),
+        ..dig_result("www.seer.test", RecordType::HTTPS, DnsStatus::NoError)
+    }
+}
+
+/// A trace hop that referred onward to `zone` (not authoritative, no
+/// answer).
+fn referral_hop(zone: &str, server: &str, address: &str, to: &str, ns: &[&str]) -> TraceHop {
+    TraceHop {
+        zone: zone.into(),
+        server: server.into(),
+        address: address.into(),
+        query_time_ms: 21,
+        status: DnsStatus::NoError,
+        authoritative: false,
+        referral_zone: Some(to.into()),
+        referral: ns.iter().map(|&n| n.into()).collect(),
+        answers: Vec::new(),
+        failed_servers: Vec::new(),
+    }
+}
+
+/// Root → com. → example.com., the last answering authoritatively; one
+/// `com.` server timed out before another answered.
+fn fixture_dns_trace() -> DnsTrace {
+    let answer = vec![a_record("www.example.com", "93.184.216.34")];
+    let mut com = referral_hop(
+        "com.",
+        "a.gtld-servers.net.",
+        "192.5.6.30",
+        "example.com.",
+        &["a.iana-servers.net.", "b.iana-servers.net."],
+    );
+    com.query_time_ms = 30;
+    com.failed_servers = vec!["b.gtld-servers.net. (192.33.14.30): timed out".into()];
+    DnsTrace {
+        name: "www.example.com".into(),
+        record_type: RecordType::A,
+        hops: vec![
+            referral_hop(
+                ".",
+                "a.root-servers.net.",
+                "198.41.0.4",
+                "com.",
+                &["a.gtld-servers.net.", "b.gtld-servers.net."],
+            ),
+            com,
+            TraceHop {
+                zone: "example.com.".into(),
+                server: "a.iana-servers.net.".into(),
+                address: "199.43.135.53".into(),
+                query_time_ms: 88,
+                status: DnsStatus::NoError,
+                authoritative: true,
+                referral_zone: None,
+                referral: Vec::new(),
+                answers: answer.clone(),
+                failed_servers: Vec::new(),
+            },
+        ],
+        status: DnsStatus::NoError,
+        answers: answer,
+        error: None,
+    }
+}
+
+/// Every server of the last zone failed: one timed out, the other answered
+/// SERVFAIL (the final hop), so the walk stopped with an error.
+fn fixture_dns_trace_error() -> DnsTrace {
+    DnsTrace {
+        name: "www.broken.test".into(),
+        record_type: RecordType::A,
+        hops: vec![
+            referral_hop(
+                ".",
+                "a.root-servers.net.",
+                "198.41.0.4",
+                "test.",
+                &["ns1.nic.test."],
+            ),
+            referral_hop(
+                "test.",
+                "ns1.nic.test.",
+                "192.0.2.10",
+                "broken.test.",
+                &["ns1.broken.test.", "ns2.broken.test."],
+            ),
+            TraceHop {
+                zone: "broken.test.".into(),
+                server: "ns2.broken.test.".into(),
+                address: "192.0.2.54".into(),
+                query_time_ms: 7,
+                status: DnsStatus::ServFail,
+                authoritative: false,
+                referral_zone: None,
+                referral: Vec::new(),
+                answers: Vec::new(),
+                failed_servers: vec!["ns1.broken.test. (192.0.2.53): timed out".into()],
+            },
+        ],
+        status: DnsStatus::ServFail,
+        answers: Vec::new(),
+        error: Some(
+            "no nameserver for broken.test. gave a usable response: ns1.broken.test. \
+             (192.0.2.53): timed out; ns2.broken.test. (192.0.2.54): SERVFAIL"
+                .into(),
+        ),
+    }
+}
+
+snapshot_tests! {
+    human_dig_cname_chain_snapshot => human.format_dig(fixture_dig_cname_chain());
+    markdown_dig_cname_chain_snapshot => markdown.format_dig(fixture_dig_cname_chain());
+    human_dig_nxdomain_snapshot => human.format_dig(fixture_dig_nxdomain());
+    markdown_dig_nxdomain_snapshot => markdown.format_dig(fixture_dig_nxdomain());
+    human_dig_nodata_snapshot => human.format_dig(fixture_dig_nodata());
+    markdown_dig_nodata_snapshot => markdown.format_dig(fixture_dig_nodata());
+    human_dig_wildcard_matched_snapshot => human.format_dig(fixture_dig_wildcard_matched());
+    markdown_dig_wildcard_matched_snapshot =>
+        markdown.format_dig(fixture_dig_wildcard_matched());
+    human_dig_servfail_snapshot => human.format_dig(fixture_dig_servfail());
+    markdown_dig_servfail_snapshot => markdown.format_dig(fixture_dig_servfail());
+    human_dig_https_snapshot => human.format_dig(fixture_dig_https());
+    markdown_dig_https_snapshot => markdown.format_dig(fixture_dig_https());
+    human_dns_trace_snapshot => human.format_dns_trace(fixture_dns_trace());
+    markdown_dns_trace_snapshot => markdown.format_dns_trace(fixture_dns_trace());
+    human_dns_trace_error_snapshot => human.format_dns_trace(fixture_dns_trace_error());
+    markdown_dns_trace_error_snapshot => markdown.format_dns_trace(fixture_dns_trace_error());
 }
 
 // --- Status, security, and comparison reports ---------------------------

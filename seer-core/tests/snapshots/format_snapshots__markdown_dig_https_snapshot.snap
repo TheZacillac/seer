@@ -1,0 +1,19 @@
+---
+source: seer-core/tests/format_snapshots.rs
+expression: markdown ().format_dig (& fixture_dig_https())
+---
+## DNS HTTPS Records: www.seer.test
+
+- **Status**: `NOERROR`
+- **Flags**: `qr rd ra`
+- **Server**: default
+- **Query time**: 12 ms
+- **Wildcard**: a random sibling (`seer-probe-3f9a1c2e7b.seer.test`) resolves too, but with different data
+
+### Answer
+
+| Name | TTL | Type | Data |
+| --- | --- | --- | --- |
+| `www.seer.test` | 300 | HTTPS | `1 . alpn="h3,h2" port=8443 ipv4hint=192.0.2.1,192.0.2.2 ech=AAH+ ipv6hint=2001:db8::1` |
+
+> Note: DNS responses are not DNSSEC-validated.

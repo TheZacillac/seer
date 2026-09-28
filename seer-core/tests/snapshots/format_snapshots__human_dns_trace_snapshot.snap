@@ -1,0 +1,34 @@
+---
+source: seer-core/tests/format_snapshots.rs
+expression: human ().format_dns_trace (& fixture_dns_trace())
+---
+
+[1;95mDNS Trace: www.example.com A[0m
+[37m────────────────────────────[0m
+
+  [1;96mHop 1[0m: [97m.[0m (root)
+    [1;96mServer[0m: [97ma.root-servers.net. (198.41.0.4) in 21 ms[0m
+    [1;96mStatus[0m: [1;92mNOERROR[0m
+    [1;96mReferral[0m: [97mcom.[0m
+      - [97ma.gtld-servers.net.[0m
+      - [97mb.gtld-servers.net.[0m
+
+  [1;96mHop 2[0m: [97mcom.[0m
+    [1;96mServer[0m: [97ma.gtld-servers.net. (192.5.6.30) in 30 ms[0m
+    [1;96mStatus[0m: [1;92mNOERROR[0m
+    [1;96mFailed servers[0m:
+      [1;91m✗[0m [97mb.gtld-servers.net. (192.33.14.30): timed out[0m
+    [1;96mReferral[0m: [97mexample.com.[0m
+      - [97ma.iana-servers.net.[0m
+      - [97mb.iana-servers.net.[0m
+
+  [1;96mHop 3[0m: [97mexample.com.[0m
+    [1;96mServer[0m: [97ma.iana-servers.net. (199.43.135.53) in 88 ms[0m
+    [1;96mStatus[0m: [1;92mNOERROR[0m[97m (authoritative)[0m
+    [1;96mAnswer[0m:
+      [97mwww.example.com[0m  [1;96m300[0m  [1;96mA[0m  [1;92m93.184.216.34[0m
+
+  [1;96mResult[0m: [1;92mNOERROR[0m
+    [97mwww.example.com[0m  [1;96m300[0m  [1;96mA[0m  [1;92m93.184.216.34[0m
+
+[1;93mNote: DNS responses are not DNSSEC-validated[0m

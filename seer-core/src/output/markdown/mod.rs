@@ -1,7 +1,8 @@
 //! Markdown output (`--format markdown`). One inherent `format_*` method per
 //! report type, split into per-concern submodules; bullets go through the
-//! private `Bullets` writer and `code_list`, which escape every value
-//! (`MdSafe`) so domain data can't inject markdown.
+//! private `Bullets` writer and `code_list`, and DNS record tables through
+//! `record_table`, which escape every value (`MdSafe`) so domain data can't
+//! inject markdown.
 
 use std::fmt::{self, Write as _};
 
@@ -13,6 +14,7 @@ use super::OutputFormatter;
 pub(super) use super::contact::{self, Contact, FlatContacts};
 pub(super) use super::days_until;
 pub(super) use super::grouping::render_grouped;
+pub(super) use super::DNSSEC_NOTE;
 pub(super) use crate::caa::{CaaPolicy, IssuerCaaMatch};
 pub(super) use crate::dns::{DnsRecord, FollowIteration, FollowResult, PropagationResult};
 pub(super) use crate::lookup::LookupResult;
@@ -22,6 +24,7 @@ pub(super) use crate::whois::WhoisResponse;
 
 mod delegation;
 mod diff;
+mod dig;
 mod dns;
 mod domain_info;
 mod lookup;
@@ -205,6 +208,22 @@ fn code_list<S: AsRef<str>>(items: &[S]) -> String {
         .map(|item| format!("`{}`", MdSafe(item.as_ref())))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// Appends a `| Name | TTL | Type | Data |` table, one row per record, with
+/// the owner name and the data (remote text) in [`MdSafe`] code spans.
+fn record_table<'r>(out: &mut Vec<String>, records: impl IntoIterator<Item = &'r DnsRecord>) {
+    out.push("| Name | TTL | Type | Data |".to_string());
+    out.push("| --- | --- | --- | --- |".to_string());
+    for record in records {
+        out.push(format!(
+            "| `{}` | {} | {} | `{}` |",
+            MdSafe(&record.name),
+            record.ttl,
+            record.record_type,
+            MdSafe(&record.data.to_string())
+        ));
+    }
 }
 
 /// Appends `- **Label**: value` bullets. Remote values go through [`MdSafe`]

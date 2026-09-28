@@ -1,0 +1,46 @@
+---
+source: seer-core/tests/format_snapshots.rs
+expression: markdown ().format_dns_trace (& fixture_dns_trace())
+---
+## DNS Trace: www.example.com A
+
+### Hop 1: `.` (root)
+
+- **Server**: `a.root-servers.net.` (`198.41.0.4`)
+- **Status**: `NOERROR`
+- **Authoritative**: no
+- **Query time**: 21 ms
+- **Referral**: `com.`
+- **Referral nameservers**: `a.gtld-servers.net.`, `b.gtld-servers.net.`
+
+### Hop 2: `com.`
+
+- **Server**: `a.gtld-servers.net.` (`192.5.6.30`)
+- **Status**: `NOERROR`
+- **Authoritative**: no
+- **Query time**: 30 ms
+- **Failed servers**:
+  - b.gtld-servers.net. (192.33.14.30): timed out
+- **Referral**: `example.com.`
+- **Referral nameservers**: `a.iana-servers.net.`, `b.iana-servers.net.`
+
+### Hop 3: `example.com.`
+
+- **Server**: `a.iana-servers.net.` (`199.43.135.53`)
+- **Status**: `NOERROR`
+- **Authoritative**: yes
+- **Query time**: 88 ms
+
+| Name | TTL | Type | Data |
+| --- | --- | --- | --- |
+| `www.example.com` | 300 | A | `93.184.216.34` |
+
+### Result
+
+- **Status**: `NOERROR`
+
+| Name | TTL | Type | Data |
+| --- | --- | --- | --- |
+| `www.example.com` | 300 | A | `93.184.216.34` |
+
+> Note: DNS responses are not DNSSEC-validated.

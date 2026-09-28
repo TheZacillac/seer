@@ -1,0 +1,19 @@
+---
+source: seer-core/tests/format_snapshots.rs
+expression: markdown ().format_dig (& fixture_dig_nodata())
+---
+## DNS AAAA Records: www.seer.test
+
+- **Status**: `NOERROR`
+- **Server**: default
+- **Query time**: 12 ms
+
+*No AAAA records (NODATA — the name exists)*
+
+### Authority
+
+| Name | TTL | Type | Data |
+| --- | --- | --- | --- |
+| `seer.test` | 900 | SOA | `ns1.seer.test. hostmaster.seer.test. 2026092801 7200 3600 1209600 900` |
+
+> Note: DNS responses are not DNSSEC-validated.

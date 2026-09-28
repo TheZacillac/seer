@@ -1,7 +1,9 @@
 //! Colored terminal output (`--format human`). One inherent `format_*` method
 //! per report type, split into per-concern submodules; label/value rows go
 //! through the private `Rows` writer, which sanitizes every value against
-//! terminal escape injection. Colors can be disabled (`without_colors`).
+//! terminal escape injection; bespoke layouts sanitize by hand
+//! (`sanitize_display`, or `sanitize_line` where a value must stay on one
+//! line). Colors can be disabled (`without_colors`).
 
 use chrono::{DateTime, TimeDelta, Utc};
 use colored::ColoredString;
@@ -12,6 +14,7 @@ use super::OutputFormatter;
 pub(super) use super::contact::{self, Contact, FlatContacts};
 pub(super) use super::days_until;
 pub(super) use super::grouping::render_grouped;
+pub(super) use super::DNSSEC_NOTE;
 pub(super) use crate::caa::{CaaPolicy, IssuerCaaMatch};
 pub(super) use crate::colors::CatppuccinExt;
 pub(super) use crate::dns::{DnsRecord, FollowIteration, FollowResult, PropagationResult};
@@ -23,6 +26,7 @@ pub(super) use colored::Colorize;
 
 mod delegation;
 mod diff;
+mod dig;
 mod dns;
 mod domain_info;
 mod lookup;
@@ -51,6 +55,16 @@ pub(super) fn sanitize_display(s: &str) -> String {
         .replace_all(s, "")
         .chars()
         .filter(|&c| c == '\n' || c == '\t' || !c.is_control())
+        .collect()
+}
+
+/// [`sanitize_display`] for text that must stay on one line — a record
+/// row, a `+short` value: the newlines and tabs it keeps are folded to
+/// spaces too, so remote data cannot forge an extra row.
+pub(super) fn sanitize_line(s: &str) -> String {
+    sanitize_display(s)
+        .chars()
+        .map(|c| if c == '\n' || c == '\t' { ' ' } else { c })
         .collect()
 }
 

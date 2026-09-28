@@ -46,4 +46,39 @@ mod tests {
         assert!(output.contains("93.184.216.34"));
         assert!(output.contains("\"A\""));
     }
+
+    #[test]
+    fn dig_and_trace_serialize_as_objects() {
+        // `seer dig -q` / `--format json` emit the whole result object (status,
+        // flags, answers, …), not the record list `format_dns` emits.
+        use crate::dns::{DnsQueryResult, DnsStatus, DnsTrace};
+        let result = DnsQueryResult {
+            name: "gone.seer.test".to_string(),
+            record_type: RecordType::A,
+            server: None,
+            status: DnsStatus::NxDomain,
+            flags: Vec::new(),
+            answers: Vec::new(),
+            authority: Vec::new(),
+            wildcard: None,
+            query_time_ms: 7,
+        };
+        let json: serde_json::Value =
+            serde_json::from_str(&JsonFormatter::new().format_dig(&result)).unwrap();
+        assert_eq!(json["status"], "NXDOMAIN");
+        assert_eq!(json["server"], serde_json::Value::Null);
+
+        let trace = DnsTrace {
+            name: "gone.seer.test".to_string(),
+            record_type: RecordType::A,
+            hops: Vec::new(),
+            status: DnsStatus::NxDomain,
+            answers: Vec::new(),
+            error: Some("stopped".to_string()),
+        };
+        let json: serde_json::Value =
+            serde_json::from_str(&JsonFormatter::new().format_dns_trace(&trace)).unwrap();
+        assert_eq!(json["status"], "NXDOMAIN");
+        assert_eq!(json["error"], "stopped");
+    }
 }
