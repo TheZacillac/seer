@@ -19,6 +19,7 @@ DIG_KEYS = {
     "name",
     "record_type",
     "server",
+    "answered_locally",
     "status",
     "flags",
     "answers",

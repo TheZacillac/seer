@@ -448,6 +448,11 @@ impl DnsResolver {
     /// outcome attached as [`DnsQueryResult::wildcard`] when the main answer
     /// has records. The probe never fails the query, and
     /// [`DnsQueryResult::query_time_ms`] times the main query alone.
+    ///
+    /// A special-use name (RFC 6761: `localhost`, `127.in-addr.arpa`,
+    /// `invalid`, `onion`, …) is answered by hickory itself, without a query
+    /// to any server; the result says so
+    /// ([`DnsQueryResult::answered_locally`]) and runs no probe.
     #[instrument(skip(self), fields(domain = %domain, record_type = %record_type))]
     pub async fn query(
         &self,
@@ -585,11 +590,13 @@ impl DnsResolver {
             .answers()
             .iter()
             .filter_map(|record| {
-                convert_rdata(record_type, &record.data).map(|data| DnsRecord {
-                    name: domain.to_string(),
-                    record_type,
-                    ttl: record.ttl,
-                    data,
+                convert_rdata(record_type, &record.data, NameSpelling::Display).map(|data| {
+                    DnsRecord {
+                        name: domain.to_string(),
+                        record_type,
+                        ttl: record.ttl,
+                        data,
+                    }
                 })
             })
             .collect();
@@ -918,7 +925,7 @@ fn parse_caa(caa: &CAA) -> (u8, String, String) {
 /// The presentation is built here rather than taken from hickory's
 /// `Display`, which leaves a trailing comma on every list (`h3,h2,`) and
 /// names unregistered keys `unknown<N>` instead of RFC 9460's `key<N>`.
-fn parse_svcb(svcb: &SVCB) -> (u16, String, Vec<SvcParam>) {
+fn parse_svcb(svcb: &SVCB, names: NameSpelling) -> (u16, String, Vec<SvcParam>) {
     let params = svcb
         .svc_params
         .iter()
@@ -927,7 +934,7 @@ fn parse_svcb(svcb: &SVCB) -> (u16, String, Vec<SvcParam>) {
             value: svc_param_value(value),
         })
         .collect();
-    (svcb.svc_priority, svcb.target_name.to_string(), params)
+    (svcb.svc_priority, names.spell(&svcb.target_name), params)
 }
 
 /// The RFC 9460 presentation name of a SvcParamKey: the registered name, or
@@ -960,13 +967,15 @@ fn svc_param_value(value: &SvcParamValue) -> String {
     }
     match value {
         SvcParamValue::Mandatory(keys) => join(keys.0.iter().map(|k| svc_param_key_name(*k))),
-        // A comma inside an alpn-id is escaped so the list stays parseable
-        // (RFC 9460 Appendix A.1).
-        SvcParamValue::Alpn(alpn) => join(
-            alpn.0
-                .iter()
-                .map(|id| escape_char_string(id.as_bytes()).replace(',', "\\,")),
-        ),
+        // Two levels of escaping, undone in reverse by a parser (RFC 9460
+        // Appendix A.1): the value-list level first (`\` → `\\`, `,` → `\,`)
+        // so a comma inside an alpn-id does not split it, then the
+        // character-string level over the result — `f\oo,bar` becomes
+        // `f\\\\oo\\,bar` (Appendix D.2).
+        SvcParamValue::Alpn(alpn) => join(alpn.0.iter().map(|id| {
+            let listed = id.replace('\\', "\\\\").replace(',', "\\,");
+            escape_char_string(listed.as_bytes())
+        })),
         SvcParamValue::NoDefaultAlpn => String::new(),
         SvcParamValue::Port(port) => port.to_string(),
         SvcParamValue::Ipv4Hint(hint) => join(hint.0.iter().map(|a| a.0)),
@@ -1046,13 +1055,42 @@ fn hex_upper(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02X}", b)).collect()
 }
 
+/// How [`convert_rdata`] spells the domain names inside RDATA: a CNAME,
+/// PTR, SRV, HTTPS/SVCB or NAPTR target, an MX exchange, an NS host, an SOA
+/// mname/rname.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NameSpelling {
+    /// hickory's `Display`, which decodes IDN labels to Unicode: what
+    /// [`DnsResolver::resolve`] has always returned, kept for its callers.
+    Display,
+    /// ASCII, an IDN label as its `xn--` A-label — the spelling of owner and
+    /// query names (see `owner_name`), so every name in a result compares
+    /// as written (a CNAME target equals the next hop's owner) and reads as
+    /// dig prints it.
+    Ascii,
+}
+
+impl NameSpelling {
+    fn spell(self, name: &Name) -> String {
+        match self {
+            NameSpelling::Display => name.to_string(),
+            NameSpelling::Ascii => name.to_ascii(),
+        }
+    }
+}
+
 /// Converts one hickory answer's RData into our [`RecordData`], if it is the
-/// variant `record_type` asked for. Any other RData in the answer section
-/// (e.g. a CNAME returned alongside A records) yields `None` and is skipped.
+/// variant `record_type` asked for, spelling the names in it as `names`
+/// says. Any other RData in the answer section (e.g. a CNAME returned
+/// alongside A records) yields `None` and is skipped.
 ///
 /// This is the single RData→RecordData conversion table used by every
 /// resolution path.
-pub(crate) fn convert_rdata(record_type: RecordType, data: &HickoryRData) -> Option<RecordData> {
+pub(crate) fn convert_rdata(
+    record_type: RecordType,
+    data: &HickoryRData,
+    names: NameSpelling,
+) -> Option<RecordData> {
     use hickory_resolver::proto::dnssec::rdata::DNSSECRData;
 
     match (record_type, data) {
@@ -1063,14 +1101,14 @@ pub(crate) fn convert_rdata(record_type: RecordType, data: &HickoryRData) -> Opt
             address: addr.0.to_string(),
         }),
         (RecordType::CNAME, HickoryRData::CNAME(cname)) => Some(RecordData::CNAME {
-            target: cname.0.to_string(),
+            target: names.spell(&cname.0),
         }),
         (RecordType::MX, HickoryRData::MX(mx)) => Some(RecordData::MX {
             preference: mx.preference,
-            exchange: mx.exchange.to_string(),
+            exchange: names.spell(&mx.exchange),
         }),
         (RecordType::NS, HickoryRData::NS(ns)) => Some(RecordData::NS {
-            nameserver: ns.0.to_string(),
+            nameserver: names.spell(&ns.0),
         }),
         (RecordType::TXT, HickoryRData::TXT(txt)) => Some(RecordData::TXT {
             text: txt
@@ -1081,8 +1119,8 @@ pub(crate) fn convert_rdata(record_type: RecordType, data: &HickoryRData) -> Opt
                 .join(""),
         }),
         (RecordType::SOA, HickoryRData::SOA(soa)) => Some(RecordData::SOA {
-            mname: soa.mname.to_string(),
-            rname: soa.rname.to_string(),
+            mname: names.spell(&soa.mname),
+            rname: names.spell(&soa.rname),
             serial: soa.serial,
             // hickory models refresh/retry/expire as i32, but they are
             // unsigned 32-bit wire intervals. A value >= 2^31 arrives as a
@@ -1095,13 +1133,13 @@ pub(crate) fn convert_rdata(record_type: RecordType, data: &HickoryRData) -> Opt
             minimum: soa.minimum,
         }),
         (RecordType::PTR, HickoryRData::PTR(ptr)) => Some(RecordData::PTR {
-            target: ptr.0.to_string(),
+            target: names.spell(&ptr.0),
         }),
         (RecordType::SRV, HickoryRData::SRV(srv)) => Some(RecordData::SRV {
             priority: srv.priority,
             weight: srv.weight,
             port: srv.port,
-            target: srv.target.to_string(),
+            target: names.spell(&srv.target),
         }),
         (RecordType::CAA, HickoryRData::CAA(caa)) => {
             let (flags, tag, value) = parse_caa(caa);
@@ -1149,7 +1187,7 @@ pub(crate) fn convert_rdata(record_type: RecordType, data: &HickoryRData) -> Opt
             })
         }
         (RecordType::HTTPS, HickoryRData::HTTPS(https)) => {
-            let (priority, target, params) = parse_svcb(&https.0);
+            let (priority, target, params) = parse_svcb(&https.0, names);
             Some(RecordData::HTTPS {
                 priority,
                 target,
@@ -1157,7 +1195,7 @@ pub(crate) fn convert_rdata(record_type: RecordType, data: &HickoryRData) -> Opt
             })
         }
         (RecordType::SVCB, HickoryRData::SVCB(svcb)) => {
-            let (priority, target, params) = parse_svcb(svcb);
+            let (priority, target, params) = parse_svcb(svcb, names);
             Some(RecordData::SVCB {
                 priority,
                 target,
@@ -1184,7 +1222,7 @@ pub(crate) fn convert_rdata(record_type: RecordType, data: &HickoryRData) -> Opt
             flags: String::from_utf8_lossy(&naptr.flags).into_owned(),
             services: String::from_utf8_lossy(&naptr.services).into_owned(),
             regexp: String::from_utf8_lossy(&naptr.regexp).into_owned(),
-            replacement: naptr.replacement.to_string(),
+            replacement: names.spell(&naptr.replacement),
         }),
         _ => None,
     }
@@ -1207,11 +1245,12 @@ pub(crate) fn from_wire_type(wire: HickoryRecordType) -> Option<RecordType> {
 /// trace hop), where records of several types and owners appear together.
 ///
 /// The owner name is ASCII (see `owner_name`) and loses its trailing root
-/// dot, matching how query names are reported. Returns `None` for types seer
-/// does not model.
+/// dot, matching how query names are reported; the names in the record's
+/// data are ASCII too ([`NameSpelling::Ascii`]), so the result uses one
+/// spelling throughout. Returns `None` for types seer does not model.
 pub(crate) fn to_dns_record(record: &Record) -> Option<DnsRecord> {
     let record_type = from_wire_type(record.record_type())?;
-    let data = convert_rdata(record_type, &record.data)?;
+    let data = convert_rdata(record_type, &record.data, NameSpelling::Ascii)?;
     Some(DnsRecord {
         name: owner_name(&record.name),
         record_type,
@@ -2087,6 +2126,57 @@ mod tests {
     }
 
     #[test]
+    fn to_dns_record_spells_rdata_names_as_a_labels_where_resolve_keeps_unicode() {
+        use hickory_resolver::proto::rr::rdata::{CNAME, MX, SOA, SRV};
+        let idn = |name: &str| Name::from_utf8(name).unwrap();
+        let data = |rdata: HickoryRData| {
+            let record = Record::from_rdata(idn("xn--bcher-kva.seer.test."), 300, rdata);
+            to_dns_record(&record).expect("modeled").data.to_string()
+        };
+        // Regression: RDATA names used hickory's Unicode `Display`, so a
+        // CNAME target (`edge.café.test.`) never equalled the next hop's
+        // A-label owner (`edge.xn--caf-dma.test`).
+        assert_eq!(
+            data(HickoryRData::CNAME(CNAME(idn("edge.café.test.")))),
+            "edge.xn--caf-dma.test."
+        );
+        assert_eq!(
+            data(HickoryRData::MX(MX::new(10, idn("mail.café.test.")))),
+            "10 mail.xn--caf-dma.test."
+        );
+        assert_eq!(
+            data(HickoryRData::SRV(SRV::new(
+                1,
+                5,
+                443,
+                idn("sip.café.test.")
+            ))),
+            "1 5 443 sip.xn--caf-dma.test."
+        );
+        assert_eq!(
+            data(HickoryRData::SOA(SOA::new(
+                idn("ns1.café.test."),
+                idn("hostmaster.café.test."),
+                1,
+                7200,
+                3600,
+                1209600,
+                300,
+            ))),
+            "ns1.xn--caf-dma.test. hostmaster.xn--caf-dma.test. 1 7200 3600 1209600 300"
+        );
+
+        // `resolve`'s conversion keeps its long-standing Unicode spelling.
+        let cname = HickoryRData::CNAME(CNAME(idn("edge.café.test.")));
+        assert_eq!(
+            convert_rdata(RecordType::CNAME, &cname, NameSpelling::Display)
+                .expect("modeled")
+                .to_string(),
+            "edge.café.test."
+        );
+    }
+
+    #[test]
     fn parse_caa_keeps_reserved_flag_bits() {
         // Regression: flags were rebuilt from `issuer_critical` alone, so a
         // record published with reserved bits set reported flags=128/0.
@@ -2100,6 +2190,25 @@ mod tests {
         assert_eq!(flags, 0x81);
         assert_eq!(tag, "issue");
         assert_eq!(value, "letsencrypt.org");
+    }
+
+    #[test]
+    fn alpn_ids_are_escaped_at_both_levels() {
+        use hickory_resolver::proto::rr::rdata::svcb::Alpn;
+        let alpn = |ids: &[&str]| {
+            svc_param_value(&SvcParamValue::Alpn(Alpn(
+                ids.iter().map(|id| id.to_string()).collect(),
+            )))
+        };
+        assert_eq!(alpn(&["h3", "h2"]), "h3,h2");
+        // Regression: a comma or backslash inside an alpn-id was escaped once,
+        // so a parser's character-string pass consumed the escape and the
+        // value-list pass then split `a,b` in two and dropped the `\`. The
+        // expected strings are raw: `a\\,b` and `x\\\\y` as written here.
+        assert_eq!(alpn(&["a,b"]), r"a\\,b");
+        assert_eq!(alpn(&[r"x\y"]), r"x\\\\y");
+        // RFC 9460 Appendix D.2's vector: alpn-ids `f\oo,bar` and `h2`.
+        assert_eq!(alpn(&[r"f\oo,bar", "h2"]), r"f\\\\oo\\,bar,h2");
     }
 
     // --- Hermetic mock-server tests -----------------------------------
@@ -2623,9 +2732,9 @@ mod tests {
 
     #[tokio::test]
     async fn mock_query_reports_idn_owners_as_a_labels() {
-        // The query name is normalized to its A-label; owners are reported
-        // in that spelling too, and the chain connects through a CNAME
-        // target rendered with Unicode labels.
+        // The query name is normalized to its A-label; owners and the CNAME
+        // target are reported in that spelling too, so the chain connects
+        // name for name.
         let port = spawn_mock_dns_fn(|qname, qtype| match (qname, qtype) {
             ("xn--bcher-kva.seer.test", HickoryRecordType::A) => MockReply::Records(vec![
                 record(
@@ -2646,7 +2755,7 @@ mod tests {
                 row(
                     "xn--bcher-kva.seer.test",
                     RecordType::CNAME,
-                    "edge.café.test."
+                    "edge.xn--caf-dma.test."
                 ),
                 row("edge.xn--caf-dma.test", RecordType::A, "192.0.2.7"),
             ]
@@ -2761,6 +2870,65 @@ mod tests {
             assert!(!result.is_nodata());
             assert_eq!(result.wildcard, None);
         }
+    }
+
+    #[tokio::test]
+    async fn mock_query_reports_a_referral_as_neither_nodata_nor_an_answer() {
+        // A server that is not authoritative for the name and does not
+        // recurse refers the query to the child zone's servers. Regression:
+        // this was reported as NODATA ("the name exists").
+        let port = spawn_mock_dns_fn(|_, _| MockReply::Delegation {
+            zone: "child.seer.test".to_string(),
+            servers: vec![
+                (
+                    "ns1.child.seer.test".to_string(),
+                    vec![IpAddr::from([192, 0, 2, 1])],
+                ),
+                ("ns2.child.seer.test".to_string(), vec![]),
+            ],
+        })
+        .await;
+        let result = mock_query(port, "www.child.seer.test", RecordType::A).await;
+        assert_eq!(result.status, DnsStatus::NoError);
+        assert!(result.answers.is_empty());
+        assert_eq!(result.referral_zone(), Some("child.seer.test"));
+        assert!(!result.is_nodata());
+        assert_eq!(
+            shown(&result.authority.iter().collect::<Vec<_>>()),
+            [
+                row("child.seer.test", RecordType::NS, "ns1.child.seer.test."),
+                row("child.seer.test", RecordType::NS, "ns2.child.seer.test."),
+            ]
+        );
+        assert_eq!(result.wildcard, None);
+    }
+
+    #[tokio::test]
+    async fn mock_query_reports_special_use_names_as_answered_locally() {
+        // hickory answers RFC 6761 names itself. Regression: `-x 127.0.0.1`
+        // was reported as the server's answer (`flags: qr`, `server: …`) and,
+        // since the probe's sibling got the same local answer, as likely
+        // wildcard-synthesized.
+        let (port, asked) = spawn_recording(|_, _| MockReply::NxDomain).await;
+        let ptr = mock_query(port, "127.0.0.1", RecordType::PTR).await;
+        assert_eq!(ptr.name, "1.0.0.127.in-addr.arpa");
+        assert!(ptr.answered_locally);
+        assert_eq!(ptr.server, None, "no server was asked");
+        assert!(ptr.flags.is_empty(), "the header is hickory's own");
+        assert_eq!(ptr.status, DnsStatus::NoError);
+        assert_eq!(
+            shown(&ptr.answers.iter().collect::<Vec<_>>()),
+            [row("1.0.0.127.in-addr.arpa", RecordType::PTR, "localhost.")]
+        );
+        assert_eq!(ptr.wildcard, None, "no wildcard probe for a local name");
+
+        let mx = mock_query(port, "foo.localhost", RecordType::MX).await;
+        assert!(mx.answered_locally && mx.is_nodata());
+        let onion = mock_query(port, "x.onion", RecordType::A).await;
+        assert!(onion.answered_locally);
+        assert_eq!(onion.status, DnsStatus::NxDomain);
+
+        assert!(asked.lock().unwrap().is_empty(), "{asked:?}");
     }
 
     #[tokio::test]

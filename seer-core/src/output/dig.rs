@@ -1,11 +1,13 @@
 //! dig-style rendering shared across formats: the `+short` lines
 //! ([`dig_short`], [`dig_trace_short`]) and the wording of a query's
-//! outcome — the negative-answer verdict, the wildcard note, the unfollowed
-//! CNAME of a trace — so the human and Markdown formatters and the TUI's DNS
-//! lens say the same thing and differ only in styling and escaping.
+//! outcome — the negative-answer verdict, the referral, the local-answer
+//! note, the wildcard note, the unfollowed CNAME of a trace — so the human
+//! and Markdown formatters and the TUI's DNS lens say the same thing and
+//! differ only in styling and escaping.
 //!
-//! The wording takes remote strings (a probe name, a CNAME target) already
-//! escaped for the caller's format and returns them embedded as given.
+//! The wording takes remote strings (a probe name, a CNAME target, a
+//! referral's zone) already escaped for the caller's format — or the escape
+//! to apply — and returns them embedded as given.
 
 use std::fmt;
 
@@ -84,6 +86,41 @@ pub fn verdict(status: DnsStatus, record_type: RecordType, nodata: bool) -> Opti
         other => format!("No answer: the server returned {other}"),
     };
     Some(text)
+}
+
+/// The sentence printed under a query result without an answer: for a
+/// referral ([`DnsQueryResult::referral_zone`]) the zone it refers to, else
+/// the [`verdict`] for its status. `None` for a positive answer. `escape`
+/// renders the referral's zone — a remote string — for the caller's format.
+pub fn query_verdict<D: fmt::Display>(
+    result: &DnsQueryResult,
+    escape: impl FnOnce(&str) -> D,
+) -> Option<String> {
+    match result.referral_zone() {
+        Some(zone) => Some(format!(
+            "No answer: referral to {}{} — the server is not authoritative for the name and \
+             does not recurse",
+            escape(zone),
+            zone_suffix(zone)
+        )),
+        None => verdict(result.status, result.record_type, result.is_nodata()),
+    }
+}
+
+/// The note under a result the resolver answered itself
+/// ([`DnsQueryResult::answered_locally`]).
+pub const LOCAL_NOTE: &str = "Answered locally, not by a server: a special-use name (RFC 6761) \
+                              that the resolver answers itself";
+
+/// The status line's server when the result names none: `none` for an
+/// answer the resolver made itself, else `default` (the default upstream).
+/// A named server is the caller's spec, which the caller escapes.
+pub fn unnamed_server(result: &DnsQueryResult) -> &'static str {
+    if result.answered_locally {
+        "none"
+    } else {
+        "default"
+    }
 }
 
 /// The wildcard note for a probe that found a wildcard, `None` when the
@@ -191,6 +228,7 @@ mod tests {
             name: "www.seer.test".to_string(),
             record_type,
             server: None,
+            answered_locally: false,
             status,
             flags: vec!["qr".into(), "rd".into(), "ra".into()],
             answers,
@@ -339,6 +377,59 @@ mod tests {
             verdict(DnsStatus::from_code(4), RecordType::A, false).as_deref(),
             Some("No answer: the server returned NOTIMP")
         );
+    }
+
+    fn ns(zone: &str, host: &str) -> DnsRecord {
+        DnsRecord {
+            name: zone.to_string(),
+            record_type: RecordType::NS,
+            ttl: 300,
+            data: RecordData::NS {
+                nameserver: host.to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn query_verdict_names_a_referral_instead_of_claiming_nodata() {
+        let mut referral = result(RecordType::A, DnsStatus::NoError, Vec::new());
+        referral.flags.clear();
+        referral.authority = vec![ns("child.seer.test", "ns1.child.seer.test.")];
+        assert_eq!(
+            query_verdict(&referral, |zone| format!("`{zone}`")).as_deref(),
+            Some(
+                "No answer: referral to `child.seer.test` — the server is not authoritative \
+                 for the name and does not recurse"
+            )
+        );
+        // An upward referral, to the root.
+        referral.authority = vec![ns(".", "a.root-servers.net.")];
+        let upward = query_verdict(&referral, str::to_string).unwrap();
+        assert!(
+            upward.starts_with("No answer: referral to . (root) — "),
+            "{upward}"
+        );
+
+        // Anything else reads as its status's verdict.
+        let nodata = result(RecordType::AAAA, DnsStatus::NoError, Vec::new());
+        assert_eq!(
+            query_verdict(&nodata, str::to_string).as_deref(),
+            Some("No AAAA records (NODATA — the name exists)")
+        );
+        let answered = result(
+            RecordType::A,
+            DnsStatus::NoError,
+            vec![a("www.seer.test", "192.0.2.1")],
+        );
+        assert_eq!(query_verdict(&answered, str::to_string), None);
+    }
+
+    #[test]
+    fn unnamed_server_is_none_for_a_local_answer() {
+        let mut r = result(RecordType::A, DnsStatus::NoError, Vec::new());
+        assert_eq!(unnamed_server(&r), "default");
+        r.answered_locally = true;
+        assert_eq!(unnamed_server(&r), "none");
     }
 
     #[test]

@@ -3,8 +3,9 @@
 //!
 //! Records renders a dig-style query result: the response's status line,
 //! the ANSWER section (the CNAME chain under its real owners, then the
-//! records), and for a response without answers why not — NXDOMAIN, NODATA
-//! or a server failure — with the AUTHORITY SOA the server sent. The outcome
+//! records), and for a response without answers why not — NXDOMAIN, NODATA,
+//! a referral or a server failure — with the AUTHORITY records the server
+//! sent, and a note when the resolver answered the name itself. The outcome
 //! wording is `seer_core::output::dig`'s, shared with `seer dig`, and every
 //! remote string goes through `sanitize_line`, as in the CLI formatters.
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -175,7 +176,8 @@ fn records(
 /// dig's header line: `● NOERROR  flags qr rd ra  server 1.1.1.1  time 12 ms`.
 /// A negative or error answer surfaces no header flags (see
 /// `DnsQueryResult::flags`), so the field is left out rather than shown
-/// empty; `server default` is the default upstream.
+/// empty; `server default` is the default upstream, `server none` a name the
+/// resolver answered itself.
 fn status_line(theme: &Theme, result: &DnsQueryResult) -> Line<'static> {
     let label = |text: &'static str| Span::styled(text, Style::default().fg(theme.overlay0));
     let value = |text: String| Span::styled(text, Style::default().fg(theme.text));
@@ -185,12 +187,10 @@ fn status_line(theme: &Theme, result: &DnsQueryResult) -> Line<'static> {
         spans.push(value(sanitize_line(&result.flags.join(" "))));
     }
     spans.push(label("  server "));
-    spans.push(value(
-        result
-            .server
-            .as_deref()
-            .map_or_else(|| "default".to_string(), sanitize_line),
-    ));
+    spans.push(value(result.server.as_deref().map_or_else(
+        || wording::unnamed_server(result).to_string(),
+        sanitize_line,
+    )));
     spans.push(label("  time "));
     spans.push(value(format!("{} ms", result.query_time_ms)));
     Line::from(spans)
@@ -200,18 +200,22 @@ fn status_line(theme: &Theme, result: &DnsQueryResult) -> Line<'static> {
 enum Section {
     /// The ANSWER table: the visible (filtered) rows, scrolled to `selected`.
     Answers,
-    /// Why there is no answer (`wording::verdict`).
-    Verdict(String),
-    /// The AUTHORITY records (the SOA of a negative answer).
+    /// Why there is no answer (`wording::query_verdict`), pre-wrapped to
+    /// the area's width — a referral's names the zone and can run long.
+    Verdict(Vec<String>),
+    /// The AUTHORITY records (the SOA of a negative answer, a referral's NS
+    /// records).
     Authority,
-    /// The wildcard note, pre-wrapped to the area's width, and its color.
+    /// The local-answer or wildcard note, pre-wrapped to the area's width,
+    /// and its color.
     Note(Vec<String>, Color),
 }
 
 /// The response below the status line, stacked from the top: the answers,
-/// the verdict when there are none, the authority records and the wildcard
-/// note. Only the answer table shrinks (and scrolls) when they do not all
-/// fit, so the verdict and the note are never cut.
+/// the verdict when there are none, the authority records, and the
+/// local-answer or wildcard note. Only the answer table shrinks (and
+/// scrolls) when they do not all fit, so the verdict and the notes are never
+/// cut.
 fn response(
     f: &mut Frame,
     area: Rect,
@@ -224,11 +228,17 @@ fn response(
     if !result.answers.is_empty() {
         sections.push(Section::Answers);
     }
-    if let Some(verdict) = wording::verdict(result.status, result.record_type, result.is_nodata()) {
-        sections.push(Section::Verdict(verdict));
+    if let Some(verdict) = wording::query_verdict(result, sanitize_line) {
+        sections.push(Section::Verdict(wrap(&verdict, area.width)));
     }
     if !result.authority.is_empty() {
         sections.push(Section::Authority);
+    }
+    if result.answered_locally {
+        sections.push(Section::Note(
+            wrap(wording::LOCAL_NOTE, area.width),
+            theme.yellow,
+        ));
     }
     if let Some(probe) = &result.wildcard {
         if let Some(note) = wording::wildcard_note(probe, sanitize_line(&probe.probe_name)) {
@@ -252,7 +262,7 @@ fn response(
             let lines = match section {
                 // The column header, then the visible rows.
                 Section::Answers => rows + 1,
-                Section::Verdict(_) => 1,
+                Section::Verdict(lines) => lines.len(),
                 Section::Authority => result.authority.len() + 1,
                 Section::Note(lines, _) => lines.len(),
             };
@@ -271,11 +281,8 @@ fn response(
                 let mut state = scroll_to(selected);
                 f.render_stateful_widget(table, band, &mut state);
             }
-            Section::Verdict(verdict) => f.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    verdict,
-                    Style::default().fg(verdict_color(theme, result.status)),
-                ))),
+            Section::Verdict(lines) => f.render_widget(
+                colored_lines(lines, verdict_color(theme, result.status)),
                 band,
             ),
             Section::Authority => f.render_widget(
@@ -287,15 +294,18 @@ fn response(
                 ),
                 band,
             ),
-            Section::Note(lines, color) => {
-                let lines: Vec<Line> = lines
-                    .into_iter()
-                    .map(|line| Line::from(Span::styled(line, Style::default().fg(color))))
-                    .collect();
-                f.render_widget(Paragraph::new(lines), band);
-            }
+            Section::Note(lines, color) => f.render_widget(colored_lines(lines, color), band),
         }
     }
+}
+
+/// Pre-wrapped lines in one color.
+fn colored_lines(lines: Vec<String>, color: Color) -> Paragraph<'static> {
+    let lines: Vec<Line> = lines
+        .into_iter()
+        .map(|line| Line::from(Span::styled(line, Style::default().fg(color))))
+        .collect();
+    Paragraph::new(lines)
 }
 
 #[cfg(test)]
@@ -517,6 +527,54 @@ mod tests {
                 .collect();
             assert_eq!(fg, [theme.red], "{status}");
         }
+    }
+
+    #[test]
+    fn a_referral_names_its_zone_instead_of_claiming_nodata() {
+        let ns = |host: &str| DnsRecord {
+            name: "child.seer.test".into(),
+            record_type: RecordType::NS,
+            ttl: 300,
+            data: RecordData::NS {
+                nameserver: host.into(),
+            },
+        };
+        let result = DnsQueryResult {
+            authority: vec![ns("ns1.child.seer.test."), ns("ns2.child.seer.test.")],
+            ..fixtures::dig_status(RecordType::A, DnsStatus::NoError)
+        };
+        let text = draw(&dig_data(result), &Panes::default(), "", None);
+        assert!(
+            flat(&text).contains(
+                "No answer: referral to child.seer.test — the server is not authoritative for \
+                 the name and does not recurse"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("NODATA"), "{text}");
+        assert!(text.contains("AUTHORITY"), "{text}");
+        assert!(
+            row_with(&text, "ns2.child.seer.test.").contains("NS"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_local_answer_says_no_server_was_asked() {
+        let result = DnsQueryResult {
+            answered_locally: true,
+            flags: vec![],
+            ..fixtures::dig(
+                RecordType::A,
+                vec![fixtures::a("foo.localhost", "127.0.0.1")],
+            )
+        };
+        let text = draw(&dig_data(result), &Panes::default(), "", None);
+        assert!(
+            text.contains("● NOERROR  server none  time 12 ms"),
+            "{text}"
+        );
+        assert!(flat(&text).contains(wording::LOCAL_NOTE), "{text}");
     }
 
     #[test]

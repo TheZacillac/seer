@@ -22,15 +22,18 @@ The dig result shape changes on the CLI, Python, REST and MCP surfaces — see
 - **Breaking: `dig` returns the whole DNS response instead of a list of
   records.** `seer dig` JSON/YAML output (`--format`, `-q`), Python
   `seer.dig()`, `GET /dns/{domain}/{record_type}` and the `seer_dig` MCP tool
-  now return one result object: `name`, `record_type`, `server`, `status`,
-  `flags`, `answers`, `authority`, `wildcard` and `query_time_ms`. The records
-  are in `answers`, which starts with any CNAME chain and lists each record
-  under its real owner name: an A record reached through a CNAME is owned by
-  the CNAME's target, no longer by the name that was asked for. Owner names
-  are A-labels (`xn--…`), spelled like `name`; record data such as a CNAME
-  target is rendered as before. SERVFAIL and REFUSED are now results with
-  that `status` instead of errors, so `seer dig` exits 0 for them, Python
-  returns the result instead of raising, and the REST route answers 200.
+  now return one result object: `name`, `record_type`, `server`,
+  `answered_locally`, `status`, `flags`, `answers`, `authority`, `wildcard`
+  and `query_time_ms`. The records are in `answers`, which starts with any
+  CNAME chain and lists each record under its real owner name: an A record
+  reached through a CNAME is owned by the CNAME's target, no longer by the
+  name that was asked for. Every name in the result — owners and the names in
+  record data such as a CNAME target alike — is spelled in A-labels
+  (`xn--…`), like `name`, so a chain can be followed name for name; the list
+  output decoded record-data names to Unicode. SERVFAIL and REFUSED are now
+  results with that `status` instead of errors, so `seer dig` exits 0 for
+  them, Python returns the result instead of raising, and the REST route
+  answers 200.
   With several record types, `seer dig` returns an array of these objects.
   `seer reverse`, bulk `dig` (the CSV, `seer.bulk_dig`, `/dns/bulk` and
   `seer_bulk_dig`) and the other DNS commands keep their output.
@@ -44,7 +47,7 @@ The dig result shape changes on the CLI, Python, REST and MCP surfaces — see
   After:
   ```json
   {"name": "www.example.com", "record_type": "A", "server": null,
-   "status": "NOERROR", "flags": ["qr", "rd", "ra"],
+   "answered_locally": false, "status": "NOERROR", "flags": ["qr", "rd", "ra"],
    "answers": [
      {"name": "www.example.com", "record_type": "CNAME", "ttl": 3600,
       "data": {"record_type": "CNAME", "value": {"target": "edge.example.net."}}},
@@ -58,7 +61,9 @@ The dig result shape changes on the CLI, Python, REST and MCP surfaces — see
 - **`ANY` covers more record types.** Wherever `ANY` is accepted, it now also
   queries CNAME, HTTPS, DS and DNSKEY (11 types, queried concurrently), and a
   record that more than one of those queries returns, such as a CNAME, is
-  listed once.
+  listed once. In `seer dig`, an `ANY` answer with records has no authority
+  section: the SOAs the types without records came back with (the parent
+  zone's among them, for DS) describe none of the answer.
 - **`--quiet --fields` on a list result** (such as `seer reverse`, or a `seer
   dig` over several types) prints each element's values together, element
   by element, instead of each field across all elements in turn. A path that
@@ -85,9 +90,17 @@ The dig result shape changes on the CLI, Python, REST and MCP surfaces — see
 - **NXDOMAIN vs NODATA:** `seer dig` says "Name does not exist (NXDOMAIN)" or
   "No AAAA records (NODATA — the name exists)" instead of showing an empty
   result, with the zone's SOA from the authority section when the server
-  sends it.
+  sends it. A referral from an `@server` that serves only a parent zone
+  (no answer, the child zone's NS records in the authority section) is
+  neither: it reads "No answer: referral to <zone>", with those NS records.
+- **Special-use names are marked as answered locally:** `localhost`,
+  `127.in-addr.arpa` (`seer dig -x 127.0.0.1`), `invalid`, `onion` and the
+  other RFC 6761 names seer's resolver answers itself are reported with
+  `answered_locally: true`, no server and no flags, and a note saying no
+  server was asked — not as if the server had answered.
 - **Wildcard detection:** for a name below its registrable domain
-  (`www.example.com`, not `example.com`), `dig` also queries a random
+  (`www.example.com`, not `example.com`, and not a special-use name),
+  `dig` also queries a random
   sibling name (`seer-probe-<hex>.example.com`) at the same time. When the
   sibling resolves, a note says the zone has a wildcard there and whether
   this answer matches it (likely wildcard-synthesized) or differs; JSON has

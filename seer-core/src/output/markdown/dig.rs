@@ -26,7 +26,7 @@ impl MarkdownFormatter {
         }
         match &result.server {
             Some(server) => b.code("Server", server),
-            None => b.raw("Server", "default"),
+            None => b.raw("Server", wording::unnamed_server(result)),
         }
         b.raw("Query time", format_args!("{} ms", result.query_time_ms));
         if let Some(probe) = &result.wildcard {
@@ -36,10 +36,12 @@ impl MarkdownFormatter {
             }
         }
 
-        if let Some(verdict) =
-            wording::verdict(result.status, result.record_type, result.is_nodata())
-        {
+        let zone = |zone: &str| format!("`{}`", MdSafe(zone));
+        if let Some(verdict) = wording::query_verdict(result, zone) {
             out.extend([String::new(), format!("*{verdict}*")]);
+        }
+        if result.answered_locally {
+            out.extend([String::new(), format!("*{}*", wording::LOCAL_NOTE)]);
         }
         if !result.answers.is_empty() {
             out.extend([String::new(), "### Answer".to_string(), String::new()]);
@@ -145,6 +147,7 @@ mod tests {
             name: "www.seer.test".to_string(),
             record_type: RecordType::TXT,
             server: Some("[x](https://phish.example)".to_string()),
+            answered_locally: false,
             status: DnsStatus::NoError,
             flags: vec!["qr".into()],
             answers: vec![DnsRecord {

@@ -56,6 +56,7 @@ mod tests {
             name: "gone.seer.test".to_string(),
             record_type: RecordType::A,
             server: None,
+            answered_locally: false,
             status: DnsStatus::NxDomain,
             flags: Vec::new(),
             answers: Vec::new(),

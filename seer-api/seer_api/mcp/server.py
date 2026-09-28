@@ -408,7 +408,12 @@ _TOOLS: dict[str, _Tool] = {
         "answers with any CNAME chain first, each record under its own owner name. "
         "NXDOMAIN means the name does not exist; NOERROR with no answers (NODATA) means "
         "it exists but has no records of that type. For either negative answer, "
-        "'authority' carries the zone's SOA when the server sent one. For a name below "
+        "'authority' carries the zone's SOA when the server sent one. NOERROR with no "
+        "answers and only NS records (no SOA) in 'authority' is a referral from a server "
+        "that is not authoritative for the name and does not recurse: it says nothing "
+        "about whether the name exists. 'answered_locally' is true for a special-use "
+        "name (localhost, 127.in-addr.arpa, .invalid, .onion) that the resolver answers "
+        "itself without asking any server. For a name below "
         "its registrable domain, 'wildcard' reports whether a random sibling name also "
         "resolves (a wildcard is present) and whether this answer matches it (likely "
         "wildcard-synthesized). ANY merges the common record types.",

@@ -265,15 +265,21 @@ call_fn! {
 ///   its reverse name, e.g. 1.2.0.192.in-addr.arpa)
 /// - record_type: the type queried
 /// - server: the nameserver exactly as given, or None for the default
-///   upstream (Google Public DNS)
+///   upstream (Google Public DNS) or when answered_locally
+/// - answered_locally: True for a special-use name (localhost,
+///   127.in-addr.arpa, .invalid, .onion, ...) that the resolver answers
+///   itself, without asking any server
 /// - status: the response code: "NOERROR", "NXDOMAIN" (the name does not
 ///   exist), "SERVFAIL", "REFUSED", ...
 /// - flags: the header flags that were set, e.g. ["qr", "rd", "ra"]; empty
 ///   for a negative or error answer
 /// - answers: the CNAME chain first, then the records, each under its own
 ///   owner name. NOERROR with no records of the type is NODATA: the name
-///   exists but has none
-/// - authority: the SOA of a negative answer, when the server sent one
+///   exists but has none — unless authority holds only NS records (no
+///   SOA): that is a referral from a server that is not authoritative for
+///   the name and does not recurse, which says nothing about existence
+/// - authority: the SOA of a negative answer, when the server sent one, or
+///   the NS records a referral points to
 /// - wildcard: for a name below its registrable domain (www.example.com,
 ///   not example.com), whether a random sibling name also resolves
 ///   (present) and to the same records (matches_answer); otherwise None

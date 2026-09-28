@@ -39,10 +39,10 @@ impl HumanFormatter {
             let flags = sanitize_line(&result.flags.join(" "));
             fields.push(self.field("flags", self.value(&flags)));
         }
-        let server = result
-            .server
-            .as_deref()
-            .map_or_else(|| "default".to_string(), sanitize_line);
+        let server = result.server.as_deref().map_or_else(
+            || wording::unnamed_server(result).to_string(),
+            sanitize_line,
+        );
         fields.push(self.field("server", self.value(&server)));
         let time = format!("{} ms", result.query_time_ms);
         fields.push(self.field("time", self.value(&time)));
@@ -56,17 +56,20 @@ impl HumanFormatter {
         if !answers.is_empty() {
             rows.section("Answer").extend(answers);
         }
-        if let Some(verdict) =
-            wording::verdict(result.status, result.record_type, result.is_nodata())
-        {
+        if let Some(verdict) = wording::query_verdict(result, sanitize_line) {
             rows.blank();
             let verdict = self.outcome(result.status, &verdict);
             rows.push(format!("  {verdict}"));
         }
-        // AUTHORITY: the SOA of a negative answer, when the server sent one.
+        // AUTHORITY: the SOA of a negative answer, when the server sent one,
+        // or the NS records of a referral.
         let authority = self.record_rows("    ", result.authority.iter().map(|r| (r, false)));
         if !authority.is_empty() {
             rows.section("Authority").extend(authority);
+        }
+        if result.answered_locally {
+            rows.blank();
+            rows.push(format!("  {}", self.warning(wording::LOCAL_NOTE)));
         }
         if let Some(probe) = &result.wildcard {
             if let Some(note) = wording::wildcard_note(probe, sanitize_line(&probe.probe_name)) {
@@ -274,6 +277,7 @@ mod tests {
             name: "www.seer.test".to_string(),
             record_type: RecordType::A,
             server: Some("1.1.1.1".to_string()),
+            answered_locally: false,
             status: DnsStatus::NoError,
             flags: vec!["qr".into(), "rd".into(), "ra".into()],
             answers: vec![

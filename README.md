@@ -312,11 +312,19 @@ Note: DNS responses are not DNSSEC-validated
 - **NXDOMAIN vs NODATA.** "Name does not exist (NXDOMAIN)" and "No AAAA
   records (NODATA — the name exists)" are told apart, each shown with the
   zone's SOA when the server sends it. SERVFAIL, REFUSED and other response
-  codes are reported as the status, not as errors.
+  codes are reported as the status, not as errors. A referral — an
+  `@server` that serves only a parent zone pointing at the child zone's
+  nameservers — reads "No answer: referral to <zone>", which says nothing
+  about whether the name exists.
+- **Special-use names.** `localhost`, `127.in-addr.arpa` (`-x 127.0.0.1`),
+  `invalid`, `onion` and the other RFC 6761 names are answered by seer's
+  resolver itself, without a query; the result says so (`server: none` and
+  a note; `answered_locally: true` in JSON).
 - **Wildcards.** For a name below its registrable domain (`www.example.com`,
   not `example.com`), a random sibling (`seer-probe-….example.com`) is queried
-  alongside. When it resolves too, a note says a wildcard answers there and
-  whether this answer matches it (likely wildcard-synthesized) or differs.
+  alongside (never for a special-use name). When it resolves too, a note says
+  a wildcard answers there and whether this answer matches it (likely
+  wildcard-synthesized) or differs.
 - **Record types.** `HTTPS` and `SVCB` (priority, target and parameters such
   as `alpn`, `ipv4hint` and `ech`) and the DNSSEC key-rollover records `CDS`
   and `CDNSKEY` are supported — see [DNS Record Types](#-dns-record-types).
@@ -333,11 +341,11 @@ Note: DNS responses are not DNSSEC-validated
   answer without following it. Every server address is checked against
   private and reserved ranges before it is queried.
 - **Scripting.** `--format json` / `yaml` prints the result object (`name`,
-  `record_type`, `server`, `status`, `flags`, `answers`, `authority`,
-  `wildcard`, `query_time_ms`), or an array of them for several types, and
-  `--quiet --fields` picks values from it. When some of several types fail,
-  the rest still print, each failure is reported on stderr, and the command
-  exits `1`.
+  `record_type`, `server`, `answered_locally`, `status`, `flags`, `answers`,
+  `authority`, `wildcard`, `query_time_ms`), or an array of them for several
+  types, and `--quiet --fields` picks values from it. When some of several
+  types fail, the rest still print, each failure is reported on stderr, and
+  the command exits `1`.
 
 The REPL's `dig` takes the same arguments. `seer reverse <ip>` is unchanged:
 it returns just the PTR records (a JSON list), where `seer dig -x <ip>`

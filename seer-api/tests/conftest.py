@@ -143,6 +143,7 @@ _DIG_RESULT = {
     "name": "www.seer.test",
     "record_type": "A",
     "server": "1.1.1.1",
+    "answered_locally": False,
     "status": "NOERROR",
     "flags": ["qr", "rd", "ra"],
     "answers": [

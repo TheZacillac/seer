@@ -12,7 +12,15 @@
 //! [`DnsTrace`](crate::dns::DnsTrace). It is what separates "the name does
 //! not exist" (NXDOMAIN) from "the name exists but has no records of this
 //! type" (NOERROR with an empty answer, i.e. NODATA) — a distinction the
-//! record-list API ([`crate::dns::DnsResolver::resolve`]) folds away.
+//! record-list API ([`crate::dns::DnsResolver::resolve`]) folds away. A
+//! referral (NOERROR with no answer, only the NS records of a zone below)
+//! is neither: see [`DnsQueryResult::referral_zone`].
+//!
+//! hickory's resolver answers the special-use names of RFC 6761
+//! (`localhost`, `127.in-addr.arpa`, `invalid`, `onion`, …) itself, without
+//! sending a query; such a result says so
+//! ([`DnsQueryResult::answered_locally`]) rather than passing off the
+//! resolver's answer as a server's.
 //!
 //! The pure steps of assembling a result — mapping a hickory outcome to an
 //! `Exchange`, ordering a CNAME chain first, merging the ANY fan-out,
@@ -27,6 +35,9 @@ use std::time::Duration;
 use hickory_resolver::lookup::Lookup;
 use hickory_resolver::net::{DnsError, NetError, NoRecords};
 use hickory_resolver::proto::op::{Message, MessageType, Metadata, ResponseCode};
+use hickory_resolver::proto::rr::domain::usage::{
+    ResolverUsage, INVALID, IN_ADDR_ARPA_127, IP6_ARPA_1, LOCAL, LOCALHOST, ONION,
+};
 use hickory_resolver::proto::rr::Name;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -180,16 +191,25 @@ pub struct DnsQueryResult {
     pub name: String,
     pub record_type: RecordType,
     /// The nameserver spec the caller passed (as given), or None for the
-    /// default upstream (Google Public DNS).
+    /// default upstream (Google Public DNS) — and None when no server was
+    /// asked at all ([`answered_locally`](Self::answered_locally)).
     pub server: Option<String>,
+    /// True when no query was sent: the name is under a special-use zone
+    /// (RFC 6761) that the resolver answers itself — `localhost`,
+    /// `127.in-addr.arpa` and `1.0…0.ip6.arpa` with loopback answers (NODATA
+    /// for other types), `invalid` and `onion` with NXDOMAIN. `server` is
+    /// then None, `flags` empty and `wildcard` None.
+    pub answered_locally: bool,
     pub status: DnsStatus,
     /// Header flags as dig prints them, lowercase, in dig's order: qr aa tc
     /// rd ra ad cd.
     ///
     /// Empty when the resolver did not surface a response header: hickory
-    /// reports a negative answer (NXDOMAIN, NODATA) and an error response
-    /// code (SERVFAIL, REFUSED, …) as an error that carries the code but not
-    /// the header, and seer never invents flags.
+    /// reports a negative answer (NXDOMAIN, NODATA, a referral) and an error
+    /// response code (SERVFAIL, REFUSED, …) as an error that carries the
+    /// code but not the header, and seer never invents flags — nor passes
+    /// on the header hickory makes up for an answer it gave itself
+    /// ([`answered_locally`](Self::answered_locally)).
     pub flags: Vec<String>,
     /// The ANSWER section in order: the CNAME chain first, then the records
     /// of the requested type — every record under its real owner name.
@@ -202,8 +222,10 @@ pub struct DnsQueryResult {
     /// exist, or has no records of the type), hickory surfaces only that
     /// negative answer, so the chain is not listed.
     pub answers: Vec<DnsRecord>,
-    /// AUTHORITY records returned (the SOA of a negative answer, when
-    /// available).
+    /// AUTHORITY records returned: for a negative answer the zone's SOA,
+    /// when the server sent one; for a referral the NS records of the zone
+    /// it refers to ([`referral_zone`](Self::referral_zone)). An ANY answer
+    /// with records carries none (see [`answers`](Self::answers)).
     pub authority: Vec<DnsRecord>,
     /// Wildcard probe outcome; None when the probe was not run or did not
     /// complete.
@@ -214,13 +236,43 @@ pub struct DnsQueryResult {
 
 impl DnsQueryResult {
     /// NOERROR with no answer of the requested type (for ANY: no answers at
-    /// all).
+    /// all) — the name exists, without records of the type. A referral is
+    /// not NODATA ([`referral_zone`](Self::referral_zone)).
     pub fn is_nodata(&self) -> bool {
-        self.status == DnsStatus::NoError
-            && match self.record_type {
-                RecordType::ANY => self.answers.is_empty(),
-                wanted => !self.records().any(|r| r.record_type == wanted),
-            }
+        self.status == DnsStatus::NoError && self.lacks_answer() && self.referral_zone().is_none()
+    }
+
+    /// The zone this response refers the query to, when it is a referral
+    /// rather than an answer: NOERROR with no answer of the requested type,
+    /// NS records in AUTHORITY and no SOA there (RFC 2308 §2.2) — the zone
+    /// is the NS records' owner.
+    ///
+    /// A server that is neither authoritative for the name nor recursive (an
+    /// `@server` serving only a parent zone) answers this way, pointing at
+    /// the servers of the zone below it. Unlike NODATA, a referral says
+    /// nothing about whether the name exists.
+    pub fn referral_zone(&self) -> Option<&str> {
+        if self.status != DnsStatus::NoError
+            || !self.lacks_answer()
+            || self
+                .authority
+                .iter()
+                .any(|r| r.record_type == RecordType::SOA)
+        {
+            return None;
+        }
+        self.authority
+            .iter()
+            .find(|r| r.record_type == RecordType::NS)
+            .map(|r| r.name.as_str())
+    }
+
+    /// No answer of the requested type (for ANY: no answers at all).
+    fn lacks_answer(&self) -> bool {
+        match self.record_type {
+            RecordType::ANY => self.answers.is_empty(),
+            wanted => !self.records().any(|r| r.record_type == wanted),
+        }
     }
 
     /// The CNAME records at the front of `answers`.
@@ -297,8 +349,9 @@ impl Exchange {
     /// - A lookup: the status and flags from its message header (hickory
     ///   keeps the upstream header), its ANSWER and AUTHORITY sections.
     /// - `NoRecordsFound`: the negative answer's own response code —
-    ///   NXDOMAIN, or NOERROR for NODATA — and its AUTHORITY records (at
-    ///   least the SOA, when the server sent one).
+    ///   NXDOMAIN, or NOERROR for NODATA or a referral — and its AUTHORITY
+    ///   records (at least the SOA, when the server sent one; a referral's
+    ///   NS records, which [`DnsQueryResult::referral_zone`] reads).
     /// - An error response code (SERVFAIL, REFUSED, NOTIMP, …): that status
     ///   with no records, as dig shows it.
     /// - Anything else is a transport failure (timeout, no connection,
@@ -358,7 +411,9 @@ impl Exchange {
         self.status == DnsStatus::NoError && !self.records(record_type).is_empty()
     }
 
-    /// Assembles the public result.
+    /// Assembles the public result. For a name the resolver answers itself
+    /// ([`answered_locally`]) no server was asked and the header is
+    /// hickory's own, so neither is reported.
     pub(crate) fn into_result(
         self,
         name: String,
@@ -367,12 +422,14 @@ impl Exchange {
         wildcard: Option<WildcardProbe>,
         query_time: Duration,
     ) -> DnsQueryResult {
+        let local = answered_locally(&name);
         DnsQueryResult {
             name,
             record_type,
-            server: server.map(str::to_string),
+            server: server.filter(|_| !local).map(str::to_string),
+            answered_locally: local,
             status: self.status,
-            flags: self.flags,
+            flags: if local { Vec::new() } else { self.flags },
             answers: self.answers,
             authority: self.authority,
             wildcard,
@@ -420,18 +477,12 @@ pub(crate) fn header_flags(metadata: &Metadata) -> Vec<String> {
     .collect()
 }
 
-/// A reported DNS name in one comparable spelling: ASCII (A-labels),
-/// lowercase (RFC 4343), without the trailing root dot. Owner and query
-/// names are reported as A-labels without the dot, but a CNAME target the
-/// way `convert_rdata` renders RDATA names — with the dot, and with IDN
-/// labels decoded to Unicode — so a chain is only walkable with both sides
-/// in this form. A name that does not parse is compared as written.
+/// A reported DNS name in one comparable spelling: lowercase (RFC 4343),
+/// without the trailing root dot. Every name in a result is already ASCII
+/// (A-labels, see `to_dns_record`), but owner and query names are reported
+/// without the dot and RDATA names such as a CNAME target with it.
 fn name_key(name: &str) -> String {
-    let bare = name.strip_suffix('.').unwrap_or(name);
-    Name::from_utf8(bare)
-        .map(|parsed| parsed.to_ascii())
-        .unwrap_or_else(|_| bare.to_string())
-        .to_ascii_lowercase()
+    name.strip_suffix('.').unwrap_or(name).to_ascii_lowercase()
 }
 
 /// Orders an ANSWER section for reporting: the CNAME chain that starts at
@@ -494,9 +545,13 @@ pub(crate) fn dedupe_records(records: impl IntoIterator<Item = DnsRecord>) -> Ve
 /// - status: NOERROR if any sub-query got NOERROR, NXDOMAIN if all got
 ///   NXDOMAIN, else the first sub-query's status;
 /// - flags: from the first sub-query that surfaced a response header;
-/// - answers and authority: concatenated in order, repeats removed
-///   ([`dedupe_records`]) — a CNAME'd name returns its CNAME to every
-///   sub-query.
+/// - answers: concatenated in order, repeats removed ([`dedupe_records`]) —
+///   a CNAME'd name returns its CNAME to every sub-query;
+/// - authority: only for a negative merge (no answers), and only from the
+///   sub-queries that returned the merged status, deduplicated the same way.
+///   A positive answer carries none: the sub-queries that came back NODATA
+///   each bring their zone's SOA — the DS one, answered by the parent, the
+///   parent's — and none of those describes the answer.
 ///
 /// Sub-queries that failed in transport are skipped; when every one failed,
 /// the last error is returned rather than an empty set that would read as
@@ -527,12 +582,50 @@ pub(crate) fn merge_any(results: Vec<Result<Exchange>>) -> Result<Exchange> {
         .map(|e| e.flags.clone())
         .unwrap_or_default();
     let answers = dedupe_records(exchanges.iter().flat_map(|e| e.answers.iter().cloned()));
-    let authority = dedupe_records(exchanges.iter().flat_map(|e| e.authority.iter().cloned()));
+    let authority = if answers.is_empty() {
+        dedupe_records(
+            exchanges
+                .iter()
+                .filter(|e| e.status == status)
+                .flat_map(|e| e.authority.iter().cloned()),
+        )
+    } else {
+        Vec::new()
+    };
     Ok(Exchange {
         status,
         flags,
         answers,
         authority,
+    })
+}
+
+/// Whether hickory's resolver answers `name` itself, without sending a
+/// query: its caching client handles the special-use zones of RFC 6761
+/// locally — `localhost`, `127.in-addr.arpa` and `1.0…0.ip6.arpa` get
+/// loopback answers (NODATA for other types), `invalid` and `onion`
+/// NXDOMAIN. The zones and their treatment are hickory's own, consulted as
+/// its `CachingClient` consults them (`local` among them, whose queries it
+/// sends on).
+pub(crate) fn answered_locally(name: &str) -> bool {
+    let Ok(name) = Name::from_ascii(name) else {
+        return false;
+    };
+    [
+        &LOCALHOST,
+        &IN_ADDR_ARPA_127,
+        &IP6_ARPA_1,
+        &INVALID,
+        &LOCAL,
+        &ONION,
+    ]
+    .into_iter()
+    .find(|zone| zone.name().zone_of(&name))
+    .is_some_and(|zone| {
+        matches!(
+            zone.resolver(),
+            ResolverUsage::Loopback | ResolverUsage::NxDomain
+        )
     })
 }
 
@@ -552,16 +645,21 @@ pub(crate) fn random_probe_label() -> String {
 /// `_service._proto` style name too, only the leftmost label is replaced.
 ///
 /// `None` when a probe is meaningless or out of bounds: for ANY (a fan-out,
-/// not one answer), for a wildcard name itself (`*.example.com`), and for a
+/// not one answer), for a wildcard name itself (`*.example.com`), for a
 /// name that is not strictly below its registrable domain — a sibling of
 /// `example.com` or `example.co.uk` would sit directly under a public
-/// suffix, and seer never probes at TLD level.
+/// suffix, and seer never probes at TLD level — and for a name the resolver
+/// answers itself ([`answered_locally`]), whose sibling it answers alike.
 pub(crate) fn wildcard_probe_name(
     name: &str,
     record_type: RecordType,
     label: &str,
 ) -> Option<String> {
-    if record_type == RecordType::ANY || name == "*" || name.starts_with("*.") {
+    if record_type == RecordType::ANY
+        || name == "*"
+        || name.starts_with("*.")
+        || answered_locally(name)
+    {
         return None;
     }
     crate::psl::registrable_parent(name)?;
@@ -871,21 +969,21 @@ mod tests {
 
     #[test]
     fn order_answers_walks_a_chain_through_idn_names() {
-        // Owners are reported as A-labels, but a CNAME target as its RDATA
-        // renders — with Unicode labels — and the chain must still connect.
+        // Owners and CNAME targets are both A-labels (see `to_dns_record`);
+        // only the case and the trailing dot differ.
         let answers = vec![
             a("edge.xn--caf-dma.test", "192.0.2.7"),
-            cname("xn--bcher-kva.seer.test", "edge.café.test."),
+            cname("xn--bcher-kva.seer.test", "Edge.XN--CAF-DMA.test."),
         ];
         let ordered = order_answers("xn--bcher-kva.seer.test", RecordType::A, answers);
         assert_eq!(
             ordered,
             vec![
-                cname("xn--bcher-kva.seer.test", "edge.café.test."),
+                cname("xn--bcher-kva.seer.test", "Edge.XN--CAF-DMA.test."),
                 a("edge.xn--caf-dma.test", "192.0.2.7"),
             ]
         );
-        assert_eq!(name_key("Edge.Café.test."), "edge.xn--caf-dma.test");
+        assert_eq!(name_key("Edge.XN--CAF-DMA.test."), "edge.xn--caf-dma.test");
         assert_eq!(name_key("WWW.seer.test"), "www.seer.test");
     }
 
@@ -920,10 +1018,14 @@ mod tests {
         );
     }
 
+    fn soa(zone: &str) -> DnsRecord {
+        to_dns_record(&soa_record(zone).into_record_of_rdata()).unwrap()
+    }
+
     #[test]
     fn merge_any_status_flags_and_answers() {
         let chain = cname("www.seer.test", "edge.cdn.test.");
-        let nodata = Exchange::negative(DnsStatus::NoError, vec![]);
+        let nodata = Exchange::negative(DnsStatus::NoError, vec![soa("seer.test")]);
         let merged = merge_any(vec![
             Ok(nodata.clone()),
             Ok(exchange(
@@ -932,20 +1034,43 @@ mod tests {
             )),
             Err(SeerError::DnsError("MX lookup failed: timeout".to_string())),
             Ok(exchange(DnsStatus::NoError, vec![chain.clone()])),
+            // The DS sub-query, answered NODATA by the parent zone.
+            Ok(Exchange::negative(DnsStatus::NoError, vec![soa("test")])),
         ])
         .unwrap();
         assert_eq!(merged.status, DnsStatus::NoError);
         // The first sub-query surfaced no header; the second did.
         assert_eq!(merged.flags, ["qr", "rd", "ra"]);
         assert_eq!(merged.answers, vec![chain, a("edge.cdn.test", "192.0.2.7")]);
+        // Regression: the NODATA sub-queries' SOAs — the parent's among
+        // them — were merged into a positive answer's AUTHORITY.
+        assert!(merged.authority.is_empty(), "{:?}", merged.authority);
+
+        // A negative merge keeps the SOA, once, from the sub-queries that
+        // returned the merged status.
+        let all_nodata = merge_any(vec![
+            Ok(nodata.clone()),
+            Ok(Exchange::negative(DnsStatus::ServFail, vec![soa("other")])),
+            Ok(nodata),
+        ])
+        .unwrap();
+        assert_eq!(all_nodata.status, DnsStatus::NoError);
+        assert_eq!(all_nodata.authority, [soa("seer.test")]);
 
         let all_nx = merge_any(vec![
-            Ok(Exchange::negative(DnsStatus::NxDomain, vec![])),
-            Ok(Exchange::negative(DnsStatus::NxDomain, vec![])),
+            Ok(Exchange::negative(
+                DnsStatus::NxDomain,
+                vec![soa("seer.test")],
+            )),
+            Ok(Exchange::negative(
+                DnsStatus::NxDomain,
+                vec![soa("seer.test")],
+            )),
         ])
         .unwrap();
         assert_eq!(all_nx.status, DnsStatus::NxDomain);
         assert!(all_nx.flags.is_empty());
+        assert_eq!(all_nx.authority, [soa("seer.test")]);
 
         // Mixed failures: the first sub-query's status.
         let mixed = merge_any(vec![
@@ -1016,6 +1141,10 @@ mod tests {
         assert_eq!(probe("*.example.com", RecordType::A), None);
         assert_eq!(probe("*", RecordType::A), None);
         assert_eq!(probe("www.example.com", RecordType::ANY), None);
+        // Regression: the resolver answers a special-use name's sibling
+        // itself, the same way, so the probe "found" a wildcard.
+        assert_eq!(probe("1.0.0.127.in-addr.arpa", RecordType::PTR), None);
+        assert_eq!(probe("a.b.localhost", RecordType::A), None);
     }
 
     #[test]
@@ -1155,6 +1284,122 @@ mod tests {
         .is_nodata());
     }
 
+    fn ns(zone: &str, host: &str) -> DnsRecord {
+        rec(
+            zone,
+            RecordType::NS,
+            300,
+            RecordData::NS {
+                nameserver: host.to_string(),
+            },
+        )
+    }
+
+    #[test]
+    fn a_referral_is_not_nodata() {
+        // Regression: a non-recursive server's referral (NOERROR, no answer,
+        // the child zone's NS records in AUTHORITY, no SOA) was reported as
+        // NODATA — "the name exists" — which a referral does not say.
+        let mut referral = result(RecordType::A, DnsStatus::NoError, vec![]);
+        referral.authority = vec![
+            ns("child.seer.test", "ns1.child.seer.test."),
+            ns("child.seer.test", "ns2.child.seer.test."),
+        ];
+        assert_eq!(referral.referral_zone(), Some("child.seer.test"));
+        assert!(!referral.is_nodata());
+
+        // NODATA may carry the zone's NS next to its SOA (RFC 2308 §2.2):
+        // the SOA makes it an answer, not a referral.
+        let mut nodata = referral.clone();
+        nodata.authority.insert(0, soa("seer.test"));
+        assert_eq!(nodata.referral_zone(), None);
+        assert!(nodata.is_nodata());
+
+        // NS records beside an answer, or under another status, are no
+        // referral either.
+        let mut answered = result(
+            RecordType::A,
+            DnsStatus::NoError,
+            vec![a("www.seer.test", "192.0.2.1")],
+        );
+        answered.authority = referral.authority.clone();
+        assert_eq!(answered.referral_zone(), None);
+        let mut nx = result(RecordType::A, DnsStatus::NxDomain, vec![]);
+        nx.authority = referral.authority.clone();
+        assert_eq!(nx.referral_zone(), None);
+        // An ANY fan-out whose sub-queries were all referred.
+        let mut any = referral.clone();
+        any.record_type = RecordType::ANY;
+        assert_eq!(any.referral_zone(), Some("child.seer.test"));
+        assert!(!any.is_nodata());
+    }
+
+    #[test]
+    fn special_use_names_are_answered_locally() {
+        for name in [
+            "localhost",
+            "foo.localhost",
+            "1.0.0.127.in-addr.arpa",
+            "seer-probe-0123456789.0.0.127.in-addr.arpa",
+            "1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.ip6.arpa",
+            "x.invalid",
+            "facebookcorewwwi.onion",
+            "Foo.LOCALHOST",
+        ] {
+            assert!(answered_locally(name), "{name}");
+        }
+        for name in [
+            "www.seer.test",
+            // `local` is consulted, but hickory sends its queries on.
+            "printer.local",
+            "1.0.0.10.in-addr.arpa",
+            "localhost.example.com",
+            "onion.seer.test",
+        ] {
+            assert!(!answered_locally(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_local_answer_names_no_server_and_no_invented_header() {
+        // Regression: hickory's own answer for a special-use name was
+        // reported as the server's — `server: 1.1.1.1`, `flags: qr` — though
+        // no query was sent.
+        let local = exchange(
+            DnsStatus::NoError,
+            vec![rec(
+                "1.0.0.127.in-addr.arpa",
+                RecordType::PTR,
+                86400,
+                RecordData::PTR {
+                    target: "localhost.".to_string(),
+                },
+            )],
+        )
+        .into_result(
+            "1.0.0.127.in-addr.arpa".to_string(),
+            RecordType::PTR,
+            Some("1.1.1.1"),
+            None,
+            Duration::ZERO,
+        );
+        assert!(local.answered_locally);
+        assert_eq!(local.server, None);
+        assert!(local.flags.is_empty());
+        assert_eq!(local.records().count(), 1);
+
+        let sent = exchange(DnsStatus::NoError, vec![]).into_result(
+            "www.seer.test".to_string(),
+            RecordType::A,
+            Some("1.1.1.1"),
+            None,
+            Duration::ZERO,
+        );
+        assert_eq!(sent.server.as_deref(), Some("1.1.1.1"));
+        assert!(!sent.answered_locally);
+        assert_eq!(sent.flags, ["qr", "rd", "ra"]);
+    }
+
     #[test]
     fn result_serializes_to_the_documented_shape() {
         let mut query = result(
@@ -1178,6 +1423,7 @@ mod tests {
                 "name": "www.seer.test",
                 "record_type": "A",
                 "server": "1.1.1.1",
+                "answered_locally": false,
                 "status": "NOERROR",
                 "flags": ["qr", "rd", "ra"],
                 "answers": [

@@ -1055,6 +1055,7 @@ fn dig_result(name: &str, record_type: RecordType, status: DnsStatus) -> DnsQuer
         name: name.into(),
         record_type,
         server: None,
+        answered_locally: false,
         status,
         flags: Vec::new(),
         answers: Vec::new(),
@@ -1130,6 +1131,47 @@ fn fixture_dig_servfail() -> DnsQueryResult {
         server: Some("tls://dns.quad9.net".into()),
         query_time_ms: 48,
         ..dig_result("broken.seer.test", RecordType::A, DnsStatus::ServFail)
+    }
+}
+
+/// A referral from a server that serves only the parent zone: no answer,
+/// the child zone's NS records in AUTHORITY and no SOA — which does not say
+/// whether the name exists.
+fn fixture_dig_referral() -> DnsQueryResult {
+    let ns = |host: &str| DnsRecord {
+        name: "child.seer.test".into(),
+        record_type: RecordType::NS,
+        ttl: 172800,
+        data: RecordData::NS {
+            nameserver: host.into(),
+        },
+    };
+    DnsQueryResult {
+        server: Some("ns1.seer.test".into()),
+        authority: vec![ns("ns1.child.seer.test."), ns("ns2.child.seer.test.")],
+        query_time_ms: 14,
+        ..dig_result("www.child.seer.test", RecordType::A, DnsStatus::NoError)
+    }
+}
+
+/// A special-use name the resolver answered itself: no server, no flags.
+fn fixture_dig_local() -> DnsQueryResult {
+    DnsQueryResult {
+        answered_locally: true,
+        answers: vec![DnsRecord {
+            name: "1.0.0.127.in-addr.arpa".into(),
+            record_type: RecordType::PTR,
+            ttl: 86400,
+            data: RecordData::PTR {
+                target: "localhost.".into(),
+            },
+        }],
+        query_time_ms: 0,
+        ..dig_result(
+            "1.0.0.127.in-addr.arpa",
+            RecordType::PTR,
+            DnsStatus::NoError,
+        )
     }
 }
 
@@ -1286,6 +1328,10 @@ snapshot_tests! {
     markdown_dig_servfail_snapshot => markdown.format_dig(fixture_dig_servfail());
     human_dig_https_snapshot => human.format_dig(fixture_dig_https());
     markdown_dig_https_snapshot => markdown.format_dig(fixture_dig_https());
+    human_dig_referral_snapshot => human.format_dig(fixture_dig_referral());
+    markdown_dig_referral_snapshot => markdown.format_dig(fixture_dig_referral());
+    human_dig_local_snapshot => human.format_dig(fixture_dig_local());
+    markdown_dig_local_snapshot => markdown.format_dig(fixture_dig_local());
     human_dns_trace_snapshot => human.format_dns_trace(fixture_dns_trace());
     markdown_dns_trace_snapshot => markdown.format_dns_trace(fixture_dns_trace());
     human_dns_trace_error_snapshot => human.format_dns_trace(fixture_dns_trace_error());

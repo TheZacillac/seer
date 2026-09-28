@@ -208,6 +208,7 @@ pub(crate) mod fixtures {
             name: "www.seer.test".into(),
             record_type,
             server: None,
+            answered_locally: false,
             status: DnsStatus::NoError,
             flags: vec!["qr".into(), "rd".into(), "ra".into()],
             answers,
