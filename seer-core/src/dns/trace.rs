@@ -6,10 +6,14 @@
 //!    ([`ROOT_SERVERS`], IANA's `named.root`).
 //! 2. Ask one server of the current zone for the query name and type,
 //!    directly and with recursion disabled (RD=0). A server that does not
-//!    respond, or answers with an error RCODE (SERVFAIL, REFUSED, …), is
+//!    respond, answers with an error RCODE (SERVFAIL, REFUSED, …), or gives a
+//!    lame server's reply — AA clear, no answer, no SOA and no referral — is
 //!    noted in the hop's `failed_servers` and the next server of the zone is
-//!    asked — up to [`MAX_SERVERS_PER_LEVEL`] servers per level, each on one
-//!    address (IPv4 preferred).
+//!    asked — up to [`MAX_SERVERS_PER_LEVEL`] servers per level. A server is
+//!    asked on one address, IPv4 first: an address this host has no route to
+//!    (IPv4 on an IPv6-only host, or the reverse) fails at once, is noted,
+//!    and the server's next address is tried instead, without counting
+//!    toward the limit, since no query left the host.
 //! 3. A referral — NOERROR, AA clear, no answer, no SOA, NS records in
 //!    AUTHORITY — names the next zone, which must lie strictly below the
 //!    current zone and at or above the query name (bailiwick); an upward or
@@ -20,8 +24,9 @@
 //!    resolver (Google Public DNS), at most [`MAX_GLUELESS_PER_LEVEL`] per
 //!    level.
 //! 4. The walk stops at the first answer — authoritative or not; a CNAME is
-//!    reported, not chased, as `dig +trace` does — at NXDOMAIN or NODATA, or
-//!    on an error, which [`DnsTrace::error`] reports with the hops so far.
+//!    reported, not chased, as `dig +trace` does — at NXDOMAIN or NODATA
+//!    (authoritative, or carrying the zone's SOA), or on an error, which
+//!    [`DnsTrace::error`] reports with the hops so far.
 //!
 //! **One raw exchange per hop.** Each query is a hickory-net UDP exchange
 //! (repeated over TCP when the reply is truncated), not a resolver lookup,
@@ -39,8 +44,9 @@
 //! `delegation::partition_reserved`) before a query is sent; a reserved one
 //! is skipped and noted in the hop's `failed_servers`. Tests reach loopback
 //! fixtures only through `#[cfg(test)]` seams (`allowing_private_hosts`,
-//! `with_root_hints`, `with_port_map`, `with_recursive_upstream`); the
-//! production validation path is never weakened.
+//! `with_root_hints`, `with_port_map`, `with_recursive_upstream`, and
+//! `with_unroutable` to simulate a missing route); the production
+//! validation path is never weakened.
 //!
 //! **Retry boundary (deliberate):** like the rest of `dns/`, no
 //! [`crate::retry::RetryPolicy`]. hickory retransmits a UDP query within the
@@ -49,9 +55,14 @@
 //!
 //! **Bounded work:** at most [`MAX_HOPS`] delegation levels and, per level,
 //! at most [`MAX_SERVERS_PER_LEVEL`] queries and [`MAX_GLUELESS_PER_LEVEL`]
-//! glueless lookups, each under the per-query timeout (the config file's DNS
-//! timeout). Each referral must descend toward the query name, so the walk
-//! cannot loop.
+//! glueless lookups, each query and each lookup under the per-query timeout
+//! (the config file's DNS timeout); an address with no local route fails
+//! without waiting. There is no deadline for the walk as a whole: at worst —
+//! every level answered only by its last server, after timed-out glueless
+//! lookups — it takes `MAX_HOPS × (MAX_SERVERS_PER_LEVEL +
+//! MAX_GLUELESS_PER_LEVEL)` = 96 timeouts (8 minutes at the default 5s),
+//! while a level whose servers all fail ends it. Each referral must descend toward the query name, so the
+//! walk cannot loop.
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
@@ -68,9 +79,7 @@ use hickory_resolver::TokioResolver;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, instrument};
 
-use super::delegation::{
-    build_recursive_resolver, is_local_no_route, partition_reserved, prefer_ipv4,
-};
+use super::delegation::{build_recursive_resolver, is_local_no_route, partition_reserved};
 use super::query::{duration_ms, DnsStatus};
 use super::records::{DnsRecord, RecordType};
 use super::resolver::{fqdn, prepare_query, to_dns_record, wire_query_name, wire_type};
@@ -140,9 +149,9 @@ pub struct TraceHop {
     /// This response's ANSWER section, every record under its real owner
     /// name (normally only the final hop has one).
     pub answers: Vec<DnsRecord>,
-    /// Servers of this zone that were skipped or failed before this one
-    /// answered, as `"host (ip): reason"` — or `"host: reason"` when no
-    /// address was found for the host.
+    /// Servers of this zone — or single addresses of one — that were skipped
+    /// or failed before this one answered, as `"host (ip): reason"`, or
+    /// `"host: reason"` when no address was found for the host.
     pub failed_servers: Vec<String>,
 }
 
@@ -216,6 +225,10 @@ pub struct DnsTracer {
     /// Test-only: skip the SSRF/reserved-IP validation on server addresses.
     #[cfg(test)]
     allow_private_hosts: bool,
+    /// Test-only: addresses a direct query fails for at once with "network
+    /// unreachable", as on a host with no route to their address family.
+    #[cfg(test)]
+    unroutable: Vec<IpAddr>,
 }
 
 impl std::fmt::Debug for DnsTracer {
@@ -247,6 +260,8 @@ impl DnsTracer {
             port_map: None,
             #[cfg(test)]
             allow_private_hosts: false,
+            #[cfg(test)]
+            unroutable: Vec::new(),
         }
     }
 
@@ -309,6 +324,15 @@ impl DnsTracer {
         self
     }
 
+    /// Test-only: fail every direct query to these addresses locally with
+    /// "network unreachable", before anything is sent — what an IPv4 server
+    /// address gives on an IPv6-only host.
+    #[cfg(test)]
+    fn with_unroutable(mut self, addrs: &[IpAddr]) -> Self {
+        self.unroutable = addrs.to_vec();
+        self
+    }
+
     #[cfg(test)]
     fn recursive_upstream(&self) -> Option<(IpAddr, u16)> {
         self.recursive_upstream
@@ -358,17 +382,37 @@ impl DnsTracer {
         53
     }
 
+    /// The local routing failure the `#[cfg(test)]` seam simulates for `ip`,
+    /// if any. Never one in production: there the socket reports it.
+    #[cfg(test)]
+    fn simulated_no_route(&self, ip: IpAddr) -> Option<NetError> {
+        self.unroutable.contains(&ip).then(|| {
+            NetError::from(std::io::Error::new(
+                std::io::ErrorKind::NetworkUnreachable,
+                "Network is unreachable",
+            ))
+        })
+    }
+
+    #[cfg(not(test))]
+    fn simulated_no_route(&self, _ip: IpAddr) -> Option<NetError> {
+        None
+    }
+
     /// Traces the resolution of `name` from the root servers down.
     ///
     /// Each hop asks one server of the current zone directly, with recursion
     /// disabled, and follows its referral to the next zone, until a server
     /// answers (a CNAME is reported, not chased), returns NXDOMAIN or NODATA,
-    /// or the walk fails. A referral must lead toward `name`; an upward or
-    /// sideways one stops the walk. Server addresses come from the root
-    /// hints, the referral's glue, or a recursive lookup for glueless
+    /// or the walk fails. A server that does not respond, returns an error
+    /// RCODE or gives a lame server's empty non-authoritative reply is passed
+    /// over for the zone's next one. A referral must lead toward `name`; an
+    /// upward or sideways one stops the walk. Server addresses come from the
+    /// root hints, the referral's glue, or a recursive lookup for glueless
     /// nameservers, and each one is refused when it is private or reserved.
     /// Up to 16 delegation levels are walked and up to 3 servers asked per
-    /// level, each query under the configured DNS timeout.
+    /// level, each query and glueless lookup under the configured DNS
+    /// timeout.
     ///
     /// # Arguments
     /// * `name` - The name to trace, prepared exactly as
@@ -392,8 +436,8 @@ impl DnsTracer {
         let mut error = None;
 
         loop {
-            let (mut hop, response) = match self.ask_level(&zone, &servers, &qname, qtype).await {
-                LevelOutcome::Answered { hop, response } => (hop, response),
+            let (mut hop, step) = match self.ask_level(&zone, &servers, &qname, qtype).await {
+                LevelOutcome::Answered { hop, step } => (hop, step),
                 LevelOutcome::Failed { final_hop, reason } => {
                     let why = format!(
                         "no nameserver for {} gave a usable response: {}",
@@ -415,7 +459,7 @@ impl DnsTracer {
                 }
             };
 
-            let referral = match classify_response(&response, &zone) {
+            let referral = match step {
                 Step::Final => {
                     hops.push(hop);
                     break;
@@ -471,7 +515,7 @@ impl DnsTracer {
     }
 
     /// Asks the servers of `zone` in turn until one gives a usable response
-    /// (NOERROR or NXDOMAIN), recording every skipped or failed server.
+    /// (a final one or a referral), recording every skipped or failed server.
     async fn ask_level(
         &self,
         zone: &Name,
@@ -482,45 +526,48 @@ impl DnsTracer {
         let (picks, mut failures) = plan_servers(servers, self.allow_private());
         let mut queried = 0;
         let mut resolved = 0;
-        // The last error-RCODE response, and the index of its own note in
-        // `failures`: it becomes the final hop if no server does better.
-        let mut rcode_hop: Option<(TraceHop, usize)> = None;
+        // The last unusable response (an error RCODE or a lame reply), and
+        // the index of its own note in `failures`: it becomes the final hop
+        // if no server does better.
+        let mut unusable_hop: Option<(TraceHop, usize)> = None;
 
         for pick in picks {
             if queried == MAX_SERVERS_PER_LEVEL {
                 break;
             }
-            let (host, ip) = match pick {
-                ServerPick::Addr(host, ip) => (host, ip),
+            let (host, addrs) = match pick {
+                ServerPick::Addrs(host, addrs) => (host, addrs),
                 ServerPick::Glueless(host) => {
                     // Glueless picks come last, so none remain to try.
                     if resolved == MAX_GLUELESS_PER_LEVEL {
                         break;
                     }
                     resolved += 1;
-                    let (ip, notes) = self.resolve_glueless(&host).await;
+                    let (addrs, notes) = self.resolve_glueless(&host).await;
                     failures.extend(notes);
-                    match ip {
-                        Some(ip) => (host, ip),
-                        None => continue,
-                    }
+                    (host, addrs)
                 }
             };
+            let Some((ip, elapsed, result)) = self
+                .ask_server(&host, &addrs, qname, qtype, &mut failures)
+                .await
+            else {
+                continue;
+            };
             queried += 1;
-            debug!(zone = %name_text(zone), server = %name_text(&host), %ip, "trace: querying");
-            let started = Instant::now();
-            let result = self.exchange(&host, ip, qname, qtype).await;
-            let elapsed = started.elapsed();
             match result {
                 Ok(response) => {
                     let mut hop = hop_from_response(zone, &host, ip, elapsed, &response);
-                    let code = response.metadata.response_code;
-                    if matches!(code, ResponseCode::NoError | ResponseCode::NXDomain) {
-                        hop.failed_servers = failures;
-                        return LevelOutcome::Answered { hop, response };
+                    match classify_response(&response, zone) {
+                        Ok(step) => {
+                            hop.failed_servers = failures;
+                            return LevelOutcome::Answered { hop, step };
+                        }
+                        Err(reason) => {
+                            unusable_hop = Some((hop, failures.len()));
+                            failures.push(server_note(&host, ip, &reason));
+                        }
                     }
-                    rcode_hop = Some((hop, failures.len()));
-                    failures.push(server_note(&host, ip, &DnsStatus::from(code).to_string()));
                 }
                 Err(e) => failures.push(server_note(&host, ip, &transport_reason(&e))),
             }
@@ -531,7 +578,7 @@ impl DnsTracer {
         } else {
             failures.join("; ")
         };
-        let final_hop = rcode_hop.map(|(mut hop, own_note)| {
+        let final_hop = unusable_hop.map(|(mut hop, own_note)| {
             failures.remove(own_note);
             hop.failed_servers = failures;
             hop
@@ -539,18 +586,50 @@ impl DnsTracer {
         LevelOutcome::Failed { final_hop, reason }
     }
 
-    /// Resolves a glueless nameserver's address through the recursive
-    /// resolver, vetting every address it returns. Returns the address to
-    /// query (IPv4 preferred), if any, and notes for the failed lookup or
-    /// the refused addresses.
-    async fn resolve_glueless(&self, host: &Name) -> (Option<IpAddr>, Vec<String>) {
+    /// Queries one server on its addresses in turn until a query leaves this
+    /// host: an address with no local route fails at once, is noted in
+    /// `failures`, and the next one is tried. Returns the address queried,
+    /// the round-trip time and the exchange's result, or `None` when no
+    /// address could be reached.
+    async fn ask_server(
+        &self,
+        host: &Name,
+        addrs: &[IpAddr],
+        qname: &Name,
+        qtype: HickoryRecordType,
+        failures: &mut Vec<String>,
+    ) -> Option<(IpAddr, Duration, std::result::Result<Message, NetError>)> {
+        for &ip in addrs {
+            debug!(server = %name_text(host), %ip, "trace: querying");
+            let started = Instant::now();
+            match self.exchange(host, ip, qname, qtype).await {
+                Err(e) if is_no_route(&e) => {
+                    failures.push(server_note(host, ip, &transport_reason(&e)));
+                }
+                result => return Some((ip, started.elapsed(), result)),
+            }
+        }
+        None
+    }
+
+    /// Resolves a glueless nameserver's addresses through the recursive
+    /// resolver, under the per-query timeout, vetting every address it
+    /// returns. Returns the addresses to query, IPv4 first (none when the
+    /// lookup failed or every address was refused), and notes for the failed
+    /// lookup or the refused addresses.
+    async fn resolve_glueless(&self, host: &Name) -> (Vec<IpAddr>, Vec<String>) {
         let text = name_text(host);
-        let ips: Vec<IpAddr> = match self.recursive.lookup_ip(text.as_str()).await {
+        // The resolver re-sends a query that timed out (`attempts`), so only
+        // this deadline holds the lookup to one per-query timeout.
+        let lookup = tokio::time::timeout(self.timeout, self.recursive.lookup_ip(text.as_str()))
+            .await
+            .unwrap_or(Err(NetError::Timeout));
+        let ips: Vec<IpAddr> = match lookup {
             Ok(lookup) => lookup.iter().collect(),
             Err(e) if e.is_no_records_found() => Vec::new(),
             Err(e) => {
                 return (
-                    None,
+                    Vec::new(),
                     vec![format!(
                         "{text}: glueless nameserver lookup failed: {}",
                         transport_reason(&e)
@@ -563,11 +642,10 @@ impl DnsTracer {
             .iter()
             .map(|(ip, reason)| server_note(host, *ip, &format!("refused, {reason}")))
             .collect();
-        let pick = prefer_ipv4(&usable);
-        if pick.is_none() && notes.is_empty() {
+        if usable.is_empty() && notes.is_empty() {
             notes.push(format!("{text}: glueless nameserver has no address"));
         }
-        (pick, notes)
+        (ipv4_first(usable), notes)
     }
 
     /// Sends one non-recursive query to `ip` and returns the response as the
@@ -580,6 +658,9 @@ impl DnsTracer {
         qname: &Name,
         qtype: HickoryRecordType,
     ) -> std::result::Result<Message, NetError> {
+        if let Some(no_route) = self.simulated_no_route(ip) {
+            return Err(no_route);
+        }
         let server = SocketAddr::new(ip, self.direct_port(host));
         let mut options = DnsRequestOptions::default();
         // Delegation data must come from each server's own authority, not
@@ -627,7 +708,7 @@ struct Referral {
     servers: Vec<NsCandidate>,
 }
 
-/// What a usable response (NOERROR / NXDOMAIN) means for the walk.
+/// What a usable response means for the walk.
 #[derive(Debug, PartialEq)]
 enum Step {
     /// A final response: an answer, NXDOMAIN, or NODATA.
@@ -638,10 +719,11 @@ enum Step {
 
 /// The outcome of asking one delegation level.
 enum LevelOutcome {
-    /// A server gave a usable response (NOERROR or NXDOMAIN).
-    Answered { hop: TraceHop, response: Message },
-    /// No server did. `final_hop` is the last error-RCODE response, if any
-    /// server responded at all; `reason` lists every failure.
+    /// A server gave a usable response: a final one or a referral.
+    Answered { hop: TraceHop, step: Step },
+    /// No server did. `final_hop` is the last unusable response (an error
+    /// RCODE or a lame reply), if any server responded at all; `reason`
+    /// lists every failure.
     Failed {
         final_hop: Option<TraceHop>,
         reason: String,
@@ -651,8 +733,8 @@ enum LevelOutcome {
 /// Where to send a level's queries, in order.
 #[derive(Debug, PartialEq)]
 enum ServerPick {
-    /// A server with a vetted address (glue or root hint).
-    Addr(Name, IpAddr),
+    /// A server with vetted addresses (glue or root hints), IPv4 first.
+    Addrs(Name, Vec<IpAddr>),
     /// A glueless server, whose address must be looked up first.
     Glueless(Name),
 }
@@ -717,10 +799,11 @@ fn query_target(name: &str, record_type: RecordType) -> Result<(String, Name)> {
 }
 
 /// Orders a level's servers for querying — every server with a known
-/// address first (IPv4 preferred), then the glueless ones — and vets every
-/// known address. Returns the picks and a note per refused address; a
-/// server whose addresses are all refused is dropped rather than looked up
-/// again, since the zone itself pointed it at reserved space.
+/// address first, then the glueless ones — and vets every known address,
+/// keeping a server's usable ones IPv4 first. Returns the picks and a note
+/// per refused address; a server whose addresses are all refused is dropped
+/// rather than looked up again, since the zone itself pointed it at
+/// reserved space.
 fn plan_servers(servers: &[NsCandidate], allow_private: bool) -> (Vec<ServerPick>, Vec<String>) {
     let mut picks = Vec::new();
     let mut glueless = Vec::new();
@@ -736,30 +819,43 @@ fn plan_servers(servers: &[NsCandidate], allow_private: bool) -> (Vec<ServerPick
                 .iter()
                 .map(|(ip, reason)| server_note(&server.host, *ip, &format!("refused, {reason}"))),
         );
-        if let Some(ip) = prefer_ipv4(&usable) {
-            picks.push(ServerPick::Addr(server.host.clone(), ip));
+        if !usable.is_empty() {
+            picks.push(ServerPick::Addrs(server.host.clone(), ipv4_first(usable)));
         }
     }
     picks.extend(glueless);
     (picks, notes)
 }
 
-/// Classifies a usable response. Any answer, NXDOMAIN, an authoritative
-/// response or an SOA in AUTHORITY is final (a referral never carries the
-/// AA bit, and a negative answer carries the zone's SOA); otherwise NS
-/// records in AUTHORITY are a referral, and an empty response is NODATA.
-fn classify_response(response: &Message, zone: &Name) -> Step {
+/// Classifies a server's response for the walk, or says why it is unusable.
+///
+/// Any answer, an authoritative response or an SOA in AUTHORITY is final —
+/// an answer, NXDOMAIN or NODATA (a referral never carries the AA bit, and a
+/// negative answer carries the zone's SOA, RFC 2308); otherwise NS records
+/// in AUTHORITY are a referral. An error RCODE is unusable, and so is what
+/// remains — AA clear, no answer, no SOA, no referral: a lame server's
+/// reply, which proves nothing about the name, so the zone's next server is
+/// asked.
+fn classify_response(response: &Message, zone: &Name) -> std::result::Result<Step, String> {
+    let code = response.metadata.response_code;
+    if !matches!(code, ResponseCode::NoError | ResponseCode::NXDomain) {
+        return Err(DnsStatus::from(code).to_string());
+    }
     if !response.answers.is_empty()
-        || response.metadata.response_code != ResponseCode::NoError
         || response.metadata.authoritative
         || response
             .authorities
             .iter()
             .any(|record| record.record_type() == HickoryRecordType::SOA)
     {
-        return Step::Final;
+        return Ok(Step::Final);
     }
-    extract_referral(response, zone).map_or(Step::Final, Step::Referral)
+    if code == ResponseCode::NXDomain {
+        return Err("non-authoritative NXDOMAIN without an SOA".to_string());
+    }
+    extract_referral(response, zone)
+        .map(Step::Referral)
+        .ok_or_else(|| "empty non-authoritative response (no answer, referral or SOA)".to_string())
 }
 
 /// Reads a referral from AUTHORITY: the child zone is the owner of the
@@ -855,6 +951,21 @@ fn hop_from_response(
 /// A `failed_servers` entry: `"host (ip): reason"`.
 fn server_note(host: &Name, ip: IpAddr, reason: &str) -> String {
     format!("{} ({}): {}", name_text(host), ip, reason)
+}
+
+/// Orders a server's vetted addresses for querying: IPv4 first — gTLD
+/// servers commonly list AAAA first, and IPv6 is unroutable on many hosts —
+/// then IPv6, each family in the order given. A later address is tried only
+/// when this host has no route to the earlier ones.
+fn ipv4_first(mut addrs: Vec<IpAddr>) -> Vec<IpAddr> {
+    addrs.sort_by_key(IpAddr::is_ipv6);
+    addrs
+}
+
+/// True when an exchange failed before its query left this host: the
+/// kernel had no route to the server's address family.
+fn is_no_route(err: &NetError) -> bool {
+    matches!(err, NetError::Io(io) if is_local_no_route(io))
 }
 
 /// A short reason for a failed exchange.
@@ -1051,36 +1162,56 @@ mod tests {
     }
 
     #[test]
-    fn classification_separates_answers_negatives_and_referrals() {
+    fn classification_separates_answers_negatives_referrals_and_lame_replies() {
         let zone = fq_name("com");
         let mut referral = message();
         referral.add_authority(ns("example.com", "ns1.example.com"));
         assert!(matches!(
             classify_response(&referral, &zone),
-            Step::Referral(_)
+            Ok(Step::Referral(_))
         ));
 
         // The same NS set with the AA bit is an authoritative NODATA.
         let mut authoritative = referral.clone();
         authoritative.metadata.authoritative = true;
-        assert_eq!(classify_response(&authoritative, &zone), Step::Final);
+        assert_eq!(classify_response(&authoritative, &zone), Ok(Step::Final));
 
         // An SOA in AUTHORITY is a negative answer, NS records or not.
         let mut nodata = referral.clone();
         nodata.add_authority(record("com", 300, soa_rdata("com")));
-        assert_eq!(classify_response(&nodata, &zone), Step::Final);
-
-        let mut nxdomain = referral.clone();
+        assert_eq!(classify_response(&nodata, &zone), Ok(Step::Final));
+        let mut nxdomain = nodata.clone();
         nxdomain.metadata.response_code = ResponseCode::NXDomain;
-        assert_eq!(classify_response(&nxdomain, &zone), Step::Final);
+        assert_eq!(classify_response(&nxdomain, &zone), Ok(Step::Final));
+        // An authoritative NXDOMAIN is final even without its SOA.
+        let mut aa_nxdomain = message();
+        aa_nxdomain.metadata.authoritative = true;
+        aa_nxdomain.metadata.response_code = ResponseCode::NXDomain;
+        assert_eq!(classify_response(&aa_nxdomain, &zone), Ok(Step::Final));
 
         // Any answer is final, authoritative or not (a CNAME included).
-        let mut answer = referral;
+        let mut answer = referral.clone();
         answer.add_answer(record("www.example.com", 300, cname_rdata("edge.cdn.net")));
-        assert_eq!(classify_response(&answer, &zone), Step::Final);
+        assert_eq!(classify_response(&answer, &zone), Ok(Step::Final));
 
-        // Nothing at all: NODATA without an SOA.
-        assert_eq!(classify_response(&message(), &zone), Step::Final);
+        // An error RCODE is unusable, whatever it carries.
+        let mut servfail = answer;
+        servfail.metadata.response_code = ResponseCode::ServFail;
+        assert_eq!(
+            classify_response(&servfail, &zone),
+            Err("SERVFAIL".to_string())
+        );
+
+        // Nothing at all from a server that is not authoritative: a lame
+        // reply, not NODATA — it proves nothing about the name.
+        let lame = classify_response(&message(), &zone).expect_err("a lame reply");
+        assert!(lame.contains("empty non-authoritative"), "{lame}");
+        // Nor is a non-authoritative NXDOMAIN without the zone's SOA a
+        // negative answer, even beside NS records.
+        let mut bare_nxdomain = referral;
+        bare_nxdomain.metadata.response_code = ResponseCode::NXDomain;
+        let lame = classify_response(&bare_nxdomain, &zone).expect_err("a lame reply");
+        assert!(lame.contains("NXDOMAIN without an SOA"), "{lame}");
     }
 
     #[test]
@@ -1116,8 +1247,10 @@ mod tests {
         assert_eq!(
             picks,
             vec![
-                ServerPick::Addr(fq_name("ns1.example.com"), public_v4),
-                ServerPick::Addr(fq_name("ns2.example.com"), public_v6),
+                // Both addresses are kept, IPv4 first: the IPv6 one is the
+                // fallback on a host with no IPv4 route.
+                ServerPick::Addrs(fq_name("ns1.example.com"), vec![public_v4, public_v6]),
+                ServerPick::Addrs(fq_name("ns2.example.com"), vec![public_v6]),
                 ServerPick::Glueless(fq_name("glueless.example.net")),
             ]
         );
@@ -1131,7 +1264,10 @@ mod tests {
 
         // The test seam's flag is the only way past the vetting.
         let (picks, notes) = plan_servers(&servers, true);
-        assert!(picks.contains(&ServerPick::Addr(fq_name("ns3.example.com"), metadata)));
+        assert!(picks.contains(&ServerPick::Addrs(
+            fq_name("ns3.example.com"),
+            vec![metadata]
+        )));
         assert!(notes.is_empty());
     }
 
@@ -1529,6 +1665,215 @@ mod tests {
         assert!(matches!(err, SeerError::DnsError(_)), "{err:?}");
         assert!(err.to_string().contains("loopback"), "{err}");
         assert_eq!(*asked.lock().unwrap(), 0, "no query may reach the server");
+    }
+
+    #[tokio::test]
+    async fn glueless_addresses_are_vetted_without_the_test_seam() {
+        // Production vetting of what a glueless NS name resolves to. The
+        // recursive upstream is a test seam the walk never sends a direct
+        // query to; the addresses it returns come from the (attacker's) zone.
+        let public_v4 = Ipv4Addr::new(9, 9, 9, 9);
+        let public_v6: Ipv6Addr = "2620:fe::fe".parse().unwrap();
+        let private = Ipv4Addr::new(10, 0, 0, 53);
+        let recursive = spawn_mock_dns_fn(move |qname, qtype| match (qname, qtype) {
+            ("ns.evil.test", HickoryRecordType::A) => MockReply::Answer(vec![
+                a_rdata(private),
+                a_rdata(Ipv4Addr::new(169, 254, 169, 254)),
+            ]),
+            ("ns.evil.test", HickoryRecordType::AAAA) => {
+                MockReply::Answer(vec![HickoryRData::AAAA(wire::AAAA(Ipv6Addr::LOCALHOST))])
+            }
+            ("ns.mixed.test", HickoryRecordType::A) => {
+                MockReply::Answer(vec![a_rdata(private), a_rdata(public_v4)])
+            }
+            ("ns.mixed.test", HickoryRecordType::AAAA) => {
+                MockReply::Answer(vec![HickoryRData::AAAA(wire::AAAA(public_v6))])
+            }
+            _ => MockReply::NoData,
+        })
+        .await;
+        let tracer = DnsTracer::new()
+            .with_timeout(Duration::from_millis(500))
+            .with_recursive_upstream(LOOPBACK, recursive);
+
+        // Only reserved addresses: nothing to query, each refusal noted.
+        let (addrs, mut notes) = tracer.resolve_glueless(&fq_name("ns.evil.test")).await;
+        assert!(addrs.is_empty(), "{addrs:?}");
+        notes.sort();
+        assert_eq!(
+            notes,
+            vec![
+                "ns.evil.test. (10.0.0.53): refused, private network (RFC 1918)",
+                "ns.evil.test. (169.254.169.254): refused, cloud metadata endpoint (169.254.169.254)",
+                "ns.evil.test. (::1): refused, IPv6 loopback (::1)",
+            ]
+        );
+
+        // Reserved beside public: only the public ones are kept, IPv4 first.
+        let (addrs, notes) = tracer.resolve_glueless(&fq_name("ns.mixed.test")).await;
+        assert_eq!(addrs, vec![IpAddr::V4(public_v4), IpAddr::V6(public_v6)]);
+        assert_eq!(
+            notes,
+            vec!["ns.mixed.test. (10.0.0.53): refused, private network (RFC 1918)"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_glueless_lookup_takes_at_most_one_timeout() {
+        // The recursive resolver re-sends a query that timed out, so an
+        // unanswered lookup took several timeouts; it must end within one.
+        let recursive = spawn_mock_dns(MockMode::Ignore).await;
+        let timeout = Duration::from_millis(300);
+        let tracer = DnsTracer::new()
+            .with_timeout(timeout)
+            .with_recursive_upstream(LOOPBACK, recursive);
+
+        let started = Instant::now();
+        let (addrs, notes) = tracer.resolve_glueless(&fq_name("ns.dark.test")).await;
+        let elapsed = started.elapsed();
+        assert!(addrs.is_empty(), "{addrs:?}");
+        assert_eq!(
+            notes,
+            vec!["ns.dark.test.: glueless nameserver lookup failed: timed out"]
+        );
+        assert!(elapsed < timeout * 2, "took {elapsed:?}");
+    }
+
+    #[tokio::test]
+    async fn addresses_with_no_route_are_skipped_without_using_up_the_level() {
+        // As on an IPv6-only host, where every IPv4 address fails locally at
+        // once: no query left the host, so the server's next address is
+        // tried, and the failure does not count toward the servers asked per
+        // level (three here, before the fourth root answers).
+        let unroutable: Vec<IpAddr> = (1..=4)
+            .map(|i| IpAddr::V4(Ipv4Addr::new(192, 0, 2, i)))
+            .collect();
+        let first_glue = unroutable[3];
+        let root = spawn_mock_dns_fn(move |_, _| MockReply::Delegation {
+            zone: "example.test".to_string(),
+            servers: vec![("ns1.example.test".to_string(), vec![first_glue, LOOPBACK])],
+        })
+        .await;
+        let auth = spawn_mock_dns_fn(|_, _| {
+            MockReply::AuthoritativeAnswer(vec![a_rdata(Ipv4Addr::new(192, 0, 2, 50))])
+        })
+        .await;
+        let trace = DnsTracer::new()
+            .with_timeout(Duration::from_millis(500))
+            .allowing_private_hosts()
+            .with_root_hints(&[
+                ("a.root.test", unroutable[0]),
+                ("b.root.test", unroutable[1]),
+                ("c.root.test", unroutable[2]),
+                ("d.root.test", LOOPBACK),
+            ])
+            .with_port_map(HashMap::from([
+                ("d.root.test".to_string(), root),
+                ("ns1.example.test".to_string(), auth),
+            ]))
+            .with_unroutable(&unroutable)
+            .trace("www.example.test", RecordType::A)
+            .await
+            .unwrap();
+
+        assert!(trace.error.is_none(), "{trace:#?}");
+        assert_eq!(trace.hops.len(), 2, "{trace:#?}");
+        let no_route = "no route from this host (Network is unreachable)";
+        let root = &trace.hops[0];
+        assert_eq!(root.server, "d.root.test.");
+        assert_eq!(
+            root.failed_servers,
+            vec![
+                format!("a.root.test. (192.0.2.1): {no_route}"),
+                format!("b.root.test. (192.0.2.2): {no_route}"),
+                format!("c.root.test. (192.0.2.3): {no_route}"),
+            ]
+        );
+        let auth = &trace.hops[1];
+        assert_eq!(auth.server, "ns1.example.test.");
+        assert_eq!(auth.address, "127.0.0.1", "the server's next address");
+        assert_eq!(
+            auth.failed_servers,
+            vec![format!("ns1.example.test. (192.0.2.4): {no_route}")]
+        );
+        assert_eq!(trace.answers.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_lame_servers_empty_reply_falls_back_to_the_next_server() {
+        let root = spawn_mock_dns_fn(|_, _| {
+            delegation("example.test", &["ns1.example.test", "ns2.example.test"])
+        })
+        .await;
+        // ns1 is lame: NOERROR, AA clear, every section empty — not NODATA.
+        let lame = spawn_mock_dns_fn(|_, _| MockReply::NoData).await;
+        let auth = spawn_mock_dns_fn(|_, _| {
+            MockReply::AuthoritativeAnswer(vec![a_rdata(Ipv4Addr::new(192, 0, 2, 60))])
+        })
+        .await;
+        let trace = tracer(
+            &["a.root.test"],
+            &[
+                ("a.root.test", root),
+                ("ns1.example.test", lame),
+                ("ns2.example.test", auth),
+            ],
+        )
+        .trace("www.example.test", RecordType::A)
+        .await
+        .unwrap();
+
+        assert!(trace.error.is_none(), "{trace:#?}");
+        assert_eq!(trace.hops.len(), 2);
+        let last = &trace.hops[1];
+        assert_eq!(last.server, "ns2.example.test.");
+        assert!(last.authoritative);
+        assert_eq!(
+            last.failed_servers,
+            vec![
+                "ns1.example.test. (127.0.0.1): empty non-authoritative response (no answer, referral or SOA)"
+            ]
+        );
+        assert_eq!(trace.status, DnsStatus::NoError);
+        assert_eq!(trace.answers.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_zone_of_lame_servers_is_an_error_not_a_negative_answer() {
+        let root = spawn_mock_dns_fn(|_, _| {
+            delegation("example.test", &["ns1.example.test", "ns2.example.test"])
+        })
+        .await;
+        let empty = spawn_mock_dns_fn(|_, _| MockReply::NoData).await;
+        // NXDOMAIN with AA clear and no SOA: no authority said so.
+        let bare_nxdomain = spawn_mock_dns_fn(|_, _| MockReply::NxDomain).await;
+        let trace = tracer(
+            &["a.root.test"],
+            &[
+                ("a.root.test", root),
+                ("ns1.example.test", empty),
+                ("ns2.example.test", bare_nxdomain),
+            ],
+        )
+        .trace("www.example.test", RecordType::A)
+        .await
+        .unwrap();
+
+        assert_eq!(trace.hops.len(), 2);
+        let last = &trace.hops[1];
+        assert_eq!(last.server, "ns2.example.test.");
+        assert_eq!(last.status, DnsStatus::NxDomain);
+        assert_eq!(
+            last.failed_servers,
+            vec![
+                "ns1.example.test. (127.0.0.1): empty non-authoritative response (no answer, referral or SOA)"
+            ]
+        );
+        let error = trace
+            .error
+            .expect("a lame zone proves nothing about the name");
+        assert!(error.contains("example.test."), "{error}");
+        assert!(error.contains("NXDOMAIN without an SOA"), "{error}");
     }
 
     #[tokio::test]

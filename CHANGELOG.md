@@ -116,15 +116,18 @@ The dig result shape changes on the CLI, Python, REST and MCP surfaces — see
   `--format` and can't be combined with `-q`/`--fields`.
 - **`+trace` / `--trace`:** `seer dig www.example.com +trace` walks the
   delegation from the root servers down to the zone that answers, asking one
-  server of each zone directly (recursion off, up to 3 servers per zone).
-  Each hop shows the zone, the server and its address, the time, the status
-  and AA flag, and the referral's nameservers or the answer, plus any
-  servers that failed. The walk stops at the answer (a CNAME is reported, not
-  followed), at NXDOMAIN or NODATA, or with an error saying why it stopped
-  early, such as a referral that leads upward or sideways. It takes one
-  record type and no nameserver, and ignores the config file's nameserver.
-  Every server address — root hint, glue or looked up — is checked against
-  private and reserved ranges before it is queried.
+  server of each zone directly (recursion off, up to 3 servers per zone). A
+  server that doesn't answer, returns an error, or gives an empty reply
+  without authority (a lame server) is passed over for the zone's next one,
+  and each server is asked over IPv4 first and over IPv6 when this host has
+  no IPv4 route. Each hop shows the zone, the server and its address, the
+  time, the status and AA flag, and the referral's nameservers or the
+  answer, plus any servers that failed. The walk stops at the answer (a
+  CNAME is reported, not followed), at NXDOMAIN or NODATA, or with an error
+  saying why it stopped early, such as a referral that leads upward or
+  sideways. It takes one record type and no nameserver, and ignores the
+  config file's nameserver. Every server address — root hint, glue or looked
+  up — is checked against private and reserved ranges before it is queried.
 - **TUI:** the DNS lens shows the status line, the CNAME chain, the
   NXDOMAIN/NODATA verdict, the authority SOA and the wildcard note, and has a
   new **Trace** tab with a selectable hop table. `:dig` takes the CLI's
