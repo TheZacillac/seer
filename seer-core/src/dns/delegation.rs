@@ -981,12 +981,18 @@ mod tests {
         .await
     }
 
-    /// A parent server that refers `seer.test` to `referral`.
+    /// A parent server that refers `seer.test` to `referral` (glueless).
     async fn spawn_parent_server(referral: &[&str]) -> u16 {
-        let records: Vec<HickoryRData> = referral.iter().map(|ns| ns_rdata(ns)).collect();
+        let servers: Vec<(String, Vec<IpAddr>)> = referral
+            .iter()
+            .map(|ns| (ns.to_string(), Vec::new()))
+            .collect();
         spawn_mock_dns_fn(move |qname, qtype| {
             if qname == "seer.test" && qtype == HickoryRecordType::NS {
-                MockReply::Referral(records.clone())
+                MockReply::Delegation {
+                    zone: "seer.test".to_string(),
+                    servers: servers.clone(),
+                }
             } else {
                 MockReply::NoData
             }

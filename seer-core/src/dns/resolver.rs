@@ -843,7 +843,9 @@ fn ptr_query_name(domain: &str) -> String {
 /// The name that goes on the wire for a prepared query (the output of
 /// [`prepare_query`]), with `resolve`'s rules: SRV must be a valid
 /// `_service._proto.name`, and PTR turns an IP literal into its reverse name.
-fn wire_query_name(domain: &str, record_type: RecordType) -> Result<String> {
+/// Shared with the trace walker (`dns::trace`), so a trace asks for — and
+/// reports — the name `query` would.
+pub(crate) fn wire_query_name(domain: &str, record_type: RecordType) -> Result<String> {
     match record_type {
         RecordType::SRV => {
             let (service, protocol, name) = parse_srv_query(domain).ok_or_else(srv_format_error)?;
@@ -2104,8 +2106,8 @@ mod tests {
 
     use crate::dns::query::DnsStatus;
     use crate::dns::test_support::{
-        mock_dns_resolver, mock_dns_resolver_default, record, spawn_mock_dns, spawn_mock_dns_fn,
-        MockMode, MockReply,
+        a_rdata, cname_rdata, mock_dns_resolver, mock_dns_resolver_default, record, spawn_mock_dns,
+        spawn_mock_dns_fn, MockMode, MockReply,
     };
     use hickory_resolver::proto::op::ResponseCode;
 
@@ -2517,18 +2519,6 @@ mod tests {
 
     // --- query(): the full dig-style result -----------------------------
 
-    fn a_rdata(octets: [u8; 4]) -> HickoryRData {
-        HickoryRData::A(hickory_resolver::proto::rr::rdata::A(Ipv4Addr::from(
-            octets,
-        )))
-    }
-
-    fn cname_rdata(target: &str) -> HickoryRData {
-        HickoryRData::CNAME(hickory_resolver::proto::rr::rdata::CNAME(
-            Name::from_ascii(target).unwrap(),
-        ))
-    }
-
     fn is_probe(qname: &str) -> bool {
         qname.starts_with("seer-probe-")
     }
@@ -2621,6 +2611,25 @@ mod tests {
         assert!(is_probe(&wildcard.probe_name), "{wildcard:?}");
         assert!(wildcard.probe_name.ends_with(".seer.test"), "{wildcard:?}");
         assert!(!wildcard.present && !wildcard.matches_answer);
+    }
+
+    #[tokio::test]
+    async fn query_refuses_a_reserved_nameserver() {
+        // SSRF: `query` builds its upstream through the same vetted path as
+        // `resolve`, so a loopback or private nameserver is refused before
+        // any packet is sent.
+        let r = DnsResolver::new();
+        for reserved in ["127.0.0.1", "10.0.0.1", "::1", "tls://192.168.1.1"] {
+            let err = r
+                .query("www.example.com", RecordType::A, Some(reserved))
+                .await
+                .expect_err("a reserved nameserver must be refused");
+            let msg = err.to_string().to_lowercase();
+            assert!(
+                msg.contains("blocked") || msg.contains("reserved"),
+                "{reserved}: {msg}"
+            );
+        }
     }
 
     #[tokio::test]

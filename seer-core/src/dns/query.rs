@@ -8,9 +8,10 @@
 //! names that do not exist.
 //!
 //! [`DnsStatus`] is the response code in dig's vocabulary (`NOERROR`,
-//! `NXDOMAIN`, `SERVFAIL`, …). It is what separates "the name does not exist"
-//! (NXDOMAIN) from "the name exists but has no records of this type"
-//! (NOERROR with an empty answer, i.e. NODATA) — a distinction the
+//! `NXDOMAIN`, `SERVFAIL`, …), for a query result and for every hop of a
+//! [`DnsTrace`](crate::dns::DnsTrace). It is what separates "the name does
+//! not exist" (NXDOMAIN) from "the name exists but has no records of this
+//! type" (NOERROR with an empty answer, i.e. NODATA) — a distinction the
 //! record-list API ([`crate::dns::DnsResolver::resolve`]) folds away.
 //!
 //! The pure steps of assembling a result — mapping a hickory outcome to an
@@ -374,9 +375,15 @@ impl Exchange {
             answers: self.answers,
             authority: self.authority,
             wildcard,
-            query_time_ms: u64::try_from(query_time.as_millis()).unwrap_or(u64::MAX),
+            query_time_ms: duration_ms(query_time),
         }
     }
+}
+
+/// Whole milliseconds in `elapsed`, saturating at `u64::MAX`: the
+/// `query_time_ms` of a query result and of a trace hop.
+pub(crate) fn duration_ms(elapsed: Duration) -> u64 {
+    u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// The AUTHORITY records of a negative answer: the whole section when hickory

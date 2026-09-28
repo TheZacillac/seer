@@ -71,11 +71,9 @@ use tracing::{debug, instrument};
 use super::delegation::{
     build_recursive_resolver, is_local_no_route, partition_reserved, prefer_ipv4,
 };
-use super::query::DnsStatus;
+use super::query::{duration_ms, DnsStatus};
 use super::records::{DnsRecord, RecordType};
-use super::resolver::{
-    fqdn, parse_srv_query, prepare_query, srv_format_error, to_dns_record, wire_type,
-};
+use super::resolver::{fqdn, prepare_query, to_dns_record, wire_query_name, wire_type};
 use crate::error::{Result, SeerError};
 
 /// Default per-query timeout, matching the DNS resolver default.
@@ -119,7 +117,7 @@ const ROOT_SERVERS: [(&str, &str, &str); 13] = [
 /// Zone and server names are fully qualified, lowercase ASCII (IDNs as
 /// `xn--` A-labels), as `dig +trace` prints them: `"."` is the root, then
 /// e.g. `"com."` and `"example.com."`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TraceHop {
     /// The zone this server was asked as an authority for (`"."` = root).
     pub zone: String,
@@ -172,10 +170,12 @@ pub struct TraceHop {
 ///   "error": null
 /// }
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DnsTrace {
-    /// The queried name, normalized like any record query (a PTR query for
-    /// an IP literal is named by its reverse-DNS name).
+    /// The queried name, exactly as [`DnsQueryResult::name`] reports it: a
+    /// PTR query for an IP literal is named by its reverse-DNS name.
+    ///
+    /// [`DnsQueryResult::name`]: crate::dns::DnsQueryResult::name
     pub name: String,
     /// The queried record type.
     pub record_type: RecordType,
@@ -371,9 +371,9 @@ impl DnsTracer {
     /// level, each query under the configured DNS timeout.
     ///
     /// # Arguments
-    /// * `name` - The name to trace, normalized like a
-    ///   [`DnsResolver::resolve`](crate::dns::DnsResolver::resolve) query
-    ///   name (`www.` is kept, a leading `*` label is accepted, SRV needs the
+    /// * `name` - The name to trace, prepared exactly as
+    ///   [`DnsResolver::query`](crate::dns::DnsResolver::query) prepares it
+    ///   (`www.` is kept, a leading `*` label is accepted, SRV needs the
     ///   `_service._proto.name` form, and a PTR query may name an IP literal)
     /// * `record_type` - The type to ask for: any single type (not `ANY`)
     ///
@@ -693,38 +693,27 @@ fn root_hints() -> Vec<NsCandidate> {
         .collect()
 }
 
-/// The wire type a trace asks for. SRV is an ordinary query here (the
-/// resolver's SRV path only adds name-shape validation, which
-/// [`query_target`] keeps); ANY is a fan-out over several types that no
+/// The wire type a trace asks for: that of any single type. ANY — the one
+/// type without a wire type — is a fan-out over several queries that no
 /// single walk can follow.
 fn trace_wire_type(record_type: RecordType) -> Result<HickoryRecordType> {
-    match record_type {
-        RecordType::ANY => Err(SeerError::InvalidInput(
+    wire_type(record_type).ok_or_else(|| {
+        SeerError::InvalidInput(
             "trace needs a single record type; ANY is a fan-out over several queries".to_string(),
-        )),
-        RecordType::SRV => Ok(HickoryRecordType::SRV),
-        other => wire_type(other).ok_or_else(|| SeerError::InvalidRecordType(other.to_string())),
-    }
+        )
+    })
 }
 
-/// Normalizes the query name like any record query and returns it as
-/// reported (no trailing dot) and as the wire name. A PTR query for an IP
-/// literal asks for — and is named by — the reverse-DNS name.
+/// The query name, prepared by the resolver's own steps (`prepare_query`,
+/// then `wire_query_name`'s SRV and PTR rules) so a trace asks for — and
+/// reports — exactly the name `DnsResolver::query` would. Returned as
+/// reported (no trailing dot) and as the wire name; a PTR query for an IP
+/// literal is its reverse-DNS name.
 fn query_target(name: &str, record_type: RecordType) -> Result<(String, Name)> {
-    let prepared = prepare_query(name, record_type)?;
-    if record_type == RecordType::PTR {
-        if let Ok(ip) = prepared.parse::<IpAddr>() {
-            let qname = Name::from(ip);
-            let reported = qname.to_ascii().trim_end_matches('.').to_string();
-            return Ok((reported, qname));
-        }
-    }
-    if record_type == RecordType::SRV && parse_srv_query(&prepared).is_none() {
-        return Err(srv_format_error());
-    }
-    let qname = Name::from_ascii(fqdn(&prepared))
-        .map_err(|e| SeerError::InvalidDomain(format!("{prepared}: {e}")))?;
-    Ok((prepared, qname))
+    let reported = wire_query_name(&prepare_query(name, record_type)?, record_type)?;
+    let qname = Name::from_ascii(fqdn(&reported))
+        .map_err(|e| SeerError::InvalidDomain(format!("{reported}: {e}")))?;
+    Ok((reported, qname))
 }
 
 /// Orders a level's servers for querying — every server with a known
@@ -853,7 +842,7 @@ fn hop_from_response(
         zone: name_text(zone),
         server: name_text(host),
         address: ip.to_string(),
-        query_time_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+        query_time_ms: duration_ms(elapsed),
         status: DnsStatus::from(response.metadata.response_code),
         authoritative: response.metadata.authoritative,
         referral_zone: None,
@@ -902,15 +891,11 @@ mod tests {
     use super::*;
     use crate::dns::records::RecordData;
     use crate::dns::test_support::{
-        soa_rdata, spawn_mock_dns, spawn_mock_dns_fn, spawn_mock_dns_fn_with_tcp, MockMode,
-        MockReply,
+        a_rdata, cname_rdata, fq_name, record, soa_rdata, spawn_mock_dns, spawn_mock_dns_fn,
+        spawn_mock_dns_fn_with_tcp, MockMode, MockReply,
     };
 
     const LOOPBACK: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
-
-    fn n(s: &str) -> Name {
-        Name::from_ascii(fqdn(s)).unwrap()
-    }
 
     // --- pure helpers ----------------------------------------------------
 
@@ -933,7 +918,7 @@ mod tests {
     #[test]
     fn name_text_is_fully_qualified_lowercase_ascii() {
         assert_eq!(name_text(&Name::root()), ".");
-        assert_eq!(name_text(&n("Example.COM")), "example.com.");
+        assert_eq!(name_text(&fq_name("Example.COM")), "example.com.");
         assert_eq!(
             name_text(&Name::from_utf8("münchen.de.").unwrap()),
             "xn--mnchen-3ya.de."
@@ -942,54 +927,61 @@ mod tests {
 
     #[test]
     fn bailiwick_accepts_only_strict_descendants_on_the_path() {
-        let qname = n("www.example.com");
+        let qname = fq_name("www.example.com");
         // Root → com → example.com: each step descends toward the name.
-        assert_eq!(check_bailiwick(&Name::root(), &n("com"), &qname), Ok(()));
         assert_eq!(
-            check_bailiwick(&n("com"), &n("example.com"), &qname),
+            check_bailiwick(&Name::root(), &fq_name("com"), &qname),
+            Ok(())
+        );
+        assert_eq!(
+            check_bailiwick(&fq_name("com"), &fq_name("example.com"), &qname),
             Ok(())
         );
         // A zone cut at the name itself is on the path.
         assert_eq!(
-            check_bailiwick(&n("example.com"), &n("www.example.com"), &qname),
+            check_bailiwick(&fq_name("example.com"), &fq_name("www.example.com"), &qname),
             Ok(())
         );
         // Skipping levels is fine (a parent may serve several cuts).
         assert_eq!(
-            check_bailiwick(&Name::root(), &n("example.com"), &qname),
+            check_bailiwick(&Name::root(), &fq_name("example.com"), &qname),
             Ok(())
         );
         // Case differences are not a new zone.
         assert_eq!(
-            check_bailiwick(&n("com"), &n("EXAMPLE.com"), &qname),
+            check_bailiwick(&fq_name("com"), &fq_name("EXAMPLE.com"), &qname),
             Ok(())
         );
 
         // Back to the root, to the same zone, or to an ancestor: upward.
         assert_eq!(
-            check_bailiwick(&n("com"), &Name::root(), &qname),
+            check_bailiwick(&fq_name("com"), &Name::root(), &qname),
             Err(ReferralFault::Upward)
         );
         assert_eq!(
-            check_bailiwick(&n("com"), &n("com"), &qname),
+            check_bailiwick(&fq_name("com"), &fq_name("com"), &qname),
             Err(ReferralFault::Upward)
         );
         assert_eq!(
-            check_bailiwick(&n("example.com"), &n("com"), &qname),
+            check_bailiwick(&fq_name("example.com"), &fq_name("com"), &qname),
             Err(ReferralFault::Upward)
         );
         // Below the zone but off the path, or outside the zone: sideways.
         assert_eq!(
-            check_bailiwick(&n("com"), &n("other.com"), &qname),
+            check_bailiwick(&fq_name("com"), &fq_name("other.com"), &qname),
             Err(ReferralFault::Sideways)
         );
         assert_eq!(
-            check_bailiwick(&n("com"), &n("example.net"), &qname),
+            check_bailiwick(&fq_name("com"), &fq_name("example.net"), &qname),
             Err(ReferralFault::Sideways)
         );
         // Below the query name is past the answer.
         assert_eq!(
-            check_bailiwick(&n("example.com"), &n("a.www.example.com"), &qname),
+            check_bailiwick(
+                &fq_name("example.com"),
+                &fq_name("a.www.example.com"),
+                &qname
+            ),
             Err(ReferralFault::Sideways)
         );
     }
@@ -999,15 +991,15 @@ mod tests {
     }
 
     fn ns(owner: &str, target: &str) -> Record {
-        Record::from_rdata(n(owner), 300, HickoryRData::NS(wire::NS(n(target))))
+        record(owner, 300, HickoryRData::NS(wire::NS(fq_name(target))))
     }
 
     fn a(owner: &str, ip: Ipv4Addr) -> Record {
-        Record::from_rdata(n(owner), 300, HickoryRData::A(wire::A(ip)))
+        record(owner, 300, a_rdata(ip))
     }
 
     fn aaaa(owner: &str, ip: Ipv6Addr) -> Record {
-        Record::from_rdata(n(owner), 300, HickoryRData::AAAA(wire::AAAA(ip)))
+        record(owner, 300, HickoryRData::AAAA(wire::AAAA(ip)))
     }
 
     #[test]
@@ -1031,8 +1023,8 @@ mod tests {
         // Additional records for names that are not NS targets are ignored.
         response.add_additional(a("unrelated.example.com", v4));
 
-        let referral = extract_referral(&response, &n("com")).expect("a referral");
-        assert_eq!(referral.zone, n("example.com"));
+        let referral = extract_referral(&response, &fq_name("com")).expect("a referral");
+        assert_eq!(referral.zone, fq_name("example.com"));
         assert_eq!(name_text(&referral.zone), "example.com.");
         let servers: Vec<(String, Vec<IpAddr>)> = referral
             .servers
@@ -1055,12 +1047,12 @@ mod tests {
         assert_eq!(from_root.servers[0].addrs.len(), 1);
 
         // No NS in AUTHORITY: no referral.
-        assert_eq!(extract_referral(&message(), &n("com")), None);
+        assert_eq!(extract_referral(&message(), &fq_name("com")), None);
     }
 
     #[test]
     fn classification_separates_answers_negatives_and_referrals() {
-        let zone = n("com");
+        let zone = fq_name("com");
         let mut referral = message();
         referral.add_authority(ns("example.com", "ns1.example.com"));
         assert!(matches!(
@@ -1075,7 +1067,7 @@ mod tests {
 
         // An SOA in AUTHORITY is a negative answer, NS records or not.
         let mut nodata = referral.clone();
-        nodata.add_authority(Record::from_rdata(n("com"), 300, soa_rdata("com")));
+        nodata.add_authority(record("com", 300, soa_rdata("com")));
         assert_eq!(classify_response(&nodata, &zone), Step::Final);
 
         let mut nxdomain = referral.clone();
@@ -1084,11 +1076,7 @@ mod tests {
 
         // Any answer is final, authoritative or not (a CNAME included).
         let mut answer = referral;
-        answer.add_answer(Record::from_rdata(
-            n("www.example.com"),
-            300,
-            HickoryRData::CNAME(wire::CNAME(n("edge.cdn.net"))),
-        ));
+        answer.add_answer(record("www.example.com", 300, cname_rdata("edge.cdn.net")));
         assert_eq!(classify_response(&answer, &zone), Step::Final);
 
         // Nothing at all: NODATA without an SOA.
@@ -1103,23 +1091,23 @@ mod tests {
         let metadata: IpAddr = "169.254.169.254".parse().unwrap();
         let servers = vec![
             NsCandidate {
-                host: n("glueless.example.net"),
+                host: fq_name("glueless.example.net"),
                 addrs: vec![],
             },
             // AAAA listed first: the IPv4 address is still the one asked.
             NsCandidate {
-                host: n("ns1.example.com"),
+                host: fq_name("ns1.example.com"),
                 addrs: vec![public_v6, public_v4],
             },
             // Reserved glue beside a public address: the public one is used
             // and the reserved one is noted.
             NsCandidate {
-                host: n("ns2.example.com"),
+                host: fq_name("ns2.example.com"),
                 addrs: vec![private, public_v6],
             },
             // Only reserved glue: dropped, not looked up again.
             NsCandidate {
-                host: n("ns3.example.com"),
+                host: fq_name("ns3.example.com"),
                 addrs: vec![metadata],
             },
         ];
@@ -1128,9 +1116,9 @@ mod tests {
         assert_eq!(
             picks,
             vec![
-                ServerPick::Addr(n("ns1.example.com"), public_v4),
-                ServerPick::Addr(n("ns2.example.com"), public_v6),
-                ServerPick::Glueless(n("glueless.example.net")),
+                ServerPick::Addr(fq_name("ns1.example.com"), public_v4),
+                ServerPick::Addr(fq_name("ns2.example.com"), public_v6),
+                ServerPick::Glueless(fq_name("glueless.example.net")),
             ]
         );
         assert_eq!(
@@ -1143,7 +1131,7 @@ mod tests {
 
         // The test seam's flag is the only way past the vetting.
         let (picks, notes) = plan_servers(&servers, true);
-        assert!(picks.contains(&ServerPick::Addr(n("ns3.example.com"), metadata)));
+        assert!(picks.contains(&ServerPick::Addr(fq_name("ns3.example.com"), metadata)));
         assert!(notes.is_empty());
     }
 
@@ -1152,13 +1140,13 @@ mod tests {
         // `www.` is kept and the name lowercased, as for every record query.
         let (name, qname) = query_target("WWW.Example.com", RecordType::A).unwrap();
         assert_eq!(name, "www.example.com");
-        assert_eq!(qname, n("www.example.com"));
+        assert_eq!(qname, fq_name("www.example.com"));
         assert!(qname.is_fqdn());
         // A PTR query for an IP literal is named by the reverse-DNS name,
         // exactly as the resolver reports it.
         let (name, qname) = query_target("192.0.2.1", RecordType::PTR).unwrap();
         assert_eq!(name, "1.2.0.192.in-addr.arpa");
-        assert_eq!(qname, n("1.2.0.192.in-addr.arpa"));
+        assert_eq!(qname, fq_name("1.2.0.192.in-addr.arpa"));
         let (name, _) = query_target("2606:4700:4700::1111", RecordType::PTR).unwrap();
         assert_eq!(
             name,
@@ -1171,6 +1159,17 @@ mod tests {
             Err(SeerError::InvalidInput(_))
         ));
         assert!(query_target("not a name", RecordType::A).is_err());
+    }
+
+    #[test]
+    fn query_target_applies_the_resolvers_srv_label_rule() {
+        // `sip_x` passes the name normalizer but is no valid service label:
+        // the trace refuses it exactly as `DnsResolver::query` does.
+        let err = query_target("_sip_x._tcp.example.com", RecordType::SRV).unwrap_err();
+        assert!(
+            matches!(&err, SeerError::InvalidInput(m) if m.contains("invalid SRV service")),
+            "{err:?}"
+        );
     }
 
     #[test]
@@ -1269,10 +1268,6 @@ mod tests {
     }
 
     // --- end-to-end walks over loopback mocks ------------------------------
-
-    fn a_rdata(ip: Ipv4Addr) -> HickoryRData {
-        HickoryRData::A(wire::A(ip))
-    }
 
     /// A referral to `zone` served by the given nameservers, each glued to
     /// the loopback address.
@@ -1414,9 +1409,7 @@ mod tests {
         let log = Arc::clone(&asked);
         let auth = spawn_mock_dns_fn(move |qname, qtype| {
             log.lock().unwrap().push((qname.to_string(), qtype));
-            MockReply::AuthoritativeAnswer(vec![HickoryRData::CNAME(wire::CNAME(n(
-                "edge.cdn.test",
-            )))])
+            MockReply::AuthoritativeAnswer(vec![cname_rdata("edge.cdn.test")])
         })
         .await;
         let trace = tracer(
@@ -1698,7 +1691,9 @@ mod tests {
         let log = Arc::clone(&asked);
         let root = spawn_mock_dns_fn(move |qname, _| {
             log.lock().unwrap().push(qname.to_string());
-            MockReply::AuthoritativeAnswer(vec![HickoryRData::PTR(wire::PTR(n("ptr.seer.test")))])
+            MockReply::AuthoritativeAnswer(vec![HickoryRData::PTR(wire::PTR(fq_name(
+                "ptr.seer.test",
+            )))])
         })
         .await;
         let trace = tracer(&["a.root.test"], &[("a.root.test", root)])
@@ -1737,6 +1732,124 @@ mod tests {
         assert_eq!(trace.hops.len(), 1);
         assert!(trace.hops[0].authoritative);
         assert_eq!(trace.answers.len(), 1, "{trace:#?}");
+    }
+
+    #[tokio::test]
+    async fn answers_convert_the_service_binding_and_child_dnssec_types() {
+        // Hops go through the resolver's one conversion table, so every
+        // modeled type — HTTPS/SVCB and CDS/CDNSKEY included — comes through
+        // under its owner.
+        use hickory_resolver::proto::dnssec::rdata::{DNSSECRData, CDS};
+        use hickory_resolver::proto::dnssec::{Algorithm, DigestType};
+        use hickory_resolver::proto::rr::rdata::svcb::{Alpn, SvcParamKey, SvcParamValue, SVCB};
+
+        let tracer = three_level_tracer(|qname| match qname {
+            "www.example.test" => {
+                MockReply::AuthoritativeAnswer(vec![HickoryRData::HTTPS(wire::HTTPS(SVCB::new(
+                    1,
+                    Name::root(),
+                    vec![(
+                        SvcParamKey::Alpn,
+                        SvcParamValue::Alpn(Alpn(vec!["h2".to_string()])),
+                    )],
+                )))])
+            }
+            _ => MockReply::AuthoritativeAnswer(vec![HickoryRData::DNSSEC(DNSSECRData::CDS(
+                CDS::new(
+                    2371,
+                    Some(Algorithm::ED25519),
+                    DigestType::SHA256,
+                    vec![0xAB],
+                ),
+            ))]),
+        })
+        .await;
+
+        let https = tracer
+            .trace("www.example.test", RecordType::HTTPS)
+            .await
+            .unwrap();
+        assert_eq!(https.answers.len(), 1, "{https:#?}");
+        assert_eq!(https.answers[0].name, "www.example.test");
+        assert_eq!(https.answers[0].record_type, RecordType::HTTPS);
+        assert_eq!(https.answers[0].data.to_string(), "1 . alpn=\"h2\"");
+        assert_eq!(https.hops[2].answers, https.answers);
+
+        let cds = tracer.trace("example.test", RecordType::CDS).await.unwrap();
+        assert_eq!(cds.answers.len(), 1, "{cds:#?}");
+        assert_eq!(cds.answers[0].record_type, RecordType::CDS);
+        assert_eq!(cds.answers[0].data.to_string(), "2371 15 2 AB");
+    }
+
+    #[tokio::test]
+    async fn at_most_three_servers_are_asked_per_level() {
+        // Four silent roots: three are asked (and time out), the fourth is
+        // never sent a packet.
+        let roots = ["a.root.test", "b.root.test", "c.root.test", "d.root.test"];
+        let mut ports = Vec::new();
+        let mut hits = Vec::new();
+        for _ in roots {
+            let count = Arc::new(Mutex::new(0usize));
+            let log = Arc::clone(&count);
+            ports.push(
+                spawn_mock_dns_fn(move |_, _| {
+                    *log.lock().unwrap() += 1;
+                    MockReply::NoReply
+                })
+                .await,
+            );
+            hits.push(count);
+        }
+        let map: Vec<(&str, u16)> = roots.iter().copied().zip(ports).collect();
+        let err = tracer(&roots, &map)
+            .with_timeout(Duration::from_millis(200))
+            .trace("example.test", RecordType::A)
+            .await
+            .expect_err("no root answered");
+
+        let message = err.to_string();
+        for root in &roots[..3] {
+            assert!(message.contains(root), "{message}");
+        }
+        assert!(!message.contains("d.root.test"), "{message}");
+        let hits: Vec<usize> = hits.iter().map(|count| *count.lock().unwrap()).collect();
+        assert!(hits[..3].iter().all(|&n| n > 0), "{hits:?}");
+        assert_eq!(hits[3], 0, "the fourth server must not be asked: {hits:?}");
+    }
+
+    #[tokio::test]
+    async fn at_most_three_glueless_nameservers_are_looked_up_per_level() {
+        let root = spawn_mock_dns_fn(|_, _| MockReply::Delegation {
+            zone: "test".to_string(),
+            servers: (1..=4)
+                .map(|i| (format!("ns{i}.nowhere.test"), vec![]))
+                .collect(),
+        })
+        .await;
+        let looked_up = Arc::new(Mutex::new(std::collections::BTreeSet::new()));
+        let log = Arc::clone(&looked_up);
+        let recursive = spawn_mock_dns_fn(move |qname, _| {
+            log.lock().unwrap().insert(qname.to_string());
+            MockReply::NxDomain
+        })
+        .await;
+        let trace = tracer(&["a.root.test"], &[("a.root.test", root)])
+            .with_recursive_upstream(LOOPBACK, recursive)
+            .trace("www.example.test", RecordType::A)
+            .await
+            .unwrap();
+
+        assert_eq!(trace.hops.len(), 1);
+        let error = trace
+            .error
+            .expect("no nameserver of `test.` has an address");
+        assert!(!error.contains("ns4.nowhere.test"), "{error}");
+        let looked_up: Vec<String> = looked_up.lock().unwrap().iter().cloned().collect();
+        assert_eq!(
+            looked_up,
+            ["ns1.nowhere.test", "ns2.nowhere.test", "ns3.nowhere.test"],
+            "sorted referral order, capped at three"
+        );
     }
 
     #[tokio::test]

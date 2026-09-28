@@ -28,7 +28,7 @@ use hickory_resolver::proto::rr::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
-use super::resolver::DnsResolver;
+use super::resolver::{fqdn, DnsResolver};
 
 /// How the mock server answers every query it receives.
 #[derive(Clone, Copy)]
@@ -45,6 +45,22 @@ pub(crate) enum MockMode {
 
 fn name(s: &str) -> Name {
     Name::from_ascii(s).expect("valid test name")
+}
+
+/// `s` as a fully qualified name, with or without its trailing dot (`"."`
+/// is the root).
+pub(crate) fn fq_name(s: &str) -> Name {
+    name(&fqdn(s))
+}
+
+/// A-record RDATA, e.g. `a_rdata([192, 0, 2, 7])`.
+pub(crate) fn a_rdata(ip: impl Into<Ipv4Addr>) -> HickoryRData {
+    HickoryRData::A(wire::A(ip.into()))
+}
+
+/// CNAME RDATA pointing at `target`.
+pub(crate) fn cname_rdata(target: &str) -> HickoryRData {
+    HickoryRData::CNAME(wire::CNAME(fq_name(target)))
 }
 
 /// Canned zone for [`MockMode::Zone`]. Query names are matched with the
@@ -285,17 +301,17 @@ pub(crate) fn soa_rdata(zone: &str) -> HickoryRData {
     ))
 }
 
-/// A record owned by `owner` (a fully-qualified name, trailing dot
-/// included), for [`MockReply::Records`] answers that must not be owned by
-/// the query name — a CNAME chain's hops, the records at its target.
+/// A record owned by `owner` (fully qualified, with or without its trailing
+/// dot), for [`MockReply::Records`] answers that must not be owned by the
+/// query name — a CNAME chain's hops, the records at its target.
 pub(crate) fn record(owner: &str, ttl: u32, rdata: HickoryRData) -> Record {
-    Record::from_rdata(name(owner), ttl, rdata)
+    Record::from_rdata(fq_name(owner), ttl, rdata)
 }
 
 /// The SOA record of `zone`, owned by the zone apex (negative answers'
 /// AUTHORITY section).
 fn zone_soa(zone: &str) -> Record {
-    Record::from_rdata(name(&format!("{zone}.")), 300, soa_rdata(zone))
+    Record::from_rdata(fq_name(zone), 300, soa_rdata(zone))
 }
 
 /// A scripted reply for [`spawn_mock_dns_fn`].
@@ -308,9 +324,6 @@ pub(crate) enum MockReply {
     Records(Vec<Record>),
     /// Like [`MockReply::Answer`], with the AA (authoritative) bit set.
     AuthoritativeAnswer(Vec<HickoryRData>),
-    /// NOERROR, empty ANSWER, these (NS) records for the query name in
-    /// AUTHORITY — a classic parent-side referral.
-    Referral(Vec<HickoryRData>),
     /// NOERROR with an empty answer section (NODATA).
     NoData,
     /// NODATA whose AUTHORITY section carries the SOA of the named zone — the
@@ -321,7 +334,11 @@ pub(crate) enum MockReply {
     /// NXDOMAIN whose AUTHORITY section carries the SOA of the named zone —
     /// the negative answer a recursive resolver relays (RFC 2308).
     NxDomainWithSoa(&'static str),
-    /// An empty response with this response code (NOTIMP, FORMERR, …).
+    /// Like [`MockReply::NxDomainWithSoa`], with the AA bit set: an
+    /// authoritative server's own "no such name".
+    AuthoritativeNxDomain(&'static str),
+    /// An empty response with any other response code (NOTIMP, FORMERR,
+    /// …); SERVFAIL and REFUSED have their own variants.
     Rcode(ResponseCode),
     /// SERVFAIL — e.g. a validating upstream rejecting a broken DNSSEC chain.
     ServFail,
@@ -329,28 +346,18 @@ pub(crate) enum MockReply {
     Refused,
     /// Send nothing, forcing the client's timeout path.
     NoReply,
-    /// A referral to a child zone: NOERROR, AA clear, empty ANSWER, an NS
-    /// record for `zone` (`"."` for the root) per listed server in
-    /// AUTHORITY, and in ADDITIONAL an A/AAAA glue record for each address
-    /// listed with a server (none: a glueless server).
+    /// A referral to a child zone, as a parent-side server sends it:
+    /// NOERROR, AA clear, empty ANSWER, an NS record for `zone` (`"."` for
+    /// the root) per listed server in AUTHORITY, and in ADDITIONAL an A/AAAA
+    /// glue record for each address listed with a server (none: a glueless
+    /// server).
     Delegation {
         zone: String,
         servers: Vec<(String, Vec<IpAddr>)>,
     },
-    /// NXDOMAIN with the AA bit set and the SOA of the named zone in
-    /// AUTHORITY — an authoritative "no such name".
-    AuthoritativeNxDomain(&'static str),
     /// NOERROR with the TC (truncated) bit set and no records: the reply did
     /// not fit, so the client must retry over TCP.
     Truncated,
-}
-
-/// `s` as a fully qualified hickory name (`"."` is the root).
-fn fq_name(s: &str) -> Name {
-    match s.trim_end_matches('.') {
-        "" => Name::root(),
-        labels => name(&format!("{labels}.")),
-    }
 }
 
 /// Binds a UDP socket on an ephemeral loopback port and answers every query
@@ -464,9 +471,6 @@ where
                         response.metadata.authoritative = true;
                         response.add_answers(answers.into_iter().map(owned));
                     }
-                    MockReply::Referral(records) => {
-                        response.add_authorities(records.into_iter().map(owned));
-                    }
                     MockReply::NoData => {}
                     MockReply::NoDataWithSoa(zone) => {
                         response.add_authority(zone_soa(zone));
@@ -475,6 +479,11 @@ where
                         response.metadata.response_code = ResponseCode::NXDomain;
                     }
                     MockReply::NxDomainWithSoa(zone) => {
+                        response.metadata.response_code = ResponseCode::NXDomain;
+                        response.add_authority(zone_soa(zone));
+                    }
+                    MockReply::AuthoritativeNxDomain(zone) => {
+                        response.metadata.authoritative = true;
                         response.metadata.response_code = ResponseCode::NXDomain;
                         response.add_authority(zone_soa(zone));
                     }
@@ -505,15 +514,6 @@ where
                                 Record::from_rdata(server.clone(), 300, glue)
                             }));
                         }
-                    }
-                    MockReply::AuthoritativeNxDomain(zone) => {
-                        response.metadata.authoritative = true;
-                        response.metadata.response_code = ResponseCode::NXDomain;
-                        response.add_authority(Record::from_rdata(
-                            fq_name(zone),
-                            300,
-                            soa_rdata(zone),
-                        ));
                     }
                     MockReply::Truncated => {
                         response.metadata.truncation = true;
