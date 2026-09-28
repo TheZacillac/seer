@@ -19,6 +19,7 @@ mod dnssec;
 mod follow;
 mod nameserver;
 mod propagation;
+mod query;
 mod records;
 mod resolver;
 #[cfg(test)]
@@ -36,6 +37,7 @@ pub use propagation::{
     ConsensusValue, DnsServer, Inconsistency, NameserverDetails, NameserverIpInconsistency,
     PropagationChecker, PropagationResult, UnreachableServer,
 };
+pub use query::DnsStatus;
 pub use records::{DnsRecord, RecordData, RecordType};
 pub use resolver::{DnsPresence, DnsResolver};
 // Crate-internal: shared with `net.rs` so the SSRF fallback resolver and the

@@ -20,7 +20,9 @@ use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use hickory_resolver::net::NetError;
 use hickory_resolver::proto::dnssec::PublicKey;
 use hickory_resolver::proto::rr::rdata::CAA;
-use hickory_resolver::proto::rr::{RData as HickoryRData, RecordType as HickoryRecordType};
+use hickory_resolver::proto::rr::{
+    Name, RData as HickoryRData, Record, RecordType as HickoryRecordType,
+};
 use hickory_resolver::TokioResolver;
 use tracing::{debug, instrument};
 
@@ -775,7 +777,7 @@ fn parse_caa(caa: &CAA) -> (u8, String, String) {
 /// `SRV` and `ANY` are composite lookups with dedicated paths
 /// (`resolve_srv_core` / `resolve_any`) and deliberately have no mapping
 /// here — asking [`DnsResolver::resolve_type`] for them is an error.
-fn wire_type(record_type: RecordType) -> Option<HickoryRecordType> {
+pub(crate) fn wire_type(record_type: RecordType) -> Option<HickoryRecordType> {
     Some(match record_type {
         RecordType::A => HickoryRecordType::A,
         RecordType::AAAA => HickoryRecordType::AAAA,
@@ -818,7 +820,7 @@ fn hex_upper(bytes: &[u8]) -> String {
 ///
 /// This is the single RData→RecordData conversion table used by every
 /// resolution path.
-fn convert_rdata(record_type: RecordType, data: &HickoryRData) -> Option<RecordData> {
+pub(crate) fn convert_rdata(record_type: RecordType, data: &HickoryRData) -> Option<RecordData> {
     use hickory_resolver::proto::dnssec::rdata::DNSSECRData;
 
     match (record_type, data) {
@@ -907,6 +909,45 @@ fn convert_rdata(record_type: RecordType, data: &HickoryRData) -> Option<RecordD
             replacement: naptr.replacement.to_string(),
         }),
         _ => None,
+    }
+}
+
+/// The seer [`RecordType`] a hickory wire type maps to, if seer models it.
+///
+/// Derived from [`wire_type`] over [`RecordType::ALL`], so the two directions
+/// cannot drift: a type added to `wire_type` is recognized here too.
+pub(crate) fn from_wire_type(wire: HickoryRecordType) -> Option<RecordType> {
+    RecordType::ALL
+        .iter()
+        .copied()
+        .find(|t| wire_type(*t) == Some(wire))
+}
+
+/// Converts one hickory record into a [`DnsRecord`] under its real owner
+/// name, typed by the record's own wire type — the conversion for any path
+/// that reports a response section as-is (a CNAME chain, an authority SOA, a
+/// trace hop), where records of several types and owners appear together.
+///
+/// The owner name loses its trailing root dot, matching how query names are
+/// reported. Returns `None` for types seer does not model.
+pub(crate) fn to_dns_record(record: &Record) -> Option<DnsRecord> {
+    let record_type = from_wire_type(record.record_type())?;
+    let data = convert_rdata(record_type, &record.data)?;
+    Some(DnsRecord {
+        name: owner_name(&record.name),
+        record_type,
+        ttl: record.ttl,
+        data,
+    })
+}
+
+/// A hickory name as seer reports it: without the trailing root dot, except
+/// for the root itself (`.`).
+fn owner_name(name: &Name) -> String {
+    let text = name.to_string();
+    match text.strip_suffix('.') {
+        Some(rest) if !rest.is_empty() => rest.to_string(),
+        _ => text,
     }
 }
 
@@ -1704,12 +1745,52 @@ mod tests {
     }
 
     #[test]
+    fn from_wire_type_inverts_wire_type_for_every_single_type() {
+        for record_type in RecordType::ALL.iter().copied() {
+            match wire_type(record_type) {
+                Some(wire) => assert_eq!(from_wire_type(wire), Some(record_type)),
+                None => assert!(matches!(record_type, RecordType::SRV | RecordType::ANY)),
+            }
+        }
+        assert_eq!(from_wire_type(HickoryRecordType::SRV), None);
+    }
+
+    #[test]
+    fn to_dns_record_keeps_the_real_owner_and_type() {
+        let cname = Record::from_rdata(
+            Name::from_ascii("www.seer.test.").unwrap(),
+            300,
+            HickoryRData::CNAME(hickory_resolver::proto::rr::rdata::CNAME(
+                Name::from_ascii("edge.cdn.test.").unwrap(),
+            )),
+        );
+        let converted = to_dns_record(&cname).expect("CNAME is modeled");
+        assert_eq!(converted.name, "www.seer.test");
+        assert_eq!(converted.record_type, RecordType::CNAME);
+        assert_eq!(converted.ttl, 300);
+        assert_eq!(converted.data.to_string(), "edge.cdn.test.");
+
+        let a = Record::from_rdata(
+            Name::from_ascii("edge.cdn.test.").unwrap(),
+            60,
+            HickoryRData::A(hickory_resolver::proto::rr::rdata::A(Ipv4Addr::new(
+                192, 0, 2, 7,
+            ))),
+        );
+        let converted = to_dns_record(&a).expect("A is modeled");
+        assert_eq!(converted.name, "edge.cdn.test");
+        assert_eq!(converted.record_type, RecordType::A);
+
+        assert_eq!(owner_name(&Name::root()), ".");
+    }
+
+    #[test]
     fn parse_caa_keeps_reserved_flag_bits() {
         // Regression: flags were rebuilt from `issuer_critical` alone, so a
         // record published with reserved bits set reported flags=128/0.
         let mut caa = CAA::new_issue(
             true,
-            Some(hickory_resolver::proto::rr::Name::from_ascii("letsencrypt.org").unwrap()),
+            Some(Name::from_ascii("letsencrypt.org").unwrap()),
             vec![],
         );
         caa.reserved_flags = 0x01;
@@ -1945,7 +2026,7 @@ mod tests {
                         10,
                         5,
                         5060,
-                        hickory_resolver::proto::rr::Name::from_ascii("sip.seer.test.").unwrap(),
+                        Name::from_ascii("sip.seer.test.").unwrap(),
                     ),
                 )])
             }
@@ -1990,9 +2071,7 @@ mod tests {
         // stripping `www.` even though `resolve` no longer does.
         let port = spawn_mock_dns_fn(|qname, qtype| match (qname, qtype) {
             ("seer.test", HickoryRecordType::NS) => MockReply::Answer(vec![HickoryRData::NS(
-                hickory_resolver::proto::rr::rdata::NS(
-                    hickory_resolver::proto::rr::Name::from_ascii("ns1.seer.test.").unwrap(),
-                ),
+                hickory_resolver::proto::rr::rdata::NS(Name::from_ascii("ns1.seer.test.").unwrap()),
             )]),
             // What a recursive resolver relays for a name inside the zone:
             // querying `www` itself would read as "no NS" → Absent.
