@@ -143,7 +143,8 @@ enum DirectNs {
     /// No usable response (timeout / transport failure), with the reason.
     Unreachable(String),
     /// The probe packet never left this host (no route for the address
-    /// family — e.g. an IPv6-only server probed from an IPv4-only host).
+    /// family, or no socket of that family at all — e.g. an IPv6-only
+    /// server probed from an IPv4-only host).
     /// The same epistemic state as unresolvable glue: nothing is known
     /// about the server's authority, so this maps to a skip, not lameness.
     LocalNoRoute(String),
@@ -670,15 +671,33 @@ fn classify_net_error(err: NetError, domain: &str) -> DirectNs {
 }
 
 /// True when an io transport error means the packet never left this host:
-/// the kernel had no route for the destination's address family. `TimedOut`
-/// never reaches here — `From<io::Error> for NetError` folds it into
+/// the kernel had no route to the destination (ENETUNREACH/EHOSTUNREACH), or
+/// cannot open a socket of its address family at all (EAFNOSUPPORT — e.g. an
+/// IPv6 server on a host whose kernel has IPv6 disabled). `TimedOut` never
+/// reaches here — `From<io::Error> for NetError` folds it into
 /// `NetError::Timeout` (which stays a lameness signal: packets were sent).
 pub(crate) fn is_local_no_route(err: &std::io::Error) -> bool {
-    matches!(
-        err.kind(),
-        std::io::ErrorKind::NetworkUnreachable | std::io::ErrorKind::HostUnreachable
-    )
+    use std::io::ErrorKind::{HostUnreachable, NetworkUnreachable};
+    matches!(err.kind(), NetworkUnreachable | HostUnreachable)
+        || err
+            .raw_os_error()
+            .is_some_and(|code| Some(code) == ADDRESS_FAMILY_UNSUPPORTED)
 }
+
+/// The OS error code for "address family not supported". std maps it to no
+/// `io::ErrorKind` of its own on any platform (it reads as uncategorized), so
+/// [`is_local_no_route`] matches the raw code: `EAFNOSUPPORT` on Unix, whose
+/// value differs across targets (97 on x86 and Arm Linux, 47 on macOS) —
+/// hence `libc` — and on Windows Winsock's `WSAEAFNOSUPPORT`, which is what
+/// std and tokio report for a failed socket call there (not the C runtime's
+/// `EAFNOSUPPORT`).
+#[cfg(unix)]
+pub(crate) const ADDRESS_FAMILY_UNSUPPORTED: Option<i32> = Some(libc::EAFNOSUPPORT);
+#[cfg(windows)]
+pub(crate) const ADDRESS_FAMILY_UNSUPPORTED: Option<i32> =
+    Some(windows_sys::Win32::Networking::WinSock::WSAEAFNOSUPPORT);
+#[cfg(not(any(unix, windows)))]
+pub(crate) const ADDRESS_FAMILY_UNSUPPORTED: Option<i32> = None;
 
 /// The parent zone of a normalized domain: everything after the leftmost
 /// label. `normalize_domain` guarantees at least one interior dot, so the
@@ -916,6 +935,32 @@ mod tests {
             matches!(refused, DirectNs::Unreachable(_)),
             "refused classified as {refused:?}"
         );
+    }
+
+    #[test]
+    fn address_family_unsupported_classifies_as_local() {
+        use std::io;
+        // EAFNOSUPPORT (WSAEAFNOSUPPORT on Windows): no socket of the
+        // server's address family can be opened on this host, e.g. an IPv6
+        // server when the kernel has IPv6 disabled. Nothing was sent. std
+        // gives the code no ErrorKind, so it is matched by the raw OS code,
+        // which is how a failed socket call reports it.
+        let code = ADDRESS_FAMILY_UNSUPPORTED.expect("a Unix or Windows target");
+        let err = io::Error::from_raw_os_error(code);
+        assert!(is_local_no_route(&err), "{err:?} ({:?})", err.kind());
+        let direct = classify_net_error(err.into(), "example.com");
+        assert!(
+            matches!(direct, DirectNs::LocalNoRoute(_)),
+            "EAFNOSUPPORT classified as {direct:?}"
+        );
+        // The code decides, not the wording or a nearby kind: an error with
+        // no OS code, or an unsupported operation, stays a remote failure.
+        for other in [
+            io::Error::other("Address family not supported by protocol"),
+            io::Error::from(io::ErrorKind::Unsupported),
+        ] {
+            assert!(!is_local_no_route(&other), "{other:?}");
+        }
     }
 
     #[test]

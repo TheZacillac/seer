@@ -11,7 +11,8 @@
 //!    noted in the hop's `failed_servers` and the next server of the zone is
 //!    asked — up to [`MAX_SERVERS_PER_LEVEL`] servers per level. A server is
 //!    asked on one address, IPv4 first: an address this host has no route to
-//!    (IPv4 on an IPv6-only host, or the reverse) fails at once, is noted,
+//!    (IPv4 on an IPv6-only host, or the reverse) or cannot open a socket
+//!    for (IPv6 when the kernel has IPv6 disabled) fails at once, is noted,
 //!    and the server's next address is tried instead, without counting
 //!    toward the limit, since no query left the host.
 //! 3. A referral — NOERROR, AA clear, no answer, no SOA, NS records in
@@ -45,7 +46,7 @@
 //! is skipped and noted in the hop's `failed_servers`. Tests reach loopback
 //! fixtures only through `#[cfg(test)]` seams (`allowing_private_hosts`,
 //! `with_root_hints`, `with_port_map`, `with_recursive_upstream`, and
-//! `with_unroutable` to simulate a missing route); the production
+//! `with_unroutable` to simulate a local routing failure); the production
 //! validation path is never weakened.
 //!
 //! **Retry boundary (deliberate):** like the rest of `dns/`, no
@@ -238,10 +239,11 @@ pub struct DnsTracer {
     /// Test-only: skip the SSRF/reserved-IP validation on server addresses.
     #[cfg(test)]
     allow_private_hosts: bool,
-    /// Test-only: addresses a direct query fails for at once with "network
-    /// unreachable", as on a host with no route to their address family.
+    /// Test-only: addresses a direct query fails for at once, before
+    /// anything is sent, each with the local socket error its function makes
+    /// (see `with_unroutable`).
     #[cfg(test)]
-    unroutable: Vec<IpAddr>,
+    unroutable: Vec<(IpAddr, fn() -> std::io::Error)>,
 }
 
 impl std::fmt::Debug for DnsTracer {
@@ -337,12 +339,14 @@ impl DnsTracer {
         self
     }
 
-    /// Test-only: fail every direct query to these addresses locally with
-    /// "network unreachable", before anything is sent — what an IPv4 server
-    /// address gives on an IPv6-only host.
+    /// Test-only: fail every direct query to these addresses locally, before
+    /// anything is sent, with the socket error `error` makes — "network
+    /// unreachable" is what an IPv4 server address gives on an IPv6-only
+    /// host, "address family not supported" what an IPv6 one gives when the
+    /// kernel has IPv6 disabled.
     #[cfg(test)]
-    fn with_unroutable(mut self, addrs: &[IpAddr]) -> Self {
-        self.unroutable = addrs.to_vec();
+    fn with_unroutable(mut self, addrs: &[IpAddr], error: fn() -> std::io::Error) -> Self {
+        self.unroutable.extend(addrs.iter().map(|&ip| (ip, error)));
         self
     }
 
@@ -399,12 +403,10 @@ impl DnsTracer {
     /// if any. Never one in production: there the socket reports it.
     #[cfg(test)]
     fn simulated_no_route(&self, ip: IpAddr) -> Option<NetError> {
-        self.unroutable.contains(&ip).then(|| {
-            NetError::from(std::io::Error::new(
-                std::io::ErrorKind::NetworkUnreachable,
-                "Network is unreachable",
-            ))
-        })
+        self.unroutable
+            .iter()
+            .find(|(addr, _)| *addr == ip)
+            .map(|(_, error)| NetError::from(error()))
     }
 
     #[cfg(not(test))]
@@ -997,7 +999,8 @@ fn ipv4_first(mut addrs: Vec<IpAddr>) -> Vec<IpAddr> {
 }
 
 /// True when an exchange failed before its query left this host: the
-/// kernel had no route to the server's address family.
+/// kernel had no route to the server, or no socket of its address family
+/// (see `delegation::is_local_no_route`).
 fn is_no_route(err: &NetError) -> bool {
     matches!(err, NetError::Io(io) if is_local_no_route(io))
 }
@@ -1034,6 +1037,7 @@ mod tests {
     use hickory_resolver::proto::rr::Record;
 
     use super::*;
+    use crate::dns::delegation::ADDRESS_FAMILY_UNSUPPORTED;
     use crate::dns::records::RecordData;
     use crate::dns::test_support::{
         a_rdata, cname_rdata, fq_name, record, soa_rdata, spawn_mock_dns, spawn_mock_dns_fn,
@@ -1041,6 +1045,22 @@ mod tests {
     };
 
     const LOOPBACK: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+
+    /// The local failure an IPv4 address gives on an IPv6-only host.
+    fn network_unreachable() -> std::io::Error {
+        std::io::Error::new(
+            std::io::ErrorKind::NetworkUnreachable,
+            "Network is unreachable",
+        )
+    }
+
+    /// The local failure an IPv6 address gives when the kernel has IPv6
+    /// disabled: EAFNOSUPPORT, by its raw OS code, as the socket call
+    /// reports it.
+    fn address_family_unsupported() -> std::io::Error {
+        let code = ADDRESS_FAMILY_UNSUPPORTED.expect("a Unix or Windows target");
+        std::io::Error::from_raw_os_error(code)
+    }
 
     // --- pure helpers ----------------------------------------------------
 
@@ -1414,13 +1434,19 @@ mod tests {
         assert_eq!(transport_reason(&NetError::Timeout), "timed out");
         // An IPv6-only server asked from an IPv4-only host: the packet never
         // left, which the note must not blame on the server.
-        let no_route = NetError::from(std::io::Error::new(
-            std::io::ErrorKind::NetworkUnreachable,
-            "Network is unreachable",
-        ));
+        let no_route = NetError::from(network_unreachable());
+        assert!(is_no_route(&no_route));
         assert_eq!(
             transport_reason(&no_route),
             "no route from this host (Network is unreachable)"
+        );
+        // Nor when no socket of the server's address family can be opened
+        // (IPv6 disabled in the kernel), whatever the OS calls it.
+        let no_socket = NetError::from(address_family_unsupported());
+        assert!(is_no_route(&no_socket));
+        assert_eq!(
+            transport_reason(&no_socket),
+            format!("no route from this host ({})", address_family_unsupported())
         );
         let refused = NetError::from(std::io::Error::new(
             std::io::ErrorKind::ConnectionRefused,
@@ -1805,7 +1831,7 @@ mod tests {
                 ("d.root.test".to_string(), root),
                 ("ns1.example.test".to_string(), auth),
             ]))
-            .with_unroutable(&unroutable)
+            .with_unroutable(&unroutable, network_unreachable)
             .trace("www.example.test", RecordType::A)
             .await
             .unwrap();
@@ -1829,6 +1855,55 @@ mod tests {
         assert_eq!(
             auth.failed_servers,
             vec![format!("ns1.example.test. (192.0.2.4): {no_route}")]
+        );
+        assert_eq!(trace.answers.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn ipv6_only_servers_without_local_ipv6_do_not_use_up_the_level() {
+        // As on a host whose kernel has IPv6 disabled, where no IPv6 socket
+        // can be opened (EAFNOSUPPORT): three IPv6-only roots fail locally
+        // without sending anything, so none of them counts toward the three
+        // servers asked per level, and the fourth root still answers.
+        let v6_only: Vec<IpAddr> = (1..=3)
+            .map(|i| IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, i)))
+            .collect();
+        let root =
+            spawn_mock_dns_fn(|_, _| delegation("example.test", &["ns1.example.test"])).await;
+        let auth = spawn_mock_dns_fn(|_, _| {
+            MockReply::AuthoritativeAnswer(vec![a_rdata(Ipv4Addr::new(192, 0, 2, 50))])
+        })
+        .await;
+        let trace = DnsTracer::new()
+            .with_timeout(Duration::from_millis(500))
+            .allowing_private_hosts()
+            .with_root_hints(&[
+                ("a.root.test", v6_only[0]),
+                ("b.root.test", v6_only[1]),
+                ("c.root.test", v6_only[2]),
+                ("d.root.test", LOOPBACK),
+            ])
+            .with_port_map(HashMap::from([
+                ("d.root.test".to_string(), root),
+                ("ns1.example.test".to_string(), auth),
+            ]))
+            .with_unroutable(&v6_only, address_family_unsupported)
+            .trace("www.example.test", RecordType::A)
+            .await
+            .unwrap();
+
+        assert!(trace.error.is_none(), "{trace:#?}");
+        assert_eq!(trace.hops.len(), 2, "{trace:#?}");
+        let no_socket = format!("no route from this host ({})", address_family_unsupported());
+        let root = &trace.hops[0];
+        assert_eq!(root.server, "d.root.test.");
+        assert_eq!(
+            root.failed_servers,
+            vec![
+                format!("a.root.test. (2001:db8::1): {no_socket}"),
+                format!("b.root.test. (2001:db8::2): {no_socket}"),
+                format!("c.root.test. (2001:db8::3): {no_socket}"),
+            ]
         );
         assert_eq!(trace.answers.len(), 1);
     }

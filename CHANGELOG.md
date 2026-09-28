@@ -133,18 +133,19 @@ The dig result shape changes on the CLI, Python, REST and MCP surfaces — see
   server that doesn't answer, returns an error, or gives an empty reply
   without authority (a lame server) is passed over for the zone's next one,
   and each server is asked over IPv4 first and over IPv6 when this host has
-  no IPv4 route. Each hop shows the zone, the server and its address, the
-  time, the status and AA flag, and the referral's nameservers or the
-  answer, plus any servers that failed. The walk stops at the answer (a
-  CNAME is reported, not followed; an NXDOMAIN beside a CNAME, which the
-  zone's server followed itself, names the target that does not exist), at
-  NXDOMAIN or NODATA, or with an error saying why it stopped early, such as
-  a referral that leads upward or sideways. The whole walk gets six DNS
-  timeouts (30s by default); one that runs out of time stops with the hops
-  so far and an error saying so. It takes one record type and no
-  nameserver, and ignores the config file's nameserver. Every server
-  address — root hint, glue or looked up — is checked against private and
-  reserved ranges before it is queried.
+  no IPv4 route. An address this host cannot send to at all (no route, or
+  IPv6 disabled in the kernel) is noted without counting toward the 3. Each
+  hop shows the zone, the server and its address, the time, the status and
+  AA flag, and the referral's nameservers or the answer, plus any servers
+  that failed. The walk stops at the answer (a CNAME is reported, not
+  followed; an NXDOMAIN beside a CNAME, which the zone's server followed
+  itself, names the target that does not exist), at NXDOMAIN or NODATA, or
+  with an error saying why it stopped early, such as a referral that leads
+  upward or sideways. The whole walk gets six DNS timeouts (30s by default);
+  one that runs out of time stops with the hops so far and an error saying
+  so. It takes one record type and no nameserver, and ignores the config
+  file's nameserver. Every server address — root hint, glue or looked up —
+  is checked against private and reserved ranges before it is queried.
 - **TUI:** the DNS lens shows the status line, the CNAME chain, the
   NXDOMAIN/NODATA verdict, the authority SOA and the wildcard note, and has a
   new **Trace** tab with a selectable hop table. `:dig` takes the CLI's
