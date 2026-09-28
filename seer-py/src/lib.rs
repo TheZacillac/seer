@@ -10,8 +10,8 @@ use pyo3::Py;
 use seer_core::{
     bulk::{BulkExecutor, BulkOperation},
     dns::{
-        DelegationChecker, DnsComparator, DnsFollower, DnsResolver, DnssecChecker, FollowConfig,
-        NameserverSpec, PropagationChecker, RecordType,
+        DelegationChecker, DnsComparator, DnsFollower, DnsResolver, DnsTracer, DnssecChecker,
+        FollowConfig, NameserverSpec, PropagationChecker, RecordType,
     },
     lookup::SmartLookup,
     rdap::RdapClient,
@@ -179,6 +179,7 @@ static SMART_LOOKUP: LazyLock<SmartLookup> = LazyLock::new(SmartLookup::new);
 static WHOIS_CLIENT: LazyLock<WhoisClient> = LazyLock::new(WhoisClient::new);
 static RDAP_CLIENT: LazyLock<RdapClient> = LazyLock::new(RdapClient::new);
 static DNS_RESOLVER: LazyLock<DnsResolver> = LazyLock::new(DnsResolver::new);
+static DNS_TRACER: LazyLock<DnsTracer> = LazyLock::new(DnsTracer::new);
 static PROPAGATION_CHECKER: LazyLock<PropagationChecker> = LazyLock::new(PropagationChecker::new);
 static STATUS_CLIENT: LazyLock<StatusClient> = LazyLock::new(StatusClient::new);
 static AVAILABILITY_CHECKER: LazyLock<AvailabilityChecker> =
@@ -257,6 +258,33 @@ call_fn! {
         => seer_core::audit_headers(&domain, seer_core::DEFAULT_HEADER_TIMEOUT);
 }
 
+/// Query one DNS record type the way `dig` does and return the whole
+/// response as a dict:
+///
+/// - name: the normalized name queried (for a PTR query on an IP address,
+///   its reverse name, e.g. 1.2.0.192.in-addr.arpa)
+/// - record_type: the type queried
+/// - server: the nameserver exactly as given, or None for the default
+///   upstream (Google Public DNS)
+/// - status: the response code: "NOERROR", "NXDOMAIN" (the name does not
+///   exist), "SERVFAIL", "REFUSED", ...
+/// - flags: the header flags that were set, e.g. ["qr", "rd", "ra"]; empty
+///   for a negative or error answer
+/// - answers: the CNAME chain first, then the records, each under its own
+///   owner name. NOERROR with no records of the type is NODATA: the name
+///   exists but has none
+/// - authority: the SOA of a negative answer, when the server sent one
+/// - wildcard: for a name below its registrable domain (www.example.com,
+///   not example.com), whether a random sibling name also resolves
+///   (present) and to the same records (matches_answer); otherwise None
+/// - query_time_ms: time taken by the query
+///
+/// `nameserver` is an IP or hostname with an optional port (UDP),
+/// tls://host[:port] or https://host[:port][/path]. ANY queries the common
+/// types concurrently and merges their answers. NXDOMAIN, NODATA, SERVFAIL
+/// and REFUSED are results, not exceptions. Invalid input raises
+/// ValueError; a query that got no response, or a private or reserved
+/// nameserver, raises RuntimeError.
 #[pyfunction]
 #[pyo3(signature = (domain, record_type = "A", nameserver = None))]
 fn dig<'py>(
@@ -267,13 +295,50 @@ fn dig<'py>(
 ) -> PyResult<Bound<'py, PyAny>> {
     let rt_parsed = parse_record_type(record_type)?;
 
-    let records = run_async(py, async move {
+    let result = run_async(py, async move {
         DNS_RESOLVER
-            .resolve(&domain, rt_parsed, nameserver.as_deref())
+            .query(&domain, rt_parsed, nameserver.as_deref())
             .await
     })?;
 
-    to_py(py, &records)
+    to_py(py, &result)
+}
+
+/// Trace how a name resolves, the way `dig +trace` does: start at the root
+/// servers, ask one server of each zone directly (recursion off) and follow
+/// its referral down, until a server answers or reports NXDOMAIN or NODATA.
+/// A CNAME answer is reported, not followed. Returns a dict:
+///
+/// - name, record_type: the normalized name and the type traced
+/// - hops: one per delegation level, root first; each has zone, server,
+///   address, query_time_ms, status, authoritative (the AA flag),
+///   referral_zone and referral (the NS names delegated to; None and empty
+///   on the last hop), answers and failed_servers (servers of that zone
+///   that did not give a usable response, with the reason)
+/// - status, answers: the last hop's
+/// - error: why the walk stopped before a final response (no server of a
+///   zone responded, an upward or sideways referral, too many levels), or
+///   None
+///
+/// record_type is any single type; ANY raises ValueError, since it is a
+/// fan-out over several queries. Private or reserved server addresses are
+/// never queried. Invalid input raises ValueError, and RuntimeError is
+/// raised when no root server responds.
+#[pyfunction]
+#[pyo3(signature = (domain, record_type = "A"))]
+fn dns_trace<'py>(
+    py: Python<'py>,
+    domain: String,
+    record_type: &str,
+) -> PyResult<Bound<'py, PyAny>> {
+    let rt_parsed = parse_record_type(record_type)?;
+
+    let trace = run_async(
+        py,
+        async move { DNS_TRACER.trace(&domain, rt_parsed).await },
+    )?;
+
+    to_py(py, &trace)
 }
 
 #[pyfunction]
@@ -959,8 +1024,8 @@ mod _seer {
         _json_to_python_nested_for_test, _raise_retry_exhausted_for_test, all_tlds, availability,
         bulk_availability, bulk_dig, bulk_info, bulk_lookup, bulk_propagation, bulk_ssl,
         bulk_status, bulk_whois, caa, cancel_follow, confusables, delegation, diff, dig,
-        dns_compare, dns_follow, dnssec, headers, info, lookup, nameserver_target, posture,
-        propagation, rdap_asn, rdap_auto, rdap_domain, rdap_ip, record_types, ssl, status,
+        dns_compare, dns_follow, dns_trace, dnssec, headers, info, lookup, nameserver_target,
+        posture, propagation, rdap_asn, rdap_auto, rdap_domain, rdap_ip, record_types, ssl, status,
         subdomains, subdomains_classify, takeover, tld_info, validate_public_host, whois,
     };
 

@@ -11,10 +11,16 @@ Example usage:
     result = seer.whois("example.com")
     print(result["registrar"])
 
-    # DNS lookup
-    records = seer.dig("google.com", "MX")
-    for record in records:
-        print(record["data"])
+    # DNS query, reported the way dig reports it
+    result = seer.dig("google.com", "MX")
+    print(result["status"])  # NOERROR, NXDOMAIN, SERVFAIL, ...
+    for record in result["answers"]:
+        print(record["name"], record["data"])
+
+    # Delegation walk from the root servers down (dig +trace)
+    trace = seer.dns_trace("www.example.com")
+    for hop in trace["hops"]:
+        print(hop["zone"], hop["server"], hop["status"])
 
     # DNS propagation check
     prop = seer.propagation("github.com", "A")
@@ -43,6 +49,7 @@ from seer._seer import (
     dig,
     dns_compare,
     dns_follow,
+    dns_trace,
     dnssec,
     headers,
     info,
@@ -97,6 +104,7 @@ __all__ = [
     "dig",
     "dns_compare",
     "dns_follow",
+    "dns_trace",
     "dnssec",
     "headers",
     "info",
