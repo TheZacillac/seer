@@ -333,7 +333,8 @@ Note: DNS responses are not DNSSEC-validated
   query minimally (RFC 8482).
 - **`+short` / `--short`** prints only the values, one per line (CNAME targets
   first), and nothing when there is no answer. It ignores `--format` and
-  can't be combined with `-q`/`--fields`.
+  can't be combined with `-q`/`--fields`. A `+trace +short` that stopped
+  early prints why on stderr and exits `1`.
 - **`+trace` / `--trace`** asks one server of each zone directly, from the
   root servers down, and shows one hop per delegation level: the server and
   address, the status, the referral or the answer, and any servers that
@@ -394,8 +395,9 @@ Check commands exit `1` on a negative result even when the command itself ran fi
 `seer dig` is not a check command: as with dig, any answer the server gave
 exits `0` — NXDOMAIN, NODATA, SERVFAIL and REFUSED included, and a `+trace`
 that stopped early reports where. It exits `1` on invalid arguments, a
-timeout or other failure to get an answer, or when any of several record
-types failed.
+timeout or other failure to get an answer, when any of several record
+types failed, or when a `+trace +short` stopped early (its values alone
+could not say so).
 
 All other commands exit `0` on success and `1` on error. With `--format json`, `yaml`, or `markdown`, errors are written to stderr in that format (e.g. `{"error": "..."}`) instead of colored prose.
 

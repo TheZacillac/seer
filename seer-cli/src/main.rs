@@ -215,8 +215,9 @@ enum Commands {
     ///
     /// Not check-style: like dig, it exits 0 whenever a server answered —
     /// NXDOMAIN, NODATA and SERVFAIL are results — and 1 on invalid input,
-    /// a timeout or other transport failure, or when any of several types
-    /// failed (the others are still printed).
+    /// a timeout or other transport failure, when any of several types
+    /// failed (the others are still printed), or when a `+short` trace
+    /// stopped early (its error goes to stderr).
     #[command(override_usage = dig_usage(), after_long_help = dig_long_help())]
     Dig {
         /// The name to query, record types, `@server`, `+short` and
@@ -1238,7 +1239,8 @@ fn check_short_output(short: bool, quiet: bool, fields: bool) -> Result<(), Stri
 }
 
 /// The process exit code for a finished query: 1 when part of it failed
-/// (a type of a multi-type `dig`), otherwise [`exit_code`] of its result.
+/// (a type of a multi-type `dig`, or the walk of a `+short` trace),
+/// otherwise [`exit_code`] of its result.
 fn outcome_exit_code(outcome: &query::Outcome) -> i32 {
     if outcome.failed() {
         1
@@ -1981,6 +1983,23 @@ mod exit_code_tests {
         assert_eq!(exit_code(&Payload::Trace(Box::new(stopped))), 0);
         let answered = fixtures::trace(vec![fixtures::a("www.seer.test", "192.0.2.7")], None);
         assert_eq!(exit_code(&Payload::Trace(Box::new(answered))), 0);
+    }
+
+    /// `+short` leaves a stopped trace's error out of its (empty) values,
+    /// so it goes to stderr and the command exits 1 — else a script could
+    /// not tell a failed walk from a name with no records.
+    #[test]
+    fn a_stopped_trace_exits_one_only_when_short() {
+        use crate::payload::fixtures;
+        use crate::query::trace_outcome;
+        let stopped = || fixtures::trace(vec![], Some("every server of seer.test. failed"));
+        assert_eq!(super::outcome_exit_code(&trace_outcome(stopped(), true)), 1);
+        assert_eq!(
+            super::outcome_exit_code(&trace_outcome(stopped(), false)),
+            0
+        );
+        let answered = fixtures::trace(vec![fixtures::a("www.seer.test", "192.0.2.7")], None);
+        assert_eq!(super::outcome_exit_code(&trace_outcome(answered, true)), 0);
     }
 
     /// A multi-type dig with a failed type still prints the rest, but the

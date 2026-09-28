@@ -2,11 +2,12 @@
 //!
 //! Each surface parses its own syntax into a [`Query`]; [`run`] performs it
 //! and hands back a [`Payload`] plus any advisory notes (and, for a `dig`
-//! over several record types, the types that failed). Each surface then
-//! renders every command the same way — the CLI through `--quiet`/`--format`
-//! and its check-style exit codes, the REPL by printing and keeping the
-//! result for `copy`; a `+short` dig prints its bare values in both — so the
-//! two cannot drift apart command by command.
+//! over several record types, the types that failed; for a `+short` trace,
+//! why the walk stopped). Each surface then renders every command the same
+//! way — the CLI through `--quiet`/`--format` and its check-style exit
+//! codes, the REPL by printing and keeping the result for `copy`; a
+//! `+short` dig prints its bare values in both — so the two cannot drift
+//! apart command by command.
 
 use std::sync::Arc;
 
@@ -95,7 +96,8 @@ pub struct Outcome {
     /// Shown after the result (`subdomains --record`'s confirmation).
     footnote: Option<String>,
     /// The parts of a partial result that failed (one record type of a
-    /// multi-type `dig`), shown on stderr after it. Any failure fails the
+    /// multi-type `dig`, or a `+short` trace's stopped walk: see
+    /// [`trace_outcome`]), shown on stderr after it. Any failure fails the
     /// command: see [`Outcome::failed`].
     errors: Vec<String>,
     /// `+short`: print the payload's bare values ([`Payload::short`])
@@ -263,9 +265,7 @@ pub async fn run(
             let trace = seer_core::DnsTracer::from_config(config)
                 .trace(&name, record_type)
                 .await?;
-            let mut outcome = Outcome::new(Payload::Trace(Box::new(trace)));
-            outcome.short = short;
-            return Ok(outcome);
+            return Ok(trace_outcome(trace, short));
         }
         Query::Prop {
             domain,
@@ -463,6 +463,23 @@ pub fn dig_outcome(
     Ok(outcome)
 }
 
+/// A finished `+trace`. A walk that stopped early is still a result — the
+/// formatted trace shows where it stopped, under its error — except with
+/// `short`: the bare values leave the error out, so it is reported on
+/// stderr instead and fails the command, the only way a `+short` script can
+/// tell a failed walk from a name with no records.
+pub fn trace_outcome(trace: seer_core::DnsTrace, short: bool) -> Outcome {
+    let stopped = trace
+        .error
+        .as_deref()
+        .filter(|_| short)
+        .map(|error| format!("trace stopped: {}", seer_core::output::sanitize_line(error)));
+    let mut outcome = Outcome::new(Payload::Trace(Box::new(trace)));
+    outcome.errors.extend(stopped);
+    outcome.short = short;
+    outcome
+}
+
 /// `subdomains --diff/--record`: the fresh enumeration against the stored
 /// baseline (see [`crate::ops::subdomain_baseline_check`]). With `diff` the
 /// result is the diff; `--record` alone shows the listing and confirms the
@@ -601,6 +618,31 @@ mod tests {
         let mut outcome = Outcome::new(Payload::Reverse(vec![]));
         outcome.short = true;
         assert_eq!(outcome.short_text(), None);
+    }
+
+    /// A stopped trace's bare values are empty, like a name with no
+    /// records, so `+short` reports why the walk stopped on stderr and
+    /// fails; the formatted trace carries the error itself.
+    #[test]
+    fn a_stopped_trace_reports_its_error_when_short() {
+        let stopped = || fixtures::trace(vec![], Some("every server of com. timed out\x1b[2J"));
+        let outcome = trace_outcome(stopped(), true);
+        assert_eq!(outcome.short_text().as_deref(), Some(""));
+        assert!(outcome.failed());
+        assert_eq!(
+            outcome.errors,
+            vec!["trace stopped: every server of com. timed out".to_string()],
+            "the error is sanitized for the terminal"
+        );
+
+        let outcome = trace_outcome(stopped(), false);
+        assert_eq!(outcome.short_text(), None);
+        assert!(!outcome.failed(), "the formatted trace shows the error");
+
+        let answered = fixtures::trace(vec![fixtures::a("www.seer.test", "192.0.2.7")], None);
+        let outcome = trace_outcome(answered, true);
+        assert_eq!(outcome.short_text().as_deref(), Some("192.0.2.7"));
+        assert!(!outcome.failed());
     }
 
     /// Only a trace is slow enough for one-shot mode's spinner; a dig,

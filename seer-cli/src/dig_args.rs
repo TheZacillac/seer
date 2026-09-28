@@ -15,7 +15,8 @@
 //! `-x`/`--reverse <ip>` — merge into the same [`DigArgs`]. clap parses them
 //! for `seer dig` and passes them in as [`DigFlags`]; the REPL, which
 //! tokenizes its own line, leaves them in the token list for [`parse`] to
-//! pick out.
+//! pick out, reading a value in each form clap does (`-s 8.8.8.8`,
+//! `-s8.8.8.8`, `-s=8.8.8.8`, `--server=8.8.8.8`).
 
 use std::net::IpAddr;
 
@@ -223,11 +224,22 @@ enum Flag {
 }
 
 /// Recognizes `-s`/`--server`/`-x`/`--reverse`: the flag, its spelling, and
-/// its value when given inline (`--server=8.8.8.8`).
+/// its value when given inline — the spellings clap reads for `seer dig`:
+/// `--server=8.8.8.8`, and for a short flag `-s=8.8.8.8` or `-s8.8.8.8`
+/// (so `-short`, as in clap, is `-s hort`).
 fn flag_with_value(token: &str) -> Option<(Flag, &str, Option<&str>)> {
-    let (name, inline) = match token.split_once('=') {
-        Some((name, value)) if name.starts_with("--") => (name, Some(value)),
-        _ => (token, None),
+    let (name, inline) = if token.starts_with("--") {
+        match token.split_once('=') {
+            Some((name, value)) => (name, Some(value)),
+            None => (token, None),
+        }
+    } else {
+        match (token.get(..2), token.get(2..)) {
+            (Some(name), Some(value)) if !value.is_empty() => {
+                (name, Some(value.strip_prefix('=').unwrap_or(value)))
+            }
+            _ => (token, None),
+        }
     };
     let flag = match name {
         "-s" | "--server" => Flag::Server,
@@ -395,19 +407,31 @@ mod tests {
             let got = parse(&["example.com"], flags(server)).expect("valid");
             assert_eq!(got.server.as_deref(), Some("8.8.8.8"));
         }
-        // The REPL spellings of the same flag.
+        // The REPL spellings of the same flag, as clap reads them for
+        // `seer dig`: a short flag's value may be attached, after `=` or not.
         for tokens in [
             &["-s", "8.8.8.8", "example.com"][..],
             &["example.com", "--server", "@8.8.8.8"],
             &["--server=8.8.8.8", "example.com"],
+            &["-s=8.8.8.8", "example.com"],
+            &["example.com", "-s8.8.8.8"],
+            &["-s@8.8.8.8", "example.com"],
         ] {
             let got = dig(tokens).expect("valid");
             assert_eq!(got.server.as_deref(), Some("8.8.8.8"), "{tokens:?}");
             assert_eq!(got.name, "example.com", "{tokens:?}");
         }
-        for tokens in [&["example.com", "-s"][..], &["example.com", "--server="]] {
+        for tokens in [
+            &["example.com", "-s"][..],
+            &["example.com", "--server="],
+            &["example.com", "-s="],
+        ] {
             assert!(err(tokens).contains("needs a nameserver"), "{tokens:?}");
         }
+        // Like clap, a short flag takes the rest of its token as the value.
+        let got = dig(&["example.com", "-short"]).expect("valid");
+        assert_eq!(got.server.as_deref(), Some("hort"));
+        assert!(!got.short);
     }
 
     #[test]
@@ -538,6 +562,8 @@ mod tests {
             &["-x", "8.8.8.8"][..],
             &["--reverse", "8.8.8.8", "ptr"],
             &["--reverse=8.8.8.8"],
+            &["-x=8.8.8.8"],
+            &["-x8.8.8.8", "PTR"],
         ] {
             assert_eq!(
                 dig(tokens),
@@ -665,6 +691,8 @@ mod tests {
         assert!(has_name(&["@1.1.1.1", "MX", "example.com"]));
         assert!(has_name(&["-x", "8.8.8.8"]));
         assert!(has_name(&["--reverse=8.8.8.8"]));
+        assert!(has_name(&["-x8.8.8.8"]));
+        assert!(!has_name(&["-s8.8.8.8", "-s=1.1.1.1"]));
     }
 
     #[test]

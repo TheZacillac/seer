@@ -23,6 +23,18 @@ impl SeerCompleter {
     }
 }
 
+/// How a command reads the word being completed, which decides whether a
+/// hint may follow the case it was typed in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Case {
+    /// Parsed in any case: commands, record types, dig's `+options`, output
+    /// formats.
+    Any,
+    /// Matched as listed: `bulk` operations, `set`'s setting and `watch`
+    /// actions, which only TAB (replacing the word) can correct.
+    Exact,
+}
+
 /// The `options` that start with `prefix` (case-insensitively, as commands
 /// are), each replacing the prefix that ends `line_to_cursor`.
 fn complete_from<'a>(
@@ -42,6 +54,45 @@ fn complete_from<'a>(
     (line_to_cursor.len() - prefix.len(), matches)
 }
 
+/// The completions of the word that ends `line_to_cursor` — where it
+/// starts, the candidates, and how its command reads it — or `None` when
+/// nothing completes there.
+fn completions(line_to_cursor: &str) -> Option<(usize, Vec<Pair>, Case)> {
+    let words: Vec<&str> = line_to_cursor.split_whitespace().collect();
+    // The word under the cursor (empty after a space) and its position.
+    let (current, index) = match words.last() {
+        Some(last) if !line_to_cursor.ends_with(' ') => (*last, words.len() - 1),
+        _ => ("", words.len()),
+    };
+    let command = words.first().map(|w| w.to_lowercase());
+
+    let (options, case): (Vec<&str>, Case) =
+        match (index, command.as_deref().map(catalog::canonical)) {
+            (0, _) => (
+                catalog::commands()
+                    .map(|c| c.name)
+                    .chain(catalog::ALIASES.iter().map(|(alias, _)| *alias))
+                    .collect(),
+                Case::Any,
+            ),
+            (1, Some("bulk")) => (
+                crate::ops::BULK_OPS.iter().map(|(op, _)| *op).collect(),
+                Case::Exact,
+            ),
+            (1, Some("set")) => (vec!["output"], Case::Exact),
+            (1, Some("watch")) => (WATCH_ACTIONS.to_vec(), Case::Exact),
+            (_, Some("set")) if words.get(1) == Some(&"output") => {
+                (OUTPUT_FORMATS.to_vec(), Case::Any)
+            }
+            (1.., Some("dig")) => (dig_candidates(&words[1..index], current), Case::Any),
+            // Record types follow the domain.
+            (2.., Some("prop" | "follow" | "compare")) => (RECORD_TYPES.to_vec(), Case::Any),
+            _ => return None,
+        };
+    let (start, pairs) = complete_from(options, current, line_to_cursor);
+    Some((start, pairs, case))
+}
+
 impl Completer for SeerCompleter {
     type Candidate = Pair;
 
@@ -55,29 +106,10 @@ impl Completer for SeerCompleter {
         // panics if it lands inside a multibyte char. `get(..pos)` returns
         // None on a non-char-boundary, so fall back to the whole line.
         let line_to_cursor = line.get(..pos).unwrap_or(line);
-        let words: Vec<&str> = line_to_cursor.split_whitespace().collect();
-        // The word under the cursor (empty after a space) and its position.
-        let (current, index) = match words.last() {
-            Some(last) if !line_to_cursor.ends_with(' ') => (*last, words.len() - 1),
-            _ => ("", words.len()),
-        };
-        let command = words.first().map(|w| w.to_lowercase());
-
-        let options: Vec<&str> = match (index, command.as_deref().map(catalog::canonical)) {
-            (0, _) => catalog::commands()
-                .map(|c| c.name)
-                .chain(catalog::ALIASES.iter().map(|(alias, _)| *alias))
-                .collect(),
-            (1, Some("bulk")) => crate::ops::BULK_OPS.iter().map(|(op, _)| *op).collect(),
-            (1, Some("set")) => vec!["output"],
-            (1, Some("watch")) => WATCH_ACTIONS.to_vec(),
-            (_, Some("set")) if words.get(1) == Some(&"output") => OUTPUT_FORMATS.to_vec(),
-            (1.., Some("dig")) => dig_candidates(&words[1..index], current),
-            // Record types follow the domain.
-            (2.., Some("prop" | "follow" | "compare")) => RECORD_TYPES.to_vec(),
-            _ => return Ok((pos, Vec::new())),
-        };
-        Ok(complete_from(options, current, line_to_cursor))
+        Ok(match completions(line_to_cursor) {
+            Some((start, pairs, _)) => (start, pairs),
+            None => (pos, Vec::new()),
+        })
     }
 }
 
@@ -94,31 +126,34 @@ fn dig_candidates(before: &[&str], current: &str) -> Vec<&'static str> {
     }
 }
 
-impl SeerCompleter {
-    /// For a partly typed argument with exactly one completion, the rest of
-    /// it (`ort` after `dig example.com +sh`), in the case of the typed part
-    /// — record types complete uppercase but parse in any case, so `cnam`
-    /// hints `e` and `CNAM` hints `E`.
-    fn completion_hint(&self, line: &str, ctx: &rustyline::Context<'_>) -> Option<String> {
-        // Only arguments: the word under the cursor is not the command.
-        line.split_whitespace().nth(1)?;
-        let (start, candidates) = self.complete(line, line.len(), ctx).ok()?;
-        let [only] = candidates.as_slice() else {
-            return None;
-        };
-        let typed = line.get(start..)?;
-        let rest = only
-            .replacement
-            .get(typed.len()..)
-            .filter(|r| !r.is_empty())?;
-        let shouting = typed.chars().any(|c| c.is_ascii_uppercase())
-            && !typed.chars().any(|c| c.is_ascii_lowercase());
-        Some(if shouting {
-            rest.to_ascii_uppercase()
-        } else {
-            rest.to_ascii_lowercase()
-        })
-    }
+/// For a partly typed argument of `line` with exactly one completion, the
+/// rest of it (`ort` after `dig example.com +sh`). A word read in any case
+/// is hinted in the case of the typed part — record types complete
+/// uppercase but parse in any case, so `cnam` hints `e` and `CNAM` hints
+/// `E`. A word matched as listed is hinted only when typed as listed, since
+/// appending to `set OUT` can never spell `output`.
+fn completion_hint(line: &str) -> Option<String> {
+    // Only arguments: the word under the cursor is not the command.
+    line.split_whitespace().nth(1)?;
+    let (start, candidates, case) = completions(line)?;
+    let [only] = candidates.as_slice() else {
+        return None;
+    };
+    let typed = line.get(start..)?;
+    let rest = match case {
+        Case::Exact => only.replacement.strip_prefix(typed)?.to_string(),
+        Case::Any => {
+            let rest = only.replacement.get(typed.len()..)?;
+            let shouting = typed.chars().any(|c| c.is_ascii_uppercase())
+                && !typed.chars().any(|c| c.is_ascii_lowercase());
+            if shouting {
+                rest.to_ascii_uppercase()
+            } else {
+                rest.to_ascii_lowercase()
+            }
+        }
+    };
+    (!rest.is_empty()).then_some(rest)
 }
 
 impl Hinter for SeerCompleter {
@@ -126,12 +161,12 @@ impl Hinter for SeerCompleter {
 
     /// After `<command> `, hints the command's arguments; inside a partly
     /// typed argument with a single completion, hints the rest of it.
-    fn hint(&self, line: &str, pos: usize, ctx: &rustyline::Context<'_>) -> Option<String> {
+    fn hint(&self, line: &str, pos: usize, _ctx: &rustyline::Context<'_>) -> Option<String> {
         if pos < line.len() {
             return None;
         }
         if !line.ends_with(' ') {
-            return self.completion_hint(line, ctx);
+            return completion_hint(line);
         }
         let mut words = line.split_whitespace();
         let (Some(command), None) = (words.next(), words.next()) else {
@@ -243,6 +278,23 @@ mod tests {
         assert_eq!(hint("dig exa"), None);
         // Command names are not hinted, only arguments.
         assert_eq!(hint("delega"), None);
+    }
+
+    /// `set`, `watch` and `bulk` match their words exactly as listed, so a
+    /// hint in the typed case would spell a word they reject (`set OUTPUT`);
+    /// only a prefix typed as listed is hinted. TAB still replaces the word.
+    #[test]
+    fn exact_words_are_hinted_only_as_listed() {
+        assert_eq!(hint("set out"), Some("put".to_string()));
+        assert_eq!(hint("watch ad"), Some("d".to_string()));
+        assert_eq!(hint("bulk looku"), Some("p".to_string()));
+        for line in ["set OUT", "set Out", "watch AD", "bulk LOOKU"] {
+            assert_eq!(hint(line), None, "{line}");
+        }
+        assert_eq!(candidates("set OUT"), vec!["output"]);
+        assert_eq!(candidates("watch AD"), vec!["add"]);
+        // Output formats parse in any case, so their hint follows it.
+        assert_eq!(hint("set output YA"), Some("ML".to_string()));
     }
 
     /// The follow hint used to omit `--changes-only`, which help showed.

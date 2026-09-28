@@ -113,7 +113,8 @@ The dig result shape changes on the CLI, Python, REST and MCP surfaces — see
   like DS and DNSKEY.
 - **`+short` / `--short`:** only the values, one per line with CNAME targets
   first, and nothing when there is no answer, as dig prints them. It ignores
-  `--format` and can't be combined with `-q`/`--fields`.
+  `--format` and can't be combined with `-q`/`--fields`. A `+trace +short`
+  that stopped early prints why on stderr and exits 1.
 - **`+trace` / `--trace`:** `seer dig www.example.com +trace` walks the
   delegation from the root servers down to the zone that answers, asking one
   server of each zone directly (recursion off, up to 3 servers per zone). A

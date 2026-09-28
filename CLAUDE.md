@@ -199,18 +199,20 @@ seer-cli/src/
   into one, the REPL's `commands::parse_query` converts its own syntax, and
   both call `query::run(query, clients, config, spin)`, which returns an
   `Outcome` (`payload`, stderr `note`/`footnote`, the `errors` of a
-  multi-type dig's failed types, and the `+short` flag). The CLI renders it
-  through `-q`/`--fields` or `payload::serialize` inside
-  `Outcome::present(format, show)`, which prints `+short` lines instead when
-  asked and the failed types after; the REPL does the same and keeps the
-  payload for `copy`. Bulk, follow, watch, history and tui are handled
-  outside the pipeline, over shared `ops.rs` helpers.
+  multi-type dig's failed types or of a `+short` trace that stopped early,
+  and the `+short` flag). The CLI renders it through `-q`/`--fields` or
+  `payload::serialize` inside `Outcome::present(format, show)`, which
+  prints `+short` lines instead when asked and the errors after; the REPL
+  does the same and keeps the payload for `copy`. Bulk, follow, watch,
+  history and tui are handled outside the pipeline, over shared `ops.rs`
+  helpers.
 - **Check-style exit codes** all live in `main.rs` `exit_code(&Payload)`,
   pinned by a table test (a scripting contract): `status`, `avail`, `dnssec`,
   `compare`, `drift`, `takeover`, `subdomains --diff`, `doctor` and
   `delegation` exit 1 when their check fails; `dig` and its trace have
   explicit not-check-style rows. `outcome_exit_code` adds the one
-  outcome-level rule: a multi-type dig with a failed type exits 1.
+  outcome-level rule: an outcome with `errors` exits 1 (a multi-type dig
+  with a failed type, a `+short` trace that stopped early).
   `cli_spinner()` lists the commands that show a spinner in one-shot mode
   (trace among them; plain dig is quiet).
 - **Catalogs.** `ops::BULK_OPS` (name, description) drives the clap
@@ -241,7 +243,9 @@ seer-cli/src/
   `dig_short`/`dig_trace_short`) whatever `--format` says, is a usage
   error with `-q`/`--fields`, and prints nothing for an empty answer. Not
   check-style: NXDOMAIN/NODATA/SERVFAIL/REFUSED and a trace that stopped
-  with an `error` exit 0. `--fields` on a list result (a multi-type dig)
+  with an `error` exit 0 — except a `+short` trace, whose empty values
+  would hide the stop: `query::trace_outcome` moves its `error` to stderr
+  and exits 1. `--fields` on a list result (a multi-type dig)
   prints element by element unless a path starts with an index
   (`1.status`). `seer reverse` still returns `Payload::Reverse`, the record
   list from `resolve`.
