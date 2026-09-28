@@ -434,8 +434,10 @@ impl DnsResolver {
     /// default upstream — but where `resolve` folds every negative answer
     /// into an empty list, `query` reports it: NXDOMAIN, NODATA, SERVFAIL
     /// and REFUSED are `Ok` results with that [`DnsQueryResult::status`].
-    /// Only a transport failure (timeout, no connection) or invalid input is
-    /// an `Err`.
+    /// An `Err` means there is no response to report: invalid input (a
+    /// malformed name, a bare-domain SRV query), a nameserver that was
+    /// refused (a private or reserved address) or did not resolve, or a
+    /// transport failure (timeout, no connection).
     ///
     /// `ANY` fans out concurrently to A, AAAA, CNAME, MX, NS, TXT, SOA, CAA,
     /// HTTPS, DS and DNSKEY and merges the answers (see

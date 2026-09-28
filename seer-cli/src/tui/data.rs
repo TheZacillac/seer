@@ -53,7 +53,8 @@ pub async fn fetch(req: FetchReq, config: &seer_core::SeerConfig) -> Result<Lens
         } => seer_core::DnsResolver::from_config(config)
             // An explicit nameserver wins; otherwise the configured one, like `dig`.
             // NXDOMAIN, NODATA and SERVFAIL are results the lens renders;
-            // only a transport failure or invalid input is an error.
+            // invalid input, a refused nameserver or a transport failure is
+            // an error.
             .query(
                 &domain,
                 record_type,

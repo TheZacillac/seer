@@ -43,13 +43,17 @@ fn short_lines<'r>(records: impl IntoIterator<Item = &'r DnsRecord>) -> String {
         .join("\n")
 }
 
-/// How a response code reads, for styling: an answer, a negative answer
-/// (the name or the type does not exist), or no answer at all.
+/// How a response code reads, for styling: an answer (NOERROR), a negative
+/// answer (NXDOMAIN — the name does not exist), or no answer at all.
+///
+/// The tone is the response code's alone, so NODATA (the name exists, but
+/// not with the type) is NOERROR and reads [`Tone::Answered`]; tell it apart
+/// with [`DnsQueryResult::is_nodata`], or word it with [`query_verdict`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tone {
-    /// NOERROR, with or without records.
+    /// NOERROR, with or without records — NODATA included.
     Answered,
-    /// NXDOMAIN.
+    /// NXDOMAIN only.
     Negative,
     /// SERVFAIL, REFUSED and every other error code.
     Failed,
@@ -471,6 +475,15 @@ mod tests {
     #[test]
     fn tone_classes_response_codes() {
         assert_eq!(tone(DnsStatus::NoError), Tone::Answered);
+        // NODATA is NOERROR: Answered, not Negative. Only is_nodata (and the
+        // verdict worded from it) tells it from an answer with records.
+        let nodata = result(RecordType::A, DnsStatus::NoError, Vec::new());
+        assert!(nodata.is_nodata());
+        assert_eq!(tone(nodata.status), Tone::Answered);
+        assert_eq!(
+            query_verdict(&nodata, |z: &str| z.to_string()).as_deref(),
+            Some("No A records (NODATA — the name exists)")
+        );
         assert_eq!(tone(DnsStatus::NxDomain), Tone::Negative);
         assert_eq!(tone(DnsStatus::ServFail), Tone::Failed);
         assert_eq!(tone(DnsStatus::Refused), Tone::Failed);

@@ -182,8 +182,11 @@ impl<'de> Deserialize<'de> for DnsStatus {
 /// Built by [`DnsResolver::query`](crate::dns::DnsResolver::query). A negative
 /// answer is a result, not an error: NXDOMAIN, NODATA (NOERROR with no
 /// records of the type), SERVFAIL and REFUSED all come back as a
-/// `DnsQueryResult` with that [`status`](Self::status); only a transport
-/// failure (timeout, no connection) is an `Err`.
+/// `DnsQueryResult` with that [`status`](Self::status). An `Err` means
+/// there is no response to report: invalid input (a malformed name, a
+/// bare-domain SRV query), a nameserver that was refused (a private or
+/// reserved address) or did not resolve, or a transport failure (timeout,
+/// no connection).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DnsQueryResult {
     /// The normalized name that was queried (for an IP-literal PTR query,

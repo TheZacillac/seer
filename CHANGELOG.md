@@ -36,7 +36,9 @@ The dig result shape changes on the CLI, Python, REST and MCP surfaces — see
   answers 200.
   With several record types, `seer dig` returns an array of these objects.
   `seer reverse`, bulk `dig` (the CSV, `seer.bulk_dig`, `/dns/bulk` and
-  `seer_bulk_dig`) and the other DNS commands keep their output.
+  `seer_bulk_dig`) and the other DNS commands keep their output shape;
+  where they accept `ANY`, it now returns more record types (see the next
+  entry).
 
   Before:
   ```json
@@ -58,12 +60,22 @@ The dig result shape changes on the CLI, Python, REST and MCP surfaces — see
                 "present": false, "matches_answer": false},
    "query_time_ms": 12}
   ```
-- **`ANY` covers more record types.** Wherever `ANY` is accepted, it now also
-  queries CNAME, HTTPS, DS and DNSKEY (11 types, queried concurrently), and a
-  record that more than one of those queries returns, such as a CNAME, is
-  listed once. In `seer dig`, an `ANY` answer with records has no authority
-  section: the SOAs the types without records came back with (the parent
-  zone's among them, for DS) describe none of the answer.
+- **Breaking: `ANY` covers more record types.** Wherever `ANY` is accepted,
+  it now also queries CNAME, HTTPS, DS and DNSKEY (11 types, queried
+  concurrently), and a record that more than one of those queries returns,
+  such as a CNAME, is listed once. So an existing `ANY` query can return
+  records of those four types, not only in `seer dig`: bulk `dig` (the CSV's
+  `records` column, `seer.bulk_dig`, `/dns/bulk` and `seer_bulk_dig`),
+  propagation (`seer prop`, bulk `prop`, `seer.propagation`,
+  `seer.bulk_propagation`, `/propagation` and the MCP tools), `seer follow`
+  and `seer.dns_follow`, and seer-core's `DnsResolver::resolve(…,
+  RecordType::ANY, …)`. `seer compare` (with `seer.dns_compare`,
+  `/dns/compare` and `seer_dns_compare`) compares those record sets too, so
+  two servers that agreed on the old seven types can now differ, making
+  `seer compare … ANY` exit 1 where it exited 0. In `seer dig`, an `ANY`
+  answer with records has no authority section: the SOAs the types without
+  records came back with (the parent zone's among them, for DS) describe
+  none of the answer.
 - **`--quiet --fields` on a list result** (such as `seer reverse`, or a `seer
   dig` over several types) prints each element's values together, element
   by element, instead of each field across all elements in turn. A path that

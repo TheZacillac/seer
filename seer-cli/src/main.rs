@@ -215,9 +215,9 @@ enum Commands {
     ///
     /// Not check-style: like dig, it exits 0 whenever a server answered —
     /// NXDOMAIN, NODATA and SERVFAIL are results — and 1 on invalid input,
-    /// a timeout or other transport failure, when any of several types
-    /// failed (the others are still printed), or when a `+short` trace
-    /// stopped early (its error goes to stderr).
+    /// a refused `@server`, a timeout or other transport failure, when any
+    /// of several types failed (the others are still printed), or when a
+    /// `+short` trace stopped early (its error goes to stderr).
     #[command(override_usage = dig_usage(), after_long_help = dig_long_help())]
     Dig {
         /// The name to query, record types, `@server`, `+short` and
