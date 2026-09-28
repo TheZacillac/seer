@@ -286,9 +286,9 @@ call_fn! {
 /// - query_time_ms: time taken by the query
 ///
 /// `nameserver` is an IP or hostname with an optional port (UDP),
-/// tls://host[:port] or https://host[:port][/path]. ANY queries the common
-/// types concurrently and merges their answers. NXDOMAIN, NODATA, SERVFAIL
-/// and REFUSED are results, not exceptions. Invalid input raises
+/// `tls://host[:port]` or `https://host[:port][/path]`. ANY queries the
+/// common types concurrently and merges their answers. NXDOMAIN, NODATA,
+/// SERVFAIL and REFUSED are results, not exceptions. Invalid input raises
 /// ValueError; a query that got no response, or a private or reserved
 /// nameserver, raises RuntimeError.
 #[pyfunction]

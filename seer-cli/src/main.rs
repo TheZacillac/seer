@@ -226,9 +226,9 @@ enum Commands {
         /// is ANY); the default is A
         #[arg(value_name = "ARGS")]
         args: Vec<String>,
-        /// Nameserver to query (same as `@server`): IP/host[:port] (UDP),
-        /// tls://host[:port] (DoT), or https://host[/path] (DoH) — e.g.
-        /// 8.8.8.8, tls://1.1.1.1, https://cloudflare-dns.com/dns-query
+        /// Nameserver to query (same as `@server`): `IP/host[:port]` (UDP),
+        /// `tls://host[:port]` (DoT), or `https://host[/path]` (DoH) — e.g.
+        /// `8.8.8.8`, `tls://1.1.1.1`, `https://cloudflare-dns.com/dns-query`
         #[arg(short, long)]
         server: Option<String>,
         /// Print only the record values, one per line (same as `+short`).
@@ -299,9 +299,9 @@ enum Commands {
         /// Record type (A, AAAA, MX, NS, TXT, etc.)
         #[arg(default_value = "A")]
         record_type: String,
-        /// Nameserver to query: IP/host[:port] (UDP), tls://host[:port] (DoT),
-        /// or https://host[/path] (DoH) — e.g. 8.8.8.8, tls://1.1.1.1,
-        /// https://cloudflare-dns.com/dns-query
+        /// Nameserver to query: `IP/host[:port]` (UDP), `tls://host[:port]`
+        /// (DoT), or `https://host[/path]` (DoH) — e.g. `8.8.8.8`,
+        /// `tls://1.1.1.1`, `https://cloudflare-dns.com/dns-query`
         #[arg(short, long)]
         server: Option<String>,
         /// Only show output when records change
@@ -363,9 +363,9 @@ enum Commands {
     Compare {
         /// Domain name to query
         domain: String,
-        /// First nameserver (e.g., 8.8.8.8 or tls://1.1.1.1)
+        /// First nameserver (e.g., `8.8.8.8` or `tls://1.1.1.1`)
         server_a: String,
-        /// Second nameserver (e.g., 1.1.1.1 or https://dns.google/dns-query)
+        /// Second nameserver (e.g., `1.1.1.1` or `https://dns.google/dns-query`)
         server_b: String,
         /// Record type (A, AAAA, MX, etc.)
         // Trails the required nameservers: clap forbids a defaulted positional
