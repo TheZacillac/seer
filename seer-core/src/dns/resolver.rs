@@ -1206,8 +1206,9 @@ pub(crate) fn from_wire_type(wire: HickoryRecordType) -> Option<RecordType> {
 /// that reports a response section as-is (a CNAME chain, an authority SOA, a
 /// trace hop), where records of several types and owners appear together.
 ///
-/// The owner name loses its trailing root dot, matching how query names are
-/// reported. Returns `None` for types seer does not model.
+/// The owner name is ASCII (see `owner_name`) and loses its trailing root
+/// dot, matching how query names are reported. Returns `None` for types seer
+/// does not model.
 pub(crate) fn to_dns_record(record: &Record) -> Option<DnsRecord> {
     let record_type = from_wire_type(record.record_type())?;
     let data = convert_rdata(record_type, &record.data)?;
@@ -1219,10 +1220,12 @@ pub(crate) fn to_dns_record(record: &Record) -> Option<DnsRecord> {
     })
 }
 
-/// A hickory name as seer reports it: without the trailing root dot, except
-/// for the root itself (`.`).
+/// A hickory name as seer reports an owner: in ASCII — an IDN label as its
+/// `xn--` A-label, the spelling of the (normalized) query name it sits
+/// beside — and without the trailing root dot, except for the root itself
+/// (`.`). hickory's `Display` would decode A-labels to Unicode.
 fn owner_name(name: &Name) -> String {
-    let text = name.to_string();
+    let text = name.to_ascii();
     match text.strip_suffix('.') {
         Some(rest) if !rest.is_empty() => rest.to_string(),
         _ => text,
@@ -2076,6 +2079,11 @@ mod tests {
         assert_eq!(converted.record_type, RecordType::A);
 
         assert_eq!(owner_name(&Name::root()), ".");
+        // An IDN owner keeps its A-label, the spelling of the query name.
+        assert_eq!(
+            owner_name(&Name::from_utf8("bücher.seer.test.").unwrap()),
+            "xn--bcher-kva.seer.test"
+        );
     }
 
     #[test]
@@ -2611,6 +2619,39 @@ mod tests {
         assert!(is_probe(&wildcard.probe_name), "{wildcard:?}");
         assert!(wildcard.probe_name.ends_with(".seer.test"), "{wildcard:?}");
         assert!(!wildcard.present && !wildcard.matches_answer);
+    }
+
+    #[tokio::test]
+    async fn mock_query_reports_idn_owners_as_a_labels() {
+        // The query name is normalized to its A-label; owners are reported
+        // in that spelling too, and the chain connects through a CNAME
+        // target rendered with Unicode labels.
+        let port = spawn_mock_dns_fn(|qname, qtype| match (qname, qtype) {
+            ("xn--bcher-kva.seer.test", HickoryRecordType::A) => MockReply::Records(vec![
+                record(
+                    "xn--bcher-kva.seer.test.",
+                    300,
+                    cname_rdata("edge.xn--caf-dma.test."),
+                ),
+                record("edge.xn--caf-dma.test.", 60, a_rdata([192, 0, 2, 7])),
+            ]),
+            _ => MockReply::NxDomain,
+        })
+        .await;
+        let result = mock_query(port, "Bücher.seer.test", RecordType::A).await;
+        assert_eq!(result.name, "xn--bcher-kva.seer.test");
+        assert_eq!(
+            shown(&result.answers.iter().collect::<Vec<_>>()),
+            [
+                row(
+                    "xn--bcher-kva.seer.test",
+                    RecordType::CNAME,
+                    "edge.café.test."
+                ),
+                row("edge.xn--caf-dma.test", RecordType::A, "192.0.2.7"),
+            ]
+        );
+        assert_eq!(result.cname_chain().count(), 1);
     }
 
     #[tokio::test]

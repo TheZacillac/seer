@@ -27,6 +27,7 @@ use std::time::Duration;
 use hickory_resolver::lookup::Lookup;
 use hickory_resolver::net::{DnsError, NetError, NoRecords};
 use hickory_resolver::proto::op::{Message, MessageType, Metadata, ResponseCode};
+use hickory_resolver::proto::rr::Name;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use super::records::{DnsRecord, RecordData, RecordType};
@@ -419,16 +420,24 @@ pub(crate) fn header_flags(metadata: &Metadata) -> Vec<String> {
     .collect()
 }
 
-/// A DNS name without its trailing root dot, for comparing owner names
-/// (reported without it) with CNAME targets (rendered with it).
-fn bare(name: &str) -> &str {
-    name.strip_suffix('.').unwrap_or(name)
+/// A reported DNS name in one comparable spelling: ASCII (A-labels),
+/// lowercase (RFC 4343), without the trailing root dot. Owner and query
+/// names are reported as A-labels without the dot, but a CNAME target the
+/// way `convert_rdata` renders RDATA names — with the dot, and with IDN
+/// labels decoded to Unicode — so a chain is only walkable with both sides
+/// in this form. A name that does not parse is compared as written.
+fn name_key(name: &str) -> String {
+    let bare = name.strip_suffix('.').unwrap_or(name);
+    Name::from_utf8(bare)
+        .map(|parsed| parsed.to_ascii())
+        .unwrap_or_else(|_| bare.to_string())
+        .to_ascii_lowercase()
 }
 
 /// Orders an ANSWER section for reporting: the CNAME chain that starts at
 /// `query_name` first, hop by hop, then everything else in the server's
-/// order (MX by preference, matching `resolve`). Owner names compare
-/// case-insensitively (RFC 4343). A CNAME query's answer is left as is.
+/// order (MX by preference, matching `resolve`). Names compare in one
+/// spelling ([`name_key`]). A CNAME query's answer is left as is.
 pub(crate) fn order_answers(
     query_name: &str,
     record_type: RecordType,
@@ -439,14 +448,15 @@ pub(crate) fn order_answers(
     }
     let mut rest = answers;
     let mut ordered = Vec::with_capacity(rest.len());
-    let mut current = bare(query_name).to_string();
+    let mut current = name_key(query_name);
     // Each hop removes a record, so even a looping chain terminates.
-    while let Some(pos) = rest.iter().position(|r| {
-        r.record_type == RecordType::CNAME && bare(&r.name).eq_ignore_ascii_case(&current)
-    }) {
+    while let Some(pos) = rest
+        .iter()
+        .position(|r| r.record_type == RecordType::CNAME && name_key(&r.name) == current)
+    {
         let hop = rest.remove(pos);
         if let RecordData::CNAME { target } = &hop.data {
-            current = bare(target).to_string();
+            current = name_key(target);
         }
         ordered.push(hop);
     }
@@ -857,6 +867,26 @@ mod tests {
                 mx("mail.cdn.test", 30),
             ]
         );
+    }
+
+    #[test]
+    fn order_answers_walks_a_chain_through_idn_names() {
+        // Owners are reported as A-labels, but a CNAME target as its RDATA
+        // renders — with Unicode labels — and the chain must still connect.
+        let answers = vec![
+            a("edge.xn--caf-dma.test", "192.0.2.7"),
+            cname("xn--bcher-kva.seer.test", "edge.café.test."),
+        ];
+        let ordered = order_answers("xn--bcher-kva.seer.test", RecordType::A, answers);
+        assert_eq!(
+            ordered,
+            vec![
+                cname("xn--bcher-kva.seer.test", "edge.café.test."),
+                a("edge.xn--caf-dma.test", "192.0.2.7"),
+            ]
+        );
+        assert_eq!(name_key("Edge.Café.test."), "edge.xn--caf-dma.test");
+        assert_eq!(name_key("WWW.seer.test"), "www.seer.test");
     }
 
     #[test]
