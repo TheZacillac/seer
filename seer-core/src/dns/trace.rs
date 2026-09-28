@@ -57,12 +57,16 @@
 //! at most [`MAX_SERVERS_PER_LEVEL`] queries and [`MAX_GLUELESS_PER_LEVEL`]
 //! glueless lookups, each query and each lookup under the per-query timeout
 //! (the config file's DNS timeout); an address with no local route fails
-//! without waiting. There is no deadline for the walk as a whole: at worst —
-//! every level answered only by its last server, after timed-out glueless
-//! lookups — it takes `MAX_HOPS × (MAX_SERVERS_PER_LEVEL +
-//! MAX_GLUELESS_PER_LEVEL)` = 96 timeouts (8 minutes at the default 5s),
-//! while a level whose servers all fail ends it. Each referral must descend toward the query name, so the
-//! walk cannot loop.
+//! without waiting. The walk as a whole has one deadline of
+//! [`TRACE_BUDGET_TIMEOUTS`] per-query timeouts (30s at the default 5s), as
+//! long as a single level may take at worst. The levels run one after
+//! another, and every level below a zone its owner controls is theirs to
+//! slow down, so without the deadline a chain of levels each answered only
+//! by its last server, after timed-out glueless lookups, would hold the
+//! caller for `MAX_HOPS × (MAX_SERVERS_PER_LEVEL + MAX_GLUELESS_PER_LEVEL)`
+//! = 96 timeouts (8 minutes at the default). A walk that runs out of time
+//! stops with the hops so far, and [`DnsTrace::error`] says so. Each
+//! referral must descend toward the query name, so the walk cannot loop.
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
@@ -98,6 +102,12 @@ const MAX_SERVERS_PER_LEVEL: usize = 3;
 /// Glueless nameserver names resolved (through the recursive resolver) per
 /// delegation level.
 const MAX_GLUELESS_PER_LEVEL: usize = 3;
+
+/// The whole walk's deadline, in per-query timeouts: as long as a single
+/// level may take at worst (every query and glueless lookup of it timing
+/// out). Any one slow level can still finish; a chain of them cannot hold
+/// the caller for [`MAX_HOPS`] times that.
+const TRACE_BUDGET_TIMEOUTS: u32 = (MAX_SERVERS_PER_LEVEL + MAX_GLUELESS_PER_LEVEL) as u32;
 
 /// The root zone's servers — name, IPv4, IPv6 — from IANA's root hints
 /// (`https://www.internic.net/domain/named.root`, last updated 2026-09-24;
@@ -196,8 +206,8 @@ pub struct DnsTrace {
     /// owner name. A CNAME answer is reported as-is, not chased.
     pub answers: Vec<DnsRecord>,
     /// Why the walk stopped before a final response, if it did: every server
-    /// of a zone failed, a server referred upward or sideways, or the chain
-    /// was too long.
+    /// of a zone failed, a server referred upward or sideways, the chain was
+    /// too long, or the walk ran out of time.
     pub error: Option<String>,
 }
 
@@ -412,7 +422,8 @@ impl DnsTracer {
     /// nameservers, and each one is refused when it is private or reserved.
     /// Up to 16 delegation levels are walked and up to 3 servers asked per
     /// level, each query and glueless lookup under the configured DNS
-    /// timeout.
+    /// timeout, and the whole walk under six times that timeout: a walk that
+    /// runs out of time returns the hops so far with an error.
     ///
     /// # Arguments
     /// * `name` - The name to trace, prepared exactly as
@@ -434,9 +445,29 @@ impl DnsTracer {
         let mut servers = self.root_servers();
         let mut hops: Vec<TraceHop> = Vec::new();
         let mut error = None;
+        // One deadline for the whole walk: each level is bounded on its own,
+        // but the levels run one after another.
+        let budget = self.timeout.saturating_mul(TRACE_BUDGET_TIMEOUTS);
+        let started = Instant::now();
 
         loop {
-            let (mut hop, step) = match self.ask_level(&zone, &servers, &qname, qtype).await {
+            let remaining = budget.saturating_sub(started.elapsed());
+            let level = self.ask_level(&zone, &servers, &qname, qtype);
+            let Ok(outcome) = tokio::time::timeout(remaining, level).await else {
+                let why = format!(
+                    "gave up after {budget:?} without a final response, while asking the \
+                     nameservers of {}",
+                    name_text(&zone)
+                );
+                if hops.is_empty() {
+                    return Err(SeerError::DnsError(format!(
+                        "trace of {name} failed: {why}"
+                    )));
+                }
+                error = Some(why);
+                break;
+            };
+            let (mut hop, step) = match outcome {
                 LevelOutcome::Answered { hop, step } => (hop, step),
                 LevelOutcome::Failed { final_hop, reason } => {
                     let why = format!(
@@ -1954,6 +1985,72 @@ mod tests {
         assert_eq!(trace.hops[0].zone, ".");
         assert_eq!(trace.hops[1].zone, "test.");
         assert_eq!(trace.hops[2].zone, "l20.test.");
+    }
+
+    #[tokio::test]
+    async fn the_whole_walk_is_held_to_one_deadline() {
+        // A chain delegated one label at a time, every level answered only
+        // by its second server after the first times out: each level costs
+        // one timeout, and the chain is longer than the walk's budget.
+        // Without the deadline the walk ran on to the answer.
+        let timeout = Duration::from_millis(100);
+        let depth = TRACE_BUDGET_TIMEOUTS as usize + 2;
+        let labels: Vec<String> = (1..=depth)
+            .map(|i| format!("l{i}"))
+            .chain(["test".into()])
+            .collect();
+        let qname = labels.join(".");
+        let zones: Vec<String> = (1..=labels.len())
+            .map(|n| labels[labels.len() - n..].join("."))
+            .collect();
+
+        let dark = spawn_mock_dns(MockMode::Ignore).await;
+        let mut asked = 0;
+        let chain = zones.clone();
+        let live = spawn_mock_dns_fn(move |_, _| {
+            let reply = match chain.get(asked) {
+                Some(zone) => MockReply::Delegation {
+                    zone: zone.clone(),
+                    servers: vec![
+                        (format!("ns1.{zone}"), vec![LOOPBACK]),
+                        (format!("ns2.{zone}"), vec![LOOPBACK]),
+                    ],
+                },
+                None => MockReply::AuthoritativeAnswer(vec![a_rdata(Ipv4Addr::new(192, 0, 2, 40))]),
+            };
+            asked += 1;
+            reply
+        })
+        .await;
+        let ns_hosts: Vec<(String, u16)> = zones
+            .iter()
+            .flat_map(|zone| [(format!("ns1.{zone}"), dark), (format!("ns2.{zone}"), live)])
+            .collect();
+        let mut ports: Vec<(&str, u16)> = ns_hosts.iter().map(|(h, p)| (h.as_str(), *p)).collect();
+        ports.extend([("a.root.test", dark), ("b.root.test", live)]);
+
+        let started = Instant::now();
+        let trace = tracer(&["a.root.test", "b.root.test"], &ports)
+            .with_timeout(timeout)
+            .trace(&qname, RecordType::A)
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        let budget = timeout * TRACE_BUDGET_TIMEOUTS;
+        assert!(elapsed < budget + timeout, "took {elapsed:?}");
+        let error = trace.error.expect("the walk must run out of time");
+        assert!(error.starts_with("gave up after 600ms"), "{error}");
+        // The hops walked so far are kept, each one a referral that the
+        // deadline cut short of the answer.
+        assert!(!trace.hops.is_empty());
+        assert!(trace.hops.iter().all(|hop| hop.referral_zone.is_some()));
+        assert!(trace.answers.is_empty());
+        let asking = zones[trace.hops.len() - 1].clone();
+        assert!(
+            error.ends_with(&format!("nameservers of {asking}.")),
+            "{error}"
+        );
     }
 
     #[tokio::test]

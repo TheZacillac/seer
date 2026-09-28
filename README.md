@@ -339,10 +339,11 @@ Note: DNS responses are not DNSSEC-validated
   address, the status, the referral or the answer, and any servers that
   failed. A server that fails or gives a lame (empty, non-authoritative)
   reply is passed over for the zone's next one, and each server is asked
-  over IPv4 first, then over IPv6 when this host has no IPv4 route. It takes
-  one record type and no nameserver, and reports a CNAME answer without
-  following it. Every server address is checked against private and
-  reserved ranges before it is queried.
+  over IPv4 first, then over IPv6 when this host has no IPv4 route. The
+  whole walk gets six DNS timeouts (30s by default) and otherwise stops with
+  the hops so far and an error. It takes one record type and no nameserver,
+  and reports a CNAME answer without following it. Every server address is
+  checked against private and reserved ranges before it is queried.
 - **Scripting.** `--format json` / `yaml` prints the result object (`name`,
   `record_type`, `server`, `answered_locally`, `status`, `flags`, `answers`,
   `authority`, `wildcard`, `query_time_ms`), or an array of them for several

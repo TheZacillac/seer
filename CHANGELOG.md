@@ -125,8 +125,10 @@ The dig result shape changes on the CLI, Python, REST and MCP surfaces — see
   answer, plus any servers that failed. The walk stops at the answer (a
   CNAME is reported, not followed), at NXDOMAIN or NODATA, or with an error
   saying why it stopped early, such as a referral that leads upward or
-  sideways. It takes one record type and no nameserver, and ignores the
-  config file's nameserver. Every server address — root hint, glue or looked
+  sideways. The whole walk gets six DNS timeouts (30s by default); one that
+  runs out of time stops with the hops so far and an error saying so. It
+  takes one record type and no nameserver, and ignores the config file's
+  nameserver. Every server address — root hint, glue or looked
   up — is checked against private and reserved ranges before it is queried.
 - **TUI:** the DNS lens shows the status line, the CNAME chain, the
   NXDOMAIN/NODATA verdict, the authority SOA and the wildcard note, and has a

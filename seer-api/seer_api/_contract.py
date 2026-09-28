@@ -21,9 +21,14 @@ MAX_CONCURRENCY = 50
 BULK_LIMIT = "10/minute"
 # Bulk SSL/status/propagation, confusables and takeover fan out hardest.
 HEAVY_LIMIT = "5/minute"
-# A DNS trace walks the delegation chain from the root servers, querying each
-# zone's nameservers directly from this host (up to 3 per level) — held to the
-# 20/minute of a single propagation check rather than a lookup's 60/minute.
+# A DNS trace walks the delegation chain from the root servers one level at a
+# time, querying each zone's nameservers directly from this host. Its cost is
+# wall-clock time, not query count: the levels run in sequence (up to 16, each
+# up to 3 servers and 3 glueless lookups at one DNS timeout apiece), and the
+# caller picks the name, so every level below a zone they own is theirs to
+# slow down. seer-core holds the whole walk to 6 DNS timeouts (30s at the
+# default 5s), so a trace holds a dispatch thread at most that long, and
+# 20/minute lets one client keep at most about 10 of them busy.
 TRACE_LIMIT = "20/minute"
 
 # DNS record-type token accepted at the edge; the core parses the name itself.

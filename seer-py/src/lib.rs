@@ -323,8 +323,8 @@ fn dig<'py>(
 ///   that did not give a usable response, with the reason)
 /// - status, answers: the last hop's
 /// - error: why the walk stopped before a final response (no server of a
-///   zone responded, an upward or sideways referral, too many levels), or
-///   None
+///   zone responded, an upward or sideways referral, too many levels, or
+///   the walk ran out of its six DNS timeouts), or None
 ///
 /// record_type is any single type; ANY raises ValueError, since it is a
 /// fan-out over several queries. Private or reserved server addresses are
