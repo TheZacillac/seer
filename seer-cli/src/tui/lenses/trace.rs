@@ -16,7 +16,7 @@ use seer_core::{DnsTrace, TraceHop};
 use crate::tui::action::LensData;
 use crate::tui::lenses::dns::{record_table, status_color, status_spans, verdict_color};
 use crate::tui::theme::Theme;
-use crate::tui::widgets::{panel, row_style, scroll_to, stack, wrap};
+use crate::tui::widgets::{panel, row_style, scroll_to, stack, wrap, Band};
 
 pub fn render(
     f: &mut Frame,
@@ -36,7 +36,7 @@ pub fn render(
 
     // The hop the selection is on (the first one until the pane is entered).
     let selected = sel.min(trace.hops.len().saturating_sub(1));
-    let detail = trace
+    let mut detail = trace
         .hops
         .get(selected)
         .map(|hop| hop_detail(theme, selected + 1, hop, inner.width))
@@ -45,22 +45,32 @@ pub fn render(
 
     // Status line, hops, the selected hop's detail, the final answer, the
     // outcome — stacked from the top, each band only when it has content.
-    // Only the hop table shrinks (and scrolls) when they do not all fit.
+    // When they do not all fit, the hop table gives up rows first but keeps
+    // its header and a few hops (it scrolls to the selection), then the
+    // detail and the answers are cut short, each saying how much it left
+    // out, so the status line and the outcome stay whole.
     let rows = |n: usize| u16::try_from(n).unwrap_or(u16::MAX);
-    let mut heights = vec![1, rows(trace.hops.len() + 1)];
+    let hops = trace.hops.len();
+    let mut layout = vec![
+        Band::fixed(1),
+        Band::shrinking(rows(hops + 1), rows(1 + hops.min(MIN_ROWS))),
+    ];
     if !detail.is_empty() {
-        heights.push(rows(detail.len()));
+        layout.push(Band::shrinking(
+            rows(detail.len()),
+            rows(detail.len().min(MIN_ROWS)),
+        ));
     }
     if !trace.answers.is_empty() {
-        heights.push(rows(trace.answers.len() + 1));
+        let answers = trace.answers.len() + 1;
+        layout.push(Band::shrinking(rows(answers), rows(answers.min(MIN_ROWS))));
     }
     if !outcome.is_empty() {
-        heights.push(rows(outcome.len()));
+        layout.push(Band::fixed(rows(outcome.len())));
     }
-    let mut bands = stack(inner, &heights, Some(1)).into_iter();
+    let mut bands = stack(inner, &layout).into_iter();
     let mut next_band = || bands.next().unwrap_or_default();
 
-    let hops = trace.hops.len();
     let mut status = Vec::from(status_spans(theme, trace.status));
     status.push(Span::styled(
         format!(
@@ -78,15 +88,59 @@ pub fn render(
         &mut state,
     );
     if !detail.is_empty() {
-        f.render_widget(Paragraph::new(detail), next_band());
+        let band = next_band();
+        let (shown, hidden) = fit(detail.len(), band.height);
+        detail.truncate(shown);
+        if hidden > 0 {
+            detail.push(more(theme, hidden, "lines"));
+        }
+        f.render_widget(Paragraph::new(detail), band);
     }
     if !trace.answers.is_empty() {
-        let answers = trace.answers.iter().map(|r| (r, true));
-        f.render_widget(record_table(theme, "ANSWER", answers, None), next_band());
+        let band = next_band();
+        // The column header, then the answers that fit.
+        let body = band.height.saturating_sub(1);
+        let (shown, hidden) = fit(trace.answers.len(), body);
+        let answers = trace.answers.iter().take(shown).map(|r| (r, true));
+        f.render_widget(record_table(theme, "ANSWER", answers, None), band);
+        if hidden > 0 && body > 0 {
+            let last = Rect {
+                y: band.bottom() - 1,
+                height: 1,
+                ..band
+            };
+            f.render_widget(Paragraph::new(more(theme, hidden, "answers")), last);
+        }
     }
     if !outcome.is_empty() {
         f.render_widget(Paragraph::new(outcome), next_band());
     }
+}
+
+/// The fewest rows a band cut short keeps: the hop table this many hops
+/// under its header, the detail and the answer table (header included) this
+/// many rows.
+const MIN_ROWS: usize = 3;
+
+/// How many of `total` rows fit in `rows`, and how many are left out: when
+/// not all fit, the last row goes to the [`more`] mark, so a mark always
+/// stands for two rows or more (a single one would fit in its place).
+fn fit(total: usize, rows: u16) -> (usize, usize) {
+    let rows = usize::from(rows);
+    if total <= rows {
+        (total, 0)
+    } else {
+        let shown = rows.saturating_sub(1);
+        (shown, total - shown)
+    }
+}
+
+/// The mark closing a band that was cut short: `… N more <rows>`.
+fn more(theme: &Theme, hidden: usize, rows: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        format!("… {hidden} more {rows}"),
+        Style::default().fg(theme.overlay0),
+    ))
 }
 
 /// One row per hop: the zone asked, the server and address that answered,
@@ -218,6 +272,75 @@ mod tests {
         text.lines()
             .find(|l| l.contains(needle))
             .unwrap_or_else(|| panic!("no row with {needle:?} in\n{text}"))
+    }
+
+    /// A root hop referring to 13 nameservers, and a final answer of
+    /// `answers` addresses — more than a small terminal holds.
+    fn long_trace(answers: u8, error: Option<&str>) -> DnsTrace {
+        let records = (1..=answers)
+            .map(|i| fixtures::a("www.seer.test", &format!("192.0.2.{i}")))
+            .collect();
+        let mut trace = fixtures::trace(records, error);
+        trace.hops[0].referral = (b'a'..=b'm')
+            .map(|c| format!("{}.gtld-servers.net.", char::from(c)))
+            .collect();
+        trace
+    }
+
+    fn draw_at(width: u16, height: u16, trace: &DnsTrace, sel: Option<usize>) -> String {
+        let theme = Theme::frappe();
+        let data = LensData::Trace(Box::new(trace.clone()));
+        render_lines(width, height, |f| {
+            render(f, f.area(), &theme, &data, sel.is_some(), sel.unwrap_or(0));
+        })
+    }
+
+    #[test]
+    fn a_long_referral_and_answer_leave_the_hop_table_in_view() {
+        let trace = long_trace(12, None);
+        for (width, height, sel) in [
+            (80, 20, None),
+            (80, 20, Some(0)),
+            (80, 20, Some(1)),
+            (110, 22, Some(0)),
+            // The lens area of an 80x24 terminal.
+            (54, 21, Some(0)),
+        ] {
+            let text = draw_at(width, height, &trace, sel);
+            let at = format!("{width}x{height} sel {sel:?}\n{text}");
+            assert!(text.contains("ZONE"), "{at}");
+            // Both hops fit, the selected one among them.
+            assert!(text.contains(". (root)"), "{at}");
+            assert!(text.contains("NOERROR aa"), "{at}");
+            // The answers are cut short, and say by how much.
+            let mark = row_with(&text, "more answers");
+            let hidden: usize = mark
+                .split_whitespace()
+                .find_map(|word| word.parse().ok())
+                .unwrap_or_else(|| panic!("no count in {mark:?}"));
+            let shown = (1..=12)
+                .filter(|i| text.contains(&format!("192.0.2.{i} ")))
+                .count();
+            assert_eq!(shown + hidden, 12, "{at}");
+            assert!(shown >= 1, "{at}");
+            assert!(text.contains(&format!("192.0.2.{shown} ")), "{at}");
+        }
+        // Where the answers fit, nothing is cut.
+        let text = draw_at(110, 40, &trace, Some(0));
+        assert!(text.contains("192.0.2.12"), "{text}");
+        assert!(!text.contains(" more "), "{text}");
+        assert!(text.contains("m.gtld-servers.net."), "{text}");
+    }
+
+    #[test]
+    fn a_long_referral_is_cut_short_before_the_outcome() {
+        let trace = long_trace(0, Some("every server failed"));
+        let text = draw_at(54, 14, &trace, Some(0));
+        row_with(&text, "ZONE");
+        row_with(&text, "Hop 1 referral to seer.test.:");
+        row_with(&text, "more lines");
+        assert!(!text.contains("m.gtld-servers.net."), "{text}");
+        row_with(&text, "Error: every server failed");
     }
 
     #[test]

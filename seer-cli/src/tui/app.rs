@@ -213,8 +213,14 @@ impl App {
 
     /// Normalize + record the domain and produce a Fetch for the current lens
     /// (if it has anything to fetch).
+    ///
+    /// The target is normalized as a host, keeping a leading `www.`: the DNS,
+    /// Trace, SSL, Status, Headers, Propagation and Follow lenses ask about
+    /// that exact name, as the CLI does, while WHOIS, RDAP, availability and
+    /// the other registration lookups drop `www.` in core themselves.
     fn set_domain_and_fetch(&mut self, raw: &str) -> Vec<Action> {
-        let normalized = seer_core::normalize_domain(raw).unwrap_or_else(|_| raw.to_lowercase());
+        let normalized =
+            seer_core::validation::normalize_host(raw).unwrap_or_else(|_| raw.to_lowercase());
         let mut actions = Vec::new();
         // A new target invalidates every cached lens.
         if self.domain.as_deref() != Some(normalized.as_str()) {
@@ -852,12 +858,8 @@ impl App {
                 vec![action]
             }
             CmdOutcome::Compare { domain, a, b } => {
-                if let Some(i) = lenses::find_by_cmd_or_key("dns") {
-                    self.lens = i;
-                    self.tab = 2; // Compare tab
-                    self.sel = 0;
-                    self.focus = Focus::Nav;
-                }
+                // The Compare tab.
+                self.open_dns_tab(2);
                 // Remember the domain (so `a`/`b` re-runs stay on it) and keep
                 // the cycling indices in sync with the given resolvers.
                 self.panes.compare.domain = Some(domain.clone());
@@ -876,13 +878,8 @@ impl App {
                 server,
                 trace,
             } => {
-                if let Some(i) = lenses::find_by_cmd_or_key("dns") {
-                    self.lens = i;
-                    self.sel = 0;
-                    self.focus = Focus::Nav;
-                    // `+trace` opens the Trace tab, anything else Records.
-                    self.tab = if trace { 3 } else { 0 };
-                }
+                // `+trace` opens the Trace tab, anything else Records.
+                self.open_dns_tab(if trace { 3 } else { 0 });
                 // The Records and Trace tabs' default requests read the type
                 // and nameserver, so the cache check refetches when only
                 // those changed.
@@ -913,6 +910,25 @@ impl App {
                 vec![]
             }
         }
+    }
+
+    /// Open the DNS lens on sub-tab `tab` for `:dig` / `:compare`. Landing on
+    /// another tab than the one shown drops the lens's `/`-filter, as a tab
+    /// switch does (`refetch_for_tab`): it narrowed the old tab's rows, and a
+    /// tab that cannot filter could neither apply nor edit it. Away from the
+    /// lens, the tab it would show is Records, since changing lens resets it.
+    fn open_dns_tab(&mut self, tab: usize) {
+        let Some(i) = lenses::find_by_cmd_or_key("dns") else {
+            return;
+        };
+        let shown = if self.lens == i { self.tab } else { 0 };
+        if shown != tab {
+            self.lens_filter.remove("dns");
+        }
+        self.lens = i;
+        self.tab = tab;
+        self.sel = 0;
+        self.focus = Focus::Nav;
     }
 
     /// Handle `:rdap <target>` — routes to the correct RDAP sub-tab based on
@@ -2618,6 +2634,72 @@ mod tests {
         assert!(
             matches!(&app.toast, Some(t) if t.tone == "fail" && t.msg.contains("one record type"))
         );
+    }
+
+    /// `:dig` asks about the name as typed, like `seer dig`: a `www.` host
+    /// has records of its own (usually a CNAME), so the target keeps it.
+    #[test]
+    fn dig_queries_a_www_host_as_typed() {
+        let mut app = App::new(None);
+        let actions = app.exec_command("dig www.seer.test");
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::Fetch {
+                    req: FetchReq::Dns { domain, .. },
+                    ..
+                } if domain == "www.seer.test"
+            )),
+            "got {actions:?}"
+        );
+        let actions = app.exec_command("dig WWW.Seer.test. +trace");
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::Fetch {
+                    req: FetchReq::Trace { domain, .. },
+                    ..
+                } if domain == "www.seer.test"
+            )),
+            "got {actions:?}"
+        );
+        // Still one canonical target: the same host spelled another way is
+        // not a new one.
+        assert_eq!(app.domain.as_deref(), Some("www.seer.test"));
+    }
+
+    /// A Records `/`-filter does not follow `:dig +trace` or `:compare` to a
+    /// tab that cannot filter, where it could be neither seen nor edited.
+    #[test]
+    fn dig_and_compare_to_another_tab_drop_the_records_filter() {
+        for command in [
+            "dig example.com +trace",
+            "compare example.com 8.8.8.8 1.1.1.1",
+        ] {
+            let mut app = dns_app_with(chained_dig(3));
+            app.focus = Focus::Pane;
+            key(&mut app, KeyCode::Char('/'));
+            for c in "192.0.2.3".chars() {
+                key(&mut app, KeyCode::Char(c));
+            }
+            key(&mut app, KeyCode::Enter);
+            assert_eq!(app.active_filter(), "192.0.2.3");
+
+            app.exec_command(command);
+            assert_ne!(app.tab, 0, "{command}");
+            assert_eq!(app.active_filter(), "", "{command}");
+            // Back on Records, the old filter is gone too.
+            app.exec_command("dig example.com");
+            assert_eq!(app.tab, 0, "{command}");
+            assert_eq!(app.active_filter(), "", "{command}");
+        }
+
+        // A `:dig` that stays on Records keeps it, like a refresh.
+        let mut app = dns_app_with(chained_dig(3));
+        app.lens_filter.insert("dns", "192.0.2.3".into());
+        app.exec_command("dig example.com");
+        assert_eq!(app.tab, 0);
+        assert_eq!(app.active_filter(), "192.0.2.3");
     }
 
     #[test]

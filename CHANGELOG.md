@@ -163,6 +163,13 @@ The dig result shape changes on the CLI, Python, REST and MCP surfaces — see
   A `*` that is the whole leftmost label is now accepted, so a wildcard's
   own records can be looked up; a `*` anywhere else is still rejected, and
   per-host checks such as `ssl` and `status` still refuse it.
+- **TUI: a `www.` host is looked up as typed.** The TUI dropped a leading
+  `www.` from every target, so `:dig www.github.com` showed `github.com`'s
+  records, without the CNAME chain or the wildcard note, and the DNS, SSL,
+  Status, Headers, Propagation and Follow lenses could not look at a `www.`
+  host at all. The target now keeps it, as the CLI does; WHOIS, RDAP,
+  availability and the other registration lookups still ask about the
+  registered domain.
 
 ## [0.49.1] - 2026-09-25
 

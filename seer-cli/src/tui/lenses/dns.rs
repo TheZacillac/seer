@@ -22,7 +22,7 @@ use crate::tui::filter;
 use crate::tui::lenses::{compare, dnssec, trace};
 use crate::tui::panes::{DnsState, Panes};
 use crate::tui::theme::Theme;
-use crate::tui::widgets::{panel, row_style, scroll_to, stack, wrap};
+use crate::tui::widgets::{panel, row_style, scroll_to, stack, wrap, Band};
 
 #[allow(clippy::too_many_arguments)]
 pub fn render(
@@ -256,22 +256,18 @@ fn response(
     }
 
     let rows = filter::dig_rows(result, filter).count();
-    let heights: Vec<u16> = sections
+    let height = |lines: usize| u16::try_from(lines).unwrap_or(u16::MAX);
+    let layout: Vec<Band> = sections
         .iter()
-        .map(|section| {
-            let lines = match section {
-                // The column header, then the visible rows.
-                Section::Answers => rows + 1,
-                Section::Verdict(lines) => lines.len(),
-                Section::Authority => result.authority.len() + 1,
-                Section::Note(lines, _) => lines.len(),
-            };
-            u16::try_from(lines).unwrap_or(u16::MAX)
+        .map(|section| match section {
+            // The column header, then the visible rows; it scrolls.
+            Section::Answers => Band::shrinking(height(rows + 1), 0),
+            Section::Verdict(lines) => Band::fixed(height(lines.len())),
+            Section::Authority => Band::fixed(height(result.authority.len() + 1)),
+            Section::Note(lines, _) => Band::fixed(height(lines.len())),
         })
         .collect();
-    // The answer table, when there is one, is always the first band.
-    let flex = (!result.answers.is_empty()).then_some(0);
-    let bands = stack(area, &heights, flex);
+    let bands = stack(area, &layout);
 
     for (section, band) in sections.into_iter().zip(bands) {
         match section {
