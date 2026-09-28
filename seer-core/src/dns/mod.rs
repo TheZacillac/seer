@@ -9,6 +9,8 @@
 //! - [`DnsComparator`] (two nameservers side by side), [`DnsFollower`] (live
 //!   monitor), [`DnssecChecker`] and [`DelegationChecker`] (parent NS set vs.
 //!   the zone's own NS RRset, plus lameness probes).
+//! - [`DnsTracer`]: iterative resolution from the root servers down, one
+//!   [`TraceHop`] per delegation level (`dig +trace`).
 //!
 //! No outer retry loop at this layer: hickory's own retransmission is the
 //! only retry (see `resolver.rs`).
@@ -24,6 +26,7 @@ mod records;
 mod resolver;
 #[cfg(test)]
 pub(crate) mod test_support;
+mod trace;
 
 pub use compare::{DnsComparator, DnsComparison, ServerResult};
 pub use delegation::{DelegationChecker, DelegationReport, LameNs};
@@ -40,6 +43,7 @@ pub use propagation::{
 pub use query::DnsStatus;
 pub use records::{DnsRecord, RecordData, RecordType};
 pub use resolver::{DnsPresence, DnsResolver};
+pub use trace::{DnsTrace, DnsTracer, TraceHop};
 // Crate-internal: shared with `net.rs` so the SSRF fallback resolver and the
 // main resolver cannot drift apart on option settings.
 pub(crate) use resolver::apply_standard_opts;

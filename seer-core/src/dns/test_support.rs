@@ -1,6 +1,7 @@
 //! Test-only mock DNS fixture shared by the crate's hermetic DNS tests
-//! (`resolver.rs`, `follow.rs`, `compare.rs`, `dnssec.rs`, `posture.rs`, …):
-//! a real UDP socket on 127.0.0.1 serving
+//! (`resolver.rs`, `follow.rs`, `compare.rs`, `dnssec.rs`, `trace.rs`,
+//! `posture.rs`, …): a real UDP socket on 127.0.0.1 (optionally with a TCP
+//! relay on the same port) serving
 //! hickory-proto-encoded canned responses, so the full `resolve()` path
 //! (normalization → custom-resolver construction → hickory transport →
 //! RData conversion) runs without touching the network.
@@ -11,7 +12,7 @@
 //! `with_port` seams on [`DnsResolver`]; the production validation path is
 //! never weakened.
 
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
 
 use hickory_resolver::proto::op::{Message, OpCode, ResponseCode};
@@ -19,7 +20,8 @@ use hickory_resolver::proto::rr::rdata::{self as wire, sshfp, tlsa, CAA};
 use hickory_resolver::proto::rr::{
     Name, RData as HickoryRData, Record, RecordType as HickoryRecordType,
 };
-use tokio::net::UdpSocket;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
 use super::resolver::DnsResolver;
 
@@ -203,19 +205,116 @@ pub(crate) enum MockReply {
     Refused,
     /// Send nothing, forcing the client's timeout path.
     NoReply,
+    /// A referral to a child zone: NOERROR, AA clear, empty ANSWER, an NS
+    /// record for `zone` (`"."` for the root) per listed server in
+    /// AUTHORITY, and in ADDITIONAL an A/AAAA glue record for each address
+    /// listed with a server (none: a glueless server).
+    Delegation {
+        zone: String,
+        servers: Vec<(String, Vec<IpAddr>)>,
+    },
+    /// NXDOMAIN with the AA bit set and the SOA of the named zone in
+    /// AUTHORITY — an authoritative "no such name".
+    AuthoritativeNxDomain(&'static str),
+    /// NOERROR with the TC (truncated) bit set and no records: the reply did
+    /// not fit, so the client must retry over TCP.
+    Truncated,
+}
+
+/// `s` as a fully qualified hickory name (`"."` is the root).
+fn fq_name(s: &str) -> Name {
+    match s.trim_end_matches('.') {
+        "" => Name::root(),
+        labels => name(&format!("{labels}.")),
+    }
 }
 
 /// Binds a UDP socket on an ephemeral loopback port and answers every query
 /// with `handler(qname, qtype)`, where `qname` is the lowercased ASCII query
 /// name without the trailing root dot. Lets a test script a whole multi-name
 /// scenario (tree walks, redirects, per-name failures) that the fixed
-/// [`MockMode::Zone`] table cannot express. The one server loop behind every
-/// spawner here. Returns the bound port.
-pub(crate) async fn spawn_mock_dns_fn<F>(mut handler: F) -> u16
+/// [`MockMode::Zone`] table cannot express. Every spawner here ends in its
+/// server loop ([`serve_udp`]). Returns the bound port.
+pub(crate) async fn spawn_mock_dns_fn<F>(handler: F) -> u16
 where
     F: FnMut(&str, HickoryRecordType) -> MockReply + Send + 'static,
 {
     let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind mock DNS");
+    serve_udp(socket, handler)
+}
+
+/// Like [`spawn_mock_dns_fn`], but the same port also takes DNS over TCP:
+/// each TCP query is relayed to the UDP server loop and its reply sent back,
+/// so one `handler` scripts both transports (in arrival order — e.g. a
+/// [`MockReply::Truncated`] first reply, then the full answer the client
+/// retries for over TCP). Returns the shared port.
+pub(crate) async fn spawn_mock_dns_fn_with_tcp<F>(handler: F) -> u16
+where
+    F: FnMut(&str, HickoryRecordType) -> MockReply + Send + 'static,
+{
+    // TCP and UDP port spaces are separate, so the UDP socket's ephemeral
+    // port is almost always free for TCP too; retry the pair if it is not.
+    for _ in 0..16 {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind mock DNS");
+        let port = socket.local_addr().expect("mock DNS local addr").port();
+        if let Ok(listener) = TcpListener::bind(("127.0.0.1", port)).await {
+            let port = serve_udp(socket, handler);
+            tokio::spawn(relay_tcp(listener, port));
+            return port;
+        }
+    }
+    panic!("no loopback port free for both UDP and TCP");
+}
+
+/// Accepts DNS-over-TCP connections and relays every length-prefixed query
+/// to the UDP mock on `udp_port`, writing its reply back.
+async fn relay_tcp(listener: TcpListener, udp_port: u16) {
+    while let Ok((stream, _)) = listener.accept().await {
+        tokio::spawn(relay_connection(stream, udp_port));
+    }
+}
+
+/// Relays one TCP connection's queries until the client closes it (or a
+/// query gets no UDP reply — the client's timeout then applies).
+async fn relay_connection(mut stream: TcpStream, udp_port: u16) {
+    let Ok(socket) = UdpSocket::bind("127.0.0.1:0").await else {
+        return;
+    };
+    let mut buf = [0u8; 4096];
+    loop {
+        let Ok(len) = stream.read_u16().await else {
+            return;
+        };
+        let mut query = vec![0u8; usize::from(len)];
+        if stream.read_exact(&mut query).await.is_err()
+            || socket
+                .send_to(&query, ("127.0.0.1", udp_port))
+                .await
+                .is_err()
+        {
+            return;
+        }
+        let Ok(reply_len) = socket.recv(&mut buf).await else {
+            return;
+        };
+        let Ok(prefix) = u16::try_from(reply_len) else {
+            return;
+        };
+        if stream.write_u16(prefix).await.is_err()
+            || stream.write_all(&buf[..reply_len]).await.is_err()
+        {
+            return;
+        }
+    }
+}
+
+/// The UDP server loop behind every spawner: answers each query on `socket`
+/// with `handler(qname, qtype)` until the test runtime shuts down. Returns
+/// the bound port.
+fn serve_udp<F>(socket: UdpSocket, mut handler: F) -> u16
+where
+    F: FnMut(&str, HickoryRecordType) -> MockReply + Send + 'static,
+{
     let port = socket.local_addr().expect("mock DNS local addr").port();
     tokio::spawn(async move {
         let mut buf = [0u8; 4096];
@@ -259,6 +358,36 @@ where
                         response.metadata.response_code = ResponseCode::Refused;
                     }
                     MockReply::NoReply => continue,
+                    MockReply::Delegation { zone, servers } => {
+                        let zone = fq_name(&zone);
+                        for (server, addrs) in servers {
+                            let server = fq_name(&server);
+                            response.add_authority(Record::from_rdata(
+                                zone.clone(),
+                                300,
+                                HickoryRData::NS(wire::NS(server.clone())),
+                            ));
+                            response.add_additionals(addrs.into_iter().map(|ip| {
+                                let glue = match ip {
+                                    IpAddr::V4(v4) => HickoryRData::A(wire::A(v4)),
+                                    IpAddr::V6(v6) => HickoryRData::AAAA(wire::AAAA(v6)),
+                                };
+                                Record::from_rdata(server.clone(), 300, glue)
+                            }));
+                        }
+                    }
+                    MockReply::AuthoritativeNxDomain(zone) => {
+                        response.metadata.authoritative = true;
+                        response.metadata.response_code = ResponseCode::NXDomain;
+                        response.add_authority(Record::from_rdata(
+                            fq_name(zone),
+                            300,
+                            soa_rdata(zone),
+                        ));
+                    }
+                    MockReply::Truncated => {
+                        response.metadata.truncation = true;
+                    }
                 }
             }
             let Ok(bytes) = response.to_vec() else {

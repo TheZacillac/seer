@@ -491,25 +491,13 @@ impl DelegationChecker {
         if ips.is_empty() {
             return Err(format!("{} did not resolve to any address", host));
         }
-        let mut blocked_reason = None;
-        let mut vetted = Vec::new();
-        for ip in ips {
-            // SSRF protection: NS host names come from untrusted DNS data,
-            // so reserved/private targets are refused. The test seam is
-            // `#[cfg(test)]`-only; production always validates.
-            if !self.allow_private() {
-                if let Some(reason) = crate::validation::describe_reserved_ip(&ip) {
-                    blocked_reason.get_or_insert_with(|| {
-                        format!("{} resolves to a blocked address ({})", host, reason)
-                    });
-                    continue;
-                }
-            }
-            vetted.push(ip);
-        }
-        prefer_ipv4(&vetted).ok_or_else(|| {
-            blocked_reason
-                .unwrap_or_else(|| format!("{} did not resolve to a usable address", host))
+        // SSRF protection: NS host names come from untrusted DNS data, so
+        // reserved/private targets are refused. The test seam is
+        // `#[cfg(test)]`-only; production always validates.
+        let (vetted, refused) = partition_reserved(&ips, self.allow_private());
+        prefer_ipv4(&vetted).ok_or_else(|| match refused.first() {
+            Some((_, reason)) => format!("{} resolves to a blocked address ({})", host, reason),
+            None => format!("{} did not resolve to a usable address", host),
         })
     }
 
@@ -615,13 +603,18 @@ fn apply_direct_opts(opts: &mut ResolverOpts, timeout: Duration) {
 }
 
 /// Builds the recursive resolver: Google DNS (UDP+TCP) in production, or a
-/// pinned loopback upstream for the `#[cfg(test)]` seam.
+/// pinned loopback upstream for the `#[cfg(test)]` seam. Shared with the
+/// trace walker (`dns::trace`), which resolves glueless nameservers through
+/// it.
 ///
 /// The `expect` expresses the same invariant as
 /// `dns::resolver::build_default_resolver`: with plain UDP/TCP upstreams the
 /// only fallible step (rustls TLS-context construction for DoT/DoH) never
 /// runs, so construction cannot fail.
-fn build_recursive_resolver(timeout: Duration, upstream: Option<(IpAddr, u16)>) -> TokioResolver {
+pub(crate) fn build_recursive_resolver(
+    timeout: Duration,
+    upstream: Option<(IpAddr, u16)>,
+) -> TokioResolver {
     let mut builder = TokioResolver::builder_with_config(
         google_or_pinned(upstream),
         TokioRuntimeProvider::default(),
@@ -680,7 +673,7 @@ fn classify_net_error(err: NetError, domain: &str) -> DirectNs {
 /// the kernel had no route for the destination's address family. `TimedOut`
 /// never reaches here — `From<io::Error> for NetError` folds it into
 /// `NetError::Timeout` (which stays a lameness signal: packets were sent).
-fn is_local_no_route(err: &std::io::Error) -> bool {
+pub(crate) fn is_local_no_route(err: &std::io::Error) -> bool {
     matches!(
         err.kind(),
         std::io::ErrorKind::NetworkUnreachable | std::io::ErrorKind::HostUnreachable
@@ -702,12 +695,32 @@ fn parent_zone_of(domain: &str) -> String {
 /// vetted address made every direct parent query fail with "network
 /// unreachable" on IPv4-only hosts. IPv6-only deployments still work: v6 is
 /// used whenever no v4 address survives vetting.
-fn prefer_ipv4(vetted: &[IpAddr]) -> Option<IpAddr> {
+pub(crate) fn prefer_ipv4(vetted: &[IpAddr]) -> Option<IpAddr> {
     vetted
         .iter()
         .find(|ip| ip.is_ipv4())
         .or_else(|| vetted.first())
         .copied()
+}
+
+/// SSRF vetting for nameserver addresses, which come from untrusted DNS data
+/// (resolved NS names here, glue in the trace walker): splits `ips` into the
+/// addresses a direct query may be sent to and the refused ones, each with
+/// its [`crate::validation::describe_reserved_ip`] reason. `allow_private`
+/// is the `#[cfg(test)]` seam's flag and is always `false` in production.
+pub(crate) fn partition_reserved(
+    ips: &[IpAddr],
+    allow_private: bool,
+) -> (Vec<IpAddr>, Vec<(IpAddr, &'static str)>) {
+    let mut usable = Vec::new();
+    let mut refused = Vec::new();
+    for &ip in ips {
+        match crate::validation::describe_reserved_ip(&ip) {
+            Some(reason) if !allow_private => refused.push((ip, reason)),
+            _ => usable.push(ip),
+        }
+    }
+    (usable, refused)
 }
 
 /// Normalizes an NS host name for set comparison: lowercase, trailing dot
@@ -844,6 +857,26 @@ mod tests {
         // IPv6-only deployments still get the v6 address.
         assert_eq!(prefer_ipv4(&[v6]), Some(v6));
         assert_eq!(prefer_ipv4(&[]), None);
+    }
+
+    #[test]
+    fn partition_reserved_refuses_reserved_addresses_with_their_reason() {
+        let public: IpAddr = "192.5.6.30".parse().unwrap();
+        let private: IpAddr = "10.0.0.53".parse().unwrap();
+        let loopback: IpAddr = "::1".parse().unwrap();
+        let (usable, refused) = partition_reserved(&[private, public, loopback], false);
+        assert_eq!(usable, vec![public]);
+        assert_eq!(
+            refused,
+            vec![
+                (private, "private network (RFC 1918)"),
+                (loopback, "IPv6 loopback (::1)")
+            ]
+        );
+        // The test seam's flag lets everything through, in order.
+        let (usable, refused) = partition_reserved(&[private, public], true);
+        assert_eq!(usable, vec![private, public]);
+        assert!(refused.is_empty());
     }
 
     #[test]
