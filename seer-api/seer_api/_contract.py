@@ -21,6 +21,10 @@ MAX_CONCURRENCY = 50
 BULK_LIMIT = "10/minute"
 # Bulk SSL/status/propagation, confusables and takeover fan out hardest.
 HEAVY_LIMIT = "5/minute"
+# A DNS trace walks the delegation chain from the root servers, querying each
+# zone's nameservers directly from this host (up to 3 per level) — held to the
+# 20/minute of a single propagation check rather than a lookup's 60/minute.
+TRACE_LIMIT = "20/minute"
 
 # DNS record-type token accepted at the edge; the core parses the name itself.
 RECORD_TYPE_PATTERN = r"^[A-Z0-9]+$"

@@ -68,6 +68,7 @@ def _install_seer_stub() -> None:
         "confusables",
         "dns_compare",
         "dns_follow",
+        "dns_trace",
         "cancel_follow",
         "diff",
         "tld_info",
@@ -103,10 +104,12 @@ def _install_seer_stub() -> None:
 
     # Called at import time by seer_api.mcp.server (to render the record-type
     # schema description), so it must return a real value, not raise.
+    # Mirrors seer-core's `RecordType::ALL_NAMES`, in its order.
     def _stub_record_types():
         return [
-            "A", "AAAA", "CNAME", "MX", "NS", "TXT", "SOA", "PTR",
-            "SRV", "CAA", "NAPTR", "DNSKEY", "DS", "TLSA", "SSHFP", "ANY",
+            "A", "AAAA", "CNAME", "MX", "NS", "TXT", "SOA", "PTR", "SRV", "CAA",
+            "NAPTR", "DNSKEY", "DS", "CDS", "CDNSKEY", "TLSA", "SSHFP", "HTTPS",
+            "SVCB", "ANY",
         ]
 
     stub.record_types = _stub_record_types
@@ -118,6 +121,8 @@ _install_seer_stub()
 
 # These imports must come after _install_seer_stub(): importing seer_api.main
 # pulls in the `seer` module, which must already be stubbed.
+import copy  # noqa: E402
+
 import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
@@ -127,6 +132,75 @@ from seer_api.main import app  # noqa: E402
 @pytest.fixture
 def client():
     return TestClient(app)
+
+
+# What the DNS bindings return, exactly as seer-core pins it
+# (`result_serializes_to_the_documented_shape` for `DnsQueryResult`,
+# `trace_serializes_to_the_documented_shape` for `DnsTrace`). Tests that stub
+# `seer.dig` / `seer.dns_trace` return these, so the routes and tools are
+# exercised with the real result shapes.
+_DIG_RESULT = {
+    "name": "www.seer.test",
+    "record_type": "A",
+    "server": "1.1.1.1",
+    "status": "NOERROR",
+    "flags": ["qr", "rd", "ra"],
+    "answers": [
+        {
+            "name": "www.seer.test",
+            "record_type": "CNAME",
+            "ttl": 300,
+            "data": {"record_type": "CNAME", "value": {"target": "edge.cdn.test."}},
+        },
+        {
+            "name": "edge.cdn.test",
+            "record_type": "A",
+            "ttl": 300,
+            "data": {"record_type": "A", "value": {"address": "192.0.2.7"}},
+        },
+    ],
+    "authority": [],
+    "wildcard": {
+        "probe_name": "seer-probe-3f9a1c2e7b.seer.test",
+        "present": False,
+        "matches_answer": False,
+    },
+    "query_time_ms": 12,
+}
+
+_DNS_TRACE = {
+    "name": "www.example.com",
+    "record_type": "A",
+    "hops": [
+        {
+            "zone": ".",
+            "server": "a.root-servers.net.",
+            "address": "198.41.0.4",
+            "query_time_ms": 21,
+            "status": "NOERROR",
+            "authoritative": False,
+            "referral_zone": "com.",
+            "referral": ["a.gtld-servers.net."],
+            "answers": [],
+            "failed_servers": [],
+        }
+    ],
+    "status": "NXDOMAIN",
+    "answers": [],
+    "error": None,
+}
+
+
+@pytest.fixture
+def dig_result():
+    """A ``seer.dig`` result (seer-core ``DnsQueryResult``): a CNAME chain."""
+    return copy.deepcopy(_DIG_RESULT)
+
+
+@pytest.fixture
+def dns_trace_result():
+    """A ``seer.dns_trace`` result (seer-core ``DnsTrace``)."""
+    return copy.deepcopy(_DNS_TRACE)
 
 
 @pytest.fixture(autouse=True)
