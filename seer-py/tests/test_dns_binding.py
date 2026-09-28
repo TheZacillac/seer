@@ -128,6 +128,21 @@ def test_dns_trace_unknown_record_type_raises_value_error():
         seer.dns_trace("example.com", "BOGUS")
 
 
+def test_dns_trace_docstring_keys_a_finished_walk_on_error():
+    # seer-core keeps a refused upward/sideways referral on the final hop,
+    # and a walk that stops at the hop limit or deadline ends on a hop that
+    # referred onward, so a None referral_zone is no "last hop" marker:
+    # callers must check error.
+    doc = " ".join(seer.dns_trace.__doc__.split())
+    assert "on the last hop" not in doc
+    for phrase in (
+        "None and empty when it did not refer onward",
+        "the referral it refused",
+        "Check error, not the last hop's referral_zone",
+    ):
+        assert phrase in doc, phrase
+
+
 # --- live ---------------------------------------------------------------------
 
 

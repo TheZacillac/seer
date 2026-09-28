@@ -318,13 +318,17 @@ fn dig<'py>(
 /// - name, record_type: the normalized name and the type traced
 /// - hops: one per delegation level, root first; each has zone, server,
 ///   address, query_time_ms, status, authoritative (the AA flag),
-///   referral_zone and referral (the NS names delegated to; None and empty
-///   on the last hop), answers and failed_servers (servers of that zone
-///   that did not give a usable response, with the reason)
+///   referral_zone and referral (the zone and NS names the server delegated
+///   to; None and empty when it did not refer onward), answers and
+///   failed_servers (servers of that zone that did not give a usable
+///   response, with the reason)
 /// - status, answers: the last hop's
 /// - error: why the walk stopped before a final response (no server of a
 ///   zone responded, an upward or sideways referral, too many levels, or
-///   the walk ran out of its six DNS timeouts), or None
+///   the walk ran out of its six DNS timeouts), or None. A walk that
+///   stopped early can end on a hop that still has a referral_zone: the
+///   referral it refused, or the one it could not follow. Check error, not
+///   the last hop's referral_zone, to tell whether the walk finished.
 ///
 /// record_type is any single type; ANY raises ValueError, since it is a
 /// fan-out over several queries. Private or reserved server addresses are
