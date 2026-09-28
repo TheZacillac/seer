@@ -39,7 +39,8 @@ A high-performance, multi-interface domain utility suite — query WHOIS, RDAP, 
 <td width="50%">
 
 **🌐 DNS & Propagation**
-- **DNS Resolution** — 16 record types with custom nameservers
+- **DNS Resolution** — dig-style queries over 20 record types: status, CNAME chain, wildcard detection
+- **DNS Trace** — follow the delegation down from the root servers (`+trace`)
 - **Encrypted DNS** — DoT (`tls://`) and DoH (`https://`) transports
 - **DNS Propagation** — 30 servers across 6 global regions
 - **DNS Monitoring** — track record changes over time
@@ -176,13 +177,13 @@ seer tui example.com      # look up a domain on launch
 The **lens** sidebar covers every Seer capability, grouped, each pulling live data from the same `seer-core` engine as the CLI with full in-pane controls:
 
 - **LOOKUP** — Overview · WHOIS · RDAP (Domain · IP · ASN) · Reverse DNS · Availability · TLD Info
-- **DNS** — Records (+ custom nameserver) · DNSSEC · Compare (two resolvers) · Propagation · Follow (live monitor)
+- **DNS** — Records (+ custom nameserver) · DNSSEC · Compare (two resolvers) · Trace (from the root servers) · Propagation · Follow (live monitor)
 - **SECURITY** — SSL / Cert · Status · Subdomains · HTTP Headers · Takeover
 - **POWER** — Diff · Bulk (streaming + CSV export) · Watchlist · History
 
 **Keys:** `j`/`k` move · `1`–`9` jump to a lens · `Tab` focus nav⇄pane · `[` `]` sub-tabs · `r` raw output (json/yaml/markdown) · `y` copy · `/` look up a domain · `:` command · `?` help · `:q` quit. In-pane: switchers (TLD, nameserver, Compare resolvers, Bulk op) and editable fields (Diff's 2nd domain, Follow interval/count, Bulk file path).
 
-**Commands (`:`):** `lookup`, `whois`, `rdap <domain|ip|AS####>`, `dig`, `ssl`, `status`, `headers`, `takeover`, `reverse <ip>`, `tld <.tld>`, `compare <domain> <nsA> <nsB>`, `diff <a> <b>`, `set output <human|json|yaml|markdown>`, `theme <frappe|latte>`, `copy`, `q`.
+**Commands (`:`):** `lookup`, `whois`, `rdap <domain|ip|AS####>`, `dig [@server] <name> [type] [+trace]`, `ssl`, `status`, `headers`, `takeover`, `reverse <ip>`, `tld <.tld>`, `compare <domain> <nsA> <nsB>`, `diff <a> <b>`, `set output <human|json|yaml|markdown>`, `theme <frappe|latte>`, `copy`, `q`.
 
 The startup theme comes from `[tui] theme` in `~/.seer/config.toml` (`"frappe"` — the default — or `"latte"`; unknown names fall back to Frappé). Switch live with `:theme latte`.
 
@@ -201,12 +202,17 @@ seer rdap example.com           # Domain
 seer rdap 8.8.8.8               # IP address
 seer rdap AS15169               # ASN
 
-# DNS queries
+# DNS queries (dig-style: arguments in any order)
 seer dig example.com             # A records (default)
 seer dig example.com MX          # Specific record type
-seer dig example.com A -s 8.8.8.8                          # Custom nameserver (UDP)
-seer dig example.com A -s tls://1.1.1.1                    # DNS over TLS
-seer dig example.com A -s https://cloudflare-dns.com/dns-query  # DNS over HTTPS
+seer dig example.com A AAAA MX   # Several types, queried concurrently
+seer dig example.com MX +short   # Values only, one per line (or --short)
+seer dig example.com ANY         # Common types, fanned out ('*' works too)
+seer dig -x 8.8.8.8              # Reverse lookup (PTR)
+seer dig www.example.com +trace  # Delegation walk from the root servers (or --trace)
+seer dig @8.8.8.8 example.com    # Custom nameserver (UDP), same as -s 8.8.8.8
+seer dig @tls://1.1.1.1 example.com                           # DNS over TLS
+seer dig example.com -s https://cloudflare-dns.com/dns-query  # DNS over HTTPS
 seer dig '*.example.com'         # Wildcard record (quote it so the shell doesn't glob)
 
 # DNS propagation & monitoring
@@ -273,6 +279,7 @@ seer doctor
 # Scriptable field extraction
 seer --quiet --fields registrar lookup example.com
 seer --quiet --fields certificate.issuer status example.com
+seer --quiet --fields status,answers.name dig www.example.com
 
 # Shell completions & man pages
 seer completions bash >> ~/.bashrc
@@ -281,6 +288,60 @@ seer mangen ./man                 # Write seer.1 + one page per subcommand
 ```
 
 `seer watch --webhook` (or `webhook_url` under `[watch]` in `~/.seer/config.toml` — the flag wins) POSTs the check-all report as JSON. Delivery is best-effort: a failed POST prints a stderr warning and never changes the exit code, and the URL passes the same SSRF guard as every other outbound request.
+
+### DNS Queries
+
+`seer dig` reports a query the way dig does: the response status, the header
+flags, and the answer with any CNAME chain first, every record under its real
+owner name.
+
+```
+$ seer dig www.github.com
+
+DNS A Records: www.github.com
+─────────────────────────────
+  status: NOERROR  flags: qr rd ra  server: default  time: 23 ms
+
+  Answer:
+    www.github.com  2944  CNAME  github.com.
+    github.com        60  A      140.82.114.3
+
+Note: DNS responses are not DNSSEC-validated
+```
+
+- **NXDOMAIN vs NODATA.** "Name does not exist (NXDOMAIN)" and "No AAAA
+  records (NODATA — the name exists)" are told apart, each shown with the
+  zone's SOA when the server sends it. SERVFAIL, REFUSED and other response
+  codes are reported as the status, not as errors.
+- **Wildcards.** For a name below its registrable domain (`www.example.com`,
+  not `example.com`), a random sibling (`seer-probe-….example.com`) is queried
+  alongside. When it resolves too, a note says a wildcard answers there and
+  whether this answer matches it (likely wildcard-synthesized) or differs.
+- **Record types.** `HTTPS` and `SVCB` (priority, target and parameters such
+  as `alpn`, `ipv4hint` and `ech`) and the DNSSEC key-rollover records `CDS`
+  and `CDNSKEY` are supported — see [DNS Record Types](#-dns-record-types).
+  `ANY` queries A, AAAA, CNAME, MX, NS, TXT, SOA, CAA, HTTPS, DS and DNSKEY
+  concurrently and merges the answers, since servers may answer a real `ANY`
+  query minimally (RFC 8482).
+- **`+short` / `--short`** prints only the values, one per line (CNAME targets
+  first), and nothing when there is no answer. It ignores `--format` and
+  can't be combined with `-q`/`--fields`.
+- **`+trace` / `--trace`** asks one server of each zone directly, from the
+  root servers down, and shows one hop per delegation level: the server and
+  address, the status, the referral or the answer, and any servers that
+  failed. It takes one record type and no nameserver, and reports a CNAME
+  answer without following it. Every server address is checked against
+  private and reserved ranges before it is queried.
+- **Scripting.** `--format json` / `yaml` prints the result object (`name`,
+  `record_type`, `server`, `status`, `flags`, `answers`, `authority`,
+  `wildcard`, `query_time_ms`), or an array of them for several types, and
+  `--quiet --fields` picks values from it. When some of several types fail,
+  the rest still print, each failure is reported on stderr, and the command
+  exits `1`.
+
+The REPL's `dig` takes the same arguments. `seer reverse <ip>` is unchanged:
+it returns just the PTR records (a JSON list), where `seer dig -x <ip>`
+returns the full result.
 
 ### Output Formats
 
@@ -316,6 +377,12 @@ Check commands exit `1` on a negative result even when the command itself ran fi
 | `seer watch` | Issues at or above the `--fail-on` threshold: `critical` (default) fails only on critical issues, `warning` fails on warnings too. `add`/`remove`/`list` exit `0` on success |
 | `seer bulk` | **Every** domain in the batch failed — partial failures exit `0`, since per-row status is already in the CSV/JSON output |
 
+`seer dig` is not a check command: as with dig, any answer the server gave
+exits `0` — NXDOMAIN, NODATA, SERVFAIL and REFUSED included, and a `+trace`
+that stopped early reports where. It exits `1` on invalid arguments, a
+timeout or other failure to get an answer, or when any of several record
+types failed.
+
 All other commands exit `0` on success and `1` on error. With `--format json`, `yaml`, or `markdown`, errors are written to stderr in that format (e.g. `{"error": "..."}`) instead of colored prose.
 
 ### Interactive REPL
@@ -326,6 +393,7 @@ Launch by running `seer` with no arguments:
 $ seer
 seer> lookup example.com
 seer> dig github.com MX
+seer> dig @1.1.1.1 www.github.com A AAAA +short
 seer> status cloudflare.com
 seer> delegation example.com
 seer> doctor
@@ -354,12 +422,14 @@ rdap  = seer.rdap_ip("8.8.8.8")
 rdap  = seer.rdap_asn(15169)
 
 # DNS
-records     = seer.dig("example.com", record_type="MX", nameserver="tls://1.1.1.1")
+answer      = seer.dig("example.com", record_type="MX", nameserver="tls://1.1.1.1")
+records     = answer["answers"]                  # Also: status, flags, authority, wildcard
+trace       = seer.dns_trace("www.example.com")  # Hops from the root servers down (dig +trace)
 propagation = seer.propagation("example.com", record_type="A")
 delegation  = seer.delegation("example.com")     # Parent vs. zone NS + lameness
 follow      = seer.dns_follow("example.com", "A", iterations=3, interval_minutes=1.0)
 seer.cancel_follow()                             # Stop a running dns_follow from another thread
-types       = seer.record_types()                # The 16 supported record types
+types       = seer.record_types()                # The 20 supported record types
 
 # Domain health & SSL
 status = seer.status("example.com")
@@ -445,6 +515,10 @@ async fn main() -> seer_core::Result<()> {
         println!("{}: {}", record.record_type, record.data);
     }
 
+    // The whole response, as dig reports it: status, flags, CNAME chain, ...
+    let answer = resolver.query("www.example.com", RecordType::A, None).await?;
+    println!("{} with {} answers", answer.status, answer.answers.len());
+
     // Domain status check
     let client = StatusClient::new();
     let status = client.check("example.com").await?;
@@ -465,11 +539,12 @@ seer-api   # Starts on http://127.0.0.1:8000 (loopback-only by default)
 ```
 
 Each lookup is a `GET` endpoint (`/lookup/{domain}`, `/dns/{domain}/{record_type}`,
-`/ssl/{domain}`, `/takeover/{domain}`, …). `lookup`, `whois`, `dns`,
-`propagation`, `status`, `ssl`, `availability`, and `info` also accept a
-`POST …/bulk` domain list, and all but `availability` and `info` can stream
-bulk results as Server-Sent Events from `…/bulk/stream`. The full endpoint
-table is in [seer-api/README.md](seer-api/README.md#endpoints).
+`/dns/trace/{domain}`, `/ssl/{domain}`, `/takeover/{domain}`, …). `lookup`,
+`whois`, `dns`, `propagation`, `status`, `ssl`, `availability`, and `info`
+also accept a `POST …/bulk` domain list, and all but `availability` and
+`info` can stream bulk results as Server-Sent Events from `…/bulk/stream`.
+The full endpoint table is in
+[seer-api/README.md](seer-api/README.md#endpoints).
 
 **Secure by default:** the server binds loopback only, refuses a non-loopback
 `SEER_HOST` without `SEER_API_KEY`, serves `/docs` only when
@@ -481,6 +556,7 @@ rate-limit store. See
 # Examples
 curl http://localhost:8000/lookup/example.com
 curl http://localhost:8000/dns/example.com/MX
+curl "http://localhost:8000/dns/trace/www.example.com?record_type=AAAA"
 curl -X POST http://localhost:8000/lookup/bulk \
   -H "Content-Type: application/json" \
   -d '{"domains": ["example.com", "google.com"]}'
@@ -520,9 +596,9 @@ eval "$(seer generate-key --export)"
 SEER_API_KEY=$KEY SEER_HOST=0.0.0.0 seer-api
 ```
 
-**30 tools:** one per lookup (`seer_lookup`, `seer_dig`, `seer_ssl`,
-`seer_takeover`, …) plus bulk variants (`seer_bulk_status`, …). The full tool
-list and the Claude Desktop configuration are in
+**31 tools:** one per lookup (`seer_lookup`, `seer_dig`, `seer_dns_trace`,
+`seer_ssl`, `seer_takeover`, …) plus bulk variants (`seer_bulk_status`, …).
+The full tool list and the Claude Desktop configuration are in
 [seer-api/README.md](seer-api/README.md#available-tools).
 
 ---
@@ -536,9 +612,11 @@ list and the Claude Desktop configuration are in
 | `MX` | Mail exchange | | `NAPTR` | Naming authority pointer |
 | `TXT` | Text records | | `DNSKEY` | DNSSEC public key |
 | `NS` | Nameserver | | `DS` | Delegation signer |
-| `SOA` | Start of authority | | `SSHFP` | SSH key fingerprint |
-| `CNAME` | Canonical name | | `TLSA` | DANE TLS association |
-| `CAA` | CA authorization | | `ANY` | All records |
+| `SOA` | Start of authority | | `CDS` | Child DS (DNSSEC key rollover) |
+| `CNAME` | Canonical name | | `CDNSKEY` | Child DNSKEY (DNSSEC key rollover) |
+| `CAA` | CA authorization | | `SSHFP` | SSH key fingerprint |
+| `HTTPS` | HTTPS service binding (ALPN, address hints, ECH) | | `TLSA` | DANE TLS association |
+| `SVCB` | General service binding | | `ANY` | A, AAAA, CNAME, MX, NS, TXT, SOA, CAA, HTTPS, DS and DNSKEY, queried concurrently |
 
 ---
 
