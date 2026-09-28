@@ -14,8 +14,13 @@
 use std::net::Ipv4Addr;
 use std::time::Duration;
 
+use hickory_resolver::proto::dnssec::rdata::{DNSSECRData, CDNSKEY, CDS, DNSKEY};
+use hickory_resolver::proto::dnssec::{Algorithm, DigestType, PublicKeyBuf};
 use hickory_resolver::proto::op::{Message, OpCode, ResponseCode};
-use hickory_resolver::proto::rr::rdata::{self as wire, sshfp, tlsa, CAA};
+use hickory_resolver::proto::rr::rdata::svcb::{
+    Alpn, EchConfigList, IpHint, Mandatory, SvcParamKey, SvcParamValue, Unknown, SVCB,
+};
+use hickory_resolver::proto::rr::rdata::{self as wire, sshfp, tlsa, CAA, HTTPS};
 use hickory_resolver::proto::rr::{
     Name, RData as HickoryRData, Record, RecordType as HickoryRecordType,
 };
@@ -122,6 +127,103 @@ fn zone_answers(qname: &str, qtype: HickoryRecordType) -> Vec<HickoryRData> {
             "1.1.1.1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.7.4.0.0.7.4.6.0.6.2.ip6.arpa",
             HickoryRecordType::PTR,
         ) => vec![HickoryRData::PTR(wire::PTR(name("one.one.one.one.")))],
+        // ServiceMode with every registered SvcParam kind plus a private-use
+        // key, in the strictly increasing key order the wire requires.
+        ("seer.test", HickoryRecordType::HTTPS) => {
+            vec![HickoryRData::HTTPS(HTTPS(SVCB::new(
+                1,
+                Name::root(),
+                vec![
+                    (
+                        SvcParamKey::Alpn,
+                        SvcParamValue::Alpn(Alpn(vec!["h3".to_string(), "h2".to_string()])),
+                    ),
+                    (SvcParamKey::Port, SvcParamValue::Port(8443)),
+                    (
+                        SvcParamKey::Ipv4Hint,
+                        SvcParamValue::Ipv4Hint(IpHint(vec![
+                            wire::A::new(192, 0, 2, 1),
+                            wire::A::new(192, 0, 2, 2),
+                        ])),
+                    ),
+                    (
+                        SvcParamKey::EchConfigList,
+                        SvcParamValue::EchConfigList(EchConfigList(vec![0x00, 0x01, 0xFE])),
+                    ),
+                    (
+                        SvcParamKey::Ipv6Hint,
+                        SvcParamValue::Ipv6Hint(IpHint(vec![wire::AAAA::new(
+                            0x2001, 0xdb8, 0, 0, 0, 0, 0, 1,
+                        )])),
+                    ),
+                    (
+                        SvcParamKey::Key(65333),
+                        SvcParamValue::Unknown(Unknown(b"ex 1".to_vec())),
+                    ),
+                ],
+            )))]
+        }
+        // AliasMode: priority 0, the alias target, no params.
+        ("alias.seer.test", HickoryRecordType::HTTPS) => vec![HickoryRData::HTTPS(HTTPS(
+            SVCB::new(0, name("pool.seer.test."), vec![]),
+        ))],
+        ("_8443._foo.seer.test", HickoryRecordType::SVCB) => {
+            vec![HickoryRData::SVCB(SVCB::new(
+                2,
+                name("svc.seer.test."),
+                vec![
+                    (
+                        SvcParamKey::Mandatory,
+                        SvcParamValue::Mandatory(Mandatory(vec![
+                            SvcParamKey::Alpn,
+                            SvcParamKey::Port,
+                        ])),
+                    ),
+                    (
+                        SvcParamKey::Alpn,
+                        SvcParamValue::Alpn(Alpn(vec!["foo".to_string()])),
+                    ),
+                    (SvcParamKey::NoDefaultAlpn, SvcParamValue::NoDefaultAlpn),
+                    (SvcParamKey::Port, SvcParamValue::Port(8443)),
+                ],
+            ))]
+        }
+        ("seer.test", HickoryRecordType::DNSKEY) => {
+            vec![HickoryRData::DNSSEC(DNSSECRData::DNSKEY(DNSKEY::new(
+                true,
+                true,
+                false,
+                PublicKeyBuf::new(vec![7u8; 32], Algorithm::ED25519),
+            )))]
+        }
+        // An update request plus the RFC 8078 delete request (`0 0 0 00`).
+        ("seer.test", HickoryRecordType::CDS) => vec![
+            HickoryRData::DNSSEC(DNSSECRData::CDS(CDS::new(
+                2371,
+                Some(Algorithm::ED25519),
+                DigestType::SHA256,
+                vec![0xAB, 0xCD, 0xEF],
+            ))),
+            HickoryRData::DNSSEC(DNSSECRData::CDS(CDS::new(
+                0,
+                None,
+                DigestType::from(0),
+                vec![0x00],
+            ))),
+        ],
+        // An update request plus the RFC 8078 delete request (`0 3 0 AA==`).
+        ("seer.test", HickoryRecordType::CDNSKEY) => vec![
+            HickoryRData::DNSSEC(DNSSECRData::CDNSKEY(CDNSKEY::with_flags(
+                257,
+                Some(Algorithm::ED25519),
+                vec![7u8; 32],
+            ))),
+            HickoryRData::DNSSEC(DNSSECRData::CDNSKEY(CDNSKEY::with_flags(
+                0,
+                None,
+                vec![0x00],
+            ))),
+        ],
         _ => vec![],
     }
 }
@@ -181,10 +283,27 @@ pub(crate) fn soa_rdata(zone: &str) -> HickoryRData {
     ))
 }
 
+/// A record owned by `owner` (a fully-qualified name, trailing dot
+/// included), for [`MockReply::Records`] answers that must not be owned by
+/// the query name — a CNAME chain's hops, the records at its target.
+pub(crate) fn record(owner: &str, ttl: u32, rdata: HickoryRData) -> Record {
+    Record::from_rdata(name(owner), ttl, rdata)
+}
+
+/// The SOA record of `zone`, owned by the zone apex (negative answers'
+/// AUTHORITY section).
+fn zone_soa(zone: &str) -> Record {
+    Record::from_rdata(name(&format!("{zone}.")), 300, soa_rdata(zone))
+}
+
 /// A scripted reply for [`spawn_mock_dns_fn`].
 pub(crate) enum MockReply {
     /// NOERROR with these answers, each owned by the query name.
     Answer(Vec<HickoryRData>),
+    /// NOERROR with these complete records in ANSWER, in this order, under
+    /// their own owner names (see [`record`]) — e.g. a CNAME chain followed
+    /// by the records at its target, as a recursive resolver relays it.
+    Records(Vec<Record>),
     /// Like [`MockReply::Answer`], with the AA (authoritative) bit set.
     AuthoritativeAnswer(Vec<HickoryRData>),
     /// NOERROR, empty ANSWER, these (NS) records for the query name in
@@ -197,6 +316,11 @@ pub(crate) enum MockReply {
     NoDataWithSoa(&'static str),
     /// NXDOMAIN.
     NxDomain,
+    /// NXDOMAIN whose AUTHORITY section carries the SOA of the named zone —
+    /// the negative answer a recursive resolver relays (RFC 2308).
+    NxDomainWithSoa(&'static str),
+    /// An empty response with this response code (NOTIMP, FORMERR, …).
+    Rcode(ResponseCode),
     /// SERVFAIL — e.g. a validating upstream rejecting a broken DNSSEC chain.
     ServFail,
     /// REFUSED.
@@ -234,6 +358,9 @@ where
                     MockReply::Answer(answers) => {
                         response.add_answers(answers.into_iter().map(owned));
                     }
+                    MockReply::Records(records) => {
+                        response.add_answers(records);
+                    }
                     MockReply::AuthoritativeAnswer(answers) => {
                         response.metadata.authoritative = true;
                         response.add_answers(answers.into_iter().map(owned));
@@ -243,14 +370,17 @@ where
                     }
                     MockReply::NoData => {}
                     MockReply::NoDataWithSoa(zone) => {
-                        response.add_authority(Record::from_rdata(
-                            name(&format!("{zone}.")),
-                            300,
-                            soa_rdata(zone),
-                        ));
+                        response.add_authority(zone_soa(zone));
                     }
                     MockReply::NxDomain => {
                         response.metadata.response_code = ResponseCode::NXDomain;
+                    }
+                    MockReply::NxDomainWithSoa(zone) => {
+                        response.metadata.response_code = ResponseCode::NXDomain;
+                        response.add_authority(zone_soa(zone));
+                    }
+                    MockReply::Rcode(code) => {
+                        response.metadata.response_code = code;
                     }
                     MockReply::ServFail => {
                         response.metadata.response_code = ResponseCode::ServFail;

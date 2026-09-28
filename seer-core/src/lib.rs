@@ -67,9 +67,10 @@ pub use retry::{NetworkRetryClassifier, RetryClassifier, RetryExecutor, RetryPol
 pub use validation::normalize_domain;
 
 pub use dns::{
-    AuthenticationTier, DnsComparator, DnsComparison, DnsFollower, DnsRecord, DnsResolver,
-    DnsStatus, DnssecChecker, DnssecReport, FollowConfig, FollowIteration, FollowResult,
-    PropagationResult, RecordType, RrsigInfo, MAX_FOLLOW_INTERVAL_SECS, MAX_FOLLOW_ITERATIONS,
+    AuthenticationTier, DnsComparator, DnsComparison, DnsFollower, DnsQueryResult, DnsRecord,
+    DnsResolver, DnsStatus, DnssecChecker, DnssecReport, FollowConfig, FollowIteration,
+    FollowResult, PropagationResult, RecordType, RrsigInfo, WildcardProbe,
+    MAX_FOLLOW_INTERVAL_SECS, MAX_FOLLOW_ITERATIONS,
 };
 pub use lookup::{LookupProgressCallback, LookupResult, SmartLookup};
 pub use rdap::{RdapClient, RdapResponse};

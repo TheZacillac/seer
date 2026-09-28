@@ -1,9 +1,12 @@
 //! DNS resolution and analysis over hickory-resolver.
 //!
-//! - [`DnsResolver`]: the 16 [`RecordType`]s, against Google Public DNS by
+//! - [`DnsResolver`]: the 20 [`RecordType`]s, against Google Public DNS by
 //!   default or a custom nameserver over UDP, DoT (`tls://`) or DoH
 //!   (`https://`) — see [`NameserverSpec`]. A hostname nameserver's resolved
-//!   addresses are tried IPv4 first.
+//!   addresses are tried IPv4 first. [`DnsResolver::resolve`] returns the
+//!   records of the requested type; [`DnsResolver::query`] returns the whole
+//!   response as dig reports it ([`DnsQueryResult`]: status, flags, CNAME
+//!   chain under real owner names, negative-answer SOA, wildcard probe).
 //! - [`PropagationChecker`]: fans one query out to 30 public resolvers across
 //!   6 regions and reports consensus and inconsistencies.
 //! - [`DnsComparator`] (two nameservers side by side), [`DnsFollower`] (live
@@ -37,8 +40,8 @@ pub use propagation::{
     ConsensusValue, DnsServer, Inconsistency, NameserverDetails, NameserverIpInconsistency,
     PropagationChecker, PropagationResult, UnreachableServer,
 };
-pub use query::DnsStatus;
-pub use records::{DnsRecord, RecordData, RecordType};
+pub use query::{DnsQueryResult, DnsStatus, WildcardProbe};
+pub use records::{DnsRecord, RecordData, RecordType, SvcParam};
 pub use resolver::{DnsPresence, DnsResolver};
 // Crate-internal: shared with `net.rs` so the SSRF fallback resolver and the
 // main resolver cannot drift apart on option settings.
