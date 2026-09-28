@@ -88,8 +88,14 @@ async def dns_lookup(
     """
     Query DNS for a domain, reporting the response the way ``dig`` does.
 
-    NXDOMAIN, NODATA (NOERROR with no answers), SERVFAIL and REFUSED are
-    results with that ``status``, not errors.
+    NXDOMAIN, NODATA (NOERROR without records of the type), SERVFAIL and
+    REFUSED are results with that ``status``, not errors. Behind a CNAME
+    chain in ``answers``, NXDOMAIN or NODATA is about the chain's last
+    target (NXDOMAIN there is a dangling CNAME), so a negative answer's
+    ``answers`` need not be empty. NOERROR with no answers, no ``aa`` flag
+    and only NS records (no SOA) in ``authority`` is a referral from a
+    server that is not authoritative for the name and does not recurse: it
+    says nothing about whether the name exists.
 
     Args:
         domain: Domain name to query
@@ -98,7 +104,8 @@ async def dns_lookup(
 
     Returns:
         The query result: status, header flags, answers (CNAME chain first,
-        each record under its owner name), authority, wildcard probe
+        each record under its owner name), authority (the AUTHORITY section
+        as the server sent it), wildcard probe
     """
     # Guard the nameserver (it's the actual connect target) but NOT the
     # queried domain — the domain is a DNS question, not a destination. The

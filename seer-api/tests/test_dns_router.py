@@ -63,6 +63,19 @@ def test_dns_lookup_negative_status_is_a_200_result(client, monkeypatch, dig_res
     assert resp.json()["status"] == status
 
 
+def test_dns_lookup_description_places_nodata_behind_a_cname(client):
+    # FastAPI publishes the docstring as the endpoint's OpenAPI description.
+    # Regression: it defined NODATA as "NOERROR with no answers", but a NODATA
+    # answer behind a CNAME keeps its chain in `answers`, so a client testing
+    # `answers == []` read it as a positive answer.
+    operation = client.app.openapi()["paths"]["/dns/{domain}/{record_type}"]["get"]
+    description = " ".join(operation["description"].split())
+    assert "NODATA (NOERROR with no answers)" not in description
+    assert "NODATA (NOERROR without records of the type)" in description
+    for term in ("CNAME chain", "last target", "referral", "as the server sent it"):
+        assert term in description, f"description should mention {term!r}"
+
+
 # ---------------------------------------------------------------------------
 # GET /dns/trace/{domain}
 # ---------------------------------------------------------------------------

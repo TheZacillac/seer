@@ -3,16 +3,18 @@
 //! [`DnsResolver::query`](crate::dns::DnsResolver::query) returns a
 //! [`DnsQueryResult`]: the response code, the header flags, the ANSWER
 //! section with every record under its real owner name (so a CNAME chain
-//! reads as it does in dig), the AUTHORITY records of a negative answer, and
-//! a [`WildcardProbe`] telling whether the zone synthesizes answers for
+//! reads as it does in dig), the AUTHORITY section as the server sent it,
+//! and a [`WildcardProbe`] telling whether the zone synthesizes answers for
 //! names that do not exist.
 //!
 //! [`DnsStatus`] is the response code in dig's vocabulary (`NOERROR`,
 //! `NXDOMAIN`, `SERVFAIL`, …), for a query result and for every hop of a
 //! [`DnsTrace`](crate::dns::DnsTrace). It is what separates "the name does
 //! not exist" (NXDOMAIN) from "the name exists but has no records of this
-//! type" (NOERROR with an empty answer, i.e. NODATA) — a distinction the
-//! record-list API ([`crate::dns::DnsResolver::resolve`]) folds away. A
+//! type" (NOERROR without records of the type, i.e. NODATA:
+//! [`DnsQueryResult::is_nodata`]) — a distinction the record-list API
+//! ([`crate::dns::DnsResolver::resolve`]) folds away. Behind a CNAME chain
+//! in the ANSWER section, either one is about the chain's last target. A
 //! referral (NOERROR with no answer, only the NS records of a zone below)
 //! is neither: see [`DnsQueryResult::referral_zone`].
 //!
@@ -57,9 +59,13 @@ use crate::error::{Result, SeerError};
 /// `RCODE<n>` for an unassigned code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DnsStatus {
-    /// `NOERROR`: the query succeeded. With no answers this is NODATA.
+    /// `NOERROR`: the query succeeded. Without records of the queried type
+    /// it is NODATA ([`DnsQueryResult::is_nodata`]) — behind a CNAME chain,
+    /// about the chain's last target — unless it is a referral
+    /// ([`DnsQueryResult::referral_zone`]).
     NoError,
-    /// `NXDOMAIN`: the name does not exist.
+    /// `NXDOMAIN`: the name does not exist — behind a CNAME chain, the
+    /// chain's last target (a dangling CNAME).
     NxDomain,
     /// `SERVFAIL`: the server could not answer (often a DNSSEC or upstream
     /// failure).
@@ -227,10 +233,13 @@ pub struct DnsQueryResult {
     /// NODATA that the target has no records of the type — the queried name
     /// exists, since it owns the first CNAME.
     pub answers: Vec<DnsRecord>,
-    /// The AUTHORITY section: for a negative answer the SOA of the zone that
-    /// gave it, when the server sent one; for a referral the NS records of
-    /// the zone it refers to ([`referral_zone`](Self::referral_zone)). An
-    /// ANY answer with records carries none (see [`answers`](Self::answers)).
+    /// The AUTHORITY section as the server sent it: for a negative answer
+    /// the SOA of the zone that gave it, when the server sent one; for a
+    /// referral the NS records of the zone it refers to
+    /// ([`referral_zone`](Self::referral_zone)); beside an answer, whatever
+    /// the server added (an authoritative server may list its zone's NS
+    /// records). An ANY answer with records carries none (see
+    /// [`answers`](Self::answers)).
     pub authority: Vec<DnsRecord>,
     /// Wildcard probe outcome; None when the probe was not run or did not
     /// complete.
