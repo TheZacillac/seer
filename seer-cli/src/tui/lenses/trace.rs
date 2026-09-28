@@ -180,8 +180,7 @@ fn outcome_lines(theme: &Theme, trace: &DnsTrace, width: u16) -> Vec<Line<'stati
         lines.extend(styled(wrap(&text, width), theme.red));
         return lines;
     }
-    let nodata = trace.answers.is_empty();
-    if let Some(verdict) = wording::verdict(trace.status, trace.record_type, nodata) {
+    if let Some(verdict) = wording::trace_verdict(trace, sanitize_line) {
         lines.extend(styled(
             wrap(&verdict, width),
             verdict_color(theme, trace.status),
@@ -295,5 +294,23 @@ mod tests {
             ),
             "{text}"
         );
+    }
+
+    #[test]
+    fn nxdomain_beside_a_cname_names_the_missing_target() {
+        // A dangling in-zone CNAME: the server followed it and answered
+        // NXDOMAIN beside it, so www exists and there is nothing to trace.
+        let mut dangling = fixtures::trace(
+            vec![fixtures::cname("www.seer.test", "gone.seer.test.")],
+            None,
+        );
+        dangling.status = DnsStatus::NxDomain;
+        let text = draw(dangling, None);
+        assert!(
+            text.contains("The CNAME target gone.seer.test. does not exist (NXDOMAIN)"),
+            "{text}"
+        );
+        assert!(!text.contains("Name does not exist"), "{text}");
+        assert!(!text.contains("trace does not follow"), "{text}");
     }
 }

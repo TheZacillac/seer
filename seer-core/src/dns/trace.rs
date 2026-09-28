@@ -203,7 +203,10 @@ pub struct DnsTrace {
     /// The final status: the last hop's response code.
     pub status: DnsStatus,
     /// The final ANSWER section (the last hop's), every record under its real
-    /// owner name. A CNAME answer is reported as-is, not chased.
+    /// owner name. A CNAME answer is reported as-is, not chased. The server
+    /// may have followed an in-zone chain itself, though: beside NXDOMAIN
+    /// the chain leads to the name that does not exist, since the response
+    /// code is about the chain's last name (RFC 6604 §2).
     pub answers: Vec<DnsRecord>,
     /// Why the walk stopped before a final response, if it did: every server
     /// of a zone failed, a server referred upward or sideways, the chain was

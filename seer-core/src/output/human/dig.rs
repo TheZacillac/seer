@@ -107,8 +107,7 @@ impl HumanFormatter {
         rows.kv("Result", self.dns_status(trace.status));
         rows.extend(self.record_rows("    ", trace.answers.iter().map(|r| (r, true))));
         if trace.error.is_none() {
-            let nodata = trace.answers.is_empty();
-            if let Some(verdict) = wording::verdict(trace.status, trace.record_type, nodata) {
+            if let Some(verdict) = wording::trace_verdict(trace, sanitize_line) {
                 let verdict = self.outcome(trace.status, &verdict);
                 rows.push(format!("    {verdict}"));
             }
@@ -416,6 +415,34 @@ mod tests {
             !out.contains("NODATA"),
             "a CNAME answer is not NODATA: {out}"
         );
+    }
+
+    #[test]
+    fn trace_nxdomain_beside_a_cname_names_the_missing_target() {
+        // A dangling in-zone CNAME: the authoritative server followed it
+        // and answered NXDOMAIN beside it (RFC 6604 §2). The queried name
+        // owns the CNAME, so it exists; the target does not, and the server
+        // has already looked it up.
+        let cname = record(
+            "www.seer.test",
+            300,
+            RecordData::CNAME {
+                target: "gone.seer.test.".to_string(),
+            },
+        );
+        let mut trace = answered_trace(vec![cname]);
+        trace.status = DnsStatus::NxDomain;
+        trace.hops[0].status = DnsStatus::NxDomain;
+        let out = formatter().format_dns_trace(&trace);
+        assert!(
+            out.contains(
+                "\n    www.seer.test  300  CNAME  gone.seer.test.\n    \
+                 The CNAME target gone.seer.test. does not exist (NXDOMAIN)\n"
+            ),
+            "{out}"
+        );
+        assert!(!out.contains("Name does not exist"), "{out}");
+        assert!(!out.contains("trace does not follow"), "{out}");
     }
 
     #[test]

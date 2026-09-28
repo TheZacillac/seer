@@ -1314,6 +1314,41 @@ fn fixture_dns_trace_error() -> DnsTrace {
     }
 }
 
+/// A dangling in-zone CNAME: the authoritative server followed
+/// `www → gone` itself and answered NXDOMAIN beside the CNAME (RFC 6604
+/// §2), so the missing name is the target, not the queried one.
+fn fixture_dns_trace_dangling_cname() -> DnsTrace {
+    let answer = vec![cname_record("www.seer.test", 300, "gone.seer.test.")];
+    DnsTrace {
+        name: "www.seer.test".into(),
+        record_type: RecordType::A,
+        hops: vec![
+            referral_hop(
+                ".",
+                "a.root-servers.net.",
+                "198.41.0.4",
+                "seer.test.",
+                &["ns1.seer.test."],
+            ),
+            TraceHop {
+                zone: "seer.test.".into(),
+                server: "ns1.seer.test.".into(),
+                address: "192.0.2.53".into(),
+                query_time_ms: 9,
+                status: DnsStatus::NxDomain,
+                authoritative: true,
+                referral_zone: None,
+                referral: Vec::new(),
+                answers: answer.clone(),
+                failed_servers: Vec::new(),
+            },
+        ],
+        status: DnsStatus::NxDomain,
+        answers: answer,
+        error: None,
+    }
+}
+
 snapshot_tests! {
     human_dig_cname_chain_snapshot => human.format_dig(fixture_dig_cname_chain());
     markdown_dig_cname_chain_snapshot => markdown.format_dig(fixture_dig_cname_chain());
@@ -1336,6 +1371,10 @@ snapshot_tests! {
     markdown_dns_trace_snapshot => markdown.format_dns_trace(fixture_dns_trace());
     human_dns_trace_error_snapshot => human.format_dns_trace(fixture_dns_trace_error());
     markdown_dns_trace_error_snapshot => markdown.format_dns_trace(fixture_dns_trace_error());
+    human_dns_trace_dangling_cname_snapshot =>
+        human.format_dns_trace(fixture_dns_trace_dangling_cname());
+    markdown_dns_trace_dangling_cname_snapshot =>
+        markdown.format_dns_trace(fixture_dns_trace_dangling_cname());
 }
 
 // --- Status, security, and comparison reports ---------------------------

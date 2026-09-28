@@ -76,8 +76,8 @@ impl MarkdownFormatter {
         if let Some(error) = &trace.error {
             b.text("Error", error);
         } else {
-            let nodata = trace.answers.is_empty();
-            if let Some(verdict) = wording::verdict(trace.status, trace.record_type, nodata) {
+            let target = |target: &str| format!("`{}`", MdSafe(target));
+            if let Some(verdict) = wording::trace_verdict(trace, target) {
                 out.extend([String::new(), format!("*{verdict}*")]);
             }
             if let Some(target) = wording::unfollowed_cname(trace) {
@@ -199,6 +199,36 @@ mod tests {
             ),
             "{out}"
         );
+    }
+
+    #[test]
+    fn trace_nxdomain_beside_a_cname_names_the_missing_target() {
+        // A dangling in-zone CNAME: the server followed it and answered
+        // NXDOMAIN beside it, so the queried name exists and there is
+        // nothing left to trace. The target is escaped like any remote
+        // string.
+        let trace = DnsTrace {
+            name: "www.seer.test".to_string(),
+            record_type: RecordType::A,
+            hops: Vec::new(),
+            status: DnsStatus::NxDomain,
+            answers: vec![DnsRecord {
+                name: "www.seer.test".to_string(),
+                record_type: RecordType::CNAME,
+                ttl: 300,
+                data: RecordData::CNAME {
+                    target: "gone`seer.test.".to_string(),
+                },
+            }],
+            error: None,
+        };
+        let out = MarkdownFormatter::new().format_dns_trace(&trace);
+        assert!(
+            out.contains("*The CNAME target `gone'seer.test.` does not exist (NXDOMAIN)*"),
+            "{out}"
+        );
+        assert!(!out.contains("Name does not exist"), "{out}");
+        assert!(!out.contains("trace does not follow"), "{out}");
     }
 
     #[test]

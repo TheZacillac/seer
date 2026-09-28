@@ -1,9 +1,9 @@
 //! dig-style rendering shared across formats: the `+short` lines
 //! ([`dig_short`], [`dig_trace_short`]) and the wording of a query's
 //! outcome — the negative-answer verdict, the referral, the local-answer
-//! note, the wildcard note, the unfollowed CNAME of a trace — so the human
-//! and Markdown formatters and the TUI's DNS lens say the same thing and
-//! differ only in styling and escaping.
+//! note, the wildcard note, a trace's verdict and its unfollowed CNAME — so
+//! the human and Markdown formatters and the TUI's DNS lens say the same
+//! thing and differ only in styling and escaping.
 //!
 //! The wording takes remote strings (a probe name, a CNAME target, a
 //! referral's zone) already escaped for the caller's format — or the escape
@@ -149,15 +149,51 @@ pub fn zone_suffix(zone: &str) -> &'static str {
     }
 }
 
-/// The CNAME a trace ended at without following it: the final answer holds
-/// a CNAME but no record of the queried type (`dig +trace` stops there
-/// too). Returns the CNAME's target — the last one, for a partial chain.
+/// The sentence printed under a trace's final result without an answer of
+/// the queried type: the [`verdict`] for its status — except for an NXDOMAIN
+/// whose answer holds a CNAME. The server followed that chain itself, and
+/// the response code is about the chain's last name (RFC 6604 §2), so the
+/// sentence names that target as the name that does not exist rather than
+/// the queried name, which the CNAME shows does. `None` for a positive
+/// answer. `escape` renders the target — a remote string — for the caller's
+/// format.
+pub fn trace_verdict<D: fmt::Display>(
+    trace: &DnsTrace,
+    escape: impl FnOnce(&str) -> D,
+) -> Option<String> {
+    if trace.status == DnsStatus::NxDomain {
+        if let Some(target) = last_cname_target(&trace.answers) {
+            return Some(format!(
+                "The CNAME target {} does not exist (NXDOMAIN)",
+                escape(target)
+            ));
+        }
+    }
+    verdict(trace.status, trace.record_type, trace.answers.is_empty())
+}
+
+/// The CNAME a trace ended at without following it: a NOERROR answer that
+/// holds a CNAME but no record of the queried type (`dig +trace` stops
+/// there too). Returns the CNAME's target — the last one, for a partial
+/// chain. `None` under any other response code: a CNAME beside NXDOMAIN (or
+/// an error) means the server followed the chain itself and the code is
+/// about its target (see [`trace_verdict`]), so there is nothing left to
+/// trace.
 pub fn unfollowed_cname(trace: &DnsTrace) -> Option<&str> {
     let wanted = trace.record_type;
-    if wanted == RecordType::CNAME || trace.answers.iter().any(|r| r.record_type == wanted) {
+    if trace.status != DnsStatus::NoError
+        || wanted == RecordType::CNAME
+        || trace.answers.iter().any(|r| r.record_type == wanted)
+    {
         return None;
     }
-    trace.answers.iter().rev().find_map(|r| match &r.data {
+    last_cname_target(&trace.answers)
+}
+
+/// The target of the last CNAME in `answers` (server order): the end of the
+/// chain the answer holds.
+fn last_cname_target(answers: &[DnsRecord]) -> Option<&str> {
+    answers.iter().rev().find_map(|r| match &r.data {
         RecordData::CNAME { target } => Some(target.as_str()),
         _ => None,
     })
@@ -491,5 +527,68 @@ mod tests {
         );
         assert_eq!(unfollowed_cname(&asked), None);
         assert_eq!(unfollowed_cname(&trace(RecordType::A, Vec::new())), None);
+    }
+
+    /// A dangling in-zone CNAME: the authoritative server followed the chain
+    /// itself and answered NXDOMAIN beside the CNAME (RFC 6604 §2).
+    fn dangling(chain: Vec<DnsRecord>) -> DnsTrace {
+        let mut t = trace(RecordType::A, chain);
+        t.status = DnsStatus::NxDomain;
+        t.hops[0].status = DnsStatus::NxDomain;
+        t
+    }
+
+    #[test]
+    fn a_cname_beside_nxdomain_was_followed_by_the_server() {
+        let t = dangling(vec![cname("www.seer.test", "gone.seer.test.")]);
+        assert_eq!(unfollowed_cname(&t), None, "nothing is left to trace");
+        for status in [DnsStatus::ServFail, DnsStatus::Refused] {
+            let failed = DnsTrace {
+                status,
+                ..t.clone()
+            };
+            assert_eq!(unfollowed_cname(&failed), None, "{status}");
+        }
+    }
+
+    #[test]
+    fn trace_verdict_names_the_missing_cname_target_not_the_queried_name() {
+        // The queried name owns the CNAME, so it exists: the NXDOMAIN is
+        // about the chain's last target.
+        let t = dangling(vec![
+            cname("www.seer.test", "mid.seer.test."),
+            cname("mid.seer.test", "gone.seer.test."),
+        ]);
+        assert_eq!(
+            trace_verdict(&t, |target| format!("`{target}`")).as_deref(),
+            Some("The CNAME target `gone.seer.test.` does not exist (NXDOMAIN)")
+        );
+
+        // Without a CNAME the queried name itself does not exist.
+        assert_eq!(
+            trace_verdict(&dangling(Vec::new()), str::to_string).as_deref(),
+            Some("Name does not exist (NXDOMAIN)")
+        );
+
+        // Every other outcome reads as its status's verdict.
+        assert_eq!(
+            trace_verdict(&trace(RecordType::AAAA, Vec::new()), str::to_string).as_deref(),
+            Some("No AAAA records (NODATA — the name exists)")
+        );
+        let stopped = trace(
+            RecordType::A,
+            vec![cname("www.seer.test", "edge.cdn.test.")],
+        );
+        assert_eq!(trace_verdict(&stopped, str::to_string), None);
+        let answered = trace(RecordType::A, vec![a("www.seer.test", "192.0.2.1")]);
+        assert_eq!(trace_verdict(&answered, str::to_string), None);
+        let failed = DnsTrace {
+            status: DnsStatus::ServFail,
+            ..trace(RecordType::A, Vec::new())
+        };
+        assert_eq!(
+            trace_verdict(&failed, str::to_string).as_deref(),
+            Some("No answer: the server failed to resolve the name (SERVFAIL)")
+        );
     }
 }

@@ -342,8 +342,10 @@ Note: DNS responses are not DNSSEC-validated
   over IPv4 first, then over IPv6 when this host has no IPv4 route. The
   whole walk gets six DNS timeouts (30s by default) and otherwise stops with
   the hops so far and an error. It takes one record type and no nameserver,
-  and reports a CNAME answer without following it. Every server address is
-  checked against private and reserved ranges before it is queried.
+  and reports a CNAME answer without following it (an NXDOMAIN beside a
+  CNAME, which the zone's server followed itself, names the target that
+  does not exist). Every server address is checked against private and
+  reserved ranges before it is queried.
 - **Scripting.** `--format json` / `yaml` prints the result object (`name`,
   `record_type`, `server`, `answered_locally`, `status`, `flags`, `answers`,
   `authority`, `wildcard`, `query_time_ms`), or an array of them for several
