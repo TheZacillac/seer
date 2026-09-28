@@ -23,7 +23,8 @@ Requires Python 3.10+. Wheels use the stable ABI (abi3).
 import seer
 
 result  = seer.lookup("example.com")                 # RDAP first, WHOIS fallback
-records = seer.dig("example.com", record_type="MX")
+answer  = seer.dig("example.com", record_type="MX")  # status, flags, answers, ...
+trace   = seer.dns_trace("example.com")              # delegation walk from the root
 status  = seer.status("example.com")
 results = seer.bulk_lookup(["example.com", "example.org"], concurrency=10)
 ```

@@ -78,7 +78,8 @@ Available only when `SEER_DOCS_ENABLED=true`:
 | `/rdap/domain/{domain}` | GET | RDAP domain lookup |
 | `/rdap/ip/{ip}` | GET | RDAP IP lookup |
 | `/rdap/asn/{asn}` | GET | RDAP ASN lookup |
-| `/dns/{domain}/{record_type}` | GET | DNS query |
+| `/dns/{domain}/{record_type}` | GET | DNS query, as `dig` reports it (status, flags, CNAME chain, wildcard probe) |
+| `/dns/trace/{domain}` | GET | Delegation trace from the root servers, like `dig +trace` (`?record_type=`, default `A`) |
 | `/dns/compare/{domain}` | GET | Compare records across nameservers |
 | `/propagation/{domain}/{record_type}` | GET | DNS propagation check |
 | `/status/{domain}` | GET | Domain status check |
@@ -113,6 +114,9 @@ curl http://localhost:8000/whois/example.com
 
 # DNS query
 curl http://localhost:8000/dns/example.com/MX
+
+# DNS trace from the root servers down
+curl "http://localhost:8000/dns/trace/www.example.com?record_type=AAAA"
 
 # Domain status
 curl http://localhost:8000/status/example.com
@@ -205,7 +209,7 @@ Optional env vars:
 
 ### Available Tools
 
-All 30 tools, on both transports:
+All 31 tools, on both transports:
 
 | Tool | Description |
 |------|-------------|
@@ -214,7 +218,8 @@ All 30 tools, on both transports:
 | `seer_rdap_domain` | RDAP domain lookup |
 | `seer_rdap_ip` | RDAP IP lookup |
 | `seer_rdap_asn` | RDAP ASN lookup |
-| `seer_dig` | DNS query |
+| `seer_dig` | DNS query, as `dig` reports it (status, flags, CNAME chain, wildcard probe) |
+| `seer_dns_trace` | Delegation trace from the root servers, like `dig +trace` |
 | `seer_dns_compare` | Compare records across nameservers |
 | `seer_propagation` | DNS propagation check |
 | `seer_status` | Domain status check |

@@ -39,6 +39,7 @@ from .._contract import (
     RECORD_TYPE_MAX_LENGTH,
     RECORD_TYPE_PATTERN,
     TLD_TOKEN_RE,
+    TRACE_LIMIT,
 )
 from .._run import run_seer
 from ..ssrf import nameserver_target
@@ -217,6 +218,17 @@ def _single(binding: str, arg: str = "domain", *, guard: bool = False) -> Handle
     return run
 
 
+def _typed(binding: str) -> Handler:
+    """``seer.<binding>(domain, record_type)``: one name, one record type."""
+
+    async def run(arguments: dict[str, Any]) -> Any:
+        domain = _require_str(arguments, "domain")
+        record_type = _require_record_type(arguments)
+        return await run_seer(getattr(seer, binding), domain, record_type)
+
+    return run
+
+
 def _scan(binding: str) -> Handler:
     """``seer.<binding>(domain, concurrency)``: a single-domain fan-out scan."""
 
@@ -265,12 +277,6 @@ async def _dig(arguments: dict[str, Any]) -> Any:
             raise ValueError(f"'nameserver' must be a string (got {type(nameserver).__name__})")
         await run_seer(_guard_nameserver, nameserver)
     return await run_seer(seer.dig, domain, record_type, nameserver)
-
-
-async def _propagation(arguments: dict[str, Any]) -> Any:
-    domain = _require_str(arguments, "domain")
-    record_type = _require_record_type(arguments)
-    return await run_seer(seer.propagation, domain, record_type)
 
 
 async def _tld_info(arguments: dict[str, Any]) -> Any:
@@ -397,8 +403,15 @@ _TOOLS: dict[str, _Tool] = {
         _rdap_asn,
     ),
     "seer_dig": _Tool(
-        "Query DNS records for a domain, similar to the 'dig' command. Supports all major "
-        "record types.",
+        "Query DNS for a domain like the 'dig' command and report the whole response: "
+        "status (NOERROR, NXDOMAIN, SERVFAIL, REFUSED, ...), header flags, and the "
+        "answers with any CNAME chain first, each record under its own owner name. "
+        "NXDOMAIN means the name does not exist; NOERROR with no answers (NODATA) means "
+        "it exists but has no records of that type. For either negative answer, "
+        "'authority' carries the zone's SOA when the server sent one. For a name below "
+        "its registrable domain, 'wildcard' reports whether a random sibling name also "
+        "resolves (a wildcard is present) and whether this answer matches it (likely "
+        "wildcard-synthesized). ANY merges the common record types.",
         _object(
             "domain",
             domain=_string("Domain name to query"),
@@ -407,11 +420,28 @@ _TOOLS: dict[str, _Tool] = {
         ),
         _dig,
     ),
+    "seer_dns_trace": _Tool(
+        "Trace how a name resolves, like 'dig +trace': starting at the root servers, ask "
+        "one nameserver of each zone directly (recursion off) and follow its referral "
+        "down to the zone that answers. Returns one hop per delegation level (zone, "
+        "server and address, status, authoritative flag, the referral's NS names or the "
+        "answers, servers that failed), the final status and answers, and 'error' when "
+        "the walk stopped early (e.g. no server of a zone responded, or a referral led "
+        "upward or sideways). A CNAME answer is reported, not followed. One record type "
+        "per trace: ANY is rejected.",
+        _object(
+            "domain",
+            domain=_string("Name to trace (e.g., 'www.example.com')"),
+            record_type=_RECORD_TYPE,
+        ),
+        _typed("dns_trace"),
+        TRACE_LIMIT,
+    ),
     "seer_propagation": _Tool(
         "Check DNS propagation for a domain across multiple global DNS servers. Shows "
         "which servers have the record and identifies inconsistencies.",
         _object("domain", domain=_string("Domain name to check"), record_type=_RECORD_TYPE),
-        _propagation,
+        _typed("propagation"),
     ),
     "seer_status": _Tool(
         "Check the health status of a domain including HTTP accessibility, SSL "
