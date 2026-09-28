@@ -148,8 +148,8 @@ Default: `*` (all origins)
 #### Rate Limiting
 
 Every REST route has its own fixed per-client limit (e.g. `5/minute` for
-`/takeover` and `/confusables`, `20/minute` for `/dns/trace`), counted per
-route — requests for different domains on the same route share one budget.
+`/takeover`, `/confusables` and `/dns/trace`), counted per route — requests
+for different domains on the same route share one budget.
 
 `SEER_RATE_LIMIT` sets the per-client limit for the MCP endpoint
 (`POST /mcp`); it does not change the REST limits. Use the

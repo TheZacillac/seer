@@ -15,7 +15,7 @@ import pytest
 from limits import parse as parse_rate_limit
 
 import seer
-from seer_api._contract import TRACE_LIMIT
+from seer_api._contract import HEAVY_LIMIT
 
 needs_binding = pytest.mark.skipif(
     getattr(seer, "_IS_STUB", False),
@@ -160,7 +160,7 @@ def test_trace_route_rejects_a_bare_srv_name_as_a_client_error(client):
     assert "_service._proto" in resp.json()["detail"]
 
 
-def test_trace_route_declares_the_shared_trace_limit(client, monkeypatch, dns_trace_result):
+def test_trace_route_declares_the_heavy_limit(client, monkeypatch, dns_trace_result):
     calls = {"n": 0}
 
     def _trace(*_args):
@@ -168,7 +168,7 @@ def test_trace_route_declares_the_shared_trace_limit(client, monkeypatch, dns_tr
         return dns_trace_result
 
     monkeypatch.setattr(seer, "dns_trace", _trace, raising=False)
-    allowed = parse_rate_limit(TRACE_LIMIT).amount
+    allowed = parse_rate_limit(HEAVY_LIMIT).amount
     # One budget per route, whatever the domain.
     statuses = [client.get(f"/dns/trace/d{i}.example.com").status_code for i in range(allowed)]
     assert statuses == [200] * allowed

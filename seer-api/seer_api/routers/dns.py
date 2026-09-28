@@ -5,9 +5,9 @@ from fastapi import APIRouter, Path, Query, Request
 import seer
 from seer_api._contract import (
     BULK_LIMIT,
+    HEAVY_LIMIT,
     RECORD_TYPE_MAX_LENGTH,
     RECORD_TYPE_PATTERN,
-    TRACE_LIMIT,
     BulkRecordRequest,
     Domain,
 )
@@ -24,7 +24,7 @@ router = APIRouter()
 # `/{domain}/{record_type}` so the two-segment record-lookup route does not
 # swallow them.
 @router.get("/trace/{domain}")
-@limiter.limit(TRACE_LIMIT)
+@limiter.limit(HEAVY_LIMIT)
 async def dns_trace(
     request: Request,
     domain: Domain,

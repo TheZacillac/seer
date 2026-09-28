@@ -39,7 +39,6 @@ from .._contract import (
     RECORD_TYPE_MAX_LENGTH,
     RECORD_TYPE_PATTERN,
     TLD_TOKEN_RE,
-    TRACE_LIMIT,
 )
 from .._run import run_seer
 from ..ssrf import nameserver_target
@@ -440,7 +439,7 @@ _TOOLS: dict[str, _Tool] = {
             record_type=_RECORD_TYPE,
         ),
         _typed("dns_trace"),
-        TRACE_LIMIT,
+        HEAVY_LIMIT,
     ),
     "seer_propagation": _Tool(
         "Check DNS propagation for a domain across multiple global DNS servers. Shows "

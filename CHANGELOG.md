@@ -158,9 +158,11 @@ The dig result shape changes on the CLI, Python, REST and MCP surfaces — see
 - **Python:** `seer.dns_trace(domain, record_type="A")` returns the trace as a
   dict. It raises `ValueError` for invalid input or `ANY`, and
   `RuntimeError` when no root server responds.
-- **REST:** `GET /dns/trace/{domain}?record_type=A`, limited to 20 requests
-  a minute per client.
-- **MCP:** the `seer_dns_trace` tool, for 31 tools in all.
+- **REST:** `GET /dns/trace/{domain}?record_type=A`, limited to 5 requests
+  a minute per client like the other heavy endpoints, since one trace can
+  take up to six DNS timeouts.
+- **MCP:** the `seer_dns_trace` tool, under the same limit, for 31 tools in
+  all.
 - **seer-core:** `DnsResolver::query` returning `DnsQueryResult` (with
   `DnsStatus` and `WildcardProbe`); `DnsTracer` returning `DnsTrace` and
   `TraceHop`s; `SvcParam`; `OutputFormatter::{format_dig,

@@ -338,7 +338,7 @@ seer-api/
 ├── pyproject.toml          # Entry points: seer-api, seer-mcp
 └── seer_api/
     ├── main.py             # FastAPI app: bearer-token auth, middleware stack, lifespan startup checks
-    ├── _contract.py        # shared bulk limits/models, record-type + TLD validators, BULK/HEAVY/TRACE rate limits
+    ├── _contract.py        # shared bulk limits/models, record-type + TLD validators, BULK/HEAVY rate limits
     ├── _env.py             # strict integer env-var parsing
     ├── _run.py             # run_seer: bounded dispatch pool + SEER_REQUEST_TIMEOUT deadline
     ├── errors.py           # http_error (exception → sanitized status) + as_http (await a core call under it)

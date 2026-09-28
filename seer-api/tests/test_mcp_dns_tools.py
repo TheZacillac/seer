@@ -16,7 +16,7 @@ import pytest
 from limits import parse as parse_rate_limit
 
 import seer
-from seer_api._contract import TRACE_LIMIT
+from seer_api._contract import HEAVY_LIMIT
 from seer_api.mcp import server
 from seer_api.mcp.server import execute_tool
 
@@ -125,9 +125,10 @@ def test_dns_trace_any_is_invalid_input():
 
 
 def test_dns_trace_mirrors_the_rest_rate_limit():
-    # The REST route and the tool share one limit, so neither surface can
-    # outrun the other.
-    assert server._TOOL_RATE_LIMITS["seer_dns_trace"] == TRACE_LIMIT
+    # A trace can hold a dispatch thread for its whole core deadline, so it is
+    # in the heavy class, and the REST route and the tool share that one
+    # limit, so neither surface can outrun the other.
+    assert server._TOOL_RATE_LIMITS["seer_dns_trace"] == HEAVY_LIMIT
 
 
 def test_dns_trace_is_rate_limited_per_tool(monkeypatch, dns_trace_result):
@@ -138,7 +139,7 @@ def test_dns_trace_is_rate_limited_per_tool(monkeypatch, dns_trace_result):
         return dns_trace_result
 
     monkeypatch.setattr(seer, "dns_trace", _trace, raising=False)
-    allowed = parse_rate_limit(TRACE_LIMIT).amount
+    allowed = parse_rate_limit(HEAVY_LIMIT).amount
     args = {"domain": "example.com"}
     for _ in range(allowed):
         out = asyncio.run(server.call_tool("seer_dns_trace", args))
