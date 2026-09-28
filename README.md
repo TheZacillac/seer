@@ -207,6 +207,7 @@ seer dig example.com MX          # Specific record type
 seer dig example.com A -s 8.8.8.8                          # Custom nameserver (UDP)
 seer dig example.com A -s tls://1.1.1.1                    # DNS over TLS
 seer dig example.com A -s https://cloudflare-dns.com/dns-query  # DNS over HTTPS
+seer dig '*.example.com'         # Wildcard record (quote it so the shell doesn't glob)
 
 # DNS propagation & monitoring
 seer prop example.com A

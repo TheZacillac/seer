@@ -27,7 +27,7 @@ use tracing::{debug, instrument};
 use super::nameserver::{NameserverProtocol, NameserverSpec};
 use super::records::{DnsRecord, RecordData, RecordType};
 use crate::error::{Result, SeerError};
-use crate::validation::{normalize_domain, normalize_host};
+use crate::validation::{normalize_domain, normalize_query_name};
 
 /// Convert a DNS lookup result, treating "no records found" as an empty vec
 /// rather than an error. This is correct DNS behavior — the absence of a
@@ -654,9 +654,11 @@ impl DnsResolver {
 /// Prepares the query name for a DNS record lookup.
 ///
 /// Record queries are about one exact DNS name, so this normalizes with
-/// [`normalize_host`], which — unlike [`normalize_domain`] — keeps a leading
-/// `www.`: `www` routinely carries its own records (typically a CNAME), and
-/// stripping it silently answered `dig www.example.com CNAME` for the apex.
+/// [`normalize_query_name`], which — unlike [`normalize_domain`] — keeps a
+/// leading `www.`: `www` routinely carries its own records (typically a
+/// CNAME), and stripping it silently answered `dig www.example.com CNAME` for
+/// the apex. It also accepts a leading wildcard label (`*.example.com`), so
+/// the wildcard's own records can be queried like any other name.
 ///
 /// PTR queries may be given a raw IP literal. IPv6 literals in particular must
 /// NOT pass through the normalizer: its trailing-`:port` strip heuristic
@@ -672,7 +674,7 @@ impl DnsResolver {
 /// actually queries — they previously re-normalized with `normalize_domain`,
 /// losing `www.` and mangling IPv6 PTR literals.
 pub(crate) fn prepare_query(domain: &str, record_type: RecordType) -> Result<String> {
-    prepare_query_with(domain, record_type, normalize_host)
+    prepare_query_with(domain, record_type, normalize_query_name)
 }
 
 /// [`prepare_query`] with the normalizer injected, so the IP-literal PTR path
@@ -1659,6 +1661,20 @@ mod tests {
     }
 
     #[test]
+    fn prepare_query_accepts_a_leading_wildcard_label() {
+        // Regression: `dig *.example.com` failed with "Invalid domain name"
+        // because the query name went through the host normalizer, which
+        // rejects `*`. Querying a wildcard owner name is ordinary DNS.
+        let out = prepare_query("*.Example.com.", RecordType::A).unwrap();
+        assert_eq!(out, "*.example.com");
+        let out = prepare_query("*.1.168.192.in-addr.arpa", RecordType::PTR).unwrap();
+        assert_eq!(out, "*.1.168.192.in-addr.arpa");
+        // Only the whole leftmost label may be `*`.
+        assert!(prepare_query("a.*.example.com", RecordType::A).is_err());
+        assert!(prepare_query("a*.example.com", RecordType::A).is_err());
+    }
+
+    #[test]
     fn prepare_query_runs_ptr_ip_literal_through_the_normalizer() {
         // Regression: an IP literal skipped the normalizer entirely, and with
         // it the `SEER_DOMAIN_ALLOWLIST` check that lives inside — so a PTR
@@ -1682,7 +1698,7 @@ mod tests {
         }
         // With the real normalizer (no allowlist in tests) both still pass.
         assert_eq!(
-            prepare_query_with("192.0.2.1", RecordType::PTR, normalize_host).unwrap(),
+            prepare_query_with("192.0.2.1", RecordType::PTR, normalize_query_name).unwrap(),
             "192.0.2.1"
         );
     }
@@ -1946,6 +1962,26 @@ mod tests {
             .expect("SRV against mock");
         assert_eq!(records.len(), 1, "{records:?}");
         assert_eq!(records[0].name, "_sip._tcp.www.seer.test");
+    }
+
+    #[tokio::test]
+    async fn mock_resolve_queries_a_wildcard_owner_name() {
+        // The literal `*` label reaches the wire, and the records come back
+        // reported under the wildcard name that was asked for.
+        let port = spawn_mock_dns_fn(|qname, qtype| match (qname, qtype) {
+            ("*.seer.test", HickoryRecordType::A) => MockReply::Answer(vec![HickoryRData::A(
+                hickory_resolver::proto::rr::rdata::A(Ipv4Addr::new(192, 0, 2, 42)),
+            )]),
+            _ => MockReply::NoData,
+        })
+        .await;
+        let records = mock_dns_resolver(port)
+            .resolve("*.seer.test", RecordType::A, Some("127.0.0.1"))
+            .await
+            .expect("wildcard A against mock");
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert_eq!(records[0].name, "*.seer.test");
+        assert_eq!(records[0].data.to_string(), "192.0.2.42");
     }
 
     #[tokio::test]

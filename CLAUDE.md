@@ -590,11 +590,15 @@ layer. `validation::normalize_domain` strips the scheme and any path,
 lowercases, converts IDNs to Punycode, validates the format and drops a
 leading `www.` (only when a registrable name remains — `www.com` is kept
 whole), which is right for registration-level operations (WHOIS, RDAP,
-availability, history/watchlist keys). Anything about one specific DNS name
-or host — DNS record queries (`dig`, propagation, follow, compare), per-host
-probes (`ssl`, `status`, `headers`, `takeover`, subdomain classification) —
-must use `validation::normalize_host`, which is identical but keeps `www.`
-(`www` usually has its own CNAME and can serve a different site/cert).
+availability, history/watchlist keys). Anything about one specific host —
+per-host probes (`ssl`, `status`, `headers`, `takeover`, subdomain
+classification) — must use `validation::normalize_host`, which is identical
+but keeps `www.` (`www` usually has its own CNAME and can serve a different
+site/cert). DNS record queries (`dig`, propagation, follow, compare) go
+through `dns::resolver::prepare_query`, which uses
+`validation::normalize_query_name`: `normalize_host` plus an RFC 4592
+wildcard as the whole leftmost label (`*.example.com`). Only query names
+accept `*`; a probe or registration lookup has nothing to connect to there.
 
 ### Lazy Statics
 

@@ -62,7 +62,7 @@ fn normalize_allowlist_entry(entry: &str) -> String {
 /// query or a per-host probe — because `www` routinely carries its own
 /// records (typically a CNAME). Use [`normalize_host`] there.
 pub fn normalize_domain(domain: &str) -> Result<String> {
-    normalize(domain, true)
+    normalize(domain, NameKind::Domain)
 }
 
 /// Normalizes and validates a hostname exactly like [`normalize_domain`], but
@@ -73,10 +73,34 @@ pub fn normalize_domain(domain: &str) -> Result<String> {
 /// apex), propagation/follow/compare, and per-host probes such as takeover
 /// detection, where `www` is the single most commonly CNAME'd host.
 pub fn normalize_host(host: &str) -> Result<String> {
-    normalize(host, false)
+    normalize(host, NameKind::Host)
 }
 
-fn normalize(domain: &str, strip_www: bool) -> Result<String> {
+/// Normalizes a DNS query name exactly like [`normalize_host`], but also
+/// accepts the RFC 4592 wildcard label: `*` as the whole leftmost label
+/// (`*.example.com`).
+///
+/// Querying a wildcard owner name is ordinary DNS (`dig *.example.com`
+/// returns the wildcard's own records), so record lookups and the other
+/// per-name DNS paths accept it. Per-host probes (`ssl`, `status`, …) keep
+/// [`normalize_host`]: `*` names no host they could connect to. A `*`
+/// anywhere else (`a*.example.com`, `a.*.example.com`) is still rejected.
+pub(crate) fn normalize_query_name(name: &str) -> Result<String> {
+    normalize(name, NameKind::QueryName)
+}
+
+/// The name shapes [`normalize`] accepts.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NameKind {
+    /// A registration-level domain: a leading `www.` is dropped.
+    Domain,
+    /// One specific host: `www.` is kept.
+    Host,
+    /// A DNS query name: `www.` is kept and the leftmost label may be `*`.
+    QueryName,
+}
+
+fn normalize(domain: &str, kind: NameKind) -> Result<String> {
     let domain = domain.trim().to_lowercase();
 
     // Remove protocol
@@ -114,7 +138,7 @@ fn normalize(domain: &str, strip_www: bool) -> Result<String> {
     // `www.com`, `www.net`, … are registered domains in their own right;
     // stripping them would leave a bare TLD and reject a valid query.
     let domain = match domain.strip_prefix("www.") {
-        Some(rest) if strip_www && rest.contains('.') => rest,
+        Some(rest) if kind == NameKind::Domain && rest.contains('.') => rest,
         _ => domain,
     };
 
@@ -130,10 +154,18 @@ fn normalize(domain: &str, strip_www: bool) -> Result<String> {
         domain.to_string()
     };
 
+    // A query name may lead with the RFC 4592 wildcard label. Only the whole
+    // leftmost label qualifies; the labels after it are validated below like
+    // any other name, and the length and allowlist checks see the full name.
+    let labels = match domain.strip_prefix("*.") {
+        Some(rest) if kind == NameKind::QueryName => rest,
+        _ => domain.as_str(),
+    };
+
     // Basic validation - alphanumeric, hyphens, dots, and underscores
     // Underscores are valid in DNS names (RFC 8552) and required for service
     // records like _dmarc., _domainkey., _sip._tcp., etc.
-    let valid = domain
+    let valid = labels
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_');
     if !valid {
@@ -141,7 +173,7 @@ fn normalize(domain: &str, strip_www: bool) -> Result<String> {
     }
 
     // Check for consecutive dots or dots at start/end
-    if domain.contains("..") || domain.starts_with('.') || domain.ends_with('.') {
+    if labels.contains("..") || labels.starts_with('.') || labels.ends_with('.') {
         return Err(SeerError::InvalidDomain(domain.to_string()));
     }
 
@@ -151,7 +183,7 @@ fn normalize(domain: &str, strip_www: bool) -> Result<String> {
     }
 
     // Check label constraints
-    for label in domain.split('.') {
+    for label in labels.split('.') {
         // Labels must be non-empty and not start/end with hyphens
         if label.is_empty() || label.starts_with('-') || label.ends_with('-') {
             return Err(SeerError::InvalidDomain(domain.to_string()));
@@ -416,6 +448,58 @@ mod tests {
         assert_eq!(normalize_host("münchen.de").unwrap(), "xn--mnchen-3ya.de");
         assert!(normalize_host("nodots").is_err());
         assert!(normalize_host("bad_label-.com").is_err());
+    }
+
+    #[test]
+    fn normalize_query_name_accepts_a_leading_wildcard_label() {
+        assert_eq!(
+            normalize_query_name("*.Example.COM.").unwrap(),
+            "*.example.com"
+        );
+        assert_eq!(
+            normalize_query_name("*.www.example.com").unwrap(),
+            "*.www.example.com"
+        );
+        // A wildcard directly under a TLD is a legitimate query too.
+        assert_eq!(normalize_query_name("*.com").unwrap(), "*.com");
+        // The labels after the wildcard still get IDN conversion.
+        assert_eq!(
+            normalize_query_name("*.münchen.de").unwrap(),
+            "*.xn--mnchen-3ya.de"
+        );
+        // Everything else normalizes exactly like `normalize_host`.
+        assert_eq!(
+            normalize_query_name("https://WWW.Example.com:443/x").unwrap(),
+            "www.example.com"
+        );
+    }
+
+    #[test]
+    fn normalize_query_name_rejects_a_misplaced_or_partial_wildcard() {
+        for bad in [
+            "*",
+            "*.",
+            "**.example.com",
+            "*a.example.com",
+            "a*.example.com",
+            "a.*.example.com",
+            "*.*.example.com",
+            "*..example.com",
+            "*.-bad.example.com",
+        ] {
+            assert!(
+                normalize_query_name(bad).is_err(),
+                "{bad:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn host_and_domain_normalizers_still_reject_wildcards() {
+        // `*` names no host to connect to (ssl, status, headers) and no
+        // registration (whois, rdap), so only DNS query names accept it.
+        assert!(normalize_host("*.example.com").is_err());
+        assert!(normalize_domain("*.example.com").is_err());
     }
 
     #[test]

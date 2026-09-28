@@ -11,6 +11,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **DNS: wildcard names can be queried.** `seer dig '*.example.com'` (and
+  `prop`, `follow`, `compare`, bulk `dig`, the REPL, Python, REST and MCP)
+  failed with "Invalid domain name" because `*` was rejected as a character.
+  A `*` that is the whole leftmost label is now accepted, so a wildcard's
+  own records can be looked up; a `*` anywhere else is still rejected, and
+  per-host checks such as `ssl` and `status` still refuse it.
+
 ## [0.49.1] - 2026-09-25
 
 A patch release fixing WHOIS status parsing for `.ru`, `.su` and `.рф`.
