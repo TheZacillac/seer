@@ -377,7 +377,12 @@ pub async fn run(
         }
         Query::Posture(domain) => {
             let _spinner = spinner(format!("Inspecting email posture for {}", domain));
-            let posture = seer_core::lookup_email_posture(&clients.dns, &domain).await?;
+            let posture = seer_core::lookup_email_posture(
+                &clients.dns,
+                &domain,
+                config.nameserver.as_deref(),
+            )
+            .await?;
             Payload::Posture(Box::new(posture))
         }
         Query::Headers(domain) => {

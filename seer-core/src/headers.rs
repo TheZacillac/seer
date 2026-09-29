@@ -50,7 +50,9 @@ impl HeaderVerdict {
             HeaderVerdict::Strict | HeaderVerdict::Present => 100,
             HeaderVerdict::Moderate => 60,
             HeaderVerdict::Weak => 30,
-            HeaderVerdict::Absent => 0,
+            // Unknown is posture-only (a failed DNS lookup); the header
+            // audit never produces it, and it earns nothing.
+            HeaderVerdict::Absent | HeaderVerdict::Unknown => 0,
         }
     }
 }

@@ -22,7 +22,8 @@ use crate::tui::widgets::{dot, gauge, panel};
 fn verdict_tone(v: HeaderVerdict) -> &'static str {
     match v {
         HeaderVerdict::Strict | HeaderVerdict::Present => "ok",
-        HeaderVerdict::Moderate | HeaderVerdict::Weak => "warn",
+        // Unknown is posture-only (a failed DNS lookup); headers never grade it.
+        HeaderVerdict::Moderate | HeaderVerdict::Weak | HeaderVerdict::Unknown => "warn",
         HeaderVerdict::Absent => "fail",
     }
 }

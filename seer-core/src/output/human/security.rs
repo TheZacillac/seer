@@ -19,7 +19,9 @@ impl HumanFormatter {
         let label = verdict.as_str();
         match verdict {
             PostureVerdict::Strict => self.success(label),
-            PostureVerdict::Moderate | PostureVerdict::Weak => self.warning(label),
+            PostureVerdict::Moderate | PostureVerdict::Weak | PostureVerdict::Unknown => {
+                self.warning(label)
+            }
             PostureVerdict::Present => self.value(label),
             PostureVerdict::Absent => self.error(label),
         }
@@ -111,6 +113,10 @@ impl HumanFormatter {
 
         let line = |name: &str, verdict: PostureVerdict, detail: Option<&str>| {
             let base = format!("{}: {}", self.label(name), self.verdict(verdict));
+            let detail = match verdict {
+                PostureVerdict::Unknown => Some("(lookup failed)"),
+                _ => detail,
+            };
             match detail {
                 Some(d) if !d.is_empty() => format!("{base} {}", self.dim(&sanitize_display(d))),
                 _ => base,

@@ -7,7 +7,7 @@ use crate::caa::CaaPolicy;
 use crate::confusables::ConfusableReport;
 use crate::drift::DriftReport;
 use crate::headers::HeaderReport;
-use crate::posture::EmailPosture;
+use crate::posture::{EmailPosture, PostureVerdict};
 use crate::subdomains::{SubdomainBaselineDiff, SubdomainClassification};
 use crate::takeover::{TakeoverReport, TakeoverVerdict};
 
@@ -98,25 +98,41 @@ impl MarkdownFormatter {
             .as_deref()
             .map(|p| format!("p={p}"))
             .unwrap_or_default();
+        // A failed lookup says so instead of its (empty) detail.
+        let failed = |verdict: PostureVerdict, detail: &str| match verdict {
+            PostureVerdict::Unknown => "lookup failed".to_string(),
+            _ => MdSafe(detail).to_string(),
+        };
         let _ = writeln!(
             out,
             "| SPF | {:?} | {} |",
             posture.spf.verdict,
-            MdSafe(&spf_detail)
+            failed(posture.spf.verdict, &spf_detail)
         );
         let _ = writeln!(
             out,
             "| DMARC | {:?} | {} |",
             posture.dmarc.verdict,
-            MdSafe(&dmarc_detail)
+            failed(posture.dmarc.verdict, &dmarc_detail)
         );
-        let _ = writeln!(out, "| MTA-STS | {:?} |  |", posture.mta_sts.verdict);
-        let _ = writeln!(out, "| BIMI | {:?} |  |", posture.bimi.verdict);
         let _ = writeln!(
             out,
-            "| DANE | {:?} | {} TLSA |",
+            "| MTA-STS | {:?} | {} |",
+            posture.mta_sts.verdict,
+            failed(posture.mta_sts.verdict, "")
+        );
+        let _ = writeln!(
+            out,
+            "| BIMI | {:?} | {} |",
+            posture.bimi.verdict,
+            failed(posture.bimi.verdict, "")
+        );
+        let dane_detail = format!("{} TLSA", posture.dane.records.len());
+        let _ = writeln!(
+            out,
+            "| DANE | {:?} | {} |",
             posture.dane.verdict,
-            posture.dane.records.len()
+            failed(posture.dane.verdict, &dane_detail)
         );
         if !posture.notes.is_empty() {
             out.push_str("\n### Advisories\n\n");
