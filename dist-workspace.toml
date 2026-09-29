@@ -21,11 +21,6 @@ targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-da
 # build from Windows Defender's real-time scan, which otherwise kills the
 # Windows release build (see the file for the history).
 github-build-setup = "../build-setup.yml"
-# TEMPORARY (removed before this PR merges): build every artifact on the
-# pull request, so the Windows fix is proven before the tag is re-pointed.
-pr-run-mode = "upload"
-# dist turns build caching on with "upload"; keep release builds cache-free.
-cache-builds = false
 
 # Override the GitHub Action refs dist bakes into `release.yml`. dist 0.32.0
 # still defaults `actions/checkout` to `v6`, while every hand-written workflow
