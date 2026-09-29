@@ -337,13 +337,9 @@ pub(crate) enum MockReply {
     /// Like [`MockReply::NxDomainWithSoa`], with the AA bit set: an
     /// authoritative server's own "no such name".
     AuthoritativeNxDomain(&'static str),
-    /// An empty response with any other response code (NOTIMP, FORMERR,
-    /// …); SERVFAIL and REFUSED have their own variants.
+    /// An empty response with this response code (SERVFAIL, REFUSED,
+    /// NOTIMP, …).
     Rcode(ResponseCode),
-    /// SERVFAIL — e.g. a validating upstream rejecting a broken DNSSEC chain.
-    ServFail,
-    /// REFUSED.
-    Refused,
     /// Send nothing, forcing the client's timeout path.
     NoReply,
     /// A referral to a child zone, as a parent-side server sends it:
@@ -504,12 +500,6 @@ where
                         if code.high() > 0 {
                             response.edns = Some(Edns::new());
                         }
-                    }
-                    MockReply::ServFail => {
-                        response.metadata.response_code = ResponseCode::ServFail;
-                    }
-                    MockReply::Refused => {
-                        response.metadata.response_code = ResponseCode::Refused;
                     }
                     MockReply::NoReply => continue,
                     MockReply::Delegation { zone, servers } => {

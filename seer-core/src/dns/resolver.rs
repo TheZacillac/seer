@@ -3144,8 +3144,8 @@ mod tests {
     #[tokio::test]
     async fn mock_query_reports_error_codes_as_results() {
         let port = spawn_mock_dns_fn(|qname, _| match qname {
-            "servfail.seer.test" => MockReply::ServFail,
-            "refused.seer.test" => MockReply::Refused,
+            "servfail.seer.test" => MockReply::Rcode(ResponseCode::ServFail),
+            "refused.seer.test" => MockReply::Rcode(ResponseCode::Refused),
             "notimp.seer.test" => MockReply::Rcode(ResponseCode::NotImp),
             _ => MockReply::NxDomain,
         })
@@ -3509,7 +3509,7 @@ mod tests {
 
     #[tokio::test]
     async fn mock_wildcard_probe_that_fails_is_dropped_not_fatal() {
-        let (port, _) = wildcard_zone(|| MockReply::ServFail).await;
+        let (port, _) = wildcard_zone(|| MockReply::Rcode(ResponseCode::ServFail)).await;
         let result = mock_query(port, "www.seer.test", RecordType::A).await;
         assert_eq!(result.status, DnsStatus::NoError);
         assert_eq!(result.wildcard, None);

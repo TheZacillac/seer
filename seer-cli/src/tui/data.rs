@@ -63,7 +63,7 @@ pub async fn fetch(req: FetchReq, config: &seer_core::SeerConfig) -> Result<Lens
             .await
             .map(|r| LensData::Dig(Box::new(r)))
             .map_err(e),
-        FetchReq::Dnssec(d) => seer_core::DnssecChecker::new()
+        FetchReq::Dnssec(d) => seer_core::DnssecChecker::from_config(config)
             .check(&d)
             .await
             .map(|r| LensData::Dnssec(Box::new(r)))
@@ -73,7 +73,7 @@ pub async fn fetch(req: FetchReq, config: &seer_core::SeerConfig) -> Result<Lens
             record_type,
             a,
             b,
-        } => seer_core::dns::DnsComparator::new()
+        } => seer_core::dns::DnsComparator::from_config(config)
             .compare(&domain, record_type, &a, &b)
             .await
             .map(|r| LensData::Compare(Box::new(r)))
@@ -98,7 +98,7 @@ pub async fn fetch(req: FetchReq, config: &seer_core::SeerConfig) -> Result<Lens
             .await
             .map(|r| LensData::Status(Box::new(r)))
             .map_err(e),
-        FetchReq::Prop(d) => seer_core::dns::PropagationChecker::new()
+        FetchReq::Prop(d) => seer_core::dns::PropagationChecker::from_config(config)
             .check(&d, RecordType::A)
             .await
             .map(|r| LensData::Prop(Box::new(r)))

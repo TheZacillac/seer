@@ -8,6 +8,10 @@ expression: markdown ().format_dns_comparison (& fixture_dns_comparison())
 
 ### Server A (8.8.8.8)
 
+**Status**: NOERROR
+
+**CNAME chain**: `example.com → edge.cdn.test.`
+
 | Record |
 | --- |
 | `192.0.2.1` |

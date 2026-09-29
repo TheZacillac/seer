@@ -175,8 +175,8 @@ impl Clients {
             whois: seer_core::WhoisClient::from_config(config),
             rdap: seer_core::RdapClient::from_config(config),
             dns: seer_core::DnsResolver::from_config(config),
-            propagation: seer_core::dns::PropagationChecker::new(),
-            dnssec: seer_core::DnssecChecker::new(),
+            propagation: seer_core::dns::PropagationChecker::from_config(config),
+            dnssec: seer_core::DnssecChecker::from_config(config),
             status: seer_core::StatusClient::from_config(config),
             avail: seer_core::AvailabilityChecker::from_config(config),
             ssl: seer_core::SslChecker::from_config(config),
@@ -316,7 +316,7 @@ pub async fn run(
                 "Comparing {} records from {} and {}",
                 domain, server_a, server_b
             ));
-            let comparison = seer_core::dns::DnsComparator::new()
+            let comparison = seer_core::dns::DnsComparator::from_config(config)
                 .compare(&domain, record_type, &server_a, &server_b)
                 .await?;
             Payload::Compare(Box::new(comparison))

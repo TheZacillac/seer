@@ -56,7 +56,7 @@ pub(super) fn build_nameserver_consensus(
 /// ties broken by the lexicographically smallest set for deterministic output.
 /// Returns the winning set together with its count, or `None` when the map is
 /// empty.
-fn pick_consensus(counts: HashMap<&Vec<String>, usize>) -> Option<(&Vec<String>, usize)> {
+fn pick_consensus<K: Ord>(counts: HashMap<&K, usize>) -> Option<(&K, usize)> {
     counts
         .into_iter()
         .max_by(|(a_set, a_count), (b_set, b_count)| {
@@ -105,6 +105,17 @@ pub(super) fn build_nameserver_inconsistencies(
     out
 }
 
+/// A successful server's answer as the consensus groups it. Ordered values
+/// first, so ties still break toward the smallest value set, and NODATA
+/// before NXDOMAIN.
+#[derive(Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct AnswerKey {
+    /// The answer's comparison keys, sorted.
+    values: Vec<String>,
+    /// An empty answer that was NXDOMAIN (else NODATA, or records).
+    nxdomain: bool,
+}
+
 pub(super) fn analyze_results(
     results: &[ServerResult],
     record_type: RecordType,
@@ -135,14 +146,17 @@ pub(super) fn analyze_results(
         };
     }
 
-    // Build sorted value sets once per server result, keyed on
+    // Build each server's answer key once: an empty answer keeps whether it
+    // was NXDOMAIN, since "the name does not exist" and "it exists without
+    // records of the type" (NODATA) are different answers, not agreement.
+    // The value sets are sorted and keyed on
     // `RecordData::comparison_key`: domain-name fields case-folded (a
     // 0x20-randomizing resolver answering `NS1.EXAMPLE.COM.` agrees with one
     // answering `ns1.example.com.`), case-sensitive data (TXT, DNSKEY)
     // verbatim. The same rule compare and follow use. The folded keys double
     // as the reported values, so consensus / inconsistency output shows
     // domain names in canonical lowercase.
-    let sorted_value_sets: Vec<Vec<String>> = successful
+    let answer_keys: Vec<AnswerKey> = successful
         .iter()
         .map(|result| {
             let mut values: Vec<String> = result
@@ -151,20 +165,21 @@ pub(super) fn analyze_results(
                 .map(|r| r.data.comparison_key())
                 .collect();
             values.sort();
-            values
+            let nxdomain = values.is_empty() && result.is_nxdomain();
+            AnswerKey { values, nxdomain }
         })
         .collect();
 
-    // Count occurrences of each value set
-    let mut value_counts: HashMap<&Vec<String>, usize> = HashMap::new();
-    for values in &sorted_value_sets {
-        *value_counts.entry(values).or_insert(0) += 1;
+    // Count occurrences of each answer
+    let mut value_counts: HashMap<&AnswerKey, usize> = HashMap::new();
+    for key in &answer_keys {
+        *value_counts.entry(key).or_insert(0) += 1;
     }
 
     // Find the most common value set (consensus). Ties break toward the
     // lexicographically smallest set so output is deterministic run-to-run
     // (see `pick_consensus`).
-    let Some((consensus_values, consensus_count)) = pick_consensus(value_counts) else {
+    let Some((consensus, consensus_count)) = pick_consensus(value_counts) else {
         // Should never happen since `successful` is non-empty (every successful
         // result contributes a value set), but handle gracefully.
         return AnalysisOutcome {
@@ -186,21 +201,24 @@ pub(super) fn analyze_results(
     // reported separately via `unreachable_servers` so that
     // `has_inconsistencies()` reflects only genuine answer conflicts.
     let mut inconsistencies: Vec<Inconsistency> = Vec::new();
-    for (result, values) in successful.iter().zip(sorted_value_sets.iter()) {
-        if values != consensus_values {
+    for (result, key) in successful.iter().zip(answer_keys.iter()) {
+        if key != consensus {
             inconsistencies.push(Inconsistency {
                 record_type,
                 server_name: result.server.name.clone(),
                 server_ip: result.server.ip.clone(),
-                values: values.clone(),
-                consensus: consensus_values.clone(),
+                values: key.values.clone(),
+                consensus: consensus.values.clone(),
+                nxdomain: key.nxdomain,
+                consensus_nxdomain: consensus.nxdomain,
             });
         }
     }
 
     // Tag each consensus value with the queried record type so downstream
     // consumers don't have to cross-reference `PropagationResult.record_type`.
-    let tagged_consensus: Vec<ConsensusValue> = consensus_values
+    let tagged_consensus: Vec<ConsensusValue> = consensus
+        .values
         .iter()
         .map(|v| ConsensusValue::new(record_type, v.clone()))
         .collect();
@@ -514,5 +532,38 @@ mod tests {
             build_nameserver_consensus(&results, &per_vantage, &["ns1.example.com.".to_string()]);
         let inconsistencies = build_nameserver_inconsistencies(&results, &per_vantage, &consensus);
         assert!(inconsistencies.is_empty(), "got: {:?}", inconsistencies);
+    }
+
+    /// Regression: NXDOMAIN and NODATA both reduced to an empty value set,
+    /// so a server saying the name does not exist agreed with servers saying
+    /// it exists without records.
+    #[test]
+    fn nxdomain_and_nodata_are_different_answers() {
+        use crate::dns::DnsStatus;
+        let negative = |ip: &str, status: DnsStatus| ServerResult {
+            server: DnsServer::new(ip, ip, "NA", ip),
+            records: vec![],
+            response_time_ms: 10,
+            success: true,
+            error: None,
+            status: Some(status),
+        };
+        let results = vec![
+            negative("1.1.1.1", DnsStatus::NoError),
+            negative("8.8.8.8", DnsStatus::NoError),
+            negative("9.9.9.9", DnsStatus::NxDomain),
+        ];
+        let outcome = analyze_results(&results, RecordType::A);
+        assert_eq!(
+            outcome.inconsistencies.len(),
+            1,
+            "{:?}",
+            outcome.inconsistencies
+        );
+        let inc = &outcome.inconsistencies[0];
+        assert_eq!(inc.server_ip, "9.9.9.9");
+        assert!(inc.nxdomain && !inc.consensus_nxdomain);
+        assert!((outcome.propagation_percentage - 200.0 / 3.0).abs() < 1e-9);
+        assert!(outcome.consensus_values.is_empty());
     }
 }
