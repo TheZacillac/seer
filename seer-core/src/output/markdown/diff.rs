@@ -12,6 +12,11 @@ impl MarkdownFormatter {
                 None => dash.to_string(),
             }
         };
+        let yes_no = |o: Option<bool>| match o {
+            Some(true) => "yes",
+            Some(false) => "no",
+            None => dash,
+        };
         // Each item is its own code span (see `code_list`), or a dash.
         let list_or_dash = |v: &Vec<String>| -> String {
             if v.is_empty() {
@@ -73,8 +78,8 @@ impl MarkdownFormatter {
         let dns = &diff.dns;
         output.push(format!(
             "| Resolves | {} | {} |",
-            if dns.resolves.0 { "yes" } else { "no" },
-            if dns.resolves.1 { "yes" } else { "no" }
+            yes_no(dns.resolves.0),
+            yes_no(dns.resolves.1)
         ));
         let a_recs_a = list_or_dash(&dns.a_records.0);
         let a_recs_b = list_or_dash(&dns.a_records.1);
@@ -119,15 +124,19 @@ impl MarkdownFormatter {
         ));
         output.push(format!(
             "| Valid | {} | {} |",
-            ssl.is_valid
-                .0
-                .map(|v| if v { "yes" } else { "no" })
-                .unwrap_or(dash),
-            ssl.is_valid
-                .1
-                .map(|v| if v { "yes" } else { "no" })
-                .unwrap_or(dash)
+            yes_no(ssl.is_valid.0),
+            yes_no(ssl.is_valid.1)
         ));
+
+        // Failed checks: their cells above are empty, not real answers.
+        if !diff.errors.is_empty() {
+            output.push(String::new());
+            output.push("### Errors".to_string());
+            output.push(String::new());
+            for error in &diff.errors {
+                output.push(format!("- {}", MdSafe(error)));
+            }
+        }
 
         output.join("\n")
     }
@@ -151,7 +160,7 @@ mod tests {
             dns: DnsDiff {
                 a_records: (Vec::new(), Vec::new()),
                 nameservers: (ns, Vec::new()),
-                resolves: (true, false),
+                resolves: (Some(true), Some(false)),
             },
             ssl: SslDiff {
                 issuer: (None, None),
@@ -159,6 +168,7 @@ mod tests {
                 days_remaining: (None, None),
                 is_valid: (None, None),
             },
+            errors: Vec::new(),
         }
     }
 

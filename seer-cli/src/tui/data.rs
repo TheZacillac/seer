@@ -115,7 +115,7 @@ pub async fn fetch(req: FetchReq, config: &seer_core::SeerConfig) -> Result<Lens
             .map_err(e),
         // lookup_tld is async + infallible.
         FetchReq::Tld(t) => Ok(LensData::Tld(Box::new(seer_core::lookup_tld(&t).await))),
-        FetchReq::Diff { a, b } => seer_core::DomainDiffer::new()
+        FetchReq::Diff { a, b } => seer_core::DomainDiffer::from_config(config)
             .diff(&a, &b)
             .await
             .map(|r| LensData::Diff(Box::new(r)))

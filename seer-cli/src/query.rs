@@ -350,7 +350,7 @@ pub async fn run(
         }
         Query::Diff(domain_a, domain_b) => {
             let _spinner = spinner(format!("Comparing {} vs {}", domain_a, domain_b));
-            let diff = seer_core::DomainDiffer::new()
+            let diff = seer_core::DomainDiffer::from_config(config)
                 .diff(&domain_a, &domain_b)
                 .await?;
             Payload::Diff(Box::new(diff))

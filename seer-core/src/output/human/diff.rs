@@ -125,6 +125,18 @@ impl HumanFormatter {
             }
         }
 
+        // Failed checks: their rows above are empty, not real answers.
+        if !diff.errors.is_empty() {
+            output.push(String::new());
+            for error in &diff.errors {
+                output.push(format!(
+                    "  {} {}",
+                    self.warning("!"),
+                    sanitize_display(error)
+                ));
+            }
+        }
+
         output.join("\n")
     }
 }
@@ -257,14 +269,6 @@ fn opt_bool_or_placeholder(o: &Option<bool>) -> String {
     }
 }
 
-fn bool_as_str(b: bool) -> String {
-    if b {
-        "yes".to_string()
-    } else {
-        "no".to_string()
-    }
-}
-
 fn list_or_placeholder(list: &[String]) -> Vec<String> {
     let cleaned: Vec<String> = list
         .iter()
@@ -318,8 +322,8 @@ fn build_diff_sections(diff: &crate::diff::DomainDiff) -> Vec<DiffSection> {
         rows: vec![
             DiffRow {
                 label: "Resolves",
-                a_values: vec![bool_as_str(dns.resolves.0)],
-                b_values: vec![bool_as_str(dns.resolves.1)],
+                a_values: vec![opt_bool_or_placeholder(&dns.resolves.0)],
+                b_values: vec![opt_bool_or_placeholder(&dns.resolves.1)],
                 matches: dns.resolves.0 == dns.resolves.1,
             },
             DiffRow {
@@ -575,7 +579,7 @@ mod tests {
                     vec!["ns1.example".to_string(), "ns2.example".to_string()],
                     vec!["ns2.example".to_string(), "ns1.example".to_string()],
                 ),
-                resolves: (true, true),
+                resolves: (Some(true), Some(true)),
             },
             ssl: SslDiff {
                 issuer: (
@@ -589,6 +593,7 @@ mod tests {
                 days_remaining: (Some(89), Some(75)),
                 is_valid: (Some(true), Some(true)),
             },
+            errors: Vec::new(),
         }
     }
 
@@ -892,7 +897,7 @@ mod tests {
             dns: DnsDiff {
                 a_records: (vec!["1.1.1.1".to_string()], vec!["1.1.1.1".to_string()]),
                 nameservers: (vec!["ns".to_string()], vec!["ns".to_string()]),
-                resolves: (true, true),
+                resolves: (Some(true), Some(true)),
             },
             ssl: SslDiff {
                 issuer: (Some("I".to_string()), Some("I".to_string())),
@@ -900,6 +905,7 @@ mod tests {
                 days_remaining: (Some(10), Some(10)),
                 is_valid: (Some(true), Some(true)),
             },
+            errors: Vec::new(),
         };
         let out = diff_formatter().format_diff(&diff);
         assert!(
@@ -923,7 +929,7 @@ mod tests {
             dns: DnsDiff {
                 a_records: (vec!["1.1.1.1".to_string()], vec!["2.2.2.2".to_string()]),
                 nameservers: (vec!["nsa".to_string()], vec!["nsb".to_string()]),
-                resolves: (true, false),
+                resolves: (Some(true), Some(false)),
             },
             ssl: SslDiff {
                 issuer: (Some("IA".to_string()), Some("IB".to_string())),
@@ -931,6 +937,7 @@ mod tests {
                 days_remaining: (Some(10), Some(20)),
                 is_valid: (Some(true), Some(false)),
             },
+            errors: Vec::new(),
         };
         let out = diff_formatter().format_diff(&diff);
         // Every field differs. Match marker must not appear on any row.

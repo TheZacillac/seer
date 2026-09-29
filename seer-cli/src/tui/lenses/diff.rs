@@ -139,10 +139,7 @@ fn comparison_table(f: &mut Frame, area: Rect, theme: &Theme, d: &seer_core::dif
         ("expires", pair(&reg.expires)),
         ("A records", joined(&dns.a_records)),
         ("nameservers", joined(&dns.nameservers)),
-        (
-            "resolves",
-            (dns.resolves.0.to_string(), dns.resolves.1.to_string()),
-        ),
+        ("resolves", pair(&dns.resolves)),
         ("ssl issuer", pair(&ssl.issuer)),
         ("ssl valid until", pair(&ssl.valid_until)),
         ("ssl days", pair(&ssl.days_remaining)),
@@ -203,7 +200,7 @@ mod tests {
             dns: DnsDiff {
                 a_records: (vec!["1.2.3.4".into()], vec!["5.6.7.8".into()]),
                 nameservers: (vec![], vec![]),
-                resolves: (true, true),
+                resolves: (Some(true), Some(true)),
             },
             ssl: SslDiff {
                 issuer: (None, None),
@@ -211,6 +208,7 @@ mod tests {
                 days_remaining: (None, None),
                 is_valid: (None, None),
             },
+            errors: Vec::new(),
         }
     }
 

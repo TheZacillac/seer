@@ -1,8 +1,17 @@
+//! Side-by-side comparison of two domains.
+//!
+//! [`DomainDiffer::diff`] runs a smart lookup (registration) and a status
+//! check (DNS resolution + TLS certificate) for each domain concurrently and
+//! lines the results up field by field in a [`DomainDiff`]. A leg that fails
+//! leaves its fields empty (`None` / no records) and records why in
+//! [`DomainDiff::errors`], so a failed check is never shown as a real answer
+//! (a status error used to read as "does not resolve").
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, instrument};
 
-use crate::error::Result;
+use crate::error::{Result, SeerError};
 use crate::lookup::{LookupResult, SmartLookup};
 use crate::status::{StatusClient, StatusResponse};
 
@@ -14,6 +23,10 @@ pub struct DomainDiff {
     pub registration: RegistrationDiff,
     pub dns: DnsDiff,
     pub ssl: SslDiff,
+    /// Checks that failed (`"<domain>: registration lookup failed: …"`,
+    /// sanitized); their fields above are left empty, not defaulted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub errors: Vec<String>,
 }
 
 /// Registration data comparison (registrar, organization, dates).
@@ -30,7 +43,9 @@ pub struct RegistrationDiff {
 pub struct DnsDiff {
     pub a_records: (Vec<String>, Vec<String>),
     pub nameservers: (Vec<String>, Vec<String>),
-    pub resolves: (bool, bool),
+    /// Whether the domain resolves; `None` when its status check failed or
+    /// did not check DNS.
+    pub resolves: (Option<bool>, Option<bool>),
 }
 
 /// SSL certificate comparison (issuer, validity, remaining days).
@@ -54,6 +69,15 @@ impl DomainDiffer {
         Self::default()
     }
 
+    /// Builds a differ honoring `~/.seer/config.toml`: the lookup and status
+    /// clients take their per-protocol timeouts from `config`.
+    pub fn from_config(config: &crate::config::SeerConfig) -> Self {
+        Self {
+            lookup: SmartLookup::from_config(config),
+            status_client: StatusClient::from_config(config),
+        }
+    }
+
     /// Compares two domains, returning their registration, DNS, and SSL differences.
     ///
     /// All four network calls (lookup + status for each domain) run concurrently.
@@ -74,9 +98,17 @@ impl DomainDiffer {
             Box::pin(self.status_client.check(&domain_b)),
         );
 
-        let registration = build_registration_diff(lookup_a.ok().as_ref(), lookup_b.ok().as_ref());
+        let registration =
+            build_registration_diff(lookup_a.as_ref().ok(), lookup_b.as_ref().ok());
         let dns = build_dns_diff(status_a.as_ref().ok(), status_b.as_ref().ok());
         let ssl = build_ssl_diff(status_a.as_ref().ok(), status_b.as_ref().ok());
+
+        let errors = failures(&[
+            (&domain_a, "registration lookup", lookup_a.as_ref().err()),
+            (&domain_b, "registration lookup", lookup_b.as_ref().err()),
+            (&domain_a, "status check", status_a.as_ref().err()),
+            (&domain_b, "status check", status_b.as_ref().err()),
+        ]);
 
         debug!("Domain diff complete");
 
@@ -86,8 +118,21 @@ impl DomainDiffer {
             registration,
             dns,
             ssl,
+            errors,
         })
     }
+}
+
+/// One sanitized line per failed `(domain, check, error)` leg; the full error
+/// goes to the debug log.
+fn failures(legs: &[(&str, &str, Option<&SeerError>)]) -> Vec<String> {
+    legs.iter()
+        .filter_map(|(domain, check, failure)| {
+            let e = (*failure)?;
+            debug!(%domain, error = %e, "{check} failed");
+            Some(format!("{domain}: {check} failed: {}", e.sanitized_message()))
+        })
+        .collect()
 }
 
 /// `YYYY-MM-DD`, the date form every diff field uses.
@@ -118,10 +163,9 @@ fn build_registration_diff(a: Option<&LookupResult>, b: Option<&LookupResult>) -
 }
 
 fn build_dns_diff(a: Option<&StatusResponse>, b: Option<&StatusResponse>) -> DnsDiff {
-    let side = |s: Option<&StatusResponse>| {
-        s.and_then(|s| s.dns_resolution.as_ref())
-            .map(|d| (d.a_records.clone(), d.nameservers.clone(), d.resolves))
-            .unwrap_or_default()
+    let side = |s: Option<&StatusResponse>| match s.and_then(|s| s.dns_resolution.as_ref()) {
+        Some(d) => (d.a_records.clone(), d.nameservers.clone(), Some(d.resolves)),
+        None => (Vec::new(), Vec::new(), None),
     };
     let ((a_records_a, ns_a, resolves_a), (a_records_b, ns_b, resolves_b)) = (side(a), side(b));
 
@@ -185,7 +229,7 @@ mod tests {
                     vec!["a.iana-servers.net".to_string()],
                     vec!["ns1.google.com".to_string()],
                 ),
-                resolves: (true, true),
+                resolves: (Some(true), Some(true)),
             },
             ssl: SslDiff {
                 issuer: (
@@ -199,6 +243,7 @@ mod tests {
                 days_remaining: (Some(89), Some(75)),
                 is_valid: (Some(true), Some(true)),
             },
+            errors: Vec::new(),
         };
 
         let json = serde_json::to_string(&diff).unwrap();
@@ -258,8 +303,36 @@ mod tests {
         assert!(diff.a_records.1.is_empty());
         assert!(diff.nameservers.0.is_empty());
         assert!(diff.nameservers.1.is_empty());
-        assert!(!diff.resolves.0);
-        assert!(!diff.resolves.1);
+        // A failed status check is unknown, not "does not resolve".
+        assert_eq!(diff.resolves, (None, None));
+    }
+
+    #[test]
+    fn failed_legs_are_reported_not_defaulted() {
+        let err = SeerError::Timeout("status check timed out".to_string());
+        let errors = failures(&[
+            ("a.test", "registration lookup", None),
+            ("b.test", "status check", Some(&err)),
+        ]);
+        assert_eq!(errors.len(), 1);
+        assert!(
+            errors[0].starts_with("b.test: status check failed: "),
+            "{errors:?}"
+        );
+        // Serialized only when something failed.
+        let json = |errors: Vec<String>| {
+            serde_json::to_value(DomainDiff {
+                domain_a: "a.test".into(),
+                domain_b: "b.test".into(),
+                registration: build_registration_diff(None, None),
+                dns: build_dns_diff(None, None),
+                ssl: build_ssl_diff(None, None),
+                errors,
+            })
+            .unwrap()
+        };
+        assert!(json(Vec::new()).get("errors").is_none());
+        assert_eq!(json(errors)["errors"].as_array().map(Vec::len), Some(1));
     }
 
     #[test]

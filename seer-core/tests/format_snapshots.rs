@@ -1543,7 +1543,7 @@ fn fixture_domain_diff() -> DomainDiff {
                 vec!["ns1.example.com".into(), "ns2.example.com".into()],
                 vec!["ns2.example.com".into(), "ns1.example.com".into()],
             ),
-            resolves: (true, true),
+            resolves: (Some(true), Some(true)),
         },
         ssl: SslDiff {
             issuer: (Some("Mock CA".into()), Some("Mock CA".into())),
@@ -1551,6 +1551,7 @@ fn fixture_domain_diff() -> DomainDiff {
             days_remaining: (Some(26_000), None),
             is_valid: (Some(true), None),
         },
+        errors: Vec::new(),
     }
 }
 
