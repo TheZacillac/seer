@@ -212,6 +212,7 @@ pub(crate) mod fixtures {
             status: DnsStatus::NoError,
             flags: vec!["qr".into(), "rd".into(), "ra".into()],
             answers,
+            failed_types: Vec::new(),
             authority: vec![],
             wildcard: None,
             query_time_ms: 12,

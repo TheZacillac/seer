@@ -486,11 +486,7 @@ mod tests {
     /// real change (case used to be folded for every record type).
     #[test]
     fn diff_values_reports_case_change_in_txt() {
-        let txt = |t: &str| {
-            observe(&[record(RecordData::TXT {
-                text: t.to_string(),
-            })])
-        };
+        let txt = |t: &str| observe(&[record(RecordData::txt(vec![t.to_string()]))]);
         let (changed, added, removed) = diff_observations(&txt("token=abc"), &txt("token=AbC"));
         assert!(changed);
         assert_eq!(added, vec!["\"token=abc\"".to_string()]);

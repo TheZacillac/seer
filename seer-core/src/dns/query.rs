@@ -49,6 +49,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use super::records::{DnsRecord, RecordData, RecordType};
 use super::resolver::to_dns_record;
+use super::transport::NoResponse;
 use crate::error::{Result, SeerError};
 
 /// A DNS response code, named as `dig` prints it.
@@ -241,6 +242,12 @@ pub struct DnsQueryResult {
     /// records). An ANY answer with records carries none (see
     /// [`answers`](Self::answers)).
     pub authority: Vec<DnsRecord>,
+    /// For ANY: the types whose sub-query failed — no server responded, or
+    /// it could not be sent — so the merged answer says nothing about them.
+    /// Empty for any other type and when every sub-query was answered
+    /// (omitted from the serialized form then).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failed_types: Vec<FailedType>,
     /// Wildcard probe outcome; None when the probe was not run or did not
     /// complete.
     pub wildcard: Option<WildcardProbe>,
@@ -304,6 +311,16 @@ impl DnsQueryResult {
     }
 }
 
+/// A record type an `ANY` fan-out asked for without getting an answer
+/// ([`DnsQueryResult::failed_types`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FailedType {
+    pub record_type: RecordType,
+    /// Why, safe to show: each asked server's transport failure
+    /// (`8.8.8.8: timed out`), or a generic message.
+    pub error: String,
+}
+
 /// The outcome of the wildcard probe: whether the zone answers a random,
 /// certainly-unpublished sibling of the queried name.
 ///
@@ -348,6 +365,8 @@ pub(crate) struct Exchange {
     pub(crate) flags: Vec<String>,
     pub(crate) answers: Vec<DnsRecord>,
     pub(crate) authority: Vec<DnsRecord>,
+    /// An ANY merge's failed sub-queries ([`merge_any`]); empty otherwise.
+    pub(crate) failed_types: Vec<FailedType>,
 }
 
 impl Exchange {
@@ -367,6 +386,7 @@ impl Exchange {
                 .iter()
                 .filter_map(to_dns_record)
                 .collect(),
+            failed_types: Vec::new(),
         }
     }
 
@@ -386,6 +406,7 @@ impl Exchange {
                 flags: Vec::new(),
                 answers: Vec::new(),
                 authority: Vec::new(),
+                failed_types: Vec::new(),
             }),
             Err(e) => Err(SeerError::DnsError(format!(
                 "{record_type} lookup failed: {e}"
@@ -432,6 +453,7 @@ impl Exchange {
             flags: if local { Vec::new() } else { self.flags },
             answers: self.answers,
             authority: self.authority,
+            failed_types: self.failed_types,
             wildcard,
             query_time_ms: duration_ms(query_time),
         }
@@ -538,21 +560,32 @@ pub(crate) fn dedupe_records(records: impl IntoIterator<Item = DnsRecord>) -> Ve
 ///   each bring their zone's SOA — the DS one, answered by the parent, the
 ///   parent's — and none of those describes the answer.
 ///
-/// Sub-queries that failed in transport are skipped; when every one failed,
-/// the last error is returned rather than an empty set that would read as
-/// "no records".
-pub(crate) fn merge_any(results: Vec<Result<Exchange>>) -> Result<Exchange> {
-    let mut exchanges = Vec::with_capacity(results.len());
-    let mut last_err = None;
-    for result in results {
-        match result {
-            Ok(exchange) => exchanges.push(exchange),
-            Err(e) => last_err = Some(e),
-        }
-    }
+/// - failed_types: the sub-queries that got no response (or could not be
+///   sent), each with its reason — so a partial merge does not pass for a
+///   complete one.
+///
+/// When every sub-query failed, the last error is returned ([`fold_any`]).
+pub(crate) fn merge_any(results: Vec<(RecordType, SubQuery)>) -> Result<Exchange> {
+    let (exchanges, failures) = fold_any(results.into_iter().map(|(record_type, result)| {
+        let result = match result {
+            Ok(Ok(exchange)) => Ok(exchange),
+            // The per-server reasons are what a caller's own `Silent` reply
+            // already shows; nothing internal.
+            Ok(Err(why)) => Err((
+                why.to_string(),
+                SeerError::DnsError(format!("{record_type} lookup failed: {why}")),
+            )),
+            Err(e) => Err((e.sanitized_message(), e)),
+        };
+        (record_type, result)
+    }))
+    .map_err(|(_, e)| e)?;
+    let failed_types = failures
+        .into_iter()
+        .map(|(record_type, (error, _))| FailedType { record_type, error })
+        .collect();
     let Some(first) = exchanges.first() else {
-        return Err(last_err
-            .unwrap_or_else(|| SeerError::DnsError("ANY lookup ran no queries".to_string())));
+        return Err(SeerError::DnsError("ANY lookup ran no queries".to_string()));
     };
     let status = if exchanges.iter().any(|e| e.status == DnsStatus::NoError) {
         DnsStatus::NoError
@@ -578,7 +611,38 @@ pub(crate) fn merge_any(results: Vec<Result<Exchange>>) -> Result<Exchange> {
         flags,
         answers,
         authority,
+        failed_types,
     })
+}
+
+/// One ANY sub-query's outcome: an exchange, no response from any server
+/// (the inner `Err`), or an error before one could be sent.
+pub(crate) type SubQuery = Result<std::result::Result<Exchange, NoResponse>>;
+
+/// [`fold_any`]'s split: the successes, and the failures by type.
+pub(crate) type Folded<T, E> = (Vec<T>, Vec<(RecordType, E)>);
+
+/// The ANY fan-out's fold, shared by `DnsResolver::resolve` and
+/// [`merge_any`]: the sub-queries that succeeded, in order, and the failed
+/// ones by type — or, when none succeeded, the last failure, rather than an
+/// empty set that would read as "no records".
+pub(crate) fn fold_any<T, E>(
+    results: impl IntoIterator<Item = (RecordType, std::result::Result<T, E>)>,
+) -> std::result::Result<Folded<T, E>, E> {
+    let mut succeeded = Vec::new();
+    let mut failed = Vec::new();
+    for (record_type, result) in results {
+        match result {
+            Ok(value) => succeeded.push(value),
+            Err(e) => failed.push((record_type, e)),
+        }
+    }
+    if succeeded.is_empty() {
+        if let Some((_, e)) = failed.pop() {
+            return Err(e);
+        }
+    }
+    Ok((succeeded, failed))
 }
 
 /// Whether hickory's resolver answers `name` itself, without sending a
@@ -802,6 +866,7 @@ mod tests {
             flags: vec!["qr".to_string(), "rd".to_string(), "ra".to_string()],
             answers,
             authority: vec![],
+            failed_types: vec![],
         }
     }
 
@@ -1051,6 +1116,19 @@ mod tests {
         to_dns_record(&soa_record(zone).into_record_of_rdata()).unwrap()
     }
 
+    /// A sub-query that got `exchange`.
+    fn answered(record_type: RecordType, exchange: Exchange) -> (RecordType, SubQuery) {
+        (record_type, Ok(Ok(exchange)))
+    }
+
+    /// A sub-query no server responded to.
+    fn silent(record_type: RecordType) -> (RecordType, SubQuery) {
+        (
+            record_type,
+            Ok(Err(NoResponse::timed_out("192.0.2.53".parse().unwrap()))),
+        )
+    }
+
     #[test]
     fn merge_any_status_flags_and_answers() {
         let chain = cname("www.seer.test", "edge.cdn.test.");
@@ -1058,16 +1136,25 @@ mod tests {
         let mut authoritative = nodata.clone();
         authoritative.flags = vec!["qr".to_string(), "aa".to_string()];
         let merged = merge_any(vec![
-            Err(SeerError::DnsError("A lookup failed: timeout".to_string())),
-            Ok(authoritative),
-            Ok(exchange(
-                DnsStatus::NoError,
-                vec![chain.clone(), a("edge.cdn.test", "192.0.2.7")],
-            )),
-            Err(SeerError::DnsError("MX lookup failed: timeout".to_string())),
-            Ok(exchange(DnsStatus::NoError, vec![chain.clone()])),
+            silent(RecordType::A),
+            answered(RecordType::AAAA, authoritative),
+            answered(
+                RecordType::CNAME,
+                exchange(
+                    DnsStatus::NoError,
+                    vec![chain.clone(), a("edge.cdn.test", "192.0.2.7")],
+                ),
+            ),
+            silent(RecordType::MX),
+            answered(
+                RecordType::NS,
+                exchange(DnsStatus::NoError, vec![chain.clone()]),
+            ),
             // The DS sub-query, answered NODATA by the parent zone.
-            Ok(negative(DnsStatus::NoError, vec![soa("test")])),
+            answered(
+                RecordType::DS,
+                negative(DnsStatus::NoError, vec![soa("test")]),
+            ),
         ])
         .unwrap();
         assert_eq!(merged.status, DnsStatus::NoError);
@@ -1081,17 +1168,27 @@ mod tests {
         // A negative merge keeps the SOA, once, from the sub-queries that
         // returned the merged status.
         let all_nodata = merge_any(vec![
-            Ok(nodata.clone()),
-            Ok(negative(DnsStatus::ServFail, vec![soa("other")])),
-            Ok(nodata),
+            answered(RecordType::A, nodata.clone()),
+            answered(
+                RecordType::AAAA,
+                negative(DnsStatus::ServFail, vec![soa("other")]),
+            ),
+            answered(RecordType::MX, nodata),
         ])
         .unwrap();
         assert_eq!(all_nodata.status, DnsStatus::NoError);
         assert_eq!(all_nodata.authority, [soa("seer.test")]);
+        assert!(all_nodata.failed_types.is_empty());
 
         let all_nx = merge_any(vec![
-            Ok(negative(DnsStatus::NxDomain, vec![soa("seer.test")])),
-            Ok(negative(DnsStatus::NxDomain, vec![soa("seer.test")])),
+            answered(
+                RecordType::A,
+                negative(DnsStatus::NxDomain, vec![soa("seer.test")]),
+            ),
+            answered(
+                RecordType::MX,
+                negative(DnsStatus::NxDomain, vec![soa("seer.test")]),
+            ),
         ])
         .unwrap();
         assert_eq!(all_nx.status, DnsStatus::NxDomain);
@@ -1104,24 +1201,81 @@ mod tests {
 
         // Mixed failures: the first sub-query's status.
         let mixed = merge_any(vec![
-            Ok(negative(DnsStatus::ServFail, vec![])),
-            Ok(negative(DnsStatus::NxDomain, vec![])),
+            answered(RecordType::A, negative(DnsStatus::ServFail, vec![])),
+            answered(RecordType::MX, negative(DnsStatus::NxDomain, vec![])),
         ])
         .unwrap();
         assert_eq!(mixed.status, DnsStatus::ServFail);
     }
 
     #[test]
-    fn merge_any_errors_only_when_every_sub_query_failed() {
-        let err = merge_any(vec![
-            Err(SeerError::DnsError("A lookup failed: timeout".to_string())),
-            Err(SeerError::DnsError(
-                "AAAA lookup failed: timeout".to_string(),
-            )),
+    fn merge_any_reports_the_types_whose_sub_query_failed() {
+        // Regression: a sub-query that timed out was dropped without a
+        // trace, so an ANY answer missing its TXT records read as complete.
+        let merged = merge_any(vec![
+            answered(
+                RecordType::A,
+                exchange(DnsStatus::NoError, vec![a("seer.test", "192.0.2.1")]),
+            ),
+            silent(RecordType::TXT),
+            (
+                RecordType::DNSKEY,
+                Err(SeerError::DnsError("internal detail".to_string())),
+            ),
         ])
-        .unwrap_err();
+        .unwrap();
+        assert_eq!(merged.answers, [a("seer.test", "192.0.2.1")]);
+        assert_eq!(
+            merged.failed_types,
+            [
+                FailedType {
+                    record_type: RecordType::TXT,
+                    error: "192.0.2.53: timed out".to_string(),
+                },
+                // An error that is not a transport failure is reported
+                // sanitized.
+                FailedType {
+                    record_type: RecordType::DNSKEY,
+                    error: "DNS resolution failed".to_string(),
+                },
+            ]
+        );
+        let result = merged.into_result(
+            "seer.test".to_string(),
+            RecordType::ANY,
+            None,
+            None,
+            Duration::ZERO,
+        );
+        assert_eq!(result.failed_types.len(), 2);
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(json["failed_types"][0]["record_type"], "TXT");
+    }
+
+    #[test]
+    fn merge_any_errors_only_when_every_sub_query_failed() {
+        let err = merge_any(vec![silent(RecordType::A), silent(RecordType::AAAA)]).unwrap_err();
         assert!(err.to_string().contains("AAAA lookup failed"), "{err}");
+        assert!(err.to_string().contains("192.0.2.53: timed out"), "{err}");
         assert!(merge_any(vec![]).is_err());
+    }
+
+    #[test]
+    fn fold_any_keeps_successes_and_failures_apart() {
+        let (ok, failed) = fold_any([
+            (RecordType::A, Ok(1)),
+            (RecordType::MX, Err("mx")),
+            (RecordType::TXT, Ok(3)),
+        ])
+        .unwrap();
+        assert_eq!(ok, [1, 3]);
+        assert_eq!(failed, [(RecordType::MX, "mx")]);
+        // Nothing succeeded: the last failure.
+        let all_failed: std::result::Result<(Vec<u8>, _), _> =
+            fold_any([(RecordType::A, Err("a")), (RecordType::MX, Err("mx"))]);
+        assert_eq!(all_failed.unwrap_err(), "mx");
+        let none: std::result::Result<Folded<u8, &str>, &str> = fold_any([]);
+        assert_eq!(none.unwrap(), (vec![], vec![]));
     }
 
     #[test]

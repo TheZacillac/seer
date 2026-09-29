@@ -295,6 +295,7 @@ mod tests {
                     },
                 ),
             ],
+            failed_types: Vec::new(),
             authority: Vec::new(),
             wildcard: None,
             query_time_ms: 12,
@@ -352,9 +353,7 @@ mod tests {
         result.answers.push(record(
             "edge.cdn.test",
             60,
-            RecordData::TXT {
-                text: format!("v=spf1{EVIL}"),
-            },
+            RecordData::txt(vec![format!("v=spf1{EVIL}")]),
         ));
         result.wildcard = Some(WildcardProbe {
             probe_name: format!("seer-probe-0000000000.seer.test{EVIL}"),

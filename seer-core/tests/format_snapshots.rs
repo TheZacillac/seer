@@ -1059,6 +1059,7 @@ fn dig_result(name: &str, record_type: RecordType, status: DnsStatus) -> DnsQuer
         status,
         flags: dig_flags(),
         answers: Vec::new(),
+        failed_types: Vec::new(),
         authority: Vec::new(),
         wildcard: None,
         query_time_ms: 12,
@@ -1093,6 +1094,7 @@ fn fixture_dig_cname_chain() -> DnsQueryResult {
 /// The name does not exist; the zone's SOA came back in AUTHORITY.
 fn fixture_dig_nxdomain() -> DnsQueryResult {
     DnsQueryResult {
+        failed_types: Vec::new(),
         authority: vec![soa_record("seer.test")],
         query_time_ms: 31,
         ..dig_result("gone.seer.test", RecordType::A, DnsStatus::NxDomain)
@@ -1102,6 +1104,7 @@ fn fixture_dig_nxdomain() -> DnsQueryResult {
 /// The name exists but has no AAAA records (NOERROR, empty answer).
 fn fixture_dig_nodata() -> DnsQueryResult {
     DnsQueryResult {
+        failed_types: Vec::new(),
         authority: vec![soa_record("seer.test")],
         ..dig_result("www.seer.test", RecordType::AAAA, DnsStatus::NoError)
     }
@@ -1116,6 +1119,7 @@ fn fixture_dig_dangling_cname() -> DnsQueryResult {
             cname_record("www.seer.test", 3600, "shop.seer.test."),
             cname_record("shop.seer.test", 300, "gone.cdn.test."),
         ],
+        failed_types: Vec::new(),
         authority: vec![soa_record("cdn.test")],
         query_time_ms: 27,
         ..dig_result("www.seer.test", RecordType::A, DnsStatus::NxDomain)
@@ -1126,6 +1130,7 @@ fn fixture_dig_dangling_cname() -> DnsQueryResult {
 fn fixture_dig_nodata_behind_cname() -> DnsQueryResult {
     DnsQueryResult {
         answers: vec![cname_record("www.seer.test", 300, "edge.cdn.test.")],
+        failed_types: Vec::new(),
         authority: vec![soa_record("cdn.test")],
         ..dig_result("www.seer.test", RecordType::AAAA, DnsStatus::NoError)
     }
@@ -1170,6 +1175,7 @@ fn fixture_dig_referral() -> DnsQueryResult {
     DnsQueryResult {
         server: Some("ns1.seer.test".into()),
         flags: vec!["qr".into(), "rd".into()],
+        failed_types: Vec::new(),
         authority: vec![ns("ns1.child.seer.test."), ns("ns2.child.seer.test.")],
         query_time_ms: 14,
         ..dig_result("www.child.seer.test", RecordType::A, DnsStatus::NoError)
