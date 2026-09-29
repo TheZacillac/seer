@@ -62,10 +62,16 @@ impl RecordType {
 
     /// The same list as `&'static str` names, for surfaces that need string
     /// slices directly (completion candidates, help text, JSON schemas).
-    pub const ALL_NAMES: &'static [&'static str] = &[
-        "A", "AAAA", "CNAME", "MX", "NS", "TXT", "SOA", "PTR", "SRV", "CAA", "NAPTR", "DNSKEY",
-        "DS", "CDS", "CDNSKEY", "TLSA", "SSHFP", "HTTPS", "SVCB", "ANY",
-    ];
+    /// Derived from [`Self::ALL`] and [`Self::as_str`], so it cannot drift.
+    pub const ALL_NAMES: &'static [&'static str] = &{
+        let mut names = [""; RecordType::ALL.len()];
+        let mut i = 0;
+        while i < names.len() {
+            names[i] = RecordType::ALL[i].as_str();
+            i += 1;
+        }
+        names
+    };
 
     /// The canonical uppercase name. Exhaustive match, so adding a variant
     /// fails to compile here first — the prompt to also extend [`Self::ALL`].
@@ -104,30 +110,17 @@ impl fmt::Display for RecordType {
 impl FromStr for RecordType {
     type Err = SeerError;
 
+    /// Parses a type name as [`RecordType::as_str`] spells it, ASCII
+    /// case-insensitively, or `*` for `ANY` (dig's spelling).
     fn from_str(s: &str) -> Result<Self> {
-        match s.to_uppercase().as_str() {
-            "A" => Ok(RecordType::A),
-            "AAAA" => Ok(RecordType::AAAA),
-            "CNAME" => Ok(RecordType::CNAME),
-            "MX" => Ok(RecordType::MX),
-            "NS" => Ok(RecordType::NS),
-            "TXT" => Ok(RecordType::TXT),
-            "SOA" => Ok(RecordType::SOA),
-            "PTR" => Ok(RecordType::PTR),
-            "SRV" => Ok(RecordType::SRV),
-            "CAA" => Ok(RecordType::CAA),
-            "NAPTR" => Ok(RecordType::NAPTR),
-            "DNSKEY" => Ok(RecordType::DNSKEY),
-            "DS" => Ok(RecordType::DS),
-            "CDS" => Ok(RecordType::CDS),
-            "CDNSKEY" => Ok(RecordType::CDNSKEY),
-            "TLSA" => Ok(RecordType::TLSA),
-            "SSHFP" => Ok(RecordType::SSHFP),
-            "HTTPS" => Ok(RecordType::HTTPS),
-            "SVCB" => Ok(RecordType::SVCB),
-            "ANY" | "*" => Ok(RecordType::ANY),
-            _ => Err(SeerError::InvalidRecordType(s.to_string())),
+        if s == "*" {
+            return Ok(RecordType::ANY);
         }
+        RecordType::ALL
+            .iter()
+            .copied()
+            .find(|t| t.as_str().eq_ignore_ascii_case(s))
+            .ok_or_else(|| SeerError::InvalidRecordType(s.to_string()))
     }
 }
 
@@ -182,6 +175,42 @@ fn write_svcb(
     Ok(())
 }
 
+/// Writes TXT RDATA the way dig prints it: each character-string quoted
+/// ([`quote_char_string`]), separated by a space — so the string boundaries,
+/// and a `"` inside a string, read unambiguously.
+fn write_txt(f: &mut fmt::Formatter<'_>, text: &str, strings: &[String]) -> fmt::Result {
+    let whole = [text.to_string()];
+    let strings = if strings.is_empty() {
+        &whole[..]
+    } else {
+        strings
+    };
+    for (i, string) in strings.iter().enumerate() {
+        if i > 0 {
+            f.write_str(" ")?;
+        }
+        f.write_str(&quote_char_string(string))?;
+    }
+    Ok(())
+}
+
+/// A character-string in quoted presentation form (RFC 1035 §5.1): `"` and
+/// `\` backslash-escaped, everything else as is — control characters are
+/// left to the renderers' terminal/markdown sanitizers, as for every other
+/// remote string.
+fn quote_char_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        if matches!(c, '"' | '\\') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('"');
+    out
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "record_type", content = "value", rename_all = "UPPERCASE")]
 #[allow(clippy::upper_case_acronyms)]
@@ -202,8 +231,21 @@ pub enum RecordData {
     NS {
         nameserver: String,
     },
+    /// A TXT record: one or more character-strings (RFC 1035 §3.3.14).
+    /// Build one with [`RecordData::txt`], which keeps the two fields in
+    /// step.
     TXT {
+        /// The character-strings joined with nothing between them — how
+        /// SPF (RFC 7208 §3.3), DMARC and verification tokens read a TXT
+        /// record.
         text: String,
+        /// The character-strings as the server sent them: where a record
+        /// splits is part of its data, so `["ab", "c"]` and `["a", "bc"]`
+        /// are different records with the same `text`. Empty only for a
+        /// record built without them (data serialized before this field),
+        /// which then reads as the one string `text`.
+        #[serde(default)]
+        strings: Vec<String>,
     },
     SOA {
         mname: String,
@@ -296,9 +338,6 @@ pub enum RecordData {
         target: String,
         params: Vec<SvcParam>,
     },
-    Unknown {
-        raw: String,
-    },
 }
 
 impl fmt::Display for RecordData {
@@ -312,7 +351,7 @@ impl fmt::Display for RecordData {
                 exchange,
             } => write!(f, "{} {}", preference, exchange),
             RecordData::NS { nameserver } => write!(f, "{}", nameserver),
-            RecordData::TXT { text } => write!(f, "\"{}\"", text),
+            RecordData::TXT { text, strings } => write_txt(f, text, strings),
             RecordData::SOA {
                 mname,
                 rname,
@@ -391,12 +430,19 @@ impl fmt::Display for RecordData {
                 target,
                 params,
             } => write_svcb(f, *priority, target, params),
-            RecordData::Unknown { raw } => write!(f, "{}", raw),
         }
     }
 }
 
 impl RecordData {
+    /// A TXT record from its character-strings, in the order sent.
+    pub fn txt(strings: Vec<String>) -> Self {
+        RecordData::TXT {
+            text: strings.concat(),
+            strings,
+        }
+    }
+
     /// The address of an A or AAAA record; `None` for any other type.
     pub(crate) fn address(&self) -> Option<&str> {
         match self {
@@ -445,8 +491,7 @@ impl RecordData {
             | RecordData::CDS { .. }
             | RecordData::CDNSKEY { .. }
             | RecordData::TLSA { .. }
-            | RecordData::SSHFP { .. }
-            | RecordData::Unknown { .. } => {}
+            | RecordData::SSHFP { .. } => {}
         }
         folded.to_string()
     }
@@ -469,6 +514,33 @@ mod tests {
         assert_eq!("MX".parse::<RecordType>().unwrap(), RecordType::MX);
         assert_eq!("*".parse::<RecordType>().unwrap(), RecordType::ANY);
         assert!("INVALID".parse::<RecordType>().is_err());
+    }
+
+    #[test]
+    fn record_type_from_str_is_ascii_case_insensitive() {
+        for (name, expected) in [
+            ("a", RecordType::A),
+            ("mx", RecordType::MX),
+            ("Mx", RecordType::MX),
+            ("cNaMe", RecordType::CNAME),
+            ("dnskey", RecordType::DNSKEY),
+            ("any", RecordType::ANY),
+            ("ANY", RecordType::ANY),
+        ] {
+            assert_eq!(name.parse::<RecordType>().unwrap(), expected, "{name}");
+        }
+        // Regression: Unicode uppercasing folded U+017F (long s) to `S`, so
+        // "ſrv" parsed as SRV.
+        assert!("ſrv".parse::<RecordType>().is_err());
+        assert!("ſoa".parse::<RecordType>().is_err());
+    }
+
+    #[test]
+    fn record_type_from_str_rejects_padding_and_unknown_names() {
+        // No trim: a padded label is malformed input, not a type.
+        for bad in [" A", "A ", "\tA\n", "NOTAREAL", "A1", "", "**"] {
+            assert!(bad.parse::<RecordType>().is_err(), "{bad:?}");
+        }
     }
 
     #[test]
@@ -500,9 +572,7 @@ mod tests {
         };
         assert_eq!(format!("{}", mx), "10 mail.example.com");
 
-        let txt = RecordData::TXT {
-            text: "v=spf1 include:example.com".to_string(),
-        };
+        let txt = RecordData::txt(vec!["v=spf1 include:example.com".to_string()]);
         assert_eq!(format!("{}", txt), "\"v=spf1 include:example.com\"");
 
         let srv = RecordData::SRV {
@@ -583,9 +653,7 @@ mod tests {
 
         // Case-sensitive payloads are compared verbatim: a TXT token or a
         // base64 key that changes only in case IS a different value.
-        let txt = |t: &str| RecordData::TXT {
-            text: t.to_string(),
-        };
+        let txt = |t: &str| RecordData::txt(vec![t.to_string()]);
         assert_ne!(
             txt("verify=AbC").comparison_key(),
             txt("verify=abc").comparison_key()
@@ -737,15 +805,61 @@ mod tests {
     /// Drift guard for the three surfaces that render `RecordType::ALL`
     /// (CLI help, REPL completion, MCP tool schema). Adding a variant breaks
     /// `as_str`'s exhaustive match at compile time; this pins the count so the
-    /// author must also extend `ALL`/`ALL_NAMES` rather than only `as_str`.
+    /// author must also extend `ALL` (which `ALL_NAMES` and `FromStr` derive
+    /// from) rather than only `as_str`.
     #[test]
     fn all_is_complete() {
         assert_eq!(
             RecordType::ALL.len(),
             20,
-            "new RecordType variant — add it to ALL and ALL_NAMES too"
+            "new RecordType variant — add it to ALL too"
         );
         assert_eq!(RecordType::ALL.len(), RecordType::ALL_NAMES.len());
+    }
+
+    fn txt(strings: &[&str]) -> RecordData {
+        RecordData::txt(strings.iter().map(|s| s.to_string()).collect())
+    }
+
+    #[test]
+    fn txt_displays_each_string_quoted_and_escaped_like_dig() {
+        let split = txt(&["v=spf1 include:_spf.example.com", " -all"]);
+        assert_eq!(
+            split.to_string(),
+            r#""v=spf1 include:_spf.example.com" " -all""#
+        );
+        // `text` is the concatenation SPF/DMARC readers want.
+        assert!(matches!(
+            &split,
+            RecordData::TXT { text, .. } if text == "v=spf1 include:_spf.example.com -all"
+        ));
+        // Quotes and backslashes are escaped, so one string cannot pass for
+        // two.
+        assert_eq!(txt(&["a\"b", "c\\d"]).to_string(), r#""a\"b" "c\\d""#);
+        assert_eq!(txt(&[""]).to_string(), r#""""#);
+        // Data without `strings` (serialized before the field) reads as one.
+        let legacy: RecordData =
+            serde_json::from_str(r#"{"record_type":"TXT","value":{"text":"a b"}}"#).unwrap();
+        assert_eq!(legacy.to_string(), r#""a b""#);
+        assert_eq!(legacy.comparison_key(), txt(&["a b"]).comparison_key());
+    }
+
+    #[test]
+    fn txt_comparison_key_keeps_string_boundaries() {
+        // Regression: the strings were joined bare, so these two different
+        // records compared equal, and `a" "b` read like two strings.
+        assert_ne!(
+            txt(&["ab", "c"]).comparison_key(),
+            txt(&["a", "bc"]).comparison_key()
+        );
+        assert_ne!(
+            txt(&["a\" \"b"]).comparison_key(),
+            txt(&["a", "b"]).comparison_key()
+        );
+        assert_eq!(
+            txt(&["ab", "c"]).comparison_key(),
+            txt(&["ab", "c"]).comparison_key()
+        );
     }
 
     /// `ALL`, `ALL_NAMES`, `as_str`, and `FromStr` must agree entry-for-entry:

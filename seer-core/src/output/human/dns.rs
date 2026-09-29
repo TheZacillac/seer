@@ -340,9 +340,7 @@ mod tests {
                 name: "example.com".to_string(),
                 record_type: RecordType::TXT,
                 ttl: 300,
-                data: RecordData::TXT {
-                    text: EVIL_TXT.to_string(),
-                },
+                data: RecordData::txt(vec![EVIL_TXT.to_string()]),
             }],
             changed: true,
             added: vec![EVIL_TXT.to_string()],

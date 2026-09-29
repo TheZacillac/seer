@@ -154,10 +154,9 @@ mod tests {
                 name: "www|seer`test".to_string(),
                 record_type: RecordType::TXT,
                 ttl: 60,
-                data: RecordData::TXT {
-                    text: "a|b`c\nd".to_string(),
-                },
+                data: RecordData::txt(vec!["a|b`c\nd".to_string()]),
             }],
+            failed_types: Vec::new(),
             authority: Vec::new(),
             wildcard: None,
             query_time_ms: 3,

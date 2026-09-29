@@ -304,7 +304,7 @@ fn txt_strings(records: &[crate::dns::DnsRecord]) -> Vec<String> {
     records
         .iter()
         .filter_map(|r| match &r.data {
-            RecordData::TXT { text } => Some(text.clone()),
+            RecordData::TXT { text, .. } => Some(text.clone()),
             _ => None,
         })
         .collect()

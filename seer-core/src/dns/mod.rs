@@ -15,8 +15,11 @@
 //! - [`DnsTracer`]: iterative resolution from the root servers down, one
 //!   [`TraceHop`] per delegation level (`dig +trace`).
 //!
-//! No outer retry loop at this layer: hickory's own retransmission is the
-//! only retry (see `resolver.rs`).
+//! No outer retry loop at this layer: hickory's own re-send of a timed-out
+//! attempt is the only retry (see `resolver.rs`).
+
+use std::net::IpAddr;
+use std::time::Duration;
 
 mod compare;
 mod delegation;
@@ -52,3 +55,39 @@ pub use trace::{DnsTrace, DnsTracer, TraceHop};
 // Crate-internal: shared with `net.rs` so the SSRF fallback resolver and the
 // main resolver cannot drift apart on option settings.
 pub(crate) use resolver::apply_standard_opts;
+
+/// The per-query DNS timeout when no config supplies one — the config
+/// file's `timeouts.dns_secs` default. One definition for every DNS client's
+/// `new()`.
+pub(crate) const DEFAULT_DNS_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// `addrs` with the IPv4 addresses first, each family in its given order.
+///
+/// Nameserver address lists are tried in order under a deadline, and
+/// hickory's `lookup_ip` returns AAAA before A: on a host with an IPv6 route
+/// but no IPv6 transit an IPv6-first list spends the deadline on black-holed
+/// sends. IPv6 stays as fallback — on an IPv6-only host the IPv4 sends fail
+/// fast (ENETUNREACH).
+pub(crate) fn ipv4_first(mut addrs: Vec<IpAddr>) -> Vec<IpAddr> {
+    // Stable sort: `false` (IPv4) before `true` (IPv6).
+    addrs.sort_by_key(IpAddr::is_ipv6);
+    addrs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ipv4_first_keeps_each_familys_order() {
+        let ips: Vec<IpAddr> = ["2001:db8::1", "192.0.2.2", "2001:db8::2", "192.0.2.1"]
+            .iter()
+            .map(|ip| ip.parse().unwrap())
+            .collect();
+        let ordered: Vec<String> = ipv4_first(ips).iter().map(IpAddr::to_string).collect();
+        assert_eq!(
+            ordered,
+            ["192.0.2.2", "192.0.2.1", "2001:db8::1", "2001:db8::2"]
+        );
+    }
+}

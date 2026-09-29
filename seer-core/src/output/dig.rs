@@ -296,12 +296,7 @@ mod tests {
     }
 
     fn txt(name: &str, text: &str) -> DnsRecord {
-        record(
-            name,
-            RecordData::TXT {
-                text: text.to_string(),
-            },
-        )
+        record(name, RecordData::txt(vec![text.to_string()]))
     }
 
     fn result(
@@ -317,6 +312,7 @@ mod tests {
             status,
             flags: vec!["qr".into(), "rd".into(), "ra".into()],
             answers,
+            failed_types: Vec::new(),
             authority: Vec::new(),
             wildcard: None,
             query_time_ms: 12,

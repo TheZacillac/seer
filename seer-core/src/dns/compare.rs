@@ -299,9 +299,7 @@ mod tests {
                 name: "example.com".to_string(),
                 record_type: RecordType::TXT,
                 ttl: 300,
-                data: RecordData::TXT {
-                    text: text.to_string(),
-                },
+                data: RecordData::txt(vec![text.to_string()]),
             }],
             error: None,
         };

@@ -306,9 +306,7 @@ mod tests {
             vec![ConsensusValue::new(RecordType::NS, "ns1.example.com.")]
         );
 
-        let txt = |t: &str| RecordData::TXT {
-            text: t.to_string(),
-        };
+        let txt = |t: &str| RecordData::txt(vec![t.to_string()]);
         let results = vec![
             result("1.1.1.1", txt("token=AbC"), RecordType::TXT),
             result("8.8.8.8", txt("token=abc"), RecordType::TXT),

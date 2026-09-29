@@ -9,11 +9,14 @@
 //!
 //! Retry boundary (deliberate): unlike the WHOIS/RDAP clients, this module
 //! does NOT wrap queries in [`crate::retry::RetryPolicy`]. hickory-resolver
-//! already performs its own retransmission (`opts.attempts` below) against
-//! the configured nameserver within the per-query timeout; stacking an outer
-//! retry loop on top would multiply worst-case latency without improving
-//! resolution odds. If a retry knob is ever needed here, tune
-//! `ResolverOpts::attempts` rather than adding a wrapper.
+//! already re-sends a lookup whose attempt timed out, up to `opts.attempts`
+//! ([`RESOLVER_ATTEMPTS`]) attempts in all, each under its own full
+//! per-query timeout — so a lookup against a silent server takes that many
+//! timeouts. Stacking an outer retry loop on top would multiply worst-case
+//! latency without improving resolution odds. If a retry knob is ever
+//! needed here, tune [`RESOLVER_ATTEMPTS`] rather than adding a wrapper;
+//! `query()`'s direct path derives its deadline from it
+//! (`transport::QUERY_BUDGET_TIMEOUTS`).
 
 use std::borrow::Cow;
 use std::net::IpAddr;
@@ -27,7 +30,6 @@ use hickory_resolver::config::{
     NameServerConfig, ResolveHosts, ResolverConfig, ResolverOpts, ServerOrderingStrategy, GOOGLE,
 };
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
-use hickory_resolver::net::NetError;
 use hickory_resolver::proto::dnssec::PublicKey;
 use hickory_resolver::proto::rr::rdata::svcb::{SvcParamKey, SvcParamValue, SVCB};
 use hickory_resolver::proto::rr::rdata::CAA;
@@ -40,34 +42,29 @@ use tracing::{debug, instrument};
 
 use super::nameserver::{NameserverProtocol, NameserverSpec};
 use super::query::{
-    answered_locally, dedupe_records, merge_any, random_probe_label, wildcard_outcome,
-    wildcard_probe_name, DnsQueryResult, Exchange, WildcardProbe,
+    answered_locally, dedupe_records, fold_any, merge_any, random_probe_label, wildcard_outcome,
+    wildcard_probe_name, DnsQueryResult, Exchange, SubQuery, WildcardProbe,
 };
 use super::records::{DnsRecord, RecordData, RecordType, SvcParam};
 use super::transport::{NoResponse, Transport};
+use super::{ipv4_first, DEFAULT_DNS_TIMEOUT};
 use crate::error::{Result, SeerError};
 use crate::validation::{normalize_domain, normalize_query_name};
 
-/// Convert a DNS lookup result, treating "no records found" as an empty vec
-/// rather than an error. This is correct DNS behavior — the absence of a
-/// record type for a domain is a valid response (NODATA), not a failure.
-fn dns_lookup_or_empty<T>(
-    result: std::result::Result<T, NetError>,
-    record_type: &str,
-) -> Result<Option<T>> {
-    match result {
-        Ok(response) => Ok(Some(response)),
-        Err(e) if e.is_no_records_found() => Ok(None),
-        Err(e) => Err(SeerError::DnsError(format!(
-            "{} lookup failed: {}",
-            record_type, e
-        ))),
-    }
-}
+/// hickory's `attempts`: how many times a lookup is sent before it fails,
+/// each attempt under a full per-query timeout. The one setting both query
+/// paths' deadlines derive from (see the module docs).
+pub(crate) const RESOLVER_ATTEMPTS: usize = 2;
 
-/// Default timeout for DNS queries (5 seconds).
-/// DNS is typically fast; longer timeouts indicate network issues or unreachable servers.
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a positive answer waits for its still-running wildcard probe,
+/// as a fraction of the per-query timeout (1s at the 5s default). The probe
+/// asks for a random, never-cached name, so it can trail a cached answer by
+/// a full recursion — but never by more than this: it must not cost the
+/// main query its answer time.
+const PROBE_GRACE_DIVISOR: u32 = 5;
+
+/// How debug logs name the upstream of a query that names no nameserver.
+const DEFAULT_UPSTREAM: &str = "default (Google Public DNS)";
 
 /// The record types an `ANY` query fans out to, in report order.
 ///
@@ -98,7 +95,7 @@ const ANY_TYPES: [RecordType; 11] = [
 /// server-ordering fix below would have landed in only one of them.
 pub(crate) fn apply_standard_opts(opts: &mut ResolverOpts, timeout: Duration) {
     opts.timeout = timeout;
-    opts.attempts = 2;
+    opts.attempts = RESOLVER_ATTEMPTS;
     opts.use_hosts_file = ResolveHosts::Never;
     // Pin the query order to the configured list instead of hickory's default
     // `QueryStatistics`. The default orders servers by observed performance,
@@ -216,18 +213,13 @@ fn build_upstream_config(
     // hickory's `lookup_ip` returns AAAA before A, so a dual-stack hostname
     // (`dns.google`, `https://cloudflare-dns.com/dns-query`) led with two
     // IPv6 entries; with black-holed IPv6 transit they spent the whole
-    // deadline and the IPv4 entries were never reached. IPv6 stays as
-    // fallback: on an IPv6-only host IPv4 sends fail fast (ENETUNREACH).
-    let ordered = ips
-        .iter()
-        .filter(|ip| ip.is_ipv4())
-        .chain(ips.iter().filter(|ip| ip.is_ipv6()));
-    for ip in ordered {
+    // deadline and the IPv4 entries were never reached.
+    for ip in ipv4_first(ips.to_vec()) {
         let mut ns = match spec.protocol {
-            NameserverProtocol::Udp => NameServerConfig::udp(*ip),
-            NameserverProtocol::Tls => NameServerConfig::tls(*ip, Arc::from(spec.tls_name())),
+            NameserverProtocol::Udp => NameServerConfig::udp(ip),
+            NameserverProtocol::Tls => NameServerConfig::tls(ip, Arc::from(spec.tls_name())),
             NameserverProtocol::Https => NameServerConfig::https(
-                *ip,
+                ip,
                 Arc::from(spec.tls_name()),
                 spec.path.as_deref().map(Arc::from),
             ),
@@ -253,6 +245,9 @@ pub struct DnsResolver {
     /// Cached default resolver (Google DNS). Reused across all queries
     /// that don't specify a custom nameserver.
     default_resolver: TokioResolver,
+    /// [`query`](Self::query)'s direct transport, built once with the same
+    /// timeout (its rustls client config is not free to build).
+    transport: Transport,
     /// Port override for custom-nameserver queries. Always `None` in
     /// production (the port comes from the parsed [`NameserverSpec`]);
     /// settable only through the `#[cfg(test)]` seam so mock-server tests
@@ -287,9 +282,16 @@ impl Default for DnsResolver {
 impl DnsResolver {
     /// Creates a new DNS resolver with default settings.
     pub fn new() -> Self {
+        Self::with_timeout_only(DEFAULT_DNS_TIMEOUT)
+    }
+
+    /// A resolver with `timeout` and every other setting at its default:
+    /// the one place the cached resolver and transport are built, once each.
+    fn with_timeout_only(timeout: Duration) -> Self {
         Self {
-            timeout: DEFAULT_TIMEOUT,
-            default_resolver: build_default_resolver(DEFAULT_TIMEOUT),
+            timeout,
+            default_resolver: build_default_resolver(timeout),
+            transport: Transport::new(timeout),
             port_override: None,
             allow_private_hosts: false,
             #[cfg(test)]
@@ -300,16 +302,15 @@ impl DnsResolver {
     /// Builds a resolver honoring `~/.seer/config.toml` settings.
     ///
     /// Reads `timeouts.dns_secs` (already clamped to 1–60s by
-    /// [`crate::config::SeerConfig::load`]). Sugar over
-    /// [`DnsResolver::with_timeout`] — equivalent to
-    /// `DnsResolver::new().with_timeout(config.dns_timeout())`.
+    /// [`crate::config::SeerConfig::load`]) — the same resolver as
+    /// `DnsResolver::new().with_timeout(config.dns_timeout())`, built once.
     ///
     /// The `nameserver` config key is deliberately NOT applied here: the
     /// resolver takes the nameserver per-query (see [`DnsResolver::resolve`]),
     /// so callers thread `config.nameserver` at the call site where it can be
     /// overridden per-invocation.
     pub fn from_config(config: &crate::config::SeerConfig) -> Self {
-        Self::new().with_timeout(config.dns_timeout())
+        Self::with_timeout_only(config.dns_timeout())
     }
 
     /// Test-only: the per-query timeout, for asserting config plumbing.
@@ -360,6 +361,7 @@ impl DnsResolver {
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self.default_resolver = build_default_resolver(timeout);
+        self.transport = Transport::new(timeout);
         self
     }
 
@@ -411,24 +413,42 @@ impl DnsResolver {
             resolved
         };
 
-        // SSRF protection: reject private/reserved IPs — whether supplied
-        // literally or returned by name resolution, and identically for
-        // UDP, tls://, and https:// specs. Without this, a hostname under
-        // attacker control could point at internal infra.
-        // `allow_private_hosts` is only settable via the `#[cfg(test)]`
-        // seam; production builds always validate.
-        if !self.allow_private_hosts {
-            for ip in &ips {
-                if let Some(reason) = crate::validation::describe_reserved_ip(ip) {
-                    return Err(SeerError::DnsError(format!(
-                        "nameserver {} blocked: {}",
-                        nameserver, reason
-                    )));
-                }
+        self.vet_nameserver_ips(nameserver, &ips)?;
+        Ok(build_upstream_config(&spec, &ips, self.port_override))
+    }
+
+    /// SSRF protection: rejects private/reserved IPs — whether supplied
+    /// literally or returned by name resolution, and identically for UDP,
+    /// tls:// and https:// specs. Without this, a hostname under attacker
+    /// control could point at internal infra. `allow_private_hosts` is only
+    /// settable via the `#[cfg(test)]` seam; production builds always
+    /// validate.
+    fn vet_nameserver_ips(&self, nameserver: &str, ips: &[IpAddr]) -> Result<()> {
+        if self.allow_private_hosts {
+            return Ok(());
+        }
+        for ip in ips {
+            if let Some(reason) = crate::validation::describe_reserved_ip(ip) {
+                return Err(SeerError::DnsError(format!(
+                    "nameserver {} blocked: {}",
+                    nameserver, reason
+                )));
             }
         }
+        Ok(())
+    }
 
-        Ok(build_upstream_config(&spec, &ips, self.port_override))
+    /// The checks on a nameserver spec that send nothing: it parses, and an
+    /// IP-literal host passes [`vet_nameserver_ips`](Self::vet_nameserver_ips).
+    /// For a query hickory answers itself ([`answered_locally`]), where the
+    /// server is never asked, so resolving its hostname would be network
+    /// traffic for nothing.
+    fn vet_nameserver_offline(&self, nameserver: &str) -> Result<()> {
+        let spec = NameserverSpec::parse(nameserver)?;
+        match spec.host.parse::<IpAddr>() {
+            Ok(ip) => self.vet_nameserver_ips(nameserver, &[ip]),
+            Err(_) => Ok(()),
+        }
     }
 
     /// The resolver a query runs on: one built for `nameserver` (parsed,
@@ -441,14 +461,26 @@ impl DnsResolver {
         })
     }
 
-    /// The servers [`query`](Self::query) sends to directly: those of
-    /// `nameserver` (parsed, resolved and SSRF-vetted by
-    /// `custom_upstream_config`), or the default upstream's.
-    async fn upstream_config(&self, nameserver: Option<&str>) -> Result<ResolverConfig> {
-        match self.effective_nameserver(nameserver) {
-            Some(ns) => self.custom_upstream_config(ns).await,
-            None => Ok(default_upstream_config()),
+    /// Where [`query`](Self::query) sends a query for `name`: hickory's
+    /// resolver for a special-use name it answers itself (the nameserver is
+    /// only vetted offline — it is never asked), else straight to the servers
+    /// of `nameserver` (parsed, resolved and SSRF-vetted by
+    /// `custom_upstream_config`) or of the default upstream.
+    async fn query_upstream(&self, name: &str, nameserver: Option<&str>) -> Result<Upstream<'_>> {
+        if answered_locally(name) {
+            if let Some(ns) = self.effective_nameserver(nameserver) {
+                self.vet_nameserver_offline(ns)?;
+            }
+            return Ok(Upstream::Local(&self.default_resolver));
         }
+        let config = match self.effective_nameserver(nameserver) {
+            Some(ns) => self.custom_upstream_config(ns).await?,
+            None => default_upstream_config(),
+        };
+        Ok(Upstream::Direct {
+            config,
+            transport: &self.transport,
+        })
     }
 
     /// Queries one name the way `dig` does and reports the whole response:
@@ -478,21 +510,25 @@ impl DnsResolver {
     ///
     /// `ANY` fans out concurrently to A, AAAA, CNAME, MX, NS, TXT, SOA, CAA,
     /// HTTPS, DS and DNSKEY and merges the answers (see
-    /// [`DnsQueryResult::answers`]); it errors only when every sub-query
-    /// failed.
+    /// [`DnsQueryResult::answers`]); a sub-query that failed is listed in
+    /// [`DnsQueryResult::failed_types`], and the query errors only when
+    /// every sub-query failed.
     ///
     /// For a name strictly below its registrable domain (`www.example.com`,
     /// not `example.com`), a random sibling (`seer-probe-….example.com`) is
     /// queried for the same type concurrently with the main query, and its
     /// outcome attached as [`DnsQueryResult::wildcard`] when the main answer
-    /// has records. The probe never fails the query, and
+    /// has records. The probe never fails the query, a positive answer waits
+    /// for it at most a fifth of the DNS timeout, and
     /// [`DnsQueryResult::query_time_ms`] times the main query alone.
     ///
     /// A special-use name (RFC 6761: `localhost`, `127.in-addr.arpa`,
     /// `invalid`, `onion`, …) is never sent to a server — RFC 7686 forbids
     /// leaking `.onion` names into the DNS — but answered by hickory's
     /// resolver itself; the result says so
-    /// ([`DnsQueryResult::answered_locally`]) and runs no probe.
+    /// ([`DnsQueryResult::answered_locally`]) and runs no probe. A
+    /// nameserver given with it is parsed and, when an IP literal, vetted,
+    /// but a hostname is not resolved: nothing is sent to it.
     #[instrument(skip(self), fields(domain = %domain, record_type = %record_type))]
     pub async fn query(
         &self,
@@ -503,25 +539,20 @@ impl DnsResolver {
         // Input first: a bad name must not cost a nameserver-hostname lookup.
         let domain = prepare_query(domain, record_type)?;
         let name = wire_query_name(&domain, record_type)?;
-        let resolver;
-        let upstream = if answered_locally(&name) {
-            resolver = self.upstream(nameserver).await?;
-            Upstream::Local(&resolver)
-        } else {
-            Upstream::Direct {
-                config: self.upstream_config(nameserver).await?,
-                transport: Transport::new(self.timeout),
-            }
-        };
+        let upstream = self.query_upstream(&name, nameserver).await?;
 
-        debug!(nameserver = nameserver.unwrap_or("system"), "Querying DNS");
+        debug!(
+            nameserver = nameserver.unwrap_or(DEFAULT_UPSTREAM),
+            "Querying DNS"
+        );
 
         let (exchange, query_time, wildcard) = if record_type == RecordType::ANY {
             let started = Instant::now();
-            let exchange = exchange_any(&upstream, &name).await?;
+            let exchange = merge_any(exchange_any(&upstream, &name).await)?;
             (exchange, started.elapsed(), None)
         } else {
-            exchange_with_probe(&upstream, &name, record_type).await?
+            let grace = self.timeout / PROBE_GRACE_DIVISOR;
+            exchange_with_probe(&upstream, &name, record_type, grace).await?
         };
         Ok(exchange.into_result(name, record_type, nameserver, wildcard, query_time))
     }
@@ -529,9 +560,12 @@ impl DnsResolver {
     /// One server's view of a name, for propagation checks:
     /// [`query`](Self::query) sent to `nameserver` alone, without the
     /// wildcard probe, and with a transport failure reported as
-    /// [`ServerReply::Silent`] and its reason rather than as an error. An
-    /// `Err` is invalid input or a nameserver that was refused (private or
-    /// reserved) or did not resolve.
+    /// [`ServerReply::Silent`] and its reason rather than as an error. For
+    /// ANY the reply is `Silent` only when no sub-query got a response; a
+    /// partial one lists the rest in [`DnsQueryResult::failed_types`], which
+    /// a comparison must read as "unknown", not as "no records". An `Err` is
+    /// invalid input or a nameserver that was refused (private or reserved)
+    /// or did not resolve.
     pub(crate) async fn query_server(
         &self,
         domain: &str,
@@ -547,35 +581,19 @@ impl DnsResolver {
                 .await
                 .map(ServerReply::Response);
         }
-        let upstream = Upstream::Direct {
-            config: self.upstream_config(Some(nameserver)).await?,
-            transport: Transport::new(self.timeout),
-        };
+        let upstream = self.query_upstream(&name, Some(nameserver)).await?;
 
         let started = Instant::now();
         let exchange = if record_type == RecordType::ANY {
-            let replies = future::join_all(
-                ANY_TYPES
-                    .into_iter()
-                    .map(|record_type| upstream.try_exchange(&name, record_type)),
-            )
-            .await;
-            let mut silence = None;
-            let results: Vec<Result<Exchange>> = replies
-                .into_iter()
-                .filter_map(|reply| match reply {
-                    Ok(Ok(exchange)) => Some(Ok(exchange)),
-                    Ok(Err(why)) => {
-                        silence.get_or_insert(why);
-                        None
-                    }
-                    Err(e) => Some(Err(e)),
-                })
-                .collect();
-            match silence {
-                Some(why) if results.is_empty() => return Ok(ServerReply::Silent(why.reason())),
-                _ => merge_any(results)?,
+            let replies = exchange_any(&upstream, &name).await;
+            // Silent only when no sub-query got through; a partial answer
+            // carries its failed types (`DnsQueryResult::failed_types`).
+            if replies.iter().all(|(_, reply)| matches!(reply, Ok(Err(_)))) {
+                if let Some((_, Ok(Err(why)))) = replies.first() {
+                    return Ok(ServerReply::Silent(why.reason()));
+                }
             }
+            merge_any(replies)?
         } else {
             match upstream.try_exchange(&name, record_type).await? {
                 Ok(exchange) => exchange,
@@ -610,11 +628,15 @@ impl DnsResolver {
         record_type: RecordType,
         nameserver: Option<&str>,
     ) -> Result<Vec<DnsRecord>> {
+        // Input first: a bad name must not cost a nameserver-hostname lookup.
+        let domain = prepare_query(domain, record_type)?;
         // Reuse the cached default resolver when no custom nameserver is specified
         let resolver = self.upstream(nameserver).await?;
-        let domain = prepare_query(domain, record_type)?;
 
-        debug!(nameserver = nameserver.unwrap_or("system"), "Resolving DNS");
+        debug!(
+            nameserver = nameserver.unwrap_or(DEFAULT_UPSTREAM),
+            "Resolving DNS"
+        );
 
         match record_type {
             RecordType::SRV => match parse_srv_query(&domain) {
@@ -678,7 +700,8 @@ impl DnsResolver {
     /// Generic single-type lookup: queries the wire type for `record_type`
     /// and maps each matching answer through [`convert_rdata`]. Answers of
     /// other types (e.g. a CNAME returned alongside A records) are skipped.
-    /// NXDOMAIN/NODATA fold to an empty vec (see [`dns_lookup_or_empty`]).
+    /// NXDOMAIN/NODATA fold to an empty vec: the absence of a type is a
+    /// valid answer, not a failure.
     ///
     /// MX is the one type with a meaningful intra-response order: answers
     /// are sorted by preference so the highest-priority exchange is first.
@@ -692,12 +715,14 @@ impl DnsResolver {
             return Err(unsupported_record_type(record_type));
         };
 
-        let Some(response) = dns_lookup_or_empty(
-            resolver.lookup(domain, wire_type).await,
-            &record_type.to_string(),
-        )?
-        else {
-            return Ok(vec![]);
+        let response = match resolver.lookup(domain, wire_type).await {
+            Ok(response) => response,
+            Err(e) if e.is_no_records_found() => return Ok(vec![]),
+            Err(e) => {
+                return Err(SeerError::DnsError(format!(
+                    "{record_type} lookup failed: {e}"
+                )))
+            }
         };
 
         let mut records: Vec<DnsRecord> = response
@@ -730,34 +755,19 @@ impl DnsResolver {
         // making `ANY` ~7x slower than a single query (#61). `join_all`
         // preserves input order, so the merged record list keeps the
         // `ANY_TYPES` ordering.
-        let results = future::join_all(
-            ANY_TYPES
-                .into_iter()
-                .map(|record_type| self.resolve_type(resolver, domain, record_type)),
-        )
+        let results = future::join_all(ANY_TYPES.into_iter().map(|record_type| async move {
+            (
+                record_type,
+                self.resolve_type(resolver, domain, record_type).await,
+            )
+        }))
         .await;
 
-        // Track whether any sub-query actually succeeded (an empty answer
-        // for an existing domain still counts as success). If every type
-        // errored — e.g. the resolver is unreachable — surface that error
-        // rather than returning an empty set that reads as "no records".
-        let mut all_records = Vec::new();
-        let mut any_ok = false;
-        let mut last_err = None;
-        for result in results {
-            match result {
-                Ok(records) => {
-                    any_ok = true;
-                    all_records.extend(records);
-                }
-                Err(e) => last_err = Some(e),
-            }
-        }
-
-        match last_err {
-            Some(e) if !any_ok => Err(e),
-            _ => Ok(dedupe_records(all_records)),
-        }
+        // An empty answer still counts as success; only when every type
+        // errored is that error surfaced. A record list has nowhere to carry
+        // the failed types — `query()` reports them.
+        let (record_sets, _failed) = fold_any(results)?;
+        Ok(dedupe_records(record_sets.into_iter().flatten()))
     }
 }
 
@@ -770,7 +780,7 @@ enum Upstream<'a> {
     /// type, the response reported as the server sent it.
     Direct {
         config: ResolverConfig,
-        transport: Transport,
+        transport: &'a Transport,
     },
 }
 
@@ -819,16 +829,14 @@ pub(crate) enum ServerReply {
     Silent(String),
 }
 
-/// The `ANY` fan-out behind [`DnsResolver::query`]: every [`ANY_TYPES`]
-/// query concurrently, merged by [`merge_any`].
-async fn exchange_any(upstream: &Upstream<'_>, name: &str) -> Result<Exchange> {
-    let results = future::join_all(
-        ANY_TYPES
-            .into_iter()
-            .map(|record_type| upstream.exchange(name, record_type)),
-    )
-    .await;
-    merge_any(results)
+/// The `ANY` fan-out behind [`DnsResolver::query`] and
+/// [`DnsResolver::query_server`]: every [`ANY_TYPES`] query concurrently,
+/// each outcome by its type, in `ANY_TYPES` order — for [`merge_any`].
+async fn exchange_any(upstream: &Upstream<'_>, name: &str) -> Vec<(RecordType, SubQuery)> {
+    future::join_all(ANY_TYPES.into_iter().map(|record_type| async move {
+        (record_type, upstream.try_exchange(name, record_type).await)
+    }))
+    .await
 }
 
 /// One query plus, when eligible, its wildcard probe run concurrently.
@@ -838,11 +846,13 @@ async fn exchange_any(upstream: &Upstream<'_>, name: &str) -> Result<Exchange> {
 /// The probe must not cost the main query anything: it never turns the
 /// result into an error, it is dropped unawaited when the main answer
 /// finishes first with nothing to attach it to (an error, a negative
-/// answer), and the reported duration is the main query's alone.
+/// answer), a positive answer waits at most `grace` more for it, and the
+/// reported duration is the main query's alone.
 async fn exchange_with_probe(
     upstream: &Upstream<'_>,
     name: &str,
     record_type: RecordType,
+    grace: Duration,
 ) -> Result<(Exchange, Duration, Option<WildcardProbe>)> {
     let main = async {
         let started = Instant::now();
@@ -860,7 +870,14 @@ async fn exchange_with_probe(
     let ((result, elapsed), probe) = match future::select(main, probe).await {
         Either::Left(((result, elapsed), probe)) => {
             let attachable = matches!(&result, Ok(answer) if answer.has_records(record_type));
-            let probe = if attachable { Some(probe.await) } else { None };
+            // Regression: this awaited the probe's whole budget (two
+            // timeouts) when its server never answered, stalling an answer
+            // already in hand.
+            let probe = if attachable {
+                tokio::time::timeout(grace, probe).await.ok()
+            } else {
+                None
+            };
             ((result, elapsed), probe)
         }
         Either::Right((probe, main)) => (main.await, Some(probe)),
@@ -1270,14 +1287,12 @@ pub(crate) fn convert_rdata(
         (RecordType::NS, HickoryRData::NS(ns)) => Some(RecordData::NS {
             nameserver: names.spell(&ns.0),
         }),
-        (RecordType::TXT, HickoryRData::TXT(txt)) => Some(RecordData::TXT {
-            text: txt
-                .txt_data
+        (RecordType::TXT, HickoryRData::TXT(txt)) => Some(RecordData::txt(
+            txt.txt_data
                 .iter()
-                .map(|data| String::from_utf8_lossy(data).to_string())
-                .collect::<Vec<_>>()
-                .join(""),
-        }),
+                .map(|data| String::from_utf8_lossy(data).into_owned())
+                .collect(),
+        )),
         (RecordType::SOA, HickoryRData::SOA(soa)) => Some(RecordData::SOA {
             mname: names.spell(&soa.mname),
             rname: names.spell(&soa.rname),
@@ -1504,48 +1519,21 @@ mod tests {
         config.timeouts.dns_secs = 9;
         let resolver = DnsResolver::from_config(&config);
         assert_eq!(resolver.timeout, Duration::from_secs(9));
+        assert_eq!(resolver.transport.timeout(), Duration::from_secs(9));
+        let rebuilt = DnsResolver::new().with_timeout(Duration::from_secs(3));
+        assert_eq!(rebuilt.transport.timeout(), Duration::from_secs(3));
+    }
+
+    #[test]
+    fn transport_budget_is_the_resolvers_attempts() {
+        let mut opts = ResolverOpts::default();
+        apply_standard_opts(&mut opts, Duration::from_secs(5));
+        assert_eq!(
+            opts.attempts as u32,
+            crate::dns::transport::QUERY_BUDGET_TIMEOUTS
+        );
     }
     use std::net::{Ipv4Addr, Ipv6Addr};
-
-    // --- RecordType::from_str edge cases -----------------------------
-
-    #[test]
-    fn record_type_from_str_accepts_lowercase() {
-        assert_eq!(RecordType::from_str("a").unwrap(), RecordType::A);
-        assert_eq!(RecordType::from_str("mx").unwrap(), RecordType::MX);
-        assert_eq!(RecordType::from_str("cname").unwrap(), RecordType::CNAME);
-        assert_eq!(RecordType::from_str("dnskey").unwrap(), RecordType::DNSKEY);
-    }
-
-    #[test]
-    fn record_type_from_str_accepts_mixed_case() {
-        assert_eq!(RecordType::from_str("Mx").unwrap(), RecordType::MX);
-        assert_eq!(RecordType::from_str("cNaMe").unwrap(), RecordType::CNAME);
-    }
-
-    #[test]
-    fn record_type_from_str_rejects_whitespace_padded() {
-        // No trim is done inside from_str; leading/trailing whitespace
-        // must currently cause a parse error so callers don't pass
-        // malformed labels through.
-        assert!(RecordType::from_str(" A").is_err());
-        assert!(RecordType::from_str("A ").is_err());
-        assert!(RecordType::from_str("\tA\n").is_err());
-    }
-
-    #[test]
-    fn record_type_from_str_rejects_unknown() {
-        assert!(RecordType::from_str("NOTAREAL").is_err());
-        assert!(RecordType::from_str("A1").is_err());
-        assert!(RecordType::from_str("").is_err());
-    }
-
-    #[test]
-    fn record_type_from_str_accepts_star_as_any() {
-        assert_eq!(RecordType::from_str("*").unwrap(), RecordType::ANY);
-        assert_eq!(RecordType::from_str("ANY").unwrap(), RecordType::ANY);
-        assert_eq!(RecordType::from_str("any").unwrap(), RecordType::ANY);
-    }
 
     // --- is_valid_srv_label ------------------------------------------
 
@@ -1648,28 +1636,6 @@ mod tests {
         );
         // 32 nibbles + 31 dots + ".ip6.arpa" (9 chars) = 72.
         assert_eq!(name.len(), 72);
-    }
-
-    // --- DnsResolver construction ------------------------------------
-
-    #[test]
-    fn resolver_new_has_default_timeout() {
-        let r = DnsResolver::new();
-        assert_eq!(r.timeout, DEFAULT_TIMEOUT);
-    }
-
-    #[test]
-    fn resolver_with_timeout_overrides_default() {
-        let custom = Duration::from_secs(42);
-        let r = DnsResolver::new().with_timeout(custom);
-        assert_eq!(r.timeout, custom);
-    }
-
-    #[test]
-    fn resolver_default_matches_new() {
-        let a = DnsResolver::default();
-        let b = DnsResolver::new();
-        assert_eq!(a.timeout, b.timeout);
     }
 
     // --- create_custom_resolver validation ---------------------------
@@ -1995,8 +1961,11 @@ mod tests {
             ProtocolConfig::Udp
         ));
         // The default upstream is Google's, IPv4 first.
-        let default = r.upstream_config(None).await.unwrap();
-        assert!(default.name_servers()[0].ip.is_ipv4());
+        let Upstream::Direct { config, .. } = r.query_upstream("seer.test", None).await.unwrap()
+        else {
+            panic!("a public name is sent to the default upstream");
+        };
+        assert!(config.name_servers()[0].ip.is_ipv4());
     }
 
     // --- Live DoT/DoH queries (opt-in only) ----------------------------
@@ -2522,9 +2491,13 @@ mod tests {
         let records = mock_zone_lookup(RecordType::TXT, "seer.test").await;
         assert_eq!(records.len(), 1);
         match &records[0].data {
-            RecordData::TXT { text } => assert_eq!(text, "v=spf1 -all"),
+            RecordData::TXT { text, strings } => {
+                assert_eq!(text, "v=spf1 -all");
+                assert_eq!(strings, &["v=spf1 ", "-all"], "the strings as sent");
+            }
             other => panic!("expected TXT data, got {other:?}"),
         }
+        assert_eq!(records[0].data.to_string(), r#""v=spf1 " "-all""#);
     }
 
     #[tokio::test]
@@ -3643,5 +3616,146 @@ mod tests {
                 unsupported_record_type(composite).to_string()
             );
         }
+    }
+
+    #[tokio::test]
+    async fn mock_unanswered_probe_costs_a_positive_answer_only_the_grace() {
+        // Regression: after the main answer landed, the probe was awaited
+        // for its whole budget (two timeouts) when its server never
+        // answered it. It now waits a fifth of one timeout at most.
+        let (port, asked) = wildcard_zone(|| MockReply::NoReply).await;
+        let resolver = DnsResolver::new()
+            .with_timeout(Duration::from_secs(2))
+            .allowing_private_hosts()
+            .with_port(port);
+        let started = Instant::now();
+        let result = resolver
+            .query("www.seer.test", RecordType::A, Some("127.0.0.1"))
+            .await
+            .expect("the main query is answered");
+        let elapsed = started.elapsed();
+        assert_eq!(result.records().count(), 1);
+        assert_eq!(result.wildcard, None, "an unfinished probe says nothing");
+        assert!(probes_sent(&asked) >= 1, "the probe was sent");
+        // Grace 400ms; the old wait was the probe's 4s budget.
+        assert!(elapsed >= Duration::from_millis(400), "{elapsed:?}");
+        assert!(elapsed < Duration::from_millis(1500), "{elapsed:?}");
+    }
+
+    /// A zone whose `www` answers every ANY sub-type but TXT and DNSKEY,
+    /// which its server never answers.
+    async fn partly_silent_zone() -> u16 {
+        spawn_mock_dns_fn(|_, qtype| match qtype {
+            HickoryRecordType::A => MockReply::Answer(vec![a_rdata([192, 0, 2, 7])]),
+            HickoryRecordType::TXT | HickoryRecordType::DNSKEY => MockReply::NoReply,
+            _ => MockReply::NoDataWithSoa("seer.test"),
+        })
+        .await
+    }
+
+    fn short_resolver(port: u16) -> DnsResolver {
+        DnsResolver::new()
+            .with_timeout(Duration::from_millis(200))
+            .allowing_private_hosts()
+            .with_port(port)
+    }
+
+    #[tokio::test]
+    async fn mock_query_any_reports_the_types_that_failed() {
+        // Regression: the timed-out TXT and DNSKEY sub-queries were dropped
+        // silently, so the ANY answer read as complete.
+        let port = partly_silent_zone().await;
+        let result = short_resolver(port)
+            .query("www.seer.test", RecordType::ANY, Some("127.0.0.1"))
+            .await
+            .expect("some sub-queries were answered");
+        assert_eq!(result.records().count(), 1);
+        let failed: Vec<RecordType> = result.failed_types.iter().map(|f| f.record_type).collect();
+        assert_eq!(failed, [RecordType::TXT, RecordType::DNSKEY]);
+        assert!(
+            result.failed_types[0].error.contains("timed out"),
+            "{:?}",
+            result.failed_types
+        );
+
+        // A single-type query never carries any.
+        let a = short_resolver(port)
+            .query("www.seer.test", RecordType::A, Some("127.0.0.1"))
+            .await
+            .unwrap();
+        assert!(a.failed_types.is_empty());
+    }
+
+    #[tokio::test]
+    async fn mock_query_server_any_keeps_partial_failures_apart_from_silence() {
+        let port = partly_silent_zone().await;
+        let reply = short_resolver(port)
+            .query_server("www.seer.test", RecordType::ANY, "127.0.0.1")
+            .await
+            .unwrap();
+        let ServerReply::Response(result) = reply else {
+            panic!("a partial answer is a response: {reply:?}");
+        };
+        assert_eq!(result.records().count(), 1);
+        let failed: Vec<RecordType> = result.failed_types.iter().map(|f| f.record_type).collect();
+        assert_eq!(failed, [RecordType::TXT, RecordType::DNSKEY]);
+
+        // No sub-query answered: the server is silent, not empty.
+        let silent = spawn_mock_dns(MockMode::Ignore).await;
+        let reply = short_resolver(silent)
+            .query_server("www.seer.test", RecordType::ANY, "127.0.0.1")
+            .await
+            .unwrap();
+        assert!(
+            matches!(&reply, ServerReply::Silent(reason) if reason == "timed out"),
+            "{reply:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_validates_the_name_before_resolving_the_nameserver() {
+        // Regression: the nameserver hostname was resolved (a network
+        // lookup) before the name was checked. The bad name fails first,
+        // without touching the network.
+        let err = DnsResolver::new()
+            .resolve(".bad..name", RecordType::A, Some("ns.seer.test"))
+            .await
+            .expect_err("an invalid name is rejected");
+        assert!(
+            matches!(
+                err,
+                SeerError::InvalidDomain(_) | SeerError::InvalidInput(_)
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_local_answer_never_resolves_the_nameserver_hostname() {
+        // Regression: `dig -x 127.0.0.1 @ns.example` resolved `ns.example` over
+        // the network though hickory answers that PTR itself. Only the
+        // offline checks run: an unresolvable hostname is fine, a reserved
+        // IP literal and a malformed spec are not.
+        let r = DnsResolver::new();
+        let result = r
+            .query(
+                "127.0.0.1",
+                RecordType::PTR,
+                Some("ns.does-not-resolve.test"),
+            )
+            .await
+            .expect("answered locally, the nameserver unused");
+        assert!(result.answered_locally);
+        assert_eq!(result.records().count(), 1);
+
+        let blocked = r
+            .query("127.0.0.1", RecordType::PTR, Some("10.0.0.1"))
+            .await
+            .expect_err("a reserved nameserver is refused all the same");
+        assert!(blocked.to_string().contains("blocked"), "{blocked}");
+        assert!(r
+            .query("127.0.0.1", RecordType::PTR, Some("ftp://ns.seer.test"))
+            .await
+            .is_err());
     }
 }

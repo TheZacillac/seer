@@ -60,6 +60,7 @@ mod tests {
             status: DnsStatus::NxDomain,
             flags: Vec::new(),
             answers: Vec::new(),
+            failed_types: Vec::new(),
             authority: Vec::new(),
             wildcard: None,
             query_time_ms: 7,
