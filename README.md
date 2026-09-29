@@ -42,7 +42,7 @@ A high-performance, multi-interface domain utility suite — query WHOIS, RDAP, 
 - **DNS Resolution** — dig-style queries over 20 record types: status, CNAME chain, wildcard detection
 - **DNS Trace** — follow the delegation down from the root servers (`+trace`)
 - **Encrypted DNS** — DoT (`tls://`) and DoH (`https://`) transports
-- **DNS Propagation** — 30 servers across 6 global regions
+- **DNS Propagation** — 20 public resolvers across North America, Europe and Asia Pacific
 - **DNS Monitoring** — track record changes over time
 - **DNS Comparison** — compare records across two nameservers
 - **DNSSEC Validation** — check DNSSEC configuration

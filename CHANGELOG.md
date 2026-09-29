@@ -11,6 +11,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`seer prop` gave misleading verdicts and waited on dead servers.** About
+  a third of the 30 built-in resolvers were ISP recursors that refuse or
+  ignore outside queries (and one was mislabeled), so every check spent ~11s
+  on timeouts, and because `propagation_percentage` counted those servers as
+  not propagated, a domain every responding server agreed on read as
+  "✗ Not propagated". The list is now 20 advertised public resolvers that
+  answer anyone (unfiltered addresses where offered, e.g. Quad9 `9.9.9.10`,
+  so blocklists don't read as inconsistencies), across North America, Europe
+  and Asia Pacific; a typical check now finishes in well under a second.
+- **Propagation reports why a server gave no answer.** Each server is asked
+  once, directly (as `seer dig` does), so a row now says `timed out`,
+  `REFUSED`, `SERVFAIL` or `referral only (not a recursive resolver)` instead
+  of the catch-all "DNS resolution failed", and an empty answer says whether
+  it is `NXDOMAIN` or `NODATA` (it always said NXDOMAIN).
+
+### Changed
+- **`propagation_percentage` is the agreeing share of the servers that
+  answered**, no longer of every server asked; a server that gave no answer
+  is a missing data point, still listed in `unreachable_servers`. Each
+  per-server result gains a `status` field (the response code; absent when
+  the server sent no response). Applies to the CLI, Python, REST and MCP
+  surfaces.
+- **Readable propagation output.** The human view leads with one verdict line
+  (`◐ Mostly propagated — 19 of 20 responding servers agree`), the consensus
+  and a no-answer count, then one aligned row per server marked ✓ (matches),
+  ≠ (the differing answer, or what it lacks and adds against a large
+  consensus set) or ✗ (the reason), in list order by region; the duplicate
+  unreachable/inconsistency lists are gone. A note flags address answers that
+  vary by resolver location (GeoDNS/CDN) rather than a propagation delay. The
+  Markdown table and the TUI Propagation lens (whose gauge now shows
+  agreement instead of the responding share, with every value rather than
+  the first) follow the same reading.
+
 ## [0.50.0] - 2026-09-29
 
 `seer dig` now works like dig: dig-style arguments with several record types

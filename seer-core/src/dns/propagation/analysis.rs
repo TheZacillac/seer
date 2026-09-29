@@ -175,9 +175,11 @@ pub(super) fn analyze_results(
         };
     };
 
-    // Calculate propagation percentage based on ALL servers checked (not just
-    // responding ones) so unreachable servers count as non-propagated.
-    let propagation_percentage = (consensus_count as f64 / results.len() as f64) * 100.0;
+    // The agreeing share of the servers that ANSWERED. A server that sent no
+    // answer is a missing data point, not a vote against the consensus:
+    // counting it here made a domain every responding server agreed on read
+    // as "not propagated" whenever a few resolvers were unreachable.
+    let propagation_percentage = (consensus_count as f64 / successful.len() as f64) * 100.0;
 
     // Find inconsistencies (reuse pre-computed sorted value sets).
     // Note: failed/unreachable servers are NOT merged in here — they are
@@ -236,6 +238,7 @@ mod tests {
                 response_time_ms: 10,
                 success: true,
                 error: None,
+                status: None,
             },
             ServerResult {
                 server: bad_server.clone(),
@@ -243,6 +246,7 @@ mod tests {
                 response_time_ms: 5000,
                 success: false,
                 error: Some("timed out".to_string()),
+                status: None,
             },
         ];
 
@@ -255,6 +259,9 @@ mod tests {
         );
         assert_eq!(outcome.unreachable_servers.len(), 1);
         assert_eq!(outcome.unreachable_servers[0].name, "Bad");
+        // The unreachable server is a missing data point, not a vote against
+        // the consensus: the one server that answered agrees with itself.
+        assert_eq!(outcome.propagation_percentage, 100.0);
         assert_eq!(
             outcome.unreachable_servers[0].error.as_deref(),
             Some("timed out")
@@ -278,6 +285,7 @@ mod tests {
             response_time_ms: 10,
             success: true,
             error: None,
+            status: None,
         };
         let ns = |n: &str| RecordData::NS {
             nameserver: n.to_string(),
@@ -338,6 +346,7 @@ mod tests {
             response_time_ms: 10,
             success: true,
             error: None,
+            status: None,
         };
         let results = vec![make_result(), make_result()];
         let outcome = analyze_results(&results, RecordType::A);
@@ -371,6 +380,7 @@ mod tests {
             response_time_ms: 10,
             success: true,
             error: None,
+            status: None,
         };
         (sr, (server_ip, vantage))
     }
@@ -463,6 +473,7 @@ mod tests {
             response_time_ms: 10,
             success: true,
             error: None,
+            status: None,
         });
 
         let consensus =

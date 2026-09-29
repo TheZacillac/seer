@@ -44,7 +44,7 @@ use super::query::{
     wildcard_probe_name, DnsQueryResult, Exchange, WildcardProbe,
 };
 use super::records::{DnsRecord, RecordData, RecordType, SvcParam};
-use super::transport::Transport;
+use super::transport::{NoResponse, Transport};
 use crate::error::{Result, SeerError};
 use crate::validation::{normalize_domain, normalize_query_name};
 
@@ -526,6 +526,71 @@ impl DnsResolver {
         Ok(exchange.into_result(name, record_type, nameserver, wildcard, query_time))
     }
 
+    /// One server's view of a name, for propagation checks:
+    /// [`query`](Self::query) sent to `nameserver` alone, without the
+    /// wildcard probe, and with a transport failure reported as
+    /// [`ServerReply::Silent`] and its reason rather than as an error. An
+    /// `Err` is invalid input or a nameserver that was refused (private or
+    /// reserved) or did not resolve.
+    pub(crate) async fn query_server(
+        &self,
+        domain: &str,
+        record_type: RecordType,
+        nameserver: &str,
+    ) -> Result<ServerReply> {
+        let domain = prepare_query(domain, record_type)?;
+        let name = wire_query_name(&domain, record_type)?;
+        if answered_locally(&name) {
+            // Never sent (RFC 7686); `query` answers it without a probe.
+            return self
+                .query(&domain, record_type, Some(nameserver))
+                .await
+                .map(ServerReply::Response);
+        }
+        let upstream = Upstream::Direct {
+            config: self.upstream_config(Some(nameserver)).await?,
+            transport: Transport::new(self.timeout),
+        };
+
+        let started = Instant::now();
+        let exchange = if record_type == RecordType::ANY {
+            let replies = future::join_all(
+                ANY_TYPES
+                    .into_iter()
+                    .map(|record_type| upstream.try_exchange(&name, record_type)),
+            )
+            .await;
+            let mut silence = None;
+            let results: Vec<Result<Exchange>> = replies
+                .into_iter()
+                .filter_map(|reply| match reply {
+                    Ok(Ok(exchange)) => Some(Ok(exchange)),
+                    Ok(Err(why)) => {
+                        silence.get_or_insert(why);
+                        None
+                    }
+                    Err(e) => Some(Err(e)),
+                })
+                .collect();
+            match silence {
+                Some(why) if results.is_empty() => return Ok(ServerReply::Silent(why.reason())),
+                _ => merge_any(results)?,
+            }
+        } else {
+            match upstream.try_exchange(&name, record_type).await? {
+                Ok(exchange) => exchange,
+                Err(why) => return Ok(ServerReply::Silent(why.reason())),
+            }
+        };
+        Ok(ServerReply::Response(exchange.into_result(
+            name,
+            record_type,
+            Some(nameserver),
+            None,
+            started.elapsed(),
+        )))
+    }
+
     /// Resolves DNS records for a domain: the records of `record_type` only,
     /// each named by the queried name, with NXDOMAIN and NODATA folded into
     /// an empty list. For the response itself — status, CNAME chain, the SOA
@@ -713,6 +778,18 @@ impl Upstream<'_> {
     /// Runs one query for `name`/`record_type` and maps its outcome to an
     /// [`Exchange`], with the answers in report order.
     async fn exchange(&self, name: &str, record_type: RecordType) -> Result<Exchange> {
+        self.try_exchange(name, record_type)
+            .await?
+            .map_err(|why| SeerError::DnsError(format!("{record_type} lookup failed: {why}")))
+    }
+
+    /// [`exchange`](Self::exchange), keeping a transport failure (no server
+    /// responded) apart from the other errors as the inner `Err`.
+    async fn try_exchange(
+        &self,
+        name: &str,
+        record_type: RecordType,
+    ) -> Result<std::result::Result<Exchange, NoResponse>> {
         let wire = wire_type(record_type).ok_or_else(|| unsupported_record_type(record_type))?;
         let exchange = match self {
             Upstream::Local(resolver) => {
@@ -722,17 +799,24 @@ impl Upstream<'_> {
                 let qname = Name::from_ascii(fqdn(name))
                     .map_err(|e| SeerError::InvalidDomain(format!("{name}: {e}")))?;
                 let request = transport.request(qname, wire, true);
-                let response = transport
-                    .query(config.name_servers(), &request)
-                    .await
-                    .map_err(|why| {
-                        SeerError::DnsError(format!("{record_type} lookup failed: {why}"))
-                    })?;
-                Exchange::from_message(&response)
+                match transport.query(config.name_servers(), &request).await {
+                    Ok(response) => Exchange::from_message(&response),
+                    Err(why) => return Ok(Err(why)),
+                }
             }
         };
-        Ok(exchange.ordered(name, record_type))
+        Ok(Ok(exchange.ordered(name, record_type)))
     }
+}
+
+/// How one nameserver answered [`DnsResolver::query_server`].
+#[derive(Debug)]
+pub(crate) enum ServerReply {
+    /// The server responded — any status, SERVFAIL and REFUSED included.
+    Response(DnsQueryResult),
+    /// It sent no response: a short reason (`timed out`, `no route from this
+    /// host (…)`), safe to show.
+    Silent(String),
 }
 
 /// The `ANY` fan-out behind [`DnsResolver::query`]: every [`ANY_TYPES`]

@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::dns::query::DnsStatus;
 use crate::dns::records::{DnsRecord, RecordType};
 
 /// A DNS server used for propagation checking.
@@ -25,13 +26,34 @@ impl DnsServer {
 }
 
 /// Result from querying a single DNS server during propagation check.
+///
+/// `success` means the server gave a definitive answer — NOERROR (records,
+/// or none: NODATA) or NXDOMAIN. A server that responded with SERVFAIL,
+/// REFUSED or another error code, sent only a referral, or did not respond
+/// at all is unsuccessful, with the reason in `error`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerResult {
     pub server: DnsServer,
+    /// The answers of the queried type (for ANY: every answer).
     pub records: Vec<DnsRecord>,
     pub response_time_ms: u64,
     pub success: bool,
     pub error: Option<String>,
+    /// The response code the server sent; `None` when it sent no response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<DnsStatus>,
+}
+
+impl ServerResult {
+    /// How an empty answer from this server reads: `NXDOMAIN` when the name
+    /// does not exist, `NODATA` when it exists without records of the type.
+    pub fn empty_answer_label(&self) -> &'static str {
+        if self.status == Some(DnsStatus::NxDomain) {
+            "NXDOMAIN"
+        } else {
+            "NODATA"
+        }
+    }
 }
 
 /// A consensus DNS value tagged with the record type it was observed for.
@@ -88,6 +110,25 @@ pub struct Inconsistency {
     pub server_ip: String,
     pub values: Vec<String>,
     pub consensus: Vec<String>,
+}
+
+impl Inconsistency {
+    /// Consensus values this server did not return.
+    pub fn missing_count(&self) -> usize {
+        self.consensus
+            .iter()
+            .filter(|v| !self.values.contains(v))
+            .count()
+    }
+
+    /// Values this server returned that the consensus lacks, in order.
+    pub fn extra_values(&self) -> Vec<&str> {
+        self.values
+            .iter()
+            .filter(|v| !self.consensus.contains(v))
+            .map(String::as_str)
+            .collect()
+    }
 }
 
 /// Per-vantage disagreement on a nameserver's A/AAAA addresses observed
@@ -219,6 +260,48 @@ pub struct PropagationResult {
     pub nameserver_details: Option<NameserverDetails>,
 }
 
+/// The overall reading of a propagation check, from the share of responding
+/// servers that agree with the consensus. Every renderer words the summary
+/// through this, so the thresholds live in one place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PropagationVerdict {
+    /// Every responding server agrees.
+    Full,
+    /// At least 80% agree.
+    Mostly,
+    /// At least half agree.
+    Partial,
+    /// No answer is held by a majority.
+    Split,
+    /// No server answered.
+    NoAnswer,
+}
+
+impl PropagationVerdict {
+    /// Short human label: `Fully propagated`, `No majority answer`, …
+    pub fn label(self) -> &'static str {
+        match self {
+            PropagationVerdict::Full => "Fully propagated",
+            PropagationVerdict::Mostly => "Mostly propagated",
+            PropagationVerdict::Partial => "Partially propagated",
+            PropagationVerdict::Split => "No majority answer",
+            PropagationVerdict::NoAnswer => "No server answered",
+        }
+    }
+}
+
+/// How one server's result relates to the consensus — the row
+/// classification every renderer shares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerVerdict<'a> {
+    /// Answered with the consensus value set.
+    Agrees,
+    /// Answered with a different value set.
+    Differs(&'a Inconsistency),
+    /// Gave no definitive answer; the reason.
+    NoAnswer(&'a str),
+}
+
 impl PropagationResult {
     /// Returns true only when one or more servers returned an answer that
     /// disagrees with the consensus. Servers that timed out or otherwise
@@ -226,6 +309,81 @@ impl PropagationResult {
     /// `unreachable_servers` instead.
     pub fn has_inconsistencies(&self) -> bool {
         !self.inconsistencies.is_empty()
+    }
+
+    /// Responding servers that returned the consensus value set.
+    pub fn servers_agreeing(&self) -> usize {
+        self.servers_responding
+            .saturating_sub(self.inconsistencies.len())
+    }
+
+    /// The overall reading, from `propagation_percentage` (the agreeing share
+    /// of responding servers).
+    pub fn verdict(&self) -> PropagationVerdict {
+        let pct = self.propagation_percentage;
+        if self.servers_responding == 0 {
+            PropagationVerdict::NoAnswer
+        } else if pct >= 100.0 {
+            PropagationVerdict::Full
+        } else if pct >= 80.0 {
+            PropagationVerdict::Mostly
+        } else if pct >= 50.0 {
+            PropagationVerdict::Partial
+        } else {
+            PropagationVerdict::Split
+        }
+    }
+
+    /// How many different answers the responding servers gave (the
+    /// consensus counted once). Three or more usually means the name answers
+    /// by the resolver's location (GeoDNS / CDN), not a propagation delay,
+    /// which typically shows two: the old answer and the new.
+    pub fn distinct_answers(&self) -> usize {
+        if self.servers_responding == 0 {
+            return 0;
+        }
+        let mut sets: Vec<&Vec<String>> = Vec::new();
+        for inc in &self.inconsistencies {
+            if !sets.contains(&&inc.values) {
+                sets.push(&inc.values);
+            }
+        }
+        1 + sets.len()
+    }
+
+    /// Whether the answers look location-dependent rather than mid-change:
+    /// an address-type query (A, AAAA, CNAME) answered at least three
+    /// different ways ([`distinct_answers`](Self::distinct_answers)). GeoDNS
+    /// and CDNs hand each resolver the addresses nearest it.
+    pub fn looks_location_dependent(&self) -> bool {
+        matches!(
+            self.record_type,
+            RecordType::A | RecordType::AAAA | RecordType::CNAME
+        ) && self.distinct_answers() >= 3
+    }
+
+    /// Classifies one of this result's `results` against the consensus.
+    pub fn server_verdict<'a>(&'a self, result: &'a ServerResult) -> ServerVerdict<'a> {
+        if !result.success {
+            return ServerVerdict::NoAnswer(result.error.as_deref().unwrap_or("no response"));
+        }
+        self.inconsistencies
+            .iter()
+            .find(|inc| inc.server_ip == result.server.ip && inc.server_name == result.server.name)
+            .map_or(ServerVerdict::Agrees, ServerVerdict::Differs)
+    }
+
+    /// How an empty consensus reads (`NXDOMAIN` or `NODATA`), taken from an
+    /// agreeing server; `None` when the consensus has values or nobody
+    /// answered.
+    pub fn empty_consensus_label(&self) -> Option<&'static str> {
+        if !self.consensus_values.is_empty() {
+            return None;
+        }
+        self.results
+            .iter()
+            .find(|r| self.server_verdict(r) == ServerVerdict::Agrees)
+            .map(ServerResult::empty_answer_label)
     }
 }
 
@@ -340,5 +498,124 @@ mod tests {
         assert!(json.contains("nameserver_details"));
         assert!(json.contains("consensus"));
         assert!(json.contains("ns1.example.com"));
+    }
+
+    fn server(name: &str, ip: &str) -> DnsServer {
+        DnsServer::new(name, ip, "Test", "Test")
+    }
+
+    fn answered(name: &str, ip: &str, status: DnsStatus) -> ServerResult {
+        ServerResult {
+            server: server(name, ip),
+            records: vec![],
+            response_time_ms: 1,
+            success: true,
+            error: None,
+            status: Some(status),
+        }
+    }
+
+    #[test]
+    fn verdict_reads_the_agreeing_share_of_responding_servers() {
+        let cases = [
+            (0, 0.0, PropagationVerdict::NoAnswer),
+            (4, 100.0, PropagationVerdict::Full),
+            (5, 80.0, PropagationVerdict::Mostly),
+            (4, 50.0, PropagationVerdict::Partial),
+            (3, 33.3, PropagationVerdict::Split),
+        ];
+        for (responding, pct, want) in cases {
+            let mut result = empty_result("example.com", pct);
+            result.servers_responding = responding;
+            assert_eq!(result.verdict(), want, "{responding} responding at {pct}%");
+        }
+    }
+
+    #[test]
+    fn server_verdict_classifies_each_row() {
+        let mut result = empty_result("example.com", 50.0);
+        let agrees = answered("A", "192.0.2.1", DnsStatus::NoError);
+        let differs = answered("B", "192.0.2.2", DnsStatus::NoError);
+        let mut silent = answered("C", "192.0.2.3", DnsStatus::NoError);
+        silent.success = false;
+        silent.status = None;
+        silent.error = Some("timed out".into());
+        result.inconsistencies = vec![Inconsistency {
+            record_type: RecordType::A,
+            server_name: "B".into(),
+            server_ip: "192.0.2.2".into(),
+            values: vec!["5.6.7.8".into()],
+            consensus: vec!["1.2.3.4".into()],
+        }];
+        result.servers_responding = 2;
+
+        assert_eq!(result.server_verdict(&agrees), ServerVerdict::Agrees);
+        assert!(matches!(
+            result.server_verdict(&differs),
+            ServerVerdict::Differs(inc) if inc.values == ["5.6.7.8"]
+        ));
+        assert_eq!(
+            result.server_verdict(&silent),
+            ServerVerdict::NoAnswer("timed out")
+        );
+        assert_eq!(result.servers_agreeing(), 1);
+    }
+
+    #[test]
+    fn inconsistency_counts_missing_and_extra_values() {
+        let inc = Inconsistency {
+            record_type: RecordType::TXT,
+            server_name: "S".into(),
+            server_ip: "192.0.2.1".into(),
+            values: vec!["a".into(), "b".into(), "z".into()],
+            consensus: vec!["a".into(), "b".into(), "c".into(), "d".into()],
+        };
+        assert_eq!(inc.missing_count(), 2);
+        assert_eq!(inc.extra_values(), ["z"]);
+    }
+
+    #[test]
+    fn distinct_answers_counts_the_consensus_once() {
+        let inc = |ip: &str, value: &str| Inconsistency {
+            record_type: RecordType::A,
+            server_name: ip.into(),
+            server_ip: ip.into(),
+            values: vec![value.into()],
+            consensus: vec!["1.2.3.4".into()],
+        };
+        let mut result = empty_result("example.com", 50.0);
+        assert_eq!(result.distinct_answers(), 0, "nobody answered");
+        result.servers_responding = 4;
+        assert_eq!(result.distinct_answers(), 1);
+        result.inconsistencies = vec![
+            inc("192.0.2.1", "5.6.7.8"),
+            inc("192.0.2.2", "5.6.7.8"),
+            inc("192.0.2.3", "9.9.9.9"),
+        ];
+        assert_eq!(result.distinct_answers(), 3);
+        assert!(result.looks_location_dependent());
+        // A TXT set split three ways is truncation or policy, not GeoDNS.
+        result.record_type = RecordType::TXT;
+        assert!(!result.looks_location_dependent());
+    }
+
+    #[test]
+    fn empty_answers_name_nxdomain_or_nodata() {
+        assert_eq!(
+            answered("A", "192.0.2.1", DnsStatus::NxDomain).empty_answer_label(),
+            "NXDOMAIN"
+        );
+        assert_eq!(
+            answered("A", "192.0.2.1", DnsStatus::NoError).empty_answer_label(),
+            "NODATA"
+        );
+
+        let mut result = empty_result("example.com", 100.0);
+        // A consensus with values has no empty label.
+        assert_eq!(result.empty_consensus_label(), None);
+        result.consensus_values.clear();
+        result.results = vec![answered("A", "192.0.2.1", DnsStatus::NxDomain)];
+        result.servers_responding = 1;
+        assert_eq!(result.empty_consensus_label(), Some("NXDOMAIN"));
     }
 }

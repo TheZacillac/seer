@@ -7,8 +7,8 @@
 //!   records of the requested type; [`DnsResolver::query`] returns the whole
 //!   response as dig reports it ([`DnsQueryResult`]: status, flags, CNAME
 //!   chain under real owner names, negative-answer SOA, wildcard probe).
-//! - [`PropagationChecker`]: fans one query out to 30 public resolvers across
-//!   6 regions and reports consensus and inconsistencies.
+//! - [`PropagationChecker`]: fans one query out to 20 public resolvers across
+//!   3 regions and reports consensus and inconsistencies.
 //! - [`DnsComparator`] (two nameservers side by side), [`DnsFollower`] (live
 //!   monitor), [`DnssecChecker`] and [`DelegationChecker`] (parent NS set vs.
 //!   the zone's own NS RRset, plus lameness probes).
@@ -42,7 +42,8 @@ pub use follow::{
 pub use nameserver::{NameserverProtocol, NameserverSpec};
 pub use propagation::{
     ConsensusValue, DnsServer, Inconsistency, NameserverDetails, NameserverIpInconsistency,
-    PropagationChecker, PropagationResult, UnreachableServer,
+    PropagationChecker, PropagationResult, PropagationServerResult, PropagationVerdict,
+    ServerVerdict, UnreachableServer,
 };
 pub use query::{DnsQueryResult, DnsStatus, WildcardProbe};
 pub use records::{DnsRecord, RecordData, RecordType, SvcParam};

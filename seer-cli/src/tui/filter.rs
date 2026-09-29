@@ -128,16 +128,14 @@ pub fn apply(data: &LensData, filter: &str) -> Option<LensData> {
         }
         LensData::Prop(p) => {
             let mut r = (**p).clone();
-            // Inline label (avoids naming the per-server element type).
             r.results.retain(|sr| {
-                let answer = sr
-                    .records
-                    .first()
-                    .map(|rec| rec.format_short())
-                    .unwrap_or_default();
                 let label = format!(
-                    "{} {} {} {}",
-                    sr.server.ip, sr.server.provider, sr.server.location, answer
+                    "{} {} {} {} {}",
+                    sr.server.name,
+                    sr.server.ip,
+                    sr.server.provider,
+                    sr.server.location,
+                    crate::tui::lenses::propagation::answer_text(p, sr)
                 );
                 matches(&label, filter)
             });

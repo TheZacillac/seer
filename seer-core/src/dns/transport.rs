@@ -166,21 +166,21 @@ impl Transport {
     /// query to the next, under one deadline of [`QUERY_BUDGET_TIMEOUTS`]
     /// per-query timeouts for the whole list.
     ///
-    /// The `Err` says why no server responded, server by server: `"8.8.8.8:
-    /// timed out; 8.8.4.4: timed out"`, plus a note when the deadline left
-    /// servers unasked.
+    /// The `Err` says why no server responded, server by server (see
+    /// [`NoResponse`]).
     pub(crate) async fn query(
         &self,
         servers: &[NameServerConfig],
         request: &DnsRequest,
-    ) -> Result<Message, String> {
+    ) -> Result<Message, NoResponse> {
         let budget = self.timeout().saturating_mul(QUERY_BUDGET_TIMEOUTS);
         let started = Instant::now();
         let mut failures = Vec::new();
+        let mut unasked = None;
         for (index, server) in servers.iter().enumerate() {
             let remaining = budget.saturating_sub(started.elapsed());
             if remaining.is_zero() {
-                failures.push(format!(
+                unasked = Some(format!(
                     "gave up after {budget:?} with {} more server(s) unasked",
                     servers.len() - index
                 ));
@@ -193,15 +193,52 @@ impl Transport {
             let attempt = self.exchange(server.ip, connection, request);
             match tokio::time::timeout(remaining, attempt).await {
                 Ok(Ok(message)) => return Ok(message),
-                Ok(Err(e)) => failures.push(format!("{}: {}", server.ip, transport_reason(&e))),
-                Err(_) => failures.push(format!("{}: timed out", server.ip)),
+                Ok(Err(e)) => failures.push((server.ip, transport_reason(&e))),
+                Err(_) => failures.push((server.ip, "timed out".to_string())),
             }
         }
-        Err(if failures.is_empty() {
-            "no nameserver to query".to_string()
+        Err(NoResponse { failures, unasked })
+    }
+}
+
+/// Why no server responded to [`Transport::query`]: each asked server's
+/// reason, in the order asked, and a note when the deadline left servers
+/// unasked.
+///
+/// Displays as `"8.8.8.8: timed out; 8.8.4.4: timed out"`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NoResponse {
+    failures: Vec<(IpAddr, String)>,
+    unasked: Option<String>,
+}
+
+impl NoResponse {
+    /// The first reason, without its server address — for a caller that
+    /// asked one server and names it itself (`timed out`).
+    pub(crate) fn reason(&self) -> String {
+        match (self.failures.first(), &self.unasked) {
+            (Some((_, reason)), _) => reason.clone(),
+            (None, Some(note)) => note.clone(),
+            (None, None) => NO_NAMESERVER.to_string(),
+        }
+    }
+}
+
+const NO_NAMESERVER: &str = "no nameserver to query";
+
+impl std::fmt::Display for NoResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let parts: Vec<String> = self
+            .failures
+            .iter()
+            .map(|(ip, reason)| format!("{ip}: {reason}"))
+            .chain(self.unasked.clone())
+            .collect();
+        if parts.is_empty() {
+            f.write_str(NO_NAMESERVER)
         } else {
-            failures.join("; ")
-        })
+            f.write_str(&parts.join("; "))
+        }
     }
 }
 
@@ -420,13 +457,13 @@ mod tests {
         assert!(elapsed >= Duration::from_millis(600), "{elapsed:?}");
         assert!(elapsed < Duration::from_millis(900), "{elapsed:?}");
         assert_eq!(
-            err,
+            err.to_string(),
             "127.0.0.1: timed out; 127.0.0.1: timed out; gave up after 600ms with 1 more \
              server(s) unasked"
         );
-        assert_eq!(
-            transport.query(&[], &request).await.unwrap_err(),
-            "no nameserver to query"
-        );
+        assert_eq!(err.reason(), "timed out");
+        let none = transport.query(&[], &request).await.unwrap_err();
+        assert_eq!(none.to_string(), "no nameserver to query");
+        assert_eq!(none.reason(), "no nameserver to query");
     }
 }
