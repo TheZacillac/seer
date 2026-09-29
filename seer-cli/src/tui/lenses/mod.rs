@@ -19,6 +19,7 @@ pub mod status;
 pub mod subdomains;
 pub mod takeover;
 pub mod tld;
+pub mod trace;
 pub mod watch;
 pub mod whois;
 
@@ -72,7 +73,7 @@ static LENSES: &[Lens] = &[
     lens("tld", "TLD Info", "⊞", "LOOKUP"),
     lens("dns", "DNS Records", "≣", "DNS")
         .cmd("dig")
-        .tabs(&["Records", "DNSSEC", "Compare"]),
+        .tabs(&["Records", "DNSSEC", "Compare", "Trace"]),
     lens("propagation", "Propagation", "◐", "DNS").cmd("prop"),
     lens("follow", "Follow", "⟳", "DNS"),
     lens("ssl", "SSL / Cert", "⛨", "SECURITY"),
@@ -121,7 +122,7 @@ use crate::tui::theme::Theme;
 /// `panes` carries interactive component state; Phase-2 renderers may ignore it
 /// (param prefixed `_panes` in those signatures to suppress clippy).
 /// `filter` is the active `/`-filter, for renderers that filter by reference
-/// (History); other row lenses receive already-filtered `data`.
+/// (History, DNS Records); other row lenses receive already-filtered `data`.
 #[allow(clippy::too_many_arguments)]
 pub fn render(
     f: &mut Frame,
@@ -139,7 +140,7 @@ pub fn render(
         "overview" => overview::render(f, area, theme, data),
         "whois" => whois::render(f, area, theme, data),
         "rdap" => rdap::render(f, area, theme, tab, data),
-        "dns" => dns::render(f, area, theme, tab, data, focused, sel, panes),
+        "dns" => dns::render(f, area, theme, tab, data, filter, focused, sel, panes),
         "ssl" => ssl::render(f, area, theme, data),
         "status" => status::render(f, area, theme, data),
         "propagation" => propagation::render(f, area, theme, data, focused, sel),

@@ -1,14 +1,19 @@
 //! DNS resolution and analysis over hickory-resolver.
 //!
-//! - [`DnsResolver`]: the 16 [`RecordType`]s, against Google Public DNS by
+//! - [`DnsResolver`]: the 20 [`RecordType`]s, against Google Public DNS by
 //!   default or a custom nameserver over UDP, DoT (`tls://`) or DoH
 //!   (`https://`) — see [`NameserverSpec`]. A hostname nameserver's resolved
-//!   addresses are tried IPv4 first.
+//!   addresses are tried IPv4 first. [`DnsResolver::resolve`] returns the
+//!   records of the requested type; [`DnsResolver::query`] returns the whole
+//!   response as dig reports it ([`DnsQueryResult`]: status, flags, CNAME
+//!   chain under real owner names, negative-answer SOA, wildcard probe).
 //! - [`PropagationChecker`]: fans one query out to 30 public resolvers across
 //!   6 regions and reports consensus and inconsistencies.
 //! - [`DnsComparator`] (two nameservers side by side), [`DnsFollower`] (live
 //!   monitor), [`DnssecChecker`] and [`DelegationChecker`] (parent NS set vs.
 //!   the zone's own NS RRset, plus lameness probes).
+//! - [`DnsTracer`]: iterative resolution from the root servers down, one
+//!   [`TraceHop`] per delegation level (`dig +trace`).
 //!
 //! No outer retry loop at this layer: hickory's own retransmission is the
 //! only retry (see `resolver.rs`).
@@ -19,10 +24,13 @@ mod dnssec;
 mod follow;
 mod nameserver;
 mod propagation;
+mod query;
 mod records;
 mod resolver;
 #[cfg(test)]
 pub(crate) mod test_support;
+mod trace;
+mod transport;
 
 pub use compare::{DnsComparator, DnsComparison, ServerResult};
 pub use delegation::{DelegationChecker, DelegationReport, LameNs};
@@ -36,8 +44,10 @@ pub use propagation::{
     ConsensusValue, DnsServer, Inconsistency, NameserverDetails, NameserverIpInconsistency,
     PropagationChecker, PropagationResult, UnreachableServer,
 };
-pub use records::{DnsRecord, RecordData, RecordType};
+pub use query::{DnsQueryResult, DnsStatus, WildcardProbe};
+pub use records::{DnsRecord, RecordData, RecordType, SvcParam};
 pub use resolver::{DnsPresence, DnsResolver};
+pub use trace::{DnsTrace, DnsTracer, TraceHop};
 // Crate-internal: shared with `net.rs` so the SSRF fallback resolver and the
 // main resolver cannot drift apart on option settings.
 pub(crate) use resolver::apply_standard_opts;

@@ -1,0 +1,15 @@
+---
+source: seer-core/tests/format_snapshots.rs
+expression: human ().format_dig (& fixture_dig_local())
+---
+
+[1;95mDNS PTR Records: 1.0.0.127.in-addr.arpa[0m
+[37m───────────────────────────────────────[0m
+  [1;96mstatus[0m: [1;92mNOERROR[0m  [1;96mserver[0m: [97mnone[0m  [1;96mtime[0m: [97m0 ms[0m
+
+  [1;96mAnswer[0m:
+    [97m1.0.0.127.in-addr.arpa[0m  [1;96m86400[0m  [1;96mPTR[0m  [1;92mlocalhost.[0m
+
+  [1;93mAnswered locally, not by a server: a special-use name (RFC 6761) that the resolver answers itself[0m
+
+[1;93mNote: DNS responses are not DNSSEC-validated[0m

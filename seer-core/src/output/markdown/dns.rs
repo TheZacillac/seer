@@ -7,7 +7,7 @@ impl MarkdownFormatter {
         if records.is_empty() {
             output.push("*No records found*".to_string());
             output.push(String::new());
-            output.push("> Note: DNS responses are not DNSSEC-validated.".to_string());
+            output.push(format!("> {DNSSEC_NOTE}."));
             return output.join("\n");
         }
 
@@ -26,22 +26,10 @@ impl MarkdownFormatter {
             MdSafe(domain)
         ));
         output.push(String::new());
-        output.push("| Name | TTL | Type | Data |".to_string());
-        output.push("| --- | --- | --- | --- |".to_string());
-
-        for record in records {
-            let data_str = record.data.to_string();
-            output.push(format!(
-                "| `{}` | {} | {} | `{}` |",
-                MdSafe(&record.name),
-                record.ttl,
-                record.record_type,
-                MdSafe(&data_str)
-            ));
-        }
+        record_table(&mut output, records);
 
         output.push(String::new());
-        output.push("> Note: DNS responses are not DNSSEC-validated.".to_string());
+        output.push(format!("> {DNSSEC_NOTE}."));
 
         output.join("\n")
     }

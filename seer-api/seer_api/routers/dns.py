@@ -5,6 +5,7 @@ from fastapi import APIRouter, Path, Query, Request
 import seer
 from seer_api._contract import (
     BULK_LIMIT,
+    HEAVY_LIMIT,
     RECORD_TYPE_MAX_LENGTH,
     RECORD_TYPE_PATTERN,
     BulkRecordRequest,
@@ -19,8 +20,39 @@ from seer_api.streaming import stream_bulk
 router = APIRouter()
 
 
-# NOTE: registered before `/{domain}/{record_type}` so `/compare/...` is not
-# swallowed by the two-segment record-lookup route.
+# NOTE: `/trace/...` and `/compare/...` are registered before
+# `/{domain}/{record_type}` so the two-segment record-lookup route does not
+# swallow them.
+@router.get("/trace/{domain}")
+@limiter.limit(HEAVY_LIMIT)
+async def dns_trace(
+    request: Request,
+    domain: Domain,
+    record_type: str = Query(
+        "A", max_length=RECORD_TYPE_MAX_LENGTH, pattern=RECORD_TYPE_PATTERN
+    ),
+):
+    """
+    Trace a name's resolution from the root servers down, like ``dig +trace``.
+
+    Each hop is one delegation level: the zone, the server asked (directly,
+    recursion off), its status, and the referral it gave or its answers. The
+    walk stops at the first answer (a CNAME is reported, not followed), at
+    NXDOMAIN or NODATA; ``error`` says why it stopped early, if it did.
+
+    Args:
+        domain: Name to trace
+        record_type: One record type (default A); ANY is rejected with 400
+
+    Returns:
+        The trace: hops (root first), final status and answers, and error
+    """
+    # No API-layer SSRF guard: the name is a DNS question, and the servers
+    # queried come from the root hints and referrals, each of which seer-core
+    # vets (and skips when reserved) before sending a query.
+    return await as_http(run_seer(seer.dns_trace, domain, record_type), "DNS trace failed")
+
+
 @router.get("/compare/{domain}")
 @limiter.limit("30/minute")
 async def dns_compare(
@@ -54,7 +86,16 @@ async def dns_lookup(
     nameserver: str | None = Query(None, description="Nameserver to query"),
 ):
     """
-    Query DNS records for a domain.
+    Query DNS for a domain, reporting the response the way ``dig`` does.
+
+    NXDOMAIN, NODATA (NOERROR without records of the type), SERVFAIL and
+    REFUSED are results with that ``status``, not errors. Behind a CNAME
+    chain in ``answers``, NXDOMAIN or NODATA is about the chain's last
+    target (NXDOMAIN there is a dangling CNAME), so a negative answer's
+    ``answers`` need not be empty. NOERROR with no answers, no ``aa`` flag
+    and only NS records (no SOA) in ``authority`` is a referral from a
+    server that is not authoritative for the name and does not recurse: it
+    says nothing about whether the name exists.
 
     Args:
         domain: Domain name to query
@@ -62,7 +103,9 @@ async def dns_lookup(
         nameserver: Optional nameserver to query (e.g., 8.8.8.8)
 
     Returns:
-        List of DNS records
+        The query result: status, header flags, answers (CNAME chain first,
+        each record under its owner name), authority (the AUTHORITY section
+        as the server sent it), wildcard probe
     """
     # Guard the nameserver (it's the actual connect target) but NOT the
     # queried domain — the domain is a DNS question, not a destination. The

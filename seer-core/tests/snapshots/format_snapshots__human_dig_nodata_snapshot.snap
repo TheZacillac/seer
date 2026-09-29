@@ -1,0 +1,16 @@
+---
+source: seer-core/tests/format_snapshots.rs
+assertion_line: 1374
+expression: human ().format_dig (& fixture_dig_nodata())
+---
+
+[1;95mDNS AAAA Records: www.seer.test[0m
+[37m───────────────────────────────[0m
+  [1;96mstatus[0m: [1;92mNOERROR[0m  [1;96mflags[0m: [97mqr rd ra[0m  [1;96mserver[0m: [97mdefault[0m  [1;96mtime[0m: [97m12 ms[0m
+
+  [1;93mNo AAAA records (NODATA — the name exists)[0m
+
+  [1;96mAuthority[0m:
+    [97mseer.test[0m  [1;96m900[0m  [1;96mSOA[0m  [97mns1.seer.test. hostmaster.seer.test. 2026092801 7200 3600 1209600 900[0m
+
+[1;93mNote: DNS responses are not DNSSEC-validated[0m

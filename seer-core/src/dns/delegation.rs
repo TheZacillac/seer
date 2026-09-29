@@ -143,7 +143,8 @@ enum DirectNs {
     /// No usable response (timeout / transport failure), with the reason.
     Unreachable(String),
     /// The probe packet never left this host (no route for the address
-    /// family — e.g. an IPv6-only server probed from an IPv4-only host).
+    /// family, or no socket of that family at all — e.g. an IPv6-only
+    /// server probed from an IPv4-only host).
     /// The same epistemic state as unresolvable glue: nothing is known
     /// about the server's authority, so this maps to a skip, not lameness.
     LocalNoRoute(String),
@@ -491,25 +492,13 @@ impl DelegationChecker {
         if ips.is_empty() {
             return Err(format!("{} did not resolve to any address", host));
         }
-        let mut blocked_reason = None;
-        let mut vetted = Vec::new();
-        for ip in ips {
-            // SSRF protection: NS host names come from untrusted DNS data,
-            // so reserved/private targets are refused. The test seam is
-            // `#[cfg(test)]`-only; production always validates.
-            if !self.allow_private() {
-                if let Some(reason) = crate::validation::describe_reserved_ip(&ip) {
-                    blocked_reason.get_or_insert_with(|| {
-                        format!("{} resolves to a blocked address ({})", host, reason)
-                    });
-                    continue;
-                }
-            }
-            vetted.push(ip);
-        }
-        prefer_ipv4(&vetted).ok_or_else(|| {
-            blocked_reason
-                .unwrap_or_else(|| format!("{} did not resolve to a usable address", host))
+        // SSRF protection: NS host names come from untrusted DNS data, so
+        // reserved/private targets are refused. The test seam is
+        // `#[cfg(test)]`-only; production always validates.
+        let (vetted, refused) = partition_reserved(&ips, self.allow_private());
+        prefer_ipv4(&vetted).ok_or_else(|| match refused.first() {
+            Some((_, reason)) => format!("{} resolves to a blocked address ({})", host, reason),
+            None => format!("{} did not resolve to a usable address", host),
         })
     }
 
@@ -615,13 +604,18 @@ fn apply_direct_opts(opts: &mut ResolverOpts, timeout: Duration) {
 }
 
 /// Builds the recursive resolver: Google DNS (UDP+TCP) in production, or a
-/// pinned loopback upstream for the `#[cfg(test)]` seam.
+/// pinned loopback upstream for the `#[cfg(test)]` seam. Shared with the
+/// trace walker (`dns::trace`), which resolves glueless nameservers through
+/// it.
 ///
 /// The `expect` expresses the same invariant as
 /// `dns::resolver::build_default_resolver`: with plain UDP/TCP upstreams the
 /// only fallible step (rustls TLS-context construction for DoT/DoH) never
 /// runs, so construction cannot fail.
-fn build_recursive_resolver(timeout: Duration, upstream: Option<(IpAddr, u16)>) -> TokioResolver {
+pub(crate) fn build_recursive_resolver(
+    timeout: Duration,
+    upstream: Option<(IpAddr, u16)>,
+) -> TokioResolver {
     let mut builder = TokioResolver::builder_with_config(
         google_or_pinned(upstream),
         TokioRuntimeProvider::default(),
@@ -677,15 +671,33 @@ fn classify_net_error(err: NetError, domain: &str) -> DirectNs {
 }
 
 /// True when an io transport error means the packet never left this host:
-/// the kernel had no route for the destination's address family. `TimedOut`
-/// never reaches here — `From<io::Error> for NetError` folds it into
+/// the kernel had no route to the destination (ENETUNREACH/EHOSTUNREACH), or
+/// cannot open a socket of its address family at all (EAFNOSUPPORT — e.g. an
+/// IPv6 server on a host whose kernel has IPv6 disabled). `TimedOut` never
+/// reaches here — `From<io::Error> for NetError` folds it into
 /// `NetError::Timeout` (which stays a lameness signal: packets were sent).
-fn is_local_no_route(err: &std::io::Error) -> bool {
-    matches!(
-        err.kind(),
-        std::io::ErrorKind::NetworkUnreachable | std::io::ErrorKind::HostUnreachable
-    )
+pub(crate) fn is_local_no_route(err: &std::io::Error) -> bool {
+    use std::io::ErrorKind::{HostUnreachable, NetworkUnreachable};
+    matches!(err.kind(), NetworkUnreachable | HostUnreachable)
+        || err
+            .raw_os_error()
+            .is_some_and(|code| Some(code) == ADDRESS_FAMILY_UNSUPPORTED)
 }
+
+/// The OS error code for "address family not supported". std maps it to no
+/// `io::ErrorKind` of its own on any platform (it reads as uncategorized), so
+/// [`is_local_no_route`] matches the raw code: `EAFNOSUPPORT` on Unix, whose
+/// value differs across targets (97 on x86 and Arm Linux, 47 on macOS) —
+/// hence `libc` — and on Windows Winsock's `WSAEAFNOSUPPORT`, which is what
+/// std and tokio report for a failed socket call there (not the C runtime's
+/// `EAFNOSUPPORT`).
+#[cfg(unix)]
+pub(crate) const ADDRESS_FAMILY_UNSUPPORTED: Option<i32> = Some(libc::EAFNOSUPPORT);
+#[cfg(windows)]
+pub(crate) const ADDRESS_FAMILY_UNSUPPORTED: Option<i32> =
+    Some(windows_sys::Win32::Networking::WinSock::WSAEAFNOSUPPORT);
+#[cfg(not(any(unix, windows)))]
+pub(crate) const ADDRESS_FAMILY_UNSUPPORTED: Option<i32> = None;
 
 /// The parent zone of a normalized domain: everything after the leftmost
 /// label. `normalize_domain` guarantees at least one interior dot, so the
@@ -702,12 +714,32 @@ fn parent_zone_of(domain: &str) -> String {
 /// vetted address made every direct parent query fail with "network
 /// unreachable" on IPv4-only hosts. IPv6-only deployments still work: v6 is
 /// used whenever no v4 address survives vetting.
-fn prefer_ipv4(vetted: &[IpAddr]) -> Option<IpAddr> {
+pub(crate) fn prefer_ipv4(vetted: &[IpAddr]) -> Option<IpAddr> {
     vetted
         .iter()
         .find(|ip| ip.is_ipv4())
         .or_else(|| vetted.first())
         .copied()
+}
+
+/// SSRF vetting for nameserver addresses, which come from untrusted DNS data
+/// (resolved NS names here, glue in the trace walker): splits `ips` into the
+/// addresses a direct query may be sent to and the refused ones, each with
+/// its [`crate::validation::describe_reserved_ip`] reason. `allow_private`
+/// is the `#[cfg(test)]` seam's flag and is always `false` in production.
+pub(crate) fn partition_reserved(
+    ips: &[IpAddr],
+    allow_private: bool,
+) -> (Vec<IpAddr>, Vec<(IpAddr, &'static str)>) {
+    let mut usable = Vec::new();
+    let mut refused = Vec::new();
+    for &ip in ips {
+        match crate::validation::describe_reserved_ip(&ip) {
+            Some(reason) if !allow_private => refused.push((ip, reason)),
+            _ => usable.push(ip),
+        }
+    }
+    (usable, refused)
 }
 
 /// Normalizes an NS host name for set comparison: lowercase, trailing dot
@@ -847,6 +879,26 @@ mod tests {
     }
 
     #[test]
+    fn partition_reserved_refuses_reserved_addresses_with_their_reason() {
+        let public: IpAddr = "192.5.6.30".parse().unwrap();
+        let private: IpAddr = "10.0.0.53".parse().unwrap();
+        let loopback: IpAddr = "::1".parse().unwrap();
+        let (usable, refused) = partition_reserved(&[private, public, loopback], false);
+        assert_eq!(usable, vec![public]);
+        assert_eq!(
+            refused,
+            vec![
+                (private, "private network (RFC 1918)"),
+                (loopback, "IPv6 loopback (::1)")
+            ]
+        );
+        // The test seam's flag lets everything through, in order.
+        let (usable, refused) = partition_reserved(&[private, public], true);
+        assert_eq!(usable, vec![private, public]);
+        assert!(refused.is_empty());
+    }
+
+    #[test]
     fn local_no_route_transport_errors_classify_as_local() {
         use std::io;
         // ENETUNREACH/EHOSTUNREACH mean the probe packet never left this
@@ -883,6 +935,32 @@ mod tests {
             matches!(refused, DirectNs::Unreachable(_)),
             "refused classified as {refused:?}"
         );
+    }
+
+    #[test]
+    fn address_family_unsupported_classifies_as_local() {
+        use std::io;
+        // EAFNOSUPPORT (WSAEAFNOSUPPORT on Windows): no socket of the
+        // server's address family can be opened on this host, e.g. an IPv6
+        // server when the kernel has IPv6 disabled. Nothing was sent. std
+        // gives the code no ErrorKind, so it is matched by the raw OS code,
+        // which is how a failed socket call reports it.
+        let code = ADDRESS_FAMILY_UNSUPPORTED.expect("a Unix or Windows target");
+        let err = io::Error::from_raw_os_error(code);
+        assert!(is_local_no_route(&err), "{err:?} ({:?})", err.kind());
+        let direct = classify_net_error(err.into(), "example.com");
+        assert!(
+            matches!(direct, DirectNs::LocalNoRoute(_)),
+            "EAFNOSUPPORT classified as {direct:?}"
+        );
+        // The code decides, not the wording or a nearby kind: an error with
+        // no OS code, or an unsupported operation, stays a remote failure.
+        for other in [
+            io::Error::other("Address family not supported by protocol"),
+            io::Error::from(io::ErrorKind::Unsupported),
+        ] {
+            assert!(!is_local_no_route(&other), "{other:?}");
+        }
     }
 
     #[test]
@@ -948,12 +1026,18 @@ mod tests {
         .await
     }
 
-    /// A parent server that refers `seer.test` to `referral`.
+    /// A parent server that refers `seer.test` to `referral` (glueless).
     async fn spawn_parent_server(referral: &[&str]) -> u16 {
-        let records: Vec<HickoryRData> = referral.iter().map(|ns| ns_rdata(ns)).collect();
+        let servers: Vec<(String, Vec<IpAddr>)> = referral
+            .iter()
+            .map(|ns| (ns.to_string(), Vec::new()))
+            .collect();
         spawn_mock_dns_fn(move |qname, qtype| {
             if qname == "seer.test" && qtype == HickoryRecordType::NS {
-                MockReply::Referral(records.clone())
+                MockReply::Delegation {
+                    zone: "seer.test".to_string(),
+                    servers: servers.clone(),
+                }
             } else {
                 MockReply::NoData
             }

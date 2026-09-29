@@ -1,0 +1,17 @@
+---
+source: seer-core/tests/format_snapshots.rs
+assertion_line: 1374
+expression: human ().format_dig (& fixture_dig_referral())
+---
+
+[1;95mDNS A Records: www.child.seer.test[0m
+[37m──────────────────────────────────[0m
+  [1;96mstatus[0m: [1;92mNOERROR[0m  [1;96mflags[0m: [97mqr rd[0m  [1;96mserver[0m: [97mns1.seer.test[0m  [1;96mtime[0m: [97m14 ms[0m
+
+  [1;93mNo answer: referral to child.seer.test — the server is not authoritative for the name (no aa flag) and does not recurse[0m
+
+  [1;96mAuthority[0m:
+    [97mchild.seer.test[0m  [1;96m172800[0m  [1;96mNS[0m  [97mns1.child.seer.test.[0m
+    [97mchild.seer.test[0m  [1;96m172800[0m  [1;96mNS[0m  [97mns2.child.seer.test.[0m
+
+[1;93mNote: DNS responses are not DNSSEC-validated[0m

@@ -45,7 +45,11 @@ pub const SECTIONS: &[Section] = &[
     Section {
         title: "DNS COMMANDS",
         commands: &[
-            cmd("dig", "<domain> [type] [@server]", "Query DNS records"),
+            cmd(
+                "dig",
+                crate::dig_args::USAGE,
+                "Query DNS records like dig (-x <ip>: reverse)",
+            ),
             cmd("prop", "<domain> [type]", "Check DNS propagation globally"),
             cmd(
                 "follow",
@@ -248,7 +252,10 @@ mod tests {
 
     #[test]
     fn usage_names_the_canonical_command() {
-        assert_eq!(usage("dns"), "Usage: dig <domain> [type] [@server]");
+        assert_eq!(
+            usage("dns"),
+            "Usage: dig [@server] <name> [type...] [+short] [+trace]"
+        );
         assert_eq!(usage("whois"), "Usage: whois <domain>");
     }
 }

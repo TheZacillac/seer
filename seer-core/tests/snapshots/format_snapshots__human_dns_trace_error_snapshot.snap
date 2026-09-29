@@ -1,0 +1,31 @@
+---
+source: seer-core/tests/format_snapshots.rs
+expression: human ().format_dns_trace (& fixture_dns_trace_error())
+---
+
+[1;95mDNS Trace: www.broken.test A[0m
+[37m────────────────────────────[0m
+
+  [1;96mHop 1[0m: [97m.[0m (root)
+    [1;96mServer[0m: [97ma.root-servers.net. (198.41.0.4) in 21 ms[0m
+    [1;96mStatus[0m: [1;92mNOERROR[0m
+    [1;96mReferral[0m: [97mtest.[0m
+      - [97mns1.nic.test.[0m
+
+  [1;96mHop 2[0m: [97mtest.[0m
+    [1;96mServer[0m: [97mns1.nic.test. (192.0.2.10) in 21 ms[0m
+    [1;96mStatus[0m: [1;92mNOERROR[0m
+    [1;96mReferral[0m: [97mbroken.test.[0m
+      - [97mns1.broken.test.[0m
+      - [97mns2.broken.test.[0m
+
+  [1;96mHop 3[0m: [97mbroken.test.[0m
+    [1;96mServer[0m: [97mns2.broken.test. (192.0.2.54) in 7 ms[0m
+    [1;96mStatus[0m: [1;91mSERVFAIL[0m
+    [1;96mFailed servers[0m:
+      [1;91m✗[0m [97mns1.broken.test. (192.0.2.53): timed out[0m
+
+  [1;96mResult[0m: [1;91mSERVFAIL[0m
+  [1;96mError[0m: [1;91mno nameserver for broken.test. gave a usable response: ns1.broken.test. (192.0.2.53): timed out; ns2.broken.test. (192.0.2.54): SERVFAIL[0m
+
+[1;93mNote: DNS responses are not DNSSEC-validated[0m

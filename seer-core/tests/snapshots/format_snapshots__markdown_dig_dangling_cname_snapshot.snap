@@ -1,0 +1,28 @@
+---
+source: seer-core/tests/format_snapshots.rs
+assertion_line: 1374
+expression: markdown ().format_dig (& fixture_dig_dangling_cname())
+---
+## DNS A Records: www.seer.test
+
+- **Status**: `NXDOMAIN`
+- **Flags**: `qr rd ra`
+- **Server**: default
+- **Query time**: 27 ms
+
+*The CNAME target `gone.cdn.test.` does not exist (NXDOMAIN)*
+
+### Answer
+
+| Name | TTL | Type | Data |
+| --- | --- | --- | --- |
+| `www.seer.test` | 3600 | CNAME | `shop.seer.test.` |
+| `shop.seer.test` | 300 | CNAME | `gone.cdn.test.` |
+
+### Authority
+
+| Name | TTL | Type | Data |
+| --- | --- | --- | --- |
+| `cdn.test` | 900 | SOA | `ns1.cdn.test. hostmaster.cdn.test. 2026092801 7200 3600 1209600 900` |
+
+> Note: DNS responses are not DNSSEC-validated.

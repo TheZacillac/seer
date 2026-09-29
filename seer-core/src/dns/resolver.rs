@@ -1,5 +1,12 @@
 //! DNS resolution over hickory-resolver.
 //!
+//! [`DnsResolver::resolve`] — and every feature built on it — looks records
+//! up through hickory's resolver. [`DnsResolver::query`] reports the response
+//! itself, as dig does, so it sends one query per record type straight to the
+//! same upstream servers through `dns::transport` (which says why the
+//! resolver cannot), except for the special-use names the resolver answers
+//! without sending anything.
+//!
 //! Retry boundary (deliberate): unlike the WHOIS/RDAP clients, this module
 //! does NOT wrap queries in [`crate::retry::RetryPolicy`]. hickory-resolver
 //! already performs its own retransmission (`opts.attempts` below) against
@@ -8,26 +15,38 @@
 //! resolution odds. If a retry knob is ever needed here, tune
 //! `ResolverOpts::attempts` rather than adding a wrapper.
 
+use std::borrow::Cow;
 use std::net::IpAddr;
+use std::pin::pin;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use futures::future::{self, Either};
 use hickory_resolver::config::{
     NameServerConfig, ResolveHosts, ResolverConfig, ResolverOpts, ServerOrderingStrategy, GOOGLE,
 };
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use hickory_resolver::net::NetError;
 use hickory_resolver::proto::dnssec::PublicKey;
+use hickory_resolver::proto::rr::rdata::svcb::{SvcParamKey, SvcParamValue, SVCB};
 use hickory_resolver::proto::rr::rdata::CAA;
-use hickory_resolver::proto::rr::{RData as HickoryRData, RecordType as HickoryRecordType};
+use hickory_resolver::proto::rr::{
+    Name, RData as HickoryRData, Record, RecordType as HickoryRecordType,
+};
+use hickory_resolver::proto::serialize::binary::BinEncodable;
 use hickory_resolver::TokioResolver;
 use tracing::{debug, instrument};
 
 use super::nameserver::{NameserverProtocol, NameserverSpec};
-use super::records::{DnsRecord, RecordData, RecordType};
+use super::query::{
+    answered_locally, dedupe_records, merge_any, random_probe_label, wildcard_outcome,
+    wildcard_probe_name, DnsQueryResult, Exchange, WildcardProbe,
+};
+use super::records::{DnsRecord, RecordData, RecordType, SvcParam};
+use super::transport::Transport;
 use crate::error::{Result, SeerError};
-use crate::validation::{normalize_domain, normalize_host};
+use crate::validation::{normalize_domain, normalize_query_name};
 
 /// Convert a DNS lookup result, treating "no records found" as an empty vec
 /// rather than an error. This is correct DNS behavior — the absence of a
@@ -49,6 +68,26 @@ fn dns_lookup_or_empty<T>(
 /// Default timeout for DNS queries (5 seconds).
 /// DNS is typically fast; longer timeouts indicate network issues or unreachable servers.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The record types an `ANY` query fans out to, in report order.
+///
+/// `ANY` is not sent on the wire: RFC 8482 lets servers answer it minimally
+/// (typically one HINFO or a single RRset), so seer queries these types
+/// concurrently instead. One list for [`DnsResolver::resolve`] and
+/// [`DnsResolver::query`], so the two cannot drift.
+const ANY_TYPES: [RecordType; 11] = [
+    RecordType::A,
+    RecordType::AAAA,
+    RecordType::CNAME,
+    RecordType::MX,
+    RecordType::NS,
+    RecordType::TXT,
+    RecordType::SOA,
+    RecordType::CAA,
+    RecordType::HTTPS,
+    RecordType::DS,
+    RecordType::DNSKEY,
+];
 
 /// Apply seer's standard resolver options.
 ///
@@ -107,8 +146,15 @@ fn build_resolver(config: ResolverConfig, timeout: Duration) -> Result<TokioReso
 /// (the only fallible step in [`build_resolver`]) cannot fail, and the
 /// infallible `new()`/`with_timeout()` constructors predate DoT/DoH support.
 fn build_default_resolver(timeout: Duration) -> TokioResolver {
-    build_resolver(ResolverConfig::udp_and_tcp(&GOOGLE), timeout)
+    build_resolver(default_upstream_config(), timeout)
         .expect("default resolver build cannot fail with the bundled webpki root store")
+}
+
+/// The default upstream: Google Public DNS over UDP with TCP fallback, IPv4
+/// servers first. The one definition for the default resolver and for
+/// [`DnsResolver::query`]'s direct queries.
+fn default_upstream_config() -> ResolverConfig {
+    ResolverConfig::udp_and_tcp(&GOOGLE)
 }
 
 /// Upstream config pinned to the single server `ip:port` — UDP only, or UDP
@@ -131,7 +177,7 @@ pub(crate) fn single_server_config(ip: IpAddr, port: u16, tcp_fallback: bool) ->
 /// delegation checkers' `#[cfg(test)]` seams point at a loopback mock.
 pub(crate) fn google_or_pinned(upstream: Option<(IpAddr, u16)>) -> ResolverConfig {
     match upstream {
-        None => ResolverConfig::udp_and_tcp(&GOOGLE),
+        None => default_upstream_config(),
         Some((ip, port)) => single_server_config(ip, port, false),
     }
 }
@@ -318,6 +364,16 @@ impl DnsResolver {
     }
 
     async fn create_custom_resolver(&self, nameserver: &str) -> Result<TokioResolver> {
+        build_resolver(self.custom_upstream_config(nameserver).await?, self.timeout)
+    }
+
+    /// The upstream config for a caller's nameserver spec: parsed, its host
+    /// resolved when it is a name, every address SSRF-vetted, then one server
+    /// per address (see [`build_upstream_config`]). The one path to a custom
+    /// nameserver, shared by the resolver ([`resolve`](Self::resolve)) and
+    /// the direct queries of [`query`](Self::query), so the vetting cannot
+    /// differ between them.
+    async fn custom_upstream_config(&self, nameserver: &str) -> Result<ResolverConfig> {
         // Parse the spec first: bare IP/host (UDP), tls:// (DoT), https://
         // (DoH). Every surface (CLI, REPL, config.toml, py/REST/MCP) funnels
         // its opaque nameserver string through here, so this one parse gives
@@ -372,13 +428,108 @@ impl DnsResolver {
             }
         }
 
-        build_resolver(
-            build_upstream_config(&spec, &ips, self.port_override),
-            self.timeout,
-        )
+        Ok(build_upstream_config(&spec, &ips, self.port_override))
     }
 
-    /// Resolves DNS records for a domain.
+    /// The resolver a query runs on: one built for `nameserver` (parsed,
+    /// resolved and SSRF-vetted by `custom_upstream_config`), or the cached
+    /// default.
+    async fn upstream(&self, nameserver: Option<&str>) -> Result<Cow<'_, TokioResolver>> {
+        Ok(match self.effective_nameserver(nameserver) {
+            Some(ns) => Cow::Owned(self.create_custom_resolver(ns).await?),
+            None => Cow::Borrowed(&self.default_resolver),
+        })
+    }
+
+    /// The servers [`query`](Self::query) sends to directly: those of
+    /// `nameserver` (parsed, resolved and SSRF-vetted by
+    /// `custom_upstream_config`), or the default upstream's.
+    async fn upstream_config(&self, nameserver: Option<&str>) -> Result<ResolverConfig> {
+        match self.effective_nameserver(nameserver) {
+            Some(ns) => self.custom_upstream_config(ns).await,
+            None => Ok(default_upstream_config()),
+        }
+    }
+
+    /// Queries one name the way `dig` does and reports the whole response:
+    /// status, header flags, the CNAME chain and answers under their real
+    /// owner names, the AUTHORITY section, and a wildcard probe.
+    ///
+    /// Takes the same input as [`resolve`](Self::resolve) — normalization,
+    /// the dig-style `_service._proto.name` SRV form, a raw IP literal for
+    /// PTR, and a custom nameserver spec (SSRF-vetted) or `None` for the
+    /// default upstream — but where `resolve` folds every negative answer
+    /// into an empty list, `query` reports it: NXDOMAIN, NODATA, SERVFAIL
+    /// and REFUSED are `Ok` results with that [`DnsQueryResult::status`].
+    /// An `Err` means there is no response to report: invalid input (a
+    /// malformed name, a bare-domain SRV query), a nameserver that was
+    /// refused (a private or reserved address) or did not resolve, or a
+    /// transport failure (timeout, no connection) at every server.
+    ///
+    /// Like dig, it sends one query (with RD set) and reports the response
+    /// the server sent — header, ANSWER and AUTHORITY sections as they came
+    /// — rather than a resolver lookup, which would chase a CNAME itself and
+    /// fold a negative answer into an error: a chain that ends at a name that
+    /// does not exist is reported with the chain and NXDOMAIN, as the
+    /// recursive server returns it. The servers are the nameserver's (or the
+    /// default upstream's), asked in order, IPv4 first; UDP, repeated over
+    /// TCP when the reply is truncated; and a server that does not respond
+    /// passes the query to the next, all under two DNS timeouts.
+    ///
+    /// `ANY` fans out concurrently to A, AAAA, CNAME, MX, NS, TXT, SOA, CAA,
+    /// HTTPS, DS and DNSKEY and merges the answers (see
+    /// [`DnsQueryResult::answers`]); it errors only when every sub-query
+    /// failed.
+    ///
+    /// For a name strictly below its registrable domain (`www.example.com`,
+    /// not `example.com`), a random sibling (`seer-probe-….example.com`) is
+    /// queried for the same type concurrently with the main query, and its
+    /// outcome attached as [`DnsQueryResult::wildcard`] when the main answer
+    /// has records. The probe never fails the query, and
+    /// [`DnsQueryResult::query_time_ms`] times the main query alone.
+    ///
+    /// A special-use name (RFC 6761: `localhost`, `127.in-addr.arpa`,
+    /// `invalid`, `onion`, …) is never sent to a server — RFC 7686 forbids
+    /// leaking `.onion` names into the DNS — but answered by hickory's
+    /// resolver itself; the result says so
+    /// ([`DnsQueryResult::answered_locally`]) and runs no probe.
+    #[instrument(skip(self), fields(domain = %domain, record_type = %record_type))]
+    pub async fn query(
+        &self,
+        domain: &str,
+        record_type: RecordType,
+        nameserver: Option<&str>,
+    ) -> Result<DnsQueryResult> {
+        // Input first: a bad name must not cost a nameserver-hostname lookup.
+        let domain = prepare_query(domain, record_type)?;
+        let name = wire_query_name(&domain, record_type)?;
+        let resolver;
+        let upstream = if answered_locally(&name) {
+            resolver = self.upstream(nameserver).await?;
+            Upstream::Local(&resolver)
+        } else {
+            Upstream::Direct {
+                config: self.upstream_config(nameserver).await?,
+                transport: Transport::new(self.timeout),
+            }
+        };
+
+        debug!(nameserver = nameserver.unwrap_or("system"), "Querying DNS");
+
+        let (exchange, query_time, wildcard) = if record_type == RecordType::ANY {
+            let started = Instant::now();
+            let exchange = exchange_any(&upstream, &name).await?;
+            (exchange, started.elapsed(), None)
+        } else {
+            exchange_with_probe(&upstream, &name, record_type).await?
+        };
+        Ok(exchange.into_result(name, record_type, nameserver, wildcard, query_time))
+    }
+
+    /// Resolves DNS records for a domain: the records of `record_type` only,
+    /// each named by the queried name, with NXDOMAIN and NODATA folded into
+    /// an empty list. For the response itself — status, CNAME chain, the SOA
+    /// of a negative answer — use [`query`](Self::query).
     ///
     /// # Arguments
     /// * `domain` - The domain name to query
@@ -395,13 +546,7 @@ impl DnsResolver {
         nameserver: Option<&str>,
     ) -> Result<Vec<DnsRecord>> {
         // Reuse the cached default resolver when no custom nameserver is specified
-        let custom_resolver;
-        let resolver = if let Some(ns) = self.effective_nameserver(nameserver) {
-            custom_resolver = self.create_custom_resolver(ns).await?;
-            &custom_resolver
-        } else {
-            &self.default_resolver
-        };
+        let resolver = self.upstream(nameserver).await?;
         let domain = prepare_query(domain, record_type)?;
 
         debug!(nameserver = nameserver.unwrap_or("system"), "Resolving DNS");
@@ -410,15 +555,15 @@ impl DnsResolver {
             RecordType::SRV => match parse_srv_query(&domain) {
                 // dig-style `_service._proto.name` queries resolve directly.
                 Some((service, protocol, name)) => {
-                    self.resolve_srv_core(resolver, &service, &protocol, &name)
+                    self.resolve_srv_core(&resolver, &service, &protocol, &name)
                         .await
                 }
                 // A bare domain isn't a valid SRV query — surface a usage hint
                 // as an input error (permanent), not a transient DNS failure.
                 None => Err(srv_format_error()),
             },
-            RecordType::ANY => self.resolve_any(resolver, &domain).await,
-            single => self.resolve_type(resolver, &domain, single).await,
+            RecordType::ANY => self.resolve_any(&resolver, &domain).await,
+            single => self.resolve_type(&resolver, &domain, single).await,
         }
     }
 
@@ -435,52 +580,9 @@ impl DnsResolver {
         protocol: &str,
         domain: &str,
     ) -> Result<Vec<DnsRecord>> {
-        if !is_valid_srv_label(service) {
-            return Err(SeerError::InvalidInput(format!(
-                "invalid SRV service name: {}",
-                service
-            )));
-        }
-        if !is_valid_srv_label(protocol) {
-            return Err(SeerError::InvalidInput(format!(
-                "invalid SRV protocol name: {}",
-                protocol
-            )));
-        }
-
-        let query_name = format!("_{}._{}.{}", service, protocol, domain);
-
-        let Some(response) = dns_lookup_or_empty(
-            resolver.lookup(&query_name, HickoryRecordType::SRV).await,
-            "SRV",
-        )?
-        else {
-            return Ok(vec![]);
-        };
-
-        let records = response
-            .answers()
-            .iter()
-            .filter_map(|record| {
-                if let HickoryRData::SRV(srv) = &record.data {
-                    Some(DnsRecord {
-                        name: query_name.clone(),
-                        record_type: RecordType::SRV,
-                        ttl: record.ttl,
-                        data: RecordData::SRV {
-                            priority: srv.priority,
-                            weight: srv.weight,
-                            port: srv.port,
-                            target: srv.target.to_string(),
-                        },
-                    })
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        Ok(records)
+        let query_name = srv_query_name(service, protocol, domain)?;
+        self.resolve_records(resolver, &query_name, RecordType::SRV)
+            .await
     }
 
     /// Single-type dispatch shared by [`resolve`](Self::resolve) and
@@ -497,15 +599,11 @@ impl DnsResolver {
         record_type: RecordType,
     ) -> Result<Vec<DnsRecord>> {
         match record_type {
+            RecordType::SRV | RecordType::ANY => Err(unsupported_record_type(record_type)),
             // PTR accepts a raw IP literal, which is queried as its
             // reverse-DNS name (and reported under that name).
             RecordType::PTR => {
-                let query = if let Ok(ip) = IpAddr::from_str(domain) {
-                    reverse_dns_name(&ip)
-                } else {
-                    domain.to_string()
-                };
-                self.resolve_records(resolver, &query, RecordType::PTR)
+                self.resolve_records(resolver, &ptr_query_name(domain), RecordType::PTR)
                     .await
             }
             single => self.resolve_records(resolver, domain, single).await,
@@ -541,11 +639,13 @@ impl DnsResolver {
             .answers()
             .iter()
             .filter_map(|record| {
-                convert_rdata(record_type, &record.data).map(|data| DnsRecord {
-                    name: domain.to_string(),
-                    record_type,
-                    ttl: record.ttl,
-                    data,
+                convert_rdata(record_type, &record.data, NameSpelling::Display).map(|data| {
+                    DnsRecord {
+                        name: domain.to_string(),
+                        record_type,
+                        ttl: record.ttl,
+                        data,
+                    }
                 })
             })
             .collect();
@@ -561,22 +661,12 @@ impl DnsResolver {
     }
 
     async fn resolve_any(&self, resolver: &TokioResolver, domain: &str) -> Result<Vec<DnsRecord>> {
-        // Query common record types concurrently — previously these ran
-        // serially, making `ANY` ~7x slower than a single query (#61).
-        // `join_all` preserves input order, so the merged record list keeps the
-        // A, AAAA, MX, … ordering.
-        let record_types = [
-            RecordType::A,
-            RecordType::AAAA,
-            RecordType::MX,
-            RecordType::NS,
-            RecordType::TXT,
-            RecordType::SOA,
-            RecordType::CAA,
-        ];
-
-        let results = futures::future::join_all(
-            record_types
+        // Query the ANY types concurrently — previously these ran serially,
+        // making `ANY` ~7x slower than a single query (#61). `join_all`
+        // preserves input order, so the merged record list keeps the
+        // `ANY_TYPES` ordering.
+        let results = future::join_all(
+            ANY_TYPES
                 .into_iter()
                 .map(|record_type| self.resolve_type(resolver, domain, record_type)),
         )
@@ -601,9 +691,100 @@ impl DnsResolver {
 
         match last_err {
             Some(e) if !any_ok => Err(e),
-            _ => Ok(all_records),
+            _ => Ok(dedupe_records(all_records)),
         }
     }
+}
+
+/// Where [`DnsResolver::query`] sends its queries.
+enum Upstream<'a> {
+    /// A special-use name hickory's resolver answers itself
+    /// ([`answered_locally`]): the resolver, which sends it nowhere.
+    Local(&'a TokioResolver),
+    /// Any other name: straight to these (vetted) servers, one query per
+    /// type, the response reported as the server sent it.
+    Direct {
+        config: ResolverConfig,
+        transport: Transport,
+    },
+}
+
+impl Upstream<'_> {
+    /// Runs one query for `name`/`record_type` and maps its outcome to an
+    /// [`Exchange`], with the answers in report order.
+    async fn exchange(&self, name: &str, record_type: RecordType) -> Result<Exchange> {
+        let wire = wire_type(record_type).ok_or_else(|| unsupported_record_type(record_type))?;
+        let exchange = match self {
+            Upstream::Local(resolver) => {
+                Exchange::from_local(resolver.lookup(name, wire).await, record_type)?
+            }
+            Upstream::Direct { config, transport } => {
+                let qname = Name::from_ascii(fqdn(name))
+                    .map_err(|e| SeerError::InvalidDomain(format!("{name}: {e}")))?;
+                let request = transport.request(qname, wire, true);
+                let response = transport
+                    .query(config.name_servers(), &request)
+                    .await
+                    .map_err(|why| {
+                        SeerError::DnsError(format!("{record_type} lookup failed: {why}"))
+                    })?;
+                Exchange::from_message(&response)
+            }
+        };
+        Ok(exchange.ordered(name, record_type))
+    }
+}
+
+/// The `ANY` fan-out behind [`DnsResolver::query`]: every [`ANY_TYPES`]
+/// query concurrently, merged by [`merge_any`].
+async fn exchange_any(upstream: &Upstream<'_>, name: &str) -> Result<Exchange> {
+    let results = future::join_all(
+        ANY_TYPES
+            .into_iter()
+            .map(|record_type| upstream.exchange(name, record_type)),
+    )
+    .await;
+    merge_any(results)
+}
+
+/// One query plus, when eligible, its wildcard probe run concurrently.
+/// Returns the main exchange, the main query's own duration, and the judged
+/// probe.
+///
+/// The probe must not cost the main query anything: it never turns the
+/// result into an error, it is dropped unawaited when the main answer
+/// finishes first with nothing to attach it to (an error, a negative
+/// answer), and the reported duration is the main query's alone.
+async fn exchange_with_probe(
+    upstream: &Upstream<'_>,
+    name: &str,
+    record_type: RecordType,
+) -> Result<(Exchange, Duration, Option<WildcardProbe>)> {
+    let main = async {
+        let started = Instant::now();
+        let result = upstream.exchange(name, record_type).await;
+        (result, started.elapsed())
+    };
+    let Some(probe_name) = wildcard_probe_name(name, record_type, &random_probe_label()) else {
+        let (result, elapsed) = main.await;
+        return Ok((result?, elapsed, None));
+    };
+    let probe = upstream.exchange(&probe_name, record_type);
+
+    let main = pin!(main);
+    let probe = pin!(probe);
+    let ((result, elapsed), probe) = match future::select(main, probe).await {
+        Either::Left(((result, elapsed), probe)) => {
+            let attachable = matches!(&result, Ok(answer) if answer.has_records(record_type));
+            let probe = if attachable { Some(probe.await) } else { None };
+            ((result, elapsed), probe)
+        }
+        Either::Right((probe, main)) => (main.await, Some(probe)),
+    };
+    let answer = result?;
+    let wildcard =
+        probe.and_then(|probe| wildcard_outcome(&probe_name, record_type, &answer, probe));
+    Ok((answer, elapsed, wildcard))
 }
 
 /// Whether a domain appears to exist in the public DNS. Used as a
@@ -654,9 +835,11 @@ impl DnsResolver {
 /// Prepares the query name for a DNS record lookup.
 ///
 /// Record queries are about one exact DNS name, so this normalizes with
-/// [`normalize_host`], which — unlike [`normalize_domain`] — keeps a leading
-/// `www.`: `www` routinely carries its own records (typically a CNAME), and
-/// stripping it silently answered `dig www.example.com CNAME` for the apex.
+/// [`normalize_query_name`], which — unlike [`normalize_domain`] — keeps a
+/// leading `www.`: `www` routinely carries its own records (typically a
+/// CNAME), and stripping it silently answered `dig www.example.com CNAME` for
+/// the apex. It also accepts a leading wildcard label (`*.example.com`), so
+/// the wildcard's own records can be queried like any other name.
 ///
 /// PTR queries may be given a raw IP literal. IPv6 literals in particular must
 /// NOT pass through the normalizer: its trailing-`:port` strip heuristic
@@ -672,7 +855,7 @@ impl DnsResolver {
 /// actually queries — they previously re-normalized with `normalize_domain`,
 /// losing `www.` and mangling IPv6 PTR literals.
 pub(crate) fn prepare_query(domain: &str, record_type: RecordType) -> Result<String> {
-    prepare_query_with(domain, record_type, normalize_host)
+    prepare_query_with(domain, record_type, normalize_query_name)
 }
 
 /// [`prepare_query`] with the normalizer injected, so the IP-literal PTR path
@@ -710,6 +893,50 @@ pub(crate) fn parse_srv_query(name: &str) -> Option<(String, String, String)> {
         return None;
     }
     Some((service.to_string(), protocol.to_string(), rest.to_string()))
+}
+
+/// Builds the validated `_service._proto.domain` SRV query name. The labels
+/// are checked first (a DNS query-injection guard): a bad one is a caller
+/// mistake, so it is [`SeerError::InvalidInput`], not a retryable DNS error.
+fn srv_query_name(service: &str, protocol: &str, domain: &str) -> Result<String> {
+    if !is_valid_srv_label(service) {
+        return Err(SeerError::InvalidInput(format!(
+            "invalid SRV service name: {}",
+            service
+        )));
+    }
+    if !is_valid_srv_label(protocol) {
+        return Err(SeerError::InvalidInput(format!(
+            "invalid SRV protocol name: {}",
+            protocol
+        )));
+    }
+    Ok(format!("_{}._{}.{}", service, protocol, domain))
+}
+
+/// The name a PTR query asks for: the reverse-DNS name of an IP literal, or
+/// the (already reverse) name as given.
+fn ptr_query_name(domain: &str) -> String {
+    match IpAddr::from_str(domain) {
+        Ok(ip) => reverse_dns_name(&ip),
+        Err(_) => domain.to_string(),
+    }
+}
+
+/// The name that goes on the wire for a prepared query (the output of
+/// [`prepare_query`]), with `resolve`'s rules: SRV must be a valid
+/// `_service._proto.name`, and PTR turns an IP literal into its reverse name.
+/// Shared with the trace walker (`dns::trace`), so a trace asks for — and
+/// reports — the name `query` would.
+pub(crate) fn wire_query_name(domain: &str, record_type: RecordType) -> Result<String> {
+    match record_type {
+        RecordType::SRV => {
+            let (service, protocol, name) = parse_srv_query(domain).ok_or_else(srv_format_error)?;
+            srv_query_name(&service, &protocol, &name)
+        }
+        RecordType::PTR => Ok(ptr_query_name(domain)),
+        _ => Ok(domain.to_string()),
+    }
 }
 
 /// The canonical "bad SRV query name" error, shared by the single-query resolver
@@ -768,12 +995,98 @@ fn parse_caa(caa: &CAA) -> (u8, String, String) {
     (flags, tag, value)
 }
 
+/// Splits HTTPS/SVCB RDATA (RFC 9460) into priority, target name and
+/// SvcParams in presentation form.
+///
+/// The presentation is built here rather than taken from hickory's
+/// `Display`, which leaves a trailing comma on every list (`h3,h2,`) and
+/// names unregistered keys `unknown<N>` instead of RFC 9460's `key<N>`.
+fn parse_svcb(svcb: &SVCB, names: NameSpelling) -> (u16, String, Vec<SvcParam>) {
+    let params = svcb
+        .svc_params
+        .iter()
+        .map(|(key, value)| SvcParam {
+            key: svc_param_key_name(*key),
+            value: svc_param_value(value),
+        })
+        .collect();
+    (svcb.svc_priority, names.spell(&svcb.target_name), params)
+}
+
+/// The RFC 9460 presentation name of a SvcParamKey: the registered name, or
+/// `key<N>` (§2.1) for any other key.
+fn svc_param_key_name(key: SvcParamKey) -> String {
+    match key {
+        SvcParamKey::Mandatory => "mandatory".to_string(),
+        SvcParamKey::Alpn => "alpn".to_string(),
+        SvcParamKey::NoDefaultAlpn => "no-default-alpn".to_string(),
+        SvcParamKey::Port => "port".to_string(),
+        SvcParamKey::Ipv4Hint => "ipv4hint".to_string(),
+        SvcParamKey::EchConfigList => "ech".to_string(),
+        SvcParamKey::Ipv6Hint => "ipv6hint".to_string(),
+        SvcParamKey::Key(_) | SvcParamKey::Key65535 | SvcParamKey::Unknown(_) => {
+            format!("key{}", u16::from(key))
+        }
+    }
+}
+
+/// The presentation value of a SvcParam, unquoted (RFC 9460 §2.1, §7): lists
+/// are comma-separated, `ech` is base64, `no-default-alpn` is empty, and an
+/// opaque value is a character-string with `\DDD` escapes.
+fn svc_param_value(value: &SvcParamValue) -> String {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    fn join<T: std::fmt::Display>(items: impl Iterator<Item = T>) -> String {
+        items
+            .map(|item| item.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+    match value {
+        SvcParamValue::Mandatory(keys) => join(keys.0.iter().map(|k| svc_param_key_name(*k))),
+        // Two levels of escaping, undone in reverse by a parser (RFC 9460
+        // Appendix A.1): the value-list level first (`\` → `\\`, `,` → `\,`)
+        // so a comma inside an alpn-id does not split it, then the
+        // character-string level over the result — `f\oo,bar` becomes
+        // `f\\\\oo\\,bar` (Appendix D.2).
+        SvcParamValue::Alpn(alpn) => join(alpn.0.iter().map(|id| {
+            let listed = id.replace('\\', "\\\\").replace(',', "\\,");
+            escape_char_string(listed.as_bytes())
+        })),
+        SvcParamValue::NoDefaultAlpn => String::new(),
+        SvcParamValue::Port(port) => port.to_string(),
+        SvcParamValue::Ipv4Hint(hint) => join(hint.0.iter().map(|a| a.0)),
+        SvcParamValue::EchConfigList(ech) => STANDARD.encode(&ech.0),
+        SvcParamValue::Ipv6Hint(hint) => join(hint.0.iter().map(|aaaa| aaaa.0)),
+        SvcParamValue::Unknown(opaque) => escape_char_string(&opaque.0),
+    }
+}
+
+/// Renders bytes as an unquoted DNS character-string (RFC 1035 §5.1):
+/// printable ASCII stays, `"` and `\` are backslash-escaped, and anything
+/// else — space and control bytes included, so the value is one token —
+/// becomes `\DDD`.
+fn escape_char_string(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len());
+    for &b in bytes {
+        match b {
+            b'"' | b'\\' => {
+                out.push('\\');
+                out.push(char::from(b));
+            }
+            0x21..=0x7E => out.push(char::from(b)),
+            _ => out.push_str(&format!("\\{b:03}")),
+        }
+    }
+    out
+}
+
 /// Maps a concrete seer [`RecordType`] to the hickory wire type it queries.
 ///
-/// `SRV` and `ANY` are composite lookups with dedicated paths
-/// (`resolve_srv_core` / `resolve_any`) and deliberately have no mapping
-/// here — asking [`DnsResolver::resolve_type`] for them is an error.
-fn wire_type(record_type: RecordType) -> Option<HickoryRecordType> {
+/// `ANY` is a composite lookup (a fan-out over `ANY_TYPES`) and deliberately
+/// has no wire type. `SRV` maps to its wire type, but `resolve` routes it
+/// through its dedicated `_service._proto.name` path (`resolve_srv_core`), so
+/// [`DnsResolver::resolve_type`] still rejects both.
+pub(crate) fn wire_type(record_type: RecordType) -> Option<HickoryRecordType> {
     Some(match record_type {
         RecordType::A => HickoryRecordType::A,
         RecordType::AAAA => HickoryRecordType::AAAA,
@@ -783,9 +1096,17 @@ fn wire_type(record_type: RecordType) -> Option<HickoryRecordType> {
         RecordType::TXT => HickoryRecordType::TXT,
         RecordType::SOA => HickoryRecordType::SOA,
         RecordType::PTR => HickoryRecordType::PTR,
+        RecordType::SRV => HickoryRecordType::SRV,
         RecordType::CAA => HickoryRecordType::CAA,
         RecordType::DNSKEY => HickoryRecordType::DNSKEY,
         RecordType::DS => HickoryRecordType::DS,
+        // RFC 7344 child-side copies of DS/DNSKEY, published for the parent
+        // to pick up (automated DS maintenance).
+        RecordType::CDS => HickoryRecordType::CDS,
+        RecordType::CDNSKEY => HickoryRecordType::CDNSKEY,
+        // RFC 9460 service bindings.
+        RecordType::HTTPS => HickoryRecordType::HTTPS,
+        RecordType::SVCB => HickoryRecordType::SVCB,
         // TLSA queries are how DANE clients discover the certificate
         // association data for a TLS endpoint. The convention is
         // `_<port>._<proto>.<host>` (e.g. `_443._tcp.example.com`); seer
@@ -794,7 +1115,7 @@ fn wire_type(record_type: RecordType) -> Option<HickoryRecordType> {
         RecordType::TLSA => HickoryRecordType::TLSA,
         RecordType::SSHFP => HickoryRecordType::SSHFP,
         RecordType::NAPTR => HickoryRecordType::NAPTR,
-        RecordType::SRV | RecordType::ANY => return None,
+        RecordType::ANY => return None,
     })
 }
 
@@ -810,13 +1131,42 @@ fn hex_upper(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02X}", b)).collect()
 }
 
+/// How [`convert_rdata`] spells the domain names inside RDATA: a CNAME,
+/// PTR, SRV, HTTPS/SVCB or NAPTR target, an MX exchange, an NS host, an SOA
+/// mname/rname.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NameSpelling {
+    /// hickory's `Display`, which decodes IDN labels to Unicode: what
+    /// [`DnsResolver::resolve`] has always returned, kept for its callers.
+    Display,
+    /// ASCII, an IDN label as its `xn--` A-label — the spelling of owner and
+    /// query names (see `owner_name`), so every name in a result compares
+    /// as written (a CNAME target equals the next hop's owner) and reads as
+    /// dig prints it.
+    Ascii,
+}
+
+impl NameSpelling {
+    fn spell(self, name: &Name) -> String {
+        match self {
+            NameSpelling::Display => name.to_string(),
+            NameSpelling::Ascii => name.to_ascii(),
+        }
+    }
+}
+
 /// Converts one hickory answer's RData into our [`RecordData`], if it is the
-/// variant `record_type` asked for. Any other RData in the answer section
-/// (e.g. a CNAME returned alongside A records) yields `None` and is skipped.
+/// variant `record_type` asked for, spelling the names in it as `names`
+/// says. Any other RData in the answer section (e.g. a CNAME returned
+/// alongside A records) yields `None` and is skipped.
 ///
 /// This is the single RData→RecordData conversion table used by every
 /// resolution path.
-fn convert_rdata(record_type: RecordType, data: &HickoryRData) -> Option<RecordData> {
+pub(crate) fn convert_rdata(
+    record_type: RecordType,
+    data: &HickoryRData,
+    names: NameSpelling,
+) -> Option<RecordData> {
     use hickory_resolver::proto::dnssec::rdata::DNSSECRData;
 
     match (record_type, data) {
@@ -827,14 +1177,14 @@ fn convert_rdata(record_type: RecordType, data: &HickoryRData) -> Option<RecordD
             address: addr.0.to_string(),
         }),
         (RecordType::CNAME, HickoryRData::CNAME(cname)) => Some(RecordData::CNAME {
-            target: cname.0.to_string(),
+            target: names.spell(&cname.0),
         }),
         (RecordType::MX, HickoryRData::MX(mx)) => Some(RecordData::MX {
             preference: mx.preference,
-            exchange: mx.exchange.to_string(),
+            exchange: names.spell(&mx.exchange),
         }),
         (RecordType::NS, HickoryRData::NS(ns)) => Some(RecordData::NS {
-            nameserver: ns.0.to_string(),
+            nameserver: names.spell(&ns.0),
         }),
         (RecordType::TXT, HickoryRData::TXT(txt)) => Some(RecordData::TXT {
             text: txt
@@ -845,8 +1195,8 @@ fn convert_rdata(record_type: RecordType, data: &HickoryRData) -> Option<RecordD
                 .join(""),
         }),
         (RecordType::SOA, HickoryRData::SOA(soa)) => Some(RecordData::SOA {
-            mname: soa.mname.to_string(),
-            rname: soa.rname.to_string(),
+            mname: names.spell(&soa.mname),
+            rname: names.spell(&soa.rname),
             serial: soa.serial,
             // hickory models refresh/retry/expire as i32, but they are
             // unsigned 32-bit wire intervals. A value >= 2^31 arrives as a
@@ -859,7 +1209,13 @@ fn convert_rdata(record_type: RecordType, data: &HickoryRData) -> Option<RecordD
             minimum: soa.minimum,
         }),
         (RecordType::PTR, HickoryRData::PTR(ptr)) => Some(RecordData::PTR {
-            target: ptr.0.to_string(),
+            target: names.spell(&ptr.0),
+        }),
+        (RecordType::SRV, HickoryRData::SRV(srv)) => Some(RecordData::SRV {
+            priority: srv.priority,
+            weight: srv.weight,
+            port: srv.port,
+            target: names.spell(&srv.target),
         }),
         (RecordType::CAA, HickoryRData::CAA(caa)) => {
             let (flags, tag, value) = parse_caa(caa);
@@ -882,6 +1238,46 @@ fn convert_rdata(record_type: RecordType, data: &HickoryRData) -> Option<RecordD
             digest_type: u8::from(ds.digest_type()),
             digest: hex_upper(ds.digest()),
         }),
+        // hickory models the RFC 8078 delete request's algorithm 0 as `None`.
+        (RecordType::CDS, HickoryRData::DNSSEC(DNSSECRData::CDS(cds))) => Some(RecordData::CDS {
+            key_tag: cds.key_tag(),
+            algorithm: cds.algorithm().map_or(0, u8::from),
+            digest_type: u8::from(cds.digest_type()),
+            digest: hex_upper(cds.digest()),
+        }),
+        (RecordType::CDNSKEY, HickoryRData::DNSSEC(DNSSECRData::CDNSKEY(cdnskey))) => {
+            use base64::{engine::general_purpose::STANDARD, Engine};
+            // hickory keeps the key bytes private and exposes them only as a
+            // `PublicKeyBuf`, which a delete request (algorithm 0) has none
+            // of. The RDATA layout is fixed (RFC 7344 §3.2, identical to
+            // DNSKEY: flags(2) protocol(1) algorithm(1) key), so read the key
+            // from the re-encoded RDATA — exact for every record, delete
+            // requests included.
+            let rdata = cdnskey.to_bytes().ok()?;
+            Some(RecordData::CDNSKEY {
+                flags: cdnskey.flags(),
+                // Protocol is always 3 (RFC 4034); hickory rejects any other.
+                protocol: 3,
+                algorithm: cdnskey.algorithm().map_or(0, u8::from),
+                public_key: STANDARD.encode(rdata.get(4..)?),
+            })
+        }
+        (RecordType::HTTPS, HickoryRData::HTTPS(https)) => {
+            let (priority, target, params) = parse_svcb(&https.0, names);
+            Some(RecordData::HTTPS {
+                priority,
+                target,
+                params,
+            })
+        }
+        (RecordType::SVCB, HickoryRData::SVCB(svcb)) => {
+            let (priority, target, params) = parse_svcb(svcb, names);
+            Some(RecordData::SVCB {
+                priority,
+                target,
+                params,
+            })
+        }
         (RecordType::TLSA, HickoryRData::TLSA(tlsa)) => Some(RecordData::TLSA {
             cert_usage: u8::from(tlsa.cert_usage),
             selector: u8::from(tlsa.selector),
@@ -902,9 +1298,52 @@ fn convert_rdata(record_type: RecordType, data: &HickoryRData) -> Option<RecordD
             flags: String::from_utf8_lossy(&naptr.flags).into_owned(),
             services: String::from_utf8_lossy(&naptr.services).into_owned(),
             regexp: String::from_utf8_lossy(&naptr.regexp).into_owned(),
-            replacement: naptr.replacement.to_string(),
+            replacement: names.spell(&naptr.replacement),
         }),
         _ => None,
+    }
+}
+
+/// The seer [`RecordType`] a hickory wire type maps to, if seer models it.
+///
+/// Derived from [`wire_type`] over [`RecordType::ALL`], so the two directions
+/// cannot drift: a type added to `wire_type` is recognized here too.
+pub(crate) fn from_wire_type(wire: HickoryRecordType) -> Option<RecordType> {
+    RecordType::ALL
+        .iter()
+        .copied()
+        .find(|t| wire_type(*t) == Some(wire))
+}
+
+/// Converts one hickory record into a [`DnsRecord`] under its real owner
+/// name, typed by the record's own wire type — the conversion for any path
+/// that reports a response section as-is (a CNAME chain, an authority SOA, a
+/// trace hop), where records of several types and owners appear together.
+///
+/// The owner name is ASCII (see `owner_name`) and loses its trailing root
+/// dot, matching how query names are reported; the names in the record's
+/// data are ASCII too ([`NameSpelling::Ascii`]), so the result uses one
+/// spelling throughout. Returns `None` for types seer does not model.
+pub(crate) fn to_dns_record(record: &Record) -> Option<DnsRecord> {
+    let record_type = from_wire_type(record.record_type())?;
+    let data = convert_rdata(record_type, &record.data, NameSpelling::Ascii)?;
+    Some(DnsRecord {
+        name: owner_name(&record.name),
+        record_type,
+        ttl: record.ttl,
+        data,
+    })
+}
+
+/// A hickory name as seer reports an owner: in ASCII — an IDN label as its
+/// `xn--` A-label, the spelling of the (normalized) query name it sits
+/// beside — and without the trailing root dot, except for the root itself
+/// (`.`). hickory's `Display` would decode A-labels to Unicode.
+fn owner_name(name: &Name) -> String {
+    let text = name.to_ascii();
+    match text.strip_suffix('.') {
+        Some(rest) if !rest.is_empty() => rest.to_string(),
+        _ => text,
     }
 }
 
@@ -1427,7 +1866,102 @@ mod tests {
         assert_eq!(config.name_servers()[0].connections[0].port, 9999);
     }
 
+    #[tokio::test]
+    async fn query_asks_dot_and_doh_servers_through_the_vetted_config() {
+        // `query` sends to the servers of `custom_upstream_config` — the one
+        // the resolver for `resolve` is built from — so a DoT or DoH spec is
+        // asked over TLS, with its host as the TLS server name (checked
+        // against the certificate), and DoH on its path. Built without any
+        // network traffic for IP literals.
+        use hickory_resolver::config::ProtocolConfig;
+
+        let r = DnsResolver::new();
+        let dot = r.custom_upstream_config("tls://1.1.1.1").await.unwrap();
+        let [server] = dot.name_servers() else {
+            panic!("one server per address: {dot:?}");
+        };
+        assert_eq!(server.ip, IpAddr::from([1, 1, 1, 1]));
+        assert_eq!(server.connections.len(), 1);
+        assert_eq!(server.connections[0].port, 853);
+        assert!(matches!(
+            &server.connections[0].protocol,
+            ProtocolConfig::Tls { server_name } if &**server_name == "1.1.1.1"
+        ));
+
+        let doh = r
+            .custom_upstream_config("https://8.8.8.8/dns-query")
+            .await
+            .unwrap();
+        let [server] = doh.name_servers() else {
+            panic!("one server per address: {doh:?}");
+        };
+        assert_eq!(server.connections[0].port, 443);
+        assert!(matches!(
+            &server.connections[0].protocol,
+            ProtocolConfig::Https { server_name, path }
+                if &**server_name == "8.8.8.8" && &**path == "/dns-query"
+        ));
+
+        // A bare spec is UDP on port 53 (a truncated reply is repeated over
+        // TCP by the transport, not configured here).
+        let udp = r.custom_upstream_config("9.9.9.9").await.unwrap();
+        assert_eq!(udp.name_servers()[0].connections[0].port, 53);
+        assert!(matches!(
+            udp.name_servers()[0].connections[0].protocol,
+            ProtocolConfig::Udp
+        ));
+        // The default upstream is Google's, IPv4 first.
+        let default = r.upstream_config(None).await.unwrap();
+        assert!(default.name_servers()[0].ip.is_ipv4());
+    }
+
     // --- Live DoT/DoH queries (opt-in only) ----------------------------
+
+    #[tokio::test]
+    #[ignore = "live network — DoT query against Cloudflare"]
+    async fn live_query_over_dot() {
+        let result = DnsResolver::new()
+            .query("example.com", RecordType::A, Some("tls://1.1.1.1"))
+            .await
+            .expect("DoT query should get a response");
+        assert_eq!(result.status, DnsStatus::NoError);
+        assert!(result.flags.contains(&"qr".to_string()), "{result:?}");
+        assert!(result.records().count() > 0, "expected A records over DoT");
+    }
+
+    #[tokio::test]
+    #[ignore = "live network — DoH query against Cloudflare"]
+    async fn live_query_over_doh() {
+        let result = DnsResolver::new()
+            .query(
+                "example.com",
+                RecordType::A,
+                Some("https://cloudflare-dns.com/dns-query"),
+            )
+            .await
+            .expect("DoH query should get a response");
+        assert_eq!(result.status, DnsStatus::NoError);
+        assert!(result.records().count() > 0, "expected A records over DoH");
+    }
+
+    #[tokio::test]
+    #[ignore = "live network — NXDOMAIN keeps its header"]
+    async fn live_query_nxdomain_has_flags_and_the_soa() {
+        let result = DnsResolver::new()
+            // `.example` is reserved (RFC 2606): the root says NXDOMAIN.
+            .query("seer-does-not-exist.example", RecordType::A, None)
+            .await
+            .expect("a negative answer is a result");
+        assert_eq!(result.status, DnsStatus::NxDomain);
+        assert!(result.flags.contains(&"qr".to_string()), "{result:?}");
+        assert!(
+            result
+                .authority
+                .iter()
+                .any(|r| r.record_type == RecordType::SOA),
+            "{result:?}"
+        );
+    }
 
     #[tokio::test]
     #[ignore = "live network — DoT query against Cloudflare"]
@@ -1659,6 +2193,20 @@ mod tests {
     }
 
     #[test]
+    fn prepare_query_accepts_a_leading_wildcard_label() {
+        // Regression: `dig *.example.com` failed with "Invalid domain name"
+        // because the query name went through the host normalizer, which
+        // rejects `*`. Querying a wildcard owner name is ordinary DNS.
+        let out = prepare_query("*.Example.com.", RecordType::A).unwrap();
+        assert_eq!(out, "*.example.com");
+        let out = prepare_query("*.1.168.192.in-addr.arpa", RecordType::PTR).unwrap();
+        assert_eq!(out, "*.1.168.192.in-addr.arpa");
+        // Only the whole leftmost label may be `*`.
+        assert!(prepare_query("a.*.example.com", RecordType::A).is_err());
+        assert!(prepare_query("a*.example.com", RecordType::A).is_err());
+    }
+
+    #[test]
     fn prepare_query_runs_ptr_ip_literal_through_the_normalizer() {
         // Regression: an IP literal skipped the normalizer entirely, and with
         // it the `SEER_DOMAIN_ALLOWLIST` check that lives inside — so a PTR
@@ -1682,8 +2230,110 @@ mod tests {
         }
         // With the real normalizer (no allowlist in tests) both still pass.
         assert_eq!(
-            prepare_query_with("192.0.2.1", RecordType::PTR, normalize_host).unwrap(),
+            prepare_query_with("192.0.2.1", RecordType::PTR, normalize_query_name).unwrap(),
             "192.0.2.1"
+        );
+    }
+
+    #[test]
+    fn from_wire_type_inverts_wire_type_for_every_single_type() {
+        for record_type in RecordType::ALL.iter().copied() {
+            match wire_type(record_type) {
+                Some(wire) => assert_eq!(from_wire_type(wire), Some(record_type)),
+                None => assert_eq!(record_type, RecordType::ANY),
+            }
+        }
+        // SRV has a wire type (so an SRV answer converts under its owner);
+        // types seer does not model have none.
+        assert_eq!(
+            from_wire_type(HickoryRecordType::SRV),
+            Some(RecordType::SRV)
+        );
+        assert_eq!(from_wire_type(HickoryRecordType::RRSIG), None);
+    }
+
+    #[test]
+    fn to_dns_record_keeps_the_real_owner_and_type() {
+        let cname = Record::from_rdata(
+            Name::from_ascii("www.seer.test.").unwrap(),
+            300,
+            HickoryRData::CNAME(hickory_resolver::proto::rr::rdata::CNAME(
+                Name::from_ascii("edge.cdn.test.").unwrap(),
+            )),
+        );
+        let converted = to_dns_record(&cname).expect("CNAME is modeled");
+        assert_eq!(converted.name, "www.seer.test");
+        assert_eq!(converted.record_type, RecordType::CNAME);
+        assert_eq!(converted.ttl, 300);
+        assert_eq!(converted.data.to_string(), "edge.cdn.test.");
+
+        let a = Record::from_rdata(
+            Name::from_ascii("edge.cdn.test.").unwrap(),
+            60,
+            HickoryRData::A(hickory_resolver::proto::rr::rdata::A(Ipv4Addr::new(
+                192, 0, 2, 7,
+            ))),
+        );
+        let converted = to_dns_record(&a).expect("A is modeled");
+        assert_eq!(converted.name, "edge.cdn.test");
+        assert_eq!(converted.record_type, RecordType::A);
+
+        assert_eq!(owner_name(&Name::root()), ".");
+        // An IDN owner keeps its A-label, the spelling of the query name.
+        assert_eq!(
+            owner_name(&Name::from_utf8("bücher.seer.test.").unwrap()),
+            "xn--bcher-kva.seer.test"
+        );
+    }
+
+    #[test]
+    fn to_dns_record_spells_rdata_names_as_a_labels_where_resolve_keeps_unicode() {
+        use hickory_resolver::proto::rr::rdata::{CNAME, MX, SOA, SRV};
+        let idn = |name: &str| Name::from_utf8(name).unwrap();
+        let data = |rdata: HickoryRData| {
+            let record = Record::from_rdata(idn("xn--bcher-kva.seer.test."), 300, rdata);
+            to_dns_record(&record).expect("modeled").data.to_string()
+        };
+        // Regression: RDATA names used hickory's Unicode `Display`, so a
+        // CNAME target (`edge.café.test.`) never equalled the next hop's
+        // A-label owner (`edge.xn--caf-dma.test`).
+        assert_eq!(
+            data(HickoryRData::CNAME(CNAME(idn("edge.café.test.")))),
+            "edge.xn--caf-dma.test."
+        );
+        assert_eq!(
+            data(HickoryRData::MX(MX::new(10, idn("mail.café.test.")))),
+            "10 mail.xn--caf-dma.test."
+        );
+        assert_eq!(
+            data(HickoryRData::SRV(SRV::new(
+                1,
+                5,
+                443,
+                idn("sip.café.test.")
+            ))),
+            "1 5 443 sip.xn--caf-dma.test."
+        );
+        assert_eq!(
+            data(HickoryRData::SOA(SOA::new(
+                idn("ns1.café.test."),
+                idn("hostmaster.café.test."),
+                1,
+                7200,
+                3600,
+                1209600,
+                300,
+            ))),
+            "ns1.xn--caf-dma.test. hostmaster.xn--caf-dma.test. 1 7200 3600 1209600 300"
+        );
+
+        // `resolve`'s conversion keeps its long-standing Unicode spelling.
+        let cname = HickoryRData::CNAME(CNAME(idn("edge.café.test.")));
+        assert_eq!(
+            convert_rdata(RecordType::CNAME, &cname, NameSpelling::Display)
+                .expect("modeled")
+                .to_string(),
+            "edge.café.test."
         );
     }
 
@@ -1693,7 +2343,7 @@ mod tests {
         // record published with reserved bits set reported flags=128/0.
         let mut caa = CAA::new_issue(
             true,
-            Some(hickory_resolver::proto::rr::Name::from_ascii("letsencrypt.org").unwrap()),
+            Some(Name::from_ascii("letsencrypt.org").unwrap()),
             vec![],
         );
         caa.reserved_flags = 0x01;
@@ -1703,9 +2353,28 @@ mod tests {
         assert_eq!(value, "letsencrypt.org");
     }
 
+    #[test]
+    fn alpn_ids_are_escaped_at_both_levels() {
+        use hickory_resolver::proto::rr::rdata::svcb::Alpn;
+        let alpn = |ids: &[&str]| {
+            svc_param_value(&SvcParamValue::Alpn(Alpn(
+                ids.iter().map(|id| id.to_string()).collect(),
+            )))
+        };
+        assert_eq!(alpn(&["h3", "h2"]), "h3,h2");
+        // Regression: a comma or backslash inside an alpn-id was escaped once,
+        // so a parser's character-string pass consumed the escape and the
+        // value-list pass then split `a,b` in two and dropped the `\`. The
+        // expected strings are raw: `a\\,b` and `x\\\\y` as written here.
+        assert_eq!(alpn(&["a,b"]), r"a\\,b");
+        assert_eq!(alpn(&[r"x\y"]), r"x\\\\y");
+        // RFC 9460 Appendix D.2's vector: alpn-ids `f\oo,bar` and `h2`.
+        assert_eq!(alpn(&[r"f\oo,bar", "h2"]), r"f\\\\oo\\,bar,h2");
+    }
+
     // --- Hermetic mock-server tests -----------------------------------
     //
-    // These exercise the full resolve() path (normalization →
+    // These exercise the full resolve() / query() path (normalization →
     // custom-resolver construction → hickory transport → RData conversion)
     // against the shared loopback fixture in `crate::dns::test_support`,
     // without touching the network. The SSRF guards deliberately refuse
@@ -1713,10 +2382,12 @@ mod tests {
     // `allowing_private_hosts` / `with_port` seams, which do not exist in
     // release builds.
 
+    use crate::dns::query::DnsStatus;
     use crate::dns::test_support::{
-        mock_dns_resolver, mock_dns_resolver_default, spawn_mock_dns, spawn_mock_dns_fn, MockMode,
-        MockReply,
+        a_rdata, cname_rdata, mock_dns_resolver, mock_dns_resolver_default, record, spawn_mock_dns,
+        spawn_mock_dns_fn, spawn_mock_dns_fn_with_tcp, MockMode, MockReply,
     };
+    use hickory_resolver::proto::op::ResponseCode;
 
     async fn mock_zone_lookup(record_type: RecordType, domain: &str) -> Vec<DnsRecord> {
         let port = spawn_mock_dns(MockMode::Zone).await;
@@ -1929,7 +2600,7 @@ mod tests {
                         10,
                         5,
                         5060,
-                        hickory_resolver::proto::rr::Name::from_ascii("sip.seer.test.").unwrap(),
+                        Name::from_ascii("sip.seer.test.").unwrap(),
                     ),
                 )])
             }
@@ -1949,14 +2620,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mock_resolve_queries_a_wildcard_owner_name() {
+        // The literal `*` label reaches the wire, and the records come back
+        // reported under the wildcard name that was asked for.
+        let port = spawn_mock_dns_fn(|qname, qtype| match (qname, qtype) {
+            ("*.seer.test", HickoryRecordType::A) => MockReply::Answer(vec![HickoryRData::A(
+                hickory_resolver::proto::rr::rdata::A(Ipv4Addr::new(192, 0, 2, 42)),
+            )]),
+            _ => MockReply::NoData,
+        })
+        .await;
+        let records = mock_dns_resolver(port)
+            .resolve("*.seer.test", RecordType::A, Some("127.0.0.1"))
+            .await
+            .expect("wildcard A against mock");
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert_eq!(records[0].name, "*.seer.test");
+        assert_eq!(records[0].data.to_string(), "192.0.2.42");
+    }
+
+    #[tokio::test]
     async fn mock_presence_still_probes_the_apex_for_www_input() {
         // `presence` answers a registration-level question, so it must keep
         // stripping `www.` even though `resolve` no longer does.
         let port = spawn_mock_dns_fn(|qname, qtype| match (qname, qtype) {
             ("seer.test", HickoryRecordType::NS) => MockReply::Answer(vec![HickoryRData::NS(
-                hickory_resolver::proto::rr::rdata::NS(
-                    hickory_resolver::proto::rr::Name::from_ascii("ns1.seer.test.").unwrap(),
-                ),
+                hickory_resolver::proto::rr::rdata::NS(Name::from_ascii("ns1.seer.test.").unwrap()),
             )]),
             // What a recursive resolver relays for a name inside the zone:
             // querying `www` itself would read as "no NS" → Absent.
@@ -1981,7 +2670,8 @@ mod tests {
     #[tokio::test]
     async fn mock_resolve_any_aggregates_multiple_types() {
         let records = mock_zone_lookup(RecordType::ANY, "seer.test").await;
-        // resolve_any fans out to exactly A/AAAA/MX/NS/TXT/SOA/CAA.
+        // resolve_any fans out over ANY_TYPES; the zone publishes all of
+        // these (and no CNAME or DS at the apex).
         for expected in [
             RecordType::A,
             RecordType::AAAA,
@@ -1990,14 +2680,822 @@ mod tests {
             RecordType::TXT,
             RecordType::SOA,
             RecordType::CAA,
+            RecordType::HTTPS,
+            RecordType::DNSKEY,
         ] {
             assert!(
                 records.iter().any(|r| r.record_type == expected),
                 "ANY must include {expected} records"
             );
         }
-        // 2 A + 1 AAAA + 3 MX + 1 NS + 1 TXT + 1 SOA + 2 CAA = 11
-        assert_eq!(records.len(), 11);
+        // 2 A + 1 AAAA + 3 MX + 1 NS + 1 TXT + 1 SOA + 2 CAA + 1 HTTPS
+        // + 1 DNSKEY = 13; every record is named by the query name.
+        assert_eq!(records.len(), 13);
+        assert!(records.iter().all(|r| r.name == "seer.test"));
+        // CDS/CDNSKEY/SVCB are published but not part of the fan-out.
+        assert!(!records.iter().any(|r| r.record_type == RecordType::CDS));
+    }
+
+    #[tokio::test]
+    async fn mock_resolve_converts_service_bindings() {
+        let records = mock_zone_lookup(RecordType::HTTPS, "seer.test").await;
+        assert_eq!(records.len(), 1, "{records:?}");
+        let RecordData::HTTPS {
+            priority,
+            target,
+            params,
+        } = &records[0].data
+        else {
+            panic!("expected HTTPS data, got {:?}", records[0].data);
+        };
+        assert_eq!((*priority, target.as_str()), (1, "."));
+        let pairs: Vec<(&str, &str)> = params
+            .iter()
+            .map(|p| (p.key.as_str(), p.value.as_str()))
+            .collect();
+        assert_eq!(
+            pairs,
+            [
+                ("alpn", "h3,h2"),
+                ("port", "8443"),
+                ("ipv4hint", "192.0.2.1,192.0.2.2"),
+                ("ech", "AAH+"),
+                ("ipv6hint", "2001:db8::1"),
+                // Private-use key: RFC 9460 `key<N>` name, the opaque value
+                // as an escaped character-string (the space is `\032`).
+                ("key65333", "ex\\0321"),
+            ]
+        );
+        assert_eq!(
+            records[0].data.to_string(),
+            "1 . alpn=\"h3,h2\" port=8443 ipv4hint=192.0.2.1,192.0.2.2 ech=AAH+ \
+             ipv6hint=2001:db8::1 key65333=ex\\0321"
+        );
+
+        let alias = mock_zone_lookup(RecordType::HTTPS, "alias.seer.test").await;
+        assert_eq!(alias.len(), 1, "{alias:?}");
+        assert_eq!(alias[0].data.to_string(), "0 pool.seer.test.");
+
+        let svcb = mock_zone_lookup(RecordType::SVCB, "_8443._foo.seer.test").await;
+        assert_eq!(svcb.len(), 1, "{svcb:?}");
+        assert_eq!(svcb[0].record_type, RecordType::SVCB);
+        assert_eq!(
+            svcb[0].data.to_string(),
+            "2 svc.seer.test. mandatory=alpn,port alpn=\"foo\" no-default-alpn port=8443"
+        );
+    }
+
+    #[tokio::test]
+    async fn mock_resolve_converts_child_dnssec_records() {
+        // ED25519 is algorithm 15; SHA-256 is digest type 2.
+        let cds = mock_zone_lookup(RecordType::CDS, "seer.test").await;
+        let shown: Vec<String> = cds.iter().map(|r| r.data.to_string()).collect();
+        assert_eq!(shown, ["2371 15 2 ABCDEF", "0 0 0 00"]);
+        assert!(cds.iter().all(|r| r.record_type == RecordType::CDS));
+
+        let cdnskey = mock_zone_lookup(RecordType::CDNSKEY, "seer.test").await;
+        let shown: Vec<String> = cdnskey.iter().map(|r| r.data.to_string()).collect();
+        assert_eq!(
+            shown,
+            [
+                "257 3 15 BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=",
+                // The RFC 8078 delete request keeps its one-octet key.
+                "0 3 0 AA==",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn mock_resolve_keeps_only_the_requested_type_behind_a_cname() {
+        // `resolve`'s contract is unchanged by the CNAME chain `query`
+        // reports: records of the requested type only, each named by the
+        // query name.
+        let port = spawn_mock_dns_fn(|qname, qtype| match (qname, qtype) {
+            ("www.seer.test", HickoryRecordType::A) => MockReply::Records(vec![
+                record("www.seer.test.", 300, cname_rdata("edge.cdn.test.")),
+                record("edge.cdn.test.", 60, a_rdata([192, 0, 2, 7])),
+            ]),
+            _ => MockReply::NxDomain,
+        })
+        .await;
+        let records = mock_dns_resolver(port)
+            .resolve("www.seer.test", RecordType::A, Some("127.0.0.1"))
+            .await
+            .expect("A behind a CNAME");
+        assert_eq!(
+            records,
+            [DnsRecord {
+                name: "www.seer.test".to_string(),
+                record_type: RecordType::A,
+                ttl: 60,
+                data: RecordData::A {
+                    address: "192.0.2.7".to_string(),
+                },
+            }]
+        );
+    }
+
+    // --- query(): the full dig-style result -----------------------------
+
+    fn is_probe(qname: &str) -> bool {
+        qname.starts_with("seer-probe-")
+    }
+
+    /// Every (name, type) the mock was asked, in order.
+    type Asked = Arc<std::sync::Mutex<Vec<(String, HickoryRecordType)>>>;
+
+    /// [`spawn_mock_dns_fn`] that also records what it was asked.
+    async fn spawn_recording<F>(mut handler: F) -> (u16, Asked)
+    where
+        F: FnMut(&str, HickoryRecordType) -> MockReply + Send + 'static,
+    {
+        let asked: Asked = Arc::default();
+        let log = Arc::clone(&asked);
+        let port = spawn_mock_dns_fn(move |qname, qtype| {
+            log.lock().unwrap().push((qname.to_string(), qtype));
+            handler(qname, qtype)
+        })
+        .await;
+        (port, asked)
+    }
+
+    fn probes_sent(asked: &Asked) -> usize {
+        asked
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(name, _)| is_probe(name))
+            .count()
+    }
+
+    async fn mock_query(port: u16, name: &str, record_type: RecordType) -> DnsQueryResult {
+        mock_dns_resolver(port)
+            .query(name, record_type, Some("127.0.0.1"))
+            .await
+            .unwrap_or_else(|e| panic!("{record_type} query against mock must succeed: {e}"))
+    }
+
+    fn shown(records: &[&DnsRecord]) -> Vec<(String, RecordType, String)> {
+        records
+            .iter()
+            .map(|r| (r.name.clone(), r.record_type, r.data.to_string()))
+            .collect()
+    }
+
+    fn row(name: &str, record_type: RecordType, data: &str) -> (String, RecordType, String) {
+        (name.to_string(), record_type, data.to_string())
+    }
+
+    #[tokio::test]
+    async fn mock_query_reports_the_cname_chain_under_real_owners() {
+        let port = spawn_mock_dns_fn(|qname, qtype| match (qname, qtype) {
+            ("www.seer.test", HickoryRecordType::A) => MockReply::Records(vec![
+                record("www.seer.test.", 300, cname_rdata("edge.cdn.test.")),
+                record("edge.cdn.test.", 120, cname_rdata("origin.cdn.test.")),
+                record("origin.cdn.test.", 60, a_rdata([192, 0, 2, 7])),
+                record("origin.cdn.test.", 60, a_rdata([192, 0, 2, 8])),
+            ]),
+            _ => MockReply::NxDomain,
+        })
+        .await;
+        let result = mock_query(port, "WWW.Seer.test", RecordType::A).await;
+
+        assert_eq!(result.name, "www.seer.test");
+        assert_eq!(result.record_type, RecordType::A);
+        assert_eq!(result.server.as_deref(), Some("127.0.0.1"));
+        assert_eq!(result.status, DnsStatus::NoError);
+        assert_eq!(result.flags, ["qr", "rd", "ra"]);
+        assert_eq!(
+            shown(&result.cname_chain().collect::<Vec<_>>()),
+            [
+                row("www.seer.test", RecordType::CNAME, "edge.cdn.test."),
+                row("edge.cdn.test", RecordType::CNAME, "origin.cdn.test."),
+            ]
+        );
+        assert_eq!(
+            shown(&result.records().collect::<Vec<_>>()),
+            [
+                row("origin.cdn.test", RecordType::A, "192.0.2.7"),
+                row("origin.cdn.test", RecordType::A, "192.0.2.8"),
+            ]
+        );
+        assert_eq!(result.answers[2].ttl, 60);
+        assert!(result.authority.is_empty());
+        assert!(!result.is_nodata());
+        // The sibling probe got NXDOMAIN: no wildcard.
+        let wildcard = result
+            .wildcard
+            .expect("probe ran for a name below seer.test");
+        assert!(is_probe(&wildcard.probe_name), "{wildcard:?}");
+        assert!(wildcard.probe_name.ends_with(".seer.test"), "{wildcard:?}");
+        assert!(!wildcard.present && !wildcard.matches_answer);
+    }
+
+    #[tokio::test]
+    async fn mock_query_reports_idn_owners_as_a_labels() {
+        // The query name is normalized to its A-label; owners and the CNAME
+        // target are reported in that spelling too, so the chain connects
+        // name for name.
+        let port = spawn_mock_dns_fn(|qname, qtype| match (qname, qtype) {
+            ("xn--bcher-kva.seer.test", HickoryRecordType::A) => MockReply::Records(vec![
+                record(
+                    "xn--bcher-kva.seer.test.",
+                    300,
+                    cname_rdata("edge.xn--caf-dma.test."),
+                ),
+                record("edge.xn--caf-dma.test.", 60, a_rdata([192, 0, 2, 7])),
+            ]),
+            _ => MockReply::NxDomain,
+        })
+        .await;
+        let result = mock_query(port, "Bücher.seer.test", RecordType::A).await;
+        assert_eq!(result.name, "xn--bcher-kva.seer.test");
+        assert_eq!(
+            shown(&result.answers.iter().collect::<Vec<_>>()),
+            [
+                row(
+                    "xn--bcher-kva.seer.test",
+                    RecordType::CNAME,
+                    "edge.xn--caf-dma.test."
+                ),
+                row("edge.xn--caf-dma.test", RecordType::A, "192.0.2.7"),
+            ]
+        );
+        assert_eq!(result.cname_chain().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn query_refuses_a_reserved_nameserver() {
+        // SSRF: `query` builds its upstream through the same vetted path as
+        // `resolve`, so a loopback or private nameserver is refused before
+        // any packet is sent.
+        let r = DnsResolver::new();
+        for reserved in ["127.0.0.1", "10.0.0.1", "::1", "tls://192.168.1.1"] {
+            let err = r
+                .query("www.example.com", RecordType::A, Some(reserved))
+                .await
+                .expect_err("a reserved nameserver must be refused");
+            let msg = err.to_string().to_lowercase();
+            assert!(
+                msg.contains("blocked") || msg.contains("reserved"),
+                "{reserved}: {msg}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mock_query_reports_a_cname_the_server_did_not_follow_as_sent() {
+        // A server that does not recurse answers with the CNAME alone. Like
+        // dig, `query` reports that response and asks nothing more — hickory's
+        // resolver used to chase the target itself, with a second query to
+        // the same server.
+        let (port, asked) = spawn_recording(|qname, qtype| match (qname, qtype) {
+            ("www.seer.test", HickoryRecordType::A) => MockReply::Records(vec![record(
+                "www.seer.test.",
+                300,
+                cname_rdata("edge.cdn.test."),
+            )]),
+            ("edge.cdn.test", HickoryRecordType::A) => {
+                MockReply::Answer(vec![a_rdata([192, 0, 2, 7])])
+            }
+            _ => MockReply::NxDomain,
+        })
+        .await;
+        let result = mock_query(port, "www.seer.test", RecordType::A).await;
+        assert_eq!(result.status, DnsStatus::NoError);
+        assert_eq!(result.flags, ["qr", "rd", "ra"]);
+        assert_eq!(
+            shown(&result.answers.iter().collect::<Vec<_>>()),
+            [row("www.seer.test", RecordType::CNAME, "edge.cdn.test.")]
+        );
+        assert_eq!(result.records().count(), 0);
+        assert!(
+            !asked
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(n, _)| n == "edge.cdn.test"),
+            "the target is not chased: {asked:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mock_query_reports_a_dangling_cname_with_its_chain() {
+        // Regression: a CNAME whose target does not exist read as a bare
+        // "Name does not exist (NXDOMAIN)" — no chain, no flags — because
+        // hickory's resolver discarded the chain and the response header.
+        let port = spawn_mock_dns_fn(|qname, _| match qname {
+            "www.seer.test" => MockReply::Negative {
+                code: ResponseCode::NXDomain,
+                chain: vec![
+                    record("www.seer.test.", 300, cname_rdata("shop.seer.test.")),
+                    record("shop.seer.test.", 300, cname_rdata("gone.cdn.test.")),
+                ],
+                soa: "cdn.test",
+            },
+            _ => MockReply::NxDomainWithSoa("seer.test"),
+        })
+        .await;
+        let result = mock_query(port, "www.seer.test", RecordType::A).await;
+        assert_eq!(result.status, DnsStatus::NxDomain);
+        assert_eq!(result.flags, ["qr", "rd", "ra"]);
+        assert_eq!(
+            shown(&result.cname_chain().collect::<Vec<_>>()),
+            [
+                row("www.seer.test", RecordType::CNAME, "shop.seer.test."),
+                row("shop.seer.test", RecordType::CNAME, "gone.cdn.test."),
+            ]
+        );
+        assert_eq!(result.records().count(), 0);
+        assert_eq!(
+            shown(&result.authority.iter().collect::<Vec<_>>()),
+            [row(
+                "cdn.test",
+                RecordType::SOA,
+                "ns1.cdn.test. hostmaster.cdn.test. 2026070101 7200 3600 1209600 300"
+            )]
+        );
+        assert!(!result.is_nodata());
+        assert_eq!(result.referral_zone(), None);
+        assert_eq!(
+            result.wildcard, None,
+            "a negative answer has nothing to compare"
+        );
+    }
+
+    #[tokio::test]
+    async fn mock_query_reports_nodata_behind_a_cname() {
+        let port = spawn_mock_dns_fn(|qname, _| match qname {
+            "www.seer.test" => MockReply::Negative {
+                code: ResponseCode::NoError,
+                chain: vec![record("www.seer.test.", 300, cname_rdata("edge.cdn.test."))],
+                soa: "cdn.test",
+            },
+            _ => MockReply::NxDomain,
+        })
+        .await;
+        let result = mock_query(port, "www.seer.test", RecordType::AAAA).await;
+        assert_eq!(result.status, DnsStatus::NoError);
+        assert_eq!(result.flags, ["qr", "rd", "ra"]);
+        assert_eq!(result.cname_chain().count(), 1);
+        assert_eq!(result.records().count(), 0);
+        assert!(result.is_nodata());
+        assert_eq!(result.referral_zone(), None);
+        assert_eq!(result.authority.len(), 1);
+        assert_eq!(result.authority[0].name, "cdn.test");
+    }
+
+    #[tokio::test]
+    async fn mock_query_reports_nxdomain_with_the_zone_soa() {
+        let (port, asked) = spawn_recording(|_, _| MockReply::NxDomainWithSoa("seer.test")).await;
+        let result = mock_query(port, "nx.seer.test", RecordType::A).await;
+        assert_eq!(result.status, DnsStatus::NxDomain);
+        assert!(result.answers.is_empty());
+        assert!(!result.is_nodata(), "NXDOMAIN is not NODATA");
+        // Regression: a negative answer came back without its header.
+        assert_eq!(result.flags, ["qr", "rd", "ra"]);
+        assert_eq!(
+            shown(&result.authority.iter().collect::<Vec<_>>()),
+            [row(
+                "seer.test",
+                RecordType::SOA,
+                "ns1.seer.test. hostmaster.seer.test. 2026070101 7200 3600 1209600 300"
+            )]
+        );
+        // A negative answer has nothing to compare a wildcard with.
+        assert_eq!(result.wildcard, None);
+        assert!(asked
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(n, _)| n == "nx.seer.test"));
+    }
+
+    #[tokio::test]
+    async fn mock_query_reports_nodata_with_the_zone_soa() {
+        let port = spawn_mock_dns_fn(|_, _| MockReply::NoDataWithSoa("seer.test")).await;
+        let result = mock_query(port, "www.seer.test", RecordType::MX).await;
+        assert_eq!(result.status, DnsStatus::NoError);
+        assert!(result.is_nodata());
+        assert!(result.answers.is_empty());
+        assert_eq!(result.authority.len(), 1);
+        assert_eq!(result.authority[0].record_type, RecordType::SOA);
+        assert_eq!(result.authority[0].name, "seer.test");
+        assert_eq!(result.wildcard, None);
+    }
+
+    #[tokio::test]
+    async fn mock_query_reports_error_codes_as_results() {
+        let port = spawn_mock_dns_fn(|qname, _| match qname {
+            "servfail.seer.test" => MockReply::ServFail,
+            "refused.seer.test" => MockReply::Refused,
+            "notimp.seer.test" => MockReply::Rcode(ResponseCode::NotImp),
+            _ => MockReply::NxDomain,
+        })
+        .await;
+        for (name, status, shown) in [
+            ("servfail.seer.test", DnsStatus::ServFail, "SERVFAIL"),
+            ("refused.seer.test", DnsStatus::Refused, "REFUSED"),
+            ("notimp.seer.test", DnsStatus::Other(4), "NOTIMP"),
+        ] {
+            let result = mock_query(port, name, RecordType::A).await;
+            assert_eq!(result.status, status, "{name}");
+            assert_eq!(result.status.to_string(), shown);
+            assert!(result.answers.is_empty() && result.authority.is_empty());
+            assert_eq!(result.flags, ["qr", "rd", "ra"], "{name}");
+            assert!(!result.is_nodata());
+            assert_eq!(result.wildcard, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn mock_query_reads_an_extended_rcode_from_edns() {
+        // BADVERS (16) does not fit the header's four bits: its high bits
+        // travel in the OPT record, and the status must include them.
+        let port = spawn_mock_dns_fn(|_, _| MockReply::Rcode(ResponseCode::BADVERS)).await;
+        let result = mock_query(port, "www.seer.test", RecordType::A).await;
+        assert_eq!(result.status, DnsStatus::Other(16));
+        assert_eq!(result.status.to_string(), "BADVERS");
+    }
+
+    #[tokio::test]
+    async fn mock_query_repeats_a_truncated_reply_over_tcp() {
+        // A bare `@server` spec configures UDP only; like dig, a truncated
+        // reply is asked again over TCP, of the same address and port.
+        let transports = Arc::new(std::sync::Mutex::new(0));
+        let seen = Arc::clone(&transports);
+        let port = spawn_mock_dns_fn_with_tcp(move |qname, _| {
+            if qname != "big.seer.test" {
+                return MockReply::NxDomain;
+            }
+            let mut n = seen.lock().unwrap();
+            *n += 1;
+            if *n == 1 {
+                MockReply::Truncated
+            } else {
+                MockReply::Answer((1..=3).map(|i| a_rdata([192, 0, 2, i])).collect())
+            }
+        })
+        .await;
+        let result = mock_query(port, "big.seer.test", RecordType::A).await;
+        assert_eq!(result.status, DnsStatus::NoError);
+        assert_eq!(result.records().count(), 3);
+        assert!(
+            !result.flags.contains(&"tc".to_string()),
+            "{:?}",
+            result.flags
+        );
+        assert_eq!(*transports.lock().unwrap(), 2, "UDP, then TCP");
+    }
+
+    #[tokio::test]
+    async fn mock_query_reports_a_referral_as_neither_nodata_nor_an_answer() {
+        // A server that is not authoritative for the name and does not
+        // recurse refers the query to the child zone's servers. Regression:
+        // this was reported as NODATA ("the name exists").
+        let port = spawn_mock_dns_fn(|_, _| MockReply::Delegation {
+            zone: "child.seer.test".to_string(),
+            servers: vec![
+                (
+                    "ns1.child.seer.test".to_string(),
+                    vec![IpAddr::from([192, 0, 2, 1])],
+                ),
+                ("ns2.child.seer.test".to_string(), vec![]),
+            ],
+        })
+        .await;
+        let result = mock_query(port, "www.child.seer.test", RecordType::A).await;
+        assert_eq!(result.status, DnsStatus::NoError);
+        // The header, as the referring server set it: no `aa`, no `ra`.
+        assert_eq!(result.flags, ["qr", "rd"]);
+        assert!(result.answers.is_empty());
+        assert_eq!(result.referral_zone(), Some("child.seer.test"));
+        assert!(!result.is_nodata());
+        assert_eq!(
+            shown(&result.authority.iter().collect::<Vec<_>>()),
+            [
+                row("child.seer.test", RecordType::NS, "ns1.child.seer.test."),
+                row("child.seer.test", RecordType::NS, "ns2.child.seer.test."),
+            ]
+        );
+        assert_eq!(result.wildcard, None);
+    }
+
+    #[tokio::test]
+    async fn mock_query_reports_special_use_names_as_answered_locally() {
+        // hickory answers RFC 6761 names itself. Regression: `-x 127.0.0.1`
+        // was reported as the server's answer (`flags: qr`, `server: …`) and,
+        // since the probe's sibling got the same local answer, as likely
+        // wildcard-synthesized.
+        let (port, asked) = spawn_recording(|_, _| MockReply::NxDomain).await;
+        let ptr = mock_query(port, "127.0.0.1", RecordType::PTR).await;
+        assert_eq!(ptr.name, "1.0.0.127.in-addr.arpa");
+        assert!(ptr.answered_locally);
+        assert_eq!(ptr.server, None, "no server was asked");
+        assert!(ptr.flags.is_empty(), "the header is hickory's own");
+        assert_eq!(ptr.status, DnsStatus::NoError);
+        assert_eq!(
+            shown(&ptr.answers.iter().collect::<Vec<_>>()),
+            [row("1.0.0.127.in-addr.arpa", RecordType::PTR, "localhost.")]
+        );
+        assert_eq!(ptr.wildcard, None, "no wildcard probe for a local name");
+
+        let mx = mock_query(port, "foo.localhost", RecordType::MX).await;
+        assert!(mx.answered_locally && mx.is_nodata());
+        let onion = mock_query(port, "x.onion", RecordType::A).await;
+        assert!(onion.answered_locally);
+        assert_eq!(onion.status, DnsStatus::NxDomain);
+
+        assert!(asked.lock().unwrap().is_empty(), "{asked:?}");
+    }
+
+    #[tokio::test]
+    async fn mock_query_times_out_as_an_error() {
+        let port = spawn_mock_dns(MockMode::Ignore).await;
+        let resolver = DnsResolver::new()
+            .with_timeout(Duration::from_millis(200))
+            .allowing_private_hosts()
+            .with_port(port);
+        let result = resolver
+            .query("www.seer.test", RecordType::A, Some("127.0.0.1"))
+            .await;
+        assert!(
+            matches!(&result, Err(SeerError::DnsError(m)) if m.contains("A lookup failed")),
+            "an unanswered query is a transport error, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mock_query_reads_flags_from_the_response_header() {
+        let port = spawn_mock_dns_fn(|qname, qtype| match (qname, qtype) {
+            ("seer.test", HickoryRecordType::A) => {
+                MockReply::AuthoritativeAnswer(vec![a_rdata([192, 0, 2, 1])])
+            }
+            _ => MockReply::NxDomain,
+        })
+        .await;
+        let result = mock_query(port, "seer.test", RecordType::A).await;
+        assert_eq!(result.flags, ["qr", "aa", "rd", "ra"]);
+        assert_eq!(result.cname_chain().count(), 0);
+        assert_eq!(
+            result.records().next().map(|r| r.name.as_str()),
+            Some("seer.test")
+        );
+    }
+
+    #[tokio::test]
+    async fn mock_query_converts_the_new_record_types_under_their_owner() {
+        let port = spawn_mock_dns(MockMode::Zone).await;
+        let https = mock_query(port, "seer.test", RecordType::HTTPS).await;
+        assert_eq!(https.answers.len(), 1, "{https:?}");
+        assert_eq!(https.answers[0].name, "seer.test");
+        assert!(https.answers[0]
+            .data
+            .to_string()
+            .starts_with("1 . alpn=\"h3,h2\" port=8443"));
+
+        let alias = mock_query(port, "alias.seer.test", RecordType::HTTPS).await;
+        assert_eq!(alias.answers[0].data.to_string(), "0 pool.seer.test.");
+        assert_eq!(alias.answers[0].name, "alias.seer.test");
+
+        let cds = mock_query(port, "seer.test", RecordType::CDS).await;
+        assert_eq!(cds.answers.len(), 2);
+        let cdnskey = mock_query(port, "seer.test", RecordType::CDNSKEY).await;
+        assert_eq!(cdnskey.answers[1].data.to_string(), "0 3 0 AA==");
+    }
+
+    #[tokio::test]
+    async fn mock_query_sorts_mx_like_resolve() {
+        let port = spawn_mock_dns(MockMode::Zone).await;
+        let result = mock_query(port, "seer.test", RecordType::MX).await;
+        let prefs: Vec<String> = result.answers.iter().map(|r| r.data.to_string()).collect();
+        assert_eq!(
+            prefs,
+            [
+                "10 a.mail.seer.test.",
+                "20 b.mail.seer.test.",
+                "30 c.mail.seer.test."
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn mock_query_resolves_srv_and_ptr_names_like_resolve() {
+        let (port, asked) = spawn_recording(|qname, qtype| match (qname, qtype) {
+            ("_sip._tcp.seer.test", HickoryRecordType::SRV) => {
+                MockReply::Answer(vec![HickoryRData::SRV(
+                    hickory_resolver::proto::rr::rdata::SRV::new(
+                        10,
+                        5,
+                        5060,
+                        Name::from_ascii("sip.seer.test.").unwrap(),
+                    ),
+                )])
+            }
+            ("1.2.0.192.in-addr.arpa", HickoryRecordType::PTR) => {
+                MockReply::Answer(vec![HickoryRData::PTR(
+                    hickory_resolver::proto::rr::rdata::PTR(
+                        Name::from_ascii("ptr.seer.test.").unwrap(),
+                    ),
+                )])
+            }
+            _ => MockReply::NxDomain,
+        })
+        .await;
+
+        let srv = mock_query(port, "_sip._tcp.seer.test", RecordType::SRV).await;
+        assert_eq!(
+            shown(&srv.answers.iter().collect::<Vec<_>>()),
+            [row(
+                "_sip._tcp.seer.test",
+                RecordType::SRV,
+                "10 5 5060 sip.seer.test."
+            )]
+        );
+        // The sibling of an underscore name replaces its leftmost label.
+        let probe = srv.wildcard.expect("SRV name is below seer.test");
+        assert!(probe.probe_name.ends_with("._tcp.seer.test"), "{probe:?}");
+        assert!(asked.lock().unwrap().iter().any(|(n, t)| is_probe(n)
+            && n.ends_with("._tcp.seer.test")
+            && *t == HickoryRecordType::SRV));
+
+        let ptr = mock_query(port, "192.0.2.1", RecordType::PTR).await;
+        assert_eq!(ptr.name, "1.2.0.192.in-addr.arpa");
+        assert_eq!(ptr.answers[0].name, "1.2.0.192.in-addr.arpa");
+
+        let err = mock_dns_resolver(port)
+            .query("seer.test", RecordType::SRV, Some("127.0.0.1"))
+            .await
+            .expect_err("a bare domain is not an SRV query");
+        assert!(matches!(err, SeerError::InvalidInput(_)), "{err:?}");
+        let err = mock_dns_resolver(port)
+            .query(".bad.example", RecordType::A, Some("127.0.0.1"))
+            .await;
+        assert!(err.is_err(), "invalid names are rejected before any I/O");
+    }
+
+    #[tokio::test]
+    async fn mock_query_any_fans_out_to_the_new_types_and_dedupes() {
+        let (port, asked) = spawn_recording(|qname, qtype| {
+            let chain = || record("www.seer.test.", 300, cname_rdata("edge.seer.test."));
+            match (qname, qtype) {
+                ("www.seer.test", HickoryRecordType::CNAME) => MockReply::Records(vec![chain()]),
+                ("www.seer.test", HickoryRecordType::A) => MockReply::Records(vec![
+                    chain(),
+                    record("edge.seer.test.", 60, a_rdata([192, 0, 2, 7])),
+                ]),
+                ("www.seer.test", HickoryRecordType::HTTPS) => {
+                    MockReply::Records(vec![
+                        chain(),
+                        record(
+                            "edge.seer.test.",
+                            60,
+                            HickoryRData::HTTPS(hickory_resolver::proto::rr::rdata::HTTPS(
+                                SVCB::new(1, Name::root(), vec![]),
+                            )),
+                        ),
+                    ])
+                }
+                // Every other type: the chain alone, as a NODATA at the
+                // target reads.
+                ("www.seer.test", _) => MockReply::Records(vec![chain()]),
+                _ => MockReply::NoDataWithSoa("seer.test"),
+            }
+        })
+        .await;
+        let result = mock_query(port, "www.seer.test", RecordType::ANY).await;
+
+        assert_eq!(result.record_type, RecordType::ANY);
+        assert_eq!(result.status, DnsStatus::NoError);
+        assert_eq!(result.flags, ["qr", "rd", "ra"]);
+        // The CNAME came back from all 11 sub-queries; it is listed once.
+        assert_eq!(
+            shown(&result.answers.iter().collect::<Vec<_>>()),
+            [
+                row("www.seer.test", RecordType::CNAME, "edge.seer.test."),
+                row("edge.seer.test", RecordType::A, "192.0.2.7"),
+                row("edge.seer.test", RecordType::HTTPS, "1 ."),
+            ]
+        );
+        assert_eq!(result.cname_chain().count(), 1);
+        assert_eq!(result.records().count(), 2);
+        assert!(!result.is_nodata());
+        assert_eq!(result.wildcard, None, "ANY is never probed");
+
+        let asked: Vec<HickoryRecordType> = asked
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(n, _)| n == "www.seer.test")
+            .map(|(_, t)| *t)
+            .collect();
+        for wire in ANY_TYPES.iter().filter_map(|t| wire_type(*t)) {
+            assert!(asked.contains(&wire), "ANY must query {wire}: {asked:?}");
+        }
+        assert!(
+            !asked.contains(&HickoryRecordType::ANY),
+            "ANY is never sent"
+        );
+    }
+
+    #[tokio::test]
+    async fn mock_query_any_errors_only_when_every_sub_query_fails() {
+        let port = spawn_mock_dns(MockMode::Ignore).await;
+        let resolver = DnsResolver::new()
+            .with_timeout(Duration::from_millis(200))
+            .allowing_private_hosts()
+            .with_port(port);
+        let result = resolver
+            .query("www.seer.test", RecordType::ANY, Some("127.0.0.1"))
+            .await;
+        assert!(matches!(result, Err(SeerError::DnsError(_))), "{result:?}");
+    }
+
+    /// A zone where `www` has its own A record and every other name under
+    /// `seer.test` answers the probe with `probe_reply`.
+    async fn wildcard_zone(probe_reply: fn() -> MockReply) -> (u16, Asked) {
+        spawn_recording(move |qname, qtype| match (qname, qtype) {
+            ("www.seer.test", HickoryRecordType::A) => {
+                MockReply::Answer(vec![a_rdata([192, 0, 2, 50])])
+            }
+            (name, HickoryRecordType::A) if is_probe(name) => probe_reply(),
+            _ => MockReply::NxDomain,
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn mock_wildcard_probe_matching_the_answer() {
+        let (port, asked) =
+            wildcard_zone(|| MockReply::Answer(vec![a_rdata([192, 0, 2, 50])])).await;
+        let result = mock_query(port, "www.seer.test", RecordType::A).await;
+        let probe = result.wildcard.expect("probe attached");
+        assert!(probe.present && probe.matches_answer, "{probe:?}");
+        assert_eq!(probes_sent(&asked), 1);
+    }
+
+    #[tokio::test]
+    async fn mock_wildcard_probe_with_different_data() {
+        let (port, _) = wildcard_zone(|| MockReply::Answer(vec![a_rdata([192, 0, 2, 99])])).await;
+        let result = mock_query(port, "www.seer.test", RecordType::A).await;
+        let probe = result.wildcard.expect("probe attached");
+        assert!(probe.present && !probe.matches_answer, "{probe:?}");
+    }
+
+    #[tokio::test]
+    async fn mock_wildcard_probe_absent() {
+        let (port, _) = wildcard_zone(|| MockReply::NxDomainWithSoa("seer.test")).await;
+        let result = mock_query(port, "www.seer.test", RecordType::A).await;
+        let probe = result.wildcard.expect("probe attached");
+        assert!(!probe.present && !probe.matches_answer, "{probe:?}");
+    }
+
+    #[tokio::test]
+    async fn mock_wildcard_probe_that_fails_is_dropped_not_fatal() {
+        let (port, _) = wildcard_zone(|| MockReply::ServFail).await;
+        let result = mock_query(port, "www.seer.test", RecordType::A).await;
+        assert_eq!(result.status, DnsStatus::NoError);
+        assert_eq!(result.wildcard, None);
+
+        // An unanswered probe times out; the main answer still stands.
+        let (port, _) = wildcard_zone(|| MockReply::NoReply).await;
+        let resolver = DnsResolver::new()
+            .with_timeout(Duration::from_millis(200))
+            .allowing_private_hosts()
+            .with_port(port);
+        let result = resolver
+            .query("www.seer.test", RecordType::A, Some("127.0.0.1"))
+            .await
+            .expect("the probe never fails the query");
+        assert_eq!(result.records().count(), 1);
+        assert_eq!(result.wildcard, None);
+    }
+
+    #[tokio::test]
+    async fn mock_wildcard_probe_is_not_sent_for_ineligible_names() {
+        // Every name answers, so a probe, if sent, would find a "wildcard".
+        let (port, asked) =
+            spawn_recording(|_, _| MockReply::Answer(vec![a_rdata([192, 0, 2, 50])])).await;
+        // The registrable domain itself: its sibling would be TLD-level.
+        assert_eq!(
+            mock_query(port, "seer.test", RecordType::A).await.wildcard,
+            None
+        );
+        // The wildcard owner itself.
+        assert_eq!(
+            mock_query(port, "*.seer.test", RecordType::A)
+                .await
+                .wildcard,
+            None
+        );
+        // ANY is a fan-out, not one answer.
+        assert_eq!(
+            mock_query(port, "www.seer.test", RecordType::ANY)
+                .await
+                .wildcard,
+            None
+        );
+        assert_eq!(probes_sent(&asked), 0, "{:?}", asked.lock().unwrap());
     }
 
     #[tokio::test]

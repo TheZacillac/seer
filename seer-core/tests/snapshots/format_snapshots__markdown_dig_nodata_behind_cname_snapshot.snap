@@ -1,0 +1,27 @@
+---
+source: seer-core/tests/format_snapshots.rs
+assertion_line: 1374
+expression: markdown ().format_dig (& fixture_dig_nodata_behind_cname())
+---
+## DNS AAAA Records: www.seer.test
+
+- **Status**: `NOERROR`
+- **Flags**: `qr rd ra`
+- **Server**: default
+- **Query time**: 12 ms
+
+*The CNAME target `edge.cdn.test.` has no AAAA records (NODATA)*
+
+### Answer
+
+| Name | TTL | Type | Data |
+| --- | --- | --- | --- |
+| `www.seer.test` | 300 | CNAME | `edge.cdn.test.` |
+
+### Authority
+
+| Name | TTL | Type | Data |
+| --- | --- | --- | --- |
+| `cdn.test` | 900 | SOA | `ns1.cdn.test. hostmaster.cdn.test. 2026092801 7200 3600 1209600 900` |
+
+> Note: DNS responses are not DNSSEC-validated.

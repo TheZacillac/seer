@@ -20,8 +20,12 @@ pub enum RecordType {
     NAPTR,
     DNSKEY,
     DS,
+    CDS,
+    CDNSKEY,
     TLSA,
     SSHFP,
+    HTTPS,
+    SVCB,
     ANY,
 }
 
@@ -47,8 +51,12 @@ impl RecordType {
         RecordType::NAPTR,
         RecordType::DNSKEY,
         RecordType::DS,
+        RecordType::CDS,
+        RecordType::CDNSKEY,
         RecordType::TLSA,
         RecordType::SSHFP,
+        RecordType::HTTPS,
+        RecordType::SVCB,
         RecordType::ANY,
     ];
 
@@ -56,7 +64,7 @@ impl RecordType {
     /// slices directly (completion candidates, help text, JSON schemas).
     pub const ALL_NAMES: &'static [&'static str] = &[
         "A", "AAAA", "CNAME", "MX", "NS", "TXT", "SOA", "PTR", "SRV", "CAA", "NAPTR", "DNSKEY",
-        "DS", "TLSA", "SSHFP", "ANY",
+        "DS", "CDS", "CDNSKEY", "TLSA", "SSHFP", "HTTPS", "SVCB", "ANY",
     ];
 
     /// The canonical uppercase name. Exhaustive match, so adding a variant
@@ -76,8 +84,12 @@ impl RecordType {
             RecordType::NAPTR => "NAPTR",
             RecordType::DNSKEY => "DNSKEY",
             RecordType::DS => "DS",
+            RecordType::CDS => "CDS",
+            RecordType::CDNSKEY => "CDNSKEY",
             RecordType::TLSA => "TLSA",
             RecordType::SSHFP => "SSHFP",
+            RecordType::HTTPS => "HTTPS",
+            RecordType::SVCB => "SVCB",
             RecordType::ANY => "ANY",
         }
     }
@@ -107,15 +119,19 @@ impl FromStr for RecordType {
             "NAPTR" => Ok(RecordType::NAPTR),
             "DNSKEY" => Ok(RecordType::DNSKEY),
             "DS" => Ok(RecordType::DS),
+            "CDS" => Ok(RecordType::CDS),
+            "CDNSKEY" => Ok(RecordType::CDNSKEY),
             "TLSA" => Ok(RecordType::TLSA),
             "SSHFP" => Ok(RecordType::SSHFP),
+            "HTTPS" => Ok(RecordType::HTTPS),
+            "SVCB" => Ok(RecordType::SVCB),
             "ANY" | "*" => Ok(RecordType::ANY),
             _ => Err(SeerError::InvalidRecordType(s.to_string())),
         }
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DnsRecord {
     pub name: String,
     pub record_type: RecordType,
@@ -123,7 +139,50 @@ pub struct DnsRecord {
     pub data: RecordData,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// One SvcParam of an HTTPS or SVCB record (RFC 9460), in presentation form.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SvcParam {
+    /// The RFC 9460 presentation name: `mandatory`, `alpn`,
+    /// `no-default-alpn`, `port`, `ipv4hint`, `ech`, `ipv6hint`, or
+    /// `key<N>` for a key without a registered name.
+    pub key: String,
+    /// The presentation value without surrounding quotes: a comma-separated
+    /// list for list-valued keys (`h3,h2`, `192.0.2.1,192.0.2.2`), base64 for
+    /// `ech`, and empty for a valueless key such as `no-default-alpn`.
+    pub value: String,
+}
+
+impl fmt::Display for SvcParam {
+    /// `key=value` as dig prints it: an `alpn` list is quoted, and a
+    /// valueless key stands bare.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.value.is_empty() {
+            f.write_str(&self.key)
+        } else if self.key == "alpn" {
+            write!(f, "{}=\"{}\"", self.key, self.value)
+        } else {
+            write!(f, "{}={}", self.key, self.value)
+        }
+    }
+}
+
+/// Writes HTTPS/SVCB RDATA the way dig prints it: priority, target name,
+/// then each SvcParam (`1 . alpn="h3,h2" ipv4hint=192.0.2.1`). AliasMode
+/// (priority 0, no params) reads `0 target.`.
+fn write_svcb(
+    f: &mut fmt::Formatter<'_>,
+    priority: u16,
+    target: &str,
+    params: &[SvcParam],
+) -> fmt::Result {
+    write!(f, "{} {}", priority, target)?;
+    for param in params {
+        write!(f, " {}", param)?;
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "record_type", content = "value", rename_all = "UPPERCASE")]
 #[allow(clippy::upper_case_acronyms)]
 pub enum RecordData {
@@ -181,6 +240,25 @@ pub enum RecordData {
         digest_type: u8,
         digest: String,
     },
+    /// Child DS (RFC 7344): the DS record a child zone asks its parent to
+    /// publish. Same fields as [`RecordData::DS`]; `algorithm` 0 is the
+    /// RFC 8078 delete request.
+    CDS {
+        key_tag: u16,
+        algorithm: u8,
+        digest_type: u8,
+        /// Hex-encoded digest (uppercase).
+        digest: String,
+    },
+    /// Child DNSKEY (RFC 7344). Same fields as [`RecordData::DNSKEY`];
+    /// `algorithm` 0 is the RFC 8078 delete request.
+    CDNSKEY {
+        flags: u16,
+        protocol: u8,
+        algorithm: u8,
+        /// Base64-encoded public key.
+        public_key: String,
+    },
     TLSA {
         cert_usage: u8,
         selector: u8,
@@ -201,6 +279,22 @@ pub enum RecordData {
         services: String,
         regexp: String,
         replacement: String,
+    },
+    /// HTTPS service binding (RFC 9460). `priority` 0 is AliasMode (`target`
+    /// is an alias, no params); anything else is ServiceMode.
+    HTTPS {
+        priority: u16,
+        /// The TargetName; `.` means the owner name itself.
+        target: String,
+        params: Vec<SvcParam>,
+    },
+    /// General service binding (RFC 9460), same shape as
+    /// [`RecordData::HTTPS`].
+    SVCB {
+        priority: u16,
+        /// The TargetName; `.` means the owner name itself.
+        target: String,
+        params: Vec<SvcParam>,
     },
     Unknown {
         raw: String,
@@ -252,6 +346,18 @@ impl fmt::Display for RecordData {
                 digest_type,
                 digest,
             } => write!(f, "{} {} {} {}", key_tag, algorithm, digest_type, digest),
+            RecordData::CDS {
+                key_tag,
+                algorithm,
+                digest_type,
+                digest,
+            } => write!(f, "{} {} {} {}", key_tag, algorithm, digest_type, digest),
+            RecordData::CDNSKEY {
+                flags,
+                protocol,
+                algorithm,
+                public_key,
+            } => write!(f, "{} {} {} {}", flags, protocol, algorithm, public_key),
             RecordData::TLSA {
                 cert_usage,
                 selector,
@@ -275,6 +381,16 @@ impl fmt::Display for RecordData {
                 "{} {} \"{}\" \"{}\" \"{}\" {}",
                 order, preference, flags, services, regexp, replacement
             ),
+            RecordData::HTTPS {
+                priority,
+                target,
+                params,
+            }
+            | RecordData::SVCB {
+                priority,
+                target,
+                params,
+            } => write_svcb(f, *priority, target, params),
             RecordData::Unknown { raw } => write!(f, "{}", raw),
         }
     }
@@ -297,7 +413,7 @@ impl RecordData {
     /// randomization return `NS1.EXAMPLE.COM.` and `ns1.example.com.` for the
     /// same record. Everything else is kept verbatim because it is
     /// case-SENSITIVE data: TXT strings, base64 DNSKEY key material, CAA
-    /// values, NAPTR regexps. Folding those (as compare/follow used to) hid
+    /// values, NAPTR regexps, HTTPS/SVCB params. Folding those (as compare/follow used to) hid
     /// real changes; folding nothing (as propagation used to) reported
     /// spurious NS/CNAME inconsistencies. This is the one shared rule.
     ///
@@ -308,7 +424,9 @@ impl RecordData {
         match &mut folded {
             RecordData::CNAME { target }
             | RecordData::PTR { target }
-            | RecordData::SRV { target, .. } => target.make_ascii_lowercase(),
+            | RecordData::SRV { target, .. }
+            | RecordData::HTTPS { target, .. }
+            | RecordData::SVCB { target, .. } => target.make_ascii_lowercase(),
             RecordData::NS { nameserver } => nameserver.make_ascii_lowercase(),
             RecordData::MX { exchange, .. } => exchange.make_ascii_lowercase(),
             RecordData::SOA { mname, rname, .. } => {
@@ -324,6 +442,8 @@ impl RecordData {
             | RecordData::TXT { .. }
             | RecordData::DNSKEY { .. }
             | RecordData::DS { .. }
+            | RecordData::CDS { .. }
+            | RecordData::CDNSKEY { .. }
             | RecordData::TLSA { .. }
             | RecordData::SSHFP { .. }
             | RecordData::Unknown { .. } => {}
@@ -482,6 +602,138 @@ mod tests {
         );
     }
 
+    fn svc(key: &str, value: &str) -> SvcParam {
+        SvcParam {
+            key: key.to_string(),
+            value: value.to_string(),
+        }
+    }
+
+    #[test]
+    fn https_display_mirrors_dig() {
+        let https = RecordData::HTTPS {
+            priority: 1,
+            target: ".".to_string(),
+            params: vec![
+                svc("alpn", "h3,h2"),
+                svc("ipv4hint", "104.16.132.229,104.16.133.229"),
+            ],
+        };
+        assert_eq!(
+            https.to_string(),
+            "1 . alpn=\"h3,h2\" ipv4hint=104.16.132.229,104.16.133.229"
+        );
+
+        // Valueless keys stand bare; other values are never quoted.
+        let svcb = RecordData::SVCB {
+            priority: 2,
+            target: "svc.example.net.".to_string(),
+            params: vec![svc("no-default-alpn", ""), svc("port", "8443")],
+        };
+        assert_eq!(
+            svcb.to_string(),
+            "2 svc.example.net. no-default-alpn port=8443"
+        );
+
+        // AliasMode: priority 0 and the alias target, nothing else.
+        let alias = RecordData::HTTPS {
+            priority: 0,
+            target: "pool.example.net.".to_string(),
+            params: vec![],
+        };
+        assert_eq!(alias.to_string(), "0 pool.example.net.");
+    }
+
+    #[test]
+    fn child_dnssec_records_display_like_their_parents() {
+        let cds = RecordData::CDS {
+            key_tag: 2371,
+            algorithm: 13,
+            digest_type: 2,
+            digest: "ABCDEF01".to_string(),
+        };
+        assert_eq!(cds.to_string(), "2371 13 2 ABCDEF01");
+        let cdnskey = RecordData::CDNSKEY {
+            flags: 257,
+            protocol: 3,
+            algorithm: 13,
+            public_key: "mdsswUyr3DPW".to_string(),
+        };
+        assert_eq!(cdnskey.to_string(), "257 3 13 mdsswUyr3DPW");
+        // RFC 8078 delete request.
+        let delete = RecordData::CDNSKEY {
+            flags: 0,
+            protocol: 3,
+            algorithm: 0,
+            public_key: "AA==".to_string(),
+        };
+        assert_eq!(delete.to_string(), "0 3 0 AA==");
+    }
+
+    #[test]
+    fn comparison_key_folds_the_service_target_only() {
+        let https = |target: &str, alpn: &str| RecordData::HTTPS {
+            priority: 1,
+            target: target.to_string(),
+            params: vec![svc("alpn", alpn)],
+        };
+        assert_eq!(
+            https("Svc.Example.NET.", "h2").comparison_key(),
+            https("svc.example.net.", "h2").comparison_key()
+        );
+        // Params are opaque data: compared verbatim.
+        assert_ne!(
+            https(".", "H2").comparison_key(),
+            https(".", "h2").comparison_key()
+        );
+        let cds = |digest: &str| RecordData::CDS {
+            key_tag: 1,
+            algorithm: 13,
+            digest_type: 2,
+            digest: digest.to_string(),
+        };
+        assert_ne!(cds("ABCD").comparison_key(), cds("abcd").comparison_key());
+    }
+
+    #[test]
+    fn https_serializes_with_structured_params() {
+        let record = DnsRecord {
+            name: "example.com".to_string(),
+            record_type: RecordType::HTTPS,
+            ttl: 300,
+            data: RecordData::HTTPS {
+                priority: 1,
+                target: ".".to_string(),
+                params: vec![svc("alpn", "h2")],
+            },
+        };
+        let json = serde_json::to_value(&record).unwrap();
+        assert_eq!(json["record_type"], "HTTPS");
+        assert_eq!(json["data"]["record_type"], "HTTPS");
+        assert_eq!(json["data"]["value"]["priority"], 1);
+        assert_eq!(json["data"]["value"]["target"], ".");
+        assert_eq!(
+            json["data"]["value"]["params"],
+            serde_json::json!([{"key": "alpn", "value": "h2"}])
+        );
+        let back: DnsRecord = serde_json::from_value(json).unwrap();
+        assert_eq!(back, record);
+    }
+
+    #[test]
+    fn new_record_types_parse_by_name() {
+        for (name, expected) in [
+            ("https", RecordType::HTTPS),
+            ("SVCB", RecordType::SVCB),
+            ("cds", RecordType::CDS),
+            ("CDNSKEY", RecordType::CDNSKEY),
+        ] {
+            assert_eq!(name.parse::<RecordType>().unwrap(), expected);
+        }
+        // ANY stays last, after the new types.
+        assert_eq!(RecordType::ALL.last(), Some(&RecordType::ANY));
+    }
+
     /// Drift guard for the three surfaces that render `RecordType::ALL`
     /// (CLI help, REPL completion, MCP tool schema). Adding a variant breaks
     /// `as_str`'s exhaustive match at compile time; this pins the count so the
@@ -490,7 +742,7 @@ mod tests {
     fn all_is_complete() {
         assert_eq!(
             RecordType::ALL.len(),
-            16,
+            20,
             "new RecordType variant — add it to ALL and ALL_NAMES too"
         );
         assert_eq!(RecordType::ALL.len(), RecordType::ALL_NAMES.len());

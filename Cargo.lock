@@ -2469,6 +2469,7 @@ dependencies = [
  "hickory-resolver",
  "idna",
  "insta",
+ "libc",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
@@ -2488,6 +2489,7 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "url",
+ "windows-sys 0.61.2",
  "wiremock",
  "x509-parser",
 ]

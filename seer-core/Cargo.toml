@@ -42,6 +42,12 @@ toml = { workspace = true }
 idna = { workspace = true }
 psl = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }
+
 [features]
 # `cli` carries the presentation/persistence layer only the CLI needs
 # (formatters, colors, history/watchlist/drift, doctor, webhook, logging

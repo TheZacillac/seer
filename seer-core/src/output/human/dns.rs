@@ -8,7 +8,7 @@ impl HumanFormatter {
             output.push(self.warning("No records found"));
             // DNSSEC disclaimer applies whether or not records were returned.
             output.push(String::new());
-            output.push(self.warning("Note: DNS responses are not DNSSEC-validated"));
+            output.push(self.warning(DNSSEC_NOTE));
             return output.join("\n");
         }
 
@@ -41,7 +41,7 @@ impl HumanFormatter {
         // DNSSEC disclosure (M12): Seer's resolver does not validate DNSSEC,
         // and UDP DNS is trivially spoofable. Surface this once per DNS block.
         output.push(String::new());
-        output.push(self.warning("Note: DNS responses are not DNSSEC-validated"));
+        output.push(self.warning(DNSSEC_NOTE));
 
         output.join("\n")
     }

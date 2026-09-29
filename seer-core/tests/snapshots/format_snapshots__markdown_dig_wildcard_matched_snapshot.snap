@@ -1,0 +1,19 @@
+---
+source: seer-core/tests/format_snapshots.rs
+expression: markdown ().format_dig (& fixture_dig_wildcard_matched())
+---
+## DNS A Records: promo.seer.test
+
+- **Status**: `NOERROR`
+- **Flags**: `qr rd ra`
+- **Server**: default
+- **Query time**: 9 ms
+- **Wildcard**: a random sibling (`seer-probe-3f9a1c2e7b.seer.test`) resolves — this answer matches it and is likely wildcard-synthesized
+
+### Answer
+
+| Name | TTL | Type | Data |
+| --- | --- | --- | --- |
+| `promo.seer.test` | 300 | A | `192.0.2.80` |
+
+> Note: DNS responses are not DNSSEC-validated.

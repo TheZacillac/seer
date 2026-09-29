@@ -1,9 +1,10 @@
 //! Test-only mock DNS fixture shared by the crate's hermetic DNS tests
-//! (`resolver.rs`, `follow.rs`, `compare.rs`, `dnssec.rs`, `posture.rs`, …):
-//! a real UDP socket on 127.0.0.1 serving
-//! hickory-proto-encoded canned responses, so the full `resolve()` path
-//! (normalization → custom-resolver construction → hickory transport →
-//! RData conversion) runs without touching the network.
+//! (`resolver.rs`, `transport.rs`, `follow.rs`, `compare.rs`, `dnssec.rs`,
+//! `trace.rs`, `posture.rs`, …): a real UDP socket on 127.0.0.1 (optionally
+//! with a TCP relay on the same port) serving
+//! hickory-proto-encoded canned responses, so the full `resolve()` and
+//! `query()` paths (normalization → nameserver vetting → hickory transport →
+//! RData conversion) run without touching the network.
 //!
 //! Compiled only under `cfg(test)` — production builds never include this
 //! module. The SSRF guards deliberately refuse loopback, so tests reach the
@@ -11,17 +12,23 @@
 //! `with_port` seams on [`DnsResolver`]; the production validation path is
 //! never weakened.
 
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
 
-use hickory_resolver::proto::op::{Message, OpCode, ResponseCode};
-use hickory_resolver::proto::rr::rdata::{self as wire, sshfp, tlsa, CAA};
+use hickory_resolver::proto::dnssec::rdata::{DNSSECRData, CDNSKEY, CDS, DNSKEY};
+use hickory_resolver::proto::dnssec::{Algorithm, DigestType, PublicKeyBuf};
+use hickory_resolver::proto::op::{Edns, Message, OpCode, ResponseCode};
+use hickory_resolver::proto::rr::rdata::svcb::{
+    Alpn, EchConfigList, IpHint, Mandatory, SvcParamKey, SvcParamValue, Unknown, SVCB,
+};
+use hickory_resolver::proto::rr::rdata::{self as wire, sshfp, tlsa, CAA, HTTPS};
 use hickory_resolver::proto::rr::{
     Name, RData as HickoryRData, Record, RecordType as HickoryRecordType,
 };
-use tokio::net::UdpSocket;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
-use super::resolver::DnsResolver;
+use super::resolver::{fqdn, DnsResolver};
 
 /// How the mock server answers every query it receives.
 #[derive(Clone, Copy)]
@@ -38,6 +45,22 @@ pub(crate) enum MockMode {
 
 fn name(s: &str) -> Name {
     Name::from_ascii(s).expect("valid test name")
+}
+
+/// `s` as a fully qualified name, with or without its trailing dot (`"."`
+/// is the root).
+pub(crate) fn fq_name(s: &str) -> Name {
+    name(&fqdn(s))
+}
+
+/// A-record RDATA, e.g. `a_rdata([192, 0, 2, 7])`.
+pub(crate) fn a_rdata(ip: impl Into<Ipv4Addr>) -> HickoryRData {
+    HickoryRData::A(wire::A(ip.into()))
+}
+
+/// CNAME RDATA pointing at `target`.
+pub(crate) fn cname_rdata(target: &str) -> HickoryRData {
+    HickoryRData::CNAME(wire::CNAME(fq_name(target)))
 }
 
 /// Canned zone for [`MockMode::Zone`]. Query names are matched with the
@@ -122,6 +145,103 @@ fn zone_answers(qname: &str, qtype: HickoryRecordType) -> Vec<HickoryRData> {
             "1.1.1.1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.7.4.0.0.7.4.6.0.6.2.ip6.arpa",
             HickoryRecordType::PTR,
         ) => vec![HickoryRData::PTR(wire::PTR(name("one.one.one.one.")))],
+        // ServiceMode with every registered SvcParam kind plus a private-use
+        // key, in the strictly increasing key order the wire requires.
+        ("seer.test", HickoryRecordType::HTTPS) => {
+            vec![HickoryRData::HTTPS(HTTPS(SVCB::new(
+                1,
+                Name::root(),
+                vec![
+                    (
+                        SvcParamKey::Alpn,
+                        SvcParamValue::Alpn(Alpn(vec!["h3".to_string(), "h2".to_string()])),
+                    ),
+                    (SvcParamKey::Port, SvcParamValue::Port(8443)),
+                    (
+                        SvcParamKey::Ipv4Hint,
+                        SvcParamValue::Ipv4Hint(IpHint(vec![
+                            wire::A::new(192, 0, 2, 1),
+                            wire::A::new(192, 0, 2, 2),
+                        ])),
+                    ),
+                    (
+                        SvcParamKey::EchConfigList,
+                        SvcParamValue::EchConfigList(EchConfigList(vec![0x00, 0x01, 0xFE])),
+                    ),
+                    (
+                        SvcParamKey::Ipv6Hint,
+                        SvcParamValue::Ipv6Hint(IpHint(vec![wire::AAAA::new(
+                            0x2001, 0xdb8, 0, 0, 0, 0, 0, 1,
+                        )])),
+                    ),
+                    (
+                        SvcParamKey::Key(65333),
+                        SvcParamValue::Unknown(Unknown(b"ex 1".to_vec())),
+                    ),
+                ],
+            )))]
+        }
+        // AliasMode: priority 0, the alias target, no params.
+        ("alias.seer.test", HickoryRecordType::HTTPS) => vec![HickoryRData::HTTPS(HTTPS(
+            SVCB::new(0, name("pool.seer.test."), vec![]),
+        ))],
+        ("_8443._foo.seer.test", HickoryRecordType::SVCB) => {
+            vec![HickoryRData::SVCB(SVCB::new(
+                2,
+                name("svc.seer.test."),
+                vec![
+                    (
+                        SvcParamKey::Mandatory,
+                        SvcParamValue::Mandatory(Mandatory(vec![
+                            SvcParamKey::Alpn,
+                            SvcParamKey::Port,
+                        ])),
+                    ),
+                    (
+                        SvcParamKey::Alpn,
+                        SvcParamValue::Alpn(Alpn(vec!["foo".to_string()])),
+                    ),
+                    (SvcParamKey::NoDefaultAlpn, SvcParamValue::NoDefaultAlpn),
+                    (SvcParamKey::Port, SvcParamValue::Port(8443)),
+                ],
+            ))]
+        }
+        ("seer.test", HickoryRecordType::DNSKEY) => {
+            vec![HickoryRData::DNSSEC(DNSSECRData::DNSKEY(DNSKEY::new(
+                true,
+                true,
+                false,
+                PublicKeyBuf::new(vec![7u8; 32], Algorithm::ED25519),
+            )))]
+        }
+        // An update request plus the RFC 8078 delete request (`0 0 0 00`).
+        ("seer.test", HickoryRecordType::CDS) => vec![
+            HickoryRData::DNSSEC(DNSSECRData::CDS(CDS::new(
+                2371,
+                Some(Algorithm::ED25519),
+                DigestType::SHA256,
+                vec![0xAB, 0xCD, 0xEF],
+            ))),
+            HickoryRData::DNSSEC(DNSSECRData::CDS(CDS::new(
+                0,
+                None,
+                DigestType::from(0),
+                vec![0x00],
+            ))),
+        ],
+        // An update request plus the RFC 8078 delete request (`0 3 0 AA==`).
+        ("seer.test", HickoryRecordType::CDNSKEY) => vec![
+            HickoryRData::DNSSEC(DNSSECRData::CDNSKEY(CDNSKEY::with_flags(
+                257,
+                Some(Algorithm::ED25519),
+                vec![7u8; 32],
+            ))),
+            HickoryRData::DNSSEC(DNSSECRData::CDNSKEY(CDNSKEY::with_flags(
+                0,
+                None,
+                vec![0x00],
+            ))),
+        ],
         _ => vec![],
     }
 }
@@ -181,15 +301,29 @@ pub(crate) fn soa_rdata(zone: &str) -> HickoryRData {
     ))
 }
 
+/// A record owned by `owner` (fully qualified, with or without its trailing
+/// dot), for [`MockReply::Records`] answers that must not be owned by the
+/// query name — a CNAME chain's hops, the records at its target.
+pub(crate) fn record(owner: &str, ttl: u32, rdata: HickoryRData) -> Record {
+    Record::from_rdata(fq_name(owner), ttl, rdata)
+}
+
+/// The SOA record of `zone`, owned by the zone apex (negative answers'
+/// AUTHORITY section).
+fn zone_soa(zone: &str) -> Record {
+    Record::from_rdata(fq_name(zone), 300, soa_rdata(zone))
+}
+
 /// A scripted reply for [`spawn_mock_dns_fn`].
 pub(crate) enum MockReply {
     /// NOERROR with these answers, each owned by the query name.
     Answer(Vec<HickoryRData>),
+    /// NOERROR with these complete records in ANSWER, in this order, under
+    /// their own owner names (see [`record`]) — e.g. a CNAME chain followed
+    /// by the records at its target, as a recursive resolver relays it.
+    Records(Vec<Record>),
     /// Like [`MockReply::Answer`], with the AA (authoritative) bit set.
     AuthoritativeAnswer(Vec<HickoryRData>),
-    /// NOERROR, empty ANSWER, these (NS) records for the query name in
-    /// AUTHORITY — a classic parent-side referral.
-    Referral(Vec<HickoryRData>),
     /// NOERROR with an empty answer section (NODATA).
     NoData,
     /// NODATA whose AUTHORITY section carries the SOA of the named zone — the
@@ -197,25 +331,131 @@ pub(crate) enum MockReply {
     NoDataWithSoa(&'static str),
     /// NXDOMAIN.
     NxDomain,
+    /// NXDOMAIN whose AUTHORITY section carries the SOA of the named zone —
+    /// the negative answer a recursive resolver relays (RFC 2308).
+    NxDomainWithSoa(&'static str),
+    /// Like [`MockReply::NxDomainWithSoa`], with the AA bit set: an
+    /// authoritative server's own "no such name".
+    AuthoritativeNxDomain(&'static str),
+    /// An empty response with any other response code (NOTIMP, FORMERR,
+    /// …); SERVFAIL and REFUSED have their own variants.
+    Rcode(ResponseCode),
     /// SERVFAIL — e.g. a validating upstream rejecting a broken DNSSEC chain.
     ServFail,
     /// REFUSED.
     Refused,
     /// Send nothing, forcing the client's timeout path.
     NoReply,
+    /// A referral to a child zone, as a parent-side server sends it:
+    /// NOERROR, AA and RA clear, empty ANSWER, an NS record for `zone` (`"."` for
+    /// the root) per listed server in AUTHORITY, and in ADDITIONAL an A/AAAA
+    /// glue record for each address listed with a server (none: a glueless
+    /// server).
+    Delegation {
+        zone: String,
+        servers: Vec<(String, Vec<IpAddr>)>,
+    },
+    /// NOERROR with the TC (truncated) bit set and no records: the reply did
+    /// not fit, so the client must retry over TCP.
+    Truncated,
+    /// A negative answer behind a CNAME chain, as a recursive resolver
+    /// relays it (RFC 6604 §2): response code `code` (NXDOMAIN when the
+    /// chain's last target does not exist, NOERROR when it has no records of
+    /// the type), the `chain` records in ANSWER under their own owners (see
+    /// [`record`]), and the SOA of `soa` — the target's zone — in AUTHORITY.
+    Negative {
+        code: ResponseCode,
+        chain: Vec<Record>,
+        soa: &'static str,
+    },
 }
 
 /// Binds a UDP socket on an ephemeral loopback port and answers every query
 /// with `handler(qname, qtype)`, where `qname` is the lowercased ASCII query
 /// name without the trailing root dot. Lets a test script a whole multi-name
 /// scenario (tree walks, redirects, per-name failures) that the fixed
-/// [`MockMode::Zone`] table cannot express. The one server loop behind every
-/// spawner here. Returns the bound port.
-pub(crate) async fn spawn_mock_dns_fn<F>(mut handler: F) -> u16
+/// [`MockMode::Zone`] table cannot express. Every spawner here ends in its
+/// server loop ([`serve_udp`]). Returns the bound port.
+pub(crate) async fn spawn_mock_dns_fn<F>(handler: F) -> u16
 where
     F: FnMut(&str, HickoryRecordType) -> MockReply + Send + 'static,
 {
     let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind mock DNS");
+    serve_udp(socket, handler)
+}
+
+/// Like [`spawn_mock_dns_fn`], but the same port also takes DNS over TCP:
+/// each TCP query is relayed to the UDP server loop and its reply sent back,
+/// so one `handler` scripts both transports (in arrival order — e.g. a
+/// [`MockReply::Truncated`] first reply, then the full answer the client
+/// retries for over TCP). Returns the shared port.
+pub(crate) async fn spawn_mock_dns_fn_with_tcp<F>(handler: F) -> u16
+where
+    F: FnMut(&str, HickoryRecordType) -> MockReply + Send + 'static,
+{
+    // TCP and UDP port spaces are separate, so the UDP socket's ephemeral
+    // port is almost always free for TCP too; retry the pair if it is not.
+    for _ in 0..16 {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind mock DNS");
+        let port = socket.local_addr().expect("mock DNS local addr").port();
+        if let Ok(listener) = TcpListener::bind(("127.0.0.1", port)).await {
+            let port = serve_udp(socket, handler);
+            tokio::spawn(relay_tcp(listener, port));
+            return port;
+        }
+    }
+    panic!("no loopback port free for both UDP and TCP");
+}
+
+/// Accepts DNS-over-TCP connections and relays every length-prefixed query
+/// to the UDP mock on `udp_port`, writing its reply back.
+async fn relay_tcp(listener: TcpListener, udp_port: u16) {
+    while let Ok((stream, _)) = listener.accept().await {
+        tokio::spawn(relay_connection(stream, udp_port));
+    }
+}
+
+/// Relays one TCP connection's queries until the client closes it (or a
+/// query gets no UDP reply — the client's timeout then applies).
+async fn relay_connection(mut stream: TcpStream, udp_port: u16) {
+    let Ok(socket) = UdpSocket::bind("127.0.0.1:0").await else {
+        return;
+    };
+    let mut buf = [0u8; 4096];
+    loop {
+        let Ok(len) = stream.read_u16().await else {
+            return;
+        };
+        let mut query = vec![0u8; usize::from(len)];
+        if stream.read_exact(&mut query).await.is_err()
+            || socket
+                .send_to(&query, ("127.0.0.1", udp_port))
+                .await
+                .is_err()
+        {
+            return;
+        }
+        let Ok(reply_len) = socket.recv(&mut buf).await else {
+            return;
+        };
+        let Ok(prefix) = u16::try_from(reply_len) else {
+            return;
+        };
+        if stream.write_u16(prefix).await.is_err()
+            || stream.write_all(&buf[..reply_len]).await.is_err()
+        {
+            return;
+        }
+    }
+}
+
+/// The UDP server loop behind every spawner: answers each query on `socket`
+/// with `handler(qname, qtype)` until the test runtime shuts down. Returns
+/// the bound port.
+fn serve_udp<F>(socket: UdpSocket, mut handler: F) -> u16
+where
+    F: FnMut(&str, HickoryRecordType) -> MockReply + Send + 'static,
+{
     let port = socket.local_addr().expect("mock DNS local addr").port();
     tokio::spawn(async move {
         let mut buf = [0u8; 4096];
@@ -234,23 +474,36 @@ where
                     MockReply::Answer(answers) => {
                         response.add_answers(answers.into_iter().map(owned));
                     }
+                    MockReply::Records(records) => {
+                        response.add_answers(records);
+                    }
                     MockReply::AuthoritativeAnswer(answers) => {
                         response.metadata.authoritative = true;
                         response.add_answers(answers.into_iter().map(owned));
                     }
-                    MockReply::Referral(records) => {
-                        response.add_authorities(records.into_iter().map(owned));
-                    }
                     MockReply::NoData => {}
                     MockReply::NoDataWithSoa(zone) => {
-                        response.add_authority(Record::from_rdata(
-                            name(&format!("{zone}.")),
-                            300,
-                            soa_rdata(zone),
-                        ));
+                        response.add_authority(zone_soa(zone));
                     }
                     MockReply::NxDomain => {
                         response.metadata.response_code = ResponseCode::NXDomain;
+                    }
+                    MockReply::NxDomainWithSoa(zone) => {
+                        response.metadata.response_code = ResponseCode::NXDomain;
+                        response.add_authority(zone_soa(zone));
+                    }
+                    MockReply::AuthoritativeNxDomain(zone) => {
+                        response.metadata.authoritative = true;
+                        response.metadata.response_code = ResponseCode::NXDomain;
+                        response.add_authority(zone_soa(zone));
+                    }
+                    MockReply::Rcode(code) => {
+                        response.metadata.response_code = code;
+                        // A code above 15 is extended: its high bits travel
+                        // in the OPT record (RFC 6891 §6.1.3).
+                        if code.high() > 0 {
+                            response.edns = Some(Edns::new());
+                        }
                     }
                     MockReply::ServFail => {
                         response.metadata.response_code = ResponseCode::ServFail;
@@ -259,6 +512,35 @@ where
                         response.metadata.response_code = ResponseCode::Refused;
                     }
                     MockReply::NoReply => continue,
+                    MockReply::Delegation { zone, servers } => {
+                        // A parent-side server answers from its own zone
+                        // data and does not recurse.
+                        response.metadata.recursion_available = false;
+                        let zone = fq_name(&zone);
+                        for (server, addrs) in servers {
+                            let server = fq_name(&server);
+                            response.add_authority(Record::from_rdata(
+                                zone.clone(),
+                                300,
+                                HickoryRData::NS(wire::NS(server.clone())),
+                            ));
+                            response.add_additionals(addrs.into_iter().map(|ip| {
+                                let glue = match ip {
+                                    IpAddr::V4(v4) => HickoryRData::A(wire::A(v4)),
+                                    IpAddr::V6(v6) => HickoryRData::AAAA(wire::AAAA(v6)),
+                                };
+                                Record::from_rdata(server.clone(), 300, glue)
+                            }));
+                        }
+                    }
+                    MockReply::Truncated => {
+                        response.metadata.truncation = true;
+                    }
+                    MockReply::Negative { code, chain, soa } => {
+                        response.metadata.response_code = code;
+                        response.add_answers(chain);
+                        response.add_authority(zone_soa(soa));
+                    }
                 }
             }
             let Ok(bytes) = response.to_vec() else {

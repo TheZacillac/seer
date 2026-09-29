@@ -19,7 +19,14 @@ MAX_CONCURRENCY = 50
 # Limits for the expensive fan-out operations, applied per REST route and per
 # MCP tool alike so neither surface can outrun the other.
 BULK_LIMIT = "10/minute"
-# Bulk SSL/status/propagation, confusables and takeover fan out hardest.
+# Bulk SSL/status/propagation, confusables and takeover fan out hardest. A DNS
+# trace shares their limit for its wall-clock cost rather than its query
+# count: it walks the delegation chain from the root servers one level at a
+# time, querying each zone's nameservers directly from this host, and the
+# caller picks the name, so every level below a zone they own is theirs to
+# slow down. seer-core holds the whole walk to 6 DNS timeouts (30s at the
+# default 5s), but that is still a bounded dispatch thread (`_run.py`) held
+# for up to 30s per request.
 HEAVY_LIMIT = "5/minute"
 
 # DNS record-type token accepted at the edge; the core parses the name itself.

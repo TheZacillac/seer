@@ -1,0 +1,15 @@
+---
+source: seer-core/tests/format_snapshots.rs
+assertion_line: 1374
+expression: markdown ().format_dig (& fixture_dig_servfail())
+---
+## DNS A Records: broken.seer.test
+
+- **Status**: `SERVFAIL`
+- **Flags**: `qr rd ra`
+- **Server**: `tls://dns.quad9.net`
+- **Query time**: 48 ms
+
+*No answer: the server failed to resolve the name (SERVFAIL)*
+
+> Note: DNS responses are not DNSSEC-validated.

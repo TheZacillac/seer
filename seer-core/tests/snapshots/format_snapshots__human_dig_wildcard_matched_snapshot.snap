@@ -1,0 +1,15 @@
+---
+source: seer-core/tests/format_snapshots.rs
+expression: human ().format_dig (& fixture_dig_wildcard_matched())
+---
+
+[1;95mDNS A Records: promo.seer.test[0m
+[37m──────────────────────────────[0m
+  [1;96mstatus[0m: [1;92mNOERROR[0m  [1;96mflags[0m: [97mqr rd ra[0m  [1;96mserver[0m: [97mdefault[0m  [1;96mtime[0m: [97m9 ms[0m
+
+  [1;96mAnswer[0m:
+    [97mpromo.seer.test[0m  [1;96m300[0m  [1;96mA[0m  [1;92m192.0.2.80[0m
+
+  [1;96mWildcard[0m: [1;93ma random sibling (seer-probe-3f9a1c2e7b.seer.test) resolves — this answer matches it and is likely wildcard-synthesized[0m
+
+[1;93mNote: DNS responses are not DNSSEC-validated[0m

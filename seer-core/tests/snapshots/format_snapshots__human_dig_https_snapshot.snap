@@ -1,0 +1,15 @@
+---
+source: seer-core/tests/format_snapshots.rs
+expression: human ().format_dig (& fixture_dig_https())
+---
+
+[1;95mDNS HTTPS Records: www.seer.test[0m
+[37m────────────────────────────────[0m
+  [1;96mstatus[0m: [1;92mNOERROR[0m  [1;96mflags[0m: [97mqr rd ra[0m  [1;96mserver[0m: [97mdefault[0m  [1;96mtime[0m: [97m12 ms[0m
+
+  [1;96mAnswer[0m:
+    [97mwww.seer.test[0m  [1;96m300[0m  [1;96mHTTPS[0m  [1;92m1 . alpn="h3,h2" port=8443 ipv4hint=192.0.2.1,192.0.2.2 ech=AAH+ ipv6hint=2001:db8::1[0m
+
+  [1;96mWildcard[0m: [97ma random sibling (seer-probe-3f9a1c2e7b.seer.test) resolves too, but with different data[0m
+
+[1;93mNote: DNS responses are not DNSSEC-validated[0m

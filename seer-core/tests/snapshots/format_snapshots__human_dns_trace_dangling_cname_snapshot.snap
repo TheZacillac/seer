@@ -1,0 +1,25 @@
+---
+source: seer-core/tests/format_snapshots.rs
+expression: human ().format_dns_trace (& fixture_dns_trace_dangling_cname())
+---
+
+[1;95mDNS Trace: www.seer.test A[0m
+[37m──────────────────────────[0m
+
+  [1;96mHop 1[0m: [97m.[0m (root)
+    [1;96mServer[0m: [97ma.root-servers.net. (198.41.0.4) in 21 ms[0m
+    [1;96mStatus[0m: [1;92mNOERROR[0m
+    [1;96mReferral[0m: [97mseer.test.[0m
+      - [97mns1.seer.test.[0m
+
+  [1;96mHop 2[0m: [97mseer.test.[0m
+    [1;96mServer[0m: [97mns1.seer.test. (192.0.2.53) in 9 ms[0m
+    [1;96mStatus[0m: [1;93mNXDOMAIN[0m[97m (authoritative)[0m
+    [1;96mAnswer[0m:
+      [97mwww.seer.test[0m  [1;96m300[0m  [1;96mCNAME[0m  [1;92mgone.seer.test.[0m
+
+  [1;96mResult[0m: [1;93mNXDOMAIN[0m
+    [97mwww.seer.test[0m  [1;96m300[0m  [1;96mCNAME[0m  [1;92mgone.seer.test.[0m
+    [1;93mThe CNAME target gone.seer.test. does not exist (NXDOMAIN)[0m
+
+[1;93mNote: DNS responses are not DNSSEC-validated[0m

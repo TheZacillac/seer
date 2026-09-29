@@ -8,6 +8,13 @@
 //! CLI, REPL, TUI raw view and clipboard copy all render identically. Human
 //! and Markdown output are pinned by `insta` snapshots in
 //! `seer-core/tests/format_snapshots.rs`.
+//!
+//! [`dig_short`] and [`dig_trace_short`] are the `dig +short` rendering of a
+//! query result and a trace: bare values, one per line, sanitized for a
+//! terminal — a plain-text mode outside the four formats. [`dig`] also holds
+//! the wording of a query's outcome (NXDOMAIN vs NODATA, the wildcard note),
+//! shared by the formatters and the TUI's DNS lens, and [`sanitize_line`] is
+//! the terminal-safety guard the human formatter applies to remote strings.
 
 // The report-method list and the impl generators below must precede the
 // `mod` declarations: `macro_rules!` is textually scoped, and the human and
@@ -25,6 +32,8 @@ macro_rules! with_report_methods {
             format_whois(response: crate::whois::WhoisResponse);
             format_rdap(response: crate::rdap::RdapResponse);
             format_dns(records: [crate::dns::DnsRecord]);
+            format_dig(result: crate::dns::DnsQueryResult);
+            format_dns_trace(trace: crate::dns::DnsTrace);
             format_propagation(result: crate::dns::PropagationResult);
             format_lookup(result: crate::lookup::LookupResult);
             format_status(response: crate::status::StatusResponse);
@@ -92,12 +101,14 @@ macro_rules! impl_forwarding {
 }
 
 mod contact;
+pub mod dig;
 mod grouping;
 mod human;
 mod json;
 mod markdown;
 
-pub use human::HumanFormatter;
+pub use dig::{dig_short, dig_trace_short};
+pub use human::{sanitize_line, HumanFormatter};
 pub use json::JsonFormatter;
 pub use markdown::MarkdownFormatter;
 
@@ -110,6 +121,11 @@ use serde::{Deserialize, Serialize};
 fn days_until(when: DateTime<Utc>) -> i64 {
     crate::dates::days_until(when, Utc::now())
 }
+
+/// The DNSSEC disclosure (M12) that closes every block of DNS answers:
+/// seer's resolver does not validate DNSSEC, and UDP DNS is trivially
+/// spoofable. The human formatters print it as is, Markdown as a quote.
+const DNSSEC_NOTE: &str = "Note: DNS responses are not DNSSEC-validated";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

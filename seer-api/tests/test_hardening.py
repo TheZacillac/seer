@@ -426,7 +426,9 @@ def _record_validator(monkeypatch):
 
 @needs_ns_parser
 @pytest.mark.parametrize("spec,target", NAMESERVER_SPECS)
-def test_dns_route_accepts_every_nameserver_spec_form(monkeypatch, client, spec, target):
+def test_dns_route_accepts_every_nameserver_spec_form(
+    monkeypatch, client, dig_result, spec, target
+):
     """Regression: the API guard treated the whole spec as a hostname, so
     `tls://`, `https://`, `host:port` and bracketed-IPv6 nameservers — all
     supported by the core — were refused with 400 before reaching it."""
@@ -437,7 +439,7 @@ def test_dns_route_accepts_every_nameserver_spec_form(monkeypatch, client, spec,
 
     def _dig(domain, record_type, nameserver):
         seen["nameserver"] = nameserver
-        return []
+        return dig_result
 
     monkeypatch.setattr(seer_mod, "dig", _dig, raising=False)
     resp = client.get("/dns/example.com/A", params={"nameserver": spec})

@@ -3,6 +3,7 @@
 
 use seer_core::RecordType;
 
+use crate::dig_args::{self, DigFlags};
 use crate::tui::lenses;
 use crate::tui::theme::Theme;
 
@@ -36,10 +37,15 @@ pub enum CmdOutcome {
         a: String,
         b: String,
     },
-    /// `dig <domain> [type]` — DNS records of one type (default `A`).
+    /// `dig [@server] <domain> [type] [+trace]` — the CLI/REPL dig syntax,
+    /// for the one record type (default `A`) the DNS lens shows.
     Dig {
         domain: String,
         record_type: RecordType,
+        /// `@server`; `None` keeps the lens's current nameserver.
+        server: Option<String>,
+        /// `+trace`: open the Trace tab rather than Records.
+        trace: bool,
     },
     /// `watch add <domain>` / `watch remove <domain>` — edit the watchlist.
     WatchMutate {
@@ -110,24 +116,13 @@ pub fn parse(raw: &str) -> CmdOutcome {
         };
     }
     if head == "dig" || head == "dns" {
-        return match parts.as_slice() {
-            [_] => CmdOutcome::Lens {
+        if parts.len() == 1 {
+            return CmdOutcome::Lens {
                 lens: head,
                 target: None,
-            },
-            [_, domain] => CmdOutcome::Dig {
-                domain: domain.to_string(),
-                record_type: RecordType::A,
-            },
-            [_, domain, rt] => match rt.parse::<RecordType>() {
-                Ok(record_type) => CmdOutcome::Dig {
-                    domain: domain.to_string(),
-                    record_type,
-                },
-                Err(_) => CmdOutcome::Invalid(format!("unknown record type: {rt}")),
-            },
-            _ => CmdOutcome::Invalid("usage: dig <domain> [type]".to_string()),
-        };
+            };
+        }
+        return dig(&parts[1..]);
     }
 
     // Global lenses (no target domain): their arguments are subcommands, and
@@ -180,6 +175,35 @@ pub fn parse(raw: &str) -> CmdOutcome {
     }
 
     CmdOutcome::Unknown(line.to_string())
+}
+
+/// `dig …` through the grammar the CLI and REPL share ([`dig_args`]),
+/// so the same line means the same query everywhere, then narrowed to what
+/// the DNS lens shows: one record type, as a full answer.
+fn dig(args: &[&str]) -> CmdOutcome {
+    let args = match dig_args::parse(args, DigFlags::default()) {
+        Ok(args) => args,
+        Err(message) => return CmdOutcome::Invalid(message),
+    };
+    if args.short {
+        return CmdOutcome::Invalid(
+            "+short prints bare values on the command line; the lens shows the whole answer"
+                .to_string(),
+        );
+    }
+    let &[record_type] = args.types.as_slice() else {
+        let types: Vec<&str> = args.types.iter().map(|t| t.as_str()).collect();
+        return CmdOutcome::Invalid(format!(
+            "the DNS lens shows one record type at a time, got {}",
+            types.join(" ")
+        ));
+    };
+    CmdOutcome::Dig {
+        domain: args.name,
+        record_type,
+        server: args.server,
+        trace: args.trace,
+    }
 }
 
 #[cfg(test)]
@@ -244,6 +268,15 @@ mod tests {
         );
     }
 
+    fn dig_of(domain: &str, record_type: RecordType) -> CmdOutcome {
+        CmdOutcome::Dig {
+            domain: domain.into(),
+            record_type,
+            server: None,
+            trace: false,
+        }
+    }
+
     #[test]
     fn dig_parses_an_optional_record_type() {
         assert_eq!(
@@ -255,18 +288,12 @@ mod tests {
         );
         assert_eq!(
             parse("dig example.com"),
-            CmdOutcome::Dig {
-                domain: "example.com".into(),
-                record_type: RecordType::A
-            }
+            dig_of("example.com", RecordType::A)
         );
         // The type was previously dropped silently (always A).
         assert_eq!(
             parse("dig example.com mx"),
-            CmdOutcome::Dig {
-                domain: "example.com".into(),
-                record_type: RecordType::MX
-            }
+            dig_of("example.com", RecordType::MX)
         );
         assert!(
             matches!(parse("dig example.com BOGUS"), CmdOutcome::Invalid(m) if m.contains("BOGUS"))
@@ -275,6 +302,58 @@ mod tests {
             parse("dig example.com MX extra"),
             CmdOutcome::Invalid(_)
         ));
+    }
+
+    /// The CLI/REPL grammar: any token order, `@server`, `+trace`, `-x`,
+    /// and every type in `RecordType::ALL` (HTTPS, SVCB, CDS, CDNSKEY …).
+    #[test]
+    fn dig_shares_the_cli_grammar() {
+        assert_eq!(
+            parse("dig MX example.com"),
+            dig_of("example.com", RecordType::MX)
+        );
+        assert_eq!(
+            parse("dns @1.1.1.1 example.com https"),
+            CmdOutcome::Dig {
+                domain: "example.com".into(),
+                record_type: RecordType::HTTPS,
+                server: Some("1.1.1.1".into()),
+                trace: false,
+            }
+        );
+        assert_eq!(
+            parse("dig example.com AAAA +trace"),
+            CmdOutcome::Dig {
+                domain: "example.com".into(),
+                record_type: RecordType::AAAA,
+                server: None,
+                trace: true,
+            }
+        );
+        assert_eq!(
+            parse("dig -x 192.0.2.7"),
+            dig_of("192.0.2.7", RecordType::PTR)
+        );
+        for name in RecordType::ALL_NAMES {
+            let CmdOutcome::Dig { record_type, .. } = parse(&format!("dig example.com {name}"))
+            else {
+                panic!("{name} must parse as a record type");
+            };
+            assert_eq!(record_type.as_str(), *name);
+        }
+    }
+
+    #[test]
+    fn dig_rejects_what_the_lens_cannot_show() {
+        let invalid = |line: &str| match parse(line) {
+            CmdOutcome::Invalid(message) => message,
+            other => panic!("{line}: expected Invalid, got {other:?}"),
+        };
+        assert!(invalid("dig example.com A MX").contains("one record type at a time, got A MX"));
+        assert!(invalid("dig example.com +short").contains("+short"));
+        // The shared parser's own errors come through verbatim.
+        assert!(invalid("dig example.com +tcp").contains("unknown dig option '+tcp'"));
+        assert!(invalid("dig @8.8.8.8 example.com +trace").contains("root servers"));
     }
 
     #[test]

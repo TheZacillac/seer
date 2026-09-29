@@ -1,0 +1,39 @@
+---
+source: seer-core/tests/format_snapshots.rs
+expression: markdown ().format_dns_trace (& fixture_dns_trace_error())
+---
+## DNS Trace: www.broken.test A
+
+### Hop 1: `.` (root)
+
+- **Server**: `a.root-servers.net.` (`198.41.0.4`)
+- **Status**: `NOERROR`
+- **Authoritative**: no
+- **Query time**: 21 ms
+- **Referral**: `test.`
+- **Referral nameservers**: `ns1.nic.test.`
+
+### Hop 2: `test.`
+
+- **Server**: `ns1.nic.test.` (`192.0.2.10`)
+- **Status**: `NOERROR`
+- **Authoritative**: no
+- **Query time**: 21 ms
+- **Referral**: `broken.test.`
+- **Referral nameservers**: `ns1.broken.test.`, `ns2.broken.test.`
+
+### Hop 3: `broken.test.`
+
+- **Server**: `ns2.broken.test.` (`192.0.2.54`)
+- **Status**: `SERVFAIL`
+- **Authoritative**: no
+- **Query time**: 7 ms
+- **Failed servers**:
+  - ns1.broken.test. (192.0.2.53): timed out
+
+### Result
+
+- **Status**: `SERVFAIL`
+- **Error**: no nameserver for broken.test. gave a usable response: ns1.broken.test. (192.0.2.53): timed out; ns2.broken.test. (192.0.2.54): SERVFAIL
+
+> Note: DNS responses are not DNSSEC-validated.

@@ -11,6 +11,193 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+`seer dig` now works like dig: dig-style arguments with several record types
+per call, the response status and flags, CNAME chains under their real owner
+names, NXDOMAIN told apart from NODATA, wildcard detection, the HTTPS, SVCB,
+CDS and CDNSKEY record types, `+short`, and `+trace` from the root servers.
+The dig result shape changes on the CLI, Python, REST and MCP surfaces — see
+**Changed**.
+
+### Changed
+- **Breaking: `dig` returns the whole DNS response instead of a list of
+  records.** `seer dig` JSON/YAML output (`--format`, `-q`), Python
+  `seer.dig()`, `GET /dns/{domain}/{record_type}` and the `seer_dig` MCP tool
+  now return one result object: `name`, `record_type`, `server`,
+  `answered_locally`, `status`, `flags`, `answers`, `authority`, `wildcard`
+  and `query_time_ms`. The records are in `answers`, which starts with any
+  CNAME chain and lists each record under its real owner name: an A record
+  reached through a CNAME is owned by the CNAME's target, no longer by the
+  name that was asked for. Every name in the result — owners and the names in
+  record data such as a CNAME target alike — is spelled in A-labels
+  (`xn--…`), like `name`, so a chain can be followed name for name; the list
+  output decoded record-data names to Unicode. SERVFAIL and REFUSED are now
+  results with that `status` instead of errors, so `seer dig` exits 0 for
+  them, Python returns the result instead of raising, and the REST route
+  answers 200.
+  With several record types, `seer dig` returns an array of these objects.
+  `seer reverse`, bulk `dig` (the CSV, `seer.bulk_dig`, `/dns/bulk` and
+  `seer_bulk_dig`) and the other DNS commands keep their output shape;
+  where they accept `ANY`, it now returns more record types (see the next
+  entry).
+
+  Before:
+  ```json
+  [{"name": "www.example.com", "record_type": "A", "ttl": 300,
+    "data": {"record_type": "A", "value": {"address": "192.0.2.7"}}}]
+  ```
+
+  After:
+  ```json
+  {"name": "www.example.com", "record_type": "A", "server": null,
+   "answered_locally": false, "status": "NOERROR", "flags": ["qr", "rd", "ra"],
+   "answers": [
+     {"name": "www.example.com", "record_type": "CNAME", "ttl": 3600,
+      "data": {"record_type": "CNAME", "value": {"target": "edge.example.net."}}},
+     {"name": "edge.example.net", "record_type": "A", "ttl": 300,
+      "data": {"record_type": "A", "value": {"address": "192.0.2.7"}}}],
+   "authority": [],
+   "wildcard": {"probe_name": "seer-probe-3f9a1c2e7b.example.com",
+                "present": false, "matches_answer": false},
+   "query_time_ms": 12}
+  ```
+- **Breaking: `ANY` covers more record types.** Wherever `ANY` is accepted,
+  it now also queries CNAME, HTTPS, DS and DNSKEY (11 types, queried
+  concurrently), and a record that more than one of those queries returns,
+  such as a CNAME, is listed once. So an existing `ANY` query can return
+  records of those four types, not only in `seer dig`: bulk `dig` (the CSV's
+  `records` column, `seer.bulk_dig`, `/dns/bulk` and `seer_bulk_dig`),
+  propagation (`seer prop`, bulk `prop`, `seer.propagation`,
+  `seer.bulk_propagation`, `/propagation` and the MCP tools), `seer follow`
+  and `seer.dns_follow`, and seer-core's `DnsResolver::resolve(…,
+  RecordType::ANY, …)`. `seer compare` (with `seer.dns_compare`,
+  `/dns/compare` and `seer_dns_compare`) compares those record sets too, so
+  two servers that agreed on the old seven types can now differ, making
+  `seer compare … ANY` exit 1 where it exited 0. In `seer dig`, an `ANY`
+  answer with records has no authority section: the SOAs the types without
+  records came back with (the parent zone's among them, for DS) describe
+  none of the answer.
+- **`--quiet --fields` on a list result** (such as `seer reverse`, or a `seer
+  dig` over several types) prints each element's values together, element
+  by element, instead of each field across all elements in turn. A path that
+  starts with an index (`1.status`) still selects elements itself.
+- **seer-core:** `RecordType` and `RecordData` have new `HTTPS`, `SVCB`,
+  `CDS` and `CDNSKEY` variants, so an exhaustive `match` on either needs new
+  arms.
+
+### Added
+- **dig-style arguments** for `seer dig` and the REPL `dig`: arguments in any
+  order, `@server` anywhere (the same as `-s`), several record types in one
+  call (`seer dig example.com A AAAA MX`, queried concurrently and printed in
+  the order given; `*` means ANY), `-x <ip>` for a reverse (PTR) lookup, and
+  `+short`/`+trace` as well as `--short`/`--trace`. An unknown `+option`, a
+  second name or nameserver, or a mistyped record type is reported as an
+  error (exit 1). Existing command lines such as `seer dig example.com MX -s
+  8.8.8.8` work as before. If some of several types fail, the others are
+  still printed, each failure is reported on stderr, and the command exits 1.
+- **The whole answer in `seer dig`:** the response status (NOERROR,
+  NXDOMAIN, SERVFAIL, REFUSED, …), the header flags, the server and the
+  query time, then the CNAME chain before the records, each record under its
+  real owner name. Like dig, `seer dig` sends one query per record type
+  straight to the nameserver (or the default upstream) and reports the
+  response exactly as the server sent it — the header flags on every
+  response, negative and error answers included, and the status with any
+  EDNS extended response code (BADVERS, …). Its servers are asked in order,
+  IPv4 first, over UDP and again over TCP when the reply is truncated (a
+  plain `@server` included); one that does not respond passes the query to
+  the next, all within two DNS timeouts. `dig` is not a check command:
+  every answer the server gave exits 0.
+- **NXDOMAIN vs NODATA:** `seer dig` says "Name does not exist (NXDOMAIN)" or
+  "No AAAA records (NODATA — the name exists)" instead of showing an empty
+  result, with the zone's SOA from the authority section when the server
+  sends it. Behind a CNAME chain, the chain is shown and the verdict names
+  its last target: "The CNAME target gone.example.net. does not exist
+  (NXDOMAIN)" for a dangling CNAME, "The CNAME target … has no AAAA records
+  (NODATA)", or, from a server that does not recurse, that it returned the
+  CNAME without following it. A referral from an `@server` that serves only
+  a parent zone (no answer, the `aa` flag clear, the child zone's NS records
+  in the authority section) is neither: it reads "No answer: referral to
+  <zone>", with those NS records.
+- **Special-use names are marked as answered locally:** `localhost`,
+  `127.in-addr.arpa` (`seer dig -x 127.0.0.1`), `invalid`, `onion` and the
+  other RFC 6761 names seer's resolver answers itself are reported with
+  `answered_locally: true`, no server and no flags, and a note saying no
+  server was asked — not as if the server had answered.
+- **Wildcard detection:** for a name below its registrable domain
+  (`www.example.com`, not `example.com`, and not a special-use name),
+  `dig` also queries a random
+  sibling name (`seer-probe-<hex>.example.com`) at the same time. When the
+  sibling resolves, a note says the zone has a wildcard there and whether
+  this answer matches it (likely wildcard-synthesized) or differs; JSON has
+  it as `wildcard.present` and `wildcard.matches_answer`.
+- **HTTPS, SVCB, CDS and CDNSKEY record types**, wherever a record type is
+  accepted (dig, prop, follow, compare, bulk dig, the REPL and TUI, Python,
+  REST and MCP). HTTPS and SVCB records print as dig prints them
+  (`1 . alpn="h3,h2" ipv4hint=…`) and serialize as `priority`, `target` and
+  `params`, a list of `{"key": …, "value": …}` objects; CDS and CDNSKEY print
+  like DS and DNSKEY.
+- **`+short` / `--short`:** only the values, one per line with CNAME targets
+  first, and nothing when there is no answer, as dig prints them. It ignores
+  `--format` and can't be combined with `-q`/`--fields`. A `+trace +short`
+  that stopped early prints why on stderr and exits 1.
+- **`+trace` / `--trace`:** `seer dig www.example.com +trace` walks the
+  delegation from the root servers down to the zone that answers, asking one
+  server of each zone directly (recursion off, up to 3 servers per zone). A
+  server that doesn't answer, returns an error, or gives an empty reply
+  without authority (a lame server) is passed over for the zone's next one,
+  and each server is asked over IPv4 first and over IPv6 when this host has
+  no IPv4 route. An address this host cannot send to at all (no route, or
+  IPv6 disabled in the kernel) is noted without counting toward the 3. Each
+  hop shows the zone, the server and its address, the time, the status and
+  AA flag, and the referral's nameservers or the answer, plus any servers
+  that failed. The walk stops at the answer (a CNAME is reported, not
+  followed; an NXDOMAIN beside a CNAME, which the zone's server followed
+  itself, names the target that does not exist), at NXDOMAIN or NODATA, or
+  with an error saying why it stopped early, such as a referral that leads
+  upward or sideways. The whole walk gets six DNS timeouts (30s by default);
+  one that runs out of time stops with the hops so far and an error saying
+  so. It takes one record type and no nameserver, and ignores the config
+  file's nameserver. Every server address — root hint, glue or looked up —
+  is checked against private and reserved ranges before it is queried.
+- **TUI:** the DNS lens shows the status line, the CNAME chain, the
+  NXDOMAIN/NODATA verdict, the authority SOA and the wildcard note, and has a
+  new **Trace** tab with a selectable hop table. `:dig` takes the CLI's
+  syntax for one record type: `:dig @9.9.9.9 example.com AAAA` selects that
+  nameserver (one that isn't in the list joins the `s` cycle), and `+trace`
+  opens the Trace tab.
+- **REPL:** when a partly typed argument has exactly one completion, the rest
+  of it is shown as a hint (typing `+sh` hints `ort`), for every command. The
+  `dig` completion offers `+short`/`+trace` and, after the name, the record
+  types.
+- **Python:** `seer.dns_trace(domain, record_type="A")` returns the trace as a
+  dict. It raises `ValueError` for invalid input or `ANY`, and
+  `RuntimeError` when no root server responds.
+- **REST:** `GET /dns/trace/{domain}?record_type=A`, limited to 5 requests
+  a minute per client like the other heavy endpoints, since one trace can
+  take up to six DNS timeouts.
+- **MCP:** the `seer_dns_trace` tool, under the same limit, for 31 tools in
+  all.
+- **seer-core:** `DnsResolver::query` returning `DnsQueryResult` (with
+  `DnsStatus` and `WildcardProbe`); `DnsTracer` returning `DnsTrace` and
+  `TraceHop`s; `SvcParam`; `OutputFormatter::{format_dig,
+  format_dns_trace}`; and `output::{dig_short, dig_trace_short,
+  sanitize_line}` with the `output::dig` module, which holds the dig outcome
+  wording.
+
+### Fixed
+- **DNS: wildcard names can be queried.** `seer dig '*.example.com'` (and
+  `prop`, `follow`, `compare`, bulk `dig`, the REPL, Python, REST and MCP)
+  failed with "Invalid domain name" because `*` was rejected as a character.
+  A `*` that is the whole leftmost label is now accepted, so a wildcard's
+  own records can be looked up; a `*` anywhere else is still rejected, and
+  per-host checks such as `ssl` and `status` still refuse it.
+- **TUI: a `www.` host is looked up as typed.** The TUI dropped a leading
+  `www.` from every target, so `:dig www.github.com` showed `github.com`'s
+  records, without the CNAME chain or the wildcard note, and the DNS, SSL,
+  Status, Headers, Propagation and Follow lenses could not look at a `www.`
+  host at all. The target now keeps it, as the CLI does; WHOIS, RDAP,
+  availability and the other registration lookups still ask about the
+  registered domain.
+
 ## [0.49.1] - 2026-09-25
 
 A patch release fixing WHOIS status parsing for `.ru`, `.su` and `.рф`.

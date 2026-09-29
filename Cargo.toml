@@ -101,6 +101,14 @@ toml = "1.1"
 # IDN support
 idna = "1"
 
+# Platform error codes. "Address family not supported" (EAFNOSUPPORT, or
+# Winsock's WSAEAFNOSUPPORT) has no io::ErrorKind of its own, so
+# dns/delegation.rs matches it by raw OS code, named by these crates rather
+# than a number (its value differs across Unix platforms). Both are already in
+# the tree through tokio/mio/socket2, with this feature, so they add no crate.
+libc = "0.2"
+windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock"] }
+
 # Public Suffix List (registrable-domain detection for confusables and
 # availability). The list is compiled into the crate, so no runtime fetch.
 psl = "2"
