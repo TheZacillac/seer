@@ -1,0 +1,20 @@
+# Extra steps dist inserts into release.yml's build-local-artifacts job, via
+# `github-build-setup` in dist-workspace.toml. Edit this file, then run
+# `dist generate` — never hand-edit release.yml.
+
+# Windows Defender's real-time scan locks the linker's outputs on GitHub's
+# windows runners and kills release builds deterministically: v0.33.0 failed
+# with "could not write output ... permission denied" and v0.50.0 with
+# "LNK1201: error writing to program database 'seer.pdb' ... insufficient
+# privilege", each identically on two consecutive attempts, while the
+# dev/test builds of the same code pass. Changing codegen until the bytes
+# stop tripping the scan (the v0.33.0 fix, [profile.dist] lto = false) only
+# lasts until the output changes again, so exclude the build instead: the
+# workspace (sources and target/) plus the cargo home, where build scripts
+# write and dependencies are unpacked.
+- name: Exclude the build from Windows Defender scanning
+  if: runner.os == 'Windows'
+  shell: pwsh
+  run: |
+    Add-MpPreference -ExclusionPath $env:GITHUB_WORKSPACE, (Join-Path $env:USERPROFILE ".cargo")
+    Get-MpPreference | Select-Object -ExpandProperty ExclusionPath
