@@ -127,6 +127,36 @@ fn days_until(when: DateTime<Utc>) -> i64 {
 /// spoofable. The human formatters print it as is, Markdown as a quote.
 const DNSSEC_NOTE: &str = "Note: DNS responses are not DNSSEC-validated";
 
+/// A differing propagation server's answer as one short line of plain
+/// text (the caller escapes it for its format; the TUI through
+/// [`sanitize_line`]): the values themselves when
+/// the sets are small, else what it lacks and adds against the consensus —
+/// a 19-record TXT set is unreadable inline, and the difference is the news.
+pub fn propagation_difference(inc: &crate::dns::Inconsistency, empty_label: &str) -> String {
+    const INLINE_VALUES: usize = 6;
+    if inc.values.is_empty() {
+        return format!("no records ({empty_label})");
+    }
+    if inc.values.len() + inc.consensus.len() <= INLINE_VALUES {
+        return inc.values.join(", ");
+    }
+    let mut parts = Vec::new();
+    let missing = inc.missing_count();
+    if missing > 0 {
+        parts.push(format!("missing {missing} of {}", inc.consensus.len()));
+    }
+    let extra = inc.extra_values();
+    if !extra.is_empty() {
+        parts.push(format!("extra: {}", extra.join(", ")));
+    }
+    parts.join("; ")
+}
+
+/// Shown beside a propagation result whose answers look location-dependent
+/// ([`crate::dns::PropagationResult::looks_location_dependent`]).
+const GEO_NOTE: &str = "Note: answers vary by resolver location, typical of GeoDNS/CDN \
+     names rather than a propagation delay";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum OutputFormat {

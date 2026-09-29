@@ -1,28 +1,21 @@
 ---
 source: seer-core/tests/format_snapshots.rs
+assertion_line: 998
 expression: markdown ().format_propagation (& fixture_propagation())
 ---
 ## Propagation: example.com A
 
-**50.0%** - Partially propagated
+**Partially propagated** — 1 of 2 responding servers agree
 
-- **Servers responding**: 2/3
-- **Consensus values**: `192.0.2.1`
-
-### Inconsistencies
-
-- Quad9 (9.9.9.9) \[A\]: 192.0.2.9 vs consensus: 192.0.2.1
-
-### Unreachable servers
-
-- **Yandex** (`77.88.8.8`): timeout
+- **Consensus**: `192.0.2.1`
+- **No answer**: 1 of 3 servers
 
 ### Results
 
-| Server | Location | IP | Result | Time |
-| --- | --- | --- | --- | --- |
-| Google | North America | `8.8.8.8` | `192.0.2.1` | 12ms |
-| Quad9 | Europe | `9.9.9.9` | `192.0.2.9` | 30ms |
-| Yandex | Europe | `77.88.8.8` | `timeout` | 5000ms |
+| | Server | Region | IP | Answer | Time |
+| --- | --- | --- | --- | --- | --- |
+| ✓ | Google | North America | `8.8.8.8` | matches consensus | 12 ms |
+| ≠ | Quad9 | Europe | `9.9.9.9` | `192.0.2.9` | 30 ms |
+| ✗ | Yandex | Europe | `77.88.8.8` | timeout | — |
 
 > Note: DNS responses are not DNSSEC-validated.

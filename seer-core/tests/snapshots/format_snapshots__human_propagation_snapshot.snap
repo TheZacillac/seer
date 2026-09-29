@@ -1,26 +1,21 @@
 ---
 source: seer-core/tests/format_snapshots.rs
+assertion_line: 998
 expression: human ().format_propagation (& fixture_propagation())
 ---
 
-[1;95mPropagation Check: example.com A[0m
-[37m────────────────────────────────[0m
-  [1;93m◑ Partially propagated (50.0%)[0m
-  [1;96mServers responding[0m: 2/3
-  [1;96mConsensus values[0m:
-    - [1;92m192.0.2.1[0m
-  [1;96mInconsistencies[0m:
-    - [1;93mQuad9 (9.9.9.9) [A]: 192.0.2.9 vs consensus: 192.0.2.1[0m
-  [1;96mUnreachable servers[0m:
-    - [1;93mYandex[0m (77.88.8.8): timeout
+[1;95mPropagation: example.com A[0m
+[37m──────────────────────────[0m
+  [1;93m◑ Partially propagated[0m [90m— 1 of 2 responding servers agree[0m
+  [1;96mConsensus[0m: [1;92m192.0.2.1[0m
+  [1;96mNo answer[0m: [1;93m1 of 3 servers (reasons below)[0m
 
-  [1;96mResults by Region[0m:
+  [1;96mNorth America[0m
+    [1;92m✓[0m [97mGoogle[0m [90m8.8.8.8  [0m [90m  12 ms[0m
 
-    [1;96mEurope[0m:
-      [1;92m✓[0m [97mQuad9[0m (9.9.9.9) - 192.0.2.9 [30ms]
-      [1;91m✗[0m [97mYandex[0m (77.88.8.8) - timeout [5000ms]
+  [1;96mEurope[0m
+    [1;93m≠[0m [97mQuad9 [0m [90m9.9.9.9  [0m [90m  30 ms[0m  [1;93m192.0.2.9[0m
+    [1;91m✗[0m [97mYandex[0m [90m77.88.8.8[0m          [90mtimeout[0m
 
-    [1;96mNorth America[0m:
-      [1;92m✓[0m [97mGoogle[0m (8.8.8.8) - 192.0.2.1 [12ms]
-
+[90m✓ matches consensus   ≠ different answer   ✗ no answer[0m
 [1;93mNote: DNS responses are not DNSSEC-validated[0m

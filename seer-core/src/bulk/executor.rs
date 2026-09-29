@@ -180,8 +180,8 @@ impl BulkExecutor {
     /// for dispatch pacing, plus every per-protocol timeout
     /// (`timeouts.whois_secs` / `rdap_secs` / `dns_secs` / `http_secs`) for
     /// the internal sub-clients. The propagation checker deliberately keeps
-    /// its own tuned timeouts (30-server fan-out has different latency
-    /// characteristics than a single query).
+    /// its own tuned timeouts (a fan-out to every server in its list has
+    /// different latency characteristics than a single query).
     pub fn from_config(config: &crate::config::SeerConfig) -> Self {
         let mut executor = Self::new()
             .with_concurrency(config.bulk.concurrency)

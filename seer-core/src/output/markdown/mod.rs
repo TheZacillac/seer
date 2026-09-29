@@ -14,7 +14,7 @@ use super::OutputFormatter;
 pub(super) use super::contact::{self, Contact, FlatContacts};
 pub(super) use super::days_until;
 pub(super) use super::grouping::render_grouped;
-pub(super) use super::DNSSEC_NOTE;
+pub(super) use super::{propagation_difference, DNSSEC_NOTE, GEO_NOTE};
 pub(super) use crate::caa::{CaaPolicy, IssuerCaaMatch};
 pub(super) use crate::dns::{DnsRecord, FollowIteration, FollowResult, PropagationResult};
 pub(super) use crate::lookup::LookupResult;
