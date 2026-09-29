@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import importlib
+from typing import Annotated
 
 import pytest
-from fastapi import FastAPI
+from fastapi import Body, FastAPI
 from fastapi.testclient import TestClient
 
 import seer
@@ -363,9 +364,10 @@ def test_stale_bindings_without_nameserver_target_fail_clearly(client, monkeypat
     """Bindings older than the SSRF guard (e.g. a stale local build) must get a
     clear 503 on a nameserver request, not an AttributeError 500."""
     from seer_api import ssrf
+    from seer_api.errors import ServiceUnavailable
 
     monkeypatch.delattr(seer, "nameserver_target", raising=False)
-    with pytest.raises(RuntimeError, match="rebuild seer-py"):
+    with pytest.raises(ServiceUnavailable):
         ssrf.nameserver_target("8.8.8.8")
     resp = client.get("/dns/example.com/A?nameserver=8.8.8.8")
     assert resp.status_code == 503, resp.text
@@ -562,18 +564,33 @@ def test_mcp_refuses_reserved_nameserver_in_any_spec_form(spec):
 
 
 @pytest.mark.parametrize(
-    "path,body",
-    [
-        # Bulk endpoints where every domain is an actual outbound connect
-        # target must guard each domain against reserved addresses.
-        ("/status/bulk", {"domains": ["127.0.0.1", "example.com"], "concurrency": 2}),
-        ("/ssl/bulk", {"domains": ["127.0.0.1", "example.com"], "concurrency": 2}),
-    ],
+    "path,seer_fn",
+    [("/status/bulk", "bulk_status"), ("/ssl/bulk", "bulk_ssl")],
 )
-def test_ssrf_guard_bulk_rejects_reserved(client, path, body):
-    """Bulk endpoints refuse any body whose domains list contains a reserved IP."""
-    resp = client.post(path, json=body)
-    assert resp.status_code == 400, (path, resp.status_code, resp.text)
+def test_bulk_leaves_reserved_hosts_to_core_per_row(monkeypatch, client, path, seer_fn):
+    """Regression: one reserved (or unresolvable) domain failed a whole bulk
+    batch with a 400 at the API layer. Core refuses a reserved host itself,
+    per row, so the batch runs and that row fails on its own."""
+    import seer as seer_mod
+
+    def _no_precheck(*_a, **_kw):
+        raise AssertionError("bulk routes must not pre-check hosts")
+
+    seen: dict = {}
+
+    def _bulk(domains, concurrency):
+        seen["domains"] = domains
+        return [
+            {"success": False, "data": None, "error": "refused: reserved address"},
+            {"success": True, "data": {"domain": domains[1]}, "error": None},
+        ]
+
+    monkeypatch.setattr(seer_mod, "validate_public_host", _no_precheck, raising=False)
+    monkeypatch.setattr(seer_mod, seer_fn, _bulk, raising=False)
+    resp = client.post(path, json={"domains": ["127.0.0.1", "example.com"]})
+    assert resp.status_code == 200, (path, resp.status_code, resp.text)
+    assert seen["domains"] == ["127.0.0.1", "example.com"]
+    assert [row["success"] for row in resp.json()] == [False, True]
 
 
 @pytest.mark.parametrize(
@@ -616,20 +633,22 @@ def test_non_connecting_routes_do_not_reject_at_api_layer(monkeypatch, client, p
     )
 
 
-def test_guard_async_yields_event_loop(monkeypatch):
-    """H1: guard_async must offload the blocking validator to the executor
-    so concurrent requests do not serialize on the event loop.
+def test_guarded_dispatch_does_not_block_the_event_loop(monkeypatch):
+    """H1: the SSRF pre-check runs inside the ``run_seer`` dispatch, off the
+    event loop, so concurrent requests do not serialize on it.
 
     The inner `seer.validate_public_host` is a PyO3 function that calls
     `block_on` — running it bare from an async def pins the event loop
     thread. We monkeypatch it to a blocking `time.sleep` so the effect is
-    deterministic, then verify that 5 concurrent `guard_async` calls
-    complete in close to max(durations), not sum(durations).
+    deterministic, then verify that 5 concurrent guarded dispatches complete
+    in close to max(durations), not sum(durations).
     """
     import asyncio
     import time
 
     import seer
+    from seer_api._run import run_seer
+    from seer_api.ssrf import guarded
 
     per_call_delay = 0.15  # seconds
     concurrency = 5
@@ -638,25 +657,19 @@ def test_guard_async_yields_event_loop(monkeypatch):
         time.sleep(per_call_delay)
 
     monkeypatch.setattr(seer, "validate_public_host", _slow_validate, raising=False)
-
-    from seer_api.ssrf import guard_async
+    work = guarded(lambda domain: domain, hosts=["example.com"])
 
     async def run_all():
-        await asyncio.gather(
-            *(guard_async("example.com", 443) for _ in range(concurrency))
-        )
+        await asyncio.gather(*(run_seer(work, "example.com") for _ in range(concurrency)))
 
     start = time.perf_counter()
     asyncio.run(run_all())
     elapsed = time.perf_counter() - start
 
-    # Serial execution would take ~per_call_delay * concurrency = 0.75s.
-    # Parallel execution on the default thread pool should finish in
-    # close to per_call_delay. Use 2x per_call_delay as a generous ceiling
-    # to absorb scheduler jitter on loaded CI runners while still catching
-    # the serial-vs-parallel regression.
+    # Serial execution would take ~per_call_delay * concurrency = 0.75s; the
+    # 2x ceiling absorbs scheduler jitter on loaded CI runners.
     assert elapsed < per_call_delay * 2, (
-        f"guard_async appears to serialize: {elapsed:.3f}s for {concurrency} "
+        f"guarded dispatch appears to serialize: {elapsed:.3f}s for {concurrency} "
         f"concurrent calls (expected < {per_call_delay * 2:.3f}s)"
     )
 
@@ -766,10 +779,10 @@ def test_mcp_call_tool_returns_invalid_input_for_ssrf():
 
 
 # ---------------------------------------------------------------------------
-# MCP retry-hint classification: permanent RuntimeErrors must NOT be labelled
-# retryable. seer-core's retry.rs::is_retryable classifies several
-# RuntimeError-mapped variants (WhoisServerNotFound, JsonError parse failures,
-# LookupFailed, certificate/SSL errors) as permanent.
+# MCP retry-hint classification, by the binding's exception class: permanent
+# failures (seer-core's retry.rs treats WhoisServerNotFound, parse failures,
+# LookupFailed, certificate/SSL and config errors as permanent) must NOT be
+# labelled retryable. The class decides, never the message text.
 # ---------------------------------------------------------------------------
 
 
@@ -796,37 +809,70 @@ def _run_call_tool_with_error(monkeypatch, exc: Exception) -> str:
 
 
 @pytest.mark.parametrize(
-    "message",
+    "exc_name,message",
     [
-        "WHOIS server not found for this TLD",
-        "Response parsing failed",
-        "Lookup failed for example.invalidtld",
-        "Certificate validation failed",
-        "SSL inspection failed",
-        "Configuration error",
-        "Bulk operation partially failed: ssl",
+        ("WhoisServerNotFoundError", "WHOIS server not found for this TLD"),
+        ("ParseError", "Response parsing failed"),
+        ("LookupFailedError", "Lookup failed for example.invalidtld"),
+        ("TlsError", "Certificate validation failed"),
+        ("TlsError", "SSL inspection failed"),
+        ("ConfigError", "Configuration error"),
     ],
 )
-def test_mcp_permanent_runtimeerror_not_labelled_retryable(monkeypatch, message):
-    text = _run_call_tool_with_error(monkeypatch, RuntimeError(message))
+def test_mcp_permanent_error_not_labelled_retryable(monkeypatch, exc_name, message):
+    text = _run_call_tool_with_error(monkeypatch, getattr(seer, exc_name)(message))
     assert "permanent failure" in text.lower()
     assert "do not retry" in text.lower()
+    assert message in text
 
 
-def test_mcp_rate_limited_runtimeerror_is_retryable(monkeypatch):
+def test_mcp_rate_limited_error_is_retryable(monkeypatch):
     text = _run_call_tool_with_error(
-        monkeypatch, RuntimeError("Rate limited - please try again later")
+        monkeypatch, seer.RateLimitedError("Rate limited - please try again later")
     )
     assert "retry" in text.lower()
     assert "permanent failure" not in text.lower()
 
 
-def test_mcp_ambiguous_runtimeerror_is_cautious(monkeypatch):
+@pytest.mark.parametrize("exc_name", ["UpstreamError", "DnsError", "SeerError"])
+def test_mcp_ambiguous_error_is_cautious(monkeypatch, exc_name):
     # Generic transport failures collapse to one sanitized string; we must
     # not over-promise a successful retry.
-    text = _run_call_tool_with_error(monkeypatch, RuntimeError("RDAP lookup failed"))
+    text = _run_call_tool_with_error(monkeypatch, getattr(seer, exc_name)("RDAP lookup failed"))
     assert "permanent failure" not in text.lower()
     assert "at most once" in text.lower()
+
+
+def test_mcp_retry_advice_ignores_message_text(monkeypatch):
+    """Regression: advice was chosen by substring-sniffing the message, which
+    echoes caller input — a LookupFailed for a domain named
+    `rate-limited.test` read as "rate limited", and an upstream error that
+    merely mentioned a permanent phrase read as permanent."""
+    text = _run_call_tool_with_error(
+        monkeypatch, seer.LookupFailedError("Lookup failed for rate-limited.test")
+    )
+    assert "permanent failure" in text.lower()
+    text = _run_call_tool_with_error(
+        monkeypatch, seer.UpstreamError("whois server not found for this tld")
+    )
+    assert "permanent failure" not in text.lower()
+    # A plain RuntimeError is not a core error at all: no text is echoed.
+    text = _run_call_tool_with_error(
+        monkeypatch, RuntimeError("WHOIS server not found for this TLD")
+    )
+    assert text == "An internal error occurred while processing your request."
+
+
+def test_mcp_error_text_is_sanitized_and_capped(monkeypatch):
+    """MCP error text goes through the same sanitizer as a REST body:
+    control/ANSI bytes stripped, length capped."""
+    from seer_api.errors import _MAX_MESSAGE_LEN
+
+    text = _run_call_tool_with_error(monkeypatch, ValueError("bad\x1b[31m\ninput" + "x" * 500))
+    assert "\x1b" not in text and "\n" not in text
+    assert len(text) <= len("Invalid input: ") + _MAX_MESSAGE_LEN
+    text = _run_call_tool_with_error(monkeypatch, seer.UpstreamError("up\x00stream"))
+    assert "\x00" not in text
 
 
 def test_mcp_timeout_is_retryable(monkeypatch):
@@ -913,7 +959,7 @@ def test_ipv4_mapped_loopback_bind_does_not_depend_on_python_version(monkeypatch
     old stdlib behavior on whatever Python runs the suite."""
     import ipaddress
 
-    from seer_api.main import _is_loopback_bind
+    from seer_api.main import _is_loopback_host
 
     if buggy_stdlib:
         monkeypatch.setattr(
@@ -923,12 +969,12 @@ def test_ipv4_mapped_loopback_bind_does_not_depend_on_python_version(monkeypatch
         )
         assert not ipaddress.IPv6Address("::ffff:127.0.0.1").is_loopback
 
-    assert _is_loopback_bind("::ffff:127.0.0.1")
-    assert _is_loopback_bind("[::ffff:127.0.0.2]")
-    assert _is_loopback_bind("::1")
+    assert _is_loopback_host("::ffff:127.0.0.1")
+    assert _is_loopback_host("[::ffff:127.0.0.2]")
+    assert _is_loopback_host("::1")
     # Mapped non-loopback addresses stay non-loopback (fail closed).
-    assert not _is_loopback_bind("::ffff:10.0.0.1")
-    assert not _is_loopback_bind("::ffff:0.0.0.0")
+    assert not _is_loopback_host("::ffff:10.0.0.1")
+    assert not _is_loopback_host("::ffff:0.0.0.0")
 
 
 @pytest.mark.parametrize("host", ["0.0.0.0", "::", "example.com", "10.0.0.5", "not-an-ip!"])
@@ -1608,3 +1654,60 @@ def test_middleware_class_rejects_large_chunked_body():
     assert sent, "no response messages"
     assert sent[0]["type"] == "http.response.start"
     assert sent[0]["status"] == 413
+    # The overflowing read failed: the app saw only the chunk under the cap
+    # (never a faked end-of-body) and nothing it might send got through.
+    assert received == [{"type": "http.request", "body": b"a" * 20, "more_body": True}]
+    assert [m.get("status") for m in sent if m["type"] == "http.response.start"] == [413]
+
+
+def test_chunked_overflow_never_runs_a_fastapi_handler():
+    """Regression: past the cap the middleware used to fake an empty
+    end-of-body, so a FastAPI route ran in full on the truncated body before
+    the 413 replaced its response. Driven at the ASGI level because
+    TestClient delivers a body as one message."""
+    import asyncio
+
+    from seer_api.middleware import MaxBodySizeMiddleware
+
+    inner = FastAPI()
+    calls: list = []
+
+    @inner.post("/work")
+    async def work(payload: Annotated[dict, Body()]):
+        calls.append(payload)
+        return {"ok": True}
+
+    # A complete request, then whitespace: the part under the cap is valid
+    # JSON on its own — exactly what the handler used to receive.
+    messages = iter(
+        [
+            {"type": "http.request", "body": b'{"a": 1}', "more_body": True},
+            {"type": "http.request", "body": b" " * 40, "more_body": True},
+            {"type": "http.request", "body": b" " * 40, "more_body": False},
+        ]
+    )
+    sent: list = []
+
+    async def receive():
+        return next(messages)
+
+    async def send(message):
+        sent.append(message)
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/work",
+        "raw_path": b"/work",
+        "root_path": "",
+        "query_string": b"",
+        "headers": [(b"content-type", b"application/json")],
+        "client": ("127.0.0.1", 1),
+        "server": ("127.0.0.1", 80),
+    }
+    asyncio.run(MaxBodySizeMiddleware(inner, max_bytes=64)(scope, receive, send))
+    assert [m["status"] for m in sent if m["type"] == "http.response.start"] == [413]
+    assert calls == [], "the handler ran on a truncated body"

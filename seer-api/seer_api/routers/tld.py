@@ -24,7 +24,8 @@ router = APIRouter()
 @limiter.limit("30/minute")
 async def tld_list(request: Request):
     """List every TLD seer knows about (sorted, deduplicated)."""
-    return await as_http(run_seer(seer.all_tlds), "TLD list failed")
+    # Embedded data, no I/O: called directly rather than taking a pool thread.
+    return seer.all_tlds()
 
 
 @router.get("/{tld}")

@@ -28,7 +28,7 @@ async def smart_lookup(request: Request, domain: Domain):
 
 
 @router.post("/bulk")
-@limiter.limit(BULK_LIMIT)
+@limiter.shared_limit(BULK_LIMIT, scope="bulk_lookup")
 async def bulk_smart_lookup(request: Request, body: BulkRequest):
     """
     Smart lookup for multiple domains.
@@ -46,7 +46,7 @@ async def bulk_smart_lookup(request: Request, body: BulkRequest):
 
 
 @router.post("/bulk/stream")
-@limiter.limit(BULK_LIMIT)
+@limiter.shared_limit(BULK_LIMIT, scope="bulk_lookup")
 async def bulk_smart_lookup_stream(request: Request, body: BulkRequest):
     """Stream bulk smart-lookup results as Server-Sent Events.
 

@@ -37,9 +37,9 @@ def _call_with_error(monkeypatch, exc: Exception):
         ValueError("'domains' must be a non-empty list"),
         TimeoutError("Operation timed out"),
         ConnectionError("WHOIS connection failed"),
-        RuntimeError("WHOIS server not found for this TLD"),  # permanent branch
-        RuntimeError("Rate limited - please try again later"),  # rate-limited branch
-        RuntimeError("RDAP lookup failed"),  # ambiguous branch
+        seer.WhoisServerNotFoundError("WHOIS server not found for this TLD"),  # permanent
+        seer.RateLimitedError("Rate limited - please try again later"),  # rate-limited
+        seer.UpstreamError("RDAP lookup failed"),  # ambiguous branch
         Exception("unexpected internal failure"),  # catch-all branch
     ],
 )
@@ -55,7 +55,7 @@ def test_every_failure_branch_sets_iserror_and_preamble(monkeypatch, exc):
 
 
 def test_per_tool_rate_limit_throttle_sets_iserror(monkeypatch):
-    monkeypatch.setattr(mcp_server, "_tool_rate_ok", lambda _name: False)
+    monkeypatch.setattr(mcp_server, "_tool_rate_ok", lambda _name, _client: False)
     result = asyncio.run(
         mcp_server.call_tool("seer_bulk_ssl", {"domains": ["example.com"]})
     )

@@ -49,6 +49,16 @@ Server runs on `http://127.0.0.1:8000` (loopback-only by default).
 - **Loopback-only bind.** The default host is `127.0.0.1`. To bind
   publicly, set both `SEER_HOST=0.0.0.0` **and** `SEER_API_KEY=<token>`;
   the server refuses to start on a non-loopback host without an auth key.
+  A server started some other way (`uvicorn seer_api.main:app --host
+  0.0.0.0`) is covered too: without `SEER_API_KEY`, every request that
+  arrives on a non-loopback interface gets a 503 telling the operator to
+  set the key.
+- **No cross-origin browser access without a key.** With no
+  `SEER_API_KEY`, a request carrying an `Origin` header is refused (403)
+  unless the origin is a loopback one or listed in `SEER_CORS_ORIGINS` —
+  so a web page cannot drive a local API from your browser. Clients that
+  send no `Origin` (curl, SDKs) are unaffected. No CORS headers are sent
+  unless `SEER_CORS_ORIGINS` is set.
 - **API documentation endpoints are off.** Set `SEER_DOCS_ENABLED=true`
   to serve `/docs`, `/redoc`, and `/openapi.json`.
 - **Multi-worker deployments need a shared rate-limit store.** With
@@ -101,7 +111,21 @@ Available only when `SEER_DOCS_ENABLED=true`:
 
 Bulk variants: `lookup`, `whois`, `dns`, `propagation`, `status`, and `ssl`
 accept `POST /<prefix>/bulk` plus an SSE-streaming `POST /<prefix>/bulk/stream`;
-`availability` and `info` accept `POST /<prefix>/bulk`.
+`availability` and `info` accept `POST /<prefix>/bulk`. One failing domain
+never fails the batch: its row carries `success: false` and the error — a
+reserved (private, loopback, …) address in bulk `status`/`ssl` included,
+which seer refuses to connect to.
+
+### Errors
+
+Failures return `{"detail": "<message>"}` with the status chosen by the
+error's type: `400` invalid input (including a single-host `status`/`ssl`/
+`rdap/ip` target that is a reserved address), `404` no WHOIS server for the
+TLD, `429` rate limited (this API's own limit, or an upstream registry's),
+`502` an upstream (WHOIS, RDAP, DNS, HTTP, TLS) failure, `503` a deployment
+fault, `504` a timeout (including `SEER_REQUEST_TIMEOUT`), `500` anything
+else. A bulk stream that fails or outlives `SEER_REQUEST_TIMEOUT` ends with
+an `error` event.
 
 ### Usage Examples
 
@@ -143,13 +167,19 @@ export SEER_CORS_ORIGINS="https://example.com,https://app.example.com"
 seer-api
 ```
 
-Default: `*` (all origins)
+Default: unset — no CORS headers, and (without `SEER_API_KEY`) requests
+from non-loopback origins are refused. `*` is rejected at startup.
 
 #### Rate Limiting
 
 Every REST route has its own fixed per-client limit (e.g. `5/minute` for
 `/takeover`, `/confusables` and `/dns/trace`), counted per route — requests
-for different domains on the same route share one budget.
+for different domains on the same route share one budget, and an
+operation's `/bulk` and `/bulk/stream` routes share one budget between them.
+
+The expensive MCP tools carry the same limits as their REST routes
+(`seer_subdomains` gets `5/minute`), counted per client like REST — by
+client IP over HTTP; the stdio server has one client.
 
 `SEER_RATE_LIMIT` sets the per-client limit for the MCP endpoint
 (`POST /mcp`); it does not change the REST limits. Use the
@@ -209,7 +239,7 @@ Optional env vars:
 
 ### Available Tools
 
-All 31 tools, on both transports:
+All 32 tools, on both transports:
 
 | Tool | Description |
 |------|-------------|
@@ -236,6 +266,7 @@ All 31 tools, on both transports:
 | `seer_takeover` | Subdomain takeover scan (HTTP-confirmed) |
 | `seer_confusables` | Look-alike (typosquat) generation |
 | `seer_tld_info` | TLD info (WHOIS server, RDAP endpoint) |
+| `seer_tld_list` | Full TLD catalog |
 | `seer_bulk_lookup` | Bulk smart lookups |
 | `seer_bulk_whois` | Bulk WHOIS lookups |
 | `seer_bulk_dig` | Bulk DNS queries |
@@ -246,7 +277,12 @@ All 31 tools, on both transports:
 | `seer_bulk_availability` | Bulk availability checks |
 
 Each tool's input schema is served by `tools/list` (defined in
-`seer_api/mcp/server.py`).
+`seer_api/mcp/server.py`). A failed call returns `isError: true` with the
+reason and retry advice picked by the error's type: invalid input (fix the
+arguments), transient (timeout, connection, rate limit: retry after a
+backoff), permanent (unsupported TLD, unparseable response, TLS failure:
+do not retry), or an upstream failure that may be either (retry at most
+once).
 
 ### Claude Desktop Integration
 

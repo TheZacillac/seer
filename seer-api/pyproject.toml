@@ -9,8 +9,8 @@ description = "FastAPI server and MCP integration for Seer domain utilities"
 readme = "README.md"
 license = { text = "MIT" }
 # Floor is 3.10: the mcp SDK requires >=3.10, so a 3.9 install would fail
-# at pip resolution. seer_api code also uses 3.10-only syntax (X | Y unions,
-# match statements).
+# at pip resolution. seer_api code also uses 3.10-only syntax (X | Y unions
+# at runtime, e.g. in isinstance checks).
 requires-python = ">=3.10"
 dependencies = [
     # Exclude 0.136.3 (PyPI advisory MAL-2026-4750): that release adds an
@@ -38,11 +38,12 @@ dependencies = [
     # (import name remains `seer`).
     #
     # Floor tracks the oldest bindings release exposing every symbol the
-    # routers and MCP server call. 0.44 is required for `delegation` and
-    # `all_tlds` (added in v0.44.0), `record_types` (v0.45.0) and
-    # `nameserver_target` (v0.49.0, the SSRF guard's spec parser) — a lower
-    # resolution installs cleanly and then AttributeErrors at request time,
-    # so bump this whenever a new binding is called.
+    # routers and MCP server call: `nameserver_target` (v0.49.0, the SSRF
+    # guard's spec parser), `dns_trace` and the dig result shape (v0.50.0).
+    # The typed exceptions (`seer.SeerError` and its subclasses) are newer
+    # than 0.51.0: raise this floor to the release that ships them. A lower
+    # resolution installs cleanly and then AttributeErrors, so bump this
+    # whenever a new binding is used.
     "domain-seer>=0.50.0",
     "slowapi>=0.1.9",
     # Imported directly (the /mcp and per-tool MCP rate limiters; the raw
@@ -55,9 +56,10 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-    # 8.4+ fails an `async def` test that no plugin runs (older releases warn
-    # and skip it), and seer-api has no async test plugin.
-    "pytest>=8.4",
+    # One floor with seer-py's dev extra. (8.4+ is also what fails an
+    # `async def` test that no plugin runs, rather than skipping it; seer-api
+    # has no async test plugin.)
+    "pytest>=9.1.1",
     "httpx>=0.26",
 ]
 

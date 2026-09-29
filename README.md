@@ -499,6 +499,15 @@ results = seer.bulk_lookup(domains, progress=lambda done, total, domain: print(f
 # SSRF helpers (used by seer-api before any user-supplied connect target)
 seer.validate_public_host("example.com", 443)   # ValueError on reserved/private addresses
 seer.nameserver_target("tls://1.1.1.1")          # ("1.1.1.1", 853); None if the spec is invalid
+
+# Errors: ValueError (invalid input), TimeoutError, ConnectionError (WHOIS
+# connect), or a seer.SeerError subclass (a RuntimeError): RateLimitedError,
+# WhoisServerNotFoundError, DnsError, UpstreamError, LookupFailedError,
+# ParseError, TlsError, ConfigError
+try:
+    seer.whois("example.zz")
+except seer.WhoisServerNotFoundError:
+    pass
 ```
 
 <details>
@@ -621,7 +630,7 @@ eval "$(seer generate-key --export)"
 SEER_API_KEY=$KEY SEER_HOST=0.0.0.0 seer-api
 ```
 
-**31 tools:** one per lookup (`seer_lookup`, `seer_dig`, `seer_dns_trace`,
+**32 tools:** one per lookup (`seer_lookup`, `seer_dig`, `seer_dns_trace`,
 `seer_ssl`, `seer_takeover`, …) plus bulk variants (`seer_bulk_status`, …).
 The full tool list and the Claude Desktop configuration are in
 [seer-api/README.md](seer-api/README.md#available-tools).
@@ -669,15 +678,15 @@ Propagation checks query **30 nameservers** across **6 regions**:
 | `RUST_LOG` | Logging level (`trace` / `debug` / `info` / `warn` / `error`) | — |
 | `SEER_LOG_LEVEL` | API log level; `ARCANUM_LOG_LEVEL` takes precedence when set | `INFO` |
 | `SEER_DOMAIN_ALLOWLIST` | Comma-separated allowlist restricting which domains may be queried | — |
-| `SEER_HOST` | API bind host. Non-loopback requires `SEER_API_KEY` | `127.0.0.1` |
+| `SEER_HOST` | API bind host. Non-loopback requires `SEER_API_KEY` (without it, requests arriving on a non-loopback interface get a 503 however the server was started) | `127.0.0.1` |
 | `SEER_PORT` | API bind port | `8000` |
 | `SEER_API_KEY` | Bearer token required for all non-`/health` requests | — |
-| `SEER_CORS_ORIGINS` | Comma-separated CORS origins for REST API | `*` |
+| `SEER_CORS_ORIGINS` | Comma-separated CORS origins for the REST API. Unset: no CORS headers, and without `SEER_API_KEY` a request from a non-loopback `Origin` is refused (403) | — |
 | `SEER_DOCS_ENABLED` | Expose `/docs`, `/redoc`, `/openapi.json` | `false` |
 | `SEER_METRICS_ENABLED` | Expose `/metrics` to non-loopback clients | `false` |
 | `SEER_RATE_LIMIT` | Per-client limit for the MCP endpoint (`POST /mcp`) as `<count>/<period>`; `;`-separated limits are all enforced. REST routes keep their own fixed limits | `30/minute` |
 | `SEER_RATE_LIMIT_STORAGE` | Rate-limit storage URI (e.g. `redis://host:6379`) | `memory://` |
-| `SEER_REQUEST_TIMEOUT` | Per-request deadline (seconds) for dispatched core calls; on expiry the client gets a 504. `0` disables | `0` |
+| `SEER_REQUEST_TIMEOUT` | Per-request deadline (seconds) covering the SSRF pre-check, the core call and bulk SSE streams (slot wait included); on expiry the client gets a 504 (a stream: an `error` event). `0` disables | `0` |
 | `SEER_DISPATCH_THREADS` | Max threads in the pool running blocking core calls (REST + `/mcp`) | `50` |
 | `SEER_MAX_CONCURRENT_STREAMS` | Max in-flight bulk SSE stream jobs per worker process | `8` |
 | `SEER_TRUST_PROXY` | Trust `X-Forwarded-For` from `SEER_TRUSTED_PROXY_IPS` | `false` |

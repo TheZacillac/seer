@@ -31,6 +31,15 @@ Example usage:
 """
 
 from seer._seer import (
+    ConfigError,
+    DnsError,
+    LookupFailedError,
+    ParseError,
+    RateLimitedError,
+    SeerError,
+    TlsError,
+    UpstreamError,
+    WhoisServerNotFoundError,
     all_tlds,
     availability,
     bulk_availability,
@@ -72,6 +81,10 @@ from seer._seer import (
     whois,
 )
 
+# Errors: invalid input raises ValueError, a timeout TimeoutError, a WHOIS
+# connect failure ConnectionError; every other failure raises a subclass of
+# SeerError (itself a RuntimeError), e.g. RateLimitedError or DnsError.
+
 # Importing seer._seer also installs the Rust -> Python `logging` bridge
 # (see the #[pymodule_init] hook in seer-py/src/lib.rs).
 
@@ -86,6 +99,15 @@ try:
 except Exception:
     __version__ = "unknown"
 __all__ = [
+    "ConfigError",
+    "DnsError",
+    "LookupFailedError",
+    "ParseError",
+    "RateLimitedError",
+    "SeerError",
+    "TlsError",
+    "UpstreamError",
+    "WhoisServerNotFoundError",
     "all_tlds",
     "availability",
     "bulk_availability",
