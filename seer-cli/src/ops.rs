@@ -271,7 +271,7 @@ pub async fn run_live_follow(
     result
 }
 
-/// Records a lookup result to `~/.seer/history.toml` off the async executor
+/// Records a lookup result to `~/.seer/history.json` off the async executor
 /// (the file I/O is blocking). Errors are deliberately swallowed — history is
 /// best-effort and must never fail the lookup that produced it.
 pub async fn record_lookup_history(domain: &str, result: seer_core::LookupResult) {
@@ -359,7 +359,7 @@ pub async fn load_history() -> Result<seer_core::LookupHistory, String> {
     state_io("load history", || Ok(seer_core::LookupHistory::load())).await
 }
 
-/// Empties `~/.seer/history.toml`.
+/// Empties `~/.seer/history.json`.
 pub async fn clear_history() -> Result<(), String> {
     state_io("clear history", || {
         let mut history = seer_core::LookupHistory::load();

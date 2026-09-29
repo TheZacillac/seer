@@ -1,7 +1,11 @@
 //! Lookup history cache for storing past lookup results to disk.
 //!
-//! Results are persisted to `~/.seer/history.json` with a maximum of 50 entries
-//! per domain to prevent unbounded growth.
+//! Results are persisted to `~/.seer/history.json`, which is rewritten on
+//! every recorded lookup, so its size is bounded three ways: at most 20
+//! entries per domain, 500 domains, and one year of age; and each stored
+//! result is slimmed of the RDAP parts no history reader uses (notices,
+//! remarks, unknown extension members). What remains is everything the
+//! history listing, the TUI History lens and drift detection read.
 
 use std::collections::BTreeMap;
 
@@ -25,14 +29,16 @@ pub struct LookupHistory {
 }
 
 /// Maximum number of history entries retained per domain.
-const MAX_ENTRIES_PER_DOMAIN: usize = 50;
+const MAX_ENTRIES_PER_DOMAIN: usize = 20;
 
 /// Maximum number of distinct domains retained. The per-domain cap above
 /// bounds entries within a domain, but the number of distinct domain keys was
 /// previously unbounded — long-lived/automated use could grow `history.json`
 /// without limit. When exceeded, the domain whose most-recent entry is oldest
-/// is evicted (LRU by most-recent activity). (issue #59)
-const MAX_DOMAINS: usize = 1000;
+/// is evicted (LRU by most-recent activity). (issue #59) With the per-domain
+/// cap this bounds the file to 10 000 slimmed entries (it was 50 000 full
+/// ones — up to ~1 GB rewritten on every lookup).
+const MAX_DOMAINS: usize = 500;
 
 /// Entries older than this are pruned. Bounds growth and the per-save rewrite
 /// cost under long-lived use. (issue #59)
@@ -42,30 +48,31 @@ crate::fsutil::persisted_store!(LookupHistory, "history.json", json, "history");
 
 impl LookupHistory {
     /// Records a lookup result for the given domain, trimming old entries if needed.
-    pub fn record(&mut self, domain: &str, result: LookupResult) {
+    pub fn record(&mut self, domain: &str, mut result: LookupResult) {
+        slim(&mut result);
         let key = history_key(domain);
         let entry = HistoryEntry {
             domain: key.clone(),
             timestamp: Utc::now(),
             result,
         };
-        let entries = self.entries.entry(key).or_default();
-        entries.push(entry);
-        // Keep at most MAX_ENTRIES_PER_DOMAIN entries
-        if entries.len() > MAX_ENTRIES_PER_DOMAIN {
-            let drain_count = entries.len() - MAX_ENTRIES_PER_DOMAIN;
-            entries.drain(..drain_count);
-        }
+        self.entries.entry(key).or_default().push(entry);
         self.prune();
     }
 
-    /// Bounds total growth: drops entries older than [`MAX_ENTRY_AGE_DAYS`],
-    /// removes any domain left with no entries, then evicts least-recently-active
-    /// domains until at most [`MAX_DOMAINS`] remain (issue #59).
+    /// Bounds total growth: drops entries older than [`MAX_ENTRY_AGE_DAYS`]
+    /// and all but the newest [`MAX_ENTRIES_PER_DOMAIN`] per domain, removes
+    /// any domain left with no entries, then evicts least-recently-active
+    /// domains until at most [`MAX_DOMAINS`] remain (issue #59). Every entry
+    /// is slimmed too, so a file written under the older, larger caps and
+    /// full results shrinks on its first save.
     fn prune(&mut self) {
         let cutoff = Utc::now() - chrono::Duration::days(MAX_ENTRY_AGE_DAYS);
         self.entries.retain(|_, v| {
             v.retain(|e| e.timestamp >= cutoff);
+            let excess = v.len().saturating_sub(MAX_ENTRIES_PER_DOMAIN);
+            v.drain(..excess);
+            v.iter_mut().for_each(|e| slim(&mut e.result));
             !v.is_empty()
         });
         // Evict whole domains (least-recently-active first) until under the cap.
@@ -94,6 +101,29 @@ impl LookupHistory {
     /// Clears all history entries.
     pub fn clear(&mut self) {
         self.entries.clear();
+    }
+}
+
+/// Drops the RDAP parts no history reader uses — notices, remarks (the
+/// object's and every entity's) and unknown extension members — keeping
+/// everything [`crate::DomainInfo::from_lookup_result`] (drift) and the
+/// listings read: events, status, entities with their vCards, public IDs and
+/// links, nameservers and DNSSEC. Idempotent. Raw WHOIS bodies are never
+/// serialized, so WHOIS results need nothing.
+fn slim(result: &mut LookupResult) {
+    let LookupResult::Rdap { data, .. } = result else {
+        return;
+    };
+    data.notices.clear();
+    data.remarks.clear();
+    data.extra.clear();
+    // Iterative, so a deeply nested entity tree cannot exhaust the stack.
+    let mut pending = vec![&mut data.entities];
+    while let Some(entities) = pending.pop() {
+        for entity in entities.iter_mut() {
+            entity.remarks.clear();
+            pending.push(&mut entity.entities);
+        }
     }
 }
 
@@ -280,6 +310,86 @@ mod tests {
             1,
             "the WHOIS entry survives"
         );
+    }
+
+    fn rdap_result() -> LookupResult {
+        let rdap: crate::rdap::RdapResponse = serde_json::from_value(serde_json::json!({
+            "objectClassName": "domain",
+            "ldhName": "example.com",
+            "status": ["client transfer prohibited"],
+            "events": [{"eventAction": "expiration", "eventDate": "2030-01-01T00:00:00Z"}],
+            "entities": [{
+                "roles": ["registrar"],
+                "vcardArray": ["vcard", [["fn", {}, "text", "Example Registrar"]]],
+                "remarks": [{"description": ["entity remark"]}],
+                "entities": [{"roles": ["abuse"], "remarks": [{"description": ["nested"]}]}]
+            }],
+            "nameservers": [{"ldhName": "ns1.example.com"}],
+            "links": [{"rel": "self", "href": "https://rdap.example/domain/example.com"}],
+            "notices": [{"title": "Terms of Use", "description": ["a long legal text"]}],
+            "remarks": [{"description": ["object remark"]}],
+            "vendorExtension_blob": "x".repeat(4096),
+        }))
+        .expect("fixture RDAP response");
+        LookupResult::Rdap {
+            data: Box::new(rdap),
+            whois_fallback: None,
+        }
+    }
+
+    #[test]
+    fn recorded_results_are_slimmed_but_keep_what_readers_use() {
+        let full = rdap_result();
+        let mut history = LookupHistory::default();
+        history.record("example.com", full.clone());
+        let stored = &history.get("example.com")[0].result;
+
+        let LookupResult::Rdap { data, .. } = stored else {
+            panic!("RDAP result expected");
+        };
+        assert!(data.notices.is_empty() && data.remarks.is_empty() && data.extra.is_empty());
+        assert!(data.entities[0].remarks.is_empty());
+        assert!(data.entities[0].entities[0].remarks.is_empty());
+        assert!(
+            serde_json::to_string(stored).unwrap().len()
+                < serde_json::to_string(&full).unwrap().len() / 2
+        );
+
+        // Drift, the listing and the TUI read the same facts from it.
+        assert_eq!(stored.registrar(), full.registrar());
+        assert_eq!(stored.expiration_date(), full.expiration_date());
+        assert!(!crate::drift::DriftReport::from_lookups("example.com", &full, stored).has_drift());
+        let info = crate::DomainInfo::from_lookup_result(stored);
+        assert_eq!(
+            info.rdap_url.as_deref(),
+            Some("https://rdap.example/domain/example.com")
+        );
+    }
+
+    #[test]
+    fn a_file_written_under_the_old_caps_is_trimmed_on_the_next_record() {
+        // Old files held up to 50 full results per domain; they still load
+        // (same format) and shrink on the next save.
+        let mut old = LookupHistory::default();
+        let entry = |result| HistoryEntry {
+            domain: "example.com".to_string(),
+            timestamp: Utc::now(),
+            result,
+        };
+        old.entries.insert(
+            "example.com".to_string(),
+            (0..50).map(|_| entry(rdap_result())).collect(),
+        );
+        let json = serde_json::to_string(&old).unwrap();
+        let mut loaded: LookupHistory = serde_json::from_str(&json).expect("old format loads");
+
+        loaded.record("other.test", make_lookup_result("other.test"));
+        let kept = loaded.get("example.com");
+        assert_eq!(kept.len(), MAX_ENTRIES_PER_DOMAIN);
+        assert!(kept.iter().all(|e| matches!(
+            &e.result,
+            LookupResult::Rdap { data, .. } if data.notices.is_empty()
+        )));
     }
 
     /// Creates a unique temporary file path for a load-from-disk test.
