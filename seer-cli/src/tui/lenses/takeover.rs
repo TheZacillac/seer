@@ -19,6 +19,7 @@ fn verdict_tone(v: TakeoverVerdict) -> &'static str {
     match v {
         TakeoverVerdict::Vulnerable => "fail",
         TakeoverVerdict::Potential => "warn",
+        TakeoverVerdict::Inconclusive => "info",
         TakeoverVerdict::Safe => "ok",
     }
 }
@@ -29,6 +30,7 @@ fn verdict_label(v: TakeoverVerdict) -> &'static str {
         // tool that warrants dropping everything.
         TakeoverVerdict::Vulnerable => "VULNERABLE",
         TakeoverVerdict::Potential => "potential",
+        TakeoverVerdict::Inconclusive => "inconclusive",
         TakeoverVerdict::Safe => "safe",
     }
 }
@@ -169,6 +171,7 @@ mod tests {
             hosts_skipped: 0,
             vulnerable,
             potential,
+            inconclusive: 0,
             findings,
             notes: vec![],
         }

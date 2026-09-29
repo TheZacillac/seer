@@ -28,7 +28,9 @@
 //!
 //! Single attempt, with the caller's timeout bounding the TCP connect and the
 //! handshake separately — like the rest of `ssl`/`status`, a probe must not
-//! retry-mask flakiness.
+//! retry-mask flakiness. Trying a host's next address after the previous one
+//! failed is failover, not a retry: the addresses are tried IPv4 first, each
+//! with an equal share of what remains of the connect budget.
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -63,9 +65,9 @@ pub(crate) struct PresentedChain {
 /// `addrs` must already be SSRF-vetted — callers pass what
 /// [`crate::net::resolve_public_host`] returned — so the TCP connection is
 /// pinned to the validated addresses with no second lookup to rebind. The
-/// connect and the handshake are each bounded by `timeout` (surfacing as
-/// [`SeerError::Timeout`]); any other failure is wrapped by `err`, keeping
-/// each caller's own error variant.
+/// connect (across all of `addrs`, see [`connect_any`]) and the handshake are
+/// each bounded by `timeout` (surfacing as [`SeerError::Timeout`]); any other
+/// failure is wrapped by `err`, keeping each caller's own error variant.
 pub(crate) async fn inspect(
     host: &str,
     addrs: &[SocketAddr],
@@ -76,10 +78,12 @@ pub(crate) async fn inspect(
         .map_err(|e| err(format!("invalid TLS server name '{host}': {e}")))?;
     let config = inspect_config().map_err(|e| err(format!("TLS setup failed: {e}")))?;
 
-    let tcp = tokio::time::timeout(timeout, TcpStream::connect(addrs))
+    let tcp = connect_any(addrs, timeout, TcpStream::connect)
         .await
-        .map_err(|_| SeerError::Timeout(format!("connection to {host} timed out")))?
-        .map_err(|e| err(format!("failed to connect to {host}: {e}")))?;
+        .map_err(|e| match e {
+            ConnectError::TimedOut => SeerError::Timeout(format!("connection to {host} timed out")),
+            ConnectError::Io(e) => err(format!("failed to connect to {host}: {e}")),
+        })?;
     let tls = tokio::time::timeout(
         timeout,
         TlsConnector::from(Arc::new(config)).connect(server_name, tcp),
@@ -103,6 +107,55 @@ pub(crate) async fn inspect(
         intermediates: certs.collect(),
         protocol: conn.protocol_version().map(protocol_name),
     })
+}
+
+/// Why [`connect_any`] found no address to connect to.
+#[derive(Debug)]
+enum ConnectError {
+    /// The last address tried ran out of its share of the budget.
+    TimedOut,
+    /// The last address tried failed outright (or there were none).
+    Io(std::io::Error),
+}
+
+/// Connects to the first of `addrs` that accepts, IPv4 first, all within
+/// `timeout`.
+///
+/// Each address gets an equal share of the budget still left, and a failure
+/// or an expired share moves on to the next address. One connect over the
+/// whole list under a single deadline let a black-holed first address (an
+/// IPv6 route with no IPv6 transit) spend the entire budget, so a reachable
+/// IPv4 address behind it was never tried.
+async fn connect_any<T, F, Fut>(
+    addrs: &[SocketAddr],
+    timeout: Duration,
+    connect: F,
+) -> std::result::Result<T, ConnectError>
+where
+    F: Fn(SocketAddr) -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<T>>,
+{
+    let mut ordered = addrs.to_vec();
+    crate::net::ipv4_first(&mut ordered, SocketAddr::ip);
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut last = ConnectError::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        "no address to connect to",
+    ));
+    for (i, addr) in ordered.iter().enumerate() {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        // `ordered.len() - i` is at least 1: the addresses not yet tried.
+        let share = remaining / u32::try_from(ordered.len() - i).unwrap_or(u32::MAX);
+        match tokio::time::timeout(share, connect(*addr)).await {
+            Ok(Ok(stream)) => return Ok(stream),
+            Ok(Err(e)) => last = ConnectError::Io(e),
+            Err(_) => last = ConnectError::TimedOut,
+        }
+    }
+    Err(last)
 }
 
 fn protocol_name(version: ProtocolVersion) -> String {
@@ -199,29 +252,32 @@ fn describe_failure(e: &std::io::Error) -> String {
 
 /// Whether `cert` identifies `host`, per RFC 6125 §6.4.4.
 ///
-/// dNSName SANs are the DNS-IDs: when a certificate carries any, they alone
-/// decide, so a CN that happens to name `host` cannot rescue a cert issued for
-/// other hosts. The subject CN is a legacy fallback consulted only when there
-/// is no DNS-ID — an iPAddress SAN is not one. An IP-literal `host` also
-/// matches an equal iPAddress SAN.
+/// For a DNS `host`, dNSName SANs are the DNS-IDs: when a certificate carries
+/// any, they alone decide, so a CN that happens to name `host` cannot rescue a
+/// cert issued for other hosts. The subject CN is a legacy fallback consulted
+/// only when there is no DNS-ID — an iPAddress SAN is not one.
+///
+/// An IP-literal `host` matches only an equal iPAddress SAN: never a dNSName
+/// (not even one spelled as that IP), never a wildcard, and never the CN.
 pub(crate) fn cert_matches_host(cert: &X509Certificate<'_>, host: &str) -> bool {
-    let host_ip = host.parse::<IpAddr>().ok();
+    let san = cert.subject_alternative_name().ok().flatten();
+    let sans = san
+        .as_ref()
+        .map(|san| san.value.general_names.as_slice())
+        .unwrap_or_default();
+
+    if let Ok(host_ip) = host.parse::<IpAddr>() {
+        return sans.iter().any(
+            |name| matches!(name, GeneralName::IPAddress(bytes) if san_ip(bytes) == Some(host_ip)),
+        );
+    }
+
     let mut has_dns_id = false;
-    if let Ok(Some(san)) = cert.subject_alternative_name() {
-        for name in &san.value.general_names {
-            match name {
-                GeneralName::DNSName(pattern) => {
-                    has_dns_id = true;
-                    if hostname_matches_pattern(host, pattern) {
-                        return true;
-                    }
-                }
-                GeneralName::IPAddress(bytes)
-                    if san_ip(bytes).is_some_and(|ip| Some(ip) == host_ip) =>
-                {
-                    return true;
-                }
-                _ => {}
+    for name in sans {
+        if let GeneralName::DNSName(pattern) = name {
+            has_dns_id = true;
+            if hostname_matches_pattern(host, pattern) {
+                return true;
             }
         }
     }
@@ -233,16 +289,45 @@ pub(crate) fn cert_matches_host(cert: &X509Certificate<'_>, host: &str) -> bool 
             .any(|cn| hostname_matches_pattern(host, cn))
 }
 
+/// Whether `cert` names a wildcard (`*.example.com`) among its DNS-IDs — or,
+/// with none, in its CN — which is what makes CAA `issuewild` govern it.
+pub(crate) fn cert_names_wildcard(cert: &X509Certificate<'_>) -> bool {
+    let san = cert.subject_alternative_name().ok().flatten();
+    let dns_ids: Vec<&str> = san
+        .iter()
+        .flat_map(|san| &san.value.general_names)
+        .filter_map(|name| match name {
+            GeneralName::DNSName(pattern) => Some(*pattern),
+            _ => None,
+        })
+        .collect();
+    if dns_ids.is_empty() {
+        cert.subject()
+            .iter_common_name()
+            .filter_map(|cn| cn.as_str().ok())
+            .any(|cn| cn.starts_with("*."))
+    } else {
+        dns_ids.iter().any(|name| name.starts_with("*."))
+    }
+}
+
 /// Exact (case-insensitive) or single-label wildcard match per RFC 6125:
 /// `*.example.com` matches `a.example.com` but not `example.com` or
-/// `a.b.example.com`.
+/// `a.b.example.com`. A wildcard directly over a public suffix (`*.com`,
+/// `*.co.uk`) matches nothing (RFC 6125 §7.2): no CA may issue one, and
+/// honoring it would let one certificate claim a whole registry.
 fn hostname_matches_pattern(host: &str, pattern: &str) -> bool {
     let host = host.to_ascii_lowercase();
     let pattern = pattern.to_ascii_lowercase();
     match pattern.strip_prefix("*.") {
-        Some(rest) => host
-            .split_once('.')
-            .is_some_and(|(_, host_rest)| host_rest == rest),
+        Some(rest) => {
+            // `None` (unclassifiable, e.g. empty) is refused too.
+            let over_public_suffix = crate::psl::public_suffix(rest).is_none_or(|s| s == rest);
+            !over_public_suffix
+                && host
+                    .split_once('.')
+                    .is_some_and(|(_, host_rest)| host_rest == rest)
+        }
         None => host == pattern,
     }
 }
@@ -292,6 +377,11 @@ pub(crate) mod test_support {
     pub const CN_VICTIM_NO_SAN: &str = "MIIBhzCCAS2gAwIBAgIUeGkzmcc68l5FOH5NOBgS3Ybcg4gwCgYIKoZIzj0EAwIwGTEXMBUGA1UEAwwOdmljdGltLmV4YW1wbGUwHhcNMjYwOTIyMTcwMzA4WhcNMzYwOTE5MTcwMzA4WjAZMRcwFQYDVQQDDA52aWN0aW0uZXhhbXBsZTBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABC6rgHiHBhd3vxpcRHm7VH2YgCybc0Bl4ewS1lMjdtM5+R+pX/STje36olq5IDx9AEJfxtdRMvtiWp9jfb5vdB6jUzBRMB0GA1UdDgQWBBS5JfZqENT0bfsAazBNLiAVb77UdzAfBgNVHSMEGDAWgBS5JfZqENT0bfsAazBNLiAVb77UdzAPBgNVHRMBAf8EBTADAQH/MAoGCCqGSM49BAMCA0gAMEUCIQD5zMnpSHSVr3vSmZM0vh0R345Rg3wc+OgeZwmsDxDJQQIgBNJ0CS0bpChCAQls0oFZUPD6u7iX7uBOD/QRPZ2Ub1k=";
     /// Self-signed `CN=victim.example`, SAN `IP:203.0.113.7` only.
     pub const CN_VICTIM_SAN_IP: &str = "MIIBmTCCAUCgAwIBAgIUNLKX5hfp150WybxH1TK4/buhJpkwCgYIKoZIzj0EAwIwGTEXMBUGA1UEAwwOdmljdGltLmV4YW1wbGUwIBcNMjYwOTIzMDAxNzA0WhgPMjEyNjA4MzAwMDE3MDRaMBkxFzAVBgNVBAMMDnZpY3RpbS5leGFtcGxlMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE34KvRRWyPfrfW30NuPRHBL/o0xYniAlVPTcjaEbsksvvSTPk0uPM2FA9GSrD8YQa+BqxdfCjZ3vMARvA95A9e6NkMGIwHQYDVR0OBBYEFCUaB8nqqyd/yXM9pZGqBITswjqTMB8GA1UdIwQYMBaAFCUaB8nqqyd/yXM9pZGqBITswjqTMA8GA1UdEwEB/wQFMAMBAf8wDwYDVR0RBAgwBocEywBxBzAKBggqhkjOPQQDAgNHADBEAiBpAbhxdLJCQWa6M9mMTKL+iXYo1FMxb0BZYOTngYts5wIgIDTiVbjBH69Uozws5X7IxMhoeF7dNXNaSzo+Fnd2zEM=";
+    /// Self-signed `CN=ip-san.test`, SAN `DNS:203.0.113.7` — an IP spelled as
+    /// a dNSName.
+    pub const IP_AS_DNS_SAN: &str = "MIIBajCCAQ+gAwIBAgIUdwgLtZDfJmy8UPeacHKtAoZ8H5MwCgYIKoZIzj0EAwIwFjEUMBIGA1UEAwwLaXAtc2FuLnRlc3QwIBcNMjYwOTI5MjIyMzM5WhgPMjEyNjA5MDUyMjIzMzlaMBYxFDASBgNVBAMMC2lwLXNhbi50ZXN0MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE9F4YomuPpoc632PRWNRl/z4c+UgSmnq8zFfQzlrK7BsXz12WlZyjMjEYV+6KZqc92wpvgZRySQGMPWCFFmxSBKM5MDcwFgYDVR0RBA8wDYILMjAzLjAuMTEzLjcwHQYDVR0OBBYEFN+libei1oT7npYAJ4yTCK60973rMAoGCCqGSM49BAMCA0kAMEYCIQDgXs7tU+LfqPni/An8TZL5fFS7h93XolVrh5Ft6DbcGgIhAPoF8r+nABXhCI29ZbmttYOViq7Rtmk1Cfw6Cxoh0XmP";
+    /// Self-signed `CN=203.0.113.7`, no SAN extension.
+    pub const IP_AS_CN: &str = "MIIBUDCB96ADAgECAhRUAemdH7MCs7oDFOpSVTfRmv+T0TAKBggqhkjOPQQDAjAWMRQwEgYDVQQDDAsyMDMuMC4xMTMuNzAgFw0yNjA5MjkyMjIzMzlaGA8yMTI2MDkwNTIyMjMzOVowFjEUMBIGA1UEAwwLMjAzLjAuMTEzLjcwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAT0Xhiia4+mhzrfY9FY1GX/Phz5SBKaerzMV9DOWsrsGxfPXZaVnKMyMRhX7opmpz3bCm+BlHJJAYw9YIUWbFIEoyEwHzAdBgNVHQ4EFgQU36WJt6LWhPuelgAnjJMIrrT3veswCgYIKoZIzj0EAwIDSAAwRQIgSETkgyazOKOFB9Z6+YVzQpanKxgb0y1TGbezd1wgXWMCIQCKVk3UIzGUyeEXrbDN+vzP8N4WtaBgDMFDeCg6MdQUvQ==";
     // Legacy leaves webpki's strict parser or aws-lc-rs' RSA floor refuse,
     // which inspection must still read. Self-signed, valid until 2126, made
     // with the openssl 3 CLI under an empty `-config` (no default v3_ca
@@ -416,6 +506,92 @@ mod tests {
         ));
         assert!(!hostname_matches_pattern("b.other.com", "*.example.com"));
         assert!(!hostname_matches_pattern("localhost", "*.example.com"));
+    }
+
+    #[test]
+    fn a_wildcard_over_a_public_suffix_matches_nothing() {
+        assert!(!hostname_matches_pattern("example.com", "*.com"));
+        assert!(!hostname_matches_pattern("example.co.uk", "*.co.uk"));
+        // An unlisted TLD is its own suffix (the PSL's implicit `*` rule).
+        assert!(!hostname_matches_pattern("a.zzunlisted", "*.zzunlisted"));
+        assert!(!hostname_matches_pattern("a.", "*."));
+        // One label below the suffix is an ordinary wildcard.
+        assert!(hostname_matches_pattern(
+            "a.example.co.uk",
+            "*.example.co.uk"
+        ));
+    }
+
+    /// Regression: an IP host was matched against dNSName SANs and the CN,
+    /// neither of which can identify an address.
+    #[test]
+    fn an_ip_host_matches_only_an_ip_san() {
+        let matches = |b64: &str, host: &str| {
+            let der = cert(b64);
+            let (_, x509) = X509Certificate::from_der(&der).unwrap();
+            cert_matches_host(&x509, host)
+        };
+        // SAN DNS:203.0.113.7 only — a dNSName spelled as the IP.
+        assert!(!matches(IP_AS_DNS_SAN, "203.0.113.7"));
+        // No SAN, CN=203.0.113.7.
+        assert!(!matches(IP_AS_CN, "203.0.113.7"));
+        // An iPAddress SAN still matches.
+        assert!(matches(CN_VICTIM_SAN_IP, "203.0.113.7"));
+    }
+
+    #[tokio::test]
+    async fn connect_tries_ipv4_first() {
+        let v6: SocketAddr = "[2001:db8::1]:443".parse().unwrap();
+        let v4: SocketAddr = "192.0.2.1:443".parse().unwrap();
+        let tried = std::sync::Mutex::new(Vec::new());
+        let got = connect_any(&[v6, v4], TIMEOUT, |addr| {
+            tried.lock().unwrap().push(addr);
+            async move { Ok::<_, std::io::Error>(addr) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(got, v4);
+        assert_eq!(*tried.lock().unwrap(), [v4]);
+    }
+
+    /// Regression: one connect over the whole list under one deadline let a
+    /// black-holed first address spend the entire budget.
+    #[tokio::test]
+    async fn a_hanging_address_leaves_budget_for_the_next() {
+        let dead: SocketAddr = "192.0.2.1:443".parse().unwrap();
+        let live: SocketAddr = "192.0.2.2:443".parse().unwrap();
+        let got = connect_any(
+            &[dead, live],
+            Duration::from_millis(400),
+            |addr| async move {
+                if addr == dead {
+                    std::future::pending::<()>().await;
+                }
+                Ok::<_, std::io::Error>(addr)
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(got, live);
+
+        // A refusal moves on at once; all failing reports the last failure.
+        let err = connect_any(&[dead, live], TIMEOUT, |_| async {
+            Err::<(), _>(std::io::Error::from(std::io::ErrorKind::ConnectionRefused))
+        })
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, ConnectError::Io(ref e) if e.kind() == std::io::ErrorKind::ConnectionRefused),
+            "got {err:?}"
+        );
+
+        // Every address hanging is a timeout.
+        let err = connect_any(&[dead], Duration::from_millis(50), |_| async {
+            std::future::pending::<std::io::Result<()>>().await
+        })
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ConnectError::TimedOut), "got {err:?}");
     }
 
     #[tokio::test]

@@ -47,7 +47,7 @@ use super::query::{
 };
 use super::records::{DnsRecord, RecordData, RecordType, SvcParam};
 use super::transport::{NoResponse, Transport};
-use super::{ipv4_first, DEFAULT_DNS_TIMEOUT};
+use super::DEFAULT_DNS_TIMEOUT;
 use crate::error::{Result, SeerError};
 use crate::validation::{normalize_domain, normalize_query_name};
 
@@ -213,8 +213,11 @@ fn build_upstream_config(
     // hickory's `lookup_ip` returns AAAA before A, so a dual-stack hostname
     // (`dns.google`, `https://cloudflare-dns.com/dns-query`) led with two
     // IPv6 entries; with black-holed IPv6 transit they spent the whole
-    // deadline and the IPv4 entries were never reached.
-    for ip in ipv4_first(ips.to_vec()) {
+    // deadline and the IPv4 entries were never reached. IPv6 stays as
+    // fallback: on an IPv6-only host IPv4 sends fail fast (ENETUNREACH).
+    let mut ordered = ips.to_vec();
+    crate::net::ipv4_first(&mut ordered, |ip| *ip);
+    for ip in ordered {
         let mut ns = match spec.protocol {
             NameserverProtocol::Udp => NameServerConfig::udp(ip),
             NameserverProtocol::Tls => NameServerConfig::tls(ip, Arc::from(spec.tls_name())),

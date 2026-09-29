@@ -678,6 +678,7 @@ fn takeover<'py>(
             &result.domain,
             result.subdomains,
             concurrency,
+            seer_core::DEFAULT_TAKEOVER_TIMEOUT,
         )
         .await
     })?;

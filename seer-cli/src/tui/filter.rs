@@ -124,6 +124,11 @@ pub fn apply(data: &LensData, filter: &str) -> Option<LensData> {
                 .iter()
                 .filter(|f| f.verdict == seer_core::TakeoverVerdict::Potential)
                 .count();
+            r.inconclusive = r
+                .findings
+                .iter()
+                .filter(|f| f.verdict == seer_core::TakeoverVerdict::Inconclusive)
+                .count();
             Some(LensData::Takeover(Box::new(r)))
         }
         LensData::Prop(p) => {
@@ -224,6 +229,7 @@ mod tests {
             hosts_skipped: 0,
             vulnerable: 1,
             potential: 2,
+            inconclusive: 0,
             findings: vec![
                 mk("api.example.com", TakeoverVerdict::Vulnerable),
                 mk("mail.example.com", TakeoverVerdict::Potential),

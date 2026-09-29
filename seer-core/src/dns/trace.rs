@@ -87,9 +87,8 @@ use hickory_resolver::TokioResolver;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, instrument};
 
-use super::delegation::{
-    build_recursive_resolver, ipv4_first, is_local_no_route, partition_reserved, DEFAULT_TIMEOUT,
-};
+use super::delegation::{build_recursive_resolver, is_local_no_route, partition_reserved};
+use super::DEFAULT_DNS_TIMEOUT;
 use super::query::{duration_ms, DnsStatus};
 use super::records::{DnsRecord, RecordType};
 use super::resolver::{fqdn, prepare_query, to_dns_record, wire_query_name, wire_type};
@@ -270,9 +269,9 @@ impl DnsTracer {
     /// DNS for glueless nameserver lookups).
     pub fn new() -> Self {
         Self {
-            timeout: DEFAULT_TIMEOUT,
-            transport: Transport::new(DEFAULT_TIMEOUT),
-            recursive: build_recursive_resolver(DEFAULT_TIMEOUT, None),
+            timeout: DEFAULT_DNS_TIMEOUT,
+            transport: Transport::new(DEFAULT_DNS_TIMEOUT),
+            recursive: build_recursive_resolver(DEFAULT_DNS_TIMEOUT, None),
             #[cfg(test)]
             recursive_upstream: None,
             #[cfg(test)]
@@ -694,7 +693,9 @@ impl DnsTracer {
         if usable.is_empty() && notes.is_empty() {
             notes.push(format!("{text}: glueless nameserver has no address"));
         }
-        (ipv4_first(usable), notes)
+        let mut usable = usable;
+        crate::net::ipv4_first(&mut usable, |ip| *ip);
+        (usable, notes)
     }
 
     /// Sends one non-recursive query to `ip` and returns the response as the
@@ -847,7 +848,9 @@ fn plan_servers(servers: &[NsCandidate], allow_private: bool) -> (Vec<ServerPick
                 .map(|(ip, reason)| server_note(&server.host, *ip, &format!("refused, {reason}"))),
         );
         if !usable.is_empty() {
-            picks.push(ServerPick::Addrs(server.host.clone(), ipv4_first(usable)));
+            let mut usable = usable;
+            crate::net::ipv4_first(&mut usable, |ip| *ip);
+            picks.push(ServerPick::Addrs(server.host.clone(), usable));
         }
     }
     picks.extend(glueless);

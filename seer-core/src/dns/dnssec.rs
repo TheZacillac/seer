@@ -20,7 +20,7 @@ use hickory_resolver::TokioResolver;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, instrument};
 
-use super::delegation::DEFAULT_TIMEOUT;
+use super::DEFAULT_DNS_TIMEOUT;
 use super::resolver::{apply_standard_opts, fqdn, google_or_pinned};
 use crate::error::Result;
 
@@ -161,8 +161,8 @@ impl Default for DnssecChecker {
 impl DnssecChecker {
     pub fn new() -> Self {
         Self {
-            resolver: Self::build_resolver(None, DEFAULT_TIMEOUT),
-            timeout: DEFAULT_TIMEOUT,
+            resolver: Self::build_resolver(None, DEFAULT_DNS_TIMEOUT),
+            timeout: DEFAULT_DNS_TIMEOUT,
             #[cfg(test)]
             upstream: None,
         }

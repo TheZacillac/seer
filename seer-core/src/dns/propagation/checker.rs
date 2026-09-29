@@ -11,7 +11,7 @@ use super::analysis::{
 };
 use super::servers::default_dns_servers;
 use super::types::{DnsServer, NameserverDetails, PropagationResult, ServerResult};
-use crate::dns::delegation::DEFAULT_TIMEOUT;
+use crate::dns::DEFAULT_DNS_TIMEOUT;
 use crate::dns::query::{DnsQueryResult, DnsStatus};
 use crate::dns::records::{RecordData, RecordType};
 use crate::dns::resolver::{DnsResolver, ServerReply};
@@ -56,7 +56,7 @@ impl PropagationChecker {
         Self {
             resolver: DnsResolver::new(),
             servers: default_dns_servers().to_vec(),
-            query_timeout: DEFAULT_TIMEOUT,
+            query_timeout: DEFAULT_DNS_TIMEOUT,
         }
     }
 

@@ -34,7 +34,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
-use crate::http::{FetchedResponse, GuardedFetcher};
+use crate::http::{GuardedFetcher, ResponseHead};
 use crate::validation::normalize_host;
 
 /// A coarse enforcement verdict for one header or cookie. This is
@@ -198,9 +198,14 @@ fn grade_hsts(value: Option<&str>, over_https: bool) -> (HeaderVerdict, Option<S
         );
     }
     let attrs = parse_attributes(value);
-    // RFC 6797 allows the value as a token or a quoted-string.
-    let max_age: Option<u64> =
-        attr(&attrs, "max-age").and_then(|v| v.trim().trim_matches('"').parse().ok());
+    // RFC 6797 allows the value as a token or a quoted-string. The grammar is
+    // `1*DIGIT` with no upper bound, so a value past u64 is a (very long)
+    // valid max-age, not a missing one.
+    let max_age: Option<u64> = attr(&attrs, "max-age").and_then(|v| {
+        let digits = v.trim().trim_matches('"');
+        (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| digits.parse().unwrap_or(u64::MAX))
+    });
     let include_subdomains = attr(&attrs, "includesubdomains").is_some();
 
     match max_age {
@@ -269,11 +274,16 @@ fn csp_directive<'a>(policy: &'a CspPolicy, name: &str) -> Option<&'a [String]> 
 enum ScriptControl {
     /// Neither `script-src` nor `default-src`: scripts are unrestricted.
     None,
-    /// Restricted, but through the named unsafe keywords.
+    /// Restricted, but opened back up by the named unsafe keywords or
+    /// any-origin sources.
     Unsafe(Vec<&'static str>),
-    /// Restricted with no effective unsafe keyword.
+    /// Restricted with no effective unsafe keyword or any-origin source.
     Safe,
 }
+
+/// Source expressions that admit script from any origin (or inline, for
+/// `data:`), which defeats a script policy as surely as `'unsafe-inline'`.
+const PERMISSIVE_SCRIPT_SOURCES: [&str; 4] = ["*", "http:", "https:", "data:"];
 
 fn script_control(policy: &CspPolicy) -> ScriptControl {
     // `script-src` governs scripts; `default-src` is only its fallback.
@@ -299,6 +309,11 @@ fn script_control(policy: &CspPolicy) -> ScriptControl {
     }
     if has("'unsafe-eval'") {
         unsafe_kw.push("'unsafe-eval'");
+    }
+    // CSP3 'strict-dynamic' makes browsers ignore host and scheme sources,
+    // so these only open the policy up without it.
+    if !has("'strict-dynamic'") {
+        unsafe_kw.extend(PERMISSIVE_SCRIPT_SOURCES.into_iter().filter(|src| has(src)));
     }
     if unsafe_kw.is_empty() {
         ScriptControl::Safe
@@ -360,27 +375,80 @@ fn grade_csp(policies: &[CspPolicy], report_only: bool) -> (HeaderVerdict, Optio
     )
 }
 
+/// How the enforced CSP policies' `frame-ancestors` constrain framing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrameAncestors {
+    /// No policy sets `frame-ancestors`.
+    Unset,
+    /// Set, but every policy that sets it admits any origin (`*`, `http:`,
+    /// `https:`).
+    AnyOrigin,
+    /// At least one policy restricts framing.
+    Restricted,
+}
+
+fn frame_ancestors(csp_policies: &[CspPolicy]) -> FrameAncestors {
+    let mut state = FrameAncestors::Unset;
+    for sources in csp_policies
+        .iter()
+        .filter_map(|p| csp_directive(p, "frame-ancestors"))
+    {
+        // Framing must satisfy every policy, so one restrictive policy wins.
+        if sources
+            .iter()
+            .any(|s| matches!(s.as_str(), "*" | "http:" | "https:"))
+        {
+            state = FrameAncestors::AnyOrigin;
+        } else {
+            return FrameAncestors::Restricted;
+        }
+    }
+    state
+}
+
 fn grade_frame_options(
     value: Option<&str>,
     csp_policies: &[CspPolicy],
 ) -> (HeaderVerdict, Option<String>) {
     // CSP frame-ancestors supersedes X-Frame-Options in every current browser;
     // a site that sets it is protected even with no XFO header at all — and
-    // browsers ignore XFO entirely when frame-ancestors is present.
-    let csp_frame_ancestors = csp_policies
-        .iter()
-        .any(|p| csp_directive(p, "frame-ancestors").is_some());
-
-    let Some(value) = value else {
-        if csp_frame_ancestors {
+    // browsers ignore XFO entirely when frame-ancestors is present, so one
+    // that admits any origin leaves the page frameable whatever XFO says.
+    match frame_ancestors(csp_policies) {
+        FrameAncestors::AnyOrigin => {
             return (
-                HeaderVerdict::Present,
+                HeaderVerdict::Weak,
                 Some(
-                    "No X-Frame-Options, but CSP frame-ancestors is set, which supersedes it."
+                    "CSP frame-ancestors admits any origin, and browsers ignore X-Frame-Options when it is set; list the allowed origins (or 'none')."
                         .into(),
                 ),
-            );
+            )
         }
+        FrameAncestors::Restricted => {
+            return match value.map(|v| v.trim().to_ascii_uppercase()) {
+                Some(v) if v == "DENY" || v == "SAMEORIGIN" => (HeaderVerdict::Strict, None),
+                None => (
+                    HeaderVerdict::Present,
+                    Some(
+                        "No X-Frame-Options, but CSP frame-ancestors is set, which supersedes it."
+                            .into(),
+                    ),
+                ),
+                // An obsolete or invalid XFO is harmless once frame-ancestors
+                // is set: that is exactly the migration the ALLOW-FROM advice
+                // recommends.
+                Some(other) => (
+                    HeaderVerdict::Present,
+                    Some(format!(
+                        "X-Frame-Options '{other}' is not a valid value, but CSP frame-ancestors is set and supersedes it."
+                    )),
+                ),
+            };
+        }
+        FrameAncestors::Unset => {}
+    }
+
+    let Some(value) = value else {
         return (
             HeaderVerdict::Absent,
             Some(
@@ -392,14 +460,6 @@ fn grade_frame_options(
 
     match value.trim().to_ascii_uppercase().as_str() {
         "DENY" | "SAMEORIGIN" => (HeaderVerdict::Strict, None),
-        // An obsolete or invalid XFO is harmless once frame-ancestors is set:
-        // that is exactly the migration the ALLOW-FROM advice recommends.
-        other if csp_frame_ancestors => (
-            HeaderVerdict::Present,
-            Some(format!(
-                "X-Frame-Options '{other}' is not a valid value, but CSP frame-ancestors is set and supersedes it."
-            )),
-        ),
         v if v.starts_with("ALLOW-FROM") => (
             HeaderVerdict::Weak,
             Some(
@@ -604,7 +664,7 @@ const DISCLOSURE_HEADERS: &[&str] = &[
     "x-drupal-cache",
 ];
 
-fn collect_disclosures(response: &FetchedResponse) -> Vec<Disclosure> {
+fn collect_disclosures(response: &ResponseHead) -> Vec<Disclosure> {
     DISCLOSURE_HEADERS
         .iter()
         .filter_map(|name| {
@@ -701,7 +761,7 @@ fn build_notes(
 
 /// Grades an already-fetched response. Pure, so the whole ruleset is
 /// unit-testable without any network.
-fn build_report(domain: String, response: &FetchedResponse) -> HeaderReport {
+fn build_report(domain: String, response: &ResponseHead) -> HeaderReport {
     let csp_policies = parse_csp_policies(response.header_all("content-security-policy"));
     let csp_report_only = response
         .header("content-security-policy-report-only")
@@ -849,7 +909,9 @@ pub async fn audit_headers(domain: &str, timeout: Duration) -> Result<HeaderRepo
     // different headers) than the apex, so `www.` is kept.
     let domain = normalize_host(domain)?;
     let fetcher = GuardedFetcher::new().with_timeout(timeout);
-    let response = fetcher.get(&format!("https://{domain}/")).await?;
+    // Only the status line and headers are graded, so the body is never read:
+    // one that stalls or resets must not fail the audit.
+    let response = fetcher.get_head(&format!("https://{domain}/")).await?;
     Ok(build_report(domain, &response))
 }
 
@@ -859,15 +921,14 @@ mod tests {
 
     /// Builds a synthetic response so the grading rules can be tested without
     /// any network.
-    fn response_with(headers: &[(&str, &str)]) -> FetchedResponse {
-        FetchedResponse {
+    fn response_with(headers: &[(&str, &str)]) -> ResponseHead {
+        ResponseHead {
             final_url: "https://example.com/".to_string(),
             status: 200,
             headers: headers
                 .iter()
                 .map(|(k, v)| (k.to_ascii_lowercase(), v.to_string()))
                 .collect(),
-            body: String::new(),
             redirects: 0,
         }
     }
@@ -902,6 +963,23 @@ mod tests {
         );
     }
 
+    /// Regression: a max-age past u64 failed to parse and was reported as
+    /// "missing or zero".
+    #[test]
+    fn hsts_max_age_beyond_u64_is_a_long_max_age() {
+        let huge = "max-age=99999999999999999999999999; includeSubDomains";
+        assert_eq!(grade_hsts(Some(huge), true).0, HeaderVerdict::Strict);
+        // Non-digits still do not count.
+        assert_eq!(
+            grade_hsts(Some("max-age=1e9; includeSubDomains"), true).0,
+            HeaderVerdict::Weak
+        );
+        assert_eq!(
+            grade_hsts(Some("max-age=-1; includeSubDomains"), true).0,
+            HeaderVerdict::Weak
+        );
+    }
+
     #[test]
     fn csp_unsafe_directives_are_weak() {
         assert_eq!(
@@ -924,6 +1002,65 @@ mod tests {
         assert_eq!(grade_csp(&[], false).0, HeaderVerdict::Absent);
         // Report-Only alone blocks nothing, but is better than silence.
         assert_eq!(grade_csp(&[], true).0, HeaderVerdict::Weak);
+    }
+
+    /// Regression: any-origin script sources were graded Strict.
+    #[test]
+    fn csp_any_origin_script_sources_are_weak() {
+        for policy in [
+            "script-src *",
+            "script-src 'self' https:",
+            "script-src 'self' http:",
+            "script-src 'self' data:",
+            // default-src is the fallback when script-src is absent.
+            "default-src 'self' *",
+        ] {
+            let (verdict, note) = grade_csp(&csp(&[policy]), false);
+            assert_eq!(verdict, HeaderVerdict::Weak, "{policy}");
+            assert!(note.is_some(), "{policy}");
+        }
+        // script-src governs alone when present: a permissive default-src
+        // does not reach scripts.
+        assert_eq!(
+            grade_csp(&csp(&["default-src *; script-src 'self'"]), false).0,
+            HeaderVerdict::Strict
+        );
+        // A host source is not any-origin.
+        assert_eq!(
+            grade_csp(&csp(&["script-src 'self' https://cdn.example.com"]), false).0,
+            HeaderVerdict::Strict
+        );
+        // 'strict-dynamic' makes browsers ignore host and scheme sources.
+        assert_eq!(
+            grade_csp(
+                &csp(&["script-src 'nonce-r4nd' 'strict-dynamic' https: http:"]),
+                false
+            )
+            .0,
+            HeaderVerdict::Strict
+        );
+    }
+
+    /// Regression: `frame-ancestors *` counted as superseding XFO, though it
+    /// permits framing by anyone (and switches XFO off in browsers).
+    #[test]
+    fn any_origin_frame_ancestors_does_not_protect() {
+        for fa in ["frame-ancestors *", "frame-ancestors https:"] {
+            assert_eq!(
+                grade_frame_options(Some("DENY"), &csp(&[fa])).0,
+                HeaderVerdict::Weak,
+                "{fa}"
+            );
+            assert_eq!(
+                grade_frame_options(None, &csp(&[fa])).0,
+                HeaderVerdict::Weak
+            );
+        }
+        // A second, restrictive policy still protects: framing must satisfy both.
+        assert_eq!(
+            grade_frame_options(None, &csp(&["frame-ancestors *", "frame-ancestors 'self'"])).0,
+            HeaderVerdict::Present
+        );
     }
 
     #[test]

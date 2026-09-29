@@ -1893,6 +1893,7 @@ mod exit_code_tests {
                 hosts_skipped: 0,
                 vulnerable,
                 potential,
+                inconclusive: 0,
                 findings: vec![],
                 notes: vec![],
             }))

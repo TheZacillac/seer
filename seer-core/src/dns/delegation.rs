@@ -60,12 +60,9 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, instrument};
 
 use super::resolver::{apply_standard_opts, fqdn, google_or_pinned, single_server_config};
+use super::DEFAULT_DNS_TIMEOUT;
 use crate::error::{Result, SeerError};
 use crate::validation::normalize_domain;
-
-/// Default per-query timeout, matching the DNS resolver default. Shared with
-/// the other direct-query modules (`trace`, `dnssec`, `propagation`).
-pub(super) const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The whole check's deadline, in per-query timeouts. An address lookup is
 /// held to one timeout, but a lookup or query that hickory retransmits
@@ -229,8 +226,8 @@ impl DelegationChecker {
     /// timeout, Google DNS as the recursive resolver).
     pub fn new() -> Self {
         Self {
-            timeout: DEFAULT_TIMEOUT,
-            recursive: build_recursive_resolver(DEFAULT_TIMEOUT, None),
+            timeout: DEFAULT_DNS_TIMEOUT,
+            recursive: build_recursive_resolver(DEFAULT_DNS_TIMEOUT, None),
             #[cfg(test)]
             recursive_upstream: None,
             #[cfg(test)]
@@ -567,7 +564,7 @@ impl DelegationChecker {
     }
 
     /// Resolves the usable (public, unless the test seam allows private)
-    /// addresses of a nameserver host, IPv4 first ([`ipv4_first`]). Errors
+    /// addresses of a nameserver host, IPv4 first ([`crate::net::ipv4_first`]). Errors
     /// carry a human-readable reason for the report's warnings.
     async fn resolve_host_ips(&self, host: &str) -> std::result::Result<Vec<IpAddr>, String> {
         // The resolver re-sends a query that timed out (`attempts`), so only
@@ -590,7 +587,9 @@ impl DelegationChecker {
                 None => format!("{} did not resolve to a usable address", host),
             });
         }
-        Ok(ipv4_first(vetted))
+        let mut vetted = vetted;
+        crate::net::ipv4_first(&mut vetted, |ip| *ip);
+        Ok(vetted)
     }
 
     /// Asks `host` for `domain`'s NS set (RD=0) on its addresses in turn,
@@ -822,16 +821,6 @@ fn parent_zone_of(domain: &str) -> String {
         .unwrap_or_else(|| domain.to_string())
 }
 
-/// Orders a server's vetted addresses for querying: IPv4 first — gTLD
-/// servers commonly list AAAA first, and IPv6 is unroutable on many hosts —
-/// then IPv6, each family in the order given. A later address is tried only
-/// when this host has no route to the earlier ones, so an IPv6-only host
-/// still reaches the server. Shared with the trace walker.
-pub(super) fn ipv4_first(mut addrs: Vec<IpAddr>) -> Vec<IpAddr> {
-    addrs.sort_by_key(IpAddr::is_ipv6);
-    addrs
-}
-
 /// SSRF vetting for nameserver addresses, which come from untrusted DNS data
 /// (resolved NS names here, glue in the trace walker): splits `ips` into the
 /// addresses a direct query may be sent to and the refused ones, each with
@@ -973,19 +962,6 @@ mod tests {
     fn ns_name_normalization_is_case_and_dot_insensitive() {
         assert_eq!(normalize_ns_name("NS1.Example.COM."), "ns1.example.com");
         assert_eq!(normalize_ns_name("ns1.example.com"), "ns1.example.com");
-    }
-
-    #[test]
-    fn probe_addresses_are_ordered_ipv4_first() {
-        // gTLD servers often list AAAA first; an IPv4-only host must not be
-        // handed an unreachable v6 address first when a v4 one exists.
-        let v6: IpAddr = "2001:503:a83e::2:30".parse().unwrap();
-        let v4: IpAddr = "192.5.6.30".parse().unwrap();
-        let v4b: IpAddr = "192.5.6.31".parse().unwrap();
-        assert_eq!(ipv4_first(vec![v6, v4, v4b]), vec![v4, v4b, v6]);
-        // IPv6-only deployments still get the v6 address.
-        assert_eq!(ipv4_first(vec![v6]), vec![v6]);
-        assert!(ipv4_first(vec![]).is_empty());
     }
 
     #[test]

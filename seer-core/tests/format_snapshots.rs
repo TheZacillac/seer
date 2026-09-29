@@ -1496,6 +1496,7 @@ fn fixture_takeover() -> TakeoverReport {
         hosts_skipped: 3,
         vulnerable: 1,
         potential: 1,
+        inconclusive: 0,
         findings: vec![
             TakeoverFinding {
                 host: "docs.example.com".into(),

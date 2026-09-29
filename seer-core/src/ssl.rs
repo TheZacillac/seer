@@ -252,10 +252,11 @@ impl SslChecker {
         }
     }
 
-    /// Sets the timeout for the TCP connect and TLS handshake.
+    /// Sets the timeout for the TCP connect and TLS handshake, and for the
+    /// CAA lookup's DNS queries on the resolver already configured.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
-        self.dns_resolver = DnsResolver::new().with_timeout(timeout);
+        self.dns_resolver = self.dns_resolver.with_timeout(timeout);
         self
     }
 
@@ -333,7 +334,13 @@ fn build_report(
 
     // Annotate the CAA policy with the issuer comparison before
     // attaching it to the report.
-    caa_policy.issuer_match = Some(caa::classify_issuer(&leaf_detail.issuer, &caa_policy));
+    // RFC 8659 §4.3: `issuewild` governs a wildcard certificate.
+    let wildcard = crate::tls::cert_names_wildcard(&x509);
+    caa_policy.issuer_match = Some(caa::classify_issuer(
+        &leaf_detail.issuer,
+        &caa_policy,
+        wildcard,
+    ));
 
     // Derive posture warnings from the parsed leaf (pure post-processing).
     let warnings =
@@ -404,7 +411,7 @@ fn parse_cert_detail(cert: &X509Certificate) -> Result<CertDetail> {
 
     let serial_number = cert.serial.to_str_radix(16);
 
-    let signature_algorithm = oid_to_name(&cert.signature_algorithm.algorithm);
+    let signature_algorithm = Some(oid_to_name(&cert.signature_algorithm.algorithm));
 
     let is_ca = cert.is_ca();
 
@@ -429,7 +436,7 @@ fn parse_cert_detail(cert: &X509Certificate) -> Result<CertDetail> {
 fn extract_key_info(spki: &SubjectPublicKeyInfo) -> (Option<String>, Option<u32>) {
     use x509_parser::public_key::PublicKey;
     let oid = &spki.algorithm.algorithm;
-    let key_type = oid_to_key_type(oid);
+    let key_type = Some(oid_to_key_type(oid));
     let key_bits = match spki.parsed() {
         Ok(PublicKey::RSA(rsa)) => Some(rsa.key_size() as u32),
         Ok(PublicKey::EC(ec)) => Some(ec.key_size() as u32),
@@ -438,39 +445,41 @@ fn extract_key_info(spki: &SubjectPublicKeyInfo) -> (Option<String>, Option<u32>
     (key_type, key_bits)
 }
 
-/// Maps common OIDs to human-readable algorithm names.
-fn oid_to_name(oid: &Oid) -> Option<String> {
-    let oid_str = format!("{}", oid);
-    match oid_str.as_str() {
-        "1.2.840.113549.1.1.11" => Some("SHA-256 with RSA".to_string()),
-        "1.2.840.113549.1.1.12" => Some("SHA-384 with RSA".to_string()),
-        "1.2.840.113549.1.1.13" => Some("SHA-512 with RSA".to_string()),
-        "1.2.840.113549.1.1.5" => Some("SHA-1 with RSA".to_string()),
+/// Maps common OIDs to human-readable algorithm names; any other OID is
+/// shown in dotted form.
+fn oid_to_name(oid: &Oid) -> String {
+    let name = match oid.to_id_string().as_str() {
+        "1.2.840.113549.1.1.11" => "SHA-256 with RSA",
+        "1.2.840.113549.1.1.12" => "SHA-384 with RSA",
+        "1.2.840.113549.1.1.13" => "SHA-512 with RSA",
+        "1.2.840.113549.1.1.5" => "SHA-1 with RSA",
         // Deprecated algorithms are named (rather than left as raw OIDs) so
         // the "sha1"/"md5" signature warning can recognize them.
-        "1.2.840.113549.1.1.4" => Some("MD5 with RSA".to_string()),
-        "1.2.840.10045.4.1" => Some("ECDSA with SHA-1".to_string()),
-        "1.2.840.10040.4.3" => Some("DSA with SHA-1".to_string()),
-        "1.2.840.113549.1.1.14" => Some("SHA-224 with RSA".to_string()),
-        "1.2.840.10045.4.3.2" => Some("ECDSA with SHA-256".to_string()),
-        "1.2.840.10045.4.3.3" => Some("ECDSA with SHA-384".to_string()),
-        "1.2.840.10045.4.3.4" => Some("ECDSA with SHA-512".to_string()),
-        "1.3.101.112" => Some("Ed25519".to_string()),
-        "1.3.101.113" => Some("Ed448".to_string()),
-        _ => Some(oid_str),
-    }
+        "1.2.840.113549.1.1.4" => "MD5 with RSA",
+        "1.2.840.10045.4.1" => "ECDSA with SHA-1",
+        "1.2.840.10040.4.3" => "DSA with SHA-1",
+        "1.2.840.113549.1.1.14" => "SHA-224 with RSA",
+        "1.2.840.10045.4.3.2" => "ECDSA with SHA-256",
+        "1.2.840.10045.4.3.3" => "ECDSA with SHA-384",
+        "1.2.840.10045.4.3.4" => "ECDSA with SHA-512",
+        "1.3.101.112" => "Ed25519",
+        "1.3.101.113" => "Ed448",
+        other => return other.to_string(),
+    };
+    name.to_string()
 }
 
-/// Maps public key algorithm OIDs to human-readable key type names.
-fn oid_to_key_type(oid: &Oid) -> Option<String> {
-    let oid_str = format!("{}", oid);
-    match oid_str.as_str() {
-        "1.2.840.113549.1.1.1" => Some("RSA".to_string()),
-        "1.2.840.10045.2.1" => Some("EC".to_string()),
-        "1.3.101.112" => Some("Ed25519".to_string()),
-        "1.3.101.113" => Some("Ed448".to_string()),
-        _ => Some(oid_str),
-    }
+/// Maps public key algorithm OIDs to human-readable key type names; any
+/// other OID is shown in dotted form.
+fn oid_to_key_type(oid: &Oid) -> String {
+    let name = match oid.to_id_string().as_str() {
+        "1.2.840.113549.1.1.1" => "RSA",
+        "1.2.840.10045.2.1" => "EC",
+        "1.3.101.112" => "Ed25519",
+        "1.3.101.113" => "Ed448",
+        other => return other.to_string(),
+    };
+    name.to_string()
 }
 
 #[cfg(test)]
@@ -481,6 +490,24 @@ mod tests {
     fn test_ssl_checker_creation() {
         let _checker = SslChecker::new();
         let _default_checker = SslChecker::default();
+    }
+
+    /// Regression: `with_timeout` swapped the configured resolver for a
+    /// fresh default one, dropping whatever it had been set up with.
+    #[tokio::test]
+    async fn with_timeout_keeps_the_configured_resolver() {
+        use crate::dns::test_support::{mock_dns_resolver_default, spawn_mock_dns, MockMode};
+
+        // Only the loopback zone has a CAA policy at `seer.test`.
+        let port = spawn_mock_dns(MockMode::Zone).await;
+        let checker = SslChecker {
+            dns_resolver: mock_dns_resolver_default(port),
+            ..SslChecker::new()
+        }
+        .with_timeout(Duration::from_secs(3));
+        assert_eq!(checker.dns_resolver.timeout(), Duration::from_secs(3));
+        let policy = caa::lookup_caa(&checker.dns_resolver, "seer.test").await;
+        assert!(policy.has_policy, "the configured resolver must be kept");
     }
 
     #[test]
@@ -494,13 +521,13 @@ mod tests {
     #[test]
     fn test_oid_to_name() {
         let oid = Oid::from(&[1, 2, 840, 113549, 1, 1, 11][..]).unwrap();
-        assert_eq!(oid_to_name(&oid), Some("SHA-256 with RSA".to_string()));
+        assert_eq!(oid_to_name(&oid), "SHA-256 with RSA");
     }
 
     #[test]
     fn test_oid_to_key_type() {
         let oid = Oid::from(&[1, 2, 840, 113549, 1, 1, 1][..]).unwrap();
-        assert_eq!(oid_to_key_type(&oid), Some("RSA".to_string()));
+        assert_eq!(oid_to_key_type(&oid), "RSA");
     }
 
     /// Live-network sanity check: a real public site with valid TLS
@@ -701,9 +728,9 @@ mod tests {
             (&[1u64, 2, 840, 10040, 4, 3][..], "DSA with SHA-1"),
         ] {
             let oid = Oid::from(arcs).unwrap();
-            assert_eq!(oid_to_name(&oid).as_deref(), Some(name));
+            assert_eq!(oid_to_name(&oid), name);
             let mut leaf = sample_leaf();
-            leaf.signature_algorithm = oid_to_name(&oid);
+            leaf.signature_algorithm = Some(oid_to_name(&oid));
             let w = derive_cert_warnings(&leaf, true, true, 90);
             assert!(
                 w.iter().any(|x| x.message.contains("deprecated signature")),

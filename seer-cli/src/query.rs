@@ -399,9 +399,14 @@ pub async fn run(
                 hosts
             };
             spinner.set_message(&format!("Checking {} host(s) for takeover", hosts.len()));
-            let report =
-                seer_core::scan_takeover(&clients.dns, &domain, hosts, config.bulk.concurrency)
-                    .await?;
+            let report = seer_core::scan_takeover(
+                &clients.dns,
+                &domain,
+                hosts,
+                config.bulk.concurrency,
+                config.http_timeout(),
+            )
+            .await?;
             Payload::Takeover(Box::new(report))
         }
         Query::Confusables(domain) => {

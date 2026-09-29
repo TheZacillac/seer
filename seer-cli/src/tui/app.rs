@@ -1681,6 +1681,7 @@ mod tests {
             hosts_skipped: 0,
             vulnerable: 1,
             potential: 1,
+            inconclusive: 0,
             findings: vec![
                 TakeoverFinding {
                     host: "a.example.com".into(),

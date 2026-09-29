@@ -101,7 +101,12 @@ enum NameKind {
 }
 
 fn normalize(domain: &str, kind: NameKind) -> Result<String> {
-    let domain = domain.trim().to_lowercase();
+    // IDNA (UTS #46) maps the ideographic and full-width full stops to `.`.
+    // Map them first: every structural check below splits on ASCII dots.
+    let domain = domain
+        .trim()
+        .to_lowercase()
+        .replace(['\u{3002}', '\u{FF0E}', '\u{FF61}'], ".");
 
     // Remove protocol
     let domain = domain
@@ -512,6 +517,23 @@ mod tests {
         assert_eq!(
             describe_reserved_ip(&"169.254.1.1".parse().unwrap()),
             Some("link-local address (169.254.0.0/16)")
+        );
+    }
+
+    /// Regression: the IDNA full stops were rejected by the ASCII-dot check
+    /// that ran before IDNA mapping.
+    #[test]
+    fn idna_full_stops_separate_labels() {
+        for input in ["例え\u{3002}jp", "例え\u{FF0E}jp", "例え\u{FF61}jp"] {
+            assert_eq!(
+                normalize_domain(input).unwrap(),
+                "xn--r8jz45g.jp",
+                "{input:?}"
+            );
+        }
+        assert_eq!(
+            normalize_host("www\u{3002}example\u{3002}com").unwrap(),
+            "www.example.com"
         );
     }
 

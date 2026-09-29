@@ -196,6 +196,13 @@ impl MarkdownFormatter {
             "{} host(s) checked — **{} vulnerable**, {} potential\n",
             report.hosts_checked, report.vulnerable, report.potential
         );
+        if report.inconclusive > 0 {
+            let _ = writeln!(
+                out,
+                "_{} host(s) could not be checked._\n",
+                report.inconclusive
+            );
+        }
         if report.hosts_skipped > 0 {
             let _ = writeln!(
                 out,
@@ -207,8 +214,8 @@ impl MarkdownFormatter {
         if report.findings.is_empty() {
             out.push_str("_No takeover signals found._\n");
         } else {
-            // `Note` carries the probe note — why a finding stayed "potential"
-            // (no fingerprint for the provider, probe failed, …).
+            // `Note` carries the probe note — why a host is only "potential"
+            // or "inconclusive" (does not resolve, probe failed, …).
             out.push_str(
                 "| Host | Verdict | Provider | CNAME | Evidence | Note |\n\
                  |---|---|---|---|---|---|\n",
@@ -217,6 +224,7 @@ impl MarkdownFormatter {
                 let verdict = match f.verdict {
                     TakeoverVerdict::Vulnerable => "**VULNERABLE**",
                     TakeoverVerdict::Potential => "potential",
+                    TakeoverVerdict::Inconclusive => "inconclusive",
                     TakeoverVerdict::Safe => "safe",
                 };
                 let _ = writeln!(
@@ -351,6 +359,7 @@ mod tests {
             hosts_skipped: 0,
             vulnerable: 0,
             potential: 1,
+            inconclusive: 0,
             findings: vec![TakeoverFinding {
                 host: "docs.example.com".to_string(),
                 verdict: TakeoverVerdict::Potential,
