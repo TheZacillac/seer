@@ -53,12 +53,12 @@ pub const SECTIONS: &[Section] = &[
             cmd("prop", "<domain> [type]", "Check DNS propagation globally"),
             cmd(
                 "follow",
-                "<domain> [iterations] [interval_minutes] [type] [@server] [--changes-only]",
+                crate::dns_args::FOLLOW_USAGE,
                 "Monitor DNS records over time",
             ),
             cmd(
                 "compare",
-                "<domain> [type] @<server1> @<server2>",
+                crate::dns_args::COMPARE_USAGE,
                 "Compare DNS records across nameservers",
             ),
             cmd(
@@ -150,10 +150,10 @@ pub const SECTIONS: &[Section] = &[
         commands: &[
             cmd(
                 "watch",
-                "[add|remove|list] [domain]",
+                "[add|remove <domain>... | list]",
                 "Check watchlist / add / remove / list",
             ),
-            cmd("history", "[domain] [--clear]", "View lookup history"),
+            cmd("history", "[<domain> | --clear]", "View lookup history"),
             cmd(
                 "drift",
                 "<domain> [--record]",
@@ -166,7 +166,7 @@ pub const SECTIONS: &[Section] = &[
         title: "BULK OPERATIONS",
         commands: &[cmd(
             "bulk",
-            "<operation> <file> [type] [-o output.csv]",
+            "<operation> <file> [type] [-o output.csv] [--progress <mode>]",
             "Run bulk operations from file (bulk -h for details)",
         )],
         note: Some(|| format!("Operations: {}", *crate::ops::BULK_OPS_SUMMARY)),

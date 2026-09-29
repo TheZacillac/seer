@@ -209,8 +209,11 @@ pub async fn run(
             // The progress callback holds a clone, so clear it explicitly.
             spinner.finish();
             let result = result?;
-            crate::ops::record_lookup_history(&domain, result.clone()).await;
-            Payload::Overview(Box::new(result))
+            let saved = crate::ops::record_lookup_history(&domain, result.clone()).await;
+            return Ok(Outcome {
+                footnote: history_warning(saved),
+                ..Outcome::new(Payload::Overview(Box::new(result)))
+            });
         }
         Query::Info(domain) => {
             let _spinner = spinner(format!("Getting comprehensive info for {}", domain));
@@ -428,6 +431,14 @@ pub async fn run(
     Ok(Outcome::new(payload))
 }
 
+/// A lookup's history is best-effort — a failed save must not fail the
+/// lookup — but it is no longer silent: the failure becomes a footnote.
+fn history_warning(saved: seer_core::Result<()>) -> Option<String> {
+    saved
+        .err()
+        .map(|e| format!("lookup history not saved: {e}"))
+}
+
 /// Assembles a `dig` outcome from its per-type results, in the requested
 /// order. One type is its result or its error. Several are a
 /// [`Payload::DigMany`] of the types that answered, with each failed type
@@ -643,6 +654,18 @@ mod tests {
         let outcome = trace_outcome(answered, true);
         assert_eq!(outcome.short_text().as_deref(), Some("192.0.2.7"));
         assert!(!outcome.failed());
+    }
+
+    /// A failed history save after a lookup was swallowed without a word.
+    #[test]
+    fn a_failed_history_save_is_a_footnote_not_a_failure() {
+        assert_eq!(history_warning(Ok(())), None);
+        let warning =
+            history_warning(Err(SeerError::ConfigError("disk full".into()))).expect("a warning");
+        assert!(
+            warning.starts_with("lookup history not saved") && warning.contains("disk full"),
+            "{warning}"
+        );
     }
 
     /// Only a trace is slow enough for one-shot mode's spinner; a dig,

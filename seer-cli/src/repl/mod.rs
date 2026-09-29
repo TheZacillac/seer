@@ -1,10 +1,11 @@
 //! Interactive REPL, launched when `seer` runs without a subcommand.
 //!
 //! A rustyline loop with tab completion ([`SeerCompleter`]) and history in
-//! `~/.seer_history` (a line typed with a leading space is not recorded).
-//! [`CommandContext`] holds the session state: the output format (`set
-//! output`) and the user config the clients are built from. `copy` puts the
-//! last result on the clipboard.
+//! `~/.seer_history`, appended after every command (a line typed with a
+//! leading space is not recorded). Ctrl-C cancels the running command and
+//! returns to the prompt. [`CommandContext`] holds the session state: the
+//! output format (`set output`) and the user config the clients are built
+//! from. `copy` puts the last result on the clipboard.
 
 mod catalog;
 mod commands;
@@ -21,13 +22,15 @@ use rustyline::history::DefaultHistory;
 use rustyline::{CompletionType, Editor};
 use seer_core::colors::CatppuccinExt;
 
-use crate::display::Spinner;
 use crate::query::{Clients, Query};
 
 const HISTORY_FILE: &str = ".seer_history";
 
 pub struct Repl {
     editor: Editor<SeerCompleter, DefaultHistory>,
+    history_path: std::path::PathBuf,
+    /// Set once a history write failed, so the warning is printed once.
+    history_warned: bool,
     context: CommandContext,
     /// Built once from the user config and kept for the session.
     clients: Clients,
@@ -60,7 +63,7 @@ impl Repl {
         let mut editor = Editor::with_config(editor_config())?;
         editor.set_helper(Some(completer));
 
-        // Load history
+        // Load history (a missing file is a first run).
         let history_path = std::env::home_dir()
             .map(|p| p.join(HISTORY_FILE))
             .unwrap_or_else(|| HISTORY_FILE.into());
@@ -74,6 +77,8 @@ impl Repl {
 
         Ok(Self {
             editor,
+            history_path,
+            history_warned: false,
             clients: Clients::from_config(cfg),
             // Honor the config file's DNS timeout like `dig` does.
             dns_follower: seer_core::DnsFollower::from_config(cfg),
@@ -105,6 +110,7 @@ impl Repl {
                     }
 
                     self.editor.add_history_entry(history_entry(&line))?;
+                    self.append_history();
 
                     match self.execute_line(command_line).await {
                         CommandResult::Continue => {}
@@ -145,24 +151,25 @@ impl Repl {
             }
         }
 
-        // Save history
-        let history_path = std::env::home_dir()
-            .map(|p| p.join(HISTORY_FILE))
-            .unwrap_or_else(|| HISTORY_FILE.into());
-
-        let _ = self.editor.save_history(&history_path);
-
-        // The history file records every queried domain/IP/ASN. Restrict it to
-        // the owner (0600), mirroring the posture of the ~/.seer/* state files
-        // (history.rs / watchlist.rs); it lives at ~/.seer_history, outside the
-        // 0700 ~/.seer dir, so the directory mode does not protect it.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&history_path, std::fs::Permissions::from_mode(0o600));
-        }
-
         Ok(())
+    }
+
+    /// Appends the new history entries to `~/.seer_history` right away, so
+    /// a crash or kill loses nothing, and with append semantics, so two
+    /// concurrent sessions add to the file instead of the last one to exit
+    /// overwriting it. rustyline creates and rewrites the file owner-only
+    /// (0600) itself — it records every queried domain/IP/ASN.
+    fn append_history(&mut self) {
+        if let Err(e) = self.editor.append_history(&self.history_path) {
+            if !std::mem::replace(&mut self.history_warned, true) {
+                eprintln!(
+                    "{} could not write {}: {}",
+                    "Warning:".ctp_yellow(),
+                    self.history_path.display(),
+                    e
+                );
+            }
+        }
     }
 
     fn print_banner(&self) {
@@ -209,17 +216,27 @@ impl Repl {
         }
 
         let command = parts[0].to_lowercase();
-        let result = self.dispatch(&command, &parts).await;
+        let canonical = catalog::canonical(&command);
 
-        // A failed command must not leave the PREVIOUS result behind for
-        // `copy` to hand out as if it were this command's output. `copy` and
-        // `set` only act on session state, so their errors (bad format name)
-        // keep the buffer.
-        if matches!(result, CommandResult::Error(_)) && !matches!(command.as_str(), "copy" | "set")
-        {
+        // Only a command that produced a result may leave one for `copy`: a
+        // failed command, or one with no single result (bulk, follow,
+        // history, watch add/remove), must not leave the PREVIOUS result to
+        // be handed out as if it were its own. The session commands keep it.
+        if !matches!(canonical, "copy" | "set" | "help" | "clear" | "exit") {
             self.last_result = None;
         }
-        result
+
+        // Ctrl-C cancels the running command (dropping it clears its spinner
+        // or progress bar) and returns to the prompt; without a handler the
+        // signal killed the whole session. `follow` handles Ctrl-C itself,
+        // to stop early and still print its summary.
+        if canonical == "follow" {
+            return self.dispatch(&command, &parts).await;
+        }
+        match until_interrupted(self.dispatch(&command, &parts), ctrl_c()).await {
+            Some(result) => result,
+            None => CommandResult::Error("Interrupted".to_string()),
+        }
     }
 
     /// Routes a tokenized line (`parts[0]` is the command as typed, `command`
@@ -275,7 +292,7 @@ impl Repl {
         println!("{}", "BULK OPERATIONS".bright_purple().bold());
         println!();
         println!("{}", "Usage:".bright_cyan());
-        println!("  bulk <operation> <file> [type] [-o output.csv]");
+        println!("  {}", catalog::usage("bulk").trim_start_matches("Usage: "));
         println!();
         println!("{}", "Operations:".bright_cyan());
         for (op, about) in crate::ops::BULK_OPS {
@@ -286,13 +303,15 @@ impl Repl {
         println!("{}", crate::ops::BULK_INPUT_FORMATS);
         println!("{}", "Output:".bright_cyan());
         println!("  Results are written to CSV file (default: <input>_results.csv)");
-        println!("  Use -o to specify custom output path");
+        println!("  Use -o to specify custom output path; with `set output json|yaml`");
+        println!("  the results print instead (and -o still writes the CSV)");
+        println!("  --progress bar|verbose|failures|none picks the progress display");
         println!("  Each operation's CSV columns: see `seer bulk --help`");
         println!();
         println!("{}", "Examples:".bright_cyan());
         println!("  bulk status domains.txt");
         println!("  bulk lookup domains.csv -o results.csv");
-        println!("  bulk dig domains.txt MX");
+        println!("  bulk dig domains.txt MX --progress failures");
         println!();
     }
 
@@ -311,8 +330,8 @@ impl Repl {
             Err(e) => CommandResult::Error(e.to_string()),
         }
     }
+    /// `bulk`: the same run as `seer bulk` ([`crate::bulk::run_bulk`]).
     async fn execute_bulk(&mut self, args: &[&str]) -> CommandResult {
-        // Handle help flags
         if args.is_empty()
             || args
                 .iter()
@@ -321,189 +340,87 @@ impl Repl {
             self.print_bulk_help();
             return CommandResult::Continue;
         }
-
-        let parsed = match commands::parse_bulk_args(args) {
-            Ok(p) => p,
+        let request = match commands::parse_bulk_args(args) {
+            Ok(request) => request,
             Err(e) => return CommandResult::Error(e),
         };
-
-        // Expand `~` / `~/...` once at the boundary so both the bulk-input
-        // read and the auto-derived output path see a home-resolved path.
-        let file_path = crate::utils::expand_tilde(&parsed.file);
-        let output_path = parsed
-            .output
-            .as_deref()
-            .map(crate::utils::expand_tilde)
-            .unwrap_or_else(|| crate::ops::default_bulk_output_path(&file_path));
-
-        // Read domains from file.
-        // `read_bulk_input` rejects FIFOs, sockets, devices, directories, and
-        // oversized files via a pre-read metadata check, preventing hangs on
-        // `mkfifo`'d paths.
-        let content = match crate::utils::read_bulk_input(&file_path) {
-            Ok(c) => c,
-            Err(e) => return CommandResult::Error(e),
-        };
-
-        let domains = match crate::ops::parse_bulk_domains(&content) {
-            Ok(d) => d,
-            Err(e) => return CommandResult::Error(e),
-        };
-
-        // Validate the operation before any progress UI is set up so an
-        // unknown op can't leave a stale progress bar registered.
-        let operations = match crate::ops::build_bulk_operations(
-            &parsed.operation,
-            &domains,
-            parsed.record_type,
-        ) {
-            Ok(operations) => operations,
-            Err(e) => return CommandResult::Error(e),
-        };
-
-        println!(
-            "{}",
-            crate::ops::bulk_banner(domains.len(), &parsed.operation)
-        );
-
-        let bar = crate::ops::bulk_bar(operations.len());
-        let executor = seer_core::BulkExecutor::from_config(&self.context.config);
-        let callback = crate::ops::bar_progress_callback(&bar);
-        let results = executor.execute(operations, Some(callback)).await;
-        crate::ops::finish_bulk_bar(&bar);
-
-        if let Err(e) = crate::ops::write_bulk_csv(&results, &parsed.operation, &output_path) {
-            return CommandResult::Error(e);
+        // The REPL has no exit code; a failed batch shows in its summary.
+        match crate::bulk::run_bulk(request, self.context.output_format, &self.context.config).await
+        {
+            Ok(_) => CommandResult::Continue,
+            Err(e) => CommandResult::Error(e),
         }
-
-        println!("\n");
-        println!("Results written to: {}", output_path.ctp_green());
-        println!("{}", crate::ops::bulk_summary(&results));
-
-        if results.iter().any(|r| !r.success) {
-            println!("\n{}", "Failures:".bright_red().bold());
-            for result in results.iter().filter(|r| !r.success) {
-                let domain = result.operation.domain();
-                println!(
-                    "  {} - {}",
-                    domain,
-                    result.error.as_deref().unwrap_or("Unknown error")
-                );
-            }
-        }
-
-        CommandResult::Continue
     }
 
+    /// `follow`: the same run as `seer follow` ([`crate::ops::follow_command`]).
     async fn execute_follow(&self, args: &[&str]) -> CommandResult {
-        let commands::FollowArgs {
-            domain,
-            iterations,
-            interval_minutes,
-            record_type,
-            nameserver,
-            changes_only,
-        } = match commands::parse_follow_args(args) {
-            Ok(p) => p,
+        let args = match commands::parse_follow_args(args) {
+            Ok(args) => args,
             Err(e) => return CommandResult::Error(e),
         };
-
-        // Fall back to the configured nameserver when none is given inline,
-        // matching `execute_dig` and the CLI's `seer follow`.
-        let nameserver = nameserver.or_else(|| self.context.config.nameserver.clone());
-
-        let config = match seer_core::FollowConfig::new(iterations, interval_minutes) {
-            Ok(cfg) => cfg.with_changes_only(changes_only),
-            Err(e) => return CommandResult::Error(e.to_string()),
-        };
-
-        println!(
-            "Following {} {} records ({} iterations, {} interval)",
-            domain.ctp_green(),
-            record_type.to_string().ctp_yellow(),
-            iterations.to_string().ctp_yellow(),
-            crate::utils::format_interval(interval_minutes)
-        );
-        println!(
-            "Press {} or {} to stop early\n",
-            "Esc".ctp_yellow(),
-            "Ctrl+C".ctp_yellow()
-        );
-
-        // In raw mode Ctrl+C arrives as a key, so no SIGINT handler here.
-        let result = crate::ops::run_live_follow(
+        match crate::ops::follow_command(
             &self.dns_follower,
-            &domain,
-            record_type,
-            nameserver.as_deref(),
-            config,
+            args,
+            &self.context.config,
             self.context.output_format,
-            false,
         )
-        .await;
-
-        match result {
-            Ok(result) => {
-                let formatter = seer_core::output::get_formatter(self.context.output_format);
-                if result.interrupted {
-                    println!("\n{}", "Follow interrupted by user".ctp_yellow());
-                }
-                println!("\n{}", formatter.format_follow(&result));
-                CommandResult::Continue
-            }
-            Err(e) => CommandResult::Error(e.to_string()),
+        .await
+        {
+            Ok(()) => CommandResult::Continue,
+            Err(e) => CommandResult::Error(e),
         }
     }
 
     async fn execute_watch(&mut self, args: &[&str]) -> CommandResult {
-        if let Some(action) = args.first() {
-            return match crate::ops::watch_edit(action, args.get(1).copied(), "watch").await {
-                Ok(message) => {
-                    println!("{}", message);
+        let format = self.context.output_format;
+        if let Some((action, domains)) = args.split_first() {
+            let domains: Vec<String> = domains.iter().map(|d| d.to_string()).collect();
+            return match crate::manage::watch_edit(action, &domains, "watch").await {
+                Ok(listing) => {
+                    println!("{}", listing.render(format));
                     CommandResult::Continue
                 }
                 Err(e) => CommandResult::Error(e),
             };
         }
-        let watchlist = match crate::ops::load_watchlist().await {
-            Ok(w) => w,
-            Err(e) => return CommandResult::Error(e),
-        };
-        if watchlist.domains.is_empty() {
-            println!("{}", crate::ops::watchlist_listing(&watchlist, "watch"));
-            return CommandResult::Continue;
-        }
-        let spinner = Spinner::new(&format!("Checking {} domains", watchlist.domains.len()));
-        let report =
-            seer_core::check_watchlist_with_config(&watchlist.domains, &self.context.config).await;
-        spinner.finish();
-        let formatter = seer_core::output::get_formatter(self.context.output_format);
-        println!("{}", formatter.format_watch(&report));
-        self.last_result = Some(crate::payload::Payload::Watch(Box::new(report)));
-        CommandResult::Continue
-    }
-
-    async fn execute_history(&self, args: &[&str]) -> CommandResult {
-        let result = if args.contains(&"--clear") {
-            crate::ops::clear_history()
-                .await
-                .map(|()| "Lookup history cleared".to_string())
-        } else {
-            crate::ops::load_history().await.map(|history| {
-                crate::ops::history_listing(&history, args.first().copied(), "lookup")
-            })
-        };
-        match result {
-            Ok(text) => {
-                println!("{}", text);
+        match crate::manage::watch_check(&self.context.config, "watch").await {
+            Ok(crate::manage::WatchCheck::Empty(listing)) => {
+                println!("{}", listing.render(format));
+                CommandResult::Continue
+            }
+            Ok(crate::manage::WatchCheck::Report(report)) => {
+                let payload = crate::payload::Payload::Watch(report);
+                println!("{}", crate::payload::serialize(&payload, format));
+                self.last_result = Some(payload);
                 CommandResult::Continue
             }
             Err(e) => CommandResult::Error(e),
         }
     }
+
+    async fn execute_history(&self, args: &[&str]) -> CommandResult {
+        let (domain, clear) = match commands::parse_history_args(args) {
+            Ok(parsed) => parsed,
+            Err(e) => return CommandResult::Error(e),
+        };
+        match crate::manage::history(domain.as_deref(), clear, "lookup").await {
+            Ok(listing) => {
+                println!("{}", listing.render(self.context.output_format));
+                CommandResult::Continue
+            }
+            Err(e) => CommandResult::Error(e),
+        }
+    }
+
     /// Pure part of `copy`: pick the format, serialize the last result.
     /// Returns (text to place on the clipboard, confirmation message).
     fn render_copy(&self, args: &[&str]) -> Result<(String, String), String> {
+        if let Some(extra) = args.get(1) {
+            return Err(format!(
+                "Unexpected argument: {extra}\n{}",
+                catalog::usage("copy")
+            ));
+        }
         let arg = args.first().map(|s| s.to_lowercase());
         let format = match arg.as_deref() {
             None => seer_core::output::OutputFormat::Markdown,
@@ -551,7 +468,7 @@ impl Repl {
     }
 
     fn execute_set(&mut self, args: &[&str]) -> CommandResult {
-        if args.len() < 2 {
+        if args.len() != 2 {
             return CommandResult::Error(catalog::usage("set"));
         }
 
@@ -568,6 +485,27 @@ impl Repl {
             },
             _ => CommandResult::Error(format!("Unknown setting: {}", args[0])),
         }
+    }
+}
+
+/// Runs `work` until it finishes — `Some(output)` — or until `interrupt`
+/// fires first, dropping `work` (its spinner or progress bar clears on drop)
+/// and returning `None`.
+async fn until_interrupted<F: std::future::Future>(
+    work: F,
+    interrupt: impl std::future::Future<Output = ()>,
+) -> Option<F::Output> {
+    tokio::select! {
+        output = work => Some(output),
+        () = interrupt => None,
+    }
+}
+
+/// Resolves on Ctrl-C (SIGINT). If the handler cannot be installed it never
+/// resolves — a command must not be cancelled by a failure to listen.
+async fn ctrl_c() {
+    if tokio::signal::ctrl_c().await.is_err() {
+        std::future::pending::<()>().await;
     }
 }
 
@@ -615,10 +553,12 @@ mod copy_tests {
     }
 
     #[test]
-    fn copy_rejects_unknown_format() {
+    fn copy_rejects_unknown_format_and_extra_arguments() {
         let repl = repl_with_result();
         let err = repl.render_copy(&["bogus"]).unwrap_err();
         assert!(err.contains("Usage: copy"));
+        let err = repl.render_copy(&["json", "yaml"]).unwrap_err();
+        assert!(err.starts_with("Unexpected argument: yaml"), "{err}");
     }
 
     // `tld` looks offline (static WHOIS-server/registry-URL tables), but
@@ -770,6 +710,38 @@ mod copy_tests {
         assert!(repl.last_result.is_none(), "stale payload must be dropped");
         let err = repl.render_copy(&[]).unwrap_err();
         assert!(err.contains("Nothing to copy"), "got: {err}");
+    }
+
+    /// `copy` after a command with no single result (bulk, follow,
+    /// history, watch add/remove) copied the result BEFORE it. These fail
+    /// before any I/O but, like a success, must not leave the old payload.
+    #[tokio::test]
+    async fn commands_without_a_result_clear_the_copy_buffer() {
+        for line in ["bulk status", "follow", "history a.com b.com", "watch add"] {
+            let mut repl = repl_with_result();
+            let _ = repl.execute_line(line).await;
+            assert!(repl.last_result.is_none(), "{line:?} kept the old payload");
+        }
+        // Session commands keep it.
+        for line in ["help", "set output json", "copy bogus"] {
+            let mut repl = repl_with_result();
+            let _ = repl.execute_line(line).await;
+            assert!(repl.last_result.is_some(), "{line:?} dropped the payload");
+        }
+    }
+
+    /// Ctrl-C used to kill the whole REPL (and lose its history) mid-command;
+    /// it now cancels just the command.
+    #[tokio::test]
+    async fn an_interrupt_cancels_the_running_command() {
+        let pending = std::future::pending::<CommandResult>();
+        assert!(until_interrupted(pending, async {}).await.is_none());
+        let done = async { CommandResult::Continue };
+        let never = std::future::pending::<()>();
+        assert!(matches!(
+            until_interrupted(done, never).await,
+            Some(CommandResult::Continue)
+        ));
     }
 
     /// `copy`/`set` errors are about the request itself (bad format name),
