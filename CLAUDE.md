@@ -94,7 +94,7 @@ seer-core/src/
 ├── domain_info.rs      # Merged RDAP + WHOIS flat structure
 ├── retry.rs            # RetryPolicy/RetryExecutor: exponential backoff + jitter
 ├── cache.rs            # Generic capacity-bounded TtlCache (plain TTL expiry)
-├── net.rs              # SSRF guards: resolve/validate public hosts (refuses loopback/private)
+├── net.rs              # SSRF guards: resolve/validate public hosts (refuses loopback/private); ipv4_first + connect_any
 ├── validation.rs       # Domain normalization, reserved-IP descriptions, SEER_DOMAIN_ALLOWLIST
 ├── psl.rs              # (private) Public Suffix List: registrable-domain boundary (example.co.uk)
 ├── dates.rs            # (private) shared "days until expiry" arithmetic
@@ -102,12 +102,12 @@ seer-core/src/
 ├── ssl.rs              # SSL inspection: full presented chain + negotiated TLS version (single-attempt)
 ├── tls.rs              # (private) inspection-only rustls handshake + RFC 6125 host matching (ssl + status)
 ├── caa.rs              # CAA policy lookup + issuer comparison
-├── posture.rs          # Email/DNS security posture: SPF/DMARC/MTA-STS/BIMI/DANE verdicts
+├── posture.rs          # Email/DNS security posture: SPF/DMARC/MTA-STS/BIMI/DANE verdicts (Unknown on a failed lookup; SPF 10-lookup limit; DMARC walk bounded by the PSL)
 ├── headers.rs          # HTTP security-header + cookie audit, weighted 0-100 score -> A+-F grade
 ├── takeover.rs         # Subdomain takeover: provider CNAME match + HTTP body fingerprint confirmation
 ├── http.rs             # (private) SSRF-guarded HTTP GET (status/headers/takeover) + shared capped body reader
 ├── confusables.rs      # Typosquat/homoglyph look-alike generation + registration scoring
-├── subdomains/         # Subdomain enumeration via CT logs: ordered source chain (crt.sh→certspotter) + per-source retry treating crt.sh 404/429/HTML-body as transient
+├── subdomains/         # Subdomain enumeration via CT logs: ordered source chain (crt.sh→certspotter) + per-source retry treating crt.sh 404/429/HTML-body as transient; each source's budget is 3 `ct_secs` timeouts, a capped run is `truncated` (and so is its baseline); classification probes each parent level with a random `dns::random_probe_label`
 ├── diff.rs             # Side-by-side domain comparison
 ├── drift.rs            # Registration drift detection vs stored history snapshot
 ├── watchlist.rs        # Cert/registration expiry watchlist
@@ -123,7 +123,7 @@ seer-core/src/
 ├── status/             # Domain health: HTTP/SSL/expiration/DNS (single-attempt by design)
 ├── tld/                # TLD info (WHOIS server, RDAP endpoint, registry URL)
 ├── bulk/               # Concurrent bulk executor + domain-list parsing
-└── output/             # OutputFormatter (macro-generated) + human/, markdown/, json, yaml, contact.rs, dig.rs (dig wording, +short)
+└── output/             # OutputFormatter (macro-generated) + human/, markdown/, json, yaml, contact.rs, dig.rs (dig wording, +short), diff_table.rs (shared diff rows)
 ```
 
 Each directory module's `mod.rs` opens with a `//!` overview (rendered on
@@ -132,25 +132,25 @@ docs.rs); there are no per-module README files.
 #### Module Responsibilities
 
 - **error.rs**: All error types in one place, uses thiserror
-- **config.rs**: Loads `~/.seer/config.toml` (timeouts, concurrency, output format, nameserver, `[watch] webhook_url`, `[tui] theme`); values clamped to safe ranges; `seer config --init` scaffolds it
-- **whois/**: WHOIS protocol, referral following (max depth: 3), IANA discovery fallback for unmapped TLDs (24h TTL cache). Registry parsers are a private static table in `parsers/mod.rs`: each module exposes `const TLDS` + `fn parse`, matched by second-level zone or TLD in table order, falling back to `WhoisResponse::parse_internal`. Field regexes are built from label lists (`field_patterns` / `line_field_patterns`), and the EDUCAUSE, NIC.it, SIDN and DENIC parsers read dates through the shared `whois::parse_date` (registry-specific formats such as JPRS's keep their own). `servers.rs` keeps its map as whitespace-separated data: `NIC_TLDS` (served at `whois.nic.<tld>`), `HOSTED_TLDS` (host → TLD rows) and `IDN_ALIASES` (U-labels resolved to their A-label's server). Keep the lists sorted — `server_tables_are_sorted` enforces it, and `server_tables_list_each_tld_once` guards duplicates
-- **rdap/**: RDAP protocol, IANA bootstrap caching (24h TTL, stale-while-revalidate), domain/IP/ASN lookups, multi-candidate base-URL fallback, 429 Retry-After honoring
-- **dns/**: DNS resolution (20 record types, HTTPS/SVCB (params as `SvcParam`s) and CDS/CDNSKEY among them; default upstream Google Public DNS, or a custom UDP/`tls://`/`https://` nameserver), propagation checking (20 public resolvers, one direct probe-less `DnsResolver::query_server` per server so each row carries its `DnsStatus` or no-response reason; `PropagationResult::verdict`/`server_verdict` are the one reading every renderer uses), compare, follow (live monitor), DNSSEC validation, NS delegation health (delegation.rs: parent NS set vs zone NS RRset + per-server RD=0 lameness probes, SSRF-vetted). A hostname nameserver's resolved upstreams are ordered **IPv4 first**: hickory's `lookup_ip` returns AAAA first, and the pool races only the first 2 servers under one per-query deadline, so on a host with an IPv6 route but no IPv6 transit an AAAA-first list timed out. Pinned-server configs share `single_server_config` / `google_or_pinned` / `fqdn` in `resolver.rs`. Two query APIs share `prepare_query` (normalization, the SRV `_svc._proto.name` and PTR IP-literal rules) and the nameserver path: `resolve()` returns the records of the type, named by the query name (NXDOMAIN/NODATA → `Ok(vec![])`, SERVFAIL → `Err`), and backs every other feature, bulk dig included; `query()` (query.rs) is `seer dig`'s and, like dig, does not go through the resolver: `transport.rs` sends one query per type (RD set, EDNS as the resolver sends it) straight to the upstream's servers over hickory's per-connection API (`ConnectionProvider::new_connection` with a `PoolContext` built from `apply_standard_opts` + hickory's own `TlsConfig`, so UDP/TCP/DoT/DoH and TLS roots are the resolver's) and reports the response as sent — the resolver's `DnsError::from_response` would turn NXDOMAIN/NODATA/referrals into header-less errors and its caching layer would chase CNAMEs, losing the chain. Servers come from the same vetted `ResolverConfig` (`custom_upstream_config`, shared with `create_custom_resolver`, or `default_upstream_config`), asked in order (IPv4 first), UDP then TCP on a truncated reply (same address and port, a bare `@server` included), the next server on a transport failure, each exchange under the DNS timeout and the list under `QUERY_BUDGET_TIMEOUTS` (2) of them — failover, not a retry; the trace walker shares `Transport::request`/`exchange`. The result is a `DnsQueryResult` with the `DnsStatus` (EDNS extended codes included), header flags (on every response; empty only for a local answer), the ANSWER section with the CNAME chain first and every record under its real owner (A-label, no trailing dot; RDATA names such as CNAME targets are A-labels too, via `to_dns_record`'s `NameSpelling::Ascii` — `resolve()` keeps hickory's Unicode `Display`), the AUTHORITY section (a negative answer's SOA — a chain that ends in NXDOMAIN/NODATA keeps its chain, and `output::dig::query_verdict` then names the chain's last target), and a `WildcardProbe` (a random `seer-probe-<hex>` sibling queried concurrently, only below the registrable domain and never for ANY, `*.` or special-use names). NXDOMAIN/NODATA/SERVFAIL/REFUSED are `Ok` results there; only invalid input, a refused (SSRF-blocked) or unresolvable nameserver, or a transport failure is `Err`. A referral (NOERROR, no answer, AA clear, NS but no SOA in AUTHORITY — RFC 2308 §2.2) is `referral_zone()`, never `is_nodata()`. hickory answers RFC 6761 special-use names (`localhost`, `127.in-addr.arpa`, `invalid`, `onion`, …) itself; `query::answered_locally` mirrors its `CachingClient` zone check, `query()` keeps those names on the resolver so they are never sent (RFC 7686), and such a result has `answered_locally: true`, no `server`, no flags and no probe. `ANY` is a concurrent fan-out over the one `ANY_TYPES` list (11 types) in both, duplicates dropped, `Err` only when every sub-query fails. `DnsTracer` (trace.rs) walks down from its root-hints table (`ROOT_SERVERS`) with one raw exchange per hop through `transport.rs` (RD=0, UDP then TCP on truncation, to the one vetted address the walk picked — the resolver layer would drop the AA bit and chase CNAMEs): up to 3 servers per level (a timeout, an error RCODE or a lame reply — AA clear, no answer, no SOA, no referral — passes to the next; each server's addresses are tried IPv4 first, and a local no-route failure — `delegation::is_local_no_route`: ENETUNREACH/EHOSTUNREACH, or EAFNOSUPPORT (no `io::ErrorKind`, so matched by raw OS code from `libc`/`windows-sys`) when the kernel has IPv6 disabled — moves to its next address without counting), referrals must descend toward the name (bailiwick), glue is trusted only for in-zone names, at most 3 glueless NS names per level resolved recursively (each lookup under one per-query timeout), `MAX_HOPS` 16, the whole walk under one deadline of `TRACE_BUDGET_TIMEOUTS` (6) per-query timeouts — the levels run in sequence and the caller picks the name, so without it a hostile chain held the caller for minutes; a walk that runs out keeps its hops and sets `error` — and every address vetted through `delegation::partition_reserved`. It stops at an answer (a CNAME is reported, not chased), at NXDOMAIN/NODATA (authoritative or with the SOA), or at an error kept in `DnsTrace::error`; `Err` is invalid input (ANY included) or no root server answering
+- **config.rs**: Loads `~/.seer/config.toml` (timeouts incl. `ct_secs` for CT-log requests, concurrency, output format, nameserver, `[watch] webhook_url`, `[tui] theme`); values clamped to safe ranges; `seer config --init` scaffolds it
+- **whois/**: WHOIS protocol, referral following (max depth: 3; a referral hop is a single attempt — the registry record is already in hand), IANA discovery fallback for unmapped TLDs (24h TTL cache). TLDs catalogued without a port-43 service (`RDAP_ONLY_TLDS`, `NO_WHOIS_TLDS`, `WHOIS_RETIRED_TLDS`, via `servers::has_no_whois_server`) fail fast with `WhoisServerNotFound`; IANA's definitive "no server" answer is negative-cached for 1h, transient failures never. The connect goes through `net::connect_any` (IPv4 first, each address an equal share of the timeout). Registry parsers are a private static table in `parsers/mod.rs`: each module exposes `const TLDS` + `fn parse`, matched by second-level zone or TLD in table order, falling back to `WhoisResponse::parse_internal`. Field regexes are built from label lists (`field_patterns` / `line_field_patterns`), and the EDUCAUSE, NIC.it, SIDN and DENIC parsers read dates through the shared `whois::parse_date` (registry-specific formats such as JPRS's keep their own). `servers.rs` keeps its map as whitespace-separated data: `NIC_TLDS` (served at `whois.nic.<tld>`), `HOSTED_TLDS` (host → TLD rows) and `IDN_ALIASES` (U-labels resolved to their A-label's server). Keep the lists sorted — `server_tables_are_sorted` enforces it, and `server_tables_list_each_tld_once` guards duplicates
+- **rdap/**: RDAP protocol, IANA bootstrap caching (24h TTL, stale-while-revalidate: stale data is served while one background task refreshes it; only a cold cache loads inline), domain/IP/ASN lookups, multi-candidate base-URL fallback, 429 Retry-After honoring through `RetryExecutor::execute_with_delay_hint` (capped at the policy's `max_delay`). A 429 is `SeerError::RateLimited`, kept through retry exhaustion and the candidate fallback
+- **dns/**: DNS resolution (20 record types, HTTPS/SVCB (params as `SvcParam`s) and CDS/CDNSKEY among them; default upstream Google Public DNS, or a custom UDP/`tls://`/`https://` nameserver), propagation checking (20 public resolvers, one direct probe-less `DnsResolver::query_server` per server so each row carries its `DnsStatus` or no-response reason; `PropagationResult::verdict`/`server_verdict` are the one reading every renderer uses; NXDOMAIN and NODATA are distinct consensus answers, and an `ANY` reply with `failed_types` is an incomplete answer kept out of the consensus), compare (the same direct `query_server` + `read_reply` per server as propagation, so response code and CNAME chain count as well as the records — `DnsComparison::summary` is the one wording), follow (live monitor), DNSSEC validation (`signed` when at least one DS authenticates a DNSKEY; unmatched DS records are issues), NS delegation health (delegation.rs: parent NS set vs zone NS RRset + per-server RD=0 lameness probes, SSRF-vetted; each server's addresses are tried IPv4 first, moving on after a local no-route, and the whole check runs under one deadline of `CHECK_BUDGET_TIMEOUTS` (11) DNS timeouts). A hostname nameserver's resolved upstreams are ordered **IPv4 first** (`net::ipv4_first`, the one ordering helper — TLS, WHOIS, trace and delegation use it too): hickory's `lookup_ip` returns AAAA first, and the pool races only the first 2 servers under one per-query deadline, so on a host with an IPv6 route but no IPv6 transit an AAAA-first list timed out. Pinned-server configs share `single_server_config` / `google_or_pinned` / `fqdn` in `resolver.rs`. Two query APIs share `prepare_query` (normalization, the SRV `_svc._proto.name` and PTR IP-literal rules) and the nameserver path: `resolve()` returns the records of the type, named by the query name (NXDOMAIN/NODATA → `Ok(vec![])`, SERVFAIL → `Err`), and backs every other feature, bulk dig included; `query()` (query.rs) is `seer dig`'s and, like dig, does not go through the resolver: `transport.rs` sends one query per type (RD set, EDNS as the resolver sends it) straight to the upstream's servers over hickory's per-connection API (`ConnectionProvider::new_connection` with a `PoolContext` built from `apply_standard_opts` + hickory's own `TlsConfig`, so UDP/TCP/DoT/DoH and TLS roots are the resolver's) and reports the response as sent — the resolver's `DnsError::from_response` would turn NXDOMAIN/NODATA/referrals into header-less errors and its caching layer would chase CNAMEs, losing the chain. Servers come from the same vetted `ResolverConfig` (`custom_upstream_config`, shared with `create_custom_resolver`, or `default_upstream_config`), asked in order (IPv4 first), UDP then TCP on a truncated reply (same address and port, a bare `@server` included), the next server on a transport failure, each exchange under the DNS timeout and the list under `QUERY_BUDGET_TIMEOUTS` (2) of them — failover, not a retry; the trace walker shares `Transport::request`/`exchange`. The result is a `DnsQueryResult` with the `DnsStatus` (EDNS extended codes included), header flags (on every response; empty only for a local answer), the ANSWER section with the CNAME chain first and every record under its real owner (A-label, no trailing dot; RDATA names such as CNAME targets are A-labels too, via `to_dns_record`'s `NameSpelling::Ascii` — `resolve()` keeps hickory's Unicode `Display`), the AUTHORITY section (a negative answer's SOA — a chain that ends in NXDOMAIN/NODATA keeps its chain, and `output::dig::query_verdict` then names the chain's last target), and a `WildcardProbe` (a random `seer-probe-<hex>` sibling queried concurrently, only below the registrable domain and never for ANY, `*.` or special-use names). NXDOMAIN/NODATA/SERVFAIL/REFUSED are `Ok` results there; only invalid input, a refused (SSRF-blocked) or unresolvable nameserver, or a transport failure is `Err`. A referral (NOERROR, no answer, AA clear, NS but no SOA in AUTHORITY — RFC 2308 §2.2) is `referral_zone()`, never `is_nodata()`. hickory answers RFC 6761 special-use names (`localhost`, `127.in-addr.arpa`, `invalid`, `onion`, …) itself; `query::answered_locally` mirrors its `CachingClient` zone check, `query()` keeps those names on the resolver so they are never sent (RFC 7686) — with `@server`, the nameserver spec is only parsed and vetted offline, never resolved, and such a result has `answered_locally: true`, no `server`, no flags and no probe. `ANY` is a concurrent fan-out over the one `ANY_TYPES` list (11 types) in both, duplicates dropped, `Err` only when every sub-query fails; in `query()`/`query_server()` the types that got no reply are listed in `DnsQueryResult::failed_types` (seer-cli reports them and exits 1). `DnsTracer` (trace.rs) walks down from its root-hints table (`ROOT_SERVERS`) with one raw exchange per hop through `transport.rs` (RD=0, UDP then TCP on truncation, to the one vetted address the walk picked — the resolver layer would drop the AA bit and chase CNAMEs): up to 3 servers per level (a timeout, an error RCODE or a lame reply — AA clear, no answer, no SOA, no referral — passes to the next; each server's addresses are tried IPv4 first, and a local no-route failure — `delegation::is_local_no_route`: ENETUNREACH/EHOSTUNREACH, or EAFNOSUPPORT (no `io::ErrorKind`, so matched by raw OS code from `libc`/`windows-sys`) when the kernel has IPv6 disabled — moves to its next address without counting), referrals must descend toward the name (bailiwick — an upward or sideways referral is a lame reply and passes to the zone's next server), glue is trusted only for in-zone names, at most 3 glueless NS names per level resolved recursively (each lookup under one per-query timeout), `MAX_HOPS` 16, the whole walk under one deadline of `TRACE_BUDGET_TIMEOUTS` (6) per-query timeouts — the levels run in sequence and the caller picks the name, so without it a hostile chain held the caller for minutes; a walk that runs out keeps its hops and sets `error` — and every address vetted through `delegation::partition_reserved`. It stops at an answer (a CNAME is reported, not chased), at NXDOMAIN/NODATA (authoritative or with the SOA), or at an error kept in `DnsTrace::error`; `Err` is invalid input (ANY included) or no root server answering
 - **status/**: HTTP status, SSL certificates, domain expiration, DNS — deliberately single-attempt (see module docs: health probes must not retry-mask flakiness). The HTTP sub-check goes through `http::GuardedFetcher::send` and reads the body only for a 2xx `text/html` response; the TLS sub-check shares `tls::inspect` with `ssl.rs`
-- **ssl.rs / tls.rs**: certificate inspection over rustls on aws-lc-rs, selected per config with `ClientConfig::builder_with_provider` (no process-global provider). The `InspectOnly` verifier accepts any chain — trust is reported, never enforced — and deliberately skips the handshake-signature check too: `inspect()` sends and trusts no application data, and no reported field (there is no fingerprint) depends on the peer holding the key, while rustls' strict signature path would refuse X.509 v1 leaves, unknown critical extensions and RSA < 2048 bits. It advertises the provider's schemes plus `EXTRA_SCHEMES` (Ed448, RSA/ECDSA SHA-1, SHA-1 last), so those certs are inspected and `ssl`'s weak-key warning fires. Only a server with no TLS 1.2+ version or no ECDHE+AEAD suite in common (CBC-only, static-RSA, DHE/DSS-only) fails, with an explanatory error. `ssl` reports the full chain as presented (leaf first) and the negotiated `TLSv1.3`/`TLSv1.2`. `tls::cert_matches_host` is the one RFC 6125 §6.4.4 hostname rule for both `ssl` and `status`: dNSName SANs decide alone, the CN counts only when there is no dNSName SAN, and an IP-literal host matches an equal iPAddress SAN
-- **lookup.rs**: Smart lookup orchestration (RDAP → WHOIS fallback)
-- **doctor.rs**: `seer doctor` diagnosis — 4 concurrent probes (config parse, DNS resolve, WHOIS port-43, RDAP bootstrap HTTPS), each stage-bounded (exchange legs 5s; the WHOIS probe's resolution stage runs through `net::resolve_public_host`, separately capped there, for parity with how production WHOIS connects); `overall` = worst check (malformed config = Warn since defaults still work; unreachable network = Fail); probe endpoints injectable via `#[cfg(test)]`-only seams. The RDAP-bootstrap probe fetches exactly like the real bootstrap load: `net::client_builder` (no redirects — a 3xx is FAIL) and `read_body_capped(.., Reject)` under `rdap::MAX_BOOTSTRAP_SIZE` (10 MB)
+- **ssl.rs / tls.rs**: certificate inspection over rustls on aws-lc-rs, selected per config with `ClientConfig::builder_with_provider` (no process-global provider). The `InspectOnly` verifier accepts any chain — trust is reported, never enforced — and deliberately skips the handshake-signature check too: `inspect()` sends and trusts no application data, and no reported field (there is no fingerprint) depends on the peer holding the key, while rustls' strict signature path would refuse X.509 v1 leaves, unknown critical extensions and RSA < 2048 bits. It advertises the provider's schemes plus `EXTRA_SCHEMES` (Ed448, RSA/ECDSA SHA-1, SHA-1 last), so those certs are inspected and `ssl`'s weak-key warning fires. Only a server with no TLS 1.2+ version or no ECDHE+AEAD suite in common (CBC-only, static-RSA, DHE/DSS-only) fails, with an explanatory error. `ssl` reports the full chain as presented (leaf first) and the negotiated `TLSv1.3`/`TLSv1.2`. `tls::cert_matches_host` is the one RFC 6125 §6.4.4 hostname rule for both `ssl` and `status`: dNSName SANs decide alone, the CN counts only when there is no dNSName SAN, an IP-literal host matches only an equal iPAddress SAN (no dNSName, wildcard or CN), and a wildcard directly over a public suffix (`*.com`) matches nothing. `inspect` connects through `net::connect_any`: IPv4 first, each address an equal share of the budget
+- **lookup.rs**: Smart lookup orchestration (RDAP → WHOIS fallback). Its availability fallback and `AvailabilityChecker` share one ladder, `availability::classify_fallback` + `DnsTieBreak`, so the two cannot diverge
+- **doctor.rs**: `seer doctor` diagnosis — 4 concurrent probes (config parse, DNS resolve, WHOIS port-43, RDAP bootstrap HTTPS), each stage-bounded (exchange legs 5s; the WHOIS probe's resolution stage runs through `net::resolve_public_host`, separately capped there, for parity with how production WHOIS connects); `overall` = worst check (malformed config = Warn since defaults still work; unreachable network = Fail); probe endpoints injectable via `#[cfg(test)]`-only seams. The RDAP-bootstrap probe fetches exactly like the real bootstrap load: the same `rdap::IANA_BOOTSTRAP_DNS` URL, `net::client_builder` (no redirects — a 3xx is FAIL) and `read_body_capped(.., Reject)` under `rdap::MAX_BOOTSTRAP_SIZE` (10 MB)
 - **webhook.rs**: SSRF-guarded JSON webhook delivery for `seer watch --webhook` — resolved addresses vetted then pinned on the client (rebinding defense), redirects disabled, single-attempt, 10s timeout, non-2xx surfaces status only (never the body)
-- **headers.rs**: `seer headers` — one non-intrusive GET graded across the security headers (HSTS, CSP, XFO, nosniff, Referrer-Policy, Permissions-Policy, COOP/COEP/CORP), every `Set-Cookie`'s Secure/HttpOnly/SameSite flags, and version-disclosing banners. Weighted 0–100 score (weights sum to 100, asserted by a test) minus bounded cookie/disclosure penalties → A+–F. Verdicts reuse posture's Absent/Weak/Moderate/Strict/Present scale; CSP `frame-ancestors` counts as superseding `X-Frame-Options`. All grading is pure and unit-tested; only the fetch is async
-- **takeover.rs**: `seer takeover` — the HTTP half of subdomain-takeover detection. `subdomains/classify.rs` already flags a dangling CNAME whose name stops resolving; this catches the commoner case where the provider still answers for a deprovisioned resource and only the response *body* says otherwise. 27 provider fingerprints in `takeover::PROVIDERS`, the single table `classify.rs` also matches against (via `match_provider`) — never add a second copy; `Vulnerable` requires a matched body marker and always records it as evidence, `Potential` is an unconfirmable dangling CNAME — never promote one to the other without evidence. Hosts whose CNAME matches no provider are never fetched, bounding the HTTP fan-out
-- **http.rs** (private): SSRF-guarded HTTP GET shared by status/headers/takeover (`GuardedFetcher::send` returns the unread response, `read_body` applies the cap). Redirects are followed **manually** with `net::validate_http_url` re-run at every hop — reqwest's own redirect policy would skip the guard (redirect-SSRF bypass) — and validated addresses are pinned per hop against rebinding. `read_body_capped(.., Overflow::{Truncate, Reject})` is the one incremental body reader, also used by the RDAP and CT-log clients and doctor's bootstrap probe. Single-attempt, like status/ssl
+- **headers.rs**: `seer headers` — one non-intrusive GET graded across the security headers (HSTS, CSP, XFO, nosniff, Referrer-Policy, Permissions-Policy, COOP/COEP/CORP), every `Set-Cookie`'s Secure/HttpOnly/SameSite flags, and version-disclosing banners. Weighted 0–100 score (weights sum to 100, asserted by a test) minus bounded cookie/disclosure penalties → A+–F. Verdicts reuse posture's Absent/Weak/Moderate/Strict/Present scale; CSP `frame-ancestors` counts as superseding `X-Frame-Options` unless it admits any origin, and `*`/`http:`/`https:`/`data:` script sources grade Weak unless `'strict-dynamic'` is present. The audit fetches through `GuardedFetcher::get_head` and never reads the body. All grading is pure and unit-tested; only the fetch is async
+- **takeover.rs**: `seer takeover` — the HTTP half of subdomain-takeover detection. `subdomains/classify.rs` already flags a dangling CNAME whose name stops resolving; this catches the commoner case where the provider still answers for a deprovisioned resource and only the response *body* says otherwise. 27 provider fingerprints in `takeover::PROVIDERS` (with per-provider `claim_statuses` where the unclaimed page's status is known), the single table `classify.rs` also matches against — never add a second copy. `resolve_host` walks the CNAME chain (at most 8 hops) and matches a provider on any hop, for takeover and subdomain classification alike. `Vulnerable` requires a matched body marker (and the expected claim status) and always records it as evidence; `Potential` is an unconfirmable dangling CNAME; `Inconclusive` is a provider host that could not be checked (lookup or probe failed) — listed and counted, never a finding. Never promote one to another without evidence. Hosts whose CNAME chain matches no provider are never fetched, bounding the HTTP fan-out. `scan_takeover` takes the HTTP timeout (`config.http_timeout()`)
+- **http.rs** (private): SSRF-guarded HTTP GET shared by status/headers/takeover (`GuardedFetcher::send` returns the unread response, `read_body` applies the cap, `get_head` returns only the `ResponseHead`). A 3xx without `Location` is the final response. Redirects are followed **manually** with `net::validate_http_url` re-run at every hop — reqwest's own redirect policy would skip the guard (redirect-SSRF bypass) — and validated addresses are pinned per hop against rebinding. `read_body_capped(.., Overflow::{Truncate, Reject})` is the one incremental body reader, also used by the RDAP and CT-log clients and doctor's bootstrap probe. Single-attempt, like status/ssl
 - **bulk/**: `BulkExecutor` — bounded concurrent fan-out (`buffer_unordered`) paced by a slot-based rate limiter; per-row results never abort the batch; plain-text/CSV domain-list parsing. Build a batch with `execute_each(domains, |d| BulkOperation::…)` (or `execute`/`execute_streaming` on prepared operations); dispatch lives in the private `run_op`
 - **cache.rs**: `TtlCache`, a plain capacity-bounded TTL cache (no stale-while-revalidate API). The RDAP bootstrap keeps its own stale-while-revalidate logic
-- **fsutil.rs** (private): `persisted_store!(Type, "file", json|toml, "label")` generates `path`/`load`/`load_from_path`/`save`/`save_to_path` for the `~/.seer` stores (history, watchlist, subdomain baselines) with atomic owner-only writes and corrupt-file backup
-- **retry.rs**: Shared retry framework — used by WHOIS/RDAP clients; dns/status/ssl intentionally don't (documented at their module level)
-- **net.rs / validation.rs**: SSRF protection — all outbound hosts resolved and checked against reserved/private ranges (`net::is_reserved_ip`) before connect. `net::validate_http_url` is the single URL-shaped entry point (scheme, no credentials, ports 80/443 only, reserved-range check) shared by every HTTP fetch path — status, headers, takeover — so the policy cannot drift between them. `net::client_builder(timeout)` is the base reqwest builder for every leg and always disables automatic redirects; `net::url_host` unbrackets IPv6 hosts; `net::USER_AGENT` identifies seer's own probes
-- **output/**: Human (colored), JSON, YAML, and Markdown formatters behind `get_formatter(OutputFormat)`. `with_report_methods!` in `output/mod.rs` is the single list of `OutputFormatter` methods — it generates the trait, the JSON/YAML impls and the forwarding impls — so a new report type is one row there plus human and markdown inherent methods (the forwarding impl is `#[deny(unconditional_recursion)]`, so a missing inherent method is a compile error, not a runtime stack overflow). `output/contact.rs` is the one contact view (`Contact`, `FlatContacts`, `ROLES`) every formatter renders registrant/admin/tech/billing through. Human label/value rows go through the private `Rows` writer and markdown through `Bullets`/`code_list`; both sanitize internally, so a row written through them cannot skip the terminal-injection / markdown escaping (bespoke layouts — tables, glyph lists — still sanitize by hand). `output::dig` (public) is the one copy of the dig outcome wording — `verdict`, `query_verdict` (adds the referral line) and `trace_verdict` (names the missing target of an NXDOMAIN beside a CNAME), `tone`, `unnamed_server`, the local-answer, wildcard and unfollowed-CNAME notes — used by the dig/trace formatters and the TUI's DNS lens, beside `dig_short`/`dig_trace_short` (the `+short` lines: bare, sanitized values, empty when there are none); `output::sanitize_line` (re-exported from `human`) is the one-line terminal guard for renderers outside the formatters
-- **colors.rs**: Catppuccin Frappe color palette; the `CatppuccinExt` trait is generated from one `palette!` table
+- **fsutil.rs** (private): `persisted_store!(Type, "file", json|toml, "label")` generates `path`/`load`/`load_from_path`/`save`/`save_to_path` for the `~/.seer` stores (history, watchlist, subdomain baselines) with atomic owner-only writes (temp created 0600, fsynced before the rename) and corrupt-file backup — only unparseable content is moved aside; any other read error is returned (`load()` is `Result`). History keeps 20 slimmed entries per domain and 500 domains
+- **retry.rs**: Shared retry framework (`RetryExecutor`, `is_retryable`, `execute_with_delay_hint` for a server-suggested delay) — used by WHOIS/RDAP clients; dns/status/ssl intentionally don't (documented at their module level)
+- **net.rs / validation.rs**: SSRF protection — all outbound hosts resolved and checked against reserved/private ranges (`net::is_reserved_ip`) before connect. `net::validate_http_url` is the single URL-shaped entry point (scheme, no credentials, ports 80/443 only, reserved-range check) shared by every HTTP fetch path — status, headers, takeover — so the policy cannot drift between them. `net::client_builder(timeout)` is the base reqwest builder for every leg and always disables automatic redirects and proxies (a proxy re-resolves the host, defeating the pin); `net::url_host` unbrackets IPv6 hosts; `net::USER_AGENT` identifies seer's own probes
+- **output/**: Human (colored), JSON, YAML, and Markdown formatters behind `get_formatter(OutputFormat)`. `with_report_methods!` in `output/mod.rs` is the single list of `OutputFormatter` methods — it generates the trait, the JSON/YAML impls and the forwarding impls — so a new report type is one row there plus human and markdown inherent methods (the forwarding impl is `#[deny(unconditional_recursion)]`, so a missing inherent method is a compile error, not a runtime stack overflow). `output/contact.rs` is the one contact view (`Contact`, `FlatContacts`, `ROLES`) every formatter renders registrant/admin/tech/billing through. Human label/value rows go through the private `Rows` writer and markdown through `Bullets`/`code_list`; both sanitize internally, so a row written through them cannot skip the terminal-injection / markdown escaping (bespoke layouts — tables, glyph lists — still sanitize by hand). Human output has one sanitizer, `sanitize_line` (escapes, control, bidi and zero-width characters stripped; newlines and tabs folded — no remote value may span rows); markdown text goes through `MdSafe` (backslash-escaped), code spans through `MdCode`/`MdCodeCell`. Shared wording lives in `output/mod.rs` — `expiry_phrase`, `availability_label`, `takeover_label`, `propagation_detail`, `dnssec_depth` — and diff rows in `output/diff_table.rs`, used by both formats (and the TUI where it shows the same thing). `output::dig` (public) is the one copy of the dig outcome wording — `verdict`, `query_verdict` (adds the referral line) and `trace_verdict` (names the missing target of an NXDOMAIN beside a CNAME), `tone`, `unnamed_server`, the local-answer, wildcard and unfollowed-CNAME notes — used by the dig/trace formatters and the TUI's DNS lens, beside `dig_short`/`dig_trace_short` (the `+short` lines: bare, sanitized values, empty when there are none); `output::sanitize_line` is the one-line terminal guard for renderers outside the formatters
+- **colors.rs**: Catppuccin Frappe color palette; the `CatppuccinExt` trait is generated from one `palette!` table, holding only the colors in use
 - **lib.rs**: `static_regex! { NAME = r"…"; }` declares every `LazyLock<Regex>` static in the crate (there are no hand-written ones)
 
 ### seer-cli/ (CLI Application)
@@ -160,7 +160,10 @@ seer-cli/src/
 ├── main.rs             # Entry point, clap commands, execute_command dispatch, exit_code(&Payload)
 ├── query.rs            # Query enum + Clients + run() -> Outcome: the single-shot pipeline shared by CLI and REPL
 ├── dig_args.rs         # the one dig grammar (@server, types, +short/+trace, -x) for `seer dig`, REPL `dig` and TUI `:dig`
-├── ops.rs              # Shared CLI/REPL/TUI pieces: BULK_OPS catalog, bulk bar/banner/CSV/summary, run_live_follow, watch/history bodies, lookup_source
+├── dns_args.rs         # the one compare/follow grammar (any order, @server) for the CLI and REPL
+├── bulk.rs             # bulk::run_bulk — the one bulk runner (read, parse, bar, stream, CSV, summary) for CLI and REPL
+├── manage.rs           # watch/history/config commands; Listing pairs prose with data so --format/-q/--fields work
+├── ops.rs              # Shared CLI/REPL/TUI pieces: BULK_OPS catalog, follow_command/run_live_follow, STORE_LOCK + ~/.seer store I/O, drift/baseline checks
 ├── payload.rs          # Payload enum (serde untagged) over every single-shot result: -q JSON, TUI raw view + `y` copy, REPL `copy`
 ├── utils.rs            # Shared helpers: table-driven bulk CSV export, raw-mode guard, follow key loop, bulk input readers
 ├── clipboard.rs        # OSC52 terminal clipboard copy
@@ -193,6 +196,9 @@ seer-cli/src/
 - Uses Clap v4 with derive macros
 - Defaults to REPL when no command provided
 - Supports global `--format` flag (human/json/yaml/markdown) — must be placed before the subcommand
+- **`main` returns `ExitCode`** — nothing in seer-cli calls `process::exit`,
+  so guards (the tracing `LogGuard`) always drop. `--format` is validated by
+  clap (unknown value → exit 2); `--fields` implies `-q`.
 - **One single-shot pipeline.** Every single-shot command (lookup, whois,
   dig, status, ssl, … 23 in all; `dig +trace` is its own `Query::Trace`) is
   a `query::Query`. The CLI's `execute_command` converts its clap subcommand
@@ -203,9 +209,11 @@ seer-cli/src/
   and the `+short` flag). The CLI renders it through `-q`/`--fields` or
   `payload::serialize` inside `Outcome::present(format, show)`, which
   prints `+short` lines instead when asked and the errors after; the REPL
-  does the same and keeps the payload for `copy`. Bulk, follow, watch,
-  history and tui are handled outside the pipeline, over shared `ops.rs`
-  helpers.
+  does the same and keeps the payload for `copy`. `query::run` boxes the
+  pipeline's state machine (tens of KB — one arm per command), so callers'
+  futures stay small. Bulk (`bulk::run_bulk`), follow
+  (`ops::follow_command`), watch/history/config (`manage.rs`) and tui are
+  handled outside the pipeline.
 - **Check-style exit codes** all live in `main.rs` `exit_code(&Payload)`,
   pinned by a table test (a scripting contract): `status`, `avail`, `dnssec`,
   `compare`, `drift`, `takeover`, `subdomains --diff`, `doctor` and
@@ -218,7 +226,9 @@ seer-cli/src/
 - **Catalogs.** `ops::BULK_OPS` (name, description) drives the clap
   `OPERATION` help, the REPL completer and `bulk -h`, and the TUI's bulk
   presets; `repl/catalog.rs` drives REPL completion, hints, `help` and every
-  usage error. Add a command or bulk op there, not in each consumer.
+  usage error. Add a command or bulk op there, not in each consumer. The
+  compare and follow argument grammars live in `dns_args.rs` (like
+  `dig_args.rs` for dig), used by clap and the REPL alike.
 - `seer generate-key` mints a random API key (OsRng, 256-bit, URL-safe base64) for `SEER_API_KEY`
 - `seer doctor` runs `seer_core::doctor` and exits 1 only when `overall` is
   FAIL (WARN exits 0 — documented in its help). Rendering lives in
@@ -260,7 +270,8 @@ seer-cli/src/
   it reports a grade and always exits 0, matching `posture`. Output goes
   through `get_formatter(format).format_headers()`.
 - `seer takeover <domain>` is check-style: exits 1 when
-  `report.has_findings()` (any vulnerable OR potential host), 0 when clean.
+  `report.has_findings()` (any vulnerable OR potential host), 0 when clean —
+  an `inconclusive` host (could not be checked) is not a finding.
   Enumerates via `SubdomainEnumerator` then calls `seer_core::scan_takeover`
   with `config.bulk.concurrency`; `--host <HOST>` (repeatable) skips CT
   enumeration entirely and scans the given hosts. Output goes through
@@ -272,11 +283,14 @@ seer-cli/src/
 - `seer mangen <DIR>` (hidden via `#[command(hide = true)]`) writes `seer.1`
   plus one page per visible subcommand with `clap_mangen::generate_to` —
   hidden commands (mangen itself) get no page.
-- REPL history saved to `~/.seer_history`
+- REPL history is appended to `~/.seer_history` after each command
+  (rustyline keeps it 0600); Ctrl-C cancels the running command, not the REPL
 - `seer tui [domain]` launches a full-screen ratatui TUI (additive — the REPL
   and all subcommands are unchanged). Architecture: async `tokio::select!` loop,
   pure `App` state (no I/O — file I/O runs in `mod.rs` via `spawn_blocking`),
-  parameterized `FetchReq` lookups dispatched to `seer-core` over a channel, and
+  parameterized `FetchReq` lookups mapped to `query::Query` and run through
+  `query::run` over one shared `Clients` (Watch/History read their stores
+  directly), and
   interactive lenses as `panes/` components (`handle_key -> PaneOutcome`). All 18
   lenses are wired with live data + full in-pane inputs, including the streaming
   Follow (live monitor) and Bulk (concurrent + CSV export) lenses. The DNS
@@ -288,7 +302,13 @@ seer-cli/src/
   opens Trace). A per-lens / per-stream generation guard drops stale async
   results (on domain/tab change or run restart), and a list lens's selection
   is clamped whenever its data lands, so a shorter refresh never leaves it
-  past the last row. Every core
+  past the last row. Each lens's fetch keeps an `AbortHandle`; bumping its
+  generation (`Action::CancelFetch`) aborts it. Lens keys are the `LensKey`
+  enum, and `LENSES` entries carry the `interactive`/`filter`/`heavy` flags
+  (heavy lenses — Subdomains, Takeover — run only on ↵ or their command).
+  Every lens change goes through `App::goto_lens`; the screen redraws only
+  when state changed; every widget sanitizes remote text; `~/.seer` store
+  edits hold `ops::STORE_LOCK`. Every core
   call honors the user config (clients via `*::from_config`), including the
   live follow (`DnsFollower::from_config` + `config.nameserver`). Two themes:
   Catppuccin Frappé (default) and Latte (light) — startup theme from
@@ -328,8 +348,14 @@ seer-py/
   resolver would contact
 - Custom `json_to_python()` converter for serde_json → Python objects
 - `SeerError` maps to `ValueError` (invalid input), `TimeoutError`,
-  `ConnectionError` (WHOIS connect failures) or `RuntimeError`, always with the
-  sanitized message
+  `ConnectionError` (WHOIS connect failures) or a typed `seer.SeerError`
+  subclass (itself a `RuntimeError`: `RateLimitedError`,
+  `WhoisServerNotFoundError`, `DnsError`, `UpstreamError`,
+  `LookupFailedError`, `ParseError`, `TlsError`, `ConfigError`), always with
+  the sanitized message. seer-api maps statuses and MCP retry advice from
+  these classes — never by matching message text
+- `dns_follow` polls `check_signals` (100 ms) so Ctrl-C stops it; integer
+  arguments are taken as `i64` so out-of-range values raise `ValueError`
 
 ### seer-api/ (FastAPI + MCP)
 
@@ -340,11 +366,11 @@ seer-api/
     ├── main.py             # FastAPI app: bearer-token auth, middleware stack, lifespan startup checks
     ├── _contract.py        # shared bulk limits/models, record-type + TLD validators, BULK/HEAVY rate limits
     ├── _env.py             # strict integer env-var parsing
-    ├── _run.py             # run_seer: bounded dispatch pool + SEER_REQUEST_TIMEOUT deadline
-    ├── errors.py           # http_error (exception → sanitized status) + as_http (await a core call under it)
+    ├── _run.py             # run_seer: bounded dispatch pool + one SEER_REQUEST_TIMEOUT Deadline (guard + work + SSE streams)
+    ├── errors.py           # http_error (exception type → status: 400/404/429/502/504/500) + as_http + clean_message (the one error-text sanitizer)
     ├── limiting.py         # rate limiter + proxy-aware client-IP keying
     ├── middleware.py       # body-size cap, request logging + /metrics counters
-    ├── ssrf.py             # SSRF guard for user-supplied connect targets (hosts; nameservers via seer.nameserver_target)
+    ├── ssrf.py             # SSRF pre-check (`guarded`) for single-host targets and nameservers (via seer.nameserver_target); bulk is left to core
     ├── streaming.py        # SSE bulk-stream plumbing
     ├── routers/            # API endpoints by feature
     │   ├── lookup.py       # Smart lookup (single + bulk)
@@ -357,26 +383,34 @@ seer-api/
     │   ├── intel.py        # availability/info/subdomains/dnssec/delegation/diff/caa/posture/headers/takeover/confusables routers
     │   └── tld.py          # TLD info (/tld/{tld}) + full catalog (/tld/)
     └── mcp/
-        └── server.py       # MCP server: the _TOOLS registry (31 tools) + dispatch + rate_limiter()
+        └── server.py       # MCP server: the _TOOLS registry (32 tools) + dispatch + rate_limiter()
 ```
 
 **Key Points:**
 - Secure by default: binds `127.0.0.1`; startup hard-fails on a non-loopback
   `SEER_HOST` without `SEER_API_KEY`, and on more than one worker with the
-  `memory://` rate-limit store (per-worker limiters would be bypassable)
+  `memory://` rate-limit store (per-worker limiters would be bypassable);
+  without a key, `auth_middleware` also answers 503 to any request that
+  arrived on a non-loopback interface (catches `uvicorn --host 0.0.0.0`)
 - OpenAPI docs at `/docs` and `/redoc` (off unless `SEER_DOCS_ENABLED`)
-- CORS configured via `SEER_CORS_ORIGINS` env var
+- No CORS unless `SEER_CORS_ORIGINS` is set; one Origin policy
+  (`_origin_blocked`) guards REST and `/mcp`: an allowlist if set, else
+  anything with an API key, else loopback origins only
 - Every REST route declares its own rate limit; `SEER_RATE_LIMIT` governs only `POST /mcp`
 - Bulk endpoints have limits (max 100 domains, max 50 concurrency), defined
   once in `_contract.py` and shared by REST and MCP
 - Route handlers await core calls through `errors.as_http(call, message)`;
-  SSRF guards run before it, so their 400s are not remapped
+  the SSRF pre-check runs in the same dispatch (`ssrf.guarded`) and only a
+  reserved-address refusal blocks (a `ValueError` → 400); any other guard
+  failure falls through to core, which re-vets and pins. `/x/bulk` and
+  `/x/bulk/stream` share one rate-limit scope per operation
 - **MCP tool registry.** Each tool is one `_TOOLS` entry in `mcp/server.py`:
   `_Tool(description, input_schema, handler, rate_limit)`, built from schema
   helpers (`_object`, `_string`, `_domains`, `_concurrency`) and handler
   factories (`_single`, `_typed` for `(domain, record_type)`, `_scan`,
   `_bulk`). `tools/list`, dispatch and the per-tool limits all derive from
-  it. `tools/list` is pinned by
+  it. Per-tool limits are keyed per client (the HTTP request's client IP;
+  `stdio` for the stdio server). `tools/list` is pinned by
   `tests/test_mcp_tool_snapshot.py` + `tests/fixtures/mcp_tools.json`;
   regenerate after an intentional change with
   `cd seer-api && python -m tests.test_mcp_tool_snapshot`. Tool results are
@@ -388,7 +422,7 @@ seer-api/
   `limits`/`starlette` declared because they are imported directly —
   `tests/test_declared_dependencies.py` fails on any undeclared import
   (first-party `seer` resolves via a fallback map, since editable installs
-  don't record it). The dev extra needs `pytest>=8.4`, which fails — rather
+  don't record it). The dev extras need `pytest>=9.1.1`, which fails — rather
   than skips — an async test with no plugin; there is no pytest-asyncio.
 - Tests run against a `seer` stub when the extension isn't built
   (`tests/conftest.py`, marked `_IS_STUB`); `needs_ns_parser` skips only for
@@ -540,7 +574,8 @@ The protocol clients also have hermetic mock-server tests that DO run in CI:
   the global bootstrap cache stays untouched.
 - **DNS** (`dns/test_support.rs`): one loopback UDP server loop
   (`spawn_mock_dns_fn`, scripted per query with `MockReply` — answers,
-  NODATA/NXDOMAIN with or without an SOA, error rcodes, no reply,
+  NODATA/NXDOMAIN with or without an SOA, any error rcode via
+  `MockReply::Rcode(ResponseCode::…)`, no reply,
   delegations with glue, truncation — or the canned `MockMode::Zone`)
   behind every resolver, query, trace, follow, compare, DNSSEC, delegation,
   posture and status test; `spawn_mock_dns_fn_with_tcp` adds a TCP relay
@@ -567,7 +602,9 @@ The protocol clients also have hermetic mock-server tests that DO run in CI:
 
 The SSRF guards deliberately refuse loopback, so the clients expose
 `#[cfg(test)]`-only seams (`allowing_private_hosts`/`with_port` on
-`WhoisClient` and `DnsResolver`, `with_default_nameserver` on `DnsResolver`,
+`WhoisClient` and `DnsResolver`, `with_iana_server` on `WhoisClient`,
+`with_default_nameserver` on `DnsResolver`, `with_unroutable`/`with_budget`
+on `DelegationChecker`,
 `allowing_private_hosts`/`with_root_hints`/`with_port_map`/
 `with_recursive_upstream`/`with_unroutable` on `DnsTracer`,
 `allowing_private_hosts` on `GuardedFetcher` and `WebhookClient`,
@@ -626,9 +663,14 @@ seer-mcp                                   # MCP server on stdio
   formatter methods (`with_report_methods!`), bulk ops (`ops::BULK_OPS`), REPL
   commands (`repl/catalog.rs`), TUI lenses (`LENSES`), MCP tools (`_TOOLS`),
   the nameserver-spec parser (`NameserverSpec::parse`, exposed to Python),
-  the dig grammar (`dig_args::parse`), the dig outcome wording
-  (`output::dig`), the `ANY` fan-out (`ANY_TYPES`) and the root hints
-  (`trace::ROOT_SERVERS`) each live in one place. Extend the table; never
+  the dig grammar (`dig_args::parse`), the compare/follow grammar
+  (`dns_args`), the dig outcome wording (`output::dig`), the shared report
+  wording (`output::expiry_phrase`, `availability_label`, `takeover_label`),
+  the availability ladder (`availability::classify_fallback`), record-type
+  names (`RecordType::ALL`), IPv4-first ordering (`net::ipv4_first`), the
+  wildcard-probe label (`dns::random_probe_label`), the `ANY` fan-out
+  (`ANY_TYPES`) and the root hints (`trace::ROOT_SERVERS`) each live in one
+  place. Extend the table; never
   fork a copy — hand-synced copies are how `subdomains --classify` and the
   API's nameserver SSRF check drifted out of step with `takeover` and the
   core parser.
@@ -819,7 +861,8 @@ README.md → Configuration → Environment Variables. Add new ones there.
 (missing file → defaults). `seer config --init` scaffolds it. Settings:
 default output format, nameserver, per-protocol timeouts, bulk concurrency,
 rate-limit delay — all clamped to safe, per-protocol ranges (concurrency
-1–50; whois/rdap timeouts 1–300s; dns 1–60s; http 1–120s) — plus two tables:
+1–50; whois/rdap timeouts 1–300s; dns 1–60s; http 1–120s; ct 1–120s,
+default 30s) — plus two tables:
 `[watch]` with `webhook_url` (Option, default None; the `--webhook` CLI flag
 overrides it) and `[tui]` with `theme` (default `"frappe"`; read through
 `SeerConfig::tui_theme()`, which trims/lowercases and clamps anything that
@@ -832,4 +875,4 @@ propagation result shape) are recorded in CHANGELOG.md.
 
 ---
 
-**Last Updated**: 2026-09-28
+**Last Updated**: 2026-09-29

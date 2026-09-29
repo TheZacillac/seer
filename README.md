@@ -69,7 +69,7 @@ A high-performance, multi-interface domain utility suite — query WHOIS, RDAP, 
 **⚡ Power Features**
 - **Bulk Operations** — process domain lists with CSV export
 - **Domain Diff** — side-by-side comparison of two domains
-- **Field Extraction** — `--quiet --fields` for scriptable output
+- **Field Extraction** — `--fields` (implies `--quiet`) for scriptable output
 - **4 Output Formats** — human, JSON, YAML, markdown
 - **Interactive REPL** — with tab completion and history
 - **Environment Doctor** — one-shot config/DNS/WHOIS/RDAP diagnosis
@@ -181,7 +181,9 @@ The **lens** sidebar covers every Seer capability, grouped, each pulling live da
 - **SECURITY** — SSL / Cert · Status · Subdomains · HTTP Headers · Takeover
 - **POWER** — Diff · Bulk (streaming + CSV export) · Watchlist · History
 
-**Keys:** `j`/`k` move · `1`–`9` jump to a lens · `Tab` focus nav⇄pane · `[` `]` sub-tabs · `r` raw output (json/yaml/markdown) · `y` copy · `/` look up a domain · `:` command · `?` help · `:q` quit. In-pane: switchers (TLD, nameserver, Compare resolvers, Bulk op) and editable fields (Diff's 2nd domain, Follow interval/count, Bulk file path).
+**Keys:** `j`/`k` move · `1`–`9` jump to a lens · `Tab` focus nav⇄pane · `[` `]` sub-tabs · `r` raw output (json/yaml/markdown; `PgUp`/`PgDn` scroll) · `y` copy · `/` look up a domain · `:` command · `?` help · `:q` quit. In-pane: switchers (TLD, nameserver, Compare resolvers, Bulk op) and editable fields (Diff's 2nd domain, Follow interval/count, Bulk file path).
+
+Subdomains and Takeover query CT logs and probe hosts, so they run only when you press `↵` on them (or use their `:` command), never just by moving onto them. Removing a watched domain (`d`) and clearing history (`c`) ask for a second press.
 
 **Commands (`:`):** `lookup`, `whois`, `rdap <domain|ip|AS####>`, `dig [@server] <name> [type] [+trace]`, `ssl`, `status`, `headers`, `takeover`, `reverse <ip>`, `tld <.tld>`, `compare <domain> <nsA> <nsB>`, `diff <a> <b>`, `set output <human|json|yaml|markdown>`, `theme <frappe|latte>`, `copy`, `q`.
 
@@ -218,11 +220,12 @@ seer dig '*.example.com'         # Wildcard record (quote it so the shell doesn'
 # DNS propagation & monitoring
 seer prop example.com A
 seer follow example.com 20 0.5       # 20 checks, 30s interval
-seer follow example.com 10 1 MX --changes-only
+seer follow example.com MX 10 1 --changes-only   # arguments in any order
+seer follow example.com AAAA @1.1.1.1
 
 # DNSSEC & DNS comparison
 seer dnssec example.com
-seer compare example.com 8.8.8.8 1.1.1.1 MX   # record type trails; defaults to A
+seer compare example.com MX @8.8.8.8 @1.1.1.1  # any order; type defaults to A
 seer delegation example.com      # Parent delegation vs. zone NS + lame-server probe
 
 # Domain health & SSL
@@ -253,8 +256,9 @@ seer tld .com
 seer diff example.com google.com
 
 # Watchlist
-seer watch add example.com
+seer watch add example.com www.example.com   # several at once; www. is kept
 seer watch list
+seer --format json watch list
 seer watch                        # Check all watched domains
 seer watch --fail-on warning      # Exit non-zero at warning severity (default: critical)
 seer watch --webhook https://hooks.example.com/seer   # Also POST the report as JSON
@@ -277,9 +281,9 @@ cat domains.txt | seer bulk avail -      # Read the list from stdin
 seer doctor
 
 # Scriptable field extraction
-seer --quiet --fields registrar lookup example.com
-seer --quiet --fields certificate.issuer status example.com
-seer --quiet --fields status,answers.name dig www.example.com
+seer --fields registrar lookup example.com        # --fields implies --quiet
+seer --fields certificate.issuer status example.com
+seer --fields status,answers.name dig www.example.com
 
 # Shell completions & man pages
 seer completions bash >> ~/.bashrc
@@ -393,8 +397,9 @@ Check commands exit `1` on a negative result even when the command itself ran fi
 | `seer status` | HTTP status is missing or non-2xx, the SSL cert is invalid or expires within 30 days, or the domain expires within 30 days |
 | `seer avail` | The domain is **not** available (already registered) |
 | `seer dnssec` | The zone's status is anything other than `signed` (i.e. `unsigned`, `partial`, or `misconfigured`) |
-| `seer compare` | The two nameservers return different record sets |
+| `seer compare` | The two nameservers give different answers (response code, CNAME chain or record set) |
 | `seer delegation` | The parent's delegation NS set and the zone's own NS RRset are out of sync, or any delegated server answers lamely |
+| `seer takeover` | Any host is `vulnerable` or `potential` (a host that could not be checked is `inconclusive` and does not fail the scan) |
 | `seer doctor` | Any check reports **FAIL**. `WARN` (degraded but usable, e.g. a malformed config file running on defaults) still exits `0` |
 | `seer drift` | Material drift is found vs. the stored baseline (a first run with no baseline exits `0`) |
 | `seer subdomains --diff` | New names appeared vs. the stored baseline (removals and a missing baseline exit `0`) |
