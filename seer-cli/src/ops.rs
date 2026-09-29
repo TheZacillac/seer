@@ -512,24 +512,22 @@ pub struct SubdomainBaselineOutcome {
 pub async fn subdomain_baseline_check(
     domain: &str,
     record: bool,
+    config: &seer_core::SeerConfig,
 ) -> seer_core::Result<SubdomainBaselineOutcome> {
-    let enumerator = seer_core::SubdomainEnumerator::new();
+    let enumerator = seer_core::SubdomainEnumerator::from_config(config);
     // `enumerate` normalizes the domain; use `result.domain` as the key so
     // the baseline store and the note agree on the canonical name.
     let result = enumerator.enumerate(domain).await?;
 
     // Baseline file I/O is blocking — keep it off the async executor.
-    let domain_key = result.domain.clone();
-    let names = result.subdomains.clone();
-    let source = result.source.clone();
-    let report = tokio::task::spawn_blocking(move || -> seer_core::Result<_> {
+    let (result, report) = tokio::task::spawn_blocking(move || -> seer_core::Result<_> {
         let mut baselines = seer_core::SubdomainBaselines::load();
-        let report = baselines.diff(&domain_key, &names);
+        let report = baselines.diff(&result.domain, &result.subdomains);
         if record {
-            baselines.record(&domain_key, &names, &source);
+            baselines.record(&result);
             baselines.save()?;
         }
-        Ok(report)
+        Ok((result, report))
     })
     .await
     .map_err(|e| seer_core::SeerError::ConfigError(format!("baseline task failed: {e}")))??;

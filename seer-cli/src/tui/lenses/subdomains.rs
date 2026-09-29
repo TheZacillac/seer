@@ -65,6 +65,7 @@ mod tests {
             subdomains: vec!["www.example.com".into(), "api.example.com".into()],
             source: "crt.sh".into(),
             count: 2,
+            truncated: false,
         }));
         let text = render_text(70, 10, |f| render(f, f.area(), &theme, &data, false, 0));
         assert!(text.contains("www.example.com"));
@@ -79,6 +80,7 @@ mod tests {
             subdomains: hosts,
             source: "crt.sh".into(),
             count: 60,
+            truncated: false,
         }));
         // Short terminal can't fit 60 rows; without scrolling the last host
         // would never render even when selected.
@@ -97,6 +99,7 @@ mod tests {
             subdomains: vec![],
             source: "crt.sh".into(),
             count: 0,
+            truncated: false,
         }));
         let text = render_text(60, 6, |f| render(f, f.area(), &theme, &data, false, 0));
         assert!(text.contains("no subdomains found"));

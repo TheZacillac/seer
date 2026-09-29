@@ -140,7 +140,7 @@ pub async fn fetch(req: FetchReq, config: &seer_core::SeerConfig) -> Result<Lens
             flat.sort_by_key(|e| std::cmp::Reverse(e.timestamp));
             Ok(LensData::History(flat))
         }
-        FetchReq::Subdomains(d) => seer_core::SubdomainEnumerator::new()
+        FetchReq::Subdomains(d) => seer_core::SubdomainEnumerator::from_config(config)
             .enumerate(&d)
             .await
             .map(|r| LensData::Subdomains(Box::new(r)))
@@ -154,7 +154,7 @@ pub async fn fetch(req: FetchReq, config: &seer_core::SeerConfig) -> Result<Lens
             // logs, then scan. Enumeration failure aborts — with no host list
             // there is nothing to scan, and reporting an empty clean result
             // would be a false all-clear.
-            let enumerated = seer_core::SubdomainEnumerator::new()
+            let enumerated = seer_core::SubdomainEnumerator::from_config(config)
                 .enumerate(&d)
                 .await
                 .map_err(e)?;

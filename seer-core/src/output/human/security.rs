@@ -66,6 +66,12 @@ impl HumanFormatter {
             let at = self.value(&at.format("%Y-%m-%d %H:%M UTC").to_string());
             self.rows(&mut out, "").kv("Baseline recorded", at);
         }
+        if report.baseline_truncated {
+            out.push(self.warning(
+                "Baseline came from truncated enumerations — added names may be long-standing \
+                 (not counted as new until a complete run is recorded)",
+            ));
+        }
         out.push(format!(
             "{} added, {} removed, {} unchanged",
             self.value(&report.added.len().to_string()),

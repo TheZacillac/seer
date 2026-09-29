@@ -52,6 +52,12 @@ impl MarkdownFormatter {
                 at.format("%Y-%m-%d %H:%M UTC")
             );
         }
+        if report.baseline_truncated {
+            out.push_str(
+                "_Baseline came from truncated enumerations — added names may be long-standing \
+                 (not counted as new until a complete run is recorded)._\n\n",
+            );
+        }
         let _ = writeln!(
             out,
             "{} added, {} removed, {} unchanged.\n",

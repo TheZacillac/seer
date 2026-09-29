@@ -317,6 +317,7 @@ fn fixture_subdomain_baseline_diff() -> seer_core::subdomains::SubdomainBaseline
         removed: vec!["old.example.com".into()],
         unchanged_count: 12,
         baseline_missing: false,
+        baseline_truncated: false,
     }
 }
 
@@ -329,6 +330,7 @@ fn fixture_subdomain_baseline_diff_missing() -> seer_core::subdomains::Subdomain
         removed: Vec::new(),
         unchanged_count: 0,
         baseline_missing: true,
+        baseline_truncated: false,
     }
 }
 
@@ -847,6 +849,7 @@ fn fixture_subdomains() -> SubdomainResult {
         subdomains: vec!["api.example.com".into(), "www.example.com".into()],
         source: "crt.sh".into(),
         count: 2,
+        truncated: false,
     }
 }
 

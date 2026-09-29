@@ -710,6 +710,7 @@ the CLI and REPL; the TUI reads the output format and theme.
 | RDAP | 15s |
 | DNS | 5s (2 retries) |
 | HTTP / SSL | 10s |
+| CT logs (subdomains) | 30s per request (`ct_secs`); each source at most 3 of them |
 | Propagation | 15s |
 
 ### Bulk Operations

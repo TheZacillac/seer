@@ -329,9 +329,9 @@ pub async fn run(
         } => {
             let spinner = spinner(format!("Enumerating subdomains for {}", domain));
             if diff || record {
-                return subdomain_baseline(&domain, diff, record).await;
+                return subdomain_baseline(&domain, diff, record, config).await;
             }
-            let result = seer_core::SubdomainEnumerator::new()
+            let result = seer_core::SubdomainEnumerator::from_config(config)
                 .enumerate(&domain)
                 .await?;
             if resolve {
@@ -396,7 +396,7 @@ pub async fn run(
             // re-check of known hosts fast and independent of CT logs.
             let hosts = if hosts.is_empty() {
                 spinner.set_message("Enumerating subdomains via CT logs");
-                seer_core::SubdomainEnumerator::new()
+                seer_core::SubdomainEnumerator::from_config(config)
                     .enumerate(&domain)
                     .await?
                     .subdomains
@@ -489,8 +489,13 @@ pub fn trace_outcome(trace: seer_core::DnsTrace, short: bool) -> Outcome {
 /// baseline (see [`crate::ops::subdomain_baseline_check`]). With `diff` the
 /// result is the diff; `--record` alone shows the listing and confirms the
 /// write afterwards.
-async fn subdomain_baseline(domain: &str, diff: bool, record: bool) -> seer_core::Result<Outcome> {
-    let outcome = crate::ops::subdomain_baseline_check(domain, record).await?;
+async fn subdomain_baseline(
+    domain: &str,
+    diff: bool,
+    record: bool,
+    config: &SeerConfig,
+) -> seer_core::Result<Outcome> {
+    let outcome = crate::ops::subdomain_baseline_check(domain, record, config).await?;
     let name = outcome.result.domain.clone();
     Ok(if diff {
         Outcome {
