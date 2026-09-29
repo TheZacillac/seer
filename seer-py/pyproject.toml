@@ -12,8 +12,8 @@ readme = "README.md"
 license = { text = "MIT" }
 # Floor is 3.10: seer-api (and its mcp SDK dependency) requires >=3.10, so
 # advertising 3.9 here would fail at pip resolution time. The workspace pyo3
-# dependency still builds abi3-py39 wheels, which stay forward-compatible
-# with every newer CPython.
+# dependency builds matching abi3-py310 wheels, forward-compatible with every
+# newer CPython.
 requires-python = ">=3.10"
 classifiers = [
     "Development Status :: 4 - Beta",

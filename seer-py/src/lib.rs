@@ -87,30 +87,97 @@ fn get_runtime() -> &'static tokio::runtime::Runtime {
     })
 }
 
+/// Typed Python exceptions for the `SeerError` categories that have no
+/// builtin equivalent. All derive from `seer.SeerError`, itself a
+/// `RuntimeError` subclass, so `except RuntimeError` keeps catching them.
+/// Callers (seer-api's REST status mapping and MCP retry advice) branch on
+/// the class, never on the message text.
+mod exceptions {
+    use pyo3::create_exception;
+    use pyo3::exceptions::PyRuntimeError;
+
+    create_exception!(
+        seer,
+        SeerError,
+        PyRuntimeError,
+        "Base class of seer's typed errors (a RuntimeError subclass)."
+    );
+    create_exception!(
+        seer,
+        RateLimitedError,
+        SeerError,
+        "An upstream registry or service rate-limited the request; retry after a backoff."
+    );
+    create_exception!(
+        seer,
+        WhoisServerNotFoundError,
+        SeerError,
+        "No WHOIS server is known for the domain's TLD; retrying will not help."
+    );
+    create_exception!(seer, DnsError, SeerError, "DNS resolution failed.");
+    create_exception!(
+        seer,
+        UpstreamError,
+        SeerError,
+        "A WHOIS, RDAP or HTTP upstream failed; may be transient."
+    );
+    create_exception!(
+        seer,
+        LookupFailedError,
+        SeerError,
+        "Every lookup source failed for the domain; retrying will not help."
+    );
+    create_exception!(
+        seer,
+        ParseError,
+        SeerError,
+        "An upstream response could not be parsed."
+    );
+    create_exception!(
+        seer,
+        TlsError,
+        SeerError,
+        "Certificate or TLS inspection failed."
+    );
+    create_exception!(seer, ConfigError, SeerError, "Invalid seer configuration.");
+}
+
 /// Map a `SeerError` to a Python exception using the variant-aware
 /// `sanitized_message()` so that internal URLs, hostnames, and raw system
 /// errors never leak to Python callers. Validation-shaped errors become
-/// `ValueError`; everything else is a `RuntimeError`.
+/// `ValueError`, timeouts `TimeoutError`, WHOIS connect failures
+/// `ConnectionError`; every other category has its own `seer.SeerError`
+/// subclass (see [`exceptions`]).
 fn seer_err_to_py(e: &SeerError) -> PyErr {
+    use exceptions as ex;
     use SeerError::*;
+    let msg = e.sanitized_message();
     match e {
         InvalidInput(_)
         | InvalidDomain(_)
         | InvalidIpAddress(_)
         | InvalidRecordType(_)
-        | DomainNotAllowed { .. } => PyValueError::new_err(e.sanitized_message()),
-        // Map transient categories to specific Python builtin exceptions so
-        // downstream consumers (MCP server, direct seer-py users) can do
-        // targeted `except TimeoutError` / `except ConnectionError` retries
-        // instead of catching the broad `RuntimeError` umbrella.
-        Timeout(_) => PyTimeoutError::new_err(e.sanitized_message()),
-        WhoisConnectionFailed { .. } => PyConnectionError::new_err(e.sanitized_message()),
+        | DomainNotAllowed { .. } => PyValueError::new_err(msg),
+        Timeout(_) => PyTimeoutError::new_err(msg),
+        WhoisConnectionFailed { .. } => PyConnectionError::new_err(msg),
         // RetryExhausted wraps the retry framework's final failure; classify
         // by the inner error so a retried timeout still surfaces as
-        // TimeoutError (which seer-api maps to 504/502) rather than a generic
-        // RuntimeError. Recursion also unwraps layered retry wrappers.
+        // TimeoutError (which seer-api maps to 504) rather than a generic
+        // error. Recursion also unwraps layered retry wrappers.
         RetryExhausted { last_error, .. } => seer_err_to_py(last_error),
-        _ => PyRuntimeError::new_err(e.sanitized_message()),
+        RateLimited(_) => ex::RateLimitedError::new_err(msg),
+        WhoisServerNotFound(_) => ex::WhoisServerNotFoundError::new_err(msg),
+        DnsError(_) | DnsResolverError(_) => ex::DnsError::new_err(msg),
+        WhoisError(_)
+        | RdapError(_)
+        | RdapBootstrapError(_)
+        | HttpError(_)
+        | ReqwestError { .. } => ex::UpstreamError::new_err(msg),
+        LookupFailed { .. } => ex::LookupFailedError::new_err(msg),
+        JsonError(_) => ex::ParseError::new_err(msg),
+        CertificateError(_) | SslError(_) => ex::TlsError::new_err(msg),
+        ConfigError(_) => ex::ConfigError::new_err(msg),
+        _ => ex::SeerError::new_err(msg),
     }
 }
 
@@ -172,6 +239,53 @@ where
             )),
         },
     )
+}
+
+/// How often [`run_interruptible`] wakes to let Python handle pending signals.
+const SIGNAL_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// [`run_async`] for long-running calls that must stay interruptible.
+///
+/// `block_on` with the GIL released never returns to the interpreter, so a
+/// Ctrl-C raised during it is only seen once the whole call is over — up to
+/// an hour for `dns_follow`. Instead the future runs as a task on the shared
+/// runtime, and every [`SIGNAL_POLL`] the GIL is reattached to run
+/// `check_signals`; when a handler raises (`KeyboardInterrupt`), the task is
+/// aborted and that exception propagates.
+fn run_interruptible<F, T>(py: Python<'_>, fut: F) -> PyResult<T>
+where
+    F: Future<Output = seer_core::Result<T>> + Send + 'static,
+    T: Send + 'static,
+{
+    let mut task = get_runtime().spawn(fut);
+    loop {
+        let step = py.detach(|| {
+            catch_unwind(AssertUnwindSafe(|| {
+                // The timer is built inside the runtime: `timeout()` needs
+                // its time driver in context.
+                get_runtime().block_on(async { tokio::time::timeout(SIGNAL_POLL, &mut task).await })
+            }))
+        });
+        match step {
+            Ok(Ok(Ok(result))) => return result.map_err(|e| seer_err_to_py(&e)),
+            // The task panicked (or was aborted elsewhere).
+            Ok(Ok(Err(_join))) => {
+                return Err(PyRuntimeError::new_err("panic in seer runtime task"))
+            }
+            Ok(Err(_elapsed)) => {
+                if let Err(interrupt) = py.check_signals() {
+                    task.abort();
+                    return Err(interrupt);
+                }
+            }
+            Err(_) => {
+                task.abort();
+                return Err(PyRuntimeError::new_err(
+                    "panic in seer runtime (likely nested async context or internal bug)",
+                ));
+            }
+        }
+    }
 }
 
 // Process-wide core clients, each built on first use and shared by every call.
@@ -237,7 +351,6 @@ call_fn! {
     whois(domain: String) => WHOIS_CLIENT.lookup(&domain);
     rdap_domain(domain: String) => RDAP_CLIENT.lookup_domain(&domain);
     rdap_ip(ip: String) => RDAP_CLIENT.lookup_ip(&ip);
-    rdap_asn(asn: u32) => RDAP_CLIENT.lookup_asn(asn);
     /// Look up RDAP data for a domain, IP address or ASN. The shape of
     /// `query` picks the lookup:
     ///
@@ -256,6 +369,17 @@ call_fn! {
     posture(domain: String) => seer_core::lookup_email_posture(&DNS_RESOLVER, &domain);
     headers(domain: String)
         => seer_core::audit_headers(&domain, seer_core::DEFAULT_HEADER_TIMEOUT);
+}
+
+/// Look up RDAP data for an Autonomous System Number (0 to 4294967295).
+/// An out-of-range number raises ValueError.
+#[pyfunction]
+fn rdap_asn<'py>(py: Python<'py>, asn: i64) -> PyResult<Bound<'py, PyAny>> {
+    let asn = u32::try_from(asn).map_err(|_| {
+        PyValueError::new_err(format!("asn must be between 0 and 4294967295 (got {asn})"))
+    })?;
+    let response = run_async(py, async move { RDAP_CLIENT.lookup_asn(asn).await })?;
+    to_py(py, &response)
 }
 
 /// Query one DNS record type the way `dig` does and return the whole
@@ -378,20 +502,20 @@ const MAX_CONCURRENCY: usize = 50;
 /// `Vec` / JSON value / Python object graph with no backpressure (issue #58).
 const MAX_BULK_DOMAINS: usize = 100;
 
-/// Validates a requested bulk concurrency. The two bounds are intentionally
+/// Validates a requested bulk concurrency. The bounds are intentionally
 /// asymmetric: `> MAX_CONCURRENCY` is a hard ceiling and is *rejected* (a DoS
 /// guard — see issue #58), whereas `0` is a nonsensical request that is quietly
 /// *floored to 1* rather than erroring, so a caller that derives concurrency
 /// from arithmetic (e.g. `len / chunk`) can't accidentally deadlock on a
-/// zero-permit semaphore.
-fn validate_concurrency(concurrency: usize) -> PyResult<usize> {
-    if concurrency > MAX_CONCURRENCY {
-        return Err(PyValueError::new_err(format!(
-            "concurrency must be <= {} (got {})",
-            MAX_CONCURRENCY, concurrency
-        )));
+/// zero-permit semaphore. Taken as `i64` so a negative value raises this
+/// `ValueError` rather than PyO3's `OverflowError` for an unsigned parameter.
+fn validate_concurrency(concurrency: i64) -> PyResult<usize> {
+    match usize::try_from(concurrency) {
+        Ok(c) if c <= MAX_CONCURRENCY => Ok(c.max(1)),
+        _ => Err(PyValueError::new_err(format!(
+            "concurrency must be between 0 and {MAX_CONCURRENCY} (got {concurrency})"
+        ))),
     }
-    Ok(concurrency.max(1))
 }
 
 fn validate_domains(domains: &[String]) -> PyResult<()> {
@@ -573,7 +697,7 @@ fn execute_bulk<'py>(
 fn run_bulk<'py>(
     py: Python<'py>,
     domains: Vec<String>,
-    concurrency: usize,
+    concurrency: i64,
     progress: Option<Py<PyAny>>,
     op: impl Fn(String) -> BulkOperation,
 ) -> PyResult<Bound<'py, PyAny>> {
@@ -591,7 +715,7 @@ macro_rules! bulk_fn {
         fn $name<'py>(
             py: Python<'py>,
             domains: Vec<String>,
-            concurrency: usize,
+            concurrency: i64,
             progress: Option<Py<PyAny>>,
         ) -> PyResult<Bound<'py, PyAny>> {
             run_bulk(py, domains, concurrency, progress, |domain| {
@@ -616,7 +740,7 @@ fn bulk_dig<'py>(
     py: Python<'py>,
     domains: Vec<String>,
     record_type: &str,
-    concurrency: usize,
+    concurrency: i64,
     progress: Option<Py<PyAny>>,
 ) -> PyResult<Bound<'py, PyAny>> {
     validate_domains(&domains)?;
@@ -638,7 +762,7 @@ fn bulk_propagation<'py>(
     py: Python<'py>,
     domains: Vec<String>,
     record_type: &str,
-    concurrency: usize,
+    concurrency: i64,
     progress: Option<Py<PyAny>>,
 ) -> PyResult<Bound<'py, PyAny>> {
     validate_domains(&domains)?;
@@ -654,22 +778,20 @@ fn bulk_propagation<'py>(
     execute_bulk(py, operations, concurrency, progress)
 }
 
+/// CAA policy for a domain. The input goes to core as given: normalizing it
+/// is core's job (a presentation-layer `normalize_domain` here dropped `www.`,
+/// which has its own CAA answer).
 #[pyfunction]
 fn caa<'py>(py: Python<'py>, domain: String) -> PyResult<Bound<'py, PyAny>> {
-    let normalized = seer_core::normalize_domain(&domain).map_err(|e| seer_err_to_py(&e))?;
     let policy = run_async_infallible(py, async move {
-        seer_core::caa::lookup_caa(&DNS_RESOLVER, &normalized).await
+        seer_core::caa::lookup_caa(&DNS_RESOLVER, &domain).await
     })?;
     to_py(py, &policy)
 }
 
 #[pyfunction]
 #[pyo3(signature = (domain, concurrency = 10))]
-fn takeover<'py>(
-    py: Python<'py>,
-    domain: String,
-    concurrency: usize,
-) -> PyResult<Bound<'py, PyAny>> {
+fn takeover<'py>(py: Python<'py>, domain: String, concurrency: i64) -> PyResult<Bound<'py, PyAny>> {
     let concurrency = validate_concurrency(concurrency)?;
     let response = run_async(py, async move {
         let result = SUBDOMAIN_ENUMERATOR.enumerate(&domain).await?;
@@ -689,7 +811,7 @@ fn takeover<'py>(
 fn confusables<'py>(
     py: Python<'py>,
     domain: String,
-    concurrency: usize,
+    concurrency: i64,
 ) -> PyResult<Bound<'py, PyAny>> {
     let concurrency = validate_concurrency(concurrency)?;
     let response = run_async(py, async move {
@@ -703,7 +825,7 @@ fn confusables<'py>(
 fn subdomains_classify<'py>(
     py: Python<'py>,
     domain: String,
-    concurrency: usize,
+    concurrency: i64,
 ) -> PyResult<Bound<'py, PyAny>> {
     let concurrency = validate_concurrency(concurrency)?;
     let response = run_async(py, async move {
@@ -747,7 +869,7 @@ fn dns_follow<'py>(
     domain: String,
     record_type: &str,
     nameserver: Option<String>,
-    iterations: usize,
+    iterations: i64,
     interval_minutes: f64,
 ) -> PyResult<Bound<'py, PyAny>> {
     // Refuse concurrent calls before touching any shared state — a second
@@ -756,6 +878,10 @@ fn dns_follow<'py>(
     let _active = FollowActiveGuard::acquire()?;
 
     let rt_parsed = parse_record_type(record_type)?;
+    // `i64` so a negative count is this ValueError, not an OverflowError.
+    let iterations = usize::try_from(iterations).map_err(|_| {
+        PyValueError::new_err(format!("iterations must be >= 0 (got {iterations})"))
+    })?;
 
     // Validate iteration/interval via core; this rejects NaN/inf/negative and
     // enforces the per-interval cap (<= 60 minutes).
@@ -793,7 +919,7 @@ fn dns_follow<'py>(
         rx
     };
 
-    let response = run_async(py, async move {
+    let response = run_interruptible(py, async move {
         DNS_FOLLOWER
             .follow(
                 &domain,
@@ -1011,6 +1137,17 @@ fn _raise_retry_exhausted_for_test(kind: &str) -> PyResult<()> {
         "timeout" => SeerError::Timeout("operation timed out".to_string()),
         "connection" => SeerError::WhoisConnectionFailed("connection refused".to_string()),
         "rate_limited" => SeerError::RateLimited("throttled".to_string()),
+        "whois_server_not_found" => SeerError::WhoisServerNotFound("zz".to_string()),
+        "dns" => SeerError::DnsError("SERVFAIL".to_string()),
+        "upstream" => SeerError::RdapError("HTTP 503".to_string()),
+        "lookup_failed" => SeerError::LookupFailed {
+            domain: "example.com".to_string(),
+            details: "all sources failed".to_string(),
+            registry_url: "https://registry.test".to_string(),
+        },
+        "tls" => SeerError::SslError("handshake failed".to_string()),
+        "config" => SeerError::ConfigError("bad value".to_string()),
+        "other" => SeerError::Other("internal".to_string()),
         // Doubly wrapped: layered retries must still unwrap to the leaf type.
         "nested_timeout" => SeerError::RetryExhausted {
             attempts: 2,
@@ -1046,9 +1183,26 @@ mod _seer {
     /// events too, via tracing's `log` feature, since no tracing subscriber
     /// is installed inside a Python process. Runs once, at import;
     /// `try_init` leaves an already-installed logger alone.
+    ///
+    /// Also registers the typed exception classes (see `exceptions`).
     #[pymodule_init]
-    fn init(_m: &pyo3::Bound<'_, pyo3::types::PyModule>) -> pyo3::PyResult<()> {
+    fn init(m: &pyo3::Bound<'_, pyo3::types::PyModule>) -> pyo3::PyResult<()> {
+        use super::exceptions as ex;
+        use pyo3::prelude::*;
         let _ = pyo3_log::try_init();
+        let py = m.py();
+        m.add("SeerError", py.get_type::<ex::SeerError>())?;
+        m.add("RateLimitedError", py.get_type::<ex::RateLimitedError>())?;
+        m.add(
+            "WhoisServerNotFoundError",
+            py.get_type::<ex::WhoisServerNotFoundError>(),
+        )?;
+        m.add("DnsError", py.get_type::<ex::DnsError>())?;
+        m.add("UpstreamError", py.get_type::<ex::UpstreamError>())?;
+        m.add("LookupFailedError", py.get_type::<ex::LookupFailedError>())?;
+        m.add("ParseError", py.get_type::<ex::ParseError>())?;
+        m.add("TlsError", py.get_type::<ex::TlsError>())?;
+        m.add("ConfigError", py.get_type::<ex::ConfigError>())?;
         Ok(())
     }
 }

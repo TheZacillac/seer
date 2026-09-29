@@ -26,9 +26,8 @@ def test_takeover_invalid_domain_raises_value_error(bad):
 @pytest.mark.parametrize("bad_concurrency", [-1, 51, 1000])
 def test_takeover_rejects_out_of_range_concurrency(bad_concurrency):
     # validate_concurrency rejects before any enumeration, keeping this
-    # hermetic even though the domain itself is valid. A negative value fails
-    # earlier still, in the usize conversion (OverflowError).
-    with pytest.raises((ValueError, OverflowError)):
+    # hermetic even though the domain itself is valid.
+    with pytest.raises(ValueError):
         seer.takeover("example.com", bad_concurrency)
 
 
