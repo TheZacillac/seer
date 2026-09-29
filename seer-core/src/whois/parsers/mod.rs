@@ -65,7 +65,7 @@ const PARSERS: &[(&[&str], ParseFn)] = &[
 pub(crate) fn parse(domain: &str, server: &str, raw: &str) -> WhoisResponse {
     let zones: Vec<String> = [
         extract_second_level_tld(domain),
-        super::get_tld(domain).map(str::to_lowercase),
+        Some(super::get_tld(domain).to_lowercase()),
     ]
     .into_iter()
     .flatten()

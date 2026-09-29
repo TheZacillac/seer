@@ -114,193 +114,170 @@ impl RetryPolicy {
     }
 }
 
-/// Trait for classifying whether an error is retryable.
-pub trait RetryClassifier: Send + Sync {
-    /// Returns true if the error is transient and the operation should be retried.
-    fn is_retryable(&self, error: &SeerError) -> bool;
-}
-
-/// Default classifier for network operations (WHOIS/RDAP).
+/// Whether `error` is transient, so a WHOIS/RDAP operation is worth retrying.
 ///
-/// Classifies the following as retryable:
+/// Retryable:
 /// - Timeouts
 /// - Connection failures (IO errors)
 /// - Rate limiting (429)
 /// - Server errors (5xx)
 ///
-/// Non-retryable errors:
+/// Not retryable:
 /// - Invalid input (domain, IP, record type)
 /// - Server not found
 /// - Parse errors (JSON, WHOIS format)
-#[derive(Debug, Clone, Default)]
-pub struct NetworkRetryClassifier;
+pub fn is_retryable(error: &SeerError) -> bool {
+    match error {
+        // Transient errors - worth retrying
+        SeerError::Timeout(_) => true,
+        SeerError::WhoisConnectionFailed(_) => true,
+        SeerError::RateLimited(_) => true,
 
-impl NetworkRetryClassifier {
-    pub fn new() -> Self {
-        Self
-    }
-}
+        // Transiency was already classified at the From<reqwest::Error>
+        // boundary (see error.rs); just read the stored flag.
+        SeerError::ReqwestError { transient, .. } => *transient,
 
-impl RetryClassifier for NetworkRetryClassifier {
-    fn is_retryable(&self, error: &SeerError) -> bool {
-        match error {
-            // Transient errors - worth retrying
-            SeerError::Timeout(_) => true,
-            SeerError::WhoisConnectionFailed(_) => true,
-            SeerError::RateLimited(_) => true,
-
-            // Transiency was already classified at the From<reqwest::Error>
-            // boundary (see error.rs); just read the stored flag.
-            SeerError::ReqwestError { transient, .. } => *transient,
-
-            // WHOIS errors might be transient if they're connection-related
-            SeerError::WhoisError(msg) => {
-                let lower = msg.to_lowercase();
-                lower.contains("connection")
-                    || lower.contains("timeout")
-                    || lower.contains("refused")
-                    || lower.contains("reset")
-            }
-
-            // RDAP errors might be transient server errors
-            SeerError::RdapError(msg) => {
-                let lower = msg.to_lowercase();
-                lower.contains("status 5")
-                    || lower.contains("status 429")
-                    || lower.contains("timeout")
-            }
-
-            // Bootstrap errors could be transient if IANA is temporarily
-            // unavailable. "all IANA bootstrap registries failed" is exactly
-            // that case (every fetch errored), so it must be retryable —
-            // otherwise the bootstrap loader's retry policy never retries.
-            // "no RDAP server for ..." and "throttled and no cache" are not.
-            SeerError::RdapBootstrapError(msg) => {
-                let lower = msg.to_lowercase();
-                lower.contains("timeout")
-                    || lower.contains("connection")
-                    || lower.contains("registries failed")
-            }
-
-            // DNS errors can be transient
-            SeerError::DnsError(msg) => {
-                let lower = msg.to_lowercase();
-                lower.contains("timeout") || lower.contains("temporary")
-            }
-
-            // HTTP errors might be transient (server errors 5xx or 429 Too Many Requests)
-            SeerError::HttpError(msg) => {
-                let lower = msg.to_lowercase();
-                lower.contains("timeout")
-                    || lower.contains("connection")
-                    || lower.contains("status 5")
-                    || lower.contains("status 429")
-            }
-
-            // Not retryable - permanent failures
-            SeerError::InvalidDomain(_) => false,
-            SeerError::DomainNotAllowed { .. } => false,
-            SeerError::InvalidIpAddress(_) => false,
-            SeerError::InvalidRecordType(_) => false,
-            SeerError::WhoisServerNotFound(_) => false,
-            SeerError::JsonError(_) => false,
-            SeerError::CertificateError(_) => false,
-            SeerError::SslError(_) => false,
-            SeerError::DnsResolverError(_) => false,
-            SeerError::BulkOperationError { .. } => false,
-            SeerError::LookupFailed { .. } => false,
-            SeerError::ConfigError(_) => false,
-            SeerError::InvalidInput(_) => false,
-            // Transparent pass-through: if a prior attempt was wrapped into
-            // RetryExhausted upstream, defer the retryable decision to the
-            // underlying cause so a caller layering retries still sees the
-            // true fault classification instead of a non-retryable wrapper.
-            SeerError::RetryExhausted { last_error, .. } => self.is_retryable(last_error),
-            SeerError::Other(_) => false,
+        // WHOIS errors might be transient if they're connection-related
+        SeerError::WhoisError(msg) => {
+            let lower = msg.to_lowercase();
+            lower.contains("connection")
+                || lower.contains("timeout")
+                || lower.contains("refused")
+                || lower.contains("reset")
         }
+
+        // RDAP errors might be transient server errors
+        SeerError::RdapError(msg) => {
+            let lower = msg.to_lowercase();
+            lower.contains("status 5") || lower.contains("status 429") || lower.contains("timeout")
+        }
+
+        // Bootstrap errors could be transient if IANA is temporarily
+        // unavailable. "all IANA bootstrap registries failed" is exactly
+        // that case (every fetch errored), so it must be retryable —
+        // otherwise the bootstrap loader's retry policy never retries.
+        // "no RDAP server for ..." and "throttled and no cache" are not.
+        SeerError::RdapBootstrapError(msg) => {
+            let lower = msg.to_lowercase();
+            lower.contains("timeout")
+                || lower.contains("connection")
+                || lower.contains("registries failed")
+        }
+
+        // DNS errors can be transient
+        SeerError::DnsError(msg) => {
+            let lower = msg.to_lowercase();
+            lower.contains("timeout") || lower.contains("temporary")
+        }
+
+        // HTTP errors might be transient (server errors 5xx or 429 Too Many Requests)
+        SeerError::HttpError(msg) => {
+            let lower = msg.to_lowercase();
+            lower.contains("timeout")
+                || lower.contains("connection")
+                || lower.contains("status 5")
+                || lower.contains("status 429")
+        }
+
+        // Not retryable - permanent failures
+        SeerError::InvalidDomain(_) => false,
+        SeerError::DomainNotAllowed { .. } => false,
+        SeerError::InvalidIpAddress(_) => false,
+        SeerError::InvalidRecordType(_) => false,
+        SeerError::WhoisServerNotFound(_) => false,
+        SeerError::JsonError(_) => false,
+        SeerError::CertificateError(_) => false,
+        SeerError::SslError(_) => false,
+        SeerError::DnsResolverError(_) => false,
+        SeerError::BulkOperationError { .. } => false,
+        SeerError::LookupFailed { .. } => false,
+        SeerError::ConfigError(_) => false,
+        SeerError::InvalidInput(_) => false,
+        // Transparent pass-through: if a prior attempt was wrapped into
+        // RetryExhausted upstream, defer the retryable decision to the
+        // underlying cause so a caller layering retries still sees the
+        // true fault classification instead of a non-retryable wrapper.
+        SeerError::RetryExhausted { last_error, .. } => is_retryable(last_error),
+        SeerError::Other(_) => false,
     }
 }
 
 /// Executes operations with retry logic using exponential backoff.
 #[derive(Debug, Clone)]
-pub struct RetryExecutor<C: RetryClassifier> {
+pub struct RetryExecutor {
     policy: RetryPolicy,
-    classifier: C,
 }
 
-impl RetryExecutor<NetworkRetryClassifier> {
-    /// Creates a new executor with the default network retry classifier.
+impl RetryExecutor {
+    /// Creates a new executor for `policy`.
     pub fn new(policy: RetryPolicy) -> Self {
-        Self {
-            policy,
-            classifier: NetworkRetryClassifier::new(),
-        }
-    }
-}
-
-impl<C: RetryClassifier> RetryExecutor<C> {
-    /// Creates a new executor with a custom classifier.
-    pub fn with_classifier(policy: RetryPolicy, classifier: C) -> Self {
-        Self { policy, classifier }
+        Self { policy }
     }
 
     /// Executes an async operation with retry logic.
     ///
     /// The operation will be retried up to `max_attempts` times if it fails
-    /// with a retryable error. Delays between retries follow exponential
-    /// backoff with optional jitter.
+    /// with a retryable error (see [`is_retryable`]). Delays between retries
+    /// follow exponential backoff with optional jitter.
     pub async fn execute<F, Fut, T>(&self, mut operation: F) -> Result<T>
     where
         F: FnMut() -> Fut,
         Fut: Future<Output = Result<T>>,
     {
-        let mut last_error: Option<SeerError> = None;
+        self.execute_with_delay_hint(|| {
+            let attempt = operation();
+            async move { attempt.await.map_err(|e| (e, None)) }
+        })
+        .await
+    }
+
+    /// Like [`execute`](Self::execute), but each failure may carry a
+    /// server-suggested delay (an HTTP 429 `Retry-After`). A hint replaces the
+    /// backoff for that retry, capped at the policy's
+    /// [`max_delay`](RetryPolicy::max_delay) so a hostile or misconfigured
+    /// header cannot pin the caller.
+    pub async fn execute_with_delay_hint<F, Fut, T>(&self, mut operation: F) -> Result<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = std::result::Result<T, (SeerError, Option<Duration>)>>,
+    {
         let mut attempt = 0;
-
-        while attempt < self.policy.max_attempts {
-            match operation().await {
+        loop {
+            let (e, hint) = match operation().await {
                 Ok(result) => return Ok(result),
-                Err(e) => {
-                    let is_retryable = self.classifier.is_retryable(&e);
-                    let attempts_remaining = self.policy.max_attempts - attempt - 1;
-
-                    if !is_retryable || attempts_remaining == 0 {
-                        if attempt > 0 {
-                            debug!(
-                                attempt = attempt + 1,
-                                max_attempts = self.policy.max_attempts,
-                                error = %e,
-                                "Operation failed after retries"
-                            );
-                        }
-                        return Err(if attempt > 0 {
-                            SeerError::RetryExhausted {
-                                attempts: attempt + 1,
-                                last_error: Box::new(e),
-                            }
-                        } else {
-                            e
-                        });
-                    }
-
-                    let delay = self.policy.delay_for_attempt(attempt);
-                    debug!(
-                        attempt = attempt + 1,
-                        max_attempts = self.policy.max_attempts,
-                        delay_ms = delay.as_millis(),
-                        error = %e,
-                        "Retrying after transient error"
-                    );
-
-                    last_error = Some(e);
-                    tokio::time::sleep(delay).await;
-                    attempt += 1;
+                Err(failure) => failure,
+            };
+            let attempts_remaining = self.policy.max_attempts.saturating_sub(attempt + 1);
+            if !is_retryable(&e) || attempts_remaining == 0 {
+                if attempt == 0 {
+                    return Err(e);
                 }
+                debug!(
+                    attempt = attempt + 1,
+                    max_attempts = self.policy.max_attempts,
+                    error = %e,
+                    "Operation failed after retries"
+                );
+                return Err(SeerError::RetryExhausted {
+                    attempts: attempt + 1,
+                    last_error: Box::new(e),
+                });
             }
-        }
 
-        // Should not reach here, but handle it gracefully
-        Err(last_error.unwrap_or_else(|| SeerError::Other("retry loop exited unexpectedly".into())))
+            let delay = match hint {
+                Some(hint) => hint.min(self.policy.max_delay),
+                None => self.policy.delay_for_attempt(attempt),
+            };
+            debug!(
+                attempt = attempt + 1,
+                max_attempts = self.policy.max_attempts,
+                delay_ms = delay.as_millis(),
+                error = %e,
+                "Retrying after transient error"
+            );
+            tokio::time::sleep(delay).await;
+            attempt += 1;
+        }
     }
 }
 
@@ -384,38 +361,35 @@ mod tests {
 
     #[test]
     fn test_classifier_timeout_is_retryable() {
-        let classifier = NetworkRetryClassifier::new();
-        assert!(classifier.is_retryable(&SeerError::Timeout("test".to_string())));
+        assert!(is_retryable(&SeerError::Timeout("test".to_string())));
     }
 
     #[test]
     fn test_classifier_invalid_domain_not_retryable() {
-        let classifier = NetworkRetryClassifier::new();
-        assert!(!classifier.is_retryable(&SeerError::InvalidDomain("test".to_string())));
+        assert!(!is_retryable(&SeerError::InvalidDomain("test".to_string())));
     }
 
     #[test]
     fn test_classifier_server_not_found_not_retryable() {
-        let classifier = NetworkRetryClassifier::new();
-        assert!(!classifier.is_retryable(&SeerError::WhoisServerNotFound("test".to_string())));
+        assert!(!is_retryable(&SeerError::WhoisServerNotFound(
+            "test".to_string()
+        )));
     }
 
     #[test]
     fn test_classifier_rate_limited_is_retryable() {
-        let classifier = NetworkRetryClassifier::new();
-        assert!(classifier.is_retryable(&SeerError::RateLimited("test".to_string())));
+        assert!(is_retryable(&SeerError::RateLimited("test".to_string())));
     }
 
     #[test]
     fn test_classifier_reads_reqwest_transient_flag() {
         // Transiency is classified once at the From<reqwest::Error> boundary
         // (tested in error.rs); the classifier only reads the stored flag.
-        let classifier = NetworkRetryClassifier::new();
-        assert!(classifier.is_retryable(&SeerError::ReqwestError {
+        assert!(is_retryable(&SeerError::ReqwestError {
             message: "HTTP status server error (503 Service Unavailable)".to_string(),
             transient: true,
         }));
-        assert!(!classifier.is_retryable(&SeerError::ReqwestError {
+        assert!(!is_retryable(&SeerError::ReqwestError {
             message: "HTTP status client error (404 Not Found)".to_string(),
             transient: false,
         }));
@@ -528,40 +502,63 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_executor_with_custom_classifier() {
-        // Retries what NetworkRetryClassifier never would (InvalidDomain), so
-        // three attempts prove the supplied classifier is the one consulted.
-        struct RetryEverything;
-        impl RetryClassifier for RetryEverything {
-            fn is_retryable(&self, _: &SeerError) -> bool {
-                true
-            }
-        }
-
+    #[tokio::test(start_paused = true)]
+    async fn delay_hint_replaces_backoff_and_is_capped_at_max_delay() {
+        // A server hint (Retry-After) wins over the backoff, but never waits
+        // past `max_delay`: the 60s hint here is honored as 2s.
         let policy = RetryPolicy::new()
-            .with_max_attempts(3)
+            .with_max_attempts(2)
             .with_initial_delay(Duration::from_millis(1))
+            .with_max_delay(Duration::from_secs(2))
             .with_jitter(false);
-        let executor = RetryExecutor::with_classifier(policy, RetryEverything);
         let attempts = Arc::new(AtomicUsize::new(0));
-
-        let attempts_clone = attempts.clone();
-        let result: Result<&str> = executor
-            .execute(|| {
-                let a = attempts_clone.clone();
+        let start = tokio::time::Instant::now();
+        let a = attempts.clone();
+        let result: Result<&str> = RetryExecutor::new(policy)
+            .execute_with_delay_hint(|| {
+                let a = a.clone();
                 async move {
-                    a.fetch_add(1, Ordering::SeqCst);
-                    Err(SeerError::InvalidDomain("bad.".to_string()))
+                    if a.fetch_add(1, Ordering::SeqCst) == 0 {
+                        Err((
+                            SeerError::RateLimited("429".to_string()),
+                            Some(Duration::from_secs(60)),
+                        ))
+                    } else {
+                        Ok("ok")
+                    }
                 }
             })
             .await;
+        assert_eq!(result.unwrap(), "ok");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(start.elapsed(), Duration::from_secs(2));
+    }
 
-        assert!(matches!(
-            result,
-            Err(SeerError::RetryExhausted { attempts: 3, .. })
-        ));
-        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    #[tokio::test(start_paused = true)]
+    async fn short_delay_hint_is_honored_over_backoff() {
+        let policy = RetryPolicy::new()
+            .with_max_attempts(2)
+            .with_initial_delay(Duration::from_secs(4))
+            .with_jitter(false);
+        let start = tokio::time::Instant::now();
+        let first = Arc::new(AtomicUsize::new(0));
+        let result: Result<()> = RetryExecutor::new(policy)
+            .execute_with_delay_hint(|| {
+                let first = first.clone();
+                async move {
+                    if first.fetch_add(1, Ordering::SeqCst) == 0 {
+                        Err((
+                            SeerError::RateLimited("429".to_string()),
+                            Some(Duration::from_secs(1)),
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                }
+            })
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(start.elapsed(), Duration::from_secs(1));
     }
 
     #[test]
@@ -595,7 +592,6 @@ mod tests {
         // RetryExhausted wrapper so a caller layering retries can still see
         // the true underlying fault classification instead of collapsing to
         // a non-retryable wrapper.
-        let classifier = NetworkRetryClassifier::new();
 
         let retryable_inner = SeerError::Timeout("inner timed out".to_string());
         let wrapped_retryable = SeerError::RetryExhausted {
@@ -603,7 +599,7 @@ mod tests {
             last_error: Box::new(retryable_inner),
         };
         assert!(
-            classifier.is_retryable(&wrapped_retryable),
+            is_retryable(&wrapped_retryable),
             "RetryExhausted wrapping a retryable Timeout should be retryable",
         );
 
@@ -613,7 +609,7 @@ mod tests {
             last_error: Box::new(non_retryable_inner),
         };
         assert!(
-            !classifier.is_retryable(&wrapped_non_retryable),
+            !is_retryable(&wrapped_non_retryable),
             "RetryExhausted wrapping a non-retryable InvalidDomain must not be retryable",
         );
     }
@@ -623,15 +619,14 @@ mod tests {
         // The RDAP bootstrap loader retries through RetryExecutor; if its
         // "every IANA registry fetch failed" error isn't classified as
         // transient, the retry policy never gets a second attempt.
-        let classifier = NetworkRetryClassifier::new();
-        assert!(classifier.is_retryable(&SeerError::RdapBootstrapError(
+        assert!(is_retryable(&SeerError::RdapBootstrapError(
             "all IANA bootstrap registries failed".to_string()
         )));
         // Permanent bootstrap outcomes stay non-retryable.
-        assert!(!classifier.is_retryable(&SeerError::RdapBootstrapError(
+        assert!(!is_retryable(&SeerError::RdapBootstrapError(
             "no RDAP server for example.ru".to_string()
         )));
-        assert!(!classifier.is_retryable(&SeerError::RdapBootstrapError(
+        assert!(!is_retryable(&SeerError::RdapBootstrapError(
             "bootstrap refresh throttled and no cache available".to_string()
         )));
     }

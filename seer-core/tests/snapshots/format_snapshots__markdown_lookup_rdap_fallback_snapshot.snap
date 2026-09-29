@@ -2,7 +2,7 @@
 source: seer-core/tests/format_snapshots.rs
 expression: markdown ().format_lookup (& fixture_lookup_rdap_with_whois_fallback())
 ---
-## Lookup: EXAMPLE.COM
+## Lookup: example.com
 
 - **Source**: RDAP
 - **Registrar**: Mock Registrar Inc.

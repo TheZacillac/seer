@@ -828,9 +828,8 @@ pub(crate) fn parse_date_with_order(date_str: &str, order: DateOrder) -> Option<
         "%Y-%m-%d %H:%M:%S",
         "%d-%b-%Y %H:%M:%S",
         "%d-%b-%Y %H:%M:%S%.f",
-        // " UTC" gets normalized to "Z" at the top of parse_date(); match both
+        // " UTC" is normalized to "Z" at the top, so this also reads "... UTC".
         "%d-%b-%Y %H:%M:%SZ",
-        "%d-%b-%Y %H:%M:%S UTC",
         "%Y-%m-%d",
         "%d-%b-%Y",
         "%d-%B-%Y",
@@ -1426,7 +1425,7 @@ Name Server: ns1.example.com
 
     #[test]
     fn indicates_registry_refusal_detects_throttle_and_negation() {
-        // The refusal detector backs decide_fallback's inconclusive routing: a
+        // The refusal detector backs `classify_fallback`'s inconclusive routing: a
         // thin body that explicitly refuses / throttles / negates availability
         // must be flagged so the fallback decision does not guess.
         for raw in [

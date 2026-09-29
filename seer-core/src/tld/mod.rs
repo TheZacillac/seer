@@ -1,4 +1,5 @@
-//! TLD information: [`lookup_tld`] combines the static WHOIS server table,
+//! TLD information: [`lookup_tld`] (or [`lookup_tld_with`] and a configured
+//! [`RdapClient`]) combines the static WHOIS server table,
 //! the IANA RDAP bootstrap and the registry URL into a [`TldInfo`];
 //! [`all_tlds`] is the full catalog seer knows about.
 
@@ -37,16 +38,25 @@ pub struct TldInfo {
 ///
 /// # Returns
 /// A `TldInfo` struct with all available information about the TLD.
+///
+/// Uses a default [`RdapClient`]; [`lookup_tld_with`] takes one built from
+/// the user config instead.
 pub async fn lookup_tld(tld: &str) -> TldInfo {
+    lookup_tld_with(tld, &RdapClient::new()).await
+}
+
+/// Like [`lookup_tld`], resolving the RDAP endpoint through `rdap` (e.g.
+/// [`RdapClient::from_config`], so a bootstrap load honors the configured
+/// RDAP timeout and retry policy).
+pub async fn lookup_tld_with(tld: &str, rdap: &RdapClient) -> TldInfo {
     let tld = tld.trim_start_matches('.').to_lowercase();
 
     let whois_server = get_whois_server(&tld).map(|s| s.to_string());
-    let registry_url = get_registry_url(&tld);
+    let registry_url = Some(get_registry_url(&tld));
     let tld_type = classify_tld(&tld);
 
     // Try to get RDAP URL from bootstrap data
-    let rdap_client = RdapClient::new();
-    let rdap_url = rdap_client.get_rdap_base_url_for_tld(&tld).await;
+    let rdap_url = rdap.get_rdap_base_url_for_tld(&tld).await;
 
     TldInfo {
         tld,

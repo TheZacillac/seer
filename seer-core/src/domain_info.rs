@@ -16,7 +16,11 @@ pub enum DomainInfoSource {
     Rdap,
     /// Only WHOIS data was available.
     Whois,
-    /// Neither protocol returned data; the domain may be available.
+    /// The result is an availability verdict (see
+    /// [`DomainInfo::availability_verdict`]) rather than a registration
+    /// record: the registries gave no usable record, and any WHOIS fields
+    /// merged alongside a not-available verdict are partial. Also used when
+    /// neither source is supplied to [`DomainInfo::from_sources`].
     Available,
 }
 
@@ -209,8 +213,10 @@ pub struct DomainInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub registrar_url: Option<String>,
 
-    /// Availability verdict: `"available"` / `"likely_available"` / `"unknown"`
-    /// when derived from a `LookupResult::Available`. `None` otherwise.
+    /// Availability verdict when derived from a `LookupResult::Available` —
+    /// one of [`AvailabilityResult::verdict`](crate::AvailabilityResult::verdict)'s
+    /// `"available"`, `"likely_available"`, `"registered"`,
+    /// `"likely_registered"` or `"unknown"`. `None` otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub availability_verdict: Option<String>,
 
@@ -418,7 +424,11 @@ impl DomainInfo {
                 data,
                 whois_fallback,
             } => Self::from_sources(
-                data.domain_name().unwrap_or("unknown"),
+                // Normalized like the WHOIS arm's queried name, so `domain`
+                // does not depend on which protocol answered.
+                &result
+                    .domain_name()
+                    .unwrap_or_else(|| "unknown".to_string()),
                 Some(data),
                 whois_fallback.as_ref(),
             ),
@@ -702,6 +712,20 @@ mod tests {
         assert_eq!(info.registrar.as_deref(), Some("RDAP Registrar LLC"));
         // WHOIS fills gaps
         assert_eq!(info.registrant.as_deref(), Some("John Doe"));
+    }
+
+    #[test]
+    fn from_lookup_result_rdap_domain_is_lowercase() {
+        let mut rdap = make_test_rdap();
+        rdap.ldh_name = Some("EXAMPLE.COM".to_string());
+        let result = LookupResult::Rdap {
+            data: Box::new(rdap),
+            whois_fallback: None,
+        };
+        assert_eq!(
+            DomainInfo::from_lookup_result(&result).domain,
+            "example.com"
+        );
     }
 
     #[test]
