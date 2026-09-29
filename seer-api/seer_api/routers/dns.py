@@ -6,6 +6,7 @@ import seer
 from seer_api._contract import (
     BULK_LIMIT,
     HEAVY_LIMIT,
+    NAMESERVER_MAX_LENGTH,
     RECORD_TYPE_MAX_LENGTH,
     RECORD_TYPE_PATTERN,
     BulkRecordRequest,
@@ -14,7 +15,7 @@ from seer_api._contract import (
 from seer_api._run import run_seer
 from seer_api.errors import as_http
 from seer_api.limiting import limiter
-from seer_api.ssrf import guard_nameserver_async
+from seer_api.ssrf import guarded
 from seer_api.streaming import stream_bulk
 
 router = APIRouter()
@@ -58,8 +59,12 @@ async def dns_trace(
 async def dns_compare(
     request: Request,
     domain: Domain,
-    server_a: str = Query(..., description="First nameserver (e.g. 8.8.8.8)"),
-    server_b: str = Query(..., description="Second nameserver (e.g. 1.1.1.1)"),
+    server_a: str = Query(
+        ..., max_length=NAMESERVER_MAX_LENGTH, description="First nameserver (e.g. 8.8.8.8)"
+    ),
+    server_b: str = Query(
+        ..., max_length=NAMESERVER_MAX_LENGTH, description="Second nameserver (e.g. 1.1.1.1)"
+    ),
     record_type: str = Query(
         "A", max_length=RECORD_TYPE_MAX_LENGTH, pattern=RECORD_TYPE_PATTERN
     ),
@@ -67,10 +72,9 @@ async def dns_compare(
     """Compare DNS records for a domain across two nameservers."""
     # Both servers are actual connect targets, so guard them. Each is a
     # nameserver spec (UDP / tls:// / https://), not a bare hostname.
-    await guard_nameserver_async(server_a)
-    await guard_nameserver_async(server_b)
+    compare = guarded(seer.dns_compare, nameservers=[server_a, server_b])
     return await as_http(
-        run_seer(seer.dns_compare, domain, record_type, server_a, server_b),
+        run_seer(compare, domain, record_type, server_a, server_b),
         "DNS comparison failed",
     )
 
@@ -83,7 +87,12 @@ async def dns_lookup(
     record_type: str = Path(
         ..., max_length=RECORD_TYPE_MAX_LENGTH, pattern=RECORD_TYPE_PATTERN
     ),
-    nameserver: str | None = Query(None, description="Nameserver to query"),
+    nameserver: str | None = Query(
+        None,
+        max_length=NAMESERVER_MAX_LENGTH,
+        description="Nameserver to query: an IP or hostname with an optional port (UDP), "
+        "tls://host[:port] or https://host[:port][/path]",
+    ),
 ):
     """
     Query DNS for a domain, reporting the response the way ``dig`` does.
@@ -110,13 +119,12 @@ async def dns_lookup(
     # Guard the nameserver (it's the actual connect target) but NOT the
     # queried domain — the domain is a DNS question, not a destination. The
     # nameserver is a spec (UDP / tls:// / https://), not a bare hostname.
-    if nameserver is not None:
-        await guard_nameserver_async(nameserver)
-    return await as_http(run_seer(seer.dig, domain, record_type, nameserver), "DNS lookup failed")
+    dig = guarded(seer.dig, nameservers=[nameserver] if nameserver is not None else [])
+    return await as_http(run_seer(dig, domain, record_type, nameserver), "DNS lookup failed")
 
 
 @router.post("/bulk")
-@limiter.limit(BULK_LIMIT)
+@limiter.shared_limit(BULK_LIMIT, scope="bulk_dns")
 async def bulk_dns_lookup(request: Request, body: BulkRecordRequest):
     """
     Query DNS records for multiple domains.
@@ -134,7 +142,7 @@ async def bulk_dns_lookup(request: Request, body: BulkRecordRequest):
 
 
 @router.post("/bulk/stream")
-@limiter.limit(BULK_LIMIT)
+@limiter.shared_limit(BULK_LIMIT, scope="bulk_dns")
 async def bulk_dns_stream(request: Request, body: BulkRecordRequest):
     """Stream bulk DNS queries as Server-Sent Events."""
     return await as_http(

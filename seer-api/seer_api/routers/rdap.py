@@ -3,20 +3,18 @@
 from fastapi import APIRouter, Path, Request
 
 import seer
+from seer_api._contract import Domain
 from seer_api._run import run_seer
 from seer_api.errors import as_http
 from seer_api.limiting import limiter
-from seer_api.ssrf import guard_async as ssrf_guard_async
+from seer_api.ssrf import guarded
 
 router = APIRouter()
 
 
 @router.get("/domain/{domain}")
 @limiter.limit("30/minute")
-async def rdap_domain_lookup(
-    request: Request,
-    domain: str = Path(..., min_length=1, max_length=253),
-):
+async def rdap_domain_lookup(request: Request, domain: Domain):
     """
     Look up RDAP information for a domain.
 
@@ -44,8 +42,8 @@ async def rdap_ip_lookup(
     Returns:
         RDAP response with network registration information
     """
-    await ssrf_guard_async(ip, 443)
-    return await as_http(run_seer(seer.rdap_ip, ip), "RDAP IP lookup failed")
+    # A reserved IP literal is refused as input validation (400).
+    return await as_http(run_seer(guarded(seer.rdap_ip, hosts=[ip]), ip), "RDAP IP lookup failed")
 
 
 @router.get("/asn/{asn}")

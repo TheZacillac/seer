@@ -1,4 +1,4 @@
-"""SSRF guard for user-supplied connect targets before calling seer.
+"""SSRF pre-check for user-supplied connect targets before calling seer.
 
 Only guard hosts that are the *actual outbound connection target*, not hosts
 that appear as query parameters. WHOIS/RDAP/propagation/DNS-lookup accept a
@@ -8,25 +8,37 @@ not the queried domain itself. Guarding the queried domain there is both a
 no-op (no SSRF vector) and a footgun (rejects legitimate lookups of parked
 or unresolvable domains).
 
-Call the guard on:
-- ``status`` and ``ssl`` endpoints (directly HTTP/TLS-connect to the target)
+Guard:
+- the ``status`` and ``ssl`` single-host routes/tools (they HTTP/TLS-connect
+  to the target), to answer a reserved target with a clear 400
 - ``rdap/ip`` input (reject reserved IP literals as input validation)
 - user-supplied DNS nameservers (the resolver we actually send packets to) —
-  via :func:`guard_nameserver_async`, which first extracts the host from the
+  via :func:`vet_nameserver`, which first extracts the host from the
   nameserver *spec*
 
-Do NOT call the guard on the queried domain for WHOIS/RDAP-domain/DNS-lookup
-target/propagation target — those paths don't connect to that host.
+This is a pre-check, never the SSRF gate: seer-core resolves, vets and pins
+every address itself before connecting (``net::resolve_public_host``,
+``DnsResolver::custom_upstream_config``). So only a *refusal* — the target is
+or resolves to a reserved address — blocks the request here. Any other
+failure of the check (the name does not resolve, the lookup timed out) falls
+through to core, which reports its own error. Bulk routes skip the pre-check
+entirely: core refuses a reserved host per row, which becomes a failed row
+instead of failing the whole batch.
+
+The checks resolve DNS inside PyO3, so they are blocking: :func:`guarded`
+runs them in the same ``run_seer`` dispatch as the work they protect, under
+the same ``SEER_REQUEST_TIMEOUT``.
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
-
-from fastapi import HTTPException
+from collections.abc import Callable, Iterable
+from typing import Any
 
 import seer
+
+from .errors import ServiceUnavailable
 
 logger = logging.getLogger(__name__)
 
@@ -34,93 +46,72 @@ logger = logging.getLogger(__name__)
 def nameserver_target(spec: str) -> tuple[str, int] | None:
     """``seer.nameserver_target``, failing clearly on bindings that predate it.
 
-    Bindings older than 0.49.0 lack the function. The ``domain-seer>=0.49.0``
-    floor keeps them out of normal installs, but a stale local build (e.g. a
-    dev venv from before the release) can still be present; without this check
-    every nameserver request would then die on a bare ``AttributeError``.
+    A stale local build (e.g. a dev venv from before the function existed)
+    can lack it even though the ``domain-seer`` floor keeps such bindings out
+    of normal installs; without this check every nameserver request would
+    die on a bare ``AttributeError``. Raises :class:`ServiceUnavailable` (503).
     """
     parse = getattr(seer, "nameserver_target", None)
     if parse is None:
-        raise RuntimeError(
+        logger.error(
             "installed domain-seer bindings lack nameserver_target; "
             "rebuild seer-py from the same checkout as seer-api"
         )
+        raise ServiceUnavailable("Nameserver validation is unavailable")
     return parse(spec)
 
 
-def guard(host: str, port: int = 443) -> None:
-    """Raise HTTPException(400) if host resolves to a reserved address.
+def vet_host(host: str, port: int = 443) -> None:
+    """Raise ``ValueError`` if ``host`` is, or resolves to, a reserved address.
 
-    Delegates to ``seer.validate_public_host``, which rejects IP literals in
-    reserved ranges and hostnames that resolve to such addresses. The raised
-    HTTPException carries the underlying validator's message so operators can
-    diagnose why a request was rejected without leaking internal details.
-
-    Blocking. The underlying ``seer.validate_public_host`` performs a DNS
-    resolution inside a Tokio ``block_on``; calling this directly from an
-    ``async def`` FastAPI handler pins the event loop thread. Use
-    :func:`guard_async` from async contexts.
+    ``seer.validate_public_host`` raises ``ValueError`` (core's
+    ``InvalidInput``) only for that refusal; its other failures (DNS error,
+    timeout) are logged and swallowed — see the module docs. Blocking.
     """
     try:
         seer.validate_public_host(host, port)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except ValueError:
+        raise
+    except (RuntimeError, OSError) as exc:  # seer.SeerError, TimeoutError, ...
+        logger.debug("SSRF pre-check inconclusive for %s:%d (%s); core re-vets", host, port, exc)
 
 
-async def guard_async(host: str, port: int = 443) -> None:
-    """Async wrapper around :func:`guard` for use in FastAPI routes.
-
-    Runs the blocking DNS-resolution leg on the default thread pool executor
-    so the event loop is free to service other requests while the lookup is
-    in flight. Without this, bare ``guard()`` calls serialize concurrent
-    requests because the PyO3 ``block_on`` inside ``validate_public_host``
-    pins the single event-loop thread.
-    """
-    loop = asyncio.get_running_loop()
-    await loop.run_in_executor(None, guard, host, port)
-
-
-async def guard_nameserver_async(spec: str) -> None:
-    """:func:`guard_async` the host a nameserver spec connects to.
+def vet_nameserver(spec: str) -> None:
+    """:func:`vet_host` the address a nameserver spec connects to.
 
     A user-supplied nameserver is a *spec*, not a hostname: a bare
     IP/hostname with an optional port (UDP, ``9.9.9.9:5353``,
     ``[2606:4700:4700::1111]``), ``tls://host[:port]`` (DoT) or
     ``https://host[:port][/path]`` (DoH). ``seer.nameserver_target`` extracts
     the ``(host, port)`` with seer-core's own ``NameserverSpec::parse``, so the
-    guard checks exactly the address the resolver would contact.
+    check covers exactly the address the resolver would contact.
 
     A spec the core rejects yields ``None`` and is passed through: the core
-    then fails it with its own ``Invalid input`` (ValueError -> 400). The core
-    also refuses reserved nameserver addresses on its own, so this pre-check
-    is defense in depth that turns a reserved target into a clear 400 — never
-    the only SSRF gate.
+    then fails it with its own ``Invalid input`` (ValueError -> 400).
     """
-    try:
-        target = nameserver_target(spec)
-    except RuntimeError:
-        # A deployment fault, not a bad request: log why, don't leak it.
-        logger.exception("nameserver SSRF guard unavailable")
-        raise HTTPException(
-            status_code=503, detail="Nameserver validation is unavailable"
-        ) from None
+    target = nameserver_target(spec)
     if target is not None:
-        await guard_async(*target)
+        vet_host(*target)
 
 
-async def guard_hosts_async(hosts: list[tuple[str, int]]) -> None:
-    """Run :func:`guard_async` against every (host, port) pair concurrently.
+def guarded(
+    fn: Callable[..., Any],
+    *,
+    hosts: Iterable[str] = (),
+    nameservers: Iterable[str] = (),
+) -> Callable[..., Any]:
+    """``fn`` preceded by the pre-check of each HTTPS host and nameserver spec.
 
-    Used by bulk endpoints to validate every user-supplied domain before
-    dispatching the work to the Rust core. A bulk request can carry up to 100
-    hosts; awaiting each guard in sequence would serialize up to 100 blocking
-    DNS resolutions before any work starts. ``asyncio.gather`` fans them out
-    onto the executor at once.
-
-    Error contract is preserved: ``gather`` re-raises the first exception it
-    observes, so an offending host still raises ``HTTPException(400)`` and the
-    bulk call short-circuits. (Ordering of *which* offending host is reported
-    is no longer strictly first-in-list, but the exception class and status
-    code are identical.)
+    Pass the result to ``run_seer``: check and work then run in one dispatch,
+    under one deadline. A refusal raises ``ValueError`` before ``fn`` runs.
     """
-    await asyncio.gather(*(guard_async(host, port) for host, port in hosts))
+    hosts, nameservers = tuple(hosts), tuple(nameservers)
+
+    def call(*args: Any) -> Any:
+        for host in hosts:
+            vet_host(host, 443)
+        for spec in nameservers:
+            vet_nameserver(spec)
+        return fn(*args)
+
+    return call

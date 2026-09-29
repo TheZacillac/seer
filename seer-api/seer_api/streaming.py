@@ -22,7 +22,7 @@ from typing import Any
 from starlette.responses import StreamingResponse
 
 from ._env import env_int
-from ._run import _DISPATCH_EXECUTOR
+from ._run import _DISPATCH_EXECUTOR, Deadline
 from .errors import safe_error_message
 
 logger = logging.getLogger("seer_api")
@@ -78,16 +78,18 @@ async def stream_bulk(
             ("progress", {"completed": completed, "total": total, "current_domain": domain}),
         )
 
+    # One SEER_REQUEST_TIMEOUT budget covers the wait for a slot and the job:
+    # a stream that outlives it ends with an `error` event.
+    deadline = Deadline()
+
     # Acquire a slot before dispatching the (uncancellable) blocking job. A
     # client that disconnects mid-stream cannot stop the job, so this bound is
     # what prevents a disconnect-flood from pinning every dispatch thread.
+    # Waiting past the deadline raises TimeoutError (a 504: nothing was sent).
     semaphore = _get_stream_semaphore()
-    await semaphore.acquire()
+    await deadline.bound(semaphore.acquire())
 
-    # Dispatch on the bounded seer-dispatch pool (see _run.py), not the
-    # default asyncio executor. The default pool is shared with
-    # ssrf.guard_async; a long bulk stream sitting on default-pool threads
-    # would starve SSRF guards and stall /status, /ssl, etc. `run_seer`
+    # Dispatch on the bounded seer-dispatch pool (see _run.py). `run_seer`
     # can't be used here because it doesn't forward the `progress` kwarg.
     try:
         bulk_future = loop.run_in_executor(
@@ -108,8 +110,19 @@ async def stream_bulk(
             get_task = asyncio.create_task(queue.get())
             finished, _ = await asyncio.wait(
                 {get_task, bulk_future},
+                timeout=deadline.remaining(),
                 return_when=asyncio.FIRST_COMPLETED,
             )
+            if not finished:
+                # Deadline passed with the job still running. The job keeps
+                # its slot until it finishes (it cannot be cancelled); the
+                # client is released now.
+                get_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await get_task
+                logger.warning("bulk stream exceeded SEER_REQUEST_TIMEOUT")
+                yield _sse("error", {"message": safe_error_message(TimeoutError())})
+                return
             if get_task in finished:
                 event, payload = get_task.result()
                 yield _sse(event, payload)

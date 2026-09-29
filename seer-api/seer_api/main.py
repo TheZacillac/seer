@@ -162,8 +162,8 @@ def _mcp_rate_ok(client_ip: str) -> bool:
 _LOCALHOST_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 
 
-def _is_loopback_bind(host: str) -> bool:
-    """Whether ``SEER_HOST`` names an interface that is unreachable off-box.
+def _is_loopback_host(host: str) -> bool:
+    """Whether ``host`` names an interface that is unreachable off-box.
 
     Covers the whole IPv4 loopback range (127.0.0.0/8, not just 127.0.0.1),
     IPv6 loopback (``::1``, and the IPv4-mapped ``::ffff:127.0.0.1``), and the
@@ -220,31 +220,63 @@ def _origin_allowed(origin: str, allowed: list[str]) -> bool:
     )
 
 
-def _mcp_origin_blocked(origin: str) -> bool:
-    """Whether the local browser-origin guard refuses this /mcp request.
+def _origin_blocked(origin: str, allowed: list[str]) -> bool:
+    """Whether the browser drive-by guard refuses a request from ``origin``.
 
-    Non-browser MCP clients (curl, stdio bridges) send no Origin and always
-    pass. Otherwise, in precedence order:
+    The one Origin policy for REST and /mcp; ``allowed`` is the surface's
+    configured allowlist (``SEER_CORS_ORIGINS`` for REST,
+    ``SEER_MCP_ALLOWED_ORIGINS`` for /mcp). Non-browser clients (curl, SDKs,
+    stdio bridges) send no Origin and always pass. Otherwise, in order:
 
-    * ``SEER_MCP_ALLOWED_HOSTS`` set → the SDK's DNS-rebinding protection is
-      on and validates Host and Origin itself; nothing to do here.
-    * ``SEER_MCP_ALLOWED_ORIGINS`` set on its own → enforce it here as the
-      Origin allowlist. The SDK protection can't be enabled without a host
-      list (it would 421 every request), and this keeps an explicitly
-      configured origin policy in force even when ``SEER_API_KEY`` is set.
-    * ``SEER_API_KEY`` set → auth already blocks a drive-by (no bearer token).
-    * Otherwise (unauthenticated dev posture) → only localhost origins.
+    * an allowlist is configured → only origins on it, whether or not
+      ``SEER_API_KEY`` is set (an explicit origin policy stays in force);
+    * ``SEER_API_KEY`` set → auth already blocks a drive-by (no bearer token);
+    * otherwise (unauthenticated dev posture) → only loopback origins, so a
+      page on another site cannot drive the API from the operator's browser.
     """
     if not origin:
         return False
-    if _csv_env("SEER_MCP_ALLOWED_HOSTS"):
-        return False
-    allowed_origins = _csv_env("SEER_MCP_ALLOWED_ORIGINS")
-    if allowed_origins:
-        return not _origin_allowed(origin, allowed_origins)
+    if allowed:
+        return not _origin_allowed(origin, allowed)
     if _api_key():
         return False
-    return _header_host(origin) not in _LOCALHOST_HOSTS
+    return not _is_loopback_host(_header_host(origin))
+
+
+def _mcp_origin_blocked(origin: str) -> bool:
+    """:func:`_origin_blocked` for /mcp.
+
+    With ``SEER_MCP_ALLOWED_HOSTS`` set, the SDK's DNS-rebinding protection is
+    on and validates Host and Origin itself, so nothing is checked here.
+    ``SEER_MCP_ALLOWED_ORIGINS`` on its own is enforced here: the SDK
+    protection can't be enabled without a host list (it would 421 every
+    request).
+    """
+    if _csv_env("SEER_MCP_ALLOWED_HOSTS"):
+        return False
+    return _origin_blocked(origin, _csv_env("SEER_MCP_ALLOWED_ORIGINS"))
+
+
+def _served_on_loopback(scope: dict) -> bool:
+    """Whether the request arrived on a loopback interface.
+
+    ``scope["server"]`` is the local socket address the connection was
+    accepted on, so this catches a public listener however it was configured
+    (``uvicorn seer_api.main:app --host 0.0.0.0`` never sets ``SEER_HOST``,
+    which is all the startup check can see). A Unix socket reports no
+    address (``None``) and an in-process transport such as Starlette's
+    TestClient reports a hostname rather than an address: neither is a
+    network interface, so both count as local.
+    """
+    server = scope.get("server")
+    if not server:
+        return True
+    host = str(server[0])
+    try:
+        ipaddress.ip_address(host.strip("[]"))
+    except ValueError:
+        return True
+    return _is_loopback_host(host)
 
 
 def _route_path(request: Request) -> str:
@@ -314,7 +346,7 @@ async def lifespan(_app: FastAPI):
     # here (not a module-level constant) so a deploy that sets it just before
     # startup is honoured, and a blank placeholder still trips the guard.
     host = os.environ.get("SEER_HOST", "127.0.0.1")
-    if not _is_loopback_bind(host) and not _api_key():
+    if not _is_loopback_host(host) and not _api_key():
         log.error(
             "seer-api is bound to %s with no SEER_API_KEY set. Refusing to "
             "start. Set SEER_API_KEY or SEER_HOST=127.0.0.1.",
@@ -364,7 +396,8 @@ app.add_middleware(MaxBodySizeMiddleware, max_bytes=64 * 1024)
 
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
-    """Enforce optional bearer-token auth when SEER_API_KEY is set.
+    """Enforce optional bearer-token auth when SEER_API_KEY is set, plus the
+    guards that keep the unauthenticated posture local.
 
     Reads `SEER_API_KEY` per request rather than from a module-level
     constant, so tests and rotating-secret deployments don't need an import
@@ -373,14 +406,28 @@ async def auth_middleware(request: Request, call_next):
     # Match paths the way the router does (root_path stripped); comparing
     # `request.url.path` skipped every check below under `--root-path`.
     route_path = _route_path(request)
+    api_key = _api_key()
 
-    # POST /mcp hardening (issue #55), applied before auth so an unauthenticated
-    # flood is throttled and a drive-by is refused regardless of credentials.
+    # Without a key the API is only for this host. The lifespan refuses a
+    # non-loopback SEER_HOST, but a server started another way (`uvicorn
+    # seer_api.main:app --host 0.0.0.0`) never sets it — so every request
+    # that arrived on a non-loopback interface is refused too.
+    if not api_key and not _served_on_loopback(request.scope):
+        return JSONResponse(
+            {
+                "detail": "seer-api is listening on a non-loopback interface "
+                "without SEER_API_KEY; the operator must set SEER_API_KEY or "
+                "bind to 127.0.0.1"
+            },
+            status_code=503,
+        )
+
+    # Browser drive-by guard: a malicious page's fetch() carries a disallowed
+    # Origin; non-browser clients send none. One policy for REST and /mcp —
+    # see `_origin_blocked`. Applied before auth, regardless of credentials.
+    origin = request.headers.get("origin", "")
     if route_path == "/mcp":
-        # Browser drive-by guard: a malicious page's fetch() carries a
-        # disallowed Origin; non-browser MCP clients (curl, stdio bridges) send
-        # none. See `_mcp_origin_blocked` for which policy applies when.
-        if _mcp_origin_blocked(request.headers.get("origin", "")):
+        if _mcp_origin_blocked(origin):
             return JSONResponse(
                 {
                     "detail": "cross-origin /mcp blocked; set "
@@ -388,13 +435,22 @@ async def auth_middleware(request: Request, call_next):
                 },
                 status_code=403,
             )
-        # Rate-limit the raw /mcp route that the @limiter.limit decorators miss.
+        # POST /mcp hardening (issue #55): rate-limit the raw /mcp route that
+        # the @limiter.limit decorators miss, before auth, so an
+        # unauthenticated flood is throttled too.
         if not _mcp_rate_ok(get_client_ip(request)):
             return JSONResponse(
                 {"detail": "rate limit exceeded"}, status_code=429
             )
+    elif _origin_blocked(origin, _csv_env("SEER_CORS_ORIGINS")):
+        return JSONResponse(
+            {
+                "detail": "cross-origin request blocked; set "
+                "SEER_CORS_ORIGINS or SEER_API_KEY to allow"
+            },
+            status_code=403,
+        )
 
-    api_key = _api_key()
     if api_key:
         # Public endpoints are exempt. OPTIONS preflight is handled by the
         # outer CORSMiddleware and never reaches here, but we still short
@@ -409,16 +465,25 @@ async def auth_middleware(request: Request, call_next):
         # re-encoding latin-1 recovers the exact wire bytes; the key is
         # encoded UTF-8 — what an HTTP client sends for a non-ASCII token —
         # with surrogateescape so an undecodable env value round-trips.
+        # The auth scheme is case-insensitive (RFC 9110 §11.1): `bearer` and
+        # `BEARER` are the same scheme; the token itself is compared exactly,
+        # in constant time.
         provided = request.headers.get("Authorization", "").encode("latin-1")
-        expected = f"Bearer {api_key}".encode("utf-8", "surrogateescape")
-        if not hmac.compare_digest(provided, expected):
+        scheme, _, token = provided.partition(b" ")
+        expected = api_key.encode("utf-8", "surrogateescape")
+        if scheme.lower() != b"bearer" or not hmac.compare_digest(
+            token.lstrip(b" "), expected
+        ):
             return JSONResponse({"detail": "unauthorized"}, status_code=401)
     return await call_next(request)
 
 
-# CORS middleware - configure allowed origins via SEER_CORS_ORIGINS env var
-# For production, set SEER_CORS_ORIGINS to comma-separated list of allowed origins
-# e.g., SEER_CORS_ORIGINS="https://example.com,https://app.example.com"
+# CORS middleware - configure allowed origins via SEER_CORS_ORIGINS env var,
+# a comma-separated list, e.g.
+# SEER_CORS_ORIGINS="https://example.com,https://app.example.com". Unset, no
+# CORS headers are sent at all: browsers then keep other sites' pages from
+# reading responses, and `_origin_blocked` refuses their requests outright in
+# the unauthenticated posture.
 #
 # Registered LAST so it is the OUTERMOST middleware, wrapping both
 # auth_middleware and MaxBodySizeMiddleware. This matters because Starlette
@@ -430,25 +495,18 @@ async def auth_middleware(request: Request, call_next):
 # answers preflight; it does not bypass downstream middleware for real
 # requests.
 # Empty entries are dropped, so `SEER_CORS_ORIGINS=",,"` and trailing commas
-# land in the dev-mode branch instead of producing a list of empty strings
-# that CORSMiddleware silently never matches.
+# mean "unset" instead of a list of empty strings that CORSMiddleware silently
+# never matches.
 allowed_origins = _csv_env("SEER_CORS_ORIGINS")
-if allowed_origins:
-    allow_credentials = True
-    # `Access-Control-Allow-Origin: *` with `allow_credentials=True` is a
-    # CORS spec violation — browsers reject it and Starlette raises a
-    # ValueError on first preflight. Catch the misconfig at startup so the
-    # operator gets a clear message instead of an opaque 500 later.
-    if "*" in allowed_origins:
-        raise RuntimeError(
-            "SEER_CORS_ORIGINS cannot contain '*' (credentials would be "
-            "exposed to any origin). List explicit origins, or unset the "
-            "variable to use the credential-less development mode."
-        )
-else:
-    # Development mode: allow all origins but disable credentials
-    allowed_origins = ["*"]
-    allow_credentials = False
+# `Access-Control-Allow-Origin: *` with `allow_credentials=True` is a CORS spec
+# violation — browsers reject it and Starlette raises a ValueError on first
+# preflight. Catch the misconfig at startup so the operator gets a clear
+# message instead of an opaque 500 later.
+if "*" in allowed_origins:
+    raise RuntimeError(
+        "SEER_CORS_ORIGINS cannot contain '*' (credentials would be exposed to "
+        "any origin). List explicit origins."
+    )
 
 # Request logging / metrics middleware. Registered here — AFTER
 # auth_middleware and MaxBodySizeMiddleware, but BEFORE CORS below — so it
@@ -466,13 +524,14 @@ else:
 # responses with Access-Control-Allow-Origin headers.
 app.add_middleware(RequestLoggingMiddleware)
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=allowed_origins,
-    allow_credentials=allow_credentials,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+if allowed_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=allowed_origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 # Include routers
 app.include_router(lookup.router, prefix="/lookup", tags=["Lookup"])
@@ -567,6 +626,7 @@ def _endpoint_index(target: FastAPI) -> dict[str, str]:
 
 
 @app.get("/")
+@limiter.limit("60/minute")
 async def root(request: Request):
     """Root endpoint with API information."""
     return {

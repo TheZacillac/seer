@@ -40,11 +40,16 @@ RECORD_TYPE_MAX_LENGTH = 10
 # rejects junk with a clear error. Never a URL/connect target.
 TLD_TOKEN_RE = re.compile(r"^\.?[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$", re.IGNORECASE)
 
+# Longest domain name accepted (RFC 1035's 253-octet presentation form), and
+# the longest nameserver spec — room for a DoH URL (https://host/path).
+DOMAIN_MAX_LENGTH = 253
+NAMESERVER_MAX_LENGTH = 512
+
 # A domain path parameter.
-Domain = Annotated[str, Path(min_length=1, max_length=253)]
+Domain = Annotated[str, Path(min_length=1, max_length=DOMAIN_MAX_LENGTH)]
 
 _DomainList = Annotated[
-    list[Annotated[str, Field(max_length=253)]],
+    list[Annotated[str, Field(max_length=DOMAIN_MAX_LENGTH)]],
     Field(min_length=1, max_length=MAX_BULK_DOMAINS),
 ]
 _Concurrency = Annotated[int, Field(ge=1, le=MAX_CONCURRENCY)]

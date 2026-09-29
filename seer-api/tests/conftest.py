@@ -113,6 +113,24 @@ def _install_seer_stub() -> None:
         ]
 
     stub.record_types = _stub_record_types
+
+    # The binding's typed exceptions (seer-py `exceptions` module): the error
+    # mapping in seer_api/errors.py and the MCP retry advice match on them.
+    class SeerError(RuntimeError):
+        pass
+
+    stub.SeerError = SeerError
+    for name in (
+        "RateLimitedError",
+        "WhoisServerNotFoundError",
+        "DnsError",
+        "UpstreamError",
+        "LookupFailedError",
+        "ParseError",
+        "TlsError",
+        "ConfigError",
+    ):
+        setattr(stub, name, type(name, (SeerError,), {}))
     sys.modules["seer"] = stub
 
 
@@ -217,5 +235,10 @@ def _reset_rate_limits():
     from seer_api.mcp import server
 
     limiter.reset()
+    # Tests that reload seer_api.main re-run its `@limiter.limit` decorators
+    # (`/`, `/metrics`), which slowapi appends to the route's limit list under
+    # the same name — N reloads count every request N times. Keep one.
+    for name, limits in list(limiter._route_limits.items()):
+        limiter._route_limits[name] = limits[:1]
     server._rate_limiter = None  # rebuilt, empty, on first use
     yield
