@@ -27,6 +27,16 @@ impl MarkdownFormatter {
             }
         }
 
+        // Failed checks: their cells above are empty, not real answers.
+        if !diff.errors.is_empty() {
+            output.push(String::new());
+            output.push("### Errors".to_string());
+            output.push(String::new());
+            for error in &diff.errors {
+                output.push(format!("- {}", MdSafe(error)));
+            }
+        }
+
         output.join("\n")
     }
 }
@@ -63,7 +73,7 @@ mod tests {
             dns: DnsDiff {
                 a_records: (Vec::new(), Vec::new()),
                 nameservers: (ns, Vec::new()),
-                resolves: (true, false),
+                resolves: (Some(true), Some(false)),
             },
             ssl: SslDiff {
                 issuer: (None, None),
@@ -71,6 +81,7 @@ mod tests {
                 days_remaining: (None, None),
                 is_valid: (None, None),
             },
+            errors: Vec::new(),
         }
     }
 

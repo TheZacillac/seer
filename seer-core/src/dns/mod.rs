@@ -48,6 +48,9 @@ pub use propagation::{
     ServerVerdict, UnreachableServer,
 };
 pub use query::{DnsQueryResult, DnsStatus, FailedType, WildcardProbe};
+// Crate-internal: the one wildcard-probe label generator, shared with
+// subdomain classification.
+pub(crate) use query::random_probe_label;
 pub use records::{DnsRecord, RecordData, RecordType, SvcParam};
 pub use resolver::{DnsPresence, DnsResolver};
 pub use trace::{DnsTrace, DnsTracer, TraceHop};

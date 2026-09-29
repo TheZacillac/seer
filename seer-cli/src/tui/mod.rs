@@ -247,7 +247,10 @@ async fn edit_watchlist(
     let store = crate::ops::STORE_LOCK.lock().await;
     tokio::task::spawn_blocking(move || {
         let _store = store;
-        let mut wl = Watchlist::load();
+        let mut wl = match Watchlist::load() {
+            Ok(wl) => wl,
+            Err(e) => return Some(("fail", format!("failed to load watchlist: {e}"))),
+        };
         let notice = mutate_watchlist(&mut wl, add.as_deref(), remove.as_deref());
         match wl.save() {
             Ok(()) => notice,

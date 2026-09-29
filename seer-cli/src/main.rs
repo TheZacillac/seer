@@ -1660,6 +1660,7 @@ mod exit_code_tests {
                 removed: removed.iter().map(|s| s.to_string()).collect(),
                 unchanged_count: 1,
                 baseline_missing,
+                baseline_truncated: false,
             }))
         };
         assert_eq!(exit_code(&diff(&[], &[], true)), 0, "first run");

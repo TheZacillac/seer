@@ -11,13 +11,27 @@ use std::time::Duration;
 
 use reqwest::StatusCode;
 use std::sync::LazyLock;
+use tokio::time::Instant;
 use tracing::debug;
 
 use crate::error::{Result, SeerError};
 use crate::http::{read_body_capped, BodyReadError, Overflow};
 
-/// Default timeout for a single CT-log request (connect + full streaming read).
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+/// The time limits one CT-log fetch runs under: each attempt (connect + full
+/// streaming read) is bounded by `timeout`, and the attempts, their backoff
+/// and any `Retry-After` all end by `deadline`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Budget {
+    pub timeout: Duration,
+    pub deadline: Instant,
+}
+
+impl Budget {
+    /// Time left before the deadline (zero once it has passed).
+    fn remaining(&self) -> Duration {
+        self.deadline.saturating_duration_since(Instant::now())
+    }
+}
 
 /// Retry budget. CT aggregators are down often enough that a thin 3-attempt
 /// budget exhausts before a bad spell clears; 4 attempts with capped
@@ -40,13 +54,15 @@ const MAX_CT_RESPONSE_SIZE: usize = 10 * 1024 * 1024;
 /// otherwise issue a 30x response that reqwest would follow by default, turning
 /// the hardcoded CT-log fetch into an SSRF primitive. With `Policy::none()` any
 /// redirect surfaces as a non-success status instead of a silent re-target.
+/// Its timeout is the configurable ceiling; each request sets its own, shorter
+/// one from its [`Budget`].
 ///
 /// Wrapped in `Option` so a reqwest builder failure surfaces as a typed
 /// `SeerError::HttpError` via `client()` instead of a process panic at first
 /// use (library code must not `.expect()` on shared state).
 static HTTP_CLIENT: LazyLock<Option<reqwest::Client>> = LazyLock::new(|| {
-    crate::net::client_builder(DEFAULT_TIMEOUT)
-        .user_agent("seer-domain-tool")
+    crate::net::client_builder(Duration::from_secs(crate::config::MAX_CT_SECS))
+        .user_agent(crate::net::USER_AGENT)
         .build()
         .ok()
 });
@@ -113,12 +129,19 @@ enum FetchOutcome {
     Terminal(SeerError),
 }
 
-/// Fetch `url`, retrying up to `MAX_ATTEMPTS` times on transient failures.
-/// Honors a server-supplied `Retry-After` in preference to exponential backoff.
-pub(crate) async fn fetch_with_retry(url: &str) -> Result<Vec<u8>> {
+/// Fetch `url`, retrying up to `MAX_ATTEMPTS` times on transient failures,
+/// all within `budget`: each attempt gets at most the per-request timeout or
+/// what is left before the deadline, and a backoff (or a server-supplied
+/// `Retry-After`, preferred over exponential backoff) that would end past the
+/// deadline stops the retries instead.
+pub(crate) async fn fetch_with_retry(url: &str, budget: Budget) -> Result<Vec<u8>> {
     let mut last_err: Option<SeerError> = None;
     for attempt in 0..MAX_ATTEMPTS {
-        match fetch_once(url).await {
+        let timeout = budget.timeout.min(budget.remaining());
+        if timeout.is_zero() {
+            break;
+        }
+        match fetch_once(url, timeout).await {
             Ok(body) => return Ok(body),
             Err(FetchOutcome::Terminal(e)) => return Err(e),
             Err(FetchOutcome::Retryable { err, retry_after }) => {
@@ -133,22 +156,26 @@ pub(crate) async fn fetch_with_retry(url: &str) -> Result<Vec<u8>> {
                     let backoff = retry_after.unwrap_or_else(|| {
                         (RETRY_BASE_BACKOFF * 2u32.pow(attempt)).min(MAX_BACKOFF)
                     });
+                    if backoff >= budget.remaining() {
+                        break;
+                    }
                     tokio::time::sleep(backoff).await;
                 }
             }
         }
     }
-    Err(last_err.unwrap_or_else(|| {
-        SeerError::HttpError("CT log query failed with no recorded error".into())
-    }))
+    Err(last_err
+        .unwrap_or_else(|| SeerError::Timeout("CT log query ran out of its time budget".into())))
 }
 
-/// Single-attempt fetch. Splits failures into retryable vs terminal so
-/// `fetch_with_retry` can decide whether another attempt is worth making.
-async fn fetch_once(url: &str) -> std::result::Result<Vec<u8>, FetchOutcome> {
+/// Single-attempt fetch under `timeout`. Splits failures into retryable vs
+/// terminal so `fetch_with_retry` can decide whether another attempt is worth
+/// making.
+async fn fetch_once(url: &str, timeout: Duration) -> std::result::Result<Vec<u8>, FetchOutcome> {
     let response = client()
         .map_err(FetchOutcome::Terminal)?
         .get(url)
+        .timeout(timeout)
         .send()
         .await
         .map_err(|e| FetchOutcome::Retryable {
@@ -186,30 +213,22 @@ async fn fetch_once(url: &str) -> std::result::Result<Vec<u8>, FetchOutcome> {
     // Stream the body under the size cap and a total-duration timeout (a
     // lying Content-Length or a trickling server can't force an unbounded
     // buffer or hang the caller). Only an oversized body is terminal.
-    let body = read_body_capped(
-        response,
-        MAX_CT_RESPONSE_SIZE,
-        DEFAULT_TIMEOUT,
-        Overflow::Reject,
-    )
-    .await
-    .map_err(|e| match e {
-        BodyReadError::TooLarge => FetchOutcome::Terminal(SeerError::HttpError(format!(
-            "CT log response too large (exceeds {} bytes)",
-            MAX_CT_RESPONSE_SIZE
-        ))),
-        BodyReadError::Chunk(e) => FetchOutcome::Retryable {
-            err: SeerError::HttpError(format!("Failed to read CT log response: {}", e)),
-            retry_after: None,
-        },
-        BodyReadError::TimedOut => FetchOutcome::Retryable {
-            err: SeerError::Timeout(format!(
-                "CT log body read timed out after {:?}",
-                DEFAULT_TIMEOUT
-            )),
-            retry_after: None,
-        },
-    })?;
+    let body = read_body_capped(response, MAX_CT_RESPONSE_SIZE, timeout, Overflow::Reject)
+        .await
+        .map_err(|e| match e {
+            BodyReadError::TooLarge => FetchOutcome::Terminal(SeerError::HttpError(format!(
+                "CT log response too large (exceeds {} bytes)",
+                MAX_CT_RESPONSE_SIZE
+            ))),
+            BodyReadError::Chunk(e) => FetchOutcome::Retryable {
+                err: SeerError::HttpError(format!("Failed to read CT log response: {}", e)),
+                retry_after: None,
+            },
+            BodyReadError::TimedOut => FetchOutcome::Retryable {
+                err: SeerError::Timeout(format!("CT log body read timed out after {:?}", timeout)),
+                retry_after: None,
+            },
+        })?;
 
     // A 200 carrying an HTML error page (crt.sh does this under load) is a
     // transient failure, not valid-but-unparseable data — retry rather than

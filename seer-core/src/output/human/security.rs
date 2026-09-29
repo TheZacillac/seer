@@ -19,7 +19,9 @@ impl HumanFormatter {
         let label = verdict.as_str();
         match verdict {
             PostureVerdict::Strict => self.success(label),
-            PostureVerdict::Moderate | PostureVerdict::Weak => self.warning(label),
+            PostureVerdict::Moderate | PostureVerdict::Weak | PostureVerdict::Unknown => {
+                self.warning(label)
+            }
             PostureVerdict::Present => self.value(label),
             PostureVerdict::Absent => self.error(label),
         }
@@ -63,6 +65,12 @@ impl HumanFormatter {
         if let Some(at) = report.baseline_recorded_at {
             let at = self.value(&at.format("%Y-%m-%d %H:%M UTC").to_string());
             self.rows(&mut out, "").kv("Baseline recorded", at);
+        }
+        if report.baseline_truncated {
+            out.push(self.warning(
+                "Baseline came from truncated enumerations — added names may be long-standing \
+                 (not counted as new until a complete run is recorded)",
+            ));
         }
         out.push(format!(
             "{} added, {} removed, {} unchanged",
@@ -111,6 +119,10 @@ impl HumanFormatter {
 
         let line = |name: &str, verdict: PostureVerdict, detail: Option<&str>| {
             let base = format!("{}: {}", self.label(name), self.verdict(verdict));
+            let detail = match verdict {
+                PostureVerdict::Unknown => Some("(lookup failed)"),
+                _ => detail,
+            };
             match detail {
                 Some(d) if !d.is_empty() => format!("{base} {}", self.dim(&sanitize_line(d))),
                 _ => base,

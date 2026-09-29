@@ -346,6 +346,7 @@ fn fixture_subdomain_baseline_diff() -> seer_core::subdomains::SubdomainBaseline
         removed: vec!["old.example.com".into()],
         unchanged_count: 12,
         baseline_missing: false,
+        baseline_truncated: false,
     }
 }
 
@@ -358,6 +359,7 @@ fn fixture_subdomain_baseline_diff_missing() -> seer_core::subdomains::Subdomain
         removed: Vec::new(),
         unchanged_count: 0,
         baseline_missing: true,
+        baseline_truncated: false,
     }
 }
 
@@ -876,6 +878,7 @@ fn fixture_subdomains() -> SubdomainResult {
         subdomains: vec!["api.example.com".into(), "www.example.com".into()],
         source: "crt.sh".into(),
         count: 2,
+        truncated: false,
     }
 }
 
@@ -1590,7 +1593,7 @@ fn fixture_domain_diff() -> DomainDiff {
                 vec!["ns1.example.com".into(), "ns2.example.com".into()],
                 vec!["ns2.example.com".into(), "ns1.example.com".into()],
             ),
-            resolves: (true, true),
+            resolves: (Some(true), Some(true)),
         },
         ssl: SslDiff {
             issuer: (Some("Mock CA".into()), Some("Mock CA".into())),
@@ -1598,6 +1601,7 @@ fn fixture_domain_diff() -> DomainDiff {
             days_remaining: (Some(26_000), None),
             is_valid: (Some(true), None),
         },
+        errors: Vec::new(),
     }
 }
 

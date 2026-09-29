@@ -8,7 +8,7 @@ use crate::confusables::ConfusableReport;
 use crate::drift::DriftReport;
 use crate::headers::HeaderReport;
 use crate::output::{subdomain_status_label, takeover_label};
-use crate::posture::EmailPosture;
+use crate::posture::{EmailPosture, PostureVerdict};
 use crate::subdomains::{SubdomainBaselineDiff, SubdomainClassification, SubdomainStatus};
 use crate::takeover::{TakeoverReport, TakeoverVerdict};
 
@@ -73,6 +73,14 @@ impl MarkdownFormatter {
             Bullets(&mut out).raw("Baseline recorded", at.format("%Y-%m-%d %H:%M UTC"));
             out.push(String::new());
         }
+        if report.baseline_truncated {
+            out.extend([
+                "_Baseline came from truncated enumerations — added names may be \
+                 long-standing (not counted as new until a complete run is recorded)._"
+                    .to_string(),
+                String::new(),
+            ]);
+        }
         out.push(format!(
             "{} added, {} removed, {} unchanged.",
             report.added.len(),
@@ -122,11 +130,12 @@ impl MarkdownFormatter {
             ("BIMI", posture.bimi.verdict, None),
             ("DANE", posture.dane.verdict, Some(dane.as_str())),
         ] {
-            out.push(format!(
-                "| {name} | {} | {} |",
-                verdict.as_str(),
-                MdSafe(detail.unwrap_or(""))
-            ));
+            // A failed lookup says so instead of its (empty) detail.
+            let detail = match verdict {
+                PostureVerdict::Unknown => "lookup failed".to_string(),
+                _ => MdSafe(detail.unwrap_or("")).to_string(),
+            };
+            out.push(format!("| {name} | {} | {detail} |", verdict.as_str()));
         }
         bullet_section(&mut out, "Advisories", &posture.notes);
         out.join("\n")

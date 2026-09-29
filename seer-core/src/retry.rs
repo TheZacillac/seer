@@ -189,7 +189,6 @@ pub fn is_retryable(error: &SeerError) -> bool {
         SeerError::CertificateError(_) => false,
         SeerError::SslError(_) => false,
         SeerError::DnsResolverError(_) => false,
-        SeerError::BulkOperationError { .. } => false,
         SeerError::LookupFailed { .. } => false,
         SeerError::ConfigError(_) => false,
         SeerError::InvalidInput(_) => false,

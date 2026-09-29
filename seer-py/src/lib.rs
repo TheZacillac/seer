@@ -253,7 +253,7 @@ call_fn! {
     ssl(domain: String) => SSL_CHECKER.check(&domain);
     dnssec(domain: String) => DNSSEC_CHECKER.check(&domain);
     delegation(domain: String) => DELEGATION_CHECKER.check(&domain);
-    posture(domain: String) => seer_core::lookup_email_posture(&DNS_RESOLVER, &domain);
+    posture(domain: String) => seer_core::lookup_email_posture(&DNS_RESOLVER, &domain, None);
     headers(domain: String)
         => seer_core::audit_headers(&domain, seer_core::DEFAULT_HEADER_TIMEOUT);
 }

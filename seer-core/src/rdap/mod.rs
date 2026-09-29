@@ -15,7 +15,7 @@ mod types;
 pub use client::RdapClient;
 // Shared with `seer doctor`'s bootstrap probe (CLI-only).
 #[cfg(feature = "cli")]
-pub(crate) use client::MAX_BOOTSTRAP_SIZE;
+pub(crate) use client::{IANA_BOOTSTRAP_DNS, MAX_BOOTSTRAP_SIZE};
 pub use types::{ContactInfo, RdapResponse, RegistrarDetail};
 
 use std::net::IpAddr;

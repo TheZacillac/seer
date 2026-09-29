@@ -346,9 +346,9 @@ async fn run_query(
         } => {
             let spinner = spinner(format!("Enumerating subdomains for {}", domain));
             if diff || record {
-                return subdomain_baseline(&domain, diff, record).await;
+                return subdomain_baseline(&domain, diff, record, config).await;
             }
-            let result = seer_core::SubdomainEnumerator::new()
+            let result = seer_core::SubdomainEnumerator::from_config(config)
                 .enumerate(&domain)
                 .await?;
             if resolve {
@@ -367,7 +367,7 @@ async fn run_query(
         }
         Query::Diff(domain_a, domain_b) => {
             let _spinner = spinner(format!("Comparing {} vs {}", domain_a, domain_b));
-            let diff = seer_core::DomainDiffer::new()
+            let diff = seer_core::DomainDiffer::from_config(config)
                 .diff(&domain_a, &domain_b)
                 .await?;
             Payload::Diff(Box::new(diff))
@@ -394,7 +394,12 @@ async fn run_query(
         }
         Query::Posture(domain) => {
             let _spinner = spinner(format!("Inspecting email posture for {}", domain));
-            let posture = seer_core::lookup_email_posture(&clients.dns, &domain).await?;
+            let posture = seer_core::lookup_email_posture(
+                &clients.dns,
+                &domain,
+                config.nameserver.as_deref(),
+            )
+            .await?;
             Payload::Posture(Box::new(posture))
         }
         Query::Headers(domain) => {
@@ -408,7 +413,7 @@ async fn run_query(
             // re-check of known hosts fast and independent of CT logs.
             let hosts = if hosts.is_empty() {
                 spinner.set_message("Enumerating subdomains via CT logs");
-                seer_core::SubdomainEnumerator::new()
+                seer_core::SubdomainEnumerator::from_config(config)
                     .enumerate(&domain)
                     .await?
                     .subdomains
@@ -526,8 +531,13 @@ pub fn trace_outcome(trace: seer_core::DnsTrace, short: bool) -> Outcome {
 /// baseline (see [`crate::ops::subdomain_baseline_check`]). With `diff` the
 /// result is the diff; `--record` alone shows the listing and confirms the
 /// write afterwards.
-async fn subdomain_baseline(domain: &str, diff: bool, record: bool) -> seer_core::Result<Outcome> {
-    let outcome = crate::ops::subdomain_baseline_check(domain, record).await?;
+async fn subdomain_baseline(
+    domain: &str,
+    diff: bool,
+    record: bool,
+    config: &SeerConfig,
+) -> seer_core::Result<Outcome> {
+    let outcome = crate::ops::subdomain_baseline_check(domain, record, config).await?;
     let name = outcome.result.domain.clone();
     Ok(if diff {
         Outcome {

@@ -237,6 +237,7 @@ mod tests {
             ],
             source: "crt.sh".into(),
             count: 3,
+            truncated: false,
         };
         let data = LensData::Subdomains(Box::new(result));
         let filtered = apply(&data, "api").expect("filter applies");
@@ -255,6 +256,7 @@ mod tests {
             subdomains: vec!["a.example.com".into()],
             source: "crt.sh".into(),
             count: 1,
+            truncated: false,
         };
         let data = LensData::Subdomains(Box::new(result));
         assert!(apply(&data, "").is_none());

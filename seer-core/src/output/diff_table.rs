@@ -139,7 +139,7 @@ pub(super) fn build_diff_sections(diff: &DomainDiff) -> Vec<DiffSection> {
         DiffSection {
             title: "DNS",
             rows: vec![
-                value_row("Resolves", &dns.resolves, |b| bool_as_str(*b)),
+                value_row("Resolves", &dns.resolves, opt_bool_or_placeholder),
                 list_row("A Records", &dns.a_records),
                 list_row("Nameservers", &dns.nameservers),
             ],
@@ -190,7 +190,7 @@ pub(super) mod tests {
                     vec!["ns1.example".to_string(), "ns2.example".to_string()],
                     vec!["ns2.example".to_string(), "ns1.example".to_string()],
                 ),
-                resolves: (true, true),
+                resolves: (Some(true), Some(true)),
             },
             ssl: SslDiff {
                 issuer: (
@@ -204,6 +204,7 @@ pub(super) mod tests {
                 days_remaining: (Some(89), Some(75)),
                 is_valid: (Some(true), Some(true)),
             },
+            errors: Vec::new(),
         }
     }
 

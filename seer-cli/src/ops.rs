@@ -285,7 +285,8 @@ pub async fn record_lookup_history(
     let store = STORE_LOCK.lock().await;
     tokio::task::spawn_blocking(move || {
         let _store = store;
-        let mut history = seer_core::LookupHistory::load();
+        // An unreadable history is left alone rather than saved over.
+        let mut history = seer_core::LookupHistory::load()?;
         history.record(&domain, result);
         history.save()
     })
@@ -308,11 +309,11 @@ where
 }
 
 pub async fn load_watchlist() -> Result<seer_core::Watchlist, String> {
-    state_io("load watchlist", || Ok(seer_core::Watchlist::load())).await
+    state_io("load watchlist", seer_core::Watchlist::load).await
 }
 
 pub async fn load_history() -> Result<seer_core::LookupHistory, String> {
-    state_io("load history", || Ok(seer_core::LookupHistory::load())).await
+    state_io("load history", seer_core::LookupHistory::load).await
 }
 
 /// Empties the `~/.seer` lookup history.
@@ -320,7 +321,7 @@ pub async fn clear_history() -> Result<(), String> {
     let store = STORE_LOCK.lock().await;
     state_io("clear history", move || {
         let _store = store;
-        let mut history = seer_core::LookupHistory::load();
+        let mut history = seer_core::LookupHistory::load()?;
         history.clear();
         history.save()
     })
@@ -354,13 +355,16 @@ pub async fn drift_check(
     // The baseline is the most recent snapshot that carries registration
     // data, so one throttled run recorded with --record does not become the
     // point every later run is compared against.
-    let previous = tokio::task::spawn_blocking(move || {
-        let history = seer_core::LookupHistory::load();
-        seer_core::drift::baseline_snapshot(history.get(&domain_key).iter().map(|e| &e.result))
-            .cloned()
+    // An unreadable history is an error, not "no baseline".
+    let previous = tokio::task::spawn_blocking(move || -> seer_core::Result<_> {
+        let history = seer_core::LookupHistory::load()?;
+        Ok(
+            seer_core::drift::baseline_snapshot(history.get(&domain_key).iter().map(|e| &e.result))
+                .cloned(),
+        )
     })
     .await
-    .map_err(|e| seer_core::SeerError::ConfigError(format!("history task failed: {e}")))?;
+    .map_err(|e| seer_core::SeerError::ConfigError(format!("history task failed: {e}")))??;
 
     finish_drift(
         domain,
@@ -436,24 +440,22 @@ pub struct SubdomainBaselineOutcome {
 pub async fn subdomain_baseline_check(
     domain: &str,
     record: bool,
+    config: &seer_core::SeerConfig,
 ) -> seer_core::Result<SubdomainBaselineOutcome> {
-    let enumerator = seer_core::SubdomainEnumerator::new();
+    let enumerator = seer_core::SubdomainEnumerator::from_config(config);
     // `enumerate` normalizes the domain; use `result.domain` as the key so
     // the baseline store and the note agree on the canonical name.
     let result = enumerator.enumerate(domain).await?;
 
     // Baseline file I/O is blocking — keep it off the async executor.
-    let domain_key = result.domain.clone();
-    let names = result.subdomains.clone();
-    let source = result.source.clone();
-    let report = tokio::task::spawn_blocking(move || -> seer_core::Result<_> {
-        let mut baselines = seer_core::SubdomainBaselines::load();
-        let report = baselines.diff(&domain_key, &names);
+    let (result, report) = tokio::task::spawn_blocking(move || -> seer_core::Result<_> {
+        let mut baselines = seer_core::SubdomainBaselines::load()?;
+        let report = baselines.diff(&result.domain, &result.subdomains);
         if record {
-            baselines.record(&domain_key, &names, &source);
+            baselines.record(&result);
             baselines.save()?;
         }
-        Ok(report)
+        Ok((result, report))
     })
     .await
     .map_err(|e| seer_core::SeerError::ConfigError(format!("baseline task failed: {e}")))??;

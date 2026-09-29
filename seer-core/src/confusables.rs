@@ -144,6 +144,29 @@ fn is_ldh(c: char) -> bool {
     c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'
 }
 
+/// Whether a permuted label is valid in DNS: 1–63 octets, no leading or
+/// trailing hyphen, and `--` at positions 3–4 only in a well-formed IDNA
+/// A-label (RFC 5891 §4.2.3.1). Permuting an `xn--` label, or inserting a
+/// hyphen, otherwise yields names no registry accepts (`nx--…`, undecodable
+/// punycode).
+fn is_valid_label(label: &str) -> bool {
+    if label.is_empty() || label.len() > 63 || label.starts_with('-') || label.ends_with('-') {
+        return false;
+    }
+    if label.get(2..4) != Some("--") {
+        return true;
+    }
+    if !label.starts_with("xn--") {
+        return false;
+    }
+    // A valid A-label decodes, and re-encoding its U-label gives the same
+    // A-label back (rejecting non-canonical and all-ASCII encodings).
+    let (unicode, decoded) = idna::domain_to_unicode(label);
+    decoded.is_ok()
+        && unicode != label
+        && idna::domain_to_ascii(&unicode).is_ok_and(|ascii| ascii == label)
+}
+
 /// Records `candidate` under `technique` unless it is the original name or
 /// was already produced (by this or an earlier technique).
 fn push_unique(
@@ -181,47 +204,39 @@ fn fair_shares(sizes: &[usize], cap: usize) -> Vec<usize> {
 
 /// Generates typo/homoglyph look-alike candidates for `domain`.
 ///
-/// The name is split at its registrable boundary using the Public Suffix
-/// List: the brand label is the one immediately left of the ICANN public
-/// suffix (`example` in `mail.example.co.uk`). That label is permuted; any
-/// deeper subdomain labels and the suffix are preserved, except for the
-/// dedicated `tld-swap` technique, which swaps the whole suffix
-/// (`example.co.uk` → `example.com`). Output is deduplicated, excludes the
-/// input itself, and capped at 600 candidates with the budget shared fairly
-/// across techniques: each keeps an equal share (or all of its candidates, if
-/// it has fewer), and a small technique's unused share passes to the larger
-/// ones. A bare public suffix has no brand label and yields nothing.
+/// Squats are registrations, so candidates are built from the registrable
+/// domain found with the Public Suffix List: `mail.example.co.uk` is scanned
+/// as `example.co.uk`, and its brand label (`example`, the one immediately
+/// left of the ICANN public suffix) is permuted with the suffix kept, except
+/// for the dedicated `tld-swap` technique, which swaps the whole suffix
+/// (`example.co.uk` → `example.com`). Subdomain labels are dropped: a
+/// `mail.xample.com` candidate names a host the squatter never has to
+/// create, so its DNS probe reads as unregistered and the real squat
+/// `xample.com` is missed. Every candidate is a valid DNS name (labels of at
+/// most 63 octets, `--` at positions 3–4 only in a well-formed `xn--`
+/// A-label). Output is deduplicated, excludes the registrable domain itself,
+/// and capped at 600 candidates with the budget shared fairly across
+/// techniques: each keeps an equal share (or all of its candidates, if it has
+/// fewer), and a small technique's unused share passes to the larger ones. A
+/// bare public suffix has no brand label and yields nothing.
 pub fn generate_candidates(domain: &str) -> Vec<ConfusableCandidate> {
     let Ok(normalized) = normalize_domain(domain) else {
         return Vec::new();
     };
-    let Some(tld) = crate::psl::public_suffix(&normalized) else {
+    let Some(registrable) = crate::psl::registrable_domain(&normalized) else {
         return Vec::new();
     };
-    let Some(prefix) = normalized
-        .strip_suffix(tld)
-        .and_then(|p| p.strip_suffix('.'))
-        .filter(|p| !p.is_empty())
-    else {
+    // The registrable domain is one label plus the (possibly multi-label)
+    // public suffix.
+    let Some((label, tld)) = registrable.split_once('.') else {
         return Vec::new();
-    };
-    // Permute only the registrable label, keeping any deeper subdomain
-    // labels fixed.
-    let (sub, label) = match prefix.rsplit_once('.') {
-        Some((sub, label)) => (Some(sub), label),
-        None => (None, prefix),
     };
 
-    // Rebuilds the full candidate name around a permuted label, rejecting
-    // labels that are empty or start/end with a hyphen.
+    // Rebuilds the candidate name around a permuted label, rejecting labels
+    // (and names, RFC 1035's 253 octets) that are not valid in DNS.
     let with_label = |variant: &str| -> Option<String> {
-        if variant.is_empty() || variant.starts_with('-') || variant.ends_with('-') {
-            return None;
-        }
-        Some(match sub {
-            Some(sub) => format!("{sub}.{variant}.{tld}"),
-            None => format!("{variant}.{tld}"),
-        })
+        let valid = is_valid_label(variant) && variant.len() + 1 + tld.len() <= 253;
+        valid.then(|| format!("{variant}.{tld}"))
     };
 
     let mut seen = HashSet::new();
@@ -232,7 +247,7 @@ pub fn generate_candidates(domain: &str) -> Vec<ConfusableCandidate> {
         let mut bucket = Vec::new();
         for variant in variants {
             if let Some(candidate) = with_label(&variant) {
-                push_unique(&mut seen, &mut bucket, &normalized, candidate, technique);
+                push_unique(&mut seen, &mut bucket, registrable, candidate, technique);
             }
         }
         buckets.push(bucket);
@@ -299,12 +314,10 @@ pub fn generate_candidates(domain: &str) -> Vec<ConfusableCandidate> {
     }
     emit("insertion", insertions);
 
-    // Bitsquatting: flip each bit of each byte; keep valid LDH results.
+    // Bitsquatting: flip each bit of each byte; keep valid LDH results. The
+    // label is an A-label (normalized), so every char is ASCII.
     let mut bitsquats = Vec::new();
     for (i, &c) in chars.iter().enumerate() {
-        if !c.is_ascii() {
-            continue;
-        }
         for bit in 0..7 {
             let fc = ((c as u8) ^ (1 << bit)) as char;
             if is_ldh(fc) && fc != c {
@@ -337,11 +350,8 @@ pub fn generate_candidates(domain: &str) -> Vec<ConfusableCandidate> {
     let mut swaps = Vec::new();
     for &swap in SWAP_TLDS {
         if swap != tld {
-            let candidate = match sub {
-                Some(sub) => format!("{sub}.{label}.{swap}"),
-                None => format!("{label}.{swap}"),
-            };
-            push_unique(&mut seen, &mut swaps, &normalized, candidate, "tld-swap");
+            let candidate = format!("{label}.{swap}");
+            push_unique(&mut seen, &mut swaps, registrable, candidate, "tld-swap");
         }
     }
     buckets.push(swaps);
@@ -431,19 +441,46 @@ pub async fn score_candidates(
     candidates: Vec<ConfusableCandidate>,
     concurrency: usize,
 ) -> (Vec<RegisteredLookalike>, usize) {
-    use futures::stream::{self, StreamExt};
+    score_with(lookup, candidates, FanOut::shared(concurrency, 1)).await
+}
 
-    let concurrency = concurrency.max(1);
+/// How many pre-filter probes and full lookups one scan runs at a time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FanOut {
+    prefilter: usize,
+    lookups: usize,
+}
+
+impl FanOut {
+    /// One scan's budget (`concurrency` lookups, at least 50 probes) split
+    /// evenly across `scans` scans running at once, so a bulk batch of
+    /// confusables scans keeps the total in flight within that budget instead
+    /// of multiplying it (50 rows × 50 lookups).
+    fn shared(concurrency: usize, scans: usize) -> Self {
+        let concurrency = concurrency.max(1);
+        let scans = scans.max(1);
+        Self {
+            prefilter: (concurrency.max(PREFILTER_CONCURRENCY) / scans).max(1),
+            lookups: (concurrency / scans).max(1),
+        }
+    }
+}
+
+async fn score_with(
+    lookup: &SmartLookup,
+    candidates: Vec<ConfusableCandidate>,
+    fan_out: FanOut,
+) -> (Vec<RegisteredLookalike>, usize) {
+    use futures::stream::{self, StreamExt};
 
     // Pre-filter: probe DNS presence and drop NXDOMAIN candidates before any
     // registry query. A wider fan-out is fine here — DNS is far cheaper than a
     // full RDAP+WHOIS race.
-    let prefilter_concurrency = concurrency.max(PREFILTER_CONCURRENCY);
     let survivors: Vec<ConfusableCandidate> = stream::iter(candidates)
         .map(|cand| async move {
             survives_prefilter(lookup.presence(&cand.domain).await).then_some(cand)
         })
-        .buffer_unordered(prefilter_concurrency)
+        .buffer_unordered(fan_out.prefilter)
         .filter_map(|c| async move { c })
         .collect()
         .await;
@@ -455,7 +492,7 @@ pub async fn score_candidates(
             let result = lookup.lookup(&cand.domain).await.ok()?;
             lookalike_from_result(cand, &result)
         })
-        .buffer_unordered(concurrency)
+        .buffer_unordered(fan_out.lookups)
         .filter_map(|r| async move { r })
         .collect()
         .await;
@@ -468,15 +505,30 @@ pub async fn score_candidates(
 
 /// Generates look-alike candidates for `domain` and scores which are
 /// registered, returning a ranked [`ConfusableReport`].
+///
+/// A subdomain is scanned at its registrable domain (see
+/// [`generate_candidates`]); the report keeps the name as given.
 pub async fn find_confusables(
     lookup: &SmartLookup,
     domain: &str,
     concurrency: usize,
 ) -> Result<ConfusableReport> {
+    find_confusables_shared(lookup, domain, concurrency, 1).await
+}
+
+/// [`find_confusables`] for one of `scans` scans running concurrently (a
+/// bulk batch): the per-scan fan-out is `concurrency` divided among them.
+pub(crate) async fn find_confusables_shared(
+    lookup: &SmartLookup,
+    domain: &str,
+    concurrency: usize,
+    scans: usize,
+) -> Result<ConfusableReport> {
     let domain = normalize_domain(domain)?;
     let candidates = generate_candidates(&domain);
     let candidates_generated = candidates.len();
-    let (registered, candidates_checked) = score_candidates(lookup, candidates, concurrency).await;
+    let (registered, candidates_checked) =
+        score_with(lookup, candidates, FanOut::shared(concurrency, scans)).await;
     Ok(ConfusableReport {
         domain,
         candidates_generated,
@@ -518,16 +570,103 @@ mod tests {
     }
 
     #[test]
-    fn preserves_subdomains_and_only_permutes_registrable_label() {
+    fn subdomain_input_is_scanned_at_its_registrable_domain() {
+        // `mail.xample.com` was generated before: a host the squatter never
+        // creates, whose NXDOMAIN presence probe dropped the real squat
+        // `xample.com`. Candidates are registrations, so subdomain labels go.
         let cands = generate_candidates("mail.example.com");
-        // Every candidate (except tld-swaps) keeps the "mail." subdomain and
-        // ".com" tld; the middle label is what varies.
+        assert_eq!(cands, generate_candidates("example.com"));
         assert!(cands
             .iter()
-            .any(|c| c.domain == "mail.xample.com" && c.technique == "omission"));
+            .any(|c| c.domain == "xample.com" && c.technique == "omission"));
         assert!(cands
             .iter()
-            .all(|c| c.domain.starts_with("mail.") || c.technique == "tld-swap"));
+            .any(|c| c.domain == "example.net" && c.technique == "tld-swap"));
+        assert!(cands.iter().all(|c| !c.domain.contains("mail")));
+        // The registrable domain itself is never a candidate.
+        assert!(!cands.iter().any(|c| c.domain == "example.com"));
+    }
+
+    #[test]
+    fn candidates_are_valid_dns_names() {
+        // A 63-octet label must not grow past 63 by insertion/repetition.
+        let long = format!("{}.com", "a".repeat(63));
+        let cands = generate_candidates(&long);
+        assert!(!cands.is_empty());
+        assert!(cands
+            .iter()
+            .all(|c| c.domain.split('.').all(|l| l.len() <= 63)));
+
+        // Permuting an A-label must not produce `nx--…`, `x--n…` or
+        // undecodable punycode; every surviving `--` label is a valid A-label.
+        let cands = generate_candidates("xn--mnchen-3ya.de");
+        assert!(!cands.is_empty());
+        for c in &cands {
+            let label = c.domain.split('.').next().unwrap();
+            if label.get(2..4) == Some("--") {
+                assert!(label.starts_with("xn--"), "{}", c.domain);
+                let (_, ok) = idna::domain_to_unicode(label);
+                assert!(ok.is_ok(), "undecodable A-label {}", c.domain);
+            }
+        }
+        assert!(!cands.iter().any(|c| c.domain.starts_with("nx--")));
+    }
+
+    #[test]
+    fn label_validation_rules() {
+        assert!(is_valid_label("example"));
+        assert!(is_valid_label("ex-ample"));
+        assert!(is_valid_label("xn--mnchen-3ya"));
+        assert!(!is_valid_label(""));
+        assert!(!is_valid_label("-example"));
+        assert!(!is_valid_label("example-"));
+        assert!(!is_valid_label(&"a".repeat(64)));
+        assert!(is_valid_label(&"a".repeat(63)));
+        // Reserved `--` at positions 3–4 outside the IDNA prefix.
+        assert!(!is_valid_label("nx--mnchen-3ya"));
+        assert!(!is_valid_label("ab--cd"));
+        // `xn--` that does not decode (a control char, truncated punycode),
+        // does not round-trip, or is malformed.
+        assert!(!is_valid_label("xn--mnchen-3ay"));
+        assert!(!is_valid_label("xn--zzzz"));
+        assert!(!is_valid_label("xn--mnchn-3yae"));
+        assert!(!is_valid_label("xn--abc-"));
+        assert!(!is_valid_label("xn--example-"));
+    }
+
+    #[test]
+    fn fan_out_is_shared_across_concurrent_scans() {
+        // One scan: `concurrency` lookups, at least 50 probes.
+        assert_eq!(
+            FanOut::shared(10, 1),
+            FanOut {
+                prefilter: 50,
+                lookups: 10
+            }
+        );
+        // A bulk batch of 10 concurrent scans keeps the same totals.
+        assert_eq!(
+            FanOut::shared(10, 10),
+            FanOut {
+                prefilter: 5,
+                lookups: 1
+            }
+        );
+        assert_eq!(
+            FanOut::shared(50, 50),
+            FanOut {
+                prefilter: 1,
+                lookups: 1
+            }
+        );
+        // Never zero (buffer_unordered(0) would stall).
+        assert_eq!(
+            FanOut::shared(0, 0),
+            FanOut {
+                prefilter: 50,
+                lookups: 1
+            }
+        );
     }
 
     #[test]
@@ -602,14 +741,13 @@ mod tests {
             .iter()
             .all(|c| c.domain.ends_with(".co.uk") || c.technique == "tld-swap"));
 
-        // Subdomains under a multi-label suffix stay fixed too.
+        // A subdomain under a multi-label suffix is scanned at its
+        // registrable domain.
         let cands = generate_candidates("shop.example.com.au");
         assert!(cands
             .iter()
-            .any(|c| c.domain == "shop.xample.com.au" && c.technique == "omission"));
-        assert!(cands
-            .iter()
-            .all(|c| c.domain.starts_with("shop.") || c.technique == "tld-swap"));
+            .any(|c| c.domain == "xample.com.au" && c.technique == "omission"));
+        assert!(cands.iter().all(|c| !c.domain.starts_with("shop.")));
     }
 
     #[test]

@@ -113,6 +113,14 @@ impl HumanFormatter {
             }
         }
 
+        // Failed checks: their rows above are empty, not real answers.
+        if !diff.errors.is_empty() {
+            output.push(String::new());
+            for error in &diff.errors {
+                output.push(format!("  {} {}", self.warning("!"), sanitize_line(error)));
+            }
+        }
+
         output.join("\n")
     }
 }
@@ -500,7 +508,7 @@ mod tests {
             dns: DnsDiff {
                 a_records: (vec!["1.1.1.1".to_string()], vec!["1.1.1.1".to_string()]),
                 nameservers: (vec!["ns".to_string()], vec!["ns".to_string()]),
-                resolves: (true, true),
+                resolves: (Some(true), Some(true)),
             },
             ssl: SslDiff {
                 issuer: (Some("I".to_string()), Some("I".to_string())),
@@ -508,6 +516,7 @@ mod tests {
                 days_remaining: (Some(10), Some(10)),
                 is_valid: (Some(true), Some(true)),
             },
+            errors: Vec::new(),
         };
         let out = diff_formatter().format_diff(&diff);
         assert!(
@@ -531,7 +540,7 @@ mod tests {
             dns: DnsDiff {
                 a_records: (vec!["1.1.1.1".to_string()], vec!["2.2.2.2".to_string()]),
                 nameservers: (vec!["nsa".to_string()], vec!["nsb".to_string()]),
-                resolves: (true, false),
+                resolves: (Some(true), Some(false)),
             },
             ssl: SslDiff {
                 issuer: (Some("IA".to_string()), Some("IB".to_string())),
@@ -539,6 +548,7 @@ mod tests {
                 days_remaining: (Some(10), Some(20)),
                 is_valid: (Some(true), Some(false)),
             },
+            errors: Vec::new(),
         };
         let out = diff_formatter().format_diff(&diff);
         // Every field differs. Match marker must not appear on any row.
