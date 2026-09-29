@@ -56,7 +56,7 @@ pub enum SeerError {
         message: String,
         /// Whether the failure is transient (connect / timeout / 429 / 5xx),
         /// classified once while the typed error is still available. Read by
-        /// the retry classifier ([`crate::retry::NetworkRetryClassifier`]).
+        /// the retry classifier ([`crate::retry::is_retryable`]).
         transient: bool,
     },
 

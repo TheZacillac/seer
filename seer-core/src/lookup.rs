@@ -12,11 +12,13 @@ use tracing::{debug, instrument, warn};
 
 use tokio::time::timeout as tokio_timeout;
 
-use crate::availability::{AvailabilityChecker, AvailabilityResult, PriorRdap, PriorWhois};
+use crate::availability::{
+    classify_fallback, AvailabilityChecker, AvailabilityResult, Fallback, PriorRdap, PriorWhois,
+};
 use crate::cache::TtlCache;
 use crate::dns::{DnsPresence, DnsResolver};
 use crate::error::{Result, SeerError};
-use crate::rdap::{rdap_error_is_404, RdapClient, RdapResponse};
+use crate::rdap::{RdapClient, RdapResponse};
 use crate::whois::{get_registry_url, get_tld, WhoisClient, WhoisResponse};
 
 /// Cache TTL for lookup results (5 minutes).
@@ -34,12 +36,14 @@ const PROTOCOL_GRACE_PERIOD: Duration = Duration::from_secs(5);
 /// Maximum length for public-facing error strings.
 const MAX_PUBLIC_ERROR_LEN: usize = 256;
 
-/// Upper bound a coalesced waiter will block on the owner's in-flight lookup
-/// before falling through to re-contend for ownership itself. Bounds the wait
-/// so a lost notification (e.g. the owner's future was cancelled/dropped before
-/// it could notify) can't hang the waiter forever. Sized to comfortably exceed
-/// a full concurrent RDAP+WHOIS race (≈15s per protocol plus the grace period
-/// and retries) so the common path always wakes via `notify_waiters()`.
+/// Upper bound on one wait of a coalesced waiter on the owner's in-flight
+/// lookup. When it elapses the waiter re-checks the cache and then the
+/// in-flight map: an owner still running keeps its entry, so the waiter just
+/// waits another round, and only a vanished owner (its guard dropped without a
+/// cached result) lets it take over. The bound therefore need not cover a full
+/// lookup — which, with WHOIS/RDAP retries, referral hops and the
+/// availability fallback, can run well past a minute; it only caps how long a
+/// lost notification can delay a waiter.
 const DEFAULT_INFLIGHT_WAIT: Duration = Duration::from_secs(30);
 
 /// Global cache for lookup results to avoid redundant network calls.
@@ -87,24 +91,26 @@ static LOOKUP_CONCURRENT_CALLS: LazyLock<std::sync::atomic::AtomicUsize> =
     LazyLock::new(|| std::sync::atomic::AtomicUsize::new(0));
 
 /// TTL for *degraded* lookup results: verdicts derived from DNS presence or
-/// a registry refusal rather than from registry data (see
-/// [`is_degraded_result`]). Short so a transient rate limit or outage isn't
+/// a registry refusal, and WHOIS records without registration data, rather
+/// than from registry data (see [`is_degraded_result`]). Short so a transient rate limit or outage isn't
 /// served back for the full [`LOOKUP_CACHE_TTL`], yet non-zero so coalesced
 /// waiters (which read the owner's result from the cache) and bulk
 /// duplicates still share one network race.
 const DEGRADED_LOOKUP_CACHE_TTL: Duration = Duration::from_secs(30);
 
 /// Whether a lookup result is a stand-in for registry data we failed to get:
-/// an inconclusive verdict, or one inferred from DNS presence (`dns_present`
-/// — "retry shortly for full detail" — and `dns_nxdomain`), or from a WHOIS
-/// error message. Such results are cached only briefly.
+/// an inconclusive verdict, one inferred from DNS presence (`dns_present` —
+/// "retry shortly for full detail" — and `dns_nxdomain`), or a WHOIS record
+/// with no registration data (a thin body kept because RDAP failed or
+/// returned an empty 200). Such results are cached only briefly.
 fn is_degraded_result(result: &LookupResult) -> bool {
     match result {
         LookupResult::Available { data, .. } => matches!(
             data.method.as_str(),
-            "inconclusive" | "dns_present" | "dns_nxdomain" | "whois_error"
+            "inconclusive" | "dns_present" | "dns_nxdomain"
         ),
-        LookupResult::Rdap { .. } | LookupResult::Whois { .. } => false,
+        LookupResult::Whois { data, .. } => data.is_thin(),
+        LookupResult::Rdap { .. } => false,
     }
 }
 
@@ -154,103 +160,34 @@ fn whois_leg_has_data(w: &Result<WhoisResponse>) -> bool {
     matches!(w, Ok(data) if !data.is_thin())
 }
 
-/// Decides whether a WHOIS response + RDAP error combination should route
-/// to the availability path. Returns `(confidence, method)` when routing is
-/// warranted, `None` to keep the existing `LookupResult::Whois` behavior.
-///
-/// Case A: WHOIS explicitly indicates no registration (highest priority).
-/// Case B: WHOIS returned but lacks registration data AND RDAP returned 404.
-fn classify_whois_leg(
-    w: &WhoisResponse,
-    rdap_err: &SeerError,
-) -> Option<(&'static str, &'static str)> {
-    if w.is_available() {
-        return Some(("high", "whois"));
-    }
-    if w.is_thin() && rdap_error_is_404(rdap_err) {
-        // Must stay in lockstep with `availability::decide_fallback`'s
-        // RDAP-404 branch: the registry's own 404 is authoritative, so the
-        // verdict is high-confidence via RDAP — not a hedged WHOIS signal.
-        return Some(("high", "rdap"));
-    }
-    None
-}
-
-/// Wraps `classify_whois_leg` with the "RDAP returned 200" veto: a successful
-/// RDAP response (HTTP 200, even if the body is thin) is positive evidence
-/// that the domain object exists, so we never let a WHOIS-only signal flip
-/// the verdict to "available" in that case. This guards against WHOIS
-/// propagation lag against freshly-provisioned domains the registry has
-/// already begun serving via RDAP. v0.26.6 regression fix.
-fn should_route_to_availability(
+/// The availability reading of a WHOIS answer when RDAP did not answer
+/// usefully. An RDAP HTTP 200 — even with a thin body — proves the domain
+/// object exists, so it vetoes every WHOIS- or DNS-derived "available"
+/// (WHOIS lags freshly provisioned domains; v0.26.6 rule) and the record is
+/// kept. Otherwise the answer is [`classify_fallback`]'s — the same ladder
+/// [`AvailabilityChecker`] uses, so the two paths cannot diverge.
+/// `rdap_err` is `None` for a grace-truncated RDAP leg.
+fn whois_leg_fallback(
+    domain: &str,
     rdap_returned_200: bool,
-    rdap_seer_error: Option<&SeerError>,
-    whois_data: &WhoisResponse,
-) -> Option<(&'static str, &'static str)> {
+    rdap_err: Option<&SeerError>,
+    whois: &WhoisResponse,
+) -> Fallback {
     if rdap_returned_200 {
-        return None;
+        return Fallback::Registered;
     }
-    // `is_available()` streams the raw response (~1 MB worst case) line by
-    // line. Compute it once and reuse — `classify_whois_leg` also calls it,
-    // so the original code paid the scan twice on every non-404 RDAP-error
-    // path. We pre-check Case A here; if it doesn't fire we drop into the
-    // 404+thin Case B branch via `classify_whois_leg`.
-    if whois_data.is_available() {
-        return Some(("high", "whois"));
-    }
-    rdap_seer_error.and_then(|e| {
-        // Case B only: WHOIS is not available, so the only remaining path
-        // is "thin WHOIS + RDAP 404". `classify_whois_leg` will re-check
-        // `is_available()` for free (it's false now), so this is a single
-        // additional thin-check call.
-        classify_whois_leg(whois_data, e)
-    })
+    classify_fallback(domain, rdap_err, Ok(whois))
 }
 
-/// Verdict for the "thin WHOIS leg + non-200 RDAP failure" fallback block in
-/// [`SmartLookup::lookup_concurrent`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ThinFallback {
-    /// The registry refused/throttled the query — no usable registration
-    /// signal. Report inconclusive rather than guessing.
-    Inconclusive,
-    /// Thin WHOIS, RDAP not 200, apex is NXDOMAIN — likely available.
-    Available,
-    /// Thin/no-service WHOIS, RDAP unavailable, apex IS delegated — registered.
-    Registered,
-    /// Preconditions not met — keep the existing [`LookupResult::Whois`].
-    UseWhois,
-}
-
-/// Pure decision for the thin-WHOIS fallback block. Encodes the same issue-#45
-/// precedence as `availability::decide_fallback` so the smart-lookup
-/// hot path and the dedicated availability path cannot diverge: a registry that
-/// *refused/throttled* the query (rather than authoritatively answering) is
-/// inconclusive and must NOT be inverted into "available" or fail-safed to
-/// "registered" on the strength of DNS presence.
-///
-/// `whois_refuses` is [`crate::whois::WhoisResponse::indicates_registry_refusal`]
-/// precomputed by the caller. Routes are only considered when the WHOIS body was
-/// thin (no registrar/dates) and RDAP did NOT return an HTTP 200 — a 200, even
-/// with a thin body, proves the domain object exists and vetoes every
-/// DNS-derived reclassification. [`DnsPresence::Unknown`] (a failed probe) is not
-/// positive evidence either way, so it falls through to WHOIS.
-fn classify_thin_fallback(
-    is_thin: bool,
-    rdap_returned_200: bool,
-    whois_refuses: bool,
-    dns: DnsPresence,
-) -> ThinFallback {
-    if !is_thin || rdap_returned_200 {
-        return ThinFallback::UseWhois;
-    }
-    if whois_refuses {
-        return ThinFallback::Inconclusive;
-    }
-    match dns {
-        DnsPresence::Absent => ThinFallback::Available,
-        DnsPresence::Present => ThinFallback::Registered,
-        DnsPresence::Unknown => ThinFallback::UseWhois,
+/// Progress line for an availability verdict reached with WHOIS in hand.
+fn verdict_progress(avail: &AvailabilityResult) -> &'static str {
+    match avail.method.as_str() {
+        "registrable_parent" => "Name is below a registrable domain (checked its parent)",
+        "inconclusive" => "Registry gave no usable answer (availability inconclusive)",
+        "dns_present" => "Domain is registered (registry detail unavailable)",
+        "dns_nxdomain" => "Domain appears unregistered (no DNS presence)",
+        _ if avail.available => "Domain appears unregistered",
+        _ => "Domain is registered",
     }
 }
 
@@ -431,10 +368,14 @@ pub enum LookupResult {
 }
 
 impl LookupResult {
-    /// Returns the domain name from the lookup result.
+    /// Returns the domain name from the lookup result, in seer's normalized
+    /// form (lowercase A-labels) whichever protocol answered: registries
+    /// spell RDAP's `ldhName` in any case (`EXAMPLE.COM`) and some send only
+    /// a `unicodeName`, while WHOIS and availability results already carry
+    /// the normalized queried name.
     pub fn domain_name(&self) -> Option<String> {
         match self {
-            LookupResult::Rdap { data, .. } => data.domain_name().map(String::from),
+            LookupResult::Rdap { data, .. } => data.domain_name().map(normalize_rdap_name),
             LookupResult::Whois { data, .. } => Some(data.domain.clone()),
             LookupResult::Available { data, .. } => Some(data.domain.clone()),
         }
@@ -498,6 +439,13 @@ impl LookupResult {
     pub fn expiration_info(&self) -> (Option<DateTime<Utc>>, Option<String>) {
         (self.expiration_date(), self.registrar())
     }
+}
+
+/// Normalizes a registry-reported RDAP domain name to seer's canonical
+/// form: no trailing root dot, lowercase, A-labels.
+fn normalize_rdap_name(name: &str) -> String {
+    let name = name.trim_end_matches('.').to_lowercase();
+    crate::validation::domain_to_ascii(&name).unwrap_or(name)
 }
 
 /// Truncates `s` to at most `max` bytes, backing up to the nearest UTF-8 char
@@ -574,10 +522,10 @@ impl SmartLookup {
     /// per-protocol timeouts in `config`.
     pub fn from_config(config: &crate::config::SeerConfig) -> Self {
         Self {
-            rdap_client: RdapClient::new().with_timeout(config.rdap_timeout()),
-            whois_client: WhoisClient::new().with_timeout(config.whois_timeout()),
+            rdap_client: RdapClient::from_config(config),
+            whois_client: WhoisClient::from_config(config),
             availability_checker: AvailabilityChecker::from_config(config),
-            dns_resolver: DnsResolver::new().with_timeout(config.dns_timeout()),
+            dns_resolver: DnsResolver::from_config(config),
         }
     }
 
@@ -793,114 +741,36 @@ impl SmartLookup {
         };
 
         if let LegOutcome::Completed(Ok(whois_data)) = whois_leg {
-            // Check Cases A and B: should we reclassify as Available? The
-            // `should_route_to_availability` helper also enforces the
-            // "RDAP returned 200 vetoes WHOIS availability claims" rule.
-            let availability_match = should_route_to_availability(
+            // Read the WHOIS answer through the shared availability ladder.
+            // The DNS probe runs only when the registry signals are silent,
+            // so the common paths never pay for it.
+            let fallback = whois_leg_fallback(
+                domain,
                 rdap_returned_200,
                 rdap_seer_error.as_ref(),
                 &whois_data,
             );
-
-            if let Some((confidence, method)) = availability_match {
+            let verdict = match fallback {
+                Fallback::Registered => None,
+                Fallback::Verdict(avail) => Some(avail),
+                Fallback::NeedsDns(tie_break) => {
+                    Some(tie_break.decide(self.dns_resolver.presence(domain).await))
+                }
+            };
+            if let Some(avail) = verdict {
                 debug!(
                     domain = %domain,
-                    confidence = %confidence,
-                    "Reclassifying WHOIS as availability signal"
+                    method = %avail.method,
+                    confidence = %avail.confidence,
+                    "Reading WHOIS leg as an availability verdict"
                 );
-                // Keyed off `method` (not confidence) so the text names the
-                // signal that actually decided the verdict, matching
-                // `availability::decide_fallback`'s wording for the same cases.
-                let details = match method {
-                    "whois" => Some("WHOIS indicates domain is not registered".to_string()),
-                    "rdap" => Some("Registry RDAP reports no such domain (HTTP 404)".to_string()),
-                    _ => None,
-                };
-                let avail = AvailabilityResult {
-                    details,
-                    ..AvailabilityResult::new(domain, true, confidence, method)
-                };
                 // A registry "no such domain" for a name below its
                 // registrable domain (mail.google.com) is not availability.
                 let avail = self.availability_checker.guard_subdomain_claim(avail).await;
                 if let Some(ref cb) = progress {
-                    cb(if avail.available {
-                        "Domain appears unregistered"
-                    } else {
-                        "Name is below a registrable domain (checked its parent)"
-                    });
+                    cb(verdict_progress(&avail));
                 }
                 return Ok(available_with_whois(avail, &rdap_error_str, whois_data));
-            }
-
-            // Fix #2 safety net: a thin WHOIS body plus an RDAP failure that was
-            // not an authoritative 404 leaves us without registry data. Route the
-            // verdict through `classify_thin_fallback`, which shares the issue-#45
-            // precedence with `availability::decide_fallback` so the two fallback
-            // paths cannot diverge: a registry refusal/throttle is inconclusive
-            // (never inverted into "available" or fail-safed to "registered");
-            // otherwise an NXDOMAIN apex reads as available and a delegated apex
-            // reads as registered. The cheap thin / not-200 preconditions gate the
-            // DNS probe so we don't pay for it on the common paths, and a refusal
-            // short-circuits before the probe entirely.
-            let whois_is_thin = whois_data.is_thin();
-            if whois_is_thin && !rdap_returned_200 {
-                let whois_refuses = whois_data.indicates_registry_refusal();
-                let dns_presence = if whois_refuses {
-                    // A refusal already settles the verdict; skip the DNS probe.
-                    DnsPresence::Unknown
-                } else {
-                    self.dns_resolver.presence(domain).await
-                };
-                match classify_thin_fallback(
-                    whois_is_thin,
-                    rdap_returned_200,
-                    whois_refuses,
-                    dns_presence,
-                ) {
-                    ThinFallback::Inconclusive => {
-                        debug!(domain = %domain, "Thin WHOIS is a registry refusal/throttle; availability inconclusive (issue #45)");
-                        if let Some(ref cb) = progress {
-                            cb("Registry refused or throttled the query (availability inconclusive)");
-                        }
-                        let avail = AvailabilityResult::new(domain, false, "none", "inconclusive")
-                            .with_details(crate::availability::REFUSED_DETAILS);
-                        return Ok(available_with_whois(avail, &rdap_error_str, whois_data));
-                    }
-                    ThinFallback::Available => {
-                        debug!(domain = %domain, "Thin WHOIS + NXDOMAIN, reclassifying as available");
-                        let avail = AvailabilityResult::new(domain, true, "medium", "dns_nxdomain")
-                            .with_details(crate::availability::THIN_NXDOMAIN_DETAILS);
-                        let avail = self.availability_checker.guard_subdomain_claim(avail).await;
-                        if let Some(ref cb) = progress {
-                            cb(if avail.available {
-                                "Domain appears unregistered (no DNS presence)"
-                            } else {
-                                "Name is below a registrable domain (checked its parent)"
-                            });
-                        }
-                        return Ok(available_with_whois(avail, &rdap_error_str, whois_data));
-                    }
-                    ThinFallback::Registered => {
-                        debug!(domain = %domain, "Thin/no-service WHOIS + DNS delegation, reporting registered");
-                        if let Some(ref cb) = progress {
-                            cb("Domain is registered (registry detail unavailable)");
-                        }
-                        let details = if whois_data.registry_unavailable() {
-                            "Domain is registered (the apex is delegated in DNS). This TLD's \
-                             registry provides no port-43 WHOIS data and RDAP was unavailable \
-                             (rate-limited or unreachable); retry shortly for full RDAP detail."
-                        } else {
-                            "Domain is registered (the apex is delegated in DNS). Registry detail \
-                             was unavailable (RDAP rate-limited or unreachable and WHOIS returned \
-                             no data); retry shortly for full detail."
-                        };
-                        let avail = AvailabilityResult::new(domain, false, "high", "dns_present")
-                            .with_details(details);
-                        return Ok(available_with_whois(avail, &rdap_error_str, whois_data));
-                    }
-                    ThinFallback::UseWhois => {}
-                }
             }
             debug!("Using WHOIS result (RDAP not useful)");
             if let Some(ref cb) = progress {
@@ -993,20 +863,14 @@ impl SmartLookup {
                 whois_error: sanitize_error_for_public(&whois_error),
                 whois_data: None,
             }),
-            Err(avail_err) => {
-                let tld = get_tld(domain).unwrap_or("unknown");
-                let registry_url = get_registry_url(tld).unwrap_or_else(|| {
-                    format!("https://www.iana.org/domains/root/db/{}.html", tld)
-                });
-                Err(SeerError::LookupFailed {
-                    domain: domain.to_string(),
-                    details: format!(
-                        "RDAP failed ({}), WHOIS failed ({}), availability check failed ({})",
-                        rdap_error, whois_error, avail_err
-                    ),
-                    registry_url,
-                })
-            }
+            Err(avail_err) => Err(SeerError::LookupFailed {
+                domain: domain.to_string(),
+                details: format!(
+                    "RDAP failed ({}), WHOIS failed ({}), availability check failed ({})",
+                    rdap_error, whois_error, avail_err
+                ),
+                registry_url: get_registry_url(get_tld(domain)),
+            }),
         }
     }
 
@@ -1022,6 +886,7 @@ impl SmartLookup {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rdap::rdap_error_is_404;
 
     /// Global serialization mutex for the tests that share `LOOKUP_INFLIGHT`
     /// or `LOOKUP_CACHE` state (map coalescing, waiter coalescing, cache
@@ -1057,6 +922,30 @@ mod tests {
     }
 
     #[test]
+    fn rdap_domain_name_is_normalized_like_the_other_protocols() {
+        for (ldh, unicode) in [
+            (Some("EXAMPLE.COM"), None),
+            (Some("Example.Com."), None),
+            (None, Some("пример.рф")),
+        ] {
+            let result = LookupResult::Rdap {
+                data: Box::new(RdapResponse {
+                    ldh_name: ldh.map(str::to_string),
+                    unicode_name: unicode.map(str::to_string),
+                    ..Default::default()
+                }),
+                whois_fallback: None,
+            };
+            let expected = if unicode.is_some() {
+                "xn--e1afmkfd.xn--p1ai"
+            } else {
+                "example.com"
+            };
+            assert_eq!(result.domain_name().as_deref(), Some(expected));
+        }
+    }
+
+    #[test]
     fn test_lookup_result_serialization() {
         let result = LookupResult::Whois {
             data: WhoisResponse {
@@ -1076,8 +965,8 @@ mod tests {
     fn test_lookup_result_available_serialization() {
         let result = LookupResult::Available {
             data: Box::new(
-                AvailabilityResult::new("test123.xyz", true, "medium", "whois_error")
-                    .with_details("WHOIS server indicates no matching records"),
+                AvailabilityResult::new("test123.xyz", true, "medium", "dns_nxdomain")
+                    .with_details("Registry lookups failed; domain has no DNS presence (NXDOMAIN)"),
             ),
             rdap_error: "RDAP failed".to_string(),
             whois_error: "WHOIS failed".to_string(),
@@ -1525,16 +1414,18 @@ mod tests {
             true,
             "medium"
         )));
-        assert!(is_degraded_result(&available_via(
-            "whois_error",
-            true,
-            "medium"
-        )));
+        // A WHOIS record without registration data (kept after an RDAP
+        // failure or an empty RDAP 200) is a stand-in too.
+        assert!(is_degraded_result(&LookupResult::Whois {
+            data: empty_whois("example.test"),
+            rdap_error: Some("RDAP response incomplete".to_string()),
+            rdap_fallback: None,
+        }));
         // Authoritative registry answers keep the full TTL.
         assert!(!is_degraded_result(&available_via("rdap", true, "high")));
         assert!(!is_degraded_result(&available_via("whois", true, "high")));
         assert!(!is_degraded_result(&LookupResult::Whois {
-            data: empty_whois("example.test"),
+            data: denic_whois(),
             rdap_error: None,
             rdap_fallback: None,
         }));
@@ -1640,223 +1531,144 @@ mod tests {
             SeerError::RdapBootstrapError("no RDAP server for example.de".to_string());
         assert!(!w.is_thin());
         assert!(whois_leg_has_data(&Ok(w.clone())));
-        assert_eq!(
-            should_route_to_availability(false, Some(&bootstrap_miss), &w),
-            None
-        );
-        assert_eq!(
-            classify_thin_fallback(
-                w.is_thin(),
-                false,
-                w.indicates_registry_refusal(),
-                DnsPresence::Present,
-            ),
-            ThinFallback::UseWhois
-        );
+        assert!(matches!(
+            whois_leg_fallback("example.de", false, Some(&bootstrap_miss), &w),
+            Fallback::Registered
+        ));
     }
 
-    // ---------------- classify_whois_leg ----------------
-
-    use crate::rdap::RdapResponse;
-
-    #[allow(dead_code)]
-    fn make_empty_rdap_response() -> RdapResponse {
-        serde_json::from_value(serde_json::json!({
-            "objectClassName": "domain",
-        }))
-        .expect("valid minimal RDAP response")
-    }
-
-    #[test]
-    fn classify_whois_leg_case_a_high_confidence() {
-        let mut w = empty_whois("zaccodes.com");
-        w.raw_response = "No match for \"ZACCODES.COM\".".to_string();
-        assert!(w.is_available());
-        let rdap_err = SeerError::RdapError("query failed with status 404 Not Found".to_string());
-        let (verdict, method) =
-            classify_whois_leg(&w, &rdap_err).expect("expected a routing decision");
-        assert_eq!(verdict, "high");
-        assert_eq!(method, "whois");
-    }
-
-    #[test]
-    fn classify_whois_leg_case_b_matches_decide_fallback() {
-        // Case B (thin WHOIS + RDAP 404) must classify identically to
-        // `availability::decide_fallback`'s branch for the same precondition:
-        // the registry's own RDAP 404 is the authoritative signal, so both
-        // ladders report ("high", "rdap"). Divergence here made `seer check`
-        // say "available" while `seer lookup` said "likely_available" for the
-        // same domain (2026-07-11 review).
-        let w = empty_whois("example.xyz");
-        assert!(!w.is_available(), "this WHOIS body has no 'no match' text");
-        let rdap_err = SeerError::RdapError("query failed with status 404 Not Found".to_string());
-        let (verdict, method) =
-            classify_whois_leg(&w, &rdap_err).expect("expected a routing decision");
-        assert_eq!(verdict, "high");
-        assert_eq!(method, "rdap");
-    }
-
-    #[test]
-    fn classify_whois_leg_rejects_thin_whois_without_404() {
-        let w = empty_whois("example.xyz");
-        let rdap_err = SeerError::RdapError("connection timeout".to_string());
-        assert!(classify_whois_leg(&w, &rdap_err).is_none());
-    }
-
-    #[test]
-    fn classify_whois_leg_rejects_whois_with_real_data() {
-        let mut w = empty_whois("legacy.tld");
-        w.registrar = Some("Legacy Registry".to_string());
-        w.creation_date = Some(Utc::now());
-        let rdap_err = SeerError::RdapError("query failed with status 404 Not Found".to_string());
-        assert!(classify_whois_leg(&w, &rdap_err).is_none());
-    }
-
-    #[test]
-    fn classify_whois_leg_case_a_wins_over_case_b() {
-        let mut w = empty_whois("example.com");
-        w.raw_response = "No match for \"EXAMPLE.COM\".".to_string();
-        let rdap_err = SeerError::RdapError("query failed with status 404 Not Found".to_string());
-        let (verdict, _) = classify_whois_leg(&w, &rdap_err).unwrap();
-        assert_eq!(verdict, "high");
-    }
-
-    // ---------------- should_route_to_availability ----------------
+    // ---------------- whois_leg_fallback ----------------
     //
-    // Regression coverage for the v0.26.6 fix: when RDAP returned an HTTP 200
-    // (even with thin body), a WHOIS "no match" must NOT be treated as
-    // evidence of availability — that would let propagation lag flip the
-    // verdict for a domain the registry has already provisioned.
+    // The ladder itself is pinned combination by combination in
+    // `availability`'s tests; these cover what the lookup adds on top.
 
-    #[test]
-    fn rdap_200_vetoes_whois_no_match() {
-        let mut w = empty_whois("freshly-registered.com");
-        w.raw_response = "No match for \"FRESHLY-REGISTERED.COM\".".to_string();
-        // rdap_returned_200 = true, no rdap_seer_error (NoData has no error).
-        assert!(
-            should_route_to_availability(true, None, &w).is_none(),
-            "RDAP 200 must veto WHOIS-only availability claim",
-        );
+    /// Reads a fallback as (available, method), `None` for Registered.
+    fn verdict_of(fallback: Fallback, dns: DnsPresence) -> Option<(bool, String)> {
+        let avail = match fallback {
+            Fallback::Registered => return None,
+            Fallback::Verdict(v) => v,
+            Fallback::NeedsDns(t) => t.decide(dns),
+        };
+        Some((avail.available, avail.method))
     }
 
     #[test]
-    fn rdap_200_vetoes_even_with_thin_whois() {
-        let w = empty_whois("freshly-registered.com");
-        // Thin WHOIS without is_available() patterns.
-        assert!(
-            should_route_to_availability(true, None, &w).is_none(),
-            "RDAP 200 must veto even when WHOIS is thin",
-        );
+    fn rdap_200_vetoes_whois_no_match_and_thin_bodies() {
+        // Regression coverage for the v0.26.6 fix: an RDAP HTTP 200 (even a
+        // thin one) proves the object exists; WHOIS propagation lag must not
+        // flip it to "available", nor DNS be consulted.
+        let mut no_match = empty_whois("freshly-registered.com");
+        no_match.raw_response = "No match for \"FRESHLY-REGISTERED.COM\".".to_string();
+        for w in [no_match, empty_whois("freshly-registered.com")] {
+            assert!(matches!(
+                whois_leg_fallback("freshly-registered.com", true, None, &w),
+                Fallback::Registered
+            ));
+        }
     }
 
     #[test]
-    fn rdap_404_with_whois_no_match_routes_to_available() {
+    fn whois_no_match_routes_to_available_for_any_rdap_failure() {
         let mut w = empty_whois("genuinely-free.com");
         w.raw_response = "No match for \"GENUINELY-FREE.COM\".".to_string();
-        let rdap_err = SeerError::RdapError("query failed with status 404".to_string());
-        let result = should_route_to_availability(false, Some(&rdap_err), &w);
-        assert_eq!(result, Some(("high", "whois")));
+        let r404 = SeerError::RdapError("query failed with status 404".to_string());
+        let bootstrap = SeerError::RdapBootstrapError("all registries failed".to_string());
+        // 404, a non-404 failure, and a grace-truncated RDAP leg (None).
+        for rdap in [Some(&r404), Some(&bootstrap), None] {
+            assert_eq!(
+                verdict_of(
+                    whois_leg_fallback("genuinely-free.com", false, rdap, &w),
+                    DnsPresence::Unknown
+                ),
+                Some((true, "whois".to_string()))
+            );
+        }
     }
 
     #[test]
-    fn rdap_error_with_whois_is_available_still_routes_case_a() {
-        let mut w = empty_whois("genuinely-free.com");
-        w.raw_response = "Domain not found".to_string();
-        // RDAP errored for a non-404 reason (e.g. bootstrap failure); WHOIS
-        // signal alone should still route to availability.
-        let rdap_err = SeerError::RdapBootstrapError("all registries failed".to_string());
-        let result = should_route_to_availability(false, Some(&rdap_err), &w);
-        assert_eq!(result, Some(("high", "whois")));
+    fn thin_whois_with_rdap_404_is_available_via_rdap() {
+        // Must read identically to `seer avail` for the same outcomes: the
+        // registry's own RDAP 404 is authoritative ("high", "rdap").
+        let r404 = SeerError::RdapError("query failed with status 404 Not Found".to_string());
+        let fallback = whois_leg_fallback("example.xyz", false, Some(&r404), &empty_whois("x"));
+        let Fallback::Verdict(v) = fallback else {
+            panic!("expected a verdict");
+        };
+        assert_eq!(
+            (v.available, v.confidence.as_str(), v.method.as_str()),
+            (true, "high", "rdap")
+        );
     }
 
     #[test]
-    fn rdap_grace_timeout_with_whois_is_available_routes_case_a() {
-        // GraceTimeout path: rdap_returned_200 = false, rdap_seer_error = None.
-        let mut w = empty_whois("genuinely-free.com");
-        w.raw_response = "No match".to_string();
-        let result = should_route_to_availability(false, None, &w);
-        assert_eq!(result, Some(("high", "whois")));
+    fn thin_whois_with_silent_rdap_is_decided_by_dns() {
+        // The zac.email / Identity-Digital case among them: thin/no-service
+        // WHOIS with RDAP unavailable. A delegated apex reads as
+        // likely-registered, NXDOMAIN as likely-available, and a failed probe
+        // as inconclusive — never a bare WHOIS record cached for 5 minutes.
+        let rdap = SeerError::RdapError("query failed with status 429".to_string());
+        let w = empty_whois("zac.email");
+        let read = |dns| verdict_of(whois_leg_fallback("zac.email", false, Some(&rdap), &w), dns);
+        assert_eq!(
+            read(DnsPresence::Present),
+            Some((false, "dns_present".to_string()))
+        );
+        assert_eq!(
+            read(DnsPresence::Absent),
+            Some((true, "dns_nxdomain".to_string()))
+        );
+        assert_eq!(
+            read(DnsPresence::Unknown),
+            Some((false, "inconclusive".to_string()))
+        );
     }
 
     #[test]
-    fn no_rdap_200_no_error_thick_whois_stays_in_whois_path() {
-        let mut w = empty_whois("registered.com");
-        w.registrar = Some("Example Registrar Ltd".to_string());
-        // GraceTimeout-like: rdap_returned_200=false, no error, and WHOIS
-        // does not look free. Must return None so the caller picks
-        // `LookupResult::Whois`.
-        assert!(should_route_to_availability(false, None, &w).is_none());
-    }
-
-    // ---------------- classify_thin_fallback ----------------
-
-    #[test]
-    fn thin_fallback_refusal_is_inconclusive_regardless_of_dns() {
+    fn thin_whois_refusal_is_inconclusive_regardless_of_dns() {
         // issue #45: a registry refusal/throttle must never be guessed into
-        // "available" (from NXDOMAIN) or "registered" (from delegation). This
-        // is the inversion that was fixed in `availability::decide_fallback`
-        // but previously bypassed on the smart-lookup hot path.
+        // "available" (from NXDOMAIN) or "registered" (from delegation).
+        let rdap = SeerError::RdapError("query failed with status 503".to_string());
+        let mut w = empty_whois("example.test");
+        w.raw_response = "Access rate limited; please try again later.\n".to_string();
         for dns in [
             DnsPresence::Absent,
             DnsPresence::Present,
             DnsPresence::Unknown,
         ] {
             assert_eq!(
-                classify_thin_fallback(true, false, true, dns),
-                ThinFallback::Inconclusive
+                verdict_of(
+                    whois_leg_fallback("example.test", false, Some(&rdap), &w),
+                    dns
+                ),
+                Some((false, "inconclusive".to_string()))
             );
         }
     }
 
     #[test]
-    fn thin_fallback_nxdomain_is_available() {
-        assert_eq!(
-            classify_thin_fallback(true, false, false, DnsPresence::Absent),
-            ThinFallback::Available
-        );
+    fn whois_with_registration_data_stays_a_whois_record() {
+        let mut w = empty_whois("registered.com");
+        w.registrar = Some("Example Registrar Ltd".to_string());
+        let rdap = SeerError::RdapError("connection timeout".to_string());
+        for rdap in [Some(&rdap), None] {
+            assert!(matches!(
+                whois_leg_fallback("registered.com", false, rdap, &w),
+                Fallback::Registered
+            ));
+        }
     }
 
     #[test]
-    fn thin_fallback_delegated_is_registered() {
-        // The zac.email / Identity-Digital case: a no-service WHOIS leg, RDAP
-        // unavailable (throttled / grace-truncated), but the apex IS delegated
-        // in DNS — the domain is registered and must not render as blank.
+    fn verdict_progress_names_the_deciding_signal() {
+        let v =
+            |available, method: &str| AvailabilityResult::new("x.test", available, "high", method);
         assert_eq!(
-            classify_thin_fallback(true, false, false, DnsPresence::Present),
-            ThinFallback::Registered
+            verdict_progress(&v(true, "rdap")),
+            "Domain appears unregistered"
         );
-    }
-
-    #[test]
-    fn thin_fallback_unknown_dns_uses_whois() {
-        // A failed DNS probe is not positive evidence either way.
-        assert_eq!(
-            classify_thin_fallback(true, false, false, DnsPresence::Unknown),
-            ThinFallback::UseWhois
-        );
-    }
-
-    #[test]
-    fn thin_fallback_requires_thin_whois() {
-        // A WHOIS body with real registration data uses the normal Whois path.
-        assert_eq!(
-            classify_thin_fallback(false, false, false, DnsPresence::Absent),
-            ThinFallback::UseWhois
-        );
-    }
-
-    #[test]
-    fn thin_fallback_vetoed_by_rdap_200() {
-        // A 200 from RDAP (object exists) vetoes any DNS-derived reclassification
-        // — and even a refusal banner — because the object provably exists.
-        assert_eq!(
-            classify_thin_fallback(true, true, false, DnsPresence::Absent),
-            ThinFallback::UseWhois
-        );
-        assert_eq!(
-            classify_thin_fallback(true, true, true, DnsPresence::Present),
-            ThinFallback::UseWhois
-        );
+        assert!(verdict_progress(&v(false, "inconclusive")).contains("inconclusive"));
+        assert!(verdict_progress(&v(false, "dns_present")).contains("registered"));
+        assert!(verdict_progress(&v(false, "registrable_parent")).contains("parent"));
     }
 
     // ---------------- race_with_grace ----------------

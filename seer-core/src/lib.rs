@@ -63,7 +63,7 @@ pub use availability::{AvailabilityChecker, AvailabilityResult};
 pub use cache::TtlCache;
 pub use config::SeerConfig;
 pub use error::{Result, SeerError};
-pub use retry::{NetworkRetryClassifier, RetryClassifier, RetryExecutor, RetryPolicy};
+pub use retry::{is_retryable, RetryExecutor, RetryPolicy};
 pub use validation::normalize_domain;
 
 pub use dns::{
@@ -75,7 +75,7 @@ pub use dns::{
 pub use lookup::{LookupProgressCallback, LookupResult, SmartLookup};
 pub use rdap::{RdapClient, RdapResponse};
 pub use status::{CertificateInfo, DnsResolution, DomainExpiration, StatusClient, StatusResponse};
-pub use tld::{all_tlds, lookup_tld, TldInfo};
+pub use tld::{all_tlds, lookup_tld, lookup_tld_with, TldInfo};
 pub use whois::{WhoisClient, WhoisResponse};
 
 pub use bulk::{BulkExecutor, BulkOperation, BulkResult};

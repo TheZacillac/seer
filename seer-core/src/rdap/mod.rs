@@ -1,7 +1,8 @@
 //! RDAP client for domain, IP and ASN lookups.
 //!
 //! [`RdapClient`] finds the authoritative server through the IANA bootstrap
-//! registries (cached 24h, stale-while-revalidate), tries each candidate base
+//! registries (cached 24h; once loaded, an expired dataset is served while one
+//! background task refreshes it), tries each candidate base
 //! URL in turn, and retries transient failures through [`crate::retry`],
 //! honoring a capped `Retry-After` on HTTP 429. Every server host passes the
 //! SSRF guard before a request is sent. [`classify`] and [`auto_lookup`] route

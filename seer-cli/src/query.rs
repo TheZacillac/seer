@@ -305,7 +305,9 @@ pub async fn run(
             let _spinner = spinner(format!("Checking SSL for {}", domain));
             Payload::Ssl(Box::new(clients.ssl.check(&domain).await?))
         }
-        Query::Tld(tld) => Payload::Tld(Box::new(seer_core::lookup_tld(&tld).await)),
+        Query::Tld(tld) => Payload::Tld(Box::new(
+            seer_core::lookup_tld_with(&tld, &clients.rdap).await,
+        )),
         Query::Compare {
             domain,
             record_type,
