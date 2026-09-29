@@ -39,7 +39,7 @@ pub fn render(
         .enumerate()
         .map(|(i, e)| {
             let when = e.timestamp.format("%Y-%m-%d %H:%M").to_string();
-            let source = crate::ops::lookup_source(&e.result).unwrap_or("—");
+            let source = e.result.protocol().unwrap_or("—");
             let registrar = sanitize_line(&or_dash(e.result.registrar()));
             Row::new(vec![
                 when,

@@ -47,7 +47,7 @@ pub use propagation::{
     PropagationChecker, PropagationResult, PropagationServerResult, PropagationVerdict,
     ServerVerdict, UnreachableServer,
 };
-pub use query::{DnsQueryResult, DnsStatus, WildcardProbe};
+pub use query::{DnsQueryResult, DnsStatus, FailedType, WildcardProbe};
 pub use records::{DnsRecord, RecordData, RecordType, SvcParam};
 pub use resolver::{DnsPresence, DnsResolver};
 pub use trace::{DnsTrace, DnsTracer, TraceHop};

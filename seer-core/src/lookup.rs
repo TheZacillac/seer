@@ -368,6 +368,17 @@ pub enum LookupResult {
 }
 
 impl LookupResult {
+    /// The protocol whose record this result carries — `"RDAP"` or
+    /// `"WHOIS"` — or `None` for an availability verdict (neither registry
+    /// had the domain). Callers pick their own fallback text.
+    pub fn protocol(&self) -> Option<&'static str> {
+        match self {
+            LookupResult::Rdap { .. } => Some("RDAP"),
+            LookupResult::Whois { .. } => Some("WHOIS"),
+            LookupResult::Available { .. } => None,
+        }
+    }
+
     /// Returns the domain name from the lookup result, in seer's normalized
     /// form (lowercase A-labels) whichever protocol answered: registries
     /// spell RDAP's `ldhName` in any case (`EXAMPLE.COM`) and some send only

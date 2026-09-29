@@ -303,8 +303,9 @@ fn propagation_detail(result: &PropagationResult) -> String {
     }
 }
 
-/// A takeover finding's verdict as the formatters print it.
-fn takeover_label(verdict: TakeoverVerdict) -> &'static str {
+/// A takeover finding's verdict as every renderer prints it (the human and
+/// markdown formatters and the TUI's takeover lens).
+pub fn takeover_label(verdict: TakeoverVerdict) -> &'static str {
     match verdict {
         TakeoverVerdict::Vulnerable => "VULNERABLE",
         TakeoverVerdict::Potential => "potential",

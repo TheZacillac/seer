@@ -361,8 +361,9 @@ fn vantage_addresses(
 
 /// Reads one server's response: a definitive answer (NOERROR or NXDOMAIN)
 /// yields its records of the queried type (for ANY, every answer) and no
-/// error; any other status, or a referral from a server that is not
-/// recursive, yields the reason as the error. Shared with the DNS comparison,
+/// error; any other status, a referral from a server that is not recursive,
+/// or an `ANY` answer missing a type that got no reply, yields the reason as
+/// the error. Shared with the DNS comparison,
 /// so both read a server's reply the same way.
 pub(in crate::dns) fn read_reply(
     response: DnsQueryResult,
@@ -381,6 +382,24 @@ pub(in crate::dns) fn read_reply(
         );
     }
     match response.status {
+        // An ANY fan-out with a type that got no reply is an incomplete
+        // answer: its missing records are no data, not a disagreement, so
+        // the server stays out of the consensus (its records still show).
+        DnsStatus::NoError | DnsStatus::NxDomain if !response.failed_types.is_empty() => {
+            let missing: Vec<String> = response
+                .failed_types
+                .iter()
+                .map(|f| format!("{} ({})", f.record_type, f.error))
+                .collect();
+            (
+                response.answers,
+                status,
+                Some(format!(
+                    "incomplete answer, no reply for {}",
+                    missing.join(", ")
+                )),
+            )
+        }
         DnsStatus::NoError | DnsStatus::NxDomain => {
             let records = if record_type == RecordType::ANY {
                 response.answers
@@ -688,5 +707,43 @@ mod tests {
         assert_eq!(vantage["ns1.seer.test."], vec!["192.0.2.1".to_string()]);
         assert!(!vantage.contains_key("ns2.seer.test."), "{vantage:?}");
         assert!(details.inconsistencies.is_empty());
+    }
+
+    /// Regression: an ANY fan-out whose TXT sub-query timed out read as a
+    /// complete answer, so the server "disagreed" with the consensus on TXT.
+    #[test]
+    fn read_reply_keeps_an_incomplete_any_answer_out_of_the_consensus() {
+        let record = crate::dns::DnsRecord {
+            name: "example.com".into(),
+            record_type: RecordType::A,
+            ttl: 300,
+            data: RecordData::A {
+                address: "192.0.2.1".into(),
+            },
+        };
+        let mut response = DnsQueryResult {
+            name: "example.com".into(),
+            record_type: RecordType::ANY,
+            server: Some("8.8.8.8".into()),
+            answered_locally: false,
+            status: DnsStatus::NoError,
+            flags: vec![],
+            answers: vec![record],
+            authority: vec![],
+            failed_types: vec![crate::dns::FailedType {
+                record_type: RecordType::TXT,
+                error: "8.8.8.8: timed out".into(),
+            }],
+            wildcard: None,
+            query_time_ms: 5,
+        };
+        let (records, status, error) = read_reply(response.clone(), RecordType::ANY);
+        assert_eq!(records.len(), 1, "the records that arrived still show");
+        assert_eq!(status, Some(DnsStatus::NoError));
+        let error = error.expect("an incomplete answer is not a success");
+        assert!(error.contains("TXT (8.8.8.8: timed out)"), "{error}");
+
+        response.failed_types.clear();
+        assert_eq!(read_reply(response, RecordType::ANY).2, None);
     }
 }

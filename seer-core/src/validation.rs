@@ -85,6 +85,8 @@ pub fn normalize_host(host: &str) -> Result<String> {
 /// per-name DNS paths accept it. Per-host probes (`ssl`, `status`, …) keep
 /// [`normalize_host`]: `*` names no host they could connect to. A `*`
 /// anywhere else (`a*.example.com`, `a.*.example.com`) is still rejected.
+/// A single label is accepted when written absolute (`com.`), so a TLD's own
+/// records can be queried.
 pub fn normalize_query_name(name: &str) -> Result<String> {
     normalize(name, NameKind::QueryName)
 }
@@ -137,6 +139,7 @@ fn normalize(domain: &str, kind: NameKind) -> Result<String> {
     // root-label dot; rejecting it would force callers to pre-clean inputs
     // that are otherwise valid. Done before the `www.` strip so `www.com.`
     // is judged on its real label count.
+    let absolute = domain.ends_with('.');
     let domain = domain.strip_suffix('.').unwrap_or(domain);
 
     // Remove www. prefix — but only when what remains still has a dot.
@@ -147,8 +150,11 @@ fn normalize(domain: &str, kind: NameKind) -> Result<String> {
         _ => domain,
     };
 
-    // Validate domain format
-    if domain.is_empty() || !domain.contains('.') {
+    // Validate domain format. A single label is a name only as a query name
+    // written absolute (`com.`, `mx.`): dig-style TLD and root-zone queries.
+    // Bare, it is far more likely a typo than a TLD.
+    let single_label_ok = kind == NameKind::QueryName && absolute;
+    if domain.is_empty() || (!domain.contains('.') && !single_label_ok) {
         return Err(SeerError::InvalidDomain(domain.to_string()));
     }
 
@@ -505,6 +511,21 @@ mod tests {
         // registration (whois, rdap), so only DNS query names accept it.
         assert!(normalize_host("*.example.com").is_err());
         assert!(normalize_domain("*.example.com").is_err());
+    }
+
+    /// Regression: `seer dig com. NS` (and the `mx.` form the dig usage
+    /// hint suggests) failed as an invalid name, so a TLD's own records could
+    /// not be queried.
+    #[test]
+    fn an_absolute_single_label_is_a_query_name_only() {
+        assert_eq!(normalize_query_name("com.").unwrap(), "com");
+        assert_eq!(normalize_query_name("MX.").unwrap(), "mx");
+        // Bare, a single label is still rejected (most likely a typo) …
+        assert!(normalize_query_name("com").is_err());
+        // … and hosts and registrations never take one.
+        assert!(normalize_host("com.").is_err());
+        assert!(normalize_domain("com.").is_err());
+        assert!(normalize_query_name(".").is_err());
     }
 
     #[test]

@@ -31,7 +31,7 @@ fn history_label(e: &seer_core::HistoryEntry) -> String {
         "{} {} {} {}",
         e.timestamp.format("%Y-%m-%d %H:%M"),
         e.domain,
-        crate::ops::lookup_source(&e.result).unwrap_or("-"),
+        e.result.protocol().unwrap_or("-"),
         e.result.registrar().unwrap_or_default(),
     )
 }

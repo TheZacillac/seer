@@ -462,7 +462,8 @@ fn history_warning(saved: seer_core::Result<()>) -> Option<String> {
 /// order. One type is its result or its error. Several are a
 /// [`Payload::DigMany`] of the types that answered, with each failed type
 /// reported (and failing the command) — unless every type failed, which is
-/// the first type's error, as for the core's `ANY` fan-out.
+/// the first type's error, as for the core's `ANY` fan-out. An `ANY` answer
+/// with sub-queries that got no reply reports and fails the same way.
 pub fn dig_outcome(
     results: Vec<(RecordType, seer_core::Result<DnsQueryResult>)>,
 ) -> seer_core::Result<Outcome> {
@@ -472,7 +473,18 @@ pub fn dig_outcome(
     let mut first_error = None;
     for (record_type, result) in results {
         match result {
-            Ok(result) => answered.push(result),
+            Ok(result) => {
+                // An ANY answer missing a type is incomplete: say which, and
+                // fail the command like a multi-type dig's failed type.
+                errors.extend(result.failed_types.iter().map(|f| {
+                    format!(
+                        "{record_type}: no reply for {}: {}",
+                        f.record_type,
+                        seer_core::output::sanitize_line(&f.error)
+                    )
+                }));
+                answered.push(result);
+            }
             Err(e) => {
                 errors.push(format!("{record_type}: {e}"));
                 first_error.get_or_insert(e);
@@ -574,6 +586,24 @@ mod tests {
         let got: Vec<RecordType> = results.iter().map(|r| r.record_type).collect();
         assert_eq!(got, types);
         assert!(!outcome.failed());
+    }
+
+    /// Regression: an ANY whose TXT sub-query got no reply looked complete
+    /// and exited 0; the missing type is now reported and fails the command.
+    #[test]
+    fn an_incomplete_any_answer_is_reported() {
+        let mut any = fixtures::dig_status(RecordType::ANY, DnsStatus::NoError);
+        any.failed_types = vec![seer_core::FailedType {
+            record_type: RecordType::TXT,
+            error: "8.8.8.8: timed out".to_string(),
+        }];
+        let outcome = dig_outcome(vec![(RecordType::ANY, Ok(any))]).expect("ok");
+        assert!(matches!(outcome.payload, Payload::Dig(_)));
+        assert!(outcome.failed());
+        assert_eq!(
+            outcome.errors,
+            ["ANY: no reply for TXT: 8.8.8.8: timed out"]
+        );
     }
 
     /// The types that answered are still shown; each failed one is reported

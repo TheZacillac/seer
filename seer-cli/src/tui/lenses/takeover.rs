@@ -9,7 +9,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Row, Table};
 use ratatui::Frame;
-use seer_core::output::sanitize_line;
+use seer_core::output::{sanitize_line, takeover_label};
 use seer_core::TakeoverVerdict;
 
 use crate::tui::action::LensData;
@@ -22,17 +22,6 @@ fn verdict_tone(v: TakeoverVerdict) -> &'static str {
         TakeoverVerdict::Potential => "warn",
         TakeoverVerdict::Inconclusive => "info",
         TakeoverVerdict::Safe => "ok",
-    }
-}
-
-fn verdict_label(v: TakeoverVerdict) -> &'static str {
-    match v {
-        // Shouted, because a confirmed takeover is the one finding in this
-        // tool that warrants dropping everything.
-        TakeoverVerdict::Vulnerable => "VULNERABLE",
-        TakeoverVerdict::Potential => "potential",
-        TakeoverVerdict::Inconclusive => "inconclusive",
-        TakeoverVerdict::Safe => "safe",
     }
 }
 
@@ -55,10 +44,13 @@ pub fn render(
     } else {
         theme.green
     };
-    let title = format!(
+    let mut title = format!(
         "Takeover · {} checked · {} vulnerable · {} potential",
         t.hosts_checked, t.vulnerable, t.potential
     );
+    if t.inconclusive > 0 {
+        title.push_str(&format!(" · {} inconclusive", t.inconclusive));
+    }
     let inner = panel::render(f, area, theme, &title, accent, focused);
 
     if t.findings.is_empty() {
@@ -95,7 +87,7 @@ pub fn render(
         Row::new(vec![
             Span::styled(sanitize_line(&finding.host), base),
             Span::styled(
-                verdict_label(finding.verdict).to_string(),
+                takeover_label(finding.verdict).to_string(),
                 base.fg(theme.tone(verdict_tone(finding.verdict))),
             ),
             Span::styled(sanitize_line(&or_dash(finding.provider.as_deref())), base),
@@ -174,7 +166,10 @@ mod tests {
             hosts_skipped: 0,
             vulnerable,
             potential,
-            inconclusive: 0,
+            inconclusive: findings
+                .iter()
+                .filter(|f| f.verdict == TakeoverVerdict::Inconclusive)
+                .count(),
             findings,
             notes: vec![],
         }
@@ -223,6 +218,17 @@ mod tests {
         assert!(s.contains("12 checked"), "got: {s}");
         assert!(s.contains("1 vulnerable"), "got: {s}");
         assert!(s.contains("1 potential"), "got: {s}");
+        assert!(
+            !s.contains("inconclusive"),
+            "no count when there are none: {s}"
+        );
+
+        let data = LensData::Takeover(Box::new(report(vec![finding(
+            "c.example.com",
+            TakeoverVerdict::Inconclusive,
+        )])));
+        let s = render_to_text(&data, 110, 10, false, 0);
+        assert!(s.contains("1 inconclusive"), "got: {s}");
     }
 
     #[test]
@@ -261,8 +267,8 @@ mod tests {
         assert_eq!(verdict_tone(TakeoverVerdict::Vulnerable), "fail");
         assert_eq!(verdict_tone(TakeoverVerdict::Potential), "warn");
         assert_eq!(verdict_tone(TakeoverVerdict::Safe), "ok");
-        assert_eq!(verdict_label(TakeoverVerdict::Vulnerable), "VULNERABLE");
-        assert_eq!(verdict_label(TakeoverVerdict::Potential), "potential");
+        assert_eq!(takeover_label(TakeoverVerdict::Vulnerable), "VULNERABLE");
+        assert_eq!(takeover_label(TakeoverVerdict::Potential), "potential");
     }
 
     #[test]

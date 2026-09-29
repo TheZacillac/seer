@@ -214,7 +214,7 @@ pub fn history_listing(
         out.push_str(&format!(
             "\n  [{}] via {} - registrar: {}",
             entry.timestamp.format("%Y-%m-%d %H:%M"),
-            crate::ops::lookup_source(&entry.result).unwrap_or("availability"),
+            entry.result.protocol().unwrap_or("availability"),
             entry.result.registrar().unwrap_or_else(|| "—".to_string())
         ));
     }

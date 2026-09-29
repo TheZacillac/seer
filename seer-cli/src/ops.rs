@@ -116,14 +116,14 @@ pub fn parse_bulk_domains(content: &str) -> Result<Vec<String>, String> {
     let domains = seer_core::bulk::parse_domains_from_file(content);
     if domains.is_empty() {
         return Err(
-            "No valid domains found in file. Expected format: one domain per line, \
+            "No valid domains found. Expected format: one domain per line, \
              # for comments, or CSV (first column)"
                 .to_string(),
         );
     }
     if domains.len() > MAX_BULK_DOMAINS {
         return Err(format!(
-            "Bulk file contains {} domains, maximum is {}",
+            "Bulk input contains {} domains, maximum is {}",
             domains.len(),
             MAX_BULK_DOMAINS
         ));
@@ -325,16 +325,6 @@ pub async fn clear_history() -> Result<(), String> {
         history.save()
     })
     .await
-}
-
-/// Which protocol answered a lookup, or `None` for an availability verdict
-/// (neither registry had the domain). Callers pick their own fallback text.
-pub fn lookup_source(result: &seer_core::LookupResult) -> Option<&'static str> {
-    match result {
-        seer_core::LookupResult::Rdap { .. } => Some("RDAP"),
-        seer_core::LookupResult::Whois { .. } => Some("WHOIS"),
-        seer_core::LookupResult::Available { .. } => None,
-    }
 }
 
 /// Outcome of a [`drift_check`]: the computed report plus whether a previous

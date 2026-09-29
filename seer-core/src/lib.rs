@@ -68,9 +68,9 @@ pub use validation::normalize_domain;
 
 pub use dns::{
     AuthenticationTier, DnsComparator, DnsComparison, DnsFollower, DnsQueryResult, DnsRecord,
-    DnsResolver, DnsStatus, DnsTrace, DnsTracer, DnssecChecker, DnssecReport, FollowConfig,
-    FollowIteration, FollowResult, PropagationResult, RecordType, TraceHop, WildcardProbe,
-    MAX_FOLLOW_INTERVAL_SECS, MAX_FOLLOW_ITERATIONS,
+    DnsResolver, DnsStatus, DnsTrace, DnsTracer, DnssecChecker, DnssecReport, FailedType,
+    FollowConfig, FollowIteration, FollowResult, PropagationResult, RecordType, TraceHop,
+    WildcardProbe, MAX_FOLLOW_INTERVAL_SECS, MAX_FOLLOW_ITERATIONS,
 };
 pub use lookup::{LookupProgressCallback, LookupResult, SmartLookup};
 pub use rdap::{RdapClient, RdapResponse};
