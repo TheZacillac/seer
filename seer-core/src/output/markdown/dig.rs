@@ -1,8 +1,9 @@
 //! Markdown renderers for a dig-style query result and a `+trace` walk.
 //! Summary facts are `Bullets`, records a `record_table`; every remote
-//! string (names, data, server spec, failure notes) goes through `MdSafe`.
+//! string (names, data, server spec, failure notes) goes through `MdSafe`
+//! (`MdCode` in a code span).
 
-use super::{record_table, Bullets, MarkdownFormatter, MdSafe, DNSSEC_NOTE};
+use super::{record_table, Bullets, MarkdownFormatter, MdCode, MdSafe, DNSSEC_NOTE};
 use crate::dns::{DnsQueryResult, DnsTrace, TraceHop};
 use crate::output::dig as wording;
 
@@ -30,28 +31,29 @@ impl MarkdownFormatter {
         }
         b.raw("Query time", format_args!("{} ms", result.query_time_ms));
         if let Some(probe) = &result.wildcard {
-            let name = format!("`{}`", MdSafe(&probe.probe_name));
+            let name = format!("`{}`", MdCode(&probe.probe_name));
             if let Some(note) = wording::wildcard_note(probe, name) {
                 b.raw("Wildcard", note);
             }
         }
 
-        let zone = |zone: &str| format!("`{}`", MdSafe(zone));
-        if let Some(verdict) = wording::query_verdict(result, zone) {
-            out.extend([String::new(), format!("*{verdict}*")]);
-        }
-        if result.answered_locally {
-            out.extend([String::new(), format!("*{}*", wording::LOCAL_NOTE)]);
-        }
+        // Answer, verdict, Authority, local note — the human formatter's order.
         if !result.answers.is_empty() {
             out.extend([String::new(), "### Answer".to_string(), String::new()]);
             // The CNAME chain first, then the records it leads to, each
             // under its own owner name.
             record_table(&mut out, result.cname_chain().chain(result.records()));
         }
+        let zone = |zone: &str| format!("`{}`", MdCode(zone));
+        if let Some(verdict) = wording::query_verdict(result, zone) {
+            out.extend([String::new(), format!("*{verdict}*")]);
+        }
         if !result.authority.is_empty() {
             out.extend([String::new(), "### Authority".to_string(), String::new()]);
             record_table(&mut out, &result.authority);
+        }
+        if result.answered_locally {
+            out.extend([String::new(), format!("*{}*", wording::LOCAL_NOTE)]);
         }
 
         out.push(String::new());
@@ -71,23 +73,28 @@ impl MarkdownFormatter {
         }
 
         out.extend([String::new(), "### Result".to_string(), String::new()]);
-        let mut b = Bullets(&mut out);
-        b.code("Status", &trace.status.to_string());
+        // Status, answer, then the verdict or the error — the human order.
+        Bullets(&mut out).code("Status", &trace.status.to_string());
+        if !trace.answers.is_empty() {
+            out.push(String::new());
+            record_table(&mut out, &trace.answers);
+        }
         if let Some(error) = &trace.error {
-            b.text("Error", error);
+            // A bullet after the table needs a blank line; right after
+            // Status it continues the same list.
+            if !trace.answers.is_empty() {
+                out.push(String::new());
+            }
+            Bullets(&mut out).text("Error", error);
         } else {
-            let target = |target: &str| format!("`{}`", MdSafe(target));
+            let target = |target: &str| format!("`{}`", MdCode(target));
             if let Some(verdict) = wording::trace_verdict(trace, target) {
                 out.extend([String::new(), format!("*{verdict}*")]);
             }
             if let Some(target) = wording::unfollowed_cname(trace) {
-                let note = wording::cname_note(format!("`{}`", MdSafe(target)));
+                let note = wording::cname_note(format!("`{}`", MdCode(target)));
                 out.extend([String::new(), format!("*{note}*")]);
             }
-        }
-        if !trace.answers.is_empty() {
-            out.push(String::new());
-            record_table(&mut out, &trace.answers);
         }
 
         out.push(String::new());
@@ -103,7 +110,7 @@ fn trace_hop(out: &mut Vec<String>, number: usize, hop: &TraceHop) {
         String::new(),
         format!(
             "### Hop {number}: `{}`{}",
-            MdSafe(&hop.zone),
+            MdCode(&hop.zone),
             wording::zone_suffix(&hop.zone)
         ),
         String::new(),
@@ -111,7 +118,7 @@ fn trace_hop(out: &mut Vec<String>, number: usize, hop: &TraceHop) {
     let mut b = Bullets(out);
     b.raw(
         "Server",
-        format_args!("`{}` (`{}`)", MdSafe(&hop.server), MdSafe(&hop.address)),
+        format_args!("`{}` (`{}`)", MdCode(&hop.server), MdCode(&hop.address)),
     );
     b.code("Status", &hop.status.to_string());
     b.raw(
@@ -164,7 +171,7 @@ mod tests {
         };
         let out = MarkdownFormatter::new().format_dig(&result);
         assert!(
-            out.contains("- **Server**: `\\[x\\](https://phish.example)`"),
+            out.contains("- **Server**: `[x](https://phish.example)`"),
             "{out}"
         );
         assert!(

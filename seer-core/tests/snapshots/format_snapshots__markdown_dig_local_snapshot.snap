@@ -1,5 +1,6 @@
 ---
 source: seer-core/tests/format_snapshots.rs
+assertion_line: 1374
 expression: markdown ().format_dig (& fixture_dig_local())
 ---
 ## DNS PTR Records: 1.0.0.127.in-addr.arpa
@@ -8,12 +9,12 @@ expression: markdown ().format_dig (& fixture_dig_local())
 - **Server**: none
 - **Query time**: 0 ms
 
-*Answered locally, not by a server: a special-use name (RFC 6761) that the resolver answers itself*
-
 ### Answer
 
 | Name | TTL | Type | Data |
 | --- | --- | --- | --- |
 | `1.0.0.127.in-addr.arpa` | 86400 | PTR | `localhost.` |
+
+*Answered locally, not by a server: a special-use name (RFC 6761) that the resolver answers itself*
 
 > Note: DNS responses are not DNSSEC-validated.

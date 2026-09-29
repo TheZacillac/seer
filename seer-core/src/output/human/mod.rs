@@ -1,25 +1,27 @@
 //! Colored terminal output (`--format human`). One inherent `format_*` method
 //! per report type, split into per-concern submodules; label/value rows go
-//! through the private `Rows` writer, which sanitizes every value against
-//! terminal escape injection; bespoke layouts sanitize by hand
-//! (`sanitize_display`, or `sanitize_line` where a value must stay on one
-//! line). Colors can be disabled (`without_colors`).
+//! through the private `Rows` writer, which passes every value through
+//! [`sanitize_line`] against terminal escape injection and forged rows;
+//! bespoke layouts call `sanitize_line` by hand. Colors can be disabled
+//! (`without_colors`).
 
-use chrono::{DateTime, TimeDelta, Utc};
+use chrono::{DateTime, Utc};
 use colored::ColoredString;
 
 use super::OutputFormatter;
 
 // Shared with the per-concern submodules below (each does `use super::*`).
 pub(super) use super::contact::{self, Contact, FlatContacts};
-pub(super) use super::days_until;
 pub(super) use super::grouping::render_grouped;
-pub(super) use super::{propagation_difference, DNSSEC_NOTE, GEO_NOTE};
+pub(super) use super::{
+    day_count, days_until, dnssec_depth, expiry_emphasis, expiry_phrase, format_duration,
+    propagation_detail, propagation_difference, sanitize_line, Emphasis, DNSSEC_NOTE, GEO_NOTE,
+};
 pub(super) use crate::caa::{CaaPolicy, IssuerCaaMatch};
 pub(super) use crate::colors::CatppuccinExt;
 pub(super) use crate::dns::{DnsRecord, FollowIteration, FollowResult, PropagationResult};
 pub(super) use crate::lookup::LookupResult;
-pub(super) use crate::rdap::{ContactInfo, RdapResponse};
+pub(super) use crate::rdap::RdapResponse;
 pub(super) use crate::status::StatusResponse;
 pub(super) use crate::whois::WhoisResponse;
 pub(super) use colored::Colorize;
@@ -35,69 +37,6 @@ mod rdap;
 mod security;
 mod status;
 mod whois;
-
-static_regex! {
-    /// Strips ANSI escape sequences from untrusted external strings to prevent
-    /// terminal injection via malicious WHOIS/RDAP response data. The OSC branch
-    /// accepts both BEL (`\x07`) and ST (`\x1b\\`) terminators (and excludes ESC
-    /// from the payload run so it can't over-consume across sequences).
-    ANSI_ESCAPE_RE = r"\x1b\[[0-9;]*[a-zA-Z]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[A-Z@-_]";
-}
-
-/// Sanitizes untrusted external text (WHOIS/RDAP field values) for safe display
-/// on a terminal. First removes well-formed ANSI escape sequences, then drops
-/// any remaining C0/C1 control characters (bare CR, backspace, BEL, stray ESC,
-/// the C1 range, DEL) that could overwrite or spoof rendered lines — keeping
-/// only `\n` and `\t`, which are legitimate layout. Mirrors the markdown
-/// `MdSafe` guard so the human path is no longer the weaker one (issue #53).
-pub(super) fn sanitize_display(s: &str) -> String {
-    ANSI_ESCAPE_RE
-        .replace_all(s, "")
-        .chars()
-        .filter(|&c| c == '\n' || c == '\t' || !c.is_control())
-        .collect()
-}
-
-/// Sanitizes untrusted remote text (a record's owner or data, a WHOIS value)
-/// for one line of a terminal: escape sequences and control characters are
-/// removed as for every human-formatted value (`sanitize_display`), and the
-/// newlines and tabs that keeps are folded to spaces too, so remote data can
-/// neither inject terminal escapes nor forge an extra row. Used for record
-/// rows and `+short` values, and by other terminal renderers (the TUI).
-pub fn sanitize_line(s: &str) -> String {
-    sanitize_display(s)
-        .chars()
-        .map(|c| if c == '\n' || c == '\t' { ' ' } else { c })
-        .collect()
-}
-
-/// Formats a [`TimeDelta`] as a compact human duration (`Ns` / `Nm Ns` /
-/// `Nh Nm`). Shared across the human and markdown formatters — `pub(crate)` so
-/// the markdown follow formatter can reuse it instead of duplicating the
-/// breakdown.
-pub(crate) fn format_duration(duration: TimeDelta) -> String {
-    let total_secs = duration.num_seconds();
-    if total_secs < 60 {
-        format!("{}s", total_secs)
-    } else if total_secs < 3600 {
-        let mins = total_secs / 60;
-        let secs = total_secs % 60;
-        format!("{}m {}s", mins, secs)
-    } else {
-        let hours = total_secs / 3600;
-        let mins = (total_secs % 3600) / 60;
-        format!("{}h {}m", hours, mins)
-    }
-}
-
-/// [`contact::rdap_views`] as this formatter renders them: the registrant
-/// block drops name/organization, which print as the top-level
-/// Registrant/Organization lines, so an identity-only registrant opens no
-/// empty heading.
-pub(super) fn detail_views(contacts: &[Option<ContactInfo>; 3]) -> [Contact<'_>; 3] {
-    let [registrant, admin, tech] = contact::rdap_views(contacts);
-    [registrant.without_identity(), admin, tech]
-}
 
 pub struct HumanFormatter {
     use_colors: bool,
@@ -152,6 +91,16 @@ impl HumanFormatter {
         self.paint(text, |t| t.overlay1())
     }
 
+    /// Styles `text` by an [`Emphasis`]: green, plain value, yellow, red.
+    fn emphasize(&self, text: &str, emphasis: Emphasis) -> String {
+        match emphasis {
+            Emphasis::Good => self.success(text),
+            Emphasis::Neutral => self.value(text),
+            Emphasis::Caution => self.warning(text),
+            Emphasis::Bad => self.error(text),
+        }
+    }
+
     /// A [`Rows`] writer appending `label: value` lines to `out` at `indent`.
     fn rows<'a>(&'a self, out: &'a mut Vec<String>, indent: &str) -> Rows<'a> {
         Rows {
@@ -200,8 +149,8 @@ impl HumanFormatter {
                     "{}{} {} \"{}\"",
                     rows.indent,
                     self.value(&r.flags.to_string()),
-                    self.label(&r.tag),
-                    sanitize_display(&r.value)
+                    self.label(&sanitize_line(&r.tag)),
+                    sanitize_line(&r.value)
                 );
                 rows.push(line);
             }
@@ -234,31 +183,26 @@ impl HumanFormatter {
         out.push(format!("note: {}", caa.note));
     }
 
-    /// Formats an expiration date with a human-readable status suffix.
-    ///
-    /// Behaviour:
-    /// - already expired (negative days): red "expired N days ago"
-    /// - <30 days remaining: red "expires in N days!"
-    /// - <90 days remaining: yellow "expires in N days"
-    /// - otherwise: green "expires in N days"
-    fn format_expiry_status(&self, expiry_str: &str, days_until: i64) -> String {
-        if days_until < 0 {
-            self.error(&format!(
-                "{} (expired {} days ago)",
-                expiry_str, -days_until
-            ))
-        } else if days_until < 30 {
-            self.error(&format!("{} (expires in {} days!)", expiry_str, days_until))
-        } else if days_until < 90 {
-            self.warning(&format!("{} (expires in {} days)", expiry_str, days_until))
-        } else {
-            self.success(&format!("{} (expires in {} days)", expiry_str, days_until))
-        }
+    /// `<date> (expires in N days)` / `<date> (expired N days ago)`, colored
+    /// by urgency ([`expiry_emphasis`]).
+    fn format_expiry_status(&self, date: DateTime<Utc>, days_until: i64) -> String {
+        let text = format!(
+            "{} ({})",
+            date.format("%Y-%m-%d"),
+            expiry_phrase(days_until)
+        );
+        self.emphasize(&text, expiry_emphasis(days_until))
+    }
+
+    /// The bare expiry phrase for `days_until`, colored by urgency.
+    fn expiry_countdown(&self, days_until: i64) -> String {
+        self.emphasize(&expiry_phrase(days_until), expiry_emphasis(days_until))
     }
 }
 
 /// Appends `label: value` rows at one indent. Remote text goes through
-/// [`sanitize_display`] here, so no row can skip the terminal-injection guard.
+/// [`sanitize_line`] here, so no row can skip the terminal-injection guard or
+/// break onto a forged line of its own.
 struct Rows<'a> {
     f: &'a HumanFormatter,
     out: &'a mut Vec<String>,
@@ -290,7 +234,7 @@ impl Rows<'_> {
 
     /// `label: value` for remote text: sanitized, then value-styled.
     fn text(&mut self, label: &str, text: &str) {
-        let value = self.f.value(&sanitize_display(text));
+        let value = self.f.value(&sanitize_line(text));
         self.kv(label, value);
     }
 
@@ -313,9 +257,7 @@ impl Rows<'_> {
     /// [`HumanFormatter::format_expiry_status`]); skipped when absent.
     fn expires(&mut self, date: Option<DateTime<Utc>>) {
         if let Some(date) = date {
-            let status = self
-                .f
-                .format_expiry_status(&date.format("%Y-%m-%d").to_string(), days_until(date));
+            let status = self.f.format_expiry_status(date, days_until(date));
             self.kv("Expires", status);
         }
     }
@@ -329,7 +271,7 @@ impl Rows<'_> {
         let label = self.f.label(label);
         self.out.push(format!("{}{label}:", self.indent));
         for item in items {
-            let item = self.f.value(&sanitize_display(item));
+            let item = self.f.value(&sanitize_line(item));
             self.out.push(format!("{}  - {item}", self.indent));
         }
     }
@@ -378,94 +320,67 @@ mod tests {
         HumanFormatter::new().without_colors()
     }
 
-    #[test]
-    fn expired_shows_days_ago() {
-        let f = formatter();
-        let out = f.format_expiry_status("2024-01-01", -3);
-        assert!(out.contains("expired 3 days ago"), "got: {}", out);
-        assert!(!out.contains("-3"), "got: {}", out);
+    fn date(s: &str) -> DateTime<Utc> {
+        s.parse().unwrap()
     }
 
     #[test]
-    fn expiring_soon_shows_expires_in() {
-        let f = formatter();
-        let out = f.format_expiry_status("2026-05-01", 15);
-        assert!(out.contains("expires in 15 days"), "got: {}", out);
-        assert!(!out.contains("days ago"), "got: {}", out);
+    fn expiry_status_says_expired_days_ago_never_a_negative_count() {
+        let out = formatter().format_expiry_status(date("2024-01-01T00:00:00Z"), -3);
+        assert_eq!(out, "2024-01-01 (expired 3 days ago)");
+        let out = formatter().format_expiry_status(date("2024-01-01T00:00:00Z"), -1);
+        assert_eq!(out, "2024-01-01 (expired 1 day ago)");
     }
 
     #[test]
-    fn warning_window_uses_expires_in() {
-        let f = formatter();
-        let out = f.format_expiry_status("2026-07-01", 60);
-        assert!(out.contains("expires in 60 days"), "got: {}", out);
-        assert!(!out.contains("!"), "got: {}", out);
-    }
-
-    #[test]
-    fn healthy_expiry_uses_expires_in() {
-        let f = formatter();
-        let out = f.format_expiry_status("2027-01-01", 300);
-        assert!(out.contains("expires in 300 days"), "got: {}", out);
-        assert!(!out.contains("!"), "got: {}", out);
-    }
-
-    #[test]
-    fn expired_one_day_is_pluralized_simply() {
-        // We don't singularize; verify the raw format.
-        let f = formatter();
-        let out = f.format_expiry_status("2024-01-01", -1);
-        assert!(out.contains("expired 1 days ago"), "got: {}", out);
-    }
-
-    #[test]
-    fn boundary_30_days_is_warning_not_error() {
-        let f = formatter();
-        // 30 days -> not <30, so warning branch, no "!"
-        let out = f.format_expiry_status("2026-05-15", 30);
-        assert!(out.contains("expires in 30 days"), "got: {}", out);
-        assert!(!out.contains("!"), "got: {}", out);
-    }
-
-    // --- #53: terminal-escape / control-char sanitization ---------------
-
-    #[test]
-    fn sanitize_display_strips_bare_control_chars_keeps_newline_tab() {
-        // The old regex only removed ESC-introduced sequences; bare C0/C1
-        // control chars (CR, backspace, BEL, C1 CSI 0x9B) survived and could
-        // overwrite or spoof rendered lines. They must be stripped; newline
-        // and tab are legitimate layout and must be preserved.
-        let evil = "a\rb\x08c\x07d\u{009b}e";
-        let clean = sanitize_display(evil);
-        for bad in ['\r', '\x08', '\x07', '\u{009b}', '\u{001b}'] {
-            assert!(
-                !clean.contains(bad),
-                "{bad:?} must be stripped from {clean:?}"
-            );
+    fn expiry_status_counts_down_in_every_urgency_band() {
+        for days in [0, 15, 30, 60, 300] {
+            let out = formatter().format_expiry_status(date("2027-01-01T00:00:00Z"), days);
+            let expected = if days == 1 {
+                "1 day".into()
+            } else {
+                format!("{days} days")
+            };
+            assert_eq!(out, format!("2027-01-01 (expires in {expected})"));
         }
-        assert!(
-            clean.contains('a') && clean.contains('e'),
-            "text kept: {clean:?}"
-        );
-        assert_eq!(
-            sanitize_display("line1\nline2\tcol"),
-            "line1\nline2\tcol",
-            "newline and tab must be preserved"
-        );
     }
 
     #[test]
-    fn sanitize_display_strips_osc_with_st_terminator() {
-        // OSC terminated by ST (ESC \\) rather than BEL previously slipped
-        // through, leaking the payload as visible text.
-        let clean = sanitize_display("\x1b]0;malicious title\x1b\\visible");
-        assert_eq!(
-            clean, "visible",
-            "OSC+ST sequence must be fully removed: {clean:?}"
+    fn expiry_status_is_colored_by_urgency() {
+        colored::control::set_override(true);
+        let f = HumanFormatter::new();
+        let when = date("2027-01-01T00:00:00Z");
+        let (red, yellow, green) = ("\x1b[1;91m", "\x1b[1;93m", "\x1b[1;92m");
+        assert!(f.format_expiry_status(when, -3).starts_with(red));
+        assert!(f.format_expiry_status(when, 29).starts_with(red));
+        assert!(f.format_expiry_status(when, 30).starts_with(yellow));
+        assert!(f.format_expiry_status(when, 90).starts_with(green));
+        colored::control::unset_override();
+    }
+
+    #[test]
+    fn rows_fold_remote_newlines_so_a_value_cannot_forge_a_row() {
+        // A registrar carrying "\n  Expires: 2099..." used to print as a
+        // second, legitimate-looking row under the real ones.
+        let mut whois = WhoisResponse::parse("example.com", "whois.test", "Registrar: R\n");
+        whois.registrar =
+            Some("Evil Registrar\n  Expires: 2099-01-01 (expires in 9999 days)".into());
+        whois.nameservers = vec!["ns1.example\n  Status: ok".into()];
+        let out = formatter().format_whois(&whois);
+        assert!(
+            out.contains("  Registrar: Evil Registrar   Expires: 2099-01-01"),
+            "got:\n{out}"
         );
-        assert!(!clean.contains('\x1b'));
-        // Regression: classic CSI color codes still stripped.
-        assert_eq!(sanitize_display("\x1b[31mred\x1b[0m"), "red");
+        assert!(
+            !out.lines()
+                .any(|l| l.trim_start().starts_with("Expires: 2099")),
+            "forged row:\n{out}"
+        );
+        assert!(
+            !out.lines()
+                .any(|l| l.trim_start().starts_with("Status: ok")),
+            "forged list row:\n{out}"
+        );
     }
 
     #[test]
@@ -511,7 +426,7 @@ mod tests {
     #[test]
     fn domain_info_sanitizes_nameserver_and_status_fields() {
         // Nameserver/status values come from attacker-controlled WHOIS parsing
-        // and were printed without sanitize_display (unlike the adjacent DNSSEC
+        // and were printed without sanitize_line (unlike the adjacent DNSSEC
         // field), so an injected ANSI/OSC sequence reached the terminal.
         let whois = WhoisResponse::parse(
             "evil.example",

@@ -1,17 +1,18 @@
 ---
 source: seer-core/tests/format_snapshots.rs
+assertion_line: 780
 expression: markdown ().format_lookup (& fixture_lookup_available())
 ---
 ## Lookup: example.com
 
-- **Source**: availability
+- **Source**: WHOIS (RDAP unavailable)
 - **Verdict**: LIKELY REGISTERED
 - **Confidence**: medium
 - **Method**: whois
 - **Details**: WHOIS returned registration data
 - **RDAP Error**: RDAP server returned 503
 
-### Additional WHOIS data
+### Additional WHOIS Data
 
 - **Nameservers**: `ns1.example.com`, `ns2.example.com`
 - **Status**: `clientTransferProhibited`

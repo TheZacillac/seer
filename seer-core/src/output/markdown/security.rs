@@ -1,341 +1,343 @@
-//! Markdown renderers for the security/intelligence report types.
+//! Markdown renderers for the security/intelligence report types: drift,
+//! subdomain baseline diffs, email posture, HTTP headers, takeover, CAA,
+//! confusables, and classified subdomains.
 
-use std::fmt::Write as _;
-
-use super::{MarkdownFormatter, MdSafe};
+use super::{caa_body, Bullets, MarkdownFormatter, MdCode, MdSafe};
 use crate::caa::CaaPolicy;
 use crate::confusables::ConfusableReport;
 use crate::drift::DriftReport;
 use crate::headers::HeaderReport;
+use crate::output::{subdomain_status_label, takeover_label};
 use crate::posture::EmailPosture;
-use crate::subdomains::{SubdomainBaselineDiff, SubdomainClassification};
+use crate::subdomains::{SubdomainBaselineDiff, SubdomainClassification, SubdomainStatus};
 use crate::takeover::{TakeoverReport, TakeoverVerdict};
+
+/// `## title` and the blank line after it.
+fn heading(title: String) -> Vec<String> {
+    vec![title, String::new()]
+}
+
+/// Appends a table header row and its delimiter row.
+fn table_header(out: &mut Vec<String>, columns: &[&str]) {
+    out.push(format!("| {} |", columns.join(" | ")));
+    out.push(format!("|{}", " --- |".repeat(columns.len())));
+}
+
+/// Appends a `### title` section of one text bullet per remote item;
+/// nothing when there are none.
+fn bullet_section(out: &mut Vec<String>, title: &str, items: &[String]) {
+    if items.is_empty() {
+        return;
+    }
+    out.extend([String::new(), format!("### {title}"), String::new()]);
+    out.extend(items.iter().map(|item| format!("- {}", MdSafe(item))));
+}
+
+/// Remote text for a table cell, or `—` when absent.
+fn or_dash(value: Option<&str>) -> String {
+    value.map_or_else(|| "—".to_string(), |v| MdSafe(v).to_string())
+}
 
 impl MarkdownFormatter {
     pub(super) fn format_drift(&self, report: &DriftReport) -> String {
-        let mut out = format!("## Drift: {}\n\n", MdSafe(&report.domain));
+        let mut out = heading(format!("## Drift: {}", MdSafe(&report.domain)));
         if let Some(reason) = &report.inconclusive {
-            let _ = writeln!(out, "_Not compared: {}._", MdSafe(reason));
-            return out;
+            out.push(format!("_Not compared: {}._", MdSafe(reason)));
+        } else if report.changes.is_empty() {
+            out.push("_No changes since the previous snapshot._".to_string());
+        } else {
+            table_header(&mut out, &["Field", "Old", "New"]);
+            for c in &report.changes {
+                out.push(format!(
+                    "| {} | {} | {} |",
+                    MdSafe(&c.field),
+                    or_dash(c.old.as_deref()),
+                    or_dash(c.new.as_deref()),
+                ));
+            }
         }
-        if report.changes.is_empty() {
-            out.push_str("_No changes since the previous snapshot._\n");
-            return out;
-        }
-        out.push_str("| Field | Old | New |\n|---|---|---|\n");
-        for c in &report.changes {
-            let _ = writeln!(
-                out,
-                "| {} | {} | {} |",
-                MdSafe(&c.field),
-                MdSafe(c.old.as_deref().unwrap_or("—")),
-                MdSafe(c.new.as_deref().unwrap_or("—")),
-            );
-        }
-        out
+        out.join("\n")
     }
 
     pub(super) fn format_subdomain_baseline_diff(&self, report: &SubdomainBaselineDiff) -> String {
-        let mut out = format!("## Subdomain diff: {}\n\n", MdSafe(&report.domain));
+        let mut out = heading(format!("## Subdomain diff: {}", MdSafe(&report.domain)));
 
         if report.baseline_missing {
             // Neutral phrasing: the CLI/REPL note carries the actionable
             // "--record" hint (it knows whether a baseline was just recorded).
-            out.push_str("_No stored baseline to compare against (first run)._\n");
-            return out;
+            out.push("_No stored baseline to compare against (first run)._".to_string());
+            return out.join("\n");
         }
 
         if let Some(at) = report.baseline_recorded_at {
-            let _ = writeln!(
-                out,
-                "**Baseline recorded:** {}\n",
-                at.format("%Y-%m-%d %H:%M UTC")
-            );
+            Bullets(&mut out).raw("Baseline recorded", at.format("%Y-%m-%d %H:%M UTC"));
+            out.push(String::new());
         }
-        let _ = writeln!(
-            out,
-            "{} added, {} removed, {} unchanged.\n",
+        out.push(format!(
+            "{} added, {} removed, {} unchanged.",
             report.added.len(),
             report.removed.len(),
             report.unchanged_count
-        );
+        ));
 
         if report.added.is_empty() && report.removed.is_empty() {
-            out.push_str("_No changes since the baseline._\n");
-            return out;
+            out.extend([
+                String::new(),
+                "_No changes since the baseline._".to_string(),
+            ]);
+            return out.join("\n");
         }
 
-        if !report.added.is_empty() {
-            out.push_str("### Added\n\n");
-            for name in &report.added {
-                let _ = writeln!(out, "- `{}`", MdSafe(name));
+        let names = |out: &mut Vec<String>, title: &str, names: &[String]| {
+            if !names.is_empty() {
+                out.extend([String::new(), format!("### {title}"), String::new()]);
+                out.extend(names.iter().map(|name| format!("- `{}`", MdCode(name))));
             }
-            out.push('\n');
-        }
-        if !report.removed.is_empty() {
-            // Removals are informational: CT logs are append-mostly, so a
-            // vanished name usually means source flakiness (see baseline.rs).
-            out.push_str("### Removed (informational — often CT source flakiness)\n\n");
-            for name in &report.removed {
-                let _ = writeln!(out, "- `{}`", MdSafe(name));
-            }
-        }
-        out
+        };
+        names(&mut out, "Added", &report.added);
+        // Removals are informational: CT logs are append-mostly, so a
+        // vanished name usually means source flakiness (see baseline.rs).
+        names(
+            &mut out,
+            "Removed (informational — often CT source flakiness)",
+            &report.removed,
+        );
+        out.join("\n")
     }
 
     pub(super) fn format_posture(&self, posture: &EmailPosture) -> String {
-        let mut out = format!("## Email posture: {}\n\n", MdSafe(&posture.domain));
-        out.push_str("| Mechanism | Verdict | Detail |\n|---|---|---|\n");
-        let spf_detail = posture
+        let mut out = heading(format!("## Email posture: {}", MdSafe(&posture.domain)));
+        table_header(&mut out, &["Mechanism", "Verdict", "Detail"]);
+        let spf = posture
             .spf
             .all_qualifier
             .as_ref()
-            .map(|q| format!("{q}all"))
-            .unwrap_or_default();
-        let dmarc_detail = posture
-            .dmarc
-            .policy
-            .as_deref()
-            .map(|p| format!("p={p}"))
-            .unwrap_or_default();
-        let _ = writeln!(
-            out,
-            "| SPF | {:?} | {} |",
-            posture.spf.verdict,
-            MdSafe(&spf_detail)
-        );
-        let _ = writeln!(
-            out,
-            "| DMARC | {:?} | {} |",
-            posture.dmarc.verdict,
-            MdSafe(&dmarc_detail)
-        );
-        let _ = writeln!(out, "| MTA-STS | {:?} |  |", posture.mta_sts.verdict);
-        let _ = writeln!(out, "| BIMI | {:?} |  |", posture.bimi.verdict);
-        let _ = writeln!(
-            out,
-            "| DANE | {:?} | {} TLSA |",
-            posture.dane.verdict,
-            posture.dane.records.len()
-        );
-        if !posture.notes.is_empty() {
-            out.push_str("\n### Advisories\n\n");
-            for note in &posture.notes {
-                let _ = writeln!(out, "- {}", MdSafe(note));
-            }
+            .map(|q| format!("{q}all"));
+        let dmarc = posture.dmarc.policy.as_deref().map(|p| format!("p={p}"));
+        let dane = format!("{} TLSA", posture.dane.records.len());
+        for (name, verdict, detail) in [
+            ("SPF", posture.spf.verdict, spf.as_deref()),
+            ("DMARC", posture.dmarc.verdict, dmarc.as_deref()),
+            ("MTA-STS", posture.mta_sts.verdict, None),
+            ("BIMI", posture.bimi.verdict, None),
+            ("DANE", posture.dane.verdict, Some(dane.as_str())),
+        ] {
+            out.push(format!(
+                "| {name} | {} | {} |",
+                verdict.as_str(),
+                MdSafe(detail.unwrap_or(""))
+            ));
         }
-        out
+        bullet_section(&mut out, "Advisories", &posture.notes);
+        out.join("\n")
     }
 
     pub(super) fn format_headers(&self, report: &HeaderReport) -> String {
-        let mut out = format!("## HTTP security headers: {}\n\n", MdSafe(&report.domain));
-        let _ = writeln!(
-            out,
-            "**Grade: {} ({}/100)** — `{}` (HTTP {})\n",
-            MdSafe(&report.grade),
-            report.score,
-            MdSafe(&report.url),
-            report.status
+        let mut out = heading(format!(
+            "## HTTP security headers: {}",
+            MdSafe(&report.domain)
+        ));
+        let mut b = Bullets(&mut out);
+        b.raw(
+            "Grade",
+            format_args!("**{}** ({}/100)", MdSafe(&report.grade), report.score),
         );
+        b.raw(
+            "URL",
+            format_args!("`{}` (HTTP {})", MdCode(&report.url), report.status),
+        );
+        if report.redirects > 0 {
+            b.raw("Redirects followed", report.redirects);
+        }
 
-        out.push_str("| Header | Verdict | Value |\n|---|---|---|\n");
+        out.push(String::new());
+        table_header(&mut out, &["Header", "Verdict", "Value"]);
         for f in &report.headers {
-            let _ = writeln!(
-                out,
-                "| {} | {:?} | {} |",
+            out.push(format!(
+                "| {} | {} | {} |",
                 MdSafe(&f.header),
-                f.verdict,
+                f.verdict.as_str(),
                 MdSafe(f.value.as_deref().unwrap_or(""))
-            );
+            ));
         }
 
         if !report.cookies.is_empty() {
-            out.push_str("\n### Cookies\n\n");
-            out.push_str(
-                "| Cookie | Verdict | Secure | HttpOnly | SameSite |\n|---|---|---|---|---|\n",
+            out.extend([String::new(), "### Cookies".to_string(), String::new()]);
+            table_header(
+                &mut out,
+                &["Cookie", "Verdict", "Secure", "HttpOnly", "SameSite"],
             );
             for c in &report.cookies {
-                let _ = writeln!(
-                    out,
-                    "| {} | {:?} | {} | {} | {} |",
+                out.push(format!(
+                    "| {} | {} | {} | {} | {} |",
                     MdSafe(&c.name),
-                    c.verdict,
+                    c.verdict.as_str(),
                     c.secure,
                     c.http_only,
-                    MdSafe(c.same_site.as_deref().unwrap_or("—"))
-                );
+                    or_dash(c.same_site.as_deref())
+                ));
             }
         }
 
         if !report.disclosures.is_empty() {
-            out.push_str("\n### Disclosed software\n\n");
+            out.extend([
+                String::new(),
+                "### Disclosed software".to_string(),
+                String::new(),
+            ]);
             for d in &report.disclosures {
-                let _ = writeln!(
-                    out,
+                out.push(format!(
                     "- `{}`: {}{}",
-                    MdSafe(&d.header),
+                    MdCode(&d.header),
                     MdSafe(&d.value),
                     if d.versioned { " (versioned)" } else { "" }
-                );
+                ));
             }
         }
 
-        if !report.notes.is_empty() {
-            out.push_str("\n### Advisories\n\n");
-            for note in &report.notes {
-                let _ = writeln!(out, "- {}", MdSafe(note));
-            }
-        }
-        out
+        bullet_section(&mut out, "Advisories", &report.notes);
+        out.join("\n")
     }
 
     pub(super) fn format_takeover(&self, report: &TakeoverReport) -> String {
-        let mut out = format!("## Takeover scan: {}\n\n", MdSafe(&report.domain));
-        let _ = writeln!(
-            out,
-            "{} host(s) checked — **{} vulnerable**, {} potential\n",
+        let mut out = heading(format!("## Takeover scan: {}", MdSafe(&report.domain)));
+        out.push(format!(
+            "{} host(s) checked — **{} vulnerable**, {} potential",
             report.hosts_checked, report.vulnerable, report.potential
-        );
+        ));
         if report.hosts_skipped > 0 {
-            let _ = writeln!(
-                out,
-                "_{} host(s) exceeded the scan cap and were not examined._\n",
-                report.hosts_skipped
-            );
+            out.extend([
+                String::new(),
+                format!(
+                    "_{} more host(s) exceeded the scan cap and were not examined._",
+                    report.hosts_skipped
+                ),
+            ]);
         }
 
+        out.push(String::new());
         if report.findings.is_empty() {
-            out.push_str("_No takeover signals found._\n");
+            out.push("_No takeover signals found._".to_string());
         } else {
             // `Note` carries the probe note — why a finding stayed "potential"
             // (no fingerprint for the provider, probe failed, …).
-            out.push_str(
-                "| Host | Verdict | Provider | CNAME | Evidence | Note |\n\
-                 |---|---|---|---|---|---|\n",
+            table_header(
+                &mut out,
+                &["Host", "Verdict", "Provider", "CNAME", "Evidence", "Note"],
             );
             for f in &report.findings {
+                let label = takeover_label(f.verdict);
                 let verdict = match f.verdict {
-                    TakeoverVerdict::Vulnerable => "**VULNERABLE**",
-                    TakeoverVerdict::Potential => "potential",
-                    TakeoverVerdict::Safe => "safe",
+                    TakeoverVerdict::Vulnerable => format!("**{label}**"),
+                    _ => label.to_string(),
                 };
-                let _ = writeln!(
-                    out,
-                    "| {} | {} | {} | {} | {} | {} |",
+                out.push(format!(
+                    "| {} | {verdict} | {} | {} | {} | {} |",
                     MdSafe(&f.host),
-                    verdict,
-                    MdSafe(f.provider.as_deref().unwrap_or("—")),
-                    MdSafe(f.cname.as_deref().unwrap_or("—")),
-                    MdSafe(f.evidence.as_deref().unwrap_or("—")),
-                    MdSafe(f.probe_note.as_deref().unwrap_or("—"))
-                );
+                    or_dash(f.provider.as_deref()),
+                    or_dash(f.cname.as_deref()),
+                    or_dash(f.evidence.as_deref()),
+                    or_dash(f.probe_note.as_deref())
+                ));
             }
         }
 
-        if !report.notes.is_empty() {
-            out.push_str("\n### Advisories\n\n");
-            for note in &report.notes {
-                let _ = writeln!(out, "- {}", MdSafe(note));
-            }
-        }
-        out
+        bullet_section(&mut out, "Advisories", &report.notes);
+        out.join("\n")
     }
 
     pub(super) fn format_caa(&self, policy: &CaaPolicy) -> String {
-        let mut out = String::from("## CAA Policy\n\n");
-        if !policy.has_policy {
-            out.push_str("_No CAA records (any CA may issue)._\n\n");
-        } else {
-            if let Some(eff) = &policy.effective_domain {
-                let _ = writeln!(out, "**Found at:** {}\n", MdSafe(eff));
-            }
-            out.push_str("| Flags | Tag | Value |\n|---|---|---|\n");
-            for r in &policy.records {
-                let _ = writeln!(
-                    out,
-                    "| {} | {} | {} |",
-                    r.flags,
-                    MdSafe(&r.tag),
-                    MdSafe(&r.value)
-                );
-            }
+        let mut out = heading("## CAA Policy".to_string());
+        caa_body(&mut out, policy);
+        if policy.has_policy && (!policy.iodef.is_empty() || policy.wildcard_note.is_some()) {
+            out.push(String::new());
+            let mut b = Bullets(&mut out);
             if !policy.iodef.is_empty() {
-                let _ = writeln!(
-                    out,
-                    "\n**iodef (incident reporting):** {}",
-                    MdSafe(&policy.iodef.join(", "))
-                );
+                b.text("iodef (incident reporting)", &policy.iodef.join(", "));
             }
-            if let Some(note) = &policy.wildcard_note {
-                let _ = writeln!(out, "\n**Wildcard:** {}", MdSafe(note));
-            }
+            b.opt("Wildcard", &policy.wildcard_note);
         }
-        let _ = writeln!(out, "\n> {}", MdSafe(&policy.note));
-        out
+        out.extend([String::new(), format!("> **Note:** {}", policy.note)]);
+        out.join("\n")
     }
 
     pub(super) fn format_confusables(&self, report: &ConfusableReport) -> String {
-        let mut out = format!("## Look-alikes: {}\n\n", MdSafe(&report.domain));
-        let _ = writeln!(
-            out,
-            "{} candidates generated, {} registered.\n",
+        let mut out = heading(format!("## Look-alikes: {}", MdSafe(&report.domain)));
+        out.push(format!(
+            "{} candidates generated, {} registered.",
             report.candidates_generated,
             report.registered.len()
-        );
+        ));
+        out.push(String::new());
         if report.registered.is_empty() {
-            out.push_str("_No registered look-alikes found._\n");
-            return out;
+            out.push("_No registered look-alikes found._".to_string());
+            return out.join("\n");
         }
-        out.push_str("| Domain | Technique | Registered | Registrar |\n|---|---|---|---|\n");
+        table_header(
+            &mut out,
+            &["Domain", "Technique", "Registered", "Registrar"],
+        );
         for r in &report.registered {
             let created = r
                 .creation_date
-                .map(|d| d.format("%Y-%m-%d").to_string())
-                .unwrap_or_else(|| "—".to_string());
-            let _ = writeln!(
-                out,
-                "| {} | {} | {} | {} |",
+                .map_or_else(|| "—".to_string(), |d| d.format("%Y-%m-%d").to_string());
+            out.push(format!(
+                "| {} | {} | {created} | {} |",
                 MdSafe(&r.domain),
                 MdSafe(&r.technique),
-                created,
-                MdSafe(r.registrar.as_deref().unwrap_or("—")),
-            );
+                or_dash(r.registrar.as_deref()),
+            ));
         }
-        out
+        out.join("\n")
     }
 
     pub(super) fn format_subdomain_classification(
         &self,
         result: &SubdomainClassification,
     ) -> String {
-        let mut out = format!("## Subdomains: {}\n\n", MdSafe(&result.domain));
+        let mut out = heading(format!("## Subdomains: {}", MdSafe(&result.domain)));
         if result.wildcard_detected {
-            out.push_str(
-                "> ⚠️ Wildcard DNS detected — some \"live\" verdicts may be zone wildcards.\n\n",
+            out.push(
+                "> ⚠️ Wildcard DNS detected — some \"live\" verdicts may be zone wildcards."
+                    .to_string(),
             );
+            out.push(String::new());
         }
+        let live = result
+            .subdomains
+            .iter()
+            .filter(|s| s.status == SubdomainStatus::Live)
+            .count();
+        let at_risk = result
+            .subdomains
+            .iter()
+            .filter(|s| s.takeover_risk.is_some())
+            .count();
+        out.push(format!(
+            "{} names — {live} live, {at_risk} takeover-risk.",
+            result.subdomains.len()
+        ));
+        out.push(String::new());
         if result.names_skipped > 0 {
-            let _ = writeln!(
-                out,
-                "> ⚠️ {} more names exceeded the classification cap and were not resolved.\n",
+            out.push(format!(
+                "> ⚠️ {} more names exceeded the classification cap and were not resolved.",
                 result.names_skipped
-            );
+            ));
+            out.push(String::new());
         }
-        out.push_str("| Name | Status | CNAME | Takeover risk |\n|---|---|---|---|\n");
+        table_header(&mut out, &["Name", "Status", "CNAME", "Takeover risk"]);
         for s in &result.subdomains {
-            let _ = writeln!(
-                out,
-                "| {} | {:?} | {} | {} |",
+            out.push(format!(
+                "| {} | {} | {} | {} |",
                 MdSafe(&s.name),
-                s.status,
-                MdSafe(s.cname.as_deref().unwrap_or("—")),
-                MdSafe(s.takeover_risk.as_deref().unwrap_or("—")),
-            );
+                subdomain_status_label(s.status),
+                or_dash(s.cname.as_deref()),
+                or_dash(s.takeover_risk.as_deref()),
+            ));
         }
-        out
+        out.join("\n")
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;

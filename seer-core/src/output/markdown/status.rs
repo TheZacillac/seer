@@ -1,16 +1,5 @@
 use super::*;
 
-/// Human-readable expiry phrase for markdown (no color). Mirrors the human
-/// formatter's `format_expiry_status` wording, including the already-expired
-/// case which previously rendered as a confusing "(-N days)".
-fn expiry_phrase(days_until: i64) -> String {
-    if days_until < 0 {
-        format!("expired {} days ago", -days_until)
-    } else {
-        format!("expires in {} days", days_until)
-    }
-}
-
 impl MarkdownFormatter {
     pub(super) fn format_status(&self, response: &StatusResponse) -> String {
         let mut output = vec![
@@ -46,12 +35,7 @@ impl MarkdownFormatter {
             };
             b.raw("Hostname Match", hostname);
             b.date("Valid From", Some(cert.valid_from));
-            let expires = format!(
-                "`{}` ({})",
-                cert.valid_until.format("%Y-%m-%d"),
-                expiry_phrase(cert.days_until_expiry)
-            );
-            b.raw("Expires", expires);
+            b.raw("Expires", expiry(cert.valid_until, cert.days_until_expiry));
         } else {
             b.push("*Not available (HTTPS may not be configured)*".to_string());
         }
@@ -62,16 +46,12 @@ impl MarkdownFormatter {
 
         // Domain Expiration
         let mut b = Bullets(&mut output);
-        if let Some(ref expiry) = response.domain_expiration {
+        if let Some(ref expiry_info) = response.domain_expiration {
             b.push(String::new());
             b.push("### Domain Registration".to_string());
             b.push(String::new());
-            b.opt("Registrar", &expiry.registrar);
-            let expires = format!(
-                "`{}` ({})",
-                expiry.expiration_date.format("%Y-%m-%d"),
-                expiry_phrase(expiry.days_until_expiry)
-            );
+            b.opt("Registrar", &expiry_info.registrar);
+            let expires = expiry(expiry_info.expiration_date, expiry_info.days_until_expiry);
             b.raw("Expires", expires);
         }
 
@@ -101,7 +81,7 @@ impl MarkdownFormatter {
         let yes_no = |ok: bool| if ok { "yes" } else { "no" };
         b.raw("Valid", yes_no(report.is_valid));
         b.raw("Hostname Match", yes_no(report.hostname_verified));
-        b.raw("Days Until Expiry", report.days_until_expiry);
+        b.raw("Days Until Expiry", expiry_phrase(report.days_until_expiry));
         b.opt("Protocol", &report.protocol_version);
         b.code_list("SANs", &report.san_names);
 

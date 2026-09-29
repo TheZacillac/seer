@@ -1,8 +1,9 @@
 //! Markdown output (`--format markdown`). One inherent `format_*` method per
 //! report type, split into per-concern submodules; bullets go through the
 //! private `Bullets` writer and `code_list`, and DNS record tables through
-//! `record_table`, which escape every value (`MdSafe`) so domain data can't
-//! inject markdown.
+//! `record_table`, which escape every value so domain data can't inject
+//! markdown: `MdSafe` for text, `MdCode` inside a code span and `MdCodeCell`
+//! inside a code span in a table cell.
 
 use std::fmt::{self, Write as _};
 
@@ -12,9 +13,11 @@ use super::OutputFormatter;
 
 // Shared with the per-concern submodules below (each does `use super::*`).
 pub(super) use super::contact::{self, Contact, FlatContacts};
-pub(super) use super::days_until;
 pub(super) use super::grouping::render_grouped;
-pub(super) use super::{propagation_difference, DNSSEC_NOTE, GEO_NOTE};
+pub(super) use super::{
+    days_until, dnssec_depth, expiry_phrase, format_duration, propagation_detail,
+    propagation_difference, DNSSEC_NOTE, GEO_NOTE,
+};
 pub(super) use crate::caa::{CaaPolicy, IssuerCaaMatch};
 pub(super) use crate::dns::{DnsRecord, FollowIteration, FollowResult, PropagationResult};
 pub(super) use crate::lookup::LookupResult;
@@ -34,44 +37,86 @@ mod security;
 mod status;
 mod whois;
 
-/// `Display` adapter that renders attacker-controlled WHOIS/RDAP/DNS/SSL
-/// strings safely inside Markdown that will be forwarded to an LLM (via
-/// the MCP server). Strips ANSI escape sequences and ASCII control
-/// characters, collapses newlines/CR/tabs to spaces (so attacker text
-/// cannot break out of a table row or look like a new heading), neutralizes
-/// backticks (so an attacker can't terminate a code span and inject Markdown
-/// structure), escapes the table-cell delimiter `|` (so a value can't add
-/// columns or break out of a cell), and backslash-escapes `[`, `]`, `<`, `>`
-/// (so a value can't render as a live link, image, autolink, or raw HTML —
-/// e.g. a registrar of `![x](https://attacker.example/p.png)`). `(`/`)` are
-/// left alone: without a `]` before them they carry no link syntax, and
-/// escaping them would add noise to ordinary text.
+/// Where escaped text lands, which decides what must be escaped.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Context {
+    /// Running text: every Markdown metacharacter that could change
+    /// structure is backslash-escaped.
+    Text,
+    /// Inside a code span outside a table. Backslash escapes are not
+    /// processed there (`\<` would print both characters), so only what can
+    /// end the span or the line matters.
+    Code,
+    /// Inside a code span in a GFM table cell. The table splits its row on
+    /// `|` before the span is parsed, so a pipe still needs `\|` here.
+    CodeCell,
+}
+
+/// Writes attacker-controlled WHOIS/RDAP/DNS/SSL text into Markdown for
+/// `context`. Whatever the context, ANSI escape sequences, control
+/// characters and invisible bidi/zero-width format characters
+/// (`is_invisible_format`) are dropped, newlines/CR/tabs and the Unicode
+/// line separators collapse to spaces (so the text cannot break out of a
+/// table row or start a heading), and backticks become apostrophes (so it
+/// cannot close a code span or open one).
+///
+/// In [`Context::Text`], `\` `[` `]` `<` `>` `|` are backslash-escaped, so a
+/// value can't render as a live link, image, autolink or raw HTML (e.g. a
+/// registrar of `![x](https://attacker.example/p.png)`), can't add table
+/// columns, and can't smuggle in a backslash that would cancel the next
+/// escape (`\[Verify\](…)` would otherwise become `\\[Verify\\](…)`, a live
+/// link). `(`/`)` are left alone: without a `]` before them they carry no
+/// link syntax. In [`Context::CodeCell`] a `|` is written `\|`, and a
+/// backslash right before a pipe is doubled too, so the table's own
+/// escape pairing still sees an escaped pipe.
+fn write_escaped(f: &mut fmt::Formatter<'_>, text: &str, context: Context) -> fmt::Result {
+    let mut iter = text.chars().peekable();
+    while let Some(c) = iter.next() {
+        match c {
+            '\x1b' => consume_escape(&mut iter),
+            '\n' | '\r' | '\t' | '\u{2028}' | '\u{2029}' => f.write_str(" ")?,
+            '`' => f.write_str("'")?,
+            '\\' | '[' | ']' | '<' | '>' | '|' if context == Context::Text => {
+                f.write_char('\\')?;
+                f.write_char(c)?;
+            }
+            '|' if context == Context::CodeCell => f.write_str("\\|")?,
+            '\\' if context == Context::CodeCell && iter.peek() == Some(&'|') => {
+                f.write_str("\\\\")?;
+            }
+            c if c.is_control() || super::is_invisible_format(c) => {}
+            c => f.write_char(c)?,
+        }
+    }
+    Ok(())
+}
+
+/// `Display` adapter for remote text in running Markdown ([`Context::Text`]).
 pub(super) struct MdSafe<'a>(pub &'a str);
 
 impl fmt::Display for MdSafe<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut iter = self.0.chars().peekable();
-        while let Some(c) = iter.next() {
-            match c {
-                '\x1b' => consume_escape(&mut iter),
-                '\n' | '\r' | '\t' => f.write_str(" ")?,
-                '`' => f.write_str("'")?,
-                // GFM table-cell delimiter: a bare `|` from attacker-controlled
-                // data would add columns / break out of the cell (and, with a
-                // backtick, escape the code-span defense). Backslash-pipe is the
-                // spec escape and renders as a literal `|` in and out of tables.
-                '|' => f.write_str("\\|")?,
-                // Link/image brackets and HTML/autolink angle brackets. A
-                // backslash-escaped ASCII punctuation char renders literally.
-                '[' | ']' | '<' | '>' => {
-                    f.write_char('\\')?;
-                    f.write_char(c)?;
-                }
-                c if c.is_control() => {}
-                c => f.write_char(c)?,
-            }
-        }
-        Ok(())
+        write_escaped(f, self.0, Context::Text)
+    }
+}
+
+/// `Display` adapter for remote text inside a `` `code span` `` outside a
+/// table ([`Context::Code`]); the caller writes the backticks.
+pub(super) struct MdCode<'a>(pub &'a str);
+
+impl fmt::Display for MdCode<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write_escaped(f, self.0, Context::Code)
+    }
+}
+
+/// `Display` adapter for remote text inside a `` `code span` `` in a table
+/// cell ([`Context::CodeCell`]); the caller writes the backticks.
+pub(super) struct MdCodeCell<'a>(pub &'a str);
+
+impl fmt::Display for MdCodeCell<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write_escaped(f, self.0, Context::CodeCell)
     }
 }
 
@@ -157,77 +202,96 @@ impl MarkdownFormatter {
         Self
     }
 
-    /// Renders the CAA policy as a Markdown section shared between SSL and
-    /// status reports.
+    /// Renders the CAA policy as a `### CAA Policy` section shared between
+    /// SSL and status reports.
     fn render_caa_section(&self, caa: &CaaPolicy) -> Vec<String> {
-        let mut out = Vec::new();
-        out.push(String::new());
-        out.push("### CAA Policy".to_string());
-        out.push(String::new());
-
-        if !caa.has_policy {
-            out.push("*No CAA records (any CA may issue)*".to_string());
-        } else {
-            Bullets(&mut out).code_opt("Found at", &caa.effective_domain);
-            out.push(String::new());
-            out.push("| Flags | Tag | Value |".to_string());
-            out.push("| --- | --- | --- |".to_string());
-            for r in &caa.records {
-                out.push(format!(
-                    "| {} | `{}` | `{}` |",
-                    r.flags,
-                    MdSafe(&r.tag),
-                    MdSafe(&r.value)
-                ));
-            }
-        }
-
-        if let Some(m) = caa.issuer_match {
-            let rendered = match m {
-                IssuerCaaMatch::NoPolicy => "no policy — any CA permitted",
-                IssuerCaaMatch::Permitted => "issuer permitted by current CAA policy",
-                IssuerCaaMatch::Mismatch => "issuer not in current CAA policy (informational)",
-                IssuerCaaMatch::Indeterminate => "CAA present but no issue/issuewild tags",
-            };
-            out.push(String::new());
-            out.push(format!("- **Issuer vs CAA**: {}", rendered));
-        }
-
-        out.push(String::new());
-        out.push(format!("> **Note:** {}", caa.note));
+        let mut out = vec![String::new(), "### CAA Policy".to_string(), String::new()];
+        caa_body(&mut out, caa);
+        out.extend([String::new(), format!("> **Note:** {}", caa.note)]);
         out
     }
 }
 
-/// `` `a`, `b` ``: each item in its own [`MdSafe`] code span, joined by a
-/// plain `, ` (the separator's backticks must never pass through `MdSafe`,
-/// which would turn them into apostrophes).
+/// The body of a CAA section: where the policy was found, its records as a
+/// table, and how the certificate's issuer compares to it.
+fn caa_body(out: &mut Vec<String>, caa: &CaaPolicy) {
+    if !caa.has_policy {
+        out.push("*No CAA records (any CA may issue)*".to_string());
+    } else {
+        Bullets(out).code_opt("Found at", &caa.effective_domain);
+        out.push(String::new());
+        out.push("| Flags | Tag | Value |".to_string());
+        out.push("| --- | --- | --- |".to_string());
+        for r in &caa.records {
+            out.push(format!(
+                "| {} | `{}` | `{}` |",
+                r.flags,
+                MdCodeCell(&r.tag),
+                MdCodeCell(&r.value)
+            ));
+        }
+    }
+
+    if let Some(m) = caa.issuer_match {
+        let rendered = match m {
+            IssuerCaaMatch::NoPolicy => "no policy — any CA permitted",
+            IssuerCaaMatch::Permitted => "issuer permitted by current CAA policy",
+            IssuerCaaMatch::Mismatch => "issuer not in current CAA policy (informational)",
+            IssuerCaaMatch::Indeterminate => "CAA present but no issue/issuewild tags",
+        };
+        out.push(String::new());
+        Bullets(out).raw("Issuer vs CAA", rendered);
+    }
+}
+
+/// `` `a`, `b` ``: each item in its own [`MdCode`] code span, joined by a
+/// plain `, ` (the separator's backticks must never pass through the
+/// escaper, which would turn them into apostrophes).
 fn code_list<S: AsRef<str>>(items: &[S]) -> String {
     items
         .iter()
-        .map(|item| format!("`{}`", MdSafe(item.as_ref())))
+        .map(|item| format!("`{}`", MdCode(item.as_ref())))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// [`code_list`] for a table cell: each span escaped with [`MdCodeCell`].
+fn code_cells<S: AsRef<str>>(items: &[S]) -> String {
+    items
+        .iter()
+        .map(|item| format!("`{}`", MdCodeCell(item.as_ref())))
         .collect::<Vec<_>>()
         .join(", ")
 }
 
 /// Appends a `| Name | TTL | Type | Data |` table, one row per record, with
-/// the owner name and the data (remote text) in [`MdSafe`] code spans.
+/// the owner name and the data (remote text) in [`MdCodeCell`] code spans.
 fn record_table<'r>(out: &mut Vec<String>, records: impl IntoIterator<Item = &'r DnsRecord>) {
     out.push("| Name | TTL | Type | Data |".to_string());
     out.push("| --- | --- | --- | --- |".to_string());
     for record in records {
         out.push(format!(
             "| `{}` | {} | {} | `{}` |",
-            MdSafe(&record.name),
+            MdCodeCell(&record.name),
             record.ttl,
             record.record_type,
-            MdSafe(&record.data.to_string())
+            MdCodeCell(&record.data.to_string())
         ));
     }
 }
 
+/// `` `YYYY-MM-DD` (expires in N days) `` — see [`expiry_phrase`].
+fn expiry(date: DateTime<Utc>, days_until: i64) -> String {
+    format!(
+        "`{}` ({})",
+        date.format("%Y-%m-%d"),
+        expiry_phrase(days_until)
+    )
+}
+
 /// Appends `- **Label**: value` bullets. Remote values go through [`MdSafe`]
-/// here, so no bullet can skip the Markdown-injection guard.
+/// (or [`MdCode`] in a code span) here, so no bullet can skip the
+/// Markdown-injection guard.
 struct Bullets<'a>(&'a mut Vec<String>);
 
 impl Bullets<'_> {
@@ -255,7 +319,7 @@ impl Bullets<'_> {
 
     /// `` - **label**: `value` `` for remote text shown as a code span.
     fn code(&mut self, label: &str, value: &str) {
-        self.0.push(format!("- **{label}**: `{}`", MdSafe(value)));
+        self.0.push(format!("- **{label}**: `{}`", MdCode(value)));
     }
 
     /// [`Self::code`], skipped when the field is absent.
@@ -280,19 +344,16 @@ impl Bullets<'_> {
         }
     }
 
-    /// `` - **Expires**: `YYYY-MM-DD` (N days) ``, skipped when absent.
+    /// `` - **Expires**: `YYYY-MM-DD` (expires in N days) `` (see
+    /// [`expiry`]), skipped when absent.
     fn expires(&mut self, date: Option<DateTime<Utc>>) {
         if let Some(date) = date {
-            self.0.push(format!(
-                "- **Expires**: `{}` ({} days)",
-                date.format("%Y-%m-%d"),
-                days_until(date)
-            ));
+            self.raw("Expires", expiry(date, days_until(date)));
         }
     }
 
     /// One `### <role> Contact` subsection with a bullet per populated
-    /// field; nothing for an empty contact.
+    /// field (the email as a code span); nothing for an empty contact.
     ///
     /// Push these only *after* every domain-level bullet: a `###` heading
     /// scopes everything below it, so a Created/Expires/Nameservers bullet
@@ -303,12 +364,12 @@ impl Bullets<'_> {
         }
         self.0
             .extend([String::new(), format!("### {role} Contact"), String::new()]);
-        self.opt("Name", c.name);
-        self.opt("Organization", c.organization);
-        self.code_opt("Email", c.email);
-        self.opt("Phone", c.phone);
-        self.opt("Address", c.address);
-        self.opt("Country", c.country);
+        for (label, field) in c.fields() {
+            match label {
+                "Email" => self.code_opt(label, field),
+                _ => self.opt(label, field),
+            }
+        }
     }
 
     /// [`Self::contact`] for each of [`contact::ROLES`].
@@ -407,8 +468,8 @@ mod tests {
     #[test]
     fn test_mdsafe_neutralizes_links_images_and_html() {
         // Attacker-controlled WHOIS/RDAP text must not render as a live image
-        // (tracking pixel), link (phishing), autolink, or raw HTML in markdown
-        // forwarded to an LLM via MCP.
+        // (tracking pixel), link (phishing), autolink, or raw HTML wherever
+        // the markdown is rendered.
         assert_eq!(
             md("![x](https://attacker.example/p.png)"),
             "!\\[x\\](https://attacker.example/p.png)"
@@ -424,6 +485,110 @@ mod tests {
         assert_eq!(md("<https://phish.example>"), "\\<https://phish.example\\>");
         // Parentheses alone carry no link syntax and stay unescaped.
         assert_eq!(md("Example (Holdings) LLC"), "Example (Holdings) LLC");
+    }
+
+    #[test]
+    fn test_mdsafe_escapes_backslash_so_it_cannot_cancel_an_escape() {
+        // A value that pre-escapes its own brackets used to come out as
+        // `\\[Verify\\](…)`: each `\\` renders one backslash and the brackets
+        // are live again, i.e. a clickable phishing link.
+        assert_eq!(
+            md("\\[Verify\\](https://phish.example)"),
+            "\\\\\\[Verify\\\\\\](https://phish.example)"
+        );
+        // Same for a pre-escaped pipe (would add a table column) and `<`.
+        assert_eq!(md("a\\|b"), "a\\\\\\|b");
+        assert_eq!(md("\\<img>"), "\\\\\\<img\\>");
+        assert_eq!(md("C:\\path"), "C:\\\\path");
+    }
+
+    fn code(s: &str) -> String {
+        format!("{}", MdCode(s))
+    }
+
+    /// The one line `write` appends through a [`Bullets`] writer.
+    fn bullet(write: impl FnOnce(&mut Bullets<'_>)) -> String {
+        let mut out = Vec::new();
+        write(&mut Bullets(&mut out));
+        assert_eq!(out.len(), 1, "{out:?}");
+        out.remove(0)
+    }
+
+    fn cell(s: &str) -> String {
+        format!("{}", MdCodeCell(s))
+    }
+
+    #[test]
+    fn code_spans_are_not_backslash_escaped() {
+        // Backslash escapes are not processed inside a code span, so the
+        // text-context escaping printed `CN=\<x\>` for a subject `CN=<x>`.
+        assert_eq!(code("CN=<x>"), "CN=<x>");
+        assert_eq!(code("[a](b) \\ c|d"), "[a](b) \\ c|d");
+        // What could close the span or the line is still neutralized.
+        assert_eq!(code("a`b\nc\x1b[31m"), "a'b c");
+    }
+
+    #[test]
+    fn table_cell_code_spans_escape_pipes() {
+        // GFM splits a row on `|` before parsing the span, so a pipe inside
+        // a code span in a cell still needs `\|` …
+        assert_eq!(cell("a|b"), "a\\|b");
+        assert_eq!(cell("CN=<x>"), "CN=<x>");
+        // … and a backslash before it is doubled, or the table would pair
+        // `\\` and split on the now-bare pipe.
+        assert_eq!(cell("a\\|b"), "a\\\\\\|b");
+        assert_eq!(cell("a\\b"), "a\\b");
+        assert_eq!(
+            bullet(|b| b.code("Subject", "CN=<x>")),
+            "- **Subject**: `CN=<x>`"
+        );
+    }
+
+    #[test]
+    fn invisible_bidi_and_zero_width_chars_are_dropped() {
+        // A right-to-left override can make `moc.evil` read as `live.com`.
+        let trojan = "a\u{202E}b\u{2066}c\u{200B}d\u{FEFF}e\u{061C}f\u{200F}g";
+        assert_eq!(md(trojan), "abcdefg");
+        assert_eq!(code(trojan), "abcdefg");
+        assert_eq!(cell(trojan), "abcdefg");
+    }
+
+    #[test]
+    fn contact_iterates_every_field_with_the_email_as_code() {
+        let (name, email, address) = (
+            Some("Jane".to_string()),
+            Some("jane@example.com".to_string()),
+            Some("1 Main St".to_string()),
+        );
+        let contact = Contact {
+            name: &name,
+            email: &email,
+            address: &address,
+            ..Contact::EMPTY
+        };
+        let mut out = Vec::new();
+        Bullets(&mut out).contact("Admin", contact);
+        assert_eq!(
+            out,
+            [
+                "",
+                "### Admin Contact",
+                "",
+                "- **Name**: Jane",
+                "- **Email**: `jane@example.com`",
+                "- **Address**: 1 Main St",
+            ]
+        );
+    }
+
+    #[test]
+    fn expires_bullet_says_expired_days_ago() {
+        let past = Utc::now() - chrono::Duration::days(3) - chrono::Duration::hours(1);
+        let line = bullet(|b| b.expires(Some(past)));
+        assert!(line.ends_with("(expired 3 days ago)"), "got: {line}");
+        let soon = Utc::now() + chrono::Duration::days(10) + chrono::Duration::hours(1);
+        let line = bullet(|b| b.expires(Some(soon)));
+        assert!(line.ends_with("(expires in 10 days)"), "got: {line}");
     }
 
     #[test]

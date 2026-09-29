@@ -25,16 +25,16 @@ impl HumanFormatter {
         output.push(self.header(&format!(
             "DNS {} Records: {}",
             record_type,
-            sanitize_display(domain)
+            sanitize_line(domain)
         )));
 
         for record in records {
             output.push(format!(
                 "  {} {} {} {}",
-                self.value(&sanitize_display(&record.name)),
+                self.value(&sanitize_line(&record.name)),
                 self.label(&format!("{}", record.ttl)),
                 self.label(&format!("{}", record.record_type)),
-                self.success(&sanitize_display(&record.data.to_string()))
+                self.success(&sanitize_line(&record.data.to_string()))
             ));
         }
 
@@ -60,7 +60,7 @@ impl HumanFormatter {
                 "[{}] {}: {}",
                 self.label(&time_str),
                 iter_str,
-                self.error(&sanitize_display(error))
+                self.error(&sanitize_line(error))
             ));
             return output.join("\n");
         }
@@ -80,7 +80,7 @@ impl HumanFormatter {
         let values: Vec<String> = iteration
             .records
             .iter()
-            .map(|r| sanitize_display(r.data.to_string().trim_end_matches('.')))
+            .map(|r| sanitize_line(r.data.to_string().trim_end_matches('.')))
             .collect();
 
         output.push(format!(
@@ -98,11 +98,11 @@ impl HumanFormatter {
 
         // Show changes if any
         for added in &iteration.added {
-            let value = sanitize_display(added.trim_end_matches('.'));
+            let value = sanitize_line(added.trim_end_matches('.'));
             output.push(format!("  {} {}", self.success("+"), self.success(&value)));
         }
         for removed in &iteration.removed {
-            let value = sanitize_display(removed.trim_end_matches('.'));
+            let value = sanitize_line(removed.trim_end_matches('.'));
             output.push(format!("  {} {}", self.error("-"), self.error(&value)));
         }
 
@@ -112,7 +112,8 @@ impl HumanFormatter {
     pub(super) fn format_follow(&self, result: &FollowResult) -> String {
         let mut output = vec![self.header(&format!(
             "DNS Follow Complete: {} {}",
-            result.domain, result.record_type
+            sanitize_line(&result.domain),
+            result.record_type
         ))];
         let mut rows = self.rows(&mut output, "  ");
 
@@ -167,7 +168,7 @@ impl HumanFormatter {
         let mut output = vec![
             format!(
                 "DNSSEC Report for {}",
-                self.success(&sanitize_display(&report.domain))
+                self.success(&sanitize_line(&report.domain))
             ),
             String::new(),
         ];
@@ -187,16 +188,11 @@ impl HumanFormatter {
             self.warning("n/a")
         };
         rows.kv("Chain Valid", chain);
-        let tier = match report.authentication_tier {
-            crate::dns::AuthenticationTier::Unsigned => "unsigned (no DNSSEC records)",
-            crate::dns::AuthenticationTier::DigestOnly => "digest-only (DS↔DNSKEY consistency)",
-            crate::dns::AuthenticationTier::RrsigChecked => "rrsig-checked (signature windows)",
-        };
-        rows.kv("Verification depth", self.value(tier));
-        rows.push(self.warning(
-            "  Note: reflects DS/DNSKEY digest consistency only — RRSIG signatures, validity \
-             periods, and the chain to the root are NOT cryptographically verified.",
-        ));
+        let (depth, note) = dnssec_depth(report.authentication_tier);
+        rows.kv("Verification depth", self.value(depth));
+        if let Some(note) = note {
+            rows.push(format!("  {}", self.warning(note)));
+        }
         rows.kv("Enabled", self.value(&report.enabled.to_string()));
         let ds_count = report.ds_records.len().to_string();
         rows.kv("DS Records", self.value(&ds_count));
@@ -217,9 +213,9 @@ impl HumanFormatter {
                     "    Key Tag: {}, Algorithm: {} ({}), Digest: {} ({}) [{}]",
                     ds.key_tag,
                     ds.algorithm,
-                    sanitize_display(&ds.algorithm_name),
+                    sanitize_line(&ds.algorithm_name),
                     ds.digest_type,
-                    sanitize_display(&ds.digest_type_name),
+                    sanitize_line(&ds.digest_type_name),
                     match_indicator,
                 ));
             }
@@ -241,7 +237,7 @@ impl HumanFormatter {
                     key.flags,
                     role,
                     key.algorithm,
-                    sanitize_display(&key.algorithm_name)
+                    sanitize_line(&key.algorithm_name)
                 ));
             }
         }
@@ -249,7 +245,7 @@ impl HumanFormatter {
         if !report.issues.is_empty() {
             let mut issue_rows = rows.section("Issues");
             for issue in &report.issues {
-                issue_rows.push(format!("    - {}", sanitize_display(issue)));
+                issue_rows.push(format!("    - {}", sanitize_line(issue)));
             }
         }
 
@@ -259,7 +255,8 @@ impl HumanFormatter {
     pub(super) fn format_dns_comparison(&self, comparison: &crate::dns::DnsComparison) -> String {
         let mut output = vec![self.header(&format!(
             "DNS Comparison: {} {}",
-            comparison.domain, comparison.record_type
+            sanitize_line(&comparison.domain),
+            comparison.record_type
         ))];
 
         // Match status
@@ -275,13 +272,13 @@ impl HumanFormatter {
             ("Server A", &comparison.server_a),
             ("Server B", &comparison.server_b),
         ] {
-            let nameserver = self.value(&sanitize_display(&server.nameserver));
+            let nameserver = self.value(&sanitize_line(&server.nameserver));
             if let Some(ref err) = server.error {
                 output.push(format!(
                     "  {} ({}): {}",
                     self.label(label),
                     nameserver,
-                    self.error(&sanitize_display(err))
+                    self.error(&sanitize_line(err))
                 ));
             } else {
                 output.push(format!(
@@ -291,14 +288,14 @@ impl HumanFormatter {
                     self.value(&server.records.len().to_string())
                 ));
                 for record in &server.records {
-                    let record = sanitize_display(&record.format_short());
+                    let record = sanitize_line(&record.format_short());
                     output.push(format!("    - {}", self.value(&record)));
                 }
             }
             output.push(String::new());
         }
 
-        let joined = |values: &[String]| sanitize_display(&values.join(", "));
+        let joined = |values: &[String]| sanitize_line(&values.join(", "));
         let mut rows = self.rows(&mut output, "  ");
         let common = if comparison.common.is_empty() {
             self.warning("(none)")
@@ -310,7 +307,7 @@ impl HumanFormatter {
             (&comparison.server_a, &comparison.only_in_a),
             (&comparison.server_b, &comparison.only_in_b),
         ] {
-            let label = format!("Only in {}", sanitize_display(&server.nameserver));
+            let label = format!("Only in {}", sanitize_line(&server.nameserver));
             let rendered = if only.is_empty() {
                 self.warning("(none)")
             } else {
@@ -355,7 +352,7 @@ mod tests {
     fn follow_iteration_sanitizes_record_values_and_changes() {
         // `seer follow` re-prints every record value, plus the added/removed
         // change lists, on each iteration — the only human DNS path that
-        // skipped sanitize_display, so an OSC 52 clipboard write or a screen
+        // skipped sanitize_line, so an OSC 52 clipboard write or a screen
         // clear in a TXT record reached the terminal verbatim.
         let out = HumanFormatter::new()
             .without_colors()
@@ -374,6 +371,36 @@ mod tests {
         assert!(out.contains("  \"v=spf1 -all\""), "value line: {out:?}");
         assert!(out.contains("+ v=spf1 -all"), "added line: {out:?}");
         assert!(out.contains("- oldv=spf1 -all"), "removed line: {out:?}");
+    }
+
+    #[test]
+    fn remote_newlines_cannot_forge_record_or_change_rows() {
+        // Human DNS rows kept `\n`, so a TXT value could print a fake,
+        // aligned A record row (or a fake `+` change line) of its own.
+        let forged = "v=spf1 -all\n  example.com 300 A 6.6.6.6";
+        let record = DnsRecord {
+            name: "example.com".to_string(),
+            record_type: RecordType::TXT,
+            ttl: 300,
+            data: RecordData::TXT {
+                text: forged.to_string(),
+            },
+        };
+        let f = HumanFormatter::new().without_colors();
+        let mut it = follow_iteration_with_evil_txt();
+        it.records = vec![record.clone()];
+        it.added = vec!["x\n  + 6.6.6.6".to_string()];
+        for out in [f.format_dns(&[record]), f.format_follow_iteration(&it)] {
+            assert!(
+                !out.lines()
+                    .any(|l| l.trim_start().starts_with("example.com 300 A")),
+                "forged record row:\n{out}"
+            );
+            assert!(
+                !out.lines().any(|l| l.trim_start().starts_with("+ 6.6.6.6")),
+                "forged change row:\n{out}"
+            );
+        }
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use super::*;
+use crate::output::availability_label;
 
 impl MarkdownFormatter {
     pub(super) fn format_tld(&self, info: &crate::tld::TldInfo) -> String {
@@ -39,7 +40,7 @@ impl MarkdownFormatter {
             output.push("*No subdomains found*".to_string());
         } else {
             for subdomain in &result.subdomains {
-                output.push(format!("- `{}`", MdSafe(subdomain)));
+                output.push(format!("- `{}`", MdCode(subdomain)));
             }
         }
 
@@ -105,13 +106,6 @@ impl MarkdownFormatter {
     pub(super) fn format_domain_info(&self, info: &crate::domain_info::DomainInfo) -> String {
         let mut output = Vec::new();
 
-        let source_str = match info.source {
-            crate::domain_info::DomainInfoSource::Both => "both",
-            crate::domain_info::DomainInfoSource::Rdap => "rdap",
-            crate::domain_info::DomainInfoSource::Whois => "whois",
-            crate::domain_info::DomainInfoSource::Available => "available",
-        };
-
         // Helper: render Option<String> via MdSafe or fall back to "-".
         let opt_md = |o: &Option<String>| -> String {
             match o {
@@ -122,18 +116,10 @@ impl MarkdownFormatter {
 
         output.push(format!("## Domain Info: {}", MdSafe(&info.domain)));
         output.push(String::new());
-        output.push(format!("**Source:** {}", source_str));
-        // Same verdict wording as the human formatter and markdown lookup.
+        output.push(format!("**Source:** {}", info.source));
         if let Some(verdict) = &info.availability_verdict {
-            let rendered = match verdict.as_str() {
-                "available" => "AVAILABLE",
-                "likely_available" => "MAY BE AVAILABLE",
-                "registered" => "REGISTERED",
-                "likely_registered" => "LIKELY REGISTERED",
-                _ => "UNKNOWN",
-            };
             output.push(String::new());
-            output.push(format!("**Verdict:** {}", rendered));
+            output.push(format!("**Verdict:** {}", availability_label(verdict).0));
         }
         output.push(String::new());
 
@@ -152,7 +138,7 @@ impl MarkdownFormatter {
             if items.is_empty() {
                 "-".to_string()
             } else {
-                code_list(items)
+                code_cells(items)
             }
         };
         output.push(format!("| Created | {} |", date_md(info.creation_date)));
@@ -165,7 +151,7 @@ impl MarkdownFormatter {
         // Derived lifecycle rows — only when computed, to keep sparse
         // (e.g. available-domain) tables free of dash-only noise.
         if let Some(days) = info.days_until_expiration {
-            output.push(format!("| Days Until Expiry | {} |", days));
+            output.push(format!("| Days Until Expiry | {} |", expiry_phrase(days)));
         }
         if let Some(age) = info.domain_age_days {
             output.push(format!("| Domain Age (days) | {} |", age));
@@ -182,7 +168,7 @@ impl MarkdownFormatter {
             for sd in &info.status_descriptions {
                 output.push(format!(
                     "- `{}` — {}",
-                    MdSafe(&sd.code),
+                    MdCode(&sd.code),
                     MdSafe(&sd.description)
                 ));
             }

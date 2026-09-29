@@ -2,8 +2,7 @@ use super::*;
 
 impl HumanFormatter {
     pub(super) fn format_whois(&self, response: &WhoisResponse) -> String {
-        let mut output =
-            vec![self.header(&format!("WHOIS: {}", sanitize_display(&response.domain)))];
+        let mut output = vec![self.header(&format!("WHOIS: {}", sanitize_line(&response.domain)))];
 
         if response.is_available() {
             output.push(format!("  {} Domain is available", self.success("✓")));

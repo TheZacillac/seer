@@ -1,42 +1,37 @@
 ---
 source: seer-core/tests/format_snapshots.rs
+assertion_line: 780
 expression: yaml ().format_lookup (& fixture_lookup_rdap_with_whois_fallback())
 ---
-data: 
+data:
   country: null
   endAddress: null
   endAutnum: null
-  entities: 
-    - 
-      entities: []
+  entities:
+    - entities: []
       events: []
       handle: MOCK-REGISTRAR
       links: []
       objectClassName: entity
       publicIds: []
       remarks: []
-      roles: 
+      roles:
         - registrar
       status: []
-      vcardArray: 
+      vcardArray:
         - vcard
-        - 
-          - 
-            - fn
+        - - - fn
             - {}
             - text
             - Mock Registrar Inc.
-  events: 
-    - 
-      eventAction: registration
+  events:
+    - eventAction: registration
       eventActor: null
       eventDate: "2010-03-15T04:00:00Z"
-    - 
-      eventAction: last changed
+    - eventAction: last changed
       eventActor: null
       eventDate: "2024-02-01T09:30:00Z"
-    - 
-      eventAction: expiration
+    - eventAction: expiration
       eventActor: null
       eventDate: "2099-03-15T04:00:00Z"
   handle: "2336799_DOMAIN_COM-VRSN"
@@ -44,16 +39,14 @@ data:
   ldhName: EXAMPLE.COM
   links: []
   name: null
-  nameservers: 
-    - 
-      ipAddresses: null
+  nameservers:
+    - ipAddresses: null
       ldhName: NS1.EXAMPLE.COM
       links: []
       objectClassName: nameserver
       status: []
       unicodeName: null
-    - 
-      ipAddresses: null
+    - ipAddresses: null
       ldhName: NS2.EXAMPLE.COM
       links: []
       objectClassName: nameserver
@@ -67,13 +60,13 @@ data:
   secureDNS: null
   startAddress: null
   startAutnum: null
-  status: 
+  status:
     - client transfer prohibited
     - server delete prohibited
   type: null
   unicodeName: null
 source: rdap
-whois_fallback: 
+whois_fallback:
   admin_email: admin@example.com
   admin_name: Alex Admin
   admin_organization: Example Holdings LLC
@@ -82,7 +75,7 @@ whois_fallback:
   dnssec: signedDelegation
   domain: example.com
   expiration_date: "2099-03-15T04:00:00Z"
-  nameservers: 
+  nameservers:
     - ns1.example.com
     - ns2.example.com
   organization: Example Holdings LLC
@@ -92,7 +85,7 @@ whois_fallback:
   registrant_email: owner@example.com
   registrant_phone: "+1.5555550100"
   registrar: Mock Registrar Inc.
-  status: 
+  status:
     - clientTransferProhibited
   tech_email: tech@example.com
   tech_name: Terry Tech

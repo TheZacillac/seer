@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 
-use super::{code_list, MarkdownFormatter, MdSafe};
+use super::{code_list, MarkdownFormatter, MdCode, MdCodeCell, MdSafe};
 use crate::dns::DelegationReport;
 
 impl MarkdownFormatter {
@@ -13,7 +13,7 @@ impl MarkdownFormatter {
         out.push(String::new());
         out.push(format!(
             "- **Parent zone**: `{}`",
-            MdSafe(&report.parent_zone)
+            MdCode(&report.parent_zone)
         ));
         let servers = if report.parent_server_queried.is_empty() {
             "none".to_string()
@@ -40,7 +40,7 @@ impl MarkdownFormatter {
             for ns in union {
                 out.push(format!(
                     "| `{}` | {} | {} |",
-                    MdSafe(ns),
+                    MdCodeCell(ns),
                     if report.delegated_ns.contains(ns) {
                         "yes"
                     } else {
@@ -62,7 +62,7 @@ impl MarkdownFormatter {
             for lame in &report.lame {
                 out.push(format!(
                     "- `{}` — {}",
-                    MdSafe(&lame.host),
+                    MdCode(&lame.host),
                     MdSafe(&lame.reason)
                 ));
             }

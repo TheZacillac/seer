@@ -1,5 +1,6 @@
 ---
 source: seer-core/tests/format_snapshots.rs
+assertion_line: 998
 expression: human ().format_dnssec (& fixture_dnssec())
 ---
 DNSSEC Report for [1;92mexample.com[0m
@@ -7,7 +8,7 @@ DNSSEC Report for [1;92mexample.com[0m
   [1;96mStatus[0m: [1;91mmisconfigured[0m
   [1;96mChain Valid[0m: [1;91minvalid[0m
   [1;96mVerification depth[0m: [97mdigest-only (DS↔DNSKEY consistency)[0m
-[1;93m  Note: reflects DS/DNSKEY digest consistency only — RRSIG signatures, validity periods, and the chain to the root are NOT cryptographically verified.[0m
+  [1;93mNote: reflects DS/DNSKEY digest consistency only — RRSIG signatures, validity periods, and the chain to the root are NOT cryptographically verified.[0m
   [1;96mEnabled[0m: [97mtrue[0m
   [1;96mDS Records[0m: [97m2[0m
   [1;96mDNSKEY Records[0m: [97m2[0m

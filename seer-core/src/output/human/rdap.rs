@@ -6,7 +6,7 @@ impl HumanFormatter {
             .domain_name()
             .or(response.name.as_deref())
             .unwrap_or("Unknown");
-        let mut output = vec![self.header(&format!("RDAP: {}", sanitize_display(name)))];
+        let mut output = vec![self.header(&format!("RDAP: {}", sanitize_line(name)))];
 
         let mut rows = self.rows(&mut output, "  ");
         rows.opt("Handle", &response.handle);
@@ -15,7 +15,7 @@ impl HumanFormatter {
         rows.opt("Organization", &response.get_registrant_organization());
 
         let infos = contact::rdap_contacts(response);
-        rows.contacts(detail_views(&infos));
+        rows.contacts(contact::rdap_detail_views(&infos));
         let billing = response.get_billing_contact();
         rows.contact("Billing", Contact::rdap(billing.as_ref()));
 
