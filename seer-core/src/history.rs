@@ -415,7 +415,7 @@ mod tests {
         // Write an intentionally corrupt JSON file.
         std::fs::write(&path, b"{ this is not valid json ").expect("seed file");
 
-        let loaded = LookupHistory::load_from_path(&path);
+        let loaded = LookupHistory::load_from_path(&path).expect("load");
         assert!(
             loaded.entries.is_empty(),
             "corrupt file load must return default"
@@ -442,7 +442,7 @@ mod tests {
         let path = unique_temp_history_path("missing");
         let _ = std::fs::remove_file(&path);
 
-        let loaded = LookupHistory::load_from_path(&path);
+        let loaded = LookupHistory::load_from_path(&path).expect("load");
         assert!(loaded.entries.is_empty());
 
         if let Some(parent) = path.parent() {

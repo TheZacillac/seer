@@ -126,6 +126,7 @@ pub async fn fetch(req: FetchReq, config: &seer_core::SeerConfig) -> Result<Lens
             // (mirrors the History path below).
             let wl = tokio::task::spawn_blocking(seer_core::Watchlist::load)
                 .await
+                .map_err(|err| err.to_string())?
                 .map_err(|err| err.to_string())?;
             Ok(LensData::Watch(Box::new(
                 seer_core::check_watchlist_with_config(&wl.domains, config).await,
@@ -134,6 +135,7 @@ pub async fn fetch(req: FetchReq, config: &seer_core::SeerConfig) -> Result<Lens
         FetchReq::History => {
             let h = tokio::task::spawn_blocking(seer_core::LookupHistory::load)
                 .await
+                .map_err(|err| err.to_string())?
                 .map_err(|err| err.to_string())?;
             let mut flat: Vec<seer_core::HistoryEntry> =
                 h.entries.into_values().flatten().collect();

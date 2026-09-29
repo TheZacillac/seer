@@ -270,7 +270,10 @@ fn handle_action(
             tokio::spawn(async move {
                 // File I/O is blocking — run in spawn_blocking to keep the async loop free.
                 let notice = tokio::task::spawn_blocking(move || {
-                    let mut wl = Watchlist::load();
+                    let mut wl = match Watchlist::load() {
+                        Ok(wl) => wl,
+                        Err(e) => return Some(("fail", format!("failed to load watchlist: {e}"))),
+                    };
                     let notice = mutate_watchlist(&mut wl, add.as_deref(), remove.as_deref());
                     match wl.save() {
                         Ok(()) => notice,

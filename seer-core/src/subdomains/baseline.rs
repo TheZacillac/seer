@@ -464,7 +464,7 @@ mod tests {
         );
         store.save_to_path(&path).expect("save");
 
-        let loaded = SubdomainBaselines::load_from_path(&path);
+        let loaded = SubdomainBaselines::load_from_path(&path).expect("load");
         let baseline = loaded.get("example.com").expect("baseline survives");
         assert_eq!(baseline.source, "crt.sh");
         assert_eq!(baseline.names.len(), 2);
@@ -512,7 +512,7 @@ mod tests {
 
         std::fs::write(&path, b"{ not valid json ").expect("seed file");
 
-        let loaded = SubdomainBaselines::load_from_path(&path);
+        let loaded = SubdomainBaselines::load_from_path(&path).expect("load");
         assert!(
             loaded.domains.is_empty(),
             "corrupt load must return default"
@@ -534,7 +534,7 @@ mod tests {
     fn load_from_path_returns_default_when_missing() {
         let path = unique_temp_path("missing");
         let _ = std::fs::remove_file(&path);
-        let loaded = SubdomainBaselines::load_from_path(&path);
+        let loaded = SubdomainBaselines::load_from_path(&path).expect("load");
         assert!(loaded.domains.is_empty());
         if let Some(parent) = path.parent() {
             let _ = std::fs::remove_dir_all(parent);

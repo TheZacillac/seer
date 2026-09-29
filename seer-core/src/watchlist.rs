@@ -410,7 +410,7 @@ mod tests {
         // TOML parsers reject stray garbage on the value side of `=`.
         std::fs::write(&path, b"domains = not-an-array-\n").expect("seed corrupt watchlist file");
 
-        let loaded = Watchlist::load_from_path(&path);
+        let loaded = Watchlist::load_from_path(&path).expect("load");
         assert!(
             loaded.domains.is_empty(),
             "corrupt watchlist must load as empty default"
@@ -436,7 +436,7 @@ mod tests {
         let path = unique_temp_watchlist_path("missing");
         let _ = std::fs::remove_file(&path);
 
-        let loaded = Watchlist::load_from_path(&path);
+        let loaded = Watchlist::load_from_path(&path).expect("load");
         assert!(loaded.domains.is_empty());
 
         if let Some(parent) = path.parent() {
