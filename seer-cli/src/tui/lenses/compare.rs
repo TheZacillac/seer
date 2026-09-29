@@ -4,6 +4,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Row, Table};
 use ratatui::Frame;
+use seer_core::output::sanitize_line;
 
 use crate::tui::action::LensData;
 use crate::tui::theme::Theme;
@@ -62,11 +63,8 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
     // We collect all unique record values across both, then show per-row match status.
     let mut all_values: Vec<String> = {
         let mut v: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for r in &c.server_a.records {
-            v.insert(r.format_short());
-        }
-        for r in &c.server_b.records {
-            v.insert(r.format_short());
+        for r in c.server_a.records.iter().chain(&c.server_b.records) {
+            v.insert(sanitize_line(&r.format_short()));
         }
         let mut sorted: Vec<String> = v.into_iter().collect();
         sorted.sort();
@@ -82,13 +80,13 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
         .server_a
         .records
         .iter()
-        .map(|r| r.format_short())
+        .map(|r| sanitize_line(&r.format_short()))
         .collect();
     let values_b: std::collections::HashSet<String> = c
         .server_b
         .records
         .iter()
-        .map(|r| r.format_short())
+        .map(|r| sanitize_line(&r.format_short()))
         .collect();
 
     let header = Row::new(["●", "RECORD", "A", "B"]).style(
@@ -125,7 +123,7 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
             Row::new(vec![
                 "!".to_string(),
                 "error".to_string(),
-                e.clone(),
+                sanitize_line(e),
                 "—".to_string(),
             ])
             .style(Style::default().fg(theme.red)),
@@ -137,7 +135,7 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
                 "!".to_string(),
                 "error".to_string(),
                 "—".to_string(),
-                e.clone(),
+                sanitize_line(e),
             ])
             .style(Style::default().fg(theme.red)),
         );

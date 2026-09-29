@@ -4,6 +4,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Row, Table};
 use ratatui::Frame;
+use seer_core::output::sanitize_line;
 
 use crate::tui::action::LensData;
 use crate::tui::theme::Theme;
@@ -30,7 +31,11 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
 
     let header = Row::new(["IP", "PTR"]).style(Style::default().fg(theme.overlay0));
     let rows = records.iter().map(|r| {
-        Row::new(vec![r.name.clone(), r.format_short()]).style(Style::default().fg(theme.text))
+        Row::new(vec![
+            sanitize_line(&r.name),
+            sanitize_line(&r.format_short()),
+        ])
+        .style(Style::default().fg(theme.text))
     });
     let table = Table::new(
         rows,

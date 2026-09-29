@@ -4,6 +4,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
+use seer_core::output::sanitize_line;
 
 use crate::tui::action::LensData;
 use crate::tui::theme::Theme;
@@ -19,7 +20,7 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
         .split(inner);
 
     let code = or_dash(s.http_status);
-    let text = s.http_status_text.clone().unwrap_or_default();
+    let text = sanitize_line(s.http_status_text.as_deref().unwrap_or_default());
     f.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(

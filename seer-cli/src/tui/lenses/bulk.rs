@@ -5,6 +5,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Row, Table};
 use ratatui::Frame;
 
+use seer_core::output::sanitize_line;
+
 use crate::ops::BULK_OPS;
 use crate::tui::app::SPIN;
 use crate::tui::line_editor::LineEditor;
@@ -56,28 +58,27 @@ pub fn render(
             Span::styled(buf.with_caret("▏"), Style::default().fg(theme.text)),
         ])
     } else {
-        let parsed = crate::tui::panes::bulk::parse_domains_input(&bulk.domains);
-        if parsed.is_empty() {
-            Line::from(Span::styled(
+        match crate::tui::panes::bulk::parse_domains_input(&bulk.domains) {
+            Ok(parsed) if parsed.is_empty() => Line::from(Span::styled(
                 "domains: none — press d to enter",
                 Style::default().fg(theme.overlay0),
-            ))
-        } else {
-            let preview = parsed
-                .iter()
-                .take(3)
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(", ");
-            let more = if parsed.len() > 3 { ", …" } else { "" };
-            Line::from(vec![
+            )),
+            Err(e) => Line::from(vec![
                 Span::styled("domains: ", Style::default().fg(theme.overlay0)),
-                Span::styled(parsed.len().to_string(), Style::default().fg(theme.sky)),
-                Span::styled(
-                    format!(" · {preview}{more}"),
-                    Style::default().fg(theme.overlay0),
-                ),
-            ])
+                Span::styled(sanitize_line(&e), Style::default().fg(theme.red)),
+            ]),
+            Ok(parsed) => {
+                let preview = sanitize_line(&parsed[..parsed.len().min(3)].join(", "));
+                let more = if parsed.len() > 3 { ", …" } else { "" };
+                Line::from(vec![
+                    Span::styled("domains: ", Style::default().fg(theme.overlay0)),
+                    Span::styled(parsed.len().to_string(), Style::default().fg(theme.sky)),
+                    Span::styled(
+                        format!(" · {preview}{more}"),
+                        Style::default().fg(theme.overlay0),
+                    ),
+                ])
+            }
         }
     };
 
@@ -124,14 +125,15 @@ pub fn render(
     let status_line = Line::from(status_spans);
 
     // Hints
-    let hints = "d domains · o op · r run · x stop · j/k select · v detail · f file · e export";
+    let hints =
+        "d domains · o op · r run · x stop · j/k select · v detail (PgUp/PgDn) · f file · e export";
     let hints_line = Line::from(Span::styled(hints, Style::default().fg(theme.overlay0)));
 
     // Optional note (e.g. file error)
     let mut lines = vec![op_chips, domains_line, gauge_line, status_line, hints_line];
     if let Some(note) = &bulk.note {
         lines.push(Line::from(Span::styled(
-            note.as_str(),
+            sanitize_line(note),
             Style::default().fg(theme.red),
         )));
     }
@@ -173,11 +175,11 @@ pub fn render(
     let header = Row::new(["DOMAIN", "RESULT", "⚑"]).style(Style::default().fg(theme.overlay0));
 
     let body = bulk.rows.iter().enumerate().map(|(i, r)| {
-        let domain = r.operation.domain().to_string();
+        let domain = sanitize_line(r.operation.domain());
         let result_text = if r.success {
             "ok".to_string()
         } else {
-            r.error.as_deref().unwrap_or("failed").to_string()
+            sanitize_line(r.error.as_deref().unwrap_or("failed"))
         };
         let flag = if r.success {
             dot::line(theme, "ok", "●")
@@ -219,7 +221,8 @@ pub fn render(
             let detail_inner = panel::render(f, area, theme, "Detail", theme.sky, false);
             f.render_widget(
                 Paragraph::new(detail_lines(theme, row))
-                    .wrap(ratatui::widgets::Wrap { trim: false }),
+                    .wrap(ratatui::widgets::Wrap { trim: false })
+                    .scroll((bulk.detail_scroll, 0)),
                 detail_inner,
             );
         }
@@ -229,7 +232,7 @@ pub fn render(
 /// Build the detail view lines for a single result: a header row of facts plus
 /// the error or a pretty-printed JSON dump of the returned data.
 fn detail_lines<'a>(theme: &Theme, r: &seer_core::bulk::BulkResult) -> Vec<Line<'a>> {
-    let domain = r.operation.domain().to_string();
+    let domain = sanitize_line(r.operation.domain());
     let status = if r.success { "ok" } else { "failed" };
     let status_fg = if r.success { theme.green } else { theme.red };
 
@@ -245,7 +248,7 @@ fn detail_lines<'a>(theme: &Theme, r: &seer_core::bulk::BulkResult) -> Vec<Line<
 
     if let Some(err) = &r.error {
         lines.push(Line::from(Span::styled(
-            err.clone(),
+            sanitize_line(err),
             Style::default().fg(theme.red),
         )));
     }
@@ -253,9 +256,11 @@ fn detail_lines<'a>(theme: &Theme, r: &seer_core::bulk::BulkResult) -> Vec<Line<
     match &r.data {
         Some(data) => match serde_json::to_string_pretty(data) {
             Ok(json) => {
+                // JSON escapes control characters, but a string can still
+                // carry an escape-free terminal sequence (e.g. U+009B CSI).
                 for l in json.lines() {
                     lines.push(Line::from(Span::styled(
-                        l.to_string(),
+                        sanitize_line(l),
                         Style::default().fg(theme.subtext),
                     )));
                 }

@@ -4,6 +4,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Row, Table};
 use ratatui::Frame;
+use seer_core::output::sanitize_line;
 
 use crate::tui::action::LensData;
 use crate::tui::theme::Theme;
@@ -70,7 +71,7 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
     if !r.issues.is_empty() {
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                r.issues.join("  ·  "),
+                sanitize_line(&r.issues.join("  ·  ")),
                 Style::default().fg(theme.yellow),
             ))),
             chunks[2],
@@ -88,8 +89,8 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
             let matched = if ds.matched_key { "✓" } else { "✗" };
             Row::new(vec![
                 ds.key_tag.to_string(),
-                ds.algorithm_name.clone(),
-                ds.digest_type_name.clone(),
+                sanitize_line(&ds.algorithm_name),
+                sanitize_line(&ds.digest_type_name),
                 matched.to_string(),
             ])
             .style(Style::default().fg(theme.text))

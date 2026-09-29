@@ -9,6 +9,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Row, Table};
 use ratatui::Frame;
+use seer_core::output::sanitize_line;
 use seer_core::TakeoverVerdict;
 
 use crate::tui::action::LensData;
@@ -90,16 +91,18 @@ pub fn render(
     let rows = t.findings.iter().enumerate().map(|(i, finding)| {
         let base = row_style(theme, focused && i == sel);
         Row::new(vec![
-            Span::styled(finding.host.clone(), base),
+            Span::styled(sanitize_line(&finding.host), base),
             Span::styled(
                 verdict_label(finding.verdict).to_string(),
                 base.fg(theme.tone(verdict_tone(finding.verdict))),
             ),
-            Span::styled(or_dash(finding.provider.as_deref()), base),
+            Span::styled(sanitize_line(&or_dash(finding.provider.as_deref())), base),
             // Evidence is the matched fingerprint on a confirmed finding; the
             // probe note explains why an unconfirmed one could not be settled.
             Span::styled(
-                or_dash(finding.evidence.as_ref().or(finding.probe_note.as_ref())),
+                sanitize_line(&or_dash(
+                    finding.evidence.as_ref().or(finding.probe_note.as_ref()),
+                )),
                 base.fg(theme.subtext),
             ),
         ])
@@ -190,6 +193,21 @@ mod tests {
         assert!(s.contains("VULNERABLE"), "got: {s}");
         // The evidence is what makes the claim auditable — it must reach the UI.
         assert!(s.contains("GitHub Pages site here"), "got: {s}");
+    }
+
+    /// Evidence is a remote response body: it reached the terminal raw.
+    #[test]
+    fn remote_strings_are_sanitized() {
+        let mut f = finding("gone\u{1b}[2J.example.com", TakeoverVerdict::Vulnerable);
+        f.evidence = Some("no site\u{1b}]0;pwned\u{7}\nhere".into());
+        f.provider = Some("Evil\u{9b}31m".into());
+        let data = LensData::Takeover(Box::new(report(vec![f])));
+        let s = render_to_text(&data, 120, 10, false, 0);
+        assert!(!s.contains(['\u{1b}', '\u{7}', '\u{9b}']), "got: {s:?}");
+        assert!(
+            s.contains("gone.example.com") || s.contains("gone"),
+            "got: {s}"
+        );
     }
 
     #[test]

@@ -50,15 +50,25 @@ impl TldState {
         format!(".{}", f[i])
     }
 
-    /// Set the filter (used by live editing); clamps the selection to the new
-    /// match set, keeping it in range as the list shrinks.
+    /// Commit a filter. A changed filter selects its first match: the old
+    /// index pointed into the previous list, so keeping it (clamped) made ↵
+    /// load whichever match happened to sit at that position.
     pub fn set_filter(&mut self, filter: String) {
-        self.filter = filter.trim().trim_start_matches('.').to_lowercase();
-        let len = self.filtered().len();
-        if len == 0 {
+        let filter = normalize_filter(&filter);
+        if filter != self.filter {
+            self.filter = filter;
             self.sel = 0;
-        } else if self.sel >= len {
-            self.sel = len - 1;
+        }
+    }
+
+    /// The selection as the list shows it while the filter is being edited
+    /// to `live`: the first match once the text differs from the committed
+    /// filter, as committing it will select.
+    pub fn sel_under(&self, live: &str) -> usize {
+        if normalize_filter(live) == self.filter {
+            self.sel
+        } else {
+            0
         }
     }
 
@@ -128,9 +138,14 @@ impl TldState {
     }
 }
 
+/// A filter as it is matched: trimmed, lowercase, leading dot dropped.
+fn normalize_filter(filter: &str) -> String {
+    filter.trim().trim_start_matches('.').to_lowercase()
+}
+
 /// Filter the catalog by a case-insensitive substring (leading dot ignored).
 pub fn filter_catalog(filter: &str) -> Vec<&'static str> {
-    let needle = filter.trim().trim_start_matches('.').to_lowercase();
+    let needle = normalize_filter(filter);
     if needle.is_empty() {
         return catalog().to_vec();
     }
@@ -260,6 +275,27 @@ mod tests {
         assert!(state.select(".io"));
         assert!(state.filter.is_empty(), "select should clear the filter");
         assert_eq!(state.current(), ".io");
+    }
+
+    /// The selection used to keep its index (`com`'s place in the full
+    /// catalog) under a new filter, clamped, so ↵ loaded an arbitrary match.
+    #[test]
+    fn a_new_filter_selects_its_first_match() {
+        let mut state = TldState::default();
+        assert_eq!(state.current(), ".com");
+        assert_eq!(
+            state.sel_under("net"),
+            0,
+            "the live list shows the first match"
+        );
+        state.set_filter("net".into());
+        assert_eq!(state.sel, 0);
+        assert_eq!(state.current(), format!(".{}", filter_catalog("net")[0]));
+        // Re-committing the same filter keeps a selection made under it.
+        state.handle_key(press(KeyCode::Char('j')));
+        state.set_filter(" .NET ".into());
+        assert_eq!(state.sel, 1);
+        assert_eq!(state.sel_under("net"), 1);
     }
 
     #[test]

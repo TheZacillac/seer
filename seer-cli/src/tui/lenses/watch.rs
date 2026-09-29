@@ -4,6 +4,7 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Row, Table};
 use ratatui::Frame;
+use seer_core::output::sanitize_line;
 
 use crate::tui::action::LensData;
 use crate::tui::theme::Theme;
@@ -71,7 +72,7 @@ pub fn render(
 
         let base_style = row_style(theme, focused && i == sel);
         Row::new(vec![
-            ratatui::text::Text::from(Span::styled(r.domain.clone(), base_style)),
+            ratatui::text::Text::from(Span::styled(sanitize_line(&r.domain), base_style)),
             ratatui::text::Text::from(Span::styled(expires, Style::default().fg(expires_color))),
             ratatui::text::Text::from(Span::styled(ssl, Style::default().fg(ssl_color))),
             ratatui::text::Text::from(Span::styled(http, base_style)),
@@ -97,7 +98,7 @@ pub fn render(
     // Hint line
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "a add · d remove · ↵ open",
+            "a add · d remove (press twice) · ↵ open",
             Style::default().fg(theme.overlay0),
         ))),
         chunks[2],

@@ -8,7 +8,7 @@ use seer_core::output::OutputFormat;
 use seer_core::RecordType;
 
 use crate::tui::action::{
-    Action, EditTarget, FetchReq, Focus, InputMode, LensData, LensState, Msg,
+    Action, EditTarget, FetchReq, Focus, InputMode, LensData, LensKey, LensState, Msg,
 };
 use crate::tui::command::{self, CmdOutcome};
 use crate::tui::event::{self, KeyAction};
@@ -18,6 +18,8 @@ use crate::tui::theme::Theme;
 
 /// Number of 100ms ticks a toast lives for (~2.2s).
 const TOAST_TICKS: u32 = 22;
+/// Rows a PgUp/PgDn moves the raw view.
+const PAGE_ROWS: u16 = 10;
 /// Spinner frames (braille), matching the mockup.
 pub const SPIN: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -26,6 +28,15 @@ pub struct Toast {
     pub tone: String,
     pub msg: String,
     ticks_left: u32,
+}
+
+/// A destructive key press waiting for its confirming second press.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Confirm {
+    /// History `c`: empties the whole store, whatever the filter shows.
+    ClearHistory,
+    /// Watchlist `d` on this domain.
+    Unwatch(String),
 }
 
 pub struct App {
@@ -41,23 +52,36 @@ pub struct App {
     pub spin: usize,
     pub toast: Option<Toast>,
     pub panes: Panes,
+    /// First line of the raw (non-human) view shown at the top of its panel.
+    pub raw_scroll: u16,
     /// Active color theme (Frappé by default). Private so swaps go through
     /// `set_theme_by_name`, keeping `theme.name` canonical.
     theme: Theme,
-    states: HashMap<&'static str, LensState>,
+    states: HashMap<LensKey, LensState>,
     startup: Vec<Action>,
     /// Per-lens generation counter; stale results carry a lower gen and are dropped.
-    fetch_gen: HashMap<&'static str, u64>,
-    /// Committed in-lens `/`-filter per lens key (subdomains/history/propagation).
-    lens_filter: HashMap<&'static str, String>,
+    fetch_gen: HashMap<LensKey, u64>,
+    /// Lenses whose generation moved on since the last `update`: their
+    /// in-flight fetch is superseded, so `update` emits a `CancelFetch` for it.
+    superseded: Vec<LensKey>,
+    /// Committed in-lens `/`-filter per lens (subdomains/history/propagation).
+    lens_filter: HashMap<LensKey, String>,
     /// The request each lens's cached state was last fetched for. The state
     /// cache is keyed by lens only, so this is what tells `fetch_current` that
     /// a cached result belongs to another sub-tab or an ad-hoc target
     /// (`:rdap AS15169`, `:compare other.com …`) and must not be re-served.
-    last_req: HashMap<&'static str, FetchReq>,
+    last_req: HashMap<LensKey, FetchReq>,
+    /// A destructive action armed by its first key press, with the ticks
+    /// left before it lapses (the toast asking for the second press lives
+    /// as long).
+    confirm: Option<(Confirm, u32)>,
+    /// Whether the frame changed since it was last drawn (see `take_redraw`).
+    redraw: bool,
 }
 
 impl App {
+    /// A fresh session. It always opens on the rendered (human) view: the
+    /// config's `output_format` is the CLI's default, and `r` toggles raw.
     pub fn new(domain: Option<String>) -> Self {
         let mut app = Self {
             lens: 0,
@@ -72,34 +96,49 @@ impl App {
             spin: 0,
             toast: None,
             panes: Panes::default(),
+            raw_scroll: 0,
             theme: Theme::frappe(),
             states: HashMap::new(),
             startup: Vec::new(),
             fetch_gen: HashMap::new(),
+            superseded: Vec::new(),
             lens_filter: HashMap::new(),
             last_req: HashMap::new(),
+            confirm: None,
+            redraw: true,
         };
         if let Some(d) = domain {
-            let actions = app.set_domain_and_fetch(&d);
+            let actions = match app.target_or_toast(&d) {
+                Some(target) => app.set_domain_and_fetch(target),
+                None => vec![],
+            };
             app.startup.extend(actions);
         }
         app
     }
 
-    /// Seeds session defaults from the user config (`~/.seer/config.toml`).
-    ///
-    /// Pure: the caller (`mod.rs`) performs the file I/O and passes the loaded
-    /// config in, keeping this `App` layer free of I/O. Currently seeds the
-    /// output format used by the raw-output view; the DNS pane's nameserver
-    /// picker is left alone — its "system" slot queries the configured
-    /// nameserver when the fetch runs (`data::fetch`).
-    pub fn apply_config(&mut self, config: &seer_core::SeerConfig) {
-        self.format = config.output_format.parse().unwrap_or(OutputFormat::Human);
-    }
-
     /// Drain the actions queued at construction (initial lookup).
     pub fn take_startup_actions(&mut self) -> Vec<Action> {
+        // Nothing was in flight to cancel yet.
+        self.superseded.clear();
         std::mem::take(&mut self.startup)
+    }
+
+    /// Whether the frame must be redrawn, clearing the flag. Anything but a
+    /// tick changes what is shown (input, data, a resize); a tick only does
+    /// while something animates or when it expires the toast.
+    pub fn take_redraw(&mut self) -> bool {
+        std::mem::take(&mut self.redraw)
+    }
+
+    /// Whether the current frame animates with the tick (a spinner).
+    fn animating(&self) -> bool {
+        matches!(self.state_of(self.lens), LensState::Loading)
+            || match self.current_lens().key {
+                LensKey::Follow => self.panes.follow.running,
+                LensKey::Bulk => self.panes.bulk.running,
+                _ => false,
+            }
     }
 
     /// The active theme — `mod.rs` passes this to `render::view` each frame.
@@ -127,7 +166,7 @@ impl App {
 
     pub fn state_of(&self, lens: usize) -> &LensState {
         self.states
-            .get(lenses::lenses()[lens].key)
+            .get(&lenses::lenses()[lens].key)
             .unwrap_or(&LensState::Idle)
     }
 
@@ -139,10 +178,26 @@ impl App {
         });
     }
 
-    /// Increment and return the generation counter for a lens key.
-    fn bump_fetch_gen(&mut self, key: &'static str) -> u64 {
+    /// Show lens `i`, on its first tab, with its first row selected and the
+    /// nav focused. Every lens change goes through here, so no path can
+    /// carry the previous lens's tab or selection over (a stale tab made the
+    /// cache check refetch — and an Overview refetch records history again).
+    fn goto_lens(&mut self, i: usize) {
+        self.lens = i;
+        self.tab = 0;
+        self.sel = 0;
+        self.raw_scroll = 0;
+        self.focus = Focus::Nav;
+    }
+
+    /// Increment and return the generation counter for a lens, superseding
+    /// its in-flight fetch.
+    fn bump_fetch_gen(&mut self, key: LensKey) -> u64 {
         let g = self.fetch_gen.entry(key).or_insert(0);
         *g += 1;
+        if !self.superseded.contains(&key) {
+            self.superseded.push(key);
+        }
         *g
     }
 
@@ -162,11 +217,10 @@ impl App {
     /// indicator), if a request was recorded.
     pub fn pending_target(&self, lens: usize) -> Option<String> {
         self.last_req
-            .get(lenses::lenses()[lens].key)
+            .get(&lenses::lenses()[lens].key)
             .map(FetchReq::target)
     }
 
-    /// Number of selectable rows in the current lens's loaded data.
     /// The active in-lens filter for the current lens: the live edit buffer
     /// while the filter field is open, else the committed filter (empty if
     /// none). Used by both the renderer and `row_count`, so the visible rows
@@ -180,11 +234,12 @@ impl App {
             return buf.as_str().to_string();
         }
         self.lens_filter
-            .get(self.current_lens().key)
+            .get(&self.current_lens().key)
             .cloned()
             .unwrap_or_default()
     }
 
+    /// Number of selectable rows in the current lens's loaded data.
     pub fn row_count(&self) -> usize {
         let LensState::Loaded(data) = self.state_of(self.lens) else {
             return 0;
@@ -211,31 +266,75 @@ impl App {
         }
     }
 
-    /// Normalize + record the domain and produce a Fetch for the current lens
-    /// (if it has anything to fetch).
+    /// Whether the main pane shows the raw (serialized) view: a non-human
+    /// format over a lens with loaded data. Pane-driven lenses render from
+    /// their pane state in every format, so they have no raw view.
+    pub fn raw_view(&self) -> bool {
+        self.format != OutputFormat::Human
+            && !self.current_lens().key.renders_from_panes()
+            && matches!(self.state_of(self.lens), LensState::Loaded(_))
+    }
+
+    /// The raw view's line count, for clamping its scroll.
+    fn raw_line_count(&self) -> usize {
+        match self.state_of(self.lens) {
+            LensState::Loaded(data) => crate::payload::serialize(data, self.format).lines().count(),
+            _ => 0,
+        }
+    }
+
+    /// Scroll the raw view by `delta` lines, clamped to its last line.
+    fn scroll_raw(&mut self, delta: i32) {
+        let last = self.raw_line_count().saturating_sub(1);
+        let last = u16::try_from(last).unwrap_or(u16::MAX);
+        let next = i32::from(self.raw_scroll) + delta;
+        self.raw_scroll = u16::try_from(next.max(0)).unwrap_or(u16::MAX).min(last);
+    }
+
+    /// Validate a typed or pasted target: an IP literal (canonical form, for
+    /// the Reverse and RDAP lenses) or a host / DNS query name, normalized by
+    /// core. An invalid one is refused with a toast (`None`), leaving the
+    /// session target as it was.
+    fn target_or_toast(&mut self, raw: &str) -> Option<String> {
+        let raw = raw.trim();
+        if let Ok(ip) = raw.parse::<std::net::IpAddr>() {
+            return Some(ip.to_string());
+        }
+        match seer_core::validation::normalize_query_name(raw) {
+            Ok(target) => Some(target),
+            Err(e) => {
+                let msg = seer_core::output::sanitize_line(&e.to_string());
+                self.set_toast("fail", &msg);
+                None
+            }
+        }
+    }
+
+    /// Record the (validated) target and fetch the current lens for it — an
+    /// explicit request, so a heavy lens runs too.
     ///
-    /// The target is normalized as a host, keeping a leading `www.`: the DNS,
+    /// Targets are normalized as hosts, keeping a leading `www.`: the DNS,
     /// Trace, SSL, Status, Headers, Propagation and Follow lenses ask about
     /// that exact name, as the CLI does, while WHOIS, RDAP, availability and
     /// the other registration lookups drop `www.` in core themselves.
-    fn set_domain_and_fetch(&mut self, raw: &str) -> Vec<Action> {
-        let normalized =
-            seer_core::validation::normalize_host(raw).unwrap_or_else(|_| raw.to_lowercase());
+    fn set_domain_and_fetch(&mut self, target: String) -> Vec<Action> {
         let mut actions = Vec::new();
         // A new target invalidates every cached lens.
-        if self.domain.as_deref() != Some(normalized.as_str()) {
+        if self.domain.as_deref() != Some(target.as_str()) {
             self.states.clear();
             self.last_req.clear();
             // `:diff a b` / `:compare d …` overrides follow the session target
             // only until it changes; the new target becomes domain A again.
             self.panes.diff.a.clear();
             self.panes.compare.domain = None;
-            // Bump EVERY lens's generation, not just the current one's (which
+            // Supersede EVERY lens's fetch, not just the current one's (which
             // fetch_current bumps below): an in-flight fetch on another lens,
             // started under the old domain, would otherwise still match its
-            // unchanged gen and land as the new domain's data.
-            for gen in self.fetch_gen.values_mut() {
-                *gen += 1;
+            // unchanged gen and land as the new domain's data — and keep
+            // probing the old target meanwhile.
+            let keys: Vec<LensKey> = self.fetch_gen.keys().copied().collect();
+            for key in keys {
+                self.bump_fetch_gen(key);
             }
             // A new target invalidates any per-lens filters too.
             self.lens_filter.clear();
@@ -254,28 +353,30 @@ impl App {
             }
             self.panes.follow.reset_for_new_domain();
         }
-        self.domain = Some(normalized);
+        self.domain = Some(target);
         self.sel = 0;
-        actions.extend(self.fetch_current());
+        actions.extend(self.fetch_current(true));
         actions
     }
 
     /// Queue a fetch for the current lens at the current domain, marking it
-    /// Loading. Returns None if there's nothing to fetch. History and Watch do
-    /// not require a target domain.
-    fn fetch_current(&mut self) -> Option<Action> {
-        let key = self.current_lens().key;
+    /// Loading. Returns None if there's nothing to fetch — including a heavy
+    /// lens reached by navigation (`explicit` false): it waits for ↵. History
+    /// and Watch do not require a target domain.
+    fn fetch_current(&mut self, explicit: bool) -> Option<Action> {
+        let lens = self.current_lens();
+        let key = lens.key;
         // History reflects on-disk state that lookups mutate behind its back;
         // always re-read it rather than serving a cached (possibly empty) view.
-        if key == "history" {
-            self.states.remove(key);
+        if key == LensKey::History {
+            self.states.remove(&key);
         }
         // Most lenses need a target; History/Watch are global views.
         let want = match self.domain.clone() {
             Some(domain) => self.default_req(key, &domain),
             None => match key {
-                "history" => Some(FetchReq::History),
-                "watch" => Some(FetchReq::Watch),
+                LensKey::History => Some(FetchReq::History),
+                LensKey::Watch => Some(FetchReq::Watch),
                 _ => None,
             },
         };
@@ -284,10 +385,10 @@ impl App {
         // switches reset the tab to 0, so e.g. a cached DNSSEC (tab 1) or
         // `:rdap AS…` (tab 2) result would otherwise render under tab 0.
         if matches!(
-            self.states.get(key),
+            self.states.get(&key),
             Some(LensState::Loaded(_) | LensState::Loading)
         ) {
-            let stale = self.last_req.get(key).is_some_and(|prev| {
+            let stale = self.last_req.get(&key).is_some_and(|prev| {
                 prev.tab() != self.tab || want.as_ref().is_some_and(|w| w != prev)
             });
             if !stale {
@@ -296,21 +397,24 @@ impl App {
             // Drop the mismatched state, and invalidate any in-flight fetch
             // for it even when no replacement request follows (e.g. RDAP
             // domain tab with no session domain).
-            self.states.remove(key);
-            self.last_req.remove(key);
+            self.states.remove(&key);
+            self.last_req.remove(&key);
             self.bump_fetch_gen(key);
+        }
+        if lens.heavy && !explicit {
+            return None;
         }
         want.map(|req| self.fetch_action(req))
     }
 
     /// Default fetch request for a lens at `domain` (used by nav/number-jump).
     /// Interactive lenses with no single-domain default return None.
-    fn default_req(&self, key: &str, domain: &str) -> Option<FetchReq> {
+    fn default_req(&self, key: LensKey, domain: &str) -> Option<FetchReq> {
         let d = domain.to_string();
         Some(match key {
-            "overview" => FetchReq::Overview(d),
-            "whois" => FetchReq::Whois(d),
-            "rdap" => match self.tab {
+            LensKey::Overview => FetchReq::Overview(d),
+            LensKey::Whois => FetchReq::Whois(d),
+            LensKey::Rdap => match self.tab {
                 0 => FetchReq::RdapDomain(d),
                 // IP tab: only auto-fetch when a real IP has been resolved (from
                 // a prior DNS/Status lookup). Without one, fall back to the idle
@@ -318,7 +422,7 @@ impl App {
                 1 => FetchReq::RdapIp(self.panes.dns.resolved_ip.clone()?),
                 _ => return None, // ASN needs explicit :rdap AS…
             },
-            "dns" => match self.tab {
+            LensKey::Dns => match self.tab {
                 1 => FetchReq::Dnssec(d),
                 2 => FetchReq::Compare {
                     domain: self.panes.compare.domain.clone().unwrap_or(d),
@@ -336,20 +440,19 @@ impl App {
                     nameserver: self.panes.dns.nameserver(),
                 },
             },
-            "ssl" => FetchReq::Ssl(d),
-            "status" => FetchReq::Status(d),
-            "propagation" => FetchReq::Prop(d),
-            "reverse" => FetchReq::Reverse(d),
-            "avail" => FetchReq::Avail(d),
-            "tld" => FetchReq::Tld(self.panes.tld.current()),
-            "diff" => return None, // needs a second domain (DiffB field)
-            "watch" => FetchReq::Watch,
-            "history" => FetchReq::History,
-            "subdomains" => FetchReq::Subdomains(d),
-            "headers" => FetchReq::Headers(d),
-            "takeover" => FetchReq::Takeover(d),
-            "follow" | "bulk" => return None, // streaming — started explicitly
-            _ => return None,
+            LensKey::Ssl => FetchReq::Ssl(d),
+            LensKey::Status => FetchReq::Status(d),
+            LensKey::Propagation => FetchReq::Prop(d),
+            LensKey::Reverse => FetchReq::Reverse(d),
+            LensKey::Avail => FetchReq::Avail(d),
+            LensKey::Tld => FetchReq::Tld(self.panes.tld.current()),
+            LensKey::Diff => return None, // needs a second domain (DiffB field)
+            LensKey::Watch => FetchReq::Watch,
+            LensKey::History => FetchReq::History,
+            LensKey::Subdomains => FetchReq::Subdomains(d),
+            LensKey::Headers => FetchReq::Headers(d),
+            LensKey::Takeover => FetchReq::Takeover(d),
+            LensKey::Follow | LensKey::Bulk => return None, // streaming — started explicitly
         })
     }
 
@@ -362,16 +465,17 @@ impl App {
             return vec![];
         }
         let key = lens.key;
-        self.states.remove(key);
+        self.states.remove(&key);
+        self.raw_scroll = 0;
         // A `/`-filter narrowed the previous tab's rows (DNS Records); the
         // new tab lists other data, or none.
-        self.lens_filter.remove(key);
+        self.lens_filter.remove(&key);
         // Invalidate any in-flight fetch for the previous tab even when the
         // new tab has no default request (RDAP IP tab without a resolved IP,
         // ASN tab): no fetch_action follows to bump the gen there, and the
         // old tab's late result would otherwise render as this tab's data.
         self.bump_fetch_gen(key);
-        self.fetch_with_current()
+        self.fetch_with_current(false)
     }
 
     /// Populate `panes.dns.resolved_ip` from DNS or Status results so the RDAP
@@ -404,7 +508,23 @@ impl App {
         }
     }
 
+    /// The single state transition. Cancels for superseded fetches lead the
+    /// returned actions, so they can never abort a fetch this same step
+    /// started for the lens.
     pub fn update(&mut self, msg: Msg) -> Vec<Action> {
+        let tick = matches!(msg, Msg::Tick);
+        let animating = tick && self.animating();
+        let had_toast = self.toast.is_some();
+        let actions = self.step(msg);
+        if !tick || animating || had_toast != self.toast.is_some() {
+            self.redraw = true;
+        }
+        let mut out: Vec<Action> = self.superseded.drain(..).map(Action::CancelFetch).collect();
+        out.extend(actions);
+        out
+    }
+
+    fn step(&mut self, msg: Msg) -> Vec<Action> {
         match msg {
             Msg::Tick => {
                 self.spin = (self.spin + 1) % SPIN.len();
@@ -414,29 +534,33 @@ impl App {
                         self.toast = None;
                     }
                 }
+                if let Some((_, ticks)) = &mut self.confirm {
+                    *ticks = ticks.saturating_sub(1);
+                    if *ticks == 0 {
+                        self.confirm = None;
+                    }
+                }
                 vec![]
             }
             Msg::Data { lens, gen, result } => {
-                // Resolve the string key back to a &'static str via the registry.
-                if let Some(reg) = lenses::lenses().iter().find(|l| l.key == lens) {
-                    // Drop stale results — only store if the generation matches.
-                    let current_gen = self.fetch_gen.get(reg.key).copied().unwrap_or(0);
-                    if current_gen == gen {
-                        let new_state = match result {
-                            Ok(data) => {
-                                // Side-effect: extract resolved IP from DNS/Status results.
-                                self.extract_resolved_ip_if_needed(&data);
-                                LensState::Loaded(data)
-                            }
-                            Err(e) => LensState::Error(e),
-                        };
-                        self.states.insert(reg.key, new_state);
-                        // A refresh can return fewer rows (e.g. after `watch
-                        // remove` of the last row); keep the selection on a
-                        // real row so the highlight and row actions agree.
-                        if reg.key == self.current_lens().key {
-                            self.sel = self.sel.min(self.row_count().saturating_sub(1));
+                // Drop stale results — only store if the generation matches.
+                let current_gen = self.fetch_gen.get(&lens).copied().unwrap_or(0);
+                if current_gen == gen {
+                    let new_state = match result {
+                        Ok(data) => {
+                            // Side-effect: extract resolved IP from DNS/Status results.
+                            self.extract_resolved_ip_if_needed(&data);
+                            LensState::Loaded(data)
                         }
+                        Err(e) => LensState::Error(e),
+                    };
+                    self.states.insert(lens, new_state);
+                    // A refresh can return fewer rows (e.g. after `watch
+                    // remove` of the last row); keep the selection on a
+                    // real row so the highlight and row actions agree.
+                    if lens == self.current_lens().key {
+                        self.sel = self.sel.min(self.row_count().saturating_sub(1));
+                        self.raw_scroll = 0;
                     }
                 }
                 vec![]
@@ -486,8 +610,15 @@ impl App {
             // Windows legacy consoles. (Held-key auto-repeat is not relied upon.)
             Msg::Input(Event::Key(key)) if key.kind == KeyEventKind::Press => self.on_key(key),
             Msg::Input(Event::Paste(s)) => {
-                // Bracketed paste lands here as one string. Route it into whatever
-                // text buffer is active so multi-line domain lists paste cleanly.
+                // Bracketed paste lands here as one string. Every input is a
+                // single-line editor, so line breaks, tabs and any other
+                // control character become spaces (a pasted multi-line
+                // domain list stays one space-separated line) rather than
+                // landing in a buffer that is echoed to the terminal.
+                let s: String = s
+                    .chars()
+                    .map(|c| if c.is_control() { ' ' } else { c })
+                    .collect();
                 match &mut self.input_mode {
                     InputMode::Field { buf, .. } => buf.insert_str(&s),
                     InputMode::Command(buf) => buf.insert_str(&s),
@@ -506,6 +637,9 @@ impl App {
             InputMode::Field { target, buf } => return self.on_field_key(key, target, buf),
             InputMode::Normal => {}
         }
+        // Only the confirming key, pressed next, completes an armed
+        // destructive action; any other key disarms it.
+        let confirm = self.confirm.take().map(|(c, _)| c);
         // Normal-mode bindings are bare keys, and the pane handlers / keymap
         // match on `key.code` alone — so Ctrl/Alt chords must stop here. In
         // raw mode Ctrl-C arrives as `Char('c') + CONTROL`: unfiltered, a
@@ -530,22 +664,34 @@ impl App {
             }
             return vec![];
         }
+        // The raw view scrolls: PgUp/PgDn anywhere, j/k/↑/↓ once focused.
+        if self.raw_view() {
+            let pane = self.focus == Focus::Pane;
+            let delta = match key.code {
+                KeyCode::PageDown => Some(i32::from(PAGE_ROWS)),
+                KeyCode::PageUp => Some(-i32::from(PAGE_ROWS)),
+                KeyCode::Char('j') | KeyCode::Down if pane => Some(1),
+                KeyCode::Char('k') | KeyCode::Up if pane => Some(-1),
+                _ => None,
+            };
+            if let Some(delta) = delta {
+                self.scroll_raw(delta);
+                return vec![];
+            }
+        }
         // Delegate to pane component when pane-focused.
-        if let Some(actions) = self.handle_pane_key(key) {
+        if let Some(actions) = self.handle_pane_key(key, confirm) {
             return actions;
         }
         // `/` opens the in-lens filter when a filterable result lens is
         // pane-focused; when nav-focused it stays the domain-edit shortcut.
+        let lens = self.current_lens();
         if key.code == KeyCode::Char('/')
             && self.focus == Focus::Pane
-            && crate::tui::filter::is_filterable(self.current_lens().key, self.tab)
+            && lens.filterable(self.tab)
             && matches!(self.state_of(self.lens), LensState::Loaded(_))
         {
-            let cur = self
-                .lens_filter
-                .get(self.current_lens().key)
-                .cloned()
-                .unwrap_or_default();
+            let cur = self.lens_filter.get(&lens.key).cloned().unwrap_or_default();
             self.input_mode = InputMode::Field {
                 target: EditTarget::LensFilter,
                 buf: cur.into(),
@@ -597,15 +743,17 @@ impl App {
                 if value.is_empty() {
                     return vec![];
                 }
-                self.lens = 0;
-                self.focus = Focus::Nav;
-                self.set_domain_and_fetch(&value)
+                let Some(target) = self.target_or_toast(&value) else {
+                    return vec![];
+                };
+                self.goto_lens(0);
+                self.set_domain_and_fetch(target)
             }
             EditTarget::LensFilter => {
                 // Commit the filter for the current lens; empty clears it.
                 let key = self.current_lens().key;
                 if value.is_empty() {
-                    self.lens_filter.remove(key);
+                    self.lens_filter.remove(&key);
                 } else {
                     self.lens_filter.insert(key, value);
                 }
@@ -627,12 +775,7 @@ impl App {
                 if value.is_empty() {
                     return vec![];
                 }
-                let gen = self.bump_fetch_gen("watch");
-                vec![Action::WatchMutate {
-                    add: Some(value),
-                    remove: None,
-                    gen,
-                }]
+                vec![self.watch_mutate(Some(value), None)]
             }
             EditTarget::TldFilter => {
                 // Commit the filter, then load details for the first match so the
@@ -640,7 +783,7 @@ impl App {
                 self.panes.tld.set_filter(value);
                 let cur = self.panes.tld.current();
                 if cur.is_empty() {
-                    self.states.remove("tld");
+                    self.states.remove(&LensKey::Tld);
                     vec![]
                 } else {
                     vec![self.fetch_action(FetchReq::Tld(cur))]
@@ -653,24 +796,26 @@ impl App {
         }
     }
 
-    fn handle_pane_key(&mut self, key: KeyEvent) -> Option<Vec<Action>> {
+    /// A watchlist edit: the lens shows Loading until the refresh that
+    /// follows the edit lands under the generation bumped here (see mod.rs).
+    fn watch_mutate(&mut self, add: Option<String>, remove: Option<String>) -> Action {
+        let gen = self.bump_fetch_gen(LensKey::Watch);
+        self.states.insert(LensKey::Watch, LensState::Loading);
+        Action::WatchMutate { add, remove, gen }
+    }
+
+    fn handle_pane_key(&mut self, key: KeyEvent, confirm: Option<Confirm>) -> Option<Vec<Action>> {
         if self.focus != Focus::Pane {
             return None;
         }
         let lens_key = self.current_lens().key;
-        // Watch and history actions need App state (selected row, loaded data),
-        // so they are handled here before generic pane delegation.
-        if lens_key == "watch" {
-            if let Some(actions) = self.handle_watch_key(key) {
-                return Some(actions);
-            }
-            return None; // fall through to normal nav for unhandled keys
-        }
-        if lens_key == "history" {
-            if let Some(actions) = self.handle_history_key(key) {
-                return Some(actions);
-            }
-            return None;
+        // Watch and history actions need App state (selected row, loaded
+        // data), so they are handled here; unhandled keys fall through to
+        // normal nav.
+        match lens_key {
+            LensKey::Watch => return self.handle_watch_key(key, confirm),
+            LensKey::History => return self.handle_history_key(key, confirm),
+            _ => {}
         }
         let domain = self.domain.clone();
         let outcome = self
@@ -679,9 +824,16 @@ impl App {
         Some(self.apply_pane_outcome(outcome))
     }
 
+    /// Arm `action` for a confirming second press of the same key, telling
+    /// the user what it will do.
+    fn arm(&mut self, action: Confirm, msg: &str) {
+        self.set_toast("warn", msg);
+        self.confirm = Some((action, TOAST_TICKS));
+    }
+
     /// Watch lens key handling (App-side — needs selected row + loaded data).
     /// Returns `Some(actions)` for consumed keys, `None` to fall through.
-    fn handle_watch_key(&mut self, key: KeyEvent) -> Option<Vec<Action>> {
+    fn handle_watch_key(&mut self, key: KeyEvent, confirm: Option<Confirm>) -> Option<Vec<Action>> {
         match key.code {
             KeyCode::Char('a') => {
                 self.input_mode = InputMode::Field {
@@ -690,40 +842,63 @@ impl App {
                 };
                 Some(vec![])
             }
+            // Removing asks for a second `d` first.
             KeyCode::Char('d') => {
                 let domain = self.selected_watch_domain()?;
-                let gen = self.bump_fetch_gen("watch");
-                Some(vec![Action::WatchMutate {
-                    add: None,
-                    remove: Some(domain),
-                    gen,
-                }])
+                let armed = Confirm::Unwatch(domain.clone());
+                if confirm.as_ref() == Some(&armed) {
+                    return Some(vec![self.watch_mutate(None, Some(domain))]);
+                }
+                let msg = format!("press d again to stop watching {domain}");
+                self.arm(armed, &seer_core::output::sanitize_line(&msg));
+                Some(vec![])
             }
             KeyCode::Enter => {
                 let domain = self.selected_watch_domain()?;
-                self.lens = 0; // switch to Overview
-                self.focus = Focus::Nav;
-                Some(self.fetch_with(&domain))
+                Some(self.open_overview(&domain))
             }
             _ => None,
         }
     }
 
     /// History lens key handling (App-side).
-    fn handle_history_key(&mut self, key: KeyEvent) -> Option<Vec<Action>> {
+    fn handle_history_key(
+        &mut self,
+        key: KeyEvent,
+        confirm: Option<Confirm>,
+    ) -> Option<Vec<Action>> {
         match key.code {
             KeyCode::Enter => {
                 let domain = self.selected_history_domain()?;
-                self.lens = 0;
-                self.focus = Focus::Nav;
-                Some(self.fetch_with(&domain))
+                Some(self.open_overview(&domain))
             }
+            // Clearing asks for a second `c` first, and says it empties the
+            // whole store: a `/`-filter narrows the view, not the clear.
             KeyCode::Char('c') => {
-                let gen = self.bump_fetch_gen("history");
-                Some(vec![Action::HistoryClear { gen }])
+                if confirm == Some(Confirm::ClearHistory) {
+                    let gen = self.bump_fetch_gen(LensKey::History);
+                    self.states.insert(LensKey::History, LensState::Loading);
+                    return Some(vec![Action::HistoryClear { gen }]);
+                }
+                let total = match self.state_of(self.lens) {
+                    LensState::Loaded(LensData::History(entries)) => entries.len(),
+                    _ => 0,
+                };
+                let msg = format!("press c again to delete ALL {total} history entries");
+                self.arm(Confirm::ClearHistory, &msg);
+                Some(vec![])
             }
             _ => None,
         }
+    }
+
+    /// Replay a stored domain (a watch or history row) on the Overview.
+    fn open_overview(&mut self, domain: &str) -> Vec<Action> {
+        let Some(target) = self.target_or_toast(domain) else {
+            return vec![];
+        };
+        self.goto_lens(0);
+        self.set_domain_and_fetch(target)
     }
 
     /// Returns the domain of the currently selected watchlist row, if available.
@@ -766,14 +941,10 @@ impl App {
                 vec![]
             }
             PaneOutcome::Toast { tone, msg } => {
-                self.set_toast(tone, msg);
+                self.set_toast(tone, &msg);
                 vec![]
             }
         }
-    }
-
-    fn fetch_with(&mut self, domain: &str) -> Vec<Action> {
-        self.set_domain_and_fetch(domain)
     }
 
     fn exec_command(&mut self, line: &str) -> Vec<Action> {
@@ -790,6 +961,7 @@ impl App {
             CmdOutcome::Copy => self.copy_action(),
             CmdOutcome::SetFormat(f) => {
                 self.format = f.parse().unwrap_or(OutputFormat::Human);
+                self.raw_scroll = 0;
                 self.set_toast("ok", &format!("output → {f}"));
                 vec![]
             }
@@ -826,30 +998,33 @@ impl App {
                         return self.tld_command(&t);
                     }
                 }
-                if let Some(i) = lenses::find_by_cmd_or_key(&lens) {
-                    self.lens = i;
-                    self.sel = 0;
-                    self.focus = Focus::Nav;
-                    self.reset_tab();
-                    if let Some(t) = target {
-                        return self.fetch_with(&t);
-                    }
-                    return self.fetch_with_current();
+                let Some(i) = lenses::find_by_cmd_or_key(&lens) else {
+                    return vec![];
+                };
+                // Validate first: a refused target leaves the view unchanged.
+                let target = match target {
+                    Some(t) => match self.target_or_toast(&t) {
+                        Some(target) => Some(target),
+                        None => return vec![],
+                    },
+                    None => None,
+                };
+                self.goto_lens(i);
+                match target {
+                    Some(target) => self.set_domain_and_fetch(target),
+                    // A command is an explicit request: a heavy lens runs.
+                    None => self.fetch_with_current(true),
                 }
-                vec![]
             }
             CmdOutcome::Lookup(d) => {
-                self.lens = 0;
-                self.reset_tab();
-                self.fetch_with(&d)
+                let Some(target) = self.target_or_toast(&d) else {
+                    return vec![];
+                };
+                self.goto_lens(0);
+                self.set_domain_and_fetch(target)
             }
             CmdOutcome::Diff { a, b } => {
-                if let Some(i) = lenses::find_by_cmd_or_key("diff") {
-                    self.lens = i;
-                    self.sel = 0;
-                    self.focus = Focus::Nav;
-                    self.reset_tab();
-                }
+                self.goto_lens(LensKey::Diff.index());
                 // Keep A too: the pane's labels and its ↵ re-run must use the
                 // command's A, not the session domain.
                 self.panes.diff.a = a.clone();
@@ -878,6 +1053,9 @@ impl App {
                 server,
                 trace,
             } => {
+                let Some(target) = self.target_or_toast(&domain) else {
+                    return vec![];
+                };
                 // `+trace` opens the Trace tab, anything else Records.
                 self.open_dns_tab(if trace { 3 } else { 0 });
                 // The Records and Trace tabs' default requests read the type
@@ -887,19 +1065,11 @@ impl App {
                 if let Some(server) = server {
                     self.panes.dns.select_server(server);
                 }
-                self.fetch_with(&domain)
+                self.set_domain_and_fetch(target)
             }
             CmdOutcome::WatchMutate { add, remove } => {
-                if let Some(i) = lenses::find_by_cmd_or_key("watch") {
-                    self.lens = i;
-                    self.sel = 0;
-                    self.focus = Focus::Nav;
-                    self.reset_tab();
-                }
-                // The mutation's refresh lands under this gen (see mod.rs).
-                let gen = self.bump_fetch_gen("watch");
-                self.states.insert("watch", LensState::Loading);
-                vec![Action::WatchMutate { add, remove, gen }]
+                self.goto_lens(LensKey::Watch.index());
+                vec![self.watch_mutate(add, remove)]
             }
             CmdOutcome::Invalid(msg) => {
                 self.set_toast("fail", &msg);
@@ -918,28 +1088,19 @@ impl App {
     /// tab that cannot filter could neither apply nor edit it. Away from the
     /// lens, the tab it would show is Records, since changing lens resets it.
     fn open_dns_tab(&mut self, tab: usize) {
-        let Some(i) = lenses::find_by_cmd_or_key("dns") else {
-            return;
-        };
+        let i = LensKey::Dns.index();
         let shown = if self.lens == i { self.tab } else { 0 };
         if shown != tab {
-            self.lens_filter.remove("dns");
+            self.lens_filter.remove(&LensKey::Dns);
         }
-        self.lens = i;
+        self.goto_lens(i);
         self.tab = tab;
-        self.sel = 0;
-        self.focus = Focus::Nav;
     }
 
     /// Handle `:rdap <target>` — routes to the correct RDAP sub-tab based on
     /// whether the target looks like an IP address, an ASN, or a domain name.
     fn rdap_command(&mut self, target: &str) -> Vec<Action> {
-        let Some(rdap_idx) = lenses::find_by_cmd_or_key("rdap") else {
-            return vec![];
-        };
-        self.lens = rdap_idx;
-        self.sel = 0;
-        self.focus = Focus::Nav;
+        self.goto_lens(LensKey::Rdap.index());
 
         // IP address?
         if target.parse::<std::net::IpAddr>().is_ok() {
@@ -954,7 +1115,6 @@ impl App {
         }
 
         // Default: domain lookup on tab 0.
-        self.tab = 0;
         vec![self.fetch_action(FetchReq::RdapDomain(target.to_string()))]
     }
 
@@ -962,17 +1122,11 @@ impl App {
     /// fetch its info WITHOUT touching the global session domain. If the TLD is
     /// not one of the known slots, show an error toast and change nothing.
     fn tld_command(&mut self, tld: &str) -> Vec<Action> {
-        let Some(tld_idx) = lenses::find_by_cmd_or_key("tld") else {
-            return vec![];
-        };
         if !self.panes.tld.select(tld) {
             self.set_toast("fail", &format!("unknown tld: {tld}"));
             return vec![];
         }
-        self.lens = tld_idx;
-        self.sel = 0;
-        self.focus = Focus::Nav;
-        self.reset_tab();
+        self.goto_lens(LensKey::Tld.index());
         // `fetch_action` replaces any cached TLD state with Loading.
         vec![self.fetch_action(FetchReq::Tld(self.panes.tld.current()))]
     }
@@ -983,16 +1137,17 @@ impl App {
         self.set_toast("fail", &msg);
     }
 
-    /// Fetch the current lens at the existing domain (if any).
-    fn fetch_with_current(&mut self) -> Vec<Action> {
-        match self.fetch_current() {
-            Some(a) => vec![a],
-            None => vec![],
-        }
+    /// Fetch the current lens at the existing domain (if any). `explicit`:
+    /// the user asked for it (↵, a command), so a heavy lens runs too.
+    fn fetch_with_current(&mut self, explicit: bool) -> Vec<Action> {
+        self.fetch_current(explicit).into_iter().collect()
     }
 
-    fn reset_tab(&mut self) {
-        self.tab = 0;
+    /// Navigate to lens `i`: its cached result, or its default fetch (never
+    /// a heavy lens's — that waits for ↵).
+    fn nav_to(&mut self, i: usize) -> Vec<Action> {
+        self.goto_lens(i);
+        self.fetch_with_current(false)
     }
 
     fn on_normal_action(&mut self, ka: KeyAction) -> Vec<Action> {
@@ -1000,10 +1155,7 @@ impl App {
         match ka {
             KeyAction::Down => {
                 if self.focus == Focus::Nav {
-                    self.lens = (self.lens + 1) % n_lenses;
-                    self.sel = 0;
-                    self.reset_tab();
-                    return self.fetch_with_current();
+                    return self.nav_to((self.lens + 1) % n_lenses);
                 }
                 let max = self.row_count().saturating_sub(1);
                 self.sel = (self.sel + 1).min(max);
@@ -1011,39 +1163,28 @@ impl App {
             }
             KeyAction::Up => {
                 if self.focus == Focus::Nav {
-                    self.lens = (self.lens + n_lenses - 1) % n_lenses;
-                    self.sel = 0;
-                    self.reset_tab();
-                    return self.fetch_with_current();
+                    return self.nav_to((self.lens + n_lenses - 1) % n_lenses);
                 }
                 self.sel = self.sel.saturating_sub(1);
                 vec![]
             }
             KeyAction::Top => {
-                if self.focus == Focus::Pane {
-                    self.sel = 0;
-                } else {
-                    self.lens = 0;
-                    return self.fetch_with_current();
+                if self.focus == Focus::Nav {
+                    return self.nav_to(0);
                 }
+                self.sel = 0;
                 vec![]
             }
             KeyAction::Bottom => {
-                if self.focus == Focus::Pane {
-                    self.sel = self.row_count().saturating_sub(1);
-                } else {
-                    self.lens = n_lenses - 1;
-                    return self.fetch_with_current();
+                if self.focus == Focus::Nav {
+                    return self.nav_to(n_lenses - 1);
                 }
+                self.sel = self.row_count().saturating_sub(1);
                 vec![]
             }
             KeyAction::JumpLens(i) => {
                 if i < n_lenses {
-                    self.lens = i;
-                    self.sel = 0;
-                    self.focus = Focus::Nav;
-                    self.reset_tab();
-                    return self.fetch_with_current();
+                    return self.nav_to(i);
                 }
                 vec![]
             }
@@ -1062,15 +1203,23 @@ impl App {
                 self.refetch_for_tab()
             }
             KeyAction::EnterPane => {
-                // Allow entering interactive lenses even when row_count is 0 (they have
-                // in-pane controls that work without pre-loaded rows).
-                // "watch": with an empty watchlist there are no rows, yet `a`
-                // (add) is the pane's whole point.
-                const INTERACTIVE_LENSES: &[&str] = &[
-                    "tld", "diff", "compare", "follow", "bulk", "dns", "rdap", "watch",
-                ];
-                let lens_key = self.current_lens().key;
-                if self.row_count() > 0 || INTERACTIVE_LENSES.contains(&lens_key) {
+                let lens = self.current_lens();
+                // ↵ runs a heavy lens that has not run for this target yet
+                // (or failed): navigation leaves it waiting for this.
+                if lens.heavy
+                    && self.domain.is_some()
+                    && matches!(
+                        self.state_of(self.lens),
+                        LensState::Idle | LensState::Error(_)
+                    )
+                {
+                    self.states.remove(&lens.key);
+                    return self.fetch_with_current(true);
+                }
+                // Interactive lenses focus even with no rows: their in-pane
+                // controls work without loaded data. The raw view focuses to
+                // scroll with j/k.
+                if self.row_count() > 0 || lens.interactive || self.raw_view() {
                     self.focus = Focus::Pane;
                 }
                 vec![]
@@ -1080,6 +1229,7 @@ impl App {
                 vec![]
             }
             KeyAction::ToggleRaw => {
+                self.raw_scroll = 0;
                 self.format = if self.format == OutputFormat::Human {
                     self.set_toast("info", "raw output → json (:set output yaml|markdown)");
                     OutputFormat::Json
@@ -1119,7 +1269,7 @@ impl App {
         // History has no serialized form (the shared payload serializer
         // yields a placeholder string), so copying would put that placeholder
         // on the clipboard and still report success.
-        if self.current_lens().key == "history" {
+        if self.current_lens().key == LensKey::History {
             self.set_toast(
                 "info",
                 "history can't be copied — ↵ replays an entry, then y copies it",
@@ -1247,7 +1397,7 @@ mod tests {
         let mut app = App::new(None);
         // gen 0 matches the initial fetch_gen (entry absent → 0), so result is stored.
         app.update(Msg::Data {
-            lens: "dns".into(),
+            lens: LensKey::Dns,
             gen: 0,
             result: Ok(empty_dig()),
         });
@@ -1343,7 +1493,12 @@ mod tests {
     #[test]
     fn watch_d_emits_watch_mutate_remove() {
         let mut app = app_on_watch_with_domain("example.com");
+        // The first `d` only asks; the second removes.
         let actions = key(&mut app, KeyCode::Char('d'));
+        assert!(actions.is_empty(), "{actions:?}");
+        assert!(matches!(&app.toast, Some(t) if t.msg.contains("press d again")));
+        let actions = key(&mut app, KeyCode::Char('d'));
+        assert!(matches!(app.state_of(watch_lens_idx()), LensState::Loading));
         assert!(
             actions.iter().any(|a| matches!(
                 a,
@@ -1404,11 +1559,49 @@ mod tests {
         app.states
             .insert(lenses::lenses()[idx].key, make_history_state("old.com"));
         let actions = key(&mut app, KeyCode::Char('c'));
+        assert!(actions.is_empty(), "the first c only asks: {actions:?}");
+        assert!(matches!(&app.toast, Some(t) if t.msg.contains("ALL 1 history")));
+        let actions = key(&mut app, KeyCode::Char('c'));
         assert!(
             actions
                 .iter()
                 .any(|a| matches!(a, Action::HistoryClear { .. })),
             "expected HistoryClear, got {actions:?}",
+        );
+    }
+
+    /// A destructive key needs its confirming press next, within the toast
+    /// window: another key or the window lapsing disarms it.
+    #[test]
+    fn destructive_keys_need_a_prompt_second_press() {
+        let mut app = App::new(None);
+        app.lens = history_lens_idx();
+        app.focus = Focus::Pane;
+        app.states
+            .insert(LensKey::History, make_history_state("old.com"));
+        // Filtered to nothing, `c` still says it clears everything.
+        app.lens_filter.insert(LensKey::History, "zzz".into());
+        key(&mut app, KeyCode::Char('c'));
+        assert!(matches!(&app.toast, Some(t) if t.msg.contains("ALL 1")));
+        key(&mut app, KeyCode::Char('j'));
+        let actions = key(&mut app, KeyCode::Char('c'));
+        assert!(actions.is_empty(), "another key in between disarms");
+        for _ in 0..=TOAST_TICKS {
+            app.update(Msg::Tick);
+        }
+        let actions = key(&mut app, KeyCode::Char('c'));
+        assert!(actions.is_empty(), "a lapsed confirmation disarms");
+
+        // Watchlist: the confirmation is for the row it was armed on.
+        let mut app = app_on_watch_with_domain("a.com");
+        key(&mut app, KeyCode::Char('d'));
+        app.states.insert(LensKey::Watch, make_watch_state("b.com"));
+        let actions = key(&mut app, KeyCode::Char('d'));
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::WatchMutate { .. })),
+            "a second d on another row re-asks: {actions:?}"
         );
     }
 
@@ -1446,7 +1639,7 @@ mod tests {
         app.fetch_gen.insert(lenses::lenses()[dns_idx].key, 1);
         // Send a stale result with gen 0.
         app.update(Msg::Data {
-            lens: "dns".into(),
+            lens: LensKey::Dns,
             gen: 0,
             result: Ok(empty_dig()),
         });
@@ -1463,7 +1656,7 @@ mod tests {
         let dns_idx = lenses::find_by_cmd_or_key("dns").unwrap();
         app.fetch_gen.insert(lenses::lenses()[dns_idx].key, 2);
         app.update(Msg::Data {
-            lens: "dns".into(),
+            lens: LensKey::Dns,
             gen: 2,
             result: Ok(empty_dig()),
         });
@@ -1541,7 +1734,7 @@ mod tests {
 
         let mut app = App::new(None);
         // Establish an in-flight follow run on the first domain.
-        let _ = app.set_domain_and_fetch("a.com");
+        let _ = app.set_domain_and_fetch("a.com".into());
         app.panes.follow.gen = 1;
         app.panes.follow.running = true;
         app.update(Msg::FollowStep {
@@ -1558,7 +1751,7 @@ mod tests {
         // the in-flight background run cancelled. Without StopFollow the old
         // domain's DNS loop kept polling invisibly for up to 10 minutes; the
         // generation guard only drops its UI updates (2026-07-11 review).
-        let actions = app.set_domain_and_fetch("b.com");
+        let actions = app.set_domain_and_fetch("b.com".into());
         assert!(
             actions.iter().any(|a| matches!(a, Action::StopFollow)),
             "domain switch with a live follow run must emit StopFollow"
@@ -1706,7 +1899,7 @@ mod tests {
             notes: vec![],
         };
         app.states.insert(
-            "takeover",
+            LensKey::Takeover,
             LensState::Loaded(LensData::Takeover(Box::new(report))),
         );
         assert_eq!(app.row_count(), 2);
@@ -1751,6 +1944,7 @@ mod tests {
         // Simulate the lens having been fetched once (gen → 1).
         app.fetch_gen
             .insert(lenses::lenses()[watch_lens_idx()].key, 1);
+        key(&mut app, KeyCode::Char('d'));
         let actions = key(&mut app, KeyCode::Char('d'));
         let gen = actions.iter().find_map(|a| match a {
             Action::WatchMutate { gen, .. } => Some(*gen),
@@ -1759,7 +1953,7 @@ mod tests {
         assert_eq!(gen, Some(2), "mutation must carry a freshly-bumped gen");
         // A Data refresh at that gen must be accepted (not dropped as stale).
         app.update(Msg::Data {
-            lens: "watch".into(),
+            lens: LensKey::Watch,
             gen: 2,
             result: Ok(make_watch_state_data("kept.com")),
         });
@@ -1784,12 +1978,12 @@ mod tests {
             })
             .collect();
         app.states
-            .insert("watch", LensState::Loaded(LensData::Watch(report)));
+            .insert(LensKey::Watch, LensState::Loaded(LensData::Watch(report)));
         app.sel = 2; // "c.com", the last row
-        app.fetch_gen.insert("watch", 1);
+        app.fetch_gen.insert(LensKey::Watch, 1);
         // The refresh after removing "c.com" returns one row.
         app.update(Msg::Data {
-            lens: "watch".into(),
+            lens: LensKey::Watch,
             gen: 1,
             result: Ok(make_watch_state_data("a.com")),
         });
@@ -1819,7 +2013,7 @@ mod tests {
         let hidx = history_lens_idx();
         app.lens = hidx;
         // First entry → a History fetch is issued.
-        let a1 = app.fetch_current();
+        let a1 = app.fetch_current(false);
         assert!(
             matches!(
                 a1,
@@ -1836,7 +2030,7 @@ mod tests {
             LensState::Loaded(LensData::History(vec![])),
         );
         // Second entry → cache is dropped, so it fetches again (fresh disk read).
-        let a2 = app.fetch_current();
+        let a2 = app.fetch_current(false);
         assert!(
             matches!(
                 a2,
@@ -1853,7 +2047,7 @@ mod tests {
     fn history_fetches_without_a_domain() {
         let mut app = App::new(None); // no target domain
         app.lens = history_lens_idx();
-        let a = app.fetch_current();
+        let a = app.fetch_current(false);
         assert!(
             matches!(
                 a,
@@ -1904,16 +2098,16 @@ mod tests {
     #[test]
     fn domain_switch_invalidates_other_lenses_inflight_fetches() {
         let mut app = App::new(None);
-        let _ = app.set_domain_and_fetch("a.com");
+        let _ = app.set_domain_and_fetch("a.com".into());
         // Simulate an in-flight DNS fetch for a.com on a non-current lens.
         let dns_idx = lenses::find_by_cmd_or_key("dns").unwrap();
         let dns_key = lenses::lenses()[dns_idx].key;
         app.fetch_gen.insert(dns_key, 1);
         app.states.insert(dns_key, LensState::Loading);
         // Switch domains, then let the old domain's result land late.
-        let _ = app.set_domain_and_fetch("b.com");
+        let _ = app.set_domain_and_fetch("b.com".into());
         app.update(Msg::Data {
-            lens: "dns".into(),
+            lens: LensKey::Dns,
             gen: 1,
             result: Ok(empty_dig()),
         });
@@ -1980,7 +2174,7 @@ mod tests {
         let rdap: seer_core::RdapResponse =
             serde_json::from_str("{}").expect("empty RDAP object deserializes");
         app.update(Msg::Data {
-            lens: "rdap".into(),
+            lens: LensKey::Rdap,
             gen: 1,
             result: Ok(LensData::Rdap(Box::new(rdap))),
         });
@@ -2067,7 +2261,8 @@ mod tests {
     fn ctrl_c_on_history_pane_shows_quit_hint_instead_of_clearing() {
         let mut app = app_on_lens(None, "history");
         app.focus = Focus::Pane;
-        app.states.insert("history", make_history_state("old.com"));
+        app.states
+            .insert(LensKey::History, make_history_state("old.com"));
         let actions = chord(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert!(
             !actions
@@ -2146,7 +2341,7 @@ mod tests {
             })
             .expect("records fetch");
         app.update(Msg::Data {
-            lens: "dns".into(),
+            lens: LensKey::Dns,
             gen,
             result: Ok(empty_dig()),
         });
@@ -2179,7 +2374,7 @@ mod tests {
         let rdap = |app: &mut App, gen| {
             let r: seer_core::RdapResponse = serde_json::from_str("{}").unwrap();
             app.update(Msg::Data {
-                lens: "rdap".into(),
+                lens: LensKey::Rdap,
                 gen,
                 result: Ok(LensData::Rdap(Box::new(r))),
             });
@@ -2296,7 +2491,7 @@ mod tests {
             "↵ must re-run a.com ⇄ b.com, got {actions:?}"
         );
         // A new session target resets A to follow it again.
-        let _ = app.set_domain_and_fetch("new.com");
+        let _ = app.set_domain_and_fetch("new.com".into());
         assert!(app.panes.diff.a.is_empty());
     }
 
@@ -2358,7 +2553,7 @@ mod tests {
     fn enter_focuses_an_empty_watchlist_so_add_is_reachable() {
         let mut app = app_on_lens(None, "watch");
         app.states.insert(
-            "watch",
+            LensKey::Watch,
             LensState::Loaded(LensData::Watch(Box::new(seer_core::WatchReport {
                 checked_at: chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0).unwrap(),
                 results: vec![],
@@ -2401,7 +2596,8 @@ mod tests {
     #[test]
     fn copy_refuses_history_instead_of_copying_a_placeholder() {
         let mut app = app_on_lens(None, "history");
-        app.states.insert("history", make_history_state("old.com"));
+        app.states
+            .insert(LensKey::History, make_history_state("old.com"));
         let actions = key(&mut app, KeyCode::Char('y'));
         assert!(
             !actions.iter().any(|a| matches!(a, Action::Copy { .. })),
@@ -2419,7 +2615,7 @@ mod tests {
         ]);
         // History is never deep-cloned by the generic filter...
         assert!(crate::tui::filter::apply(&data, "beta").is_none());
-        app.states.insert("history", LensState::Loaded(data));
+        app.states.insert(LensKey::History, LensState::Loaded(data));
         let _ = app.apply_field(EditTarget::LensFilter, "beta".into());
         // ...yet the visible-row count still reflects the filter.
         assert_eq!(app.row_count(), 1);
@@ -2450,12 +2646,12 @@ mod tests {
     /// The DNS lens on `example.com`, its Records fetch answered with `data`.
     fn dns_app_with(data: LensData) -> App {
         let mut app = app_on_lens(Some("example.com"), "dns");
-        let actions = app.fetch_with_current();
+        let actions = app.fetch_with_current(false);
         let Some(Action::Fetch { gen, .. }) = actions.first() else {
             panic!("expected a Records fetch, got {actions:?}");
         };
         app.update(Msg::Data {
-            lens: "dns".into(),
+            lens: LensKey::Dns,
             gen: *gen,
             result: Ok(data),
         });
@@ -2503,7 +2699,7 @@ mod tests {
         let actions = key(&mut app, KeyCode::Char('s'));
         let gen = fetch_gen_of(&actions);
         app.update(Msg::Data {
-            lens: "dns".into(),
+            lens: LensKey::Dns,
             gen,
             result: Ok(chained_dig(1)),
         });
@@ -2550,7 +2746,7 @@ mod tests {
     fn the_trace_tab_fetches_a_trace_and_drops_a_late_records_result() {
         let mut app = app_on_lens(Some("example.com"), "dns");
         app.panes.dns.record_type = RecordType::MX;
-        let records_gen = fetch_gen_of(&app.fetch_with_current());
+        let records_gen = fetch_gen_of(&app.fetch_with_current(false));
         // `[` from Records wraps round to the last tab.
         let actions = key(&mut app, KeyCode::Char('['));
         assert_eq!(app.tab, 3);
@@ -2570,14 +2766,14 @@ mod tests {
         let trace_gen = fetch_gen_of(&actions);
         // The Records query started before the tab switch lands late.
         app.update(Msg::Data {
-            lens: "dns".into(),
+            lens: LensKey::Dns,
             gen: records_gen,
             result: Ok(chained_dig(1)),
         });
         assert!(matches!(app.state_of(app.lens), LensState::Loading));
         let trace = crate::payload::fixtures::trace(vec![], None);
         app.update(Msg::Data {
-            lens: "dns".into(),
+            lens: LensKey::Dns,
             gen: trace_gen,
             result: Ok(LensData::Trace(Box::new(trace))),
         });
@@ -2696,7 +2892,7 @@ mod tests {
 
         // A `:dig` that stays on Records keeps it, like a refresh.
         let mut app = dns_app_with(chained_dig(3));
-        app.lens_filter.insert("dns", "192.0.2.3".into());
+        app.lens_filter.insert(LensKey::Dns, "192.0.2.3".into());
         app.exec_command("dig example.com");
         assert_eq!(app.tab, 0);
         assert_eq!(app.active_filter(), "192.0.2.3");
@@ -2723,5 +2919,222 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(text).expect("one JSON object");
         assert_eq!(value["status"], "NOERROR");
         assert_eq!(value["answers"][1]["name"], "edge.cdn.test");
+    }
+
+    fn has_fetch(actions: &[Action]) -> bool {
+        actions.iter().any(|a| matches!(a, Action::Fetch { .. }))
+    }
+
+    /// Navigating onto Subdomains or Takeover used to start a CT-log query
+    /// (and, for Takeover, HTTP probes) on every pass through the nav.
+    #[test]
+    fn heavy_lenses_wait_for_enter_instead_of_scanning_on_nav() {
+        for lens in [LensKey::Subdomains, LensKey::Takeover] {
+            let mut app = App::new(Some("example.com".into()));
+            let _ = app.take_startup_actions();
+            // Walk the nav down onto the heavy lens.
+            let mut landed = vec![];
+            while app.current_lens().key != lens {
+                landed = key(&mut app, KeyCode::Char('j'));
+            }
+            assert!(
+                !has_fetch(&landed),
+                "{lens:?} must not auto-run: {landed:?}"
+            );
+            assert!(matches!(app.state_of(app.lens), LensState::Idle));
+            // ↵ runs it, without leaving the nav.
+            let actions = key(&mut app, KeyCode::Enter);
+            assert!(has_fetch(&actions), "{lens:?}: {actions:?}");
+            assert!(matches!(app.state_of(app.lens), LensState::Loading));
+            // Once run, revisiting serves the cache rather than re-running.
+            key(&mut app, KeyCode::Char('k'));
+            assert!(!has_fetch(&key(&mut app, KeyCode::Char('j'))));
+        }
+        // A command is an explicit request: it runs at once.
+        let mut app = App::new(Some("example.com".into()));
+        let _ = app.take_startup_actions();
+        app.input_mode = InputMode::Command("subdomains".into());
+        assert!(has_fetch(&key(&mut app, KeyCode::Enter)));
+    }
+
+    /// A new target, tab or request supersedes a lens's fetch: the cancel
+    /// comes before any new fetch, so it cannot abort the replacement.
+    #[test]
+    fn superseded_fetches_are_cancelled_before_their_replacement() {
+        let mut app = App::new(Some("a.com".into()));
+        let _ = app.take_startup_actions();
+        key(&mut app, KeyCode::Char('2')); // WHOIS in flight too
+        let actions = app.update(Msg::Input(Event::Paste(String::new())));
+        assert!(actions.is_empty(), "a no-op update cancels nothing");
+        app.input_mode = InputMode::Field {
+            target: EditTarget::Target,
+            buf: "b.com".into(),
+        };
+        let actions = key(&mut app, KeyCode::Enter);
+        assert_eq!(app.domain.as_deref(), Some("b.com"));
+        let first_fetch = actions
+            .iter()
+            .position(|a| matches!(a, Action::Fetch { .. }))
+            .expect("the new target fetches");
+        for lens in [LensKey::Overview, LensKey::Whois] {
+            let cancel = actions
+                .iter()
+                .position(|a| matches!(a, Action::CancelFetch(k) if *k == lens))
+                .unwrap_or_else(|| panic!("{lens:?} not cancelled: {actions:?}"));
+            assert!(cancel < first_fetch, "{actions:?}");
+        }
+        // A tab switch supersedes the old tab's fetch.
+        app.lens = LensKey::Rdap.index();
+        let actions = key(&mut app, KeyCode::Char(']'));
+        assert!(matches!(
+            actions.first(),
+            Some(Action::CancelFetch(LensKey::Rdap))
+        ));
+    }
+
+    /// `g`/`G` in the nav (and replaying a watch/history row, and the `/`
+    /// target) changed lens but kept the old tab, so the cache check saw a
+    /// tab mismatch and refetched — an Overview refetch records history
+    /// again.
+    #[test]
+    fn every_lens_change_resets_tab_and_selection() {
+        let mut app = App::new(Some("example.com".into()));
+        let _ = app.take_startup_actions();
+        app.update(Msg::Data {
+            lens: LensKey::Overview,
+            gen: 1,
+            result: Ok(empty_dig()),
+        });
+        assert!(matches!(app.state_of(0), LensState::Loaded(_)));
+        // Onto the DNS lens's Trace tab, then back with `g`.
+        app.lens = LensKey::Dns.index();
+        app.tab = 3;
+        app.sel = 4;
+        let actions = key(&mut app, KeyCode::Char('g'));
+        assert_eq!((app.lens, app.tab, app.sel), (0, 0, 0));
+        assert!(
+            !has_fetch(&actions),
+            "the cached Overview is served: {actions:?}"
+        );
+        // `G` likewise lands on tab 0.
+        app.tab = 2;
+        key(&mut app, KeyCode::Char('G'));
+        assert_eq!((app.tab, app.sel), (0, 0));
+        // The `/` target from a tabbed lens: same domain, cached Overview.
+        app.lens = LensKey::Dns.index();
+        app.tab = 3;
+        key(&mut app, KeyCode::Char('/'));
+        let actions = key(&mut app, KeyCode::Enter);
+        assert_eq!((app.lens, app.tab), (0, 0));
+        assert!(!has_fetch(&actions), "{actions:?}");
+    }
+
+    /// An invalid target used to become the session domain lowercased as
+    /// typed; it is refused, and the previous target stays.
+    #[test]
+    fn invalid_targets_are_refused_and_ip_literals_accepted() {
+        let mut app = App::new(Some("example.com".into()));
+        let _ = app.take_startup_actions();
+        key(&mut app, KeyCode::Char('/'));
+        app.input_mode = InputMode::Field {
+            target: EditTarget::Target,
+            buf: "not a domain!".into(),
+        };
+        let actions = key(&mut app, KeyCode::Enter);
+        assert!(actions.is_empty(), "{actions:?}");
+        assert_eq!(app.domain.as_deref(), Some("example.com"));
+        assert!(matches!(&app.toast, Some(t) if t.tone == "fail"));
+
+        // `:reverse 2001:db8::1` — an IPv6 literal is a valid target.
+        key(&mut app, KeyCode::Char(':'));
+        app.input_mode = InputMode::Command("reverse 2001:DB8::1".into());
+        let actions = key(&mut app, KeyCode::Enter);
+        assert_eq!(app.domain.as_deref(), Some("2001:db8::1"));
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            Action::Fetch { req: FetchReq::Reverse(ip), .. } if ip == "2001:db8::1"
+        )));
+        // A wildcard query name is valid for `:dig`.
+        app.input_mode = InputMode::Command("dig *.example.com".into());
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.domain.as_deref(), Some("*.example.com"));
+    }
+
+    #[test]
+    fn pasted_control_characters_become_spaces() {
+        let mut app = App::new(None);
+        key(&mut app, KeyCode::Char('/'));
+        app.update(Msg::Input(Event::Paste(
+            "a.com\r\nb.com\tc\u{1b}[2J".into(),
+        )));
+        let InputMode::Field { buf, .. } = &app.input_mode else {
+            panic!("field closed");
+        };
+        assert_eq!(buf.as_str(), "a.com  b.com c [2J");
+    }
+
+    /// An idle tick used to redraw the whole frame ten times a second.
+    #[test]
+    fn idle_ticks_do_not_redraw() {
+        let mut app = App::new(None);
+        assert!(app.take_redraw(), "the first frame");
+        app.update(Msg::Tick);
+        assert!(!app.take_redraw(), "nothing animates");
+        key(&mut app, KeyCode::Char('j'));
+        assert!(app.take_redraw(), "input changes the frame");
+        // A toast redraws when it appears and when it expires, not between.
+        app.set_toast("ok", "hi");
+        for _ in 0..TOAST_TICKS - 1 {
+            app.update(Msg::Tick);
+            assert!(!app.take_redraw());
+        }
+        app.update(Msg::Tick);
+        assert!(app.toast.is_none());
+        assert!(app.take_redraw(), "the expired toast must be cleared");
+        // A loading lens animates its spinner.
+        app.states
+            .insert(app.current_lens().key, LensState::Loading);
+        app.update(Msg::Tick);
+        assert!(app.take_redraw());
+    }
+
+    /// The CLI's `output_format = "json"` used to open the TUI in the raw
+    /// view on every lens.
+    #[test]
+    fn a_session_opens_on_the_rendered_view() {
+        assert_eq!(App::new(None).format, OutputFormat::Human);
+    }
+
+    #[test]
+    fn the_raw_view_scrolls_and_resets_on_lens_change() {
+        let mut app = App::new(None);
+        app.lens = LensKey::Dns.index();
+        app.update(Msg::Data {
+            lens: LensKey::Dns,
+            gen: 0,
+            result: Ok(chained_dig(3)),
+        });
+        key(&mut app, KeyCode::Char('r'));
+        assert!(app.raw_view());
+        let lines = app.raw_line_count() as u16;
+        assert!(lines > PAGE_ROWS, "fixture too short: {lines}");
+        key(&mut app, KeyCode::PageDown);
+        assert_eq!(app.raw_scroll, PAGE_ROWS);
+        // j/k scroll once the raw view is focused.
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.focus, Focus::Pane);
+        key(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.raw_scroll, PAGE_ROWS + 1);
+        key(&mut app, KeyCode::Char('k'));
+        key(&mut app, KeyCode::PageUp);
+        key(&mut app, KeyCode::PageUp);
+        assert_eq!(app.raw_scroll, 0, "clamped at the top");
+        for _ in 0..(lines / PAGE_ROWS + 3) {
+            key(&mut app, KeyCode::PageDown);
+        }
+        assert_eq!(app.raw_scroll, lines - 1, "clamped at the last line");
+        key(&mut app, KeyCode::Esc);
+        key(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.raw_scroll, 0, "another lens starts at its top");
     }
 }

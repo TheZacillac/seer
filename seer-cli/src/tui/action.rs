@@ -3,6 +3,8 @@
 use crossterm::event::Event;
 use seer_core::RecordType;
 
+pub use crate::tui::lenses::LensKey;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Focus {
     #[default]
@@ -91,25 +93,27 @@ pub enum FetchReq {
 
 impl FetchReq {
     /// The registry lens key this request's result belongs to.
-    pub fn lens_key(&self) -> &'static str {
+    pub fn lens_key(&self) -> LensKey {
         match self {
-            FetchReq::Overview(_) => "overview",
-            FetchReq::Whois(_) => "whois",
-            FetchReq::RdapDomain(_) | FetchReq::RdapIp(_) | FetchReq::RdapAsn(_) => "rdap",
-            FetchReq::Dns { .. } => "dns",
-            FetchReq::Dnssec(_) | FetchReq::Compare { .. } | FetchReq::Trace { .. } => "dns",
-            FetchReq::Ssl(_) => "ssl",
-            FetchReq::Status(_) => "status",
-            FetchReq::Prop(_) => "propagation",
-            FetchReq::Reverse(_) => "reverse",
-            FetchReq::Avail(_) => "avail",
-            FetchReq::Tld(_) => "tld",
-            FetchReq::Diff { .. } => "diff",
-            FetchReq::Watch => "watch",
-            FetchReq::History => "history",
-            FetchReq::Subdomains(_) => "subdomains",
-            FetchReq::Headers(_) => "headers",
-            FetchReq::Takeover(_) => "takeover",
+            FetchReq::Overview(_) => LensKey::Overview,
+            FetchReq::Whois(_) => LensKey::Whois,
+            FetchReq::RdapDomain(_) | FetchReq::RdapIp(_) | FetchReq::RdapAsn(_) => LensKey::Rdap,
+            FetchReq::Dns { .. }
+            | FetchReq::Dnssec(_)
+            | FetchReq::Compare { .. }
+            | FetchReq::Trace { .. } => LensKey::Dns,
+            FetchReq::Ssl(_) => LensKey::Ssl,
+            FetchReq::Status(_) => LensKey::Status,
+            FetchReq::Prop(_) => LensKey::Propagation,
+            FetchReq::Reverse(_) => LensKey::Reverse,
+            FetchReq::Avail(_) => LensKey::Avail,
+            FetchReq::Tld(_) => LensKey::Tld,
+            FetchReq::Diff { .. } => LensKey::Diff,
+            FetchReq::Watch => LensKey::Watch,
+            FetchReq::History => LensKey::History,
+            FetchReq::Subdomains(_) => LensKey::Subdomains,
+            FetchReq::Headers(_) => LensKey::Headers,
+            FetchReq::Takeover(_) => LensKey::Takeover,
         }
     }
 
@@ -181,6 +185,10 @@ pub enum Action {
         req: FetchReq,
         gen: u64,
     },
+    /// Abort the lens's in-flight fetch: its generation moved on (new
+    /// target, tab or request), so its result would be dropped anyway, and
+    /// an active scan should not keep probing hosts for nothing.
+    CancelFetch(LensKey),
     Copy {
         text: String,
         label: String,
@@ -197,8 +205,11 @@ pub enum Action {
         path: String,
         gen: u64,
     },
+    /// Export bulk results. `name` is the preferred file name in the working
+    /// directory; an existing file is never overwritten (`mod.rs` picks the
+    /// first free `-N` suffix).
     WriteCsv {
-        path: String,
+        name: String,
         contents: String,
     },
     /// Add or remove a domain from the watchlist. Handled in `mod.rs`.
@@ -233,7 +244,7 @@ pub enum Msg {
     Input(Event),
     Tick,
     Data {
-        lens: String,
+        lens: LensKey,
         gen: u64,
         result: Result<LensData, String>,
     },
