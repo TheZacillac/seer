@@ -4,6 +4,7 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Row, Table};
 use ratatui::Frame;
+use seer_core::output::sanitize_line;
 
 use crate::tui::action::LensData;
 use crate::tui::theme::Theme;
@@ -39,9 +40,14 @@ pub fn render(
         .map(|(i, e)| {
             let when = e.timestamp.format("%Y-%m-%d %H:%M").to_string();
             let source = crate::ops::lookup_source(&e.result).unwrap_or("—");
-            let registrar = or_dash(e.result.registrar());
-            Row::new(vec![when, e.domain.clone(), source.to_string(), registrar])
-                .style(row_style(theme, focused && i == sel))
+            let registrar = sanitize_line(&or_dash(e.result.registrar()));
+            Row::new(vec![
+                when,
+                sanitize_line(&e.domain),
+                source.to_string(),
+                registrar,
+            ])
+            .style(row_style(theme, focused && i == sel))
         });
 
     let table = Table::new(
@@ -61,7 +67,7 @@ pub fn render(
     // Hint line
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "↵ replay · c clear",
+            "↵ replay · c clear all (press twice)",
             Style::default().fg(theme.overlay0),
         ))),
         chunks[1],

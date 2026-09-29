@@ -6,6 +6,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Row, Table};
 use ratatui::Frame;
+use seer_core::output::sanitize_line;
 
 use crate::tui::action::{LensData, LensState};
 use crate::tui::line_editor::LineEditor;
@@ -55,13 +56,13 @@ pub fn render(
     let b = loaded.map(|d| d.domain_b.as_str()).unwrap_or(b);
     let (b_text, b_color) = match editing {
         Some(buf) => (buf.with_caret("▏"), theme.text),
-        None if !b.is_empty() => (b.to_string(), theme.text),
+        None if !b.is_empty() => (sanitize_line(b), theme.text),
         None => ("[ press e ]".to_string(), theme.overlay0),
     };
     f.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled("A · ", Style::default().fg(theme.overlay0)),
-            Span::styled(a.to_string(), Style::default().fg(theme.text)),
+            Span::styled(sanitize_line(a), Style::default().fg(theme.text)),
             Span::styled("   ⇄   ", Style::default().fg(theme.yellow)),
             Span::styled("B · ", Style::default().fg(theme.overlay0)),
             Span::styled(b_text, Style::default().fg(b_color)),
@@ -98,9 +99,10 @@ pub fn render(
         LensState::Error(msg) => {
             f.render_widget(
                 Paragraph::new(Line::from(Span::styled(
-                    msg.clone(),
+                    sanitize_line(msg),
                     Style::default().fg(theme.red),
-                ))),
+                )))
+                .wrap(ratatui::widgets::Wrap { trim: false }),
                 chunks[2],
             );
         }
@@ -125,13 +127,18 @@ pub fn render(
 
 /// Both sides of an optional diff field, with missing values dashed.
 fn pair<T: Display>((a, b): &(Option<T>, Option<T>)) -> (String, String) {
-    (or_dash(a.as_ref()), or_dash(b.as_ref()))
+    (
+        sanitize_line(&or_dash(a.as_ref())),
+        sanitize_line(&or_dash(b.as_ref())),
+    )
 }
 
 /// The FIELD | A | B comparison table for a completed diff.
 fn comparison_table(f: &mut Frame, area: Rect, theme: &Theme, d: &seer_core::diff::DomainDiff) {
     let (reg, dns, ssl) = (&d.registration, &d.dns, &d.ssl);
-    let joined = |(a, b): &(Vec<String>, Vec<String>)| (a.join(", "), b.join(", "));
+    let joined = |(a, b): &(Vec<String>, Vec<String>)| {
+        (sanitize_line(&a.join(", ")), sanitize_line(&b.join(", ")))
+    };
     let raw = [
         ("registrar", pair(&reg.registrar)),
         ("organization", pair(&reg.organization)),

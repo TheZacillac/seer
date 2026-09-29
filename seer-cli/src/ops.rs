@@ -265,6 +265,14 @@ pub async fn follow_command(
     Ok(())
 }
 
+/// Serializes this process's load→modify→save cycles on the `~/.seer`
+/// stores (history, watchlist): two overlapping cycles each save their own
+/// snapshot, so the later save silently undoes the earlier one's change.
+/// The TUI records history, clears it and edits the watchlist concurrently.
+/// Move the guard into the blocking closure, so a cancelled caller cannot
+/// release it while the orphaned write still runs.
+pub static STORE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Records a lookup result to the `~/.seer` history off the async executor
 /// (the file I/O is blocking). The caller decides what a failure means: a
 /// plain lookup's history is best-effort and only warns, while `drift
@@ -274,7 +282,9 @@ pub async fn record_lookup_history(
     result: seer_core::LookupResult,
 ) -> seer_core::Result<()> {
     let domain = domain.to_string();
+    let store = STORE_LOCK.lock().await;
     tokio::task::spawn_blocking(move || {
+        let _store = store;
         let mut history = seer_core::LookupHistory::load();
         history.record(&domain, result);
         history.save()
@@ -307,7 +317,9 @@ pub async fn load_history() -> Result<seer_core::LookupHistory, String> {
 
 /// Empties the `~/.seer` lookup history.
 pub async fn clear_history() -> Result<(), String> {
-    state_io("clear history", || {
+    let store = STORE_LOCK.lock().await;
+    state_io("clear history", move || {
+        let _store = store;
         let mut history = seer_core::LookupHistory::load();
         history.clear();
         history.save()

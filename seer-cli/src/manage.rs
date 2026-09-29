@@ -7,7 +7,7 @@ use seer_core::colors::CatppuccinExt;
 use seer_core::output::OutputFormat;
 use serde::Serialize;
 
-use crate::ops::{load_history, load_watchlist, state_io};
+use crate::ops::{load_history, load_watchlist, state_io, STORE_LOCK};
 
 /// A local-state command's result: `text` for human (and markdown) output,
 /// `data` for the structured formats.
@@ -65,6 +65,9 @@ pub async fn watch_edit(action: &str, domains: &[String], cmd: &str) -> Result<L
         return Err(format!("Usage: {} {} <domain>...", cmd, action));
     }
 
+    // Held from load to save (and moved into the write) so a concurrent
+    // store edit cannot interleave; see `STORE_LOCK`.
+    let store = STORE_LOCK.lock().await;
     let mut watchlist = load_watchlist().await?;
     let mut changes = Vec::with_capacity(domains.len());
     for domain in domains {
@@ -82,7 +85,11 @@ pub async fn watch_edit(action: &str, domains: &[String], cmd: &str) -> Result<L
         });
     }
     if changes.iter().any(|c| c.changed) {
-        state_io("save watchlist", move || watchlist.save()).await?;
+        state_io("save watchlist", move || {
+            let _store = store;
+            watchlist.save()
+        })
+        .await?;
     }
     let text = changes
         .iter()

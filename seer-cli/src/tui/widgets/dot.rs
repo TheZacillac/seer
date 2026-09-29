@@ -1,15 +1,21 @@
 //! Colored status dot + label.
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
+use seer_core::output::sanitize_line;
 
 use crate::tui::theme::Theme;
 
-/// `● label` colored by tone. `wait` uses a half-circle glyph.
+/// `● label` colored by tone. `wait` uses a half-circle glyph. Labels often
+/// quote remote data (certificate warnings, header advisories), so they are
+/// sanitized.
 pub fn line<'a>(theme: &Theme, tone: &str, label: impl Into<String>) -> Line<'a> {
     let glyph = if tone == "wait" { "◐ " } else { "● " };
     Line::from(vec![
         Span::styled(glyph, Style::default().fg(theme.tone(tone))),
-        Span::styled(label.into(), Style::default().fg(theme.tone(tone))),
+        Span::styled(
+            sanitize_line(&label.into()),
+            Style::default().fg(theme.tone(tone)),
+        ),
     ])
 }
 

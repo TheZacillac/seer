@@ -4,6 +4,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Row, Table};
 use ratatui::Frame;
+use seer_core::output::sanitize_line;
 
 use crate::tui::action::LensData;
 use crate::tui::theme::Theme;
@@ -39,10 +40,9 @@ pub fn render(
 
     let header = Row::new(["HOST"]).style(Style::default().fg(theme.overlay0));
 
-    let rows =
-        s.subdomains.iter().enumerate().map(|(i, host)| {
-            Row::new(vec![host.clone()]).style(row_style(theme, focused && i == sel))
-        });
+    let rows = s.subdomains.iter().enumerate().map(|(i, host)| {
+        Row::new(vec![sanitize_line(host)]).style(row_style(theme, focused && i == sel))
+    });
 
     let table = Table::new(rows, [Constraint::Percentage(100)])
         .header(header)

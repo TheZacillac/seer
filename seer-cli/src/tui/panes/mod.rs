@@ -15,7 +15,7 @@ pub use tld::TldState;
 
 use crossterm::event::KeyEvent;
 
-use crate::tui::action::{Action, EditTarget, FetchReq};
+use crate::tui::action::{Action, EditTarget, FetchReq, LensKey};
 
 #[derive(Debug)]
 pub enum PaneOutcome {
@@ -26,7 +26,7 @@ pub enum PaneOutcome {
     /// Show a transient toast (App calls `set_toast`).
     Toast {
         tone: &'static str,
-        msg: &'static str,
+        msg: String,
     },
 }
 
@@ -46,21 +46,21 @@ impl Panes {
     /// CRITICAL: never swallow `Esc` — components must return `None` for it.
     pub fn handle_key(
         &mut self,
-        lens_key: &str,
+        lens_key: LensKey,
         tab: usize,
         key: KeyEvent,
         domain: Option<&str>,
     ) -> Option<PaneOutcome> {
         match lens_key {
-            "tld" => self.tld.handle_key(key),
-            "dns" => match tab {
+            LensKey::Tld => self.tld.handle_key(key),
+            LensKey::Dns => match tab {
                 0 => self.dns.handle_key(key, domain),
                 2 => self.compare.handle_key(key, domain),
                 _ => None,
             },
-            "diff" => self.diff.handle_key(key, domain),
-            "follow" => self.follow.handle_key(key, domain),
-            "bulk" => self.bulk.handle_key(key),
+            LensKey::Diff => self.diff.handle_key(key, domain),
+            LensKey::Follow => self.follow.handle_key(key, domain),
+            LensKey::Bulk => self.bulk.handle_key(key),
             _ => None,
         }
     }

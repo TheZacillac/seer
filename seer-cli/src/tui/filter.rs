@@ -1,5 +1,6 @@
 //! Case-insensitive in-lens row filtering for the table lenses (subdomains,
-//! history, propagation, takeover, and the DNS lens's Records tab).
+//! history, propagation, takeover, and the DNS lens's Records tab — which
+//! lenses and tabs accept `/` is the `filter` flag of their `LENSES` entry).
 //!
 //! [`apply`] returns a filtered clone of the lens data; it is used by BOTH the
 //! renderer and `App::row_count`, so the displayed rows, the selection index
@@ -22,16 +23,6 @@ use crate::tui::action::LensData;
 /// matches everything.
 pub fn matches(text: &str, filter: &str) -> bool {
     filter.is_empty() || text.to_lowercase().contains(&filter.to_lowercase())
-}
-
-/// Whether a lens's sub-`tab` supports in-lens `/`-filtering. Of the DNS
-/// lens's tabs only Records lists rows.
-pub fn is_filterable(lens_key: &str, tab: usize) -> bool {
-    match lens_key {
-        "subdomains" | "history" | "propagation" | "takeover" => true,
-        "dns" => tab == 0,
-        _ => false,
-    }
 }
 
 /// The filterable text for a history row (mirrors the columns the lens shows).
@@ -161,19 +152,6 @@ mod tests {
         assert!(!matches("host.example.com", "zzz"));
     }
 
-    #[test]
-    fn is_filterable_covers_the_table_lenses() {
-        assert!(is_filterable("subdomains", 0));
-        assert!(is_filterable("history", 0));
-        assert!(is_filterable("propagation", 0));
-        assert!(!is_filterable("whois", 0));
-        // DNS: Records only — DNSSEC, Compare and Trace list no rows.
-        assert!(is_filterable("dns", 0));
-        for tab in 1..=3 {
-            assert!(!is_filterable("dns", tab), "tab {tab}");
-        }
-    }
-
     fn chained() -> seer_core::DnsQueryResult {
         use crate::payload::fixtures;
         fixtures::dig(
@@ -246,11 +224,6 @@ mod tests {
         // otherwise the title claims findings the table no longer shows.
         assert_eq!(t.vulnerable, 1);
         assert_eq!(t.potential, 1);
-    }
-
-    #[test]
-    fn takeover_is_filterable() {
-        assert!(is_filterable("takeover", 0));
     }
 
     #[test]

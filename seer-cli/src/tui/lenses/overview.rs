@@ -4,6 +4,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
+use seer_core::output::sanitize_line;
 
 use seer_core::output::{availability_label, Emphasis};
 use seer_core::LookupResult;
@@ -42,7 +43,7 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
     f.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(
-                result.domain_name().unwrap_or_default(),
+                sanitize_line(&result.domain_name().unwrap_or_default()),
                 Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
             ),
             Span::raw("  "),

@@ -4,6 +4,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Row, Table};
 use ratatui::Frame;
+use seer_core::output::sanitize_line;
 
 use crate::tui::app::SPIN;
 use crate::tui::panes::FollowState;
@@ -87,11 +88,11 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, follow: &FollowState, sp
         let (a_record, delta) = if !it.success() {
             let msg = it.error.as_deref().unwrap_or("error");
             (
-                msg.chars().take(40).collect::<String>(),
+                sanitize_line(msg).chars().take(40).collect::<String>(),
                 dot::line(theme, "fail", "ERROR"),
             )
         } else {
-            let a = or_dash(it.records.first().map(|r| r.format_short()));
+            let a = sanitize_line(&or_dash(it.records.first().map(|r| r.format_short())));
             let d = if it.changed {
                 dot::line(theme, "warn", "CHANGED")
             } else {

@@ -193,6 +193,18 @@ pub async fn run(
     config: &SeerConfig,
     spin: bool,
 ) -> seer_core::Result<Outcome> {
+    // One arm per command makes the pipeline's state machine tens of KB;
+    // boxing it keeps every caller's future (REPL dispatch, TUI fetch task)
+    // pointer-sized instead of nesting that inline on the stack.
+    Box::pin(run_query(query, clients, config, spin)).await
+}
+
+async fn run_query(
+    query: Query,
+    clients: &Clients,
+    config: &SeerConfig,
+    spin: bool,
+) -> seer_core::Result<Outcome> {
     let spinner = |message: String| Spinner::maybe(spin, &message);
     let payload = match query {
         Query::Lookup(domain) => {
