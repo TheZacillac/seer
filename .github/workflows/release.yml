@@ -127,6 +127,12 @@ jobs:
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
             echo "$HOME/.cargo/bin" >> $GITHUB_PATH
           fi
+      - name: "Exclude the build from Windows Defender scanning"
+        if: "runner.os == 'Windows'"
+        run: |
+          Add-MpPreference -ExclusionPath $env:GITHUB_WORKSPACE, (Join-Path $env:USERPROFILE ".cargo")
+          Get-MpPreference | Select-Object -ExpandProperty ExclusionPath
+        shell: "pwsh"
       - name: Install dist
         run: ${{ matrix.install_dist.run }}
       # Get the dist-manifest

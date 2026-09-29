@@ -459,7 +459,12 @@ libc/libm/libgcc_s on Linux.
 - **`[profile.dist]`** (cargo-dist release artifacts): inherits release but
   turns LTO off (`codegen-units = 16`) — LTO intermediate objects
   deterministically tripped Windows Defender on GitHub's windows runners — and
-  sets `panic = "abort"` (−21% on the shipped binary). cargo-dist builds the
+  sets `panic = "abort"` (−21% on the shipped binary). Defender's real-time
+  scan still broke the v0.50.0 Windows release link (`LNK1201` writing
+  `seer.pdb`, twice), so `.github/build-setup.yml` — wired in through
+  `github-build-setup` in `dist-workspace.toml`, then `dist generate` —
+  excludes the workspace and the cargo home from the scan on Windows build
+  jobs. cargo-dist builds the
   whole workspace, so seer-py is compiled with abort too, but only the CLI is
   shipped; the Python extension users get comes from maturin with
   `[profile.release]`, which unwinds. Never move abort into
