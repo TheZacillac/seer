@@ -98,8 +98,7 @@ impl DomainDiffer {
             Box::pin(self.status_client.check(&domain_b)),
         );
 
-        let registration =
-            build_registration_diff(lookup_a.as_ref().ok(), lookup_b.as_ref().ok());
+        let registration = build_registration_diff(lookup_a.as_ref().ok(), lookup_b.as_ref().ok());
         let dns = build_dns_diff(status_a.as_ref().ok(), status_b.as_ref().ok());
         let ssl = build_ssl_diff(status_a.as_ref().ok(), status_b.as_ref().ok());
 
@@ -130,7 +129,10 @@ fn failures(legs: &[(&str, &str, Option<&SeerError>)]) -> Vec<String> {
         .filter_map(|(domain, check, failure)| {
             let e = (*failure)?;
             debug!(%domain, error = %e, "{check} failed");
-            Some(format!("{domain}: {check} failed: {}", e.sanitized_message()))
+            Some(format!(
+                "{domain}: {check} failed: {}",
+                e.sanitized_message()
+            ))
         })
         .collect()
 }
