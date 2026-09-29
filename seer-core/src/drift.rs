@@ -112,13 +112,21 @@ impl DriftReport {
             }
         };
 
-        push("registrar", old.registrar.clone(), new.registrar.clone());
-        push(
-            "organization",
-            old.organization.clone(),
-            new.organization.clone(),
-        );
-        push("registrant", old.registrant.clone(), new.registrant.clone());
+        // Contact fields are only comparable when BOTH sides report them:
+        // RDAP and WHOIS (and registries' redaction) differ in which of them
+        // they carry, so a value missing on one side after a source flip is
+        // not a transfer or a registrant change.
+        for (field, o, n) in [
+            ("registrar", &old.registrar, &new.registrar),
+            ("organization", &old.organization, &new.organization),
+            ("registrant", &old.registrant, &new.registrant),
+        ] {
+            if let (Some(o), Some(n)) = (o, n) {
+                if contact_key(o) != contact_key(n) {
+                    push(field, Some(o.clone()), Some(n.clone()));
+                }
+            }
+        }
         push(
             "nameservers",
             joined_set(&old.nameservers),
@@ -177,6 +185,16 @@ fn status_key(code: &str) -> String {
         .filter(|c| c.is_ascii_alphanumeric())
         .map(|c| c.to_ascii_lowercase())
         .collect()
+}
+
+/// A contact value (registrar, organization, registrant) in comparable form:
+/// case and whitespace runs are spelling, not a change.
+fn contact_key(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
 }
 
 /// DNSSEC state reduced to signed (`true`) / unsigned (`false`), or `None`
@@ -307,6 +325,35 @@ mod tests {
         let new = snapshot("R", &["ns1.example.com"], "Unsigned");
         let report = DriftReport::between("example.com", &old, &new);
         assert!(report.changes.iter().any(|c| c.field == "dnssec"));
+    }
+
+    #[test]
+    fn one_sided_contact_absence_is_not_drift() {
+        // RDAP → WHOIS flip: the WHOIS side lacks organization/registrant
+        // (and a thin record even the registrar). Used to exit 1 as drift.
+        let mut old = snapshot("Example Registrar, Inc.", &["ns1.example.com"], "signed");
+        old.organization = Some("Example Org".to_string());
+        old.registrant = Some("Jane Doe".to_string());
+        let mut new = snapshot("R", &["ns1.example.com"], "signed");
+        new.registrar = None;
+        let report = DriftReport::between("example.com", &old, &new);
+        assert!(!report.has_drift(), "{:?}", report.changes);
+
+        // Case/whitespace is spelling, not a transfer.
+        let new = snapshot("EXAMPLE  Registrar, Inc.", &["ns1.example.com"], "signed");
+        assert!(!DriftReport::between("example.com", &old, &new).has_drift());
+
+        // A value on both sides that differs is still caught.
+        let mut new = snapshot("Example Registrar, Inc.", &["ns1.example.com"], "signed");
+        new.registrant = Some("Mallory".to_string());
+        let report = DriftReport::between("example.com", &old, &new);
+        let change = report
+            .changes
+            .iter()
+            .find(|c| c.field == "registrant")
+            .expect("registrant change");
+        assert_eq!(change.old.as_deref(), Some("Jane Doe"));
+        assert_eq!(change.new.as_deref(), Some("Mallory"));
     }
 
     #[test]
