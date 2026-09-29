@@ -978,7 +978,7 @@ fn server_note(host: &Name, ip: IpAddr, reason: &str) -> String {
 /// then IPv6, each family in the order given. A later address is tried only
 /// when this host has no route to the earlier ones.
 fn ipv4_first(mut addrs: Vec<IpAddr>) -> Vec<IpAddr> {
-    addrs.sort_by_key(IpAddr::is_ipv6);
+    crate::net::ipv4_first(&mut addrs, |ip| *ip);
     addrs
 }
 

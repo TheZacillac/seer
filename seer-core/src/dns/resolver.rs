@@ -218,11 +218,9 @@ fn build_upstream_config(
     // IPv6 entries; with black-holed IPv6 transit they spent the whole
     // deadline and the IPv4 entries were never reached. IPv6 stays as
     // fallback: on an IPv6-only host IPv4 sends fail fast (ENETUNREACH).
-    let ordered = ips
-        .iter()
-        .filter(|ip| ip.is_ipv4())
-        .chain(ips.iter().filter(|ip| ip.is_ipv6()));
-    for ip in ordered {
+    let mut ordered = ips.to_vec();
+    crate::net::ipv4_first(&mut ordered, |ip| *ip);
+    for ip in &ordered {
         let mut ns = match spec.protocol {
             NameserverProtocol::Udp => NameServerConfig::udp(*ip),
             NameserverProtocol::Tls => NameServerConfig::tls(*ip, Arc::from(spec.tls_name())),

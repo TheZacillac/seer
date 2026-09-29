@@ -108,10 +108,14 @@ impl WebhookClient {
     /// # Returns
     /// * `Ok(WebhookDelivery)` - the endpoint answered 2xx
     /// * `Err(SeerError::InvalidInput)` - bad URL shape or SSRF-blocked host
+    /// * `Err(SeerError::DnsError)` - the endpoint's host could not be resolved
     /// * `Err(SeerError::JsonError)` - payload failed to serialize
     /// * `Err(SeerError::HttpError)` - endpoint answered non-2xx (the error
     ///   names the status; the response body is untrusted and never read)
     /// * `Err(SeerError::ReqwestError)` - transport failure (connect/timeout)
+    ///
+    /// No error carries the URL: webhook URLs routinely embed a secret token
+    /// in the path or query.
     pub async fn post_json<T: Serialize + ?Sized>(
         &self,
         url: &str,
@@ -143,12 +147,14 @@ impl WebhookClient {
             .build()
             .map_err(|e| SeerError::HttpError(format!("failed to build HTTP client: {}", e)))?;
 
+        // reqwest's error text includes the request URL; drop it.
         let response = client
             .post(url)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(body)
             .send()
-            .await?;
+            .await
+            .map_err(|e| SeerError::from(e.without_url()))?;
 
         let status = response.status();
         if !status.is_success() {
@@ -170,8 +176,9 @@ impl WebhookClient {
 /// `(host, port)` for the SSRF guard. Any port is allowed: the endpoint is
 /// operator configuration, not a server-supplied redirect.
 fn parse_webhook_url(url: &str) -> Result<(String, u16)> {
+    // The URL itself is never echoed: it may carry a secret token.
     let parsed = Url::parse(url)
-        .map_err(|e| SeerError::InvalidInput(format!("invalid webhook URL '{}': {}", url, e)))?;
+        .map_err(|e| SeerError::InvalidInput(format!("invalid webhook URL: {e}")))?;
 
     let scheme = parsed.scheme();
     if scheme != "http" && scheme != "https" {
@@ -182,7 +189,7 @@ fn parse_webhook_url(url: &str) -> Result<(String, u16)> {
     }
 
     let host = crate::net::url_host(&parsed)
-        .ok_or_else(|| SeerError::InvalidInput(format!("webhook URL '{}' has no host", url)))?;
+        .ok_or_else(|| SeerError::InvalidInput("webhook URL has no host".to_string()))?;
 
     // `port_or_known_default` always answers for http/https; the fallback
     // arm is unreachable but keeps the expression total.
@@ -411,5 +418,39 @@ mod tests {
             }
             other => panic!("expected ReqwestError from timeout, got {other:?}"),
         }
+    }
+
+    /// Regression: reqwest's transport-error text carries the request URL,
+    /// and webhook URLs embed secret tokens.
+    #[tokio::test]
+    async fn errors_never_carry_the_url() {
+        // Bind-and-drop: a loopback port with no listener refuses at once.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let client = WebhookClient::new().allowing_private_hosts();
+        let err = client
+            .post_json(
+                &format!("http://127.0.0.1:{port}/hooks/s3cr3t-token?key=hunter2"),
+                &serde_json::json!({}),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SeerError::ReqwestError { .. }), "got {err:?}");
+        let msg = err.to_string();
+        assert!(!msg.contains("s3cr3t-token"), "{msg}");
+        assert!(!msg.contains("hunter2"), "{msg}");
+
+        let err = client
+            .post_json("ftp://example.com/s3cr3t-token", &serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert!(!err.to_string().contains("s3cr3t-token"), "{err}");
+        let err = client
+            .post_json("http//s3cr3t-token", &serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert!(!err.to_string().contains("s3cr3t-token"), "{err}");
     }
 }
