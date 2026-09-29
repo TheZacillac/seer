@@ -7,9 +7,12 @@
 //! - `+short` / `+trace` switch those modes on; any other `+option` is an
 //!   error rather than silently ignored;
 //! - a record type (`A`, `mx`, `*` for ANY) with no dot in it is a type;
-//!   several may be given, repeats are dropped and the order kept;
+//!   several may be given, repeats are dropped and the order kept (a name
+//!   that spells a type is written with its trailing dot: `mx.`);
 //! - anything else is the name to query, and there must be exactly one
 //!   (`-x <ip>` supplies it for a reverse lookup).
+//!
+//! [`crate::dns_args`] reads `compare` and `follow` the same way.
 //!
 //! The flag spellings — `-s`/`--server`, `--short`, `--trace` and
 //! `-x`/`--reverse <ip>` — merge into the same [`DigArgs`]. clap parses them
@@ -69,6 +72,8 @@ pub fn parse<S: AsRef<str>>(tokens: &[S], flags: DigFlags) -> Result<DigArgs, St
     let mut reverse: Vec<String> = Vec::new();
     let mut names: Vec<&str> = Vec::new();
     let mut types: Vec<RecordType> = Vec::new();
+    // The type tokens as typed, for the no-name hint.
+    let mut type_tokens: Vec<&str> = Vec::new();
     let DigFlags {
         server,
         mut short,
@@ -125,6 +130,7 @@ pub fn parse<S: AsRef<str>>(tokens: &[S], flags: DigFlags) -> Result<DigArgs, St
                 }
             }
         } else if let Some(record_type) = record_type_token(token) {
+            type_tokens.push(token);
             if !types.contains(&record_type) {
                 types.push(record_type);
             }
@@ -142,7 +148,7 @@ pub fn parse<S: AsRef<str>>(tokens: &[S], flags: DigFlags) -> Result<DigArgs, St
             ))
         }
     };
-    let name = the_name(&reverse, &names)?;
+    let name = the_name(&reverse, &names, &type_tokens)?;
     let types = if reverse.is_empty() {
         if types.is_empty() {
             vec![RecordType::A]
@@ -218,7 +224,7 @@ impl DigArgs {
 
 /// A REPL flag that takes a value.
 #[derive(Clone, Copy)]
-enum Flag {
+pub(crate) enum Flag {
     Server,
     Reverse,
 }
@@ -227,7 +233,7 @@ enum Flag {
 /// its value when given inline — the spellings clap reads for `seer dig`:
 /// `--server=8.8.8.8`, and for a short flag `-s=8.8.8.8` or `-s8.8.8.8`
 /// (so `-short`, as in clap, is `-s hort`).
-fn flag_with_value(token: &str) -> Option<(Flag, &str, Option<&str>)> {
+pub(crate) fn flag_with_value(token: &str) -> Option<(Flag, &str, Option<&str>)> {
     let (name, inline) = if token.starts_with("--") {
         match token.split_once('=') {
             Some((name, value)) => (name, Some(value)),
@@ -251,7 +257,7 @@ fn flag_with_value(token: &str) -> Option<(Flag, &str, Option<&str>)> {
 
 /// The record type a token names, if it is one. A token with a dot is always
 /// a name, so a type is never mistaken for part of a domain.
-fn record_type_token(token: &str) -> Option<RecordType> {
+pub(crate) fn record_type_token(token: &str) -> Option<RecordType> {
     if token.contains('.') {
         return None;
     }
@@ -259,12 +265,14 @@ fn record_type_token(token: &str) -> Option<RecordType> {
 }
 
 /// A nameserver spec without the `@` dig puts in front of it.
-fn strip_at(server: &str) -> &str {
+pub(crate) fn strip_at(server: &str) -> &str {
     server.strip_prefix('@').unwrap_or(server)
 }
 
-/// The one name to query, from `-x` or the positional names.
-fn the_name(reverse: &[String], names: &[&str]) -> Result<String, String> {
+/// The one name to query, from `-x` or the positional names. `type_tokens`
+/// (the tokens read as types) explain a missing name: `dig mx NS` meant the
+/// `mx` zone, which its trailing dot (`mx.`) marks as a name.
+fn the_name(reverse: &[String], names: &[&str], type_tokens: &[&str]) -> Result<String, String> {
     let mut given: Vec<String> = reverse.iter().map(|ip| format!("-x {ip}")).collect();
     given.extend(names.iter().map(|name| name.to_string()));
     if given.len() > 1 {
@@ -284,7 +292,27 @@ fn the_name(reverse: &[String], names: &[&str]) -> Result<String, String> {
             Err(_) => Err(format!("-x needs an IP address, got '{ip}'")),
         },
         (None, Some(name)) => Ok(name.to_string()),
-        (None, None) => Err("no name to query (give a domain, or -x <ip>)".to_string()),
+        (None, None) => {
+            let mut message = "no name to query (give a domain, or -x <ip>)".to_string();
+            if let Some(first) = type_tokens.first() {
+                message.push_str(&format!(
+                    "; {} read as record {} — write a name that spells a type with its \
+                     trailing dot, e.g. '{first}.'",
+                    quoted_list(
+                        &type_tokens
+                            .iter()
+                            .map(|t| t.to_string())
+                            .collect::<Vec<_>>()
+                    ),
+                    if type_tokens.len() == 1 {
+                        "type"
+                    } else {
+                        "types"
+                    },
+                ));
+            }
+            Err(message)
+        }
     }
 }
 
@@ -306,12 +334,12 @@ fn reverse_types(types: Vec<RecordType>) -> Result<Vec<RecordType>, String> {
 }
 
 /// `A, AAAA and MX`.
-fn type_list(types: &[RecordType]) -> String {
+pub(crate) fn type_list(types: &[RecordType]) -> String {
     and_list(types.iter().map(ToString::to_string).collect())
 }
 
 /// `'a', 'b' and 'c'`.
-fn quoted_list(items: &[String]) -> String {
+pub(crate) fn quoted_list(items: &[String]) -> String {
     and_list(items.iter().map(|item| format!("'{item}'")).collect())
 }
 
@@ -622,6 +650,24 @@ mod tests {
             assert!(e.contains("'MXX' is not a record type"), "{e}");
             assert!(e.contains("valid types: A, AAAA"), "{e}");
         }
+    }
+
+    /// `seer dig mx NS` read both words as types and failed with a bare
+    /// "no name to query"; the error now names them and the trailing-dot
+    /// spelling, which parses as a name.
+    #[test]
+    fn a_missing_name_suggests_the_trailing_dot_for_a_type_word() {
+        let e = err(&["mx", "NS"]);
+        assert!(e.starts_with("no name to query"), "{e}");
+        assert!(e.contains("'mx' and 'NS' read as record types"), "{e}");
+        assert!(e.contains("e.g. 'mx.'"), "{e}");
+        assert_eq!(
+            dig(&["mx.", "NS"]),
+            Ok(args("mx.", &[RecordType::NS])),
+            "the suggested spelling is a name"
+        );
+        // No type tokens, no hint.
+        assert!(!err(&["@8.8.8.8"]).contains("trailing dot"));
     }
 
     #[test]

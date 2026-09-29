@@ -72,6 +72,7 @@ clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 clap_mangen = "0.3"
 crossterm = "0.29"
+ratatui = { version = "0.30", default-features = false, features = ["crossterm", "layout-cache"] }
 
 # Python bindings
 pyo3 = { version = "0.29", features = ["extension-module", "abi3-py39"] }

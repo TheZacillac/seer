@@ -11,21 +11,33 @@ use seer_core::bulk::{BulkResult, BulkResultData};
 /// (`[profile.dist]`), which skips Drop, so there the panic hook from
 /// [`install_raw_mode_panic_hook`] restores the terminal instead.
 ///
-/// If enabling raw mode fails (e.g. stdin is not a TTY), the guard is inert and
-/// its drop is a no-op, so we never disable a mode we did not enable.
+/// Raw mode is only enabled when stdin is a terminal: the keys it exists to
+/// catch are read from stdin, and crossterm would otherwise switch the
+/// controlling terminal (`/dev/tty`) to raw mode — turning off its Ctrl-C
+/// signal — with no key listener to notice the keypress, leaving the follow
+/// uninterruptible. When raw mode is not enabled the guard is inert and its
+/// drop is a no-op, so we never disable a mode we did not enable.
 pub struct RawModeGuard {
     enabled: bool,
 }
 
 impl RawModeGuard {
-    /// Enables raw mode, returning a guard that restores cooked mode on drop.
+    /// Enables raw mode when stdin is a terminal, returning a guard that
+    /// restores cooked mode on drop.
     pub fn new() -> Self {
-        let enabled = crossterm::terminal::enable_raw_mode().is_ok();
+        use std::io::IsTerminal;
+        Self::enable_if(std::io::stdin().is_terminal())
+    }
+
+    /// [`Self::new`] with the stdin check passed in: an inert guard unless
+    /// `stdin_is_terminal`.
+    fn enable_if(stdin_is_terminal: bool) -> Self {
+        let enabled = stdin_is_terminal && crossterm::terminal::enable_raw_mode().is_ok();
         Self { enabled }
     }
 
-    /// Whether raw mode was actually enabled (false when there is no usable
-    /// terminal, e.g. stdin/stdout redirected in CI).
+    /// Whether raw mode was actually enabled (false when stdin is not a
+    /// terminal, e.g. redirected in CI, or enabling it failed).
     pub fn is_enabled(&self) -> bool {
         self.enabled
     }
@@ -119,16 +131,15 @@ pub struct FollowKeyListener {
 }
 
 impl FollowKeyListener {
-    /// Starts the listener, or returns `None` when there is no terminal to
-    /// read keys from: raw mode could not be enabled, or stdin is not a TTY.
-    /// Callers keep their other cancellation paths (the CLI's SIGINT task),
-    /// so a missing listener only loses the Esc shortcut.
+    /// Starts the listener, or returns `None` when raw mode is off — there
+    /// is then no terminal on stdin to read keys from ([`RawModeGuard`] only
+    /// enables it for one). Callers keep their SIGINT path, which is how
+    /// such a follow is interrupted, so a missing listener only loses Esc.
     pub fn spawn(
         cancel_tx: tokio::sync::watch::Sender<bool>,
         raw_mode_enabled: bool,
     ) -> Option<Self> {
-        use std::io::IsTerminal;
-        if !raw_mode_enabled || !std::io::stdin().is_terminal() {
+        if !raw_mode_enabled {
             return None;
         }
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -160,27 +171,47 @@ impl FollowKeyListener {
     }
 }
 
-/// Write `content` to `path` atomically: write to a sibling `.tmp` file and
-/// then `rename` it over the destination. `rename` is atomic on POSIX, so a
-/// crash mid-write cannot leave the destination truncated. Mirrors the same
-/// pattern used by `seer_core::LookupHistory::save`.
+/// Writes `content` to `path` atomically: into a fresh sibling temp file,
+/// then `rename`d over the destination (atomic on POSIX), so a crash or full
+/// disk mid-write cannot leave the destination truncated.
+///
+/// The temp file is created with `create_new` (`O_EXCL`) under a per-call
+/// unique name: a fixed name could be a pre-planted symlink the write would
+/// follow, and two concurrent writers would truncate each other's bytes.
+/// `rename` replaces a symlink at `path` itself rather than writing through
+/// it. Unlike the owner-only `~/.seer` stores (core's `fsutil`), the file
+/// keeps default permissions — it is the user's own output, in their chosen
+/// directory, whose mode must not change.
 pub fn atomic_write<P: AsRef<Path>>(path: P, content: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
     let path = path.as_ref();
-    let tmp_path = match path.extension() {
-        Some(ext) => {
-            let mut ext = ext.to_os_string();
-            ext.push(".tmp");
-            path.with_extension(ext)
-        }
-        None => path.with_extension("tmp"),
-    };
-    std::fs::write(&tmp_path, content)?;
-    if let Err(e) = std::fs::rename(&tmp_path, path) {
-        // Best-effort cleanup so we don't leave the `.tmp` behind.
+    let name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("not a file path: {}", path.display()),
+        )
+    })?;
+    let seq = WRITE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut tmp_name = name.to_os_string();
+    tmp_name.push(format!(".{}.{}.tmp", std::process::id(), seq));
+    let tmp_path = path.with_file_name(tmp_name);
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp_path)?;
+    let written = file
+        .write_all(content.as_bytes())
+        .and_then(|()| file.sync_all())
+        .and_then(|()| std::fs::rename(&tmp_path, path));
+    if written.is_err() {
+        // Best-effort cleanup so a failed write leaves no temp behind.
         let _ = std::fs::remove_file(&tmp_path);
-        return Err(e);
     }
-    Ok(())
+    written
 }
 
 /// Maximum allowed size of a bulk input file, in bytes (1 MB).
@@ -304,16 +335,7 @@ pub fn bulk_results_to_csv(results: &[BulkResult], operation: &str) -> String {
     let (columns, trailing, cells_of) = csv_layout(operation);
     let (width, trailing_width) = (column_count(columns), column_count(trailing));
 
-    let header = [
-        "domain",
-        "success",
-        columns,
-        "duration_ms",
-        trailing,
-        "error",
-    ];
-    let header: Vec<&str> = header.into_iter().filter(|c| !c.is_empty()).collect();
-    let mut csv = header.join(",");
+    let mut csv = bulk_csv_header(operation);
     csv.push('\n');
 
     for result in results {
@@ -344,6 +366,22 @@ pub fn bulk_results_to_csv(results: &[BulkResult], operation: &str) -> String {
     }
 
     csv
+}
+
+/// The CSV header line (no newline) [`bulk_results_to_csv`] writes for
+/// `operation` — also the header lines of `seer bulk --help`'s examples.
+pub fn bulk_csv_header(operation: &str) -> String {
+    let (columns, trailing, _) = csv_layout(operation);
+    let header = [
+        "domain",
+        "success",
+        columns,
+        "duration_ms",
+        trailing,
+        "error",
+    ];
+    let header: Vec<&str> = header.into_iter().filter(|c| !c.is_empty()).collect();
+    header.join(",")
 }
 
 /// Cell values for one result's data — the op's columns, then its trailing
@@ -714,6 +752,62 @@ mod tests {
         // Drop must never disable a mode that was never enabled (issue #60).
         let guard = RawModeGuard::new();
         drop(guard); // must not panic
+    }
+
+    /// With stdin redirected, raw mode used to be enabled on the controlling
+    /// terminal anyway (Ctrl-C no longer a signal) while the key listener
+    /// stayed off, so nothing could interrupt a follow. A non-terminal stdin
+    /// must leave raw mode off, and so the listener unstarted.
+    #[test]
+    fn raw_mode_stays_off_when_stdin_is_not_a_terminal() {
+        let guard = RawModeGuard::enable_if(false);
+        assert!(!guard.is_enabled());
+        let (tx, _rx) = tokio::sync::watch::channel(false);
+        assert!(FollowKeyListener::spawn(tx, guard.is_enabled()).is_none());
+    }
+
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "seer-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    #[test]
+    fn atomic_write_replaces_the_file_and_leaves_no_temp() {
+        let dir = scratch_dir("atomic");
+        let out = dir.join("out.csv");
+        atomic_write(&out, "first\n").unwrap();
+        atomic_write(&out, "second\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "second\n");
+        let names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("out.csv")]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The temp name used to be a fixed `<out>.tmp`; a symlink planted there
+    /// redirected the write to wherever it pointed.
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_never_writes_through_a_planted_temp_symlink() {
+        let dir = scratch_dir("atomic-link");
+        let victim = dir.join("victim.txt");
+        std::fs::write(&victim, "untouched").unwrap();
+        std::os::unix::fs::symlink(&victim, dir.join("out.csv.tmp")).unwrap();
+        atomic_write(dir.join("out.csv"), "rows\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "untouched");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("out.csv")).unwrap(),
+            "rows\n"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
