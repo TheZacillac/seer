@@ -911,11 +911,22 @@ fn fixture_dns_comparison() -> DnsComparison {
         record_type: RecordType::A,
         server_a: ServerResult {
             nameserver: "8.8.8.8".into(),
-            records: vec![a_record("example.com", "192.0.2.1")],
+            status: Some(DnsStatus::NoError),
+            cname_chain: vec![DnsRecord {
+                name: "example.com".into(),
+                record_type: RecordType::CNAME,
+                ttl: 300,
+                data: RecordData::CNAME {
+                    target: "edge.cdn.test.".into(),
+                },
+            }],
+            records: vec![a_record("edge.cdn.test", "192.0.2.1")],
             error: None,
         },
         server_b: ServerResult {
             nameserver: "1.1.1.1".into(),
+            status: None,
+            cname_chain: Vec::new(),
             records: Vec::new(),
             error: Some("query timed out".into()),
         },

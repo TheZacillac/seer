@@ -1796,7 +1796,6 @@ mod exit_code_tests {
             status: status.into(),
             chain_valid: status == "signed",
             authentication_tier: seer_core::dns::AuthenticationTier::DigestOnly,
-            rrsig_records: vec![],
         }))
     }
 
@@ -1859,6 +1858,8 @@ mod exit_code_tests {
         let compare = |matches| {
             let side = |ns: &str| seer_core::dns::ServerResult {
                 nameserver: ns.into(),
+                status: Some(seer_core::DnsStatus::NoError),
+                cname_chain: vec![],
                 records: vec![],
                 error: None,
             };

@@ -38,8 +38,13 @@
 //!
 //! **Bounded work:** at most [`MAX_PARENT_SERVERS_TRIED`] parent servers are
 //! contacted (stopping after [`PARENT_SERVERS_WANTED`] respond), at most
-//! [`MAX_NS_PROBED`] delegated servers are probed (concurrently), and each
-//! server is probed on a single vetted address.
+//! [`MAX_NS_PROBED`] delegated servers are probed (concurrently), each
+//! address lookup and query runs under the per-query timeout, and each server
+//! is asked on one vetted address at a time, IPv4 first: an address this
+//! host has no route to (IPv6 on an IPv4-only host, or the reverse) fails at
+//! once and the server's next address is tried. The whole check runs under
+//! one deadline of [`CHECK_BUDGET_TIMEOUTS`] per-query timeouts; a probe
+//! still running when it passes is reported as not probed.
 
 use std::collections::BTreeSet;
 use std::net::IpAddr;
@@ -58,8 +63,19 @@ use super::resolver::{apply_standard_opts, fqdn, google_or_pinned, single_server
 use crate::error::{Result, SeerError};
 use crate::validation::normalize_domain;
 
-/// Default per-query timeout, matching the DNS resolver default.
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Default per-query timeout, matching the DNS resolver default. Shared with
+/// the other direct-query modules (`trace`, `dnssec`, `propagation`).
+pub(super) const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The whole check's deadline, in per-query timeouts. An address lookup is
+/// held to one timeout, but a lookup or query that hickory retransmits
+/// (`attempts = 2`) may take two: the parent NS lookup (2), then
+/// [`PARENT_SERVERS_WANTED`] parent servers that each answer only on the
+/// retransmission (3 each: lookup + query), then the concurrent probes (3).
+/// Without the bound, silent servers held the caller for up to 17 timeouts
+/// (85s at the default 5s): the parent phase is sequential over
+/// [`MAX_PARENT_SERVERS_TRIED`] servers.
+const CHECK_BUDGET_TIMEOUTS: u32 = 2 + 3 * PARENT_SERVERS_WANTED as u32 + 3;
 
 /// Maximum delegated NS servers probed for lameness. Delegations larger than
 /// this are unusual; the cap bounds total probe work and a warning notes the
@@ -184,6 +200,14 @@ pub struct DelegationChecker {
     /// Test-only: skip the SSRF/reserved-IP validation on direct targets.
     #[cfg(test)]
     allow_private_hosts: bool,
+    /// Test-only: addresses whose direct queries fail as if this host had
+    /// no route to them (see `with_unroutable`).
+    #[cfg(test)]
+    unroutable: Vec<IpAddr>,
+    /// Test-only: the whole check's deadline, instead of
+    /// [`CHECK_BUDGET_TIMEOUTS`] per-query timeouts.
+    #[cfg(test)]
+    budget: Option<Duration>,
 }
 
 impl std::fmt::Debug for DelegationChecker {
@@ -213,6 +237,10 @@ impl DelegationChecker {
             port_map: None,
             #[cfg(test)]
             allow_private_hosts: false,
+            #[cfg(test)]
+            unroutable: Vec::new(),
+            #[cfg(test)]
+            budget: None,
         }
     }
 
@@ -254,6 +282,44 @@ impl DelegationChecker {
     fn allowing_private_hosts(mut self) -> Self {
         self.allow_private_hosts = true;
         self
+    }
+
+    /// Test-only: direct queries to `addrs` fail at once with a local
+    /// no-route error, as on a host without a route to that family.
+    #[cfg(test)]
+    fn with_unroutable(mut self, addrs: &[IpAddr]) -> Self {
+        self.unroutable.extend_from_slice(addrs);
+        self
+    }
+
+    /// Test-only: hold the whole check to `budget`.
+    #[cfg(test)]
+    fn with_budget(mut self, budget: Duration) -> Self {
+        self.budget = Some(budget);
+        self
+    }
+
+    /// The whole check's deadline: [`CHECK_BUDGET_TIMEOUTS`] per-query
+    /// timeouts.
+    #[cfg(not(test))]
+    fn budget(&self) -> Duration {
+        self.timeout.saturating_mul(CHECK_BUDGET_TIMEOUTS)
+    }
+
+    #[cfg(test)]
+    fn budget(&self) -> Duration {
+        self.budget
+            .unwrap_or_else(|| self.timeout.saturating_mul(CHECK_BUDGET_TIMEOUTS))
+    }
+
+    #[cfg(test)]
+    fn simulated_no_route(&self, ip: IpAddr) -> bool {
+        self.unroutable.contains(&ip)
+    }
+
+    #[cfg(not(test))]
+    fn simulated_no_route(&self, _ip: IpAddr) -> bool {
+        false
     }
 
     #[cfg(test)]
@@ -307,9 +373,18 @@ impl DelegationChecker {
         let domain = normalize_domain(domain)?;
         let parent_zone = parent_zone_of(&domain);
         let mut warnings = Vec::new();
+        let budget = self.budget();
+        let deadline = tokio::time::Instant::now() + budget;
+        let out_of_time = || {
+            SeerError::DnsError(format!(
+                "delegation check for {domain} gave up after {budget:?} without a parent-zone answer"
+            ))
+        };
 
         // 1. Parent zone NS set via the recursive resolver.
-        let parent_hosts = self.recursive_ns_set(&parent_zone).await?;
+        let parent_hosts = tokio::time::timeout_at(deadline, self.recursive_ns_set(&parent_zone))
+            .await
+            .map_err(|_| out_of_time())??;
         if parent_hosts.is_empty() {
             return Err(SeerError::DnsError(format!(
                 "parent zone {} has no NS records — cannot locate the delegation for {}",
@@ -326,15 +401,21 @@ impl DelegationChecker {
             if parent_server_queried.len() >= PARENT_SERVERS_WANTED {
                 break;
             }
-            let ip = match self.resolve_host_ip(host).await {
-                Ok(ip) => ip,
+            let Ok(asked) = tokio::time::timeout_at(deadline, self.ask_host(host, &domain)).await
+            else {
+                warnings.push(format!(
+                    "stopped asking parent servers: the check's {budget:?} budget ran out"
+                ));
+                break;
+            };
+            let direct = match asked {
+                Ok(direct) => direct,
                 Err(reason) => {
                     warnings.push(format!("skipped parent server {}: {}", host, reason));
                     continue;
                 }
             };
-            debug!(server = %host, %ip, "querying parent server for delegation");
-            match self.direct_ns_query(host, ip, &domain).await {
+            match direct {
                 DirectNs::Response {
                     response_code,
                     answer_ns,
@@ -394,11 +475,17 @@ impl DelegationChecker {
                 delegated.len()
             ));
         }
-        let outcomes = futures::future::join_all(
-            probe_hosts
-                .iter()
-                .map(|host| self.probe_delegated_ns(host, &domain)),
-        )
+        // Each probe under the check's deadline, so one that runs out is
+        // reported on its own and the probes that finished are kept.
+        let outcomes = futures::future::join_all(probe_hosts.iter().map(|host| async {
+            tokio::time::timeout_at(deadline, self.probe_delegated_ns(host, &domain))
+                .await
+                .unwrap_or_else(|_| {
+                    ProbeOutcome::Skipped(format!(
+                        "not probed within the check's {budget:?} budget"
+                    ))
+                })
+        }))
         .await;
 
         let mut zone_ns: BTreeSet<String> = BTreeSet::new();
@@ -479,14 +566,15 @@ impl DelegationChecker {
         }
     }
 
-    /// Resolves one usable (public, unless the test seam allows private)
-    /// address for a nameserver host. Errors carry a human-readable reason
-    /// for the report's warnings.
-    async fn resolve_host_ip(&self, host: &str) -> std::result::Result<IpAddr, String> {
-        let response = self
-            .recursive
-            .lookup_ip(fqdn(host))
+    /// Resolves the usable (public, unless the test seam allows private)
+    /// addresses of a nameserver host, IPv4 first ([`ipv4_first`]). Errors
+    /// carry a human-readable reason for the report's warnings.
+    async fn resolve_host_ips(&self, host: &str) -> std::result::Result<Vec<IpAddr>, String> {
+        // The resolver re-sends a query that timed out (`attempts`), so only
+        // this deadline holds the lookup to one per-query timeout.
+        let response = tokio::time::timeout(self.timeout, self.recursive.lookup_ip(fqdn(host)))
             .await
+            .unwrap_or(Err(NetError::Timeout))
             .map_err(|e| format!("could not resolve {}: {}", host, e))?;
         let ips: Vec<IpAddr> = response.iter().collect();
         if ips.is_empty() {
@@ -496,10 +584,34 @@ impl DelegationChecker {
         // reserved/private targets are refused. The test seam is
         // `#[cfg(test)]`-only; production always validates.
         let (vetted, refused) = partition_reserved(&ips, self.allow_private());
-        prefer_ipv4(&vetted).ok_or_else(|| match refused.first() {
-            Some((_, reason)) => format!("{} resolves to a blocked address ({})", host, reason),
-            None => format!("{} did not resolve to a usable address", host),
-        })
+        if vetted.is_empty() {
+            return Err(match refused.first() {
+                Some((_, reason)) => format!("{} resolves to a blocked address ({})", host, reason),
+                None => format!("{} did not resolve to a usable address", host),
+            });
+        }
+        Ok(ipv4_first(vetted))
+    }
+
+    /// Asks `host` for `domain`'s NS set (RD=0) on its addresses in turn,
+    /// until a query leaves this host: an address with no local route
+    /// ([`DirectNs::LocalNoRoute`]) fails at once and the next is tried —
+    /// an IPv6-only server from an IPv4-only host, or the reverse. `Err` is
+    /// an address-lookup failure; when no address is routable, the last
+    /// `LocalNoRoute`.
+    async fn ask_host(&self, host: &str, domain: &str) -> std::result::Result<DirectNs, String> {
+        let mut last = None;
+        for ip in self.resolve_host_ips(host).await? {
+            debug!(server = %host, %ip, "direct NS query");
+            match self.direct_ns_query(host, ip, domain).await {
+                DirectNs::LocalNoRoute(reason) => {
+                    last = Some(DirectNs::LocalNoRoute(format!("{ip}: {reason}")));
+                }
+                direct => return Ok(direct),
+            }
+        }
+        // `resolve_host_ips` returns at least one address.
+        Ok(last.unwrap_or_else(|| DirectNs::Unreachable("no address to query".to_string())))
     }
 
     /// Sends a single non-recursive NS query for `domain` to the server at
@@ -507,6 +619,9 @@ impl DelegationChecker {
     /// transport errors fold into [`DirectNs::Unreachable`] so callers can
     /// record them per-server.
     async fn direct_ns_query(&self, host: &str, ip: IpAddr, domain: &str) -> DirectNs {
+        if self.simulated_no_route(ip) {
+            return DirectNs::LocalNoRoute("network is unreachable (simulated)".to_string());
+        }
         let resolver = match self.build_direct_resolver(host, ip) {
             Ok(resolver) => resolver,
             Err(e) => return DirectNs::Unreachable(format!("resolver construction failed: {}", e)),
@@ -542,17 +657,15 @@ impl DelegationChecker {
             .map_err(|e| SeerError::DnsError(format!("failed to construct DNS resolver: {}", e)))
     }
 
-    /// Probes one delegated nameserver: resolves an address, sends the RD=0
-    /// NS query, and classifies the result.
+    /// Probes one delegated nameserver: sends the RD=0 NS query
+    /// ([`ask_host`](Self::ask_host)) and classifies the result.
     async fn probe_delegated_ns(&self, host: &str, domain: &str) -> ProbeOutcome {
-        let ip = match self.resolve_host_ip(host).await {
-            Ok(ip) => ip,
+        match self.ask_host(host, domain).await {
+            Ok(direct) => outcome_for_direct(direct),
             // Unresolvable "glue" is a warning, not lameness: the server was
             // never reached, so nothing is known about its authority.
-            Err(reason) => return ProbeOutcome::Skipped(reason),
-        };
-        debug!(server = %host, %ip, "probing delegated nameserver");
-        outcome_for_direct(self.direct_ns_query(host, ip, domain).await)
+            Err(reason) => ProbeOutcome::Skipped(reason),
+        }
     }
 }
 
@@ -709,17 +822,14 @@ fn parent_zone_of(domain: &str) -> String {
         .unwrap_or_else(|| domain.to_string())
 }
 
-/// Picks the probe address from the vetted list, preferring IPv4. gTLD
-/// servers commonly list AAAA records first, and blindly taking the first
-/// vetted address made every direct parent query fail with "network
-/// unreachable" on IPv4-only hosts. IPv6-only deployments still work: v6 is
-/// used whenever no v4 address survives vetting.
-pub(crate) fn prefer_ipv4(vetted: &[IpAddr]) -> Option<IpAddr> {
-    vetted
-        .iter()
-        .find(|ip| ip.is_ipv4())
-        .or_else(|| vetted.first())
-        .copied()
+/// Orders a server's vetted addresses for querying: IPv4 first — gTLD
+/// servers commonly list AAAA first, and IPv6 is unroutable on many hosts —
+/// then IPv6, each family in the order given. A later address is tried only
+/// when this host has no route to the earlier ones, so an IPv6-only host
+/// still reaches the server. Shared with the trace walker.
+pub(super) fn ipv4_first(mut addrs: Vec<IpAddr>) -> Vec<IpAddr> {
+    addrs.sort_by_key(IpAddr::is_ipv6);
+    addrs
 }
 
 /// SSRF vetting for nameserver addresses, which come from untrusted DNS data
@@ -866,16 +976,16 @@ mod tests {
     }
 
     #[test]
-    fn probe_ip_selection_prefers_ipv4_over_first_listed() {
+    fn probe_addresses_are_ordered_ipv4_first() {
         // gTLD servers often list AAAA first; an IPv4-only host must not be
-        // handed an unreachable v6 address when a v4 one exists.
+        // handed an unreachable v6 address first when a v4 one exists.
         let v6: IpAddr = "2001:503:a83e::2:30".parse().unwrap();
         let v4: IpAddr = "192.5.6.30".parse().unwrap();
-        assert_eq!(prefer_ipv4(&[v6, v4]), Some(v4));
-        assert_eq!(prefer_ipv4(&[v4, v6]), Some(v4));
+        let v4b: IpAddr = "192.5.6.31".parse().unwrap();
+        assert_eq!(ipv4_first(vec![v6, v4, v4b]), vec![v4, v4b, v6]);
         // IPv6-only deployments still get the v6 address.
-        assert_eq!(prefer_ipv4(&[v6]), Some(v6));
-        assert_eq!(prefer_ipv4(&[]), None);
+        assert_eq!(ipv4_first(vec![v6]), vec![v6]);
+        assert!(ipv4_first(vec![]).is_empty());
     }
 
     #[test]
@@ -1145,7 +1255,7 @@ mod tests {
         let recursive = spawn_recursive_mock(&["ns1.seer.test", "ns2.seer.test"]).await;
         let parent = spawn_parent_server(&["ns1.seer.test.", "ns2.seer.test."]).await;
         let ns1 = spawn_zone_server(&["ns1.seer.test.", "ns2.seer.test."]).await;
-        let ns2 = spawn_mock_dns_fn(|_, _| MockReply::Refused).await;
+        let ns2 = spawn_mock_dns_fn(|_, _| MockReply::Rcode(ResponseCode::Refused)).await;
 
         let report = checker(
             recursive,
@@ -1289,5 +1399,85 @@ mod tests {
             "expected DnsError, got: {err:?}"
         );
         assert!(err.to_string().contains("parent"), "got: {err}");
+    }
+
+    /// Regression: each server was probed on one address only, so a server
+    /// whose first (IPv4) address this host cannot route to — an IPv6-only
+    /// host — was never reached. The next address is tried instead.
+    #[tokio::test]
+    async fn unroutable_address_falls_back_to_the_next() {
+        let unroutable: IpAddr = Ipv4Addr::new(127, 0, 0, 2).into();
+        let recursive = spawn_mock_dns_fn(move |qname, qtype| match (qname, qtype) {
+            ("test", HickoryRecordType::NS) => MockReply::Answer(vec![ns_rdata("a.parent.test.")]),
+            (_, HickoryRecordType::A) => MockReply::Answer(vec![
+                HickoryRData::A(wire::A(Ipv4Addr::new(127, 0, 0, 2))),
+                loopback_a(),
+            ]),
+            _ => MockReply::NoData,
+        })
+        .await;
+        let parent = spawn_parent_server(&["ns1.seer.test."]).await;
+        let ns1 = spawn_zone_server(&["ns1.seer.test."]).await;
+        let ports = HashMap::from([
+            ("a.parent.test".to_string(), parent),
+            ("ns1.seer.test".to_string(), ns1),
+        ]);
+
+        let report = checker(recursive, ports.clone())
+            .with_unroutable(&[unroutable])
+            .check("seer.test")
+            .await
+            .expect("check must succeed");
+        assert_eq!(report.parent_server_queried, vec!["a.parent.test"]);
+        assert_eq!(report.zone_ns, vec!["ns1.seer.test"]);
+        assert!(report.in_sync, "{report:?}");
+
+        // With no routable address at all, the server is not reached.
+        let err = checker(recursive, ports)
+            .with_unroutable(&[unroutable, Ipv4Addr::LOCALHOST.into()])
+            .check("seer.test")
+            .await
+            .expect_err("no parent server reachable");
+        assert!(err.to_string().contains("parent"), "{err}");
+    }
+
+    /// Regression: the check had no overall deadline, so silent servers
+    /// held the caller for up to 17 timeouts. A probe still running at the
+    /// deadline is reported as not probed, and the answers that arrived are
+    /// kept.
+    #[tokio::test]
+    async fn the_check_is_held_to_one_deadline() {
+        assert_eq!(CHECK_BUDGET_TIMEOUTS, 11);
+        let recursive = spawn_recursive_mock(&["ns1.seer.test", "ns2.seer.test"]).await;
+        let parent = spawn_parent_server(&["ns1.seer.test.", "ns2.seer.test."]).await;
+        let ns1 = spawn_zone_server(&["ns1.seer.test.", "ns2.seer.test."]).await;
+        let ns2 = spawn_mock_dns(MockMode::Ignore).await;
+
+        let started = std::time::Instant::now();
+        let report = checker(
+            recursive,
+            HashMap::from([
+                ("a.parent.test".to_string(), parent),
+                ("ns1.seer.test".to_string(), ns1),
+                ("ns2.seer.test".to_string(), ns2),
+            ]),
+        )
+        .with_budget(Duration::from_millis(300))
+        .check("seer.test")
+        .await
+        .expect("the parent answered in time");
+
+        // ns2 would time out after 500ms (twice); the deadline cut it short.
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(report.lame.is_empty(), "{report:?}");
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("ns2.seer.test") && w.contains("budget")),
+            "{:?}",
+            report.warnings
+        );
+        assert_eq!(report.zone_ns, vec!["ns1.seer.test", "ns2.seer.test"]);
     }
 }

@@ -4,13 +4,14 @@ use std::time::{Duration, Instant};
 
 use futures::future::join_all;
 use tokio::sync::Semaphore;
-use tracing::{debug, instrument, warn};
+use tracing::{debug, instrument};
 
 use super::analysis::{
     analyze_results, build_nameserver_consensus, build_nameserver_inconsistencies, PerVantage,
 };
 use super::servers::default_dns_servers;
 use super::types::{DnsServer, NameserverDetails, PropagationResult, ServerResult};
+use crate::dns::delegation::DEFAULT_TIMEOUT;
 use crate::dns::query::{DnsQueryResult, DnsStatus};
 use crate::dns::records::{RecordData, RecordType};
 use crate::dns::resolver::{DnsResolver, ServerReply};
@@ -52,12 +53,18 @@ impl Default for PropagationChecker {
 
 impl PropagationChecker {
     pub fn new() -> Self {
-        let query_timeout = Duration::from_secs(5);
         Self {
-            resolver: DnsResolver::new().with_timeout(query_timeout),
+            resolver: DnsResolver::new(),
             servers: default_dns_servers().to_vec(),
-            query_timeout,
+            query_timeout: DEFAULT_TIMEOUT,
         }
+    }
+
+    /// Builds a checker honoring `~/.seer/config.toml` (`timeouts.dns_secs`).
+    /// The configured nameserver does not apply: a propagation check asks its
+    /// own list of public resolvers.
+    pub fn from_config(config: &crate::config::SeerConfig) -> Self {
+        Self::new().with_timeout(config.dns_timeout())
     }
 
     pub fn with_servers(mut self, servers: Vec<DnsServer>) -> Self {
@@ -70,15 +77,6 @@ impl PropagationChecker {
         self.query_timeout = timeout;
         self
     }
-
-    /// Hard cap on the post-check nameserver-IP enrichment step for NS lookups.
-    /// If it expires, propagation results are returned without IP annotations
-    /// rather than failing the whole call — enrichment is best-effort.
-    /// Bumped from the single-vantage version (5s) because per-vantage
-    /// resolution fans out every responding server × N nameservers; even fully parallel,
-    /// the slowest single A/AAAA query gates completion and DNS-over-WAN to
-    /// distant resolvers can exceed the per-query timeout.
-    const NS_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(8);
 
     #[instrument(skip(self), fields(domain = %domain, record_type = %record_type))]
     pub async fn check(&self, domain: &str, record_type: RecordType) -> Result<PropagationResult> {
@@ -132,33 +130,16 @@ impl PropagationChecker {
         // it returns for every nameserver hostname observed in the NS answers.
         // This is the per-vantage view that surfaces glue-record propagation
         // lag — a regional recursor still serving the previous IP shows up as
-        // a `NameserverIpInconsistency`. Bounded by NS_RESOLUTION_TIMEOUT so a
-        // slow secondary lookup cannot extend total wall-clock beyond the
-        // documented bound; on timeout we surface results without IP
-        // annotations rather than failing the call.
+        // a `NameserverIpInconsistency`. Each lookup is bounded on its own,
+        // so a slow one costs only its own entry.
         let nameserver_details = if record_type == RecordType::NS {
-            match tokio::time::timeout(
-                Self::NS_RESOLUTION_TIMEOUT,
-                self.resolve_nameserver_details(&results),
-            )
-            .await
-            {
-                Ok(details) => details,
-                Err(_) => {
-                    warn!(
-                        domain = %domain,
-                        timeout_secs = Self::NS_RESOLUTION_TIMEOUT.as_secs(),
-                        "Per-vantage nameserver IP enrichment timed out; returning results without IP annotations"
-                    );
-                    None
-                }
-            }
+            self.resolve_nameserver_details(&results, budget).await
         } else {
             None
         };
 
         Ok(PropagationResult {
-            domain: domain.to_string(),
+            domain,
             record_type,
             servers_checked,
             servers_responding,
@@ -181,10 +162,12 @@ impl PropagationChecker {
     /// Returns `None` when there are no NS records to enrich; otherwise
     /// returns `Some(NameserverDetails { consensus, per_vantage, inconsistencies })`.
     ///
-    /// Failed A/AAAA lookups from a given vantage produce an empty list —
-    /// empty matches an NXDOMAIN/NODATA response, and either way the resolver
-    /// couldn't provide an IP. If that empty differs from the consensus it
-    /// surfaces as a `NameserverIpInconsistency`.
+    /// Each vantage's A and AAAA lookups for one hostname run under
+    /// `budget` (the per-server budget) and count only when both answered: an
+    /// empty set is a negative answer (NXDOMAIN/NODATA), which may surface as
+    /// a `NameserverIpInconsistency`; a failed or timed-out lookup leaves the
+    /// entry out — no data, never a partial or empty set that would read as
+    /// a disagreement.
     ///
     /// Hostnames are lowercased for dedup so case-variant responses from
     /// different upstream resolvers do not trigger redundant lookups.
@@ -192,6 +175,7 @@ impl PropagationChecker {
     async fn resolve_nameserver_details(
         &self,
         results: &[ServerResult],
+        budget: Duration,
     ) -> Option<NameserverDetails> {
         let unique: HashSet<String> = results
             .iter()
@@ -212,7 +196,7 @@ impl PropagationChecker {
         // server can't meaningfully report a per-vantage IP either.
         let unique_vec: Vec<String> = unique.into_iter().collect();
         // Bound the fan-out: this loop produces `responding_servers × unique_ns`
-        // tasks, each doing 2 lookups. Harmless at the built-in 29-server list,
+        // tasks, each doing 2 lookups. Harmless at the built-in 20-server list,
         // but a large custom `with_servers` list would otherwise spawn an
         // unbounded burst of concurrent DNS queries (#61).
         let sem = Arc::new(Semaphore::new(MAX_CONCURRENT_NS_LOOKUPS));
@@ -226,19 +210,16 @@ impl PropagationChecker {
                 tasks.push(async move {
                     // Held for the task's lifetime; caps concurrent lookups.
                     let _permit = sem.acquire().await.ok();
-                    let (a_res, aaaa_res) = tokio::join!(
-                        resolver.resolve(&ns, RecordType::A, Some(&server_ip)),
-                        resolver.resolve(&ns, RecordType::AAAA, Some(&server_ip)),
-                    );
-                    // A failed lookup contributes no addresses.
-                    let mut ips: Vec<String> = [a_res, aaaa_res]
-                        .into_iter()
-                        .flatten()
-                        .flatten()
-                        .filter_map(|r| r.data.address().map(str::to_string))
-                        .collect();
-                    ips.sort();
-                    ips.dedup();
+                    let lookups = async {
+                        tokio::join!(
+                            resolver.resolve(&ns, RecordType::A, Some(&server_ip)),
+                            resolver.resolve(&ns, RecordType::AAAA, Some(&server_ip)),
+                        )
+                    };
+                    let ips = match tokio::time::timeout(budget, lookups).await {
+                        Ok((a, aaaa)) => vantage_addresses(a, aaaa),
+                        Err(_) => None,
+                    };
                     (server_ip, ns, ips)
                 });
             }
@@ -247,7 +228,9 @@ impl PropagationChecker {
         let outputs = join_all(tasks).await;
         let mut per_vantage: PerVantage = HashMap::new();
         for (server_ip, ns, ips) in outputs {
-            per_vantage.entry(server_ip).or_default().insert(ns, ips);
+            if let Some(ips) = ips {
+                per_vantage.entry(server_ip).or_default().insert(ns, ips);
+            }
         }
 
         let consensus = build_nameserver_consensus(results, &per_vantage, &unique_vec);
@@ -271,11 +254,7 @@ impl PropagationChecker {
 
     #[cfg(test)]
     fn empty_for_tests() -> Self {
-        Self {
-            resolver: DnsResolver::new(),
-            servers: Vec::new(),
-            query_timeout: Duration::from_secs(5),
-        }
+        Self::new().with_servers(Vec::new())
     }
 
     /// [`query_server`](Self::query_server) wrapped in a per-server timeout.
@@ -361,11 +340,31 @@ impl PropagationChecker {
     }
 }
 
+/// One vantage's addresses for a nameserver host, from its A and AAAA
+/// lookups: sorted and deduplicated, empty for a negative answer to both, and
+/// `None` — no data — when either lookup failed, since the addresses it
+/// would have added are unknown.
+fn vantage_addresses(
+    a: Result<Vec<crate::dns::DnsRecord>>,
+    aaaa: Result<Vec<crate::dns::DnsRecord>>,
+) -> Option<Vec<String>> {
+    let (a, aaaa) = (a.ok()?, aaaa.ok()?);
+    let mut ips: Vec<String> = a
+        .iter()
+        .chain(&aaaa)
+        .filter_map(|r| r.data.address().map(str::to_string))
+        .collect();
+    ips.sort();
+    ips.dedup();
+    Some(ips)
+}
+
 /// Reads one server's response: a definitive answer (NOERROR or NXDOMAIN)
 /// yields its records of the queried type (for ANY, every answer) and no
 /// error; any other status, or a referral from a server that is not
-/// recursive, yields the reason as the error.
-fn read_reply(
+/// recursive, yields the reason as the error. Shared with the DNS comparison,
+/// so both read a server's reply the same way.
+pub(in crate::dns) fn read_reply(
     response: DnsQueryResult,
     record_type: RecordType,
 ) -> (
@@ -520,6 +519,7 @@ mod tests {
         use crate::dns::test_support::{
             a_rdata, cname_rdata, mock_dns_resolver, record, spawn_mock_dns_fn, MockReply,
         };
+        use hickory_resolver::proto::op::ResponseCode;
 
         let port = spawn_mock_dns_fn(|name, _| match name {
             "answer.seer.test" => MockReply::Answer(vec![a_rdata([192, 0, 2, 1])]),
@@ -529,8 +529,8 @@ mod tests {
             ]),
             "nx.seer.test" => MockReply::NxDomainWithSoa("seer.test"),
             "nodata.seer.test" => MockReply::NoDataWithSoa("seer.test"),
-            "refused.seer.test" => MockReply::Refused,
-            "servfail.seer.test" => MockReply::ServFail,
+            "refused.seer.test" => MockReply::Rcode(ResponseCode::Refused),
+            "servfail.seer.test" => MockReply::Rcode(ResponseCode::ServFail),
             "referral.seer.test" => MockReply::Delegation {
                 zone: "referral.seer.test".into(),
                 servers: vec![("ns1.elsewhere.test".into(), vec![])],
@@ -617,5 +617,76 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(nodata.empty_consensus_label(), Some("NODATA"));
+    }
+
+    #[test]
+    fn from_config_applies_dns_timeout() {
+        let mut config = crate::config::SeerConfig::default();
+        config.timeouts.dns_secs = 9;
+        let checker = PropagationChecker::from_config(&config);
+        assert_eq!(checker.query_timeout, Duration::from_secs(9));
+        assert_eq!(checker.resolver.timeout(), Duration::from_secs(9));
+        assert_eq!(checker.servers.len(), default_dns_servers().len());
+    }
+
+    /// Regression: a failed A or AAAA lookup was dropped and the other's
+    /// addresses kept (a partial set), and a vantage whose lookups both
+    /// failed became an empty set — each read as a
+    /// `NameserverIpInconsistency` against the consensus.
+    #[test]
+    fn failed_vantage_lookup_is_no_data() {
+        use crate::dns::{DnsRecord, RecordData};
+        let a = |ip: &str| DnsRecord {
+            name: "ns1.example.com".into(),
+            record_type: RecordType::A,
+            ttl: 300,
+            data: RecordData::A { address: ip.into() },
+        };
+        let failed = || Err(SeerError::DnsError("SERVFAIL".into()));
+        assert_eq!(
+            vantage_addresses(Ok(vec![a("192.0.2.2"), a("192.0.2.1")]), Ok(vec![])),
+            Some(vec!["192.0.2.1".to_string(), "192.0.2.2".to_string()])
+        );
+        assert_eq!(vantage_addresses(Ok(vec![]), Ok(vec![])), Some(vec![]));
+        assert_eq!(vantage_addresses(Ok(vec![a("192.0.2.1")]), failed()), None);
+        assert_eq!(vantage_addresses(failed(), failed()), None);
+    }
+
+    /// Regression: the whole per-vantage enrichment ran under one 8s cap and
+    /// was discarded when any lookup ran long. Each vantage's lookups are
+    /// bounded on their own: a hostname whose lookups never answer is left
+    /// out, and the one that answered is kept.
+    #[tokio::test]
+    async fn slow_vantage_lookup_keeps_the_answers_that_arrived() {
+        use crate::dns::test_support::{a_rdata, mock_dns_resolver, spawn_mock_dns_fn, MockReply};
+        use hickory_resolver::proto::rr::rdata as wire;
+        use hickory_resolver::proto::rr::{Name, RData};
+
+        let ns = |host: &str| RData::NS(wire::NS(Name::from_ascii(host).unwrap()));
+        let port = spawn_mock_dns_fn(
+            move |name, qtype| match (name, qtype.to_string().as_str()) {
+                ("seer.test", "NS") => {
+                    MockReply::Answer(vec![ns("ns1.seer.test."), ns("ns2.seer.test.")])
+                }
+                ("ns1.seer.test", "A") => MockReply::Answer(vec![a_rdata([192, 0, 2, 1])]),
+                ("ns1.seer.test", _) => MockReply::NoData,
+                _ => MockReply::NoReply,
+            },
+        )
+        .await;
+        let timeout = Duration::from_millis(200);
+        let checker = PropagationChecker::new()
+            .with_servers(vec![DnsServer::new("Mock", "127.0.0.1", "Test", "Test")])
+            .with_resolver(mock_dns_resolver(port).with_timeout(timeout), timeout);
+
+        let result = checker
+            .check("seer.test", RecordType::NS)
+            .await
+            .expect("check");
+        let details = result.nameserver_details.expect("NS details");
+        let vantage = &details.per_vantage["127.0.0.1"];
+        assert_eq!(vantage["ns1.seer.test."], vec!["192.0.2.1".to_string()]);
+        assert!(!vantage.contains_key("ns2.seer.test."), "{vantage:?}");
+        assert!(details.inconsistencies.is_empty());
     }
 }

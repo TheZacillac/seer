@@ -129,7 +129,6 @@ mod tests {
             status: "signed".into(),
             chain_valid: true,
             authentication_tier: seer_core::AuthenticationTier::DigestOnly,
-            rrsig_records: vec![],
         }));
         let text = render_text(70, 14, |f| render(f, f.area(), &theme, &data));
         assert!(text.contains("signed"));

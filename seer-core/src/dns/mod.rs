@@ -34,7 +34,7 @@ mod transport;
 
 pub use compare::{DnsComparator, DnsComparison, ServerResult};
 pub use delegation::{DelegationChecker, DelegationReport, LameNs};
-pub use dnssec::{AuthenticationTier, DnskeyInfo, DnssecChecker, DnssecReport, DsInfo, RrsigInfo};
+pub use dnssec::{AuthenticationTier, DnskeyInfo, DnssecChecker, DnssecReport, DsInfo};
 pub use follow::{
     DnsFollower, FollowConfig, FollowIteration, FollowProgressCallback, FollowResult,
     MAX_FOLLOW_INTERVAL_SECS, MAX_FOLLOW_ITERATIONS,

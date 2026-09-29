@@ -253,6 +253,8 @@ mod tests {
             server_ip: ip.into(),
             values: values.iter().map(|v| v.to_string()).collect(),
             consensus: consensus.iter().map(|v| v.to_string()).collect(),
+            nxdomain: false,
+            consensus_nxdomain: false,
         }
     }
 

@@ -375,7 +375,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_error_rcode_is_a_response_not_a_failure() {
-        let port = spawn_mock_dns_fn(|_, _| MockReply::ServFail).await;
+        let port = spawn_mock_dns_fn(|_, _| MockReply::Rcode(ResponseCode::ServFail)).await;
         let transport = transport();
         let request = request_for(&transport, "www.seer.test");
         let message = transport

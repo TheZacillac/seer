@@ -244,11 +244,7 @@ impl MarkdownFormatter {
     }
 
     pub(super) fn format_dns_comparison(&self, comparison: &crate::dns::DnsComparison) -> String {
-        let result = if comparison.matches {
-            "**Result**: Records match"
-        } else {
-            "**Result**: Records differ"
-        };
+        let result = format!("**Result**: {}", comparison.summary());
         let mut output = vec![
             format!(
                 "## DNS Comparison: {} {}",
@@ -256,7 +252,7 @@ impl MarkdownFormatter {
                 comparison.record_type
             ),
             String::new(),
-            result.to_string(),
+            result,
             String::new(),
         ];
 
@@ -268,7 +264,23 @@ impl MarkdownFormatter {
             output.push(String::new());
             if let Some(ref err) = server.error {
                 output.push(format!("**Error**: {}", MdSafe(err)));
-            } else if server.records.is_empty() {
+                output.push(String::new());
+                continue;
+            }
+            if let Some(status) = server.status_label() {
+                output.push(format!("**Status**: {status}"));
+                output.push(String::new());
+            }
+            if !server.cname_chain.is_empty() {
+                let hops: Vec<String> = server
+                    .cname_chain
+                    .iter()
+                    .map(|hop| format!("{} → {}", hop.name, hop.format_short()))
+                    .collect();
+                output.push(format!("**CNAME chain**: {}", code_list(&hops)));
+                output.push(String::new());
+            }
+            if server.records.is_empty() {
                 output.push("*No records found*".to_string());
             } else {
                 output.push("| Record |".to_string());

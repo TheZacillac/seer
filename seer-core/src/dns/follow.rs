@@ -225,7 +225,7 @@ impl DnsFollower {
         nameserver: Option<&str>,
         config: FollowConfig,
         callback: Option<FollowProgressCallback>,
-        cancel_rx: Option<watch::Receiver<bool>>,
+        mut cancel_rx: Option<watch::Receiver<bool>>,
     ) -> Result<FollowResult> {
         config.validate()?;
         // The resolver's own per-name rule: keeps `www.` and passes an IPv6
@@ -333,18 +333,11 @@ impl DnsFollower {
             if i < config.iterations - 1 {
                 let sleep_duration = Duration::from_secs(config.interval_secs);
 
-                // Use interruptible sleep
-                if let Some(ref rx) = cancel_rx {
-                    let mut rx_clone = rx.clone();
-                    tokio::select! {
-                        _ = tokio::time::sleep(sleep_duration) => {}
-                        _ = rx_clone.changed() => {
-                            if *rx_clone.borrow() {
-                                debug!("Follow operation cancelled during sleep");
-                                interrupted = true;
-                                break;
-                            }
-                        }
+                if let Some(ref mut rx) = cancel_rx {
+                    if cancelled_during(rx, sleep_duration).await {
+                        debug!("Follow operation cancelled during sleep");
+                        interrupted = true;
+                        break;
                     }
                 } else {
                     tokio::time::sleep(sleep_duration).await;
@@ -355,7 +348,7 @@ impl DnsFollower {
         let ended_at = Utc::now();
 
         Ok(FollowResult {
-            domain: domain.to_string(),
+            domain,
             record_type,
             nameserver: nameserver.map(|s| s.to_string()),
             iterations_requested: config.iterations,
@@ -366,6 +359,23 @@ impl DnsFollower {
             started_at,
             ended_at,
         })
+    }
+}
+
+/// Sleeps for `duration` unless the follow is cancelled first; returns whether
+/// it was. Only a `true` value cancels — `wait_for` also sees one sent before
+/// the sleep began. Every sender gone means nothing can cancel any more, so
+/// the sleep runs its full length instead of waking at once (which turned the
+/// follow into back-to-back queries).
+async fn cancelled_during(rx: &mut watch::Receiver<bool>, duration: Duration) -> bool {
+    let cancel = async {
+        if rx.wait_for(|cancelled| *cancelled).await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    };
+    tokio::select! {
+        _ = tokio::time::sleep(duration) => false,
+        _ = cancel => true,
     }
 }
 
@@ -543,6 +553,7 @@ mod tests {
     async fn follow_first_iteration_error_is_not_a_baseline() {
         use std::sync::atomic::{AtomicBool, Ordering};
 
+        use hickory_resolver::proto::op::ResponseCode;
         use hickory_resolver::proto::rr::rdata as wire;
         use hickory_resolver::proto::rr::{RData as HickoryRData, RecordType as WireType};
 
@@ -559,7 +570,7 @@ mod tests {
                         192, 0, 2, 7,
                     )))])
                 } else {
-                    MockReply::ServFail
+                    MockReply::Rcode(ResponseCode::ServFail)
                 }
             }
         })
@@ -834,5 +845,45 @@ mod tests {
             result.completed_iterations() < 100,
             "should not complete all iterations"
         );
+    }
+
+    /// Regression: the sleep woke at once when every sender was dropped
+    /// (`changed()` errors immediately), so a follow whose caller let go of
+    /// the sender ran its iterations back to back.
+    #[tokio::test(start_paused = true)]
+    async fn cancel_sleep_runs_full_length_when_sender_dropped() {
+        let (tx, mut rx) = watch::channel(false);
+        drop(tx);
+        let start = tokio::time::Instant::now();
+        assert!(!cancelled_during(&mut rx, Duration::from_secs(30)).await);
+        assert_eq!(start.elapsed(), Duration::from_secs(30));
+    }
+
+    /// Regression: a value already seen (or a `false` send) must not end the
+    /// sleep; only `true` cancels, including one sent before the sleep.
+    #[tokio::test(start_paused = true)]
+    async fn cancel_sleep_only_true_cancels() {
+        let (tx, mut rx) = watch::channel(false);
+        tx.send(false).expect("receiver alive");
+        let start = tokio::time::Instant::now();
+        assert!(!cancelled_during(&mut rx, Duration::from_secs(5)).await);
+        assert_eq!(start.elapsed(), Duration::from_secs(5));
+
+        tx.send(true).expect("receiver alive");
+        let start = tokio::time::Instant::now();
+        assert!(cancelled_during(&mut rx, Duration::from_secs(5)).await);
+        assert_eq!(start.elapsed(), Duration::ZERO);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancel_sleep_wakes_on_cancel_mid_sleep() {
+        let (tx, mut rx) = watch::channel(false);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            tx.send(true).expect("receiver alive");
+        });
+        let start = tokio::time::Instant::now();
+        assert!(cancelled_during(&mut rx, Duration::from_secs(60)).await);
+        assert_eq!(start.elapsed(), Duration::from_secs(2));
     }
 }

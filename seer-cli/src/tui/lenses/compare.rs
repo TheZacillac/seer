@@ -8,6 +8,7 @@ use ratatui::Frame;
 use crate::tui::action::LensData;
 use crate::tui::theme::Theme;
 use crate::tui::widgets::{or_dash, panel};
+use seer_core::output::sanitize_line;
 
 pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
     let LensData::Compare(c) = data else {
@@ -35,9 +36,11 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
     // Summary line
     let (summary_text, summary_color) = if c.matches {
         ("● identical".to_string(), theme.green)
-    } else {
+    } else if c.status_matches() && c.chain_matches() {
         let n = c.only_in_a.len() + c.only_in_b.len();
         (format!("≠ {n} difference(s)"), theme.yellow)
+    } else {
+        (format!("≠ {}", sanitize_line(&c.summary())), theme.yellow)
     };
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -97,6 +100,45 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
             .add_modifier(Modifier::DIM),
     );
 
+    // The response code and CNAME chain lead: two servers can agree on the
+    // records yet differ there (NXDOMAIN vs NODATA, another CDN target).
+    let status = |s: &seer_core::dns::ServerResult| or_dash(s.status_label());
+    let chain = |s: &seer_core::dns::ServerResult| {
+        let hops: Vec<String> = s.cname_chain.iter().map(|r| r.format_short()).collect();
+        or_dash((!hops.is_empty()).then(|| sanitize_line(&hops.join(" → "))))
+    };
+    let differs = |same: bool| {
+        let (dot, color) = if same {
+            ("=", theme.text)
+        } else {
+            ("≠", theme.yellow)
+        };
+        (dot.to_string(), Style::default().fg(color))
+    };
+    let mut head_rows = Vec::new();
+    let (dot, style) = differs(c.status_matches());
+    head_rows.push(
+        Row::new(vec![
+            dot,
+            "status".into(),
+            status(&c.server_a),
+            status(&c.server_b),
+        ])
+        .style(style),
+    );
+    if !c.server_a.cname_chain.is_empty() || !c.server_b.cname_chain.is_empty() {
+        let (dot, style) = differs(c.chain_matches());
+        head_rows.push(
+            Row::new(vec![
+                dot,
+                "CNAME".into(),
+                chain(&c.server_a),
+                chain(&c.server_b),
+            ])
+            .style(style),
+        );
+    }
+
     let rows: Vec<Row> = all_values
         .iter()
         .map(|val| {
@@ -143,7 +185,11 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
         );
     }
 
-    let all_rows: Vec<Row> = rows.into_iter().chain(error_rows).collect();
+    let all_rows: Vec<Row> = head_rows
+        .into_iter()
+        .chain(rows)
+        .chain(error_rows)
+        .collect();
 
     let table = Table::new(
         all_rows,
@@ -164,7 +210,7 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
 mod tests {
     use super::*;
     use crate::tui::test_util::render_text;
-    use seer_core::dns::{DnsComparison, RecordData, RecordType, ServerResult};
+    use seer_core::dns::{DnsComparison, DnsStatus, RecordData, RecordType, ServerResult};
     use seer_core::DnsRecord;
 
     fn make_record(ip: &str) -> DnsRecord {
@@ -183,11 +229,15 @@ mod tests {
             record_type: RecordType::A,
             server_a: ServerResult {
                 nameserver: "8.8.8.8".into(),
+                status: Some(DnsStatus::NoError),
+                cname_chain: vec![],
                 records: vec![make_record(ip)],
                 error: None,
             },
             server_b: ServerResult {
                 nameserver: "1.1.1.1".into(),
+                status: Some(DnsStatus::NoError),
+                cname_chain: vec![],
                 records: if matches {
                     vec![make_record(ip)]
                 } else {
@@ -247,5 +297,25 @@ mod tests {
             text.contains("difference"),
             "non-matching should show 'difference(s)'"
         );
+    }
+
+    /// A negative-answer difference has no differing records to count, so
+    /// the summary names the two outcomes instead of "0 difference(s)".
+    #[test]
+    fn renders_status_difference() {
+        let theme = Theme::frappe();
+        let mut c = comparison_fixture(true);
+        c.matches = false;
+        c.common.clear();
+        c.server_a.records.clear();
+        c.server_b.records.clear();
+        c.server_a.status = Some(DnsStatus::NxDomain);
+        let data = LensData::Compare(Box::new(c));
+        let text = render_text(90, 14, |f| render(f, f.area(), &theme, &data));
+        assert!(
+            text.contains("Responses differ: NXDOMAIN vs NODATA"),
+            "{text}"
+        );
+        assert!(!text.contains("0 difference"), "{text}");
     }
 }

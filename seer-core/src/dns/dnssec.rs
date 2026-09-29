@@ -10,8 +10,6 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
-use hickory_resolver::config::ResolverOpts;
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use hickory_resolver::net::{DnsError, NetError};
 use hickory_resolver::proto::dnssec::rdata::{DNSSECRData, DNSKEY, DS};
@@ -22,6 +20,7 @@ use hickory_resolver::TokioResolver;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, instrument};
 
+use super::delegation::DEFAULT_TIMEOUT;
 use super::resolver::{apply_standard_opts, fqdn, google_or_pinned};
 use crate::error::Result;
 
@@ -44,10 +43,15 @@ pub struct DnssecReport {
     pub issues: Vec<String>,
     /// Overall status: "signed", "unsigned", "partial", or "misconfigured".
     ///
-    /// "misconfigured" covers a DS↔DNSKEY mismatch and a DS at the parent
-    /// with no (or an unobtainable) DNSKEY behind it — validating resolvers
-    /// fail such a zone. "partial" is a DNSKEY with no DS (an island of
-    /// security), or a DS set validators would ignore entirely.
+    /// "signed" needs one DS that authenticates a published DNSKEY — all a
+    /// validator needs (RFC 4035 §5.2), so a DS left over from a key
+    /// rollover (RFC 7583) is an issue, not a failure. "misconfigured" is a
+    /// DS set validators would use in which no DS matches a DNSKEY, or such a
+    /// DS at the parent with no (or an unobtainable) DNSKEY behind it —
+    /// validating resolvers fail the zone. "partial" is a DNSKEY with no DS
+    /// (an island of security), or a DS set validators ignore entirely
+    /// (unsupported algorithms or digest types), which leaves the zone
+    /// unsigned in their eyes.
     ///
     /// IMPORTANT: this reflects DS↔DNSKEY *digest consistency* (RFC 4509)
     /// observed over plain, unauthenticated DNS. It does NOT verify any RRSIG
@@ -58,9 +62,10 @@ pub struct DnssecReport {
     /// self-consistent DS+DNSKEY pair. Do not treat this as proof of
     /// authenticity.
     pub status: String,
-    /// Whether every DS record's digest matches a published DNSKEY (RFC 4509
-    /// digest consistency). This is NOT signature / chain-of-trust validation —
-    /// see the caveat on `status`.
+    /// Whether at least one DS record's digest matches a published DNSKEY
+    /// (RFC 4509 digest consistency) — the link a validator follows. DS
+    /// records that match nothing are listed in `issues`. This is NOT
+    /// signature / chain-of-trust validation — see the caveat on `status`.
     pub chain_valid: bool,
     /// Machine-readable tier describing the DEPTH of checking that was
     /// performed, so consumers don't over-trust a digest-only "signed" result.
@@ -68,11 +73,6 @@ pub struct DnssecReport {
     /// this field says only *what was checked*.
     #[serde(default = "default_authentication_tier")]
     pub authentication_tier: AuthenticationTier,
-    /// RRSIG signatures observed over the zone apex, populated only when RRSIG
-    /// validation is enabled (`DnssecChecker::with_rrsig_validation(true)`).
-    /// Empty in the default fast path.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub rrsig_records: Vec<RrsigInfo>,
 }
 
 /// The depth of DNSSEC verification performed for a [`DnssecReport`].
@@ -86,52 +86,13 @@ pub struct DnssecReport {
 pub enum AuthenticationTier {
     /// No DNSSEC records are published.
     Unsigned,
-    /// Only DS↔DNSKEY digest consistency (RFC 4509) was checked — the default
-    /// fast path. Does NOT inspect RRSIG signatures or their validity windows.
+    /// Only DS↔DNSKEY digest consistency (RFC 4509) was checked. Does NOT
+    /// inspect RRSIG signatures or their validity windows.
     DigestOnly,
-    /// RRSIG signatures over the apex were additionally fetched and their
-    /// validity windows inspected (expired / near-expiry surfaced in
-    /// `issues`). Still not full cryptographic chain validation to the root.
-    RrsigChecked,
 }
 
 fn default_authentication_tier() -> AuthenticationTier {
     AuthenticationTier::DigestOnly
-}
-
-/// Summary of a single RRSIG record's coverage and validity window.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RrsigInfo {
-    /// The record type this signature covers (e.g. "DNSKEY", "SOA").
-    pub type_covered: String,
-    /// DNSSEC algorithm number.
-    pub algorithm: u8,
-    /// Human-readable algorithm name.
-    pub algorithm_name: String,
-    /// Key tag of the signing key.
-    pub key_tag: u16,
-    /// The signer (zone) name.
-    pub signer_name: String,
-    /// Signature inception time.
-    pub inception: Option<DateTime<Utc>>,
-    /// Signature expiration time.
-    pub expiration: Option<DateTime<Utc>>,
-    /// Whether the signature is currently outside its validity window.
-    pub expired: bool,
-    /// Days until the signature expires (negative if already expired).
-    pub expires_in_days: i64,
-}
-
-/// Days-until-expiry threshold below which an RRSIG is flagged as near-expiry.
-const RRSIG_EXPIRY_WARN_DAYS: i64 = 7;
-
-/// Given an RRSIG's inception/expiration and the current time (all Unix
-/// seconds), returns `(expired, expires_in_days)`. `expired` is true when
-/// `now` is outside `[inception, expiration]`. Pure, so it is unit-testable.
-fn rrsig_validity(inception: i64, expiration: i64, now: i64) -> (bool, i64) {
-    let expired = now > expiration || now < inception;
-    let expires_in_days = (expiration - now).div_euclid(86_400);
-    (expired, expires_in_days)
 }
 
 /// Summary of a DS record.
@@ -167,9 +128,6 @@ pub struct DnskeyInfo {
 /// AUTHORITY section), so the walk rarely takes more than one step.
 const MAX_ZONE_WALK: usize = 8;
 
-/// Per-query timeout, matching the resolver default.
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
-
 /// Where [`DnssecChecker::find_zone_apex`] landed.
 #[derive(Debug, PartialEq, Eq)]
 enum ZoneApex {
@@ -187,9 +145,8 @@ pub struct DnssecChecker {
     /// single resolver and a single DNSKEY query feed both the displayed key
     /// list and the digest verification, so the two can never disagree.
     resolver: TokioResolver,
-    /// When true, `check` additionally fetches RRSIG signatures and inspects
-    /// their validity windows (opt-in; adds a network round-trip).
-    check_rrsig: bool,
+    /// The per-query timeout the resolver was built with.
+    timeout: Duration,
     /// Test-only: pin every resolver this checker builds to a loopback mock.
     #[cfg(test)]
     upstream: Option<(IpAddr, u16)>,
@@ -204,19 +161,24 @@ impl Default for DnssecChecker {
 impl DnssecChecker {
     pub fn new() -> Self {
         Self {
-            resolver: Self::build_resolver(false, None),
-            check_rrsig: false,
+            resolver: Self::build_resolver(None, DEFAULT_TIMEOUT),
+            timeout: DEFAULT_TIMEOUT,
             #[cfg(test)]
             upstream: None,
         }
     }
 
-    /// Enables (or disables) the opt-in RRSIG validity check. When enabled,
-    /// `check` fetches RRSIG records for a signed zone and flags expired /
-    /// near-expiry signatures — the most common real-world DNSSEC outage that
-    /// the default digest-consistency check is blind to.
-    pub fn with_rrsig_validation(mut self, on: bool) -> Self {
-        self.check_rrsig = on;
+    /// Builds a checker honoring `~/.seer/config.toml` (`timeouts.dns_secs`).
+    /// The records are always read through the default upstream, so the
+    /// configured nameserver does not apply.
+    pub fn from_config(config: &crate::config::SeerConfig) -> Self {
+        Self::new().with_timeout(config.dns_timeout())
+    }
+
+    /// Sets the per-query timeout.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self.resolver = Self::build_resolver(self.upstream(), timeout);
         self
     }
 
@@ -224,7 +186,7 @@ impl DnssecChecker {
     #[cfg(test)]
     fn with_upstream(mut self, ip: IpAddr, port: u16) -> Self {
         self.upstream = Some((ip, port));
-        self.resolver = Self::build_resolver(false, self.upstream);
+        self.resolver = Self::build_resolver(self.upstream, self.timeout);
         self
     }
 
@@ -240,55 +202,17 @@ impl DnssecChecker {
 
     /// Builds a hickory resolver against Google DNS (or, in tests only, the
     /// pinned loopback `upstream`) with the shared option set from
-    /// [`apply_standard_opts`]. When `validating` is true the DNSSEC-OK (DO)
-    /// bit is set (`opts.validate`), which is required for upstream
-    /// resolvers to return RRSIG records.
-    fn build_resolver(validating: bool, upstream: Option<(IpAddr, u16)>) -> TokioResolver {
+    /// [`apply_standard_opts`] (hand-copied here it had drifted and lacked
+    /// the pinned server ordering).
+    fn build_resolver(upstream: Option<(IpAddr, u16)>, timeout: Duration) -> TokioResolver {
         let mut builder = TokioResolver::builder_with_config(
             google_or_pinned(upstream),
             TokioRuntimeProvider::default(),
         );
-        apply_dnssec_opts(builder.options_mut(), validating);
+        apply_standard_opts(builder.options_mut(), timeout);
         builder
             .build()
             .expect("hickory resolver build is infallible without TLS features")
-    }
-
-    /// Fetches RRSIG records covering the zone apex and summarizes each one's
-    /// coverage and validity window. Best-effort: returns an empty vec if the
-    /// resolver path does not surface RRSIGs (e.g. DO stripped upstream), so
-    /// the caller never over-claims validation.
-    async fn resolve_rrsigs(&self, zone: &str) -> Vec<RrsigInfo> {
-        let resolver = Self::build_resolver(true, self.upstream());
-        let Ok(lookup) = resolver.lookup(fqdn(zone), HickoryRecordType::RRSIG).await else {
-            return vec![];
-        };
-        let now = Utc::now().timestamp();
-        lookup
-            .answers()
-            .iter()
-            .filter_map(|record| {
-                let RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) = &record.data else {
-                    return None;
-                };
-                let input = rrsig.input();
-                let inception = input.sig_inception.get() as i64;
-                let expiration = input.sig_expiration.get() as i64;
-                let (expired, expires_in_days) = rrsig_validity(inception, expiration, now);
-                let algorithm = u8::from(input.algorithm);
-                Some(RrsigInfo {
-                    type_covered: input.type_covered.to_string(),
-                    algorithm,
-                    algorithm_name: algorithm_name(algorithm),
-                    key_tag: input.key_tag,
-                    signer_name: input.signer_name.to_string(),
-                    inception: DateTime::from_timestamp(inception, 0),
-                    expiration: DateTime::from_timestamp(expiration, 0),
-                    expired,
-                    expires_in_days,
-                })
-            })
-            .collect()
     }
 
     /// Queries the DS RRset for `zone` (served by the parent zone).
@@ -579,12 +503,14 @@ impl DnssecChecker {
         let (chain_valid, status) = derive_chain_status(&ds_info, has_dnskey);
 
         // Structural explanations for the non-"signed" verdicts.
-        if has_ds && !has_dnskey {
-            issues.push(if status == "partial" {
+        if has_ds && status == "partial" {
+            issues.push(
                 "DS records exist at the parent, but every one uses an algorithm or digest \
                  type validating resolvers do not support \u{2014} the zone is treated as unsigned"
-                    .to_string()
-            } else if dnskey_query_failed {
+                    .to_string(),
+            );
+        } else if has_ds && !has_dnskey {
+            issues.push(if dnskey_query_failed {
                 "DS records exist at the parent but the DNSKEY query failed \u{2014} a \
                  validating upstream returns SERVFAIL when the chain is broken, so validating \
                  resolvers are likely failing this zone"
@@ -602,35 +528,11 @@ impl DnssecChecker {
             );
         }
 
-        // Opt-in RRSIG validity inspection (the default check is blind to
-        // expired signatures — the most common real-world DNSSEC outage).
         let enabled = has_ds || has_dnskey;
-        let mut rrsig_records = Vec::new();
-        if self.check_rrsig && enabled {
-            rrsig_records = self.resolve_rrsigs(&zone).await;
-            for r in &rrsig_records {
-                if r.expired {
-                    issues.push(format!(
-                        "RRSIG (key_tag={}, covers {}) is outside its validity window (expires_in_days={})",
-                        r.key_tag, r.type_covered, r.expires_in_days
-                    ));
-                } else if r.expires_in_days <= RRSIG_EXPIRY_WARN_DAYS {
-                    issues.push(format!(
-                        "RRSIG (key_tag={}, covers {}) expires in {} day(s)",
-                        r.key_tag, r.type_covered, r.expires_in_days
-                    ));
-                }
-            }
-        }
-
-        // Report the DEPTH of checking performed. RrsigChecked only when we
-        // actually observed RRSIGs — never claim more than we verified.
-        let authentication_tier = if !enabled {
-            AuthenticationTier::Unsigned
-        } else if !rrsig_records.is_empty() {
-            AuthenticationTier::RrsigChecked
-        } else {
+        let authentication_tier = if enabled {
             AuthenticationTier::DigestOnly
+        } else {
+            AuthenticationTier::Unsigned
         };
 
         Ok(DnssecReport {
@@ -644,7 +546,6 @@ impl DnssecChecker {
             status: status.to_string(),
             chain_valid,
             authentication_tier,
-            rrsig_records,
         })
     }
 
@@ -665,21 +566,6 @@ impl DnssecChecker {
     }
 }
 
-/// The checker's resolver options: the shared set from
-/// [`apply_standard_opts`] (hand-copied here it had drifted and lacked the
-/// pinned server ordering), plus — when `validating` — the DNSSEC-OK bit.
-fn apply_dnssec_opts(opts: &mut ResolverOpts, validating: bool) {
-    apply_standard_opts(opts, DEFAULT_TIMEOUT);
-    if validating {
-        // Sets the DO bit so RRSIGs are returned (and asks hickory to
-        // validate). A validation failure surfaces as a lookup error, which
-        // the RRSIG path treats as "no data" and degrades to the digest-only
-        // tier — never a false "validated" claim.
-        opts.validate = true;
-        opts.edns0 = true;
-    }
-}
-
 /// Derives `(chain_valid, status)` from the DS cross-validation results and
 /// whether the zone publishes a DNSKEY RRset. Pure, so the verdict policy is
 /// unit-testable without DNS.
@@ -691,31 +577,26 @@ fn apply_dnssec_opts(opts: &mut ResolverOpts, validating: bool) {
 fn derive_chain_status(ds_info: &[DsInfo], has_dnskey: bool) -> (bool, &'static str) {
     let has_ds = !ds_info.is_empty();
 
-    // A DS whose digest type we cannot compute is excluded from the "all
-    // must verify" check (we can't judge it), but at least one computable DS
-    // must actually verify — otherwise a zone we can't evaluate at all would
-    // be reported as valid.
-    let chain_valid = has_ds
-        && has_dnskey
+    // One DS that authenticates a DNSKEY is all a validator needs (RFC 4035
+    // §5.2): during a double-DS rollover (RFC 7583) the parent lists a DS
+    // for a key the zone no longer (or does not yet) publish, and the zone
+    // still validates. Unmatched DS records are reported as issues.
+    let chain_valid = has_dnskey
         && ds_info
             .iter()
-            .any(|ds| ds.matched_key && ds.digest_verified)
-        && ds_info
-            .iter()
-            .filter(|ds| DnssecChecker::to_hickory_digest_type(ds.digest_type).is_some())
-            .all(|ds| ds.matched_key && ds.digest_verified);
+            .any(|ds| ds.matched_key && ds.digest_verified);
 
     let status = match (has_ds, has_dnskey) {
         (true, true) if chain_valid => "signed",
-        (true, true) => "misconfigured",
         // A DS the parent publishes tells validating resolvers to expect a
-        // signed zone; with no DNSKEY behind it (absent, or its query failed
-        // — a validating upstream SERVFAILs a broken chain) they fail the
-        // zone outright. That is a broken zone, not a "partial" one — unless
-        // no DS is usable by validators, in which case they treat the zone
-        // as unsigned (RFC 4035 §5.2).
-        (true, false) if ds_info.iter().any(ds_is_validatable) => "misconfigured",
-        (true, false) => "partial",
+        // signed zone; when none authenticates a DNSKEY (no key behind them,
+        // their query failed — a validating upstream SERVFAILs a broken
+        // chain — or every digest mismatches) they fail the zone outright.
+        // That is a broken zone, not a "partial" one — unless no DS is
+        // usable by validators, in which case they treat the zone as
+        // unsigned (RFC 4035 §5.2), with or without a DNSKEY.
+        (true, _) if ds_info.iter().any(ds_is_validatable) => "misconfigured",
+        (true, _) => "partial",
         // An island of security: signed, but no chain from the parent.
         (false, true) => "partial",
         (false, false) => "unsigned",
@@ -845,36 +726,22 @@ mod tests {
     }
 
     #[test]
-    fn rrsig_validity_classifies_windows() {
-        let day = 86_400i64;
-        let now = 1_000_000 * day; // arbitrary fixed "now"
-
-        // Comfortably valid: 30 days left.
-        let (expired, days) = rrsig_validity(now - day, now + 30 * day, now);
-        assert!(!expired);
-        assert_eq!(days, 30);
-
-        // Already past expiration.
-        let (expired, days) = rrsig_validity(now - 40 * day, now - day, now);
-        assert!(expired);
-        assert_eq!(days, -1);
-
-        // Not yet valid (inception in the future) also counts as expired/out-of-window.
-        let (expired, _days) = rrsig_validity(now + day, now + 30 * day, now);
-        assert!(expired);
-    }
-
-    #[test]
     fn default_tier_is_digest_only() {
-        // Reports deserialized without the field default to digest-only, and
-        // a fresh checker does not enable RRSIG validation.
+        // Reports deserialized without the field default to digest-only.
         assert_eq!(
             default_authentication_tier(),
             AuthenticationTier::DigestOnly
         );
-        let checker = DnssecChecker::new();
-        assert!(!checker.check_rrsig);
-        assert!(checker.with_rrsig_validation(true).check_rrsig);
+    }
+
+    #[test]
+    fn from_config_applies_dns_timeout() {
+        let mut config = crate::config::SeerConfig::default();
+        config.timeouts.dns_secs = 9;
+        assert_eq!(
+            DnssecChecker::from_config(&config).timeout,
+            Duration::from_secs(9)
+        );
     }
 
     #[test]
@@ -907,7 +774,6 @@ mod tests {
             status: "signed".to_string(),
             chain_valid: true,
             authentication_tier: AuthenticationTier::DigestOnly,
-            rrsig_records: vec![],
         };
         let json = serde_json::to_string(&report).unwrap();
         assert!(json.contains("\"enabled\":true"));
@@ -958,20 +824,30 @@ mod tests {
             derive_chain_status(&mismatch, true),
             (false, "misconfigured")
         );
-        // One good DS does not excuse a computable one that fails.
-        let mixed = [ds(1, 13, 2, true, true), ds(2, 13, 2, true, false)];
-        assert_eq!(derive_chain_status(&mixed, true), (false, "misconfigured"));
     }
 
     #[test]
-    fn chain_status_uncomputable_digest_is_excluded_but_not_sufficient() {
-        // A GOST (type 3) DS can't be computed: it is skipped by the
-        // all-verify rule, but alone it cannot make the chain valid.
+    fn chain_status_one_authenticating_ds_is_enough() {
+        // Regression: any computable DS that failed made the zone
+        // "misconfigured", although validators need only one DS that
+        // authenticates a DNSKEY (RFC 4035 §5.2) — the parent's DS set during
+        // a double-DS key rollover (RFC 7583) holds one for a key the zone
+        // does not publish yet (or any more).
+        let rollover = [ds(1, 13, 2, true, true), ds(2, 13, 2, false, false)];
+        assert_eq!(derive_chain_status(&rollover, true), (true, "signed"));
+        let mixed = [ds(1, 13, 2, true, true), ds(2, 13, 2, true, false)];
+        assert_eq!(derive_chain_status(&mixed, true), (true, "signed"));
+    }
+
+    #[test]
+    fn chain_status_uncomputable_digest_alone_is_partial() {
+        // Regression: a DS set whose only digest is one validators do not
+        // implement (GOST, type 3) was "misconfigured" beside a DNSKEY but
+        // "partial" without one. Validators ignore such a set (RFC 4035
+        // §5.2) and treat the zone as unsigned either way.
         let gost_only = [ds(1, 13, 3, true, false)];
-        assert_eq!(
-            derive_chain_status(&gost_only, true),
-            (false, "misconfigured")
-        );
+        assert_eq!(derive_chain_status(&gost_only, true), (false, "partial"));
+        assert_eq!(derive_chain_status(&gost_only, false), (false, "partial"));
         let with_sha256 = [ds(1, 13, 3, true, false), ds(1, 13, 2, true, true)];
         assert_eq!(derive_chain_status(&with_sha256, true), (true, "signed"));
     }
@@ -1003,21 +879,6 @@ mod tests {
     fn chain_status_island_and_unsigned() {
         assert_eq!(derive_chain_status(&[], true), (false, "partial"));
         assert_eq!(derive_chain_status(&[], false), (false, "unsigned"));
-    }
-
-    #[test]
-    fn resolver_opts_share_the_standard_set() {
-        // Regression: the hand-copied option set lacked the pinned
-        // `UserProvidedOrder` server ordering.
-        for validating in [false, true] {
-            let mut opts = ResolverOpts::default();
-            apply_dnssec_opts(&mut opts, validating);
-            assert_eq!(
-                opts.server_ordering_strategy,
-                hickory_resolver::config::ServerOrderingStrategy::UserProvidedOrder
-            );
-            assert_eq!(opts.validate, validating);
-        }
     }
 
     #[test]
@@ -1163,7 +1024,7 @@ mod tests {
     async fn check_uses_the_negative_answer_soa_to_find_the_apex() {
         let port = spawn_mock_dns_fn(|qname, qtype| match (qname, qtype) {
             ("deep.api.signed.test", WireType::SOA) => MockReply::NoDataWithSoa("signed.test"),
-            ("api.signed.test", _) => MockReply::ServFail,
+            ("api.signed.test", _) => MockReply::Rcode(ResponseCode::ServFail),
             ("signed.test", WireType::DS) => {
                 MockReply::Answer(vec![ds_rdata(ds_for("signed.test", &test_key()))])
             }
@@ -1191,7 +1052,7 @@ mod tests {
             ("broken.test", WireType::DS) => {
                 MockReply::Answer(vec![ds_rdata(ds_for("broken.test", &test_key()))])
             }
-            ("broken.test", _) => MockReply::ServFail,
+            ("broken.test", _) => MockReply::Rcode(ResponseCode::ServFail),
             _ => MockReply::NoData,
         })
         .await;
@@ -1254,27 +1115,6 @@ mod tests {
         // Should have computed key tags on DNSKEYs
         for key in &report.dnskey_records {
             assert!(key.key_tag > 0, "key_tag should be computed");
-        }
-    }
-
-    #[tokio::test]
-    #[ignore = "live network; run with --ignored or SEER_LIVE_TESTS=1"]
-    async fn test_live_dnssec_rrsig_validation_cloudflare() {
-        let checker = DnssecChecker::new().with_rrsig_validation(true);
-        let report = checker.check("cloudflare.com").await.unwrap();
-        assert!(report.enabled, "cloudflare.com should have DNSSEC enabled");
-        // When the resolver surfaces RRSIGs, the tier upgrades and every
-        // signature must be within its validity window for a healthy zone.
-        if !report.rrsig_records.is_empty() {
-            assert_eq!(report.authentication_tier, AuthenticationTier::RrsigChecked);
-            for r in &report.rrsig_records {
-                assert!(r.expiration.is_some(), "RRSIG should carry an expiration");
-                assert!(
-                    !r.expired,
-                    "cloudflare.com RRSIG (covers {}) should be within its validity window",
-                    r.type_covered
-                );
-            }
         }
     }
 

@@ -225,8 +225,6 @@ pub async fn run_live_follow(
 ) -> seer_core::Result<seer_core::FollowResult> {
     use std::io::Write;
 
-    // `cancel_tx` must stay alive until the follow returns: once every sender
-    // is dropped, the follow's interruptible sleep wakes immediately.
     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
     if handle_sigint {
         let cancel_tx = cancel_tx.clone();

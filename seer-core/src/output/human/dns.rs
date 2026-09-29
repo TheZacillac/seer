@@ -190,7 +190,6 @@ impl HumanFormatter {
         let tier = match report.authentication_tier {
             crate::dns::AuthenticationTier::Unsigned => "unsigned (no DNSSEC records)",
             crate::dns::AuthenticationTier::DigestOnly => "digest-only (DS↔DNSKEY consistency)",
-            crate::dns::AuthenticationTier::RrsigChecked => "rrsig-checked (signature windows)",
         };
         rows.kv("Verification depth", self.value(tier));
         rows.push(self.warning(
@@ -263,10 +262,11 @@ impl HumanFormatter {
         ))];
 
         // Match status
+        let summary = comparison.summary();
         if comparison.matches {
-            output.push(format!("  {} Records match", self.success("✓")));
+            output.push(format!("  {} {}", self.success("✓"), summary));
         } else {
-            output.push(format!("  {} Records differ", self.error("✗")));
+            output.push(format!("  {} {}", self.error("✗"), summary));
         }
         output.push(String::new());
 
@@ -285,11 +285,16 @@ impl HumanFormatter {
                 ));
             } else {
                 output.push(format!(
-                    "  {} ({}): {} records",
+                    "  {} ({}): {} · {} records",
                     self.label(label),
                     nameserver,
+                    self.value(&server.status_label().unwrap_or_default()),
                     self.value(&server.records.len().to_string())
                 ));
+                for hop in &server.cname_chain {
+                    let hop = sanitize_display(&format!("{} → {}", hop.name, hop.format_short()));
+                    output.push(format!("    CNAME {}", self.value(&hop)));
+                }
                 for record in &server.records {
                     let record = sanitize_display(&record.format_short());
                     output.push(format!("    - {}", self.value(&record)));
