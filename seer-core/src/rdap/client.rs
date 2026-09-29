@@ -970,10 +970,15 @@ async fn query_rdap_attempt(
         } else {
             None
         };
-        return Err((
-            SeerError::RdapError(format!("query failed with status {}", status)),
-            retry_after,
-        ));
+        // A 429 is its own error kind, so it survives retry exhaustion as
+        // RateLimited (Python `RateLimitedError`, REST 429) instead of a
+        // generic RDAP failure.
+        let error = if status.as_u16() == 429 {
+            SeerError::RateLimited(format!("RDAP query failed with status {}", status))
+        } else {
+            SeerError::RdapError(format!("query failed with status {}", status))
+        };
+        return Err((error, retry_after));
     }
 
     read_and_parse_rdap_body(response, &current, timeout)
@@ -1246,6 +1251,18 @@ fn wrap_all_candidates_failed(last_error: Option<SeerError>, candidate_count: us
         {
             SeerError::Timeout(format!(
                 "all {} RDAP candidate URLs timed out; last error: {}",
+                candidate_count, last
+            ))
+        }
+        SeerError::RateLimited(_) => SeerError::RateLimited(format!(
+            "all {} RDAP candidate URLs failed; last error: {}",
+            candidate_count, last
+        )),
+        SeerError::RetryExhausted { ref last_error, .. }
+            if matches!(**last_error, SeerError::RateLimited(_)) =>
+        {
+            SeerError::RateLimited(format!(
+                "all {} RDAP candidate URLs failed; last error: {}",
                 candidate_count, last
             ))
         }
@@ -1692,6 +1709,35 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.handle.as_deref(), Some("MOCK-1"));
+    }
+
+    /// Regression: a registry that kept answering 429 surfaced as a generic
+    /// RDAP error, so Python raised RuntimeError and the API returned 500.
+    #[tokio::test]
+    async fn mock_rdap_persistent_429_is_rate_limited() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "0"))
+            .mount(&server)
+            .await;
+
+        let client = RdapClient::new().allowing_reserved_for_tests();
+        let err = client
+            .query_rdap_with_retry(&format!("{}/domain/example.com", server.uri()))
+            .await
+            .unwrap_err();
+        let inner = match &err {
+            SeerError::RetryExhausted { last_error, .. } => last_error.as_ref(),
+            other => other,
+        };
+        assert!(matches!(inner, SeerError::RateLimited(_)), "got: {err:?}");
+
+        // Across several candidate URLs the kind is kept too.
+        let wrapped = wrap_all_candidates_failed(Some(err), 2);
+        assert!(
+            matches!(wrapped, SeerError::RateLimited(_)),
+            "got: {wrapped:?}"
+        );
     }
 
     #[tokio::test]

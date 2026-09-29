@@ -27,6 +27,12 @@ impl HumanFormatter {
         let mut rows = self.rows(&mut output, "  ");
         rows.text("Source", &result.source);
         rows.kv("Count", self.value(&result.count.to_string()));
+        if result.truncated {
+            rows.push(format!(
+                "  {}",
+                self.warning("Truncated: the source stopped early; this list may be incomplete")
+            ));
+        }
 
         if result.subdomains.is_empty() {
             rows.push(format!("  {}", self.warning("No subdomains found")));

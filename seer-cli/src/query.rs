@@ -384,12 +384,10 @@ async fn run_query(
             });
         }
         Query::Caa(domain) => {
-            // Normalize first so `caa HTTPS://WWW.EXAMPLE.COM` works and an
-            // invalid domain fails before any lookup.
-            let domain = seer_core::normalize_domain(&domain)?;
             let _spinner = spinner(format!("Looking up CAA policy for {}", domain));
             Payload::Caa(Box::new(
-                seer_core::caa::lookup_caa(&clients.dns, &domain).await,
+                seer_core::caa::lookup_caa(&clients.dns, &domain, config.nameserver.as_deref())
+                    .await?,
             ))
         }
         Query::Posture(domain) => {

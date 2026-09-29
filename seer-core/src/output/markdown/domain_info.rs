@@ -34,6 +34,12 @@ impl MarkdownFormatter {
         let mut b = Bullets(&mut output);
         b.text("Source", &result.source);
         b.raw("Count", result.count);
+        if result.truncated {
+            output.push(
+                "- **Truncated**: the source stopped early; this list may be incomplete"
+                    .to_string(),
+            );
+        }
         output.push(String::new());
 
         if result.subdomains.is_empty() {

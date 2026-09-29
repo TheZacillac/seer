@@ -415,12 +415,11 @@ impl BulkExecutor {
                 Ok(BulkResultData::Confusables(result))
             }
             BulkOperation::Caa { domain } => {
-                // lookup_caa itself never fails (CAA is advisory; resolver errors
-                // yield an empty policy) but expects a normalized domain — the
-                // same normalize-then-query shape the CLI's single-domain command
-                // uses, so an invalid domain still surfaces as a per-row error.
-                let domain = crate::validation::normalize_domain(domain)?;
-                let policy = crate::caa::lookup_caa(&self.dns_resolver, &domain).await;
+                // Only invalid input errors (a per-row error); resolver
+                // errors yield an empty policy.
+                let policy =
+                    crate::caa::lookup_caa(&self.dns_resolver, domain, self.nameserver.as_deref())
+                        .await?;
                 Ok(BulkResultData::Caa(policy))
             }
         }

@@ -97,7 +97,7 @@ impl StatusClient {
             self.fetch_certificate_info(&domain),
             self.fetch_domain_expiration(&domain),
             self.fetch_dns_resolution(&domain),
-            caa::lookup_caa(&self.dns_resolver, &domain),
+            caa::lookup_caa(&self.dns_resolver, &domain, None),
         );
 
         // Apply HTTP info
@@ -112,7 +112,8 @@ impl StatusClient {
 
         // Apply certificate info and tag the CAA policy with the issuer
         // comparison if a cert was retrieved.
-        let mut caa_policy: CaaPolicy = caa_policy;
+        // `domain` is already normalized, so `lookup_caa` cannot fail here.
+        let mut caa_policy: CaaPolicy = caa_policy.unwrap_or_else(|_| CaaPolicy::empty());
         match cert_result {
             Ok((cert_info, wildcard)) => {
                 caa_policy.issuer_match = Some(caa::classify_issuer(

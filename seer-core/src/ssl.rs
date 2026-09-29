@@ -282,7 +282,7 @@ impl SslChecker {
         // CAA query runs concurrently with the TLS probe — it is advisory
         // and never fails the report (a resolver error yields an empty
         // policy).
-        let caa_future = caa::lookup_caa(&self.dns_resolver, &domain);
+        let caa_future = caa::lookup_caa(&self.dns_resolver, &domain, None);
 
         // Resolve + SSRF check. `resolve_public_host` already falls back to
         // hickory (Google DNS) when the OS resolver fails — important for
@@ -291,6 +291,9 @@ impl SslChecker {
         let resolve_future = resolve_public_host(&domain, 443);
 
         let (caa_policy, socket_addrs) = tokio::join!(caa_future, resolve_future);
+        // `domain` is already normalized, so only a resolver miss is left,
+        // and that is an empty policy anyway.
+        let caa_policy = caa_policy.unwrap_or_else(|_| CaaPolicy::empty());
         let socket_addrs = socket_addrs.map_err(|e| {
             SeerError::SslError(format!(
                 "could not resolve {} for SSL inspection: {}",
@@ -506,7 +509,9 @@ mod tests {
         }
         .with_timeout(Duration::from_secs(3));
         assert_eq!(checker.dns_resolver.timeout(), Duration::from_secs(3));
-        let policy = caa::lookup_caa(&checker.dns_resolver, "seer.test").await;
+        let policy = caa::lookup_caa(&checker.dns_resolver, "seer.test", None)
+            .await
+            .unwrap();
         assert!(policy.has_policy, "the configured resolver must be kept");
     }
 

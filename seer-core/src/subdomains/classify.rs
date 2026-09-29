@@ -19,7 +19,7 @@ use std::collections::{BTreeSet, HashMap};
 use serde::{Deserialize, Serialize};
 
 use crate::dns::DnsResolver;
-use crate::takeover::{match_provider, resolve_host, truncate_to_cap};
+use crate::takeover::{resolve_host, truncate_to_cap};
 
 /// What a random name directly under one parent resolved to, when it did:
 /// the level has a wildcard. Only its CNAME target matters — a CDN-backed
@@ -101,10 +101,14 @@ fn cname_key(cname: Option<&str>) -> Option<String> {
 /// case it is `Live`. Addresses are deliberately not compared: a CDN-backed
 /// wildcard answers from a rotating pool, so an exact-IP match read every
 /// wildcard-synthesized name as live.
+///
+/// `provider` is the takeover-prone provider any hop of the name's CNAME
+/// chain points at (`resolve_host` walks the chain), not just the first.
 fn classify_one(
     name: String,
     addresses: Vec<String>,
     cname: Option<String>,
+    provider: Option<&'static str>,
     lookup_failed: bool,
     wildcard: Option<&WildcardAnswer>,
 ) -> ClassifiedSubdomain {
@@ -125,10 +129,8 @@ fn classify_one(
 
     // A dangling CNAME: points at a takeover-prone provider yet does not
     // resolve to any address.
-    let takeover_risk = match (&cname, status) {
-        (Some(target), SubdomainStatus::Dead) => {
-            match_provider(target).map(|p| p.provider.to_string())
-        }
+    let takeover_risk = match status {
+        SubdomainStatus::Dead => provider.map(str::to_string),
         _ => None,
     };
 
@@ -209,7 +211,8 @@ pub async fn classify_subdomains(
             let wildcard = parent_of(&name)
                 .and_then(|p| wildcards.get(p))
                 .and_then(Option::as_ref);
-            classify_one(name, r.addresses, r.cname, failed, wildcard)
+            let provider = r.provider.map(|(p, _)| p.provider);
+            classify_one(name, r.addresses, r.cname, provider, failed, wildcard)
         })
         .buffer_unordered(concurrency)
         .collect()
@@ -241,6 +244,38 @@ pub async fn classify_subdomains(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::takeover::match_provider;
+
+    /// `classify_one` with the provider of a one-hop chain, as
+    /// `resolve_host` would report it.
+    fn classify(
+        name: String,
+        addresses: Vec<String>,
+        cname: Option<String>,
+        lookup_failed: bool,
+        wildcard: Option<&WildcardAnswer>,
+    ) -> ClassifiedSubdomain {
+        let provider = cname
+            .as_deref()
+            .and_then(match_provider)
+            .map(|p| p.provider);
+        classify_one(name, addresses, cname, provider, lookup_failed, wildcard)
+    }
+
+    /// Regression: only the first CNAME hop was matched, so
+    /// `shop → edge.example.net → foo.herokudns.com` was never flagged.
+    #[test]
+    fn classify_flags_a_provider_deeper_in_the_chain() {
+        let c = classify_one(
+            "shop.example.com".to_string(),
+            vec![],
+            Some("edge.example.net".to_string()),
+            Some("Heroku"),
+            false,
+            None,
+        );
+        assert_eq!(c.takeover_risk.as_deref(), Some("Heroku"));
+    }
 
     /// Regression: classify used to keep its own provider table, which drifted
     /// from `seer takeover`'s (no Tumblr, Webflow, S3 website endpoints, ...,
@@ -249,7 +284,7 @@ mod tests {
     #[test]
     fn classify_flags_every_takeover_provider() {
         let dangling = |cname: &str| {
-            classify_one(
+            classify(
                 "gone.example.com".to_string(),
                 vec![],
                 Some(cname.to_string()),
@@ -272,7 +307,7 @@ mod tests {
 
     #[test]
     fn classify_dead_cname_to_provider_is_takeover_risk() {
-        let c = classify_one(
+        let c = classify(
             "gone.example.com".to_string(),
             vec![], // does not resolve
             Some("gone.herokuapp.com".to_string()),
@@ -287,7 +322,7 @@ mod tests {
     fn classify_failed_lookup_is_unknown_not_dangling() {
         // A timed-out lookup with a provider CNAME used to read as Dead + a
         // takeover risk; an unanswered query proves nothing.
-        let c = classify_one(
+        let c = classify(
             "slow.example.com".to_string(),
             vec![],
             Some("slow.herokuapp.com".to_string()),
@@ -297,7 +332,7 @@ mod tests {
         assert_eq!(c.status, SubdomainStatus::Unknown);
         assert!(c.takeover_risk.is_none());
         // If the other family answered, the host is simply live.
-        let c = classify_one(
+        let c = classify(
             "v6.example.com".to_string(),
             vec!["2001:db8::1".to_string()],
             None,
@@ -310,7 +345,7 @@ mod tests {
     #[test]
     fn classify_live_host_is_not_takeover_even_with_provider_cname() {
         // Resolves to an address → not dangling, so no takeover flag.
-        let c = classify_one(
+        let c = classify(
             "live.example.com".to_string(),
             vec!["203.0.113.5".to_string()],
             Some("live.herokuapp.com".to_string()),
@@ -326,7 +361,7 @@ mod tests {
         // Regression: exact-IP equality read a CDN wildcard's rotating
         // addresses as distinct live hosts.
         let wildcard = WildcardAnswer { cname: None };
-        let c = classify_one(
+        let c = classify(
             "anything.example.com".to_string(),
             vec!["203.0.113.7".to_string()],
             None,
@@ -339,7 +374,7 @@ mod tests {
         let wildcard = WildcardAnswer {
             cname: Some("edge.cdn.test.".to_string()),
         };
-        let c = classify_one(
+        let c = classify(
             "x.example.com".to_string(),
             vec!["203.0.113.7".to_string()],
             Some("EDGE.cdn.test".to_string()),
@@ -353,7 +388,7 @@ mod tests {
     fn classify_a_distinct_alias_under_a_wildcard_is_live() {
         // An explicitly configured CNAME the wildcard does not synthesize.
         let wildcard = WildcardAnswer { cname: None };
-        let c = classify_one(
+        let c = classify(
             "shop.example.com".to_string(),
             vec!["203.0.113.7".to_string()],
             Some("shops.myshopify.com".to_string()),
@@ -362,7 +397,7 @@ mod tests {
         );
         assert_eq!(c.status, SubdomainStatus::Live);
         // No wildcard at the level: resolving is live.
-        let c = classify_one(
+        let c = classify(
             "real.example.com".to_string(),
             vec!["203.0.113.7".to_string()],
             None,

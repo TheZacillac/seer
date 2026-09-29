@@ -135,6 +135,25 @@ fn pair<T: Display>((a, b): &(Option<T>, Option<T>)) -> (String, String) {
 
 /// The FIELD | A | B comparison table for a completed diff.
 fn comparison_table(f: &mut Frame, area: Rect, theme: &Theme, d: &seer_core::diff::DomainDiff) {
+    // Checks that failed are listed under the table: their rows read "—",
+    // which alone would look like a real absence.
+    let error_rows = u16::try_from(d.errors.len()).unwrap_or(u16::MAX);
+    let [area, errors_area] = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(error_rows)])
+        .areas(area);
+    let errors: Vec<Line> = d
+        .errors
+        .iter()
+        .map(|e| {
+            Line::from(Span::styled(
+                format!("! {}", sanitize_line(e)),
+                Style::default().fg(theme.red),
+            ))
+        })
+        .collect();
+    f.render_widget(Paragraph::new(errors), errors_area);
+
     let (reg, dns, ssl) = (&d.registration, &d.dns, &d.ssl);
     let joined = |(a, b): &(Vec<String>, Vec<String>)| {
         (sanitize_line(&a.join(", ")), sanitize_line(&b.join(", ")))
@@ -217,6 +236,31 @@ mod tests {
             },
             errors: Vec::new(),
         }
+    }
+
+    /// A failed check's rows read "—"; the lens must say the check failed.
+    #[test]
+    fn failed_checks_are_listed() {
+        let theme = Theme::frappe();
+        let mut diff = diff_fixture();
+        diff.errors = vec!["b.com: status check failed: HTTP request failed".into()];
+        let state = LensState::Loaded(LensData::Diff(Box::new(diff)));
+        let text = render_text(100, 24, |f| {
+            render(
+                f,
+                f.area(),
+                &theme,
+                Some("a.com"),
+                "b.com",
+                None,
+                false,
+                &state,
+            );
+        });
+        assert!(
+            text.contains("b.com: status check failed"),
+            "errors are shown: {text}"
+        );
     }
 
     #[test]

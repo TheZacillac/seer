@@ -1,0 +1,14 @@
+---
+source: seer-core/tests/format_snapshots.rs
+assertion_line: 1050
+expression: human ().format_subdomains (& fixture_subdomains_truncated())
+---
+
+[1;95mSubdomains: example.com[0m
+[37m───────────────────────[0m
+  [1;96mSource[0m: [97mcertspotter[0m
+  [1;96mCount[0m: [97m2[0m
+  [1;93mTruncated: the source stopped early; this list may be incomplete[0m
+
+    - [97mapi.example.com[0m
+    - [97mwww.example.com[0m

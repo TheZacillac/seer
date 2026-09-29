@@ -1,0 +1,13 @@
+---
+source: seer-core/tests/format_snapshots.rs
+assertion_line: 1050
+expression: markdown ().format_subdomains (& fixture_subdomains_truncated())
+---
+## Subdomains: example.com
+
+- **Source**: certspotter
+- **Count**: 2
+- **Truncated**: the source stopped early; this list may be incomplete
+
+- `api.example.com`
+- `www.example.com`

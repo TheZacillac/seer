@@ -11,6 +11,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::dns::{DnsResolver, RecordData, RecordType};
+use crate::error::Result;
+use crate::validation::normalize_host;
 
 /// Informational note surfaced alongside every CAA report.
 ///
@@ -173,17 +175,28 @@ fn analyze_wildcard(records: &[CaaRecord]) -> Option<String> {
     }
 }
 
-/// Looks up CAA records for `domain`, climbing the DNS tree per RFC 8659
+/// Looks up CAA records for `host`, climbing the DNS tree per RFC 8659
 /// section 3 until a record set is found or only a TLD remains.
 ///
-/// Returns an [`CaaPolicy::empty`] on resolver errors — CAA is advisory,
-/// so we never want to fail a higher-level check just because a CAA query
-/// did not return.
-pub async fn lookup_caa(resolver: &DnsResolver, domain: &str) -> CaaPolicy {
-    let mut current = domain.trim_end_matches('.').to_ascii_lowercase();
+/// `host` is normalized here with [`normalize_host`]: CAA is a per-name
+/// policy, so `www.` is kept (it can carry its own records). `nameserver`
+/// is an optional nameserver spec, as for [`DnsResolver::resolve`].
+///
+/// Errors only on invalid input. A resolver error yields
+/// [`CaaPolicy::empty`] — CAA is advisory, so a CAA query that did not
+/// return never fails a higher-level check.
+pub async fn lookup_caa(
+    resolver: &DnsResolver,
+    host: &str,
+    nameserver: Option<&str>,
+) -> Result<CaaPolicy> {
+    let mut current = normalize_host(host)?;
 
     loop {
-        match resolver.resolve(&current, RecordType::CAA, None).await {
+        match resolver
+            .resolve(&current, RecordType::CAA, nameserver)
+            .await
+        {
             Ok(records) if !records.is_empty() => {
                 let caa: Vec<CaaRecord> = records
                     .into_iter()
@@ -198,7 +211,7 @@ pub async fn lookup_caa(resolver: &DnsResolver, domain: &str) -> CaaPolicy {
                     .collect();
 
                 if !caa.is_empty() {
-                    return CaaPolicy::from_records(caa, current);
+                    return Ok(CaaPolicy::from_records(caa, current));
                 }
             }
             Ok(_) | Err(_) => {}
@@ -207,7 +220,7 @@ pub async fn lookup_caa(resolver: &DnsResolver, domain: &str) -> CaaPolicy {
         // Strip the leftmost label. Stop when only one label (TLD) remains.
         match current.split_once('.') {
             Some((_, rest)) if rest.contains('.') => current = rest.to_string(),
-            _ => return CaaPolicy::empty(),
+            _ => return Ok(CaaPolicy::empty()),
         }
     }
 }
@@ -365,6 +378,36 @@ const CA_ALIASES: &[(&str, &[&str])] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: callers normalized with `normalize_domain`, which drops
+    /// `www.` — but CAA is per name, so `www` must be asked first.
+    #[tokio::test]
+    async fn lookup_keeps_www_and_rejects_invalid_input() {
+        use crate::dns::test_support::{mock_dns_resolver_default, spawn_mock_dns_fn, MockReply};
+        use std::sync::{Arc, Mutex};
+
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let log = asked.clone();
+        let port = spawn_mock_dns_fn(move |name, _| {
+            log.lock().unwrap().push(name.to_string());
+            MockReply::NoData
+        })
+        .await;
+        let resolver = mock_dns_resolver_default(port);
+
+        let policy = lookup_caa(&resolver, "HTTPS://WWW.Seer.Test/path", None)
+            .await
+            .unwrap();
+        assert!(!policy.has_policy);
+        let asked = asked.lock().unwrap().clone();
+        assert_eq!(
+            asked.first().map(|n| n.trim_end_matches('.')),
+            Some("www.seer.test"),
+            "{asked:?}"
+        );
+
+        assert!(lookup_caa(&resolver, "bad..name", None).await.is_err());
+    }
 
     fn policy_with(records: Vec<(&str, &str)>) -> CaaPolicy {
         // Route through the real constructor so tests also exercise iodef +

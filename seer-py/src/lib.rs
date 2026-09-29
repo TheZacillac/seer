@@ -783,8 +783,8 @@ fn bulk_propagation<'py>(
 /// which has its own CAA answer).
 #[pyfunction]
 fn caa<'py>(py: Python<'py>, domain: String) -> PyResult<Bound<'py, PyAny>> {
-    let policy = run_async_infallible(py, async move {
-        seer_core::caa::lookup_caa(&DNS_RESOLVER, &domain).await
+    let policy = run_async(py, async move {
+        seer_core::caa::lookup_caa(&DNS_RESOLVER, &domain, None).await
     })?;
     to_py(py, &policy)
 }

@@ -882,6 +882,15 @@ fn fixture_subdomains() -> SubdomainResult {
     }
 }
 
+/// A certspotter run that hit its page cap.
+fn fixture_subdomains_truncated() -> SubdomainResult {
+    SubdomainResult {
+        source: "certspotter".into(),
+        truncated: true,
+        ..fixture_subdomains()
+    }
+}
+
 fn fixture_watch() -> WatchReport {
     WatchReport {
         checked_at: "2026-06-01T12:00:00Z".parse().unwrap(),
@@ -1045,6 +1054,8 @@ snapshot_tests! {
     markdown_tld_sparse_snapshot => markdown.format_tld(fixture_tld_sparse());
     human_subdomains_snapshot => human.format_subdomains(fixture_subdomains());
     markdown_subdomains_snapshot => markdown.format_subdomains(fixture_subdomains());
+    human_subdomains_truncated_snapshot => human.format_subdomains(fixture_subdomains_truncated());
+    markdown_subdomains_truncated_snapshot => markdown.format_subdomains(fixture_subdomains_truncated());
     human_watch_snapshot => human.format_watch(fixture_watch());
     markdown_watch_snapshot => markdown.format_watch(fixture_watch());
     human_dnssec_snapshot => human.format_dnssec(fixture_dnssec());
