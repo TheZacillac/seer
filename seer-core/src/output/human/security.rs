@@ -277,6 +277,12 @@ impl HumanFormatter {
                 self.success("0")
             },
         ));
+        if report.inconclusive > 0 {
+            out.push(self.warning(&format!(
+                "{} host(s) could not be checked",
+                report.inconclusive
+            )));
+        }
         if report.hosts_skipped > 0 {
             out.push(self.warning(&format!(
                 "{} more host(s) exceeded the scan cap and were not examined",
@@ -290,6 +296,7 @@ impl HumanFormatter {
                 let verdict = match f.verdict {
                     TakeoverVerdict::Vulnerable => self.error("VULNERABLE"),
                     TakeoverVerdict::Potential => self.warning("potential"),
+                    TakeoverVerdict::Inconclusive => self.dim("inconclusive"),
                     TakeoverVerdict::Safe => self.success("safe"),
                 };
                 let mut line = format!("{}  [{}]", self.value(&sanitize_display(&f.host)), verdict);

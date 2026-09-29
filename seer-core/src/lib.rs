@@ -109,7 +109,9 @@ pub use subdomains::{
 };
 #[cfg(feature = "cli")]
 pub use subdomains::{SubdomainBaseline, SubdomainBaselineDiff, SubdomainBaselines};
-pub use takeover::{scan_takeover, TakeoverFinding, TakeoverReport, TakeoverVerdict};
+pub use takeover::{
+    scan_takeover, TakeoverFinding, TakeoverReport, TakeoverVerdict, DEFAULT_TAKEOVER_TIMEOUT,
+};
 #[cfg(feature = "cli")]
 pub use watchlist::{
     check_watchlist_with, check_watchlist_with_config, WatchReport, WatchResult, Watchlist,

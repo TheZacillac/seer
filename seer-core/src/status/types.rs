@@ -33,9 +33,10 @@ pub struct StatusResponse {
 /// An error from a specific sub-check within a status operation
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusError {
-    /// Which check failed (e.g., "http", "ssl", "expiration", "dns")
+    /// Which check failed: `"http"` or `"ssl"`. (A failed expiration or DNS
+    /// lookup is not an error; it leaves that section empty.)
     pub check: String,
-    /// Error message
+    /// The sanitized error message (safe for external consumers).
     pub message: String,
 }
 

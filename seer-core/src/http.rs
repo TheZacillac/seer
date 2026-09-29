@@ -49,23 +49,42 @@ const MAX_REDIRECTS: usize = 5;
 /// across a concurrent scan.
 const DEFAULT_MAX_BODY: usize = 64 * 1024;
 
-/// A fetched HTTP response, reduced to what the security probes need.
+/// The status line and headers of a guarded response, reduced to what the
+/// security probes need.
 #[derive(Debug, Clone)]
-pub(crate) struct FetchedResponse {
+pub(crate) struct ResponseHead {
     /// The URL that finally answered (after any redirects).
     pub final_url: String,
     pub status: u16,
-    /// Response headers with **lowercased** names, in wire order. A `Vec`
-    /// rather than a map because `set-cookie` legitimately repeats and each
-    /// occurrence must be graded separately.
+    /// Response headers with lowercase names (as the `http` crate stores
+    /// them), in wire order. A `Vec` rather than a map because `set-cookie`
+    /// legitimately repeats and each occurrence must be graded separately.
     pub headers: Vec<(String, String)>,
-    /// Body, lossily decoded as UTF-8 and truncated to the configured cap.
-    pub body: String,
     /// Number of redirect hops followed to reach `final_url`.
     pub redirects: usize,
 }
 
-impl FetchedResponse {
+impl ResponseHead {
+    fn of(response: &reqwest::Response, redirects: usize) -> Self {
+        Self {
+            final_url: response.url().to_string(),
+            status: response.status().as_u16(),
+            headers: response
+                .headers()
+                .iter()
+                .map(|(name, value)| {
+                    (
+                        name.as_str().to_owned(),
+                        // A header value that isn't valid UTF-8 is still worth
+                        // reporting as present; lossy-decode rather than drop.
+                        String::from_utf8_lossy(value.as_bytes()).into_owned(),
+                    )
+                })
+                .collect(),
+            redirects,
+        }
+    }
+
     /// First value for `name` (which must be lowercase), or `None`.
     pub fn header(&self, name: &str) -> Option<&str> {
         self.headers
@@ -81,6 +100,14 @@ impl FetchedResponse {
             .filter(move |(k, _)| k == name)
             .map(|(_, v)| v.as_str())
     }
+}
+
+/// A fetched HTTP response: its head plus the capped body.
+#[derive(Debug, Clone)]
+pub(crate) struct FetchedResponse {
+    pub head: ResponseHead,
+    /// Body, lossily decoded as UTF-8 and truncated to the configured cap.
+    pub body: String,
 }
 
 /// SSRF-guarded HTTP GET client. See the module docs for the security posture.
@@ -130,35 +157,24 @@ impl GuardedFetcher {
     ///   loop, too many hops, or a transport failure.
     pub async fn get(&self, url: &str) -> Result<FetchedResponse> {
         let (response, redirects) = self.send(url).await?;
-        let status = response.status().as_u16();
-        let final_url = response.url().to_string();
-        let headers = response
-            .headers()
-            .iter()
-            .map(|(name, value)| {
-                (
-                    name.as_str().to_ascii_lowercase(),
-                    // A header value that isn't valid UTF-8 is still worth
-                    // reporting as present; lossy-decode rather than drop.
-                    String::from_utf8_lossy(value.as_bytes()).into_owned(),
-                )
-            })
-            .collect();
+        let head = ResponseHead::of(&response, redirects);
         let body = self.read_body(response).await?;
+        Ok(FetchedResponse { head, body })
+    }
 
-        Ok(FetchedResponse {
-            final_url,
-            status,
-            headers,
-            body,
-            redirects,
-        })
+    /// [`GuardedFetcher::get`] for callers that grade only the status and
+    /// headers: the body is never read, so one that stalls or resets cannot
+    /// fail the fetch.
+    pub async fn get_head(&self, url: &str) -> Result<ResponseHead> {
+        let (response, redirects) = self.send(url).await?;
+        Ok(ResponseHead::of(&response, redirects))
     }
 
     /// The guarded request half of [`GuardedFetcher::get`]: returns the final
-    /// (non-redirect) response with its body still unread, plus the number of
-    /// hops followed. For callers that want the body only for some responses —
-    /// read it through [`GuardedFetcher::read_body`] so the cap still applies.
+    /// response (a 3xx only when it carries no `Location`) with its body still
+    /// unread, plus the number of hops followed. For callers that want the
+    /// body only for some responses — read it through
+    /// [`GuardedFetcher::read_body`] so the cap still applies.
     pub async fn send(&self, url: &str) -> Result<(reqwest::Response, usize)> {
         let mut url = Url::parse(url)
             .map_err(|e| SeerError::HttpError(format!("invalid URL '{}': {}", url, e)))?;
@@ -191,25 +207,27 @@ impl GuardedFetcher {
                 .await
                 .map_err(|e| SeerError::HttpError(e.to_string()))?;
 
-            if response.status().is_redirection() {
-                let location = response
-                    .headers()
-                    .get(reqwest::header::LOCATION)
-                    .and_then(|v| v.to_str().ok())
-                    .ok_or_else(|| {
-                        SeerError::HttpError("redirect missing location header".to_string())
-                    })?;
-                // Resolve relative Locations against the current URL; fall back
-                // to an absolute parse. The result is re-validated at the top
-                // of the next iteration before any connect.
-                url = url
-                    .join(location)
-                    .or_else(|_| Url::parse(location))
-                    .map_err(|e| SeerError::HttpError(format!("invalid redirect URL: {}", e)))?;
-                continue;
-            }
-
-            return Ok((response, hop));
+            // A 3xx with no `Location` has nowhere to go and is the final
+            // response (RFC 9110 §15.4: `Location` is optional for 300 and
+            // absent from 304).
+            let location = response
+                .status()
+                .is_redirection()
+                .then(|| response.headers().get(reqwest::header::LOCATION))
+                .flatten();
+            let Some(location) = location else {
+                return Ok((response, hop));
+            };
+            let location = location.to_str().map_err(|_| {
+                SeerError::HttpError("redirect location is not valid text".to_string())
+            })?;
+            // Resolve relative Locations against the current URL; fall back to
+            // an absolute parse. The result is re-validated at the top of the
+            // next iteration before any connect.
+            url = url
+                .join(location)
+                .or_else(|_| Url::parse(location))
+                .map_err(|e| SeerError::HttpError(format!("invalid redirect URL: {}", e)))?;
         }
 
         Err(SeerError::HttpError("too many redirects".to_string()))
@@ -328,11 +346,11 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(resp.status, 200);
+        assert_eq!(resp.head.status, 200);
         assert_eq!(resp.body, "hello world");
-        assert_eq!(resp.redirects, 0);
+        assert_eq!(resp.head.redirects, 0);
         // Header names are normalized to lowercase for lookup.
-        assert_eq!(resp.header("x-frame-options"), Some("DENY"));
+        assert_eq!(resp.head.header("x-frame-options"), Some("DENY"));
     }
 
     #[tokio::test]
@@ -354,7 +372,7 @@ mod tests {
             .await
             .unwrap();
 
-        let cookies: Vec<&str> = resp.header_all("set-cookie").collect();
+        let cookies: Vec<&str> = resp.head.header_all("set-cookie").collect();
         assert_eq!(cookies.len(), 2, "both Set-Cookie values must survive");
         assert!(cookies.contains(&"a=1; Secure"));
         assert!(cookies.contains(&"b=2; HttpOnly"));
@@ -380,10 +398,61 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(resp.status, 200);
+        assert_eq!(resp.head.status, 200);
         assert_eq!(resp.body, "arrived");
-        assert_eq!(resp.redirects, 1);
-        assert!(resp.final_url.ends_with("/end"), "got {}", resp.final_url);
+        assert_eq!(resp.head.redirects, 1);
+        assert!(
+            resp.head.final_url.ends_with("/end"),
+            "got {}",
+            resp.head.final_url
+        );
+    }
+
+    /// Regression: a 3xx without `Location` (a 300 choice page, a 304) was a
+    /// hard error instead of the final response.
+    #[tokio::test]
+    async fn a_redirect_status_without_location_is_final() {
+        let server = MockServer::start().await;
+        for status in [300u16, 304] {
+            Mock::given(method("GET"))
+                .and(path(format!("/s{status}")))
+                .respond_with(ResponseTemplate::new(status))
+                .mount(&server)
+                .await;
+            let head = GuardedFetcher::new()
+                .allowing_private_hosts()
+                .get_head(&format!("{}/s{status}", server.uri()))
+                .await
+                .unwrap();
+            assert_eq!(head.status, status);
+            assert_eq!(head.redirects, 0);
+        }
+    }
+
+    /// `get_head` never reads the body, so one that never arrives cannot
+    /// fail the fetch.
+    #[tokio::test]
+    async fn get_head_does_not_wait_for_the_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut tcp, _) = listener.accept().await.unwrap();
+            let _ = tcp.read(&mut [0u8; 1024]).await;
+            // Promise a body, then stall.
+            let _ = tcp
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\nx-probe: 1\r\n\r\n")
+                .await;
+            std::future::pending::<()>().await;
+        });
+
+        let fetcher = GuardedFetcher::new()
+            .allowing_private_hosts()
+            .with_timeout(Duration::from_millis(500));
+        let head = fetcher.get_head(&format!("http://{addr}/")).await.unwrap();
+        assert_eq!(head.status, 200);
+        assert_eq!(head.header("x-probe"), Some("1"));
     }
 
     #[tokio::test]

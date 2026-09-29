@@ -164,6 +164,7 @@ pub async fn fetch(req: FetchReq, config: &seer_core::SeerConfig) -> Result<Lens
                 &enumerated.domain,
                 enumerated.subdomains,
                 config.bulk.concurrency,
+                config.http_timeout(),
             )
             .await
             .map(|r| LensData::Takeover(Box::new(r)))
