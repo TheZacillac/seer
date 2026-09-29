@@ -85,7 +85,7 @@ pub fn normalize_host(host: &str) -> Result<String> {
 /// per-name DNS paths accept it. Per-host probes (`ssl`, `status`, …) keep
 /// [`normalize_host`]: `*` names no host they could connect to. A `*`
 /// anywhere else (`a*.example.com`, `a.*.example.com`) is still rejected.
-pub(crate) fn normalize_query_name(name: &str) -> Result<String> {
+pub fn normalize_query_name(name: &str) -> Result<String> {
     normalize(name, NameKind::QueryName)
 }
 
