@@ -20,8 +20,8 @@ use hickory_resolver::TokioResolver;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, instrument};
 
-use super::DEFAULT_DNS_TIMEOUT;
 use super::resolver::{apply_standard_opts, fqdn, google_or_pinned};
+use super::DEFAULT_DNS_TIMEOUT;
 use crate::error::Result;
 
 /// DNSSEC validation report for a domain.

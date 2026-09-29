@@ -59,4 +59,3 @@ pub(crate) use resolver::apply_standard_opts;
 /// file's `timeouts.dns_secs` default. One definition for every DNS client's
 /// `new()`.
 pub(crate) const DEFAULT_DNS_TIMEOUT: Duration = Duration::from_secs(5);
-

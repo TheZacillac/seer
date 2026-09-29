@@ -88,11 +88,11 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, instrument};
 
 use super::delegation::{build_recursive_resolver, is_local_no_route, partition_reserved};
-use super::DEFAULT_DNS_TIMEOUT;
 use super::query::{duration_ms, DnsStatus};
 use super::records::{DnsRecord, RecordType};
 use super::resolver::{fqdn, prepare_query, to_dns_record, wire_query_name, wire_type};
 use super::transport::{transport_reason, Transport};
+use super::DEFAULT_DNS_TIMEOUT;
 use crate::error::{Result, SeerError};
 
 /// Most delegation levels walked (root included) before giving up. Real

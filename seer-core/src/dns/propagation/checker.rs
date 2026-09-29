@@ -11,10 +11,10 @@ use super::analysis::{
 };
 use super::servers::default_dns_servers;
 use super::types::{DnsServer, NameserverDetails, PropagationResult, ServerResult};
-use crate::dns::DEFAULT_DNS_TIMEOUT;
 use crate::dns::query::{DnsQueryResult, DnsStatus};
 use crate::dns::records::{RecordData, RecordType};
 use crate::dns::resolver::{DnsResolver, ServerReply};
+use crate::dns::DEFAULT_DNS_TIMEOUT;
 use crate::error::Result;
 
 /// Caps concurrent A/AAAA lookups during nameserver-IP enrichment so a large

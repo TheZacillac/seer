@@ -48,6 +48,7 @@ use tokio_rustls::TlsConnector;
 use x509_parser::prelude::{GeneralName, X509Certificate};
 
 use crate::error::{Result, SeerError};
+use crate::net::{connect_any, ConnectError};
 
 /// What a server presented during an inspection handshake.
 #[derive(Debug)]
@@ -107,55 +108,6 @@ pub(crate) async fn inspect(
         intermediates: certs.collect(),
         protocol: conn.protocol_version().map(protocol_name),
     })
-}
-
-/// Why [`connect_any`] found no address to connect to.
-#[derive(Debug)]
-enum ConnectError {
-    /// The last address tried ran out of its share of the budget.
-    TimedOut,
-    /// The last address tried failed outright (or there were none).
-    Io(std::io::Error),
-}
-
-/// Connects to the first of `addrs` that accepts, IPv4 first, all within
-/// `timeout`.
-///
-/// Each address gets an equal share of the budget still left, and a failure
-/// or an expired share moves on to the next address. One connect over the
-/// whole list under a single deadline let a black-holed first address (an
-/// IPv6 route with no IPv6 transit) spend the entire budget, so a reachable
-/// IPv4 address behind it was never tried.
-async fn connect_any<T, F, Fut>(
-    addrs: &[SocketAddr],
-    timeout: Duration,
-    connect: F,
-) -> std::result::Result<T, ConnectError>
-where
-    F: Fn(SocketAddr) -> Fut,
-    Fut: std::future::Future<Output = std::io::Result<T>>,
-{
-    let mut ordered = addrs.to_vec();
-    crate::net::ipv4_first(&mut ordered, SocketAddr::ip);
-    let deadline = tokio::time::Instant::now() + timeout;
-    let mut last = ConnectError::Io(std::io::Error::new(
-        std::io::ErrorKind::InvalidInput,
-        "no address to connect to",
-    ));
-    for (i, addr) in ordered.iter().enumerate() {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            break;
-        }
-        // `ordered.len() - i` is at least 1: the addresses not yet tried.
-        let share = remaining / u32::try_from(ordered.len() - i).unwrap_or(u32::MAX);
-        match tokio::time::timeout(share, connect(*addr)).await {
-            Ok(Ok(stream)) => return Ok(stream),
-            Ok(Err(e)) => last = ConnectError::Io(e),
-            Err(_) => last = ConnectError::TimedOut,
-        }
-    }
-    Err(last)
 }
 
 fn protocol_name(version: ProtocolVersion) -> String {
@@ -537,61 +489,6 @@ mod tests {
         assert!(!matches(IP_AS_CN, "203.0.113.7"));
         // An iPAddress SAN still matches.
         assert!(matches(CN_VICTIM_SAN_IP, "203.0.113.7"));
-    }
-
-    #[tokio::test]
-    async fn connect_tries_ipv4_first() {
-        let v6: SocketAddr = "[2001:db8::1]:443".parse().unwrap();
-        let v4: SocketAddr = "192.0.2.1:443".parse().unwrap();
-        let tried = std::sync::Mutex::new(Vec::new());
-        let got = connect_any(&[v6, v4], TIMEOUT, |addr| {
-            tried.lock().unwrap().push(addr);
-            async move { Ok::<_, std::io::Error>(addr) }
-        })
-        .await
-        .unwrap();
-        assert_eq!(got, v4);
-        assert_eq!(*tried.lock().unwrap(), [v4]);
-    }
-
-    /// Regression: one connect over the whole list under one deadline let a
-    /// black-holed first address spend the entire budget.
-    #[tokio::test]
-    async fn a_hanging_address_leaves_budget_for_the_next() {
-        let dead: SocketAddr = "192.0.2.1:443".parse().unwrap();
-        let live: SocketAddr = "192.0.2.2:443".parse().unwrap();
-        let got = connect_any(
-            &[dead, live],
-            Duration::from_millis(400),
-            |addr| async move {
-                if addr == dead {
-                    std::future::pending::<()>().await;
-                }
-                Ok::<_, std::io::Error>(addr)
-            },
-        )
-        .await
-        .unwrap();
-        assert_eq!(got, live);
-
-        // A refusal moves on at once; all failing reports the last failure.
-        let err = connect_any(&[dead, live], TIMEOUT, |_| async {
-            Err::<(), _>(std::io::Error::from(std::io::ErrorKind::ConnectionRefused))
-        })
-        .await
-        .unwrap_err();
-        assert!(
-            matches!(err, ConnectError::Io(ref e) if e.kind() == std::io::ErrorKind::ConnectionRefused),
-            "got {err:?}"
-        );
-
-        // Every address hanging is a timeout.
-        let err = connect_any(&[dead], Duration::from_millis(50), |_| async {
-            std::future::pending::<std::io::Result<()>>().await
-        })
-        .await
-        .unwrap_err();
-        assert!(matches!(err, ConnectError::TimedOut), "got {err:?}");
     }
 
     #[tokio::test]

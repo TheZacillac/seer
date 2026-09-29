@@ -554,56 +554,27 @@ async fn query_server_internal_with(
     Ok(decode_whois_body(response))
 }
 
-/// Orders `addrs` IPv4 first, keeping the resolver's order within each family.
-fn ipv4_first(mut addrs: Vec<std::net::SocketAddr>) -> Vec<std::net::SocketAddr> {
-    addrs.sort_by_key(std::net::SocketAddr::is_ipv6);
-    addrs
-}
-
-/// Connects to the first reachable of `addrs`, IPv4 first, within `budget`.
-///
-/// Each address gets an equal share of the time left, so a blackholed one
-/// (typically IPv6 on a host with a v6 route but no v6 transit) costs only
-/// its share instead of the whole budget: `TcpStream::connect` over the
-/// full list would spend the entire timeout on the first address.
+/// Connects to the first reachable of `addrs` within `budget`, IPv4 first
+/// with a per-address share of the budget ([`crate::net::connect_any`]).
 async fn connect_ipv4_first(
     server: &str,
     addrs: Vec<std::net::SocketAddr>,
     budget: Duration,
 ) -> Result<TcpStream> {
-    let deadline = tokio::time::Instant::now() + budget;
-    let addrs = ipv4_first(addrs);
-    let mut last_error: Option<std::io::Error> = None;
-    for (i, addr) in addrs.iter().enumerate() {
-        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
-        let remaining_addrs = u32::try_from(addrs.len() - i).unwrap_or(u32::MAX);
-        let share = left / remaining_addrs;
-        if share.is_zero() {
-            break;
-        }
-        match timeout(share, TcpStream::connect(addr)).await {
-            Ok(Ok(stream)) => return Ok(stream),
-            Ok(Err(e)) => {
-                debug!(%addr, error = %e, "WHOIS connect failed, trying next address");
-                last_error = Some(e);
+    crate::net::connect_any(&addrs, budget, TcpStream::connect)
+        .await
+        .map_err(|e| match e {
+            // The unconditionally-retryable variant: the substring-gated
+            // WhoisError classification misses transient connect failures
+            // whose OS message lacks "connection"/"refused"/"reset"/"timeout"
+            // (e.g. "Network is unreachable", "No route to host").
+            crate::net::ConnectError::Io(e) => {
+                SeerError::WhoisConnectionFailed(format!("failed to connect to {server}: {e}"))
             }
-            Err(_) => debug!(%addr, "WHOIS connect timed out, trying next address"),
-        }
-    }
-    // The unconditionally-retryable variant: the substring-gated WhoisError
-    // classification misses transient connect failures whose OS message lacks
-    // "connection"/"refused"/"reset"/"timeout" (e.g. "Network is
-    // unreachable", "No route to host").
-    match last_error {
-        Some(e) => Err(SeerError::WhoisConnectionFailed(format!(
-            "failed to connect to {}: {}",
-            server, e
-        ))),
-        None => Err(SeerError::Timeout(format!(
-            "connection to {} timed out",
-            server
-        ))),
-    }
+            crate::net::ConnectError::TimedOut => {
+                SeerError::Timeout(format!("connection to {server} timed out"))
+            }
+        })
 }
 
 /// Decodes a raw port-43 body: UTF-8 where the bytes are valid UTF-8, and
@@ -1248,26 +1219,6 @@ mod tests {
             accepted.load(Ordering::SeqCst),
             2,
             "one registry query plus a single referral attempt"
-        );
-    }
-
-    #[test]
-    fn ipv4_first_keeps_family_order() {
-        let addrs: Vec<std::net::SocketAddr> = vec![
-            "[2001:db8::1]:43".parse().unwrap(),
-            "192.0.2.1:43".parse().unwrap(),
-            "[2001:db8::2]:43".parse().unwrap(),
-            "192.0.2.2:43".parse().unwrap(),
-        ];
-        let ordered: Vec<String> = ipv4_first(addrs).iter().map(|a| a.to_string()).collect();
-        assert_eq!(
-            ordered,
-            [
-                "192.0.2.1:43",
-                "192.0.2.2:43",
-                "[2001:db8::1]:43",
-                "[2001:db8::2]:43"
-            ]
         );
     }
 
