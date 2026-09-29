@@ -10,7 +10,10 @@ impl JsonFormatter {
     }
 
     fn to_json<T: serde::Serialize + ?Sized>(&self, value: &T) -> String {
-        serde_json::to_string_pretty(value).unwrap_or_else(|e| format!("{{\"error\": \"{}\"}}", e))
+        // Built through `json!` so the error text is escaped: a message
+        // carrying a quote must not yield invalid JSON.
+        serde_json::to_string_pretty(value)
+            .unwrap_or_else(|e| serde_json::json!({ "error": e.to_string() }).to_string())
     }
 }
 
@@ -45,6 +48,21 @@ mod tests {
         let output = formatter.format_dns(&records);
         assert!(output.contains("93.184.216.34"));
         assert!(output.contains("\"A\""));
+    }
+
+    #[test]
+    fn error_fallback_is_valid_json() {
+        // A serializer error carrying a quote was interpolated raw into
+        // `{"error": "…"}`, producing invalid JSON.
+        struct Failing;
+        impl serde::Serialize for Failing {
+            fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+                Err(serde::ser::Error::custom("bad \"value\"\n"))
+            }
+        }
+        let out = JsonFormatter::new().to_json(&Failing);
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["error"], "bad \"value\"\n");
     }
 
     #[test]

@@ -1,21 +1,24 @@
 ---
 source: seer-core/tests/format_snapshots.rs
+assertion_line: 1557
 expression: markdown ().format_headers (& fixture_headers())
 ---
 ## HTTP security headers: example.com
 
-**Grade: C (55/100)** — `https://www.example.com/` (HTTP 200)
+- **Grade**: **C** (55/100)
+- **URL**: `https://www.example.com/` (HTTP 200)
+- **Redirects followed**: 1
 
 | Header | Verdict | Value |
-|---|---|---|
-| strict-transport-security | Moderate | max-age=31536000 |
-| content-security-policy | Absent |  |
+| --- | --- | --- |
+| strict-transport-security | moderate | max-age=31536000 |
+| content-security-policy | absent |  |
 
 ### Cookies
 
 | Cookie | Verdict | Secure | HttpOnly | SameSite |
-|---|---|---|---|---|
-| session | Weak | true | false | — |
+| --- | --- | --- | --- | --- |
+| session | weak | true | false | — |
 
 ### Disclosed software
 

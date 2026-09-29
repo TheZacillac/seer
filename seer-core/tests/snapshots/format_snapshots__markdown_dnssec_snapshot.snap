@@ -1,15 +1,18 @@
 ---
 source: seer-core/tests/format_snapshots.rs
+assertion_line: 998
 expression: markdown ().format_dnssec (& fixture_dnssec())
 ---
 ## DNSSEC: example.com
 
 - **Status**: `misconfigured`
 - **Chain Valid**: no
-> Note: reflects DS/DNSKEY digest consistency only — RRSIG signatures, validity periods, and the chain to the root are NOT cryptographically verified.
+- **Verification depth**: digest-only (DS↔DNSKEY consistency)
 - **Enabled**: true
 - **DS Records**: 2
 - **DNSKEY Records**: 2
+
+> Note: reflects DS/DNSKEY digest consistency only — RRSIG signatures, validity periods, and the chain to the root are NOT cryptographically verified.
 
 ### DS Records
 

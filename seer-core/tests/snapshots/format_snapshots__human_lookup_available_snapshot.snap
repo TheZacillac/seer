@@ -1,5 +1,6 @@
 ---
 source: seer-core/tests/format_snapshots.rs
+assertion_line: 780
 expression: human ().format_lookup (& fixture_lookup_available())
 ---
 
@@ -11,7 +12,8 @@ expression: human ().format_lookup (& fixture_lookup_available())
   [1;96mMethod[0m: [97mwhois[0m
   [1;96mDetails[0m: [97mWHOIS returned registration data[0m
   [1;96mRDAP Error[0m: [1;91mRDAP server returned 503[0m
-  [1;96mAdditional WHOIS data:[0m
+
+  [1;96mAdditional WHOIS Data:[0m
     [1;96mNameservers[0m: [97mns1.example.com, ns2.example.com[0m
     [1;96mStatus[0m: [97mclientTransferProhibited[0m
     [1;96mDNSSEC[0m: [97msignedDelegation[0m

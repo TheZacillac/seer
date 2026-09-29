@@ -10,13 +10,13 @@ expression: markdown ().format_dig (& fixture_dig_nodata_behind_cname())
 - **Server**: default
 - **Query time**: 12 ms
 
-*The CNAME target `edge.cdn.test.` has no AAAA records (NODATA)*
-
 ### Answer
 
 | Name | TTL | Type | Data |
 | --- | --- | --- | --- |
 | `www.seer.test` | 300 | CNAME | `edge.cdn.test.` |
+
+*The CNAME target `edge.cdn.test.` has no AAAA records (NODATA)*
 
 ### Authority
 

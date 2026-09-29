@@ -88,9 +88,13 @@ pub(super) fn rdap_contacts(data: &RdapResponse) -> [Option<ContactInfo>; 3] {
     ]
 }
 
-/// Views of [`rdap_contacts`], with every field.
-pub(super) fn rdap_views(contacts: &[Option<ContactInfo>; 3]) -> [Contact<'_>; 3] {
-    contacts.each_ref().map(|c| Contact::rdap(c.as_ref()))
+/// Views of [`rdap_contacts`] as the formatters render them beside the
+/// top-level Registrant/Organization lines: the registrant block drops
+/// name/organization (already printed there), so the registrant is never
+/// shown twice and an identity-only registrant opens no empty heading.
+pub(super) fn rdap_detail_views(contacts: &[Option<ContactInfo>; 3]) -> [Contact<'_>; 3] {
+    let [registrant, admin, tech] = contacts.each_ref().map(|c| Contact::rdap(c.as_ref()));
+    [registrant.without_identity(), admin, tech]
 }
 
 /// Contacts of a source that stores them as flat fields, for [`ROLES`] in

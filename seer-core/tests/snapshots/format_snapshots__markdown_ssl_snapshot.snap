@@ -1,13 +1,13 @@
 ---
 source: seer-core/tests/format_snapshots.rs
-assertion_line: 535
-expression: markdown().format_ssl(&fixture_ssl_report_with_warnings())
+assertion_line: 548
+expression: markdown ().format_ssl (& fixture_ssl_report_with_warnings())
 ---
 ## SSL Report: example.com
 
 - **Valid**: yes
 - **Hostname Match**: no
-- **Days Until Expiry**: 180
+- **Days Until Expiry**: expires in [N] days
 - **Protocol**: TLSv1.3
 - **SANs**: `example.com`, `www.example.com`
 

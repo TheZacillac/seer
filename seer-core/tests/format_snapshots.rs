@@ -305,6 +305,35 @@ snapshot_tests! {
     // while the human formatter warned; the hostname check must be visible.
     markdown_status_hostname_mismatch_snapshot =>
         markdown.format_status(fixture_status_hostname_mismatch());
+    // One expiry wording in both formats: "expired N days ago" (never a
+    // negative count) and a red "expires in N days" inside 30 days.
+    human_status_expired_snapshot => human.format_status(fixture_status_expired());
+    markdown_status_expired_snapshot => markdown.format_status(fixture_status_expired());
+    human_status_expiring_soon_snapshot => human.format_status(fixture_status_expiring_soon());
+    markdown_status_expiring_soon_snapshot =>
+        markdown.format_status(fixture_status_expiring_soon());
+}
+
+/// A certificate that expired days ago on a registration expiring within 30
+/// days: both urgent bands of the expiry wording.
+fn fixture_status_expiring_soon() -> StatusResponse {
+    StatusResponse {
+        certificate: Some(CertificateInfo {
+            issuer: "CN=Mock CA".into(),
+            subject: "CN=example.com".into(),
+            valid_from: "2025-01-01T00:00:00Z".parse().unwrap(),
+            valid_until: "2026-01-01T00:00:00Z".parse().unwrap(),
+            days_until_expiry: -3,
+            is_valid: false,
+            hostname_verified: true,
+        }),
+        domain_expiration: Some(DomainExpiration {
+            expiration_date: "2026-10-10T00:00:00Z".parse().unwrap(),
+            days_until_expiry: 12,
+            registrar: None,
+        }),
+        ..fixture_status()
+    }
 }
 
 /// A subdomain baseline diff with additions, removals, and unchanged names.

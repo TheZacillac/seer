@@ -1,18 +1,15 @@
 use super::*;
+use crate::output::diff_table::{build_diff_sections, DiffSection, EMPTY_PLACEHOLDER};
 
 impl HumanFormatter {
     pub(super) fn format_diff(&self, diff: &crate::diff::DomainDiff) -> String {
         let mut output = Vec::new();
 
-        output.push(self.header(&format!(
-            "Diff: {} vs {}",
-            sanitize_display(&diff.domain_a),
-            sanitize_display(&diff.domain_b)
-        )));
+        // The column headers are aligned cells too, so one line each.
+        let domain_a = sanitize_line(&diff.domain_a);
+        let domain_b = sanitize_line(&diff.domain_b);
+        output.push(self.header(&format!("Diff: {domain_a} vs {domain_b}")));
 
-        // Column headers are aligned cells too, so flatten them like the body.
-        let domain_a = flatten_cell(&sanitize_display(&diff.domain_a));
-        let domain_b = flatten_cell(&sanitize_display(&diff.domain_b));
         let sections = build_diff_sections(diff);
         let col_width = compute_column_width(&sections, &domain_a, &domain_b);
 
@@ -42,7 +39,7 @@ impl HumanFormatter {
         let header_line = format!(
             "{}{}   {}",
             " ".repeat(header_left_pad),
-            self.label(&pad_right(&header_a, col_width)),
+            self.label(&format!("{header_a:<col_width$}")),
             self.label(&header_b)
         );
         // Rules match the rendered (elided) header cell widths, never the raw
@@ -52,7 +49,7 @@ impl HumanFormatter {
         let rule_line = format!(
             "{}{}   {}",
             " ".repeat(header_left_pad),
-            self.label(&pad_right(&rule_a, col_width)),
+            self.label(&format!("{rule_a:<col_width$}")),
             self.label(&rule_b)
         );
         output.push(String::new());
@@ -65,25 +62,19 @@ impl HumanFormatter {
 
             for row in &section.rows {
                 // Wrap each value column independently.
-                let mut a_lines: Vec<String> = row
-                    .a_values
-                    .iter()
-                    .flat_map(|v| wrap_cell(&sanitize_display(v), col_width))
-                    .collect();
-                let mut b_lines: Vec<String> = row
-                    .b_values
-                    .iter()
-                    .flat_map(|v| wrap_cell(&sanitize_display(v), col_width))
-                    .collect();
+                let wrap = |values: &[String]| -> Vec<String> {
+                    values
+                        .iter()
+                        .flat_map(|v| wrap_cell(v, col_width))
+                        .collect()
+                };
+                let mut a_lines = wrap(&row.a_values);
+                let mut b_lines = wrap(&row.b_values);
 
                 // Pad the shorter list with blank lines so rows align.
                 let rows_needed = a_lines.len().max(b_lines.len()).max(1);
-                while a_lines.len() < rows_needed {
-                    a_lines.push(String::new());
-                }
-                while b_lines.len() < rows_needed {
-                    b_lines.push(String::new());
-                }
+                a_lines.resize(rows_needed, String::new());
+                b_lines.resize(rows_needed, String::new());
 
                 let marker_glyph = if row.matches { "=" } else { "≠" };
                 let color = |s: &str| -> String {
@@ -95,11 +86,8 @@ impl HumanFormatter {
                 };
 
                 for (i, (a, b)) in a_lines.iter().zip(b_lines.iter()).enumerate() {
-                    let label_cell = if i == 0 {
-                        format!("{}{}", label_indent, pad_right(row.label, label_width))
-                    } else {
-                        format!("{}{}", label_indent, " ".repeat(label_width))
-                    };
+                    let label = if i == 0 { row.label } else { "" };
+                    let label_cell = format!("{label_indent}{label:<label_width$}");
                     let marker_cell = if i == 0 {
                         format!("{} ", color(marker_glyph))
                     } else {
@@ -112,7 +100,7 @@ impl HumanFormatter {
                             color(s)
                         }
                     };
-                    let a_cell = color_value(&pad_right(a, col_width), a);
+                    let a_cell = color_value(&format!("{a:<col_width$}"), a);
                     let b_cell = color_value(b, b);
                     output.push(format!(
                         "{}  {}{}   {}",
@@ -129,64 +117,16 @@ impl HumanFormatter {
     }
 }
 
-/// Compares two `Option<String>` values for equality after trimming whitespace.
-/// Empty-after-trim is treated as `None`.
-fn eq_opt_str_trimmed(a: &Option<String>, b: &Option<String>) -> bool {
-    let norm = |o: &Option<String>| -> Option<String> {
-        o.as_ref()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-    };
-    norm(a) == norm(b)
-}
-
-/// Compares two string lists as sets: trims each item, drops empty items,
-/// then checks that the sorted multisets are equal.
-fn eq_as_set(a: &[String], b: &[String]) -> bool {
-    let mut an: Vec<String> = a
-        .iter()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-    let mut bn: Vec<String> = b
-        .iter()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-    an.sort();
-    bn.sort();
-    an == bn
-}
-
-/// Maps the layout characters `sanitize_display` deliberately keeps (`\n`,
-/// `\t`, and `\r` for good measure) to spaces. Inside an aligned table cell
-/// they are not layout: a raw newline would break the row (the pad math
-/// counts it as one column) and let a remote party forge extra, aligned rows.
-fn flatten_cell(text: &str) -> String {
-    text.chars()
-        .map(|c| {
-            if matches!(c, '\n' | '\r' | '\t') {
-                ' '
-            } else {
-                c
-            }
-        })
-        .collect()
-}
-
-/// Wraps `text` into lines no wider than `max_width` display chars.
-/// Breaks at the last ASCII whitespace within the window when possible;
-/// otherwise hard-breaks at the cap. Widths are measured in `chars().count()`
-/// which is correct for ASCII and a reasonable fallback for other inputs.
-/// Newlines/tabs/CRs are flattened to spaces first (see [`flatten_cell`]), so
-/// every returned line is a single physical row.
+/// Wraps remote `text` into lines no wider than `max_width` display chars.
+/// Breaks at the last whitespace within the window when possible; otherwise
+/// hard-breaks at the cap. Widths are measured in `chars().count()`, which is
+/// correct for ASCII and a reasonable fallback for other inputs. The text
+/// goes through [`sanitize_line`] first, so every returned line is a single
+/// physical row: a raw newline would break the row (the pad math counts it
+/// as one column) and let a remote party forge extra, aligned rows.
 fn wrap_cell(text: &str, max_width: usize) -> Vec<String> {
     let width = max_width.max(1);
-    if text.is_empty() {
-        return vec![String::new()];
-    }
-
-    let text = flatten_cell(text);
+    let text = sanitize_line(text);
     let chars: Vec<char> = text.chars().collect();
     if chars.len() <= width {
         return vec![text];
@@ -219,157 +159,6 @@ fn wrap_cell(text: &str, max_width: usize) -> Vec<String> {
     out
 }
 
-/// One labeled row in the rendered diff table. `a_values` / `b_values` each
-/// hold one item per rendered line — scalars are single-element; multi-value
-/// fields (A records, nameservers) hold one entry per item.
-struct DiffRow {
-    label: &'static str,
-    a_values: Vec<String>,
-    b_values: Vec<String>,
-    matches: bool,
-}
-
-struct DiffSection {
-    title: &'static str,
-    rows: Vec<DiffRow>,
-}
-
-/// The placeholder rendered for `None` or empty values.
-const EMPTY_PLACEHOLDER: &str = "—";
-
-fn opt_or_placeholder(o: &Option<String>) -> String {
-    o.as_ref()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| EMPTY_PLACEHOLDER.to_string())
-}
-
-fn opt_i64_or_placeholder(o: &Option<i64>) -> String {
-    o.map(|n| n.to_string())
-        .unwrap_or_else(|| EMPTY_PLACEHOLDER.to_string())
-}
-
-fn opt_bool_or_placeholder(o: &Option<bool>) -> String {
-    match o {
-        Some(true) => "yes".to_string(),
-        Some(false) => "no".to_string(),
-        None => EMPTY_PLACEHOLDER.to_string(),
-    }
-}
-
-fn bool_as_str(b: bool) -> String {
-    if b {
-        "yes".to_string()
-    } else {
-        "no".to_string()
-    }
-}
-
-fn list_or_placeholder(list: &[String]) -> Vec<String> {
-    let cleaned: Vec<String> = list
-        .iter()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-    if cleaned.is_empty() {
-        vec![EMPTY_PLACEHOLDER.to_string()]
-    } else {
-        cleaned
-    }
-}
-
-fn build_diff_sections(diff: &crate::diff::DomainDiff) -> Vec<DiffSection> {
-    let reg = &diff.registration;
-    let dns = &diff.dns;
-    let ssl = &diff.ssl;
-
-    let registration = DiffSection {
-        title: "Registration",
-        rows: vec![
-            DiffRow {
-                label: "Registrar",
-                a_values: vec![opt_or_placeholder(&reg.registrar.0)],
-                b_values: vec![opt_or_placeholder(&reg.registrar.1)],
-                matches: eq_opt_str_trimmed(&reg.registrar.0, &reg.registrar.1),
-            },
-            DiffRow {
-                label: "Organization",
-                a_values: vec![opt_or_placeholder(&reg.organization.0)],
-                b_values: vec![opt_or_placeholder(&reg.organization.1)],
-                matches: eq_opt_str_trimmed(&reg.organization.0, &reg.organization.1),
-            },
-            DiffRow {
-                label: "Created",
-                a_values: vec![opt_or_placeholder(&reg.created.0)],
-                b_values: vec![opt_or_placeholder(&reg.created.1)],
-                matches: eq_opt_str_trimmed(&reg.created.0, &reg.created.1),
-            },
-            DiffRow {
-                label: "Expires",
-                a_values: vec![opt_or_placeholder(&reg.expires.0)],
-                b_values: vec![opt_or_placeholder(&reg.expires.1)],
-                matches: eq_opt_str_trimmed(&reg.expires.0, &reg.expires.1),
-            },
-        ],
-    };
-
-    let dns_section = DiffSection {
-        title: "DNS",
-        rows: vec![
-            DiffRow {
-                label: "Resolves",
-                a_values: vec![bool_as_str(dns.resolves.0)],
-                b_values: vec![bool_as_str(dns.resolves.1)],
-                matches: dns.resolves.0 == dns.resolves.1,
-            },
-            DiffRow {
-                label: "A Records",
-                a_values: list_or_placeholder(&dns.a_records.0),
-                b_values: list_or_placeholder(&dns.a_records.1),
-                matches: eq_as_set(&dns.a_records.0, &dns.a_records.1),
-            },
-            DiffRow {
-                label: "Nameservers",
-                a_values: list_or_placeholder(&dns.nameservers.0),
-                b_values: list_or_placeholder(&dns.nameservers.1),
-                matches: eq_as_set(&dns.nameservers.0, &dns.nameservers.1),
-            },
-        ],
-    };
-
-    let ssl_section = DiffSection {
-        title: "SSL",
-        rows: vec![
-            DiffRow {
-                label: "Issuer",
-                a_values: vec![opt_or_placeholder(&ssl.issuer.0)],
-                b_values: vec![opt_or_placeholder(&ssl.issuer.1)],
-                matches: eq_opt_str_trimmed(&ssl.issuer.0, &ssl.issuer.1),
-            },
-            DiffRow {
-                label: "Valid Until",
-                a_values: vec![opt_or_placeholder(&ssl.valid_until.0)],
-                b_values: vec![opt_or_placeholder(&ssl.valid_until.1)],
-                matches: eq_opt_str_trimmed(&ssl.valid_until.0, &ssl.valid_until.1),
-            },
-            DiffRow {
-                label: "Days Remaining",
-                a_values: vec![opt_i64_or_placeholder(&ssl.days_remaining.0)],
-                b_values: vec![opt_i64_or_placeholder(&ssl.days_remaining.1)],
-                matches: ssl.days_remaining.0 == ssl.days_remaining.1,
-            },
-            DiffRow {
-                label: "Valid",
-                a_values: vec![opt_bool_or_placeholder(&ssl.is_valid.0)],
-                b_values: vec![opt_bool_or_placeholder(&ssl.is_valid.1)],
-                matches: ssl.is_valid.0 == ssl.is_valid.1,
-            },
-        ],
-    };
-
-    vec![registration, dns_section, ssl_section]
-}
-
 /// Hard cap on a single value column (applies before wrapping).
 const DIFF_COLUMN_CAP: usize = 40;
 
@@ -386,16 +175,6 @@ fn compute_column_width(sections: &[DiffSection], domain_a: &str, domain_b: &str
         }
     }
     widest.clamp(1, DIFF_COLUMN_CAP)
-}
-
-/// Right-pads `text` with spaces to `width` display chars. Never truncates.
-fn pad_right(text: &str, width: usize) -> String {
-    let have = text.chars().count();
-    if have >= width {
-        text.to_string()
-    } else {
-        format!("{}{}", text, " ".repeat(width - have))
-    }
 }
 
 /// Elides `text` to at most `width` display chars, appending a single-char
@@ -422,62 +201,8 @@ fn elide_to(text: &str, width: usize) -> String {
 mod tests {
     use super::*;
     use crate::diff::{DnsDiff, DomainDiff, RegistrationDiff, SslDiff};
-
-    #[test]
-    fn eq_opt_str_trims_whitespace() {
-        assert!(eq_opt_str_trimmed(
-            &Some("  foo  ".to_string()),
-            &Some("foo".to_string())
-        ));
-        assert!(!eq_opt_str_trimmed(
-            &Some("foo".to_string()),
-            &Some("bar".to_string())
-        ));
-    }
-
-    #[test]
-    fn eq_opt_str_both_none_matches() {
-        assert!(eq_opt_str_trimmed(&None, &None));
-    }
-
-    #[test]
-    fn eq_opt_str_empty_string_is_none() {
-        assert!(eq_opt_str_trimmed(&None, &Some("".to_string())));
-        assert!(eq_opt_str_trimmed(&Some("   ".to_string()), &None));
-    }
-
-    #[test]
-    fn eq_opt_str_some_vs_none_differs() {
-        assert!(!eq_opt_str_trimmed(&Some("foo".to_string()), &None));
-    }
-
-    #[test]
-    fn eq_as_set_order_independent() {
-        let a = vec!["ns1".to_string(), "ns2".to_string()];
-        let b = vec!["ns2".to_string(), "ns1".to_string()];
-        assert!(eq_as_set(&a, &b));
-    }
-
-    #[test]
-    fn eq_as_set_trims_and_drops_empty() {
-        let a = vec!["ns1".to_string(), "  ".to_string(), " ns2 ".to_string()];
-        let b = vec!["ns2".to_string(), "ns1".to_string()];
-        assert!(eq_as_set(&a, &b));
-    }
-
-    #[test]
-    fn eq_as_set_different_contents() {
-        let a = vec!["1.2.3.4".to_string()];
-        let b = vec!["1.2.3.5".to_string()];
-        assert!(!eq_as_set(&a, &b));
-    }
-
-    #[test]
-    fn eq_as_set_both_empty_matches() {
-        let a: Vec<String> = vec![];
-        let b: Vec<String> = vec![];
-        assert!(eq_as_set(&a, &b));
-    }
+    use crate::output::diff_table::tests::make_sample_diff;
+    use crate::output::diff_table::DiffRow;
 
     #[test]
     fn wrap_cell_short_returns_single_line() {
@@ -524,9 +249,9 @@ mod tests {
 
     #[test]
     fn wrap_cell_flattens_newline_cr_tab() {
-        // sanitize_display keeps `\n`/`\t`; inside an aligned cell they must
-        // not survive, or a value breaks its row / forges new ones.
-        assert_eq!(wrap_cell("a\nb\tc\rd", 40), vec!["a b c d".to_string()]);
+        // Inside an aligned cell a newline or tab must not survive, or a
+        // value breaks its row / forges new ones (a bare CR is dropped).
+        assert_eq!(wrap_cell("a\nb\tc\rd", 40), vec!["a b cd".to_string()]);
         for line in wrap_cell("x\ny\nz", 3) {
             assert!(!line.contains(['\n', '\r', '\t']), "{line:?}");
         }
@@ -550,128 +275,6 @@ mod tests {
         assert!(!out.contains('\t'), "tab leaked:\n{out}");
     }
 
-    fn make_sample_diff() -> DomainDiff {
-        DomainDiff {
-            domain_a: "example.com".to_string(),
-            domain_b: "google.com".to_string(),
-            registration: RegistrationDiff {
-                registrar: (Some("IANA".to_string()), Some("MarkMonitor".to_string())),
-                organization: (None, Some("Google LLC".to_string())),
-                created: (
-                    Some("1995-08-14".to_string()),
-                    Some("1997-09-15".to_string()),
-                ),
-                expires: (
-                    Some("2026-08-13".to_string()),
-                    Some("2028-09-14".to_string()),
-                ),
-            },
-            dns: DnsDiff {
-                a_records: (
-                    vec!["93.184.216.34".to_string()],
-                    vec!["142.250.185.46".to_string()],
-                ),
-                nameservers: (
-                    vec!["ns1.example".to_string(), "ns2.example".to_string()],
-                    vec!["ns2.example".to_string(), "ns1.example".to_string()],
-                ),
-                resolves: (true, true),
-            },
-            ssl: SslDiff {
-                issuer: (
-                    Some("DigiCert".to_string()),
-                    Some("Google Trust".to_string()),
-                ),
-                valid_until: (
-                    Some("2025-03-01".to_string()),
-                    Some("2025-02-15".to_string()),
-                ),
-                days_remaining: (Some(89), Some(75)),
-                is_valid: (Some(true), Some(true)),
-            },
-        }
-    }
-
-    #[test]
-    fn build_diff_sections_produces_three_sections() {
-        let diff = make_sample_diff();
-        let sections = build_diff_sections(&diff);
-        assert_eq!(sections.len(), 3);
-        assert_eq!(sections[0].title, "Registration");
-        assert_eq!(sections[1].title, "DNS");
-        assert_eq!(sections[2].title, "SSL");
-    }
-
-    #[test]
-    fn build_diff_sections_marks_nameservers_as_match_when_sets_equal() {
-        let diff = make_sample_diff();
-        let sections = build_diff_sections(&diff);
-        let dns = &sections[1];
-        let ns_row = dns.rows.iter().find(|r| r.label == "Nameservers").unwrap();
-        assert!(ns_row.matches, "reversed-order nameservers should match");
-    }
-
-    #[test]
-    fn build_diff_sections_marks_registrar_differ() {
-        let diff = make_sample_diff();
-        let sections = build_diff_sections(&diff);
-        let reg = &sections[0];
-        let row = reg.rows.iter().find(|r| r.label == "Registrar").unwrap();
-        assert!(!row.matches);
-    }
-
-    #[test]
-    fn build_diff_sections_marks_resolves_match_when_both_true() {
-        let diff = make_sample_diff();
-        let sections = build_diff_sections(&diff);
-        let dns = &sections[1];
-        let row = dns.rows.iter().find(|r| r.label == "Resolves").unwrap();
-        assert!(row.matches);
-        assert_eq!(row.a_values, vec!["yes".to_string()]);
-        assert_eq!(row.b_values, vec!["yes".to_string()]);
-    }
-
-    #[test]
-    fn build_diff_sections_renders_none_as_em_dash() {
-        let diff = make_sample_diff();
-        let sections = build_diff_sections(&diff);
-        let reg = &sections[0];
-        let row = reg.rows.iter().find(|r| r.label == "Organization").unwrap();
-        assert_eq!(row.a_values, vec!["—".to_string()]);
-    }
-
-    #[test]
-    fn build_diff_sections_a_records_one_item_per_row() {
-        let mut diff = make_sample_diff();
-        diff.dns.a_records = (
-            vec!["1.1.1.1".to_string(), "2.2.2.2".to_string()],
-            vec!["3.3.3.3".to_string()],
-        );
-        let sections = build_diff_sections(&diff);
-        let dns = &sections[1];
-        let row = dns.rows.iter().find(|r| r.label == "A Records").unwrap();
-        assert_eq!(row.a_values.len(), 2);
-        assert_eq!(row.b_values.len(), 1);
-    }
-
-    #[test]
-    fn build_diff_sections_preserves_field_order() {
-        let diff = make_sample_diff();
-        let sections = build_diff_sections(&diff);
-        let labels: Vec<&str> = sections[0].rows.iter().map(|r| r.label).collect();
-        assert_eq!(
-            labels,
-            vec!["Registrar", "Organization", "Created", "Expires"]
-        );
-        let dns_labels: Vec<&str> = sections[1].rows.iter().map(|r| r.label).collect();
-        assert_eq!(dns_labels, vec!["Resolves", "A Records", "Nameservers"]);
-        let ssl_labels: Vec<&str> = sections[2].rows.iter().map(|r| r.label).collect();
-        assert_eq!(
-            ssl_labels,
-            vec!["Issuer", "Valid Until", "Days Remaining", "Valid"]
-        );
-    }
-
     #[test]
     fn compute_column_width_uses_widest_value_across_sections() {
         let sections = vec![DiffSection {
@@ -682,12 +285,14 @@ mod tests {
                     a_values: vec!["IANA".to_string()],
                     b_values: vec!["MarkMonitor".to_string()],
                     matches: false,
+                    list: false,
                 },
                 DiffRow {
                     label: "Organization",
                     a_values: vec!["—".to_string()],
                     b_values: vec!["Google LLC".to_string()],
                     matches: false,
+                    list: false,
                 },
             ],
         }];
@@ -704,6 +309,7 @@ mod tests {
                 a_values: vec!["x".to_string()],
                 b_values: vec!["y".to_string()],
                 matches: false,
+                list: false,
             }],
         }];
         // Domain "very-long-domain.example" is wider than any value.
@@ -721,6 +327,7 @@ mod tests {
                 a_values: vec![long_value],
                 b_values: vec!["y".to_string()],
                 matches: false,
+                list: false,
             }],
         }];
         assert_eq!(compute_column_width(&sections, "a.com", "b.com"), 40);
@@ -736,6 +343,7 @@ mod tests {
                 a_values: vec!["a".to_string()],
                 b_values: vec!["b".to_string()],
                 matches: true,
+                list: false,
             }],
         }];
         let w = compute_column_width(&sections, "a", "b");

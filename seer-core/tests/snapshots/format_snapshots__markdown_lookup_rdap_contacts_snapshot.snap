@@ -1,5 +1,6 @@
 ---
 source: seer-core/tests/format_snapshots.rs
+assertion_line: 780
 expression: markdown ().format_lookup (& fixture_lookup_rdap_with_contacts())
 ---
 ## Lookup: example.com
@@ -9,15 +10,13 @@ expression: markdown ().format_lookup (& fixture_lookup_rdap_with_contacts())
 - **Registrant**: Jane Registrant
 - **Organization**: Example Holdings LLC
 - **Created**: `2010-03-15`
-- **Expires**: `2099-03-15` ([N] days)
+- **Expires**: `2099-03-15` (expires in [N] days)
 - **Status**: `client transfer prohibited`
 - **Nameservers**: `NS1.EXAMPLE.COM`
 - **DNSSEC**: signed
 
 ### Registrant Contact
 
-- **Name**: Jane Registrant
-- **Organization**: Example Holdings LLC
 - **Email**: `owner@example.com`
 - **Address**: 1 Main St, Springfield, US
 - **Country**: US

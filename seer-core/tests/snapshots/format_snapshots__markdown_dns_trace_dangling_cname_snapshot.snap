@@ -1,5 +1,6 @@
 ---
 source: seer-core/tests/format_snapshots.rs
+assertion_line: 1374
 expression: markdown ().format_dns_trace (& fixture_dns_trace_dangling_cname())
 ---
 ## DNS Trace: www.seer.test A
@@ -28,10 +29,10 @@ expression: markdown ().format_dns_trace (& fixture_dns_trace_dangling_cname())
 
 - **Status**: `NXDOMAIN`
 
-*The CNAME target `gone.seer.test.` does not exist (NXDOMAIN)*
-
 | Name | TTL | Type | Data |
 | --- | --- | --- | --- |
 | `www.seer.test` | 300 | CNAME | `gone.seer.test.` |
+
+*The CNAME target `gone.seer.test.` does not exist (NXDOMAIN)*
 
 > Note: DNS responses are not DNSSEC-validated.
