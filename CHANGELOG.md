@@ -11,6 +11,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.51.0] - 2026-09-29
+
+`seer prop` is reliable and readable again: it asks 20 public resolvers that
+answer anyone, finishes in well under a second instead of ~11s, measures
+agreement among the servers that answered, and says why any server did not.
+`propagation_percentage` changes meaning on every surface — see **Changed**.
+
 ### Fixed
 - **`seer prop` gave misleading verdicts and waited on dead servers.** About
   a third of the 30 built-in resolvers were ISP recursors that refuse or
@@ -1603,7 +1610,8 @@ Two notable breaking changes landed in this period:
   The human and markdown formatters group both fields by record type and
   omit the per-type subheader when only one type is present.
 
-[Unreleased]: https://github.com/TheZacillac/seer/compare/v0.50.0...HEAD
+[Unreleased]: https://github.com/TheZacillac/seer/compare/v0.51.0...HEAD
+[0.51.0]: https://github.com/TheZacillac/seer/compare/v0.50.0...v0.51.0
 [0.50.0]: https://github.com/TheZacillac/seer/compare/v0.49.1...v0.50.0
 [0.49.1]: https://github.com/TheZacillac/seer/compare/v0.49.0...v0.49.1
 [0.49.0]: https://github.com/TheZacillac/seer/compare/v0.48.0...v0.49.0
