@@ -774,28 +774,30 @@ fn build_notes(
 ) -> Vec<String> {
     let mut notes = dmarc.notes.clone();
     notes.extend(spf.notes.iter().cloned());
-    match mta_sts.verdict {
+    let mta_sts_note = match mta_sts.verdict {
         PostureVerdict::Absent => {
-            notes.push("MTA-STS is not configured — SMTP is vulnerable to downgrade.".to_string())
+            Some("MTA-STS is not configured — SMTP is vulnerable to downgrade.")
         }
-        PostureVerdict::Unknown => {
-            notes.push("MTA-STS lookup failed — its state is unknown.".to_string())
+        PostureVerdict::Unknown => Some("MTA-STS lookup failed — its state is unknown."),
+        _ => None,
+    };
+    let bimi_note = (bimi.verdict == PostureVerdict::Unknown)
+        .then_some("BIMI lookup failed — its state is unknown.");
+    let dane_note = match dane.verdict {
+        PostureVerdict::Absent => {
+            Some("No DANE (TLSA) records — no DNS-based TLS pinning for mail/HTTPS.")
         }
-        _ => {}
-    }
-    if bimi.verdict == PostureVerdict::Unknown {
-        notes.push("BIMI lookup failed — its state is unknown.".to_string());
-    }
-    match dane.verdict {
-        PostureVerdict::Absent => notes
-            .push("No DANE (TLSA) records — no DNS-based TLS pinning for mail/HTTPS.".to_string()),
-        PostureVerdict::Unknown => notes.push(
-            "DANE (TLSA/MX) lookup failed and no TLSA records were found — DANE state is \
-             unknown."
-                .to_string(),
+        PostureVerdict::Unknown => Some(
+            "DANE (TLSA/MX) lookup failed and no TLSA records were found — DANE state is unknown.",
         ),
-        _ => {}
-    }
+        _ => None,
+    };
+    notes.extend(
+        [mta_sts_note, bimi_note, dane_note]
+            .into_iter()
+            .flatten()
+            .map(str::to_string),
+    );
     notes
 }
 
