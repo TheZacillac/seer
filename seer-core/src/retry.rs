@@ -207,7 +207,6 @@ impl RetryClassifier for NetworkRetryClassifier {
             SeerError::CertificateError(_) => false,
             SeerError::SslError(_) => false,
             SeerError::DnsResolverError(_) => false,
-            SeerError::BulkOperationError { .. } => false,
             SeerError::LookupFailed { .. } => false,
             SeerError::ConfigError(_) => false,
             SeerError::InvalidInput(_) => false,

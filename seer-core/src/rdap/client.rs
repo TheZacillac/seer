@@ -17,7 +17,8 @@ use crate::http::{read_body_capped, BodyReadError, Overflow};
 use crate::retry::{NetworkRetryClassifier, RetryClassifier, RetryExecutor, RetryPolicy};
 use crate::validation::normalize_domain;
 
-const IANA_BOOTSTRAP_DNS: &str = "https://data.iana.org/rdap/dns.json";
+/// IANA RDAP bootstrap registry for DNS (also probed by `seer doctor`).
+pub(crate) const IANA_BOOTSTRAP_DNS: &str = "https://data.iana.org/rdap/dns.json";
 const IANA_BOOTSTRAP_IPV4: &str = "https://data.iana.org/rdap/ipv4.json";
 const IANA_BOOTSTRAP_IPV6: &str = "https://data.iana.org/rdap/ipv6.json";
 const IANA_BOOTSTRAP_ASN: &str = "https://data.iana.org/rdap/asn.json";

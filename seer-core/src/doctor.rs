@@ -27,11 +27,7 @@ use tokio::time::timeout;
 use crate::config::SeerConfig;
 use crate::dns::{DnsResolver, RecordType};
 use crate::http::{read_body_capped, BodyReadError, Overflow};
-use crate::rdap::MAX_BOOTSTRAP_SIZE;
-
-/// IANA RDAP bootstrap registry for DNS. Mirrors the private
-/// `IANA_BOOTSTRAP_DNS` const in `rdap/client.rs` — keep the two in sync.
-const IANA_BOOTSTRAP_DNS: &str = "https://data.iana.org/rdap/dns.json";
+use crate::rdap::{IANA_BOOTSTRAP_DNS, MAX_BOOTSTRAP_SIZE};
 
 /// Default WHOIS probe target: IANA's root WHOIS server (reachable for every
 /// TLD lookup seer performs, so it is the canonical port-43 reachability
