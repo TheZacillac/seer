@@ -33,7 +33,10 @@ pub struct WatchReport {
     pub checked_at: DateTime<Utc>,
     pub results: Vec<WatchResult>,
     pub total: usize,
+    /// Results with issues that are not critical.
     pub warnings: usize,
+    /// Critical results (expiry under 30 days, invalid certificate, failed
+    /// check); never also counted in `warnings`.
     pub critical: usize,
 }
 
@@ -41,8 +44,14 @@ crate::fsutil::persisted_store!(Watchlist, "watchlist.toml", toml, "watchlist");
 
 impl Watchlist {
     /// Adds a domain to the watchlist. Returns `Ok(true)` if the domain was newly added.
+    ///
+    /// Entries are keyed by [`normalize_host`](crate::validation::normalize_host),
+    /// which keeps `www.`: a watch runs per-host probes (TLS certificate, HTTP)
+    /// and `www` routinely serves a different site and certificate than the
+    /// apex. Entries saved by older versions (always without `www.`) load and
+    /// match unchanged.
     pub fn add(&mut self, domain: &str) -> Result<bool> {
-        let domain = crate::validation::normalize_domain(domain)?;
+        let domain = crate::validation::normalize_host(domain)?;
         if self.domains.contains(&domain) {
             return Ok(false);
         }
@@ -54,7 +63,7 @@ impl Watchlist {
     /// Removes a domain from the watchlist. Returns `true` if the domain was present.
     pub fn remove(&mut self, domain: &str) -> bool {
         let domain =
-            crate::validation::normalize_domain(domain).unwrap_or_else(|_| domain.to_lowercase());
+            crate::validation::normalize_host(domain).unwrap_or_else(|_| domain.to_lowercase());
         let len_before = self.domains.len();
         self.domains.retain(|d| d != &domain);
         self.domains.len() < len_before
@@ -182,6 +191,20 @@ fn assess(domain: String, outcome: Result<crate::status::StatusResponse>) -> Wat
     watch_result
 }
 
+/// Counts `(warnings, critical)` results in exclusive bands: a critical
+/// result (see [`result_is_critical`] and the `EXPIRY_*` constants) is not
+/// also a warning, so `total` ≥ `warnings + critical` and the tally lines up
+/// with the issue lines — a registration expiry in the 30..90-day band is a
+/// warning, under 30 days critical.
+fn tally(results: &[WatchResult]) -> (usize, usize) {
+    let critical = results.iter().filter(|r| result_is_critical(r)).count();
+    let warnings = results
+        .iter()
+        .filter(|r| !r.issues.is_empty() && !result_is_critical(r))
+        .count();
+    (warnings, critical)
+}
+
 /// Checks all given domains concurrently and produces a [`WatchReport`],
 /// honoring the config file's per-protocol timeouts (via
 /// [`StatusClient::from_config`]) and `bulk.concurrency`.
@@ -225,12 +248,7 @@ pub async fn check_watchlist_with(
         .await;
 
     let total = results.len();
-    // Critical vs warning use explicit, shared bands (see `result_is_critical`
-    // and the EXPIRY_* constants) so the tally lines up with the human-visible
-    // issue lines: a registration expiry in the 30..90-day warning band shows
-    // an issue and counts as a warning, while < 30 days counts as critical.
-    let critical = results.iter().filter(|r| result_is_critical(r)).count();
-    let warnings = results.iter().filter(|r| !r.issues.is_empty()).count();
+    let (warnings, critical) = tally(&results);
 
     WatchReport {
         checked_at: Utc::now(),
@@ -344,6 +362,18 @@ mod tests {
     }
 
     #[test]
+    fn watchlist_keeps_www_hosts_distinct() {
+        // `watch` probes the host's certificate and site; `www` is its own
+        // host, so it must not collapse into the apex entry.
+        let mut wl = Watchlist::default();
+        assert!(wl.add("https://WWW.example.com/").unwrap());
+        assert!(wl.add("example.com").unwrap());
+        assert_eq!(wl.domains, vec!["example.com", "www.example.com"]);
+        assert!(wl.remove("www.example.com"));
+        assert_eq!(wl.domains, vec!["example.com"]);
+    }
+
+    #[test]
     fn test_watchlist_serialization() {
         let mut wl = Watchlist::default();
         wl.add("a.com").unwrap();
@@ -380,7 +410,7 @@ mod tests {
         // TOML parsers reject stray garbage on the value side of `=`.
         std::fs::write(&path, b"domains = not-an-array-\n").expect("seed corrupt watchlist file");
 
-        let loaded = Watchlist::load_from_path(&path);
+        let loaded = Watchlist::load_from_path(&path).expect("load");
         assert!(
             loaded.domains.is_empty(),
             "corrupt watchlist must load as empty default"
@@ -406,7 +436,7 @@ mod tests {
         let path = unique_temp_watchlist_path("missing");
         let _ = std::fs::remove_file(&path);
 
-        let loaded = Watchlist::load_from_path(&path);
+        let loaded = Watchlist::load_from_path(&path).expect("load");
         assert!(loaded.domains.is_empty());
 
         if let Some(parent) = path.parent() {
@@ -494,6 +524,17 @@ mod tests {
             None,
             &["Check failed: connection refused"]
         )));
+    }
+
+    #[test]
+    fn warnings_and_critical_are_exclusive_bands() {
+        // A critical result used to be counted as a warning too.
+        let results = [
+            result_with(Some(10), None, &["SSL expires in 10 days"]), // critical
+            result_with(None, Some(60), &["Domain expires in 60 days"]), // warning
+            result_with(Some(200), Some(200), &[]),                   // healthy
+        ];
+        assert_eq!(tally(&results), (1, 1));
     }
 
     #[test]

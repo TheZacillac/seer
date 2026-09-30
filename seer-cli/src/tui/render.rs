@@ -4,10 +4,11 @@
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
+use seer_core::output::sanitize_line;
 
-use crate::tui::action::{EditTarget, Focus, InputMode, LensData, LensState};
+use crate::tui::action::{EditTarget, Focus, InputMode, LensData, LensKey, LensState};
 use crate::tui::app::{App, SPIN};
 use crate::tui::lenses::{self};
 use crate::tui::line_editor::LineEditor;
@@ -194,11 +195,11 @@ fn main_pane(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     // raw serialization either, so render them the same way in every format —
     // otherwise toggling `r` would drop them to the generic "press /" idle hint.
     match lens.key {
-        "follow" => {
+        LensKey::Follow => {
             lenses::follow::render(f, content, theme, &app.panes.follow, app.spin);
             return;
         }
-        "diff" => {
+        LensKey::Diff => {
             let domain_a = app.panes.diff.effective_a(app.domain.as_deref());
             lenses::diff::render(
                 f,
@@ -212,7 +213,7 @@ fn main_pane(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             );
             return;
         }
-        "bulk" => {
+        LensKey::Bulk => {
             lenses::bulk::render(
                 f,
                 content,
@@ -223,7 +224,7 @@ fn main_pane(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             );
             return;
         }
-        "tld" => {
+        LensKey::Tld => {
             let (loaded, loading) = match app.state_of(app.lens) {
                 LensState::Loaded(LensData::Tld(t)) => (Some(t.as_ref()), false),
                 LensState::Loading => (None, true),
@@ -261,25 +262,31 @@ fn main_pane(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         }
         LensState::Error(e) => {
             let inner = panel::render(f, content, theme, lens.label, theme.red, false);
+            // Errors quote remote servers: one sanitized line, wrapped to
+            // the panel rather than clipped at its edge.
             f.render_widget(
                 Paragraph::new(Line::from(Span::styled(
-                    e.clone(),
+                    sanitize_line(e),
                     Style::default().fg(theme.red),
-                ))),
+                )))
+                .wrap(Wrap { trim: false }),
                 inner,
             );
             return;
         }
         LensState::Idle => {
-            // Tab-specific idle hints for the RDAP lens.
-            let hint_text = if lens.key == "rdap" {
-                match app.tab {
-                    2 => "use :rdap AS<number>  (e.g. :rdap AS15169)",
-                    1 => "use :rdap <ip>  or navigate to a domain first",
-                    _ => "press / to look up a domain",
+            let hint_text = match (lens.key, app.tab, app.domain.as_deref()) {
+                // Tab-specific idle hints for the RDAP lens.
+                (LensKey::Rdap, 2, _) => "use :rdap AS<number>  (e.g. :rdap AS15169)".to_string(),
+                (LensKey::Rdap, 1, _) => {
+                    "use :rdap <ip>  or navigate to a domain first".to_string()
                 }
-            } else {
-                "press / to look up a domain"
+                // A heavy lens waits for ↵ rather than scanning on navigation.
+                (_, _, Some(domain)) if lens.heavy => format!(
+                    "press ↵ to run {} for {domain}  (active scan: CT logs + HTTP probes)",
+                    lens.label
+                ),
+                _ => "press / to look up a domain".to_string(),
             };
             let hint = Line::from(Span::styled(hint_text, Style::default().fg(theme.overlay0)));
             f.render_widget(Paragraph::new(hint), content);
@@ -288,14 +295,31 @@ fn main_pane(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         LensState::Loaded(_) => {}
     }
 
-    // Raw view takes over for non-human formats.
+    // Raw view takes over for non-human formats. It scrolls (PgUp/PgDn, or
+    // j/k once focused); each line is sanitized, since serializers escape
+    // control characters but pass other terminal sequences (U+009B CSI).
     if app.format != seer_core::output::OutputFormat::Human {
         if let LensState::Loaded(data) = app.state_of(app.lens) {
             let text = crate::payload::serialize(data, app.format);
+            let lines: Vec<Line> = text.lines().map(|l| Line::from(sanitize_line(l))).collect();
+            let total = lines.len();
             let raw_title = format!("{} · raw", lens.label);
-            let inner = panel::render(f, content, theme, &raw_title, theme.green, false);
+            let inner = panel::render(
+                f,
+                content,
+                theme,
+                &raw_title,
+                theme.green,
+                app.focus == Focus::Pane,
+            );
+            // Stop once the last line reaches the panel's bottom.
+            let max = total.saturating_sub(usize::from(inner.height));
+            let top = usize::from(app.raw_scroll).min(max);
+            let top = u16::try_from(top).unwrap_or(u16::MAX);
             f.render_widget(
-                Paragraph::new(text).style(Style::default().fg(theme.subtext)),
+                Paragraph::new(lines)
+                    .style(Style::default().fg(theme.subtext))
+                    .scroll((top, 0)),
                 inner,
             );
         }
@@ -417,7 +441,7 @@ fn status_or_command(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     )];
     if let Some(t) = &app.toast {
         spans.push(Span::styled(
-            format!("● {}", t.msg),
+            format!("● {}", sanitize_line(&t.msg)),
             Style::default().fg(theme.tone(&t.tone)),
         ));
     }
@@ -461,10 +485,11 @@ fn help_overlay(f: &mut Frame, area: Rect, theme: &Theme) {
         ("1 … 9", "jump straight to a lens"),
         ("Tab", "toggle focus: nav ⇄ pane"),
         ("[ / ]", "switch sub-tabs (RDAP, DNS)"),
-        ("↵ / l", "enter the active pane"),
+        ("↵ / l", "enter the pane · run Subdomains / Takeover"),
         ("h / Esc", "back to nav"),
         ("g / G", "jump to top / bottom"),
         ("r", "raw output ⇄ human view"),
+        ("PgUp / PgDn", "scroll the raw view (j / k once focused)"),
         ("y", "copy current output to clipboard"),
         ("/", "look up a domain"),
         (":", "command (lookup · dig · ssl · set output · theme · q)"),
@@ -552,6 +577,60 @@ mod tests {
         }
     }
 
+    /// A lens error quotes the remote server: it was rendered raw and
+    /// clipped at the panel edge.
+    #[test]
+    fn lens_errors_are_sanitized_and_wrapped() {
+        let theme = Theme::frappe();
+        let mut app = App::new(None);
+        app.update(crate::tui::action::Msg::Data {
+            lens: LensKey::Overview,
+            gen: 0,
+            result: Err(format!(
+                "whois.example.test said \u{1b}[2J{} END",
+                "x ".repeat(60)
+            )),
+        });
+        let s = render_text(100, 30, |f| view(f, &app, &theme));
+        assert!(!s.contains('\u{1b}'), "{s:?}");
+        assert!(s.contains("END"), "the tail wraps into view: {s}");
+    }
+
+    /// Navigating onto a heavy lens says how to run it.
+    #[test]
+    fn a_heavy_lens_waits_for_enter() {
+        let theme = Theme::frappe();
+        let mut app = App::new(Some("example.com".into()));
+        let _ = app.take_startup_actions();
+        app.lens = LensKey::Takeover.index();
+        let s = full_buf(&app, &theme);
+        assert!(s.contains("press ↵ to run Takeover for example.com"), "{s}");
+    }
+
+    #[test]
+    fn the_raw_view_scrolls() {
+        use crate::payload::fixtures;
+        use seer_core::RecordType;
+
+        let theme = Theme::frappe();
+        let mut app = App::new(None);
+        app.lens = LensKey::Dns.index();
+        app.update(crate::tui::action::Msg::Data {
+            lens: LensKey::Dns,
+            gen: 0,
+            result: Ok(LensData::Dig(Box::new(fixtures::dig(
+                RecordType::A,
+                vec![fixtures::a("www.seer.test", "192.0.2.7")],
+            )))),
+        });
+        app.format = seer_core::output::OutputFormat::Json;
+        let top = render_text(100, 14, |f| view(f, &app, &theme));
+        assert!(top.contains("\"status\": \"NOERROR\""), "{top}");
+        app.raw_scroll = 6;
+        let scrolled = render_text(100, 14, |f| view(f, &app, &theme));
+        assert!(!scrolled.contains("\"status\": \"NOERROR\""), "{scrolled}");
+    }
+
     #[test]
     fn loading_indicator_names_the_requested_target() {
         use crate::tui::action::Msg;
@@ -586,7 +665,7 @@ mod tests {
         let mut app = App::new(None);
         app.lens = lenses::find_by_cmd_or_key("dns").unwrap();
         app.update(crate::tui::action::Msg::Data {
-            lens: "dns".into(),
+            lens: LensKey::Dns,
             gen: 0,
             result: Ok(LensData::Dig(Box::new(fixtures::dig(
                 RecordType::A,

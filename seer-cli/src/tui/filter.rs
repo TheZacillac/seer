@@ -1,5 +1,6 @@
 //! Case-insensitive in-lens row filtering for the table lenses (subdomains,
-//! history, propagation, takeover, and the DNS lens's Records tab).
+//! history, propagation, takeover, and the DNS lens's Records tab — which
+//! lenses and tabs accept `/` is the `filter` flag of their `LENSES` entry).
 //!
 //! [`apply`] returns a filtered clone of the lens data; it is used by BOTH the
 //! renderer and `App::row_count`, so the displayed rows, the selection index
@@ -24,23 +25,13 @@ pub fn matches(text: &str, filter: &str) -> bool {
     filter.is_empty() || text.to_lowercase().contains(&filter.to_lowercase())
 }
 
-/// Whether a lens's sub-`tab` supports in-lens `/`-filtering. Of the DNS
-/// lens's tabs only Records lists rows.
-pub fn is_filterable(lens_key: &str, tab: usize) -> bool {
-    match lens_key {
-        "subdomains" | "history" | "propagation" | "takeover" => true,
-        "dns" => tab == 0,
-        _ => false,
-    }
-}
-
 /// The filterable text for a history row (mirrors the columns the lens shows).
 fn history_label(e: &seer_core::HistoryEntry) -> String {
     format!(
         "{} {} {} {}",
         e.timestamp.format("%Y-%m-%d %H:%M"),
         e.domain,
-        crate::ops::lookup_source(&e.result).unwrap_or("-"),
+        e.result.protocol().unwrap_or("-"),
         e.result.registrar().unwrap_or_default(),
     )
 }
@@ -124,6 +115,11 @@ pub fn apply(data: &LensData, filter: &str) -> Option<LensData> {
                 .iter()
                 .filter(|f| f.verdict == seer_core::TakeoverVerdict::Potential)
                 .count();
+            r.inconclusive = r
+                .findings
+                .iter()
+                .filter(|f| f.verdict == seer_core::TakeoverVerdict::Inconclusive)
+                .count();
             Some(LensData::Takeover(Box::new(r)))
         }
         LensData::Prop(p) => {
@@ -154,19 +150,6 @@ mod tests {
         assert!(matches("API.example.com", "api"));
         assert!(matches("anything", ""));
         assert!(!matches("host.example.com", "zzz"));
-    }
-
-    #[test]
-    fn is_filterable_covers_the_table_lenses() {
-        assert!(is_filterable("subdomains", 0));
-        assert!(is_filterable("history", 0));
-        assert!(is_filterable("propagation", 0));
-        assert!(!is_filterable("whois", 0));
-        // DNS: Records only — DNSSEC, Compare and Trace list no rows.
-        assert!(is_filterable("dns", 0));
-        for tab in 1..=3 {
-            assert!(!is_filterable("dns", tab), "tab {tab}");
-        }
     }
 
     fn chained() -> seer_core::DnsQueryResult {
@@ -224,6 +207,7 @@ mod tests {
             hosts_skipped: 0,
             vulnerable: 1,
             potential: 2,
+            inconclusive: 0,
             findings: vec![
                 mk("api.example.com", TakeoverVerdict::Vulnerable),
                 mk("mail.example.com", TakeoverVerdict::Potential),
@@ -243,11 +227,6 @@ mod tests {
     }
 
     #[test]
-    fn takeover_is_filterable() {
-        assert!(is_filterable("takeover", 0));
-    }
-
-    #[test]
     fn apply_filters_subdomains_and_updates_count() {
         let result = seer_core::SubdomainResult {
             domain: "example.com".into(),
@@ -258,6 +237,7 @@ mod tests {
             ],
             source: "crt.sh".into(),
             count: 3,
+            truncated: false,
         };
         let data = LensData::Subdomains(Box::new(result));
         let filtered = apply(&data, "api").expect("filter applies");
@@ -276,6 +256,7 @@ mod tests {
             subdomains: vec!["a.example.com".into()],
             source: "crt.sh".into(),
             count: 1,
+            truncated: false,
         };
         let data = LensData::Subdomains(Box::new(result));
         assert!(apply(&data, "").is_none());

@@ -1,5 +1,6 @@
 ---
 source: seer-core/tests/format_snapshots.rs
+assertion_line: 780
 expression: markdown ().format_domain_info (& fixture_domain_info())
 ---
 ## Domain Info: example.com
@@ -19,7 +20,7 @@ expression: markdown ().format_domain_info (& fixture_domain_info())
 | Nameservers | `NS1.EXAMPLE.COM` |
 | Status | `client transfer prohibited` |
 | DNSSEC | signed |
-| Days Until Expiry | 26660 |
+| Days Until Expiry | expires in [N] days |
 | Domain Age (days) | 5800 |
 | Expiry Status | active |
 

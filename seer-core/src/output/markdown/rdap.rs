@@ -36,7 +36,7 @@ impl MarkdownFormatter {
         // Contact sections last: each `###` heading scopes everything below
         // it, so no domain-level field may follow one.
         let infos = contact::rdap_contacts(response);
-        b.contacts(contact::rdap_views(&infos));
+        b.contacts(contact::rdap_detail_views(&infos));
         let billing = response.get_billing_contact();
         b.contact("Billing", Contact::rdap(billing.as_ref()));
 
@@ -81,6 +81,37 @@ mod tests {
             "raw backticks survived into output:\n{}",
             output
         );
+    }
+
+    #[test]
+    fn registrant_identity_is_printed_once() {
+        // The registrant's name/organization are the top-level bullets; the
+        // contact section repeated them (the human formatter strips them).
+        let response: RdapResponse = serde_json::from_value(serde_json::json!({
+            "ldhName": "example.com",
+            "entities": [{
+                "objectClassName": "entity",
+                "roles": ["registrant"],
+                "vcardArray": ["vcard", [
+                    ["fn", {}, "text", "Jane Registrant"],
+                    ["org", {}, "text", "Example LLC"],
+                    ["email", {}, "text", "jane@example.com"]
+                ]]
+            }]
+        }))
+        .unwrap();
+        for out in [
+            MarkdownFormatter::new().format_rdap(&response),
+            MarkdownFormatter::new().format_lookup(&LookupResult::Rdap {
+                data: Box::new(response.clone()),
+                whois_fallback: None,
+            }),
+        ] {
+            assert_eq!(out.matches("Jane Registrant").count(), 1, "got:\n{out}");
+            assert_eq!(out.matches("Example LLC").count(), 1, "got:\n{out}");
+            assert!(out.contains("### Registrant Contact"), "got:\n{out}");
+            assert!(out.contains("`jane@example.com`"), "got:\n{out}");
+        }
     }
 
     #[test]

@@ -1,7 +1,7 @@
 ---
 source: seer-core/tests/format_snapshots.rs
-assertion_line: 430
-expression: human().format_subdomain_classification(&fixture_subdomain_classification())
+assertion_line: 456
+expression: "human ().format_subdomain_classification\n(& fixture_subdomain_classification())"
 ---
 
 [1;95mSubdomains: example.com[0m
@@ -11,5 +11,5 @@ expression: human().format_subdomain_classification(&fixture_subdomain_classific
 [1;93m3 more names exceeded the classification cap and were not resolved[0m
 
 [97mwww.example.com[0m  [[1;92mlive[0m]
-[97mdocs.example.com[0m  [[90mdead[0m]  [1;91mtakeover risk: GitHub Pages[0m
+[97mdocs.example.com[0m  [[90mdead[0m]  [1;96mCNAME →[0m [90mexample.github.io.[0m  [1;91mtakeover risk: GitHub Pages[0m
 [97mrandom.example.com[0m  [[1;93mwildcard[0m]

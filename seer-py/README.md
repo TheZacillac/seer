@@ -29,9 +29,12 @@ status  = seer.status("example.com")
 results = seer.bulk_lookup(["example.com", "example.org"], concurrency=10)
 ```
 
-Every call is synchronous and returns plain Python data. Errors raise
-built-in exceptions: `ValueError` for invalid input, `TimeoutError` and
-`ConnectionError` for transient network failures, `RuntimeError` otherwise.
+Every call is synchronous and returns plain Python data. Invalid input raises
+`ValueError`, a timeout `TimeoutError` and a WHOIS connect failure
+`ConnectionError`. Every other failure raises a subclass of `seer.SeerError`
+(itself a `RuntimeError`): `RateLimitedError`, `WhoisServerNotFoundError`,
+`DnsError`, `UpstreamError` (a WHOIS/RDAP/HTTP upstream failed),
+`LookupFailedError`, `ParseError`, `TlsError` or `ConfigError`.
 
 Every exported function is shown in the
 [Python Library section of the main README](https://github.com/TheZacillac/seer#-python-library);

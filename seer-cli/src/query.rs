@@ -175,8 +175,8 @@ impl Clients {
             whois: seer_core::WhoisClient::from_config(config),
             rdap: seer_core::RdapClient::from_config(config),
             dns: seer_core::DnsResolver::from_config(config),
-            propagation: seer_core::dns::PropagationChecker::new(),
-            dnssec: seer_core::DnssecChecker::new(),
+            propagation: seer_core::dns::PropagationChecker::from_config(config),
+            dnssec: seer_core::DnssecChecker::from_config(config),
             status: seer_core::StatusClient::from_config(config),
             avail: seer_core::AvailabilityChecker::from_config(config),
             ssl: seer_core::SslChecker::from_config(config),
@@ -188,6 +188,18 @@ impl Clients {
 /// spinner is always cleared before this returns, so callers can print the
 /// outcome straight away.
 pub async fn run(
+    query: Query,
+    clients: &Clients,
+    config: &SeerConfig,
+    spin: bool,
+) -> seer_core::Result<Outcome> {
+    // One arm per command makes the pipeline's state machine tens of KB;
+    // boxing it keeps every caller's future (REPL dispatch, TUI fetch task)
+    // pointer-sized instead of nesting that inline on the stack.
+    Box::pin(run_query(query, clients, config, spin)).await
+}
+
+async fn run_query(
     query: Query,
     clients: &Clients,
     config: &SeerConfig,
@@ -209,8 +221,11 @@ pub async fn run(
             // The progress callback holds a clone, so clear it explicitly.
             spinner.finish();
             let result = result?;
-            crate::ops::record_lookup_history(&domain, result.clone()).await;
-            Payload::Overview(Box::new(result))
+            let saved = crate::ops::record_lookup_history(&domain, result.clone()).await;
+            return Ok(Outcome {
+                footnote: history_warning(saved),
+                ..Outcome::new(Payload::Overview(Box::new(result)))
+            });
         }
         Query::Info(domain) => {
             let _spinner = spinner(format!("Getting comprehensive info for {}", domain));
@@ -305,7 +320,9 @@ pub async fn run(
             let _spinner = spinner(format!("Checking SSL for {}", domain));
             Payload::Ssl(Box::new(clients.ssl.check(&domain).await?))
         }
-        Query::Tld(tld) => Payload::Tld(Box::new(seer_core::lookup_tld(&tld).await)),
+        Query::Tld(tld) => Payload::Tld(Box::new(
+            seer_core::lookup_tld_with(&tld, &clients.rdap).await,
+        )),
         Query::Compare {
             domain,
             record_type,
@@ -316,7 +333,7 @@ pub async fn run(
                 "Comparing {} records from {} and {}",
                 domain, server_a, server_b
             ));
-            let comparison = seer_core::dns::DnsComparator::new()
+            let comparison = seer_core::dns::DnsComparator::from_config(config)
                 .compare(&domain, record_type, &server_a, &server_b)
                 .await?;
             Payload::Compare(Box::new(comparison))
@@ -329,9 +346,9 @@ pub async fn run(
         } => {
             let spinner = spinner(format!("Enumerating subdomains for {}", domain));
             if diff || record {
-                return subdomain_baseline(&domain, diff, record).await;
+                return subdomain_baseline(&domain, diff, record, config).await;
             }
-            let result = seer_core::SubdomainEnumerator::new()
+            let result = seer_core::SubdomainEnumerator::from_config(config)
                 .enumerate(&domain)
                 .await?;
             if resolve {
@@ -350,7 +367,7 @@ pub async fn run(
         }
         Query::Diff(domain_a, domain_b) => {
             let _spinner = spinner(format!("Comparing {} vs {}", domain_a, domain_b));
-            let diff = seer_core::DomainDiffer::new()
+            let diff = seer_core::DomainDiffer::from_config(config)
                 .diff(&domain_a, &domain_b)
                 .await?;
             Payload::Diff(Box::new(diff))
@@ -367,17 +384,20 @@ pub async fn run(
             });
         }
         Query::Caa(domain) => {
-            // Normalize first so `caa HTTPS://WWW.EXAMPLE.COM` works and an
-            // invalid domain fails before any lookup.
-            let domain = seer_core::normalize_domain(&domain)?;
             let _spinner = spinner(format!("Looking up CAA policy for {}", domain));
             Payload::Caa(Box::new(
-                seer_core::caa::lookup_caa(&clients.dns, &domain).await,
+                seer_core::caa::lookup_caa(&clients.dns, &domain, config.nameserver.as_deref())
+                    .await?,
             ))
         }
         Query::Posture(domain) => {
             let _spinner = spinner(format!("Inspecting email posture for {}", domain));
-            let posture = seer_core::lookup_email_posture(&clients.dns, &domain).await?;
+            let posture = seer_core::lookup_email_posture(
+                &clients.dns,
+                &domain,
+                config.nameserver.as_deref(),
+            )
+            .await?;
             Payload::Posture(Box::new(posture))
         }
         Query::Headers(domain) => {
@@ -391,7 +411,7 @@ pub async fn run(
             // re-check of known hosts fast and independent of CT logs.
             let hosts = if hosts.is_empty() {
                 spinner.set_message("Enumerating subdomains via CT logs");
-                seer_core::SubdomainEnumerator::new()
+                seer_core::SubdomainEnumerator::from_config(config)
                     .enumerate(&domain)
                     .await?
                     .subdomains
@@ -399,9 +419,14 @@ pub async fn run(
                 hosts
             };
             spinner.set_message(&format!("Checking {} host(s) for takeover", hosts.len()));
-            let report =
-                seer_core::scan_takeover(&clients.dns, &domain, hosts, config.bulk.concurrency)
-                    .await?;
+            let report = seer_core::scan_takeover(
+                &clients.dns,
+                &domain,
+                hosts,
+                config.bulk.concurrency,
+                config.http_timeout(),
+            )
+            .await?;
             Payload::Takeover(Box::new(report))
         }
         Query::Confusables(domain) => {
@@ -428,11 +453,20 @@ pub async fn run(
     Ok(Outcome::new(payload))
 }
 
+/// A lookup's history is best-effort — a failed save must not fail the
+/// lookup — but it is no longer silent: the failure becomes a footnote.
+fn history_warning(saved: seer_core::Result<()>) -> Option<String> {
+    saved
+        .err()
+        .map(|e| format!("lookup history not saved: {e}"))
+}
+
 /// Assembles a `dig` outcome from its per-type results, in the requested
 /// order. One type is its result or its error. Several are a
 /// [`Payload::DigMany`] of the types that answered, with each failed type
 /// reported (and failing the command) — unless every type failed, which is
-/// the first type's error, as for the core's `ANY` fan-out.
+/// the first type's error, as for the core's `ANY` fan-out. An `ANY` answer
+/// with sub-queries that got no reply reports and fails the same way.
 pub fn dig_outcome(
     results: Vec<(RecordType, seer_core::Result<DnsQueryResult>)>,
 ) -> seer_core::Result<Outcome> {
@@ -442,7 +476,18 @@ pub fn dig_outcome(
     let mut first_error = None;
     for (record_type, result) in results {
         match result {
-            Ok(result) => answered.push(result),
+            Ok(result) => {
+                // An ANY answer missing a type is incomplete: say which, and
+                // fail the command like a multi-type dig's failed type.
+                errors.extend(result.failed_types.iter().map(|f| {
+                    format!(
+                        "{record_type}: no reply for {}: {}",
+                        f.record_type,
+                        seer_core::output::sanitize_line(&f.error)
+                    )
+                }));
+                answered.push(result);
+            }
             Err(e) => {
                 errors.push(format!("{record_type}: {e}"));
                 first_error.get_or_insert(e);
@@ -484,8 +529,13 @@ pub fn trace_outcome(trace: seer_core::DnsTrace, short: bool) -> Outcome {
 /// baseline (see [`crate::ops::subdomain_baseline_check`]). With `diff` the
 /// result is the diff; `--record` alone shows the listing and confirms the
 /// write afterwards.
-async fn subdomain_baseline(domain: &str, diff: bool, record: bool) -> seer_core::Result<Outcome> {
-    let outcome = crate::ops::subdomain_baseline_check(domain, record).await?;
+async fn subdomain_baseline(
+    domain: &str,
+    diff: bool,
+    record: bool,
+    config: &SeerConfig,
+) -> seer_core::Result<Outcome> {
+    let outcome = crate::ops::subdomain_baseline_check(domain, record, config).await?;
     let name = outcome.result.domain.clone();
     Ok(if diff {
         Outcome {
@@ -544,6 +594,24 @@ mod tests {
         let got: Vec<RecordType> = results.iter().map(|r| r.record_type).collect();
         assert_eq!(got, types);
         assert!(!outcome.failed());
+    }
+
+    /// Regression: an ANY whose TXT sub-query got no reply looked complete
+    /// and exited 0; the missing type is now reported and fails the command.
+    #[test]
+    fn an_incomplete_any_answer_is_reported() {
+        let mut any = fixtures::dig_status(RecordType::ANY, DnsStatus::NoError);
+        any.failed_types = vec![seer_core::FailedType {
+            record_type: RecordType::TXT,
+            error: "8.8.8.8: timed out".to_string(),
+        }];
+        let outcome = dig_outcome(vec![(RecordType::ANY, Ok(any))]).expect("ok");
+        assert!(matches!(outcome.payload, Payload::Dig(_)));
+        assert!(outcome.failed());
+        assert_eq!(
+            outcome.errors,
+            ["ANY: no reply for TXT: 8.8.8.8: timed out"]
+        );
     }
 
     /// The types that answered are still shown; each failed one is reported
@@ -643,6 +711,18 @@ mod tests {
         let outcome = trace_outcome(answered, true);
         assert_eq!(outcome.short_text().as_deref(), Some("192.0.2.7"));
         assert!(!outcome.failed());
+    }
+
+    /// A failed history save after a lookup was swallowed without a word.
+    #[test]
+    fn a_failed_history_save_is_a_footnote_not_a_failure() {
+        assert_eq!(history_warning(Ok(())), None);
+        let warning =
+            history_warning(Err(SeerError::ConfigError("disk full".into()))).expect("a warning");
+        assert!(
+            warning.starts_with("lookup history not saved") && warning.contains("disk full"),
+            "{warning}"
+        );
     }
 
     /// Only a trace is slow enough for one-shot mode's spinner; a dig,

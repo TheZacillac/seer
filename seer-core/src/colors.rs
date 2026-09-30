@@ -27,60 +27,28 @@ macro_rules! palette {
     };
 }
 
+// Only the colors the CLI and the human formatter use; add a row (mapped
+// to its ANSI approximation) when a new one is needed.
 palette! {
     // Accent colors
-    /// Rosewater → bright white (closest to light pink).
-    rosewater => bright_white,
-    /// Flamingo → bright red (light coral).
-    flamingo => bright_red,
-    /// Pink → bright magenta.
-    pink => bright_magenta,
-    /// Mauve → bright purple.
-    mauve => bright_purple,
     /// Red → bright red.
     ctp_red => bright_red,
-    /// Maroon → red.
-    maroon => red,
-    /// Peach → bright yellow (orange-ish).
-    peach => bright_yellow,
     /// Yellow → bright yellow.
     ctp_yellow => bright_yellow,
     /// Green → bright green.
     ctp_green => bright_green,
-    /// Teal → cyan.
-    teal => cyan,
     /// Sky → bright cyan.
     sky => bright_cyan,
-    /// Sapphire → bright cyan.
-    sapphire => bright_cyan,
-    /// Blue → bright blue.
-    ctp_blue => bright_blue,
     /// Lavender → bright purple.
     lavender => bright_purple,
 
     // Text colors
-    /// Text → bright white.
-    text => bright_white,
-    /// Subtext1 → white.
-    subtext1 => white,
     /// Subtext0 → white.
     subtext0 => white,
     /// White → bright white.
     ctp_white => bright_white,
 
     // Overlay colors
-    /// Overlay2 → white (the lightest overlay).
-    overlay2 => white,
     /// Overlay1 → bright black (gray).
     overlay1 => bright_black,
-    /// Overlay0 → bright black (gray).
-    overlay0 => bright_black,
-
-    // Surface colors (dark grays)
-    /// Surface2 → bright black.
-    surface2 => bright_black,
-    /// Surface1 → bright black.
-    surface1 => bright_black,
-    /// Surface0 → bright black.
-    surface0 => bright_black,
 }

@@ -1,5 +1,8 @@
 //! Terminal-native clipboard via the OSC52 escape sequence. Works over SSH and
-//! needs no system clipboard libraries. Honest about failure (returns Err).
+//! needs no system clipboard libraries. OSC52 has no acknowledgement: `copy`
+//! can only report a failed write to stdout, not whether the terminal honored
+//! the sequence (many disable OSC52 or cap its size), so success is a request
+//! sent, not a clipboard confirmed.
 use std::io::{self, Write};
 
 use base64::engine::general_purpose::STANDARD;
@@ -11,7 +14,8 @@ pub fn osc52_sequence(text: &str) -> String {
     format!("\x1b]52;c;{encoded}\x07")
 }
 
-/// Write the OSC52 sequence to stdout. Returns Err if the write fails.
+/// Write the OSC52 sequence to stdout. Returns Err only if the write fails;
+/// `Ok` cannot mean the terminal set its clipboard (see the module docs).
 pub fn copy(text: &str) -> io::Result<()> {
     let seq = osc52_sequence(text);
     let mut out = io::stdout();

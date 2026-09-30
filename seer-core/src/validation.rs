@@ -85,7 +85,9 @@ pub fn normalize_host(host: &str) -> Result<String> {
 /// per-name DNS paths accept it. Per-host probes (`ssl`, `status`, …) keep
 /// [`normalize_host`]: `*` names no host they could connect to. A `*`
 /// anywhere else (`a*.example.com`, `a.*.example.com`) is still rejected.
-pub(crate) fn normalize_query_name(name: &str) -> Result<String> {
+/// A single label is accepted when written absolute (`com.`), so a TLD's own
+/// records can be queried.
+pub fn normalize_query_name(name: &str) -> Result<String> {
     normalize(name, NameKind::QueryName)
 }
 
@@ -101,7 +103,12 @@ enum NameKind {
 }
 
 fn normalize(domain: &str, kind: NameKind) -> Result<String> {
-    let domain = domain.trim().to_lowercase();
+    // IDNA (UTS #46) maps the ideographic and full-width full stops to `.`.
+    // Map them first: every structural check below splits on ASCII dots.
+    let domain = domain
+        .trim()
+        .to_lowercase()
+        .replace(['\u{3002}', '\u{FF0E}', '\u{FF61}'], ".");
 
     // Remove protocol
     let domain = domain
@@ -132,6 +139,7 @@ fn normalize(domain: &str, kind: NameKind) -> Result<String> {
     // root-label dot; rejecting it would force callers to pre-clean inputs
     // that are otherwise valid. Done before the `www.` strip so `www.com.`
     // is judged on its real label count.
+    let absolute = domain.ends_with('.');
     let domain = domain.strip_suffix('.').unwrap_or(domain);
 
     // Remove www. prefix — but only when what remains still has a dot.
@@ -142,8 +150,11 @@ fn normalize(domain: &str, kind: NameKind) -> Result<String> {
         _ => domain,
     };
 
-    // Validate domain format
-    if domain.is_empty() || !domain.contains('.') {
+    // Validate domain format. A single label is a name only as a query name
+    // written absolute (`com.`, `mx.`): dig-style TLD and root-zone queries.
+    // Bare, it is far more likely a typo than a TLD.
+    let single_label_ok = kind == NameKind::QueryName && absolute;
+    if domain.is_empty() || (!domain.contains('.') && !single_label_ok) {
         return Err(SeerError::InvalidDomain(domain.to_string()));
     }
 
@@ -502,6 +513,21 @@ mod tests {
         assert!(normalize_domain("*.example.com").is_err());
     }
 
+    /// Regression: `seer dig com. NS` (and the `mx.` form the dig usage
+    /// hint suggests) failed as an invalid name, so a TLD's own records could
+    /// not be queried.
+    #[test]
+    fn an_absolute_single_label_is_a_query_name_only() {
+        assert_eq!(normalize_query_name("com.").unwrap(), "com");
+        assert_eq!(normalize_query_name("MX.").unwrap(), "mx");
+        // Bare, a single label is still rejected (most likely a typo) …
+        assert!(normalize_query_name("com").is_err());
+        // … and hosts and registrations never take one.
+        assert!(normalize_host("com.").is_err());
+        assert!(normalize_domain("com.").is_err());
+        assert!(normalize_query_name(".").is_err());
+    }
+
     #[test]
     fn describe_reserved_ip_names_the_metadata_endpoint() {
         // 169.254.169.254 is link-local too; the specific wording must win.
@@ -512,6 +538,23 @@ mod tests {
         assert_eq!(
             describe_reserved_ip(&"169.254.1.1".parse().unwrap()),
             Some("link-local address (169.254.0.0/16)")
+        );
+    }
+
+    /// Regression: the IDNA full stops were rejected by the ASCII-dot check
+    /// that ran before IDNA mapping.
+    #[test]
+    fn idna_full_stops_separate_labels() {
+        for input in ["例え\u{3002}jp", "例え\u{FF0E}jp", "例え\u{FF61}jp"] {
+            assert_eq!(
+                normalize_domain(input).unwrap(),
+                "xn--r8jz45g.jp",
+                "{input:?}"
+            );
+        }
+        assert_eq!(
+            normalize_host("www\u{3002}example\u{3002}com").unwrap(),
+            "www.example.com"
         );
     }
 

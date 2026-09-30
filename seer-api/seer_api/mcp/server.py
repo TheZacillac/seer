@@ -33,15 +33,18 @@ import seer
 from .. import __version__
 from .._contract import (
     BULK_LIMIT,
+    DOMAIN_MAX_LENGTH,
     HEAVY_LIMIT,
     MAX_BULK_DOMAINS,
     MAX_CONCURRENCY,
+    NAMESERVER_MAX_LENGTH,
     RECORD_TYPE_MAX_LENGTH,
     RECORD_TYPE_PATTERN,
     TLD_TOKEN_RE,
 )
 from .._run import run_seer
-from ..ssrf import nameserver_target
+from ..errors import clean_message
+from ..ssrf import guarded
 
 # No logging.basicConfig() here: this module is also imported by the REST app
 # (seer_api.main), where configuring the root logger at import time made
@@ -92,7 +95,7 @@ _RECORD_TYPE_DESC = (
 
 def _require_tld(arguments: dict[str, Any]) -> str:
     """Extract and validate a required TLD argument."""
-    tld = _require_str(arguments, "tld")
+    tld = _require_str(arguments, "tld", max_length=64)
     if not TLD_TOKEN_RE.fullmatch(tld):
         raise ValueError(
             "'tld' must be ASCII letters/digits/hyphens (punycode allowed), "
@@ -115,11 +118,18 @@ def _require_record_type(arguments: dict[str, Any], default: str = "A") -> str:
     return value
 
 
-def _require_str(arguments: dict[str, Any], key: str) -> str:
-    """Extract and validate a required string argument."""
+def _require_str(
+    arguments: dict[str, Any], key: str, *, max_length: int = DOMAIN_MAX_LENGTH
+) -> str:
+    """Extract and validate a required string argument.
+
+    Capped like the REST parameter it mirrors (a domain by default).
+    """
     value = arguments.get(key)
     if not value or not isinstance(value, str):
         raise ValueError(f"Required argument '{key}' is missing or empty")
+    if len(value) > max_length:
+        raise ValueError(f"'{key}' exceeds {max_length} characters")
     return value
 
 
@@ -133,6 +143,8 @@ def _require_domains(arguments: dict[str, Any]) -> list[str]:
     for d in domains:
         if not isinstance(d, str) or not d.strip():
             raise ValueError("Each domain must be a non-empty string")
+        if len(d) > DOMAIN_MAX_LENGTH:
+            raise ValueError(f"Each domain must be at most {DOMAIN_MAX_LENGTH} characters")
     return domains
 
 
@@ -159,60 +171,40 @@ def _invalid_input_message(exc: Exception) -> str:
     'Invalid input:' (e.g. the SSRF guard's reserved-address refusal), and
     PyO3 surfaces that text verbatim — so blindly prefixing would produce a
     doubled 'Invalid input: Invalid input:'. Add the marker only when absent.
+    The text goes through the same sanitizer and cap as a REST 400 body.
     """
-    msg = str(exc)
+    msg = clean_message(str(exc))
     if msg.startswith(_INVALID_INPUT_PREFIX):
         return msg
     return _INVALID_INPUT_PREFIX + msg
 
 
-# --- SSRF guards --------------------------------------------------------------
-# Only hosts that are an actual outbound connect target are guarded (see
-# seer_api/ssrf.py). `seer.validate_public_host` raises ValueError, which
-# `call_tool` surfaces as "Invalid input:". It enters PyO3 and `block_on`s a
-# DNS resolution, so handlers call these through `run_seer` to keep it off the
-# event loop.
-
-
-def _guard_hosts(*hosts: str) -> None:
-    """SSRF-check each host as an HTTPS (port 443) connect target."""
-    for host in hosts:
-        seer.validate_public_host(host, 443)
-
-
-def _guard_nameserver(spec: str) -> None:
-    """SSRF-check the host a nameserver spec connects to.
-
-    Mirrors ``seer_api.ssrf.guard_nameserver_async``: the argument is a spec
-    (``8.8.8.8``, ``9.9.9.9:5353``, ``tls://1.1.1.1``,
-    ``https://cloudflare-dns.com/dns-query``), not a hostname, parsed by
-    seer-core. A malformed spec is left for the core to reject with its own
-    ``Invalid input``.
-    """
-    target = nameserver_target(spec)
-    if target is not None:
-        seer.validate_public_host(*target)
-
-
 # --- Tool handlers ------------------------------------------------------------
 # Each handler validates its arguments, then dispatches the blocking PyO3 call
-# through `run_seer` (the bounded `_DISPATCH_EXECUTOR`) so the MCP-over-HTTP
-# transport honors SEER_DISPATCH_THREADS exactly like the REST routes (issue
-# #48). Bindings are looked up on `seer` at call time, never captured at
-# import.
+# through ONE `run_seer` (the bounded `_DISPATCH_EXECUTOR`) so the MCP-over-HTTP
+# transport honors SEER_DISPATCH_THREADS and SEER_REQUEST_TIMEOUT exactly like
+# the REST routes (issue #48). Connect targets are SSRF-pre-checked inside that
+# same dispatch with `ssrf.guarded` — the pre-check REST uses; a refusal is a
+# ValueError, which `call_tool` surfaces as "Invalid input:". Bindings are
+# looked up on `seer` at call time, never captured at import.
 
 Handler = Callable[[dict[str, Any]], Awaitable[Any]]
 
 
-def _single(binding: str, arg: str = "domain", *, guard: bool = False) -> Handler:
+def _single(
+    binding: str,
+    arg: str = "domain",
+    *,
+    guard: bool = False,
+    max_length: int = DOMAIN_MAX_LENGTH,
+) -> Handler:
     """``seer.<binding>(<arg>)``. With ``guard``, the argument is the HTTPS
-    connect target and is SSRF-checked first."""
+    connect target and is SSRF-pre-checked in the same dispatch."""
 
     async def run(arguments: dict[str, Any]) -> Any:
-        value = _require_str(arguments, arg)
-        if guard:
-            await run_seer(_guard_hosts, value)
-        return await run_seer(getattr(seer, binding), value)
+        value = _require_str(arguments, arg, max_length=max_length)
+        call = getattr(seer, binding)
+        return await run_seer(guarded(call, hosts=[value]) if guard else call, value)
 
     return run
 
@@ -244,17 +236,18 @@ def _bulk(
     *,
     record_type: bool = False,
     default_concurrency: int = 10,
-    guard: bool = False,
 ) -> Handler:
-    """``seer.<binding>(domains, [record_type,] concurrency)``. With ``guard``,
-    every domain is an HTTPS connect target and is SSRF-checked first."""
+    """``seer.<binding>(domains, [record_type,] concurrency)``.
+
+    No SSRF pre-check, even where every domain is a connect target (bulk
+    status/SSL): core refuses a reserved host per row, which fails that row
+    rather than the whole batch (see seer_api/ssrf.py).
+    """
 
     async def run(arguments: dict[str, Any]) -> Any:
         domains = _require_domains(arguments)
         extra = (_require_record_type(arguments),) if record_type else ()
         concurrency = _get_concurrency(arguments, default=default_concurrency)
-        if guard:
-            await run_seer(_guard_hosts, *domains)
         return await run_seer(getattr(seer, binding), domains, *extra, concurrency)
 
     return run
@@ -271,15 +264,23 @@ async def _dig(arguments: dict[str, Any]) -> Any:
     domain = _require_str(arguments, "domain")
     record_type = _require_record_type(arguments)
     nameserver = arguments.get("nameserver")
-    if nameserver is not None:
-        if not isinstance(nameserver, str):
-            raise ValueError(f"'nameserver' must be a string (got {type(nameserver).__name__})")
-        await run_seer(_guard_nameserver, nameserver)
-    return await run_seer(seer.dig, domain, record_type, nameserver)
+    if nameserver is None:
+        return await run_seer(seer.dig, domain, record_type, None)
+    if not isinstance(nameserver, str):
+        raise ValueError(f"'nameserver' must be a string (got {type(nameserver).__name__})")
+    if len(nameserver) > NAMESERVER_MAX_LENGTH:
+        raise ValueError(f"'nameserver' exceeds {NAMESERVER_MAX_LENGTH} characters")
+    dig = guarded(seer.dig, nameservers=[nameserver])
+    return await run_seer(dig, domain, record_type, nameserver)
 
 
 async def _tld_info(arguments: dict[str, Any]) -> Any:
     return await run_seer(seer.tld_info, _require_tld(arguments))
+
+
+async def _tld_list(_arguments: dict[str, Any]) -> Any:
+    # Embedded data, no I/O: called directly rather than taking a pool thread.
+    return seer.all_tlds()
 
 
 async def _subdomains(arguments: dict[str, Any]) -> Any:
@@ -296,12 +297,11 @@ async def _subdomains(arguments: dict[str, Any]) -> Any:
 async def _dns_compare(arguments: dict[str, Any]) -> Any:
     domain = _require_str(arguments, "domain")
     record_type = _require_record_type(arguments)
-    server_a = _require_str(arguments, "server_a")
-    server_b = _require_str(arguments, "server_b")
+    server_a = _require_str(arguments, "server_a", max_length=NAMESERVER_MAX_LENGTH)
+    server_b = _require_str(arguments, "server_b", max_length=NAMESERVER_MAX_LENGTH)
     # Both servers are actual connect targets (nameserver specs).
-    await run_seer(_guard_nameserver, server_a)
-    await run_seer(_guard_nameserver, server_b)
-    return await run_seer(seer.dns_compare, domain, record_type, server_a, server_b)
+    compare = guarded(seer.dns_compare, nameservers=[server_a, server_b])
+    return await run_seer(compare, domain, record_type, server_a, server_b)
 
 
 async def _diff(arguments: dict[str, Any]) -> Any:
@@ -385,7 +385,7 @@ _TOOLS: dict[str, _Tool] = {
         "information including the network range, country, and responsible organization.",
         _object("ip", ip=_string("IP address (IPv4 or IPv6) to look up")),
         # Rejects reserved IP literals as input validation.
-        _single("rdap_ip", "ip", guard=True),
+        _single("rdap_ip", "ip", guard=True, max_length=45),
     ),
     "seer_rdap_asn": _Tool(
         "Look up RDAP information for an Autonomous System Number (ASN). Returns "
@@ -422,7 +422,11 @@ _TOOLS: dict[str, _Tool] = {
             "domain",
             domain=_string("Domain name to query"),
             record_type=_RECORD_TYPE,
-            nameserver=_string("Optional nameserver IP to query (e.g., '8.8.8.8')"),
+            nameserver=_string(
+                "Optional nameserver to query: an IP or hostname with an optional port "
+                "(UDP, e.g. '8.8.8.8' or '9.9.9.9:5353'), 'tls://host[:port]' (DNS over "
+                "TLS) or 'https://host[:port][/path]' (DNS over HTTPS)"
+            ),
         ),
         _dig,
     ),
@@ -484,7 +488,7 @@ _TOOLS: dict[str, _Tool] = {
         "Check health status for multiple domains at once. Returns HTTP, SSL, and "
         "expiration status for each domain.",
         _object("domains", domains=_domains("check"), concurrency=_concurrency()),
-        _bulk("bulk_status", guard=True),
+        _bulk("bulk_status"),
         HEAVY_LIMIT,
     ),
     "seer_bulk_propagation": _Tool(
@@ -515,7 +519,7 @@ _TOOLS: dict[str, _Tool] = {
         "Inspect SSL certificate chains for multiple domains. Returns the full chain, "
         "SANs, key details, and signature algorithm for each domain.",
         _object("domains", domains=_domains("inspect"), concurrency=_concurrency()),
-        _bulk("bulk_ssl", guard=True),
+        _bulk("bulk_ssl"),
         HEAVY_LIMIT,
     ),
     "seer_ssl": _Tool(
@@ -544,6 +548,12 @@ _TOOLS: dict[str, _Tool] = {
         "or infrastructure).",
         _object("tld", tld=_string("TLD with or without leading dot (e.g., 'com' or '.com')")),
         _tld_info,
+    ),
+    "seer_tld_list": _Tool(
+        "List every top-level domain seer knows about (sorted, deduplicated), from its "
+        "embedded TLD data; no network access. Use seer_tld_info for one TLD's details.",
+        _object(),
+        _tld_list,
     ),
     "seer_dnssec": _Tool(
         "DNSSEC validation report for a domain: DS/DNSKEY digest consistency, chain "
@@ -609,6 +619,9 @@ _TOOLS: dict[str, _Tool] = {
             concurrency=_concurrency("Concurrency for the resolve pass"),
         ),
         _subdomains,
+        # A limit is per tool, not per argument: sized for the heavier
+        # resolve=true path (a DNS fan-out over every name found).
+        HEAVY_LIMIT,
     ),
     "seer_confusables": _Tool(
         "Generate typosquat / homoglyph look-alike domains for a domain and report which "
@@ -661,11 +674,11 @@ async def list_tools() -> list[Tool]:
 # REST routers apply per route (see `_contract`). The flat /mcp gate in
 # main.py applies SEER_RATE_LIMIT to every call equally, so without this an
 # MCP client could drive e.g. seer_bulk_ssl 6x more often than REST permits
-# for the identical operation. Keyed per-process, not per-client: no request
-# identity reaches tool handlers through the MCP session, and these limits
-# exist to protect upstream registries and outbound IP reputation, which are
-# per-process concerns. The same table covers stdio, where the flat /mcp gate
-# doesn't apply at all.
+# for the identical operation. Keyed per client like the REST limits and the
+# /mcp gate (`limiting.get_client_ip` on the HTTP request the SDK hands the
+# handler), so one client exhausting a tool doesn't lock every other client
+# out of it. The same table covers stdio — one local client, where the flat
+# /mcp gate doesn't apply at all.
 _TOOL_RATE_LIMITS: dict[str, str] = {
     name: tool.rate_limit for name, tool in _TOOLS.items() if tool.rate_limit
 }
@@ -691,8 +704,12 @@ def rate_limiter() -> MovingWindowRateLimiter:
     return _rate_limiter
 
 
-def _tool_rate_ok(name: str) -> bool:
-    """Record a hit against ``name``'s per-tool limit; False if over.
+# Rate-limit key of a stdio session: its one local client.
+_STDIO_CLIENT = "stdio"
+
+
+def _tool_rate_ok(name: str, client: str = _STDIO_CLIENT) -> bool:
+    """Record a hit by ``client`` against ``name``'s per-tool limit; False if over.
 
     Tools without an entry in ``_TOOL_RATE_LIMITS`` are always allowed here —
     the flat /mcp limit (HTTP transport) is their only throttle.
@@ -700,21 +717,34 @@ def _tool_rate_ok(name: str) -> bool:
     limit = _TOOL_RATE_LIMITS.get(name)
     if limit is None:
         return True
-    return rate_limiter().hit(_parse_rate_limit(limit), "mcp-tool", name)
+    return rate_limiter().hit(_parse_rate_limit(limit), "mcp-tool", name, client)
+
+
+# Core failures no retry will fix (seer-core's `retry.rs` treats them as
+# permanent): an unsupported TLD, every lookup source failing, an unparseable
+# response, a TLS/certificate failure, a bad configuration. Classified by the
+# binding's exception class, never by the message text.
+_PERMANENT_ERRORS: tuple[type[Exception], ...] = (
+    seer.WhoisServerNotFoundError,
+    seer.LookupFailedError,
+    seer.ParseError,
+    seer.TlsError,
+    seer.ConfigError,
+)
 
 
 async def call_tool(
-    name: str, arguments: dict[str, Any]
+    name: str, arguments: dict[str, Any], client: str = _STDIO_CLIENT
 ) -> list[TextContent] | CallToolResult:
-    """Execute a Seer tool.
+    """Execute a Seer tool for ``client`` (its per-tool rate-limit key).
 
     Success returns a content list (the SDK wraps it as ``isError=False``);
     every failure branch returns an explicit ``CallToolResult`` via
     ``_error_result`` so ``isError=True`` reaches the client. The stdio and
     streamable-HTTP transports share this registry, so the contract holds on
-    both.
+    both. Failures carry retry advice chosen by exception class.
     """
-    if not _tool_rate_ok(name):
+    if not _tool_rate_ok(name, client):
         logger.warning("Tool %s throttled by per-tool rate limit", name)
         return _error_result(
             f"Rate limit exceeded for {name} "
@@ -729,56 +759,27 @@ async def call_tool(
     except ValueError as e:
         return _error_result(_invalid_input_message(e))
     except (TimeoutError, ConnectionError) as e:
-        # PyO3 maps SeerError::Timeout to TimeoutError and connection-class
-        # errors to ConnectionError. These are transient — surface a clear
-        # retryable signal so the host LLM can decide to back off and try
-        # again. We do not include the error text (which can carry server
-        # response data) — the binary classification is enough.
+        # Transient. The error text (which can carry server response data)
+        # is left out — the classification is enough.
         logger.warning("Tool %s failed with transient error: %s", name, e)
         return _error_result("Transient error — retry suggested.")
-    except RuntimeError as e:
-        # PyO3 collapses many SeerError variants into a bare RuntimeError
-        # (see seer-py/src/lib.rs `seer_err_to_py`): some are transient
-        # (RateLimited, RDAP/HTTP 5xx/429, bootstrap-while-IANA-down) but
-        # several are PERMANENTLY non-retryable per seer-core's
-        # `retry.rs::is_retryable` (WhoisServerNotFound/unsupported TLD,
-        # parse/JSON errors, LookupFailed, certificate/SSL failures,
-        # resolver/config errors). Blanket-labelling every RuntimeError as
-        # retryable tells the host LLM to burn its budget re-running permanent
-        # failures. Until the binding exposes core's `is_retryable` directly
-        # (the proper long-term fix), sniff the already-sanitized message for
-        # known-permanent signals — these strings are the fixed output of
-        # `SeerError::sanitized_message`, so the match is stable, not heuristic
-        # parsing of free-form text.
-        msg = str(e)
-        lower = msg.lower()
-        # Stable sanitized prefixes for non-retryable variants.
-        permanent_signals = (
-            "whois server not found",          # WhoisServerNotFound (unsupported TLD)
-            "response parsing failed",         # JsonError (parse failure)
-            "lookup failed for",               # LookupFailed
-            "certificate validation failed",   # CertificateError
-            "ssl inspection failed",           # SslError
-            "configuration error",             # ConfigError
-            "bulk operation partially failed", # BulkOperationError
-        )
-        if any(sig in lower for sig in permanent_signals):
-            logger.warning("Tool %s failed with permanent error: %s", name, e)
-            return _error_result(
-                f"Error: {msg}. This looks like a permanent failure; do not retry."
-            )
-        # Explicitly transient: rate limiting. Other remaining RuntimeErrors
-        # (generic "RDAP lookup failed" / "HTTP request failed") are ambiguous
-        # because sanitization collapses 5xx and 4xx into one string, so we
-        # cannot confidently promise a retry will help — say so rather than
-        # over-promise.
-        if "rate limited" in lower:
-            logger.warning("Tool %s rate limited: %s", name, e)
-            return _error_result("Rate limited — retry after a short backoff.")
-        logger.warning("Tool %s failed with runtime error: %s", name, e)
+    except seer.RateLimitedError as e:
+        logger.warning("Tool %s rate limited upstream: %s", name, e)
+        return _error_result("Rate limited — retry after a short backoff.")
+    except _PERMANENT_ERRORS as e:
+        logger.warning("Tool %s failed with permanent error: %s", name, e)
         return _error_result(
-            f"Error: {msg}. This may be transient (e.g. an upstream 5xx) "
-            "or permanent (e.g. a 4xx); retry at most once with backoff."
+            f"Error: {clean_message(str(e))}. This looks like a permanent failure; "
+            "do not retry."
+        )
+    except seer.SeerError as e:
+        # DNS and upstream (WHOIS/RDAP/HTTP) failures: core's sanitized text
+        # collapses a 5xx and a 4xx into one category, so a retry may or may
+        # not help — say so rather than over-promise.
+        logger.warning("Tool %s failed: %s", name, e)
+        return _error_result(
+            f"Error: {clean_message(str(e))}. This may be transient (e.g. an upstream "
+            "5xx) or permanent (e.g. a 4xx); retry at most once with backoff."
         )
     except Exception:
         logger.exception("Tool %s failed", name)
@@ -808,8 +809,22 @@ async def _handle_list_tools(
     return ListToolsResult(tools=await list_tools())
 
 
+def _client_key(ctx: ServerRequestContext[Any] | None) -> str:
+    """Rate-limit identity of the caller: the client IP of the HTTP request
+    the SDK attached (Streamable HTTP), keyed exactly as the /mcp gate keys
+    it; the local stdio client otherwise."""
+    request = getattr(ctx, "request", None)
+    if request is None:
+        return _STDIO_CLIENT
+    # Imported here, not at module import: limiting builds slowapi's limiter,
+    # which the stdio server never needs.
+    from ..limiting import get_client_ip
+
+    return get_client_ip(request)
+
+
 async def _handle_call_tool(
-    _ctx: ServerRequestContext[Any], params: CallToolRequestParams
+    ctx: ServerRequestContext[Any], params: CallToolRequestParams
 ) -> CallToolResult:
     """Adapt the dispatcher's return to a `CallToolResult`.
 
@@ -819,7 +834,7 @@ async def _handle_call_tool(
     success case is wrapped here; preserving that split is what keeps genuine
     tool failures distinguishable from data at the client.
     """
-    result = await call_tool(params.name, params.arguments or {})
+    result = await call_tool(params.name, params.arguments or {}, _client_key(ctx))
     if isinstance(result, CallToolResult):
         return result
     return CallToolResult(content=result)

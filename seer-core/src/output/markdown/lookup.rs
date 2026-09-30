@@ -1,19 +1,14 @@
 use super::*;
+use crate::output::{availability_label, lookup_source};
 
 impl MarkdownFormatter {
     pub(super) fn format_lookup(&self, result: &LookupResult) -> String {
         let domain = result
             .domain_name()
             .unwrap_or_else(|| "Unknown".to_string());
-        let source = match result {
-            LookupResult::Rdap { .. } => "RDAP",
-            LookupResult::Whois { .. } => "WHOIS",
-            LookupResult::Available { .. } => "availability",
-        };
-
         let mut output = vec![format!("## Lookup: {}", MdSafe(&domain)), String::new()];
         let mut b = Bullets(&mut output);
-        b.raw("Source", source);
+        b.raw("Source", lookup_source(result));
 
         match result {
             LookupResult::Rdap {
@@ -34,7 +29,7 @@ impl MarkdownFormatter {
                 // Contact sections from RDAP — after every domain-level
                 // bullet, since a `###` heading scopes everything below it.
                 let infos = contact::rdap_contacts(data);
-                let rdap_contacts = contact::rdap_views(&infos);
+                let rdap_contacts = contact::rdap_detail_views(&infos);
                 b.contacts(rdap_contacts);
 
                 // WHOIS fallback data, limited to what RDAP didn't show:
@@ -99,19 +94,10 @@ impl MarkdownFormatter {
             } => {
                 // Branch on the stable verdict (which considers `available`),
                 // not `confidence` alone: a confidence:"high" result still
-                // means "registered" when available == false. Mirrors the
-                // human formatter; without this a registered domain reached
-                // via the availability fallback rendered as "AVAILABLE".
-                let verdict = match data.verdict() {
-                    "available" => "AVAILABLE",
-                    "likely_available" => "MAY BE AVAILABLE",
-                    "registered" => "REGISTERED",
-                    "likely_registered" => "LIKELY REGISTERED",
-                    _ => "UNKNOWN",
-                };
-                b.raw("Verdict", verdict);
-                b.raw("Confidence", &data.confidence);
-                b.raw("Method", &data.method);
+                // means "registered" when available == false.
+                b.raw("Verdict", availability_label(data.verdict()).0);
+                b.text("Confidence", &data.confidence);
+                b.text("Method", &data.method);
                 b.opt("Details", &data.details);
                 if !rdap_error.is_empty() {
                     b.text("RDAP Error", rdap_error);
@@ -132,7 +118,7 @@ impl MarkdownFormatter {
                     if !extra.is_empty() {
                         output.extend([
                             String::new(),
-                            "### Additional WHOIS data".to_string(),
+                            "### Additional WHOIS Data".to_string(),
                             String::new(),
                         ]);
                         output.extend(extra);
@@ -159,8 +145,8 @@ impl MarkdownFormatter {
             "**TAKEN**"
         };
         b.raw("Result", verdict);
-        b.raw("Confidence", &result.confidence);
-        b.raw("Method", &result.method);
+        b.text("Confidence", &result.confidence);
+        b.text("Method", &result.method);
         b.opt("Details", &result.details);
 
         output.join("\n")

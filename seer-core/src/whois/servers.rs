@@ -12,9 +12,9 @@ use std::sync::LazyLock;
 /// `whois.nic.google` does not resolve and IANA publishes no `whois:` field
 /// for these TLDs; they are RDAP-only. Re-adding them sends every WHOIS
 /// query to a dead hostname and produces a misleading "DNS resolution failed"
-/// instead of the clean `WhoisServerNotFound` error the discovery path
-/// generates. Use `seer.lookup()` (RDAP-first) or `seer.rdap_domain()` for
-/// these TLDs.
+/// instead of the clean `WhoisServerNotFound` error the client returns for
+/// every TLD in [`RDAP_ONLY_TLDS`] without asking IANA. Use `seer.lookup()`
+/// (RDAP-first) or `seer.rdap_domain()` for these TLDs.
 ///
 /// For the same reason, these TLDs were removed 2026-07-04 after a full-TLD
 /// live sweep found their WHOIS hostnames dead in DNS and their IANA records
@@ -370,8 +370,9 @@ pub fn get_whois_server_for_domain(domain: &str) -> Option<&'static str> {
     labels.first().and_then(|tld| get_whois_server(tld))
 }
 
-pub fn get_tld(domain: &str) -> Option<&str> {
-    domain.rsplit('.').next()
+/// The last label of `domain` (the whole input when it has no dot).
+pub fn get_tld(domain: &str) -> &str {
+    domain.rsplit('.').next().unwrap_or(domain)
 }
 
 /// Returns a suggested registry website URL for a TLD.
@@ -379,7 +380,7 @@ pub fn get_tld(domain: &str) -> Option<&str> {
 /// IDN TLD is converted to its A-label so derived URLs and the IANA fallback
 /// page use the canonical punycode form (IANA's root-db URLs are A-label
 /// keyed: `.../db/xn--p1ai.html`, not `.../db/рф.html`).
-pub fn get_registry_url(tld: &str) -> Option<String> {
+pub fn get_registry_url(tld: &str) -> String {
     let tld_lower = tld.to_lowercase();
     let tld_lower = if tld_lower.is_ascii() {
         tld_lower
@@ -390,14 +391,12 @@ pub fn get_registry_url(tld: &str) -> Option<String> {
     // Special cases for well-known registries
     match tld_lower.as_str() {
         "com" | "net" | "cc" | "tv" => {
-            return Some("https://www.verisign.com/en_US/domain-names/index.xhtml".to_string())
+            return "https://www.verisign.com/en_US/domain-names/index.xhtml".to_string()
         }
-        "org" => return Some("https://thenew.org/org-people/domain-management/whois/".to_string()),
-        "edu" => return Some("https://www.educause.edu/whois".to_string()),
-        "gov" => return Some("https://domains.dotgov.gov/".to_string()),
-        "app" | "dev" | "page" => {
-            return Some("https://www.registry.google/policies/whois/".to_string())
-        }
+        "org" => return "https://thenew.org/org-people/domain-management/whois/".to_string(),
+        "edu" => return "https://www.educause.edu/whois".to_string(),
+        "gov" => return "https://domains.dotgov.gov/".to_string(),
+        "app" | "dev" | "page" => return "https://www.registry.google/policies/whois/".to_string(),
         _ => {}
     }
 
@@ -411,23 +410,20 @@ pub fn get_registry_url(tld: &str) -> Option<String> {
         // page, which is always correct for the requested TLD.
         if let Some(suffix) = whois_server.strip_prefix("whois.nic.") {
             if suffix == tld_lower {
-                return Some(format!("https://nic.{}", suffix));
+                return format!("https://nic.{}", suffix);
             }
         }
         // Pattern: whois.XX -> https://www.nic.XX or https://XX registry
         if whois_server.starts_with("whois.") {
             // For ccTLDs, try the nic.TLD pattern
             if tld_lower.len() == 2 {
-                return Some(format!("https://nic.{}", tld_lower));
+                return format!("https://nic.{}", tld_lower);
             }
         }
     }
 
     // Fallback: suggest IANA's TLD info page
-    Some(format!(
-        "https://www.iana.org/domains/root/db/{}.html",
-        tld_lower
-    ))
+    format!("https://www.iana.org/domains/root/db/{}.html", tld_lower)
 }
 
 /// TLDs that are intentionally absent from `WHOIS_SERVERS` (RDAP-only — see the
@@ -477,6 +473,19 @@ pub const NO_WHOIS_TLDS: &str = "
     xn--rhqv96g za zw ελ ارامكو الاردن البحرين المغرب سودان پاکستان বাংলা გე 世界 健康 商标 招聘
     餐厅
 ";
+
+/// Whether `tld` is a catalogued TLD with no port-43 WHOIS service
+/// ([`RDAP_ONLY_TLDS`], [`WHOIS_RETIRED_TLDS`], [`NO_WHOIS_TLDS`]), so
+/// asking IANA for its server is pointless. Either form of an IDN TLD.
+pub(crate) fn has_no_whois_server(tld: &str) -> bool {
+    static NO_WHOIS: LazyLock<std::collections::HashSet<&'static str>> = LazyLock::new(|| {
+        [RDAP_ONLY_TLDS, WHOIS_RETIRED_TLDS, NO_WHOIS_TLDS]
+            .into_iter()
+            .flat_map(str::split_ascii_whitespace)
+            .collect()
+    });
+    NO_WHOIS.contains(tld.to_lowercase().as_str())
+}
 
 /// Returns every TLD seer knows about: the WHOIS server map keys unioned with
 /// the RDAP-only, WHOIS-retired, and no-WHOIS TLDs, sorted and deduplicated.
@@ -745,15 +754,12 @@ mod all_tlds_tests {
     #[test]
     fn get_registry_url_uses_punycode_for_idn_tlds() {
         assert_eq!(
-            get_registry_url("рф").as_deref(),
-            Some("https://www.iana.org/domains/root/db/xn--p1ai.html")
+            get_registry_url("рф").as_str(),
+            "https://www.iana.org/domains/root/db/xn--p1ai.html"
         );
         // whois.nic.xn--d1acj3b matches the converted TLD, so the derived
         // registry URL is kept — under the A-label, never the U-label.
-        assert_eq!(
-            get_registry_url("дети").as_deref(),
-            Some("https://nic.xn--d1acj3b")
-        );
+        assert_eq!(get_registry_url("дети").as_str(), "https://nic.xn--d1acj3b");
         assert_eq!(
             get_registry_url("дети"),
             get_registry_url("xn--d1acj3b"),
@@ -767,11 +773,11 @@ mod all_tlds_tests {
         // URL by stripping the prefix must NOT point .datsun at the .gmo
         // registry; it should fall through to the always-correct IANA page.
         assert_eq!(
-            get_registry_url("datsun").as_deref(),
-            Some("https://www.iana.org/domains/root/db/datsun.html")
+            get_registry_url("datsun").as_str(),
+            "https://www.iana.org/domains/root/db/datsun.html"
         );
         // But when the trailing label really is the TLD, the derivation is kept.
-        assert_eq!(get_registry_url("gmo").as_deref(), Some("https://nic.gmo"));
+        assert_eq!(get_registry_url("gmo"), "https://nic.gmo");
     }
 
     /// TLDs whose WHOIS hostnames are dead and whose IANA records no longer

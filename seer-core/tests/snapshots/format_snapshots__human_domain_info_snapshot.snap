@@ -1,5 +1,6 @@
 ---
 source: seer-core/tests/format_snapshots.rs
+assertion_line: 780
 expression: human ().format_domain_info (& fixture_domain_info())
 ---
 
@@ -11,7 +12,7 @@ expression: human ().format_domain_info (& fixture_domain_info())
   [1;96mCreated[0m: [97m2010-03-15[0m
   [1;96mExpires[0m: [97m2099-03-15[0m
   [1;96mUpdated[0m: [97m2024-02-01[0m
-  [1;96mDays Until Expiry[0m: [97m26660 days[0m
+  [1;96mDays Until Expiry[0m: [1;92mexpires in [N] days[0m
   [1;96mDomain Age[0m: [97m5800 days[0m
   [1;96mExpiry Status[0m: [97mactive[0m
   [1;96mNameservers[0m: [97mNS1.EXAMPLE.COM[0m

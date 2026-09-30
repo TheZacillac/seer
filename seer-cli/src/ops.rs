@@ -1,15 +1,15 @@
-//! Shared command pipeline for the CLI subcommands and the interactive REPL.
-//!
-//! Both surfaces run the same fetch-then-format pipelines; before this module
-//! existed, `main.rs` and `repl/mod.rs` were two hand-maintained copies of the
-//! bulk-operation mapping, domain-list validation, output-path derivation,
-//! progress wiring, and drift/history-snapshot logic. Keeping those pieces
+//! Shared command pieces for the CLI subcommands, the interactive REPL and
+//! the TUI: the bulk-operation catalog and mapping, domain-list validation,
+//! the live `follow` runner, `~/.seer` state I/O, and the drift and
+//! subdomain-baseline checks. Before this module existed, `main.rs` and
+//! `repl/mod.rs` were two hand-maintained copies of this logic; keeping it
 //! here means a new bulk operation or a semantics fix lands in one place and
-//! every surface (CLI, REPL, and the TUI's op mapping) picks it up.
+//! every surface picks it up. The `bulk` command's run itself is
+//! [`crate::bulk`]; the watch/history/config commands are [`crate::manage`].
 
 use std::sync::LazyLock;
 
-use seer_core::bulk::{BulkOperation, BulkResult};
+use seer_core::bulk::BulkOperation;
 use seer_core::colors::CatppuccinExt;
 use seer_core::RecordType;
 
@@ -116,14 +116,14 @@ pub fn parse_bulk_domains(content: &str) -> Result<Vec<String>, String> {
     let domains = seer_core::bulk::parse_domains_from_file(content);
     if domains.is_empty() {
         return Err(
-            "No valid domains found in file. Expected format: one domain per line, \
+            "No valid domains found. Expected format: one domain per line, \
              # for comments, or CSV (first column)"
                 .to_string(),
         );
     }
     if domains.len() > MAX_BULK_DOMAINS {
         return Err(format!(
-            "Bulk file contains {} domains, maximum is {}",
+            "Bulk input contains {} domains, maximum is {}",
             domains.len(),
             MAX_BULK_DOMAINS
         ));
@@ -131,89 +131,14 @@ pub fn parse_bulk_domains(content: &str) -> Result<Vec<String>, String> {
     Ok(domains)
 }
 
-/// Default bulk output CSV path: a sibling `<stem>_results.csv` of the input
-/// file (`domains.txt` → `domains_results.csv`).
-pub fn default_bulk_output_path(input_file: &str) -> String {
-    let input_path = std::path::Path::new(input_file);
-    let stem = input_path.file_stem().unwrap_or_default().to_string_lossy();
-    let parent = input_path.parent().unwrap_or(std::path::Path::new("."));
-    parent
-        .join(format!("{}_results.csv", stem))
-        .to_string_lossy()
-        .to_string()
-}
-
-/// Progress bar for a bulk run, registered with the tracing writer so log
-/// lines print above it instead of tearing it. Pair with [`finish_bulk_bar`].
-pub fn bulk_bar(total: usize) -> indicatif::ProgressBar {
-    let bar = indicatif::ProgressBar::new(total as u64);
-    bar.set_style(
-        indicatif::ProgressStyle::default_bar()
-            .template("{bar:40.cyan/blue} {pos}/{len} ({percent}%) eta {eta} {msg}")
-            .expect("valid progress bar template")
-            .progress_chars("=>-"),
-    );
-    crate::display::set_bulk_progress_bar(bar.clone());
-    bar
-}
-
-/// Unregisters and clears a [`bulk_bar`].
-pub fn finish_bulk_bar(bar: &indicatif::ProgressBar) {
-    crate::display::clear_bulk_progress_bar();
-    bar.finish_and_clear();
-}
-
-/// Progress callback that drives an indicatif bar: advances the position and
-/// shows the most recently completed domain as the bar message.
-pub fn bar_progress_callback(bar: &indicatif::ProgressBar) -> seer_core::bulk::ProgressCallback {
-    let bar = bar.clone();
-    Box::new(move |completed: usize, _total: usize, domain: &str| {
-        bar.set_position(completed as u64);
-        bar.set_message(domain.to_string());
-    })
-}
-
-/// The "Processing N domains with OP operation..." line printed before a run.
-pub fn bulk_banner(domain_count: usize, op: &str) -> String {
-    format!(
-        "Processing {} domains with {} operation...",
-        domain_count.to_string().ctp_green(),
-        op.ctp_yellow()
-    )
-}
-
-/// Writes a run's CSV atomically, so a crash or full disk mid-write cannot
-/// leave a truncated file that downstream pipelines treat as authoritative.
-pub fn write_bulk_csv(results: &[BulkResult], op: &str, path: &str) -> Result<(), String> {
-    let csv = crate::utils::bulk_results_to_csv(results, op);
-    crate::utils::atomic_write(path, &csv)
-        .map_err(|e| format!("Failed to write output file {}: {}", path, e))
-}
-
-/// The "  N successful, M failed" line after a run.
-pub fn bulk_summary(results: &[BulkResult]) -> String {
-    let ok = results.iter().filter(|r| r.success).count();
-    let failed = results.len() - ok;
-    let failed = if failed > 0 {
-        failed.to_string().ctp_red()
-    } else {
-        failed.to_string().ctp_green()
-    };
-    format!(
-        "  {} successful, {} failed",
-        ok.to_string().ctp_green(),
-        failed
-    )
-}
-
 /// Runs a live `follow` for the CLI and the REPL: raw mode so Esc / Ctrl-C
 /// cancel, and each iteration streamed to stdout as it lands. Raw mode is
 /// left by [`RawModeGuard`](crate::utils::RawModeGuard) on return or unwind,
 /// and by `main`'s panic hook when `panic = "abort"` skips Drop (issue #60).
 /// The key listener is stopped before returning so it cannot swallow
-/// keystrokes meant for whatever reads the terminal next. `handle_sigint`
-/// also cancels on SIGINT, the only interrupt path when there is no terminal
-/// for the key listener.
+/// keystrokes meant for whatever reads the terminal next. SIGINT cancels
+/// too: it is the interrupt path when stdin is not a terminal (raw mode and
+/// the key listener are then off), and raw mode never raises it otherwise.
 pub async fn run_live_follow(
     follower: &seer_core::DnsFollower,
     domain: &str,
@@ -221,20 +146,17 @@ pub async fn run_live_follow(
     nameserver: Option<&str>,
     config: seer_core::FollowConfig,
     format: seer_core::output::OutputFormat,
-    handle_sigint: bool,
 ) -> seer_core::Result<seer_core::FollowResult> {
     use std::io::Write;
 
-    // `cancel_tx` must stay alive until the follow returns: once every sender
-    // is dropped, the follow's interruptible sleep wakes immediately.
     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-    if handle_sigint {
+    let sigint = {
         let cancel_tx = cancel_tx.clone();
         tokio::spawn(async move {
             tokio::signal::ctrl_c().await.ok();
             let _ = cancel_tx.send(true);
-        });
-    }
+        })
+    };
 
     let raw_guard = crate::utils::RawModeGuard::new();
     let key_listener =
@@ -264,6 +186,8 @@ pub async fn run_live_follow(
         .await;
 
     // Stop the listener, then restore cooked mode, before the caller prints.
+    // The SIGINT task goes too, so it cannot outlive this follow.
+    sigint.abort();
     if let Some(listener) = key_listener {
         listener.stop().await;
     }
@@ -271,23 +195,108 @@ pub async fn run_live_follow(
     result
 }
 
-/// Records a lookup result to `~/.seer/history.toml` off the async executor
-/// (the file I/O is blocking). Errors are deliberately swallowed — history is
-/// best-effort and must never fail the lookup that produced it.
-pub async fn record_lookup_history(domain: &str, result: seer_core::LookupResult) {
+/// Whether `follow`'s prose (the "Following …" banner and the interrupted
+/// note) belongs on stderr: yes for every non-human format, so stdout carries
+/// only the formatted iterations and summary and stays machine-parseable.
+pub fn follow_notes_to_stderr(format: seer_core::output::OutputFormat) -> bool {
+    format != seer_core::output::OutputFormat::Human
+}
+
+/// The `follow` command for the CLI and the REPL: the banner, the live
+/// follow ([`run_live_follow`]) and its summary. The nameserver falls back to
+/// the config file's, like `dig`.
+pub async fn follow_command(
+    follower: &seer_core::DnsFollower,
+    args: crate::dns_args::FollowArgs,
+    config: &seer_core::SeerConfig,
+    format: seer_core::output::OutputFormat,
+) -> Result<(), String> {
+    use std::io::Write;
+
+    let follow_config = seer_core::FollowConfig::new(args.iterations, args.interval_minutes)
+        .map_err(|e| e.to_string())?
+        .with_changes_only(args.changes_only);
+    let nameserver = args.nameserver.as_deref().or(config.nameserver.as_deref());
+
+    // The banner is prose, so under a machine format it goes to stderr and
+    // stdout stays a parseable stream (`seer --format json follow … | jq`).
+    // `\r\n` matches the raw-mode iteration lines that follow.
+    let notes_to_stderr = follow_notes_to_stderr(format);
+    let banner = format!(
+        "Following {} {} records ({} iterations, {} interval)\r\nPress {} or {} to stop early\r\n\r\n",
+        args.domain.ctp_green(),
+        args.record_type.to_string().ctp_yellow(),
+        args.iterations.to_string().ctp_yellow(),
+        crate::utils::format_interval(args.interval_minutes),
+        "Esc".ctp_yellow(),
+        "Ctrl+C".ctp_yellow()
+    );
+    if notes_to_stderr {
+        eprint!("{}", banner);
+        let _ = std::io::stderr().flush();
+    } else {
+        print!("{}", banner);
+        let _ = std::io::stdout().flush();
+    }
+
+    let result = run_live_follow(
+        follower,
+        &args.domain,
+        args.record_type,
+        nameserver,
+        follow_config,
+        format,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    if result.interrupted {
+        let note = "Follow interrupted by user".ctp_yellow();
+        if notes_to_stderr {
+            eprintln!("{}", note);
+        } else {
+            println!("\n{}", note);
+        }
+    }
+    println!(
+        "\n{}",
+        seer_core::output::get_formatter(format).format_follow(&result)
+    );
+    Ok(())
+}
+
+/// Serializes this process's load→modify→save cycles on the `~/.seer`
+/// stores (history, watchlist): two overlapping cycles each save their own
+/// snapshot, so the later save silently undoes the earlier one's change.
+/// The TUI records history, clears it and edits the watchlist concurrently.
+/// Move the guard into the blocking closure, so a cancelled caller cannot
+/// release it while the orphaned write still runs.
+pub static STORE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Records a lookup result to the `~/.seer` history off the async executor
+/// (the file I/O is blocking). The caller decides what a failure means: a
+/// plain lookup's history is best-effort and only warns, while `drift
+/// --record` fails — recording is the whole point there.
+pub async fn record_lookup_history(
+    domain: &str,
+    result: seer_core::LookupResult,
+) -> seer_core::Result<()> {
     let domain = domain.to_string();
+    let store = STORE_LOCK.lock().await;
     tokio::task::spawn_blocking(move || {
-        let mut history = seer_core::LookupHistory::load();
+        let _store = store;
+        // An unreadable history is left alone rather than saved over.
+        let mut history = seer_core::LookupHistory::load()?;
         history.record(&domain, result);
-        let _ = history.save();
+        history.save()
     })
     .await
-    .ok();
+    .map_err(|e| seer_core::SeerError::ConfigError(format!("history task failed: {e}")))?
 }
 
 /// Runs blocking `~/.seer` state-file I/O off the async executor, folding a
 /// failed task into the same `Failed to <what>: …` error as the I/O itself.
-async fn state_io<T, F>(what: &str, io: F) -> Result<T, String>
+pub(crate) async fn state_io<T, F>(what: &str, io: F) -> Result<T, String>
 where
     T: Send + 'static,
     F: FnOnce() -> seer_core::Result<T> + Send + 'static,
@@ -300,130 +309,23 @@ where
 }
 
 pub async fn load_watchlist() -> Result<seer_core::Watchlist, String> {
-    state_io("load watchlist", || Ok(seer_core::Watchlist::load())).await
-}
-
-/// Runs `watch add|remove|list` and returns the confirmation to print.
-/// `cmd` is how the user invokes watch on this surface (`seer watch` in the
-/// CLI, `watch` in the REPL), for the usage error and the empty-list hint.
-pub async fn watch_edit(action: &str, domain: Option<&str>, cmd: &str) -> Result<String, String> {
-    let adding = match action {
-        "list" => return Ok(watchlist_listing(&load_watchlist().await?, cmd)),
-        "add" => true,
-        "remove" => false,
-        other => {
-            return Err(format!(
-                "Unknown watch action: {}. Use: add, remove, list",
-                other
-            ))
-        }
-    };
-    let domain = domain.ok_or_else(|| format!("Usage: {} {} <domain>", cmd, action))?;
-
-    let mut watchlist = load_watchlist().await?;
-    let changed = if adding {
-        watchlist
-            .add(domain)
-            .map_err(|e| format!("Invalid domain: {}", e))?
-    } else {
-        watchlist.remove(domain)
-    };
-    if changed {
-        state_io("save watchlist", move || watchlist.save()).await?;
-    }
-    Ok(match (adding, changed) {
-        (true, true) => format!("Added {} to watchlist", domain.ctp_green()),
-        (true, false) => format!("{} is already in the watchlist", domain),
-        (false, true) => format!("Removed {} from watchlist", domain.ctp_green()),
-        (false, false) => format!("{} was not in the watchlist", domain),
-    })
-}
-
-/// The `watch list` text, or the empty-watchlist hint (see [`watch_edit`]
-/// for `cmd`).
-pub fn watchlist_listing(watchlist: &seer_core::Watchlist, cmd: &str) -> String {
-    if watchlist.domains.is_empty() {
-        return format!(
-            "Watchlist is empty. Use '{} add <domain>' to add domains.",
-            cmd
-        );
-    }
-    let mut out = format!("Watchlist ({} domains):", watchlist.domains.len());
-    for domain in &watchlist.domains {
-        out.push_str(&format!("\n  - {}", domain));
-    }
-    out
+    state_io("load watchlist", seer_core::Watchlist::load).await
 }
 
 pub async fn load_history() -> Result<seer_core::LookupHistory, String> {
-    state_io("load history", || Ok(seer_core::LookupHistory::load())).await
+    state_io("load history", seer_core::LookupHistory::load).await
 }
 
-/// Empties `~/.seer/history.toml`.
+/// Empties the `~/.seer` lookup history.
 pub async fn clear_history() -> Result<(), String> {
-    state_io("clear history", || {
-        let mut history = seer_core::LookupHistory::load();
+    let store = STORE_LOCK.lock().await;
+    state_io("clear history", move || {
+        let _store = store;
+        let mut history = seer_core::LookupHistory::load()?;
         history.clear();
         history.save()
     })
     .await
-}
-
-/// The `history` listing: one domain's lookups, or a per-domain summary.
-/// `lookup_cmd` (`seer lookup` / `lookup`) names the command in the
-/// empty-history hint.
-pub fn history_listing(
-    history: &seer_core::LookupHistory,
-    domain: Option<&str>,
-    lookup_cmd: &str,
-) -> String {
-    let Some(domain) = domain else {
-        let total: usize = history.entries.values().map(Vec::len).sum();
-        if total == 0 {
-            return format!(
-                "No lookup history. Run '{} <domain>' to build history.",
-                lookup_cmd
-            );
-        }
-        let mut out = format!(
-            "Lookup history ({} entries across {} domains):",
-            total,
-            history.entries.len()
-        );
-        for (domain, entries) in &history.entries {
-            out.push_str(&format!("\n  {} ({} entries)", domain, entries.len()));
-        }
-        return out;
-    };
-
-    let entries = history.get(domain);
-    if entries.is_empty() {
-        return format!("No history for {}", domain);
-    }
-    let mut out = format!(
-        "History for {} ({} entries):",
-        domain.ctp_green(),
-        entries.len()
-    );
-    for entry in entries {
-        out.push_str(&format!(
-            "\n  [{}] via {} - registrar: {}",
-            entry.timestamp.format("%Y-%m-%d %H:%M"),
-            lookup_source(&entry.result).unwrap_or("availability"),
-            entry.result.registrar().unwrap_or_else(|| "—".to_string())
-        ));
-    }
-    out
-}
-
-/// Which protocol answered a lookup, or `None` for an availability verdict
-/// (neither registry had the domain). Callers pick their own fallback text.
-pub fn lookup_source(result: &seer_core::LookupResult) -> Option<&'static str> {
-    match result {
-        seer_core::LookupResult::Rdap { .. } => Some("RDAP"),
-        seer_core::LookupResult::Whois { .. } => Some("WHOIS"),
-        seer_core::LookupResult::Available { .. } => None,
-    }
 }
 
 /// Outcome of a [`drift_check`]: the computed report plus whether a previous
@@ -453,24 +355,50 @@ pub async fn drift_check(
     // The baseline is the most recent snapshot that carries registration
     // data, so one throttled run recorded with --record does not become the
     // point every later run is compared against.
-    let previous = tokio::task::spawn_blocking(move || {
-        let history = seer_core::LookupHistory::load();
-        seer_core::drift::baseline_snapshot(history.get(&domain_key).iter().map(|e| &e.result))
-            .cloned()
+    // An unreadable history is an error, not "no baseline".
+    let previous = tokio::task::spawn_blocking(move || -> seer_core::Result<_> {
+        let history = seer_core::LookupHistory::load()?;
+        Ok(
+            seer_core::drift::baseline_snapshot(history.get(&domain_key).iter().map(|e| &e.result))
+                .cloned(),
+        )
     })
     .await
-    .ok()
-    .flatten();
+    .map_err(|e| seer_core::SeerError::ConfigError(format!("history task failed: {e}")))??;
 
+    finish_drift(
+        domain,
+        previous,
+        result,
+        record,
+        |domain, result| async move { record_lookup_history(&domain, result).await },
+    )
+    .await
+}
+
+/// The rest of [`drift_check`] once the fresh lookup and the stored baseline
+/// are in hand: the report, then — with `record` — the save through `save`.
+/// A failed save fails the check (it used to be swallowed while the note
+/// still said "recorded a baseline", so every later run compared against a
+/// stale snapshot). `save` is a seam so tests need not touch `~/.seer`.
+async fn finish_drift<F, Fut>(
+    domain: &str,
+    previous: Option<seer_core::LookupResult>,
+    result: seer_core::LookupResult,
+    record: bool,
+    save: F,
+) -> seer_core::Result<DriftOutcome>
+where
+    F: FnOnce(String, seer_core::LookupResult) -> Fut,
+    Fut: std::future::Future<Output = seer_core::Result<()>>,
+{
     let report = match &previous {
         Some(prev) => seer_core::DriftReport::from_lookups(domain, prev, &result),
         None => seer_core::DriftReport::empty(domain),
     };
-
     if record {
-        record_lookup_history(domain, result).await;
+        save(domain.to_string(), result).await?;
     }
-
     Ok(DriftOutcome {
         report,
         had_previous: previous.is_some(),
@@ -512,24 +440,22 @@ pub struct SubdomainBaselineOutcome {
 pub async fn subdomain_baseline_check(
     domain: &str,
     record: bool,
+    config: &seer_core::SeerConfig,
 ) -> seer_core::Result<SubdomainBaselineOutcome> {
-    let enumerator = seer_core::SubdomainEnumerator::new();
+    let enumerator = seer_core::SubdomainEnumerator::from_config(config);
     // `enumerate` normalizes the domain; use `result.domain` as the key so
     // the baseline store and the note agree on the canonical name.
     let result = enumerator.enumerate(domain).await?;
 
     // Baseline file I/O is blocking — keep it off the async executor.
-    let domain_key = result.domain.clone();
-    let names = result.subdomains.clone();
-    let source = result.source.clone();
-    let report = tokio::task::spawn_blocking(move || -> seer_core::Result<_> {
-        let mut baselines = seer_core::SubdomainBaselines::load();
-        let report = baselines.diff(&domain_key, &names);
+    let (result, report) = tokio::task::spawn_blocking(move || -> seer_core::Result<_> {
+        let mut baselines = seer_core::SubdomainBaselines::load()?;
+        let report = baselines.diff(&result.domain, &result.subdomains);
         if record {
-            baselines.record(&domain_key, &names, &source);
+            baselines.record(&result);
             baselines.save()?;
         }
-        Ok(report)
+        Ok((result, report))
     })
     .await
     .map_err(|e| seer_core::SeerError::ConfigError(format!("baseline task failed: {e}")))??;
@@ -637,72 +563,10 @@ mod tests {
         assert_eq!(domains, vec!["a.com", "b.com"]);
     }
 
-    #[test]
-    fn default_bulk_output_path_derives_sibling_csv() {
-        assert_eq!(
-            default_bulk_output_path("domains.txt"),
-            "domains_results.csv"
-        );
-        // Build the expected sibling path through the same Path API so the
-        // separator matches the host OS (Windows joins with `\`, not `/`).
-        let nested = std::path::Path::new("lists").join("domains.csv");
-        let expected = std::path::Path::new("lists")
-            .join("domains_results.csv")
-            .to_string_lossy()
-            .to_string();
-        assert_eq!(
-            default_bulk_output_path(&nested.to_string_lossy()),
-            expected
-        );
-    }
-
-    #[test]
-    fn no_baseline_note_reflects_record_flag() {
-        assert!(no_baseline_note("a.com", true).contains("recorded a baseline"));
-        assert!(no_baseline_note("a.com", false).contains("--record"));
-    }
-
-    #[tokio::test]
-    async fn watch_edit_rejects_bad_actions_and_missing_domains_before_io() {
-        let err = watch_edit("bogus", Some("a.com"), "watch")
-            .await
-            .unwrap_err();
-        assert!(err.starts_with("Unknown watch action: bogus"), "got: {err}");
-        let err = watch_edit("add", None, "seer watch").await.unwrap_err();
-        assert_eq!(err, "Usage: seer watch add <domain>");
-        let err = watch_edit("remove", None, "watch").await.unwrap_err();
-        assert_eq!(err, "Usage: watch remove <domain>");
-    }
-
-    #[test]
-    fn watchlist_listing_names_the_surface_command_when_empty() {
-        let mut watchlist = seer_core::Watchlist::default();
-        assert_eq!(
-            watchlist_listing(&watchlist, "seer watch"),
-            "Watchlist is empty. Use 'seer watch add <domain>' to add domains."
-        );
-        watchlist.domains = vec!["a.com".into(), "b.com".into()];
-        assert_eq!(
-            watchlist_listing(&watchlist, "watch"),
-            "Watchlist (2 domains):\n  - a.com\n  - b.com"
-        );
-    }
-
-    #[test]
-    fn history_listing_covers_empty_summary_and_per_domain_views() {
-        let mut history = seer_core::LookupHistory::default();
-        assert_eq!(
-            history_listing(&history, None, "lookup"),
-            "No lookup history. Run 'lookup <domain>' to build history."
-        );
-        assert_eq!(
-            history_listing(&history, Some("a.com"), "lookup"),
-            "No history for a.com"
-        );
-
-        let available = seer_core::LookupResult::Available {
+    fn available(domain: &str) -> seer_core::LookupResult {
+        seer_core::LookupResult::Available {
             data: Box::new(seer_core::AvailabilityResult {
-                domain: "a.com".into(),
+                domain: domain.into(),
                 available: true,
                 confidence: "high".into(),
                 method: "rdap".into(),
@@ -711,18 +575,60 @@ mod tests {
             rdap_error: "404".into(),
             whois_error: "no match".into(),
             whois_data: None,
+        }
+    }
+
+    /// `drift --record` swallowed a failed history save and still reported
+    /// "recorded a baseline"; the error must now fail the check.
+    #[tokio::test]
+    async fn drift_record_propagates_a_failed_save() {
+        let failing = |_: String, _: seer_core::LookupResult| async {
+            Err(seer_core::SeerError::ConfigError("disk full".into()))
         };
-        history.record("a.com", available);
-        assert_eq!(
-            history_listing(&history, None, "seer lookup"),
-            "Lookup history (1 entries across 1 domains):\n  a.com (1 entries)"
-        );
-        let listing = history_listing(&history, Some("a.com"), "lookup");
-        assert!(listing.contains("(1 entries):"), "got: {listing}");
-        assert!(
-            listing.ends_with("via availability - registrar: —"),
-            "got: {listing}"
-        );
+        let err = finish_drift("a.com", None, available("a.com"), true, failing)
+            .await
+            .err()
+            .expect("a failed save fails the check");
+        assert!(err.to_string().contains("disk full"), "{err}");
+
+        // Without --record nothing is saved, so nothing can fail.
+        let outcome = finish_drift("a.com", None, available("a.com"), false, failing)
+            .await
+            .expect("no save attempted");
+        assert!(!outcome.had_previous);
+
+        let saved = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = saved.clone();
+        let recording = move |domain: String, _: seer_core::LookupResult| async move {
+            assert_eq!(domain, "a.com");
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        };
+        finish_drift("a.com", None, available("a.com"), true, recording)
+            .await
+            .expect("saved");
+        assert!(saved.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn no_baseline_note_reflects_record_flag() {
+        assert!(no_baseline_note("a.com", true).contains("recorded a baseline"));
+        assert!(no_baseline_note("a.com", false).contains("--record"));
+    }
+
+    /// `seer --format json follow … | jq` broke on the prose banner and the
+    /// "interrupted" note written to stdout.
+    #[test]
+    fn follow_prose_leaves_stdout_for_machine_formats() {
+        use seer_core::output::OutputFormat;
+        assert!(!follow_notes_to_stderr(OutputFormat::Human));
+        for format in [
+            OutputFormat::Json,
+            OutputFormat::Yaml,
+            OutputFormat::Markdown,
+        ] {
+            assert!(follow_notes_to_stderr(format), "{format:?}");
+        }
     }
 
     #[test]

@@ -5,11 +5,14 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders};
 use ratatui::Frame;
+use seer_core::output::sanitize_line;
 
 use crate::tui::theme::Theme;
 
 /// Build a titled, accent-bordered Block. `focused` brightens the border.
-fn block<'a>(theme: &Theme, title: &'a str, accent: Color, focused: bool) -> Block<'a> {
+/// Titles often name remote data (a WHOIS server, a subdomain source), so
+/// they are sanitized here.
+fn block<'a>(theme: &Theme, title: &str, accent: Color, focused: bool) -> Block<'a> {
     let border_color = if focused { accent } else { theme.surface1 };
     Block::default()
         .borders(Borders::ALL)
@@ -17,7 +20,7 @@ fn block<'a>(theme: &Theme, title: &'a str, accent: Color, focused: bool) -> Blo
         .border_style(Style::default().fg(border_color))
         .title(Line::from(vec![
             Span::styled("┤ ", Style::default().fg(theme.surface2)),
-            Span::styled(title, Style::default().fg(accent)),
+            Span::styled(sanitize_line(title), Style::default().fg(accent)),
             Span::styled(" ├", Style::default().fg(theme.surface2)),
         ]))
 }

@@ -17,6 +17,9 @@
 //! visibility but do NOT count as a material change — only additions drive
 //! [`SubdomainBaselineDiff::has_new_names`], which callers (CLI/cron) use for
 //! a non-zero exit code, mirroring [`crate::drift::DriftReport::has_drift`].
+//! The same truncation cuts the other way when it is the *baseline* that was
+//! incomplete, so a baseline records whether it only ever saw truncated runs,
+//! and additions against such a baseline are listed but not material.
 //!
 //! Persistence mirrors [`crate::history`]: owner-only permissions on Unix,
 //! atomic write-and-rename saves, corrupt files backed up to `.corrupt`
@@ -27,6 +30,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+
+use super::SubdomainResult;
 
 /// Maximum number of distinct domains retained. When exceeded, the domain
 /// with the oldest baseline is evicted (same bounded-growth rationale as
@@ -46,6 +51,12 @@ pub struct SubdomainBaseline {
     /// The recorded subdomain names (sorted, deduplicated).
     #[serde(default)]
     pub names: BTreeSet<String>,
+    /// True when every run merged into this baseline was truncated (see
+    /// [`SubdomainResult::truncated`]): the set is known to be incomplete,
+    /// so names a later complete run finds are not evidence of anything new.
+    /// Files written before this field existed load as complete.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
 }
 
 /// On-disk store of subdomain baselines, keyed by (lowercased) domain.
@@ -78,14 +89,23 @@ pub struct SubdomainBaselineDiff {
     /// `added`/`removed` lists are empty in that case so callers keying the
     /// exit code off [`Self::has_new_names`] exit 0 on a first run.
     pub baseline_missing: bool,
+    /// True when the baseline was recorded only from truncated enumerations.
+    /// `added` is still listed, but those names may simply be ones the
+    /// truncated run never saw, so they are not material until a complete
+    /// run has been recorded.
+    #[serde(default)]
+    pub baseline_truncated: bool,
 }
 
 impl SubdomainBaselineDiff {
-    /// True when at least one new name appeared since the baseline. Callers
-    /// (CLI/cron) use this to drive a non-zero exit code. Removals never make
-    /// this true — see the module docs.
+    /// True when at least one new name appeared since a complete baseline.
+    /// Callers (CLI/cron) use this to drive a non-zero exit code. Removals
+    /// never make this true — see the module docs — and neither do names
+    /// "added" relative to a truncated baseline (a certspotter fallback that
+    /// hit its page cap), which the next complete run would otherwise report
+    /// wholesale as new.
     pub fn has_new_names(&self) -> bool {
-        !self.added.is_empty()
+        !self.added.is_empty() && !self.baseline_truncated
     }
 
     /// Diffs a fresh enumeration against an optional stored baseline.
@@ -101,6 +121,7 @@ impl SubdomainBaselineDiff {
                 removed: Vec::new(),
                 unchanged_count: 0,
                 baseline_missing: true,
+                baseline_truncated: false,
             };
         };
 
@@ -117,6 +138,7 @@ impl SubdomainBaselineDiff {
             removed,
             unchanged_count,
             baseline_missing: false,
+            baseline_truncated: baseline.truncated,
         }
     }
 }
@@ -136,30 +158,30 @@ crate::fsutil::persisted_store!(
 );
 
 impl SubdomainBaselines {
-    /// Records `names` into the baseline for `domain`, merging them with any
-    /// previously recorded names. Evicts the oldest-recorded domain when the
-    /// store exceeds 1000 domains.
+    /// Records an enumeration into the baseline for its domain, merging its
+    /// names with any previously recorded ones. Evicts the oldest-recorded
+    /// domain when the store exceeds 1000 domains.
     ///
     /// Merging rather than replacing follows from the module's premise: a
     /// name missing from a run is almost always aggregator truncation, not a
     /// real removal. Replacing would let one flaky run (crt.sh throttled, a
     /// capped certspotter fallback) shrink the baseline, and every
     /// long-standing name it dropped would then resurface as "new" — a false
-    /// alert — on the next healthy run.
-    pub fn record(&mut self, domain: &str, names: &[String], source: &str) {
-        let key = domain.to_lowercase();
-        let mut merged: BTreeSet<String> = self
-            .domains
-            .remove(&key)
-            .map(|previous| previous.names)
-            .unwrap_or_default();
-        merged.extend(names.iter().map(|n| normalize_name(n)));
+    /// alert — on the next healthy run. The merged baseline is truncated only
+    /// while every run merged into it was: one complete run completes it.
+    pub fn record(&mut self, result: &SubdomainResult) {
+        let key = result.domain.to_lowercase();
+        let previous = self.domains.remove(&key);
+        let truncated = result.truncated && previous.as_ref().is_none_or(|p| p.truncated);
+        let mut merged: BTreeSet<String> = previous.map(|p| p.names).unwrap_or_default();
+        merged.extend(result.subdomains.iter().map(|n| normalize_name(n)));
         self.domains.insert(
             key,
             SubdomainBaseline {
                 recorded_at: Utc::now(),
-                source: source.to_string(),
+                source: result.source.clone(),
                 names: merged,
+                truncated,
             },
         );
         while self.domains.len() > MAX_DOMAINS {
@@ -196,10 +218,80 @@ mod tests {
         items.iter().map(|s| s.to_string()).collect()
     }
 
+    fn run(domain: &str, names: &[String], source: &str, truncated: bool) -> SubdomainResult {
+        SubdomainResult {
+            domain: domain.to_string(),
+            subdomains: names.to_vec(),
+            source: source.to_string(),
+            count: names.len(),
+            truncated,
+        }
+    }
+
+    /// Records a complete run.
+    fn record(store: &mut SubdomainBaselines, domain: &str, names: &[String], source: &str) {
+        store.record(&run(domain, names, source, false));
+    }
+
+    /// Regression: a first baseline recorded from a truncated certspotter
+    /// fallback made the next full crt.sh run report every name it had
+    /// missed as "added" (exit 1).
+    #[test]
+    fn names_added_to_a_truncated_baseline_are_not_material() {
+        let mut store = SubdomainBaselines::default();
+        store.record(&run(
+            "example.com",
+            &names(&["a.example.com"]),
+            "certspotter",
+            true,
+        ));
+        assert!(store.get("example.com").expect("baseline").truncated);
+
+        let full = names(&["a.example.com", "b.example.com", "c.example.com"]);
+        let report = store.diff("example.com", &full);
+        assert_eq!(report.added, vec!["b.example.com", "c.example.com"]);
+        assert!(report.baseline_truncated);
+        assert!(!report.has_new_names(), "{report:?}");
+
+        // Recording a complete run completes the baseline: real alerts resume.
+        record(&mut store, "example.com", &full, "crt.sh");
+        assert!(!store.get("example.com").expect("baseline").truncated);
+        let report = store.diff(
+            "example.com",
+            &names(&[
+                "a.example.com",
+                "b.example.com",
+                "c.example.com",
+                "d.example.com",
+            ]),
+        );
+        assert!(!report.baseline_truncated);
+        assert!(report.has_new_names());
+
+        // A truncated run merged into a complete baseline keeps it complete.
+        store.record(&run(
+            "example.com",
+            &names(&["a.example.com"]),
+            "certspotter",
+            true,
+        ));
+        assert!(!store.get("example.com").expect("baseline").truncated);
+    }
+
+    #[test]
+    fn baselines_without_the_truncated_field_load_as_complete() {
+        let json = r#"{"domains":{"example.com":{"recorded_at":"2026-06-01T00:00:00Z","source":"crt.sh","names":["a.example.com"]}}}"#;
+        let store: SubdomainBaselines = serde_json::from_str(json).expect("parses");
+        assert!(!store.get("example.com").expect("baseline").truncated);
+        let report = store.diff("example.com", &names(&["a.example.com", "b.example.com"]));
+        assert!(report.has_new_names());
+    }
+
     #[test]
     fn diff_reports_added_removed_and_unchanged() {
         let mut store = SubdomainBaselines::default();
-        store.record(
+        record(
+            &mut store,
             "example.com",
             &names(&["api.example.com", "mail.example.com", "old.example.com"]),
             "crt.sh",
@@ -222,7 +314,8 @@ mod tests {
         // CT logs are append-mostly; a shrinking result set usually means
         // source flakiness, so removals must not drive the exit code.
         let mut store = SubdomainBaselines::default();
-        store.record(
+        record(
+            &mut store,
             "example.com",
             &names(&["a.example.com", "b.example.com"]),
             "crt.sh",
@@ -235,7 +328,12 @@ mod tests {
     #[test]
     fn identical_sets_show_no_changes() {
         let mut store = SubdomainBaselines::default();
-        store.record("example.com", &names(&["a.example.com"]), "crt.sh");
+        record(
+            &mut store,
+            "example.com",
+            &names(&["a.example.com"]),
+            "crt.sh",
+        );
         let report = store.diff("example.com", &names(&["a.example.com"]));
         assert!(report.added.is_empty());
         assert!(report.removed.is_empty());
@@ -259,7 +357,8 @@ mod tests {
     #[test]
     fn empty_fresh_set_reports_all_baseline_names_removed() {
         let mut store = SubdomainBaselines::default();
-        store.record(
+        record(
+            &mut store,
             "example.com",
             &names(&["a.example.com", "b.example.com"]),
             "crt.sh",
@@ -274,7 +373,12 @@ mod tests {
     #[test]
     fn case_and_whitespace_churn_is_not_a_change() {
         let mut store = SubdomainBaselines::default();
-        store.record("Example.COM", &names(&["API.example.com "]), "crt.sh");
+        record(
+            &mut store,
+            "Example.COM",
+            &names(&["API.example.com "]),
+            "crt.sh",
+        );
         let report = store.diff("example.com", &names(&["api.example.com"]));
         assert!(report.added.is_empty(), "case churn: {:?}", report.added);
         assert!(report.removed.is_empty());
@@ -284,13 +388,19 @@ mod tests {
     #[test]
     fn record_merges_into_previous_baseline() {
         let mut store = SubdomainBaselines::default();
-        store.record(
+        record(
+            &mut store,
             "example.com",
             &names(&["a.example.com", "b.example.com"]),
             "crt.sh",
         );
         // A truncated fallback run must not shrink the baseline...
-        store.record("example.com", &names(&["b.example.com"]), "certspotter");
+        record(
+            &mut store,
+            "example.com",
+            &names(&["b.example.com"]),
+            "certspotter",
+        );
         let baseline = store.get("example.com").expect("baseline");
         assert_eq!(baseline.source, "certspotter");
         assert!(baseline.names.contains("a.example.com"));
@@ -304,7 +414,12 @@ mod tests {
     fn domain_cap_evicts_oldest_baseline() {
         let mut store = SubdomainBaselines::default();
         for i in 0..(MAX_DOMAINS + 5) {
-            store.record(&format!("d{i}.example"), &names(&["x.d.example"]), "t");
+            record(
+                &mut store,
+                &format!("d{i}.example"),
+                &names(&["x.d.example"]),
+                "t",
+            );
             // Backdate earlier entries so eviction order is deterministic.
             if let Some(b) = store.domains.get_mut(&format!("d{i}.example")) {
                 b.recorded_at = Utc::now() + chrono::Duration::seconds(i as i64);
@@ -341,14 +456,15 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         let mut store = SubdomainBaselines::default();
-        store.record(
+        record(
+            &mut store,
             "example.com",
             &names(&["api.example.com", "mail.example.com"]),
             "crt.sh",
         );
         store.save_to_path(&path).expect("save");
 
-        let loaded = SubdomainBaselines::load_from_path(&path);
+        let loaded = SubdomainBaselines::load_from_path(&path).expect("load");
         let baseline = loaded.get("example.com").expect("baseline survives");
         assert_eq!(baseline.source, "crt.sh");
         assert_eq!(baseline.names.len(), 2);
@@ -367,7 +483,12 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         let mut store = SubdomainBaselines::default();
-        store.record("example.com", &names(&["a.example.com"]), "crt.sh");
+        record(
+            &mut store,
+            "example.com",
+            &names(&["a.example.com"]),
+            "crt.sh",
+        );
         store.save_to_path(&path).expect("save");
 
         let mode = std::fs::metadata(&path).expect("metadata").permissions();
@@ -391,7 +512,7 @@ mod tests {
 
         std::fs::write(&path, b"{ not valid json ").expect("seed file");
 
-        let loaded = SubdomainBaselines::load_from_path(&path);
+        let loaded = SubdomainBaselines::load_from_path(&path).expect("load");
         assert!(
             loaded.domains.is_empty(),
             "corrupt load must return default"
@@ -413,7 +534,7 @@ mod tests {
     fn load_from_path_returns_default_when_missing() {
         let path = unique_temp_path("missing");
         let _ = std::fs::remove_file(&path);
-        let loaded = SubdomainBaselines::load_from_path(&path);
+        let loaded = SubdomainBaselines::load_from_path(&path).expect("load");
         assert!(loaded.domains.is_empty());
         if let Some(parent) = path.parent() {
             let _ = std::fs::remove_dir_all(parent);

@@ -305,6 +305,35 @@ snapshot_tests! {
     // while the human formatter warned; the hostname check must be visible.
     markdown_status_hostname_mismatch_snapshot =>
         markdown.format_status(fixture_status_hostname_mismatch());
+    // One expiry wording in both formats: "expired N days ago" (never a
+    // negative count) and a red "expires in N days" inside 30 days.
+    human_status_expired_snapshot => human.format_status(fixture_status_expired());
+    markdown_status_expired_snapshot => markdown.format_status(fixture_status_expired());
+    human_status_expiring_soon_snapshot => human.format_status(fixture_status_expiring_soon());
+    markdown_status_expiring_soon_snapshot =>
+        markdown.format_status(fixture_status_expiring_soon());
+}
+
+/// A certificate that expired days ago on a registration expiring within 30
+/// days: both urgent bands of the expiry wording.
+fn fixture_status_expiring_soon() -> StatusResponse {
+    StatusResponse {
+        certificate: Some(CertificateInfo {
+            issuer: "CN=Mock CA".into(),
+            subject: "CN=example.com".into(),
+            valid_from: "2025-01-01T00:00:00Z".parse().unwrap(),
+            valid_until: "2026-01-01T00:00:00Z".parse().unwrap(),
+            days_until_expiry: -3,
+            is_valid: false,
+            hostname_verified: true,
+        }),
+        domain_expiration: Some(DomainExpiration {
+            expiration_date: "2026-10-10T00:00:00Z".parse().unwrap(),
+            days_until_expiry: 12,
+            registrar: None,
+        }),
+        ..fixture_status()
+    }
 }
 
 /// A subdomain baseline diff with additions, removals, and unchanged names.
@@ -317,6 +346,7 @@ fn fixture_subdomain_baseline_diff() -> seer_core::subdomains::SubdomainBaseline
         removed: vec!["old.example.com".into()],
         unchanged_count: 12,
         baseline_missing: false,
+        baseline_truncated: false,
     }
 }
 
@@ -329,6 +359,7 @@ fn fixture_subdomain_baseline_diff_missing() -> seer_core::subdomains::Subdomain
         removed: Vec::new(),
         unchanged_count: 0,
         baseline_missing: true,
+        baseline_truncated: false,
     }
 }
 
@@ -847,6 +878,16 @@ fn fixture_subdomains() -> SubdomainResult {
         subdomains: vec!["api.example.com".into(), "www.example.com".into()],
         source: "crt.sh".into(),
         count: 2,
+        truncated: false,
+    }
+}
+
+/// A certspotter run that hit its page cap.
+fn fixture_subdomains_truncated() -> SubdomainResult {
+    SubdomainResult {
+        source: "certspotter".into(),
+        truncated: true,
+        ..fixture_subdomains()
     }
 }
 
@@ -911,11 +952,22 @@ fn fixture_dns_comparison() -> DnsComparison {
         record_type: RecordType::A,
         server_a: ServerResult {
             nameserver: "8.8.8.8".into(),
-            records: vec![a_record("example.com", "192.0.2.1")],
+            status: Some(DnsStatus::NoError),
+            cname_chain: vec![DnsRecord {
+                name: "example.com".into(),
+                record_type: RecordType::CNAME,
+                ttl: 300,
+                data: RecordData::CNAME {
+                    target: "edge.cdn.test.".into(),
+                },
+            }],
+            records: vec![a_record("edge.cdn.test", "192.0.2.1")],
             error: None,
         },
         server_b: ServerResult {
             nameserver: "1.1.1.1".into(),
+            status: None,
+            cname_chain: Vec::new(),
             records: Vec::new(),
             error: Some("query timed out".into()),
         },
@@ -1002,6 +1054,8 @@ snapshot_tests! {
     markdown_tld_sparse_snapshot => markdown.format_tld(fixture_tld_sparse());
     human_subdomains_snapshot => human.format_subdomains(fixture_subdomains());
     markdown_subdomains_snapshot => markdown.format_subdomains(fixture_subdomains());
+    human_subdomains_truncated_snapshot => human.format_subdomains(fixture_subdomains_truncated());
+    markdown_subdomains_truncated_snapshot => markdown.format_subdomains(fixture_subdomains_truncated());
     human_watch_snapshot => human.format_watch(fixture_watch());
     markdown_watch_snapshot => markdown.format_watch(fixture_watch());
     human_dnssec_snapshot => human.format_dnssec(fixture_dnssec());
@@ -1059,6 +1113,7 @@ fn dig_result(name: &str, record_type: RecordType, status: DnsStatus) -> DnsQuer
         status,
         flags: dig_flags(),
         answers: Vec::new(),
+        failed_types: Vec::new(),
         authority: Vec::new(),
         wildcard: None,
         query_time_ms: 12,
@@ -1093,6 +1148,7 @@ fn fixture_dig_cname_chain() -> DnsQueryResult {
 /// The name does not exist; the zone's SOA came back in AUTHORITY.
 fn fixture_dig_nxdomain() -> DnsQueryResult {
     DnsQueryResult {
+        failed_types: Vec::new(),
         authority: vec![soa_record("seer.test")],
         query_time_ms: 31,
         ..dig_result("gone.seer.test", RecordType::A, DnsStatus::NxDomain)
@@ -1102,6 +1158,7 @@ fn fixture_dig_nxdomain() -> DnsQueryResult {
 /// The name exists but has no AAAA records (NOERROR, empty answer).
 fn fixture_dig_nodata() -> DnsQueryResult {
     DnsQueryResult {
+        failed_types: Vec::new(),
         authority: vec![soa_record("seer.test")],
         ..dig_result("www.seer.test", RecordType::AAAA, DnsStatus::NoError)
     }
@@ -1116,6 +1173,7 @@ fn fixture_dig_dangling_cname() -> DnsQueryResult {
             cname_record("www.seer.test", 3600, "shop.seer.test."),
             cname_record("shop.seer.test", 300, "gone.cdn.test."),
         ],
+        failed_types: Vec::new(),
         authority: vec![soa_record("cdn.test")],
         query_time_ms: 27,
         ..dig_result("www.seer.test", RecordType::A, DnsStatus::NxDomain)
@@ -1126,6 +1184,7 @@ fn fixture_dig_dangling_cname() -> DnsQueryResult {
 fn fixture_dig_nodata_behind_cname() -> DnsQueryResult {
     DnsQueryResult {
         answers: vec![cname_record("www.seer.test", 300, "edge.cdn.test.")],
+        failed_types: Vec::new(),
         authority: vec![soa_record("cdn.test")],
         ..dig_result("www.seer.test", RecordType::AAAA, DnsStatus::NoError)
     }
@@ -1170,6 +1229,7 @@ fn fixture_dig_referral() -> DnsQueryResult {
     DnsQueryResult {
         server: Some("ns1.seer.test".into()),
         flags: vec!["qr".into(), "rd".into()],
+        failed_types: Vec::new(),
         authority: vec![ns("ns1.child.seer.test."), ns("ns2.child.seer.test.")],
         query_time_ms: 14,
         ..dig_result("www.child.seer.test", RecordType::A, DnsStatus::NoError)
@@ -1479,6 +1539,7 @@ fn fixture_takeover() -> TakeoverReport {
         hosts_skipped: 3,
         vulnerable: 1,
         potential: 1,
+        inconclusive: 0,
         findings: vec![
             TakeoverFinding {
                 host: "docs.example.com".into(),
@@ -1543,7 +1604,7 @@ fn fixture_domain_diff() -> DomainDiff {
                 vec!["ns1.example.com".into(), "ns2.example.com".into()],
                 vec!["ns2.example.com".into(), "ns1.example.com".into()],
             ),
-            resolves: (true, true),
+            resolves: (Some(true), Some(true)),
         },
         ssl: SslDiff {
             issuer: (Some("Mock CA".into()), Some("Mock CA".into())),
@@ -1551,6 +1612,7 @@ fn fixture_domain_diff() -> DomainDiff {
             days_remaining: (Some(26_000), None),
             is_valid: (Some(true), None),
         },
+        errors: Vec::new(),
     }
 }
 

@@ -81,8 +81,8 @@ impl StatusClient {
     pub async fn check(&self, domain: &str) -> Result<StatusResponse> {
         // Normalize domain format (doesn't require DNS resolution). The exact
         // host is kept — `www.example.com` can serve a different site and
-        // certificate than the apex; the expiration lookup reduces it to the
-        // registration on its own.
+        // certificate than the apex; the expiration lookup reduces it to its
+        // registrable domain (see `registration_name`).
         let domain = normalize_host(domain)?;
         debug!("Checking status for domain: {}", domain);
 
@@ -97,7 +97,7 @@ impl StatusClient {
             self.fetch_certificate_info(&domain),
             self.fetch_domain_expiration(&domain),
             self.fetch_dns_resolution(&domain),
-            caa::lookup_caa(&self.dns_resolver, &domain),
+            caa::lookup_caa(&self.dns_resolver, &domain, None),
         );
 
         // Apply HTTP info
@@ -107,25 +107,23 @@ impl StatusClient {
                 response.http_status_text = Some(status_text);
                 response.title = title;
             }
-            Err(e) => response.errors.push(super::types::StatusError {
-                check: "http".to_string(),
-                message: e.to_string(),
-            }),
+            Err(e) => response.errors.push(sub_check_error("http", &e)),
         }
 
         // Apply certificate info and tag the CAA policy with the issuer
         // comparison if a cert was retrieved.
-        let mut caa_policy: CaaPolicy = caa_policy;
+        // `domain` is already normalized, so `lookup_caa` cannot fail here.
+        let mut caa_policy: CaaPolicy = caa_policy.unwrap_or_else(|_| CaaPolicy::empty());
         match cert_result {
-            Ok(cert_info) => {
-                caa_policy.issuer_match =
-                    Some(caa::classify_issuer(&cert_info.issuer, &caa_policy));
+            Ok((cert_info, wildcard)) => {
+                caa_policy.issuer_match = Some(caa::classify_issuer(
+                    &cert_info.issuer,
+                    &caa_policy,
+                    wildcard,
+                ));
                 response.certificate = Some(cert_info);
             }
-            Err(e) => response.errors.push(super::types::StatusError {
-                check: "ssl".to_string(),
-                message: e.to_string(),
-            }),
+            Err(e) => response.errors.push(sub_check_error("ssl", &e)),
         }
         response.caa = Some(caa_policy);
 
@@ -160,13 +158,14 @@ impl StatusClient {
     }
 
     /// Fetches the leaf certificate's details via the inspection handshake
-    /// ([`crate::tls::inspect`]).
+    /// ([`crate::tls::inspect`]), and whether it names a wildcard (for the
+    /// CAA comparison).
     ///
     /// # Security Note
     /// The handshake accepts any presented chain so invalid certificates can
     /// be inspected. Chain trust is not verified, so the data retrieved
     /// (issuer, subject, dates) may come from a MITM's own certificate.
-    async fn fetch_certificate_info(&self, domain: &str) -> Result<CertificateInfo> {
+    async fn fetch_certificate_info(&self, domain: &str) -> Result<(CertificateInfo, bool)> {
         // SSRF protection: resolve and reject reserved IPs before connecting.
         // Use crate::net::resolve_public_host so we get the Hickory fallback
         // when the OS resolver is broken (corporate Macs, Tailscale split-DNS,
@@ -186,10 +185,15 @@ impl StatusClient {
         parse_certificate_der(&presented.leaf, domain)
     }
 
-    /// Fetches domain expiration info using WHOIS/RDAP; `None` when the lookup
-    /// fails (which must not fail the whole status check) or has no date.
+    /// Fetches the registration's expiration via WHOIS/RDAP; `None` when the
+    /// host has no registrable domain, or the lookup fails (which must not
+    /// fail the whole status check) or has no date.
     async fn fetch_domain_expiration(&self, domain: &str) -> Option<DomainExpiration> {
-        let result = self.smart_lookup.lookup(domain).await.ok()?;
+        let result = self
+            .smart_lookup
+            .lookup(registration_name(domain)?)
+            .await
+            .ok()?;
         let (expiration_date, registrar) = result.expiration_info();
         let expiration_date = expiration_date?;
         Some(DomainExpiration {
@@ -260,11 +264,34 @@ impl StatusClient {
     }
 }
 
+/// A failed sub-check as the response reports it: the sanitized message
+/// (the response reaches REST/MCP/Python consumers), with the full error
+/// logged instead.
+fn sub_check_error(check: &str, e: &SeerError) -> super::types::StatusError {
+    debug!(check, error = %e, "status sub-check failed");
+    super::types::StatusError {
+        check: check.to_string(),
+        message: e.sanitized_message(),
+    }
+}
+
+/// The name whose registration expiry a status check reports: the
+/// registrable domain of `host` (`google.com` for `mail.google.com`) — a
+/// registry holds no object for a host below it. `None` for an IP literal
+/// or a bare public suffix.
+fn registration_name(host: &str) -> Option<&str> {
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return None;
+    }
+    crate::psl::registrable_domain(host)
+}
+
 /// GETs `url` and returns `(status code, reason phrase, page title)`.
 ///
 /// The body is read only for a 2xx `text/html` response, where it feeds the
 /// title; any other final response reports its status straight from the
-/// headers, so a body that stalls or errors cannot fail the sub-check.
+/// headers. A body that stalls or errors only costs the title, so it cannot
+/// fail the sub-check.
 async fn http_info(fetcher: &GuardedFetcher, url: &str) -> Result<(u16, String, Option<String>)> {
     let (response, _) = fetcher.send(url).await?;
     let status = response.status();
@@ -274,7 +301,13 @@ async fn http_info(fetcher: &GuardedFetcher, url: &str) -> Result<(u16, String, 
         .and_then(|v| v.to_str().ok())
         .is_some_and(|ct| ct.contains("text/html"));
     let title = if status.is_success() && is_html {
-        extract_title(&fetcher.read_body(response).await?)
+        match fetcher.read_body(response).await {
+            Ok(body) => extract_title(&body),
+            Err(e) => {
+                debug!(error = %e, "status page body unreadable; reporting no title");
+                None
+            }
+        }
     } else {
         None
     };
@@ -310,8 +343,9 @@ fn extract_title(html: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// Parses certificate information from DER-encoded certificate using x509-parser.
-fn parse_certificate_der(der: &[u8], domain: &str) -> Result<CertificateInfo> {
+/// Parses certificate information from DER-encoded certificate using
+/// x509-parser, plus whether the certificate names a wildcard.
+fn parse_certificate_der(der: &[u8], domain: &str) -> Result<(CertificateInfo, bool)> {
     use x509_parser::prelude::*;
 
     let (_, cert) = X509Certificate::from_der(der)
@@ -341,7 +375,7 @@ fn parse_certificate_der(der: &[u8], domain: &str) -> Result<CertificateInfo> {
     // `ssl.rs`, so `seer status` and `seer ssl` cannot disagree.
     let hostname_verified = crate::tls::cert_matches_host(&cert, domain);
 
-    Ok(CertificateInfo {
+    let info = CertificateInfo {
         issuer,
         subject,
         valid_from,
@@ -349,7 +383,8 @@ fn parse_certificate_der(der: &[u8], domain: &str) -> Result<CertificateInfo> {
         days_until_expiry,
         is_valid,
         hostname_verified,
-    })
+    };
+    Ok((info, crate::tls::cert_names_wildcard(&cert)))
 }
 
 /// Builds a human-readable issuer label, combining Organization and Common
@@ -451,6 +486,7 @@ mod tests {
         let verified = |b64, host| {
             parse_certificate_der(&cert(b64), host)
                 .unwrap()
+                .0
                 .hostname_verified
         };
         assert!(!verified(CN_VICTIM_SAN_OTHER, "victim.example"));
@@ -499,5 +535,58 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(info, (404, "Not Found".to_string(), None));
+    }
+
+    /// Regression: a 2xx HTML page whose body stalled failed the whole
+    /// "http" sub-check instead of just losing its title.
+    #[tokio::test]
+    async fn an_unreadable_body_costs_only_the_title() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut tcp, _) = listener.accept().await.unwrap();
+            let _ = tcp.read(&mut [0u8; 1024]).await;
+            let _ = tcp
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/html\r\ncontent-length: 100\r\n\r\n<title>",
+                )
+                .await;
+            std::future::pending::<()>().await;
+        });
+
+        let fetcher = GuardedFetcher::new()
+            .allowing_private_hosts()
+            .with_timeout(Duration::from_millis(300));
+        let info = http_info(&fetcher, &format!("http://{addr}/"))
+            .await
+            .unwrap();
+        assert_eq!(info, (200, "OK".to_string(), None));
+    }
+
+    /// Regression: expiry was looked up for the full host, which no registry
+    /// holds (`mail.google.com`), so it was always missing.
+    #[test]
+    fn expiry_is_looked_up_for_the_registrable_domain() {
+        assert_eq!(registration_name("mail.google.com"), Some("google.com"));
+        assert_eq!(
+            registration_name("www.example.co.uk"),
+            Some("example.co.uk")
+        );
+        assert_eq!(registration_name("example.com"), Some("example.com"));
+        assert_eq!(registration_name("co.uk"), None);
+        assert_eq!(registration_name("192.0.2.1"), None);
+    }
+
+    /// Sub-check errors reach REST/MCP/Python, so they carry the sanitized
+    /// message, never the upstream detail.
+    #[test]
+    fn sub_check_errors_are_sanitized() {
+        let e = SeerError::CertificateError("failed to connect to internal.corp: refused".into());
+        let err = sub_check_error("ssl", &e);
+        assert_eq!(err.check, "ssl");
+        assert_eq!(err.message, e.sanitized_message());
+        assert!(!err.message.contains("internal.corp"));
     }
 }

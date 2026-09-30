@@ -20,6 +20,10 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 DEFAULT_MAX_BODY_BYTES = 64 * 1024
 
 
+class _BodyTooLarge(Exception):
+    """Raised from the wrapped ``receive`` once the body passes the cap."""
+
+
 class MaxBodySizeMiddleware:
     """Reject any request whose body exceeds ``max_bytes`` with 413.
 
@@ -29,8 +33,8 @@ class MaxBodySizeMiddleware:
        before reading the body at all. Fast-path for clients that
        advertise their size honestly.
     2. Streaming byte-count — chunked requests and clients that lie
-       about Content-Length are handled by wrapping ``receive`` and
-       truncating the body after ``max_bytes``.
+       about Content-Length are handled by wrapping ``receive``: the read
+       that crosses ``max_bytes`` fails, so the handler never runs.
 
     Implemented as a bare ASGI middleware (not
     ``BaseHTTPMiddleware``) because we need to short-circuit the
@@ -58,8 +62,9 @@ class MaxBodySizeMiddleware:
                 # Malformed Content-Length — let Starlette reject it.
                 pass
 
-        # Streaming path: count bytes as we read. If we blow past the
-        # cap mid-stream, reply 413 immediately and stop forwarding.
+        # Streaming path: count bytes as we read. Past the cap, the read
+        # fails with `_BodyTooLarge` — the app never sees a (truncated) body,
+        # so no handler runs on one — and the response is a 413.
         total = 0
         over_limit = False
 
@@ -67,37 +72,32 @@ class MaxBodySizeMiddleware:
             nonlocal total, over_limit
             message = await receive()
             if message.get("type") == "http.request":
-                body = message.get("body") or b""
-                total += len(body)
+                total += len(message.get("body") or b"")
                 if total > self.max_bytes:
                     over_limit = True
-                    # Drain the rest so we don't leave bytes in the queue.
-                    return {
-                        "type": "http.request",
-                        "body": b"",
-                        "more_body": False,
-                    }
+                    raise _BodyTooLarge
             return message
 
         sent_response = False
 
         async def send_wrapper(message: dict) -> None:
+            # FastAPI turns a failed body read into its own 400 response
+            # before any endpoint runs; replace whatever the app answers
+            # after an overflow with the 413.
             nonlocal sent_response
-            if over_limit and not sent_response:
+            if sent_response:
+                return
+            if over_limit:
                 sent_response = True
                 await self._send_too_large(send)
                 return
-            if sent_response:
-                return
             await send(message)
 
-        # `try/finally` so the 413 always fires when the body went over,
-        # even if the downstream app raises an unhandled exception
-        # (rare — FastAPI's exception handlers convert most failures into
-        # responses that flow through `send_wrapper` — but a bare ASGI
-        # exception would otherwise produce a 500 instead of 413).
         try:
             await self.app(scope, receive_wrapper, send_wrapper)
+        except _BodyTooLarge:
+            # A raw ASGI app (e.g. /mcp) lets the read failure propagate.
+            pass
         finally:
             if over_limit and not sent_response:
                 sent_response = True

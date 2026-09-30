@@ -15,8 +15,10 @@
 //! - [`DnsTracer`]: iterative resolution from the root servers down, one
 //!   [`TraceHop`] per delegation level (`dig +trace`).
 //!
-//! No outer retry loop at this layer: hickory's own retransmission is the
-//! only retry (see `resolver.rs`).
+//! No outer retry loop at this layer: hickory's own re-send of a timed-out
+//! attempt is the only retry (see `resolver.rs`).
+
+use std::time::Duration;
 
 mod compare;
 mod delegation;
@@ -34,7 +36,7 @@ mod transport;
 
 pub use compare::{DnsComparator, DnsComparison, ServerResult};
 pub use delegation::{DelegationChecker, DelegationReport, LameNs};
-pub use dnssec::{AuthenticationTier, DnskeyInfo, DnssecChecker, DnssecReport, DsInfo, RrsigInfo};
+pub use dnssec::{AuthenticationTier, DnskeyInfo, DnssecChecker, DnssecReport, DsInfo};
 pub use follow::{
     DnsFollower, FollowConfig, FollowIteration, FollowProgressCallback, FollowResult,
     MAX_FOLLOW_INTERVAL_SECS, MAX_FOLLOW_ITERATIONS,
@@ -45,10 +47,18 @@ pub use propagation::{
     PropagationChecker, PropagationResult, PropagationServerResult, PropagationVerdict,
     ServerVerdict, UnreachableServer,
 };
-pub use query::{DnsQueryResult, DnsStatus, WildcardProbe};
+pub use query::{DnsQueryResult, DnsStatus, FailedType, WildcardProbe};
+// Crate-internal: the one wildcard-probe label generator, shared with
+// subdomain classification.
+pub(crate) use query::random_probe_label;
 pub use records::{DnsRecord, RecordData, RecordType, SvcParam};
 pub use resolver::{DnsPresence, DnsResolver};
 pub use trace::{DnsTrace, DnsTracer, TraceHop};
 // Crate-internal: shared with `net.rs` so the SSRF fallback resolver and the
 // main resolver cannot drift apart on option settings.
 pub(crate) use resolver::apply_standard_opts;
+
+/// The per-query DNS timeout when no config supplies one — the config
+/// file's `timeouts.dns_secs` default. One definition for every DNS client's
+/// `new()`.
+pub(crate) const DEFAULT_DNS_TIMEOUT: Duration = Duration::from_secs(5);

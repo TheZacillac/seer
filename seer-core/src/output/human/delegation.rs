@@ -1,6 +1,6 @@
 //! Human (colored) renderer for the NS delegation health report.
 
-use super::sanitize_display;
+use super::sanitize_line;
 use super::HumanFormatter;
 use crate::dns::DelegationReport;
 
@@ -10,14 +10,14 @@ impl HumanFormatter {
 
         out.push(format!(
             "Delegation Report for {}",
-            self.success(&sanitize_display(&report.domain))
+            self.success(&sanitize_line(&report.domain))
         ));
         out.push(String::new());
 
         let servers = if report.parent_server_queried.is_empty() {
             self.warning("(none)")
         } else {
-            self.value(&sanitize_display(&report.parent_server_queried.join(", ")))
+            self.value(&sanitize_line(&report.parent_server_queried.join(", ")))
         };
         let verdict = if report.in_sync {
             self.success("in sync")
@@ -45,11 +45,7 @@ impl HumanFormatter {
             } else {
                 self.success("\u{2713}")
             };
-            out.push(format!(
-                "    {} {}",
-                mark,
-                self.value(&sanitize_display(ns))
-            ));
+            out.push(format!("    {} {}", mark, self.value(&sanitize_line(ns))));
         }
 
         out.push(format!("  {}:", self.label("Zone NS (authoritative view)")));
@@ -65,11 +61,7 @@ impl HumanFormatter {
             } else {
                 self.success("\u{2713}")
             };
-            out.push(format!(
-                "    {} {}",
-                mark,
-                self.value(&sanitize_display(ns))
-            ));
+            out.push(format!("    {} {}", mark, self.value(&sanitize_line(ns))));
         }
 
         if !report.missing_from_zone.is_empty() {
@@ -82,7 +74,7 @@ impl HumanFormatter {
                 out.push(format!(
                     "    {} {}",
                     self.error("\u{2717}"),
-                    self.value(&sanitize_display(ns))
+                    self.value(&sanitize_line(ns))
                 ));
             }
         }
@@ -96,7 +88,7 @@ impl HumanFormatter {
                 out.push(format!(
                     "    {} {}",
                     self.error("\u{2717}"),
-                    self.value(&sanitize_display(ns))
+                    self.value(&sanitize_line(ns))
                 ));
             }
         }
@@ -108,8 +100,8 @@ impl HumanFormatter {
                 out.push(format!(
                     "    {} {} — {}",
                     self.error("\u{2717}"),
-                    self.value(&sanitize_display(&lame.host)),
-                    self.error(&sanitize_display(&lame.reason))
+                    self.value(&sanitize_line(&lame.host)),
+                    self.error(&sanitize_line(&lame.reason))
                 ));
             }
         }
@@ -121,7 +113,7 @@ impl HumanFormatter {
                 out.push(format!(
                     "    {} {}",
                     self.warning("\u{2022}"),
-                    sanitize_display(warning)
+                    sanitize_line(warning)
                 ));
             }
         }

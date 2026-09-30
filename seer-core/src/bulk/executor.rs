@@ -73,9 +73,9 @@ pub enum BulkOperation {
     /// own candidate generation, a DNS presence pre-filter over every
     /// candidate, and a full smart lookup per surviving candidate. A batch of
     /// N domains therefore multiplies into N independent candidate scans —
-    /// budget bulk sizes accordingly. Dispatch is throttled only by the
-    /// executor's existing semaphore/rate limiter (deliberately no extra
-    /// per-op limiting).
+    /// budget bulk sizes accordingly. The scans running at once share one
+    /// scan's fan-out (the executor's concurrency divided among them), so the
+    /// total in flight stays bounded instead of multiplying per row.
     Confusables {
         domain: String,
     },
@@ -262,6 +262,9 @@ impl BulkExecutor {
             Some(Arc::new(SlotLimiter::new(self.rate_limit_delay)))
         };
 
+        // Operations that can actually be in flight together.
+        let parallel = self.concurrency.min(total);
+
         let results: Vec<BulkResult> = stream::iter(operations)
             .map(|op| {
                 let completed = completed.clone();
@@ -278,7 +281,7 @@ impl BulkExecutor {
                     }
 
                     let start = std::time::Instant::now();
-                    let result = self.run_op(&op).await;
+                    let result = self.run_op(&op, parallel).await;
                     let duration_ms = start.elapsed().as_millis() as u64;
 
                     let count = completed.fetch_add(1, Ordering::Relaxed) + 1;
@@ -338,8 +341,9 @@ impl BulkExecutor {
         results
     }
 
-    /// Dispatches one operation to the matching sub-client.
-    async fn run_op(&self, op: &BulkOperation) -> Result<BulkResultData> {
+    /// Dispatches one operation to the matching sub-client; `parallel` is how
+    /// many operations of the batch run at once.
+    async fn run_op(&self, op: &BulkOperation, parallel: usize) -> Result<BulkResultData> {
         match op {
             BulkOperation::Whois { domain } => {
                 let result = self.whois_client.lookup(domain).await?;
@@ -389,29 +393,33 @@ impl BulkExecutor {
                 Ok(BulkResultData::Ssl(result))
             }
             BulkOperation::Posture { domain } => {
-                let result =
-                    crate::posture::lookup_email_posture(&self.dns_resolver, domain).await?;
+                let result = crate::posture::lookup_email_posture(
+                    &self.dns_resolver,
+                    domain,
+                    self.nameserver.as_deref(),
+                )
+                .await?;
                 Ok(BulkResultData::Posture(result))
             }
             BulkOperation::Confusables { domain } => {
-                // The per-domain candidate fan-out mirrors the executor's own
-                // concurrency, as the single-domain CLI command uses
-                // `bulk.concurrency`.
-                let result = crate::confusables::find_confusables(
+                // The single-domain command fans out to `bulk.concurrency`;
+                // here the concurrent scans split that budget, so a batch
+                // does not nest it (50 rows × 50 lookups).
+                let result = crate::confusables::find_confusables_shared(
                     &self.smart_lookup,
                     domain,
                     self.concurrency,
+                    parallel,
                 )
                 .await?;
                 Ok(BulkResultData::Confusables(result))
             }
             BulkOperation::Caa { domain } => {
-                // lookup_caa itself never fails (CAA is advisory; resolver errors
-                // yield an empty policy) but expects a normalized domain — the
-                // same normalize-then-query shape the CLI's single-domain command
-                // uses, so an invalid domain still surfaces as a per-row error.
-                let domain = crate::validation::normalize_domain(domain)?;
-                let policy = crate::caa::lookup_caa(&self.dns_resolver, &domain).await;
+                // Only invalid input errors (a per-row error); resolver
+                // errors yield an empty policy.
+                let policy =
+                    crate::caa::lookup_caa(&self.dns_resolver, domain, self.nameserver.as_deref())
+                        .await?;
                 Ok(BulkResultData::Caa(policy))
             }
         }
@@ -501,31 +509,16 @@ impl SlotLimiter {
     }
 }
 
-/// Keywords commonly used as CSV header labels for a domain column.
-const HEADER_KEYWORDS: &[&str] = &["domain", "host", "hostname", "url", "name", "site", "fqdn"];
-
-/// Returns true if `first` looks like a CSV header row rather than a real domain.
-///
-/// Heuristic: take the first comma-delimited column and trim it. Real domains
-/// always contain a `.` (e.g., "example.com", "domain.com"); a bare keyword
-/// like "domain" or "hostname" does not. Only treat the row as a header when
-/// the first column has no dot AND matches a known header keyword.
-fn is_csv_header_row(first: &str) -> bool {
-    let first_col = first.split(',').next().unwrap_or(first).trim();
-    // Real domains always contain a dot; a bare keyword does not.
-    if first_col.contains('.') {
-        return false;
-    }
-    let label = first_col.to_lowercase();
-    HEADER_KEYWORDS.contains(&label.as_str())
-}
-
+/// Parses a plain-text or CSV domain list: one domain per line (the first
+/// column of a CSV row, quotes stripped), `#` comments and blank lines
+/// skipped. Entries without a dot are dropped, which also drops a CSV header
+/// row (`domain,status`).
 pub fn parse_domains_from_file(content: &str) -> Vec<String> {
     // A UTF-8 BOM (Excel's "CSV UTF-8" export) is not whitespace to
     // `str::trim`: it would hide a first-line `#` comment and leak invisibly
     // into the first domain.
     let content = content.strip_prefix('\u{FEFF}').unwrap_or(content);
-    let mut domains: Vec<String> = content
+    content
         .lines()
         .map(|line| line.trim())
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
@@ -542,24 +535,7 @@ pub fn parse_domains_from_file(content: &str) -> Vec<String> {
                 .to_string()
         })
         .filter(|domain| domain.contains('.'))
-        .collect();
-
-    // A bare-keyword CSV header like "domain" / "hostname" has no dot and is
-    // already dropped by the filter above. `is_csv_header_row` additionally
-    // covers the edge case where the first surviving entry is a dotted header
-    // (rare, and the current heuristic treats such values as real domains —
-    // see `domain_dot_com_is_not_dropped_as_header`). The guard below is a
-    // belt-and-suspenders check that stays correct if the upstream filter
-    // ever changes.
-    if domains
-        .first()
-        .map(|d| is_csv_header_row(d))
-        .unwrap_or(false)
-    {
-        domains.remove(0);
-    }
-
-    domains
+        .collect()
 }
 
 #[cfg(test)]
@@ -654,28 +630,6 @@ csv,format,example.org
         let input = "domain.com\nexample.com\n";
         let result = parse_domains_from_file(input);
         assert_eq!(result, vec!["domain.com", "example.com"]);
-    }
-
-    #[test]
-    fn is_csv_header_row_detects_bare_keywords() {
-        assert!(is_csv_header_row("domain"));
-        assert!(is_csv_header_row("Hostname"));
-        assert!(is_csv_header_row("URL"));
-        assert!(is_csv_header_row("domain,status,notes"));
-        assert!(is_csv_header_row("  host  "));
-    }
-
-    #[test]
-    fn is_csv_header_row_rejects_dotted_values() {
-        assert!(!is_csv_header_row("domain.com"));
-        assert!(!is_csv_header_row("google.com"));
-        assert!(!is_csv_header_row("host.name"));
-    }
-
-    #[test]
-    fn is_csv_header_row_rejects_non_keyword() {
-        assert!(!is_csv_header_row("example"));
-        assert!(!is_csv_header_row("mydata"));
     }
 
     #[test]

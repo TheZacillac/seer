@@ -11,6 +11,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::dns::{DnsResolver, RecordData, RecordType};
+use crate::error::Result;
+use crate::validation::normalize_host;
 
 /// Informational note surfaced alongside every CAA report.
 ///
@@ -51,13 +53,15 @@ impl CaaRecord {
 pub enum IssuerCaaMatch {
     /// No CAA records exist (any CA may issue per default).
     NoPolicy,
-    /// CAA records exist and at least one `issue`/`issuewild` value plausibly
-    /// matches the presented issuer.
+    /// CAA records exist and at least one value of the tag governing the
+    /// certificate (`issue`, or `issuewild` for a wildcard — RFC 8659 §4.3)
+    /// plausibly matches the presented issuer.
     Permitted,
     /// CAA records exist but none of the allowed CAs appear to match the
     /// presented issuer. Informational, not a validation failure.
     Mismatch,
-    /// CAA records exist but only contain `iodef` / unknown tags — no
+    /// CAA records exist but none governs the certificate (only `iodef` /
+    /// unknown tags, or only `issuewild` for a non-wildcard certificate) — no
     /// authoritative answer about issuance.
     Indeterminate,
 }
@@ -171,17 +175,28 @@ fn analyze_wildcard(records: &[CaaRecord]) -> Option<String> {
     }
 }
 
-/// Looks up CAA records for `domain`, climbing the DNS tree per RFC 8659
+/// Looks up CAA records for `host`, climbing the DNS tree per RFC 8659
 /// section 3 until a record set is found or only a TLD remains.
 ///
-/// Returns an [`CaaPolicy::empty`] on resolver errors — CAA is advisory,
-/// so we never want to fail a higher-level check just because a CAA query
-/// did not return.
-pub async fn lookup_caa(resolver: &DnsResolver, domain: &str) -> CaaPolicy {
-    let mut current = domain.trim_end_matches('.').to_ascii_lowercase();
+/// `host` is normalized here with [`normalize_host`]: CAA is a per-name
+/// policy, so `www.` is kept (it can carry its own records). `nameserver`
+/// is an optional nameserver spec, as for [`DnsResolver::resolve`].
+///
+/// Errors only on invalid input. A resolver error yields
+/// [`CaaPolicy::empty`] — CAA is advisory, so a CAA query that did not
+/// return never fails a higher-level check.
+pub async fn lookup_caa(
+    resolver: &DnsResolver,
+    host: &str,
+    nameserver: Option<&str>,
+) -> Result<CaaPolicy> {
+    let mut current = normalize_host(host)?;
 
     loop {
-        match resolver.resolve(&current, RecordType::CAA, None).await {
+        match resolver
+            .resolve(&current, RecordType::CAA, nameserver)
+            .await
+        {
             Ok(records) if !records.is_empty() => {
                 let caa: Vec<CaaRecord> = records
                     .into_iter()
@@ -196,7 +211,7 @@ pub async fn lookup_caa(resolver: &DnsResolver, domain: &str) -> CaaPolicy {
                     .collect();
 
                 if !caa.is_empty() {
-                    return CaaPolicy::from_records(caa, current);
+                    return Ok(CaaPolicy::from_records(caa, current));
                 }
             }
             Ok(_) | Err(_) => {}
@@ -205,14 +220,19 @@ pub async fn lookup_caa(resolver: &DnsResolver, domain: &str) -> CaaPolicy {
         // Strip the leftmost label. Stop when only one label (TLD) remains.
         match current.split_once('.') {
             Some((_, rest)) if rest.contains('.') => current = rest.to_string(),
-            _ => return CaaPolicy::empty(),
+            _ => return Ok(CaaPolicy::empty()),
         }
     }
 }
 
 /// Compares a presented certificate's issuer string against a CAA policy
 /// and returns a classification. Pure function — no I/O.
-pub fn classify_issuer(issuer: &str, policy: &CaaPolicy) -> IssuerCaaMatch {
+///
+/// `wildcard` says whether the certificate names a wildcard
+/// (`*.example.com`). Per RFC 8659 §4.3, `issuewild` governs wildcard
+/// issuance — falling back to `issue` when the policy has no `issuewild` —
+/// and is ignored for every other name, which `issue` alone governs.
+pub fn classify_issuer(issuer: &str, policy: &CaaPolicy, wildcard: bool) -> IssuerCaaMatch {
     if !policy.has_policy {
         return IssuerCaaMatch::NoPolicy;
     }
@@ -231,10 +251,16 @@ pub fn classify_issuer(issuer: &str, policy: &CaaPolicy) -> IssuerCaaMatch {
         return IssuerCaaMatch::Mismatch;
     }
 
+    let has_issuewild = policy.records.iter().any(|r| r.tag == "issuewild");
+    let governing = if wildcard && has_issuewild {
+        "issuewild"
+    } else {
+        "issue"
+    };
     let issue_values: Vec<String> = policy
         .records
         .iter()
-        .filter(|r| r.tag == "issue" || r.tag == "issuewild")
+        .filter(|r| r.tag == governing)
         .map(CaaRecord::ca_domain)
         .collect();
 
@@ -353,6 +379,36 @@ const CA_ALIASES: &[(&str, &[&str])] = &[
 mod tests {
     use super::*;
 
+    /// Regression: callers normalized with `normalize_domain`, which drops
+    /// `www.` — but CAA is per name, so `www` must be asked first.
+    #[tokio::test]
+    async fn lookup_keeps_www_and_rejects_invalid_input() {
+        use crate::dns::test_support::{mock_dns_resolver_default, spawn_mock_dns_fn, MockReply};
+        use std::sync::{Arc, Mutex};
+
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let log = asked.clone();
+        let port = spawn_mock_dns_fn(move |name, _| {
+            log.lock().unwrap().push(name.to_string());
+            MockReply::NoData
+        })
+        .await;
+        let resolver = mock_dns_resolver_default(port);
+
+        let policy = lookup_caa(&resolver, "HTTPS://WWW.Seer.Test/path", None)
+            .await
+            .unwrap();
+        assert!(!policy.has_policy);
+        let asked = asked.lock().unwrap().clone();
+        assert_eq!(
+            asked.first().map(|n| n.trim_end_matches('.')),
+            Some("www.seer.test"),
+            "{asked:?}"
+        );
+
+        assert!(lookup_caa(&resolver, "bad..name", None).await.is_err());
+    }
+
     fn policy_with(records: Vec<(&str, &str)>) -> CaaPolicy {
         // Route through the real constructor so tests also exercise iodef +
         // wildcard-note derivation.
@@ -412,7 +468,7 @@ mod tests {
     #[test]
     fn classify_no_policy() {
         assert_eq!(
-            classify_issuer("Let's Encrypt R3", &CaaPolicy::empty()),
+            classify_issuer("Let's Encrypt R3", &CaaPolicy::empty(), false),
             IssuerCaaMatch::NoPolicy
         );
     }
@@ -421,7 +477,7 @@ mod tests {
     fn classify_indeterminate_when_only_iodef() {
         let policy = policy_with(vec![("iodef", "mailto:sec@example.com")]);
         assert_eq!(
-            classify_issuer("Let's Encrypt R3", &policy),
+            classify_issuer("Let's Encrypt R3", &policy, false),
             IssuerCaaMatch::Indeterminate
         );
     }
@@ -430,7 +486,7 @@ mod tests {
     fn classify_permitted_letsencrypt() {
         let policy = policy_with(vec![("issue", "letsencrypt.org")]);
         assert_eq!(
-            classify_issuer("CN=R3, O=Let's Encrypt", &policy),
+            classify_issuer("CN=R3, O=Let's Encrypt", &policy, false),
             IssuerCaaMatch::Permitted
         );
     }
@@ -441,7 +497,7 @@ mod tests {
         // maps it to "Google Trust Services".
         let policy = policy_with(vec![("issue", "pki.goog")]);
         assert_eq!(
-            classify_issuer("CN=GTS CA 1C3, O=Google Trust Services LLC", &policy),
+            classify_issuer("CN=GTS CA 1C3, O=Google Trust Services LLC", &policy, false),
             IssuerCaaMatch::Permitted
         );
     }
@@ -450,7 +506,7 @@ mod tests {
     fn classify_mismatch_when_only_other_ca_allowed() {
         let policy = policy_with(vec![("issue", "digicert.com")]);
         assert_eq!(
-            classify_issuer("CN=R3, O=Let's Encrypt", &policy),
+            classify_issuer("CN=R3, O=Let's Encrypt", &policy, false),
             IssuerCaaMatch::Mismatch
         );
     }
@@ -463,7 +519,7 @@ mod tests {
         // length-guarded just like the base-label fallback (issue #56 follow-up).
         let policy = policy_with(vec![("issue", "ca")]);
         assert_eq!(
-            classify_issuer("CN=Verisign Class 3 CA, O=Symantec", &policy),
+            classify_issuer("CN=Verisign Class 3 CA, O=Symantec", &policy, false),
             IssuerCaaMatch::Mismatch,
             "two-letter verbatim CAA value must not over-match unrelated issuers"
         );
@@ -475,7 +531,7 @@ mod tests {
         // still Permitted — the length guard must not break the common case.
         let policy = policy_with(vec![("issue", "letsencrypt.org")]);
         assert_eq!(
-            classify_issuer("CN=R3, O=letsencrypt.org", &policy),
+            classify_issuer("CN=R3, O=letsencrypt.org", &policy, false),
             IssuerCaaMatch::Permitted,
             "full-domain verbatim value must still match"
         );
@@ -488,13 +544,13 @@ mod tests {
         // short/ambiguous for the generic fallback (issue #56).
         let policy = policy_with(vec![("issue", "ssl.com")]);
         assert_eq!(
-            classify_issuer("CN=WoanWolf SSL Root CA, O=Other", &policy),
+            classify_issuer("CN=WoanWolf SSL Root CA, O=Other", &policy, false),
             IssuerCaaMatch::Mismatch,
             "bare 'ssl' substring must not over-match"
         );
         // The genuine SSL.com issuer (value appears verbatim) is still permitted.
         assert_eq!(
-            classify_issuer("CN=SSL.com RSA SSL subCA, O=SSL Corp", &policy),
+            classify_issuer("CN=SSL.com RSA SSL subCA, O=SSL Corp", &policy, false),
             IssuerCaaMatch::Permitted
         );
     }
@@ -505,11 +561,11 @@ mod tests {
         // only as a whole word, never buried inside a larger token (issue #56).
         let policy = policy_with(vec![("issue", "examplecorp.test")]);
         assert_eq!(
-            classify_issuer("CN=ExampleCorp Root, O=ExampleCorp", &policy),
+            classify_issuer("CN=ExampleCorp Root, O=ExampleCorp", &policy, false),
             IssuerCaaMatch::Permitted
         );
         assert_eq!(
-            classify_issuer("CN=NotExamplecorporated CA", &policy),
+            classify_issuer("CN=NotExamplecorporated CA", &policy, false),
             IssuerCaaMatch::Mismatch,
             "base inside a larger word must not match"
         );
@@ -524,7 +580,7 @@ mod tests {
     fn classify_does_not_panic_on_multibyte_rejected_match() {
         let policy = policy_with(vec![("issue", "éabcdef.com")]);
         assert_eq!(
-            classify_issuer("CN=xéabcdef.com", &policy),
+            classify_issuer("CN=xéabcdef.com", &policy, false),
             IssuerCaaMatch::Mismatch
         );
         // Directly, including a later whole-word hit after the rejected one.
@@ -538,21 +594,22 @@ mod tests {
     fn classify_alias_requires_whole_word() {
         let policy = policy_with(vec![("issue", "entrust.net")]);
         assert_eq!(
-            classify_issuer("CN=TrustID Server CA O1, O=IdenTrust", &policy),
+            classify_issuer("CN=TrustID Server CA O1, O=IdenTrust", &policy, false),
             IssuerCaaMatch::Mismatch,
             "entrust must not match inside identrust"
         );
         assert_eq!(
             classify_issuer(
                 "CN=Entrust Certification Authority - L1K, O=Entrust, Inc.",
-                &policy
+                &policy,
+                false
             ),
             IssuerCaaMatch::Permitted
         );
         // The trimmed `gts` alias still matches Google's intermediates.
         let google = policy_with(vec![("issue", "pki.goog")]);
         assert_eq!(
-            classify_issuer("CN=WR2, O=GTS", &google),
+            classify_issuer("CN=WR2, O=GTS", &google, false),
             IssuerCaaMatch::Permitted
         );
     }
@@ -562,16 +619,49 @@ mod tests {
         // A bare `issue ";"` forbids all issuance, yet a cert exists.
         let policy = policy_with(vec![("issue", ";")]);
         assert_eq!(
-            classify_issuer("CN=R3, O=Let's Encrypt", &policy),
+            classify_issuer("CN=R3, O=Let's Encrypt", &policy, false),
             IssuerCaaMatch::Mismatch
         );
     }
 
+    /// Regression: `issue` and `issuewild` values were pooled, so a CA
+    /// permitted only for wildcards counted as permitted for any name.
     #[test]
-    fn classify_issuewild_treated_like_issue() {
-        let policy = policy_with(vec![("issuewild", "letsencrypt.org")]);
+    fn issuewild_governs_wildcards_and_only_wildcards() {
+        const LE: &str = "CN=R3, O=Let's Encrypt";
+        let split = policy_with(vec![
+            ("issue", "digicert.com"),
+            ("issuewild", "letsencrypt.org"),
+        ]);
+        assert_eq!(classify_issuer(LE, &split, true), IssuerCaaMatch::Permitted);
+        assert_eq!(classify_issuer(LE, &split, false), IssuerCaaMatch::Mismatch);
+
+        // issuewild alone says nothing about non-wildcard names.
+        let wild_only = policy_with(vec![("issuewild", "letsencrypt.org")]);
         assert_eq!(
-            classify_issuer("CN=R3, O=Let's Encrypt", &policy),
+            classify_issuer(LE, &wild_only, true),
+            IssuerCaaMatch::Permitted
+        );
+        assert_eq!(
+            classify_issuer(LE, &wild_only, false),
+            IssuerCaaMatch::Indeterminate
+        );
+
+        // No issuewild: a wildcard falls back to issue.
+        let issue_only = policy_with(vec![("issue", "letsencrypt.org")]);
+        assert_eq!(
+            classify_issuer(LE, &issue_only, true),
+            IssuerCaaMatch::Permitted
+        );
+
+        // issuewild ";" forbids wildcards even though issue permits the CA.
+        let no_wild = policy_with(vec![("issue", "letsencrypt.org"), ("issuewild", ";")]);
+        assert_eq!(
+            classify_issuer(LE, &no_wild, true),
+            IssuerCaaMatch::Mismatch
+        );
+        assert_eq!(
+            classify_issuer(LE, &no_wild, false),
             IssuerCaaMatch::Permitted
         );
     }
@@ -613,7 +703,7 @@ mod tests {
             note: ISSUANCE_TIME_NOTE.to_string(),
         };
         assert_eq!(
-            classify_issuer("CN=R3, O=Let's Encrypt", &policy),
+            classify_issuer("CN=R3, O=Let's Encrypt", &policy, false),
             IssuerCaaMatch::Mismatch,
             "critical unknown tag must veto otherwise-matching issue"
         );
@@ -644,7 +734,7 @@ mod tests {
             note: ISSUANCE_TIME_NOTE.to_string(),
         };
         assert_eq!(
-            classify_issuer("CN=R3, O=Let's Encrypt", &policy),
+            classify_issuer("CN=R3, O=Let's Encrypt", &policy, false),
             IssuerCaaMatch::Permitted
         );
     }
@@ -667,7 +757,7 @@ mod tests {
             note: ISSUANCE_TIME_NOTE.to_string(),
         };
         assert_eq!(
-            classify_issuer("CN=R3, O=Let's Encrypt", &policy),
+            classify_issuer("CN=R3, O=Let's Encrypt", &policy, false),
             IssuerCaaMatch::Permitted
         );
     }

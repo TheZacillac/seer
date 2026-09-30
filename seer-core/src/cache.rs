@@ -52,7 +52,8 @@ impl<V> CacheEntry<V> {
 ///
 /// This cache supports:
 /// - Automatic expiration based on TTL
-/// - A capacity bound (expired, then oldest, entries are evicted)
+/// - A capacity bound (expired, then oldest-inserted, entries are evicted —
+///   FIFO by insertion age; reads do not refresh an entry)
 /// - Thread-safe access via RwLock
 ///
 /// # Example
@@ -169,8 +170,9 @@ where
             // pass amortizes the O(n) selection across the next inserts instead
             // of re-running it on every insert once full — which serialized all
             // writers behind an O(n) scan and became a write-lock contention
-            // cliff at large capacities (issue #51). Exact-LRU is preserved:
-            // the genuinely oldest entries are the ones removed.
+            // cliff at large capacities (issue #51). Eviction is by insertion
+            // age (FIFO), not recency: `get` does not refresh an entry, so the
+            // entries removed are the longest-resident ones, used or not.
             if entries.len() >= self.max_capacity {
                 let low_water = self.max_capacity.saturating_mul(9) / 10;
                 let to_remove = entries.len().saturating_sub(low_water).max(1);
@@ -279,7 +281,7 @@ mod tests {
             cache.len() < cap,
             "must be below capacity after a batch evict"
         );
-        // Exact-LRU preserved: newest survives, oldest evicted.
+        // Oldest-inserted evicted first: newest survives.
         assert_eq!(cache.get(&(cap as u32)), Some(cap as u32));
         assert_eq!(cache.get(&0), None);
     }

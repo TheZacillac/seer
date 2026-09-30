@@ -452,6 +452,7 @@ mod tests {
     #[test]
     fn nxdomain_says_the_name_does_not_exist_and_shows_the_soa() {
         let result = DnsQueryResult {
+            failed_types: Vec::new(),
             authority: vec![soa("seer.test")],
             ..fixtures::dig_status(RecordType::A, DnsStatus::NxDomain)
         };
@@ -473,6 +474,7 @@ mod tests {
     #[test]
     fn nodata_says_the_name_exists_without_the_type() {
         let result = DnsQueryResult {
+            failed_types: Vec::new(),
             authority: vec![soa("seer.test")],
             ..fixtures::dig(RecordType::AAAA, vec![])
         };
@@ -492,6 +494,7 @@ mod tests {
         // name, which exists — it owns the CNAME.
         let result = DnsQueryResult {
             answers: vec![fixtures::cname("www.seer.test", "gone.cdn.test.")],
+            failed_types: Vec::new(),
             authority: vec![soa("cdn.test")],
             ..fixtures::dig_status(RecordType::A, DnsStatus::NxDomain)
         };
@@ -559,6 +562,7 @@ mod tests {
         // A parent-side server's header: no `aa`, no `ra`.
         let result = DnsQueryResult {
             flags: vec!["qr".into(), "rd".into()],
+            failed_types: Vec::new(),
             authority: vec![ns("ns1.child.seer.test."), ns("ns2.child.seer.test.")],
             ..fixtures::dig_status(RecordType::A, DnsStatus::NoError)
         };
@@ -658,9 +662,7 @@ mod tests {
                 name: "seer.test".into(),
                 record_type: RecordType::TXT,
                 ttl: 300,
-                data: RecordData::TXT {
-                    text: "v=spf1\x1b[2J -all\n203.0.113.66".into(),
-                },
+                data: RecordData::txt(vec!["v=spf1\x1b[2J -all\n203.0.113.66".into()]),
             }],
         );
         let text = draw(&dig_data(result), &Panes::default(), "", None);

@@ -9,6 +9,10 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
+/// Upper clamp for `timeouts.ct_secs`; the CT-log client is built with it so
+/// any configured per-request timeout fits under it.
+pub(crate) const MAX_CT_SECS: u64 = 120;
+
 /// Seer configuration loaded from `~/.seer/config.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -45,6 +49,10 @@ pub struct TimeoutConfig {
     pub dns_secs: u64,
     /// HTTP/SSL check timeout in seconds
     pub http_secs: u64,
+    /// Certificate Transparency log request timeout in seconds (subdomain
+    /// enumeration). Separate from `http_secs`: CT aggregators routinely take
+    /// tens of seconds to answer for a busy domain, far past a site probe.
+    pub ct_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -104,6 +112,7 @@ impl Default for TimeoutConfig {
             rdap_secs: 15,
             dns_secs: 5,
             http_secs: 10,
+            ct_secs: 30,
         }
     }
 }
@@ -173,12 +182,12 @@ impl SeerConfig {
 
     /// Clamp loaded values into sane ranges. Without this, a user
     /// (accidentally or maliciously) setting `bulk.concurrency = 0` would
-    /// hand `Semaphore::new(0)` to every bulk operation and block forever;
-    /// `bulk.concurrency = 10000` would spawn thousands of concurrent
-    /// connections. Timeouts of `0` would error every network call
+    /// hand `buffer_unordered(0)` to every bulk fan-out, which never starts a
+    /// task and hangs; `bulk.concurrency = 10000` would spawn thousands of
+    /// concurrent connections. Timeouts of `0` would error every network call
     /// immediately. The bounds are per-protocol (a config file can't bypass
     /// them): concurrency 1–50; whois/rdap timeouts 1–300s; dns 1–60s;
-    /// http 1–120s.
+    /// http and CT 1–120s.
     fn clamped(mut self) -> Self {
         self.bulk.concurrency = self.bulk.concurrency.clamp(1, 50);
         // A multi-day per-operation delay would stall bulk runs indefinitely;
@@ -188,6 +197,7 @@ impl SeerConfig {
         self.timeouts.rdap_secs = self.timeouts.rdap_secs.clamp(1, 300);
         self.timeouts.dns_secs = self.timeouts.dns_secs.clamp(1, 60);
         self.timeouts.http_secs = self.timeouts.http_secs.clamp(1, 120);
+        self.timeouts.ct_secs = self.timeouts.ct_secs.clamp(1, MAX_CT_SECS);
         self
     }
 
@@ -209,6 +219,11 @@ impl SeerConfig {
     /// Returns the HTTP timeout as a Duration.
     pub fn http_timeout(&self) -> Duration {
         Duration::from_secs(self.timeouts.http_secs)
+    }
+
+    /// Returns the Certificate Transparency log request timeout as a Duration.
+    pub fn ct_timeout(&self) -> Duration {
+        Duration::from_secs(self.timeouts.ct_secs)
     }
 
     /// Returns the inter-operation bulk rate-limit delay as a Duration.
@@ -294,6 +309,18 @@ concurrency = 20
         assert_eq!(config.rdap_timeout(), Duration::from_secs(15));
         assert_eq!(config.dns_timeout(), Duration::from_secs(5));
         assert_eq!(config.http_timeout(), Duration::from_secs(10));
+        assert_eq!(config.ct_timeout(), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn ct_timeout_parses_and_is_clamped() {
+        let path = std::path::Path::new("~/.seer/config.toml");
+        let config = SeerConfig::parse_or_default("[timeouts]\nct_secs = 45\n", path);
+        assert_eq!(config.ct_timeout(), Duration::from_secs(45));
+        let config = SeerConfig::parse_or_default("[timeouts]\nct_secs = 0\n", path);
+        assert_eq!(config.ct_timeout(), Duration::from_secs(1));
+        let config = SeerConfig::parse_or_default("[timeouts]\nct_secs = 9999\n", path);
+        assert_eq!(config.ct_timeout(), Duration::from_secs(MAX_CT_SECS));
     }
 
     #[test]

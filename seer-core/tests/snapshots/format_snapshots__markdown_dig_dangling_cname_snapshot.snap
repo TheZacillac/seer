@@ -10,14 +10,14 @@ expression: markdown ().format_dig (& fixture_dig_dangling_cname())
 - **Server**: default
 - **Query time**: 27 ms
 
-*The CNAME target `gone.cdn.test.` does not exist (NXDOMAIN)*
-
 ### Answer
 
 | Name | TTL | Type | Data |
 | --- | --- | --- | --- |
 | `www.seer.test` | 3600 | CNAME | `shop.seer.test.` |
 | `shop.seer.test` | 300 | CNAME | `gone.cdn.test.` |
+
+*The CNAME target `gone.cdn.test.` does not exist (NXDOMAIN)*
 
 ### Authority
 

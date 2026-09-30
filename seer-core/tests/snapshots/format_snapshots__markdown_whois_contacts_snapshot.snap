@@ -1,5 +1,6 @@
 ---
 source: seer-core/tests/format_snapshots.rs
+assertion_line: 780
 expression: markdown ().format_whois (& fixture_whois_with_contacts())
 ---
 ## WHOIS: example.com
@@ -8,7 +9,7 @@ expression: markdown ().format_whois (& fixture_whois_with_contacts())
 - **Registrant**: Jane Registrant
 - **Organization**: Example Holdings LLC
 - **Created**: `2010-03-15`
-- **Expires**: `2099-03-15` ([N] days)
+- **Expires**: `2099-03-15` (expires in [N] days)
 - **Updated**: `2024-02-01`
 - **Nameservers**: `ns1.example.com`, `ns2.example.com`
 - **Status**: `clientTransferProhibited`

@@ -11,6 +11,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
+use seer_core::output::sanitize_line;
 use seer_core::HeaderVerdict;
 
 use crate::tui::action::LensData;
@@ -22,7 +23,8 @@ use crate::tui::widgets::{dot, gauge, panel};
 fn verdict_tone(v: HeaderVerdict) -> &'static str {
     match v {
         HeaderVerdict::Strict | HeaderVerdict::Present => "ok",
-        HeaderVerdict::Moderate | HeaderVerdict::Weak => "warn",
+        // Unknown is posture-only (a failed DNS lookup); headers never grade it.
+        HeaderVerdict::Moderate | HeaderVerdict::Weak | HeaderVerdict::Unknown => "warn",
         HeaderVerdict::Absent => "fail",
     }
 }
@@ -69,7 +71,7 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
                 Some(&label),
             ),
             Line::from(Span::styled(
-                format!("{}  [HTTP {}]", h.url, h.status),
+                format!("{}  [HTTP {}]", sanitize_line(&h.url), h.status),
                 Style::default().fg(theme.subtext),
             )),
         ]),
@@ -89,10 +91,11 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
         .iter()
         .map(|finding| {
             let label = finding.verdict.as_str();
-            let used = finding.header.chars().count() + label.chars().count() + 2;
+            let header = sanitize_line(&finding.header);
+            let used = header.chars().count() + label.chars().count() + 2;
             let dots = width.saturating_sub(used).max(1);
             Line::from(vec![
-                Span::styled(finding.header.clone(), Style::default().fg(theme.mauve)),
+                Span::styled(header, Style::default().fg(theme.mauve)),
                 Span::styled(
                     format!(" {} ", ".".repeat(dots)),
                     Style::default().fg(theme.surface1),

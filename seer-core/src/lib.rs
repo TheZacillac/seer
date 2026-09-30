@@ -63,19 +63,19 @@ pub use availability::{AvailabilityChecker, AvailabilityResult};
 pub use cache::TtlCache;
 pub use config::SeerConfig;
 pub use error::{Result, SeerError};
-pub use retry::{NetworkRetryClassifier, RetryClassifier, RetryExecutor, RetryPolicy};
+pub use retry::{is_retryable, RetryExecutor, RetryPolicy};
 pub use validation::normalize_domain;
 
 pub use dns::{
     AuthenticationTier, DnsComparator, DnsComparison, DnsFollower, DnsQueryResult, DnsRecord,
-    DnsResolver, DnsStatus, DnsTrace, DnsTracer, DnssecChecker, DnssecReport, FollowConfig,
-    FollowIteration, FollowResult, PropagationResult, RecordType, RrsigInfo, TraceHop,
+    DnsResolver, DnsStatus, DnsTrace, DnsTracer, DnssecChecker, DnssecReport, FailedType,
+    FollowConfig, FollowIteration, FollowResult, PropagationResult, RecordType, TraceHop,
     WildcardProbe, MAX_FOLLOW_INTERVAL_SECS, MAX_FOLLOW_ITERATIONS,
 };
 pub use lookup::{LookupProgressCallback, LookupResult, SmartLookup};
 pub use rdap::{RdapClient, RdapResponse};
 pub use status::{CertificateInfo, DnsResolution, DomainExpiration, StatusClient, StatusResponse};
-pub use tld::{all_tlds, lookup_tld, TldInfo};
+pub use tld::{all_tlds, lookup_tld, lookup_tld_with, TldInfo};
 pub use whois::{WhoisClient, WhoisResponse};
 
 pub use bulk::{BulkExecutor, BulkOperation, BulkResult};
@@ -109,7 +109,9 @@ pub use subdomains::{
 };
 #[cfg(feature = "cli")]
 pub use subdomains::{SubdomainBaseline, SubdomainBaselineDiff, SubdomainBaselines};
-pub use takeover::{scan_takeover, TakeoverFinding, TakeoverReport, TakeoverVerdict};
+pub use takeover::{
+    scan_takeover, TakeoverFinding, TakeoverReport, TakeoverVerdict, DEFAULT_TAKEOVER_TIMEOUT,
+};
 #[cfg(feature = "cli")]
 pub use watchlist::{
     check_watchlist_with, check_watchlist_with_config, WatchReport, WatchResult, Watchlist,

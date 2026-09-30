@@ -16,7 +16,7 @@ pub struct CommandContext {
 impl CommandContext {
     pub fn new() -> Self {
         let config = SeerConfig::load();
-        let output_format = config.output_format.parse().unwrap_or_default();
+        let output_format = crate::config_output_format(&config.output_format);
         Self {
             output_format,
             config,
@@ -105,12 +105,8 @@ pub fn split_quoted_literal(line: &str) -> Result<Vec<String>, String> {
 /// Everything is validated here, before any network I/O.
 pub fn parse_query(command: &str, parts: &[&str]) -> Result<Query, String> {
     let args = &parts[1..];
-    // The first argument, or the command's usage line.
-    let arg = || {
-        args.first()
-            .map(|a| a.to_string())
-            .ok_or_else(|| catalog::usage(command))
-    };
+    // The one argument, or the command's usage line.
+    let arg = || only_arg(command, args);
     Ok(match catalog::canonical(command) {
         "lookup" => Query::Lookup(arg()?),
         "info" => Query::Info(arg()?),
@@ -126,13 +122,20 @@ pub fn parse_query(command: &str, parts: &[&str]) -> Result<Query, String> {
                 .map_err(|e| format!("{e}\n{}", catalog::usage(command)))?
                 .into_query()
         }
-        "prop" => Query::Prop {
-            domain: arg()?,
-            record_type: match args.get(1) {
-                Some(name) => crate::try_parse_record_type(name)?,
-                None => RecordType::A,
-            },
-        },
+        "prop" => {
+            let usage = catalog::usage(command);
+            reject_flags(args, &usage)?;
+            let (domain, record_type) = match args {
+                [domain] => (domain, RecordType::A),
+                [domain, name] => (domain, crate::try_parse_record_type(name)?),
+                [] => return Err(usage),
+                [_, _, extra, ..] => return Err(unexpected(extra, &usage)),
+            };
+            Query::Prop {
+                domain: domain.to_string(),
+                record_type,
+            }
+        }
         "status" => Query::Status(arg()?),
         "reverse" => Query::Reverse(arg()?),
         "avail" => Query::Avail(arg()?),
@@ -140,19 +143,12 @@ pub fn parse_query(command: &str, parts: &[&str]) -> Result<Query, String> {
         "ssl" => Query::Ssl(arg()?),
         "tld" => Query::Tld(arg()?),
         "compare" => {
-            if args.len() < 3 {
+            if args.is_empty() {
                 return Err(catalog::usage(command));
             }
-            let (servers, record_type) = servers_and_type(&args[1..])?;
-            let [server_a, server_b, ..] = servers.as_slice() else {
-                return Err("Need two nameservers (e.g., @8.8.8.8 @1.1.1.1)".to_string());
-            };
-            Query::Compare {
-                domain: args[0].to_string(),
-                record_type,
-                server_a: server_a.clone(),
-                server_b: server_b.clone(),
-            }
+            crate::dns_args::parse_compare(args)
+                .map_err(|e| format!("{e}\n{}", catalog::usage(command)))?
+                .into_query()
         }
         "subdomains" => {
             let SubdomainsArgs {
@@ -168,10 +164,15 @@ pub fn parse_query(command: &str, parts: &[&str]) -> Result<Query, String> {
                 record,
             }
         }
-        "diff" => match args {
-            [a, b, ..] => Query::Diff(a.to_string(), b.to_string()),
-            _ => return Err(catalog::usage(command)),
-        },
+        "diff" => {
+            let usage = catalog::usage(command);
+            reject_flags(args, &usage)?;
+            match args {
+                [a, b] => Query::Diff(a.to_string(), b.to_string()),
+                [_, _, extra, ..] => return Err(unexpected(extra, &usage)),
+                _ => return Err(usage),
+            }
+        }
         "drift" => {
             let DriftArgs { domain, record } = parse_drift_args(args)?;
             Query::Drift { domain, record }
@@ -184,9 +185,20 @@ pub fn parse_query(command: &str, parts: &[&str]) -> Result<Query, String> {
             Query::Takeover { domain, hosts }
         }
         "confusables" => Query::Confusables(arg()?),
-        "doctor" => Query::Doctor,
+        "doctor" => {
+            no_args(command, args)?;
+            Query::Doctor
+        }
         "delegation" => Query::Delegation(arg()?),
-        _ if command.contains('.') => Query::Lookup(parts[0].to_string()),
+        // A bare domain is `lookup <domain>`, with the same arity.
+        _ if command.contains('.') => {
+            if let Some(extra) = args.first() {
+                let usage = catalog::usage("lookup");
+                reject_unknown_flag(extra, &usage)?;
+                return Err(unexpected(extra, &usage));
+            }
+            Query::Lookup(parts[0].to_string())
+        }
         _ => {
             return Err(format!(
                 "Unknown command: {}. Type 'help' for available commands.",
@@ -196,20 +208,6 @@ pub fn parse_query(command: &str, parts: &[&str]) -> Result<Query, String> {
     })
 }
 
-/// Splits DNS command arguments into `@server`s and a record type (default
-/// A). A typo'd type must error, not silently query A records.
-fn servers_and_type(args: &[&str]) -> Result<(Vec<String>, RecordType), String> {
-    let mut servers = Vec::new();
-    let mut record_type = RecordType::A;
-    for arg in args {
-        match arg.strip_prefix('@') {
-            Some(server) => servers.push(server.to_string()),
-            None => record_type = crate::try_parse_record_type(arg)?,
-        }
-    }
-    Ok((servers, record_type))
-}
-
 /// Returns a usage error for an unrecognized `--flag` / `-f` token, so a typo
 /// like `--recrod` fails loudly instead of being silently ignored.
 fn reject_unknown_flag(token: &str, usage: &str) -> Result<(), String> {
@@ -217,6 +215,60 @@ fn reject_unknown_flag(token: &str, usage: &str) -> Result<(), String> {
         return Err(format!("Unknown option: {token}\n{usage}"));
     }
     Ok(())
+}
+
+/// [`reject_unknown_flag`] for every token of a command that takes no flags.
+fn reject_flags(args: &[&str], usage: &str) -> Result<(), String> {
+    args.iter()
+        .try_for_each(|arg| reject_unknown_flag(arg, usage))
+}
+
+fn unexpected(extra: &str, usage: &str) -> String {
+    format!("Unexpected argument: {extra}\n{usage}")
+}
+
+/// The single argument of a one-argument command. Extra arguments and flags
+/// are usage errors: they used to be dropped silently, so `whois example.com
+/// --raw` ran a plain lookup and `diff a b c` ignored `c`.
+fn only_arg(command: &str, args: &[&str]) -> Result<String, String> {
+    let usage = catalog::usage(command);
+    reject_flags(args, &usage)?;
+    match args {
+        [arg] => Ok(arg.to_string()),
+        [] => Err(usage),
+        [_, extra, ..] => Err(unexpected(extra, &usage)),
+    }
+}
+
+/// A command that takes no arguments at all.
+pub fn no_args(command: &str, args: &[&str]) -> Result<(), String> {
+    match args.first() {
+        Some(extra) => {
+            let usage = catalog::usage(command);
+            reject_unknown_flag(extra, &usage)?;
+            Err(unexpected(extra, &usage))
+        }
+        None => Ok(()),
+    }
+}
+
+/// Parses `history [domain] [--clear]`; unknown flags and a second domain
+/// are errors (`manage::history` rejects a domain with `--clear`).
+pub fn parse_history_args(args: &[&str]) -> Result<(Option<String>, bool), String> {
+    let usage = catalog::usage("history");
+    let (mut domain, mut clear) = (None, false);
+    for arg in args {
+        if *arg == "--clear" {
+            clear = true;
+            continue;
+        }
+        reject_unknown_flag(arg, &usage)?;
+        if domain.is_some() {
+            return Err(unexpected(arg, &usage));
+        }
+        domain = Some(arg.to_string());
+    }
+    Ok((domain, clear))
 }
 
 /// Parsed arguments for the REPL `subdomains` command.
@@ -344,137 +396,89 @@ pub fn parse_drift_args(args: &[&str]) -> Result<DriftArgs, String> {
     Ok(DriftArgs { domain, record })
 }
 
-/// Parsed arguments for the REPL `bulk` command.
+/// Parses `bulk <operation> <file> [type] [-o output.csv] [--progress
+/// <mode>]` into the request [`crate::bulk::run_bulk`] runs for both
+/// surfaces. Paths stay as typed (`run_bulk` expands `~`).
 ///
-/// Paths are returned exactly as typed — tilde expansion is the caller's
-/// responsibility so this parser stays pure and unit-testable.
-#[derive(Debug, Clone, PartialEq)]
-pub struct BulkArgs {
-    /// Operation name as typed (validated later by `ops::build_bulk_operations`).
-    pub operation: String,
-    /// Input file path as typed.
-    pub file: String,
-    /// Record type for dig/prop operations (defaults to A).
-    pub record_type: RecordType,
-    /// Output CSV path from `-o`/`--output`, if given.
-    pub output: Option<String>,
-}
-
-/// Parses `bulk <operation> <file> [type] [-o output.csv]` arguments.
-///
-/// Errors with a usage message when fewer than two positionals are given, or
-/// when `-o`/`--output` trails without a value (previously that flag was
-/// silently ignored, quietly overwriting the default output path).
-pub fn parse_bulk_args(args: &[&str]) -> Result<BulkArgs, String> {
-    if args.len() < 2 {
-        return Err(format!(
-            "{}\nType 'bulk -h' for detailed help.",
-            catalog::usage("bulk")
-        ));
+/// Errors with a usage message when fewer than two positionals are given,
+/// when `-o`/`--output` or `--progress` trails without a value (previously
+/// `-o` was silently ignored, quietly writing the default path), on an
+/// unknown flag or a second type, and on `-` as the file: the REPL's stdin
+/// is the terminal it reads commands from, so a domain list can only be
+/// piped into `seer bulk … -`.
+pub fn parse_bulk_args(args: &[&str]) -> Result<crate::bulk::BulkRequest, String> {
+    let usage = catalog::usage("bulk");
+    let (operation, file) = match args {
+        [operation, file, ..] => (operation.to_string(), file.to_string()),
+        _ => return Err(format!("{usage}\nType 'bulk -h' for detailed help.")),
+    };
+    if file == "-" {
+        return Err(
+            "The REPL cannot read a domain list from stdin; give a file, or pipe the list \
+             into `seer bulk <operation> -`"
+                .to_string(),
+        );
     }
-
-    let operation = args[0].to_string();
-    let file = args[1].to_string();
-    let mut record_type = RecordType::A;
+    let mut record_type: Option<RecordType> = None;
     let mut output: Option<String> = None;
+    let mut progress: Option<crate::bulk::ProgressMode> = None;
 
-    let mut i = 2;
-    while i < args.len() {
-        match args[i] {
+    let mut rest = args[2..].iter();
+    while let Some(arg) = rest.next() {
+        match *arg {
             "-o" | "--output" => {
-                let Some(value) = args.get(i + 1) else {
+                let Some(value) = rest.next() else {
                     return Err("Missing value after -o/--output".to_string());
                 };
                 output = Some(value.to_string());
-                i += 2;
+            }
+            "--progress" => {
+                let Some(value) = rest.next() else {
+                    return Err("Missing value after --progress".to_string());
+                };
+                let mode = <crate::bulk::ProgressMode as clap::ValueEnum>::from_str(value, true)
+                    .map_err(|_| {
+                        format!("Unknown progress mode: {value}. Use: bar, verbose, failures, none")
+                    })?;
+                progress = Some(mode);
             }
             other => {
-                record_type = crate::try_parse_record_type(other)?;
-                i += 1;
+                reject_unknown_flag(other, &usage)?;
+                if record_type.is_some() {
+                    return Err(unexpected(other, &usage));
+                }
+                record_type = Some(crate::try_parse_record_type(other)?);
             }
         }
     }
 
-    Ok(BulkArgs {
+    Ok(crate::bulk::BulkRequest {
         operation,
-        file,
-        record_type,
+        input: file,
+        record_type: record_type.unwrap_or(RecordType::A),
         output,
+        progress,
     })
 }
 
-/// Parsed arguments for the REPL `follow` command.
-#[derive(Debug, Clone, PartialEq)]
-pub struct FollowArgs {
-    pub domain: String,
-    /// Number of checks to perform (defaults to 10).
-    pub iterations: usize,
-    /// Minutes between checks; may be fractional (defaults to 1.0).
-    pub interval_minutes: f64,
-    /// Record type to monitor (defaults to A).
-    pub record_type: RecordType,
-    /// Nameserver from an inline `@server` argument.
-    pub nameserver: Option<String>,
-    /// Only print iterations whose records changed.
-    pub changes_only: bool,
-}
-
-/// Parses `follow <domain> [iterations] [interval_minutes] [type] [@server]
-/// [--changes-only]` arguments.
-///
-/// Positional numbers are order-sensitive: the first integer is the iteration
-/// count, any later number (integer or float) the interval in minutes. A bare
-/// float is always the interval. Any other token must be a record type — a
-/// typo (`MXX`) or unknown `--flag` is an error, matching the CLI and the
-/// REPL's other DNS commands, rather than silently following A records.
-pub fn parse_follow_args(args: &[&str]) -> Result<FollowArgs, String> {
+/// Parses `follow` through the grammar `seer follow` shares
+/// ([`crate::dns_args::parse_follow`]); errors end with the usage line.
+pub fn parse_follow_args(args: &[&str]) -> Result<crate::dns_args::FollowArgs, String> {
     let usage = catalog::usage("follow");
-    let Some(domain) = args.first() else {
+    if args.is_empty() {
         return Err(usage);
-    };
-
-    let mut parsed = FollowArgs {
-        domain: domain.to_string(),
-        iterations: 10,
-        interval_minutes: 1.0,
-        record_type: RecordType::A,
-        nameserver: None,
-        changes_only: false,
-    };
-
-    // Track whether the first numeric positional (iterations) has been
-    // consumed. Comparing against the default `10` would be wrong because
-    // `follow x 10 5` must treat the explicit `10` as already set.
-    let mut iterations_set = false;
-
-    for arg in &args[1..] {
-        if let Some(ns) = arg.strip_prefix('@') {
-            parsed.nameserver = Some(ns.to_string());
-        } else if *arg == "--changes-only" {
-            parsed.changes_only = true;
-        } else if arg.starts_with("--") {
-            return Err(format!("Unknown option: {arg}\n{usage}"));
-        } else if let Ok(n) = arg.parse::<usize>() {
-            // First number is iterations, second is interval
-            if !iterations_set {
-                parsed.iterations = n;
-                iterations_set = true;
-            } else {
-                parsed.interval_minutes = n as f64;
-            }
-        } else if let Ok(mins) = arg.parse::<f64>() {
-            parsed.interval_minutes = mins;
-        } else {
-            parsed.record_type = crate::try_parse_record_type(arg)?;
-        }
     }
-
-    Ok(parsed)
+    crate::dns_args::parse_follow(args, crate::dns_args::FollowFlags::default())
+        .map_err(|e| format!("{e}\n{usage}"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn bulk(args: &[&str]) -> crate::bulk::BulkRequest {
+        parse_bulk_args(args).unwrap_or_else(|e| panic!("{args:?}: {e}"))
+    }
 
     #[test]
     fn bulk_requires_operation_and_file() {
@@ -484,100 +488,103 @@ mod tests {
 
     #[test]
     fn bulk_minimal_defaults() {
-        let got = parse_bulk_args(&["status", "domains.txt"]).expect("valid");
-        assert_eq!(
-            got,
-            BulkArgs {
-                operation: "status".into(),
-                file: "domains.txt".into(),
-                record_type: RecordType::A,
-                output: None,
-            }
-        );
+        let got = bulk(&["status", "domains.txt"]);
+        assert_eq!(got.operation, "status");
+        assert_eq!(got.input, "domains.txt");
+        assert_eq!(got.record_type, RecordType::A);
+        assert_eq!(got.output, None);
+        assert_eq!(got.progress, None);
     }
 
     #[test]
     fn bulk_parses_record_type_positional() {
-        let got = parse_bulk_args(&["dig", "domains.txt", "MX"]).expect("valid");
-        assert_eq!(got.record_type, RecordType::MX);
+        assert_eq!(
+            bulk(&["dig", "domains.txt", "MX"]).record_type,
+            RecordType::MX
+        );
         // Unparseable type tokens error instead of silently falling back to A.
-        let err = parse_bulk_args(&["dig", "domains.txt", "NOTATYPE"]).expect_err("must error");
+        let err = parse_bulk_args(&["dig", "domains.txt", "NOTATYPE"])
+            .err()
+            .expect("must error");
         assert!(err.contains("NOTATYPE"));
         assert!(err.contains("valid types"));
+        // A second type used to replace the first silently.
+        let err = parse_bulk_args(&["dig", "d.txt", "MX", "TXT"])
+            .err()
+            .expect("two types");
+        assert!(err.starts_with("Unexpected argument: TXT"), "{err}");
     }
 
     #[test]
-    fn bulk_parses_output_flag_variants() {
+    fn bulk_parses_output_and_progress_in_any_order() {
         for flag in ["-o", "--output"] {
-            let got = parse_bulk_args(&["lookup", "d.txt", flag, "out.csv"]).expect("valid");
+            assert_eq!(
+                bulk(&["lookup", "d.txt", flag, "out.csv"])
+                    .output
+                    .as_deref(),
+                Some("out.csv")
+            );
+        }
+        for args in [
+            &[
+                "dig",
+                "d.txt",
+                "-o",
+                "out.csv",
+                "TXT",
+                "--progress",
+                "failures",
+            ][..],
+            &[
+                "dig",
+                "d.txt",
+                "--progress",
+                "Failures",
+                "TXT",
+                "-o",
+                "out.csv",
+            ],
+        ] {
+            let got = bulk(args);
+            assert_eq!(got.record_type, RecordType::TXT);
             assert_eq!(got.output.as_deref(), Some("out.csv"));
+            assert_eq!(got.progress, Some(crate::bulk::ProgressMode::Failures));
         }
     }
 
     #[test]
-    fn bulk_output_flag_and_type_combine_in_any_order() {
-        let got = parse_bulk_args(&["dig", "d.txt", "-o", "out.csv", "TXT"]).expect("valid");
-        assert_eq!(got.record_type, RecordType::TXT);
-        assert_eq!(got.output.as_deref(), Some("out.csv"));
-
-        let got = parse_bulk_args(&["dig", "d.txt", "TXT", "-o", "out.csv"]).expect("valid");
-        assert_eq!(got.record_type, RecordType::TXT);
-        assert_eq!(got.output.as_deref(), Some("out.csv"));
-    }
-
-    #[test]
-    fn bulk_dangling_output_flag_errors() {
-        let err = parse_bulk_args(&["lookup", "d.txt", "-o"]).expect_err("must error");
+    fn bulk_rejects_dangling_values_unknown_flags_and_stdin() {
+        let err = parse_bulk_args(&["lookup", "d.txt", "-o"])
+            .err()
+            .expect("must error");
         assert!(err.contains("-o/--output"), "got: {err}");
+        let err = parse_bulk_args(&["lookup", "d.txt", "--progress"])
+            .err()
+            .expect("dangling");
+        assert!(err.contains("--progress"), "got: {err}");
+        let err = parse_bulk_args(&["lookup", "d.txt", "--progress", "loud"])
+            .err()
+            .expect("mode");
+        assert!(err.contains("Unknown progress mode: loud"), "got: {err}");
+        let err = parse_bulk_args(&["lookup", "d.txt", "--ouput", "x.csv"])
+            .err()
+            .expect("typo");
+        assert!(err.starts_with("Unknown option: --ouput"), "got: {err}");
+        let err = parse_bulk_args(&["lookup", "-"]).err().expect("stdin");
+        assert!(err.contains("stdin"), "got: {err}");
     }
 
     #[test]
-    fn follow_requires_domain() {
-        assert!(parse_follow_args(&[]).is_err());
-    }
-
-    #[test]
-    fn follow_defaults() {
-        let got = parse_follow_args(&["example.com"]).expect("valid");
-        assert_eq!(
-            got,
-            FollowArgs {
-                domain: "example.com".into(),
-                iterations: 10,
-                interval_minutes: 1.0,
-                record_type: RecordType::A,
-                nameserver: None,
-                changes_only: false,
-            }
-        );
-    }
-
-    #[test]
-    fn follow_first_int_is_iterations_second_is_interval() {
-        let got = parse_follow_args(&["example.com", "5", "2"]).expect("valid");
-        assert_eq!(got.iterations, 5);
-        assert_eq!(got.interval_minutes, 2.0);
-    }
-
-    #[test]
-    fn follow_explicit_default_iterations_still_consumes_slot() {
-        // `follow x 10 5` — the explicit `10` matches the default but must
-        // still claim the iterations slot, making `5` the interval.
-        let got = parse_follow_args(&["example.com", "10", "5"]).expect("valid");
-        assert_eq!(got.iterations, 10);
-        assert_eq!(got.interval_minutes, 5.0);
-    }
-
-    #[test]
-    fn follow_float_is_always_interval() {
-        // A float can't be iterations, so it sets the interval even first.
-        let got = parse_follow_args(&["example.com", "0.5"]).expect("valid");
-        assert_eq!(got.iterations, 10);
-        assert_eq!(got.interval_minutes, 0.5);
-    }
-
-    #[test]
-    fn follow_parses_type_server_and_changes_only() {
+    fn follow_errors_end_with_the_usage_line() {
+        assert_eq!(parse_follow_args(&[]).err(), Some(catalog::usage("follow")));
+        for args in [
+            &["example.com", "--chnages-only"][..],
+            &["example.com", "5", "MXX"],
+            &["example.com", "1", "2", "3"],
+        ] {
+            let err = parse_follow_args(args).expect_err("must error");
+            assert!(err.ends_with(&catalog::usage("follow")), "{args:?}: {err}");
+        }
         let got =
             parse_follow_args(&["example.com", "MX", "@8.8.8.8", "--changes-only"]).expect("valid");
         assert_eq!(got.record_type, RecordType::MX);
@@ -585,32 +592,52 @@ mod tests {
         assert!(got.changes_only);
     }
 
+    /// Extra arguments and flags on one-argument commands were dropped
+    /// silently; they are usage errors now.
     #[test]
-    fn follow_full_argument_soup() {
-        let got =
-            parse_follow_args(&["example.com", "20", "0.5", "AAAA", "@1.1.1.1"]).expect("valid");
-        assert_eq!(got.iterations, 20);
-        assert_eq!(got.interval_minutes, 0.5);
-        assert_eq!(got.record_type, RecordType::AAAA);
-        assert_eq!(got.nameserver.as_deref(), Some("1.1.1.1"));
-        assert!(!got.changes_only);
+    fn single_argument_commands_reject_extras_and_flags() {
+        for (line, problem) in [
+            (
+                &["whois", "example.com", "--raw"][..],
+                "Unknown option: --raw",
+            ),
+            (&["whois", "--raw", "example.com"], "Unknown option: --raw"),
+            (&["lookup", "a.com", "b.com"], "Unexpected argument: b.com"),
+            (
+                &["diff", "a.com", "b.com", "c.com"],
+                "Unexpected argument: c.com",
+            ),
+            (
+                &["prop", "a.com", "MX", "extra"],
+                "Unexpected argument: extra",
+            ),
+            (&["doctor", "now"], "Unexpected argument: now"),
+            (&["example.com", "--raw"], "Unknown option: --raw"),
+            (&["example.com", "extra"], "Unexpected argument: extra"),
+        ] {
+            let err = parse_query(&line[0].to_lowercase(), line)
+                .err()
+                .expect("must be rejected");
+            assert!(err.starts_with(problem), "{line:?}: {err}");
+        }
+        assert!(matches!(
+            parse_query("diff", &["diff", "a.com", "b.com"]),
+            Ok(Query::Diff(..))
+        ));
     }
 
     #[test]
-    fn follow_rejects_mistyped_record_type() {
-        // `follow example.com 5 MXX` previously ignored the typo and watched
-        // A records.
-        let err = parse_follow_args(&["example.com", "5", "MXX"]).expect_err("must error");
-        assert!(err.contains("MXX"), "error should name the input: {err}");
-        assert!(err.contains("valid types"), "got: {err}");
-    }
-
-    #[test]
-    fn follow_rejects_unknown_long_flag() {
-        let err =
-            parse_follow_args(&["example.com", "--chnages-only"]).expect_err("typo'd flag errors");
-        assert!(err.contains("--chnages-only"), "got: {err}");
-        assert!(err.contains("Usage: follow"), "got: {err}");
+    fn history_args_accept_a_domain_or_clear_and_reject_the_rest() {
+        assert_eq!(parse_history_args(&[]), Ok((None, false)));
+        assert_eq!(
+            parse_history_args(&["a.com"]),
+            Ok((Some("a.com".to_string()), false))
+        );
+        assert_eq!(parse_history_args(&["--clear"]), Ok((None, true)));
+        let err = parse_history_args(&["a.com", "b.com"]).expect_err("two domains");
+        assert!(err.starts_with("Unexpected argument: b.com"), "{err}");
+        let err = parse_history_args(&["--clera"]).expect_err("typo");
+        assert!(err.starts_with("Unknown option: --clera"), "{err}");
     }
 
     // ---------------- parse_query ----------------
@@ -645,15 +672,25 @@ mod tests {
             Ok(Query::Dig { ref types, server: Some(ref s), .. })
                 if types == &[RecordType::MX] && s == "1.1.1.1"
         ));
-        assert!(matches!(
-            parse_query("compare", &["compare", "example.com", "@8.8.8.8", "@1.1.1.1"]),
-            Ok(Query::Compare { ref server_a, ref server_b, .. })
-                if server_a == "8.8.8.8" && server_b == "1.1.1.1"
-        ));
+        // compare takes the CLI's positional form too (one grammar).
+        for line in [
+            &["compare", "example.com", "@8.8.8.8", "@1.1.1.1"][..],
+            &["compare", "example.com", "8.8.8.8", "1.1.1.1"],
+        ] {
+            assert!(matches!(
+                parse_query("compare", line),
+                Ok(Query::Compare { ref server_a, ref server_b, .. })
+                    if server_a == "8.8.8.8" && server_b == "1.1.1.1"
+            ));
+        }
         let err = parse_query("compare", &["compare", "example.com", "MX", "@8.8.8.8"])
             .err()
             .expect("one server");
-        assert!(err.starts_with("Need two nameservers"), "got: {err}");
+        assert!(
+            err.starts_with("compare needs two nameservers"),
+            "got: {err}"
+        );
+        assert!(err.ends_with(&catalog::usage("compare")), "got: {err}");
         assert!(matches!(
             parse_query("example.com", &["Example.COM"]),
             Ok(Query::Lookup(ref d)) if d == "Example.COM"

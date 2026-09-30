@@ -1,11 +1,12 @@
 ---
 source: seer-core/tests/format_snapshots.rs
+assertion_line: 780
 expression: human ().format_lookup (& fixture_lookup_rdap_with_contacts())
 ---
 
-[1;95mLookup: EXAMPLE.COM (via RDAP)[0m
+[1;95mLookup: example.com (via RDAP)[0m
 [37m──────────────────────────────[0m
-  [1;96mSource[0m: [1;92mRDAP (modern protocol)[0m
+  [1;96mSource[0m: [1;92mRDAP[0m
   [1;96mRegistrar[0m: [97mMock Registrar Inc.[0m
   [1;96mRegistrant[0m: [97mJane Registrant[0m
   [1;96mOrganization[0m: [97mExample Holdings LLC[0m

@@ -149,7 +149,7 @@ pub fn parse(raw: &str) -> CmdOutcome {
     if head == "history" || head == "bulk" {
         if parts.len() > 1 {
             let usage = if head == "history" {
-                "usage: history (in the pane: ↵ replay · c clear)"
+                "usage: history (in the pane: ↵ replay · c twice clears all)"
             } else {
                 "usage: bulk (in the pane: d domains · f file · r run)"
             };

@@ -44,7 +44,7 @@ pub fn render(
     let sel = if list.is_empty() {
         0
     } else {
-        state.sel.min(list.len() - 1)
+        state.sel_under(effective_filter).min(list.len() - 1)
     };
 
     // ── filter line ──────────────────────────────────────────────────────────

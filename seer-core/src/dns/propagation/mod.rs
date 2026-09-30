@@ -11,6 +11,7 @@ mod checker;
 mod servers;
 mod types;
 
+pub(super) use checker::read_reply;
 pub use checker::PropagationChecker;
 /// One server's result in a [`PropagationResult`] (named apart from the
 /// DNS comparison's own `ServerResult`).

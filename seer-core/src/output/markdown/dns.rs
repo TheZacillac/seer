@@ -66,7 +66,7 @@ impl MarkdownFormatter {
             String::new()
         } else {
             let joined = values.join(", ");
-            format!(" `{}`", MdSafe(&joined))
+            format!(" `{}`", MdCode(&joined))
         };
 
         let mut output = vec![format!(
@@ -83,13 +83,13 @@ impl MarkdownFormatter {
         for added in &iteration.added {
             output.push(format!(
                 "- Added: `{}`",
-                MdSafe(added.trim_end_matches('.'))
+                MdCode(added.trim_end_matches('.'))
             ));
         }
         for removed in &iteration.removed {
             output.push(format!(
                 "- Removed: `{}`",
-                MdSafe(removed.trim_end_matches('.'))
+                MdCode(removed.trim_end_matches('.'))
             ));
         }
 
@@ -122,7 +122,7 @@ impl MarkdownFormatter {
         // Reuse the shared duration formatter rather than re-deriving the
         // <60 / <3600 / else breakdown (kept identical to the human path).
         let duration = result.ended_at - result.started_at;
-        let duration_str = crate::output::human::format_duration(duration);
+        let duration_str = format_duration(duration);
         output.push(format!("- **Duration**: {}", duration_str));
 
         // Iteration details table
@@ -164,22 +164,18 @@ impl MarkdownFormatter {
         output.push(format!("## DNSSEC: {}", MdSafe(&report.domain)));
         output.push(String::new());
 
-        output.push(format!("- **Status**: `{}`", MdSafe(&report.status)));
-        output.push(format!(
-            "- **Chain Valid**: {}",
-            if report.chain_valid { "yes" } else { "no" }
-        ));
-        output.push(
-            "> Note: reflects DS/DNSKEY digest consistency only — RRSIG signatures, validity \
-             periods, and the chain to the root are NOT cryptographically verified."
-                .to_string(),
-        );
-        output.push(format!("- **Enabled**: {}", report.enabled));
-        output.push(format!("- **DS Records**: {}", report.ds_records.len()));
-        output.push(format!(
-            "- **DNSKEY Records**: {}",
-            report.dnskey_records.len()
-        ));
+        let (depth, note) = dnssec_depth(report.authentication_tier);
+        let mut b = Bullets(&mut output);
+        b.code("Status", &report.status);
+        b.raw("Chain Valid", if report.chain_valid { "yes" } else { "no" });
+        b.raw("Verification depth", depth);
+        b.raw("Enabled", report.enabled);
+        b.raw("DS Records", report.ds_records.len());
+        b.raw("DNSKEY Records", report.dnskey_records.len());
+        // A quote inside a list would end it; it follows the list instead.
+        if let Some(note) = note {
+            output.extend([String::new(), format!("> {note}")]);
+        }
 
         if !report.ds_records.is_empty() {
             output.push(String::new());
@@ -244,11 +240,7 @@ impl MarkdownFormatter {
     }
 
     pub(super) fn format_dns_comparison(&self, comparison: &crate::dns::DnsComparison) -> String {
-        let result = if comparison.matches {
-            "**Result**: Records match"
-        } else {
-            "**Result**: Records differ"
-        };
+        let result = format!("**Result**: {}", comparison.summary());
         let mut output = vec![
             format!(
                 "## DNS Comparison: {} {}",
@@ -256,7 +248,7 @@ impl MarkdownFormatter {
                 comparison.record_type
             ),
             String::new(),
-            result.to_string(),
+            result,
             String::new(),
         ];
 
@@ -268,13 +260,29 @@ impl MarkdownFormatter {
             output.push(String::new());
             if let Some(ref err) = server.error {
                 output.push(format!("**Error**: {}", MdSafe(err)));
-            } else if server.records.is_empty() {
+                output.push(String::new());
+                continue;
+            }
+            if let Some(status) = server.status_label() {
+                output.push(format!("**Status**: {status}"));
+                output.push(String::new());
+            }
+            if !server.cname_chain.is_empty() {
+                let hops: Vec<String> = server
+                    .cname_chain
+                    .iter()
+                    .map(|hop| format!("{} → {}", hop.name, hop.format_short()))
+                    .collect();
+                output.push(format!("**CNAME chain**: {}", code_list(&hops)));
+                output.push(String::new());
+            }
+            if server.records.is_empty() {
                 output.push("*No records found*".to_string());
             } else {
                 output.push("| Record |".to_string());
                 output.push("| --- |".to_string());
                 for record in &server.records {
-                    output.push(format!("| `{}` |", MdSafe(&record.format_short())));
+                    output.push(format!("| `{}` |", MdCodeCell(&record.format_short())));
                 }
             }
             output.push(String::new());
@@ -359,7 +367,7 @@ mod tests {
             ended_at: ended,
         };
 
-        let expected = crate::output::human::format_duration(ended - started);
+        let expected = format_duration(ended - started);
         assert_eq!(expected, "2m 5s", "sanity: shared formatter output");
 
         let out = MarkdownFormatter::new().format_follow(&result);
@@ -395,7 +403,8 @@ mod tests {
         assert!(out.contains("(**CHANGED**) `5.6.7.8`"), "got:\n{out}");
         assert!(out.contains("\n- Added: `5.6.7.8`"), "got:\n{out}");
         assert!(out.contains("\n- Removed: `1.2.3.4`"), "got:\n{out}");
-        // Change values are attacker-controlled record data: MdSafe applies.
-        assert!(out.contains("\n- Removed: `evil'\\|x`"), "got:\n{out}");
+        // Change values are attacker-controlled record data, escaped for a
+        // code span: the backtick is neutralized, a pipe is harmless there.
+        assert!(out.contains("\n- Removed: `evil'|x`"), "got:\n{out}");
     }
 }

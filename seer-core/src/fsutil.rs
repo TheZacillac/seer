@@ -3,12 +3,14 @@
 //!
 //! One envelope, three callers (each wired up by [`persisted_store!`]):
 //! create the parent dir owner-only, write the serialized content to a
-//! per-call-unique sibling temp file, restrict the temp file to owner-only,
+//! per-call-unique sibling temp file created owner-only, flush it to disk,
 //! then `rename` over the target (atomic on POSIX, so a reader never sees a
-//! torn file). Extracted after the per-call-unique temp-name fix had to be
-//! applied to multiple hand-copied versions of this routine — each store
-//! picks its file and codec, the envelope lives here.
+//! torn file) and flush the directory entry. Extracted after the
+//! per-call-unique temp-name fix had to be applied to multiple hand-copied
+//! versions of this routine — each store picks its file and codec, the
+//! envelope lives here.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::error::{Result, SeerError};
@@ -22,9 +24,11 @@ use crate::error::{Result, SeerError};
 /// crate::fsutil::persisted_store!(LookupHistory, "history.json", json, "history");
 /// ```
 ///
-/// `load` returns the default store when the file is missing or unreadable,
-/// moving an unreadable file to a backup first ([`load_or_back_up`]) so the
-/// next `save` cannot destroy the user's data. `save` publishes through
+/// `load` returns the default store when the file is missing or corrupt
+/// (unparseable or not UTF-8), moving a corrupt file to a backup first
+/// ([`load_or_back_up`]) so the next `save` cannot destroy the user's data;
+/// any other read failure (permission denied, a directory in the way) is an
+/// error and leaves the file alone. `save` publishes through
 /// [`write_atomic_owner_only`], so a crash mid-write can never leave the store
 /// truncated. The load → mutate → save cycle is *not* cross-process locked:
 /// two concurrent writers are last-writer-wins (one side's change can be
@@ -45,17 +49,23 @@ macro_rules! persisted_store {
             }
 
             /// Loads the store from disk, returning an empty store when the file
-            /// is missing or unreadable (an unreadable file is backed up first).
-            pub fn load() -> Self {
+            /// is missing or corrupt (a corrupt file is backed up first).
+            ///
+            /// # Errors
+            ///
+            /// A read failure other than a missing file (permission denied, a
+            /// directory at the path, an I/O error): the file is left in place,
+            /// and callers must not save over what they could not read.
+            pub fn load() -> $crate::error::Result<Self> {
                 match Self::path() {
                     Some(path) => Self::load_from_path(&path),
-                    None => Self::default(),
+                    None => Ok(Self::default()),
                 }
             }
 
             /// [`Self::load`] from an explicit path — a test seam that avoids
             /// touching the real `~/.seer`.
-            pub(crate) fn load_from_path(path: &std::path::Path) -> Self {
+            pub(crate) fn load_from_path(path: &std::path::Path) -> $crate::error::Result<Self> {
                 $crate::fsutil::load_or_back_up(path, $what, |content| {
                     $codec::from_str(content).map_err(|e| e.to_string())
                 })
@@ -86,12 +96,17 @@ pub(crate) use persisted_store;
 ///
 /// `tmp_ext` is the target's extension (`"json"` / `"toml"`), kept in the
 /// temp-file name so stray temps remain recognizable next to their store.
-/// The parent directory is created `0o700` and the temp file is `chmod`ed
-/// `0o600` *before* the rename, so the published file is never briefly
-/// world-readable (the stores hold sensitive reconnaissance metadata).
+/// The parent directory is created `0o700` and the temp file is *created*
+/// `0o600` (never briefly world-readable — the stores hold sensitive
+/// reconnaissance metadata). The temp's data is flushed to disk before the
+/// rename, so a crash cannot publish an empty or partial file under the
+/// target name, and on Unix the directory is flushed after it, so the rename
+/// itself survives a crash.
 pub(crate) fn write_atomic_owner_only(path: &Path, content: &str, tmp_ext: &str) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| SeerError::ConfigError(e.to_string()))?;
+    let io_err = |e: std::io::Error| SeerError::ConfigError(format!("{}: {e}", path.display()));
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+    if let Some(parent) = parent {
+        std::fs::create_dir_all(parent).map_err(io_err)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -99,45 +114,70 @@ pub(crate) fn write_atomic_owner_only(path: &Path, content: &str, tmp_ext: &str)
         }
     }
     let tmp_path = unique_tmp_path(path, tmp_ext);
-    std::fs::write(&tmp_path, content).map_err(|e| {
+    let write_tmp = || -> std::io::Result<()> {
+        // A leftover from a crashed process that had the same PID would make
+        // `create_new` fail; it is ours to replace.
+        let _ = std::fs::remove_file(&tmp_path);
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&tmp_path)?;
+        file.write_all(content.as_bytes())?;
+        file.sync_all()
+    };
+    if let Err(e) = write_tmp().and_then(|()| std::fs::rename(&tmp_path, path)) {
         // A failed (e.g. ENOSPC, partially written) temp must not be left
         // behind: each failed save would otherwise orphan a new unique file.
         let _ = std::fs::remove_file(&tmp_path);
-        SeerError::ConfigError(e.to_string())
-    })?;
+        return Err(io_err(e));
+    }
+    // Persist the rename (best-effort: the data is already safe on disk).
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600));
+        if let Some(dir) = parent.and_then(|p| std::fs::File::open(p).ok()) {
+            let _ = dir.sync_all();
+        }
     }
-    std::fs::rename(&tmp_path, path).map_err(|e| {
-        // Best-effort temp cleanup; surface the original rename error.
-        let _ = std::fs::remove_file(&tmp_path);
-        SeerError::ConfigError(e.to_string())
-    })?;
     Ok(())
 }
 
 /// Loads a `~/.seer` store, never letting unreadable data be overwritten.
 ///
-/// A missing file yields `T::default()`. Anything else that fails — a parse
-/// error, but also a read error such as invalid UTF-8 from a stray byte or a
-/// Latin-1 editor — moves the file to a backup (`<name>.corrupt`, or a
-/// timestamped variant when that already exists, so a second corruption never
-/// destroys the first backup) before returning the default. Without the
-/// backup the caller's next `save` would silently replace the user's data.
+/// A missing file yields `T::default()`. Corrupt content — a parse error, or
+/// invalid UTF-8 from a stray byte or a Latin-1 editor — moves the file to a
+/// backup (`<name>.corrupt`, or a timestamped variant when that already
+/// exists, so a second corruption never destroys the first backup) before
+/// returning the default. Without the backup the caller's next `save` would
+/// silently replace the user's data.
+///
+/// Any other read failure (permission denied, a directory at the path, an I/O
+/// error) says nothing about the content, so the file is left where it is
+/// and the failure is returned: backing it up and defaulting would lose a
+/// healthy store to a transient or fixable problem.
 pub(crate) fn load_or_back_up<T: Default>(
     path: &Path,
     what: &str,
     parse: impl FnOnce(&str) -> std::result::Result<T, String>,
-) -> T {
-    let failure = match std::fs::read_to_string(path) {
-        Ok(content) => match parse(&content) {
-            Ok(value) => return value,
-            Err(e) => e,
+) -> Result<T> {
+    let failure = match std::fs::read(path) {
+        Ok(bytes) => match std::str::from_utf8(&bytes) {
+            Ok(content) => match parse(content) {
+                Ok(value) => return Ok(value),
+                Err(e) => e,
+            },
+            Err(e) => format!("not valid UTF-8: {e}"),
         },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return T::default(),
-        Err(e) => e.to_string(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(T::default()),
+        Err(e) => {
+            return Err(SeerError::ConfigError(format!(
+                "cannot read {what} file {}: {e}",
+                path.display()
+            )))
+        }
     };
 
     let backup = backup_path(path);
@@ -154,7 +194,7 @@ pub(crate) fn load_or_back_up<T: Default>(
             "failed to back up unreadable {what}",
         ),
     }
-    T::default()
+    Ok(T::default())
 }
 
 /// `<path>.corrupt`, or `<path>.corrupt.<unix-seconds>[.<n>]` when a previous
@@ -209,14 +249,14 @@ mod tests {
         // Invalid UTF-8 is a *read* error, not a parse error — it used to
         // skip the backup entirely and the next save overwrote the data.
         std::fs::write(&path, [0xff, 0xfe, b'x']).unwrap();
-        assert!(load_or_back_up(&path, "test", parse).is_empty());
+        assert!(load_or_back_up(&path, "test", parse).unwrap().is_empty());
         assert!(!path.exists());
         let first = path.with_extension("corrupt");
         assert_eq!(std::fs::read(&first).unwrap(), vec![0xff, 0xfe, b'x']);
 
         // A second corruption gets its own backup.
         std::fs::write(&path, "garbage").unwrap();
-        assert!(load_or_back_up(&path, "test", parse).is_empty());
+        assert!(load_or_back_up(&path, "test", parse).unwrap().is_empty());
         assert_eq!(std::fs::read(&first).unwrap(), vec![0xff, 0xfe, b'x']);
         let backups = std::fs::read_dir(&dir.0)
             .unwrap()
@@ -231,9 +271,47 @@ mod tests {
         assert_eq!(backups, 2);
 
         // Missing → default; readable + valid → parsed.
-        assert!(load_or_back_up(&dir.0.join("missing.json"), "test", parse).is_empty());
+        assert!(load_or_back_up(&dir.0.join("missing.json"), "test", parse)
+            .unwrap()
+            .is_empty());
         std::fs::write(&path, "ok").unwrap();
-        assert_eq!(load_or_back_up(&path, "test", parse), vec![1]);
+        assert_eq!(load_or_back_up(&path, "test", parse).unwrap(), vec![1]);
+    }
+
+    /// Regression: any read error other than NotFound (EACCES, EISDIR) was
+    /// treated as corruption and the path moved aside; the next save then
+    /// replaced a healthy store. Such errors now propagate and touch nothing.
+    #[test]
+    fn a_read_error_is_returned_and_the_path_left_alone() {
+        let dir = TmpDir::new("readerr");
+        let path = dir.0.join("store.json");
+        // A directory where the store should be: read fails with EISDIR.
+        std::fs::create_dir_all(&path).unwrap();
+        let parse = |_: &str| -> std::result::Result<Vec<u8>, String> { Ok(vec![1]) };
+        let err = load_or_back_up(&path, "test", parse).expect_err("read error surfaces");
+        assert!(err.to_string().contains("cannot read test file"), "{err}");
+        assert!(path.is_dir(), "the path must not be moved aside");
+        assert!(!path.with_extension("corrupt").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_permission_denied_store_is_not_backed_up() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TmpDir::new("eacces");
+        std::fs::create_dir_all(&dir.0).unwrap();
+        let path = dir.0.join("store.json");
+        std::fs::write(&path, "ok").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let parse = |_: &str| -> std::result::Result<Vec<u8>, String> { Ok(vec![1]) };
+        let result = load_or_back_up(&path, "test", parse);
+        // Root reads through 0o000; only assert when the read was refused.
+        if std::fs::read(&path).is_err() {
+            assert!(result.is_err());
+            assert!(path.exists());
+            assert!(!path.with_extension("corrupt").exists());
+        }
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
     }
 
     /// Unique scratch dir per test invocation, removed on drop.

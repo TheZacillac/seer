@@ -1,0 +1,22 @@
+---
+source: seer-core/tests/format_snapshots.rs
+assertion_line: 301
+expression: human ().format_status (& fixture_status_expiring_soon())
+---
+
+[1;95mStatus: example.com[0m
+[37m───────────────────[0m
+  [1;96mHTTP Status[0m: [1;92m200 (OK)[0m
+  [1;96mSite Title[0m: [97mExample Domain[0m
+
+  [1;96mSSL Certificate[0m:
+    [1;96mSubject[0m: [97mCN=example.com[0m
+    [1;96mIssuer[0m: [97mCN=Mock CA[0m
+    [1;96mStatus[0m: [1;91mInvalid[0m
+    [1;96mValid From[0m: [97m2025-01-01[0m
+    [1;96mExpires[0m: [1;91m2026-01-01 (expired [N] days ago)[0m
+
+  [1;96mDomain Registration[0m:
+    [1;96mExpires[0m: [1;91m2026-10-10 (expires in [N] days)[0m
+
+  [1;96mDNS Resolution[0m: [1;93mCheck failed[0m

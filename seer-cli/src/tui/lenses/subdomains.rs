@@ -4,6 +4,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Row, Table};
 use ratatui::Frame;
+use seer_core::output::sanitize_line;
 
 use crate::tui::action::LensData;
 use crate::tui::theme::Theme;
@@ -39,10 +40,9 @@ pub fn render(
 
     let header = Row::new(["HOST"]).style(Style::default().fg(theme.overlay0));
 
-    let rows =
-        s.subdomains.iter().enumerate().map(|(i, host)| {
-            Row::new(vec![host.clone()]).style(row_style(theme, focused && i == sel))
-        });
+    let rows = s.subdomains.iter().enumerate().map(|(i, host)| {
+        Row::new(vec![sanitize_line(host)]).style(row_style(theme, focused && i == sel))
+    });
 
     let table = Table::new(rows, [Constraint::Percentage(100)])
         .header(header)
@@ -65,6 +65,7 @@ mod tests {
             subdomains: vec!["www.example.com".into(), "api.example.com".into()],
             source: "crt.sh".into(),
             count: 2,
+            truncated: false,
         }));
         let text = render_text(70, 10, |f| render(f, f.area(), &theme, &data, false, 0));
         assert!(text.contains("www.example.com"));
@@ -79,6 +80,7 @@ mod tests {
             subdomains: hosts,
             source: "crt.sh".into(),
             count: 60,
+            truncated: false,
         }));
         // Short terminal can't fit 60 rows; without scrolling the last host
         // would never render even when selected.
@@ -97,6 +99,7 @@ mod tests {
             subdomains: vec![],
             source: "crt.sh".into(),
             count: 0,
+            truncated: false,
         }));
         let text = render_text(60, 6, |f| render(f, f.area(), &theme, &data, false, 0));
         assert!(text.contains("no subdomains found"));

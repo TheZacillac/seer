@@ -32,7 +32,7 @@ async def propagation_check(
 
     Args:
         domain: Domain name to check
-        record_type: Record type to check (default: A)
+        record_type: Record type to check (A, AAAA, MX, TXT, ...)
 
     Returns:
         Propagation result with percentage and per-server results
@@ -44,7 +44,7 @@ async def propagation_check(
 
 
 @router.post("/bulk")
-@limiter.limit(HEAVY_LIMIT)
+@limiter.shared_limit(HEAVY_LIMIT, scope="bulk_propagation")
 async def bulk_propagation_check(request: Request, body: BulkPropagationRequest):
     """
     Check DNS propagation for multiple domains.
@@ -62,7 +62,7 @@ async def bulk_propagation_check(request: Request, body: BulkPropagationRequest)
 
 
 @router.post("/bulk/stream")
-@limiter.limit(HEAVY_LIMIT)
+@limiter.shared_limit(HEAVY_LIMIT, scope="bulk_propagation")
 async def bulk_propagation_stream(request: Request, body: BulkPropagationRequest):
     """Stream bulk DNS-propagation checks as Server-Sent Events."""
     return await as_http(

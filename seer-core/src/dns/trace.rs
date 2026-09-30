@@ -18,7 +18,9 @@
 //! 3. A referral — NOERROR, AA clear, no answer, no SOA, NS records in
 //!    AUTHORITY — names the next zone, which must lie strictly below the
 //!    current zone and at or above the query name (bailiwick); an upward or
-//!    sideways referral stops the walk with an error. The next servers'
+//!    sideways referral is unusable, like a lame reply: it is noted and the
+//!    zone's next server asked, and only when no server of the zone does
+//!    better does the walk stop with an error. The next servers'
 //!    addresses are the referral's glue: ADDITIONAL A/AAAA records for the
 //!    NS names, trusted only for names inside the current zone, as a
 //!    resolver would. Glueless NS names are resolved through the recursive
@@ -90,10 +92,8 @@ use super::query::{duration_ms, DnsStatus};
 use super::records::{DnsRecord, RecordType};
 use super::resolver::{fqdn, prepare_query, to_dns_record, wire_query_name, wire_type};
 use super::transport::{transport_reason, Transport};
+use super::DEFAULT_DNS_TIMEOUT;
 use crate::error::{Result, SeerError};
-
-/// Default per-query timeout, matching the DNS resolver default.
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Most delegation levels walked (root included) before giving up. Real
 /// names resolve in 3–5; the bound matters only for pathological chains.
@@ -155,7 +155,7 @@ pub struct TraceHop {
     pub authoritative: bool,
     /// The zone the server delegated to — the next hop's `zone` — or `None`
     /// when it did not refer onward. A referral the walk refused (upward or
-    /// sideways) is recorded here too, and the trace stops with an error.
+    /// sideways) is recorded here too when it ends the trace, with an error.
     pub referral_zone: Option<String>,
     /// The NS names delegated to, sorted; empty when there is no referral.
     pub referral: Vec<String>,
@@ -212,8 +212,8 @@ pub struct DnsTrace {
     /// code is about the chain's last name (RFC 6604 §2).
     pub answers: Vec<DnsRecord>,
     /// Why the walk stopped before a final response, if it did: every server
-    /// of a zone failed, a server referred upward or sideways, the chain was
-    /// too long, or the walk ran out of time.
+    /// of a zone failed (a referral upward or sideways counts as a failure),
+    /// the chain was too long, or the walk ran out of time.
     pub error: Option<String>,
 }
 
@@ -269,9 +269,9 @@ impl DnsTracer {
     /// DNS for glueless nameserver lookups).
     pub fn new() -> Self {
         Self {
-            timeout: DEFAULT_TIMEOUT,
-            transport: Transport::new(DEFAULT_TIMEOUT),
-            recursive: build_recursive_resolver(DEFAULT_TIMEOUT, None),
+            timeout: DEFAULT_DNS_TIMEOUT,
+            transport: Transport::new(DEFAULT_DNS_TIMEOUT),
+            recursive: build_recursive_resolver(DEFAULT_DNS_TIMEOUT, None),
             #[cfg(test)]
             recursive_upstream: None,
             #[cfg(test)]
@@ -428,9 +428,10 @@ impl DnsTracer {
     /// or the walk fails. A server that does not respond, returns an error
     /// RCODE or gives a lame server's empty non-authoritative reply is passed
     /// over for the zone's next one. A referral must lead toward `name`; an
-    /// upward or sideways one stops the walk. Server addresses come from the
-    /// root hints, the referral's glue, or a recursive lookup for glueless
-    /// nameservers, and each one is refused when it is private or reserved.
+    /// upward or sideways one is passed over the same way. Server addresses
+    /// come from the root hints, the referral's glue, or a recursive lookup
+    /// for glueless nameservers, and each one is refused when it is private
+    /// or reserved.
     /// Up to 16 delegation levels are walked and up to 3 servers asked per
     /// level, each query and glueless lookup under the configured DNS
     /// timeout, and the whole walk under six times that timeout: a walk that
@@ -478,7 +479,7 @@ impl DnsTracer {
                 error = Some(why);
                 break;
             };
-            let (mut hop, step) = match outcome {
+            let (hop, step) = match outcome {
                 LevelOutcome::Answered { hop, step } => (hop, step),
                 LevelOutcome::Failed { final_hop, reason } => {
                     let why = format!(
@@ -501,6 +502,7 @@ impl DnsTracer {
                 }
             };
 
+            // `ask_level` accepts only a referral inside the bailiwick.
             let referral = match step {
                 Step::Final => {
                     hops.push(hop);
@@ -508,24 +510,6 @@ impl DnsTracer {
                 }
                 Step::Referral(referral) => referral,
             };
-            hop.referral_zone = Some(name_text(&referral.zone));
-            hop.referral = referral
-                .servers
-                .iter()
-                .map(|s| name_text(&s.host))
-                .collect();
-            if let Err(fault) = check_bailiwick(&zone, &referral.zone, &qname) {
-                error = Some(format!(
-                    "{} ({}) referred {} from {} to {} — stopped",
-                    hop.server,
-                    hop.address,
-                    fault,
-                    hop.zone,
-                    name_text(&referral.zone)
-                ));
-                hops.push(hop);
-                break;
-            }
             hops.push(hop);
             if hops.len() >= MAX_HOPS {
                 error = Some(format!(
@@ -600,16 +584,38 @@ impl DnsTracer {
             match result {
                 Ok(response) => {
                     let mut hop = hop_from_response(zone, &host, ip, elapsed, &response);
-                    match classify_response(&response, zone) {
+                    let reason = match classify_response(&response, zone) {
+                        Ok(Step::Referral(referral)) => {
+                            hop.referral_zone = Some(name_text(&referral.zone));
+                            hop.referral = referral
+                                .servers
+                                .iter()
+                                .map(|s| name_text(&s.host))
+                                .collect();
+                            // A referral off the path to the name — one lame
+                            // server's upward or sideways pointer — is as
+                            // unusable as a lame reply: the next server of
+                            // the zone may still refer correctly.
+                            match check_bailiwick(zone, &referral.zone, qname) {
+                                Ok(()) => {
+                                    hop.failed_servers = failures;
+                                    let step = Step::Referral(referral);
+                                    return LevelOutcome::Answered { hop, step };
+                                }
+                                Err(fault) => format!(
+                                    "referred {fault} to {} (not toward the name)",
+                                    name_text(&referral.zone)
+                                ),
+                            }
+                        }
                         Ok(step) => {
                             hop.failed_servers = failures;
                             return LevelOutcome::Answered { hop, step };
                         }
-                        Err(reason) => {
-                            unusable_hop = Some((hop, failures.len()));
-                            failures.push(server_note(&host, ip, &reason));
-                        }
-                    }
+                        Err(reason) => reason,
+                    };
+                    unusable_hop = Some((hop, failures.len()));
+                    failures.push(server_note(&host, ip, &reason));
                 }
                 Err(e) => failures.push(server_note(&host, ip, &transport_reason(&e))),
             }
@@ -687,7 +693,9 @@ impl DnsTracer {
         if usable.is_empty() && notes.is_empty() {
             notes.push(format!("{text}: glueless nameserver has no address"));
         }
-        (ipv4_first(usable), notes)
+        let mut usable = usable;
+        crate::net::ipv4_first(&mut usable, |ip| *ip);
+        (usable, notes)
     }
 
     /// Sends one non-recursive query to `ip` and returns the response as the
@@ -840,7 +848,9 @@ fn plan_servers(servers: &[NsCandidate], allow_private: bool) -> (Vec<ServerPick
                 .map(|(ip, reason)| server_note(&server.host, *ip, &format!("refused, {reason}"))),
         );
         if !usable.is_empty() {
-            picks.push(ServerPick::Addrs(server.host.clone(), ipv4_first(usable)));
+            let mut usable = usable;
+            crate::net::ipv4_first(&mut usable, |ip| *ip);
+            picks.push(ServerPick::Addrs(server.host.clone(), usable));
         }
     }
     picks.extend(glueless);
@@ -971,15 +981,6 @@ fn hop_from_response(
 /// A `failed_servers` entry: `"host (ip): reason"`.
 fn server_note(host: &Name, ip: IpAddr, reason: &str) -> String {
     format!("{} ({}): {}", name_text(host), ip, reason)
-}
-
-/// Orders a server's vetted addresses for querying: IPv4 first — gTLD
-/// servers commonly list AAAA first, and IPv6 is unroutable on many hosts —
-/// then IPv6, each family in the order given. A later address is tried only
-/// when this host has no route to the earlier ones.
-fn ipv4_first(mut addrs: Vec<IpAddr>) -> Vec<IpAddr> {
-    addrs.sort_by_key(IpAddr::is_ipv6);
-    addrs
 }
 
 /// True when an exchange failed before its query left this host: the
@@ -1961,9 +1962,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upward_referral_stops_the_walk() {
+    async fn upward_referral_from_every_server_stops_the_walk() {
         let root = spawn_mock_dns_fn(|_, _| delegation("test", &["ns1.nic.test"])).await;
-        // A lame TLD server sends the resolver back to the root.
+        // The zone's only server is lame and sends the resolver back to the root.
         let tld = spawn_mock_dns_fn(|_, _| delegation(".", &["a.root.test"])).await;
         let trace = tracer(
             &["a.root.test"],
@@ -1979,6 +1980,49 @@ mod tests {
         assert!(trace.answers.is_empty());
         let error = trace.error.expect("an upward referral is an error");
         assert!(error.contains("upward"), "{error}");
+        assert!(error.contains("ns1.nic.test."), "{error}");
+    }
+
+    /// Regression: one lame server's upward referral ended the trace,
+    /// although the zone's next server would have referred correctly. It
+    /// is passed over like any other unusable reply.
+    #[tokio::test]
+    async fn upward_referral_from_a_lame_server_asks_the_next() {
+        let root =
+            spawn_mock_dns_fn(|_, _| delegation("test", &["ns1.nic.test", "ns2.nic.test"])).await;
+        let lame = spawn_mock_dns_fn(|_, _| delegation(".", &["a.root.test"])).await;
+        let healthy =
+            spawn_mock_dns_fn(|_, _| delegation("example.test", &["ns1.example.test"])).await;
+        let auth =
+            spawn_mock_dns_fn(|_, _| MockReply::AuthoritativeAnswer(vec![a_rdata([192, 0, 2, 1])]))
+                .await;
+        let trace = tracer(
+            &["a.root.test"],
+            &[
+                ("a.root.test", root),
+                ("ns1.nic.test", lame),
+                ("ns2.nic.test", healthy),
+                ("ns1.example.test", auth),
+            ],
+        )
+        .trace("www.example.test", RecordType::A)
+        .await
+        .unwrap();
+
+        assert!(trace.error.is_none(), "{:?}", trace.error);
+        assert_eq!(trace.hops.len(), 3);
+        let tld_hop = &trace.hops[1];
+        assert_eq!(tld_hop.server, "ns2.nic.test.");
+        assert_eq!(tld_hop.referral_zone.as_deref(), Some("example.test."));
+        assert!(
+            tld_hop
+                .failed_servers
+                .iter()
+                .any(|f| f.starts_with("ns1.nic.test.") && f.contains("referred upward")),
+            "{:?}",
+            tld_hop.failed_servers
+        );
+        assert_eq!(trace.answers.len(), 1);
     }
 
     #[tokio::test]
@@ -2138,8 +2182,8 @@ mod tests {
             delegation("example.test", &["ns1.example.test", "ns2.example.test"])
         })
         .await;
-        let refused = spawn_mock_dns_fn(|_, _| MockReply::Refused).await;
-        let servfail = spawn_mock_dns_fn(|_, _| MockReply::ServFail).await;
+        let refused = spawn_mock_dns_fn(|_, _| MockReply::Rcode(ResponseCode::Refused)).await;
+        let servfail = spawn_mock_dns_fn(|_, _| MockReply::Rcode(ResponseCode::ServFail)).await;
         let trace = tracer(
             &["a.root.test"],
             &[

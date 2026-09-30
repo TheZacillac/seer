@@ -1,173 +1,169 @@
 //! Async data layer: run a parameterized `FetchReq` against seer-core.
-//! The only module coupled to seer-core's network clients.
+//!
+//! Every request with a command equivalent becomes a [`Query`] and runs
+//! through [`query::run`] — the single-shot pipeline the CLI and the REPL
+//! share — over the one [`Clients`] set `run_loop` keeps for the session, so
+//! a lens shows exactly what the command prints (and a lookup records its
+//! history there, once). Watch and History are views of the local stores
+//! with no single-shot command (the CLI's `watch`/`history` run outside the
+//! pipeline too), so they read their stores here.
 
-use seer_core::RecordType;
+use seer_core::{RecordType, SeerConfig};
 
+use crate::query::{self, Clients, Query};
 use crate::tui::action::{FetchReq, LensData};
 
-fn e(e: seer_core::SeerError) -> String {
-    e.to_string()
+/// Runs `req`. `clients` and `config` come from `~/.seer/config.toml`, so the
+/// TUI honors the same timeouts, nameserver and concurrency as the CLI.
+pub async fn fetch(
+    req: FetchReq,
+    clients: &Clients,
+    config: &SeerConfig,
+) -> Result<LensData, String> {
+    match to_query(req) {
+        Ok(query) => {
+            let outcome = query::run(query, clients, config, false)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(outcome.payload)
+        }
+        Err(Store::Watch) => watchlist(config).await,
+        Err(Store::History) => history().await,
+    }
 }
 
-/// Runs `req`, building every client from `config` (`~/.seer/config.toml`)
-/// so the TUI honors the same timeouts, nameserver, and concurrency as the
-/// CLI subcommands and the REPL.
-pub async fn fetch(req: FetchReq, config: &seer_core::SeerConfig) -> Result<LensData, String> {
-    match req {
-        FetchReq::Overview(d) => {
-            let r = seer_core::SmartLookup::from_config(config)
-                .lookup(&d)
-                .await
-                .map_err(e)?;
-            // Record to history like the CLI/REPL lookup, but detached (not
-            // awaited): the Overview renders immediately; the save lands a
-            // beat later.
-            let result = r.clone();
-            tokio::spawn(async move { crate::ops::record_lookup_history(&d, result).await });
-            Ok(LensData::Overview(Box::new(r)))
-        }
-        FetchReq::Whois(d) => seer_core::WhoisClient::from_config(config)
-            .lookup(&d)
-            .await
-            .map(|r| LensData::Whois(Box::new(r)))
-            .map_err(e),
-        FetchReq::RdapDomain(d) => seer_core::RdapClient::from_config(config)
-            .lookup_domain(&d)
-            .await
-            .map(|r| LensData::Rdap(Box::new(r)))
-            .map_err(e),
-        FetchReq::RdapIp(ip) => seer_core::RdapClient::from_config(config)
-            .lookup_ip(&ip)
-            .await
-            .map(|r| LensData::Rdap(Box::new(r)))
-            .map_err(e),
-        FetchReq::RdapAsn(asn) => seer_core::RdapClient::from_config(config)
-            .lookup_asn(asn)
-            .await
-            .map(|r| LensData::Rdap(Box::new(r)))
-            .map_err(e),
+/// A lens request with no single-shot command: a local-store view.
+#[derive(Debug, PartialEq, Eq)]
+enum Store {
+    Watch,
+    History,
+}
+
+/// The single-shot command a lens request runs, or the store it views.
+fn to_query(req: FetchReq) -> Result<Query, Store> {
+    Ok(match req {
+        // `lookup` records the result to history, as the CLI does.
+        FetchReq::Overview(d) => Query::Lookup(d),
+        FetchReq::Whois(d) => Query::Whois(d),
+        // One RDAP command: `auto_lookup` routes an IP, `AS<n>` or domain
+        // exactly as `rdap_command` picked the lens tab.
+        FetchReq::RdapDomain(q) | FetchReq::RdapIp(q) => Query::Rdap(q),
+        FetchReq::RdapAsn(asn) => Query::Rdap(format!("AS{asn}")),
+        // An explicit nameserver wins; otherwise the configured one, like `dig`.
         FetchReq::Dns {
             domain,
             record_type,
             nameserver,
-        } => seer_core::DnsResolver::from_config(config)
-            // An explicit nameserver wins; otherwise the configured one, like `dig`.
-            // NXDOMAIN, NODATA and SERVFAIL are results the lens renders;
-            // invalid input, a refused nameserver or a transport failure is
-            // an error.
-            .query(
-                &domain,
-                record_type,
-                nameserver.as_deref().or(config.nameserver.as_deref()),
-            )
-            .await
-            .map(|r| LensData::Dig(Box::new(r)))
-            .map_err(e),
-        FetchReq::Dnssec(d) => seer_core::DnssecChecker::new()
-            .check(&d)
-            .await
-            .map(|r| LensData::Dnssec(Box::new(r)))
-            .map_err(e),
+        } => Query::Dig {
+            name: domain,
+            types: vec![record_type],
+            server: nameserver,
+            short: false,
+        },
+        FetchReq::Dnssec(d) => Query::Dnssec(d),
         FetchReq::Compare {
             domain,
             record_type,
             a,
             b,
-        } => seer_core::dns::DnsComparator::new()
-            .compare(&domain, record_type, &a, &b)
-            .await
-            .map(|r| LensData::Compare(Box::new(r)))
-            .map_err(e),
-        // The walk starts at the root servers, so no nameserver applies —
-        // not even the configured one (`seer dig +trace` ignores it too).
+        } => Query::Compare {
+            domain,
+            record_type,
+            server_a: a,
+            server_b: b,
+        },
         FetchReq::Trace {
             domain,
             record_type,
-        } => seer_core::DnsTracer::from_config(config)
-            .trace(&domain, record_type)
-            .await
-            .map(|t| LensData::Trace(Box::new(t)))
-            .map_err(e),
-        FetchReq::Ssl(d) => seer_core::SslChecker::from_config(config)
-            .check(&d)
-            .await
-            .map(|r| LensData::Ssl(Box::new(r)))
-            .map_err(e),
-        FetchReq::Status(d) => seer_core::StatusClient::from_config(config)
-            .check(&d)
-            .await
-            .map(|r| LensData::Status(Box::new(r)))
-            .map_err(e),
-        FetchReq::Prop(d) => seer_core::dns::PropagationChecker::new()
-            .check(&d, RecordType::A)
-            .await
-            .map(|r| LensData::Prop(Box::new(r)))
-            .map_err(e),
-        FetchReq::Reverse(ip) => seer_core::DnsResolver::from_config(config)
-            .resolve(&ip, RecordType::PTR, config.nameserver.as_deref())
-            .await
-            .map(LensData::Reverse)
-            .map_err(e),
-        FetchReq::Avail(d) => seer_core::AvailabilityChecker::from_config(config)
-            .check(&d)
-            .await
-            .map(|r| LensData::Avail(Box::new(r)))
-            .map_err(e),
-        // lookup_tld is async + infallible.
-        FetchReq::Tld(t) => Ok(LensData::Tld(Box::new(seer_core::lookup_tld(&t).await))),
-        FetchReq::Diff { a, b } => seer_core::DomainDiffer::new()
-            .diff(&a, &b)
-            .await
-            .map(|r| LensData::Diff(Box::new(r)))
-            .map_err(e),
-        FetchReq::Watch => {
-            // Watchlist load is blocking file I/O — offload it so the TUI's
-            // async select! loop keeps servicing other in-flight lookups
-            // (mirrors the History path below).
-            let wl = tokio::task::spawn_blocking(seer_core::Watchlist::load)
-                .await
-                .map_err(|err| err.to_string())?;
-            Ok(LensData::Watch(Box::new(
-                seer_core::check_watchlist_with_config(&wl.domains, config).await,
-            )))
-        }
-        FetchReq::History => {
-            let h = tokio::task::spawn_blocking(seer_core::LookupHistory::load)
-                .await
-                .map_err(|err| err.to_string())?;
-            let mut flat: Vec<seer_core::HistoryEntry> =
-                h.entries.into_values().flatten().collect();
-            flat.sort_by_key(|e| std::cmp::Reverse(e.timestamp));
-            Ok(LensData::History(flat))
-        }
-        FetchReq::Subdomains(d) => seer_core::SubdomainEnumerator::new()
-            .enumerate(&d)
-            .await
-            .map(|r| LensData::Subdomains(Box::new(r)))
-            .map_err(e),
-        FetchReq::Headers(d) => seer_core::audit_headers(&d, config.http_timeout())
-            .await
-            .map(|r| LensData::Headers(Box::new(r)))
-            .map_err(e),
-        FetchReq::Takeover(d) => {
-            // Two stages, like the CLI's takeover command: enumerate via CT
-            // logs, then scan. Enumeration failure aborts — with no host list
-            // there is nothing to scan, and reporting an empty clean result
-            // would be a false all-clear.
-            let enumerated = seer_core::SubdomainEnumerator::new()
-                .enumerate(&d)
-                .await
-                .map_err(e)?;
-            let resolver = seer_core::DnsResolver::from_config(config);
-            seer_core::scan_takeover(
-                &resolver,
-                &enumerated.domain,
-                enumerated.subdomains,
-                config.bulk.concurrency,
-            )
-            .await
-            .map(|r| LensData::Takeover(Box::new(r)))
-            .map_err(e)
-        }
+        } => Query::Trace {
+            name: domain,
+            record_type,
+            short: false,
+        },
+        FetchReq::Ssl(d) => Query::Ssl(d),
+        FetchReq::Status(d) => Query::Status(d),
+        // The lens has no record-type input.
+        FetchReq::Prop(d) => Query::Prop {
+            domain: d,
+            record_type: RecordType::A,
+        },
+        FetchReq::Reverse(ip) => Query::Reverse(ip),
+        FetchReq::Avail(d) => Query::Avail(d),
+        FetchReq::Tld(t) => Query::Tld(t),
+        FetchReq::Diff { a, b } => Query::Diff(a, b),
+        FetchReq::Subdomains(d) => Query::Subdomains {
+            domain: d,
+            resolve: false,
+            diff: false,
+            record: false,
+        },
+        FetchReq::Headers(d) => Query::Headers(d),
+        // No host list: enumerate via CT logs first, like `seer takeover`.
+        FetchReq::Takeover(d) => Query::Takeover {
+            domain: d,
+            hosts: Vec::new(),
+        },
+        FetchReq::Watch => return Err(Store::Watch),
+        FetchReq::History => return Err(Store::History),
+    })
+}
+
+/// The watchlist with every domain checked. The load is blocking file I/O,
+/// so it runs off the async loop.
+async fn watchlist(config: &SeerConfig) -> Result<LensData, String> {
+    let wl = crate::ops::load_watchlist().await?;
+    Ok(LensData::Watch(Box::new(
+        seer_core::check_watchlist_with_config(&wl.domains, config).await,
+    )))
+}
+
+/// Every recorded lookup, newest first.
+async fn history() -> Result<LensData, String> {
+    let h = crate::ops::load_history().await?;
+    let mut flat: Vec<seer_core::HistoryEntry> = h.entries.into_values().flatten().collect();
+    flat.sort_by_key(|e| std::cmp::Reverse(e.timestamp));
+    Ok(LensData::History(flat))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Takeover used to scan under the enumerator's echo of the domain
+    /// rather than the domain asked for; it now runs the CLI's own command.
+    #[test]
+    fn requests_map_to_the_cli_commands() {
+        assert!(matches!(
+            to_query(FetchReq::Takeover("www.example.com".into())),
+            Ok(Query::Takeover { ref domain, ref hosts }) if domain == "www.example.com" && hosts.is_empty()
+        ));
+        assert!(matches!(
+            to_query(FetchReq::Overview("example.com".into())),
+            Ok(Query::Lookup(ref d)) if d == "example.com"
+        ));
+        assert!(matches!(
+            to_query(FetchReq::RdapAsn(15169)),
+            Ok(Query::Rdap(ref q)) if q == "AS15169"
+        ));
+        assert!(matches!(
+            to_query(FetchReq::Dns {
+                domain: "example.com".into(),
+                record_type: RecordType::MX,
+                nameserver: Some("1.1.1.1".into()),
+            }),
+            Ok(Query::Dig { ref types, ref server, short: false, .. })
+                if *types == [RecordType::MX] && server.as_deref() == Some("1.1.1.1")
+        ));
+        assert!(matches!(
+            to_query(FetchReq::Subdomains("example.com".into())),
+            Ok(Query::Subdomains {
+                resolve: false,
+                diff: false,
+                record: false,
+                ..
+            })
+        ));
+        assert!(matches!(to_query(FetchReq::Watch), Err(Store::Watch)));
+        assert!(matches!(to_query(FetchReq::History), Err(Store::History)));
     }
 }

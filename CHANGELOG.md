@@ -11,6 +11,172 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+A hardening release from a full adversarial review of every crate: SSRF and
+output-injection gaps closed, several misleading verdicts corrected, the
+CLI, REPL and TUI brought onto one grammar and pipeline each, and the Python
+bindings and API given typed errors. Some output, exit-code and JSON shapes
+change — see **Changed** and **Removed**.
+
+### Security
+- **HTTP legs ignore `HTTP(S)_PROXY`/`ALL_PROXY`.** A configured proxy
+  re-resolved the target itself, defeating the DNS-rebinding pin on status,
+  headers, takeover, webhook and RDAP requests.
+- **The SSRF guard also refuses** 192.88.99.0/24, 100::/64, 2001:2::/48,
+  3fff::/20 and 5f00::/16.
+- **Remote text can no longer forge output.** Human output folds newlines
+  and tabs in every remote value (a WHOIS or TXT value could print a fake
+  `Expires:` row); Markdown escapes backslashes (`\[x\](url)` rendered as a
+  live link) and code spans get their own escaper; bidi-override and
+  zero-width characters are stripped everywhere, including every TUI lens.
+- **Webhook errors never include the URL**, which may carry a token.
+- **seer-api:** without `SEER_API_KEY`, requests arriving on a non-loopback
+  interface get 503 even when launched as `uvicorn … --host 0.0.0.0` (the
+  startup check only read `SEER_HOST`); CORS is off unless
+  `SEER_CORS_ORIGINS` is set (was `*`), and the browser Origin guard `/mcp`
+  had now covers the REST routes too; an over-cap chunked body no longer runs
+  the handler before the 413; MCP per-tool limits are per client, not per
+  process; status sub-check errors are sanitized.
+
+### Fixed
+- **`dig`:** an `ANY` answer with a type that got no reply lists it
+  (`failed_types`) and exits 1, and propagation keeps such a server out of
+  the consensus; a positive answer no longer waits up to two DNS timeouts
+  for an unanswered wildcard probe; TXT records print each character-string
+  quoted and escaped, dig-style, so differently split records no longer
+  compare equal; an absolute single label (`dig com. NS`) is a valid name.
+- **`dig +trace` no longer stops at one lame server** that refers upward or
+  sideways; the zone's next server is asked.
+- **`delegation`** tries each nameserver address in turn (IPv6-only hosts
+  work), bounds its address lookups and runs under one overall deadline.
+- **`dnssec`** reports `signed` when one DS authenticates a DNSKEY
+  (double-DS key rollover); unmatched DS records are listed as issues.
+- **`propagation`** tells NXDOMAIN from NODATA, and a failed or slow
+  nameserver address lookup no longer produces false inconsistencies or
+  discards every nameserver detail.
+- **`avail` and `lookup` share one availability ladder**; a thin WHOIS reply
+  with RDAP down and a failed DNS probe is now `unknown`, not a confident
+  "registered".
+- **WHOIS** for RDAP-only, retired or server-less TLDs (`.dev`, `.app`, …)
+  fails fast instead of querying whois.iana.org on every lookup (IANA's
+  definitive answer is cached for 1h); connects are IPv4 first with a
+  per-address budget, so a dead IPv6 route no longer eats the timeout; a
+  registrar referral hop is a single attempt.
+- **RDAP:** an expired bootstrap is refreshed in the background instead of
+  stalling a lookup; a registry that keeps answering 429 is reported as rate
+  limited; timeouts keep their type across several candidate URLs.
+- **TLS (`ssl`, `status`)** connects IPv4 first with per-address failover,
+  and hostname matching follows RFC 6125: an IP host matches only an IP SAN,
+  and wildcards over a public suffix (`*.com`) match nothing.
+- **`headers`** grades `*`, `http:`, `https:` and `data:` script sources and
+  an any-origin `frame-ancestors` as Weak (they scored Strict), reads a huge
+  HSTS `max-age` correctly, and no longer fails when the body stalls.
+- **`status`** reports registration expiry for subdomains and keeps the HTTP
+  status when the body cannot be read.
+- **CAA** applies `issuewild` only to wildcard certificates (RFC 8659), and
+  `seer caa www.example.com` asks `www` first instead of the apex.
+- **`posture`** reports a failed DNS lookup as `unknown` instead of "no
+  record — trivially spoofable", counts SPF DNS lookups against the RFC 7208
+  limit of 10, stops the DMARC walk at the organizational domain, and honors
+  the configured nameserver.
+- **`confusables`** scans a subdomain at its registrable domain (it reported
+  almost nothing), emits only valid DNS labels, and bulk runs share one
+  concurrency budget instead of multiplying it.
+- **`drift`** no longer flags a registrar, organization or registrant that
+  only one snapshot has (an RDAP/WHOIS switch).
+- **`subdomains`:** enumeration has an overall time budget; a baseline
+  recorded from a truncated run no longer makes later names "new" (exit 1);
+  wildcards below the apex and CDN wildcards with rotating addresses are
+  detected; a provider anywhere in a CNAME chain is flagged.
+- **`watch`** warning and critical counts no longer overlap.
+- **`~/.seer` stores** are no longer moved aside on a permission or I/O
+  error, saves are fsynced, and concurrent edits in one process no longer
+  lose each other's changes.
+- **Markdown** expiry reads "expired N days ago" (it printed "(-3 days)"),
+  RDAP/lookup no longer print the registrant twice, and the DNSSEC note is
+  correct; YAML output has no blank first line or trailing spaces.
+- **CLI:** `follow` can be stopped when stdin is not a terminal; the last log
+  lines are no longer lost on a non-zero exit; `bulk --progress
+  verbose|failures` prints lines as results arrive; `drift --record` fails
+  when the baseline cannot be saved; `history <domain> --clear` is rejected
+  instead of clearing everything; the bulk CSV is written through an
+  exclusively created temp file.
+- **REPL:** Ctrl-C cancels the running command instead of exiting, history
+  is appended after each command (and no longer clobbers other sessions),
+  `copy` no longer copies an older result, and extra arguments or unknown
+  flags are rejected.
+- **TUI:** Subdomains and Takeover no longer start scans when you navigate
+  onto them (press ↵); in-flight lookups are cancelled when the target, tab
+  or request changes; `g`/`G` and history/watch replays no longer re-run a
+  lookup; the TLD filter selects its first match; bulk lists are no longer
+  cut to 50 and export the CLI's per-operation CSV without overwriting; no
+  100% CPU spin if terminal input closes; invalid targets are refused.
+- **Python:** `dns_follow` stops on Ctrl-C; out-of-range integers raise
+  `ValueError` instead of `OverflowError`; `seer.caa` no longer drops `www.`.
+- **seer-api:** an unresolvable host on `/status` and `/ssl` reaches core
+  instead of returning 500, and one bad domain no longer fails a whole bulk
+  status/ssl batch; `SEER_REQUEST_TIMEOUT` also covers the SSRF check and
+  SSE streams; `/bulk` and `/bulk/stream` share one rate limit; the bearer
+  scheme is case-insensitive; `GET /` is rate-limited.
+
+### Changed
+- **`takeover`** follows CNAME chains, requires the provider's claim-page
+  status where known, uses the configured HTTP timeout, and reports a host it
+  could not check as `inconclusive` (listed and counted, not a finding, exit
+  0) instead of `potential`.
+- **`compare`** compares response codes (NXDOMAIN ≠ NODATA, SERVFAIL) and
+  CNAME chains as well as records; `server_a`/`server_b` gain `status` and
+  `cname_chain`.
+- **`compare` and `follow` take arguments in any order** with one grammar in
+  the CLI and REPL (`@server` accepted by the CLI; the old positional forms
+  still work); extra numbers, types, servers or domains are errors.
+- **`--format` with an unknown value is a usage error** (exit 2); an invalid
+  `output_format` in the config file warns and falls back to human.
+- **`--fields` implies `--quiet`.**
+- **`history`, `watch add|remove|list` and `config`** honor `--format
+  json|yaml` and `-q`/`--fields`; `watch add`/`remove` take several domains
+  and keep `www.`.
+- **Config timeouts are honored everywhere**: `dnssec`, `propagation`,
+  `compare`, `diff`, `subdomains`, `takeover` and `tld` use the config file's
+  timeouts in the CLI, REPL and TUI. New setting `timeouts.ct_secs`
+  (default 30, 1–120) for Certificate Transparency requests.
+- **`diff`** reports checks that failed (`errors`; `resolves` may be null)
+  instead of defaulting them.
+- **History** keeps 20 entries per domain and 500 domains, without RDAP
+  notices or remarks.
+- **TUI:** deleting a watched domain (`d`) and clearing history (`c`) ask for
+  a second press; the raw view and bulk detail scroll; the screen redraws
+  only on change; the TUI always opens on the rendered view.
+- **Human/Markdown parity:** both formats now carry the same sections
+  (header redirects, subdomain summary and CNAME, dig verdict order, lookup
+  source wording, a Markdown diff Match column).
+- **Python:** failures other than invalid input, timeouts and WHOIS connect
+  failures raise `seer.SeerError` subclasses — `RateLimitedError`,
+  `WhoisServerNotFoundError`, `DnsError`, `UpstreamError`,
+  `LookupFailedError`, `ParseError`, `TlsError`, `ConfigError` — all still
+  `RuntimeError`s. Wheels are abi3-py310.
+- **seer-api** maps errors by type: 429 for a rate-limited upstream, 404 for
+  an unsupported TLD, 502 for upstream/DNS/TLS failures (these were 500).
+  MCP retry advice is chosen by error type, error text is sanitized and
+  capped, and string arguments are length-capped. `seer_subdomains` is
+  limited to 5/minute. seer-api now needs the next `domain-seer` release.
+- **Rust API:** `lookup_email_posture(.., nameserver)`,
+  `lookup_caa(.., nameserver) -> Result`, `scan_takeover(.., timeout)`;
+  the `~/.seer` stores' `load()` returns `Result`;
+  `SubdomainBaselines::record(&SubdomainResult)`; `SubdomainEnumerator` and
+  `DomainDiffer`, `DnssecChecker`, `PropagationChecker` and `DnsComparator`
+  gain `from_config`; `retry::is_retryable` replaces `RetryClassifier`;
+  `lookup_tld_with`, `LookupResult::protocol` and `dns::FailedType` are new.
+
+### Added
+- MCP tool `seer_tld_list` (the full TLD catalog).
+
+### Removed
+- The unused opt-in RRSIG tier (`DnssecChecker::with_rrsig_validation`,
+  `RrsigInfo`, `DnssecReport.rrsig_records`, `AuthenticationTier::RrsigChecked`).
+- `RecordData::Unknown` and `SeerError::BulkOperationError` (never produced).
+- The unreachable `whois_error` availability method.
+- 16 unused `CatppuccinExt` palette methods.
+
 ## [0.51.0] - 2026-09-29
 
 `seer prop` is reliable and readable again: it asks 20 public resolvers that

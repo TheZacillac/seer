@@ -10,7 +10,10 @@ impl JsonFormatter {
     }
 
     fn to_json<T: serde::Serialize + ?Sized>(&self, value: &T) -> String {
-        serde_json::to_string_pretty(value).unwrap_or_else(|e| format!("{{\"error\": \"{}\"}}", e))
+        // Built through `json!` so the error text is escaped: a message
+        // carrying a quote must not yield invalid JSON.
+        serde_json::to_string_pretty(value)
+            .unwrap_or_else(|e| serde_json::json!({ "error": e.to_string() }).to_string())
     }
 }
 
@@ -48,6 +51,21 @@ mod tests {
     }
 
     #[test]
+    fn error_fallback_is_valid_json() {
+        // A serializer error carrying a quote was interpolated raw into
+        // `{"error": "…"}`, producing invalid JSON.
+        struct Failing;
+        impl serde::Serialize for Failing {
+            fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+                Err(serde::ser::Error::custom("bad \"value\"\n"))
+            }
+        }
+        let out = JsonFormatter::new().to_json(&Failing);
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["error"], "bad \"value\"\n");
+    }
+
+    #[test]
     fn dig_and_trace_serialize_as_objects() {
         // `seer dig -q` / `--format json` emit the whole result object (status,
         // flags, answers, …), not the record list `format_dns` emits.
@@ -60,6 +78,7 @@ mod tests {
             status: DnsStatus::NxDomain,
             flags: Vec::new(),
             answers: Vec::new(),
+            failed_types: Vec::new(),
             authority: Vec::new(),
             wildcard: None,
             query_time_ms: 7,

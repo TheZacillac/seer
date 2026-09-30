@@ -28,7 +28,7 @@ async def whois_lookup(request: Request, domain: Domain):
 
 
 @router.post("/bulk")
-@limiter.limit(BULK_LIMIT)
+@limiter.shared_limit(BULK_LIMIT, scope="bulk_whois")
 async def bulk_whois_lookup(request: Request, body: BulkRequest):
     """
     Look up WHOIS information for multiple domains.
@@ -46,7 +46,7 @@ async def bulk_whois_lookup(request: Request, body: BulkRequest):
 
 
 @router.post("/bulk/stream")
-@limiter.limit(BULK_LIMIT)
+@limiter.shared_limit(BULK_LIMIT, scope="bulk_whois")
 async def bulk_whois_stream(request: Request, body: BulkRequest):
     """Stream bulk WHOIS lookups as Server-Sent Events."""
     return await as_http(

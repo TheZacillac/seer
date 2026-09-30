@@ -1,0 +1,26 @@
+---
+source: seer-core/tests/format_snapshots.rs
+assertion_line: 301
+expression: markdown ().format_status (& fixture_status_expiring_soon())
+---
+## Status: example.com
+
+- **HTTP Status**: `200` (OK)
+- **Site Title**: Example Domain
+
+### SSL Certificate
+
+- **Subject**: `CN=example.com`
+- **Issuer**: CN=Mock CA
+- **Status**: Invalid
+- **Hostname Match**: yes
+- **Valid From**: `2025-01-01`
+- **Expires**: `2026-01-01` (expired [N] days ago)
+
+### Domain Registration
+
+- **Expires**: `2026-10-10` (expires in [N] days)
+
+### DNS Resolution
+
+*Check failed*

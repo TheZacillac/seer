@@ -1,4 +1,5 @@
 use super::*;
+use crate::output::{availability_label, lookup_source};
 
 impl HumanFormatter {
     pub(super) fn format_lookup(&self, result: &LookupResult) -> String {
@@ -6,35 +7,36 @@ impl HumanFormatter {
             .domain_name()
             .unwrap_or_else(|| "Unknown".to_string());
         let header_suffix = match result {
-            LookupResult::Rdap { .. } => "via RDAP",
-            LookupResult::Whois { .. } => "via WHOIS",
-            LookupResult::Available { data, .. } => match data.verdict() {
-                "available" => "available",
-                "likely_available" => "likely available",
-                "registered" => "registered",
-                "likely_registered" => "likely registered",
-                _ => "status unknown",
-            },
+            LookupResult::Rdap { .. } => "via RDAP".to_string(),
+            LookupResult::Whois { .. } => "via WHOIS".to_string(),
+            LookupResult::Available { data, .. } => {
+                availability_label(data.verdict()).0.to_lowercase()
+            }
         };
 
         let mut output = vec![self.header(&format!(
             "Lookup: {} ({})",
-            sanitize_display(&domain),
+            sanitize_line(&domain),
             header_suffix
         ))];
         let mut rows = self.rows(&mut output, "  ");
+        let source = lookup_source(result);
+        let source = match result {
+            LookupResult::Rdap { .. } => self.success(source),
+            _ => self.warning(source),
+        };
+        rows.kv("Source", source);
 
         match result {
             LookupResult::Rdap {
                 data,
                 whois_fallback,
             } => {
-                rows.kv("Source", self.success("RDAP (modern protocol)"));
                 rows.opt("Registrar", &data.get_registrar());
                 rows.opt("Registrant", &data.get_registrant());
                 rows.opt("Organization", &data.get_registrant_organization());
                 let infos = contact::rdap_contacts(data);
-                let rdap_contacts = detail_views(&infos);
+                let rdap_contacts = contact::rdap_detail_views(&infos);
                 rows.contacts(rdap_contacts);
                 rows.date("Created", data.creation_date());
                 rows.expires(data.expiration_date());
@@ -73,7 +75,7 @@ impl HumanFormatter {
                     }
 
                     if !extra.is_empty() {
-                        rows.push(format!("\n  {}", self.label("Additional WHOIS data:")));
+                        rows.push(format!("\n  {}", self.label("Additional WHOIS Data:")));
                         rows.extend(extra);
                     }
                 }
@@ -81,17 +83,11 @@ impl HumanFormatter {
             LookupResult::Whois {
                 data, rdap_error, ..
             } => {
-                let source_note = if rdap_error.is_some() {
-                    "WHOIS (RDAP unavailable)"
-                } else {
-                    "WHOIS"
-                };
-                rows.kv("Source", self.warning(source_note));
                 // Error strings can carry upstream server text (e.g. an
                 // IANA-returned WHOIS server name), so sanitize like any
                 // other remote-sourced value.
                 if let Some(error) = rdap_error {
-                    rows.kv("RDAP Error", self.error(&sanitize_display(error)));
+                    rows.kv("RDAP Error", self.error(&sanitize_line(error)));
                 }
                 rows.opt("Registrar", &data.registrar);
                 rows.opt("Registrant", &data.registrant);
@@ -109,29 +105,16 @@ impl HumanFormatter {
                 whois_error,
                 whois_data,
             } => {
-                let source_note = if whois_data.is_some() {
-                    "WHOIS (RDAP unavailable)"
-                } else {
-                    "availability check (RDAP and WHOIS failed)"
-                };
-                rows.kv("Source", self.warning(source_note));
-
-                let verdict = match data.verdict() {
-                    "available" => self.success("AVAILABLE"),
-                    "likely_available" => self.warning("MAY BE AVAILABLE"),
-                    "registered" => self.value("REGISTERED"),
-                    "likely_registered" => self.warning("LIKELY REGISTERED"),
-                    _ => self.error("UNKNOWN"),
-                };
-                rows.kv("Verdict", verdict);
+                let (verdict, emphasis) = availability_label(data.verdict());
+                rows.kv("Verdict", self.emphasize(verdict, emphasis));
                 rows.kv("Confidence", self.confidence(&data.confidence));
                 rows.text("Method", &data.method);
                 rows.opt("Details", &data.details);
                 if !rdap_error.is_empty() {
-                    rows.kv("RDAP Error", self.error(&sanitize_display(rdap_error)));
+                    rows.kv("RDAP Error", self.error(&sanitize_line(rdap_error)));
                 }
                 if !whois_error.is_empty() {
-                    rows.kv("WHOIS Error", self.error(&sanitize_display(whois_error)));
+                    rows.kv("WHOIS Error", self.error(&sanitize_line(whois_error)));
                 }
 
                 if let Some(w) = whois_data {
@@ -148,7 +131,7 @@ impl HumanFormatter {
                         fill.text("WHOIS Server", &w.whois_server);
                     }
                     if !extra.is_empty() {
-                        rows.push(format!("  {}", self.label("Additional WHOIS data:")));
+                        rows.push(format!("\n  {}", self.label("Additional WHOIS Data:")));
                         rows.extend(extra);
                     }
                 }
@@ -167,7 +150,7 @@ impl HumanFormatter {
         } else {
             self.error("TAKEN")
         };
-        let mut output = vec![format!("{}: {}", sanitize_display(&result.domain), status)];
+        let mut output = vec![format!("{}: {}", sanitize_line(&result.domain), status)];
         let mut rows = self.rows(&mut output, "  ");
         rows.kv("Confidence", self.confidence(&result.confidence));
         rows.text("Method", &result.method);
@@ -266,7 +249,7 @@ mod tests {
     fn format_lookup_sanitizes_protocol_error_strings() {
         // rdap_error / whois_error can carry upstream server text (e.g. an
         // IANA-returned WHOIS server name); they were printed raw while every
-        // adjacent value went through sanitize_display.
+        // adjacent value went through sanitize_line.
         let evil = "connect to whois.evil\x1b]52;c;AAAA\x07\x1b[2J failed";
         let whois = WhoisResponse::parse("example.com", "whois.test", "Registrar: R\n");
         let whois_variant = LookupResult::Whois {

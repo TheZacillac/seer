@@ -4,7 +4,9 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
+use seer_core::output::sanitize_line;
 
+use seer_core::output::{availability_label, Emphasis};
 use seer_core::LookupResult;
 
 use crate::tui::action::LensData;
@@ -27,18 +29,21 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
     let source = match result.as_ref() {
         LookupResult::Rdap { .. } => ("RDAP", theme.mauve),
         LookupResult::Whois { .. } => ("WHOIS", theme.peach),
-        LookupResult::Available { data, .. } => match data.verdict() {
-            "available" => ("AVAILABLE", theme.green),
-            "likely_available" => ("MAY BE AVAILABLE", theme.yellow),
-            "registered" => ("REGISTERED", theme.text),
-            "likely_registered" => ("LIKELY REGISTERED", theme.yellow),
-            _ => ("UNKNOWN", theme.red),
-        },
+        LookupResult::Available { data, .. } => {
+            let (label, emphasis) = availability_label(data.verdict());
+            let color = match emphasis {
+                Emphasis::Good => theme.green,
+                Emphasis::Neutral => theme.text,
+                Emphasis::Caution => theme.yellow,
+                Emphasis::Bad => theme.red,
+            };
+            (label, color)
+        }
     };
     f.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(
-                result.domain_name().unwrap_or_default(),
+                sanitize_line(&result.domain_name().unwrap_or_default()),
                 Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
             ),
             Span::raw("  "),

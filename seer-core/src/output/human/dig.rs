@@ -18,11 +18,6 @@ struct RecordRow {
     highlight: bool,
 }
 
-/// Spaces that pad `text` out to `width` characters.
-fn pad(text: &str, width: usize) -> String {
-    " ".repeat(width.saturating_sub(text.chars().count()))
-}
-
 impl HumanFormatter {
     pub(super) fn format_dig(&self, result: &DnsQueryResult) -> String {
         let mut out = vec![self.header(&format!(
@@ -233,14 +228,12 @@ impl HumanFormatter {
                 } else {
                     self.value(&row.data)
                 };
+                // `{:<w$}` pads by chars, so IDN owners line up too.
                 format!(
-                    "{indent}{}{}  {}{}  {}{}  {data}",
-                    self.value(&row.owner),
-                    pad(&row.owner, owner_w),
-                    pad(&row.ttl, ttl_w),
-                    self.label(&row.ttl),
-                    self.label(row.record_type),
-                    pad(row.record_type, type_w),
+                    "{indent}{}  {}  {}  {data}",
+                    self.value(&format!("{:<owner_w$}", row.owner)),
+                    self.label(&format!("{:>ttl_w$}", row.ttl)),
+                    self.label(&format!("{:<type_w$}", row.record_type)),
                 )
             })
             .collect()
@@ -295,6 +288,7 @@ mod tests {
                     },
                 ),
             ],
+            failed_types: Vec::new(),
             authority: Vec::new(),
             wildcard: None,
             query_time_ms: 12,
@@ -352,9 +346,7 @@ mod tests {
         result.answers.push(record(
             "edge.cdn.test",
             60,
-            RecordData::TXT {
-                text: format!("v=spf1{EVIL}"),
-            },
+            RecordData::txt(vec![format!("v=spf1{EVIL}")]),
         ));
         result.wildcard = Some(WildcardProbe {
             probe_name: format!("seer-probe-0000000000.seer.test{EVIL}"),

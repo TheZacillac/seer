@@ -1,16 +1,18 @@
 ---
 source: seer-core/tests/format_snapshots.rs
-assertion_line: 435
-expression: markdown().format_subdomain_classification(&fixture_subdomain_classification())
+assertion_line: 456
+expression: "markdown ().format_subdomain_classification\n(& fixture_subdomain_classification())"
 ---
 ## Subdomains: example.com
 
 > ⚠️ Wildcard DNS detected — some "live" verdicts may be zone wildcards.
 
+3 names — 1 live, 1 takeover-risk.
+
 > ⚠️ 3 more names exceeded the classification cap and were not resolved.
 
 | Name | Status | CNAME | Takeover risk |
-|---|---|---|---|
-| www.example.com | Live | — | — |
-| docs.example.com | Dead | example.github.io. | GitHub Pages |
-| random.example.com | Wildcard | — | — |
+| --- | --- | --- | --- |
+| www.example.com | live | — | — |
+| docs.example.com | dead | example.github.io. | GitHub Pages |
+| random.example.com | wildcard | — | — |

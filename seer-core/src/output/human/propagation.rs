@@ -9,7 +9,7 @@ impl HumanFormatter {
         let mut output = Vec::new();
         output.push(self.header(&format!(
             "Propagation: {} {}",
-            sanitize_display(&result.domain),
+            sanitize_line(&result.domain),
             result.record_type
         )));
         output.push(format!("  {}", self.propagation_summary(result)));
@@ -29,12 +29,12 @@ impl HumanFormatter {
                     .consensus_values
                     .iter()
                     .map(|v| {
-                        let mut text = sanitize_display(&v.value);
+                        let mut text = sanitize_line(&v.value);
                         if let Some(ips) = ns_details
                             .and_then(|d| d.consensus.get(&v.value.to_ascii_lowercase()))
                             .filter(|ips| !ips.is_empty())
                         {
-                            text = format!("{text} ({})", sanitize_display(&ips.join(", ")));
+                            text = format!("{text} ({})", sanitize_line(&ips.join(", ")));
                         }
                         if multi_type {
                             text = format!("{:<6} {text}", v.record_type.to_string());
@@ -80,13 +80,13 @@ impl HumanFormatter {
                 &mut output,
                 &details.inconsistencies,
                 |inc| inc.nameserver.clone(),
-                |out, hdr| out.push(format!("    {}:", self.label(hdr))),
+                |out, hdr| out.push(format!("    {}:", self.label(&sanitize_line(hdr)))),
                 |out, inc, nested| {
                     let indent = if nested { "      " } else { "    " };
                     out.push(format!(
                         "{}- {}",
                         indent,
-                        self.warning(&sanitize_display(&inc.to_string()))
+                        self.warning(&sanitize_line(&inc.to_string()))
                     ));
                 },
             );
@@ -113,17 +113,7 @@ impl HumanFormatter {
     /// agree`.
     fn propagation_summary(&self, result: &PropagationResult) -> String {
         let verdict = result.verdict();
-        let (agree, responding) = (result.servers_agreeing(), result.servers_responding);
-        let detail = match verdict {
-            PropagationVerdict::NoAnswer => {
-                format!("none of the {} servers answered", result.servers_checked)
-            }
-            PropagationVerdict::Full if responding == 1 => {
-                "the one responding server answered".to_string()
-            }
-            PropagationVerdict::Full => format!("all {responding} responding servers agree"),
-            _ => format!("{agree} of {responding} responding servers agree"),
-        };
+        let detail = propagation_detail(result);
         let headline = match verdict {
             PropagationVerdict::Full => self.success(&format!("✓ {}", verdict.label())),
             PropagationVerdict::Mostly => self.warning(&format!("◐ {}", verdict.label())),
@@ -142,13 +132,13 @@ impl HumanFormatter {
         let name_width = result
             .results
             .iter()
-            .map(|r| sanitize_display(&r.server.name).chars().count())
+            .map(|r| sanitize_line(&r.server.name).chars().count())
             .max()
             .unwrap_or(0);
         let ip_width = result
             .results
             .iter()
-            .map(|r| sanitize_display(&r.server.ip).chars().count())
+            .map(|r| sanitize_line(&r.server.ip).chars().count())
             .max()
             .unwrap_or(0);
 
@@ -160,14 +150,14 @@ impl HumanFormatter {
         }
         for region in regions {
             output.push(String::new());
-            output.push(format!("  {}", self.label(&sanitize_display(region))));
+            output.push(format!("  {}", self.label(&sanitize_line(region))));
             for sr in result
                 .results
                 .iter()
                 .filter(|r| r.server.location == region)
             {
-                let name = format!("{:<name_width$}", sanitize_display(&sr.server.name));
-                let ip = format!("{:<ip_width$}", sanitize_display(&sr.server.ip));
+                let name = format!("{:<name_width$}", sanitize_line(&sr.server.name));
+                let ip = format!("{:<ip_width$}", sanitize_line(&sr.server.ip));
                 let time = format!("{:>7}", format!("{} ms", sr.response_time_ms));
                 let line = match result.server_verdict(sr) {
                     ServerVerdict::Agrees => format!(
@@ -185,7 +175,7 @@ impl HumanFormatter {
                             self.value(&name),
                             self.dim(&ip),
                             self.dim(&time),
-                            self.warning(&sanitize_display(&answer))
+                            self.warning(&sanitize_line(&answer))
                         )
                     }
                     // A silent server's time is only the timeout: leave it out.
@@ -195,7 +185,7 @@ impl HumanFormatter {
                         self.value(&name),
                         self.dim(&ip),
                         "",
-                        self.dim(&sanitize_display(reason))
+                        self.dim(&sanitize_line(reason))
                     ),
                 };
                 output.push(format!("    {}", line.trim_end()));
@@ -253,6 +243,8 @@ mod tests {
             server_ip: ip.into(),
             values: values.iter().map(|v| v.to_string()).collect(),
             consensus: consensus.iter().map(|v| v.to_string()).collect(),
+            nxdomain: false,
+            consensus_nxdomain: false,
         }
     }
 

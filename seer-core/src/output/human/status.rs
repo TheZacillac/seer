@@ -2,14 +2,13 @@ use super::*;
 
 impl HumanFormatter {
     pub(super) fn format_status(&self, response: &StatusResponse) -> String {
-        let mut output =
-            vec![self.header(&format!("Status: {}", sanitize_display(&response.domain)))];
+        let mut output = vec![self.header(&format!("Status: {}", sanitize_line(&response.domain)))];
         let mut rows = self.rows(&mut output, "  ");
 
         // HTTP Status
         if let Some(status) = response.http_status {
             let status_text =
-                sanitize_display(response.http_status_text.as_deref().unwrap_or("Unknown"));
+                sanitize_line(response.http_status_text.as_deref().unwrap_or("Unknown"));
             let text = format!("{} ({})", status, status_text);
             let styled = if (200..300).contains(&status) {
                 self.success(&text)
@@ -39,12 +38,9 @@ impl HumanFormatter {
                 ssl.push(format!("    {warning}"));
             }
             ssl.date("Valid From", Some(cert.valid_from));
-            // Shared helper renders the already-expired (negative) case as
-            // "expired N days ago" instead of a confusing "(-N days!)".
-            let expiry = cert.valid_until.format("%Y-%m-%d").to_string();
             ssl.kv(
                 "Expires",
-                self.format_expiry_status(&expiry, cert.days_until_expiry),
+                self.format_expiry_status(cert.valid_until, cert.days_until_expiry),
             );
         } else {
             rows.blank();
@@ -63,10 +59,9 @@ impl HumanFormatter {
         if let Some(ref expiry) = response.domain_expiration {
             let mut registration = rows.section("Domain Registration");
             registration.opt("Registrar", &expiry.registrar);
-            let date = expiry.expiration_date.format("%Y-%m-%d").to_string();
             registration.kv(
                 "Expires",
-                self.format_expiry_status(&date, expiry.days_until_expiry),
+                self.format_expiry_status(expiry.expiration_date, expiry.days_until_expiry),
             );
         }
 
@@ -79,7 +74,7 @@ impl HumanFormatter {
                 resolution.push(format!("    {}", self.error("✗ Domain does not resolve")));
             }
             if let Some(ref cname) = dns.cname_target {
-                let target = self.success(&sanitize_display(cname));
+                let target = self.success(&sanitize_line(cname));
                 resolution.push(format!(
                     "    {}: Aliases to {}",
                     self.label("CNAME"),
@@ -94,8 +89,7 @@ impl HumanFormatter {
                 if !values.is_empty() {
                     resolution.push(format!("    {}:", self.label(label)));
                     for value in values {
-                        resolution
-                            .push(format!("      • {}", self.value(&sanitize_display(value))));
+                        resolution.push(format!("      • {}", self.value(&sanitize_line(value))));
                     }
                 }
             }
@@ -115,7 +109,7 @@ impl HumanFormatter {
 
     pub(super) fn format_ssl(&self, report: &crate::ssl::SslReport) -> String {
         let mut output =
-            vec![self.header(&format!("SSL Report: {}", sanitize_display(&report.domain)))];
+            vec![self.header(&format!("SSL Report: {}", sanitize_line(&report.domain)))];
         let mut rows = self.rows(&mut output, "  ");
         let yes_no = |ok: bool| {
             if ok {
@@ -128,15 +122,16 @@ impl HumanFormatter {
         rows.kv("Hostname Match", yes_no(report.hostname_verified));
         rows.kv(
             "Days Until Expiry",
-            self.value(&report.days_until_expiry.to_string()),
+            self.expiry_countdown(report.days_until_expiry),
         );
 
         if !report.warnings.is_empty() {
             rows.push(format!("  {}:", self.label("Warnings")));
             for w in &report.warnings {
+                let message = sanitize_line(&w.message);
                 let rendered = match w.severity {
-                    crate::ssl::CertWarningSeverity::Critical => self.error(&w.message),
-                    crate::ssl::CertWarningSeverity::Warning => self.warning(&w.message),
+                    crate::ssl::CertWarningSeverity::Critical => self.error(&message),
+                    crate::ssl::CertWarningSeverity::Warning => self.warning(&message),
                 };
                 rows.push(format!("    {} {}", self.error("⚠"), rendered));
             }
@@ -144,11 +139,7 @@ impl HumanFormatter {
 
         rows.opt("Protocol", &report.protocol_version);
         if !report.san_names.is_empty() {
-            let sans: Vec<String> = report
-                .san_names
-                .iter()
-                .map(|s| sanitize_display(s))
-                .collect();
+            let sans: Vec<String> = report.san_names.iter().map(|s| sanitize_line(s)).collect();
             rows.kv("SANs", self.value(&sans.join(", ")));
         }
 
@@ -159,13 +150,13 @@ impl HumanFormatter {
                 rows.push(format!(
                     "    [{}] {}",
                     i,
-                    self.value(&sanitize_display(&cert.subject))
+                    self.value(&sanitize_line(&cert.subject))
                 ));
                 let mut detail = rows.at("        ");
                 detail.text("Issuer", &cert.issuer);
                 detail.opt("Algorithm", &cert.signature_algorithm);
                 if let Some(ref key_type) = cert.key_type {
-                    let key_type = sanitize_display(key_type);
+                    let key_type = sanitize_line(key_type);
                     let key = match cert.key_bits {
                         Some(bits) => format!("{key_type} ({bits} bits)"),
                         None => key_type,

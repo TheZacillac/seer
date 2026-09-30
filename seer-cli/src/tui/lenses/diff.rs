@@ -6,6 +6,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Row, Table};
 use ratatui::Frame;
+use seer_core::output::sanitize_line;
 
 use crate::tui::action::{LensData, LensState};
 use crate::tui::line_editor::LineEditor;
@@ -55,13 +56,13 @@ pub fn render(
     let b = loaded.map(|d| d.domain_b.as_str()).unwrap_or(b);
     let (b_text, b_color) = match editing {
         Some(buf) => (buf.with_caret("▏"), theme.text),
-        None if !b.is_empty() => (b.to_string(), theme.text),
+        None if !b.is_empty() => (sanitize_line(b), theme.text),
         None => ("[ press e ]".to_string(), theme.overlay0),
     };
     f.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled("A · ", Style::default().fg(theme.overlay0)),
-            Span::styled(a.to_string(), Style::default().fg(theme.text)),
+            Span::styled(sanitize_line(a), Style::default().fg(theme.text)),
             Span::styled("   ⇄   ", Style::default().fg(theme.yellow)),
             Span::styled("B · ", Style::default().fg(theme.overlay0)),
             Span::styled(b_text, Style::default().fg(b_color)),
@@ -98,9 +99,10 @@ pub fn render(
         LensState::Error(msg) => {
             f.render_widget(
                 Paragraph::new(Line::from(Span::styled(
-                    msg.clone(),
+                    sanitize_line(msg),
                     Style::default().fg(theme.red),
-                ))),
+                )))
+                .wrap(ratatui::widgets::Wrap { trim: false }),
                 chunks[2],
             );
         }
@@ -125,13 +127,37 @@ pub fn render(
 
 /// Both sides of an optional diff field, with missing values dashed.
 fn pair<T: Display>((a, b): &(Option<T>, Option<T>)) -> (String, String) {
-    (or_dash(a.as_ref()), or_dash(b.as_ref()))
+    (
+        sanitize_line(&or_dash(a.as_ref())),
+        sanitize_line(&or_dash(b.as_ref())),
+    )
 }
 
 /// The FIELD | A | B comparison table for a completed diff.
 fn comparison_table(f: &mut Frame, area: Rect, theme: &Theme, d: &seer_core::diff::DomainDiff) {
+    // Checks that failed are listed under the table: their rows read "—",
+    // which alone would look like a real absence.
+    let error_rows = u16::try_from(d.errors.len()).unwrap_or(u16::MAX);
+    let [area, errors_area] = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(error_rows)])
+        .areas(area);
+    let errors: Vec<Line> = d
+        .errors
+        .iter()
+        .map(|e| {
+            Line::from(Span::styled(
+                format!("! {}", sanitize_line(e)),
+                Style::default().fg(theme.red),
+            ))
+        })
+        .collect();
+    f.render_widget(Paragraph::new(errors), errors_area);
+
     let (reg, dns, ssl) = (&d.registration, &d.dns, &d.ssl);
-    let joined = |(a, b): &(Vec<String>, Vec<String>)| (a.join(", "), b.join(", "));
+    let joined = |(a, b): &(Vec<String>, Vec<String>)| {
+        (sanitize_line(&a.join(", ")), sanitize_line(&b.join(", ")))
+    };
     let raw = [
         ("registrar", pair(&reg.registrar)),
         ("organization", pair(&reg.organization)),
@@ -139,10 +165,7 @@ fn comparison_table(f: &mut Frame, area: Rect, theme: &Theme, d: &seer_core::dif
         ("expires", pair(&reg.expires)),
         ("A records", joined(&dns.a_records)),
         ("nameservers", joined(&dns.nameservers)),
-        (
-            "resolves",
-            (dns.resolves.0.to_string(), dns.resolves.1.to_string()),
-        ),
+        ("resolves", pair(&dns.resolves)),
         ("ssl issuer", pair(&ssl.issuer)),
         ("ssl valid until", pair(&ssl.valid_until)),
         ("ssl days", pair(&ssl.days_remaining)),
@@ -203,7 +226,7 @@ mod tests {
             dns: DnsDiff {
                 a_records: (vec!["1.2.3.4".into()], vec!["5.6.7.8".into()]),
                 nameservers: (vec![], vec![]),
-                resolves: (true, true),
+                resolves: (Some(true), Some(true)),
             },
             ssl: SslDiff {
                 issuer: (None, None),
@@ -211,7 +234,33 @@ mod tests {
                 days_remaining: (None, None),
                 is_valid: (None, None),
             },
+            errors: Vec::new(),
         }
+    }
+
+    /// A failed check's rows read "—"; the lens must say the check failed.
+    #[test]
+    fn failed_checks_are_listed() {
+        let theme = Theme::frappe();
+        let mut diff = diff_fixture();
+        diff.errors = vec!["b.com: status check failed: HTTP request failed".into()];
+        let state = LensState::Loaded(LensData::Diff(Box::new(diff)));
+        let text = render_text(100, 24, |f| {
+            render(
+                f,
+                f.area(),
+                &theme,
+                Some("a.com"),
+                "b.com",
+                None,
+                false,
+                &state,
+            );
+        });
+        assert!(
+            text.contains("b.com: status check failed"),
+            "errors are shown: {text}"
+        );
     }
 
     #[test]

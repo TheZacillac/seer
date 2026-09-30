@@ -1,9 +1,10 @@
 use super::*;
-use crate::domain_info::{DomainInfo, DomainInfoSource, ExpiryStatus};
+use crate::domain_info::{DomainInfo, ExpiryStatus};
+use crate::output::availability_label;
 
 impl HumanFormatter {
     pub(super) fn format_tld(&self, info: &crate::tld::TldInfo) -> String {
-        let mut output = vec![self.header(&format!("TLD Info: .{}", info.tld))];
+        let mut output = vec![self.header(&format!("TLD Info: .{}", sanitize_line(&info.tld)))];
         let mut rows = self.rows(&mut output, "  ");
         rows.text("Type", &info.tld_type);
         for (label, value) in [
@@ -22,20 +23,23 @@ impl HumanFormatter {
 
     pub(super) fn format_subdomains(&self, result: &crate::subdomains::SubdomainResult) -> String {
         let mut output =
-            vec![self.header(&format!("Subdomains: {}", sanitize_display(&result.domain)))];
+            vec![self.header(&format!("Subdomains: {}", sanitize_line(&result.domain)))];
         let mut rows = self.rows(&mut output, "  ");
         rows.text("Source", &result.source);
         rows.kv("Count", self.value(&result.count.to_string()));
+        if result.truncated {
+            rows.push(format!(
+                "  {}",
+                self.warning("Truncated: the source stopped early; this list may be incomplete")
+            ));
+        }
 
         if result.subdomains.is_empty() {
             rows.push(format!("  {}", self.warning("No subdomains found")));
         } else {
             rows.blank();
             for subdomain in &result.subdomains {
-                rows.push(format!(
-                    "    - {}",
-                    self.value(&sanitize_display(subdomain))
-                ));
+                rows.push(format!("    - {}", self.value(&sanitize_line(subdomain))));
             }
         }
 
@@ -67,7 +71,8 @@ impl HumanFormatter {
             ),
         );
 
-        let days = |d: Option<i64>| d.map_or_else(|| "N/A".to_string(), |d| format!("{d} days"));
+        let days =
+            |d: Option<i64>| d.map_or_else(|| self.value("N/A"), |d| self.expiry_countdown(d));
         for r in &report.results {
             rows.blank();
             let icon = if r.issues.is_empty() {
@@ -78,7 +83,7 @@ impl HumanFormatter {
             rows.push(format!(
                 "  {} {}",
                 icon,
-                self.value(&sanitize_display(&r.domain))
+                self.value(&sanitize_line(&r.domain))
             ));
 
             // Condensed status line: SSL | Domain | HTTP
@@ -88,9 +93,9 @@ impl HumanFormatter {
             rows.push(format!(
                 "      {}: {} | {}: {} | {}: {}",
                 self.label("SSL"),
-                self.value(&days(r.ssl_days_remaining)),
+                days(r.ssl_days_remaining),
                 self.label("Domain"),
-                self.value(&days(r.domain_days_remaining)),
+                days(r.domain_days_remaining),
                 self.label("HTTP"),
                 self.value(&http)
             ));
@@ -98,10 +103,7 @@ impl HumanFormatter {
             if !r.issues.is_empty() {
                 rows.push(format!("      {}:", self.label("Issues")));
                 for issue in &r.issues {
-                    rows.push(format!(
-                        "        - {}",
-                        self.warning(&sanitize_display(issue))
-                    ));
+                    rows.push(format!("        - {}", self.warning(&sanitize_line(issue))));
                 }
             }
         }
@@ -110,28 +112,16 @@ impl HumanFormatter {
     }
 
     pub(super) fn format_domain_info(&self, info: &DomainInfo) -> String {
-        let source = match info.source {
-            DomainInfoSource::Both => "both",
-            DomainInfoSource::Rdap => "rdap",
-            DomainInfoSource::Whois => "whois",
-            DomainInfoSource::Available => "available",
-        };
         let mut output = vec![self.header(&format!(
             "Domain Info: {} (source: {})",
-            sanitize_display(&info.domain),
-            source
+            sanitize_line(&info.domain),
+            info.source
         ))];
         let mut rows = self.rows(&mut output, "  ");
 
         if let Some(verdict) = &info.availability_verdict {
-            let colored = match verdict.as_str() {
-                "available" => self.success("AVAILABLE"),
-                "likely_available" => self.warning("MAY BE AVAILABLE"),
-                "registered" => self.value("REGISTERED"),
-                "likely_registered" => self.warning("LIKELY REGISTERED"),
-                _ => self.error("UNKNOWN"),
-            };
-            rows.kv("Status", colored);
+            let (label, emphasis) = availability_label(verdict);
+            rows.kv("Status", self.emphasize(label, emphasis));
         }
 
         // Registration
@@ -146,16 +136,10 @@ impl HumanFormatter {
 
         // Derived lifecycle (computed at construction from the dates above).
         if let Some(days) = info.days_until_expiration {
-            let rendered = format!("{} days", days);
-            let styled = if days <= 30 {
-                self.warning(&rendered)
-            } else {
-                self.value(&rendered)
-            };
-            rows.kv("Days Until Expiry", styled);
+            rows.kv("Days Until Expiry", self.expiry_countdown(days));
         }
         if let Some(age) = info.domain_age_days {
-            rows.kv("Domain Age", self.value(&format!("{} days", age)));
+            rows.kv("Domain Age", self.value(&day_count(age)));
         }
         if let Some(expiry_status) = info.expiry_status {
             let rendered = expiry_status.to_string();
@@ -181,7 +165,7 @@ impl HumanFormatter {
         if !info.status_descriptions.is_empty() {
             let mut codes = rows.section("Status Codes");
             for sd in &info.status_descriptions {
-                codes.text(&sanitize_display(&sd.code), &sd.description);
+                codes.text(&sanitize_line(&sd.code), &sd.description);
             }
         }
 

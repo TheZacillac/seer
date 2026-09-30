@@ -18,7 +18,9 @@ would make the test flaky.
 
 from __future__ import annotations
 
+import _thread
 import threading
+import time
 
 import pytest
 
@@ -31,6 +33,31 @@ def test_cancel_follow_is_safe_on_fresh_process():
     against a freshly-initialized sender."""
     # Must not raise.
     seer.cancel_follow()
+
+
+def test_keyboard_interrupt_cancels_follow():
+    """Ctrl-C must interrupt a running `dns_follow` promptly.
+
+    The follow used to run inside one GIL-released `block_on`, so a
+    KeyboardInterrupt was only raised after the whole follow (up to 60
+    minutes) had finished. `interrupt_main` raises the same pending SIGINT
+    state Ctrl-C does. `.invalid` is answered by the resolver itself
+    (RFC 6761), so no query leaves the host; the 30s interval is what would
+    keep an uninterruptible call busy.
+    """
+    timer = threading.Timer(0.3, _thread.interrupt_main)
+    start = time.monotonic()
+    timer.start()
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            seer.dns_follow("seer-follow.invalid", iterations=2, interval_minutes=0.5)
+    finally:
+        timer.cancel()
+    assert time.monotonic() - start < 5, "the follow was not interrupted promptly"
+    # The single-follow guard is released: a new follow is not refused as
+    # "already running" (it fails validation instead, before any I/O).
+    with pytest.raises(ValueError):
+        seer.dns_follow("seer-follow.invalid", iterations=-1)
 
 
 @pytest.mark.live

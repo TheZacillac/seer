@@ -1,5 +1,5 @@
 use super::*;
-use crate::dns::{PropagationVerdict, ServerVerdict};
+use crate::dns::ServerVerdict;
 
 impl MarkdownFormatter {
     pub(super) fn format_propagation(&self, result: &PropagationResult) -> String {
@@ -12,16 +12,12 @@ impl MarkdownFormatter {
         ));
         output.push(String::new());
 
-        let verdict = result.verdict();
-        let (agree, responding) = (result.servers_agreeing(), result.servers_responding);
-        let detail = match verdict {
-            PropagationVerdict::NoAnswer => {
-                format!("none of the {} servers answered", result.servers_checked)
-            }
-            PropagationVerdict::Full => format!("all {responding} responding servers agree"),
-            _ => format!("{agree} of {responding} responding servers agree"),
-        };
-        output.push(format!("**{}** — {detail}", verdict.label()));
+        let responding = result.servers_responding;
+        output.push(format!(
+            "**{}** — {}",
+            result.verdict().label(),
+            propagation_detail(result)
+        ));
         output.push(String::new());
 
         let ns_details = result.nameserver_details.as_ref();
@@ -38,7 +34,7 @@ impl MarkdownFormatter {
                     .consensus_values
                     .iter()
                     .map(|v| {
-                        let mut text = format!("`{}`", MdSafe(&v.value));
+                        let mut text = format!("`{}`", MdCode(&v.value));
                         if let Some(ips) = ns_details
                             .and_then(|d| d.consensus.get(&v.value.to_ascii_lowercase()))
                             .filter(|ips| !ips.is_empty())
@@ -98,7 +94,7 @@ impl MarkdownFormatter {
                     "≠",
                     format!(
                         "`{}`",
-                        MdSafe(&propagation_difference(inc, sr.empty_answer_label()))
+                        MdCodeCell(&propagation_difference(inc, sr.empty_answer_label()))
                     ),
                     format!("{} ms", sr.response_time_ms),
                 ),
@@ -108,7 +104,7 @@ impl MarkdownFormatter {
                 "| {mark} | {} | {} | `{}` | {answer} | {time} |",
                 MdSafe(&sr.server.name),
                 MdSafe(&sr.server.location),
-                MdSafe(&sr.server.ip),
+                MdCodeCell(&sr.server.ip),
             ));
         }
 

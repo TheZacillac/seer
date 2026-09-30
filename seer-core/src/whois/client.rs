@@ -9,7 +9,7 @@ use tokio::time::timeout;
 use tracing::{debug, instrument, warn};
 
 use super::parser::{field_patterns, WhoisResponse};
-use super::servers::{get_tld, get_whois_server_for_domain};
+use super::servers::{get_tld, get_whois_server_for_domain, has_no_whois_server};
 use crate::cache::TtlCache;
 use crate::error::{Result, SeerError};
 use crate::retry::{RetryExecutor, RetryPolicy};
@@ -37,8 +37,23 @@ const IANA_WHOIS_SERVER: &str = "whois.iana.org";
 /// TTL for discovered WHOIS servers (24 hours)
 const SERVER_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// Cache for dynamically discovered WHOIS servers with TTL expiration
-static DISCOVERED_SERVERS: LazyLock<TtlCache<String, String>> =
+/// TTL for a definitive "IANA lists no WHOIS server" answer. Shorter than
+/// [`SERVER_CACHE_TTL`] so a registry that starts publishing a server is
+/// picked up the same day, while repeat lookups skip the IANA round trip.
+const NO_SERVER_CACHE_TTL: Duration = Duration::from_secs(60 * 60);
+
+/// Outcome of an IANA WHOIS-server discovery, cached per TLD.
+#[derive(Debug, Clone)]
+enum Discovery {
+    /// IANA named this (vetted) server.
+    Server(String),
+    /// IANA answered for the TLD but lists no server; the error message.
+    NoServer(String),
+}
+
+/// Cache of IANA discovery outcomes per TLD. Transient failures (timeouts,
+/// connection errors, a reply that is not an IANA record) are never cached.
+static DISCOVERED_SERVERS: LazyLock<TtlCache<String, Discovery>> =
     LazyLock::new(|| TtlCache::new(SERVER_CACHE_TTL));
 
 #[derive(Debug, Clone)]
@@ -53,6 +68,9 @@ pub struct WhoisClient {
     /// the client at a 127.0.0.1 fixture. Not settable outside `#[cfg(test)]`
     /// builds — production paths always validate.
     allow_private_hosts: bool,
+    /// Server asked to discover unmapped TLDs. Always [`IANA_WHOIS_SERVER`]
+    /// in production; the `#[cfg(test)]` seam points it at a mock.
+    iana_server: &'static str,
 }
 
 impl Default for WhoisClient {
@@ -69,6 +87,7 @@ impl WhoisClient {
             retry_policy: RetryPolicy::default(),
             port: WHOIS_PORT,
             allow_private_hosts: false,
+            iana_server: IANA_WHOIS_SERVER,
         }
     }
 
@@ -96,6 +115,13 @@ impl WhoisClient {
         self
     }
 
+    /// Test-only: discover unmapped TLDs from `server` instead of IANA.
+    #[cfg(test)]
+    fn with_iana_server(mut self, server: &'static str) -> Self {
+        self.iana_server = server;
+        self
+    }
+
     /// Sets the timeout for WHOIS queries.
     ///
     /// The default is 15 seconds to accommodate slow ccTLD registries.
@@ -106,7 +132,8 @@ impl WhoisClient {
 
     /// Sets the retry policy for transient network failures.
     ///
-    /// The default policy retries up to 3 times with exponential backoff.
+    /// The default policy makes up to 3 attempts in all (the first plus 2
+    /// retries) with exponential backoff.
     pub fn with_retry_policy(mut self, policy: RetryPolicy) -> Self {
         self.retry_policy = policy;
         self
@@ -126,25 +153,12 @@ impl WhoisClient {
     pub async fn lookup(&self, domain: &str) -> Result<WhoisResponse> {
         let start = std::time::Instant::now();
         let domain = normalize_domain(domain)?;
-        let tld = get_tld(&domain).ok_or_else(|| SeerError::InvalidDomain(domain.clone()))?;
 
         // Try the static mapping first — most-specific match wins (a
         // second-level registry zone like co.za before the plain TLD).
-        let whois_server = if let Some(server) = get_whois_server_for_domain(&domain) {
-            server.to_string()
-        } else {
-            let tld_lower = tld.to_lowercase();
-            // Try cached discovered server (TTL-aware)
-            if let Some(server) = DISCOVERED_SERVERS.get(&tld_lower) {
-                debug!(tld = %tld, server = %server, "Using cached WHOIS server");
-                server
-            } else {
-                // Query IANA to discover the WHOIS server (with retry)
-                debug!(tld = %tld, "Querying IANA for WHOIS server");
-                let server = self.discover_whois_server_with_retry(tld).await?;
-                DISCOVERED_SERVERS.insert(tld_lower, server.clone());
-                server
-            }
+        let whois_server = match get_whois_server_for_domain(&domain) {
+            Some(server) => server.to_string(),
+            None => self.discover_whois_server(get_tld(&domain)).await?,
         };
 
         let mut visited = HashSet::new();
@@ -190,9 +204,20 @@ impl WhoisClient {
 
             debug!(whois_server = %whois_server, depth = depth, "Querying WHOIS server");
 
-            // Query with retry logic
+            // The registry (depth 0) gets the full retry policy. A registrar
+            // referral hop only runs with the registry record already in
+            // hand — which is kept whenever the hop fails — so it is a
+            // single attempt rather than seconds of retries on a
+            // best-effort enrichment.
+            let policy = if depth == 0 {
+                self.retry_policy.clone()
+            } else {
+                RetryPolicy::no_retry()
+            };
             let query = format_query_for_server(whois_server, domain);
-            let raw_response = self.query_server_with_retry(whois_server, &query).await?;
+            let raw_response = self
+                .query_server_with_retry(whois_server, &query, &policy)
+                .await?;
             let current_response = WhoisResponse::parse(domain, whois_server, &raw_response);
 
             // Prefer registry response when it has core data (registrar, dates,
@@ -282,13 +307,20 @@ impl WhoisClient {
 
         let domain = normalize_domain(domain)?;
         let query = format_query_for_server(server, &domain);
-        let raw_response = self.query_server_with_retry(server, &query).await?;
+        let raw_response = self
+            .query_server_with_retry(server, &query, &self.retry_policy)
+            .await?;
         Ok(WhoisResponse::parse(&domain, server, &raw_response))
     }
 
-    /// Queries a WHOIS server with retry logic for transient failures.
-    async fn query_server_with_retry(&self, server: &str, query: &str) -> Result<String> {
-        let executor = RetryExecutor::new(self.retry_policy.clone());
+    /// Queries a WHOIS server, retrying transient failures under `policy`.
+    async fn query_server_with_retry(
+        &self,
+        server: &str,
+        query: &str,
+        policy: &RetryPolicy,
+    ) -> Result<String> {
+        let executor = RetryExecutor::new(policy.clone());
         let server = server.to_string();
         let query = query.to_string();
         let timeout_duration = self.timeout;
@@ -313,17 +345,51 @@ impl WhoisClient {
             .await
     }
 
-    /// Discovers the WHOIS server for a TLD by querying IANA (with retry).
-    async fn discover_whois_server_with_retry(&self, tld: &str) -> Result<String> {
-        let response = self.query_server_with_retry(IANA_WHOIS_SERVER, tld).await?;
+    /// Finds the WHOIS server for a TLD missing from the static map: none for
+    /// a TLD the catalog knows has no port-43 service (RDAP-only, retired or
+    /// server-less per IANA), else the cached or freshly queried IANA answer.
+    async fn discover_whois_server(&self, tld: &str) -> Result<String> {
+        if has_no_whois_server(tld) {
+            return Err(SeerError::WhoisServerNotFound(format!(
+                "No WHOIS server for '.{tld}' (the registry offers no port-43 WHOIS; use RDAP)"
+            )));
+        }
+        let discovery = match DISCOVERED_SERVERS.get(&tld.to_string()) {
+            Some(cached) => {
+                debug!(tld = %tld, "Using cached IANA discovery");
+                cached
+            }
+            None => {
+                debug!(tld = %tld, "Querying IANA for WHOIS server");
+                let discovery = self.query_iana(tld).await?;
+                let ttl = match discovery {
+                    Discovery::Server(_) => SERVER_CACHE_TTL,
+                    Discovery::NoServer(_) => NO_SERVER_CACHE_TTL,
+                };
+                DISCOVERED_SERVERS.insert_with_ttl(tld.to_string(), discovery.clone(), ttl);
+                discovery
+            }
+        };
+        match discovery {
+            Discovery::Server(server) => Ok(server),
+            Discovery::NoServer(msg) => Err(SeerError::WhoisServerNotFound(msg)),
+        }
+    }
 
-        // Parse IANA response to find the whois server
+    /// Asks IANA (with retry) for a TLD's WHOIS server. `Ok` is a definitive
+    /// answer worth caching; every failure — including a reply that is not an
+    /// IANA TLD record — is `Err` and left uncached.
+    async fn query_iana(&self, tld: &str) -> Result<Discovery> {
+        let response = self
+            .query_server_with_retry(self.iana_server, tld, &self.retry_policy)
+            .await?;
+
         // IANA response format includes a line like: "whois:        whois.nic.xyz"
         if let Some(server) = extract_iana_whois_server(&response) {
             // Validate IANA-discovered hostname before trusting/caching it.
             // A poisoned IANA response could otherwise inject a malicious
             // WHOIS server that gets cached for 24h.
-            if !is_safe_whois_server(&server) {
+            if !self.allow_private_hosts && !is_safe_whois_server(&server) {
                 warn!(server = %server, "IANA returned unsafe WHOIS server, rejecting");
                 return Err(SeerError::WhoisError(format!(
                     "IANA returned unsafe WHOIS server: {}",
@@ -335,23 +401,33 @@ impl WhoisClient {
             // or poisoned IANA response from caching a hostname that (via DNS
             // rebinding or otherwise) points at internal services (H1 amplifier
             // via 24h cache).
-            crate::net::validate_public_host(&server, WHOIS_PORT).await?;
-            return Ok(server);
+            if !self.allow_private_hosts {
+                crate::net::validate_public_host(&server, WHOIS_PORT).await?;
+            }
+            return Ok(Discovery::Server(server));
         }
 
-        // No WHOIS server found - check for registration URL in remarks
-        if let Some(url) = extract_iana_registration_url(&response) {
-            return Err(SeerError::WhoisServerNotFound(format!(
-                "No WHOIS server for '.{}' - check whois directly via: {}",
-                tld, url
-            )));
+        let msg = match extract_iana_registration_url(&response) {
+            Some(url) => format!("No WHOIS server for '.{tld}' - check whois directly via: {url}"),
+            None => format!("No WHOIS server found for TLD '{tld}'"),
+        };
+        if is_iana_record(&response) {
+            Ok(Discovery::NoServer(msg))
+        } else {
+            // Not an IANA answer (truncated, throttled, empty): do not cache.
+            Err(SeerError::WhoisServerNotFound(msg))
         }
-
-        Err(SeerError::WhoisServerNotFound(format!(
-            "No WHOIS server found for TLD '{}'",
-            tld
-        )))
     }
+}
+
+/// Whether an IANA port-43 reply is an authoritative answer for the query:
+/// a TLD record (it opens with a `domain:` line) or IANA's explicit "0
+/// objects" miss. Anything else is not a definitive "no server".
+fn is_iana_record(response: &str) -> bool {
+    response.lines().any(|line| {
+        let line = line.trim_start().to_ascii_lowercase();
+        line.starts_with("domain:") || line.contains("returned 0 objects")
+    })
 }
 
 /// Formats the wire query for registries whose port-43 servers need more
@@ -417,17 +493,7 @@ async fn query_server_internal_with(
     };
 
     debug!("WHOIS query to {}", server);
-    let mut stream = timeout(timeout_duration, TcpStream::connect(addrs.as_slice()))
-        .await
-        .map_err(|_| SeerError::Timeout(format!("connection to {} timed out", server)))?
-        // Use the unconditionally-retryable variant: the substring-gated
-        // WhoisError classifier misses transient connect failures whose OS
-        // message lacks "connection"/"refused"/"reset"/"timeout" (e.g.
-        // "Network is unreachable", "No route to host"), so those would not be
-        // retried despite the configured RetryPolicy.
-        .map_err(|e| {
-            SeerError::WhoisConnectionFailed(format!("failed to connect to {}: {}", server, e))
-        })?;
+    let mut stream = connect_ipv4_first(server, addrs, timeout_duration).await?;
 
     // Send query with CRLF
     let query_bytes = format!("{}\r\n", query);
@@ -486,6 +552,29 @@ async fn query_server_internal_with(
     let _ = stream.shutdown().await;
 
     Ok(decode_whois_body(response))
+}
+
+/// Connects to the first reachable of `addrs` within `budget`, IPv4 first
+/// with a per-address share of the budget ([`crate::net::connect_any`]).
+async fn connect_ipv4_first(
+    server: &str,
+    addrs: Vec<std::net::SocketAddr>,
+    budget: Duration,
+) -> Result<TcpStream> {
+    crate::net::connect_any(&addrs, budget, TcpStream::connect)
+        .await
+        .map_err(|e| match e {
+            // The unconditionally-retryable variant: the substring-gated
+            // WhoisError classification misses transient connect failures
+            // whose OS message lacks "connection"/"refused"/"reset"/"timeout"
+            // (e.g. "Network is unreachable", "No route to host").
+            crate::net::ConnectError::Io(e) => {
+                SeerError::WhoisConnectionFailed(format!("failed to connect to {server}: {e}"))
+            }
+            crate::net::ConnectError::TimedOut => {
+                SeerError::Timeout(format!("connection to {server} timed out"))
+            }
+        })
 }
 
 /// Decodes a raw port-43 body: UTF-8 where the bytes are valid UTF-8, and
@@ -730,7 +819,7 @@ mod tests {
     #[test]
     fn iana_discovery_rejects_unsafe_server() {
         // extract_iana_whois_server returns the value verbatim (lowercased).
-        // discover_whois_server_with_retry is expected to reject anything that
+        // `query_iana` is expected to reject anything that
         // fails is_safe_whois_server before caching it.
         let synthetic = "refer: whois.iana.org\nwhois: 127.0.0.1\n";
         let extracted = extract_iana_whois_server(synthetic);
@@ -986,6 +1075,169 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, SeerError::Timeout(_)), "got: {err:?}");
+    }
+
+    /// Serves `responses` in connection order — `None` accepts and holds the
+    /// connection silently — counting every accepted connection.
+    async fn spawn_counting_whois(
+        responses: Vec<Option<&'static str>>,
+    ) -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = accepted.clone();
+        tokio::spawn(async move {
+            let mut responses = responses.into_iter();
+            while let Ok((mut sock, _)) = listener.accept().await {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let response = responses.next().flatten();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 512];
+                    let _ = sock.read(&mut buf).await;
+                    match response {
+                        Some(r) => {
+                            let _ = sock.write_all(r.as_bytes()).await;
+                        }
+                        None => tokio::time::sleep(Duration::from_secs(10)).await,
+                    }
+                });
+            }
+        });
+        (port, accepted)
+    }
+
+    /// Catalogued TLDs without port-43 service fail fast with
+    /// `WhoisServerNotFound` — no IANA round trip (nothing listens on the
+    /// mock "IANA" port, so a query would fail as a connection error).
+    #[tokio::test]
+    async fn catalogued_no_whois_tlds_short_circuit_before_discovery() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let client = mock_client(port).with_iana_server("127.0.0.1");
+        // RDAP-only, no-WHOIS (per IANA) and retired, in turn.
+        for domain in ["example.app", "example.netflix", "example.mt"] {
+            let err = client.lookup(domain).await.unwrap_err();
+            assert!(
+                matches!(err, SeerError::WhoisServerNotFound(_)),
+                "{domain}: {err:?}"
+            );
+        }
+        // A mapped second-level zone still wins over its server-less TLD.
+        assert_eq!(
+            get_whois_server_for_domain("example.co.za"),
+            Some("whois.registry.net.za")
+        );
+    }
+
+    /// IANA's definitive "no server" answer is negative-cached: the second
+    /// lookup for the TLD does not query IANA again.
+    #[tokio::test]
+    async fn definitive_iana_no_server_answer_is_negative_cached() {
+        use std::sync::atomic::Ordering;
+        let (port, accepted) = spawn_counting_whois(vec![Some(
+            "% IANA WHOIS server\n\ndomain:       SEERNEGCACHE\n\nstatus:       ACTIVE\n",
+        )])
+        .await;
+        let client = mock_client(port).with_iana_server("127.0.0.1");
+        for _ in 0..2 {
+            let err = client.lookup("example.seernegcache").await.unwrap_err();
+            assert!(matches!(err, SeerError::WhoisServerNotFound(_)), "{err:?}");
+        }
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            1,
+            "second lookup hit the cache"
+        );
+    }
+
+    /// A reply that is not an IANA record (throttle banner) is not a
+    /// definitive answer, so it is not cached and the next lookup asks again.
+    #[tokio::test]
+    async fn non_definitive_iana_reply_is_not_cached() {
+        use std::sync::atomic::Ordering;
+        let (port, accepted) = spawn_counting_whois(vec![
+            Some("% Query rate limit exceeded, try again later\n"),
+            Some("% IANA WHOIS server\n\ndomain:       SEERTRANSIENT\n"),
+        ])
+        .await;
+        let client = mock_client(port).with_iana_server("127.0.0.1");
+        for _ in 0..3 {
+            let err = client.lookup("example.seertransient").await.unwrap_err();
+            assert!(matches!(err, SeerError::WhoisServerNotFound(_)), "{err:?}");
+        }
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            2,
+            "the throttle reply was retried, the IANA record then cached"
+        );
+    }
+
+    #[test]
+    fn iana_record_detection() {
+        assert!(is_iana_record(
+            "domain:       COM\nwhois: whois.verisign-grs.com\n"
+        ));
+        assert!(is_iana_record("% This query returned 0 objects.\n"));
+        assert!(!is_iana_record(""));
+        assert!(!is_iana_record("% rate limit exceeded\n"));
+    }
+
+    /// A referral hop runs once, not under the registry's retry policy: the
+    /// registry record is already in hand and is kept when the hop fails.
+    #[tokio::test]
+    async fn referral_hop_is_a_single_attempt() {
+        use std::sync::atomic::Ordering;
+        // Registry (127.0.0.1) answers thin with a referral to "localhost";
+        // the referral target then accepts and never answers (a timeout,
+        // which is retryable).
+        let (port, accepted) = spawn_counting_whois(vec![
+            Some("Domain Name: EXAMPLE.COM\nRegistrar WHOIS Server: localhost\n"),
+            None,
+            None,
+            None,
+        ])
+        .await;
+        let client = WhoisClient::new()
+            .with_retry_policy(
+                RetryPolicy::new()
+                    .with_max_attempts(3)
+                    .with_initial_delay(Duration::from_millis(1))
+                    .with_jitter(false),
+            )
+            .allowing_private_hosts()
+            .with_port(port)
+            .with_timeout(Duration::from_millis(200));
+        let mut visited = HashSet::new();
+        let resp = client
+            .lookup_with_referrals("example.com", "127.0.0.1", 0, &mut visited)
+            .await
+            .unwrap();
+        assert_eq!(resp.whois_server, "127.0.0.1", "registry response kept");
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            2,
+            "one registry query plus a single referral attempt"
+        );
+    }
+
+    /// An address that never answers (TEST-NET-1 is blackholed or unrouted)
+    /// costs only its share of the budget; the next address still connects.
+    #[tokio::test]
+    async fn connect_moves_past_an_unresponsive_address_within_budget() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live = listener.local_addr().unwrap();
+        let addrs = vec![
+            std::net::SocketAddr::new("192.0.2.1".parse().unwrap(), live.port()),
+            live,
+        ];
+        let start = std::time::Instant::now();
+        let stream = connect_ipv4_first("mock", addrs, Duration::from_secs(2))
+            .await
+            .expect("the live address connects");
+        assert_eq!(stream.peer_addr().unwrap(), live);
+        assert!(start.elapsed() < Duration::from_secs(2));
     }
 
     /// Registries whose port-43 servers need a non-bare query: DENIC returns

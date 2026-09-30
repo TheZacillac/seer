@@ -108,6 +108,19 @@ impl Payload {
     }
 }
 
+/// `value` as one JSON (pretty) or YAML document, or `None` for the prose
+/// formats — for results with no formatter method of their own.
+pub fn structured<T: serde::Serialize + ?Sized>(value: &T, format: OutputFormat) -> Option<String> {
+    match format {
+        OutputFormat::Json => Some(
+            serde_json::to_string_pretty(value)
+                .unwrap_or_else(|e| format!("{{\"error\":\"{}\"}}", e)),
+        ),
+        OutputFormat::Yaml => Some(YamlFormatter::new().to_yaml_value(value)),
+        OutputFormat::Human | OutputFormat::Markdown => None,
+    }
+}
+
 pub fn serialize(data: &Payload, format: OutputFormat) -> String {
     let fmt = get_formatter(format);
     match data {
@@ -115,15 +128,12 @@ pub fn serialize(data: &Payload, format: OutputFormat) -> String {
         Payload::Whois(w) => fmt.format_whois(w),
         Payload::Rdap(r) => fmt.format_rdap(r),
         Payload::Dig(result) => fmt.format_dig(result),
-        Payload::DigMany(results) => match format {
-            // One document: the array of results, as `-q` prints it.
-            OutputFormat::Json => serde_json::to_string_pretty(results)
-                .unwrap_or_else(|e| format!("{{\"error\":\"{}\"}}", e)),
-            OutputFormat::Yaml => YamlFormatter::new().to_yaml_value(results),
-            // One block per type, each with its own header. A human block
-            // opens with a blank line of its own; Markdown needs one between
-            // a block's closing note and the next heading.
-            OutputFormat::Human | OutputFormat::Markdown => results
+        // One document: the array of results, as `-q` prints it — or one
+        // block per type, each with its own header. A human block opens
+        // with a blank line of its own; Markdown needs one between a block's
+        // closing note and the next heading.
+        Payload::DigMany(results) => structured(results, format).unwrap_or_else(|| {
+            results
                 .iter()
                 .map(|result| fmt.format_dig(result))
                 .collect::<Vec<_>>()
@@ -131,8 +141,8 @@ pub fn serialize(data: &Payload, format: OutputFormat) -> String {
                     "\n\n"
                 } else {
                     "\n"
-                }),
-        },
+                })
+        }),
         Payload::Trace(trace) => fmt.format_dns_trace(trace),
         Payload::Ssl(s) => fmt.format_ssl(s),
         Payload::Status(s) => fmt.format_status(s),
@@ -144,7 +154,9 @@ pub fn serialize(data: &Payload, format: OutputFormat) -> String {
         Payload::Compare(c) => fmt.format_dns_comparison(c),
         Payload::Diff(d) => fmt.format_diff(d),
         Payload::Watch(w) => fmt.format_watch(w),
-        Payload::History(_) => "history (raw view not applicable)".to_string(),
+        // The entries as data; the prose listing is `manage::history_listing`.
+        Payload::History(entries) => structured(entries, format)
+            .unwrap_or_else(|| "history (raw view not applicable)".to_string()),
         Payload::Subdomains(s) => fmt.format_subdomains(s),
         Payload::SubdomainBaselineDiff(d) => fmt.format_subdomain_baseline_diff(d),
         Payload::Info(i) => fmt.format_domain_info(i),
@@ -212,6 +224,7 @@ pub(crate) mod fixtures {
             status: DnsStatus::NoError,
             flags: vec!["qr".into(), "rd".into(), "ra".into()],
             answers,
+            failed_types: Vec::new(),
             authority: vec![],
             wildcard: None,
             query_time_ms: 12,

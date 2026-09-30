@@ -53,16 +53,19 @@ use hickory_resolver::{ConnectionProvider, PoolContext, TlsConfig};
 use tracing::debug;
 
 use super::delegation::is_local_no_route;
-use super::resolver::apply_standard_opts;
+use super::resolver::{apply_standard_opts, RESOLVER_ATTEMPTS};
 
 /// A [`Transport::query`]'s deadline, in per-query timeouts: the resolver's
-/// `attempts` (2), so after one server times out there is time to ask the
-/// next — no longer than a resolver lookup, whose retry handle re-sends an
-/// attempt that timed out, may take.
-pub(crate) const QUERY_BUDGET_TIMEOUTS: u32 = 2;
+/// `attempts` ([`RESOLVER_ATTEMPTS`]), so after one server times out there
+/// is time to ask the next — no longer than a resolver lookup, whose retry
+/// handle re-sends an attempt that timed out, may take.
+pub(crate) const QUERY_BUDGET_TIMEOUTS: u32 = RESOLVER_ATTEMPTS as u32;
 
 /// Sends DNS requests straight to given servers over hickory's transports
 /// and hands back the responses as sent. See the module docs.
+///
+/// Cheap to clone: the options and TLS config are shared.
+#[derive(Clone)]
 pub(crate) struct Transport {
     /// What hickory's connections read: the resolver options (the per-query
     /// timeout among them) and the TLS client config for DoT/DoH.
@@ -213,6 +216,15 @@ pub(crate) struct NoResponse {
 }
 
 impl NoResponse {
+    /// Test-only: one server that timed out.
+    #[cfg(test)]
+    pub(crate) fn timed_out(ip: IpAddr) -> Self {
+        Self {
+            failures: vec![(ip, "timed out".to_string())],
+            unasked: None,
+        }
+    }
+
     /// The first reason, without its server address — for a caller that
     /// asked one server and names it itself (`timed out`).
     pub(crate) fn reason(&self) -> String {
@@ -375,7 +387,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_error_rcode_is_a_response_not_a_failure() {
-        let port = spawn_mock_dns_fn(|_, _| MockReply::ServFail).await;
+        let port = spawn_mock_dns_fn(|_, _| MockReply::Rcode(ResponseCode::ServFail)).await;
         let transport = transport();
         let request = request_for(&transport, "www.seer.test");
         let message = transport

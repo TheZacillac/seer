@@ -2,12 +2,12 @@
 //! drift, email posture, standalone CAA, confusables, and classified
 //! subdomains.
 
-use super::sanitize_display;
-use super::HumanFormatter;
+use super::{sanitize_line, HumanFormatter};
 use crate::caa::CaaPolicy;
 use crate::confusables::ConfusableReport;
 use crate::drift::DriftReport;
 use crate::headers::HeaderReport;
+use crate::output::{subdomain_status_label, takeover_label};
 use crate::posture::{EmailPosture, PostureVerdict};
 use crate::subdomains::{SubdomainBaselineDiff, SubdomainClassification, SubdomainStatus};
 use crate::takeover::{TakeoverReport, TakeoverVerdict};
@@ -19,16 +19,18 @@ impl HumanFormatter {
         let label = verdict.as_str();
         match verdict {
             PostureVerdict::Strict => self.success(label),
-            PostureVerdict::Moderate | PostureVerdict::Weak => self.warning(label),
+            PostureVerdict::Moderate | PostureVerdict::Weak | PostureVerdict::Unknown => {
+                self.warning(label)
+            }
             PostureVerdict::Present => self.value(label),
             PostureVerdict::Absent => self.error(label),
         }
     }
 
     pub(super) fn format_drift(&self, report: &DriftReport) -> String {
-        let mut out = vec![self.header(&format!("Drift: {}", sanitize_display(&report.domain)))];
+        let mut out = vec![self.header(&format!("Drift: {}", sanitize_line(&report.domain)))];
         if let Some(reason) = &report.inconclusive {
-            out.push(self.warning(&format!("Not compared: {}", sanitize_display(reason))));
+            out.push(self.warning(&format!("Not compared: {}", sanitize_line(reason))));
         } else if report.changes.is_empty() {
             out.push(self.success("No changes since the previous snapshot"));
         } else {
@@ -37,10 +39,10 @@ impl HumanFormatter {
                 let new = c.new.as_deref().unwrap_or("(none)");
                 out.push(format!(
                     "{}: {} {} {}",
-                    self.label(&c.field),
-                    self.dim(&sanitize_display(old)),
+                    self.label(&sanitize_line(&c.field)),
+                    self.dim(&sanitize_line(old)),
                     self.warning("→"),
-                    self.value(&sanitize_display(new)),
+                    self.value(&sanitize_line(new)),
                 ));
             }
         }
@@ -50,7 +52,7 @@ impl HumanFormatter {
     pub(super) fn format_subdomain_baseline_diff(&self, report: &SubdomainBaselineDiff) -> String {
         let mut out = vec![self.header(&format!(
             "Subdomain diff: {}",
-            sanitize_display(&report.domain)
+            sanitize_line(&report.domain)
         ))];
 
         if report.baseline_missing {
@@ -63,6 +65,12 @@ impl HumanFormatter {
         if let Some(at) = report.baseline_recorded_at {
             let at = self.value(&at.format("%Y-%m-%d %H:%M UTC").to_string());
             self.rows(&mut out, "").kv("Baseline recorded", at);
+        }
+        if report.baseline_truncated {
+            out.push(self.warning(
+                "Baseline came from truncated enumerations — added names may be long-standing \
+                 (not counted as new until a complete run is recorded)",
+            ));
         }
         out.push(format!(
             "{} added, {} removed, {} unchanged",
@@ -83,7 +91,7 @@ impl HumanFormatter {
                 out.push(format!(
                     "  {} {}",
                     self.warning("+"),
-                    self.value(&sanitize_display(name))
+                    self.value(&sanitize_line(name))
                 ));
             }
         }
@@ -96,7 +104,7 @@ impl HumanFormatter {
                 out.push(format!(
                     "  {} {}",
                     self.dim("-"),
-                    self.dim(&sanitize_display(name))
+                    self.dim(&sanitize_line(name))
                 ));
             }
         }
@@ -106,13 +114,17 @@ impl HumanFormatter {
     pub(super) fn format_posture(&self, posture: &EmailPosture) -> String {
         let mut out = vec![self.header(&format!(
             "Email posture: {}",
-            sanitize_display(&posture.domain)
+            sanitize_line(&posture.domain)
         ))];
 
         let line = |name: &str, verdict: PostureVerdict, detail: Option<&str>| {
             let base = format!("{}: {}", self.label(name), self.verdict(verdict));
+            let detail = match verdict {
+                PostureVerdict::Unknown => Some("(lookup failed)"),
+                _ => detail,
+            };
             match detail {
-                Some(d) if !d.is_empty() => format!("{base} {}", self.dim(&sanitize_display(d))),
+                Some(d) if !d.is_empty() => format!("{base} {}", self.dim(&sanitize_line(d))),
                 _ => base,
             }
         };
@@ -149,11 +161,7 @@ impl HumanFormatter {
             out.push(String::new());
             out.push(self.label("Advisories:"));
             for note in &posture.notes {
-                out.push(format!(
-                    "  {} {}",
-                    self.warning("•"),
-                    sanitize_display(note)
-                ));
+                out.push(format!("  {} {}", self.warning("•"), sanitize_line(note)));
             }
         }
         out.join("\n")
@@ -162,7 +170,7 @@ impl HumanFormatter {
     pub(super) fn format_headers(&self, report: &HeaderReport) -> String {
         let mut out = vec![self.header(&format!(
             "HTTP security headers: {}",
-            sanitize_display(&report.domain)
+            sanitize_line(&report.domain)
         ))];
 
         // Color the grade by band so the headline verdict is readable at a
@@ -173,7 +181,7 @@ impl HumanFormatter {
             _ => self.error(&report.grade),
         };
         let score = self.value(&report.score.to_string());
-        let url = self.value(&sanitize_display(&report.url));
+        let url = self.value(&sanitize_line(&report.url));
         let status = self.dim(&format!("[HTTP {}]", report.status));
         let mut rows = self.rows(&mut out, "");
         rows.kv("Grade", format!("{grade} ({score}/100)"));
@@ -189,11 +197,11 @@ impl HumanFormatter {
         for finding in &report.headers {
             let mut line = format!(
                 "{}: {}",
-                self.label(&finding.header),
+                self.label(&sanitize_line(&finding.header)),
                 self.verdict(finding.verdict),
             );
             if let Some(value) = &finding.value {
-                line.push_str(&format!(" {}", self.dim(&sanitize_display(value))));
+                line.push_str(&format!(" {}", self.dim(&sanitize_line(value))));
             }
             out.push(line);
         }
@@ -219,7 +227,7 @@ impl HumanFormatter {
                 .join(", ");
                 out.push(format!(
                     "  {} [{}] {}",
-                    self.value(&sanitize_display(&cookie.name)),
+                    self.value(&sanitize_line(&cookie.name)),
                     self.verdict(cookie.verdict),
                     self.dim(&flags),
                 ));
@@ -230,10 +238,10 @@ impl HumanFormatter {
             out.push(String::new());
             out.push(self.label("Disclosed software:"));
             for d in &report.disclosures {
-                let value = sanitize_display(&d.value);
+                let value = sanitize_line(&d.value);
                 out.push(format!(
                     "  {}: {}",
-                    self.dim(&d.header),
+                    self.dim(&sanitize_line(&d.header)),
                     if d.versioned {
                         self.warning(&value)
                     } else {
@@ -247,21 +255,15 @@ impl HumanFormatter {
             out.push(String::new());
             out.push(self.label("Advisories:"));
             for note in &report.notes {
-                out.push(format!(
-                    "  {} {}",
-                    self.warning("•"),
-                    sanitize_display(note)
-                ));
+                out.push(format!("  {} {}", self.warning("•"), sanitize_line(note)));
             }
         }
         out.join("\n")
     }
 
     pub(super) fn format_takeover(&self, report: &TakeoverReport) -> String {
-        let mut out = vec![self.header(&format!(
-            "Takeover scan: {}",
-            sanitize_display(&report.domain)
-        ))];
+        let mut out =
+            vec![self.header(&format!("Takeover scan: {}", sanitize_line(&report.domain)))];
 
         out.push(format!(
             "{} host(s) checked — {} vulnerable, {} potential",
@@ -277,6 +279,12 @@ impl HumanFormatter {
                 self.success("0")
             },
         ));
+        if report.inconclusive > 0 {
+            out.push(self.warning(&format!(
+                "{} host(s) could not be checked",
+                report.inconclusive
+            )));
+        }
         if report.hosts_skipped > 0 {
             out.push(self.warning(&format!(
                 "{} more host(s) exceeded the scan cap and were not examined",
@@ -287,21 +295,23 @@ impl HumanFormatter {
         if !report.findings.is_empty() {
             out.push(String::new());
             for f in &report.findings {
+                let label = takeover_label(f.verdict);
                 let verdict = match f.verdict {
-                    TakeoverVerdict::Vulnerable => self.error("VULNERABLE"),
-                    TakeoverVerdict::Potential => self.warning("potential"),
-                    TakeoverVerdict::Safe => self.success("safe"),
+                    TakeoverVerdict::Vulnerable => self.error(label),
+                    TakeoverVerdict::Potential => self.warning(label),
+                    TakeoverVerdict::Inconclusive => self.dim(label),
+                    TakeoverVerdict::Safe => self.success(label),
                 };
-                let mut line = format!("{}  [{}]", self.value(&sanitize_display(&f.host)), verdict);
+                let mut line = format!("{}  [{}]", self.value(&sanitize_line(&f.host)), verdict);
                 if let Some(provider) = &f.provider {
-                    line.push_str(&format!("  {}", self.dim(&sanitize_display(provider))));
+                    line.push_str(&format!("  {}", self.dim(&sanitize_line(provider))));
                 }
                 out.push(line);
                 if let Some(cname) = &f.cname {
                     out.push(format!(
                         "    {} {}",
                         self.label("CNAME →"),
-                        self.dim(&sanitize_display(cname)),
+                        self.dim(&sanitize_line(cname)),
                     ));
                 }
                 // The matched fingerprint is the evidence for a VULNERABLE
@@ -310,11 +320,11 @@ impl HumanFormatter {
                     out.push(format!(
                         "    {} {}",
                         self.label("Evidence:"),
-                        self.error(&sanitize_display(evidence)),
+                        self.error(&sanitize_line(evidence)),
                     ));
                 }
                 if let Some(note) = &f.probe_note {
-                    out.push(format!("    {}", self.dim(&sanitize_display(note))));
+                    out.push(format!("    {}", self.dim(&sanitize_line(note))));
                 }
             }
         }
@@ -322,7 +332,7 @@ impl HumanFormatter {
         if !report.notes.is_empty() {
             out.push(String::new());
             for note in &report.notes {
-                out.push(format!("{} {}", self.warning("•"), sanitize_display(note)));
+                out.push(format!("{} {}", self.warning("•"), sanitize_line(note)));
             }
         }
         out.join("\n")
@@ -336,17 +346,14 @@ impl HumanFormatter {
             rows.text("iodef (incident reporting)", &policy.iodef.join(", "));
         }
         if let Some(note) = &policy.wildcard_note {
-            rows.kv("Wildcard", self.warning(&sanitize_display(note)));
+            rows.kv("Wildcard", self.warning(&sanitize_line(note)));
         }
         self.push_caa_note_footer(&mut out, policy);
         out.join("\n")
     }
 
     pub(super) fn format_confusables(&self, report: &ConfusableReport) -> String {
-        let mut out = vec![self.header(&format!(
-            "Look-alikes: {}",
-            sanitize_display(&report.domain)
-        ))];
+        let mut out = vec![self.header(&format!("Look-alikes: {}", sanitize_line(&report.domain)))];
         out.push(format!(
             "{} candidates generated, {} registered",
             self.value(&report.candidates_generated.to_string()),
@@ -364,10 +371,10 @@ impl HumanFormatter {
                 let registrar = r.registrar.as_deref().unwrap_or("-");
                 out.push(format!(
                     "{}  [{}]  registered {}  via {}",
-                    self.warning(&sanitize_display(&r.domain)),
-                    self.dim(&r.technique),
+                    self.warning(&sanitize_line(&r.domain)),
+                    self.dim(&sanitize_line(&r.technique)),
                     self.value(&created),
-                    self.dim(&sanitize_display(registrar)),
+                    self.dim(&sanitize_line(registrar)),
                 ));
             }
         }
@@ -378,8 +385,7 @@ impl HumanFormatter {
         &self,
         result: &SubdomainClassification,
     ) -> String {
-        let mut out =
-            vec![self.header(&format!("Subdomains: {}", sanitize_display(&result.domain)))];
+        let mut out = vec![self.header(&format!("Subdomains: {}", sanitize_line(&result.domain)))];
         if result.wildcard_detected {
             out.push(
                 self.warning(
@@ -413,17 +419,24 @@ impl HumanFormatter {
         }
         out.push(String::new());
         for s in &result.subdomains {
+            let label = subdomain_status_label(s.status);
             let status = match s.status {
-                SubdomainStatus::Live => self.success("live"),
-                SubdomainStatus::Dead => self.dim("dead"),
-                SubdomainStatus::Wildcard => self.warning("wildcard"),
-                SubdomainStatus::Unknown => self.warning("unknown"),
+                SubdomainStatus::Live => self.success(label),
+                SubdomainStatus::Dead => self.dim(label),
+                SubdomainStatus::Wildcard | SubdomainStatus::Unknown => self.warning(label),
             };
-            let mut line = format!("{}  [{}]", self.value(&sanitize_display(&s.name)), status);
+            let mut line = format!("{}  [{}]", self.value(&sanitize_line(&s.name)), status);
+            if let Some(cname) = &s.cname {
+                line.push_str(&format!(
+                    "  {} {}",
+                    self.label("CNAME →"),
+                    self.dim(&sanitize_line(cname))
+                ));
+            }
             if let Some(risk) = &s.takeover_risk {
                 line.push_str(&format!(
                     "  {}",
-                    self.error(&format!("takeover risk: {}", sanitize_display(risk)))
+                    self.error(&format!("takeover risk: {}", sanitize_line(risk)))
                 ));
             }
             out.push(line);

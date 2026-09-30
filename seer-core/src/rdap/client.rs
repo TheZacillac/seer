@@ -14,10 +14,11 @@ use super::bootstrap::{ip_matches_prefix, parse_asn_range, validate_bootstrap_ur
 use super::types::RdapResponse;
 use crate::error::{Result, SeerError};
 use crate::http::{read_body_capped, BodyReadError, Overflow};
-use crate::retry::{NetworkRetryClassifier, RetryClassifier, RetryExecutor, RetryPolicy};
+use crate::retry::{RetryExecutor, RetryPolicy};
 use crate::validation::normalize_domain;
 
-const IANA_BOOTSTRAP_DNS: &str = "https://data.iana.org/rdap/dns.json";
+/// IANA RDAP bootstrap registry for DNS (also probed by `seer doctor`).
+pub(crate) const IANA_BOOTSTRAP_DNS: &str = "https://data.iana.org/rdap/dns.json";
 const IANA_BOOTSTRAP_IPV4: &str = "https://data.iana.org/rdap/ipv4.json";
 const IANA_BOOTSTRAP_IPV6: &str = "https://data.iana.org/rdap/ipv6.json";
 const IANA_BOOTSTRAP_ASN: &str = "https://data.iana.org/rdap/asn.json";
@@ -294,6 +295,103 @@ async fn wait_for_in_flight_load(
     }
 }
 
+/// Outcome of trying to claim the (single-flight) bootstrap load.
+enum BootstrapClaim {
+    /// This caller owns the load; dropping the guard ends it.
+    Won(BootstrapLoadGuard),
+    /// A load is in flight, or one was attempted within
+    /// [`BOOTSTRAP_REFRESH_MIN_INTERVAL`].
+    Busy,
+}
+
+/// Claims the bootstrap load unless one is running or was attempted within
+/// the throttle window. The attempt timestamp and the in-flight flag are set
+/// in one critical section, so a loser that observes the timestamp also
+/// observes the flag (see [`wait_for_in_flight_load`]).
+async fn claim_bootstrap_load() -> BootstrapClaim {
+    let mut last = BOOTSTRAP_LAST_ATTEMPT.write().await;
+    let throttled = last.is_some_and(|ts| ts.elapsed() < BOOTSTRAP_REFRESH_MIN_INTERVAL);
+    if throttled || BOOTSTRAP_LOAD_IN_FLIGHT.load(Ordering::SeqCst) {
+        return BootstrapClaim::Busy;
+    }
+    *last = Some(Instant::now());
+    BootstrapClaim::Won(BootstrapLoadGuard::start())
+}
+
+/// Stores a finished load (merged over any previous data). A failed load
+/// keeps whatever (stale) data is cached: it is an error only when there is
+/// nothing to serve.
+async fn finish_bootstrap_load(result: Result<BootstrapLoad>) -> Result<()> {
+    match result {
+        Ok(load) => {
+            store_bootstrap_load(&mut *BOOTSTRAP_CACHE.write().await, load);
+            Ok(())
+        }
+        Err(e) => match BOOTSTRAP_CACHE.read().await.as_ref() {
+            Some(cached) => {
+                debug!(
+                    error = %e,
+                    age_hours = cached.age().as_secs() / 3600,
+                    "Bootstrap refresh failed, using stale data"
+                );
+                Ok(())
+            }
+            None => Err(e),
+        },
+    }
+}
+
+/// Makes bootstrap data available, running `load` at most once at a time
+/// (single-flight) and at most once per [`BOOTSTRAP_REFRESH_MIN_INTERVAL`].
+///
+/// * Fresh cache: returns at once; `load` is dropped unrun.
+/// * Stale cache: returns at once, serving the stale data, and — when this
+///   caller wins the claim — refreshes it on a spawned task. The task owns the
+///   in-flight guard, so a later caller cannot start a second refresh while it
+///   runs.
+/// * Cold cache: the winner loads inline (the cache lock is not held across
+///   the network load); losers wait, bounded, for its result via
+///   [`BOOTSTRAP_LOAD_NOTIFY`] instead of failing with "throttled".
+async fn ensure_bootstrap_with<F>(load: F) -> Result<()>
+where
+    F: std::future::Future<Output = Result<BootstrapLoad>> + Send + 'static,
+{
+    let stale = match BOOTSTRAP_CACHE.read().await.as_ref() {
+        Some(cached) if !cached.is_expired() => return Ok(()),
+        Some(_) => true,
+        None => false,
+    };
+
+    // Subscribe BEFORE the claim: a `notify_waiters()` from the winner then
+    // cannot slip between observing "busy, empty cache" and the wait below.
+    let notified = BOOTSTRAP_LOAD_NOTIFY.notified();
+    tokio::pin!(notified);
+
+    let guard = match claim_bootstrap_load().await {
+        BootstrapClaim::Won(guard) => guard,
+        BootstrapClaim::Busy if stale => return Ok(()),
+        BootstrapClaim::Busy => return wait_for_in_flight_load(notified).await,
+    };
+
+    if stale {
+        debug!("Serving stale RDAP bootstrap data; refreshing in the background");
+        tokio::spawn(async move {
+            // The result is stored (or logged) for later callers; this one
+            // has already been served the stale data.
+            let _ = finish_bootstrap_load(load.await).await;
+            drop(guard);
+        });
+        return Ok(());
+    }
+
+    debug!("Loading RDAP bootstrap data");
+    let outcome = finish_bootstrap_load(load.await).await;
+    // Clear the in-flight flag and wake losers only after the cache write
+    // above, so they observe its result.
+    drop(guard);
+    outcome
+}
+
 #[derive(Debug, Clone)]
 pub struct RdapClient {
     retry_policy: RetryPolicy,
@@ -369,122 +467,14 @@ impl RdapClient {
         self
     }
 
-    /// Ensures bootstrap data is loaded and not expired.
+    /// Ensures bootstrap data is loaded, loading or refreshing it as needed.
     ///
-    /// Uses stale-while-revalidate: if refresh fails, stale data is used.
-    /// Performs the actual network load WITHOUT holding the write lock, so
-    /// concurrent readers are never blocked by an in-flight HTTP request
-    /// (fix for the previous deadlock/await-under-lock hazard).
-    ///
-    /// Refresh attempts are also throttled to at most one per
-    /// `BOOTSTRAP_REFRESH_MIN_INTERVAL` to avoid thundering-herd storms
-    /// against IANA when bootstrap is down.
-    ///
-    /// Concurrent cold-cache callers coordinate via `BOOTSTRAP_LOAD_NOTIFY`:
-    /// losers of the throttle race wait (with a bounded timeout) for the
-    /// winner's load instead of erroring out immediately.
+    /// Stale-while-revalidate: once the cache holds data, an expired dataset
+    /// is served as-is and refreshed by a background task, so no lookup waits
+    /// on IANA after the first load. Only a cold (empty) cache loads inline —
+    /// there is nothing to serve until it lands. See [`ensure_bootstrap_with`].
     async fn ensure_bootstrap(&self) -> Result<()> {
-        // Fast path: read-lock and return if fresh.
-        {
-            let cache = BOOTSTRAP_CACHE.read().await;
-            if let Some(cached) = cache.as_ref() {
-                if !cached.is_expired() {
-                    return Ok(());
-                }
-            }
-        }
-
-        // Register a notify subscription BEFORE we check the throttle gate,
-        // so a `notify_waiters()` from the winner can't slip between our
-        // "still throttled, empty cache" check and our `.notified().await`.
-        // `Notify::notified()` holds the permit slot the moment it's
-        // constructed; only `.await` blocks.
-        let notified = BOOTSTRAP_LOAD_NOTIFY.notified();
-        tokio::pin!(notified);
-
-        // Throttle refresh attempts. If another caller tried very recently,
-        // either return stale data we already have, or wait for their load
-        // to complete rather than erroring with "throttled and no cache".
-        {
-            let last = BOOTSTRAP_LAST_ATTEMPT.read().await;
-            if let Some(ts) = *last {
-                if ts.elapsed() < BOOTSTRAP_REFRESH_MIN_INTERVAL {
-                    // Another caller attempted a refresh very recently.
-                    let cache = BOOTSTRAP_CACHE.read().await;
-                    if cache.is_some() {
-                        // We have some data (possibly stale) — accept it.
-                        return Ok(());
-                    }
-                    // Cache is empty AND another task is mid-load (or just
-                    // failed). Wait for an in-flight load instead of
-                    // returning an error; a load that already failed yields
-                    // the throttle error without waiting.
-                    drop(cache);
-                    drop(last);
-                    return wait_for_in_flight_load(notified).await;
-                }
-            }
-        }
-
-        // Record the attempt timestamp before we begin the network load, and
-        // mark the load in flight inside the same critical section: a loser
-        // that observes the fresh timestamp is then guaranteed to observe the
-        // in-flight flag too (see `wait_for_in_flight_load`).
-        let load_guard = {
-            let mut last = BOOTSTRAP_LAST_ATTEMPT.write().await;
-            // Double-check in case another task just updated it.
-            if let Some(ts) = *last {
-                if ts.elapsed() < BOOTSTRAP_REFRESH_MIN_INTERVAL {
-                    drop(last);
-                    let cache = BOOTSTRAP_CACHE.read().await;
-                    if cache.is_some() {
-                        return Ok(());
-                    }
-                    drop(cache);
-                    return wait_for_in_flight_load(notified).await;
-                }
-            }
-            *last = Some(Instant::now());
-            BootstrapLoadGuard::start()
-        };
-
-        // Perform the actual load WITHOUT holding any cache lock. Whichever
-        // branch exits (or if this future is dropped mid-load), dropping
-        // `load_guard` clears the in-flight flag and notifies waiters so
-        // losers don't hang for the full bounded timeout.
-        debug!("Loading/refreshing RDAP bootstrap data");
-        let load_result = load_bootstrap_data_with_retry(&self.retry_policy).await;
-
-        let outcome = match load_result {
-            Ok(load) => {
-                // Merges per registry over any previous (stale) data, and
-                // skips the store if another task loaded fresh data while we
-                // ran.
-                let mut cache = BOOTSTRAP_CACHE.write().await;
-                store_bootstrap_load(&mut cache, load);
-                Ok(())
-            }
-            Err(e) => {
-                // Stale-while-revalidate: keep using any existing stale cache.
-                let cache = BOOTSTRAP_CACHE.read().await;
-                if let Some(cached) = cache.as_ref() {
-                    debug!(
-                        error = %e,
-                        age_hours = cached.age().as_secs() / 3600,
-                        "Bootstrap refresh failed, using stale data"
-                    );
-                    Ok(())
-                } else {
-                    // No stale data available.
-                    Err(e)
-                }
-            }
-        };
-
-        // Clear the in-flight flag and wake any losers waiting on our load
-        // (after the cache write above, so they observe its result).
-        drop(load_guard);
-        outcome
+        ensure_bootstrap_with(load_bootstrap_data_with_retry(self.retry_policy.clone())).await
     }
 
     /// Looks up the candidate RDAP base URLs for a domain's TLD.
@@ -658,55 +648,21 @@ impl RdapClient {
         ))
     }
 
-    /// Queries a single RDAP endpoint, retrying transient failures. Unlike the
-    /// generic `RetryExecutor`, this honors a `Retry-After` header on HTTP 429
-    /// responses — registries rate-limit aggressively, and the server-suggested
-    /// delay clears the limit far more reliably than blind exponential backoff.
+    /// Queries a single RDAP endpoint, retrying transient failures. A 429's
+    /// `Retry-After` is handed to the executor as the delay hint —
+    /// registries rate-limit aggressively, and the server-suggested delay
+    /// clears the limit far more reliably than blind exponential backoff.
+    /// The policy's `max_delay` caps the hint, so a sticky limit still falls
+    /// through to the WHOIS/DNS fallback instead of hanging a lookup.
     async fn query_rdap_with_retry(&self, url: &str) -> Result<RdapResponse> {
-        let classifier = NetworkRetryClassifier::new();
-        let mut attempt = 0;
-        loop {
-            match query_rdap_attempt(url, self.timeout, self.allow_reserved).await {
-                Ok(resp) => return Ok(resp),
-                Err((err, retry_after)) => {
-                    let attempts_remaining =
-                        self.retry_policy.max_attempts.saturating_sub(attempt + 1);
-                    if !classifier.is_retryable(&err) || attempts_remaining == 0 {
-                        return Err(if attempt > 0 {
-                            SeerError::RetryExhausted {
-                                attempts: attempt + 1,
-                                last_error: Box::new(err),
-                            }
-                        } else {
-                            err
-                        });
-                    }
-                    let backoff = self.retry_policy.delay_for_attempt(attempt);
-                    let delay = effective_retry_delay(backoff, retry_after);
-                    debug!(
-                        url = %url,
-                        attempt = attempt + 1,
-                        max_attempts = self.retry_policy.max_attempts,
-                        delay_ms = delay.as_millis(),
-                        error = %err,
-                        "Retrying RDAP after transient error"
-                    );
-                    tokio::time::sleep(delay).await;
-                    attempt += 1;
-                }
-            }
-        }
+        RetryExecutor::new(self.retry_policy.clone())
+            .execute_with_delay_hint(|| query_rdap_attempt(url, self.timeout, self.allow_reserved))
+            .await
     }
 }
 
 /// Maximum RDAP response body size (10 MB, matching CT log response limit).
 const MAX_RDAP_RESPONSE_SIZE: usize = 10 * 1024 * 1024;
-
-/// Cap on how long we'll honor a server-supplied `Retry-After`. Real RDAP
-/// 429s ask for a second or two; anything larger we treat as "give up and
-/// fall back to WHOIS/DNS" rather than hang an interactive lookup — and the
-/// cap also stops a hostile/misconfigured header from pinning the client.
-const MAX_RETRY_AFTER: Duration = Duration::from_secs(5);
 
 /// Parses an RDAP URL and enforces the https-only scheme, returning the
 /// (unbracketed) host and effective port.
@@ -765,16 +721,6 @@ async fn validate_url_not_reserved(url: &str) -> Result<Vec<SocketAddr>> {
 /// exponential backoff).
 fn parse_retry_after(value: &str) -> Option<Duration> {
     value.trim().parse::<u64>().ok().map(Duration::from_secs)
-}
-
-/// Chooses the delay before the next RDAP attempt: honor the server's
-/// `Retry-After` (capped at [`MAX_RETRY_AFTER`]) when present, otherwise use
-/// the policy's exponential backoff.
-fn effective_retry_delay(backoff: Duration, retry_after: Option<Duration>) -> Duration {
-    match retry_after {
-        Some(hint) => hint.min(MAX_RETRY_AFTER),
-        None => backoff,
-    }
 }
 
 /// TTL for cached pinned RDAP clients. Short by design: on expiry the next
@@ -1024,10 +970,15 @@ async fn query_rdap_attempt(
         } else {
             None
         };
-        return Err((
-            SeerError::RdapError(format!("query failed with status {}", status)),
-            retry_after,
-        ));
+        // A 429 is its own error kind, so it survives retry exhaustion as
+        // RateLimited (Python `RateLimitedError`, REST 429) instead of a
+        // generic RDAP failure.
+        let error = if status.as_u16() == 429 {
+            SeerError::RateLimited(format!("RDAP query failed with status {}", status))
+        } else {
+            SeerError::RdapError(format!("query failed with status {}", status))
+        };
+        return Err((error, retry_after));
     }
 
     read_and_parse_rdap_body(response, &current, timeout)
@@ -1038,9 +989,10 @@ async fn query_rdap_attempt(
 /// Loads IANA RDAP bootstrap data from all registries with retry. Only a
 /// load where *every* registry failed is an error (and is retryable); a
 /// partial load succeeds and is merged by [`store_bootstrap_load`].
-async fn load_bootstrap_data_with_retry(policy: &RetryPolicy) -> Result<BootstrapLoad> {
-    let executor = RetryExecutor::new(policy.clone());
-    executor.execute(load_bootstrap_data).await
+async fn load_bootstrap_data_with_retry(policy: RetryPolicy) -> Result<BootstrapLoad> {
+    RetryExecutor::new(policy)
+        .execute(load_bootstrap_data)
+        .await
 }
 
 /// Loads IANA RDAP bootstrap data from all registries. Each section of the
@@ -1249,7 +1201,7 @@ async fn load_bootstrap_data() -> Result<BootstrapLoad> {
         .filter(|v| !v.is_empty());
 
     // If ALL four registries failed, that's a real error. The message is
-    // matched by `NetworkRetryClassifier` as transient, so the retry policy
+    // matched by `retry::is_retryable` as transient, so the retry policy
     // gets another go at IANA.
     if dns.is_none() && ipv4.is_none() && ipv6.is_none() && asn.is_none() {
         return Err(SeerError::RdapBootstrapError(
@@ -1276,9 +1228,10 @@ async fn load_bootstrap_data() -> Result<BootstrapLoad> {
 /// Wraps the "all N candidate URLs failed" case for `query_rdap_urls`.
 ///
 /// Preserves the `SeerError::Timeout` variant when the last failure was a
-/// timeout, so upstream callers that branch on `Timeout` for retry-or-not
-/// decisions can still do so. Non-timeout failures are wrapped in a generic
-/// `RdapError` with the last error's Display in the message. The
+/// timeout — bare, or after retries (`RetryExhausted` wrapping a timeout,
+/// the usual shape since timeouts are retryable) — so upstream callers that
+/// branch on `Timeout` still can. Non-timeout failures are wrapped in a
+/// generic `RdapError` with the last error's Display in the message. The
 /// single-candidate case returns the last error unchanged to avoid
 /// double-wrapping.
 fn wrap_all_candidates_failed(last_error: Option<SeerError>, candidate_count: usize) -> SeerError {
@@ -1293,6 +1246,26 @@ fn wrap_all_candidates_failed(last_error: Option<SeerError>, candidate_count: us
             "all {} RDAP candidate URLs timed out; last error: {}",
             candidate_count, msg
         )),
+        SeerError::RetryExhausted { ref last_error, .. }
+            if matches!(**last_error, SeerError::Timeout(_)) =>
+        {
+            SeerError::Timeout(format!(
+                "all {} RDAP candidate URLs timed out; last error: {}",
+                candidate_count, last
+            ))
+        }
+        SeerError::RateLimited(_) => SeerError::RateLimited(format!(
+            "all {} RDAP candidate URLs failed; last error: {}",
+            candidate_count, last
+        )),
+        SeerError::RetryExhausted { ref last_error, .. }
+            if matches!(**last_error, SeerError::RateLimited(_)) =>
+        {
+            SeerError::RateLimited(format!(
+                "all {} RDAP candidate URLs failed; last error: {}",
+                candidate_count, last
+            ))
+        }
         other => SeerError::RdapError(format!(
             "all {} RDAP candidate URLs failed; last error: {}",
             candidate_count, other
@@ -1358,24 +1331,12 @@ mod tests {
     }
 
     #[test]
-    fn effective_retry_delay_prefers_capped_retry_after() {
-        // Honors the server hint when present.
+    fn default_policy_caps_retry_after_at_five_seconds() {
+        // The executor caps a Retry-After hint at the policy's max_delay; the
+        // RDAP default keeps it at 5s so a sticky limit falls through fast.
         assert_eq!(
-            effective_retry_delay(Duration::from_millis(100), Some(Duration::from_secs(5))),
+            RdapClient::new().retry_policy.max_delay,
             Duration::from_secs(5)
-        );
-        // Caps an excessive hint at MAX_RETRY_AFTER so a bad header can't pin us.
-        assert_eq!(
-            effective_retry_delay(Duration::from_millis(100), Some(Duration::from_secs(600))),
-            MAX_RETRY_AFTER
-        );
-    }
-
-    #[test]
-    fn effective_retry_delay_falls_back_to_backoff() {
-        assert_eq!(
-            effective_retry_delay(Duration::from_millis(250), None),
-            Duration::from_millis(250)
         );
     }
 
@@ -1544,6 +1505,32 @@ mod tests {
                 other
             ),
         }
+    }
+
+    #[test]
+    fn test_wrap_all_candidates_failed_preserves_retried_timeout() {
+        // Timeouts are retryable, so a candidate's timeout usually arrives
+        // wrapped in RetryExhausted; it must still surface as a Timeout.
+        let last = SeerError::RetryExhausted {
+            attempts: 3,
+            last_error: Box::new(SeerError::Timeout("request timed out".to_string())),
+        };
+        let wrapped = wrap_all_candidates_failed(Some(last), 2);
+        assert!(
+            matches!(wrapped, SeerError::Timeout(ref s)
+                if s.contains("all 2 RDAP candidate URLs timed out")
+                    && s.contains("request timed out")),
+            "expected wrapped Timeout, got: {wrapped:?}"
+        );
+        // A retried non-timeout failure stays an RdapError.
+        let last = SeerError::RetryExhausted {
+            attempts: 3,
+            last_error: Box::new(SeerError::RdapError("query failed with status 503".into())),
+        };
+        assert!(matches!(
+            wrap_all_candidates_failed(Some(last), 2),
+            SeerError::RdapError(_)
+        ));
     }
 
     #[test]
@@ -1722,6 +1709,35 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.handle.as_deref(), Some("MOCK-1"));
+    }
+
+    /// Regression: a registry that kept answering 429 surfaced as a generic
+    /// RDAP error, so Python raised RuntimeError and the API returned 500.
+    #[tokio::test]
+    async fn mock_rdap_persistent_429_is_rate_limited() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "0"))
+            .mount(&server)
+            .await;
+
+        let client = RdapClient::new().allowing_reserved_for_tests();
+        let err = client
+            .query_rdap_with_retry(&format!("{}/domain/example.com", server.uri()))
+            .await
+            .unwrap_err();
+        let inner = match &err {
+            SeerError::RetryExhausted { last_error, .. } => last_error.as_ref(),
+            other => other,
+        };
+        assert!(matches!(inner, SeerError::RateLimited(_)), "got: {err:?}");
+
+        // Across several candidate URLs the kind is kept too.
+        let wrapped = wrap_all_candidates_failed(Some(err), 2);
+        assert!(
+            matches!(wrapped, SeerError::RateLimited(_)),
+            "got: {wrapped:?}"
+        );
     }
 
     #[tokio::test]
@@ -2222,5 +2238,107 @@ mod tests {
 
         let mut cache = BOOTSTRAP_CACHE.write().await;
         *cache = None;
+    }
+
+    /// Seeds an already-expired dataset and clears the refresh throttle.
+    async fn seed_stale_bootstrap() {
+        *BOOTSTRAP_CACHE.write().await = Some(CachedBootstrap::with_ttl(
+            full_load().merge_over(None),
+            Duration::ZERO,
+        ));
+        *BOOTSTRAP_LAST_ATTEMPT.write().await = None;
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        assert!(BOOTSTRAP_CACHE.read().await.as_ref().unwrap().is_expired());
+    }
+
+    /// Stale-while-revalidate: a caller holding stale data is served at once
+    /// while the refresh runs in the background, and a second caller during
+    /// that refresh neither waits nor starts another load (single-flight).
+    #[tokio::test]
+    async fn stale_bootstrap_is_served_while_refreshing_in_background() {
+        let _guard = BOOTSTRAP_TEST_LOCK.lock().await;
+        seed_stale_bootstrap().await;
+
+        let (release, gate) = tokio::sync::oneshot::channel::<()>();
+        let loads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = loads.clone();
+        let slow_load = async move {
+            counted.fetch_add(1, Ordering::SeqCst);
+            let _ = gate.await;
+            Ok(full_load())
+        };
+
+        // Returns before the (blocked) load completes.
+        tokio::time::timeout(Duration::from_secs(1), ensure_bootstrap_with(slow_load))
+            .await
+            .expect("a stale read must not wait for the refresh")
+            .expect("stale data is served");
+        assert!(BOOTSTRAP_LOAD_IN_FLIGHT.load(Ordering::SeqCst));
+
+        // A concurrent caller is served too, without a second load.
+        *BOOTSTRAP_LAST_ATTEMPT.write().await = None; // only in-flight gates it
+        let second = loads.clone();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            ensure_bootstrap_with(async move {
+                second.fetch_add(1, Ordering::SeqCst);
+                Ok(full_load())
+            }),
+        )
+        .await
+        .expect("second stale read must not wait")
+        .expect("stale data is served");
+        tokio::task::yield_now().await;
+        assert_eq!(loads.load(Ordering::SeqCst), 1, "one refresh at a time");
+
+        // Let the refresh finish: the cache becomes fresh.
+        release.send(()).expect("refresh task is waiting");
+        let refreshed = async {
+            while BOOTSTRAP_LOAD_IN_FLIGHT.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), refreshed)
+            .await
+            .expect("background refresh completes");
+        {
+            let cache = BOOTSTRAP_CACHE.read().await;
+            let cached = cache.as_ref().expect("cache populated");
+            assert!(!cached.is_expired());
+            assert_eq!(cached.ttl, BOOTSTRAP_TTL);
+        }
+
+        *BOOTSTRAP_CACHE.write().await = None;
+        *BOOTSTRAP_LAST_ATTEMPT.write().await = None;
+    }
+
+    /// A failed background refresh keeps serving the stale data.
+    #[tokio::test]
+    async fn failed_background_refresh_keeps_stale_bootstrap() {
+        let _guard = BOOTSTRAP_TEST_LOCK.lock().await;
+        seed_stale_bootstrap().await;
+
+        ensure_bootstrap_with(async {
+            Err(SeerError::RdapBootstrapError(
+                "all IANA bootstrap registries failed".to_string(),
+            ))
+        })
+        .await
+        .expect("stale data is served");
+        let settled = async {
+            while BOOTSTRAP_LOAD_IN_FLIGHT.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), settled)
+            .await
+            .expect("background refresh settles");
+        assert!(
+            BOOTSTRAP_CACHE.read().await.is_some(),
+            "stale data survives a failed refresh"
+        );
+
+        *BOOTSTRAP_CACHE.write().await = None;
+        *BOOTSTRAP_LAST_ATTEMPT.write().await = None;
     }
 }

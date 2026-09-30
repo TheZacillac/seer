@@ -48,11 +48,21 @@ impl ServerResult {
     /// How an empty answer from this server reads: `NXDOMAIN` when the name
     /// does not exist, `NODATA` when it exists without records of the type.
     pub fn empty_answer_label(&self) -> &'static str {
-        if self.status == Some(DnsStatus::NxDomain) {
-            "NXDOMAIN"
-        } else {
-            "NODATA"
-        }
+        negative_label(self.is_nxdomain())
+    }
+
+    /// Whether the server answered NXDOMAIN: the name does not exist.
+    pub(super) fn is_nxdomain(&self) -> bool {
+        self.status == Some(DnsStatus::NxDomain)
+    }
+}
+
+/// How an empty answer reads: `NXDOMAIN` or `NODATA`.
+fn negative_label(nxdomain: bool) -> &'static str {
+    if nxdomain {
+        "NXDOMAIN"
+    } else {
+        "NODATA"
     }
 }
 
@@ -101,7 +111,9 @@ pub struct UnreachableServer {
 /// the consensus. Carries the queried record type and the raw value sets on
 /// both sides so consumers can render or compare them without parsing strings.
 ///
-/// Empty `values` / `consensus` represent NXDOMAIN (no records).
+/// Empty `values` / `consensus` are a negative answer: NXDOMAIN when the
+/// matching flag is set, else NODATA. The two are different answers, so a
+/// server answering NXDOMAIN differs from a NODATA consensus.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Inconsistency {
     #[serde(rename = "type")]
@@ -110,6 +122,12 @@ pub struct Inconsistency {
     pub server_ip: String,
     pub values: Vec<String>,
     pub consensus: Vec<String>,
+    /// Whether this server's answer was NXDOMAIN (its `values` are empty).
+    #[serde(default)]
+    pub nxdomain: bool,
+    /// Whether the consensus answer was NXDOMAIN (`consensus` is empty).
+    #[serde(default)]
+    pub consensus_nxdomain: bool,
 }
 
 impl Inconsistency {
@@ -150,7 +168,7 @@ pub struct NameserverIpInconsistency {
 }
 
 /// Render a value set for human-readable Display output, substituting
-/// `empty_label` when the set is empty (NXDOMAIN/NODATA semantics).
+/// `empty_label` when the set is empty.
 fn render_value_set(values: &[String], empty_label: &str) -> String {
     if values.is_empty() {
         empty_label.to_string()
@@ -181,8 +199,8 @@ impl std::fmt::Display for Inconsistency {
             self.server_name,
             self.server_ip,
             self.record_type,
-            render_value_set(&self.values, "NXDOMAIN"),
-            render_value_set(&self.consensus, "NXDOMAIN"),
+            render_value_set(&self.values, negative_label(self.nxdomain)),
+            render_value_set(&self.consensus, negative_label(self.consensus_nxdomain)),
         )
     }
 }
@@ -206,8 +224,9 @@ pub struct NameserverDetails {
     pub consensus: HashMap<String, Vec<String>>,
     /// Per-vantage view: for each propagation server (keyed by its IP), the
     /// A/AAAA value set that resolver returned when asked for each nameserver
-    /// hostname. Missing entries mean the per-vantage A/AAAA lookup wasn't
-    /// issued or yielded nothing.
+    /// hostname. An empty set is a negative answer (NXDOMAIN/NODATA for both
+    /// types); a missing entry means no data — the lookup was not issued,
+    /// failed or ran out of time — and is never read as a disagreement.
     pub per_vantage: HashMap<String, HashMap<String, Vec<String>>>,
     /// Propagation resolvers whose per-vantage IPs disagree with `consensus`.
     /// The primary signal for glue-record propagation lag — a regional
@@ -221,10 +240,6 @@ impl NameserverDetails {
     pub fn has_inconsistencies(&self) -> bool {
         !self.inconsistencies.is_empty()
     }
-}
-
-fn default_dnssec_validated() -> bool {
-    false
 }
 
 /// Aggregated result of DNS propagation check across multiple global servers.
@@ -251,7 +266,7 @@ pub struct PropagationResult {
     /// validation, and UDP DNS responses are trivially spoofable. Callers
     /// and formatters should surface this to avoid giving a false sense of
     /// authenticity.
-    #[serde(default = "default_dnssec_validated")]
+    #[serde(default)]
     pub dnssec_validated: bool,
     /// NS-record-specific propagation detail (consensus, per-vantage view,
     /// inconsistencies). `None` for non-NS lookups and for NS lookups that
@@ -342,10 +357,11 @@ impl PropagationResult {
         if self.servers_responding == 0 {
             return 0;
         }
-        let mut sets: Vec<&Vec<String>> = Vec::new();
+        let mut sets: Vec<(&Vec<String>, bool)> = Vec::new();
         for inc in &self.inconsistencies {
-            if !sets.contains(&&inc.values) {
-                sets.push(&inc.values);
+            let answer = (&inc.values, inc.nxdomain);
+            if !sets.contains(&answer) {
+                sets.push(answer);
             }
         }
         1 + sets.len()
@@ -443,6 +459,8 @@ mod tests {
             server_ip: "203.0.113.2".to_string(),
             values: vec!["5.6.7.8".to_string()],
             consensus: vec!["1.2.3.4".to_string()],
+            nxdomain: false,
+            consensus_nxdomain: false,
         }];
         assert!(result.has_inconsistencies());
     }
@@ -546,6 +564,8 @@ mod tests {
             server_ip: "192.0.2.2".into(),
             values: vec!["5.6.7.8".into()],
             consensus: vec!["1.2.3.4".into()],
+            nxdomain: false,
+            consensus_nxdomain: false,
         }];
         result.servers_responding = 2;
 
@@ -569,6 +589,8 @@ mod tests {
             server_ip: "192.0.2.1".into(),
             values: vec!["a".into(), "b".into(), "z".into()],
             consensus: vec!["a".into(), "b".into(), "c".into(), "d".into()],
+            nxdomain: false,
+            consensus_nxdomain: false,
         };
         assert_eq!(inc.missing_count(), 2);
         assert_eq!(inc.extra_values(), ["z"]);
@@ -582,6 +604,8 @@ mod tests {
             server_ip: ip.into(),
             values: vec![value.into()],
             consensus: vec!["1.2.3.4".into()],
+            nxdomain: false,
+            consensus_nxdomain: false,
         };
         let mut result = empty_result("example.com", 50.0);
         assert_eq!(result.distinct_answers(), 0, "nobody answered");
@@ -617,5 +641,24 @@ mod tests {
         result.results = vec![answered("A", "192.0.2.1", DnsStatus::NxDomain)];
         result.servers_responding = 1;
         assert_eq!(result.empty_consensus_label(), Some("NXDOMAIN"));
+    }
+
+    /// Regression: the Display called every empty set "NXDOMAIN", a NODATA
+    /// answer included.
+    #[test]
+    fn inconsistency_display_names_the_negative_answer() {
+        let inc = Inconsistency {
+            record_type: RecordType::A,
+            server_name: "S".into(),
+            server_ip: "192.0.2.1".into(),
+            values: vec![],
+            consensus: vec![],
+            nxdomain: true,
+            consensus_nxdomain: false,
+        };
+        assert_eq!(
+            inc.to_string(),
+            "S (192.0.2.1) [A]: NXDOMAIN vs consensus: NODATA"
+        );
     }
 }

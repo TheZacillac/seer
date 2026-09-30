@@ -56,7 +56,7 @@ pub enum SeerError {
         message: String,
         /// Whether the failure is transient (connect / timeout / 429 / 5xx),
         /// classified once while the typed error is still available. Read by
-        /// the retry classifier ([`crate::retry::NetworkRetryClassifier`]).
+        /// the retry classifier ([`crate::retry::is_retryable`]).
         transient: bool,
     },
 
@@ -74,12 +74,6 @@ pub enum SeerError {
 
     #[error("SSL error: {0}")]
     SslError(String),
-
-    #[error("Bulk operation failed: {context}")]
-    BulkOperationError {
-        context: String,
-        failures: Vec<(String, String)>,
-    },
 
     #[error("Lookup failed for {domain}: {details}\n\nTip: Try checking the registry directly at: {registry_url}")]
     LookupFailed {
@@ -196,9 +190,6 @@ impl SeerError {
             SeerError::RateLimited(_) => "Rate limited - please try again later".to_string(),
             SeerError::CertificateError(_) => "Certificate validation failed".to_string(),
             SeerError::SslError(_) => "SSL inspection failed".to_string(),
-            SeerError::BulkOperationError { context, .. } => {
-                format!("Bulk operation partially failed: {}", context)
-            }
             // Drop `details` (built from upstream RDAP/WHOIS error strings).
             SeerError::LookupFailed { domain, .. } => format!("Lookup failed for {}", domain),
             SeerError::ConfigError(_) => "Configuration error".to_string(),

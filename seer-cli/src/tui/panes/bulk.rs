@@ -28,27 +28,32 @@ pub struct BulkState {
     pub selected: Option<usize>,
     /// Whether the detail panel for the selected row is expanded.
     pub detail: bool,
+    /// First line of the detail panel shown (PgUp/PgDn scroll it).
+    pub detail_scroll: u16,
     /// `BULK_OPS` index the current `rows` were produced with, captured when the
     /// run starts. `o` changes `op_idx` for the NEXT run, so the results title
     /// and CSV export must not follow it.
     pub run_op_idx: Option<usize>,
 }
 
-/// Parse a free-form domains blob (typed or pasted) into a capped list. Same
-/// filtering as `parse_domains_from_file` (trim, skip blank/`#`, require a dot)
-/// but split on whitespace / comma / newline so single- or multi-line input works.
-/// Lines starting with `#` are dropped before token splitting so that a token
-/// following the comment marker on the same line is also excluded.
-pub fn parse_domains_input(s: &str) -> Vec<String> {
-    s.lines()
-        .map(str::trim)
-        .filter(|line| !line.starts_with('#'))
-        .flat_map(|line| line.split([',', ' ', '\t']))
-        .map(str::trim)
-        .filter(|t| !t.is_empty() && !t.starts_with('#') && t.contains('.'))
-        .map(str::to_string)
-        .take(50)
-        .collect()
+/// Rows a PgUp/PgDn moves the detail panel.
+const DETAIL_PAGE: u16 = 5;
+
+/// Parse the domains field (typed or pasted; a single line, so domains are
+/// separated by spaces or commas) into the run's list. Each token becomes a
+/// line for `ops::parse_bulk_domains`, the one bulk-list parser the CLI's
+/// files go through too: dotted names only, `#`-tokens skipped, and more
+/// than `MAX_BULK_DOMAINS` an error rather than a silent truncation.
+/// `Ok(vec![])` when nothing was entered.
+pub fn parse_domains_input(s: &str) -> Result<Vec<String>, String> {
+    let lines: Vec<&str> = s
+        .split(|c: char| c.is_whitespace() || c == ',')
+        .filter(|t| !t.is_empty())
+        .collect();
+    if lines.is_empty() {
+        return Ok(Vec::new());
+    }
+    crate::ops::parse_bulk_domains(&lines.join("\n"))
 }
 
 impl BulkState {
@@ -112,6 +117,7 @@ impl BulkState {
         self.gen += 1;
         self.selected = None;
         self.detail = false;
+        self.detail_scroll = 0;
         self.run_op_idx = Some(self.op_idx);
     }
 
@@ -124,6 +130,7 @@ impl BulkState {
         let cur = self.selected.unwrap_or(last) as isize;
         let next = (cur + delta).clamp(0, last as isize) as usize;
         self.selected = Some(next);
+        self.detail_scroll = 0;
     }
 
     /// Handle a key event for the Bulk pane. `Some(_)` = consumed; never `Esc`.
@@ -143,6 +150,15 @@ impl BulkState {
                 self.move_selection(1);
                 Some(PaneOutcome::None)
             }
+            // Scroll the open detail panel.
+            KeyCode::PageDown if self.detail => {
+                self.detail_scroll = self.detail_scroll.saturating_add(DETAIL_PAGE);
+                Some(PaneOutcome::None)
+            }
+            KeyCode::PageUp if self.detail => {
+                self.detail_scroll = self.detail_scroll.saturating_sub(DETAIL_PAGE);
+                Some(PaneOutcome::None)
+            }
             KeyCode::Char('k') | KeyCode::Up => {
                 self.move_selection(-1);
                 Some(PaneOutcome::None)
@@ -157,6 +173,7 @@ impl BulkState {
                     return Some(PaneOutcome::None);
                 }
                 self.detail = !self.detail;
+                self.detail_scroll = 0;
                 Some(PaneOutcome::None)
             }
             // Cancel an in-flight run
@@ -175,9 +192,12 @@ impl BulkState {
                 if self.rows.is_empty() {
                     Some(PaneOutcome::None)
                 } else {
-                    let path = format!("seer-bulk-{}.csv", self.results_op());
-                    let contents = self.to_csv();
-                    Some(PaneOutcome::Action(Action::WriteCsv { path, contents }))
+                    let op = self.results_op();
+                    Some(PaneOutcome::Action(Action::WriteCsv {
+                        name: format!("seer-bulk-{op}.csv"),
+                        // The CLI's table-driven exporter: the op's own columns.
+                        contents: crate::utils::bulk_results_to_csv(&self.rows, op),
+                    }))
                 }
             }
             _ => None,
@@ -187,13 +207,16 @@ impl BulkState {
     /// Validate the entered domains and emit a `StartBulk` action, or a toast
     /// when the list is empty.
     fn start_run(&mut self) -> PaneOutcome {
-        let domains = parse_domains_input(&self.domains);
-        if domains.is_empty() {
-            return PaneOutcome::Toast {
-                tone: "info",
-                msg: "enter domains first (d)",
-            };
-        }
+        let domains = match parse_domains_input(&self.domains) {
+            Ok(domains) if domains.is_empty() => {
+                return PaneOutcome::Toast {
+                    tone: "info",
+                    msg: "enter domains first (d)".to_string(),
+                }
+            }
+            Ok(domains) => domains,
+            Err(msg) => return PaneOutcome::Toast { tone: "fail", msg },
+        };
         self.begin_run();
         self.total = domains.len();
         PaneOutcome::Action(Action::StartBulk(BulkParams {
@@ -201,23 +224,6 @@ impl BulkState {
             domains,
             gen: self.gen,
         }))
-    }
-
-    /// Build a CSV string from the current rows. Reuses the CLI's
-    /// `escape_csv_field` so the export is RFC 4180 quoted and protected
-    /// against spreadsheet formula injection.
-    pub fn to_csv(&self) -> String {
-        use crate::utils::escape_csv_field;
-        let mut out = String::from("domain,success,error,duration_ms\n");
-        for r in &self.rows {
-            let domain = escape_csv_field(r.operation.domain());
-            let err = escape_csv_field(r.error.as_deref().unwrap_or(""));
-            out.push_str(&format!(
-                "{},{},{},{}\n",
-                domain, r.success, err, r.duration_ms
-            ));
-        }
-        out
     }
 }
 
@@ -269,18 +275,36 @@ mod tests {
 
     #[test]
     fn parse_domains_input_splits_and_filters() {
-        let got = parse_domains_input("google.com, github.com\nrust-lang.org  bad\n# comment.skip");
-        assert_eq!(got, vec!["google.com", "github.com", "rust-lang.org"]);
-        // "bad" has no dot → dropped; "# comment.skip" starts with # → dropped.
+        let got = parse_domains_input("google.com, github.com rust-lang.org  bad #comment.skip");
+        assert_eq!(
+            got.unwrap(),
+            vec!["google.com", "github.com", "rust-lang.org"]
+        );
+        // "bad" has no dot → dropped; "#comment.skip" starts with # → dropped.
+        assert_eq!(parse_domains_input("  ").unwrap(), Vec::<String>::new());
     }
 
+    /// More than 50 domains used to be cut to 50 without a word; the pane
+    /// now shares the CLI's cap, and an over-long list is an error.
     #[test]
-    fn parse_domains_input_caps_at_50() {
-        let many = (0..80)
-            .map(|i| format!("d{i}.com"))
-            .collect::<Vec<_>>()
-            .join(" ");
-        assert_eq!(parse_domains_input(&many).len(), 50);
+    fn parse_domains_input_uses_the_cli_cap_instead_of_truncating() {
+        let list = |n: usize| {
+            (0..n)
+                .map(|i| format!("d{i}.com"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        assert_eq!(parse_domains_input(&list(80)).unwrap().len(), 80);
+        let err = parse_domains_input(&list(crate::ops::MAX_BULK_DOMAINS + 1)).unwrap_err();
+        assert!(err.contains("maximum"), "got: {err}");
+
+        let mut s = BulkState {
+            domains: list(crate::ops::MAX_BULK_DOMAINS + 1),
+            ..Default::default()
+        };
+        let out = s.handle_key(key(KeyCode::Char('r')));
+        assert!(!s.running, "an over-long list must not start");
+        assert!(matches!(out, Some(PaneOutcome::Toast { tone: "fail", .. })));
     }
 
     #[test]
@@ -360,8 +384,8 @@ mod tests {
         assert_eq!(s.op(), "status");
         assert_eq!(s.results_op(), "lookup");
         match s.handle_key(key(KeyCode::Char('e'))) {
-            Some(PaneOutcome::Action(Action::WriteCsv { path, .. })) => {
-                assert_eq!(path, "seer-bulk-lookup.csv");
+            Some(PaneOutcome::Action(Action::WriteCsv { name, .. })) => {
+                assert_eq!(name, "seer-bulk-lookup.csv");
             }
             other => panic!("expected WriteCsv, got {other:?}"),
         }
@@ -542,53 +566,50 @@ mod tests {
         }
     }
 
+    /// The export is the CLI's table-driven CSV for the run's op, not a
+    /// four-column summary.
     #[test]
-    fn to_csv_produces_header_and_row() {
+    fn export_uses_the_cli_csv_for_the_runs_op() {
         let mut s = BulkState::default();
         s.rows.push(make_lookup_result("x.com"));
-        let csv = s.to_csv();
-        assert!(csv.starts_with("domain,success,error,duration_ms\n"));
-        assert!(csv.contains("x.com,true,,5"));
-    }
-
-    #[test]
-    fn to_csv_escapes_commas_in_error() {
-        let mut s = BulkState::default();
         s.rows.push(BulkResult {
             operation: BulkOperation::Lookup {
-                domain: "bad.com".to_string(),
+                domain: "=bad.com".to_string(),
             },
             success: false,
             data: None,
             error: Some("timeout, retry failed".to_string()),
             duration_ms: 10,
         });
-        let csv = s.to_csv();
-        // Commas inside the error field must be RFC 4180 quoted (not stripped).
-        assert!(
-            csv.contains("\"timeout, retry failed\""),
-            "error with comma must be quoted, got: {csv}"
+        let Some(PaneOutcome::Action(Action::WriteCsv { contents, .. })) =
+            s.handle_key(key(KeyCode::Char('e')))
+        else {
+            panic!("expected WriteCsv");
+        };
+        assert_eq!(
+            contents,
+            crate::utils::bulk_results_to_csv(&s.rows, "lookup")
         );
+        let header = contents.lines().next().unwrap();
+        assert!(header.starts_with("domain,success,"), "{header}");
+        assert!(header.ends_with(",error"), "{header}");
+        assert_ne!(header, "domain,success,error,duration_ms");
     }
 
     #[test]
-    fn to_csv_protects_against_formula_injection() {
+    fn page_keys_scroll_the_open_detail_and_reset_on_move() {
         let mut s = BulkState::default();
-        s.rows.push(BulkResult {
-            operation: BulkOperation::Lookup {
-                domain: "=cmd.com".to_string(),
-            },
-            success: false,
-            data: None,
-            error: Some("=HYPERLINK(\"evil\")".to_string()),
-            duration_ms: 10,
-        });
-        let csv = s.to_csv();
-        // Formula-leading fields are prefixed with a single quote.
-        assert!(csv.contains("'=cmd.com"), "domain must be guarded: {csv}");
-        assert!(
-            csv.contains("\"'=HYPERLINK(\"\"evil\"\")\""),
-            "error must be guarded + quoted: {csv}"
-        );
+        s.rows.push(make_lookup_result("a.com"));
+        s.rows.push(make_lookup_result("b.com"));
+        // Closed detail: PgDn is not the pane's.
+        assert!(s.handle_key(key(KeyCode::PageDown)).is_none());
+        s.handle_key(key(KeyCode::Char('v')));
+        s.handle_key(key(KeyCode::PageDown));
+        s.handle_key(key(KeyCode::PageDown));
+        assert_eq!(s.detail_scroll, 2 * DETAIL_PAGE);
+        s.handle_key(key(KeyCode::PageUp));
+        assert_eq!(s.detail_scroll, DETAIL_PAGE);
+        s.handle_key(key(KeyCode::Char('k')));
+        assert_eq!(s.detail_scroll, 0, "another row starts at its top");
     }
 }

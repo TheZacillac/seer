@@ -63,15 +63,17 @@ const PRIMARY_RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
 /// for outbound queries from a public-facing tool.
 ///
 /// This is the single source of truth for SSRF range checks across every
-/// outbound leg (RDAP, WHOIS, status, DNS). It covers, for IPv4: loopback,
-/// private (RFC1918), link-local (incl. 169.254.169.254 metadata), multicast,
-/// broadcast, unspecified, 0.0.0.0/8, documentation (RFC5737), CGNAT
-/// (100.64/10), IETF 192.0.0.0/24, benchmark (198.18/15), and class-E
-/// (240/4); and for IPv6: loopback, multicast, unspecified, ULA (fc00::/7),
-/// link-local (fe80::/10), site-local (fec0::/10), documentation
-/// (2001:db8::/32), 6to4 (2002::/16), Teredo (2001::/32),
-/// NAT64 (64:ff9b::/96 and 64:ff9b:1::/48), and the IPv4-mapped, SIIT
-/// IPv4-translated, and IPv4-compatible forms (re-checking the embedded IPv4).
+/// outbound leg (RDAP, WHOIS, DNS nameservers, HTTP probes, TLS inspection,
+/// webhooks). It covers, for IPv4: loopback, private (RFC 1918), link-local
+/// (incl. 169.254.169.254 metadata), multicast, broadcast, 0.0.0.0/8,
+/// documentation (RFC 5737), CGNAT (100.64/10), IETF 192.0.0.0/24, the
+/// deprecated 6to4 relay anycast 192.88.99.0/24, benchmarking (198.18/15),
+/// and 240/4; and for IPv6: loopback, multicast, unspecified, ULA (fc00::/7),
+/// link-local (fe80::/10), site-local (fec0::/10), discard-only (100::/64),
+/// documentation (2001:db8::/32, 3fff::/20), benchmarking (2001:2::/48),
+/// Teredo (2001::/32), 6to4 (2002::/16), SRv6 SIDs (5f00::/16), NAT64
+/// (64:ff9b::/96, 64:ff9b:1::/48), and the IPv4-mapped, SIIT
+/// IPv4-translated and IPv4-compatible forms (re-checking the embedded IPv4).
 pub fn is_reserved_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
@@ -91,6 +93,8 @@ pub fn is_reserved_ip(ip: IpAddr) -> bool {
                 || (o[0] == 100 && (o[1] & 0xC0) == 64)
                 // 192.0.0.0/24 — IETF protocol assignments.
                 || (o[0] == 192 && o[1] == 0 && o[2] == 0)
+                // 192.88.99.0/24 — deprecated 6to4 relay anycast (RFC 7526).
+                || (o[0] == 192 && o[1] == 88 && o[2] == 99)
                 // 198.18.0.0/15 — network benchmark.
                 || (o[0] == 198 && (o[1] == 18 || o[1] == 19))
         }
@@ -112,8 +116,21 @@ pub fn is_reserved_ip(ip: IpAddr) -> bool {
             if (seg[0] & 0xffc0) == 0xfec0 {
                 return true;
             }
-            // Documentation 2001:db8::/32
-            if seg[0] == 0x2001 && seg[1] == 0x0db8 {
+            // Documentation 2001:db8::/32 and 3fff::/20 (RFC 9637).
+            if (seg[0] == 0x2001 && seg[1] == 0x0db8) || (seg[0] == 0x3fff && seg[1] & 0xf000 == 0)
+            {
+                return true;
+            }
+            // Benchmarking 2001:2::/48 (RFC 5180).
+            if seg[0] == 0x2001 && seg[1] == 0x0002 && seg[2] == 0 {
+                return true;
+            }
+            // Discard-only 100::/64 (RFC 6666).
+            if seg[0] == 0x0100 && seg[1] == 0 && seg[2] == 0 && seg[3] == 0 {
+                return true;
+            }
+            // SRv6 SIDs 5f00::/16 (RFC 9602) — segment identifiers, not hosts.
+            if seg[0] == 0x5f00 {
                 return true;
             }
             // 6to4 2002::/16 — embeds an IPv4 a 6to4 relay can reach (e.g.
@@ -303,15 +320,79 @@ pub async fn resolve_public_host(host: &str, port: u16) -> Result<Vec<SocketAddr
 /// User agent for seer's own HTTP probes (status, headers, takeover, webhook).
 pub(crate) const USER_AGENT: &str = concat!("Seer/", env!("CARGO_PKG_VERSION"));
 
-/// Starts a reqwest client for an outbound leg: an overall `timeout`, and
-/// redirects never followed automatically. reqwest's own policy would resolve
-/// each `Location` host itself, skipping the SSRF guard and any
-/// `resolve_to_addrs` pin (redirect-based SSRF); legs that need redirects
-/// follow them by hand and re-validate every hop.
+/// Starts a reqwest client for an outbound leg: an overall `timeout`,
+/// redirects never followed automatically, and no proxy.
+///
+/// reqwest's own redirect policy would resolve each `Location` host itself,
+/// skipping the SSRF guard and any `resolve_to_addrs` pin (redirect-based
+/// SSRF); legs that need redirects follow them by hand and re-validate every
+/// hop. Proxies are off for the same reason: by default reqwest honors
+/// `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`, and a proxy resolves the target
+/// host itself, so the vetted, pinned addresses would never be used.
 pub(crate) fn client_builder(timeout: Duration) -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .timeout(timeout)
         .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+}
+
+/// Orders addresses IPv4 first, each family keeping its given order.
+///
+/// Resolvers commonly return AAAA before A, and on a host with an IPv6 route
+/// but no IPv6 transit a leading IPv6 address burns the whole budget before
+/// any IPv4 one is tried. IPv6 stays as the fallback, so IPv6-only hosts still
+/// work. `ip` projects the address out of each element.
+pub(crate) fn ipv4_first<T>(addrs: &mut [T], ip: impl Fn(&T) -> IpAddr) {
+    addrs.sort_by_key(|a| ip(a).is_ipv6());
+}
+
+/// Why [`connect_any`] found no address to connect to.
+#[derive(Debug)]
+pub(crate) enum ConnectError {
+    /// The last address tried ran out of its share of the budget.
+    TimedOut,
+    /// The last address tried failed outright (or there were none).
+    Io(std::io::Error),
+}
+
+/// Connects to the first of `addrs` that accepts, IPv4 first, all within
+/// `timeout`.
+///
+/// Each address gets an equal share of the budget still left, and a failure
+/// or an expired share moves on to the next address. One connect over the
+/// whole list under a single deadline let a black-holed first address (an
+/// IPv6 route with no IPv6 transit) spend the entire budget, so a reachable
+/// IPv4 address behind it was never tried.
+pub(crate) async fn connect_any<T, F, Fut>(
+    addrs: &[SocketAddr],
+    timeout: Duration,
+    connect: F,
+) -> std::result::Result<T, ConnectError>
+where
+    F: Fn(SocketAddr) -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<T>>,
+{
+    let mut ordered = addrs.to_vec();
+    ipv4_first(&mut ordered, SocketAddr::ip);
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut last = ConnectError::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        "no address to connect to",
+    ));
+    for (i, addr) in ordered.iter().enumerate() {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        // `ordered.len() - i` is at least 1: the addresses not yet tried.
+        let share = remaining / u32::try_from(ordered.len() - i).unwrap_or(u32::MAX);
+        match tokio::time::timeout(share, connect(*addr)).await {
+            Ok(Ok(stream)) => return Ok(stream),
+            Ok(Err(e)) => last = ConnectError::Io(e),
+            Err(_) => last = ConnectError::TimedOut,
+        }
+    }
+    Err(last)
 }
 
 /// A URL's host as the SSRF guard wants it. Uses `host()` rather than
@@ -361,10 +442,11 @@ pub(crate) async fn validate_http_url(url: &Url) -> Result<Vec<SocketAddr>> {
     let host = url_host(url).ok_or_else(|| SeerError::HttpError("missing URL host".to_string()))?;
     let port = url.port_or_known_default().unwrap_or(443);
 
-    // Only allow standard HTTP/HTTPS ports to prevent port scanning via redirects
+    // Standard HTTP/HTTPS ports only, for the initial URL and every redirect
+    // hop alike — otherwise a redirect chain becomes a port scanner.
     if port != 80 && port != 443 {
         return Err(SeerError::HttpError(format!(
-            "non-standard port {} is not allowed in redirects",
+            "non-standard port {} is not allowed",
             port
         )));
     }
@@ -523,6 +605,79 @@ mod tests {
     }
 
     #[test]
+    fn rejects_special_purpose_ranges() {
+        for ip in [
+            "192.88.99.1",      // 6to4 relay anycast
+            "2001:2::1",        // benchmarking /48
+            "2001:2:0:ffff::1", // ...its last /64
+            "3fff::1",          // documentation /20
+            "3fff:fff:ffff::1", // ...its top
+            "100::1",           // discard-only /64
+            "5f00::1",          // SRv6 SIDs
+            "5f00:ffff::1",
+        ] {
+            assert!(is_reserved_ip(ip.parse().unwrap()), "{ip} must be reserved");
+        }
+        // The neighbours stay public.
+        for ip in [
+            "192.88.98.1",
+            "2001:3::1",
+            "3fff:1000::1",
+            "100:0:0:1::1",
+            "5f01::1",
+        ] {
+            assert!(!is_reserved_ip(ip.parse().unwrap()), "{ip} must be public");
+        }
+    }
+
+    #[test]
+    fn ipv4_first_keeps_each_family_in_order() {
+        let mut addrs: Vec<IpAddr> = ["2001:db8::1", "192.0.2.1", "2001:db8::2", "192.0.2.2"]
+            .iter()
+            .map(|a| a.parse().unwrap())
+            .collect();
+        ipv4_first(&mut addrs, |ip| *ip);
+        let text: Vec<String> = addrs.iter().map(IpAddr::to_string).collect();
+        assert_eq!(
+            text,
+            ["192.0.2.1", "192.0.2.2", "2001:db8::1", "2001:db8::2"]
+        );
+    }
+
+    /// Regression: reqwest honors `HTTPS_PROXY` by default, and a proxy
+    /// resolves the target itself, voiding the `resolve_to_addrs` pin.
+    ///
+    /// Only `HTTPS_PROXY` is set, and only while the client is built (reqwest
+    /// reads it then): no other hermetic test sends `https://` through
+    /// reqwest, so a client built concurrently elsewhere is unaffected.
+    #[tokio::test]
+    async fn client_builder_ignores_proxy_environment() {
+        use tokio::net::TcpListener;
+
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_port = target.local_addr().unwrap().port();
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_url = format!("http://{}", proxy.local_addr().unwrap());
+
+        std::env::set_var("HTTPS_PROXY", &proxy_url);
+        let client = client_builder(Duration::from_secs(2)).build();
+        std::env::remove_var("HTTPS_PROXY");
+        let client = client.unwrap();
+
+        // The target accepts and hangs up, so the handshake fails fast; only
+        // where the TCP connection went matters.
+        let accepted = tokio::spawn(async move { target.accept().await.is_ok() });
+        let _ = client
+            .get(format!("https://127.0.0.1:{target_port}/"))
+            .send()
+            .await;
+        let direct = tokio::time::timeout(Duration::from_secs(2), accepted).await;
+        assert!(matches!(direct, Ok(Ok(true))), "must connect to the target");
+        let via_proxy = tokio::time::timeout(Duration::from_millis(100), proxy.accept()).await;
+        assert!(via_proxy.is_err(), "must not connect through the proxy");
+    }
+
+    #[test]
     fn allows_public_v4() {
         assert!(!is_reserved_ip("8.8.8.8".parse().unwrap()));
         assert!(!is_reserved_ip("1.1.1.1".parse().unwrap()));
@@ -614,5 +769,60 @@ mod tests {
         assert!(msg.contains("fallback"), "got: {msg}");
         // The external projection must not carry the host or resolver text.
         assert_eq!(err.sanitized_message(), "DNS resolution failed");
+    }
+
+    #[tokio::test]
+    async fn connect_tries_ipv4_first() {
+        let v6: SocketAddr = "[2001:db8::1]:443".parse().unwrap();
+        let v4: SocketAddr = "192.0.2.1:443".parse().unwrap();
+        let tried = std::sync::Mutex::new(Vec::new());
+        let got = connect_any(&[v6, v4], Duration::from_secs(5), |addr| {
+            tried.lock().unwrap().push(addr);
+            async move { Ok::<_, std::io::Error>(addr) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(got, v4);
+        assert_eq!(*tried.lock().unwrap(), [v4]);
+    }
+
+    /// Regression: one connect over the whole list under one deadline let a
+    /// black-holed first address spend the entire budget.
+    #[tokio::test]
+    async fn a_hanging_address_leaves_budget_for_the_next() {
+        let dead: SocketAddr = "192.0.2.1:443".parse().unwrap();
+        let live: SocketAddr = "192.0.2.2:443".parse().unwrap();
+        let got = connect_any(
+            &[dead, live],
+            Duration::from_millis(400),
+            |addr| async move {
+                if addr == dead {
+                    std::future::pending::<()>().await;
+                }
+                Ok::<_, std::io::Error>(addr)
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(got, live);
+
+        // A refusal moves on at once; all failing reports the last failure.
+        let err = connect_any(&[dead, live], Duration::from_secs(5), |_| async {
+            Err::<(), _>(std::io::Error::from(std::io::ErrorKind::ConnectionRefused))
+        })
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, ConnectError::Io(ref e) if e.kind() == std::io::ErrorKind::ConnectionRefused),
+            "got {err:?}"
+        );
+
+        // Every address hanging is a timeout.
+        let err = connect_any(&[dead], Duration::from_millis(50), |_| async {
+            std::future::pending::<std::io::Result<()>>().await
+        })
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ConnectError::TimedOut), "got {err:?}");
     }
 }
