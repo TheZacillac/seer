@@ -19,6 +19,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   gained WHOIS on the same server (IANA changed 2026-09-28). Every change was
   verified with a live port-43 query. The 12 WHOIS-retired TLDs were
   re-checked against IANA and still publish no server, so none were re-added.
+- **`whois` on a TLD without WHOIS says where to look instead.** When the TLD
+  publishes RDAP (`.apple`, `.dev`, `.cymru`, …), the error names the
+  `rdap <domain>` and `lookup <domain>` commands. When it publishes neither
+  (`.mt`, `.lk`), the error links the registry's page. Previously the error
+  told users to "use RDAP" even for TLDs that have none. This covers the CLI,
+  the REPL and the TUI.
 
 ## [0.52.0] - 2026-09-30
 

@@ -350,8 +350,10 @@ impl WhoisClient {
     /// server-less per IANA), else the cached or freshly queried IANA answer.
     async fn discover_whois_server(&self, tld: &str) -> Result<String> {
         if has_no_whois_server(tld) {
+            // Not every such TLD publishes RDAP either (.lk, .mt), so the
+            // message states only the fact; callers can offer alternatives.
             return Err(SeerError::WhoisServerNotFound(format!(
-                "No WHOIS server for '.{tld}' (the registry offers no port-43 WHOIS; use RDAP)"
+                "'.{tld}' has no port-43 WHOIS service"
             )));
         }
         let discovery = match DISCOVERED_SERVERS.get(&tld.to_string()) {
