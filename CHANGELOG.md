@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.52.0] - 2026-09-30
+
 A hardening release from a full adversarial review of every crate: SSRF and
 output-injection gaps closed, several misleading verdicts corrected, the
 CLI, REPL and TUI brought onto one grammar and pipeline each, and the Python
@@ -158,7 +160,7 @@ change — see **Changed** and **Removed**.
   an unsupported TLD, 502 for upstream/DNS/TLS failures (these were 500).
   MCP retry advice is chosen by error type, error text is sanitized and
   capped, and string arguments are length-capped. `seer_subdomains` is
-  limited to 5/minute. seer-api now needs the next `domain-seer` release.
+  limited to 5/minute. seer-api now requires `domain-seer>=0.52.0`.
 - **Rust API:** `lookup_email_posture(.., nameserver)`,
   `lookup_caa(.., nameserver) -> Result`, `scan_takeover(.., timeout)`;
   the `~/.seer` stores' `load()` returns `Result`;
@@ -1776,7 +1778,8 @@ Two notable breaking changes landed in this period:
   The human and markdown formatters group both fields by record type and
   omit the per-type subheader when only one type is present.
 
-[Unreleased]: https://github.com/TheZacillac/seer/compare/v0.51.0...HEAD
+[Unreleased]: https://github.com/TheZacillac/seer/compare/v0.52.0...HEAD
+[0.52.0]: https://github.com/TheZacillac/seer/compare/v0.51.0...v0.52.0
 [0.51.0]: https://github.com/TheZacillac/seer/compare/v0.50.0...v0.51.0
 [0.50.0]: https://github.com/TheZacillac/seer/compare/v0.49.1...v0.50.0
 [0.49.1]: https://github.com/TheZacillac/seer/compare/v0.49.0...v0.49.1
