@@ -11,6 +11,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **WHOIS server map synced with upstream** (WooMai/whois-servers, 2026-09-30).
+  `.jo` now has WHOIS at `whois.nic.net.jo`, where it used to fail fast as a
+  TLD with no WHOIS server (IANA record changed 2026-08-17). `.bh` moved to
+  `whois.bhregistry.bh`, and the Bahraini IDN `.البحرين`/`xn--mgbcpq6gpa1a`
+  gained WHOIS on the same server (IANA changed 2026-09-28). Every change was
+  verified with a live port-43 query. The 12 WHOIS-retired TLDs were
+  re-checked against IANA and still publish no server, so none were re-added.
+
 ## [0.52.0] - 2026-09-30
 
 A hardening release from a full adversarial review of every crate: SSRF and
