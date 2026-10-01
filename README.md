@@ -774,7 +774,7 @@ cargo deny check                                       # Supply-chain policy (ad
 The four packages are listed under [Packages](#-packages); all business
 logic lives in `seer-core`, and the other three are thin interfaces over it.
 The annotated per-module map is in
-[CLAUDE.md → Codebase Structure](CLAUDE.md#codebase-structure).
+[AGENTS.md → Layout](AGENTS.md#layout).
 
 ---
 

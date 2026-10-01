@@ -36,7 +36,7 @@ jobs:
           echo "Publishing version: $VERSION"
 
       # Manual dispatches (the normal path — dist-created releases never fire
-      # the `published` event, see CLAUDE.md) check out main HEAD, not the
+      # the `published` event, see AGENTS.md) check out main HEAD, not the
       # release tag. Refuse to publish when the version in Cargo.toml has no
       # tag, or when HEAD isn't the tagged commit — either would put a
       # crates.io release on different code than the GitHub release binaries.
