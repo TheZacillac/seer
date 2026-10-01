@@ -54,6 +54,10 @@ use serde_json::{json, Value};
 const DEFAULT_CONCURRENCY: usize = 8;
 const DEFAULT_DNS_QPS: u32 = 10;
 const PROBE_PREFIXES: &[&str] = &["nic", "google", "google.com", "google.co"];
+/// ccTLDs whose first candidate has NS records but is not an ordinary
+/// registration (`--probe` overrides these too). `nic.cn` is a CNNIC
+/// reserved name: its WHOIS says it "can not be registered online".
+const PINNED_PROBES: &[(&str, &str)] = &[("cn", "google.cn")];
 
 struct Args {
     out: PathBuf,
@@ -73,6 +77,10 @@ fn parse_args() -> Result<Args, String> {
         nameserver: None,
         dns_qps: DEFAULT_DNS_QPS,
     };
+    for (tld, domain) in PINNED_PROBES {
+        args.probes
+            .insert((*tld).to_string(), (*domain).to_string());
+    }
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
         let mut value = || it.next().ok_or(format!("{flag} needs a value"));

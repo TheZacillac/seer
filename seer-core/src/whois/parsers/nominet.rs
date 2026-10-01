@@ -1,7 +1,11 @@
-//! Parser for .uk domains (Nominet format).
+//! Parser for .uk domains (Nominet format), also used for .gg and .je.
 //!
 //! Nominet uses a section-based format with indented values and
-//! human-readable date formats.
+//! human-readable date formats. Island Networks (the CIDR registry for .gg
+//! and .je) prints the same layout with a few differences: a `Domain:` /
+//! `Domain Status:` heading pair, prose dates without a colon
+//! (`Registered on 24th April 1997 at 00:00:00.000`), a registrar followed by
+//! its URL in parentheses, and no expiry date (fees are annual).
 //!
 //! Example Nominet response:
 //! ```text
@@ -29,7 +33,9 @@ use crate::whois::parser::WhoisResponse;
 
 // Regex patterns for Nominet-specific fields.
 static_regex! {
-    DOMAIN_SECTION = r"(?i)^Domain name:\s*$";
+    DOMAIN_SECTION = r"(?i)^Domain(?: name)?:\s*$";
+    /// Island Networks' heading for the domain state (`Active`).
+    DOMAIN_STATUS_SECTION = r"(?i)^Domain Status:\s*$";
     REGISTRANT_SECTION = r"(?i)^Registrant:\s*$";
     REGISTRAR_SECTION = r"(?i)^Registrar:\s*$";
     REGISTRATION_DATE = r"(?i)^Registration date:\s*$";
@@ -45,9 +51,10 @@ static_regex! {
     DNSSEC_SECTION = r"(?i)^DNSSEC:\s*$";
 }
 
-/// The .uk TLD and the second-level zones Nominet serves.
+/// The .uk TLD and the second-level zones Nominet serves, plus Island
+/// Networks' .gg and .je (their second-level zones dispatch on the TLD).
 pub(super) const TLDS: &[&str] = &[
-    "uk", "co.uk", "org.uk", "me.uk", "ltd.uk", "plc.uk", "net.uk", "sch.uk",
+    "uk", "co.uk", "org.uk", "me.uk", "ltd.uk", "plc.uk", "net.uk", "sch.uk", "gg", "je",
 ];
 
 /// Parses .uk domains using the Nominet format.
@@ -102,7 +109,7 @@ pub(super) fn parse(domain: &str, server: &str, raw: &str) -> WhoisResponse {
         } else if NAME_SERVERS_SECTION.is_match(trimmed) {
             current_section = Section::NameServers;
             continue;
-        } else if STATUS_SECTION.is_match(trimmed) {
+        } else if STATUS_SECTION.is_match(trimmed) || DOMAIN_STATUS_SECTION.is_match(trimmed) {
             current_section = Section::Status;
             continue;
         } else if DNSSEC_SECTION.is_match(trimmed) {
@@ -134,8 +141,15 @@ pub(super) fn parse(domain: &str, server: &str, raw: &str) -> WhoisResponse {
                     registrant = Some(value);
                 }
                 Section::Registrar if registrar.is_none() => {
-                    // Extract registrar name from format like "Example Ltd [Tag = EXAMPLE]"
-                    let name = value.split('[').next().unwrap_or(&value).trim().to_string();
+                    // Drop Nominet's `[Tag = EXAMPLE]` and Island Networks'
+                    // `(http://…)` suffixes.
+                    let name = value
+                        .split('[')
+                        .next()
+                        .and_then(|v| v.split(" (http").next())
+                        .unwrap_or(&value)
+                        .trim()
+                        .to_string();
                     if !is_redacted(&name) {
                         registrar = Some(name);
                     }
@@ -152,8 +166,12 @@ pub(super) fn parse(domain: &str, server: &str, raw: &str) -> WhoisResponse {
                 Section::RelevantDates => {
                     // Indented inline `Sub-field: value` lines. Match the
                     // sub-field name case-insensitively and slice the value
-                    // at the actual `:` (char-boundary safe).
-                    if let Some((field, raw_date)) = value.split_once(':') {
+                    // at the actual `:` (char-boundary safe). Island Networks
+                    // writes `Registered on <date>` with no colon, and its
+                    // time-of-day would otherwise be the split point.
+                    let split =
+                        relevant_date_without_colon(&value).or_else(|| value.split_once(':'));
+                    if let Some((field, raw_date)) = split {
                         let date = raw_date.trim();
                         let field = field.trim();
                         if field.eq_ignore_ascii_case("Registered on") && creation_date.is_none() {
@@ -226,9 +244,26 @@ pub(super) fn parse(domain: &str, server: &str, raw: &str) -> WhoisResponse {
     }
 }
 
-/// Parses Nominet's date format: DD-Month-YYYY or DD Month YYYY
+/// Splits Island Networks' colon-less `Registered on 24th April 1997 at …`
+/// into `("Registered on", "24th April 1997 at …")`.
+fn relevant_date_without_colon(value: &str) -> Option<(&str, &str)> {
+    const FIELD: &str = "Registered on ";
+    let head = value.get(..FIELD.len())?;
+    let rest = &value[FIELD.len()..];
+    (head.eq_ignore_ascii_case(FIELD) && !rest.trim_start().starts_with(':'))
+        .then(|| (head.trim_end(), rest))
+}
+
+/// Parses Nominet's date format: DD-Month-YYYY or DD Month YYYY, plus Island
+/// Networks' `24th April 1997 at 00:00:00.000` (time dropped, ordinal
+/// suffix stripped).
 fn parse_nominet_date(date_str: &str) -> Option<DateTime<Utc>> {
-    let cleaned = date_str.trim();
+    static_regex! {
+        ORDINAL_DAY = r"^(\d{1,2})(?:st|nd|rd|th)\b";
+    }
+    let date_part = date_str.split(" at ").next().unwrap_or(date_str).trim();
+    let cleaned = ORDINAL_DAY.replace(date_part, "$1");
+    let cleaned = cleaned.as_ref();
 
     // Nominet uses formats like "01-January-2020" or "01 January 2020"
     let formats = [
@@ -478,5 +513,56 @@ Relevant dates:
         assert_eq!(expiry.year(), 2026);
         assert_eq!(expiry.month(), 3);
         assert_eq!(expiry.day(), 3);
+    }
+
+    /// Island Networks (.gg/.je) reply, trimmed from a live `nic.gg` query
+    /// (2026-10-01, CRLF on some lines as served).
+    const ISLAND_NETWORKS_RESPONSE: &str = "Domain:\r\n     nic.gg\r\n\
+Domain Status:\r\n     Active\r\n\
+Registrant:\n     Redacted for privacy\n\
+Registrar:\n     Alderney Domains (http://www.channelisles.net)\n\
+Relevant dates:\n     Registered on 24th April 1997 at 00:00:00.000\n\
+\x20    Registry fee due on 01st January each year\n\
+Registration status:\n     Registered until cancelled\n\
+Name servers:\n     ns1.livedns.co.uk\n     ns2.livedns.co.uk\n\
+\n\
+WHOIS lookup made on Thu, 1 Oct 2026 at 19:14:26 BST\n";
+
+    #[test]
+    fn island_networks_format_parses() {
+        let r = parse("nic.gg", "whois.gg", ISLAND_NETWORKS_RESPONSE);
+        assert_eq!(r.registrar.as_deref(), Some("Alderney Domains"));
+        assert!(r.registrant.is_none(), "redacted registrant is dropped");
+        let created = r.creation_date.expect("Registered on <ordinal date>");
+        assert_eq!(
+            (created.year(), created.month(), created.day()),
+            (1997, 4, 24)
+        );
+        assert!(
+            r.expiration_date.is_none(),
+            "annual fee line is not an expiry"
+        );
+        assert_eq!(
+            r.nameservers,
+            vec!["ns1.livedns.co.uk", "ns2.livedns.co.uk"]
+        );
+        assert_eq!(r.status, vec!["Active", "Registered until cancelled"]);
+    }
+
+    #[test]
+    fn colon_less_relevant_date_split_only_matches_registered_on() {
+        assert_eq!(
+            relevant_date_without_colon("Registered on 24th April 1997 at 00:00:00.000"),
+            Some(("Registered on", "24th April 1997 at 00:00:00.000"))
+        );
+        // Nominet's own colon form is left to the `:` split.
+        assert_eq!(
+            relevant_date_without_colon("Registered on: 01-January-2020"),
+            None
+        );
+        assert_eq!(
+            relevant_date_without_colon("Expiry date: 01-Jan-2025"),
+            None
+        );
     }
 }

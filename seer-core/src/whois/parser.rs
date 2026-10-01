@@ -34,12 +34,31 @@ fn line_field_patterns(labels: &[&str]) -> Vec<Regex> {
         .collect()
 }
 
+/// Rewrites padded labels into the plain `Label: value` form every pattern
+/// here expects: dot leaders (Traficom .fi/.ax, KazNIC .kz:
+/// `created..........: 16.2.1999`) and blanks before the colon (NIC Monaco
+/// .mc: `Expires on         : 2027-01-08`). Only a label at the start of a
+/// line is touched, so values and prose keep their dots and spacing.
+fn normalize_label_padding(raw: &str) -> std::borrow::Cow<'_, str> {
+    static_regex! {
+        LABEL_PADDING = r"(?m)^([ \t]*[A-Za-z][A-Za-z0-9 /()_-]*?)(?:\.{2,}[ \t]*|[ \t]+):";
+    }
+    LABEL_PADDING.replace_all(raw, "$1:")
+}
+
 fn compile(pattern: &str) -> Regex {
     Regex::new(pattern).expect("valid WHOIS field regex")
 }
 
-static REGISTRAR_PATTERNS: LazyLock<Vec<Regex>> =
-    LazyLock::new(|| field_patterns(&["Registrar", "Registrar Name", "Sponsoring Registrar"]));
+static REGISTRAR_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
+    field_patterns(&[
+        "Registrar",
+        "Registrar Name",
+        "Sponsoring Registrar",
+        // RESTENA (.lu)
+        "registrar-name",
+    ])
+});
 
 static REGISTRANT_PATTERNS: LazyLock<Vec<Regex>> =
     LazyLock::new(|| field_patterns(&["Registrant Name", "Registrant"]));
@@ -65,6 +84,10 @@ static CREATION_DATE_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
         "Created",
         "Registration Date",
         "Domain Registration Date",
+        // HKIRC (.hk): `Domain Name Commencement Date: 06-04-2004`
+        "Commencement Date",
+        // NIC.BO (.bo)
+        "Fecha de registro",
     ]);
     // Punktum (.dk) style `Registered:           2018-01-25`, and French
     // registries (ANINF .ga) `Date de création:`.
@@ -80,6 +103,8 @@ static EXPIRATION_DATE_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
         "Expires",
         "Expiry Date",
         "paid-till",
+        // NIC.BO (.bo)
+        "Fecha de vencimiento",
     ]);
     // French registries (ANINF .ga): `Date d'expiration:`
     patterns.extend(line_field_patterns(&["Date d'expiration"]));
@@ -110,6 +135,9 @@ static NAMESERVER_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     // Punktum (.dk) lists nameservers as `Hostname:` lines under a
     // `Nameservers` heading (line-anchored to avoid hostname mentions inside
     // prose); French registries (ANINF .ga) use `Serveur de noms:` lines.
+    // A bare `DNS:` label is NOT a nameserver everywhere (Punktum prints the
+    // domain itself as `DNS:`), so NIC México's `DNS:` lines are read only
+    // inside a heading block by `extract_nameserver_block`.
     patterns.extend(line_field_patterns(&["Hostname", "Serveur de noms"]));
     patterns
 });
@@ -214,6 +242,9 @@ impl WhoisResponse {
     /// The generic regex-based parser: the fallback for every TLD without a
     /// registry-specific parser (see [`parse`](Self::parse)).
     pub fn parse_internal(domain: &str, whois_server: &str, raw: &str) -> Self {
+        let original = raw;
+        let normalized = normalize_label_padding(raw);
+        let raw: &str = &normalized;
         let registrar = extract_field_with_patterns(raw, &REGISTRAR_PATTERNS)
             .or_else(|| extract_section_value(raw, &["registrar"]));
         let registrant = extract_field_with_patterns(raw, &REGISTRANT_PATTERNS)
@@ -284,7 +315,7 @@ impl WhoisResponse {
             status,
             dnssec,
             whois_server: whois_server.to_string(),
-            raw_response: raw.to_string(),
+            raw_response: original.to_string(),
         }
     }
 
@@ -358,6 +389,8 @@ impl WhoisResponse {
             "malformed request",
             "invalid query",
             "no whois server is known",
+            // Freenom's leftover .gq server: "This TLD has no whois server."
+            "this tld has no whois server",
             "this server does not",
         ];
         // Registries retiring port-43 WHOIS under ICANN's RDAP transition
@@ -742,8 +775,8 @@ fn extract_section_value(text: &str, labels: &[&str]) -> Option<String> {
     None
 }
 
-/// Interpretation order for ambiguous all-numeric dates (`A/B/YYYY` /
-/// `A.B.YYYY` where both `A` and `B` are <= 12). `DayFirst` reads them as
+/// Interpretation order for ambiguous all-numeric dates (`A/B/YYYY`,
+/// `A.B.YYYY` or `A-B-YYYY` where both `A` and `B` are <= 12). `DayFirst` reads them as
 /// `DD/MM` (the international norm, Seer's documented default); `MonthFirst`
 /// reads them as `MM/DD` (the US convention). Unambiguous dates (a field > 12,
 /// ISO, or named-month) parse identically under either order.
@@ -765,7 +798,7 @@ pub(crate) enum DateOrder {
 /// server table (issue #47).
 fn infer_date_order<'a>(candidates: impl IntoIterator<Item = &'a str>) -> Option<DateOrder> {
     static_regex! {
-        NUMERIC_DATE = r"^\s*(\d{1,2})[/.](\d{1,2})[/.]\d{4}\b";
+        NUMERIC_DATE = r"^\s*(\d{1,2})[/.-](\d{1,2})[/.-]\d{4}\b";
     }
     for s in candidates {
         if let Some(c) = NUMERIC_DATE.captures(s) {
@@ -796,11 +829,18 @@ pub(crate) fn parse_date(date_str: &str) -> Option<DateTime<Utc>> {
 /// strict RFC 3339, but real servers are as sloppy as WHOIS, so both reuse this
 /// tolerant parser).
 pub(crate) fn parse_date_with_order(date_str: &str, order: DateOrder) -> Option<DateTime<Utc>> {
+    static_regex! {
+        // Registro.br appends the registration ticket: `created: 19970711 #46903`.
+        TICKET_SUFFIX = r"\s+#\d+$";
+    }
     let cleaned = date_str
         .trim()
         .replace(" UTC", "Z")
         .replace(" (UTC)", "")
+        // KazNIC (.kz): `1999-08-17 21:34:57 (GMT+0:00)`
+        .replace(" (GMT+0:00)", "")
         .replace(" +0000", "Z");
+    let cleaned = TICKET_SUFFIX.replace(&cleaned, "");
 
     // First: try RFC 3339, which handles any timezone offset (e.g., +05:30, +01:00, Z)
     if let Ok(dt) = DateTime::parse_from_rfc3339(&cleaned) {
@@ -839,8 +879,14 @@ pub(crate) fn parse_date_with_order(date_str: &str, order: DateOrder) -> Option<
         "%Y/%m/%d %H:%M:%S",
         "%Y/%m/%d",
         "%b %d %Y",
+        // ISNIC (.is): `created: September  5 2000`
+        "%B %d %Y",
         // DNS Belgium (.be): `Registered: Tue Dec 12 2000`
         "%a %b %d %Y",
+        // ctime, KG domain registry (.kg): `Record created: Tue Jan 16 10:31:46 2001`
+        "%a %b %d %H:%M:%S %Y",
+        // Registro.br (.br): `created: 19970711` (ticket suffix stripped above)
+        "%Y%m%d",
     ];
     // Ambiguous all-numeric formats, tried in the hinted order first. The
     // other order is still tried second so an unambiguous date (a field > 12)
@@ -848,17 +894,20 @@ pub(crate) fn parse_date_with_order(date_str: &str, order: DateOrder) -> Option<
     // an input the first rejected, so it never reinterprets an accepted date.
     // Each has a time-of-day variant (CZ.NIC: `registered: 18.09.2000
     // 13:05:00`); the date part obeys the same order rules.
+    // HKIRC (.hk) separates with dashes: `Expiry Date: 31-03-2027`.
     const DAY_FIRST: &[&str] = &[
         "%d.%m.%Y %H:%M:%S",
         "%d.%m.%Y",
         "%d/%m/%Y %H:%M:%S",
         "%d/%m/%Y",
+        "%d-%m-%Y",
     ];
     const MONTH_FIRST: &[&str] = &[
         "%m.%d.%Y %H:%M:%S",
         "%m.%d.%Y",
         "%m/%d/%Y %H:%M:%S",
         "%m/%d/%Y",
+        "%m-%d-%Y",
     ];
     let (first_pair, second_pair) = match order {
         DateOrder::DayFirst => (DAY_FIRST, MONTH_FIRST),
@@ -887,6 +936,72 @@ pub(crate) fn parse_date_with_order(date_str: &str, order: DateOrder) -> Option<
 }
 
 fn extract_nameservers(text: &str) -> Vec<String> {
+    let nameservers = extract_labelled_nameservers(text);
+    if nameservers.is_empty() {
+        extract_nameserver_block(text)
+    } else {
+        nameservers
+    }
+}
+
+/// Headings (lowercased, colon optional) that introduce a block of bare
+/// hostname lines instead of `Label: host` fields.
+const NAMESERVER_HEADINGS: &[&str] = &[
+    "name servers",                     // Island Networks (.gg/.je), NIC México (.mx)
+    "dns servers",                      // AMNIC (.am)
+    "name server information",          // Register.bg (.bg)
+    "name servers information",         // HKIRC (.hk)
+    "name servers in the listed order", // KG domain registry (.kg)
+];
+
+/// Section-style fallback for registries that list nameservers one per line
+/// under a heading. Blank lines between the heading and the first host are
+/// skipped (HKIRC); the block ends at the first blank or non-hostname line, so
+/// trailing notices can never be read as hosts. Glue after the hostname is
+/// dropped, as in [`extract_labelled_nameservers`], and so is the `DNS:`
+/// prefix NIC México puts on each entry.
+fn extract_nameserver_block(text: &str) -> Vec<String> {
+    let mut nameservers = Vec::new();
+    let mut lines = text.lines();
+    while let Some(line) = lines.next() {
+        let heading = line.trim().trim_end_matches(':').to_lowercase();
+        if !NAMESERVER_HEADINGS.contains(&heading.as_str()) {
+            continue;
+        }
+        let mut started = false;
+        for line in lines.by_ref() {
+            let entry = line.trim_start();
+            let entry = match entry.get(..4) {
+                Some(p) if p.eq_ignore_ascii_case("dns:") => &entry[4..],
+                _ => entry,
+            };
+            let host = entry.split_whitespace().next().unwrap_or("");
+            if host.is_empty() && !started {
+                continue;
+            }
+            if !is_hostname(host) {
+                break;
+            }
+            started = true;
+            push_bounded(&mut nameservers, host.to_lowercase(), MAX_NAMESERVERS);
+        }
+        if !nameservers.is_empty() {
+            break;
+        }
+    }
+    nameservers
+}
+
+/// A dotted DNS name (`ns1.example.com`, optional trailing root dot).
+fn is_hostname(s: &str) -> bool {
+    static_regex! {
+        HOSTNAME = r"^(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z][A-Za-z0-9-]{0,62}\.?$";
+    }
+    HOSTNAME.is_match(s)
+}
+
+/// Nameservers from `Label: host` fields ([`NAMESERVER_PATTERNS`]).
+fn extract_labelled_nameservers(text: &str) -> Vec<String> {
     let mut nameservers = Vec::new();
 
     for re in NAMESERVER_PATTERNS.iter() {
@@ -941,6 +1056,9 @@ fn extract_status_top_level(raw: &str) -> Vec<String> {
         // `trimmed.len() - rest.len()` into an out-of-bounds slice panic.
         let value_opt = if lower.starts_with("domain status:") {
             Some(&trimmed["domain status:".len()..])
+        } else if lower.starts_with("registration status:") {
+            // Register.bg (.bg): `registration status: busy, active`
+            Some(&trimmed["registration status:".len()..])
         } else if lower.starts_with("status:") {
             Some(&trimmed["status:".len()..])
         } else if lower.starts_with("state:") {
@@ -1286,6 +1404,17 @@ TLD is not supported.
 Terms of Use: Access to WHOIS information is provided to assist persons ...
 ";
         assert!(make_response(raw).registry_unavailable());
+    }
+
+    #[test]
+    fn registry_unavailable_true_for_freenom_gq_reply() {
+        // Live reply from whois.dominio.gq for a registered domain
+        // (2026-10-01): no data, and it must not read as "available".
+        let raw = "The domain you requested is not known in Freenoms database.\n\
+                   This TLD has no whois server.\n";
+        let r = WhoisResponse::parse_internal("nic.gq", "whois.dominio.gq", raw);
+        assert!(r.registry_unavailable());
+        assert!(!r.is_available());
     }
 
     #[test]
@@ -2289,5 +2418,202 @@ Name Server: ns2.example.com
         );
         assert!(result.registrar.is_none());
         assert!(result.nameservers.is_empty());
+    }
+
+    // --- ccTLD formats found by the 2026-10-01 whois_sweep ---------------
+    // Each body is trimmed from a live reply; the assertions name the fields
+    // the generic parser used to miss.
+
+    fn ymd(dt: Option<DateTime<Utc>>) -> Option<String> {
+        dt.map(|d| d.format("%Y-%m-%d").to_string())
+    }
+
+    #[test]
+    fn traficom_dot_leader_labels_parse() {
+        // .fi (and .ax, same format): every label is padded with dots.
+        let raw = "domain.............: nic.fi\n\
+                   status.............: Registered\n\
+                   created............: 16.2.1999 00:00:00\n\
+                   expires............: 2.3.2027 14:08:22\n\
+                   modified...........: 31.1.2026 16:08:34\n\
+                   Nameservers\n\
+                   nserver............: ns-se.elisa.net [OK]\n\
+                   nserver............: ns-fi.elisa.net [OK]\n\
+                   Registrar\n\
+                   registrar..........: Ascio Technologies\n\
+                   www................: www.ascio.com\n";
+        let r = WhoisResponse::parse_internal("nic.fi", "whois.fi", raw);
+        assert_eq!(r.registrar.as_deref(), Some("Ascio Technologies"));
+        assert_eq!(ymd(r.creation_date).as_deref(), Some("1999-02-16"));
+        assert_eq!(ymd(r.expiration_date).as_deref(), Some("2027-03-02"));
+        assert_eq!(ymd(r.updated_date).as_deref(), Some("2026-01-31"));
+        assert_eq!(r.nameservers, vec!["ns-se.elisa.net", "ns-fi.elisa.net"]);
+        assert_eq!(r.status, vec!["Registered"]);
+        assert!(r.has_core_data());
+        // The raw body is kept verbatim; only extraction sees the rewrite.
+        assert_eq!(r.raw_response, raw);
+    }
+
+    #[test]
+    fn kaznic_dot_leaders_and_gmt_suffix_parse() {
+        let raw = "Domain Name............: nic.kz\n\
+                   Name Server list\n\
+                   Name Server............: ns.nic.kz\n\
+                   IP Address.............: 194.0.21.5, 2001:678:98:1::5\n\
+                   Name Server............: ns1.nic.kz\n\
+                   Domain created.........: 1999-08-17 21:34:57 (GMT+0:00)\n\
+                   Last modified..........: 2022-12-05 17:28:31 (GMT+0:00)\n\
+                   Domain status..........: ok - Normal state.\n\
+                   Registrar created......: KAZNIC\n\
+                   Current Registrar......: KAZNIC\n";
+        let r = WhoisResponse::parse_internal("nic.kz", "whois.nic.kz", raw);
+        assert_eq!(r.registrar.as_deref(), Some("KAZNIC"));
+        assert_eq!(ymd(r.creation_date).as_deref(), Some("1999-08-17"));
+        assert_eq!(ymd(r.updated_date).as_deref(), Some("2022-12-05"));
+        assert_eq!(r.nameservers, vec!["ns.nic.kz", "ns1.nic.kz"]);
+        assert_eq!(r.status, vec!["ok"]);
+    }
+
+    #[test]
+    fn nic_monaco_space_padded_labels_parse() {
+        let raw = "Domain             : NIC.MC\n\
+                   Status             : ACTIVE\n\
+                   Registrar          : NIC Monaco\n\
+                   nserver            : ns1.nic.mc\n\
+                   nserver            : ns2.nic.mc\n\
+                   Created            : 2007-01-08T11:06:00Z\n\
+                   Expires on         : 2027-01-08\n\
+                   Last update        : 2026-01-08T00:10:01Z\n";
+        let r = WhoisResponse::parse_internal("nic.mc", "whois.nic.mc", raw);
+        assert_eq!(r.registrar.as_deref(), Some("NIC Monaco"));
+        assert_eq!(ymd(r.creation_date).as_deref(), Some("2007-01-08"));
+        assert_eq!(ymd(r.expiration_date).as_deref(), Some("2027-01-08"));
+        assert_eq!(r.nameservers, vec!["ns1.nic.mc", "ns2.nic.mc"]);
+        assert_eq!(r.status, vec!["ACTIVE"]);
+    }
+
+    #[test]
+    fn label_padding_leaves_values_and_prose_alone() {
+        let raw = "Registrar URL: https://example..test/a b :x\n\
+                   This line has a colon : in prose.\n";
+        let normalized = normalize_label_padding(raw);
+        assert!(normalized.contains("Registrar URL: https://example..test/a b :x"));
+        // A line-start label padded with blanks is normalized, nothing else.
+        assert!(normalized.contains("This line has a colon: in prose."));
+    }
+
+    #[test]
+    fn kg_ctime_dates_and_nameserver_block_parse() {
+        let raw = "Domain NIC.KG (ACTIVE)\n\
+                   Record created: Tue Jan 16 10:31:46 2001\n\
+                   Record last updated on:  Tue Mar  3 21:02:44 2026\n\
+                   Record expires on: Mon Mar 22 23:59:00 2027\n\
+                   Name servers in the listed order:\n\
+                   \n\
+                   NS1.WEBSITE.ORG\n\
+                   NS2.WEBSITE.ORG\n\
+                   \n\
+                   Some trailing.notice line\n";
+        let r = WhoisResponse::parse_internal("nic.kg", "whois.kg", raw);
+        assert_eq!(ymd(r.creation_date).as_deref(), Some("2001-01-16"));
+        assert_eq!(ymd(r.updated_date).as_deref(), Some("2026-03-03"));
+        assert_eq!(ymd(r.expiration_date).as_deref(), Some("2027-03-22"));
+        assert_eq!(r.nameservers, vec!["ns1.website.org", "ns2.website.org"]);
+    }
+
+    #[test]
+    fn nameserver_block_stops_at_non_host_line() {
+        // Register.bg: glue after the host, block ends at the next field.
+        let raw = "registration status: busy, active\n\
+                   NAME SERVER INFORMATION:\n\
+                   ns.digsys.bg \n\
+                   a.nic.bg 192.92.129.99 2a02:6a80::192:92:129:99 \n\
+                   DNSSEC: active\n";
+        let r = WhoisResponse::parse_internal("nic.bg", "whois.register.bg", raw);
+        assert_eq!(r.nameservers, vec!["ns.digsys.bg", "a.nic.bg"]);
+        assert_eq!(r.status, vec!["busy", "active"]);
+    }
+
+    #[test]
+    fn amnic_indented_dns_servers_block_parses() {
+        let raw = "   Domain name: google.am\n\
+                   \x20  Registrar:   abcdomain (ABCDomain LLC)\n\
+                   \x20  DNS servers:\n\
+                   \x20     ns1.google.com\n\
+                   \x20     ns2.google.com\n\
+                   \n\
+                   \x20  Registered:    1999-06-05\n\
+                   \x20  Expires:       2027-04-15\n";
+        let r = WhoisResponse::parse_internal("google.am", "whois.amnic.net", raw);
+        assert_eq!(r.nameservers, vec!["ns1.google.com", "ns2.google.com"]);
+        assert!(r.has_core_data());
+    }
+
+    #[test]
+    fn nic_mexico_dns_lines_parse() {
+        let raw = "Domain Name:       nic.mx\r\n\
+                   Created On:        1997-01-15\r\n\
+                   Expiration Date:   2027-01-14\r\n\
+                   Registrar:         Registry .MX\r\n\
+                   Name Servers:\r\n\
+                   \x20  DNS:            a.nic.mx       2001:1250:a000:0:0:0:0:1, 207.248.65.1\r\n\
+                   \x20  DNS:            b.nic.mx       2001:1250:b000:0:0:0:0:1, 201.131.250.1\r\n\
+                   DNSSEC DS Records:\r\n";
+        let r = WhoisResponse::parse_internal("nic.mx", "whois.mx", raw);
+        assert_eq!(r.nameservers, vec!["a.nic.mx", "b.nic.mx"]);
+    }
+
+    #[test]
+    fn hkirc_dash_dates_and_spaced_nameserver_block_parse() {
+        let raw = "Domain Name Commencement Date: 06-04-2004\n\
+                   Expiry Date: 31-03-2027 \n\
+                   Domain Status: Active\n\
+                   Registrar Name: MARKMONITOR INC.\n\
+                   Name Servers Information:\n\
+                   \n\
+                   NS1.GOOGLE.COM\n\
+                   NS2.GOOGLE.COM\n\
+                   \n\
+                   Status Information:\n";
+        let r = WhoisResponse::parse_internal("google.hk", "whois.hkirc.hk", raw);
+        // 31-03 reveals day-first, so 06-04 is 6 April.
+        assert_eq!(ymd(r.creation_date).as_deref(), Some("2004-04-06"));
+        assert_eq!(ymd(r.expiration_date).as_deref(), Some("2027-03-31"));
+        assert_eq!(r.nameservers, vec!["ns1.google.com", "ns2.google.com"]);
+        assert!(r.has_core_data());
+    }
+
+    #[test]
+    fn registro_br_ticket_suffixed_compact_date_parses() {
+        let raw = "domain:      nic.br\n\
+                   nserver:     a.dns.br\n\
+                   created:     19970711 #46903\n\
+                   changed:     20180327\n";
+        let r = WhoisResponse::parse_internal("nic.br", "whois.registro.br", raw);
+        assert_eq!(ymd(r.creation_date).as_deref(), Some("1997-07-11"));
+    }
+
+    #[test]
+    fn isnic_full_month_name_date_parses() {
+        let raw = "domain:       nic.is\n\
+                   created:      September  5 2000\n\
+                   expires:      September  5 2027\n";
+        let r = WhoisResponse::parse_internal("nic.is", "whois.isnic.is", raw);
+        assert_eq!(ymd(r.creation_date).as_deref(), Some("2000-09-05"));
+        assert_eq!(ymd(r.expiration_date).as_deref(), Some("2027-09-05"));
+    }
+
+    #[test]
+    fn restena_registrar_name_and_nic_bo_spanish_dates_parse() {
+        let lu = "domainname:     nic.lu\nregistrar-name:         Fondation Restena\n";
+        let r = WhoisResponse::parse_internal("nic.lu", "whois.dns.lu", lu);
+        assert_eq!(r.registrar.as_deref(), Some("Fondation Restena"));
+
+        let bo = "Dominio: google.bo\r\n\
+                  Fecha de registro: 2019-01-15\r\n\
+                  Fecha de vencimiento: 2027-01-15\r\n";
+        let r = WhoisResponse::parse_internal("google.bo", "whois.nic.bo", bo);
+        assert_eq!(ymd(r.creation_date).as_deref(), Some("2019-01-15"));
+        assert_eq!(ymd(r.expiration_date).as_deref(), Some("2027-01-15"));
     }
 }

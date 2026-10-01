@@ -11,6 +11,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **WHOIS parsing for 16 ccTLDs whose replies came back empty or partial.**
+  These were found by a live sweep of every ccTLD (the new `whois_sweep`
+  example).
+  - **Padded labels:** `created.......: x` (`.fi`, `.ax`, `.kz`) and
+    `Expires on   : x` (`.mc`) are now read like `Label: x`.
+  - **Nameservers listed under a heading:** `.am`, `.bg`, `.hk`, `.kg`,
+    `.mx`, `.gg`, `.je`.
+  - **New date formats:** `31-03-2027` (`.hk`), `September  5 2000`
+    (`.is`), `Tue Jan 16 10:31:46 2001` (`.kg`), `19970711 #46903` (`.br`)
+    and a `(GMT+0:00)` suffix (`.kz`).
+  - **New labels:** `registrar-name` (`.lu`), the Spanish
+    `Fecha de registro` / `Fecha de vencimiento` (`.bo`) and
+    `registration status` (`.bg`).
+  - **`.gg` / `.je`** (Island Networks) now go through the Nominet parser,
+    which reads their `Registered on 24th April 1997` dates and strips the
+    registrar's URL.
+  - **`.gq`:** Freenom's "This TLD has no whois server" reply now counts as
+    "no WHOIS service" instead of an unreadable record.
+
+### Added
+- **`whois_sweep` example** (`cargo run -p seer-core --example whois_sweep`):
+  a live maintainer tool that sorts every ccTLD's WHOIS result into buckets
+  (ok, partial, unparsed, unreachable, …) and saves the raw replies as parser
+  fixtures.
+
 ## [0.52.1] - 2026-10-01
 
 A WHOIS maintenance release: the server map is synced with upstream, and
