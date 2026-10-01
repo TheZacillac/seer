@@ -236,7 +236,13 @@ async fn run_query(
         }
         Query::Whois(domain) => {
             let _spinner = spinner(format!("Looking up WHOIS for {}", domain));
-            Payload::Whois(Box::new(clients.whois.lookup(&domain).await?))
+            match clients.whois.lookup(&domain).await {
+                Ok(response) => Payload::Whois(Box::new(response)),
+                Err(seer_core::SeerError::WhoisServerNotFound(msg)) => {
+                    return Err(no_whois_server_error(&domain, msg, clients).await)
+                }
+                Err(e) => return Err(e),
+            }
         }
         Query::Rdap(query) => {
             let _spinner = spinner(format!("Looking up RDAP for {}", query));
@@ -556,6 +562,43 @@ async fn subdomain_baseline(
     })
 }
 
+/// Extends a `whois` "no server" error with where to look instead. Only
+/// reached on that error, so the RDAP bootstrap load (cached) costs nothing
+/// on a normal lookup.
+async fn no_whois_server_error(
+    domain: &str,
+    msg: String,
+    clients: &Clients,
+) -> seer_core::SeerError {
+    let hint = match seer_core::normalize_domain(domain) {
+        Ok(name) => {
+            let tld =
+                seer_core::lookup_tld_with(seer_core::whois::get_tld(&name), &clients.rdap).await;
+            no_whois_hint(&name, &tld)
+        }
+        Err(_) => None,
+    };
+    seer_core::SeerError::WhoisServerNotFound(match hint {
+        Some(hint) => format!("{msg}; {hint}"),
+        None => msg,
+    })
+}
+
+/// The alternative to WHOIS for a TLD without it: its RDAP service when the
+/// IANA bootstrap lists one (commands named bare, so the text reads right in
+/// the CLI and the REPL), else the registry's page.
+fn no_whois_hint(domain: &str, tld: &seer_core::TldInfo) -> Option<String> {
+    if tld.rdap_url.is_some() {
+        Some(format!(
+            "it publishes RDAP instead — try `rdap {domain}` or `lookup {domain}`"
+        ))
+    } else {
+        tld.registry_url
+            .as_ref()
+            .map(|url| format!("check the registry directly: {url}"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -570,6 +613,35 @@ mod tests {
 
     fn answered(record_type: RecordType) -> seer_core::Result<DnsQueryResult> {
         Ok(fixtures::dig_status(record_type, DnsStatus::NoError))
+    }
+
+    fn tld_info(rdap_url: Option<&str>, registry_url: Option<&str>) -> seer_core::TldInfo {
+        seer_core::TldInfo {
+            tld: "x".to_string(),
+            whois_server: None,
+            rdap_url: rdap_url.map(str::to_string),
+            registry_url: registry_url.map(str::to_string),
+            tld_type: "generic".to_string(),
+        }
+    }
+
+    /// An RDAP-only TLD (.apple) points at the commands that read RDAP.
+    #[test]
+    fn no_whois_hint_offers_rdap_when_published() {
+        let info = tld_info(Some("https://rdap.nic.apple/"), Some("https://nic.apple"));
+        let hint = no_whois_hint("nic.apple", &info).unwrap();
+        assert!(hint.contains("`rdap nic.apple`"), "{hint}");
+        assert!(hint.contains("`lookup nic.apple`"), "{hint}");
+    }
+
+    /// With neither WHOIS nor RDAP (.mt, .lk) the hint must not suggest
+    /// RDAP — only the registry's own page.
+    #[test]
+    fn no_whois_hint_falls_back_to_registry_without_rdap() {
+        let info = tld_info(None, Some("https://www.nic.org.mt/"));
+        let hint = no_whois_hint("nic.mt", &info).unwrap();
+        assert_eq!(hint, "check the registry directly: https://www.nic.org.mt/");
+        assert_eq!(no_whois_hint("nic.mt", &tld_info(None, None)), None);
     }
 
     #[test]

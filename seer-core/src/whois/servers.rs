@@ -28,12 +28,15 @@ use std::sync::LazyLock;
 /// Conversely, two entries here deliberately DISAGREE with IANA (live-probed
 /// 2026-07-04): `ga` → `whois.nic.ga` (ANINF runs port-43 but IANA lists no
 /// server, Freenom aftermath) and `ps` → `whois.registry.ps` (PNINA
-/// relocated; IANA still lists the dead `whois.pnina.ps`).
+/// relocated; upstream still lists the dead `whois.pnina.ps`, and IANA has
+/// listed no server since at least 2026-09-30). Both re-probed live
+/// 2026-09-30.
 ///
-/// Last upstream sync: 2026-08-07. Delta applied: CONAC's two gTLDs moved off
-/// the shared `whois.conac.cn` host to per-TLD servers (`xn--55qw42g`/公益 →
-/// `whois.nic.xn--55qw42g`, `xn--zfr164b`/政务 → `whois.nic.xn--zfr164b`;
-/// IANA records changed 2026-07-21, both hostnames verified in DNS). Every
+/// Last upstream sync: 2026-09-30. Delta applied: `jo` gained port-43 WHOIS
+/// at `whois.nic.net.jo` (IANA record changed 2026-08-17), and `bh` plus its
+/// IDN `xn--mgbcpq6gpa1a`/البحرين moved to `whois.bhregistry.bh` (IANA
+/// changed 2026-09-28; the old `whois.nic.bh` is a CNAME to it, and the IDN
+/// had no server before). Each was verified with a live port-43 query. Every
 /// retired TLD above was re-checked against IANA the same day: all still
 /// publish an empty `whois:` field, so the upstream entries for them remain
 /// stale and none were re-added.
@@ -77,7 +80,7 @@ const NIC_TLDS: &str = "
     aquarelle ar arab archi army art arte as asda asia associates at attorney auction audi audible
     audio auspost author auto autos aw aws azure baby band bank bar barcelona barclaycard barclays
     barefoot bargains baseball basketball bauhaus bayern bbc bbt bbva bcg bcn beats beauty beer
-    berlin best bestbuy bet bh bharti bible bid bike bing bingo bio biz bj black blackfriday
+    berlin best bestbuy bet bharti bible bid bike bing bingo bio biz bj black blackfriday
     blockbuster blog bloomberg blue bm bms bmw bnpparibas bo boats boehringer bofa bond book bosch
     bostik boston bot boutique box bradesco bridgestone broadway broker brother build builders
     business buy buzz bzh cab cafe call cam camera camp canon capetown capital capitalone car cards
@@ -161,6 +164,7 @@ const HOSTED_TLDS: &[(&str, &str)] = &[
     ("whois.ati.tn", "tn xn--pgbs0dh"),
     ("whois.auda.org.au", "au"),
     ("whois.ax", "ax"),
+    ("whois.bhregistry.bh", "bh xn--mgbcpq6gpa1a"),
     ("whois.bnnic.bn", "bn"),
     ("whois.cctld.by", "by xn--90ais"),
     ("whois.cctld.uz", "uz"),
@@ -232,6 +236,7 @@ const HOSTED_TLDS: &[(&str, &str)] = &[
     ("whois.nic.la", "xn--q7ce6a"),
     ("whois.nic.mr", "xn--mgbah1a3hjkrd"),
     ("whois.nic.net.bw", "bw"),
+    ("whois.nic.net.jo", "jo"),
     ("whois.nic.net.ng", "ng"),
     ("whois.nic.net.sa", "sa xn--mgberp4a5d4ar"),
     ("whois.nic.net.sb", "sb"),
@@ -305,7 +310,7 @@ const HOSTED_TLDS: &[(&str, &str)] = &[
 /// Whitespace-separated, sorted.
 const IDN_ALIASES: &str = "
     vermögensberater vermögensberatung ευ бг бел дети ею католик ком мкд мон москва онлайн орг рф
-    сайт срб укр қаз հայ ישראל קום ابوظبي الجزائر السعودية العليان امارات ایران بارت بازار بيتك
+    сайт срб укр қаз հայ ישראל קום ابوظبي البحرين الجزائر السعودية العليان امارات ایران بارت بازار بيتك
     بھارت تونس سورية شبكة عراق عرب عمان فلسطين قطر كاثوليك كوم مصر مليسيا موريتانيا موقع همراه ڀارت
     कॉम नेट भारत भारतम् भारोत संगठन ভারত ভাৰত ਭਾਰਤ ભારત ଭାରତ இந்தியா சிங்கப்பூர் భారత్ ಭಾರತ ഭാരതം คอม ไทย
     ລາວ アマゾン クラウド コム ストア セール ファッション ポイント 中信 中国 中國 中文网 亚马逊 企业
@@ -464,13 +469,13 @@ pub const NO_WHOIS_TLDS: &str = "
     able aetna aig al americanexpress amex amica analytics ao aq aramco athleta axa az ba banamex bb
     bd booking bs bt bv calvinklein caravan cbn cbre cg chase cisco citi citic ck cu cw cy dell dhl
     dj dupont eg er et farmers ferrero fk flickr flir ford frontier ftr gap gb gm gr grainger gt gu
-    gw hbo health homegoods homesense hsbc hyatt ieee intuit ipiranga itau jm jmp jnj jo jpmorgan kh
+    gw hbo health homegoods homesense hsbc hyatt ieee intuit ipiranga itau jm jmp jnj jpmorgan kh
     km kp kpmg kpn kred lanxess lilly lincoln lr marshalls mattel mh mil mint mlb mp mv nba ne
     netflix neustar nfl ni nike np nr pa pfizer ph pn praxi pru prudential py sas sj sohu staples
     statefarm sv sz target tj tjmaxx tjx tkmaxx tt va vivo vn weather weatherchannel web williamhill
     winners xn--54b7fta0cc xn--czr694b xn--imr513n xn--mgba3a3ejt xn--mgbai9azgqp6j xn--mgbayh7gpa
-    xn--mgbc0a9azcg xn--mgbcpq6gpa1a xn--mgbpl2fh xn--node xn--nyqy26a xn--otu796d xn--qxam
-    xn--rhqv96g za zw ελ ارامكو الاردن البحرين المغرب سودان پاکستان বাংলা გე 世界 健康 商标 招聘
+    xn--mgbc0a9azcg xn--mgbpl2fh xn--node xn--nyqy26a xn--otu796d xn--qxam
+    xn--rhqv96g za zw ελ ارامكو الاردن المغرب سودان پاکستان বাংলা გე 世界 健康 商标 招聘
     餐厅
 ";
 
@@ -723,6 +728,19 @@ mod all_tlds_tests {
             Some("whois.nic.xn--zfr164b")
         );
         assert_eq!(get_whois_server("政务"), Some("whois.nic.xn--zfr164b"));
+    }
+
+    /// 2026-09-30 sync: `.jo` and the Bahraini IDN gained port-43 WHOIS, so
+    /// they must resolve and no longer fail fast as no-WHOIS TLDs.
+    #[test]
+    fn jo_and_bh_servers_follow_iana() {
+        assert_eq!(get_whois_server("jo"), Some("whois.nic.net.jo"));
+        for tld in ["bh", "xn--mgbcpq6gpa1a", "البحرين"] {
+            assert_eq!(get_whois_server(tld), Some("whois.bhregistry.bh"), "{tld}");
+        }
+        for tld in ["jo", "bh", "xn--mgbcpq6gpa1a", "البحرين"] {
+            assert!(!has_no_whois_server(tld), "{tld} still marked no-WHOIS");
+        }
     }
 
     /// Full IDN domains resolve to their TLD's server whether given as
