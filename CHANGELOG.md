@@ -11,6 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.52.1] - 2026-10-01
+
+A WHOIS maintenance release: the server map is synced with upstream, and
+`whois` on a TLD without a WHOIS server now says where to look instead.
+
 ### Changed
 - **WHOIS server map synced with upstream** (WooMai/whois-servers, 2026-09-30).
   `.jo` now has WHOIS at `whois.nic.net.jo`, where it used to fail fast as a
@@ -1793,7 +1798,8 @@ Two notable breaking changes landed in this period:
   The human and markdown formatters group both fields by record type and
   omit the per-type subheader when only one type is present.
 
-[Unreleased]: https://github.com/TheZacillac/seer/compare/v0.52.0...HEAD
+[Unreleased]: https://github.com/TheZacillac/seer/compare/v0.52.1...HEAD
+[0.52.1]: https://github.com/TheZacillac/seer/compare/v0.52.0...v0.52.1
 [0.52.0]: https://github.com/TheZacillac/seer/compare/v0.51.0...v0.52.0
 [0.51.0]: https://github.com/TheZacillac/seer/compare/v0.50.0...v0.51.0
 [0.50.0]: https://github.com/TheZacillac/seer/compare/v0.49.1...v0.50.0
