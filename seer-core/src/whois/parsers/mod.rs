@@ -55,7 +55,7 @@ const PARSERS: &[(&[&str], ParseFn)] = &[
     (kisa::TLDS, kisa::parse),         // .kr, .한국, .삼성
     (nic_it::TLDS, nic_it::parse),     // .it
     (nic_lv::TLDS, nic_lv::parse),     // .lv
-    (nominet::TLDS, nominet::parse),   // .uk, .co.uk
+    (nominet::TLDS, nominet::parse),   // .uk, .co.uk, .gg, .je
     (sidn::TLDS, sidn::parse),         // .nl
 ];
 
@@ -129,6 +129,20 @@ mod tests {
         );
         // Nominet strips the `[Tag = …]` suffix; the generic parser keeps it.
         assert_eq!(result.registrar.as_deref(), Some("Example Registrar Ltd"));
+    }
+
+    #[test]
+    fn test_parser_registry_selects_nominet_for_island_networks() {
+        let raw = "Registrar:\n     Alderney Domains (http://www.channelisles.net)\n";
+        for domain in ["example.gg", "example.co.je"] {
+            let result = parse(domain, "whois.gg", raw);
+            // Only the Nominet parser strips the `(http://…)` suffix.
+            assert_eq!(
+                result.registrar.as_deref(),
+                Some("Alderney Domains"),
+                "{domain}"
+            );
+        }
     }
 
     #[test]
