@@ -312,7 +312,7 @@ python -m seer_api.mcp.server
 
 The package's module layout (routers, MCP server, dispatch pool, rate
 limiting, SSRF guards) is mapped in the repository's
-[CLAUDE.md](https://github.com/TheZacillac/seer/blob/main/CLAUDE.md#seer-api-fastapi--mcp).
+[AGENTS.md](https://github.com/TheZacillac/seer/blob/main/AGENTS.md#seer-py-and-seer-api).
 
 ## Bulk Operation Limits
 

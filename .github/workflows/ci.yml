@@ -124,7 +124,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # Verify the workspace compiles on the declared MSRV against the committed
       # Cargo.lock (no re-resolution). If a dependency bump raises the floor this
-      # fails — bump `rust-version` in Cargo.toml and the README/CLAUDE.md refs.
+      # fails — bump `rust-version` in Cargo.toml and the README/AGENTS.md refs.
       - run: cargo check --workspace --locked
 
   coverage:

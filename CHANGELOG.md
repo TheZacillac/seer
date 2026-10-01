@@ -5,7 +5,7 @@ All notable changes to Seer are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-> Releases are tag-driven (see `CLAUDE.md` → Release Process). When cutting a
+> Releases are tag-driven (see `AGENTS.md` → Git and releases). When cutting a
 > release, move the `[Unreleased]` entries into a new version section. cargo-dist
 > reads the matching section as the GitHub Release body.
 
