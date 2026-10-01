@@ -11,6 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.52.2] - 2026-10-01
+
+A WHOIS parsing release: a live sweep of every ccTLD found 16 registries
+whose replies seer read as empty or partial, and they now parse.
+
 ### Fixed
 - **WHOIS parsing for 16 ccTLDs whose replies came back empty or partial.**
   These were found by a live sweep of every ccTLD (the new `whois_sweep`
@@ -1824,7 +1829,8 @@ Two notable breaking changes landed in this period:
   The human and markdown formatters group both fields by record type and
   omit the per-type subheader when only one type is present.
 
-[Unreleased]: https://github.com/TheZacillac/seer/compare/v0.52.1...HEAD
+[Unreleased]: https://github.com/TheZacillac/seer/compare/v0.52.2...HEAD
+[0.52.2]: https://github.com/TheZacillac/seer/compare/v0.52.1...v0.52.2
 [0.52.1]: https://github.com/TheZacillac/seer/compare/v0.52.0...v0.52.1
 [0.52.0]: https://github.com/TheZacillac/seer/compare/v0.51.0...v0.52.0
 [0.51.0]: https://github.com/TheZacillac/seer/compare/v0.50.0...v0.51.0
