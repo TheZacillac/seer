@@ -11,6 +11,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **WHOIS values that were present but wrong for ~20 ccTLDs.** An accuracy
+  pass over every ccTLD (raw reply vs. parse, plus an RDAP cross-check)
+  found fields filled from the wrong line.
+  - **FRED-format registries** (`.cz`, `.cr`, `.ls`, `.mk`, `.mw`, `.tz`,
+    `.ve`, and `.ar`, which uses the same layout): the creation date came
+    from a contact object's `created:` instead of the domain's
+    `registered:`, and expiry/updated (`expire:`, `changed:`) were missing.
+    A new parser reads dates and status from the domain object only and
+    resolves the registrant handle to its contact's name.
+  - **`.pl`:** expiry came from `option expiration date` (a registration
+    option, not the domain); it is now `renewal date`. All nameservers on
+    the multi-line `nameservers:` field are read.
+  - **Status:** multi-word statuses are kept whole (`registrar locked`,
+    `Sponsoring registrar change forbidden`) instead of their first word,
+    and contact sections no longer leak address `State:` or contact
+    `status:` lines into the domain status (`.mx`, `.kz`, `.ua`).
+  - **Nameservers** drop the trailing root dot (`.ru`, `.su`, `.uz`, `.ws`)
+    and the `not.defined` placeholder (`.uz`, WHOIS and RDAP).
+  - **Contacts:** `Registrar Admin Email` is no longer read as the
+    domain's admin email (`.ps`, `.bf`); `.ee` organization is the
+    registrant's name, not its business-register code; `.th`'s
+    `Personal Information` placeholder is dropped.
+  - **`.uk`:** "No registrar listed…" / "No registration status listed."
+    are no longer shown as values. **`.lv`:** the reply's generation time
+    is no longer reported as the updated date. **`.de`:** DNSSEC shows
+    `signedDelegation` instead of the raw DNSKEY. **`.tg`:** dot leaders
+    after the colon are stripped.
+- `whois_sweep` (maintainer example) now checks accuracy, not just
+  presence: parsed values missing from the raw reply land in `unsourced`,
+  and `--rdap` compares WHOIS against the registry's RDAP record.
+
 ## [0.52.3] - 2026-10-13
 
 A WHOIS parsing patch: `.cn` lookups now show registration and expiry dates.

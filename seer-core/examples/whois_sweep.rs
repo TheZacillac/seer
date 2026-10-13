@@ -20,13 +20,26 @@
 //!
 //! Classification reuses the parser's own predicates, so a bucket reflects
 //! what `seer whois` would actually show. Raw replies land in
-//! `<out>/raw/<tld>.txt` (fixture material for new parsers) and every row in
-//! `<out>/report.json`.
+//! `<out>/raw/<tld>.txt` (fixture material for new parsers), the parsed
+//! result in `<out>/parsed/<tld>.json` and every row in `<out>/report.json`.
+//!
+//! ## Accuracy checks
+//!
+//! A bucket says a field was *found*, not that it is *right*. Each answered
+//! row also carries:
+//!
+//! - `unsourced` — parsed values that do not appear in the raw reply
+//!   (registrar, nameservers, and dates checked against the usual
+//!   renderings, ±1 day for timezone shifts). A hit usually means a value
+//!   was taken from the wrong line or a date's day and month were swapped.
+//! - `rdap` (with `--rdap`) — the probe's RDAP record from the registry
+//!   compared against WHOIS: dates more than a day apart and differing
+//!   nameserver sets land in `mismatch`. RDAP lands in `<out>/rdap/<tld>.json`.
 //!
 //! ```text
 //! cargo run -p seer-core --example whois_sweep -- \
 //!     [--out DIR] [--only uk,de,...] [--probe tld=domain ...] [--concurrency N]
-//!     [--nameserver SPEC] [--dns-qps N]
+//!     [--nameserver SPEC] [--dns-qps N] [--rdap]
 //! ```
 //!
 //! Probe selection sends up to four NS queries per ccTLD, so they are
@@ -46,9 +59,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use chrono::{DateTime, Days, Utc};
 use futures::stream::{self, StreamExt};
 use seer_core::whois::{all_tlds, get_whois_server};
-use seer_core::{DnsResolver, RecordType, SeerError, WhoisClient, WhoisResponse};
+use seer_core::{
+    DnsResolver, RdapClient, RdapResponse, RecordType, SeerError, WhoisClient, WhoisResponse,
+};
 use serde_json::{json, Value};
 
 const DEFAULT_CONCURRENCY: usize = 8;
@@ -66,6 +82,7 @@ struct Args {
     concurrency: usize,
     nameserver: Option<String>,
     dns_qps: u32,
+    rdap: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -76,6 +93,7 @@ fn parse_args() -> Result<Args, String> {
         concurrency: DEFAULT_CONCURRENCY,
         nameserver: None,
         dns_qps: DEFAULT_DNS_QPS,
+        rdap: false,
     };
     for (tld, domain) in PINNED_PROBES {
         args.probes
@@ -85,6 +103,7 @@ fn parse_args() -> Result<Args, String> {
     while let Some(flag) = it.next() {
         let mut value = || it.next().ok_or(format!("{flag} needs a value"));
         match flag.as_str() {
+            "--rdap" => args.rdap = true,
             "--out" => args.out = PathBuf::from(value()?),
             "--only" => {
                 args.only = Some(
@@ -223,6 +242,158 @@ fn classify_response(r: &WhoisResponse) -> (&'static str, String) {
     (bucket, detail)
 }
 
+/// Lowercased, comma-free, whitespace-collapsed, trailing-dot-free form for
+/// substring checks, so `NS1.Example.COM.` matches `ns1.example.com` across
+/// line wraps and `Inc.` matches `, Inc.`.
+fn norm(s: &str) -> String {
+    s.replace(',', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim_end_matches('.')
+        .to_lowercase()
+}
+
+/// Whether some common rendering of `date` (or the day either side, for a
+/// registry that prints local time) appears in the normalized raw reply.
+fn date_in_raw(raw: &str, date: DateTime<Utc>) -> bool {
+    const FORMATS: &[&str] = &[
+        "%Y-%m-%d",
+        "%d.%m.%Y",
+        "%d/%m/%Y",
+        "%Y%m%d",
+        "%Y.%m.%d",
+        "%Y/%m/%d",
+        "%d-%m-%Y",
+        "%d-%b-%Y",
+        "%d %b %Y",
+        "%b %d %Y",
+        "%b %e %Y",
+        "%e %b %Y",
+        "%d-%B-%Y",
+        "%d %B %Y",
+        "%B %d %Y",
+        "%B %e %Y",
+        "%e %B %Y",
+        "%a %b %d",
+        "%a %b %e",
+        // Traficom (.fi) `16.2.1999`, KISA (.kr) `2007. 03. 02.`
+        "%-d.%-m.%Y",
+        "%Y. %m. %d",
+    ];
+    // Nominet (.gg/.je) `24th April 1997`, `01st January`
+    let ordinal = |d: DateTime<Utc>| {
+        let suffix = match d.format("%d").to_string().as_str() {
+            "01" | "21" | "31" => "st",
+            "02" | "22" => "nd",
+            "03" | "23" => "rd",
+            _ => "th",
+        };
+        [
+            norm(&d.format(&format!("%d{suffix} %B %Y")).to_string()),
+            norm(&d.format(&format!("%-d{suffix} %B %Y")).to_string()),
+        ]
+    };
+    let days = [
+        Some(date),
+        date.checked_sub_days(Days::new(1)),
+        date.checked_add_days(Days::new(1)),
+    ];
+    days.into_iter().flatten().any(|d| {
+        FORMATS
+            .iter()
+            .map(|f| norm(&d.format(f).to_string()))
+            .chain(ordinal(d))
+            .any(|rendered| raw.contains(&rendered))
+    })
+}
+
+/// Parsed values that the raw reply does not back up.
+fn unsourced(r: &WhoisResponse) -> Vec<String> {
+    let raw = norm(&r.raw_response);
+    let mut out = Vec::new();
+    if let Some(reg) = &r.registrar {
+        if !raw.contains(&norm(reg)) {
+            out.push(format!("registrar={reg}"));
+        }
+    }
+    for ns in &r.nameservers {
+        if !raw.contains(&norm(ns)) {
+            out.push(format!("ns={ns}"));
+        }
+    }
+    let dates = [
+        ("created", r.creation_date),
+        ("expires", r.expiration_date),
+        ("updated", r.updated_date),
+    ];
+    for (name, date) in dates {
+        if let Some(d) = date {
+            if !date_in_raw(&raw, d) {
+                out.push(format!("{name}={}", d.format("%Y-%m-%d")));
+            }
+        }
+    }
+    out
+}
+
+/// Nameserver names compared as a set, case- and trailing-dot-insensitive.
+fn ns_set(names: &[String]) -> std::collections::BTreeSet<String> {
+    names.iter().map(|n| norm(n)).collect()
+}
+
+/// Disagreements between the WHOIS parse and the registry's RDAP record.
+/// A field only one side carries is not a disagreement.
+fn rdap_mismatches(w: &WhoisResponse, r: &RdapResponse) -> Vec<String> {
+    let mut out = Vec::new();
+    let dates = [
+        ("created", w.creation_date, r.creation_date()),
+        ("expires", w.expiration_date, r.expiration_date()),
+    ];
+    for (name, wd, rd) in dates {
+        if let (Some(wd), Some(rd)) = (wd, rd) {
+            if (wd - rd).num_hours().abs() > 36 {
+                out.push(format!(
+                    "{name}: whois={} rdap={}",
+                    wd.format("%Y-%m-%d"),
+                    rd.format("%Y-%m-%d")
+                ));
+            }
+        }
+    }
+    let (wns, rns) = (ns_set(&w.nameservers), ns_set(&r.nameserver_names()));
+    if !wns.is_empty() && !rns.is_empty() && wns != rns {
+        out.push(format!("ns: whois={wns:?} rdap={rns:?}"));
+    }
+    out
+}
+
+/// Fetches RDAP for `probe` and compares it with the WHOIS parse. `None`
+/// when the TLD has no RDAP service in the bootstrap.
+async fn rdap_check(
+    rdap: &RdapClient,
+    tld: &str,
+    probe: &str,
+    w: &WhoisResponse,
+    dir: &std::path::Path,
+) -> Option<Value> {
+    rdap.get_rdap_base_url_for_tld(tld).await?;
+    Some(match rdap.lookup_domain(probe).await {
+        Ok(r) => {
+            if let Ok(s) = serde_json::to_string_pretty(&r) {
+                let _ = tokio::fs::write(dir.join(format!("{tld}.json")), s).await;
+            }
+            let mismatch = rdap_mismatches(w, &r);
+            json!({
+                "status": if mismatch.is_empty() { "match" } else { "mismatch" },
+                "mismatch": mismatch,
+                "registrar": r.get_registrar(),
+            })
+        }
+        Err(e) => json!({ "status": "error", "error": e.to_string() }),
+    })
+}
+
 fn classify_error(e: &SeerError) -> &'static str {
     match e {
         SeerError::WhoisConnectionFailed(_) | SeerError::Timeout(_) => "unreachable",
@@ -232,34 +403,54 @@ fn classify_error(e: &SeerError) -> &'static str {
     }
 }
 
-async fn sweep_one(
-    tld: &'static str,
-    whois: Arc<WhoisClient>,
-    dns: Arc<DnsResolver>,
-    pacer: Arc<Pacer>,
-    pinned: Option<String>,
-    nameserver: Option<Arc<str>>,
-    raw_dir: PathBuf,
-) -> Value {
+/// Clients and settings every per-TLD task shares.
+struct Sweep {
+    whois: WhoisClient,
+    dns: DnsResolver,
+    pacer: Pacer,
+    nameserver: Option<String>,
+    /// Set with `--rdap`.
+    rdap: Option<RdapClient>,
+    out: PathBuf,
+}
+
+async fn sweep_one(tld: &'static str, pinned: Option<String>, ctx: Arc<Sweep>) -> Value {
+    let Sweep {
+        whois,
+        dns,
+        pacer,
+        nameserver,
+        rdap,
+        out,
+    } = &*ctx;
     let server = get_whois_server(tld).unwrap_or("");
     let row = |bucket: &str, probe: &str, detail: String| json!({ "tld": tld, "bucket": bucket, "server": server, "probe": probe, "detail": detail });
     if server.is_empty() {
         return row("no_whois", "", String::new());
     }
-    let probe = match find_probe(&dns, &pacer, tld, pinned.as_ref(), nameserver.as_deref()).await {
+    let probe = match find_probe(dns, pacer, tld, pinned.as_ref(), nameserver.as_deref()).await {
         Ok(p) => p,
         Err(why) => return row("no_probe", "", why),
     };
     match whois.lookup(&probe).await {
         Ok(r) => {
             let (bucket, detail) = classify_response(&r);
-            let path = raw_dir.join(format!("{tld}.txt"));
+            let path = out.join("raw").join(format!("{tld}.txt"));
             if let Err(e) = tokio::fs::write(&path, &r.raw_response).await {
                 eprintln!("could not write {}: {e}", path.display());
+            }
+            if let Ok(s) = serde_json::to_string_pretty(&r) {
+                let _ = tokio::fs::write(out.join("parsed").join(format!("{tld}.json")), s).await;
             }
             let mut v = row(bucket, &probe, detail);
             v["answered_by"] = json!(r.whois_server);
             v["bytes"] = json!(r.raw_response.len());
+            v["unsourced"] = json!(unsourced(&r));
+            if let Some(rdap) = rdap {
+                v["rdap"] = rdap_check(rdap, tld, &probe, &r, &out.join("rdap"))
+                    .await
+                    .unwrap_or_else(|| json!({ "status": "no_rdap" }));
+            }
             v
         }
         Err(e) => row(classify_error(&e), &probe, e.to_string()),
@@ -275,17 +466,23 @@ async fn main() -> std::process::ExitCode {
             return std::process::ExitCode::from(2);
         }
     };
-    let raw_dir = args.out.join("raw");
-    if let Err(e) = std::fs::create_dir_all(&raw_dir) {
-        eprintln!("cannot create {}: {e}", raw_dir.display());
-        return std::process::ExitCode::FAILURE;
+    for sub in ["raw", "parsed", "rdap"] {
+        let dir = args.out.join(sub);
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            eprintln!("cannot create {}: {e}", dir.display());
+            return std::process::ExitCode::FAILURE;
+        }
     }
 
     // Single attempt: a sweep should see flakiness, not have retries hide it.
-    let whois = Arc::new(WhoisClient::new().without_retries());
-    let dns = Arc::new(DnsResolver::new());
-    let pacer = Arc::new(Pacer::new(args.dns_qps));
-    let nameserver: Option<Arc<str>> = args.nameserver.as_deref().map(Arc::from);
+    let ctx = Arc::new(Sweep {
+        whois: WhoisClient::new().without_retries(),
+        dns: DnsResolver::new(),
+        pacer: Pacer::new(args.dns_qps),
+        nameserver: args.nameserver.clone(),
+        rdap: args.rdap.then(|| RdapClient::new().without_retries()),
+        out: args.out.clone(),
+    });
     let tlds = cctlds(args.only.as_deref());
     eprintln!(
         "sweeping {} ccTLDs, {} at a time",
@@ -296,15 +493,7 @@ async fn main() -> std::process::ExitCode {
     let mut rows: Vec<Value> = stream::iter(tlds)
         .map(|tld| {
             let pinned = args.probes.get(tld).cloned();
-            sweep_one(
-                tld,
-                whois.clone(),
-                dns.clone(),
-                pacer.clone(),
-                pinned,
-                nameserver.clone(),
-                raw_dir.clone(),
-            )
+            sweep_one(tld, pinned, ctx.clone())
         })
         .buffer_unordered(args.concurrency)
         .inspect(|row| {
@@ -352,10 +541,33 @@ async fn main() -> std::process::ExitCode {
             row["detail"].as_str().unwrap_or(""),
         );
     }
+    println!("\n== accuracy ==");
+    for row in &rows {
+        let unsourced = row["unsourced"].as_array().filter(|a| !a.is_empty());
+        let mismatch = row["rdap"]["mismatch"].as_array().filter(|a| !a.is_empty());
+        if unsourced.is_none() && mismatch.is_none() {
+            continue;
+        }
+        let list = |a: Option<&Vec<Value>>| {
+            a.map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            })
+            .unwrap_or_default()
+        };
+        println!(
+            "{:<4} unsourced: [{}]  rdap: [{}]",
+            row["tld"].as_str().unwrap_or(""),
+            list(unsourced),
+            list(mismatch),
+        );
+    }
     println!(
-        "\nreport: {}  raw replies: {}",
+        "\nreport: {}  raw/parsed/rdap: {}/{{raw,parsed,rdap}}",
         report.display(),
-        raw_dir.display()
+        args.out.display()
     );
     std::process::ExitCode::SUCCESS
 }

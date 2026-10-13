@@ -90,11 +90,10 @@ pub(super) fn parse(domain: &str, server: &str, raw: &str) -> WhoisResponse {
             }
         }
 
-        // Parse DNSSEC
-        if let Some(caps) = DNSKEY_PATTERN.captures(line) {
-            if let Some(m) = caps.get(1) {
-                dnssec = Some(m.as_str().trim().to_string());
-            }
+        // A published `Dnskey:` means a signed delegation; the key material
+        // itself is not a DNSSEC state (matches the EIS and SIDN parsers).
+        if DNSKEY_PATTERN.is_match(line) {
+            dnssec = Some("signedDelegation".to_string());
         }
     }
 
@@ -263,5 +262,13 @@ Changed: 2023-01-15T10:30:00+01:00
             Some("2023-01-15T10:30:00+00:00".to_string())
         );
         assert!(parse_date("2023-01-15").is_some());
+    }
+
+    #[test]
+    fn dnskey_line_reports_signed_delegation_not_the_key() {
+        // Live whois.denic.de reply for nic.de (2026-10-13), trimmed.
+        let raw = "Domain: nic.de\nNserver: a.nic.de\nDnskey: 257 3 8 AwEAAb/xrM2MD+xm84YNYby6TxkMaC6\nStatus: connect\n";
+        let r = parse("nic.de", "whois.denic.de", raw);
+        assert_eq!(r.dnssec.as_deref(), Some("signedDelegation"));
     }
 }

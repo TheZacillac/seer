@@ -140,6 +140,11 @@ pub(super) fn parse(domain: &str, server: &str, raw: &str) -> WhoisResponse {
                 Section::Registrant if registrant.is_none() && !is_redacted(&value) => {
                     registrant = Some(value);
                 }
+                // "No registrar listed.  This domain is directly registered
+                // with Nominet." / "No registration status listed." are
+                // sentences in place of a value.
+                _ if value.starts_with("No registrar listed")
+                    || value.starts_with("No registration status listed") => {}
                 Section::Registrar if registrar.is_none() => {
                     // Drop Nominet's `[Tag = EXAMPLE]` and Island Networks'
                     // `(http://…)` suffixes.
@@ -564,5 +569,15 @@ WHOIS lookup made on Thu, 1 Oct 2026 at 19:14:26 BST\n";
             relevant_date_without_colon("Expiry date: 01-Jan-2025"),
             None
         );
+    }
+
+    #[test]
+    fn no_registrar_and_no_status_sentences_are_not_values() {
+        // Live whois.nic.uk reply for nic.uk (2026-10-13), trimmed.
+        let raw = "    Domain name:\n        nic.uk\n\n    Registrar:\n        No registrar listed.  This domain is directly registered with Nominet.\n\n    Registration status:\n        No registration status listed.\n\n    Name servers:\n        nsa.nic.uk\n";
+        let r = parse("nic.uk", "whois.nic.uk", raw);
+        assert!(r.registrar.is_none(), "{:?}", r.registrar);
+        assert!(r.status.is_empty(), "{:?}", r.status);
+        assert_eq!(r.nameservers, vec!["nsa.nic.uk"]);
     }
 }

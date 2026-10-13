@@ -103,7 +103,9 @@ pub(super) fn parse(domain: &str, server: &str, raw: &str) -> WhoisResponse {
     let mut nameservers: Vec<String> = Vec::new();
     let mut registrar: Option<String> = None;
     let mut registrant: Option<String> = None;
-    let mut organization: Option<String> = None;
+    // `org id:` (the business-register code) appears only for a legal
+    // person, whose `name:` is then the organization's name.
+    let mut has_org_id = false;
     let mut registrant_country: Option<String> = None;
     let mut registrant_email: Option<String> = None;
     let mut registrant_phone: Option<String> = None;
@@ -156,9 +158,7 @@ pub(super) fn parse(domain: &str, server: &str, raw: &str) -> WhoisResponse {
             (Section::Registrant, "name") if registrant.is_none() => {
                 registrant = Some(value);
             }
-            (Section::Registrant, "org id") if organization.is_none() => {
-                organization = Some(value);
-            }
+            (Section::Registrant, "org id") => has_org_id = true,
             (Section::Registrant, "country") if registrant_country.is_none() => {
                 registrant_country = Some(value);
             }
@@ -199,6 +199,7 @@ pub(super) fn parse(domain: &str, server: &str, raw: &str) -> WhoisResponse {
         }
     }
 
+    let organization = registrant.clone().filter(|_| has_org_id);
     WhoisResponse {
         domain: domain.to_string(),
         registrar,
@@ -306,7 +307,9 @@ changed:   2023-05-08 09:20:15 +03:00\n";
     fn extracts_registrant_separately_from_registrar() {
         let r = parse(SAMPLE);
         assert_eq!(r.registrant.as_deref(), Some("Eesti Energia AS"));
-        assert_eq!(r.organization.as_deref(), Some("10421629"));
+        // The org id is a register code, not a name: the legal person's
+        // name is its organization.
+        assert_eq!(r.organization.as_deref(), Some("Eesti Energia AS"));
         assert_eq!(r.registrant_country.as_deref(), Some("EE"));
     }
 

@@ -20,6 +20,7 @@ mod servers;
 
 pub use client::WhoisClient;
 pub use parser::WhoisResponse;
-// Tolerant multi-format date parser, reused by the RDAP types module.
-pub(crate) use parser::parse_date;
+// Tolerant multi-format date parser and the nameserver placeholder check,
+// reused by the RDAP types module.
+pub(crate) use parser::{is_nameserver_placeholder, parse_date};
 pub use servers::{all_tlds, get_registry_url, get_tld, get_whois_server};
