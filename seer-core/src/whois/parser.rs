@@ -805,11 +805,79 @@ pub(super) fn extract_field_with_patterns(text: &str, patterns: &[Regex]) -> Opt
             .find(|v| !v.is_empty());
         if let Some(value) = first_value {
             if !is_placeholder_value(value) {
-                return Some(value.to_string());
+                return Some(decode_html_entities(value).into_owned());
             }
         }
     }
     None
+}
+
+/// Named HTML entities registries leave in plain-text replies (NIC Togo
+/// `Activ&eacute;`): markup basics and the accented Latin letters of the
+/// French-, Spanish- and Portuguese-speaking registries.
+const HTML_ENTITIES: &[(&str, &str)] = &[
+    ("amp", "&"),
+    ("lt", "<"),
+    ("gt", ">"),
+    ("quot", "\""),
+    ("apos", "'"),
+    ("nbsp", " "),
+    ("aacute", "á"),
+    ("agrave", "à"),
+    ("acirc", "â"),
+    ("atilde", "ã"),
+    ("auml", "ä"),
+    ("eacute", "é"),
+    ("egrave", "è"),
+    ("ecirc", "ê"),
+    ("euml", "ë"),
+    ("iacute", "í"),
+    ("icirc", "î"),
+    ("iuml", "ï"),
+    ("oacute", "ó"),
+    ("ocirc", "ô"),
+    ("otilde", "õ"),
+    ("ouml", "ö"),
+    ("uacute", "ú"),
+    ("ugrave", "ù"),
+    ("ucirc", "û"),
+    ("uuml", "ü"),
+    ("ccedil", "ç"),
+    ("ntilde", "ñ"),
+    ("Aacute", "Á"),
+    ("Agrave", "À"),
+    ("Eacute", "É"),
+    ("Egrave", "È"),
+    ("Ccedil", "Ç"),
+    ("Ntilde", "Ñ"),
+];
+
+/// Decodes HTML entities in a reply value: the named ones in
+/// [`HTML_ENTITIES`] and numeric `&#233;` / `&#xE9;`. Anything else,
+/// including a bare `&`, is left as written.
+fn decode_html_entities(value: &str) -> std::borrow::Cow<'_, str> {
+    static_regex! {
+        ENTITY = r"&(#[0-9]{1,7}|#[xX][0-9A-Fa-f]{1,6}|[A-Za-z]{2,8});";
+    }
+    if !value.contains('&') {
+        return std::borrow::Cow::Borrowed(value);
+    }
+    ENTITY.replace_all(value, |caps: &regex::Captures<'_>| {
+        let name = &caps[1];
+        let decoded = if let Some(num) = name.strip_prefix('#') {
+            let code = match num.strip_prefix(['x', 'X']) {
+                Some(hex) => u32::from_str_radix(hex, 16).ok(),
+                None => num.parse().ok(),
+            };
+            code.and_then(char::from_u32).map(String::from)
+        } else {
+            HTML_ENTITIES
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, c)| (*c).to_string())
+        };
+        decoded.unwrap_or_else(|| caps[0].to_string())
+    })
 }
 
 /// Registry/registrar boilerplate printed in place of contact data — most
@@ -1313,6 +1381,27 @@ fn is_contact_heading(line: &str) -> bool {
         .any(|h| heading.eq_ignore_ascii_case(h))
 }
 
+/// Line prefixes (lowercase, ASCII) that introduce domain status values.
+const STATUS_LABELS: &[&str] = &[
+    "domain status:",
+    // Register.bg (.bg): `registration status: busy, active`
+    "registration status:",
+    "status:",
+    // TCI (.ru/.su): `state: REGISTERED, DELEGATED, VERIFIED`
+    "state:",
+    // ANINF (.ga), NIC Sénégal (.sn): `Statut: actif`
+    "statut:",
+    // MoldData (.md): `Domain state: OK`
+    "domain state:",
+    // RESTENA (.lu): `domaintype: ACTIVE`
+    "domaintype:",
+];
+
+static_regex! {
+    // KG domain registry (.kg) puts the status after the name.
+    KG_DOMAIN_STATUS = r"^Domain\s+\S+\s+\(([A-Za-z][A-Za-z ]*)\)\s*$";
+}
+
 /// Extracts Status values only from the top-level domain block of a WHOIS
 /// response. Stops scanning at the first RIPE-style `[Section-Header]` line
 /// and skips contact sections (see [`CONTACT_HEADINGS`]), which keeps
@@ -1346,8 +1435,16 @@ fn extract_status_top_level(raw: &str) -> Vec<String> {
             continue;
         }
 
-        // Match "Domain Status:", "Status:", "status:", "state:" case-insensitively
-        // via a prefix check on the lowercased line.
+        // KG domain registry (.kg): `Domain NIC.KG (ACTIVE)`
+        if let Some(caps) = KG_DOMAIN_STATUS.captures(trimmed) {
+            if let Some(m) = caps.get(1) {
+                push_bounded(&mut statuses, m.as_str().to_string(), MAX_STATUSES);
+            }
+            continue;
+        }
+
+        // Match a [`STATUS_LABELS`] prefix case-insensitively via a prefix
+        // check on the lowercased line.
         let lower = trimmed.to_lowercase();
         // Slice the ORIGINAL line by the ASCII prefix length. The prefixes are
         // pure ASCII, so their byte length is identical in `trimmed` and
@@ -1356,18 +1453,10 @@ fn extract_status_top_level(raw: &str) -> Vec<String> {
         // Unicode (e.g. Turkish İ → i̇ grows 2→3 bytes), which could make the
         // lowercased suffix longer than the whole original line and underflow
         // `trimmed.len() - rest.len()` into an out-of-bounds slice panic.
-        let value_opt = if lower.starts_with("domain status:") {
-            Some(&trimmed["domain status:".len()..])
-        } else if lower.starts_with("registration status:") {
-            // Register.bg (.bg): `registration status: busy, active`
-            Some(&trimmed["registration status:".len()..])
-        } else if lower.starts_with("status:") {
-            Some(&trimmed["status:".len()..])
-        } else if lower.starts_with("state:") {
-            Some(&trimmed["state:".len()..])
-        } else {
-            None
-        };
+        let value_opt = STATUS_LABELS
+            .iter()
+            .find(|label| lower.starts_with(*label))
+            .map(|label| &trimmed[label.len()..]);
 
         // A value may list several comma-separated statuses (TCI's .ru/.su/.рф
         // `state: REGISTERED, DELEGATED, VERIFIED`); keep each one. ICANN-style
@@ -1388,7 +1477,11 @@ fn extract_status_top_level(raw: &str) -> Vec<String> {
                     })
                     .collect::<Vec<_>>()
                     .join(" ");
-                push_bounded(&mut statuses, phrase, MAX_STATUSES);
+                push_bounded(
+                    &mut statuses,
+                    decode_html_entities(&phrase).into_owned(),
+                    MAX_STATUSES,
+                );
             }
         }
     }
@@ -3373,6 +3466,54 @@ Name Server: ns2.example.com
         assert_eq!(
             generic("nic.au", raw).registrant.as_deref(),
             Some("INSTRA CORPORATION PTY LTD")
+        );
+    }
+
+    // ── ccTLD status labels present in the reply but not read (#189) ──
+
+    #[test]
+    fn registry_status_labels_are_read() {
+        let st = |domain: &str, raw: &str| generic(domain, raw).status;
+        // ANINF (.ga) / NIC Sénégal (.sn), MoldData (.md), RESTENA (.lu)
+        assert_eq!(
+            st("nic.ga", "Statut:                        actif\n"),
+            vec!["actif"]
+        );
+        assert_eq!(st("nic.md", "Domain state:   OK\n"), vec!["OK"]);
+        assert_eq!(
+            st("nic.lu", "domainname:     nic.lu\ndomaintype:     ACTIVE\n"),
+            vec!["ACTIVE"]
+        );
+        // KG domain registry (.kg): status in parentheses after the name.
+        assert_eq!(
+            st(
+                "nic.kg",
+                "% banner\n\nDomain NIC.KG (ACTIVE)\n\nAdministrative Contact:\n"
+            ),
+            vec!["ACTIVE"]
+        );
+        // A `Domain …` line without the parenthesised status is not one.
+        assert!(st("nic.kg", "Domain NIC.KG\n").is_empty());
+    }
+
+    #[test]
+    fn html_entities_in_values_are_decoded() {
+        // NIC Togo (.tg)
+        assert_eq!(
+            generic("nic.tg", "Status:.............Activ&eacute;\n").status,
+            vec!["Activé"]
+        );
+        assert_eq!(
+            decode_html_entities("Soci&#233;t&#xE9; &amp; Fils"),
+            "Société & Fils"
+        );
+        // Unknown entities and a bare `&` are left alone.
+        assert_eq!(decode_html_entities("A & B &bogus;"), "A & B &bogus;");
+        assert_eq!(
+            generic("x.tg", "Registrar: Netmaster &amp; Co\n")
+                .registrar
+                .as_deref(),
+            Some("Netmaster & Co")
         );
     }
 }
