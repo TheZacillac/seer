@@ -12,6 +12,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **WHOIS domain status for 7 more ccTLDs.** New status labels `Statut`
+  (`.ga`, `.sn`), `Domain state` (`.md`) and `domaintype` (`.lu`); `.kg`'s
+  `Domain NIC.KG (ACTIVE)` line; and `.kr` / `.한국` EPP statuses (`Domain
+  Status`, or `등록정보 보호` in a Korean-only reply), which the KISA parser
+  didn't read. HTML entities in WHOIS values are decoded (`.tg` showed
+  `Activ&eacute;`).
 - **WHOIS registrar, registrant and organization for 19 more ccTLDs.**
   - Registrant sections whose name sits under a heading are now read:
     colon-less (`Holder`, `Registrant`, `Owner Contact`), starred

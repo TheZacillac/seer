@@ -15,7 +15,7 @@
 
 use chrono::{DateTime, NaiveDate, Utc};
 
-use super::{push_bounded, MAX_NAMESERVERS};
+use super::{push_bounded, MAX_NAMESERVERS, MAX_STATUSES};
 use crate::whois::parser::WhoisResponse;
 
 static_regex! {
@@ -34,6 +34,8 @@ static_regex! {
     LAST_UPDATED_PATTERN = r"(?im)^Last Updated Date[ \t]*:[ \t]*(.+)$";
     AUTHORIZED_AGENCY_PATTERN = r"(?im)^Authorized Agency[ \t]*:[ \t]*(.+)$";
     DNSSEC_PATTERN = r"(?im)^DNSSEC[ \t]*:[ \t]*(.+)$";
+    /// EPP statuses: `Domain Status` (English), `등록정보 보호` (Korean).
+    STATUS_PATTERN = r"(?im)^(?:Domain Status|등록정보 보호)[ \t]*:[ \t]*(.+)$";
 }
 
 /// TLDs this parser handles.
@@ -77,6 +79,15 @@ pub(super) fn parse(domain: &str, server: &str, raw: &str) -> WhoisResponse {
                 let ns = m.as_str().trim().to_lowercase();
                 push_bounded(&mut nameservers, ns, MAX_NAMESERVERS);
             }
+        }
+    }
+
+    // Statuses from the English section (or the whole reply when there is
+    // none; the Korean and English lines carry the same codes and dedupe).
+    let mut status = Vec::new();
+    for caps in STATUS_PATTERN.captures_iter(english_section) {
+        if let Some(m) = caps.get(1) {
+            push_bounded(&mut status, m.as_str().trim().to_string(), MAX_STATUSES);
         }
     }
 
@@ -171,6 +182,7 @@ pub(super) fn parse(domain: &str, server: &str, raw: &str) -> WhoisResponse {
         expiration_date,
         updated_date,
         nameservers,
+        status,
         dnssec,
         whois_server: server.to_string(),
         raw_response: raw.to_string(),
@@ -353,5 +365,23 @@ Secondary Name Server
         assert_eq!(result.registrant, None);
         assert_eq!(result.registrar, None);
         assert_eq!(result.dnssec.as_deref(), Some("unsigned"));
+    }
+
+    #[test]
+    fn domain_status_is_read_once_from_both_sections() {
+        // Live whois.kr reply for google.co.kr (2026-10-13), trimmed: the
+        // Korean section repeats the codes under `등록정보 보호`.
+        let raw = "query : google.co.kr\n\n# KOREAN(UTF8)\n\n도메인이름                  : google.co.kr\n등록정보 보호               : clientTransferProhibited\n등록정보 보호               : clientUpdateProhibited\n\n# ENGLISH\n\nDomain Name                 : google.co.kr\nDomain Status               : clientTransferProhibited\nDomain Status               : clientUpdateProhibited\n";
+        let r = parse("google.co.kr", "whois.kr", raw);
+        assert_eq!(
+            r.status,
+            vec!["clientTransferProhibited", "clientUpdateProhibited"]
+        );
+        // Without an English section the Korean label is read.
+        let korean = raw.split("# ENGLISH").next().unwrap_or(raw);
+        assert_eq!(
+            parse("google.co.kr", "whois.kr", korean).status,
+            vec!["clientTransferProhibited", "clientUpdateProhibited"]
+        );
     }
 }
