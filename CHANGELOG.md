@@ -11,6 +11,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **WHOIS-only lookups are cross-checked against DNS.** When a domain's
+  record comes from WHOIS with no RDAP record beside it, `lookup` and
+  `info` also read the parent zone's NS delegation and show it as
+  `Nameservers (DNS)`, with a `DNS Delegation` line saying whether WHOIS
+  matches or which hosts each side is missing. Some registries' WHOIS lags
+  their own zone (`.tg` listed 2 of the 4 delegated nameservers). JSON
+  (CLI, Python, REST, MCP) gains a `dns_nameservers` object. A DNS failure
+  leaves it off; the query is capped at two DNS timeouts. Results that
+  RDAP answered are unchanged.
+
 ### Fixed
 - **`.jp` WHOIS no longer invents a registrar or registrant country.** The
   JPRS parser reported `JPRS` (the registry) as every domain's registrar

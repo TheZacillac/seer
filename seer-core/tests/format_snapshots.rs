@@ -22,9 +22,9 @@ use seer_core::caa::{CaaPolicy, CaaRecord, ISSUANCE_TIME_NOTE};
 use seer_core::confusables::{ConfusableReport, RegisteredLookalike};
 use seer_core::diff::{DnsDiff, DomainDiff, RegistrationDiff, SslDiff};
 use seer_core::dns::{
-    DelegationReport, DnsComparison, DnsQueryResult, DnsRecord, DnsStatus, DnsTrace, DnssecReport,
-    FollowIteration, FollowResult, LameNs, PropagationResult, RecordData, RecordType, ServerResult,
-    SvcParam, TraceHop, WildcardProbe,
+    DelegationReport, DnsComparison, DnsNameservers, DnsQueryResult, DnsRecord, DnsStatus,
+    DnsTrace, DnssecReport, FollowIteration, FollowResult, LameNs, PropagationResult, RecordData,
+    RecordType, ServerResult, SvcParam, TraceHop, WildcardProbe,
 };
 use seer_core::domain_info::DomainInfo;
 use seer_core::drift::{DriftReport, FieldChange};
@@ -773,6 +773,35 @@ fn fixture_lookup_whois() -> LookupResult {
         data: fixture_whois_with_contacts(),
         rdap_error: Some("RDAP bootstrap has no entry for this TLD".into()),
         rdap_fallback: None,
+        dns_nameservers: None,
+    }
+}
+
+/// A WHOIS-only lookup whose registry WHOIS lags the DNS delegation: one
+/// delegated host is missing from WHOIS and one WHOIS host is not delegated
+/// (the `.tg` case).
+fn fixture_lookup_whois_dns_differs() -> LookupResult {
+    let data = fixture_whois_with_contacts();
+    let mut delegated: Vec<String> = data.nameservers.iter().skip(1).cloned().collect();
+    delegated.push("ns9.example-dns.net".into());
+    LookupResult::Whois {
+        dns_nameservers: Some(DnsNameservers::compare(&data.nameservers, delegated)),
+        data,
+        rdap_error: Some("RDAP bootstrap has no entry for this TLD".into()),
+        rdap_fallback: None,
+    }
+}
+
+fn fixture_lookup_whois_dns_in_sync() -> LookupResult {
+    let data = fixture_whois_with_contacts();
+    LookupResult::Whois {
+        dns_nameservers: Some(DnsNameservers::compare(
+            &data.nameservers,
+            data.nameservers.clone(),
+        )),
+        data,
+        rdap_error: Some("RDAP bootstrap has no entry for this TLD".into()),
+        rdap_fallback: None,
     }
 }
 
@@ -826,6 +855,15 @@ snapshot_tests! {
         markdown.format_lookup(fixture_lookup_rdap_with_contacts());
     human_lookup_whois_snapshot => human.format_lookup(fixture_lookup_whois());
     markdown_lookup_whois_snapshot => markdown.format_lookup(fixture_lookup_whois());
+    // WHOIS-only lookups carry the live DNS delegation: the full list and
+    // both differences when WHOIS lags, one line when they agree.
+    human_lookup_whois_dns_differs_snapshot => human.format_lookup(fixture_lookup_whois_dns_differs());
+    markdown_lookup_whois_dns_differs_snapshot => markdown.format_lookup(fixture_lookup_whois_dns_differs());
+    human_lookup_whois_dns_in_sync_snapshot => human.format_lookup(fixture_lookup_whois_dns_in_sync());
+    human_domain_info_dns_differs_snapshot =>
+        human.format_domain_info(DomainInfo::from_lookup_result(&fixture_lookup_whois_dns_differs()));
+    markdown_domain_info_dns_differs_snapshot =>
+        markdown.format_domain_info(DomainInfo::from_lookup_result(&fixture_lookup_whois_dns_differs()));
     human_lookup_available_snapshot => human.format_lookup(fixture_lookup_available());
     markdown_lookup_available_snapshot => markdown.format_lookup(fixture_lookup_available());
     human_availability_snapshot => human.format_availability(fixture_availability());

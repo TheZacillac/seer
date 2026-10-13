@@ -405,6 +405,7 @@ mod tests {
             ),
             rdap_error: None,
             rdap_fallback: None,
+            dns_nameservers: None,
         };
         // No earlier snapshot → nothing to compare.
         assert!(baseline_snapshot(std::iter::empty()).is_none());

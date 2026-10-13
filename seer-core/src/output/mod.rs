@@ -250,6 +250,29 @@ fn lookup_source(result: &LookupResult) -> &'static str {
     }
 }
 
+/// The WHOIS-vs-DNS nameserver verdict every formatter prints for a
+/// WHOIS-only lookup ([`crate::DnsNameservers`]). Host names are remote text:
+/// callers pass this through their sanitizing writer.
+pub(crate) fn dns_delegation_verdict(ns: &crate::DnsNameservers) -> String {
+    if ns.in_sync {
+        return "matches WHOIS".to_string();
+    }
+    let mut parts = Vec::new();
+    if !ns.missing_from_whois.is_empty() {
+        parts.push(format!(
+            "delegated but not in WHOIS: {}",
+            ns.missing_from_whois.join(", ")
+        ));
+    }
+    if !ns.missing_from_dns.is_empty() {
+        parts.push(format!(
+            "in WHOIS but not delegated: {}",
+            ns.missing_from_dns.join(", ")
+        ));
+    }
+    format!("differs from WHOIS ({})", parts.join("; "))
+}
+
 /// Formats a [`TimeDelta`] as a compact duration (`Ns` / `Nm Ns` / `Nh Nm`).
 fn format_duration(duration: TimeDelta) -> String {
     let total_secs = duration.num_seconds();

@@ -16,7 +16,7 @@ use crate::availability::{
     classify_fallback, AvailabilityChecker, AvailabilityResult, Fallback, PriorRdap, PriorWhois,
 };
 use crate::cache::TtlCache;
-use crate::dns::{DnsPresence, DnsResolver};
+use crate::dns::{DelegationChecker, DnsNameservers, DnsPresence, DnsResolver};
 use crate::error::{Result, SeerError};
 use crate::rdap::{RdapClient, RdapResponse};
 use crate::whois::{get_registry_url, get_tld, WhoisClient, WhoisResponse};
@@ -354,6 +354,11 @@ pub enum LookupResult {
         rdap_error: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         rdap_fallback: Option<Box<RdapResponse>>,
+        /// The live parent-zone delegation checked against WHOIS's
+        /// nameservers, when RDAP had no record to cross-check against (see
+        /// [`DnsNameservers`]). Absent when the DNS query failed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dns_nameservers: Option<DnsNameservers>,
     },
     Available {
         data: Box<AvailabilityResult>,
@@ -514,12 +519,47 @@ pub(crate) fn trim_raw_response(mut result: LookupResult) -> LookupResult {
     result
 }
 
+/// Whether `result` is a WHOIS record with no RDAP record beside it — the
+/// case [`SmartLookup`] cross-checks against the DNS delegation.
+fn wants_dns_nameservers(result: &LookupResult) -> bool {
+    matches!(
+        result,
+        LookupResult::Whois {
+            rdap_fallback: None,
+            ..
+        }
+    )
+}
+
+/// Attaches the delegation comparison to a result [`wants_dns_nameservers`]
+/// accepts; any other result, or a failed DNS query, is returned unchanged.
+fn with_dns_nameservers(mut result: LookupResult, delegated: Result<Vec<String>>) -> LookupResult {
+    if !wants_dns_nameservers(&result) {
+        return result;
+    }
+    if let LookupResult::Whois {
+        data,
+        dns_nameservers,
+        ..
+    } = &mut result
+    {
+        match delegated {
+            Ok(delegated) => {
+                *dns_nameservers = Some(DnsNameservers::compare(&data.nameservers, delegated));
+            }
+            Err(e) => debug!(error = %e, "DNS delegation unavailable for the WHOIS cross-check"),
+        }
+    }
+    result
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SmartLookup {
     rdap_client: RdapClient,
     whois_client: WhoisClient,
     availability_checker: AvailabilityChecker,
     dns_resolver: DnsResolver,
+    delegation_checker: DelegationChecker,
 }
 
 impl SmartLookup {
@@ -537,6 +577,7 @@ impl SmartLookup {
             whois_client: WhoisClient::from_config(config),
             availability_checker: AvailabilityChecker::from_config(config),
             dns_resolver: DnsResolver::from_config(config),
+            delegation_checker: DelegationChecker::from_config(config),
         }
     }
 
@@ -642,7 +683,12 @@ impl SmartLookup {
             return Ok(cached);
         }
 
-        let result = self.lookup_concurrent(&normalized, progress).await?;
+        let result = self
+            .lookup_concurrent(&normalized, progress.clone())
+            .await?;
+        let result = self
+            .attach_dns_nameservers(&normalized, result, progress)
+            .await;
 
         // Cache a trimmed copy to limit memory usage before releasing
         // waiters (via guard drop) so they observe the cached value. A
@@ -656,6 +702,25 @@ impl SmartLookup {
         LOOKUP_CACHE.insert_with_ttl(normalized.clone(), trim_raw_response(result.clone()), ttl);
 
         Ok(result)
+    }
+
+    /// Adds the live parent-zone delegation to a WHOIS-sourced result that
+    /// RDAP had no record for (see [`DnsNameservers`]). A DNS failure leaves
+    /// it off: it is supplementary detail, never a reason to fail the lookup.
+    async fn attach_dns_nameservers(
+        &self,
+        domain: &str,
+        result: LookupResult,
+        progress: Option<LookupProgressCallback>,
+    ) -> LookupResult {
+        if !wants_dns_nameservers(&result) {
+            return result;
+        }
+        if let Some(ref cb) = progress {
+            cb("Checking the DNS delegation");
+        }
+        let delegated = self.delegation_checker.delegated_ns(domain).await;
+        with_dns_nameservers(result, delegated)
     }
 
     #[instrument(skip(self, progress), fields(domain = %domain))]
@@ -791,6 +856,7 @@ impl SmartLookup {
                 data: whois_data,
                 rdap_error: Some(sanitize_error_for_public(&rdap_error_str)),
                 rdap_fallback: rdap_fallback_data,
+                dns_nameservers: None,
             });
         }
 
@@ -923,6 +989,7 @@ mod tests {
             },
             rdap_error: None,
             rdap_fallback: None,
+            dns_nameservers: None,
         };
 
         assert_eq!(result.domain_name(), Some("example.com".to_string()));
@@ -965,6 +1032,7 @@ mod tests {
             },
             rdap_error: Some("RDAP failed".to_string()),
             rdap_fallback: None,
+            dns_nameservers: None,
         };
 
         let json = serde_json::to_string(&result).unwrap();
@@ -1031,6 +1099,7 @@ mod tests {
             data: w,
             rdap_error: None,
             rdap_fallback: None,
+            dns_nameservers: None,
         });
         if let LookupResult::Whois { data, .. } = result {
             assert!(data.raw_response.ends_with("[truncated]"));
@@ -1278,6 +1347,7 @@ mod tests {
             data: empty_whois(&normalized),
             rdap_error: None,
             rdap_fallback: None,
+            dns_nameservers: None,
         };
         LOOKUP_CACHE.insert(normalized.clone(), canned);
         {
@@ -1431,6 +1501,7 @@ mod tests {
             data: empty_whois("example.test"),
             rdap_error: Some("RDAP response incomplete".to_string()),
             rdap_fallback: None,
+            dns_nameservers: None,
         }));
         // Authoritative registry answers keep the full TTL.
         assert!(!is_degraded_result(&available_via("rdap", true, "high")));
@@ -1439,6 +1510,7 @@ mod tests {
             data: denic_whois(),
             rdap_error: None,
             rdap_fallback: None,
+            dns_nameservers: None,
         }));
         const { assert!(DEGRADED_LOOKUP_CACHE_TTL.as_secs() < LOOKUP_CACHE_TTL.as_secs()) };
     }
@@ -1939,5 +2011,108 @@ mod tests {
             !map.contains_key(&key),
             "poisoned-mutex drop path should still remove the in-flight entry"
         );
+    }
+
+    // --- DNS delegation cross-check on WHOIS-only results --------------------
+
+    fn whois_result(
+        nameservers: &[&str],
+        rdap_fallback: Option<Box<RdapResponse>>,
+    ) -> LookupResult {
+        LookupResult::Whois {
+            data: WhoisResponse {
+                domain: "nic.tg".to_string(),
+                nameservers: nameservers.iter().map(|s| s.to_string()).collect(),
+                ..Default::default()
+            },
+            rdap_error: None,
+            rdap_fallback,
+            dns_nameservers: None,
+        }
+    }
+
+    fn delegated(hosts: &[&str]) -> Result<Vec<String>> {
+        Ok(hosts.iter().map(|s| s.to_string()).collect())
+    }
+
+    #[test]
+    fn whois_only_result_gets_the_dns_delegation() {
+        let result = with_dns_nameservers(
+            whois_result(&["ns1.nic.tg", "ns2.nic.tg"], None),
+            delegated(&["ns1.nic.tg", "ns2.nic.tg", "ns4.nic.tg"]),
+        );
+        let LookupResult::Whois {
+            dns_nameservers: Some(ns),
+            ..
+        } = result
+        else {
+            panic!("expected a DNS delegation on {result:?}");
+        };
+        assert!(!ns.in_sync);
+        assert_eq!(ns.missing_from_whois, vec!["ns4.nic.tg"]);
+    }
+
+    #[test]
+    fn result_with_an_rdap_record_is_not_cross_checked() {
+        assert!(!wants_dns_nameservers(&whois_result(
+            &[],
+            Some(Box::default())
+        )));
+        let rdap = LookupResult::Rdap {
+            data: Box::default(),
+            whois_fallback: None,
+        };
+        assert!(!wants_dns_nameservers(&rdap));
+        let result = with_dns_nameservers(
+            whois_result(&[], Some(Box::default())),
+            delegated(&["ns1.x"]),
+        );
+        assert!(matches!(
+            result,
+            LookupResult::Whois {
+                dns_nameservers: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn failed_dns_query_leaves_the_result_unchanged() {
+        let result = with_dns_nameservers(
+            whois_result(&["ns1.nic.tg"], None),
+            Err(SeerError::DnsError("no parent server answered".into())),
+        );
+        assert!(matches!(
+            result,
+            LookupResult::Whois {
+                dns_nameservers: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn dns_nameservers_round_trip_and_stay_optional() {
+        // History/cache entries written before the field existed still read.
+        let old = r#"{"source":"whois","data":{"domain":"nic.tg","registrar":null,"registrant":null,"organization":null,"creation_date":null,"expiration_date":null,"updated_date":null,"nameservers":[],"status":[],"dnssec":null,"whois_server":"whois.nic.tg"},"rdap_error":null}"#;
+        let parsed: LookupResult = serde_json::from_str(old).expect("old shape deserializes");
+        assert!(matches!(
+            parsed,
+            LookupResult::Whois {
+                dns_nameservers: None,
+                ..
+            }
+        ));
+        let with = with_dns_nameservers(whois_result(&["a.x"], None), delegated(&["a.x"]));
+        let json = serde_json::to_string(&with).unwrap();
+        assert!(json.contains("\"dns_nameservers\""), "{json}");
+        let back: LookupResult = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            back,
+            LookupResult::Whois {
+                dns_nameservers: Some(_),
+                ..
+            }
+        ));
     }
 }

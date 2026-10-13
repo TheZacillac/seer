@@ -762,6 +762,7 @@ csv,format,example.org
             data: whois,
             rdap_error: None,
             rdap_fallback: None,
+            dns_nameservers: None,
         }));
         let BulkResultData::Lookup(LookupResult::Whois { data, .. }) = trimmed else {
             panic!("expected Lookup(Whois) variant");

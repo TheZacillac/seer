@@ -14,6 +14,11 @@
 //!    authoritative answers is `zone_ns`.
 //! 4. Compare the two sets case-insensitively with trailing dots normalized.
 //!
+//! [`DelegationChecker::delegated_ns`] runs steps 1–2 only, on a shorter
+//! deadline: [`crate::SmartLookup`] uses it to cross-check a WHOIS-only
+//! result's nameservers ([`DnsNameservers`]), since some registries' WHOIS
+//! lags their own zone.
+//!
 //! **Parent-zone simplification:** the parent zone is derived by stripping the
 //! domain's leftmost label (`example.com` → `com`, `example.co.uk` → `co.uk`).
 //! For multi-label public suffixes this is exactly the registrable parent, and
@@ -74,6 +79,12 @@ use crate::validation::normalize_domain;
 /// [`MAX_PARENT_SERVERS_TRIED`] servers.
 const CHECK_BUDGET_TIMEOUTS: u32 = 2 + 3 * PARENT_SERVERS_WANTED as u32 + 3;
 
+/// Overall deadline of [`DelegationChecker::delegated_ns`], in per-query
+/// timeouts. It is supplementary detail on a lookup, so it gets far less
+/// than a full [`DelegationChecker::check`]: a parent zone that answers at
+/// all does so well within it, and one that doesn't is not worth waiting on.
+const DELEGATED_NS_BUDGET_TIMEOUTS: u32 = 2;
+
 /// Maximum delegated NS servers probed for lameness. Delegations larger than
 /// this are unusual; the cap bounds total probe work and a warning notes the
 /// truncation.
@@ -128,6 +139,54 @@ pub struct DelegationReport {
     pub warnings: Vec<String>,
 }
 
+/// A registry's WHOIS nameserver list checked against the live parent-zone
+/// delegation ([`DelegationChecker::delegated_ns`]).
+///
+/// Some registries' WHOIS lags their own zone (NIC Togo listed 2 of the 4
+/// nameservers `.tg` delegates for `nic.tg`), and a WHOIS-only lookup has no
+/// RDAP record to cross-check against, so [`crate::SmartLookup`] attaches
+/// this to WHOIS-sourced results. Names are normalized (lowercase, no
+/// trailing dot) and sorted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DnsNameservers {
+    /// NS names the parent zone delegates for the domain.
+    pub delegated: Vec<String>,
+    /// True when WHOIS lists exactly the delegated set.
+    pub in_sync: bool,
+    /// Delegated NS names WHOIS does not list.
+    pub missing_from_whois: Vec<String>,
+    /// NS names WHOIS lists that the parent does not delegate.
+    pub missing_from_dns: Vec<String>,
+}
+
+impl DnsNameservers {
+    /// Compares `whois` (any case, trailing dots allowed) with the
+    /// `delegated` set.
+    pub fn compare(whois: &[String], delegated: Vec<String>) -> Self {
+        let norm = |n: &String| n.trim_end_matches('.').to_ascii_lowercase();
+        let whois: BTreeSet<String> = whois.iter().map(norm).collect();
+        let delegated: BTreeSet<String> = delegated.iter().map(norm).collect();
+        let missing_from_whois: Vec<String> = delegated.difference(&whois).cloned().collect();
+        let missing_from_dns: Vec<String> = whois.difference(&delegated).cloned().collect();
+        Self {
+            in_sync: missing_from_whois.is_empty() && missing_from_dns.is_empty(),
+            delegated: delegated.into_iter().collect(),
+            missing_from_whois,
+            missing_from_dns,
+        }
+    }
+}
+
+/// The parent zone's answer for a delegation (steps 1–2 of
+/// [`DelegationChecker::check`]).
+struct ParentDelegation {
+    /// Parent-zone servers that answered.
+    servers_queried: Vec<String>,
+    /// Union of the NS names they delegate (normalized, sorted).
+    delegated: BTreeSet<String>,
+    warnings: Vec<String>,
+}
+
 /// Classified result of a single non-recursive NS query against one server.
 ///
 /// hickory folds a referral for an NS query (empty ANSWER, matching NS
@@ -180,6 +239,7 @@ enum ProbeOutcome {
 /// Construct with [`DelegationChecker::new`] (defaults) or
 /// [`DelegationChecker::from_config`] (honors `~/.seer/config.toml`
 /// `timeouts.dns_secs`), then call [`check`](DelegationChecker::check).
+#[derive(Clone)]
 pub struct DelegationChecker {
     /// Per-query timeout for both recursive and direct queries.
     timeout: Duration,
@@ -298,6 +358,133 @@ impl DelegationChecker {
 
     /// The whole check's deadline: [`CHECK_BUDGET_TIMEOUTS`] per-query
     /// timeouts.
+    /// Steps 1–2 of [`check`](Self::check): the parent zone's NS set, then the
+    /// delegation for `domain` from up to [`PARENT_SERVERS_WANTED`] of its
+    /// servers. Errors when the parent has no NS set or no parent server
+    /// answers; an empty delegation is a warning.
+    async fn parent_delegation(
+        &self,
+        domain: &str,
+        parent_zone: &str,
+        deadline: tokio::time::Instant,
+        budget: Duration,
+    ) -> Result<ParentDelegation> {
+        let mut warnings = Vec::new();
+        let out_of_time = || {
+            SeerError::DnsError(format!(
+                "delegation check for {domain} gave up after {budget:?} without a parent-zone answer"
+            ))
+        };
+
+        // 1. Parent zone NS set via the recursive resolver.
+        let parent_hosts = tokio::time::timeout_at(deadline, self.recursive_ns_set(parent_zone))
+            .await
+            .map_err(|_| out_of_time())??;
+        if parent_hosts.is_empty() {
+            return Err(SeerError::DnsError(format!(
+                "parent zone {} has no NS records — cannot locate the delegation for {}",
+                parent_zone, domain
+            )));
+        }
+
+        // 2. Ask up to PARENT_SERVERS_WANTED responsive parent servers for the
+        //    delegation (RD=0). Referrals carry the NS set in AUTHORITY; a
+        //    parent that is also authoritative for the child answers in ANSWER.
+        let mut parent_server_queried = Vec::new();
+        let mut delegated: BTreeSet<String> = BTreeSet::new();
+        for host in parent_hosts.iter().take(MAX_PARENT_SERVERS_TRIED) {
+            if parent_server_queried.len() >= PARENT_SERVERS_WANTED {
+                break;
+            }
+            let Ok(asked) = tokio::time::timeout_at(deadline, self.ask_host(host, domain)).await
+            else {
+                warnings.push(format!(
+                    "stopped asking parent servers: the check's {budget:?} budget ran out"
+                ));
+                break;
+            };
+            let direct = match asked {
+                Ok(direct) => direct,
+                Err(reason) => {
+                    warnings.push(format!("skipped parent server {}: {}", host, reason));
+                    continue;
+                }
+            };
+            match direct {
+                DirectNs::Response {
+                    response_code,
+                    answer_ns,
+                    authority_ns,
+                    ..
+                } => {
+                    if response_code == ResponseCode::NXDomain {
+                        warnings.push(format!(
+                            "parent server {} returned NXDOMAIN for {}",
+                            host, domain
+                        ));
+                    }
+                    // Referrals carry the delegation in AUTHORITY; a parent
+                    // that is also authoritative for the child answers in
+                    // ANSWER. Union both.
+                    delegated.extend(answer_ns);
+                    delegated.extend(authority_ns);
+                    parent_server_queried.push(host.clone());
+                }
+                DirectNs::Rcode(code) => {
+                    warnings.push(format!("parent server {} answered with {}", host, code));
+                }
+                DirectNs::Unreachable(reason) => {
+                    warnings.push(format!(
+                        "parent server {} did not respond: {}",
+                        host, reason
+                    ));
+                }
+                DirectNs::LocalNoRoute(reason) => {
+                    warnings.push(format!(
+                        "parent server {} not probed — no route from this host ({})",
+                        host, reason
+                    ));
+                }
+            }
+        }
+
+        if parent_server_queried.is_empty() {
+            return Err(SeerError::DnsError(format!(
+                "no parent-zone ({}) nameserver answered the delegation query for {}",
+                parent_zone, domain
+            )));
+        }
+        if delegated.is_empty() {
+            warnings.push(format!(
+                "parent zone {} returned no NS delegation for {} — the domain may not be delegated",
+                parent_zone, domain
+            ));
+        }
+
+        Ok(ParentDelegation {
+            servers_queried: parent_server_queried,
+            delegated,
+            warnings,
+        })
+    }
+
+    /// The NS set the parent zone delegates for `domain` (normalized:
+    /// lowercase, no trailing dot; sorted) — the registry's live view, without
+    /// [`check`](Self::check)'s per-server lameness probes. Bounded by two
+    /// per-query timeouts overall (`DELEGATED_NS_BUDGET_TIMEOUTS`), far less
+    /// than a full check: it is supplementary detail on a lookup.
+    #[instrument(skip(self), fields(domain = %domain))]
+    pub async fn delegated_ns(&self, domain: &str) -> Result<Vec<String>> {
+        let domain = normalize_domain(domain)?;
+        let parent_zone = parent_zone_of(&domain);
+        let budget = self.timeout.saturating_mul(DELEGATED_NS_BUDGET_TIMEOUTS);
+        let deadline = tokio::time::Instant::now() + budget;
+        let delegation = self
+            .parent_delegation(&domain, &parent_zone, deadline, budget)
+            .await?;
+        Ok(delegation.delegated.into_iter().collect())
+    }
+
     #[cfg(not(test))]
     fn budget(&self) -> Duration {
         self.timeout.saturating_mul(CHECK_BUDGET_TIMEOUTS)
@@ -369,99 +556,17 @@ impl DelegationChecker {
     pub async fn check(&self, domain: &str) -> Result<DelegationReport> {
         let domain = normalize_domain(domain)?;
         let parent_zone = parent_zone_of(&domain);
-        let mut warnings = Vec::new();
         let budget = self.budget();
         let deadline = tokio::time::Instant::now() + budget;
-        let out_of_time = || {
-            SeerError::DnsError(format!(
-                "delegation check for {domain} gave up after {budget:?} without a parent-zone answer"
-            ))
-        };
 
-        // 1. Parent zone NS set via the recursive resolver.
-        let parent_hosts = tokio::time::timeout_at(deadline, self.recursive_ns_set(&parent_zone))
-            .await
-            .map_err(|_| out_of_time())??;
-        if parent_hosts.is_empty() {
-            return Err(SeerError::DnsError(format!(
-                "parent zone {} has no NS records — cannot locate the delegation for {}",
-                parent_zone, domain
-            )));
-        }
-
-        // 2. Ask up to PARENT_SERVERS_WANTED responsive parent servers for the
-        //    delegation (RD=0). Referrals carry the NS set in AUTHORITY; a
-        //    parent that is also authoritative for the child answers in ANSWER.
-        let mut parent_server_queried = Vec::new();
-        let mut delegated: BTreeSet<String> = BTreeSet::new();
-        for host in parent_hosts.iter().take(MAX_PARENT_SERVERS_TRIED) {
-            if parent_server_queried.len() >= PARENT_SERVERS_WANTED {
-                break;
-            }
-            let Ok(asked) = tokio::time::timeout_at(deadline, self.ask_host(host, &domain)).await
-            else {
-                warnings.push(format!(
-                    "stopped asking parent servers: the check's {budget:?} budget ran out"
-                ));
-                break;
-            };
-            let direct = match asked {
-                Ok(direct) => direct,
-                Err(reason) => {
-                    warnings.push(format!("skipped parent server {}: {}", host, reason));
-                    continue;
-                }
-            };
-            match direct {
-                DirectNs::Response {
-                    response_code,
-                    answer_ns,
-                    authority_ns,
-                    ..
-                } => {
-                    if response_code == ResponseCode::NXDomain {
-                        warnings.push(format!(
-                            "parent server {} returned NXDOMAIN for {}",
-                            host, domain
-                        ));
-                    }
-                    // Referrals carry the delegation in AUTHORITY; a parent
-                    // that is also authoritative for the child answers in
-                    // ANSWER. Union both.
-                    delegated.extend(answer_ns);
-                    delegated.extend(authority_ns);
-                    parent_server_queried.push(host.clone());
-                }
-                DirectNs::Rcode(code) => {
-                    warnings.push(format!("parent server {} answered with {}", host, code));
-                }
-                DirectNs::Unreachable(reason) => {
-                    warnings.push(format!(
-                        "parent server {} did not respond: {}",
-                        host, reason
-                    ));
-                }
-                DirectNs::LocalNoRoute(reason) => {
-                    warnings.push(format!(
-                        "parent server {} not probed — no route from this host ({})",
-                        host, reason
-                    ));
-                }
-            }
-        }
-
-        if parent_server_queried.is_empty() {
-            return Err(SeerError::DnsError(format!(
-                "no parent-zone ({}) nameserver answered the delegation query for {}",
-                parent_zone, domain
-            )));
-        }
-        if delegated.is_empty() {
-            warnings.push(format!(
-                "parent zone {} returned no NS delegation for {} — the domain may not be delegated",
-                parent_zone, domain
-            ));
-        }
+        // 1–2. The parent zone's delegation.
+        let ParentDelegation {
+            servers_queried: parent_server_queried,
+            delegated,
+            mut warnings,
+        } = self
+            .parent_delegation(&domain, &parent_zone, deadline, budget)
+            .await?;
 
         // 3. Probe the delegated servers (bounded, concurrent) for lameness.
         let probe_hosts: Vec<String> = delegated.iter().take(MAX_NS_PROBED).cloned().collect();
@@ -1455,5 +1560,58 @@ mod tests {
             report.warnings
         );
         assert_eq!(report.zone_ns, vec!["ns1.seer.test", "ns2.seer.test"]);
+    }
+
+    // --- delegated_ns (lookup cross-check) ---------------------------------
+
+    #[tokio::test]
+    async fn delegated_ns_reads_the_parent_referral_without_probing() {
+        // No zone servers exist: delegated_ns must not need them.
+        let recursive = spawn_recursive_mock(&[]).await;
+        let parent = spawn_parent_server(&["NS2.seer.test.", "ns1.seer.test."]).await;
+        let delegated = checker(
+            recursive,
+            HashMap::from([("a.parent.test".to_string(), parent)]),
+        )
+        .delegated_ns("seer.test")
+        .await
+        .expect("parent answers the delegation");
+        assert_eq!(delegated, vec!["ns1.seer.test", "ns2.seer.test"]);
+    }
+
+    #[tokio::test]
+    async fn delegated_ns_errors_when_no_parent_server_answers() {
+        let recursive = spawn_recursive_mock(&[]).await;
+        // a.parent.test resolves, but nothing listens on its mapped port.
+        let dead = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = dead.local_addr().unwrap().port();
+        drop(dead);
+        let result = checker(
+            recursive,
+            HashMap::from([("a.parent.test".to_string(), port)]),
+        )
+        .delegated_ns("seer.test")
+        .await;
+        assert!(result.is_err(), "{result:?}");
+    }
+
+    #[test]
+    fn dns_nameservers_compare_normalizes_and_diffs() {
+        // NIC Togo (.tg): WHOIS lists 2 of the 4 delegated hosts.
+        let whois = vec!["NS1.nic.tg.".to_string(), "ns2.nic.tg".to_string()];
+        let delegated = ["ns1.nic.tg", "ns2.nic.tg", "ns4.nic.tg", "ns5.netmaster.tg"]
+            .map(String::from)
+            .to_vec();
+        let ns = DnsNameservers::compare(&whois, delegated);
+        assert!(!ns.in_sync);
+        assert_eq!(
+            ns.missing_from_whois,
+            vec!["ns4.nic.tg", "ns5.netmaster.tg"]
+        );
+        assert!(ns.missing_from_dns.is_empty());
+
+        let same = DnsNameservers::compare(&whois, vec!["ns2.nic.tg".into(), "ns1.nic.tg".into()]);
+        assert!(same.in_sync);
+        assert_eq!(same.delegated, vec!["ns1.nic.tg", "ns2.nic.tg"]);
     }
 }

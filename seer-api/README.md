@@ -83,7 +83,7 @@ Available only when `SEER_DOCS_ENABLED=true`:
 | `/` | GET | List available endpoints |
 | `/health` | GET | Health check |
 | `/metrics` | GET | Operational metrics (loopback always; non-loopback gated by `SEER_METRICS_ENABLED`) |
-| `/lookup/{domain}` | GET | Smart lookup (RDAP → WHOIS fallback) |
+| `/lookup/{domain}` | GET | Smart lookup (RDAP → WHOIS fallback; WHOIS-only results add `dns_nameservers`, the live NS delegation compared with WHOIS) |
 | `/whois/{domain}` | GET | WHOIS lookup |
 | `/rdap/domain/{domain}` | GET | RDAP domain lookup |
 | `/rdap/ip/{ip}` | GET | RDAP IP lookup |

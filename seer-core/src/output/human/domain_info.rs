@@ -1,6 +1,6 @@
 use super::*;
 use crate::domain_info::{DomainInfo, ExpiryStatus};
-use crate::output::availability_label;
+use crate::output::{availability_label, dns_delegation_verdict};
 
 impl HumanFormatter {
     pub(super) fn format_tld(&self, info: &crate::tld::TldInfo) -> String {
@@ -155,6 +155,18 @@ impl HumanFormatter {
         // parsing, so they are sanitized like every other remote value (#53).
         if !info.nameservers.is_empty() {
             rows.text("Nameservers", &info.nameservers.join(", "));
+        }
+        if let Some(dns) = &info.dns_nameservers {
+            if !dns.in_sync {
+                rows.text("Nameservers (DNS)", &dns.delegated.join(", "));
+            }
+            let verdict = sanitize_line(&dns_delegation_verdict(dns));
+            let styled = if dns.in_sync {
+                self.value(&verdict)
+            } else {
+                self.warning(&verdict)
+            };
+            rows.kv("DNS Delegation", styled);
         }
         if !info.status.is_empty() {
             rows.text("Status", &info.status.join(", "));

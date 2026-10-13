@@ -1,5 +1,5 @@
 use super::*;
-use crate::output::{availability_label, lookup_source};
+use crate::output::{availability_label, dns_delegation_verdict, lookup_source};
 
 impl HumanFormatter {
     pub(super) fn format_lookup(&self, result: &LookupResult) -> String {
@@ -81,7 +81,10 @@ impl HumanFormatter {
                 }
             }
             LookupResult::Whois {
-                data, rdap_error, ..
+                data,
+                rdap_error,
+                dns_nameservers,
+                ..
             } => {
                 // Error strings can carry upstream server text (e.g. an
                 // IANA-returned WHOIS server name), so sanitize like any
@@ -97,6 +100,18 @@ impl HumanFormatter {
                 rows.expires(data.expiration_date);
                 rows.list("Status", &data.status);
                 rows.list("Nameservers", &data.nameservers);
+                if let Some(dns) = dns_nameservers {
+                    if !dns.in_sync {
+                        rows.list("Nameservers (DNS)", &dns.delegated);
+                    }
+                    let verdict = sanitize_line(&dns_delegation_verdict(dns));
+                    let styled = if dns.in_sync {
+                        self.value(&verdict)
+                    } else {
+                        self.warning(&verdict)
+                    };
+                    rows.kv("DNS Delegation", styled);
+                }
                 rows.opt("DNSSEC", &data.dnssec);
             }
             LookupResult::Available {
@@ -256,6 +271,7 @@ mod tests {
             data: whois,
             rdap_error: Some(evil.to_string()),
             rdap_fallback: None,
+            dns_nameservers: None,
         };
         let available_variant = LookupResult::Available {
             data: Box::new(crate::availability::AvailabilityResult {

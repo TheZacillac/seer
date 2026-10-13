@@ -26,7 +26,8 @@ A high-performance, multi-interface domain utility suite — query WHOIS, RDAP, 
 <td width="50%">
 
 **🔍 Lookups & Discovery**
-- **Smart Lookup** — concurrent RDAP + WHOIS with fallback
+- **Smart Lookup** — concurrent RDAP + WHOIS with fallback; a WHOIS-only
+  result is cross-checked against the live DNS delegation
 - **WHOIS** — registrant, registrar, and expiration data
 - **RDAP** — modern protocol for domains, IPs, and ASNs
 - **Domain Info** — merged RDAP + WHOIS in a flat structure
@@ -192,7 +193,9 @@ The startup theme comes from `[tui] theme` in `~/.seer/config.toml` (`"frappe"` 
 ### Command Mode
 
 ```bash
-# Smart lookup (concurrent RDAP + WHOIS)
+# Smart lookup (concurrent RDAP + WHOIS). When only WHOIS has the domain
+# (no RDAP record), the parent zone's NS delegation is also queried and
+# shown as "Nameservers (DNS)", with a note when WHOIS lags it.
 seer lookup example.com
 
 # Comprehensive domain info (merged RDAP + WHOIS)
