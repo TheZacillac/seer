@@ -23,6 +23,7 @@ mod nominet;
 mod objects;
 mod rnids;
 mod sidn;
+mod sknic;
 
 use super::parser::WhoisResponse;
 
@@ -68,6 +69,7 @@ const PARSERS: &[(&[&str], ParseFn)] = &[
     (nominet::TLDS, nominet::parse),   // .uk, .co.uk, .gg, .je
     (rnids::TLDS, rnids::parse),       // .rs, .срб
     (sidn::TLDS, sidn::parse),         // .nl
+    (sknic::TLDS, sknic::parse),       // .sk
 ];
 
 /// Parses a WHOIS response with the registry parser for the domain's

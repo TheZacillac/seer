@@ -12,6 +12,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **WHOIS registrar, registrant and organization for 19 more ccTLDs.**
+  - Registrant sections whose name sits under a heading are now read:
+    colon-less (`Holder`, `Registrant`, `Owner Contact`), starred
+    (`** Registrant:`) and bracketed (`[HOLDER]`) headings, a blank line
+    after the heading, and `Name` / `Organization Name` / `Nom` sub-fields
+    (`.fi .ax .kz .tn .bn .sm .sn .gf .tw .tr`).
+  - New labels: `Registrant Contact Name` / `Organisation` (`.ae`),
+    `registrant-name` / `-organization` (`.st`), `owner` (`.br`),
+    `Domain Holder Organization` (`.th`), `Org` (`.by`), `Company English
+    Name` (`.hk`), `Registration Service Provider` (`.tw`).
+  - `.sk`: registrar and registrant names instead of their handles (new
+    SK-NIC parser); `.il`: the holder on the newer `registrant:` line;
+    `.ir`: the holder's organization.
+  - `NO OBJECT FOUND!` (`.gf`/`.mq`) is a placeholder, not a name.
 - **WHOIS nameservers for 8 more ccTLDs.** They were in the reply but unread:
   heading blocks for `.be` (`Nameservers:`), `.aw` (`Domain nameservers:`),
   `.tw` (`Domain servers in listed order:`), `.tr` (`** Domain Servers:`)

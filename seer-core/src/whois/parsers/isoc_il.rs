@@ -111,6 +111,8 @@ pub(super) fn parse(domain: &str, server: &str, raw: &str) -> WhoisResponse {
 
     let mut registrar: Option<String> = None;
     let mut descr: Vec<String> = Vec::new();
+    // Newer replies name the holder on a `registrant:` line instead.
+    let mut registrant_line: Option<String> = None;
     let mut registrant_email: Option<String> = None;
     let mut registrant_phone: Option<String> = None;
     let mut admin_handle: Option<String> = None;
@@ -171,6 +173,9 @@ pub(super) fn parse(domain: &str, server: &str, raw: &str) -> WhoisResponse {
                 // First `descr:` is the holder name; the rest is the
                 // postal address, one line each.
                 "descr" if descr.len() < 16 => descr.push(value.to_string()),
+                "registrant" if registrant_line.is_none() => {
+                    registrant_line = Some(value.to_string());
+                }
                 "e-mail" if registrant_email.is_none() => {
                     registrant_email = Some(normalize_email(value));
                 }
@@ -238,7 +243,7 @@ pub(super) fn parse(domain: &str, server: &str, raw: &str) -> WhoisResponse {
     let tech = find_contact(&tech_handle);
 
     let mut descr_iter = descr.into_iter();
-    let registrant = descr_iter.next();
+    let registrant = registrant_line.or_else(|| descr_iter.next());
     let address: Vec<String> = descr_iter.collect();
     let registrant_address = if address.is_empty() {
         None
@@ -580,5 +585,14 @@ registrar name: Israel Internet Association ISOC-IL
         assert_eq!(parse_validity("01-12-2030").map(ymd), Some((2030, 12, 1)));
         // Tolerates an ISO date should the registry ever change format.
         assert_eq!(parse_validity("2030-12-01").map(ymd), Some((2030, 12, 1)));
+    }
+
+    #[test]
+    fn registrant_line_names_the_holder() {
+        // Live whois.isoc.org.il reply for google.co.il (2026-10-13), trimmed:
+        // the holder is on `registrant:`, with no `descr:` lines.
+        let raw = "domain:       google.co.il\n\nregistrant:   Google LLC.\ne-mail:       dns-admin AT google.com\nnserver:      ns1.google.com\nassigned:     05-06-1999\nvalidity:     05-06-2027\nstatus:       Transfer Locked\n";
+        let r = parse("google.co.il", raw);
+        assert_eq!(r.registrant.as_deref(), Some("Google LLC."));
     }
 }

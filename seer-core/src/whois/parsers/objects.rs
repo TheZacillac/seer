@@ -1,11 +1,12 @@
 //! Shared reader for RPSL-style object replies: blank-line-separated objects
 //! of `key: value` lines, each opened by its class key (`domain:`,
-//! `contact:`, `nic-hdl:`, `nsset:`, …). Used by the FRED and AFNIC parsers,
+//! `contact:`, `nic-hdl:`, `nsset:`, …). Used by the FRED, AFNIC and SK-NIC parsers,
 //! whose contact objects repeat domain labels (`created:`, `changed:`,
 //! `eppstatus:`) that a flat label scan would mistake for the domain's.
 
 static_regex! {
-    KEY_VALUE = r"^([A-Za-z][A-Za-z0-9-]*):[ \t]*(.*?)[ \t]*$";
+    // Keys may contain spaces (SK-NIC `Domain registrant:`).
+    KEY_VALUE = r"^([A-Za-z][A-Za-z0-9 -]*?):[ \t]*(.*?)[ \t]*$";
 }
 
 /// One object: its `key: value` lines in order, keys lowercased.
