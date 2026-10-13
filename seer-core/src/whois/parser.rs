@@ -64,14 +64,47 @@ static REGISTRAR_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
         "Sponsoring Registrar",
         // RESTENA (.lu)
         "registrar-name",
+        // TWNIC (.tw)
+        "Registration Service Provider",
     ])
 });
 
-static REGISTRANT_PATTERNS: LazyLock<Vec<Regex>> =
-    LazyLock::new(|| field_patterns(&["Registrant Name", "Registrant"]));
+static REGISTRANT_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
+    let mut patterns = field_patterns(&[
+        "Registrant Name",
+        "Registrant",
+        // .ae: `Registrant Contact Name:`; Tecnisys (.st) `registrant-name:`.
+        // After the plain label: auDA (.au) prints both, and its
+        // `Registrant:` is the holder, the contact name a person.
+        "Registrant Contact Name",
+        "registrant-name",
+    ]);
+    // Registro.br (.br): `owner:` (not `owner-c:` / `ownerid:`)
+    patterns.extend(line_field_patterns(&["owner"]));
+    patterns
+});
+
+/// Section headings a registrant's name sits under (see
+/// [`extract_section_value`]): TWNIC/METU/BNNIC/KazNIC `Registrant`,
+/// Traficom/`.sn` `Holder`, NIC.SM `Owner`, ATI (.tn) `Owner Contact`.
+const REGISTRANT_HEADINGS: &[&str] = &[
+    "registrant",
+    "holder",
+    "domain holder",
+    "owner",
+    "owner contact",
+];
 
 static ORGANIZATION_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
-    let mut patterns = field_patterns(&["Registrant Organization"]);
+    let mut patterns = field_patterns(&[
+        "Registrant Organization",
+        // .ae: `Registrant Contact Organisation:`; Tecnisys (.st)
+        // `registrant-organization:`; THNIC (.th) `Domain Holder Organization:`
+        "Registrant Contact Organisation",
+        "Registrant Organisation",
+        "registrant-organization",
+        "Domain Holder Organization",
+    ]);
     // The bare/ambiguous org labels are line-anchored so they cannot match the
     // "Organization:" inside "Admin Organization:" / "Tech Organization:" and
     // thereby attribute another contact's org to the registrant.
@@ -79,6 +112,10 @@ static ORGANIZATION_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
         "Organization",
         "org-name",
         "Org Name",
+        // HKIRC (.hk): `Company English Name (It should be the same as …): X`
+        r"Company English Name(?: \([^)]*\))?",
+        // hoster.by (.by): `Org:` heads the reply, before any contact.
+        "Org",
     ]));
     patterns
 });
@@ -312,7 +349,7 @@ impl WhoisResponse {
         let registrar = extract_field_with_patterns(raw, &REGISTRAR_PATTERNS)
             .or_else(|| extract_section_value(raw, &["registrar"]));
         let registrant = extract_field_with_patterns(raw, &REGISTRANT_PATTERNS)
-            .or_else(|| extract_section_value(raw, &["registrant"]));
+            .or_else(|| extract_section_value(raw, REGISTRANT_HEADINGS));
         let organization = extract_field_with_patterns(raw, &ORGANIZATION_PATTERNS);
         let registrant_email = extract_field_with_patterns(raw, &REGISTRANT_EMAIL_PATTERNS);
         let registrant_phone = extract_field_with_patterns(raw, &REGISTRANT_PHONE_PATTERNS);
@@ -806,39 +843,77 @@ fn is_placeholder_value(value: &str) -> bool {
         || lower == "none"
         // THNIC (.th) `Tech Organization: Personal Information`
         || lower == "personal information"
+        // Mediaserv (.gf/.mq) in place of an unpublished contact
+        || lower == "no object found!"
 }
 
-/// Section-style fallback for registries that print a label alone on its own
-/// line and the value on the NEXT line — NASK (`REGISTRAR:` / `MarkMonitor,
-/// Inc.`), DNS Belgium (`Registrar:` / `\tName:\t MarkMonitor Inc.`) and
-/// TWNIC (`Registrant:` / `      Google LLC`).
+/// Sub-field keys that name the entity inside a section: `Name:`, KazNIC
+/// `Organization Name:`, `.sn` `Nom:`.
+const SECTION_NAME_KEYS: &[&str] = &["name", "organization name", "organisation name", "nom"];
+
+/// Section-style fallback for registries that print a heading on its own line
+/// and the entity under it — NASK (`REGISTRAR:` / `MarkMonitor, Inc.`), DNS
+/// Belgium (`Registrar:` / `\tName:\t MarkMonitor Inc.`), TWNIC
+/// (`Registrant:` / blank / `      Google LLC`), METU (`** Registrar:` /
+/// `NIC Handle: …` / `Organization Name: …`), Traficom (`Holder` /
+/// `name: …`), `.sn` (`[HOLDER]` / … / `Nom: …`).
 ///
-/// Only the line immediately after a header whose whole content is one of
-/// `labels` + `:` (case-insensitive) is considered, and only when it is a bare
-/// value (no `:` at all) or a `Name: <value>` sub-field. Anything else — most
-/// importantly another `Key: value` field (`Registrar IANA ID: 376`) — is not
-/// a value for this header, which is exactly the misattribution the
-/// horizontal-whitespace field patterns exist to prevent.
+/// The heading is a whole line equal to one of `labels`, optionally marked
+/// `**` or bracketed and with or without a colon. Its body runs to the next
+/// blank line (one blank line straight after the heading is allowed). The
+/// value is the body's first line when it is bare (no `:`), or else the
+/// first [`SECTION_NAME_KEYS`] sub-field. Any other `Key: value` line — most
+/// importantly `Registrar IANA ID: 376` — is never taken as the value, which
+/// is exactly the misattribution the horizontal-whitespace field patterns
+/// exist to prevent.
 fn extract_section_value(text: &str, labels: &[&str]) -> Option<String> {
     let mut lines = text.lines();
     while let Some(line) = lines.next() {
-        let Some(label) = line.trim().strip_suffix(':') else {
-            continue;
-        };
-        if !labels.iter().any(|l| label.trim().eq_ignore_ascii_case(l)) {
+        if !is_section_heading(line, labels) {
             continue;
         }
-        let next = lines.next()?.trim();
-        let value = match next.split_once(':') {
-            None => next,
-            Some((key, value)) if key.trim().eq_ignore_ascii_case("name") => value.trim(),
-            Some(_) => continue,
-        };
-        if !value.is_empty() && !is_placeholder_value(value) {
-            return Some(value.to_string());
+        let mut first = true;
+        let mut skipped_blank = false;
+        for body in lines.by_ref() {
+            let body = body.trim();
+            if body.is_empty() {
+                if first && !skipped_blank {
+                    skipped_blank = true;
+                    continue;
+                }
+                break;
+            }
+            let value = match body.split_once(':') {
+                None if first => Some(body),
+                None => None,
+                Some((key, value)) => SECTION_NAME_KEYS
+                    .iter()
+                    .any(|k| key.trim().eq_ignore_ascii_case(k))
+                    .then(|| value.trim()),
+            };
+            first = false;
+            if let Some(value) = value.filter(|v| !v.is_empty() && !is_placeholder_value(v)) {
+                return Some(value.to_string());
+            }
         }
     }
     None
+}
+
+/// Whether `line` is a bare heading for one of `labels`: `Registrant`,
+/// `Registrant:`, `** Registrant:` or `[HOLDER]`, compared case-insensitively.
+fn is_section_heading(line: &str, labels: &[&str]) -> bool {
+    let heading = line
+        .trim()
+        .trim_start_matches('*')
+        .trim()
+        .trim_end_matches(':')
+        .trim_end();
+    let heading = heading
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(heading);
+    labels.iter().any(|l| heading.eq_ignore_ascii_case(l))
 }
 
 /// Interpretation order for ambiguous all-numeric dates (`A/B/YYYY`,
@@ -3163,6 +3238,141 @@ Name Server: ns2.example.com
         assert_eq!(
             generic("nic.tg", tg).nameservers,
             vec!["ns1.nic.tg", "ns2.nic.tg"]
+        );
+    }
+
+    // ── ccTLD registrar / registrant present in the reply but not read (#189) ──
+
+    #[test]
+    fn registrant_sections_are_read() {
+        let reg = |domain: &str, raw: &str| generic(domain, raw).registrant;
+        // TWNIC (.tw): colon heading, a blank line, then the bare name.
+        assert_eq!(
+            reg(
+                "google.tw",
+                "   Registrant:\n      \n      Google LLC\n      dns-admin@google.com\n"
+            )
+            .as_deref(),
+            Some("Google LLC")
+        );
+        // METU (.tr): `** ` heading, bare name.
+        assert_eq!(
+            reg(
+                "google.com.tr",
+                "** Registrant:\nGoogle LLC\nHidden upon user request\n"
+            )
+            .as_deref(),
+            Some("Google LLC")
+        );
+        // Traficom (.fi): colon-less `Holder`, padded `name` sub-field.
+        assert_eq!(
+            reg("nic.fi", "Holder\nname...............: Elisa Oyj\n").as_deref(),
+            Some("Elisa Oyj")
+        );
+        // KazNIC (.kz): colon-less heading, `Name:`.
+        assert_eq!(
+            reg("nic.kz", "Registrant\nName...................: KazNIC\n").as_deref(),
+            Some("KazNIC")
+        );
+        // ATI (.tn): `Owner Contact`; NIC.SM: `Owner:` and a bare name.
+        assert_eq!(
+            reg("nic.tn", "Owner Contact\nName................: ATI\n").as_deref(),
+            Some("ATI")
+        );
+        assert_eq!(
+            reg(
+                "nic.sm",
+                "Owner:\nTelecom Italia San Marino S.p.A.\nVia 28 Luglio, 212\n"
+            )
+            .as_deref(),
+            Some("Telecom Italia San Marino S.p.A.")
+        );
+        // `.sn`: bracketed heading, French `Nom:` after other keys.
+        assert_eq!(reg("nic.sn", "[HOLDER]\nID Contact: NICS100\nType: Organisation\nNom: Network Information Center Sénégal\n").as_deref(), Some("Network Information Center Sénégal"));
+    }
+
+    #[test]
+    fn section_value_never_takes_another_field_or_crosses_a_blank_line() {
+        // A non-name `Key: value` is skipped, and the section ends at a blank
+        // line, so the next section's bare line is not borrowed.
+        let raw = "Registrar:\nRegistrar IANA ID: 376\n\nSome Other Heading\n";
+        assert!(generic("example.com", raw).registrar.is_none());
+        // Mediaserv (.gf/.mq) placeholder for an unpublished contact.
+        assert!(
+            generic("nic.mq", "[holder]\nNO OBJECT FOUND!\nobject: 2068011865\n")
+                .registrant
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn registrar_from_section_or_service_provider_label() {
+        // METU (.tr): handle line first, then `Organization Name`.
+        let raw =
+            "** Registrar:\nNIC Handle\t\t: ogv40\nOrganization Name\t: ODTÜ GELİŞTİRME VAKFI\n";
+        assert_eq!(
+            generic("google.com.tr", raw).registrar.as_deref(),
+            Some("ODTÜ GELİŞTİRME VAKFI")
+        );
+        // TWNIC (.tw)
+        let raw = "Registration Service Provider: Markmonitor, Inc.\n";
+        assert_eq!(
+            generic("google.tw", raw).registrar.as_deref(),
+            Some("Markmonitor, Inc.")
+        );
+    }
+
+    #[test]
+    fn registrant_and_organization_labels_are_read() {
+        // .ae
+        let r = generic("nic.ae", "Registrant Contact Name:         Etisalat\nRegistrant Contact Organisation: Etisalat Corp\n");
+        assert_eq!(
+            (r.registrant.as_deref(), r.organization.as_deref()),
+            (Some("Etisalat"), Some("Etisalat Corp"))
+        );
+        // Tecnisys (.st)
+        let r = generic(
+            "nic.st",
+            "registrant-organization: ST Registry\nregistrant-name:         ST Registry (TEM1)\n",
+        );
+        assert_eq!(
+            (r.registrant.as_deref(), r.organization.as_deref()),
+            (Some("ST Registry (TEM1)"), Some("ST Registry"))
+        );
+        // Registro.br: `owner:`, not `owner-c:`
+        assert_eq!(
+            generic("nic.br", "owner-c:     FAN\nowner:       NIC.BR\n")
+                .registrant
+                .as_deref(),
+            Some("NIC.BR")
+        );
+        // THNIC (.th), HKIRC (.hk), hoster.by (.by)
+        assert_eq!(
+            generic("nic.th", "Domain Holder Organization: Google LLC\n")
+                .organization
+                .as_deref(),
+            Some("Google LLC")
+        );
+        let hk = "Company English Name (It should be the same as the registered/corporation name on your Business Register Certificate or relevant documents): GOOGLE LLC\n";
+        assert_eq!(
+            generic("google.hk", hk).organization.as_deref(),
+            Some("GOOGLE LLC")
+        );
+        assert_eq!(
+            generic("nic.by", "Org: OOO Example\nCountry: BY\n")
+                .organization
+                .as_deref(),
+            Some("OOO Example")
+        );
+    }
+
+    #[test]
+    fn plain_registrant_outranks_registrant_contact_name() {
+        // auDA (.au) prints both; `Registrant:` is the holder.
+        let raw = "Registrant: INSTRA CORPORATION PTY LTD\nRegistrant Contact Name: Domain Administrator\n";
+        assert_eq!(
+            generic("nic.au", raw).registrant.as_deref(),
+            Some("INSTRA CORPORATION PTY LTD")
         );
     }
 }
