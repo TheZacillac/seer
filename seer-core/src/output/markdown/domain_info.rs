@@ -1,5 +1,5 @@
 use super::*;
-use crate::output::availability_label;
+use crate::output::{availability_label, dns_delegation_verdict};
 
 impl MarkdownFormatter {
     pub(super) fn format_tld(&self, info: &crate::tld::TldInfo) -> String {
@@ -151,6 +151,16 @@ impl MarkdownFormatter {
         output.push(format!("| Expires | {} |", date_md(info.expiration_date)));
         output.push(format!("| Updated | {} |", date_md(info.updated_date)));
         output.push(format!("| Nameservers | {} |", list_md(&info.nameservers)));
+        if let Some(dns) = &info.dns_nameservers {
+            if !dns.in_sync {
+                output.push(format!(
+                    "| Nameservers (DNS) | {} |",
+                    list_md(&dns.delegated)
+                ));
+            }
+            let verdict = dns_delegation_verdict(dns);
+            output.push(format!("| DNS Delegation | {} |", MdSafe(&verdict)));
+        }
         output.push(format!("| Status | {} |", list_md(&info.status)));
         output.push(format!("| DNSSEC | {} |", opt_md(&info.dnssec)));
 

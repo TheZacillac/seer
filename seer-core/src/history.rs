@@ -298,6 +298,7 @@ mod tests {
             data: whois,
             rdap_error: None,
             rdap_fallback: None,
+            dns_nameservers: None,
         };
         let mut history = LookupHistory::default();
         history.record("example.com", result);

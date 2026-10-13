@@ -1655,6 +1655,7 @@ mod tests {
                         data: whois(),
                         rdap_error: None,
                         rdap_fallback: None,
+                        dns_nameservers: None,
                     }),
                 ),
                 ok(

@@ -1,0 +1,38 @@
+---
+source: seer-core/tests/format_snapshots.rs
+assertion_line: 840
+expression: markdown ().format_lookup (& fixture_lookup_whois_dns_differs())
+---
+## Lookup: example.com
+
+- **Source**: WHOIS (RDAP unavailable)
+- **RDAP Error**: RDAP bootstrap has no entry for this TLD
+- **Registrar**: Mock Registrar Inc.
+- **Registrant**: Jane Registrant
+- **Organization**: Example Holdings LLC
+- **Created**: `2010-03-15`
+- **Expires**: `2099-03-15` (expires in [N] days)
+- **Status**: `clientTransferProhibited`
+- **Nameservers**: `ns1.example.com`, `ns2.example.com`
+- **Nameservers (DNS)**: `ns2.example.com`, `ns9.example-dns.net`
+- **DNS Delegation**: differs from WHOIS (delegated but not in WHOIS: ns9.example-dns.net; in WHOIS but not delegated: ns1.example.com)
+- **DNSSEC**: signedDelegation
+
+### Registrant Contact
+
+- **Email**: `owner@example.com`
+- **Phone**: +1.5555550100
+- **Address**: 1 Main St, Springfield
+- **Country**: US
+
+### Admin Contact
+
+- **Name**: Alex Admin
+- **Organization**: Example Holdings LLC
+- **Email**: `admin@example.com`
+- **Phone**: +1.5555550101
+
+### Tech Contact
+
+- **Name**: Terry Tech
+- **Email**: `tech@example.com`

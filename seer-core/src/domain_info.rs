@@ -235,6 +235,10 @@ pub struct DomainInfo {
     /// Plain-English decodings of recognized `status` codes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub status_descriptions: Vec<StatusDescription>,
+    /// The live DNS delegation checked against WHOIS's nameservers, for a
+    /// WHOIS-only lookup (see [`crate::DnsNameservers`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns_nameservers: Option<crate::DnsNameservers>,
 }
 
 impl DomainInfo {
@@ -392,6 +396,7 @@ impl DomainInfo {
             domain_age_days: None,
             expiry_status: None,
             status_descriptions: Vec::new(),
+            dns_nameservers: None,
         };
         info.compute_lifecycle(Utc::now());
         info
@@ -435,12 +440,16 @@ impl DomainInfo {
             LookupResult::Whois {
                 data,
                 rdap_fallback,
+                dns_nameservers,
                 ..
-            } => Self::from_sources(
-                &data.domain,
-                rdap_fallback.as_ref().map(|b| b.as_ref()),
-                Some(data),
-            ),
+            } => Self {
+                dns_nameservers: dns_nameservers.clone(),
+                ..Self::from_sources(
+                    &data.domain,
+                    rdap_fallback.as_ref().map(|b| b.as_ref()),
+                    Some(data),
+                )
+            },
             LookupResult::Available {
                 data, whois_data, ..
             } => {
@@ -735,6 +744,7 @@ mod tests {
             data: whois,
             rdap_error: Some("RDAP failed".to_string()),
             rdap_fallback: None,
+            dns_nameservers: None,
         };
 
         let info = DomainInfo::from_lookup_result(&result);

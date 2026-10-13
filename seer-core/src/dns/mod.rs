@@ -35,7 +35,7 @@ mod trace;
 mod transport;
 
 pub use compare::{DnsComparator, DnsComparison, ServerResult};
-pub use delegation::{DelegationChecker, DelegationReport, LameNs};
+pub use delegation::{DelegationChecker, DelegationReport, DnsNameservers, LameNs};
 pub use dnssec::{AuthenticationTier, DnskeyInfo, DnssecChecker, DnssecReport, DsInfo};
 pub use follow::{
     DnsFollower, FollowConfig, FollowIteration, FollowProgressCallback, FollowResult,

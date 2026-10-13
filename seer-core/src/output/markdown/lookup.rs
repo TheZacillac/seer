@@ -1,5 +1,5 @@
 use super::*;
-use crate::output::{availability_label, lookup_source};
+use crate::output::{availability_label, dns_delegation_verdict, lookup_source};
 
 impl MarkdownFormatter {
     pub(super) fn format_lookup(&self, result: &LookupResult) -> String {
@@ -72,7 +72,10 @@ impl MarkdownFormatter {
                 }
             }
             LookupResult::Whois {
-                data, rdap_error, ..
+                data,
+                rdap_error,
+                dns_nameservers,
+                ..
             } => {
                 b.opt("RDAP Error", rdap_error);
                 b.opt("Registrar", &data.registrar);
@@ -82,6 +85,12 @@ impl MarkdownFormatter {
                 b.expires(data.expiration_date);
                 b.code_list("Status", &data.status);
                 b.code_list("Nameservers", &data.nameservers);
+                if let Some(dns) = dns_nameservers {
+                    if !dns.in_sync {
+                        b.code_list("Nameservers (DNS)", &dns.delegated);
+                    }
+                    b.text("DNS Delegation", &dns_delegation_verdict(dns));
+                }
                 b.opt("DNSSEC", &data.dnssec);
                 // Contact subsections last, after every domain-level bullet.
                 b.contacts(data.contacts());
@@ -269,6 +278,7 @@ mod tests {
             data: whois_with_contacts(),
             rdap_error: None,
             rdap_fallback: None,
+            dns_nameservers: None,
         };
         let out = MarkdownFormatter::new().format_lookup(&result);
         assert_fields_before(
