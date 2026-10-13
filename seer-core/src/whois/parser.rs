@@ -3516,4 +3516,16 @@ Name Server: ns2.example.com
             Some("Netmaster & Co")
         );
     }
+
+    #[test]
+    fn isle_of_man_reply_parses_with_redacted_contacts() {
+        // Live whois.nic.im reply for google.im (2026-10-13), trimmed. The
+        // contacts are GDPR-redacted (`Name: Redacted`) and must stay empty;
+        // .im publishes no creation date or status.
+        let raw = "\n                This information has been redacted to comply with European Union General Data Protection Regulations (GDPR).\n\nDomain Name:\tgoogle.im\nDomain Managers\nName: Redacted\nAddress\nRedacted\nDomain Owners / Registrant\nName: Redacted\nAddress\nRedacted\nDomain Details\nExpiry Date: 16/08/2027 23:59:39\nName Server:ns1.google.com.\nName Server:ns2.google.com.\n";
+        let r = generic("google.im", raw);
+        assert_eq!(dates("google.im", raw)[1], some("2027-08-16 23:59"));
+        assert_eq!(r.nameservers, vec!["ns1.google.com", "ns2.google.com"]);
+        assert!(r.registrar.is_none() && r.registrant.is_none());
+    }
 }

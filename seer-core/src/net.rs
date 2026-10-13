@@ -677,6 +677,41 @@ mod tests {
         assert!(via_proxy.is_err(), "must not connect through the proxy");
     }
 
+    /// TWNIC (.tw) serves RDAP over HTTP/2 only and answers HTTP/1.1 with
+    /// `426 Upgrade Required`; the client must offer `h2` in its TLS ALPN
+    /// extension (the `http2` reqwest feature).
+    #[tokio::test]
+    async fn client_offers_http2_over_alpn() {
+        use tokio::io::AsyncReadExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hello = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let n = sock.read(&mut buf).await.unwrap();
+            buf.truncate(n);
+            buf
+        });
+        let client = client_builder(Duration::from_secs(2)).build().unwrap();
+        // The listener never answers; only the ClientHello it captured matters.
+        let _ = tokio::time::timeout(
+            Duration::from_secs(2),
+            client.get(format!("https://127.0.0.1:{port}/")).send(),
+        )
+        .await;
+        let hello = hello.await.unwrap();
+        // ALPN protocol names are length-prefixed in the plaintext ClientHello.
+        let offers = |proto: &[u8]| {
+            let mut needle = vec![u8::try_from(proto.len()).unwrap()];
+            needle.extend_from_slice(proto);
+            hello.windows(needle.len()).any(|w| w == needle.as_slice())
+        };
+        assert!(offers(b"h2"), "ClientHello must offer h2");
+        assert!(offers(b"http/1.1"), "ClientHello must still offer http/1.1");
+    }
+
     #[test]
     fn allows_public_v4() {
         assert!(!is_reserved_ip("8.8.8.8".parse().unwrap()));

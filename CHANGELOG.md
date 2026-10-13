@@ -12,6 +12,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **RDAP for `.tw` works.** TWNIC serves RDAP over HTTP/2 only and answers
+  HTTP/1.1 with `426 Upgrade Required`; seer's HTTP client was built
+  without HTTP/2. It now negotiates HTTP/2 over ALPN when the server
+  offers it (no new dependency — `h2` was already in the tree). Status
+  and header probes report the same results.
+- `whois_sweep` now probes `.im` and `.vg` with real registrations:
+  `nic.vg` is delegated but absent from the registry, and `nic.im` is the
+  registry's own record without the usual registration details.
 - **WHOIS domain status for 7 more ccTLDs.** New status labels `Statut`
   (`.ga`, `.sn`), `Domain state` (`.md`) and `domaintype` (`.lu`); `.kg`'s
   `Domain NIC.KG (ACTIVE)` line; and `.kr` / `.한국` EPP statuses (`Domain

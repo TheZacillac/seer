@@ -39,8 +39,11 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time",
 # relying on rustls' process-level default. aws-lc-sys builds with the `cc`
 # crate (no cmake/NASM needed on the dist targets).
 # `default-features = false` keeps reqwest off its own default-tls path;
-# `stream` backs the capped `bytes_stream()` body readers.
-reqwest = { version = "0.13", features = ["rustls", "stream"], default-features = false }
+# `stream` backs the capped `bytes_stream()` body readers. `http2` is
+# negotiated over ALPN: some registries serve RDAP only over HTTP/2 (TWNIC
+# .tw answers HTTP/1.1 with 426 Upgrade Required). `h2` is already in the
+# tree via hickory's DoH.
+reqwest = { version = "0.13", features = ["rustls", "stream", "http2"], default-features = false }
 
 # DNS resolution.
 # `tokio` is the runtime glue (the only default feature we keep —

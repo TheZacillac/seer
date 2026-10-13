@@ -73,7 +73,14 @@ const PROBE_PREFIXES: &[&str] = &["nic", "google", "google.com", "google.co"];
 /// ccTLDs whose first candidate has NS records but is not an ordinary
 /// registration (`--probe` overrides these too). `nic.cn` is a CNNIC
 /// reserved name: its WHOIS says it "can not be registered online".
-const PINNED_PROBES: &[(&str, &str)] = &[("cn", "google.cn")];
+/// `nic.vg` is delegated but absent from the registry (WHOIS and RDAP both
+/// say not found), and `nic.im` is the registry's own record, which lacks
+/// the "Domain Details" every registration carries.
+const PINNED_PROBES: &[(&str, &str)] = &[
+    ("cn", "google.cn"),
+    ("im", "google.im"),
+    ("vg", "google.vg"),
+];
 
 struct Args {
     out: PathBuf,
