@@ -11,6 +11,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.53.0] - 2026-10-13
+
+A WHOIS/RDAP accuracy release. A probe of every ccTLD compared each parsed
+field against the registry's raw reply and its RDAP record: values that
+were present but wrong are fixed for about 20 ccTLDs, data that was in the
+reply but unread is now extracted for about 60 more, `.tw` RDAP works, and
+WHOIS-only lookups are cross-checked against the live DNS delegation.
+
 ### Added
 - **WHOIS-only lookups are cross-checked against DNS.** When a domain's
   record comes from WHOIS with no RDAP record beside it, `lookup` and
@@ -1947,7 +1955,8 @@ Two notable breaking changes landed in this period:
   The human and markdown formatters group both fields by record type and
   omit the per-type subheader when only one type is present.
 
-[Unreleased]: https://github.com/TheZacillac/seer/compare/v0.52.3...HEAD
+[Unreleased]: https://github.com/TheZacillac/seer/compare/v0.53.0...HEAD
+[0.53.0]: https://github.com/TheZacillac/seer/compare/v0.52.3...v0.53.0
 [0.52.3]: https://github.com/TheZacillac/seer/compare/v0.52.2...v0.52.3
 [0.52.2]: https://github.com/TheZacillac/seer/compare/v0.52.1...v0.52.2
 [0.52.1]: https://github.com/TheZacillac/seer/compare/v0.52.0...v0.52.1
