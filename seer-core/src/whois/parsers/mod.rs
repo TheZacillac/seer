@@ -21,6 +21,7 @@ mod nic_it;
 mod nic_lv;
 mod nominet;
 mod objects;
+mod rnids;
 mod sidn;
 
 use super::parser::WhoisResponse;
@@ -65,6 +66,7 @@ const PARSERS: &[(&[&str], ParseFn)] = &[
     (nic_it::TLDS, nic_it::parse),     // .it
     (nic_lv::TLDS, nic_lv::parse),     // .lv
     (nominet::TLDS, nominet::parse),   // .uk, .co.uk, .gg, .je
+    (rnids::TLDS, rnids::parse),       // .rs, .срб
     (sidn::TLDS, sidn::parse),         // .nl
 ];
 

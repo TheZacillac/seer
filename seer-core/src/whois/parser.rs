@@ -185,7 +185,15 @@ static NAMESERVER_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     // A bare `DNS:` label is NOT a nameserver everywhere (Punktum prints the
     // domain itself as `DNS:`), so NIC México's `DNS:` lines are read only
     // inside a heading block by `extract_nameserver_block`.
-    patterns.extend(line_field_patterns(&["Hostname", "Serveur de noms"]));
+    patterns.extend(line_field_patterns(&[
+        "Hostname",
+        "Serveur de noms",
+        // NIC Togo (.tg): `Name Server (DB):...ns1.nic.tg`
+        r"Name Server \(DB\)",
+        // TMNIC (.tm): `NS 1   : dns01.nic.tm` (padding normalized away);
+        // its glue continuation lines start with `:` and are not matched.
+        r"NS \d+",
+    ]));
     patterns
 });
 
@@ -1078,7 +1086,16 @@ const NAMESERVER_HEADINGS: &[&str] = &[
     "name server information",          // Register.bg (.bg)
     "name servers information",         // HKIRC (.hk)
     "name servers in the listed order", // KG domain registry (.kg)
+    "nameservers",                      // DNS Belgium (.be)
+    "domain nameservers",               // SETAR (.aw)
+    "domain servers in listed order",   // TWNIC (.tw)
+    "domain servers",                   // METU (.tr): `** Domain Servers:`
 ];
+
+/// Prefixes some registries put before each host in a heading block:
+/// NIC México `DNS: ns.example.mx`, ATI (.tn) `Name: ns4.ati.tn.` (after
+/// [`normalize_label_padding`]).
+const NAMESERVER_ENTRY_PREFIXES: &[&str] = &["dns:", "name:"];
 
 /// Section-style fallback for registries that list nameservers one per line
 /// under a heading. Blank lines between the heading and the first host are
@@ -1090,17 +1107,28 @@ fn extract_nameserver_block(text: &str) -> Vec<String> {
     let mut nameservers = Vec::new();
     let mut lines = text.lines();
     while let Some(line) = lines.next() {
-        let heading = line.trim().trim_end_matches(':').to_lowercase();
+        // METU (.tr) marks headings with `** `.
+        let heading = line
+            .trim()
+            .trim_start_matches('*')
+            .trim_start()
+            .trim_end_matches(':')
+            .to_lowercase();
         if !NAMESERVER_HEADINGS.contains(&heading.as_str()) {
             continue;
         }
         let mut started = false;
         for line in lines.by_ref() {
             let entry = line.trim_start();
-            let entry = match entry.get(..4) {
-                Some(p) if p.eq_ignore_ascii_case("dns:") => &entry[4..],
-                _ => entry,
-            };
+            let entry = NAMESERVER_ENTRY_PREFIXES
+                .iter()
+                .find_map(|p| {
+                    entry
+                        .get(..p.len())
+                        .filter(|head| head.eq_ignore_ascii_case(p))
+                        .map(|_| &entry[p.len()..])
+                })
+                .unwrap_or(entry);
             let host = entry.split_whitespace().next().unwrap_or("");
             if host.is_empty() && !started {
                 continue;
@@ -3082,5 +3110,59 @@ Name Server: ns2.example.com
             some("2026-05-18 00:10")
         );
         assert_eq!(fmt("2024-01-15 10:30:00+99"), None);
+    }
+
+    // ── ccTLD nameservers present in the reply but not read (issue #189) ──
+
+    #[test]
+    fn nameserver_heading_blocks_are_read() {
+        let ns = |domain: &str, raw: &str| generic(domain, raw).nameservers;
+        // DNS Belgium (.be): tab-indented under `Nameservers:`, then `Keys:`.
+        assert_eq!(
+            ns(
+                "nic.be",
+                "Nameservers:\n\tns3.combell.net\n\tns4.combell.net\n\nKeys:\n"
+            ),
+            vec!["ns3.combell.net", "ns4.combell.net"]
+        );
+        // SETAR (.aw)
+        assert_eq!(
+            ns("nic.aw", "Domain nameservers:\n   ns3.sidn.nl\n   ns1.sidn.nl\n\nCreation Date: 2014-02-25\n"),
+            vec!["ns3.sidn.nl", "ns1.sidn.nl"]
+        );
+        // TWNIC (.tw): trailing blanks after each host.
+        assert_eq!(
+            ns("google.tw", "   Domain servers in listed order:\n      ns1.google.com     \n      ns2.google.com     \n"),
+            vec!["ns1.google.com", "ns2.google.com"]
+        );
+        // METU (.tr): `** ` heading marker.
+        assert_eq!(
+            ns(
+                "google.com.tr",
+                "** Domain Servers:\nns4.google.com\nns1.google.com\n\n** Additional Info:\n"
+            ),
+            vec!["ns4.google.com", "ns1.google.com"]
+        );
+        // ATI (.tn): `Name....: host.` entries under `DNS servers`.
+        assert_eq!(
+            ns("nic.tn", "DNS servers\nName................: ns4.ati.tn.\nName................: ns6.ati.tn.\n"),
+            vec!["ns4.ati.tn", "ns6.ati.tn"]
+        );
+    }
+
+    #[test]
+    fn numbered_and_annotated_nameserver_labels_are_read() {
+        // TMNIC (.tm): glue continuation lines start with `:`.
+        let tm = "NS 1   : dns01.nic.tm\n       : 74.116.178.11,74.116.179.11\n       : 2001:678:4::b\nNS 2   : dns1.nic.tm\n       : 194.0.1.11\n";
+        assert_eq!(
+            generic("nic.tm", tm).nameservers,
+            vec!["dns01.nic.tm", "dns1.nic.tm"]
+        );
+        // NIC Togo (.tg)
+        let tg = "Name Server (DB):...ns1.nic.tg\nName Server (DB):...ns2.nic.tg\n";
+        assert_eq!(
+            generic("nic.tg", tg).nameservers,
+            vec!["ns1.nic.tg", "ns2.nic.tg"]
+        );
     }
 }

@@ -12,6 +12,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **WHOIS nameservers for 8 more ccTLDs.** They were in the reply but unread:
+  heading blocks for `.be` (`Nameservers:`), `.aw` (`Domain nameservers:`),
+  `.tw` (`Domain servers in listed order:`), `.tr` (`** Domain Servers:`)
+  and `.tn` (`Name: host` entries under `DNS servers`); numbered
+  `NS 1 :` labels (`.tm`) and `Name Server (DB):` (`.tg`); and `.rs` /
+  `.срб` `DNS: host - glue` lines, read by a new RNIDS parser (a generic
+  `DNS:` label is unsafe — Punktum `.dk` prints the domain itself there).
 - **WHOIS registration, expiry and updated dates for 19 more ccTLDs.**
   These were in the registry's reply but unread:
   - new labels: `Valid Until` (`.sk`), `Registered On` (`.ug`, `.md`),
