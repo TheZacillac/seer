@@ -12,6 +12,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **`.jp` WHOIS no longer invents a registrar or registrant country.** The
+  JPRS parser reported `JPRS` (the registry) as every domain's registrar
+  and `JP` as every registrant's country; JPRS publishes neither, and a
+  `.jp` registrant need not be in Japan (`google.jp`'s is in the US). Both
+  are now empty unless the reply states them. Lookup and availability
+  results are unchanged.
 - **RDAP for `.tw` works.** TWNIC serves RDAP over HTTP/2 only and answers
   HTTP/1.1 with `426 Upgrade Required`; seer's HTTP client was built
   without HTTP/2. It now negotiates HTTP/2 over ALPN when the server
