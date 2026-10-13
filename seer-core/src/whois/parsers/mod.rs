@@ -6,6 +6,7 @@
 //! second-level zone or TLD and falls back to the generic regex parser
 //! ([`WhoisResponse::parse_internal`]) for everything else.
 
+mod afnic;
 mod cnnic;
 mod denic;
 mod educause;
@@ -19,6 +20,7 @@ mod nask;
 mod nic_it;
 mod nic_lv;
 mod nominet;
+mod objects;
 mod sidn;
 
 use super::parser::WhoisResponse;
@@ -49,6 +51,7 @@ type ParseFn = fn(&str, &str, &str) -> WhoisResponse;
 
 /// Every registry parser with the TLDs (or second-level zones) it handles.
 const PARSERS: &[(&[&str], ParseFn)] = &[
+    (afnic::TLDS, afnic::parse),       // .fr .pm .re .tf .wf .yt
     (cnnic::TLDS, cnnic::parse),       // .cn, .中国, .中國
     (denic::TLDS, denic::parse),       // .de
     (educause::TLDS, educause::parse), // .edu

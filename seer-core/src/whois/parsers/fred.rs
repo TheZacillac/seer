@@ -34,18 +34,12 @@
 //! whole. Times are the registry's local time without a zone and are read
 //! as UTC, like the generic parser does.
 
+use super::objects::{class, find_by_handle, first, objects, values};
 use super::{push_bounded, MAX_STATUSES};
 use crate::whois::parser::{parse_date, WhoisResponse};
 
-static_regex! {
-    KEY_VALUE = r"^([A-Za-z][A-Za-z-]*):[ \t]*(.*?)[ \t]*$";
-}
-
 /// TLDs this parser handles.
 pub(super) const TLDS: &[&str] = &["ar", "cr", "cz", "ls", "mk", "mw", "tz", "ve"];
-
-/// One object: its `key: value` lines in order, keys lowercased.
-type Object<'a> = Vec<(String, &'a str)>;
 
 /// Parses a FRED-style reply: the generic parser, with domain-level fields
 /// taken from the `domain:` object only.
@@ -62,18 +56,15 @@ pub(super) fn parse(domain: &str, server: &str, raw: &str) -> WhoisResponse {
     response.expiration_date = first(dom, "expire").and_then(parse_date);
 
     let mut status = Vec::new();
-    for (_, value) in dom.iter().filter(|(k, _)| k == "status") {
-        push_bounded(&mut status, (*value).to_string(), MAX_STATUSES);
+    for value in values(dom, "status") {
+        push_bounded(&mut status, value.to_string(), MAX_STATUSES);
     }
     response.status = status;
 
     // `registrant:` is a contact handle; its object carries the name/org.
     if let Some(handle) = first(dom, "registrant") {
-        let contact = objects
-            .iter()
-            .find(|o| class(o) == Some("contact") && o[0].1.eq_ignore_ascii_case(handle));
         // A contact without name or org (.ls, .tz) leaves the handle.
-        if let Some(contact) = contact {
+        if let Some(contact) = find_by_handle(&objects, "contact", handle) {
             let org = first(contact, "org").map(str::to_string);
             if let Some(name) = first(contact, "name").map(str::to_string).or(org.clone()) {
                 response.registrant = Some(name);
@@ -82,46 +73,6 @@ pub(super) fn parse(domain: &str, server: &str, raw: &str) -> WhoisResponse {
         }
     }
     response
-}
-
-/// Splits the reply into objects at blank lines, skipping `%` comments.
-fn objects(raw: &str) -> Vec<Object<'_>> {
-    let mut out = Vec::new();
-    let mut current: Object<'_> = Vec::new();
-    for line in raw.lines() {
-        let line = line.trim_end_matches('\r');
-        if line.trim().is_empty() {
-            if !current.is_empty() {
-                out.push(std::mem::take(&mut current));
-            }
-            continue;
-        }
-        if line.starts_with('%') {
-            continue;
-        }
-        if let Some(caps) = KEY_VALUE.captures(line) {
-            if let (Some(k), Some(v)) = (caps.get(1), caps.get(2)) {
-                current.push((k.as_str().to_ascii_lowercase(), v.as_str()));
-            }
-        }
-    }
-    if !current.is_empty() {
-        out.push(current);
-    }
-    out
-}
-
-/// The object's class: the key of its first line.
-fn class<'a>(object: &'a Object<'_>) -> Option<&'a str> {
-    object.first().map(|(k, _)| k.as_str())
-}
-
-/// The first non-empty value for `key` in `object`.
-fn first<'a>(object: &Object<'a>, key: &str) -> Option<&'a str> {
-    object
-        .iter()
-        .find(|(k, v)| k == key && !v.is_empty())
-        .map(|(_, v)| *v)
 }
 
 #[cfg(test)]

@@ -12,6 +12,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **AFNIC ccTLDs (`.fr`, `.pm`, `.re`, `.tf`, `.wf`, `.yt`) now report the
+  updated date, EPP statuses, DNSSEC and contacts.** A new AFNIC parser
+  reads `last-update:` and the domain's `eppstatus:` lines, and resolves
+  the `holder-c` / `admin-c` / `tech-c` handles to their contact objects.
+  Contacts AFNIC publishes as `anonymous: YES` are not read. DNSSEC shows
+  `signedDelegation` when the reply carries a DS key.
 - **WHOIS values that were present but wrong for ~20 ccTLDs.** An accuracy
   pass over every ccTLD (raw reply vs. parse, plus an RDAP cross-check)
   found fields filled from the wrong line.
