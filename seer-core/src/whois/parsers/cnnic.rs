@@ -1,10 +1,9 @@
 //! Parser for .cn domains (CNNIC format).
 //!
 //! CNNIC's body is plain `Label: value` lines the generic parser reads,
-//! except for three labels of its own: `Registration Time`, `Expiration
-//! Time` and `Registrant Contact Email`. Its times carry no zone and are
-//! China Standard Time (UTC+8), so they are converted here rather than read
-//! as UTC.
+//! except for the dates: `Registration Time` and `Expiration Time` carry no
+//! zone and are China Standard Time (UTC+8), so they are read here and
+//! converted rather than taken as UTC by the generic tables.
 //!
 //! Example CNNIC response:
 //! ```text
@@ -20,48 +19,43 @@
 //! DNSSEC: unsigned
 //! ```
 
-use chrono::{DateTime, Duration, NaiveDateTime, Utc};
+use std::sync::LazyLock;
 
-use crate::whois::parser::WhoisResponse;
+use chrono::{DateTime, Utc};
+use regex::Regex;
 
-static_regex! {
-    REGISTRATION_TIME = r"(?im)^[ \t]*Registration Time:[ \t]*(.+)$";
-    EXPIRATION_TIME = r"(?im)^[ \t]*Expiration Time:[ \t]*(.+)$";
-    REGISTRANT_CONTACT_EMAIL = r"(?im)^[ \t]*Registrant Contact Email:[ \t]*(.+)$";
-}
+use crate::whois::parser::{
+    extract_field_with_patterns, line_field_patterns, normalize_label_padding,
+    parse_fixed_offset_date, WhoisResponse,
+};
+
+static REGISTRATION_TIME: LazyLock<Vec<Regex>> =
+    LazyLock::new(|| line_field_patterns(&["Registration Time"]));
+static EXPIRATION_TIME: LazyLock<Vec<Regex>> =
+    LazyLock::new(|| line_field_patterns(&["Expiration Time"]));
+
+/// China Standard Time, UTC+8.
+const CST_OFFSET_HOURS: i64 = 8;
 
 /// TLDs this parser handles: .cn, .中国 and .中國.
 pub(super) const TLDS: &[&str] = &["cn", "xn--fiqs8s", "xn--fiqz9s"];
 
-/// Parses .cn domains: the generic parser plus CNNIC's own labels.
+/// Parses .cn domains: the generic parser plus CNNIC's CST dates.
 pub(super) fn parse(domain: &str, server: &str, raw: &str) -> WhoisResponse {
     let mut response = WhoisResponse::parse_internal(domain, server, raw);
-    if let Some(date) = capture(&REGISTRATION_TIME, raw).and_then(parse_cnnic_time) {
+    let normalized = normalize_label_padding(raw);
+    if let Some(date) = cnnic_date(&normalized, &REGISTRATION_TIME) {
         response.creation_date = Some(date);
     }
-    if let Some(date) = capture(&EXPIRATION_TIME, raw).and_then(parse_cnnic_time) {
+    if let Some(date) = cnnic_date(&normalized, &EXPIRATION_TIME) {
         response.expiration_date = Some(date);
-    }
-    if response.registrant_email.is_none() {
-        response.registrant_email = capture(&REGISTRANT_CONTACT_EMAIL, raw).map(str::to_string);
     }
     response
 }
 
-fn capture<'a>(pattern: &regex::Regex, raw: &'a str) -> Option<&'a str> {
-    pattern
-        .captures(raw)
-        .and_then(|caps| caps.get(1))
-        .map(|m| m.as_str().trim())
-        .filter(|value| !value.is_empty())
-}
-
-/// Reads `YYYY-MM-DD HH:MM:SS` in China Standard Time as UTC.
-fn parse_cnnic_time(value: &str) -> Option<DateTime<Utc>> {
-    let local = NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S").ok()?;
-    // Checked: the body is untrusted (port 43 is plaintext), and a year at
-    // chrono's lower bound would make the plain `-` operator panic.
-    local.and_utc().checked_sub_signed(Duration::hours(8))
+fn cnnic_date(raw: &str, patterns: &[Regex]) -> Option<DateTime<Utc>> {
+    let value = extract_field_with_patterns(raw, patterns)?;
+    parse_fixed_offset_date(&value, "%Y-%m-%d", CST_OFFSET_HOURS)
 }
 
 #[cfg(test)]
@@ -110,10 +104,51 @@ mod tests {
     }
 
     #[test]
-    fn unparseable_or_extreme_times_are_none() {
-        assert_eq!(parse_cnnic_time("not a date"), None);
-        // Chrono's minimum: subtracting the offset must not underflow.
-        let min = NaiveDateTime::MIN.format("%Y-%m-%d %H:%M:%S").to_string();
-        assert_eq!(parse_cnnic_time(&min), None);
+    fn crlf_body_parses_like_lf() {
+        let crlf = SAMPLE.replace('\n', "\r\n");
+        let r = parse("homeview.cn", "whois.cnnic.cn", &crlf);
+        assert_eq!(
+            ymd_hms(r.expiration_date).as_deref(),
+            Some("2026-11-03 16:17:02")
+        );
+        assert_eq!(r.registrant_email.as_deref(), Some("pem2008@126.com"));
+    }
+
+    #[test]
+    fn empty_first_label_does_not_hide_a_later_value() {
+        let raw = "Expiration Time: \r\nExpiration Time: 2026-11-04 00:17:02\r\n";
+        let r = parse("example.cn", "whois.cnnic.cn", raw);
+        assert_eq!(
+            ymd_hms(r.expiration_date).as_deref(),
+            Some("2026-11-03 16:17:02")
+        );
+    }
+
+    #[test]
+    fn padded_label_is_read() {
+        let raw = "Registration Time   : 2005-11-04 00:17:02\n";
+        let r = parse("example.cn", "whois.cnnic.cn", raw);
+        assert_eq!(
+            ymd_hms(r.creation_date).as_deref(),
+            Some("2005-11-03 16:17:02")
+        );
+    }
+
+    #[test]
+    fn date_only_value_is_kept_as_that_day() {
+        let raw = "Expiration Time: 2026-11-04\n";
+        let r = parse("example.cn", "whois.cnnic.cn", raw);
+        assert_eq!(
+            ymd_hms(r.expiration_date).as_deref(),
+            Some("2026-11-04 00:00:00")
+        );
+    }
+
+    #[test]
+    fn placeholder_email_is_not_stored() {
+        let raw = "Registrant Contact Email: Please query the RDDS service of the \
+                   Registrar of Record for information on how to contact the Registrant.\n";
+        let r = parse("example.cn", "whois.cnnic.cn", raw);
+        assert_eq!(r.registrant_email, None);
     }
 }
