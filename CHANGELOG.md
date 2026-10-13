@@ -12,6 +12,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **WHOIS registration, expiry and updated dates for 19 more ccTLDs.**
+  These were in the registry's reply but unread:
+  - new labels: `Valid Until` (`.sk`), `Registered On` (`.ug`, `.md`),
+    `Exp date` (`.th`), `Activation` / `Expiration` (`.tg`), `expire`
+    (`.si`), `Modified Date` (`.bn`), `Update Date` (`.by`),
+    `Last updated` (`.no`), `Modification date` (`.rs`),
+    `Information Last Updated` (`.ug`), the domain's `changed:` (`.at`,
+    `.br`, `.gf`, `.mq`), and `.tw`'s colon-less `Record created on …` /
+    `Record expires on …`;
+  - new date formats: `23 Jun 2026` (`.th`), `Jul 26 2005 12:00AM`
+    (`.jo`), `2001-Aug-23.` (`.tr`), `20000825 20:16:35` (`.at`),
+    `14-07-2009 00:00:00` (`.tn`);
+  - local times with a trailing offset — `+03` (`.ua`), `GMT+1` (`.tn`),
+    `(UTC+8)` (`.tw`) — are converted to UTC.
+
+  `.tr`'s `Last Update Time:` (the WHOIS server's clock) and `.ug`'s
+  `Renewed On` are deliberately not read as the updated date.
 - **AFNIC ccTLDs (`.fr`, `.pm`, `.re`, `.tf`, `.wf`, `.yt`) now report the
   updated date, EPP statuses, DNSSEC and contacts.** A new AFNIC parser
   reads `last-update:` and the domain's `eppstatus:` lines, and resolves

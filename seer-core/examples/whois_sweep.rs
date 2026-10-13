@@ -280,6 +280,8 @@ fn date_in_raw(raw: &str, date: DateTime<Utc>) -> bool {
         // Traficom (.fi) `16.2.1999`, KISA (.kr) `2007. 03. 02.`
         "%-d.%-m.%Y",
         "%Y. %m. %d",
+        // METU (.tr) `2001-Aug-23`
+        "%Y-%b-%d",
     ];
     // Nominet (.gg/.je) `24th April 1997`, `01st January`
     let ordinal = |d: DateTime<Utc>| {

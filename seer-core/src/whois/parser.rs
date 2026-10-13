@@ -98,7 +98,16 @@ static CREATION_DATE_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     ]);
     // Punktum (.dk) style `Registered:           2018-01-25`, and French
     // registries (ANINF .ga) `Date de création:`.
-    patterns.extend(line_field_patterns(&["Registered", "Date de création"]));
+    patterns.extend(line_field_patterns(&[
+        "Registered",
+        "Date de création",
+        // UG registry (.ug), MoldData (.md): `Registered On: 2004-08-03`
+        "Registered On",
+        // NIC Togo (.tg): `Activation:.........2023-03-02`
+        "Activation",
+    ]));
+    // TWNIC (.tw): `Record created on 2005-10-27 17:02:34 (UTC+8)`, no colon.
+    patterns.push(compile(r"(?im)^[ \t]*Record created on[ \t]+(.+)$"));
     patterns
 });
 
@@ -114,7 +123,19 @@ static EXPIRATION_DATE_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
         "Fecha de vencimiento",
     ]);
     // French registries (ANINF .ga): `Date d'expiration:`
-    patterns.extend(line_field_patterns(&["Date d'expiration"]));
+    patterns.extend(line_field_patterns(&[
+        "Date d'expiration",
+        // SK-NIC (.sk)
+        "Valid Until",
+        // THNIC (.th): `Exp date: 16 Jul 2027`
+        "Exp date",
+        // NIC Togo (.tg)
+        "Expiration",
+        // Register.si (.si)
+        "expire",
+    ]));
+    // TWNIC (.tw): `Record expires on 2027-10-31 12:47:54 (UTC+8)`, no colon.
+    patterns.push(compile(r"(?im)^[ \t]*Record expires on[ \t]+(.+)$"));
     patterns
 });
 
@@ -125,11 +146,30 @@ static UPDATED_DATE_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
         "Last Modified",
         "Last Update",
         "Modified",
+        // BNNIC (.bn)
+        "Modified Date",
+        // hoster.by (.by)
+        "Update Date",
     ]);
     // French registries (ANINF .ga): `Dernière modification:` — contact
     // blocks repeat this label; extract_field_with_patterns takes the first
     // match, which is the domain-level line.
-    patterns.extend(line_field_patterns(&["Dernière modification"]));
+    patterns.extend(line_field_patterns(&[
+        "Dernière modification",
+        // Norid (.no)
+        "Last updated",
+        // UG registry (.ug)
+        "Information Last Updated",
+        // RNIDS (.rs)
+        "Modification date",
+        // SK-NIC (.sk); line-anchored and last so it never outranks a
+        // specific label.
+        "Updated",
+        // RIPE-style objects (nic.at, Registro.br, .gf/.mq): the domain's
+        // `changed:` comes before any contact object's. FRED/AFNIC replies,
+        // whose contacts come first, have their own parsers.
+        "changed",
+    ]));
     patterns
 });
 
@@ -856,6 +896,25 @@ pub(crate) fn parse_fixed_offset_date(
         .map(|date| date.and_time(NaiveTime::MIN).and_utc())
 }
 
+/// Splits a trailing UTC offset (`+03`, `+0530`, `GMT+1`, `(UTC+8)`) off a
+/// date-time, returning the local part and the offset to subtract. Only a
+/// value with a time of day qualifies: shifting a bare date would move it
+/// onto another calendar day (the rule [`parse_fixed_offset_date`] follows).
+fn split_utc_offset(value: &str) -> Option<(&str, Duration)> {
+    static_regex! {
+        UTC_OFFSET = r"^(.*\d:\d{2}(?::\d{2})?(?:\.\d+)?)[ \t]*\(?(?:UTC|GMT)?[ \t]*([+-])(\d{1,2})(?::?(\d{2}))?\)?$";
+    }
+    let caps = UTC_OFFSET.captures(value)?;
+    let hours: i64 = caps.get(3)?.as_str().parse().ok()?;
+    let minutes: i64 = caps.get(4).map_or(Some(0), |m| m.as_str().parse().ok())?;
+    if hours > 14 || minutes > 59 {
+        return None;
+    }
+    let offset = Duration::minutes(hours * 60 + minutes);
+    let offset = if &caps[2] == "-" { -offset } else { offset };
+    Some((caps.get(1)?.as_str(), offset))
+}
+
 /// Parse a date string from registry output into a UTC datetime, using the
 /// documented international day-first interpretation for ambiguous all-numeric
 /// dates. Thin wrapper over [`parse_date_with_order`].
@@ -874,28 +933,41 @@ pub(crate) fn parse_date_with_order(date_str: &str, order: DateOrder) -> Option<
         // Registro.br appends the registration ticket: `created: 19970711 #46903`.
         TICKET_SUFFIX = r"\s+#\d+$";
     }
-    let cleaned = date_str
-        .trim()
-        .replace(" UTC", "Z")
+    // A trailing ` UTC` is `Z`; mid-value (`10:30:00 UTC-5`) it introduces
+    // an offset, which `split_utc_offset` handles.
+    let trimmed = date_str.trim();
+    let zulu = trimmed.strip_suffix(" UTC").map(|d| format!("{d}Z"));
+    let cleaned = zulu
+        .as_deref()
+        .unwrap_or(trimmed)
         .replace(" (UTC)", "")
         // KazNIC (.kz): `1999-08-17 21:34:57 (GMT+0:00)`
         .replace(" (GMT+0:00)", "")
         .replace(" +0000", "Z");
     let cleaned = TICKET_SUFFIX.replace(&cleaned, "");
+    // METU (.tr) ends its dates with a period: `2001-Aug-23.`
+    let cleaned = cleaned.trim_end_matches('.');
 
     // First: try RFC 3339, which handles any timezone offset (e.g., +05:30, +01:00, Z)
-    if let Ok(dt) = DateTime::parse_from_rfc3339(&cleaned) {
+    if let Ok(dt) = DateTime::parse_from_rfc3339(cleaned) {
         return Some(dt.with_timezone(&Utc));
     }
 
     // Second: try ISO 8601 with timezone offset (e.g., 2024-01-15T10:30:00+05:30)
-    if let Ok(dt) = DateTime::<FixedOffset>::parse_from_str(&cleaned, "%Y-%m-%dT%H:%M:%S%z") {
+    if let Ok(dt) = DateTime::<FixedOffset>::parse_from_str(cleaned, "%Y-%m-%dT%H:%M:%S%z") {
         return Some(dt.with_timezone(&Utc));
     }
 
     // Third: try space-separated datetime with timezone offset (e.g., 2024-01-15 10:30:00+05:30)
-    if let Ok(dt) = DateTime::<FixedOffset>::parse_from_str(&cleaned, "%Y-%m-%d %H:%M:%S%z") {
+    if let Ok(dt) = DateTime::<FixedOffset>::parse_from_str(cleaned, "%Y-%m-%d %H:%M:%S%z") {
         return Some(dt.with_timezone(&Utc));
+    }
+
+    // Then a local time with a trailing UTC offset in a form chrono's `%z`
+    // does not take — `+03` (Hostmaster .ua), `GMT+1` (ATI .tn), `(UTC+8)`
+    // (TWNIC .tw): parse the local part with the formats below, then shift.
+    if let Some((local, offset)) = split_utc_offset(cleaned) {
+        return parse_date_with_order(local, order)?.checked_sub_signed(offset);
     }
 
     // Fourth: try NaiveDateTime / NaiveDate formats (timezone-less dates).
@@ -930,6 +1002,14 @@ pub(crate) fn parse_date_with_order(date_str: &str, order: DateOrder) -> Option<
         "%a %b %d %H:%M:%S %Y",
         // Registro.br (.br): `created: 19970711` (ticket suffix stripped above)
         "%Y%m%d",
+        // nic.at (.at): `registered: 20000825 20:16:35`
+        "%Y%m%d %H:%M:%S",
+        // THNIC (.th): `Created date: 17 Jul 2014`
+        "%d %b %Y",
+        // NITC (.jo): `Updated Date: Jul 26 2005 12:00AM`
+        "%b %d %Y %I:%M%p",
+        // METU (.tr): `Created on: 2001-Aug-23.` (trailing dot stripped above)
+        "%Y-%b-%d",
     ];
     // Ambiguous all-numeric formats, tried in the hinted order first. The
     // other order is still tried second so an unambiguous date (a field > 12)
@@ -943,6 +1023,8 @@ pub(crate) fn parse_date_with_order(date_str: &str, order: DateOrder) -> Option<
         "%d.%m.%Y",
         "%d/%m/%Y %H:%M:%S",
         "%d/%m/%Y",
+        // ATI (.tn): `14-07-2009 00:00:00 GMT+1` (offset split off first)
+        "%d-%m-%Y %H:%M:%S",
         "%d-%m-%Y",
     ];
     const MONTH_FIRST: &[&str] = &[
@@ -950,6 +1032,7 @@ pub(crate) fn parse_date_with_order(date_str: &str, order: DateOrder) -> Option<
         "%m.%d.%Y",
         "%m/%d/%Y %H:%M:%S",
         "%m/%d/%Y",
+        "%m-%d-%Y %H:%M:%S",
         "%m-%d-%Y",
     ];
     let (first_pair, second_pair) = match order {
@@ -962,10 +1045,10 @@ pub(crate) fn parse_date_with_order(date_str: &str, order: DateOrder) -> Option<
         .chain(first_pair.iter())
         .chain(second_pair.iter())
     {
-        if let Ok(dt) = NaiveDateTime::parse_from_str(&cleaned, fmt) {
+        if let Ok(dt) = NaiveDateTime::parse_from_str(cleaned, fmt) {
             return Some(dt.and_utc());
         }
-        if let Ok(d) = NaiveDate::parse_from_str(&cleaned, fmt) {
+        if let Ok(d) = NaiveDate::parse_from_str(cleaned, fmt) {
             return Some(d.and_hms_opt(0, 0, 0)?.and_utc());
         }
     }
@@ -2869,5 +2952,135 @@ Name Server: ns2.example.com
         // NIC.ar `changed: 2023-07-17 17:23:05.989470`
         let d = parse_date("2023-07-17 17:23:05.989470").map(|d| d.to_rfc3339());
         assert_eq!(d.as_deref(), Some("2023-07-17T17:23:05.989470+00:00"));
+    }
+
+    // ── ccTLD dates present in the reply but not read (issue #189) ──
+
+    fn dates(domain: &str, raw: &str) -> [Option<String>; 3] {
+        let r = generic(domain, raw);
+        [r.creation_date, r.expiration_date, r.updated_date]
+            .map(|d| d.map(|d| d.format("%Y-%m-%d %H:%M").to_string()))
+    }
+
+    fn some(s: &str) -> Option<String> {
+        Some(s.to_string())
+    }
+
+    #[test]
+    fn registry_date_labels_are_read() {
+        // SK-NIC (.sk)
+        let raw = "Created: 2003-09-30\nValid Until: 2027-09-30\nUpdated: 2026-09-08\n";
+        assert_eq!(
+            dates("google.sk", raw),
+            [
+                some("2003-09-30 00:00"),
+                some("2027-09-30 00:00"),
+                some("2026-09-08 00:00")
+            ]
+        );
+        // UG registry (.ug): `Renewed On` is not an update.
+        let raw = "Expires On: 2027-03-18\nRegistered On: 2004-08-03\nRenewed On: 2026-03-03\n\nInformation Last Updated: 2026-05-18T03:10:41.000+03:00\n";
+        assert_eq!(
+            dates("google.ug", raw),
+            [
+                some("2004-08-03 00:00"),
+                some("2027-03-18 00:00"),
+                some("2026-05-18 00:10")
+            ]
+        );
+        // NIC Togo (.tg), dot leaders after the colon.
+        let raw = "Activation:.........2023-03-02\nExpiration:.........2030-06-26\n";
+        assert_eq!(
+            dates("nic.tg", raw),
+            [some("2023-03-02 00:00"), some("2030-06-26 00:00"), None]
+        );
+        // Norid (.no), BNNIC (.bn), hoster.by (.by), RNIDS (.rs), Register.si (.si)
+        assert_eq!(
+            dates("nic.no", "Last updated:    2026-01-27\n")[2],
+            some("2026-01-27 00:00")
+        );
+        assert_eq!(
+            dates("nic.bn", "Modified Date:\t\t02-Mar-2026 14:08:42\n")[2],
+            some("2026-03-02 14:08")
+        );
+        assert_eq!(
+            dates("nic.by", "Update Date: 2026-08-19\n")[2],
+            some("2026-08-19 00:00")
+        );
+        assert_eq!(
+            dates("nic.rs", "Modification date: 17.03.2025 14:55:15\n")[2],
+            some("2025-03-17 14:55")
+        );
+        assert_eq!(
+            dates("nic.si", "created:\t2008-10-28\nexpire:\t\t2027-10-28\n")[1],
+            some("2027-10-28 00:00")
+        );
+    }
+
+    #[test]
+    fn whois_server_clock_is_not_the_updated_date() {
+        // METU (.tr): `Last Update Time:` is when the reply was generated.
+        let raw = "Created on..............: 2001-Aug-23.\nExpires on..............: 2027-Aug-22.\n\nLast Update Time: 2026-10-13T19:16:43+03:00\n";
+        assert_eq!(
+            dates("google.com.tr", raw),
+            [some("2001-08-23 00:00"), some("2027-08-22 00:00"), None]
+        );
+    }
+
+    #[test]
+    fn record_created_and_expires_sentences_are_read() {
+        // TWNIC (.tw): no colon, local time marked `(UTC+8)`.
+        let raw = "   Record expires on 2027-10-31 12:47:54 (UTC+8)\n   Record created on 2005-10-27 17:02:34 (UTC+8)\n";
+        assert_eq!(
+            dates("google.tw", raw),
+            [some("2005-10-27 09:02"), some("2027-10-31 04:47"), None]
+        );
+    }
+
+    #[test]
+    fn domain_changed_line_is_the_updated_date() {
+        // nic.at (.at): the domain's `changed:` precedes the contacts'.
+        let raw = "domain: nic.at\nchanged:           20200427 16:03:40\nregistered:        20000825 20:16:35\n\nnic-hdl: X\nchanged:           20121116 16:58:21\n";
+        assert_eq!(
+            dates("nic.at", raw),
+            [some("2000-08-25 20:16"), None, some("2020-04-27 16:03")]
+        );
+    }
+
+    #[test]
+    fn named_month_and_twelve_hour_formats_parse() {
+        // THNIC (.th), NITC (.jo)
+        let raw = "Updated date: 23 Jun 2026\nCreated date: 17 Jul 2014\nExp date: 16 Jul 2027\n";
+        assert_eq!(
+            dates("nic.th", raw),
+            [
+                some("2014-07-17 00:00"),
+                some("2027-07-16 00:00"),
+                some("2026-06-23 00:00")
+            ]
+        );
+        assert_eq!(
+            dates("nic.jo", "Updated Date: Jul 26 2005 12:00AM\n")[2],
+            some("2005-07-26 00:00")
+        );
+    }
+
+    #[test]
+    fn trailing_utc_offsets_convert_to_utc() {
+        let fmt = |s: &str| parse_date(s).map(|d| d.format("%Y-%m-%d %H:%M").to_string());
+        // Hostmaster (.ua) `+03`, ATI (.tn) `GMT+1`, a negative and a minutes offset.
+        assert_eq!(fmt("2007-10-04 13:40:19+03"), some("2007-10-04 10:40"));
+        assert_eq!(fmt("14-07-2009 00:00:00 GMT+1"), some("2009-07-13 23:00"));
+        assert_eq!(fmt("2024-01-15 10:30:00 UTC-5"), some("2024-01-15 15:30"));
+        assert_eq!(
+            fmt("2024-01-15 10:30:00 (UTC+5:30)"),
+            some("2024-01-15 05:00")
+        );
+        // RFC 3339 is unaffected; an out-of-range offset is not a date.
+        assert_eq!(
+            fmt("2026-05-18T03:10:41.000+03:00"),
+            some("2026-05-18 00:10")
+        );
+        assert_eq!(fmt("2024-01-15 10:30:00+99"), None);
     }
 }
