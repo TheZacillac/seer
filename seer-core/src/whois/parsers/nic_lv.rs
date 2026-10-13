@@ -40,8 +40,6 @@
 //! string is matched by the generic `AVAILABILITY_PATTERNS` in
 //! `crate::whois::parser`, so this parser does not need to special-case it.
 
-use chrono::{DateTime, Utc};
-
 use super::{push_bounded, MAX_NAMESERVERS, MAX_STATUSES};
 use crate::whois::parser::WhoisResponse;
 
@@ -89,7 +87,6 @@ pub(super) fn parse(domain: &str, server: &str, raw: &str) -> WhoisResponse {
     let mut registrant: Option<String> = None;
     let mut registrant_address: Option<String> = None;
     let mut registrant_country: Option<String> = None;
-    let mut updated_date: Option<DateTime<Utc>> = None;
 
     for line in raw.lines() {
         let trimmed = line.trim();
@@ -138,9 +135,6 @@ pub(super) fn parse(domain: &str, server: &str, raw: &str) -> WhoisResponse {
                     MAX_NAMESERVERS,
                 );
             }
-            (Section::Whois, "updated") if updated_date.is_none() => {
-                updated_date = parse_iso8601(value);
-            }
             _ => {}
         }
     }
@@ -151,27 +145,20 @@ pub(super) fn parse(domain: &str, server: &str, raw: &str) -> WhoisResponse {
         registrant,
         registrant_address,
         registrant_country,
-        updated_date,
         nameservers,
         status,
         whois_server: server.to_string(),
         raw_response: raw.to_string(),
-        // NIC.LV's WHOIS publishes no creation/expiry date or DNSSEC state.
+        // NIC.LV's WHOIS publishes no creation/expiry/update date or DNSSEC
+        // state: `[Whois] Updated:` is when the reply was generated (it is
+        // ~now on every query), not a change to the domain.
         ..Default::default()
     }
-}
-
-fn parse_iso8601(value: &str) -> Option<DateTime<Utc>> {
-    // NIC.LV uses fractional-second ISO8601 like `2026-05-26T11:12:34.874386+00:00`.
-    DateTime::parse_from_rfc3339(value.trim())
-        .ok()
-        .map(|dt| dt.with_timezone(&Utc))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Datelike;
 
     const REGISTERED: &str = "[Domain]\n\
 Domain: myroyalcanin.lv\n\
@@ -252,12 +239,11 @@ Updated: 2026-05-26T11:12:34.874386+00:00\n";
     }
 
     #[test]
-    fn registered_parses_updated_date() {
+    fn whois_section_timestamp_is_not_the_updated_date() {
+        // `[Whois] Updated:` is when the reply was generated, not a change
+        // to the domain; it was reported as "updated today" on every query.
         let r = parse(REGISTERED);
-        let updated = r.updated_date.expect("updated date should parse");
-        assert_eq!(updated.year(), 2026);
-        assert_eq!(updated.month(), 5);
-        assert_eq!(updated.day(), 26);
+        assert!(r.updated_date.is_none());
     }
 
     #[test]

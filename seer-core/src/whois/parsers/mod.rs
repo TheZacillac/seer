@@ -11,9 +11,11 @@ mod denic;
 mod educause;
 mod eis;
 mod eurid;
+mod fred;
 mod isoc_il;
 mod jprs;
 mod kisa;
+mod nask;
 mod nic_it;
 mod nic_lv;
 mod nominet;
@@ -52,9 +54,11 @@ const PARSERS: &[(&[&str], ParseFn)] = &[
     (educause::TLDS, educause::parse), // .edu
     (eis::TLDS, eis::parse),           // .ee
     (eurid::TLDS, eurid::parse),       // .eu, .ею, .ευ
+    (fred::TLDS, fred::parse),         // .ar .cr .cz .ls .mk .mw .tz .ve
     (isoc_il::TLDS, isoc_il::parse),   // .il (co.il, org.il, …), .ישראל
     (jprs::TLDS, jprs::parse),         // .jp
     (kisa::TLDS, kisa::parse),         // .kr, .한국, .삼성
+    (nask::TLDS, nask::parse),         // .pl
     (nic_it::TLDS, nic_it::parse),     // .it
     (nic_lv::TLDS, nic_lv::parse),     // .lv
     (nominet::TLDS, nominet::parse),   // .uk, .co.uk, .gg, .je

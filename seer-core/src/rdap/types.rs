@@ -698,10 +698,12 @@ impl RdapResponse {
         self.event_date("last changed")
     }
 
+    /// Nameserver names, minus registry placeholders (`not.defined`).
     pub fn nameserver_names(&self) -> Vec<String> {
         self.nameservers
             .iter()
             .filter_map(|ns| ns.ldh_name.clone().or_else(|| ns.unicode_name.clone()))
+            .filter(|name| !crate::whois::is_nameserver_placeholder(name))
             .collect()
     }
 
@@ -1116,6 +1118,20 @@ mod tests {
         .unwrap();
         assert!(resp.secure_dns.is_none());
         assert_eq!(resp.ldh_name.as_deref(), Some("example.com"));
+    }
+
+    #[test]
+    fn placeholder_nameserver_is_not_listed() {
+        // UZINFOCOM (.uz) lists `not.defined` among nic.uz's nameservers.
+        let resp: RdapResponse = serde_json::from_value(serde_json::json!({
+            "ldhName": "nic.uz",
+            "nameservers": [
+                {"objectClassName": "nameserver", "ldhName": "ns.uz"},
+                {"objectClassName": "nameserver", "ldhName": "NOT.DEFINED."}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(resp.nameserver_names(), vec!["ns.uz"]);
     }
 
     // ---- nameserver ipAddresses leniency (NASK array form) -----------------

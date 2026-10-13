@@ -35,15 +35,22 @@ pub(super) fn line_field_patterns(labels: &[&str]) -> Vec<Regex> {
 }
 
 /// Rewrites padded labels into the plain `Label: value` form every pattern
-/// here expects: dot leaders (Traficom .fi/.ax, KazNIC .kz:
-/// `created..........: 16.2.1999`) and blanks before the colon (NIC Monaco
-/// .mc: `Expires on         : 2027-01-08`). Only a label at the start of a
-/// line is touched, so values and prose keep their dots and spacing.
+/// here expects: dot leaders before the colon (Traficom .fi/.ax, KazNIC .kz:
+/// `created..........: 16.2.1999`) or after it (NIC Togo .tg:
+/// `Registrar:..........NETMASTER SARL`), and blanks before the colon (NIC
+/// Monaco .mc: `Expires on         : 2027-01-08`). Only a label at the start
+/// of a line is touched, so values and prose keep their dots and spacing.
 pub(super) fn normalize_label_padding(raw: &str) -> std::borrow::Cow<'_, str> {
     static_regex! {
         LABEL_PADDING = r"(?m)^([ \t]*[A-Za-z][A-Za-z0-9 /()_-]*?)(?:\.{2,}[ \t]*|[ \t]+):";
+        TRAILING_LEADER = r"(?m)^([ \t]*[A-Za-z][A-Za-z0-9 /()_-]*?):\.{2,}";
     }
-    LABEL_PADDING.replace_all(raw, "$1:")
+    match LABEL_PADDING.replace_all(raw, "$1:") {
+        std::borrow::Cow::Borrowed(b) => TRAILING_LEADER.replace_all(b, "$1: "),
+        std::borrow::Cow::Owned(o) => {
+            std::borrow::Cow::Owned(TRAILING_LEADER.replace_all(&o, "$1: ").into_owned())
+        }
+    }
 }
 
 fn compile(pattern: &str) -> Regex {
@@ -160,29 +167,32 @@ static REGISTRANT_ADDRESS_PATTERNS: LazyLock<Vec<Regex>> =
 static REGISTRANT_COUNTRY_PATTERNS: LazyLock<Vec<Regex>> =
     LazyLock::new(|| field_patterns(&["Registrant Country"]));
 
+// Admin/tech labels are line-anchored: gTLD-style replies also print
+// `Registrar Admin Email:` etc. (the registrar's own contacts, .ps), which an
+// unanchored `Admin Email:` would match first.
 static ADMIN_NAME_PATTERNS: LazyLock<Vec<Regex>> =
-    LazyLock::new(|| field_patterns(&["Admin Name", "Administrative Contact Name"]));
+    LazyLock::new(|| line_field_patterns(&["Admin Name", "Administrative Contact Name"]));
 
 static ADMIN_ORG_PATTERNS: LazyLock<Vec<Regex>> =
-    LazyLock::new(|| field_patterns(&["Admin Organization"]));
+    LazyLock::new(|| line_field_patterns(&["Admin Organization"]));
 
 static ADMIN_EMAIL_PATTERNS: LazyLock<Vec<Regex>> =
-    LazyLock::new(|| field_patterns(&["Admin Email", "Admin E-mail"]));
+    LazyLock::new(|| line_field_patterns(&["Admin Email", "Admin E-mail"]));
 
 static ADMIN_PHONE_PATTERNS: LazyLock<Vec<Regex>> =
-    LazyLock::new(|| field_patterns(&["Admin Phone", "Admin Tel"]));
+    LazyLock::new(|| line_field_patterns(&["Admin Phone", "Admin Tel"]));
 
 static TECH_NAME_PATTERNS: LazyLock<Vec<Regex>> =
-    LazyLock::new(|| field_patterns(&["Tech Name", "Technical Contact Name"]));
+    LazyLock::new(|| line_field_patterns(&["Tech Name", "Technical Contact Name"]));
 
 static TECH_ORG_PATTERNS: LazyLock<Vec<Regex>> =
-    LazyLock::new(|| field_patterns(&["Tech Organization"]));
+    LazyLock::new(|| line_field_patterns(&["Tech Organization"]));
 
 static TECH_EMAIL_PATTERNS: LazyLock<Vec<Regex>> =
-    LazyLock::new(|| field_patterns(&["Tech Email", "Tech E-mail"]));
+    LazyLock::new(|| line_field_patterns(&["Tech Email", "Tech E-mail"]));
 
 static TECH_PHONE_PATTERNS: LazyLock<Vec<Regex>> =
-    LazyLock::new(|| field_patterns(&["Tech Phone", "Tech Tel"]));
+    LazyLock::new(|| line_field_patterns(&["Tech Phone", "Tech Tel"]));
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WhoisResponse {
@@ -746,6 +756,8 @@ fn is_placeholder_value(value: &str) -> bool {
         || PLACEHOLDER_PHRASES.iter().any(|p| lower.contains(p))
         || lower == "n/a"
         || lower == "none"
+        // THNIC (.th) `Tech Organization: Personal Information`
+        || lower == "personal information"
 }
 
 /// Section-style fallback for registries that print a label alone on its own
@@ -895,6 +907,8 @@ pub(crate) fn parse_date_with_order(date_str: &str, order: DateOrder) -> Option<
         // Naive ISO datetime, read as UTC (DENIC `Changed:`).
         "%Y-%m-%dT%H:%M:%S",
         "%Y-%m-%d %H:%M:%S",
+        // NIC.ar `changed: 2023-07-17 17:23:05.989470`
+        "%Y-%m-%d %H:%M:%S%.f",
         "%d-%b-%Y %H:%M:%S",
         "%d-%b-%Y %H:%M:%S%.f",
         // " UTC" is normalized to "Z" at the top, so this also reads "... UTC".
@@ -1012,7 +1026,9 @@ fn extract_nameserver_block(text: &str) -> Vec<String> {
                 break;
             }
             started = true;
-            push_bounded(&mut nameservers, host.to_lowercase(), MAX_NAMESERVERS);
+            if let Some(ns) = clean_nameserver(host) {
+                push_bounded(&mut nameservers, ns, MAX_NAMESERVERS);
+            }
         }
         if !nameservers.is_empty() {
             break;
@@ -1029,6 +1045,28 @@ fn is_hostname(s: &str) -> bool {
     HOSTNAME.is_match(s)
 }
 
+/// Values registries print in a nameserver slot that are not a nameserver
+/// (UZINFOCOM .uz: `Name Server: not.defined.`, in WHOIS and RDAP alike).
+const NAMESERVER_PLACEHOLDERS: &[&str] = &["not.defined"];
+
+/// Whether a nameserver name (any case, trailing dot or not) is a
+/// placeholder rather than a host. Shared with the RDAP nameserver list.
+pub(crate) fn is_nameserver_placeholder(name: &str) -> bool {
+    let name = name.trim_end_matches('.');
+    NAMESERVER_PLACEHOLDERS
+        .iter()
+        .any(|p| name.eq_ignore_ascii_case(p))
+}
+
+/// One nameserver token in canonical form: lowercased, without the trailing
+/// root dot TCI (.ru/.su) and UZINFOCOM (.uz) print (`ns5.nic.ru.`), so it
+/// compares equal to the same host from RDAP or DNS. `None` for a
+/// placeholder.
+fn clean_nameserver(token: &str) -> Option<String> {
+    let ns = token.trim_end_matches('.').to_lowercase();
+    (!ns.is_empty() && !is_nameserver_placeholder(&ns)).then_some(ns)
+}
+
 /// Nameservers from `Label: host` fields ([`NAMESERVER_PATTERNS`]).
 fn extract_labelled_nameservers(text: &str) -> Vec<String> {
     let mut nameservers = Vec::new();
@@ -1042,8 +1080,9 @@ fn extract_labelled_nameservers(text: &str) -> Vec<String> {
                 // Strip glue IP addresses that some registries append after the hostname
                 // e.g., "ns1.example.br 200.1.2.3 2001:db8::1" → "ns1.example.br"
                 let raw = m.as_str().trim();
-                let ns = raw.split_whitespace().next().unwrap_or(raw).to_lowercase();
-                push_bounded(&mut nameservers, ns, MAX_NAMESERVERS);
+                if let Some(ns) = clean_nameserver(raw.split_whitespace().next().unwrap_or(raw)) {
+                    push_bounded(&mut nameservers, ns, MAX_NAMESERVERS);
+                }
             }
         }
     }
@@ -1051,12 +1090,51 @@ fn extract_labelled_nameservers(text: &str) -> Vec<String> {
     nameservers
 }
 
+/// Headings (compared case-insensitively, `%`/`#` and trailing colon
+/// stripped) that open a contact section, which runs to the next blank line.
+/// Contact sections carry their own `Status:` / `State:` lines — a contact
+/// object's `status: linked` (Hostmaster .ua), an address `State: Nuevo Leon`
+/// (NIC México), `State: VKO` (KazNIC) — so the status scan skips them.
+/// KazNIC prints the domain's own status after its contacts, so the scan
+/// resumes after the section rather than stopping.
+const CONTACT_HEADINGS: &[&str] = &[
+    "registrant",
+    "registrant contact",
+    "owner contact",
+    "holder",
+    "domain holder",
+    "admin contact",
+    "administrative contact",
+    "administrative contacts",
+    "tech contact",
+    "technical contact",
+    "technical contacts",
+    "billing contact",
+    "billing contacts",
+];
+
+/// Whether `line` is a bare contact-section heading (`Registrant:`,
+/// `Registrant`, `% Administrative Contacts:`) with no value after it.
+fn is_contact_heading(line: &str) -> bool {
+    let heading = line
+        .trim()
+        .trim_start_matches(['%', '#'])
+        .trim()
+        .trim_end_matches(':')
+        .trim_end();
+    CONTACT_HEADINGS
+        .iter()
+        .any(|h| heading.eq_ignore_ascii_case(h))
+}
+
 /// Extracts Status values only from the top-level domain block of a WHOIS
-/// response. Stops scanning as soon as a RIPE-style `[Section-Header]` line is
-/// encountered, which prevents contact-object `Status:` lines (e.g., inside
-/// `[Tech-C]` blocks) from polluting the domain status list.
+/// response. Stops scanning at the first RIPE-style `[Section-Header]` line
+/// and skips contact sections (see [`CONTACT_HEADINGS`]), which keeps
+/// contact-object `Status:` lines (e.g. inside `[Tech-C]` blocks) out of the
+/// domain status list.
 fn extract_status_top_level(raw: &str) -> Vec<String> {
     let mut statuses = Vec::new();
+    let mut in_contact = false;
 
     for line in raw.lines() {
         if statuses.len() >= MAX_STATUSES {
@@ -1068,8 +1146,17 @@ fn extract_status_top_level(raw: &str) -> Vec<String> {
         if trimmed.starts_with('[') && trimmed.contains(']') {
             break;
         }
-        // Skip comments and empty lines.
-        if trimmed.is_empty() || trimmed.starts_with('%') || trimmed.starts_with('#') {
+        if is_contact_heading(trimmed) {
+            in_contact = true;
+            continue;
+        }
+        if trimmed.trim_end().is_empty() {
+            in_contact = false;
+            continue;
+        }
+        // Skip comments (a heading's `% ====` underline among them) and
+        // contact-section lines.
+        if in_contact || trimmed.starts_with('%') || trimmed.starts_with('#') {
             continue;
         }
 
@@ -1097,14 +1184,25 @@ fn extract_status_top_level(raw: &str) -> Vec<String> {
         };
 
         // A value may list several comma-separated statuses (TCI's .ru/.su/.рф
-        // `state: REGISTERED, DELEGATED, VERIFIED`); keep each one. Within an
-        // entry only the first word is the status — ICANN-style lines append
-        // an explanatory URL (`clientHold https://icann.org/epp#clientHold`).
+        // `state: REGISTERED, DELEGATED, VERIFIED`); keep each one. ICANN-style
+        // lines append an explanatory URL (`clientHold
+        // https://icann.org/epp#clientHold`) and KazNIC a dash-led gloss
+        // (`ok - Normal state.`); both are dropped, and the rest of
+        // the entry is kept whole, since some registries' statuses are
+        // phrases (CZ.NIC `Sponsoring registrar change forbidden`, Armenia
+        // `registrar locked`).
         if let Some(rest) = value_opt {
             for entry in rest.split(',') {
-                if let Some(first) = entry.split_whitespace().next() {
-                    push_bounded(&mut statuses, first.to_string(), MAX_STATUSES);
-                }
+                let phrase = entry
+                    .split_whitespace()
+                    .take_while(|word| {
+                        *word != "-"
+                            && !word.starts_with("http://")
+                            && !word.starts_with("https://")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                push_bounded(&mut statuses, phrase, MAX_STATUSES);
             }
         }
     }
@@ -2681,5 +2779,95 @@ Name Server: ns2.example.com
         let r = WhoisResponse::parse_internal("google.bo", "whois.nic.bo", bo);
         assert_eq!(ymd(r.creation_date).as_deref(), Some("2019-01-15"));
         assert_eq!(ymd(r.expiration_date).as_deref(), Some("2027-01-15"));
+    }
+
+    // ── ccTLD accuracy probe (2026-10-13): values that were present but wrong ──
+
+    fn generic(domain: &str, raw: &str) -> WhoisResponse {
+        WhoisResponse::parse_internal(domain, "whois.example", raw)
+    }
+
+    #[test]
+    fn status_phrases_are_kept_whole_and_glosses_dropped() {
+        // AMNIC (.am), PKNIC (.pk), ICANN-style URL suffix, KazNIC gloss.
+        let r = generic("nic.am", "Status:      active, registrar locked\n");
+        assert_eq!(r.status, vec!["active", "registrar locked"]);
+        let r = generic("google.pk", "Status: Domain is Registered\n");
+        assert_eq!(r.status, vec!["Domain is Registered"]);
+        let r = generic(
+            "example.com",
+            "Domain Status: clientHold https://icann.org/epp#clientHold\n",
+        );
+        assert_eq!(r.status, vec!["clientHold"]);
+        let r = generic("nic.kz", "Domain status: ok - Normal state.\n");
+        assert_eq!(r.status, vec!["ok"]);
+    }
+
+    #[test]
+    fn contact_section_state_and_status_are_not_domain_status() {
+        // NIC México (.mx): an address `State:` under a contact heading.
+        let mx = "Domain Name:       nic.mx\n\nRegistrant:\n   Name:           NIC México\n   State:          Nuevo Leon\n   Country:        Mexico\n";
+        assert!(generic("nic.mx", mx).status.is_empty());
+        // KazNIC (.kz): bare heading, and the domain status after the contacts.
+        let kz = "Domain Name: nic.kz\n\nRegistrant\nName: KazNIC\nState: VKO\n\nDomain status: ok - Normal state.\n";
+        assert_eq!(generic("nic.kz", kz).status, vec!["ok"]);
+        // Hostmaster (.ua): `% Registrant:` comment heading over a contact object.
+        let ua = "domain: nic.ua\nstatus: clientTransferProhibited\n\n% Registrant:\n% ===========\nperson: NIC.UA LLC\nstatus: ok\nstatus: linked\n";
+        assert_eq!(
+            generic("nic.ua", ua).status,
+            vec!["clientTransferProhibited"]
+        );
+    }
+
+    #[test]
+    fn nameservers_drop_the_root_dot_and_placeholders() {
+        // TCI (.ru) and UZINFOCOM (.uz)
+        let r = generic(
+            "nic.ru",
+            "nserver: ns5.nic.ru. 31.177.67.100\nnserver: NS6.nic.ru.\n",
+        );
+        assert_eq!(r.nameservers, vec!["ns5.nic.ru", "ns6.nic.ru"]);
+        let r = generic(
+            "nic.uz",
+            "   Name Server: ns.uz. 91.212.89.8\n   Name Server: not.defined. \n",
+        );
+        assert_eq!(r.nameservers, vec!["ns.uz"]);
+    }
+
+    #[test]
+    fn registrar_admin_email_is_not_the_admin_email() {
+        // PNINA (.ps), ARCEP (.bf): the registrar's own contacts come first.
+        let raw =
+            "Registrar Admin Email: CCOPS@markmonitor.com\nAdmin Email: dns-admin@google.com\n";
+        assert_eq!(
+            generic("google.ps", raw).admin_email.as_deref(),
+            Some("dns-admin@google.com")
+        );
+        let raw = "Registrar Admin Email: registre@arcep.bf\n";
+        assert!(generic("nic.bf", raw).admin_email.is_none());
+    }
+
+    #[test]
+    fn dot_leaders_after_the_colon_are_padding() {
+        // NIC Togo (.tg)
+        let raw = "Domain:.............nic.tg\nRegistrar:..........NETMASTER SARL\n";
+        assert_eq!(
+            generic("nic.tg", raw).registrar.as_deref(),
+            Some("NETMASTER SARL")
+        );
+    }
+
+    #[test]
+    fn personal_information_is_a_placeholder() {
+        // THNIC (.th)
+        let raw = "Tech Organization:          Personal Information\n";
+        assert!(generic("nic.th", raw).tech_organization.is_none());
+    }
+
+    #[test]
+    fn space_separated_fractional_seconds_parse() {
+        // NIC.ar `changed: 2023-07-17 17:23:05.989470`
+        let d = parse_date("2023-07-17 17:23:05.989470").map(|d| d.to_rfc3339());
+        assert_eq!(d.as_deref(), Some("2023-07-17T17:23:05.989470+00:00"));
     }
 }
