@@ -174,22 +174,14 @@ pub(super) fn parse(domain: &str, server: &str, raw: &str) -> WhoisResponse {
         }
     }
 
-    // Only claim JPRS identity fields when the response actually carried
-    // registration data. Synthesizing them onto a "No match!!" response
-    // would trip is_available()'s registered-data guard, making
-    // unregistered .jp domains impossible to report as available.
-    let has_data = organization.is_some()
-        || !nameservers.is_empty()
-        || creation_date.is_some()
-        || expiration_date.is_some()
-        || !status.is_empty();
-
+    // JPRS publishes neither the registrar (designated agent) nor a
+    // registrant country, so none is reported. JPRS is the registry, not the
+    // registrar, and a .jp registrant need not be in Japan (google.jp's is
+    // in the US).
     WhoisResponse {
         domain: domain.to_string(),
-        registrar: has_data.then(|| "JPRS".to_string()),
         registrant: organization.clone(),
         organization,
-        registrant_country: has_data.then(|| "JP".to_string()),
         creation_date,
         expiration_date,
         updated_date,
@@ -543,5 +535,19 @@ s. [Signing Key]                \n\
         let result = parse("example.jp", "whois.jprs.jp", &raw);
         assert_eq!(result.updated_date, None);
         assert_eq!(result.nameservers, vec!["ns1.example.jp"]);
+    }
+
+    #[test]
+    fn registrar_and_country_are_not_invented() {
+        // Live whois.jprs.jp reply for google.jp/e (2026-10-13), trimmed: no
+        // registrar line, and the registrant's address is in the US.
+        let raw = "Domain Information:\n[Domain Name]                   GOOGLE.JP\n\n[Registrant]                    Google LLC\n\n[Name Server]                   ns1.google.com\n[Name Server]                   ns2.google.com\n\n[Created on]                    2005/05/30\n[Expires on]                    2027/05/31\n[Status]                        Active\n\nContact Information:\n[Name]                          Google LLC\n[Postal Address]                Mountain View\n";
+        let r = parse("google.jp", "whois.jprs.jp", raw);
+        assert!(r.registrar.is_none(), "{:?}", r.registrar);
+        assert!(r.registrant_country.is_none(), "{:?}", r.registrant_country);
+        assert_eq!(r.registrant.as_deref(), Some("Google LLC"));
+        // Still a registration record: lookup and availability read it so.
+        assert!(!r.is_thin());
+        assert!(!r.is_available());
     }
 }
