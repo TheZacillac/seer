@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.52.3] - 2026-10-13
+
+A WHOIS parsing patch: `.cn` lookups now show registration and expiry dates.
+
 ### Fixed
 - **`.cn` WHOIS now reports registration and expiry dates.** CNNIC labels
   them `Registration Time` / `Expiration Time`, which the generic parser
@@ -1836,7 +1840,8 @@ Two notable breaking changes landed in this period:
   The human and markdown formatters group both fields by record type and
   omit the per-type subheader when only one type is present.
 
-[Unreleased]: https://github.com/TheZacillac/seer/compare/v0.52.2...HEAD
+[Unreleased]: https://github.com/TheZacillac/seer/compare/v0.52.3...HEAD
+[0.52.3]: https://github.com/TheZacillac/seer/compare/v0.52.2...v0.52.3
 [0.52.2]: https://github.com/TheZacillac/seer/compare/v0.52.1...v0.52.2
 [0.52.1]: https://github.com/TheZacillac/seer/compare/v0.52.0...v0.52.1
 [0.52.0]: https://github.com/TheZacillac/seer/compare/v0.51.0...v0.52.0
