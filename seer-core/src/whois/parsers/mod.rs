@@ -6,6 +6,7 @@
 //! second-level zone or TLD and falls back to the generic regex parser
 //! ([`WhoisResponse::parse_internal`]) for everything else.
 
+mod cnnic;
 mod denic;
 mod educause;
 mod eis;
@@ -46,6 +47,7 @@ type ParseFn = fn(&str, &str, &str) -> WhoisResponse;
 
 /// Every registry parser with the TLDs (or second-level zones) it handles.
 const PARSERS: &[(&[&str], ParseFn)] = &[
+    (cnnic::TLDS, cnnic::parse),       // .cn, .中国, .中國
     (denic::TLDS, denic::parse),       // .de
     (educause::TLDS, educause::parse), // .edu
     (eis::TLDS, eis::parse),           // .ee
@@ -177,6 +179,20 @@ mod tests {
                 "{domain} must use the KISA parser"
             );
             assert_eq!(result.nameservers, vec!["ns1.example.kr"], "{domain}");
+        }
+    }
+
+    /// whois.cnnic.cn serves .cn / .中国 / .中國; only the CNNIC parser reads
+    /// `Expiration Time:`.
+    #[test]
+    fn test_parser_registry_selects_cnnic_for_cn_and_idn_tlds() {
+        let raw = "Expiration Time: 2026-11-04 00:17:02\n";
+        for domain in ["example.cn", "example.xn--fiqs8s", "example.xn--fiqz9s"] {
+            let result = parse(domain, "whois.cnnic.cn", raw);
+            assert!(
+                result.expiration_date.is_some(),
+                "{domain} must use the CNNIC parser"
+            );
         }
     }
 

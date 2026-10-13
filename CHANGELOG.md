@@ -11,6 +11,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`.cn` WHOIS now reports registration and expiry dates.** CNNIC labels
+  them `Registration Time` / `Expiration Time`, which the generic parser
+  didn't recognize. A new CNNIC parser (also used for `.中国` / `.中國`) reads
+  them as China Standard Time (UTC+8) and converts to UTC, and also picks up
+  `Registrant Contact Email`.
+
 ## [0.52.2] - 2026-10-01
 
 A WHOIS parsing release: a live sweep of every ccTLD found 16 registries
