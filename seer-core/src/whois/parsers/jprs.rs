@@ -16,11 +16,11 @@
 //! [最終更新]                      2005/03/30 17:37:52 (JST)
 //! ```
 
-use chrono::{DateTime, NaiveDateTime, Utc};
+use chrono::{DateTime, Utc};
 use regex::Regex;
 
 use super::{push_bounded, MAX_NAMESERVERS, MAX_STATUSES};
-use crate::whois::parser::WhoisResponse;
+use crate::whois::parser::{parse_fixed_offset_date, WhoisResponse};
 
 static_regex! {
     /// Matches nameserver lines in both the legacy lettered format
@@ -207,27 +207,15 @@ pub(super) fn parse(domain: &str, server: &str, raw: &str) -> WhoisResponse {
 }
 
 fn parse_jprs_date(date_str: &str) -> Option<DateTime<Utc>> {
-    let cleaned = date_str.trim().trim_end_matches("(JST)").trim();
-
-    // JPRS uses "YYYY/MM/DD HH:MM:SS" or "YYYY/MM/DD"
-    if let Ok(dt) = NaiveDateTime::parse_from_str(cleaned, "%Y/%m/%d %H:%M:%S") {
-        // JST is UTC+9. Checked: the body is untrusted (port 43 is
-        // plaintext), and a year at chrono's lower bound would make the
-        // plain `-` operator panic on underflow.
-        return dt.and_utc().checked_sub_signed(chrono::Duration::hours(9));
-    }
-    if let Ok(dt) =
-        NaiveDateTime::parse_from_str(&format!("{} 00:00:00", cleaned), "%Y/%m/%d %H:%M:%S")
-    {
-        return Some(dt.and_utc());
-    }
-
-    None
+    // JPRS uses "YYYY/MM/DD HH:MM:SS (JST)" or "YYYY/MM/DD"; JST is UTC+9.
+    let cleaned = date_str.trim().trim_end_matches("(JST)");
+    parse_fixed_offset_date(cleaned, "%Y/%m/%d", 9)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::NaiveDateTime;
 
     const SAMPLE_JPRS_RESPONSE: &str = r#"[ JPRS database provides information on network administration. Its use is    ]
 [ restricted to network administration purposes. For further information,     ]

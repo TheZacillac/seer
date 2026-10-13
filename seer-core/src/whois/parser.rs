@@ -1,4 +1,4 @@
-use chrono::{DateTime, FixedOffset, Utc};
+use chrono::{DateTime, Duration, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
@@ -27,7 +27,7 @@ pub(super) fn field_patterns(labels: &[&str]) -> Vec<Regex> {
 /// Like [`field_patterns`], but anchored to the start of a line (indentation
 /// allowed), for labels that also end a longer one (`Organization:` inside
 /// `Admin Organization:`) or would otherwise match inside prose.
-fn line_field_patterns(labels: &[&str]) -> Vec<Regex> {
+pub(super) fn line_field_patterns(labels: &[&str]) -> Vec<Regex> {
     labels
         .iter()
         .map(|label| compile(&format!(r"(?im)^[ \t]*{label}:[ \t]*(.+)$")))
@@ -39,7 +39,7 @@ fn line_field_patterns(labels: &[&str]) -> Vec<Regex> {
 /// `created..........: 16.2.1999`) and blanks before the colon (NIC Monaco
 /// .mc: `Expires on         : 2027-01-08`). Only a label at the start of a
 /// line is touched, so values and prose keep their dots and spacing.
-fn normalize_label_padding(raw: &str) -> std::borrow::Cow<'_, str> {
+pub(super) fn normalize_label_padding(raw: &str) -> std::borrow::Cow<'_, str> {
     static_regex! {
         LABEL_PADDING = r"(?m)^([ \t]*[A-Za-z][A-Za-z0-9 /()_-]*?)(?:\.{2,}[ \t]*|[ \t]+):";
     }
@@ -142,8 +142,14 @@ static NAMESERVER_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     patterns
 });
 
-static REGISTRANT_EMAIL_PATTERNS: LazyLock<Vec<Regex>> =
-    LazyLock::new(|| field_patterns(&["Registrant Email", "Registrant E-mail"]));
+static REGISTRANT_EMAIL_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
+    field_patterns(&[
+        "Registrant Email",
+        "Registrant E-mail",
+        // CNNIC (.cn)
+        "Registrant Contact Email",
+    ])
+});
 
 static REGISTRANT_PHONE_PATTERNS: LazyLock<Vec<Regex>> =
     LazyLock::new(|| field_patterns(&["Registrant Phone", "Registrant Tel"]));
@@ -691,7 +697,7 @@ const NOT_FOUND_PATTERNS: &[&str] = &[
     "domain is not registered",
 ];
 
-fn extract_field_with_patterns(text: &str, patterns: &[Regex]) -> Option<String> {
+pub(super) fn extract_field_with_patterns(text: &str, patterns: &[Regex]) -> Option<String> {
     for re in patterns {
         // The first occurrence of this label that carries a value. An empty
         // occurrence (`Label: \r\n` — the `(.+)` captures just the `\r`) is
@@ -815,6 +821,29 @@ fn infer_date_order<'a>(candidates: impl IntoIterator<Item = &'a str>) -> Option
     None
 }
 
+/// Parses a zone-less timestamp a registry writes in a fixed local time
+/// (JPRS: JST, UTC+9; CNNIC: CST, UTC+8) into UTC. `date_fmt` is the
+/// registry's date layout; `<date> HH:MM:SS` is shifted by the offset, while
+/// a bare date stays midnight UTC, since shifting it would move it onto the
+/// previous calendar day.
+pub(crate) fn parse_fixed_offset_date(
+    value: &str,
+    date_fmt: &str,
+    utc_offset_hours: i64,
+) -> Option<DateTime<Utc>> {
+    let value = value.trim();
+    if let Ok(local) = NaiveDateTime::parse_from_str(value, &format!("{date_fmt} %H:%M:%S")) {
+        // Checked: the body is untrusted (port 43 is plaintext), and a year
+        // at chrono's lower bound would make the plain `-` operator panic.
+        return local
+            .and_utc()
+            .checked_sub_signed(Duration::hours(utc_offset_hours));
+    }
+    NaiveDate::parse_from_str(value, date_fmt)
+        .ok()
+        .map(|date| date.and_time(NaiveTime::MIN).and_utc())
+}
+
 /// Parse a date string from registry output into a UTC datetime, using the
 /// documented international day-first interpretation for ambiguous all-numeric
 /// dates. Thin wrapper over [`parse_date_with_order`].
@@ -919,10 +948,10 @@ pub(crate) fn parse_date_with_order(date_str: &str, order: DateOrder) -> Option<
         .chain(first_pair.iter())
         .chain(second_pair.iter())
     {
-        if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(&cleaned, fmt) {
+        if let Ok(dt) = NaiveDateTime::parse_from_str(&cleaned, fmt) {
             return Some(dt.and_utc());
         }
-        if let Ok(d) = chrono::NaiveDate::parse_from_str(&cleaned, fmt) {
+        if let Ok(d) = NaiveDate::parse_from_str(&cleaned, fmt) {
             return Some(d.and_hms_opt(0, 0, 0)?.and_utc());
         }
     }
@@ -1089,6 +1118,43 @@ mod tests {
 
     fn make_response(raw: &str) -> WhoisResponse {
         WhoisResponse::parse_internal("example.jp", "whois.jprs.jp", raw)
+    }
+
+    #[test]
+    fn fixed_offset_date_shifts_datetimes_but_not_bare_dates() {
+        let fmt = |d: Option<DateTime<Utc>>| d.map(|d| d.to_rfc3339());
+        assert_eq!(
+            fmt(parse_fixed_offset_date(
+                " 2026-11-04 00:17:02 ",
+                "%Y-%m-%d",
+                8
+            ))
+            .as_deref(),
+            Some("2026-11-03T16:17:02+00:00")
+        );
+        assert_eq!(
+            fmt(parse_fixed_offset_date("2026-11-04", "%Y-%m-%d", 8)).as_deref(),
+            Some("2026-11-04T00:00:00+00:00")
+        );
+        assert_eq!(parse_fixed_offset_date("garbage", "%Y-%m-%d", 8), None);
+    }
+
+    /// Port 43 is plaintext, so a hostile server can send chrono's minimum
+    /// datetime; subtracting the offset must drop it, not panic.
+    #[test]
+    fn fixed_offset_date_at_chrono_min_does_not_panic() {
+        let min = NaiveDateTime::MIN.format("%Y-%m-%d %H:%M:%S").to_string();
+        assert!(
+            NaiveDateTime::parse_from_str(&min, "%Y-%m-%d %H:%M:%S").is_ok(),
+            "fixture must reach the offset subtraction: {min}"
+        );
+        assert_eq!(parse_fixed_offset_date(&min, "%Y-%m-%d", 8), None);
+    }
+
+    #[test]
+    fn registrant_contact_email_label_is_read() {
+        let r = make_response("Registrant Contact Email: hostmaster@example.cn\n");
+        assert_eq!(r.registrant_email.as_deref(), Some("hostmaster@example.cn"));
     }
 
     #[test]
