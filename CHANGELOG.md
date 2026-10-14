@@ -11,6 +11,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.53.1] - 2026-10-14
+
+A security and polish release: rustls picks up four advisory fixes, and
+the new WHOIS-vs-DNS nameserver cross-check no longer warns when a
+registry's WHOIS simply publishes no nameservers.
+
+### Security
+- **rustls 0.23.46.** Fixes RUSTSEC-2026-0346 (TLS secrets in client
+  session `Debug` output), RUSTSEC-2026-0347 (buffered data sent after an
+  ECH rejection), RUSTSEC-2026-0348 (up to 1 GiB allocated decompressing a
+  Brotli certificate before authentication) and RUSTSEC-2026-0349
+  (ServerHello downgrade of later connections to classical key exchange).
+
 ### Fixed
 - **No false "differs from WHOIS" when WHOIS lists no nameservers.** Many
   registries' WHOIS omits nameservers entirely, and the DNS cross-check
@@ -1962,7 +1975,8 @@ Two notable breaking changes landed in this period:
   The human and markdown formatters group both fields by record type and
   omit the per-type subheader when only one type is present.
 
-[Unreleased]: https://github.com/TheZacillac/seer/compare/v0.53.0...HEAD
+[Unreleased]: https://github.com/TheZacillac/seer/compare/v0.53.1...HEAD
+[0.53.1]: https://github.com/TheZacillac/seer/compare/v0.53.0...v0.53.1
 [0.53.0]: https://github.com/TheZacillac/seer/compare/v0.52.3...v0.53.0
 [0.52.3]: https://github.com/TheZacillac/seer/compare/v0.52.2...v0.52.3
 [0.52.2]: https://github.com/TheZacillac/seer/compare/v0.52.1...v0.52.2
