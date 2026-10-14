@@ -175,6 +175,17 @@ impl DnsNameservers {
             missing_from_dns,
         }
     }
+
+    /// True when WHOIS lists no nameservers but the parent delegates some.
+    /// Many registries' WHOIS omits nameservers entirely, so unlike a partial
+    /// list this is no sign of a stale record.
+    pub fn whois_lists_none(&self) -> bool {
+        // Any WHOIS name either shrinks `missing_from_whois` below the
+        // delegated set or lands in `missing_from_dns`.
+        !self.delegated.is_empty()
+            && self.missing_from_dns.is_empty()
+            && self.missing_from_whois.len() == self.delegated.len()
+    }
 }
 
 /// The parent zone's answer for a delegation (steps 1–2 of

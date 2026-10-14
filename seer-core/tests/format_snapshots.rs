@@ -805,6 +805,19 @@ fn fixture_lookup_whois_dns_in_sync() -> LookupResult {
     }
 }
 
+/// A WHOIS-only lookup whose registry WHOIS publishes no nameservers: the
+/// delegation is shown, but not as a mismatch.
+fn fixture_lookup_whois_lists_no_ns() -> LookupResult {
+    let mut data = fixture_whois_with_contacts();
+    let delegated = std::mem::take(&mut data.nameservers);
+    LookupResult::Whois {
+        dns_nameservers: Some(DnsNameservers::compare(&data.nameservers, delegated)),
+        data,
+        rdap_error: Some("RDAP bootstrap has no entry for this TLD".into()),
+        rdap_fallback: None,
+    }
+}
+
 fn fixture_availability() -> AvailabilityResult {
     AvailabilityResult {
         domain: "example.com".into(),
@@ -837,6 +850,16 @@ fn fixture_domain_info() -> DomainInfo {
     info
 }
 
+/// [`DomainInfo`] built from a lookup result, with the now()-relative counts
+/// pinned like [`fixture_domain_info`]'s: the `[N] days` filter can't reach a
+/// count behind an ANSI code or in a bare table cell.
+fn fixture_domain_info_from(result: &LookupResult) -> DomainInfo {
+    let mut info = DomainInfo::from_lookup_result(result);
+    info.days_until_expiration = Some(26_660);
+    info.domain_age_days = Some(5_800);
+    info
+}
+
 snapshot_tests! {
     human_whois_contacts_snapshot => human.format_whois(fixture_whois_with_contacts());
     markdown_whois_contacts_snapshot => markdown.format_whois(fixture_whois_with_contacts());
@@ -860,10 +883,12 @@ snapshot_tests! {
     human_lookup_whois_dns_differs_snapshot => human.format_lookup(fixture_lookup_whois_dns_differs());
     markdown_lookup_whois_dns_differs_snapshot => markdown.format_lookup(fixture_lookup_whois_dns_differs());
     human_lookup_whois_dns_in_sync_snapshot => human.format_lookup(fixture_lookup_whois_dns_in_sync());
+    human_lookup_whois_lists_no_ns_snapshot => human.format_lookup(fixture_lookup_whois_lists_no_ns());
+    markdown_lookup_whois_lists_no_ns_snapshot => markdown.format_lookup(fixture_lookup_whois_lists_no_ns());
     human_domain_info_dns_differs_snapshot =>
-        human.format_domain_info(DomainInfo::from_lookup_result(&fixture_lookup_whois_dns_differs()));
+        human.format_domain_info(fixture_domain_info_from(&fixture_lookup_whois_dns_differs()));
     markdown_domain_info_dns_differs_snapshot =>
-        markdown.format_domain_info(DomainInfo::from_lookup_result(&fixture_lookup_whois_dns_differs()));
+        markdown.format_domain_info(fixture_domain_info_from(&fixture_lookup_whois_dns_differs()));
     human_lookup_available_snapshot => human.format_lookup(fixture_lookup_available());
     markdown_lookup_available_snapshot => markdown.format_lookup(fixture_lookup_available());
     human_availability_snapshot => human.format_availability(fixture_availability());

@@ -534,11 +534,10 @@ fn wants_dns_nameservers(result: &LookupResult) -> bool {
 /// Attaches the delegation comparison to a result [`wants_dns_nameservers`]
 /// accepts; any other result, or a failed DNS query, is returned unchanged.
 fn with_dns_nameservers(mut result: LookupResult, delegated: Result<Vec<String>>) -> LookupResult {
-    if !wants_dns_nameservers(&result) {
-        return result;
-    }
+    // Same shape as `wants_dns_nameservers`: a WHOIS record with no RDAP one.
     if let LookupResult::Whois {
         data,
+        rdap_fallback: None,
         dns_nameservers,
         ..
     } = &mut result

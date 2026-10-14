@@ -11,6 +11,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **No false "differs from WHOIS" when WHOIS lists no nameservers.** Many
+  registries' WHOIS omits nameservers entirely, and the DNS cross-check
+  reported every delegated host as missing, styled as a warning. It now
+  says `WHOIS lists no nameservers` and still shows the delegated set; a
+  partial or wrong WHOIS list is still flagged.
+
 ## [0.53.0] - 2026-10-13
 
 A WHOIS/RDAP accuracy release. A probe of every ccTLD compared each parsed
