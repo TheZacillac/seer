@@ -257,6 +257,9 @@ pub(crate) fn dns_delegation_verdict(ns: &crate::DnsNameservers) -> String {
     if ns.in_sync {
         return "matches WHOIS".to_string();
     }
+    if ns.whois_lists_none() {
+        return "WHOIS lists no nameservers".to_string();
+    }
     let mut parts = Vec::new();
     if !ns.missing_from_whois.is_empty() {
         parts.push(format!(
@@ -271,6 +274,12 @@ pub(crate) fn dns_delegation_verdict(ns: &crate::DnsNameservers) -> String {
         ));
     }
     format!("differs from WHOIS ({})", parts.join("; "))
+}
+
+/// Whether [`dns_delegation_verdict`] reports a real mismatch, the case
+/// formatters style as a warning. WHOIS listing no nameservers is not one.
+pub(crate) fn dns_delegation_differs(ns: &crate::DnsNameservers) -> bool {
+    !ns.in_sync && !ns.whois_lists_none()
 }
 
 /// Formats a [`TimeDelta`] as a compact duration (`Ns` / `Nm Ns` / `Nh Nm`).
@@ -575,6 +584,34 @@ pub fn get_formatter(format: OutputFormat) -> Box<dyn OutputFormatter> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dns_delegation_with_no_whois_nameservers_is_not_a_mismatch() {
+        let ns = |w: &[&str], d: &[&str]| {
+            crate::DnsNameservers::compare(
+                &w.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                d.iter().map(|s| s.to_string()).collect(),
+            )
+        };
+        // WHOIS publishes no nameservers: shown neutrally, not as stale.
+        let none = ns(&[], &["a.ns.test", "b.ns.test"]);
+        assert!(none.whois_lists_none());
+        assert!(!dns_delegation_differs(&none));
+        assert_eq!(dns_delegation_verdict(&none), "WHOIS lists no nameservers");
+        // A partial WHOIS list is still a mismatch.
+        let partial = ns(&["a.ns.test"], &["a.ns.test", "b.ns.test"]);
+        assert!(!partial.whois_lists_none());
+        assert!(dns_delegation_differs(&partial));
+        assert!(dns_delegation_verdict(&partial).starts_with("differs from WHOIS"));
+        // A WHOIS list the parent doesn't delegate at all is too.
+        let wrong = ns(&["x.ns.test"], &["a.ns.test"]);
+        assert!(!wrong.whois_lists_none());
+        assert!(dns_delegation_differs(&wrong));
+        // Nothing on either side matches.
+        let empty = ns(&[], &[]);
+        assert!(!empty.whois_lists_none());
+        assert!(!dns_delegation_differs(&empty));
+    }
 
     #[test]
     fn test_output_format_from_str() {

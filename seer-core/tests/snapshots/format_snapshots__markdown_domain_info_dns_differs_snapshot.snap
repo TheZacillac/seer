@@ -1,7 +1,6 @@
 ---
 source: seer-core/tests/format_snapshots.rs
-assertion_line: 840
-expression: "markdown ().format_domain_info\n(& DomainInfo::from_lookup_result(&fixture_lookup_whois_dns_differs()))"
+expression: "markdown ().format_domain_info\n(& fixture_domain_info_from(&fixture_lookup_whois_dns_differs()))"
 ---
 ## Domain Info: example.com
 
@@ -23,7 +22,7 @@ expression: "markdown ().format_domain_info\n(& DomainInfo::from_lookup_result(&
 | Status | `clientTransferProhibited` |
 | DNSSEC | signedDelegation |
 | Days Until Expiry | expires in [N] days |
-| Domain Age (days) | 6056 |
+| Domain Age (days) | 5800 |
 | Expiry Status | active |
 
 ### Status Codes

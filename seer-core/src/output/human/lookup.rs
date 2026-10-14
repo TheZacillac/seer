@@ -1,5 +1,5 @@
 use super::*;
-use crate::output::{availability_label, dns_delegation_verdict, lookup_source};
+use crate::output::{availability_label, lookup_source};
 
 impl HumanFormatter {
     pub(super) fn format_lookup(&self, result: &LookupResult) -> String {
@@ -104,13 +104,7 @@ impl HumanFormatter {
                     if !dns.in_sync {
                         rows.list("Nameservers (DNS)", &dns.delegated);
                     }
-                    let verdict = sanitize_line(&dns_delegation_verdict(dns));
-                    let styled = if dns.in_sync {
-                        self.value(&verdict)
-                    } else {
-                        self.warning(&verdict)
-                    };
-                    rows.kv("DNS Delegation", styled);
+                    rows.dns_delegation(dns);
                 }
                 rows.opt("DNSSEC", &data.dnssec);
             }

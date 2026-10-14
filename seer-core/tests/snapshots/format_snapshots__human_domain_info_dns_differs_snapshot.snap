@@ -1,7 +1,6 @@
 ---
 source: seer-core/tests/format_snapshots.rs
-assertion_line: 840
-expression: "human ().format_domain_info\n(& DomainInfo::from_lookup_result(&fixture_lookup_whois_dns_differs()))"
+expression: "human ().format_domain_info\n(& fixture_domain_info_from(&fixture_lookup_whois_dns_differs()))"
 ---
 
 [1;95mDomain Info: example.com (source: whois)[0m
@@ -13,7 +12,7 @@ expression: "human ().format_domain_info\n(& DomainInfo::from_lookup_result(&fix
   [1;96mExpires[0m: [97m2099-03-15[0m
   [1;96mUpdated[0m: [97m2024-02-01[0m
   [1;96mDays Until Expiry[0m: [1;92mexpires in [N] days[0m
-  [1;96mDomain Age[0m: [97m6056 days[0m
+  [1;96mDomain Age[0m: [97m5800 days[0m
   [1;96mExpiry Status[0m: [97mactive[0m
   [1;96mNameservers[0m: [97mns1.example.com, ns2.example.com[0m
   [1;96mNameservers (DNS)[0m: [97mns2.example.com, ns9.example-dns.net[0m

@@ -276,6 +276,18 @@ impl Rows<'_> {
         }
     }
 
+    /// `DNS Delegation: <verdict>`, warning-styled only on a real mismatch
+    /// ([`crate::output::dns_delegation_differs`]).
+    fn dns_delegation(&mut self, dns: &crate::DnsNameservers) {
+        let verdict = sanitize_line(&crate::output::dns_delegation_verdict(dns));
+        let styled = if crate::output::dns_delegation_differs(dns) {
+            self.f.warning(&verdict)
+        } else {
+            self.f.value(&verdict)
+        };
+        self.kv("DNS Delegation", styled);
+    }
+
     /// A writer into the same output at another indent.
     fn at(&mut self, indent: &str) -> Rows<'_> {
         self.f.rows(self.out, indent)
