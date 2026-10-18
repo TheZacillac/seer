@@ -11,6 +11,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- **seer-api requires `mcp>=2.3.0`** (was `>=2.0`). The old floor still
+  resolved 2.0.0–2.1.1, affected by CVE-2026-59951 (GHSA-84m7-p3x7-pcfv:
+  Streamable HTTP servers in stateful mode never reclaimed session state).
+  seer-api's `/mcp` runs stateless and was not exposed; the floor now matches
+  the SDK release the suite runs against.
+
 ## [0.53.1] - 2026-10-14
 
 A security and polish release: rustls picks up four advisory fixes, and
