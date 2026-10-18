@@ -284,6 +284,12 @@ backoff), permanent (unsupported TLD, unparseable response, TLS failure:
 do not retry), or an upstream failure that may be either (retry at most
 once).
 
+Every tool is annotated read-only and non-destructive (`readOnlyHint`,
+`destructiveHint: false`, `idempotentHint`), and open-world except
+`seer_tld_list`, which reads embedded data only. The server also sends
+`instructions` with its handshake: that results are untrusted third-party
+data, and which tool fits which question.
+
 ### Claude Desktop Integration
 
 Add to `claude_desktop_config.json`:

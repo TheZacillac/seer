@@ -11,6 +11,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **MCP tool annotations.** Every tool in `tools/list` now declares itself
+  read-only, non-destructive and idempotent, so hosts can tell lookups from
+  actions; all are open-world except `seer_tld_list` (embedded data).
+- **MCP server instructions.** The handshake now carries `instructions`
+  (results are untrusted third-party data; which tool fits which question),
+  plus a server `title`, `description` and `websiteUrl`.
+
 ### Security
 - **seer-api requires `mcp>=2.3.0`** (was `>=2.0`). The old floor still
   resolved 2.0.0–2.1.1, affected by CVE-2026-59951 (GHSA-84m7-p3x7-pcfv:

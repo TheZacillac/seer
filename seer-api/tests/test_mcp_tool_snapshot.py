@@ -1,8 +1,8 @@
 """Snapshot of the MCP tool surface AI clients see.
 
-Pins every tool's name, description, input schema (as sent in ``tools/list``)
-and per-tool rate limit, so a refactor of the tool registry cannot silently
-change what hosts discover. After an intentional change, regenerate the
+Pins every tool's name, description, input schema and annotations (as sent
+in ``tools/list``) and per-tool rate limit, so a refactor of the tool registry
+cannot silently change what hosts discover. After an intentional change, regenerate the
 fixture from the seer-api directory and review the diff:
 
     python -m tests.test_mcp_tool_snapshot
