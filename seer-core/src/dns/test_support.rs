@@ -389,18 +389,39 @@ pub(crate) async fn spawn_mock_dns_fn_with_tcp<F>(handler: F) -> u16
 where
     F: FnMut(&str, HickoryRecordType) -> MockReply + Send + 'static,
 {
-    // TCP and UDP port spaces are separate, so the UDP socket's ephemeral
-    // port is almost always free for TCP too; retry the pair if it is not.
-    for _ in 0..16 {
-        let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind mock DNS");
-        let port = socket.local_addr().expect("mock DNS local addr").port();
-        if let Ok(listener) = TcpListener::bind(("127.0.0.1", port)).await {
-            let port = serve_udp(socket, handler);
-            tokio::spawn(relay_tcp(listener, port));
-            return port;
+    // One protocol picks an ephemeral port, the other binds the same number.
+    // Alternate which one picks: Windows reserves blocks of ports per protocol
+    // (Hyper-V/WinNAT exclusions) and hands out ephemeral ports near the last
+    // one, so UDP-first retries can all land in one TCP-excluded block. The
+    // picking protocol's allocator always skips its own exclusions.
+    let mut last_err = None;
+    for attempt in 0..16 {
+        match bind_udp_tcp_pair(attempt % 2 == 1).await {
+            Ok((socket, listener)) => {
+                let port = serve_udp(socket, handler);
+                tokio::spawn(relay_tcp(listener, port));
+                return port;
+            }
+            Err(e) => last_err = Some(e),
         }
     }
-    panic!("no loopback port free for both UDP and TCP");
+    panic!("no loopback port free for both UDP and TCP: {last_err:?}");
+}
+
+/// Binds a UDP socket and a TCP listener on one loopback port, letting TCP
+/// pick the ephemeral port when `tcp_first`, UDP otherwise.
+async fn bind_udp_tcp_pair(tcp_first: bool) -> std::io::Result<(UdpSocket, TcpListener)> {
+    if tcp_first {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+        let socket = UdpSocket::bind(("127.0.0.1", port)).await?;
+        Ok((socket, listener))
+    } else {
+        let socket = UdpSocket::bind("127.0.0.1:0").await?;
+        let port = socket.local_addr()?.port();
+        let listener = TcpListener::bind(("127.0.0.1", port)).await?;
+        Ok((socket, listener))
+    }
 }
 
 /// Accepts DNS-over-TCP connections and relays every length-prefixed query
@@ -556,4 +577,24 @@ pub(crate) fn mock_dns_resolver(port: u16) -> DnsResolver {
 /// the default upstream (posture, CAA) can be exercised end to end.
 pub(crate) fn mock_dns_resolver_default(port: u16) -> DnsResolver {
     mock_dns_resolver(port).with_default_nameserver("127.0.0.1")
+}
+
+// The whole module is already `cfg(test)`.
+mod tests {
+    use super::*;
+
+    /// Both pick orders must yield a UDP socket and TCP listener on one port:
+    /// the retry loop alternates them, and a working machine only ever takes
+    /// the first branch, so the TCP-first one is pinned here.
+    #[tokio::test]
+    async fn udp_tcp_pair_shares_one_port_in_either_pick_order() {
+        for tcp_first in [false, true] {
+            let (socket, listener) = bind_udp_tcp_pair(tcp_first).await.expect("bind pair");
+            assert_eq!(
+                socket.local_addr().unwrap().port(),
+                listener.local_addr().unwrap().port(),
+                "tcp_first = {tcp_first}"
+            );
+        }
+    }
 }
