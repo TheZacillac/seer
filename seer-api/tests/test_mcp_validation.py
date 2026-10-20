@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 
 import pytest
 
@@ -183,3 +184,34 @@ def test_every_record_type_argument_advertises_the_full_list() -> None:
     assert described, "expected at least one tool with a record_type argument"
     for prop in described:
         assert prop["description"] == server._RECORD_TYPE_DESC
+
+
+def test_every_tool_is_annotated_read_only() -> None:
+    """Every seer tool is a lookup, so `tools/list` must say so: hosts read
+    these hints to decide which calls need confirmation."""
+    for tool in asyncio.run(server.list_tools()):
+        hints = tool.annotations
+        assert hints is not None, f"{tool.name} has no annotations"
+        assert hints.read_only_hint is True, tool.name
+        assert hints.destructive_hint is False, tool.name
+        assert hints.idempotent_hint is True, tool.name
+
+
+def test_only_embedded_data_tools_are_closed_world() -> None:
+    """open_world_hint=False promises no network access; only seer_tld_list
+    (embedded TLD data) keeps that promise."""
+    closed = {
+        t.name for t in asyncio.run(server.list_tools()) if not t.annotations.open_world_hint
+    }
+    assert closed == {"seer_tld_list"}
+
+
+def test_instructions_name_only_registered_tools() -> None:
+    """Drift guard: a renamed or removed tool must not linger in the
+    instructions hosts load into the model's context."""
+    named = set(re.findall(r"\bseer_[a-z_]*[a-z]\b", server._INSTRUCTIONS))
+    assert named, "expected the instructions to name tools"
+    assert named <= set(server._TOOLS), named - set(server._TOOLS)
+    # `seer_bulk_*` is a family reference, so at least one bulk tool must exist.
+    assert "seer_bulk_*" in server._INSTRUCTIONS
+    assert any(name.startswith("seer_bulk_") for name in server._TOOLS)

@@ -56,6 +56,12 @@ def test_mcp_initialize_returns_server_info(client):
     assert payload["result"]["serverInfo"]["version"] == __version__
     assert payload["result"]["serverInfo"]["version"] != ""
     assert "tools" in payload["result"]["capabilities"]
+    assert payload["result"]["serverInfo"]["title"] == "Seer"
+    # Sent once per connection so hosts load the untrusted-data policy and
+    # tool guidance into context up front.
+    from seer_api.mcp.server import _INSTRUCTIONS
+
+    assert payload["result"]["instructions"] == _INSTRUCTIONS
 
 
 def test_mcp_tools_list_includes_seer_tools(client):

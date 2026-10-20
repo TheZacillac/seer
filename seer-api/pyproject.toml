@@ -29,11 +29,14 @@ dependencies = [
     "uvloop>=0.15.1; sys_platform != 'win32' and sys_platform != 'cygwin' and platform_python_implementation != 'PyPy'",
     "httptools>=0.8.0",
     "pydantic>=2.0",
-    # Floored at 2.0: the server registers handlers through the 2.x API
-    # (`add_request_handler` by protocol method name). SDK 1.x has no such
-    # method — it used the `@server.list_tools()` / `@server.call_tool()`
-    # decorators 2.0 removed — so a 1.x resolution fails at import.
-    "mcp>=2.0",
+    # 2.x API: the server registers handlers through `add_request_handler`
+    # by protocol method name; 1.x used the `@server.list_tools()` /
+    # `@server.call_tool()` decorators 2.0 removed, so it fails at import.
+    # 2.2.0 is the security floor (CVE-2026-59951 / GHSA-84m7-p3x7-pcfv:
+    # unbounded Streamable HTTP session state in 2.0.0–2.1.1; /mcp runs
+    # stateless, so seer-api wasn't exposed, but keep the vulnerable range
+    # unresolvable). Floored at 2.3.0, the release the suite runs against.
+    "mcp>=2.3.0",
     # The seer Python bindings; distributed on PyPI as `domain-seer`
     # (import name remains `seer`).
     #
