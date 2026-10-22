@@ -712,19 +712,6 @@ fn compute_score(
     earned.saturating_sub(cookie_penalty + disclosure_penalty)
 }
 
-/// Maps a score to a letter grade.
-fn grade_letter(score: u32) -> &'static str {
-    match score {
-        95..=u32::MAX => "A+",
-        85..=94 => "A",
-        75..=84 => "B",
-        65..=74 => "C",
-        50..=64 => "D",
-        30..=49 => "E",
-        _ => "F",
-    }
-}
-
 /// Builds the ranked advisory list from the graded findings.
 fn build_notes(
     headers: &[HeaderFinding],
@@ -874,7 +861,7 @@ fn build_report(domain: String, response: &ResponseHead) -> HeaderReport {
         url: response.final_url.clone(),
         status: response.status,
         redirects: response.redirects,
-        grade: grade_letter(score).to_string(),
+        grade: crate::grade::Letter::from_score(score).as_str().to_string(),
         score,
         headers,
         cookies,
@@ -911,10 +898,23 @@ pub async fn audit_headers(domain: &str, timeout: Duration) -> Result<HeaderRepo
     // different headers) than the apex, so `www.` is kept.
     let domain = normalize_host(domain)?;
     let fetcher = GuardedFetcher::new().with_timeout(timeout);
+    Ok(audit_headers_with(&fetcher, &domain).await?)
+}
+
+/// [`audit_headers`] for an already-normalized `host` and a caller-built
+/// fetcher, keeping the connect/other failure split (the audit reports a
+/// failed HTTPS connection as a finding, anything else as unknown).
+pub(crate) async fn audit_headers_with(
+    fetcher: &GuardedFetcher,
+    host: &str,
+) -> std::result::Result<HeaderReport, crate::http::SendError> {
     // Only the status line and headers are graded, so the body is never read:
     // one that stalls or resets must not fail the audit.
-    let response = fetcher.get_head(&format!("https://{domain}/")).await?;
-    Ok(build_report(domain, &response))
+    fetcher
+        .get_head_traced(&format!("https://{host}/"))
+        .await
+        .result
+        .map(|response| build_report(host.to_string(), &response))
 }
 
 #[cfg(test)]
@@ -1451,20 +1451,6 @@ mod tests {
         // or a flawless site could never reach A+.
         let total: u32 = HEADER_WEIGHTS.iter().map(|(_, w)| *w).sum();
         assert_eq!(total, 100);
-    }
-
-    #[test]
-    fn grade_bands_are_ordered_and_total() {
-        assert_eq!(grade_letter(100), "A+");
-        assert_eq!(grade_letter(95), "A+");
-        assert_eq!(grade_letter(94), "A");
-        assert_eq!(grade_letter(85), "A");
-        assert_eq!(grade_letter(75), "B");
-        assert_eq!(grade_letter(65), "C");
-        assert_eq!(grade_letter(50), "D");
-        assert_eq!(grade_letter(30), "E");
-        assert_eq!(grade_letter(29), "F");
-        assert_eq!(grade_letter(0), "F");
     }
 
     #[test]

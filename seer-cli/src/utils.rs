@@ -1025,8 +1025,8 @@ mod tests {
 
     fn sample_posture() -> seer_core::EmailPosture {
         use seer_core::{
-            BimiPolicy, DanePolicy, DmarcPolicy, EmailPosture, MtaStsPolicy, PostureVerdict,
-            SpfPolicy,
+            BimiPolicy, DanePolicy, DmarcPolicy, EmailPosture, MailExchangers, MtaStsPolicy,
+            PostureVerdict, SpfPolicy,
         };
         EmailPosture {
             domain: "example.com".to_string(),
@@ -1035,6 +1035,7 @@ mod tests {
                 record: Some("v=spf1 -all".to_string()),
                 all_qualifier: Some("-".to_string()),
                 verdict: PostureVerdict::Strict,
+                permerror: None,
             },
             dmarc: DmarcPolicy {
                 present: true,
@@ -1063,6 +1064,7 @@ mod tests {
                 records: vec![],
                 verdict: PostureVerdict::Absent,
             },
+            mx: MailExchangers::Hosts(vec!["mx.example.com".to_string()]),
             notes: vec!["strong posture".to_string()],
         }
     }
@@ -1155,6 +1157,7 @@ mod tests {
             issuer_match: None,
             iodef: vec!["mailto:security@example.com".to_string()],
             wildcard_note: None,
+            lookup_failed: false,
             note: "CAA restricts which CAs may issue".to_string(),
         };
         let result = BulkResult {
@@ -1948,6 +1951,7 @@ mod tests {
                 issuer_match: None,
                 iodef: vec!["mailto:security@example.com".to_string()],
                 wildcard_note: Some("wildcards restricted, see issuewild".to_string()),
+                lookup_failed: false,
                 note: "CAA restricts which CAs may issue".to_string(),
             };
             let caa = [

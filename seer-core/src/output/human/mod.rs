@@ -26,6 +26,7 @@ pub(super) use crate::status::StatusResponse;
 pub(super) use crate::whois::WhoisResponse;
 pub(super) use colored::Colorize;
 
+mod audit;
 mod delegation;
 mod diff;
 mod dig;

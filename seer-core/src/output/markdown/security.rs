@@ -2,7 +2,7 @@
 //! subdomain baseline diffs, email posture, HTTP headers, takeover, CAA,
 //! confusables, and classified subdomains.
 
-use super::{caa_body, Bullets, MarkdownFormatter, MdCode, MdSafe};
+use super::{caa_body, heading, table_header, Bullets, MarkdownFormatter, MdCode, MdSafe};
 use crate::caa::CaaPolicy;
 use crate::confusables::ConfusableReport;
 use crate::drift::DriftReport;
@@ -11,17 +11,6 @@ use crate::output::{subdomain_status_label, takeover_label};
 use crate::posture::{EmailPosture, PostureVerdict};
 use crate::subdomains::{SubdomainBaselineDiff, SubdomainClassification, SubdomainStatus};
 use crate::takeover::{TakeoverReport, TakeoverVerdict};
-
-/// `## title` and the blank line after it.
-fn heading(title: String) -> Vec<String> {
-    vec![title, String::new()]
-}
-
-/// Appends a table header row and its delimiter row.
-fn table_header(out: &mut Vec<String>, columns: &[&str]) {
-    out.push(format!("| {} |", columns.join(" | ")));
-    out.push(format!("|{}", " --- |".repeat(columns.len())));
-}
 
 /// Appends a `### title` section of one text bullet per remote item;
 /// nothing when there are none.

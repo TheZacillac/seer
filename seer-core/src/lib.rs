@@ -13,6 +13,7 @@ macro_rules! static_regex {
     };
 }
 
+pub mod audit;
 pub mod availability;
 pub mod bulk;
 pub mod caa;
@@ -23,6 +24,7 @@ pub mod config;
 pub mod confusables;
 mod dates;
 pub mod diff;
+pub mod dkim;
 pub mod dns;
 #[cfg(feature = "cli")]
 pub mod doctor;
@@ -32,10 +34,12 @@ pub mod drift;
 pub mod error;
 #[cfg(feature = "cli")]
 mod fsutil;
+pub mod grade;
 pub mod headers;
 #[cfg(feature = "cli")]
 pub mod history;
 mod http;
+pub mod https_upgrade;
 #[cfg(feature = "cli")]
 pub mod logging;
 pub mod lookup;
@@ -46,6 +50,7 @@ pub mod posture;
 mod psl;
 pub mod rdap;
 pub mod retry;
+pub mod security_txt;
 pub mod ssl;
 pub mod status;
 pub mod subdomains;
@@ -59,6 +64,7 @@ pub mod watchlist;
 pub mod webhook;
 pub mod whois;
 
+pub use audit::{AuditOptions, AuditReport, Auditor};
 pub use availability::{AvailabilityChecker, AvailabilityResult};
 pub use cache::TtlCache;
 pub use config::SeerConfig;
@@ -99,10 +105,12 @@ pub use history::{HistoryEntry, LookupHistory};
 #[cfg(feature = "cli")]
 pub use output::{OutputFormat, OutputFormatter};
 pub use posture::{
-    lookup_email_posture, BimiPolicy, DanePolicy, DmarcPolicy, EmailPosture, MtaStsPolicy,
-    PostureVerdict, SpfPolicy,
+    lookup_email_posture, BimiPolicy, DanePolicy, DmarcPolicy, EmailPosture, MailExchangers,
+    MtaStsPolicy, PostureVerdict, SpfPermerror, SpfPolicy,
 };
-pub use ssl::{CertDetail, CertWarning, CertWarningSeverity, SslChecker, SslReport};
+pub use ssl::{
+    CertDetail, CertWarning, CertWarningKind, CertWarningSeverity, SslChecker, SslReport,
+};
 pub use subdomains::{
     classify_subdomains, ClassifiedSubdomain, SubdomainClassification, SubdomainEnumerator,
     SubdomainResult, SubdomainStatus,

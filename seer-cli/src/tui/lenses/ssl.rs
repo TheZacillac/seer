@@ -104,15 +104,17 @@ mod tests {
 
     #[test]
     fn renders_cert_warnings() {
-        use seer_core::{CertWarning, CertWarningSeverity};
+        use seer_core::{CertWarning, CertWarningKind, CertWarningSeverity};
         let mut report = ssl_fixture();
         report.warnings = vec![
             CertWarning {
                 severity: CertWarningSeverity::Critical,
+                kind: CertWarningKind::WeakKey,
                 message: "weak RSA key (1024 bits)".into(),
             },
             CertWarning {
                 severity: CertWarningSeverity::Warning,
+                kind: CertWarningKind::SelfSigned,
                 message: "certificate is self-signed".into(),
             },
         ];

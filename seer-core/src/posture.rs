@@ -11,6 +11,10 @@
 //! lookups the RFCs require (SPF `redirect=`, DMARC's organizational-domain
 //! fallback, DANE at the MX hosts) are DNS-only and bounded. All parsing is
 //! pure and unit-tested; only the record fetch is async.
+//!
+//! Beyond verdicts and notes, the result carries structured signals for
+//! machine consumers: [`SpfPolicy::permerror`] (why SPF evaluation fails) and
+//! [`EmailPosture::mx`] (hosts, null MX, absent or unknown).
 
 use std::collections::HashMap;
 
@@ -67,6 +71,48 @@ pub struct SpfPolicy {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub all_qualifier: Option<String>,
     pub verdict: PostureVerdict,
+    /// Set when SPF evaluation ends in permerror (the record is then useless).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permerror: Option<SpfPermerror>,
+}
+
+/// Why SPF evaluation ends in `permerror` (RFC 7208 §2.6.7): receivers get no
+/// SPF result at all, whatever the record says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SpfPermerror {
+    /// More than one `v=spf1` record (RFC 7208 §4.5).
+    MultipleRecords,
+    /// More than 10 DNS-querying terms (RFC 7208 §4.6.4).
+    TooManyLookups,
+    /// The `redirect=` target could not be evaluated.
+    RedirectFailed,
+}
+
+impl SpfPermerror {
+    /// Short plain-English cause, for evidence lines.
+    pub fn describe(self) -> &'static str {
+        match self {
+            SpfPermerror::MultipleRecords => "more than one SPF record is published",
+            SpfPermerror::TooManyLookups => "SPF needs more than 10 DNS lookups",
+            SpfPermerror::RedirectFailed => "the SPF redirect= target could not be evaluated",
+        }
+    }
+}
+
+/// The domain's MX state as the posture lookup saw it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", content = "hosts", rename_all = "kebab-case")]
+pub enum MailExchangers {
+    /// MX hosts (lowercase, no trailing dot), in preference order.
+    Hosts(Vec<String>),
+    /// A null MX (RFC 7505): the domain accepts no mail.
+    Null,
+    /// No MX records: mail falls back to the domain's address (RFC 5321 §5.1).
+    Absent,
+    /// The MX lookup failed, so the state is not known.
+    #[default]
+    Unknown,
 }
 
 /// DMARC posture.
@@ -149,6 +195,10 @@ pub struct EmailPosture {
     pub mta_sts: MtaStsPolicy,
     pub bimi: BimiPolicy,
     pub dane: DanePolicy,
+    /// MX state, read once for DANE and reused by consumers (the audit's
+    /// "receives mail?" questions).
+    #[serde(default)]
+    pub mx: MailExchangers,
     /// Human-readable advisory findings (e.g. "domain is spoofable").
     pub notes: Vec<String>,
 }
@@ -408,6 +458,7 @@ fn unknown_spf(reason: &str) -> Assessed<SpfPolicy> {
             record: None,
             all_qualifier: None,
             verdict: PostureVerdict::Unknown,
+            permerror: None,
         },
         notes: vec![format!(
             "SPF lookup failed ({reason}) — SPF posture is unknown, not absent."
@@ -426,6 +477,7 @@ fn build_spf(apex_txt: &[String], follow_up: &SpfFollowUp) -> Assessed<SpfPolicy
                     record: None,
                     all_qualifier: None,
                     verdict: PostureVerdict::Absent,
+                    permerror: None,
                 },
                 notes: vec!["No SPF record — sending sources are undeclared.".to_string()],
             };
@@ -437,6 +489,7 @@ fn build_spf(apex_txt: &[String], follow_up: &SpfFollowUp) -> Assessed<SpfPolicy
                     record: None,
                     all_qualifier: None,
                     verdict: PostureVerdict::Weak,
+                    permerror: Some(SpfPermerror::MultipleRecords),
                 },
                 notes: vec![format!(
                     "{count} SPF records are published — SPF evaluation fails with permerror \
@@ -448,19 +501,22 @@ fn build_spf(apex_txt: &[String], follow_up: &SpfFollowUp) -> Assessed<SpfPolicy
     };
 
     // A policy whose verdict is decided before its `all` qualifier.
-    let settled = |verdict: PostureVerdict, note: String| Assessed {
-        policy: SpfPolicy {
-            present: true,
-            record: Some(record.to_string()),
-            all_qualifier: None,
-            verdict,
-        },
-        notes: vec![note],
-    };
+    let settled =
+        |verdict: PostureVerdict, permerror: Option<SpfPermerror>, note: String| Assessed {
+            policy: SpfPolicy {
+                present: true,
+                record: Some(record.to_string()),
+                all_qualifier: None,
+                verdict,
+                permerror,
+            },
+            notes: vec![note],
+        };
 
     if follow_up.lookups > MAX_SPF_LOOKUPS {
         return settled(
             PostureVerdict::Weak,
+            Some(SpfPermerror::TooManyLookups),
             format!(
                 "SPF needs more than {MAX_SPF_LOOKUPS} DNS lookups (include/a/mx/ptr/exists/\
                  redirect, counted through its includes) — evaluation fails with permerror \
@@ -481,6 +537,7 @@ fn build_spf(apex_txt: &[String], follow_up: &SpfFollowUp) -> Assessed<SpfPolicy
         (SpfTerminal::Redirect(_), Some(RedirectOutcome::Failed { target, reason })) => {
             return settled(
                 PostureVerdict::Weak,
+                Some(SpfPermerror::RedirectFailed),
                 format!(
                     "SPF redirect={target} could not be evaluated ({reason}) — receivers get \
                      no usable SPF result."
@@ -490,6 +547,7 @@ fn build_spf(apex_txt: &[String], follow_up: &SpfFollowUp) -> Assessed<SpfPolicy
         (SpfTerminal::Redirect(_), Some(RedirectOutcome::LookupFailed { target, reason })) => {
             return settled(
                 PostureVerdict::Unknown,
+                None,
                 format!(
                     "SPF redirect={target} lookup failed ({reason}) — the effective SPF policy \
                      is unknown."
@@ -506,6 +564,7 @@ fn build_spf(apex_txt: &[String], follow_up: &SpfFollowUp) -> Assessed<SpfPolicy
             verdict,
             all_qualifier,
             record: Some(record.to_string()),
+            permerror: None,
         },
         notes,
     }
@@ -998,6 +1057,35 @@ async fn discover_dmarc(dns: Dns<'_>, domain: &str, own: TxtLookup) -> DmarcDisc
     DmarcDiscovery::NotFound
 }
 
+/// Classifies an MX lookup. A single `.` exchange is a null MX (RFC 7505).
+fn mail_exchangers(mx: &Result<Vec<crate::dns::DnsRecord>>) -> MailExchangers {
+    let Ok(records) = mx else {
+        return MailExchangers::Unknown;
+    };
+    let mut hosts: Vec<(u16, String)> = records
+        .iter()
+        .filter_map(|r| match &r.data {
+            RecordData::MX {
+                preference,
+                exchange,
+            } => Some((
+                *preference,
+                exchange.trim_end_matches('.').to_ascii_lowercase(),
+            )),
+            _ => None,
+        })
+        .collect();
+    if hosts.is_empty() {
+        return MailExchangers::Absent;
+    }
+    if hosts.iter().any(|(_, h)| h.is_empty()) {
+        return MailExchangers::Null;
+    }
+    hosts.sort();
+    hosts.dedup_by(|a, b| a.1 == b.1);
+    MailExchangers::Hosts(hosts.into_iter().map(|(_, h)| h).collect())
+}
+
 /// SMTP DANE records per RFC 7672 §2.2: TLSA lives at `_25._tcp.<MX host>`,
 /// not at the mail domain. Probes the first [`MAX_DANE_MX_HOSTS`] exchanges
 /// (preference order) concurrently; a domain with no MX falls back to its
@@ -1094,6 +1182,8 @@ pub async fn lookup_email_posture(
         Box::pin(dns.resolve(&https_tlsa_name, RecordType::TLSA)),
     );
 
+    let mx_state = mail_exchangers(&mx);
+
     // Second round: steps that depend on a first-round answer (SPF redirect
     // and lookup count, DMARC inheritance, TLSA at the MX hosts), again
     // concurrently.
@@ -1120,6 +1210,7 @@ pub async fn lookup_email_posture(
         mta_sts,
         bimi,
         dane,
+        mx: mx_state,
         notes,
     })
 }
@@ -1292,6 +1383,54 @@ mod tests {
     }
 
     #[test]
+    fn spf_permerror_is_structured() {
+        let multiple = build_spf(
+            &strings(&["v=spf1 -all", "v=spf1 ~all"]),
+            &SpfFollowUp::default(),
+        );
+        assert_eq!(
+            multiple.policy.permerror,
+            Some(SpfPermerror::MultipleRecords)
+        );
+
+        let heavy = build_spf(
+            &strings(&["v=spf1 include:a.test -all"]),
+            &SpfFollowUp {
+                lookups: MAX_SPF_LOOKUPS + 1,
+                ..SpfFollowUp::default()
+            },
+        );
+        assert_eq!(heavy.policy.permerror, Some(SpfPermerror::TooManyLookups));
+
+        let fine = build_spf(&strings(&["v=spf1 -all"]), &SpfFollowUp::default());
+        assert_eq!(fine.policy.permerror, None);
+
+        let redirect = |outcome| SpfFollowUp {
+            redirect: Some(outcome),
+            ..SpfFollowUp::default()
+        };
+        let failed = build_spf(
+            &strings(&["v=spf1 redirect=_spf.example.test"]),
+            &redirect(RedirectOutcome::Failed {
+                target: "_spf.example.test".into(),
+                reason: "no SPF record".into(),
+            }),
+        );
+        assert_eq!(failed.policy.permerror, Some(SpfPermerror::RedirectFailed));
+
+        // A failed DNS lookup on the chain is unknown, not a permerror.
+        let unknown = build_spf(
+            &strings(&["v=spf1 redirect=_spf.example.test"]),
+            &redirect(RedirectOutcome::LookupFailed {
+                target: "_spf.example.test".into(),
+                reason: "timeout".into(),
+            }),
+        );
+        assert_eq!(unknown.policy.verdict, PostureVerdict::Unknown);
+        assert_eq!(unknown.policy.permerror, None);
+    }
+
+    #[test]
     fn spf_prefers_the_spf_record_among_txt() {
         // The apex TXT set carries a verification token AND the SPF record.
         let txts = strings(&[
@@ -1353,6 +1492,7 @@ mod tests {
 
     // --- End to end against the scripted mock DNS fixture ----------------
 
+    use hickory_resolver::proto::op::ResponseCode;
     use hickory_resolver::proto::rr::rdata as wire;
     use hickory_resolver::proto::rr::{Name, RData, RecordType as WireType};
 
@@ -1399,6 +1539,10 @@ mod tests {
         assert!(posture.dane.present, "{:?}", posture.dane);
         assert_eq!(posture.dane.records.len(), 1);
         assert_eq!(posture.dane.records[0].scope, "_25._tcp.mx2.mail.test");
+        assert_eq!(
+            posture.mx,
+            MailExchangers::Hosts(vec!["mx1.mail.test".into(), "mx2.mail.test".into()])
+        );
     }
 
     /// A domain with no MX is its own (implicit) MX: TLSA at the domain.
@@ -1414,6 +1558,26 @@ mod tests {
             .unwrap();
         assert_eq!(posture.dane.records.len(), 1, "{:?}", posture.dane);
         assert_eq!(posture.dane.records[0].scope, "_25._tcp");
+        assert_eq!(posture.mx, MailExchangers::Absent);
+    }
+
+    #[tokio::test]
+    async fn null_mx_and_failed_mx_are_distinguished() {
+        let port = spawn_mock_dns_fn(|qname, qtype| match (qname, qtype) {
+            ("null.test", WireType::MX) => MockReply::Answer(vec![mx(0, ".")]),
+            ("broken.test", WireType::MX) => MockReply::Rcode(ResponseCode::ServFail),
+            _ => MockReply::NoData,
+        })
+        .await;
+        let resolver = mock_dns_resolver_default(port);
+        let null = lookup_email_posture(&resolver, "null.test", None)
+            .await
+            .unwrap();
+        assert_eq!(null.mx, MailExchangers::Null);
+        let broken = lookup_email_posture(&resolver, "broken.test", None)
+            .await
+            .unwrap();
+        assert_eq!(broken.mx, MailExchangers::Unknown);
     }
 
     /// Regression: only `_dmarc.<domain>` was queried, so a subdomain
@@ -1572,10 +1736,7 @@ mod tests {
     /// DMARC/SPF — trivially spoofable". A failed lookup is Unknown.
     #[tokio::test]
     async fn failed_lookups_are_unknown_not_absent() {
-        let port = spawn_mock_dns_fn(|_, _| {
-            MockReply::Rcode(hickory_resolver::proto::op::ResponseCode::ServFail)
-        })
-        .await;
+        let port = spawn_mock_dns_fn(|_, _| MockReply::Rcode(ResponseCode::ServFail)).await;
         let posture = lookup_email_posture(&mock_dns_resolver_default(port), "down.test", None)
             .await
             .unwrap();

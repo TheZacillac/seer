@@ -43,24 +43,28 @@ fn derive_cert_warnings(
     days_until_expiry: i64,
 ) -> Vec<CertWarning> {
     let mut warnings = Vec::new();
-    let critical = |message: String| CertWarning {
+    let critical = |kind: CertWarningKind, message: String| CertWarning {
         severity: CertWarningSeverity::Critical,
+        kind,
         message,
     };
-    let warn = |message: String| CertWarning {
+    let warn = |kind: CertWarningKind, message: String| CertWarning {
         severity: CertWarningSeverity::Warning,
+        kind,
         message,
     };
 
     // Weak public key.
     if let (Some(kt), Some(bits)) = (leaf.key_type.as_deref(), leaf.key_bits) {
         match kt {
-            "RSA" if bits < RSA_MIN_KEY_BITS => warnings.push(critical(format!(
-                "RSA key size {bits} is below the {RSA_MIN_KEY_BITS}-bit minimum"
-            ))),
-            "EC" if bits < EC_MIN_KEY_BITS => warnings.push(critical(format!(
-                "EC key size {bits} is below the {EC_MIN_KEY_BITS}-bit minimum"
-            ))),
+            "RSA" if bits < RSA_MIN_KEY_BITS => warnings.push(critical(
+                CertWarningKind::WeakKey,
+                format!("RSA key size {bits} is below the {RSA_MIN_KEY_BITS}-bit minimum"),
+            )),
+            "EC" if bits < EC_MIN_KEY_BITS => warnings.push(critical(
+                CertWarningKind::WeakKey,
+                format!("EC key size {bits} is below the {EC_MIN_KEY_BITS}-bit minimum"),
+            )),
             _ => {}
         }
     }
@@ -69,15 +73,17 @@ fn derive_cert_warnings(
     if let Some(sig) = leaf.signature_algorithm.as_deref() {
         let lower = sig.to_lowercase();
         if lower.contains("sha-1") || lower.contains("sha1") || lower.contains("md5") {
-            warnings.push(critical(format!(
-                "Certificate uses deprecated signature algorithm: {sig}"
-            )));
+            warnings.push(critical(
+                CertWarningKind::DeprecatedSignature,
+                format!("Certificate uses deprecated signature algorithm: {sig}"),
+            ));
         }
     }
 
     // Self-signed (issuer equals subject).
     if leaf.subject == leaf.issuer {
         warnings.push(warn(
+            CertWarningKind::SelfSigned,
             "Certificate is self-signed (issuer equals subject)".to_string(),
         ));
     }
@@ -85,30 +91,34 @@ fn derive_cert_warnings(
     // Leaf certificate marked as a CA (basic-constraints misuse).
     if leaf.is_ca {
         warnings.push(warn(
+            CertWarningKind::CaLeaf,
             "Leaf certificate is marked as a CA certificate".to_string(),
         ));
     }
 
     // Validity window.
     if days_until_expiry < 0 {
-        warnings.push(critical(format!(
-            "Certificate expired {} day(s) ago",
-            -days_until_expiry
-        )));
+        warnings.push(critical(
+            CertWarningKind::Expired,
+            format!("Certificate expired {} day(s) ago", -days_until_expiry),
+        ));
     } else if !is_valid {
         // Date-valid check failed but not past expiry → notBefore is future.
         warnings.push(critical(
+            CertWarningKind::NotYetValid,
             "Certificate is not yet valid (notBefore is in the future)".to_string(),
         ));
     } else if days_until_expiry <= CERT_EXPIRING_SOON_DAYS {
-        warnings.push(warn(format!(
-            "Certificate expires in {days_until_expiry} day(s)"
-        )));
+        warnings.push(warn(
+            CertWarningKind::ExpiringSoon,
+            format!("Certificate expires in {days_until_expiry} day(s)"),
+        ));
     }
 
     // Hostname mismatch.
     if !hostname_verified {
         warnings.push(critical(
+            CertWarningKind::HostnameMismatch,
             "Certificate does not match the requested hostname".to_string(),
         ));
     }
@@ -180,11 +190,36 @@ pub enum CertWarningSeverity {
     Warning,
 }
 
+/// What a [`CertWarning`] is about, so consumers (the security audit) can act
+/// on a warning without parsing its `message`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CertWarningKind {
+    /// RSA below 2048 bits or EC below 256 bits.
+    WeakKey,
+    /// SHA-1 or MD5 signature.
+    DeprecatedSignature,
+    /// Issuer equals subject.
+    SelfSigned,
+    /// Leaf marked as a CA certificate.
+    CaLeaf,
+    /// Past `notAfter`.
+    Expired,
+    /// Before `notBefore`.
+    NotYetValid,
+    /// Within the expiring-soon window.
+    ExpiringSoon,
+    /// SANs/CN do not match the requested host.
+    HostnameMismatch,
+}
+
 /// A single security-posture warning about a certificate.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CertWarning {
     /// How serious the finding is.
     pub severity: CertWarningSeverity,
+    /// What the warning is about.
+    pub kind: CertWarningKind,
     /// Human-readable description of the finding.
     pub message: String,
 }
@@ -436,7 +471,7 @@ fn parse_cert_detail(cert: &X509Certificate) -> Result<CertDetail> {
 }
 
 /// Extracts key type and size from a SubjectPublicKeyInfo.
-fn extract_key_info(spki: &SubjectPublicKeyInfo) -> (Option<String>, Option<u32>) {
+pub(crate) fn extract_key_info(spki: &SubjectPublicKeyInfo) -> (Option<String>, Option<u32>) {
     use x509_parser::public_key::PublicKey;
     let oid = &spki.algorithm.algorithm;
     let key_type = Some(oid_to_key_type(oid));
@@ -768,5 +803,53 @@ mod tests {
             build_report("victim.example".to_string(), presented, CaaPolicy::empty()).unwrap();
         assert!(report.hostname_verified);
         assert_eq!(report.san_names, ["203.0.113.7"]);
+    }
+
+    #[test]
+    fn warnings_carry_a_structured_kind() {
+        let leaf = CertDetail {
+            subject: "CN=self.test".into(),
+            issuer: "CN=self.test".into(),
+            valid_from: Utc::now() - chrono::Duration::days(400),
+            valid_until: Utc::now() - chrono::Duration::days(1),
+            serial_number: "01".into(),
+            signature_algorithm: Some("SHA-1 with RSA".into()),
+            is_ca: true,
+            key_type: Some("RSA".into()),
+            key_bits: Some(1024),
+        };
+        let kinds: Vec<CertWarningKind> = derive_cert_warnings(&leaf, false, false, -1)
+            .into_iter()
+            .map(|w| w.kind)
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                CertWarningKind::WeakKey,
+                CertWarningKind::DeprecatedSignature,
+                CertWarningKind::SelfSigned,
+                CertWarningKind::CaLeaf,
+                CertWarningKind::Expired,
+                CertWarningKind::HostnameMismatch,
+            ]
+        );
+    }
+
+    #[test]
+    fn not_yet_valid_and_expiring_soon_have_their_own_kinds() {
+        let leaf = CertDetail {
+            subject: "CN=a.test".into(),
+            issuer: "CN=CA".into(),
+            valid_from: Utc::now(),
+            valid_until: Utc::now(),
+            serial_number: "01".into(),
+            signature_algorithm: Some("SHA-256 with RSA".into()),
+            is_ca: false,
+            key_type: Some("RSA".into()),
+            key_bits: Some(2048),
+        };
+        let kind = |valid, days| derive_cert_warnings(&leaf, valid, true, days)[0].kind;
+        assert_eq!(kind(false, 10), CertWarningKind::NotYetValid);
+        assert_eq!(kind(true, 10), CertWarningKind::ExpiringSoon);
     }
 }

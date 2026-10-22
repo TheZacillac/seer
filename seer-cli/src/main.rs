@@ -389,6 +389,21 @@ enum Commands {
         /// Domain to audit
         domain: String,
     },
+    /// Graded security audit across email, web, TLS, DNS, takeover and registration
+    ///
+    /// Runs Seer's checks together (SPF/DMARC/DKIM/MTA-STS, security headers,
+    /// HTTP→HTTPS, security.txt, certificate and CAA, DNSSEC and delegation,
+    /// takeover, registrar locks and expiry) and grades each category A+–F.
+    /// A Critical finding caps the overall grade at F, a High at C. Exits 1
+    /// on any Critical finding, when no category could be graded, or when
+    /// the grade is below --fail-under.
+    Audit {
+        /// Domain to audit
+        domain: String,
+        /// Exit 1 when the overall grade is below this (A+, A, B, C, D, E, F)
+        #[arg(long, value_name = "GRADE")]
+        fail_under: Option<seer_core::grade::Letter>,
+    },
     /// Scan subdomains for takeover exposure, confirmed over HTTP
     ///
     /// Enumerates subdomains via Certificate Transparency logs, then checks
@@ -745,6 +760,7 @@ async fn execute_command(
         Commands::Caa { domain } => Query::Caa(domain),
         Commands::Posture { domain } => Query::Posture(domain),
         Commands::Headers { domain } => Query::Headers(domain),
+        Commands::Audit { domain, fail_under } => Query::Audit { domain, fail_under },
         Commands::Takeover { domain, hosts } => Query::Takeover { domain, hosts },
         Commands::Confusables { domain } => Query::Confusables(domain),
         Commands::Doctor => Query::Doctor,
@@ -901,6 +917,7 @@ fn cli_spinner(query: &Query) -> bool {
             | Query::Subdomains { .. }
             | Query::Drift { .. }
             | Query::Headers(_)
+            | Query::Audit { .. }
             | Query::Takeover { .. }
             | Query::Confusables(_)
             | Query::Diff(..)
@@ -979,6 +996,8 @@ fn exit_code(payload: &Payload) -> i32 {
         // Lame servers already veto in_sync; the explicit check keeps the
         // contract if that coupling ever changes.
         Payload::Delegation(d) => !d.in_sync || !d.lame.is_empty(),
+        // Core computes the gate: graded, no Critical, and >= --fail-under.
+        Payload::Audit(a) => !a.passed,
         // Not check-style, like dig: an answered query is a result whatever
         // its status (NXDOMAIN, SERVFAIL), and a trace reports where it
         // stopped. Failed queries are errors, which exit 1 on their own.
@@ -1303,6 +1322,22 @@ mod feature_suite_cli_tests {
             panic!("expected Delegation command");
         };
         assert_eq!(domain, "example.com");
+    }
+
+    #[test]
+    fn audit_requires_a_domain_and_parses_the_gate() {
+        use seer_core::grade::Letter;
+        assert!(Cli::try_parse_from(["seer", "audit"]).is_err());
+        let cli = Cli::try_parse_from(["seer", "audit", "example.com", "--fail-under", "A+"])
+            .expect("audit should parse");
+        let Some(Commands::Audit { domain, fail_under }) = cli.command else {
+            panic!("expected Audit command");
+        };
+        assert_eq!(domain, "example.com");
+        assert_eq!(fail_under, Some(Letter::APlus));
+        assert!(
+            Cli::try_parse_from(["seer", "audit", "example.com", "--fail-under", "Z"]).is_err()
+        );
     }
 
     #[test]
@@ -1700,12 +1735,34 @@ mod exit_code_tests {
         let lame = || {
             vec![seer_core::dns::LameNs {
                 host: "ns1.example.com".into(),
+                kind: seer_core::dns::LameKind::ErrorRcode,
                 reason: "REFUSED".into(),
             }]
         };
         assert_eq!(exit_code(&delegation(true, vec![])), 0);
         assert_eq!(exit_code(&delegation(false, vec![])), 1);
         assert_eq!(exit_code(&delegation(true, lame())), 1);
+    }
+
+    fn audit(passed: bool) -> Payload {
+        Payload::Audit(Box::new(seer_core::AuditReport {
+            domain: "example.com".into(),
+            host: "example.com".into(),
+            overall: None,
+            categories: vec![],
+            findings: vec![],
+            runs: vec![],
+            complete: true,
+            fail_under: None,
+            passed,
+        }))
+    }
+
+    /// The audit gate is computed in core (`passed`); the CLI only reads it.
+    #[test]
+    fn audit_exits_on_its_gate() {
+        assert_eq!(exit_code(&audit(true)), 0);
+        assert_eq!(exit_code(&audit(false)), 1);
     }
 
     #[test]

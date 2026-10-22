@@ -124,6 +124,11 @@ pub const SECTIONS: &[Section] = &[
                 "Audit HTTP security headers + cookie flags",
             ),
             cmd(
+                "audit",
+                "<domain>",
+                "Graded security audit (email, web, TLS, DNS, takeover, registration)",
+            ),
+            cmd(
                 "takeover",
                 "<domain> [--host <host>]...",
                 "Scan subdomains for takeover exposure",

@@ -180,6 +180,10 @@ pub fn parse_query(command: &str, parts: &[&str]) -> Result<Query, String> {
         "caa" => Query::Caa(arg()?),
         "posture" => Query::Posture(arg()?),
         "headers" => Query::Headers(arg()?),
+        "audit" => Query::Audit {
+            domain: arg()?,
+            fail_under: None,
+        },
         "takeover" => {
             let TakeoverArgs { domain, hosts } = parse_takeover_args(args)?;
             Query::Takeover { domain, hosts }

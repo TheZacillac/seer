@@ -30,6 +30,7 @@ import seer
         ("/caa/example.com", "caa", ("example.com",)),
         ("/posture/example.com", "posture", ("example.com",)),
         ("/headers/example.com", "headers", ("example.com",)),
+        ("/audit/example.com", "audit", ("example.com",)),
         ("/takeover/example.com", "takeover", ("example.com", 10)),
         ("/confusables/example.com", "confusables", ("example.com", 10)),
         ("/diff/example.com/example.org", "diff", ("example.com", "example.org")),

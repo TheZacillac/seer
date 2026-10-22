@@ -17,7 +17,7 @@ use seer_core::{
     rdap::RdapClient,
     status::StatusClient,
     whois::WhoisClient,
-    AvailabilityChecker, DomainDiffer, SeerError, SslChecker, SubdomainEnumerator,
+    Auditor, AvailabilityChecker, DomainDiffer, SeerError, SslChecker, SubdomainEnumerator,
 };
 use tokio::sync::watch;
 
@@ -306,6 +306,7 @@ static DELEGATION_CHECKER: LazyLock<DelegationChecker> = LazyLock::new(Delegatio
 static DNS_COMPARATOR: LazyLock<DnsComparator> = LazyLock::new(DnsComparator::new);
 static DNS_FOLLOWER: LazyLock<DnsFollower> = LazyLock::new(DnsFollower::new);
 static DOMAIN_DIFFER: LazyLock<DomainDiffer> = LazyLock::new(DomainDiffer::new);
+static AUDITOR: LazyLock<Auditor> = LazyLock::new(Auditor::new);
 
 /// Validate that a host is safe to connect to (not a reserved/loopback/private IP).
 ///
@@ -369,6 +370,10 @@ call_fn! {
     posture(domain: String) => seer_core::lookup_email_posture(&DNS_RESOLVER, &domain, None);
     headers(domain: String)
         => seer_core::audit_headers(&domain, seer_core::DEFAULT_HEADER_TIMEOUT);
+    /// Graded security audit across email, web, TLS, DNS, takeover and
+    /// registration. Returns the report as a dict; `passed` is the gate
+    /// (graded, no critical finding).
+    audit(domain: String) => AUDITOR.audit(&domain, seer_core::AuditOptions::default());
 }
 
 /// Look up RDAP data for an Autonomous System Number (0 to 4294967295).
@@ -1172,9 +1177,9 @@ fn _raise_retry_exhausted_for_test(kind: &str) -> PyResult<()> {
 mod _seer {
     #[pymodule_export]
     use super::{
-        _json_to_python_nested_for_test, _raise_retry_exhausted_for_test, all_tlds, availability,
-        bulk_availability, bulk_dig, bulk_info, bulk_lookup, bulk_propagation, bulk_ssl,
-        bulk_status, bulk_whois, caa, cancel_follow, confusables, delegation, diff, dig,
+        _json_to_python_nested_for_test, _raise_retry_exhausted_for_test, all_tlds, audit,
+        availability, bulk_availability, bulk_dig, bulk_info, bulk_lookup, bulk_propagation,
+        bulk_ssl, bulk_status, bulk_whois, caa, cancel_follow, confusables, delegation, diff, dig,
         dns_compare, dns_follow, dns_trace, dnssec, headers, info, lookup, nameserver_target,
         posture, propagation, rdap_asn, rdap_auto, rdap_domain, rdap_ip, record_types, ssl, status,
         subdomains, subdomains_classify, takeover, tld_info, validate_public_host, whois,

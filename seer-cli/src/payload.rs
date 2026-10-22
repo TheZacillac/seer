@@ -39,6 +39,7 @@ pub enum Payload {
     Drift(Box<seer_core::DriftReport>),
     Posture(Box<seer_core::EmailPosture>),
     Headers(Box<seer_core::HeaderReport>),
+    Audit(Box<seer_core::AuditReport>),
     Takeover(Box<seer_core::TakeoverReport>),
     Caa(Box<seer_core::CaaPolicy>),
     Confusables(Box<seer_core::ConfusableReport>),
@@ -79,6 +80,7 @@ impl Payload {
             Payload::Drift(_) => "drift",
             Payload::Posture(_) => "posture",
             Payload::Headers(_) => "headers",
+            Payload::Audit(_) => "audit",
             Payload::Takeover(_) => "takeover",
             Payload::Caa(_) => "caa",
             Payload::Confusables(_) => "confusables",
@@ -163,6 +165,7 @@ pub fn serialize(data: &Payload, format: OutputFormat) -> String {
         Payload::Drift(d) => fmt.format_drift(d),
         Payload::Posture(p) => fmt.format_posture(p),
         Payload::Headers(h) => fmt.format_headers(h),
+        Payload::Audit(a) => fmt.format_audit(a),
         Payload::Takeover(t) => fmt.format_takeover(t),
         Payload::Caa(c) => fmt.format_caa(c),
         Payload::Confusables(c) => fmt.format_confusables(c),
@@ -432,6 +435,7 @@ mod tests {
             issuer_match: None,
             iodef: vec![],
             wildcard_note: None,
+            lookup_failed: false,
             note: "no CAA policy found".into(),
         };
         let data = Payload::Caa(Box::new(policy));

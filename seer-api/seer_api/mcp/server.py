@@ -644,6 +644,18 @@ _TOOLS: dict[str, _Tool] = {
         _DOMAIN_SCHEMA,
         _single("headers"),
     ),
+    "seer_audit": _Tool(
+        "Graded security audit of a domain. Runs email (SPF, DMARC, DKIM selector probing, "
+        "MTA-STS, DANE, BIMI), web (security headers, cookies, HTTP-to-HTTPS redirect, "
+        "security.txt), TLS (certificate, CAA), DNS (DNSSEC, delegation), takeover (apex and "
+        "www) and registration (expiry, registrar locks) checks, and returns findings with "
+        "severity, evidence and remediation plus an A+ to F grade per category and overall. "
+        "A critical finding caps the overall grade at F, a high one at C. Checks that could "
+        "not run are listed as incomplete, never counted as failures.",
+        _DOMAIN_SCHEMA,
+        _single("audit"),
+        HEAVY_LIMIT,
+    ),
     "seer_takeover": _Tool(
         "Scan a domain's subdomains for takeover exposure. Enumerates via Certificate "
         "Transparency logs, then checks each host whose CNAME points at a takeover-prone "

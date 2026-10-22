@@ -7,7 +7,7 @@ look-alikes). Each router is mounted under its own prefix in ``main.py``.
 
 For most routes here the queried domain is a DNS/RDAP/WHOIS *question*, not a
 connect target, so — like ``dns.dns_lookup`` — they apply no API-layer SSRF
-guard. ``headers`` and ``takeover`` are the exceptions: they do connect to the
+guard. ``headers``, ``takeover`` and ``audit`` are the exceptions: they do connect to the
 queried host over HTTPS. They still apply no API-layer guard — seer-core
 resolves and vets every target itself and pins the validated addresses, so a
 second check here would add nothing but its own TOCTOU window. (``ssl`` and
@@ -181,6 +181,24 @@ async def headers(request: Request, domain: Domain):
     would only add a second resolution with its own TOCTOU window.
     """
     return await as_http(run_seer(seer.headers, domain), "Header audit failed")
+
+
+# --- audit ---------------------------------------------------------------
+
+audit_router = APIRouter()
+
+
+@audit_router.get("/{domain}")
+@limiter.limit(HEAVY_LIMIT)
+async def audit(request: Request, domain: Domain):
+    """Graded security audit across email, web, TLS, DNS, takeover, registration.
+
+    Roughly forty outbound requests per call (DNS, one HTTPS origin, the
+    registry), hence the heavy rate limit. Like ``headers`` it connects to the
+    queried host; seer-core resolves, vets and pins every target itself, so no
+    API-layer SSRF guard is added (it would only open a second TOCTOU window).
+    """
+    return await as_http(run_seer(seer.audit, domain), "Security audit failed")
 
 
 # --- takeover ------------------------------------------------------------

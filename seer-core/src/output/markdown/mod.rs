@@ -25,6 +25,7 @@ pub(super) use crate::rdap::RdapResponse;
 pub(super) use crate::status::StatusResponse;
 pub(super) use crate::whois::WhoisResponse;
 
+mod audit;
 mod delegation;
 mod diff;
 mod dig;
@@ -36,6 +37,17 @@ mod rdap;
 mod security;
 mod status;
 mod whois;
+
+/// `## title` and the blank line after it.
+pub(super) fn heading(title: String) -> Vec<String> {
+    vec![title, String::new()]
+}
+
+/// Appends a table header row and its delimiter row.
+pub(super) fn table_header(out: &mut Vec<String>, columns: &[&str]) {
+    out.push(format!("| {} |", columns.join(" | ")));
+    out.push(format!("|{}", " --- |".repeat(columns.len())));
+}
 
 /// Where escaped text lands, which decides what must be escaped.
 #[derive(Clone, Copy, PartialEq, Eq)]

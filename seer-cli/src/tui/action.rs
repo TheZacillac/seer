@@ -88,6 +88,7 @@ pub enum FetchReq {
     History,
     Subdomains(String),
     Headers(String),
+    Audit(String),
     Takeover(String),
 }
 
@@ -113,6 +114,7 @@ impl FetchReq {
             FetchReq::History => LensKey::History,
             FetchReq::Subdomains(_) => LensKey::Subdomains,
             FetchReq::Headers(_) => LensKey::Headers,
+            FetchReq::Audit(_) => LensKey::Audit,
             FetchReq::Takeover(_) => LensKey::Takeover,
         }
     }
@@ -145,6 +147,7 @@ impl FetchReq {
             | FetchReq::Tld(d)
             | FetchReq::Subdomains(d)
             | FetchReq::Headers(d)
+            | FetchReq::Audit(d)
             | FetchReq::Takeover(d) => d.clone(),
             FetchReq::RdapAsn(n) => format!("AS{n}"),
             FetchReq::Dns { domain, .. }
@@ -302,6 +305,8 @@ mod tests {
         assert_eq!(trace.target(), "x");
         assert_eq!(FetchReq::Tld(".com".into()).lens_key(), "tld");
         assert_eq!(FetchReq::Headers("x".into()).lens_key(), "headers");
+        assert_eq!(FetchReq::Audit("x".into()).lens_key(), "audit");
+        assert_eq!(FetchReq::Audit("x".into()).target(), "x");
         assert_eq!(FetchReq::Takeover("x".into()).lens_key(), "takeover");
     }
 

@@ -53,6 +53,9 @@ pub struct TimeoutConfig {
     /// enumeration). Separate from `http_secs`: CT aggregators routinely take
     /// tens of seconds to answer for a busy domain, far past a site probe.
     pub ct_secs: u64,
+    /// Overall deadline for one `seer audit` run, in seconds: every check
+    /// still running when it passes is reported incomplete.
+    pub audit_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -113,6 +116,7 @@ impl Default for TimeoutConfig {
             dns_secs: 5,
             http_secs: 10,
             ct_secs: 30,
+            audit_secs: 60,
         }
     }
 }
@@ -187,7 +191,7 @@ impl SeerConfig {
     /// concurrent connections. Timeouts of `0` would error every network call
     /// immediately. The bounds are per-protocol (a config file can't bypass
     /// them): concurrency 1–50; whois/rdap timeouts 1–300s; dns 1–60s;
-    /// http and CT 1–120s.
+    /// http and CT 1–120s; audit 10–300s.
     fn clamped(mut self) -> Self {
         self.bulk.concurrency = self.bulk.concurrency.clamp(1, 50);
         // A multi-day per-operation delay would stall bulk runs indefinitely;
@@ -198,6 +202,7 @@ impl SeerConfig {
         self.timeouts.dns_secs = self.timeouts.dns_secs.clamp(1, 60);
         self.timeouts.http_secs = self.timeouts.http_secs.clamp(1, 120);
         self.timeouts.ct_secs = self.timeouts.ct_secs.clamp(1, MAX_CT_SECS);
+        self.timeouts.audit_secs = self.timeouts.audit_secs.clamp(10, 300);
         self
     }
 
@@ -224,6 +229,11 @@ impl SeerConfig {
     /// Returns the Certificate Transparency log request timeout as a Duration.
     pub fn ct_timeout(&self) -> Duration {
         Duration::from_secs(self.timeouts.ct_secs)
+    }
+
+    /// Returns the overall `seer audit` deadline as a Duration.
+    pub fn audit_timeout(&self) -> Duration {
+        Duration::from_secs(self.timeouts.audit_secs)
     }
 
     /// Returns the inter-operation bulk rate-limit delay as a Duration.
@@ -310,6 +320,21 @@ concurrency = 20
         assert_eq!(config.dns_timeout(), Duration::from_secs(5));
         assert_eq!(config.http_timeout(), Duration::from_secs(10));
         assert_eq!(config.ct_timeout(), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn audit_timeout_defaults_and_is_clamped() {
+        let path = std::path::Path::new("~/.seer/config.toml");
+        assert_eq!(
+            SeerConfig::default().audit_timeout(),
+            Duration::from_secs(60)
+        );
+        let config = SeerConfig::parse_or_default("[timeouts]\naudit_secs = 90\n", path);
+        assert_eq!(config.audit_timeout(), Duration::from_secs(90));
+        let config = SeerConfig::parse_or_default("[timeouts]\naudit_secs = 1\n", path);
+        assert_eq!(config.audit_timeout(), Duration::from_secs(10));
+        let config = SeerConfig::parse_or_default("[timeouts]\naudit_secs = 9999\n", path);
+        assert_eq!(config.audit_timeout(), Duration::from_secs(300));
     }
 
     #[test]

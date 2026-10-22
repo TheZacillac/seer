@@ -1,0 +1,36 @@
+---
+source: seer-core/tests/format_snapshots.rs
+expression: human ().format_audit (& fixture_audit())
+---
+
+[1;95mSecurity audit: example.com[0m
+[37m───────────────────────────[0m
+[1;96mOverall[0m: [1;91mF[0m (72/100) [90m[capped by a critical finding][0m
+[1;96mCategories[0m: Email [1;93mC[0m  Web [1;93mB[0m  TLS [1;92mA+[0m  DNS [90m?[0m  Takeover [1;91mE[0m  Registration [1;92mA+[0m
+[1;96mCompleteness[0m: [1;93mincomplete — some checks did not finish (see below)[0m
+[1;96mGate[0m: fail under B — [1;91mfailed[0m
+
+[1;96mEmail[0m
+  [[1;91mHIGH[0m] No DMARC record [90m(email.dmarc.missing)[0m
+      fix: Publish _dmarc.
+  [[90mINFO[0m] No DKIM key found at common selectors [90m(email.dkim.none-found)[0m
+      evidence: [97mprobed 19 common selectors[0m
+
+[1;96mWeb[0m
+  [[1;93mMEDIUM[0m] No HSTS header [90m(web.hsts.missing)[0m
+      fix: Send HSTS.
+  [[90mLOW[0m] Server discloses software versions [90m(web.disclosure.banner)[0m
+      evidence: [97mserver: evil|row split[0m
+
+[1;96mTLS[0m
+  [[90mLOW[0m] No CAA policy [90m(tls.caa.missing)[0m
+
+[1;96mTakeover[0m
+  [[1;91mCRITICAL[0m] Subdomain can be taken over [90m(takeover.cname.vulnerable)[0m
+      host: [97mwww.example.com[0m
+      evidence: [97mGitHub Pages · x.github.io[0m
+      fix: Remove the CNAME.
+
+[1;96mNot run:[0m
+  dns.dnssec — incomplete: [90mDNS resolution failed[0m
+  web.upgrade — n/a: [90mnothing listens on port 80[0m
