@@ -37,6 +37,7 @@ pub mod headers;
 #[cfg(feature = "cli")]
 pub mod history;
 mod http;
+pub mod https_upgrade;
 #[cfg(feature = "cli")]
 pub mod logging;
 pub mod lookup;
