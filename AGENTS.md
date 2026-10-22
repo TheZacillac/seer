@@ -38,6 +38,7 @@ in `seer-core`. The other three parse input, call core and present results.
 | Registration | `lookup.rs` (RDAP-first, WHOIS fallback), `whois/` (client, `parsers/` table, `servers.rs` TLD map), `rdap/` (client, IANA bootstrap), `availability.rs`, `domain_info.rs`, `tld/` |
 | DNS | `dns/` — `resolver.rs` (`resolve()`, the record-list API everything else uses), `query.rs` + `transport.rs` (`query()`, dig's raw view), `trace.rs`, `propagation/`, `compare`, `follow`, DNSSEC, `delegation.rs` |
 | Probes | `ssl.rs` + `tls.rs` (inspection-only rustls), `status/`, `headers.rs`, `http.rs` (SSRF-guarded GET), `posture.rs` (SPF/DMARC/MTA-STS/BIMI/DANE), `caa.rs`, `takeover.rs`, `subdomains/` (CT logs), `confusables.rs` |
+| Assessment | `audit/` (finding model, scorer, `CHECKS` adapters), `grade.rs` (letter scale), `dkim.rs`, `security_txt.rs`, `https_upgrade.rs` |
 | Safety | `net.rs` (SSRF guards, `ipv4_first`, `connect_any`, `client_builder`), `validation.rs` (normalization), `psl.rs` |
 | Infra | `error.rs`, `config.rs`, `retry.rs`, `cache.rs`, `bulk/`, `logging.rs`, `fsutil.rs` (`~/.seer` stores), `doctor.rs`, `webhook.rs` |
 | CLI-only | `output/` (formatters), `colors.rs`, `history.rs`, `watchlist.rs`, `drift.rs`, `diff.rs` |
@@ -195,6 +196,10 @@ step). The tables:
 
 | What | Where |
 |------|-------|
+| Audit adapters | `audit::checks::CHECKS` |
+| Audit finding ids | each adapter's `IDS` (test-enforced unique) |
+| DKIM selectors | `dkim::DKIM_SELECTORS` (sorted, test-enforced) |
+| Letter-grade scale | `grade::Letter` |
 | Takeover provider fingerprints | `takeover::PROVIDERS` (also used by `subdomains/classify.rs`) |
 | Formatter methods | `with_report_methods!` in `output/mod.rs` |
 | Shared report / dig wording | `output/mod.rs`, `output::dig`, `output/diff_table.rs` |
@@ -252,7 +257,7 @@ step). The tables:
   everything else uses `resolve()`. NXDOMAIN/NODATA are `Ok` results there,
   and a referral is `referral_zone()`, never `is_nodata()`.
 - **Exit codes are a contract.** Check-style commands (status, avail,
-  dnssec, compare, drift, takeover, `subdomains --diff`, doctor, delegation)
+  dnssec, compare, drift, takeover, audit, `subdomains --diff`, doctor, delegation)
   exit 1 on failure; dig, headers and posture don't. All of it lives in
   `exit_code` + its table test.
 - **`--format` goes before the subcommand**; `--fields` implies `-q`;

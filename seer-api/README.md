@@ -103,6 +103,7 @@ Available only when `SEER_DOCS_ENABLED=true`:
 | `/caa/{domain}` | GET | CAA policy lookup |
 | `/posture/{domain}` | GET | Email/DNS security posture |
 | `/headers/{domain}` | GET | HTTP security header + cookie audit |
+| `/audit/{domain}` | GET | Graded security assessment across email, web, TLS, DNS, takeover and registration (`5/minute`) |
 | `/takeover/{domain}` | GET | Subdomain takeover exposure scan |
 | `/confusables/{domain}` | GET | Look-alike (typosquat) generation |
 | `/tld/{tld}` | GET | TLD info (WHOIS server, RDAP endpoint) |
@@ -173,12 +174,12 @@ from non-loopback origins are refused. `*` is rejected at startup.
 #### Rate Limiting
 
 Every REST route has its own fixed per-client limit (e.g. `5/minute` for
-`/takeover`, `/confusables` and `/dns/trace`), counted per route — requests
+`/audit`, `/takeover`, `/confusables` and `/dns/trace`), counted per route — requests
 for different domains on the same route share one budget, and an
 operation's `/bulk` and `/bulk/stream` routes share one budget between them.
 
 The expensive MCP tools carry the same limits as their REST routes
-(`seer_subdomains` gets `5/minute`), counted per client like REST — by
+(`seer_subdomains` and `seer_audit` get `5/minute`), counted per client like REST — by
 client IP over HTTP; the stdio server has one client.
 
 `SEER_RATE_LIMIT` sets the per-client limit for the MCP endpoint
@@ -239,7 +240,7 @@ Optional env vars:
 
 ### Available Tools
 
-All 32 tools, on both transports:
+All 33 tools, on both transports:
 
 | Tool | Description |
 |------|-------------|
@@ -263,6 +264,7 @@ All 32 tools, on both transports:
 | `seer_caa` | CAA policy lookup |
 | `seer_posture` | Email/DNS security posture |
 | `seer_headers` | HTTP security header + cookie audit (graded A+–F) |
+| `seer_audit` | Graded security assessment across email, web, TLS, DNS, takeover and registration (`5/minute`) |
 | `seer_takeover` | Subdomain takeover scan (HTTP-confirmed) |
 | `seer_confusables` | Look-alike (typosquat) generation |
 | `seer_tld_info` | TLD info (WHOIS server, RDAP endpoint) |

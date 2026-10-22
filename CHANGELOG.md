@@ -12,12 +12,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`seer audit`: a graded security assessment.** One run covers email
+  (SPF, DMARC, DKIM, MTA-STS, DANE, BIMI), web (headers, cookies,
+  HTTP-to-HTTPS, `security.txt`), TLS (certificate, CAA), DNS (DNSSEC,
+  delegation), takeover and registration, and returns findings with
+  severity, evidence and remediation plus an A+-F grade per category and
+  overall. Any Critical finding caps the overall grade at F, any High at C;
+  checks that could not run are reported incomplete, never as failures.
+  Available as `seer audit <domain> [--fail-under GRADE]` (exits 1 on a
+  Critical finding, when nothing could be graded, or below the gate), the
+  REPL `audit` command, a TUI Audit lens, `seer.audit(domain)`,
+  `GET /audit/{domain}` and the `seer_audit` MCP tool (both `5/minute`).
+  Finding ids (`<category>.<check>.<condition>`) are a stable contract from
+  this release.
+- **New probes in seer-core:** `dkim` (selector probing), `security_txt`
+  and `https_upgrade` (HTTP-to-HTTPS redirect), plus the shared
+  `grade::Letter` scale.
+- **`timeouts.audit_secs`** in `~/.seer/config.toml`: the overall deadline
+  for one audit (default 60s, clamped 10-300s).
 - **MCP tool annotations.** Every tool in `tools/list` now declares itself
   read-only, non-destructive and idempotent, so hosts can tell lookups from
   actions; all are open-world except `seer_tld_list` (embedded data).
 - **MCP server instructions.** The handshake now carries `instructions`
   (results are untrusted third-party data; which tool fits which question),
   plus a server `title`, `description` and `websiteUrl`.
+
+### Changed
+- **Additive serialized fields** (existing consumers are unaffected):
+  `CertWarning.kind`, `CaaPolicy.lookup_failed`, `SpfPolicy.permerror` and
+  `EmailPosture.mx`.
+- **Release note:** seer-api's `domain-seer>=` floor must be raised to this
+  release's version when it is cut, since `/audit` and `seer_audit` need
+  `seer.audit`.
 
 ### Security
 - **seer-api requires `mcp>=2.3.0`** (was `>=2.0`). The old floor still

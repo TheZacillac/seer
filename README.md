@@ -59,6 +59,7 @@ A high-performance, multi-interface domain utility suite — query WHOIS, RDAP, 
 - **SSL Chain Inspection** — full chain, SANs, key details, validity
 - **CAA Policy** — who may issue certs, vs. actual issuer
 - **Email Posture** — SPF, DMARC, MTA-STS, BIMI, and DANE checks
+- **Security Audit** — one graded A+–F assessment across email, web, TLS, DNS, takeover and registration, with a CI gate
 - **Look-alike Detection** — confusable/homoglyph domains
 - **Registration Drift** — diff live registration vs. a baseline
 - **Domain Watchlist** — monitor expiring certs and registrations, with optional webhook alerts
@@ -179,14 +180,14 @@ The **lens** sidebar covers every Seer capability, grouped, each pulling live da
 
 - **LOOKUP** — Overview · WHOIS · RDAP (Domain · IP · ASN) · Reverse DNS · Availability · TLD Info
 - **DNS** — Records (+ custom nameserver) · DNSSEC · Compare (two resolvers) · Trace (from the root servers) · Propagation · Follow (live monitor)
-- **SECURITY** — SSL / Cert · Status · Subdomains · HTTP Headers · Takeover
+- **SECURITY** — SSL / Cert · Status · Subdomains · HTTP Headers · Takeover · Audit
 - **POWER** — Diff · Bulk (streaming + CSV export) · Watchlist · History
 
 **Keys:** `j`/`k` move · `1`–`9` jump to a lens · `Tab` focus nav⇄pane · `[` `]` sub-tabs · `r` raw output (json/yaml/markdown; `PgUp`/`PgDn` scroll) · `y` copy · `/` look up a domain · `:` command · `?` help · `:q` quit. In-pane: switchers (TLD, nameserver, Compare resolvers, Bulk op) and editable fields (Diff's 2nd domain, Follow interval/count, Bulk file path).
 
-Subdomains and Takeover query CT logs and probe hosts, so they run only when you press `↵` on them (or use their `:` command), never just by moving onto them. Removing a watched domain (`d`) and clearing history (`c`) ask for a second press.
+Subdomains, Takeover and Audit query CT logs and probe hosts, so they run only when you press `↵` on them (or use their `:` command), never just by moving onto them. Removing a watched domain (`d`) and clearing history (`c`) ask for a second press.
 
-**Commands (`:`):** `lookup`, `whois`, `rdap <domain|ip|AS####>`, `dig [@server] <name> [type] [+trace]`, `ssl`, `status`, `headers`, `takeover`, `reverse <ip>`, `tld <.tld>`, `compare <domain> <nsA> <nsB>`, `diff <a> <b>`, `set output <human|json|yaml|markdown>`, `theme <frappe|latte>`, `copy`, `q`.
+**Commands (`:`):** `lookup`, `whois`, `rdap <domain|ip|AS####>`, `dig [@server] <name> [type] [+trace]`, `ssl`, `status`, `headers`, `takeover`, `audit`, `reverse <ip>`, `tld <.tld>`, `compare <domain> <nsA> <nsB>`, `diff <a> <b>`, `set output <human|json|yaml|markdown>`, `theme <frappe|latte>`, `copy`, `q`.
 
 The startup theme comes from `[tui] theme` in `~/.seer/config.toml` (`"frappe"` — the default — or `"latte"`; unknown names fall back to Frappé). Switch live with `:theme latte`.
 
@@ -237,6 +238,8 @@ seer ssl example.com
 seer caa example.com              # CAA policy vs. actual cert issuer
 seer posture example.com          # SPF / DMARC / MTA-STS email posture
 seer headers example.com          # HTTP security headers + cookie flags, graded A+-F
+seer audit example.com            # Graded security assessment across every category
+seer audit example.com --fail-under B   # Exit 1 below a B (CI gate)
 
 # Security intel
 seer confusables example.com      # Look-alike / homoglyph domains
@@ -295,6 +298,40 @@ seer mangen ./man                 # Write seer.1 + one page per subcommand
 ```
 
 `seer watch --webhook` (or `webhook_url` under `[watch]` in `~/.seer/config.toml` — the flag wins) POSTs the check-all report as JSON. Delivery is best-effort: a failed POST prints a stderr warning and never changes the exit code, and the URL passes the same SSRF guard as every other outbound request.
+
+### Security Audit
+
+`seer audit` runs one non-intrusive, graded assessment of a domain and turns
+the results of the individual probes into findings with a severity, the
+evidence behind it and a remediation hint:
+
+- **Email** — SPF, DMARC, DKIM (common selectors are probed), MTA-STS, DANE, BIMI
+- **Web** — security headers, cookie flags, HTTP-to-HTTPS redirect, `security.txt`
+- **TLS** — certificate chain and expiry, CAA
+- **DNS** — DNSSEC, delegation health
+- **Takeover** — dangling-CNAME exposure of the apex and `www`
+- **Registration** — expiry and registrar locks
+
+Each category starts at 100 and loses 60 / 25 / 10 / 3 points per Critical /
+High / Medium / Low finding; the overall score is the weighted average (Email,
+Web and TLS 20 each, DNS and Takeover 15, Registration 10) and maps to an
+A+–F letter. Any Critical finding caps the overall grade at F and any High at
+C. A check that could not run (timeout, unreachable source) is reported as
+incomplete and is never counted as a failure.
+
+```bash
+seer audit example.com                    # Findings + per-category grades
+seer audit example.com --fail-under B     # CI gate: exit 1 below a B
+seer --format json audit example.com      # Machine-readable report
+```
+
+`seer audit` exits `1` on any Critical finding, when nothing could be graded,
+or when the overall grade is below `--fail-under`. The JSON report carries
+`overall`, `categories`, `findings`, `runs` (every check's outcome), `complete`
+(false if any check was incomplete) and `passed` (the gate result). Finding
+ids (`<category>.<check>.<condition>`) are stable, so they are safe to match
+on in scripts. The overall deadline is `timeouts.audit_secs` (see
+[Timeouts](#timeouts)).
 
 ### DNS Queries
 
@@ -402,6 +439,7 @@ Check commands exit `1` on a negative result even when the command itself ran fi
 | `seer dnssec` | The zone's status is anything other than `signed` (i.e. `unsigned`, `partial`, or `misconfigured`) |
 | `seer compare` | The two nameservers give different answers (response code, CNAME chain or record set) |
 | `seer delegation` | The parent's delegation NS set and the zone's own NS RRset are out of sync, or any delegated server answers lamely |
+| `seer audit` | Any **Critical** finding, nothing could be graded, or the overall grade is below `--fail-under` |
 | `seer takeover` | Any host is `vulnerable` or `potential` (a host that could not be checked is `inconclusive` and does not fail the scan) |
 | `seer doctor` | Any check reports **FAIL**. `WARN` (degraded but usable, e.g. a malformed config file running on defaults) still exits `0` |
 | `seer drift` | Material drift is found vs. the stored baseline (a first run with no baseline exits `0`) |
@@ -473,6 +511,7 @@ caa    = seer.caa("example.com")
 # Security intel
 posture     = seer.posture("example.com")        # SPF / DMARC / MTA-STS
 headers     = seer.headers("example.com")        # HTTP security headers, graded A+-F
+audit       = seer.audit("example.com")          # Graded security assessment (all categories)
 takeover    = seer.takeover("example.com")       # Subdomain takeover scan
 confusables = seer.confusables("example.com")    # Look-alike domains
 
@@ -581,7 +620,7 @@ seer-api   # Starts on http://127.0.0.1:8000 (loopback-only by default)
 ```
 
 Each lookup is a `GET` endpoint (`/lookup/{domain}`, `/dns/{domain}/{record_type}`,
-`/dns/trace/{domain}`, `/ssl/{domain}`, `/takeover/{domain}`, …). `lookup`,
+`/dns/trace/{domain}`, `/ssl/{domain}`, `/audit/{domain}`, `/takeover/{domain}`, …). `lookup`,
 `whois`, `dns`, `propagation`, `status`, `ssl`, `availability`, and `info`
 also accept a `POST …/bulk` domain list, and all but `availability` and
 `info` can stream bulk results as Server-Sent Events from `…/bulk/stream`.
@@ -638,7 +677,7 @@ eval "$(seer generate-key --export)"
 SEER_API_KEY=$KEY SEER_HOST=0.0.0.0 seer-api
 ```
 
-**32 tools:** one per lookup (`seer_lookup`, `seer_dig`, `seer_dns_trace`,
+**33 tools:** one per lookup (`seer_lookup`, `seer_dig`, `seer_dns_trace`,
 `seer_ssl`, `seer_takeover`, …) plus bulk variants (`seer_bulk_status`, …).
 The full tool list and the Claude Desktop configuration are in
 [seer-api/README.md](seer-api/README.md#available-tools).
