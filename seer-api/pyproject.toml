@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "seer-api"
-version = "0.53.1"
+version = "0.54.0"
 description = "FastAPI server and MCP integration for Seer domain utilities"
 readme = "README.md"
 license = { text = "MIT" }
@@ -46,7 +46,7 @@ dependencies = [
     # and the typed exceptions (`seer.SeerError` and its subclasses, v0.52.0).
     # A lower resolution installs cleanly and then AttributeErrors, so bump
     # this whenever a new binding is used.
-    "domain-seer>=0.52.0",
+    "domain-seer>=0.54.0",
     "slowapi>=0.1.9",
     # Imported directly (the /mcp and per-tool MCP rate limiters; the raw
     # /mcp route, middleware and SSE responses), so declared rather than left

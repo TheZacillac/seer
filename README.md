@@ -576,7 +576,7 @@ if cert := status.get("certificate"):
 
 ```toml
 [dependencies]
-seer-core = "0.53"
+seer-core = "0.54"
 tokio = { version = "1", features = ["full"] }
 ```
 
