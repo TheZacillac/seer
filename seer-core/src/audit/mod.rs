@@ -231,6 +231,62 @@ mod tests {
         assert!(report.complete);
     }
 
+    #[test]
+    fn json_shape_is_the_contract() {
+        let mut output = checks::CheckOutput::default();
+        output.ran(
+            "web.headers",
+            Category::Web,
+            vec![Finding::new(
+                "web.hsts.missing",
+                Category::Web,
+                Severity::Medium,
+                "example.com",
+                "No HSTS header",
+            )],
+        );
+        output.incomplete("tls.caa", Category::Tls, "CAA lookup failed");
+        output.not_applicable("email.bimi", Category::Email, "domain receives no mail");
+        let report = AuditReport::assemble(
+            "example.com".into(),
+            "example.com".into(),
+            output,
+            Some(Letter::APlus),
+        );
+        let json = serde_json::to_value(&report).unwrap();
+
+        // `status` is kebab-case and `reason` is flattened beside it.
+        assert_eq!(
+            json["runs"],
+            serde_json::json!([
+                {"check": "web.headers", "category": "web", "status": "ran"},
+                {"check": "tls.caa", "category": "tls", "status": "incomplete",
+                 "reason": "CAA lookup failed"},
+                {"check": "email.bimi", "category": "email", "status": "not-applicable",
+                 "reason": "domain receives no mail"},
+            ])
+        );
+        let finding = &json["findings"][0];
+        assert_eq!(finding["id"], "web.hsts.missing");
+        assert_eq!(finding["category"], "web");
+        assert_eq!(finding["severity"], "medium");
+        assert_eq!(json["fail_under"], "A+");
+
+        for category in Category::ALL {
+            assert_eq!(serde_json::json!(category), category.as_str());
+        }
+        for severity in [
+            Severity::Info,
+            Severity::Low,
+            Severity::Medium,
+            Severity::High,
+            Severity::Critical,
+        ] {
+            assert_eq!(serde_json::json!(severity), severity.as_str());
+        }
+        assert_eq!(Category::ALL.iter().map(|c| c.weight()).sum::<u32>(), 100);
+    }
+
     #[tokio::test]
     #[ignore = "live network"]
     async fn live_audit_of_a_real_domain() {

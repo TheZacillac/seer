@@ -1404,6 +1404,30 @@ mod tests {
 
         let fine = build_spf(&strings(&["v=spf1 -all"]), &SpfFollowUp::default());
         assert_eq!(fine.policy.permerror, None);
+
+        let redirect = |outcome| SpfFollowUp {
+            redirect: Some(outcome),
+            ..SpfFollowUp::default()
+        };
+        let failed = build_spf(
+            &strings(&["v=spf1 redirect=_spf.example.test"]),
+            &redirect(RedirectOutcome::Failed {
+                target: "_spf.example.test".into(),
+                reason: "no SPF record".into(),
+            }),
+        );
+        assert_eq!(failed.policy.permerror, Some(SpfPermerror::RedirectFailed));
+
+        // A failed DNS lookup on the chain is unknown, not a permerror.
+        let unknown = build_spf(
+            &strings(&["v=spf1 redirect=_spf.example.test"]),
+            &redirect(RedirectOutcome::LookupFailed {
+                target: "_spf.example.test".into(),
+                reason: "timeout".into(),
+            }),
+        );
+        assert_eq!(unknown.policy.verdict, PostureVerdict::Unknown);
+        assert_eq!(unknown.policy.permerror, None);
     }
 
     #[test]

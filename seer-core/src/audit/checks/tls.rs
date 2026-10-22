@@ -228,38 +228,50 @@ mod tests {
             ],
             "ExpiringSoon is graded from days_until_expiry, not the warning"
         );
+        let severities: Vec<Severity> = out.findings.iter().map(|f| f.severity).collect();
+        assert_eq!(
+            severities,
+            vec![
+                Severity::Critical,
+                Severity::Critical,
+                Severity::High,
+                Severity::High,
+                Severity::High,
+                Severity::Medium,
+                Severity::Critical,
+            ]
+        );
     }
 
     #[test]
     fn expiry_windows() {
         let mut r = report();
         r.days_until_expiry = 10;
-        assert_eq!(
-            ids(&assess("example.com", &r)),
-            vec!["tls.cert.expiring-14d"]
-        );
+        let out = assess("example.com", &r);
+        assert_eq!(ids(&out), vec!["tls.cert.expiring-14d"]);
+        assert_eq!(out.findings[0].severity, Severity::High);
         r.days_until_expiry = 20;
-        assert_eq!(
-            ids(&assess("example.com", &r)),
-            vec!["tls.cert.expiring-30d"]
-        );
+        let out = assess("example.com", &r);
+        assert_eq!(ids(&out), vec!["tls.cert.expiring-30d"]);
+        assert_eq!(out.findings[0].severity, Severity::Medium);
     }
 
     #[test]
     fn caa_missing_mismatch_and_unknown() {
         let mut r = report();
         r.caa = Some(CaaPolicy::empty());
-        assert_eq!(ids(&assess("example.com", &r)), vec!["tls.caa.missing"]);
+        let out = assess("example.com", &r);
+        assert_eq!(ids(&out), vec!["tls.caa.missing"]);
+        assert_eq!(out.findings[0].severity, Severity::Low);
 
         r.caa = Some(CaaPolicy {
             has_policy: true,
             issuer_match: Some(IssuerCaaMatch::Mismatch),
             ..CaaPolicy::empty()
         });
-        assert_eq!(
-            ids(&assess("example.com", &r)),
-            vec!["tls.caa.issuer-not-listed"]
-        );
+        let out = assess("example.com", &r);
+        assert_eq!(ids(&out), vec!["tls.caa.issuer-not-listed"]);
+        assert_eq!(out.findings[0].severity, Severity::Info);
 
         r.caa = Some(CaaPolicy {
             lookup_failed: true,

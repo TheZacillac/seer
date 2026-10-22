@@ -1325,6 +1325,22 @@ mod feature_suite_cli_tests {
     }
 
     #[test]
+    fn audit_requires_a_domain_and_parses_the_gate() {
+        use seer_core::grade::Letter;
+        assert!(Cli::try_parse_from(["seer", "audit"]).is_err());
+        let cli = Cli::try_parse_from(["seer", "audit", "example.com", "--fail-under", "A+"])
+            .expect("audit should parse");
+        let Some(Commands::Audit { domain, fail_under }) = cli.command else {
+            panic!("expected Audit command");
+        };
+        assert_eq!(domain, "example.com");
+        assert_eq!(fail_under, Some(Letter::APlus));
+        assert!(
+            Cli::try_parse_from(["seer", "audit", "example.com", "--fail-under", "Z"]).is_err()
+        );
+    }
+
+    #[test]
     fn headers_requires_a_domain() {
         assert!(Cli::try_parse_from(["seer", "headers"]).is_err());
         let cli =
