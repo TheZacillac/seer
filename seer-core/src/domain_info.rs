@@ -104,6 +104,16 @@ pub(crate) fn has_status_key(statuses: &[String], key: &str) -> bool {
     statuses.iter().any(|s| normalize_status_key(s) == key)
 }
 
+/// Whether the registry speaks EPP lock vocabulary: some status normalizes
+/// to a `…prohibited` key (`clientTransferProhibited`,
+/// `serverUpdateProhibited`, …). Without one, a missing lock is no evidence
+/// of an unlocked domain — the registry may not publish locks at all.
+pub(crate) fn has_lock_vocabulary(statuses: &[String]) -> bool {
+    statuses
+        .iter()
+        .any(|s| normalize_status_key(s).ends_with("prohibited"))
+}
+
 /// Decodes a domain status code (EPP or RDAP form) into a plain-English
 /// description, or `None` if the code is unrecognized.
 pub fn describe_epp_status(code: &str) -> Option<&'static str> {

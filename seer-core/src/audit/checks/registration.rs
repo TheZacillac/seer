@@ -1,12 +1,14 @@
 //! Registration hygiene from the smart lookup: expiry, registrar locks and
-//! registration age. No new traffic. Registries that publish no EPP status
-//! codes give no evidence about locks, so none are reported for them.
+//! registration age. No new traffic. Lock findings are reported only for
+//! registries that demonstrably speak EPP lock vocabulary (some status is a
+//! `…Prohibited` code); for the rest (`ok`/`active` only, a ccTLD's own
+//! words) a missing lock is no evidence.
 
 use futures::future::BoxFuture;
 
 use super::{AuditContext, CheckOutput, CheckSpec};
 use crate::audit::finding::{Category, Finding, Severity};
-use crate::domain_info::{has_status_key, DomainInfo, ExpiryStatus};
+use crate::domain_info::{has_lock_vocabulary, has_status_key, DomainInfo, ExpiryStatus};
 use crate::lookup::LookupResult;
 
 const CHECK: &str = "registration";
@@ -116,8 +118,9 @@ pub(crate) fn findings(domain: &str, reg: &Registration<'_>) -> Vec<Finding> {
         _ => {}
     }
 
-    // A registry that publishes no status codes says nothing about locks.
-    if !reg.statuses.is_empty() {
+    // A registry that publishes no `*Prohibited` status says nothing about
+    // locks: it may not use (or publish) EPP lock statuses at all.
+    if has_lock_vocabulary(reg.statuses) {
         let locked = |client: &str, server: &str| {
             has_status_key(reg.statuses, client) || has_status_key(reg.statuses, server)
         };
@@ -231,17 +234,32 @@ mod tests {
 
     #[test]
     fn missing_locks_are_flagged() {
-        let statuses = vec!["ok".to_string()];
+        let statuses = vec!["ok".to_string(), "clientDeleteProhibited".to_string()];
         let f = findings("example.com", &reg(&statuses));
         assert_eq!(
             ids(&f),
-            vec![
-                "registration.lock.transfer",
-                "registration.lock.update",
-                "registration.lock.delete"
-            ]
+            vec!["registration.lock.transfer", "registration.lock.update"]
         );
         assert_eq!(f[0].severity, Severity::Medium);
+        assert_eq!(f[1].severity, Severity::Low);
+    }
+
+    #[test]
+    fn no_lock_findings_without_epp_lock_vocabulary() {
+        // Registries that never publish a `*Prohibited` status (plain "ok",
+        // "active", a ccTLD's own words, FRED prose) say nothing about locks.
+        for status in [
+            "active",
+            "connect",
+            "ok",
+            "Sponsoring registrar change forbidden",
+        ] {
+            let statuses = vec![status.to_string()];
+            assert!(
+                findings("example.com", &reg(&statuses)).is_empty(),
+                "{status}"
+            );
+        }
     }
 
     #[test]
@@ -275,7 +293,7 @@ mod tests {
 
     #[test]
     fn every_emitted_id_is_declared() {
-        let statuses = vec!["ok".to_string()];
+        let statuses = vec!["ok".to_string(), "clientRenewProhibited".to_string()];
         let f = findings(
             "example.com",
             &Registration {
