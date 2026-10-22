@@ -10,6 +10,7 @@
 mod dkim;
 mod email;
 mod registration;
+mod web;
 
 use std::time::Duration;
 
@@ -97,11 +98,18 @@ pub(crate) struct CheckSpec {
 }
 
 /// Every adapter the audit runs.
-pub(crate) static CHECKS: &[CheckSpec] = &[registration::SPEC, email::SPEC, dkim::SPEC];
+pub(crate) static CHECKS: &[CheckSpec] = &[
+    registration::SPEC,
+    email::SPEC,
+    dkim::SPEC,
+    web::HEADERS,
+    web::UPGRADE,
+    web::SECURITY_TXT,
+];
 
 /// Every finding id any adapter can emit.
 pub(crate) fn all_ids() -> Vec<&'static str> {
-    let lists: &[&[&str]] = &[registration::IDS, email::IDS, dkim::IDS];
+    let lists: &[&[&str]] = &[registration::IDS, email::IDS, dkim::IDS, web::IDS];
     lists.iter().flat_map(|ids| ids.iter().copied()).collect()
 }
 
