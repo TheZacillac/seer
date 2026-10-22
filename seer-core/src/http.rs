@@ -114,12 +114,13 @@ pub(crate) struct FetchedResponse {
 }
 
 /// Why a guarded request failed, split so a probe can tell "the connection
-/// failed" (refused, unreachable, connect timeout, TLS handshake) from
-/// everything else (SSRF refusal, bad URL, redirect loop, body timeout),
-/// which is an unknown, not a negative result.
+/// failed" (refused, unreachable, TLS handshake failure) from everything else
+/// (SSRF refusal, bad URL, redirect loop, any timeout), which is an unknown,
+/// not a negative result. A timeout is [`SendError::Other`]: it may be packet
+/// loss, so it proves nothing about the host.
 #[derive(Debug)]
 pub(crate) enum SendError {
-    /// The TCP/TLS connect failed.
+    /// The connection failed: refused, unreachable, or a TLS handshake failure.
     Connect(SeerError),
     /// Any other failure.
     Other(SeerError),
@@ -194,14 +195,6 @@ impl GuardedFetcher {
         Ok(FetchedResponse { head, body })
     }
 
-    /// [`GuardedFetcher::get`] for callers that grade only the status and
-    /// headers: the body is never read, so one that stalls or resets cannot
-    /// fail the fetch.
-    pub async fn get_head(&self, url: &str) -> Result<ResponseHead> {
-        let (response, redirects) = self.send(url).await?;
-        Ok(ResponseHead::of(&response, redirects))
-    }
-
     /// The guarded request half of [`GuardedFetcher::get`]: returns the final
     /// response (a 3xx only when it carries no `Location`) with its body still
     /// unread, plus the number of hops followed. For callers that want the
@@ -213,8 +206,10 @@ impl GuardedFetcher {
         Ok((response, chain.len().saturating_sub(1)))
     }
 
-    /// [`GuardedFetcher::get_head`] that also reports the URLs attempted and
-    /// keeps the connect/other split. See [`Traced`].
+    /// [`GuardedFetcher::get_traced`] for callers that grade only the status
+    /// and headers: the body is never read, so one that stalls or resets
+    /// cannot fail the fetch. Also reports the URLs attempted and keeps the
+    /// connect/other split. See [`Traced`].
     pub async fn get_head_traced(&self, url: &str) -> Traced<ResponseHead> {
         let mut chain = Vec::new();
         let result = self
@@ -514,18 +509,19 @@ mod tests {
                 .await;
             let head = GuardedFetcher::new()
                 .allowing_private_hosts()
-                .get_head(&format!("{}/s{status}", server.uri()))
+                .get_head_traced(&format!("{}/s{status}", server.uri()))
                 .await
+                .result
                 .unwrap();
             assert_eq!(head.status, status);
             assert_eq!(head.redirects, 0);
         }
     }
 
-    /// `get_head` never reads the body, so one that never arrives cannot
+    /// `get_head_traced` never reads the body, so one that never arrives cannot
     /// fail the fetch.
     #[tokio::test]
-    async fn get_head_does_not_wait_for_the_body() {
+    async fn get_head_traced_does_not_wait_for_the_body() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -543,7 +539,11 @@ mod tests {
         let fetcher = GuardedFetcher::new()
             .allowing_private_hosts()
             .with_timeout(Duration::from_millis(500));
-        let head = fetcher.get_head(&format!("http://{addr}/")).await.unwrap();
+        let head = fetcher
+            .get_head_traced(&format!("http://{addr}/"))
+            .await
+            .result
+            .unwrap();
         assert_eq!(head.status, 200);
         assert_eq!(head.header("x-probe"), Some("1"));
     }
@@ -715,6 +715,21 @@ mod tests {
             traced.result.err()
         );
         assert_eq!(traced.chain.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_ssrf_refused_first_hop_is_other_with_a_one_url_chain() {
+        // A production fetcher (no `allowing_private_hosts`) refuses loopback
+        // before any connect.
+        let traced = GuardedFetcher::new()
+            .get_head_traced("http://127.0.0.1/")
+            .await;
+        assert!(
+            matches!(traced.result, Err(SendError::Other(_))),
+            "{:?}",
+            traced.result.err()
+        );
+        assert_eq!(traced.chain, vec!["http://127.0.0.1/".to_string()]);
     }
 
     #[tokio::test]
