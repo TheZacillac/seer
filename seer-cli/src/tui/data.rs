@@ -98,6 +98,10 @@ fn to_query(req: FetchReq) -> Result<Query, Store> {
             record: false,
         },
         FetchReq::Headers(d) => Query::Headers(d),
+        FetchReq::Audit(d) => Query::Audit {
+            domain: d,
+            fail_under: None,
+        },
         // No host list: enumerate via CT logs first, like `seer takeover`.
         FetchReq::Takeover(d) => Query::Takeover {
             domain: d,

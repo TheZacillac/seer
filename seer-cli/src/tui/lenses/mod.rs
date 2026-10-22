@@ -1,9 +1,10 @@
-//! Registry of the 18 lenses shown in the left nav, grouped LOOKUP / DNS /
+//! Registry of the 19 lenses shown in the left nav, grouped LOOKUP / DNS /
 //! SECURITY / POWER. Each `LENSES` entry also carries the lens's behaviour
 //! flags — `interactive` (↵ focuses it without rows), `filter` (which tabs
 //! take `/`) and `heavy` (an active scan, run only on request) — so `App`
 //! reads them here instead of keeping its own lists of keys.
 
+pub mod audit;
 pub mod avail;
 pub mod bulk;
 pub mod compare;
@@ -46,6 +47,7 @@ pub enum LensKey {
     Status,
     Subdomains,
     Headers,
+    Audit,
     Takeover,
     Diff,
     Bulk,
@@ -70,6 +72,7 @@ impl LensKey {
             LensKey::Status => "status",
             LensKey::Subdomains => "subdomains",
             LensKey::Headers => "headers",
+            LensKey::Audit => "audit",
             LensKey::Takeover => "takeover",
             LensKey::Diff => "diff",
             LensKey::Bulk => "bulk",
@@ -212,6 +215,7 @@ static LENSES: &[Lens] = &[
         .filter(Filter::All)
         .heavy(),
     lens(LensKey::Headers, "HTTP Headers", "☰", "SECURITY"),
+    lens(LensKey::Audit, "Audit", "◉", "SECURITY").heavy(),
     lens(LensKey::Takeover, "Takeover", "⚑", "SECURITY")
         .filter(Filter::All)
         .heavy(),
@@ -285,6 +289,7 @@ pub fn render(
         LensKey::History => history::render(f, area, theme, data, filter, focused, sel),
         LensKey::Subdomains => subdomains::render(f, area, theme, data, focused, sel),
         LensKey::Headers => headers::render(f, area, theme, data),
+        LensKey::Audit => audit::render(f, area, theme, data),
         LensKey::Takeover => takeover::render(f, area, theme, data, focused, sel),
         // Pane-driven lenses render from `app.panes` state in
         // render.rs::main_pane, before the state match, so they never reach
@@ -298,9 +303,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn registry_has_eighteen_lenses_in_four_groups() {
+    fn registry_has_nineteen_lenses_in_four_groups() {
         let ls = lenses();
-        assert_eq!(ls.len(), 18);
+        assert_eq!(ls.len(), 19);
         assert_eq!(ls[0].key, "overview");
         assert_eq!(ls[0].group, "LOOKUP");
         let groups: Vec<&str> = ls.iter().map(|l| l.group).collect();
@@ -333,6 +338,7 @@ mod tests {
                 "status",
                 "subdomains",
                 "headers",
+                "audit",
                 "takeover",
                 "diff",
                 "bulk",
@@ -365,7 +371,7 @@ mod tests {
                 .map(|l| l.key.as_str())
                 .collect()
         };
-        assert_eq!(flagged(|l| l.heavy), ["subdomains", "takeover"]);
+        assert_eq!(flagged(|l| l.heavy), ["subdomains", "audit", "takeover"]);
         assert_eq!(
             flagged(|l| l.interactive),
             ["rdap", "tld", "dns", "follow", "diff", "bulk", "watch"]
