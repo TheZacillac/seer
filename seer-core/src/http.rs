@@ -19,6 +19,9 @@
 //!   omits or lies about `Content-Length` cannot force an unbounded buffer, and
 //!   the read is wrapped in a total-duration timeout so a server that trickles
 //!   bytes forever cannot hang the caller.
+//! - Failures are classified ([`SendError`]): a connect failure is
+//!   distinguishable from an unknown, and the traced variants keep the
+//!   redirect chain.
 //! - TLS verification is left at reqwest's validating default. Unlike
 //!   [`crate::ssl`], which relaxes verification *because* inspecting a bad
 //!   certificate is its purpose, these probes draw security conclusions from
@@ -110,6 +113,35 @@ pub(crate) struct FetchedResponse {
     pub body: String,
 }
 
+/// Why a guarded request failed, split so a probe can tell "the connection
+/// failed" (refused, unreachable, connect timeout, TLS handshake) from
+/// everything else (SSRF refusal, bad URL, redirect loop, body timeout),
+/// which is an unknown, not a negative result.
+#[derive(Debug)]
+pub(crate) enum SendError {
+    /// The TCP/TLS connect failed.
+    Connect(SeerError),
+    /// Any other failure.
+    Other(SeerError),
+}
+
+impl From<SendError> for SeerError {
+    fn from(e: SendError) -> Self {
+        match e {
+            SendError::Connect(error) | SendError::Other(error) => error,
+        }
+    }
+}
+
+/// A guarded fetch plus the URLs it attempted, in order. The chain is kept
+/// even when a later hop fails: a probe may only need to know where the
+/// first hop pointed.
+#[derive(Debug)]
+pub(crate) struct Traced<T> {
+    pub chain: Vec<String>,
+    pub result: std::result::Result<T, SendError>,
+}
+
 /// SSRF-guarded HTTP GET client. See the module docs for the security posture.
 #[derive(Debug, Clone)]
 pub(crate) struct GuardedFetcher {
@@ -176,36 +208,91 @@ impl GuardedFetcher {
     /// body only for some responses — read it through
     /// [`GuardedFetcher::read_body`] so the cap still applies.
     pub async fn send(&self, url: &str) -> Result<(reqwest::Response, usize)> {
-        let mut url = Url::parse(url)
-            .map_err(|e| SeerError::HttpError(format!("invalid URL '{}': {}", url, e)))?;
+        let mut chain = Vec::new();
+        let response = self.send_inner(url, &mut chain).await?;
+        Ok((response, chain.len().saturating_sub(1)))
+    }
+
+    /// [`GuardedFetcher::get_head`] that also reports the URLs attempted and
+    /// keeps the connect/other split. See [`Traced`].
+    pub async fn get_head_traced(&self, url: &str) -> Traced<ResponseHead> {
+        let mut chain = Vec::new();
+        let result = self
+            .send_inner(url, &mut chain)
+            .await
+            .map(|response| ResponseHead::of(&response, chain.len().saturating_sub(1)));
+        Traced { chain, result }
+    }
+
+    /// [`GuardedFetcher::get`] that also reports the URLs attempted and keeps
+    /// the connect/other split. See [`Traced`].
+    pub async fn get_traced(&self, url: &str) -> Traced<FetchedResponse> {
+        let mut chain = Vec::new();
+        let result = match self.send_inner(url, &mut chain).await {
+            Ok(response) => {
+                let head = ResponseHead::of(&response, chain.len().saturating_sub(1));
+                self.read_body(response)
+                    .await
+                    .map(|body| FetchedResponse { head, body })
+                    .map_err(SendError::Other)
+            }
+            Err(e) => Err(e),
+        };
+        Traced { chain, result }
+    }
+
+    /// The redirect walk behind every fetch: records each URL in `chain`
+    /// before requesting it and classifies a failed connect.
+    async fn send_inner(
+        &self,
+        url: &str,
+        chain: &mut Vec<String>,
+    ) -> std::result::Result<reqwest::Response, SendError> {
+        let mut url = Url::parse(url).map_err(|e| {
+            SendError::Other(SeerError::HttpError(format!(
+                "invalid URL '{}': {}",
+                url, e
+            )))
+        })?;
         let mut visited: HashSet<String> = HashSet::new();
 
-        for hop in 0..=MAX_REDIRECTS {
+        for _ in 0..=MAX_REDIRECTS {
             if !visited.insert(url.as_str().to_string()) {
-                return Err(SeerError::HttpError("redirect loop detected".to_string()));
+                return Err(SendError::Other(SeerError::HttpError(
+                    "redirect loop detected".to_string(),
+                )));
             }
+            chain.push(url.to_string());
 
             // No auto-redirects (see the module docs): each hop is re-guarded.
             let mut builder =
                 crate::net::client_builder(self.timeout).user_agent(crate::net::USER_AGENT);
 
             if !self.allow_private {
-                let addrs = crate::net::validate_http_url(&url).await?;
-                let host = url
-                    .host_str()
-                    .ok_or_else(|| SeerError::HttpError("missing URL host".to_string()))?;
+                let addrs = crate::net::validate_http_url(&url)
+                    .await
+                    .map_err(SendError::Other)?;
+                let host = url.host_str().ok_or_else(|| {
+                    SendError::Other(SeerError::HttpError("missing URL host".to_string()))
+                })?;
                 builder = builder.resolve_to_addrs(host, &addrs);
             }
 
-            let client = builder
-                .build()
-                .map_err(|e| SeerError::HttpError(format!("failed to build HTTP client: {}", e)))?;
+            let client = builder.build().map_err(|e| {
+                SendError::Other(SeerError::HttpError(format!(
+                    "failed to build HTTP client: {}",
+                    e
+                )))
+            })?;
 
-            let response = client
-                .get(url.clone())
-                .send()
-                .await
-                .map_err(|e| SeerError::HttpError(e.to_string()))?;
+            let response = client.get(url.clone()).send().await.map_err(|e| {
+                let error = SeerError::HttpError(e.to_string());
+                if e.is_connect() {
+                    SendError::Connect(error)
+                } else {
+                    SendError::Other(error)
+                }
+            })?;
 
             // A 3xx with no `Location` has nowhere to go and is the final
             // response (RFC 9110 §15.4: `Location` is optional for 300 and
@@ -216,10 +303,12 @@ impl GuardedFetcher {
                 .then(|| response.headers().get(reqwest::header::LOCATION))
                 .flatten();
             let Some(location) = location else {
-                return Ok((response, hop));
+                return Ok(response);
             };
             let location = location.to_str().map_err(|_| {
-                SeerError::HttpError("redirect location is not valid text".to_string())
+                SendError::Other(SeerError::HttpError(
+                    "redirect location is not valid text".to_string(),
+                ))
             })?;
             // Resolve relative Locations against the current URL; fall back to
             // an absolute parse. The result is re-validated at the top of the
@@ -227,10 +316,14 @@ impl GuardedFetcher {
             url = url
                 .join(location)
                 .or_else(|_| Url::parse(location))
-                .map_err(|e| SeerError::HttpError(format!("invalid redirect URL: {}", e)))?;
+                .map_err(|e| {
+                    SendError::Other(SeerError::HttpError(format!("invalid redirect URL: {}", e)))
+                })?;
         }
 
-        Err(SeerError::HttpError("too many redirects".to_string()))
+        Err(SendError::Other(SeerError::HttpError(
+            "too many redirects".to_string(),
+        )))
     }
 
     /// Streams at most `self.max_body` bytes of the response body, bounded by
@@ -574,5 +667,71 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("credentials"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn traced_fetch_records_every_hop() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/start"))
+            .respond_with(ResponseTemplate::new(301).insert_header("location", "/end"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/end"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let fetcher = GuardedFetcher::new().allowing_private_hosts();
+        let traced = fetcher
+            .get_head_traced(&format!("{}/start", server.uri()))
+            .await;
+        assert_eq!(traced.result.unwrap().status, 200);
+        assert_eq!(
+            traced.chain,
+            vec![
+                format!("{}/start", server.uri()),
+                format!("{}/end", server.uri())
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn refused_connection_is_a_connect_error() {
+        // Bind then drop: the port is closed, so connecting is refused.
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let fetcher = GuardedFetcher::new()
+            .with_timeout(Duration::from_secs(2))
+            .allowing_private_hosts();
+        let traced = fetcher
+            .get_head_traced(&format!("http://127.0.0.1:{port}/"))
+            .await;
+        assert!(
+            matches!(traced.result, Err(SendError::Connect(_))),
+            "{:?}",
+            traced.result.err()
+        );
+        assert_eq!(traced.chain.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn send_still_counts_hops() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/a"))
+            .respond_with(ResponseTemplate::new(302).insert_header("location", "/b"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/b"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let fetcher = GuardedFetcher::new().allowing_private_hosts();
+        let (_, hops) = fetcher.send(&format!("{}/a", server.uri())).await.unwrap();
+        assert_eq!(hops, 1);
     }
 }

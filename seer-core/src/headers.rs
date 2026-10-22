@@ -898,10 +898,23 @@ pub async fn audit_headers(domain: &str, timeout: Duration) -> Result<HeaderRepo
     // different headers) than the apex, so `www.` is kept.
     let domain = normalize_host(domain)?;
     let fetcher = GuardedFetcher::new().with_timeout(timeout);
+    Ok(audit_headers_with(&fetcher, &domain).await?)
+}
+
+/// [`audit_headers`] for an already-normalized `host` and a caller-built
+/// fetcher, keeping the connect/other failure split (the audit reports a
+/// failed HTTPS connection as a finding, anything else as unknown).
+pub(crate) async fn audit_headers_with(
+    fetcher: &GuardedFetcher,
+    host: &str,
+) -> std::result::Result<HeaderReport, crate::http::SendError> {
     // Only the status line and headers are graded, so the body is never read:
     // one that stalls or resets must not fail the audit.
-    let response = fetcher.get_head(&format!("https://{domain}/")).await?;
-    Ok(build_report(domain, &response))
+    fetcher
+        .get_head_traced(&format!("https://{host}/"))
+        .await
+        .result
+        .map(|response| build_report(host.to_string(), &response))
 }
 
 #[cfg(test)]
