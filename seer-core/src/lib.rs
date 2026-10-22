@@ -23,6 +23,7 @@ pub mod config;
 pub mod confusables;
 mod dates;
 pub mod diff;
+pub mod dkim;
 pub mod dns;
 #[cfg(feature = "cli")]
 pub mod doctor;
