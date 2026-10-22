@@ -289,7 +289,7 @@ pub fn render(
         LensKey::History => history::render(f, area, theme, data, filter, focused, sel),
         LensKey::Subdomains => subdomains::render(f, area, theme, data, focused, sel),
         LensKey::Headers => headers::render(f, area, theme, data),
-        LensKey::Audit => audit::render(f, area, theme, data),
+        LensKey::Audit => audit::render(f, area, theme, data, focused, sel),
         LensKey::Takeover => takeover::render(f, area, theme, data, focused, sel),
         // Pane-driven lenses render from `app.panes` state in
         // render.rs::main_pane, before the state match, so they never reach

@@ -262,6 +262,8 @@ impl App {
             // Only reported (non-safe) hosts are listed, so the selection
             // index space is the findings vec, not hosts_checked.
             LensData::Takeover(t) => t.findings.len(),
+            // One selectable row per finding.
+            LensData::Audit(a) => a.findings.len(),
             _ => 0,
         }
     }
@@ -1876,6 +1878,40 @@ mod tests {
             )),
             "expected Fetch(Takeover(example.com)), got {actions:?}",
         );
+    }
+
+    #[test]
+    fn audit_row_count_is_one_row_per_finding() {
+        let mut app = App::new(Some("example.com".into()));
+        let _ = app.take_startup_actions();
+        app.lens = LensKey::Audit.index();
+        let mut report = seer_core::AuditReport {
+            domain: "example.com".into(),
+            host: "example.com".into(),
+            overall: None,
+            categories: vec![],
+            findings: vec![],
+            runs: vec![],
+            complete: true,
+            fail_under: None,
+            passed: true,
+        };
+        report.findings = (0..3)
+            .map(|_| seer_core::audit::Finding {
+                id: "web.headers.missing",
+                category: seer_core::audit::Category::Web,
+                severity: seer_core::audit::Severity::Low,
+                host: "example.com".into(),
+                title: "t".into(),
+                evidence: None,
+                remediation: None,
+            })
+            .collect();
+        app.states.insert(
+            LensKey::Audit,
+            LensState::Loaded(LensData::Audit(Box::new(report))),
+        );
+        assert_eq!(app.row_count(), 3);
     }
 
     #[test]
