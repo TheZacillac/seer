@@ -96,14 +96,38 @@ const MAX_PARENT_SERVERS_TRIED: usize = 4;
 /// Stop querying parent servers once this many have answered.
 const PARENT_SERVERS_WANTED: usize = 2;
 
+/// Why a delegated nameserver is lame, for consumers that act on the cause
+/// without parsing [`LameNs::reason`] (the security audit grades a server
+/// that answered wrongly apart from one that never answered).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LameKind {
+    /// Answered NXDOMAIN for its own zone.
+    Nxdomain,
+    /// Answered authoritatively, but with no NS records.
+    NoNsRecords,
+    /// Answered the NS set without the AA bit (a cache, not the authority).
+    NotAuthoritative,
+    /// Referred the query elsewhere instead of answering.
+    Referral,
+    /// Answered with an empty, non-authoritative response.
+    EmptyAnswer,
+    /// Answered with an error RCODE (REFUSED, SERVFAIL, …).
+    ErrorRcode,
+    /// Gave no usable response (timeout, transport failure) — the server may
+    /// be dead, or the probe may have been lost.
+    Unresponsive,
+}
+
 /// A delegated nameserver that failed to answer authoritatively for its own
-/// zone, with a human-readable reason (refused / timeout / non-authoritative /
-/// empty).
+/// zone, with a structured [`LameKind`] and a human-readable reason.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LameNs {
     /// Nameserver host name (normalized: lowercase, no trailing dot).
     pub host: String,
-    /// Why the server is considered lame.
+    /// What made the server lame.
+    pub kind: LameKind,
+    /// Why the server is considered lame, for display.
     pub reason: String,
 }
 
@@ -238,8 +262,8 @@ enum DirectNs {
 enum ProbeOutcome {
     /// Authoritative NS answer — contributes to `zone_ns`.
     Healthy(Vec<String>),
-    /// The server is lame, with the reason.
-    Lame(String),
+    /// The server is lame: its kind and the display reason.
+    Lame(LameKind, String),
     /// The server could not be probed at all (e.g. unresolvable glue);
     /// reported as a warning, not as lameness.
     Skipped(String),
@@ -606,8 +630,9 @@ impl DelegationChecker {
         for (host, outcome) in probe_hosts.iter().zip(outcomes) {
             match outcome {
                 ProbeOutcome::Healthy(ns) => zone_ns.extend(ns),
-                ProbeOutcome::Lame(reason) => lame.push(LameNs {
+                ProbeOutcome::Lame(kind, reason) => lame.push(LameNs {
                     host: host.clone(),
+                    kind,
                     reason,
                 }),
                 ProbeOutcome::Skipped(reason) => {
@@ -791,7 +816,10 @@ fn outcome_for_direct(direct: DirectNs) -> ProbeOutcome {
         DirectNs::Response {
             response_code: ResponseCode::NXDomain,
             ..
-        } => ProbeOutcome::Lame("returned NXDOMAIN for its own zone".to_string()),
+        } => ProbeOutcome::Lame(
+            LameKind::Nxdomain,
+            "returned NXDOMAIN for its own zone".to_string(),
+        ),
         DirectNs::Response {
             authoritative: true,
             answer_ns,
@@ -800,20 +828,30 @@ fn outcome_for_direct(direct: DirectNs) -> ProbeOutcome {
         DirectNs::Response {
             authoritative: true,
             ..
-        } => ProbeOutcome::Lame("authoritative answer contained no NS records".to_string()),
-        DirectNs::Response { answer_ns, .. } if !answer_ns.is_empty() => {
-            ProbeOutcome::Lame("answered non-authoritatively (AA bit not set)".to_string())
-        }
-        DirectNs::Response { authority_ns, .. } if !authority_ns.is_empty() => {
-            ProbeOutcome::Lame("not authoritative — referred the query elsewhere".to_string())
-        }
-        DirectNs::Response { .. } => {
-            ProbeOutcome::Lame("returned an empty answer (no NS records)".to_string())
-        }
-        DirectNs::Rcode(code) => ProbeOutcome::Lame(format!("refused the query ({})", code)),
-        DirectNs::Unreachable(reason) => {
-            ProbeOutcome::Lame(format!("no usable response: {}", reason))
-        }
+        } => ProbeOutcome::Lame(
+            LameKind::NoNsRecords,
+            "authoritative answer contained no NS records".to_string(),
+        ),
+        DirectNs::Response { answer_ns, .. } if !answer_ns.is_empty() => ProbeOutcome::Lame(
+            LameKind::NotAuthoritative,
+            "answered non-authoritatively (AA bit not set)".to_string(),
+        ),
+        DirectNs::Response { authority_ns, .. } if !authority_ns.is_empty() => ProbeOutcome::Lame(
+            LameKind::Referral,
+            "not authoritative — referred the query elsewhere".to_string(),
+        ),
+        DirectNs::Response { .. } => ProbeOutcome::Lame(
+            LameKind::EmptyAnswer,
+            "returned an empty answer (no NS records)".to_string(),
+        ),
+        DirectNs::Rcode(code) => ProbeOutcome::Lame(
+            LameKind::ErrorRcode,
+            format!("refused the query ({})", code),
+        ),
+        DirectNs::Unreachable(reason) => ProbeOutcome::Lame(
+            LameKind::Unresponsive,
+            format!("no usable response: {}", reason),
+        ),
         DirectNs::LocalNoRoute(reason) => ProbeOutcome::Skipped(format!(
             "no route from this host ({}) — server not probed (e.g. an IPv6-only nameserver on an IPv4-only host)",
             reason
@@ -1165,6 +1203,56 @@ mod tests {
         }
     }
 
+    /// Every lameness branch carries its own structured kind, so consumers
+    /// (the security audit) never parse `reason`.
+    #[test]
+    fn each_lame_outcome_has_its_kind() {
+        let response =
+            |authoritative, code, answer: &[&str], authority: &[&str]| DirectNs::Response {
+                authoritative,
+                response_code: code,
+                answer_ns: answer.iter().map(|s| s.to_string()).collect(),
+                authority_ns: authority.iter().map(|s| s.to_string()).collect(),
+            };
+        let kind = |direct| match outcome_for_direct(direct) {
+            ProbeOutcome::Lame(kind, _) => kind,
+            other => panic!("expected lame, got {other:?}"),
+        };
+        assert_eq!(
+            kind(response(true, ResponseCode::NXDomain, &[], &[])),
+            LameKind::Nxdomain
+        );
+        assert_eq!(
+            kind(response(true, ResponseCode::NoError, &[], &[])),
+            LameKind::NoNsRecords
+        );
+        assert_eq!(
+            kind(response(false, ResponseCode::NoError, &["ns1.test"], &[])),
+            LameKind::NotAuthoritative
+        );
+        assert_eq!(
+            kind(response(
+                false,
+                ResponseCode::NoError,
+                &[],
+                &["ns.parent.test"]
+            )),
+            LameKind::Referral
+        );
+        assert_eq!(
+            kind(response(false, ResponseCode::NoError, &[], &[])),
+            LameKind::EmptyAnswer
+        );
+        assert_eq!(
+            kind(DirectNs::Rcode(ResponseCode::Refused)),
+            LameKind::ErrorRcode
+        );
+        assert_eq!(
+            kind(DirectNs::Unreachable("timed out".to_string())),
+            LameKind::Unresponsive
+        );
+    }
+
     #[test]
     fn local_no_route_probe_outcome_is_skipped_not_lame() {
         let outcome =
@@ -1372,6 +1460,7 @@ mod tests {
             "reason should mention the refusal: {}",
             report.lame[0].reason
         );
+        assert_eq!(report.lame[0].kind, LameKind::ErrorRcode);
         assert!(!report.in_sync);
     }
 
@@ -1410,6 +1499,7 @@ mod tests {
             "reason: {}",
             report.lame[0].reason
         );
+        assert_eq!(report.lame[0].kind, LameKind::NotAuthoritative);
         assert!(!report.in_sync);
         // The healthy server still provides the zone view.
         assert_eq!(report.zone_ns, vec!["ns1.seer.test", "ns2.seer.test"]);
@@ -1442,6 +1532,7 @@ mod tests {
             "reason: {}",
             report.lame[0].reason
         );
+        assert_eq!(report.lame[0].kind, LameKind::Unresponsive);
         assert!(!report.in_sync);
     }
 

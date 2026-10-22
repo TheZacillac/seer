@@ -1735,6 +1735,7 @@ mod exit_code_tests {
         let lame = || {
             vec![seer_core::dns::LameNs {
                 host: "ns1.example.com".into(),
+                kind: seer_core::dns::LameKind::ErrorRcode,
                 reason: "REFUSED".into(),
             }]
         };

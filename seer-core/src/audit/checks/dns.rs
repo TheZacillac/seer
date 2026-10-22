@@ -1,12 +1,17 @@
 //! DNSSEC and NS delegation health. DNSSEC is digest-only
 //! (`AuthenticationTier::DigestOnly`): "broken" means a DS set validators
 //! would use matches no DNSKEY — validating resolvers then fail the zone.
+//!
+//! Lame nameservers split on [`LameKind`]: one that answered wrongly
+//! (REFUSED, non-authoritative, referral, …) is definitive and High; one
+//! that gave no usable response may be dead or may be a lost probe, so it is
+//! Medium and never caps the grade.
 
 use futures::future::BoxFuture;
 
 use super::{AuditContext, CheckOutput, CheckSpec};
 use crate::audit::finding::{Category, Finding, Severity};
-use crate::dns::{DelegationReport, DnssecReport};
+use crate::dns::{DelegationReport, DnssecReport, LameKind};
 
 const D: Category = Category::Dns;
 const DNSSEC_CHECK: &str = "dns.dnssec";
@@ -27,6 +32,7 @@ pub(crate) const IDS: &[&str] = &[
     "dns.dnssec.unsigned",
     "dns.dnssec.partial",
     "dns.delegation.lame",
+    "dns.delegation.unresponsive",
     "dns.delegation.out-of-sync",
     "dns.ns.single",
 ];
@@ -82,12 +88,32 @@ pub(crate) fn assess_dnssec(domain: &str, r: &DnssecReport) -> Vec<Finding> {
 /// Maps a delegation report to findings. Pure.
 pub(crate) fn assess_delegation(domain: &str, r: &DelegationReport) -> Vec<Finding> {
     let new = |id, severity, title: &str| Finding::new(id, D, severity, domain, title);
+    let hosts = |unresponsive: bool| {
+        r.lame
+            .iter()
+            .filter(|l| (l.kind == LameKind::Unresponsive) == unresponsive)
+            .map(|l| l.host.as_str())
+            .collect::<Vec<_>>()
+    };
     let mut out = Vec::new();
-    if !r.lame.is_empty() {
+    let answered_wrongly = hosts(false);
+    if !answered_wrongly.is_empty() {
         out.push(
             new("dns.delegation.lame", Severity::High, "Lame nameserver delegation")
-                .evidence(r.lame.iter().map(|l| l.host.as_str()).collect::<Vec<_>>().join(", "))
+                .evidence(answered_wrongly.join(", "))
                 .fix("Make every delegated nameserver answer authoritatively, or remove it from the delegation."),
+        );
+    }
+    let silent = hosts(true);
+    if !silent.is_empty() {
+        out.push(
+            new(
+                "dns.delegation.unresponsive",
+                Severity::Medium,
+                "Nameserver did not respond",
+            )
+            .evidence(silent.join(", "))
+            .fix("Check the nameserver is up and reachable on UDP and TCP port 53, or remove it from the delegation."),
         );
     }
     if !r.missing_from_zone.is_empty() || !r.missing_from_parent.is_empty() {
@@ -112,8 +138,7 @@ pub(crate) fn assess_delegation(domain: &str, r: &DelegationReport) -> Vec<Findi
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dns::AuthenticationTier;
-    use crate::dns::LameNs;
+    use crate::dns::{AuthenticationTier, LameKind, LameNs};
 
     fn dnssec(status: &str) -> DnssecReport {
         DnssecReport {
@@ -168,10 +193,7 @@ mod tests {
         assert!(assess_delegation("example.com", &delegation()).is_empty());
 
         let mut d = delegation();
-        d.lame = vec![LameNs {
-            host: "ns2.example.com".into(),
-            reason: "refused".into(),
-        }];
+        d.lame = vec![lame("ns2.example.com", LameKind::ErrorRcode)];
         d.missing_from_zone = vec!["ns3.example.com".into()];
         d.in_sync = false;
         assert_eq!(
@@ -185,5 +207,54 @@ mod tests {
             ids(&assess_delegation("example.com", &d)),
             vec!["dns.ns.single"]
         );
+    }
+
+    fn lame(host: &str, kind: LameKind) -> LameNs {
+        LameNs {
+            host: host.into(),
+            kind,
+            reason: String::new(),
+        }
+    }
+
+    /// A server that answered wrongly is definitive (High, caps at C); one
+    /// that never answered may be dead or may be packet loss (Medium, no
+    /// cap). Each finding names only its own servers.
+    #[test]
+    fn unresponsive_nameservers_are_medium_not_lame() {
+        let mut d = delegation();
+        d.in_sync = false;
+        d.lame = vec![lame("ns2.example.com", LameKind::Unresponsive)];
+        let f = assess_delegation("example.com", &d);
+        assert_eq!(ids(&f), vec!["dns.delegation.unresponsive"]);
+        assert_eq!(f[0].severity, Severity::Medium);
+        assert_eq!(f[0].evidence.as_deref(), Some("ns2.example.com"));
+
+        for definitive in [
+            LameKind::Nxdomain,
+            LameKind::NoNsRecords,
+            LameKind::NotAuthoritative,
+            LameKind::Referral,
+            LameKind::EmptyAnswer,
+            LameKind::ErrorRcode,
+        ] {
+            d.lame = vec![lame("ns1.example.com", definitive)];
+            let f = assess_delegation("example.com", &d);
+            assert_eq!(ids(&f), vec!["dns.delegation.lame"], "{definitive:?}");
+            assert_eq!(f[0].severity, Severity::High);
+        }
+
+        d.lame = vec![
+            lame("ns1.example.com", LameKind::ErrorRcode),
+            lame("ns2.example.com", LameKind::Unresponsive),
+        ];
+        let f = assess_delegation("example.com", &d);
+        assert_eq!(
+            ids(&f),
+            vec!["dns.delegation.lame", "dns.delegation.unresponsive"]
+        );
+        assert_eq!(f[0].evidence.as_deref(), Some("ns1.example.com"));
+        assert_eq!(f[1].evidence.as_deref(), Some("ns2.example.com"));
+        assert!(f.iter().all(|f| IDS.contains(&f.id)));
     }
 }

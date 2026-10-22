@@ -27,8 +27,8 @@ use seer_core::confusables::{ConfusableReport, RegisteredLookalike};
 use seer_core::diff::{DnsDiff, DomainDiff, RegistrationDiff, SslDiff};
 use seer_core::dns::{
     DelegationReport, DnsComparison, DnsNameservers, DnsQueryResult, DnsRecord, DnsStatus,
-    DnsTrace, DnssecReport, FollowIteration, FollowResult, LameNs, PropagationResult, RecordData,
-    RecordType, ServerResult, SvcParam, TraceHop, WildcardProbe,
+    DnsTrace, DnssecReport, FollowIteration, FollowResult, LameKind, LameNs, PropagationResult,
+    RecordData, RecordType, ServerResult, SvcParam, TraceHop, WildcardProbe,
 };
 use seer_core::domain_info::DomainInfo;
 use seer_core::drift::{DriftReport, FieldChange};
@@ -623,6 +623,7 @@ fn fixture_delegation_broken() -> DelegationReport {
         missing_from_parent: vec!["ns2.example.com".into()],
         lame: vec![LameNs {
             host: "ns-old.example.net".into(),
+            kind: LameKind::ErrorRcode,
             reason: "refused the query (REFUSED)".into(),
         }],
         warnings: vec!["skipped parent server b.gtld-servers.net: could not resolve".into()],

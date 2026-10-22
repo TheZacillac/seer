@@ -39,8 +39,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - **Additive serialized fields** (existing consumers are unaffected):
-  `CertWarning.kind`, `CaaPolicy.lookup_failed`, `SpfPolicy.permerror` and
-  `EmailPosture.mx`.
+  `CertWarning.kind`, `CaaPolicy.lookup_failed`, `SpfPolicy.permerror`,
+  `EmailPosture.mx` and `LameNs.kind` (a `LameKind`: `nxdomain`,
+  `no-ns-records`, `not-authoritative`, `referral`, `empty-answer`,
+  `error-rcode`, `unresponsive`).
+- **`seer audit` grades a nameserver that never answered apart from one that
+  answered wrongly.** A server that refuses, answers without authority or
+  refers elsewhere stays `dns.delegation.lame` (High); one that gave no
+  usable response is now `dns.delegation.unresponsive` (Medium), so a lost
+  probe can no longer cap the grade at C. `seer delegation` and its exit code
+  are unchanged.
 
 ### Security
 - **seer-api requires `mcp>=2.3.0`** (was `>=2.0`). The old floor still
