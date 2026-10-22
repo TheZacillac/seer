@@ -4,7 +4,9 @@
 //! One SSRF-guarded GET to `https://<host>/.well-known/security.txt` (body
 //! capped at 32 KiB, redirects re-validated). Only a 200 `text/plain` body
 //! that is not an HTML page counts as found — many sites answer every path
-//! with a 200 HTML soft-404. The parser checks the two required fields
+//! with a 200 HTML soft-404. Only a 404 or 410 means the file is missing;
+//! any other status (a WAF's 403, a 429, a 5xx, a 3xx with no `Location`)
+//! is an error, since it says nothing about the file. The parser checks the two required fields
 //! (`Contact`, exactly one `Expires` in RFC 3339 form) and notes a PGP
 //! cleartext-signature wrapper (presence only; the signature is not
 //! verified). Field values are remote text: sanitize before display.
@@ -14,7 +16,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::error::Result;
+use crate::error::{Result, SeerError};
 use crate::http::{GuardedFetcher, SendError};
 use crate::validation::normalize_host;
 
@@ -25,7 +27,7 @@ const MAX_BODY: usize = 32 * 1024;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SecurityTxtIssue {
-    /// No 200 response at the well-known path.
+    /// The well-known path answered 404 or 410.
     NotFound,
     /// A 200 that is HTML or not `text/plain` (a soft-404).
     NotPlainText,
@@ -78,6 +80,10 @@ impl SecurityTxtReport {
 }
 
 /// Fetches and parses `https://<host>/.well-known/security.txt`.
+///
+/// # Errors
+/// `InvalidDomain` for bad input; an HTTP error when the fetch failed or the
+/// server answered anything but 200, 404 or 410 (the result is unknown).
 pub async fn fetch_security_txt(host: &str, timeout: Duration) -> Result<SecurityTxtReport> {
     let host = normalize_host(host)?;
     let fetcher = GuardedFetcher::new().with_timeout(timeout);
@@ -93,8 +99,16 @@ pub(crate) async fn fetch_url(
 ) -> std::result::Result<SecurityTxtReport, SendError> {
     let fetcher = fetcher.clone().with_max_body(MAX_BODY);
     let response = fetcher.get_traced(url).await.result?;
-    if response.head.status != 200 {
-        return Ok(SecurityTxtReport::missing(url, SecurityTxtIssue::NotFound));
+    match response.head.status {
+        200 => {}
+        404 | 410 => return Ok(SecurityTxtReport::missing(url, SecurityTxtIssue::NotFound)),
+        // A WAF block, rate limit, server error or a 3xx with no `Location`
+        // says nothing about whether the file exists.
+        status => {
+            return Err(SendError::Other(SeerError::HttpError(format!(
+                "security.txt fetch answered HTTP {status}"
+            ))))
+        }
     }
     let plain = response.head.header("content-type").is_some_and(|ct| {
         ct.trim_start()
@@ -252,6 +266,37 @@ mod tests {
         let r = fetch_url(&fetcher, &url, now()).await.unwrap();
         assert!(!r.found);
         assert_eq!(r.issues, vec![SecurityTxtIssue::NotFound]);
+    }
+
+    /// Serves `status` (no `Location`) at the well-known path.
+    async fn fetch_status(status: u16) -> std::result::Result<SecurityTxtReport, SendError> {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/security.txt"))
+            .respond_with(ResponseTemplate::new(status))
+            .mount(&server)
+            .await;
+        let fetcher = GuardedFetcher::new().allowing_private_hosts();
+        let url = format!("{}/.well-known/security.txt", server.uri());
+        fetch_url(&fetcher, &url, now()).await
+    }
+
+    #[tokio::test]
+    async fn only_404_and_410_mean_not_found() {
+        for status in [404, 410] {
+            let r = fetch_status(status).await.unwrap();
+            assert_eq!(r.issues, vec![SecurityTxtIssue::NotFound], "{status}");
+        }
+    }
+
+    #[tokio::test]
+    async fn blocked_throttled_or_failing_answers_are_unknown() {
+        // A WAF block, rate limit, server error or a 3xx going nowhere says
+        // nothing about whether the file exists.
+        for status in [401, 403, 429, 500, 503, 302] {
+            let r = fetch_status(status).await;
+            assert!(matches!(r, Err(SendError::Other(_))), "{status}: {r:?}");
+        }
     }
 
     #[tokio::test]
