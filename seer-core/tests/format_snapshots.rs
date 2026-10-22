@@ -36,7 +36,7 @@ use seer_core::posture::{
     TlsaRecord,
 };
 use seer_core::rdap::RdapResponse;
-use seer_core::ssl::{CertDetail, CertWarning, CertWarningSeverity, SslReport};
+use seer_core::ssl::{CertDetail, CertWarning, CertWarningKind, CertWarningSeverity, SslReport};
 use seer_core::status::{CertificateInfo, DnsResolution, DomainExpiration, StatusResponse};
 use seer_core::subdomains::{
     ClassifiedSubdomain, SubdomainClassification, SubdomainResult, SubdomainStatus,
@@ -522,6 +522,7 @@ fn fixture_caa_policy() -> CaaPolicy {
              broader than named issuance"
                 .into(),
         ),
+        lookup_failed: false,
         note: ISSUANCE_TIME_NOTE.to_string(),
     }
 }
@@ -558,18 +559,22 @@ fn fixture_ssl_report_with_warnings() -> SslReport {
         warnings: vec![
             CertWarning {
                 severity: CertWarningSeverity::Critical,
+                kind: CertWarningKind::WeakKey,
                 message: "RSA key size 1024 is below the 2048-bit minimum".into(),
             },
             CertWarning {
                 severity: CertWarningSeverity::Critical,
+                kind: CertWarningKind::DeprecatedSignature,
                 message: "Certificate uses deprecated signature algorithm: SHA1-RSA".into(),
             },
             CertWarning {
                 severity: CertWarningSeverity::Warning,
+                kind: CertWarningKind::SelfSigned,
                 message: "Certificate is self-signed (issuer equals subject)".into(),
             },
             CertWarning {
                 severity: CertWarningSeverity::Critical,
+                kind: CertWarningKind::HostnameMismatch,
                 message: "Certificate does not match the requested hostname".into(),
             },
         ],

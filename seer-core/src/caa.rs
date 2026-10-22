@@ -93,6 +93,10 @@ pub struct CaaPolicy {
     /// `issuewild` inherits `issue`, which is NOT a gap).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wildcard_note: Option<String>,
+    /// True when no policy was found AND at least one level of the tree walk
+    /// failed to resolve — the absence is then unknown, not established.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub lookup_failed: bool,
     /// Informational note about CAA semantics. Always populated.
     pub note: String,
 }
@@ -107,6 +111,7 @@ impl CaaPolicy {
             issuer_match: None,
             iodef: Vec::new(),
             wildcard_note: None,
+            lookup_failed: false,
             note: ISSUANCE_TIME_NOTE.to_string(),
         }
     }
@@ -128,6 +133,7 @@ impl CaaPolicy {
             issuer_match: None,
             iodef,
             wildcard_note,
+            lookup_failed: false,
             note: ISSUANCE_TIME_NOTE.to_string(),
         }
     }
@@ -183,14 +189,15 @@ fn analyze_wildcard(records: &[CaaRecord]) -> Option<String> {
 /// is an optional nameserver spec, as for [`DnsResolver::resolve`].
 ///
 /// Errors only on invalid input. A resolver error yields
-/// [`CaaPolicy::empty`] — CAA is advisory, so a CAA query that did not
-/// return never fails a higher-level check.
+/// [`CaaPolicy::empty`] with `lookup_failed` set — CAA is advisory, so a CAA
+/// query that did not return never fails a higher-level check.
 pub async fn lookup_caa(
     resolver: &DnsResolver,
     host: &str,
     nameserver: Option<&str>,
 ) -> Result<CaaPolicy> {
     let mut current = normalize_host(host)?;
+    let mut failed = false;
 
     loop {
         match resolver
@@ -214,13 +221,19 @@ pub async fn lookup_caa(
                     return Ok(CaaPolicy::from_records(caa, current));
                 }
             }
-            Ok(_) | Err(_) => {}
+            Ok(_) => {}
+            Err(_) => failed = true,
         }
 
         // Strip the leftmost label. Stop when only one label (TLD) remains.
         match current.split_once('.') {
             Some((_, rest)) if rest.contains('.') => current = rest.to_string(),
-            _ => return Ok(CaaPolicy::empty()),
+            _ => {
+                return Ok(CaaPolicy {
+                    lookup_failed: failed,
+                    ..CaaPolicy::empty()
+                })
+            }
         }
     }
 }
@@ -700,6 +713,7 @@ mod tests {
             issuer_match: None,
             iodef: Vec::new(),
             wildcard_note: None,
+            lookup_failed: false,
             note: ISSUANCE_TIME_NOTE.to_string(),
         };
         assert_eq!(
@@ -731,6 +745,7 @@ mod tests {
             issuer_match: None,
             iodef: Vec::new(),
             wildcard_note: None,
+            lookup_failed: false,
             note: ISSUANCE_TIME_NOTE.to_string(),
         };
         assert_eq!(
@@ -754,11 +769,40 @@ mod tests {
             issuer_match: None,
             iodef: Vec::new(),
             wildcard_note: None,
+            lookup_failed: false,
             note: ISSUANCE_TIME_NOTE.to_string(),
         };
         assert_eq!(
             classify_issuer("CN=R3, O=Let's Encrypt", &policy, false),
             IssuerCaaMatch::Permitted
         );
+    }
+
+    use crate::dns::test_support::{mock_dns_resolver_default, spawn_mock_dns_fn, MockReply};
+    use hickory_resolver::proto::op::ResponseCode;
+    use hickory_resolver::proto::rr::RecordType as WireType;
+
+    #[tokio::test]
+    async fn a_failed_level_with_no_policy_is_flagged_as_lookup_failed() {
+        let port = spawn_mock_dns_fn(|qname, qtype| match (qname, qtype) {
+            ("www.caa.test", WireType::CAA) => MockReply::Rcode(ResponseCode::ServFail),
+            _ => MockReply::NoData,
+        })
+        .await;
+        let policy = lookup_caa(&mock_dns_resolver_default(port), "www.caa.test", None)
+            .await
+            .unwrap();
+        assert!(!policy.has_policy);
+        assert!(policy.lookup_failed, "{policy:?}");
+    }
+
+    #[tokio::test]
+    async fn a_clean_empty_walk_is_not_a_lookup_failure() {
+        let port = spawn_mock_dns_fn(|_, _| MockReply::NoData).await;
+        let policy = lookup_caa(&mock_dns_resolver_default(port), "www.caa.test", None)
+            .await
+            .unwrap();
+        assert!(!policy.has_policy);
+        assert!(!policy.lookup_failed);
     }
 }

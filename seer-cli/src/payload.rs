@@ -432,6 +432,7 @@ mod tests {
             issuer_match: None,
             iodef: vec![],
             wildcard_note: None,
+            lookup_failed: false,
             note: "no CAA policy found".into(),
         };
         let data = Payload::Caa(Box::new(policy));

@@ -103,7 +103,9 @@ pub use posture::{
     lookup_email_posture, BimiPolicy, DanePolicy, DmarcPolicy, EmailPosture, MtaStsPolicy,
     PostureVerdict, SpfPolicy,
 };
-pub use ssl::{CertDetail, CertWarning, CertWarningSeverity, SslChecker, SslReport};
+pub use ssl::{
+    CertDetail, CertWarning, CertWarningKind, CertWarningSeverity, SslChecker, SslReport,
+};
 pub use subdomains::{
     classify_subdomains, ClassifiedSubdomain, SubdomainClassification, SubdomainEnumerator,
     SubdomainResult, SubdomainStatus,

@@ -1155,6 +1155,7 @@ mod tests {
             issuer_match: None,
             iodef: vec!["mailto:security@example.com".to_string()],
             wildcard_note: None,
+            lookup_failed: false,
             note: "CAA restricts which CAs may issue".to_string(),
         };
         let result = BulkResult {
@@ -1948,6 +1949,7 @@ mod tests {
                 issuer_match: None,
                 iodef: vec!["mailto:security@example.com".to_string()],
                 wildcard_note: Some("wildcards restricted, see issuewild".to_string()),
+                lookup_failed: false,
                 note: "CAA restricts which CAs may issue".to_string(),
             };
             let caa = [
