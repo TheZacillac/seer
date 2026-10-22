@@ -2,14 +2,17 @@
 //!
 //! Each adapter module owns one or more checks, a pure `assess`-style
 //! function mapping its source report to [`Finding`]s, an async runner, its
-//! [`CheckSpec`] row and its `IDS` list. [`CHECKS`] is the one table of
+//! [`CheckSpec`] row and a test-only `IDS` list (checked by the id-contract test). [`CHECKS`] is the one table of
 //! adapters — add a row here, never a second list. [`run_specs`] runs every
 //! spec concurrently under one deadline; a spec still running at the
 //! deadline has each of its checks recorded as incomplete.
 
 mod dkim;
+mod dns;
 mod email;
 mod registration;
+mod takeover;
+mod tls;
 mod web;
 
 use std::time::Duration;
@@ -105,11 +108,24 @@ pub(crate) static CHECKS: &[CheckSpec] = &[
     web::HEADERS,
     web::UPGRADE,
     web::SECURITY_TXT,
+    tls::SPEC,
+    dns::DNSSEC,
+    dns::DELEGATION,
+    takeover::SPEC,
 ];
 
-/// Every finding id any adapter can emit.
+/// Every finding id any adapter can emit (for the id-contract test).
+#[cfg(test)]
 pub(crate) fn all_ids() -> Vec<&'static str> {
-    let lists: &[&[&str]] = &[registration::IDS, email::IDS, dkim::IDS, web::IDS];
+    let lists: &[&[&str]] = &[
+        registration::IDS,
+        email::IDS,
+        dkim::IDS,
+        web::IDS,
+        tls::IDS,
+        dns::IDS,
+        takeover::IDS,
+    ];
     lists.iter().flat_map(|ids| ids.iter().copied()).collect()
 }
 

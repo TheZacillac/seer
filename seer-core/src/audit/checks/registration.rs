@@ -16,6 +16,7 @@ pub(crate) const SPEC: CheckSpec = CheckSpec {
     run,
 };
 
+#[cfg(test)]
 pub(crate) const IDS: &[&str] = &[
     "registration.expiry.expired",
     "registration.expiry.redemption",

@@ -18,6 +18,7 @@ pub(crate) const SPEC: CheckSpec = CheckSpec {
     run,
 };
 
+#[cfg(test)]
 pub(crate) const IDS: &[&str] = &[
     "email.dkim.weak-key",
     "email.dkim.1024-key",

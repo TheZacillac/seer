@@ -31,6 +31,7 @@ pub(crate) const SPEC: CheckSpec = CheckSpec {
     run,
 };
 
+#[cfg(test)]
 pub(crate) const IDS: &[&str] = &[
     "email.spf.missing",
     "email.spf.permissive",

@@ -33,6 +33,7 @@ pub(crate) const SECURITY_TXT: CheckSpec = CheckSpec {
     run: run_security_txt,
 };
 
+#[cfg(test)]
 pub(crate) const IDS: &[&str] = &[
     "web.https.unreachable",
     "web.hsts.missing",

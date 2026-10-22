@@ -230,4 +230,17 @@ mod tests {
         assert_eq!(ids, vec!["email.a.high", "web.a.high", "web.b.low"]);
         assert!(report.complete);
     }
+
+    #[tokio::test]
+    #[ignore = "live network"]
+    async fn live_audit_of_a_real_domain() {
+        let report = Auditor::new()
+            .audit("example.com", AuditOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(report.categories.len(), 6);
+        assert!(report.runs.len() >= 16, "{:?}", report.runs);
+        assert!(report.overall.is_some(), "{report:#?}");
+        eprintln!("{}", serde_json::to_string_pretty(&report).unwrap());
+    }
 }
