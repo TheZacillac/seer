@@ -2,7 +2,8 @@
 
 Python bindings for [Seer](https://github.com/TheZacillac/seer), built with
 PyO3 on top of the Rust `seer-core` library: WHOIS, RDAP, DNS, propagation,
-SSL, domain status, security posture and bulk operations from Python.
+SSL, domain status, security posture, a graded security audit and bulk
+operations from Python.
 
 ## Installation
 
@@ -26,6 +27,7 @@ result  = seer.lookup("example.com")                 # RDAP first, WHOIS fallbac
 answer  = seer.dig("example.com", record_type="MX")  # status, flags, answers, ...
 trace   = seer.dns_trace("example.com")              # delegation walk from the root
 status  = seer.status("example.com")
+audit   = seer.audit("example.com")                  # graded A+–F report: overall, findings, passed
 results = seer.bulk_lookup(["example.com", "example.org"], concurrency=10)
 ```
 
