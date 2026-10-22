@@ -13,6 +13,7 @@ macro_rules! static_regex {
     };
 }
 
+pub mod audit;
 pub mod availability;
 pub mod bulk;
 pub mod caa;
