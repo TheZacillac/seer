@@ -25,6 +25,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Streamable HTTP servers in stateful mode never reclaimed session state).
   seer-api's `/mcp` runs stateless and was not exposed; the floor now matches
   the SDK release the suite runs against.
+- **Distrusted emSign roots removed from the TLS trust path**: `rustls-webpki`
+  0.103.16, `webpki-roots` 1.0.10 and `webpki-root-certs` 1.0.10
+  (RUSTSEC-2026-0381, RUSTSEC-2026-0382, RUSTSEC-2026-0383). They affect the
+  validating TLS used by RDAP, HTTP probes and DoH/DoT; `seer ssl`'s
+  inspection-only handshake reports trust rather than enforcing it.
 
 ## [0.53.1] - 2026-10-14
 
