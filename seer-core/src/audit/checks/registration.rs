@@ -176,7 +176,8 @@ pub(crate) fn findings(domain: &str, reg: &Registration<'_>) -> Vec<Finding> {
         }
     }
 
-    if let Some(days) = reg.age_days.filter(|d| *d < YOUNG_DAYS) {
+    // A negative age (creation date in the future) is bad data, not youth.
+    if let Some(days) = reg.age_days.filter(|d| (0..YOUNG_DAYS).contains(d)) {
         out.push(
             new(
                 "registration.age.young",
@@ -302,6 +303,21 @@ mod tests {
     #[test]
     fn no_status_codes_means_no_lock_findings() {
         assert!(findings("example.com", &reg(&[])).is_empty());
+    }
+
+    #[test]
+    fn a_negative_age_is_not_young() {
+        // A creation date in the future (clock skew, bad registry data) is
+        // not evidence of a fresh registration.
+        let statuses = locked();
+        let f = findings(
+            "example.com",
+            &Registration {
+                age_days: Some(-2),
+                ..reg(&statuses)
+            },
+        );
+        assert!(f.is_empty(), "{f:?}");
     }
 
     #[test]

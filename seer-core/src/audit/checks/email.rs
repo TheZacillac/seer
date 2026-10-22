@@ -152,7 +152,9 @@ pub(crate) fn assess(domain: &str, p: &EmailPosture) -> CheckOutput {
         }
     }
 
-    if !enforcing(&p.dmarc) {
+    if matches!(p.mx, MailExchangers::Null | MailExchangers::Absent) {
+        out.not_applicable(BIMI, E, "domain receives no mail");
+    } else if !enforcing(&p.dmarc) {
         out.not_applicable(BIMI, E, "BIMI requires an enforcing DMARC policy");
     } else if p.bimi.verdict == PostureVerdict::Unknown {
         out.incomplete(BIMI, E, "BIMI lookup failed");
@@ -412,6 +414,24 @@ mod tests {
         let mut p = hardened();
         p.mx = MailExchangers::Null;
         assert!(ids(&assess("example.com", &p)).is_empty());
+    }
+
+    #[test]
+    fn bimi_does_not_apply_without_mail() {
+        // Enforcing DMARC, no BIMI record, but the domain receives no mail.
+        for mx in [MailExchangers::Null, MailExchangers::Absent] {
+            let mut p = hardened();
+            p.mx = mx;
+            p.bimi.present = false;
+            p.bimi.verdict = PostureVerdict::Absent;
+            let out = assess("example.com", &p);
+            assert!(!ids(&out).contains(&"email.bimi.missing"), "{:?}", p.mx);
+            assert!(out.runs.iter().any(|r| r.check == "email.bimi"
+                && r.status
+                    == CheckStatus::NotApplicable {
+                        reason: "domain receives no mail".into()
+                    }));
+        }
     }
 
     #[test]

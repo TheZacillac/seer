@@ -11,6 +11,7 @@ use futures::future::BoxFuture;
 
 use super::{AuditContext, CheckOutput, CheckSpec};
 use crate::audit::finding::{Category, Finding, Severity};
+use crate::error::SeerError;
 use crate::headers::{audit_headers_with, HeaderReport, HeaderVerdict};
 use crate::http::SendError;
 use crate::https_upgrade::{self, HttpsUpgradeReport};
@@ -56,7 +57,10 @@ fn run_headers<'a>(ctx: &'a AuditContext<'a>) -> BoxFuture<'a, CheckOutput> {
         let mut out = CheckOutput::default();
         match audit_headers_with(&ctx.auditor.fetcher(), ctx.host).await {
             Ok(report) => out.ran(HEADERS_CHECK, W, assess_headers(ctx.host, &report)),
-            Err(SendError::Connect(_)) => out.ran(HEADERS_CHECK, W, vec![unreachable(ctx.host)]),
+            Err(SendError::Connect(e)) => {
+                tracing::debug!(host = ctx.host, error = %e, "audit: HTTPS connect failed");
+                out.ran(HEADERS_CHECK, W, vec![unreachable(ctx.host, &e)]);
+            }
             Err(SendError::Other(e)) => out.failed(HEADERS_CHECK, W, &e),
         }
         out
@@ -92,8 +96,9 @@ fn run_security_txt<'a>(ctx: &'a AuditContext<'a>) -> BoxFuture<'a, CheckOutput>
     })
 }
 
-/// The finding for a failed HTTPS connection.
-pub(crate) fn unreachable(host: &str) -> Finding {
+/// The finding for a failed HTTPS connection; the evidence is the error's
+/// sanitized category, never its raw detail.
+pub(crate) fn unreachable(host: &str, error: &SeerError) -> Finding {
     Finding::new(
         "web.https.unreachable",
         W,
@@ -101,6 +106,7 @@ pub(crate) fn unreachable(host: &str) -> Finding {
         host,
         "HTTPS connection failed (refused, unreachable, or TLS handshake failure)",
     )
+    .evidence(error.sanitized_message())
     .fix("Serve the site over HTTPS on port 443 with a valid certificate and TLS 1.2+.")
 }
 
@@ -390,10 +396,13 @@ mod tests {
 
     #[test]
     fn connect_failure_reports_https_connection_failed() {
-        let f = unreachable("example.com");
+        let error = SeerError::CertificateError("unknown issuer from 192.0.2.1".into());
+        let f = unreachable("example.com", &error);
         assert_eq!(f.id, "web.https.unreachable");
         assert_eq!(f.severity, Severity::High);
         assert!(f.title.contains("HTTPS connection"), "{}", f.title);
+        // The sanitized category, never the raw detail.
+        assert_eq!(f.evidence, Some(error.sanitized_message()));
     }
 
     #[test]
@@ -465,7 +474,10 @@ mod tests {
             header("content-security-policy", HeaderVerdict::Absent),
         ]);
         let mut all = assess_headers("example.com", &r);
-        all.push(unreachable("example.com"));
+        all.push(unreachable(
+            "example.com",
+            &SeerError::HttpError("refused".into()),
+        ));
         assert!(all.iter().all(|f| IDS.contains(&f.id)));
     }
 }

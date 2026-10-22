@@ -141,7 +141,8 @@ pub(crate) fn parse(url: &str, body: &str, now: DateTime<Utc>) -> SecurityTxtRep
             continue;
         };
         match name.trim().to_ascii_lowercase().as_str() {
-            "contact" => contact.push(value.trim().to_string()),
+            // An empty `Contact:` names no one.
+            "contact" if !value.trim().is_empty() => contact.push(value.trim().to_string()),
             "expires" => expires_raw.push(value.trim()),
             _ => {}
         }
@@ -230,6 +231,17 @@ mod tests {
             now(),
         );
         assert!(r.issues.contains(&SecurityTxtIssue::MultipleExpires));
+    }
+
+    #[test]
+    fn an_empty_contact_is_not_a_contact() {
+        let r = parse(
+            URL,
+            "Contact:\nContact:   \nExpires: 2027-01-01T00:00:00Z\n",
+            now(),
+        );
+        assert!(r.contact.is_empty());
+        assert_eq!(r.issues, vec![SecurityTxtIssue::MissingContact]);
     }
 
     #[test]

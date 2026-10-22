@@ -41,9 +41,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Additive serialized fields** (existing consumers are unaffected):
   `CertWarning.kind`, `CaaPolicy.lookup_failed`, `SpfPolicy.permerror` and
   `EmailPosture.mx`.
-- **Release note:** seer-api's `domain-seer>=` floor must be raised to this
-  release's version when it is cut, since `/audit` and `seer_audit` need
-  `seer.audit`.
 
 ### Security
 - **seer-api requires `mcp>=2.3.0`** (was `>=2.0`). The old floor still

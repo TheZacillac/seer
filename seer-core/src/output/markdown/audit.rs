@@ -1,6 +1,6 @@
 //! Markdown renderer for the security audit.
 
-use super::{heading, table_header, Bullets, MarkdownFormatter, MdCode, MdSafe};
+use super::{heading, table_header, Bullets, MarkdownFormatter, MdCode, MdCodeCell, MdSafe};
 use crate::audit::{AuditReport, CategoryState, CheckStatus};
 
 impl MarkdownFormatter {
@@ -59,7 +59,7 @@ impl MarkdownFormatter {
                     f.severity.as_str(),
                     f.category.label(),
                     MdSafe(&f.title),
-                    MdCode(f.id),
+                    MdCodeCell(f.id),
                     MdSafe(&f.host),
                     MdSafe(f.evidence.as_deref().unwrap_or("")),
                     MdSafe(f.remediation.as_deref().unwrap_or("")),

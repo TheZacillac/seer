@@ -49,6 +49,23 @@ fn run<'a>(ctx: &'a AuditContext<'a>) -> BoxFuture<'a, CheckOutput> {
     })
 }
 
+/// SANs listed in name-mismatch evidence before the rest are counted.
+const MAX_LISTED_SANS: usize = 5;
+
+/// The first [`MAX_LISTED_SANS`] SANs, then `+N more`.
+fn san_summary(sans: &[String]) -> String {
+    let mut out = sans
+        .iter()
+        .take(MAX_LISTED_SANS)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    if sans.len() > MAX_LISTED_SANS {
+        out.push_str(&format!(", +{} more", sans.len() - MAX_LISTED_SANS));
+    }
+    out
+}
+
 /// Maps an SSL report to the certificate and CAA runs. Pure.
 pub(crate) fn assess(host: &str, r: &SslReport) -> CheckOutput {
     let mut out = CheckOutput::default();
@@ -74,7 +91,7 @@ pub(crate) fn assess(host: &str, r: &SslReport) -> CheckOutput {
                 Severity::Critical,
                 "Certificate does not match the host name",
             )
-            .evidence(r.san_names.join(", "))
+            .evidence(san_summary(&r.san_names))
             .fix("Issue a certificate whose SANs include this host."),
             CertWarningKind::SelfSigned => new(
                 "tls.cert.self-signed",
@@ -240,6 +257,24 @@ mod tests {
                 Severity::Medium,
                 Severity::Critical,
             ]
+        );
+    }
+
+    #[test]
+    fn name_mismatch_evidence_caps_the_san_list() {
+        let mut r = report();
+        r.warnings = vec![warning(CertWarningKind::HostnameMismatch)];
+        r.san_names = (1..=8).map(|i| format!("h{i}.example.net")).collect();
+        let out = assess("example.com", &r);
+        assert_eq!(
+            out.findings[0].evidence.as_deref(),
+            Some("h1.example.net, h2.example.net, h3.example.net, h4.example.net, h5.example.net, +3 more")
+        );
+        r.san_names.truncate(2);
+        let out = assess("example.com", &r);
+        assert_eq!(
+            out.findings[0].evidence.as_deref(),
+            Some("h1.example.net, h2.example.net")
         );
     }
 
