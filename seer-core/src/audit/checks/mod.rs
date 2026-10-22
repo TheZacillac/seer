@@ -7,6 +7,10 @@
 //! spec concurrently under one deadline; a spec still running at the
 //! deadline has each of its checks recorded as incomplete.
 
+mod dkim;
+mod email;
+mod registration;
+
 use std::time::Duration;
 
 use futures::future::BoxFuture;
@@ -93,11 +97,11 @@ pub(crate) struct CheckSpec {
 }
 
 /// Every adapter the audit runs.
-pub(crate) static CHECKS: &[CheckSpec] = &[];
+pub(crate) static CHECKS: &[CheckSpec] = &[registration::SPEC, email::SPEC, dkim::SPEC];
 
 /// Every finding id any adapter can emit.
 pub(crate) fn all_ids() -> Vec<&'static str> {
-    let lists: &[&[&str]] = &[];
+    let lists: &[&[&str]] = &[registration::IDS, email::IDS, dkim::IDS];
     lists.iter().flat_map(|ids| ids.iter().copied()).collect()
 }
 
