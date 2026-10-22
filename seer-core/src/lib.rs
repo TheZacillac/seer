@@ -64,6 +64,7 @@ pub mod watchlist;
 pub mod webhook;
 pub mod whois;
 
+pub use audit::{AuditOptions, AuditReport, Auditor};
 pub use availability::{AvailabilityChecker, AvailabilityResult};
 pub use cache::TtlCache;
 pub use config::SeerConfig;

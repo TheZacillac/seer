@@ -729,6 +729,7 @@ the CLI and REPL; the TUI reads the output format and theme.
 | HTTP / SSL | 10s |
 | CT logs (subdomains) | 30s per request (`ct_secs`); each source at most 3 of them |
 | Propagation | 15s |
+| Security audit (whole run) | 60s (`audit_secs`, 10–300s); unfinished checks are reported incomplete |
 
 ### Bulk Operations
 
