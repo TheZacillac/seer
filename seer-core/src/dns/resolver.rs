@@ -17,6 +17,11 @@
 //! needed here, tune [`RESOLVER_ATTEMPTS`] rather than adding a wrapper;
 //! `query()`'s direct path derives its deadline from it
 //! (`transport::QUERY_BUDGET_TIMEOUTS`).
+//!
+//! One follow-up is not a retry: hickory-resolver 0.26.3 can give up on an
+//! answer too big for UDP without asking over TCP, so a lookup that ends
+//! truncated is asked once more over TCP of the same servers
+//! (`DnsResolver::lookup_with_tcp_fallback`), as a truncated reply requires.
 
 use std::borrow::Cow;
 use std::net::IpAddr;
@@ -27,9 +32,12 @@ use std::time::{Duration, Instant};
 
 use futures::future::{self, Either};
 use hickory_resolver::config::{
-    NameServerConfig, ResolveHosts, ResolverConfig, ResolverOpts, ServerOrderingStrategy, GOOGLE,
+    ConnectionConfig, NameServerConfig, ProtocolConfig, ResolveHosts, ResolverConfig, ResolverOpts,
+    ServerOrderingStrategy, GOOGLE,
 };
+use hickory_resolver::lookup::Lookup;
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
+use hickory_resolver::net::NetError;
 use hickory_resolver::proto::dnssec::PublicKey;
 use hickory_resolver::proto::rr::rdata::svcb::{SvcParamKey, SvcParamValue, SVCB};
 use hickory_resolver::proto::rr::rdata::CAA;
@@ -134,6 +142,46 @@ fn build_resolver(config: ResolverConfig, timeout: Duration) -> Result<TokioReso
     builder
         .build()
         .map_err(|e| SeerError::DnsError(format!("failed to construct DNS resolver: {}", e)))
+}
+
+/// The resolver a [`DnsResolver::resolve`] call runs on, with the upstream
+/// config it was built from (kept so a truncated answer can be asked again
+/// over TCP of the same servers: see [`tcp_only`]).
+struct ResolveTarget<'a> {
+    resolver: Cow<'a, TokioResolver>,
+    config: ResolverConfig,
+}
+
+/// `config` with every UDP connection replaced by TCP on the same port.
+/// Encrypted transports are kept as they are: they never truncate.
+fn tcp_only(config: &ResolverConfig) -> ResolverConfig {
+    let mut tcp =
+        ResolverConfig::from_parts(config.domain().cloned(), config.search().to_vec(), vec![]);
+    for server in config.name_servers() {
+        let mut server = server.clone();
+        let udp_ports: Vec<u16> = server
+            .connections
+            .iter()
+            .filter(|c| matches!(c.protocol, ProtocolConfig::Udp))
+            .map(|c| c.port)
+            .collect();
+        server
+            .connections
+            .retain(|c| !matches!(c.protocol, ProtocolConfig::Udp));
+        for port in udp_ports {
+            let has_tcp = server
+                .connections
+                .iter()
+                .any(|c| matches!(c.protocol, ProtocolConfig::Tcp) && c.port == port);
+            if !has_tcp {
+                let mut connection = ConnectionConfig::tcp();
+                connection.port = port;
+                server.connections.push(connection);
+            }
+        }
+        tcp.add_name_server(server);
+    }
+    tcp
 }
 
 /// Build the default (Google DNS over UDP/TCP) resolver.
@@ -368,8 +416,29 @@ impl DnsResolver {
         self
     }
 
+    /// Test-only: the resolver `resolve` builds for `nameserver`, for
+    /// asserting its spec parsing and SSRF vetting.
+    #[cfg(test)]
     async fn create_custom_resolver(&self, nameserver: &str) -> Result<TokioResolver> {
-        build_resolver(self.custom_upstream_config(nameserver).await?, self.timeout)
+        Ok(self.custom_target(nameserver).await?.resolver.into_owned())
+    }
+
+    /// A resolver built for `nameserver` (parsed, resolved and SSRF-vetted by
+    /// `custom_upstream_config`), with the config it was built from.
+    async fn custom_target(&self, nameserver: &str) -> Result<ResolveTarget<'static>> {
+        let config = self.custom_upstream_config(nameserver).await?;
+        Ok(ResolveTarget {
+            resolver: Cow::Owned(build_resolver(config.clone(), self.timeout)?),
+            config,
+        })
+    }
+
+    /// The cached default resolver, with the config it was built from.
+    fn default_target(&self) -> ResolveTarget<'_> {
+        ResolveTarget {
+            resolver: Cow::Borrowed(&self.default_resolver),
+            config: default_upstream_config(),
+        }
     }
 
     /// The upstream config for a caller's nameserver spec: parsed, its host
@@ -454,13 +523,12 @@ impl DnsResolver {
         }
     }
 
-    /// The resolver a query runs on: one built for `nameserver` (parsed,
-    /// resolved and SSRF-vetted by `custom_upstream_config`), or the cached
-    /// default.
-    async fn upstream(&self, nameserver: Option<&str>) -> Result<Cow<'_, TokioResolver>> {
+    /// The resolver a [`resolve`](Self::resolve) call runs on: one built for
+    /// `nameserver`, or the cached default.
+    async fn upstream(&self, nameserver: Option<&str>) -> Result<ResolveTarget<'_>> {
         Ok(match self.effective_nameserver(nameserver) {
-            Some(ns) => Cow::Owned(self.create_custom_resolver(ns).await?),
-            None => Cow::Borrowed(&self.default_resolver),
+            Some(ns) => self.custom_target(ns).await?,
+            None => self.default_target(),
         })
     }
 
@@ -634,7 +702,7 @@ impl DnsResolver {
         // Input first: a bad name must not cost a nameserver-hostname lookup.
         let domain = prepare_query(domain, record_type)?;
         // Reuse the cached default resolver when no custom nameserver is specified
-        let resolver = self.upstream(nameserver).await?;
+        let target = self.upstream(nameserver).await?;
 
         debug!(
             nameserver = nameserver.unwrap_or(DEFAULT_UPSTREAM),
@@ -645,15 +713,15 @@ impl DnsResolver {
             RecordType::SRV => match parse_srv_query(&domain) {
                 // dig-style `_service._proto.name` queries resolve directly.
                 Some((service, protocol, name)) => {
-                    self.resolve_srv_core(&resolver, &service, &protocol, &name)
+                    self.resolve_srv_core(&target, &service, &protocol, &name)
                         .await
                 }
                 // A bare domain isn't a valid SRV query — surface a usage hint
                 // as an input error (permanent), not a transient DNS failure.
                 None => Err(srv_format_error()),
             },
-            RecordType::ANY => self.resolve_any(&resolver, &domain).await,
-            single => self.resolve_type(&resolver, &domain, single).await,
+            RecordType::ANY => self.resolve_any(&target, &domain).await,
+            single => self.resolve_type(&target, &domain, single).await,
         }
     }
 
@@ -665,13 +733,13 @@ impl DnsResolver {
     /// DNS failures, so they must not be advertised as retryable.
     async fn resolve_srv_core(
         &self,
-        resolver: &TokioResolver,
+        target: &ResolveTarget<'_>,
         service: &str,
         protocol: &str,
         domain: &str,
     ) -> Result<Vec<DnsRecord>> {
         let query_name = srv_query_name(service, protocol, domain)?;
-        self.resolve_records(resolver, &query_name, RecordType::SRV)
+        self.resolve_records(target, &query_name, RecordType::SRV)
             .await
     }
 
@@ -684,7 +752,7 @@ impl DnsResolver {
     /// "unsupported record type" error from either entry point.
     async fn resolve_type(
         &self,
-        resolver: &TokioResolver,
+        target: &ResolveTarget<'_>,
         domain: &str,
         record_type: RecordType,
     ) -> Result<Vec<DnsRecord>> {
@@ -693,10 +761,42 @@ impl DnsResolver {
             // PTR accepts a raw IP literal, which is queried as its
             // reverse-DNS name (and reported under that name).
             RecordType::PTR => {
-                self.resolve_records(resolver, &ptr_query_name(domain), RecordType::PTR)
+                self.resolve_records(target, &ptr_query_name(domain), RecordType::PTR)
                     .await
             }
-            single => self.resolve_records(resolver, domain, single).await,
+            single => self.resolve_records(target, domain, single).await,
+        }
+    }
+
+    /// `target`'s lookup of `name`, asked once more over TCP when it ends with
+    /// a truncated answer.
+    ///
+    /// hickory-resolver 0.26.3 queries two servers in parallel. When the
+    /// answer is too big for UDP, the first truncated reply switches the
+    /// request to TCP, and the second server's truncated UDP reply, still in
+    /// flight, is then taken for a truncated TCP reply: hickory gives up
+    /// without asking over TCP. A truncated reply calls for exactly that TCP
+    /// query (RFC 7766 §5), so this sends it — once, to the same servers.
+    /// Remove once hickory fixes the race (the
+    /// `hickory_still_abandons_truncated_parallel_udp_replies` test fails then).
+    async fn lookup_with_tcp_fallback(
+        &self,
+        target: &ResolveTarget<'_>,
+        name: &str,
+        wire_type: HickoryRecordType,
+    ) -> std::result::Result<Lookup, NetError> {
+        match target.resolver.lookup(name, wire_type).await {
+            Err(NetError::Truncated) => {
+                debug!(name, "truncated answer abandoned over UDP; asking over TCP");
+                match build_resolver(tcp_only(&target.config), self.timeout) {
+                    Ok(tcp) => tcp.lookup(name, wire_type).await,
+                    Err(e) => {
+                        debug!(error = %e, "cannot build the TCP resolver");
+                        Err(NetError::Truncated)
+                    }
+                }
+            }
+            other => other,
         }
     }
 
@@ -710,7 +810,7 @@ impl DnsResolver {
     /// are sorted by preference so the highest-priority exchange is first.
     async fn resolve_records(
         &self,
-        resolver: &TokioResolver,
+        target: &ResolveTarget<'_>,
         domain: &str,
         record_type: RecordType,
     ) -> Result<Vec<DnsRecord>> {
@@ -718,7 +818,10 @@ impl DnsResolver {
             return Err(unsupported_record_type(record_type));
         };
 
-        let response = match resolver.lookup(domain, wire_type).await {
+        let response = match self
+            .lookup_with_tcp_fallback(target, domain, wire_type)
+            .await
+        {
             Ok(response) => response,
             Err(e) if e.is_no_records_found() => return Ok(vec![]),
             Err(e) => {
@@ -753,7 +856,11 @@ impl DnsResolver {
         Ok(records)
     }
 
-    async fn resolve_any(&self, resolver: &TokioResolver, domain: &str) -> Result<Vec<DnsRecord>> {
+    async fn resolve_any(
+        &self,
+        target: &ResolveTarget<'_>,
+        domain: &str,
+    ) -> Result<Vec<DnsRecord>> {
         // Query the ANY types concurrently — previously these ran serially,
         // making `ANY` ~7x slower than a single query (#61). `join_all`
         // preserves input order, so the merged record list keeps the
@@ -761,7 +868,7 @@ impl DnsResolver {
         let results = future::join_all(ANY_TYPES.into_iter().map(|record_type| async move {
             (
                 record_type,
-                self.resolve_type(resolver, domain, record_type).await,
+                self.resolve_type(target, domain, record_type).await,
             )
         }))
         .await;
@@ -1767,6 +1874,44 @@ mod tests {
     }
 
     #[test]
+    fn tcp_only_swaps_udp_for_tcp_on_the_same_port() {
+        let default = tcp_only(&default_upstream_config());
+        assert!(!default.name_servers().is_empty());
+        for server in default.name_servers() {
+            assert_eq!(server.connections.len(), 1, "{server:?}");
+            assert!(matches!(
+                server.connections[0].protocol,
+                ProtocolConfig::Tcp
+            ));
+            assert_eq!(server.connections[0].port, 53);
+        }
+
+        let udp_only = tcp_only(&single_server_config(
+            IpAddr::from([192, 0, 2, 1]),
+            5353,
+            false,
+        ));
+        let server = &udp_only.name_servers()[0];
+        assert_eq!(server.connections.len(), 1);
+        assert!(matches!(
+            server.connections[0].protocol,
+            ProtocolConfig::Tcp
+        ));
+        assert_eq!(server.connections[0].port, 5353);
+    }
+
+    #[test]
+    fn tcp_only_keeps_encrypted_transports() {
+        let spec = NameserverSpec::parse("tls://1.1.1.1").unwrap();
+        let config = build_upstream_config(&spec, &[IpAddr::from([1, 1, 1, 1])], None);
+        let tcp = tcp_only(&config);
+        assert_eq!(
+            format!("{:?}", tcp.name_servers()),
+            format!("{:?}", config.name_servers())
+        );
+    }
+
+    #[test]
     fn upstream_config_udp_defaults() {
         use hickory_resolver::config::ProtocolConfig;
 
@@ -2052,7 +2197,7 @@ mod tests {
         let r = DnsResolver::new();
         // With_dot service name would construct a malformed DNS query.
         let result = r
-            .resolve_srv_core(&r.default_resolver, "http.evil", "tcp", "example.com")
+            .resolve_srv_core(&r.default_target(), "http.evil", "tcp", "example.com")
             .await;
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string().to_lowercase();
@@ -2067,7 +2212,7 @@ mod tests {
     async fn resolve_srv_rejects_invalid_protocol_label() {
         let r = DnsResolver::new();
         let result = r
-            .resolve_srv_core(&r.default_resolver, "http", "tcp.evil", "example.com")
+            .resolve_srv_core(&r.default_target(), "http", "tcp.evil", "example.com")
             .await;
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string().to_lowercase();
@@ -2441,7 +2586,7 @@ mod tests {
     use crate::dns::query::DnsStatus;
     use crate::dns::test_support::{
         a_rdata, cname_rdata, mock_dns_resolver, mock_dns_resolver_default, record, spawn_mock_dns,
-        spawn_mock_dns_fn, spawn_mock_dns_fn_with_tcp, MockMode, MockReply,
+        spawn_mock_dns_fn, spawn_mock_dns_fn_with_tcp, spawn_mock_dns_split, MockMode, MockReply,
     };
     use hickory_resolver::proto::op::ResponseCode;
 
@@ -3208,6 +3353,64 @@ mod tests {
         assert_eq!(*transports.lock().unwrap(), 2, "UDP, then TCP");
     }
 
+    /// Two mock servers on loopback whose answer for `big.seer.test` is too
+    /// big for UDP: every UDP reply is truncated, TCP returns three A
+    /// records. One upstream group, so hickory queries both in parallel.
+    async fn two_truncating_servers() -> ResolverConfig {
+        let mut config = ResolverConfig::from_parts(None, vec![], vec![]);
+        for _ in 0..2 {
+            let port = spawn_mock_dns_split(
+                |_, _| MockReply::Truncated,
+                |qname, _| {
+                    if qname == "big.seer.test" {
+                        MockReply::Answer((1..=3).map(|i| a_rdata([192, 0, 2, i])).collect())
+                    } else {
+                        MockReply::NxDomain
+                    }
+                },
+            )
+            .await;
+            for server in
+                single_server_config(IpAddr::from([127, 0, 0, 1]), port, true).name_servers()
+            {
+                config.add_name_server(server.clone());
+            }
+        }
+        config
+    }
+
+    /// Regression: an answer too big for UDP (cloudflare.com's apex TXT) was
+    /// reported as a failed lookup, so `posture` read SPF as unknown.
+    #[tokio::test]
+    async fn mock_resolve_asks_over_tcp_when_parallel_udp_replies_truncate() {
+        let r = DnsResolver::new().with_timeout(Duration::from_secs(2));
+        let config = two_truncating_servers().await;
+        let target = ResolveTarget {
+            resolver: Cow::Owned(build_resolver(config.clone(), r.timeout).unwrap()),
+            config,
+        };
+        let records = r
+            .resolve_records(&target, "big.seer.test", RecordType::A)
+            .await
+            .expect("a truncated answer is asked again over TCP");
+        assert_eq!(records.len(), 3);
+    }
+
+    /// The hickory-resolver 0.26.3 race the TCP fallback exists for. When
+    /// this fails, hickory asks over TCP by itself: remove
+    /// `lookup_with_tcp_fallback`.
+    #[tokio::test]
+    async fn hickory_still_abandons_truncated_parallel_udp_replies() {
+        let config = two_truncating_servers().await;
+        let resolver = build_resolver(config, Duration::from_secs(2)).unwrap();
+        let result = resolver.lookup("big.seer.test", HickoryRecordType::A).await;
+        assert!(
+            matches!(result, Err(NetError::Truncated)),
+            "{:?}",
+            result.map(|lookup| lookup.answers().len())
+        );
+    }
+
     #[tokio::test]
     async fn mock_query_reports_a_referral_as_neither_nodata_nor_an_answer() {
         // A server that is not authoritative for the name and does not
@@ -3611,7 +3814,7 @@ mod tests {
         let r = DnsResolver::new();
         for composite in [RecordType::SRV, RecordType::ANY] {
             let err = r
-                .resolve_type(&r.default_resolver, "seer.test", composite)
+                .resolve_type(&r.default_target(), "seer.test", composite)
                 .await
                 .expect_err("composite types must be rejected by resolve_type");
             assert_eq!(

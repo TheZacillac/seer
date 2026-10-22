@@ -50,6 +50,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   probe can no longer cap the grade at C. `seer delegation` and its exit code
   are unchanged.
 
+### Fixed
+- **Records too big for UDP no longer fail to resolve.** `posture` read SPF
+  as "unknown (lookup failed)" for domains with a large apex TXT set, such
+  as cloudflare.com and github.com, and any other lookup of an answer that
+  needs TCP could fail the same way. hickory-resolver 0.26.3 queries two
+  servers in parallel and, when both UDP replies come back truncated, gives
+  up without asking over TCP. Seer now asks such a lookup once more over TCP
+  of the same servers. This works around the hickory race and can be
+  removed once hickory ships a fix (a test flags when it does).
+
 ### Security
 - **seer-api requires `mcp>=2.3.0`** (was `>=2.0`). The old floor still
   resolved 2.0.0–2.1.1, affected by CVE-2026-59951 (GHSA-84m7-p3x7-pcfv:

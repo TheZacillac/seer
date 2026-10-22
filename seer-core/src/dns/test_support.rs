@@ -389,6 +389,32 @@ pub(crate) async fn spawn_mock_dns_fn_with_tcp<F>(handler: F) -> u16
 where
     F: FnMut(&str, HickoryRecordType) -> MockReply + Send + 'static,
 {
+    let (socket, listener) = bind_shared_port().await;
+    let port = serve_udp(socket, handler);
+    tokio::spawn(relay_tcp(listener, port));
+    port
+}
+
+/// Like [`spawn_mock_dns_fn_with_tcp`], but each transport has its own
+/// handler: UDP queries get `udp(qname, qtype)`, TCP queries
+/// `tcp(qname, qtype)` — e.g. a server whose answer is too big for UDP,
+/// truncating every UDP reply and answering in full over TCP. Returns the
+/// shared port.
+pub(crate) async fn spawn_mock_dns_split<U, T>(udp: U, tcp: T) -> u16
+where
+    U: FnMut(&str, HickoryRecordType) -> MockReply + Send + 'static,
+    T: FnMut(&str, HickoryRecordType) -> MockReply + Send + 'static,
+{
+    // TCP queries are relayed to a UDP loop of their own, on another port.
+    let tcp_backend = spawn_mock_dns_fn(tcp).await;
+    let (socket, listener) = bind_shared_port().await;
+    let port = serve_udp(socket, udp);
+    tokio::spawn(relay_tcp(listener, tcp_backend));
+    port
+}
+
+/// A UDP socket and a TCP listener bound to one free loopback port.
+async fn bind_shared_port() -> (UdpSocket, TcpListener) {
     // One protocol picks an ephemeral port, the other binds the same number.
     // Alternate which one picks: Windows reserves blocks of ports per protocol
     // (Hyper-V/WinNAT exclusions) and hands out ephemeral ports near the last
@@ -397,11 +423,7 @@ where
     let mut last_err = None;
     for attempt in 0..16 {
         match bind_udp_tcp_pair(attempt % 2 == 1).await {
-            Ok((socket, listener)) => {
-                let port = serve_udp(socket, handler);
-                tokio::spawn(relay_tcp(listener, port));
-                return port;
-            }
+            Ok(pair) => return pair,
             Err(e) => last_err = Some(e),
         }
     }
