@@ -6,7 +6,9 @@
 //! `https://` at the same registrable domain. A connection failure on the
 //! first hop means nothing listens on port 80 (`listening: false`) — which is
 //! fine, not a finding. A failure on a later hop does not erase what the
-//! chain already shows: the first hop's redirect target is the evidence.
+//! chain already shows once it has reached `https://` or left the site; a
+//! failed plain-http hop on the same site leaves the answer unknown (an
+//! error). IP literals compare exactly, never through the PSL.
 //! Single-attempt, like every probe.
 
 use std::time::Duration;
@@ -38,7 +40,9 @@ pub struct HttpsUpgradeReport {
 ///
 /// # Errors
 /// `InvalidDomain` for bad input; an HTTP error when the first hop failed for
-/// a reason other than a refused/failed connection (the result is unknown).
+/// a reason other than a refused/failed connection, or a later hop failed
+/// before the chain reached `https://` or another site (the result is
+/// unknown).
 pub async fn check_https_upgrade(host: &str, timeout: Duration) -> Result<HttpsUpgradeReport> {
     let host = normalize_host(host)?;
     check_with(&GuardedFetcher::new().with_timeout(timeout), &host).await
@@ -47,9 +51,11 @@ pub async fn check_https_upgrade(host: &str, timeout: Duration) -> Result<HttpsU
 /// [`check_https_upgrade`] for a normalized host and a caller-built fetcher.
 pub(crate) async fn check_with(fetcher: &GuardedFetcher, host: &str) -> Result<HttpsUpgradeReport> {
     let traced = fetcher.get_head_traced(&format!("http://{host}/")).await;
+    // An empty chain (the URL never parsed) is a first-hop failure too.
+    let first_hop = traced.chain.len() <= 1;
     match traced.result {
         Ok(_) => Ok(assess(host, &traced.chain)),
-        Err(SendError::Connect(_)) if traced.chain.len() == 1 => Ok(HttpsUpgradeReport {
+        Err(SendError::Connect(_)) if first_hop => Ok(HttpsUpgradeReport {
             host: host.to_string(),
             listening: false,
             chain: traced.chain,
@@ -57,9 +63,23 @@ pub(crate) async fn check_with(fetcher: &GuardedFetcher, host: &str) -> Result<H
             first_hop_https: false,
             cross_domain: false,
         }),
-        Err(e) if traced.chain.len() == 1 => Err(e.into()),
-        // A later hop failed; the chain so far is still the evidence.
-        Err(_) => Ok(assess(host, &traced.chain)),
+        Err(e) if first_hop => Err(e.into()),
+        // A later hop failed. The chain so far is evidence only once it has
+        // reached `https://` or left the site; a failed plain-http hop on the
+        // same site leaves the answer unknown.
+        Err(e) => {
+            let report = assess(host, &traced.chain);
+            let reached_https = traced
+                .chain
+                .last()
+                .and_then(|u| url::Url::parse(u).ok())
+                .is_some_and(|u| u.scheme() == "https");
+            if reached_https || report.cross_domain {
+                Ok(report)
+            } else {
+                Err(e.into())
+            }
+        }
     }
 }
 
@@ -83,8 +103,10 @@ pub(crate) fn assess(host: &str, chain: &[String]) -> HttpsUpgradeReport {
     }
 }
 
-/// Whether two hosts share a registrable domain; hosts with none (IP
-/// literals, bare labels) must match exactly. A `:port` on `a` is ignored.
+/// Whether two hosts share a registrable domain; IP literals and hosts with
+/// none (bare labels) must match exactly — an IP never goes through the PSL,
+/// which would read `10.1.2.3` as the registrable `2.3`. A `:port` on `a` is
+/// ignored.
 fn same_registrable(a: &str, b: &str) -> bool {
     let a = a.rsplit_once(':').map_or(a, |(h, port)| {
         if port.chars().all(|c| c.is_ascii_digit()) {
@@ -93,6 +115,10 @@ fn same_registrable(a: &str, b: &str) -> bool {
             a
         }
     });
+    let is_ip = |h: &str| h.parse::<std::net::IpAddr>().is_ok();
+    if is_ip(a) || is_ip(b) {
+        return a.eq_ignore_ascii_case(b);
+    }
     match (
         crate::psl::registrable_domain(a),
         crate::psl::registrable_domain(b),
@@ -149,6 +175,16 @@ mod tests {
         assert!(r.first_hop_https && !r.upgraded);
     }
 
+    #[test]
+    fn ip_literals_compare_exactly() {
+        // Never through the PSL, which would read `2.3` as a registrable domain.
+        assert!(!same_registrable("10.1.2.3", "10.9.2.3"));
+        assert!(!same_registrable("10.1.2.3:8080", "10.9.2.3"));
+        assert!(same_registrable("10.1.2.3:8080", "10.1.2.3"));
+        assert!(!same_registrable("example.com", "10.1.2.3"));
+        assert!(same_registrable("example.com", "www.example.com"));
+    }
+
     #[tokio::test]
     async fn closed_port_80_is_not_listening() {
         let port = {
@@ -202,8 +238,49 @@ mod tests {
             .allowing_private_hosts();
         let r = check_with(&fetcher, &host).await.unwrap();
         assert!(r.listening && r.first_hop_https, "{r:?}");
-        // Loopback hosts have no registrable domain, so same-host comparison
-        // falls back to the bare host (ports differ, IP is equal).
+        // IP literals compare exactly, ignoring the probed host's port: the
+        // ports differ, the IP is equal.
         assert!(r.upgraded, "{r:?}");
+    }
+
+    #[tokio::test]
+    async fn later_plain_http_hop_failure_is_unknown() {
+        // Redirects to another plain-http URL that fails: nothing shows the
+        // site upgrades or not, so the result is unknown.
+        let closed = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/"))
+            .respond_with(
+                ResponseTemplate::new(301)
+                    .insert_header("location", format!("http://127.0.0.1:{closed}/").as_str()),
+            )
+            .mount(&server)
+            .await;
+        let host = server.uri().trim_start_matches("http://").to_string();
+        let fetcher = GuardedFetcher::new()
+            .with_timeout(Duration::from_secs(2))
+            .allowing_private_hosts();
+        let r = check_with(&fetcher, &host).await;
+        assert!(r.is_err(), "{r:?}");
+    }
+
+    #[tokio::test]
+    async fn first_hop_non_connect_failure_is_unknown() {
+        // A production fetcher refuses loopback before connecting (SSRF): an
+        // unknown, not "nothing listens".
+        let r = check_with(&GuardedFetcher::new(), "127.0.0.1").await;
+        assert!(r.is_err(), "{r:?}");
+    }
+
+    #[tokio::test]
+    async fn a_failure_before_any_hop_is_unknown() {
+        // The URL never parses, so the chain is empty: unknown, never an
+        // assessment of an empty chain.
+        let r = check_with(&GuardedFetcher::new().allowing_private_hosts(), "exa mple").await;
+        assert!(r.is_err(), "{r:?}");
     }
 }
