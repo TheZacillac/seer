@@ -19,9 +19,10 @@
 //!   omits or lies about `Content-Length` cannot force an unbounded buffer, and
 //!   the read is wrapped in a total-duration timeout so a server that trickles
 //!   bytes forever cannot hang the caller.
-//! - Failures are classified ([`SendError`]): a connect failure is
-//!   distinguishable from an unknown, and the traced variants keep the
-//!   redirect chain.
+//! - Failures are classified ([`SendError`]): a connect failure that reached
+//!   the network is distinguishable from an unknown (a timeout, or a local
+//!   no-route error — this host has no route), and the traced variants keep
+//!   the redirect chain.
 //! - TLS verification is left at reqwest's validating default. Unlike
 //!   [`crate::ssl`], which relaxes verification *because* inspecting a bad
 //!   certificate is its purpose, these probes draw security conclusions from
@@ -114,15 +115,18 @@ pub(crate) struct FetchedResponse {
 }
 
 /// Why a guarded request failed, split so a probe can tell "the connection
-/// failed" (refused, unreachable, TLS handshake failure) from everything else
-/// (SSRF refusal, bad URL, redirect loop, any timeout), which is an unknown,
-/// not a negative result. A timeout is [`SendError::Other`]: it may be packet
-/// loss, so it proves nothing about the host.
+/// failed" (refused, remote unreachable, TLS handshake failure) from
+/// everything else (SSRF refusal, bad URL, redirect loop, any timeout, a
+/// local no-route error), which is an unknown, not a negative result. A
+/// timeout is [`SendError::Other`]: it may be packet loss, so it proves
+/// nothing about the host; nor does a local no-route error (this host has no
+/// route to the address, e.g. an IPv6 address without IPv6 transit).
 #[derive(Debug)]
 pub(crate) enum SendError {
-    /// The connection failed: refused, unreachable, or a TLS handshake failure.
+    /// The connection failed: refused, remote unreachable, or a TLS handshake
+    /// failure.
     Connect(SeerError),
-    /// Any other failure.
+    /// Any other failure, including timeouts and local no-route errors.
     Other(SeerError),
 }
 
@@ -280,14 +284,11 @@ impl GuardedFetcher {
                 )))
             })?;
 
-            let response = client.get(url.clone()).send().await.map_err(|e| {
-                let error = SeerError::HttpError(e.to_string());
-                if e.is_connect() {
-                    SendError::Connect(error)
-                } else {
-                    SendError::Other(error)
-                }
-            })?;
+            let response = client
+                .get(url.clone())
+                .send()
+                .await
+                .map_err(classify_send_error)?;
 
             // A 3xx with no `Location` has nowhere to go and is the final
             // response (RFC 9110 §15.4: `Location` is optional for 300 and
@@ -337,6 +338,39 @@ impl GuardedFetcher {
             })?;
         Ok(String::from_utf8_lossy(&body).into_owned())
     }
+}
+
+/// Splits a failed request into [`SendError`]: only a connect failure that
+/// reached the network (refused, remote unreachable, TLS handshake failure)
+/// is [`SendError::Connect`]. A connect timeout and a local no-route error
+/// (this host has no route, see [`is_local_failure`]) say nothing about the
+/// remote host, so they are [`SendError::Other`].
+fn classify_send_error(e: reqwest::Error) -> SendError {
+    let connect = e.is_connect() && !e.is_timeout() && !is_local_failure(&e);
+    let error = SeerError::HttpError(e.to_string());
+    if connect {
+        SendError::Connect(error)
+    } else {
+        SendError::Other(error)
+    }
+}
+
+/// Whether any io error in `error`'s source chain (or wrapped inside one)
+/// means the packet never left this host — the DNS layer's rule,
+/// `dns::delegation::is_local_no_route`.
+fn is_local_failure(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut next = Some(error);
+    while let Some(err) = next {
+        next = match err.downcast_ref::<std::io::Error>() {
+            Some(io) if crate::dns::is_local_no_route(io) => return true,
+            // An io error's `source()` skips its own payload; look inside it.
+            Some(io) => io
+                .get_ref()
+                .map(|inner| inner as &(dyn std::error::Error + 'static)),
+            None => err.source(),
+        };
+    }
+    false
 }
 
 /// What [`read_body_capped`] does once a body outgrows its cap.
@@ -715,6 +749,35 @@ mod tests {
             traced.result.err()
         );
         assert_eq!(traced.chain.len(), 1);
+    }
+
+    /// A wrapper whose `source()` is the io error, as hyper's connect error is.
+    #[derive(Debug)]
+    struct Wrapped(std::io::Error);
+    impl std::fmt::Display for Wrapped {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("tcp connect error")
+        }
+    }
+    impl std::error::Error for Wrapped {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&self.0)
+        }
+    }
+
+    #[test]
+    fn local_no_route_anywhere_in_the_chain_is_a_local_failure() {
+        use std::io::{Error, ErrorKind};
+        for kind in [ErrorKind::NetworkUnreachable, ErrorKind::HostUnreachable] {
+            assert!(is_local_failure(&Wrapped(Error::from(kind))), "{kind:?}");
+            // Also when an io error wraps the cause (as its payload).
+            assert!(is_local_failure(&Error::other(Error::from(kind))));
+        }
+        // A remote refusal or reset reached the host: not local.
+        for kind in [ErrorKind::ConnectionRefused, ErrorKind::ConnectionReset] {
+            assert!(!is_local_failure(&Wrapped(Error::from(kind))), "{kind:?}");
+        }
+        assert!(!is_local_failure(&Error::other("no io cause")));
     }
 
     #[tokio::test]

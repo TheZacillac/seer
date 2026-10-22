@@ -2,9 +2,10 @@
 //! port-80 → HTTPS upgrade, and `security.txt`. Three independent fetches,
 //! so three specs (one slow origin cannot take the others' results with it).
 //!
-//! A failed HTTPS connection (refused, unreachable, TLS handshake failure)
-//! is a finding — the site is not reachable over HTTPS — reported by the
-//! `web.headers` check; any other fetch failure is unknown (incomplete).
+//! A failed HTTPS connection (refused, remote unreachable, TLS handshake
+//! failure) is a finding — the site is not reachable over HTTPS — reported
+//! by the `web.headers` check; any other fetch failure (a timeout, or no
+//! route from this host) is unknown (incomplete).
 
 use futures::future::BoxFuture;
 
