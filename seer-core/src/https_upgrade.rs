@@ -192,7 +192,7 @@ mod tests {
             l.local_addr().unwrap().port()
         };
         let fetcher = GuardedFetcher::new()
-            .with_timeout(Duration::from_secs(2))
+            .with_timeout(crate::http::CLOSED_PORT_TEST_TIMEOUT)
             .allowing_private_hosts();
         let r = check_with(&fetcher, &format!("127.0.0.1:{port}"))
             .await
@@ -234,7 +234,7 @@ mod tests {
             .await;
         let host = server.uri().trim_start_matches("http://").to_string();
         let fetcher = GuardedFetcher::new()
-            .with_timeout(Duration::from_secs(2))
+            .with_timeout(crate::http::CLOSED_PORT_TEST_TIMEOUT)
             .allowing_private_hosts();
         let r = check_with(&fetcher, &host).await.unwrap();
         assert!(r.listening && r.first_hop_https, "{r:?}");
@@ -262,7 +262,7 @@ mod tests {
             .await;
         let host = server.uri().trim_start_matches("http://").to_string();
         let fetcher = GuardedFetcher::new()
-            .with_timeout(Duration::from_secs(2))
+            .with_timeout(crate::http::CLOSED_PORT_TEST_TIMEOUT)
             .allowing_private_hosts();
         let r = check_with(&fetcher, &host).await;
         assert!(r.is_err(), "{r:?}");

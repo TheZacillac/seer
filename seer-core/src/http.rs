@@ -44,6 +44,13 @@ use crate::error::{Result, SeerError};
 /// Default per-hop timeout (connect + response headers + body read).
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Deadline for tests that connect to a closed loopback port and expect a
+/// refusal. Windows retries a refused SYN and reports ECONNREFUSED only after
+/// about 2s, so a shorter deadline turns the refusal into a timeout (which
+/// classifies as [`SendError::Other`], not `Connect`).
+#[cfg(test)]
+pub(crate) const CLOSED_PORT_TEST_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Maximum redirect hops followed before giving up.
 const MAX_REDIRECTS: usize = 5;
 
@@ -738,7 +745,7 @@ mod tests {
             listener.local_addr().unwrap().port()
         };
         let fetcher = GuardedFetcher::new()
-            .with_timeout(Duration::from_secs(2))
+            .with_timeout(CLOSED_PORT_TEST_TIMEOUT)
             .allowing_private_hosts();
         let traced = fetcher
             .get_head_traced(&format!("http://127.0.0.1:{port}/"))
