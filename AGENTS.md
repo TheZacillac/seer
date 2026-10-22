@@ -2,8 +2,9 @@
 
 Seer is a domain-name utility in Rust with Python bindings: WHOIS, RDAP, DNS
 (dig, trace, propagation, DNSSEC, delegation), SSL, HTTP status/headers,
-email posture, subdomain takeover and more, exposed as a CLI (commands, REPL,
-TUI), a Python library, a FastAPI REST API and an MCP server.
+email posture, subdomain takeover, a graded security audit (`seer audit`)
+and more, exposed as a CLI (commands, REPL, TUI), a Python library, a
+FastAPI REST API and an MCP server.
 
 This file holds the rules and the non-obvious parts. **How a module works
 lives in its `//!` overview** (every `mod.rs` and major file has one) — read
@@ -122,7 +123,9 @@ informational coverage. Python test failures block merges like Rust ones.
   - RDAP: `wiremock` against `query_rdap_with_retry` (bypasses the global
     bootstrap cache).
   - DNS: `dns/test_support.rs` — `spawn_mock_dns_fn` scripted with
-    `MockReply` (+ `_with_tcp` for truncation), `mock_dns_resolver[_default]`.
+    `MockReply` (+ `_with_tcp` for truncation; `spawn_mock_dns_split` for a
+    separate UDP and TCP handler, e.g. an answer too big for UDP),
+    `mock_dns_resolver[_default]`.
     A `query()` below the registrable domain also sends the wildcard probe
     (`seer-probe-<hex>.<parent>`), so handlers see one extra query.
   - TLS: `tls::test_support` loopback rustls servers and legacy leaves.
@@ -167,7 +170,13 @@ informational coverage. Python test failures block merges like Rust ones.
 - **Retry boundary.** WHOIS and RDAP retry via `retry.rs`. `dns/`,
   `status/`, `ssl.rs`/`tls.rs`, `http.rs` are single-attempt on purpose —
   health probes must not retry-mask flakiness. Failing over to the next
-  address/server is allowed; re-sending the same query is not.
+  address/server is allowed; re-sending the same query is not. One
+  deliberate exception: `DnsResolver::lookup_with_tcp_fallback` asks once
+  more over TCP when a lookup ends truncated (RFC 7766 §5), because
+  hickory-resolver 0.26.3 can abandon a truncated answer without doing so.
+  It is a protocol step, not a retry — keep it to that single TCP query, and
+  remove it when `hickory_still_abandons_truncated_parallel_udp_replies`
+  starts failing (hickory fixed upstream).
 - **Timeouts on every network operation**, bounded by one overall deadline
   where a walk could chain them (trace, delegation, `query()`). Defaults:
   WHOIS/RDAP 15s, DNS 5s, HTTP/SSL 10s, CT 30s.
