@@ -711,6 +711,7 @@ def test_mcp_ssrf_guard_rejects_reserved():
         ("seer_caa", {"domain": "example.com"}, "caa"),
         ("seer_posture", {"domain": "example.com"}, "posture"),
         ("seer_headers", {"domain": "example.com"}, "headers"),
+        ("seer_audit", {"domain": "example.com"}, "audit"),
         ("seer_takeover", {"domain": "example.com"}, "takeover"),
         ("seer_subdomains", {"domain": "example.com"}, "subdomains"),
         (
