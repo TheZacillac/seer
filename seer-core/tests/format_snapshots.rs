@@ -32,8 +32,8 @@ use seer_core::headers::{CookieFinding, Disclosure, HeaderFinding, HeaderReport,
 use seer_core::lookup::LookupResult;
 use seer_core::output::{get_formatter, OutputFormat, OutputFormatter};
 use seer_core::posture::{
-    BimiPolicy, DanePolicy, DmarcPolicy, EmailPosture, MtaStsPolicy, PostureVerdict, SpfPolicy,
-    TlsaRecord,
+    BimiPolicy, DanePolicy, DmarcPolicy, EmailPosture, MailExchangers, MtaStsPolicy,
+    PostureVerdict, SpfPolicy, TlsaRecord,
 };
 use seer_core::rdap::RdapResponse;
 use seer_core::ssl::{CertDetail, CertWarning, CertWarningKind, CertWarningSeverity, SslReport};
@@ -374,6 +374,7 @@ fn fixture_posture() -> EmailPosture {
             record: Some("v=spf1 include:_spf.example.com -all".into()),
             all_qualifier: Some("-".into()),
             verdict: PostureVerdict::Strict,
+            permerror: None,
         },
         dmarc: DmarcPolicy {
             present: true,
@@ -408,6 +409,7 @@ fn fixture_posture() -> EmailPosture {
             }],
             verdict: PostureVerdict::Present,
         },
+        mx: MailExchangers::Hosts(vec!["mx.example.com".into()]),
         notes: vec![
             "DMARC pct=50 applies the policy to only half of spoofed mail".into(),
             "MTA-STS is not configured".into(),

@@ -98,6 +98,12 @@ fn normalize_status_key(code: &str) -> String {
         .collect()
 }
 
+/// Whether any status code (EPP or RDAP form) normalizes to `key`, the
+/// lowercase alphanumeric form (`"clienttransferprohibited"`).
+pub(crate) fn has_status_key(statuses: &[String], key: &str) -> bool {
+    statuses.iter().any(|s| normalize_status_key(s) == key)
+}
+
 /// Decodes a domain status code (EPP or RDAP form) into a plain-English
 /// description, or `None` if the code is unrecognized.
 pub fn describe_epp_status(code: &str) -> Option<&'static str> {
@@ -242,6 +248,12 @@ pub struct DomainInfo {
 }
 
 impl DomainInfo {
+    /// Whether the domain carries the status `key` (normalized form, e.g.
+    /// `"clienttransferprohibited"`), in either EPP or RDAP spelling.
+    pub fn has_status(&self, key: &str) -> bool {
+        has_status_key(&self.status, key)
+    }
+
     /// Constructs a `DomainInfo` by merging optional RDAP and WHOIS data.
     ///
     /// For each field, RDAP is tried first; WHOIS fills any remaining gaps.
@@ -471,6 +483,17 @@ impl DomainInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn has_status_key_matches_either_protocol_form() {
+        let statuses = vec![
+            "client transfer prohibited (https://icann.org/epp)".to_string(),
+            "serverDeleteProhibited".to_string(),
+        ];
+        assert!(has_status_key(&statuses, "clienttransferprohibited"));
+        assert!(has_status_key(&statuses, "serverdeleteprohibited"));
+        assert!(!has_status_key(&statuses, "clientupdateprohibited"));
+    }
 
     /// Build a test RdapResponse with registrar entity, events, nameserver,
     /// secure_dns, and a self link via JSON deserialization.

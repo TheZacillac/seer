@@ -100,8 +100,8 @@ pub use history::{HistoryEntry, LookupHistory};
 #[cfg(feature = "cli")]
 pub use output::{OutputFormat, OutputFormatter};
 pub use posture::{
-    lookup_email_posture, BimiPolicy, DanePolicy, DmarcPolicy, EmailPosture, MtaStsPolicy,
-    PostureVerdict, SpfPolicy,
+    lookup_email_posture, BimiPolicy, DanePolicy, DmarcPolicy, EmailPosture, MailExchangers,
+    MtaStsPolicy, PostureVerdict, SpfPermerror, SpfPolicy,
 };
 pub use ssl::{
     CertDetail, CertWarning, CertWarningKind, CertWarningSeverity, SslChecker, SslReport,
