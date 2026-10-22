@@ -1,5 +1,7 @@
 //! Registration hygiene from the smart lookup: expiry, registrar locks and
-//! registration age. No new traffic. Lock findings are reported only for
+//! registration age, and whether the name is registered at all (only a
+//! high-confidence "available" verdict is a finding; a less certain one is
+//! incomplete). No new traffic. Lock findings are reported only for
 //! registries that demonstrably speak EPP lock vocabulary (some status is a
 //! `…Prohibited` code); for the rest (`ok`/`active` only, a ccTLD's own
 //! words) a missing lock is no evidence.
@@ -8,6 +10,7 @@ use futures::future::BoxFuture;
 
 use super::{AuditContext, CheckOutput, CheckSpec};
 use crate::audit::finding::{Category, Finding, Severity};
+use crate::availability::AvailabilityResult;
 use crate::domain_info::{has_lock_vocabulary, has_status_key, DomainInfo, ExpiryStatus};
 use crate::lookup::LookupResult;
 
@@ -27,6 +30,7 @@ pub(crate) const IDS: &[&str] = &[
     "registration.lock.update",
     "registration.lock.delete",
     "registration.age.young",
+    "registration.status.unregistered",
 ];
 
 /// Registrations younger than this are noted: fresh domains are phishing's
@@ -56,15 +60,11 @@ fn run<'a>(ctx: &'a AuditContext<'a>) -> BoxFuture<'a, CheckOutput> {
     Box::pin(async move {
         let mut out = CheckOutput::default();
         match ctx.auditor.lookup.lookup(ctx.domain).await {
-            Ok(LookupResult::Available { data, .. }) if data.available => {
-                out.not_applicable(CHECK, Category::Registration, "domain is not registered");
-            }
-            Ok(LookupResult::Available { .. }) => {
-                out.incomplete(
-                    CHECK,
-                    Category::Registration,
-                    "registration data unavailable",
-                );
+            Ok(LookupResult::Available { data, .. }) => {
+                match availability_outcome(ctx.domain, &data) {
+                    Ok(findings) => out.ran(CHECK, Category::Registration, findings),
+                    Err(reason) => out.incomplete(CHECK, Category::Registration, reason),
+                }
             }
             Ok(result) => {
                 let info = DomainInfo::from_lookup_result(&result);
@@ -78,6 +78,33 @@ fn run<'a>(ctx: &'a AuditContext<'a>) -> BoxFuture<'a, CheckOutput> {
         }
         out
     })
+}
+
+/// Maps a lookup that found no registration record to findings, or to the
+/// reason the check is incomplete. Only a high-confidence "available"
+/// verdict is a finding; anything less certain is unknown. Pure.
+pub(crate) fn availability_outcome(
+    domain: &str,
+    data: &AvailabilityResult,
+) -> Result<Vec<Finding>, &'static str> {
+    if !data.available {
+        return Err("registration data unavailable");
+    }
+    // `verdict()` is "available" only for (available, confidence "high").
+    if data.verdict() != "available" {
+        return Err("registration status uncertain");
+    }
+    Ok(vec![Finding::new(
+        "registration.status.unregistered",
+        Category::Registration,
+        Severity::Critical,
+        domain,
+        "Domain is not registered",
+    )
+    .evidence(format!("checked via {}", data.method))
+    .fix(
+        "Anyone can register this name; register it or stop using it.",
+    )])
 }
 
 /// Maps registration facts to findings. Pure.
@@ -289,6 +316,34 @@ mod tests {
         );
         assert_eq!(ids(&f), vec!["registration.age.young"]);
         assert_eq!(f[0].severity, Severity::Info);
+    }
+
+    fn availability(available: bool, confidence: &str) -> AvailabilityResult {
+        AvailabilityResult::new("example.com", available, confidence, "rdap")
+    }
+
+    #[test]
+    fn a_confidently_unregistered_domain_is_critical() {
+        let f = availability_outcome("example.com", &availability(true, "high")).unwrap();
+        assert_eq!(ids(&f), vec!["registration.status.unregistered"]);
+        assert_eq!(f[0].severity, Severity::Critical);
+        assert_eq!(f[0].evidence.as_deref(), Some("checked via rdap"));
+        assert!(IDS.contains(&f[0].id));
+    }
+
+    #[test]
+    fn an_uncertain_or_failed_availability_is_incomplete() {
+        for confidence in ["medium", "low", "none"] {
+            assert_eq!(
+                availability_outcome("example.com", &availability(true, confidence)),
+                Err("registration status uncertain"),
+                "{confidence}"
+            );
+        }
+        assert_eq!(
+            availability_outcome("example.com", &availability(false, "none")),
+            Err("registration data unavailable")
+        );
     }
 
     #[test]

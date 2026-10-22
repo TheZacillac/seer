@@ -310,7 +310,7 @@ evidence behind it and a remediation hint:
 - **TLS** — certificate chain and expiry, CAA
 - **DNS** — DNSSEC, delegation health
 - **Takeover** — dangling-CNAME exposure of the apex and `www`
-- **Registration** — expiry and registrar locks
+- **Registration** — whether the name is registered at all, expiry and registrar locks
 
 Each category starts at 100 and loses 60 / 25 / 10 / 3 points per Critical /
 High / Medium / Low finding; the overall score is the weighted average (Email,
