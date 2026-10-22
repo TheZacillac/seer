@@ -260,17 +260,23 @@ mod tests {
         assert!(cache.get(&"key".to_string()).is_none());
     }
 
-    #[test]
-    fn capacity_eviction_batches_to_low_water_mark() {
+    #[tokio::test(start_paused = true)]
+    async fn capacity_eviction_batches_to_low_water_mark() {
         // Eviction removes a BATCH of the oldest entries down to a low-water
         // mark in a single pass, so the O(n) selection is amortized across the
         // next inserts rather than re-run on every insert once full (issue #51).
         // After crossing capacity the size drops below it, not hovering at it.
+        //
+        // Eviction ranks entries by age, and entries inserted in the same
+        // clock tick tie in arbitrary order — on a coarse real clock (seen on
+        // macOS CI) entry 0 could outlive newer ones. The virtual clock gives
+        // each insert a strictly later instant, so "oldest" is well defined.
         let cap = 100;
         let cache: TtlCache<u32, u32> = TtlCache::with_max_capacity(Duration::from_secs(3600), cap);
         for i in 0..=cap as u32 {
             // 0..=100 => 101 distinct keys, crossing capacity once.
             cache.insert(i, i);
+            tokio::time::advance(Duration::from_millis(1)).await;
         }
         assert!(
             cache.len() <= (cap * 9 / 10) + 1,
