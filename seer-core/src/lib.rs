@@ -48,6 +48,7 @@ pub mod posture;
 mod psl;
 pub mod rdap;
 pub mod retry;
+pub mod security_txt;
 pub mod ssl;
 pub mod status;
 pub mod subdomains;
