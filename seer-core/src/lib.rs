@@ -32,6 +32,7 @@ pub mod drift;
 pub mod error;
 #[cfg(feature = "cli")]
 mod fsutil;
+pub mod grade;
 pub mod headers;
 #[cfg(feature = "cli")]
 pub mod history;
