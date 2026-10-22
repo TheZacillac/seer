@@ -78,6 +78,10 @@ pub enum Query {
     Caa(String),
     Posture(String),
     Headers(String),
+    Audit {
+        domain: String,
+        fail_under: Option<seer_core::grade::Letter>,
+    },
     /// Non-empty `hosts` skips CT enumeration.
     Takeover {
         domain: String,
@@ -410,6 +414,13 @@ async fn run_query(
             let _spinner = spinner(format!("Auditing HTTP security headers for {}", domain));
             let report = seer_core::audit_headers(&domain, config.http_timeout()).await?;
             Payload::Headers(Box::new(report))
+        }
+        Query::Audit { domain, fail_under } => {
+            let _spinner = spinner(format!("Auditing security posture of {}", domain));
+            let report = seer_core::Auditor::from_config(config)
+                .audit(&domain, seer_core::AuditOptions { fail_under })
+                .await?;
+            Payload::Audit(Box::new(report))
         }
         Query::Takeover { domain, hosts } => {
             let spinner = spinner(format!("Scanning {} for takeover exposure", domain));
