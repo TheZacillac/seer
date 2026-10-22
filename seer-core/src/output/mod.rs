@@ -56,6 +56,7 @@ macro_rules! with_report_methods {
             format_drift(report: crate::drift::DriftReport);
             format_posture(posture: crate::posture::EmailPosture);
             format_headers(report: crate::headers::HeaderReport);
+            format_audit(report: crate::audit::AuditReport);
             format_takeover(report: crate::takeover::TakeoverReport);
             format_caa(policy: crate::caa::CaaPolicy);
             format_confusables(report: crate::confusables::ConfusableReport);

@@ -17,6 +17,10 @@
 // here as in unit tests.
 #![allow(clippy::unwrap_used)]
 
+use seer_core::audit::{
+    AuditReport, Category, CategoryGrade, CategoryState, CheckRun, CheckStatus, Finding,
+    OverallGrade, Severity,
+};
 use seer_core::availability::AvailabilityResult;
 use seer_core::caa::{CaaPolicy, CaaRecord, ISSUANCE_TIME_NOTE};
 use seer_core::confusables::{ConfusableReport, RegisteredLookalike};
@@ -28,6 +32,7 @@ use seer_core::dns::{
 };
 use seer_core::domain_info::DomainInfo;
 use seer_core::drift::{DriftReport, FieldChange};
+use seer_core::grade::Letter;
 use seer_core::headers::{CookieFinding, Disclosure, HeaderFinding, HeaderReport, HeaderVerdict};
 use seer_core::lookup::LookupResult;
 use seer_core::output::{get_formatter, OutputFormat, OutputFormatter};
@@ -1686,6 +1691,129 @@ fn fixture_domain_diff() -> DomainDiff {
     }
 }
 
+/// A capped, incomplete audit with findings at every severity, one finding on
+/// another host, remote text in evidence, and a failed gate.
+fn fixture_audit() -> AuditReport {
+    let f = |id,
+             category,
+             severity,
+             host: &str,
+             title: &str,
+             evidence: Option<&str>,
+             fix: Option<&str>| Finding {
+        id,
+        category,
+        severity,
+        host: host.into(),
+        title: title.into(),
+        evidence: evidence.map(Into::into),
+        remediation: fix.map(Into::into),
+    };
+    let grade = |category, score: Option<u32>, state| CategoryGrade {
+        category,
+        state,
+        score,
+        letter: score.map(Letter::from_score),
+    };
+    AuditReport {
+        domain: "example.com".into(),
+        host: "example.com".into(),
+        overall: Some(OverallGrade {
+            score: 72,
+            letter: Letter::F,
+            capped_by: Some(Severity::Critical),
+        }),
+        categories: vec![
+            grade(Category::Email, Some(65), CategoryState::Graded),
+            grade(Category::Web, Some(77), CategoryState::Graded),
+            grade(Category::Tls, Some(97), CategoryState::Graded),
+            grade(Category::Dns, None, CategoryState::Incomplete),
+            grade(Category::Takeover, Some(40), CategoryState::Graded),
+            grade(Category::Registration, Some(100), CategoryState::Graded),
+        ],
+        findings: vec![
+            f(
+                "takeover.cname.vulnerable",
+                Category::Takeover,
+                Severity::Critical,
+                "www.example.com",
+                "Subdomain can be taken over",
+                Some("GitHub Pages · x.github.io"),
+                Some("Remove the CNAME."),
+            ),
+            f(
+                "email.dmarc.missing",
+                Category::Email,
+                Severity::High,
+                "example.com",
+                "No DMARC record",
+                None,
+                Some("Publish _dmarc."),
+            ),
+            f(
+                "web.hsts.missing",
+                Category::Web,
+                Severity::Medium,
+                "example.com",
+                "No HSTS header",
+                None,
+                Some("Send HSTS."),
+            ),
+            f(
+                "web.disclosure.banner",
+                Category::Web,
+                Severity::Low,
+                "example.com",
+                "Server discloses software versions",
+                Some("server: evil\u{1b}[31m|row\nsplit"),
+                None,
+            ),
+            f(
+                "tls.caa.missing",
+                Category::Tls,
+                Severity::Low,
+                "example.com",
+                "No CAA policy",
+                None,
+                None,
+            ),
+            f(
+                "email.dkim.none-found",
+                Category::Email,
+                Severity::Info,
+                "example.com",
+                "No DKIM key found at common selectors",
+                Some("probed 19 common selectors"),
+                None,
+            ),
+        ],
+        runs: vec![
+            CheckRun {
+                check: "dns.dnssec",
+                category: Category::Dns,
+                status: CheckStatus::Incomplete {
+                    reason: "DNS resolution failed".into(),
+                },
+            },
+            CheckRun {
+                check: "web.upgrade",
+                category: Category::Web,
+                status: CheckStatus::NotApplicable {
+                    reason: "nothing listens on port 80".into(),
+                },
+            },
+            CheckRun {
+                check: "registration",
+                category: Category::Registration,
+                status: CheckStatus::Ran,
+            },
+        ],
+        complete: false,
+        fail_under: Some(Letter::B),
+        passed: false,
+    }
+}
+
 snapshot_tests! {
     human_status_full_snapshot => human.format_status(fixture_status_full());
     markdown_status_full_snapshot => markdown.format_status(fixture_status_full());
@@ -1697,4 +1825,6 @@ snapshot_tests! {
     markdown_drift_snapshot => markdown.format_drift(fixture_drift());
     human_domain_diff_snapshot => human.format_diff(fixture_domain_diff());
     markdown_domain_diff_snapshot => markdown.format_diff(fixture_domain_diff());
+    human_audit_snapshot => human.format_audit(fixture_audit());
+    markdown_audit_snapshot => markdown.format_audit(fixture_audit());
 }

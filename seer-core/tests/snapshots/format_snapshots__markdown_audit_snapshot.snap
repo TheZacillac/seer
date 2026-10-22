@@ -1,0 +1,34 @@
+---
+source: seer-core/tests/format_snapshots.rs
+expression: markdown ().format_audit (& fixture_audit())
+---
+## Security audit: example.com
+
+- **Overall**: **F** (72/100) — capped by a critical finding
+- **Completeness**: incomplete — some checks did not finish
+- **Gate**: fail under B — failed
+
+| Category | Grade |
+| --- | --- |
+| Email | C |
+| Web | B |
+| TLS | A+ |
+| DNS | ? |
+| Takeover | E |
+| Registration | A+ |
+
+### Findings
+
+| Severity | Category | Finding | Host | Evidence | Fix |
+| --- | --- | --- | --- | --- | --- |
+| critical | Takeover | Subdomain can be taken over (`takeover.cname.vulnerable`) | www.example.com | GitHub Pages · x.github.io | Remove the CNAME. |
+| high | Email | No DMARC record (`email.dmarc.missing`) | example.com |  | Publish _dmarc. |
+| medium | Web | No HSTS header (`web.hsts.missing`) | example.com |  | Send HSTS. |
+| low | Web | Server discloses software versions (`web.disclosure.banner`) | example.com | server: evil\|row split |  |
+| low | TLS | No CAA policy (`tls.caa.missing`) | example.com |  |  |
+| info | Email | No DKIM key found at common selectors (`email.dkim.none-found`) | example.com | probed 19 common selectors |  |
+
+### Not run
+
+- `dns.dnssec` — incomplete: DNS resolution failed
+- `web.upgrade` — n/a: nothing listens on port 80
