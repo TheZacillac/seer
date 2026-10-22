@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.54.0] - 2026-10-22
+
 ### Added
 - **`seer audit`: a graded security assessment.** One run covers email
   (SPF, DMARC, DKIM, MTA-STS, DANE, BIMI), web (headers, cookies,
@@ -49,6 +51,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   usable response is now `dns.delegation.unresponsive` (Medium), so a lost
   probe can no longer cap the grade at C. `seer delegation` and its exit code
   are unchanged.
+- **seer-api requires `domain-seer>=0.54.0`** (was `>=0.52.0`): the new
+  `/audit` route and `seer_audit` MCP tool call `seer.audit`.
 
 ### Fixed
 - **Records too big for UDP no longer fail to resolve.** `posture` read SPF
@@ -2036,7 +2040,8 @@ Two notable breaking changes landed in this period:
   The human and markdown formatters group both fields by record type and
   omit the per-type subheader when only one type is present.
 
-[Unreleased]: https://github.com/TheZacillac/seer/compare/v0.53.1...HEAD
+[Unreleased]: https://github.com/TheZacillac/seer/compare/v0.54.0...HEAD
+[0.54.0]: https://github.com/TheZacillac/seer/compare/v0.53.1...v0.54.0
 [0.53.1]: https://github.com/TheZacillac/seer/compare/v0.53.0...v0.53.1
 [0.53.0]: https://github.com/TheZacillac/seer/compare/v0.52.3...v0.53.0
 [0.52.3]: https://github.com/TheZacillac/seer/compare/v0.52.2...v0.52.3
