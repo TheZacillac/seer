@@ -40,7 +40,8 @@ fn status_prompt(app: &App, target: EditTarget) -> Option<String> {
         | EditTarget::DiffB
         | EditTarget::BulkDomains
         | EditTarget::TldFilter
-        | EditTarget::LensFilter => None,
+        | EditTarget::LensFilter
+        | EditTarget::Switcher => None,
     }
 }
 
@@ -73,6 +74,9 @@ pub fn view(f: &mut Frame, app: &App, theme: &Theme) {
     main_pane(f, rows[3], app, theme);
     status_or_command(f, rows[4], app, theme);
 
+    if let Some(buf) = field_buf(&app.input_mode, EditTarget::Switcher) {
+        switcher(f, area, buf, theme);
+    }
     if app.help {
         help_overlay(f, area, app, theme);
     }
@@ -487,6 +491,7 @@ fn status_or_command(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     } else {
         vec![
             ("j/k", "move"),
+            ("␣", "go to"),
             ("tab", "focus"),
             ("[ ]", "tab"),
             ("r", "raw"),
@@ -515,6 +520,51 @@ fn status_or_command(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     );
 }
 
+/// The `Space` switcher: the query, then the lenses it matches, best first
+/// (highlighted: the one `↵` goes to).
+fn switcher(f: &mut Frame, area: Rect, buf: &LineEditor, theme: &Theme) {
+    let all = lenses::lenses();
+    let matches = lenses::switch_matches(buf.as_str());
+    let mut lines = vec![Line::from(vec![
+        Span::styled("> ", Style::default().fg(theme.mauve)),
+        Span::styled(buf.with_caret("▏"), Style::default().fg(theme.text)),
+    ])];
+    if matches.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "no lens matches",
+            Style::default().fg(theme.overlay0),
+        )));
+    }
+    for (n, &i) in matches.iter().enumerate() {
+        let l = &all[i];
+        lines.push(
+            Line::from(vec![
+                Span::styled(format!("{} ", l.glyph), Style::default().fg(theme.lavender)),
+                Span::raw(format!("{:<14}", l.label)),
+                Span::styled(l.group, Style::default().fg(theme.overlay0)),
+            ])
+            .style(crate::tui::widgets::row_style(theme, n == 0)),
+        );
+    }
+    let w = 40u16.min(area.width.saturating_sub(4));
+    let h = u16::try_from(lines.len() + 2)
+        .unwrap_or(u16::MAX)
+        .min(area.height.saturating_sub(2));
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(w)) / 2,
+        y: area.y + (area.height.saturating_sub(h)) / 3,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, popup);
+    f.render_widget(
+        Block::default().style(Style::default().bg(theme.base).fg(theme.text)),
+        popup,
+    );
+    let inner = panel::render(f, popup, theme, "go to", theme.mauve, true);
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
 /// Width of the key column in the help overlay.
 const HELP_KEY_COL: usize = 16;
 
@@ -523,6 +573,7 @@ fn help_overlay(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         ("j / k  ·  ↑ ↓", "move selection (nav or pane)"),
         ("1 … 9", "lens in the current group"),
         ("{ / }", "previous / next group"),
+        ("Space", "go to any lens by name"),
         ("Tab", "toggle focus: nav ⇄ pane"),
         ("[ / ]", "switch sub-tabs (RDAP)"),
         ("↵ / l", "enter the pane · run Subdomains / Takeover"),
@@ -619,6 +670,21 @@ mod tests {
         let s = render_lines(40, 20, |f| view(f, &app, app.theme()));
         let row = s.lines().nth(2).unwrap_or_default();
         assert!(row.contains("Follow") && row.starts_with('‹'), "{s}");
+    }
+
+    #[test]
+    fn switcher_popup_lists_matches() {
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+        let mut app = App::new(None);
+        for c in [' ', 's', 'u', 'b'] {
+            app.update(crate::tui::action::Msg::Input(Event::Key(KeyEvent::new(
+                KeyCode::Char(c),
+                KeyModifiers::NONE,
+            ))));
+        }
+        let s = render_lines(100, 30, |f| view(f, &app, app.theme()));
+        assert!(s.contains("go to"), "{s}");
+        assert!(s.contains("Subdomains") && s.contains("SECURITY"), "{s}");
     }
 
     #[test]

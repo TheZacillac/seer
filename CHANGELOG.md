@@ -19,6 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - TUI: a two-row strip across the top (groups, then the active group's
   lenses) replaces the sidebar, giving the lens the full width; `1`–`9`
   pick a lens within the current group and `{` / `}` move between groups.
+- TUI: `Space` opens a switcher — type part of a lens's name or `:` command
+  and press `↵` to go there.
 - TUI: DNSSEC, Compare and Trace are lenses of their own in the DNS group
   (they were sub-tabs of DNS Records); `:dnssec`, `:compare` and `:trace`
   open them.

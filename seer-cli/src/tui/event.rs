@@ -34,6 +34,7 @@ pub enum KeyAction {
     EditDomain,
     Command,
     Help,
+    Switcher,
     QuitHint,
 }
 
@@ -54,6 +55,7 @@ pub fn map(key: KeyEvent) -> Option<KeyAction> {
         KeyCode::Char('/') => KeyAction::EditDomain,
         KeyCode::Char(':') => KeyAction::Command,
         KeyCode::Char('?') => KeyAction::Help,
+        KeyCode::Char(' ') => KeyAction::Switcher,
         KeyCode::Char('{') => KeyAction::PrevGroup,
         KeyCode::Char('}') => KeyAction::NextGroup,
         KeyCode::Char('q') => KeyAction::QuitHint,

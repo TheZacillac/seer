@@ -33,6 +33,8 @@ pub enum EditTarget {
     TldFilter,
     /// Live `/`-filter for a table lens (subdomains/history/propagation).
     LensFilter,
+    /// The `Space` lens switcher's query.
+    Switcher,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]

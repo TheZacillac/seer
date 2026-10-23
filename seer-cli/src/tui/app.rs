@@ -752,6 +752,14 @@ impl App {
                 self.goto_lens(0);
                 self.set_domain_and_fetch(target)
             }
+            EditTarget::Switcher => match lenses::switch_matches(&value).first() {
+                Some(&i) => self.nav_to(i),
+                None => {
+                    let msg = format!("no lens matches “{value}”");
+                    self.set_toast("warn", &seer_core::output::sanitize_line(&msg));
+                    vec![]
+                }
+            },
             EditTarget::LensFilter => {
                 // Commit the filter for the current lens; empty clears it.
                 let key = self.current_lens().key;
@@ -1239,6 +1247,13 @@ impl App {
                 self.input_mode = InputMode::Command(crate::tui::line_editor::LineEditor::new());
                 vec![]
             }
+            KeyAction::Switcher => {
+                self.input_mode = InputMode::Field {
+                    target: EditTarget::Switcher,
+                    buf: crate::tui::line_editor::LineEditor::new(),
+                };
+                vec![]
+            }
             KeyAction::Help => {
                 self.help = true;
                 vec![]
@@ -1447,6 +1462,33 @@ mod tests {
                 ..
             }]
         ));
+    }
+
+    #[test]
+    fn space_opens_the_switcher_and_enter_goes_to_the_best_match() {
+        let mut app = App::new(None);
+        app.focus = Focus::Pane;
+        key(&mut app, KeyCode::Char(' '));
+        for c in "j1{/".chars() {
+            key(&mut app, KeyCode::Char(c));
+        }
+        assert_eq!(app.lens, 0, "keys typed into the switcher never navigate");
+        for _ in 0..4 {
+            key(&mut app, KeyCode::Backspace);
+        }
+        for c in "tra".chars() {
+            key(&mut app, KeyCode::Char(c));
+        }
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.current_lens().key, LensKey::Trace);
+        // No match: stay put and say so.
+        key(&mut app, KeyCode::Char(' '));
+        for c in "zzzz".chars() {
+            key(&mut app, KeyCode::Char(c));
+        }
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.current_lens().key, LensKey::Trace);
+        assert!(matches!(&app.toast, Some(t) if t.msg.contains("no lens matches")));
     }
 
     #[test]

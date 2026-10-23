@@ -306,6 +306,36 @@ pub fn lenses() -> &'static [Lens] {
     LENSES
 }
 
+/// Lenses matching `query` for the `Space` switcher, best first, at most
+/// eight: a label prefix, then a `:` command prefix, then a substring of
+/// either, then the query's letters in order within the label — ignoring
+/// case, ties in nav order. An empty query lists the first eight.
+pub fn switch_matches(query: &str) -> Vec<usize> {
+    const SHOWN: usize = 8;
+    let q = query.trim().to_lowercase();
+    let score = |l: &Lens| -> Option<u8> {
+        let label = l.label.to_lowercase();
+        if label.starts_with(&q) {
+            return Some(0);
+        }
+        if l.cmd.starts_with(&q) {
+            return Some(1);
+        }
+        if label.contains(&q) || l.cmd.contains(&q) {
+            return Some(2);
+        }
+        let mut rest = label.chars().filter(|c| c.is_alphanumeric());
+        q.chars().all(|c| rest.any(|l| l == c)).then_some(3)
+    };
+    let mut ranked: Vec<(u8, usize)> = LENSES
+        .iter()
+        .enumerate()
+        .filter_map(|(i, l)| score(l).map(|s| (s, i)))
+        .collect();
+    ranked.sort();
+    ranked.into_iter().take(SHOWN).map(|(_, i)| i).collect()
+}
+
 /// The nav groups, in order.
 pub fn groups() -> Vec<&'static str> {
     let mut out: Vec<&'static str> = Vec::new();
@@ -429,6 +459,18 @@ mod tests {
     fn hint_labels_come_from_their_key_code() {
         assert_eq!(hint(KeyCode::Char('s'), "start").label(), "s");
         assert_eq!(hint(KeyCode::Enter, "open").label(), "↵");
+    }
+
+    #[test]
+    fn switcher_ranks_label_prefix_then_command_then_substring_then_subsequence() {
+        let first = |q: &str| switch_matches(q).first().map(|&i| lenses()[i].key);
+        assert_eq!(first("tra"), Some(LensKey::Trace));
+        assert_eq!(first("dig"), Some(LensKey::Dns), "command prefix");
+        assert_eq!(first("cert"), Some(LensKey::Ssl), "substring of SSL / Cert");
+        assert_eq!(first("hdrs"), Some(LensKey::Headers), "subsequence");
+        assert_eq!(first("TRA"), Some(LensKey::Trace), "case-insensitive");
+        assert!(switch_matches("zzzz").is_empty());
+        assert_eq!(switch_matches("").len(), 8);
     }
 
     #[test]
