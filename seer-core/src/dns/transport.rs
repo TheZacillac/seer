@@ -29,8 +29,9 @@
 //!
 //! **Bounds:** every exchange — a TCP repeat of a truncated reply included —
 //! runs under the per-query timeout (the config file's DNS timeout), and a
-//! [`Transport::query`] under [`QUERY_BUDGET_TIMEOUTS`] of them, as many as
-//! the resolver's `attempts` setting.
+//! [`Transport::query`] under the caller's deadline — for
+//! [`DnsResolver::query`], [`QUERY_BUDGET_TIMEOUTS`] of them from its start
+//! ([`Transport::deadline`]), as many as the resolver's `attempts` setting.
 //!
 //! **SSRF:** the transport connects only to the addresses in the configs it
 //! is handed and never resolves a name. Callers vet those addresses first:
@@ -41,7 +42,7 @@
 
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use hickory_resolver::config::{ConnectionConfig, NameServerConfig, ProtocolConfig, ResolverOpts};
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
@@ -92,6 +93,17 @@ impl Transport {
     /// The per-query timeout.
     pub(crate) fn timeout(&self) -> Duration {
         self.cx.options.timeout
+    }
+
+    /// A deadline [`QUERY_BUDGET_TIMEOUTS`] per-query timeouts from now: a
+    /// whole [`query`](Self::query)'s, failover included.
+    pub(crate) fn deadline(&self) -> tokio::time::Instant {
+        tokio::time::Instant::now() + self.budget()
+    }
+
+    /// [`QUERY_BUDGET_TIMEOUTS`] per-query timeouts.
+    fn budget(&self) -> Duration {
+        self.timeout().saturating_mul(QUERY_BUDGET_TIMEOUTS)
     }
 
     /// A query for `name`/`record_type`, built as hickory's resolver builds
@@ -166,8 +178,10 @@ impl Transport {
     /// server is asked once ([`exchange`](Self::exchange)) on its preferred
     /// connection: UDP when it has one, as hickory's pool prefers it, else
     /// its only one (DoT or DoH). A server that fails in transport passes the
-    /// query to the next, under one deadline of [`QUERY_BUDGET_TIMEOUTS`]
-    /// per-query timeouts for the whole list.
+    /// query to the next, all before `deadline` — normally
+    /// [`deadline`](Self::deadline), taken when the caller's query began, so
+    /// work before the first exchange (resolving a nameserver's hostname)
+    /// counts against it too.
     ///
     /// The `Err` says why no server responded, server by server (see
     /// [`NoResponse`]).
@@ -175,16 +189,15 @@ impl Transport {
         &self,
         servers: &[NameServerConfig],
         request: &DnsRequest,
+        deadline: tokio::time::Instant,
     ) -> Result<Message, NoResponse> {
-        let budget = self.timeout().saturating_mul(QUERY_BUDGET_TIMEOUTS);
-        let started = Instant::now();
         let mut failures = Vec::new();
         let mut unasked = None;
         for (index, server) in servers.iter().enumerate() {
-            let remaining = budget.saturating_sub(started.elapsed());
-            if remaining.is_zero() {
+            if tokio::time::Instant::now() >= deadline {
                 unasked = Some(format!(
-                    "gave up after {budget:?} with {} more server(s) unasked",
+                    "gave up after {:?} with {} more server(s) unasked",
+                    self.budget(),
                     servers.len() - index
                 ));
                 break;
@@ -194,7 +207,7 @@ impl Transport {
             };
             debug!(ip = %server.ip, "querying");
             let attempt = self.exchange(server.ip, connection, request);
-            match tokio::time::timeout(remaining, attempt).await {
+            match tokio::time::timeout_at(deadline, attempt).await {
                 Ok(Ok(message)) => return Ok(message),
                 Ok(Err(e)) => failures.push((server.ip, transport_reason(&e))),
                 Err(_) => failures.push((server.ip, "timed out".to_string())),
@@ -291,6 +304,7 @@ mod tests {
     //! 127.0.0.1 directly; each mock "server" is its own ephemeral port.
 
     use std::sync::Mutex;
+    use std::time::Instant;
 
     use hickory_resolver::config::ResolverConfig;
     use hickory_resolver::proto::op::ResponseCode;
@@ -391,7 +405,7 @@ mod tests {
         let transport = transport();
         let request = request_for(&transport, "www.seer.test");
         let message = transport
-            .query(&[udp_server(port)], &request)
+            .query(&[udp_server(port)], &request, transport.deadline())
             .await
             .expect("SERVFAIL is what the server said");
         assert_eq!(message.metadata.response_code, ResponseCode::ServFail);
@@ -434,7 +448,11 @@ mod tests {
         let request = request_for(&transport, "www.seer.test");
         let started = Instant::now();
         let message = transport
-            .query(&[udp_server(silent), udp_server(answering)], &request)
+            .query(
+                &[udp_server(silent), udp_server(answering)],
+                &request,
+                transport.deadline(),
+            )
             .await
             .expect("the second server answers");
         assert_eq!(addresses(&message), ["192.0.2.9"]);
@@ -462,7 +480,7 @@ mod tests {
             udp_server(answering),
         ];
         let err = transport
-            .query(&servers, &request)
+            .query(&servers, &request, transport.deadline())
             .await
             .expect_err("the deadline ends the list");
         let elapsed = started.elapsed();
@@ -474,7 +492,10 @@ mod tests {
              server(s) unasked"
         );
         assert_eq!(err.reason(), "timed out");
-        let none = transport.query(&[], &request).await.unwrap_err();
+        let none = transport
+            .query(&[], &request, transport.deadline())
+            .await
+            .unwrap_err();
         assert_eq!(none.to_string(), "no nameserver to query");
         assert_eq!(none.reason(), "no nameserver to query");
     }

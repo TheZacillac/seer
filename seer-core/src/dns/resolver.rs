@@ -393,6 +393,19 @@ impl DnsResolver {
         self
     }
 
+    /// Test-only: point the cached default resolver — which also resolves a
+    /// nameserver given by hostname — at a loopback fixture on `port`. Call
+    /// after [`with_timeout`](Self::with_timeout), which rebuilds it.
+    #[cfg(test)]
+    pub(crate) fn with_default_upstream_port(mut self, port: u16) -> Self {
+        self.default_resolver = build_resolver(
+            single_server_config(std::net::Ipv4Addr::LOCALHOST.into(), port, false),
+            self.timeout,
+        )
+        .expect("a plain UDP resolver builds");
+        self
+    }
+
     /// The nameserver a query actually uses: the caller's choice, or (in test
     /// builds only) the fixture default installed by
     /// [`with_default_nameserver`](Self::with_default_nameserver).
@@ -442,8 +455,9 @@ impl DnsResolver {
     }
 
     /// The upstream config for a caller's nameserver spec: parsed, its host
-    /// resolved when it is a name, every address SSRF-vetted, then one server
-    /// per address (see [`build_upstream_config`]). The one path to a custom
+    /// resolved when it is a name (under one per-query timeout), every
+    /// address SSRF-vetted, then one server per address (see
+    /// [`build_upstream_config`]). The one path to a custom
     /// nameserver, shared by the resolver ([`resolve`](Self::resolve)) and
     /// the direct queries of [`query`](Self::query), so the vetting cannot
     /// differ between them.
@@ -465,10 +479,12 @@ impl DnsResolver {
         let ips: Vec<IpAddr> = if let Ok(ip) = spec.host.parse::<IpAddr>() {
             vec![ip]
         } else {
-            let response = self
-                .default_resolver
-                .lookup_ip(spec.host.as_str())
+            // The resolver re-sends a lookup that timed out (`attempts`), so
+            // only this deadline holds it to one per-query timeout.
+            let lookup = self.default_resolver.lookup_ip(spec.host.as_str());
+            let response = tokio::time::timeout(self.timeout, lookup)
                 .await
+                .unwrap_or(Err(NetError::Timeout))
                 .map_err(|e| {
                     SeerError::DnsError(format!(
                         "failed to resolve nameserver hostname {}: {}",
@@ -536,7 +552,9 @@ impl DnsResolver {
     /// resolver for a special-use name it answers itself (the nameserver is
     /// only vetted offline — it is never asked), else straight to the servers
     /// of `nameserver` (parsed, resolved and SSRF-vetted by
-    /// `custom_upstream_config`) or of the default upstream.
+    /// `custom_upstream_config`) or of the default upstream. The query's
+    /// deadline starts here, before a nameserver hostname is resolved, so
+    /// that lookup spends the same budget as the exchanges after it.
     async fn query_upstream(&self, name: &str, nameserver: Option<&str>) -> Result<Upstream<'_>> {
         if answered_locally(name) {
             if let Some(ns) = self.effective_nameserver(nameserver) {
@@ -544,6 +562,7 @@ impl DnsResolver {
             }
             return Ok(Upstream::Local(&self.default_resolver));
         }
+        let deadline = self.transport.deadline();
         let config = match self.effective_nameserver(nameserver) {
             Some(ns) => self.custom_upstream_config(ns).await?,
             None => default_upstream_config(),
@@ -551,6 +570,7 @@ impl DnsResolver {
         Ok(Upstream::Direct {
             config,
             transport: &self.transport,
+            deadline,
         })
     }
 
@@ -577,7 +597,9 @@ impl DnsResolver {
     /// recursive server returns it. The servers are the nameserver's (or the
     /// default upstream's), asked in order, IPv4 first; UDP, repeated over
     /// TCP when the reply is truncated; and a server that does not respond
-    /// passes the query to the next, all under two DNS timeouts.
+    /// passes the query to the next, all under two DNS timeouts from the
+    /// call — resolving a nameserver given by hostname included, which is
+    /// itself held to one.
     ///
     /// `ANY` fans out concurrently to A, AAAA, CNAME, MX, NS, TXT, SOA, CAA,
     /// HTTPS, DS and DNSKEY and merges the answers (see
@@ -887,10 +909,12 @@ enum Upstream<'a> {
     /// ([`answered_locally`]): the resolver, which sends it nowhere.
     Local(&'a TokioResolver),
     /// Any other name: straight to these (vetted) servers, one query per
-    /// type, the response reported as the server sent it.
+    /// type, the response reported as the server sent it — every query
+    /// (main, wildcard probe, ANY fan-out) before the one `deadline`.
     Direct {
         config: ResolverConfig,
         transport: &'a Transport,
+        deadline: tokio::time::Instant,
     },
 }
 
@@ -915,11 +939,18 @@ impl Upstream<'_> {
             Upstream::Local(resolver) => {
                 Exchange::from_local(resolver.lookup(name, wire).await, record_type)?
             }
-            Upstream::Direct { config, transport } => {
+            Upstream::Direct {
+                config,
+                transport,
+                deadline,
+            } => {
                 let qname = Name::from_ascii(fqdn(name))
                     .map_err(|e| SeerError::InvalidDomain(format!("{name}: {e}")))?;
                 let request = transport.request(qname, wire, true);
-                match transport.query(config.name_servers(), &request).await {
+                match transport
+                    .query(config.name_servers(), &request, *deadline)
+                    .await
+                {
                     Ok(response) => Exchange::from_message(&response),
                     Err(why) => return Ok(Err(why)),
                 }
@@ -3963,5 +3994,87 @@ mod tests {
             .query("127.0.0.1", RecordType::PTR, Some("ftp://ns.seer.test"))
             .await
             .is_err());
+    }
+
+    /// Regression: a nameserver given by hostname was resolved with no
+    /// deadline of its own, so the bootstrap lookup's retransmissions
+    /// (`attempts`) ran on before any query was sent. It is held to one
+    /// timeout.
+    #[tokio::test]
+    async fn a_nameserver_hostname_lookup_is_held_to_one_timeout() {
+        use crate::dns::test_support::{spawn_mock_dns_fn, MockReply};
+
+        let timeout = Duration::from_millis(500);
+        let bootstrap = spawn_mock_dns_fn(|_, _| MockReply::NoReply).await;
+        let resolver = DnsResolver::new()
+            .with_timeout(timeout)
+            .with_default_upstream_port(bootstrap)
+            .allowing_private_hosts();
+
+        for use_query in [true, false] {
+            let started = Instant::now();
+            let err = if use_query {
+                resolver
+                    .query("seer.test", RecordType::A, Some("ns.bootstrap.test"))
+                    .await
+                    .expect_err("the hostname never resolves")
+            } else {
+                resolver
+                    .resolve("seer.test", RecordType::A, Some("ns.bootstrap.test"))
+                    .await
+                    .expect_err("the hostname never resolves")
+            };
+            let elapsed = started.elapsed();
+            assert!(err.to_string().contains("ns.bootstrap.test"), "{err}");
+            // Two attempts took at least two timeouts.
+            assert!(elapsed < timeout * 2 - timeout / 5, "took {elapsed:?}");
+        }
+    }
+
+    /// Regression: `query()`'s two-timeout budget started only after the
+    /// nameserver's hostname had resolved, so a slow lookup added on top.
+    /// The budget now starts with the call.
+    // Multi-thread: the bootstrap handler sleeps on its worker to delay a reply.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_nameserver_hostname_lookup_spends_the_query_budget() {
+        use crate::dns::test_support::{a_rdata, spawn_mock_dns_fn, MockReply};
+
+        let timeout = Duration::from_millis(800);
+        let delay = timeout * 3 / 4;
+        let bootstrap = spawn_mock_dns_fn(move |qname, qtype| match (qname, qtype) {
+            // Two addresses, so a silent first one leaves failover to the
+            // second for the budget to cut short.
+            ("ns.bootstrap.test", HickoryRecordType::A) => {
+                std::thread::sleep(delay);
+                MockReply::Answer(vec![
+                    a_rdata(Ipv4Addr::LOCALHOST),
+                    a_rdata(Ipv4Addr::LOCALHOST),
+                ])
+            }
+            _ => MockReply::NoData,
+        })
+        .await;
+        // The nameserver itself never answers, on either address.
+        let target = spawn_mock_dns_fn(|_, _| MockReply::NoReply).await;
+        let resolver = DnsResolver::new()
+            .with_timeout(timeout)
+            .with_default_upstream_port(bootstrap)
+            .allowing_private_hosts()
+            .with_port(target);
+
+        let started = Instant::now();
+        let err = resolver
+            .query("seer.test", RecordType::A, Some("ns.bootstrap.test"))
+            .await
+            .expect_err("the nameserver is silent");
+        let elapsed = started.elapsed();
+        assert!(err.to_string().contains("timed out"), "{err}");
+        assert!(
+            !err.to_string().contains("ns.bootstrap.test"),
+            "the hostname resolved: {err}"
+        );
+        // Two timeouts from the call; before, the lookup's delay came on top.
+        let budget = timeout * crate::dns::transport::QUERY_BUDGET_TIMEOUTS;
+        assert!(elapsed < budget + delay / 2, "took {elapsed:?}");
     }
 }
