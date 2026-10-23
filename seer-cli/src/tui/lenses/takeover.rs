@@ -3,18 +3,21 @@
 //! Only actionable hosts are listed: `scan_takeover` filters `Safe` out of
 //! `findings` before returning, so the table is the findings vec and the
 //! summary line carries how many hosts were actually checked. A clean scan
-//! shows the count and says so rather than rendering an empty grid.
+//! shows the count and says so rather than rendering an empty grid. While
+//! focused, the selected finding's CNAME, addresses and probe result show
+//! beneath the table.
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Row, Table};
 use ratatui::Frame;
 use seer_core::output::{sanitize_line, takeover_label};
-use seer_core::TakeoverVerdict;
+use seer_core::{TakeoverFinding, TakeoverVerdict};
 
 use crate::tui::action::LensData;
 use crate::tui::theme::Theme;
-use crate::tui::widgets::{or_dash, panel, row_style, scroll_to};
+use crate::tui::widgets::inspector::{self, Field};
+use crate::tui::widgets::{or_dash, panel, row_style, scroll_to, stack, Band};
 
 fn verdict_tone(v: TakeoverVerdict) -> &'static str {
     match v {
@@ -23,6 +26,21 @@ fn verdict_tone(v: TakeoverVerdict) -> &'static str {
         TakeoverVerdict::Inconclusive => "info",
         TakeoverVerdict::Safe => "ok",
     }
+}
+
+/// The selected finding's detail: the CNAME and addresses behind the
+/// verdict, and what the HTTP probe saw.
+fn finding_fields(finding: &TakeoverFinding) -> Vec<Field> {
+    vec![
+        Field::new("host", finding.host.clone()),
+        Field::new("verdict", takeover_label(finding.verdict)).tone(verdict_tone(finding.verdict)),
+        Field::new("provider", or_dash(finding.provider.as_deref())),
+        Field::new("cname", or_dash(finding.cname.as_deref())),
+        Field::new("addresses", finding.addresses.join(" ")),
+        Field::new("http", or_dash(finding.http_status)),
+        Field::new("evidence", or_dash(finding.evidence.as_deref())),
+        Field::new("probe", or_dash(finding.probe_note.as_deref())),
+    ]
 }
 
 pub fn render(
@@ -114,8 +132,28 @@ pub fn render(
     )
     .header(header)
     .column_spacing(1);
+    let area = chunks[0];
+    let detail = focused
+        .then(|| t.findings.get(sel))
+        .flatten()
+        .map(|finding| inspector::lines(theme, &finding_fields(finding), area.width))
+        .unwrap_or_default();
+    let rows = |n: usize| u16::try_from(n).unwrap_or(u16::MAX);
+    let n = t.findings.len();
+    // The table keeps its header and a few rows; the detail takes the rest.
+    let mut layout = vec![Band::shrinking(
+        rows(n + 1),
+        rows(1 + n.min(inspector::MIN_ROWS)),
+    )];
+    if !detail.is_empty() {
+        layout.push(inspector::band(&detail));
+    }
+    let bands = stack(area, &layout);
     let mut state = scroll_to(focused.then_some(sel));
-    f.render_stateful_widget(table, chunks[0], &mut state);
+    f.render_stateful_widget(table, bands[0], &mut state);
+    if let Some(band) = bands.get(1) {
+        inspector::draw(f, *band, theme, detail);
+    }
 
     if t.hosts_skipped > 0 {
         f.render_widget(
@@ -178,6 +216,21 @@ mod tests {
     fn render_to_text(data: &LensData, w: u16, h: u16, focused: bool, sel: usize) -> String {
         let theme = Theme::frappe();
         render_lines(w, h, |f| render(f, f.area(), &theme, data, focused, sel))
+    }
+
+    #[test]
+    fn focused_finding_shows_cname_addresses_and_probe() {
+        let mut f = finding("shop.example.com", TakeoverVerdict::Potential);
+        f.cname = Some("shop-example.myshopify.com".into());
+        f.addresses = vec!["23.227.38.65".into()];
+        f.http_status = Some(404);
+        f.probe_note = Some("fingerprint not matched".into());
+        let data = LensData::Takeover(Box::new(report(vec![f])));
+        let s = render_to_text(&data, 100, 20, true, 0);
+        assert!(s.contains("shop-example.myshopify.com"), "{s}");
+        assert!(s.contains("23.227.38.65") && s.contains("404"), "{s}");
+        let nav = render_to_text(&data, 100, 20, false, 0);
+        assert!(!nav.contains("23.227.38.65"), "{nav}");
     }
 
     #[test]
