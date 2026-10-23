@@ -11,6 +11,89 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `DmarcPolicy.effective_policy` in posture results: the `sp=`/`p=` value
+  that actually applies to the domain (`None` when no single record
+  applies). Rust code that builds `DmarcPolicy` with a struct literal must
+  add the field.
+- `seer audit` findings `web.frame.weak` and `web.nosniff.weak` for
+  framing protection that does not protect (CSP `frame-ancestors *`,
+  `ALLOW-FROM`, an invalid X-Frame-Options) and an invalid
+  X-Content-Type-Options value.
+- seer-api: `SEER_ALLOWED_HOSTS` (extra `Host` names accepted without an
+  API key) and `SEER_MAX_CONCURRENT_BULK` (see Security).
+
+### Changed
+- The HTTP timeout for headers, status, takeover, security.txt and the
+  HTTPS-upgrade check is now one deadline for the whole redirect chain and
+  body read, not a fresh timeout per hop.
+- `dnssec` runs its zone-apex walk and DS/DNSKEY reads under one deadline
+  of six DNS timeouts; a walk that cannot find the zone in time reports a
+  timeout instead of a verdict for a guessed zone.
+- seer-api: REST `/subdomains` is limited to `5/minute` (`HEAVY_LIMIT`, was
+  `20/minute`), matching the MCP `seer_subdomains` tool; a test now enforces
+  contract-limit parity across every REST/MCP twin.
+- seer-api: a `/bulk/stream` request that times out waiting for a job slot
+  gets 503 (was 504). `SEER_MAX_CONCURRENT_STREAMS` is still read when
+  `SEER_MAX_CONCURRENT_BULK` is unset.
+
+### Fixed
+- `seer audit` grades DMARC on the policy that applies: an inherited
+  organizational `sp=` is honored (`p=none; sp=reject` is no longer
+  "monitoring only", an inherited `sp=none` is no longer missed), and
+  several published DMARC records, which receivers ignore, are reported as
+  `email.dmarc.missing`.
+- A redirect target that refuses the connection no longer makes `seer audit`
+  report the original host as unreachable over HTTPS
+  (`web.https.unreachable`) or without an HTTPS listener; those checks are
+  now incomplete.
+- `normalize_domain` drops a leading `www.` however it is spelled:
+  full-width `ｗｗｗ.example.com` normalized to `www.example.com`, splitting
+  history and watchlist keys.
+- `seer doctor`'s WHOIS probe connects IPv4 first like the WHOIS client, so
+  a host with a dead IPv6 route no longer reports a false port-43 failure.
+- `propagation … NS` enriches at most 13 nameserver hostnames (the
+  most-reported first) under one deadline that includes waiting for a
+  lookup slot; a zone listing many nameservers can no longer hold a check
+  for minutes. Lookups the deadline cuts off are reported as no data; the
+  NS answers are kept.
+- `delegation` and the WHOIS nameserver cross-check: a lame parent server
+  (an empty reply without the zone's SOA, or a referral elsewhere) no longer
+  counts as one of the two parent answers, so two lame parents no longer
+  yield an empty delegation.
+- `dig @hostname` / `--nameserver hostname`: resolving the nameserver's
+  name is held to one DNS timeout and counts against `dig`'s two-timeout
+  budget instead of adding to it.
+
+### Security
+- WHOIS/RDAP date parsing no longer recurses once per trailing UTC offset:
+  a hostile ~100 KB date of chained offsets (under the response caps)
+  overflowed a worker stack and aborted the process, taking seer-api or the
+  MCP server down with it. One offset is split off at most, and date values
+  over 128 bytes are refused before parsing.
+- `-q --fields`, `seer history` and `seer bulk` (per-item lines, the
+  Failures list, the progress bar) sanitize remote text: a hostile
+  WHOIS/RDAP value, server error or input line can no longer inject
+  terminal escapes or forge extra output lines.
+- seer-api: every bulk job (sync `/bulk`, `/bulk/stream`, MCP
+  `seer_bulk_*`) takes a slot from one per-process cap,
+  `SEER_MAX_CONCURRENT_BULK` (default 8, clamped below
+  `SEER_DISPATCH_THREADS`), so batches can no longer pin every dispatch
+  thread and stall the API. With no slot free before `SEER_REQUEST_TIMEOUT`
+  the request gets 503 (MCP: a retryable "server busy").
+- seer-api: without `SEER_API_KEY`, a request whose `Host` is not loopback
+  gets 421, which blocks DNS-rebinding pages (including `/metrics`). A
+  keyless deployment behind a proxy that rewrites `Host` must list the name
+  in `SEER_ALLOWED_HOSTS`.
+- seer-api: the ssl/status/nameserver SSRF pre-check refuses only reserved
+  IP literals (still 400); a hostname that resolves to a reserved address
+  is answered exactly like one that does not resolve, so the API no longer
+  reveals which internal names exist.
+- seer-api docs: the multi-worker `memory://` startup guard sees only
+  `WEB_CONCURRENCY`/`UVICORN_WORKERS`; deployments that set workers with
+  `--workers`, `-w` or `uvicorn.run(workers=…)` must set
+  `SEER_RATE_LIMIT_STORAGE` themselves.
+
 ## [0.54.0] - 2026-10-22
 
 ### Added

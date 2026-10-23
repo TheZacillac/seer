@@ -65,7 +65,7 @@ in `seer-core`. The other three parse input, call core and present results.
   also goes in the `#[pymodule_export]` list and in
   `python/seer/__init__.py` + `__all__`.
 - `seer-api/seer_api/` — `main.py` (auth, middleware, startup checks),
-  `_run.py` (`run_seer` dispatch + deadline), `errors.py` (exception →
+  `_run.py` (`run_seer` dispatch + deadline, the shared bulk-job cap), `errors.py` (exception →
   status, `clean_message`), `ssrf.py`, `routers/`, `mcp/server.py` (the
   `_TOOLS` registry).
 
