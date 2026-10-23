@@ -8,7 +8,7 @@
 //! reason for its verdict beneath it), and cookies/advisories take what is
 //! left. Bands with nothing to show
 //! collapse to zero height instead of leaving a labeled empty box.
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
@@ -19,7 +19,7 @@ use seer_core::HeaderVerdict;
 use crate::tui::action::LensData;
 use crate::tui::theme::Theme;
 use crate::tui::widgets::inspector::{self, Field};
-use crate::tui::widgets::{dot, gauge, kv, panel, row_style};
+use crate::tui::widgets::{dot, gauge, kv, panel, row_style, stack, Band};
 
 /// Tone for a verdict, using the shared `Theme::tone` vocabulary so these
 /// verdicts read the same as every other status in the TUI.
@@ -67,25 +67,33 @@ pub fn render(
             inspector::lines(theme, &fields, inner.width)
         })
         .unwrap_or_default();
-    let detail_rows = u16::try_from(detail.len()).unwrap_or(u16::MAX);
 
-    let cookie_rows = if h.cookies.is_empty() { 0 } else { 1 };
-    // Advisories get whatever vertical space is left, so a long list scrolls
-    // off rather than squeezing the verdicts it is explaining.
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(2),                      // gauge + url
-            Constraint::Length(h.headers.len() as u16), // per-header verdicts
-            Constraint::Length(detail_rows),            // selected header (focused)
-            Constraint::Length(cookie_rows),
-            Constraint::Min(0), // advisories
-        ])
-        .split(inner);
+    // Stacked like the other lenses: when the bands do not all fit, the
+    // verdicts give up rows first (scrolling to the selection), then the
+    // detail, so the selected row and its value stay in view. Advisories get
+    // what is left, so a long list scrolls off rather than squeezing the
+    // verdicts it is explaining.
+    let rows = |n: usize| u16::try_from(n).unwrap_or(u16::MAX);
+    let n = h.headers.len();
+    let mut layout = vec![
+        Band::fixed(2),
+        Band::shrinking(rows(n), rows(n.min(inspector::MIN_ROWS))),
+    ];
+    if !detail.is_empty() {
+        layout.push(inspector::band(&detail));
+    }
+    if !h.cookies.is_empty() {
+        layout.push(Band::fixed(1));
+    }
+    layout.push(Band::shrinking(rows(h.notes.len().max(1)), 1));
+    let mut bands = stack(inner, &layout).into_iter();
+    let mut next_band = || bands.next().unwrap_or_default();
+    let gauge_area = next_band();
+    let verdict_area = next_band();
 
     // Grade gauge — score is already 0–100.
     let ratio = f64::from(h.score) / 100.0;
-    let width = chunks[0].width.saturating_sub(20).clamp(10, 40);
+    let width = gauge_area.width.saturating_sub(20).clamp(10, 40);
     let label = format!("{} ({}/100)", h.grade, h.score);
     f.render_widget(
         Paragraph::new(vec![
@@ -101,7 +109,7 @@ pub fn render(
                 Style::default().fg(theme.subtext),
             )),
         ]),
-        chunks[0],
+        gauge_area,
     );
 
     // Per-header verdicts. The value carries the verdict word; the header name
@@ -111,7 +119,10 @@ pub fn render(
     // paints every value one color, and colouring each verdict by severity
     // is the whole point of this band — a column of same-colored words
     // would bury the absent headers among the strict ones.
-    let gutter = kv::gutter(h.headers.iter().map(|f| f.header.as_str()), chunks[1].width);
+    let gutter = kv::gutter(
+        h.headers.iter().map(|f| f.header.as_str()),
+        verdict_area.width,
+    );
     let lines: Vec<Line> = h
         .headers
         .iter()
@@ -126,8 +137,17 @@ pub fn render(
             Line::from(spans).style(row_style(theme, focused && i == sel))
         })
         .collect();
-    f.render_widget(Paragraph::new(lines), chunks[1]);
-    inspector::draw(f, chunks[2], theme, detail);
+    // Scroll the verdicts so a selection past the band's last row shows.
+    let visible = usize::from(verdict_area.height);
+    let top = if focused && sel >= visible {
+        sel + 1 - visible
+    } else {
+        0
+    };
+    f.render_widget(Paragraph::new(lines).scroll((rows(top), 0)), verdict_area);
+    if !detail.is_empty() {
+        inspector::draw(f, next_band(), theme, detail);
+    }
 
     if !h.cookies.is_empty() {
         let flawed = h.cookies.iter().filter(|c| !c.issues.is_empty()).count();
@@ -138,17 +158,18 @@ pub fn render(
                 tone,
                 format!("{} cookie(s), {} with issues", h.cookies.len(), flawed),
             )),
-            chunks[3],
+            next_band(),
         );
     }
 
+    let notes_area = next_band();
     if !h.notes.is_empty() {
         let lines: Vec<Line> = h
             .notes
             .iter()
             .map(|n| dot::line(theme, "warn", n.clone()))
             .collect();
-        f.render_widget(Paragraph::new(lines), chunks[4]);
+        f.render_widget(Paragraph::new(lines), notes_area);
     } else {
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
@@ -157,7 +178,7 @@ pub fn render(
                     .fg(theme.green)
                     .add_modifier(Modifier::ITALIC),
             ))),
-            chunks[4],
+            notes_area,
         );
     }
 }
@@ -212,6 +233,22 @@ mod tests {
         render_lines(width, height, |f| {
             render(f, f.area(), &theme, data, false, 0);
         })
+    }
+
+    /// On a short pane a long value must not clip the selected verdict row
+    /// out of view; the verdicts scroll to it and the detail is cut short.
+    #[test]
+    fn selected_verdict_stays_visible_on_a_short_pane() {
+        let theme = Theme::frappe();
+        let mut r = report();
+        r.headers = (0..9)
+            .map(|i| finding(&format!("x-header-{i}"), HeaderVerdict::Present))
+            .collect();
+        r.headers[8].value = Some("a ".repeat(300));
+        let data = LensData::Headers(Box::new(r));
+        let s = render_lines(60, 18, |f| render(f, f.area(), &theme, &data, true, 8));
+        assert!(s.contains("x-header-8 ·"), "selected row must show: {s}");
+        assert!(s.contains("more lines"), "the detail is cut short: {s}");
     }
 
     #[test]
