@@ -73,7 +73,9 @@ subdomains_router = APIRouter()
 
 
 @subdomains_router.get("/{domain}")
-@limiter.limit("20/minute")
+# A limit is per route, not per argument: sized for the heavier resolve=true
+# path (a DNS fan-out over every name found), like the MCP seer_subdomains.
+@limiter.limit(HEAVY_LIMIT)
 async def subdomains(
     request: Request,
     domain: Domain,
