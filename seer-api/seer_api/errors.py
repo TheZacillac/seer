@@ -11,7 +11,7 @@ Three responsibilities:
 
 3. ``http_status_for(exc)`` / ``http_error(exc, message)`` — classify the
    exception and pick the HTTP status code: invalid input 400, a rate-limited
-   upstream 429, an unsupported TLD 404, upstream failures 502, timeouts 504.
+   upstream 429, an unsupported TLD 404, upstream failures 502, no free bulk slot 503, timeouts 504.
    Route handlers wrap their core call in ``as_http``, which applies it.
 
 The binding raises builtins for invalid input (``ValueError``), timeouts
@@ -53,6 +53,14 @@ class ServiceUnavailable(Exception):
     """
 
 
+class ServerBusy(Exception):
+    """Every bulk job slot stayed busy until the request deadline: HTTP 503.
+
+    Nothing was started, so the client can retry. The message is written by
+    seer-api itself and is safe to surface.
+    """
+
+
 def clean_message(msg: str) -> str:
     """Strip control/ANSI bytes from ``msg``, then cap its length.
 
@@ -70,6 +78,7 @@ _STATUS_BY_TYPE: tuple[tuple[type[BaseException], int], ...] = (
     (TimeoutError, 504),
     (ConnectionError, 502),
     (ServiceUnavailable, 503),
+    (ServerBusy, 503),
     (seer.RateLimitedError, 429),
     (seer.WhoisServerNotFoundError, 404),
     (seer.DnsError, 502),
@@ -83,14 +92,15 @@ _STATUS_BY_TYPE: tuple[tuple[type[BaseException], int], ...] = (
 def safe_error_message(exc: BaseException, fallback: str = "Request failed") -> str:
     """Return a client-safe message for ``exc``.
 
-    ``ValueError``, ``seer.SeerError`` and ``ServiceUnavailable`` carry text
-    that is safe to show (the caller's own input echoed back, or core's
-    ``sanitized_message``), surfaced through :func:`clean_message`;
+    ``ValueError``, ``seer.SeerError``, ``ServiceUnavailable`` and
+    ``ServerBusy`` carry text that is safe to show (the caller's own input
+    echoed back, core's ``sanitized_message``, or seer-api's own text),
+    surfaced through :func:`clean_message`;
     ``TimeoutError`` and ``ConnectionError`` map to canonical strings;
     anything else — an unexpected exception whose text nobody vetted —
     returns ``fallback``.
     """
-    if isinstance(exc, ValueError | seer.SeerError | ServiceUnavailable):
+    if isinstance(exc, ValueError | seer.SeerError | ServiceUnavailable | ServerBusy):
         return clean_message(str(exc))
     if isinstance(exc, TimeoutError):
         return "request timed out"
@@ -118,7 +128,9 @@ def http_error(exc: Exception, message: str = "Request failed") -> HTTPException
     status = http_status_for(exc)
     if status < 500:
         logger.info("API request rejected (%d): %s", status, exc)
-    elif isinstance(exc, TimeoutError | ConnectionError | seer.SeerError | ServiceUnavailable):
+    elif isinstance(
+        exc, TimeoutError | ConnectionError | seer.SeerError | ServiceUnavailable | ServerBusy
+    ):
         logger.warning("API request failed (%d): %s", status, exc)
     else:
         logger.exception("API request failed: %s", exc)

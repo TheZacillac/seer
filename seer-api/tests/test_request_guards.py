@@ -15,6 +15,7 @@ from fastapi.testclient import TestClient
 
 import seer
 from seer_api import _run, streaming
+from seer_api.errors import ServerBusy
 from seer_api.main import app
 from seer_api.mcp import server as mcp_server
 
@@ -93,13 +94,14 @@ def test_precheck_and_work_share_one_deadline(monkeypatch, client):
 
 @pytest.fixture
 def one_stream_slot(monkeypatch):
-    monkeypatch.setattr(streaming, "_MAX_CONCURRENT_STREAMS", 1, raising=False)
-    monkeypatch.setattr(streaming, "_stream_semaphore", None, raising=False)
-    monkeypatch.setattr(streaming, "_stream_semaphore_loop", None, raising=False)
+    monkeypatch.setattr(_run, "_MAX_CONCURRENT_BULK", 1, raising=False)
+    monkeypatch.setattr(_run, "_bulk_semaphore", None, raising=False)
+    monkeypatch.setattr(_run, "_bulk_semaphore_loop", None, raising=False)
 
 
 def test_stream_wait_for_a_slot_is_bounded(monkeypatch, one_stream_slot):
-    """Regression: a stream queued behind busy slots waited forever."""
+    """Regression: a stream queued behind busy slots waited forever. Running
+    out of the deadline while queued is a ServerBusy (503): nothing started."""
     monkeypatch.setattr(_run, "_REQUEST_TIMEOUT", 0.2)
     release = threading.Event()
 
@@ -109,7 +111,7 @@ def test_stream_wait_for_a_slot_is_bounded(monkeypatch, one_stream_slot):
 
     async def scenario() -> None:
         await streaming.stream_bulk(blocking_bulk, ["a.com"])  # takes the slot
-        with pytest.raises(TimeoutError):
+        with pytest.raises(ServerBusy):
             await streaming.stream_bulk(blocking_bulk, ["b.com"])
         release.set()
 

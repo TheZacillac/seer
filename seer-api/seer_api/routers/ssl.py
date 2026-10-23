@@ -4,7 +4,7 @@ from fastapi import APIRouter, Request
 
 import seer
 from seer_api._contract import HEAVY_LIMIT, BulkRequest, Domain
-from seer_api._run import run_seer
+from seer_api._run import run_bulk, run_seer
 from seer_api.errors import as_http
 from seer_api.limiting import limiter
 from seer_api.ssrf import guarded
@@ -38,7 +38,7 @@ async def bulk_ssl(request: Request, body: BulkRequest):
     signature algorithm).
     """
     return await as_http(
-        run_seer(seer.bulk_ssl, body.domains, body.concurrency),
+        run_bulk(seer.bulk_ssl, body.domains, body.concurrency),
         "Bulk SSL inspection failed",
     )
 
