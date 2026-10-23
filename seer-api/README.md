@@ -59,6 +59,13 @@ Server runs on `http://127.0.0.1:8000` (loopback-only by default).
   so a web page cannot drive a local API from your browser. Clients that
   send no `Origin` (curl, SDKs) are unaffected. No CORS headers are sent
   unless `SEER_CORS_ORIGINS` is set.
+- **No DNS rebinding without a key.** With no `SEER_API_KEY`, a request
+  whose `Host` is not a loopback name (`localhost`, `127.0.0.0/8`, `[::1]`,
+  any port) is refused with 421, `/metrics` included — a page whose domain
+  was rebound to `127.0.0.1` sends its own `Host` (and, on a GET, no
+  `Origin`). List other names the API may be reached by in
+  `SEER_ALLOWED_HOSTS` (`host:*` matches any port), or set `SEER_API_KEY`.
+  `/mcp` follows `SEER_MCP_ALLOWED_HOSTS` instead when that is set.
 - **API documentation endpoints are off.** Set `SEER_DOCS_ENABLED=true`
   to serve `/docs`, `/redoc`, and `/openapi.json`.
 - **Multi-worker deployments need a shared rate-limit store.** With

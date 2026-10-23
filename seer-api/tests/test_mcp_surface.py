@@ -27,7 +27,7 @@ def dev_app(monkeypatch):
 
 
 def test_mcp_blocks_cross_origin_browser_request(dev_app):
-    with TestClient(dev_app.app) as c:
+    with TestClient(dev_app.app, base_url="http://localhost") as c:
         resp = c.post(
             "/mcp",
             headers={"Origin": "https://evil.example"},
@@ -39,7 +39,7 @@ def test_mcp_blocks_cross_origin_browser_request(dev_app):
 
 
 def test_mcp_allows_localhost_origin(dev_app):
-    with TestClient(dev_app.app) as c:
+    with TestClient(dev_app.app, base_url="http://localhost") as c:
         resp = c.post(
             "/mcp",
             headers={"Origin": "http://localhost:3000"},
@@ -51,7 +51,7 @@ def test_mcp_allows_localhost_origin(dev_app):
 
 
 def test_mcp_allows_non_browser_client_without_origin(dev_app):
-    with TestClient(dev_app.app) as c:
+    with TestClient(dev_app.app, base_url="http://localhost") as c:
         resp = c.post(
             "/mcp",
             json={"jsonrpc": "2.0", "method": "ping", "id": 1},
@@ -68,7 +68,7 @@ def test_mcp_is_rate_limited(monkeypatch):
 
     importlib.reload(main)
     statuses = []
-    with TestClient(main.app) as c:
+    with TestClient(main.app, base_url="http://localhost") as c:
         for _ in range(5):
             r = c.post("/mcp", json={"jsonrpc": "2.0", "method": "ping", "id": 1})
             statuses.append(r.status_code)
@@ -85,7 +85,7 @@ def test_mcp_multi_limit_rate_string_enforces_every_limit(monkeypatch):
     import seer_api.main as main
 
     importlib.reload(main)
-    with TestClient(main.app) as c:
+    with TestClient(main.app, base_url="http://localhost") as c:
         statuses = [
             c.post("/mcp", json={"jsonrpc": "2.0", "method": "ping", "id": 1}).status_code
             for _ in range(4)
@@ -109,7 +109,7 @@ def test_mcp_guards_apply_under_root_path(monkeypatch):
 
     importlib.reload(main)
     body = {"jsonrpc": "2.0", "method": "ping", "id": 1}
-    with TestClient(main.app, root_path="/api") as c:
+    with TestClient(main.app, base_url="http://localhost", root_path="/api") as c:
         blocked = c.post("/api/mcp", headers={"Origin": "https://evil.example"}, json=body)
         assert blocked.status_code == 403, blocked.status_code
         statuses = [c.post("/api/mcp", json=body).status_code for _ in range(4)]
@@ -143,7 +143,7 @@ def test_mcp_origins_only_allowlist_does_not_421_every_request(monkeypatch):
     main = _reload_with(
         monkeypatch, SEER_MCP_ALLOWED_ORIGINS="https://app.example, http://localhost:*"
     )
-    with TestClient(main.app) as c:
+    with TestClient(main.app, base_url="http://localhost") as c:
         def post(origin=None):
             headers = dict(_SSE_HEADERS)
             if origin:
@@ -167,7 +167,7 @@ def test_mcp_origins_allowlist_enforced_with_api_key(monkeypatch):
         monkeypatch, SEER_API_KEY="s3cret", SEER_MCP_ALLOWED_ORIGINS="https://app.example"
     )
     auth = {**_SSE_HEADERS, "Authorization": "Bearer s3cret"}
-    with TestClient(main.app) as c:
+    with TestClient(main.app, base_url="http://localhost") as c:
         ok = c.post("/mcp", json=_TOOLS_LIST, headers={**auth, "Origin": "https://app.example"})
         assert ok.status_code == 200, ok.text
         evil = c.post(
@@ -184,6 +184,8 @@ def test_mcp_allowed_hosts_enables_sdk_rebinding_protection(monkeypatch):
         SEER_MCP_ALLOWED_HOSTS="testserver",
         SEER_MCP_ALLOWED_ORIGINS="https://app.example",
     )
+    # Default Host (testserver): the one listed host. /mcp's Host check is the
+    # SDK's here, so the REST guard's loopback rule must not apply.
     with TestClient(main.app) as c:
         ok = c.post(
             "/mcp", json=_TOOLS_LIST, headers={**_SSE_HEADERS, "Origin": "https://app.example"}

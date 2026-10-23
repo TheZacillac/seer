@@ -728,6 +728,7 @@ Propagation checks query **30 nameservers** across **6 regions**:
 | `SEER_HOST` | API bind host. Non-loopback requires `SEER_API_KEY` (without it, requests arriving on a non-loopback interface get a 503 however the server was started) | `127.0.0.1` |
 | `SEER_PORT` | API bind port | `8000` |
 | `SEER_API_KEY` | Bearer token required for all non-`/health` requests | — |
+| `SEER_ALLOWED_HOSTS` | Comma-separated `Host:` values (`host:*` matches any port) the API also answers without `SEER_API_KEY`. Without a key only a loopback `Host` (`localhost`, `127.0.0.0/8`, `[::1]`) is served otherwise — any other gets a 421, which stops DNS-rebinding pages. Ignored with a key; `/mcp` uses `SEER_MCP_ALLOWED_HOSTS` instead when that is set | — |
 | `SEER_CORS_ORIGINS` | Comma-separated CORS origins for the REST API. Unset: no CORS headers, and without `SEER_API_KEY` a request from a non-loopback `Origin` is refused (403) | — |
 | `SEER_DOCS_ENABLED` | Expose `/docs`, `/redoc`, `/openapi.json` | `false` |
 | `SEER_METRICS_ENABLED` | Expose `/metrics` to non-loopback clients | `false` |

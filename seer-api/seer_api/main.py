@@ -257,6 +257,40 @@ def _mcp_origin_blocked(origin: str) -> bool:
     return _origin_blocked(origin, _csv_env("SEER_MCP_ALLOWED_ORIGINS"))
 
 
+def _host_allowed(host: str, allowed: list[str]) -> bool:
+    """Whether a ``Host`` header value matches an ``allowed`` entry.
+
+    The MCP SDK's DNS-rebinding matching, so ``SEER_ALLOWED_HOSTS`` and
+    ``SEER_MCP_ALLOWED_HOSTS`` mean the same thing: an exact match, or a
+    ``host:*`` entry matching any port on that host.
+    """
+    if host in allowed:
+        return True
+    return any(
+        entry.endswith(":*") and host.startswith(entry[:-2] + ":") for entry in allowed
+    )
+
+
+def _host_blocked(route_path: str, host: str) -> bool:
+    """Whether the DNS-rebinding guard refuses a request with ``Host: host``.
+
+    Applied only without ``SEER_API_KEY`` (with one, a rebinding page has no
+    bearer token). A rebinding page's requests are same-origin — a GET
+    carries no ``Origin`` at all — so the Origin guard cannot see them; what
+    gives them away is the ``Host``, which names the attacker's domain. So
+    without a key only a loopback ``Host`` (``localhost``, ``127.0.0.0/8``,
+    ``[::1]``, any port) or one listed in ``SEER_ALLOWED_HOSTS`` is served.
+
+    /mcp with ``SEER_MCP_ALLOWED_HOSTS`` set is left to the MCP SDK, whose
+    DNS-rebinding protection then validates ``Host`` against that list.
+    """
+    if route_path == "/mcp" and _csv_env("SEER_MCP_ALLOWED_HOSTS"):
+        return False
+    if _is_loopback_host(_header_host(host)):
+        return False
+    return not _host_allowed(host, _csv_env("SEER_ALLOWED_HOSTS"))
+
+
 def _served_on_loopback(scope: dict) -> bool:
     """Whether the request arrived on a loopback interface.
 
@@ -420,6 +454,18 @@ async def auth_middleware(request: Request, call_next):
                 "bind to 127.0.0.1"
             },
             status_code=503,
+        )
+
+    # DNS-rebinding guard: without a key, only a loopback (or explicitly
+    # allowed) Host is served — see `_host_blocked`. 421 Misdirected Request,
+    # the MCP SDK's answer to a Host it does not serve.
+    if not api_key and _host_blocked(route_path, request.headers.get("host", "")):
+        return JSONResponse(
+            {
+                "detail": "Host not allowed without SEER_API_KEY; use a loopback "
+                "Host, or set SEER_ALLOWED_HOSTS or SEER_API_KEY"
+            },
+            status_code=421,
         )
 
     # Browser drive-by guard: a malicious page's fetch() carries a disallowed

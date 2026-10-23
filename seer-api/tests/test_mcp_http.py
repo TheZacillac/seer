@@ -25,7 +25,7 @@ def client():
     # manager's run() context.
     from seer_api.main import app
 
-    with TestClient(app) as c:
+    with TestClient(app, base_url="http://localhost") as c:
         yield c
 
 
@@ -97,7 +97,7 @@ def test_mcp_auth_gated_when_api_key_set(monkeypatch):
     importlib.reload(main)
     try:
         body = {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
-        with TestClient(main.app) as c:
+        with TestClient(main.app, base_url="http://localhost") as c:
             # Missing token -> 401, no MCP processing
             r = c.post("/mcp", json=body, headers=_SSE_HEADERS)
             assert r.status_code == 401

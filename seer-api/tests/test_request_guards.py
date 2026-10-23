@@ -172,6 +172,67 @@ def test_request_on_public_interface_with_key_is_served(monkeypatch):
     assert c.get("/lookup/example.com").status_code == 401
 
 
+_REBOUND_HOST = "rebind.attacker.example:8000"
+
+
+@pytest.mark.parametrize("path", ["/tld/com", "/metrics", "/"])
+def test_dns_rebinding_without_key_is_refused(monkeypatch, path):
+    """Regression: with no key the drive-by guard keyed only on Origin, so a
+    DNS-rebinding page (same-origin GET: the attacker's Host, no Origin)
+    was served — /metrics included, as the TCP peer is 127.0.0.1."""
+    _no_key(monkeypatch)
+    monkeypatch.delenv("SEER_ALLOWED_HOSTS", raising=False)
+    monkeypatch.setattr(seer, "tld_info", lambda t: {"tld": t}, raising=False)
+    c = TestClient(app, base_url="http://localhost", client=("127.0.0.1", 5555))
+    resp = c.get(path, headers={"Host": _REBOUND_HOST})
+    assert resp.status_code == 421, resp.text
+    assert "Host" in resp.json()["detail"]
+
+
+@pytest.mark.parametrize("host", ["localhost:8000", "127.0.0.1:8000", "[::1]:8000", "localhost"])
+def test_loopback_host_is_served_without_key(monkeypatch, host):
+    _no_key(monkeypatch)
+    monkeypatch.delenv("SEER_ALLOWED_HOSTS", raising=False)
+    monkeypatch.setattr(seer, "tld_info", lambda t: {"tld": t}, raising=False)
+    resp = TestClient(app, base_url="http://localhost").get("/tld/com", headers={"Host": host})
+    assert resp.status_code == 200, (host, resp.text)
+
+
+def test_allowed_hosts_admits_its_names_without_key(monkeypatch):
+    _no_key(monkeypatch)
+    monkeypatch.setenv("SEER_ALLOWED_HOSTS", "seer.internal:*, api.lan:8000")
+    monkeypatch.setattr(seer, "tld_info", lambda t: {"tld": t}, raising=False)
+    c = TestClient(app, base_url="http://localhost")
+    assert c.get("/tld/com", headers={"Host": "seer.internal:9000"}).status_code == 200
+    assert c.get("/tld/com", headers={"Host": "api.lan:8000"}).status_code == 200
+    assert c.get("/tld/com", headers={"Host": "api.lan:8001"}).status_code == 421
+    assert c.get("/tld/com", headers={"Host": _REBOUND_HOST}).status_code == 421
+
+
+def test_foreign_host_is_served_with_key(monkeypatch):
+    """With a key, bearer auth already stops a rebinding page (it has no
+    token), and a public deployment is reached by its own name."""
+    monkeypatch.setenv("SEER_API_KEY", "k")
+    monkeypatch.setattr(seer, "tld_info", lambda t: {"tld": t}, raising=False)
+    c = TestClient(app, base_url="http://192.0.2.10:8000")
+    headers = {"Host": "seer.example.com", "Authorization": "Bearer k"}
+    assert c.get("/tld/com", headers=headers).status_code == 200
+
+
+def test_mcp_host_check_is_left_to_the_sdk_when_mcp_hosts_are_set(monkeypatch):
+    """With SEER_MCP_ALLOWED_HOSTS set the MCP SDK validates Host for /mcp
+    itself; the REST guard must not refuse a host that list admits."""
+    from seer_api import main
+
+    _no_key(monkeypatch)
+    monkeypatch.delenv("SEER_ALLOWED_HOSTS", raising=False)
+    assert main._host_blocked("/tld/com", "mcp.lan:8000")
+    assert main._host_blocked("/mcp", "mcp.lan:8000")
+    monkeypatch.setenv("SEER_MCP_ALLOWED_HOSTS", "mcp.lan:*")
+    assert not main._host_blocked("/mcp", "mcp.lan:8000")
+    assert main._host_blocked("/tld/com", "mcp.lan:8000")
+
+
 def test_cross_origin_rest_request_blocked_without_key(monkeypatch, client):
     """Regression: with no key, REST sent `Access-Control-Allow-Origin: *`
     and checked no Origin, so any web page could drive the API from the
@@ -200,7 +261,7 @@ def test_cors_allowlist_admits_its_origins(monkeypatch):
     monkeypatch.setattr(seer, "lookup", lambda d: {"domain": d}, raising=False)
     importlib.reload(main)
     try:
-        c = TestClient(main.app)
+        c = TestClient(main.app, base_url="http://localhost")
         resp = c.get("/lookup/example.com", headers={"Origin": "https://app.example"})
         assert resp.status_code == 200
         assert resp.headers["access-control-allow-origin"] == "https://app.example"

@@ -31,7 +31,7 @@ def app_module():
 
 @pytest.fixture
 def client(app_module):
-    return TestClient(app_module.app)
+    return TestClient(app_module.app, base_url="http://localhost")
 
 
 # ---------------------------------------------------------------------------
@@ -80,7 +80,7 @@ def test_api_key_required_when_set(monkeypatch):
     import seer_api.main as main
 
     importlib.reload(main)
-    c = TestClient(main.app)
+    c = TestClient(main.app, base_url="http://localhost")
 
     # Missing auth -> 401
     assert c.get("/").status_code == 401
@@ -105,7 +105,7 @@ def test_preflight_options_bypasses_auth(monkeypatch):
     import seer_api.main as main
 
     importlib.reload(main)
-    c = TestClient(main.app)
+    c = TestClient(main.app, base_url="http://localhost")
 
     response = c.options(
         "/lookup/example.com",
@@ -129,7 +129,7 @@ def test_non_ascii_bearer_token_is_401_not_500(monkeypatch):
     import seer_api.main as main
 
     importlib.reload(main)
-    c = TestClient(main.app)
+    c = TestClient(main.app, base_url="http://localhost")
     # httpx only sends str header values as ASCII; send raw bytes the way a
     # hostile client can (latin-1 and UTF-8 spellings).
     for raw in ("Bearer été".encode("latin-1"), "Bearer été".encode()):
@@ -147,7 +147,7 @@ def test_non_ascii_api_key_is_usable(monkeypatch):
     import seer_api.main as main
 
     importlib.reload(main)
-    c = TestClient(main.app)
+    c = TestClient(main.app, base_url="http://localhost")
     assert c.get("/").status_code == 401
     assert c.get("/", headers={"Authorization": b"Bearer cl"}).status_code == 401
     ok = c.get("/", headers={"Authorization": "Bearer clé".encode()})  # UTF-8 on the wire
@@ -164,7 +164,7 @@ def test_auth_exemption_honors_root_path(monkeypatch):
     import seer_api.main as main
 
     importlib.reload(main)
-    c = TestClient(main.app, root_path="/api")
+    c = TestClient(main.app, base_url="http://localhost", root_path="/api")
     assert c.get("/api/health").status_code == 200
     # Everything else is still authenticated under the prefix.
     assert c.get("/api/").status_code == 401
@@ -968,7 +968,7 @@ def test_refuses_public_bind_without_auth(monkeypatch):
     import seer_api.main as main
 
     importlib.reload(main)
-    with pytest.raises(RuntimeError, match="public bind without auth"), TestClient(main.app):
+    with pytest.raises(RuntimeError, match="public bind without auth"), TestClient(main.app, base_url="http://localhost"):
         pass  # lifespan runs on __enter__
 
     monkeypatch.delenv("SEER_HOST")
@@ -983,7 +983,7 @@ def test_public_bind_with_auth_starts(monkeypatch):
 
     importlib.reload(main)
     # Should not raise
-    with TestClient(main.app) as c:
+    with TestClient(main.app, base_url="http://localhost") as c:
         assert c.get("/health").status_code == 200
 
     monkeypatch.delenv("SEER_HOST")
@@ -998,7 +998,7 @@ def test_loopback_bind_without_auth_starts(monkeypatch):
     import seer_api.main as main
 
     importlib.reload(main)
-    with TestClient(main.app) as c:
+    with TestClient(main.app, base_url="http://localhost") as c:
         assert c.get("/health").status_code == 200
 
     monkeypatch.delenv("SEER_HOST")
@@ -1019,7 +1019,7 @@ def test_other_loopback_forms_start_without_auth(monkeypatch, host):
     import seer_api.main as main
 
     importlib.reload(main)
-    with TestClient(main.app) as c:
+    with TestClient(main.app, base_url="http://localhost") as c:
         assert c.get("/health").status_code == 200
 
     monkeypatch.delenv("SEER_HOST")
@@ -1065,7 +1065,7 @@ def test_non_loopback_binds_still_refused_without_auth(monkeypatch, host):
     import seer_api.main as main
 
     importlib.reload(main)
-    with pytest.raises(RuntimeError, match="public bind without auth"), TestClient(main.app):
+    with pytest.raises(RuntimeError, match="public bind without auth"), TestClient(main.app, base_url="http://localhost"):
         pass
 
     monkeypatch.delenv("SEER_HOST")
@@ -1148,12 +1148,12 @@ def test_root_index_describes_the_serving_app_not_module_state(monkeypatch):
     import seer_api.main as main
 
     serving_app = main.app
-    with TestClient(serving_app) as c:
+    with TestClient(serving_app, base_url="http://localhost") as c:
         before = c.get("/").json()["endpoints"]
 
     # Rebind the module global to a DIFFERENT, near-empty app.
     monkeypatch.setattr(main, "app", FastAPI())
-    with TestClient(serving_app) as c:
+    with TestClient(serving_app, base_url="http://localhost") as c:
         after = c.get("/").json()["endpoints"]
 
     assert after == before, (
@@ -1181,7 +1181,7 @@ def test_metrics_labels_keep_the_router_prefix(monkeypatch):
     monkeypatch.setattr(seer, "posture", lambda d: {"d": d}, raising=False)
 
     before = dict(metrics.snapshot()["endpoints"])
-    with TestClient(app) as c:
+    with TestClient(app, base_url="http://localhost") as c:
         c.get("/info/a.com")
         c.get("/availability/b.com")
         c.get("/posture/c.com")
@@ -1207,7 +1207,7 @@ def test_refuses_multi_worker_without_shared_store(monkeypatch):
     import seer_api.main as main
 
     importlib.reload(main)
-    with pytest.raises(RuntimeError, match="SEER_RATE_LIMIT_STORAGE"), TestClient(main.app):
+    with pytest.raises(RuntimeError, match="SEER_RATE_LIMIT_STORAGE"), TestClient(main.app, base_url="http://localhost"):
         pass
 
     monkeypatch.delenv("WEB_CONCURRENCY")
@@ -1224,7 +1224,7 @@ def test_web_concurrency_shadows_unparseable_uvicorn_workers(monkeypatch):
     import seer_api.main as main
 
     importlib.reload(main)
-    with TestClient(main.app) as c:
+    with TestClient(main.app, base_url="http://localhost") as c:
         assert c.get("/health").status_code == 200
 
     monkeypatch.delenv("WEB_CONCURRENCY")
@@ -1246,7 +1246,7 @@ def test_unparseable_uvicorn_workers_rejected_when_it_is_the_fallback(
     import seer_api.main as main
 
     importlib.reload(main)
-    with pytest.raises(RuntimeError, match="UVICORN_WORKERS"), TestClient(main.app):
+    with pytest.raises(RuntimeError, match="UVICORN_WORKERS"), TestClient(main.app, base_url="http://localhost"):
         pass
 
     monkeypatch.delenv("UVICORN_WORKERS")
@@ -1260,7 +1260,7 @@ def test_multi_worker_with_shared_store_starts(monkeypatch):
     import seer_api.main as main
 
     importlib.reload(main)
-    with TestClient(main.app) as c:
+    with TestClient(main.app, base_url="http://localhost") as c:
         assert c.get("/health").status_code == 200
 
     monkeypatch.delenv("WEB_CONCURRENCY")
@@ -1285,7 +1285,7 @@ def test_docs_enabled_when_flag_set(monkeypatch):
     import seer_api.main as main
 
     importlib.reload(main)
-    with TestClient(main.app) as c:
+    with TestClient(main.app, base_url="http://localhost") as c:
         assert c.get("/docs").status_code == 200
         assert c.get("/openapi.json").status_code == 200
 
@@ -1612,7 +1612,7 @@ def test_metrics_localhost_only_socket_peer(reset_limiter, app_module):
     """The default TestClient reports client.host as 'testclient', not
     127.0.0.1 — verify that the metrics gate uses the socket peer
     directly (not the spoofable X-Forwarded-For) and rejects non-loopback."""
-    c = TestClient(app_module.app)
+    c = TestClient(app_module.app, base_url="http://localhost")
     resp = c.get("/metrics", headers={"X-Forwarded-For": "127.0.0.1"})
     # TestClient's synthetic peer is 'testclient' — not in the allowlist,
     # so we should be rejected. Importantly, the XFF header must not
@@ -1623,7 +1623,7 @@ def test_metrics_localhost_only_socket_peer(reset_limiter, app_module):
 def test_metrics_allows_real_loopback(reset_limiter, app_module):
     """When the socket peer is 127.0.0.1 the gate lets the request through."""
     # Force the TestClient to appear as 127.0.0.1
-    c = TestClient(app_module.app, client=("127.0.0.1", 12345))
+    c = TestClient(app_module.app, base_url="http://localhost", client=("127.0.0.1", 12345))
     resp = c.get("/metrics")
     assert resp.status_code == 200
     assert "total_requests" in resp.json()
@@ -1634,7 +1634,7 @@ def test_metrics_rate_limited(reset_limiter, monkeypatch):
     import seer_api.main as main
 
     importlib.reload(main)
-    c = TestClient(main.app, client=("127.0.0.1", 12345))
+    c = TestClient(main.app, base_url="http://localhost", client=("127.0.0.1", 12345))
     # Send > 10 requests in a burst; at least one must be 429.
     statuses = [c.get("/metrics").status_code for _ in range(15)]
     assert 429 in statuses, f"expected rate-limit in {statuses}"
