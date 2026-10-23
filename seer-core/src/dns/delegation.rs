@@ -8,6 +8,10 @@
 //!    disabled for the domain's NS — the delegation lives in the referral's
 //!    AUTHORITY section (or the ANSWER section when the parent server also
 //!    happens to be authoritative for the child). The union is `delegated_ns`.
+//!    A server counts as responsive only when it answers for the parent
+//!    zone — a delegation, or a negative answer backed by the zone's SOA; an
+//!    empty reply or a referral elsewhere is a lame parent, noted in the
+//!    warnings while the next one is asked.
 //! 3. Query each delegated NS directly (RD=0) for the domain's own NS RRset.
 //!    A server that fails to answer authoritatively for its own zone is lame
 //!    (refused / timeout / non-authoritative / empty). The union of
@@ -244,6 +248,10 @@ enum DirectNs {
         /// NS targets for the queried domain from the AUTHORITY section
         /// (where a parent publishes the delegation / referral).
         authority_ns: Vec<String>,
+        /// Owner of an SOA record in AUTHORITY (normalized): the zone a
+        /// negative answer speaks for (RFC 2308). A server that is not
+        /// authoritative for the name's zone has none to give.
+        soa_zone: Option<String>,
     },
     /// The server responded with an error RCODE (REFUSED, SERVFAIL, ...).
     Rcode(ResponseCode),
@@ -391,12 +399,13 @@ impl DelegationChecker {
         self
     }
 
-    /// The whole check's deadline: [`CHECK_BUDGET_TIMEOUTS`] per-query
-    /// timeouts.
     /// Steps 1–2 of [`check`](Self::check): the parent zone's NS set, then the
     /// delegation for `domain` from up to [`PARENT_SERVERS_WANTED`] of its
-    /// servers. Errors when the parent has no NS set or no parent server
-    /// answers; an empty delegation is a warning.
+    /// servers. A server counts only when it answers for the parent zone
+    /// (see [`parent_answer`]); a lame one is a warning and the next is
+    /// asked, up to [`MAX_PARENT_SERVERS_TRIED`] within the deadline. Errors
+    /// when the parent has no NS set or no parent server answers; an empty
+    /// delegation is a warning.
     async fn parent_delegation(
         &self,
         domain: &str,
@@ -445,40 +454,25 @@ impl DelegationChecker {
                     continue;
                 }
             };
-            match direct {
-                DirectNs::Response {
-                    response_code,
-                    answer_ns,
-                    authority_ns,
-                    ..
-                } => {
-                    if response_code == ResponseCode::NXDomain {
+            // Only a real answer counts toward PARENT_SERVERS_WANTED: a lame
+            // server's empty reply would otherwise stop the hunt before a
+            // healthy one is asked.
+            match parent_answer(direct, domain) {
+                ParentAnswer::Delegation(ns) => {
+                    delegated.extend(ns);
+                    parent_server_queried.push(host.clone());
+                }
+                ParentAnswer::Negative(code) => {
+                    if code == ResponseCode::NXDomain {
                         warnings.push(format!(
                             "parent server {} returned NXDOMAIN for {}",
                             host, domain
                         ));
                     }
-                    // Referrals carry the delegation in AUTHORITY; a parent
-                    // that is also authoritative for the child answers in
-                    // ANSWER. Union both.
-                    delegated.extend(answer_ns);
-                    delegated.extend(authority_ns);
                     parent_server_queried.push(host.clone());
                 }
-                DirectNs::Rcode(code) => {
-                    warnings.push(format!("parent server {} answered with {}", host, code));
-                }
-                DirectNs::Unreachable(reason) => {
-                    warnings.push(format!(
-                        "parent server {} did not respond: {}",
-                        host, reason
-                    ));
-                }
-                DirectNs::LocalNoRoute(reason) => {
-                    warnings.push(format!(
-                        "parent server {} not probed — no route from this host ({})",
-                        host, reason
-                    ));
+                ParentAnswer::Lame(reason) => {
+                    warnings.push(format!("parent server {host} {reason}"));
                 }
             }
         }
@@ -777,6 +771,7 @@ impl DelegationChecker {
                     response_code: message.metadata.response_code,
                     answer_ns: ns_targets_for(&message.answers, domain),
                     authority_ns: ns_targets_for(&message.authorities, domain),
+                    soa_zone: soa_zone_in(&message.authorities),
                 }
             }
             Err(e) => classify_net_error(e, domain),
@@ -901,16 +896,20 @@ pub(crate) fn build_recursive_resolver(
 /// exists in any section (NODATA / NXDOMAIN) — see [`DirectNs`].
 fn classify_net_error(err: NetError, domain: &str) -> DirectNs {
     match err {
-        NetError::Dns(DnsError::NoRecordsFound(no_records)) => DirectNs::Response {
-            authoritative: false,
-            response_code: no_records.response_code,
-            answer_ns: Vec::new(),
-            authority_ns: no_records
-                .authorities
-                .as_deref()
-                .map(|records| ns_targets_for(records, domain))
-                .unwrap_or_default(),
-        },
+        NetError::Dns(DnsError::NoRecordsFound(no_records)) => {
+            let authorities = no_records.authorities.as_deref().unwrap_or_default();
+            DirectNs::Response {
+                authoritative: false,
+                response_code: no_records.response_code,
+                answer_ns: Vec::new(),
+                authority_ns: ns_targets_for(authorities, domain),
+                soa_zone: no_records
+                    .soa
+                    .as_ref()
+                    .map(|soa| normalize_ns_name(&soa.name.to_ascii()))
+                    .or_else(|| soa_zone_in(authorities)),
+            }
+        }
         NetError::Dns(DnsError::ResponseCode(code)) => DirectNs::Rcode(code),
         NetError::Timeout => DirectNs::Unreachable("timed out".to_string()),
         // What `resolver.lookup()` actually returns when every transport
@@ -1025,6 +1024,69 @@ fn ns_targets_for(records: &[Record], owner: &str) -> Vec<String> {
             }
         })
         .collect()
+}
+
+/// The normalized owner of the first SOA record in `records` (an AUTHORITY
+/// section), if any.
+fn soa_zone_in(records: &[Record]) -> Option<String> {
+    records
+        .iter()
+        .find(|record| matches!(record.data, HickoryRData::SOA(_)))
+        .map(|record| normalize_ns_name(&record.name.to_ascii()))
+}
+
+/// What one parent-zone server's reply says about `domain`'s delegation.
+#[derive(Debug, PartialEq)]
+enum ParentAnswer {
+    /// The NS names it delegates (ANSWER and AUTHORITY, unioned).
+    Delegation(Vec<String>),
+    /// An authoritative "no delegation": NXDOMAIN or NODATA carrying the SOA
+    /// of a zone that contains `domain`.
+    Negative(ResponseCode),
+    /// Not an answer for `domain` — the server is lame for the parent zone,
+    /// so it does not count toward [`PARENT_SERVERS_WANTED`]. The reason,
+    /// for the report's warnings.
+    Lame(String),
+}
+
+/// Reads a parent server's reply to `domain NS` (RD=0). A delegation is an
+/// answer, and so is a negative one backed by the SOA of a zone containing
+/// `domain` (the parent's own "no such delegation"; hickory's negative path
+/// drops the AA bit, so the SOA is the evidence of authority). Anything else
+/// — an empty reply without that SOA, a referral to some other zone — comes
+/// from a server that does not serve the parent zone.
+fn parent_answer(direct: DirectNs, domain: &str) -> ParentAnswer {
+    match direct {
+        DirectNs::Response {
+            answer_ns,
+            authority_ns,
+            ..
+        } if !answer_ns.is_empty() || !authority_ns.is_empty() => {
+            ParentAnswer::Delegation(answer_ns.into_iter().chain(authority_ns).collect())
+        }
+        DirectNs::Response {
+            response_code,
+            soa_zone: Some(zone),
+            ..
+        } if zone_contains(&zone, domain) => ParentAnswer::Negative(response_code),
+        DirectNs::Response { response_code, .. } => ParentAnswer::Lame(format!(
+            "gave no delegation for {domain} ({response_code} without the zone's SOA)"
+        )),
+        DirectNs::Rcode(code) => ParentAnswer::Lame(format!("answered with {code}")),
+        DirectNs::Unreachable(reason) => ParentAnswer::Lame(format!("did not respond: {reason}")),
+        DirectNs::LocalNoRoute(reason) => {
+            ParentAnswer::Lame(format!("not probed — no route from this host ({reason})"))
+        }
+    }
+}
+
+/// True when `name` is `zone` or a name below it (both normalized).
+fn zone_contains(zone: &str, name: &str) -> bool {
+    zone.is_empty()
+        || name == zone
+        || name
+            .strip_suffix(zone)
+            .is_some_and(|rest| rest.ends_with('.'))
 }
 
 #[cfg(test)]
@@ -1213,6 +1275,7 @@ mod tests {
                 response_code: code,
                 answer_ns: answer.iter().map(|s| s.to_string()).collect(),
                 authority_ns: authority.iter().map(|s| s.to_string()).collect(),
+                soa_zone: None,
             };
         let kind = |direct| match outcome_for_direct(direct) {
             ProbeOutcome::Lame(kind, _) => kind,
@@ -1715,5 +1778,157 @@ mod tests {
         let same = DnsNameservers::compare(&whois, vec!["ns2.nic.tg".into(), "ns1.nic.tg".into()]);
         assert!(same.in_sync);
         assert_eq!(same.delegated, vec!["ns1.nic.tg", "ns2.nic.tg"]);
+    }
+
+    // --- lame parent servers -------------------------------------------------
+
+    /// Recursive mock: parent zone `test` served by each of `parents`, and
+    /// every A lookup → 127.0.0.1.
+    async fn spawn_recursive_with_parents(parents: &'static [&'static str]) -> u16 {
+        spawn_mock_dns_fn(move |qname, qtype| match (qname, qtype) {
+            ("test", HickoryRecordType::NS) => {
+                MockReply::Answer(parents.iter().map(|p| ns_rdata(&format!("{p}."))).collect())
+            }
+            (_, HickoryRecordType::A) => MockReply::Answer(vec![loopback_a()]),
+            _ => MockReply::NoData,
+        })
+        .await
+    }
+
+    /// Regression: any NOERROR reply counted toward `PARENT_SERVERS_WANTED`,
+    /// so two lame parents (empty answer, no SOA) ended the hunt with an
+    /// empty delegation before the healthy third was asked.
+    #[tokio::test]
+    async fn lame_parents_do_not_count_toward_wanted() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let recursive =
+            spawn_recursive_with_parents(&["a.parent.test", "b.parent.test", "c.parent.test"])
+                .await;
+        let lame_a = spawn_mock_dns_fn(|_, _| MockReply::NoData).await;
+        // b refers the query to some other zone: no delegation for seer.test.
+        let lame_b = spawn_mock_dns_fn(|_, _| MockReply::Delegation {
+            zone: "elsewhere.test".to_string(),
+            servers: vec![("ns.elsewhere.test".to_string(), Vec::new())],
+        })
+        .await;
+        let asked = Arc::new(AtomicUsize::new(0));
+        let seen = asked.clone();
+        let healthy_c = spawn_mock_dns_fn(move |qname, qtype| {
+            seen.fetch_add(1, Ordering::SeqCst);
+            if qname == "seer.test" && qtype == HickoryRecordType::NS {
+                MockReply::Delegation {
+                    zone: "seer.test".to_string(),
+                    servers: vec![("ns1.seer.test".to_string(), Vec::new())],
+                }
+            } else {
+                MockReply::NoData
+            }
+        })
+        .await;
+        let checker = checker(
+            recursive,
+            HashMap::from([
+                ("a.parent.test".to_string(), lame_a),
+                ("b.parent.test".to_string(), lame_b),
+                ("c.parent.test".to_string(), healthy_c),
+            ]),
+        );
+
+        let delegated = checker.delegated_ns("seer.test").await.expect("c answers");
+        assert_eq!(delegated, vec!["ns1.seer.test"]);
+        assert!(asked.load(Ordering::SeqCst) >= 1);
+
+        let ParentDelegation {
+            servers_queried,
+            warnings,
+            ..
+        } = checker
+            .parent_delegation(
+                "seer.test",
+                "test",
+                tokio::time::Instant::now() + Duration::from_secs(10),
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("c answers");
+        assert_eq!(servers_queried, vec!["c.parent.test"]);
+        for lame in ["a.parent.test", "b.parent.test"] {
+            assert!(
+                warnings
+                    .iter()
+                    .any(|w| w.contains(lame) && w.contains("no delegation")),
+                "{warnings:?}"
+            );
+        }
+    }
+
+    /// The parent's own negative answer (NXDOMAIN with its SOA) is an
+    /// answer: the server counts and the domain reads as not delegated.
+    #[tokio::test]
+    async fn parent_nxdomain_with_its_soa_counts_as_an_answer() {
+        let recursive = spawn_recursive_mock(&[]).await;
+        let parent = spawn_mock_dns_fn(|_, _| MockReply::AuthoritativeNxDomain("test")).await;
+        let report = checker(
+            recursive,
+            HashMap::from([("a.parent.test".to_string(), parent)]),
+        )
+        .check("seer.test")
+        .await
+        .expect("the parent answered");
+        assert_eq!(report.parent_server_queried, vec!["a.parent.test"]);
+        assert!(report.delegated_ns.is_empty());
+        assert!(
+            report.warnings.iter().any(|w| w.contains("NXDOMAIN")),
+            "{:?}",
+            report.warnings
+        );
+    }
+
+    #[test]
+    fn parent_answer_needs_a_delegation_or_the_zones_soa() {
+        let response = |code, authority: &[&str], soa: Option<&str>| DirectNs::Response {
+            authoritative: false,
+            response_code: code,
+            answer_ns: Vec::new(),
+            authority_ns: authority.iter().map(|s| s.to_string()).collect(),
+            soa_zone: soa.map(str::to_string),
+        };
+        let nx = ResponseCode::NXDomain;
+        let ok = ResponseCode::NoError;
+        assert_eq!(
+            parent_answer(response(ok, &["ns1.seer.test"], None), "seer.test"),
+            ParentAnswer::Delegation(vec!["ns1.seer.test".to_string()])
+        );
+        for soa in ["test", "", "seer.test"] {
+            assert_eq!(
+                parent_answer(response(nx, &[], Some(soa)), "seer.test"),
+                ParentAnswer::Negative(nx),
+                "{soa:?}"
+            );
+        }
+        assert_eq!(
+            parent_answer(response(ok, &[], Some("test")), "seer.test"),
+            ParentAnswer::Negative(ok)
+        );
+        // No SOA, or the SOA of a zone that does not contain the name.
+        for soa in [None, Some("other.test"), Some("eer.test")] {
+            assert!(
+                matches!(
+                    parent_answer(response(ok, &[], soa), "seer.test"),
+                    ParentAnswer::Lame(_)
+                ),
+                "{soa:?}"
+            );
+            assert!(matches!(
+                parent_answer(response(nx, &[], soa), "seer.test"),
+                ParentAnswer::Lame(_)
+            ));
+        }
+        assert!(matches!(
+            parent_answer(DirectNs::Rcode(ResponseCode::Refused), "seer.test"),
+            ParentAnswer::Lame(_)
+        ));
     }
 }
