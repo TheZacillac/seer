@@ -17,7 +17,7 @@ use crate::tui::widgets::{wrap_hard, Band};
 pub const MIN_ROWS: usize = 3;
 /// Widest label gutter, so a long label cannot squeeze the values.
 const MAX_LABEL: usize = 14;
-/// Narrowest value column, however narrow the pane.
+/// Value columns the label gutter always leaves, shrinking itself to do so.
 const MIN_VALUE: usize = 8;
 
 /// One `label  value` line of the detail. `tone` is a `Theme::tone` name
@@ -54,9 +54,15 @@ pub fn lines(theme: &Theme, fields: &[Field], width: u16) -> Vec<Line<'static>> 
         .max()
         .unwrap_or(0)
         .min(MAX_LABEL);
-    let gutter = label_w + 2;
-    let value_w = usize::from(width).saturating_sub(gutter).max(MIN_VALUE);
-    let value_w = u16::try_from(value_w).unwrap_or(u16::MAX);
+    // The gutter gives way before the values do: it shrinks (labels cut to
+    // fit) to leave MIN_VALUE columns, and goes entirely when that leaves no
+    // room for a label, so no line is wider than `width`.
+    let width = usize::from(width);
+    let mut gutter = (label_w + 2).min(width.saturating_sub(MIN_VALUE));
+    if gutter < 3 {
+        gutter = 0;
+    }
+    let value_w = u16::try_from(width.saturating_sub(gutter).max(1)).unwrap_or(u16::MAX);
     let mut out = Vec::new();
     for field in fields {
         let color = field.tone.map_or(theme.text, |t| theme.tone(t));
@@ -65,7 +71,11 @@ pub fn lines(theme: &Theme, fields: &[Field], width: u16) -> Vec<Line<'static>> 
             chunks.push("—".to_string());
         }
         for (i, chunk) in chunks.into_iter().enumerate() {
-            let label = if i == 0 { field.label } else { "" };
+            let label: String = if i == 0 && gutter > 0 {
+                field.label.chars().take(gutter - 2).collect()
+            } else {
+                String::new()
+            };
             out.push(Line::from(vec![
                 Span::styled(
                     format!("{label:<gutter$}"),
@@ -154,6 +164,19 @@ mod tests {
         let got = text(&lines(&theme, &fields, 40)).join("|");
         assert!(!got.contains('\x1b') && !got.contains('\n'), "{got:?}");
         assert!(got.contains("e  —"), "{got:?}");
+    }
+
+    /// On a narrow pane the label gutter gives way, so no line is wider
+    /// than the band (a wider one would be clipped at its edge).
+    #[test]
+    fn lines_never_exceed_a_narrow_width() {
+        let theme = Theme::frappe();
+        let fields = [Field::new("remediation", "x".repeat(60))];
+        for width in [6u16, 12, 20] {
+            for line in lines(&theme, &fields, width) {
+                assert!(line.width() <= usize::from(width), "{width}: {line:?}");
+            }
+        }
     }
 
     #[test]
