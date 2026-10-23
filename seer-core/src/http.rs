@@ -19,10 +19,11 @@
 //!   omits or lies about `Content-Length` cannot force an unbounded buffer, and
 //!   the read is wrapped in a total-duration timeout so a server that trickles
 //!   bytes forever cannot hang the caller.
-//! - Failures are classified ([`SendError`]): a connect failure that reached
-//!   the network is distinguishable from an unknown (a timeout, or a local
-//!   no-route error — this host has no route), and the traced variants keep
-//!   the redirect chain.
+//! - Failures are classified ([`SendError`]): a connect failure on the first
+//!   hop that reached the network is distinguishable from an unknown (a
+//!   timeout, a local no-route error — this host has no route — or a redirect
+//!   target that would not connect), and the traced variants keep the
+//!   redirect chain.
 //! - TLS verification is left at reqwest's validating default. Unlike
 //!   [`crate::ssl`], which relaxes verification *because* inspecting a bad
 //!   certificate is its purpose, these probes draw security conclusions from
@@ -122,18 +123,21 @@ pub(crate) struct FetchedResponse {
 }
 
 /// Why a guarded request failed, split so a probe can tell "the connection
-/// failed" (refused, remote unreachable, TLS handshake failure) from
-/// everything else (SSRF refusal, bad URL, redirect loop, any timeout, a
-/// local no-route error), which is an unknown, not a negative result. A
-/// timeout is [`SendError::Other`]: it may be packet loss, so it proves
-/// nothing about the host; nor does a local no-route error (this host has no
-/// route to the address, e.g. an IPv6 address without IPv6 transit).
+/// to the requested URL failed" (refused, remote unreachable, TLS handshake
+/// failure) from everything else (SSRF refusal, bad URL, redirect loop, any
+/// timeout, a local no-route error, a failed redirect hop), which is an
+/// unknown, not a negative result. A timeout is [`SendError::Other`]: it may
+/// be packet loss, so it proves nothing about the host; nor does a local
+/// no-route error (this host has no route to the address, e.g. an IPv6
+/// address without IPv6 transit). Nor does a redirect target that fails to
+/// connect: the requested host answered, so it is reachable.
 #[derive(Debug)]
 pub(crate) enum SendError {
-    /// The connection failed: refused, remote unreachable, or a TLS handshake
-    /// failure.
+    /// The connection to the requested URL (the first hop) failed: refused,
+    /// remote unreachable, or a TLS handshake failure.
     Connect(SeerError),
-    /// Any other failure, including timeouts and local no-route errors.
+    /// Any other failure, including timeouts, local no-route errors and any
+    /// failure on a later redirect hop.
     Other(SeerError),
 }
 
@@ -262,7 +266,7 @@ impl GuardedFetcher {
         })?;
         let mut visited: HashSet<String> = HashSet::new();
 
-        for _ in 0..=MAX_REDIRECTS {
+        for hop in 0..=MAX_REDIRECTS {
             if !visited.insert(url.as_str().to_string()) {
                 return Err(SendError::Other(SeerError::HttpError(
                     "redirect loop detected".to_string(),
@@ -295,7 +299,7 @@ impl GuardedFetcher {
                 .get(url.clone())
                 .send()
                 .await
-                .map_err(classify_send_error)?;
+                .map_err(|e| classify_send_error(e, hop == 0))?;
 
             // A 3xx with no `Location` has nowhere to go and is the final
             // response (RFC 9110 §15.4: `Location` is optional for 300 and
@@ -347,18 +351,21 @@ impl GuardedFetcher {
     }
 }
 
-/// Splits a failed request into [`SendError`]: only a connect failure that
-/// reached the network (refused, remote unreachable, TLS handshake failure)
-/// is [`SendError::Connect`]. A connect timeout and a local no-route error
-/// (this host has no route, see [`is_local_failure`]) say nothing about the
-/// remote host, so they are [`SendError::Other`].
-fn classify_send_error(e: reqwest::Error) -> SendError {
+/// Splits a failed request into [`SendError`]: only a connect failure on the
+/// `first_hop` that reached the network (refused, remote unreachable, TLS
+/// handshake failure) is [`SendError::Connect`]. A connect timeout and a
+/// local no-route error (this host has no route, see [`is_local_failure`])
+/// say nothing about the remote host, and a later hop failing says nothing
+/// about the requested one (it answered with the redirect), so they are
+/// [`SendError::Other`].
+fn classify_send_error(e: reqwest::Error, first_hop: bool) -> SendError {
     let connect = e.is_connect() && !e.is_timeout() && !is_local_failure(&e);
-    let error = SeerError::HttpError(e.to_string());
-    if connect {
-        SendError::Connect(error)
-    } else {
-        SendError::Other(error)
+    match (connect, first_hop) {
+        (true, true) => SendError::Connect(SeerError::HttpError(e.to_string())),
+        (true, false) => SendError::Other(SeerError::HttpError(format!(
+            "redirect target unreachable: {e}"
+        ))),
+        (false, _) => SendError::Other(SeerError::HttpError(e.to_string())),
     }
 }
 
@@ -818,5 +825,37 @@ mod tests {
         let fetcher = GuardedFetcher::new().allowing_private_hosts();
         let (_, hops) = fetcher.send(&format!("{}/a", server.uri())).await.unwrap();
         assert_eq!(hops, 1);
+    }
+
+    /// Regression: a redirect target that refused the connection surfaced as
+    /// `SendError::Connect`, so the audit called the requested host (which
+    /// answered) unreachable over HTTPS.
+    #[tokio::test]
+    async fn a_later_hop_connect_failure_is_other() {
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("location", format!("http://127.0.0.1:{port}/")),
+            )
+            .mount(&server)
+            .await;
+        let traced = GuardedFetcher::new()
+            .with_timeout(CLOSED_PORT_TEST_TIMEOUT)
+            .allowing_private_hosts()
+            .get_head_traced(&format!("{}/", server.uri()))
+            .await;
+        match traced.result {
+            Err(SendError::Other(e)) => {
+                assert!(e.to_string().contains("redirect target"), "{e}");
+            }
+            other => panic!("expected SendError::Other, got {:?}", other.err()),
+        }
+        assert_eq!(traced.chain.len(), 2);
     }
 }

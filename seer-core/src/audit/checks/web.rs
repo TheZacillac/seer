@@ -2,10 +2,11 @@
 //! port-80 → HTTPS upgrade, and `security.txt`. Three independent fetches,
 //! so three specs (one slow origin cannot take the others' results with it).
 //!
-//! A failed HTTPS connection (refused, remote unreachable, TLS handshake
-//! failure) is a finding — the site is not reachable over HTTPS — reported
-//! by the `web.headers` check; any other fetch failure (a timeout, or no
-//! route from this host) is unknown (incomplete).
+//! A failed HTTPS connection to the host itself (refused, remote
+//! unreachable, TLS handshake failure) is a finding — the site is not
+//! reachable over HTTPS — reported by the `web.headers` check; any other
+//! fetch failure (a timeout, no route from this host, or a redirect target
+//! that fails after the host answered) is unknown (incomplete).
 
 use futures::future::BoxFuture;
 
@@ -56,17 +57,23 @@ pub(crate) const IDS: &[&str] = &[
 
 fn run_headers<'a>(ctx: &'a AuditContext<'a>) -> BoxFuture<'a, CheckOutput> {
     Box::pin(async move {
-        let mut out = CheckOutput::default();
-        match audit_headers_with(&ctx.auditor.fetcher(), ctx.host).await {
-            Ok(report) => out.ran(HEADERS_CHECK, W, assess_headers(ctx.host, &report)),
-            Err(SendError::Connect(e)) => {
-                tracing::debug!(host = ctx.host, error = %e, "audit: HTTPS connect failed");
-                out.ran(HEADERS_CHECK, W, vec![unreachable(ctx.host, &e)]);
-            }
-            Err(SendError::Other(e)) => out.failed(HEADERS_CHECK, W, &e),
-        }
-        out
+        let fetched = audit_headers_with(&ctx.auditor.fetcher(), ctx.host).await;
+        headers_output(ctx.host, fetched)
     })
+}
+
+/// Maps the header fetch's outcome to the `web.headers` run. Pure.
+fn headers_output(host: &str, fetched: Result<HeaderReport, SendError>) -> CheckOutput {
+    let mut out = CheckOutput::default();
+    match fetched {
+        Ok(report) => out.ran(HEADERS_CHECK, W, assess_headers(host, &report)),
+        Err(SendError::Connect(e)) => {
+            tracing::debug!(host, error = %e, "audit: HTTPS connect failed");
+            out.ran(HEADERS_CHECK, W, vec![unreachable(host, &e)]);
+        }
+        Err(SendError::Other(e)) => out.failed(HEADERS_CHECK, W, &e),
+    }
+    out
 }
 
 fn run_upgrade<'a>(ctx: &'a AuditContext<'a>) -> BoxFuture<'a, CheckOutput> {
@@ -85,17 +92,24 @@ fn run_upgrade<'a>(ctx: &'a AuditContext<'a>) -> BoxFuture<'a, CheckOutput> {
 
 fn run_security_txt<'a>(ctx: &'a AuditContext<'a>) -> BoxFuture<'a, CheckOutput> {
     Box::pin(async move {
-        let mut out = CheckOutput::default();
         let url = format!("https://{}/.well-known/security.txt", ctx.host);
-        match security_txt::fetch_url(&ctx.auditor.fetcher(), &url, chrono::Utc::now()).await {
-            Ok(r) => out.ran(SECURITY_TXT_CHECK, W, assess_security_txt(ctx.host, &r)),
-            Err(SendError::Connect(_)) => {
-                out.not_applicable(SECURITY_TXT_CHECK, W, "no HTTPS listener");
-            }
-            Err(SendError::Other(e)) => out.failed(SECURITY_TXT_CHECK, W, &e),
-        }
-        out
+        let fetched =
+            security_txt::fetch_url(&ctx.auditor.fetcher(), &url, chrono::Utc::now()).await;
+        security_txt_output(ctx.host, fetched)
     })
+}
+
+/// Maps the security.txt fetch's outcome to the `web.security-txt` run. Pure.
+fn security_txt_output(host: &str, fetched: Result<SecurityTxtReport, SendError>) -> CheckOutput {
+    let mut out = CheckOutput::default();
+    match fetched {
+        Ok(r) => out.ran(SECURITY_TXT_CHECK, W, assess_security_txt(host, &r)),
+        Err(SendError::Connect(_)) => {
+            out.not_applicable(SECURITY_TXT_CHECK, W, "no HTTPS listener");
+        }
+        Err(SendError::Other(e)) => out.failed(SECURITY_TXT_CHECK, W, &e),
+    }
+    out
 }
 
 /// The finding for a failed HTTPS connection; the evidence is the error's
@@ -559,5 +573,55 @@ mod tests {
                 .any(|id| id.starts_with("web.frame") || id.starts_with("web.nosniff")),
             "{valid:?}"
         );
+    }
+
+    /// Regression: a redirect target that refused the connection made the
+    /// audit report the host itself unreachable over HTTPS (High) and
+    /// security.txt not applicable. Both are unknown: incomplete.
+    #[tokio::test]
+    async fn a_failed_redirect_target_is_incomplete_not_unreachable() {
+        use crate::audit::finding::CheckStatus;
+        use crate::headers::build_report;
+        use crate::http::{GuardedFetcher, CLOSED_PORT_TEST_TIMEOUT};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            listener.local_addr().expect("local addr").port()
+        };
+        let server = MockServer::start().await;
+        Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("location", format!("http://127.0.0.1:{port}/")),
+            )
+            .mount(&server)
+            .await;
+        let fetcher = GuardedFetcher::new()
+            .with_timeout(CLOSED_PORT_TEST_TIMEOUT)
+            .allowing_private_hosts();
+        let incomplete = |out: &CheckOutput| {
+            assert!(out.findings.is_empty(), "{:?}", out.findings);
+            assert!(
+                matches!(out.runs[0].status, CheckStatus::Incomplete { .. }),
+                "{:?}",
+                out.runs[0].status
+            );
+        };
+
+        let head = fetcher
+            .get_head_traced(&format!("{}/", server.uri()))
+            .await
+            .result
+            .map(|h| build_report("example.com".into(), &h));
+        incomplete(&headers_output("example.com", head));
+
+        let txt = security_txt::fetch_url(
+            &fetcher,
+            &format!("{}/.well-known/security.txt", server.uri()),
+            chrono::Utc::now(),
+        )
+        .await;
+        incomplete(&security_txt_output("example.com", txt));
     }
 }
