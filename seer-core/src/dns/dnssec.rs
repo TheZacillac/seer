@@ -5,6 +5,13 @@
 //! of the zone that holds the name (found by an SOA walk), so a host inside
 //! a signed zone — `api.cloudflare.com` — reports on `cloudflare.com` rather
 //! than as "unsigned".
+//!
+//! **Bounds:** the whole check runs under one deadline of
+//! [`CHECK_BUDGET_TIMEOUTS`] per-query timeouts (30s at the default 5s): the
+//! SOA walk gets [`ZONE_WALK_BUDGET_TIMEOUTS`] of them, and a walk still
+//! running then fails the check with a timeout rather than evaluate a guessed
+//! zone; the concurrent DS and DNSKEY reads get the rest, and one cut off
+//! there is reported as a failed query in `issues`.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -22,7 +29,7 @@ use tracing::{debug, instrument};
 
 use super::resolver::{apply_standard_opts, fqdn, google_or_pinned};
 use super::DEFAULT_DNS_TIMEOUT;
-use crate::error::Result;
+use crate::error::{Result, SeerError};
 
 /// DNSSEC validation report for a domain.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -127,6 +134,17 @@ pub struct DnskeyInfo {
 /// A negative answer usually names the apex directly (the SOA in its
 /// AUTHORITY section), so the walk rarely takes more than one step.
 const MAX_ZONE_WALK: usize = 8;
+
+/// The SOA walk's deadline, in per-query timeouts: a lookup hickory
+/// retransmits (`attempts = 2`) takes two, so this covers two such steps —
+/// or the whole walk when the upstream answers promptly. Without it a slow
+/// upstream held the caller for up to [`MAX_ZONE_WALK`] × 2 timeouts before
+/// the records were even asked for.
+const ZONE_WALK_BUDGET_TIMEOUTS: u32 = 4;
+
+/// The whole check's deadline, in per-query timeouts: the walk, then the
+/// concurrent DS and DNSKEY reads (two: one retransmitted lookup).
+const CHECK_BUDGET_TIMEOUTS: u32 = ZONE_WALK_BUDGET_TIMEOUTS + 2;
 
 /// Where [`DnssecChecker::find_zone_apex`] landed.
 #[derive(Debug, PartialEq, Eq)]
@@ -333,6 +351,11 @@ impl DnssecChecker {
     /// `domain` itself, the first entry of `issues` names the zone that was
     /// evaluated. `DnssecReport::domain` is always the (normalized) name that
     /// was asked about.
+    ///
+    /// Bounded by six per-query timeouts overall (`CHECK_BUDGET_TIMEOUTS`):
+    /// a walk that has not found the zone within four of them
+    /// (`ZONE_WALK_BUDGET_TIMEOUTS`) is a [`SeerError::Timeout`], and a DS or
+    /// DNSKEY read the deadline cuts off is a failed query in `issues`.
     #[instrument(skip(self), fields(domain = %domain))]
     pub async fn check(&self, domain: &str) -> Result<DnssecReport> {
         // `normalize_host`, not `normalize_domain`: the zone walk below
@@ -341,8 +364,24 @@ impl DnssecChecker {
         let domain = crate::validation::normalize_host(domain)?;
         debug!(domain = %domain, "Checking DNSSEC");
 
+        // One deadline for the whole check; the walk must end early enough
+        // to leave the DS/DNSKEY reads theirs.
+        let started = tokio::time::Instant::now();
+        let walk_budget = self.timeout.saturating_mul(ZONE_WALK_BUDGET_TIMEOUTS);
+        let budget = self.timeout.saturating_mul(CHECK_BUDGET_TIMEOUTS);
+        let apex = tokio::time::timeout_at(started + walk_budget, self.find_zone_apex(&domain))
+            .await
+            .map_err(|_| {
+                // No zone to report on: evaluating a guessed one could read
+                // a signed zone as unsigned.
+                SeerError::Timeout(format!(
+                    "DNSSEC check for {domain} gave up after {walk_budget:?} without finding \
+                     the zone that holds it"
+                ))
+            })?;
+
         let mut issues = Vec::new();
-        let zone = match self.find_zone_apex(&domain).await {
+        let zone = match apex {
             ZoneApex::Found(zone) => {
                 if zone != domain {
                     issues.push(format!(
@@ -370,9 +409,16 @@ impl DnssecChecker {
             }
         };
 
-        // DS (at the parent) and DNSKEY (at the apex), concurrently.
-        let (ds_result, dnskey_result) =
-            tokio::join!(self.lookup_ds(&zone), self.lookup_dnskeys(&zone));
+        // DS (at the parent) and DNSKEY (at the apex), concurrently, by the
+        // check's deadline; one cut off is a failed query.
+        let deadline = started + budget;
+        let out_of_time = || format!("timed out \u{2014} the check's {budget:?} budget ran out");
+        let (ds_result, dnskey_result) = tokio::join!(
+            tokio::time::timeout_at(deadline, self.lookup_ds(&zone)),
+            tokio::time::timeout_at(deadline, self.lookup_dnskeys(&zone)),
+        );
+        let ds_result = ds_result.unwrap_or_else(|_| Err(out_of_time()));
+        let dnskey_result = dnskey_result.unwrap_or_else(|_| Err(out_of_time()));
         let ds_records = ds_result.unwrap_or_else(|e| {
             issues.push(format!("DS query failed: {e}"));
             Vec::new()
@@ -1127,5 +1173,56 @@ mod tests {
 
         assert!(!report.chain_valid);
         assert_eq!(report.status, "unsigned");
+    }
+
+    /// Regression: the SOA walk had no overall deadline, so an upstream
+    /// that answers each name only on hickory's retransmission (NODATA
+    /// without an SOA) held the check for ~`MAX_ZONE_WALK` + 1 lookups, and
+    /// then evaluated a guessed zone. The walk now ends at its budget, with
+    /// a timeout rather than a made-up verdict.
+    #[tokio::test]
+    async fn the_zone_walk_is_held_to_its_budget() {
+        use std::net::Ipv4Addr;
+        use std::sync::{Arc, Mutex};
+
+        use crate::dns::test_support::{spawn_mock_dns_fn, MockReply};
+
+        let timeout = Duration::from_millis(200);
+        // Per (name, type): the first query is dropped, the retransmission
+        // gets NODATA with no SOA in AUTHORITY.
+        let seen: Arc<Mutex<HashMap<String, usize>>> = Arc::default();
+        let log = seen.clone();
+        let port = spawn_mock_dns_fn(move |qname, qtype| {
+            let mut seen = log.lock().unwrap();
+            let n = seen.entry(format!("{qname} {qtype}")).or_insert(0);
+            *n += 1;
+            if *n == 1 {
+                MockReply::NoReply
+            } else {
+                MockReply::NoData
+            }
+        })
+        .await;
+        let checker = DnssecChecker::new()
+            .with_timeout(timeout)
+            .with_upstream(Ipv4Addr::LOCALHOST.into(), port);
+
+        let started = std::time::Instant::now();
+        let err = checker
+            .check("a.b.c.d.e.f.g.h.i.seer.test")
+            .await
+            .expect_err("the walk runs out of time");
+        let elapsed = started.elapsed();
+        assert!(matches!(err, SeerError::Timeout(_)), "{err:?}");
+        assert!(err.to_string().contains("zone"), "{err}");
+        // The walk's budget, with slack — never the whole check's.
+        let walk_budget = timeout * ZONE_WALK_BUDGET_TIMEOUTS;
+        assert!(elapsed < walk_budget + timeout, "took {elapsed:?}");
+        // Neither DS nor DNSKEY was asked for a guessed zone.
+        assert!(
+            !seen.lock().unwrap().keys().any(|k| k.ends_with(" DNSKEY")),
+            "{:?}",
+            seen.lock().unwrap().keys()
+        );
     }
 }
