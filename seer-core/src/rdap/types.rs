@@ -920,6 +920,25 @@ mod tests {
     }
 
     #[test]
+    fn parsed_date_rejects_hostile_offset_chain_on_a_worker_stack() {
+        // An eventDate of chained UTC offsets (100 KB, far under the 10 MB
+        // RDAP cap) used to recurse once per offset in the shared date
+        // parser and overflow a 2 MiB Tokio worker stack.
+        let event = RdapEvent {
+            event_action: "registration".to_string(),
+            event_date: Some(format!("1:00{}", "-1:00".repeat(20_000))),
+            event_actor: None,
+        };
+        let parsed = std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(move || event.parsed_date())
+            .expect("spawn")
+            .join()
+            .expect("no stack overflow");
+        assert_eq!(parsed, None);
+    }
+
+    #[test]
     fn parsed_date_accepts_non_strict_rfc3339_forms() {
         // RFC 9083 mandates RFC 3339, but real registries emit looser forms.
         // parsed_date() must recover date-only and space-separated datetimes
