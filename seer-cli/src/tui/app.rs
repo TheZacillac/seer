@@ -48,6 +48,9 @@ pub struct App {
     pub domain: Option<String>,
     pub input_mode: InputMode,
     pub help: bool,
+    /// Nav drawn as numbers and glyphs only (`\`); the startup value comes
+    /// from `[tui] nav`.
+    pub compact_nav: bool,
     pub should_quit: bool,
     pub spin: usize,
     pub toast: Option<Toast>,
@@ -92,6 +95,7 @@ impl App {
             domain: None,
             input_mode: InputMode::Normal,
             help: false,
+            compact_nav: false,
             should_quit: false,
             spin: 0,
             toast: None,
@@ -1261,6 +1265,10 @@ impl App {
                 self.help = true;
                 vec![]
             }
+            KeyAction::ToggleNav => {
+                self.compact_nav = !self.compact_nav;
+                vec![]
+            }
             KeyAction::QuitHint => {
                 self.set_toast("info", "type :q to quit");
                 vec![]
@@ -1399,6 +1407,21 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn backslash_toggles_the_compact_nav_but_types_in_a_field() {
+        let mut app = App::new(None);
+        key(&mut app, KeyCode::Char('\\'));
+        assert!(app.compact_nav);
+        key(&mut app, KeyCode::Char('\\'));
+        assert!(!app.compact_nav);
+        key(&mut app, KeyCode::Char(':'));
+        key(&mut app, KeyCode::Char('\\'));
+        assert!(
+            !app.compact_nav,
+            "a backslash typed into : must not toggle the nav"
+        );
     }
 
     #[test]

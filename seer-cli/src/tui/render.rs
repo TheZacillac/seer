@@ -68,7 +68,7 @@ pub fn view(f: &mut Frame, app: &App, theme: &Theme) {
 
     let body = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(26), Constraint::Min(0)])
+        .constraints([Constraint::Length(nav_width(app)), Constraint::Min(0)])
         .split(rows[1]);
 
     nav(f, body[0], app, theme);
@@ -131,6 +131,15 @@ fn top_bar(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     );
 }
 
+/// Columns the nav takes: full labels, or (`\\`) number and glyph only.
+fn nav_width(app: &App) -> u16 {
+    if app.compact_nav {
+        6
+    } else {
+        26
+    }
+}
+
 fn nav(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     let block = Block::default()
         .borders(Borders::RIGHT)
@@ -143,12 +152,18 @@ fn nav(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     for (i, l) in all.iter().enumerate() {
         let new_group = i == 0 || all[i - 1].group != l.group;
         if new_group {
-            lines.push(Line::from(Span::styled(
-                l.group,
-                Style::default()
-                    .fg(theme.overlay0)
-                    .add_modifier(Modifier::DIM),
-            )));
+            // The compact nav marks a group with a rule instead of its name.
+            let header = if app.compact_nav {
+                Span::styled("──", Style::default().fg(theme.surface1))
+            } else {
+                Span::styled(
+                    l.group,
+                    Style::default()
+                        .fg(theme.overlay0)
+                        .add_modifier(Modifier::DIM),
+                )
+            };
+            lines.push(Line::from(header));
         }
         let active = i == app.lens;
         let num = if i < 9 {
@@ -158,12 +173,20 @@ fn nav(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         };
         let label_color = if active { theme.text } else { theme.subtext };
         let glyph_color = if active { theme.blue } else { theme.lavender };
+        let num_style = Style::default().fg(if active { theme.blue } else { theme.overlay0 });
+        if app.compact_nav {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{}{num}", if active { "▸" } else { " " }),
+                    num_style,
+                ),
+                Span::styled(l.glyph, Style::default().fg(glyph_color)),
+            ]));
+            continue;
+        }
         let prefix = if active { "▸ " } else { "  " };
         lines.push(Line::from(vec![
-            Span::styled(
-                format!("{prefix}{num} "),
-                Style::default().fg(if active { theme.blue } else { theme.overlay0 }),
-            ),
+            Span::styled(format!("{prefix}{num} "), num_style),
             Span::styled(format!("{} ", l.glyph), Style::default().fg(glyph_color)),
             Span::styled(l.label, Style::default().fg(label_color)),
             Span::styled(
@@ -565,6 +588,16 @@ mod tests {
 
     fn full_buf(app: &App, theme: &Theme) -> String {
         render_text(100, 30, |f| view(f, app, theme))
+    }
+
+    #[test]
+    fn compact_nav_gives_the_pane_the_width() {
+        let mut app = App::new(None);
+        app.compact_nav = true;
+        let s = render_lines(100, 30, |f| view(f, &app, app.theme()));
+        assert!(!s.contains("WHOIS"), "labels are hidden: {s}");
+        let first = s.lines().nth(2).unwrap_or_default();
+        assert!(first.starts_with("▸1◈"), "{s}");
     }
 
     #[test]
