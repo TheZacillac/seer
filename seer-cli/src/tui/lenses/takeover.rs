@@ -6,18 +6,18 @@
 //! shows the count and says so rather than rendering an empty grid. While
 //! focused, the selected finding's CNAME, addresses and probe result show
 //! beneath the table.
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::Constraint;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Row, Table};
-use ratatui::Frame;
+use ratatui::widgets::Row;
 use seer_core::output::{sanitize_line, takeover_label};
 use seer_core::{TakeoverFinding, TakeoverVerdict};
 
 use crate::tui::action::LensData;
 use crate::tui::theme::Theme;
-use crate::tui::widgets::inspector::{self, Field};
-use crate::tui::widgets::{or_dash, panel, row_style, scroll_to, stack, Band};
+use crate::tui::widgets::inspector::Field;
+use crate::tui::widgets::or_dash;
+use crate::tui::widgets::page::{Block, Detail, Page, TableBlock};
 
 fn verdict_tone(v: TakeoverVerdict) -> &'static str {
     match v {
@@ -43,15 +43,10 @@ fn finding_fields(finding: &TakeoverFinding) -> Vec<Field> {
     ]
 }
 
-pub fn render(
-    f: &mut Frame,
-    area: Rect,
-    theme: &Theme,
-    data: &LensData,
-    focused: bool,
-    sel: usize,
-) {
-    let LensData::Takeover(t) = data else { return };
+pub fn page(theme: &Theme, data: &LensData, focused: bool, sel: usize) -> Option<Page> {
+    let LensData::Takeover(t) = data else {
+        return None;
+    };
 
     // Border accent tracks the worst finding, so the panel itself signals
     // severity before any row is read.
@@ -69,7 +64,7 @@ pub fn render(
     if t.inconclusive > 0 {
         title.push_str(&format!(" · {} inconclusive", t.inconclusive));
     }
-    let inner = panel::render(f, area, theme, &title, accent, focused);
+    let page = Page::new(title, accent);
 
     if t.findings.is_empty() {
         let msg = if t.hosts_checked == 0 {
@@ -77,101 +72,89 @@ pub fn render(
         } else {
             format!("no takeover signals across {} host(s)", t.hosts_checked)
         };
-        f.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                msg,
-                Style::default()
-                    .fg(theme.green)
-                    .add_modifier(Modifier::ITALIC),
-            ))),
-            inner,
-        );
-        return;
+        return Some(page.push(Block::Lines(vec![Line::from(Span::styled(
+            msg,
+            Style::default()
+                .fg(theme.green)
+                .add_modifier(Modifier::ITALIC),
+        ))])));
     }
 
-    // Reserve a line for the skipped-hosts note so a truncated scan never
-    // silently reads as a complete one.
-    let skipped_rows = u16::from(t.hosts_skipped > 0);
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(skipped_rows)])
-        .split(inner);
-
-    let header = Row::new(["HOST", "VERDICT", "PROVIDER", "EVIDENCE"])
-        .style(Style::default().fg(theme.overlay0));
-
-    let rows = t.findings.iter().enumerate().map(|(i, finding)| {
-        let base = row_style(theme, focused && i == sel);
-        Row::new(vec![
-            Span::styled(sanitize_line(&finding.host), base),
-            Span::styled(
-                takeover_label(finding.verdict).to_string(),
-                base.fg(theme.tone(verdict_tone(finding.verdict))),
-            ),
-            Span::styled(sanitize_line(&or_dash(finding.provider.as_deref())), base),
-            // Evidence is the matched fingerprint on a confirmed finding; the
-            // probe note explains why an unconfirmed one could not be settled.
-            Span::styled(
-                sanitize_line(&or_dash(
-                    finding.evidence.as_ref().or(finding.probe_note.as_ref()),
-                )),
-                base.fg(theme.subtext),
-            ),
-        ])
-        .style(base)
-    });
-
-    let table = Table::new(
-        rows,
-        [
+    let rows = t
+        .findings
+        .iter()
+        .map(|finding| {
+            Row::new(vec![
+                Span::raw(sanitize_line(&finding.host)),
+                Span::styled(
+                    takeover_label(finding.verdict).to_string(),
+                    Style::default().fg(theme.tone(verdict_tone(finding.verdict))),
+                ),
+                Span::raw(sanitize_line(&or_dash(finding.provider.as_deref()))),
+                // Evidence is the matched fingerprint on a confirmed finding;
+                // the probe note explains why an unconfirmed one could not be
+                // settled.
+                Span::styled(
+                    sanitize_line(&or_dash(
+                        finding.evidence.as_ref().or(finding.probe_note.as_ref()),
+                    )),
+                    Style::default().fg(theme.subtext),
+                ),
+            ])
+        })
+        .collect();
+    let detail = focused
+        .then(|| t.findings.get(sel))
+        .flatten()
+        .map_or(Detail::None, |finding| {
+            Detail::Fields(finding_fields(finding))
+        });
+    let table = TableBlock::new(
+        vec!["HOST", "VERDICT", "PROVIDER", "EVIDENCE"],
+        vec![
             Constraint::Percentage(32),
             Constraint::Length(11),
             Constraint::Percentage(20),
             Constraint::Percentage(38),
         ],
+        rows,
     )
-    .header(header)
-    .column_spacing(1);
-    let area = chunks[0];
-    let detail = focused
-        .then(|| t.findings.get(sel))
-        .flatten()
-        .map(|finding| inspector::lines(theme, &finding_fields(finding), area.width))
-        .unwrap_or_default();
-    let rows = |n: usize| u16::try_from(n).unwrap_or(u16::MAX);
-    let n = t.findings.len();
-    // The table keeps its header and a few rows; the detail takes the rest.
-    let mut layout = vec![Band::shrinking(
-        rows(n + 1),
-        rows(1 + n.min(inspector::MIN_ROWS)),
-    )];
-    if !detail.is_empty() {
-        layout.push(inspector::band(&detail));
-    }
-    let bands = stack(area, &layout);
-    let mut state = scroll_to(focused.then_some(sel));
-    f.render_stateful_widget(table, bands[0], &mut state);
-    if let Some(band) = bands.get(1) {
-        inspector::draw(f, *band, theme, detail);
-    }
-
-    if t.hosts_skipped > 0 {
-        f.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                format!(
-                    "{} host(s) exceeded the scan cap and were not examined",
-                    t.hosts_skipped
-                ),
-                Style::default().fg(theme.yellow),
-            ))),
-            chunks[1],
-        );
-    }
+    .selected(focused.then_some(sel))
+    .detail(detail);
+    // The skipped-hosts note is kept whole, so a truncated scan never
+    // silently reads as a complete one.
+    Some(
+        page.push(Block::Table(table))
+            .push_if(t.hosts_skipped > 0, || {
+                Block::Lines(vec![Line::from(Span::styled(
+                    format!(
+                        "{} host(s) exceeded the scan cap and were not examined",
+                        t.hosts_skipped
+                    ),
+                    Style::default().fg(theme.yellow),
+                ))])
+            }),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::widgets::page;
+
+    /// Draw this lens's page as the TUI does.
+    fn render(
+        f: &mut ratatui::Frame,
+        area: ratatui::layout::Rect,
+        theme: &Theme,
+        data: &LensData,
+        focused: bool,
+        sel: usize,
+    ) {
+        if let Some(p) = page(theme, data, focused, sel) {
+            page::draw(f, area, theme, p, focused);
+        }
+    }
     use crate::tui::test_util::{render_buffer, render_lines};
     use seer_core::{TakeoverFinding, TakeoverReport};
 

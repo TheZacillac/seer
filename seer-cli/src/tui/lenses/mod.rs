@@ -395,6 +395,13 @@ pub fn render(
         LensKey::Status => status::page(theme, data),
         LensKey::Reverse => reverse::page(theme, data),
         LensKey::Avail => avail::page(theme, data),
+        LensKey::Propagation => propagation::page(theme, data, focused, sel),
+        LensKey::Watch => watch::page(theme, data, focused, sel),
+        LensKey::History => history::page(theme, data, filter, focused, sel),
+        LensKey::Subdomains => subdomains::page(theme, data, focused, sel),
+        LensKey::Headers => headers::page(theme, data, focused, sel),
+        LensKey::Audit => audit::page(theme, data, focused, sel),
+        LensKey::Takeover => takeover::page(theme, data, focused, sel),
         _ => None,
     };
     if let Some(page) = page {
@@ -403,13 +410,6 @@ pub fn render(
     }
     match key {
         LensKey::Dns => dns::render(f, area, theme, tab, data, filter, focused, sel, panes),
-        LensKey::Propagation => propagation::render(f, area, theme, data, focused, sel),
-        LensKey::Watch => watch::render(f, area, theme, data, focused, sel),
-        LensKey::History => history::render(f, area, theme, data, filter, focused, sel),
-        LensKey::Subdomains => subdomains::render(f, area, theme, data, focused, sel),
-        LensKey::Headers => headers::render(f, area, theme, data, focused, sel),
-        LensKey::Audit => audit::render(f, area, theme, data, focused, sel),
-        LensKey::Takeover => takeover::render(f, area, theme, data, focused, sel),
         // Converted above, or pane-driven: those render from `app.panes`
         // state in render.rs::main_pane and never reach this dispatch.
         _ => {}

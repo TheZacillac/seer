@@ -82,7 +82,9 @@ mod tests {
 
     /// Draw this lens's page as the TUI does.
     fn render(f: &mut ratatui::Frame, area: ratatui::layout::Rect, theme: &Theme, data: &LensData) {
-        page::draw(f, area, theme, page(theme, data).unwrap(), false);
+        if let Some(p) = page(theme, data) {
+            page::draw(f, area, theme, p, false);
+        }
     }
     use crate::tui::test_util::render_lines;
     use seer_core::AvailabilityResult;

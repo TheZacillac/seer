@@ -1,9 +1,8 @@
 //! Propagation lens — verdict gauge + consensus, then one row per resolver.
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::Constraint;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Cell, Paragraph, Row, Table};
-use ratatui::Frame;
+use ratatui::widgets::{Cell, Row};
 use seer_core::dns::{
     PropagationResult, PropagationServerResult, PropagationVerdict, ServerVerdict,
 };
@@ -11,23 +10,13 @@ use seer_core::output::{propagation_difference, sanitize_line};
 
 use crate::tui::action::LensData;
 use crate::tui::theme::Theme;
-use crate::tui::widgets::{gauge, panel, row_style, scroll_to};
+use crate::tui::widgets::gauge;
+use crate::tui::widgets::page::{Block, Page, TableBlock};
 
-pub fn render(
-    f: &mut Frame,
-    area: Rect,
-    theme: &Theme,
-    data: &LensData,
-    focused: bool,
-    sel: usize,
-) {
-    let LensData::Prop(p) = data else { return };
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(4), Constraint::Min(0)])
-        .split(area);
-
-    let top_inner = panel::render(f, rows[0], theme, "Propagation", theme.teal, false);
+pub fn page(theme: &Theme, data: &LensData, focused: bool, sel: usize) -> Option<Page> {
+    let LensData::Prop(p) = data else {
+        return None;
+    };
     let verdict = p.verdict();
     let color = match verdict {
         PropagationVerdict::Full => theme.green,
@@ -53,45 +42,38 @@ pub fn render(
         Span::styled("consensus ", Style::default().fg(theme.overlay0)),
         Span::styled(consensus_text(p), Style::default().fg(theme.green)),
     ]);
-    f.render_widget(
-        Paragraph::new(vec![
-            gauge::line(theme, ratio, 30, color, Some(&label)),
-            consensus,
-        ]),
-        top_inner,
-    );
 
-    let inner = panel::render(f, rows[1], theme, "Resolvers", theme.teal, focused);
-    let header = Row::new(["", "RESOLVER", "IP", "REGION", "TIME", "ANSWER"])
-        .style(Style::default().fg(theme.overlay0));
-    let body = p.results.iter().enumerate().map(|(i, sr)| {
-        let verdict = p.server_verdict(sr);
-        let (mark, color) = match verdict {
-            ServerVerdict::Agrees => ("✓", theme.green),
-            ServerVerdict::Differs(_) => ("≠", theme.yellow),
-            ServerVerdict::NoAnswer(_) => ("✗", theme.red),
-        };
-        let time = match verdict {
-            ServerVerdict::NoAnswer(_) => "—".to_string(),
-            _ => format!("{}ms", sr.response_time_ms),
-        };
-        let answer_color = match verdict {
-            ServerVerdict::Agrees => theme.overlay0,
-            _ => color,
-        };
-        Row::new(vec![
-            Cell::from(mark).style(Style::default().fg(color)),
-            Cell::from(sanitize_line(&sr.server.name)),
-            Cell::from(sr.server.ip.clone()).style(Style::default().fg(theme.subtext)),
-            Cell::from(sr.server.location.clone()).style(Style::default().fg(theme.subtext)),
-            Cell::from(time),
-            Cell::from(answer_text(p, sr)).style(Style::default().fg(answer_color)),
-        ])
-        .style(row_style(theme, focused && i == sel))
-    });
-    let table = Table::new(
-        body,
-        [
+    let rows = p
+        .results
+        .iter()
+        .map(|sr| {
+            let verdict = p.server_verdict(sr);
+            let (mark, color) = match verdict {
+                ServerVerdict::Agrees => ("✓", theme.green),
+                ServerVerdict::Differs(_) => ("≠", theme.yellow),
+                ServerVerdict::NoAnswer(_) => ("✗", theme.red),
+            };
+            let time = match verdict {
+                ServerVerdict::NoAnswer(_) => "—".to_string(),
+                _ => format!("{}ms", sr.response_time_ms),
+            };
+            let answer_color = match verdict {
+                ServerVerdict::Agrees => theme.overlay0,
+                _ => color,
+            };
+            Row::new(vec![
+                Cell::from(mark).style(Style::default().fg(color)),
+                Cell::from(sanitize_line(&sr.server.name)),
+                Cell::from(sr.server.ip.clone()).style(Style::default().fg(theme.subtext)),
+                Cell::from(sr.server.location.clone()).style(Style::default().fg(theme.subtext)),
+                Cell::from(time),
+                Cell::from(answer_text(p, sr)).style(Style::default().fg(answer_color)),
+            ])
+        })
+        .collect();
+    let table = TableBlock::new(
+        vec!["", "RESOLVER", "IP", "REGION", "TIME", "ANSWER"],
+        vec![
             Constraint::Length(1),
             Constraint::Length(18),
             Constraint::Length(15),
@@ -99,11 +81,18 @@ pub fn render(
             Constraint::Length(7),
             Constraint::Min(10),
         ],
+        rows,
     )
-    .header(header)
-    .column_spacing(1);
-    let mut state = scroll_to(focused.then_some(sel));
-    f.render_stateful_widget(table, inner, &mut state);
+    .selected(focused.then_some(sel));
+    Some(
+        Page::new("Propagation", theme.teal)
+            .push(Block::Lines(vec![
+                gauge::line(theme, ratio, 30, color, Some(&label)),
+                consensus,
+            ]))
+            .push(Block::Gap)
+            .push(Block::Table(table)),
+    )
 }
 
 /// The consensus on one line: its values, or the empty answer's label.
@@ -137,6 +126,21 @@ pub(crate) fn answer_text(p: &PropagationResult, sr: &PropagationServerResult) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::widgets::page;
+
+    /// Draw this lens's page as the TUI does.
+    fn render(
+        f: &mut ratatui::Frame,
+        area: ratatui::layout::Rect,
+        theme: &Theme,
+        data: &LensData,
+        focused: bool,
+        sel: usize,
+    ) {
+        if let Some(p) = page(theme, data, focused, sel) {
+            page::draw(f, area, theme, p, focused);
+        }
+    }
     use crate::tui::test_util::render_lines;
 
     /// Three servers: one agrees, one differs, one timed out — the fixture
