@@ -121,19 +121,17 @@ pub enum Filter {
 }
 
 /// A key a lens's pane handles, for the status bar and `?` overlay. `code`
-/// is what the pane matches (the dead-hint test sends it); `tab` limits the
-/// hint to one sub-tab.
+/// is what the pane matches (the dead-hint test sends it) and what the hint
+/// shows; `tab` limits the hint to one sub-tab.
 #[derive(Debug, Clone, Copy)]
 pub struct KeyHint {
-    pub key: &'static str,
     pub code: KeyCode,
     pub what: &'static str,
     pub tab: Option<usize>,
 }
 
-const fn hint(key: &'static str, code: KeyCode, what: &'static str) -> KeyHint {
+const fn hint(code: KeyCode, what: &'static str) -> KeyHint {
     KeyHint {
-        key,
         code,
         what,
         tab: None,
@@ -141,6 +139,15 @@ const fn hint(key: &'static str, code: KeyCode, what: &'static str) -> KeyHint {
 }
 
 impl KeyHint {
+    /// The key as the hint shows it: `↵` for Enter, else the character.
+    pub fn label(&self) -> String {
+        match self.code {
+            KeyCode::Enter => "↵".to_string(),
+            KeyCode::Char(c) => c.to_string(),
+            other => format!("{other:?}"),
+        }
+    }
+
     const fn on_tab(self, tab: usize) -> Self {
         Self {
             tab: Some(tab),
@@ -249,8 +256,8 @@ static LENSES: &[Lens] = &[
     lens(LensKey::Tld, "TLD Info", "⊞", "LOOKUP")
         .interactive()
         .keys(&[
-            hint("f", KeyCode::Char('f'), "filter"),
-            hint("↵", KeyCode::Enter, "load"),
+            hint(KeyCode::Char('f'), "filter"),
+            hint(KeyCode::Enter, "load"),
         ]),
     lens(LensKey::Dns, "DNS Records", "≣", "DNS")
         .cmd("dig")
@@ -258,9 +265,9 @@ static LENSES: &[Lens] = &[
         .interactive()
         .filter(Filter::Tab(0))
         .keys(&[
-            hint("s", KeyCode::Char('s'), "nameserver").on_tab(0),
-            hint("a", KeyCode::Char('a'), "resolver A").on_tab(2),
-            hint("b", KeyCode::Char('b'), "resolver B").on_tab(2),
+            hint(KeyCode::Char('s'), "nameserver").on_tab(0),
+            hint(KeyCode::Char('a'), "resolver A").on_tab(2),
+            hint(KeyCode::Char('b'), "resolver B").on_tab(2),
         ]),
     lens(LensKey::Propagation, "Propagation", "◐", "DNS")
         .cmd("prop")
@@ -268,10 +275,10 @@ static LENSES: &[Lens] = &[
     lens(LensKey::Follow, "Follow", "⟳", "DNS")
         .interactive()
         .keys(&[
-            hint("s", KeyCode::Char('s'), "start"),
-            hint("i", KeyCode::Char('i'), "interval"),
-            hint("n", KeyCode::Char('n'), "count"),
-            hint("x", KeyCode::Char('x'), "stop"),
+            hint(KeyCode::Char('s'), "start"),
+            hint(KeyCode::Char('i'), "interval"),
+            hint(KeyCode::Char('n'), "count"),
+            hint(KeyCode::Char('x'), "stop"),
         ]),
     lens(LensKey::Ssl, "SSL / Cert", "⛨", "SECURITY"),
     lens(LensKey::Status, "Status", "♥", "SECURITY"),
@@ -286,31 +293,31 @@ static LENSES: &[Lens] = &[
     // `↵` diffs only once a second domain is set, so it is not hinted.
     lens(LensKey::Diff, "Diff", "⇄", "POWER")
         .interactive()
-        .keys(&[hint("e", KeyCode::Char('e'), "2nd domain")]),
+        .keys(&[hint(KeyCode::Char('e'), "2nd domain")]),
     lens(LensKey::Bulk, "Bulk", "⧉", "POWER")
         .interactive()
         .keys(&[
-            hint("o", KeyCode::Char('o'), "op"),
-            hint("d", KeyCode::Char('d'), "domains"),
-            hint("f", KeyCode::Char('f'), "file"),
-            hint("r", KeyCode::Char('r'), "run"),
-            hint("v", KeyCode::Char('v'), "detail"),
-            hint("x", KeyCode::Char('x'), "cancel"),
-            hint("e", KeyCode::Char('e'), "export"),
+            hint(KeyCode::Char('o'), "op"),
+            hint(KeyCode::Char('d'), "domains"),
+            hint(KeyCode::Char('f'), "file"),
+            hint(KeyCode::Char('r'), "run"),
+            hint(KeyCode::Char('v'), "detail"),
+            hint(KeyCode::Char('x'), "cancel"),
+            hint(KeyCode::Char('e'), "export"),
         ]),
     // An empty watchlist has no rows, yet `a` (add) is the pane's point.
     lens(LensKey::Watch, "Watchlist", "★", "POWER")
         .interactive()
         .keys(&[
-            hint("a", KeyCode::Char('a'), "add"),
-            hint("d", KeyCode::Char('d'), "remove"),
-            hint("↵", KeyCode::Enter, "open"),
+            hint(KeyCode::Char('a'), "add"),
+            hint(KeyCode::Char('d'), "remove"),
+            hint(KeyCode::Enter, "open"),
         ]),
     lens(LensKey::History, "History", "↺", "POWER")
         .filter(Filter::All)
         .keys(&[
-            hint("↵", KeyCode::Enter, "replay"),
-            hint("c", KeyCode::Char('c'), "clear"),
+            hint(KeyCode::Enter, "replay"),
+            hint(KeyCode::Char('c'), "clear"),
         ]),
 ];
 
@@ -406,6 +413,12 @@ pub fn render(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hint_labels_come_from_their_key_code() {
+        assert_eq!(hint(KeyCode::Char('s'), "start").label(), "s");
+        assert_eq!(hint(KeyCode::Enter, "open").label(), "↵");
+    }
 
     #[test]
     fn group_start_steps_between_groups_and_wraps() {

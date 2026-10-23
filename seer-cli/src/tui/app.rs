@@ -1404,7 +1404,7 @@ mod tests {
                     app.handle_pane_key(ev, None).is_some(),
                     "{} hint {:?} ({}) is not handled",
                     lens.label,
-                    hint.key,
+                    hint.label(),
                     hint.what
                 );
             }

@@ -210,7 +210,7 @@ mod tests {
     fn render_to_text(data: &LensData, width: u16, height: u16) -> String {
         let theme = Theme::frappe();
         render_lines(width, height, |f| {
-            render(f, f.area(), &theme, data, false, 0)
+            render(f, f.area(), &theme, data, false, 0);
         })
     }
 

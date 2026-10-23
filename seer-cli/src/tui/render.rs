@@ -478,13 +478,16 @@ fn status_or_command(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     }
     spans.push(Span::raw("   "));
     // A focused pane lists its own keys; otherwise the global ones.
-    let lens_keys: Vec<(&str, &str)> = lens.keys_for(app.tab).map(|h| (h.key, h.what)).collect();
-    let keys: Vec<(&str, &str)> = if app.focus == Focus::Pane && !lens_keys.is_empty() {
+    let lens_keys: Vec<(String, &str)> = lens
+        .keys_for(app.tab)
+        .map(|h| (h.label(), h.what))
+        .collect();
+    let keys: Vec<(String, &str)> = if app.focus == Focus::Pane && !lens_keys.is_empty() {
         let mut keys = lens_keys;
         if lens.filterable(app.tab) {
-            keys.push(("/", "filter"));
+            keys.push(("/".to_string(), "filter"));
         }
-        keys.extend([("h", "back"), ("?", "help")]);
+        keys.extend([("h".to_string(), "back"), ("?".to_string(), "help")]);
         keys
     } else {
         vec![
@@ -497,6 +500,9 @@ fn status_or_command(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             (":", "cmd"),
             ("?", "help"),
         ]
+        .into_iter()
+        .map(|(k, t)| (k.to_string(), t))
+        .collect()
     };
     for (k, t) in keys {
         spans.push(Span::styled(
@@ -536,7 +542,10 @@ fn help_overlay(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         ("?", "this help · Esc closes"),
     ];
     let lens = app.current_lens();
-    let lens_rows: Vec<(&str, &str)> = lens.keys_for(app.tab).map(|h| (h.key, h.what)).collect();
+    let lens_rows: Vec<(String, &str)> = lens
+        .keys_for(app.tab)
+        .map(|h| (h.label(), h.what))
+        .collect();
     let row = |(k, t): (&str, &str)| {
         Line::from(vec![
             Span::styled(
@@ -553,7 +562,7 @@ fn help_overlay(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             format!("{} {} keys", lens.glyph, lens.label),
             Style::default().fg(theme.lavender),
         )));
-        lines.extend(lens_rows.iter().copied().map(row));
+        lines.extend(lens_rows.iter().map(|(k, t)| row((k.as_str(), *t))));
     }
     // Wide enough for the longest row (border + padding), never past the frame.
     let longest = lines.iter().map(Line::width).max().unwrap_or(0);

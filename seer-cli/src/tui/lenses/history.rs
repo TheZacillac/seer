@@ -143,7 +143,7 @@ mod tests {
         let s = render_lines(100, 20, |f| render(f, f.area(), &theme, &data, "", true, 0));
         assert!(s.contains("1970-01-01 00:00:00 UTC"), "{s}");
         let nav = render_lines(100, 20, |f| {
-            render(f, f.area(), &theme, &data, "", false, 0)
+            render(f, f.area(), &theme, &data, "", false, 0);
         });
         assert!(!nav.contains("00:00:00 UTC"), "{nav}");
     }
