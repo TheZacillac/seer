@@ -2,7 +2,8 @@
 //! SECURITY / POWER. Each `LENSES` entry also carries the lens's behaviour
 //! flags — `interactive` (↵ focuses it without rows), `filter` (which tabs
 //! take `/`) and `heavy` (an active scan, run only on request) — so `App`
-//! reads them here instead of keeping its own lists of keys.
+//! reads them here instead of keeping its own lists of keys, and its `keys`:
+//! the pane keys the status bar and `?` overlay list for it.
 
 pub mod audit;
 pub mod avail;
@@ -26,6 +27,8 @@ pub mod tld;
 pub mod trace;
 pub mod watch;
 pub mod whois;
+
+use crossterm::event::KeyCode;
 
 /// A lens's identity. Every lens-keyed table (per-lens state, fetch
 /// generations, filters, the renderer and pane dispatch) is keyed by this
@@ -117,6 +120,42 @@ pub enum Filter {
     Tab(usize),
 }
 
+/// A key a lens's pane handles, for the status bar and `?` overlay. `code`
+/// is what the pane matches (the dead-hint test sends it) and what the hint
+/// shows; `tab` limits the hint to one sub-tab.
+#[derive(Debug, Clone, Copy)]
+pub struct KeyHint {
+    pub code: KeyCode,
+    pub what: &'static str,
+    pub tab: Option<usize>,
+}
+
+const fn hint(code: KeyCode, what: &'static str) -> KeyHint {
+    KeyHint {
+        code,
+        what,
+        tab: None,
+    }
+}
+
+impl KeyHint {
+    /// The key as the hint shows it: `↵` for Enter, else the character.
+    pub fn label(&self) -> String {
+        match self.code {
+            KeyCode::Enter => "↵".to_string(),
+            KeyCode::Char(c) => c.to_string(),
+            other => format!("{other:?}"),
+        }
+    }
+
+    const fn on_tab(self, tab: usize) -> Self {
+        Self {
+            tab: Some(tab),
+            ..self
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Lens {
     pub key: LensKey,
@@ -132,6 +171,9 @@ pub struct Lens {
     /// An active scan (CT-log queries, HTTP probes across many hosts): it
     /// runs only on request (↵ or its `:` command), never on navigation.
     pub heavy: bool,
+    /// Pane keys beyond the global ones, shown in the status bar while
+    /// focused and in `?`.
+    pub keys: &'static [KeyHint],
 }
 
 /// A tab-less, non-interactive lens whose `:` command is its key; the
@@ -147,6 +189,7 @@ const fn lens(key: LensKey, label: &'static str, glyph: &'static str, group: &'s
         interactive: false,
         filter: Filter::None,
         heavy: false,
+        keys: &[],
     }
 }
 
@@ -179,6 +222,17 @@ impl Lens {
         }
     }
 
+    const fn keys(self, keys: &'static [KeyHint]) -> Self {
+        Self { keys, ..self }
+    }
+
+    /// The key hints that apply on sub-`tab`.
+    pub fn keys_for(&self, tab: usize) -> impl Iterator<Item = &'static KeyHint> {
+        self.keys
+            .iter()
+            .filter(move |h| h.tab.is_none_or(|t| t == tab))
+    }
+
     /// Whether sub-`tab` accepts the in-lens `/`-filter.
     pub fn filterable(&self, tab: usize) -> bool {
         match self.filter {
@@ -199,16 +253,33 @@ static LENSES: &[Lens] = &[
         .interactive(),
     lens(LensKey::Reverse, "Reverse DNS", "↩", "LOOKUP"),
     lens(LensKey::Avail, "Availability", "◎", "LOOKUP"),
-    lens(LensKey::Tld, "TLD Info", "⊞", "LOOKUP").interactive(),
+    lens(LensKey::Tld, "TLD Info", "⊞", "LOOKUP")
+        .interactive()
+        .keys(&[
+            hint(KeyCode::Char('f'), "filter"),
+            hint(KeyCode::Enter, "load"),
+        ]),
     lens(LensKey::Dns, "DNS Records", "≣", "DNS")
         .cmd("dig")
         .tabs(&["Records", "DNSSEC", "Compare", "Trace"])
         .interactive()
-        .filter(Filter::Tab(0)),
+        .filter(Filter::Tab(0))
+        .keys(&[
+            hint(KeyCode::Char('s'), "nameserver").on_tab(0),
+            hint(KeyCode::Char('a'), "resolver A").on_tab(2),
+            hint(KeyCode::Char('b'), "resolver B").on_tab(2),
+        ]),
     lens(LensKey::Propagation, "Propagation", "◐", "DNS")
         .cmd("prop")
         .filter(Filter::All),
-    lens(LensKey::Follow, "Follow", "⟳", "DNS").interactive(),
+    lens(LensKey::Follow, "Follow", "⟳", "DNS")
+        .interactive()
+        .keys(&[
+            hint(KeyCode::Char('s'), "start"),
+            hint(KeyCode::Char('i'), "interval"),
+            hint(KeyCode::Char('n'), "count"),
+            hint(KeyCode::Char('x'), "stop"),
+        ]),
     lens(LensKey::Ssl, "SSL / Cert", "⛨", "SECURITY"),
     lens(LensKey::Status, "Status", "♥", "SECURITY"),
     lens(LensKey::Subdomains, "Subdomains", "⋔", "SECURITY")
@@ -219,15 +290,56 @@ static LENSES: &[Lens] = &[
     lens(LensKey::Takeover, "Takeover", "⚑", "SECURITY")
         .filter(Filter::All)
         .heavy(),
-    lens(LensKey::Diff, "Diff", "⇄", "POWER").interactive(),
-    lens(LensKey::Bulk, "Bulk", "⧉", "POWER").interactive(),
+    // `↵` diffs only once a second domain is set, so it is not hinted.
+    lens(LensKey::Diff, "Diff", "⇄", "POWER")
+        .interactive()
+        .keys(&[hint(KeyCode::Char('e'), "2nd domain")]),
+    lens(LensKey::Bulk, "Bulk", "⧉", "POWER")
+        .interactive()
+        .keys(&[
+            hint(KeyCode::Char('o'), "op"),
+            hint(KeyCode::Char('d'), "domains"),
+            hint(KeyCode::Char('f'), "file"),
+            hint(KeyCode::Char('r'), "run"),
+            hint(KeyCode::Char('v'), "detail"),
+            hint(KeyCode::Char('x'), "cancel"),
+            hint(KeyCode::Char('e'), "export"),
+        ]),
     // An empty watchlist has no rows, yet `a` (add) is the pane's point.
-    lens(LensKey::Watch, "Watchlist", "★", "POWER").interactive(),
-    lens(LensKey::History, "History", "↺", "POWER").filter(Filter::All),
+    lens(LensKey::Watch, "Watchlist", "★", "POWER")
+        .interactive()
+        .keys(&[
+            hint(KeyCode::Char('a'), "add"),
+            hint(KeyCode::Char('d'), "remove"),
+            hint(KeyCode::Enter, "open"),
+        ]),
+    lens(LensKey::History, "History", "↺", "POWER")
+        .filter(Filter::All)
+        .keys(&[
+            hint(KeyCode::Enter, "replay"),
+            hint(KeyCode::Char('c'), "clear"),
+        ]),
 ];
 
 pub fn lenses() -> &'static [Lens] {
     LENSES
+}
+
+/// The first lens of the group after (`forward`) or before the one `from`
+/// is in, wrapping at either end. Backward from inside a group goes to the
+/// previous group's start, like `{` in an editor.
+pub fn group_start(from: usize, forward: bool) -> usize {
+    let starts: Vec<usize> = (0..LENSES.len())
+        .filter(|&i| i == 0 || LENSES[i - 1].group != LENSES[i].group)
+        .collect();
+    let current = starts.iter().rposition(|&s| s <= from).unwrap_or(0);
+    let n = starts.len();
+    let next = if forward {
+        (current + 1) % n
+    } else {
+        (current + n - 1) % n
+    };
+    starts[next]
 }
 
 /// Find a lens index by its `cmd` alias or `key`.
@@ -288,7 +400,7 @@ pub fn render(
         LensKey::Watch => watch::render(f, area, theme, data, focused, sel),
         LensKey::History => history::render(f, area, theme, data, filter, focused, sel),
         LensKey::Subdomains => subdomains::render(f, area, theme, data, focused, sel),
-        LensKey::Headers => headers::render(f, area, theme, data),
+        LensKey::Headers => headers::render(f, area, theme, data, focused, sel),
         LensKey::Audit => audit::render(f, area, theme, data, focused, sel),
         LensKey::Takeover => takeover::render(f, area, theme, data, focused, sel),
         // Pane-driven lenses render from `app.panes` state in
@@ -301,6 +413,28 @@ pub fn render(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hint_labels_come_from_their_key_code() {
+        assert_eq!(hint(KeyCode::Char('s'), "start").label(), "s");
+        assert_eq!(hint(KeyCode::Enter, "open").label(), "↵");
+    }
+
+    #[test]
+    fn group_start_steps_between_groups_and_wraps() {
+        let dns = LensKey::Dns.index();
+        let ssl = LensKey::Ssl.index();
+        let diff = LensKey::Diff.index();
+        assert_eq!(group_start(0, true), dns);
+        assert_eq!(group_start(dns + 1, true), ssl);
+        assert_eq!(group_start(diff, true), 0, "wraps past POWER to LOOKUP");
+        assert_eq!(group_start(0, false), diff, "wraps back to POWER");
+        assert_eq!(
+            group_start(dns + 1, false),
+            0,
+            "mid-group goes to the previous group's start"
+        );
+    }
 
     #[test]
     fn registry_has_nineteen_lenses_in_four_groups() {

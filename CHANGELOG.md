@@ -11,6 +11,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- TUI: with a pane focused, Audit, DNS records, HTTP Headers, Takeover and
+  History show the selected row's full detail beneath the table — including
+  each audit finding's evidence and remediation, a record's untruncated
+  data and a header's raw value. HTTP Headers rows are now selectable.
+- TUI: `\` collapses the nav to numbers and glyphs (`[tui] nav = "compact"`
+  starts that way); `{` / `}` jump between nav groups; the status bar and
+  `?` list the focused lens's own keys.
+
+### Changed
+- TUI key/value rows align to a shared gutter and wrap long values instead
+  of clipping them at the pane edge.
+
+### Fixed
+- TUI `?` help no longer clips its `:` row.
+
 ## [0.55.0] - 2026-10-23
 
 ### Added

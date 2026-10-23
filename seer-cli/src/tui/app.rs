@@ -48,6 +48,9 @@ pub struct App {
     pub domain: Option<String>,
     pub input_mode: InputMode,
     pub help: bool,
+    /// Nav drawn as numbers and glyphs only (`\`); the startup value comes
+    /// from `[tui] nav`.
+    pub compact_nav: bool,
     pub should_quit: bool,
     pub spin: usize,
     pub toast: Option<Toast>,
@@ -92,6 +95,7 @@ impl App {
             domain: None,
             input_mode: InputMode::Normal,
             help: false,
+            compact_nav: false,
             should_quit: false,
             spin: 0,
             toast: None,
@@ -264,6 +268,8 @@ impl App {
             LensData::Takeover(t) => t.findings.len(),
             // One selectable row per finding.
             LensData::Audit(a) => a.findings.len(),
+            // One selectable row per graded header.
+            LensData::Headers(h) => h.headers.len(),
             _ => 0,
         }
     }
@@ -1191,6 +1197,8 @@ impl App {
                 }
                 vec![]
             }
+            KeyAction::NextGroup => self.nav_to(lenses::group_start(self.lens, true)),
+            KeyAction::PrevGroup => self.nav_to(lenses::group_start(self.lens, false)),
             KeyAction::ToggleFocus => {
                 self.focus = self.focus.toggled();
                 vec![]
@@ -1257,6 +1265,10 @@ impl App {
             }
             KeyAction::Help => {
                 self.help = true;
+                vec![]
+            }
+            KeyAction::ToggleNav => {
+                self.compact_nav = !self.compact_nav;
                 vec![]
             }
             KeyAction::QuitHint => {
@@ -1332,6 +1344,98 @@ mod tests {
             RecordType::A,
             vec![],
         )))
+    }
+
+    #[test]
+    fn headers_rows_are_selectable() {
+        let mut app = App::new(None);
+        app.lens = LensKey::Headers.index();
+        let finding = |header: &str| seer_core::HeaderFinding {
+            header: header.into(),
+            present: true,
+            value: None,
+            verdict: seer_core::HeaderVerdict::Present,
+            note: None,
+        };
+        let report = seer_core::HeaderReport {
+            domain: "example.com".into(),
+            url: "https://example.com/".into(),
+            status: 200,
+            redirects: 0,
+            grade: "C".into(),
+            score: 65,
+            headers: vec![
+                finding("strict-transport-security"),
+                finding("x-frame-options"),
+            ],
+            cookies: vec![],
+            disclosures: vec![],
+            notes: vec![],
+        };
+        app.states.insert(
+            LensKey::Headers,
+            LensState::Loaded(LensData::Headers(Box::new(report))),
+        );
+        assert_eq!(app.row_count(), 2);
+    }
+
+    /// Every key a lens advertises is consumed by its pane (no dead hints).
+    #[test]
+    fn every_lens_key_hint_is_handled() {
+        for lens in lenses::lenses() {
+            for hint in lens.keys {
+                let mut app = App::new(Some("example.com".into()));
+                app.lens = lens.key.index();
+                app.tab = hint.tab.unwrap_or(0);
+                app.focus = Focus::Pane;
+                match lens.key {
+                    LensKey::Watch => {
+                        app.states
+                            .insert(LensKey::Watch, make_watch_state("example.com"));
+                    }
+                    LensKey::History => {
+                        app.states
+                            .insert(LensKey::History, make_history_state("old.com"));
+                    }
+                    _ => {}
+                }
+                let ev = KeyEvent::new(hint.code, KeyModifiers::NONE);
+                assert!(
+                    app.handle_pane_key(ev, None).is_some(),
+                    "{} hint {:?} ({}) is not handled",
+                    lens.label,
+                    hint.label(),
+                    hint.what
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn backslash_toggles_the_compact_nav_but_types_in_a_field() {
+        let mut app = App::new(None);
+        key(&mut app, KeyCode::Char('\\'));
+        assert!(app.compact_nav);
+        key(&mut app, KeyCode::Char('\\'));
+        assert!(!app.compact_nav);
+        key(&mut app, KeyCode::Char(':'));
+        key(&mut app, KeyCode::Char('\\'));
+        assert!(
+            !app.compact_nav,
+            "a backslash typed into : must not toggle the nav"
+        );
+    }
+
+    #[test]
+    fn brace_jumps_to_the_next_group_through_nav_to() {
+        let mut app = App::new(Some("example.com".into()));
+        let _ = app.take_startup_actions();
+        app.focus = Focus::Pane;
+        key(&mut app, KeyCode::Char('}'));
+        assert_eq!(app.lens, LensKey::Dns.index());
+        assert_eq!(app.focus, Focus::Nav);
+        key(&mut app, KeyCode::Char('{'));
+        assert_eq!(app.lens, 0);
     }
 
     #[test]

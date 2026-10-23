@@ -22,6 +22,7 @@ use crate::tui::filter;
 use crate::tui::lenses::{compare, dnssec, trace};
 use crate::tui::panes::{DnsState, Panes};
 use crate::tui::theme::Theme;
+use crate::tui::widgets::inspector::{self, Field};
 use crate::tui::widgets::{panel, row_style, scroll_to, stack, wrap, Band};
 
 #[allow(clippy::too_many_arguments)]
@@ -199,6 +200,8 @@ fn status_line(theme: &Theme, result: &DnsQueryResult) -> Line<'static> {
 enum Section {
     /// The ANSWER table: the visible (filtered) rows, scrolled to `selected`.
     Answers,
+    /// The selected answer's full fields (focused only).
+    Detail,
     /// Why there is no answer (`wording::query_verdict`), pre-wrapped to
     /// the area's width — a referral's names the zone and can run long.
     Verdict(Vec<String>),
@@ -211,10 +214,12 @@ enum Section {
 }
 
 /// The response below the status line, stacked from the top: the answers,
-/// the verdict when there are none, the authority records, and the
-/// local-answer or wildcard note. Only the answer table shrinks (and
-/// scrolls) when they do not all fit, so the verdict and the notes are never
-/// cut.
+/// the selected answer's detail while focused, the verdict when there are
+/// none, the authority records, and the local-answer or wildcard note. When
+/// they do not all fit, the answer table shrinks (and scrolls) first, then
+/// the detail, so the verdict and the notes are not cut; while a detail
+/// shows, the table keeps its header and a few rows so the selected one
+/// stays in view.
 fn response(
     f: &mut Frame,
     area: Rect,
@@ -223,9 +228,24 @@ fn response(
     filter: &str,
     selected: Option<usize>,
 ) {
+    let mut detail = selected
+        .and_then(|i| filter::dig_rows(result, filter).nth(i))
+        .map(|(record, _)| {
+            let fields = [
+                Field::new("name", record.name.clone()),
+                Field::new("type", record.record_type.as_str()),
+                Field::new("ttl", record.ttl.to_string()),
+                Field::new("data", record.data.to_string()),
+            ];
+            inspector::lines(theme, &fields, area.width)
+        })
+        .unwrap_or_default();
     let mut sections = Vec::new();
     if !result.answers.is_empty() {
         sections.push(Section::Answers);
+    }
+    if !detail.is_empty() {
+        sections.push(Section::Detail);
     }
     if let Some(verdict) = wording::query_verdict(result, sanitize_line) {
         sections.push(Section::Verdict(wrap(&verdict, area.width)));
@@ -260,7 +280,15 @@ fn response(
         .iter()
         .map(|section| match section {
             // The column header, then the visible rows; it scrolls.
-            Section::Answers => Band::shrinking(height(rows + 1), 0),
+            Section::Answers => {
+                let min = if detail.is_empty() {
+                    0
+                } else {
+                    1 + rows.min(inspector::MIN_ROWS)
+                };
+                Band::shrinking(height(rows + 1), height(min))
+            }
+            Section::Detail => inspector::band(&detail),
             Section::Verdict(lines) => Band::fixed(height(lines.len())),
             Section::Authority => Band::fixed(height(result.authority.len() + 1)),
             Section::Note(lines, _) => Band::fixed(height(lines.len())),
@@ -276,6 +304,7 @@ fn response(
                 let mut state = scroll_to(selected);
                 f.render_stateful_widget(table, band, &mut state);
             }
+            Section::Detail => inspector::draw(f, band, theme, std::mem::take(&mut detail)),
             Section::Verdict(lines) => f.render_widget(
                 colored_lines(lines, verdict_color(theme, result.status)),
                 band,
@@ -310,6 +339,40 @@ mod tests {
     use crate::tui::test_util::{render_buffer, render_lines, render_text};
     use seer_core::dns::{RecordData, RecordType};
     use seer_core::WildcardProbe;
+
+    fn txt_dig(text: &str) -> LensData {
+        let record = DnsRecord {
+            name: "www.seer.test".into(),
+            record_type: RecordType::TXT,
+            ttl: 300,
+            data: RecordData::txt(vec![text.to_string()]),
+        };
+        LensData::Dig(Box::new(fixtures::dig(RecordType::TXT, vec![record])))
+    }
+
+    /// A detail longer than the pane must not push the answer table (and
+    /// the selected row) out of view: the table keeps its header and a few
+    /// rows, and the detail is the band cut short.
+    #[test]
+    fn a_long_detail_keeps_the_answer_table_in_view() {
+        let data = txt_dig(&"x".repeat(2000));
+        let s = draw(&data, &Panes::default(), "", Some(0));
+        assert!(s.contains("ANSWER"), "the table header must stay: {s}");
+        assert!(s.contains("more lines"), "the detail is cut short: {s}");
+    }
+
+    #[test]
+    fn focused_record_shows_its_full_data_wrapped() {
+        let long = format!("v=spf1 {}-all", "include:_spf.example.net ".repeat(12));
+        let data = txt_dig(&long);
+        let s = draw(&data, &Panes::default(), "", Some(0));
+        assert!(
+            s.contains("-all"),
+            "the tail of a long TXT must be visible: {s}"
+        );
+        let unfocused = draw(&data, &Panes::default(), "", None);
+        assert!(!unfocused.contains("-all"), "{unfocused}");
+    }
 
     fn draw(data: &LensData, panes: &Panes, filter: &str, sel: Option<usize>) -> String {
         let theme = Theme::frappe();

@@ -61,9 +61,9 @@ mod tests {
             text.contains("WHOIS · whois.verisign-grs.com"),
             "got: {text}"
         );
-        assert!(text.contains(" Example Registrar│"), "got: {text}");
-        assert!(text.contains(" 1995-08-14│"), "date only: {text}");
-        assert!(text.contains(" 2030-08-13│"), "date only: {text}");
+        assert!(text.contains("· Example Registrar"), "got: {text}");
+        assert!(text.contains("· 1995-08-14 "), "date only: {text}");
+        assert!(text.contains("· 2030-08-13 "), "date only: {text}");
         assert!(
             text.contains("a.iana-servers.net  b.iana-servers.net"),
             "got: {text}"
@@ -75,7 +75,7 @@ mod tests {
         let text = render_whois(serde_json::json!({}));
         let row = |key: &str| {
             text.lines()
-                .find(|l| l.contains(&format!("│{key} .")))
+                .find(|l| l.contains(&format!("│{key} ·")))
                 .unwrap_or_else(|| panic!("no {key} row: {text}"))
                 .to_string()
         };
@@ -87,7 +87,11 @@ mod tests {
             "expires",
             "dnssec",
         ] {
-            assert!(row(key).ends_with(" —│"), "{key}: {text}");
+            let row = row(key);
+            assert!(
+                row.trim_end_matches('│').trim_end().ends_with("· —"),
+                "{key}: {text}"
+            );
         }
     }
 }

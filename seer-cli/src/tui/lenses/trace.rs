@@ -16,6 +16,7 @@ use seer_core::{DnsTrace, TraceHop};
 use crate::tui::action::LensData;
 use crate::tui::lenses::dns::{record_table, status_color, status_spans, verdict_color};
 use crate::tui::theme::Theme;
+use crate::tui::widgets::inspector::{self, fit, more, MIN_ROWS};
 use crate::tui::widgets::{panel, row_style, scroll_to, stack, wrap, Band};
 
 pub fn render(
@@ -36,7 +37,7 @@ pub fn render(
 
     // The hop the selection is on (the first one until the pane is entered).
     let selected = sel.min(trace.hops.len().saturating_sub(1));
-    let mut detail = trace
+    let detail = trace
         .hops
         .get(selected)
         .map(|hop| hop_detail(theme, selected + 1, hop, inner.width))
@@ -56,10 +57,7 @@ pub fn render(
         Band::shrinking(rows(hops + 1), rows(1 + hops.min(MIN_ROWS))),
     ];
     if !detail.is_empty() {
-        layout.push(Band::shrinking(
-            rows(detail.len()),
-            rows(detail.len().min(MIN_ROWS)),
-        ));
+        layout.push(inspector::band(&detail));
     }
     if !trace.answers.is_empty() {
         let answers = trace.answers.len() + 1;
@@ -88,13 +86,7 @@ pub fn render(
         &mut state,
     );
     if !detail.is_empty() {
-        let band = next_band();
-        let (shown, hidden) = fit(detail.len(), band.height);
-        detail.truncate(shown);
-        if hidden > 0 {
-            detail.push(more(theme, hidden, "lines"));
-        }
-        f.render_widget(Paragraph::new(detail), band);
+        inspector::draw(f, next_band(), theme, detail);
     }
     if !trace.answers.is_empty() {
         let band = next_band();
@@ -115,32 +107,6 @@ pub fn render(
     if !outcome.is_empty() {
         f.render_widget(Paragraph::new(outcome), next_band());
     }
-}
-
-/// The fewest rows a band cut short keeps: the hop table this many hops
-/// under its header, the detail and the answer table (header included) this
-/// many rows.
-const MIN_ROWS: usize = 3;
-
-/// How many of `total` rows fit in `rows`, and how many are left out: when
-/// not all fit, the last row goes to the [`more`] mark, so a mark always
-/// stands for two rows or more (a single one would fit in its place).
-fn fit(total: usize, rows: u16) -> (usize, usize) {
-    let rows = usize::from(rows);
-    if total <= rows {
-        (total, 0)
-    } else {
-        let shown = rows.saturating_sub(1);
-        (shown, total - shown)
-    }
-}
-
-/// The mark closing a band that was cut short: `… N more <rows>`.
-fn more(theme: &Theme, hidden: usize, rows: &str) -> Line<'static> {
-    Line::from(Span::styled(
-        format!("… {hidden} more {rows}"),
-        Style::default().fg(theme.overlay0),
-    ))
 }
 
 /// One row per hop: the zone asked, the server and address that answered,

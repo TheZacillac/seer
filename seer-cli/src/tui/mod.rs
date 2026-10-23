@@ -124,12 +124,13 @@ fn install_panic_hook() {
 
 async fn run_loop(terminal: &mut Term, domain: Option<String>) -> Result<()> {
     let mut app = App::new(domain);
-    // The theme comes from `[tui] theme` in ~/.seer/config.toml. tui_theme()
-    // clamps to a known name (unknown → "frappe"), so the swap cannot fail;
-    // App keeps Frappé if it somehow did. The CLI's `output_format` is not
+    // The theme and nav width come from `[tui]` in ~/.seer/config.toml.
+    // tui_theme() clamps to a known name (unknown → "frappe"), so the swap
+    // cannot fail; App keeps Frappé if it somehow did. The CLI's `output_format` is not
     // applied: the TUI always opens on its rendered view (`r` toggles raw).
     let config = SeerConfig::load();
     app.set_theme_by_name(config.tui_theme());
+    app.compact_nav = config.tui_nav_compact();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Msg>();
     let mut tasks = Tasks::new(tx, config);
     let mut events = EventStream::new();

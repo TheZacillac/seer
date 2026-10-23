@@ -22,6 +22,8 @@ pub enum KeyAction {
     Top,
     Bottom,
     JumpLens(usize),
+    PrevGroup,
+    NextGroup,
     ToggleFocus,
     NextTab,
     PrevTab,
@@ -32,6 +34,7 @@ pub enum KeyAction {
     EditDomain,
     Command,
     Help,
+    ToggleNav,
     QuitHint,
 }
 
@@ -52,6 +55,9 @@ pub fn map(key: KeyEvent) -> Option<KeyAction> {
         KeyCode::Char('/') => KeyAction::EditDomain,
         KeyCode::Char(':') => KeyAction::Command,
         KeyCode::Char('?') => KeyAction::Help,
+        KeyCode::Char('\\') => KeyAction::ToggleNav,
+        KeyCode::Char('{') => KeyAction::PrevGroup,
+        KeyCode::Char('}') => KeyAction::NextGroup,
         KeyCode::Char('q') => KeyAction::QuitHint,
         _ => return None,
     })
@@ -95,6 +101,9 @@ mod tests {
         assert_eq!(map(k(KeyCode::Char('g'))), Some(KeyAction::Top));
         assert_eq!(map(k(KeyCode::Char('G'))), Some(KeyAction::Bottom));
         assert_eq!(map(k(KeyCode::Char('q'))), Some(KeyAction::QuitHint));
+        assert_eq!(map(k(KeyCode::Char('\\'))), Some(KeyAction::ToggleNav));
+        assert_eq!(map(k(KeyCode::Char('{'))), Some(KeyAction::PrevGroup));
+        assert_eq!(map(k(KeyCode::Char('}'))), Some(KeyAction::NextGroup));
     }
 
     #[test]

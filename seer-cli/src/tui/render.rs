@@ -13,7 +13,7 @@ use crate::tui::app::{App, SPIN};
 use crate::tui::lenses::{self};
 use crate::tui::line_editor::LineEditor;
 use crate::tui::theme::Theme;
-use crate::tui::widgets::panel;
+use crate::tui::widgets::{inspector, panel};
 
 /// The in-progress editor for `target`, if a matching field is active (the
 /// editor, not just its text, so renderers can place the caret at the cursor).
@@ -68,7 +68,7 @@ pub fn view(f: &mut Frame, app: &App, theme: &Theme) {
 
     let body = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(26), Constraint::Min(0)])
+        .constraints([Constraint::Length(nav_width(app)), Constraint::Min(0)])
         .split(rows[1]);
 
     nav(f, body[0], app, theme);
@@ -76,7 +76,7 @@ pub fn view(f: &mut Frame, app: &App, theme: &Theme) {
     status_or_command(f, rows[2], app, theme);
 
     if app.help {
-        help_overlay(f, area, theme);
+        help_overlay(f, area, app, theme);
     }
 }
 
@@ -131,6 +131,15 @@ fn top_bar(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     );
 }
 
+/// Columns the nav takes: full labels, or (`\\`) number and glyph only.
+fn nav_width(app: &App) -> u16 {
+    if app.compact_nav {
+        6
+    } else {
+        26
+    }
+}
+
 fn nav(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     let block = Block::default()
         .borders(Borders::RIGHT)
@@ -143,12 +152,18 @@ fn nav(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     for (i, l) in all.iter().enumerate() {
         let new_group = i == 0 || all[i - 1].group != l.group;
         if new_group {
-            lines.push(Line::from(Span::styled(
-                l.group,
-                Style::default()
-                    .fg(theme.overlay0)
-                    .add_modifier(Modifier::DIM),
-            )));
+            // The compact nav marks a group with a rule instead of its name.
+            let header = if app.compact_nav {
+                Span::styled("──", Style::default().fg(theme.surface1))
+            } else {
+                Span::styled(
+                    l.group,
+                    Style::default()
+                        .fg(theme.overlay0)
+                        .add_modifier(Modifier::DIM),
+                )
+            };
+            lines.push(Line::from(header));
         }
         let active = i == app.lens;
         let num = if i < 9 {
@@ -158,12 +173,20 @@ fn nav(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         };
         let label_color = if active { theme.text } else { theme.subtext };
         let glyph_color = if active { theme.blue } else { theme.lavender };
+        let num_style = Style::default().fg(if active { theme.blue } else { theme.overlay0 });
+        if app.compact_nav {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{}{num}", if active { "▸" } else { " " }),
+                    num_style,
+                ),
+                Span::styled(l.glyph, Style::default().fg(glyph_color)),
+            ]));
+            continue;
+        }
         let prefix = if active { "▸ " } else { "  " };
         lines.push(Line::from(vec![
-            Span::styled(
-                format!("{prefix}{num} "),
-                Style::default().fg(if active { theme.blue } else { theme.overlay0 }),
-            ),
+            Span::styled(format!("{prefix}{num} "), num_style),
             Span::styled(format!("{} ", l.glyph), Style::default().fg(glyph_color)),
             Span::styled(l.label, Style::default().fg(label_color)),
             Span::styled(
@@ -454,16 +477,34 @@ fn status_or_command(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         ));
     }
     spans.push(Span::raw("   "));
-    for (k, t) in [
-        ("j/k", "move"),
-        ("tab", "focus"),
-        ("[ ]", "tab"),
-        ("r", "raw"),
-        ("y", "copy"),
-        ("/", "lookup"),
-        (":", "cmd"),
-        ("?", "help"),
-    ] {
+    // A focused pane lists its own keys; otherwise the global ones.
+    let lens_keys: Vec<(String, &str)> = lens
+        .keys_for(app.tab)
+        .map(|h| (h.label(), h.what))
+        .collect();
+    let keys: Vec<(String, &str)> = if app.focus == Focus::Pane && !lens_keys.is_empty() {
+        let mut keys = lens_keys;
+        if lens.filterable(app.tab) {
+            keys.push(("/".to_string(), "filter"));
+        }
+        keys.extend([("h".to_string(), "back"), ("?".to_string(), "help")]);
+        keys
+    } else {
+        vec![
+            ("j/k", "move"),
+            ("tab", "focus"),
+            ("[ ]", "tab"),
+            ("r", "raw"),
+            ("y", "copy"),
+            ("/", "lookup"),
+            (":", "cmd"),
+            ("?", "help"),
+        ]
+        .into_iter()
+        .map(|(k, t)| (k.to_string(), t))
+        .collect()
+    };
+    for (k, t) in keys {
         spans.push(Span::styled(
             format!(" {k}"),
             Style::default().fg(theme.crust).bg(theme.overlay),
@@ -479,10 +520,15 @@ fn status_or_command(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     );
 }
 
-fn help_overlay(f: &mut Frame, area: Rect, theme: &Theme) {
-    let rows = [
+/// Width of the key column in the help overlay.
+const HELP_KEY_COL: usize = 16;
+
+fn help_overlay(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
+    let global = [
         ("j / k  ·  ↑ ↓", "move selection (nav or pane)"),
         ("1 … 9", "jump straight to a lens"),
+        ("{ / }", "previous / next nav group"),
+        ("\\", "collapse / expand the nav"),
         ("Tab", "toggle focus: nav ⇄ pane"),
         ("[ / ]", "switch sub-tabs (RDAP, DNS)"),
         ("↵ / l", "enter the pane · run Subdomains / Takeover"),
@@ -495,8 +541,40 @@ fn help_overlay(f: &mut Frame, area: Rect, theme: &Theme) {
         (":", "command (lookup · dig · ssl · set output · theme · q)"),
         ("?", "this help · Esc closes"),
     ];
-    let w = 60u16.min(area.width.saturating_sub(4));
-    let h = (rows.len() as u16 + 4).min(area.height.saturating_sub(2));
+    let lens = app.current_lens();
+    let lens_rows: Vec<(String, &str)> = lens
+        .keys_for(app.tab)
+        .map(|h| (h.label(), h.what))
+        .collect();
+    let row = |(k, t): (&str, &str)| {
+        Line::from(vec![
+            Span::styled(
+                format!("{k:<HELP_KEY_COL$}"),
+                Style::default().fg(theme.peach),
+            ),
+            Span::styled(t.to_string(), Style::default().fg(theme.subtext)),
+        ])
+    };
+    // The focused lens's own keys lead, so on a short terminal the rows cut
+    // off (and marked) are global ones the status bar also lists.
+    let mut lines: Vec<Line> = Vec::new();
+    if !lens_rows.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!("{} {} keys", lens.glyph, lens.label),
+            Style::default().fg(theme.lavender),
+        )));
+        lines.extend(lens_rows.iter().map(|(k, t)| row((k.as_str(), *t))));
+        lines.push(Line::default());
+    }
+    lines.extend(global.iter().copied().map(row));
+    // Wide enough for the longest row (border + padding), never past the frame.
+    let longest = lines.iter().map(Line::width).max().unwrap_or(0);
+    let w = u16::try_from(longest + 4)
+        .unwrap_or(u16::MAX)
+        .max(60)
+        .min(area.width.saturating_sub(4));
+    let rows = u16::try_from(lines.len() + 4).unwrap_or(u16::MAX);
+    let h = rows.min(area.height.saturating_sub(2));
     let popup = Rect {
         x: area.x + (area.width.saturating_sub(w)) / 2,
         y: area.y + (area.height.saturating_sub(h)) / 2,
@@ -511,26 +589,80 @@ fn help_overlay(f: &mut Frame, area: Rect, theme: &Theme) {
         popup,
     );
     let inner = panel::render(f, popup, theme, "keybindings", theme.lavender, true);
-    let lines: Vec<Line> = rows
-        .iter()
-        .map(|(k, t)| {
-            Line::from(vec![
-                Span::styled(format!("{k:<16}"), Style::default().fg(theme.peach)),
-                Span::styled(*t, Style::default().fg(theme.subtext)),
-            ])
-        })
-        .collect();
-    f.render_widget(Paragraph::new(lines), inner);
+    inspector::draw(f, inner, theme, lines);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::tui::app::App;
-    use crate::tui::test_util::{render_buffer, render_text};
+    use crate::tui::test_util::{render_buffer, render_lines, render_text};
 
     fn full_buf(app: &App, theme: &Theme) -> String {
         render_text(100, 30, |f| view(f, app, theme))
+    }
+
+    #[test]
+    fn compact_nav_gives_the_pane_the_width() {
+        let mut app = App::new(None);
+        app.compact_nav = true;
+        let s = render_lines(100, 30, |f| view(f, &app, app.theme()));
+        assert!(!s.contains("WHOIS"), "labels are hidden: {s}");
+        let first = s.lines().nth(2).unwrap_or_default();
+        assert!(first.starts_with("▸1◈"), "{s}");
+    }
+
+    #[test]
+    fn help_overlay_rows_are_not_clipped() {
+        let mut app = App::new(None);
+        app.help = true;
+        let s = render_lines(100, 30, |f| view(f, &app, app.theme()));
+        assert!(s.contains("theme · q)"), "the : row must render whole: {s}");
+    }
+
+    /// On an 80×24 terminal the lens's own keys come first, so a long list
+    /// (Bulk has seven) is never the part cut off.
+    #[test]
+    fn help_overlay_keeps_every_lens_key_on_a_small_terminal() {
+        let mut app = App::new(None);
+        app.lens = LensKey::Bulk.index();
+        app.help = true;
+        let s = render_lines(80, 24, |f| view(f, &app, app.theme()));
+        assert!(s.contains(&format!("{:<16}export", "e")), "{s}");
+        assert!(
+            s.contains("more lines"),
+            "the cut global rows are marked: {s}"
+        );
+    }
+
+    #[test]
+    fn help_overlay_lists_the_current_lens_keys() {
+        let mut app = App::new(None);
+        app.lens = LensKey::Follow.index();
+        app.help = true;
+        let s = render_lines(100, 40, |f| view(f, &app, app.theme()));
+        // The overlay's own row format: the key padded to its 16-col column.
+        // (The Follow pane behind it also says "interval".)
+        assert!(s.contains("Follow keys"), "{s}");
+        assert!(s.contains(&format!("{:<16}interval", "i")), "{s}");
+    }
+
+    #[test]
+    fn status_bar_shows_lens_keys_when_the_pane_is_focused() {
+        let mut app = App::new(None);
+        app.lens = LensKey::Follow.index();
+        // Only the status bar (last row) is checked: the Follow pane itself
+        // also prints its interval.
+        let status = |app: &App| {
+            render_lines(140, 30, |f| view(f, app, app.theme()))
+                .lines()
+                .last()
+                .unwrap_or_default()
+                .to_string()
+        };
+        assert!(!status(&app).contains("interval"), "{}", status(&app));
+        app.focus = Focus::Pane;
+        assert!(status(&app).contains("interval"), "{}", status(&app));
     }
 
     #[test]

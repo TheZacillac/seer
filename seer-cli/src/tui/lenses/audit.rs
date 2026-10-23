@@ -4,19 +4,21 @@
 //! gauge, category strip and, when any check did not finish, an incomplete
 //! notice) over a findings table. The table is selectable and scrolls with
 //! the selection like the Takeover lens, so a long list never hides rows or
-//! the incomplete notice.
+//! the incomplete notice. While focused, the selected finding's evidence and
+//! remediation show beneath it.
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Row, Table};
 use ratatui::Frame;
-use seer_core::audit::{CategoryState, CheckStatus, Severity};
+use seer_core::audit::{CategoryState, CheckStatus, Finding, Severity};
 use seer_core::grade::Letter;
 use seer_core::output::sanitize_line;
 
 use crate::tui::action::LensData;
 use crate::tui::theme::Theme;
-use crate::tui::widgets::{dot, gauge, panel, row_style, scroll_to};
+use crate::tui::widgets::inspector::{self, Field};
+use crate::tui::widgets::{dot, gauge, panel, row_style, scroll_to, stack, Band};
 
 /// Letter band → tone: A/A+ pass, B/C partial, D and below fail.
 fn letter_tone(letter: Letter) -> &'static str {
@@ -33,6 +35,32 @@ fn severity_tone(severity: Severity) -> &'static str {
         Severity::Medium | Severity::Low => "warn",
         Severity::Info => "info",
     }
+}
+
+/// The selected finding's detail, in reading order: what, how bad, where,
+/// what was seen, how to fix it, and the stable id to grep for.
+fn finding_fields(finding: &Finding) -> Vec<Field> {
+    let mut fields = vec![
+        Field::new("finding", finding.title.clone()),
+        Field::new(
+            "severity",
+            format!(
+                "{} · {}",
+                finding.severity.as_str(),
+                finding.category.label()
+            ),
+        )
+        .tone(severity_tone(finding.severity)),
+        Field::new("host", finding.host.clone()),
+    ];
+    if let Some(evidence) = &finding.evidence {
+        fields.push(Field::new("evidence", evidence.clone()));
+    }
+    if let Some(fix) = &finding.remediation {
+        fields.push(Field::new("remediation", fix.clone()));
+    }
+    fields.push(Field::new("check", finding.id));
+    fields
 }
 
 pub fn render(
@@ -143,8 +171,28 @@ pub fn render(
     )
     .header(Row::new(["SEVERITY", "FINDING", "CHECK"]).style(Style::default().fg(theme.overlay0)))
     .column_spacing(1);
+    let area = chunks[1];
+    let detail = focused
+        .then(|| a.findings.get(sel))
+        .flatten()
+        .map(|finding| inspector::lines(theme, &finding_fields(finding), area.width))
+        .unwrap_or_default();
+    let rows = |n: usize| u16::try_from(n).unwrap_or(u16::MAX);
+    let n = a.findings.len();
+    // The table keeps its header and a few rows; the detail takes the rest.
+    let mut layout = vec![Band::shrinking(
+        rows(n + 1),
+        rows(1 + n.min(inspector::MIN_ROWS)),
+    )];
+    if !detail.is_empty() {
+        layout.push(inspector::band(&detail));
+    }
+    let bands = stack(area, &layout);
     let mut state = scroll_to(focused.then_some(sel));
-    f.render_stateful_widget(table, chunks[1], &mut state);
+    f.render_stateful_widget(table, bands[0], &mut state);
+    if let Some(band) = bands.get(1) {
+        inspector::draw(f, *band, theme, detail);
+    }
 }
 
 #[cfg(test)]
@@ -192,6 +240,29 @@ mod tests {
     fn render_to_text(data: &LensData) -> String {
         let theme = Theme::frappe();
         render_lines(90, 16, |f| render(f, f.area(), &theme, data, false, 0))
+    }
+
+    #[test]
+    fn focused_selection_shows_evidence_and_remediation() {
+        let theme = Theme::frappe();
+        let mut r = report();
+        r.findings[0].evidence = Some("no TXT at _dmarc.example.com".into());
+        r.findings[0].remediation = Some("Publish v=DMARC1; p=quarantine".into());
+        let data = LensData::Audit(Box::new(r));
+        let focused = render_lines(90, 20, |f| render(f, f.area(), &theme, &data, true, 0));
+        assert!(
+            focused.contains("no TXT at _dmarc.example.com"),
+            "{focused}"
+        );
+        assert!(focused.contains("Publish v=DMARC1"), "{focused}");
+        let nav = render_lines(90, 20, |f| render(f, f.area(), &theme, &data, false, 0));
+        assert!(
+            !nav.contains("Publish v=DMARC1"),
+            "detail only while focused: {nav}"
+        );
+        // A stale selection past the list shows no detail and does not panic.
+        let stale = render_lines(90, 20, |f| render(f, f.area(), &theme, &data, true, 9));
+        assert!(!stale.contains("Publish v=DMARC1"), "{stale}");
     }
 
     #[test]

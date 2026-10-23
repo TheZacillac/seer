@@ -1,12 +1,14 @@
 //! Small reusable TUI building blocks: `panel` (bordered block → inner
-//! `Rect`), `kv` rows, `gauge`, status `dot` and `chips`, plus the shared
+//! `Rect`), `kv` rows, `gauge`, status `dot` and `chips`, the selected-row
+//! `inspector`, plus the shared
 //! `or_dash` missing-value mark, `row_style` selection styling, and `stack`
-//! (of [`Band`]s) and `wrap` for bands sized to their content before they
+//! (of [`Band`]s), `wrap` and `wrap_hard` for bands sized to their content before they
 //! are drawn.
 
 pub mod chips;
 pub mod dot;
 pub mod gauge;
+pub mod inspector;
 pub mod kv;
 pub mod panel;
 
@@ -128,6 +130,55 @@ pub fn wrap(text: &str, width: u16) -> Vec<String> {
     lines
 }
 
+/// `text` split into lines at most `width` columns wide, breaking at the
+/// last space that fits (the spaces at a break are dropped) and splitting a
+/// run with no space mid-word. Unlike [`wrap`], the spacing inside a line is
+/// kept: for values whose spacing is data (TXT records, header values).
+/// A width of 0 is treated as 1.
+pub fn wrap_hard(text: &str, width: u16) -> Vec<String> {
+    let max = usize::from(width.max(1));
+    let col = |s: &str| Span::raw(s).width();
+    // Close `line` onto `lines`: trailing spaces dropped, blank lines skipped.
+    fn push(lines: &mut Vec<String>, line: &mut String) {
+        let kept = line.trim_end();
+        if !kept.is_empty() {
+            lines.push(kept.to_string());
+        }
+        line.clear();
+    }
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for c in text.chars() {
+        let mut buf = [0u8; 4];
+        let w = col(c.encode_utf8(&mut buf));
+        if col(&line) + w > max && !line.is_empty() {
+            if c == ' ' {
+                push(&mut lines, &mut line);
+                continue;
+            }
+            match line.rfind(' ') {
+                // Carry the word after the last space onto the next line.
+                Some(at) => {
+                    let rest = line.split_off(at + 1);
+                    push(&mut lines, &mut line);
+                    line = rest;
+                }
+                None => push(&mut lines, &mut line),
+            }
+            // The carried word plus this character may still not fit.
+            if col(&line) + w > max && !line.is_empty() {
+                push(&mut lines, &mut line);
+            }
+        }
+        // A continuation line does not start with the spaces it broke at.
+        if !(line.is_empty() && c == ' ' && !lines.is_empty()) {
+            line.push(c);
+        }
+    }
+    push(&mut lines, &mut line);
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -190,6 +241,39 @@ mod tests {
         assert_eq!(spans(&bands), [(0, 4), (5, 1)]);
         // A minimum above the height is the height.
         assert_eq!(Band::shrinking(2, 5), Band::fixed(2));
+    }
+
+    #[test]
+    fn wrap_hard_splits_words_wider_than_the_line() {
+        assert_eq!(
+            wrap_hard("v=DKIM1 abcdefghij", 4),
+            ["v=DK", "IM1", "abcd", "efgh", "ij"]
+        );
+        assert_eq!(wrap_hard("fits", 10), ["fits"]);
+        assert!(wrap_hard("", 5).is_empty());
+        // Width 0 must not loop forever: treated as 1.
+        assert_eq!(wrap_hard("ab", 0), ["a", "b"]);
+    }
+
+    /// The word carried to a new line plus a double-width character can
+    /// still be too wide: it must break again, never overflow the width.
+    #[test]
+    fn wrap_hard_breaks_again_after_carrying_a_word() {
+        let got = wrap_hard(" ab漢", 3);
+        assert!(
+            got.iter().all(|l| Span::raw(l.as_str()).width() <= 3),
+            "{got:?}"
+        );
+        assert_eq!(got.concat(), "ab漢");
+    }
+
+    #[test]
+    fn wrap_hard_keeps_the_spacing_inside_a_line() {
+        // A value's own spacing is data (a TXT record, joined nameservers):
+        // only the spaces a line breaks at are dropped.
+        assert_eq!(wrap_hard("a  b", 10), ["a  b"]);
+        assert_eq!(wrap_hard("v=spf1  -all", 7), ["v=spf1", "-all"]);
+        assert!(wrap_hard("   ", 5).is_empty());
     }
 
     #[test]
