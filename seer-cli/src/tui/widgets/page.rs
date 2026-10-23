@@ -179,15 +179,23 @@ impl Part {
         }
     }
 
-    /// When this part gives rows up; `None` never. A panel goes with the
-    /// first of its contents to.
-    fn priority(&self) -> Option<u8> {
+    /// The rows this part can give up in the `priority` pass. A panel gives
+    /// what its own parts of that priority can, so nesting never changes the
+    /// order rows are taken in.
+    fn give(&self, priority: u8) -> usize {
+        let own = |p: u8| {
+            if p == priority {
+                self.want() - self.min()
+            } else {
+                0
+            }
+        };
         match self {
-            Part::Gap => Some(GAP),
-            Part::Fixed(_) => None,
-            Part::Shrink { priority, .. } => Some(*priority),
-            Part::Rows { .. } => Some(TABLE),
-            Part::Panel { parts, .. } => parts.iter().filter_map(Part::priority).min(),
+            Part::Gap => own(GAP),
+            Part::Fixed(_) => 0,
+            Part::Shrink { priority: p, .. } => own(*p),
+            Part::Rows { .. } => own(TABLE),
+            Part::Panel { parts, .. } => parts.iter().map(|p| p.give(priority)).sum(),
         }
     }
 }
@@ -261,8 +269,9 @@ fn note(text: &str, color: Color, width: u16) -> Vec<Line<'static>> {
 }
 
 /// Heights for `parts` in `avail` rows: all they want, then rows taken in
-/// priority order (first part first within one) down to each minimum. Rows
-/// left over go to the last part when it is a panel.
+/// priority order (first part first within one) down to each minimum; a
+/// panel's own parts are taken from in the same passes when it is drawn.
+/// Rows left over go to the last part when it is a panel.
 fn allocate(parts: &[Part], avail: usize) -> Vec<usize> {
     let mut heights: Vec<usize> = parts.iter().map(Part::want).collect();
     let mut over = heights.iter().sum::<usize>().saturating_sub(avail);
@@ -271,11 +280,9 @@ fn allocate(parts: &[Part], avail: usize) -> Vec<usize> {
             if over == 0 {
                 break;
             }
-            if part.priority() == Some(priority) {
-                let give = heights[i].saturating_sub(part.min()).min(over);
-                heights[i] -= give;
-                over -= give;
-            }
+            let give = part.give(priority).min(over);
+            heights[i] -= give;
+            over -= give;
         }
     }
     let used: usize = heights.iter().sum();
@@ -510,6 +517,39 @@ mod tests {
         });
         assert_eq!(buf[(1, 1)].fg, Color::Red);
         assert_eq!(buf[(1, 2)].bg, theme.surface0);
+    }
+
+    /// A panel gives rows up in the same order as everything else: its
+    /// key/value rows go after a sibling table's, not with its own gap.
+    #[test]
+    fn a_panel_shrinks_child_by_child_in_priority_order() {
+        let rows = (0..10).map(|i| ("k", format!("v{i}"))).collect();
+        let inner = page().push(Block::Gap).push(Block::Kv {
+            key_color: Color::Reset,
+            rows,
+        });
+        let s = draw_page(
+            40,
+            20,
+            page().push(table(30, Some(0), 0)).push(Block::Panel(inner)),
+        );
+        assert!(s.contains("v9"), "the panel's kv keeps its rows: {s}");
+        assert!(
+            !s.contains("row9"),
+            "the outer table gave up rows first: {s}"
+        );
+    }
+
+    /// A detail inside a panel outlasts a sibling table's rows.
+    #[test]
+    fn a_nested_detail_outlasts_a_sibling_table() {
+        let inner = page().push(table(10, Some(0), 10));
+        let s = draw_page(
+            40,
+            24,
+            page().push(table(30, Some(0), 0)).push(Block::Panel(inner)),
+        );
+        assert!(s.contains("det9"), "the nested detail is whole: {s}");
     }
 
     #[test]
