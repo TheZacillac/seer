@@ -83,16 +83,12 @@ pub struct TuiConfig {
     /// read through [`SeerConfig::tui_theme`], which falls back to "frappe"
     /// on anything unrecognized so config parsing stays tolerant.
     pub theme: String,
-    /// Nav sidebar at startup: "full" (default) or "compact" (number and
-    /// glyph only). Read through [`SeerConfig::tui_nav_compact`].
-    pub nav: String,
 }
 
 impl Default for TuiConfig {
     fn default() -> Self {
         Self {
             theme: "frappe".to_string(),
-            nav: "full".to_string(),
         }
     }
 }
@@ -258,13 +254,6 @@ impl SeerConfig {
         }
     }
 
-    /// Whether the TUI opens with the compact nav. Only "compact"
-    /// (case-insensitive, trimmed) is; anything else is the full nav, so a
-    /// typo degrades to the default rather than erroring.
-    pub fn tui_nav_compact(&self) -> bool {
-        self.tui.nav.trim().eq_ignore_ascii_case("compact")
-    }
-
     /// Generates a default config file content as TOML.
     pub fn default_toml() -> String {
         toml::to_string_pretty(&Self::default()).unwrap_or_else(|_| String::new())
@@ -410,15 +399,6 @@ concurrency = 20
         let config = SeerConfig::default();
         assert_eq!(config.tui.theme, "frappe");
         assert_eq!(config.tui_theme(), "frappe");
-    }
-
-    #[test]
-    fn tui_nav_parses_and_defaults_to_full() {
-        let config: SeerConfig = toml::from_str("[tui]\nnav = \" Compact \"\n").unwrap();
-        assert!(config.tui_nav_compact());
-        let config: SeerConfig = toml::from_str("[tui]\nnav = \"sideways\"\n").unwrap();
-        assert!(!config.tui_nav_compact());
-        assert!(!SeerConfig::default().tui_nav_compact());
     }
 
     #[test]

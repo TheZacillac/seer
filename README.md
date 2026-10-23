@@ -176,20 +176,20 @@ seer tui                  # start on the target prompt
 seer tui example.com      # look up a domain on launch
 ```
 
-The **lens** sidebar covers every Seer capability, grouped, each pulling live data from the same `seer-core` engine as the CLI with full in-pane controls:
+The **lens** strip across the top covers every Seer capability, grouped, each pulling live data from the same `seer-core` engine as the CLI with full in-pane controls:
 
 - **LOOKUP** — Overview · WHOIS · RDAP (Domain · IP · ASN) · Reverse DNS · Availability · TLD Info
 - **DNS** — Records (+ custom nameserver) · DNSSEC · Compare (two resolvers) · Trace (from the root servers) · Propagation · Follow (live monitor)
 - **SECURITY** — SSL / Cert · Status · Subdomains · HTTP Headers · Takeover · Audit
 - **POWER** — Diff · Bulk (streaming + CSV export) · Watchlist · History
 
-**Keys:** `j`/`k` move · `1`–`9` jump to a lens · `{` `}` jump between nav groups · `\` collapse the nav · `Tab` focus nav⇄pane · `[` `]` sub-tabs · `r` raw output (json/yaml/markdown; `PgUp`/`PgDn` scroll) · `y` copy · `/` look up a domain · `:` command · `?` help · `:q` quit. In-pane: switchers (TLD, nameserver, Compare resolvers, Bulk op) and editable fields (Diff's 2nd domain, Follow interval/count, Bulk file path). In a focused pane the status bar lists that lens's own keys, and `?` shows them too. Audit, DNS records, HTTP Headers, Takeover and History show the selected row's full detail beneath the table while focused.
+**Keys:** `j`/`k` move · `1`–`9` pick a lens in the current group · `{` `}` previous / next group · `Tab` focus nav⇄pane · `[` `]` RDAP sub-tabs · `r` raw output (json/yaml/markdown; `PgUp`/`PgDn` scroll) · `y` copy · `/` look up a domain · `:` command · `?` help · `:q` quit. In-pane: switchers (TLD, nameserver, Compare resolvers, Bulk op) and editable fields (Diff's 2nd domain, Follow interval/count, Bulk file path). In a focused pane the status bar lists that lens's own keys, and `?` shows them too. Audit, DNS records, HTTP Headers, Takeover and History show the selected row's full detail beneath the table while focused.
 
 Subdomains, Takeover and Audit query CT logs and probe hosts, so they run only when you press `↵` on them (or use their `:` command), never just by moving onto them. Removing a watched domain (`d`) and clearing history (`c`) ask for a second press.
 
 **Commands (`:`):** `lookup`, `whois`, `rdap <domain|ip|AS####>`, `dig [@server] <name> [type] [+trace]`, `ssl`, `status`, `headers`, `takeover`, `audit`, `reverse <ip>`, `tld <.tld>`, `compare <domain> <nsA> <nsB>`, `diff <a> <b>`, `set output <human|json|yaml|markdown>`, `theme <frappe|latte>`, `copy`, `q`.
 
-The startup theme comes from `[tui] theme` in `~/.seer/config.toml` (`"frappe"` — the default — or `"latte"`; unknown names fall back to Frappé). Switch live with `:theme latte`. `[tui] nav = "compact"` starts with the narrow, glyph-only nav (`\` toggles it).
+The startup theme comes from `[tui] theme` in `~/.seer/config.toml` (`"frappe"` — the default — or `"latte"`; unknown names fall back to Frappé). Switch live with `:theme latte`.
 
 ### Command Mode
 
@@ -756,8 +756,8 @@ seer config --init
 Settings: default output format, nameserver (UDP, `tls://`, or `https://`),
 per-protocol timeouts, bulk concurrency, rate-limit delay — all clamped to
 safe ranges — plus a `[watch]` table (`webhook_url` for `seer watch` report
-delivery) and a `[tui]` table (`theme = "frappe"` or `"latte"`; `nav = "full"` or `"compact"`). Applies to
-the CLI and REPL; the TUI reads the output format, theme and nav.
+delivery) and a `[tui]` table (`theme = "frappe"` or `"latte"`). Applies to
+the CLI and REPL; the TUI reads the output format and theme.
 
 ### Timeouts
 

@@ -16,9 +16,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   History show the selected row's full detail beneath the table — including
   each audit finding's evidence and remediation, a record's untruncated
   data and a header's raw value. HTTP Headers rows are now selectable.
-- TUI: `\` collapses the nav to numbers and glyphs (`[tui] nav = "compact"`
-  starts that way); `{` / `}` jump between nav groups; the status bar and
-  `?` list the focused lens's own keys.
+- TUI: a two-row strip across the top (groups, then the active group's
+  lenses) replaces the sidebar, giving the lens the full width; `1`–`9`
+  pick a lens within the current group and `{` / `}` move between groups.
+- TUI: DNSSEC, Compare and Trace are lenses of their own in the DNS group
+  (they were sub-tabs of DNS Records); `:dnssec`, `:compare` and `:trace`
+  open them.
+- TUI: the status bar and `?` list the focused lens's own keys.
 
 ### Changed
 - TUI key/value rows align to a shared gutter and wrap long values instead

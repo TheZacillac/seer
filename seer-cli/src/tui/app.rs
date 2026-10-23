@@ -48,9 +48,6 @@ pub struct App {
     pub domain: Option<String>,
     pub input_mode: InputMode,
     pub help: bool,
-    /// Nav drawn as numbers and glyphs only (`\`); the startup value comes
-    /// from `[tui] nav`.
-    pub compact_nav: bool,
     pub should_quit: bool,
     pub spin: usize,
     pub toast: Option<Toast>,
@@ -95,7 +92,6 @@ impl App {
             domain: None,
             input_mode: InputMode::Normal,
             help: false,
-            compact_nav: false,
             should_quit: false,
             spin: 0,
             toast: None,
@@ -1172,12 +1168,11 @@ impl App {
                 self.sel = self.row_count().saturating_sub(1);
                 vec![]
             }
-            KeyAction::JumpLens(i) => {
-                if i < n_lenses {
-                    return self.nav_to(i);
-                }
-                vec![]
-            }
+            // Numbers count within the current group, as the strip shows.
+            KeyAction::JumpLens(i) => match lenses::nth_in_group(self.lens, i) {
+                Some(target) => self.nav_to(target),
+                None => vec![],
+            },
             KeyAction::NextGroup => self.nav_to(lenses::group_start(self.lens, true)),
             KeyAction::PrevGroup => self.nav_to(lenses::group_start(self.lens, false)),
             KeyAction::ToggleFocus => {
@@ -1246,10 +1241,6 @@ impl App {
             }
             KeyAction::Help => {
                 self.help = true;
-                vec![]
-            }
-            KeyAction::ToggleNav => {
-                self.compact_nav = !self.compact_nav;
                 vec![]
             }
             KeyAction::QuitHint => {
@@ -1392,21 +1383,6 @@ mod tests {
     }
 
     #[test]
-    fn backslash_toggles_the_compact_nav_but_types_in_a_field() {
-        let mut app = App::new(None);
-        key(&mut app, KeyCode::Char('\\'));
-        assert!(app.compact_nav);
-        key(&mut app, KeyCode::Char('\\'));
-        assert!(!app.compact_nav);
-        key(&mut app, KeyCode::Char(':'));
-        key(&mut app, KeyCode::Char('\\'));
-        assert!(
-            !app.compact_nav,
-            "a backslash typed into : must not toggle the nav"
-        );
-    }
-
-    #[test]
     fn brace_jumps_to_the_next_group_through_nav_to() {
         let mut app = App::new(Some("example.com".into()));
         let _ = app.take_startup_actions();
@@ -1471,6 +1447,18 @@ mod tests {
                 ..
             }]
         ));
+    }
+
+    #[test]
+    fn number_keys_pick_within_the_current_group() {
+        let mut app = App::new(None);
+        app.lens = LensKey::Ssl.index();
+        key(&mut app, KeyCode::Char('2'));
+        assert_eq!(app.current_lens().key, LensKey::Status);
+        // Past the group's end, nothing happens.
+        app.lens = LensKey::Diff.index();
+        key(&mut app, KeyCode::Char('9'));
+        assert_eq!(app.current_lens().key, LensKey::Diff);
     }
 
     #[test]

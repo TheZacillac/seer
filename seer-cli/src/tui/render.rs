@@ -4,7 +4,7 @@
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 use seer_core::output::sanitize_line;
 
@@ -55,9 +55,12 @@ pub fn view(f: &mut Frame, app: &App, theme: &Theme) {
         Block::default().style(Style::default().bg(theme.base).fg(theme.text)),
         area,
     );
+    // Top bar, the group row, the active group's lenses, the lens, status.
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Min(0),
             Constraint::Length(1),
@@ -65,15 +68,10 @@ pub fn view(f: &mut Frame, app: &App, theme: &Theme) {
         .split(area);
 
     top_bar(f, rows[0], app, theme);
-
-    let body = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(nav_width(app)), Constraint::Min(0)])
-        .split(rows[1]);
-
-    nav(f, body[0], app, theme);
-    main_pane(f, body[1], app, theme);
-    status_or_command(f, rows[2], app, theme);
+    strip_groups(f, rows[1], app, theme);
+    strip_lenses(f, rows[2], app, theme);
+    main_pane(f, rows[3], app, theme);
+    status_or_command(f, rows[4], app, theme);
 
     if app.help {
         help_overlay(f, area, app, theme);
@@ -131,71 +129,81 @@ fn top_bar(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     );
 }
 
-/// Columns the nav takes: full labels, or (`\\`) number and glyph only.
-fn nav_width(app: &App) -> u16 {
-    if app.compact_nav {
-        6
-    } else {
-        26
+/// The nav groups, the active one highlighted.
+fn strip_groups(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
+    let active = app.current_lens().group;
+    let mut spans = vec![Span::raw(" ")];
+    for group in lenses::groups() {
+        let style = if group == active {
+            Style::default()
+                .fg(theme.base)
+                .bg(theme.mauve)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.subtext)
+        };
+        spans.push(Span::styled(format!(" {group} "), style));
+        spans.push(Span::raw(" "));
     }
+    f.render_widget(
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(theme.mantle)),
+        area,
+    );
 }
 
-fn nav(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
-    let block = Block::default()
-        .borders(Borders::RIGHT)
-        .border_style(Style::default().fg(theme.surface0));
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-
-    let mut lines: Vec<Line> = Vec::new();
+/// The active group's lenses, numbered for `1`–`9`. When they are wider
+/// than the row, leading lenses give way until the active one fits, and a
+/// `‹` / `›` marks each clipped edge.
+fn strip_lenses(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     let all = lenses::lenses();
-    for (i, l) in all.iter().enumerate() {
-        let new_group = i == 0 || all[i - 1].group != l.group;
-        if new_group {
-            // The compact nav marks a group with a rule instead of its name.
-            let header = if app.compact_nav {
-                Span::styled("──", Style::default().fg(theme.surface1))
+    let members = lenses::group_members(app.current_lens().group);
+    let items: Vec<Span> = members
+        .iter()
+        .enumerate()
+        .map(|(n, &i)| {
+            let l = &all[i];
+            let text = format!(" {} {} {} ", n + 1, l.glyph, l.label);
+            let style = if i == app.lens {
+                Style::default()
+                    .fg(theme.text)
+                    .bg(theme.surface0)
+                    .add_modifier(Modifier::BOLD)
             } else {
-                Span::styled(
-                    l.group,
-                    Style::default()
-                        .fg(theme.overlay0)
-                        .add_modifier(Modifier::DIM),
-                )
+                Style::default().fg(theme.subtext)
             };
-            lines.push(Line::from(header));
-        }
-        let active = i == app.lens;
-        let num = if i < 9 {
-            (b'1' + i as u8) as char
-        } else {
-            '·'
-        };
-        let label_color = if active { theme.text } else { theme.subtext };
-        let glyph_color = if active { theme.blue } else { theme.lavender };
-        let num_style = Style::default().fg(if active { theme.blue } else { theme.overlay0 });
-        if app.compact_nav {
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!("{}{num}", if active { "▸" } else { " " }),
-                    num_style,
-                ),
-                Span::styled(l.glyph, Style::default().fg(glyph_color)),
-            ]));
-            continue;
-        }
-        let prefix = if active { "▸ " } else { "  " };
-        lines.push(Line::from(vec![
-            Span::styled(format!("{prefix}{num} "), num_style),
-            Span::styled(format!("{} ", l.glyph), Style::default().fg(glyph_color)),
-            Span::styled(l.label, Style::default().fg(label_color)),
-            Span::styled(
-                if l.tabs.is_empty() { "" } else { " ⋯" },
-                Style::default().fg(theme.overlay0),
-            ),
-        ]));
+            Span::styled(text, style)
+        })
+        .collect();
+    let active = members.iter().position(|&i| i == app.lens).unwrap_or(0);
+    let width = usize::from(area.width);
+    let span_w = |range: &[Span]| range.iter().map(Span::width).sum::<usize>();
+    // Room for the marks either side.
+    const MARK: usize = 2;
+    let mut start = 0;
+    while start < active && MARK + span_w(&items[start..=active]) + MARK > width {
+        start += 1;
     }
-    f.render_widget(Paragraph::new(lines), inner);
+    let mut end = start;
+    while end < items.len() {
+        let more = end + 1 < items.len();
+        let reserve = if more { MARK } else { 0 };
+        if MARK + span_w(&items[start..=end]) + reserve > width && end > active {
+            break;
+        }
+        end += 1;
+    }
+    let mut spans = vec![Span::styled(
+        if start > 0 { "‹ " } else { "  " },
+        Style::default().fg(theme.overlay0),
+    )];
+    spans.extend(items[start..end].iter().cloned());
+    if end < items.len() {
+        spans.push(Span::styled(" ›", Style::default().fg(theme.overlay0)));
+    }
+    f.render_widget(
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(theme.mantle)),
+        area,
+    );
 }
 
 fn main_pane(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
@@ -513,9 +521,8 @@ const HELP_KEY_COL: usize = 16;
 fn help_overlay(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     let global = [
         ("j / k  ·  ↑ ↓", "move selection (nav or pane)"),
-        ("1 … 9", "jump straight to a lens"),
-        ("{ / }", "previous / next nav group"),
-        ("\\", "collapse / expand the nav"),
+        ("1 … 9", "lens in the current group"),
+        ("{ / }", "previous / next group"),
         ("Tab", "toggle focus: nav ⇄ pane"),
         ("[ / ]", "switch sub-tabs (RDAP)"),
         ("↵ / l", "enter the pane · run Subdomains / Takeover"),
@@ -587,13 +594,31 @@ mod tests {
     }
 
     #[test]
-    fn compact_nav_gives_the_pane_the_width() {
+    fn strip_shows_groups_and_the_active_groups_lenses() {
         let mut app = App::new(None);
-        app.compact_nav = true;
-        let s = render_lines(100, 30, |f| view(f, &app, app.theme()));
-        assert!(!s.contains("WHOIS"), "labels are hidden: {s}");
-        let first = s.lines().nth(2).unwrap_or_default();
-        assert!(first.starts_with("▸1◈"), "{s}");
+        app.lens = LensKey::Dnssec.index();
+        let s = render_lines(140, 30, |f| view(f, &app, app.theme()));
+        let rows: Vec<&str> = s.lines().collect();
+        assert!(
+            rows[1].contains("LOOKUP") && rows[1].contains("POWER"),
+            "{s}"
+        );
+        assert!(
+            rows[2].contains("1 ≣ Records") && rows[2].contains("2 ◑ DNSSEC"),
+            "{s}"
+        );
+        assert!(!rows[2].contains("WHOIS"), "{s}");
+        // No sidebar: the lens (here its idle hint) starts at column 0.
+        assert!(rows[3].starts_with("press /"), "{s}");
+    }
+
+    #[test]
+    fn a_narrow_strip_keeps_the_active_lens_visible() {
+        let mut app = App::new(None);
+        app.lens = LensKey::Follow.index();
+        let s = render_lines(40, 20, |f| view(f, &app, app.theme()));
+        let row = s.lines().nth(2).unwrap_or_default();
+        assert!(row.contains("Follow") && row.starts_with('‹'), "{s}");
     }
 
     #[test]
