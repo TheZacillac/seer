@@ -83,7 +83,7 @@ def test_precheck_and_work_share_one_deadline(monkeypatch, client):
 
     monkeypatch.setattr(seer, "validate_public_host", _slow_validate, raising=False)
     monkeypatch.setattr(seer, "status", _slow_status, raising=False)
-    resp = client.get("/status/example.com")
+    resp = client.get("/status/93.184.215.14")  # an IP literal is pre-checked
     assert resp.status_code == 504, resp.text
 
 
