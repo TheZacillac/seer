@@ -165,6 +165,10 @@ pub fn wrap_hard(text: &str, width: u16) -> Vec<String> {
                 }
                 None => push(&mut lines, &mut line),
             }
+            // The carried word plus this character may still not fit.
+            if col(&line) + w > max && !line.is_empty() {
+                push(&mut lines, &mut line);
+            }
         }
         // A continuation line does not start with the spaces it broke at.
         if !(line.is_empty() && c == ' ' && !lines.is_empty()) {
@@ -249,6 +253,18 @@ mod tests {
         assert!(wrap_hard("", 5).is_empty());
         // Width 0 must not loop forever: treated as 1.
         assert_eq!(wrap_hard("ab", 0), ["a", "b"]);
+    }
+
+    /// The word carried to a new line plus a double-width character can
+    /// still be too wide: it must break again, never overflow the width.
+    #[test]
+    fn wrap_hard_breaks_again_after_carrying_a_word() {
+        let got = wrap_hard(" ab漢", 3);
+        assert!(
+            got.iter().all(|l| Span::raw(l.as_str()).width() <= 3),
+            "{got:?}"
+        );
+        assert_eq!(got.concat(), "ab漢");
     }
 
     #[test]
