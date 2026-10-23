@@ -1,45 +1,32 @@
 //! History lens — selectable table of past lookups; while focused, the
 //! selected entry's full timestamp, registrar and expiry show beneath it.
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::Constraint;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Row, Table};
-use ratatui::Frame;
+use ratatui::widgets::Row;
 use seer_core::output::sanitize_line;
 
 use crate::tui::action::LensData;
 use crate::tui::theme::Theme;
-use crate::tui::widgets::inspector::{self, Field};
-use crate::tui::widgets::{or_dash, panel, row_style, scroll_to, stack, Band};
+use crate::tui::widgets::inspector::Field;
+use crate::tui::widgets::or_dash;
+use crate::tui::widgets::page::{Block, Detail, Page, TableBlock};
 
 /// `filter` is the active in-lens `/`-filter; rows are filtered by reference
 /// (see `filter::history_rows`) so no entry is cloned per frame.
-pub fn render(
-    f: &mut Frame,
-    area: Rect,
+pub fn page(
     theme: &Theme,
     data: &LensData,
     filter: &str,
     focused: bool,
     sel: usize,
-) {
+) -> Option<Page> {
     let LensData::History(entries) = data else {
-        return;
+        return None;
     };
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(1)])
-        .split(area);
-
-    let inner = panel::render(f, chunks[0], theme, "Lookup History", theme.teal, focused);
-
-    let header = Row::new(["WHEN", "DOMAIN", "SOURCE", "REGISTRAR"])
-        .style(Style::default().fg(theme.overlay0));
-
     let rows = crate::tui::filter::history_rows(entries, filter)
-        .enumerate()
-        .map(|(i, e)| {
+        .map(|e| {
             let when = e.timestamp.format("%Y-%m-%d %H:%M").to_string();
             let source = e.result.protocol().unwrap_or("—");
             let registrar = sanitize_line(&or_dash(e.result.registrar()));
@@ -49,27 +36,16 @@ pub fn render(
                 source.to_string(),
                 registrar,
             ])
-            .style(row_style(theme, focused && i == sel))
-        });
+        })
+        .collect();
 
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(17),
-            Constraint::Percentage(30),
-            Constraint::Length(6),
-            Constraint::Percentage(40),
-        ],
-    )
-    .header(header)
-    .column_spacing(1);
     // The detail follows the visible (filtered) row the table highlights.
     let detail = focused
         .then(|| crate::tui::filter::history_rows(entries, filter).nth(sel))
         .flatten()
-        .map(|e| {
+        .map_or(Detail::None, |e| {
             let (expires, registrar) = e.result.expiration_info();
-            let fields = [
+            Detail::Fields(vec![
                 Field::new("domain", e.domain.clone()),
                 Field::new(
                     "looked up",
@@ -81,40 +57,50 @@ pub fn render(
                     "expires",
                     or_dash(expires.map(|d| d.format("%Y-%m-%d").to_string())),
                 ),
-            ];
-            inspector::lines(theme, &fields, inner.width)
-        })
-        .unwrap_or_default();
-    let rows = |n: usize| u16::try_from(n).unwrap_or(u16::MAX);
-    let n = crate::tui::filter::history_rows(entries, filter).count();
-    // The table keeps its header and a few rows; the detail takes the rest.
-    let mut layout = vec![Band::shrinking(
-        rows(n + 1),
-        rows(1 + n.min(inspector::MIN_ROWS)),
-    )];
-    if !detail.is_empty() {
-        layout.push(inspector::band(&detail));
-    }
-    let bands = stack(inner, &layout);
-    let mut state = scroll_to(focused.then_some(sel));
-    f.render_stateful_widget(table, bands[0], &mut state);
-    if let Some(band) = bands.get(1) {
-        inspector::draw(f, *band, theme, detail);
-    }
-
-    // Hint line
-    f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            "↵ replay · c clear all (press twice)",
-            Style::default().fg(theme.overlay0),
-        ))),
-        chunks[1],
-    );
+            ])
+        });
+    let table = TableBlock::new(
+        vec!["WHEN", "DOMAIN", "SOURCE", "REGISTRAR"],
+        vec![
+            Constraint::Length(17),
+            Constraint::Percentage(30),
+            Constraint::Length(6),
+            Constraint::Percentage(40),
+        ],
+        rows,
+    )
+    .selected(focused.then_some(sel))
+    .detail(detail);
+    Some(
+        Page::new("Lookup History", theme.teal)
+            .push(Block::Table(table))
+            .push(Block::Gap)
+            .push(Block::Lines(vec![Line::from(Span::styled(
+                "↵ replay · c clear all (press twice)",
+                Style::default().fg(theme.overlay0),
+            ))])),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::widgets::page;
+
+    /// Draw this lens's page as the TUI does.
+    fn render(
+        f: &mut ratatui::Frame,
+        area: ratatui::layout::Rect,
+        theme: &Theme,
+        data: &LensData,
+        filter: &str,
+        focused: bool,
+        sel: usize,
+    ) {
+        if let Some(p) = page(theme, data, filter, focused, sel) {
+            page::draw(f, area, theme, p, focused);
+        }
+    }
     use crate::tui::test_util::{render_lines, render_text};
 
     fn entry(domain: &str) -> seer_core::HistoryEntry {

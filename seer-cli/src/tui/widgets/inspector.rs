@@ -10,7 +10,7 @@ use ratatui::Frame;
 use seer_core::output::sanitize_line;
 
 use crate::tui::theme::Theme;
-use crate::tui::widgets::{wrap_hard, Band};
+use crate::tui::widgets::wrap_hard;
 
 /// The fewest rows a band cut short keeps: a table this many rows under its
 /// header, a detail band this many lines.
@@ -46,7 +46,7 @@ impl Field {
     }
 }
 
-/// `fields` as lines `width` columns wide, ready to size a band with [`band`].
+/// `fields` as lines `width` columns wide.
 pub fn lines(theme: &Theme, fields: &[Field], width: u16) -> Vec<Line<'static>> {
     let label_w = fields
         .iter()
@@ -86,13 +86,6 @@ pub fn lines(theme: &Theme, fields: &[Field], width: u16) -> Vec<Line<'static>> 
         }
     }
     out
-}
-
-/// The band `lines` asks for in a [`super::stack`]: all its rows, down to
-/// [`MIN_ROWS`] when space is short.
-pub fn band(lines: &[Line]) -> Band {
-    let rows = |n: usize| u16::try_from(n).unwrap_or(u16::MAX);
-    Band::shrinking(rows(lines.len()), rows(lines.len().min(MIN_ROWS)))
 }
 
 /// Draw `lines` into `area`, cut short with a [`more`] mark when they do

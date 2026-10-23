@@ -1,25 +1,26 @@
 //! Headers lens — HTTP security-header grade, per-header verdicts, cookie
 //! flags, and advisories.
 //!
-//! The report has four distinct parts and a fixed nine-header spine, so the
-//! layout is vertical bands rather than a table: the grade gauge leads (it is
-//! the headline number), the per-header verdicts fill the middle as a KV list
-//! (selectable once focused, with the selected header's raw value and the
-//! reason for its verdict beneath it), and cookies/advisories take what is
-//! left. Bands with nothing to show
+//! The grade gauge leads (it is the headline number), then the per-header
+//! verdicts as a two-column table (selectable once focused, with the
+//! selected header's raw value and the reason for its verdict beneath it),
+//! then cookies and the advisories, which give rows up first when short. Bands with nothing to show
 //! collapse to zero height instead of leaving a labeled empty box.
-use ratatui::layout::Rect;
+use ratatui::layout::Constraint;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
-use ratatui::Frame;
+use ratatui::widgets::Row;
 use seer_core::output::sanitize_line;
 use seer_core::HeaderVerdict;
 
 use crate::tui::action::LensData;
 use crate::tui::theme::Theme;
-use crate::tui::widgets::inspector::{self, Field};
-use crate::tui::widgets::{dot, gauge, kv, panel, row_style, stack, Band};
+use crate::tui::widgets::inspector::Field;
+use crate::tui::widgets::page::{Block, Detail, Page, TableBlock};
+use crate::tui::widgets::{dot, gauge};
+
+/// Columns of the grade gauge.
+const GAUGE: u16 = 30;
 
 /// Tone for a verdict, using the shared `Theme::tone` vocabulary so these
 /// verdicts read the same as every other status in the TUI.
@@ -41,150 +42,133 @@ fn grade_tone(grade: &str) -> &'static str {
     }
 }
 
-pub fn render(
-    f: &mut Frame,
-    area: Rect,
-    theme: &Theme,
-    data: &LensData,
-    focused: bool,
-    sel: usize,
-) {
-    let LensData::Headers(h) = data else { return };
+pub fn page(theme: &Theme, data: &LensData, focused: bool, sel: usize) -> Option<Page> {
+    let LensData::Headers(h) = data else {
+        return None;
+    };
 
-    let title = format!("HTTP Headers · {} · {}/100", h.grade, h.score);
-    let inner = panel::render(f, area, theme, &title, theme.mauve, focused);
+    // Grade gauge — score is already 0–100.
+    let label = format!("{} ({}/100)", h.grade, h.score);
+    let summary = vec![
+        gauge::line(
+            theme,
+            f64::from(h.score) / 100.0,
+            GAUGE,
+            theme.tone(grade_tone(&h.grade)),
+            Some(&label),
+        ),
+        Line::from(Span::styled(
+            format!("{}  [HTTP {}]", sanitize_line(&h.url), h.status),
+            Style::default().fg(theme.subtext),
+        )),
+    ];
 
+    // Per-header verdicts: the header name, then the verdict word colored by
+    // severity, so the absent headers stand out among the strict ones.
+    let names: Vec<String> = h.headers.iter().map(|f| sanitize_line(&f.header)).collect();
+    let name_w = names
+        .iter()
+        .map(|n| Span::raw(n.as_str()).width())
+        .max()
+        .unwrap_or(0);
+    let rows = h
+        .headers
+        .iter()
+        .zip(names)
+        .map(|(finding, name)| {
+            Row::new(vec![
+                Span::styled(name, Style::default().fg(theme.mauve)),
+                Span::styled(
+                    finding.verdict.as_str(),
+                    Style::default().fg(theme.tone(verdict_tone(finding.verdict))),
+                ),
+            ])
+        })
+        .collect();
     let detail = focused
         .then(|| h.headers.get(sel))
         .flatten()
-        .map(|finding| {
-            let fields = [
+        .map_or(Detail::None, |finding| {
+            Detail::Fields(vec![
                 Field::new("header", finding.header.clone()),
                 Field::new("verdict", finding.verdict.as_str()).tone(verdict_tone(finding.verdict)),
                 Field::new("value", finding.value.clone().unwrap_or_default()),
                 Field::new("note", finding.note.clone().unwrap_or_default()),
-            ];
-            inspector::lines(theme, &fields, inner.width)
-        })
-        .unwrap_or_default();
+            ])
+        });
+    // The longest name (or the column title), a space, then the verdict.
+    let width = u16::try_from(name_w.max("HEADER".len()) + 1).unwrap_or(u16::MAX);
+    let table = TableBlock::new(
+        vec!["HEADER", "VERDICT"],
+        vec![Constraint::Length(width), Constraint::Min(0)],
+        rows,
+    )
+    .selected(focused.then_some(sel))
+    .detail(detail);
 
-    // Stacked like the other lenses: when the bands do not all fit, the
-    // verdicts give up rows first (scrolling to the selection), then the
-    // detail, so the selected row and its value stay in view. Advisories get
-    // what is left, so a long list scrolls off rather than squeezing the
-    // verdicts it is explaining.
-    let rows = |n: usize| u16::try_from(n).unwrap_or(u16::MAX);
-    let n = h.headers.len();
-    let mut layout = vec![
-        Band::fixed(2),
-        Band::shrinking(rows(n), rows(n.min(inspector::MIN_ROWS))),
-    ];
-    if !detail.is_empty() {
-        layout.push(inspector::band(&detail));
-    }
-    if !h.cookies.is_empty() {
-        layout.push(Band::fixed(1));
-    }
-    layout.push(Band::shrinking(rows(h.notes.len().max(1)), 1));
-    let mut bands = stack(inner, &layout).into_iter();
-    let mut next_band = || bands.next().unwrap_or_default();
-    let gauge_area = next_band();
-    let verdict_area = next_band();
-
-    // Grade gauge — score is already 0–100.
-    let ratio = f64::from(h.score) / 100.0;
-    let width = gauge_area.width.saturating_sub(20).clamp(10, 40);
-    let label = format!("{} ({}/100)", h.grade, h.score);
-    f.render_widget(
-        Paragraph::new(vec![
-            gauge::line(
-                theme,
-                ratio,
-                width,
-                theme.tone(grade_tone(&h.grade)),
-                Some(&label),
-            ),
-            Line::from(Span::styled(
-                format!("{}  [HTTP {}]", sanitize_line(&h.url), h.status),
-                Style::default().fg(theme.subtext),
-            )),
-        ]),
-        gauge_area,
-    );
-
-    // Per-header verdicts. The value carries the verdict word; the header name
-    // is the key, so this reads as a checklist top to bottom.
-    //
-    // Built from `kv`'s gutter and leaders rather than `kv::render`: that
-    // paints every value one color, and colouring each verdict by severity
-    // is the whole point of this band — a column of same-colored words
-    // would bury the absent headers among the strict ones.
-    // Sanitized once, so the gutter is measured on the names as drawn.
-    let names: Vec<String> = h.headers.iter().map(|f| sanitize_line(&f.header)).collect();
-    let gutter = kv::gutter(names.iter().map(String::as_str), verdict_area.width);
-    let lines: Vec<Line> = h
-        .headers
-        .iter()
-        .zip(&names)
-        .enumerate()
-        .map(|(i, (finding, header))| {
-            let mut spans = kv::leader(theme, header, theme.mauve, gutter).to_vec();
-            spans.push(Span::styled(
-                finding.verdict.as_str(),
-                Style::default().fg(theme.tone(verdict_tone(finding.verdict))),
-            ));
-            Line::from(spans).style(row_style(theme, focused && i == sel))
-        })
-        .collect();
-    // Scroll the verdicts so a selection past the band's last row shows.
-    let visible = usize::from(verdict_area.height);
-    let top = if focused && sel >= visible {
-        sel + 1 - visible
-    } else {
-        0
-    };
-    f.render_widget(Paragraph::new(lines).scroll((rows(top), 0)), verdict_area);
-    if !detail.is_empty() {
-        inspector::draw(f, next_band(), theme, detail);
-    }
-
-    if !h.cookies.is_empty() {
+    let cookies = (!h.cookies.is_empty()).then(|| {
         let flawed = h.cookies.iter().filter(|c| !c.issues.is_empty()).count();
         let tone = if flawed == 0 { "ok" } else { "warn" };
-        f.render_widget(
-            Paragraph::new(dot::line(
-                theme,
-                tone,
-                format!("{} cookie(s), {} with issues", h.cookies.len(), flawed),
-            )),
-            next_band(),
-        );
-    }
-
-    let notes_area = next_band();
-    if !h.notes.is_empty() {
-        let lines: Vec<Line> = h
-            .notes
-            .iter()
-            .map(|n| dot::line(theme, "warn", n.clone()))
-            .collect();
-        f.render_widget(Paragraph::new(lines), notes_area);
+        dot::line(
+            theme,
+            tone,
+            format!("{} cookie(s), {} with issues", h.cookies.len(), flawed),
+        )
+    });
+    // Advisories give rows up first, so a long list never squeezes the
+    // verdicts it explains.
+    let advisories = if h.notes.is_empty() {
+        Block::Lines(vec![Line::from(Span::styled(
+            "no advisories — every graded header is set",
+            Style::default()
+                .fg(theme.green)
+                .add_modifier(Modifier::ITALIC),
+        ))])
     } else {
-        f.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                "no advisories — every graded header is set",
-                Style::default()
-                    .fg(theme.green)
-                    .add_modifier(Modifier::ITALIC),
-            ))),
-            notes_area,
-        );
-    }
+        Block::Scroll {
+            lines: h
+                .notes
+                .iter()
+                .map(|n| dot::line(theme, "warn", n.clone()))
+                .collect(),
+            offset: 0,
+            unit: "advisories",
+        }
+    };
+    Some(
+        Page::new(
+            format!("HTTP Headers · {} · {}/100", h.grade, h.score),
+            theme.mauve,
+        )
+        .push(Block::Lines(summary))
+        .push(Block::Gap)
+        .push(Block::Table(table))
+        .push(Block::Gap)
+        .push_if(cookies.is_some(), || {
+            Block::Lines(cookies.into_iter().collect())
+        })
+        .push(advisories),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::widgets::page;
+
+    /// Draw this lens's page as the TUI does.
+    fn render(
+        f: &mut ratatui::Frame,
+        area: ratatui::layout::Rect,
+        theme: &Theme,
+        data: &LensData,
+        focused: bool,
+        sel: usize,
+    ) {
+        if let Some(p) = page(theme, data, focused, sel) {
+            page::draw(f, area, theme, p, focused);
+        }
+    }
     use crate::tui::test_util::{render_buffer, render_lines};
     use seer_core::{CookieFinding, Disclosure, HeaderFinding, HeaderReport};
 
@@ -246,19 +230,19 @@ mod tests {
         r.headers[8].value = Some("a ".repeat(300));
         let data = LensData::Headers(Box::new(r));
         let s = render_lines(60, 18, |f| render(f, f.area(), &theme, &data, true, 8));
-        assert!(s.contains("x-header-8 ·"), "selected row must show: {s}");
+        assert!(s.contains("x-header-8 "), "selected row must show: {s}");
         assert!(s.contains("more lines"), "the detail is cut short: {s}");
     }
 
-    /// The gutter is measured on the name as drawn: an escape sequence
-    /// stripped from a header name must not widen the leaders.
+    /// A header name is remote text: an escape sequence in it is stripped,
+    /// and the name column is sized to the name as drawn.
     #[test]
-    fn gutter_is_measured_on_sanitized_header_names() {
+    fn header_names_are_sanitized_and_sized_as_drawn() {
         let mut r = report();
         r.headers = vec![finding("x-\u{1b}[2Jframe", HeaderVerdict::Present)];
         let s = render_to_text(&LensData::Headers(Box::new(r)), 80, 16);
-        assert!(s.contains("x-frame ·· "), "{s}");
-        assert!(!s.contains("x-frame ···"), "{s}");
+        assert!(!s.contains('\u{1b}'), "{s}");
+        assert!(s.contains("x-frame  present"), "{s}");
     }
 
     #[test]
@@ -282,13 +266,13 @@ mod tests {
         assert!(s.contains('C'), "grade must be visible: {s}");
     }
 
-    /// The verdict word on `header`'s dot-leader row. Checking the row itself
-    /// matters: a bare `contains("strict")` is always satisfied by the header
-    /// name "strict-transport-security".
+    /// The verdict word on `header`'s row. Checking the row itself matters:
+    /// a bare `contains("strict")` is always satisfied by the header name
+    /// "strict-transport-security".
     fn verdict_on_row(s: &str, header: &str) -> String {
         let row = s
             .lines()
-            .find(|l| l.contains(&format!("{header} ·")))
+            .find(|l| l.contains(&format!("{header} ")))
             .unwrap_or_else(|| panic!("no verdict row for {header}: {s}"));
         row.trim_end()
             .trim_end_matches('│')

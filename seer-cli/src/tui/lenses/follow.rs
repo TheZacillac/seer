@@ -1,23 +1,17 @@
 //! Follow lens — live DNS monitor: progress gauge + change log table.
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::Constraint;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Row, Table};
-use ratatui::Frame;
+use ratatui::widgets::Row;
 use seer_core::output::sanitize_line;
 
 use crate::tui::app::SPIN;
 use crate::tui::panes::FollowState;
 use crate::tui::theme::Theme;
-use crate::tui::widgets::{dot, gauge, or_dash, panel};
+use crate::tui::widgets::page::{Block, Page, TableBlock};
+use crate::tui::widgets::{dot, gauge, or_dash};
 
-pub fn render(f: &mut Frame, area: Rect, theme: &Theme, follow: &FollowState, spin: usize) {
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(5), Constraint::Min(0)])
-        .split(area);
-
-    // ── top panel: progress gauge + status ──────────────────────────────────
+pub fn page(theme: &Theme, follow: &FollowState, spin: usize) -> Page {
     // Title and gauge describe the run on screen; the editable settings (which
     // only apply to the next run) are shown on the hints line instead, so
     // editing `n` after a run can't produce e.g. "20/5 done".
@@ -26,8 +20,7 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, follow: &FollowState, sp
         .last_run
         .map(|(_, secs)| secs)
         .unwrap_or(follow.interval_secs);
-    let top_title = format!("Follow  ·  {interval}s interval  ·  {total} checks");
-    let top_inner = panel::render(f, rows[0], theme, &top_title, theme.teal, false);
+    let title = format!("Follow  ·  {interval}s interval  ·  {total} checks");
 
     let ratio = if total > 0 {
         (follow.log.len() as f64 / total as f64).min(1.0)
@@ -36,7 +29,6 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, follow: &FollowState, sp
     };
     let gauge_label = format!("{}/{} done", follow.log.len(), total);
     let gauge_line = gauge::line(theme, ratio, 30, theme.teal, Some(&gauge_label));
-
     let spin_text = if follow.running {
         format!("  {} polling…", SPIN[spin % SPIN.len()])
     } else {
@@ -50,7 +42,6 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, follow: &FollowState, sp
             theme.overlay0
         }),
     )]);
-
     let hints_line = Line::from(vec![Span::styled(
         format!(
             "s start  ·  i interval ({}s)  ·  n count ({})  ·  x stop",
@@ -59,74 +50,81 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, follow: &FollowState, sp
         Style::default().fg(theme.overlay0),
     )]);
 
-    let top_para = Paragraph::new(vec![gauge_line, status_line, hints_line]);
-    f.render_widget(top_para, top_inner);
-
-    // ── bottom panel: change log table ──────────────────────────────────────
-    let log_inner = panel::render(f, rows[1], theme, "Change Log", theme.teal, false);
-
-    if follow.log.is_empty() {
-        f.render_widget(
-            Paragraph::new(Line::from(vec![Span::styled(
-                "waiting for first check…",
-                Style::default()
-                    .fg(theme.overlay0)
-                    .add_modifier(Modifier::ITALIC),
-            )])),
-            log_inner,
-        );
-        return;
-    }
-
-    let header =
-        Row::new(["#", "TIME", "A RECORD", "Δ"]).style(Style::default().fg(theme.overlay0));
-
-    let body = follow.log.iter().map(|it| {
-        // An errored iteration (NXDOMAIN/timeout/resolver failure) has empty
-        // records and changed=false; without inspecting it.error it would paint
-        // identically to a healthy no-A-record check. Surface the failure.
-        let (a_record, delta) = if !it.success() {
-            let msg = it.error.as_deref().unwrap_or("error");
-            (
-                sanitize_line(msg).chars().take(40).collect::<String>(),
-                dot::line(theme, "fail", "ERROR"),
+    let log = Page::new("Change Log", theme.teal);
+    let log = if follow.log.is_empty() {
+        log.push(Block::Lines(vec![Line::from(vec![Span::styled(
+            "waiting for first check…",
+            Style::default()
+                .fg(theme.overlay0)
+                .add_modifier(Modifier::ITALIC),
+        )])]))
+    } else {
+        let rows = follow
+            .log
+            .iter()
+            .map(|it| {
+                // An errored iteration (NXDOMAIN/timeout/resolver failure) has
+                // empty records and changed=false; without inspecting it.error
+                // it would paint identically to a healthy no-A-record check.
+                // Surface the failure.
+                let (a_record, delta) = if !it.success() {
+                    let msg = it.error.as_deref().unwrap_or("error");
+                    (
+                        sanitize_line(msg).chars().take(40).collect::<String>(),
+                        dot::line(theme, "fail", "ERROR"),
+                    )
+                } else {
+                    let a = sanitize_line(&or_dash(it.records.first().map(|r| r.format_short())));
+                    let d = if it.changed {
+                        dot::line(theme, "warn", "CHANGED")
+                    } else {
+                        dot::line(theme, "ok", "—")
+                    };
+                    (a, d)
+                };
+                Row::new(vec![
+                    Line::from(it.iteration.to_string()),
+                    Line::from(it.timestamp.format("%H:%M:%S").to_string()),
+                    Line::from(a_record),
+                    delta,
+                ])
+            })
+            .collect();
+        log.push(Block::Table(
+            TableBlock::new(
+                vec!["#", "TIME", "A RECORD", "Δ"],
+                vec![
+                    Constraint::Length(4),
+                    Constraint::Length(10),
+                    Constraint::Percentage(50),
+                    Constraint::Min(10),
+                ],
+                rows,
             )
-        } else {
-            let a = sanitize_line(&or_dash(it.records.first().map(|r| r.format_short())));
-            let d = if it.changed {
-                dot::line(theme, "warn", "CHANGED")
-            } else {
-                dot::line(theme, "ok", "—")
-            };
-            (a, d)
-        };
-        Row::new(vec![
-            Line::from(it.iteration.to_string()),
-            Line::from(it.timestamp.format("%H:%M:%S").to_string()),
-            Line::from(a_record),
-            delta,
-        ])
-        .style(Style::default().fg(theme.text))
-    });
-
-    let table = Table::new(
-        body,
-        [
-            Constraint::Length(4),
-            Constraint::Length(10),
-            Constraint::Percentage(50),
-            Constraint::Min(10),
-        ],
-    )
-    .header(header)
-    .column_spacing(1);
-
-    f.render_widget(table, log_inner);
+            .unit("checks"),
+        ))
+    };
+    Page::new(title, theme.teal)
+        .push(Block::Lines(vec![gauge_line, status_line, hints_line]))
+        .push(Block::Gap)
+        .push(Block::Panel(log))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::widgets::page;
+
+    /// Draw this lens's page as the TUI does.
+    fn render(
+        f: &mut ratatui::Frame,
+        area: ratatui::layout::Rect,
+        theme: &Theme,
+        follow: &FollowState,
+        spin: usize,
+    ) {
+        page::draw(f, area, theme, page(theme, follow, spin), false);
+    }
     use crate::tui::test_util::render_text;
     use chrono::Utc;
     use seer_core::dns::FollowIteration;

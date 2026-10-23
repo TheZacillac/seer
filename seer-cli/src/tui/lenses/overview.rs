@@ -1,9 +1,6 @@
 //! Overview lens — merged registration summary from the smart lookup.
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
-use ratatui::Frame;
 use seer_core::output::sanitize_line;
 
 use seer_core::output::{availability_label, Emphasis};
@@ -11,17 +8,13 @@ use seer_core::LookupResult;
 
 use crate::tui::action::LensData;
 use crate::tui::theme::Theme;
-use crate::tui::widgets::{kv, or_dash, panel};
+use crate::tui::widgets::or_dash;
+use crate::tui::widgets::page::{Block, Page};
 
-pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
+pub fn page(theme: &Theme, data: &LensData) -> Option<Page> {
     let LensData::Overview(result) = data else {
-        return;
+        return None;
     };
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(2), Constraint::Min(0)])
-        .split(area);
 
     // Mirror the core human formatter: `Available` is a fallback variant
     // carrying a graded verdict, not proof of availability — a dns_present
@@ -40,22 +33,17 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
             (label, color)
         }
     };
-    f.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(
-                sanitize_line(&result.domain_name().unwrap_or_default()),
-                Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("  "),
-            Span::styled(
-                source.0,
-                Style::default().fg(source.1).add_modifier(Modifier::BOLD),
-            ),
-        ])),
-        chunks[0],
-    );
-
-    let inner = panel::render(f, chunks[1], theme, "Registration", theme.blue, false);
+    let headline = Line::from(vec![
+        Span::styled(
+            sanitize_line(&result.domain_name().unwrap_or_default()),
+            Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            source.0,
+            Style::default().fg(source.1).add_modifier(Modifier::BOLD),
+        ),
+    ]);
 
     let (expiry, registrar) = result.expiration_info();
     // The header chip shows the verdict for Available results; the source row
@@ -74,12 +62,30 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
         rows.push(("method", data.method.clone()));
         rows.push(("confidence", data.confidence.clone()));
     }
-    kv::render(f, inner, theme, theme.blue, &rows);
+    Some(
+        Page::new("Overview", theme.blue)
+            .push(Block::Lines(vec![headline]))
+            .push(Block::Gap)
+            .push(Block::Panel(Page::new("Registration", theme.blue).push(
+                Block::Kv {
+                    key_color: theme.blue,
+                    rows,
+                },
+            ))),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::widgets::page;
+
+    /// Draw this lens's page as the TUI does.
+    fn render(f: &mut ratatui::Frame, area: ratatui::layout::Rect, theme: &Theme, data: &LensData) {
+        if let Some(p) = page(theme, data) {
+            page::draw(f, area, theme, p, false);
+        }
+    }
     use crate::tui::test_util::render_lines;
     use seer_core::AvailabilityResult;
 

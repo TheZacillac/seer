@@ -6,19 +6,22 @@
 //! the selection like the Takeover lens, so a long list never hides rows or
 //! the incomplete notice. While focused, the selected finding's evidence and
 //! remediation show beneath it.
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::Constraint;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Row, Table};
-use ratatui::Frame;
+use ratatui::widgets::Row;
 use seer_core::audit::{CategoryState, CheckStatus, Finding, Severity};
 use seer_core::grade::Letter;
 use seer_core::output::sanitize_line;
 
 use crate::tui::action::LensData;
 use crate::tui::theme::Theme;
-use crate::tui::widgets::inspector::{self, Field};
-use crate::tui::widgets::{dot, gauge, panel, row_style, scroll_to, stack, Band};
+use crate::tui::widgets::inspector::Field;
+use crate::tui::widgets::page::{Block, Detail, Page, TableBlock};
+use crate::tui::widgets::{dot, gauge};
+
+/// Columns of the grade gauge.
+const GAUGE: u16 = 30;
 
 /// Letter band → tone: A/A+ pass, B/C partial, D and below fail.
 fn letter_tone(letter: Letter) -> &'static str {
@@ -63,36 +66,20 @@ fn finding_fields(finding: &Finding) -> Vec<Field> {
     fields
 }
 
-pub fn render(
-    f: &mut Frame,
-    area: Rect,
-    theme: &Theme,
-    data: &LensData,
-    focused: bool,
-    sel: usize,
-) {
-    let LensData::Audit(a) = data else { return };
+pub fn page(theme: &Theme, data: &LensData, focused: bool, sel: usize) -> Option<Page> {
+    let LensData::Audit(a) = data else {
+        return None;
+    };
 
     let title = match &a.overall {
         Some(o) => format!("Security Audit · {} · {}/100", o.letter.as_str(), o.score),
         None => "Security Audit · not graded".to_string(),
     };
-    let inner = panel::render(f, area, theme, &title, theme.mauve, focused);
     let skipped = a
         .runs
         .iter()
         .filter(|r| matches!(r.status, CheckStatus::Incomplete { .. }))
         .count();
-    // The incomplete notice lives in the fixed header so overflow in the
-    // findings list can never hide it.
-    let header_rows = 2 + u16::from(!a.complete);
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(header_rows), Constraint::Min(0)])
-        .split(inner);
-
-    let width = chunks[0].width.saturating_sub(20).clamp(10, 40);
-    // Outlives the gauge line, which borrows it.
     let label = a
         .overall
         .as_ref()
@@ -101,7 +88,7 @@ pub fn render(
         Some(o) => gauge::line(
             theme,
             f64::from(o.score) / 100.0,
-            width,
+            GAUGE,
             theme.tone(letter_tone(o.letter)),
             label.as_deref(),
         ),
@@ -128,6 +115,8 @@ pub fn render(
             ]
         })
         .collect();
+    // The incomplete notice is kept whole, so a long findings list can
+    // never hide it.
     let mut header = vec![headline, Line::from(strip)];
     if !a.complete {
         header.push(dot::line(
@@ -136,68 +125,68 @@ pub fn render(
             format!("incomplete: {skipped} check(s) did not finish — see raw view"),
         ));
     }
-    f.render_widget(Paragraph::new(header), chunks[0]);
+    let page = Page::new(title, theme.mauve).push(Block::Lines(header));
 
     if a.findings.is_empty() {
         // "No findings" is only good news when every check ran and graded.
-        if a.complete && a.overall.is_some() {
-            f.render_widget(
-                Paragraph::new(dot::line(theme, "ok", "no findings")),
-                chunks[1],
-            );
-        }
-        return;
+        let good = a.complete && a.overall.is_some();
+        return Some(page.push_if(good, || {
+            Block::Lines(vec![dot::line(theme, "ok", "no findings")])
+        }));
     }
 
-    let rows = a.findings.iter().enumerate().map(|(i, finding)| {
-        let base = row_style(theme, focused && i == sel);
-        Row::new(vec![
-            Span::styled(
-                finding.severity.as_str().to_ascii_uppercase(),
-                base.fg(theme.tone(severity_tone(finding.severity))),
-            ),
-            Span::styled(sanitize_line(&finding.title), base),
-            Span::styled(finding.id, base.fg(theme.subtext)),
-        ])
-        .style(base)
-    });
-    let table = Table::new(
-        rows,
-        [
+    let rows = a
+        .findings
+        .iter()
+        .map(|finding| {
+            Row::new(vec![
+                Span::styled(
+                    finding.severity.as_str().to_ascii_uppercase(),
+                    Style::default().fg(theme.tone(severity_tone(finding.severity))),
+                ),
+                Span::raw(sanitize_line(&finding.title)),
+                Span::styled(finding.id, Style::default().fg(theme.subtext)),
+            ])
+        })
+        .collect();
+    let detail = focused
+        .then(|| a.findings.get(sel))
+        .flatten()
+        .map_or(Detail::None, |finding| {
+            Detail::Fields(finding_fields(finding))
+        });
+    let table = TableBlock::new(
+        vec!["SEVERITY", "FINDING", "CHECK"],
+        vec![
             Constraint::Length(9),
             Constraint::Percentage(55),
             Constraint::Percentage(35),
         ],
+        rows,
     )
-    .header(Row::new(["SEVERITY", "FINDING", "CHECK"]).style(Style::default().fg(theme.overlay0)))
-    .column_spacing(1);
-    let area = chunks[1];
-    let detail = focused
-        .then(|| a.findings.get(sel))
-        .flatten()
-        .map(|finding| inspector::lines(theme, &finding_fields(finding), area.width))
-        .unwrap_or_default();
-    let rows = |n: usize| u16::try_from(n).unwrap_or(u16::MAX);
-    let n = a.findings.len();
-    // The table keeps its header and a few rows; the detail takes the rest.
-    let mut layout = vec![Band::shrinking(
-        rows(n + 1),
-        rows(1 + n.min(inspector::MIN_ROWS)),
-    )];
-    if !detail.is_empty() {
-        layout.push(inspector::band(&detail));
-    }
-    let bands = stack(area, &layout);
-    let mut state = scroll_to(focused.then_some(sel));
-    f.render_stateful_widget(table, bands[0], &mut state);
-    if let Some(band) = bands.get(1) {
-        inspector::draw(f, *band, theme, detail);
-    }
+    .selected(focused.then_some(sel))
+    .detail(detail);
+    Some(page.push(Block::Gap).push(Block::Table(table)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::widgets::page;
+
+    /// Draw this lens's page as the TUI does.
+    fn render(
+        f: &mut ratatui::Frame,
+        area: ratatui::layout::Rect,
+        theme: &Theme,
+        data: &LensData,
+        focused: bool,
+        sel: usize,
+    ) {
+        if let Some(p) = page(theme, data, focused, sel) {
+            page::draw(f, area, theme, p, focused);
+        }
+    }
     use crate::tui::test_util::render_lines;
     use seer_core::audit::{
         AuditReport, Category, CategoryGrade, CategoryState, Finding, OverallGrade, Severity,

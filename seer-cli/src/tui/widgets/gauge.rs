@@ -13,13 +13,13 @@ pub fn filled_cells(ratio: f64, width: u16) -> u16 {
 /// Build a styled gauge line: filled bar + empty bar + optional label.
 /// Track and label colors come from `theme` (matching the dot/chips
 /// convention) so the gauge stays readable under both Frappé and Latte.
-pub fn line<'a>(
+pub fn line(
     theme: &Theme,
     ratio: f64,
     width: u16,
     color: Color,
-    label: Option<&'a str>,
-) -> Line<'a> {
+    label: Option<&str>,
+) -> Line<'static> {
     let f = filled_cells(ratio, width);
     let mut spans = vec![
         Span::styled("█".repeat(f as usize), Style::default().fg(color)),

@@ -1,19 +1,19 @@
 //! Diff lens — always-visible A⇄B input bar + 3-column comparison (FIELD|A|B).
 use std::fmt::Display;
 
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::Constraint;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Row, Table};
-use ratatui::Frame;
+use ratatui::widgets::Row;
 use seer_core::output::sanitize_line;
 
 use crate::tui::action::{LensData, LensState};
 use crate::tui::line_editor::LineEditor;
 use crate::tui::theme::Theme;
-use crate::tui::widgets::{or_dash, panel};
+use crate::tui::widgets::or_dash;
+use crate::tui::widgets::page::{Block, Page, TableBlock};
 
-/// Render the Diff lens. Pure function of its inputs (no `App` coupling):
+/// The Diff lens. Pure function of its inputs (no `App` coupling):
 /// - `domain`  domain A (the `:diff` override, else the session target)
 /// - `b`       committed second domain (B)
 /// - `editing` `Some(editor)` while the B field is being typed
@@ -22,28 +22,14 @@ use crate::tui::widgets::{or_dash, panel};
 ///
 /// Once a comparison is loaded the input bar names the domains that result
 /// is actually for (`domain_a`/`domain_b`), not whatever is configured now.
-#[allow(clippy::too_many_arguments)]
-pub fn render(
-    f: &mut Frame,
-    area: Rect,
+pub fn page(
     theme: &Theme,
     domain: Option<&str>,
     b: &str,
     editing: Option<&LineEditor>,
     focused: bool,
     state: &LensState,
-) {
-    let inner = panel::render(f, area, theme, "Diff", theme.yellow, focused);
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1), // input bar
-            Constraint::Length(1), // hint
-            Constraint::Min(0),    // body
-        ])
-        .split(inner);
-
+) -> Page {
     // ── input bar: A · <domain>   ⇄   B · <value> ────────────────────────────
     let loaded = match state {
         LensState::Loaded(LensData::Diff(d)) => Some(d),
@@ -59,68 +45,52 @@ pub fn render(
         None if !b.is_empty() => (sanitize_line(b), theme.text),
         None => ("[ press e ]".to_string(), theme.overlay0),
     };
-    f.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled("A · ", Style::default().fg(theme.overlay0)),
-            Span::styled(sanitize_line(a), Style::default().fg(theme.text)),
-            Span::styled("   ⇄   ", Style::default().fg(theme.yellow)),
-            Span::styled("B · ", Style::default().fg(theme.overlay0)),
-            Span::styled(b_text, Style::default().fg(b_color)),
-        ])),
-        chunks[0],
-    );
-
+    let bar = Line::from(vec![
+        Span::styled("A · ", Style::default().fg(theme.overlay0)),
+        Span::styled(sanitize_line(a), Style::default().fg(theme.text)),
+        Span::styled("   ⇄   ", Style::default().fg(theme.yellow)),
+        Span::styled("B · ", Style::default().fg(theme.overlay0)),
+        Span::styled(b_text, Style::default().fg(b_color)),
+    ]);
     // ── hint (focus-aware) ───────────────────────────────────────────────────
     let hint = if focused {
         "e edit B · ↵ compare"
     } else {
         "↵ focus pane"
     };
-    f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            hint,
-            Style::default().fg(theme.overlay0),
-        ))),
-        chunks[1],
-    );
+    let page = Page::new("Diff", theme.yellow).push(Block::Lines(vec![
+        bar,
+        Line::from(Span::styled(hint, Style::default().fg(theme.overlay0))),
+    ]));
 
     // ── body by state ────────────────────────────────────────────────────────
+    let line =
+        |text: String, style: Style| Block::Lines(vec![Line::from(Span::styled(text, style))]);
     match state {
-        LensState::Loaded(LensData::Diff(d)) => comparison_table(f, chunks[2], theme, d),
-        LensState::Loading => {
-            f.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    format!("⠋ comparing {a} ⇄ {b}…"),
-                    Style::default().fg(theme.overlay),
-                ))),
-                chunks[2],
-            );
-        }
-        LensState::Error(msg) => {
-            f.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    sanitize_line(msg),
-                    Style::default().fg(theme.red),
-                )))
-                .wrap(ratatui::widgets::Wrap { trim: false }),
-                chunks[2],
-            );
-        }
+        LensState::Loaded(LensData::Diff(d)) => comparison(theme, page, d),
+        LensState::Loading => page.push(line(
+            format!("⠋ comparing {} ⇄ {}…", sanitize_line(a), sanitize_line(b)),
+            Style::default().fg(theme.overlay),
+        )),
+        LensState::Error(msg) => page.push(Block::Note {
+            text: msg.clone(),
+            color: theme.red,
+        }),
         _ => {
             let idle = if domain.is_some() {
-                format!("set a second domain (e) to compare against {a}")
+                format!(
+                    "set a second domain (e) to compare against {}",
+                    sanitize_line(a)
+                )
             } else {
                 "look up a domain first (/)".to_string()
             };
-            f.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    idle,
-                    Style::default()
-                        .fg(theme.overlay0)
-                        .add_modifier(Modifier::ITALIC),
-                ))),
-                chunks[2],
-            );
+            page.push(line(
+                idle,
+                Style::default()
+                    .fg(theme.overlay0)
+                    .add_modifier(Modifier::ITALIC),
+            ))
         }
     }
 }
@@ -133,27 +103,9 @@ fn pair<T: Display>((a, b): &(Option<T>, Option<T>)) -> (String, String) {
     )
 }
 
-/// The FIELD | A | B comparison table for a completed diff.
-fn comparison_table(f: &mut Frame, area: Rect, theme: &Theme, d: &seer_core::diff::DomainDiff) {
-    // Checks that failed are listed under the table: their rows read "—",
-    // which alone would look like a real absence.
-    let error_rows = u16::try_from(d.errors.len()).unwrap_or(u16::MAX);
-    let [area, errors_area] = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(error_rows)])
-        .areas(area);
-    let errors: Vec<Line> = d
-        .errors
-        .iter()
-        .map(|e| {
-            Line::from(Span::styled(
-                format!("! {}", sanitize_line(e)),
-                Style::default().fg(theme.red),
-            ))
-        })
-        .collect();
-    f.render_widget(Paragraph::new(errors), errors_area);
-
+/// The FIELD | A | B comparison for a completed diff, then the checks that
+/// failed: their rows read "—", which alone would look like a real absence.
+fn comparison(theme: &Theme, page: Page, d: &seer_core::diff::DomainDiff) -> Page {
     let (reg, dns, ssl) = (&d.registration, &d.dns, &d.ssl);
     let joined = |(a, b): &(Vec<String>, Vec<String>)| {
         (sanitize_line(&a.join(", ")), sanitize_line(&b.join(", ")))
@@ -171,45 +123,70 @@ fn comparison_table(f: &mut Frame, area: Rect, theme: &Theme, d: &seer_core::dif
         ("ssl days", pair(&ssl.days_remaining)),
         ("ssl ok", pair(&ssl.is_valid)),
     ];
-
-    let rows: Vec<Row> = raw
-        .iter()
+    let rows = raw
+        .into_iter()
         .map(|(field, (a_val, b_val))| {
             let same = a_val == b_val;
             let indicator = if same { "=" } else { "≠" };
             let value_color = if same { theme.text } else { theme.yellow };
             Row::new(vec![
-                ratatui::text::Text::from(Line::from(Span::styled(
+                Span::styled(
                     format!("{indicator} {field:<16}"),
                     Style::default().fg(if same { theme.overlay0 } else { theme.yellow }),
-                ))),
-                ratatui::text::Text::from(Line::from(Span::styled(
-                    a_val.clone(),
-                    Style::default().fg(value_color),
-                ))),
-                ratatui::text::Text::from(Line::from(Span::styled(
-                    b_val.clone(),
-                    Style::default().fg(value_color),
-                ))),
+                ),
+                Span::styled(a_val, Style::default().fg(value_color)),
+                Span::styled(b_val, Style::default().fg(value_color)),
             ])
         })
         .collect();
-
-    let table = Table::new(
-        rows,
-        [
+    let table = TableBlock::new(
+        vec![],
+        vec![
             Constraint::Length(20),
             Constraint::Percentage(40),
             Constraint::Percentage(40),
         ],
-    )
-    .column_spacing(1);
-    f.render_widget(table, area);
+        rows,
+    );
+    let errors: Vec<Line<'static>> = d
+        .errors
+        .iter()
+        .map(|e| {
+            Line::from(Span::styled(
+                format!("! {}", sanitize_line(e)),
+                Style::default().fg(theme.red),
+            ))
+        })
+        .collect();
+    page.push(Block::Table(table))
+        .push_if(!errors.is_empty(), || Block::Lines(errors))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::widgets::page;
+
+    /// Draw this lens's page as the TUI does.
+    #[allow(clippy::too_many_arguments)]
+    fn render(
+        f: &mut ratatui::Frame,
+        area: ratatui::layout::Rect,
+        theme: &Theme,
+        domain: Option<&str>,
+        b: &str,
+        editing: Option<&LineEditor>,
+        focused: bool,
+        state: &LensState,
+    ) {
+        page::draw(
+            f,
+            area,
+            theme,
+            page(theme, domain, b, editing, focused, state),
+            focused,
+        );
+    }
     use crate::tui::test_util::render_text;
     use seer_core::diff::{DnsDiff, DomainDiff, RegistrationDiff, SslDiff};
 

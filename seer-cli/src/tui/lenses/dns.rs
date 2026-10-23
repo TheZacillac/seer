@@ -1,49 +1,24 @@
-//! DNS Records lens — Records tab (tab 0), DNSSEC tab (tab 1), Compare tab
-//! (tab 2), Trace tab (tab 3).
-//!
-//! Records renders a dig-style query result: the response's status line,
+//! DNS Records lens. It renders a dig-style query result: the response's status line,
 //! the ANSWER section (the CNAME chain under its real owners, then the
 //! records), and for a response without answers why not — NXDOMAIN, NODATA,
 //! a referral or a server failure — with the AUTHORITY records the server
 //! sent, and a note when the resolver answered the name itself. The outcome
 //! wording is `seer_core::output::dig`'s, shared with `seer dig`, and every
 //! remote string goes through `sanitize_line`, as in the CLI formatters.
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::Constraint;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Cell, Paragraph, Row, Table};
-use ratatui::Frame;
+use ratatui::widgets::{Cell, Row};
 use seer_core::output::dig::{self as wording, Tone};
 use seer_core::output::sanitize_line;
 use seer_core::{DnsQueryResult, DnsRecord, DnsStatus};
 
 use crate::tui::action::LensData;
 use crate::tui::filter;
-use crate::tui::lenses::{compare, dnssec, trace};
-use crate::tui::panes::{DnsState, Panes};
+use crate::tui::panes::DnsState;
 use crate::tui::theme::Theme;
-use crate::tui::widgets::inspector::{self, Field};
-use crate::tui::widgets::{panel, row_style, scroll_to, stack, wrap, Band};
-
-#[allow(clippy::too_many_arguments)]
-pub fn render(
-    f: &mut Frame,
-    area: Rect,
-    theme: &Theme,
-    tab: usize,
-    data: &LensData,
-    filter: &str,
-    focused: bool,
-    sel: usize,
-    panes: &Panes,
-) {
-    match tab {
-        1 => dnssec::render(f, area, theme, data),
-        2 => compare::render(f, area, theme, data),
-        3 => trace::render(f, area, theme, data, focused, sel),
-        _ => records(f, area, theme, data, filter, focused, sel, &panes.dns),
-    }
-}
+use crate::tui::widgets::inspector::Field;
+use crate::tui::widgets::page::{Block, Detail, Page, TableBlock};
 
 /// The color of a response code: green for NOERROR, yellow for NXDOMAIN,
 /// red for a server failure (SERVFAIL, REFUSED, …) — `seer dig`'s scheme.
@@ -73,22 +48,18 @@ pub(super) fn status_spans(theme: &Theme, status: DnsStatus) -> [Span<'static>; 
     ]
 }
 
-/// A table of DNS records in dig's column order — owner, TTL, type, data —
+/// A DNS records table in dig's column order — owner, TTL, type, data —
 /// under `section` (`ANSWER`, `AUTHORITY`). Each record comes with whether
 /// it is an answer proper, whose data is highlighted, rather than a CNAME
-/// hop or an authority record. `selected` is the highlighted row, if any.
+/// hop or an authority record.
 pub(super) fn record_table<'r>(
     theme: &Theme,
     section: &'static str,
     records: impl IntoIterator<Item = (&'r DnsRecord, bool)>,
-    selected: Option<usize>,
-) -> Table<'static> {
-    let header =
-        Row::new([section, "TTL", "TYPE", "DATA"]).style(Style::default().fg(theme.overlay0));
-    let rows: Vec<Row> = records
+) -> TableBlock {
+    let rows = records
         .into_iter()
-        .enumerate()
-        .map(|(i, (record, answer))| {
+        .map(|(record, answer)| {
             let data = if answer { theme.green } else { theme.subtext };
             Row::new([
                 Cell::from(sanitize_line(&record.name)),
@@ -97,52 +68,41 @@ pub(super) fn record_table<'r>(
                 Cell::from(sanitize_line(&record.data.to_string()))
                     .style(Style::default().fg(data)),
             ])
-            .style(row_style(theme, selected == Some(i)))
         })
         .collect();
-    Table::new(
-        rows,
-        [
+    TableBlock::new(
+        vec![section, "TTL", "TYPE", "DATA"],
+        vec![
             Constraint::Percentage(30),
             Constraint::Length(7),
             Constraint::Length(8),
             Constraint::Min(0),
         ],
+        rows,
     )
-    .header(header)
-    .column_spacing(1)
 }
 
-/// The Records tab.
-#[allow(clippy::too_many_arguments)]
-fn records(
-    f: &mut Frame,
-    area: Rect,
+/// The Records lens: the nameserver chips and their keys, dig's status line,
+/// then the response — the answers (and, while focused, the selected one's
+/// full fields), the verdict when there are none, the authority records,
+/// and the local-answer or wildcard note. The verdict and notes are kept
+/// whole; the tables give rows up first.
+pub fn page(
     theme: &Theme,
     data: &LensData,
     filter: &str,
     focused: bool,
     sel: usize,
     dns: &DnsState,
-) {
-    let LensData::Dig(result) = data else { return };
+) -> Option<Page> {
+    let LensData::Dig(result) = data else {
+        return None;
+    };
     let title = format!(
         "dig · {} records · {}",
         result.record_type,
         sanitize_line(&result.name)
     );
-    let inner = panel::render(f, area, theme, &title, theme.sky, focused);
-
-    // Layout: nameserver chips + hint + status line + the response
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Min(0),
-        ])
-        .split(inner);
 
     // Nameserver chip row
     let mut ns_spans: Vec<Span> = Vec::new();
@@ -157,21 +117,69 @@ fn records(
         };
         ns_spans.push(Span::styled(format!(" {label} "), style));
     }
-    f.render_widget(Paragraph::new(Line::from(ns_spans)), chunks[0]);
+    let hint = Line::from(vec![
+        Span::styled("s ", Style::default().fg(theme.overlay0)),
+        Span::styled("nameserver  ", Style::default().fg(theme.subtext)),
+        Span::styled("/ ", Style::default().fg(theme.overlay0)),
+        Span::styled("filter", Style::default().fg(theme.subtext)),
+    ]);
+    let mut page = Page::new(title, theme.sky).push(Block::Lines(vec![
+        Line::from(ns_spans),
+        hint,
+        status_line(theme, result),
+    ]));
 
-    // Hint line
-    f.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled("s ", Style::default().fg(theme.overlay0)),
-            Span::styled("nameserver  ", Style::default().fg(theme.subtext)),
-            Span::styled("/ ", Style::default().fg(theme.overlay0)),
-            Span::styled("filter", Style::default().fg(theme.subtext)),
-        ])),
-        chunks[1],
-    );
-
-    f.render_widget(Paragraph::new(status_line(theme, result)), chunks[2]);
-    response(f, chunks[3], theme, result, filter, focused.then_some(sel));
+    if !result.answers.is_empty() {
+        let selected = focused.then_some(sel);
+        let detail = selected
+            .and_then(|i| filter::dig_rows(result, filter).nth(i))
+            .map_or(Detail::None, |(record, _)| {
+                Detail::Fields(vec![
+                    Field::new("name", record.name.clone()),
+                    Field::new("type", record.record_type.as_str()),
+                    Field::new("ttl", record.ttl.to_string()),
+                    Field::new("data", record.data.to_string()),
+                ])
+            });
+        let table = record_table(theme, "ANSWER", filter::dig_rows(result, filter))
+            .selected(selected)
+            .detail(detail);
+        page = page.push(Block::Table(table));
+    }
+    // Sections sit a blank row apart; the gaps are the first rows given up.
+    if let Some(verdict) = wording::query_verdict(result, sanitize_line) {
+        page = page.push(Block::Gap).push(Block::Note {
+            text: verdict,
+            color: verdict_color(theme, result.status),
+        });
+    }
+    if !result.authority.is_empty() {
+        let authority = result.authority.iter().map(|r| (r, false));
+        page =
+            page.push(Block::Gap)
+                .push(Block::Table(record_table(theme, "AUTHORITY", authority)));
+    }
+    if result.answered_locally {
+        page = page.push(Block::Gap).push(Block::Note {
+            text: wording::LOCAL_NOTE.to_string(),
+            color: theme.yellow,
+        });
+    }
+    if let Some(probe) = &result.wildcard {
+        if let Some(note) = wording::wildcard_note(probe, sanitize_line(&probe.probe_name)) {
+            // A likely-synthesized answer is the one worth a warning.
+            let color = if probe.matches_answer {
+                theme.yellow
+            } else {
+                theme.subtext
+            };
+            page = page.push(Block::Gap).push(Block::Note {
+                text: format!("Wildcard: {note}"),
+                color,
+            });
+        }
+    }
+    Some(page)
 }
 
 /// dig's header line: `● NOERROR  flags qr rd ra  server 1.1.1.1  time 12 ms`.
@@ -196,147 +204,30 @@ fn status_line(theme: &Theme, result: &DnsQueryResult) -> Line<'static> {
     Line::from(spans)
 }
 
-/// One band of the response, top to bottom.
-enum Section {
-    /// The ANSWER table: the visible (filtered) rows, scrolled to `selected`.
-    Answers,
-    /// The selected answer's full fields (focused only).
-    Detail,
-    /// Why there is no answer (`wording::query_verdict`), pre-wrapped to
-    /// the area's width — a referral's names the zone and can run long.
-    Verdict(Vec<String>),
-    /// The AUTHORITY records (the SOA of a negative answer, a referral's NS
-    /// records).
-    Authority,
-    /// The local-answer or wildcard note, pre-wrapped to the area's width,
-    /// and its color.
-    Note(Vec<String>, Color),
-}
-
-/// The response below the status line, stacked from the top: the answers,
-/// the selected answer's detail while focused, the verdict when there are
-/// none, the authority records, and the local-answer or wildcard note. When
-/// they do not all fit, the answer table shrinks (and scrolls) first, then
-/// the detail, so the verdict and the notes are not cut; while a detail
-/// shows, the table keeps its header and a few rows so the selected one
-/// stays in view.
-fn response(
-    f: &mut Frame,
-    area: Rect,
-    theme: &Theme,
-    result: &DnsQueryResult,
-    filter: &str,
-    selected: Option<usize>,
-) {
-    let mut detail = selected
-        .and_then(|i| filter::dig_rows(result, filter).nth(i))
-        .map(|(record, _)| {
-            let fields = [
-                Field::new("name", record.name.clone()),
-                Field::new("type", record.record_type.as_str()),
-                Field::new("ttl", record.ttl.to_string()),
-                Field::new("data", record.data.to_string()),
-            ];
-            inspector::lines(theme, &fields, area.width)
-        })
-        .unwrap_or_default();
-    let mut sections = Vec::new();
-    if !result.answers.is_empty() {
-        sections.push(Section::Answers);
-    }
-    if !detail.is_empty() {
-        sections.push(Section::Detail);
-    }
-    if let Some(verdict) = wording::query_verdict(result, sanitize_line) {
-        sections.push(Section::Verdict(wrap(&verdict, area.width)));
-    }
-    if !result.authority.is_empty() {
-        sections.push(Section::Authority);
-    }
-    if result.answered_locally {
-        sections.push(Section::Note(
-            wrap(wording::LOCAL_NOTE, area.width),
-            theme.yellow,
-        ));
-    }
-    if let Some(probe) = &result.wildcard {
-        if let Some(note) = wording::wildcard_note(probe, sanitize_line(&probe.probe_name)) {
-            // A likely-synthesized answer is the one worth a warning.
-            let color = if probe.matches_answer {
-                theme.yellow
-            } else {
-                theme.subtext
-            };
-            sections.push(Section::Note(
-                wrap(&format!("Wildcard: {note}"), area.width),
-                color,
-            ));
-        }
-    }
-
-    let rows = filter::dig_rows(result, filter).count();
-    let height = |lines: usize| u16::try_from(lines).unwrap_or(u16::MAX);
-    let layout: Vec<Band> = sections
-        .iter()
-        .map(|section| match section {
-            // The column header, then the visible rows; it scrolls.
-            Section::Answers => {
-                let min = if detail.is_empty() {
-                    0
-                } else {
-                    1 + rows.min(inspector::MIN_ROWS)
-                };
-                Band::shrinking(height(rows + 1), height(min))
-            }
-            Section::Detail => inspector::band(&detail),
-            Section::Verdict(lines) => Band::fixed(height(lines.len())),
-            Section::Authority => Band::fixed(height(result.authority.len() + 1)),
-            Section::Note(lines, _) => Band::fixed(height(lines.len())),
-        })
-        .collect();
-    let bands = stack(area, &layout);
-
-    for (section, band) in sections.into_iter().zip(bands) {
-        match section {
-            Section::Answers => {
-                let rows = filter::dig_rows(result, filter);
-                let table = record_table(theme, "ANSWER", rows, selected);
-                let mut state = scroll_to(selected);
-                f.render_stateful_widget(table, band, &mut state);
-            }
-            Section::Detail => inspector::draw(f, band, theme, std::mem::take(&mut detail)),
-            Section::Verdict(lines) => f.render_widget(
-                colored_lines(lines, verdict_color(theme, result.status)),
-                band,
-            ),
-            Section::Authority => f.render_widget(
-                record_table(
-                    theme,
-                    "AUTHORITY",
-                    result.authority.iter().map(|r| (r, false)),
-                    None,
-                ),
-                band,
-            ),
-            Section::Note(lines, color) => f.render_widget(colored_lines(lines, color), band),
-        }
-    }
-}
-
-/// Pre-wrapped lines in one color.
-fn colored_lines(lines: Vec<String>, color: Color) -> Paragraph<'static> {
-    let lines: Vec<Line> = lines
-        .into_iter()
-        .map(|line| Line::from(Span::styled(line, Style::default().fg(color))))
-        .collect();
-    Paragraph::new(lines)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::widgets::page;
+
+    /// Draw this lens's page as the TUI does.
+    #[allow(clippy::too_many_arguments)]
+    fn render(
+        f: &mut ratatui::Frame,
+        area: ratatui::layout::Rect,
+        theme: &Theme,
+        data: &LensData,
+        filter: &str,
+        focused: bool,
+        sel: usize,
+        panes: &Panes,
+    ) {
+        if let Some(p) = page(theme, data, filter, focused, sel, &panes.dns) {
+            page::draw(f, area, theme, p, focused);
+        }
+    }
     use crate::payload::fixtures;
-    use crate::tui::test_util::{render_buffer, render_lines, render_text};
+    use crate::tui::panes::Panes;
+    use crate::tui::test_util::{render_buffer, render_lines};
     use seer_core::dns::{RecordData, RecordType};
     use seer_core::WildcardProbe;
 
@@ -381,7 +272,6 @@ mod tests {
                 f,
                 f.area(),
                 &theme,
-                0,
                 data,
                 filter,
                 sel.is_some(),
@@ -492,7 +382,7 @@ mod tests {
         let data = dig_data(chained());
         let panes = Panes::default();
         let buffer = render_buffer(100, 16, |f| {
-            render(f, f.area(), &theme, 0, &data, "", false, 0, &panes);
+            render(f, f.area(), &theme, &data, "", false, 0, &panes);
         });
         let fg_of = |needle: &str| {
             let area = buffer.area();
@@ -594,7 +484,7 @@ mod tests {
             assert!(!text.contains("AUTHORITY"), "{text}");
             // The status is drawn in the failure color.
             let buffer = render_buffer(100, 16, |f| {
-                render(f, f.area(), &theme, 0, &data, "", false, 0, &panes);
+                render(f, f.area(), &theme, &data, "", false, 0, &panes);
             });
             let status_row = (0..16u16)
                 .find(|&y| {
@@ -753,34 +643,5 @@ mod tests {
         panes.dns.select_server("9.9.9.9".into());
         let text = draw(&data, &panes, "", None);
         assert!(text.contains(" 1.1.1.1   9.9.9.9 "), "custom slot: {text}");
-    }
-
-    #[test]
-    fn other_tabs_render_their_own_payloads() {
-        let theme = Theme::frappe();
-        let panes = Panes::default();
-        let trace = LensData::Trace(Box::new(fixtures::trace(
-            vec![fixtures::a("www.seer.test", "192.0.2.7")],
-            None,
-        )));
-        let text = render_text(100, 20, |f| {
-            render(f, f.area(), &theme, 3, &trace, "", false, 0, &panes);
-        });
-        assert!(text.contains("trace · www.seer.test A"), "{text}");
-        // A Records payload under the Trace tab (a stale cache) draws nothing.
-        let text = render_text(100, 20, |f| {
-            render(
-                f,
-                f.area(),
-                &theme,
-                3,
-                &dig_data(chained()),
-                "",
-                false,
-                0,
-                &panes,
-            );
-        });
-        assert!(!text.contains("192.0.2.7"), "{text}");
     }
 }

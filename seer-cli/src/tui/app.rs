@@ -48,9 +48,6 @@ pub struct App {
     pub domain: Option<String>,
     pub input_mode: InputMode,
     pub help: bool,
-    /// Nav drawn as numbers and glyphs only (`\`); the startup value comes
-    /// from `[tui] nav`.
-    pub compact_nav: bool,
     pub should_quit: bool,
     pub spin: usize,
     pub toast: Option<Toast>,
@@ -95,7 +92,6 @@ impl App {
             domain: None,
             input_mode: InputMode::Normal,
             help: false,
-            compact_nav: false,
             should_quit: false,
             spin: 0,
             toast: None,
@@ -430,23 +426,21 @@ impl App {
                 1 => FetchReq::RdapIp(self.panes.dns.resolved_ip.clone()?),
                 _ => return None, // ASN needs explicit :rdap AS…
             },
-            LensKey::Dns => match self.tab {
-                1 => FetchReq::Dnssec(d),
-                2 => FetchReq::Compare {
-                    domain: self.panes.compare.domain.clone().unwrap_or(d),
-                    record_type: RecordType::A,
-                    a: self.panes.compare.a.clone(),
-                    b: self.panes.compare.b.clone(),
-                },
-                3 => FetchReq::Trace {
-                    domain: d,
-                    record_type: self.panes.dns.record_type,
-                },
-                _ => FetchReq::Dns {
-                    domain: d,
-                    record_type: self.panes.dns.record_type,
-                    nameserver: self.panes.dns.nameserver(),
-                },
+            LensKey::Dns => FetchReq::Dns {
+                domain: d,
+                record_type: self.panes.dns.record_type,
+                nameserver: self.panes.dns.nameserver(),
+            },
+            LensKey::Dnssec => FetchReq::Dnssec(d),
+            LensKey::Compare => FetchReq::Compare {
+                domain: self.panes.compare.domain.clone().unwrap_or(d),
+                record_type: RecordType::A,
+                a: self.panes.compare.a.clone(),
+                b: self.panes.compare.b.clone(),
+            },
+            LensKey::Trace => FetchReq::Trace {
+                domain: d,
+                record_type: self.panes.dns.record_type,
             },
             LensKey::Ssl => FetchReq::Ssl(d),
             LensKey::Status => FetchReq::Status(d),
@@ -476,8 +470,8 @@ impl App {
         let key = lens.key;
         self.states.remove(&key);
         self.raw_scroll = 0;
-        // A `/`-filter narrowed the previous tab's rows (DNS Records); the
-        // new tab lists other data, or none.
+        // A `/`-filter narrowed the previous tab's rows; the new tab lists
+        // other data, or none.
         self.lens_filter.remove(&key);
         // Invalidate any in-flight fetch for the previous tab even when the
         // new tab has no default request (RDAP IP tab without a resolved IP,
@@ -697,7 +691,7 @@ impl App {
         let lens = self.current_lens();
         if key.code == KeyCode::Char('/')
             && self.focus == Focus::Pane
-            && lens.filterable(self.tab)
+            && lens.filterable()
             && matches!(self.state_of(self.lens), LensState::Loaded(_))
         {
             let cur = self.lens_filter.get(&lens.key).cloned().unwrap_or_default();
@@ -758,6 +752,14 @@ impl App {
                 self.goto_lens(0);
                 self.set_domain_and_fetch(target)
             }
+            EditTarget::Switcher => match lenses::switch_matches(&value).first() {
+                Some(&i) => self.nav_to(i),
+                None => {
+                    let msg = format!("no lens matches “{value}”");
+                    self.set_toast("warn", &seer_core::output::sanitize_line(&msg));
+                    vec![]
+                }
+            },
             EditTarget::LensFilter => {
                 // Commit the filter for the current lens; empty clears it.
                 let key = self.current_lens().key;
@@ -827,9 +829,7 @@ impl App {
             _ => {}
         }
         let domain = self.domain.clone();
-        let outcome = self
-            .panes
-            .handle_key(lens_key, self.tab, key, domain.as_deref())?;
+        let outcome = self.panes.handle_key(lens_key, key, domain.as_deref())?;
         Some(self.apply_pane_outcome(outcome))
     }
 
@@ -1042,8 +1042,7 @@ impl App {
                 vec![action]
             }
             CmdOutcome::Compare { domain, a, b } => {
-                // The Compare tab.
-                self.open_dns_tab(2);
+                self.goto_lens(LensKey::Compare.index());
                 // Remember the domain (so `a`/`b` re-runs stay on it) and keep
                 // the cycling indices in sync with the given resolvers.
                 self.panes.compare.domain = Some(domain.clone());
@@ -1065,9 +1064,10 @@ impl App {
                 let Some(target) = self.target_or_toast(&domain) else {
                     return vec![];
                 };
-                // `+trace` opens the Trace tab, anything else Records.
-                self.open_dns_tab(if trace { 3 } else { 0 });
-                // The Records and Trace tabs' default requests read the type
+                // `+trace` opens the Trace lens, anything else Records.
+                let lens = if trace { LensKey::Trace } else { LensKey::Dns };
+                self.goto_lens(lens.index());
+                // The Records and Trace lenses' default requests read the type
                 // and nameserver, so the cache check refetches when only
                 // those changed.
                 self.panes.dns.record_type = record_type;
@@ -1089,21 +1089,6 @@ impl App {
                 vec![]
             }
         }
-    }
-
-    /// Open the DNS lens on sub-tab `tab` for `:dig` / `:compare`. Landing on
-    /// another tab than the one shown drops the lens's `/`-filter, as a tab
-    /// switch does (`refetch_for_tab`): it narrowed the old tab's rows, and a
-    /// tab that cannot filter could neither apply nor edit it. Away from the
-    /// lens, the tab it would show is Records, since changing lens resets it.
-    fn open_dns_tab(&mut self, tab: usize) {
-        let i = LensKey::Dns.index();
-        let shown = if self.lens == i { self.tab } else { 0 };
-        if shown != tab {
-            self.lens_filter.remove(&LensKey::Dns);
-        }
-        self.goto_lens(i);
-        self.tab = tab;
     }
 
     /// Handle `:rdap <target>` — routes to the correct RDAP sub-tab based on
@@ -1191,12 +1176,11 @@ impl App {
                 self.sel = self.row_count().saturating_sub(1);
                 vec![]
             }
-            KeyAction::JumpLens(i) => {
-                if i < n_lenses {
-                    return self.nav_to(i);
-                }
-                vec![]
-            }
+            // Numbers count within the current group, as the strip shows.
+            KeyAction::JumpLens(i) => match lenses::nth_in_group(self.lens, i) {
+                Some(target) => self.nav_to(target),
+                None => vec![],
+            },
             KeyAction::NextGroup => self.nav_to(lenses::group_start(self.lens, true)),
             KeyAction::PrevGroup => self.nav_to(lenses::group_start(self.lens, false)),
             KeyAction::ToggleFocus => {
@@ -1263,12 +1247,15 @@ impl App {
                 self.input_mode = InputMode::Command(crate::tui::line_editor::LineEditor::new());
                 vec![]
             }
-            KeyAction::Help => {
-                self.help = true;
+            KeyAction::Switcher => {
+                self.input_mode = InputMode::Field {
+                    target: EditTarget::Switcher,
+                    buf: crate::tui::line_editor::LineEditor::new(),
+                };
                 vec![]
             }
-            KeyAction::ToggleNav => {
-                self.compact_nav = !self.compact_nav;
+            KeyAction::Help => {
+                self.help = true;
                 vec![]
             }
             KeyAction::QuitHint => {
@@ -1386,7 +1373,6 @@ mod tests {
             for hint in lens.keys {
                 let mut app = App::new(Some("example.com".into()));
                 app.lens = lens.key.index();
-                app.tab = hint.tab.unwrap_or(0);
                 app.focus = Focus::Pane;
                 match lens.key {
                     LensKey::Watch => {
@@ -1412,21 +1398,6 @@ mod tests {
     }
 
     #[test]
-    fn backslash_toggles_the_compact_nav_but_types_in_a_field() {
-        let mut app = App::new(None);
-        key(&mut app, KeyCode::Char('\\'));
-        assert!(app.compact_nav);
-        key(&mut app, KeyCode::Char('\\'));
-        assert!(!app.compact_nav);
-        key(&mut app, KeyCode::Char(':'));
-        key(&mut app, KeyCode::Char('\\'));
-        assert!(
-            !app.compact_nav,
-            "a backslash typed into : must not toggle the nav"
-        );
-    }
-
-    #[test]
     fn brace_jumps_to_the_next_group_through_nav_to() {
         let mut app = App::new(Some("example.com".into()));
         let _ = app.take_startup_actions();
@@ -1436,6 +1407,40 @@ mod tests {
         assert_eq!(app.focus, Focus::Nav);
         key(&mut app, KeyCode::Char('{'));
         assert_eq!(app.lens, 0);
+    }
+
+    #[test]
+    fn dns_tools_are_lenses_with_their_own_fetch() {
+        for (key, want) in [
+            (LensKey::Dnssec, "Dnssec"),
+            (LensKey::Compare, "Compare"),
+            (LensKey::Trace, "Trace"),
+        ] {
+            let mut app = App::new(Some("example.com".into()));
+            let _ = app.take_startup_actions();
+            let actions = app.nav_to(key.index());
+            assert!(
+                actions.iter().any(|a| matches!(
+                    a,
+                    Action::Fetch { req, .. } if format!("{req:?}").starts_with(want)
+                )),
+                "{key:?}: {actions:?}"
+            );
+            assert_eq!(app.tab, 0);
+        }
+    }
+
+    #[test]
+    fn dig_trace_opens_the_trace_lens() {
+        let mut app = App::new(Some("example.com".into()));
+        let _ = app.take_startup_actions();
+        app.exec_command("dig example.com +trace");
+        assert_eq!(app.current_lens().key, LensKey::Trace);
+        app.exec_command("compare example.com 1.1.1.1 8.8.8.8");
+        assert_eq!(app.current_lens().key, LensKey::Compare);
+        app.exec_command("dig example.com");
+        assert_eq!(app.current_lens().key, LensKey::Dns);
+        assert_eq!(app.tab, 0);
     }
 
     #[test]
@@ -1457,6 +1462,45 @@ mod tests {
                 ..
             }]
         ));
+    }
+
+    #[test]
+    fn space_opens_the_switcher_and_enter_goes_to_the_best_match() {
+        let mut app = App::new(None);
+        app.focus = Focus::Pane;
+        key(&mut app, KeyCode::Char(' '));
+        for c in "j1{/".chars() {
+            key(&mut app, KeyCode::Char(c));
+        }
+        assert_eq!(app.lens, 0, "keys typed into the switcher never navigate");
+        for _ in 0..4 {
+            key(&mut app, KeyCode::Backspace);
+        }
+        for c in "tra".chars() {
+            key(&mut app, KeyCode::Char(c));
+        }
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.current_lens().key, LensKey::Trace);
+        // No match: stay put and say so.
+        key(&mut app, KeyCode::Char(' '));
+        for c in "zzzz".chars() {
+            key(&mut app, KeyCode::Char(c));
+        }
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.current_lens().key, LensKey::Trace);
+        assert!(matches!(&app.toast, Some(t) if t.msg.contains("no lens matches")));
+    }
+
+    #[test]
+    fn number_keys_pick_within_the_current_group() {
+        let mut app = App::new(None);
+        app.lens = LensKey::Ssl.index();
+        key(&mut app, KeyCode::Char('2'));
+        assert_eq!(app.current_lens().key, LensKey::Status);
+        // Past the group's end, nothing happens.
+        app.lens = LensKey::Diff.index();
+        key(&mut app, KeyCode::Char('9'));
+        assert_eq!(app.current_lens().key, LensKey::Diff);
     }
 
     #[test]
@@ -2488,47 +2532,6 @@ mod tests {
     }
 
     #[test]
-    fn dns_revisit_does_not_serve_dnssec_cache_under_records_tab() {
-        let mut app = App::new(Some("example.com".into()));
-        let _ = app.take_startup_actions();
-        let first = key(&mut app, KeyCode::Char('7')); // DNS · Records
-        let gen = first
-            .iter()
-            .find_map(|a| match a {
-                Action::Fetch { gen, .. } => Some(*gen),
-                _ => None,
-            })
-            .expect("records fetch");
-        app.update(Msg::Data {
-            lens: LensKey::Dns,
-            gen,
-            result: Ok(empty_dig()),
-        });
-        let dnssec = key(&mut app, KeyCode::Char(']')); // DNSSEC tab
-        assert!(dnssec.iter().any(|a| matches!(
-            a,
-            Action::Fetch {
-                req: FetchReq::Dnssec(_),
-                ..
-            }
-        )));
-        // Pressing 7 again resets to tab 0: the cached DNSSEC state must not
-        // be served there (it rendered blank); Records are refetched.
-        let again = key(&mut app, KeyCode::Char('7'));
-        assert_eq!(app.tab, 0);
-        assert!(
-            again.iter().any(|a| matches!(
-                a,
-                Action::Fetch {
-                    req: FetchReq::Dns { .. },
-                    ..
-                }
-            )),
-            "expected a Records refetch, got {again:?}"
-        );
-    }
-
-    #[test]
     fn rdap_asn_cache_is_not_served_on_the_domain_tab() {
         let rdap = |app: &mut App, gen| {
             let r: seer_core::RdapResponse = serde_json::from_str("{}").unwrap();
@@ -2886,29 +2889,19 @@ mod tests {
         assert_eq!(app.active_filter(), "192.0.2.3");
         assert_eq!(app.row_count(), 1);
         assert_eq!(app.sel, 0);
-        // Another sub-tab lists other data: the filter does not follow.
-        key(&mut app, KeyCode::Char(']'));
-        assert_eq!(app.tab, 1);
+        // The filter belongs to Records: DNSSEC shows none, and it is still
+        // there on the way back.
+        app.nav_to(LensKey::Dnssec.index());
         assert_eq!(app.active_filter(), "");
-        // `/` there is the domain editor again, as on any unfiltered tab.
-        key(&mut app, KeyCode::Char('/'));
-        assert!(matches!(
-            app.input_mode,
-            InputMode::Field {
-                target: EditTarget::Target,
-                ..
-            }
-        ));
+        app.nav_to(LensKey::Dns.index());
+        assert_eq!(app.active_filter(), "192.0.2.3");
     }
 
     #[test]
-    fn the_trace_tab_fetches_a_trace_and_drops_a_late_records_result() {
+    fn the_trace_lens_fetches_a_trace_of_the_records_type() {
         let mut app = app_on_lens(Some("example.com"), "dns");
         app.panes.dns.record_type = RecordType::MX;
-        let records_gen = fetch_gen_of(&app.fetch_with_current(false));
-        // `[` from Records wraps round to the last tab.
-        let actions = key(&mut app, KeyCode::Char('['));
-        assert_eq!(app.tab, 3);
+        let actions = app.nav_to(LensKey::Trace.index());
         assert!(
             actions.iter().any(|a| matches!(
                 a,
@@ -2922,18 +2915,10 @@ mod tests {
             )),
             "got {actions:?}"
         );
-        let trace_gen = fetch_gen_of(&actions);
-        // The Records query started before the tab switch lands late.
-        app.update(Msg::Data {
-            lens: LensKey::Dns,
-            gen: records_gen,
-            result: Ok(chained_dig(1)),
-        });
-        assert!(matches!(app.state_of(app.lens), LensState::Loading));
         let trace = crate::payload::fixtures::trace(vec![], None);
         app.update(Msg::Data {
-            lens: LensKey::Dns,
-            gen: trace_gen,
+            lens: LensKey::Trace,
+            gen: fetch_gen_of(&actions),
             result: Ok(LensData::Trace(Box::new(trace))),
         });
         assert!(matches!(
@@ -2944,7 +2929,7 @@ mod tests {
     }
 
     #[test]
-    fn dig_command_selects_the_nameserver_and_the_trace_tab() {
+    fn dig_command_selects_the_nameserver_and_the_trace_lens() {
         let mut app = App::new(Some("example.com".into()));
         let _ = app.take_startup_actions();
         let actions = app.exec_command("dig @9.9.9.9 AAAA example.org");
@@ -2969,7 +2954,7 @@ mod tests {
         );
 
         let actions = app.exec_command("dig example.org https +trace");
-        assert_eq!(app.tab, 3, "Trace tab");
+        assert_eq!(app.current_lens().key, LensKey::Trace);
         assert!(
             actions.iter().any(|a| matches!(
                 a,
@@ -3023,38 +3008,22 @@ mod tests {
         assert_eq!(app.domain.as_deref(), Some("www.seer.test"));
     }
 
-    /// A Records `/`-filter does not follow `:dig +trace` or `:compare` to a
-    /// tab that cannot filter, where it could be neither seen nor edited.
+    /// A Records `/`-filter stays with Records: `:dig +trace` and
+    /// `:compare` land on lenses without one, and it is there on return.
     #[test]
-    fn dig_and_compare_to_another_tab_drop_the_records_filter() {
+    fn dig_and_compare_leave_the_records_filter_on_records() {
         for command in [
             "dig example.com +trace",
             "compare example.com 8.8.8.8 1.1.1.1",
         ] {
             let mut app = dns_app_with(chained_dig(3));
-            app.focus = Focus::Pane;
-            key(&mut app, KeyCode::Char('/'));
-            for c in "192.0.2.3".chars() {
-                key(&mut app, KeyCode::Char(c));
-            }
-            key(&mut app, KeyCode::Enter);
-            assert_eq!(app.active_filter(), "192.0.2.3");
-
+            app.lens_filter.insert(LensKey::Dns, "192.0.2.3".into());
             app.exec_command(command);
-            assert_ne!(app.tab, 0, "{command}");
+            assert_ne!(app.current_lens().key, LensKey::Dns, "{command}");
             assert_eq!(app.active_filter(), "", "{command}");
-            // Back on Records, the old filter is gone too.
             app.exec_command("dig example.com");
-            assert_eq!(app.tab, 0, "{command}");
-            assert_eq!(app.active_filter(), "", "{command}");
+            assert_eq!(app.active_filter(), "192.0.2.3", "{command}");
         }
-
-        // A `:dig` that stays on Records keeps it, like a refresh.
-        let mut app = dns_app_with(chained_dig(3));
-        app.lens_filter.insert(LensKey::Dns, "192.0.2.3".into());
-        app.exec_command("dig example.com");
-        assert_eq!(app.tab, 0);
-        assert_eq!(app.active_filter(), "192.0.2.3");
     }
 
     #[test]
@@ -3165,9 +3134,9 @@ mod tests {
             result: Ok(empty_dig()),
         });
         assert!(matches!(app.state_of(0), LensState::Loaded(_)));
-        // Onto the DNS lens's Trace tab, then back with `g`.
-        app.lens = LensKey::Dns.index();
-        app.tab = 3;
+        // Onto RDAP's ASN tab, then back with `g`.
+        app.lens = LensKey::Rdap.index();
+        app.tab = 2;
         app.sel = 4;
         let actions = key(&mut app, KeyCode::Char('g'));
         assert_eq!((app.lens, app.tab, app.sel), (0, 0, 0));
@@ -3180,8 +3149,8 @@ mod tests {
         key(&mut app, KeyCode::Char('G'));
         assert_eq!((app.tab, app.sel), (0, 0));
         // The `/` target from a tabbed lens: same domain, cached Overview.
-        app.lens = LensKey::Dns.index();
-        app.tab = 3;
+        app.lens = LensKey::Rdap.index();
+        app.tab = 2;
         key(&mut app, KeyCode::Char('/'));
         let actions = key(&mut app, KeyCode::Enter);
         assert_eq!((app.lens, app.tab), (0, 0));

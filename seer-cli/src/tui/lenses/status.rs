@@ -1,38 +1,28 @@
 //! Status lens — big HTTP code + composite health.
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
-use ratatui::Frame;
 use seer_core::output::sanitize_line;
 
 use crate::tui::action::LensData;
 use crate::tui::theme::Theme;
-use crate::tui::widgets::{kv, or_dash, panel};
+use crate::tui::widgets::or_dash;
+use crate::tui::widgets::page::{Block, Page};
 
-pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
-    let LensData::Status(s) = data else { return };
-    let inner = panel::render(f, area, theme, "HTTP Health", theme.green, false);
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(2), Constraint::Min(0)])
-        .split(inner);
-
+pub fn page(theme: &Theme, data: &LensData) -> Option<Page> {
+    let LensData::Status(s) = data else {
+        return None;
+    };
     let code = or_dash(s.http_status);
     let text = sanitize_line(s.http_status_text.as_deref().unwrap_or_default());
-    f.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(
-                format!("{code} "),
-                Style::default()
-                    .fg(theme.green)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(text, Style::default().fg(theme.subtext)),
-        ])),
-        chunks[0],
-    );
+    let headline = Line::from(vec![
+        Span::styled(
+            format!("{code} "),
+            Style::default()
+                .fg(theme.green)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(text, Style::default().fg(theme.subtext)),
+    ]);
 
     let mut rows = vec![("title", or_dash(s.title.as_deref()))];
     if let Some(c) = &s.certificate {
@@ -46,12 +36,28 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
         let resolves = if dns.resolves { "yes" } else { "no" };
         rows.push(("resolves", resolves.to_string()));
     }
-    kv::render(f, chunks[1], theme, theme.green, &rows);
+    Some(
+        Page::new("HTTP Health", theme.green)
+            .push(Block::Lines(vec![headline]))
+            .push(Block::Gap)
+            .push(Block::Kv {
+                key_color: theme.green,
+                rows,
+            }),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::widgets::page;
+
+    /// Draw this lens's page as the TUI does.
+    fn render(f: &mut ratatui::Frame, area: ratatui::layout::Rect, theme: &Theme, data: &LensData) {
+        if let Some(p) = page(theme, data) {
+            page::draw(f, area, theme, p, false);
+        }
+    }
     use crate::tui::test_util::render_text;
     use seer_core::StatusResponse;
 

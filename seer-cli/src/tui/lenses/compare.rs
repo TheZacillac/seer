@@ -1,18 +1,18 @@
-//! DNS Compare tab renderer — shows A vs B nameserver record comparison.
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+//! DNS Compare lens — A vs B nameserver record comparison.
+use ratatui::layout::Constraint;
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Row, Table};
-use ratatui::Frame;
+use ratatui::widgets::Row;
 use seer_core::output::sanitize_line;
 
 use crate::tui::action::LensData;
 use crate::tui::theme::Theme;
-use crate::tui::widgets::{or_dash, panel};
+use crate::tui::widgets::or_dash;
+use crate::tui::widgets::page::{Block, Page, TableBlock};
 
-pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
+pub fn page(theme: &Theme, data: &LensData) -> Option<Page> {
     let LensData::Compare(c) = data else {
-        return;
+        return None;
     };
 
     // Name the compared domain: `:compare` can target a domain other than the
@@ -21,17 +21,6 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
         "compare · {} · A {} vs B {}",
         c.domain, c.server_a.nameserver, c.server_b.nameserver
     );
-    let inner = panel::render(f, area, theme, &title, theme.sky, false);
-
-    // Layout: summary line + hint + table
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Min(0),
-        ])
-        .split(inner);
 
     // Summary line
     let (summary_text, summary_color) = if c.matches {
@@ -42,24 +31,16 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
     } else {
         (format!("≠ {}", sanitize_line(&c.summary())), theme.yellow)
     };
-    f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            summary_text,
-            Style::default().fg(summary_color),
-        ))),
-        chunks[0],
-    );
-
-    // Hint line
-    f.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled("a ", Style::default().fg(theme.overlay0)),
-            Span::styled("cycle A  ", Style::default().fg(theme.subtext)),
-            Span::styled("b ", Style::default().fg(theme.overlay0)),
-            Span::styled("cycle B", Style::default().fg(theme.subtext)),
-        ])),
-        chunks[1],
-    );
+    let summary = Line::from(Span::styled(
+        summary_text,
+        Style::default().fg(summary_color),
+    ));
+    let hint = Line::from(vec![
+        Span::styled("a ", Style::default().fg(theme.overlay0)),
+        Span::styled("cycle A  ", Style::default().fg(theme.subtext)),
+        Span::styled("b ", Style::default().fg(theme.overlay0)),
+        Span::styled("cycle B", Style::default().fg(theme.subtext)),
+    ]);
 
     // Build comparison rows from both servers' records.
     // We collect all unique record values across both, then show per-row match status.
@@ -90,12 +71,6 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
         .iter()
         .map(|r| sanitize_line(&r.format_short()))
         .collect();
-
-    let header = Row::new(["●", "RECORD", "A", "B"]).style(
-        Style::default()
-            .fg(theme.overlay0)
-            .add_modifier(Modifier::DIM),
-    );
 
     // The response code and CNAME chain lead: two servers can agree on the
     // records yet differ there (NXDOMAIN vs NODATA, another CDN target).
@@ -188,24 +163,34 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
         .chain(error_rows)
         .collect();
 
-    let table = Table::new(
-        all_rows,
-        [
+    let table = TableBlock::new(
+        vec!["●", "RECORD", "A", "B"],
+        vec![
             Constraint::Length(2),
             Constraint::Length(8),
             Constraint::Percentage(44),
             Constraint::Percentage(44),
         ],
+        all_rows,
+    );
+    Some(
+        Page::new(title, theme.sky)
+            .push(Block::Lines(vec![summary, hint]))
+            .push(Block::Table(table)),
     )
-    .header(header)
-    .column_spacing(1);
-
-    f.render_widget(table, chunks[2]);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::widgets::page;
+
+    /// Draw this lens's page as the TUI does.
+    fn render(f: &mut ratatui::Frame, area: ratatui::layout::Rect, theme: &Theme, data: &LensData) {
+        if let Some(p) = page(theme, data) {
+            page::draw(f, area, theme, p, false);
+        }
+    }
     use crate::tui::test_util::render_text;
     use seer_core::dns::{DnsComparison, DnsStatus, RecordData, RecordType, ServerResult};
     use seer_core::DnsRecord;

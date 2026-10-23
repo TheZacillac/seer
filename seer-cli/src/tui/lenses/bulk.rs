@@ -1,9 +1,8 @@
 //! Bulk lens — multi-domain batch runner with streaming results + CSV export.
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::Constraint;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Row, Table};
-use ratatui::Frame;
+use ratatui::widgets::Row;
 
 use seer_core::output::sanitize_line;
 
@@ -12,24 +11,13 @@ use crate::tui::app::SPIN;
 use crate::tui::line_editor::LineEditor;
 use crate::tui::panes::bulk::BulkState;
 use crate::tui::theme::Theme;
-use crate::tui::widgets::{dot, gauge, panel, row_style, scroll_to};
+use crate::tui::widgets::page::{Block, Page, TableBlock};
+use crate::tui::widgets::{dot, gauge};
 
-pub fn render(
-    f: &mut Frame,
-    area: Rect,
-    theme: &Theme,
-    bulk: &BulkState,
-    editing: Option<&LineEditor>,
-    spin: usize,
-) {
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(7), Constraint::Min(0)])
-        .split(area);
-
-    // ── top panel: op chips + domains + gauge + hints ────────────────────────
+/// The batch runner: op chips, the domains, progress and hints, then the
+/// results panel and, when open (`v`), the selected row's detail panel.
+pub fn page(theme: &Theme, bulk: &BulkState, editing: Option<&LineEditor>, spin: usize) -> Page {
     let top_title = format!("Bulk  ·  {}", bulk.op());
-    let top_inner = panel::render(f, rows[0], theme, &top_title, theme.mauve, false);
 
     // Op chip row — highlight the selected op
     let op_chips: Line = {
@@ -138,100 +126,86 @@ pub fn render(
         )));
     }
 
-    f.render_widget(Paragraph::new(lines), top_inner);
-
-    // ── bottom panel: results table (+ optional detail panel) ────────────────
-    let selected = bulk.effective_selected();
-
-    // When the detail panel is open and a row is selected, split the bottom
-    // area into the results table (top) and a detail panel (bottom).
-    let (table_area, detail_area) = if bulk.detail && selected.is_some() {
-        let split = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(3), Constraint::Length(9)])
-            .split(rows[1]);
-        (split[0], Some(split[1]))
-    } else {
-        (rows[1], None)
-    };
+    let page = Page::new(top_title, theme.mauve)
+        .push(Block::Lines(lines))
+        .push(Block::Gap);
 
     // The op the rows were produced with — `o` only selects the NEXT run's op.
-    let results_title = format!("Results  ·  seer bulk {}", bulk.results_op());
-    let results_inner = panel::render(f, table_area, theme, &results_title, theme.mauve, false);
-
+    let results = Page::new(
+        format!("Results  ·  seer bulk {}", bulk.results_op()),
+        theme.mauve,
+    );
     if bulk.rows.is_empty() {
-        f.render_widget(
-            Paragraph::new(Line::from(vec![Span::styled(
+        return page.push(Block::Panel(results.push(Block::Lines(vec![Line::from(
+            vec![Span::styled(
                 "enter domains (d) or load a file (f), then r to run",
                 Style::default()
                     .fg(theme.overlay0)
                     .add_modifier(Modifier::ITALIC),
-            )])),
-            results_inner,
-        );
-        return;
+            )],
+        )]))));
     }
 
-    let header = Row::new(["DOMAIN", "RESULT", "⚑"]).style(Style::default().fg(theme.overlay0));
-
-    let body = bulk.rows.iter().enumerate().map(|(i, r)| {
-        let domain = sanitize_line(r.operation.domain());
-        let result_text = if r.success {
-            "ok".to_string()
-        } else {
-            sanitize_line(r.error.as_deref().unwrap_or("failed"))
-        };
-        let flag = if r.success {
-            dot::line(theme, "ok", "●")
-        } else {
-            dot::line(theme, "fail", "●")
-        };
-        Row::new(vec![
-            Line::from(domain),
-            Line::from(Span::styled(
-                result_text,
-                Style::default().fg(if r.success { theme.green } else { theme.red }),
-            )),
-            flag,
-        ])
-        // Highlight the selected row so j/k navigation is visible.
-        .style(row_style(theme, Some(i) == selected))
-    });
-
-    let table = Table::new(
-        body,
-        [
+    let body = bulk
+        .rows
+        .iter()
+        .map(|r| {
+            let domain = sanitize_line(r.operation.domain());
+            let result_text = if r.success {
+                "ok".to_string()
+            } else {
+                sanitize_line(r.error.as_deref().unwrap_or("failed"))
+            };
+            let flag = if r.success {
+                dot::line(theme, "ok", "●")
+            } else {
+                dot::line(theme, "fail", "●")
+            };
+            Row::new(vec![
+                Line::from(domain),
+                Line::from(Span::styled(
+                    result_text,
+                    Style::default().fg(if r.success { theme.green } else { theme.red }),
+                )),
+                flag,
+            ])
+        })
+        .collect();
+    // Keep the selected row in view. While streaming with no manual selection,
+    // `effective_selected` is the tail, so newest rows stay pinned; once the
+    // user moves the selection it follows their choice instead.
+    let selected = bulk.effective_selected();
+    let table = TableBlock::new(
+        vec!["DOMAIN", "RESULT", "⚑"],
+        vec![
             Constraint::Percentage(45),
             Constraint::Percentage(45),
             Constraint::Length(4),
         ],
+        body,
     )
-    .header(header)
-    .column_spacing(1);
+    .selected(selected);
+    let page = page.push(Block::Panel(results.push(Block::Table(table))));
 
-    // Keep the selected row in view. While streaming with no manual selection,
-    // `effective_selected` is the tail, so newest rows stay pinned; once the
-    // user moves the selection it follows their choice instead.
-    let mut state = scroll_to(selected);
-    f.render_stateful_widget(table, results_inner, &mut state);
-
-    // ── detail panel for the selected row ────────────────────────────────────
-    if let (Some(area), Some(idx)) = (detail_area, selected) {
-        if let Some(row) = bulk.rows.get(idx) {
-            let detail_inner = panel::render(f, area, theme, "Detail", theme.sky, false);
-            f.render_widget(
-                Paragraph::new(detail_lines(theme, row))
-                    .wrap(ratatui::widgets::Wrap { trim: false })
-                    .scroll((bulk.detail_scroll, 0)),
-                detail_inner,
-            );
-        }
+    // The detail panel for the selected row, scrolled with PgUp / PgDn.
+    let detail = selected
+        .filter(|_| bulk.detail)
+        .and_then(|idx| bulk.rows.get(idx));
+    match detail {
+        Some(row) => page.push(Block::Panel(Page::new("Detail", theme.sky).push(
+            Block::Scroll {
+                lines: detail_lines(theme, row),
+                offset: bulk.detail_scroll,
+                unit: "lines",
+            },
+        ))),
+        None => page,
     }
 }
 
 /// Build the detail view lines for a single result: a header row of facts plus
 /// the error or a pretty-printed JSON dump of the returned data.
-fn detail_lines<'a>(theme: &Theme, r: &seer_core::bulk::BulkResult) -> Vec<Line<'a>> {
+fn detail_lines(theme: &Theme, r: &seer_core::bulk::BulkResult) -> Vec<Line<'static>> {
     let domain = sanitize_line(r.operation.domain());
     let status = if r.success { "ok" } else { "failed" };
     let status_fg = if r.success { theme.green } else { theme.red };
@@ -283,6 +257,19 @@ fn detail_lines<'a>(theme: &Theme, r: &seer_core::bulk::BulkResult) -> Vec<Line<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::widgets::page;
+
+    /// Draw this lens's page as the TUI does.
+    fn render(
+        f: &mut ratatui::Frame,
+        area: ratatui::layout::Rect,
+        theme: &Theme,
+        bulk: &BulkState,
+        editing: Option<&LineEditor>,
+        spin: usize,
+    ) {
+        page::draw(f, area, theme, page(theme, bulk, editing, spin), false);
+    }
     use crate::tui::test_util::render_text;
     use seer_core::bulk::{BulkOperation, BulkResult};
 

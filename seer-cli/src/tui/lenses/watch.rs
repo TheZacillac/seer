@@ -1,113 +1,103 @@
 //! Watchlist lens — selectable table of watched domains with health indicators.
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::Constraint;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Row, Table};
-use ratatui::Frame;
+use ratatui::widgets::Row;
 use seer_core::output::sanitize_line;
 
 use crate::tui::action::LensData;
 use crate::tui::theme::Theme;
-use crate::tui::widgets::{or_dash, panel, row_style, scroll_to};
+use crate::tui::widgets::or_dash;
+use crate::tui::widgets::page::{Block, Page, TableBlock};
 
-pub fn render(
-    f: &mut Frame,
-    area: Rect,
-    theme: &Theme,
-    data: &LensData,
-    focused: bool,
-    sel: usize,
-) {
+/// Red under two weeks left, yellow under a month.
+fn days_color(theme: &Theme, days: Option<i64>) -> ratatui::style::Color {
+    match days {
+        Some(d) if d < 14 => theme.red,
+        Some(d) if d < 30 => theme.yellow,
+        _ => theme.text,
+    }
+}
+
+pub fn page(theme: &Theme, data: &LensData, focused: bool, sel: usize) -> Option<Page> {
     let LensData::Watch(w) = data else {
-        return;
+        return None;
     };
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(0),
-            Constraint::Length(1),
-        ])
-        .split(area);
+    let summary = Line::from(vec![
+        Span::styled(
+            format!("{} domains", w.total),
+            Style::default().fg(theme.text),
+        ),
+        Span::styled("  warnings: ", Style::default().fg(theme.overlay0)),
+        Span::styled(w.warnings.to_string(), Style::default().fg(theme.yellow)),
+        Span::styled("  critical: ", Style::default().fg(theme.overlay0)),
+        Span::styled(w.critical.to_string(), Style::default().fg(theme.red)),
+    ]);
 
-    // Summary bar
-    let summary_inner = panel::render(f, chunks[0], theme, "Watchlist", theme.yellow, false);
-    f.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(
-                format!("{} domains", w.total),
-                Style::default().fg(theme.text),
-            ),
-            Span::styled("  warnings: ", Style::default().fg(theme.overlay0)),
-            Span::styled(w.warnings.to_string(), Style::default().fg(theme.yellow)),
-            Span::styled("  critical: ", Style::default().fg(theme.overlay0)),
-            Span::styled(w.critical.to_string(), Style::default().fg(theme.red)),
-        ])),
-        summary_inner,
-    );
-
-    // Results table
-    let inner = panel::render(f, chunks[1], theme, "Domains", theme.yellow, focused);
-
-    let header = Row::new(["DOMAIN", "EXPIRES(d)", "SSL(d)", "HTTP", "⚑"])
-        .style(Style::default().fg(theme.overlay0));
-
-    let rows = w.results.iter().enumerate().map(|(i, r)| {
-        let expires = or_dash(r.domain_days_remaining);
-        let ssl = or_dash(r.ssl_days_remaining);
-        let http = or_dash(r.http_status);
-        let issues_flag = if r.issues.is_empty() { "" } else { "!" };
-
-        let expires_color = match r.domain_days_remaining {
-            Some(d) if d < 14 => theme.red,
-            Some(d) if d < 30 => theme.yellow,
-            _ => theme.text,
-        };
-        let ssl_color = match r.ssl_days_remaining {
-            Some(d) if d < 14 => theme.red,
-            Some(d) if d < 30 => theme.yellow,
-            _ => theme.text,
-        };
-
-        let base_style = row_style(theme, focused && i == sel);
-        Row::new(vec![
-            ratatui::text::Text::from(Span::styled(sanitize_line(&r.domain), base_style)),
-            ratatui::text::Text::from(Span::styled(expires, Style::default().fg(expires_color))),
-            ratatui::text::Text::from(Span::styled(ssl, Style::default().fg(ssl_color))),
-            ratatui::text::Text::from(Span::styled(http, base_style)),
-            ratatui::text::Text::from(Span::styled(issues_flag, Style::default().fg(theme.red))),
-        ])
-    });
-
-    let table = Table::new(
-        rows,
-        [
+    let rows = w
+        .results
+        .iter()
+        .map(|r| {
+            let issues_flag = if r.issues.is_empty() { "" } else { "!" };
+            Row::new(vec![
+                Span::raw(sanitize_line(&r.domain)),
+                Span::styled(
+                    or_dash(r.domain_days_remaining),
+                    Style::default().fg(days_color(theme, r.domain_days_remaining)),
+                ),
+                Span::styled(
+                    or_dash(r.ssl_days_remaining),
+                    Style::default().fg(days_color(theme, r.ssl_days_remaining)),
+                ),
+                Span::raw(or_dash(r.http_status)),
+                Span::styled(issues_flag, Style::default().fg(theme.red)),
+            ])
+        })
+        .collect();
+    let table = TableBlock::new(
+        vec!["DOMAIN", "EXPIRES(d)", "SSL(d)", "HTTP", "⚑"],
+        vec![
             Constraint::Percentage(40),
             Constraint::Length(10),
             Constraint::Length(8),
             Constraint::Length(6),
             Constraint::Length(3),
         ],
+        rows,
     )
-    .header(header)
-    .column_spacing(1);
-    let mut state = scroll_to(focused.then_some(sel));
-    f.render_stateful_widget(table, inner, &mut state);
-
-    // Hint line
-    f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            "a add · d remove (press twice) · ↵ open",
-            Style::default().fg(theme.overlay0),
-        ))),
-        chunks[2],
-    );
+    .selected(focused.then_some(sel));
+    Some(
+        Page::new("Watchlist", theme.yellow)
+            .push(Block::Lines(vec![summary]))
+            .push(Block::Gap)
+            .push(Block::Table(table))
+            .push(Block::Gap)
+            .push(Block::Lines(vec![Line::from(Span::styled(
+                "a add · d remove (press twice) · ↵ open",
+                Style::default().fg(theme.overlay0),
+            ))])),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::widgets::page;
+
+    /// Draw this lens's page as the TUI does.
+    fn render(
+        f: &mut ratatui::Frame,
+        area: ratatui::layout::Rect,
+        theme: &Theme,
+        data: &LensData,
+        focused: bool,
+        sel: usize,
+    ) {
+        if let Some(p) = page(theme, data, focused, sel) {
+            page::draw(f, area, theme, p, focused);
+        }
+    }
     use crate::tui::test_util::render_text;
     use chrono::Utc;
     use seer_core::{WatchReport, WatchResult};

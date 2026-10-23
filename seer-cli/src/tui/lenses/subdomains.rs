@@ -1,59 +1,61 @@
 //! Subdomains lens — selectable single-column table of CT-log subdomains.
-use ratatui::layout::{Constraint, Rect};
+use ratatui::layout::Constraint;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Row, Table};
-use ratatui::Frame;
+use ratatui::widgets::Row;
 use seer_core::output::sanitize_line;
 
 use crate::tui::action::LensData;
 use crate::tui::theme::Theme;
-use crate::tui::widgets::{panel, row_style, scroll_to};
+use crate::tui::widgets::page::{Block, Page, TableBlock};
 
-pub fn render(
-    f: &mut Frame,
-    area: Rect,
-    theme: &Theme,
-    data: &LensData,
-    focused: bool,
-    sel: usize,
-) {
+pub fn page(theme: &Theme, data: &LensData, focused: bool, sel: usize) -> Option<Page> {
     let LensData::Subdomains(s) = data else {
-        return;
+        return None;
     };
-
-    let title = format!("Subdomains · {} via {}", s.count, s.source);
-    let inner = panel::render(f, area, theme, &title, theme.pink, focused);
-
+    let page = Page::new(
+        format!("Subdomains · {} via {}", s.count, s.source),
+        theme.pink,
+    );
     if s.subdomains.is_empty() {
-        f.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                "no subdomains found",
-                Style::default()
-                    .fg(theme.overlay0)
-                    .add_modifier(Modifier::ITALIC),
-            ))),
-            inner,
-        );
-        return;
+        return Some(page.push(Block::Lines(vec![Line::from(Span::styled(
+            "no subdomains found",
+            Style::default()
+                .fg(theme.overlay0)
+                .add_modifier(Modifier::ITALIC),
+        ))])));
     }
-
-    let header = Row::new(["HOST"]).style(Style::default().fg(theme.overlay0));
-
-    let rows = s.subdomains.iter().enumerate().map(|(i, host)| {
-        Row::new(vec![sanitize_line(host)]).style(row_style(theme, focused && i == sel))
-    });
-
-    let table = Table::new(rows, [Constraint::Percentage(100)])
-        .header(header)
-        .column_spacing(1);
-    let mut state = scroll_to(focused.then_some(sel));
-    f.render_stateful_widget(table, inner, &mut state);
+    let rows = s
+        .subdomains
+        .iter()
+        .map(|host| Row::new(vec![sanitize_line(host)]))
+        .collect();
+    Some(
+        page.push(Block::Table(
+            TableBlock::new(vec!["HOST"], vec![Constraint::Percentage(100)], rows)
+                .selected(focused.then_some(sel)),
+        )),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::widgets::page;
+
+    /// Draw this lens's page as the TUI does.
+    fn render(
+        f: &mut ratatui::Frame,
+        area: ratatui::layout::Rect,
+        theme: &Theme,
+        data: &LensData,
+        focused: bool,
+        sel: usize,
+    ) {
+        if let Some(p) = page(theme, data, focused, sel) {
+            page::draw(f, area, theme, p, focused);
+        }
+    }
     use crate::tui::test_util::render_text;
     use seer_core::SubdomainResult;
 

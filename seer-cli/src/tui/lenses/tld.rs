@@ -1,32 +1,28 @@
 //! TLD Browser lens — live-filterable, scrollable list over the full TLD
 //! catalog with a per-TLD registry detail panel.
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::Constraint;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Row, Table};
-use ratatui::Frame;
+use ratatui::widgets::Row;
 
 use crate::tui::line_editor::LineEditor;
 use crate::tui::panes::tld::{filter_catalog, TldState};
 use crate::tui::theme::Theme;
-use crate::tui::widgets::{kv, or_dash, panel, scroll_to};
+use crate::tui::widgets::or_dash;
+use crate::tui::widgets::page::{Block, Page, TableBlock};
 use seer_core::TldInfo;
 
-/// Render the TLD browser. `loaded` is the detail for the most recently fetched
-/// TLD (if any); `loading` is true while a fetch is in flight; `editing` is the
+/// The TLD browser. `loaded` is the detail for the most recently fetched TLD
+/// (if any); `loading` is true while a fetch is in flight; `editing` is the
 /// in-progress filter buffer when the filter field is active (drives live
-/// filtering).
-pub fn render(
-    f: &mut Frame,
-    area: Rect,
+/// filtering). The list takes what the Registry panel beneath it leaves.
+pub fn page(
     theme: &Theme,
     state: &TldState,
     loaded: Option<&TldInfo>,
     loading: bool,
     editing: Option<&LineEditor>,
-) {
-    let inner = panel::render(f, area, theme, "TLD Browser", theme.maroon, false);
-
+) -> Page {
     // The list filters live against the in-progress edit buffer when the filter
     // field is active, otherwise against the committed filter.
     let effective_filter = editing.map_or(state.filter.as_str(), LineEditor::as_str);
@@ -36,40 +32,8 @@ pub fn render(
     } else {
         state.sel_under(effective_filter).min(list.len() - 1)
     };
-
     let selected_dotted = list.get(sel).map(|t| format!(".{t}")).unwrap_or_default();
 
-    // Only show the loaded detail when it matches the highlighted TLD, so moving
-    // the selection without reloading doesn't show stale data for another TLD.
-    let detail = loaded
-        .filter(|t| t.tld.trim_start_matches('.') == selected_dotted.trim_start_matches('.'))
-        .filter(|_| !loading)
-        .map(|t| {
-            let rows = [
-                ("tld", t.tld.clone()),
-                ("type", t.tld_type.clone()),
-                ("whois", or_dash(t.whois_server.as_deref())),
-                ("rdap", or_dash(t.rdap_url.as_deref())),
-                ("registry", or_dash(t.registry_url.as_deref())),
-            ];
-            // The panel's border takes a column each side.
-            kv::lines(theme, theme.maroon, &rows, inner.width.saturating_sub(2))
-        });
-    // The detail panel keeps its usual 8 rows, growing (from the list) when a
-    // wrapped value needs more, so no row is pushed out of it.
-    let detail_height = detail.as_ref().map_or(0, |lines| lines.len() + 2).max(8);
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1), // filter line
-            Constraint::Length(1), // hint line
-            Constraint::Min(3),    // list
-            Constraint::Length(u16::try_from(detail_height).unwrap_or(u16::MAX)), // detail
-        ])
-        .split(inner);
-
-    // ── filter line ──────────────────────────────────────────────────────────
     let filter_line = if let Some(buf) = editing {
         Line::from(vec![
             Span::styled("filter: ", Style::default().fg(theme.overlay0)),
@@ -97,70 +61,61 @@ pub fn render(
             ),
         ])
     };
-    f.render_widget(Paragraph::new(filter_line), chunks[0]);
+    let hint = Line::from(Span::styled(
+        "/ filter  ·  j/k move  ·  g/G top/bottom  ·  ↵ load details",
+        Style::default().fg(theme.overlay0),
+    ));
+    let mut page =
+        Page::new("TLD Browser", theme.maroon).push(Block::Lines(vec![filter_line, hint]));
 
-    // ── hint line ──────────────────────────────────────────────────────────
-    f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            "/ filter  ·  j/k move  ·  g/G top/bottom  ·  ↵ load details",
+    page = if list.is_empty() {
+        page.push(Block::Lines(vec![Line::from(Span::styled(
+            "no TLDs match — adjust the filter",
             Style::default().fg(theme.overlay0),
-        ))),
-        chunks[1],
-    );
-
-    // ── list ─────────────────────────────────────────────────────────────────
-    if list.is_empty() {
-        f.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                "no TLDs match — adjust the filter",
-                Style::default().fg(theme.overlay0),
-            ))),
-            chunks[2],
-        );
+        ))]))
     } else {
-        let rows = list.iter().enumerate().map(|(i, tld)| {
-            let style = if i == sel {
-                Style::default().fg(theme.text).bg(theme.surface0)
+        let rows = list
+            .iter()
+            .map(|tld| Row::new(vec![format!(".{tld}")]))
+            .collect();
+        page.push(Block::Table(
+            TableBlock::new(vec![], vec![Constraint::Percentage(100)], rows).selected(Some(sel)),
+        ))
+    };
+
+    // Only show the loaded detail when it matches the highlighted TLD, so moving
+    // the selection without reloading doesn't show stale data for another TLD.
+    let registry = Page::new("Registry", theme.maroon);
+    let detail =
+        loaded.filter(|t| t.tld.trim_start_matches('.') == selected_dotted.trim_start_matches('.'));
+    let registry = match (loading, detail) {
+        (true, _) => registry.push(Block::Lines(vec![Line::from(Span::styled(
+            format!("querying {selected_dotted}…"),
+            Style::default().fg(theme.overlay),
+        ))])),
+        (false, Some(t)) => registry.push(Block::Kv {
+            key_color: theme.maroon,
+            rows: vec![
+                ("tld", t.tld.clone()),
+                ("type", t.tld_type.clone()),
+                ("whois", or_dash(t.whois_server.as_deref())),
+                ("rdap", or_dash(t.rdap_url.as_deref())),
+                ("registry", or_dash(t.registry_url.as_deref())),
+            ],
+        }),
+        (false, None) => {
+            let hint = if selected_dotted.is_empty() {
+                "—".to_string()
             } else {
-                Style::default().fg(theme.subtext)
+                format!("press ↵ to load details for {selected_dotted}")
             };
-            Row::new(vec![Line::from(format!(".{tld}"))]).style(style)
-        });
-        let table = Table::new(rows, [Constraint::Percentage(100)]).column_spacing(0);
-        let mut ts = scroll_to(Some(sel));
-        f.render_stateful_widget(table, chunks[2], &mut ts);
-    }
-
-    // ── detail ─────────────────────────────────────────────────────────────
-    let detail_inner = panel::render(f, chunks[3], theme, "Registry", theme.maroon, false);
-
-    if loading {
-        f.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                format!("querying {selected_dotted}…"),
-                Style::default().fg(theme.overlay),
-            ))),
-            detail_inner,
-        );
-        return;
-    }
-
-    if let Some(lines) = detail {
-        f.render_widget(Paragraph::new(lines), detail_inner);
-    } else {
-        let hint = if selected_dotted.is_empty() {
-            "—".to_string()
-        } else {
-            format!("press ↵ to load details for {selected_dotted}")
-        };
-        f.render_widget(
-            Paragraph::new(Line::from(Span::styled(
+            registry.push(Block::Lines(vec![Line::from(Span::styled(
                 hint,
                 Style::default().fg(theme.overlay0),
-            ))),
-            detail_inner,
-        );
-    }
+            ))]))
+        }
+    };
+    page.push(Block::Panel(registry))
 }
 
 fn plural(n: usize) -> &'static str {
@@ -174,6 +129,26 @@ fn plural(n: usize) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::widgets::page;
+
+    /// Draw this lens's page as the TUI does.
+    fn render(
+        f: &mut ratatui::Frame,
+        area: ratatui::layout::Rect,
+        theme: &Theme,
+        state: &TldState,
+        loaded: Option<&TldInfo>,
+        loading: bool,
+        editing: Option<&LineEditor>,
+    ) {
+        page::draw(
+            f,
+            area,
+            theme,
+            page(theme, state, loaded, loading, editing),
+            false,
+        );
+    }
     use crate::tui::panes::tld::TldState;
     use crate::tui::test_util::{render_lines, render_text};
     use seer_core::TldInfo;
