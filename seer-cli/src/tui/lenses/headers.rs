@@ -19,7 +19,7 @@ use seer_core::HeaderVerdict;
 use crate::tui::action::LensData;
 use crate::tui::theme::Theme;
 use crate::tui::widgets::inspector::{self, Field};
-use crate::tui::widgets::{dot, gauge, panel, row_style};
+use crate::tui::widgets::{dot, gauge, kv, panel, row_style};
 
 /// Tone for a verdict, using the shared `Theme::tone` vocabulary so these
 /// verdicts read the same as every other status in the TUI.
@@ -107,32 +107,23 @@ pub fn render(
     // Per-header verdicts. The value carries the verdict word; the header name
     // is the key, so this reads as a checklist top to bottom.
     //
-    // Built by hand rather than via `kv::render`: that helper paints every
-    // value one color, and colouring each verdict by severity is the whole
-    // point of this band — a column of same-colored words would bury the
-    // absent headers among the strict ones.
-    let width = chunks[1].width as usize;
+    // Built from `kv`'s gutter and leaders rather than `kv::render`: that
+    // paints every value one color, and colouring each verdict by severity
+    // is the whole point of this band — a column of same-colored words
+    // would bury the absent headers among the strict ones.
+    let gutter = kv::gutter(h.headers.iter().map(|f| f.header.as_str()), chunks[1].width);
     let lines: Vec<Line> = h
         .headers
         .iter()
         .enumerate()
         .map(|(i, finding)| {
-            let label = finding.verdict.as_str();
             let header = sanitize_line(&finding.header);
-            let used = header.chars().count() + label.chars().count() + 2;
-            let dots = width.saturating_sub(used).max(1);
-            Line::from(vec![
-                Span::styled(header, Style::default().fg(theme.mauve)),
-                Span::styled(
-                    format!(" {} ", ".".repeat(dots)),
-                    Style::default().fg(theme.surface1),
-                ),
-                Span::styled(
-                    label,
-                    Style::default().fg(theme.tone(verdict_tone(finding.verdict))),
-                ),
-            ])
-            .style(row_style(theme, focused && i == sel))
+            let mut spans = kv::leader(theme, &header, theme.mauve, gutter).to_vec();
+            spans.push(Span::styled(
+                finding.verdict.as_str(),
+                Style::default().fg(theme.tone(verdict_tone(finding.verdict))),
+            ));
+            Line::from(spans).style(row_style(theme, focused && i == sel))
         })
         .collect();
     f.render_widget(Paragraph::new(lines), chunks[1]);
@@ -250,7 +241,7 @@ mod tests {
     fn verdict_on_row(s: &str, header: &str) -> String {
         let row = s
             .lines()
-            .find(|l| l.contains(&format!("{header} .")))
+            .find(|l| l.contains(&format!("{header} ·")))
             .unwrap_or_else(|| panic!("no verdict row for {header}: {s}"));
         row.trim_end()
             .trim_end_matches('│')

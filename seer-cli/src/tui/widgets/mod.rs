@@ -130,29 +130,49 @@ pub fn wrap(text: &str, width: u16) -> Vec<String> {
     lines
 }
 
-/// [`wrap`], except a word wider than the line is split across lines rather
-/// than clipped: for values with long unbroken runs (TXT/DKIM data, header
-/// values). A width of 0 is treated as 1.
+/// `text` split into lines at most `width` columns wide, breaking at the
+/// last space that fits (the spaces at a break are dropped) and splitting a
+/// run with no space mid-word. Unlike [`wrap`], the spacing inside a line is
+/// kept: for values whose spacing is data (TXT records, header values).
+/// A width of 0 is treated as 1.
 pub fn wrap_hard(text: &str, width: u16) -> Vec<String> {
     let max = usize::from(width.max(1));
-    let mut out = Vec::new();
-    for line in wrap(text, width.max(1)) {
-        let mut piece = String::new();
-        let mut used = 0;
-        for c in line.chars() {
-            let w = Span::raw(c.to_string()).width();
-            if used + w > max && !piece.is_empty() {
-                out.push(std::mem::take(&mut piece));
-                used = 0;
-            }
-            piece.push(c);
-            used += w;
+    let col = |s: &str| Span::raw(s).width();
+    // Close `line` onto `lines`: trailing spaces dropped, blank lines skipped.
+    fn push(lines: &mut Vec<String>, line: &mut String) {
+        let kept = line.trim_end();
+        if !kept.is_empty() {
+            lines.push(kept.to_string());
         }
-        if !piece.is_empty() {
-            out.push(piece);
+        line.clear();
+    }
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for c in text.chars() {
+        let mut buf = [0u8; 4];
+        let w = col(c.encode_utf8(&mut buf));
+        if col(&line) + w > max && !line.is_empty() {
+            if c == ' ' {
+                push(&mut lines, &mut line);
+                continue;
+            }
+            match line.rfind(' ') {
+                // Carry the word after the last space onto the next line.
+                Some(at) => {
+                    let rest = line.split_off(at + 1);
+                    push(&mut lines, &mut line);
+                    line = rest;
+                }
+                None => push(&mut lines, &mut line),
+            }
+        }
+        // A continuation line does not start with the spaces it broke at.
+        if !(line.is_empty() && c == ' ' && !lines.is_empty()) {
+            line.push(c);
         }
     }
-    out
+    push(&mut lines, &mut line);
+    lines
 }
 
 #[cfg(test)]
@@ -229,6 +249,15 @@ mod tests {
         assert!(wrap_hard("", 5).is_empty());
         // Width 0 must not loop forever: treated as 1.
         assert_eq!(wrap_hard("ab", 0), ["a", "b"]);
+    }
+
+    #[test]
+    fn wrap_hard_keeps_the_spacing_inside_a_line() {
+        // A value's own spacing is data (a TXT record, joined nameservers):
+        // only the spaces a line breaks at are dropped.
+        assert_eq!(wrap_hard("a  b", 10), ["a  b"]);
+        assert_eq!(wrap_hard("v=spf1  -all", 7), ["v=spf1", "-all"]);
+        assert!(wrap_hard("   ", 5).is_empty());
     }
 
     #[test]
