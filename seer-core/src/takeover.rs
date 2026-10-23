@@ -68,7 +68,7 @@ use crate::validation::{normalize_domain, normalize_host};
 /// [`TakeoverReport::hosts_skipped`] state the value; keep them in step.
 const MAX_TAKEOVER_HOSTS: usize = 2000;
 
-/// Default per-hop HTTP timeout for a fingerprint probe, for callers with no
+/// Default HTTP fetch deadline for a fingerprint probe, for callers with no
 /// configured value of their own (the Python bindings). The CLI passes
 /// `config.http_timeout()`.
 pub const DEFAULT_TAKEOVER_TIMEOUT: Duration = Duration::from_secs(10);
@@ -794,7 +794,7 @@ fn build_report(
 /// * `domain` - The apex the hosts belong to (reported, and normalized)
 /// * `hosts` - Candidate hostnames (typically from CT-log enumeration)
 /// * `concurrency` - Maximum simultaneous host checks
-/// * `timeout` - Per-hop HTTP timeout for each probe (the CLI passes
+/// * `timeout` - HTTP fetch deadline for each probe (the CLI passes
 ///   `config.http_timeout()`; [`DEFAULT_TAKEOVER_TIMEOUT`] otherwise)
 ///
 /// # Returns
