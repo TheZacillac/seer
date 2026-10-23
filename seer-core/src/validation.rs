@@ -142,14 +142,6 @@ fn normalize(domain: &str, kind: NameKind) -> Result<String> {
     let absolute = domain.ends_with('.');
     let domain = domain.strip_suffix('.').unwrap_or(domain);
 
-    // Remove www. prefix — but only when what remains still has a dot.
-    // `www.com`, `www.net`, … are registered domains in their own right;
-    // stripping them would leave a bare TLD and reject a valid query.
-    let domain = match domain.strip_prefix("www.") {
-        Some(rest) if kind == NameKind::Domain && rest.contains('.') => rest,
-        _ => domain,
-    };
-
     // Validate domain format. A single label is a name only as a query name
     // written absolute (`com.`, `mx.`): dig-style TLD and root-zone queries.
     // Bare, it is far more likely a typo than a TLD.
@@ -163,6 +155,15 @@ fn normalize(domain: &str, kind: NameKind) -> Result<String> {
         domain_to_ascii(domain)?
     } else {
         domain.to_string()
+    };
+
+    // Remove www. prefix — but only when what remains still has a dot.
+    // `www.com`, `www.net`, … are registered domains in their own right;
+    // stripping them would leave a bare TLD and reject a valid query. Done
+    // after the IDN mapping so a full-width `ｗｗｗ.` is caught too.
+    let domain = match domain.strip_prefix("www.") {
+        Some(rest) if kind == NameKind::Domain && rest.contains('.') => rest.to_string(),
+        _ => domain,
     };
 
     // A query name may lead with the RFC 4592 wildcard label. Only the whole
@@ -440,6 +441,29 @@ mod tests {
         assert_eq!(normalize_domain("https://www.io/x").unwrap(), "www.io");
         // A registrable name after the strip still normalizes to the apex.
         assert_eq!(normalize_domain("www.example.com.").unwrap(), "example.com");
+    }
+
+    #[test]
+    fn www_is_stripped_however_it_is_spelled() {
+        // UTS #46 maps full-width `ｗｗｗ` to `www`; the strip must see the
+        // mapped name, or the history/watchlist key splits in two.
+        assert_eq!(
+            normalize_domain("\u{FF57}\u{FF57}\u{FF57}.example.com").unwrap(),
+            "example.com"
+        );
+        assert_eq!(
+            normalize_domain("\u{FF37}\u{FF37}\u{FF37}\u{FF0E}example.com").unwrap(),
+            "example.com"
+        );
+        // Still kept when only a TLD would remain, and by normalize_host.
+        assert_eq!(
+            normalize_domain("\u{FF57}\u{FF57}\u{FF57}.com").unwrap(),
+            "www.com"
+        );
+        assert_eq!(
+            normalize_host("\u{FF57}\u{FF57}\u{FF57}.example.com").unwrap(),
+            "www.example.com"
+        );
     }
 
     #[test]
