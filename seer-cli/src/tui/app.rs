@@ -1369,6 +1369,38 @@ mod tests {
         assert_eq!(app.row_count(), 2);
     }
 
+    /// Every key a lens advertises is consumed by its pane (no dead hints).
+    #[test]
+    fn every_lens_key_hint_is_handled() {
+        for lens in lenses::lenses() {
+            for hint in lens.keys {
+                let mut app = App::new(Some("example.com".into()));
+                app.lens = lens.key.index();
+                app.tab = hint.tab.unwrap_or(0);
+                app.focus = Focus::Pane;
+                match lens.key {
+                    LensKey::Watch => {
+                        app.states
+                            .insert(LensKey::Watch, make_watch_state("example.com"));
+                    }
+                    LensKey::History => {
+                        app.states
+                            .insert(LensKey::History, make_history_state("old.com"));
+                    }
+                    _ => {}
+                }
+                let ev = KeyEvent::new(hint.code, KeyModifiers::NONE);
+                assert!(
+                    app.handle_pane_key(ev, None).is_some(),
+                    "{} hint {:?} ({}) is not handled",
+                    lens.label,
+                    hint.key,
+                    hint.what
+                );
+            }
+        }
+    }
+
     #[test]
     fn new_starts_on_overview_nav_focus() {
         let app = App::new(None);

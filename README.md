@@ -183,7 +183,7 @@ The **lens** sidebar covers every Seer capability, grouped, each pulling live da
 - **SECURITY** — SSL / Cert · Status · Subdomains · HTTP Headers · Takeover · Audit
 - **POWER** — Diff · Bulk (streaming + CSV export) · Watchlist · History
 
-**Keys:** `j`/`k` move · `1`–`9` jump to a lens · `Tab` focus nav⇄pane · `[` `]` sub-tabs · `r` raw output (json/yaml/markdown; `PgUp`/`PgDn` scroll) · `y` copy · `/` look up a domain · `:` command · `?` help · `:q` quit. In-pane: switchers (TLD, nameserver, Compare resolvers, Bulk op) and editable fields (Diff's 2nd domain, Follow interval/count, Bulk file path).
+**Keys:** `j`/`k` move · `1`–`9` jump to a lens · `Tab` focus nav⇄pane · `[` `]` sub-tabs · `r` raw output (json/yaml/markdown; `PgUp`/`PgDn` scroll) · `y` copy · `/` look up a domain · `:` command · `?` help · `:q` quit. In-pane: switchers (TLD, nameserver, Compare resolvers, Bulk op) and editable fields (Diff's 2nd domain, Follow interval/count, Bulk file path). In a focused pane the status bar lists that lens's own keys, and `?` shows them too. Audit, DNS records, HTTP Headers, Takeover and History show the selected row's full detail beneath the table while focused.
 
 Subdomains, Takeover and Audit query CT logs and probe hosts, so they run only when you press `↵` on them (or use their `:` command), never just by moving onto them. Removing a watched domain (`d`) and clearing history (`c`) ask for a second press.
 
