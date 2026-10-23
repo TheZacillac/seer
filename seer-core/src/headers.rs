@@ -877,7 +877,7 @@ pub(crate) fn build_report(domain: String, response: &ResponseHead) -> HeaderRep
 ///
 /// # Arguments
 /// * `domain` - Domain to audit (normalized internally)
-/// * `timeout` - Per-hop HTTP timeout
+/// * `timeout` - HTTP fetch deadline (the whole redirect walk)
 ///
 /// # Returns
 /// * `Ok(HeaderReport)` - the graded audit

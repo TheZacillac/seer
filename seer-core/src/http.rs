@@ -16,9 +16,13 @@
 //!   the TOCTOU window between validation and connect (DNS-rebinding defense).
 //!   Pinning depends on the resolved addresses, so the client is built per hop.
 //! - The body is read from a stream with an incremental cap, so a server that
-//!   omits or lies about `Content-Length` cannot force an unbounded buffer, and
-//!   the read is wrapped in a total-duration timeout so a server that trickles
-//!   bytes forever cannot hang the caller.
+//!   omits or lies about `Content-Length` cannot force an unbounded buffer.
+//! - One deadline, the configured timeout, bounds the whole fetch: every
+//!   hop's SSRF resolution, connect and response, and the body read. Hops
+//!   share what is left of it rather than each getting a fresh timeout, so a
+//!   chain of slow redirects (or a server trickling its body) cannot multiply
+//!   the wait. A fetch that never redirects behaves as before: one request
+//!   under one timeout.
 //! - Failures are classified ([`SendError`]): a connect failure on the first
 //!   hop that reached the network is distinguishable from an unknown (a
 //!   timeout, a local no-route error — this host has no route — or a redirect
@@ -42,7 +46,7 @@ use reqwest::Url;
 
 use crate::error::{Result, SeerError};
 
-/// Default per-hop timeout (connect + response headers + body read).
+/// Default fetch deadline: the whole redirect walk plus the body read.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Deadline for tests that connect to a closed loopback port and expect a
@@ -178,7 +182,7 @@ impl GuardedFetcher {
         }
     }
 
-    /// Sets the per-hop timeout.
+    /// Sets the fetch deadline (the whole redirect walk plus the body read).
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
@@ -204,9 +208,11 @@ impl GuardedFetcher {
     /// * [`SeerError::HttpError`] — bad URL shape, SSRF-blocked host, redirect
     ///   loop, too many hops, or a transport failure.
     pub async fn get(&self, url: &str) -> Result<FetchedResponse> {
-        let (response, redirects) = self.send(url).await?;
-        let head = ResponseHead::of(&response, redirects);
-        let body = self.read_body(response).await?;
+        let deadline = self.deadline();
+        let mut chain = Vec::new();
+        let response = self.send_until(url, &mut chain, deadline).await?;
+        let head = ResponseHead::of(&response, chain.len().saturating_sub(1));
+        let body = self.read_body_until(response, deadline).await?;
         Ok(FetchedResponse { head, body })
     }
 
@@ -214,10 +220,12 @@ impl GuardedFetcher {
     /// response (a 3xx only when it carries no `Location`) with its body still
     /// unread, plus the number of hops followed. For callers that want the
     /// body only for some responses — read it through
-    /// [`GuardedFetcher::read_body`] so the cap still applies.
+    /// [`GuardedFetcher::read_body`] so the cap still applies. The response's
+    /// client carries what is left of the fetch deadline as its total
+    /// timeout, which spans the body, so a later read stays within it.
     pub async fn send(&self, url: &str) -> Result<(reqwest::Response, usize)> {
         let mut chain = Vec::new();
-        let response = self.send_inner(url, &mut chain).await?;
+        let response = self.send_until(url, &mut chain, self.deadline()).await?;
         Ok((response, chain.len().saturating_sub(1)))
     }
 
@@ -228,7 +236,7 @@ impl GuardedFetcher {
     pub async fn get_head_traced(&self, url: &str) -> Traced<ResponseHead> {
         let mut chain = Vec::new();
         let result = self
-            .send_inner(url, &mut chain)
+            .send_until(url, &mut chain, self.deadline())
             .await
             .map(|response| ResponseHead::of(&response, chain.len().saturating_sub(1)));
         Traced { chain, result }
@@ -237,11 +245,12 @@ impl GuardedFetcher {
     /// [`GuardedFetcher::get`] that also reports the URLs attempted and keeps
     /// the connect/other split. See [`Traced`].
     pub async fn get_traced(&self, url: &str) -> Traced<FetchedResponse> {
+        let deadline = self.deadline();
         let mut chain = Vec::new();
-        let result = match self.send_inner(url, &mut chain).await {
+        let result = match self.send_until(url, &mut chain, deadline).await {
             Ok(response) => {
                 let head = ResponseHead::of(&response, chain.len().saturating_sub(1));
-                self.read_body(response)
+                self.read_body_until(response, deadline)
                     .await
                     .map(|body| FetchedResponse { head, body })
                     .map_err(SendError::Other)
@@ -251,12 +260,36 @@ impl GuardedFetcher {
         Traced { chain, result }
     }
 
-    /// The redirect walk behind every fetch: records each URL in `chain`
-    /// before requesting it and classifies a failed connect.
-    async fn send_inner(
+    /// The deadline for a fetch starting now.
+    fn deadline(&self) -> tokio::time::Instant {
+        tokio::time::Instant::now() + self.timeout
+    }
+
+    /// [`GuardedFetcher::walk`] bounded by `deadline`; running out is a
+    /// timeout ([`SendError::Other`]). `chain` keeps the URLs attempted.
+    async fn send_until(
         &self,
         url: &str,
         chain: &mut Vec<String>,
+        deadline: tokio::time::Instant,
+    ) -> std::result::Result<reqwest::Response, SendError> {
+        match tokio::time::timeout_at(deadline, self.walk(url, chain, deadline)).await {
+            Ok(result) => result,
+            Err(_) => Err(SendError::Other(SeerError::Timeout(format!(
+                "HTTP fetch timed out after {:?}",
+                self.timeout
+            )))),
+        }
+    }
+
+    /// The redirect walk behind every fetch: records each URL in `chain`
+    /// before requesting it and classifies a failed connect. Each hop's
+    /// client gets what is left of `deadline` as its total timeout.
+    async fn walk(
+        &self,
+        url: &str,
+        chain: &mut Vec<String>,
+        deadline: tokio::time::Instant,
     ) -> std::result::Result<reqwest::Response, SendError> {
         let mut url = Url::parse(url).map_err(|e| {
             SendError::Other(SeerError::HttpError(format!(
@@ -275,8 +308,9 @@ impl GuardedFetcher {
             chain.push(url.to_string());
 
             // No auto-redirects (see the module docs): each hop is re-guarded.
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             let mut builder =
-                crate::net::client_builder(self.timeout).user_agent(crate::net::USER_AGENT);
+                crate::net::client_builder(remaining).user_agent(crate::net::USER_AGENT);
 
             if !self.allow_private {
                 let addrs = crate::net::validate_http_url(&url)
@@ -333,17 +367,31 @@ impl GuardedFetcher {
         )))
     }
 
-    /// Streams at most `self.max_body` bytes of the response body, bounded by
-    /// an overall read timeout, and decodes them lossily as UTF-8.
+    /// Streams at most `self.max_body` bytes of the response body and
+    /// decodes them lossily as UTF-8. The read is bounded by the fetch
+    /// deadline (see [`GuardedFetcher::send`]) and, as a backstop, by one
+    /// more timeout of its own.
     pub async fn read_body(&self, response: reqwest::Response) -> Result<String> {
-        let body = read_body_capped(response, self.max_body, self.timeout, Overflow::Truncate)
+        self.read_body_until(response, self.deadline()).await
+    }
+
+    /// [`GuardedFetcher::read_body`] bounded by `deadline`.
+    async fn read_body_until(
+        &self,
+        response: reqwest::Response,
+        deadline: tokio::time::Instant,
+    ) -> Result<String> {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let timed_out =
+            || SeerError::Timeout(format!("HTTP body read timed out after {:?}", self.timeout));
+        let body = read_body_capped(response, self.max_body, remaining, Overflow::Truncate)
             .await
             .map_err(|e| match e {
                 // A truncated body is still usable for fingerprinting, but a
-                // read that never terminates is a failure.
-                BodyReadError::TimedOut => {
-                    SeerError::Timeout(format!("HTTP body read timed out after {:?}", self.timeout))
-                }
+                // read that never terminates is a failure, whichever of our
+                // deadline and the client's (the same one) fires first.
+                BodyReadError::TimedOut => timed_out(),
+                BodyReadError::Chunk(e) if e.is_timeout() => timed_out(),
                 // A chunk error (a truncating read never reports TooLarge).
                 other => SeerError::HttpError(format!("body chunk: {other}")),
             })?;
@@ -857,5 +905,81 @@ mod tests {
             other => panic!("expected SendError::Other, got {:?}", other.err()),
         }
         assert_eq!(traced.chain.len(), 2);
+    }
+
+    /// Regression: each redirect hop got a fresh full timeout, so six hops of
+    /// 300ms each finished after ~1.8s under a 1s timeout.
+    #[tokio::test]
+    async fn one_deadline_bounds_the_whole_redirect_walk() {
+        let server = MockServer::start().await;
+        for n in 0..5 {
+            Mock::given(method("GET"))
+                .and(path(format!("/{n}")))
+                .respond_with(
+                    ResponseTemplate::new(302)
+                        .insert_header("location", format!("/{}", n + 1))
+                        .set_delay(Duration::from_millis(300)),
+                )
+                .mount(&server)
+                .await;
+        }
+        Mock::given(method("GET"))
+            .and(path("/5"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(300)))
+            .mount(&server)
+            .await;
+
+        let started = std::time::Instant::now();
+        let traced = GuardedFetcher::new()
+            .with_timeout(Duration::from_secs(1))
+            .allowing_private_hosts()
+            .get_head_traced(&format!("{}/0", server.uri()))
+            .await;
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(traced.result, Err(SendError::Other(SeerError::Timeout(_)))),
+            "{:?}",
+            traced.result.map(|h| h.status)
+        );
+        assert!(elapsed < Duration::from_millis(1500), "took {elapsed:?}");
+        // The hops reached before the deadline are still reported.
+        assert!((2..6).contains(&traced.chain.len()), "{:?}", traced.chain);
+    }
+
+    /// The body read shares the walk's deadline: a slow redirect followed by
+    /// a stalled body does not get a fresh timeout for the read.
+    #[tokio::test]
+    async fn the_body_read_shares_the_fetch_deadline() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut tcp, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let n = tcp.read(&mut buf).await.unwrap_or(0);
+                    let reply: &[u8] = if buf[..n].starts_with(b"GET /start") {
+                        tokio::time::sleep(Duration::from_millis(700)).await;
+                        b"HTTP/1.1 302 Found\r\nlocation: /end\r\ncontent-length: 0\r\n\r\n"
+                    } else {
+                        // Promise a body, send part of it, then stall.
+                        b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\npartial"
+                    };
+                    let _ = tcp.write_all(reply).await;
+                    std::future::pending::<()>().await;
+                });
+            }
+        });
+
+        let started = std::time::Instant::now();
+        let result = GuardedFetcher::new()
+            .with_timeout(Duration::from_secs(1))
+            .allowing_private_hosts()
+            .get(&format!("http://{addr}/start"))
+            .await;
+        let elapsed = started.elapsed();
+        assert!(matches!(result, Err(SeerError::Timeout(_))), "{result:?}");
+        assert!(elapsed < Duration::from_millis(1400), "took {elapsed:?}");
     }
 }
