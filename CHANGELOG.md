@@ -29,6 +29,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - TUI key/value rows align to a shared gutter and wrap long values instead
   of clipping them at the pane edge.
+- TUI: every lens is drawn through one layout template, so a lens can no
+  longer overflow a hand-sized area: when space is short, blank rows go
+  first, then table rows (keeping the header and three rows), then a row's
+  detail, then scrolling text and key/value rows; verdicts and notes are
+  never cut, and a table cut short says how many rows it left out. Visible
+  changes: the Overview header sits inside its border; Watchlist and
+  Propagation are one panel each; HTTP Headers lists its verdicts as a
+  HEADER / VERDICT table.
 
 ### Fixed
 - TUI `?` help no longer clips its `:` row.
