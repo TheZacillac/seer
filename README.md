@@ -741,7 +741,7 @@ Propagation checks query **30 nameservers** across **6 regions**:
 | `SEER_TRUSTED_PROXY_IPS` | Comma-separated IPs allowed to set `X-Forwarded-For` | — |
 | `SEER_MCP_ALLOWED_HOSTS` | Comma-separated `Host:` values for the MCP `/mcp` endpoint — setting this turns on DNS-rebinding protection | — |
 | `SEER_MCP_ALLOWED_ORIGINS` | Comma-separated `Origin:` values for the MCP `/mcp` endpoint (browser hosts) | — |
-| `WEB_CONCURRENCY` | Uvicorn worker count. `>1` requires a non-`memory://` store | `1` |
+| `WEB_CONCURRENCY` | Uvicorn worker count. `>1` requires a non-`memory://` store (startup refuses otherwise). A worker count passed as `--workers`/`-w` or to `uvicorn.run()` is not visible to the app and not checked: set a shared store yourself | `1` |
 | `UVICORN_WORKERS` | Fallback worker count when `WEB_CONCURRENCY` is unset (same `>1` store rule) | `1` |
 | `SEER_RELOAD` | Uvicorn auto-reload for the `seer-api` entry point (dev only) | `false` |
 

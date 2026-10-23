@@ -105,7 +105,8 @@ def get_client_ip(request: Request) -> str:
 # NOTE: In-memory rate limiting is per-worker. With multiple uvicorn workers,
 # the effective rate limit is multiplied by the worker count. The application
 # lifespan refuses to start with WEB_CONCURRENCY>1 and the default memory://
-# store; for multi-worker deployments set SEER_RATE_LIMIT_STORAGE to a Redis URL:
+# store (a `--workers`/`-w` flag is invisible to it: see main.lifespan); for
+# multi-worker deployments set SEER_RATE_LIMIT_STORAGE to a Redis URL:
 #   export SEER_RATE_LIMIT_STORAGE="redis://localhost:6379"
 _storage_uri = os.environ.get("SEER_RATE_LIMIT_STORAGE", "memory://")
 # SEER_RATE_LIMIT governs the raw POST /mcp route (enforced by main.py's
