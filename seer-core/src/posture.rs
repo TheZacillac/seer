@@ -13,8 +13,10 @@
 //! pure and unit-tested; only the record fetch is async.
 //!
 //! Beyond verdicts and notes, the result carries structured signals for
-//! machine consumers: [`SpfPolicy::permerror`] (why SPF evaluation fails) and
-//! [`EmailPosture::mx`] (hosts, null MX, absent or unknown).
+//! machine consumers: [`SpfPolicy::permerror`] (why SPF evaluation fails),
+//! [`DmarcPolicy::effective_policy`] (the DMARC policy that actually applies,
+//! after `sp=` inheritance) and [`EmailPosture::mx`] (hosts, null MX, absent
+//! or unknown).
 
 use std::collections::HashMap;
 
@@ -127,6 +129,12 @@ pub struct DmarcPolicy {
     /// The `sp=` subdomain policy, if set.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subdomain_policy: Option<String>,
+    /// The policy receivers apply to this domain: `sp=` when the record is
+    /// inherited from the organizational domain and sets one, else `p=`
+    /// (RFC 7489 §6.6.3). `None` when no single record applies (none, or
+    /// several published). `verdict` grades this value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_policy: Option<String>,
     /// Aggregate report (`rua=`) destinations.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub aggregate_reports: Vec<String>,
@@ -601,6 +609,7 @@ fn absent_dmarc() -> DmarcPolicy {
         record: None,
         policy: None,
         subdomain_policy: None,
+        effective_policy: None,
         aggregate_reports: Vec::new(),
         percent: None,
         verdict: PostureVerdict::Absent,
@@ -692,6 +701,7 @@ fn build_dmarc(domain: &str, discovery: &DmarcDiscovery) -> Assessed<DmarcPolicy
         ));
     }
     let effective_lc = effective.map(str::to_ascii_lowercase);
+    let effective_policy = effective.map(str::to_string);
     match (base, effective_lc.as_deref()) {
         (PostureVerdict::Moderate, _) => notes.push(format!(
             "DMARC policy is {label}=quarantine — spoofed mail is filtered but not rejected."
@@ -718,6 +728,7 @@ fn build_dmarc(domain: &str, discovery: &DmarcDiscovery) -> Assessed<DmarcPolicy
             present: true,
             verdict,
             subdomain_policy,
+            effective_policy,
             percent,
             aggregate_reports,
             policy,
@@ -725,6 +736,18 @@ fn build_dmarc(domain: &str, discovery: &DmarcDiscovery) -> Assessed<DmarcPolicy
         },
         notes,
     }
+}
+
+/// Test-only: the DMARC policy [`build_dmarc`] assembles for `domain` from
+/// the `txts` found at `_dmarc.<at>` (inherited when `at` is not `domain`).
+#[cfg(test)]
+pub(crate) fn dmarc_from_records(domain: &str, at: &str, txts: &[&str]) -> DmarcPolicy {
+    let source = DmarcSource {
+        txts: txts.iter().map(|t| t.to_string()).collect(),
+        at: at.to_string(),
+        inherited: at != domain,
+    };
+    build_dmarc(domain, &DmarcDiscovery::Found(source)).policy
 }
 
 fn build_mta_sts(txt: &TxtLookup) -> MtaStsPolicy {
@@ -1375,11 +1398,13 @@ mod tests {
         };
         let dmarc = build_dmarc("mail.org.test", &inherited("v=DMARC1; p=none; sp=reject"));
         assert_eq!(dmarc.policy.verdict, PostureVerdict::Strict);
+        assert_eq!(dmarc.policy.effective_policy.as_deref(), Some("reject"));
         assert!(dmarc.notes[0].contains("inherits"), "{:?}", dmarc.notes);
         assert!(dmarc.notes[0].contains("_dmarc.org.test"));
 
         let dmarc = build_dmarc("mail.org.test", &inherited("v=DMARC1; p=quarantine"));
         assert_eq!(dmarc.policy.verdict, PostureVerdict::Moderate);
+        assert_eq!(dmarc.policy.effective_policy.as_deref(), Some("quarantine"));
     }
 
     #[test]
