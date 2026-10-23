@@ -12,8 +12,13 @@ from __future__ import annotations
 
 import asyncio
 
+from limits import parse
+
 import seer
+from seer_api._contract import BULK_LIMIT, HEAVY_LIMIT
+from seer_api.limiting import limiter
 from seer_api.mcp import server
+from seer_api.routers import dns, intel, lookup, propagation, rdap, ssl, status, tld, whois
 
 
 def _text(out) -> str:
@@ -99,3 +104,74 @@ def test_unlimited_tools_are_not_throttled_per_tool(monkeypatch):
     for _ in range(12):
         out = asyncio.run(server.call_tool("seer_lookup", {"domain": "example.com"}))
         assert "rate limit" not in _text(out).lower(), _text(out)
+
+
+# --- REST/MCP parity ------------------------------------------------------
+# Every MCP tool and the REST route(s) running the same operation (a bulk
+# tool: the sync and the streaming route). Must name every tool (enforced
+# below), so a new tool cannot skip the parity check.
+_REST_TWINS = {
+    "seer_lookup": (lookup.smart_lookup,),
+    "seer_whois": (whois.whois_lookup,),
+    "seer_rdap_domain": (rdap.rdap_domain_lookup,),
+    "seer_rdap_ip": (rdap.rdap_ip_lookup,),
+    "seer_rdap_asn": (rdap.rdap_asn_lookup,),
+    "seer_dig": (dns.dns_lookup,),
+    "seer_dns_trace": (dns.dns_trace,),
+    "seer_dns_compare": (dns.dns_compare,),
+    "seer_propagation": (propagation.propagation_check,),
+    "seer_status": (status.check_status,),
+    "seer_ssl": (ssl.ssl_inspect,),
+    "seer_availability": (intel.availability,),
+    "seer_info": (intel.info,),
+    "seer_subdomains": (intel.subdomains,),
+    "seer_dnssec": (intel.dnssec,),
+    "seer_delegation": (intel.delegation,),
+    "seer_diff": (intel.diff,),
+    "seer_caa": (intel.caa,),
+    "seer_posture": (intel.posture,),
+    "seer_headers": (intel.headers,),
+    "seer_audit": (intel.audit,),
+    "seer_takeover": (intel.takeover,),
+    "seer_confusables": (intel.confusables,),
+    "seer_tld_info": (tld.tld_info,),
+    "seer_tld_list": (tld.tld_list,),
+    "seer_bulk_lookup": (lookup.bulk_smart_lookup, lookup.bulk_smart_lookup_stream),
+    "seer_bulk_whois": (whois.bulk_whois_lookup, whois.bulk_whois_stream),
+    "seer_bulk_dig": (dns.bulk_dns_lookup, dns.bulk_dns_stream),
+    "seer_bulk_propagation": (
+        propagation.bulk_propagation_check,
+        propagation.bulk_propagation_stream,
+    ),
+    "seer_bulk_status": (status.bulk_status, status.bulk_status_stream),
+    "seer_bulk_ssl": (ssl.bulk_ssl, ssl.bulk_ssl_stream),
+    "seer_bulk_info": (intel.bulk_info,),
+    "seer_bulk_availability": (intel.bulk_availability,),
+}
+
+
+def _rest_limits(endpoint) -> list:
+    """The limits slowapi registered for a REST endpoint function."""
+    name = f"{endpoint.__module__}.{endpoint.__name__}"
+    return [lim.limit for lim in limiter._route_limits[name]]
+
+
+def test_every_mcp_tool_names_its_rest_twin():
+    assert set(_REST_TWINS) == set(server._TOOLS)
+
+
+def test_contract_limits_match_across_rest_and_mcp():
+    """Regression: REST /subdomains was a literal 20/minute while
+    seer_subdomains carried HEAVY_LIMIT (5/minute) for the same resolve=true
+    fan-out. An operation on a contract limit (`_contract.BULK_LIMIT` /
+    `HEAVY_LIMIT`) on either surface must carry exactly that limit on both."""
+    contract = {parse(BULK_LIMIT), parse(HEAVY_LIMIT)}
+    mismatched = {}
+    for tool, endpoints in _REST_TWINS.items():
+        mcp_limit = server._TOOLS[tool].rate_limit
+        mcp = [parse(mcp_limit)] if mcp_limit else []
+        for endpoint in endpoints:
+            rest = _rest_limits(endpoint)
+            if (contract & set(rest) or contract & set(mcp)) and rest != mcp:
+                mismatched[f"{tool} / {endpoint.__name__}"] = (rest, mcp)
+    assert not mismatched, mismatched

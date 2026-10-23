@@ -96,7 +96,7 @@ Available only when `SEER_DOCS_ENABLED=true`:
 | `/ssl/{domain}` | GET | SSL certificate chain inspection |
 | `/availability/{domain}` | GET | Domain availability check |
 | `/info/{domain}` | GET | Merged RDAP + WHOIS domain info |
-| `/subdomains/{domain}` | GET | Subdomain enumeration (CT logs) |
+| `/subdomains/{domain}` | GET | Subdomain enumeration (CT logs; `?resolve=true` also resolves and classifies each name) (`5/minute`) |
 | `/dnssec/{domain}` | GET | DNSSEC validation |
 | `/delegation/{domain}` | GET | NS delegation health |
 | `/diff/{domain_a}/{domain_b}` | GET | Side-by-side domain comparison |
@@ -175,13 +175,16 @@ from non-loopback origins are refused. `*` is rejected at startup.
 #### Rate Limiting
 
 Every REST route has its own fixed per-client limit (e.g. `5/minute` for
-`/audit`, `/takeover`, `/confusables` and `/dns/trace`), counted per route — requests
-for different domains on the same route share one budget, and an
-operation's `/bulk` and `/bulk/stream` routes share one budget between them.
+`/audit`, `/subdomains`, `/takeover`, `/confusables` and `/dns/trace`),
+counted per route — requests for different domains on the same route share
+one budget, and an operation's `/bulk` and `/bulk/stream` routes share one
+budget between them. A limit is per route, not per argument: `/subdomains`
+is sized for its heavier `resolve=true` fan-out.
 
 The expensive MCP tools carry the same limits as their REST routes
-(`seer_subdomains` and `seer_audit` get `5/minute`), counted per client like REST — by
-client IP over HTTP; the stdio server has one client.
+(`seer_subdomains` and `seer_audit` get `5/minute`, like `/subdomains` and
+`/audit`), counted per client like REST — by client IP over HTTP; the stdio
+server has one client.
 
 `SEER_RATE_LIMIT` sets the per-client limit for the MCP endpoint
 (`POST /mcp`); it does not change the REST limits. Use the
