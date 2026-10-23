@@ -150,7 +150,7 @@ from seer_api.main import app  # noqa: E402
 
 @pytest.fixture
 def client():
-    return TestClient(app)
+    return TestClient(app, base_url="http://localhost")
 
 
 # What the DNS bindings return, exactly as seer-core pins it

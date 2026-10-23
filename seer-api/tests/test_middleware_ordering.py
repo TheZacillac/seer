@@ -43,7 +43,7 @@ def test_unauthenticated_401_is_counted_in_metrics(auth_app):
     recorded in the metrics snapshot (total_requests + a 401 status bucket)."""
     from seer_api.middleware import metrics
 
-    client = TestClient(auth_app.app)
+    client = TestClient(auth_app.app, base_url="http://localhost")
 
     before = metrics.snapshot()
     before_total = before["total_requests"]
@@ -67,7 +67,7 @@ def test_unauthenticated_401_is_logged(auth_app, caplog):
     """The 401 rejection must also emit a request log line at WARNING."""
     import logging
 
-    client = TestClient(auth_app.app)
+    client = TestClient(auth_app.app, base_url="http://localhost")
 
     with caplog.at_level(logging.WARNING, logger="seer_api"):
         resp = client.get("/lookup/example.com")
@@ -87,7 +87,7 @@ def test_unauthenticated_401_is_logged(auth_app, caplog):
 def test_401_response_still_carries_request_id_header(auth_app):
     """Reordering must not lose the X-Request-ID annotation: since logging now
     wraps auth, the short-circuit 401 should carry the request id header."""
-    client = TestClient(auth_app.app)
+    client = TestClient(auth_app.app, base_url="http://localhost")
     resp = client.get("/lookup/example.com")
     assert resp.status_code == 401
     assert resp.headers.get("X-Request-ID"), (
@@ -111,7 +111,7 @@ def test_mcp_browser_guard_403_is_counted(monkeypatch):
     before = metrics.snapshot()
     before_total = before["total_requests"]
 
-    with TestClient(main.app) as client:
+    with TestClient(main.app, base_url="http://localhost") as client:
         resp = client.post(
             "/mcp",
             headers={"Origin": "https://evil.example"},
