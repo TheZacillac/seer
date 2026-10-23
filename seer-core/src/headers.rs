@@ -750,7 +750,7 @@ fn build_notes(
 
 /// Grades an already-fetched response. Pure, so the whole ruleset is
 /// unit-testable without any network.
-fn build_report(domain: String, response: &ResponseHead) -> HeaderReport {
+pub(crate) fn build_report(domain: String, response: &ResponseHead) -> HeaderReport {
     let csp_policies = parse_csp_policies(response.header_all("content-security-policy"));
     let csp_report_only = response
         .header("content-security-policy-report-only")

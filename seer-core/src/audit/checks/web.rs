@@ -43,7 +43,9 @@ pub(crate) const IDS: &[&str] = &[
     "web.csp.missing",
     "web.csp.weak",
     "web.frame.missing",
+    "web.frame.weak",
     "web.nosniff.missing",
+    "web.nosniff.weak",
     "web.cookie.insecure",
     "web.cookie.flags",
     "web.disclosure.banner",
@@ -152,21 +154,41 @@ pub(crate) fn assess_headers(host: &str, r: &HeaderReport) -> Vec<Finding> {
         ),
         _ => {}
     }
-    if verdict_of(r, "x-frame-options") == Some(HeaderVerdict::Absent) {
-        out.push(
+    match verdict_of(r, "x-frame-options") {
+        Some(HeaderVerdict::Absent) => out.push(
             new("web.frame.missing", Severity::Low, "No framing protection")
                 .fix("Send X-Frame-Options: DENY or CSP frame-ancestors 'none'."),
-        );
+        ),
+        // CSP frame-ancestors admitting any origin, ALLOW-FROM, or an
+        // invalid value: the page is still frameable.
+        Some(HeaderVerdict::Weak | HeaderVerdict::Moderate) => out.push(
+            new(
+                "web.frame.weak",
+                Severity::Low,
+                "Framing protection is ineffective",
+            )
+            .fix("Send X-Frame-Options: DENY or SAMEORIGIN, and restrict CSP frame-ancestors to listed origins (or 'none')."),
+        ),
+        _ => {}
     }
-    if verdict_of(r, "x-content-type-options") == Some(HeaderVerdict::Absent) {
-        out.push(
+    match verdict_of(r, "x-content-type-options") {
+        Some(HeaderVerdict::Absent) => out.push(
             new(
                 "web.nosniff.missing",
                 Severity::Low,
                 "No X-Content-Type-Options: nosniff",
             )
             .fix("Send X-Content-Type-Options: nosniff."),
-        );
+        ),
+        Some(HeaderVerdict::Weak | HeaderVerdict::Moderate) => out.push(
+            new(
+                "web.nosniff.weak",
+                Severity::Low,
+                "X-Content-Type-Options has an invalid value",
+            )
+            .fix("Send X-Content-Type-Options: nosniff (the only valid value)."),
+        ),
+        _ => {}
     }
 
     let insecure: Vec<&str> = r
@@ -479,5 +501,63 @@ mod tests {
             &SeerError::HttpError("refused".into()),
         ));
         assert!(all.iter().all(|f| IDS.contains(&f.id)));
+    }
+
+    /// Regression: a Weak framing or nosniff verdict produced no finding
+    /// (only Absent did), unlike HSTS and CSP. Graded from real responses.
+    #[test]
+    fn weak_framing_and_nosniff_are_findings() {
+        use crate::headers::build_report;
+        use crate::http::ResponseHead;
+        let response = |headers: &[(&str, &str)]| ResponseHead {
+            final_url: "https://example.com/".into(),
+            status: 200,
+            headers: headers
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            redirects: 0,
+        };
+        let graded = |headers: &[(&str, &str)]| {
+            let r = build_report("example.com".into(), &response(headers));
+            ids(&assess_headers("example.com", &r))
+        };
+
+        // frame-ancestors * overrides a valid XFO: still frameable.
+        let any_origin = graded(&[
+            ("content-security-policy", "frame-ancestors *"),
+            ("x-frame-options", "DENY"),
+            ("x-content-type-options", "nosniff"),
+        ]);
+        assert!(any_origin.contains(&"web.frame.weak"), "{any_origin:?}");
+        assert!(!any_origin.contains(&"web.frame.missing"));
+
+        let allow_from = graded(&[
+            ("x-frame-options", "ALLOW-FROM https://x.example"),
+            ("x-content-type-options", "nosniff"),
+        ]);
+        assert!(allow_from.contains(&"web.frame.weak"), "{allow_from:?}");
+
+        let misspelled = graded(&[
+            ("x-frame-options", "DENY"),
+            ("x-content-type-options", "no-sniff"),
+        ]);
+        assert!(misspelled.contains(&"web.nosniff.weak"), "{misspelled:?}");
+        assert!(!misspelled.contains(&"web.frame.weak"));
+        for id in any_origin.iter().chain(&allow_from).chain(&misspelled) {
+            assert!(IDS.contains(id), "{id} undeclared");
+        }
+
+        // Valid values: neither finding.
+        let valid = graded(&[
+            ("x-frame-options", "SAMEORIGIN"),
+            ("x-content-type-options", "nosniff"),
+        ]);
+        assert!(
+            !valid
+                .iter()
+                .any(|id| id.starts_with("web.frame") || id.starts_with("web.nosniff")),
+            "{valid:?}"
+        );
     }
 }
