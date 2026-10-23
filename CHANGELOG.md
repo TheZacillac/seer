@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.55.0] - 2026-10-23
+
 ### Added
 - `DmarcPolicy.effective_policy` in posture results: the `sp=`/`p=` value
   that actually applies to the domain (`None` when no single record
@@ -2126,7 +2128,8 @@ Two notable breaking changes landed in this period:
   The human and markdown formatters group both fields by record type and
   omit the per-type subheader when only one type is present.
 
-[Unreleased]: https://github.com/TheZacillac/seer/compare/v0.54.0...HEAD
+[Unreleased]: https://github.com/TheZacillac/seer/compare/v0.55.0...HEAD
+[0.55.0]: https://github.com/TheZacillac/seer/compare/v0.54.0...v0.55.0
 [0.54.0]: https://github.com/TheZacillac/seer/compare/v0.53.1...v0.54.0
 [0.53.1]: https://github.com/TheZacillac/seer/compare/v0.53.0...v0.53.1
 [0.53.0]: https://github.com/TheZacillac/seer/compare/v0.52.3...v0.53.0
