@@ -13,7 +13,7 @@ use crate::tui::app::{App, SPIN};
 use crate::tui::lenses::{self};
 use crate::tui::line_editor::LineEditor;
 use crate::tui::theme::Theme;
-use crate::tui::widgets::panel;
+use crate::tui::widgets::{inspector, panel};
 
 /// The in-progress editor for `target`, if a matching field is active (the
 /// editor, not just its text, so renderers can place the caret at the cursor).
@@ -555,15 +555,18 @@ fn help_overlay(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             Span::styled(t.to_string(), Style::default().fg(theme.subtext)),
         ])
     };
-    let mut lines: Vec<Line> = global.iter().copied().map(row).collect();
+    // The focused lens's own keys lead, so on a short terminal the rows cut
+    // off (and marked) are global ones the status bar also lists.
+    let mut lines: Vec<Line> = Vec::new();
     if !lens_rows.is_empty() {
-        lines.push(Line::default());
         lines.push(Line::from(Span::styled(
             format!("{} {} keys", lens.glyph, lens.label),
             Style::default().fg(theme.lavender),
         )));
         lines.extend(lens_rows.iter().map(|(k, t)| row((k.as_str(), *t))));
+        lines.push(Line::default());
     }
+    lines.extend(global.iter().copied().map(row));
     // Wide enough for the longest row (border + padding), never past the frame.
     let longest = lines.iter().map(Line::width).max().unwrap_or(0);
     let w = u16::try_from(longest + 4)
@@ -586,7 +589,7 @@ fn help_overlay(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         popup,
     );
     let inner = panel::render(f, popup, theme, "keybindings", theme.lavender, true);
-    f.render_widget(Paragraph::new(lines), inner);
+    inspector::draw(f, inner, theme, lines);
 }
 
 #[cfg(test)]
@@ -615,6 +618,21 @@ mod tests {
         app.help = true;
         let s = render_lines(100, 30, |f| view(f, &app, app.theme()));
         assert!(s.contains("theme · q)"), "the : row must render whole: {s}");
+    }
+
+    /// On an 80×24 terminal the lens's own keys come first, so a long list
+    /// (Bulk has seven) is never the part cut off.
+    #[test]
+    fn help_overlay_keeps_every_lens_key_on_a_small_terminal() {
+        let mut app = App::new(None);
+        app.lens = LensKey::Bulk.index();
+        app.help = true;
+        let s = render_lines(80, 24, |f| view(f, &app, app.theme()));
+        assert!(s.contains(&format!("{:<16}export", "e")), "{s}");
+        assert!(
+            s.contains("more lines"),
+            "the cut global rows are marked: {s}"
+        );
     }
 
     #[test]
