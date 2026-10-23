@@ -85,13 +85,15 @@ pub enum Detail {
 }
 
 /// A table [`Block`]: no header row when `header` is empty. The renderer
-/// paints the selection band, so rows carry only their cells' colors.
+/// paints the selection band on the selected row. A table with a selection
+/// scrolls to it; one without, cut short, ends with `… N more <unit>`.
 pub struct TableBlock {
     header: Vec<&'static str>,
     widths: Vec<Constraint>,
     rows: Vec<Row<'static>>,
     selected: Option<usize>,
     detail: Detail,
+    unit: &'static str,
 }
 
 impl TableBlock {
@@ -106,7 +108,13 @@ impl TableBlock {
             rows,
             selected: None,
             detail: Detail::None,
+            unit: "rows",
         }
+    }
+
+    /// What the cut-short mark counts (`rows` by default).
+    pub fn unit(self, unit: &'static str) -> Self {
+        Self { unit, ..self }
     }
 
     pub fn selected(self, selected: Option<usize>) -> Self {
@@ -140,6 +148,7 @@ enum Part {
         widths: Vec<Constraint>,
         rows: Vec<Row<'static>>,
         selected: Option<usize>,
+        unit: &'static str,
     },
     Panel {
         title: String,
@@ -213,6 +222,7 @@ fn prepare(theme: &Theme, blocks: Vec<Block>, width: u16) -> Vec<Part> {
                     widths: t.widths,
                     rows: t.rows,
                     selected: t.selected,
+                    unit: t.unit,
                 });
                 let detail = match t.detail {
                     Detail::None => Vec::new(),
@@ -316,12 +326,32 @@ fn draw_parts(f: &mut Frame, area: Rect, theme: &Theme, parts: Vec<Part>) {
                 widths,
                 rows,
                 selected,
+                unit,
             } => {
-                let rows: Vec<Row> = rows
+                let header_rows = usize::from(!header.is_empty());
+                let total = rows.len();
+                let mut rows: Vec<Row> = rows
                     .into_iter()
                     .enumerate()
-                    .map(|(i, row)| row.style(row_style(theme, selected == Some(i))))
+                    .map(|(i, row)| {
+                        if selected == Some(i) {
+                            row.style(row_style(theme, true))
+                        } else {
+                            row
+                        }
+                    })
                     .collect();
+                // Unselected, the table cannot scroll: say what was cut.
+                let mut mark = None;
+                if selected.is_none() {
+                    let body = usize::from(height).saturating_sub(header_rows);
+                    let (shown, hidden) =
+                        inspector::fit(total, u16::try_from(body).unwrap_or(u16::MAX));
+                    if hidden > 0 {
+                        rows.truncate(shown);
+                        mark = Some(inspector::more(theme, hidden, unit));
+                    }
+                }
                 let mut table = Table::new(rows, widths).column_spacing(1);
                 if !header.is_empty() {
                     table =
@@ -329,6 +359,14 @@ fn draw_parts(f: &mut Frame, area: Rect, theme: &Theme, parts: Vec<Part>) {
                 }
                 let mut state = scroll_to(selected);
                 f.render_stateful_widget(table, rect, &mut state);
+                if let Some(mark) = mark {
+                    let last = Rect {
+                        y: rect.bottom() - 1,
+                        height: 1,
+                        ..rect
+                    };
+                    f.render_widget(Paragraph::new(mark), last);
+                }
             }
             Part::Panel {
                 title,
@@ -445,6 +483,33 @@ mod tests {
         let s = draw_page(30, 8, page().push(b));
         assert!(s.contains("s5") && !s.contains("s4 "), "{s}");
         assert!(s.contains("more lines"), "{s}");
+    }
+
+    /// A table without a selection cannot be scrolled, so cutting it short
+    /// says how many rows it left out, in the table's own unit.
+    #[test]
+    fn an_unselected_table_cut_short_counts_what_it_left_out() {
+        let rows = (0..12).map(|i| Row::new([format!("r{i}")])).collect();
+        let t = TableBlock::new(vec!["H"], vec![Constraint::Min(0)], rows).unit("answers");
+        let s = draw_page(30, 8, page().push(lines(1, "a")).push(Block::Table(t)));
+        // Header, three rows and the mark, which takes a row of its own.
+        assert!(s.contains("r2") && s.contains("… 9 more answers"), "{s}");
+    }
+
+    /// Only the selected row is restyled: other rows keep their own colors.
+    #[test]
+    fn unselected_rows_keep_their_row_style() {
+        let rows = vec![
+            Row::new(["a"]).style(Style::default().fg(Color::Red)),
+            Row::new(["b"]),
+        ];
+        let t = TableBlock::new(vec![], vec![Constraint::Min(0)], rows).selected(Some(1));
+        let theme = Theme::frappe();
+        let buf = crate::tui::test_util::render_buffer(10, 6, |f| {
+            draw(f, f.area(), &theme, page().push(Block::Table(t)), false);
+        });
+        assert_eq!(buf[(1, 1)].fg, Color::Red);
+        assert_eq!(buf[(1, 2)].bg, theme.surface0);
     }
 
     #[test]

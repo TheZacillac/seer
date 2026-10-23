@@ -402,6 +402,7 @@ pub fn render(
         LensKey::Headers => headers::page(theme, data, focused, sel),
         LensKey::Audit => audit::page(theme, data, focused, sel),
         LensKey::Takeover => takeover::page(theme, data, focused, sel),
+        LensKey::Dns => dns::page(theme, tab, data, filter, focused, sel, panes),
         _ => None,
     };
     if let Some(page) = page {
@@ -409,7 +410,6 @@ pub fn render(
         return;
     }
     match key {
-        LensKey::Dns => dns::render(f, area, theme, tab, data, filter, focused, sel, panes),
         // Converted above, or pane-driven: those render from `app.panes`
         // state in render.rs::main_pane and never reach this dispatch.
         _ => {}

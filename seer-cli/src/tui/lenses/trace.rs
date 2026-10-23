@@ -4,11 +4,10 @@
 //! final answer and why the walk ended. The wording is
 //! `seer_core::output::dig`'s and every remote string goes through
 //! `sanitize_line`, as in the Records tab.
-use ratatui::layout::{Constraint, Rect};
+use ratatui::layout::Constraint;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Cell, Paragraph, Row, Table};
-use ratatui::Frame;
+use ratatui::widgets::{Cell, Row};
 use seer_core::output::dig as wording;
 use seer_core::output::sanitize_line;
 use seer_core::{DnsTrace, TraceHop};
@@ -16,59 +15,21 @@ use seer_core::{DnsTrace, TraceHop};
 use crate::tui::action::LensData;
 use crate::tui::lenses::dns::{record_table, status_color, status_spans, verdict_color};
 use crate::tui::theme::Theme;
-use crate::tui::widgets::inspector::{self, fit, more, MIN_ROWS};
-use crate::tui::widgets::{panel, row_style, scroll_to, stack, wrap, Band};
+use crate::tui::widgets::page::{Block, Detail, Page, TableBlock};
 
-pub fn render(
-    f: &mut Frame,
-    area: Rect,
-    theme: &Theme,
-    data: &LensData,
-    focused: bool,
-    sel: usize,
-) {
-    let LensData::Trace(trace) = data else { return };
+/// The walk: a status line, one row per hop with the selected hop's
+/// referral and failed servers beneath (the first hop's until the pane is
+/// entered), the final answers, and why the walk ended — kept whole.
+pub fn page(theme: &Theme, data: &LensData, focused: bool, sel: usize) -> Option<Page> {
+    let LensData::Trace(trace) = data else {
+        return None;
+    };
     let title = format!(
         "trace · {} {}",
         sanitize_line(&trace.name),
         trace.record_type
     );
-    let inner = panel::render(f, area, theme, &title, theme.sky, focused);
-
-    // The hop the selection is on (the first one until the pane is entered).
-    let selected = sel.min(trace.hops.len().saturating_sub(1));
-    let detail = trace
-        .hops
-        .get(selected)
-        .map(|hop| hop_detail(theme, selected + 1, hop, inner.width))
-        .unwrap_or_default();
-    let outcome = outcome_lines(theme, trace, inner.width);
-
-    // Status line, hops, the selected hop's detail, the final answer, the
-    // outcome — stacked from the top, each band only when it has content.
-    // When they do not all fit, the hop table gives up rows first but keeps
-    // its header and a few hops (it scrolls to the selection), then the
-    // detail and the answers are cut short, each saying how much it left
-    // out, so the status line and the outcome stay whole.
-    let rows = |n: usize| u16::try_from(n).unwrap_or(u16::MAX);
     let hops = trace.hops.len();
-    let mut layout = vec![
-        Band::fixed(1),
-        Band::shrinking(rows(hops + 1), rows(1 + hops.min(MIN_ROWS))),
-    ];
-    if !detail.is_empty() {
-        layout.push(inspector::band(&detail));
-    }
-    if !trace.answers.is_empty() {
-        let answers = trace.answers.len() + 1;
-        layout.push(Band::shrinking(rows(answers), rows(answers.min(MIN_ROWS))));
-    }
-    if !outcome.is_empty() {
-        layout.push(Band::fixed(rows(outcome.len())));
-    }
-    let mut bands = stack(inner, &layout).into_iter();
-    let mut next_band = || bands.next().unwrap_or_default();
-
     let mut status = Vec::from(status_spans(theme, trace.status));
     status.push(Span::styled(
         format!(
@@ -77,43 +38,39 @@ pub fn render(
         ),
         Style::default().fg(theme.overlay0),
     ));
-    f.render_widget(Paragraph::new(Line::from(status)), next_band());
 
-    let mut state = scroll_to(focused.then_some(sel));
-    f.render_stateful_widget(
-        hop_table(theme, trace, focused.then_some(sel)),
-        next_band(),
-        &mut state,
-    );
-    if !detail.is_empty() {
-        inspector::draw(f, next_band(), theme, detail);
-    }
+    let selected = sel.min(hops.saturating_sub(1));
+    let detail = trace.hops.get(selected).map_or(Detail::None, |hop| {
+        Detail::Notes(hop_detail(theme, selected + 1, hop))
+    });
+    // Sections sit a blank row apart; the gaps are the first rows given up.
+    let mut page = Page::new(title, theme.sky)
+        .push(Block::Lines(vec![Line::from(status)]))
+        .push(Block::Gap)
+        .push(Block::Table(
+            hop_table(theme, trace)
+                .selected(focused.then_some(sel))
+                .detail(detail),
+        ));
     if !trace.answers.is_empty() {
-        let band = next_band();
-        // The column header, then the answers that fit.
-        let body = band.height.saturating_sub(1);
-        let (shown, hidden) = fit(trace.answers.len(), body);
-        let answers = trace.answers.iter().take(shown).map(|r| (r, true));
-        f.render_widget(record_table(theme, "ANSWER", answers, None), band);
-        if hidden > 0 && body > 0 {
-            let last = Rect {
-                y: band.bottom() - 1,
-                height: 1,
-                ..band
-            };
-            f.render_widget(Paragraph::new(more(theme, hidden, "answers")), last);
-        }
+        let answers = trace.answers.iter().map(|r| (r, true));
+        page = page.push(Block::Gap).push(Block::Table(
+            record_table(theme, "ANSWER", answers).unit("answers"),
+        ));
     }
+    let outcome = outcome(theme, trace);
     if !outcome.is_empty() {
-        f.render_widget(Paragraph::new(outcome), next_band());
+        page = page.push(Block::Gap);
     }
+    for (text, color) in outcome {
+        page = page.push(Block::Note { text, color });
+    }
+    Some(page)
 }
 
 /// One row per hop: the zone asked, the server and address that answered,
 /// how long it took, its status (`aa` when authoritative) and where it led.
-fn hop_table(theme: &Theme, trace: &DnsTrace, selected: Option<usize>) -> Table<'static> {
-    let header = Row::new(["#", "ZONE", "SERVER", "ADDRESS", "TIME", "STATUS", "NEXT"])
-        .style(Style::default().fg(theme.overlay0));
+fn hop_table(theme: &Theme, trace: &DnsTrace) -> TableBlock {
     let rows: Vec<Row> = trace
         .hops
         .iter()
@@ -140,12 +97,11 @@ fn hop_table(theme: &Theme, trace: &DnsTrace, selected: Option<usize>) -> Table<
                 Cell::from(Line::from(status)),
                 Cell::from(next_step(hop)).style(Style::default().fg(theme.subtext)),
             ])
-            .style(row_style(theme, selected == Some(i)))
         })
         .collect();
-    Table::new(
-        rows,
-        [
+    TableBlock::new(
+        vec!["#", "ZONE", "SERVER", "ADDRESS", "TIME", "STATUS", "NEXT"],
+        vec![
             Constraint::Length(2),
             Constraint::Percentage(18),
             Constraint::Percentage(24),
@@ -154,9 +110,8 @@ fn hop_table(theme: &Theme, trace: &DnsTrace, selected: Option<usize>) -> Table<
             Constraint::Length(11),
             Constraint::Min(0),
         ],
+        rows,
     )
-    .header(header)
-    .column_spacing(1)
 }
 
 /// Where a hop led: the zone it delegated to, or its answer.
@@ -169,11 +124,9 @@ fn next_step(hop: &TraceHop) -> String {
     }
 }
 
-/// The selected hop's detail, wrapped to `width`: the nameservers it
-/// referred to and the servers at its level that failed before one answered.
-/// Empty when it has neither.
-fn hop_detail(theme: &Theme, number: usize, hop: &TraceHop, width: u16) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
+/// The selected hop's referral and failed servers, each with its color.
+fn hop_detail(theme: &Theme, number: usize, hop: &TraceHop) -> Vec<(String, Color)> {
+    let mut notes = Vec::new();
     if let Some(zone) = &hop.referral_zone {
         let servers: Vec<String> = hop.referral.iter().map(|ns| sanitize_line(ns)).collect();
         let text = format!(
@@ -181,47 +134,49 @@ fn hop_detail(theme: &Theme, number: usize, hop: &TraceHop, width: u16) -> Vec<L
             sanitize_line(zone),
             servers.join(" ")
         );
-        lines.extend(styled(wrap(&text, width), theme.subtext));
+        notes.push((text, theme.subtext));
     }
     for failure in &hop.failed_servers {
-        let text = format!("✗ {}", sanitize_line(failure));
-        lines.extend(styled(wrap(&text, width), theme.red));
+        notes.push((format!("✗ {}", sanitize_line(failure)), theme.red));
     }
-    lines
+    notes
 }
 
-/// Why the walk ended, wrapped to `width`: the verdict for an answer without
-/// records of the type and the CNAME a trace does not follow — or, for a
-/// walk that stopped short, its error.
-fn outcome_lines(theme: &Theme, trace: &DnsTrace, width: u16) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
+/// Why the walk ended: the verdict for an answer without records of the
+/// type and the CNAME a trace does not follow — or, for a walk that stopped
+/// short, its error.
+fn outcome(theme: &Theme, trace: &DnsTrace) -> Vec<(String, Color)> {
     if let Some(error) = &trace.error {
-        let text = format!("Error: {}", sanitize_line(error));
-        lines.extend(styled(wrap(&text, width), theme.red));
-        return lines;
+        return vec![(format!("Error: {}", sanitize_line(error)), theme.red)];
     }
+    let mut notes = Vec::new();
     if let Some(verdict) = wording::trace_verdict(trace, sanitize_line) {
-        lines.extend(styled(
-            wrap(&verdict, width),
-            verdict_color(theme, trace.status),
-        ));
+        notes.push((verdict, verdict_color(theme, trace.status)));
     }
     if let Some(target) = wording::unfollowed_cname(trace) {
-        let note = wording::cname_note(sanitize_line(target));
-        lines.extend(styled(wrap(&note, width), theme.overlay));
+        notes.push((wording::cname_note(sanitize_line(target)), theme.overlay));
     }
-    lines
-}
-
-fn styled(lines: Vec<String>, color: Color) -> impl Iterator<Item = Line<'static>> {
-    lines
-        .into_iter()
-        .map(move |line| Line::from(Span::styled(line, Style::default().fg(color))))
+    notes
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::widgets::page;
+
+    /// Draw this lens's page as the TUI does.
+    fn render(
+        f: &mut ratatui::Frame,
+        area: ratatui::layout::Rect,
+        theme: &Theme,
+        data: &LensData,
+        focused: bool,
+        sel: usize,
+    ) {
+        if let Some(p) = page(theme, data, focused, sel) {
+            page::draw(f, area, theme, p, focused);
+        }
+    }
     use crate::payload::fixtures;
     use crate::tui::test_util::render_lines;
     use seer_core::DnsStatus;
@@ -278,15 +233,15 @@ mod tests {
             // Both hops fit, the selected one among them.
             assert!(text.contains(". (root)"), "{at}");
             assert!(text.contains("NOERROR aa"), "{at}");
-            // The answers are cut short, and say by how much.
-            let mark = row_with(&text, "more answers");
-            let hidden: usize = mark
-                .split_whitespace()
-                .find_map(|word| word.parse().ok())
-                .unwrap_or_else(|| panic!("no count in {mark:?}"));
+            // Answers cut short say by how much; uncut, all of them show.
             let shown = (1..=12)
                 .filter(|i| text.contains(&format!("192.0.2.{i} ")))
                 .count();
+            let hidden: usize = text
+                .lines()
+                .find(|l| l.contains("more answers"))
+                .and_then(|mark| mark.split_whitespace().find_map(|word| word.parse().ok()))
+                .unwrap_or(0);
             assert_eq!(shown + hidden, 12, "{at}");
             assert!(shown >= 1, "{at}");
             assert!(text.contains(&format!("192.0.2.{shown} ")), "{at}");
@@ -301,7 +256,7 @@ mod tests {
     #[test]
     fn a_long_referral_is_cut_short_before_the_outcome() {
         let trace = long_trace(0, Some("every server failed"));
-        let text = draw_at(54, 14, &trace, Some(0));
+        let text = draw_at(54, 12, &trace, Some(0));
         row_with(&text, "ZONE");
         row_with(&text, "Hop 1 referral to seer.test.:");
         row_with(&text, "more lines");

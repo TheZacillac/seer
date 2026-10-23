@@ -1,18 +1,17 @@
 //! DNSSEC tab renderer — state header + KV summary + DS records table.
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::Constraint;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Row, Table};
-use ratatui::Frame;
+use ratatui::widgets::Row;
 use seer_core::output::sanitize_line;
 
 use crate::tui::action::LensData;
 use crate::tui::theme::Theme;
-use crate::tui::widgets::{kv, panel};
+use crate::tui::widgets::page::{Block, Page, TableBlock};
 
-pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
+pub fn page(theme: &Theme, data: &LensData) -> Option<Page> {
     let LensData::Dnssec(r) = data else {
-        return;
+        return None;
     };
 
     let status_color = if r.chain_valid || r.status == "signed" {
@@ -22,70 +21,35 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
     } else {
         theme.red
     };
-
-    let inner = panel::render(f, area, theme, "DNSSEC", status_color, false);
-
-    // Split: status header + kv + issues + DS table
-    let has_ds = !r.ds_records.is_empty();
-    let constraints = if has_ds {
-        vec![
-            Constraint::Length(1),
-            Constraint::Length(7),
-            Constraint::Length(2),
-            Constraint::Min(0),
-        ]
-    } else {
-        vec![
-            Constraint::Length(1),
-            Constraint::Length(7),
-            Constraint::Min(0),
-        ]
-    };
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints(constraints)
-        .split(inner);
-
-    // Status header
-    f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            r.status.to_uppercase(),
-            Style::default()
-                .fg(status_color)
-                .add_modifier(Modifier::BOLD),
-        ))),
-        chunks[0],
-    );
-
-    // KV summary
-    let rows = [
+    let rows = vec![
         ("enabled", r.enabled.to_string()),
         ("status", r.status.clone()),
         ("chain valid", r.chain_valid.to_string()),
         ("DS records", r.ds_records.len().to_string()),
         ("DNSKEY records", r.dnskey_records.len().to_string()),
     ];
-    kv::render(f, chunks[1], theme, status_color, &rows);
-
-    // Issues line
-    if !r.issues.is_empty() {
-        f.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                sanitize_line(&r.issues.join("  ·  ")),
-                Style::default().fg(theme.yellow),
-            ))),
-            chunks[2],
-        );
+    let page = Page::new("DNSSEC", status_color)
+        .push(Block::Lines(vec![Line::from(Span::styled(
+            r.status.to_uppercase(),
+            Style::default()
+                .fg(status_color)
+                .add_modifier(Modifier::BOLD),
+        ))]))
+        .push(Block::Kv {
+            key_color: status_color,
+            rows,
+        })
+        .push_if(!r.issues.is_empty(), || Block::Note {
+            text: r.issues.join("  ·  "),
+            color: theme.yellow,
+        });
+    if r.ds_records.is_empty() {
+        return Some(page);
     }
-
-    // DS records table
-    if has_ds {
-        let ds_area = chunks[chunks.len() - 1];
-        let inner2 = panel::render(f, ds_area, theme, "DS Records", theme.overlay0, false);
-
-        let header = Row::new(["KEY TAG", "ALGORITHM", "DIGEST TYPE", "MATCHED"])
-            .style(Style::default().fg(theme.overlay0));
-        let ds_rows = r.ds_records.iter().map(|ds| {
+    let ds_rows = r
+        .ds_records
+        .iter()
+        .map(|ds| {
             let matched = if ds.matched_key { "✓" } else { "✗" };
             Row::new(vec![
                 ds.key_tag.to_string(),
@@ -93,26 +57,34 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
                 sanitize_line(&ds.digest_type_name),
                 matched.to_string(),
             ])
-            .style(Style::default().fg(theme.text))
-        });
-        let table = Table::new(
-            ds_rows,
-            [
-                Constraint::Length(10),
-                Constraint::Percentage(35),
-                Constraint::Percentage(35),
-                Constraint::Length(8),
-            ],
-        )
-        .header(header)
-        .column_spacing(1);
-        f.render_widget(table, inner2);
-    }
+        })
+        .collect();
+    let table = TableBlock::new(
+        vec!["KEY TAG", "ALGORITHM", "DIGEST TYPE", "MATCHED"],
+        vec![
+            Constraint::Length(10),
+            Constraint::Percentage(35),
+            Constraint::Percentage(35),
+            Constraint::Length(8),
+        ],
+        ds_rows,
+    );
+    Some(page.push(Block::Gap).push(Block::Panel(
+        Page::new("DS Records", theme.overlay0).push(Block::Table(table)),
+    )))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::widgets::page;
+
+    /// Draw this lens's page as the TUI does.
+    fn render(f: &mut ratatui::Frame, area: ratatui::layout::Rect, theme: &Theme, data: &LensData) {
+        if let Some(p) = page(theme, data) {
+            page::draw(f, area, theme, p, false);
+        }
+    }
     use crate::tui::test_util::render_text;
     use seer_core::DnssecReport;
 
