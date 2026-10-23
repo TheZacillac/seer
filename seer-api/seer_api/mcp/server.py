@@ -43,8 +43,8 @@ from .._contract import (
     RECORD_TYPE_PATTERN,
     TLD_TOKEN_RE,
 )
-from .._run import run_seer
-from ..errors import clean_message
+from .._run import run_bulk, run_seer
+from ..errors import ServerBusy, clean_message
 from ..ssrf import guarded
 
 # No logging.basicConfig() here: this module is also imported by the REST app
@@ -281,6 +281,9 @@ def _bulk(
 ) -> Handler:
     """``seer.<binding>(domains, [record_type,] concurrency)``.
 
+    Dispatched with ``run_bulk``: the job takes a slot from the bulk cap it
+    shares with the REST bulk routes (see seer_api/_run.py).
+
     No SSRF pre-check, even where every domain is a connect target (bulk
     status/SSL): core refuses a reserved host per row, which fails that row
     rather than the whole batch (see seer_api/ssrf.py).
@@ -290,7 +293,7 @@ def _bulk(
         domains = _require_domains(arguments)
         extra = (_require_record_type(arguments),) if record_type else ()
         concurrency = _get_concurrency(arguments, default=default_concurrency)
-        return await run_seer(getattr(seer, binding), domains, *extra, concurrency)
+        return await run_bulk(getattr(seer, binding), domains, *extra, concurrency)
 
     return run
 
@@ -840,6 +843,10 @@ async def call_tool(
         # is left out — the classification is enough.
         logger.warning("Tool %s failed with transient error: %s", name, e)
         return _error_result("Transient error — retry suggested.")
+    except ServerBusy as e:
+        # Every bulk job slot stayed busy (see _run.py); nothing ran.
+        logger.warning("Tool %s refused: %s", name, e)
+        return _error_result("Server busy — retry after a short backoff.")
     except seer.RateLimitedError as e:
         logger.warning("Tool %s rate limited upstream: %s", name, e)
         return _error_result("Rate limited — retry after a short backoff.")

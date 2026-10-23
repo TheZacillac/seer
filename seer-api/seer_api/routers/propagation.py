@@ -10,7 +10,7 @@ from seer_api._contract import (
     BulkPropagationRequest,
     Domain,
 )
-from seer_api._run import run_seer
+from seer_api._run import run_bulk, run_seer
 from seer_api.errors import as_http
 from seer_api.limiting import limiter
 from seer_api.streaming import stream_bulk
@@ -56,7 +56,7 @@ async def bulk_propagation_check(request: Request, body: BulkPropagationRequest)
         List of propagation results for each domain
     """
     return await as_http(
-        run_seer(seer.bulk_propagation, body.domains, body.record_type, body.concurrency),
+        run_bulk(seer.bulk_propagation, body.domains, body.record_type, body.concurrency),
         "Bulk propagation check failed",
     )
 

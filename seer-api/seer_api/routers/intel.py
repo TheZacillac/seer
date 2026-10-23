@@ -19,7 +19,7 @@ from fastapi import APIRouter, Query, Request
 
 import seer
 from seer_api._contract import BULK_LIMIT, HEAVY_LIMIT, MAX_CONCURRENCY, BulkRequest, Domain
-from seer_api._run import run_seer
+from seer_api._run import run_bulk, run_seer
 from seer_api.errors import as_http
 from seer_api.limiting import limiter
 
@@ -40,7 +40,7 @@ async def availability(request: Request, domain: Domain):
 async def bulk_availability(request: Request, body: BulkRequest):
     """Check availability for multiple domains at once."""
     return await as_http(
-        run_seer(seer.bulk_availability, body.domains, body.concurrency),
+        run_bulk(seer.bulk_availability, body.domains, body.concurrency),
         "Bulk availability check failed",
     )
 
@@ -62,7 +62,7 @@ async def info(request: Request, domain: Domain):
 async def bulk_info(request: Request, body: BulkRequest):
     """Merged domain info for multiple domains at once."""
     return await as_http(
-        run_seer(seer.bulk_info, body.domains, body.concurrency),
+        run_bulk(seer.bulk_info, body.domains, body.concurrency),
         "Bulk info lookup failed",
     )
 

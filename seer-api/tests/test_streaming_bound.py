@@ -6,14 +6,14 @@ from __future__ import annotations
 import asyncio
 import threading
 
-from seer_api import streaming
+from seer_api import _run, streaming
 
 
 def test_stream_bulk_caps_concurrent_jobs(monkeypatch):
     # Force a single concurrent slot and a fresh per-loop semaphore.
-    monkeypatch.setattr(streaming, "_MAX_CONCURRENT_STREAMS", 1, raising=False)
-    monkeypatch.setattr(streaming, "_stream_semaphore", None, raising=False)
-    monkeypatch.setattr(streaming, "_stream_semaphore_loop", None, raising=False)
+    monkeypatch.setattr(_run, "_MAX_CONCURRENT_BULK", 1, raising=False)
+    monkeypatch.setattr(_run, "_bulk_semaphore", None, raising=False)
+    monkeypatch.setattr(_run, "_bulk_semaphore_loop", None, raising=False)
 
     release = threading.Event()
     first_started = threading.Event()

@@ -124,8 +124,9 @@ error's type: `400` invalid input (including a single-host `status`/`ssl`/
 `rdap/ip` target that is a reserved address), `404` no WHOIS server for the
 TLD, `429` rate limited (this API's own limit, or an upstream registry's),
 `502` an upstream (WHOIS, RDAP, DNS, HTTP, TLS) failure, `503` a deployment
-fault, `504` a timeout (including `SEER_REQUEST_TIMEOUT`), `500` anything
-else. A bulk stream that fails or outlives `SEER_REQUEST_TIMEOUT` ends with
+fault or a bulk request that found every bulk slot busy until
+`SEER_REQUEST_TIMEOUT` (nothing ran; retry later), `504` a timeout
+(including `SEER_REQUEST_TIMEOUT`), `500` anything else. A bulk stream that fails or outlives `SEER_REQUEST_TIMEOUT` ends with
 an `error` event.
 
 ### Usage Examples
@@ -329,3 +330,12 @@ limiting, SSRF guards) is mapped in the repository's
 | Max domains per request | 100 |
 | Max concurrency | 50 |
 | Default concurrency | 10 |
+| Concurrent bulk jobs per worker (`SEER_MAX_CONCURRENT_BULK`) | 8 |
+
+Every bulk job — a `/bulk` or `/bulk/stream` request, or an MCP
+`seer_bulk_*` call — takes one of `SEER_MAX_CONCURRENT_BULK` slots for as
+long as it runs, even after its client has gone (a running job cannot be
+cancelled). A job that finds every slot busy waits; with
+`SEER_REQUEST_TIMEOUT` set it gives up at the deadline with a `503` (MCP: a
+"server busy" error to retry). The cap stays below `SEER_DISPATCH_THREADS`,
+so batches can never take every thread from single-domain requests.

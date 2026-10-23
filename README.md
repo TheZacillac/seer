@@ -733,9 +733,9 @@ Propagation checks query **30 nameservers** across **6 regions**:
 | `SEER_METRICS_ENABLED` | Expose `/metrics` to non-loopback clients | `false` |
 | `SEER_RATE_LIMIT` | Per-client limit for the MCP endpoint (`POST /mcp`) as `<count>/<period>`; `;`-separated limits are all enforced. REST routes keep their own fixed limits | `30/minute` |
 | `SEER_RATE_LIMIT_STORAGE` | Rate-limit storage URI (e.g. `redis://host:6379`) | `memory://` |
-| `SEER_REQUEST_TIMEOUT` | Per-request deadline (seconds) covering the SSRF pre-check, the core call and bulk SSE streams (slot wait included); on expiry the client gets a 504 (a stream: an `error` event). `0` disables | `0` |
-| `SEER_DISPATCH_THREADS` | Max threads in the pool running blocking core calls (REST + `/mcp`) | `50` |
-| `SEER_MAX_CONCURRENT_STREAMS` | Max in-flight bulk SSE stream jobs per worker process | `8` |
+| `SEER_REQUEST_TIMEOUT` | Per-request deadline (seconds) covering the SSRF pre-check, the core call and bulk jobs (slot wait included); on expiry the client gets a 504 (a stream: an `error` event), or a 503 when it was still waiting for a bulk slot. `0` disables (a bulk job then waits for a slot as long as it takes) | `0` |
+| `SEER_DISPATCH_THREADS` | Max threads in the pool running blocking core calls (REST + `/mcp`); at least `2` | `50` |
+| `SEER_MAX_CONCURRENT_BULK` | Max in-flight bulk jobs per worker process, shared by every `/bulk` and `/bulk/stream` route and the MCP `seer_bulk_*` tools; clamped to `SEER_DISPATCH_THREADS` − 1 so single-domain requests always keep a thread. `SEER_MAX_CONCURRENT_STREAMS` (its old, streams-only name) is still read when this is unset | `8` |
 | `SEER_TRUST_PROXY` | Trust `X-Forwarded-For` from `SEER_TRUSTED_PROXY_IPS` | `false` |
 | `SEER_TRUSTED_PROXY_IPS` | Comma-separated IPs allowed to set `X-Forwarded-For` | — |
 | `SEER_MCP_ALLOWED_HOSTS` | Comma-separated `Host:` values for the MCP `/mcp` endpoint — setting this turns on DNS-rebinding protection | — |
