@@ -4,7 +4,7 @@
 //! CLI) get a structured document instead of the prose.
 
 use seer_core::colors::CatppuccinExt;
-use seer_core::output::OutputFormat;
+use seer_core::output::{sanitize_line, OutputFormat};
 use serde::Serialize;
 
 use crate::ops::{load_history, load_watchlist, state_io, STORE_LOCK};
@@ -169,7 +169,8 @@ pub async fn history(
 }
 
 /// The `history` listing: one domain's lookups, or a per-domain summary
-/// (see [`history`] for `lookup_cmd`).
+/// (see [`history`] for `lookup_cmd`). Stored values are remote text (and
+/// the store is a plain file), so each goes through `sanitize_line`.
 pub fn history_listing(
     history: &seer_core::LookupHistory,
     domain: Option<&str>,
@@ -196,7 +197,11 @@ pub fn history_listing(
             history.entries.len()
         );
         for (domain, entries) in &history.entries {
-            out.push_str(&format!("\n  {} ({} entries)", domain, entries.len()));
+            out.push_str(&format!(
+                "\n  {} ({} entries)",
+                sanitize_line(domain),
+                entries.len()
+            ));
         }
         return Listing::new(out, &data);
     };
@@ -215,7 +220,7 @@ pub fn history_listing(
             "\n  [{}] via {} - registrar: {}",
             entry.timestamp.format("%Y-%m-%d %H:%M"),
             entry.result.protocol().unwrap_or("availability"),
-            entry.result.registrar().unwrap_or_else(|| "—".to_string())
+            sanitize_line(&entry.result.registrar().unwrap_or_else(|| "—".to_string()))
         ));
     }
     Listing::new(out, &data)
@@ -381,6 +386,32 @@ mod tests {
             .err()
             .expect("must be rejected");
         assert!(err.contains("takes no domain"), "got: {err}");
+    }
+
+    /// A registrar from a WHOIS server must not inject escapes or forge a
+    /// history row of its own.
+    #[test]
+    fn history_listing_sanitizes_the_stored_registrar() {
+        let mut history = seer_core::LookupHistory::default();
+        let data = seer_core::WhoisResponse {
+            domain: "a.com".into(),
+            registrar: Some("R\u{1b}[31m\n  [2099-01-01 00:00] via rdap - registrar: Legit".into()),
+            ..Default::default()
+        };
+        history.record(
+            "a.com",
+            seer_core::LookupResult::Whois {
+                data,
+                rdap_error: None,
+                rdap_fallback: None,
+                dns_nameservers: None,
+            },
+        );
+        let text = history_listing(&history, Some("a.com"), "lookup").text;
+        // The header colors the domain itself; only the entry is remote.
+        let entry = text.lines().nth(1).expect("entry line");
+        assert!(!entry.contains('\u{1b}'), "{entry:?}");
+        assert_eq!(text.lines().count(), 2, "{text:?}");
     }
 
     #[test]
