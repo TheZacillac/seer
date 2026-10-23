@@ -387,26 +387,32 @@ pub fn render(
     sel: usize,
     panes: &Panes,
 ) {
+    let page = match key {
+        LensKey::Overview => overview::page(theme, data),
+        LensKey::Whois => whois::page(theme, data),
+        LensKey::Rdap => Some(rdap::page(theme, tab, data)),
+        LensKey::Ssl => ssl::page(theme, data),
+        LensKey::Status => status::page(theme, data),
+        LensKey::Reverse => reverse::page(theme, data),
+        LensKey::Avail => avail::page(theme, data),
+        _ => None,
+    };
+    if let Some(page) = page {
+        crate::tui::widgets::page::draw(f, area, theme, page, focused);
+        return;
+    }
     match key {
-        LensKey::Overview => overview::render(f, area, theme, data),
-        LensKey::Whois => whois::render(f, area, theme, data),
-        LensKey::Rdap => rdap::render(f, area, theme, tab, data),
         LensKey::Dns => dns::render(f, area, theme, tab, data, filter, focused, sel, panes),
-        LensKey::Ssl => ssl::render(f, area, theme, data),
-        LensKey::Status => status::render(f, area, theme, data),
         LensKey::Propagation => propagation::render(f, area, theme, data, focused, sel),
-        LensKey::Reverse => reverse::render(f, area, theme, data),
-        LensKey::Avail => avail::render(f, area, theme, data),
         LensKey::Watch => watch::render(f, area, theme, data, focused, sel),
         LensKey::History => history::render(f, area, theme, data, filter, focused, sel),
         LensKey::Subdomains => subdomains::render(f, area, theme, data, focused, sel),
         LensKey::Headers => headers::render(f, area, theme, data, focused, sel),
         LensKey::Audit => audit::render(f, area, theme, data, focused, sel),
         LensKey::Takeover => takeover::render(f, area, theme, data, focused, sel),
-        // Pane-driven lenses render from `app.panes` state in
-        // render.rs::main_pane, before the state match, so they never reach
-        // this generic dispatch.
-        LensKey::Follow | LensKey::Diff | LensKey::Bulk | LensKey::Tld => {}
+        // Converted above, or pane-driven: those render from `app.panes`
+        // state in render.rs::main_pane and never reach this dispatch.
+        _ => {}
     }
 }
 

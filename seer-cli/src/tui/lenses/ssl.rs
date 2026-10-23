@@ -1,28 +1,16 @@
 //! SSL/Cert lens — certificate summary, posture warnings + SANs.
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::Line;
-use ratatui::Frame;
 use seer_core::CertWarningSeverity;
 
 use crate::tui::action::LensData;
 use crate::tui::theme::Theme;
-use crate::tui::widgets::{chips, dot, kv, or_dash, panel};
-use ratatui::widgets::Paragraph;
+use crate::tui::widgets::page::{Block, Page};
+use crate::tui::widgets::{chips, dot, or_dash};
 
-pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
-    let LensData::Ssl(s) = data else { return };
-    let inner = panel::render(f, area, theme, "Certificate", theme.green, false);
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(0),
-            // One line per posture warning (zero-height when clean).
-            Constraint::Length(s.warnings.len() as u16),
-            Constraint::Length(2),
-        ])
-        .split(inner);
-
+pub fn page(theme: &Theme, data: &LensData) -> Option<Page> {
+    let LensData::Ssl(s) = data else {
+        return None;
+    };
     let leaf = s.chain.first();
     let valid = if s.is_valid { "yes" } else { "no" };
     let hostname = if s.hostname_verified {
@@ -30,7 +18,7 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
     } else {
         "MISMATCH"
     };
-    let rows = [
+    let rows = vec![
         ("domain", s.domain.clone()),
         ("subject", or_dash(leaf.map(|c| &c.subject))),
         ("issuer", or_dash(leaf.map(|c| &c.issuer))),
@@ -39,27 +27,39 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
         ("hostname", hostname.to_string()),
         ("expires in", format!("{}d", s.days_until_expiry)),
     ];
-    kv::render(f, chunks[0], theme, theme.green, &rows);
-    if !s.warnings.is_empty() {
-        let lines: Vec<Line> = s
-            .warnings
-            .iter()
-            .map(|w| {
-                let tone = match w.severity {
-                    CertWarningSeverity::Critical => "fail",
-                    CertWarningSeverity::Warning => "warn",
-                };
-                dot::line(theme, tone, w.message.clone())
+    // One line per posture warning.
+    let warnings: Vec<Line<'static>> = s
+        .warnings
+        .iter()
+        .map(|w| {
+            let tone = match w.severity {
+                CertWarningSeverity::Critical => "fail",
+                CertWarningSeverity::Warning => "warn",
+            };
+            dot::line(theme, tone, w.message.clone())
+        })
+        .collect();
+    Some(
+        Page::new("Certificate", theme.green)
+            .push(Block::Kv {
+                key_color: theme.green,
+                rows,
             })
-            .collect();
-        f.render_widget(Paragraph::new(lines), chunks[1]);
-    }
-    f.render_widget(Paragraph::new(chips::line(theme, &s.san_names)), chunks[2]);
+            .push_if(!warnings.is_empty(), || Block::Lines(warnings))
+            .push(Block::Gap)
+            .push(Block::Lines(vec![chips::line(theme, &s.san_names)])),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::widgets::page;
+
+    /// Draw this lens's page as the TUI does.
+    fn render(f: &mut ratatui::Frame, area: ratatui::layout::Rect, theme: &Theme, data: &LensData) {
+        page::draw(f, area, theme, page(theme, data).unwrap(), false);
+    }
     use crate::tui::test_util::render_lines;
     use seer_core::SslReport;
 

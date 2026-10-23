@@ -1,17 +1,14 @@
 //! WHOIS lens — key/value dump.
-use ratatui::layout::Rect;
-use ratatui::Frame;
-
 use crate::tui::action::LensData;
 use crate::tui::theme::Theme;
-use crate::tui::widgets::{kv, or_dash, panel};
+use crate::tui::widgets::or_dash;
+use crate::tui::widgets::page::{Block, Page};
 
-pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
-    let LensData::Whois(w) = data else { return };
-    let title = format!("WHOIS · {}", w.whois_server);
-    let inner = panel::render(f, area, theme, &title, theme.peach, false);
-
-    let rows = [
+pub fn page(theme: &Theme, data: &LensData) -> Option<Page> {
+    let LensData::Whois(w) = data else {
+        return None;
+    };
+    let rows = vec![
         ("domain", w.domain.clone()),
         ("registrar", or_dash(w.registrar.as_deref())),
         ("organization", or_dash(w.organization.as_deref())),
@@ -25,12 +22,23 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
         ("nameservers", w.nameservers.join("  ")),
         ("status", w.status.join(", ")),
     ];
-    kv::render(f, inner, theme, theme.peach, &rows);
+    Some(
+        Page::new(format!("WHOIS · {}", w.whois_server), theme.peach).push(Block::Kv {
+            key_color: theme.peach,
+            rows,
+        }),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::widgets::page;
+
+    /// Draw this lens's page as the TUI does.
+    fn render(f: &mut ratatui::Frame, area: ratatui::layout::Rect, theme: &Theme, data: &LensData) {
+        page::draw(f, area, theme, page(theme, data).unwrap(), false);
+    }
     use crate::tui::test_util::render_lines;
 
     fn render_whois(fields: serde_json::Value) -> String {

@@ -1,54 +1,52 @@
 //! Reverse DNS lens — renders PTR records from `LensData::Reverse`.
-use ratatui::layout::{Constraint, Rect};
+use ratatui::layout::Constraint;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Row, Table};
-use ratatui::Frame;
+use ratatui::widgets::Row;
 use seer_core::output::sanitize_line;
 
 use crate::tui::action::LensData;
 use crate::tui::theme::Theme;
-use crate::tui::widgets::panel;
+use crate::tui::widgets::page::{Block, Page, TableBlock};
 
-pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
+pub fn page(theme: &Theme, data: &LensData) -> Option<Page> {
     let LensData::Reverse(records) = data else {
-        return;
+        return None;
     };
-    let inner = panel::render(f, area, theme, "Reverse DNS · PTR", theme.sapphire, false);
-
+    let page = Page::new("Reverse DNS · PTR", theme.sapphire);
     if records.is_empty() {
-        f.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                "no PTR records",
-                Style::default()
-                    .fg(theme.overlay0)
-                    .add_modifier(Modifier::ITALIC),
-            ))),
-            inner,
-        );
-        return;
+        return Some(page.push(Block::Lines(vec![Line::from(Span::styled(
+            "no PTR records",
+            Style::default()
+                .fg(theme.overlay0)
+                .add_modifier(Modifier::ITALIC),
+        ))])));
     }
-
-    let header = Row::new(["IP", "PTR"]).style(Style::default().fg(theme.overlay0));
-    let rows = records.iter().map(|r| {
-        Row::new(vec![
-            sanitize_line(&r.name),
-            sanitize_line(&r.format_short()),
-        ])
-        .style(Style::default().fg(theme.text))
-    });
-    let table = Table::new(
+    let rows = records
+        .iter()
+        .map(|r| {
+            Row::new(vec![
+                sanitize_line(&r.name),
+                sanitize_line(&r.format_short()),
+            ])
+        })
+        .collect();
+    Some(page.push(Block::Table(TableBlock::new(
+        vec!["IP", "PTR"],
+        vec![Constraint::Percentage(45), Constraint::Percentage(55)],
         rows,
-        [Constraint::Percentage(45), Constraint::Percentage(55)],
-    )
-    .header(header)
-    .column_spacing(1);
-    f.render_widget(table, inner);
+    ))))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::widgets::page;
+
+    /// Draw this lens's page as the TUI does.
+    fn render(f: &mut ratatui::Frame, area: ratatui::layout::Rect, theme: &Theme, data: &LensData) {
+        page::draw(f, area, theme, page(theme, data).unwrap(), false);
+    }
     use crate::tui::test_util::render_text;
     use seer_core::dns::{RecordData, RecordType};
     use seer_core::DnsRecord;

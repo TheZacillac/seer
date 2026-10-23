@@ -1,55 +1,55 @@
 //! Availability lens — big verdict header + KV details.
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
-use ratatui::Frame;
 
 use crate::tui::action::LensData;
 use crate::tui::theme::Theme;
-use crate::tui::widgets::{kv, or_dash, panel};
+use crate::tui::widgets::or_dash;
+use crate::tui::widgets::page::{Block, Page};
 
-pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
+pub fn page(theme: &Theme, data: &LensData) -> Option<Page> {
     let LensData::Avail(a) = data else {
-        return;
+        return None;
     };
-    let inner = panel::render(f, area, theme, "Availability", theme.peach, false);
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(2), Constraint::Min(0)])
-        .split(inner);
-
     // Big verdict header
-    let verdict = a.verdict();
     let verdict_color = if a.available {
         theme.green
     } else {
         theme.peach
     };
-    f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            verdict.to_uppercase(),
-            Style::default()
-                .fg(verdict_color)
-                .add_modifier(Modifier::BOLD),
-        ))),
-        chunks[0],
-    );
-
-    let rows = [
+    let verdict = Line::from(Span::styled(
+        a.verdict().to_uppercase(),
+        Style::default()
+            .fg(verdict_color)
+            .add_modifier(Modifier::BOLD),
+    ));
+    let rows = vec![
         ("domain", a.domain.clone()),
         ("available", a.available.to_string()),
         ("confidence", a.confidence.clone()),
         ("method", a.method.clone()),
         ("details", or_dash(a.details.as_deref())),
     ];
-    kv::render(f, chunks[1], theme, theme.peach, &rows);
+    Some(
+        Page::new("Availability", theme.peach)
+            .push(Block::Lines(vec![verdict]))
+            .push(Block::Gap)
+            .push(Block::Kv {
+                key_color: theme.peach,
+                rows,
+            }),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::widgets::page;
+
+    /// Draw this lens's page as the TUI does.
+    fn render(f: &mut ratatui::Frame, area: ratatui::layout::Rect, theme: &Theme, data: &LensData) {
+        page::draw(f, area, theme, page(theme, data).unwrap(), false);
+    }
     use crate::tui::test_util::render_text;
     use seer_core::AvailabilityResult;
 
