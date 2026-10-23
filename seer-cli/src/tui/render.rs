@@ -13,7 +13,7 @@ use crate::tui::app::{App, SPIN};
 use crate::tui::lenses::{self};
 use crate::tui::line_editor::LineEditor;
 use crate::tui::theme::Theme;
-use crate::tui::widgets::{inspector, panel};
+use crate::tui::widgets::{inspector, page, panel};
 
 /// The in-progress editor for `target`, if a matching field is active (the
 /// editor, not just its text, so renderers can place the caret at the cursor).
@@ -217,54 +217,44 @@ fn main_pane(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     // fetched `LensData`, so they never reach `LensState::Loaded`. They have no
     // raw serialization either, so render them the same way in every format —
     // otherwise toggling `r` would drop them to the generic "press /" idle hint.
-    match lens.key {
-        LensKey::Follow => {
-            lenses::follow::render(f, content, theme, &app.panes.follow, app.spin);
-            return;
-        }
+    let pane_page = match lens.key {
+        LensKey::Follow => Some(lenses::follow::page(theme, &app.panes.follow, app.spin)),
         LensKey::Diff => {
             let domain_a = app.panes.diff.effective_a(app.domain.as_deref());
-            lenses::diff::render(
-                f,
-                content,
+            Some(lenses::diff::page(
                 theme,
                 domain_a.as_deref(),
                 &app.panes.diff.b,
                 field_buf(&app.input_mode, EditTarget::DiffB),
                 app.focus == Focus::Pane,
                 app.state_of(app.lens),
-            );
-            return;
+            ))
         }
-        LensKey::Bulk => {
-            lenses::bulk::render(
-                f,
-                content,
-                theme,
-                &app.panes.bulk,
-                field_buf(&app.input_mode, EditTarget::BulkDomains),
-                app.spin,
-            );
-            return;
-        }
+        LensKey::Bulk => Some(lenses::bulk::page(
+            theme,
+            &app.panes.bulk,
+            field_buf(&app.input_mode, EditTarget::BulkDomains),
+            app.spin,
+        )),
         LensKey::Tld => {
             let (loaded, loading) = match app.state_of(app.lens) {
                 LensState::Loaded(LensData::Tld(t)) => (Some(t.as_ref()), false),
                 LensState::Loading => (None, true),
                 _ => (None, false),
             };
-            lenses::tld::render(
-                f,
-                content,
+            Some(lenses::tld::page(
                 theme,
                 &app.panes.tld,
                 loaded,
                 loading,
                 field_buf(&app.input_mode, EditTarget::TldFilter),
-            );
-            return;
+            ))
         }
-        _ => {}
+        _ => None,
+    };
+    if let Some(p) = pane_page {
+        page::draw(f, content, theme, p, app.focus == Focus::Pane);
+        return;
     }
 
     match app.state_of(app.lens) {

@@ -1,9 +1,8 @@
 //! Small reusable TUI building blocks: `panel` (bordered block → inner
 //! `Rect`), `kv` rows, `gauge`, status `dot` and `chips`, the selected-row
 //! `inspector`, the `page` every lens is drawn through, plus the shared
-//! `or_dash` missing-value mark, `row_style` selection styling, and `stack`
-//! (of [`Band`]s), `wrap` and `wrap_hard` for bands sized to their content before they
-//! are drawn.
+//! `or_dash` missing-value mark, `row_style` selection styling, `scroll_to`,
+//! and `wrap` / `wrap_hard` for text sized to its width before it is drawn.
 
 pub mod chips;
 pub mod dot;
@@ -13,7 +12,6 @@ pub mod kv;
 pub mod page;
 pub mod panel;
 
-use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::Span;
 use ratatui::widgets::TableState;
@@ -51,60 +49,6 @@ pub fn row_style(theme: &Theme, selected: bool) -> Style {
 /// Pass `None` (e.g. when a pane isn't focused) to leave the list at the top.
 pub fn scroll_to(selected: Option<usize>) -> TableState {
     TableState::default().with_selected(selected)
-}
-
-/// One band of a [`stack`]: the rows its content wants, and the fewest it
-/// may be given when the bands do not all fit.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Band {
-    height: u16,
-    min: u16,
-}
-
-impl Band {
-    /// A band that keeps every row it wants: a verdict, a note.
-    pub fn fixed(height: u16) -> Self {
-        Self {
-            height,
-            min: height,
-        }
-    }
-
-    /// A band that gives up rows, down to `min`, when the bands do not all
-    /// fit: a table that scrolls, or content that marks what it leaves out.
-    pub fn shrinking(height: u16, min: u16) -> Self {
-        Self {
-            height,
-            min: min.min(height),
-        }
-    }
-}
-
-/// `bands` stacked down `area` from its top, one blank row apart. When they
-/// do not all fit, the shrinking bands give up rows, first to last, each
-/// down to its minimum, so the fixed bands — a verdict, a note — stay whole;
-/// whatever still overflows is clipped at the bottom.
-pub fn stack(area: Rect, bands: &[Band]) -> Vec<Rect> {
-    let gaps = bands.len().saturating_sub(1);
-    let total = bands.iter().map(|b| usize::from(b.height)).sum::<usize>() + gaps;
-    let mut excess = total.saturating_sub(usize::from(area.height));
-    let mut y = area.y;
-    bands
-        .iter()
-        .map(|band| {
-            let spare = band.height - band.min;
-            let give = u16::try_from(excess).unwrap_or(u16::MAX).min(spare);
-            excess -= usize::from(give);
-            let top = y.min(area.bottom());
-            let height = (band.height - give).min(area.bottom() - top);
-            y = top.saturating_add(height).saturating_add(1);
-            Rect {
-                y: top,
-                height,
-                ..area
-            }
-        })
-        .collect()
 }
 
 /// `text` split at spaces into lines at most `width` columns wide, filled
@@ -183,66 +127,6 @@ pub fn wrap_hard(text: &str, width: u16) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn spans(bands: &[Rect]) -> Vec<(u16, u16)> {
-        bands.iter().map(|r| (r.y, r.height)).collect()
-    }
-
-    #[test]
-    fn stack_places_bands_top_down_one_row_apart() {
-        let area = Rect::new(2, 5, 40, 20);
-        let bands = stack(
-            area,
-            &[Band::shrinking(3, 0), Band::fixed(1), Band::fixed(2)],
-        );
-        assert_eq!(spans(&bands), [(5, 3), (9, 1), (11, 2)]);
-        assert!(bands.iter().all(|r| r.x == 2 && r.width == 40));
-    }
-
-    #[test]
-    fn stack_shrinks_the_shrinking_band_so_the_rest_fit() {
-        // 30 + 1 + 1 + 1 + 2 = 35 rows wanted in 10: the table keeps 5.
-        let bands = stack(
-            Rect::new(0, 0, 40, 10),
-            &[Band::shrinking(30, 0), Band::fixed(1), Band::fixed(2)],
-        );
-        assert_eq!(spans(&bands), [(0, 5), (6, 1), (8, 2)]);
-        // Too little room even without the table: clipped, never past the area.
-        let bands = stack(
-            Rect::new(0, 0, 40, 3),
-            &[Band::shrinking(4, 0), Band::fixed(2), Band::fixed(2)],
-        );
-        assert!(bands.iter().all(|r| r.bottom() <= 3), "{bands:?}");
-        // With no shrinking band, the overflow is clipped at the bottom only.
-        let bands = stack(Rect::new(0, 0, 40, 4), &[Band::fixed(1), Band::fixed(3)]);
-        assert_eq!(spans(&bands), [(0, 1), (2, 2)]);
-    }
-
-    #[test]
-    fn stack_shrinks_bands_first_to_last_down_to_their_minimums() {
-        // 1 + 1 + 6 + 1 + 5 + 1 + 13 + 1 + 1 = 30 rows wanted in 18: the
-        // first shrinking band gives up 2 to its minimum of 4, the second 3
-        // to its 2, and the third the 7 still over.
-        let bands = stack(
-            Rect::new(0, 0, 40, 18),
-            &[
-                Band::fixed(1),
-                Band::shrinking(6, 4),
-                Band::shrinking(5, 2),
-                Band::shrinking(13, 3),
-                Band::fixed(1),
-            ],
-        );
-        assert_eq!(spans(&bands), [(0, 1), (2, 4), (7, 2), (10, 6), (17, 1)]);
-        // Once every band is at its minimum, the rest is clipped at the bottom.
-        let bands = stack(
-            Rect::new(0, 0, 40, 6),
-            &[Band::shrinking(6, 4), Band::shrinking(5, 2)],
-        );
-        assert_eq!(spans(&bands), [(0, 4), (5, 1)]);
-        // A minimum above the height is the height.
-        assert_eq!(Band::shrinking(2, 5), Band::fixed(2));
-    }
 
     #[test]
     fn wrap_hard_splits_words_wider_than_the_line() {

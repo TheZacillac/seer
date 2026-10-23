@@ -403,16 +403,13 @@ pub fn render(
         LensKey::Audit => audit::page(theme, data, focused, sel),
         LensKey::Takeover => takeover::page(theme, data, focused, sel),
         LensKey::Dns => dns::page(theme, tab, data, filter, focused, sel, panes),
-        _ => None,
+        // Pane-driven lenses render from `app.panes` state in
+        // render.rs::main_pane, before the state match, so they never reach
+        // this dispatch.
+        LensKey::Follow | LensKey::Diff | LensKey::Bulk | LensKey::Tld => None,
     };
     if let Some(page) = page {
         crate::tui::widgets::page::draw(f, area, theme, page, focused);
-        return;
-    }
-    match key {
-        // Converted above, or pane-driven: those render from `app.panes`
-        // state in render.rs::main_pane and never reach this dispatch.
-        _ => {}
     }
 }
 

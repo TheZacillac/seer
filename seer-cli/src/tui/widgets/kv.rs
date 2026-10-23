@@ -1,11 +1,8 @@
 //! Key/value rows, like a WHOIS dump: keys share a gutter, dotted leaders
 //! run to it, and values wrap under the value column. Values are sanitized
 //! here, so a row cannot skip the terminal guard.
-use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
-use ratatui::Frame;
 use seer_core::output::sanitize_line;
 
 use crate::tui::theme::Theme;
@@ -64,18 +61,11 @@ pub fn lines(
     out
 }
 
-/// Draw [`lines`] for `rows` into `area`.
-pub fn render(f: &mut Frame, area: Rect, theme: &Theme, key_color: Color, rows: &[(&str, String)]) {
-    f.render_widget(
-        Paragraph::new(lines(theme, key_color, rows, area.width)),
-        area,
-    );
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::tui::test_util::render_lines;
+    use ratatui::widgets::Paragraph;
 
     #[test]
     fn leaders_stop_at_a_shared_gutter() {
@@ -84,7 +74,10 @@ mod tests {
             ("registrar", "IANA".to_string()),
             ("expires", "2027-08-13".to_string()),
         ];
-        let s = render_lines(80, 2, |f| render(f, f.area(), &theme, theme.blue, &rows));
+        let s = render_lines(80, 2, |f| {
+            let lines = lines(&theme, theme.blue, &rows, f.area().width);
+            f.render_widget(Paragraph::new(lines), f.area());
+        });
         let lines: Vec<&str> = s.lines().collect();
         assert!(lines[0].starts_with("registrar ·· IANA"), "{s}");
         assert!(lines[1].starts_with("expires ···· 2027-08-13"), "{s}");
