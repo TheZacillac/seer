@@ -318,6 +318,23 @@ pub fn lenses() -> &'static [Lens] {
     LENSES
 }
 
+/// The first lens of the group after (`forward`) or before the one `from`
+/// is in, wrapping at either end. Backward from inside a group goes to the
+/// previous group's start, like `{` in an editor.
+pub fn group_start(from: usize, forward: bool) -> usize {
+    let starts: Vec<usize> = (0..LENSES.len())
+        .filter(|&i| i == 0 || LENSES[i - 1].group != LENSES[i].group)
+        .collect();
+    let current = starts.iter().rposition(|&s| s <= from).unwrap_or(0);
+    let n = starts.len();
+    let next = if forward {
+        (current + 1) % n
+    } else {
+        (current + n - 1) % n
+    };
+    starts[next]
+}
+
 /// Find a lens index by its `cmd` alias or `key`.
 pub fn find_by_cmd_or_key(token: &str) -> Option<usize> {
     lenses()
@@ -389,6 +406,22 @@ pub fn render(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn group_start_steps_between_groups_and_wraps() {
+        let dns = LensKey::Dns.index();
+        let ssl = LensKey::Ssl.index();
+        let diff = LensKey::Diff.index();
+        assert_eq!(group_start(0, true), dns);
+        assert_eq!(group_start(dns + 1, true), ssl);
+        assert_eq!(group_start(diff, true), 0, "wraps past POWER to LOOKUP");
+        assert_eq!(group_start(0, false), diff, "wraps back to POWER");
+        assert_eq!(
+            group_start(dns + 1, false),
+            0,
+            "mid-group goes to the previous group's start"
+        );
+    }
 
     #[test]
     fn registry_has_nineteen_lenses_in_four_groups() {

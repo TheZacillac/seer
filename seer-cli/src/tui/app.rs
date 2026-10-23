@@ -1197,6 +1197,8 @@ impl App {
                 }
                 vec![]
             }
+            KeyAction::NextGroup => self.nav_to(lenses::group_start(self.lens, true)),
+            KeyAction::PrevGroup => self.nav_to(lenses::group_start(self.lens, false)),
             KeyAction::ToggleFocus => {
                 self.focus = self.focus.toggled();
                 vec![]
@@ -1422,6 +1424,18 @@ mod tests {
             !app.compact_nav,
             "a backslash typed into : must not toggle the nav"
         );
+    }
+
+    #[test]
+    fn brace_jumps_to_the_next_group_through_nav_to() {
+        let mut app = App::new(Some("example.com".into()));
+        let _ = app.take_startup_actions();
+        app.focus = Focus::Pane;
+        key(&mut app, KeyCode::Char('}'));
+        assert_eq!(app.lens, LensKey::Dns.index());
+        assert_eq!(app.focus, Focus::Nav);
+        key(&mut app, KeyCode::Char('{'));
+        assert_eq!(app.lens, 0);
     }
 
     #[test]
