@@ -215,10 +215,11 @@ enum Section {
 
 /// The response below the status line, stacked from the top: the answers,
 /// the selected answer's detail while focused, the verdict when there are
-/// none, the authority records, and the
-/// local-answer or wildcard note. Only the answer table shrinks (and
-/// scrolls) when they do not all fit, so the verdict and the notes are never
-/// cut.
+/// none, the authority records, and the local-answer or wildcard note. When
+/// they do not all fit, the answer table shrinks (and scrolls) first, then
+/// the detail, so the verdict and the notes are not cut; while a detail
+/// shows, the table keeps its header and a few rows so the selected one
+/// stays in view.
 fn response(
     f: &mut Frame,
     area: Rect,
@@ -279,7 +280,14 @@ fn response(
         .iter()
         .map(|section| match section {
             // The column header, then the visible rows; it scrolls.
-            Section::Answers => Band::shrinking(height(rows + 1), 0),
+            Section::Answers => {
+                let min = if detail.is_empty() {
+                    0
+                } else {
+                    1 + rows.min(inspector::MIN_ROWS)
+                };
+                Band::shrinking(height(rows + 1), height(min))
+            }
             Section::Detail => inspector::band(&detail),
             Section::Verdict(lines) => Band::fixed(height(lines.len())),
             Section::Authority => Band::fixed(height(result.authority.len() + 1)),
@@ -340,6 +348,17 @@ mod tests {
             data: RecordData::txt(vec![text.to_string()]),
         };
         LensData::Dig(Box::new(fixtures::dig(RecordType::TXT, vec![record])))
+    }
+
+    /// A detail longer than the pane must not push the answer table (and
+    /// the selected row) out of view: the table keeps its header and a few
+    /// rows, and the detail is the band cut short.
+    #[test]
+    fn a_long_detail_keeps_the_answer_table_in_view() {
+        let data = txt_dig(&"x".repeat(2000));
+        let s = draw(&data, &Panes::default(), "", Some(0));
+        assert!(s.contains("ANSWER"), "the table header must stay: {s}");
+        assert!(s.contains("more lines"), "the detail is cut short: {s}");
     }
 
     #[test]
