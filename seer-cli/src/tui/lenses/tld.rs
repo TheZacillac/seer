@@ -27,16 +27,6 @@ pub fn render(
 ) {
     let inner = panel::render(f, area, theme, "TLD Browser", theme.maroon, false);
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1), // filter line
-            Constraint::Length(1), // hint line
-            Constraint::Min(3),    // list
-            Constraint::Length(8), // detail
-        ])
-        .split(inner);
-
     // The list filters live against the in-progress edit buffer when the filter
     // field is active, otherwise against the committed filter.
     let effective_filter = editing.map_or(state.filter.as_str(), LineEditor::as_str);
@@ -46,6 +36,38 @@ pub fn render(
     } else {
         state.sel_under(effective_filter).min(list.len() - 1)
     };
+
+    let selected_dotted = list.get(sel).map(|t| format!(".{t}")).unwrap_or_default();
+
+    // Only show the loaded detail when it matches the highlighted TLD, so moving
+    // the selection without reloading doesn't show stale data for another TLD.
+    let detail = loaded
+        .filter(|t| t.tld.trim_start_matches('.') == selected_dotted.trim_start_matches('.'))
+        .filter(|_| !loading)
+        .map(|t| {
+            let rows = [
+                ("tld", t.tld.clone()),
+                ("type", t.tld_type.clone()),
+                ("whois", or_dash(t.whois_server.as_deref())),
+                ("rdap", or_dash(t.rdap_url.as_deref())),
+                ("registry", or_dash(t.registry_url.as_deref())),
+            ];
+            // The panel's border takes a column each side.
+            kv::lines(theme, theme.maroon, &rows, inner.width.saturating_sub(2))
+        });
+    // The detail panel keeps its usual 8 rows, growing (from the list) when a
+    // wrapped value needs more, so no row is pushed out of it.
+    let detail_height = detail.as_ref().map_or(0, |lines| lines.len() + 2).max(8);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // filter line
+            Constraint::Length(1), // hint line
+            Constraint::Min(3),    // list
+            Constraint::Length(u16::try_from(detail_height).unwrap_or(u16::MAX)), // detail
+        ])
+        .split(inner);
 
     // ── filter line ──────────────────────────────────────────────────────────
     let filter_line = if let Some(buf) = editing {
@@ -112,8 +134,6 @@ pub fn render(
     // ── detail ─────────────────────────────────────────────────────────────
     let detail_inner = panel::render(f, chunks[3], theme, "Registry", theme.maroon, false);
 
-    let selected_dotted = list.get(sel).map(|t| format!(".{t}")).unwrap_or_default();
-
     if loading {
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
@@ -125,22 +145,8 @@ pub fn render(
         return;
     }
 
-    // Only show the loaded detail when it matches the highlighted TLD, so moving
-    // the selection without reloading doesn't show stale data for another TLD.
-    let detail_matches = loaded.is_some_and(|t| {
-        let want = selected_dotted.trim_start_matches('.');
-        t.tld.trim_start_matches('.') == want
-    });
-
-    if let (true, Some(t)) = (detail_matches, loaded) {
-        let rows = [
-            ("tld", t.tld.clone()),
-            ("type", t.tld_type.clone()),
-            ("whois", or_dash(t.whois_server.as_deref())),
-            ("rdap", or_dash(t.rdap_url.as_deref())),
-            ("registry", or_dash(t.registry_url.as_deref())),
-        ];
-        kv::render(f, detail_inner, theme, theme.maroon, &rows);
+    if let Some(lines) = detail {
+        f.render_widget(Paragraph::new(lines), detail_inner);
     } else {
         let hint = if selected_dotted.is_empty() {
             "—".to_string()
@@ -169,7 +175,7 @@ fn plural(n: usize) -> &'static str {
 mod tests {
     use super::*;
     use crate::tui::panes::tld::TldState;
-    use crate::tui::test_util::render_text;
+    use crate::tui::test_util::{render_lines, render_text};
     use seer_core::TldInfo;
 
     fn com_info() -> TldInfo {
@@ -226,6 +232,20 @@ mod tests {
         assert!(text.contains("filter: shop"), "shows the edit buffer");
         assert!(text.contains(".shop"), "filtered list shows .shop");
         assert!(!text.contains(".com "), "unrelated TLDs filtered out");
+    }
+
+    /// A long value wraps; the panel grows to fit so no row is pushed out.
+    #[test]
+    fn detail_panel_grows_to_fit_wrapped_values() {
+        let state = TldState::default(); // selected .com
+        let mut info = com_info();
+        info.rdap_url = Some(format!("https://rdap.example/{}", "path/".repeat(12)));
+        info.registry_url = Some("https://registry.example".into());
+        let theme = Theme::frappe();
+        let text = render_lines(40, 24, |f| {
+            render(f, f.area(), &theme, &state, Some(&info), false, None);
+        });
+        assert!(text.contains("registry"), "{text}");
     }
 
     #[test]
