@@ -478,7 +478,7 @@ fn status_or_command(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             Style::default().fg(theme.mauve),
         ));
     }
-    spans.push(Span::raw("   "));
+    spans.push(Span::raw(" "));
     // A focused pane lists its own keys; otherwise the global ones.
     let lens_keys: Vec<(String, &str)> = lens.keys.iter().map(|h| (h.label(), h.what)).collect();
     let keys: Vec<(String, &str)> = if app.focus == Focus::Pane && !lens_keys.is_empty() {
@@ -489,20 +489,21 @@ fn status_or_command(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         keys.extend([("h".to_string(), "back"), ("?".to_string(), "help")]);
         keys
     } else {
-        vec![
-            ("j/k", "move"),
-            ("␣", "go to"),
-            ("tab", "focus"),
-            ("[ ]", "tab"),
-            ("r", "raw"),
-            ("y", "copy"),
-            ("/", "lookup"),
-            (":", "cmd"),
-            ("?", "help"),
-        ]
-        .into_iter()
-        .map(|(k, t)| (k.to_string(), t))
-        .collect()
+        // `[ ] tab` only where there are sub-tabs, so `? help` still fits at
+        // 80 columns.
+        let tabs = (!lens.tabs.is_empty()).then_some(("[ ]", "tab"));
+        [("j/k", "move"), ("␣", "go to"), ("tab", "focus")]
+            .into_iter()
+            .chain(tabs)
+            .chain([
+                ("r", "raw"),
+                ("y", "copy"),
+                ("/", "lookup"),
+                (":", "cmd"),
+                ("?", "help"),
+            ])
+            .map(|(k, t)| (k.to_string(), t))
+            .collect()
     };
     for (k, t) in keys {
         spans.push(Span::styled(
@@ -685,6 +686,24 @@ mod tests {
         let s = render_lines(100, 30, |f| view(f, &app, app.theme()));
         assert!(s.contains("go to"), "{s}");
         assert!(s.contains("Subdomains") && s.contains("SECURITY"), "{s}");
+    }
+
+    /// At 80 columns the global hints still end with `? help`: `[ ] tab`
+    /// shows only on a lens that has sub-tabs.
+    #[test]
+    fn the_status_bar_fits_its_help_hint_at_80_columns() {
+        let mut app = App::new(None);
+        app.lens = LensKey::Audit.index();
+        let s = render_lines(80, 24, |f| view(f, &app, app.theme()));
+        let status = s.lines().last().unwrap_or_default();
+        assert!(status.contains("? help"), "{status}");
+        assert!(!status.contains("[ ] tab"), "{status}");
+        app.lens = LensKey::Rdap.index();
+        let s = render_lines(140, 24, |f| view(f, &app, app.theme()));
+        assert!(
+            s.lines().last().is_some_and(|l| l.contains("[ ] tab")),
+            "{s}"
+        );
     }
 
     #[test]
