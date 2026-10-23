@@ -7,7 +7,7 @@
 
 use seer_core::bulk::BulkResult;
 use seer_core::colors::CatppuccinExt;
-use seer_core::output::OutputFormat;
+use seer_core::output::{sanitize_line, OutputFormat};
 use seer_core::RecordType;
 
 /// Progress display for a bulk run (`--progress`).
@@ -147,11 +147,7 @@ pub async fn run_bulk(
     if !failures.is_empty() && !matches!(mode, ProgressMode::Verbose | ProgressMode::Failures) {
         report(&format!("{}", "Failures:".ctp_red()));
         for result in failures {
-            report(&format!(
-                "  {} - {}",
-                result.operation.domain(),
-                result.error.as_deref().unwrap_or("unknown error")
-            ));
+            report(&failure_line(result));
         }
     }
 
@@ -218,7 +214,7 @@ impl BulkBar {
         let bar = self.0.clone();
         Box::new(move |result: &BulkResult| {
             bar.inc(1);
-            bar.set_message(result.operation.domain().to_string());
+            bar.set_message(sanitize_line(result.operation.domain()));
             if let Some(line) = item_line(mode, result) {
                 let _ = crate::display::bar_println(&bar, &line);
             }
@@ -233,9 +229,24 @@ impl Drop for BulkBar {
     }
 }
 
+/// The domain and error of a result, sanitized: both can be remote text (an
+/// input line, a server's error), and every line here goes to a terminal.
+fn domain_and_error(result: &BulkResult) -> (String, String) {
+    (
+        sanitize_line(result.operation.domain()),
+        sanitize_line(result.error.as_deref().unwrap_or("unknown error")),
+    )
+}
+
+/// One row of the end-of-run "Failures:" list.
+fn failure_line(result: &BulkResult) -> String {
+    let (domain, err) = domain_and_error(result);
+    format!("  {domain} - {err}")
+}
+
 /// The line `mode` prints for one finished result, if any.
 fn item_line(mode: ProgressMode, result: &BulkResult) -> Option<String> {
-    let domain = result.operation.domain();
+    let (domain, err) = domain_and_error(result);
     match (mode, result.success) {
         (ProgressMode::Verbose, true) => Some(format!(
             "{} {} ({}ms)",
@@ -244,7 +255,6 @@ fn item_line(mode: ProgressMode, result: &BulkResult) -> Option<String> {
             result.duration_ms
         )),
         (ProgressMode::Verbose | ProgressMode::Failures, false) => {
-            let err = result.error.as_deref().unwrap_or("unknown error");
             Some(format!("{} {} ({})", "\u{2717}".ctp_red(), domain, err))
         }
         _ => None,
@@ -427,6 +437,26 @@ mod tests {
         }
         assert_eq!(item_line(ProgressMode::Failures, &ok), None);
         assert_eq!(item_line(ProgressMode::Bar, &bad), None);
+    }
+
+    /// A bulk input line and a server's error are remote text: neither the
+    /// streamed per-item line nor the "Failures:" row may carry a terminal
+    /// escape or break onto a second line.
+    #[test]
+    fn failure_lines_sanitize_domain_and_error() {
+        let bad = result(
+            "evil\u{1b}]0;owned\u{7}.com",
+            Some("Invalid domain name: evil\u{1b}]0;owned\u{7}.com\nforged"),
+        );
+        let line = item_line(ProgressMode::Failures, &bad).expect("a line");
+        assert!(
+            line.ends_with(" evil.com (Invalid domain name: evil.com forged)"),
+            "{line:?}"
+        );
+        assert_eq!(
+            failure_line(&bad),
+            "  evil.com - Invalid domain name: evil.com forged"
+        );
     }
 
     /// The callback the executor streams results into advances the bar as

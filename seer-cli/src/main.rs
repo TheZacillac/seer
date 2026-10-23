@@ -622,7 +622,9 @@ fn resolve_field_path<'a>(
 
 /// Renders the requested fields of a JSON value as output lines, one per
 /// resolved value (see [`resolve_field_path`] for the path syntax). Strings
-/// print bare, a missing field prints an empty line, anything else as JSON.
+/// print bare but through `sanitize_line` (they are remote text: no escape
+/// may reach the terminal, no value may span lines), a missing field prints
+/// an empty line, anything else as JSON (whose escaping already covers it).
 ///
 /// On a list root (a multi-type `dig`), the fields are extracted element by
 /// element, so each element's values stay together — unless a path starts
@@ -648,7 +650,7 @@ fn extract_field_lines(value: &serde_json::Value, fields: &[String]) -> Vec<Stri
         let mut matches = Vec::new();
         resolve_field_path(value, &parts, &mut matches);
         lines.extend(matches.into_iter().map(|v| match v {
-            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::String(s) => seer_core::output::sanitize_line(s),
             serde_json::Value::Null => String::new(),
             other => other.to_string(),
         }));
@@ -1874,6 +1876,20 @@ mod quiet_fields_tests {
         assert_eq!(
             extract_field_lines(&json!(["a"]), &fields(&["5"])),
             vec![""]
+        );
+    }
+
+    /// Field values are remote text: `-q --fields` must not pass terminal
+    /// escapes through or let one value forge a second line.
+    #[test]
+    fn string_fields_are_sanitized_to_one_line() {
+        let value = json!({
+            "registrar": "Evil\u{1b}]0;pwn\u{7}\nfake.example",
+            "nested": {"error": "\u{1b}[31mred\r"}
+        });
+        assert_eq!(
+            extract_field_lines(&value, &fields(&["registrar", "nested"])),
+            vec!["Evil fake.example", r#"{"error":"\u001b[31mred\r"}"#]
         );
     }
 
