@@ -1,7 +1,7 @@
-//! Registry of the 19 lenses shown in the left nav, grouped LOOKUP / DNS /
+//! Registry of the 22 lenses shown in the nav, grouped LOOKUP / DNS /
 //! SECURITY / POWER. Each `LENSES` entry also carries the lens's behaviour
-//! flags — `interactive` (↵ focuses it without rows), `filter` (which tabs
-//! take `/`) and `heavy` (an active scan, run only on request) — so `App`
+//! flags — `interactive` (↵ focuses it without rows), `filter` (`/` filters
+//! its rows) and `heavy` (an active scan, run only on request) — so `App`
 //! reads them here instead of keeping its own lists of keys, and its `keys`:
 //! the pane keys the status bar and `?` overlay list for it.
 
@@ -44,6 +44,9 @@ pub enum LensKey {
     Avail,
     Tld,
     Dns,
+    Dnssec,
+    Compare,
+    Trace,
     Propagation,
     Follow,
     Ssl,
@@ -69,6 +72,9 @@ impl LensKey {
             LensKey::Avail => "avail",
             LensKey::Tld => "tld",
             LensKey::Dns => "dns",
+            LensKey::Dnssec => "dnssec",
+            LensKey::Compare => "compare",
+            LensKey::Trace => "trace",
             LensKey::Propagation => "propagation",
             LensKey::Follow => "follow",
             LensKey::Ssl => "ssl",
@@ -110,32 +116,17 @@ impl PartialEq<&str> for LensKey {
     }
 }
 
-/// Which of a lens's sub-tabs accept the in-lens `/`-filter.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Filter {
-    None,
-    /// Every tab (or the lens has none).
-    All,
-    /// Only this tab lists rows.
-    Tab(usize),
-}
-
 /// A key a lens's pane handles, for the status bar and `?` overlay. `code`
 /// is what the pane matches (the dead-hint test sends it) and what the hint
-/// shows; `tab` limits the hint to one sub-tab.
+/// shows.
 #[derive(Debug, Clone, Copy)]
 pub struct KeyHint {
     pub code: KeyCode,
     pub what: &'static str,
-    pub tab: Option<usize>,
 }
 
 const fn hint(code: KeyCode, what: &'static str) -> KeyHint {
-    KeyHint {
-        code,
-        what,
-        tab: None,
-    }
+    KeyHint { code, what }
 }
 
 impl KeyHint {
@@ -145,13 +136,6 @@ impl KeyHint {
             KeyCode::Enter => "↵".to_string(),
             KeyCode::Char(c) => c.to_string(),
             other => format!("{other:?}"),
-        }
-    }
-
-    const fn on_tab(self, tab: usize) -> Self {
-        Self {
-            tab: Some(tab),
-            ..self
         }
     }
 }
@@ -166,8 +150,8 @@ pub struct Lens {
     pub tabs: &'static [&'static str],
     /// ↵ focuses the pane even with no rows: its controls work without data.
     pub interactive: bool,
-    /// Where `/` filters the loaded rows.
-    pub filter: Filter,
+    /// `/` filters the loaded rows.
+    pub filter: bool,
     /// An active scan (CT-log queries, HTTP probes across many hosts): it
     /// runs only on request (↵ or its `:` command), never on navigation.
     pub heavy: bool,
@@ -187,7 +171,7 @@ const fn lens(key: LensKey, label: &'static str, glyph: &'static str, group: &'s
         group,
         tabs: &[],
         interactive: false,
-        filter: Filter::None,
+        filter: false,
         heavy: false,
         keys: &[],
     }
@@ -211,8 +195,11 @@ impl Lens {
         }
     }
 
-    const fn filter(self, filter: Filter) -> Self {
-        Self { filter, ..self }
+    const fn filter(self) -> Self {
+        Self {
+            filter: true,
+            ..self
+        }
     }
 
     const fn heavy(self) -> Self {
@@ -226,20 +213,9 @@ impl Lens {
         Self { keys, ..self }
     }
 
-    /// The key hints that apply on sub-`tab`.
-    pub fn keys_for(&self, tab: usize) -> impl Iterator<Item = &'static KeyHint> {
-        self.keys
-            .iter()
-            .filter(move |h| h.tab.is_none_or(|t| t == tab))
-    }
-
-    /// Whether sub-`tab` accepts the in-lens `/`-filter.
-    pub fn filterable(&self, tab: usize) -> bool {
-        match self.filter {
-            Filter::None => false,
-            Filter::All => true,
-            Filter::Tab(t) => t == tab,
-        }
+    /// Whether `/` filters this lens's rows.
+    pub fn filterable(&self) -> bool {
+        self.filter
     }
 }
 
@@ -259,19 +235,24 @@ static LENSES: &[Lens] = &[
             hint(KeyCode::Char('f'), "filter"),
             hint(KeyCode::Enter, "load"),
         ]),
-    lens(LensKey::Dns, "DNS Records", "≣", "DNS")
+    // Interactive so `s` can change the nameserver of an empty answer.
+    lens(LensKey::Dns, "Records", "≣", "DNS")
         .cmd("dig")
-        .tabs(&["Records", "DNSSEC", "Compare", "Trace"])
         .interactive()
-        .filter(Filter::Tab(0))
+        .filter()
+        .keys(&[hint(KeyCode::Char('s'), "nameserver")]),
+    lens(LensKey::Dnssec, "DNSSEC", "◑", "DNS"),
+    // `a` / `b` cycle the resolvers even before a comparison has loaded.
+    lens(LensKey::Compare, "Compare", "≍", "DNS")
+        .interactive()
         .keys(&[
-            hint(KeyCode::Char('s'), "nameserver").on_tab(0),
-            hint(KeyCode::Char('a'), "resolver A").on_tab(2),
-            hint(KeyCode::Char('b'), "resolver B").on_tab(2),
+            hint(KeyCode::Char('a'), "resolver A"),
+            hint(KeyCode::Char('b'), "resolver B"),
         ]),
+    lens(LensKey::Trace, "Trace", "⇶", "DNS"),
     lens(LensKey::Propagation, "Propagation", "◐", "DNS")
         .cmd("prop")
-        .filter(Filter::All),
+        .filter(),
     lens(LensKey::Follow, "Follow", "⟳", "DNS")
         .interactive()
         .keys(&[
@@ -283,12 +264,12 @@ static LENSES: &[Lens] = &[
     lens(LensKey::Ssl, "SSL / Cert", "⛨", "SECURITY"),
     lens(LensKey::Status, "Status", "♥", "SECURITY"),
     lens(LensKey::Subdomains, "Subdomains", "⋔", "SECURITY")
-        .filter(Filter::All)
+        .filter()
         .heavy(),
     lens(LensKey::Headers, "HTTP Headers", "☰", "SECURITY"),
     lens(LensKey::Audit, "Audit", "◉", "SECURITY").heavy(),
     lens(LensKey::Takeover, "Takeover", "⚑", "SECURITY")
-        .filter(Filter::All)
+        .filter()
         .heavy(),
     // `↵` diffs only once a second domain is set, so it is not hinted.
     lens(LensKey::Diff, "Diff", "⇄", "POWER")
@@ -314,7 +295,7 @@ static LENSES: &[Lens] = &[
             hint(KeyCode::Enter, "open"),
         ]),
     lens(LensKey::History, "History", "↺", "POWER")
-        .filter(Filter::All)
+        .filter()
         .keys(&[
             hint(KeyCode::Enter, "replay"),
             hint(KeyCode::Char('c'), "clear"),
@@ -402,7 +383,10 @@ pub fn render(
         LensKey::Headers => headers::page(theme, data, focused, sel),
         LensKey::Audit => audit::page(theme, data, focused, sel),
         LensKey::Takeover => takeover::page(theme, data, focused, sel),
-        LensKey::Dns => dns::page(theme, tab, data, filter, focused, sel, panes),
+        LensKey::Dns => dns::page(theme, data, filter, focused, sel, &panes.dns),
+        LensKey::Dnssec => dnssec::page(theme, data),
+        LensKey::Compare => compare::page(theme, data),
+        LensKey::Trace => trace::page(theme, data, focused, sel),
         // Pane-driven lenses render from `app.panes` state in
         // render.rs::main_pane, before the state match, so they never reach
         // this dispatch.
@@ -440,9 +424,25 @@ mod tests {
     }
 
     #[test]
-    fn registry_has_nineteen_lenses_in_four_groups() {
+    fn registry_has_twenty_two_lenses_in_four_groups() {
         let ls = lenses();
-        assert_eq!(ls.len(), 19);
+        assert_eq!(ls.len(), 22);
+        let dns: Vec<&str> = ls
+            .iter()
+            .filter(|l| l.group == "DNS")
+            .map(|l| l.label)
+            .collect();
+        assert_eq!(
+            dns,
+            [
+                "Records",
+                "DNSSEC",
+                "Compare",
+                "Trace",
+                "Propagation",
+                "Follow"
+            ]
+        );
         assert_eq!(ls[0].key, "overview");
         assert_eq!(ls[0].group, "LOOKUP");
         let groups: Vec<&str> = ls.iter().map(|l| l.group).collect();
@@ -469,6 +469,9 @@ mod tests {
                 "avail",
                 "tld",
                 "dns",
+                "dnssec",
+                "compare",
+                "trace",
                 "propagation",
                 "follow",
                 "ssl",
@@ -511,14 +514,12 @@ mod tests {
         assert_eq!(flagged(|l| l.heavy), ["subdomains", "audit", "takeover"]);
         assert_eq!(
             flagged(|l| l.interactive),
-            ["rdap", "tld", "dns", "follow", "diff", "bulk", "watch"]
+            ["rdap", "tld", "dns", "compare", "follow", "diff", "bulk", "watch"]
         );
         assert_eq!(
-            flagged(|l| l.filterable(0)),
+            flagged(|l| l.filterable()),
             ["dns", "propagation", "subdomains", "takeover", "history"]
         );
-        // Of the DNS lens's tabs only Records lists rows.
-        assert!(!LENSES[LensKey::Dns.index()].filterable(1));
     }
 
     #[test]

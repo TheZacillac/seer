@@ -1,9 +1,9 @@
-//! DNS Trace tab renderer — the iterative walk from the root servers down to
+//! DNS Trace lens — the iterative walk from the root servers down to
 //! the authoritative answer (`seer dig +trace`): one selectable row per
 //! delegation hop, the selected hop's referral and failed servers, then the
 //! final answer and why the walk ended. The wording is
 //! `seer_core::output::dig`'s and every remote string goes through
-//! `sanitize_line`, as in the Records tab.
+//! `sanitize_line`, as in the Records lens.
 use ratatui::layout::Constraint;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};

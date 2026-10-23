@@ -1,4 +1,4 @@
-//! DNSSEC tab renderer — state header + KV summary + DS records table.
+//! DNSSEC lens — state header + KV summary + DS records table.
 use ratatui::layout::Constraint;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};

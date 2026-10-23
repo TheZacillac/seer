@@ -55,7 +55,7 @@ pub enum FetchReq {
     RdapDomain(String),
     RdapIp(String),
     RdapAsn(u32),
-    /// A dig-style query (the DNS lens's Records tab).
+    /// A dig-style query (the Records lens).
     Dns {
         domain: String,
         record_type: RecordType,
@@ -68,7 +68,7 @@ pub enum FetchReq {
         a: String,
         b: String,
     },
-    /// An iterative trace from the root servers (the DNS lens's Trace tab).
+    /// An iterative trace from the root servers (the Trace lens).
     /// It takes no nameserver: the walk asks each zone's own servers.
     Trace {
         domain: String,
@@ -99,10 +99,10 @@ impl FetchReq {
             FetchReq::Overview(_) => LensKey::Overview,
             FetchReq::Whois(_) => LensKey::Whois,
             FetchReq::RdapDomain(_) | FetchReq::RdapIp(_) | FetchReq::RdapAsn(_) => LensKey::Rdap,
-            FetchReq::Dns { .. }
-            | FetchReq::Dnssec(_)
-            | FetchReq::Compare { .. }
-            | FetchReq::Trace { .. } => LensKey::Dns,
+            FetchReq::Dns { .. } => LensKey::Dns,
+            FetchReq::Dnssec(_) => LensKey::Dnssec,
+            FetchReq::Compare { .. } => LensKey::Compare,
+            FetchReq::Trace { .. } => LensKey::Trace,
             FetchReq::Ssl(_) => LensKey::Ssl,
             FetchReq::Status(_) => LensKey::Status,
             FetchReq::Prop(_) => LensKey::Propagation,
@@ -124,9 +124,8 @@ impl FetchReq {
     /// the active tab to tell whether a cached result still belongs on screen.
     pub fn tab(&self) -> usize {
         match self {
-            FetchReq::RdapIp(_) | FetchReq::Dnssec(_) => 1,
-            FetchReq::RdapAsn(_) | FetchReq::Compare { .. } => 2,
-            FetchReq::Trace { .. } => 3,
+            FetchReq::RdapIp(_) => 1,
+            FetchReq::RdapAsn(_) => 2,
             _ => 0,
         }
     }
@@ -285,7 +284,7 @@ mod tests {
     #[test]
     fn fetch_req_lens_keys() {
         assert_eq!(FetchReq::RdapIp("1.2.3.4".into()).lens_key(), "rdap");
-        assert_eq!(FetchReq::Dnssec("x".into()).lens_key(), "dns");
+        assert_eq!(FetchReq::Dnssec("x".into()).lens_key(), "dnssec");
         assert_eq!(
             FetchReq::Compare {
                 domain: "x".into(),
@@ -294,14 +293,14 @@ mod tests {
                 b: "1.1.1.1".into()
             }
             .lens_key(),
-            "dns"
+            "compare"
         );
         let trace = FetchReq::Trace {
             domain: "x".into(),
             record_type: RecordType::A,
         };
-        assert_eq!(trace.lens_key(), "dns");
-        assert_eq!(trace.tab(), 3, "the DNS lens's Trace tab");
+        assert_eq!(trace.lens_key(), "trace");
+        assert_eq!(trace.tab(), 0, "a lens of its own");
         assert_eq!(trace.target(), "x");
         assert_eq!(FetchReq::Tld(".com".into()).lens_key(), "tld");
         assert_eq!(FetchReq::Headers("x".into()).lens_key(), "headers");
@@ -315,7 +314,8 @@ mod tests {
         assert_eq!(FetchReq::RdapDomain("x".into()).tab(), 0);
         assert_eq!(FetchReq::RdapIp("1.2.3.4".into()).tab(), 1);
         assert_eq!(FetchReq::RdapAsn(15169).tab(), 2);
-        assert_eq!(FetchReq::Dnssec("x".into()).tab(), 1);
+        assert_eq!(FetchReq::Dnssec("x".into()).tab(), 0);
+        assert_eq!(FetchReq::Dnssec("x".into()).lens_key(), "dnssec");
         assert_eq!(FetchReq::Whois("x".into()).tab(), 0);
         assert_eq!(FetchReq::RdapAsn(15169).target(), "AS15169");
     }

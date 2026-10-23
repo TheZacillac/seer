@@ -47,17 +47,13 @@ impl Panes {
     pub fn handle_key(
         &mut self,
         lens_key: LensKey,
-        tab: usize,
         key: KeyEvent,
         domain: Option<&str>,
     ) -> Option<PaneOutcome> {
         match lens_key {
             LensKey::Tld => self.tld.handle_key(key),
-            LensKey::Dns => match tab {
-                0 => self.dns.handle_key(key, domain),
-                2 => self.compare.handle_key(key, domain),
-                _ => None,
-            },
+            LensKey::Dns => self.dns.handle_key(key, domain),
+            LensKey::Compare => self.compare.handle_key(key, domain),
             LensKey::Diff => self.diff.handle_key(key, domain),
             LensKey::Follow => self.follow.handle_key(key, domain),
             LensKey::Bulk => self.bulk.handle_key(key),

@@ -468,13 +468,10 @@ fn status_or_command(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     }
     spans.push(Span::raw("   "));
     // A focused pane lists its own keys; otherwise the global ones.
-    let lens_keys: Vec<(String, &str)> = lens
-        .keys_for(app.tab)
-        .map(|h| (h.label(), h.what))
-        .collect();
+    let lens_keys: Vec<(String, &str)> = lens.keys.iter().map(|h| (h.label(), h.what)).collect();
     let keys: Vec<(String, &str)> = if app.focus == Focus::Pane && !lens_keys.is_empty() {
         let mut keys = lens_keys;
-        if lens.filterable(app.tab) {
+        if lens.filterable() {
             keys.push(("/".to_string(), "filter"));
         }
         keys.extend([("h".to_string(), "back"), ("?".to_string(), "help")]);
@@ -520,7 +517,7 @@ fn help_overlay(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         ("{ / }", "previous / next nav group"),
         ("\\", "collapse / expand the nav"),
         ("Tab", "toggle focus: nav ⇄ pane"),
-        ("[ / ]", "switch sub-tabs (RDAP, DNS)"),
+        ("[ / ]", "switch sub-tabs (RDAP)"),
         ("↵ / l", "enter the pane · run Subdomains / Takeover"),
         ("h / Esc", "back to nav"),
         ("g / G", "jump to top / bottom"),
@@ -532,10 +529,7 @@ fn help_overlay(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         ("?", "this help · Esc closes"),
     ];
     let lens = app.current_lens();
-    let lens_rows: Vec<(String, &str)> = lens
-        .keys_for(app.tab)
-        .map(|h| (h.label(), h.what))
-        .collect();
+    let lens_rows: Vec<(String, &str)> = lens.keys.iter().map(|h| (h.label(), h.what)).collect();
     let row = |(k, t): (&str, &str)| {
         Line::from(vec![
             Span::styled(
@@ -798,7 +792,7 @@ mod tests {
         assert!(human.contains("● NOERROR"), "{human}");
         app.format = seer_core::output::OutputFormat::Json;
         let raw = full_buf(&app, &theme);
-        assert!(raw.contains("DNS Records · raw"), "{raw}");
+        assert!(raw.contains("Records · raw"), "{raw}");
         assert!(raw.contains("\"status\": \"NOERROR\""), "{raw}");
         assert!(raw.contains("\"address\": \"192.0.2.7\""), "{raw}");
     }

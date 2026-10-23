@@ -20,7 +20,7 @@ pub struct DnsState {
     pub custom_ns: Option<String>,
     /// Cached resolved IP for the current domain (used by RDAP IP tab).
     pub resolved_ip: Option<String>,
-    /// Record type the Records and Trace tabs query (`:dig <domain> <type>`;
+    /// Record type the Records and Trace lenses query (`:dig <domain> <type>`;
     /// default A).
     pub record_type: RecordType,
 }

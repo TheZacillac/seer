@@ -1,6 +1,6 @@
 //! Case-insensitive in-lens row filtering for the table lenses (subdomains,
-//! history, propagation, takeover, and the DNS lens's Records tab — which
-//! lenses and tabs accept `/` is the `filter` flag of their `LENSES` entry).
+//! history, propagation, takeover, and the DNS Records lens — which
+//! lenses accept `/` is the `filter` flag of their `LENSES` entry).
 //!
 //! [`apply`] returns a filtered clone of the lens data; it is used by BOTH the
 //! renderer and `App::row_count`, so the displayed rows, the selection index

@@ -1,4 +1,4 @@
-//! DNS Compare tab renderer — shows A vs B nameserver record comparison.
+//! DNS Compare lens — A vs B nameserver record comparison.
 use ratatui::layout::Constraint;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};

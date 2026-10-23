@@ -44,7 +44,7 @@ pub enum CmdOutcome {
         record_type: RecordType,
         /// `@server`; `None` keeps the lens's current nameserver.
         server: Option<String>,
-        /// `+trace`: open the Trace tab rather than Records.
+        /// `+trace`: open the Trace lens rather than Records.
         trace: bool,
     },
     /// `watch add <domain>` / `watch remove <domain>` — edit the watchlist.
@@ -111,6 +111,11 @@ pub fn parse(raw: &str) -> CmdOutcome {
                 domain: d.to_string(),
                 a: a.to_string(),
                 b: b.to_string(),
+            },
+            // Bare `compare` opens the lens on the session target.
+            (None, _, _) => CmdOutcome::Lens {
+                lens: head,
+                target: None,
             },
             _ => CmdOutcome::Unknown(line.to_string()),
         };
@@ -236,6 +241,26 @@ mod tests {
             CmdOutcome::SetFormat("yaml".into())
         );
         assert_eq!(parse("set output bogus"), CmdOutcome::BadFormat);
+    }
+
+    /// The split-out DNS tools open by name; `compare` with arguments still
+    /// runs a comparison.
+    #[test]
+    fn dns_tool_names_open_their_lenses() {
+        for name in ["compare", "dnssec", "trace"] {
+            assert_eq!(
+                parse(name),
+                CmdOutcome::Lens {
+                    lens: name.into(),
+                    target: None
+                },
+                "{name}"
+            );
+        }
+        assert!(matches!(
+            parse("compare example.com 1.1.1.1 8.8.8.8"),
+            CmdOutcome::Compare { .. }
+        ));
     }
 
     #[test]

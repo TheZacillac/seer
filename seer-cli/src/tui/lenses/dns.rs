@@ -1,7 +1,4 @@
-//! DNS Records lens — Records tab (tab 0), DNSSEC tab (tab 1), Compare tab
-//! (tab 2), Trace tab (tab 3).
-//!
-//! Records renders a dig-style query result: the response's status line,
+//! DNS Records lens. It renders a dig-style query result: the response's status line,
 //! the ANSWER section (the CNAME chain under its real owners, then the
 //! records), and for a response without answers why not — NXDOMAIN, NODATA,
 //! a referral or a server failure — with the AUTHORITY records the server
@@ -18,29 +15,10 @@ use seer_core::{DnsQueryResult, DnsRecord, DnsStatus};
 
 use crate::tui::action::LensData;
 use crate::tui::filter;
-use crate::tui::lenses::{compare, dnssec, trace};
-use crate::tui::panes::{DnsState, Panes};
+use crate::tui::panes::DnsState;
 use crate::tui::theme::Theme;
 use crate::tui::widgets::inspector::Field;
 use crate::tui::widgets::page::{Block, Detail, Page, TableBlock};
-
-#[allow(clippy::too_many_arguments)]
-pub fn page(
-    theme: &Theme,
-    tab: usize,
-    data: &LensData,
-    filter: &str,
-    focused: bool,
-    sel: usize,
-    panes: &Panes,
-) -> Option<Page> {
-    match tab {
-        1 => dnssec::page(theme, data),
-        2 => compare::page(theme, data),
-        3 => trace::page(theme, data, focused, sel),
-        _ => records(theme, data, filter, focused, sel, &panes.dns),
-    }
-}
 
 /// The color of a response code: green for NOERROR, yellow for NXDOMAIN,
 /// red for a server failure (SERVFAIL, REFUSED, …) — `seer dig`'s scheme.
@@ -104,12 +82,12 @@ pub(super) fn record_table<'r>(
     )
 }
 
-/// The Records tab: the nameserver chips and their keys, dig's status line,
+/// The Records lens: the nameserver chips and their keys, dig's status line,
 /// then the response — the answers (and, while focused, the selected one's
 /// full fields), the verdict when there are none, the authority records,
 /// and the local-answer or wildcard note. The verdict and notes are kept
 /// whole; the tables give rows up first.
-fn records(
+pub fn page(
     theme: &Theme,
     data: &LensData,
     filter: &str,
@@ -237,19 +215,19 @@ mod tests {
         f: &mut ratatui::Frame,
         area: ratatui::layout::Rect,
         theme: &Theme,
-        tab: usize,
         data: &LensData,
         filter: &str,
         focused: bool,
         sel: usize,
         panes: &Panes,
     ) {
-        if let Some(p) = page(theme, tab, data, filter, focused, sel, panes) {
+        if let Some(p) = page(theme, data, filter, focused, sel, &panes.dns) {
             page::draw(f, area, theme, p, focused);
         }
     }
     use crate::payload::fixtures;
-    use crate::tui::test_util::{render_buffer, render_lines, render_text};
+    use crate::tui::panes::Panes;
+    use crate::tui::test_util::{render_buffer, render_lines};
     use seer_core::dns::{RecordData, RecordType};
     use seer_core::WildcardProbe;
 
@@ -294,7 +272,6 @@ mod tests {
                 f,
                 f.area(),
                 &theme,
-                0,
                 data,
                 filter,
                 sel.is_some(),
@@ -405,7 +382,7 @@ mod tests {
         let data = dig_data(chained());
         let panes = Panes::default();
         let buffer = render_buffer(100, 16, |f| {
-            render(f, f.area(), &theme, 0, &data, "", false, 0, &panes);
+            render(f, f.area(), &theme, &data, "", false, 0, &panes);
         });
         let fg_of = |needle: &str| {
             let area = buffer.area();
@@ -507,7 +484,7 @@ mod tests {
             assert!(!text.contains("AUTHORITY"), "{text}");
             // The status is drawn in the failure color.
             let buffer = render_buffer(100, 16, |f| {
-                render(f, f.area(), &theme, 0, &data, "", false, 0, &panes);
+                render(f, f.area(), &theme, &data, "", false, 0, &panes);
             });
             let status_row = (0..16u16)
                 .find(|&y| {
@@ -666,34 +643,5 @@ mod tests {
         panes.dns.select_server("9.9.9.9".into());
         let text = draw(&data, &panes, "", None);
         assert!(text.contains(" 1.1.1.1   9.9.9.9 "), "custom slot: {text}");
-    }
-
-    #[test]
-    fn other_tabs_render_their_own_payloads() {
-        let theme = Theme::frappe();
-        let panes = Panes::default();
-        let trace = LensData::Trace(Box::new(fixtures::trace(
-            vec![fixtures::a("www.seer.test", "192.0.2.7")],
-            None,
-        )));
-        let text = render_text(100, 20, |f| {
-            render(f, f.area(), &theme, 3, &trace, "", false, 0, &panes);
-        });
-        assert!(text.contains("trace · www.seer.test A"), "{text}");
-        // A Records payload under the Trace tab (a stale cache) draws nothing.
-        let text = render_text(100, 20, |f| {
-            render(
-                f,
-                f.area(),
-                &theme,
-                3,
-                &dig_data(chained()),
-                "",
-                false,
-                0,
-                &panes,
-            );
-        });
-        assert!(!text.contains("192.0.2.7"), "{text}");
     }
 }
