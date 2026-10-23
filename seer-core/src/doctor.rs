@@ -436,12 +436,23 @@ impl Doctor {
     }
 
     /// The raw WHOIS exchange against pre-vetted addresses; `Err` carries
-    /// the failure detail. The probe target is the hardcoded IANA server in
-    /// production (only injectable under `#[cfg(test)]`).
+    /// the failure detail. Connects the way the WHOIS client does
+    /// ([`crate::net::connect_any`]: IPv4 first, each address a share of the
+    /// budget), so an unusable IPv6 route fails here only when it would fail
+    /// there. The probe target is the hardcoded IANA server in production
+    /// (only injectable under `#[cfg(test)]`).
     async fn whois_exchange(&self, addrs: &[SocketAddr]) -> Result<String, String> {
-        let mut stream = TcpStream::connect(addrs)
+        let mut stream = crate::net::connect_any(addrs, self.probe_timeout, TcpStream::connect)
             .await
-            .map_err(|e| format!("connect to {} failed: {}", self.whois_addr, e))?;
+            .map_err(|e| match e {
+                crate::net::ConnectError::Io(e) => {
+                    format!("connect to {} failed: {}", self.whois_addr, e)
+                }
+                crate::net::ConnectError::TimedOut => format!(
+                    "connect to {} timed out after {:?} (port 43 may be blocked)",
+                    self.whois_addr, self.probe_timeout
+                ),
+            })?;
         stream
             .write_all(format!("{}\r\n", self.probe_domain).as_bytes())
             .await
@@ -834,6 +845,36 @@ mod tests {
         let check = doctor.check_whois().await;
         assert_eq!(check.status, CheckStatus::Fail);
         assert!(check.detail.contains("timed out"), "got: {}", check.detail);
+    }
+
+    /// Regression: the probe connected in resolver order (IPv6 first, as
+    /// hickory returns it) while the WHOIS client connects IPv4 first.
+    #[tokio::test]
+    async fn whois_exchange_connects_ipv4_first() {
+        let Ok(v6) = tokio::net::TcpListener::bind("[::1]:0").await else {
+            eprintln!("skipping: no IPv6 loopback");
+            return;
+        };
+        let v4 = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind v4");
+        let addrs = [
+            v6.local_addr().expect("v6 addr"),
+            v4.local_addr().expect("v4 addr"),
+        ];
+        let doctor = base_doctor(&SeerConfig::default()).with_probe_timeout(Duration::from_secs(2));
+        let exchange = tokio::spawn(async move { doctor.whois_exchange(&addrs).await });
+        timeout(Duration::from_secs(2), v4.accept())
+            .await
+            .expect("the IPv4 listener is connected")
+            .expect("accept");
+        assert!(
+            timeout(Duration::from_millis(100), v6.accept())
+                .await
+                .is_err(),
+            "the IPv6 listener must not be tried first"
+        );
+        exchange.abort();
     }
 
     // --- rdap bootstrap check ---------------------------------------------
