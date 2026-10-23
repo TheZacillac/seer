@@ -1,6 +1,6 @@
 //! Small reusable TUI building blocks: `panel` (bordered block → inner
 //! `Rect`), `kv` rows, `gauge`, status `dot` and `chips`, the selected-row
-//! `inspector`, plus the shared
+//! `inspector`, the `page` every lens is drawn through, plus the shared
 //! `or_dash` missing-value mark, `row_style` selection styling, and `stack`
 //! (of [`Band`]s), `wrap` and `wrap_hard` for bands sized to their content before they
 //! are drawn.
@@ -10,6 +10,7 @@ pub mod dot;
 pub mod gauge;
 pub mod inspector;
 pub mod kv;
+pub mod page;
 pub mod panel;
 
 use ratatui::layout::Rect;
