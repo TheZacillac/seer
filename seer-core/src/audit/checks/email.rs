@@ -1,7 +1,9 @@
 //! Email anti-spoofing posture (SPF, DMARC, MX, MTA-STS, DANE, BIMI), one
 //! check per mechanism so a failed lookup marks only that mechanism
 //! incomplete. Reads `posture`'s structured fields (verdict, qualifiers,
-//! `permerror`, `mx`), never its notes.
+//! `permerror`, `mx`), never its notes. DMARC is judged on posture's
+//! `effective_policy` (the inherited `sp=` rule lives there only), and a
+//! record set receivers ignore (several records) counts as no DMARC.
 
 use futures::future::BoxFuture;
 
@@ -60,9 +62,10 @@ fn run<'a>(ctx: &'a AuditContext<'a>) -> BoxFuture<'a, CheckOutput> {
     })
 }
 
-/// The DMARC `p=` value, lowercased.
+/// The DMARC policy that applies to the domain (posture's
+/// `effective_policy`: `sp=` for an inherited record), lowercased.
 fn dmarc_policy(d: &DmarcPolicy) -> Option<String> {
-    d.policy.as_deref().map(str::to_ascii_lowercase)
+    d.effective_policy.as_deref().map(str::to_ascii_lowercase)
 }
 
 fn enforcing(d: &DmarcPolicy) -> bool {
@@ -220,6 +223,18 @@ fn spf_findings(domain: &str, spf: &SpfPolicy) -> Vec<Finding> {
 }
 
 fn dmarc_findings(domain: &str, d: &DmarcPolicy) -> Vec<Finding> {
+    // Present but `Absent`: several records, so receivers apply none
+    // (RFC 7489 §6.6.3).
+    if d.present && d.verdict == PostureVerdict::Absent {
+        return vec![Finding::new(
+            "email.dmarc.missing",
+            E,
+            Severity::High,
+            domain,
+            "Multiple DMARC records, so none applies",
+        )
+        .fix("Publish exactly one _dmarc record.")];
+    }
     if !d.present {
         return vec![Finding::new(
             "email.dmarc.missing",
@@ -241,7 +256,7 @@ fn dmarc_findings(domain: &str, d: &DmarcPolicy) -> Vec<Finding> {
                 E,
                 Severity::Medium,
                 domain,
-                "DMARC only monitors (p=none)",
+                "DMARC only monitors (policy none)",
             )
             .fix("Move the DMARC policy to quarantine, then reject."),
         )];
@@ -288,6 +303,7 @@ mod tests {
                 record: Some("v=DMARC1; p=reject".into()),
                 policy: Some("reject".into()),
                 subdomain_policy: None,
+                effective_policy: Some("reject".into()),
                 aggregate_reports: vec![],
                 percent: None,
                 verdict: PostureVerdict::Strict,
@@ -373,6 +389,7 @@ mod tests {
     fn dmarc_none_and_partial() {
         let mut p = hardened();
         p.dmarc.policy = Some("none".into());
+        p.dmarc.effective_policy = Some("none".into());
         p.dmarc.verdict = PostureVerdict::Weak;
         // BIMI needs an enforcing DMARC: not applicable now, so no BIMI finding.
         assert_eq!(
@@ -454,5 +471,87 @@ mod tests {
             ]
         );
         assert!(out.findings.iter().all(|f| IDS.contains(&f.id)));
+    }
+
+    fn with_dmarc(domain: &str, at: &str, txts: &[&str]) -> EmailPosture {
+        let mut p = hardened();
+        p.domain = domain.into();
+        p.dmarc = crate::posture::dmarc_from_records(domain, at, txts);
+        p
+    }
+
+    /// Regression: the audit graded raw `p=`, so a subdomain inheriting
+    /// `p=none; sp=reject` was reported as monitoring-only although posture
+    /// grades it Strict.
+    #[test]
+    fn inherited_enforcing_sp_is_not_policy_none() {
+        let p = with_dmarc(
+            "mail.org.test",
+            "org.test",
+            &["v=DMARC1; p=none; sp=reject"],
+        );
+        assert_eq!(p.dmarc.verdict, PostureVerdict::Strict);
+        let out = assess("mail.org.test", &p);
+        assert!(out.findings.is_empty(), "{:?}", out.findings);
+        // Enforcing, so BIMI applies (and is present).
+        assert!(out
+            .runs
+            .iter()
+            .any(|r| r.check == "email.bimi" && r.status == CheckStatus::Ran));
+
+        // A parked subdomain under the same record is locked down too.
+        let mut parked = p.clone();
+        parked.mx = MailExchangers::Absent;
+        assert!(ids(&assess("mail.org.test", &parked)).is_empty());
+    }
+
+    /// Regression: `p=reject; sp=none` inherited by a subdomain leaves it
+    /// unenforced, which the audit missed.
+    #[test]
+    fn inherited_sp_none_is_policy_none() {
+        let p = with_dmarc(
+            "mail.org.test",
+            "org.test",
+            &["v=DMARC1; p=reject; sp=none"],
+        );
+        assert_eq!(p.dmarc.verdict, PostureVerdict::Weak);
+        let out = assess("mail.org.test", &p);
+        assert_eq!(ids(&out), vec!["email.dmarc.policy-none"]);
+        assert_eq!(out.findings[0].severity, Severity::Medium);
+
+        let mut parked = p.clone();
+        parked.mx = MailExchangers::Absent;
+        assert_eq!(
+            ids(&assess("mail.org.test", &parked)),
+            vec!["email.dmarc.policy-none", "email.parked.spoofable"]
+        );
+    }
+
+    /// The domain's own `p=reject; sp=none`: enforced here, partial for
+    /// subdomains.
+    #[test]
+    fn own_sp_none_is_partial() {
+        let p = with_dmarc(
+            "example.com",
+            "example.com",
+            &["v=DMARC1; p=reject; sp=none"],
+        );
+        assert_eq!(ids(&assess("example.com", &p)), vec!["email.dmarc.partial"]);
+    }
+
+    /// Regression: two DMARC records mean receivers apply none (RFC 7489
+    /// §6.6.3), but the audit reported a Medium policy-none.
+    #[test]
+    fn multiple_dmarc_records_are_missing() {
+        let p = with_dmarc(
+            "example.com",
+            "example.com",
+            &["v=DMARC1; p=reject", "v=DMARC1; p=none"],
+        );
+        assert!(p.dmarc.present);
+        assert_eq!(p.dmarc.verdict, PostureVerdict::Absent);
+        let out = assess("example.com", &p);
+        assert_eq!(ids(&out), vec!["email.dmarc.missing"]);
+        assert_eq!(out.findings[0].severity, Severity::High);
     }
 }

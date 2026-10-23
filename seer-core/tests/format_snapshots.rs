@@ -386,6 +386,7 @@ fn fixture_posture() -> EmailPosture {
             record: Some("v=DMARC1; p=quarantine; pct=50; rua=mailto:dmarc@example.com".into()),
             policy: Some("quarantine".into()),
             subdomain_policy: None,
+            effective_policy: Some("quarantine".into()),
             aggregate_reports: vec!["mailto:dmarc@example.com".into()],
             percent: Some(50),
             verdict: PostureVerdict::Moderate,

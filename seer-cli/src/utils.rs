@@ -1042,6 +1042,7 @@ mod tests {
                 record: Some("v=DMARC1; p=reject".to_string()),
                 policy: Some("reject".to_string()),
                 subdomain_policy: None,
+                effective_policy: Some("reject".to_string()),
                 aggregate_reports: vec![],
                 percent: None,
                 verdict: PostureVerdict::Strict,
