@@ -121,13 +121,20 @@ which seer refuses to connect to.
 
 Failures return `{"detail": "<message>"}` with the status chosen by the
 error's type: `400` invalid input (including a single-host `status`/`ssl`/
-`rdap/ip` target that is a reserved address), `404` no WHOIS server for the
-TLD, `429` rate limited (this API's own limit, or an upstream registry's),
-`502` an upstream (WHOIS, RDAP, DNS, HTTP, TLS) failure, `503` a deployment
-fault or a bulk request that found every bulk slot busy until
-`SEER_REQUEST_TIMEOUT` (nothing ran; retry later), `504` a timeout
-(including `SEER_REQUEST_TIMEOUT`), `500` anything else. A bulk stream that fails or outlives `SEER_REQUEST_TIMEOUT` ends with
-an `error` event.
+`rdap/ip` target or a nameserver that is a reserved IP address), `404` no
+WHOIS server for the TLD, `429` rate limited (this API's own limit, or an
+upstream registry's), `502` an upstream (WHOIS, RDAP, DNS, HTTP, TLS)
+failure, `503` a deployment fault or a bulk request that found every bulk
+slot busy until `SEER_REQUEST_TIMEOUT` (nothing ran; retry later), `504` a
+timeout (including `SEER_REQUEST_TIMEOUT`), `500` anything else. A bulk
+stream that fails or outlives `SEER_REQUEST_TIMEOUT` ends with an `error`
+event.
+
+A *hostname* that resolves to a reserved address is refused by seer-core
+when it connects, and answered exactly like a hostname that does not
+resolve (`ssl`: `502 SSL inspection failed`; `status`: a report whose
+checks failed; a nameserver: `502 DNS resolution failed`), so the API
+cannot be used to probe which internal names exist.
 
 ### Usage Examples
 

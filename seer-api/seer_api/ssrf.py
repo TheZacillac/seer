@@ -10,7 +10,7 @@ or unresolvable domains).
 
 Guard:
 - the ``status`` and ``ssl`` single-host routes/tools (they HTTP/TLS-connect
-  to the target), to answer a reserved target with a clear 400
+  to the target), to answer a reserved IP literal with a clear 400
 - ``rdap/ip`` input (reject reserved IP literals as input validation)
 - user-supplied DNS nameservers (the resolver we actually send packets to) —
   via :func:`vet_nameserver`, which first extracts the host from the
@@ -18,20 +18,24 @@ Guard:
 
 This is a pre-check, never the SSRF gate: seer-core resolves, vets and pins
 every address itself before connecting (``net::resolve_public_host``,
-``DnsResolver::custom_upstream_config``). So only a *refusal* — the target is
-or resolves to a reserved address — blocks the request here. Any other
-failure of the check (the name does not resolve, the lookup timed out) falls
-through to core, which reports its own error. Bulk routes skip the pre-check
-entirely: core refuses a reserved host per row, which becomes a failed row
-instead of failing the whole batch.
+``DnsResolver::custom_upstream_config``). So the pre-check only refuses an
+**IP literal** in a reserved range — the caller already knows that address,
+so saying so leaks nothing. A **hostname** is never pre-checked: answering
+"resolves to a non-public address" (400) for an internal name and "DNS
+resolution failed" (502) for a missing one let any caller probe which
+internal names exist. Core refuses such a host itself and reports it the
+same way as a host that does not resolve (``ssl``: a TLS failure, ``status``:
+a report with generic errors, a nameserver: a DNS failure). Bulk routes skip
+the pre-check entirely: core refuses a reserved host per row, which becomes a
+failed row instead of failing the whole batch.
 
-The checks resolve DNS inside PyO3, so they are blocking: :func:`guarded`
-runs them in the same ``run_seer`` dispatch as the work they protect, under
-the same ``SEER_REQUEST_TIMEOUT``.
+:func:`guarded` runs the check in the same ``run_seer`` dispatch as the work
+it protects, under the same ``SEER_REQUEST_TIMEOUT``.
 """
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 from collections.abc import Callable, Iterable
 from typing import Any
@@ -62,18 +66,17 @@ def nameserver_target(spec: str) -> tuple[str, int] | None:
 
 
 def vet_host(host: str, port: int = 443) -> None:
-    """Raise ``ValueError`` if ``host`` is, or resolves to, a reserved address.
+    """Raise ``ValueError`` if ``host`` is an IP literal in a reserved range.
 
-    ``seer.validate_public_host`` raises ``ValueError`` (core's
-    ``InvalidInput``) only for that refusal; its other failures (DNS error,
-    timeout) are logged and swallowed — see the module docs. Blocking.
+    A hostname passes unchecked; see the module docs for why. The literal is
+    recognized here and vetted by ``seer.validate_public_host`` (core's one
+    reserved-range policy), which resolves nothing for a literal.
     """
     try:
-        seer.validate_public_host(host, port)
+        ipaddress.ip_address(host)
     except ValueError:
-        raise
-    except (RuntimeError, OSError) as exc:  # seer.SeerError, TimeoutError, ...
-        logger.debug("SSRF pre-check inconclusive for %s:%d (%s); core re-vets", host, port, exc)
+        return
+    seer.validate_public_host(host, port)
 
 
 def vet_nameserver(spec: str) -> None:
@@ -100,7 +103,8 @@ def guarded(
     hosts: Iterable[str] = (),
     nameservers: Iterable[str] = (),
 ) -> Callable[..., Any]:
-    """``fn`` preceded by the pre-check of each HTTPS host and nameserver spec.
+    """``fn`` preceded by the pre-check of each HTTPS host and nameserver spec
+    (IP literals only; see :func:`vet_host`).
 
     Pass the result to ``run_seer``: check and work then run in one dispatch,
     under one deadline. A refusal raises ``ValueError`` before ``fn`` runs.

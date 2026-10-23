@@ -344,6 +344,68 @@ def test_ssrf_guard_rejects_reserved(client, path):
     assert "reserved" in detail or "invalid" in detail, (path, detail)
 
 
+@pytest.fixture
+def internal_and_missing_hosts(monkeypatch):
+    """A validator that, like core's, refuses a hostname resolving to a
+    reserved address (ValueError) and fails a missing one (DnsError); and
+    core calls that answer both the way core does (verified against the
+    bindings: ssl -> TlsError, status -> a report with generic errors, dig ->
+    DnsError — none tells the two apart)."""
+    import seer as seer_mod
+
+    def _validate(host, port):
+        if host.startswith("internal."):
+            raise ValueError(
+                f"Invalid input: {host} is not permitted (resolves to a non-public address)"
+            )
+        raise seer_mod.DnsError("DNS resolution failed")
+
+    def _tls_failure(domain):
+        raise seer_mod.TlsError("SSL inspection failed")
+
+    def _dns_failure(*_args):
+        raise seer_mod.DnsError("DNS resolution failed")
+
+    monkeypatch.setattr(seer_mod, "validate_public_host", _validate, raising=False)
+    monkeypatch.setattr(seer_mod, "nameserver_target", lambda s: (s, 53), raising=False)
+    monkeypatch.setattr(seer_mod, "ssl", _tls_failure, raising=False)
+    monkeypatch.setattr(seer_mod, "status", lambda d: {"errors": ["HTTP request failed"]},
+                        raising=False)
+    monkeypatch.setattr(seer_mod, "dig", _dns_failure, raising=False)
+    monkeypatch.setattr(seer_mod, "dns_compare", _dns_failure, raising=False)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/ssl/{host}",
+        "/status/{host}",
+        "/dns/example.com/A?nameserver={host}",
+        "/dns/compare/example.com?server_a={host}&server_b=8.8.8.8",
+    ],
+)
+def test_reserved_hostname_answers_like_a_missing_one(client, internal_and_missing_hosts, path):
+    """Regression: the pre-check answered a hostname that resolves to a
+    reserved address with a distinct 400 ("resolves to a non-public
+    address") and a missing one with core's 502, so any caller could probe
+    which internal names exist. A hostname is left to core, which vets and
+    pins it itself and answers both the same way."""
+    internal = client.get(path.format(host="internal.corp.example"))
+    missing = client.get(path.format(host="missing.corp.example"))
+    assert (internal.status_code, internal.json()) == (missing.status_code, missing.json())
+
+
+def test_mcp_reserved_hostname_answers_like_a_missing_one(internal_and_missing_hosts):
+    import asyncio
+
+    from seer_api.mcp import server
+
+    def text(host):
+        return asyncio.run(server.call_tool("seer_ssl", {"domain": host})).content[0].text
+
+    assert text("internal.corp.example") == text("missing.corp.example")
+
+
 # Nameserver *specs* the core accepts (seer-core dns/nameserver.rs) and the
 # (host, port) each one connects to — the address the SSRF guard must check.
 NAMESERVER_SPECS = [
@@ -411,6 +473,16 @@ def test_nameserver_target_returns_none_for_malformed_specs(spec):
     assert seer.nameserver_target(spec) is None
 
 
+def _is_ip_literal(host: str) -> bool:
+    from ipaddress import ip_address
+
+    try:
+        ip_address(host)
+    except ValueError:
+        return False
+    return True
+
+
 def _record_validator(monkeypatch):
     """Replace the SSRF validator with one that records (host, port) and
     accepts — keeps hostname specs hermetic (no DNS resolution)."""
@@ -446,7 +518,8 @@ def test_dns_route_accepts_every_nameserver_spec_form(
     monkeypatch.setattr(seer_mod, "dig", _dig, raising=False)
     resp = client.get("/dns/example.com/A", params={"nameserver": spec})
     assert resp.status_code == 200, (spec, resp.text)
-    assert checked == [target]
+    # Only an IP literal is pre-checked; core vets a hostname (see ssrf.py).
+    assert checked == ([target] if _is_ip_literal(target[0]) else [])
     # The core still receives the original spec (it parses it itself).
     assert seen["nameserver"] == spec
 
@@ -468,7 +541,7 @@ def test_dns_compare_accepts_nameserver_spec_forms(monkeypatch, client):
         params={"server_a": "tls://1.1.1.1", "server_b": "https://dns.google/dns-query"},
     )
     assert resp.status_code == 200, resp.text
-    assert checked == [("1.1.1.1", 853), ("dns.google", 443)]
+    assert checked == [("1.1.1.1", 853)]  # dns.google: a hostname, left to core
     assert seen["servers"] == ("tls://1.1.1.1", "https://dns.google/dns-query")
 
 
@@ -540,7 +613,8 @@ def test_mcp_nameserver_spec_forms(monkeypatch):
             },
         )
     )
-    assert checked == [("1.1.1.1", 853), ("9.9.9.9", 5353), ("cloudflare-dns.com", 443)]
+    # cloudflare-dns.com: a hostname, left to core (see ssrf.py).
+    assert checked == [("1.1.1.1", 853), ("9.9.9.9", 5353)]
 
 
 @needs_ns_parser
