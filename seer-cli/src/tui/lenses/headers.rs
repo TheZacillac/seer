@@ -3,8 +3,10 @@
 //!
 //! The report has four distinct parts and a fixed nine-header spine, so the
 //! layout is vertical bands rather than a table: the grade gauge leads (it is
-//! the headline number), the per-header verdicts fill the middle as a KV list,
-//! and cookies/advisories take what is left. Bands with nothing to show
+//! the headline number), the per-header verdicts fill the middle as a KV list
+//! (selectable once focused, with the selected header's raw value and the
+//! reason for its verdict beneath it), and cookies/advisories take what is
+//! left. Bands with nothing to show
 //! collapse to zero height instead of leaving a labeled empty box.
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -16,7 +18,8 @@ use seer_core::HeaderVerdict;
 
 use crate::tui::action::LensData;
 use crate::tui::theme::Theme;
-use crate::tui::widgets::{dot, gauge, panel};
+use crate::tui::widgets::inspector::{self, Field};
+use crate::tui::widgets::{dot, gauge, panel, row_style};
 
 /// Tone for a verdict, using the shared `Theme::tone` vocabulary so these
 /// verdicts read the same as every other status in the TUI.
@@ -38,11 +41,33 @@ fn grade_tone(grade: &str) -> &'static str {
     }
 }
 
-pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
+pub fn render(
+    f: &mut Frame,
+    area: Rect,
+    theme: &Theme,
+    data: &LensData,
+    focused: bool,
+    sel: usize,
+) {
     let LensData::Headers(h) = data else { return };
 
     let title = format!("HTTP Headers · {} · {}/100", h.grade, h.score);
-    let inner = panel::render(f, area, theme, &title, theme.mauve, false);
+    let inner = panel::render(f, area, theme, &title, theme.mauve, focused);
+
+    let detail = focused
+        .then(|| h.headers.get(sel))
+        .flatten()
+        .map(|finding| {
+            let fields = [
+                Field::new("header", finding.header.clone()),
+                Field::new("verdict", finding.verdict.as_str()).tone(verdict_tone(finding.verdict)),
+                Field::new("value", finding.value.clone().unwrap_or_default()),
+                Field::new("note", finding.note.clone().unwrap_or_default()),
+            ];
+            inspector::lines(theme, &fields, inner.width)
+        })
+        .unwrap_or_default();
+    let detail_rows = u16::try_from(detail.len()).unwrap_or(u16::MAX);
 
     let cookie_rows = if h.cookies.is_empty() { 0 } else { 1 };
     // Advisories get whatever vertical space is left, so a long list scrolls
@@ -52,6 +77,7 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
         .constraints([
             Constraint::Length(2),                      // gauge + url
             Constraint::Length(h.headers.len() as u16), // per-header verdicts
+            Constraint::Length(detail_rows),            // selected header (focused)
             Constraint::Length(cookie_rows),
             Constraint::Min(0), // advisories
         ])
@@ -89,7 +115,8 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
     let lines: Vec<Line> = h
         .headers
         .iter()
-        .map(|finding| {
+        .enumerate()
+        .map(|(i, finding)| {
             let label = finding.verdict.as_str();
             let header = sanitize_line(&finding.header);
             let used = header.chars().count() + label.chars().count() + 2;
@@ -105,9 +132,11 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
                     Style::default().fg(theme.tone(verdict_tone(finding.verdict))),
                 ),
             ])
+            .style(row_style(theme, focused && i == sel))
         })
         .collect();
     f.render_widget(Paragraph::new(lines), chunks[1]);
+    inspector::draw(f, chunks[2], theme, detail);
 
     if !h.cookies.is_empty() {
         let flawed = h.cookies.iter().filter(|c| !c.issues.is_empty()).count();
@@ -118,7 +147,7 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
                 tone,
                 format!("{} cookie(s), {} with issues", h.cookies.len(), flawed),
             )),
-            chunks[2],
+            chunks[3],
         );
     }
 
@@ -128,7 +157,7 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
             .iter()
             .map(|n| dot::line(theme, "warn", n.clone()))
             .collect();
-        f.render_widget(Paragraph::new(lines), chunks[3]);
+        f.render_widget(Paragraph::new(lines), chunks[4]);
     } else {
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
@@ -137,7 +166,7 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, data: &LensData) {
                     .fg(theme.green)
                     .add_modifier(Modifier::ITALIC),
             ))),
-            chunks[3],
+            chunks[4],
         );
     }
 }
@@ -189,7 +218,23 @@ mod tests {
 
     fn render_to_text(data: &LensData, width: u16, height: u16) -> String {
         let theme = Theme::frappe();
-        render_lines(width, height, |f| render(f, f.area(), &theme, data))
+        render_lines(width, height, |f| {
+            render(f, f.area(), &theme, data, false, 0)
+        })
+    }
+
+    #[test]
+    fn focused_header_shows_its_value_and_note() {
+        let theme = Theme::frappe();
+        let mut r = report();
+        r.headers[0].value = Some("max-age=63072000; includeSubDomains; preload".into());
+        r.headers[0].note = Some("Strict: long max-age with preload.".into());
+        let data = LensData::Headers(Box::new(r));
+        let s = render_lines(80, 24, |f| render(f, f.area(), &theme, &data, true, 0));
+        assert!(s.contains("includeSubDomains; preload"), "{s}");
+        assert!(s.contains("long max-age"), "{s}");
+        let nav = render_lines(80, 24, |f| render(f, f.area(), &theme, &data, false, 0));
+        assert!(!nav.contains("includeSubDomains"), "{nav}");
     }
 
     #[test]
@@ -245,7 +290,7 @@ mod tests {
         // a mismatched variant must be a no-op rather than a panic.
         let theme = Theme::frappe();
         let data = LensData::History(vec![]);
-        render_buffer(40, 6, |f| render(f, f.area(), &theme, &data));
+        render_buffer(40, 6, |f| render(f, f.area(), &theme, &data, false, 0));
     }
 
     #[test]

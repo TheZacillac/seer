@@ -264,6 +264,8 @@ impl App {
             LensData::Takeover(t) => t.findings.len(),
             // One selectable row per finding.
             LensData::Audit(a) => a.findings.len(),
+            // One selectable row per graded header.
+            LensData::Headers(h) => h.headers.len(),
             _ => 0,
         }
     }
@@ -1332,6 +1334,39 @@ mod tests {
             RecordType::A,
             vec![],
         )))
+    }
+
+    #[test]
+    fn headers_rows_are_selectable() {
+        let mut app = App::new(None);
+        app.lens = LensKey::Headers.index();
+        let finding = |header: &str| seer_core::HeaderFinding {
+            header: header.into(),
+            present: true,
+            value: None,
+            verdict: seer_core::HeaderVerdict::Present,
+            note: None,
+        };
+        let report = seer_core::HeaderReport {
+            domain: "example.com".into(),
+            url: "https://example.com/".into(),
+            status: 200,
+            redirects: 0,
+            grade: "C".into(),
+            score: 65,
+            headers: vec![
+                finding("strict-transport-security"),
+                finding("x-frame-options"),
+            ],
+            cookies: vec![],
+            disclosures: vec![],
+            notes: vec![],
+        };
+        app.states.insert(
+            LensKey::Headers,
+            LensState::Loaded(LensData::Headers(Box::new(report))),
+        );
+        assert_eq!(app.row_count(), 2);
     }
 
     #[test]
