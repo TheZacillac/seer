@@ -12,6 +12,9 @@
 //! running then fails the check with a timeout rather than evaluate a guessed
 //! zone; the concurrent DS and DNSKEY reads get the rest, and one cut off
 //! there is reported as a failed query in `issues`.
+//!
+//! **No verdict without evidence:** when both the DS and the DNSKEY read fail
+//! the check fails too, rather than read the empty result as "unsigned".
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -176,6 +179,29 @@ impl Default for DnssecChecker {
     }
 }
 
+/// A failed DS or DNSKEY read: what went wrong, and whether it was the
+/// resolver or the check's deadline running out of time.
+#[derive(Debug)]
+struct ReadFailure {
+    detail: String,
+    timed_out: bool,
+}
+
+impl From<&NetError> for ReadFailure {
+    fn from(e: &NetError) -> Self {
+        Self {
+            detail: e.to_string(),
+            timed_out: matches!(e, NetError::Timeout),
+        }
+    }
+}
+
+impl std::fmt::Display for ReadFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.detail)
+    }
+}
+
 impl DnssecChecker {
     pub fn new() -> Self {
         Self {
@@ -236,7 +262,7 @@ impl DnssecChecker {
     /// Queries the DS RRset for `zone` (served by the parent zone).
     /// NXDOMAIN/NODATA fold to an empty set; a failed query is an `Err` with
     /// a human-readable reason.
-    async fn lookup_ds(&self, zone: &str) -> std::result::Result<Vec<DS>, String> {
+    async fn lookup_ds(&self, zone: &str) -> std::result::Result<Vec<DS>, ReadFailure> {
         match self
             .resolver
             .lookup(fqdn(zone), HickoryRecordType::DS)
@@ -251,7 +277,7 @@ impl DnssecChecker {
                 })
                 .collect()),
             Err(e) if e.is_no_records_found() => Ok(Vec::new()),
-            Err(e) => Err(e.to_string()),
+            Err(e) => Err(ReadFailure::from(&e)),
         }
     }
 
@@ -263,7 +289,7 @@ impl DnssecChecker {
     async fn lookup_dnskeys(
         &self,
         zone: &str,
-    ) -> std::result::Result<Vec<(DNSKEY, Option<u16>)>, String> {
+    ) -> std::result::Result<Vec<(DNSKEY, Option<u16>)>, ReadFailure> {
         match self
             .resolver
             .lookup(fqdn(zone), HickoryRecordType::DNSKEY)
@@ -280,7 +306,7 @@ impl DnssecChecker {
                 })
                 .collect()),
             Err(e) if e.is_no_records_found() => Ok(Vec::new()),
-            Err(e) => Err(e.to_string()),
+            Err(e) => Err(ReadFailure::from(&e)),
         }
     }
 
@@ -356,6 +382,10 @@ impl DnssecChecker {
     /// a walk that has not found the zone within four of them
     /// (`ZONE_WALK_BUDGET_TIMEOUTS`) is a [`SeerError::Timeout`], and a DS or
     /// DNSKEY read the deadline cuts off is a failed query in `issues`.
+    ///
+    /// When both the DS and the DNSKEY query fail there is nothing to judge,
+    /// so the check fails ([`SeerError::Timeout`] if both ran out of time,
+    /// else [`SeerError::DnsError`]) rather than report "unsigned".
     #[instrument(skip(self), fields(domain = %domain))]
     pub async fn check(&self, domain: &str) -> Result<DnssecReport> {
         // `normalize_host`, not `normalize_domain`: the zone walk below
@@ -412,13 +442,28 @@ impl DnssecChecker {
         // DS (at the parent) and DNSKEY (at the apex), concurrently, by the
         // check's deadline; one cut off is a failed query.
         let deadline = started + budget;
-        let out_of_time = || format!("timed out \u{2014} the check's {budget:?} budget ran out");
+        let out_of_time = || ReadFailure {
+            detail: format!("timed out \u{2014} the check's {budget:?} budget ran out"),
+            timed_out: true,
+        };
         let (ds_result, dnskey_result) = tokio::join!(
             tokio::time::timeout_at(deadline, self.lookup_ds(&zone)),
             tokio::time::timeout_at(deadline, self.lookup_dnskeys(&zone)),
         );
         let ds_result = ds_result.unwrap_or_else(|_| Err(out_of_time()));
         let dnskey_result = dnskey_result.unwrap_or_else(|_| Err(out_of_time()));
+        // With neither record set read there is no evidence either way:
+        // "unsigned" would be a verdict on a zone never seen. One failed
+        // query still leaves the other's answer to report on.
+        if let (Err(ds), Err(dnskey)) = (&ds_result, &dnskey_result) {
+            let detail =
+                format!("DNSSEC check for {zone} read neither DS ({ds}) nor DNSKEY ({dnskey})");
+            return Err(if ds.timed_out && dnskey.timed_out {
+                SeerError::Timeout(detail)
+            } else {
+                SeerError::DnsError(detail)
+            });
+        }
         let ds_records = ds_result.unwrap_or_else(|e| {
             issues.push(format!("DS query failed: {e}"));
             Vec::new()
@@ -1121,6 +1166,44 @@ mod tests {
             "{:?}",
             report.issues
         );
+    }
+
+    /// Regression: with both DS and DNSKEY failing, the empty record sets
+    /// read as "unsigned", so a signed zone behind a flaky upstream got a
+    /// `dns.dnssec.unsigned` audit finding instead of an incomplete check.
+    #[tokio::test]
+    async fn both_queries_failing_is_an_error_not_unsigned() {
+        let port = spawn_mock_dns_fn(|qname, qtype| match (qname, qtype) {
+            ("signed.test", WireType::SOA) => MockReply::Answer(vec![soa_rdata("signed.test")]),
+            ("signed.test", WireType::DS | WireType::DNSKEY) => {
+                MockReply::Rcode(ResponseCode::ServFail)
+            }
+            _ => MockReply::NoData,
+        })
+        .await;
+
+        let err = mock_checker(port).check("signed.test").await.unwrap_err();
+        assert!(matches!(err, SeerError::DnsError(_)), "{err:?}");
+        assert!(err.to_string().contains("neither DS"), "{err}");
+    }
+
+    /// Both reads cut off by the check's deadline are a timeout, not a
+    /// verdict.
+    #[tokio::test]
+    async fn both_queries_cut_off_by_the_deadline_is_a_timeout() {
+        let port = spawn_mock_dns_fn(|qname, qtype| match (qname, qtype) {
+            ("signed.test", WireType::SOA) => MockReply::Answer(vec![soa_rdata("signed.test")]),
+            (_, WireType::DS | WireType::DNSKEY) => MockReply::NoReply,
+            _ => MockReply::NoData,
+        })
+        .await;
+
+        let err = mock_checker(port)
+            .with_timeout(Duration::from_millis(100))
+            .check("signed.test")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SeerError::Timeout(_)), "{err:?}");
     }
 
     #[tokio::test]

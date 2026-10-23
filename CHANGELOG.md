@@ -61,6 +61,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (an empty reply without the zone's SOA, or a referral elsewhere) no longer
   counts as one of the two parent answers, so two lame parents no longer
   yield an empty delegation.
+- `dnssec` fails (an incomplete check in `seer audit`) when both the DS and
+  DNSKEY queries fail, instead of reporting the zone "unsigned": a signed
+  zone behind a flaky upstream got a false `dns.dnssec.unsigned` finding.
 - `dig @hostname` / `--nameserver hostname`: resolving the nameserver's
   name is held to one DNS timeout and counts against `dig`'s two-timeout
   budget instead of adding to it.
