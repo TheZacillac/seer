@@ -401,13 +401,19 @@ impl GuardedFetcher {
 
 /// Splits a failed request into [`SendError`]: only a connect failure on the
 /// `first_hop` that reached the network (refused, remote unreachable, TLS
-/// handshake failure) is [`SendError::Connect`]. A connect timeout and a
-/// local no-route error (this host has no route, see [`is_local_failure`])
-/// say nothing about the remote host, and a later hop failing says nothing
-/// about the requested one (it answered with the redirect), so they are
-/// [`SendError::Other`].
+/// handshake failure) is [`SendError::Connect`]. Any timeout is
+/// [`SendError::Other`] carrying [`SeerError::Timeout`], the same error the
+/// fetch deadline gives. A local no-route error (this host has no route, see
+/// [`is_local_failure`]) says nothing about the remote host, and a later hop
+/// failing says nothing about the requested one (it answered with the
+/// redirect), so they are [`SendError::Other`] too.
 fn classify_send_error(e: reqwest::Error, first_hop: bool) -> SendError {
-    let connect = e.is_connect() && !e.is_timeout() && !is_local_failure(&e);
+    // Each hop's client times out at the fetch deadline, racing our own
+    // `timeout_at`: whichever fires, running out of time is a timeout.
+    if e.is_timeout() {
+        return SendError::Other(SeerError::Timeout(format!("HTTP request timed out: {e}")));
+    }
+    let connect = e.is_connect() && !is_local_failure(&e);
     match (connect, first_hop) {
         (true, true) => SendError::Connect(SeerError::HttpError(e.to_string())),
         (true, false) => SendError::Other(SeerError::HttpError(format!(
