@@ -21,6 +21,15 @@ use crate::error::Result;
 /// custom server list can't trigger an unbounded burst of DNS queries (#61).
 const MAX_CONCURRENT_NS_LOOKUPS: usize = 50;
 
+/// At most this many distinct nameserver hostnames get per-vantage A/AAAA
+/// enrichment. Thirteen is as many NS records as a classic 512-byte referral
+/// carries — far beyond a real delegation's two to six — while a hostile zone
+/// listing hundreds can no longer multiply the fan-out. The hostnames that
+/// most servers reported are kept (ties by name, for a deterministic pick);
+/// the rest stay in the NS answers but have no per-vantage or consensus
+/// entry, which reads as "no data", never as a disagreement.
+const MAX_ENRICHED_NAMESERVERS: usize = 13;
+
 /// Per-server wall-clock budget derived from the per-query timeout.
 ///
 /// A slow or unreachable vantage point is capped at this budget and reported as
@@ -33,6 +42,41 @@ fn per_server_budget(query_timeout: Duration) -> Duration {
     query_timeout
         .saturating_mul(2)
         .saturating_add(Duration::from_secs(1))
+}
+
+/// The nameserver hostnames to enrich: the distinct (lowercased) NS targets
+/// across all answers, most-reported first, ties by name, at most
+/// [`MAX_ENRICHED_NAMESERVERS`] of them.
+fn nameservers_to_enrich(results: &[ServerResult]) -> Vec<String> {
+    let mut reported: HashMap<String, usize> = HashMap::new();
+    for sr in results {
+        // Once per server: a server repeating a name doesn't outvote others.
+        let names: HashSet<String> = sr
+            .records
+            .iter()
+            .filter_map(|r| match &r.data {
+                RecordData::NS { nameserver } => Some(nameserver.to_ascii_lowercase()),
+                _ => None,
+            })
+            .collect();
+        for name in names {
+            *reported.entry(name).or_insert(0) += 1;
+        }
+    }
+    let mut names: Vec<(String, usize)> = reported.into_iter().collect();
+    names.sort_by(|(a, a_n), (b, b_n)| b_n.cmp(a_n).then_with(|| a.cmp(b)));
+    if names.len() > MAX_ENRICHED_NAMESERVERS {
+        debug!(
+            nameservers = names.len(),
+            enriched = MAX_ENRICHED_NAMESERVERS,
+            "Too many nameserver hostnames; enriching only the most-reported"
+        );
+    }
+    names
+        .into_iter()
+        .take(MAX_ENRICHED_NAMESERVERS)
+        .map(|(name, _)| name)
+        .collect()
 }
 
 /// Checks DNS propagation across multiple global DNS servers.
@@ -127,11 +171,12 @@ impl PropagationChecker {
         let outcome = analyze_results(&results, record_type);
 
         // For NS lookups, ask each responding propagation server what A/AAAA
-        // it returns for every nameserver hostname observed in the NS answers.
+        // it returns for the nameserver hostnames observed in the NS answers.
         // This is the per-vantage view that surfaces glue-record propagation
         // lag — a regional recursor still serving the previous IP shows up as
-        // a `NameserverIpInconsistency`. Each lookup is bounded on its own,
-        // so a slow one costs only its own entry.
+        // a `NameserverIpInconsistency`. The phase has one deadline of its
+        // own (`budget` again), so a slow lookup costs only its own entry and
+        // the whole check ends within two budgets.
         let nameserver_details = if record_type == RecordType::NS {
             self.resolve_nameserver_details(&results, budget).await
         } else {
@@ -156,18 +201,22 @@ impl PropagationChecker {
         })
     }
 
-    /// Per-vantage resolution: for every unique nameserver hostname returned
-    /// across all NS answers, ask each successfully-responding propagation
-    /// server (via its own IP) for that hostname's A/AAAA addresses.
+    /// Per-vantage resolution: for each nameserver hostname returned across
+    /// the NS answers (at most [`MAX_ENRICHED_NAMESERVERS`]), ask each
+    /// successfully-responding propagation server (via its own IP) for that
+    /// hostname's A/AAAA addresses.
     /// Returns `None` when there are no NS records to enrich; otherwise
     /// returns `Some(NameserverDetails { consensus, per_vantage, inconsistencies })`.
     ///
-    /// Each vantage's A and AAAA lookups for one hostname run under
-    /// `budget` (the per-server budget) and count only when both answered: an
-    /// empty set is a negative answer (NXDOMAIN/NODATA), which may surface as
-    /// a `NameserverIpInconsistency`; a failed or timed-out lookup leaves the
-    /// entry out — no data, never a partial or empty set that would read as
-    /// a disagreement.
+    /// The whole phase — waiting for a lookup permit included — runs under
+    /// one deadline of `budget` (the per-server budget), so the check as a
+    /// whole stays within two budgets however many servers and hostnames
+    /// there are. A vantage's A and AAAA lookups for one hostname count only
+    /// when both answered before it: an empty set is a negative answer
+    /// (NXDOMAIN/NODATA), which may surface as a `NameserverIpInconsistency`;
+    /// a failed lookup, or one the deadline cut off, leaves the entry out —
+    /// no data, never a partial or empty set that would read as a
+    /// disagreement. The NS answers themselves are never touched.
     ///
     /// Hostnames are lowercased for dedup so case-variant responses from
     /// different upstream resolvers do not trigger redundant lookups.
@@ -177,16 +226,8 @@ impl PropagationChecker {
         results: &[ServerResult],
         budget: Duration,
     ) -> Option<NameserverDetails> {
-        let unique: HashSet<String> = results
-            .iter()
-            .flat_map(|sr| sr.records.iter())
-            .filter_map(|r| match &r.data {
-                RecordData::NS { nameserver } => Some(nameserver.to_ascii_lowercase()),
-                _ => None,
-            })
-            .collect();
-
-        if unique.is_empty() {
+        let enriched = nameservers_to_enrich(results);
+        if enriched.is_empty() {
             return None;
         }
 
@@ -194,29 +235,28 @@ impl PropagationChecker {
         // and fan out in parallel. Only successful propagation servers — those
         // that already answered the NS query — are queried; an unreachable
         // server can't meaningfully report a per-vantage IP either.
-        let unique_vec: Vec<String> = unique.into_iter().collect();
-        // Bound the fan-out: this loop produces `responding_servers × unique_ns`
-        // tasks, each doing 2 lookups. Harmless at the built-in 20-server list,
-        // but a large custom `with_servers` list would otherwise spawn an
-        // unbounded burst of concurrent DNS queries (#61).
+        // `responding_servers × enriched` tasks, each doing 2 lookups: the
+        // semaphore caps how many run at once (#61), the deadline how long
+        // the queue may take.
         let sem = Arc::new(Semaphore::new(MAX_CONCURRENT_NS_LOOKUPS));
+        let deadline = tokio::time::Instant::now() + budget;
         let mut tasks = Vec::new();
         for sr in results.iter().filter(|sr| sr.success) {
-            for ns in &unique_vec {
+            for ns in &enriched {
                 let resolver = self.resolver.clone();
                 let server_ip = sr.server.ip.clone();
                 let ns = ns.clone();
                 let sem = sem.clone();
                 tasks.push(async move {
-                    // Held for the task's lifetime; caps concurrent lookups.
-                    let _permit = sem.acquire().await.ok();
                     let lookups = async {
+                        // Held for the task's lifetime; caps concurrent lookups.
+                        let _permit = sem.acquire().await.ok();
                         tokio::join!(
                             resolver.resolve(&ns, RecordType::A, Some(&server_ip)),
                             resolver.resolve(&ns, RecordType::AAAA, Some(&server_ip)),
                         )
                     };
-                    let ips = match tokio::time::timeout(budget, lookups).await {
+                    let ips = match tokio::time::timeout_at(deadline, lookups).await {
                         Ok((a, aaaa)) => vantage_addresses(a, aaaa),
                         Err(_) => None,
                     };
@@ -233,7 +273,7 @@ impl PropagationChecker {
             }
         }
 
-        let consensus = build_nameserver_consensus(results, &per_vantage, &unique_vec);
+        let consensus = build_nameserver_consensus(results, &per_vantage, &enriched);
         let inconsistencies = build_nameserver_inconsistencies(results, &per_vantage, &consensus);
 
         Some(NameserverDetails {
@@ -419,6 +459,7 @@ pub(in crate::dns) fn read_reply(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dns::test_support::MockReply;
     use crate::error::SeerError;
 
     /// `check()` must normalize the input domain ONCE at the top and store the
@@ -745,5 +786,133 @@ mod tests {
 
         response.failed_types.clear();
         assert_eq!(read_reply(response, RecordType::ANY).2, None);
+    }
+
+    /// `count` NS records `ns<i>.seer.test.`, as a mock answer.
+    fn many_ns(count: usize) -> MockReply {
+        use hickory_resolver::proto::rr::rdata as wire;
+        use hickory_resolver::proto::rr::{Name, RData};
+        MockReply::Answer(
+            (0..count)
+                .map(|i| {
+                    RData::NS(wire::NS(
+                        Name::from_ascii(format!("ns{i}.seer.test.")).unwrap(),
+                    ))
+                })
+                .collect(),
+        )
+    }
+
+    fn mock_servers(count: usize) -> Vec<DnsServer> {
+        (0..count)
+            .map(|i| DnsServer::new(&format!("Mock{i}"), "127.0.0.1", "Test", "Test"))
+            .collect()
+    }
+
+    /// Regression: every distinct NS hostname was enriched, so a zone
+    /// listing hundreds multiplied the fan-out without limit. Only
+    /// `MAX_ENRICHED_NAMESERVERS` are asked about; the NS answer keeps all.
+    #[tokio::test]
+    async fn ns_enrichment_is_capped() {
+        use crate::dns::test_support::{a_rdata, mock_dns_resolver, spawn_mock_dns_fn};
+        use std::sync::Mutex;
+
+        let asked: Arc<Mutex<HashSet<String>>> = Arc::default();
+        let log = asked.clone();
+        let port = spawn_mock_dns_fn(
+            move |name, qtype| match (name, qtype.to_string().as_str()) {
+                ("seer.test", "NS") => many_ns(50),
+                (host, "A") => {
+                    log.lock().unwrap().insert(host.to_string());
+                    MockReply::Answer(vec![a_rdata([192, 0, 2, 1])])
+                }
+                _ => MockReply::NoData,
+            },
+        )
+        .await;
+        let timeout = Duration::from_millis(500);
+        let checker = PropagationChecker::new()
+            .with_servers(mock_servers(2))
+            .with_resolver(mock_dns_resolver(port).with_timeout(timeout), timeout);
+
+        let result = checker.check("seer.test", RecordType::NS).await.unwrap();
+        assert!(result.results.iter().all(|r| r.records.len() == 50));
+        assert_eq!(asked.lock().unwrap().len(), MAX_ENRICHED_NAMESERVERS);
+        let details = result.nameserver_details.expect("NS details");
+        assert_eq!(details.consensus.len(), MAX_ENRICHED_NAMESERVERS);
+        assert_eq!(
+            details.per_vantage["127.0.0.1"].len(),
+            MAX_ENRICHED_NAMESERVERS
+        );
+    }
+
+    /// Regression: enrichment had no overall deadline — each lookup was
+    /// bounded, but the queue behind the 50-permit semaphore was not, so
+    /// many responding servers × silent nameserver hosts ran for many
+    /// budgets. The phase now ends at one budget, and the NS answers that
+    /// arrived are all kept.
+    #[tokio::test]
+    async fn ns_enrichment_is_held_to_one_deadline() {
+        use crate::dns::test_support::{mock_dns_resolver, spawn_mock_dns_fn};
+
+        // 100 servers × 13 hostnames = 1300 lookup pairs, 26 waves of 50,
+        // each at least one timeout long: over 5s without the deadline.
+        const SERVERS: usize = 100;
+        let port = spawn_mock_dns_fn(|name, qtype| match (name, qtype.to_string().as_str()) {
+            ("seer.test", "NS") => many_ns(MAX_ENRICHED_NAMESERVERS),
+            _ => MockReply::NoReply,
+        })
+        .await;
+        let timeout = Duration::from_millis(200);
+        let budget = per_server_budget(timeout);
+        let checker = PropagationChecker::new()
+            .with_servers(mock_servers(SERVERS))
+            .with_resolver(mock_dns_resolver(port).with_timeout(timeout), timeout);
+
+        let started = Instant::now();
+        let result = checker.check("seer.test", RecordType::NS).await.unwrap();
+        let elapsed = started.elapsed();
+
+        // NS phase (answered at once) + one enrichment budget, with slack.
+        assert!(elapsed < budget * 2 + timeout, "took {elapsed:?}");
+        assert_eq!(result.servers_responding, SERVERS);
+        assert!(result
+            .results
+            .iter()
+            .all(|r| r.records.len() == MAX_ENRICHED_NAMESERVERS));
+        let details = result.nameserver_details.expect("NS details");
+        assert!(details.per_vantage.is_empty(), "{:?}", details.per_vantage);
+        assert!(details.inconsistencies.is_empty());
+    }
+
+    /// The most-reported hostnames win the enrichment slots, ties by name.
+    #[test]
+    fn nameservers_to_enrich_prefers_the_most_reported() {
+        use crate::dns::{DnsRecord, RecordData};
+        let server = |names: &[&str]| ServerResult {
+            server: DnsServer::new("Mock", "127.0.0.1", "Test", "Test"),
+            records: names
+                .iter()
+                .map(|n| DnsRecord {
+                    name: "seer.test".into(),
+                    record_type: RecordType::NS,
+                    ttl: 300,
+                    data: RecordData::NS {
+                        nameserver: (*n).into(),
+                    },
+                })
+                .collect(),
+            response_time_ms: 1,
+            success: true,
+            error: None,
+            status: None,
+        };
+        let mut lots: Vec<String> = (0..20).map(|i| format!("a{i:02}.test.")).collect();
+        lots.push("Z.TEST.".into());
+        let lots: Vec<&str> = lots.iter().map(String::as_str).collect();
+        let picked = nameservers_to_enrich(&[server(&lots), server(&["z.test.", "z.test."])]);
+        assert_eq!(picked.len(), MAX_ENRICHED_NAMESERVERS);
+        assert_eq!(picked[0], "z.test.");
+        assert_eq!(picked[1], "a00.test.");
     }
 }

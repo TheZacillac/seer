@@ -2,7 +2,12 @@
 //! public, unfiltered recursive resolvers concurrently (`servers.rs`), one
 //! direct query per server, then groups the answers into a consensus,
 //! per-server inconsistencies and unreachable servers (`analysis.rs`) behind
-//! [`PropagationChecker`]. [`PropagationResult::verdict`] and
+//! [`PropagationChecker`]. Each server is held to its own budget (two
+//! per-query timeouts plus a second). An NS check then asks every responding
+//! server for the addresses of the nameserver hostnames it saw (at most 13,
+//! the most-reported first) under one more budget for the whole phase; a
+//! lookup it cuts off is "no data", and the NS answers stay as they arrived.
+//! [`PropagationResult::verdict`] and
 //! [`PropagationResult::server_verdict`] are the one reading of a result
 //! that every renderer shares.
 
