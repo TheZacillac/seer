@@ -1084,9 +1084,16 @@ pub(crate) fn parse_date_with_order(date_str: &str, order: DateOrder) -> Option<
         // Registro.br appends the registration ticket: `created: 19970711 #46903`.
         TICKET_SUFFIX = r"\s+#\d+$";
     }
+    // The longest known form is ~35 bytes (RFC 3339 with nanoseconds and an
+    // offset); the cap leaves room for unseen registry spellings while
+    // keeping a hostile value from costing a regex pass per format below.
+    const MAX_DATE_LEN: usize = 128;
     // A trailing ` UTC` is `Z`; mid-value (`10:30:00 UTC-5`) it introduces
     // an offset, which `split_utc_offset` handles.
     let trimmed = date_str.trim();
+    if trimmed.len() > MAX_DATE_LEN {
+        return None;
+    }
     let zulu = trimmed.strip_suffix(" UTC").map(|d| format!("{d}Z"));
     let cleaned = zulu
         .as_deref()
@@ -1117,10 +1124,21 @@ pub(crate) fn parse_date_with_order(date_str: &str, order: DateOrder) -> Option<
     // Then a local time with a trailing UTC offset in a form chrono's `%z`
     // does not take — `+03` (Hostmaster .ua), `GMT+1` (ATI .tn), `(UTC+8)`
     // (TWNIC .tw): parse the local part with the formats below, then shift.
+    // Exactly one offset is split off: the local part goes straight to the
+    // naive formats, so a chain of offsets (`1:00-1:00-1:00…`) fails there
+    // instead of recursing once per link.
     if let Some((local, offset)) = split_utc_offset(cleaned) {
-        return parse_date_with_order(local, order)?.checked_sub_signed(offset);
+        return parse_naive_date(local, order)?.checked_sub_signed(offset);
     }
+    // Last resort: chrono's own lenient ISO 8601 reader. Kept out of
+    // `parse_naive_date`: it also takes an offset, so it would let a split
+    // local part carry a second one.
+    parse_naive_date(cleaned, order).or_else(|| cleaned.parse::<DateTime<Utc>>().ok())
+}
 
+/// The timezone-less tail of [`parse_date_with_order`]: `cleaned` is already
+/// normalized, and its time of day is read as UTC.
+fn parse_naive_date(cleaned: &str, order: DateOrder) -> Option<DateTime<Utc>> {
     // Fourth: try NaiveDateTime / NaiveDate formats (timezone-less dates).
     // Unambiguous formats (year-first, named-month) first — these never depend
     // on the day/month order.
@@ -1203,12 +1221,6 @@ pub(crate) fn parse_date_with_order(date_str: &str, order: DateOrder) -> Option<
             return Some(d.and_hms_opt(0, 0, 0)?.and_utc());
         }
     }
-
-    // Last resort: try parsing ISO 8601 directly
-    if let Ok(dt) = cleaned.parse::<DateTime<Utc>>() {
-        return Some(dt);
-    }
-
     None
 }
 
@@ -2224,6 +2236,32 @@ Domain Status: clientTransferProhibited
         assert_eq!(parsed.year(), 2024);
         assert_eq!(parsed.month(), 7);
         assert_eq!(parsed.day(), 6);
+    }
+
+    #[test]
+    fn parse_date_splits_at_most_one_utc_offset() {
+        // One offset still shifts; a second one makes it not a date, rather
+        // than recursing into the remainder (which `%z` would then accept).
+        let one = parse_date("2024-01-15 10:30:00 +01").expect("single offset");
+        assert_eq!(one.to_rfc3339(), "2024-01-15T09:30:00+00:00");
+        assert_eq!(parse_date("2024-01-15 10:30:00+01:00+01:00"), None);
+    }
+
+    #[test]
+    fn parse_date_rejects_long_offset_chains_without_deep_recursion() {
+        // `1:00-1:00-…` (100 KB, well under the WHOIS cap) once recursed per
+        // link: it overflowed a 2 MiB Tokio worker stack and took seconds of
+        // CPU. Run on a stack that size to prove it now returns at once.
+        let hostile = format!("1:00{}", "-1:00".repeat(20_000));
+        let started = std::time::Instant::now();
+        let parsed = std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(move || parse_date(&hostile))
+            .expect("spawn")
+            .join()
+            .expect("no stack overflow");
+        assert_eq!(parsed, None);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
     }
 
     // --- #47: per-registry date order disambiguation --------------------
