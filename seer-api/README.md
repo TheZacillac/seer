@@ -68,10 +68,18 @@ Server runs on `http://127.0.0.1:8000` (loopback-only by default).
   `/mcp` follows `SEER_MCP_ALLOWED_HOSTS` instead when that is set.
 - **API documentation endpoints are off.** Set `SEER_DOCS_ENABLED=true`
   to serve `/docs`, `/redoc`, and `/openapi.json`.
-- **Multi-worker deployments need a shared rate-limit store.** With
-  `WEB_CONCURRENCY>1` (or `UVICORN_WORKERS>1`), set
-  `SEER_RATE_LIMIT_STORAGE=redis://...`; on the default in-memory store
-  each worker would keep its own budget, so the server refuses to start.
+- **Multi-worker deployments need a shared rate-limit store.** Set
+  `SEER_RATE_LIMIT_STORAGE=redis://...` whenever more than one process
+  serves the API: on the default in-memory store each worker keeps its own
+  budget, multiplying every rate limit by the worker count. The server
+  refuses to start on `memory://` when the worker count is visible to it —
+  `WEB_CONCURRENCY>1` (which `seer-api`, `uvicorn` and `gunicorn` all use as
+  their worker count) or `UVICORN_WORKERS>1`. **A count given any other way
+  is invisible to the app and is not caught**: `uvicorn seer_api.main:app
+  --workers 3`, `gunicorn -w 3 …`, `uvicorn.run(…, workers=3)`, or several
+  replicas behind a load balancer. Each worker process cannot tell how many
+  siblings it has, so for those deployments setting a shared store is up to
+  you.
 
 These became the defaults on 2026-04-20 (previously `0.0.0.0` with docs
 on); see the CHANGELOG.

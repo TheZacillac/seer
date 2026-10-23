@@ -350,6 +350,14 @@ async def lifespan(_app: FastAPI):
     """
     # H10: in-memory rate limit with multiple workers is per-worker and
     # therefore bypassable by rotating through workers. Refuse to start.
+    #
+    # Only a worker count in the environment is visible here. A count passed
+    # as `uvicorn --workers N`, `gunicorn -w N` or `uvicorn.run(workers=N)`
+    # never reaches the worker processes, and nothing a worker can inspect
+    # tells it how many siblings it has (uvicorn spawns them with
+    # multiprocessing, as it does its single --reload worker; gunicorn forks),
+    # so those deployments are not caught. Documented in the READMEs rather
+    # than guessed at from argv or the process tree.
     storage_uri = os.environ.get("SEER_RATE_LIMIT_STORAGE", "memory://")
     # WEB_CONCURRENCY wins; UVICORN_WORKERS is the fallback; default 1. A
     # non-integer (e.g. the PaaS convention WEB_CONCURRENCY=auto) raises a clear
