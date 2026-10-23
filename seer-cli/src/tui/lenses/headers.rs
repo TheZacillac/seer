@@ -119,17 +119,16 @@ pub fn render(
     // paints every value one color, and colouring each verdict by severity
     // is the whole point of this band — a column of same-colored words
     // would bury the absent headers among the strict ones.
-    let gutter = kv::gutter(
-        h.headers.iter().map(|f| f.header.as_str()),
-        verdict_area.width,
-    );
+    // Sanitized once, so the gutter is measured on the names as drawn.
+    let names: Vec<String> = h.headers.iter().map(|f| sanitize_line(&f.header)).collect();
+    let gutter = kv::gutter(names.iter().map(String::as_str), verdict_area.width);
     let lines: Vec<Line> = h
         .headers
         .iter()
+        .zip(&names)
         .enumerate()
-        .map(|(i, finding)| {
-            let header = sanitize_line(&finding.header);
-            let mut spans = kv::leader(theme, &header, theme.mauve, gutter).to_vec();
+        .map(|(i, (finding, header))| {
+            let mut spans = kv::leader(theme, header, theme.mauve, gutter).to_vec();
             spans.push(Span::styled(
                 finding.verdict.as_str(),
                 Style::default().fg(theme.tone(verdict_tone(finding.verdict))),
@@ -249,6 +248,17 @@ mod tests {
         let s = render_lines(60, 18, |f| render(f, f.area(), &theme, &data, true, 8));
         assert!(s.contains("x-header-8 ·"), "selected row must show: {s}");
         assert!(s.contains("more lines"), "the detail is cut short: {s}");
+    }
+
+    /// The gutter is measured on the name as drawn: an escape sequence
+    /// stripped from a header name must not widen the leaders.
+    #[test]
+    fn gutter_is_measured_on_sanitized_header_names() {
+        let mut r = report();
+        r.headers = vec![finding("x-\u{1b}[2Jframe", HeaderVerdict::Present)];
+        let s = render_to_text(&LensData::Headers(Box::new(r)), 80, 16);
+        assert!(s.contains("x-frame ·· "), "{s}");
+        assert!(!s.contains("x-frame ···"), "{s}");
     }
 
     #[test]
