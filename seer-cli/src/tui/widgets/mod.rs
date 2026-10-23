@@ -1,12 +1,14 @@
 //! Small reusable TUI building blocks: `panel` (bordered block → inner
-//! `Rect`), `kv` rows, `gauge`, status `dot` and `chips`, plus the shared
+//! `Rect`), `kv` rows, `gauge`, status `dot` and `chips`, the selected-row
+//! `inspector`, plus the shared
 //! `or_dash` missing-value mark, `row_style` selection styling, and `stack`
-//! (of [`Band`]s) and `wrap` for bands sized to their content before they
+//! (of [`Band`]s), `wrap` and `wrap_hard` for bands sized to their content before they
 //! are drawn.
 
 pub mod chips;
 pub mod dot;
 pub mod gauge;
+pub mod inspector;
 pub mod kv;
 pub mod panel;
 
@@ -128,6 +130,31 @@ pub fn wrap(text: &str, width: u16) -> Vec<String> {
     lines
 }
 
+/// [`wrap`], except a word wider than the line is split across lines rather
+/// than clipped: for values with long unbroken runs (TXT/DKIM data, header
+/// values). A width of 0 is treated as 1.
+pub fn wrap_hard(text: &str, width: u16) -> Vec<String> {
+    let max = usize::from(width.max(1));
+    let mut out = Vec::new();
+    for line in wrap(text, width.max(1)) {
+        let mut piece = String::new();
+        let mut used = 0;
+        for c in line.chars() {
+            let w = Span::raw(c.to_string()).width();
+            if used + w > max && !piece.is_empty() {
+                out.push(std::mem::take(&mut piece));
+                used = 0;
+            }
+            piece.push(c);
+            used += w;
+        }
+        if !piece.is_empty() {
+            out.push(piece);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -190,6 +217,18 @@ mod tests {
         assert_eq!(spans(&bands), [(0, 4), (5, 1)]);
         // A minimum above the height is the height.
         assert_eq!(Band::shrinking(2, 5), Band::fixed(2));
+    }
+
+    #[test]
+    fn wrap_hard_splits_words_wider_than_the_line() {
+        assert_eq!(
+            wrap_hard("v=DKIM1 abcdefghij", 4),
+            ["v=DK", "IM1", "abcd", "efgh", "ij"]
+        );
+        assert_eq!(wrap_hard("fits", 10), ["fits"]);
+        assert!(wrap_hard("", 5).is_empty());
+        // Width 0 must not loop forever: treated as 1.
+        assert_eq!(wrap_hard("ab", 0), ["a", "b"]);
     }
 
     #[test]
