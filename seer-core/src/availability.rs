@@ -236,7 +236,7 @@ pub(crate) const THIN_NXDOMAIN_DETAILS: &str =
 /// registered verdict and confidence; under an available or undetermined
 /// parent the verdict is unknown (confidence `none`) and the details say
 /// which name to register instead.
-fn subdomain_verdict(domain: &str, parent: &AvailabilityResult) -> AvailabilityResult {
+pub(crate) fn subdomain_verdict(domain: &str, parent: &AvailabilityResult) -> AvailabilityResult {
     let p = &parent.domain;
     let (confidence, status) = match parent.verdict() {
         "registered" | "likely_registered" => {
