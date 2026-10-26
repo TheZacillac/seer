@@ -36,6 +36,43 @@ where
     })
 }
 
+/// Deserializes an RDAP text block (`description`) leniently: RFC 9083
+/// specifies an array of strings, but some servers send one bare string,
+/// which is kept as a single line. Non-string array elements are dropped and
+/// any other shape reads as empty.
+fn lenient_lines<'de, D>(deserializer: D) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(match Value::deserialize(deserializer)? {
+        Value::String(line) => vec![line],
+        Value::Array(items) => items
+            .into_iter()
+            .filter_map(|item| match item {
+                Value::String(line) => Some(line),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    })
+}
+
+/// Deserializes an identifier that RFC 9083 specifies as a string but some
+/// servers send as a JSON number (an IANA Registrar ID such as `292`). Any
+/// other shape is an error, which [`lenient_vec`] turns into a dropped entry.
+fn string_or_number<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    match Value::deserialize(deserializer)? {
+        Value::String(s) => Ok(s),
+        Value::Number(n) => Ok(n.to_string()),
+        other => Err(serde::de::Error::custom(format!(
+            "expected a string or number, found {other}"
+        ))),
+    }
+}
+
 /// RDAP response for domain, IP, or ASN lookups.
 /// Follows RFC 7483 (JSON Responses for RDAP).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -81,10 +118,12 @@ pub struct RdapResponse {
     #[serde(default)]
     pub links: Vec<RdapLink>,
 
-    #[serde(default)]
+    /// Lenient (see `lenient_vec`): a malformed remark is dropped.
+    #[serde(default, deserialize_with = "lenient_vec")]
     pub remarks: Vec<RdapRemark>,
 
-    #[serde(default)]
+    /// Lenient (see `lenient_vec`): a malformed notice is dropped.
+    #[serde(default, deserialize_with = "lenient_vec")]
     pub notices: Vec<RdapNotice>,
 
     #[serde(default)]
@@ -159,7 +198,8 @@ pub struct RdapEntity {
     #[serde(default)]
     pub roles: Vec<String>,
 
-    #[serde(default)]
+    /// Lenient (see `lenient_vec`): a malformed identifier is dropped.
+    #[serde(default, deserialize_with = "lenient_vec")]
     pub public_ids: Vec<PublicId>,
 
     #[serde(default)]
@@ -168,7 +208,8 @@ pub struct RdapEntity {
     #[serde(default)]
     pub entities: Vec<RdapEntity>,
 
-    #[serde(default)]
+    /// Lenient (see `lenient_vec`): a malformed remark is dropped.
+    #[serde(default, deserialize_with = "lenient_vec")]
     pub remarks: Vec<RdapRemark>,
 
     #[serde(default)]
@@ -331,6 +372,8 @@ impl RdapEntity {
 pub struct PublicId {
     #[serde(rename = "type")]
     pub id_type: String,
+    /// A string per RFC 9083; a JSON number is accepted and kept as text.
+    #[serde(deserialize_with = "string_or_number")]
     pub identifier: String,
 }
 
@@ -473,7 +516,8 @@ pub struct RdapLink {
 pub struct RdapRemark {
     #[serde(default)]
     pub title: Option<String>,
-    #[serde(default)]
+    /// Lenient (see `lenient_lines`): a bare string is one line.
+    #[serde(default, deserialize_with = "lenient_lines")]
     pub description: Vec<String>,
     #[serde(default)]
     pub links: Vec<RdapLink>,
@@ -484,7 +528,8 @@ pub struct RdapRemark {
 pub struct RdapNotice {
     #[serde(default)]
     pub title: Option<String>,
-    #[serde(default)]
+    /// Lenient (see `lenient_lines`): a bare string is one line.
+    #[serde(default, deserialize_with = "lenient_lines")]
     pub description: Vec<String>,
     #[serde(default)]
     pub links: Vec<RdapLink>,
@@ -1322,5 +1367,49 @@ mod tests {
         );
         assert_eq!(e.get_country().as_deref(), Some("DE"));
         assert_eq!(e.get_address().as_deref(), Some("Berlin"));
+    }
+
+    /// Regression: RFC 9083 makes `description` an array of strings, but a
+    /// boilerplate notice sent with one bare string failed the whole RDAP
+    /// 200 (JsonError), losing the dates/status and the "RDAP 200 proves
+    /// existence" veto. The string is kept as one line.
+    #[test]
+    fn a_string_notice_description_does_not_fail_whole_response() {
+        let r: RdapResponse = serde_json::from_value(serde_json::json!({
+            "ldhName": "example.com",
+            "status": ["active"],
+            "events": [{"eventAction": "registration", "eventDate": "2000-01-01T00:00:00Z"}],
+            "notices": [{"title": "Terms of Use", "description": "Service subject to Terms of Use."}],
+            "remarks": [{"description": ["kept", 7, "too"]}]
+        }))
+        .expect("a bare-string description must not fail the response");
+        assert_eq!(r.status, ["active"]);
+        assert_eq!(
+            r.notices[0].description,
+            ["Service subject to Terms of Use."]
+        );
+        assert_eq!(r.remarks[0].description, ["kept", "too"]);
+    }
+
+    /// Regression: a numeric `publicIds` identifier (an IANA Registrar ID
+    /// sent as `292`) failed the whole RDAP 200. It is kept as text, and an
+    /// identifier of any other shape drops only its own entry.
+    #[test]
+    fn a_numeric_public_id_does_not_fail_whole_response() {
+        let r: RdapResponse = serde_json::from_value(serde_json::json!({
+            "ldhName": "example.com",
+            "status": ["active"],
+            "entities": [{
+                "roles": ["registrar"],
+                "publicIds": [
+                    {"type": "IANA Registrar ID", "identifier": 292},
+                    {"type": "broken", "identifier": {"nested": true}}
+                ]
+            }]
+        }))
+        .expect("a numeric identifier must not fail the response");
+        let ids = &r.entities[0].public_ids;
+        assert_eq!(ids.len(), 1, "{ids:?}");
+        assert_eq!(ids[0].identifier, "292");
     }
 }

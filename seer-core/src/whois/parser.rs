@@ -1147,6 +1147,9 @@ fn parse_naive_date(cleaned: &str, order: DateOrder) -> Option<DateTime<Utc>> {
         "%Y-%m-%dT%H:%M:%S%.fZ",
         // Naive ISO datetime, read as UTC (DENIC `Changed:`).
         "%Y-%m-%dT%H:%M:%S",
+        // With fractional seconds: what `split_utc_offset` leaves of Java's
+        // `yyyy-MM-dd'T'HH:mm:ss.SSSZ` (`…T10:30:00.000+0000`).
+        "%Y-%m-%dT%H:%M:%S%.f",
         "%Y-%m-%d %H:%M:%S",
         // NIC.ar `changed: 2023-07-17 17:23:05.989470`
         "%Y-%m-%d %H:%M:%S%.f",
@@ -3565,5 +3568,25 @@ Name Server: ns2.example.com
         assert_eq!(dates("google.im", raw)[1], some("2027-08-16 23:59"));
         assert_eq!(r.nameservers, vec!["ns1.google.com", "ns2.google.com"]);
         assert!(r.registrar.is_none() && r.registrant.is_none());
+    }
+
+    /// Regression: `split_utc_offset` deliberately accepts fractional
+    /// seconds before a `+HHMM`/`+HH` offset (`(?:\.\d+)?` in UTC_OFFSET),
+    /// but the local part it hands to `parse_naive_date` is
+    /// `YYYY-MM-DDTHH:MM:SS.fff`, a shape no
+    /// naive format accepts (only the space-separated `%.f` form and the
+    /// `…%.fZ` form existed). Java's `yyyy-MM-dd'T'HH:mm:ss.SSSZ` output — and
+    /// the same value with no zone at all — therefore parsed to `None`.
+    #[test]
+    fn t_separated_fractional_seconds_parse() {
+        let want = Some("2024-01-15T10:30:00".to_string());
+        let fmt = |d: Option<DateTime<Utc>>| d.map(|d| d.format("%Y-%m-%dT%H:%M:%S").to_string());
+        assert_eq!(
+            fmt(parse_date("2024-01-15T10:30:00.000+0000")),
+            want,
+            "+0000"
+        );
+        assert_eq!(fmt(parse_date("2024-01-15T13:30:00.000+03")), want, "+03");
+        assert_eq!(fmt(parse_date("2024-01-15T10:30:00.000")), want, "naive");
     }
 }

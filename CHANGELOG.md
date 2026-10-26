@@ -11,6 +11,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- RDAP: a notice or remark whose `description` is a bare string, or a
+  numeric `publicIds` identifier, no longer fails the whole response (and
+  with it the registration dates, status and the "RDAP proves the domain
+  exists" check). The string is kept as one line and the number as text.
+- WHOIS/RDAP dates with fractional seconds and a `T` separator
+  (`2024-01-15T10:30:00.000+0000`) now parse; they were silently dropped,
+  hiding creation and expiry dates.
+- `avail`/`lookup` of a subdomain whose registrable parent could not be
+  checked against the registry is now cached for 30 seconds, not 5 minutes.
+
 ## [0.56.0] - 2026-10-23
 
 ### Added
