@@ -171,12 +171,14 @@ informational coverage. Python test failures block merges like Rust ones.
   `status/`, `ssl.rs`/`tls.rs`, `http.rs` are single-attempt on purpose —
   health probes must not retry-mask flakiness. Failing over to the next
   address/server is allowed; re-sending the same query is not. One
-  deliberate exception: `DnsResolver::lookup_with_tcp_fallback` asks once
+  deliberate exception: `resolver::lookup_with_tcp_fallback` asks once
   more over TCP when a lookup ends truncated (RFC 7766 §5), because
   hickory-resolver 0.26.3 can abandon a truncated answer without doing so.
-  It is a protocol step, not a retry — keep it to that single TCP query, and
-  remove it when `hickory_still_abandons_truncated_parallel_udp_replies`
-  starts failing (hickory fixed upstream).
+  It is a protocol step, not a retry — keep it to that single TCP query,
+  route every hickory-resolver lookup that may draw a large answer through
+  it (`resolve()`, the DNSSEC checker), and remove it when
+  `hickory_still_abandons_truncated_parallel_udp_replies` starts failing
+  (hickory fixed upstream).
 - **Timeouts on every network operation**, bounded by one overall deadline
   where a walk could chain them (trace, delegation, `query()`). Defaults:
   WHOIS/RDAP 15s, DNS 5s, HTTP/SSL 10s, CT 30s.

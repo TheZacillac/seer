@@ -11,6 +11,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `dnssec`: a name that is a CNAME to a deleted target (a dangling `www`)
+  was reported as nonexistent and graded unsigned; it is now evaluated at
+  its enclosing zone.
+- `dnssec`: a CNAME whose target lies in a parent zone made the check
+  evaluate that parent zone instead of the name's own delegated zone.
+- `dnssec`: a DNSKEY set too big for UDP (e.g. RSA keys mid-rollover)
+  could fail to load and grade a healthy signed zone "misconfigured"; it is
+  now asked over TCP, as `dns` lookups already were.
+- RDAP: a notice or remark whose `description` is a bare string, or a
+  numeric `publicIds` identifier, no longer fails the whole response (and
+  with it the registration dates, status and the "RDAP proves the domain
+  exists" check). The string is kept as one line and the number as text.
+- WHOIS/RDAP dates with fractional seconds and a `T` separator
+  (`2024-01-15T10:30:00.000+0000`) now parse; they were silently dropped,
+  hiding creation and expiry dates.
+- `avail`/`lookup` of a subdomain whose registrable parent could not be
+  checked against the registry is now cached for 30 seconds, not 5 minutes.
+
 ### Performance
 - HTTP clients (status, headers, takeover, audit web checks, RDAP, CT logs,
   webhooks) share one TLS configuration instead of rebuilding it for every

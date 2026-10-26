@@ -100,15 +100,22 @@ const DEGRADED_LOOKUP_CACHE_TTL: Duration = Duration::from_secs(30);
 
 /// Whether a lookup result is a stand-in for registry data we failed to get:
 /// an inconclusive verdict, one inferred from DNS presence (`dns_present` —
-/// "retry shortly for full detail" — and `dns_nxdomain`), or a WHOIS record
-/// with no registration data (a thin body kept because RDAP failed or
-/// returned an empty 200). Such results are cached only briefly.
+/// "retry shortly for full detail" — and `dns_nxdomain`), a name under a
+/// registrable parent whose verdict was not a high-confidence registry
+/// answer, or a WHOIS record with no registration data (a thin body kept
+/// because RDAP failed or returned an empty 200). Such results are cached
+/// only briefly.
 fn is_degraded_result(result: &LookupResult) -> bool {
     match result {
-        LookupResult::Available { data, .. } => matches!(
-            data.method.as_str(),
-            "inconclusive" | "dns_present" | "dns_nxdomain"
-        ),
+        LookupResult::Available { data, .. } => match data.method.as_str() {
+            "inconclusive" | "dns_present" | "dns_nxdomain" => true,
+            // Inherits the parent's verdict and confidence but not its
+            // method, so only "high" is known to be registry data. An
+            // available parent (confidence "none" here) is refreshed early
+            // too, which costs a lookup, never a stale answer.
+            "registrable_parent" => data.confidence != "high",
+            _ => false,
+        },
         LookupResult::Whois { data, .. } => data.is_thin(),
         LookupResult::Rdap { .. } => false,
     }
@@ -1512,6 +1519,31 @@ mod tests {
             dns_nameservers: None,
         }));
         const { assert!(DEGRADED_LOOKUP_CACHE_TTL.as_secs() < LOOKUP_CACHE_TTL.as_secs()) };
+    }
+
+    /// Regression: `availability::subdomain_verdict` labels every guarded
+    /// subdomain verdict `registrable_parent` — including one whose parent
+    /// check was inconclusive or DNS-inferred. `is_degraded_result` keyed on
+    /// the method only, so such a stand-in was cached for the full 5 minutes
+    /// instead of 30s.
+    #[test]
+    fn a_registrable_parent_verdict_is_degraded_when_the_parents_was() {
+        use crate::availability::subdomain_verdict;
+        let under = |method: &str, available: bool, confidence: &str| {
+            let parent = AvailabilityResult::new("example.test", available, confidence, method);
+            LookupResult::Available {
+                data: Box::new(subdomain_verdict("www.example.test", &parent)),
+                rdap_error: String::new(),
+                whois_error: String::new(),
+                whois_data: None,
+            }
+        };
+        assert!(is_degraded_result(&under("inconclusive", false, "none")));
+        assert!(is_degraded_result(&under("dns_present", false, "medium")));
+        assert!(is_degraded_result(&under("dns_nxdomain", true, "medium")));
+        // A registered parent the registry answered for is registry data.
+        assert!(!is_degraded_result(&under("rdap", false, "high")));
+        assert!(!is_degraded_result(&under("whois", false, "high")));
     }
 
     #[test]

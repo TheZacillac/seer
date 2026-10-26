@@ -21,7 +21,8 @@
 //! One follow-up is not a retry: hickory-resolver 0.26.3 can give up on an
 //! answer too big for UDP without asking over TCP, so a lookup that ends
 //! truncated is asked once more over TCP of the same servers
-//! (`DnsResolver::lookup_with_tcp_fallback`), as a truncated reply requires.
+//! ([`lookup_with_tcp_fallback`], shared with the DNSSEC checker), as a
+//! truncated reply requires.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -145,6 +146,53 @@ fn build_resolver(config: ResolverConfig, timeout: Duration) -> Result<TokioReso
         .map_err(|e| SeerError::DnsError(format!("failed to construct DNS resolver: {}", e)))
 }
 
+/// [`build_resolver`] for a plain UDP/TCP upstream config — the default
+/// upstream, or the DNSSEC and delegation checkers' recursive reads.
+///
+/// The `expect` expresses an invariant rather than laziness: building only
+/// fails on hickory's rustls TLS context, which a plain UDP/TCP config never
+/// needs, and the bundled webpki root store makes it infallible besides.
+pub(crate) fn build_plain_resolver(config: ResolverConfig, timeout: Duration) -> TokioResolver {
+    build_resolver(config, timeout)
+        .expect("plain UDP/TCP resolver build cannot fail with the bundled webpki root store")
+}
+
+/// `resolver`'s lookup of `name`, asked once more over TCP of the same
+/// servers (`config`, the upstream it was built from) when it ends with a
+/// truncated answer. Every hickory-resolver lookup that may draw a large
+/// answer goes through here: [`DnsResolver::resolve`] and the DNSSEC
+/// checker's DS/DNSKEY reads.
+///
+/// hickory-resolver 0.26.3 queries two servers in parallel. When the answer
+/// is too big for UDP, the first truncated reply switches the request to
+/// TCP, and the second server's truncated UDP reply, still in flight, is
+/// then taken for a truncated TCP reply: hickory gives up without asking
+/// over TCP. A truncated reply calls for exactly that TCP query (RFC 7766
+/// §5), so this sends it — once, to the same servers. Remove once hickory
+/// fixes the race (the
+/// `hickory_still_abandons_truncated_parallel_udp_replies` test fails then).
+pub(crate) async fn lookup_with_tcp_fallback(
+    resolver: &TokioResolver,
+    config: &ResolverConfig,
+    timeout: Duration,
+    name: &str,
+    wire_type: HickoryRecordType,
+) -> std::result::Result<Lookup, NetError> {
+    match resolver.lookup(name, wire_type).await {
+        Err(NetError::Truncated) => {
+            debug!(name, "truncated answer abandoned over UDP; asking over TCP");
+            match build_resolver(tcp_only(config), timeout) {
+                Ok(tcp) => tcp.lookup(name, wire_type).await,
+                Err(e) => {
+                    debug!(error = %e, "cannot build the TCP resolver");
+                    Err(NetError::Truncated)
+                }
+            }
+        }
+        other => other,
+    }
+}
+
 /// The resolver a [`DnsResolver::resolve`] call runs on, with the upstream
 /// config it was built from (kept so a truncated answer can be asked again
 /// over TCP of the same servers: see [`tcp_only`]).
@@ -247,13 +295,10 @@ fn tcp_only(config: &ResolverConfig) -> ResolverConfig {
 
 /// Build the default (Google DNS over UDP/TCP) resolver.
 ///
-/// The `expect` expresses an invariant rather than laziness: with the
-/// `webpki-roots` root store compiled in, hickory's TLS-context construction
-/// (the only fallible step in [`build_resolver`]) cannot fail, and the
-/// infallible `new()`/`with_timeout()` constructors predate DoT/DoH support.
+/// Infallible (see [`build_plain_resolver`]): the `new()`/`with_timeout()`
+/// constructors predate DoT/DoH support.
 fn build_default_resolver(timeout: Duration) -> TokioResolver {
-    build_resolver(default_upstream_config(), timeout)
-        .expect("default resolver build cannot fail with the bundled webpki root store")
+    build_plain_resolver(default_upstream_config(), timeout)
 }
 
 /// The default upstream: Google Public DNS over UDP with TCP fallback, IPv4
@@ -908,38 +953,6 @@ impl DnsResolver {
         }
     }
 
-    /// `target`'s lookup of `name`, asked once more over TCP when it ends with
-    /// a truncated answer.
-    ///
-    /// hickory-resolver 0.26.3 queries two servers in parallel. When the
-    /// answer is too big for UDP, the first truncated reply switches the
-    /// request to TCP, and the second server's truncated UDP reply, still in
-    /// flight, is then taken for a truncated TCP reply: hickory gives up
-    /// without asking over TCP. A truncated reply calls for exactly that TCP
-    /// query (RFC 7766 §5), so this sends it — once, to the same servers.
-    /// Remove once hickory fixes the race (the
-    /// `hickory_still_abandons_truncated_parallel_udp_replies` test fails then).
-    async fn lookup_with_tcp_fallback(
-        &self,
-        target: &ResolveTarget<'_>,
-        name: &str,
-        wire_type: HickoryRecordType,
-    ) -> std::result::Result<Lookup, NetError> {
-        match target.resolver.lookup(name, wire_type).await {
-            Err(NetError::Truncated) => {
-                debug!(name, "truncated answer abandoned over UDP; asking over TCP");
-                match build_resolver(tcp_only(&target.config), self.timeout) {
-                    Ok(tcp) => tcp.lookup(name, wire_type).await,
-                    Err(e) => {
-                        debug!(error = %e, "cannot build the TCP resolver");
-                        Err(NetError::Truncated)
-                    }
-                }
-            }
-            other => other,
-        }
-    }
-
     /// Generic single-type lookup: queries the wire type for `record_type`
     /// and maps each matching answer through [`convert_rdata`]. Answers of
     /// other types (e.g. a CNAME returned alongside A records) are skipped.
@@ -958,9 +971,14 @@ impl DnsResolver {
             return Err(unsupported_record_type(record_type));
         };
 
-        let response = match self
-            .lookup_with_tcp_fallback(target, domain, wire_type)
-            .await
+        let response = match lookup_with_tcp_fallback(
+            &target.resolver,
+            &target.config,
+            self.timeout,
+            domain,
+            wire_type,
+        )
+        .await
         {
             Ok(response) => response,
             Err(e) if e.is_no_records_found() => return Ok(vec![]),
