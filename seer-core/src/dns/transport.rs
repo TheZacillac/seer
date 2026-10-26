@@ -77,7 +77,7 @@ impl Transport {
     /// A transport with seer's standard resolver options
     /// ([`apply_standard_opts`]) and `timeout` per query.
     ///
-    /// The `expect` is the invariant `resolver::build_default_resolver`
+    /// The `expect` is the invariant `resolver::build_plain_resolver`
     /// relies on: the TLS client config is the only fallible step, and with
     /// the bundled webpki root store its construction cannot fail.
     pub(crate) fn new(timeout: Duration) -> Self {

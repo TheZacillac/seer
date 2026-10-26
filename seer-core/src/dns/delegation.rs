@@ -68,7 +68,9 @@ use hickory_resolver::TokioResolver;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, instrument};
 
-use super::resolver::{apply_standard_opts, fqdn, google_or_pinned, single_server_config};
+use super::resolver::{
+    apply_standard_opts, build_plain_resolver, fqdn, google_or_pinned, single_server_config,
+};
 use super::DEFAULT_DNS_TIMEOUT;
 use crate::error::{Result, SeerError};
 use crate::validation::normalize_domain;
@@ -867,27 +869,14 @@ fn apply_direct_opts(opts: &mut ResolverOpts, timeout: Duration) {
 /// Builds the recursive resolver: Google DNS (UDP+TCP) in production, or a
 /// pinned loopback upstream for the `#[cfg(test)]` seam. Shared with the
 /// trace walker (`dns::trace`), which resolves glueless nameservers through
-/// it.
-///
-/// The `expect` expresses the same invariant as
-/// `dns::resolver::build_default_resolver`: with plain UDP/TCP upstreams the
-/// only fallible step (rustls TLS-context construction for DoT/DoH) never
-/// runs, so construction cannot fail.
+/// it. Built by `resolver::build_plain_resolver`, the one builder for plain
+/// UDP/TCP upstreams, so the option set cannot drift from the main
+/// resolver's (a hand-copied version once lacked the pinned server ordering).
 pub(crate) fn build_recursive_resolver(
     timeout: Duration,
     upstream: Option<(IpAddr, u16)>,
 ) -> TokioResolver {
-    let mut builder = TokioResolver::builder_with_config(
-        google_or_pinned(upstream),
-        TokioRuntimeProvider::default(),
-    );
-    // Shared with the main resolver so the option sets cannot drift: the
-    // hand-copied version here lacked the pinned `UserProvidedOrder` server
-    // ordering, so parent-NS discovery could draw black-holed IPv6 upstreams.
-    apply_standard_opts(builder.options_mut(), timeout);
-    builder
-        .build()
-        .expect("plain UDP/TCP resolver build cannot fail with the bundled webpki root store")
+    build_plain_resolver(google_or_pinned(upstream), timeout)
 }
 
 /// Classifies a hickory lookup error into a [`DirectNs`] outcome, extracting
